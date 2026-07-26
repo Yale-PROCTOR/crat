@@ -1,6 +1,7 @@
 //! C1-lite corpus runner for the experimental BO (borrow_ownership) analysis.
 //!
-//! Harness ONLY: nothing under `analyses/**` is touched. Runs BO exactly as
+//! Harness and test-only diagnostic hooks: production analysis semantics stay
+//! untouched. Runs BO exactly as
 //! `tests::borrow_ownership_coherence::assert_ownership_parity` constructs it
 //! (tests.rs `collect_program` → `CrateSlots::build` → `CrateCtxt::new` →
 //! `KindSolver::new` → `emit_crate_ownership_constraints` → per-fn
@@ -34,7 +35,11 @@
 use rustc_hir::{ItemKind, OwnerNode};
 use rustc_middle::ty::TyCtxt;
 
-use crate::utils::rustc::RustProgram;
+use self::ownership_diagnostic_package::{
+    AssumeSite, BoxDecisionEvidence, FunctionPrecisionRecord, NecessityEvidence,
+    ProductionPrecisionEvidence,
+};
+use crate::{analyses::borrow_ownership::solver::CORE_LABEL_FAMILIES, utils::rustc::RustProgram};
 
 /// Copy of tests.rs `borrow_ownership_coherence::collect_program` (kept local so
 /// tests.rs stays untouched): every top-level fn/struct item, in HIR owner order.
@@ -903,8 +908,18 @@ mod ownership_yield {
 /// The RED commit deliberately provides inert answers so each test below
 /// compiles and fails at assertion level. GREEN binds these contracts to the
 /// diagnostic workers without changing BO or production semantics.
-mod ownership_diagnostic_package {
+pub(crate) mod ownership_diagnostic_package {
+    use std::{
+        cell::{Cell, RefCell},
+        collections::{BTreeMap, BTreeSet},
+        fs,
+        path::Path,
+    };
+
+    use serde::{Deserialize, Serialize};
+
     use super::ownership_yield::OwnerClass;
+    pub(crate) use crate::analyses::borrow_ownership::solver::OwnAssumeSite as AssumeSite;
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub enum HardConstraintDecision {
@@ -919,7 +934,7 @@ mod ownership_diagnostic_package {
         pub tracking_markers: usize,
     }
 
-    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
     pub enum CausalBucket {
         JointNoSingleFamilyNecessity,
         SoleOwnAssume,
@@ -927,24 +942,19 @@ mod ownership_diagnostic_package {
     }
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-    pub enum AssumeSite {
-        OpaqueCallArg,
-        LibcRule,
-        LocalWrapper,
-        SsaTransfer,
-        TemporaryFinalization,
-        CastOrDepth,
-        OtherInternal,
+    pub enum RemovalFilter {
+        Family(&'static str),
+        OwnAssumeSite(AssumeSite),
     }
 
-    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
     pub enum PrecisionClass {
         Full,
         Degraded,
         Dummy,
     }
 
-    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
     pub struct BoxDecisionCounts {
         pub locals: usize,
         pub params: usize,
@@ -960,55 +970,284 @@ mod ownership_diagnostic_package {
         ResourceDeferred,
     }
 
-    pub fn inactive_filter_probe(_label: impl FnOnce() -> String) -> FilterProbe {
+    pub const ASSUME_SITES: &[AssumeSite] = &[
+        AssumeSite::OpaqueCallArg,
+        AssumeSite::LibcRule,
+        AssumeSite::LocalWrapper,
+        AssumeSite::SsaTransfer,
+        AssumeSite::TemporaryFinalization,
+        AssumeSite::CastOrDepth,
+        AssumeSite::OtherInternal,
+    ];
+
+    pub const ENV: &str = "CRAT_BOC1_OWNERSHIP_DIAGNOSTIC_PACKAGE";
+
+    pub fn enabled() -> bool {
+        match std::env::var(ENV).as_deref() {
+            Err(std::env::VarError::NotPresent) | Ok("0") => false,
+            Ok("1") => true,
+            Ok(other) => panic!("{ENV} must be 0 or 1, got {other:?}"),
+            Err(error) => panic!("{ENV} is not valid Unicode: {error}"),
+        }
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct NecessityEvidence {
+        pub program: String,
+        pub selector_key: String,
+        pub selector_index: usize,
+        pub epoch: usize,
+        pub raw_families: BTreeSet<String>,
+        pub necessary_families: BTreeSet<String>,
+        pub own_assume_necessary_sites: BTreeSet<String>,
+        pub causal_bucket: CausalBucket,
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct FunctionPrecisionRecord {
+        pub program: String,
+        pub function: String,
+        pub required_precision: u8,
+        pub final_precision: u8,
+        pub class: PrecisionClass,
+        pub owning_locals: usize,
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct ProductionPrecisionEvidence {
+        pub program: String,
+        pub functions: Vec<FunctionPrecisionRecord>,
+        pub field_owning_not_applicable: usize,
+        pub total_owning: usize,
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct BoxDecisionEvidence {
+        pub program: String,
+        pub counts: BoxDecisionCounts,
+    }
+
+    thread_local! {
+        static REMOVAL_FILTER: RefCell<Option<RemovalFilter>> = const { RefCell::new(None) };
+    }
+
+    pub fn with_removal_filter<T>(filter: RemovalFilter, f: impl FnOnce() -> T) -> T {
+        struct Restore(Option<RemovalFilter>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                REMOVAL_FILTER.with(|slot| {
+                    slot.replace(self.0.take());
+                });
+            }
+        }
+        let _restore = Restore(REMOVAL_FILTER.with(|slot| slot.replace(Some(filter))));
+        f()
+    }
+
+    pub fn removal_filter_active() -> bool {
+        REMOVAL_FILTER.with(|slot| slot.borrow().is_some())
+    }
+
+    pub fn suppresses_label(label: impl FnOnce() -> String) -> bool {
+        let filter = REMOVAL_FILTER.with(|slot| *slot.borrow());
+        let Some(filter) = filter else {
+            return false;
+        };
+        let label = label();
+        let family = crate::analyses::borrow_ownership::solver::core_label_family(&label)
+            .unwrap_or_else(|| panic!("unrecognized hard-constraint family: {label}"));
+        match filter {
+            RemovalFilter::Family(suppressed) => family == suppressed,
+            RemovalFilter::OwnAssumeSite(site) => {
+                family == "own-assume"
+                    && crate::analyses::borrow_ownership::solver::current_own_assume_site() == site
+            }
+        }
+    }
+
+    pub fn inactive_filter_probe(label: impl FnOnce() -> String) -> FilterProbe {
+        debug_assert!(!removal_filter_active());
+        let label_evaluated = Cell::new(false);
+        let decision = if removal_filter_active() {
+            let suppressed = suppresses_label(|| {
+                label_evaluated.set(true);
+                label()
+            });
+            if suppressed {
+                HardConstraintDecision::Suppress
+            } else {
+                HardConstraintDecision::Assert
+            }
+        } else {
+            HardConstraintDecision::Assert
+        };
         FilterProbe {
-            decision: HardConstraintDecision::Suppress,
-            label_evaluated: true,
-            tracking_markers: 1,
+            decision,
+            label_evaluated: label_evaluated.get(),
+            tracking_markers: 0,
         }
     }
 
     pub fn active_filter_probe(
-        _family: &str,
-        _label: impl FnOnce() -> String,
+        family: &'static str,
+        label: impl FnOnce() -> String,
     ) -> FilterProbe {
-        FilterProbe {
-            decision: HardConstraintDecision::Assert,
-            label_evaluated: false,
-            tracking_markers: 1,
+        with_removal_filter(RemovalFilter::Family(family), || {
+            let label_evaluated = Cell::new(false);
+            let suppressed = suppresses_label(|| {
+                label_evaluated.set(true);
+                label()
+            });
+            FilterProbe {
+                decision: if suppressed {
+                    HardConstraintDecision::Suppress
+                } else {
+                    HardConstraintDecision::Assert
+                },
+                label_evaluated: label_evaluated.get(),
+                tracking_markers: 0,
+            }
+        })
+    }
+
+    pub fn replay_matches_official(expected: &[usize], actual: &[usize]) -> bool {
+        expected == actual
+    }
+
+    pub fn removal_is_necessary(result_is_sat: bool) -> bool {
+        result_is_sat
+    }
+
+    pub fn causal_bucket(necessary_families: &[&str]) -> CausalBucket {
+        match necessary_families {
+            [] => CausalBucket::JointNoSingleFamilyNecessity,
+            ["own-assume"] => CausalBucket::SoleOwnAssume,
+            _ => CausalBucket::Other,
         }
     }
 
-    pub fn replay_matches_official(_expected: &[usize], _actual: &[usize]) -> bool {
-        false
+    pub fn read_family_matrix(path: &Path) -> Result<BTreeMap<String, BTreeSet<String>>, String> {
+        let input = fs::read_to_string(path)
+            .map_err(|error| format!("read family matrix {}: {error}", path.display()))?;
+        let mut lines = input.lines();
+        let header = lines
+            .next()
+            .ok_or_else(|| "family matrix is empty".to_string())?;
+        if !header.starts_with("program,selector_key,phase,raw_families,") {
+            return Err(format!("unrecognized family matrix header: {header}"));
+        }
+        let mut matrix = BTreeMap::new();
+        for (line_index, line) in lines.enumerate() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            let fields = line.split(',').collect::<Vec<_>>();
+            if fields.len() != 9 {
+                return Err(format!(
+                    "family matrix line {} has {} fields, expected 9",
+                    line_index + 2,
+                    fields.len()
+                ));
+            }
+            let key = fields[1].to_string();
+            let families = fields[3]
+                .split('+')
+                .filter(|family| !family.is_empty())
+                .map(str::to_string)
+                .collect::<BTreeSet<_>>();
+            if matrix.insert(key.clone(), families).is_some() {
+                return Err(format!("duplicate family-matrix selector key: {key}"));
+            }
+        }
+        Ok(matrix)
     }
 
-    pub fn removal_is_necessary(_result_is_sat: bool) -> bool {
-        false
+    pub fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<(), String> {
+        let encoded = serde_json::to_string_pretty(value)
+            .map_err(|error| format!("encode {}: {error}", path.display()))?;
+        fs::write(path, format!("{encoded}\n"))
+            .map_err(|error| format!("write {}: {error}", path.display()))
     }
 
-    pub fn causal_bucket(_necessary_families: &[&str]) -> CausalBucket {
-        CausalBucket::Other
+    pub fn read_json<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<T, String> {
+        let encoded = fs::read_to_string(path)
+            .map_err(|error| format!("read {}: {error}", path.display()))?;
+        serde_json::from_str(&encoded).map_err(|error| format!("parse {}: {error}", path.display()))
     }
 
-    pub fn classify_assume_site(_label: &str) -> AssumeSite {
-        AssumeSite::OtherInternal
+    pub fn classify_assume_site(label: &str) -> AssumeSite {
+        [
+            AssumeSite::OpaqueCallArg,
+            AssumeSite::LibcRule,
+            AssumeSite::LocalWrapper,
+            AssumeSite::SsaTransfer,
+            AssumeSite::TemporaryFinalization,
+            AssumeSite::CastOrDepth,
+            AssumeSite::OtherInternal,
+        ]
+        .into_iter()
+        .find(|site| label.contains(&format!("[{}]", site.as_str())))
+        .unwrap_or(AssumeSite::OtherInternal)
     }
 
-    pub fn precision_class(_final_precision: u8, _required_precision: u8) -> PrecisionClass {
-        PrecisionClass::Degraded
+    pub fn precision_class(final_precision: u8, required_precision: u8) -> PrecisionClass {
+        if final_precision == 0 {
+            PrecisionClass::Dummy
+        } else if final_precision < required_precision {
+            PrecisionClass::Degraded
+        } else {
+            PrecisionClass::Full
+        }
     }
 
-    pub fn owning_precision_function(_owner: OwnerClass) -> Option<&'static str> {
-        Some("function")
+    pub fn owning_precision_function(owner: OwnerClass) -> Option<&'static str> {
+        match owner {
+            OwnerClass::Local => Some("function"),
+            OwnerClass::Field => None,
+        }
     }
 
-    pub fn parse_pointer_diagnostics(_input: &str) -> Result<BoxDecisionCounts, String> {
-        Ok(BoxDecisionCounts::default())
+    pub fn parse_pointer_diagnostics(input: &str) -> Result<BoxDecisionCounts, String> {
+        let mut counts = BoxDecisionCounts::default();
+        for line in input
+            .lines()
+            .filter(|line| line.starts_with("[pointer-decision] subject="))
+        {
+            let final_kind = line
+                .split_whitespace()
+                .find_map(|field| field.strip_prefix("final="))
+                .ok_or_else(|| format!("pointer decision lacks final kind: {line}"))?;
+            if !matches!(
+                final_kind,
+                "Box" | "OptBox" | "BoxedSlice" | "OptBoxedSlice"
+            ) {
+                continue;
+            }
+            if line.contains("subject=local ") {
+                counts.locals += 1;
+                counts.d0_locals += 1;
+            } else if line.contains("subject=param ") {
+                counts.params += 1;
+            } else if line.contains("subject=return ") {
+                counts.returns += 1;
+            } else if line.contains("subject=field ") {
+                counts.fields += 1;
+            } else {
+                return Err(format!("unrecognized pointer-decision subject: {line}"));
+            }
+        }
+        Ok(counts)
     }
 
-    pub fn retry_status(_first: &str, _retry: Option<&str>) -> RetryStatus {
-        RetryStatus::ResourceDeferred
+    pub fn retry_status(first: &str, retry: Option<&str>) -> RetryStatus {
+        match (first, retry) {
+            ("ok", _) => RetryStatus::CompleteFirstPass,
+            ("timeout" | "oom-kill", Some("ok")) => RetryStatus::CompleteAfterRetry,
+            ("timeout" | "oom-kill", Some("timeout" | "oom-kill") | None) => {
+                RetryStatus::ResourceDeferred
+            }
+            (other, _) => panic!("correctness failure is not a retry status: {other}"),
+        }
     }
 
     #[cfg(test)]
@@ -2333,7 +2572,7 @@ pub(crate) use run::{CollateralMeasurement, measure_collateral};
 /// Per-mode analysis drivers producing report rows.
 mod run {
     use std::{
-        collections::BTreeSet,
+        collections::{BTreeMap, BTreeSet},
         path::Path,
         time::{Duration, Instant},
     };
@@ -2345,6 +2584,10 @@ mod run {
 
     use super::{
         collect_program,
+        ownership_diagnostic_package::{
+            self, FunctionPrecisionRecord, NecessityEvidence, ProductionPrecisionEvidence,
+            RemovalFilter,
+        },
         ownership_yield::{self, OwnerClass, SlotRecord},
         report::Row,
         selector_leak_diagnosis::{
@@ -3258,7 +3501,7 @@ mod run {
         program: &crate::utils::rustc::RustProgram,
         official: &selector_leak_diagnosis::OfficialTrace,
         solver: &KindSolver,
-        tracker: &CoreTracker,
+        tracker: Option<&CoreTracker>,
         round: usize,
     ) {
         for commit in official
@@ -3268,7 +3511,9 @@ mod run {
         {
             let target_key =
                 selector_leak_diagnosis::portable_slot_key(tcx, &program.functions, commit.target);
-            tracker.set_context(&format!("borrow-round-{round}-target={target_key}"));
+            if let Some(tracker) = tracker {
+                tracker.set_context(&format!("borrow-round-{round}-target={target_key}"));
+            }
             solver.add_borrow_exclusion(
                 Some(selector_leak_diagnosis::restore_slot(
                     &program.functions,
@@ -3331,7 +3576,14 @@ mod run {
                 epoch.events.iter().all(|event| event.epoch == epoch_index),
                 "official selector event epoch drift"
             );
-            replay_commit_round(tcx, &program, &official, &solver, tracker, epoch_index);
+            replay_commit_round(
+                tcx,
+                &program,
+                &official,
+                &solver,
+                Some(tracker),
+                epoch_index,
+            );
 
             let reenable_outcomes = epoch
                 .events
@@ -3509,7 +3761,7 @@ mod run {
         assert_eq!(selectors.all().len(), official.total_selectors);
         let reporting_commits = commit_events_for_reporting(tcx, &program, &official);
         for round in 0..=epoch {
-            replay_commit_round(tcx, &program, &official, &solver, tracker, round);
+            replay_commit_round(tcx, &program, &official, &solver, Some(tracker), round);
         }
 
         let event = official
@@ -3582,6 +3834,273 @@ mod run {
         row.set("selector_detail_epoch", epoch);
         row.set("selector_detail_index", selector_index);
         row.set("selector_detail_minimized", minimized);
+        row.set("t_total_s", secs(t0.elapsed()));
+        row.set("status", "ok");
+        row
+    }
+
+    /// Untracked removal-based necessity worker. The accepted family-core
+    /// matrix limits probes to families present in a preserved UNSAT core;
+    /// absent families are recorded non-necessary without a solve.
+    pub fn run_selector_necessity(tcx: TyCtxt<'_>, t_tcx: Duration) -> Row {
+        let t0 = Instant::now();
+        let mut row = Row::default();
+        row.set("t_tcx_s", secs(t_tcx));
+        row.set("z3_full_version", z3::full_version().to_string());
+
+        let program_name =
+            std::env::var("CRAT_BOC1_NAME").expect("necessity worker requires program name");
+        let trace_path = std::env::var("CRAT_BOC1_SELECTOR_TRACE")
+            .expect("necessity worker requires CRAT_BOC1_SELECTOR_TRACE");
+        let matrix_path = std::env::var("CRAT_BOC1_SELECTOR_FAMILY_MATRIX")
+            .expect("necessity worker requires CRAT_BOC1_SELECTOR_FAMILY_MATRIX");
+        let evidence_path = std::env::var("CRAT_BOC1_NECESSITY_EVIDENCE")
+            .expect("necessity worker requires CRAT_BOC1_NECESSITY_EVIDENCE");
+        let official = selector_leak_diagnosis::read_official_trace(Path::new(&trace_path))
+            .unwrap_or_else(|error| panic!("{error}"));
+        assert_eq!(official.program, program_name);
+        assert_eq!(
+            official.code_sha,
+            super::orchestrate::git_sha(),
+            "selector trace/code SHA mismatch"
+        );
+        let matrix = ownership_diagnostic_package::read_family_matrix(Path::new(&matrix_path))
+            .unwrap_or_else(|error| panic!("{error}"));
+        let program_prefix = format!("{program_name}/source:");
+        let program_matrix = matrix
+            .into_iter()
+            .filter(|(key, _)| key.starts_with(&program_prefix))
+            .collect::<BTreeMap<_, _>>();
+
+        let last_epoch_index = official
+            .epochs
+            .len()
+            .checked_sub(1)
+            .expect("official trace must contain a selector epoch");
+        let last_epoch = &official.epochs[last_epoch_index];
+        let actual_source_keys = last_epoch
+            .final_dropped
+            .iter()
+            .filter(|index| **index < official.n_sources)
+            .map(|index| {
+                selector_leak_diagnosis::selector_key(
+                    &program_name,
+                    SelectorClass::Source,
+                    *index,
+                    official.n_sources,
+                )
+            })
+            .collect::<BTreeSet<_>>();
+        let expected_source_keys = program_matrix.keys().cloned().collect::<BTreeSet<_>>();
+        assert!(
+            ownership_diagnostic_package::replay_matches_official(
+                &expected_source_keys
+                    .iter()
+                    .map(|key| {
+                        key.strip_prefix(&program_prefix)
+                            .expect("program source key")
+                            .parse::<usize>()
+                            .expect("source selector index")
+                    })
+                    .collect::<Vec<_>>(),
+                &actual_source_keys
+                    .iter()
+                    .map(|key| {
+                        key.strip_prefix(&program_prefix)
+                            .expect("program source key")
+                            .parse::<usize>()
+                            .expect("source selector index")
+                    })
+                    .collect::<Vec<_>>(),
+            ),
+            "official/family-matrix selector-set mismatch for {program_name}: \
+             expected={expected_source_keys:?} actual={actual_source_keys:?}"
+        );
+
+        let mut drop_events = BTreeMap::new();
+        for event in last_epoch
+            .events
+            .iter()
+            .filter(|event| event.phase == TracePhase::Drop)
+        {
+            let key = selector_leak_diagnosis::selector_key(
+                &program_name,
+                event.class,
+                event.selector_index,
+                official.n_sources,
+            );
+            if program_matrix.contains_key(&key) {
+                assert!(
+                    drop_events.insert(key, event).is_none(),
+                    "duplicate final-epoch drop event"
+                );
+            }
+        }
+        assert_eq!(
+            drop_events.keys().cloned().collect::<BTreeSet<_>>(),
+            expected_source_keys,
+            "final leaked source lacks a final-epoch drop event"
+        );
+
+        let program = collect_program(tcx);
+        let origins = compute_origins(&program);
+        let slots = CrateSlots::build(&program);
+        let candidate_families = program_matrix
+            .values()
+            .flat_map(|families| families.iter().cloned())
+            .collect::<BTreeSet<_>>();
+        for family in &candidate_families {
+            assert!(
+                CORE_LABEL_FAMILIES.contains(&family.as_str()),
+                "unrecognized family in accepted matrix: {family}"
+            );
+        }
+
+        let probe = |filter: RemovalFilter, keys: &BTreeSet<String>| -> (BTreeSet<String>, usize) {
+            ownership_diagnostic_package::with_removal_filter(filter, || {
+                let crate_ctxt = CrateCtxt::new(&program);
+                let solver = KindSolver::new(&slots);
+                let (_stats, selectors) =
+                    emit_crate_ownership_constraints(&crate_ctxt, &slots, &origins, &solver)
+                        .expect("untracked necessity emission");
+                for &function in &program.functions {
+                    let body = tcx
+                        .mir_drops_elaborated_and_const_checked(function)
+                        .borrow();
+                    add_coherence(&solver, &slots, function, &body);
+                }
+                constrain_field_ownership(&solver, &slots, &program);
+                assert_eq!(selectors.sources().len(), official.n_sources);
+                assert_eq!(selectors.all().len(), official.total_selectors);
+                let mut necessary = BTreeSet::new();
+                for round in 0..=last_epoch_index {
+                    replay_commit_round(tcx, &program, &official, &solver, None, round);
+                    if round != last_epoch_index {
+                        continue;
+                    }
+                    for key in keys {
+                        let event = drop_events
+                            .get(key)
+                            .unwrap_or_else(|| panic!("missing drop event for {key}"));
+                        let assumptions = event
+                            .active_before
+                            .iter()
+                            .map(|index| {
+                                selectors
+                                    .all()
+                                    .get(*index)
+                                    .unwrap_or_else(|| {
+                                        panic!("selector index {index} out of range")
+                                    })
+                                    .clone()
+                            })
+                            .collect::<Vec<_>>();
+                        match solver.check_with_assumptions(&assumptions) {
+                            SatResult::Sat => {
+                                necessary.insert(key.clone());
+                            }
+                            SatResult::Unsat => {}
+                            SatResult::Unknown => {
+                                panic!("necessity probe returned unknown for {key}")
+                            }
+                        }
+                    }
+                }
+                (necessary, solver.check_sat_count())
+            })
+        };
+
+        let mut necessary_by_key: BTreeMap<String, BTreeSet<String>> = program_matrix
+            .keys()
+            .cloned()
+            .map(|key| (key, BTreeSet::new()))
+            .collect();
+        let mut check_sat_count = 0usize;
+        for family in &candidate_families {
+            let keys = program_matrix
+                .iter()
+                .filter(|(_, families)| families.contains(family))
+                .map(|(key, _)| key.clone())
+                .collect::<BTreeSet<_>>();
+            let family = CORE_LABEL_FAMILIES
+                .iter()
+                .copied()
+                .find(|candidate| *candidate == family.as_str())
+                .expect("validated family");
+            let (necessary, checks) = probe(RemovalFilter::Family(family), &keys);
+            check_sat_count = check_sat_count.saturating_add(checks);
+            for key in necessary {
+                necessary_by_key
+                    .get_mut(&key)
+                    .expect("necessity key")
+                    .insert(family.to_string());
+            }
+        }
+
+        let own_assume_keys = necessary_by_key
+            .iter()
+            .filter(|(_, families)| families.contains("own-assume"))
+            .map(|(key, _)| key.clone())
+            .collect::<BTreeSet<_>>();
+        let mut necessary_sites_by_key: BTreeMap<String, BTreeSet<String>> = program_matrix
+            .keys()
+            .cloned()
+            .map(|key| (key, BTreeSet::new()))
+            .collect();
+        if !own_assume_keys.is_empty() {
+            for &site in ownership_diagnostic_package::ASSUME_SITES {
+                let (necessary, checks) =
+                    probe(RemovalFilter::OwnAssumeSite(site), &own_assume_keys);
+                check_sat_count = check_sat_count.saturating_add(checks);
+                for key in necessary {
+                    necessary_sites_by_key
+                        .get_mut(&key)
+                        .expect("assume-site key")
+                        .insert(site.as_str().to_string());
+                }
+            }
+        }
+
+        let evidence = program_matrix
+            .into_iter()
+            .map(|(selector_key, raw_families)| {
+                let event = drop_events[&selector_key];
+                let necessary_families = necessary_by_key
+                    .remove(&selector_key)
+                    .expect("necessary-family row");
+                let family_refs = necessary_families
+                    .iter()
+                    .map(String::as_str)
+                    .collect::<Vec<_>>();
+                let causal_bucket = ownership_diagnostic_package::causal_bucket(&family_refs);
+                NecessityEvidence {
+                    program: program_name.clone(),
+                    selector_key: selector_key.clone(),
+                    selector_index: event.selector_index,
+                    epoch: last_epoch_index,
+                    raw_families,
+                    necessary_families,
+                    own_assume_necessary_sites: necessary_sites_by_key
+                        .remove(&selector_key)
+                        .expect("assume-site row"),
+                    causal_bucket,
+                }
+            })
+            .collect::<Vec<_>>();
+        ownership_diagnostic_package::write_json(Path::new(&evidence_path), &evidence)
+            .unwrap_or_else(|error| panic!("{error}"));
+        row.set("necessity_sources", evidence.len());
+        row.set(
+            "necessity_joint",
+            evidence
+                .iter()
+                .filter(|record| {
+                    record.causal_bucket
+                        == ownership_diagnostic_package::CausalBucket::JointNoSingleFamilyNecessity
+                })
+                .count(),
+        );
+        row.set("check_sat_count", check_sat_count);
         row.set("t_total_s", secs(t0.elapsed()));
         row.set("status", "ok");
         row
@@ -4343,8 +4862,8 @@ mod run {
         use crate::analyses::{
             output_params::compute_output_params,
             ownership::{
-                AnalysisKind, CrateCtxt as OwnershipCrateCtxt,
-                solidify::SolidifiedOwnershipSchemes, whole_program::WholeProgramAnalysis,
+                solidify::SolidifiedOwnershipSchemes, total_deref_level,
+                whole_program::WholeProgramAnalysis, AnalysisKind, CrateCtxt as OwnershipCrateCtxt,
             },
             type_qualifier::foster::mutability::mutability_analysis,
         };
@@ -4468,6 +4987,75 @@ mod run {
 
         let records = records(&program, &solidified, &output_params);
         let counts = ownership_yield::side_counts(&records);
+        if let Ok(path) = std::env::var("CRAT_BOC1_PROD_PRECISION_EVIDENCE") {
+            let required_precision = std::cmp::min(
+                program
+                    .functions
+                    .iter()
+                    .copied()
+                    .map(|did| {
+                        let body = tcx.mir_drops_elaborated_and_const_checked(did).borrow();
+                        total_deref_level(&body) + 1
+                    })
+                    .max()
+                    .unwrap_or(0),
+                3,
+            );
+            let functions = program
+                .functions
+                .iter()
+                .copied()
+                .map(|did| {
+                    let final_precision = results.precision(&did.to_def_id());
+                    let body = tcx.mir_drops_elaborated_and_const_checked(did).borrow();
+                    let fn_result = solidified.fn_results(&did.to_def_id());
+                    let owning_locals = body
+                        .local_decls
+                        .indices()
+                        .map(|local| {
+                            fn_result
+                                .local_result(local)
+                                .iter()
+                                .filter(|ownership| ownership.is_owning())
+                                .count()
+                        })
+                        .sum();
+                    FunctionPrecisionRecord {
+                        program: std::env::var("CRAT_BOC1_NAME")
+                            .expect("production precision worker name"),
+                        function: tcx.def_path_str(did.to_def_id()),
+                        required_precision,
+                        final_precision,
+                        class: ownership_diagnostic_package::precision_class(
+                            final_precision,
+                            required_precision,
+                        ),
+                        owning_locals,
+                    }
+                })
+                .collect::<Vec<_>>();
+            let local_owning = functions
+                .iter()
+                .map(|record| record.owning_locals)
+                .sum::<usize>();
+            let field_owning_not_applicable = counts.field_owning_by_depth.values().sum::<usize>();
+            assert_eq!(
+                local_owning + field_owning_not_applicable,
+                counts.total_owning,
+                "production precision attribution must reconcile to solver-layer Owning"
+            );
+            ownership_diagnostic_package::write_json(
+                Path::new(&path),
+                &ProductionPrecisionEvidence {
+                    program: std::env::var("CRAT_BOC1_NAME")
+                        .expect("production precision worker name"),
+                    functions,
+                    field_owning_not_applicable,
+                    total_owning: counts.total_owning,
+                },
+            )
+            .unwrap_or_else(|error| panic!("{error}"));
+        }
         let forced = records.iter().filter(|record| record.forced_output).count();
         row.set("n_own_prod", counts.total_owning);
         row.set(
@@ -4482,10 +5070,27 @@ mod run {
                 .checked_sub(forced)
                 .expect("forced output entries exceed production Owning count"),
         );
-        ownership_yield::write_worker_snapshot(&records).unwrap_or_else(|error| panic!("{error}"));
-        row.set("ownership_yield_snapshot", records.len());
+        if std::env::var_os("CRAT_BOC1_YIELD_SNAPSHOT").is_some() {
+            ownership_yield::write_worker_snapshot(&records)
+                .unwrap_or_else(|error| panic!("{error}"));
+            row.set("ownership_yield_snapshot", records.len());
+        }
         row.set("status", "ok");
         row.set("t_total_s", secs(t0.elapsed() + t_tcx));
+        row
+    }
+
+    /// Production end-to-end decision worker. The generated source is
+    /// intentionally discarded; final pointer decisions are emitted by the
+    /// existing full diagnostics surface and parsed by the parent harness.
+    pub fn run_prod_box(tcx: TyCtxt<'_>, t_tcx: Duration) -> Row {
+        let t0 = Instant::now();
+        let mut row = Row::default();
+        row.set("t_tcx_s", secs(t_tcx));
+        let (generated, _) = crate::replace_local_borrows(&crate::Config::default(), tcx);
+        drop(generated);
+        row.set("t_total_s", secs(t0.elapsed() + t_tcx));
+        row.set("status", "ok");
         row
     }
 
@@ -5311,8 +5916,10 @@ fn boc1_run_one() {
     // production-borrow `prod` reference remains untouched. Expected behavior-neutral (z3's default
     // seed is already 0); the value is recorded through each solver-backed row's
     // `z3_full_version` stamp.
-    if matches!(mode.as_str(), "bo" | "prod-own" | "selector-core")
-        || mode.starts_with("selector-detail-")
+    if matches!(
+        mode.as_str(),
+        "bo" | "prod-own" | "prod-precision" | "prod-box" | "selector-core" | "selector-necessity"
+    ) || mode.starts_with("selector-detail-")
     {
         z3::set_global_param("smt.random_seed", "0");
         z3::set_global_param("sat.random_seed", "0");
@@ -5325,7 +5932,10 @@ fn boc1_run_one() {
             "bo" => run::run_bo(tcx, t_tcx),
             "prod" => run::run_prod(tcx, t_tcx),
             "prod-own" => run::run_prod_ownership(tcx, t_tcx),
+            "prod-precision" => run::run_prod_ownership(tcx, t_tcx),
+            "prod-box" => run::run_prod_box(tcx, t_tcx),
             "selector-core" => run::run_selector_core(tcx, t_tcx),
+            "selector-necessity" => run::run_selector_necessity(tcx, t_tcx),
             detail if detail.starts_with("selector-detail-") => {
                 run::run_selector_core_detail(tcx, t_tcx)
             }
@@ -5634,6 +6244,7 @@ mod orchestrate {
     };
 
     use super::{
+        ownership_diagnostic_package,
         ownership_yield,
         report::{self, Row},
         selector_leak_diagnosis,
@@ -5647,6 +6258,7 @@ mod orchestrate {
         pub row: Option<Row>,
         pub wall_s: f64,
         pub note: String,
+        pub stderr: String,
     }
 
     fn env_u64(key: &str, default: u64) -> u64 {
@@ -5688,6 +6300,24 @@ mod orchestrate {
         out_dir()
             .join("selector-details")
             .join(format!("{program}.{case}.json"))
+    }
+
+    pub fn necessity_evidence_path(program: &str) -> PathBuf {
+        out_dir()
+            .join("selector-family-necessity")
+            .join(format!("{program}.json"))
+    }
+
+    pub fn production_precision_path(program: &str) -> PathBuf {
+        out_dir()
+            .join("production-precision")
+            .join(format!("{program}.json"))
+    }
+
+    pub fn production_box_path(program: &str) -> PathBuf {
+        out_dir()
+            .join("production-box")
+            .join(format!("{program}.json"))
     }
 
     /// Current commit SHA of the parent code repo, for the `results.jsonl` provenance stamp.
@@ -5804,6 +6434,41 @@ mod orchestrate {
                     .env("CRAT_BOC1_SELECTOR_DETAIL_EVIDENCE", detail);
             }
         }
+        if ownership_diagnostic_package::enabled() {
+            let trace = selector_trace_path(program);
+            let necessity = necessity_evidence_path(program);
+            let precision = production_precision_path(program);
+            let boxes = production_box_path(program);
+            for path in [&trace, &necessity, &precision, &boxes] {
+                fs::create_dir_all(path.parent().expect("diagnostic package artifact parent"))
+                    .expect("create diagnostic package artifact dir");
+            }
+            command.env("CRAT_BOC1_SELECTOR_TRACE", &trace);
+            if mode == "bo" {
+                if trace.is_file() {
+                    fs::remove_file(&trace).expect("remove stale selector trace");
+                }
+                command.env("CRAT_BOC1_SELECTOR_CORE", "official");
+            } else if mode == "selector-necessity" {
+                if necessity.is_file() {
+                    fs::remove_file(&necessity).expect("remove stale necessity evidence");
+                }
+                command
+                    .env(
+                        "CRAT_BOC1_SELECTOR_FAMILY_MATRIX",
+                        std::env::var("CRAT_BOC1_SELECTOR_FAMILY_MATRIX")
+                            .expect("diagnostic package family matrix"),
+                    )
+                    .env("CRAT_BOC1_NECESSITY_EVIDENCE", necessity);
+            } else if mode == "prod-precision" {
+                if precision.is_file() {
+                    fs::remove_file(&precision).expect("remove stale precision evidence");
+                }
+                command.env("CRAT_BOC1_PROD_PRECISION_EVIDENCE", precision);
+            } else if mode == "prod-box" {
+                command.env("CRAT_POINTER_DECISION_DIAGNOSTICS", "full");
+            }
+        }
         let mut child = command.spawn().expect("spawn worker");
 
         let mut killed_for: Option<&str> = None;
@@ -5879,6 +6544,7 @@ mod orchestrate {
             row,
             wall_s,
             note,
+            stderr,
         }
     }
 }
@@ -5893,7 +6559,8 @@ fn boc1_corpus() {
     };
 
     use orchestrate::{
-        out_dir, run_child, run_child_labeled, selector_detail_path, selector_evidence_path,
+        necessity_evidence_path, out_dir, production_box_path, production_precision_path,
+        run_child, run_child_labeled, selector_detail_path, selector_evidence_path,
         selector_trace_path, workspace_root, yield_snapshot_path,
     };
     use report::Row;
@@ -5928,6 +6595,7 @@ fn boc1_corpus() {
         .unwrap_or(true);
     let ownership_yield_enabled = ownership_yield::enabled();
     let selector_leak_diag = selector_leak_diagnosis::enabled();
+    let diagnostic_package = ownership_diagnostic_package::enabled();
     let only: Option<Vec<String>> = std::env::var("CRAT_BOC1_PROGRAMS")
         .ok()
         .map(|v| v.split(',').map(|s| s.trim().to_string()).collect());
@@ -5969,6 +6637,61 @@ fn boc1_corpus() {
         assert!(
             only.is_none(),
             "selector-leak diagnosis must cover all 20 frozen programs"
+        );
+        assert_eq!(CORPUS.len(), 20);
+    }
+    if diagnostic_package {
+        assert_eq!(
+            std::env::var("CRAT_BO_REPAIR").as_deref(),
+            Ok("mode_a"),
+            "ownership diagnostic package requires Mode-A"
+        );
+        assert_eq!(
+            std::env::var("CRAT_BO_L2_GUARDED_COMMITS").as_deref(),
+            Ok("0"),
+            "ownership diagnostic package requires L2 explicitly off"
+        );
+        assert!(
+            !crate::analyses::borrow_ownership::l2::enabled_from_env(),
+            "ownership diagnostic package resolved L2 on"
+        );
+        assert_eq!(
+            timeout,
+            Duration::from_secs(900),
+            "ownership diagnostic official timeout must be 900 seconds"
+        );
+        assert_eq!(
+            diagnostic_timeout,
+            Duration::from_secs(1800),
+            "ownership diagnostic worker timeout must be 1800 seconds"
+        );
+        assert_eq!(
+            prod_timeout,
+            Duration::from_secs(1800),
+            "ownership diagnostic production timeout must be 1800 seconds"
+        );
+        assert_eq!(
+            std::env::var("CRAT_BOC1_MEM_MB").as_deref(),
+            Ok("8192"),
+            "ownership diagnostic package requires the 8192-MiB worker cap"
+        );
+        assert!(
+            !prod_enabled,
+            "ownership diagnostic package owns its production workers"
+        );
+        assert!(
+            only.is_none(),
+            "ownership diagnostic package must cover all 20 frozen programs"
+        );
+        assert!(
+            !selector_leak_diag && !ownership_yield_enabled && !l2_gate,
+            "ownership diagnostic package is mutually exclusive with other corpus modes"
+        );
+        let family_matrix = std::env::var("CRAT_BOC1_SELECTOR_FAMILY_MATRIX")
+            .expect("ownership diagnostic package requires the accepted family matrix");
+        assert!(
+            std::path::Path::new(&family_matrix).is_file(),
+            "accepted family matrix does not exist: {family_matrix}"
         );
         assert_eq!(CORPUS.len(), 20);
     }
@@ -6145,6 +6868,7 @@ fn boc1_corpus() {
     let mut production_failures = 0usize;
     let mut selector_retry_queue = Vec::new();
     let mut selector_resource_deferred = Vec::new();
+    let mut diagnostic_retry_queue: Vec<(CorpusProgram, &'static str)> = Vec::new();
 
     for &program in CORPUS {
         if let Some(only) = &only
@@ -6245,6 +6969,158 @@ fn boc1_corpus() {
                             "selector-leak tracked worker failed for {}: status={} note={}",
                             program.name, tracked.status, tracked.note
                         );
+                    }
+                }
+            }
+
+            if diagnostic_package {
+                assert_eq!(
+                    bo.status, "ok",
+                    "ownership diagnostic official worker failed for {}: status={} note={}",
+                    program.name, bo.status, bo.note
+                );
+                assert!(
+                    selector_trace_path(program.name).is_file(),
+                    "ownership diagnostic official trace missing for {}",
+                    program.name
+                );
+
+                eprintln!("[boc1] {}: selector-necessity mode...", program.name);
+                let necessity = run_child(
+                    program.name,
+                    &input,
+                    "selector-necessity",
+                    diagnostic_timeout,
+                );
+                m.set("necessity_first_wall_s", format!("{:.1}", necessity.wall_s));
+                m.set("necessity_wall_s", format!("{:.1}", necessity.wall_s));
+                match diagnostic_worker_disposition(&necessity.status) {
+                    DiagnosticWorkerDisposition::Complete => {
+                        m.set("necessity_status", "ok");
+                        let row = necessity
+                            .row
+                            .as_ref()
+                            .expect("necessity worker completed without row");
+                        for (source, target) in [
+                            ("necessity_sources", "necessity_sources"),
+                            ("necessity_joint", "necessity_joint"),
+                            ("check_sat_count", "necessity_check_sat_count"),
+                        ] {
+                            if let Some(value) = row.get(source) {
+                                m.set(target, value);
+                            }
+                        }
+                        raw_rows.push(row.clone());
+                        assert!(
+                            necessity_evidence_path(program.name).is_file(),
+                            "necessity evidence missing for {}",
+                            program.name
+                        );
+                    }
+                    DiagnosticWorkerDisposition::ResourceDeferred => {
+                        diagnostic_retry_queue.push((program, "selector-necessity"));
+                        m.set("necessity_status", "resource-deferred-pending-retry");
+                        m.set(
+                            "necessity_note",
+                            format!("{} at {}s", necessity.status, diagnostic_timeout.as_secs()),
+                        );
+                    }
+                    DiagnosticWorkerDisposition::CorrectnessFailure => {
+                        panic!(
+                            "necessity worker correctness failure for {}: status={} note={}",
+                            program.name, necessity.status, necessity.note
+                        );
+                    }
+                }
+
+                eprintln!("[boc1] {}: prod-precision mode...", program.name);
+                let precision = run_child(program.name, &input, "prod-precision", prod_timeout);
+                m.set(
+                    "prod_precision_first_wall_s",
+                    format!("{:.1}", precision.wall_s),
+                );
+                m.set("prod_precision_wall_s", format!("{:.1}", precision.wall_s));
+                match diagnostic_worker_disposition(&precision.status) {
+                    DiagnosticWorkerDisposition::Complete => {
+                        m.set("prod_precision_status", "ok");
+                        let row = precision
+                            .row
+                            .as_ref()
+                            .expect("production precision worker completed without row");
+                        for key in [
+                            "t_andersen_s",
+                            "t_output_params_s",
+                            "t_ownership_s",
+                            "t_solidify_s",
+                            "n_own_prod",
+                            "n_own_prod_fields",
+                        ] {
+                            if let Some(value) = row.get(key) {
+                                m.set(&format!("prod_precision_{key}"), value);
+                            }
+                        }
+                        raw_rows.push(row.clone());
+                        assert!(
+                            production_precision_path(program.name).is_file(),
+                            "production precision evidence missing for {}",
+                            program.name
+                        );
+                    }
+                    DiagnosticWorkerDisposition::ResourceDeferred => {
+                        diagnostic_retry_queue.push((program, "prod-precision"));
+                        m.set("prod_precision_status", "resource-deferred-pending-retry");
+                        m.set(
+                            "prod_precision_note",
+                            format!("{} at {}s", precision.status, prod_timeout.as_secs()),
+                        );
+                    }
+                    DiagnosticWorkerDisposition::CorrectnessFailure => {
+                        m.set(
+                            "prod_precision_status",
+                            format!("failed-{}", precision.status),
+                        );
+                        m.set("prod_precision_note", &precision.note);
+                    }
+                }
+
+                eprintln!("[boc1] {}: prod-box mode...", program.name);
+                let boxes = run_child(program.name, &input, "prod-box", prod_timeout);
+                m.set("prod_box_first_wall_s", format!("{:.1}", boxes.wall_s));
+                m.set("prod_box_wall_s", format!("{:.1}", boxes.wall_s));
+                match diagnostic_worker_disposition(&boxes.status) {
+                    DiagnosticWorkerDisposition::Complete => {
+                        m.set("prod_box_status", "ok");
+                        let counts =
+                            ownership_diagnostic_package::parse_pointer_diagnostics(&boxes.stderr)
+                                .unwrap_or_else(|error| panic!("{}: {error}", program.name));
+                        ownership_diagnostic_package::write_json(
+                            &production_box_path(program.name),
+                            &ownership_diagnostic_package::BoxDecisionEvidence {
+                                program: program.name.to_string(),
+                                counts,
+                            },
+                        )
+                        .unwrap_or_else(|error| panic!("{error}"));
+                        m.set("prod_box_locals", counts.locals);
+                        m.set("prod_box_params", counts.params);
+                        m.set("prod_box_returns", counts.returns);
+                        m.set("prod_box_fields", counts.fields);
+                        m.set("prod_box_d0_locals", counts.d0_locals);
+                        if let Some(row) = &boxes.row {
+                            raw_rows.push(row.clone());
+                        }
+                    }
+                    DiagnosticWorkerDisposition::ResourceDeferred => {
+                        diagnostic_retry_queue.push((program, "prod-box"));
+                        m.set("prod_box_status", "resource-deferred-pending-retry");
+                        m.set(
+                            "prod_box_note",
+                            format!("{} at {}s", boxes.status, prod_timeout.as_secs()),
+                        );
+                    }
+                    DiagnosticWorkerDisposition::CorrectnessFailure => {
+                        m.set("prod_box_status", format!("failed-{}", boxes.status));
+                        m.set("prod_box_note", &boxes.note);
                     }
                 }
             }
@@ -6497,6 +7373,136 @@ fn boc1_corpus() {
                 .expect("write retry csv");
             fs::write(out_dir().join("report.md"), render_report(&merged))
                 .expect("write retry report");
+        }
+    }
+
+    if diagnostic_package {
+        let retry_timeout = Duration::from_secs(3600);
+        for (program, mode) in diagnostic_retry_queue {
+            let input = program.input_path(&root);
+            let label = format!("{mode}-retry");
+            eprintln!(
+                "[boc1] {}: {mode} retry ({}s cap)...",
+                program.name,
+                retry_timeout.as_secs()
+            );
+            let retried = run_child_labeled(program.name, &input, mode, &label, retry_timeout);
+            let m = merged
+                .iter_mut()
+                .find(|row| row.get("program") == Some(program.name))
+                .unwrap_or_else(|| panic!("diagnostic retry row missing for {}", program.name));
+            let prefix = match mode {
+                "selector-necessity" => "necessity",
+                "prod-precision" => "prod_precision",
+                "prod-box" => "prod_box",
+                _ => unreachable!("unknown diagnostic retry mode"),
+            };
+            let first_wall = m
+                .get(&format!("{prefix}_first_wall_s"))
+                .and_then(|wall| wall.parse::<f64>().ok())
+                .expect("diagnostic first-attempt wall time");
+            m.set(
+                &format!("{prefix}_retry_wall_s"),
+                format!("{:.1}", retried.wall_s),
+            );
+            m.set(
+                &format!("{prefix}_wall_s"),
+                format!("{:.1}", first_wall + retried.wall_s),
+            );
+            match diagnostic_worker_disposition(&retried.status) {
+                DiagnosticWorkerDisposition::Complete => {
+                    m.set(&format!("{prefix}_status"), "ok-after-retry");
+                    m.set(&format!("{prefix}_note"), "completed_on_3600s_retry");
+                    match mode {
+                        "selector-necessity" => {
+                            assert!(
+                                necessity_evidence_path(program.name).is_file(),
+                                "necessity retry evidence missing for {}",
+                                program.name
+                            );
+                            let row = retried
+                                .row
+                                .as_ref()
+                                .expect("necessity retry completed without row");
+                            for (source, target) in [
+                                ("necessity_sources", "necessity_sources"),
+                                ("necessity_joint", "necessity_joint"),
+                                ("check_sat_count", "necessity_check_sat_count"),
+                            ] {
+                                if let Some(value) = row.get(source) {
+                                    m.set(target, value);
+                                }
+                            }
+                        }
+                        "prod-precision" => {
+                            assert!(
+                                production_precision_path(program.name).is_file(),
+                                "production precision retry evidence missing for {}",
+                                program.name
+                            );
+                            let row = retried
+                                .row
+                                .as_ref()
+                                .expect("production precision retry completed without row");
+                            for key in [
+                                "t_andersen_s",
+                                "t_output_params_s",
+                                "t_ownership_s",
+                                "t_solidify_s",
+                                "n_own_prod",
+                                "n_own_prod_fields",
+                            ] {
+                                if let Some(value) = row.get(key) {
+                                    m.set(&format!("prod_precision_{key}"), value);
+                                }
+                            }
+                        }
+                        "prod-box" => {
+                            let counts = ownership_diagnostic_package::parse_pointer_diagnostics(
+                                &retried.stderr,
+                            )
+                            .unwrap_or_else(|error| panic!("{}: {error}", program.name));
+                            ownership_diagnostic_package::write_json(
+                                &production_box_path(program.name),
+                                &ownership_diagnostic_package::BoxDecisionEvidence {
+                                    program: program.name.to_string(),
+                                    counts,
+                                },
+                            )
+                            .unwrap_or_else(|error| panic!("{error}"));
+                            m.set("prod_box_locals", counts.locals);
+                            m.set("prod_box_params", counts.params);
+                            m.set("prod_box_returns", counts.returns);
+                            m.set("prod_box_fields", counts.fields);
+                            m.set("prod_box_d0_locals", counts.d0_locals);
+                        }
+                        _ => unreachable!(),
+                    }
+                    if let Some(row) = &retried.row {
+                        raw_rows.push(row.clone());
+                    }
+                }
+                DiagnosticWorkerDisposition::ResourceDeferred => {
+                    m.set(&format!("{prefix}_status"), "resource-deferred-final");
+                    m.set(
+                        &format!("{prefix}_note"),
+                        format!("resource wall at 1800s and {} at 3600s", retried.status),
+                    );
+                }
+                DiagnosticWorkerDisposition::CorrectnessFailure => {
+                    if mode == "selector-necessity" {
+                        panic!(
+                            "necessity retry correctness failure for {}: status={} note={}",
+                            program.name, retried.status, retried.note
+                        );
+                    }
+                    m.set(
+                        &format!("{prefix}_status"),
+                        format!("failed-{}", retried.status),
+                    );
+                    m.set(&format!("{prefix}_note"), &retried.note);
+                }
+            }
         }
     }
 
@@ -6891,6 +7897,425 @@ fn boc1_corpus() {
             ),
         )
         .expect("write selector classification report");
+    }
+
+    if diagnostic_package {
+        let parse_total = |key: &str| {
+            merged
+                .iter()
+                .map(|row| {
+                    row.get(key)
+                        .unwrap_or_else(|| panic!("ownership diagnostic row missing {key}"))
+                        .parse::<usize>()
+                        .unwrap_or_else(|error| {
+                            panic!("ownership diagnostic {key} is not numeric: {error}")
+                        })
+                })
+                .sum::<usize>()
+        };
+        assert_eq!(
+            merged.len(),
+            20,
+            "diagnostic package must cover 20 programs"
+        );
+        assert!(
+            merged.iter().all(|row| row.get("status") == Some("ok")),
+            "ownership diagnostic official worker declined"
+        );
+        assert_eq!(parse_total("n_ref"), 52_810);
+        assert_eq!(parse_total("n_own"), 230);
+        assert_eq!(parse_total("sources_leaked_sel"), 114);
+        assert_eq!(parse_total("sources_total"), 144);
+        assert_eq!(parse_total("sinks_leaked"), 170);
+        assert_eq!(parse_total("sinks_total"), 206);
+
+        let production_failures = merged
+            .iter()
+            .flat_map(|row| {
+                ["prod_precision_status", "prod_box_status"]
+                    .into_iter()
+                    .filter_map(move |key| {
+                        row.get(key)
+                            .filter(|status| !status.starts_with("ok"))
+                            .map(|status| {
+                                (
+                                    row.get("program").unwrap_or("unknown"),
+                                    key,
+                                    status.to_string(),
+                                )
+                            })
+                    })
+            })
+            .collect::<Vec<_>>();
+        let failed_production_programs = production_failures
+            .iter()
+            .map(|(program, _, _)| *program)
+            .collect::<BTreeSet<_>>();
+        assert!(
+            failed_production_programs.len() <= 5,
+            "production failed on {} programs; measurement design review required: {:?}",
+            failed_production_programs.len(),
+            production_failures
+        );
+
+        let mut necessity = Vec::<NecessityEvidence>::new();
+        let mut uncovered_sources = 0usize;
+        for program in CORPUS {
+            let row = merged
+                .iter()
+                .find(|row| row.get("program") == Some(program.name))
+                .expect("diagnostic program row");
+            if row
+                .get("necessity_status")
+                .is_some_and(|status| status.starts_with("ok"))
+            {
+                let mut records: Vec<NecessityEvidence> =
+                    ownership_diagnostic_package::read_json(&necessity_evidence_path(program.name))
+                        .unwrap_or_else(|error| panic!("{error}"));
+                necessity.append(&mut records);
+            } else {
+                uncovered_sources += row
+                    .get("sources_leaked_sel")
+                    .expect("deferred necessity source count")
+                    .parse::<usize>()
+                    .expect("numeric deferred necessity source count");
+            }
+        }
+        necessity.sort_by(|left, right| {
+            left.program
+                .cmp(&right.program)
+                .then_with(|| left.selector_key.cmp(&right.selector_key))
+        });
+        assert_eq!(
+            necessity.len() + uncovered_sources,
+            114,
+            "necessity coverage must reconcile to official leaked sources"
+        );
+
+        let mut selector_csv = String::from(
+            "program,selector_key,epoch,raw_families,necessary_families,\
+             causal_bucket,own_assume_necessary_sites,solely_own_assume,\
+             wrapper_share,own_linear_candidate,grouping_hinge\n",
+        );
+        let mut causal_csv = String::from(
+            "program,selector_key,causal_bucket,solely_own_assume,wrapper_share,\
+             own_linear_candidate,grouping_hinge,joint_no_single_family_necessity\n",
+        );
+        let mut assume_csv =
+            String::from("program,selector_key,own_assume_necessary,necessary_sites,distributed\n");
+        let programs = CORPUS
+            .iter()
+            .map(|program| program.name)
+            .collect::<Vec<_>>();
+        let mut family_program: BTreeMap<String, BTreeMap<&str, usize>> = BTreeMap::new();
+        let mut sole_own_assume = 0usize;
+        let mut wrapper_share = 0usize;
+        let mut own_linear_candidates = 0usize;
+        let mut grouping_hinges = 0usize;
+        let mut joint = 0usize;
+        let mut distributed_assume = 0usize;
+        for record in &necessity {
+            for family in &record.necessary_families {
+                *family_program
+                    .entry(family.clone())
+                    .or_default()
+                    .entry(record.program.as_str())
+                    .or_default() += 1;
+            }
+            let sole = record.necessary_families.len() == 1
+                && record.necessary_families.contains("own-assume");
+            let wrapper = sole
+                && record
+                    .own_assume_necessary_sites
+                    .contains(AssumeSite::LocalWrapper.as_str());
+            let own_linear = record.necessary_families.contains("own-linear");
+            let grouping = record.necessary_families.contains("kind-equate")
+                || record.necessary_families.contains("link-own");
+            let is_joint = record.necessary_families.is_empty();
+            let own_assume = record.necessary_families.contains("own-assume");
+            let distributed = own_assume && record.own_assume_necessary_sites.is_empty();
+            sole_own_assume += usize::from(sole);
+            wrapper_share += usize::from(wrapper);
+            own_linear_candidates += usize::from(own_linear);
+            grouping_hinges += usize::from(grouping);
+            joint += usize::from(is_joint);
+            distributed_assume += usize::from(distributed);
+            let raw = record
+                .raw_families
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>()
+                .join("+");
+            let necessary_families = record
+                .necessary_families
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>()
+                .join("+");
+            let sites = record
+                .own_assume_necessary_sites
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>()
+                .join("+");
+            selector_csv.push_str(&format!(
+                "{},{},{},{raw},{necessary_families},{:?},{sites},{sole},{wrapper},\
+                 {own_linear},{grouping}\n",
+                record.program, record.selector_key, record.epoch, record.causal_bucket
+            ));
+            causal_csv.push_str(&format!(
+                "{},{},{:?},{sole},{wrapper},{own_linear},{grouping},{is_joint}\n",
+                record.program, record.selector_key, record.causal_bucket
+            ));
+            assume_csv.push_str(&format!(
+                "{},{},{own_assume},{sites},{distributed}\n",
+                record.program, record.selector_key
+            ));
+        }
+        let mut family_program_csv = format!("family,{},total\n", programs.join(","));
+        for family in CORE_LABEL_FAMILIES {
+            let mut total = 0usize;
+            family_program_csv.push_str(family);
+            for program in &programs {
+                let count = family_program
+                    .get(*family)
+                    .and_then(|by_program| by_program.get(*program))
+                    .copied()
+                    .unwrap_or(0);
+                total += count;
+                family_program_csv.push_str(&format!(",{count}"));
+            }
+            family_program_csv.push_str(&format!(",{total}\n"));
+        }
+
+        let mut precision_records = Vec::<FunctionPrecisionRecord>::new();
+        let mut precision_programs = Vec::<ProductionPrecisionEvidence>::new();
+        for program in CORPUS {
+            let row = merged
+                .iter()
+                .find(|row| row.get("program") == Some(program.name))
+                .expect("precision program row");
+            if row
+                .get("prod_precision_status")
+                .is_some_and(|status| status.starts_with("ok"))
+            {
+                let evidence: ProductionPrecisionEvidence =
+                    ownership_diagnostic_package::read_json(&production_precision_path(
+                        program.name,
+                    ))
+                    .unwrap_or_else(|error| panic!("{error}"));
+                precision_records.extend(evidence.functions.iter().cloned());
+                precision_programs.push(evidence);
+            }
+        }
+        precision_records.sort_by(|left, right| {
+            left.program
+                .cmp(&right.program)
+                .then_with(|| left.function.cmp(&right.function))
+        });
+        let production_total = precision_programs
+            .iter()
+            .map(|evidence| evidence.total_owning)
+            .sum::<usize>();
+        if production_failures
+            .iter()
+            .all(|(_, key, _)| *key != "prod_precision_status")
+        {
+            assert_eq!(production_total, 6_515, "production Owning anchor diverged");
+        }
+        let mut precision_csv = String::from(
+            "program,function,required_precision,final_precision,class,owning_locals\n",
+        );
+        for record in &precision_records {
+            precision_csv.push_str(&format!(
+                "{},{},{},{},{:?},{}\n",
+                record.program,
+                record.function,
+                record.required_precision,
+                record.final_precision,
+                record.class,
+                record.owning_locals
+            ));
+        }
+        let mut owning_by_precision_csv = String::from(
+            "program,full_owning,degraded_owning,dummy_owning,field_owning_not_applicable,\
+             total_owning\n",
+        );
+        let mut full_owning = 0usize;
+        let mut degraded_owning = 0usize;
+        let mut dummy_owning = 0usize;
+        let mut field_na = 0usize;
+        for evidence in &precision_programs {
+            let by_class = |class| {
+                evidence
+                    .functions
+                    .iter()
+                    .filter(|record| record.class == class)
+                    .map(|record| record.owning_locals)
+                    .sum::<usize>()
+            };
+            let full = by_class(ownership_diagnostic_package::PrecisionClass::Full);
+            let degraded = by_class(ownership_diagnostic_package::PrecisionClass::Degraded);
+            let dummy = by_class(ownership_diagnostic_package::PrecisionClass::Dummy);
+            full_owning += full;
+            degraded_owning += degraded;
+            dummy_owning += dummy;
+            field_na += evidence.field_owning_not_applicable;
+            owning_by_precision_csv.push_str(&format!(
+                "{},{full},{degraded},{dummy},{},{}\n",
+                evidence.program, evidence.field_owning_not_applicable, evidence.total_owning
+            ));
+        }
+        let functions_total = precision_records.len();
+        let functions_degraded = precision_records
+            .iter()
+            .filter(|record| record.class == ownership_diagnostic_package::PrecisionClass::Degraded)
+            .count();
+        let functions_dummy = precision_records
+            .iter()
+            .filter(|record| record.class == ownership_diagnostic_package::PrecisionClass::Dummy)
+            .count();
+
+        let mut boxes = Vec::<BoxDecisionEvidence>::new();
+        for program in CORPUS {
+            let row = merged
+                .iter()
+                .find(|row| row.get("program") == Some(program.name))
+                .expect("Box program row");
+            if row
+                .get("prod_box_status")
+                .is_some_and(|status| status.starts_with("ok"))
+            {
+                boxes.push(
+                    ownership_diagnostic_package::read_json(&production_box_path(program.name))
+                        .unwrap_or_else(|error| panic!("{error}")),
+                );
+            }
+        }
+        let mut box_csv =
+            String::from("program,locals,params,returns,fields,total,d0_locals_only\n");
+        let mut box_total = ownership_diagnostic_package::BoxDecisionCounts::default();
+        for evidence in &boxes {
+            let counts = evidence.counts;
+            box_total.locals += counts.locals;
+            box_total.params += counts.params;
+            box_total.returns += counts.returns;
+            box_total.fields += counts.fields;
+            box_total.d0_locals += counts.d0_locals;
+            box_csv.push_str(&format!(
+                "{},{},{},{},{},{},{}\n",
+                evidence.program,
+                counts.locals,
+                counts.params,
+                counts.returns,
+                counts.fields,
+                counts.locals + counts.params + counts.returns + counts.fields,
+                counts.d0_locals,
+            ));
+        }
+
+        let mut status_csv = String::from(
+            "program,official_status,official_wall_s,necessity_status,necessity_first_wall_s,\
+             necessity_retry_wall_s,necessity_total_wall_s,prod_precision_status,\
+             prod_precision_first_wall_s,prod_precision_retry_wall_s,prod_precision_total_wall_s,\
+             prod_box_status,prod_box_first_wall_s,prod_box_retry_wall_s,prod_box_total_wall_s\n",
+        );
+        for row in &merged {
+            status_csv.push_str(&format!(
+                "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}\n",
+                row.get("program").unwrap_or("-"),
+                row.get("status").unwrap_or("-"),
+                row.get("bo_wall_s").unwrap_or("-"),
+                row.get("necessity_status").unwrap_or("-"),
+                row.get("necessity_first_wall_s").unwrap_or("-"),
+                row.get("necessity_retry_wall_s").unwrap_or("-"),
+                row.get("necessity_wall_s").unwrap_or("-"),
+                row.get("prod_precision_status").unwrap_or("-"),
+                row.get("prod_precision_first_wall_s").unwrap_or("-"),
+                row.get("prod_precision_retry_wall_s").unwrap_or("-"),
+                row.get("prod_precision_wall_s").unwrap_or("-"),
+                row.get("prod_box_status").unwrap_or("-"),
+                row.get("prod_box_first_wall_s").unwrap_or("-"),
+                row.get("prod_box_retry_wall_s").unwrap_or("-"),
+                row.get("prod_box_wall_s").unwrap_or("-"),
+            ));
+        }
+
+        fs::write(
+            out_dir().join("selector-family-necessity.csv"),
+            &selector_csv,
+        )
+        .expect("write selector-family necessity");
+        fs::write(
+            out_dir().join("family-program-necessity.csv"),
+            &family_program_csv,
+        )
+        .expect("write family-program necessity");
+        fs::write(out_dir().join("assume-site-necessity.csv"), &assume_csv)
+            .expect("write assume-site necessity");
+        fs::write(out_dir().join("causal-partition.csv"), &causal_csv)
+            .expect("write causal partition");
+        fs::write(
+            out_dir().join("production-function-precision.csv"),
+            &precision_csv,
+        )
+        .expect("write production function precision");
+        fs::write(
+            out_dir().join("production-owning-by-precision.csv"),
+            &owning_by_precision_csv,
+        )
+        .expect("write production owning by precision");
+        fs::write(out_dir().join("production-box-decisions.csv"), &box_csv)
+            .expect("write production Box decisions");
+        fs::write(out_dir().join("status-timing.csv"), &status_csv)
+            .expect("write diagnostic status and timing");
+        let joint_followup = if joint == 0 {
+            String::new()
+        } else {
+            "\n## Joint-cause follow-up\n\n\
+             Because the joint/no-single-family bucket is nonempty, pairwise \
+             family-removal probing is a recorded follow-up option. It was not \
+             executed in this task.\n"
+                .to_string()
+        };
+        fs::write(
+            out_dir().join("ownership-diagnostic-package-report.md"),
+            format!(
+                "# Ownership diagnostic package\n\n\
+                 - Contract: frozen rs-crown; Mode-A; L2 off; smt.random_seed=0; \
+                   sat.random_seed=0; serialized; official workers 900 s; diagnostic and \
+                   production workers 1800 s; one 3600 s retry; 8192 MiB.\n\
+                 - Baseline: 20/20 accept; n_ref=52,810; n_own=230; source leaks=114/144; \
+                   sink leaks=170/206.\n\
+                 - Necessity coverage: {}/114 (uncovered resource-deferred: {}).\n\
+                 - Solely own-assume: {sole_own_assume}; local-wrapper share: {wrapper_share}; \
+                   own-linear candidates: {own_linear_candidates}; grouping hinges: \
+                   {grouping_hinges}; joint/no-single-family necessity: {joint}; \
+                   distributed own-assume sites: {distributed_assume}.\n\
+                 - Production precision coverage: {}/20 programs; functions: {functions_total}; \
+                   degraded: {functions_degraded}; dummy: {functions_dummy}; Owning claims by \
+                   function precision full/degraded/dummy={full_owning}/{degraded_owning}/\
+                   {dummy_owning}; fields not applicable={field_na}; covered production Owning \
+                   total={production_total}.\n\
+                 - Production end-to-end Box-family coverage: {}/20 programs; \
+                   locals/params/returns/fields={}/{}/{}/{}; total={}; \
+                   d0-locals-only={}.\n\
+                 - Production failures: {:?}.\n\
+                 {joint_followup}",
+                necessity.len(),
+                uncovered_sources,
+                precision_programs.len(),
+                boxes.len(),
+                box_total.locals,
+                box_total.params,
+                box_total.returns,
+                box_total.fields,
+                box_total.locals + box_total.params + box_total.returns + box_total.fields,
+                box_total.d0_locals,
+                production_failures,
+            ),
+        )
+        .expect("write ownership diagnostic package report");
     }
 
     println!("\n{}", render_report(&merged));

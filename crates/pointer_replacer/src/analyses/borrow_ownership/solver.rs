@@ -6,10 +6,9 @@ use std::{
 use rustc_hash::FxHashMap;
 use rustc_index::IndexVec;
 use rustc_span::def_id::LocalDefId;
-use z3::{Model, Optimize, SatResult, ast::Bool};
+use z3::{ast::Bool, Model, Optimize, SatResult};
 
 use super::{
-    SlotKind,
     crate_slots::CrateSlots,
     l2::{
         CommitAction, CommitActionKind, GUARDED_COMMIT_CORE_FAMILY,
@@ -17,6 +16,7 @@ use super::{
     },
     slots::{SlotId, SlotUniverse},
     ssa::constraint::{Database, Gen, Var},
+    SlotKind,
 };
 
 /// Global identity for a flattened pointer slot.
@@ -162,11 +162,74 @@ pub(crate) const CORE_LABEL_FAMILIES: &[&str] = &[
     "sink-selector",
 ];
 
-fn core_label_family(label: &str) -> Option<&'static str> {
+pub(crate) fn core_label_family(label: &str) -> Option<&'static str> {
     CORE_LABEL_FAMILIES
         .iter()
         .copied()
         .find(|family| label.contains(family))
+}
+
+/// Diagnosis-only provenance for hard `own-assume` constraints. The wrappers
+/// are present in normal builds but inline to a direct call; only the test-only
+/// corpus harness stores or reads the thread-local tag.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum OwnAssumeSite {
+    OpaqueCallArg,
+    LibcRule,
+    LocalWrapper,
+    SsaTransfer,
+    TemporaryFinalization,
+    CastOrDepth,
+    OtherInternal,
+}
+
+impl OwnAssumeSite {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::OpaqueCallArg => "opaque-call-arg",
+            Self::LibcRule => "libc-rule",
+            Self::LocalWrapper => "local-wrapper",
+            Self::SsaTransfer => "ssa-transfer",
+            Self::TemporaryFinalization => "temporary-finalization",
+            Self::CastOrDepth => "cast-or-depth",
+            Self::OtherInternal => "other-internal",
+        }
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static OWN_ASSUME_SITE: Cell<OwnAssumeSite> =
+        const { Cell::new(OwnAssumeSite::OtherInternal) };
+}
+
+#[cfg(test)]
+pub(crate) fn with_own_assume_site<T>(site: OwnAssumeSite, f: impl FnOnce() -> T) -> T {
+    struct Restore(OwnAssumeSite);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            OWN_ASSUME_SITE.with(|slot| slot.set(self.0));
+        }
+    }
+    let _restore = Restore(OWN_ASSUME_SITE.with(|slot| slot.replace(site)));
+    f()
+}
+
+#[cfg(not(test))]
+#[inline]
+pub(crate) fn with_own_assume_site<T>(_site: OwnAssumeSite, f: impl FnOnce() -> T) -> T {
+    f()
+}
+
+#[cfg(test)]
+pub(crate) fn current_own_assume_site() -> OwnAssumeSite {
+    OWN_ASSUME_SITE.with(Cell::get)
+}
+
+#[cfg(not(test))]
+#[inline]
+pub(crate) fn current_own_assume_site() -> OwnAssumeSite {
+    OwnAssumeSite::OtherInternal
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -631,7 +694,7 @@ impl KindSolver {
         self.check_sat_count.get()
     }
 
-    fn check_with_assumptions(&self, assumptions: &[Bool]) -> SatResult {
+    pub(crate) fn check_with_assumptions(&self, assumptions: &[Bool]) -> SatResult {
         self.check_sat_count
             .set(self.check_sat_count.get().saturating_add(1));
         self.solver.check(assumptions)
@@ -1023,6 +1086,18 @@ fn assert_hard(
     label: impl FnOnce() -> String,
     constraint: &Bool,
 ) {
+    #[cfg(test)]
+    if crate::bo_c1::ownership_diagnostic_package::removal_filter_active() {
+        assert!(
+            tracker.is_none(),
+            "family-removal diagnosis must remain untracked"
+        );
+        if crate::bo_c1::ownership_diagnostic_package::suppresses_label(label) {
+            return;
+        }
+        solver.assert(constraint);
+        return;
+    }
     match tracker {
         None => solver.assert(constraint),
         Some(tracker) => {
@@ -1163,6 +1238,12 @@ impl Database for BoOwnDatabase<'_> {
     }
 
     fn push_assume_impl(&mut self, x: Var, sign: bool) {
+        #[cfg(test)]
+        let label = || {
+            let site = current_own_assume_site();
+            format!("own-assume[{}]({x:?}={sign})", site.as_str())
+        };
+        #[cfg(not(test))]
         let label = || format!("own-assume({x:?}={sign})");
         let x = &self.z3_ast[x];
         let value = Bool::from_bool(sign);

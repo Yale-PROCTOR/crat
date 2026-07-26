@@ -17,6 +17,7 @@ use super::{AnalysisKind, Precision};
 use crate::analyses::borrow_ownership::{
     assoc::AssocExt,
     ptr::{decompose_ty, Measurable},
+    solver::{with_own_assume_site, OwnAssumeSite},
     ssa::{
         constraint::{
             infer::{InferMode, Renamer},
@@ -574,42 +575,35 @@ where
     ) {
         tracing::debug!("transfer relation: {:?} ~ {:?}", lhs_result, rhs_result);
 
-        matcher(
-            ty,
-            lhs_result.transpose(),
-            rhs_result.transpose(),
-            infer_cx.struct_ctxt,
-            infer_cx.database,
-            |lhs, rhs, database| {
-                database.push_assume::<crate::analyses::borrow_ownership::ssa::constraint::Debug>(
-                    (),
-                    lhs.r#use,
-                    false,
-                );
-                if ENSURE_MOVE {
-                    database
-                        .push_equal::<crate::analyses::borrow_ownership::ssa::constraint::Debug>(
-                            (),
-                            lhs.def,
-                            rhs.r#use,
-                        );
+        with_own_assume_site(OwnAssumeSite::SsaTransfer, || {
+            matcher(
+                ty,
+                lhs_result.transpose(),
+                rhs_result.transpose(),
+                infer_cx.struct_ctxt,
+                infer_cx.database,
+                |lhs, rhs, database| {
                     database
                         .push_assume::<crate::analyses::borrow_ownership::ssa::constraint::Debug>(
                             (),
-                            rhs.def,
+                            lhs.r#use,
                             false,
                         );
-                } else {
-                    database
-                        .push_linear::<crate::analyses::borrow_ownership::ssa::constraint::Debug>(
-                            (),
-                            lhs.def,
-                            rhs.def,
-                            rhs.r#use,
-                        )
-                }
-            },
-        )
+                    if ENSURE_MOVE {
+                        database.push_equal::<
+                            crate::analyses::borrow_ownership::ssa::constraint::Debug,
+                        >((), lhs.def, rhs.r#use);
+                        database.push_assume::<
+                            crate::analyses::borrow_ownership::ssa::constraint::Debug,
+                        >((), rhs.def, false);
+                    } else {
+                        database.push_linear::<
+                            crate::analyses::borrow_ownership::ssa::constraint::Debug,
+                        >((), lhs.def, rhs.def, rhs.r#use)
+                    }
+                },
+            )
+        })
     }
 
     fn cast<const ENSURE_MOVE: bool>(
@@ -722,11 +716,15 @@ where
                 match infer_cx.tcx.hir_node_by_def_id(local_did) {
                     // this crate
                     rustc_hir::Node::Item(_) => {
-                        <Analysis as Boundary>::call(infer_cx, destination, &args, callee)
+                        with_own_assume_site(OwnAssumeSite::LocalWrapper, || {
+                            <Analysis as Boundary>::call(infer_cx, destination, &args, callee)
+                        })
                     }
                     // extern
                     rustc_hir::Node::ForeignItem(foreign_item) => {
-                        infer_cx.libc_call(destination, &args, callee, foreign_item.ident)
+                        with_own_assume_site(OwnAssumeSite::LibcRule, || {
+                            infer_cx.libc_call(destination, &args, callee, foreign_item.ident)
+                        })
                     }
                     // in libxml2.rust/src/xmlschemastypes.rs/{} impl_xmlSchemaValDate/set_mon
                     rustc_hir::Node::ImplItem(_) => { /* TODO */ }
@@ -775,20 +773,22 @@ where
         );
 
         // finalize temporaries
-        for vars in locals {
-            let Some(vars) = vars else {
-                continue;
-            };
-            for var in vars {
-                infer_cx
-                    .database
-                    .push_assume::<crate::analyses::borrow_ownership::ssa::constraint::Debug>(
-                        (),
-                        var,
-                        false,
-                    )
+        with_own_assume_site(OwnAssumeSite::TemporaryFinalization, || {
+            for vars in locals {
+                let Some(vars) = vars else {
+                    continue;
+                };
+                for var in vars {
+                    infer_cx
+                        .database
+                        .push_assume::<crate::analyses::borrow_ownership::ssa::constraint::Debug>(
+                            (),
+                            var,
+                            false,
+                        )
+                }
             }
-        }
+        });
     }
 
     fn cast_to_c_void(
@@ -797,7 +797,9 @@ where
     ) -> Consume<Self::LocalSig> {
         consume.repack(|sigs| {
             let (outter, inner) = (sigs.start..sigs.start + 1u32, sigs.start + 1u32..sigs.end);
-            Self::assume(infer_cx, inner, false);
+            with_own_assume_site(OwnAssumeSite::CastOrDepth, || {
+                Self::assume(infer_cx, inner, false);
+            });
             outter
         })
     }
