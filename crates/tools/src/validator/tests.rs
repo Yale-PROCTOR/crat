@@ -1,13 +1,46 @@
 use super::*;
 
-fn request(skeleton: &str, transformation: &str) -> ValidationRequest {
+fn expected_function(id: u64, name: &str, skeleton: &str) -> ExpectedFunction {
+    let mut labels = skeleton
+        .match_indices("#[proctor(")
+        .filter_map(|(start, _)| {
+            let value = &skeleton[start + "#[proctor(".len()..];
+            value[..value.find(')')?].parse::<u32>().ok()
+        })
+        .collect::<Vec<_>>();
+    labels.sort_unstable();
+    labels.dedup();
+    ExpectedFunction {
+        id,
+        name: name.to_owned(),
+        skeleton: skeleton.to_owned(),
+        needs_transformation: !labels.is_empty(),
+        statements_requiring_transformation: labels,
+    }
+}
+
+fn preservation_request(
+    skeleton: &str,
+    transformed: Vec<u32>,
+    transformation: &str,
+) -> ValidationRequest {
     ValidationRequest {
         schema_version: 1,
         expected_functions: vec![ExpectedFunction {
             id: 7,
             name: "f".to_owned(),
             skeleton: skeleton.to_owned(),
+            needs_transformation: !transformed.is_empty(),
+            statements_requiring_transformation: transformed,
         }],
+        transformation: transformation.to_owned(),
+    }
+}
+
+fn request(skeleton: &str, transformation: &str) -> ValidationRequest {
+    ValidationRequest {
+        schema_version: 1,
+        expected_functions: vec![expected_function(7, "f", skeleton)],
         transformation: transformation.to_owned(),
     }
 }
@@ -45,9 +78,143 @@ fn assert_codes(skeleton: &str, transformation: &str, expected: &[&str]) {
 const UNIT_SKELETON: &str = "unsafe fn f() { #[proctor(0)] todo!(); }";
 
 #[test]
+fn amendment_2_preserved_leaf_and_expansion_group_are_canonicalized() {
+    let skeleton = "unsafe fn f(value: i32) -> i32 { #[proctor(0)] value + 1 }";
+    for transformation in [
+        "unsafe fn f(value: i32) -> i32 { #[proctor(0)] 999 }",
+        "unsafe fn f(value: i32) -> i32 { #[proctor(0)] let proctor_temp_var_0 = value * 100; #[proctor(0)] proctor_temp_var_0 }",
+    ] {
+        assert_eq!(
+            validate(&preservation_request(skeleton, vec![], transformation)),
+            ValidationResponse::Valid
+        );
+    }
+}
+
+#[test]
+fn amendment_2_preserved_parent_is_opaque_after_outer_alignment() {
+    let skeleton = "unsafe fn f(flag: bool) -> i32 { #[proctor(0)] if flag { #[proctor(1)] let value: i32 = 1; #[proctor(2)] value } else { #[proctor(3)] 2 } }";
+    let transformation = "unsafe fn f(flag: bool) -> i32 { #[proctor(0)] return 999; }";
+    assert_eq!(
+        validate(&preservation_request(skeleton, vec![], transformation)),
+        ValidationResponse::Valid
+    );
+}
+
+#[test]
+fn amendment_2_preserved_child_requires_unique_control_anchor() {
+    let skeleton = "unsafe fn f(flag: bool, pointer: *mut i32) { #[proctor(0)] if flag { #[proctor(1)] let nested: i32 = 1; #[proctor(2)] (*pointer = nested); } else { #[proctor(3)] return; } }";
+    let valid = "unsafe fn f(flag: bool, pointer: *mut i32) { #[proctor(0)] let proctor_temp_var_0 = flag; #[proctor(0)] if proctor_temp_var_0 { #[proctor(1)] let nested: i32 = 99; #[proctor(2)] (*pointer = nested); } else { #[proctor(3)] return; } }";
+    assert_eq!(
+        validate(&preservation_request(skeleton, vec![0, 2], valid)),
+        ValidationResponse::Valid
+    );
+    let misplaced = "unsafe fn f(flag: bool, pointer: *mut i32) { #[proctor(0)] if flag { #[proctor(2)] (*pointer = 7); } else { #[proctor(1)] let nested: i32 = 99; #[proctor(3)] return; } }";
+    assert_eq!(
+        codes(&validate(&preservation_request(
+            skeleton,
+            vec![0, 2],
+            misplaced
+        ))),
+        ["descendant_location_mismatch"]
+    );
+    let missing = "unsafe fn f(flag: bool, pointer: *mut i32) { #[proctor(0)] let proctor_temp_var_0 = flag; }";
+    assert_eq!(
+        codes(&validate(&preservation_request(
+            skeleton,
+            vec![0, 2],
+            missing
+        ))),
+        ["missing_control_root"]
+    );
+    let multiple = "unsafe fn f(flag: bool, pointer: *mut i32) { #[proctor(0)] if flag { #[proctor(1)] let nested: i32 = 1; #[proctor(2)] (*pointer = nested); } else { #[proctor(3)] return; } #[proctor(0)] if flag { #[proctor(1)] let nested: i32 = 2; #[proctor(2)] (*pointer = nested); } else { #[proctor(3)] return; } }";
+    assert_eq!(
+        codes(&validate(&preservation_request(
+            skeleton,
+            vec![0, 2],
+            multiple
+        ))),
+        ["multiple_control_roots"]
+    );
+}
+
+#[test]
+fn amendment_2_invalid_preservation_metadata_is_setup_error() {
+    let skeleton = "unsafe fn f() { #[proctor(0)] if true { #[proctor(1)] return; } }";
+    for (needs, labels, code) in [
+        (false, vec![0], "invalid_expected_skeleton"),
+        (true, vec![0, 0], "invalid_expected_skeleton"),
+        (true, vec![2], "invalid_expected_skeleton"),
+        (true, vec![1], "invalid_expected_skeleton"),
+    ] {
+        let response = validate(&ValidationRequest {
+            schema_version: 1,
+            expected_functions: vec![ExpectedFunction {
+                id: 7,
+                name: "f".to_owned(),
+                skeleton: skeleton.to_owned(),
+                needs_transformation: needs,
+                statements_requiring_transformation: labels,
+            }],
+            transformation: "unsafe fn f() { #[proctor(0)] if true { #[proctor(1)] return; } }"
+                .to_owned(),
+        });
+        assert_eq!(codes(&response), [code], "{response:?}");
+    }
+}
+
+#[test]
+fn amendment_2_discarded_errors_do_not_leak_but_external_temporary_use_does() {
+    let skeleton = "unsafe fn f(value: i32, pointer: *mut i32) -> i32 { #[proctor(0)] let scalar: i32 = value + 1; #[proctor(1)] (*pointer = scalar); #[proctor(2)] scalar }";
+    let discarded = "unsafe fn f(value: i32, pointer: *mut i32) -> i32 { #[proctor(0)] #[allow(unused_variables)] unsafe { const LOCAL: i32 = 100; let wrong_name = value + LOCAL; wrong_name }; #[proctor(1)] (*pointer = value + 1); #[proctor(2)] 999 }";
+    assert_eq!(
+        validate(&preservation_request(skeleton, vec![1], discarded)),
+        ValidationResponse::Valid
+    );
+    let escaping = "unsafe fn f(value: i32, pointer: *mut i32) -> i32 { #[proctor(0)] let proctor_temp_var_0 = value + 1; #[proctor(1)] (*pointer = proctor_temp_var_0); #[proctor(2)] 999 }";
+    let response = validate(&preservation_request(skeleton, vec![1], escaping));
+    assert!(
+        codes(&response).contains(&"temporary_outside_expansion_group"),
+        "{response:?}"
+    );
+}
+
+#[test]
+fn amendment_2_preserved_outer_alignment_keeps_stable_label_errors() {
+    let skeleton = "unsafe fn f(value: i32) -> i32 { #[proctor(0)] let first: i32 = value + 1; #[proctor(1)] first + 2 }";
+    for (transformation, code) in [
+        (
+            "unsafe fn f(value: i32) -> i32 { #[proctor(1)] value + 2 }",
+            "missing_label",
+        ),
+        (
+            "unsafe fn f(value: i32) -> i32 { #[proctor(00)] let first: i32 = value + 1; #[proctor(1)] first + 2 }",
+            "malformed_label",
+        ),
+        (
+            "unsafe fn f(value: i32) -> i32 { #[proctor(1)] value + 2; #[proctor(0)] let first: i32 = value + 1; }",
+            "label_order_mismatch",
+        ),
+        (
+            "unsafe fn f(value: i32) -> i32 { #[proctor(0)] let first: i32 = value + 1; #[proctor(1)] first + 2; #[proctor(0)] let second: i32 = value + 3; }",
+            "nonconsecutive_label",
+        ),
+    ] {
+        assert_eq!(
+            codes(&validate(&preservation_request(
+                skeleton,
+                vec![],
+                transformation
+            ))),
+            [code]
+        );
+    }
+}
+
+#[test]
 fn valid_response_has_explicit_status() {
     let response = validate_json(
-        r#"{"schema_version":1,"expected_functions":[{"id":7,"name":"f","skeleton":"unsafe fn f() { #[proctor(0)] todo!(); }"}],"transformation":"unsafe fn f() { #[proctor(0)] return; }"}"#,
+        r#"{"schema_version":1,"expected_functions":[{"id":7,"name":"f","skeleton":"unsafe fn f() { #[proctor(0)] todo!(); }","needs_transformation":true,"statements_requiring_transformation":[0]}],"transformation":"unsafe fn f() { #[proctor(0)] return; }"}"#,
     );
     assert_eq!(
         response,
@@ -83,7 +250,7 @@ fn setup_error_matches_schema_and_key_order() {
 fn json_round_trip_preserves_embedded_rust() {
     let input = r#"{
   "schema_version": 1,
-  "expected_functions": [{"id":7,"name":"f","skeleton":"unsafe fn f() -> &'static str {\n #[proctor(0)]\n todo!()\n}"}],
+  "expected_functions": [{"id":7,"name":"f","skeleton":"unsafe fn f() -> &'static str {\n #[proctor(0)]\n todo!()\n}","needs_transformation":true,"statements_requiring_transformation":[0]}],
   "transformation":"unsafe fn f() -> &'static str {\n #[proctor(0)]\n \"quote:\\\" slash:\\\\ line:\\n\"\n}"
 }"#;
     assert!(validate_json(input).contains("\"status\": \"valid\""));
@@ -128,7 +295,7 @@ fn malformed_request_json_is_setup_error() {
 #[test]
 fn unknown_request_field_is_setup_error() {
     let response = validate_json(
-        r#"{"schema_version":1,"expected_functions":[{"id":7,"name":"f","skeleton":"unsafe fn f() { #[proctor(0)] todo!(); }"}],"transformation":"unsafe fn f() { #[proctor(0)] return; }","extra":true}"#,
+        r#"{"schema_version":1,"expected_functions":[{"id":7,"name":"f","skeleton":"unsafe fn f() { #[proctor(0)] todo!(); }","needs_transformation":true,"statements_requiring_transformation":[0]}],"transformation":"unsafe fn f() { #[proctor(0)] return; }","extra":true}"#,
     );
     assert!(response.contains("\"code\": \"unknown_request_field\""));
 }
@@ -146,22 +313,20 @@ fn empty_expected_function_list_is_setup_error() {
 #[test]
 fn duplicate_expected_ids_are_setup_error() {
     let mut request = request(UNIT_SKELETON, "unsafe fn f() {}");
-    request.expected_functions.push(ExpectedFunction {
-        id: 7,
-        name: "g".to_owned(),
-        skeleton: "unsafe fn g() { #[proctor(0)] todo!(); }".to_owned(),
-    });
+    request.expected_functions.push(expected_function(
+        7,
+        "g",
+        "unsafe fn g() { #[proctor(0)] todo!(); }",
+    ));
     assert_eq!(codes(&validate(&request)), ["duplicate_expected_id"]);
 }
 
 #[test]
 fn duplicate_expected_names_are_setup_error() {
     let mut request = request(UNIT_SKELETON, "unsafe fn f() {}");
-    request.expected_functions.push(ExpectedFunction {
-        id: 8,
-        name: "f".to_owned(),
-        skeleton: UNIT_SKELETON.to_owned(),
-    });
+    request
+        .expected_functions
+        .push(expected_function(8, "f", UNIT_SKELETON));
     assert_eq!(codes(&validate(&request)), ["duplicate_expected_name"]);
 }
 
@@ -235,11 +400,11 @@ fn result_parse_error_is_global() {
 #[test]
 fn missing_expected_function_is_global() {
     let mut request = request(UNIT_SKELETON, "unsafe fn f() { #[proctor(0)] return; }");
-    request.expected_functions.push(ExpectedFunction {
-        id: 8,
-        name: "g".to_owned(),
-        skeleton: "unsafe fn g() { #[proctor(0)] todo!(); }".to_owned(),
-    });
+    request.expected_functions.push(expected_function(
+        8,
+        "g",
+        "unsafe fn g() { #[proctor(0)] todo!(); }",
+    ));
     assert_eq!(codes(&validate(&request)), ["missing_function"]);
 }
 
@@ -283,16 +448,12 @@ fn result_function_order_is_irrelevant() {
     let request = ValidationRequest {
         schema_version: 1,
         expected_functions: vec![
-            ExpectedFunction {
-                id: 7,
-                name: "f".to_owned(),
-                skeleton: UNIT_SKELETON.to_owned(),
-            },
-            ExpectedFunction {
-                id: 8,
-                name: "r#match".to_owned(),
-                skeleton: "unsafe fn r#match() { #[proctor(0)] todo!(); }".to_owned(),
-            },
+            expected_function(7, "f", UNIT_SKELETON),
+            expected_function(
+                8,
+                "r#match",
+                "unsafe fn r#match() { #[proctor(0)] todo!(); }",
+            ),
         ],
         transformation:
             "unsafe fn r#match() { #[proctor(0)] return; } unsafe fn f() { #[proctor(0)] return; }"
@@ -470,16 +631,16 @@ fn generic_mismatch_aggregates_in_request_order() {
     let request = ValidationRequest {
         schema_version: 1,
         expected_functions: vec![
-            ExpectedFunction {
-                id: 7,
-                name: "first".to_owned(),
-                skeleton: "unsafe fn first<'a>(mut input: &'a i32) -> &'a i32 { #[proctor(0)] todo!() }".to_owned(),
-            },
-            ExpectedFunction {
-                id: 8,
-                name: "second".to_owned(),
-                skeleton: "unsafe fn second<'x, 'y>(mut input: &'x i32, mut fallback: &'y i32) -> &'x i32 { #[proctor(0)] todo!() }".to_owned(),
-            },
+            expected_function(
+                7,
+                "first",
+                "unsafe fn first<'a>(mut input: &'a i32) -> &'a i32 { #[proctor(0)] todo!() }",
+            ),
+            expected_function(
+                8,
+                "second",
+                "unsafe fn second<'x, 'y>(mut input: &'x i32, mut fallback: &'y i32) -> &'x i32 { #[proctor(0)] todo!() }",
+            ),
         ],
         transformation: r#"
 unsafe fn second<'y, 'x>(input: &'x i32, fallback: &'y i32) -> &'x i32 {
@@ -1471,19 +1632,19 @@ fn deep_multi_function_request_reports_only_failing_items() {
     let request = ValidationRequest {
         schema_version: 1,
         expected_functions: vec![
-            ExpectedFunction {
-                id: 7,
-                name: "leaf".to_owned(),
-                skeleton: "unsafe fn leaf(mut p: Option<&i32>) -> i32 { #[proctor(0)] let mut x: i32 = todo!(); #[proctor(1)] todo!() }".to_owned(),
-            },
-            ExpectedFunction {
-                id: 8,
-                name: "driver".to_owned(),
-                skeleton: r#"unsafe fn driver(mut flag: bool, mut p: Option<&i32>) -> i32 {
+            expected_function(
+                7,
+                "leaf",
+                "unsafe fn leaf(mut p: Option<&i32>) -> i32 { #[proctor(0)] let mut x: i32 = todo!(); #[proctor(1)] todo!() }",
+            ),
+            expected_function(
+                8,
+                "driver",
+                r#"unsafe fn driver(mut flag: bool, mut p: Option<&i32>) -> i32 {
 #[proctor(0)] let mut result: i32 = if todo!() { #[proctor(1)] todo!() } else { #[proctor(2)] todo!() };
 #[proctor(3)] match todo!() { 0 => { #[proctor(4)] todo!() } _ => { #[proctor(5)] todo!() } }
-}"#.to_owned(),
-            },
+}"#,
+            ),
         ],
         transformation: r#"unsafe fn driver(flag: bool, p: Option<&i32>) -> i32 {
 #[proctor(0)] let result: i32 = if flag { #[proctor(2)] 0 } else { #[proctor(1)] leaf(p) };
@@ -1492,7 +1653,8 @@ fn deep_multi_function_request_reports_only_failing_items() {
 unsafe fn leaf(p: Option<&i32>) -> i32 {
 #[proctor(0)] let x: i32 = *p.unwrap();
 #[proctor(1)] x
-}"#.to_owned(),
+}"#
+        .to_owned(),
     };
     let ValidationResponse::Invalid { failures } = validate(&request) else {
         panic!("expected invalid response");

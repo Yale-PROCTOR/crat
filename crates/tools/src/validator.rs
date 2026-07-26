@@ -13,6 +13,8 @@ use rustc_ast::{
 use rustc_ast_pretty::pprust;
 use serde::{Deserialize, Serialize, ser::SerializeStruct};
 
+use crate::preservation::{canonicalize_function, validate_preservation_metadata};
+
 const SCHEMA_VERSION: u64 = 1;
 const TEMP_PREFIX: &str = "proctor_temp_var_";
 
@@ -30,6 +32,8 @@ pub struct ExpectedFunction {
     pub id: u64,
     pub name: String,
     pub skeleton: String,
+    pub needs_transformation: bool,
+    pub statements_requiring_transformation: Vec<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -373,6 +377,17 @@ fn validate_expected_skeleton(item: &Item, entry: &ExpectedFunction) -> Result<(
             ));
         }
     }
+    validate_preservation_metadata(
+        item,
+        entry.needs_transformation,
+        &entry.statements_requiring_transformation,
+    )
+    .map_err(|error| {
+        format!(
+            "Expected skeleton for `{}` (item {}) has invalid preservation metadata: {}",
+            entry.name, entry.id, error.message
+        )
+    })?;
     validate_expected_block(body).map_err(|detail| {
         format!(
             "Expected skeleton for `{}` (item {}) has an invalid Phase 1 control/statement tree: {detail}",
@@ -587,7 +602,26 @@ fn item_kind_name(item: &Item) -> &'static str {
 fn validate_function(expected: &ParsedExpected, result: &Item) -> Vec<ValidationError> {
     let signature_errors = validate_signature(expected, result);
     let ItemKind::Fn(box expected_fn) = &expected.item.kind else { unreachable!() };
-    let ItemKind::Fn(box result_fn) = &result.kind else { unreachable!() };
+    let ItemKind::Fn(box returned_fn) = &result.kind else { unreachable!() };
+    let mut returned_scan = BodyScanner::new(false);
+    returned_scan.visit_block(returned_fn.body.as_ref().unwrap());
+    let canonical = match canonicalize_function(
+        &expected.item,
+        result,
+        expected.metadata.needs_transformation,
+        &expected.metadata.statements_requiring_transformation,
+    ) {
+        Ok(canonical) => canonical,
+        Err(problem) => {
+            let mut errors = signature_errors;
+            errors.push(error(
+                problem.code,
+                function_message(expected, problem.message),
+            ));
+            return errors;
+        }
+    };
+    let ItemKind::Fn(box result_fn) = &canonical.kind else { unreachable!() };
     let expected_body = expected_fn.body.as_ref().unwrap();
     let result_body = result_fn.body.as_ref().unwrap();
 
@@ -637,9 +671,10 @@ fn validate_function(expected: &ParsedExpected, result: &Item) -> Vec<Validation
 
     validate_temporaries(
         expected,
-        result,
+        &canonical,
         &expected_scan,
         &result_scan,
+        &returned_scan,
         &mut temporary_errors,
     );
 
@@ -2717,6 +2752,7 @@ enum ScopedTempProblem {
 struct LexicalTempScanner<'a> {
     existing_names: &'a HashSet<String>,
     reliable_declarations: &'a HashMap<&'a str, Option<u32>>,
+    discarded_declarations: &'a HashSet<&'a str>,
     unreliable_names: &'a HashSet<&'a str>,
     scopes: Vec<HashSet<String>>,
     current_label: Option<u32>,
@@ -2849,6 +2885,14 @@ impl<'ast> Visitor<'ast> for LexicalTempScanner<'_> {
                     });
                     return;
                 }
+                if self.discarded_declarations.contains(name.as_str()) {
+                    self.outside_group.push(ScopedTempProblem::OutsideGroup {
+                        name,
+                        declaration_label: declaration_label.flatten(),
+                        reference_label: self.current_label,
+                    });
+                    return;
+                }
                 if !self.is_active(&name) {
                     self.unresolved.push(ScopedTempProblem::Unresolved {
                         name,
@@ -2875,6 +2919,7 @@ fn validate_temporaries(
     result: &Item,
     expected_scan: &BodyScanner,
     result_scan: &BodyScanner,
+    returned_scan: &BodyScanner,
     errors: &mut Vec<ValidationError>,
 ) {
     let ItemKind::Fn(box expected_function) = &expected.item.kind else { unreachable!() };
@@ -2929,10 +2974,30 @@ fn validate_temporaries(
         .filter(|binding| !unreliable_names.contains(binding.name.as_str()))
         .map(|binding| (binding.name.as_str(), binding.label))
         .collect::<HashMap<_, _>>();
+    let discarded_declarations = returned_scan
+        .bindings
+        .iter()
+        .filter(|binding| {
+            is_temp_name(&binding.name)
+                && !expected_names.contains(binding.name.as_str())
+                && !reliable_declarations.contains_key(binding.name.as_str())
+        })
+        .map(|binding| binding.name.as_str())
+        .collect::<HashSet<_>>();
+    let returned_declarations = returned_scan
+        .bindings
+        .iter()
+        .filter(|binding| discarded_declarations.contains(binding.name.as_str()))
+        .map(|binding| (binding.name.as_str(), binding.label));
+    let reliable_declarations = reliable_declarations
+        .into_iter()
+        .chain(returned_declarations)
+        .collect::<HashMap<_, _>>();
     let ItemKind::Fn(box result_function) = &result.kind else { unreachable!() };
     let mut scanner = LexicalTempScanner {
         existing_names: &expected_names,
         reliable_declarations: &reliable_declarations,
+        discarded_declarations: &discarded_declarations,
         unreliable_names: &unreliable_names,
         scopes: vec![],
         current_label: None,

@@ -7,6 +7,18 @@ fn generate(source: &str) -> Vec<ItemRecord> {
     run_compiler_on_str(source, |tcx| make_skeletons(source, tcx).unwrap()).unwrap()
 }
 
+fn local_def(name: &str, tcx: TyCtxt<'_>) -> LocalDefId {
+    tcx.hir_free_items()
+        .find_map(|item_id| {
+            let item = tcx.hir_item(item_id);
+            item.kind
+                .ident()
+                .is_some_and(|ident| ident.name.as_str() == name)
+                .then_some(item_id.owner_id.def_id)
+        })
+        .unwrap()
+}
+
 fn function<'a>(records: &'a [ItemRecord], path: &str) -> &'a FunctionRecord {
     records
         .iter()
@@ -44,13 +56,25 @@ fn compact(text: &str) -> String {
 }
 
 fn assert_skeleton(source: &str, path: &str, expected: &str) {
+    struct ParenNormalizer;
+
+    impl MutVisitor for ParenNormalizer {
+        fn visit_expr(&mut self, expression: &mut Expr) {
+            while let ExprKind::Paren(inner) = &expression.kind {
+                *expression = (**inner).clone();
+            }
+            mut_visit::walk_expr(self, expression);
+        }
+    }
+
     fn canonical_item(text: &str) -> String {
         let without_labels = text
             .lines()
             .filter(|line| !line.trim_start().starts_with("#[proctor("))
             .collect::<Vec<_>>()
             .join("\n");
-        let krate = utils::ast::parse_crate(without_labels);
+        let mut krate = utils::ast::parse_crate(without_labels);
+        ParenNormalizer.visit_crate(&mut krate);
         let [item] = &krate.items[..] else { panic!("expected exactly one item in {text}") };
         pprust::item_to_string(item)
     }
@@ -62,6 +86,7 @@ fn assert_skeleton(source: &str, path: &str, expected: &str) {
             {
                 let mut expected = utils::ast::parse_crate(expected.to_owned());
                 PresentationBindingNormalizer.visit_crate(&mut expected);
+                ParenNormalizer.visit_crate(&mut expected);
                 pprust::item_to_string(&expected.items[0])
             }
         );
@@ -194,6 +219,8 @@ fn record_variants_serialize_only_their_defined_fields() {
             "annotated_skeleton",
             "source_signature",
             "target_signature",
+            "needs_transformation",
+            "statements_requiring_transformation",
             "signature_dependencies",
             "dependencies"
         ]
@@ -244,7 +271,7 @@ fn json_round_trip_preserves_embedded_rust_text() {
     assert!(
         before
             .annotated_skeleton
-            .contains("let mut s: &str = todo!();"),
+            .contains("let mut s: &str = \"quote:"),
         "{}",
         before.annotated_skeleton
     );
@@ -794,13 +821,13 @@ fn replaces_leaf_expression_payloads_with_todo() {
     let source = "unsafe fn callee(_x: i32) {} pub unsafe fn f() -> i32 { let x = 1; callee(x); println!(\"{x}\"); -x + 2 }";
     let records = generate(source);
     let skeleton = &function(&records, "f").annotated_skeleton;
-    assert!(skeleton.contains("let mut x: i32 = todo!();"));
-    assert_eq!(skeleton.matches("todo!()").count(), 4);
+    assert!(skeleton.contains("let mut x: i32 = 1;"));
+    assert_eq!(skeleton.matches("todo!()").count(), 1);
     assert_eq!(labels(skeleton), [0, 1, 2, 3]);
     assert_skeleton(
         source,
         "f",
-        "pub unsafe fn f() -> i32 { let x: i32 = todo!(); todo!(); todo!(); todo!() }",
+        "pub unsafe fn f() -> i32 { let x: i32 = 1; callee(x); todo!(); -x + 2 }",
     );
 }
 
@@ -810,15 +837,15 @@ fn materializes_inferred_types_for_simple_bindings() {
     let records = generate(source);
     let skeleton = compact(&function(&records, "f").annotated_skeleton);
     for declaration in [
-        "let mut b: bool = todo!();",
-        "let mut i: i32 = todo!();",
-        "let mut u: u64 = todo!();",
-        "let mut n: f32 = todo!();",
-        "let mut c: char = todo!();",
-        "let mut t: (i32, u8) = todo!();",
-        "let mut a: [u16; 3] = todo!();",
-        "let mut r: &i32 = todo!();",
-        "let mut l: Local = todo!();",
+        "let mut b: bool = true;",
+        "let mut i: i32 = -1i32;",
+        "let mut u: u64 = 1u64;",
+        "let mut n: f32 = 1.5f32;",
+        "let mut c: char = 'x';",
+        "let mut t: (i32, u8) = (1i32, 2u8);",
+        "let mut a: [u16; 3] = [1u16; 3];",
+        "let mut r: &i32 = &i;",
+        "let mut l: Local = Local;",
     ] {
         assert!(
             skeleton.contains(declaration),
@@ -828,7 +855,7 @@ fn materializes_inferred_types_for_simple_bindings() {
     assert_skeleton(
         source,
         "f",
-        "pub unsafe fn f() { let b: bool = todo!(); let i: i32 = todo!(); let u: u64 = todo!(); let n: f32 = todo!(); let c: char = todo!(); let t: (i32, u8) = todo!(); let a: [u16; 3] = todo!(); let r: &i32 = todo!(); let l: Local = todo!(); }",
+        "pub unsafe fn f() { let b: bool = true; let i: i32 = -1i32; let u: u64 = 1u64; let n: f32 = 1.5f32; let c: char = 'x'; let t: (i32, u8) = (1i32, 2u8); let a: [u16; 3] = [1u16; 3]; let r: &i32 = &i; let l: Local = Local; }",
     );
 }
 
@@ -837,14 +864,14 @@ fn preserves_mutability_declarations_and_existing_types() {
     let source = "struct T; type Count = i32; pub unsafe fn f() { let mut a = 1; let x: T; let y: Count = 2; x = T; let _ = (a, x, y); }";
     let records = generate(source);
     let skeleton = compact(&function(&records, "f").annotated_skeleton);
-    assert!(skeleton.contains("let mut a: i32 = todo!();"));
+    assert!(skeleton.contains("let mut a: i32 = 1;"));
     assert!(skeleton.contains("let mut x: T;"));
-    assert!(skeleton.contains("let mut y: Count = todo!();"));
-    assert_eq!(skeleton.matches("todo!()").count(), 4);
+    assert!(skeleton.contains("let mut y: Count = 2;"));
+    assert_eq!(skeleton.matches("todo!()").count(), 0);
     assert_skeleton(
         source,
         "f",
-        "pub unsafe fn f() { let mut a: i32 = todo!(); let x: T; let y: Count = todo!(); todo!(); let _ = todo!(); }",
+        "pub unsafe fn f() { let mut a: i32 = 1; let x: T; let y: Count = 2; x = T; let _ = (a, x, y); }",
     );
 }
 
@@ -854,12 +881,12 @@ fn holes_assignments_and_preserves_return_and_break_roles() {
     let records = generate(source);
     let skeleton = compact(&function(&records, "f").annotated_skeleton);
     assert!(skeleton.contains("let mut y: i32 = loop"));
-    assert!(skeleton.contains("break todo!();"));
-    assert!(skeleton.contains("return todo!();"));
+    assert!(skeleton.contains("break x;"));
+    assert!(skeleton.contains("return y;"));
     assert_skeleton(
         source,
         "f",
-        "pub unsafe fn f(mut x: i32) -> i32 { todo!(); todo!(); let y: i32 = loop { break todo!(); }; return todo!(); }",
+        "pub unsafe fn f(mut x: i32) -> i32 { x = 1; x += 2; let y: i32 = loop { break x; }; return y; }",
     );
 }
 
@@ -868,7 +895,7 @@ fn preserves_if_and_else_structure() {
     let source = "unsafe fn sink(_x: i32) {} pub unsafe fn f(flag: bool) { if flag { sink(1); } else { sink(2); } }";
     let records = generate(source);
     let skeleton = compact(&function(&records, "f").annotated_skeleton);
-    assert!(skeleton.contains("if todo!()"));
+    assert!(skeleton.contains("if flag"));
     assert!(skeleton.contains("} else {"));
     assert_eq!(
         labels(&function(&records, "f").annotated_skeleton),
@@ -877,7 +904,7 @@ fn preserves_if_and_else_structure() {
     assert_skeleton(
         source,
         "f",
-        "pub unsafe fn f(flag: bool) { if todo!() { todo!(); } else { todo!(); } }",
+        "pub unsafe fn f(flag: bool) { if flag { sink(1); } else { sink(2); } }",
     );
 }
 
@@ -887,11 +914,11 @@ fn preserves_nested_if_and_else_if_structure() {
     let records = generate(source);
     let f = function(&records, "f");
     assert_eq!(labels(&f.annotated_skeleton), (0..=8).collect::<Vec<_>>());
-    assert_eq!(f.annotated_skeleton.matches("if todo!()").count(), 4);
+    assert_eq!(f.annotated_skeleton.matches("if ").count(), 4);
     assert_skeleton(
         source,
         "f",
-        "pub unsafe fn f(a: bool, b: bool, c: bool) -> i32 { let x: i32 = if todo!() { todo!() } else { todo!() }; if todo!() { if todo!() { todo!() } else { todo!() } } else if todo!() { todo!() } else { todo!() } }",
+        "pub unsafe fn f(a: bool, b: bool, c: bool) -> i32 { let x: i32 = if a { 1 } else { 2 }; if b { if c { x } else { 3 } } else if a { 4 } else { 5 } }",
     );
 }
 
@@ -900,12 +927,12 @@ fn preserves_if_let_and_while_let_patterns() {
     let source = "unsafe fn sink(_x: i32) {} pub unsafe fn f(mut value: Option<i32>) { if let Some(x) = value { sink(x); } while let Some(x) = value { sink(x); value = None; } }";
     let records = generate(source);
     let skeleton = compact(&function(&records, "f").annotated_skeleton);
-    assert!(skeleton.contains("if let Some(mut x) = todo!()"));
-    assert!(skeleton.contains("while let Some(mut x) = todo!()"));
+    assert!(skeleton.contains("if let Some(mut x) = value"));
+    assert!(skeleton.contains("while let Some(mut x) = value"));
     assert_skeleton(
         source,
         "f",
-        "pub unsafe fn f(mut value: Option<i32>) { if let Some(x) = todo!() { todo!(); } while let Some(x) = todo!() { todo!(); todo!(); } }",
+        "pub unsafe fn f(mut value: Option<i32>) { if let Some(x) = value { sink(x); } while let Some(x) = value { sink(x); value = None; } }",
     );
 }
 
@@ -914,13 +941,13 @@ fn preserves_while_for_and_loop_constructs() {
     let source = "unsafe fn sink(_x: i32) {} pub unsafe fn f(mut n: i32, pairs: [(i32, i32); 2]) { 'w: while n > 0 { n -= 1; } for (x, y) in pairs { sink(x + y); } 'l: loop { break 'l; } }";
     let records = generate(source);
     let skeleton = compact(&function(&records, "f").annotated_skeleton);
-    assert!(skeleton.contains("'w: while todo!()"));
+    assert!(skeleton.contains("'w: while n > 0"));
     assert!(skeleton.contains("for (mut x, mut y) in todo!()"));
     assert!(skeleton.contains("'l: loop"));
     assert_skeleton(
         source,
         "f",
-        "pub unsafe fn f(mut n: i32, pairs: [(i32, i32); 2]) { 'w: while todo!() { todo!(); } for (x, y) in todo!() { todo!(); } 'l: loop { break 'l; } }",
+        "pub unsafe fn f(mut n: i32, pairs: [(i32, i32); 2]) { 'w: while n > 0 { n -= 1; } for (x, y) in todo!() { sink(x + y); } 'l: loop { break 'l; } }",
     );
 }
 
@@ -931,12 +958,12 @@ fn preserves_match_arms_patterns_guards_and_order() {
     let f = function(&records, "f");
     assert_eq!(labels(&f.annotated_skeleton), (0..=11).collect::<Vec<_>>());
     let skeleton = compact(&f.annotated_skeleton);
-    assert!(skeleton.contains("E::Tuple(mut x) if todo!()"));
+    assert!(skeleton.contains("E::Tuple(mut x) if x > 0"));
     assert!(skeleton.contains("1..=3 =>"));
     assert_skeleton(
         source,
         "f",
-        "pub unsafe fn f(e: E, n: i32, pair: (i32, i32)) -> i32 { let a: i32 = match todo!() { E::Unit => { todo!() } E::Tuple(x) if todo!() => { todo!() } E::Tuple(_) => { todo!() } E::Struct { x } => { todo!(); todo!() }, }; let b: i32 = match todo!() { 0 => { todo!() } 1..=3 => { todo!() } _ => { todo!() } }; match todo!() { (x, y) => { todo!() } } }",
+        "pub unsafe fn f(e: E, n: i32, pair: (i32, i32)) -> i32 { let a: i32 = match e { E::Unit => { 0 } E::Tuple(x) if x > 0 => { x } E::Tuple(_) => { -1 } E::Struct { x } => { sink(x); x }, }; let b: i32 = match todo!() { 0 => { 0 } 1..=3 => { 1 } _ => { 2 } }; match pair { (x, y) => { a + b + x + y } } }",
     );
 }
 
@@ -947,12 +974,12 @@ fn preserves_let_else_and_plain_nested_blocks() {
     let f = function(&records, "f");
     assert_eq!(labels(&f.annotated_skeleton), [0, 1, 2, 3, 4, 5]);
     let skeleton = compact(&f.annotated_skeleton);
-    assert!(skeleton.contains("let Some(mut x): Option<i32> = todo!() else"));
-    assert!(skeleton.contains("return todo!();"));
+    assert!(skeleton.contains("let Some(mut x): Option<i32> = value else"));
+    assert!(skeleton.contains("return 0;"));
     assert_skeleton(
         source,
         "f",
-        "pub unsafe fn f(value: Option<i32>) -> i32 { let Some(x): Option<i32> = todo!() else { return todo!(); }; let y: i32 = { todo!(); todo!() }; todo!() }",
+        "pub unsafe fn f(value: Option<i32>) -> i32 { let Some(x): Option<i32> = value else { return 0; }; let y: i32 = { sink(x); x + 1 }; y }",
     );
 }
 
@@ -970,7 +997,7 @@ fn preserves_existing_identifiers_paths_and_patterns() {
     assert_skeleton(
         source,
         "keep_names",
-        "pub unsafe fn keep_names(mut input_value: m::Pair) -> i32 { let mut local_total: i32 = todo!(); 'outer: loop { let m::Pair { left: bound_left, right: bound_right } = todo!(); todo!(); break 'outer; } todo!() }",
+        "pub unsafe fn keep_names(mut input_value: m::Pair) -> i32 { let mut local_total: i32 = input_value.left; 'outer: loop { let m::Pair { left: bound_left, right: bound_right } = input_value; local_total += bound_left + bound_right; break 'outer; } local_total }",
     );
 }
 
@@ -1000,7 +1027,7 @@ fn preserves_payloadless_control_expressions_without_holes() {
     assert_skeleton(
         source,
         "f",
-        "pub unsafe fn f(flag: bool) { if todo!() { return; } loop { if todo!() { continue; } break; } }",
+        "pub unsafe fn f(flag: bool) { if flag { return; } loop { if flag { continue; } break; } }",
     );
 }
 
@@ -1035,7 +1062,7 @@ fn allows_restricted_conditionals_beneath_non_control_payloads() {
         let function = function(&records, path);
         assert_eq!(labels(&function.annotated_source), [0]);
         assert_eq!(labels(&function.annotated_skeleton), [0]);
-        assert!(!function.annotated_skeleton.contains("if "));
+        assert!(function.annotated_skeleton.contains("if "));
     }
     let wrapped_let = function(&records, "wrapped_let");
     assert_eq!(labels(&wrapped_let.annotated_source), [0, 1]);
@@ -1043,17 +1070,17 @@ fn allows_restricted_conditionals_beneath_non_control_payloads() {
     assert_skeleton(
         source,
         "assign",
-        "pub unsafe fn assign(mut value: i32, flag: bool) { todo!(); }",
+        "pub unsafe fn assign(mut value: i32, flag: bool) { value = 1 + if flag { 2 } else { 3 }; }",
     );
     assert_skeleton(
         source,
         "wrapped_return",
-        "pub unsafe fn wrapped_return(flag: bool) -> Option<i32> { return todo!(); }",
+        "pub unsafe fn wrapped_return(flag: bool) -> Option<i32> { return Some(if flag { 1 } else { 2 }); }",
     );
     assert_skeleton(
         source,
         "wrapped_let",
-        "pub unsafe fn wrapped_let(flag: bool) -> i32 { let value: std::option::Option<i32> = todo!(); todo!() }",
+        "pub unsafe fn wrapped_let(flag: bool) -> i32 { let value: std::option::Option<i32> = Some(if flag { 1 } else { 2 }); value.unwrap() }",
     );
 }
 
@@ -1079,12 +1106,17 @@ fn allows_else_if_chains_and_recursive_branch_tail_conditionals() {
         assert_eq!(labels(&function.annotated_source), [0, 1]);
         assert_eq!(labels(&function.annotated_skeleton), [0, 1]);
         assert_eq!(function.annotated_source.matches("if ").count(), 2);
-        assert!(!function.annotated_skeleton.contains("if "));
+        assert!(function.annotated_skeleton.contains("if "));
         assert_skeleton(
             source,
             path,
             &format!(
-                "pub unsafe fn {path}(c1: bool, c2: bool) -> i32 {{ let value: std::option::Option<i32> = todo!(); todo!() }}"
+                "pub unsafe fn {path}(c1: bool, c2: bool) -> i32 {{ let value: std::option::Option<i32> = {}; value.unwrap() }}",
+                if path == "chained" {
+                    "Some(if c1 { 1 } else if c2 { 2 } else { 3 })"
+                } else {
+                    "Some(if c1 { 1 } else { if c2 { 2 } else { 3 } })"
+                }
             ),
         );
     }
@@ -1601,10 +1633,10 @@ fn source_and_target_parameters_and_simple_locals_are_mutable() {
         source,
         "f",
         r#"pub unsafe fn f(mut input: i32, mut existing: i32) -> i32 {
-    let mut value: i32 = todo!();
-    let mut total: i32 = todo!();
-    todo!();
-    todo!()
+    let mut value: i32 = input;
+    let mut total: i32 = existing;
+    total += value;
+    total
 }"#,
     );
     assert_eq!(
@@ -1631,8 +1663,8 @@ fn wildcards_remain_wildcards() {
         source,
         "f",
         r#"pub unsafe fn f(mut pair: (i32, i32)) {
-    let (_, mut value) = todo!();
-    let _ = todo!();
+    let (_, mut value) = pair;
+    let _ = value;
 }"#,
     );
     assert_eq!(
@@ -1727,7 +1759,7 @@ fn safe_source_functions_get_unsafe_target_headers() {
     assert!(safe.annotated_skeleton.starts_with("pub unsafe fn safe"));
     assert!(
         safe.annotated_skeleton
-            .contains("let mut value: i32 = todo!();")
+            .contains("let mut value: i32 = input;")
     );
     assert_eq!(
         function(&records, "already_unsafe").source_signature,
@@ -1891,12 +1923,682 @@ fn small_skeleton_json_matches_inline_golden() {
     "kind": "Fn",
     "name": "f",
     "annotated_source": "pub unsafe fn f() -> i32 {\n    #[proctor(0)]\n    1\n}",
-    "annotated_skeleton": "pub unsafe fn f() -> i32 {\n    #[proctor(0)]\n    todo!()\n}",
+    "annotated_skeleton": "pub unsafe fn f() -> i32 {\n    #[proctor(0)]\n    1\n}",
     "source_signature": "pub unsafe fn f() -> i32",
     "target_signature": "pub unsafe fn f() -> i32",
+    "needs_transformation": false,
+    "statements_requiring_transformation": [],
     "signature_dependencies": [],
     "dependencies": []
   }
 ]"#
+    );
+}
+
+#[test]
+fn amendment_2_preserves_scalar_statements_and_metadata() {
+    let source = r#"
+pub unsafe fn scalar(mut x: i32, y: i32, z: i32) -> i32 {
+    let sum = y + z;
+    x = sum * 2;
+    return x;
+}
+"#;
+    let records = generate(source);
+    let function = function(&records, "scalar");
+    assert!(!function.needs_transformation);
+    assert!(function.statements_requiring_transformation.is_empty());
+    let skeleton = compact(&function.annotated_skeleton);
+    assert!(skeleton.contains("y + z"));
+    assert!(skeleton.contains("sum * 2"));
+    assert!(skeleton.contains("return x"));
+    assert!(!skeleton.contains("todo!"));
+}
+
+#[test]
+fn amendment_2_mixed_control_has_recursive_parent_disposition() {
+    let source = r#"
+pub unsafe fn mixed(mut p: *mut i32, flag: bool, y: i32, z: i32) -> i32 {
+    if flag {
+        let sum = y + z;
+        *p = sum;
+    } else {
+        let difference = y - z;
+        return difference;
+    }
+    return y + z;
+}
+"#;
+    let records = generate(source);
+    let function = function(&records, "mixed");
+    assert!(function.needs_transformation);
+    assert_eq!(function.statements_requiring_transformation, [0, 2]);
+    let skeleton = compact(&function.annotated_skeleton);
+    assert!(skeleton.contains("if todo!()"));
+    assert!(skeleton.contains("y + z"));
+    assert!(skeleton.contains("y - z"));
+    assert!(skeleton.contains("return difference"));
+}
+
+#[test]
+fn amendment_2_callable_policy_is_conservative() {
+    let source = r#"
+pub fn local(value: i32) -> i32 { value + 1 }
+pub unsafe fn caller(values: &[i32], left: i32, right: i32) -> i32 {
+    let a = local(left);
+    let b = std::cmp::max(a, right);
+    let d = values.len() as i32;
+    let e = values[0];
+    b + d + e
+}
+"#;
+    let records = generate(source);
+    let caller = function(&records, "caller");
+    assert_eq!(
+        caller.statements_requiring_transformation,
+        Vec::<u32>::new()
+    );
+}
+
+#[test]
+fn amendment_2_unsafe_nonlocal_calls_macros_and_raw_pointers_transform() {
+    let source = r#"
+pub unsafe fn cases(values: &[i32], pointer: *mut i32, value: i32) -> i32 {
+    let unchecked = *values.get_unchecked(0);
+    println!("{value}");
+    let is_null = pointer.is_null();
+    let scalar = value + 1;
+    scalar + unchecked + is_null as i32
+}
+"#;
+    let records = generate(source);
+    let function = function(&records, "cases");
+    assert_eq!(function.statements_requiring_transformation, [0, 1, 2]);
+}
+
+#[test]
+fn amendment_2_opens_local_adts_but_not_external_representation() {
+    let source = r#"
+pub struct Leaf { pub pointer: *mut i32 }
+pub struct Middle { pub leaf: Leaf }
+pub unsafe fn values(
+    mut local: Middle,
+    other_local: Middle,
+    mut integers: Vec<i32>,
+    other_integers: Vec<i32>,
+    mut pointers: Vec<*mut i32>,
+    other_pointers: Vec<*mut i32>,
+) {
+    local = other_local;
+    integers = other_integers;
+    pointers = other_pointers;
+}
+"#;
+    let records = generate(source);
+    let function = function(&records, "values");
+    assert_eq!(function.statements_requiring_transformation, [0, 2]);
+    assert!(compact(&function.annotated_skeleton).contains("other_integers"));
+}
+
+#[test]
+fn amendment_2_restricted_conditionals_preserve_or_stay_opaque() {
+    let source = r#"
+pub unsafe fn conditional(mut x: i32, flag: bool, pointer: *mut i32) -> i32 {
+    x = 1 + if flag { 2 } else { 3 };
+    x = 1 + if flag { *pointer } else { 3 };
+    x
+}
+"#;
+    let records = generate(source);
+    let function = function(&records, "conditional");
+    assert_eq!(function.statements_requiring_transformation, [1]);
+    let skeleton = compact(&function.annotated_skeleton);
+    assert!(skeleton.contains("1 + if flag"));
+    assert_eq!(skeleton.matches("todo!()").count(), 1);
+}
+
+#[test]
+fn amendment_2_future_field_change_marks_containing_values_sensitive() {
+    let source = r#"
+#[derive(Clone, Copy)]
+pub struct FutureField { pub value: i32 }
+pub unsafe fn move_future(mut left: FutureField, right: FutureField) -> i32 {
+    left = right;
+    left.value + right.value
+}
+"#;
+    let ordinary = generate(source);
+    assert!(
+        function(&ordinary, "move_future")
+            .statements_requiring_transformation
+            .is_empty()
+    );
+    let changed = run_compiler_on_str(source, |tcx| {
+        let item = tcx
+            .hir_node_by_def_id(local_def("FutureField", tcx))
+            .expect_item();
+        let hir::ItemKind::Struct(_, _, variant) = item.kind else { unreachable!() };
+        let mut overrides = PreservationDecisionOverrides::default();
+        overrides
+            .changed_fields
+            .insert(variant.fields()[0].def_id.to_def_id());
+        make_skeletons_with_preservation_overrides(source, tcx, &overrides).unwrap()
+    })
+    .unwrap();
+    assert_eq!(
+        function(&changed, "move_future").statements_requiring_transformation,
+        [0, 1]
+    );
+}
+
+#[test]
+fn amendment_2_changed_local_signature_forces_call_transformation() {
+    let source = r#"
+pub unsafe fn scalar_callee(value: i32) -> i32 { value + 1 }
+pub unsafe fn scalar_caller(value: i32) -> i32 { scalar_callee(value) }
+"#;
+    assert!(
+        function(&generate(source), "scalar_caller")
+            .statements_requiring_transformation
+            .is_empty()
+    );
+    let changed = run_compiler_on_str(source, |tcx| {
+        let mut overrides = PreservationDecisionOverrides::default();
+        overrides
+            .changed_local_signatures
+            .insert(local_def("scalar_callee", tcx));
+        make_skeletons_with_preservation_overrides(source, tcx, &overrides).unwrap()
+    })
+    .unwrap();
+    assert_eq!(
+        function(&changed, "scalar_caller").statements_requiring_transformation,
+        [0]
+    );
+}
+
+#[test]
+fn amendment_2_missing_ast_mapping_and_changed_binding_decision_are_conservative() {
+    let scalar_source = r#"
+pub unsafe fn scalar(y: i32, z: i32) -> i32 {
+    let sum = y + z;
+    sum
+}
+"#;
+    run_compiler_on_str(scalar_source, |tcx| {
+        struct YExpression {
+            id: Option<NodeId>,
+        }
+
+        impl<'ast> rustc_ast::visit::Visitor<'ast> for YExpression {
+            fn visit_expr(&mut self, expression: &'ast Expr) {
+                if let ExprKind::Path(None, path) = &expression.kind
+                    && path
+                        .segments
+                        .last()
+                        .is_some_and(|segment| segment.ident.name.as_str() == "y")
+                {
+                    self.id = Some(expression.id);
+                }
+                rustc_ast::visit::walk_expr(self, expression);
+            }
+        }
+
+        let mut surface = utils::ast::parse_crate(scalar_source.to_owned());
+        let mut mapper = utils::ir::AstToHirMapper::new(tcx);
+        mapper.map_crate_to_mod(&mut surface, tcx.hir_root_module(), false);
+        let mut ast_to_hir = mapper.ast_to_hir;
+        let mut finder = YExpression { id: None };
+        finder.visit_crate(&surface);
+        ast_to_hir.local_map.remove(&finder.id.unwrap());
+        let ItemKind::Fn(box function) = &surface.items[0].kind else { unreachable!() };
+        let decisions = initial_pointer_decisions(
+            &pointer_replacer::Config::default(),
+            PointerDecisionOptions {
+                assume_nonnegative_offsets: true,
+            },
+            tcx,
+        );
+        assert!(!statement_is_preservable(
+            &function.body.as_ref().unwrap().stmts[0],
+            &ast_to_hir,
+            &decisions,
+            &PreservationDecisionOverrides::default(),
+            tcx,
+        ));
+    })
+    .unwrap();
+
+    let pointer_source = r#"
+pub unsafe fn observe(pointer: *mut i32) -> bool {
+    let is_null = pointer.is_null();
+    is_null
+}
+"#;
+    run_compiler_on_str(pointer_source, |tcx| {
+        let mut surface = utils::ast::parse_crate(pointer_source.to_owned());
+        let mut mapper = utils::ir::AstToHirMapper::new(tcx);
+        mapper.map_crate_to_mod(&mut surface, tcx.hir_root_module(), false);
+        let ast_to_hir = mapper.ast_to_hir;
+        let ItemKind::Fn(box function) = &surface.items[0].kind else { unreachable!() };
+        let parameter_hir = ast_to_hir.local_map[&function.sig.decl.inputs[0].pat.id];
+        let mut decisions = initial_pointer_decisions(
+            &pointer_replacer::Config::default(),
+            PointerDecisionOptions {
+                assume_nonnegative_offsets: true,
+            },
+            tcx,
+        );
+        decisions.bindings.insert(parameter_hir, PtrKind::Ref(true));
+        let overrides = PreservationDecisionOverrides::default();
+        let checker = HirPreservationCheck {
+            tcx,
+            decisions: &decisions,
+            preservation_overrides: &overrides,
+            owner: parameter_hir.owner,
+            direct_callee: None,
+            preservable: true,
+            sensitive_types: FxHashMap::default(),
+            visiting_types: FxHashSet::default(),
+        };
+        assert!(checker.binding_changes(parameter_hir));
+        assert!(!statement_is_preservable(
+            &function.body.as_ref().unwrap().stmts[0],
+            &ast_to_hir,
+            &decisions,
+            &overrides,
+            tcx,
+        ));
+    })
+    .unwrap();
+}
+
+#[test]
+fn amendment_2_type_sensitivity_substitutes_generic_local_adts_and_terminates() {
+    let source = r#"
+pub struct Wrap<T> { pub value: T }
+pub struct Recursive<T> {
+    pub next: Option<Box<Recursive<T>>>,
+    pub value: T,
+}
+pub unsafe fn generic_values(
+    scalar: Wrap<i32>,
+    pointer: Wrap<*mut i32>,
+    recursive_scalar: Recursive<i32>,
+    recursive_pointer: Recursive<*mut i32>,
+) {}
+"#;
+    run_compiler_on_str(source, |tcx| {
+        let owner = local_def("generic_values", tcx);
+        let decisions = initial_pointer_decisions(
+            &pointer_replacer::Config::default(),
+            PointerDecisionOptions {
+                assume_nonnegative_offsets: true,
+            },
+            tcx,
+        );
+        let overrides = PreservationDecisionOverrides::default();
+        let mut checker = HirPreservationCheck {
+            tcx,
+            decisions: &decisions,
+            preservation_overrides: &overrides,
+            owner: hir::OwnerId { def_id: owner },
+            direct_callee: None,
+            preservable: true,
+            sensitive_types: FxHashMap::default(),
+            visiting_types: FxHashSet::default(),
+        };
+        let signature = tcx.fn_sig(owner).instantiate_identity().skip_binder();
+        assert_eq!(
+            signature
+                .inputs()
+                .iter()
+                .map(|ty| checker.type_is_sensitive(*ty))
+                .collect::<Vec<_>>(),
+            [false, true, false, true]
+        );
+    })
+    .unwrap();
+}
+
+#[test]
+fn amendment_2_unresolved_projection_is_transformation_sensitive() {
+    let source = r#"
+pub trait HasItem { type Item; }
+pub unsafe fn projection<T: HasItem>(value: T::Item) { let _ = value; }
+"#;
+    run_compiler_on_str(source, |tcx| {
+        let owner = local_def("projection", tcx);
+        let decisions = initial_pointer_decisions(
+            &pointer_replacer::Config::default(),
+            PointerDecisionOptions {
+                assume_nonnegative_offsets: true,
+            },
+            tcx,
+        );
+        let overrides = PreservationDecisionOverrides::default();
+        let mut checker = HirPreservationCheck {
+            tcx,
+            decisions: &decisions,
+            preservation_overrides: &overrides,
+            owner: hir::OwnerId { def_id: owner },
+            direct_callee: None,
+            preservable: true,
+            sensitive_types: FxHashMap::default(),
+            visiting_types: FxHashSet::default(),
+        };
+        let signature = tcx.fn_sig(owner).instantiate_identity().skip_binder();
+        assert!(checker.type_is_sensitive(signature.inputs()[0]));
+    })
+    .unwrap();
+}
+
+#[test]
+fn amendment_2_exact_scalar_call_and_pointer_matrix() {
+    let scalar = generate(
+        r#"pub unsafe fn arithmetic(mut x: i32, y: i32, z: i32) -> (i64, [i32; 2]) {
+            x = y + z;
+            x += 1;
+            let wide = x as i64;
+            let pair = (wide, [y, z]);
+            return pair;
+        }"#,
+    );
+    assert!(
+        function(&scalar, "arithmetic")
+            .statements_requiring_transformation
+            .is_empty()
+    );
+
+    let calls = generate(
+        r#"unsafe extern "C" { fn foreign_abs(value: i32) -> i32; }
+        pub fn local(value: i32) -> i32 { value + 1 }
+        pub unsafe fn local_unsafe(value: i32) -> i32 { value + 1 }
+        pub unsafe fn safe_calls(values: &[i32], left: i32, right: i32) -> i32 {
+            let a = local(left);
+            let b = std::cmp::max(a, right);
+            let c = values.len() as i32;
+            let d = values[0];
+            b + c + d
+        }
+        pub unsafe fn local_call(value: i32) -> i32 { local_unsafe(value) }
+        pub unsafe fn foreign_call(value: i32) -> i32 { foreign_abs(value) }
+        pub unsafe fn unsafe_calls(values: &[i32]) -> (i32, char) {
+            let value = *values.get_unchecked(0);
+            let character = char::from_u32_unchecked(65);
+            (value, character)
+        }"#,
+    );
+    for path in ["safe_calls", "local_call"] {
+        assert!(
+            function(&calls, path)
+                .statements_requiring_transformation
+                .is_empty(),
+            "{path}"
+        );
+    }
+    assert_eq!(
+        function(&calls, "foreign_call").statements_requiring_transformation,
+        [0]
+    );
+    assert_eq!(
+        function(&calls, "unsafe_calls").statements_requiring_transformation,
+        [0, 1]
+    );
+
+    let pointers = generate(
+        r#"pub unsafe fn pointer_uses(mut left: *mut i32, right: *const i32) -> i32 {
+            *left = *right;
+            let alias: *const i32 = left;
+            let value = *alias;
+            value
+        }"#,
+    );
+    assert_eq!(
+        function(&pointers, "pointer_uses").statements_requiring_transformation,
+        [0, 1, 2]
+    );
+}
+
+#[test]
+fn amendment_2_exact_declaration_generic_and_macro_matrix() {
+    let declarations = generate(
+        r#"pub unsafe fn declarations() {
+            let scalar: i32;
+            let pointer: *mut i32;
+            scalar = 1;
+            pointer = core::ptr::null_mut();
+            let _ = scalar;
+            let _ = pointer;
+        }"#,
+    );
+    assert_eq!(
+        function(&declarations, "declarations").statements_requiring_transformation,
+        [1, 3, 5]
+    );
+    let nested = generate(
+        r#"pub unsafe fn nested(
+            mut a: Option<Box<(*mut i32, [usize; 2])>>,
+            b: Option<Box<(*mut i32, [usize; 2])>>,
+        ) { a = b; }
+        pub unsafe fn type_arguments() -> usize {
+            let marker = core::marker::PhantomData::<*mut i32>;
+            let size = core::mem::size_of::<*mut i32>();
+            let _ = marker;
+            size
+        }"#,
+    );
+    assert_eq!(
+        function(&nested, "nested").statements_requiring_transformation,
+        [0]
+    );
+    assert_eq!(
+        function(&nested, "type_arguments").statements_requiring_transformation,
+        [0, 1, 2]
+    );
+    let macros = generate(
+        r#"pub unsafe fn macros(value: i32) {
+            println!("{value}");
+            assert!(value > 0);
+            let nested = 1 + dbg!(value);
+            let _ = nested;
+        }"#,
+    );
+    assert_eq!(
+        function(&macros, "macros").statements_requiring_transformation,
+        [0, 1, 2]
+    );
+}
+
+#[test]
+fn amendment_2_exact_local_adt_matrix_opens_alias_union_and_recursive_fields() {
+    let records = generate(
+        r#"pub struct Leaf { pub pointer: *mut i32 }
+        pub struct Middle { pub leaf: Leaf }
+        pub enum Choice { Empty, Value(Middle) }
+        pub union Storage {
+            pub leaf: core::mem::ManuallyDrop<Leaf>,
+            pub integer: i64,
+        }
+        pub struct Link {
+            pub next: Option<Box<Link>>,
+            pub leaf: Leaf,
+        }
+        pub type Alias = Choice;
+        pub unsafe fn move_values(
+            mut a: Middle,
+            b: Middle,
+            mut c: Alias,
+            d: Alias,
+            mut s: Storage,
+            t: Storage,
+            mut link: Link,
+            other: Link,
+        ) {
+            a = b;
+            c = d;
+            s = t;
+            link = other;
+        }"#,
+    );
+    assert_eq!(
+        function(&records, "move_values").statements_requiring_transformation,
+        [0, 1, 2, 3]
+    );
+}
+
+#[test]
+fn amendment_2_exact_patterns_control_and_unsafe_storage_matrix() {
+    let patterns = generate(
+        r#"pub unsafe fn patterns(
+            pair: (i32, i32),
+            pointer_pair: Option<(*mut i32, i32)>,
+        ) -> i32 {
+            let (left, right) = pair;
+            let Some((pointer, value)) = pointer_pair else {
+                return left + right;
+            };
+            match value {
+                n if n > 0 => { let copy = n; copy }
+                _ => { let _ = pointer; 0 }
+            }
+        }"#,
+    );
+    assert_eq!(
+        function(&patterns, "patterns").statements_requiring_transformation,
+        [1, 3, 6]
+    );
+
+    let safe_control = generate(
+        r#"pub unsafe fn control(flag: bool, left: i32, right: i32) -> i32 {
+            if flag {
+                let value = left + right;
+                return value;
+            } else {
+                return left - right;
+            }
+        }"#,
+    );
+    assert!(
+        function(&safe_control, "control")
+            .statements_requiring_transformation
+            .is_empty()
+    );
+
+    let storage = generate(
+        r#"pub static mut GLOBAL: i32 = 0;
+        pub union Scalar { pub signed: i32, pub unsigned: u32 }
+        pub unsafe fn storage(value: Scalar) -> i32 {
+            GLOBAL = 1;
+            let local = value.signed;
+            local + GLOBAL
+        }"#,
+    );
+    assert_eq!(
+        function(&storage, "storage").statements_requiring_transformation,
+        [0, 1, 2]
+    );
+
+    let control_patterns = generate(
+        r#"pub unsafe fn control_patterns(
+            mut current: Option<*mut i32>,
+            values: [*mut i32; 1],
+        ) {
+            if let Some(pointer) = current {
+                let _ = pointer;
+            }
+            while let Some(pointer) = current.take() {
+                let _ = pointer;
+            }
+            for pointer in values {
+                let _ = pointer;
+            }
+        }"#,
+    );
+    assert_eq!(
+        function(&control_patterns, "control_patterns").statements_requiring_transformation,
+        [0, 1, 2, 3, 4, 5]
+    );
+
+    let mixed_storage = generate(
+        r#"pub union Mixed {
+            pub pointer: *mut i32,
+            pub integer: i32,
+        }
+        pub unsafe fn mixed_storage(value: Mixed) -> i32 {
+            value.integer
+        }"#,
+    );
+    assert_eq!(
+        function(&mixed_storage, "mixed_storage").statements_requiring_transformation,
+        [0]
+    );
+}
+
+#[test]
+fn amendment_2_exact_validator_fixture_has_recursive_parent_disposition() {
+    let records = generate(
+        r#"pub unsafe fn validate_me(flag: bool, mut pointer: *mut i32) -> i32 {
+            let scalar = 1 + 2;
+            if flag {
+                let nested = 3 + 4;
+                *pointer = nested;
+            } else {
+                return scalar;
+            }
+            scalar
+        }"#,
+    );
+    assert_eq!(
+        function(&records, "validate_me").statements_requiring_transformation,
+        [1, 3]
+    );
+}
+
+#[test]
+fn amendment_2_exact_unsupported_callable_and_desugar_matrix() {
+    let functions = generate(
+        r#"pub unsafe fn local(value: i32) -> i32 { value + 1 }
+        pub unsafe fn invoke(callback: unsafe fn(i32) -> i32, value: i32) -> i32 {
+            callback(value)
+        }
+        pub unsafe fn hold_callable() {
+            let callable = local;
+            let _ = callable;
+        }
+        pub unsafe fn closure(value: i32) -> i32 {
+            let add = |other: i32| value + other;
+            add(1)
+        }
+        pub unsafe fn question(value: Option<i32>) -> Option<i32> {
+            let inner = value?;
+            Some(inner + 1)
+        }"#,
+    );
+    assert_eq!(
+        function(&functions, "invoke").statements_requiring_transformation,
+        [0]
+    );
+    assert_eq!(
+        function(&functions, "hold_callable").statements_requiring_transformation,
+        [0, 1]
+    );
+    assert_eq!(
+        function(&functions, "closure").statements_requiring_transformation,
+        [0, 1]
+    );
+    assert_eq!(
+        function(&functions, "question").statements_requiring_transformation,
+        [0]
+    );
+
+    let assembly = generate(
+        r#"pub unsafe fn assembly(mut value: u64) -> u64 {
+            core::arch::asm!("/* {0} */", inout(reg) value);
+            value
+        }"#,
+    );
+    assert_eq!(
+        function(&assembly, "assembly").statements_requiring_transformation,
+        [0]
     );
 }

@@ -153,11 +153,16 @@ impl<'infer, 'tcx, D: HasLocalDecls<'tcx>> Visitor<'tcx> for FatnessAnalysis<'in
                 let lhs = place_vars(lhs, local_decls, locals, struct_fields);
                 let rhs = place_vars(rhs, local_decls, locals, struct_fields);
 
-                // type safety
-                assert_eq!(
-                    lhs.end.index() - lhs.start.index(),
-                    rhs.end.index() - rhs.start.index()
-                );
+                if lhs.end.index() - lhs.start.index() != rhs.end.index() - rhs.start.index() {
+                    // MIR projections introduced for nested pattern bindings can
+                    // lack a corresponding qualifier range. Fall back to the
+                    // conservative scalar-pointer value instead of inferring a
+                    // slice or aborting analysis.
+                    for variable in lhs {
+                        database.top(variable);
+                    }
+                    return;
+                }
 
                 let mut lhs_rhs = lhs.zip(rhs);
                 if let Some((lhs, rhs)) = lhs_rhs.next() {
