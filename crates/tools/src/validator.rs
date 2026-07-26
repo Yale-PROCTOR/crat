@@ -328,7 +328,16 @@ fn validate_expected_skeleton(item: &Item, entry: &ExpectedFunction) -> Result<(
         )
     })?;
     let body = function.body.as_ref().unwrap();
-    let mut scan = BodyScanner::new(true);
+    let transformed = entry
+        .statements_requiring_transformation
+        .iter()
+        .copied()
+        .collect::<HashSet<_>>();
+    let preserved = statement_labels(body)
+        .into_iter()
+        .filter(|label| !transformed.contains(label))
+        .collect();
+    let mut scan = BodyScanner::new_with_preserved_labels(true, preserved);
     scan.visit_block(body);
     if let Some(problem) = scan.syntax_errors.first() {
         return Err(format!(
@@ -388,7 +397,7 @@ fn validate_expected_skeleton(item: &Item, entry: &ExpectedFunction) -> Result<(
             entry.name, entry.id, error.message
         )
     })?;
-    validate_expected_block(body).map_err(|detail| {
+    validate_expected_block(body, &transformed).map_err(|detail| {
         format!(
             "Expected skeleton for `{}` (item {}) has an invalid Phase 1 control/statement tree: {detail}",
             entry.name, entry.id
@@ -437,22 +446,28 @@ fn validate_supported_target_signature(function: &rustc_ast::Fn) -> Result<(), &
     Ok(())
 }
 
-fn validate_expected_block(block: &rustc_ast::Block) -> Result<(), String> {
+fn validate_expected_block(
+    block: &rustc_ast::Block,
+    transformed: &HashSet<u32>,
+) -> Result<(), String> {
     for statement in &block.stmts {
-        validate_expected_statement(statement)?;
+        validate_expected_statement(statement, transformed)?;
     }
     Ok(())
 }
 
-fn validate_expected_statement(statement: &Stmt) -> Result<(), String> {
+fn validate_expected_statement(statement: &Stmt, transformed: &HashSet<u32>) -> Result<(), String> {
+    let allow_restricted = stmt_label(statement).is_some_and(|label| !transformed.contains(&label));
     match &statement.kind {
         StmtKind::Let(local) => {
             match &local.kind {
                 LocalKind::Decl => {}
-                LocalKind::Init(initializer) => validate_expected_payload(initializer)?,
+                LocalKind::Init(initializer) => {
+                    validate_expected_payload(initializer, transformed, allow_restricted)?
+                }
                 LocalKind::InitElse(initializer, else_block) => {
-                    validate_expected_payload(initializer)?;
-                    validate_expected_block(else_block)?;
+                    validate_expected_payload(initializer, transformed, allow_restricted)?;
+                    validate_expected_block(else_block, transformed)?;
                 }
             }
             Ok(())
@@ -463,24 +478,30 @@ fn validate_expected_statement(statement: &Stmt) -> Result<(), String> {
         )),
         StmtKind::Expr(expression) | StmtKind::Semi(expression) => match &expression.kind {
             ExprKind::Ret(Some(value)) | ExprKind::Break(_, Some(value)) => {
-                validate_expected_payload(value)
+                validate_expected_payload(value, transformed, allow_restricted)
             }
-            _ => validate_expected_payload(expression),
+            _ => validate_expected_payload(expression, transformed, allow_restricted),
         },
         StmtKind::MacCall(_) => Ok(()),
         StmtKind::Empty => Err("empty statements are unsupported".to_owned()),
     }
 }
 
-fn validate_expected_payload(expression: &Expr) -> Result<(), String> {
+fn validate_expected_payload(
+    expression: &Expr,
+    transformed: &HashSet<u32>,
+    allow_restricted: bool,
+) -> Result<(), String> {
     match &expression.kind {
         ExprKind::If(condition, then_block, else_expression) => {
-            validate_no_nested_control(condition, "an if condition")?;
-            validate_expected_block(then_block)?;
+            validate_no_nested_control(condition, "an if condition", allow_restricted)?;
+            validate_expected_block(then_block, transformed)?;
             if let Some(else_expression) = else_expression {
                 match &else_expression.kind {
-                    ExprKind::If(..) => validate_expected_payload(else_expression)?,
-                    ExprKind::Block(block, _) => validate_expected_block(block)?,
+                    ExprKind::If(..) => {
+                        validate_expected_payload(else_expression, transformed, allow_restricted)?
+                    }
+                    ExprKind::Block(block, _) => validate_expected_block(block, transformed)?,
                     _ => {
                         return Err(
                             "an if else branch must be a block or recursive else-if".to_owned()
@@ -491,19 +512,21 @@ fn validate_expected_payload(expression: &Expr) -> Result<(), String> {
             Ok(())
         }
         ExprKind::While(condition, body, _) => {
-            validate_no_nested_control(condition, "a while condition")?;
-            validate_expected_block(body)
+            validate_no_nested_control(condition, "a while condition", allow_restricted)?;
+            validate_expected_block(body, transformed)
         }
         ExprKind::ForLoop { iter, body, .. } => {
-            validate_no_nested_control(iter, "a for iterator")?;
-            validate_expected_block(body)
+            validate_no_nested_control(iter, "a for iterator", allow_restricted)?;
+            validate_expected_block(body, transformed)
         }
-        ExprKind::Loop(body, ..) | ExprKind::Block(body, ..) => validate_expected_block(body),
+        ExprKind::Loop(body, ..) | ExprKind::Block(body, ..) => {
+            validate_expected_block(body, transformed)
+        }
         ExprKind::Match(scrutinee, arms, _) => {
-            validate_no_nested_control(scrutinee, "a match scrutinee")?;
+            validate_no_nested_control(scrutinee, "a match scrutinee", allow_restricted)?;
             for (index, arm) in arms.iter().enumerate() {
                 if let Some(guard) = &arm.guard {
-                    validate_no_nested_control(guard, "a match guard")?;
+                    validate_no_nested_control(guard, "a match guard", allow_restricted)?;
                 }
                 let Some(body) = &arm.body else {
                     return Err(format!("match arm {index} has no body"));
@@ -511,30 +534,41 @@ fn validate_expected_payload(expression: &Expr) -> Result<(), String> {
                 let ExprKind::Block(block, _) = &body.kind else {
                     return Err(format!("match arm {index} must have a block body"));
                 };
-                validate_expected_block(block)?;
+                validate_expected_block(block, transformed)?;
             }
             Ok(())
         }
-        _ => validate_no_nested_control(expression, "a non-control payload"),
+        _ => validate_no_nested_control(expression, "a non-control payload", allow_restricted),
     }
 }
 
-fn validate_no_nested_control(expression: &Expr, role: &str) -> Result<(), String> {
+fn validate_no_nested_control(
+    expression: &Expr,
+    role: &str,
+    allow_restricted: bool,
+) -> Result<(), String> {
     struct ControlFinder {
         found: bool,
+        allow_restricted: bool,
     }
 
     impl<'ast> Visitor<'ast> for ControlFinder {
         fn visit_expr(&mut self, expression: &'ast Expr) {
             if control_expr(expression, ControlRole::Statement).is_some() {
-                self.found = true;
+                if !self.allow_restricted || !crate::skeleton::is_restricted_conditional(expression)
+                {
+                    self.found = true;
+                }
                 return;
             }
             visit::walk_expr(self, expression);
         }
     }
 
-    let mut finder = ControlFinder { found: false };
+    let mut finder = ControlFinder {
+        found: false,
+        allow_restricted,
+    };
     finder.visit_expr(expression);
     if finder.found {
         Err(format!(
@@ -625,7 +659,17 @@ fn validate_function(expected: &ParsedExpected, result: &Item) -> Vec<Validation
     let expected_body = expected_fn.body.as_ref().unwrap();
     let result_body = result_fn.body.as_ref().unwrap();
 
-    let mut expected_scan = BodyScanner::new(true);
+    let transformed = expected
+        .metadata
+        .statements_requiring_transformation
+        .iter()
+        .copied()
+        .collect::<HashSet<_>>();
+    let preserved = statement_labels(expected_body)
+        .into_iter()
+        .filter(|label| !transformed.contains(label))
+        .collect();
+    let mut expected_scan = BodyScanner::new_with_preserved_labels(true, preserved);
     expected_scan.visit_block(expected_body);
     let mut result_scan = BodyScanner::new(false);
     result_scan.visit_block(result_body);
@@ -1060,6 +1104,9 @@ struct BodyScanner {
     skip_expr_attrs: bool,
     root_attribute_spans: HashSet<(u32, u32)>,
     next_declaration_order: usize,
+    preserved_labels: HashSet<u32>,
+    non_control_payload: bool,
+    suppress_unlabeled: usize,
 }
 
 impl BodyScanner {
@@ -1079,6 +1126,16 @@ impl BodyScanner {
             skip_expr_attrs: false,
             root_attribute_spans: HashSet::new(),
             next_declaration_order: 0,
+            preserved_labels: HashSet::new(),
+            non_control_payload: false,
+            suppress_unlabeled: 0,
+        }
+    }
+
+    fn new_with_preserved_labels(expected: bool, preserved_labels: HashSet<u32>) -> Self {
+        Self {
+            preserved_labels,
+            ..Self::new(expected)
         }
     }
 
@@ -1165,6 +1222,27 @@ impl BodyScanner {
             labels.first().copied()
         }
     }
+
+    fn visit_payload(&mut self, expression: &Expr) {
+        if control_expr(expression, ControlRole::Statement).is_some() {
+            self.visit_expr(expression);
+            return;
+        }
+        let previous = std::mem::replace(&mut self.non_control_payload, true);
+        self.visit_expr(expression);
+        self.non_control_payload = previous;
+    }
+
+    fn visit_statement_expression(&mut self, expression: &Expr) {
+        if matches!(
+            expression.kind,
+            ExprKind::Ret(..) | ExprKind::Break(..) | ExprKind::Continue(..)
+        ) {
+            self.visit_expr(expression);
+        } else {
+            self.visit_payload(expression);
+        }
+    }
 }
 
 impl<'ast> Visitor<'ast> for BodyScanner {
@@ -1178,7 +1256,7 @@ impl<'ast> Visitor<'ast> for BodyScanner {
         );
         let label =
             self.record_root_attributes(root_attrs, matches!(stmt.kind, StmtKind::Item(..)));
-        if self.expected && label.is_none() {
+        if self.expected && label.is_none() && self.suppress_unlabeled == 0 {
             self.unlabeled_statements.push(self.path());
         }
         if let Some(label) = label {
@@ -1194,7 +1272,7 @@ impl<'ast> Visitor<'ast> for BodyScanner {
             StmtKind::Item(item) => self.visit_item(item),
             StmtKind::Expr(expr) | StmtKind::Semi(expr) => {
                 self.skip_expr_attrs = true;
-                self.visit_expr(expr);
+                self.visit_statement_expression(expr);
             }
             StmtKind::MacCall(mac) => self.visit_mac_call(&mac.mac),
             StmtKind::Empty => {}
@@ -1214,9 +1292,9 @@ impl<'ast> Visitor<'ast> for BodyScanner {
         );
         match &local.kind {
             LocalKind::Decl => {}
-            LocalKind::Init(init) => self.visit_expr(init),
+            LocalKind::Init(init) => self.visit_payload(init),
             LocalKind::InitElse(init, else_block) => {
-                self.visit_expr(init);
+                self.visit_payload(init);
                 self.with_path("let-else body".to_owned(), |this| {
                     this.visit_block(else_block)
                 });
@@ -1268,13 +1346,21 @@ impl<'ast> Visitor<'ast> for BodyScanner {
                 }
             }
         }
+        let opaque_restricted = self.non_control_payload
+            && self
+                .current_label
+                .is_some_and(|label| self.preserved_labels.contains(&label))
+            && crate::skeleton::is_restricted_conditional(expr);
+        if opaque_restricted {
+            self.suppress_unlabeled += 1;
+        }
         match &expr.kind {
             ExprKind::If(condition, then_block, else_expr) => {
                 if let ExprKind::Let(pat, value, ..) = &condition.kind {
                     self.collect_pattern(pat, "if-let pattern", None);
-                    self.visit_expr(value);
+                    self.visit_payload(value);
                 } else {
-                    self.visit_expr(condition);
+                    self.visit_payload(condition);
                 }
                 self.with_path("if then branch".to_owned(), |this| {
                     this.visit_block(then_block)
@@ -1293,9 +1379,9 @@ impl<'ast> Visitor<'ast> for BodyScanner {
             ExprKind::While(condition, body, _) => {
                 if let ExprKind::Let(pat, value, ..) = &condition.kind {
                     self.collect_pattern(pat, "while-let pattern", None);
-                    self.visit_expr(value);
+                    self.visit_payload(value);
                 } else {
-                    self.visit_expr(condition);
+                    self.visit_payload(condition);
                 }
                 self.with_path("while body".to_owned(), |this| this.visit_block(body));
             }
@@ -1303,7 +1389,7 @@ impl<'ast> Visitor<'ast> for BodyScanner {
                 pat, iter, body, ..
             } => {
                 self.collect_pattern(pat, "for pattern", None);
-                self.visit_expr(iter);
+                self.visit_payload(iter);
                 self.with_path("for body".to_owned(), |this| this.visit_block(body));
             }
             ExprKind::Loop(body, ..) => {
@@ -1318,17 +1404,22 @@ impl<'ast> Visitor<'ast> for BodyScanner {
                 self.with_path("plain block".to_owned(), |this| this.visit_block(block));
             }
             ExprKind::Match(scrutinee, arms, _) => {
-                self.visit_expr(scrutinee);
+                self.visit_payload(scrutinee);
                 for (index, arm) in arms.iter().enumerate() {
                     self.with_path(format!("match arm {index}"), |this| {
                         this.collect_pattern(&arm.pat, &format!("match-arm-{index} pattern"), None);
                         if let Some(guard) = &arm.guard {
-                            this.visit_expr(guard);
+                            this.visit_payload(guard);
                         }
                         if let Some(body) = &arm.body {
                             this.visit_expr(body);
                         }
                     });
+                }
+            }
+            ExprKind::Ret(value) | ExprKind::Break(_, value) => {
+                if let Some(value) = value {
+                    self.visit_payload(value);
                 }
             }
             ExprKind::Closure(closure) => {
@@ -1343,6 +1434,9 @@ impl<'ast> Visitor<'ast> for BodyScanner {
             }
             ExprKind::MacCall(mac) => self.visit_mac_call(mac),
             _ => visit::walk_expr(self, expr),
+        }
+        if opaque_restricted {
+            self.suppress_unlabeled -= 1;
         }
     }
 
@@ -1380,6 +1474,8 @@ fn leading_expr_attrs(expr: &Expr) -> &[Attribute] {
     match &expr.kind {
         ExprKind::Binary(_, left, _)
         | ExprKind::Unary(_, left)
+        | ExprKind::Assign(left, ..)
+        | ExprKind::AssignOp(_, left, _)
         | ExprKind::Cast(left, _)
         | ExprKind::Type(left, _)
         | ExprKind::Field(left, _)
@@ -1391,6 +1487,23 @@ fn leading_expr_attrs(expr: &Expr) -> &[Attribute] {
         ExprKind::Call(callee, _) => leading_expr_attrs(callee),
         _ => &expr.attrs,
     }
+}
+
+fn statement_labels(block: &rustc_ast::Block) -> HashSet<u32> {
+    struct Collector(HashSet<u32>);
+
+    impl<'ast> Visitor<'ast> for Collector {
+        fn visit_stmt(&mut self, statement: &'ast Stmt) {
+            if let Some(label) = stmt_label(statement) {
+                self.0.insert(label);
+            }
+            visit::walk_stmt(self, statement);
+        }
+    }
+
+    let mut collector = Collector(HashSet::new());
+    collector.visit_block(block);
+    collector.0
 }
 
 enum LabelAttribute {

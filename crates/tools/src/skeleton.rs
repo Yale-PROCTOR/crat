@@ -1307,7 +1307,7 @@ fn contains_let_expression(expr: &Expr) -> bool {
     finder.found
 }
 
-fn is_restricted_conditional(expr: &Expr) -> bool {
+pub(crate) fn is_restricted_conditional(expr: &Expr) -> bool {
     let ExprKind::If(condition, then_block, Some(else_expr)) = &expr.kind else {
         return false;
     };
@@ -1466,7 +1466,7 @@ impl OpaqueNestedIfCollector<'_> {
     }
 }
 
-fn collect_opaque_nested_ifs(
+pub(crate) fn collect_opaque_nested_ifs(
     item: &Item,
     path: &str,
 ) -> Result<FxHashSet<NodeId>, GenerationError> {

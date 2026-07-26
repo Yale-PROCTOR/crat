@@ -35,23 +35,8 @@ pub(crate) fn validate_preservation_metadata(
         ));
     }
 
-    let ItemKind::Fn(box function) = &item.kind else {
-        return Err(metadata_error(
-            "invalid_expected_skeleton",
-            "preservation metadata requires one function skeleton",
-        ));
-    };
-    let mut collector = LabelTreeCollector::default();
-    collector.visit_block(
-        function
-            .body
-            .as_ref()
-            .expect("validated function skeleton has a body"),
-    );
-    if let Some(error) = collector.error {
-        return Err(error);
-    }
-    let all_labels = collector.parents.keys().copied().collect::<HashSet<_>>();
+    let parents = collect_label_parents(item)?;
+    let all_labels = parents.keys().copied().collect::<HashSet<_>>();
     let transformed = statements_requiring_transformation
         .iter()
         .copied()
@@ -66,7 +51,7 @@ pub(crate) fn validate_preservation_metadata(
         ));
     }
     for label in statements_requiring_transformation {
-        let mut parent = collector.parents[label];
+        let mut parent = parents[label];
         while let Some(ancestor) = parent {
             if !transformed.contains(&ancestor) {
                 return Err(metadata_error(
@@ -76,7 +61,7 @@ pub(crate) fn validate_preservation_metadata(
                     ),
                 ));
             }
-            parent = collector.parents[&ancestor];
+            parent = parents[&ancestor];
         }
     }
     Ok(())
@@ -130,17 +115,10 @@ fn canonicalize_function_impl(
             "preservation metadata requires one function skeleton",
         ));
     };
-    if !require_complete_alignment {
-        let mut labels = LabelTreeCollector::default();
-        labels.visit_block(
-            expected_function
-                .body
-                .as_ref()
-                .expect("validated function skeleton has a body"),
-        );
-        if labels.parents.len() == statements_requiring_transformation.len() {
-            return Ok(P(result.clone()));
-        }
+    if !require_complete_alignment
+        && collect_label_parents(expected)?.len() == statements_requiring_transformation.len()
+    {
+        return Ok(P(result.clone()));
     }
     let ItemKind::Fn(box returned_function) = &result.kind else {
         return Err(structural_error(
@@ -188,18 +166,56 @@ fn structural_error(code: &'static str, message: impl Into<String>) -> Preservat
     }
 }
 
-#[derive(Default)]
+fn collect_label_parents(item: &Item) -> Result<HashMap<u32, Option<u32>>, PreservationError> {
+    let ItemKind::Fn(box function) = &item.kind else {
+        return Err(metadata_error(
+            "invalid_expected_skeleton",
+            "preservation metadata requires one function skeleton",
+        ));
+    };
+    crate::skeleton::collect_opaque_nested_ifs(item, "").map_err(|error| {
+        metadata_error(
+            "invalid_expected_skeleton",
+            format!(
+                "expected skeleton has unsupported nested control: {}",
+                error.message
+            ),
+        )
+    })?;
+    let mut collector = LabelTreeCollector {
+        parents: HashMap::new(),
+        parent: None,
+        error: None,
+    };
+    collector.collect_block(
+        function
+            .body
+            .as_ref()
+            .expect("validated function skeleton has a body"),
+    );
+    match collector.error {
+        Some(error) => Err(error),
+        None => Ok(collector.parents),
+    }
+}
+
 struct LabelTreeCollector {
     parents: HashMap<u32, Option<u32>>,
     parent: Option<u32>,
     error: Option<PreservationError>,
 }
 
-impl<'ast> Visitor<'ast> for LabelTreeCollector {
-    fn visit_stmt(&mut self, statement: &'ast Stmt) {
-        if self.error.is_some() {
-            return;
+impl LabelTreeCollector {
+    fn collect_block(&mut self, block: &rustc_ast::Block) {
+        for statement in &block.stmts {
+            self.collect_statement(statement);
+            if self.error.is_some() {
+                return;
+            }
         }
+    }
+
+    fn collect_statement(&mut self, statement: &Stmt) {
         let Some(label) = statement_label(statement) else {
             self.error = Some(metadata_error(
                 "invalid_expected_skeleton",
@@ -214,10 +230,133 @@ impl<'ast> Visitor<'ast> for LabelTreeCollector {
             ));
             return;
         }
+        if non_control_payload(statement).is_some_and(contains_statement_label) {
+            self.error = Some(metadata_error(
+                "invalid_expected_skeleton",
+                format!(
+                    "opaque restricted conditional beneath label {label} must not contain statement labels"
+                ),
+            ));
+            return;
+        }
         let previous = self.parent.replace(label);
-        visit::walk_stmt(self, statement);
+        if let StmtKind::Let(local) = &statement.kind
+            && let LocalKind::InitElse(_, else_block) = &local.kind
+        {
+            self.collect_block(else_block);
+        }
+        if let Some(root) = control_root(statement, false) {
+            self.collect_control(root.expression);
+        }
         self.parent = previous;
     }
+
+    fn collect_control(&mut self, expression: &Expr) {
+        match &expression.kind {
+            ExprKind::If(condition, then_block, else_expression) => {
+                if self.reject_opaque_operand_labels(condition) {
+                    return;
+                }
+                self.collect_block(then_block);
+                if let Some(else_expression) = else_expression {
+                    match &else_expression.kind {
+                        ExprKind::If(..) => self.collect_control(else_expression),
+                        ExprKind::Block(block, _) => self.collect_block(block),
+                        _ => {}
+                    }
+                }
+            }
+            ExprKind::While(condition, body, _) => {
+                if self.reject_opaque_operand_labels(condition) {
+                    return;
+                }
+                self.collect_block(body);
+            }
+            ExprKind::ForLoop { iter, body, .. } => {
+                if self.reject_opaque_operand_labels(iter) {
+                    return;
+                }
+                self.collect_block(body);
+            }
+            ExprKind::Loop(body, ..) | ExprKind::Block(body, ..) => self.collect_block(body),
+            ExprKind::Match(scrutinee, arms, _) => {
+                if self.reject_opaque_operand_labels(scrutinee) {
+                    return;
+                }
+                for arm in arms {
+                    if let Some(guard) = &arm.guard
+                        && self.reject_opaque_operand_labels(guard)
+                    {
+                        return;
+                    }
+                    if let Some(body) = &arm.body
+                        && let ExprKind::Block(block, _) = &body.kind
+                    {
+                        self.collect_block(block);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn reject_opaque_operand_labels(&mut self, expression: &Expr) -> bool {
+        if self.error.is_none() && contains_statement_label(expression) {
+            let label = self
+                .parent
+                .expect("control operand is visited beneath its statement label");
+            self.error = Some(metadata_error(
+                "invalid_expected_skeleton",
+                format!(
+                    "opaque restricted conditional beneath label {label} must not contain statement labels"
+                ),
+            ));
+            true
+        } else {
+            false
+        }
+    }
+}
+
+fn non_control_payload(statement: &Stmt) -> Option<&Expr> {
+    let (expression, role) = match &statement.kind {
+        StmtKind::Let(local) => match &local.kind {
+            LocalKind::Init(expression) | LocalKind::InitElse(expression, _) => {
+                (expression.as_ref(), ControlRole::LetInitializer)
+            }
+            LocalKind::Decl => return None,
+        },
+        StmtKind::Expr(expression) | StmtKind::Semi(expression) => match &expression.kind {
+            ExprKind::Ret(Some(value)) => (value.as_ref(), ControlRole::ReturnValue),
+            ExprKind::Break(_, Some(value)) => (value.as_ref(), ControlRole::BreakValue),
+            _ => (expression.as_ref(), ControlRole::Statement),
+        },
+        _ => return None,
+    };
+    control_expression(expression, role)
+        .is_none()
+        .then_some(expression)
+}
+
+fn contains_statement_label(expression: &Expr) -> bool {
+    struct Finder(bool);
+
+    impl<'ast> Visitor<'ast> for Finder {
+        fn visit_stmt(&mut self, statement: &'ast Stmt) {
+            if effective_statement_attributes(statement)
+                .iter()
+                .any(|attribute| !matches!(parse_label_attribute(attribute), Ok(None)))
+            {
+                self.0 = true;
+                return;
+            }
+            visit::walk_stmt(self, statement);
+        }
+    }
+
+    let mut finder = Finder(false);
+    finder.visit_expr(expression);
+    finder.0
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -913,6 +1052,8 @@ fn leading_expression_attributes(expression: &Expr) -> &[Attribute] {
     match &expression.kind {
         ExprKind::Binary(_, left, _)
         | ExprKind::Unary(_, left)
+        | ExprKind::Assign(left, ..)
+        | ExprKind::AssignOp(_, left, _)
         | ExprKind::Cast(left, _)
         | ExprKind::Type(left, _)
         | ExprKind::Field(left, _)
