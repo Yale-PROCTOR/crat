@@ -898,6 +898,234 @@ mod ownership_yield {
     }
 }
 
+/// Measurement-only contracts for the three-part ownership diagnostic package.
+///
+/// The RED commit deliberately provides inert answers so each test below
+/// compiles and fails at assertion level. GREEN binds these contracts to the
+/// diagnostic workers without changing BO or production semantics.
+mod ownership_diagnostic_package {
+    use super::ownership_yield::OwnerClass;
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum HardConstraintDecision {
+        Assert,
+        Suppress,
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct FilterProbe {
+        pub decision: HardConstraintDecision,
+        pub label_evaluated: bool,
+        pub tracking_markers: usize,
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum CausalBucket {
+        JointNoSingleFamilyNecessity,
+        SoleOwnAssume,
+        Other,
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum AssumeSite {
+        OpaqueCallArg,
+        LibcRule,
+        LocalWrapper,
+        SsaTransfer,
+        TemporaryFinalization,
+        CastOrDepth,
+        OtherInternal,
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum PrecisionClass {
+        Full,
+        Degraded,
+        Dummy,
+    }
+
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    pub struct BoxDecisionCounts {
+        pub locals: usize,
+        pub params: usize,
+        pub returns: usize,
+        pub fields: usize,
+        pub d0_locals: usize,
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum RetryStatus {
+        CompleteFirstPass,
+        CompleteAfterRetry,
+        ResourceDeferred,
+    }
+
+    pub fn inactive_filter_probe(_label: impl FnOnce() -> String) -> FilterProbe {
+        FilterProbe {
+            decision: HardConstraintDecision::Suppress,
+            label_evaluated: true,
+            tracking_markers: 1,
+        }
+    }
+
+    pub fn active_filter_probe(
+        _family: &str,
+        _label: impl FnOnce() -> String,
+    ) -> FilterProbe {
+        FilterProbe {
+            decision: HardConstraintDecision::Assert,
+            label_evaluated: false,
+            tracking_markers: 1,
+        }
+    }
+
+    pub fn replay_matches_official(_expected: &[usize], _actual: &[usize]) -> bool {
+        false
+    }
+
+    pub fn removal_is_necessary(_result_is_sat: bool) -> bool {
+        false
+    }
+
+    pub fn causal_bucket(_necessary_families: &[&str]) -> CausalBucket {
+        CausalBucket::Other
+    }
+
+    pub fn classify_assume_site(_label: &str) -> AssumeSite {
+        AssumeSite::OtherInternal
+    }
+
+    pub fn precision_class(_final_precision: u8, _required_precision: u8) -> PrecisionClass {
+        PrecisionClass::Degraded
+    }
+
+    pub fn owning_precision_function(_owner: OwnerClass) -> Option<&'static str> {
+        Some("function")
+    }
+
+    pub fn parse_pointer_diagnostics(_input: &str) -> Result<BoxDecisionCounts, String> {
+        Ok(BoxDecisionCounts::default())
+    }
+
+    pub fn retry_status(_first: &str, _retry: Option<&str>) -> RetryStatus {
+        RetryStatus::ResourceDeferred
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use std::cell::Cell;
+
+        use super::*;
+
+        #[test]
+        fn diagnostic_package_inactive_filter_is_byte_path_inert() {
+            let called = Cell::new(false);
+            let got = inactive_filter_probe(|| {
+                called.set(true);
+                "own-linear(x+y=z)".to_string()
+            });
+            assert_eq!(
+                (got.decision, got.label_evaluated, called.get()),
+                (HardConstraintDecision::Assert, false, false)
+            );
+        }
+
+        #[test]
+        fn diagnostic_package_active_filter_is_untracked() {
+            let got = active_filter_probe("own-linear", || "own-linear(x+y=z)".to_string());
+            assert_eq!(
+                (got.decision, got.label_evaluated, got.tracking_markers),
+                (HardConstraintDecision::Suppress, true, 0)
+            );
+        }
+
+        #[test]
+        fn diagnostic_package_replay_requires_exact_selector_sets() {
+            assert!(replay_matches_official(&[0, 2, 7], &[0, 2, 7]));
+        }
+
+        #[test]
+        fn diagnostic_package_sat_removal_is_necessary_and_all_false_is_joint() {
+            assert_eq!(
+                (
+                    removal_is_necessary(true),
+                    causal_bucket(&[]),
+                    causal_bucket(&["own-assume"])
+                ),
+                (
+                    true,
+                    CausalBucket::JointNoSingleFamilyNecessity,
+                    CausalBucket::SoleOwnAssume
+                )
+            );
+        }
+
+        #[test]
+        fn diagnostic_package_tags_assume_provenance() {
+            assert_eq!(
+                [
+                    classify_assume_site("own-assume[opaque-call-arg](v1=false)"),
+                    classify_assume_site("own-assume[libc-rule](v2=false)"),
+                    classify_assume_site("own-assume[local-wrapper](v3=false)"),
+                ],
+                [
+                    AssumeSite::OpaqueCallArg,
+                    AssumeSite::LibcRule,
+                    AssumeSite::LocalWrapper,
+                ]
+            );
+        }
+
+        #[test]
+        fn diagnostic_package_precision_has_full_degraded_dummy_trichotomy() {
+            assert_eq!(
+                [
+                    precision_class(2, 2),
+                    precision_class(1, 2),
+                    precision_class(0, 2),
+                ],
+                [
+                    PrecisionClass::Full,
+                    PrecisionClass::Degraded,
+                    PrecisionClass::Dummy,
+                ]
+            );
+        }
+
+        #[test]
+        fn diagnostic_package_fields_have_no_function_precision() {
+            assert_eq!(owning_precision_function(OwnerClass::Field), None);
+        }
+
+        #[test]
+        fn diagnostic_package_parses_final_box_family_subjects() {
+            let input = "\
+[pointer-decision] subject=local fn=a name=x original=*mut i32 span=s final=Box\n\
+[pointer-decision] subject=param fn=a index=0 name=p original=*mut i32 span=s final=OptBox\n\
+[pointer-decision] subject=return fn=a original=*mut i32 final=BoxedSlice\n\
+[pointer-decision] subject=field field=S.f original=*mut i32 final=OptBoxedSlice\n";
+            assert_eq!(
+                parse_pointer_diagnostics(input).expect("pointer diagnostics"),
+                BoxDecisionCounts {
+                    locals: 1,
+                    params: 1,
+                    returns: 1,
+                    fields: 1,
+                    d0_locals: 1,
+                }
+            );
+        }
+
+        #[test]
+        fn diagnostic_package_resource_retry_contract_is_deterministic() {
+            assert_eq!(
+                retry_status("timeout", Some("ok")),
+                RetryStatus::CompleteAfterRetry
+            );
+        }
+    }
+}
+
 /// Measurement-only report contract for the source-selector leak diagnosis.
 ///
 /// The official untracked solve remains authoritative for selector choices.
