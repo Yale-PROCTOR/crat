@@ -1520,16 +1520,19 @@ mod selector_leak_diagnosis {
             let known = ["safe-mono", "borrow-exclusion"];
             assert_eq!(
                 validate_families(
-                    ["f::safe-mono(a=>b)", "replay::borrow-exclusion(x,[])"],
+                    [
+                        "family-marker::safe-mono",
+                        "family-marker::borrow-exclusion",
+                    ],
                     &known,
                 )
                 .unwrap(),
                 BTreeSet::from(["borrow-exclusion".to_string(), "safe-mono".to_string()])
             );
             assert!(
-                validate_families(["f::fatness"], &known)
+                validate_families(["f::safe-mono(a=>b)"], &known)
                     .unwrap_err()
-                    .contains("unrecognized")
+                    .contains("family marker")
             );
         }
 
@@ -1584,13 +1587,13 @@ mod selector_leak_diagnosis {
             let record = CoreRecord {
                 program: "bst".to_string(),
                 selector_key: "bst/source:0".to_string(),
-                phase: TracePhase::Reenable,
+                phase: TracePhase::Drop,
                 raw_families: BTreeSet::from([
                     "borrow-exclusion".to_string(),
                     "safe-mono".to_string(),
                 ]),
-                minimized_families: BTreeSet::from(["borrow-exclusion".to_string()]),
-                minimized: true,
+                minimized_families: BTreeSet::new(),
+                minimized: false,
                 reenable_outcome: TraceOutcome::StayedDropped,
                 out_param_tag: cheap_out_param_tag(false, true),
                 commit_origin: Some("target=x issuer=y".to_string()),
@@ -1611,6 +1614,37 @@ mod selector_leak_diagnosis {
             }
             assert!(cross_tab.contains("family,bst,total"));
             assert!(cross_tab.contains("borrow-exclusion,1,1"));
+            assert!(cross_tab.contains("safe-mono,1,1"));
+        }
+
+        #[test]
+        fn selector_leak_final_records_use_drop_core_not_reenable_tracking() {
+            let evidence = CoreEvidence {
+                program: "bst".to_string(),
+                selector_key: "bst/source:0".to_string(),
+                selector_index: 0,
+                class: SelectorClass::Source,
+                epoch: 0,
+                phase: TracePhase::Drop,
+                outcome: TraceOutcome::StayedDropped,
+                active_before: vec![0],
+                official_selector_core: vec![0],
+                raw_labels: vec!["family-marker::safe-mono".to_string()],
+                raw_families: BTreeSet::from(["safe-mono".to_string()]),
+                minimized_labels: Vec::new(),
+                minimized_families: BTreeSet::new(),
+                minimized: false,
+                out_param_tag: OutParamTag::Untagged,
+                commit_origins: Vec::new(),
+            };
+            let records =
+                final_records(&[evidence], SelectorClass::Source).expect("drop-phase record");
+            assert_eq!(records.len(), 1);
+            assert_eq!(records[0].phase, TracePhase::Drop);
+            assert_eq!(
+                records[0].reenable_outcome,
+                TraceOutcome::StayedDropped
+            );
         }
     }
 }
