@@ -1,21 +1,14 @@
-//! §NB3-3c-i — signature-origin inference (compute-only; NOT yet injected into the borrow replay).
+//! BO-native signature-origin inference.
 //!
-//! Thin-reuse architecture (ruled 2026-07-11): derive origin relations from production
-//! `lifetime_flow`'s signature-granularity value-flow summaries, wrapped **read-only** behind the
-//! single call site `derive_signature_flows` (isolation requirement). `OriginSummary` is the only
-//! interface the rest of BO sees. **NB5-O is NOT a body-only swap** (corrected after the 3c-i
-//! adversarial review): `OriginSummary` still uses production slot types (`LifetimeSlot` /
-//! `SignatureSlot`) and `derive_signature_flows` returns `LifetimeFlowResults`, so retiring
-//! `lifetime_flow` at NB5-O replaces the derivation body AND those interface/return types with
-//! BO-owned index/place/slot types — with the production→BO conversion kept behind this one adapter.
-//! Scoped (the isolation still holds — one call site + one type boundary), but not drop-in; gated on
-//! a corpus differential.
+//! NB5-O replaced the wrapped production `lifetime_flow` route with BO-owned slot types and
+//! `origin_flow`. `OriginSummary` remains the only interface the rest of BO sees. The wrapped
+//! derivation and its production→BO conversion remain compiled only in tests as the differential
+//! oracle; production `analyses/borrow/` stays frozen for the rewriter.
 //!
 //! What this adds over the reused summaries: (1) a **transitively-correct** subset closure (the
 //! production `subset_closure` is 1-hop — D3, diagnostic-only, never reused); (2) `unknown` carried
 //! for candidacy demotion. Origin inference is kind-independent and runs ONCE per program;
-//! `ORIGIN_WRAP_COUNT` (counting ORIGINS' wrap, not the underlying lifetime-flow call) backs the
-//! runs-once invariant.
+//! `origin_flow::ORIGIN_DERIVATION_COUNT` backs the runs-once invariant.
 //!
 //! §NB3-3c-ii OUTCOME (2026-07-12): compute-only is where origins STAY on the BO path.
 //! - **Depth-0 subset is NOT injected — proven redundant.** `nb3c_origins_subset_redundant_vs_depth0`
@@ -28,48 +21,85 @@
 //!   treatment is effect-dependent (may-overwrite vs may-supply vs pure-read) = NB4. The clause impl +
 //!   retain-shape/negative-control witnesses are saved as an NB4 seed patch.
 
-use std::cell::Cell;
-
 use rustc_index::{
-    Idx,
+    Idx, IndexVec,
     bit_set::{DenseBitSet, SparseBitMatrix},
 };
 
-use crate::analyses::borrow::lifetime_flow::{self, LifetimeFlowResults, LifetimeSlot};
+#[cfg(test)]
+use super::origin_summary::SignaturePlace;
+use super::{
+    crate_slots::CrateSlots,
+    origin_flow,
+    origin_summary::{OriginSlot, OriginSummaries, OriginSummary, SignatureRoot, SignatureSlot},
+    solver::SlotRef,
+};
+#[cfg(test)]
+use crate::analyses::borrow::lifetime_flow::{self, LifetimeFlowResults};
 use crate::utils::rustc::RustProgram;
 
-use super::crate_slots::CrateSlots;
-use super::origin_summary::{OriginSummaries, OriginSummary};
-use super::solver::SlotRef;
-
-thread_local! {
-    /// Per-thread count of `compute_origins` invocations (one increment per call), NOT the underlying
-    /// lifetime-flow derivation. Backs the "origin inference runs once per program, kind-independent"
-    /// invariant. **THREAD-LOCAL, not a global atomic:** compiler test sessions run on separate
-    /// threads with thread-local rustc session globals, so compute_origins calls from concurrent tests
-    /// race a global counter; the runs-once test measures this counter's delta around a single driver
-    /// call, all on one callback thread, where a thread-local delta is exact.
-    pub(crate) static ORIGIN_WRAP_COUNT: Cell<usize> = const { Cell::new(0) };
-}
-
-/// The ONE derivation call site (isolation requirement). NB5-O replaces this body's derivation AND
-/// its `LifetimeFlowResults` return with a BO-native origin derivation over BO-owned types; downstream
-/// keys off `OriginSummary`, whose field types (`LifetimeSlot`/`SignatureSlot`) are ALSO swapped to
-/// BO-owned at that point (not a body-only change — 3c-i review). (3c-ii established that origins are
-/// NOT injected into the replay — the depth-0 subset is redundant — so there is no double-compute to
-/// avoid on an injection path; NB4's effect-aware `unknown` use will consume the ctxt's `lifetime_flows`.)
-fn derive_signature_flows(program: &RustProgram<'_>) -> LifetimeFlowResults {
+/// Test-only wrapped oracle at the single production→BO type boundary.
+#[cfg(test)]
+fn derive_signature_flows_wrapped(program: &RustProgram<'_>) -> LifetimeFlowResults {
     lifetime_flow::analyze_program_lifetime_flow(program)
 }
 
-/// Whole-program signature-origin summaries. Computed once, kind-independent.
-pub(crate) fn compute_origins(program: &RustProgram<'_>) -> OriginSummaries {
-    ORIGIN_WRAP_COUNT.with(|c| c.set(c.get() + 1));
-    derive_signature_flows(program)
+#[cfg(test)]
+fn wrapped_slot(slot: crate::analyses::borrow::lifetime_flow::SignatureSlot) -> SignatureSlot {
+    let root = match slot.place.root {
+        crate::analyses::borrow::lifetime_flow::SignatureRoot::Return => SignatureRoot::Return,
+        crate::analyses::borrow::lifetime_flow::SignatureRoot::Arg(local) => {
+            SignatureRoot::Arg(local)
+        }
+    };
+    let field = slot.place.field.map(|field| super::slots::StructFieldSlot {
+        struct_did: field.struct_did,
+        field_index: field.field_index,
+    });
+    SignatureSlot {
+        place: SignaturePlace {
+            root,
+            deref_depth: slot.place.deref_depth,
+            field,
+        },
+        depth: slot.depth,
+    }
+}
+
+fn build_origin_summary(
+    slots: IndexVec<OriginSlot, SignatureSlot>,
+    value_flows: &SparseBitMatrix<OriginSlot, OriginSlot>,
+    storage_aliases: &SparseBitMatrix<OriginSlot, OriginSlot>,
+    unknown: DenseBitSet<OriginSlot>,
+) -> OriginSummary {
+    let n = slots.len();
+    let mut combined = SparseBitMatrix::new(n);
+    for relation in [value_flows, storage_aliases] {
+        for source in relation.rows() {
+            if let Some(targets) = relation.row(source) {
+                for target in targets.iter() {
+                    combined.insert(source, target);
+                }
+            }
+        }
+    }
+    OriginSummary {
+        slots,
+        subset: transitive_closure(&combined, n),
+        unknown,
+    }
+}
+
+/// Wrapped validation oracle converted at the single production→BO type boundary.
+#[cfg(test)]
+pub(crate) fn compute_origins_wrapped(program: &RustProgram<'_>) -> OriginSummaries {
+    derive_signature_flows_wrapped(program)
         .into_iter()
         .map(|(f, result)| {
             let summary = result.summary;
             let n = summary.slots.len();
+            let slots =
+                IndexVec::from_raw(summary.slots.iter().copied().map(wrapped_slot).collect());
             // `subset` = closure(value_flows ∪ storage_aliases). `closed()` fuses storage into
             // value_flows at BODY granularity, but `to_summary()` re-projects value_flow targets
             // through an `observable_value_target` filter (lifetime_flow.rs:758) that DROPS some
@@ -80,25 +110,61 @@ pub(crate) fn compute_origins(program: &RustProgram<'_>) -> OriginSummaries {
             // Unioning `storage_aliases` back in BEFORE closing restores the complete relation in one
             // matrix (no separate storage field). The union is not pre-closed across value↔storage
             // chains, so `transitive_closure` below does real work (and is guarded directly).
-            let mut combined = summary.value_flows;
-            for src in summary.storage_aliases.rows() {
-                if let Some(tgts) = summary.storage_aliases.row(src) {
+            let mut value_flows = SparseBitMatrix::new(n);
+            for src in summary.value_flows.rows() {
+                if let Some(tgts) = summary.value_flows.row(src) {
                     for tgt in tgts.iter() {
-                        combined.insert(src, tgt);
+                        value_flows
+                            .insert(OriginSlot::new(src.index()), OriginSlot::new(tgt.index()));
                     }
                 }
             }
-            let subset = transitive_closure(&combined, n);
+            let mut storage_aliases = SparseBitMatrix::new(n);
+            for src in summary.storage_aliases.rows() {
+                if let Some(tgts) = summary.storage_aliases.row(src) {
+                    for tgt in tgts.iter() {
+                        storage_aliases
+                            .insert(OriginSlot::new(src.index()), OriginSlot::new(tgt.index()));
+                    }
+                }
+            }
+            let mut unknown = DenseBitSet::new_empty(n);
+            for slot in summary.unknown_targets.iter() {
+                unknown.insert(OriginSlot::new(slot.index()));
+            }
             (
                 f,
-                OriginSummary {
-                    slots: summary.slots,
-                    subset,
-                    unknown: summary.unknown_targets,
-                },
+                build_origin_summary(slots, &value_flows, &storage_aliases, unknown),
             )
         })
         .collect()
+}
+
+/// NB5-O native derivation over BO-owned MIR-flow and signature-slot types.
+pub(crate) fn compute_origins_native(program: &RustProgram<'_>) -> OriginSummaries {
+    let flows = origin_flow::analyze_program_origin_flow(program);
+    let summaries = flows
+        .iter()
+        .map(|(&f, result)| {
+            let summary = &result.summary;
+            (
+                f,
+                build_origin_summary(
+                    summary.slots.clone(),
+                    &summary.value_flows,
+                    &summary.storage_aliases,
+                    summary.unknown_targets.clone(),
+                ),
+            )
+        })
+        .collect();
+    OriginSummaries::native(summaries, flows)
+}
+
+/// Whole-program signature-origin summaries. NB5-O's zero-delta rs-crown differential retired the
+/// wrapped production derivation from the BO path; it remains available only as a test oracle.
+pub(crate) fn compute_origins(program: &RustProgram<'_>) -> OriginSummaries {
+    compute_origins_native(program)
 }
 
 /// §NB4-4c NO-BORROW-ORIGIN DEMOTION SET: the origins' `unknown` SIGNATURE/FIELD slots, mapped to
@@ -151,20 +217,15 @@ pub(crate) fn collect_no_borrow_origin_slots(
 /// `field_index`)` semantics (`borrow/mod.rs:136` `field.index()` vs `crate_slots.rs:39-46`
 /// `all_fields().enumerate()`), but distinct nominal types.
 fn signature_slot_to_ref(
-    sig: crate::analyses::borrow::lifetime_flow::SignatureSlot,
+    sig: SignatureSlot,
     f: rustc_span::def_id::LocalDefId,
     slots: &CrateSlots,
 ) -> Option<SlotRef> {
-    use crate::analyses::borrow::lifetime_flow::SignatureRoot;
     use rustc_middle::mir::RETURN_PLACE;
     if let Some(field) = sig.place.field {
-        let kind_field = super::slots::StructFieldSlot {
-            struct_did: field.struct_did,
-            field_index: field.field_index,
-        };
         return slots
             .field_slots
-            .slot_for_field_depth(kind_field, sig.depth)
+            .slot_for_field_depth(field, sig.depth)
             .map(SlotRef::Field);
     }
     let universe = slots.fn_local_slots.get(&f)?;
@@ -215,7 +276,7 @@ pub(crate) fn collect_overincluded_modeled_origin_slots(
 /// True iff `s` has an incoming subset edge `sub → s` from a non-self, non-`unknown` source (a modeled
 /// borrow origin flows into it). `mitigated` additionally requires the edge be unidirectional (no
 /// reverse `s → sub`), discarding the symmetric storage aliases folded into `subset`.
-fn carries_modeled_origin(summary: &OriginSummary, s: LifetimeSlot, mitigated: bool) -> bool {
+fn carries_modeled_origin(summary: &OriginSummary, s: OriginSlot, mitigated: bool) -> bool {
     for sub in summary.subset.rows() {
         if sub == s || summary.unknown.contains(sub) {
             continue;
@@ -238,8 +299,11 @@ fn carries_modeled_origin(summary: &OriginSummary, s: LifetimeSlot, mitigated: b
 /// symmetric storage aliases. Removing these from the demotion set yields collateral ≥ the TRUE
 /// recoverable, so it is the SOUND upper bound the defer/gate decision needs. A pure opaque result has
 /// NO incoming edge (the opaque call breaks the flow), so it stays demoted — correctly excluded.
-fn has_any_incoming_origin(summary: &OriginSummary, s: LifetimeSlot) -> bool {
-    summary.subset.rows().any(|sub| summary.subset.contains(sub, s))
+fn has_any_incoming_origin(summary: &OriginSummary, s: OriginSlot) -> bool {
+    summary
+        .subset
+        .rows()
+        .any(|sub| summary.subset.contains(sub, s))
 }
 
 /// §NB4-4c-Q UPPER-BOUND over-inclusion collector (Codex F1). The self-inclusive maximal set; see
@@ -267,13 +331,13 @@ pub(crate) fn collect_upperbound_overincluded_slots(
 /// This is the transitively-correct closure the production `subset_closure` (1-hop, D3) is not —
 /// note line: successors are taken from the POPPED node, never the root.
 fn transitive_closure(
-    value_flows: &SparseBitMatrix<LifetimeSlot, LifetimeSlot>,
+    value_flows: &SparseBitMatrix<OriginSlot, OriginSlot>,
     n_slots: usize,
-) -> SparseBitMatrix<LifetimeSlot, LifetimeSlot> {
+) -> SparseBitMatrix<OriginSlot, OriginSlot> {
     let mut answer = SparseBitMatrix::new(n_slots);
-    let mut stack: Vec<LifetimeSlot> = vec![];
-    let mut visited: DenseBitSet<LifetimeSlot> = DenseBitSet::new_empty(n_slots);
-    for root in (0..n_slots).map(LifetimeSlot::new) {
+    let mut stack: Vec<OriginSlot> = vec![];
+    let mut visited: DenseBitSet<OriginSlot> = DenseBitSet::new_empty(n_slots);
+    for root in (0..n_slots).map(OriginSlot::new) {
         stack.clear();
         visited.clear();
         if let Some(succs) = value_flows.row(root) {
@@ -294,11 +358,14 @@ fn transitive_closure(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::analyses::borrow::lifetime_flow::{SignatureRoot, SignatureSlot};
     use rustc_hash::FxHashMap;
     use rustc_hir::{ItemKind, OwnerNode};
     use rustc_middle::ty::TyCtxt;
+
+    use super::*;
+    use crate::analyses::borrow_ownership::origin_summary::{
+        OriginSlot, SignatureRoot, SignatureSlot,
+    };
 
     fn build_program(tcx: TyCtxt<'_>) -> RustProgram<'_> {
         let mut functions = vec![];
@@ -312,7 +379,11 @@ mod tests {
                 _ => {}
             }
         }
-        RustProgram { tcx, functions, structs }
+        RustProgram {
+            tcx,
+            functions,
+            structs,
+        }
     }
 
     fn format_slot(slot: SignatureSlot) -> String {
@@ -337,11 +408,11 @@ mod tests {
     fn origin_facts(code: &str) -> FxHashMap<String, Facts> {
         ::utils::compilation::run_compiler_on_str(code, |tcx| {
             let program = build_program(tcx);
-            let summaries = compute_origins(&program);
+            let summaries = compute_origins_native(&program);
             let mut out = FxHashMap::default();
             for &f in &program.functions {
                 let s = &summaries[&f];
-                let edges = |m: &rustc_index::bit_set::SparseBitMatrix<LifetimeSlot, LifetimeSlot>| {
+                let edges = |m: &rustc_index::bit_set::SparseBitMatrix<OriginSlot, OriginSlot>| {
                     let mut v = vec![];
                     for sub in m.rows() {
                         if let Some(sups) = m.row(sub) {
@@ -353,17 +424,97 @@ mod tests {
                     v.sort();
                     v
                 };
-                let mut unknown: Vec<String> =
-                    s.unknown.iter().map(|slot| format_slot(s.slots[slot])).collect();
+                let mut unknown: Vec<String> = s
+                    .unknown
+                    .iter()
+                    .map(|slot| format_slot(s.slots[slot]))
+                    .collect();
                 unknown.sort();
                 out.insert(
                     tcx.item_name(f.to_def_id()).to_string(),
-                    Facts { subset: edges(&s.subset), unknown },
+                    Facts {
+                        subset: edges(&s.subset),
+                        unknown,
+                    },
                 );
             }
             out
         })
         .unwrap()
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct CanonicalSummary {
+        slots: Vec<String>,
+        subset: Vec<(String, String)>,
+        unknown: Vec<String>,
+    }
+
+    fn canonical_summaries(
+        code: &str,
+        compute: for<'tcx> fn(&RustProgram<'tcx>) -> OriginSummaries,
+    ) -> FxHashMap<String, CanonicalSummary> {
+        ::utils::compilation::run_compiler_on_str(code, |tcx| {
+            let program = build_program(tcx);
+            let summaries = compute(&program);
+            let mut out = FxHashMap::default();
+            for &f in &program.functions {
+                let summary = &summaries[&f];
+                let slots = summary.slots.iter().copied().map(format_slot).collect();
+                let mut subset = Vec::new();
+                for sub in summary.subset.rows() {
+                    if let Some(sups) = summary.subset.row(sub) {
+                        for sup in sups.iter() {
+                            subset.push((
+                                format_slot(summary.slots[sub]),
+                                format_slot(summary.slots[sup]),
+                            ));
+                        }
+                    }
+                }
+                subset.sort();
+                let mut unknown = summary
+                    .unknown
+                    .iter()
+                    .map(|slot| format_slot(summary.slots[slot]))
+                    .collect::<Vec<_>>();
+                unknown.sort();
+                out.insert(
+                    tcx.item_name(f.to_def_id()).to_string(),
+                    CanonicalSummary {
+                        slots,
+                        subset,
+                        unknown,
+                    },
+                );
+            }
+            out
+        })
+        .unwrap()
+    }
+
+    /// NB5-O RED: the BO-native derivation must reproduce the wrapped oracle at the finest
+    /// summary granularity: every function, ordered slot, subset edge, and unknown membership.
+    #[test]
+    fn nb5o_native_matches_wrapped_fixture_summaries() {
+        const FIXTURES: &[&str] = &[
+            "unsafe fn id(p: *mut i32) -> *mut i32 { p }",
+            "unsafe fn f(dst: *mut *mut i32, src: *mut i32) { *dst = src; }",
+            "unsafe fn addr(mut p: *mut i32) -> *mut *mut i32 { &raw mut p }",
+            "unsafe extern \"C\" { fn ext(p: *mut i32) -> *mut i32; }\n\
+             unsafe fn f(p: *mut i32) -> *mut i32 { ext(p) }",
+            "unsafe fn a(p: *mut i32, n: i32) -> *mut i32 { if n == 0 { p } else { b(p, n - 1) } }\n\
+             unsafe fn b(p: *mut i32, n: i32) -> *mut i32 { if n == 0 { p } else { a(p, n - 1) } }",
+            "struct A { p: *mut i32 }\nstruct B { p: *mut i32 }\n\
+             unsafe fn f(a: *mut A, b: *mut B) { (*a).p = (*b).p; }",
+        ];
+        for fixture in FIXTURES {
+            assert_eq!(
+                canonical_summaries(fixture, compute_origins_native),
+                canonical_summaries(fixture, compute_origins_wrapped),
+                "native/wrapped summary delta for fixture:\n{fixture}"
+            );
+        }
     }
 
     fn has(edges: &[(String, String)], sub: &str, sup: &str) -> bool {
@@ -431,8 +582,7 @@ mod tests {
     /// RED: `*dst = src` — src's origin flows into arg0's storage (output-param shape).
     #[test]
     fn nb3_arg_into_arg0_storage_flow() {
-        let facts =
-            origin_facts("unsafe fn f(dst: *mut *mut i32, src: *mut i32) { *dst = src; }");
+        let facts = origin_facts("unsafe fn f(dst: *mut *mut i32, src: *mut i32) { *dst = src; }");
         let f = &facts["f"];
         // src (arg2@0) flows into dst's pointee (arg1@1 — the store `*dst = src`); the deref is
         // captured in the slot depth, and this output-param flow lands in the same subset seam
@@ -452,8 +602,7 @@ mod tests {
     /// directions in `subset` is exactly what pins that the symmetric relation survives the fold.
     #[test]
     fn nb3_storage_alias_symmetric() {
-        let facts =
-            origin_facts("unsafe fn forward(out: *mut *mut i32) -> *mut *mut i32 { out }");
+        let facts = origin_facts("unsafe fn forward(out: *mut *mut i32) -> *mut *mut i32 { out }");
         let f = &facts["forward"];
         assert!(
             has(&f.subset, "arg1@1", "return@1"),
@@ -494,14 +643,21 @@ mod tests {
     /// closure the NB5-O BO-native (un-closed) input will depend on.
     #[test]
     fn transitive_closure_multi_hop_from_synthetic() {
-        let mut m: SparseBitMatrix<LifetimeSlot, LifetimeSlot> = SparseBitMatrix::new(3);
-        let (a, b, c) = (LifetimeSlot::new(0), LifetimeSlot::new(1), LifetimeSlot::new(2));
+        let mut m: SparseBitMatrix<OriginSlot, OriginSlot> = SparseBitMatrix::new(3);
+        let (a, b, c) = (OriginSlot::new(0), OriginSlot::new(1), OriginSlot::new(2));
         m.insert(a, b);
         m.insert(b, c);
         let closed = transitive_closure(&m, 3);
-        let reaches = |x: LifetimeSlot, y: LifetimeSlot| closed.row(x).is_some_and(|r| r.iter().any(|z| z == y));
-        assert!(reaches(a, c), "A→C must hold transitively (A→B→C); a 1-hop closure misses it");
-        assert!(reaches(a, b) && reaches(b, c), "direct A→B and B→C must hold");
+        let reaches =
+            |x: OriginSlot, y: OriginSlot| closed.row(x).is_some_and(|r| r.iter().any(|z| z == y));
+        assert!(
+            reaches(a, c),
+            "A→C must hold transitively (A→B→C); a 1-hop closure misses it"
+        );
+        assert!(
+            reaches(a, b) && reaches(b, c),
+            "direct A→B and B→C must hold"
+        );
     }
 
     /// Argument depth-0 storage symmetry regression (Codex 3c-i re-review). A storage alias whose
@@ -512,8 +668,7 @@ mod tests {
     /// removed separate field).
     #[test]
     fn nb3_arg_depth0_storage_symmetry() {
-        let facts =
-            origin_facts("unsafe fn addr(mut p: *mut i32) -> *mut *mut i32 { &raw mut p }");
+        let facts = origin_facts("unsafe fn addr(mut p: *mut i32) -> *mut *mut i32 { &raw mut p }");
         let f = &facts["addr"];
         assert!(
             has(&f.subset, "arg1@0", "return@1") && has(&f.subset, "return@1", "arg1@0"),
@@ -539,8 +694,9 @@ mod tests {
     // and 3c-ii injection would be depth-0 (the depth-0/Local-grained provenance universe). Deeper
     // origins are the NB5-O harvest, out of scope here.
 
-    use crate::analyses::borrow::{ProvenanceOwner, StructFieldSlot};
     use rustc_hash::FxHashSet;
+
+    use crate::analyses::{borrow::ProvenanceOwner, borrow_ownership::slots::StructFieldSlot};
 
     // Owner key preserving FULL field identity (F4, Codex 2026-07-12): `StructFieldSlot` carries
     // `struct_did` + `field_index`, so keying fields by `field_index` alone collided field-0 across
@@ -556,7 +712,10 @@ mod tests {
     fn owner_key(o: ProvenanceOwner) -> OKey {
         match o {
             ProvenanceOwner::Local(l) => OKey::Local(l.index()),
-            ProvenanceOwner::Field(sf) => OKey::Field(sf),
+            ProvenanceOwner::Field(sf) => OKey::Field(StructFieldSlot {
+                struct_did: sf.struct_did,
+                field_index: sf.field_index,
+            }),
         }
     }
 
@@ -628,17 +787,19 @@ mod tests {
                 // these (`depth0_value_flows` reads value_flows only), so they classify as `storage`.
                 let mut store: FxHashSet<(OKey, OKey)> = FxHashSet::default();
                 for sub in storage.rows() {
-                    let Some(sk) = slot_key(o.slots[sub]) else { continue };
+                    let Some(sk) = slot_key(o.slots[OriginSlot::new(sub.index())]) else {
+                        continue;
+                    };
                     if let Some(sups) = storage.row(sub) {
                         for sup in sups.iter() {
-                            if let Some(tk) = slot_key(o.slots[sup]) {
+                            if let Some(tk) = slot_key(o.slots[OriginSlot::new(sup.index())]) {
                                 store.insert((sk, tk));
                             }
                         }
                     }
                 }
 
-                let unknown: std::collections::BTreeSet<LifetimeSlot> = o.unknown.iter().collect();
+                let unknown: std::collections::BTreeSet<OriginSlot> = o.unknown.iter().collect();
                 let mut buckets = Buckets::default();
                 for sub in o.subset.rows() {
                     if unknown.contains(&sub) {
@@ -684,7 +845,10 @@ mod tests {
                 "unsafe fn f(a: *mut i32, b: *mut i32, c: *mut i32) -> *mut i32 { \
                  let x = a; let y = x; let _ = (b, c); y }",
             ),
-            ("addr", "unsafe fn addr(mut p: *mut i32) -> *mut *mut i32 { &raw mut p }"),
+            (
+                "addr",
+                "unsafe fn addr(mut p: *mut i32) -> *mut *mut i32 { &raw mut p }",
+            ),
             (
                 "storechain",
                 "unsafe fn f(a: *mut *mut i32, b: *mut *mut i32, c: *mut *mut i32) { \
@@ -710,14 +874,22 @@ mod tests {
                 eprintln!(
                     "REDUNDANCY {label}/{fname}: already={} closure={} reflexive={} storage={} \
                      genuinely_new={}",
-                    bk.already, bk.closure, bk.reflexive, bk.storage.len(), bk.genuinely_new.len()
+                    bk.already,
+                    bk.closure,
+                    bk.reflexive,
+                    bk.storage.len(),
+                    bk.genuinely_new.len()
                 );
                 assert!(
                     bk.storage.is_empty() && bk.genuinely_new.is_empty(),
                     "{label}/{fname}: origins carry depth-0 subset edges the fork cannot re-derive — \
                      injection is NOT redundant (STOP). storage={:?} genuinely_new={:?} \
                      (already={} closure={} reflexive={})",
-                    bk.storage, bk.genuinely_new, bk.already, bk.closure, bk.reflexive
+                    bk.storage,
+                    bk.genuinely_new,
+                    bk.already,
+                    bk.closure,
+                    bk.reflexive
                 );
             }
         }
