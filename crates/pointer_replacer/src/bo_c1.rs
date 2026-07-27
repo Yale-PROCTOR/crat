@@ -2085,7 +2085,12 @@ pub(crate) mod ownership_diagnostic_package {
     pub struct PairRemovalEvidence {
         pub outcomes: Vec<PairRemovalOutcome>,
         pub minimal_sat_pairs: BTreeSet<FamilyPair>,
-        pub no_pair: bool,
+    }
+
+    impl PairRemovalEvidence {
+        pub fn no_pair(&self) -> bool {
+            self.minimal_sat_pairs.is_empty()
+        }
     }
 
     #[derive(Clone, Debug, PartialEq, Eq)]
@@ -2319,11 +2324,9 @@ pub(crate) mod ownership_diagnostic_package {
             .filter(|outcome| outcome.result_is_sat)
             .map(|outcome| outcome.pair.clone())
             .collect::<BTreeSet<_>>();
-        let no_pair = minimal_sat_pairs.is_empty();
         PairRemovalEvidence {
             outcomes,
             minimal_sat_pairs,
-            no_pair,
         }
     }
 
@@ -2373,8 +2376,8 @@ pub(crate) mod ownership_diagnostic_package {
             joint_rows += 1;
             program.0 += 1;
             recovered_rows += usize::from(!pair_removal.minimal_sat_pairs.is_empty());
-            no_pair_rows += usize::from(pair_removal.no_pair);
-            program.2 += usize::from(pair_removal.no_pair);
+            no_pair_rows += usize::from(pair_removal.no_pair());
+            program.2 += usize::from(pair_removal.no_pair());
             for pair in &pair_removal.minimal_sat_pairs {
                 *pair_frequency
                     .get_mut(pair)
@@ -2397,9 +2400,9 @@ pub(crate) mod ownership_diagnostic_package {
                 record.selector_index,
                 record.epoch,
                 pair_removal.minimal_sat_pairs.len(),
-                pair_removal.no_pair,
+                pair_removal.no_pair(),
             ));
-            if pair_removal.no_pair {
+            if pair_removal.no_pair() {
                 no_pair_csv.push_str(&format!(
                     "{},{},{},{}\n",
                     record.program, record.selector_key, record.selector_index, record.epoch
@@ -2439,6 +2442,26 @@ pub(crate) mod ownership_diagnostic_package {
             recovered_rows,
             no_pair_rows,
         }
+    }
+
+    pub fn dominant_pair_summary(
+        pair_frequency: &BTreeMap<FamilyPair, usize>,
+        coverage_complete: bool,
+    ) -> Option<(BTreeSet<FamilyPair>, usize)> {
+        if !coverage_complete {
+            return None;
+        }
+        let dominant_count = pair_frequency.values().copied().max().unwrap_or(0);
+        let dominant_pairs = if dominant_count == 0 {
+            BTreeSet::new()
+        } else {
+            pair_frequency
+                .iter()
+                .filter(|(_, count)| **count == dominant_count)
+                .map(|(pair, _)| pair.clone())
+                .collect()
+        };
+        Some((dominant_pairs, dominant_count))
     }
 
     pub fn causal_bucket(necessary_families: &[&str]) -> CausalBucket {
@@ -2658,7 +2681,14 @@ pub(crate) mod ownership_diagnostic_package {
                 evidence.minimal_sat_pairs,
                 BTreeSet::from([FamilyPair::new(["own-equal", "link-own"])])
             );
-            assert!(!evidence.no_pair);
+            assert!(!evidence.no_pair());
+            assert!(
+                serde_json::to_value(&evidence)
+                    .expect("serialize pair evidence")
+                    .get("no_pair")
+                    .is_none(),
+                "no-pair status must be derived from the SAT-pair set"
+            );
 
             let no_pair = completed_pair_removal_evidence(
                 pairwise_removal_pairs()
@@ -2667,7 +2697,7 @@ pub(crate) mod ownership_diagnostic_package {
                     .collect(),
             );
             assert!(no_pair.minimal_sat_pairs.is_empty());
-            assert!(no_pair.no_pair);
+            assert!(no_pair.no_pair());
 
             assert!(
                 std::panic::catch_unwind(|| {
@@ -2746,6 +2776,33 @@ pub(crate) mod ownership_diagnostic_package {
             );
             assert!(summary.no_pair_csv.contains("buffer,buffer/source:1,1,0"));
             assert!(summary.program_csv.contains("zero,0,0,0,0,0,0,0,0,0,0,0,0"));
+        }
+
+        #[test]
+        fn diagnostic_package_pair_dominance_requires_complete_coverage() {
+            let frequencies = pairwise_removal_pairs()
+                .into_iter()
+                .map(|pair| (FamilyPair::new(pair), 0usize))
+                .collect::<BTreeMap<_, _>>();
+            assert_eq!(dominant_pair_summary(&frequencies, false), None);
+            assert_eq!(
+                dominant_pair_summary(&frequencies, true),
+                Some((BTreeSet::new(), 0))
+            );
+
+            let mut tied = frequencies;
+            tied.insert(FamilyPair::new(["own-equal", "own-assume"]), 63);
+            tied.insert(FamilyPair::new(["own-equal", "kind-equate"]), 63);
+            assert_eq!(
+                dominant_pair_summary(&tied, true),
+                Some((
+                    BTreeSet::from([
+                        FamilyPair::new(["own-equal", "own-assume"]),
+                        FamilyPair::new(["own-equal", "kind-equate"]),
+                    ]),
+                    63,
+                ))
+            );
         }
 
         #[test]
@@ -5664,7 +5721,7 @@ mod run {
                     record
                         .pair_removal
                         .as_ref()
-                        .is_some_and(|pair| pair.no_pair)
+                        .is_some_and(|pair| pair.no_pair())
                 })
                 .count(),
         );
@@ -10485,22 +10542,15 @@ fn boc1_corpus() {
         )
         .expect("write pairwise program status");
 
-        let dominant_count = summary
-            .pair_frequency
-            .values()
-            .copied()
-            .max()
-            .expect("ten pair frequencies");
-        assert!(
-            dominant_count > 0,
-            "all ten pair removals failed; no dominant pair exists"
+        let dominance = ownership_diagnostic_package::dominant_pair_summary(
+            &summary.pair_frequency,
+            deferred_joint == 0,
         );
-        let dominant_pairs = summary
-            .pair_frequency
-            .iter()
-            .filter(|(_, count)| **count == dominant_count)
-            .map(|(pair, _)| pair.clone())
-            .collect::<BTreeSet<_>>();
+        let dominant_pairs = dominance
+            .as_ref()
+            .map(|(pairs, _)| pairs.clone())
+            .unwrap_or_default();
+        let representatives_enabled = !dominant_pairs.is_empty();
         let dominant_coverage = |record: &NecessityEvidence| {
             record
                 .pair_removal
@@ -10527,14 +10577,20 @@ fn boc1_corpus() {
                 })
         });
 
-        let lil_index = joint_indices
-            .iter()
-            .copied()
-            .filter(|index| records[*index].program == "lil")
-            .max_by_key(|index| dominant_coverage(&records[*index]))
-            .expect("representative set must include one lil joint row");
-        let mut selected_indices = vec![lil_index];
-        while selected_indices.len() < 3 {
+        let mut selected_indices = Vec::new();
+        if representatives_enabled {
+            let lil_index = joint_indices
+                .iter()
+                .copied()
+                .filter(|index| records[*index].program == "lil")
+                .max_by_key(|index| dominant_coverage(&records[*index]))
+                .expect("representative set must include one lil joint row");
+            selected_indices.push(lil_index);
+        }
+        while representatives_enabled
+            && selected_indices.len() < 3
+            && selected_indices.len() < joint_indices.len()
+        {
             let selected_programs = selected_indices
                 .iter()
                 .map(|index| records[*index].program.as_str())
@@ -10543,7 +10599,6 @@ fn boc1_corpus() {
                 .iter()
                 .copied()
                 .filter(|index| !selected_indices.contains(index))
-                .filter(|index| dominant_coverage(&records[*index]) > 0)
                 .max_by(|left, right| {
                     let left_distinct =
                         !selected_programs.contains(records[*left].program.as_str());
@@ -10567,16 +10622,24 @@ fn boc1_corpus() {
             };
             selected_indices.push(candidate);
         }
-        assert!(
-            (2..=3).contains(&selected_indices.len()),
-            "dominant pair must support two or three representative rows"
-        );
-        assert!(
-            selected_indices
-                .iter()
-                .any(|index| records[*index].program == "lil"),
-            "representative set lost the mandatory lil row"
-        );
+        if representatives_enabled {
+            assert_eq!(
+                selected_indices.len(),
+                3,
+                "complete 63-row coverage must yield three representatives"
+            );
+            assert!(
+                selected_indices
+                    .iter()
+                    .any(|index| records[*index].program == "lil"),
+                "representative set lost the mandatory lil row"
+            );
+        } else {
+            assert!(
+                selected_indices.is_empty(),
+                "partial or all-no-pair coverage must not produce dominance representatives"
+            );
+        }
 
         let mut representative_tsv = String::from(
             "program\tselector_key\tepoch\tselector_index\tminimal_pairs\tdominant_pairs\t\
@@ -10726,11 +10789,28 @@ fn boc1_corpus() {
         )
         .expect("write pairwise representative index");
 
-        let dominant_labels = dominant_pairs
-            .iter()
-            .map(ownership_diagnostic_package::FamilyPair::label)
-            .collect::<Vec<_>>()
-            .join(", ");
+        let dominance_report = match &dominance {
+            None => "not computed because pair coverage is partial".to_string(),
+            Some((pairs, 0)) if pairs.is_empty() => {
+                "none; every pair frequency is zero".to_string()
+            }
+            Some((pairs, count)) => format!(
+                "{} ({count} rows each)",
+                pairs
+                    .iter()
+                    .map(ownership_diagnostic_package::FamilyPair::label)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        };
+        let interpretation = if dominance.is_some() {
+            "Pair necessity localizes coupling structure and prices candidate repairs. It does \
+             not authorize tuning; kind-coupling through equality/version paths remains a \
+             hypothesis to test against the recorded chains."
+        } else {
+            "Dominance interpretation is withheld because final pair coverage is partial. Raw \
+             covered-row tables and resource deferrals remain recorded."
+        };
         fs::write(
             out_dir().join("pairwise-family-removal-report.md"),
             format!(
@@ -10745,10 +10825,8 @@ fn boc1_corpus() {
                  - Pair recovery: {} rows have at least one SAT pair; {} rows have no SAT pair.\n\
                  - Inclusion-minimality: all singleton removals for these rows were already UNSAT, \
                    so every SAT pair is inclusion-minimal.\n\
-                 - Dominant pair(s): {dominant_labels} ({dominant_count} rows each).\n\
-                 - Interpretation: pair necessity localizes coupling structure and prices candidate \
-                   repairs. It does not authorize tuning; kind-coupling through equality/version \
-                   paths remains a hypothesis to test against the recorded chains.\n\n\
+                 - Dominant pair(s): {dominance_report}.\n\
+                 - Interpretation: {interpretation}\n\n\
                  ## Pair frequency\n\n```csv\n{}```\n\n\
                  ## Pair × program\n\n```csv\n{}```\n\n\
                  ## Program status\n\n```csv\n{program_status_csv}```\n\n\
