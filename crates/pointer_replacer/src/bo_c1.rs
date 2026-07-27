@@ -1125,7 +1125,10 @@ mod crown_projection {
                 "declaration_key\tmapping\toutcome\tmapped_mir_locals\tmapped_slots\traw_slots\tref_slots\towning_slots\tslot_keys",
             )
         {
-            return Err(format!("{}: unexpected model snapshot header", path.display()));
+            return Err(format!(
+                "{}: unexpected model snapshot header",
+                path.display()
+            ));
         }
         let mut records = BTreeMap::new();
         for (index, line) in lines.enumerate() {
@@ -2022,7 +2025,79 @@ pub(crate) mod ownership_diagnostic_package {
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub enum RemovalFilter {
         Family(&'static str),
+        FamilyPair([&'static str; 2]),
         OwnAssumeSite(AssumeSite),
+    }
+
+    pub const PAIRWISE_REMOVAL_FAMILIES: [&str; 5] = [
+        "own-equal",
+        "own-assume",
+        "own-linear",
+        "kind-equate",
+        "link-own",
+    ];
+
+    pub fn pairwise_removal_pairs() -> Vec<[&'static str; 2]> {
+        let mut pairs = Vec::with_capacity(10);
+        for (index, &first) in PAIRWISE_REMOVAL_FAMILIES.iter().enumerate() {
+            for &second in &PAIRWISE_REMOVAL_FAMILIES[index + 1..] {
+                pairs.push([first, second]);
+            }
+        }
+        pairs
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+    pub struct FamilyPair {
+        pub first: String,
+        pub second: String,
+    }
+
+    impl FamilyPair {
+        pub fn new(pair: [&str; 2]) -> Self {
+            Self {
+                first: pair[0].to_string(),
+                second: pair[1].to_string(),
+            }
+        }
+
+        pub fn label(&self) -> String {
+            format!("{}+{}", self.first, self.second)
+        }
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct PairRemovalOutcome {
+        pub pair: FamilyPair,
+        pub result_is_sat: bool,
+    }
+
+    impl PairRemovalOutcome {
+        pub fn new(pair: [&str; 2], result_is_sat: bool) -> Self {
+            Self {
+                pair: FamilyPair::new(pair),
+                result_is_sat,
+            }
+        }
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct PairRemovalEvidence {
+        pub outcomes: Vec<PairRemovalOutcome>,
+        pub minimal_sat_pairs: BTreeSet<FamilyPair>,
+        pub no_pair: bool,
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub struct PairRemovalSummary {
+        pub selector_csv: String,
+        pub frequency_csv: String,
+        pub program_csv: String,
+        pub no_pair_csv: String,
+        pub pair_frequency: BTreeMap<FamilyPair, usize>,
+        pub joint_rows: usize,
+        pub recovered_rows: usize,
+        pub no_pair_rows: usize,
     }
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -2059,6 +2134,7 @@ pub(crate) mod ownership_diagnostic_package {
     ];
 
     pub const ENV: &str = "CRAT_BOC1_OWNERSHIP_DIAGNOSTIC_PACKAGE";
+    pub const PAIRWISE_ENV: &str = "CRAT_BOC1_PAIRWISE_FAMILY_REMOVAL";
     pub const SNAPSHOT_ONLY_ENV: &str = "CRAT_BOC1_PROD_BOX_SNAPSHOT_ONLY";
 
     pub fn enabled() -> bool {
@@ -2079,6 +2155,15 @@ pub(crate) mod ownership_diagnostic_package {
         }
     }
 
+    pub fn pairwise_enabled() -> bool {
+        match std::env::var(PAIRWISE_ENV).as_deref() {
+            Err(std::env::VarError::NotPresent) | Ok("0") => false,
+            Ok("1") => true,
+            Ok(other) => panic!("{PAIRWISE_ENV} must be 0 or 1, got {other:?}"),
+            Err(error) => panic!("{PAIRWISE_ENV} is not valid Unicode: {error}"),
+        }
+    }
+
     #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
     pub struct NecessityEvidence {
         pub program: String,
@@ -2089,6 +2174,8 @@ pub(crate) mod ownership_diagnostic_package {
         pub necessary_families: BTreeSet<String>,
         pub own_assume_necessary_sites: BTreeSet<String>,
         pub causal_bucket: CausalBucket,
+        #[serde(default)]
+        pub pair_removal: Option<PairRemovalEvidence>,
     }
 
     #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -2146,6 +2233,7 @@ pub(crate) mod ownership_diagnostic_package {
             .unwrap_or_else(|| panic!("unrecognized hard-constraint family: {label}"));
         match filter {
             RemovalFilter::Family(suppressed) => family == suppressed,
+            RemovalFilter::FamilyPair(suppressed) => suppressed.contains(&family),
             RemovalFilter::OwnAssumeSite(site) => {
                 family == "own-assume"
                     && crate::analyses::borrow_ownership::solver::current_own_assume_site() == site
@@ -2204,6 +2292,153 @@ pub(crate) mod ownership_diagnostic_package {
 
     pub fn removal_is_necessary(result_is_sat: bool) -> bool {
         result_is_sat
+    }
+
+    pub fn completed_pair_removal_evidence(
+        outcomes: Vec<PairRemovalOutcome>,
+    ) -> PairRemovalEvidence {
+        assert_eq!(
+            outcomes.len(),
+            10,
+            "completed joint row must contain exactly ten pair-removal outcomes"
+        );
+        let actual_pairs = outcomes
+            .iter()
+            .map(|outcome| outcome.pair.clone())
+            .collect::<BTreeSet<_>>();
+        let expected_pairs = pairwise_removal_pairs()
+            .into_iter()
+            .map(FamilyPair::new)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            actual_pairs, expected_pairs,
+            "completed joint row must contain the ten canonical distinct family pairs"
+        );
+        let minimal_sat_pairs = outcomes
+            .iter()
+            .filter(|outcome| outcome.result_is_sat)
+            .map(|outcome| outcome.pair.clone())
+            .collect::<BTreeSet<_>>();
+        let no_pair = minimal_sat_pairs.is_empty();
+        PairRemovalEvidence {
+            outcomes,
+            minimal_sat_pairs,
+            no_pair,
+        }
+    }
+
+    pub fn summarize_pair_removals(
+        records: &[NecessityEvidence],
+        programs: &[&str],
+    ) -> PairRemovalSummary {
+        let canonical_pairs = pairwise_removal_pairs()
+            .into_iter()
+            .map(FamilyPair::new)
+            .collect::<Vec<_>>();
+        let mut pair_frequency = canonical_pairs
+            .iter()
+            .cloned()
+            .map(|pair| (pair, 0usize))
+            .collect::<BTreeMap<_, _>>();
+        let mut by_program = programs
+            .iter()
+            .map(|program| (*program, (0usize, pair_frequency.clone(), 0usize)))
+            .collect::<BTreeMap<_, _>>();
+        let mut selector_csv = String::from(
+            "program,selector_key,selector_index,epoch,minimal_pairs,minimal_pair_count,no_pair\n",
+        );
+        let mut no_pair_csv = String::from("program,selector_key,selector_index,epoch\n");
+        let mut joint_rows = 0usize;
+        let mut recovered_rows = 0usize;
+        let mut no_pair_rows = 0usize;
+
+        for record in records {
+            let is_joint = record.causal_bucket == CausalBucket::JointNoSingleFamilyNecessity;
+            if !is_joint {
+                assert!(
+                    record.pair_removal.is_none(),
+                    "singleton-necessary row contains pair-removal evidence"
+                );
+                continue;
+            }
+            let pair_removal = record
+                .pair_removal
+                .as_ref()
+                .expect("joint row lacks completed pair-removal evidence");
+            let program = by_program
+                .get_mut(record.program.as_str())
+                .unwrap_or_else(|| {
+                    panic!("pair-removal row has unknown program {}", record.program)
+                });
+            joint_rows += 1;
+            program.0 += 1;
+            recovered_rows += usize::from(!pair_removal.minimal_sat_pairs.is_empty());
+            no_pair_rows += usize::from(pair_removal.no_pair);
+            program.2 += usize::from(pair_removal.no_pair);
+            for pair in &pair_removal.minimal_sat_pairs {
+                *pair_frequency
+                    .get_mut(pair)
+                    .expect("noncanonical minimal family pair") += 1;
+                *program
+                    .1
+                    .get_mut(pair)
+                    .expect("noncanonical per-program family pair") += 1;
+            }
+            let minimal_pairs = pair_removal
+                .minimal_sat_pairs
+                .iter()
+                .map(FamilyPair::label)
+                .collect::<Vec<_>>()
+                .join(";");
+            selector_csv.push_str(&format!(
+                "{},{},{},{},{minimal_pairs},{},{}\n",
+                record.program,
+                record.selector_key,
+                record.selector_index,
+                record.epoch,
+                pair_removal.minimal_sat_pairs.len(),
+                pair_removal.no_pair,
+            ));
+            if pair_removal.no_pair {
+                no_pair_csv.push_str(&format!(
+                    "{},{},{},{}\n",
+                    record.program, record.selector_key, record.selector_index, record.epoch
+                ));
+            }
+        }
+
+        let mut frequency_csv = String::from("family_a,family_b,unblocked_rows\n");
+        for pair in &canonical_pairs {
+            frequency_csv.push_str(&format!(
+                "{},{},{}\n",
+                pair.first, pair.second, pair_frequency[pair]
+            ));
+        }
+        let pair_headers = canonical_pairs
+            .iter()
+            .map(FamilyPair::label)
+            .collect::<Vec<_>>()
+            .join(",");
+        let mut program_csv = format!("program,joint_rows,{pair_headers},no_pair\n");
+        for program in programs {
+            let (program_joint, frequencies, program_no_pair) = &by_program[program];
+            program_csv.push_str(&format!("{program},{program_joint}"));
+            for pair in &canonical_pairs {
+                program_csv.push_str(&format!(",{}", frequencies[pair]));
+            }
+            program_csv.push_str(&format!(",{program_no_pair}\n"));
+        }
+
+        PairRemovalSummary {
+            selector_csv,
+            frequency_csv,
+            program_csv,
+            no_pair_csv,
+            pair_frequency,
+            joint_rows,
+            recovered_rows,
+            no_pair_rows,
+        }
     }
 
     pub fn causal_bucket(necessary_families: &[&str]) -> CausalBucket {
@@ -2367,6 +2602,153 @@ pub(crate) mod ownership_diagnostic_package {
         }
 
         #[test]
+        fn diagnostic_package_pair_removal_universe_is_canonical_and_complete() {
+            assert_eq!(
+                PAIRWISE_REMOVAL_FAMILIES,
+                [
+                    "own-equal",
+                    "own-assume",
+                    "own-linear",
+                    "kind-equate",
+                    "link-own",
+                ]
+            );
+            assert_eq!(
+                pairwise_removal_pairs(),
+                vec![
+                    ["own-equal", "own-assume"],
+                    ["own-equal", "own-linear"],
+                    ["own-equal", "kind-equate"],
+                    ["own-equal", "link-own"],
+                    ["own-assume", "own-linear"],
+                    ["own-assume", "kind-equate"],
+                    ["own-assume", "link-own"],
+                    ["own-linear", "kind-equate"],
+                    ["own-linear", "link-own"],
+                    ["kind-equate", "link-own"],
+                ]
+            );
+            assert_eq!(
+                pairwise_removal_pairs()
+                    .into_iter()
+                    .collect::<BTreeSet<_>>()
+                    .len(),
+                10
+            );
+        }
+
+        #[test]
+        fn diagnostic_package_pair_filter_suppresses_either_family_untracked() {
+            with_removal_filter(RemovalFilter::FamilyPair(["own-equal", "link-own"]), || {
+                assert!(suppresses_label(|| "own-equal(x=y)".to_string()));
+                assert!(suppresses_label(|| "link-own(x=y)".to_string()));
+                assert!(!suppresses_label(|| "own-linear(x+y=z)".to_string()));
+            });
+            assert!(!removal_filter_active());
+        }
+
+        #[test]
+        fn diagnostic_package_pair_evidence_requires_all_ten_outcomes() {
+            let outcomes = pairwise_removal_pairs()
+                .into_iter()
+                .map(|pair| PairRemovalOutcome::new(pair, pair == ["own-equal", "link-own"]))
+                .collect();
+            let evidence = completed_pair_removal_evidence(outcomes);
+            assert_eq!(
+                evidence.minimal_sat_pairs,
+                BTreeSet::from([FamilyPair::new(["own-equal", "link-own"])])
+            );
+            assert!(!evidence.no_pair);
+
+            let no_pair = completed_pair_removal_evidence(
+                pairwise_removal_pairs()
+                    .into_iter()
+                    .map(|pair| PairRemovalOutcome::new(pair, false))
+                    .collect(),
+            );
+            assert!(no_pair.minimal_sat_pairs.is_empty());
+            assert!(no_pair.no_pair);
+
+            assert!(
+                std::panic::catch_unwind(|| {
+                    completed_pair_removal_evidence(
+                        pairwise_removal_pairs()[..9]
+                            .iter()
+                            .copied()
+                            .map(|pair| PairRemovalOutcome::new(pair, false))
+                            .collect(),
+                    )
+                })
+                .is_err()
+            );
+
+            assert!(
+                std::panic::catch_unwind(|| {
+                    let mut outcomes = pairwise_removal_pairs()
+                        .into_iter()
+                        .map(|pair| PairRemovalOutcome::new(pair, false))
+                        .collect::<Vec<_>>();
+                    outcomes[9] = outcomes[8].clone();
+                    completed_pair_removal_evidence(outcomes)
+                })
+                .is_err()
+            );
+        }
+
+        #[test]
+        fn diagnostic_package_pair_summary_covers_frequency_programs_and_no_pair() {
+            let pair = ["own-equal", "kind-equate"];
+            let joint_record =
+                |program: &str, selector_index: usize, sat_pair: Option<[&str; 2]>| {
+                    NecessityEvidence {
+                        program: program.to_string(),
+                        selector_key: format!("{program}/source:{selector_index}"),
+                        selector_index,
+                        epoch: 0,
+                        raw_families: BTreeSet::new(),
+                        necessary_families: BTreeSet::new(),
+                        own_assume_necessary_sites: BTreeSet::new(),
+                        causal_bucket: CausalBucket::JointNoSingleFamilyNecessity,
+                        pair_removal: Some(completed_pair_removal_evidence(
+                            pairwise_removal_pairs()
+                                .into_iter()
+                                .map(|candidate| {
+                                    PairRemovalOutcome::new(candidate, Some(candidate) == sat_pair)
+                                })
+                                .collect(),
+                        )),
+                    }
+                };
+            let records = vec![
+                joint_record("lil", 5, Some(pair)),
+                joint_record("buffer", 1, None),
+            ];
+            let summary = summarize_pair_removals(&records, &["buffer", "lil", "zero"]);
+
+            assert_eq!(
+                (
+                    summary.joint_rows,
+                    summary.recovered_rows,
+                    summary.no_pair_rows
+                ),
+                (2, 1, 1)
+            );
+            assert_eq!(
+                summary.pair_frequency[&FamilyPair::new(pair)],
+                1,
+                "the SAT pair must count once"
+            );
+            assert_eq!(summary.pair_frequency.len(), 10);
+            assert!(
+                summary
+                    .selector_csv
+                    .contains("lil,lil/source:5,5,0,own-equal+kind-equate,1,false")
+            );
+            assert!(summary.no_pair_csv.contains("buffer,buffer/source:1,1,0"));
+            assert!(summary.program_csv.contains("zero,0,0,0,0,0,0,0,0,0,0,0,0"));
+        }
+
+        #[test]
         fn diagnostic_package_replay_requires_exact_selector_sets() {
             assert!(replay_matches_official(&[0, 2, 7], &[0, 2, 7]));
         }
@@ -2428,10 +2810,14 @@ pub(crate) mod ownership_diagnostic_package {
         fn diagnostic_package_parses_final_box_family_subjects() {
             assert!(crate::rewriter::decision_snapshot_pre_transform_enabled_from_value(Some("1")));
             assert!(!crate::rewriter::decision_snapshot_pre_transform_enabled_from_value(None));
-            assert!(std::panic::catch_unwind(|| {
-                crate::rewriter::decision_snapshot_pre_transform_enabled_from_value(Some("true"))
-            })
-            .is_err());
+            assert!(
+                std::panic::catch_unwind(|| {
+                    crate::rewriter::decision_snapshot_pre_transform_enabled_from_value(Some(
+                        "true",
+                    ))
+                })
+                .is_err()
+            );
             let input = "\
 [pointer-decision] subject=local fn=a name=x original=*mut i32 span=s final=Box\n\
 [pointer-decision] subject=param fn=a index=0 name=p original=*mut i32 span=s final=OptBox\n\
@@ -3677,11 +4063,10 @@ mod run {
     use z3::{SatResult, ast::Bool};
 
     use super::{
-        collect_program,
-        crown_projection,
+        collect_program, crown_projection,
         ownership_diagnostic_package::{
-            self, FunctionPrecisionRecord, NecessityEvidence, ProductionPrecisionEvidence,
-            RemovalFilter,
+            self, FunctionPrecisionRecord, NecessityEvidence, PairRemovalOutcome,
+            ProductionPrecisionEvidence, RemovalFilter,
         },
         ownership_yield::{self, OwnerClass, SlotRecord},
         report::Row,
@@ -3695,8 +4080,8 @@ mod run {
             CrateCtxt, SafeMonoMode, SlotKind,
             borrow_verify::{
                 RepairMode, model_accepts_with_flows, slotref_key,
-                verify_to_fixpoint_counting_with_flows, verify_to_fixpoint_with_flows, with_capture,
-                with_mode_a_commit_trace,
+                verify_to_fixpoint_counting_with_flows, verify_to_fixpoint_with_flows,
+                with_capture, with_mode_a_commit_trace,
             },
             coherence::{add_coherence, constrain_field_ownership, field_ownership_candidates},
             crate_slots::CrateSlots,
@@ -3877,14 +4262,7 @@ mod run {
                 .borrow();
             add_coherence(&solver, slots, g, &body);
         }
-        verify_to_fixpoint_with_flows(
-            program,
-            slots,
-            origin_flows,
-            &solver,
-            &selectors,
-            mut_facts,
-        )
+        verify_to_fixpoint_with_flows(program, slots, origin_flows, &solver, &selectors, mut_facts)
     }
 
     /// Measure the collateral. Returns a status-tagged struct (never panics on decline — Codex F2a).
@@ -3944,13 +4322,9 @@ mod run {
         }
         // Real FULL solve — for the like-with-like delta AND the anchor (both solves are REAL, so the
         // collateral is not confounded by an impl difference; F2b anchors real FULL to run_bo's model).
-        let Some(full_model) = solve_with_demotion(
-            program,
-            slots,
-            origins.native_flows(),
-            &full_vec,
-            mut_facts,
-        ) else {
+        let Some(full_model) =
+            solve_with_demotion(program, slots, origins.native_flows(), &full_vec, mut_facts)
+        else {
             return build("real-decline", None, None, 0, 0, 0, 0);
         };
         let (nref_full, nref_d0_full) = count_refs(&full_model, slots);
@@ -3960,14 +4334,8 @@ mod run {
                 .copied()
                 .filter(|s| !exclude.contains(s))
                 .collect();
-            solve_with_demotion(
-                program,
-                slots,
-                origins.native_flows(),
-                &v,
-                mut_facts,
-            )
-            .map(|m| count_refs(&m, slots))
+            solve_with_demotion(program, slots, origins.native_flows(), &v, mut_facts)
+                .map(|m| count_refs(&m, slots))
         };
         let Some((nref_mu, nref_d0_mu)) = minus(&upper_set) else {
             return build(
@@ -4074,13 +4442,7 @@ mod run {
         let verdict = match base.model_kinds_relaxing(selectors) {
             Some(model) => {
                 model.get(&target) == Some(&SlotKind::Ref)
-                    && model_accepts_with_flows(
-                        program,
-                        slots,
-                        origin_flows,
-                        &model,
-                        is_mutable,
-                    )
+                    && model_accepts_with_flows(program, slots, origin_flows, &model, is_mutable)
             }
             // UNSAT even without `target` ⇒ `target` is not the reason it declines; NOT removable.
             None => false,
@@ -4277,13 +4639,7 @@ mod run {
             return;
         };
         assert!(
-            model_accepts_with_flows(
-                program,
-                slots,
-                origins.native_flows(),
-                model,
-                is_mutable,
-            ),
+            model_accepts_with_flows(program, slots, origins.native_flows(), model, is_mutable,),
             "necessity audit: the anchor's accepted model must satisfy model_accepts (drift STOP)"
         );
         let (anchor_nref, anchor_nref_d0) = count_refs(model, slots);
@@ -4390,13 +4746,9 @@ mod run {
         let witnessed = match base.model_kinds_relaxing(&selectors) {
             // Removed slots are hard-pinned `Ref`, so a SAT model has them all `Ref` by construction;
             // only acceptance remains to check.
-            Some(m) => model_accepts_with_flows(
-                program,
-                slots,
-                origins.native_flows(),
-                &m,
-                is_mutable,
-            ),
+            Some(m) => {
+                model_accepts_with_flows(program, slots, origins.native_flows(), &m, is_mutable)
+            }
             // UNSAT under the pins ⇒ the removed set is NOT jointly `Ref`-recoverable (unless empty).
             None => removed.is_empty(),
         };
@@ -4519,13 +4871,7 @@ mod run {
             "certified-context witness violated a hard Ref pin"
         );
         assert!(
-            model_accepts_with_flows(
-                program,
-                slots,
-                origins.native_flows(),
-                &witness,
-                is_mutable,
-            ),
+            model_accepts_with_flows(program, slots, origins.native_flows(), &witness, is_mutable,),
             "certified-context hard-pinned witness must pass audit acceptance"
         );
 
@@ -5182,6 +5528,36 @@ mod run {
             }
         }
 
+        let pairwise_enabled = ownership_diagnostic_package::pairwise_enabled();
+        let joint_keys = necessary_by_key
+            .iter()
+            .filter(|(_, families)| families.is_empty())
+            .map(|(key, _)| key.clone())
+            .collect::<BTreeSet<_>>();
+        let mut pair_outcomes_by_key = if pairwise_enabled {
+            joint_keys
+                .iter()
+                .cloned()
+                .map(|key| (key, Vec::new()))
+                .collect::<BTreeMap<_, _>>()
+        } else {
+            BTreeMap::new()
+        };
+        if pairwise_enabled && !joint_keys.is_empty() {
+            for pair in ownership_diagnostic_package::pairwise_removal_pairs() {
+                // Joint rows have already failed every singleton-family removal,
+                // so every SAT pair here is minimal by construction.
+                let (sat_keys, checks) = probe(RemovalFilter::FamilyPair(pair), &joint_keys);
+                check_sat_count = check_sat_count.saturating_add(checks);
+                for key in &joint_keys {
+                    pair_outcomes_by_key
+                        .get_mut(key)
+                        .expect("joint pair-removal row")
+                        .push(PairRemovalOutcome::new(pair, sat_keys.contains(key)));
+                }
+            }
+        }
+
         let own_assume_keys = necessary_by_key
             .iter()
             .filter(|(_, families)| families.contains("own-assume"))
@@ -5218,6 +5594,24 @@ mod run {
                     .map(String::as_str)
                     .collect::<Vec<_>>();
                 let causal_bucket = ownership_diagnostic_package::causal_bucket(&family_refs);
+                let pair_removal = if pairwise_enabled
+                    && causal_bucket
+                        == ownership_diagnostic_package::CausalBucket::JointNoSingleFamilyNecessity
+                {
+                    Some(
+                        ownership_diagnostic_package::completed_pair_removal_evidence(
+                            pair_outcomes_by_key
+                                .remove(&selector_key)
+                                .expect("joint pair-removal outcomes"),
+                        ),
+                    )
+                } else {
+                    assert!(
+                        !pair_outcomes_by_key.contains_key(&selector_key),
+                        "singleton-necessary row received pair-removal outcomes"
+                    );
+                    None
+                };
                 NecessityEvidence {
                     program: program_name.clone(),
                     selector_key: selector_key.clone(),
@@ -5229,9 +5623,14 @@ mod run {
                         .remove(&selector_key)
                         .expect("assume-site row"),
                     causal_bucket,
+                    pair_removal,
                 }
             })
             .collect::<Vec<_>>();
+        assert!(
+            pair_outcomes_by_key.is_empty(),
+            "unconsumed joint pair-removal outcomes"
+        );
         ownership_diagnostic_package::write_json(Path::new(&evidence_path), &evidence)
             .unwrap_or_else(|error| panic!("{error}"));
         row.set("necessity_sources", evidence.len());
@@ -5242,6 +5641,30 @@ mod run {
                 .filter(|record| {
                     record.causal_bucket
                         == ownership_diagnostic_package::CausalBucket::JointNoSingleFamilyNecessity
+                })
+                .count(),
+        );
+        row.set(
+            "necessity_pair_recovered",
+            evidence
+                .iter()
+                .filter(|record| {
+                    record
+                        .pair_removal
+                        .as_ref()
+                        .is_some_and(|pair| !pair.minimal_sat_pairs.is_empty())
+                })
+                .count(),
+        );
+        row.set(
+            "necessity_no_pair",
+            evidence
+                .iter()
+                .filter(|record| {
+                    record
+                        .pair_removal
+                        .as_ref()
+                        .is_some_and(|pair| pair.no_pair)
                 })
                 .count(),
         );
@@ -6034,8 +6457,9 @@ mod run {
         use crate::analyses::{
             output_params::compute_output_params,
             ownership::{
+                AnalysisKind, CrateCtxt as OwnershipCrateCtxt,
                 solidify::SolidifiedOwnershipSchemes, total_deref_level,
-                whole_program::WholeProgramAnalysis, AnalysisKind, CrateCtxt as OwnershipCrateCtxt,
+                whole_program::WholeProgramAnalysis,
             },
             type_qualifier::foster::mutability::mutability_analysis,
         };
@@ -7417,8 +7841,7 @@ mod orchestrate {
     };
 
     use super::{
-        ownership_diagnostic_package,
-        ownership_yield,
+        ownership_diagnostic_package, ownership_yield,
         report::{self, Row},
         selector_leak_diagnosis,
     };
@@ -7639,12 +8062,12 @@ mod orchestrate {
                     .env("CRAT_BOC1_SELECTOR_DETAIL_EVIDENCE", detail);
             }
         }
-        if ownership_diagnostic_package::enabled() {
+        if ownership_diagnostic_package::enabled()
+            || ownership_diagnostic_package::pairwise_enabled()
+        {
             let trace = selector_trace_path(program);
             let necessity = necessity_evidence_path(program);
-            let precision = production_precision_path(program);
-            let boxes = production_box_path(program);
-            for path in [&trace, &necessity, &precision, &boxes] {
+            for path in [&trace, &necessity] {
                 fs::create_dir_all(path.parent().expect("diagnostic package artifact parent"))
                     .expect("create diagnostic package artifact dir");
             }
@@ -7665,15 +8088,35 @@ mod orchestrate {
                             .expect("diagnostic package family matrix"),
                     )
                     .env("CRAT_BOC1_NECESSITY_EVIDENCE", necessity);
-            } else if mode == "prod-precision" {
-                if precision.is_file() {
-                    fs::remove_file(&precision).expect("remove stale precision evidence");
+            } else if let Some(case) = mode.strip_prefix("selector-detail-") {
+                let case = case.replacen('-', ":", 1);
+                let detail = selector_detail_path(program, &case.replace(':', "-"));
+                fs::create_dir_all(detail.parent().expect("selector detail parent"))
+                    .expect("create selector detail dir");
+                if detail.is_file() {
+                    fs::remove_file(&detail).expect("remove stale selector detail evidence");
                 }
-                command.env("CRAT_BOC1_PROD_PRECISION_EVIDENCE", precision);
-            } else if mode == "prod-box" {
                 command
-                    .env("CRAT_POINTER_DECISION_DIAGNOSTICS", "full")
-                    .env("CRAT_POINTER_DECISION_SNAPSHOT_PRE_TRANSFORM", "1");
+                    .env("CRAT_BOC1_SELECTOR_DETAIL_CASE", &case)
+                    .env("CRAT_BOC1_SELECTOR_DETAIL_EVIDENCE", detail);
+            }
+            if ownership_diagnostic_package::enabled() {
+                let precision = production_precision_path(program);
+                let boxes = production_box_path(program);
+                for path in [&precision, &boxes] {
+                    fs::create_dir_all(path.parent().expect("diagnostic package artifact parent"))
+                        .expect("create diagnostic package artifact dir");
+                }
+                if mode == "prod-precision" {
+                    if precision.is_file() {
+                        fs::remove_file(&precision).expect("remove stale precision evidence");
+                    }
+                    command.env("CRAT_BOC1_PROD_PRECISION_EVIDENCE", precision);
+                } else if mode == "prod-box" {
+                    command
+                        .env("CRAT_POINTER_DECISION_DIAGNOSTICS", "full")
+                        .env("CRAT_POINTER_DECISION_SNAPSHOT_PRE_TRANSFORM", "1");
+                }
             }
         }
         let mut child = command.spawn().expect("spawn worker");
@@ -8678,6 +9121,7 @@ fn boc1_corpus() {
     let ownership_yield_enabled = ownership_yield::enabled();
     let selector_leak_diag = selector_leak_diagnosis::enabled();
     let diagnostic_package = ownership_diagnostic_package::enabled();
+    let pairwise_probe = ownership_diagnostic_package::pairwise_enabled();
     let prod_box_snapshot_only = ownership_diagnostic_package::snapshot_only_enabled();
     let only: Option<Vec<String>> = std::env::var("CRAT_BOC1_PROGRAMS")
         .ok()
@@ -8778,6 +9222,60 @@ fn boc1_corpus() {
                 "accepted family matrix does not exist: {family_matrix}"
             );
         }
+        assert_eq!(CORPUS.len(), 20);
+    }
+    if pairwise_probe {
+        assert_eq!(
+            std::env::var("CRAT_BO_REPAIR").as_deref(),
+            Ok("mode_a"),
+            "pairwise family removal requires Mode-A"
+        );
+        assert_eq!(
+            std::env::var("CRAT_BO_L2_GUARDED_COMMITS").as_deref(),
+            Ok("0"),
+            "pairwise family removal requires L2 explicitly off"
+        );
+        assert!(
+            !crate::analyses::borrow_ownership::l2::enabled_from_env(),
+            "pairwise family removal resolved L2 on"
+        );
+        assert_eq!(
+            timeout,
+            Duration::from_secs(900),
+            "pairwise official timeout must be 900 seconds"
+        );
+        assert_eq!(
+            diagnostic_timeout,
+            Duration::from_secs(900),
+            "pairwise diagnostic first-pass timeout must be 900 seconds"
+        );
+        assert_eq!(
+            std::env::var("CRAT_BOC1_MEM_MB").as_deref(),
+            Ok("8192"),
+            "pairwise family removal requires the 8192-MiB worker cap"
+        );
+        assert!(
+            !prod_enabled,
+            "pairwise family removal must disable production workers"
+        );
+        assert!(
+            only.is_none(),
+            "pairwise family removal must cover all 20 frozen programs"
+        );
+        assert!(
+            !diagnostic_package
+                && !selector_leak_diag
+                && !ownership_yield_enabled
+                && !l2_gate
+                && !prod_box_snapshot_only,
+            "pairwise family removal is mutually exclusive with other corpus modes"
+        );
+        let family_matrix = std::env::var("CRAT_BOC1_SELECTOR_FAMILY_MATRIX")
+            .expect("pairwise family removal requires the accepted family matrix");
+        assert!(
+            std::path::Path::new(&family_matrix).is_file(),
+            "accepted family matrix does not exist: {family_matrix}"
+        );
         assert_eq!(CORPUS.len(), 20);
     }
     assert!(
@@ -9073,7 +9571,10 @@ fn boc1_corpus() {
         let snapshot_dirty = orchestrate::git_dirty();
         let total = rows
             .iter()
-            .filter(|row| row.get("status").is_some_and(|status| status.starts_with("ok")))
+            .filter(|row| {
+                row.get("status")
+                    .is_some_and(|status| status.starts_with("ok"))
+            })
             .map(|row| {
                 row.get("total")
                     .expect("successful snapshot total")
@@ -9245,15 +9746,15 @@ fn boc1_corpus() {
                 }
             }
 
-            if diagnostic_package {
+            if diagnostic_package || pairwise_probe {
                 assert_eq!(
                     bo.status, "ok",
-                    "ownership diagnostic official worker failed for {}: status={} note={}",
+                    "necessity diagnostic official worker failed for {}: status={} note={}",
                     program.name, bo.status, bo.note
                 );
                 assert!(
                     selector_trace_path(program.name).is_file(),
-                    "ownership diagnostic official trace missing for {}",
+                    "necessity diagnostic official trace missing for {}",
                     program.name
                 );
 
@@ -9276,6 +9777,8 @@ fn boc1_corpus() {
                         for (source, target) in [
                             ("necessity_sources", "necessity_sources"),
                             ("necessity_joint", "necessity_joint"),
+                            ("necessity_pair_recovered", "necessity_pair_recovered"),
+                            ("necessity_no_pair", "necessity_no_pair"),
                             ("check_sat_count", "necessity_check_sat_count"),
                         ] {
                             if let Some(value) = row.get(source) {
@@ -9304,7 +9807,9 @@ fn boc1_corpus() {
                         );
                     }
                 }
+            }
 
+            if diagnostic_package {
                 eprintln!("[boc1] {}: prod-precision mode...", program.name);
                 let precision = run_child(program.name, &input, "prod-precision", prod_timeout);
                 m.set(
@@ -9648,7 +10153,7 @@ fn boc1_corpus() {
         }
     }
 
-    if diagnostic_package {
+    if diagnostic_package || pairwise_probe {
         let retry_timeout = Duration::from_secs(3600);
         for (program, mode) in diagnostic_retry_queue {
             let input = program.input_path(&root);
@@ -9699,6 +10204,8 @@ fn boc1_corpus() {
                             for (source, target) in [
                                 ("necessity_sources", "necessity_sources"),
                                 ("necessity_joint", "necessity_joint"),
+                                ("necessity_pair_recovered", "necessity_pair_recovered"),
+                                ("necessity_no_pair", "necessity_no_pair"),
                                 ("check_sat_count", "necessity_check_sat_count"),
                             ] {
                                 if let Some(value) = row.get(source) {
@@ -9758,7 +10265,11 @@ fn boc1_corpus() {
                     m.set(&format!("{prefix}_status"), "resource-deferred-final");
                     m.set(
                         &format!("{prefix}_note"),
-                        format!("resource wall at 1800s and {} at 3600s", retried.status),
+                        format!(
+                            "resource wall at {}s and {} at 3600s",
+                            diagnostic_timeout.as_secs(),
+                            retried.status
+                        ),
                     );
                 }
                 DiagnosticWorkerDisposition::CorrectnessFailure => {
@@ -9776,6 +10287,462 @@ fn boc1_corpus() {
                 }
             }
         }
+    }
+
+    if pairwise_probe {
+        let parse_total = |key: &str| {
+            merged
+                .iter()
+                .map(|row| {
+                    row.get(key)
+                        .unwrap_or_else(|| panic!("pairwise row missing {key}"))
+                        .parse::<usize>()
+                        .unwrap_or_else(|error| panic!("pairwise {key} is not numeric: {error}"))
+                })
+                .sum::<usize>()
+        };
+        assert_eq!(merged.len(), 20, "pairwise sweep must cover 20 programs");
+        assert!(
+            merged.iter().all(|row| row.get("status") == Some("ok")),
+            "pairwise official worker declined"
+        );
+        assert_eq!(parse_total("n_ref"), 52_810);
+        assert_eq!(parse_total("n_own"), 230);
+        assert_eq!(parse_total("sources_leaked_sel"), 114);
+        assert_eq!(parse_total("sinks_leaked"), 170);
+
+        let expected_joint = BTreeMap::from([
+            ("bst", 0usize),
+            ("avl", 0),
+            ("ht", 0),
+            ("libcsv", 0),
+            ("buffer", 5),
+            ("quadtree", 0),
+            ("urlparser", 0),
+            ("robotfindskitten", 0),
+            ("rgba", 0),
+            ("genann", 0),
+            ("libtree", 7),
+            ("json.h", 2),
+            ("binn", 0),
+            ("libzahl", 4),
+            ("lil", 33),
+            ("heman", 6),
+            ("bzip2", 4),
+            ("tmux", 0),
+            ("libxml2", 0),
+            ("brotli", 2),
+        ]);
+        assert_eq!(
+            expected_joint.values().sum::<usize>(),
+            63,
+            "registered joint-row distribution must sum to 63"
+        );
+
+        let mut records = Vec::<NecessityEvidence>::new();
+        let mut deferred_programs = Vec::new();
+        let mut covered_joint_by_program = BTreeMap::<&str, usize>::new();
+        for program in CORPUS {
+            let row = merged
+                .iter()
+                .find(|row| row.get("program") == Some(program.name))
+                .expect("pairwise program row");
+            if row
+                .get("necessity_status")
+                .is_some_and(|status| status.starts_with("ok"))
+            {
+                let mut program_records: Vec<NecessityEvidence> =
+                    ownership_diagnostic_package::read_json(&necessity_evidence_path(program.name))
+                        .unwrap_or_else(|error| panic!("{error}"));
+                let covered_joint = program_records
+                    .iter()
+                    .filter(|record| {
+                        record.causal_bucket
+                            == ownership_diagnostic_package::CausalBucket::JointNoSingleFamilyNecessity
+                    })
+                    .count();
+                assert_eq!(
+                    covered_joint, expected_joint[program.name],
+                    "{} joint-row anchor diverged",
+                    program.name
+                );
+                covered_joint_by_program.insert(program.name, covered_joint);
+                records.append(&mut program_records);
+            } else {
+                assert_eq!(
+                    row.get("necessity_status"),
+                    Some("resource-deferred-final"),
+                    "{} necessity ended in a non-resource failure",
+                    program.name
+                );
+                covered_joint_by_program.insert(program.name, 0);
+                deferred_programs.push(program.name);
+            }
+        }
+        records.sort_by(|left, right| {
+            left.program
+                .cmp(&right.program)
+                .then_with(|| left.selector_key.cmp(&right.selector_key))
+        });
+        let programs = CORPUS
+            .iter()
+            .map(|program| program.name)
+            .collect::<Vec<_>>();
+        let summary = ownership_diagnostic_package::summarize_pair_removals(&records, &programs);
+        let deferred_joint = deferred_programs
+            .iter()
+            .map(|program| expected_joint[program])
+            .sum::<usize>();
+        assert_eq!(
+            summary.joint_rows + deferred_joint,
+            63,
+            "covered and resource-deferred joint rows must reconcile to 63"
+        );
+        let completed_outcomes = records
+            .iter()
+            .filter_map(|record| record.pair_removal.as_ref())
+            .map(|evidence| evidence.outcomes.len())
+            .sum::<usize>();
+        assert_eq!(
+            completed_outcomes,
+            summary.joint_rows * 10,
+            "every covered joint row must contain all ten actual pair solves"
+        );
+        if deferred_programs.is_empty() {
+            assert_eq!(summary.joint_rows, 63);
+            assert_eq!(completed_outcomes, 630);
+        }
+
+        fs::write(
+            out_dir().join("selector-pair-necessity.csv"),
+            &summary.selector_csv,
+        )
+        .expect("write per-selector pair necessity");
+        fs::write(out_dir().join("pair-frequency.csv"), &summary.frequency_csv)
+            .expect("write pair frequency");
+        fs::write(
+            out_dir().join("pair-program-crosstab.csv"),
+            &summary.program_csv,
+        )
+        .expect("write pair/program cross-tab");
+        fs::write(out_dir().join("no-pair-suffices.csv"), &summary.no_pair_csv)
+            .expect("write no-pair bucket");
+
+        let mut program_status_csv = String::from(
+            "program,expected_joint_rows,covered_joint_rows,status,official_wall_s,\
+             necessity_first_wall_s,necessity_retry_wall_s,necessity_total_wall_s\n",
+        );
+        for row in &merged {
+            let program = row.get("program").expect("pairwise status program");
+            program_status_csv.push_str(&format!(
+                "{program},{},{},{},{},{},{},{}\n",
+                expected_joint[program],
+                covered_joint_by_program[program],
+                row.get("necessity_status").unwrap_or("missing"),
+                row.get("bo_wall_s").unwrap_or("-"),
+                row.get("necessity_first_wall_s").unwrap_or("-"),
+                row.get("necessity_retry_wall_s").unwrap_or("-"),
+                row.get("necessity_wall_s").unwrap_or("-"),
+            ));
+        }
+        fs::write(
+            out_dir().join("pairwise-program-status.csv"),
+            &program_status_csv,
+        )
+        .expect("write pairwise program status");
+
+        let dominant_count = summary
+            .pair_frequency
+            .values()
+            .copied()
+            .max()
+            .expect("ten pair frequencies");
+        assert!(
+            dominant_count > 0,
+            "all ten pair removals failed; no dominant pair exists"
+        );
+        let dominant_pairs = summary
+            .pair_frequency
+            .iter()
+            .filter(|(_, count)| **count == dominant_count)
+            .map(|(pair, _)| pair.clone())
+            .collect::<BTreeSet<_>>();
+        let dominant_coverage = |record: &NecessityEvidence| {
+            record
+                .pair_removal
+                .as_ref()
+                .expect("representative joint row")
+                .minimal_sat_pairs
+                .intersection(&dominant_pairs)
+                .count()
+        };
+        let mut joint_indices = records
+            .iter()
+            .enumerate()
+            .filter(|(_, record)| record.pair_removal.is_some())
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+        joint_indices.sort_by(|left, right| {
+            dominant_coverage(&records[*right])
+                .cmp(&dominant_coverage(&records[*left]))
+                .then_with(|| records[*left].program.cmp(&records[*right].program))
+                .then_with(|| {
+                    records[*left]
+                        .selector_key
+                        .cmp(&records[*right].selector_key)
+                })
+        });
+
+        let lil_index = joint_indices
+            .iter()
+            .copied()
+            .filter(|index| records[*index].program == "lil")
+            .max_by_key(|index| dominant_coverage(&records[*index]))
+            .expect("representative set must include one lil joint row");
+        let mut selected_indices = vec![lil_index];
+        while selected_indices.len() < 3 {
+            let selected_programs = selected_indices
+                .iter()
+                .map(|index| records[*index].program.as_str())
+                .collect::<BTreeSet<_>>();
+            let candidate = joint_indices
+                .iter()
+                .copied()
+                .filter(|index| !selected_indices.contains(index))
+                .filter(|index| dominant_coverage(&records[*index]) > 0)
+                .max_by(|left, right| {
+                    let left_distinct =
+                        !selected_programs.contains(records[*left].program.as_str());
+                    let right_distinct =
+                        !selected_programs.contains(records[*right].program.as_str());
+                    left_distinct
+                        .cmp(&right_distinct)
+                        .then_with(|| {
+                            dominant_coverage(&records[*left])
+                                .cmp(&dominant_coverage(&records[*right]))
+                        })
+                        .then_with(|| records[*right].program.cmp(&records[*left].program))
+                        .then_with(|| {
+                            records[*right]
+                                .selector_key
+                                .cmp(&records[*left].selector_key)
+                        })
+                });
+            let Some(candidate) = candidate else {
+                break;
+            };
+            selected_indices.push(candidate);
+        }
+        assert!(
+            (2..=3).contains(&selected_indices.len()),
+            "dominant pair must support two or three representative rows"
+        );
+        assert!(
+            selected_indices
+                .iter()
+                .any(|index| records[*index].program == "lil"),
+            "representative set lost the mandatory lil row"
+        );
+
+        let mut representative_tsv = String::from(
+            "program\tselector_key\tepoch\tselector_index\tminimal_pairs\tdominant_pairs\t\
+             raw_families\tminimized_families\traw_labels\tminimized_labels\tcommit_origins\t\
+             first_wall_s\tretry_wall_s\ttotal_wall_s\tstatus\tevidence_path\n",
+        );
+        for index in selected_indices {
+            let record = &records[index];
+            let corpus_program = CORPUS
+                .iter()
+                .find(|program| program.name == record.program)
+                .expect("representative program belongs to corpus");
+            let input = corpus_program.input_path(&root);
+            let mode = format!("selector-detail-{}-{}", record.epoch, record.selector_index);
+            eprintln!(
+                "[boc1] {}: {mode} pairwise representative...",
+                record.program
+            );
+            let first = run_child(&record.program, &input, &mode, diagnostic_timeout);
+            let first_wall_s = first.wall_s;
+            let retry_wall_s = match diagnostic_worker_disposition(&first.status) {
+                DiagnosticWorkerDisposition::Complete => None,
+                DiagnosticWorkerDisposition::ResourceDeferred => {
+                    eprintln!(
+                        "[boc1] {}: {mode} representative retry (3600s cap)...",
+                        record.program
+                    );
+                    let retry = run_child_labeled(
+                        &record.program,
+                        &input,
+                        &mode,
+                        &format!("{mode}-retry"),
+                        Duration::from_secs(3600),
+                    );
+                    match diagnostic_worker_disposition(&retry.status) {
+                        DiagnosticWorkerDisposition::Complete => Some(retry.wall_s),
+                        DiagnosticWorkerDisposition::ResourceDeferred => {
+                            representative_tsv.push_str(&format!(
+                                "{}\t{}\t{}\t{}\t{}\t{}\t-\t-\t-\t-\t-\t{:.1}\t{:.1}\t{:.1}\t\
+                                 resource-deferred\t-\n",
+                                record.program,
+                                record.selector_key,
+                                record.epoch,
+                                record.selector_index,
+                                record
+                                    .pair_removal
+                                    .as_ref()
+                                    .expect("representative pair evidence")
+                                    .minimal_sat_pairs
+                                    .iter()
+                                    .map(ownership_diagnostic_package::FamilyPair::label)
+                                    .collect::<Vec<_>>()
+                                    .join(";"),
+                                record
+                                    .pair_removal
+                                    .as_ref()
+                                    .expect("representative pair evidence")
+                                    .minimal_sat_pairs
+                                    .intersection(&dominant_pairs)
+                                    .map(ownership_diagnostic_package::FamilyPair::label)
+                                    .collect::<Vec<_>>()
+                                    .join(";"),
+                                first_wall_s,
+                                retry.wall_s,
+                                first_wall_s + retry.wall_s,
+                            ));
+                            continue;
+                        }
+                        DiagnosticWorkerDisposition::CorrectnessFailure => {
+                            panic!(
+                                "{} representative retry failed: status={} note={}",
+                                record.program, retry.status, retry.note
+                            );
+                        }
+                    }
+                }
+                DiagnosticWorkerDisposition::CorrectnessFailure => {
+                    panic!(
+                        "{} representative failed: status={} note={}",
+                        record.program, first.status, first.note
+                    );
+                }
+            };
+            let path = selector_detail_path(
+                &record.program,
+                &format!("{}-{}", record.epoch, record.selector_index),
+            );
+            assert!(
+                path.is_file(),
+                "pairwise representative evidence missing: {}",
+                path.display()
+            );
+            let detail = selector_leak_diagnosis::read_detail_evidence(&path)
+                .unwrap_or_else(|error| panic!("{error}"));
+            assert_eq!(detail.program, record.program);
+            assert_eq!(detail.selector_key, record.selector_key);
+            representative_tsv.push_str(&format!(
+                "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{first_wall_s:.1}\t{}\t{:.1}\t\
+                 ok\t{}\n",
+                record.program,
+                record.selector_key,
+                record.epoch,
+                record.selector_index,
+                record
+                    .pair_removal
+                    .as_ref()
+                    .expect("representative pair evidence")
+                    .minimal_sat_pairs
+                    .iter()
+                    .map(ownership_diagnostic_package::FamilyPair::label)
+                    .collect::<Vec<_>>()
+                    .join(";"),
+                record
+                    .pair_removal
+                    .as_ref()
+                    .expect("representative pair evidence")
+                    .minimal_sat_pairs
+                    .intersection(&dominant_pairs)
+                    .map(ownership_diagnostic_package::FamilyPair::label)
+                    .collect::<Vec<_>>()
+                    .join(";"),
+                detail
+                    .raw_families
+                    .iter()
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join("+"),
+                detail
+                    .minimized_families
+                    .iter()
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join("+"),
+                serde_json::to_string(&detail.raw_labels).expect("encode raw labels"),
+                serde_json::to_string(&detail.minimized_labels).expect("encode minimized labels"),
+                serde_json::to_string(&detail.commit_origins).expect("encode commit origins"),
+                retry_wall_s
+                    .map(|wall| format!("{wall:.1}"))
+                    .unwrap_or_else(|| "-".to_string()),
+                first_wall_s + retry_wall_s.unwrap_or(0.0),
+                path.display(),
+            ));
+        }
+        fs::write(
+            out_dir().join("pairwise-representatives.tsv"),
+            &representative_tsv,
+        )
+        .expect("write pairwise representative index");
+
+        let dominant_labels = dominant_pairs
+            .iter()
+            .map(ownership_diagnostic_package::FamilyPair::label)
+            .collect::<Vec<_>>()
+            .join(", ");
+        fs::write(
+            out_dir().join("pairwise-family-removal-report.md"),
+            format!(
+                "# Pairwise family-removal probing\n\n\
+                 - Contract: Mode-A, L2 off, smt.random_seed=0, sat.random_seed=0, \
+                   official and first-pass diagnostic cap 900 s, one serialized 3600 s retry, \
+                   8192 MiB, serialized.\n\
+                 - Baseline: 20/20 accept; n_ref=52,810; n_own=230; \
+                   sources leaked=114/144; sinks leaked=170/206.\n\
+                 - Joint rows: {}/63 covered; {} resource-deferred. Completed actual pair solves: \
+                   {completed_outcomes}/630.\n\
+                 - Pair recovery: {} rows have at least one SAT pair; {} rows have no SAT pair.\n\
+                 - Inclusion-minimality: all singleton removals for these rows were already UNSAT, \
+                   so every SAT pair is inclusion-minimal.\n\
+                 - Dominant pair(s): {dominant_labels} ({dominant_count} rows each).\n\
+                 - Interpretation: pair necessity localizes coupling structure and prices candidate \
+                   repairs. It does not authorize tuning; kind-coupling through equality/version \
+                   paths remains a hypothesis to test against the recorded chains.\n\n\
+                 ## Pair frequency\n\n```csv\n{}```\n\n\
+                 ## Pair × program\n\n```csv\n{}```\n\n\
+                 ## Program status\n\n```csv\n{program_status_csv}```\n\n\
+                 ## No-pair bucket\n\n```csv\n{}```\n\n\
+                 Representative tracked chains are supplementary explanations only; untracked \
+                 pair solves are authoritative. See `pairwise-representatives.tsv` and \
+                 `selector-details/`.\n",
+                summary.joint_rows,
+                deferred_joint,
+                summary.recovered_rows,
+                summary.no_pair_rows,
+                summary.frequency_csv,
+                summary.program_csv,
+                summary.no_pair_csv,
+            ),
+        )
+        .expect("write pairwise report");
+
+        let mut jsonl = provenance::line(&sha, dirty, unix) + "\n";
+        for row in &raw_rows {
+            jsonl.push_str(&report::to_json_line(row));
+            jsonl.push('\n');
+        }
+        fs::write(out_dir().join("results.jsonl"), jsonl).expect("write pairwise jsonl");
+        fs::write(out_dir().join("results.csv"), report::render_csv(&merged))
+            .expect("write pairwise csv");
+        fs::write(out_dir().join("report.md"), render_report(&merged))
+            .expect("write pairwise corpus report");
     }
 
     if selector_leak_diag {
@@ -9986,13 +10953,11 @@ fn boc1_corpus() {
                         detail,
                     }
                 }
-                DiagnosticWorkerDisposition::ResourceDeferred => {
-                    DetailOutcome::ResourceDeferred {
-                        wall_s: outcome.wall_s,
-                        status: outcome.status,
-                        note: outcome.note,
-                    }
-                }
+                DiagnosticWorkerDisposition::ResourceDeferred => DetailOutcome::ResourceDeferred {
+                    wall_s: outcome.wall_s,
+                    status: outcome.status,
+                    note: outcome.note,
+                },
                 DiagnosticWorkerDisposition::CorrectnessFailure => {
                     panic!(
                         "selector representative failed for {program} epoch {epoch} selector \
@@ -10001,10 +10966,7 @@ fn boc1_corpus() {
                     );
                 }
             };
-            detail_outcomes.insert(
-                (program.clone(), *epoch, *selector_index),
-                detail_outcome,
-            );
+            detail_outcomes.insert((program.clone(), *epoch, *selector_index), detail_outcome);
         }
 
         let mut representative_tsv = String::from(
@@ -11084,13 +12046,7 @@ fn nb5l2_anchor<'tcx>(
     let model = model.expect("fixture must accept under Mode-A");
     // FULL-anchor anti-drift: the accepted model must satisfy model_accepts.
     assert!(
-        model_accepts_with_flows(
-            &program,
-            &slots,
-            origins.native_flows(),
-            &model,
-            true,
-        ),
+        model_accepts_with_flows(&program, &slots, origins.native_flows(), &model, true,),
         "anchor's accepted model must satisfy model_accepts (drift check)"
     );
     (program, slots, origins, model, events)
