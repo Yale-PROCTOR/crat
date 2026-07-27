@@ -78,7 +78,7 @@ fn assert_codes(skeleton: &str, transformation: &str, expected: &[&str]) {
 const UNIT_SKELETON: &str = "unsafe fn f() { #[proctor(0)] todo!(); }";
 
 #[test]
-fn amendment_2_preserved_leaf_and_expansion_group_are_canonicalized() {
+fn preserved_leaf_and_expansion_group_are_canonicalized() {
     let skeleton = "unsafe fn f(value: i32) -> i32 { #[proctor(0)] value + 1 }";
     for transformation in [
         "unsafe fn f(value: i32) -> i32 { #[proctor(0)] 999 }",
@@ -92,7 +92,7 @@ fn amendment_2_preserved_leaf_and_expansion_group_are_canonicalized() {
 }
 
 #[test]
-fn amendment_2_preserved_parent_is_opaque_after_outer_alignment() {
+fn preserved_parent_is_opaque_after_outer_alignment() {
     let skeleton = "unsafe fn f(flag: bool) -> i32 { #[proctor(0)] if flag { #[proctor(1)] let value: i32 = 1; #[proctor(2)] value } else { #[proctor(3)] 2 } }";
     let transformation = "unsafe fn f(flag: bool) -> i32 { #[proctor(0)] return 999; }";
     assert_eq!(
@@ -102,7 +102,7 @@ fn amendment_2_preserved_parent_is_opaque_after_outer_alignment() {
 }
 
 #[test]
-fn amendment_2_preserved_restricted_conditional_coexists_with_transformed_control() {
+fn preserved_restricted_conditional_coexists_with_transformed_control() {
     let skeleton = r#"
 unsafe fn f(flag: bool, pointer: *mut i32, value: i32) -> i32 {
     #[proctor(0)]
@@ -142,7 +142,7 @@ unsafe fn f(flag: bool, pointer: *mut i32, value: i32) -> i32 {
 }
 
 #[test]
-fn amendment_2_transformed_label_does_not_relax_nested_control_validation() {
+fn transformed_label_does_not_relax_nested_control_validation() {
     let skeleton = "unsafe fn f(flag: bool, value: i32) -> i32 { #[proctor(0)] value + (if flag { -1 } else { 1 }) }";
     assert_eq!(
         codes(&validate(&preservation_request(
@@ -155,7 +155,7 @@ fn amendment_2_transformed_label_does_not_relax_nested_control_validation() {
 }
 
 #[test]
-fn amendment_2_opaque_restricted_conditional_rejects_inner_labels() {
+fn opaque_restricted_conditional_rejects_inner_labels() {
     let skeleton = "unsafe fn f(flag: bool, value: i32) -> i32 { #[proctor(0)] value + (if flag { #[proctor(1)] -1 } else { 1 }) }";
     assert_eq!(
         codes(&validate(&preservation_request(skeleton, vec![], skeleton))),
@@ -164,7 +164,7 @@ fn amendment_2_opaque_restricted_conditional_rejects_inner_labels() {
 }
 
 #[test]
-fn amendment_2_opaque_control_operand_rejects_inner_labels() {
+fn opaque_control_operand_rejects_inner_labels() {
     let skeleton = "unsafe fn f(a: bool) -> i32 { #[proctor(0)] if 1 + (if a { #[proctor(99)] 2 } else { 3 }) > 0 { #[proctor(1)] 1 } else { #[proctor(2)] 2 } }";
     assert_eq!(
         codes(&validate(&preservation_request(skeleton, vec![], skeleton))),
@@ -173,7 +173,7 @@ fn amendment_2_opaque_control_operand_rejects_inner_labels() {
 }
 
 #[test]
-fn amendment_2_unlabeled_restricted_conditionals_are_valid_control_operands() {
+fn unlabeled_restricted_conditionals_are_valid_control_operands() {
     for skeleton in [
         "unsafe fn f(a: bool) -> i32 { #[proctor(0)] if 1 + (if a { 2 } else { 3 }) > 0 { #[proctor(1)] 1 } else { #[proctor(2)] 2 } }",
         "unsafe fn f(a: bool) { #[proctor(0)] while 1 + (if a { 2 } else { 3 }) > 0 { #[proctor(1)] break; } }",
@@ -189,7 +189,7 @@ fn amendment_2_unlabeled_restricted_conditionals_are_valid_control_operands() {
 }
 
 #[test]
-fn amendment_2_bare_assignment_labels_are_statement_roots() {
+fn bare_assignment_labels_are_statement_roots() {
     let skeleton = "unsafe fn f(mut values: (i32, i32), value: i32) { #[proctor(0)] values.0 = value; #[proctor(1)] values.1 += 1; }";
     assert_eq!(
         validate(&preservation_request(skeleton, vec![0, 1], skeleton)),
@@ -198,7 +198,7 @@ fn amendment_2_bare_assignment_labels_are_statement_roots() {
 }
 
 #[test]
-fn amendment_2_preserved_child_requires_unique_control_anchor() {
+fn preserved_child_requires_unique_control_anchor() {
     let skeleton = "unsafe fn f(flag: bool, pointer: *mut i32) { #[proctor(0)] if flag { #[proctor(1)] let nested: i32 = 1; #[proctor(2)] (*pointer = nested); } else { #[proctor(3)] return; } }";
     let valid = "unsafe fn f(flag: bool, pointer: *mut i32) { #[proctor(0)] let proctor_temp_var_0 = flag; #[proctor(0)] if proctor_temp_var_0 { #[proctor(1)] let nested: i32 = 99; #[proctor(2)] (*pointer = nested); } else { #[proctor(3)] return; } }";
     assert_eq!(
@@ -235,7 +235,7 @@ fn amendment_2_preserved_child_requires_unique_control_anchor() {
 }
 
 #[test]
-fn amendment_2_invalid_preservation_metadata_is_setup_error() {
+fn invalid_preservation_metadata_is_setup_error() {
     let skeleton = "unsafe fn f() { #[proctor(0)] if true { #[proctor(1)] return; } }";
     for (needs, labels, code) in [
         (false, vec![0], "invalid_expected_skeleton"),
@@ -260,7 +260,7 @@ fn amendment_2_invalid_preservation_metadata_is_setup_error() {
 }
 
 #[test]
-fn amendment_2_discarded_errors_do_not_leak_but_external_temporary_use_does() {
+fn discarded_errors_do_not_leak_but_external_temporary_use_does() {
     let skeleton = "unsafe fn f(value: i32, pointer: *mut i32) -> i32 { #[proctor(0)] let scalar: i32 = value + 1; #[proctor(1)] (*pointer = scalar); #[proctor(2)] scalar }";
     let discarded = "unsafe fn f(value: i32, pointer: *mut i32) -> i32 { #[proctor(0)] #[allow(unused_variables)] unsafe { const LOCAL: i32 = 100; let wrong_name = value + LOCAL; wrong_name }; #[proctor(1)] (*pointer = value + 1); #[proctor(2)] 999 }";
     assert_eq!(
@@ -276,7 +276,7 @@ fn amendment_2_discarded_errors_do_not_leak_but_external_temporary_use_does() {
 }
 
 #[test]
-fn amendment_2_preserved_outer_alignment_keeps_stable_label_errors() {
+fn preserved_outer_alignment_keeps_stable_label_errors() {
     let skeleton = "unsafe fn f(value: i32) -> i32 { #[proctor(0)] let first: i32 = value + 1; #[proctor(1)] first + 2 }";
     for (transformation, code) in [
         (
@@ -770,7 +770,7 @@ unsafe fn first(input: &'a i32) -> &'a i32 {
 }
 
 #[test]
-fn phase_2_rejects_every_local_item() {
+fn rejects_every_local_item() {
     for skeleton in [
         "unsafe fn f() { #[proctor(0)] const LOCAL: i32 = 1; }",
         "unsafe fn f() { #[proctor(0)] { #[proctor(1)] static mut STATE: i32 = 1; } }",
@@ -915,7 +915,7 @@ fn malformed_duplicate_and_misplaced_proctor_attributes_are_rejected() {
 }
 
 #[test]
-fn all_phase_1_control_kinds_are_preserved() {
+fn all_supported_control_kinds_are_preserved() {
     let skeleton = r#"unsafe fn f(mut flag: bool, mut value: Option<i32>, mut xs: [i32; 1]) {
 #[proctor(0)] if todo!() { #[proctor(1)] todo!(); } else { #[proctor(2)] todo!(); }
 #[proctor(3)] if let Some(mut x) = todo!() { #[proctor(4)] todo!(); }

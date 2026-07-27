@@ -17,7 +17,7 @@ use crate::{
 #[derive(Default)]
 pub struct FnPtrRewriteDecision {
     pub direct_rewrite: FxHashSet<LocalDefId>,
-    #[allow(dead_code)] // used in Phase 2 wrapper generation
+    #[allow(dead_code)] // reserved for compatibility-wrapper decisions
     pub needs_wrapper: FxHashSet<LocalDefId>,
     /// Per-parameter individual decisions per fn-ptr function (ignoring group consensus).
     pub individual_decisions: FxHashMap<LocalDefId, Vec<Option<PtrKind>>>,
