@@ -237,6 +237,773 @@ mod report {
     }
 }
 
+// Compile the registered inventory walker itself into this measurement harness.
+// This deliberately avoids a copied/reimplemented definition of the 2,414-row
+// official universe.
+#[allow(dead_code)]
+mod crown_artifact_walker {
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tools/crown_artifact_inventory/src/lib.rs"
+    ));
+}
+
+mod crown_projection {
+    use std::{
+        collections::{BTreeMap, BTreeSet},
+        ffi::OsStr,
+        fs,
+        path::{Path, PathBuf},
+    };
+
+    use rustc_hash::{FxHashMap, FxHashSet};
+    use rustc_index::bit_set::DenseBitSet;
+    use rustc_middle::{
+        mir::{Local, VarDebugInfoContents},
+        ty::TyCtxt,
+    };
+    use rustc_span::def_id::LocalDefId;
+
+    use super::crown_artifact_walker::{
+        analyze_json_claims, analyze_named_rust_sources, parse_official_evaluation,
+        OfficialEvaluation,
+    };
+    use crate::{
+        analyses::{
+            borrow_ownership::{
+                crate_slots::CrateSlots, slots::SlotOwner, solver::SlotRef, SlotKind,
+            },
+            mir_variable_grouping::SourceVarGroups,
+        },
+        utils::rustc::RustProgram,
+    };
+
+    pub const MODEL_LABEL: &str = "model-level projection, pre-rewriter UPPER BOUND — not realized conversion; emission arrives with the BO rewriter.";
+    pub const LEGACY_LABEL: &str =
+        "legacy decision-layer PREDICTED, pre-transform UPPER BOUND; not realized conversion";
+    pub const CROWN_LABEL: &str = "CROWN realized, emitted-output official metric";
+
+    pub fn audit_text(value: impl ToString) -> String {
+        value.to_string().replace('\0', "\\0")
+    }
+
+    pub fn csv_cell(value: impl ToString) -> String {
+        let value = audit_text(value);
+        if value.contains([',', '"', '\n']) {
+            format!("\"{}\"", value.replace('"', "\"\""))
+        } else {
+            value
+        }
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum MappingCompleteness {
+        Empty,
+        Partial,
+        Complete,
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum ModelKind {
+        Raw,
+        Ref,
+        Owning,
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum LegacyDecisionKind {
+        Ref,
+        OptRef,
+        Slice,
+        SliceCursor,
+        Box,
+        OptBox,
+        BoxedSlice,
+        OptBoxedSlice,
+        Raw,
+        Other,
+    }
+
+    impl LegacyDecisionKind {
+        fn parse(value: &str) -> Self {
+            if value.starts_with("OptRef(") {
+                Self::OptRef
+            } else if value.starts_with("Ref(") {
+                Self::Ref
+            } else if value.starts_with("SliceCursor(") {
+                Self::SliceCursor
+            } else if value.starts_with("Slice(") {
+                Self::Slice
+            } else if value.starts_with("Raw(") {
+                Self::Raw
+            } else {
+                match value {
+                    "Box" => Self::Box,
+                    "OptBox" => Self::OptBox,
+                    "BoxedSlice" => Self::BoxedSlice,
+                    "OptBoxedSlice" => Self::OptBoxedSlice,
+                    _ => Self::Other,
+                }
+            }
+        }
+
+        fn is_safe(self) -> bool {
+            matches!(
+                self,
+                Self::Ref
+                    | Self::OptRef
+                    | Self::Slice
+                    | Self::SliceCursor
+                    | Self::Box
+                    | Self::OptBox
+                    | Self::BoxedSlice
+                    | Self::OptBoxedSlice
+            )
+        }
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum ProjectionOutcome {
+        RefBacked,
+        OwningBacked,
+        Eliminated,
+        Remaining,
+        Unmapped,
+    }
+
+    impl ProjectionOutcome {
+        pub fn as_str(self) -> &'static str {
+            match self {
+                Self::RefBacked => "predicted-eliminated-ref-backed",
+                Self::OwningBacked => "predicted-eliminated-owning-backed",
+                Self::Eliminated => "predicted-eliminated",
+                Self::Remaining => "predicted-remaining",
+                Self::Unmapped => "unmapped-counted-remaining",
+            }
+        }
+    }
+
+    impl MappingCompleteness {
+        pub fn as_str(self) -> &'static str {
+            match self {
+                Self::Empty => "empty",
+                Self::Partial => "partial",
+                Self::Complete => "complete",
+            }
+        }
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum CrownRealizedKind {
+        Reference,
+        Box,
+        Remaining,
+    }
+
+    impl CrownRealizedKind {
+        pub fn as_str(self) -> &'static str {
+            match self {
+                Self::Reference => "realized-reference",
+                Self::Box => "realized-Box",
+                Self::Remaining => "realized-remaining",
+            }
+        }
+    }
+
+    #[derive(Clone, Debug)]
+    pub struct OfficialProgram {
+        pub evaluation: OfficialEvaluation,
+        pub universe: BTreeSet<String>,
+        pub crown_kinds: BTreeMap<String, CrownRealizedKind>,
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub struct ModelEvidence {
+        pub declaration_key: String,
+        pub completeness: MappingCompleteness,
+        pub outcome: ProjectionOutcome,
+        pub mapped_mir_locals: usize,
+        pub mapped_slots: usize,
+        pub raw_slots: usize,
+        pub ref_slots: usize,
+        pub owning_slots: usize,
+        pub slot_keys: Vec<String>,
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub struct LegacyEvidence {
+        pub declaration_key: String,
+        pub completeness: MappingCompleteness,
+        pub outcome: ProjectionOutcome,
+        pub mapped_subjects: usize,
+        pub kinds: Vec<LegacyDecisionKind>,
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub struct LegacyDecisionRecord {
+        pub declaration_key: Option<String>,
+        pub kind: LegacyDecisionKind,
+    }
+
+    pub fn classify_model_slots(
+        completeness: MappingCompleteness,
+        kinds: &[ModelKind],
+    ) -> ProjectionOutcome {
+        if completeness != MappingCompleteness::Complete || kinds.is_empty() {
+            ProjectionOutcome::Unmapped
+        } else if kinds.contains(&ModelKind::Raw) {
+            ProjectionOutcome::Remaining
+        } else if kinds.contains(&ModelKind::Owning) {
+            ProjectionOutcome::OwningBacked
+        } else {
+            ProjectionOutcome::RefBacked
+        }
+    }
+
+    pub fn classify_legacy_subjects(
+        completeness: MappingCompleteness,
+        kinds: &[LegacyDecisionKind],
+    ) -> ProjectionOutcome {
+        if completeness != MappingCompleteness::Complete || kinds.is_empty() {
+            ProjectionOutcome::Unmapped
+        } else if kinds.iter().all(|kind| kind.is_safe()) {
+            ProjectionOutcome::Eliminated
+        } else {
+            ProjectionOutcome::Remaining
+        }
+    }
+
+    pub fn parse_legacy_decisions(input: &str) -> Result<Vec<LegacyDecisionRecord>, String> {
+        input
+            .lines()
+            .filter(|line| line.starts_with("[pointer-decision] subject="))
+            .map(|line| {
+                let field = |prefix: &str| {
+                    line.split_whitespace()
+                        .find_map(|part| part.strip_prefix(prefix))
+                };
+                let kind = field("final=")
+                    .map(LegacyDecisionKind::parse)
+                    .ok_or_else(|| format!("pointer decision lacks final kind: {line}"))?;
+                let declaration_key = if line.starts_with("[pointer-decision] subject=local ")
+                    || line.starts_with("[pointer-decision] subject=param ")
+                {
+                    match (field("fn="), field("name=")) {
+                        (Some(function), Some(name)) => Some(format!("{function}::{name}")),
+                        _ => {
+                            return Err(format!("pointer decision lacks function/name: {line}"));
+                        }
+                    }
+                } else if line.starts_with("[pointer-decision] subject=return ")
+                    || line.starts_with("[pointer-decision] subject=field ")
+                {
+                    None
+                } else {
+                    return Err(format!("unrecognized pointer-decision subject: {line}"));
+                };
+                Ok(LegacyDecisionRecord {
+                    declaration_key,
+                    kind,
+                })
+            })
+            .collect()
+    }
+
+    pub fn load_official_program(
+        artifact_root: &Path,
+        program: &str,
+    ) -> Result<OfficialProgram, String> {
+        let evaluations = parse_official_evaluation(
+            &fs::read_to_string(artifact_root.join("evaluation.tsv"))
+                .map_err(|error| format!("read evaluation.tsv: {error}"))?,
+        )?;
+        let evaluation = evaluations
+            .get(program)
+            .cloned()
+            .ok_or_else(|| format!("evaluation.tsv lacks {program}"))?;
+        let program_root = artifact_root.join(program);
+        let analysis_root = program_root.join("analysis_results");
+        let read_json = |name: &str| {
+            fs::read_to_string(analysis_root.join(format!("{name}.json")))
+                .map_err(|error| format!("{program}: read {name}.json: {error}"))
+        };
+        let claims = analyze_json_claims(
+            &read_json("ownership")?,
+            &read_json("statistics")?,
+            &read_json("mutability")?,
+            &read_json("fatness")?,
+        )
+        .map_err(|error| format!("{program}: {error}"))?;
+        if claims.fn_d0_mut_ptr != evaluation.declaration_before {
+            return Err(format!(
+                "{program}: official universe {} != evaluation BEFORE {}",
+                claims.fn_d0_mut_ptr, evaluation.declaration_before
+            ));
+        }
+
+        let mut files = Vec::new();
+        collect_rust_files(&program_root, &mut files)
+            .map_err(|error| format!("{program}: discover emitted Rust: {error}"))?;
+        files.sort();
+        let mut sources = Vec::new();
+        for path in &files {
+            sources.push((
+                rust_module_path(&program_root, path),
+                fs::read_to_string(path).map_err(|error| format!("{}: {error}", path.display()))?,
+            ));
+        }
+        let source_refs: Vec<_> = sources
+            .iter()
+            .map(|(module, source)| (module.as_str(), source.as_str()))
+            .collect();
+        let emitted = analyze_named_rust_sources(&source_refs)
+            .map_err(|error| format!("{program}: parse emitted Rust: {error}"))?;
+        let reference_keys = emitted
+            .reference_function_slot_keys
+            .intersection(&claims.fn_d0_mut_ptr_keys)
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        let box_keys = emitted
+            .box_function_slot_keys
+            .intersection(&claims.fn_d0_mut_ptr_keys)
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        if let Some(key) = reference_keys.intersection(&box_keys).next() {
+            return Err(format!(
+                "{program}: emitted reference/Box classifications overlap at {key}"
+            ));
+        }
+        let eliminated = reference_keys.len() + box_keys.len();
+        if claims.fn_d0_mut_ptr_keys.len().checked_sub(eliminated)
+            != Some(evaluation.declaration_after as usize)
+        {
+            return Err(format!(
+                "{program}: emitted safe-form intersection {eliminated} does not reproduce AFTER {}",
+                evaluation.declaration_after
+            ));
+        }
+        let crown_kinds = claims
+            .fn_d0_mut_ptr_keys
+            .iter()
+            .map(|key| {
+                let kind = if reference_keys.contains(key) {
+                    CrownRealizedKind::Reference
+                } else if box_keys.contains(key) {
+                    CrownRealizedKind::Box
+                } else {
+                    CrownRealizedKind::Remaining
+                };
+                (key.clone(), kind)
+            })
+            .collect();
+        Ok(OfficialProgram {
+            evaluation,
+            universe: claims.fn_d0_mut_ptr_keys,
+            crown_kinds,
+        })
+    }
+
+    fn collect_rust_files(dir: &Path, files: &mut Vec<PathBuf>) -> std::io::Result<()> {
+        for entry in fs::read_dir(dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            if entry.file_type()?.is_dir() {
+                if entry.file_name() != OsStr::new("target")
+                    && entry.file_name() != OsStr::new("analysis_results")
+                {
+                    collect_rust_files(&path, files)?;
+                }
+            } else if path.extension() == Some(OsStr::new("rs")) {
+                files.push(path);
+            }
+        }
+        Ok(())
+    }
+
+    fn rust_module_path(root: &Path, path: &Path) -> String {
+        path.strip_prefix(root)
+            .unwrap_or(path)
+            .with_extension("")
+            .iter()
+            .map(|component| component.to_string_lossy().replace('-', "_"))
+            .collect::<Vec<_>>()
+            .join("::")
+    }
+
+    fn source_group(
+        groups: &SourceVarGroups,
+        did: LocalDefId,
+        root: Local,
+        domain_size: usize,
+    ) -> Vec<Local> {
+        let mut without_root = DenseBitSet::new_filled(domain_size);
+        without_root.remove(root);
+        let processed = groups
+            .postprocess_non_null_locals(FxHashMap::from_iter([(did, without_root)]))
+            .remove(&did)
+            .unwrap_or_else(|| DenseBitSet::new_empty(domain_size));
+        (0..domain_size)
+            .map(Local::from_usize)
+            .filter(|local| !processed.contains(*local))
+            .collect()
+    }
+
+    pub fn project_model_for_universe(
+        tcx: TyCtxt<'_>,
+        program: &RustProgram<'_>,
+        slots: &CrateSlots,
+        model: &FxHashMap<SlotRef, SlotKind>,
+        universe: &BTreeSet<String>,
+    ) -> BTreeMap<String, ModelEvidence> {
+        let groups = SourceVarGroups::new(program);
+        let mut roots: BTreeMap<String, Vec<(LocalDefId, Local)>> = BTreeMap::new();
+        for &did in &program.functions {
+            let body = tcx.mir_drops_elaborated_and_const_checked(did).borrow();
+            for info in &body.var_debug_info {
+                let VarDebugInfoContents::Place(place) = &info.value else {
+                    continue;
+                };
+                let Some(local) = place.as_local() else {
+                    continue;
+                };
+                let key = format!("{}::{}", tcx.def_path_str(did), info.name);
+                if universe.contains(&key) {
+                    let entry = roots.entry(key).or_default();
+                    if !entry.contains(&(did, local)) {
+                        entry.push((did, local));
+                    }
+                }
+            }
+        }
+
+        universe
+            .iter()
+            .map(|key| {
+                let debug_roots = roots.get(key).cloned().unwrap_or_default();
+                let mut mapped_locals = FxHashSet::default();
+                for (did, root) in &debug_roots {
+                    let body = tcx.mir_drops_elaborated_and_const_checked(*did).borrow();
+                    for local in source_group(&groups, *did, *root, body.local_decls.len()) {
+                        mapped_locals.insert((*did, local));
+                    }
+                }
+                let mut slot_refs = FxHashSet::default();
+                let mut missing = false;
+                for (did, local) in &mapped_locals {
+                    match slots
+                        .fn_local_slots
+                        .get(did)
+                        .and_then(|universe| universe.slot_for_local_depth(*local, 0))
+                    {
+                        Some(slot) => {
+                            slot_refs.insert(SlotRef::Local(*did, slot));
+                        }
+                        None => missing = true,
+                    }
+                }
+                let mut kinds = Vec::new();
+                let mut slot_keys = Vec::new();
+                for slot_ref in &slot_refs {
+                    let SlotRef::Local(did, slot_id) = slot_ref else {
+                        unreachable!("declaration mapping produces only local slots");
+                    };
+                    let universe = &slots.fn_local_slots[did];
+                    let SlotOwner::Local(local) = universe.slot(*slot_id).owner else {
+                        unreachable!("local slot universe yielded non-local owner");
+                    };
+                    slot_keys.push(format!("{}::_{}@d0", tcx.def_path_str(*did), local.index()));
+                    match model.get(slot_ref) {
+                        Some(SlotKind::Raw) => kinds.push(ModelKind::Raw),
+                        Some(SlotKind::Ref) => kinds.push(ModelKind::Ref),
+                        Some(SlotKind::Owning) => kinds.push(ModelKind::Owning),
+                        None => missing = true,
+                    }
+                }
+                slot_keys.sort();
+                let completeness = if debug_roots.is_empty() || mapped_locals.is_empty() {
+                    MappingCompleteness::Empty
+                } else if missing || slot_refs.is_empty() {
+                    MappingCompleteness::Partial
+                } else {
+                    MappingCompleteness::Complete
+                };
+                let outcome = classify_model_slots(completeness, &kinds);
+                let evidence = ModelEvidence {
+                    declaration_key: key.clone(),
+                    completeness,
+                    outcome,
+                    mapped_mir_locals: mapped_locals.len(),
+                    mapped_slots: slot_refs.len(),
+                    raw_slots: kinds.iter().filter(|kind| **kind == ModelKind::Raw).count(),
+                    ref_slots: kinds.iter().filter(|kind| **kind == ModelKind::Ref).count(),
+                    owning_slots: kinds
+                        .iter()
+                        .filter(|kind| **kind == ModelKind::Owning)
+                        .count(),
+                    slot_keys,
+                };
+                (key.clone(), evidence)
+            })
+            .collect()
+    }
+
+    pub fn project_legacy_for_universe(
+        universe: &BTreeSet<String>,
+        records: &[LegacyDecisionRecord],
+    ) -> BTreeMap<String, LegacyEvidence> {
+        let mut by_key: BTreeMap<String, Vec<LegacyDecisionKind>> = BTreeMap::new();
+        for record in records {
+            if let Some(key) = &record.declaration_key
+                && universe.contains(key)
+            {
+                by_key.entry(key.clone()).or_default().push(record.kind);
+            }
+        }
+        universe
+            .iter()
+            .map(|key| {
+                let kinds = by_key.get(key).cloned().unwrap_or_default();
+                let completeness = if kinds.is_empty() {
+                    MappingCompleteness::Empty
+                } else {
+                    MappingCompleteness::Complete
+                };
+                (
+                    key.clone(),
+                    LegacyEvidence {
+                        declaration_key: key.clone(),
+                        completeness,
+                        outcome: classify_legacy_subjects(completeness, &kinds),
+                        mapped_subjects: kinds.len(),
+                        kinds,
+                    },
+                )
+            })
+            .collect()
+    }
+
+    pub fn write_model_snapshot(path: &Path, records: &BTreeMap<String, ModelEvidence>) {
+        let mut out = String::from(
+            "declaration_key\tmapping\toutcome\tmapped_mir_locals\tmapped_slots\traw_slots\tref_slots\towning_slots\tslot_keys\n",
+        );
+        for record in records.values() {
+            out.push_str(&format!(
+                "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+                record.declaration_key,
+                record.completeness.as_str(),
+                record.outcome.as_str(),
+                record.mapped_mir_locals,
+                record.mapped_slots,
+                record.raw_slots,
+                record.ref_slots,
+                record.owning_slots,
+                record.slot_keys.join(";"),
+            ));
+        }
+        fs::write(path, out).unwrap_or_else(|error| {
+            panic!("write projection snapshot {}: {error}", path.display())
+        });
+    }
+
+    pub fn read_model_snapshot(path: &Path) -> Result<BTreeMap<String, ModelEvidence>, String> {
+        let source =
+            fs::read_to_string(path).map_err(|error| format!("{}: {error}", path.display()))?;
+        let mut lines = source.lines();
+        if lines.next()
+            != Some(
+                "declaration_key\tmapping\toutcome\tmapped_mir_locals\tmapped_slots\traw_slots\tref_slots\towning_slots\tslot_keys",
+            )
+        {
+            return Err(format!("{}: unexpected model snapshot header", path.display()));
+        }
+        let mut records = BTreeMap::new();
+        for (index, line) in lines.enumerate() {
+            let fields = line.split('\t').collect::<Vec<_>>();
+            if fields.len() != 9 {
+                return Err(format!(
+                    "{}:{}: expected 9 fields",
+                    path.display(),
+                    index + 2
+                ));
+            }
+            let completeness = match fields[1] {
+                "empty" => MappingCompleteness::Empty,
+                "partial" => MappingCompleteness::Partial,
+                "complete" => MappingCompleteness::Complete,
+                value => return Err(format!("{}: unknown mapping {value}", path.display())),
+            };
+            let outcome = match fields[2] {
+                "predicted-eliminated-ref-backed" => ProjectionOutcome::RefBacked,
+                "predicted-eliminated-owning-backed" => ProjectionOutcome::OwningBacked,
+                "predicted-remaining" => ProjectionOutcome::Remaining,
+                "unmapped-counted-remaining" => ProjectionOutcome::Unmapped,
+                value => return Err(format!("{}: unknown outcome {value}", path.display())),
+            };
+            let parse = |field: usize| {
+                fields[field].parse::<usize>().map_err(|_| {
+                    format!(
+                        "{}:{}: field {} is not an integer",
+                        path.display(),
+                        index + 2,
+                        field + 1
+                    )
+                })
+            };
+            let record = ModelEvidence {
+                declaration_key: fields[0].to_owned(),
+                completeness,
+                outcome,
+                mapped_mir_locals: parse(3)?,
+                mapped_slots: parse(4)?,
+                raw_slots: parse(5)?,
+                ref_slots: parse(6)?,
+                owning_slots: parse(7)?,
+                slot_keys: if fields[8].is_empty() {
+                    Vec::new()
+                } else {
+                    fields[8].split(';').map(str::to_owned).collect()
+                },
+            };
+            if records
+                .insert(record.declaration_key.clone(), record)
+                .is_some()
+            {
+                return Err(format!(
+                    "{}:{}: duplicate declaration",
+                    path.display(),
+                    index + 2
+                ));
+            }
+        }
+        Ok(records)
+    }
+
+    pub fn write_legacy_snapshot(path: &Path, records: &BTreeMap<String, LegacyEvidence>) {
+        let mut out =
+            String::from("declaration_key\tmapping\toutcome\tmapped_subjects\tfinal_kinds\n");
+        for record in records.values() {
+            out.push_str(&format!(
+                "{}\t{}\t{}\t{}\t{}\n",
+                record.declaration_key,
+                record.completeness.as_str(),
+                record.outcome.as_str(),
+                record.mapped_subjects,
+                record
+                    .kinds
+                    .iter()
+                    .map(|kind| format!("{kind:?}"))
+                    .collect::<Vec<_>>()
+                    .join(";"),
+            ));
+        }
+        fs::write(path, out)
+            .unwrap_or_else(|error| panic!("write legacy snapshot {}: {error}", path.display()));
+    }
+
+    pub fn read_legacy_snapshot(path: &Path) -> Result<BTreeMap<String, LegacyEvidence>, String> {
+        let source =
+            fs::read_to_string(path).map_err(|error| format!("{}: {error}", path.display()))?;
+        let mut lines = source.lines();
+        if lines.next() != Some("declaration_key\tmapping\toutcome\tmapped_subjects\tfinal_kinds") {
+            return Err(format!(
+                "{}: unexpected legacy snapshot header",
+                path.display()
+            ));
+        }
+        let mut records = BTreeMap::new();
+        for (index, line) in lines.enumerate() {
+            let fields = line.split('\t').collect::<Vec<_>>();
+            if fields.len() != 5 {
+                return Err(format!(
+                    "{}:{}: expected 5 fields",
+                    path.display(),
+                    index + 2
+                ));
+            }
+            let completeness = match fields[1] {
+                "empty" => MappingCompleteness::Empty,
+                "complete" => MappingCompleteness::Complete,
+                value => return Err(format!("{}: unknown mapping {value}", path.display())),
+            };
+            let outcome = match fields[2] {
+                "predicted-eliminated" => ProjectionOutcome::Eliminated,
+                "predicted-remaining" => ProjectionOutcome::Remaining,
+                "unmapped-counted-remaining" => ProjectionOutcome::Unmapped,
+                value => return Err(format!("{}: unknown outcome {value}", path.display())),
+            };
+            let kinds = if fields[4].is_empty() {
+                Vec::new()
+            } else {
+                fields[4]
+                    .split(';')
+                    .map(|value| match value {
+                        "Ref" => Ok(LegacyDecisionKind::Ref),
+                        "OptRef" => Ok(LegacyDecisionKind::OptRef),
+                        "Slice" => Ok(LegacyDecisionKind::Slice),
+                        "SliceCursor" => Ok(LegacyDecisionKind::SliceCursor),
+                        "Box" => Ok(LegacyDecisionKind::Box),
+                        "OptBox" => Ok(LegacyDecisionKind::OptBox),
+                        "BoxedSlice" => Ok(LegacyDecisionKind::BoxedSlice),
+                        "OptBoxedSlice" => Ok(LegacyDecisionKind::OptBoxedSlice),
+                        "Raw" => Ok(LegacyDecisionKind::Raw),
+                        "Other" => Ok(LegacyDecisionKind::Other),
+                        _ => Err(format!("{}: unknown legacy kind {value}", path.display())),
+                    })
+                    .collect::<Result<Vec<_>, _>>()?
+            };
+            let record = LegacyEvidence {
+                declaration_key: fields[0].to_owned(),
+                completeness,
+                outcome,
+                mapped_subjects: fields[3].parse().map_err(|_| {
+                    format!(
+                        "{}:{}: mapped_subjects is not an integer",
+                        path.display(),
+                        index + 2
+                    )
+                })?,
+                kinds,
+            };
+            if records
+                .insert(record.declaration_key.clone(), record)
+                .is_some()
+            {
+                return Err(format!(
+                    "{}:{}: duplicate declaration",
+                    path.display(),
+                    index + 2
+                ));
+            }
+        }
+        Ok(records)
+    }
+
+    pub fn maybe_write_model_snapshot(
+        tcx: TyCtxt<'_>,
+        program: &RustProgram<'_>,
+        slots: &CrateSlots,
+        model: &FxHashMap<SlotRef, SlotKind>,
+    ) -> Option<usize> {
+        let path = std::env::var_os("CRAT_BOC1_PROJECTION_SNAPSHOT").map(PathBuf::from)?;
+        let artifact_root = PathBuf::from(
+            std::env::var_os("CRAT_BOC1_CROWN_ARTIFACT")
+                .expect("projection worker requires CRAT_BOC1_CROWN_ARTIFACT"),
+        );
+        let name =
+            std::env::var("CRAT_BOC1_NAME").expect("projection worker requires CRAT_BOC1_NAME");
+        let official = load_official_program(&artifact_root, &name)
+            .unwrap_or_else(|error| panic!("load official projection universe: {error}"));
+        let records = project_model_for_universe(tcx, program, slots, model, &official.universe);
+        assert_eq!(
+            records.len(),
+            official.evaluation.declaration_before as usize,
+            "{name}: projection snapshot must partition the official BEFORE universe"
+        );
+        write_model_snapshot(&path, &records);
+        Some(records.len())
+    }
+}
+
 /// Measurement-only comparison surface for the registered PRIMARY ownership-yield evaluation.
 ///
 /// This module owns canonical report records and their deterministic comparison/serialization.
@@ -2600,6 +3367,7 @@ mod run {
 
     use super::{
         collect_program,
+        crown_projection,
         ownership_diagnostic_package::{
             self, FunctionPrecisionRecord, NecessityEvidence, ProductionPrecisionEvidence,
             RemovalFilter,
@@ -4665,6 +5433,11 @@ mod run {
                         .unwrap_or_else(|error| panic!("{error}"));
                     row.set("ownership_yield_snapshot", records.len());
                 }
+                if let Some(records) =
+                    crown_projection::maybe_write_model_snapshot(tcx, &program, &slots, m)
+                {
+                    row.set("crown_projection_snapshot", records);
+                }
                 record_l2_red_inventory(&program, &slots, m, rstats.repair, n_ref, &mut row);
             }
         }
@@ -6336,6 +7109,18 @@ mod orchestrate {
             .join(format!("{program}.json"))
     }
 
+    pub fn projection_snapshot_path(program: &str) -> PathBuf {
+        out_dir()
+            .join("model-projection")
+            .join(format!("{program}.tsv"))
+    }
+
+    pub fn legacy_projection_path(program: &str) -> PathBuf {
+        out_dir()
+            .join("legacy-projection")
+            .join(format!("{program}.tsv"))
+    }
+
     /// Current commit SHA of the parent code repo, for the `results.jsonl` provenance stamp.
     /// Best-effort: `unknown` if git is unavailable.
     pub fn git_sha() -> String {
@@ -6419,6 +7204,26 @@ mod orchestrate {
                 fs::remove_file(&snapshot).expect("remove stale ownership-yield snapshot");
             }
             command.env("CRAT_BOC1_YIELD_SNAPSHOT", snapshot);
+        }
+        if std::env::var_os("CRAT_BOC1_CROWN_PROJECTION").is_some() {
+            command.env(
+                "CRAT_BOC1_CROWN_ARTIFACT",
+                std::env::var_os("CRAT_BOC1_CROWN_ARTIFACT")
+                    .expect("projection requires CRAT_BOC1_CROWN_ARTIFACT"),
+            );
+            if mode == "bo" {
+                let snapshot = projection_snapshot_path(program);
+                fs::create_dir_all(snapshot.parent().expect("projection snapshot parent"))
+                    .expect("create projection snapshot dir");
+                if snapshot.is_file() {
+                    fs::remove_file(&snapshot).expect("remove stale projection snapshot");
+                }
+                command.env("CRAT_BOC1_PROJECTION_SNAPSHOT", snapshot);
+            } else if mode == "prod-box" {
+                command
+                    .env("CRAT_POINTER_DECISION_DIAGNOSTICS", "full")
+                    .env("CRAT_POINTER_DECISION_SNAPSHOT_PRE_TRANSFORM", "1");
+            }
         }
         if selector_leak_diagnosis::enabled() {
             let trace = selector_trace_path(program);
@@ -6565,6 +7370,744 @@ mod orchestrate {
             stderr,
         }
     }
+}
+
+#[test]
+#[ignore = "official CROWN-metric projection sweep; run once for Mode-A and once for L2"]
+fn boc1_crown_projection_corpus() {
+    use std::{fs, path::PathBuf, time::Duration};
+
+    use crown_projection::{
+        load_official_program, parse_legacy_decisions, project_legacy_for_universe,
+        write_legacy_snapshot,
+    };
+    use orchestrate::{
+        legacy_projection_path, out_dir, projection_snapshot_path, run_child, workspace_root,
+    };
+
+    assert_eq!(
+        std::env::var("CRAT_BO_REPAIR").as_deref(),
+        Ok("mode_a"),
+        "projection sweep requires Mode-A"
+    );
+    assert_eq!(
+        std::env::var("CRAT_BOC1_TIMEOUT_SECS").as_deref(),
+        Ok("900"),
+        "projection sweep requires the official 900-second cap"
+    );
+    assert_eq!(
+        std::env::var("CRAT_BOC1_MEM_MB").as_deref(),
+        Ok("8192"),
+        "projection sweep requires the official 8192-MiB cap"
+    );
+    assert!(
+        std::env::var_os("CRAT_BOC1_PROGRAMS").is_none(),
+        "projection sweep must cover all 20 frozen programs"
+    );
+    assert_eq!(CORPUS.len(), 20);
+
+    let root = workspace_root();
+    let deps = root.join("deps_crate/target/debug/deps");
+    assert!(
+        deps.is_dir(),
+        "deps_crate not built at {deps:?} — run its build first"
+    );
+    let artifact_root = PathBuf::from(
+        std::env::var_os("CRAT_BOC1_CROWN_ARTIFACT")
+            .expect("projection sweep requires CRAT_BOC1_CROWN_ARTIFACT"),
+    );
+    let l2_value = std::env::var("CRAT_BO_L2_GUARDED_COMMITS")
+        .expect("projection sweep requires an explicit L2 value");
+    assert!(
+        matches!(l2_value.as_str(), "0" | "1"),
+        "projection sweep L2 value must be exactly 0 or 1"
+    );
+    let l2_on = l2_value == "1";
+    assert_eq!(
+        crate::analyses::borrow_ownership::l2::enabled_from_env(),
+        l2_on,
+        "projection sweep L2 environment disagrees with the analysis gate"
+    );
+    let legacy = std::env::var("CRAT_BOC1_PROJECTION_LEGACY").as_deref() == Ok("1");
+    if legacy {
+        assert!(!l2_on, "legacy snapshot belongs only to the Mode-A sweep");
+    }
+
+    fs::create_dir_all(out_dir()).expect("create projection output");
+    let mut run_contract = String::from(
+        "program\tsystem\tstatus\twall_seconds\trepair\tl2\tseed_smt\tseed_sat\ttimeout_seconds\tmemory_mib\tn_ref\tn_own\tuniverse_rows\tnote\n",
+    );
+    let mut ok = 0usize;
+    let mut total_ref = 0usize;
+    let mut total_own = 0usize;
+    let mut legacy_measurable = 0usize;
+    for program in CORPUS {
+        let official = load_official_program(&artifact_root, program.name)
+            .unwrap_or_else(|error| panic!("{}: {error}", program.name));
+        let input = program.input_path(&root);
+        let outcome = run_child(program.name, &input, "bo", Duration::from_secs(900));
+        let row = outcome
+            .row
+            .as_ref()
+            .unwrap_or_else(|| panic!("{}: BO worker lacks sentinel", program.name));
+        let n_ref = row
+            .get("n_ref")
+            .expect("BO row n_ref")
+            .parse::<usize>()
+            .expect("numeric n_ref");
+        let n_own = row
+            .get("n_own")
+            .expect("BO row n_own")
+            .parse::<usize>()
+            .expect("numeric n_own");
+        run_contract.push_str(&format!(
+            "{}\tBO\t{}\t{:.3}\tmode_a\t{}\t0\t0\t900\t8192\t{}\t{}\t{}\t{}\n",
+            program.name,
+            outcome.status,
+            outcome.wall_s,
+            u8::from(l2_on),
+            n_ref,
+            n_own,
+            official.universe.len(),
+            outcome.note.replace(['\t', '\n'], " "),
+        ));
+        if outcome.status == "ok" {
+            ok += 1;
+            total_ref += n_ref;
+            total_own += n_own;
+        }
+        assert_eq!(
+            outcome.status, "ok",
+            "{}: BO projection worker failed: {}",
+            program.name, outcome.note
+        );
+        let snapshot =
+            crown_projection::read_model_snapshot(&projection_snapshot_path(program.name))
+                .unwrap_or_else(|error| panic!("{}: {error}", program.name));
+        assert_eq!(
+            snapshot.keys().collect::<Vec<_>>(),
+            official.universe.iter().collect::<Vec<_>>(),
+            "{}: model snapshot keys must equal the official universe",
+            program.name
+        );
+
+        if legacy {
+            let legacy_outcome =
+                run_child(program.name, &input, "prod-box", Duration::from_secs(900));
+            let expected_unmeasurable = program.name == "urlparser";
+            if legacy_outcome.status == "ok" {
+                assert!(
+                    !expected_unmeasurable,
+                    "urlparser unexpectedly crossed the recorded pre-seam parser panic"
+                );
+                let decisions = parse_legacy_decisions(&legacy_outcome.stderr)
+                    .unwrap_or_else(|error| panic!("{}: {error}", program.name));
+                let evidence = project_legacy_for_universe(&official.universe, &decisions);
+                let path = legacy_projection_path(program.name);
+                fs::create_dir_all(path.parent().expect("legacy projection parent"))
+                    .expect("create legacy projection dir");
+                write_legacy_snapshot(&path, &evidence);
+                legacy_measurable += 1;
+            } else {
+                assert!(
+                    expected_unmeasurable,
+                    "{}: unexpected legacy worker failure {}: {}",
+                    program.name, legacy_outcome.status, legacy_outcome.note
+                );
+            }
+            run_contract.push_str(&format!(
+                "{}\tlegacy\t{}\t{:.3}\tproduction-decision\t-\t0\t0\t900\t8192\t\t\t{}\t{}\n",
+                program.name,
+                if expected_unmeasurable {
+                    "unmeasurable-parser-panic"
+                } else {
+                    &legacy_outcome.status
+                },
+                legacy_outcome.wall_s,
+                official.universe.len(),
+                crown_projection::audit_text(legacy_outcome.note.replace(['\t', '\n'], " ")),
+            ));
+        }
+    }
+    assert_eq!(ok, 20, "projection BO sweep must accept 20/20");
+    if l2_on {
+        assert_eq!(
+            total_ref, 53_041,
+            "L2 projection sweep must reproduce n_ref=53,041"
+        );
+    } else {
+        assert_eq!(
+            total_ref, 52_810,
+            "Mode-A projection sweep must reproduce n_ref=52,810"
+        );
+        assert_eq!(
+            total_own, 230,
+            "Mode-A projection sweep must reproduce n_own=230"
+        );
+    }
+    if legacy {
+        assert_eq!(
+            legacy_measurable, 19,
+            "legacy snapshot must be measurable on 19/20"
+        );
+    }
+    fs::write(out_dir().join("projection-run.tsv"), run_contract)
+        .expect("write projection run contract");
+    eprintln!(
+        "CROWNPROJECTION mode={} ok={ok}/20 n_ref={total_ref} n_own={total_own} legacy={legacy_measurable}/20",
+        if l2_on { "l2-on" } else { "mode-a" }
+    );
+}
+
+#[test]
+#[ignore = "combine completed Mode-A/L2 projection sweeps into the three review CSVs"]
+fn boc1_crown_projection_combine() {
+    use std::{collections::BTreeMap, fs, path::PathBuf};
+
+    use crown_projection::{
+        csv_cell, load_official_program, read_legacy_snapshot, read_model_snapshot,
+        CrownRealizedKind, ModelEvidence, ProjectionOutcome, CROWN_LABEL, LEGACY_LABEL,
+        MODEL_LABEL,
+    };
+
+    #[derive(Default)]
+    struct Counts {
+        eliminated: usize,
+        ref_backed: usize,
+        owning_backed: usize,
+        remaining: usize,
+        unmapped: usize,
+    }
+
+    fn model_counts(records: &BTreeMap<String, ModelEvidence>) -> Counts {
+        let mut counts = Counts::default();
+        for record in records.values() {
+            match record.outcome {
+                ProjectionOutcome::RefBacked => {
+                    counts.eliminated += 1;
+                    counts.ref_backed += 1;
+                }
+                ProjectionOutcome::OwningBacked => {
+                    counts.eliminated += 1;
+                    counts.owning_backed += 1;
+                }
+                ProjectionOutcome::Remaining => counts.remaining += 1,
+                ProjectionOutcome::Unmapped => counts.unmapped += 1,
+                ProjectionOutcome::Eliminated => unreachable!("BO has split eliminated kinds"),
+            }
+        }
+        counts
+    }
+
+    fn percent(numerator: usize, denominator: usize) -> String {
+        if denominator == 0 {
+            "0.00".to_owned()
+        } else {
+            format!("{:.2}", numerator as f64 * 100.0 / denominator as f64)
+        }
+    }
+
+    let artifact_root = PathBuf::from(
+        std::env::var_os("CRAT_BOC1_CROWN_ARTIFACT")
+            .expect("combine requires CRAT_BOC1_CROWN_ARTIFACT"),
+    );
+    let mode_a_root = PathBuf::from(
+        std::env::var_os("CRAT_BOC1_MODE_A_OUT").expect("combine requires CRAT_BOC1_MODE_A_OUT"),
+    );
+    let l2_root = PathBuf::from(
+        std::env::var_os("CRAT_BOC1_L2_OUT").expect("combine requires CRAT_BOC1_L2_OUT"),
+    );
+    let output = orchestrate::out_dir();
+    fs::create_dir_all(&output).expect("create combined output");
+
+    let mut comparison = String::from(
+        "program,metric_scope,universe_before,CROWN_epistemic_status,CROWN_after,CROWN_realized_eliminated,CROWN_realized_reference,CROWN_realized_Box,CROWN_usage_before,CROWN_usage_after,CROWN_usage_reduction_percent,legacy_epistemic_status,legacy_predicted_eliminated,legacy_predicted_remaining_mapped,legacy_unmapped_counted_remaining,legacy_predicted_remaining_including_unmapped,legacy_unmapped_percent,legacy_validity_flag,BO_Mode_A_epistemic_status,BO_Mode_A_predicted_eliminated,BO_Mode_A_predicted_ref_backed,BO_Mode_A_predicted_owning_backed,BO_Mode_A_predicted_remaining_mapped,BO_Mode_A_unmapped_counted_remaining,BO_Mode_A_predicted_remaining_including_unmapped,BO_Mode_A_unmapped_percent,BO_Mode_A_validity_flag,BO_L2_on_epistemic_status,BO_L2_on_predicted_eliminated,BO_L2_on_predicted_ref_backed,BO_L2_on_predicted_owning_backed,BO_L2_on_predicted_remaining_mapped,BO_L2_on_unmapped_counted_remaining,BO_L2_on_predicted_remaining_including_unmapped,BO_L2_on_unmapped_percent,BO_L2_on_validity_flag\n",
+    );
+    let mut evidence = String::from(
+        "program,declaration_key,CROWN_epistemic_status,CROWN_realized_status,legacy_epistemic_status,legacy_mapping,legacy_prediction,legacy_mapped_subjects,legacy_final_kinds,BO_Mode_A_epistemic_status,BO_Mode_A_mapping,BO_Mode_A_prediction,BO_Mode_A_mapped_MIR_locals,BO_Mode_A_mapped_d0_slots,BO_Mode_A_raw_slots,BO_Mode_A_ref_slots,BO_Mode_A_owning_slots,BO_Mode_A_slot_keys,BO_L2_on_epistemic_status,BO_L2_on_mapping,BO_L2_on_prediction,BO_L2_on_mapped_MIR_locals,BO_L2_on_mapped_d0_slots,BO_L2_on_raw_slots,BO_L2_on_ref_slots,BO_L2_on_owning_slots,BO_L2_on_slot_keys\n",
+    );
+
+    let mut corpus_universe = 0usize;
+    let mut corpus_crown_after = 0usize;
+    let mut corpus_crown_ref = 0usize;
+    let mut corpus_crown_box = 0usize;
+    let mut corpus_usage_before = 0u64;
+    let mut corpus_usage_after = 0u64;
+    let mut corpus_mode_a = Counts::default();
+    let mut corpus_l2 = Counts::default();
+    let mut legacy_19_universe = 0usize;
+    let mut legacy_19 = Counts::default();
+    let mut crown_19_after = 0usize;
+    let mut crown_19_ref = 0usize;
+    let mut crown_19_box = 0usize;
+    let mut mode_a_19 = Counts::default();
+    let mut l2_19 = Counts::default();
+
+    for program in CORPUS {
+        let official = load_official_program(&artifact_root, program.name)
+            .unwrap_or_else(|error| panic!("{}: {error}", program.name));
+        let mode_a = read_model_snapshot(
+            &mode_a_root
+                .join("model-projection")
+                .join(format!("{}.tsv", program.name)),
+        )
+        .unwrap_or_else(|error| panic!("{} Mode-A: {error}", program.name));
+        let l2 = read_model_snapshot(
+            &l2_root
+                .join("model-projection")
+                .join(format!("{}.tsv", program.name)),
+        )
+        .unwrap_or_else(|error| panic!("{} L2: {error}", program.name));
+        assert_eq!(
+            mode_a.keys().collect::<Vec<_>>(),
+            official.universe.iter().collect::<Vec<_>>(),
+            "{}: Mode-A evidence is not the official universe",
+            program.name
+        );
+        assert_eq!(
+            l2.keys().collect::<Vec<_>>(),
+            official.universe.iter().collect::<Vec<_>>(),
+            "{}: L2 evidence is not the official universe",
+            program.name
+        );
+        let mode_a_counts = model_counts(&mode_a);
+        let l2_counts = model_counts(&l2);
+        for (label, counts) in [("Mode-A", &mode_a_counts), ("L2", &l2_counts)] {
+            assert_eq!(
+                counts.eliminated + counts.remaining + counts.unmapped,
+                official.universe.len(),
+                "{}: {label} eliminated + remaining + unmapped != BEFORE",
+                program.name
+            );
+            assert_eq!(
+                counts.ref_backed + counts.owning_backed,
+                counts.eliminated,
+                "{}: {label} safe-kind split does not reconcile",
+                program.name
+            );
+        }
+
+        let legacy = if program.name == "urlparser" {
+            None
+        } else {
+            let records = read_legacy_snapshot(
+                &mode_a_root
+                    .join("legacy-projection")
+                    .join(format!("{}.tsv", program.name)),
+            )
+            .unwrap_or_else(|error| panic!("{} legacy: {error}", program.name));
+            assert_eq!(
+                records.keys().collect::<Vec<_>>(),
+                official.universe.iter().collect::<Vec<_>>(),
+                "{}: legacy evidence is not the official universe",
+                program.name
+            );
+            Some(records)
+        };
+        let legacy_counts = legacy.as_ref().map(|records| {
+            let mut counts = Counts::default();
+            for record in records.values() {
+                match record.outcome {
+                    ProjectionOutcome::Eliminated => counts.eliminated += 1,
+                    ProjectionOutcome::Remaining => counts.remaining += 1,
+                    ProjectionOutcome::Unmapped => counts.unmapped += 1,
+                    _ => unreachable!("legacy uses unsplit safe outcome"),
+                }
+            }
+            assert_eq!(
+                counts.eliminated + counts.remaining + counts.unmapped,
+                official.universe.len(),
+                "{}: legacy eliminated + remaining + unmapped != BEFORE",
+                program.name
+            );
+            counts
+        });
+
+        let crown_ref = official
+            .crown_kinds
+            .values()
+            .filter(|kind| **kind == CrownRealizedKind::Reference)
+            .count();
+        let crown_box = official
+            .crown_kinds
+            .values()
+            .filter(|kind| **kind == CrownRealizedKind::Box)
+            .count();
+        let crown_eliminated = crown_ref + crown_box;
+        assert_eq!(
+            crown_eliminated + official.evaluation.declaration_after as usize,
+            official.universe.len(),
+            "{}: CROWN realized partition does not reconcile",
+            program.name
+        );
+
+        let legacy_cells = if let Some(counts) = &legacy_counts {
+            vec![
+                LEGACY_LABEL.to_owned(),
+                counts.eliminated.to_string(),
+                counts.remaining.to_string(),
+                counts.unmapped.to_string(),
+                (counts.remaining + counts.unmapped).to_string(),
+                percent(counts.unmapped, official.universe.len()),
+                if counts.unmapped * 100 > official.universe.len() * 3 {
+                    "VALIDITY-LIMIT: unmapped >3.0%".to_owned()
+                } else {
+                    "within 3.0% threshold".to_owned()
+                },
+            ]
+        } else {
+            vec![
+                "unmeasurable: urlparser pre-seam parser panic".to_owned(),
+                String::new(),
+                String::new(),
+                String::new(),
+                String::new(),
+                String::new(),
+                "unmeasurable".to_owned(),
+            ]
+        };
+        let model_cells = |counts: &Counts| {
+            vec![
+                MODEL_LABEL.to_owned(),
+                counts.eliminated.to_string(),
+                counts.ref_backed.to_string(),
+                counts.owning_backed.to_string(),
+                counts.remaining.to_string(),
+                counts.unmapped.to_string(),
+                (counts.remaining + counts.unmapped).to_string(),
+                percent(counts.unmapped, official.universe.len()),
+                if counts.unmapped * 100 > official.universe.len() * 3 {
+                    "VALIDITY-LIMIT: unmapped >3.0%".to_owned()
+                } else {
+                    "within 3.0% threshold".to_owned()
+                },
+            ]
+        };
+        let mut row = vec![
+            program.name.to_owned(),
+            "function declaration d0 Mut ∩ Ptr; fields/deeper/const/array excluded".to_owned(),
+            official.universe.len().to_string(),
+            CROWN_LABEL.to_owned(),
+            official.evaluation.declaration_after.to_string(),
+            crown_eliminated.to_string(),
+            crown_ref.to_string(),
+            crown_box.to_string(),
+            official.evaluation.usage_before.to_string(),
+            official.evaluation.usage_after.to_string(),
+            official.evaluation.usage_rate.clone(),
+        ];
+        row.extend(legacy_cells);
+        row.extend(model_cells(&mode_a_counts));
+        row.extend(model_cells(&l2_counts));
+        comparison.push_str(&row.into_iter().map(csv_cell).collect::<Vec<_>>().join(","));
+        comparison.push('\n');
+
+        for key in &official.universe {
+            let crown = official.crown_kinds[key].as_str();
+            let mode_a_record = &mode_a[key];
+            let l2_record = &l2[key];
+            let legacy_fields = if let Some(records) = &legacy {
+                let record = &records[key];
+                vec![
+                    LEGACY_LABEL.to_owned(),
+                    record.completeness.as_str().to_owned(),
+                    record.outcome.as_str().to_owned(),
+                    record.mapped_subjects.to_string(),
+                    record
+                        .kinds
+                        .iter()
+                        .map(|kind| format!("{kind:?}"))
+                        .collect::<Vec<_>>()
+                        .join(";"),
+                ]
+            } else {
+                vec![
+                    "unmeasurable: urlparser pre-seam parser panic".to_owned(),
+                    String::new(),
+                    "unmeasurable".to_owned(),
+                    String::new(),
+                    String::new(),
+                ]
+            };
+            let model_fields = |record: &ModelEvidence| {
+                vec![
+                    MODEL_LABEL.to_owned(),
+                    record.completeness.as_str().to_owned(),
+                    record.outcome.as_str().to_owned(),
+                    record.mapped_mir_locals.to_string(),
+                    record.mapped_slots.to_string(),
+                    record.raw_slots.to_string(),
+                    record.ref_slots.to_string(),
+                    record.owning_slots.to_string(),
+                    record.slot_keys.join(";"),
+                ]
+            };
+            let mut row = vec![
+                program.name.to_owned(),
+                key.clone(),
+                CROWN_LABEL.to_owned(),
+                crown.to_owned(),
+            ];
+            row.extend(legacy_fields);
+            row.extend(model_fields(mode_a_record));
+            row.extend(model_fields(l2_record));
+            evidence.push_str(&row.into_iter().map(csv_cell).collect::<Vec<_>>().join(","));
+            evidence.push('\n');
+        }
+
+        corpus_universe += official.universe.len();
+        corpus_crown_after += official.evaluation.declaration_after as usize;
+        corpus_crown_ref += crown_ref;
+        corpus_crown_box += crown_box;
+        corpus_usage_before += official.evaluation.usage_before;
+        corpus_usage_after += official.evaluation.usage_after;
+        for (total, counts) in [
+            (&mut corpus_mode_a, &mode_a_counts),
+            (&mut corpus_l2, &l2_counts),
+        ] {
+            total.eliminated += counts.eliminated;
+            total.ref_backed += counts.ref_backed;
+            total.owning_backed += counts.owning_backed;
+            total.remaining += counts.remaining;
+            total.unmapped += counts.unmapped;
+        }
+        if let Some(counts) = legacy_counts {
+            legacy_19_universe += official.universe.len();
+            legacy_19.eliminated += counts.eliminated;
+            legacy_19.remaining += counts.remaining;
+            legacy_19.unmapped += counts.unmapped;
+            crown_19_after += official.evaluation.declaration_after as usize;
+            crown_19_ref += crown_ref;
+            crown_19_box += crown_box;
+            for (total, counts) in [(&mut mode_a_19, &mode_a_counts), (&mut l2_19, &l2_counts)] {
+                total.eliminated += counts.eliminated;
+                total.ref_backed += counts.ref_backed;
+                total.owning_backed += counts.owning_backed;
+                total.remaining += counts.remaining;
+                total.unmapped += counts.unmapped;
+            }
+        }
+    }
+
+    assert_eq!(corpus_universe, 2_414);
+    assert_eq!(corpus_crown_after, 1_711);
+    assert_eq!(corpus_crown_ref, 650);
+    assert_eq!(corpus_crown_box, 53);
+    assert_eq!(
+        corpus_mode_a.eliminated + corpus_mode_a.remaining + corpus_mode_a.unmapped,
+        2_414
+    );
+    assert_eq!(
+        corpus_l2.eliminated + corpus_l2.remaining + corpus_l2.unmapped,
+        2_414
+    );
+
+    let aggregate_model_cells = |counts: &Counts, denominator: usize| {
+        vec![
+            MODEL_LABEL.to_owned(),
+            counts.eliminated.to_string(),
+            counts.ref_backed.to_string(),
+            counts.owning_backed.to_string(),
+            counts.remaining.to_string(),
+            counts.unmapped.to_string(),
+            (counts.remaining + counts.unmapped).to_string(),
+            percent(counts.unmapped, denominator),
+            if counts.unmapped * 100 > denominator * 3 {
+                "VALIDITY-LIMIT: unmapped >3.0%".to_owned()
+            } else {
+                "within 3.0% threshold".to_owned()
+            },
+        ]
+    };
+    let mut subtotal = vec![
+        "LEGACY_MEASURABLE_19_SUBTOTAL".to_owned(),
+        "same official universe, excluding unmeasurable urlparser".to_owned(),
+        legacy_19_universe.to_string(),
+        CROWN_LABEL.to_owned(),
+        crown_19_after.to_string(),
+        (crown_19_ref + crown_19_box).to_string(),
+        crown_19_ref.to_string(),
+        crown_19_box.to_string(),
+        String::new(),
+        String::new(),
+        String::new(),
+        LEGACY_LABEL.to_owned(),
+        legacy_19.eliminated.to_string(),
+        legacy_19.remaining.to_string(),
+        legacy_19.unmapped.to_string(),
+        (legacy_19.remaining + legacy_19.unmapped).to_string(),
+        percent(legacy_19.unmapped, legacy_19_universe),
+        if legacy_19.unmapped * 100 > legacy_19_universe * 3 {
+            "VALIDITY-LIMIT: unmapped >3.0%".to_owned()
+        } else {
+            "within 3.0% threshold".to_owned()
+        },
+    ];
+    subtotal.extend(aggregate_model_cells(&mode_a_19, legacy_19_universe));
+    subtotal.extend(aggregate_model_cells(&l2_19, legacy_19_universe));
+    comparison.push_str(
+        &subtotal
+            .into_iter()
+            .map(csv_cell)
+            .collect::<Vec<_>>()
+            .join(","),
+    );
+    comparison.push('\n');
+
+    let usage_rate = format!(
+        "{:.1}%",
+        (corpus_usage_before - corpus_usage_after) as f64 * 100.0 / corpus_usage_before as f64
+    );
+    let mut corpus = vec![
+        "CORPUS_20".to_owned(),
+        "function declaration d0 Mut ∩ Ptr; fields/deeper/const/array excluded".to_owned(),
+        corpus_universe.to_string(),
+        CROWN_LABEL.to_owned(),
+        corpus_crown_after.to_string(),
+        (corpus_crown_ref + corpus_crown_box).to_string(),
+        corpus_crown_ref.to_string(),
+        corpus_crown_box.to_string(),
+        corpus_usage_before.to_string(),
+        corpus_usage_after.to_string(),
+        usage_rate,
+        "unmeasurable corpus-wide: urlparser pre-seam parser panic; see 19-program subtotal"
+            .to_owned(),
+        String::new(),
+        String::new(),
+        String::new(),
+        String::new(),
+        String::new(),
+        "unmeasurable".to_owned(),
+    ];
+    corpus.extend(aggregate_model_cells(&corpus_mode_a, corpus_universe));
+    corpus.extend(aggregate_model_cells(&corpus_l2, corpus_universe));
+    comparison.push_str(
+        &corpus
+            .into_iter()
+            .map(csv_cell)
+            .collect::<Vec<_>>()
+            .join(","),
+    );
+    comparison.push('\n');
+
+    let mut runs = String::from(
+        "program,system,epistemic_status,worker_status,wall_seconds,repair,L2_guarded_commits,smt_random_seed,sat_random_seed,timeout_seconds,memory_mib,n_ref_internal,n_own_internal,official_universe_rows,unmapped_rows,unmapped_percent,validity_flag,note\n",
+    );
+    for (root, profile) in [(&mode_a_root, "Mode-A L2-off"), (&l2_root, "Mode-A L2-on")] {
+        let source = fs::read_to_string(root.join("projection-run.tsv"))
+            .unwrap_or_else(|error| panic!("{}: {error}", root.display()));
+        let mut lines = source.lines();
+        let header = lines
+            .next()
+            .expect("run TSV header")
+            .split('\t')
+            .collect::<Vec<_>>();
+        for line in lines {
+            let fields = line.split('\t').collect::<Vec<_>>();
+            let get = |name: &str| {
+                fields[header
+                    .iter()
+                    .position(|column| *column == name)
+                    .expect("run column")]
+            };
+            if root == &l2_root && get("system") == "legacy" {
+                continue;
+            }
+            let program = get("program");
+            let (epistemic, unmapped, denominator) = if get("system") == "legacy" {
+                if program == "urlparser" {
+                    (
+                        "unmeasurable: urlparser pre-seam parser panic",
+                        None,
+                        get("universe_rows").parse::<usize>().expect("universe"),
+                    )
+                } else {
+                    let records = read_legacy_snapshot(
+                        &mode_a_root
+                            .join("legacy-projection")
+                            .join(format!("{program}.tsv")),
+                    )
+                    .expect("legacy run coverage");
+                    (
+                        LEGACY_LABEL,
+                        Some(
+                            records
+                                .values()
+                                .filter(|record| record.outcome == ProjectionOutcome::Unmapped)
+                                .count(),
+                        ),
+                        records.len(),
+                    )
+                }
+            } else {
+                let records = read_model_snapshot(
+                    &root.join("model-projection").join(format!("{program}.tsv")),
+                )
+                .expect("model run coverage");
+                (
+                    MODEL_LABEL,
+                    Some(
+                        records
+                            .values()
+                            .filter(|record| record.outcome == ProjectionOutcome::Unmapped)
+                            .count(),
+                    ),
+                    records.len(),
+                )
+            };
+            let unmapped_percent = unmapped.map(|value| percent(value, denominator));
+            let validity = match unmapped {
+                None => "unmeasurable".to_owned(),
+                Some(value) if value * 100 > denominator * 3 => {
+                    "VALIDITY-LIMIT: unmapped >3.0%".to_owned()
+                }
+                Some(_) => "within 3.0% threshold".to_owned(),
+            };
+            let row = [
+                program.to_owned(),
+                if get("system") == "BO" {
+                    profile.to_owned()
+                } else {
+                    "legacy".to_owned()
+                },
+                epistemic.to_owned(),
+                get("status").to_owned(),
+                get("wall_seconds").to_owned(),
+                get("repair").to_owned(),
+                get("l2").to_owned(),
+                get("seed_smt").to_owned(),
+                get("seed_sat").to_owned(),
+                get("timeout_seconds").to_owned(),
+                get("memory_mib").to_owned(),
+                get("n_ref").to_owned(),
+                get("n_own").to_owned(),
+                denominator.to_string(),
+                unmapped.map(|value| value.to_string()).unwrap_or_default(),
+                unmapped_percent.unwrap_or_default(),
+                validity,
+                get("note").to_owned(),
+            ];
+            runs.push_str(&row.into_iter().map(csv_cell).collect::<Vec<_>>().join(","));
+            runs.push('\n');
+        }
+    }
+
+    let comparison_path = output.join("2026-07-27-crown-official-metric-projection.csv");
+    let evidence_path = output.join("2026-07-27-crown-official-metric-declarations.csv");
+    let runs_path = output.join("2026-07-27-crown-official-metric-runs.csv");
+    fs::write(&comparison_path, comparison).expect("write comparison CSV");
+    fs::write(&evidence_path, evidence).expect("write evidence CSV");
+    fs::write(&runs_path, runs).expect("write runs CSV");
+    eprintln!(
+        "CROWNPROJECTION combined universe=2414 CROWN=703({}+{}) mode_a={} l2={} files={},{},{}",
+        corpus_crown_ref,
+        corpus_crown_box,
+        corpus_mode_a.eliminated,
+        corpus_l2.eliminated,
+        comparison_path.display(),
+        evidence_path.display(),
+        runs_path.display(),
+    );
 }
 
 #[test]
@@ -9627,4 +11170,153 @@ fn l2_red_feature_off_matches_base_ae6f334() {
         golden_output,
         "feature-off generated output is not byte-identical to the approved ae6f334 base"
     );
+}
+
+#[cfg(test)]
+mod crown_projection_red_tests {
+    use std::collections::BTreeSet;
+
+    use rustc_hash::FxHashMap;
+
+    use super::crown_projection::{
+        classify_legacy_subjects, classify_model_slots, csv_cell, parse_legacy_decisions,
+        project_model_for_universe, LegacyDecisionKind, MappingCompleteness, ModelKind,
+        ProjectionOutcome,
+    };
+
+    #[test]
+    fn crown_projection_csv_preserves_nul_as_visible_text() {
+        assert_eq!(csv_cell("a\0b"), "a\\0b");
+        assert_eq!(csv_cell("a,b"), "\"a,b\"");
+    }
+
+    #[test]
+    fn crown_projection_uses_all_mapped_slots_and_partitions_safe_groups() {
+        assert_eq!(
+            classify_model_slots(
+                MappingCompleteness::Complete,
+                &[ModelKind::Ref, ModelKind::Ref]
+            ),
+            ProjectionOutcome::RefBacked
+        );
+        assert_eq!(
+            classify_model_slots(
+                MappingCompleteness::Complete,
+                &[ModelKind::Ref, ModelKind::Owning]
+            ),
+            ProjectionOutcome::OwningBacked
+        );
+        assert_eq!(
+            classify_model_slots(
+                MappingCompleteness::Complete,
+                &[ModelKind::Ref, ModelKind::Raw]
+            ),
+            ProjectionOutcome::Remaining
+        );
+        assert_eq!(
+            classify_model_slots(MappingCompleteness::Partial, &[ModelKind::Ref]),
+            ProjectionOutcome::Unmapped
+        );
+        assert_eq!(
+            classify_model_slots(MappingCompleteness::Complete, &[]),
+            ProjectionOutcome::Unmapped
+        );
+    }
+
+    #[test]
+    fn crown_projection_legacy_safe_kind_list_is_closed_and_all_subjects_apply() {
+        let safe = [
+            LegacyDecisionKind::Ref,
+            LegacyDecisionKind::OptRef,
+            LegacyDecisionKind::Slice,
+            LegacyDecisionKind::SliceCursor,
+            LegacyDecisionKind::Box,
+            LegacyDecisionKind::OptBox,
+            LegacyDecisionKind::BoxedSlice,
+            LegacyDecisionKind::OptBoxedSlice,
+        ];
+        assert_eq!(
+            classify_legacy_subjects(MappingCompleteness::Complete, &safe),
+            ProjectionOutcome::Eliminated
+        );
+        assert_eq!(
+            classify_legacy_subjects(
+                MappingCompleteness::Complete,
+                &[LegacyDecisionKind::Ref, LegacyDecisionKind::Raw]
+            ),
+            ProjectionOutcome::Remaining
+        );
+        assert_eq!(
+            classify_legacy_subjects(MappingCompleteness::Empty, &[]),
+            ProjectionOutcome::Unmapped
+        );
+    }
+
+    #[test]
+    fn crown_projection_parses_final_legacy_subjects_without_collapsing_duplicates() {
+        let input = "\
+[pointer-decision] subject=local fn=src::sample::f name=x original=*mut i32 span=a final=Ref(true)
+[pointer-decision] subject=local fn=src::sample::f name=x original=*mut i32 span=b final=Box
+[pointer-decision] subject=param fn=src::sample::f index=0 name=p original=*mut i32 span=c final=Raw(true)
+[pointer-decision] subject=return fn=src::sample::f original=*mut i32 final=OptRef(true)
+";
+        let records = parse_legacy_decisions(input).expect("legacy decisions");
+        assert_eq!(records.len(), 4);
+        assert_eq!(
+            records[0].declaration_key.as_deref(),
+            Some("src::sample::f::x")
+        );
+        assert_eq!(
+            records[1].declaration_key.as_deref(),
+            Some("src::sample::f::x")
+        );
+        assert_eq!(
+            records[2].declaration_key.as_deref(),
+            Some("src::sample::f::p")
+        );
+        assert_eq!(records[3].declaration_key, None);
+    }
+
+    #[test]
+    fn crown_projection_maps_debug_declarations_through_existing_mir_groups() {
+        use crate::analyses::borrow_ownership::{
+            crate_slots::CrateSlots, slots::SlotId, solver::SlotRef, SlotKind,
+        };
+
+        ::utils::compilation::run_compiler_on_str(
+            "pub unsafe fn f(p: *mut i32) -> i32 { let copy = p; *copy }",
+            |tcx| {
+                let program = super::collect_program(tcx);
+                let slots = CrateSlots::build(&program);
+                let did = program.functions[0];
+                let key = format!("{}::p", tcx.def_path_str(did));
+                let universe = BTreeSet::from([key.clone()]);
+                let mut model = FxHashMap::default();
+                for (&fn_did, slot_universe) in &slots.fn_local_slots {
+                    for index in 0..slot_universe.len() {
+                        model.insert(
+                            SlotRef::Local(fn_did, SlotId::from_usize(index)),
+                            SlotKind::Ref,
+                        );
+                    }
+                }
+
+                let projected =
+                    project_model_for_universe(tcx, &program, &slots, &model, &universe);
+                let record = &projected[&key];
+                assert_eq!(record.completeness, MappingCompleteness::Complete);
+                assert_eq!(record.outcome, ProjectionOutcome::RefBacked);
+                assert!(record.mapped_mir_locals >= 1);
+                assert!(record.mapped_slots >= 1);
+
+                for kind in model.values_mut() {
+                    *kind = SlotKind::Raw;
+                }
+                let projected =
+                    project_model_for_universe(tcx, &program, &slots, &model, &universe);
+                assert_eq!(projected[&key].outcome, ProjectionOutcome::Remaining);
+            },
+        )
+        .unwrap_or_else(|error| error.raise());
+    }
 }
