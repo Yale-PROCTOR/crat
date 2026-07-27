@@ -28,6 +28,7 @@ use super::{
         SolverOutcome as L2SolverOutcome, StableLoanKey,
     },
     mutability_facts::MutProvider,
+    origin_flow::OriginFlowResults,
     slots::{SlotId, SlotOwner},
     solver::{KindSolver, L2SolveResult, Selectors, SlotRef},
 };
@@ -205,6 +206,17 @@ pub(crate) fn revalidate(
     is_ref: impl Fn(SlotRef) -> bool,
     is_mutable: impl MutProvider + Copy,
 ) -> FxHashMap<LocalDefId, Vec<SlotConflict>> {
+    let origin_flows = super::origin_flow::analyze_program_origin_flow(program);
+    revalidate_with_flows(program, slots, &origin_flows, is_ref, is_mutable)
+}
+
+fn revalidate_with_flows(
+    program: &RustProgram,
+    slots: &CrateSlots,
+    origin_flows: &OriginFlowResults,
+    is_ref: impl Fn(SlotRef) -> bool,
+    is_mutable: impl MutProvider + Copy,
+) -> FxHashMap<LocalDefId, Vec<SlotConflict>> {
     let is_ref = &is_ref;
     let cand = move |fn_did| {
         let universe = slots.fn_local_slots.get(&fn_did);
@@ -225,7 +237,7 @@ pub(crate) fn revalidate(
             borrow::borrow_conflicts(program, cand, mutab)
         }
         super::borrow_engine::ForkEngineMode::Fork => {
-            super::borrow_engine::borrow_conflicts(program, cand, mutab)
+            super::borrow_engine::borrow_conflicts_with_flows(program, origin_flows, cand, mutab)
         }
     };
 
@@ -242,6 +254,18 @@ pub(crate) fn revalidate(
 pub(crate) fn revalidate_replaying(
     program: &RustProgram,
     slots: &CrateSlots,
+    is_ref: impl Fn(SlotRef) -> bool,
+    is_raw: impl Fn(SlotRef) -> bool,
+    is_mutable: impl MutProvider + Copy,
+) -> FxHashMap<LocalDefId, Vec<SlotConflict>> {
+    let origin_flows = super::origin_flow::analyze_program_origin_flow(program);
+    revalidate_replaying_with_flows(program, slots, &origin_flows, is_ref, is_raw, is_mutable)
+}
+
+fn revalidate_replaying_with_flows(
+    program: &RustProgram,
+    slots: &CrateSlots,
+    origin_flows: &OriginFlowResults,
     is_ref: impl Fn(SlotRef) -> bool,
     is_raw: impl Fn(SlotRef) -> bool,
     is_mutable: impl MutProvider + Copy,
@@ -288,7 +312,14 @@ pub(crate) fn revalidate_replaying(
             borrow::borrow_conflicts_replaying(program, cand, raw, mutab)
         }
         super::borrow_engine::ForkEngineMode::Fork => {
-            super::borrow_engine::borrow_conflicts_replaying(program, cand, raw, mutab, &raw_fields)
+            super::borrow_engine::borrow_conflicts_replaying_with_flows(
+                program,
+                origin_flows,
+                cand,
+                raw,
+                mutab,
+                &raw_fields,
+            )
         }
     };
 
@@ -301,6 +332,7 @@ pub(crate) fn revalidate_replaying(
 fn revalidate_replaying_witnessed(
     program: &RustProgram,
     slots: &CrateSlots,
+    origin_flows: &OriginFlowResults,
     is_ref: impl Fn(SlotRef) -> bool,
     is_raw: impl Fn(SlotRef) -> bool,
     is_mutable: impl MutProvider + Copy,
@@ -342,6 +374,7 @@ fn revalidate_replaying_witnessed(
     );
     let edges = super::borrow_engine::borrow_conflicts_replaying_witnessed(
         program,
+        origin_flows,
         cand,
         raw,
         mutab,
@@ -496,11 +529,38 @@ pub(crate) fn verify_to_fixpoint(
     selectors: &Selectors,
     is_mutable: impl MutProvider + Copy,
 ) -> Option<FxHashMap<SlotRef, SlotKind>> {
+    let origin_flows = super::origin_flow::analyze_program_origin_flow(program);
+    verify_to_fixpoint_with_flows(
+        program,
+        slots,
+        &origin_flows,
+        solver,
+        selectors,
+        is_mutable,
+    )
+}
+
+pub(crate) fn verify_to_fixpoint_with_flows(
+    program: &RustProgram,
+    slots: &CrateSlots,
+    origin_flows: &OriginFlowResults,
+    solver: &KindSolver,
+    selectors: &Selectors,
+    is_mutable: impl MutProvider + Copy,
+) -> Option<FxHashMap<SlotRef, SlotKind>> {
     // §NB5-M: thin wrapper over the single counting loop (model only). KEEP THIN — any logic
     // added here but not in `verify_to_fixpoint_counting` diverges the sweep's counters from what
     // the suite verifies (exactly the mirror-drift the retired bo_c1 mirror guarded; wrapper-
     // thinness is now the guard — see `verify_to_fixpoint_is_thin_wrapper`).
-    verify_to_fixpoint_counting(program, slots, solver, selectors, is_mutable).0
+    verify_to_fixpoint_counting_with_flows(
+        program,
+        slots,
+        origin_flows,
+        solver,
+        selectors,
+        is_mutable,
+    )
+    .0
 }
 
 /// §NB5-M CEGAR round/commit counters, native to the fork — retires the bo_c1 mirror
@@ -558,6 +618,25 @@ pub(crate) fn verify_to_fixpoint_counting(
     selectors: &Selectors,
     is_mutable: impl MutProvider + Copy,
 ) -> (Option<FxHashMap<SlotRef, SlotKind>>, RoundStats) {
+    let origin_flows = super::origin_flow::analyze_program_origin_flow(program);
+    verify_to_fixpoint_counting_with_flows(
+        program,
+        slots,
+        &origin_flows,
+        solver,
+        selectors,
+        is_mutable,
+    )
+}
+
+pub(crate) fn verify_to_fixpoint_counting_with_flows(
+    program: &RustProgram,
+    slots: &CrateSlots,
+    origin_flows: &OriginFlowResults,
+    solver: &KindSolver,
+    selectors: &Selectors,
+    is_mutable: impl MutProvider + Copy,
+) -> (Option<FxHashMap<SlotRef, SlotKind>>, RoundStats) {
     // §NB-R guard (release-active): a tracked solver's hard constraints are
     // track-gated; every solve in this loop would be vacuously SAT and the
     // accepted model meaningless. Tracked instances belong to the explain path.
@@ -573,7 +652,14 @@ pub(crate) fn verify_to_fixpoint_counting(
             RepairMode::ModeA,
             "CRAT_BO_L2_GUARDED_COMMITS=1 requires CRAT_BO_REPAIR=mode_a (or the unset Mode-A default)"
         );
-        return verify_l2_to_fixpoint_counting(program, slots, solver, selectors, is_mutable);
+        return verify_l2_to_fixpoint_counting(
+            program,
+            slots,
+            origin_flows,
+            solver,
+            selectors,
+            is_mutable,
+        );
     }
     let cap = round_cap(slots);
     // §9.10.2 — constrain each struct-field slot's ownership to `field.own <=> AND(stored
@@ -590,9 +676,10 @@ pub(crate) fn verify_to_fixpoint_counting(
     record_dropped(&mut stats, selectors, &dropped);
     for _ in 0..cap {
         stats.rounds += 1;
-        let conflicts = revalidate_replaying(
+        let conflicts = revalidate_replaying_with_flows(
             program,
             slots,
+            origin_flows,
             |s| model.get(&s) == Some(&SlotKind::Ref),
             // §8 BB3-b — complete-by-construction: EVERY non-`Ref` slot is a replay candidate
             // (`is_raw`), so no `Owning` slot is ever EXCLUDED from the replay. A flow-insensitive
@@ -813,6 +900,7 @@ impl L2TransitionDiagnostics {
 fn verify_l2_to_fixpoint_counting(
     program: &RustProgram,
     slots: &CrateSlots,
+    origin_flows: &OriginFlowResults,
     solver: &KindSolver,
     selectors: &Selectors,
     is_mutable: impl MutProvider + Copy,
@@ -867,6 +955,7 @@ fn verify_l2_to_fixpoint_counting(
         let conflicts = revalidate_replaying_witnessed(
             program,
             slots,
+            origin_flows,
             |slot| model.get(&slot) == Some(&SlotKind::Ref),
             |slot| match slot {
                 SlotRef::Field(_) => model.get(&slot) == Some(&SlotKind::Raw),
@@ -1074,9 +1163,21 @@ pub(crate) fn model_accepts(
     model: &FxHashMap<SlotRef, SlotKind>,
     is_mutable: impl MutProvider + Copy,
 ) -> bool {
-    let conflicts = revalidate_replaying(
+    let origin_flows = super::origin_flow::analyze_program_origin_flow(program);
+    model_accepts_with_flows(program, slots, &origin_flows, model, is_mutable)
+}
+
+pub(crate) fn model_accepts_with_flows(
+    program: &RustProgram,
+    slots: &CrateSlots,
+    origin_flows: &OriginFlowResults,
+    model: &FxHashMap<SlotRef, SlotKind>,
+    is_mutable: impl MutProvider + Copy,
+) -> bool {
+    let conflicts = revalidate_replaying_with_flows(
         program,
         slots,
+        origin_flows,
         |s| model.get(&s) == Some(&SlotKind::Ref),
         |s| match s {
             SlotRef::Field(_) => model.get(&s) == Some(&SlotKind::Raw),
