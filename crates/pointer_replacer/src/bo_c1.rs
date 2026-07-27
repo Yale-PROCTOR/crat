@@ -981,6 +981,7 @@ pub(crate) mod ownership_diagnostic_package {
     ];
 
     pub const ENV: &str = "CRAT_BOC1_OWNERSHIP_DIAGNOSTIC_PACKAGE";
+    pub const SNAPSHOT_ONLY_ENV: &str = "CRAT_BOC1_PROD_BOX_SNAPSHOT_ONLY";
 
     pub fn enabled() -> bool {
         match std::env::var(ENV).as_deref() {
@@ -988,6 +989,15 @@ pub(crate) mod ownership_diagnostic_package {
             Ok("1") => true,
             Ok(other) => panic!("{ENV} must be 0 or 1, got {other:?}"),
             Err(error) => panic!("{ENV} is not valid Unicode: {error}"),
+        }
+    }
+
+    pub fn snapshot_only_enabled() -> bool {
+        match std::env::var(SNAPSHOT_ONLY_ENV).as_deref() {
+            Err(std::env::VarError::NotPresent) | Ok("0") => false,
+            Ok("1") => true,
+            Ok(other) => panic!("{SNAPSHOT_ONLY_ENV} must be 0 or 1, got {other:?}"),
+            Err(error) => panic!("{SNAPSHOT_ONLY_ENV} is not valid Unicode: {error}"),
         }
     }
 
@@ -1338,6 +1348,12 @@ pub(crate) mod ownership_diagnostic_package {
 
         #[test]
         fn diagnostic_package_parses_final_box_family_subjects() {
+            assert!(crate::rewriter::decision_snapshot_pre_transform_enabled_from_value(Some("1")));
+            assert!(!crate::rewriter::decision_snapshot_pre_transform_enabled_from_value(None));
+            assert!(std::panic::catch_unwind(|| {
+                crate::rewriter::decision_snapshot_pre_transform_enabled_from_value(Some("true"))
+            })
+            .is_err());
             let input = "\
 [pointer-decision] subject=local fn=a name=x original=*mut i32 span=s final=Box\n\
 [pointer-decision] subject=param fn=a index=0 name=p original=*mut i32 span=s final=OptBox\n\
@@ -6466,7 +6482,9 @@ mod orchestrate {
                 }
                 command.env("CRAT_BOC1_PROD_PRECISION_EVIDENCE", precision);
             } else if mode == "prod-box" {
-                command.env("CRAT_POINTER_DECISION_DIAGNOSTICS", "full");
+                command
+                    .env("CRAT_POINTER_DECISION_DIAGNOSTICS", "full")
+                    .env("CRAT_POINTER_DECISION_SNAPSHOT_PRE_TRANSFORM", "1");
             }
         }
         let mut child = command.spawn().expect("spawn worker");
@@ -6596,6 +6614,7 @@ fn boc1_corpus() {
     let ownership_yield_enabled = ownership_yield::enabled();
     let selector_leak_diag = selector_leak_diagnosis::enabled();
     let diagnostic_package = ownership_diagnostic_package::enabled();
+    let prod_box_snapshot_only = ownership_diagnostic_package::snapshot_only_enabled();
     let only: Option<Vec<String>> = std::env::var("CRAT_BOC1_PROGRAMS")
         .ok()
         .map(|v| v.split(',').map(|s| s.trim().to_string()).collect());
@@ -6687,14 +6706,22 @@ fn boc1_corpus() {
             !selector_leak_diag && !ownership_yield_enabled && !l2_gate,
             "ownership diagnostic package is mutually exclusive with other corpus modes"
         );
-        let family_matrix = std::env::var("CRAT_BOC1_SELECTOR_FAMILY_MATRIX")
-            .expect("ownership diagnostic package requires the accepted family matrix");
-        assert!(
-            std::path::Path::new(&family_matrix).is_file(),
-            "accepted family matrix does not exist: {family_matrix}"
-        );
+        if !prod_box_snapshot_only {
+            let family_matrix = std::env::var("CRAT_BOC1_SELECTOR_FAMILY_MATRIX")
+                .expect("ownership diagnostic package requires the accepted family matrix");
+            assert!(
+                std::path::Path::new(&family_matrix).is_file(),
+                "accepted family matrix does not exist: {family_matrix}"
+            );
+        }
         assert_eq!(CORPUS.len(), 20);
     }
+    assert!(
+        !prod_box_snapshot_only || diagnostic_package,
+        "{} requires {}=1",
+        ownership_diagnostic_package::SNAPSHOT_ONLY_ENV,
+        ownership_diagnostic_package::ENV,
+    );
     if ownership_yield_enabled {
         assert!(
             prod_enabled,
@@ -6838,6 +6865,176 @@ fn boc1_corpus() {
     }
 
     fs::create_dir_all(out_dir().join("logs")).expect("create out dir");
+    if prod_box_snapshot_only {
+        let retry_timeout = Duration::from_secs(3600);
+        let mut rows = Vec::<Row>::new();
+        let mut retry_queue = Vec::<CorpusProgram>::new();
+
+        let record_counts = |program: &CorpusProgram,
+                             outcome: &orchestrate::ChildOutcome,
+                             row: &mut Row| {
+            let counts = ownership_diagnostic_package::parse_pointer_diagnostics(&outcome.stderr)
+                .unwrap_or_else(|error| panic!("{}: {error}", program.name));
+            ownership_diagnostic_package::write_json(
+                &production_box_path(program.name),
+                &ownership_diagnostic_package::BoxDecisionEvidence {
+                    program: program.name.to_string(),
+                    counts,
+                },
+            )
+            .unwrap_or_else(|error| panic!("{error}"));
+            row.set("locals", counts.locals);
+            row.set("params", counts.params);
+            row.set("returns", counts.returns);
+            row.set("fields", counts.fields);
+            row.set(
+                "total",
+                counts.locals + counts.params + counts.returns + counts.fields,
+            );
+            row.set("d0_locals_only", counts.d0_locals);
+        };
+
+        for &program in CORPUS {
+            let input = program.input_path(&root);
+            assert!(input.is_file(), "missing crate root {input:?}");
+            eprintln!(
+                "[boc1] {}: pre-transform decision snapshot...",
+                program.name
+            );
+            let outcome = run_child(program.name, &input, "prod-box", prod_timeout);
+            let mut row = Row::default();
+            row.set("program", program.name);
+            row.set("first_wall_s", format!("{:.1}", outcome.wall_s));
+            row.set("total_wall_s", format!("{:.1}", outcome.wall_s));
+            match diagnostic_worker_disposition(&outcome.status) {
+                DiagnosticWorkerDisposition::Complete => {
+                    row.set("status", "ok");
+                    record_counts(&program, &outcome, &mut row);
+                }
+                DiagnosticWorkerDisposition::ResourceDeferred => {
+                    row.set("status", "resource-deferred-pending-retry");
+                    row.set(
+                        "note",
+                        format!("{} at {}s", outcome.status, prod_timeout.as_secs()),
+                    );
+                    retry_queue.push(program);
+                }
+                DiagnosticWorkerDisposition::CorrectnessFailure => {
+                    row.set("status", format!("failed-{}", outcome.status));
+                    row.set("note", &outcome.note);
+                }
+            }
+            rows.push(row);
+        }
+
+        for program in retry_queue {
+            let input = program.input_path(&root);
+            eprintln!(
+                "[boc1] {}: pre-transform decision snapshot retry ({}s cap)...",
+                program.name,
+                retry_timeout.as_secs()
+            );
+            let outcome = run_child_labeled(
+                program.name,
+                &input,
+                "prod-box",
+                "prod-box-retry",
+                retry_timeout,
+            );
+            let row = rows
+                .iter_mut()
+                .find(|row| row.get("program") == Some(program.name))
+                .expect("pre-transform retry row");
+            let first_wall_s = row
+                .get("first_wall_s")
+                .expect("pre-transform first wall")
+                .parse::<f64>()
+                .expect("numeric pre-transform first wall");
+            row.set("retry_wall_s", format!("{:.1}", outcome.wall_s));
+            row.set(
+                "total_wall_s",
+                format!("{:.1}", first_wall_s + outcome.wall_s),
+            );
+            match diagnostic_worker_disposition(&outcome.status) {
+                DiagnosticWorkerDisposition::Complete => {
+                    row.set("status", "ok-after-retry");
+                    row.set("note", "completed_on_3600s_retry");
+                    record_counts(&program, &outcome, row);
+                }
+                DiagnosticWorkerDisposition::ResourceDeferred => {
+                    row.set("status", "resource-deferred-final");
+                    row.set(
+                        "note",
+                        format!(
+                            "resource wall at {}s and {} at {}s",
+                            prod_timeout.as_secs(),
+                            outcome.status,
+                            retry_timeout.as_secs()
+                        ),
+                    );
+                }
+                DiagnosticWorkerDisposition::CorrectnessFailure => {
+                    row.set("status", format!("failed-{}", outcome.status));
+                    row.set("note", &outcome.note);
+                }
+            }
+        }
+
+        let failures = rows
+            .iter()
+            .filter(|row| {
+                row.get("status")
+                    .map_or(true, |status| !status.starts_with("ok"))
+                    && row.get("status") != Some("resource-deferred-final")
+            })
+            .map(|row| row.get("program").unwrap_or("unknown"))
+            .collect::<Vec<_>>();
+        let deferred = rows
+            .iter()
+            .filter(|row| row.get("status") == Some("resource-deferred-final"))
+            .count();
+        let covered = rows.len() - failures.len() - deferred;
+        let snapshot_sha = orchestrate::git_sha();
+        let snapshot_dirty = orchestrate::git_dirty();
+        let total = rows
+            .iter()
+            .filter(|row| row.get("status").is_some_and(|status| status.starts_with("ok")))
+            .map(|row| {
+                row.get("total")
+                    .expect("successful snapshot total")
+                    .parse::<usize>()
+                    .expect("numeric successful snapshot total")
+            })
+            .sum::<usize>();
+        fs::write(
+            out_dir().join("production-box-pre-transform-decisions.csv"),
+            report::render_csv(&rows),
+        )
+        .expect("write pre-transform decision snapshot CSV");
+        fs::write(
+            out_dir().join("production-box-pre-transform-report.md"),
+            format!(
+                "# Production decision-layer yield\n\n\
+                 - Label: decision-layer yield, PRE-transform-demotion UPPER BOUND.\n\
+                 - Contract: frozen rs-crown; Mode-A; L2 off; both z3 seeds 0; serialized; \
+                   1800 s / 8192 MiB first pass; one 3600 s retry.\n\
+                 - Provenance: code={snapshot_sha}; dirty={snapshot_dirty}.\n\
+                 - Coverage: {covered}/20; resource-deferred: {deferred}; failures: {:?}.\n\
+                 - Box-family total on covered programs: {total}.\n",
+                failures,
+            ),
+        )
+        .expect("write pre-transform decision snapshot report");
+        assert!(
+            failures.len() <= 5,
+            "pre-transform production decision snapshot failed on {} programs; \
+             measurement design review required: {:?}",
+            failures.len(),
+            failures
+        );
+        println!("{}", render_report(&rows));
+        return;
+    }
 
     // Provenance guard (NB2, 2026-07-10): stamp this run's SHA into results.jsonl (line 1)
     // and move any SHA-mismatched / unstamped prior file aside so a killed sweep cannot
