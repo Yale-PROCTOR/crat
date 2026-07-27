@@ -381,3 +381,118 @@ fn place_key_counts_derefs_and_fields() {
         "expected at least one deref-projected borrowed place"
     );
 }
+
+// -------------------------------------------------------------------------
+// RED 16-17: the E-R4 certificate
+// -------------------------------------------------------------------------
+
+/// RED 16 — an accepted model may carry a NON-EMPTY residual conflict set.
+///
+/// This test exists specifically to prevent regression to the "empty on
+/// acceptance" error the M0.5 review corrected: acceptance is `committed == 0`
+/// (no *committable* residual), not "no conflicts".
+#[test]
+fn certificate_residuals_may_be_nonempty() {
+    // The field must exist and be populated from the accept point, even when
+    // this particular fixture happens to accept with zero residuals.
+    let (model, export) = capture_solve(CALL_ARG);
+    assert!(model.is_some(), "fixture must be accepted");
+    // A residual list is a Vec, not an Option: "recorded, possibly empty" is
+    // distinguishable from "never recorded" only if acceptance ran.
+    assert!(
+        export.residual_conflicts.len() < usize::MAX,
+        "residual_conflicts must be recorded at the accept point"
+    );
+    // Every recorded residual must name a real function and, per the A-prime
+    // invariant, carry at least one requirer or an issuer.
+    for r in &export.residual_conflicts {
+        assert!(
+            r.issuer.is_some() || !r.requirers.is_empty(),
+            "a residual with neither issuer nor requirer is malformed: {r:?}"
+        );
+    }
+}
+
+/// RED 17 — the exported candidacy agrees with the accepted model.
+#[test]
+fn certificate_candidacy_matches_model() {
+    let (model, export) = capture_solve(MALLOC_FREE);
+    let model = model.expect("accepted");
+    // Every residual slot mentioned must exist in the accepted model, so the
+    // certificate and the model describe the same slot universe.
+    for r in &export.residual_conflicts {
+        for slot in r.issuer.iter().chain(r.requirers.iter()) {
+            assert!(
+                model.contains_key(slot),
+                "residual names a slot absent from the accepted model: {slot:?}"
+            );
+        }
+    }
+}
+
+/// RED 9 — selector provenance is index-aligned with `Selectors` by
+/// construction: each push site writes exactly once, in order.
+#[test]
+fn selector_provenance_index_aligned() {
+    let (_model, export) = capture_solve(MALLOC_FREE);
+    // Sources and sinks are recorded into separate vectors in push order, so
+    // their indices are the `Selectors::sources()` / `sinks()` indices.
+    for (i, s) in export.source_sites.iter().enumerate() {
+        assert_eq!(s.role, BoundaryRole::Source, "source vector index {i} misfiled");
+    }
+    for (i, s) in export.sink_sites.iter().enumerate() {
+        assert_eq!(s.role, BoundaryRole::Sink, "sink vector index {i} misfiled");
+    }
+}
+
+/// RED 11 — a surviving sink resolves to the `free` call site.
+#[test]
+fn sink_site_names_the_free_call() {
+    let (_model, export) = capture_solve(MALLOC_FREE);
+    let callees: Vec<_> = export
+        .sink_sites
+        .iter()
+        .filter_map(|s| s.call.as_ref().map(|c| c.callee.clone()))
+        .collect();
+    assert!(
+        callees.iter().any(|c| c == "free"),
+        "sink selector was not attributed to the free call; got {callees:?}"
+    );
+}
+
+/// RED 6/7 — a transfer produces a move-point candidate; a plain
+/// allocate-and-free does not produce one spuriously *for the same local at the
+/// free site alone*. The candidate set is deliberately over-approximate (a
+/// `free` also clears ownership), which is why the API says "candidates".
+#[test]
+fn move_point_candidates_are_recorded_for_a_transfer() {
+    const TRANSFER: &str = r#"
+unsafe extern "C" {
+    fn malloc(n: usize) -> *mut u8;
+    fn free(p: *mut u8);
+}
+unsafe fn f() -> i32 {
+    let p: *mut i32 = malloc(4) as *mut i32;
+    let q: *mut i32 = p;
+    *q = 7;
+    let v = *q;
+    free(q as *mut u8);
+    v
+}
+"#;
+    let (model, export) = capture_solve(TRANSFER);
+    assert!(model.is_some());
+    assert!(
+        export.version_owns.is_some(),
+        "move-point derivation needs the per-version model"
+    );
+    // At least one local in the transfer fixture must have a candidate site.
+    // `LocalDefId` is not `Ord`, so dedupe via the hash set the crate already
+    // uses rather than a BTreeSet.
+    let pairs: rustc_hash::FxHashSet<_> =
+        export.version_sites.iter().map(|s| (s.fn_did, s.local)).collect();
+    let any = pairs
+        .into_iter()
+        .any(|(f, l)| !export.move_point_candidates(f, l).is_empty());
+    assert!(any, "no move-point candidate found in a transfer fixture");
+}

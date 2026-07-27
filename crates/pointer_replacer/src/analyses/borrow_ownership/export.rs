@@ -165,6 +165,14 @@ pub(crate) struct LoanIdentity {
     pub invalid: bool,
 }
 
+/// One residual conflict the accepted model tolerated, flattened to owner keys.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ResidualConflict {
+    pub fn_did: LocalDefId,
+    pub issuer: Option<SlotRef>,
+    pub requirers: Vec<SlotRef>,
+}
+
 // ---------------------------------------------------------------------------
 // §3 E-R2 — per-version ownership and move points
 // ---------------------------------------------------------------------------
@@ -226,6 +234,13 @@ pub(crate) struct BoExport {
     pub sink_sites: Vec<SelectorSite>,
     /// E-R4 loan identity for the complete final `BorrowSet`.
     pub loans: Vec<LoanIdentity>,
+    /// E-R4 certificate: the residual conflicts the accepted model TOLERATES.
+    ///
+    /// **Non-empty in general.** Acceptance is `committed == 0` — a round in
+    /// which no residual was *committable* — not an empty conflict set. A
+    /// consumer that assumes emptiness here is reading the spec's corrected
+    /// §1.2 limit 1 backwards.
+    pub residual_conflicts: Vec<ResidualConflict>,
 }
 
 impl BoExport {
@@ -441,6 +456,14 @@ pub(crate) fn record_version_owns_from(
 /// Record one loan's identity (E-R4).
 pub(crate) fn record_loan(identity: LoanIdentity) {
     record(|export| export.loans.push(identity));
+}
+
+/// Record the residual conflicts present at acceptance (E-R4 certificate).
+///
+/// Called at the `committed == 0` accept point, where the residual set is the
+/// one the accepted model tolerates.
+pub(crate) fn record_residuals(residuals: Vec<ResidualConflict>) {
+    record(|export| export.residual_conflicts = residuals);
 }
 
 /// E-R1 is the accepted model itself, which existing entry points already

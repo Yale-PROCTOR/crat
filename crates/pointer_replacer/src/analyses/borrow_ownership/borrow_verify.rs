@@ -796,6 +796,21 @@ pub(crate) fn verify_to_fixpoint_counting_with_flows(
         }
         stats.commits_per_round.push(committed);
         if committed == 0 {
+            // E-R4 certificate: record the residuals the accepted model
+            // TOLERATES. Acceptance is `committed == 0`, not an empty conflict
+            // set, so this is non-empty in general. Recording-only.
+            super::export::record_residuals(
+                conflicts
+                    .iter()
+                    .flat_map(|(did, cs)| {
+                        cs.iter().map(move |c| super::export::ResidualConflict {
+                            fn_did: *did,
+                            issuer: c.issuer,
+                            requirers: c.requirers.clone(),
+                        })
+                    })
+                    .collect(),
+            );
             // No committable residual: a genuine fixpoint. Every non-`Ref` slot was a replay
             // candidate above, so an empty residual means the surviving `Ref` slots genuinely do not
             // alias (no `Owning` slot's reference role is hidden). §NB5-F: a `Ref` field residual is
