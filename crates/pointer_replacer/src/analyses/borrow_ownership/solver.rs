@@ -717,6 +717,7 @@ impl KindSolver {
             return None;
         }
         let model = self.solver.get_model()?;
+        self.read_version_owns(&model);
         Some(self.read_kinds(&model))
     }
 
@@ -877,7 +878,11 @@ impl KindSolver {
 
         // Final SAT model under the maximal-retention assumption set.
         match self.check_with_assumptions(&assumptions) {
-            SatResult::Sat => Some((self.read_kinds(&self.solver.get_model()?), leaked)),
+            SatResult::Sat => {
+                let model = self.solver.get_model()?;
+                self.read_version_owns(&model);
+                Some((self.read_kinds(&model), leaked))
+            }
             _ => None,
         }
     }
@@ -941,13 +946,25 @@ impl KindSolver {
                 .solver
                 .get_model()
                 .map(|model| L2SolveResult::Sat {
-                    kinds: self.read_kinds(&model),
+                    kinds: {
+                        self.read_version_owns(&model);
+                        self.read_kinds(&model)
+                    },
                     dropped: leaked,
                 })
                 .unwrap_or(L2SolveResult::Unknown),
             SatResult::Unsat => L2SolveResult::Unsat,
             SatResult::Unknown => L2SolveResult::Unknown,
         }
+    }
+
+    /// E-R2 sibling of [`Self::read_kinds`]: evaluate each ownership `Var`'s
+    /// Bool against the SAME live model, using the same [`is_true`] helper so
+    /// the two readouts cannot disagree.
+    fn read_version_owns(&self, model: &Model) {
+        super::export::record_version_owns_from(|asts| {
+            asts.iter().map(|b| is_true(model, b)).collect()
+        });
     }
 
     fn read_kinds(&self, model: &Model) -> FxHashMap<SlotRef, SlotKind> {
@@ -1133,6 +1150,15 @@ pub(crate) struct BoOwnDatabase<'opt> {
     sink_selectors: Vec<Bool>,
 }
 
+impl BoOwnDatabase<'_> {
+    /// E-R2: hand the export a snapshot of the `Var -> Bool` map so the model
+    /// readout can evaluate per-version ownership after emission has ended.
+    /// Recording-only; no-op unless a capture scope is active.
+    pub(crate) fn snapshot_version_asts(&self) {
+        super::export::record_version_asts(&self.z3_ast);
+    }
+}
+
 impl<'opt> BoOwnDatabase<'opt> {
     pub(crate) fn new(optimize: &'opt Optimize, tracker: Option<&'opt CoreTracker>) -> Self {
         let mut z3_ast = IndexVec::with_capacity(100);
@@ -1290,6 +1316,9 @@ impl Database for BoOwnDatabase<'_> {
         let clause = Bool::or(&[&not_sel, &self.z3_ast[var]]);
         self.optimize.assert(&clause);
         self.source_selectors.push(selector);
+        // E-R3 capture: index-aligned with `source_selectors` by construction —
+        // this is the only writer and it pushes exactly once. Recording-only.
+        super::export::record_selector(super::export::BoundaryRole::Source, var);
     }
 
     fn push_sink_owning(&mut self, var: Var) {
@@ -1304,5 +1333,8 @@ impl Database for BoOwnDatabase<'_> {
         let clause = Bool::or(&[&not_sel, &self.z3_ast[var]]);
         self.optimize.assert(&clause);
         self.sink_selectors.push(selector);
+        // E-R3 capture: sink twin of the source push above; same alignment
+        // guarantee, same recording-only contract.
+        super::export::record_selector(super::export::BoundaryRole::Sink, var);
     }
 }

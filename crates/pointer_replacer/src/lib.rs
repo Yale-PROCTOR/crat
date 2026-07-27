@@ -25,6 +25,7 @@ extern crate smallvec;
 extern crate thin_vec;
 
 mod analyses;
+mod bo_rewriter;
 mod rewriter;
 mod utils;
 
