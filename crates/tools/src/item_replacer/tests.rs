@@ -183,7 +183,7 @@ fn versioned_request_json_round_trip_preserves_rust() {
 }
 
 #[test]
-fn amendment_2_replacement_discards_preserved_groups_without_validator() {
+fn replacement_discards_preserved_groups_without_validator() {
     let source = "pub unsafe fn f(value: i32) -> i32 { value + 1 }";
     let request = ReplacementRequest {
         schema_version: 1,
@@ -203,7 +203,7 @@ fn amendment_2_replacement_discards_preserved_groups_without_validator() {
 }
 
 #[test]
-fn amendment_2_preserved_restricted_conditional_has_only_its_outer_label() {
+fn preserved_restricted_conditional_has_only_its_outer_label() {
     let source =
         "pub unsafe fn f(value: i32) -> i32 { return value + (if value > 0 { -1 } else { 1 }); }";
     let request = ReplacementRequest {
@@ -228,7 +228,7 @@ fn amendment_2_preserved_restricted_conditional_has_only_its_outer_label() {
 }
 
 #[test]
-fn amendment_2_restricted_conditional_does_not_hide_other_label_subtrees() {
+fn restricted_conditional_does_not_hide_other_label_subtrees() {
     let source = r#"
 pub unsafe fn f(mut pointer: *mut i32, value: i32, flag: bool) -> i32 {
     let conditional = value + (if flag { -1 } else { 1 });
@@ -286,7 +286,7 @@ unsafe fn f(mut pointer: *mut i32, value: i32, flag: bool) -> i32 {
 }
 
 #[test]
-fn amendment_2_replacement_accepts_bare_assignment_labels() {
+fn replacement_accepts_bare_assignment_labels() {
     let source = r#"
 pub struct State {
     pub first: i32,
@@ -318,7 +318,7 @@ pub unsafe fn f(mut state: State, value: i32) -> State {
 }
 
 #[test]
-fn amendment_2_replacement_restores_every_preserved_validator_group() {
+fn replacement_restores_every_preserved_validator_group() {
     let source = r#"
 pub unsafe fn validate_me(flag: bool, mut pointer: *mut i32) -> i32 {
     let scalar = 1 + 2;
@@ -392,7 +392,7 @@ unsafe fn validate_me(flag: bool, pointer: *mut i32) -> i32 {
 }
 
 #[test]
-fn amendment_2_replacement_rejects_extra_outer_groups_without_validator() {
+fn replacement_rejects_extra_outer_groups_without_validator() {
     let source = "pub unsafe fn f(value: i32) -> i32 { value + 1 }";
     for transformation in [
         "unsafe fn f(value: i32) -> i32 { attacker(); #[proctor(0)] 999 }",
@@ -415,7 +415,7 @@ fn amendment_2_replacement_rejects_extra_outer_groups_without_validator() {
 }
 
 #[test]
-fn amendment_2_replacement_uses_immutable_skeleton_header() {
+fn replacement_uses_immutable_skeleton_header() {
     let source = "pub unsafe fn f(value: i32) -> i32 { value + 1 }";
     let request = ReplacementRequest {
         schema_version: 1,
@@ -437,7 +437,7 @@ fn amendment_2_replacement_uses_immutable_skeleton_header() {
 }
 
 #[test]
-fn amendment_2_fully_preserved_body_can_change_signature_and_create_wrapper() {
+fn fully_preserved_body_can_change_signature_and_create_wrapper() {
     let source = "pub unsafe fn f(pointer: *mut i32) -> bool { pointer.is_null() }";
     let request = ReplacementRequest {
         schema_version: 1,
@@ -459,7 +459,7 @@ fn amendment_2_fully_preserved_body_can_change_signature_and_create_wrapper() {
 }
 
 #[test]
-fn amendment_2_metadata_failure_is_atomic() {
+fn metadata_failure_is_atomic() {
     let source = "pub unsafe fn f(value: i32) -> i32 { value + 1 }";
     let request = ReplacementRequest {
         schema_version: 1,
@@ -480,7 +480,7 @@ fn amendment_2_metadata_failure_is_atomic() {
 }
 
 #[test]
-fn amendment_2_metadata_and_canonicalization_failures_are_atomic() {
+fn metadata_and_canonicalization_failures_are_atomic() {
     let source = r#"
 pub unsafe fn f(flag: bool, pointer: *mut i32) {
     if flag {
@@ -1606,7 +1606,7 @@ pub unsafe fn top(value: *const i32) -> i32 { caller(value) }
 }
 
 #[test]
-fn amendment_2_transformed_calls_cannot_restore_obsolete_wrapper_calls() {
+fn transformed_calls_cannot_restore_obsolete_wrapper_calls() {
     let source = r#"
 pub unsafe fn callee(_pointer: *mut i32, value: i32) -> i32 {
     value + 1

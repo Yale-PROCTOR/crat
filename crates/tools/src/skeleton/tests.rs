@@ -3,57 +3,58 @@ use utils::compilation::run_compiler_on_str;
 
 use super::*;
 
-#[path = "amendment4_sources.rs"]
-mod amendment4_sources;
-use amendment4_sources::*;
+#[path = "type_spelling_sources.rs"]
+mod type_spelling_sources;
 
-fn exact_a4_source(name: &str) -> &'static str {
+fn type_spelling_source(name: &str) -> &'static str {
     let delimited = match name {
-        "A4-SRC-MOTIVATING" => A4_SRC_MOTIVATING,
-        "A4-SRC-IMPORTS" => A4_SRC_IMPORTS,
-        "A4-SRC-CANDIDATES" => A4_SRC_CANDIDATES,
-        "A4-SRC-CANDIDATE-PRECEDENCE" => A4_SRC_CANDIDATE_PRECEDENCE,
-        "A4-SRC-REEXPORTS" => A4_SRC_REEXPORTS,
-        "A4-SRC-LOCAL-FALLBACK-ROUTES" => A4_SRC_LOCAL_FALLBACK_ROUTES,
-        "A4-SRC-EXTERNAL-ROOT-ALIAS" => A4_SRC_EXTERNAL_ROOT_ALIAS,
-        "A4-SRC-SOURCE-PATHS" => A4_SRC_SOURCE_PATHS,
-        "A4-SRC-SOURCE-HINT-EDGES" => A4_SRC_SOURCE_HINT_EDGES,
-        "A4-SRC-DIRECT-HINTS" => A4_SRC_DIRECT_HINTS,
-        "A4-SRC-RECURSIVE-TYPES" => A4_SRC_RECURSIVE_TYPES,
-        "A4-SRC-POINTERS" => A4_SRC_POINTERS,
-        "A4-SRC-COMPOUND" => A4_SRC_COMPOUND,
-        "A4-SRC-RAW-IDENTIFIERS" => A4_SRC_RAW_IDENTIFIERS,
-        "A4-SRC-QUALIFIED-RAW-FALLBACK" => A4_SRC_QUALIFIED_RAW_FALLBACK,
-        "A4-SRC-STANDARD-CONSTRUCTORS" => A4_SRC_STANDARD_CONSTRUCTORS,
-        "A4-SRC-STANDARD-BARE-IMPORTS" => A4_SRC_STANDARD_BARE_IMPORTS,
-        "A4-SRC-NO-STD-OPTION-SUCCESS" => A4_SRC_NO_STD_OPTION_SUCCESS,
-        "A4-SRC-NAMED-OPTIONAL-BOX" => A4_SRC_NAMED_OPTIONAL_BOX,
-        "A4-SRC-OPTION-COLLISION" => A4_SRC_OPTION_COLLISION,
-        "A4-SRC-BOX-COLLISION" => A4_SRC_BOX_COLLISION,
-        "A4-SRC-RENAMED-CONSTRUCTOR-COLLISION" => A4_SRC_RENAMED_CONSTRUCTOR_COLLISION,
-        "A4-SRC-GLOB-CONSTRUCTOR-COLLISION" => A4_SRC_GLOB_CONSTRUCTOR_COLLISION,
-        "A4-SRC-OPTBOX-PARTIAL-CONSTRUCTOR-COLLISION" => {
-            A4_SRC_OPTBOX_PARTIAL_CONSTRUCTOR_COLLISION
+        "motivating" => type_spelling_sources::MOTIVATING,
+        "imports" => type_spelling_sources::IMPORTS,
+        "candidates" => type_spelling_sources::CANDIDATES,
+        "candidate-precedence" => type_spelling_sources::CANDIDATE_PRECEDENCE,
+        "reexports" => type_spelling_sources::REEXPORTS,
+        "local-fallback-routes" => type_spelling_sources::LOCAL_FALLBACK_ROUTES,
+        "external-root-alias" => type_spelling_sources::EXTERNAL_ROOT_ALIAS,
+        "source-paths" => type_spelling_sources::SOURCE_PATHS,
+        "source-hint-edges" => type_spelling_sources::SOURCE_HINT_EDGES,
+        "direct-hints" => type_spelling_sources::DIRECT_HINTS,
+        "recursive-types" => type_spelling_sources::RECURSIVE_TYPES,
+        "pointers" => type_spelling_sources::POINTERS,
+        "compound" => type_spelling_sources::COMPOUND,
+        "raw-identifiers" => type_spelling_sources::RAW_IDENTIFIERS,
+        "qualified-raw-fallback" => type_spelling_sources::QUALIFIED_RAW_FALLBACK,
+        "standard-constructors" => type_spelling_sources::STANDARD_CONSTRUCTORS,
+        "standard-bare-imports" => type_spelling_sources::STANDARD_BARE_IMPORTS,
+        "no-std-option-success" => type_spelling_sources::NO_STD_OPTION_SUCCESS,
+        "named-optional-box" => type_spelling_sources::NAMED_OPTIONAL_BOX,
+        "option-collision" => type_spelling_sources::OPTION_COLLISION,
+        "box-collision" => type_spelling_sources::BOX_COLLISION,
+        "renamed-constructor-collision" => type_spelling_sources::RENAMED_CONSTRUCTOR_COLLISION,
+        "glob-constructor-collision" => type_spelling_sources::GLOB_CONSTRUCTOR_COLLISION,
+        "optional-box-partial-constructor-collision" => {
+            type_spelling_sources::OPTIONAL_BOX_PARTIAL_CONSTRUCTOR_COLLISION
         }
-        "A4-SRC-LOCAL-BOX-COLLISION" => A4_SRC_LOCAL_BOX_COLLISION,
-        "A4-SRC-EXTERN-PRELUDE-CONSTRUCTOR-COLLISION" => {
-            A4_SRC_EXTERN_PRELUDE_CONSTRUCTOR_COLLISION
+        "local-box-collision" => type_spelling_sources::LOCAL_BOX_COLLISION,
+        "extern-prelude-constructor-collision" => {
+            type_spelling_sources::EXTERN_PRELUDE_CONSTRUCTOR_COLLISION
         }
-        "A4-SRC-IRRELEVANT-COLLISIONS" => A4_SRC_IRRELEVANT_COLLISIONS,
-        "A4-SRC-NO-IMPLICIT-PRELUDE-REJECTION" => A4_SRC_NO_IMPLICIT_PRELUDE_REJECTION,
-        "A4-SRC-NO-STD-BOX-REJECTION" => A4_SRC_NO_STD_BOX_REJECTION,
-        "A4-SRC-BOX-NO-IMPLICIT-PRELUDE-REJECTION" => A4_SRC_BOX_NO_IMPLICIT_PRELUDE_REJECTION,
-        "A4-SRC-MODULE-NO-IMPLICIT-PRELUDE-REJECTION" => {
-            A4_SRC_MODULE_NO_IMPLICIT_PRELUDE_REJECTION
+        "irrelevant-collisions" => type_spelling_sources::IRRELEVANT_COLLISIONS,
+        "no-implicit-prelude-rejection" => type_spelling_sources::NO_IMPLICIT_PRELUDE_REJECTION,
+        "no-std-box-rejection" => type_spelling_sources::NO_STD_BOX_REJECTION,
+        "box-no-implicit-prelude-rejection" => {
+            type_spelling_sources::BOX_NO_IMPLICIT_PRELUDE_REJECTION
         }
-        "A4-SRC-ANCESTOR-NO-IMPLICIT-PRELUDE-REJECTION" => {
-            A4_SRC_ANCESTOR_NO_IMPLICIT_PRELUDE_REJECTION
+        "module-no-implicit-prelude-rejection" => {
+            type_spelling_sources::MODULE_NO_IMPLICIT_PRELUDE_REJECTION
         }
-        "A4-SRC-PRESERVED-PARENT" => A4_SRC_PRESERVED_PARENT,
-        "A4-SRC-UNNAMEABLE" => A4_SRC_UNNAMEABLE,
-        "A4-SRC-TREE" => A4_SRC_TREE,
-        "A4-SRC-COMPREHENSIVE" => A4_SRC_COMPREHENSIVE,
-        _ => panic!("missing Amendment 4 source constant {name}"),
+        "ancestor-no-implicit-prelude-rejection" => {
+            type_spelling_sources::ANCESTOR_NO_IMPLICIT_PRELUDE_REJECTION
+        }
+        "preserved-parent" => type_spelling_sources::PRESERVED_PARENT,
+        "unnameable" => type_spelling_sources::UNNAMEABLE,
+        "tree" => type_spelling_sources::TREE,
+        "comprehensive" => type_spelling_sources::COMPREHENSIVE,
+        _ => panic!("missing type-spelling source fixture {name}"),
     };
     delimited
         .strip_prefix('\n')
@@ -66,47 +67,47 @@ fn generate(source: &str) -> Vec<ItemRecord> {
 }
 
 #[test]
-fn every_exact_amendment_4_source_baseline_compiles_independently() {
+fn every_type_spelling_source_fixture_compiles_independently() {
     let names = [
-        "A4-SRC-MOTIVATING",
-        "A4-SRC-IMPORTS",
-        "A4-SRC-CANDIDATES",
-        "A4-SRC-CANDIDATE-PRECEDENCE",
-        "A4-SRC-REEXPORTS",
-        "A4-SRC-LOCAL-FALLBACK-ROUTES",
-        "A4-SRC-EXTERNAL-ROOT-ALIAS",
-        "A4-SRC-SOURCE-PATHS",
-        "A4-SRC-SOURCE-HINT-EDGES",
-        "A4-SRC-DIRECT-HINTS",
-        "A4-SRC-RECURSIVE-TYPES",
-        "A4-SRC-POINTERS",
-        "A4-SRC-COMPOUND",
-        "A4-SRC-RAW-IDENTIFIERS",
-        "A4-SRC-QUALIFIED-RAW-FALLBACK",
-        "A4-SRC-STANDARD-CONSTRUCTORS",
-        "A4-SRC-STANDARD-BARE-IMPORTS",
-        "A4-SRC-NO-STD-OPTION-SUCCESS",
-        "A4-SRC-NAMED-OPTIONAL-BOX",
-        "A4-SRC-OPTION-COLLISION",
-        "A4-SRC-BOX-COLLISION",
-        "A4-SRC-RENAMED-CONSTRUCTOR-COLLISION",
-        "A4-SRC-GLOB-CONSTRUCTOR-COLLISION",
-        "A4-SRC-OPTBOX-PARTIAL-CONSTRUCTOR-COLLISION",
-        "A4-SRC-LOCAL-BOX-COLLISION",
-        "A4-SRC-EXTERN-PRELUDE-CONSTRUCTOR-COLLISION",
-        "A4-SRC-IRRELEVANT-COLLISIONS",
-        "A4-SRC-NO-IMPLICIT-PRELUDE-REJECTION",
-        "A4-SRC-NO-STD-BOX-REJECTION",
-        "A4-SRC-BOX-NO-IMPLICIT-PRELUDE-REJECTION",
-        "A4-SRC-MODULE-NO-IMPLICIT-PRELUDE-REJECTION",
-        "A4-SRC-ANCESTOR-NO-IMPLICIT-PRELUDE-REJECTION",
-        "A4-SRC-PRESERVED-PARENT",
-        "A4-SRC-UNNAMEABLE",
-        "A4-SRC-TREE",
-        "A4-SRC-COMPREHENSIVE",
+        "motivating",
+        "imports",
+        "candidates",
+        "candidate-precedence",
+        "reexports",
+        "local-fallback-routes",
+        "external-root-alias",
+        "source-paths",
+        "source-hint-edges",
+        "direct-hints",
+        "recursive-types",
+        "pointers",
+        "compound",
+        "raw-identifiers",
+        "qualified-raw-fallback",
+        "standard-constructors",
+        "standard-bare-imports",
+        "no-std-option-success",
+        "named-optional-box",
+        "option-collision",
+        "box-collision",
+        "renamed-constructor-collision",
+        "glob-constructor-collision",
+        "optional-box-partial-constructor-collision",
+        "local-box-collision",
+        "extern-prelude-constructor-collision",
+        "irrelevant-collisions",
+        "no-implicit-prelude-rejection",
+        "no-std-box-rejection",
+        "box-no-implicit-prelude-rejection",
+        "module-no-implicit-prelude-rejection",
+        "ancestor-no-implicit-prelude-rejection",
+        "preserved-parent",
+        "unnameable",
+        "tree",
+        "comprehensive",
     ];
     for name in names {
-        let source = exact_a4_source(name);
+        let source = type_spelling_source(name);
         assert!(
             !source.starts_with('\n'),
             "{name} has a leading fence newline"
@@ -118,10 +119,10 @@ fn every_exact_amendment_4_source_baseline_compiles_independently() {
         run_compiler_on_str(source, |_| ())
             .unwrap_or_else(|_| panic!("{name} did not baseline-compile"));
     }
-    assert!(A4_SRC_MOTIVATING.starts_with('\n'));
-    assert!(A4_SRC_MOTIVATING.ends_with('\n'));
-    assert!(exact_a4_source("A4-SRC-MOTIVATING").starts_with("unsafe extern \"C\""));
-    assert!(exact_a4_source("A4-SRC-MOTIVATING").ends_with('}'));
+    assert!(type_spelling_sources::MOTIVATING.starts_with('\n'));
+    assert!(type_spelling_sources::MOTIVATING.ends_with('\n'));
+    assert!(type_spelling_source("motivating").starts_with("unsafe extern \"C\""));
+    assert!(type_spelling_source("motivating").ends_with('}'));
 }
 
 fn local_def(name: &str, tcx: TyCtxt<'_>) -> LocalDefId {
@@ -328,15 +329,15 @@ fn assert_constructor_failure_pointer_prerequisites(name: &str, tcx: TyCtxt<'_>)
     let decisions = tools_pointer_decisions(tcx);
     let signature = |path: &str| &decisions.signatures.data[&local_def_path(path, tcx)];
     match name {
-        "A4-SRC-OPTION-COLLISION" => {
+        "option-collision" => {
             let signature = signature("wrapped::read");
             assert_eq!(
                 signature.input_decs,
                 [Some(PtrKind::OptRef(false)), Some(PtrKind::OptRef(false))]
             );
         }
-        "A4-SRC-BOX-COLLISION" | "A4-SRC-GLOB-CONSTRUCTOR-COLLISION" => {
-            let path = if name == "A4-SRC-BOX-COLLISION" {
+        "box-collision" | "glob-constructor-collision" => {
+            let path = if name == "box-collision" {
                 "wrapped::allocate"
             } else {
                 "globbed::allocate"
@@ -348,19 +349,19 @@ fn assert_constructor_failure_pointer_prerequisites(name: &str, tcx: TyCtxt<'_>)
                 PtrKind::Box
             );
         }
-        "A4-SRC-RENAMED-CONSTRUCTOR-COLLISION"
-        | "A4-SRC-EXTERN-PRELUDE-CONSTRUCTOR-COLLISION"
-        | "A4-SRC-NO-IMPLICIT-PRELUDE-REJECTION"
-        | "A4-SRC-MODULE-NO-IMPLICIT-PRELUDE-REJECTION"
-        | "A4-SRC-ANCESTOR-NO-IMPLICIT-PRELUDE-REJECTION" => {
+        "renamed-constructor-collision"
+        | "extern-prelude-constructor-collision"
+        | "no-implicit-prelude-rejection"
+        | "module-no-implicit-prelude-rejection"
+        | "ancestor-no-implicit-prelude-rejection" => {
             let path = match name {
-                "A4-SRC-RENAMED-CONSTRUCTOR-COLLISION" => "renamed::read",
-                "A4-SRC-ANCESTOR-NO-IMPLICIT-PRELUDE-REJECTION" => "outer::middle::inner::read",
+                "renamed-constructor-collision" => "renamed::read",
+                "ancestor-no-implicit-prelude-rejection" => "outer::middle::inner::read",
                 _ => "wrapped::read",
             };
             assert_eq!(signature(path).input_decs[0], Some(PtrKind::OptRef(false)));
         }
-        "A4-SRC-OPTBOX-PARTIAL-CONSTRUCTOR-COLLISION" => {
+        "optional-box-partial-constructor-collision" => {
             let owned_id = local_def_path("wrapped::owned_id", tcx);
             assert_eq!(
                 decisions.signatures.data[&owned_id].input_decs[0],
@@ -384,7 +385,7 @@ fn assert_constructor_failure_pointer_prerequisites(name: &str, tcx: TyCtxt<'_>)
                 PtrKind::OptBox
             );
         }
-        "A4-SRC-LOCAL-BOX-COLLISION" => {
+        "local-box-collision" => {
             let def_id = local_def_path("consumer::local_only", tcx);
             for binding in ["first", "second"] {
                 assert_eq!(
@@ -393,7 +394,7 @@ fn assert_constructor_failure_pointer_prerequisites(name: &str, tcx: TyCtxt<'_>)
                 );
             }
         }
-        "A4-SRC-NO-STD-BOX-REJECTION" | "A4-SRC-BOX-NO-IMPLICIT-PRELUDE-REJECTION" => {
+        "no-std-box-rejection" | "box-no-implicit-prelude-rejection" => {
             let def_id = local_def_path("allocate", tcx);
             assert_eq!(
                 decisions.signatures.data[&def_id].output_dec,
@@ -667,7 +668,7 @@ fn assert_function_record_json_key_order(record: &ItemRecord) {
 
 #[test]
 fn nested_same_module_inferred_local_uses_local_name() {
-    let records = generate(exact_a4_source("A4-SRC-MOTIVATING"));
+    let records = generate(type_spelling_source("motivating"));
     let record = function(&records, "src::lib::cb_remove_gamma_rgb");
     assert!(record.target_signature.contains("rgb: cb_rgb"));
     assert!(record.annotated_skeleton.contains("let mut init: cb_rgb"));
@@ -676,7 +677,7 @@ fn nested_same_module_inferred_local_uses_local_name() {
 
 #[test]
 fn direct_renamed_and_glob_imports_name_inferred_locals() {
-    let source = exact_a4_source("A4-SRC-IMPORTS");
+    let source = type_spelling_source("imports");
     run_compiler_on_str(source, |tcx| {
         for (function_path, spelling, definition_path) in [
             ("direct::make", "Direct", "model::Direct"),
@@ -703,7 +704,7 @@ fn direct_renamed_and_glob_imports_name_inferred_locals() {
 
 #[test]
 fn multiple_aliases_are_deterministic_and_source_hint_wins() {
-    let candidates_source = exact_a4_source("A4-SRC-CANDIDATES");
+    let candidates_source = type_spelling_source("candidates");
     run_compiler_on_str(candidates_source, |tcx| {
         let target = local_def_path("left::Thing", tcx).to_def_id();
         for (function_path, spelling) in [
@@ -732,7 +733,7 @@ fn multiple_aliases_are_deterministic_and_source_hint_wins() {
     let source_hint = &function(&first, "aliases::source_hint").target_signature;
     assert!(source_hint.contains("pointer: &Zed"), "{source_hint}");
 
-    let precedence_source = exact_a4_source("A4-SRC-CANDIDATE-PRECEDENCE");
+    let precedence_source = type_spelling_source("candidate-precedence");
     run_compiler_on_str(precedence_source, |tcx| {
         let own_target = local_def_path("own::Local", tcx).to_def_id();
         assert_eq!(
@@ -785,7 +786,7 @@ fn multiple_aliases_are_deterministic_and_source_hint_wins() {
 
 #[test]
 fn wrong_same_spelling_binding_requires_absolute_local_fallback() {
-    let source = exact_a4_source("A4-SRC-CANDIDATES");
+    let source = type_spelling_source("candidates");
     run_compiler_on_str(source, |tcx| {
         let inferred = local_def_path("collision::inferred", tcx);
         let module: LocalDefId = tcx.parent_module_from_def_id(inferred).into();
@@ -863,7 +864,7 @@ fn wrong_same_spelling_binding_requires_absolute_local_fallback() {
 
 #[test]
 fn local_visible_fallback_uses_public_reexport_not_private_definition_path() {
-    let source = exact_a4_source("A4-SRC-REEXPORTS");
+    let source = type_spelling_source("reexports");
     run_compiler_on_str(source, |tcx| {
         let consumer: LocalDefId = tcx
             .parent_module_from_def_id(local_def_path("consumer::local", tcx))
@@ -884,7 +885,7 @@ fn local_visible_fallback_uses_public_reexport_not_private_definition_path() {
     assert!(local.contains("let mut value: crate::api::Exposed"));
     assert!(!local.contains("hidden::Public"));
 
-    let source = exact_a4_source("A4-SRC-LOCAL-FALLBACK-ROUTES");
+    let source = type_spelling_source("local-fallback-routes");
     run_compiler_on_str(source, |tcx| {
         let consumer: LocalDefId = tcx
             .parent_module_from_def_id(local_def_path("consumer::restricted", tcx))
@@ -942,7 +943,7 @@ fn local_visible_fallback_uses_public_reexport_not_private_definition_path() {
 
 #[test]
 fn external_visible_fallback_is_absolute_and_uses_public_reexport() {
-    let reexports = exact_a4_source("A4-SRC-REEXPORTS");
+    let reexports = type_spelling_source("reexports");
     run_compiler_on_str(reexports, |tcx| {
         let function_def_id = local_def_path("consumer::external", tcx);
         let target = local_binding_ty(function_def_id, "value", tcx)
@@ -979,7 +980,7 @@ fn external_visible_fallback_is_absolute_and_uses_public_reexport() {
     )));
     assert!(!external.contains("hash::random"));
 
-    let alias_source = exact_a4_source("A4-SRC-EXTERNAL-ROOT-ALIAS");
+    let alias_source = type_spelling_source("external-root-alias");
     run_compiler_on_str(alias_source, |tcx| {
         let function_def_id = local_def_path("consumer::external_alias", tcx);
         let target = local_binding_ty(function_def_id, "value", tcx)
@@ -1085,7 +1086,7 @@ fn external_visible_fallback_is_absolute_and_uses_public_reexport() {
 
 #[test]
 fn source_alias_and_relative_pointee_paths_are_reused() {
-    let source = exact_a4_source("A4-SRC-SOURCE-PATHS");
+    let source = type_spelling_source("source-paths");
     run_compiler_on_str(source, |tcx| {
         let decisions = tools_pointer_decisions(tcx);
         let point_alias = local_def_path("model::PointAlias", tcx).to_def_id();
@@ -1155,7 +1156,7 @@ fn source_alias_and_relative_pointee_paths_are_reused() {
             .contains("&super::model::Point")
     );
 
-    let source = exact_a4_source("A4-SRC-SOURCE-HINT-EDGES");
+    let source = type_spelling_source("source-hint-edges");
     run_compiler_on_str(source, |tcx| {
         let decisions = tools_pointer_decisions(tcx);
         for (path, expected) in [
@@ -1211,7 +1212,7 @@ fn source_alias_and_relative_pointee_paths_are_reused() {
 
 #[test]
 fn same_module_parameter_return_local_and_lifetime_types_are_short() {
-    let source = exact_a4_source("A4-SRC-POINTERS");
+    let source = type_spelling_source("pointers");
     run_compiler_on_str(source, |tcx| {
         let decisions = tools_pointer_decisions(tcx);
         let update = local_def_path("update_and_return", tcx);
@@ -1279,7 +1280,7 @@ fn same_module_parameter_return_local_and_lifetime_types_are_short() {
 
 #[test]
 fn raw_identifiers_remain_parseable_in_inferred_and_pointer_types() {
-    let source = exact_a4_source("A4-SRC-RAW-IDENTIFIERS");
+    let source = type_spelling_source("raw-identifiers");
     run_compiler_on_str(source, |tcx| {
         let read = local_def_path("r#type::read", tcx);
         let inferred = local_def_path("r#type::inferred", tcx);
@@ -1304,7 +1305,7 @@ fn raw_identifiers_remain_parseable_in_inferred_and_pointer_types() {
             .annotated_skeleton
             .contains("let mut value: r#match")
     );
-    let qualified = exact_a4_source("A4-SRC-QUALIFIED-RAW-FALLBACK");
+    let qualified = type_spelling_source("qualified-raw-fallback");
     run_compiler_on_str(qualified, |tcx| {
         let function_def_id = local_def_path("consumer::inferred", tcx);
         let target = local_def_path("r#type::r#match", tcx).to_def_id();
@@ -1362,7 +1363,7 @@ fn standard_constructors_require_exact_bare_prelude_resolution() {
             ConstructorRequirements { option, boxed }
         );
     }
-    let source = exact_a4_source("A4-SRC-STANDARD-CONSTRUCTORS");
+    let source = type_spelling_source("standard-constructors");
     run_compiler_on_str(source, |tcx| {
         let decisions = tools_pointer_decisions(tcx);
         let read = local_def_path("wrapped::read", tcx);
@@ -1441,7 +1442,7 @@ fn standard_constructors_require_exact_bare_prelude_resolution() {
             .contains("let mut q: Option<Box<i32>>")
     );
 
-    let source = exact_a4_source("A4-SRC-STANDARD-BARE-IMPORTS");
+    let source = type_spelling_source("standard-bare-imports");
     run_compiler_on_str(source, |tcx| {
         let decisions = tools_pointer_decisions(tcx);
         let read = local_def_path("imported::read", tcx);
@@ -1485,7 +1486,7 @@ fn standard_constructors_require_exact_bare_prelude_resolution() {
             .contains("let mut p: Box<i32>")
     );
 
-    let source = exact_a4_source("A4-SRC-NO-STD-OPTION-SUCCESS");
+    let source = type_spelling_source("no-std-option-success");
     run_compiler_on_str(source, |tcx| {
         let decisions = tools_pointer_decisions(tcx);
         let read = local_def_path("read", tcx);
@@ -1505,7 +1506,7 @@ fn standard_constructors_require_exact_bare_prelude_resolution() {
         "pub unsafe fn read(mut p: Option<&i32>) -> i32"
     );
 
-    let source = exact_a4_source("A4-SRC-NAMED-OPTIONAL-BOX");
+    let source = type_spelling_source("named-optional-box");
     run_compiler_on_str(source, |tcx| {
         let decisions = tools_pointer_decisions(tcx);
         let owned_id = local_def_path("consumer::owned_id", tcx);
@@ -1553,7 +1554,7 @@ fn standard_constructors_require_exact_bare_prelude_resolution() {
     assert!(foo.contains("let mut p: Box<LocalP>"));
     assert!(foo.contains("let mut q: Option<Box<LocalQ>>"));
 
-    let source = exact_a4_source("A4-SRC-IRRELEVANT-COLLISIONS");
+    let source = type_spelling_source("irrelevant-collisions");
     run_compiler_on_str(source, |tcx| {
         let decisions = tools_pointer_decisions(tcx);
         let allocate = local_def_path("box_only::allocate", tcx);
@@ -1595,7 +1596,7 @@ fn standard_constructors_require_exact_bare_prelude_resolution() {
 
 #[test]
 fn wholly_preserved_parent_does_not_materialize_nested_local() {
-    let source = exact_a4_source("A4-SRC-PRESERVED-PARENT");
+    let source = type_spelling_source("preserved-parent");
     let records = generate(source);
     let record = function(&records, "preserved");
     assert!(
@@ -1609,9 +1610,9 @@ fn wholly_preserved_parent_does_not_materialize_nested_local() {
 
 #[test]
 fn type_spelling_failures_are_structured_and_atomic() {
-    let option_collision = exact_a4_source("A4-SRC-OPTION-COLLISION");
+    let option_collision = type_spelling_source("option-collision");
     run_compiler_on_str(option_collision, |tcx| {
-        assert_constructor_failure_pointer_prerequisites("A4-SRC-OPTION-COLLISION", tcx);
+        assert_constructor_failure_pointer_prerequisites("option-collision", tcx);
         let read = local_def_path("wrapped::read", tcx);
         assert_eq!(
             tcx.hir_body_owned_by(read)
@@ -1640,68 +1641,68 @@ fn type_spelling_failures_are_structured_and_atomic() {
 
     let constructor_failures = [
         (
-            "A4-SRC-BOX-COLLISION",
-            exact_a4_source("A4-SRC-BOX-COLLISION"),
+            "box-collision",
+            type_spelling_source("box-collision"),
             "wrapped::allocate",
             &["return", "Box", "wrapped::Box"][..],
         ),
         (
-            "A4-SRC-RENAMED-CONSTRUCTOR-COLLISION",
-            exact_a4_source("A4-SRC-RENAMED-CONSTRUCTOR-COLLISION"),
+            "renamed-constructor-collision",
+            type_spelling_source("renamed-constructor-collision"),
             "renamed::read",
             &["parameter `p`", "OptRef(false)", "fake::WrongOption"][..],
         ),
         (
-            "A4-SRC-GLOB-CONSTRUCTOR-COLLISION",
-            exact_a4_source("A4-SRC-GLOB-CONSTRUCTOR-COLLISION"),
+            "glob-constructor-collision",
+            type_spelling_source("glob-constructor-collision"),
             "globbed::allocate",
             &["return", "Box", "fake::glob::Box"][..],
         ),
         (
-            "A4-SRC-OPTBOX-PARTIAL-CONSTRUCTOR-COLLISION",
-            exact_a4_source("A4-SRC-OPTBOX-PARTIAL-CONSTRUCTOR-COLLISION"),
+            "optional-box-partial-constructor-collision",
+            type_spelling_source("optional-box-partial-constructor-collision"),
             "wrapped::owned_id",
             &["parameter `p`", "OptBox", "wrapped::Box"][..],
         ),
         (
-            "A4-SRC-LOCAL-BOX-COLLISION",
-            exact_a4_source("A4-SRC-LOCAL-BOX-COLLISION"),
+            "local-box-collision",
+            type_spelling_source("local-box-collision"),
             "consumer::local_only",
             &["local `first`", "Box", "consumer::Box"][..],
         ),
         (
-            "A4-SRC-EXTERN-PRELUDE-CONSTRUCTOR-COLLISION",
-            exact_a4_source("A4-SRC-EXTERN-PRELUDE-CONSTRUCTOR-COLLISION"),
+            "extern-prelude-constructor-collision",
+            type_spelling_source("extern-prelude-constructor-collision"),
             "wrapped::read",
             &["parameter `p`", "Option", "extern prelude"][..],
         ),
         (
-            "A4-SRC-NO-IMPLICIT-PRELUDE-REJECTION",
-            exact_a4_source("A4-SRC-NO-IMPLICIT-PRELUDE-REJECTION"),
+            "no-implicit-prelude-rejection",
+            type_spelling_source("no-implicit-prelude-rejection"),
             "wrapped::read",
             &["parameter `p`", "Option", "implicit prelude disabled"][..],
         ),
         (
-            "A4-SRC-NO-STD-BOX-REJECTION",
-            exact_a4_source("A4-SRC-NO-STD-BOX-REJECTION"),
+            "no-std-box-rejection",
+            type_spelling_source("no-std-box-rejection"),
             "allocate",
             &["return", "Box", "unresolved"][..],
         ),
         (
-            "A4-SRC-BOX-NO-IMPLICIT-PRELUDE-REJECTION",
-            exact_a4_source("A4-SRC-BOX-NO-IMPLICIT-PRELUDE-REJECTION"),
+            "box-no-implicit-prelude-rejection",
+            type_spelling_source("box-no-implicit-prelude-rejection"),
             "allocate",
             &["return", "Box", "implicit prelude disabled"][..],
         ),
         (
-            "A4-SRC-MODULE-NO-IMPLICIT-PRELUDE-REJECTION",
-            exact_a4_source("A4-SRC-MODULE-NO-IMPLICIT-PRELUDE-REJECTION"),
+            "module-no-implicit-prelude-rejection",
+            type_spelling_source("module-no-implicit-prelude-rejection"),
             "wrapped::read",
             &["parameter `p`", "Option", "implicit prelude disabled"][..],
         ),
         (
-            "A4-SRC-ANCESTOR-NO-IMPLICIT-PRELUDE-REJECTION",
-            exact_a4_source("A4-SRC-ANCESTOR-NO-IMPLICIT-PRELUDE-REJECTION"),
+            "ancestor-no-implicit-prelude-rejection",
+            type_spelling_source("ancestor-no-implicit-prelude-rejection"),
             "outer::middle::inner::read",
             &["parameter `p`", "Option", "implicit prelude disabled"][..],
         ),
@@ -1710,7 +1711,7 @@ fn type_spelling_failures_are_structured_and_atomic() {
         run_compiler_on_str(source, |tcx| {
             assert_constructor_failure_pointer_prerequisites(name, tcx);
             match name {
-                "A4-SRC-OPTBOX-PARTIAL-CONSTRUCTOR-COLLISION" => {
+                "optional-box-partial-constructor-collision" => {
                     let owned_id = local_def_path("wrapped::owned_id", tcx);
                     assert!(tcx.is_lang_item(
                         resolved_bare_constructor(owned_id, sym::Option, tcx),
@@ -1721,14 +1722,14 @@ fn type_spelling_failures_are_structured_and_atomic() {
                         local_def_path("wrapped::Box", tcx).to_def_id()
                     );
                 }
-                "A4-SRC-NO-IMPLICIT-PRELUDE-REJECTION" => {
+                "no-implicit-prelude-rejection" => {
                     let read = local_def_path("wrapped::read", tcx);
                     assert!(tcx.is_lang_item(
                         resolved_bare_constructor(read, sym::Option, tcx),
                         hir::LangItem::Option
                     ));
                 }
-                "A4-SRC-LOCAL-BOX-COLLISION" => {
+                "local-box-collision" => {
                     let local_only = local_def_path("consumer::local_only", tcx);
                     let order = local_binding_order(local_only, tcx);
                     assert_eq!(&order[..2], ["first", "second"]);
@@ -1752,13 +1753,13 @@ fn type_spelling_failures_are_structured_and_atomic() {
                 error.message
             );
         }
-        if name == "A4-SRC-OPTBOX-PARTIAL-CONSTRUCTOR-COLLISION" {
+        if name == "optional-box-partial-constructor-collision" {
             assert!(error.message.contains("requires bare `Box`"));
             assert!(!error.message.contains("requires bare `Option`"));
         }
     }
 
-    let unnameable = exact_a4_source("A4-SRC-UNNAMEABLE");
+    let unnameable = type_spelling_source("unnameable");
     let error = generate_error(unnameable);
     assert_eq!(error.kind, GenerationErrorKind::TypeSpelling);
     assert_eq!(error.function_path, "consume");
@@ -1773,14 +1774,14 @@ fn type_spelling_failures_are_structured_and_atomic() {
 #[test]
 fn scope_tables_and_serialized_output_are_deterministic() {
     for source in [
-        exact_a4_source("A4-SRC-IMPORTS"),
-        exact_a4_source("A4-SRC-CANDIDATES"),
-        exact_a4_source("A4-SRC-CANDIDATE-PRECEDENCE"),
-        exact_a4_source("A4-SRC-REEXPORTS"),
-        exact_a4_source("A4-SRC-LOCAL-FALLBACK-ROUTES"),
-        exact_a4_source("A4-SRC-EXTERNAL-ROOT-ALIAS"),
-        exact_a4_source("A4-SRC-RAW-IDENTIFIERS"),
-        exact_a4_source("A4-SRC-QUALIFIED-RAW-FALLBACK"),
+        type_spelling_source("imports"),
+        type_spelling_source("candidates"),
+        type_spelling_source("candidate-precedence"),
+        type_spelling_source("reexports"),
+        type_spelling_source("local-fallback-routes"),
+        type_spelling_source("external-root-alias"),
+        type_spelling_source("raw-identifiers"),
+        type_spelling_source("qualified-raw-fallback"),
     ] {
         let first = generate(source);
         let second = generate(source);
@@ -1800,7 +1801,7 @@ fn scope_tables_and_serialized_output_are_deterministic() {
         .unwrap();
     }
 
-    let candidates = generate(exact_a4_source("A4-SRC-CANDIDATES"));
+    let candidates = generate(type_spelling_source("candidates"));
     assert!(
         function(&candidates, "aliases::inferred")
             .annotated_skeleton
@@ -1816,7 +1817,7 @@ fn scope_tables_and_serialized_output_are_deterministic() {
             .annotated_skeleton
             .contains("crate::left::Thing")
     );
-    let reexports = generate(exact_a4_source("A4-SRC-REEXPORTS"));
+    let reexports = generate(type_spelling_source("reexports"));
     assert!(
         function(&reexports, "consumer::local")
             .annotated_skeleton
@@ -1827,7 +1828,7 @@ fn scope_tables_and_serialized_output_are_deterministic() {
             .annotated_skeleton
             .contains("::std::hash::DefaultHasher")
     );
-    let routes = generate(exact_a4_source("A4-SRC-LOCAL-FALLBACK-ROUTES"));
+    let routes = generate(type_spelling_source("local-fallback-routes"));
     for (path, ty) in [
         ("consumer::restricted", "crate::restricted_api::Exposed"),
         ("consumer::shortest", "crate::short::S"),
@@ -1835,7 +1836,7 @@ fn scope_tables_and_serialized_output_are_deterministic() {
     ] {
         assert!(function(&routes, path).annotated_skeleton.contains(ty));
     }
-    let aliases = generate(exact_a4_source("A4-SRC-EXTERNAL-ROOT-ALIAS"));
+    let aliases = generate(type_spelling_source("external-root-alias"));
     assert!(
         function(&aliases, "consumer::external_alias")
             .annotated_skeleton
@@ -1850,7 +1851,7 @@ fn scope_tables_and_serialized_output_are_deterministic() {
 }
 
 fn comprehensive_fixture() -> &'static str {
-    exact_a4_source("A4-SRC-COMPREHENSIVE")
+    type_spelling_source("comprehensive")
 }
 
 #[test]
@@ -2445,7 +2446,7 @@ fn rejects_nested_empty_statement() {
 }
 
 #[test]
-fn phase_1_rejects_local_const_and_static_recursively() {
+fn rejects_local_const_and_static_recursively() {
     for (source, kind) in [
         (
             r#"pub unsafe fn f() -> i32 {
@@ -2474,7 +2475,7 @@ fn phase_1_rejects_local_const_and_static_recursively() {
 }
 
 #[test]
-fn phase_1_rejects_representative_other_local_items() {
+fn rejects_representative_other_local_items() {
     for (source, kind) in [
         ("pub unsafe fn f() { fn local() {} }", "function"),
         ("pub unsafe fn f() { type Local = i32; }", "type alias"),
@@ -3072,7 +3073,7 @@ fn does_not_change_named_type_or_global_declarations() {
 }
 
 fn local_struct_demotion_fixture() -> &'static str {
-    exact_a4_source("A4-SRC-TREE")
+    type_spelling_source("tree")
 }
 
 #[test]
@@ -3327,8 +3328,8 @@ fn existing_pointer_and_protocol_regressions_change_only_rendered_tools_types() 
         validate,
     };
 
-    let tree = exact_a4_source("A4-SRC-TREE");
-    let comprehensive = exact_a4_source("A4-SRC-COMPREHENSIVE");
+    let tree = type_spelling_source("tree");
+    let comprehensive = type_spelling_source("comprehensive");
     for source in [tree, comprehensive] {
         let direct = run_compiler_on_str(source, tools_pointer_decisions).unwrap();
         let through_generation = run_compiler_on_str(source, |tcx| {
@@ -3528,7 +3529,7 @@ fn compound_pointees_and_inferred_pointer_locals_recurse() {
         assert_const_i32_pointer(output);
     }
 
-    let compound = exact_a4_source("A4-SRC-COMPOUND");
+    let compound = type_spelling_source("compound");
     let records = generate(compound);
     assert!(
         function(&records, "consumer::mutate")
@@ -3547,7 +3548,7 @@ fn compound_pointees_and_inferred_pointer_locals_recurse() {
         "&mut (Alpha, [B; 2])".into()
     )));
 
-    let direct = exact_a4_source("A4-SRC-DIRECT-HINTS");
+    let direct = type_spelling_source("direct-hints");
     run_compiler_on_str(direct, |tcx| {
         let mut surface = utils::ast::parse_crate(direct.to_owned());
         let mut mapper = utils::ir::AstToHirMapper::new(tcx);
@@ -3630,7 +3631,7 @@ fn compound_pointees_and_inferred_pointer_locals_recurse() {
     })
     .unwrap();
 
-    let recursive = exact_a4_source("A4-SRC-RECURSIVE-TYPES");
+    let recursive = type_spelling_source("recursive-types");
     run_compiler_on_str(recursive, |tcx| {
         let grammar = local_def("grammar", tcx);
         let signature = tcx.fn_sig(grammar).instantiate_identity().skip_binder();
@@ -3829,9 +3830,9 @@ fn compound_pointees_and_inferred_pointer_locals_recurse() {
 #[test]
 fn ordinary_pointer_rewriter_and_decisions_are_unchanged() {
     for source in [
-        exact_a4_source("A4-SRC-TREE"),
-        exact_a4_source("A4-SRC-POINTERS"),
-        exact_a4_source("A4-SRC-COMPOUND"),
+        type_spelling_source("tree"),
+        type_spelling_source("pointers"),
+        type_spelling_source("compound"),
     ] {
         let direct = run_compiler_on_str(source, tools_pointer_decisions).unwrap();
         let through_generation = run_compiler_on_str(source, |tcx| {
@@ -3843,7 +3844,7 @@ fn ordinary_pointer_rewriter_and_decisions_are_unchanged() {
         assert_eq!(direct, through_generation);
     }
 
-    let tree = exact_a4_source("A4-SRC-TREE");
+    let tree = type_spelling_source("tree");
     let records = generate(tree);
     assert_eq!(
         function(&records, "tree_print_helper").target_signature,
@@ -3865,7 +3866,7 @@ fn generated_local_name_validates_replaces_and_compiles_in_original_module() {
         normalize_target_safety, replace_items, validate,
     };
 
-    let normalized = normalize_target_safety(exact_a4_source("A4-SRC-MOTIVATING")).unwrap();
+    let normalized = normalize_target_safety(type_spelling_source("motivating")).unwrap();
     let replaced = run_compiler_on_str(&normalized, |tcx| {
         let records = make_skeletons(&normalized, tcx).unwrap();
         let record = function(&records, "src::lib::cb_remove_gamma_rgb");
@@ -4431,7 +4432,7 @@ pub unsafe fn dependency_free(pointer: *mut libc::c_void) {
 }
 
 #[test]
-fn amendment_2_preserves_scalar_statements_and_metadata() {
+fn preserves_scalar_statements_and_metadata() {
     let source = r#"
 pub unsafe fn scalar(mut x: i32, y: i32, z: i32) -> i32 {
     let sum = y + z;
@@ -4451,7 +4452,7 @@ pub unsafe fn scalar(mut x: i32, y: i32, z: i32) -> i32 {
 }
 
 #[test]
-fn amendment_2_mixed_control_has_recursive_parent_disposition() {
+fn mixed_control_has_recursive_parent_disposition() {
     let source = r#"
 pub unsafe fn mixed(mut p: *mut i32, flag: bool, y: i32, z: i32) -> i32 {
     if flag {
@@ -4476,7 +4477,7 @@ pub unsafe fn mixed(mut p: *mut i32, flag: bool, y: i32, z: i32) -> i32 {
 }
 
 #[test]
-fn amendment_2_callable_policy_is_conservative() {
+fn callable_policy_is_conservative() {
     let source = r#"
 pub fn local(value: i32) -> i32 { value + 1 }
 pub unsafe fn caller(values: &[i32], left: i32, right: i32) -> i32 {
@@ -4496,7 +4497,7 @@ pub unsafe fn caller(values: &[i32], left: i32, right: i32) -> i32 {
 }
 
 #[test]
-fn amendment_2_unsafe_nonlocal_calls_macros_and_raw_pointers_transform() {
+fn unsafe_nonlocal_calls_macros_and_raw_pointers_transform() {
     let source = r#"
 pub unsafe fn cases(values: &[i32], pointer: *mut i32, value: i32) -> i32 {
     let unchecked = *values.get_unchecked(0);
@@ -4512,7 +4513,7 @@ pub unsafe fn cases(values: &[i32], pointer: *mut i32, value: i32) -> i32 {
 }
 
 #[test]
-fn amendment_2_opens_local_adts_but_not_external_representation() {
+fn opens_local_adts_but_not_external_representation() {
     let source = r#"
 pub struct Leaf { pub pointer: *mut i32 }
 pub struct Middle { pub leaf: Leaf }
@@ -4536,7 +4537,7 @@ pub unsafe fn values(
 }
 
 #[test]
-fn amendment_2_restricted_conditionals_preserve_or_stay_opaque() {
+fn restricted_conditionals_preserve_or_stay_opaque() {
     let source = r#"
 pub unsafe fn conditional(mut x: i32, flag: bool, pointer: *mut i32) -> i32 {
     x = 1 + if flag { 2 } else { 3 };
@@ -4553,7 +4554,7 @@ pub unsafe fn conditional(mut x: i32, flag: bool, pointer: *mut i32) -> i32 {
 }
 
 #[test]
-fn amendment_2_future_field_change_marks_containing_values_sensitive() {
+fn future_field_change_marks_containing_values_sensitive() {
     let source = r#"
 #[derive(Clone, Copy)]
 pub struct FutureField { pub value: i32 }
@@ -4587,7 +4588,7 @@ pub unsafe fn move_future(mut left: FutureField, right: FutureField) -> i32 {
 }
 
 #[test]
-fn amendment_2_changed_local_signature_forces_call_transformation() {
+fn changed_local_signature_forces_call_transformation() {
     let source = r#"
 pub unsafe fn scalar_callee(value: i32) -> i32 { value + 1 }
 pub unsafe fn scalar_caller(value: i32) -> i32 { scalar_callee(value) }
@@ -4612,7 +4613,7 @@ pub unsafe fn scalar_caller(value: i32) -> i32 { scalar_callee(value) }
 }
 
 #[test]
-fn amendment_2_missing_ast_mapping_and_changed_binding_decision_are_conservative() {
+fn missing_ast_mapping_and_changed_binding_decision_are_conservative() {
     let scalar_source = r#"
 pub unsafe fn scalar(y: i32, z: i32) -> i32 {
     let sum = y + z;
@@ -4708,7 +4709,7 @@ pub unsafe fn observe(pointer: *mut i32) -> bool {
 }
 
 #[test]
-fn amendment_2_type_sensitivity_substitutes_generic_local_adts_and_terminates() {
+fn type_sensitivity_substitutes_generic_local_adts_and_terminates() {
     let source = r#"
 pub struct Wrap<T> { pub value: T }
 pub struct Recursive<T> {
@@ -4756,7 +4757,7 @@ pub unsafe fn generic_values(
 }
 
 #[test]
-fn amendment_2_unresolved_projection_is_transformation_sensitive() {
+fn unresolved_projection_is_transformation_sensitive() {
     let source = r#"
 pub trait HasItem { type Item; }
 pub unsafe fn projection<T: HasItem>(value: T::Item) { let _ = value; }
@@ -4788,7 +4789,7 @@ pub unsafe fn projection<T: HasItem>(value: T::Item) { let _ = value; }
 }
 
 #[test]
-fn amendment_2_exact_scalar_call_and_pointer_matrix() {
+fn exact_scalar_call_and_pointer_matrix() {
     let scalar = generate(
         r#"pub unsafe fn arithmetic(mut x: i32, y: i32, z: i32) -> (i64, [i32; 2]) {
             x = y + z;
@@ -4855,7 +4856,7 @@ fn amendment_2_exact_scalar_call_and_pointer_matrix() {
 }
 
 #[test]
-fn amendment_2_exact_declaration_generic_and_macro_matrix() {
+fn exact_declaration_generic_and_macro_matrix() {
     let declarations = generate(
         r#"pub unsafe fn declarations() {
             let scalar: i32;
@@ -4905,7 +4906,7 @@ fn amendment_2_exact_declaration_generic_and_macro_matrix() {
 }
 
 #[test]
-fn amendment_2_exact_local_adt_matrix_opens_alias_union_and_recursive_fields() {
+fn exact_local_adt_matrix_opens_alias_union_and_recursive_fields() {
     let records = generate(
         r#"pub struct Leaf { pub pointer: *mut i32 }
         pub struct Middle { pub leaf: Leaf }
@@ -4942,7 +4943,7 @@ fn amendment_2_exact_local_adt_matrix_opens_alias_union_and_recursive_fields() {
 }
 
 #[test]
-fn amendment_2_exact_patterns_control_and_unsafe_storage_matrix() {
+fn exact_patterns_control_and_unsafe_storage_matrix() {
     let patterns = generate(
         r#"pub unsafe fn patterns(
             pair: (i32, i32),
@@ -5030,7 +5031,7 @@ fn amendment_2_exact_patterns_control_and_unsafe_storage_matrix() {
 }
 
 #[test]
-fn amendment_2_exact_validator_fixture_has_recursive_parent_disposition() {
+fn exact_validator_fixture_has_recursive_parent_disposition() {
     let records = generate(
         r#"pub unsafe fn validate_me(flag: bool, mut pointer: *mut i32) -> i32 {
             let scalar = 1 + 2;
@@ -5050,7 +5051,7 @@ fn amendment_2_exact_validator_fixture_has_recursive_parent_disposition() {
 }
 
 #[test]
-fn amendment_2_exact_unsupported_callable_and_desugar_matrix() {
+fn exact_unsupported_callable_and_desugar_matrix() {
     let functions = generate(
         r#"pub unsafe fn local(value: i32) -> i32 { value + 1 }
         pub unsafe fn invoke(callback: unsafe fn(i32) -> i32, value: i32) -> i32 {

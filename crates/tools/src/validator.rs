@@ -347,7 +347,7 @@ fn validate_expected_skeleton(item: &Item, entry: &ExpectedFunction) -> Result<(
     }
     if let Some(path) = scan.unlabeled_statements.first() {
         return Err(format!(
-            "Expected skeleton for `{}` (item {}) contains an unlabeled statement in {path}; every Phase 1 statement must have one canonical `#[proctor(N)]` label.",
+            "Expected skeleton for `{}` (item {}) contains an unlabeled statement in {path}; every generated skeleton statement must have one canonical `#[proctor(N)]` label.",
             entry.name, entry.id
         ));
     }
@@ -371,7 +371,7 @@ fn validate_expected_skeleton(item: &Item, entry: &ExpectedFunction) -> Result<(
     }
     if let Some(block) = scan.unsafe_blocks.first() {
         return Err(format!(
-            "Expected skeleton for `{}` (item {}) contains an explicit unsafe block{}; Phase 1 target skeletons must not contain explicit unsafe blocks.",
+            "Expected skeleton for `{}` (item {}) contains an explicit unsafe block{}; generated target skeletons must not contain explicit unsafe blocks.",
             entry.name,
             entry.id,
             label_context(block.label)
@@ -399,7 +399,7 @@ fn validate_expected_skeleton(item: &Item, entry: &ExpectedFunction) -> Result<(
     })?;
     validate_expected_block(body, &transformed).map_err(|detail| {
         format!(
-            "Expected skeleton for `{}` (item {}) has an invalid Phase 1 control/statement tree: {detail}",
+            "Expected skeleton for `{}` (item {}) has an invalid control/statement tree: {detail}",
             entry.name, entry.id
         )
     })?;

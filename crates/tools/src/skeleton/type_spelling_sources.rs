@@ -1,4 +1,4 @@
-pub const A4_SRC_MOTIVATING: &str = r####"
+pub const MOTIVATING: &str = r####"
 unsafe extern "C" {
     fn transform(value: f64) -> f64;
 }
@@ -27,7 +27,7 @@ pub mod src {
 }
 "####;
 
-pub const A4_SRC_IMPORTS: &str = r####"
+pub const IMPORTS: &str = r####"
 pub mod model {
     #[repr(C)]
     pub struct Direct(pub i32);
@@ -67,7 +67,7 @@ pub mod globbed {
 }
 "####;
 
-pub const A4_SRC_CANDIDATES: &str = r####"
+pub const CANDIDATES: &str = r####"
 pub mod left {
     #[repr(C)]
     pub struct Thing {
@@ -110,7 +110,7 @@ pub mod collision {
 }
 "####;
 
-pub const A4_SRC_CANDIDATE_PRECEDENCE: &str = r####"
+pub const CANDIDATE_PRECEDENCE: &str = r####"
 pub mod model {
     #[repr(C)]
     pub struct Item {
@@ -158,7 +158,7 @@ pub mod namespace {
 }
 "####;
 
-pub const A4_SRC_REEXPORTS: &str = r####"
+pub const REEXPORTS: &str = r####"
 pub mod api {
     mod hidden {
         #[repr(C)]
@@ -185,7 +185,7 @@ pub mod consumer {
 }
 "####;
 
-pub const A4_SRC_LOCAL_FALLBACK_ROUTES: &str = r####"
+pub const LOCAL_FALLBACK_ROUTES: &str = r####"
 pub(crate) mod restricted_api {
     mod hidden {
         #[repr(C)]
@@ -248,7 +248,7 @@ pub mod consumer {
 }
 "####;
 
-pub const A4_SRC_EXTERNAL_ROOT_ALIAS: &str = r####"
+pub const EXTERNAL_ROOT_ALIAS: &str = r####"
 #![no_std]
 
 extern crate std as rust_std;
@@ -262,7 +262,7 @@ pub mod consumer {
 }
 "####;
 
-pub const A4_SRC_SOURCE_PATHS: &str = r####"
+pub const SOURCE_PATHS: &str = r####"
 pub mod model {
     #[repr(C)]
     pub struct Point {
@@ -296,7 +296,7 @@ pub mod consumer {
 }
 "####;
 
-pub const A4_SRC_SOURCE_HINT_EDGES: &str = r####"
+pub const SOURCE_HINT_EDGES: &str = r####"
 pub mod model {
     #[repr(C)]
     pub struct Point {
@@ -338,7 +338,7 @@ pub mod consumer {
 }
 "####;
 
-pub const A4_SRC_DIRECT_HINTS: &str = r####"
+pub const DIRECT_HINTS: &str = r####"
 #[repr(C)]
 pub struct P {
     pub value: i32,
@@ -349,7 +349,7 @@ pub unsafe fn hint(pointer: *const P) -> i32 {
 }
 "####;
 
-pub const A4_SRC_RECURSIVE_TYPES: &str = r####"
+pub const RECURSIVE_TYPES: &str = r####"
 pub const WIDTH: usize = 2;
 
 pub struct Wrap<T>(pub T);
@@ -380,7 +380,7 @@ pub unsafe fn higher_ranked(
 }
 "####;
 
-pub const A4_SRC_POINTERS: &str = r####"
+pub const POINTERS: &str = r####"
 #[repr(C)]
 pub struct Node {
     pub value: i32,
@@ -399,7 +399,7 @@ pub unsafe fn local_pointer() -> i32 {
 }
 "####;
 
-pub const A4_SRC_COMPOUND: &str = r####"
+pub const COMPOUND: &str = r####"
 pub mod types {
     #[repr(C)]
     pub struct A {
@@ -432,7 +432,7 @@ pub mod consumer {
 }
 "####;
 
-pub const A4_SRC_RAW_IDENTIFIERS: &str = r####"
+pub const RAW_IDENTIFIERS: &str = r####"
 pub mod r#type {
     #[repr(C)]
     pub struct r#match {
@@ -450,7 +450,7 @@ pub mod r#type {
 }
 "####;
 
-pub const A4_SRC_QUALIFIED_RAW_FALLBACK: &str = r####"
+pub const QUALIFIED_RAW_FALLBACK: &str = r####"
 pub mod r#type {
     #[repr(C)]
     pub struct r#match {
@@ -467,7 +467,7 @@ pub mod consumer {
 }
 "####;
 
-pub const A4_SRC_STANDARD_CONSTRUCTORS: &str = r####"
+pub const STANDARD_CONSTRUCTORS: &str = r####"
 pub mod wrapped {
     unsafe extern "C" {
         fn malloc(size: usize) -> *mut i32;
@@ -502,7 +502,7 @@ pub mod wrapped {
 }
 "####;
 
-pub const A4_SRC_STANDARD_BARE_IMPORTS: &str = r####"
+pub const STANDARD_BARE_IMPORTS: &str = r####"
 pub mod imported {
     use core::option::Option;
     use std::boxed::Box;
@@ -528,7 +528,7 @@ pub mod imported {
 }
 "####;
 
-pub const A4_SRC_NO_STD_OPTION_SUCCESS: &str = r####"
+pub const NO_STD_OPTION_SUCCESS: &str = r####"
 #![no_std]
 
 pub unsafe fn read(p: *const i32) -> i32 {
@@ -540,7 +540,7 @@ pub unsafe fn read(p: *const i32) -> i32 {
 }
 "####;
 
-pub const A4_SRC_NAMED_OPTIONAL_BOX: &str = r####"
+pub const NAMED_OPTIONAL_BOX: &str = r####"
 pub mod model {
     #[repr(C)]
     pub struct Point {
@@ -574,7 +574,7 @@ pub mod consumer {
 }
 "####;
 
-pub const A4_SRC_OPTION_COLLISION: &str = r####"
+pub const OPTION_COLLISION: &str = r####"
 pub mod wrapped {
     pub struct Option;
     use core::option::Option as Maybe;
@@ -596,7 +596,7 @@ pub mod wrapped {
 }
 "####;
 
-pub const A4_SRC_BOX_COLLISION: &str = r####"
+pub const BOX_COLLISION: &str = r####"
 pub mod wrapped {
     pub struct Box;
     use std::boxed::Box as Owned;
@@ -614,7 +614,7 @@ pub mod wrapped {
 }
 "####;
 
-pub const A4_SRC_RENAMED_CONSTRUCTOR_COLLISION: &str = r####"
+pub const RENAMED_CONSTRUCTOR_COLLISION: &str = r####"
 pub mod fake {
     pub struct WrongOption;
 }
@@ -632,7 +632,7 @@ pub mod renamed {
 }
 "####;
 
-pub const A4_SRC_GLOB_CONSTRUCTOR_COLLISION: &str = r####"
+pub const GLOB_CONSTRUCTOR_COLLISION: &str = r####"
 pub mod fake {
     pub mod glob {
         pub struct Box;
@@ -655,7 +655,7 @@ pub mod globbed {
 }
 "####;
 
-pub const A4_SRC_OPTBOX_PARTIAL_CONSTRUCTOR_COLLISION: &str = r####"
+pub const OPTIONAL_BOX_PARTIAL_CONSTRUCTOR_COLLISION: &str = r####"
 pub mod wrapped {
     pub struct Box;
     use core::option::Option;
@@ -678,7 +678,7 @@ pub mod wrapped {
 }
 "####;
 
-pub const A4_SRC_LOCAL_BOX_COLLISION: &str = r####"
+pub const LOCAL_BOX_COLLISION: &str = r####"
 pub mod consumer {
     pub struct Box;
 
@@ -702,7 +702,7 @@ pub mod consumer {
 }
 "####;
 
-pub const A4_SRC_EXTERN_PRELUDE_CONSTRUCTOR_COLLISION: &str = r####"
+pub const EXTERN_PRELUDE_CONSTRUCTOR_COLLISION: &str = r####"
 extern crate core as Option;
 
 pub mod wrapped {
@@ -716,7 +716,7 @@ pub mod wrapped {
 }
 "####;
 
-pub const A4_SRC_IRRELEVANT_COLLISIONS: &str = r####"
+pub const IRRELEVANT_COLLISIONS: &str = r####"
 pub mod box_only {
     pub struct Option;
 
@@ -745,7 +745,7 @@ pub mod option_only {
 }
 "####;
 
-pub const A4_SRC_NO_IMPLICIT_PRELUDE_REJECTION: &str = r####"
+pub const NO_IMPLICIT_PRELUDE_REJECTION: &str = r####"
 #![no_implicit_prelude]
 
 extern crate core;
@@ -763,7 +763,7 @@ pub mod wrapped {
 }
 "####;
 
-pub const A4_SRC_NO_STD_BOX_REJECTION: &str = r####"
+pub const NO_STD_BOX_REJECTION: &str = r####"
 #![no_std]
 
 unsafe extern "C" {
@@ -778,7 +778,7 @@ pub unsafe fn allocate() -> *mut i32 {
 }
 "####;
 
-pub const A4_SRC_BOX_NO_IMPLICIT_PRELUDE_REJECTION: &str = r####"
+pub const BOX_NO_IMPLICIT_PRELUDE_REJECTION: &str = r####"
 #![no_implicit_prelude]
 
 extern crate core;
@@ -795,7 +795,7 @@ pub unsafe fn allocate() -> *mut i32 {
 }
 "####;
 
-pub const A4_SRC_MODULE_NO_IMPLICIT_PRELUDE_REJECTION: &str = r####"
+pub const MODULE_NO_IMPLICIT_PRELUDE_REJECTION: &str = r####"
 #[no_implicit_prelude]
 pub mod wrapped {
     pub unsafe fn read(p: *const i32) -> i32 {
@@ -808,7 +808,7 @@ pub mod wrapped {
 }
 "####;
 
-pub const A4_SRC_ANCESTOR_NO_IMPLICIT_PRELUDE_REJECTION: &str = r####"
+pub const ANCESTOR_NO_IMPLICIT_PRELUDE_REJECTION: &str = r####"
 #[no_implicit_prelude]
 pub mod outer {
     pub mod middle {
@@ -825,7 +825,7 @@ pub mod outer {
 }
 "####;
 
-pub const A4_SRC_PRESERVED_PARENT: &str = r####"
+pub const PRESERVED_PARENT: &str = r####"
 pub struct Local {
     pub value: i32,
 }
@@ -840,7 +840,7 @@ pub unsafe fn preserved(flag: bool) -> i32 {
 }
 "####;
 
-pub const A4_SRC_UNNAMEABLE: &str = r####"
+pub const UNNAMEABLE: &str = r####"
 pub fn values() -> impl Iterator<Item = i32> {
     0..3
 }
@@ -851,7 +851,7 @@ pub unsafe fn consume() {
 }
 "####;
 
-pub const A4_SRC_TREE: &str = r####"
+pub const TREE: &str = r####"
 #[repr(C)]
 pub struct Tree {
     root_id: i32,
@@ -866,7 +866,7 @@ pub unsafe fn caller(tree: *mut Tree) {
 }
 "####;
 
-pub const A4_SRC_COMPREHENSIVE: &str = r####"
+pub const COMPREHENSIVE: &str = r####"
 const N: usize = 4;
 
 mod model {
