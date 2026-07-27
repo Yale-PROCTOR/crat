@@ -3,8 +3,11 @@
 Five adversarial review lenses ran against `f9ee8fee` (read-only). 38 raw
 findings; nine re-verified and accepted. Four were HIGH and blocked merge.
 
-**Status: D1–D4 CLOSED, each with a named witness test. D5–D9 remain open and
-are recorded below with a recommended disposition.**
+**Status after delta verification of `9f21eac8`: D1, D2, D3 CLOSED. D4 NOT
+CLOSED — my fix is incomplete and its witness cannot fail. D5–D9 remain open.
+Two new defects (D10, D11) were introduced by the fix delta and are recorded.**
+
+M0 remains **not merge-ready**.
 
 Suite after fixes: **834 passed, 0 failed, 7 ignored.**
 
@@ -27,6 +30,20 @@ oracle is where the loan set exists; the accept point only sees conflicts.
 **restored cardinality equality** — one record per `(fn_did, loan)`), and
 `multi_round_export_holds_only_the_final_round`.
 
+*Verification caveat, accepted:* the review notes neither witness **pins the
+round count**, so on these small fixtures they may accept in one round and
+would then not have failed against the pre-fix behaviour. The fix is correct
+by construction (`begin_round()` at the top of both loop bodies, before the
+oracle, with the accept returning inside the same iteration), but a fixture
+with an asserted `stats.rounds > 1` would make the witness load-bearing.
+Registered for M0.1.
+
+*Useful correction from the review:* candidacy is **not** model-dependent
+(`is_candidate` reduces to `slot_for_local_depth(local, 0).is_some()`,
+constant across rounds), so loan indices are stable and cross-round entries
+collide exactly on `(fn_did, loan)` — which is precisely what the restored
+cardinality assertion keys on. The dedup check is the right shape.
+
 > **The RED-weakening trap — on the record for future milestones.**
 > I had weakened RED 14 from the spec's cardinality equality to a
 > non-emptiness check. That single weakening is what let D1 through: with the
@@ -45,8 +62,17 @@ capture on either loop exit, so `loans` was silently empty under
 Gap-B reasoning (capture before the `invalid_loans.is_empty()` early break).
 Capture now exists on all four replay exits across the two paths.
 
-*Witness:* `l2_path_records_loans` — solves an L2-on fixture and asserts
-non-empty **and** round-correct (one record per loan) loans.
+*Witness:* `l2_path_records_loans`. **Caveat the review is right about:**
+every assertion it makes is already satisfied on the Mode-A path, so it is
+non-distinguishing — it would pass with the L2 capture removed unless the L2
+route is actually taken. The code fix itself was verified by direct reading of
+both exits, not via this test.
+
+*Adjacent gap, still open:* the L2 accept path never records **residuals**, so
+`export.residual_conflicts` is unconditionally empty under
+`CRAT_BO_L2_GUARDED_COMMITS=1`. That pre-dates the delta; what the delta
+changed is that `begin_round()`'s clear makes the emptiness indistinguishable
+from "recorded, none found".
 
 ### D3 — the R-Q1a witness was a tautology — **CLOSED**
 
@@ -68,7 +94,7 @@ projected place would look up a different local and disagree.
 diagnostics ("derivation disagreed with the supplied provider for base local
 _1 … the key or the lookup has drifted"). Verified, then reverted.
 
-### D4 — `CRAT_BO_EXPORT` was a dead switch — **CLOSED**
+### D4 — `CRAT_BO_EXPORT` was a dead switch — **NOT CLOSED**
 
 *Was:* the flag was parsed, validated, and tested — and consulted by nothing.
 Setting it to 1 recorded nothing, contradicting the module doc's claim that a
@@ -79,7 +105,26 @@ a capture buffer lazily when the flag is on. Scope-based enablement is
 unchanged for tests. Feature-off identity is preserved: with the flag unset,
 `capturing()` is one thread-local read returning false.
 
-*Witness:* `export_flag_gates_capture`, plus `export_flag_rejects_invalid_value`.
+*Witness:* `export_flag_gates_capture` — **and the delta review is right that
+this witness cannot fail.** It asserts `!capturing() || flag`, which holds
+byte-identically with the flag branch deleted. It is the same tautology class
+as D3, reintroduced in the fix for D4.
+
+**Why D4 is still open — the fix is write-only.** `capturing()` now installs a
+buffer when the flag is on, but **nothing can retrieve it**: `with_bo_export`
+is the only reader of `BO_EXPORT_CAPTURE`, and it installs its own fresh
+buffer on entry. So `CRAT_BO_EXPORT=1` makes capture *run* and then discards
+everything — the corpus-worker capability the module doc promises still does
+not exist. The flag now gates, but gates onto nothing.
+
+*Required to close:* a drain API (e.g. `take_export() -> BoExport`) so the
+flag path has a reader, plus a witness that actually fails with the flag
+branch removed. Both are M0.1 work; I did not start another fix cycle without
+authorization, having just seen an unverified fix introduce two new defects.
+
+*Secondary, also open:* on the flag path the buffer is never bracketed, so
+`version_sites`, `source_sites` and `sink_sites` grow for the process
+lifetime — `begin_round()` clears only `loans` and `residual_conflicts`.
 
 > **Secondary finding, fixed in passing.** Wiring the flag into `capturing()`
 > made RED 1's `set_var("CRAT_BO_EXPORT", "2")` a **data race**: the suite runs
@@ -89,6 +134,20 @@ unchanged for tests. Feature-off identity is preserved: with the flag unset,
 > split `rewriter::decision_snapshot_pre_transform_enabled_from_value` already
 > uses. RED 1 now exercises the parse without touching the process
 > environment.
+
+## Introduced by the fix delta
+
+- **D10 (HIGH)** `capture_solve_l2` mutates `CRAT_BO_L2_GUARDED_COMMITS` with
+  `set_var` inside a parallel test binary — **the same data-race class I had
+  just fixed for `CRAT_BO_EXPORT`**, reintroduced one test-helper over. It is
+  panic-safe within its own thread (`catch_unwind` + `remove_var` +
+  `resume_unwind`) but not safe against a concurrently running test. Fix: an
+  L2 mode provider parameter, or a serial-test guard.
+- **D11 (MEDIUM)** `model_accepts_with_flows` calls the loan-recording oracle
+  **outside** either CEGAR loop, so no `begin_round()` precedes it. Latent
+  today (nothing opens a scope around it), but D4's flag path would make it
+  live: with the flag on, that call would append loans with no round reset,
+  reopening D1 by another route.
 
 ## Open — recorded, not fixed
 
