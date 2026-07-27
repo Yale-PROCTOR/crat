@@ -7689,6 +7689,29 @@ const CORPUS: &[CorpusProgram] = &[
     },
 ];
 
+const PAIRWISE_EXPECTED_JOINT_BY_PROGRAM: [(&str, usize); 20] = [
+    ("bst", 0),
+    ("avl", 0),
+    ("ht", 0),
+    ("libcsv", 0),
+    ("buffer", 5),
+    ("quadtree", 0),
+    ("urlparser", 0),
+    ("robotfindskitten", 0),
+    ("rgba", 0),
+    ("genann", 0),
+    ("libtree", 7),
+    ("json.h", 2),
+    ("binn", 0),
+    ("libzahl", 4),
+    ("lil", 33),
+    ("heman", 6),
+    ("bzip2", 4),
+    ("lodepng", 0),
+    ("tulipindicators", 0),
+    ("brotli", 2),
+];
+
 #[test]
 fn rs_crown_catalog_contract() {
     let expected = [
@@ -7749,6 +7772,27 @@ fn rs_crown_catalog_contract() {
             Some(expected_root)
         );
     }
+}
+
+#[test]
+fn pairwise_joint_anchor_covers_exact_catalog() {
+    assert_eq!(
+        PAIRWISE_EXPECTED_JOINT_BY_PROGRAM
+            .iter()
+            .map(|(program, _)| *program)
+            .collect::<std::collections::BTreeSet<_>>(),
+        CORPUS
+            .iter()
+            .map(|program| program.name)
+            .collect::<std::collections::BTreeSet<_>>()
+    );
+    assert_eq!(
+        PAIRWISE_EXPECTED_JOINT_BY_PROGRAM
+            .iter()
+            .map(|(_, rows)| *rows)
+            .sum::<usize>(),
+        63
+    );
 }
 
 #[test]
@@ -9277,6 +9321,17 @@ fn boc1_corpus() {
             "accepted family matrix does not exist: {family_matrix}"
         );
         assert_eq!(CORPUS.len(), 20);
+        assert_eq!(
+            PAIRWISE_EXPECTED_JOINT_BY_PROGRAM
+                .iter()
+                .map(|(program, _)| *program)
+                .collect::<BTreeSet<_>>(),
+            CORPUS
+                .iter()
+                .map(|program| program.name)
+                .collect::<BTreeSet<_>>(),
+            "pairwise joint anchor must cover the exact frozen catalog"
+        );
     }
     assert!(
         !prod_box_snapshot_only || diagnostic_package,
@@ -10311,28 +10366,7 @@ fn boc1_corpus() {
         assert_eq!(parse_total("sources_leaked_sel"), 114);
         assert_eq!(parse_total("sinks_leaked"), 170);
 
-        let expected_joint = BTreeMap::from([
-            ("bst", 0usize),
-            ("avl", 0),
-            ("ht", 0),
-            ("libcsv", 0),
-            ("buffer", 5),
-            ("quadtree", 0),
-            ("urlparser", 0),
-            ("robotfindskitten", 0),
-            ("rgba", 0),
-            ("genann", 0),
-            ("libtree", 7),
-            ("json.h", 2),
-            ("binn", 0),
-            ("libzahl", 4),
-            ("lil", 33),
-            ("heman", 6),
-            ("bzip2", 4),
-            ("tmux", 0),
-            ("libxml2", 0),
-            ("brotli", 2),
-        ]);
+        let expected_joint = BTreeMap::from(PAIRWISE_EXPECTED_JOINT_BY_PROGRAM);
         assert_eq!(
             expected_joint.values().sum::<usize>(),
             63,
