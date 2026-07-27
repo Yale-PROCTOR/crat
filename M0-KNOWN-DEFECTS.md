@@ -9,6 +9,10 @@ Two new defects (D10, D11) were introduced by the fix delta and are recorded.**
 
 M0 remains **not merge-ready**.
 
+Delta verification of `9f21eac8`: 5 lenses, 30 raw findings, **18 confirmed**
+after adversarial refutation (12 refuted). Closed verdicts: D1 ✓, D2 ✓, D3 ✓,
+D4 ✗, regression ✗.
+
 Suite after fixes: **834 passed, 0 failed, 7 ignored.**
 
 ## Closed
@@ -30,13 +34,22 @@ oracle is where the loan set exists; the accept point only sees conflicts.
 **restored cardinality equality** — one record per `(fn_did, loan)`), and
 `multi_round_export_holds_only_the_final_round`.
 
-*Verification caveat, accepted:* the review notes neither witness **pins the
-round count**, so on these small fixtures they may accept in one round and
-would then not have failed against the pre-fix behaviour. The fix is correct
-by construction (`begin_round()` at the top of both loop bodies, before the
-oracle, with the accept returning inside the same iteration), but a fixture
-with an asserted `stats.rounds > 1` would make the witness load-bearing.
-Registered for M0.1.
+*Verification caveat, accepted (MEDIUM, not HIGH).* The refutation pass is
+explicit that **the fix itself is sound and correctly placed — nothing in
+production behaviour is wrong** — and that this is a regression-guard defect
+only. Duplicates can arise *only* across rounds (the oracle runs exactly once
+per round, and `record_loan_identities` fires once per function per call), so
+the uniqueness assertion is provably inert below 2 rounds, and nothing pins the
+round count. `multi_round_export_holds_only_the_final_round` additionally
+asserts neither `model.is_some()` nor non-emptiness, so a decline at the first
+solve would let it pass with zero signal.
+
+Concrete remedy for M0.1, from the refutation: assert `model.is_some()` and
+`!export.loans.is_empty()` in the D1 test, and pin the fixture's round count
+through `verify_to_fixpoint_counting` — the idiom already exists at
+`bo_c1.rs:6442` (`accept.rounds == 1`, `commit.rounds == 3`).
+
+Unlike D3's tautology, this witness *can* fail; it is unpinned, not inert.
 
 *Useful correction from the review:* candidacy is **not** model-dependent
 (`is_candidate` reduces to `slot_for_local_depth(local, 0).is_some()`,
@@ -70,9 +83,20 @@ both exits, not via this test.
 
 *Adjacent gap, still open:* the L2 accept path never records **residuals**, so
 `export.residual_conflicts` is unconditionally empty under
-`CRAT_BO_L2_GUARDED_COMMITS=1`. That pre-dates the delta; what the delta
-changed is that `begin_round()`'s clear makes the emptiness indistinguishable
-from "recorded, none found".
+`CRAT_BO_L2_GUARDED_COMMITS=1`. `record_residuals` has exactly one call site
+(`borrow_verify.rs:806`, inside the **Mode-A** `committed == 0` accept), and
+`verify_to_fixpoint_counting_with_flows` routes unconditionally to the L2
+function when L2 is enabled, so that accept is unreachable there. The struct
+doc's "non-empty in general" is therefore false under the plan-of-record
+configuration.
+
+> **CORRECTION — an earlier claim in this ledger was refuted.** I previously
+> wrote that "what the delta changed is that `begin_round()`'s clear makes the
+> emptiness indistinguishable from 'recorded, none found'." **That is wrong.**
+> `residual_conflicts` was never written on the L2 path *before* the delta
+> either, so the added clear is a no-op there and nothing became less
+> distinguishable. The gap is real and pre-existing; my attribution of a change
+> to the delta was not. Severity accordingly LOW, not MEDIUM.
 
 ### D3 — the R-Q1a witness was a tautology — **CLOSED**
 
@@ -143,6 +167,11 @@ lifetime — `begin_round()` clears only `loans` and `residual_conflicts`.
   panic-safe within its own thread (`catch_unwind` + `remove_var` +
   `resume_unwind`) but not safe against a concurrently running test. Fix: an
   L2 mode provider parameter, or a serial-test guard.
+- **D12 (MEDIUM)** `certificate_residuals_may_be_nonempty`'s core assertion is
+  `export.residual_conflicts.len() < usize::MAX` — **vacuously true**. Same
+  tautology class as D3, written by me in `ad79b01a` and not caught until the
+  delta review. Spec RED 16 needs an assertion that can fail: a fixture whose
+  accepted model genuinely carries a non-committable residual.
 - **D11 (MEDIUM)** `model_accepts_with_flows` calls the loan-recording oracle
   **outside** either CEGAR loop, so no `begin_round()` precedes it. Latent
   today (nothing opens a scope around it), but D4's flag path would make it
