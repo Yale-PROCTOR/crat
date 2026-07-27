@@ -244,7 +244,17 @@ impl<'rn, 'tcx: 'rn> Renamer<'rn, 'tcx> {
                 block: bb,
                 statement_index: index,
             };
-            self.go_terminator::<Infer>(infer_cx, terminator, location);
+            // E-R3 capture: park `(fn_did, location)` so a selector pushed
+            // deeper in the boundary dispatch can attribute itself to this call
+            // site. No-op unless a capture scope is active.
+            match self.body.source.def_id().as_local() {
+                Some(fn_did) => crate::analyses::borrow_ownership::export::with_terminator_site(
+                    fn_did,
+                    location,
+                    || self.go_terminator::<Infer>(infer_cx, terminator, location),
+                ),
+                None => self.go_terminator::<Infer>(infer_cx, terminator, location),
+            }
         }
 
         for succ in self.body.basic_blocks.successors(bb) {
