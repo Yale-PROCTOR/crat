@@ -6,20 +6,22 @@
 // verbatim (`borrow_conflicts`/`borrow_conflicts_replaying`/`invalid_loan_set`/
 // `extract_conflict_edges`) so 3b/NB6 diffs are 1:1 — the module path is the only distinguisher.
 //
-// The fork's ONLY behavioral seam is `overwrite_with_engine_facts`: after the PUBLIC production
-// `borrow_inference` produces all facts, this replaces its `invalidates` + `errors` with the BO
-// engine's (byte-identical at 3a; 3b makes `invalidates` write-aware). Everything else is production,
-// reached via its public API + the 7-field visibility manifest (see the 3a task doc).
+// NB5-O adds the BO-owned origin-replay seam: production `borrow_inference` still supplies the
+// frozen base facts, then `NativeBorrowContext` replaces subset/requires/loan-liveness from retained
+// BO-native body flows before this module replaces invalidates/errors with the BO engine's.
 use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_index::bit_set::DenseBitSet;
 use rustc_middle::{mir::Local, ty::TyCtxt};
 use rustc_span::def_id::LocalDefId;
 
+use super::origin_replay::NativeBorrowContext;
 use crate::{
-    analyses::borrow::{
-        BorrowInferenceResults, Borrower, ConflictEdge, GBorrowInferCtxt, Loan, Provenance,
-        ProvenanceOwner, ProvenanceSet, StructFieldSlot, borrow_inference,
-        collect_invalid_loan_demotions,
+    analyses::{
+        borrow::{
+            BorrowInferenceResults, Borrower, ConflictEdge, GBorrowInferCtxt, Loan, Provenance,
+            ProvenanceOwner, ProvenanceSet, StructFieldSlot, collect_invalid_loan_demotions,
+        },
+        borrow_ownership::origin_flow::OriginFlowResults,
     },
     utils::rustc::RustProgram,
 };
@@ -198,6 +200,55 @@ where
     K: Fn(LocalDefId) -> L,
     L: Fn(Local) -> bool,
 {
+    let flows =
+        crate::analyses::borrow_ownership::origin_flow::analyze_program_origin_flow(program);
+    borrow_conflicts_with_flows(program, &flows, is_candidate, is_mutable)
+}
+
+pub(crate) fn borrow_conflicts_with_flows<I, J, K, L>(
+    program: &RustProgram,
+    flows: &OriginFlowResults,
+    is_candidate: I,
+    is_mutable: K,
+) -> FxHashMap<LocalDefId, Vec<ConflictEdge>>
+where
+    I: Fn(LocalDefId) -> J,
+    J: Fn(Local) -> bool,
+    K: Fn(LocalDefId) -> L,
+    L: Fn(Local) -> bool,
+{
+    let ctxt = NativeBorrowContext::new(program, flows, is_candidate, is_mutable);
+    let mut out = FxHashMap::default();
+    for f in program.functions.iter().copied() {
+        let mut inference = ctxt.infer(program.tcx, f, &[]);
+        overwrite_with_engine_facts(program.tcx, f, &ctxt.borrow, &mut inference);
+        let invalid_loans = invalid_loan_set(&inference);
+        if invalid_loans.is_empty() {
+            continue;
+        }
+        let provenance_set = ctxt.borrow.provenances.get(&f).unwrap();
+        out.insert(
+            f,
+            extract_conflict_edges(&inference, provenance_set, &invalid_loans),
+        );
+    }
+    out
+}
+
+#[cfg(test)]
+fn borrow_conflicts_wrapped<I, J, K, L>(
+    program: &RustProgram,
+    is_candidate: I,
+    is_mutable: K,
+) -> FxHashMap<LocalDefId, Vec<ConflictEdge>>
+where
+    I: Fn(LocalDefId) -> J,
+    J: Fn(Local) -> bool,
+    K: Fn(LocalDefId) -> L,
+    L: Fn(Local) -> bool,
+{
+    use crate::analyses::borrow::borrow_inference;
+
     let ctxt = GBorrowInferCtxt::new(program, is_candidate, is_mutable);
     let mut out = FxHashMap::default();
     for f in program.functions.iter().copied() {
@@ -236,12 +287,33 @@ where
     K: Fn(LocalDefId) -> L,
     L: Fn(Local) -> bool,
 {
+    let flows =
+        crate::analyses::borrow_ownership::origin_flow::analyze_program_origin_flow(program);
+    borrow_conflicts_replaying_with_flows(program, &flows, is_ref, is_raw, is_mutable, raw_fields)
+}
+
+pub(crate) fn borrow_conflicts_replaying_with_flows<I, J, M, N, K, L>(
+    program: &RustProgram,
+    flows: &OriginFlowResults,
+    is_ref: I,
+    is_raw: M,
+    is_mutable: K,
+    raw_fields: &[StructFieldSlot],
+) -> FxHashMap<LocalDefId, Vec<ConflictEdge>>
+where
+    I: Fn(LocalDefId) -> J,
+    J: Fn(Local) -> bool,
+    M: Fn(LocalDefId) -> N,
+    N: Fn(Local) -> bool,
+    K: Fn(LocalDefId) -> L,
+    L: Fn(Local) -> bool,
+{
     let is_candidate = |did: LocalDefId| {
         let ref_f = is_ref(did);
         let raw_f = is_raw(did);
         move |local: Local| ref_f(local) || raw_f(local)
     };
-    let mut ctxt = GBorrowInferCtxt::new(program, is_candidate, is_mutable);
+    let mut ctxt = NativeBorrowContext::new(program, flows, is_candidate, is_mutable);
 
     // §NB5-F2 — field candidacy: a struct-field slot the model settled `Raw` is a raw pointer, not a
     // borrow, so its loan must be disabled — the field analogue of a Raw local's `local_data=None`
@@ -251,7 +323,7 @@ where
     // the field conflicts that Option A (NB5-F) had to decline, so those programs now accept with the
     // field `Raw`. Genuinely un-dischargeable field residuals (never disabled here) still hit the
     // `residual_nonref_field` decline backstop in the caller — B narrows the decline set, not deletes it.
-    for provenance_set in ctxt.provenances.values_mut() {
+    for provenance_set in ctxt.borrow.provenances.values_mut() {
         for &field in raw_fields {
             provenance_set.disable_owner(ProvenanceOwner::Field(field));
         }
@@ -262,15 +334,15 @@ where
         let is_raw_f = is_raw(f);
 
         let edges = loop {
-            let mut inference = borrow_inference(program.tcx, f, &ctxt);
-            overwrite_with_engine_facts(program.tcx, f, &ctxt, &mut inference);
+            let mut inference = ctxt.infer(program.tcx, f, raw_fields);
+            overwrite_with_engine_facts(program.tcx, f, &ctxt.borrow, &mut inference);
             let invalid_loans = invalid_loan_set(&inference);
             if invalid_loans.is_empty() {
                 break Vec::new();
             }
 
             let to_demote: Vec<(Local, Local)> = {
-                let provenance_set = ctxt.provenances.get(&f).unwrap();
+                let provenance_set = ctxt.borrow.provenances.get(&f).unwrap();
                 let demotions =
                     collect_invalid_loan_demotions(&inference, provenance_set, &invalid_loans);
                 demotions
@@ -283,12 +355,12 @@ where
             };
 
             if to_demote.is_empty() {
-                let provenance_set = ctxt.provenances.get(&f).unwrap();
+                let provenance_set = ctxt.borrow.provenances.get(&f).unwrap();
                 break extract_conflict_edges(&inference, provenance_set, &invalid_loans);
             }
 
             drop(inference);
-            let provenance_set = ctxt.provenances.get_mut(&f).unwrap();
+            let provenance_set = ctxt.borrow.provenances.get_mut(&f).unwrap();
             for (local, base) in to_demote {
                 // production: `provenance_set.disable_owner(ProvenanceOwner::Local(local));`
                 // (Local branch = this field write; return value is ignored here).
@@ -301,7 +373,7 @@ where
         };
 
         // BB2-i stray-Raw inert-ness invariant (verbatim; release-active tripwire).
-        let provenance_set = ctxt.provenances.get(&f).unwrap();
+        let provenance_set = ctxt.borrow.provenances.get(&f).unwrap();
         assert!(
             provenance_set
                 .local_data
@@ -333,6 +405,7 @@ where
 /// retain their original output shape and perform no capture allocation.
 pub(crate) fn borrow_conflicts_replaying_witnessed<I, J, M, N, K, L>(
     program: &RustProgram,
+    flows: &OriginFlowResults,
     is_ref: I,
     is_raw: M,
     is_mutable: K,
@@ -351,9 +424,9 @@ where
         let raw_f = is_raw(did);
         move |local: Local| ref_f(local) || raw_f(local)
     };
-    let mut ctxt = GBorrowInferCtxt::new(program, is_candidate, is_mutable);
+    let mut ctxt = NativeBorrowContext::new(program, flows, is_candidate, is_mutable);
 
-    for provenance_set in ctxt.provenances.values_mut() {
+    for provenance_set in ctxt.borrow.provenances.values_mut() {
         for &field in raw_fields {
             provenance_set.disable_owner(ProvenanceOwner::Field(field));
         }
@@ -364,16 +437,16 @@ where
         let is_raw_f = is_raw(f);
 
         let edges = loop {
-            let mut inference = borrow_inference(program.tcx, f, &ctxt);
+            let mut inference = ctxt.infer(program.tcx, f, raw_fields);
             let accesses =
-                overwrite_with_engine_facts_capturing(program.tcx, f, &ctxt, &mut inference);
+                overwrite_with_engine_facts_capturing(program.tcx, f, &ctxt.borrow, &mut inference);
             let invalid_loans = invalid_loan_set(&inference);
             if invalid_loans.is_empty() {
                 break Vec::new();
             }
 
             let to_demote: Vec<(Local, Local)> = {
-                let provenance_set = ctxt.provenances.get(&f).unwrap();
+                let provenance_set = ctxt.borrow.provenances.get(&f).unwrap();
                 let demotions =
                     collect_invalid_loan_demotions(&inference, provenance_set, &invalid_loans);
                 demotions
@@ -386,7 +459,7 @@ where
             };
 
             if to_demote.is_empty() {
-                let provenance_set = ctxt.provenances.get(&f).unwrap();
+                let provenance_set = ctxt.borrow.provenances.get(&f).unwrap();
                 break extract_witnessed_conflict_edges(
                     &inference,
                     provenance_set,
@@ -396,7 +469,7 @@ where
             }
 
             drop(inference);
-            let provenance_set = ctxt.provenances.get_mut(&f).unwrap();
+            let provenance_set = ctxt.borrow.provenances.get_mut(&f).unwrap();
             for (local, base) in to_demote {
                 provenance_set.local_data[local] = None;
                 provenance_set
@@ -406,7 +479,7 @@ where
             }
         };
 
-        let provenance_set = ctxt.provenances.get(&f).unwrap();
+        let provenance_set = ctxt.borrow.provenances.get(&f).unwrap();
         assert!(
             provenance_set
                 .local_data
@@ -433,4 +506,97 @@ where
         }
     }
     out
+}
+
+#[cfg(test)]
+mod nb5o_tests {
+    use rustc_hir::{ItemKind, OwnerNode};
+    use rustc_middle::ty::TyCtxt;
+
+    use super::*;
+
+    fn program(tcx: TyCtxt<'_>) -> RustProgram<'_> {
+        let mut functions = vec![];
+        let mut structs = vec![];
+        for owner in tcx.hir_crate(()).owners.iter() {
+            let Some(owner) = owner.as_owner() else {
+                continue;
+            };
+            let OwnerNode::Item(item) = owner.node() else {
+                continue;
+            };
+            match item.kind {
+                ItemKind::Fn { .. } => functions.push(item.owner_id.def_id),
+                ItemKind::Struct(..) => structs.push(item.owner_id.def_id),
+                _ => {}
+            }
+        }
+        RustProgram {
+            tcx,
+            functions,
+            structs,
+        }
+    }
+
+    fn canonical(
+        edges: FxHashMap<LocalDefId, Vec<ConflictEdge>>,
+    ) -> Vec<(String, Vec<(String, Vec<String>)>)> {
+        let mut out = edges
+            .into_iter()
+            .map(|(f, edges)| {
+                let mut edges = edges
+                    .into_iter()
+                    .map(|edge| {
+                        let mut requirers = edge
+                            .requirers
+                            .into_iter()
+                            .map(|owner| format!("{owner:?}"))
+                            .collect::<Vec<_>>();
+                        requirers.sort();
+                        (format!("{:?}", edge.issuer), requirers)
+                    })
+                    .collect::<Vec<_>>();
+                edges.sort();
+                (f.local_def_index.index().to_string(), edges)
+            })
+            .collect::<Vec<_>>();
+        out.sort();
+        out
+    }
+
+    #[test]
+    fn nb5o_native_replay_matches_wrapped_edges() {
+        let code = r#"
+            #[inline(never)]
+            unsafe fn id(p: *mut i32) -> *mut i32 { p }
+            unsafe fn f(p: *mut i32) -> i32 {
+                let mut cell = 0;
+                let a = &mut cell as *mut i32;
+                let b = &mut cell as *mut i32;
+                let q = id(p);
+                *a = 1;
+                *b = *q;
+                *a
+            }
+        "#;
+        ::utils::compilation::run_compiler_on_str(code, |tcx| {
+            let program = program(tcx);
+            let wrapped = borrow_conflicts_wrapped(
+                &program,
+                |_: LocalDefId| |_: Local| true,
+                |_: LocalDefId| |_: Local| true,
+            );
+            let native = borrow_conflicts(
+                &program,
+                |_: LocalDefId| |_: Local| true,
+                |_: LocalDefId| |_: Local| true,
+            );
+            assert!(
+                !wrapped.is_empty(),
+                "replay fixture must exercise a conflict"
+            );
+            assert_eq!(canonical(native), canonical(wrapped));
+        })
+        .unwrap();
+    }
 }
