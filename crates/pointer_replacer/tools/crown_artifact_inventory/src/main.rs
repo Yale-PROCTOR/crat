@@ -8,8 +8,8 @@ use std::{
 };
 
 use crown_artifact_inventory::{
-    analyze_json_claims, analyze_named_rust_sources, analyze_rust_source, JsonClaimCounts,
-    RustCounts,
+    analyze_json_claims, analyze_named_rust_sources, analyze_rust_source,
+    parse_official_evaluation, JsonClaimCounts, OfficialEvaluation, RustCounts,
 };
 
 const CODE_CSV: &str = "2026-07-27-crown-code-counts.csv";
@@ -17,16 +17,6 @@ const SITE_CSV: &str = "2026-07-27-crown-site-conversion-rates.csv";
 const JSON_CSV: &str = "2026-07-27-crown-json-claims.csv";
 const PAPER_CSV: &str = "2026-07-27-crown-paper-declaration-consistency.csv";
 const OFFICIAL_CSV: &str = "2026-07-27-crown-official-metric-consistency.csv";
-
-#[derive(Clone)]
-struct OfficialEvaluation {
-    declaration_before: u64,
-    declaration_after: u64,
-    declaration_rate: String,
-    usage_before: u64,
-    usage_after: u64,
-    usage_rate: String,
-}
 
 struct ProgramInventory {
     name: String,
@@ -54,7 +44,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let original_names = program_names(&original_root)?;
     let transformed_names = program_names(&transformed_root)?;
-    let official = parse_official_evaluation(&transformed_root.join("evaluation.tsv"))?;
+    let official = parse_official_evaluation(&fs::read_to_string(
+        transformed_root.join("evaluation.tsv"),
+    )?)
+    .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
     if original_names != transformed_names {
         return Err(format!(
             "program directory mismatch: original_only={:?}, transformed_only={:?}",
@@ -172,106 +165,6 @@ fn inventory_program(
         missing_json,
         official,
     })
-}
-
-fn parse_official_evaluation(path: &Path) -> io::Result<BTreeMap<String, OfficialEvaluation>> {
-    const HEADER: &str =
-        "Benchmark Name,#Unsafe Mutable Non-Array Pointers,,,#Unsafe Mutable Non-Array Usages,,";
-    let source = fs::read_to_string(path)?;
-    let mut lines = source.lines();
-    if lines.next() != Some(HEADER) {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "evaluation.tsv: unexpected header",
-        ));
-    }
-    let mut rows = BTreeMap::new();
-    for (index, line) in lines.enumerate() {
-        let values: Vec<_> = line.split(',').collect();
-        if values.len() != 7 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("evaluation.tsv:{}: expected 7 columns", index + 2),
-            ));
-        }
-        let parse_count = |column: usize| -> io::Result<u64> {
-            values[column].parse().map_err(|_| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!(
-                        "evaluation.tsv:{}: column {} must be a non-negative integer",
-                        index + 2,
-                        column + 1
-                    ),
-                )
-            })
-        };
-        let row = OfficialEvaluation {
-            declaration_before: parse_count(1)?,
-            declaration_after: parse_count(2)?,
-            declaration_rate: values[3].to_owned(),
-            usage_before: parse_count(4)?,
-            usage_after: parse_count(5)?,
-            usage_rate: values[6].to_owned(),
-        };
-        validate_official_rate(
-            index + 2,
-            "declaration",
-            row.declaration_before,
-            row.declaration_after,
-            &row.declaration_rate,
-        )?;
-        validate_official_rate(
-            index + 2,
-            "usage",
-            row.usage_before,
-            row.usage_after,
-            &row.usage_rate,
-        )?;
-        if rows.insert(values[0].to_owned(), row).is_some() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "evaluation.tsv:{}: duplicate program {}",
-                    index + 2,
-                    values[0]
-                ),
-            ));
-        }
-    }
-    let before: u64 = rows.values().map(|row| row.declaration_before).sum();
-    let after: u64 = rows.values().map(|row| row.declaration_after).sum();
-    if (before, after) != (2_414, 1_711) {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("evaluation.tsv: declaration totals must be 2414/1711, got {before}/{after}"),
-        ));
-    }
-    Ok(rows)
-}
-
-fn validate_official_rate(
-    line: usize,
-    metric: &str,
-    before: u64,
-    after: u64,
-    actual: &str,
-) -> io::Result<()> {
-    let expected = if before == 0 {
-        "NaN%".to_owned()
-    } else {
-        format!(
-            "{:.1}%",
-            (before.saturating_sub(after)) as f64 * 100.0 / before as f64
-        )
-    };
-    if actual != expected {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("evaluation.tsv:{line}: {metric} rate {actual} does not match {expected}"),
-        ));
-    }
-    Ok(())
 }
 
 fn inventory_rust_files(

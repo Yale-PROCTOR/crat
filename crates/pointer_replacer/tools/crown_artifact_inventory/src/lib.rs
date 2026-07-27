@@ -216,6 +216,103 @@ pub struct JsonClaimCounts {
     pub max_depth: usize,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OfficialEvaluation {
+    pub declaration_before: u64,
+    pub declaration_after: u64,
+    pub declaration_rate: String,
+    pub usage_before: u64,
+    pub usage_after: u64,
+    pub usage_rate: String,
+}
+
+pub fn parse_official_evaluation(
+    source: &str,
+) -> Result<BTreeMap<String, OfficialEvaluation>, String> {
+    const HEADER: &str =
+        "Benchmark Name,#Unsafe Mutable Non-Array Pointers,,,#Unsafe Mutable Non-Array Usages,,";
+    let mut lines = source.lines();
+    if lines.next() != Some(HEADER) {
+        return Err("evaluation.tsv: unexpected header".to_owned());
+    }
+    let mut rows = BTreeMap::new();
+    for (index, line) in lines.enumerate() {
+        let values: Vec<_> = line.split(',').collect();
+        if values.len() != 7 {
+            return Err(format!("evaluation.tsv:{}: expected 7 columns", index + 2));
+        }
+        let parse_count = |column: usize| -> Result<u64, String> {
+            values[column].parse().map_err(|_| {
+                format!(
+                    "evaluation.tsv:{}: column {} must be a non-negative integer",
+                    index + 2,
+                    column + 1
+                )
+            })
+        };
+        let row = OfficialEvaluation {
+            declaration_before: parse_count(1)?,
+            declaration_after: parse_count(2)?,
+            declaration_rate: values[3].to_owned(),
+            usage_before: parse_count(4)?,
+            usage_after: parse_count(5)?,
+            usage_rate: values[6].to_owned(),
+        };
+        validate_official_rate(
+            index + 2,
+            "declaration",
+            row.declaration_before,
+            row.declaration_after,
+            &row.declaration_rate,
+        )?;
+        validate_official_rate(
+            index + 2,
+            "usage",
+            row.usage_before,
+            row.usage_after,
+            &row.usage_rate,
+        )?;
+        if rows.insert(values[0].to_owned(), row).is_some() {
+            return Err(format!(
+                "evaluation.tsv:{}: duplicate program {}",
+                index + 2,
+                values[0]
+            ));
+        }
+    }
+    let before: u64 = rows.values().map(|row| row.declaration_before).sum();
+    let after: u64 = rows.values().map(|row| row.declaration_after).sum();
+    if (before, after) != (2_414, 1_711) {
+        return Err(format!(
+            "evaluation.tsv: declaration totals must be 2414/1711, got {before}/{after}"
+        ));
+    }
+    Ok(rows)
+}
+
+fn validate_official_rate(
+    line: usize,
+    metric: &str,
+    before: u64,
+    after: u64,
+    actual: &str,
+) -> Result<(), String> {
+    let expected = if before == 0 {
+        "NaN%".to_owned()
+    } else {
+        format!(
+            "{:.1}%",
+            (before.saturating_sub(after)) as f64 * 100.0 / before as f64
+        )
+    };
+    if actual != expected {
+        return Err(format!(
+            "evaluation.tsv:{line}: {metric} rate {actual} does not match {expected}"
+        ));
+    }
+    Ok(())
+}
+
 pub fn analyze_rust_source(source: &str) -> Result<RustCounts, syn::Error> {
     analyze_rust_sources(&[source])
 }
@@ -1399,5 +1496,23 @@ mod tests {
         let error = error.to_string();
         assert!(error.contains("statistics.json"));
         assert!(error.contains("num_owning_ptrs_detected"));
+    }
+
+    #[test]
+    fn parses_the_official_evaluation_contract_without_redefining_it() {
+        let source = "\
+Benchmark Name,#Unsafe Mutable Non-Array Pointers,,,#Unsafe Mutable Non-Array Usages,,
+small,1000,500,50.0%,10,5,50.0%
+large,1414,1211,14.4%,0,0,NaN%
+";
+
+        let rows = parse_official_evaluation(source).expect("official evaluation");
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows["small"].declaration_before, 1000);
+        assert_eq!(rows["small"].declaration_after, 500);
+        assert_eq!(rows["large"].declaration_before, 1414);
+        assert_eq!(rows["large"].declaration_after, 1211);
+        assert_eq!(rows["small"].usage_before, 10);
+        assert_eq!(rows["small"].usage_after, 5);
     }
 }
