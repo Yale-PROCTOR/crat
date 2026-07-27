@@ -3383,8 +3383,9 @@ mod run {
         borrow_ownership::{
             CrateCtxt, SafeMonoMode, SlotKind,
             borrow_verify::{
-                RepairMode, model_accepts, slotref_key, verify_to_fixpoint,
-                verify_to_fixpoint_counting, with_capture, with_mode_a_commit_trace,
+                RepairMode, model_accepts_with_flows, slotref_key,
+                verify_to_fixpoint_counting_with_flows, verify_to_fixpoint_with_flows, with_capture,
+                with_mode_a_commit_trace,
             },
             coherence::{add_coherence, constrain_field_ownership, field_ownership_candidates},
             crate_slots::CrateSlots,
@@ -3546,6 +3547,7 @@ mod run {
     fn solve_with_demotion(
         program: &crate::utils::rustc::RustProgram,
         slots: &CrateSlots,
+        origin_flows: &crate::analyses::borrow_ownership::origin_flow::OriginFlowResults,
         demote: &[SlotRef],
         mut_facts: &MutFacts,
     ) -> Option<FxHashMap<SlotRef, SlotKind>> {
@@ -3564,7 +3566,14 @@ mod run {
                 .borrow();
             add_coherence(&solver, slots, g, &body);
         }
-        verify_to_fixpoint(program, slots, &solver, &selectors, mut_facts)
+        verify_to_fixpoint_with_flows(
+            program,
+            slots,
+            origin_flows,
+            &solver,
+            &selectors,
+            mut_facts,
+        )
     }
 
     /// Measure the collateral. Returns a status-tagged struct (never panics on decline — Codex F2a).
@@ -3624,7 +3633,13 @@ mod run {
         }
         // Real FULL solve — for the like-with-like delta AND the anchor (both solves are REAL, so the
         // collateral is not confounded by an impl difference; F2b anchors real FULL to run_bo's model).
-        let Some(full_model) = solve_with_demotion(program, slots, &full_vec, mut_facts) else {
+        let Some(full_model) = solve_with_demotion(
+            program,
+            slots,
+            origins.native_flows(),
+            &full_vec,
+            mut_facts,
+        ) else {
             return build("real-decline", None, None, 0, 0, 0, 0);
         };
         let (nref_full, nref_d0_full) = count_refs(&full_model, slots);
@@ -3634,7 +3649,14 @@ mod run {
                 .copied()
                 .filter(|s| !exclude.contains(s))
                 .collect();
-            solve_with_demotion(program, slots, &v, mut_facts).map(|m| count_refs(&m, slots))
+            solve_with_demotion(
+                program,
+                slots,
+                origins.native_flows(),
+                &v,
+                mut_facts,
+            )
+            .map(|m| count_refs(&m, slots))
         };
         let Some((nref_mu, nref_d0_mu)) = minus(&upper_set) else {
             return build(
@@ -3727,6 +3749,7 @@ mod run {
     fn probe_accepts_with_ref(
         program: &crate::utils::rustc::RustProgram,
         slots: &CrateSlots,
+        origin_flows: &crate::analyses::borrow_ownership::origin_flow::OriginFlowResults,
         base: &KindSolver,
         selectors: &Selectors,
         is_mutable: impl MutProvider + Copy,
@@ -3740,7 +3763,13 @@ mod run {
         let verdict = match base.model_kinds_relaxing(selectors) {
             Some(model) => {
                 model.get(&target) == Some(&SlotKind::Ref)
-                    && model_accepts(program, slots, &model, is_mutable)
+                    && model_accepts_with_flows(
+                        program,
+                        slots,
+                        origin_flows,
+                        &model,
+                        is_mutable,
+                    )
             }
             // UNSAT even without `target` ⇒ `target` is not the reason it declines; NOT removable.
             None => false,
@@ -3772,6 +3801,7 @@ mod run {
         if probe_accepts_with_ref(
             program,
             slots,
+            origins.native_flows(),
             &base,
             &selectors,
             is_mutable,
@@ -3936,7 +3966,13 @@ mod run {
             return;
         };
         assert!(
-            model_accepts(program, slots, model, is_mutable),
+            model_accepts_with_flows(
+                program,
+                slots,
+                origins.native_flows(),
+                model,
+                is_mutable,
+            ),
             "necessity audit: the anchor's accepted model must satisfy model_accepts (drift STOP)"
         );
         let (anchor_nref, anchor_nref_d0) = count_refs(model, slots);
@@ -3984,6 +4020,7 @@ mod run {
                 if probe_accepts_with_ref(
                     program,
                     slots,
+                    origins.native_flows(),
                     &base,
                     &selectors,
                     is_mutable,
@@ -4010,6 +4047,7 @@ mod run {
             if probe_accepts_with_ref(
                 program,
                 slots,
+                origins.native_flows(),
                 &base,
                 &selectors,
                 is_mutable,
@@ -4041,7 +4079,13 @@ mod run {
         let witnessed = match base.model_kinds_relaxing(&selectors) {
             // Removed slots are hard-pinned `Ref`, so a SAT model has them all `Ref` by construction;
             // only acceptance remains to check.
-            Some(m) => model_accepts(program, slots, &m, is_mutable),
+            Some(m) => model_accepts_with_flows(
+                program,
+                slots,
+                origins.native_flows(),
+                &m,
+                is_mutable,
+            ),
             // UNSAT under the pins ⇒ the removed set is NOT jointly `Ref`-recoverable (unless empty).
             None => removed.is_empty(),
         };
@@ -4164,7 +4208,13 @@ mod run {
             "certified-context witness violated a hard Ref pin"
         );
         assert!(
-            model_accepts(program, slots, &witness, is_mutable),
+            model_accepts_with_flows(
+                program,
+                slots,
+                origins.native_flows(),
+                &witness,
+                is_mutable,
+            ),
             "certified-context hard-pinned witness must pass audit acceptance"
         );
 
@@ -4908,19 +4958,16 @@ mod run {
         row.set("fn_count", program.functions.len());
         row.set("struct_count", program.structs.len());
 
-        // §NB3-3c-i: signature-origin summaries — computed ONCE per program here, kind-independent,
-        // and NOT yet injected into the borrow replay (compute-only; fork == production preserved).
-        // This is the single driver call site the runs-once invariant (`ORIGIN_WRAP_COUNT`) pins;
-        // 3c-ii threads `_origins` into the replay's subset input. `t_origins_s` is reported so the
-        // sweep can watch origin-derivation cost (brotli specifically — plan §3d numeric stop).
+        // NB5-O: derive BO-native signature summaries and body flows ONCE per program,
+        // kind-independent. The summaries feed candidacy while the retained body flows feed the
+        // native replay seam. `ORIGIN_DERIVATION_COUNT` pins this actual full-program fixpoint
+        // boundary. `t_origins_s` keeps the existing brotli cost watch.
         let t = Instant::now();
         let origins = compute_origins(&program);
         row.set("t_origins_s", secs(t.elapsed()));
-        // §NB3-3c-i brotli-scale stop instrumentation (plan §3d). `origin_slots` IS the origin-count
-        // metric for the stop (≤ ~10× signature slots): at 3c-i origins reuse `lifetime_flow`'s
-        // signature slots 1:1, so origin_slots == the signature-slot count (ratio 1.0). `subset_edges`
-        // reports the transitive-closure size (the real space concern at brotli scale). Both are
-        // read-only over the still-UNINJECTED summaries — no effect on the replay / n_ref.
+        // Brotli-scale stop instrumentation. `origin_slots` is the BO-native signature-slot count;
+        // `subset_edges` reports the transitively closed summary relation (the main retained-space
+        // concern).
         row.set(
             "origin_slots",
             origins.values().map(|s| s.slots.len()).sum::<usize>(),
@@ -5067,9 +5114,8 @@ mod run {
             return row;
         }
 
-        // §NB4-4c: `origins` is now THREADED into `emit_crate_ownership_constraints` below (F3) —
-        // computed ONCE here (the `ORIGIN_WRAP_COUNT` runs-once site), passed by reference. No longer
-        // the pre-4c uninjected `_origins`.
+        // The same `origins` value is threaded into both constraint emission and replay below;
+        // neither consumer reruns the native derivation.
 
         // §NB3-3c-i measurement seam: origins-only mode returns before the fixpoint solve, so the
         // origin-derivation cost (t_origins) and size (origin_slots/origin_subset_edges) can be
@@ -5214,7 +5260,14 @@ mod run {
         let ((model, rstats), captured) = if selector_core_capture {
             let ((model_and_stats, commit_trace), selector_trace) = with_selector_trace(|| {
                 with_mode_a_commit_trace(|| {
-                    verify_to_fixpoint_counting(&program, &slots, &solver, &selectors, &mut_facts)
+                    verify_to_fixpoint_counting_with_flows(
+                        &program,
+                        &slots,
+                        origins.native_flows(),
+                        &solver,
+                        &selectors,
+                        &mut_facts,
+                    )
                 })
             });
             let trace_path = std::env::var("CRAT_BOC1_SELECTOR_TRACE")
@@ -5233,12 +5286,26 @@ mod run {
             (model_and_stats, None)
         } else if audit || certified_context {
             let (mr, events) = with_capture(|| {
-                verify_to_fixpoint_counting(&program, &slots, &solver, &selectors, &mut_facts)
+                verify_to_fixpoint_counting_with_flows(
+                    &program,
+                    &slots,
+                    origins.native_flows(),
+                    &solver,
+                    &selectors,
+                    &mut_facts,
+                )
             });
             (mr, Some(events))
         } else {
             (
-                verify_to_fixpoint_counting(&program, &slots, &solver, &selectors, &mut_facts),
+                verify_to_fixpoint_counting_with_flows(
+                    &program,
+                    &slots,
+                    origins.native_flows(),
+                    &solver,
+                    &selectors,
+                    &mut_facts,
+                ),
                 None,
             )
         };
@@ -5526,8 +5593,13 @@ mod run {
                         }
                         // §NB2: same oracle as run_bo's native solve above, so the fidelity check
                         // compares like with like (shipped facts vs a fresh real solve).
-                        Some(verify_to_fixpoint(
-                            &program, &slots, &solver, &selectors, &mut_facts,
+                        Some(verify_to_fixpoint_with_flows(
+                            &program,
+                            &slots,
+                            origins.native_flows(),
+                            &solver,
+                            &selectors,
+                            &mut_facts,
                         ))
                     }
                     Err(_) => None,
@@ -5884,20 +5956,21 @@ mod run {
     }
 
     /// §NB3-3c-i runs-once invariant: the driver (`run_bo`) computes signature origins EXACTLY ONCE
-    /// per program, kind-independent. `ORIGIN_WRAP_COUNT` is thread-local, so this before/after delta
+    /// per program, kind-independent. `ORIGIN_DERIVATION_COUNT` is thread-local, so this before/after
+    /// delta
     /// around a single `run_bo` call — all on one compiler-callback thread — is race-free under the
     /// suite's parallel (thread-local rustc-session) test execution. Guards against a future refactor
     /// that recomputes origins per-kind / per-fn / per-query (which would push the delta above 1).
     #[test]
     fn origins_runs_once_per_program() {
-        use crate::analyses::borrow_ownership::origins::ORIGIN_WRAP_COUNT;
+        use crate::analyses::borrow_ownership::origin_flow::ORIGIN_DERIVATION_COUNT;
         ::utils::compilation::run_compiler_on_str(
             "unsafe fn id(p: *mut i32) -> *mut i32 { p }\n\
              unsafe fn f(p: *mut i32) -> *mut i32 { id(p) }",
             |tcx| {
-                let before = ORIGIN_WRAP_COUNT.with(|c| c.get());
+                let before = ORIGIN_DERIVATION_COUNT.with(|c| c.get());
                 let _row = run_bo(tcx, Duration::ZERO);
-                let delta = ORIGIN_WRAP_COUNT.with(|c| c.get()) - before;
+                let delta = ORIGIN_DERIVATION_COUNT.with(|c| c.get()) - before;
                 assert_eq!(
                     delta, 1,
                     "compute_origins must run exactly once per program on the analysis path \
@@ -10528,7 +10601,9 @@ fn nb5l2_anchor<'tcx>(
 ) {
     use crate::analyses::borrow_ownership::{
         CrateCtxt,
-        borrow_verify::{self, RepairMode, verify_to_fixpoint_counting},
+        borrow_verify::{
+            self, RepairMode, model_accepts_with_flows, verify_to_fixpoint_counting_with_flows,
+        },
         coherence::add_coherence,
         crate_slots::CrateSlots,
         emit_crate_ownership_constraints,
@@ -10548,13 +10623,26 @@ fn nb5l2_anchor<'tcx>(
     }
     let ((model, _stats), events) = RepairMode::with_override(RepairMode::ModeA, || {
         borrow_verify::with_capture(|| {
-            verify_to_fixpoint_counting(&program, &slots, &solver, &sel, true)
+            verify_to_fixpoint_counting_with_flows(
+                &program,
+                &slots,
+                origins.native_flows(),
+                &solver,
+                &sel,
+                true,
+            )
         })
     });
     let model = model.expect("fixture must accept under Mode-A");
     // FULL-anchor anti-drift: the accepted model must satisfy model_accepts.
     assert!(
-        borrow_verify::model_accepts(&program, &slots, &model, true),
+        model_accepts_with_flows(
+            &program,
+            &slots,
+            origins.native_flows(),
+            &model,
+            true,
+        ),
         "anchor's accepted model must satisfy model_accepts (drift check)"
     );
     (program, slots, origins, model, events)
@@ -10588,6 +10676,9 @@ fn nb5l2_probe_necessary_and_injected_overpin() {
                 unsafe fn f(p: *mut i32) -> i32 { let x = id(p); *x = 1; let b = p; *b = 2; *x }";
     ::utils::compilation::run_compiler_on_str(code, |tcx| {
         let (program, slots, origins, model, events) = nb5l2_anchor(tcx);
+        let before =
+            crate::analyses::borrow_ownership::origin_flow::ORIGIN_DERIVATION_COUNT
+                .with(|count| count.get());
         let commit_set = nb5l2_distinct(&events);
         assert!(!commit_set.is_empty(), "cascade must yield >=1 Mode-A commit");
         // NECESSARY arm: singleton probe of any real commit → empty leave-one-out → conflict returns.
@@ -10617,6 +10708,13 @@ fn nb5l2_probe_necessary_and_injected_overpin() {
             ),
             "a spurious ¬ref on a surviving Ref slot must probe OVER-PIN (dropping it still accepts, \
              slot Ref)"
+        );
+        let after =
+            crate::analyses::borrow_ownership::origin_flow::ORIGIN_DERIVATION_COUNT
+                .with(|count| count.get());
+        assert_eq!(
+            after, before,
+            "necessity probes must reuse the anchor's retained origin flows"
         );
     })
     .unwrap_or_else(|e| e.raise())
