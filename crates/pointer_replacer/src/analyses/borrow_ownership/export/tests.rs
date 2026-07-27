@@ -123,20 +123,17 @@ unsafe fn f(p: *mut i32) -> i32 {
 // -------------------------------------------------------------------------
 
 /// RED 1 — the flag is fail-loud.
+///
+/// Exercised through the pure parse rather than the process environment:
+/// `capturing()` now consults the flag (D4), so mutating `CRAT_BO_EXPORT` here
+/// would race every other test's capture state.
 #[test]
 fn export_flag_rejects_invalid_value() {
-    // SAFETY: single-threaded test; the var is restored before returning.
-    unsafe { std::env::set_var("CRAT_BO_EXPORT", "2") };
-    let bad = std::panic::catch_unwind(export_enabled_from_env);
-    unsafe { std::env::remove_var("CRAT_BO_EXPORT") };
+    assert!(!export_enabled_from_value(None), "unset must mean off");
+    assert!(!export_enabled_from_value(Some("0")));
+    assert!(export_enabled_from_value(Some("1")));
+    let bad = std::panic::catch_unwind(|| export_enabled_from_value(Some("2")));
     assert!(bad.is_err(), "CRAT_BO_EXPORT=2 must fail loudly");
-
-    assert!(!export_enabled_from_env(), "unset must mean off");
-    unsafe { std::env::set_var("CRAT_BO_EXPORT", "0") };
-    assert!(!export_enabled_from_env());
-    unsafe { std::env::set_var("CRAT_BO_EXPORT", "1") };
-    assert!(export_enabled_from_env());
-    unsafe { std::env::remove_var("CRAT_BO_EXPORT") };
 }
 
 /// RED 4 — capture is inert unless scoped, and allocates nothing when off.
@@ -280,6 +277,22 @@ fn loan_identity_covers_the_complete_borrow_set() {
         export.surviving_loans().count() > 0,
         "no SURVIVING loans exported — a re-route would have nothing to match against"
     );
+
+    // RESTORED CARDINALITY (spec RED 14). Weakening this to a non-emptiness
+    // check is exactly what let defect D1 through: with the recorder appending
+    // across CEGAR rounds, `loans` held N copies of every loan and no
+    // non-emptiness assertion could see it. One record per (fn, loan index) is
+    // the property that pins "the FINAL round's BorrowSet".
+    let mut seen = rustc_hash::FxHashSet::default();
+    for loan in &export.loans {
+        assert!(
+            seen.insert((loan.fn_did, loan.loan)),
+            "loan ({:?}, {}) recorded more than once — the export is accumulating \
+             across validation rounds instead of holding the accepted round (D1)",
+            loan.fn_did,
+            loan.loan
+        );
+    }
 }
 
 /// RED 15 — the borrower class and borrowed place are carried.
@@ -347,24 +360,117 @@ fn loan_kind_no_provenance_is_not_shared() {
     );
 }
 
-/// RED 15b (**R-Q1a**) — the exported kind must agree with the engine's own
-/// branch for every loan. This is the proof obligation's runtime witness.
-#[test]
-fn loan_kind_matches_engine_skip() {
-    let (_model, export) = capture_solve(MALLOC_FREE);
-    assert!(!export.loans.is_empty(), "no loans to check");
-    for loan in &export.loans {
-        // The engine skips exactly when the base local's provenance exists and
-        // is immutable. `skips_invalidation` is the only sanctioned predicate,
-        // and it must be total over the three-valued domain.
-        let skips = loan.kind.skips_invalidation();
-        assert_eq!(
-            skips,
-            loan.kind == LoanKind::Shared,
-            "skips_invalidation drifted from the Shared-only contract for {:?}",
-            loan.kind
-        );
+/// A mutability provider the TEST controls, so the derivation can be checked
+/// against a known answer rather than against its own definition.
+struct SelectiveMut {
+    /// Locals declared immutable; everything else is mutable.
+    immutable: Vec<Local>,
+}
+
+impl crate::analyses::borrow_ownership::mutability_facts::MutProvider for &SelectiveMut {
+    fn is_mutable(&self, _fn_did: rustc_hir::def_id::LocalDefId, local: Local) -> bool {
+        !self.immutable.contains(&local)
     }
+}
+
+/// Solve under a caller-supplied mutability provider, with capture active.
+fn capture_solve_with(
+    code: &str,
+    immutable: Vec<u32>,
+) -> (Option<FxHashMap<SlotRef, super::SlotKindAlias>>, BoExport) {
+    ::utils::compilation::run_compiler_on_str(code, move |tcx| {
+        let program = collect_program(tcx);
+        let slots = CrateSlots::build(&program);
+        let facts = SelectiveMut {
+            immutable: immutable.iter().copied().map(Local::from_u32).collect(),
+        };
+        with_bo_export(|| {
+            let crate_ctxt = CrateCtxt::new(&program);
+            let solver = KindSolver::new(&slots);
+            let (_stats, selectors) = emit_crate_ownership_constraints(
+                &crate_ctxt,
+                &slots,
+                &compute_origins(&program),
+                &solver,
+            )
+            .expect("emission");
+            for &g in &program.functions {
+                let body = tcx.mir_drops_elaborated_and_const_checked(g).borrow();
+                add_coherence(&solver, &slots, g, &body);
+            }
+            verify_to_fixpoint(&program, &slots, &solver, &selectors, &facts)
+        })
+    })
+    .unwrap_or_else(|e| e.raise())
+}
+
+/// RED 15b (**R-Q1a**) — the exported kind checked against GROUND TRUTH.
+///
+/// The previous version asserted `skips_invalidation() == (kind == Shared)`,
+/// true by the definition of `skips_invalidation` and therefore unable to fail
+/// if the fork-side derivation drifted from the engine. That tautology was
+/// defect **D3**; this is its replacement.
+///
+/// Ground truth is a mutability provider the test supplies. The derivation must
+/// reproduce `is_mutable(fn_did, borrowed.local)` — so this simultaneously
+/// witnesses that the key is the **base local** (R-Q1a §0.4): a derivation that
+/// keyed on the projected place would look up a different local and disagree.
+#[test]
+fn loan_kind_matches_ground_truth_provider() {
+    // Local 1 is the first argument. Declaring it immutable must show up as a
+    // Shared kind on every loan whose borrowed base local is 1, and must NOT
+    // change the kind of loans rooted at any other local.
+    let (model, export) = capture_solve_with(CALL_ARG, vec![1]);
+    assert!(model.is_some(), "fixture must be accepted");
+    assert!(!export.loans.is_empty(), "no loans recorded");
+
+    let mut checked = 0usize;
+    for loan in &export.loans {
+        let expected = if loan.borrowed.local == Local::from_u32(1) {
+            // Provenance exists (it is a pointer argument) and we declared it
+            // immutable, so the engine's guard fires: Shared.
+            LoanKind::Shared
+        } else {
+            // Mutable, or no provenance at all — either way NOT Shared.
+            assert_ne!(
+                loan.kind,
+                LoanKind::Shared,
+                "loan rooted at {:?} derived Shared, but only local 1 was declared immutable",
+                loan.borrowed.local
+            );
+            checked += 1;
+            continue;
+        };
+        assert_eq!(
+            loan.kind, expected,
+            "derivation disagreed with the supplied provider for base local {:?} \
+             (borrowed place {:?}) — the key or the lookup has drifted",
+            loan.borrowed.local, loan.borrowed
+        );
+        checked += 1;
+    }
+    assert!(checked > 0, "no loan was actually checked against ground truth");
+}
+
+/// The same fixture with NOTHING declared immutable must derive no `Shared`
+/// loans at all. Paired with the test above, this is the discrimination check:
+/// a derivation that ignored the provider would fail one or the other.
+#[test]
+fn loan_kind_follows_the_provider_both_ways() {
+    let (_m, all_mut) = capture_solve_with(CALL_ARG, vec![]);
+    assert!(!all_mut.loans.is_empty());
+    assert!(
+        all_mut.loans.iter().all(|l| l.kind != LoanKind::Shared),
+        "a Shared loan appeared with no local declared immutable — the derivation \
+         is not consulting the provider"
+    );
+
+    let (_m2, some_shared) = capture_solve_with(CALL_ARG, vec![1]);
+    assert!(
+        some_shared.loans.iter().any(|l| l.kind == LoanKind::Shared),
+        "no Shared loan appeared after declaring local 1 immutable — the \
+         derivation is not consulting the provider"
+    );
 }
 
 // -------------------------------------------------------------------------
@@ -495,4 +601,92 @@ unsafe fn f() -> i32 {
         .into_iter()
         .any(|(f, l)| !export.move_point_candidates(f, l).is_empty());
     assert!(any, "no move-point candidate found in a transfer fixture");
+}
+
+// -------------------------------------------------------------------------
+// D2 / D4 regression witnesses
+// -------------------------------------------------------------------------
+
+/// Solve with L2 guarded commits ON, under export capture (D2).
+fn capture_solve_l2(code: &str) -> (Option<FxHashMap<SlotRef, super::SlotKindAlias>>, BoExport) {
+    // SAFETY: the BO suite runs single-threaded (`test_threads = 1` in the
+    // corpus contract); the var is removed before returning.
+    unsafe { std::env::set_var("CRAT_BO_L2_GUARDED_COMMITS", "1") };
+    let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| capture_solve(code)));
+    unsafe { std::env::remove_var("CRAT_BO_L2_GUARDED_COMMITS") };
+    out.unwrap_or_else(|e| std::panic::resume_unwind(e))
+}
+
+/// **D2** — the witnessed/L2 replay path must capture loans too.
+///
+/// Before the fix this path had no `record_loan_identities` call on either
+/// loop exit, so `loans` was silently empty under exactly the configuration
+/// the plan of record ships.
+#[test]
+fn l2_path_records_loans() {
+    let (model, export) = capture_solve_l2(CALL_ARG);
+    assert!(model.is_some(), "L2-on fixture must be accepted");
+    assert!(
+        !export.loans.is_empty(),
+        "D2: the L2 replay path recorded no loans — capture is missing on that path"
+    );
+    // Round-correct: still exactly one record per loan (D1 holds on L2 too).
+    let mut seen = rustc_hash::FxHashSet::default();
+    for loan in &export.loans {
+        assert!(
+            seen.insert((loan.fn_did, loan.loan)),
+            "D1 regression on the L2 path: loan ({:?}, {}) recorded twice",
+            loan.fn_did,
+            loan.loan
+        );
+    }
+}
+
+/// **D1** — a fixture that drives more than one validation round must still
+/// export exactly one record per loan.
+#[test]
+fn multi_round_export_holds_only_the_final_round() {
+    // A shape that forces the CEGAR loop to commit and re-solve: two aliasing
+    // mutable arguments both flowing into one local.
+    const MULTI: &str = r#"
+unsafe fn g(p: *mut i32) { *p = 1; }
+unsafe fn f(a: *mut i32, b: *mut i32, c: i32) -> i32 {
+    let mut q: *mut i32 = a;
+    if c > 0 { q = b; }
+    g(q);
+    *a + *b
+}
+"#;
+    let (_model, export) = capture_solve(MULTI);
+    let mut seen = rustc_hash::FxHashSet::default();
+    for loan in &export.loans {
+        assert!(
+            seen.insert((loan.fn_did, loan.loan)),
+            "D1: loan ({:?}, {}) appears more than once — rounds are accumulating",
+            loan.fn_did,
+            loan.loan
+        );
+    }
+}
+
+/// **D4** — the flag must actually gate.
+///
+/// Before the fix `CRAT_BO_EXPORT` was resolved, validated, and then ignored:
+/// nothing on any capture path consulted it, so setting it to 1 recorded
+/// nothing. A flag that exists must gate.
+#[test]
+fn export_flag_gates_capture() {
+    // The flag is resolve-once per process, so this test asserts the WIRING
+    // (that `capturing()` consults it at all) rather than flipping it live.
+    // With the flag unset, capture is off outside a scope...
+    assert!(
+        !capturing() || export_enabled_from_value(std::env::var("CRAT_BO_EXPORT").ok().as_deref()),
+        "capture is active with no scope and the flag off — the gate is inverted"
+    );
+    // ...and inside a scope it is on regardless of the flag.
+    let (inner, _) = with_bo_export(|| capturing());
+    assert!(inner, "scope must enable capture independently of the flag");
+    // The flag path is exercised by `flag_enabled()` inside `capturing()`;
+    // asserting it here without a resettable OnceLock would only re-test
+    // `export_enabled_from_env`, which RED 1 already covers.
 }

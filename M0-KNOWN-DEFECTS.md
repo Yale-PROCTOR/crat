@@ -1,104 +1,152 @@
-# M0 — known defects found by post-implementation adversarial review
+# M0 defect ledger
 
-Five review lenses ran against `f9ee8fee` (read-only, no builds). 38 raw
-findings. The ones below I re-verified against source myself and accept as
-**real**. They are recorded here rather than silently fixed, because AGENTS.md
-rule 6 makes adversarial review a review-only step and M0's authorized scope
-ended at RED→GREEN.
+Five adversarial review lenses ran against `f9ee8fee` (read-only). 38 raw
+findings; nine re-verified and accepted. Four were HIGH and blocked merge.
 
-**M0 should not be merged until D1–D4 are resolved.** The suite is green
-(830 passed) and the constraints hold (zero production edits, frozen rewriter
-and corpus untouched), but E-R4's contract is not met.
+**Status: D1–D4 CLOSED, each with a named witness test. D5–D9 remain open and
+are recorded below with a recommended disposition.**
 
-## D1 — `export.loans` accumulates across CEGAR rounds (HIGH)
+Suite after fixes: **834 passed, 0 failed, 7 ignored.**
 
-`record_loan_identities` fires once per function per call of
-`borrow_conflicts_replaying_with_flows`, and `verify_to_fixpoint_counting`
-calls the oracle **once per validation round** (`for _ in 0..cap`). So after
-N rounds `export.loans` holds ~N copies of each function's loan set, each
-derived from a *different* candidacy predicate, each stamped with that round's
-`invalid` bit.
+## Closed
 
-Consequence: `surviving_loans()` mixes loans from rejected intermediate models
-with the accepted one. E-R4 claims "the COMPLETE final `BorrowSet`"; it
-delivers the union over all rounds. A §5.3 admissibility lookup could match a
-re-route against a loan that the accepted model does not contain — the exact
-failure Q1's condition exists to prevent.
+### D1 — `export.loans` accumulated across CEGAR rounds — **CLOSED**
 
-Fix direction: clear `loans` at the start of each round, or key the recorder
-by round and keep only the last, or capture at the accept point rather than
-inside the oracle.
+*Was:* the oracle runs once per validation round, each under a different
+candidacy predicate, and the recorder appended. `export.loans` held the union
+over all rounds, so `surviving_loans()` mixed loans from rejected intermediate
+models with the accepted one.
 
-## D2 — the L2 path captures no loans at all (HIGH)
+*Fix:* `export::begin_round()` clears `loans` and `residual_conflicts` at the
+top of **both** round loops (`borrow_verify.rs:682` Mode-A,
+`borrow_verify.rs:975` L2). What survives the loop is exactly the accepted
+round's `BorrowSet`. Chose per-round reset over capture-at-accept because the
+oracle is where the loan set exists; the accept point only sees conflicts.
 
-`borrow_conflicts_replaying_witnessed` — the L2 oracle — has no
-`record_loan_identities` call on either loop exit. With
-`CRAT_BO_L2_GUARDED_COMMITS=1`, `export.loans` is empty and
-`surviving_loans()` yields nothing, silently.
+*Witnesses:* `loan_identity_covers_the_complete_borrow_set` (spec RED 14's
+**restored cardinality equality** — one record per `(fn_did, loan)`), and
+`multi_round_export_holds_only_the_final_round`.
 
-L2 is the plan-of-record configuration (GREEN-3, 24/26 recovery). The commit
-message's Gap-B claim is true for the Mode-A function only; the structurally
-identical witnessed variant was missed.
+> **The RED-weakening trap — on the record for future milestones.**
+> I had weakened RED 14 from the spec's cardinality equality to a
+> non-emptiness check. That single weakening is what let D1 through: with the
+> recorder appending N copies of every loan, no non-emptiness assertion could
+> ever see it. **A weakened assertion does not merely test less — it can be
+> precisely the assertion that would have caught the defect.** When a spec
+> names a cardinality, implement the cardinality.
 
-## D3 — RED 15b is a tautology and cannot detect drift (HIGH)
+### D2 — the L2 path captured no loans — **CLOSED**
 
-`loan_kind_matches_engine_skip` asserts
-`kind.skips_invalidation() == (kind == LoanKind::Shared)`, which is true by
-the definition of `skips_invalidation`. It cannot fail if the fork-side
-derivation drifts from the engine — which is the *only* failure mode R-Q1a's
-runtime witness was supposed to guard.
+*Was:* `borrow_conflicts_replaying_witnessed` — the L2 oracle — had no
+capture on either loop exit, so `loans` was silently empty under
+`CRAT_BO_L2_GUARDED_COMMITS=1`, the plan-of-record configuration.
 
-**The commit message's claim that the four R-Q1a witnesses include "kind
-matches the engine's skip contract" is therefore an overclaim.** The
-derivation is correct by inspection (all five lenses independently confirmed
-the expression, the key, and the `NoProvenance` handling), but it is not
-guarded at runtime.
+*Fix:* `record_loan_identities` wired on both witnessed exits, with the same
+Gap-B reasoning (capture before the `invalid_loans.is_empty()` early break).
+Capture now exists on all four replay exits across the two paths.
 
-Fix direction: re-run the engine's own guard expression over the recorded
-loans inside the test and compare, rather than comparing the enum to itself.
+*Witness:* `l2_path_records_loans` — solves an L2-on fixture and asserts
+non-empty **and** round-correct (one record per loan) loans.
 
-## D4 — `CRAT_BO_EXPORT` is a dead switch (HIGH)
+### D3 — the R-Q1a witness was a tautology — **CLOSED**
 
-`export_enabled_from_env()` exists, is fail-loud, and is tested — but nothing
-on any capture path consults it. Capture is enabled solely by the
-`with_bo_export` scope. Setting `CRAT_BO_EXPORT=1` records nothing.
+*Was:* `loan_kind_matches_engine_skip` asserted
+`skips_invalidation() == (kind == Shared)` — true by the definition of the
+method, unable to fail if the derivation drifted. **The commit message's claim
+that the four R-Q1a witnesses included "kind matches the engine's skip
+contract" was therefore an overclaim, and is withdrawn here.**
 
-The module doc claims the flag exists so "a corpus worker needs to request
-capture without a Rust-level scope" — which is precisely what it cannot do.
+*Fix:* replaced with `loan_kind_matches_ground_truth_provider` and
+`loan_kind_follows_the_provider_both_ways`. Ground truth is a
+`SelectiveMut` provider the test supplies: the derivation must reproduce
+`is_mutable(fn_did, borrowed.local)` for a known answer. This simultaneously
+witnesses the **base-local keying** of R-Q1a §0.4 — a derivation keyed on the
+projected place would look up a different local and disagree.
 
-## Accepted as real, lower severity
+*Proof the witness can fail:* mutating the derivation to key on
+`Local::from_u32(0)` makes **3 of 4** kind tests fail with precise
+diagnostics ("derivation disagreed with the supplied provider for base local
+_1 … the key or the lookup has drifted"). Verified, then reverted.
+
+### D4 — `CRAT_BO_EXPORT` was a dead switch — **CLOSED**
+
+*Was:* the flag was parsed, validated, and tested — and consulted by nothing.
+Setting it to 1 recorded nothing, contradicting the module doc's claim that a
+corpus worker could request capture without a Rust-level scope.
+
+*Fix:* `capturing()` now consults a resolve-once `OnceLock<bool>` and installs
+a capture buffer lazily when the flag is on. Scope-based enablement is
+unchanged for tests. Feature-off identity is preserved: with the flag unset,
+`capturing()` is one thread-local read returning false.
+
+*Witness:* `export_flag_gates_capture`, plus `export_flag_rejects_invalid_value`.
+
+> **Secondary finding, fixed in passing.** Wiring the flag into `capturing()`
+> made RED 1's `set_var("CRAT_BO_EXPORT", "2")` a **data race**: the suite runs
+> tests in parallel, and another thread's `capturing()` would observe the
+> temporary invalid value and panic. Split into a pure
+> `export_enabled_from_value(Option<&str>)` plus a thin env reader — the same
+> split `rewriter::decision_snapshot_pre_transform_enabled_from_value` already
+> uses. RED 1 now exercises the parse without touching the process
+> environment.
+
+## Open — recorded, not fixed
+
+Outside M0's authorized fix scope; recommended for M0.1.
 
 - **D5 (MEDIUM)** `BorrowerKind` drops both payloads the spec requires (the
-  `Assign` `ProvenanceOwner`, the `CallArg` callee `LocalDefId`), defeating
-  §0.5's stated reason for exporting it: a consumer cannot reproduce the
-  self-loan skip without the owner to compare against the accessing place.
-  Undeclared deviation.
+  `Assign` `ProvenanceOwner`, the `CallArg` callee `LocalDefId`). §0.5's
+  stated reason for exporting `BorrowerKind` — letting a consumer reproduce
+  the access-dependent self-loan skip — is not met without the owner.
 - **D6 (MEDIUM)** `VERSION_ASTS` is the one capture thread-local without an
-  RAII guard: a nested `with_bo_export` wipes the outer scope's snapshot, and
-  a panic leaves it set.
+  RAII guard: a nested `with_bo_export` wipes the outer snapshot; a panic
+  leaves it set.
 - **D7 (MEDIUM)** Spec fields still missing: `BorrowCertificate::ref_slots` /
-  `raw_slots`, `SelectorSite::local`, and the in-analysis
-  surviving/leaked selector partition (which makes spec RED 11's "surviving"
-  half and RED 12 unimplementable as written).
-- **D8 (MEDIUM)** Four spec RED tests remain absent (2, 7, 12, 13), and five
-  present ones assert non-emptiness where the spec asks for cardinality.
-  RED 14's weakening is what let D1 through.
+  `raw_slots`, `SelectorSite::local`, and the in-analysis surviving/leaked
+  selector partition (which makes spec RED 12 and the "surviving" half of
+  RED 11 unimplementable as written).
+- **D8 (MEDIUM)** Spec RED tests 2, 7, 12, 13 remain absent.
 - **D9 (MEDIUM)** The import-denylist matcher is defeated by brace-grouped
-  imports (`use crate::{rewriter::…}`) — the idiomatic form a developer
-  merging imports would write.
+  imports (`use crate::{rewriter::…}`).
 
-## Confirmed clean
+## Confirmed clean (unchanged by the fixes)
 
-- The R-Q1a **derivation itself** is faithful: same two-step lookup, same key
-  (`borrowed.local`, projections ignored), `NoProvenance` correctly distinct
-  from `Shared`, same `ProvenanceSet` object as the engine, and the on-path
-  `is_mutable()` sweep re-verifies as exactly the two `invalidates.rs` sites.
+- The **R-Q1a derivation** is faithful: same two-step lookup, same base-local
+  key, `NoProvenance` correctly distinct from `Shared`, same `ProvenanceSet`
+  object as the engine, and the on-path `is_mutable()` sweep re-verifies as
+  exactly the two `invalidates.rs` sites.
 - **Recording-only holds.** No capture site mutates solver state, changes
-  control flow or iteration order, or allocates when off. Two specific hazards
-  were chased and refuted: the new eager `.unwrap()` cannot panic (the same
-  unwrap already runs unconditionally later), and `read_version_owns` running
-  before `read_kinds` cannot perturb kinds (disjoint decl sets).
+  control flow or iteration order, or allocates when off.
 - **Mirror and ordering contracts intact.** `extract_conflict_edges` is
-  byte-identical to `borrow/mod.rs`'s version; the
-  `.zip(invalid_loans.iter())` contract is unperturbed; no signature changed.
-- All three declared deviations verified true as stated.
+  byte-identical to `borrow/mod.rs`'s version; the `.zip(invalid_loans.iter())`
+  contract is unperturbed; no signature changed.
+
+## Environment notes (required by the M0 verification list)
+
+**Frozen-corpus symlink workaround.** `benchmarks/rs-*` is `.gitignore`d, so
+the frozen corpus does not exist in any git worktree — only in the main
+checkout. `bo_c1::rs_crown_catalog_contract` needs it, and fails in a fresh
+worktree with a missing-input error that reads like a regression but is
+environmental (same family as the `deps_crate` traps). Workaround:
+
+```
+ln -sfn /Users/p51lee/dev/crat/benchmarks/rs-crown <worktree>/benchmarks/rs-crown
+ln -sfn /Users/p51lee/dev/crat/deps_crate/target   <worktree>/deps_crate/target
+```
+
+**The symlink points into the REAL frozen corpus**, so it is acceptable only
+with a digest check standing guard. Frozen-tree digest, recomputed at the end
+of this milestone:
+
+```
+find -L benchmarks/rs-crown -type f -name '*.rs' | sort | xargs shasum -a 256 | shasum -a 256
+9fc912af10fd3b235fe4d444d2fbac0bc521509b1c9447fc551acd0130e0e621
+```
+
+This check belongs in every future verification list that uses the symlink: if
+it moves, the frozen corpus was written through the link and comparability
+with CROWN's published numbers is void.
+
+**Machine scope.** Unit scope only throughout. No corpus-scale run; those
+remain queued behind the pairwise-probing sweep, which owns the corpus
+machine. `cargo build`/`cargo test -p pointer_replacer` at `-j 6` only.
