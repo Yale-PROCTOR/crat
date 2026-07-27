@@ -52,14 +52,39 @@ use super::{l2::MirLocationKey, solver::SlotRef, ssa::constraint::Var};
 /// Modelled on [`super::l2::enabled_from_env`], the in-tree contract for a
 /// binary switch. Callers must resolve this **once** and thread the resulting
 /// `bool`; capture points never call it themselves.
+/// Pure parse, so a test can exercise every branch without touching the
+/// process environment — the same split `rewriter::decision_snapshot_pre_
+/// transform_enabled_from_value` uses. Mutating `CRAT_BO_EXPORT` in a test is
+/// unsafe now that `capturing()` consults it: the suite runs tests in parallel
+/// and another thread's `capturing()` would observe the temporary value.
+pub(crate) fn export_enabled_from_value(value: Option<&str>) -> bool {
+    match value {
+        None | Some("0") => false,
+        Some("1") => true,
+        Some(other) => panic!("CRAT_BO_EXPORT must be 0 or 1, got {other:?}"),
+    }
+}
+
 pub(crate) fn export_enabled_from_env() -> bool {
-    match std::env::var("CRAT_BO_EXPORT").as_deref() {
-        Err(std::env::VarError::NotPresent) | Ok("0") => false,
-        Ok("1") => true,
-        Ok(other) => panic!("CRAT_BO_EXPORT must be 0 or 1, got {other:?}"),
+    match std::env::var("CRAT_BO_EXPORT") {
+        Ok(value) => export_enabled_from_value(Some(&value)),
+        Err(std::env::VarError::NotPresent) => export_enabled_from_value(None),
         Err(error) => panic!("CRAT_BO_EXPORT is not valid Unicode: {error}"),
     }
 }
+
+/// Resolve-once cache for [`export_enabled_from_env`].
+///
+/// D4: the flag has to actually gate, not merely exist. Resolved at most once
+/// per process so a mid-run env change cannot make two capture points disagree
+/// — the same discipline L2 applies with its per-invocation resolve.
+static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+fn flag_enabled() -> bool {
+    *FLAG.get_or_init(export_enabled_from_env)
+}
+
+
 
 // ---------------------------------------------------------------------------
 // §1.2 Lifetime-free keys
@@ -303,9 +328,27 @@ pub(crate) fn with_bo_export<T>(f: impl FnOnce() -> T) -> (T, BoExport) {
     (output, captured)
 }
 
-/// Whether capture is active. Cheap enough to call at a capture point.
+/// Whether capture is active.
+///
+/// Active when either a [`with_bo_export`] scope is open (the test path) **or**
+/// `CRAT_BO_EXPORT=1` resolved on (the corpus-worker path, D4). In the latter
+/// case the buffer is installed lazily on first use, so a worker gets capture
+/// without a Rust-level scope — which is what the flag was always documented to
+/// provide.
+///
+/// When the flag is off and no scope is open this is one thread-local read of
+/// an `Option`, and every capture point short-circuits on it.
 pub(crate) fn capturing() -> bool {
-    BO_EXPORT_CAPTURE.with(|c| c.borrow().is_some())
+    BO_EXPORT_CAPTURE.with(|c| {
+        if c.borrow().is_some() {
+            return true;
+        }
+        if flag_enabled() {
+            *c.borrow_mut() = Some(BoExport::default());
+            return true;
+        }
+        false
+    })
 }
 
 /// Mutate the active capture, or do nothing when inactive.
@@ -313,6 +356,9 @@ pub(crate) fn capturing() -> bool {
 /// Every capture point funnels through here, so "zero work when off" is a
 /// property of one function rather than of every call site.
 pub(crate) fn record(f: impl FnOnce(&mut BoExport)) {
+    if !capturing() {
+        return;
+    }
     BO_EXPORT_CAPTURE.with(|c| {
         if let Some(export) = c.borrow_mut().as_mut() {
             f(export);
@@ -456,6 +502,24 @@ pub(crate) fn record_version_owns_from(
 /// Record one loan's identity (E-R4).
 pub(crate) fn record_loan(identity: LoanIdentity) {
     record(|export| export.loans.push(identity));
+}
+
+/// Start a fresh validation round (D1).
+///
+/// The borrow oracle runs once per CEGAR round, each time under a DIFFERENT
+/// candidacy predicate. Without this reset `loans` would accumulate the union
+/// over all rounds — including loans from models the loop went on to reject —
+/// and `surviving_loans()` would mix stale pre-commit loans with accepted ones.
+/// Clearing at the start of every round leaves exactly the accepted round's
+/// `BorrowSet` behind when the loop exits.
+///
+/// Residuals are cleared with them: they are recorded at the accept point and
+/// must describe the same round.
+pub(crate) fn begin_round() {
+    record(|export| {
+        export.loans.clear();
+        export.residual_conflicts.clear();
+    });
 }
 
 /// Record the residual conflicts present at acceptance (E-R4 certificate).

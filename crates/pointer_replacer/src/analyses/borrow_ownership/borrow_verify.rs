@@ -676,6 +676,10 @@ pub(crate) fn verify_to_fixpoint_counting_with_flows(
     record_dropped(&mut stats, selectors, &dropped);
     for _ in 0..cap {
         stats.rounds += 1;
+        // D1: each round re-runs the oracle under a DIFFERENT candidacy
+        // predicate. Reset so the export holds the FINAL round's BorrowSet,
+        // not the union over rejected intermediate models.
+        super::export::begin_round();
         let conflicts = revalidate_replaying_with_flows(
             program,
             slots,
@@ -967,6 +971,8 @@ fn verify_l2_to_fixpoint_counting(
         if let Some(diagnostics) = &transition_diagnostics {
             diagnostics.emit_round(stats.rounds, &planner, &model);
         }
+        // D1: same per-round reset on the L2 path.
+        super::export::begin_round();
         let conflicts = revalidate_replaying_witnessed(
             program,
             slots,

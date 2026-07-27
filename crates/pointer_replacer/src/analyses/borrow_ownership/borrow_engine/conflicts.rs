@@ -500,6 +500,17 @@ where
                 overwrite_with_engine_facts_capturing(program.tcx, f, &ctxt.borrow, &mut inference);
             let invalid_loans = invalid_loan_set(&inference);
             if invalid_loans.is_empty() {
+                // D2: the witnessed/L2 replay is structurally identical to the
+                // Mode-A one and had no capture at all, so `loans` was silently
+                // empty under CRAT_BO_L2_GUARDED_COMMITS=1 — the plan-of-record
+                // configuration. Same Gap-B reasoning applies here: a
+                // conflict-free function is where every loan SURVIVED.
+                record_loan_identities(
+                    f,
+                    &inference,
+                    ctxt.borrow.provenances.get(&f).unwrap(),
+                    &invalid_loans,
+                );
                 break Vec::new();
             }
 
@@ -518,6 +529,9 @@ where
 
             if to_demote.is_empty() {
                 let provenance_set = ctxt.borrow.provenances.get(&f).unwrap();
+                // D2: record from the FINAL inference of this call, exactly as
+                // the Mode-A path does.
+                record_loan_identities(f, &inference, provenance_set, &invalid_loans);
                 break extract_witnessed_conflict_edges(
                     &inference,
                     provenance_set,
