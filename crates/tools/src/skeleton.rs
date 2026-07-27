@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, VecDeque};
 
 use pointer_replacer::{
     InitialPointerDecisions, PointerDecisionOptions, PtrKind, initial_pointer_decisions,
@@ -12,7 +12,7 @@ use rustc_ast_pretty::pprust;
 use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_hir::{
     self as hir, HirId,
-    def::{DefKind, Res},
+    def::{DefKind, Namespace, Res},
     intravisit::{self, Visitor, VisitorExt},
 };
 use rustc_middle::{
@@ -20,8 +20,8 @@ use rustc_middle::{
     ty::{self, TyCtxt},
 };
 use rustc_span::{
-    DUMMY_SP, Symbol,
-    def_id::{DefId, LocalDefId},
+    DUMMY_SP, Ident, Symbol,
+    def_id::{CRATE_DEF_ID, DefId, LocalDefId},
     sym,
 };
 use serde::{Deserialize, Serialize};
@@ -123,6 +123,7 @@ pub enum GenerationErrorKind {
     NonBlockMatchArm,
     NestedControlPayload,
     AstHirMismatch,
+    TypeSpelling,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -336,13 +337,13 @@ fn make_record(
     }
 }
 
-fn make_function_record(
+fn make_function_record<'tcx>(
     surface: SurfaceItem,
     ast_to_hir: &utils::ir::AstToHir,
     item_ids: &FxHashMap<rustc_span::def_id::DefId, u64>,
     decisions: &InitialPointerDecisions,
     preservation_overrides: &PreservationDecisionOverrides,
-    tcx: TyCtxt<'_>,
+    tcx: TyCtxt<'tcx>,
 ) -> Result<ItemRecord, GenerationError> {
     let hitem = tcx.hir_node_by_def_id(surface.def_id).expect_item();
     let signature_dependencies = collect_signature_dependencies(hitem, item_ids, tcx);
@@ -363,14 +364,28 @@ fn make_function_record(
         tcx,
     );
     let mut skeleton = source.clone();
-    apply_target_signature(&mut skeleton, surface.def_id, decisions, tcx);
+    let type_speller = TypeSpeller::new(surface.def_id, ast_to_hir, tcx);
+    apply_target_signature(
+        &mut skeleton,
+        surface.def_id,
+        decisions,
+        &type_speller,
+        &surface.path,
+        tcx,
+    )?;
     let mut skeletonizer = Skeletonizer {
         ast_to_hir,
         decisions,
         statements_requiring_transformation: &statements_requiring_transformation,
+        type_speller: &type_speller,
+        function_path: &surface.path,
+        error: None,
         tcx,
     };
     skeletonizer.visit_item(&mut skeleton);
+    if let Some(error) = skeletonizer.error {
+        return Err(error);
+    }
     let source_signature = render_signature(&source);
     let target_signature = render_signature(&skeleton);
     let name = surface.item.kind.ident().unwrap().to_string();
@@ -547,12 +562,14 @@ fn annotate_function(item: &mut Item, opaque_nested_ifs: &FxHashSet<NodeId>) {
     labeler.visit_block(function.body.as_mut().unwrap());
 }
 
-fn apply_target_signature(
+fn apply_target_signature<'a, 'tcx>(
     item: &mut Item,
     def_id: LocalDefId,
     decisions: &InitialPointerDecisions,
-    tcx: TyCtxt<'_>,
-) {
+    type_speller: &TypeSpeller<'a, 'tcx>,
+    function_path: &str,
+    tcx: TyCtxt<'tcx>,
+) -> Result<(), GenerationError> {
     let ItemKind::Fn(box function) = &mut item.kind else { unreachable!() };
     let force_main_argv = is_supported_two_argument_main_0(function);
     function.sig.header.safety = Safety::Unsafe(DUMMY_SP);
@@ -560,7 +577,7 @@ fn apply_target_signature(
         if force_main_argv {
             function.sig.decl.inputs[1].ty = P(utils::ast::parse_ty("&mut [&mut [i8]]".to_owned()));
         }
-        return;
+        return Ok(());
     };
     let body = tcx.mir_drops_elaborated_and_const_checked(def_id).borrow();
     let mut lifetimes = vec![];
@@ -577,6 +594,9 @@ fn apply_target_signature(
     }
     add_lifetime_params(&mut function.generics, &lifetimes);
     for (index, param) in function.sig.decl.inputs.iter_mut().enumerate() {
+        if force_main_argv && index == 1 {
+            continue;
+        }
         let Some(kind) = decision.input_decs.get(index).copied().flatten() else {
             continue;
         };
@@ -585,17 +605,43 @@ fn apply_target_signature(
         }
         let original = body.local_decls[rustc_middle::mir::Local::from_usize(index + 1)].ty;
         let lifetime = decision.input_lifetimes.get(index).copied().flatten();
-        *param.ty = target_type(original, kind, lifetime, tcx);
+        let source_hint = param.ty.clone();
+        *param.ty = target_type(
+            original,
+            kind,
+            lifetime,
+            Some(&source_hint),
+            type_speller,
+            function_path,
+            &format!("parameter `{}`", parameter_name(param, index)),
+        )?;
     }
     if let Some(kind) = decision.output_dec
         && let FnRetTy::Ty(output) = &mut function.sig.decl.output
         && !raw_decision_matches_ast_type(kind, output)
     {
         let original = body.local_decls[rustc_middle::mir::RETURN_PLACE].ty;
-        **output = target_type(original, kind, decision.output_lifetime, tcx);
+        let source_hint = output.clone();
+        **output = target_type(
+            original,
+            kind,
+            decision.output_lifetime,
+            Some(&source_hint),
+            type_speller,
+            function_path,
+            "return",
+        )?;
     }
     if force_main_argv {
         function.sig.decl.inputs[1].ty = P(utils::ast::parse_ty("&mut [&mut [i8]]".to_owned()));
+    }
+    Ok(())
+}
+
+fn parameter_name(param: &rustc_ast::Param, index: usize) -> String {
+    match &param.pat.kind {
+        PatKind::Ident(_, ident, _) => ident.to_string(),
+        _ => format!("#{index}"),
     }
 }
 
@@ -655,16 +701,498 @@ fn add_lifetime_params(generics: &mut rustc_ast::Generics, lifetimes: &[Symbol])
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ConstructorRequirements {
+    option: bool,
+    boxed: bool,
+}
+
+fn constructor_requirements(kind: PtrKind) -> ConstructorRequirements {
+    match kind {
+        PtrKind::Ref(_) => ConstructorRequirements {
+            option: false,
+            boxed: false,
+        },
+        PtrKind::OptRef(_) => ConstructorRequirements {
+            option: true,
+            boxed: false,
+        },
+        PtrKind::Box => ConstructorRequirements {
+            option: false,
+            boxed: true,
+        },
+        PtrKind::OptBox => ConstructorRequirements {
+            option: true,
+            boxed: true,
+        },
+        PtrKind::Raw(_) => ConstructorRequirements {
+            option: false,
+            boxed: false,
+        },
+        PtrKind::BoxedSlice => ConstructorRequirements {
+            option: false,
+            boxed: true,
+        },
+        PtrKind::OptBoxedSlice => ConstructorRequirements {
+            option: true,
+            boxed: true,
+        },
+        PtrKind::Slice(_) => ConstructorRequirements {
+            option: false,
+            boxed: false,
+        },
+        PtrKind::SliceCursor(_) => ConstructorRequirements {
+            option: false,
+            boxed: false,
+        },
+    }
+}
+
+#[derive(Clone)]
+struct ScopeCandidate {
+    ident: Ident,
+    def_id: DefId,
+    own_definition: bool,
+}
+
+struct TypeSpeller<'a, 'tcx> {
+    tcx: TyCtxt<'tcx>,
+    ast_to_hir: &'a utils::ir::AstToHir,
+    containing_module: LocalDefId,
+    candidates: Vec<ScopeCandidate>,
+    external_roots: Vec<(String, DefId)>,
+    implicit_prelude_enabled: bool,
+    implicit_prelude_disabled_by: Option<LocalDefId>,
+    prelude_module: Option<DefId>,
+}
+
+impl<'a, 'tcx> TypeSpeller<'a, 'tcx> {
+    fn new(
+        function_def_id: LocalDefId,
+        ast_to_hir: &'a utils::ir::AstToHir,
+        tcx: TyCtxt<'tcx>,
+    ) -> Self {
+        let containing_module: LocalDefId = tcx.parent_module_from_def_id(function_def_id).into();
+        let mut candidates = tcx
+            .module_children_local(containing_module)
+            .iter()
+            .filter(|child| child.res.ns() == Some(Namespace::TypeNS))
+            .filter_map(|child| {
+                let def_id = child.res.opt_def_id()?;
+                let own_definition = def_id.as_local().is_some_and(|local| {
+                    LocalDefId::from(tcx.parent_module_from_def_id(local)) == containing_module
+                }) && child.reexport_chain.is_empty();
+                Some(ScopeCandidate {
+                    ident: child.ident,
+                    def_id,
+                    own_definition,
+                })
+            })
+            .collect::<Vec<_>>();
+        candidates.sort_by_key(|candidate| candidate.ident.to_string());
+
+        let mut module = Some(containing_module);
+        let mut implicit_prelude_enabled = true;
+        let mut implicit_prelude_disabled_by = None;
+        while let Some(def_id) = module {
+            if tcx
+                .get_attrs(def_id, sym::no_implicit_prelude)
+                .next()
+                .is_some()
+            {
+                implicit_prelude_enabled = false;
+                implicit_prelude_disabled_by = Some(def_id);
+                break;
+            }
+            module = tcx.opt_local_parent(def_id);
+        }
+
+        let mut external_roots = vec![];
+        for item_id in tcx.hir_root_module().item_ids {
+            let item = tcx.hir_item(*item_id);
+            if let hir::ItemKind::ExternCrate(_, ident) = item.kind
+                && let Some(crate_num) = tcx.extern_mod_stmt_cnum(item.owner_id.def_id)
+            {
+                external_roots.push((ident.to_string(), crate_num.as_def_id()));
+            }
+        }
+        for (name, entry) in tcx.sess.opts.externs.iter() {
+            if !entry.add_prelude {
+                continue;
+            }
+            let exact_match = tcx.crates(()).iter().find(|crate_num| {
+                entry.files().is_some_and(|mut files| {
+                    files.any(|file| {
+                        tcx.crate_extern_paths(**crate_num)
+                            .iter()
+                            .any(|path| path == file.canonicalized() || path == file.original())
+                    })
+                })
+            });
+            if let Some(crate_num) = exact_match {
+                external_roots.push((name.clone(), crate_num.as_def_id()));
+            } else if let Some(crate_num) = tcx
+                .crates(())
+                .iter()
+                .find(|crate_num| tcx.crate_name(**crate_num).as_str() == name)
+            {
+                external_roots.push((name.clone(), crate_num.as_def_id()));
+            }
+        }
+        let prelude_module = tcx.hir_free_items().find_map(|item_id| {
+            let item = tcx.hir_item(item_id);
+            if !matches!(item.kind, hir::ItemKind::Use(_, hir::UseKind::Glob))
+                || !tcx
+                    .hir_attrs(item.hir_id())
+                    .iter()
+                    .any(|attribute| attribute.has_name(sym::prelude_import))
+            {
+                return None;
+            }
+            let hir::ItemKind::Use(path, _) = item.kind else {
+                return None;
+            };
+            path.segments
+                .last()
+                .and_then(|segment| segment.res.opt_def_id())
+        });
+        if let Some(prelude) = prelude_module {
+            external_roots.push((
+                tcx.crate_name(prelude.krate).to_string(),
+                prelude.krate.as_def_id(),
+            ));
+        }
+        if implicit_prelude_enabled
+            && let Some(core_crate) = tcx
+                .crates(())
+                .iter()
+                .find(|crate_num| tcx.crate_name(**crate_num).as_str() == "core")
+        {
+            external_roots.push(("core".to_owned(), core_crate.as_def_id()));
+        }
+        external_roots.sort_by(|left, right| left.0.cmp(&right.0));
+        external_roots.dedup();
+
+        Self {
+            tcx,
+            ast_to_hir,
+            containing_module,
+            candidates,
+            external_roots,
+            implicit_prelude_enabled,
+            implicit_prelude_disabled_by,
+            prelude_module,
+        }
+    }
+
+    fn preferred_one_segment(&self, def_id: DefId) -> Option<Ident> {
+        self.candidates
+            .iter()
+            .find(|candidate| candidate.def_id == def_id && candidate.own_definition)
+            .or_else(|| {
+                self.candidates
+                    .iter()
+                    .find(|candidate| candidate.def_id == def_id)
+            })
+            .map(|candidate| candidate.ident)
+    }
+
+    fn shorten_source_type(&self, ty: &mut Ty) {
+        SourceTypeShortener { speller: self }.visit_ty(ty);
+    }
+
+    fn render_semantic_type(&self, ty: ty::Ty<'tcx>) -> Result<Ty, String> {
+        let mut rendered = String::new();
+        let mut nominal_path = |def_id| {
+            self.nominal_path(def_id)
+                .map_err(utils::ir::MirTypeFormatError::Nominal)
+        };
+        utils::ir::format_mir_ty_with_policy(
+            &mut rendered,
+            ty,
+            self.tcx,
+            &mut nominal_path,
+            utils::ir::MirTypeFormatPolicy::SourceValid,
+        )
+        .map_err(|error| format!("{error:?}"))?;
+        let mut rendered_ty = utils::ast::try_parse_ty(rendered.clone())
+            .map_err(|error| format!("rendered type `{rendered}` does not parse: {error}"))?;
+        SemanticIdentRestorer { speller: self }.visit_ty(&mut rendered_ty);
+        Ok(rendered_ty)
+    }
+
+    fn nominal_path(&self, def_id: DefId) -> Result<String, String> {
+        if let Some(ident) = self.preferred_one_segment(def_id) {
+            return Ok(ident.to_string());
+        }
+        let candidates = if def_id.is_local() {
+            self.local_visible_paths(def_id)
+        } else {
+            self.external_visible_paths(def_id)
+        };
+        candidates.into_iter().next().ok_or_else(|| {
+            format!(
+                "no accessible source path names `{}` from the containing module",
+                self.tcx.def_path_str(def_id)
+            )
+        })
+    }
+
+    fn local_visible_paths(&self, target: DefId) -> Vec<String> {
+        let mut paths = vec![];
+        let mut queue = VecDeque::from([(CRATE_DEF_ID.to_def_id(), Vec::<String>::new())]);
+        let mut best_modules = FxHashMap::<DefId, (usize, String)>::default();
+        while let Some((module, prefix)) = queue.pop_front() {
+            let mut children = if module.is_local() {
+                self.tcx
+                    .module_children_local(module.expect_local())
+                    .iter()
+                    .collect::<Vec<_>>()
+            } else {
+                vec![]
+            };
+            children.sort_by_key(|child| child.ident.to_string());
+            for child in children {
+                if !child
+                    .vis
+                    .is_accessible_from(self.containing_module, self.tcx)
+                {
+                    continue;
+                }
+                let Some(def_id) = child.res.opt_def_id() else {
+                    continue;
+                };
+                let mut child_path = prefix.clone();
+                child_path.push(child.ident.to_string());
+                if def_id == target && child.res.ns() == Some(Namespace::TypeNS) {
+                    paths.push(format!("crate::{}", child_path.join("::")));
+                }
+                if matches!(child.res, Res::Def(DefKind::Mod, _)) && def_id.is_local() {
+                    let rendered = child_path.join("::");
+                    let key = (child_path.len(), rendered.clone());
+                    if best_modules.get(&def_id).is_none_or(|old| key < *old) {
+                        best_modules.insert(def_id, key);
+                        queue.push_back((def_id, child_path));
+                    }
+                }
+            }
+        }
+        sort_paths(&mut paths);
+        paths
+    }
+
+    fn external_visible_paths(&self, target: DefId) -> Vec<String> {
+        let mut paths = vec![];
+        for (root_name, root_def_id) in &self.external_roots {
+            if root_def_id.krate != target.krate {
+                continue;
+            }
+            let mut queue = VecDeque::from([(*root_def_id, Vec::<String>::new())]);
+            let mut best_modules = FxHashMap::<DefId, (usize, String)>::default();
+            while let Some((module, prefix)) = queue.pop_front() {
+                let mut children = self.tcx.module_children(module).iter().collect::<Vec<_>>();
+                children.sort_by_key(|child| child.ident.to_string());
+                for child in children {
+                    if !child.vis.is_public() {
+                        continue;
+                    }
+                    let Some(def_id) = child.res.opt_def_id() else {
+                        continue;
+                    };
+                    let mut child_path = prefix.clone();
+                    child_path.push(child.ident.to_string());
+                    if def_id == target && child.res.ns() == Some(Namespace::TypeNS) {
+                        paths.push(format!("::{root_name}::{}", child_path.join("::")));
+                    }
+                    if matches!(child.res, Res::Def(DefKind::Mod, _)) {
+                        let rendered = child_path.join("::");
+                        let key = (child_path.len(), rendered.clone());
+                        if best_modules.get(&def_id).is_none_or(|old| key < *old) {
+                            best_modules.insert(def_id, key);
+                            queue.push_back((def_id, child_path));
+                        }
+                    }
+                }
+            }
+        }
+        sort_paths(&mut paths);
+        paths
+    }
+
+    fn check_constructors(&self, kind: PtrKind) -> Result<(), String> {
+        let requirements = constructor_requirements(kind);
+        if !self.implicit_prelude_enabled && (requirements.option || requirements.boxed) {
+            let constructor = if requirements.option { "Option" } else { "Box" };
+            let containing_module = if self.containing_module == CRATE_DEF_ID {
+                "crate root".to_owned()
+            } else {
+                format!(
+                    "containing module `{}`",
+                    self.tcx.def_path_str(self.containing_module)
+                )
+            };
+            let disabled_by = self
+                .implicit_prelude_disabled_by
+                .filter(|def_id| *def_id != self.containing_module)
+                .map(|def_id| {
+                    if def_id == CRATE_DEF_ID {
+                        " by the crate root".to_owned()
+                    } else {
+                        format!(" by ancestor module `{}`", self.tcx.def_path_str(def_id))
+                    }
+                })
+                .unwrap_or_default();
+            return Err(format!(
+                "selected kind {kind:?} requires bare `{constructor}`, but the {containing_module} has its ordinary implicit prelude disabled{disabled_by}"
+            ));
+        }
+        if requirements.option {
+            self.check_constructor(sym::Option, hir::LangItem::Option, "Option", kind)?;
+        }
+        if requirements.boxed {
+            self.check_constructor(Symbol::intern("Box"), hir::LangItem::OwnedBox, "Box", kind)?;
+        }
+        Ok(())
+    }
+
+    fn check_constructor(
+        &self,
+        symbol: Symbol,
+        lang_item: hir::LangItem,
+        display: &str,
+        kind: PtrKind,
+    ) -> Result<(), String> {
+        if let Some(candidate) = self
+            .candidates
+            .iter()
+            .find(|candidate| candidate.ident.name == symbol)
+        {
+            if self.tcx.is_lang_item(candidate.def_id, lang_item) {
+                return Ok(());
+            }
+            return Err(format!(
+                "selected kind {kind:?} requires bare `{display}`, but it resolves to `{}`, not the standard `{display}`",
+                self.tcx.def_path_str(candidate.def_id)
+            ));
+        }
+        if let Some((root, def_id)) = self.external_roots.iter().find(|(root, _)| root == display) {
+            return Err(format!(
+                "selected kind {kind:?} requires bare `{display}`, but the extern prelude binds it to crate `{root}` ({})",
+                self.tcx.def_path_str(*def_id)
+            ));
+        }
+        let prelude_binding = self.prelude_module.and_then(|module| {
+            self.tcx
+                .module_children(module)
+                .iter()
+                .find(|child| {
+                    child.ident.name == symbol && child.res.ns() == Some(Namespace::TypeNS)
+                })
+                .and_then(|child| child.res.opt_def_id())
+        });
+        match prelude_binding {
+            Some(def_id) if self.tcx.is_lang_item(def_id, lang_item) => Ok(()),
+            Some(def_id) => Err(format!(
+                "selected kind {kind:?} requires bare `{display}`, but the ordinary prelude resolves it to `{}`, not the standard `{display}`",
+                self.tcx.def_path_str(def_id)
+            )),
+            None => Err(format!(
+                "selected kind {kind:?} requires bare `{display}`, but it is unresolved in the enabled ordinary prelude"
+            )),
+        }
+    }
+}
+
+fn sort_paths(paths: &mut Vec<String>) {
+    paths.sort_by(|left, right| {
+        left.split("::")
+            .filter(|segment| !segment.is_empty())
+            .count()
+            .cmp(
+                &right
+                    .split("::")
+                    .filter(|segment| !segment.is_empty())
+                    .count(),
+            )
+            .then_with(|| left.cmp(right))
+    });
+    paths.dedup();
+}
+
+struct SourceTypeShortener<'a, 'map, 'tcx> {
+    speller: &'a TypeSpeller<'map, 'tcx>,
+}
+
+impl MutVisitor for SourceTypeShortener<'_, '_, '_> {
+    fn visit_ty(&mut self, ty: &mut Ty) {
+        if let TyKind::Path(None, path) = &mut ty.kind
+            && let Some(res) = self.speller.ast_to_hir.path_span_to_res.get(&path.span)
+            && let Some(def_id) = res.opt_def_id()
+            && path.segments.len() != 1
+            && let Some(ident) = self.speller.preferred_one_segment(def_id)
+        {
+            let args = path
+                .segments
+                .last()
+                .and_then(|segment| segment.args.clone());
+            *path = rustc_ast::Path::from_ident(ident);
+            path.segments[0].args = args;
+        }
+        mut_visit::walk_ty(self, ty);
+    }
+}
+
+struct SemanticIdentRestorer<'a, 'map, 'tcx> {
+    speller: &'a TypeSpeller<'map, 'tcx>,
+}
+
+impl MutVisitor for SemanticIdentRestorer<'_, '_, '_> {
+    fn visit_ty(&mut self, ty: &mut Ty) {
+        if let TyKind::Path(None, path) = &mut ty.kind
+            && let [segment] = &path.segments[..]
+            && let Some(candidate) = self
+                .speller
+                .candidates
+                .iter()
+                .find(|candidate| candidate.ident.to_string() == segment.ident.to_string())
+            && self.speller.preferred_one_segment(candidate.def_id) == Some(candidate.ident)
+        {
+            path.segments[0].ident = candidate.ident;
+        }
+        mut_visit::walk_ty(self, ty);
+    }
+}
+
 fn target_type<'tcx>(
     original: ty::Ty<'tcx>,
     kind: PtrKind,
     lifetime: Option<Symbol>,
-    tcx: TyCtxt<'tcx>,
-) -> Ty {
+    source_hint: Option<&Ty>,
+    type_speller: &TypeSpeller<'_, 'tcx>,
+    function_path: &str,
+    location: &str,
+) -> Result<Ty, GenerationError> {
+    type_speller.check_constructors(kind).map_err(|reason| {
+        type_spelling_error(function_path, location, original, reason, type_speller.tcx)
+    })?;
     let (ty::TyKind::RawPtr(inner, _) | ty::TyKind::Ref(_, inner, _)) = original.kind() else {
-        return utils::ast::parse_ty(utils::ir::mir_ty_to_string(original, tcx));
+        return type_speller
+            .render_semantic_type(original)
+            .map_err(|reason| {
+                type_spelling_error(function_path, location, original, reason, type_speller.tcx)
+            });
     };
-    let inner = utils::ir::mir_ty_to_string(*inner, tcx);
+    let inner = source_hint
+        .and_then(peel_source_pointer)
+        .map(|mut ty| {
+            type_speller.shorten_source_type(&mut ty);
+            Ok(ty)
+        })
+        .unwrap_or_else(|| type_speller.render_semantic_type(*inner))
+        .map_err(|reason| {
+            type_spelling_error(function_path, location, original, reason, type_speller.tcx)
+        })?;
+    let inner = pprust::ty_to_string(&inner);
     let lifetime = lifetime
         .map(|lifetime| format!("'{} ", lifetime.as_str()))
         .unwrap_or_default();
@@ -691,7 +1219,39 @@ fn target_type<'tcx>(
             format!("crate::slice_cursor::{cursor}<{lifetime}, {inner}>")
         }
     };
-    utils::ast::parse_ty(rendered)
+    utils::ast::try_parse_ty(rendered.clone()).map_err(|reason| {
+        type_spelling_error(
+            function_path,
+            location,
+            original,
+            format!("rendered target type `{rendered}` does not parse: {reason}"),
+            type_speller.tcx,
+        )
+    })
+}
+
+fn peel_source_pointer(ty: &Ty) -> Option<Ty> {
+    match &ty.kind {
+        TyKind::Ptr(mut_ty) | TyKind::Ref(_, mut_ty) => Some((*mut_ty.ty).clone()),
+        _ => None,
+    }
+}
+
+fn type_spelling_error<'tcx>(
+    function_path: &str,
+    location: &str,
+    semantic_type: ty::Ty<'tcx>,
+    reason: String,
+    tcx: TyCtxt<'tcx>,
+) -> GenerationError {
+    GenerationError {
+        kind: GenerationErrorKind::TypeSpelling,
+        function_path: function_path.to_owned(),
+        message: format!(
+            "cannot spell type for {location} (semantic type `{}`): {reason}",
+            tcx.erase_regions(semantic_type)
+        ),
+    }
 }
 
 fn classify_function_statements(
@@ -1146,11 +1706,17 @@ struct Skeletonizer<'a, 'tcx> {
     ast_to_hir: &'a utils::ir::AstToHir,
     decisions: &'a InitialPointerDecisions,
     statements_requiring_transformation: &'a BTreeSet<u32>,
+    type_speller: &'a TypeSpeller<'a, 'tcx>,
+    function_path: &'a str,
+    error: Option<GenerationError>,
     tcx: TyCtxt<'tcx>,
 }
 
 impl MutVisitor for Skeletonizer<'_, '_> {
     fn flat_map_stmt(&mut self, mut stmt: Stmt) -> SmallVec<[Stmt; 1]> {
+        if self.error.is_some() {
+            return smallvec![stmt];
+        }
         let requires_transformation = statement_numeric_label(&stmt)
             .is_none_or(|label| self.statements_requiring_transformation.contains(&label));
         if let StmtKind::Let(local) = &mut stmt.kind
@@ -1164,12 +1730,21 @@ impl MutVisitor for Skeletonizer<'_, '_> {
                 .flatten();
             let ty = match (decision, local.ty.as_deref()) {
                 (Some(kind), Some(ty)) if raw_decision_matches_inferred_type(kind, inferred) => {
-                    Some(ty.clone())
+                    Ok(Some(ty.clone()))
                 }
-                (Some(kind), _) => Some(target_type(inferred, kind, None, self.tcx)),
-                (None, Some(ty)) => Some(ty.clone()),
+                (Some(kind), source_hint) => target_type(
+                    inferred,
+                    kind,
+                    None,
+                    source_hint,
+                    self.type_speller,
+                    self.function_path,
+                    &format!("local `{}`", local_binding_name(&local.pat)),
+                )
+                .map(Some),
+                (None, Some(ty)) => Ok(Some(ty.clone())),
                 (None, None)
-                    if !matches!(
+                    if matches!(
                         inferred.kind(),
                         ty::TyKind::FnDef(..)
                             | ty::TyKind::FnPtr(..)
@@ -1179,11 +1754,29 @@ impl MutVisitor for Skeletonizer<'_, '_> {
                             | ty::TyKind::CoroutineWitness(..)
                     ) =>
                 {
-                    Some(utils::ast::parse_ty(inferred.to_string()))
+                    Ok(None)
                 }
-                (None, None) => None,
+                (None, None) => self
+                    .type_speller
+                    .render_semantic_type(inferred)
+                    .map(Some)
+                    .map_err(|reason| {
+                        type_spelling_error(
+                            self.function_path,
+                            &format!("local `{}`", local_binding_name(&local.pat)),
+                            inferred,
+                            reason,
+                            self.tcx,
+                        )
+                    }),
             };
-            local.ty = ty.map(P);
+            match ty {
+                Ok(ty) => local.ty = ty.map(P),
+                Err(error) => {
+                    self.error = Some(error);
+                    return smallvec![stmt];
+                }
+            }
         }
         if !requires_transformation {
             return smallvec![stmt];
@@ -1209,6 +1802,13 @@ impl MutVisitor for Skeletonizer<'_, '_> {
             }
         }
         smallvec![stmt]
+    }
+}
+
+fn local_binding_name(pattern: &Pat) -> String {
+    match &pattern.kind {
+        PatKind::Ident(_, ident, _) => ident.to_string(),
+        _ => "<pattern>".to_owned(),
     }
 }
 
