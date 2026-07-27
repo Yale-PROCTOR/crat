@@ -264,14 +264,17 @@ mod crown_projection {
     };
     use rustc_span::def_id::LocalDefId;
 
-    use super::crown_artifact_walker::{
-        analyze_json_claims, analyze_named_rust_sources, parse_official_evaluation,
-        OfficialEvaluation,
+    use super::{
+        crown_artifact_walker::{
+            OfficialEvaluation, analyze_json_claims, analyze_named_rust_sources,
+            parse_official_evaluation,
+        },
+        report,
     };
     use crate::{
         analyses::{
             borrow_ownership::{
-                crate_slots::CrateSlots, slots::SlotOwner, solver::SlotRef, SlotKind,
+                SlotKind, crate_slots::CrateSlots, slots::SlotOwner, solver::SlotRef,
             },
             mir_variable_grouping::SourceVarGroups,
         },
@@ -324,6 +327,205 @@ mod crown_projection {
         Other,
     }
 
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum LegacyBackingKind {
+        BoxFamily,
+        RefSlice,
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub struct BoFullScopeCounts {
+        pub program: String,
+        pub slots_total: usize,
+        pub n_ref: usize,
+        pub n_own: usize,
+        pub n_raw: usize,
+        pub n_ref_d0: usize,
+        pub n_own_d0: usize,
+        pub n_raw_d0: usize,
+    }
+
+    impl BoFullScopeCounts {
+        pub fn d0_local_slots(&self) -> usize {
+            self.n_ref_d0 + self.n_own_d0 + self.n_raw_d0
+        }
+    }
+
+    pub const BO_FULL_SCOPE_CSV_HEADER: &str = "program,profile,scope_row,universe_definition,slots_total,n_ref,n_own,n_raw,raw_share_percent,partition_identity\n";
+
+    #[derive(Clone, Debug, Default, PartialEq, Eq)]
+    pub struct LegacyFullScopeHistogram {
+        pub ref_false: usize,
+        pub ref_true: usize,
+        pub opt_ref_false: usize,
+        pub opt_ref_true: usize,
+        pub slice_false: usize,
+        pub slice_true: usize,
+        pub slice_cursor_false: usize,
+        pub slice_cursor_true: usize,
+        pub r#box: usize,
+        pub opt_box: usize,
+        pub boxed_slice: usize,
+        pub opt_boxed_slice: usize,
+        pub raw_false: usize,
+        pub raw_true: usize,
+        pub none: usize,
+    }
+
+    impl LegacyFullScopeHistogram {
+        pub fn ref_count(&self) -> usize {
+            self.ref_false + self.ref_true
+        }
+
+        pub fn opt_ref_count(&self) -> usize {
+            self.opt_ref_false + self.opt_ref_true
+        }
+
+        pub fn slice_count(&self) -> usize {
+            self.slice_false + self.slice_true
+        }
+
+        pub fn slice_cursor_count(&self) -> usize {
+            self.slice_cursor_false + self.slice_cursor_true
+        }
+
+        pub fn box_family_count(&self) -> usize {
+            self.r#box + self.opt_box + self.boxed_slice + self.opt_boxed_slice
+        }
+
+        pub fn subjects_total(&self) -> usize {
+            self.ref_count()
+                + self.opt_ref_count()
+                + self.slice_count()
+                + self.slice_cursor_count()
+                + self.box_family_count()
+                + self.raw_false
+                + self.raw_true
+                + self.none
+        }
+
+        pub fn add_assign(&mut self, other: &Self) {
+            self.ref_false += other.ref_false;
+            self.ref_true += other.ref_true;
+            self.opt_ref_false += other.opt_ref_false;
+            self.opt_ref_true += other.opt_ref_true;
+            self.slice_false += other.slice_false;
+            self.slice_true += other.slice_true;
+            self.slice_cursor_false += other.slice_cursor_false;
+            self.slice_cursor_true += other.slice_cursor_true;
+            self.r#box += other.r#box;
+            self.opt_box += other.opt_box;
+            self.boxed_slice += other.boxed_slice;
+            self.opt_boxed_slice += other.opt_boxed_slice;
+            self.raw_false += other.raw_false;
+            self.raw_true += other.raw_true;
+            self.none += other.none;
+        }
+    }
+
+    pub const LEGACY_FULL_SCOPE_CSV_HEADER: &str = "program,measurement_status,universe_definition,subjects_total,Ref,OptRef,Slice,SliceCursor,Box,OptBox,BoxedSlice,OptBoxedSlice,Raw_false,Raw_true,None,safe_total,Box_family_total,raw_total,partition_identity\n";
+
+    pub fn bo_full_scope_csv_rows(
+        profile: &str,
+        counts: &BoFullScopeCounts,
+    ) -> Result<String, String> {
+        let mut output = String::new();
+        for (scope_row, universe, slots_total, n_ref, n_own, n_raw) in [
+            (
+                "all slots",
+                "BO local + field slots at all pointer depths",
+                counts.slots_total,
+                counts.n_ref,
+                counts.n_own,
+                counts.n_raw,
+            ),
+            (
+                "d0 local slots",
+                "BO depth-0 local slots only; fields excluded",
+                counts.d0_local_slots(),
+                counts.n_ref_d0,
+                counts.n_own_d0,
+                counts.n_raw_d0,
+            ),
+        ] {
+            if n_ref + n_own + n_raw != slots_total {
+                return Err(format!(
+                    "{} {profile} {scope_row}: kind partition does not reconcile",
+                    counts.program
+                ));
+            }
+            let raw_share = if slots_total == 0 {
+                "0.00".to_owned()
+            } else {
+                format!("{:.2}", n_raw as f64 * 100.0 / slots_total as f64)
+            };
+            let row = [
+                counts.program.clone(),
+                profile.to_owned(),
+                scope_row.to_owned(),
+                universe.to_owned(),
+                slots_total.to_string(),
+                n_ref.to_string(),
+                n_own.to_string(),
+                n_raw.to_string(),
+                raw_share,
+                "PASS: n_ref + n_own + n_raw = slots_total".to_owned(),
+            ];
+            output.push_str(&row.into_iter().map(csv_cell).collect::<Vec<_>>().join(","));
+            output.push('\n');
+        }
+        Ok(output)
+    }
+
+    pub fn legacy_full_scope_csv_row(
+        program: &str,
+        status: &str,
+        counts: Option<&LegacyFullScopeHistogram>,
+    ) -> Result<String, String> {
+        let mut row = vec![
+            program.to_owned(),
+            status.to_owned(),
+            "all legacy pre-transform decision subjects; final decision kind".to_owned(),
+        ];
+        if let Some(counts) = counts {
+            let safe_total = counts.ref_count()
+                + counts.opt_ref_count()
+                + counts.slice_count()
+                + counts.slice_cursor_count()
+                + counts.box_family_count();
+            let raw_total = counts.raw_false + counts.raw_true;
+            if safe_total + raw_total + counts.none != counts.subjects_total() {
+                return Err(format!(
+                    "{program}: legacy kind partition does not reconcile"
+                ));
+            }
+            row.extend([
+                counts.subjects_total().to_string(),
+                counts.ref_count().to_string(),
+                counts.opt_ref_count().to_string(),
+                counts.slice_count().to_string(),
+                counts.slice_cursor_count().to_string(),
+                counts.r#box.to_string(),
+                counts.opt_box.to_string(),
+                counts.boxed_slice.to_string(),
+                counts.opt_boxed_slice.to_string(),
+                counts.raw_false.to_string(),
+                counts.raw_true.to_string(),
+                counts.none.to_string(),
+                safe_total.to_string(),
+                counts.box_family_count().to_string(),
+                raw_total.to_string(),
+                "PASS: Σ final kinds + None = subjects_total".to_owned(),
+            ]);
+        } else {
+            row.extend(std::iter::repeat_n(String::new(), 16));
+        }
+        Ok(format!(
+            "{}\n",
+            row.into_iter().map(csv_cell).collect::<Vec<_>>().join(",")
+        ))
+    }
+
     impl LegacyDecisionKind {
         fn parse(value: &str) -> Self {
             if value.starts_with("OptRef(") {
@@ -360,6 +562,115 @@ mod crown_projection {
                     | Self::OptBoxedSlice
             )
         }
+    }
+
+    pub fn classify_legacy_safe_backing(
+        kinds: &[LegacyDecisionKind],
+    ) -> Result<LegacyBackingKind, String> {
+        if classify_legacy_subjects(MappingCompleteness::Complete, kinds)
+            != ProjectionOutcome::Eliminated
+        {
+            return Err("legacy backing classification requires a non-empty safe group".to_owned());
+        }
+        if kinds.iter().any(|kind| {
+            matches!(
+                kind,
+                LegacyDecisionKind::Box
+                    | LegacyDecisionKind::OptBox
+                    | LegacyDecisionKind::BoxedSlice
+                    | LegacyDecisionKind::OptBoxedSlice
+            )
+        }) {
+            Ok(LegacyBackingKind::BoxFamily)
+        } else {
+            Ok(LegacyBackingKind::RefSlice)
+        }
+    }
+
+    pub fn parse_bo_full_scope_counts(input: &str) -> Result<BoFullScopeCounts, String> {
+        let lines = input
+            .lines()
+            .filter(|line| line.starts_with("BOC1 "))
+            .collect::<Vec<_>>();
+        let [line] = lines.as_slice() else {
+            return Err(format!(
+                "expected exactly one BOC1 result row, found {}",
+                lines.len()
+            ));
+        };
+        let row = report::parse_kv_line(line).ok_or_else(|| "malformed BOC1 row".to_owned())?;
+        let mut fields = BTreeSet::new();
+        for (key, _) in &row.0 {
+            if !fields.insert(key) {
+                return Err(format!("duplicate BOC1 field {key}"));
+            }
+        }
+        let required = |key: &str| row.get(key).ok_or_else(|| format!("BOC1 row lacks {key}"));
+        if required("mode")? != "bo" || required("status")? != "ok" {
+            return Err("BOC1 full-scope row must be mode=bo status=ok".to_owned());
+        }
+        let parse = |key: &str| {
+            required(key)?
+                .parse::<usize>()
+                .map_err(|_| format!("BOC1 {key} is not an integer"))
+        };
+        let counts = BoFullScopeCounts {
+            program: required("program")?.to_owned(),
+            slots_total: parse("slots_total")?,
+            n_ref: parse("n_ref")?,
+            n_own: parse("n_own")?,
+            n_raw: parse("n_raw")?,
+            n_ref_d0: parse("n_ref_d0")?,
+            n_own_d0: parse("n_own_d0")?,
+            n_raw_d0: parse("n_raw_d0")?,
+        };
+        if counts.n_ref + counts.n_own + counts.n_raw != counts.slots_total {
+            return Err("BOC1 n_ref + n_own + n_raw != slots_total".to_owned());
+        }
+        if counts.d0_local_slots() > counts.slots_total {
+            return Err("BOC1 d0 local-slot partition exceeds slots_total".to_owned());
+        }
+        if counts.n_ref_d0 > counts.n_ref
+            || counts.n_own_d0 > counts.n_own
+            || counts.n_raw_d0 > counts.n_raw
+        {
+            return Err("BOC1 d0 kind count exceeds its all-scope count".to_owned());
+        }
+        Ok(counts)
+    }
+
+    pub fn parse_legacy_full_scope_histogram(
+        input: &str,
+    ) -> Result<LegacyFullScopeHistogram, String> {
+        let mut counts = LegacyFullScopeHistogram::default();
+        for line in input
+            .lines()
+            .filter(|line| line.starts_with("[pointer-decision] subject="))
+        {
+            let value = line
+                .split_whitespace()
+                .find_map(|field| field.strip_prefix("final="))
+                .ok_or_else(|| format!("pointer decision lacks final kind: {line}"))?;
+            match value {
+                "Ref(false)" => counts.ref_false += 1,
+                "Ref(true)" => counts.ref_true += 1,
+                "OptRef(false)" => counts.opt_ref_false += 1,
+                "OptRef(true)" => counts.opt_ref_true += 1,
+                "Slice(false)" => counts.slice_false += 1,
+                "Slice(true)" => counts.slice_true += 1,
+                "SliceCursor(false)" => counts.slice_cursor_false += 1,
+                "SliceCursor(true)" => counts.slice_cursor_true += 1,
+                "Box" => counts.r#box += 1,
+                "OptBox" => counts.opt_box += 1,
+                "BoxedSlice" => counts.boxed_slice += 1,
+                "OptBoxedSlice" => counts.opt_boxed_slice += 1,
+                "Raw(false)" => counts.raw_false += 1,
+                "Raw(true)" => counts.raw_true += 1,
+                "None" => counts.none += 1,
+                _ => return Err(format!("unknown final decision kind {value}")),
+            }
+        }
+        Ok(counts)
     }
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -7565,9 +7876,12 @@ fn boc1_crown_projection_combine() {
     use std::{collections::BTreeMap, fs, path::PathBuf};
 
     use crown_projection::{
-        csv_cell, load_official_program, read_legacy_snapshot, read_model_snapshot,
-        CrownRealizedKind, ModelEvidence, ProjectionOutcome, CROWN_LABEL, LEGACY_LABEL,
-        MODEL_LABEL,
+        BO_FULL_SCOPE_CSV_HEADER, BoFullScopeCounts, CROWN_LABEL, CrownRealizedKind,
+        LEGACY_FULL_SCOPE_CSV_HEADER, LEGACY_LABEL, LegacyBackingKind, LegacyEvidence,
+        LegacyFullScopeHistogram, MODEL_LABEL, ModelEvidence, ProjectionOutcome,
+        bo_full_scope_csv_rows, classify_legacy_safe_backing, csv_cell, legacy_full_scope_csv_row,
+        load_official_program, parse_bo_full_scope_counts, parse_legacy_full_scope_histogram,
+        read_legacy_snapshot, read_model_snapshot,
     };
 
     #[derive(Default)]
@@ -7577,6 +7891,20 @@ fn boc1_crown_projection_combine() {
         owning_backed: usize,
         remaining: usize,
         unmapped: usize,
+    }
+
+    #[derive(Default)]
+    struct LegacyCounts {
+        ref_slice_backed: usize,
+        box_family_backed: usize,
+        remaining: usize,
+        unmapped: usize,
+    }
+
+    impl LegacyCounts {
+        fn eliminated(&self) -> usize {
+            self.ref_slice_backed + self.box_family_backed
+        }
     }
 
     fn model_counts(records: &BTreeMap<String, ModelEvidence>) -> Counts {
@@ -7594,6 +7922,26 @@ fn boc1_crown_projection_combine() {
                 ProjectionOutcome::Remaining => counts.remaining += 1,
                 ProjectionOutcome::Unmapped => counts.unmapped += 1,
                 ProjectionOutcome::Eliminated => unreachable!("BO has split eliminated kinds"),
+            }
+        }
+        counts
+    }
+
+    fn legacy_counts(records: &BTreeMap<String, LegacyEvidence>) -> LegacyCounts {
+        let mut counts = LegacyCounts::default();
+        for record in records.values() {
+            match record.outcome {
+                ProjectionOutcome::Eliminated => {
+                    match classify_legacy_safe_backing(&record.kinds)
+                        .expect("eliminated legacy record must have only safe backing kinds")
+                    {
+                        LegacyBackingKind::BoxFamily => counts.box_family_backed += 1,
+                        LegacyBackingKind::RefSlice => counts.ref_slice_backed += 1,
+                    }
+                }
+                ProjectionOutcome::Remaining => counts.remaining += 1,
+                ProjectionOutcome::Unmapped => counts.unmapped += 1,
+                _ => unreachable!("legacy uses unsplit safe outcome"),
             }
         }
         counts
@@ -7621,7 +7969,7 @@ fn boc1_crown_projection_combine() {
     fs::create_dir_all(&output).expect("create combined output");
 
     let mut comparison = String::from(
-        "program,metric_scope,universe_before,CROWN_epistemic_status,CROWN_after,CROWN_realized_eliminated,CROWN_realized_reference,CROWN_realized_Box,CROWN_usage_before,CROWN_usage_after,CROWN_usage_reduction_percent,legacy_epistemic_status,legacy_predicted_eliminated,legacy_predicted_remaining_mapped,legacy_unmapped_counted_remaining,legacy_predicted_remaining_including_unmapped,legacy_unmapped_percent,legacy_validity_flag,BO_Mode_A_epistemic_status,BO_Mode_A_predicted_eliminated,BO_Mode_A_predicted_ref_backed,BO_Mode_A_predicted_owning_backed,BO_Mode_A_predicted_remaining_mapped,BO_Mode_A_unmapped_counted_remaining,BO_Mode_A_predicted_remaining_including_unmapped,BO_Mode_A_unmapped_percent,BO_Mode_A_validity_flag,BO_L2_on_epistemic_status,BO_L2_on_predicted_eliminated,BO_L2_on_predicted_ref_backed,BO_L2_on_predicted_owning_backed,BO_L2_on_predicted_remaining_mapped,BO_L2_on_unmapped_counted_remaining,BO_L2_on_predicted_remaining_including_unmapped,BO_L2_on_unmapped_percent,BO_L2_on_validity_flag\n",
+        "program,metric_scope,universe_before,CROWN_epistemic_status,CROWN_after,CROWN_realized_eliminated,CROWN_realized_reference,CROWN_realized_Box,CROWN_usage_before,CROWN_usage_after,CROWN_usage_reduction_percent,legacy_epistemic_status,legacy_predicted_eliminated,legacy_predicted_ref_slice_backed,legacy_predicted_Box_family_backed,legacy_predicted_remaining_mapped,legacy_unmapped_counted_remaining,legacy_predicted_remaining_including_unmapped,legacy_unmapped_percent,legacy_validity_flag,BO_Mode_A_epistemic_status,BO_Mode_A_predicted_eliminated,BO_Mode_A_predicted_ref_backed,BO_Mode_A_predicted_owning_backed,BO_Mode_A_predicted_remaining_mapped,BO_Mode_A_unmapped_counted_remaining,BO_Mode_A_predicted_remaining_including_unmapped,BO_Mode_A_unmapped_percent,BO_Mode_A_validity_flag,BO_L2_on_epistemic_status,BO_L2_on_predicted_eliminated,BO_L2_on_predicted_ref_backed,BO_L2_on_predicted_owning_backed,BO_L2_on_predicted_remaining_mapped,BO_L2_on_unmapped_counted_remaining,BO_L2_on_predicted_remaining_including_unmapped,BO_L2_on_unmapped_percent,BO_L2_on_validity_flag\n",
     );
     let mut evidence = String::from(
         "program,declaration_key,CROWN_epistemic_status,CROWN_realized_status,legacy_epistemic_status,legacy_mapping,legacy_prediction,legacy_mapped_subjects,legacy_final_kinds,BO_Mode_A_epistemic_status,BO_Mode_A_mapping,BO_Mode_A_prediction,BO_Mode_A_mapped_MIR_locals,BO_Mode_A_mapped_d0_slots,BO_Mode_A_raw_slots,BO_Mode_A_ref_slots,BO_Mode_A_owning_slots,BO_Mode_A_slot_keys,BO_L2_on_epistemic_status,BO_L2_on_mapping,BO_L2_on_prediction,BO_L2_on_mapped_MIR_locals,BO_L2_on_mapped_d0_slots,BO_L2_on_raw_slots,BO_L2_on_ref_slots,BO_L2_on_owning_slots,BO_L2_on_slot_keys\n",
@@ -7636,7 +7984,7 @@ fn boc1_crown_projection_combine() {
     let mut corpus_mode_a = Counts::default();
     let mut corpus_l2 = Counts::default();
     let mut legacy_19_universe = 0usize;
-    let mut legacy_19 = Counts::default();
+    let mut legacy_19 = LegacyCounts::default();
     let mut crown_19_after = 0usize;
     let mut crown_19_ref = 0usize;
     let mut crown_19_box = 0usize;
@@ -7705,17 +8053,9 @@ fn boc1_crown_projection_combine() {
             Some(records)
         };
         let legacy_counts = legacy.as_ref().map(|records| {
-            let mut counts = Counts::default();
-            for record in records.values() {
-                match record.outcome {
-                    ProjectionOutcome::Eliminated => counts.eliminated += 1,
-                    ProjectionOutcome::Remaining => counts.remaining += 1,
-                    ProjectionOutcome::Unmapped => counts.unmapped += 1,
-                    _ => unreachable!("legacy uses unsplit safe outcome"),
-                }
-            }
+            let counts = legacy_counts(records);
             assert_eq!(
-                counts.eliminated + counts.remaining + counts.unmapped,
+                counts.eliminated() + counts.remaining + counts.unmapped,
                 official.universe.len(),
                 "{}: legacy eliminated + remaining + unmapped != BEFORE",
                 program.name
@@ -7744,7 +8084,9 @@ fn boc1_crown_projection_combine() {
         let legacy_cells = if let Some(counts) = &legacy_counts {
             vec![
                 LEGACY_LABEL.to_owned(),
-                counts.eliminated.to_string(),
+                counts.eliminated().to_string(),
+                counts.ref_slice_backed.to_string(),
+                counts.box_family_backed.to_string(),
                 counts.remaining.to_string(),
                 counts.unmapped.to_string(),
                 (counts.remaining + counts.unmapped).to_string(),
@@ -7758,6 +8100,8 @@ fn boc1_crown_projection_combine() {
         } else {
             vec![
                 "unmeasurable: urlparser pre-seam parser panic".to_owned(),
+                String::new(),
+                String::new(),
                 String::new(),
                 String::new(),
                 String::new(),
@@ -7873,7 +8217,8 @@ fn boc1_crown_projection_combine() {
         }
         if let Some(counts) = legacy_counts {
             legacy_19_universe += official.universe.len();
-            legacy_19.eliminated += counts.eliminated;
+            legacy_19.ref_slice_backed += counts.ref_slice_backed;
+            legacy_19.box_family_backed += counts.box_family_backed;
             legacy_19.remaining += counts.remaining;
             legacy_19.unmapped += counts.unmapped;
             crown_19_after += official.evaluation.declaration_after as usize;
@@ -7901,6 +8246,9 @@ fn boc1_crown_projection_combine() {
         corpus_l2.eliminated + corpus_l2.remaining + corpus_l2.unmapped,
         2_414
     );
+    assert_eq!(legacy_19.eliminated(), 1_457);
+    assert_eq!(legacy_19.ref_slice_backed, 1_438);
+    assert_eq!(legacy_19.box_family_backed, 19);
 
     let aggregate_model_cells = |counts: &Counts, denominator: usize| {
         vec![
@@ -7932,7 +8280,9 @@ fn boc1_crown_projection_combine() {
         String::new(),
         String::new(),
         LEGACY_LABEL.to_owned(),
-        legacy_19.eliminated.to_string(),
+        legacy_19.eliminated().to_string(),
+        legacy_19.ref_slice_backed.to_string(),
+        legacy_19.box_family_backed.to_string(),
         legacy_19.remaining.to_string(),
         legacy_19.unmapped.to_string(),
         (legacy_19.remaining + legacy_19.unmapped).to_string(),
@@ -7977,6 +8327,8 @@ fn boc1_crown_projection_combine() {
         String::new(),
         String::new(),
         String::new(),
+        String::new(),
+        String::new(),
         "unmeasurable".to_owned(),
     ];
     corpus.extend(aggregate_model_cells(&corpus_mode_a, corpus_universe));
@@ -7989,6 +8341,93 @@ fn boc1_crown_projection_combine() {
             .join(","),
     );
     comparison.push('\n');
+
+    let mut bo_full_scope = String::from(BO_FULL_SCOPE_CSV_HEADER);
+    for (root, profile, expected_ref, expected_own, expected_raw) in [
+        (&mode_a_root, "Mode-A L2-off", 52_810, 230, 9_742),
+        (&l2_root, "Mode-A L2-on", 53_041, 240, 9_501),
+    ] {
+        let mut total = BoFullScopeCounts {
+            program: "CORPUS_20".to_owned(),
+            slots_total: 0,
+            n_ref: 0,
+            n_own: 0,
+            n_raw: 0,
+            n_ref_d0: 0,
+            n_own_d0: 0,
+            n_raw_d0: 0,
+        };
+        for program in CORPUS {
+            let log_path = root.join("logs").join(format!("{}.bo.out", program.name));
+            let counts = parse_bo_full_scope_counts(
+                &fs::read_to_string(&log_path)
+                    .unwrap_or_else(|error| panic!("{}: {error}", log_path.display())),
+            )
+            .unwrap_or_else(|error| panic!("{} {profile}: {error}", program.name));
+            assert_eq!(counts.program, program.name);
+            bo_full_scope.push_str(
+                &bo_full_scope_csv_rows(profile, &counts).unwrap_or_else(|error| panic!("{error}")),
+            );
+            total.slots_total += counts.slots_total;
+            total.n_ref += counts.n_ref;
+            total.n_own += counts.n_own;
+            total.n_raw += counts.n_raw;
+            total.n_ref_d0 += counts.n_ref_d0;
+            total.n_own_d0 += counts.n_own_d0;
+            total.n_raw_d0 += counts.n_raw_d0;
+        }
+        assert_eq!(total.slots_total, 62_782, "{profile}: slots_total drifted");
+        assert_eq!(total.n_ref, expected_ref, "{profile}: n_ref drifted");
+        assert_eq!(total.n_own, expected_own, "{profile}: n_own drifted");
+        assert_eq!(total.n_raw, expected_raw, "{profile}: n_raw drifted");
+        bo_full_scope.push_str(
+            &bo_full_scope_csv_rows(profile, &total).unwrap_or_else(|error| panic!("{error}")),
+        );
+    }
+
+    let mut legacy_full_scope = String::from(LEGACY_FULL_SCOPE_CSV_HEADER);
+    let mut legacy_corpus = LegacyFullScopeHistogram::default();
+    for program in CORPUS {
+        if program.name == "urlparser" {
+            legacy_full_scope.push_str(
+                &legacy_full_scope_csv_row(
+                    program.name,
+                    "unmeasurable: urlparser pre-seam parser panic",
+                    None,
+                )
+                .unwrap_or_else(|error| panic!("{error}")),
+            );
+            continue;
+        }
+        let log_path = mode_a_root
+            .join("logs")
+            .join(format!("{}.prod-box.err", program.name));
+        let counts = parse_legacy_full_scope_histogram(
+            &fs::read_to_string(&log_path)
+                .unwrap_or_else(|error| panic!("{}: {error}", log_path.display())),
+        )
+        .unwrap_or_else(|error| panic!("{} legacy full-scope: {error}", program.name));
+        assert!(
+            counts.subjects_total() > 0,
+            "{}: legacy diagnostic contains no decision subjects",
+            program.name
+        );
+        legacy_full_scope.push_str(
+            &legacy_full_scope_csv_row(program.name, "measured", Some(&counts))
+                .unwrap_or_else(|error| panic!("{error}")),
+        );
+        legacy_corpus.add_assign(&counts);
+    }
+    assert_eq!(legacy_corpus.subjects_total(), 8_335);
+    assert_eq!(legacy_corpus.box_family_count(), 84);
+    legacy_full_scope.push_str(
+        &legacy_full_scope_csv_row(
+            "CORPUS_19_MEASURABLE",
+            "measured; urlparser excluded as unmeasurable",
+            Some(&legacy_corpus),
+        )
+        .unwrap_or_else(|error| panic!("{error}")),
+    );
 
     let mut runs = String::from(
         "program,system,epistemic_status,worker_status,wall_seconds,repair,L2_guarded_commits,smt_random_seed,sat_random_seed,timeout_seconds,memory_mib,n_ref_internal,n_own_internal,official_universe_rows,unmapped_rows,unmapped_percent,validity_flag,note\n",
@@ -8095,18 +8534,27 @@ fn boc1_crown_projection_combine() {
     let comparison_path = output.join("2026-07-27-crown-official-metric-projection.csv");
     let evidence_path = output.join("2026-07-27-crown-official-metric-declarations.csv");
     let runs_path = output.join("2026-07-27-crown-official-metric-runs.csv");
+    let bo_full_scope_path = output.join("2026-07-27-bo-full-scope-kind-distribution.csv");
+    let legacy_full_scope_path = output.join("2026-07-27-legacy-full-scope-decision-histogram.csv");
     fs::write(&comparison_path, comparison).expect("write comparison CSV");
     fs::write(&evidence_path, evidence).expect("write evidence CSV");
     fs::write(&runs_path, runs).expect("write runs CSV");
+    fs::write(&bo_full_scope_path, bo_full_scope).expect("write BO full-scope CSV");
+    fs::write(&legacy_full_scope_path, legacy_full_scope).expect("write legacy full-scope CSV");
     eprintln!(
-        "CROWNPROJECTION combined universe=2414 CROWN=703({}+{}) mode_a={} l2={} files={},{},{}",
+        "CROWNPROJECTION combined universe=2414 CROWN=703({}+{}) legacy={}({}+{}) mode_a={} l2={} files={},{},{},{},{}",
         corpus_crown_ref,
         corpus_crown_box,
+        legacy_19.eliminated(),
+        legacy_19.ref_slice_backed,
+        legacy_19.box_family_backed,
         corpus_mode_a.eliminated,
         corpus_l2.eliminated,
         comparison_path.display(),
         evidence_path.display(),
         runs_path.display(),
+        bo_full_scope_path.display(),
+        legacy_full_scope_path.display(),
     );
 }
 
@@ -11179,9 +11627,11 @@ mod crown_projection_red_tests {
     use rustc_hash::FxHashMap;
 
     use super::crown_projection::{
-        classify_legacy_subjects, classify_model_slots, csv_cell, parse_legacy_decisions,
-        project_model_for_universe, LegacyDecisionKind, MappingCompleteness, ModelKind,
-        ProjectionOutcome,
+        BoFullScopeCounts, LegacyBackingKind, LegacyDecisionKind, MappingCompleteness, ModelKind,
+        ProjectionOutcome, bo_full_scope_csv_rows, classify_legacy_safe_backing,
+        classify_legacy_subjects, classify_model_slots, csv_cell, legacy_full_scope_csv_row,
+        parse_bo_full_scope_counts, parse_legacy_decisions, parse_legacy_full_scope_histogram,
+        project_model_for_universe,
     };
 
     #[test]
@@ -11278,9 +11728,152 @@ mod crown_projection_red_tests {
     }
 
     #[test]
+    fn crown_projection_classifies_legacy_safe_backing_with_box_precedence() {
+        assert_eq!(
+            classify_legacy_safe_backing(&[LegacyDecisionKind::Ref, LegacyDecisionKind::Box])
+                .expect("safe mixed group"),
+            LegacyBackingKind::BoxFamily
+        );
+        assert_eq!(
+            classify_legacy_safe_backing(&[
+                LegacyDecisionKind::OptRef,
+                LegacyDecisionKind::SliceCursor,
+            ])
+            .expect("safe reference/slice group"),
+            LegacyBackingKind::RefSlice
+        );
+        assert!(classify_legacy_safe_backing(&[]).is_err());
+        assert!(
+            classify_legacy_safe_backing(&[LegacyDecisionKind::Ref, LegacyDecisionKind::Raw])
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn crown_projection_strictly_parses_bo_full_scope_counts() {
+        let input = "\
+running 1 test
+BOC1 program=sample mode=bo slots_total=20 status=ok n_ref=11 n_raw=7 n_own=2 n_ref_d0=9 n_raw_d0=6 n_own_d0=1
+test result: ok
+";
+        let counts = parse_bo_full_scope_counts(input).expect("BO full-scope counts");
+        assert_eq!(counts.program, "sample");
+        assert_eq!(counts.slots_total, 20);
+        assert_eq!(counts.n_ref, 11);
+        assert_eq!(counts.n_own, 2);
+        assert_eq!(counts.n_raw, 7);
+        assert_eq!(counts.d0_local_slots(), 16);
+
+        assert!(parse_bo_full_scope_counts(input.replace(" n_raw=7", "").as_str()).is_err());
+        assert!(
+            parse_bo_full_scope_counts(input.replace(" n_own=2", " n_raw=7 n_own=2").as_str())
+                .is_err()
+        );
+        assert!(parse_bo_full_scope_counts(&input.replace("mode=bo", "mode=legacy")).is_err());
+        assert!(parse_bo_full_scope_counts(&input.replace("status=ok", "status=failed")).is_err());
+        assert!(parse_bo_full_scope_counts(&format!("{input}{input}")).is_err());
+        assert!(
+            parse_bo_full_scope_counts(&input.replace("slots_total=20", "slots_total=19")).is_err()
+        );
+        assert!(parse_bo_full_scope_counts(&input.replace("n_raw_d0=6", "n_raw_d0=18")).is_err());
+        assert!(
+            parse_bo_full_scope_counts(
+                &input
+                    .replace("n_ref_d0=9", "n_ref_d0=12")
+                    .replace("n_raw_d0=6", "n_raw_d0=3"),
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn crown_projection_emits_exact_bo_full_scope_csv_rows() {
+        let counts = BoFullScopeCounts {
+            program: "sample".to_owned(),
+            slots_total: 20,
+            n_ref: 11,
+            n_own: 2,
+            n_raw: 7,
+            n_ref_d0: 9,
+            n_own_d0: 1,
+            n_raw_d0: 6,
+        };
+        assert_eq!(
+            bo_full_scope_csv_rows("Mode-A L2-off", &counts).expect("BO rows"),
+            "\
+sample,Mode-A L2-off,all slots,BO local + field slots at all pointer depths,20,11,2,7,35.00,PASS: n_ref + n_own + n_raw = slots_total
+sample,Mode-A L2-off,d0 local slots,BO depth-0 local slots only; fields excluded,16,9,1,6,37.50,PASS: n_ref + n_own + n_raw = slots_total
+"
+        );
+    }
+
+    #[test]
+    fn crown_projection_strictly_parses_legacy_full_scope_histogram() {
+        let input = "\
+[pointer-decision] subject=local fn=f name=a original=*mut i32 final=Ref(true)
+[pointer-decision] subject=param fn=f name=b original=*mut i32 final=Ref(false)
+[pointer-decision] subject=return fn=f original=*mut i32 final=OptRef(true)
+[pointer-decision] subject=field owner=S name=x original=*mut i32 final=Slice(false)
+[pointer-decision] subject=local fn=f name=c original=*mut i32 final=SliceCursor(true)
+[pointer-decision] subject=local fn=f name=d original=*mut i32 final=Box
+[pointer-decision] subject=local fn=f name=e original=*mut i32 final=OptBox
+[pointer-decision] subject=local fn=f name=f original=*mut i32 final=BoxedSlice
+[pointer-decision] subject=local fn=f name=g original=*mut i32 final=OptBoxedSlice
+[pointer-decision] subject=local fn=f name=h original=*mut i32 final=Raw(false)
+[pointer-decision] subject=local fn=f name=i original=*mut i32 final=Raw(true)
+[pointer-decision] subject=local fn=f name=j original=*mut i32 final=None
+";
+        let counts = parse_legacy_full_scope_histogram(input).expect("legacy full-scope histogram");
+        assert_eq!(counts.subjects_total(), 12);
+        assert_eq!(counts.ref_count(), 2);
+        assert_eq!(counts.opt_ref_count(), 1);
+        assert_eq!(counts.slice_count(), 1);
+        assert_eq!(counts.slice_cursor_count(), 1);
+        assert_eq!(counts.box_family_count(), 4);
+        assert_eq!(counts.raw_false, 1);
+        assert_eq!(counts.raw_true, 1);
+        assert_eq!(counts.none, 1);
+
+        assert!(
+            parse_legacy_full_scope_histogram(
+                "[pointer-decision] subject=local fn=f name=x final=UnknownKind\n"
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn crown_projection_emits_exact_legacy_full_scope_csv_rows() {
+        let counts = parse_legacy_full_scope_histogram(
+            "\
+[pointer-decision] subject=local fn=f name=a final=Ref(true)
+[pointer-decision] subject=local fn=f name=b final=Box
+[pointer-decision] subject=local fn=f name=c final=Raw(false)
+[pointer-decision] subject=local fn=f name=d final=None
+",
+        )
+        .expect("legacy counts");
+        assert_eq!(
+            legacy_full_scope_csv_row("sample", "measured", Some(&counts)).expect("legacy row"),
+            "\
+sample,measured,all legacy pre-transform decision subjects; final decision kind,4,1,0,0,0,1,0,0,0,1,0,1,2,1,1,PASS: Σ final kinds + None = subjects_total
+"
+        );
+        assert_eq!(
+            legacy_full_scope_csv_row(
+                "urlparser",
+                "unmeasurable: urlparser pre-seam parser panic",
+                None,
+            )
+            .expect("unmeasurable row"),
+            "urlparser,unmeasurable: urlparser pre-seam parser panic,all legacy pre-transform decision subjects; final decision kind,,,,,,,,,,,,,,,,\n"
+        );
+    }
+
+    #[test]
     fn crown_projection_maps_debug_declarations_through_existing_mir_groups() {
         use crate::analyses::borrow_ownership::{
-            crate_slots::CrateSlots, slots::SlotId, solver::SlotRef, SlotKind,
+            SlotKind, crate_slots::CrateSlots, slots::SlotId, solver::SlotRef,
         };
 
         ::utils::compilation::run_compiler_on_str(
