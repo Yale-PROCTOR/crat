@@ -6869,6 +6869,17 @@ fn boc1_corpus() {
         let retry_timeout = Duration::from_secs(3600);
         let mut rows = Vec::<Row>::new();
         let mut retry_queue = Vec::<CorpusProgram>::new();
+        let clean_note = |note: &str| {
+            note.chars()
+                .map(|character| {
+                    if character.is_control() {
+                        '_'
+                    } else {
+                        character
+                    }
+                })
+                .collect::<String>()
+        };
 
         let record_counts = |program: &CorpusProgram,
                              outcome: &orchestrate::ChildOutcome,
@@ -6921,7 +6932,7 @@ fn boc1_corpus() {
                 }
                 DiagnosticWorkerDisposition::CorrectnessFailure => {
                     row.set("status", format!("failed-{}", outcome.status));
-                    row.set("note", &outcome.note);
+                    row.set("note", clean_note(&outcome.note));
                 }
             }
             rows.push(row);
@@ -6975,7 +6986,7 @@ fn boc1_corpus() {
                 }
                 DiagnosticWorkerDisposition::CorrectnessFailure => {
                     row.set("status", format!("failed-{}", outcome.status));
-                    row.set("note", &outcome.note);
+                    row.set("note", clean_note(&outcome.note));
                 }
             }
         }
