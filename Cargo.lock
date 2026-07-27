@@ -954,6 +954,7 @@ dependencies = [
  "serde",
  "serde_json",
  "similar",
+ "syn",
  "tracing",
  "typed-arena",
  "utils",
