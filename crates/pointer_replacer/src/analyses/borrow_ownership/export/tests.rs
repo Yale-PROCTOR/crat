@@ -978,9 +978,22 @@ fn l2_door_rejects_a_tracked_solver() {
 /// loans (more than one loan at one location), or the permutation has nothing
 /// to permute and the test proves nothing.
 ///
-/// *Mutation-tested, Rider 0 order.* **Deletion first:** revert the key to the
-/// run-local index — i.e. compare `run_local_handle` sets instead of `key`
-/// sets — and this fails whenever the two runs number siblings differently.
+/// *Mutation-tested, Rider 0 order.* The mutation actually run compares
+/// `(fn_did, run_local_handle, place.local)` triples instead of `key`s:
+/// **failed 8/8 runs; unmutated passed 8/8.**
+///
+/// **Correction to an earlier version of this note**, which said the mutation
+/// was "compare `run_local_handle` sets instead of `key` sets". That recipe is
+/// WEAKER than what was run and would NOT fail: handles are exactly
+/// `0..n_f-1` per function in both runs (`record_loan_identities` walks
+/// `loans.iter_enumerated()` with no filtering), so the bare-handle sets are
+/// equal by construction. The measurement is real; the recipe as written
+/// described a different mutation.
+///
+/// **Known gap (not fixed here):** nothing asserts a permutation actually
+/// OCCURRED between the two runs, so this witness would silently stop guarding
+/// if `utils/dsa/union_find.rs` ever used a deterministic hasher. The stronger
+/// form is to build `handle -> key` maps for both runs and `assert_ne!` them.
 #[test]
 fn loan_keys_are_stable_across_reinference() {
     let first = capture_solve(CASCADE).1;
@@ -994,6 +1007,12 @@ fn loan_keys_are_stable_across_reinference() {
             .entry((l.key.fn_did, l.key.location))
             .or_default() += 1;
     }
+    // NOTE (accepted limitation): >1 loan at one site is a PROXY for a
+    // multi-member `group()`, and it is not exact — a call with two pointer
+    // arguments also puts two `CallArg` loans at one terminator, and those come
+    // from a deterministic `args.iter().enumerate()`, not from `group()`. For
+    // CASCADE (single-argument `id`) the proxy is satisfied via group siblings,
+    // but a different fixture could satisfy it with nothing permutable.
     assert!(
         per_site.values().any(|n| *n > 1),
         "fixture has no sibling loans, so nothing can permute — this witness \

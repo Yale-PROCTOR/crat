@@ -3,6 +3,97 @@
 Five adversarial review lenses ran against `f9ee8fee` (read-only). 38 raw
 findings; nine re-verified and accepted. Four were HIGH and blocked merge.
 
+## FINAL CYCLE + CORPUS GATES (2026-07-28)
+
+**Both corpus-scale gates PASS, and the guardrail FIRED on a new HIGH.**
+
+### R4 differential — ANCHOR-EXACT
+
+Sorted vs unsorted Mode-A commit emission, all 20 rs-crown programs, two fresh
+complete sweeps (`CRAT_BOC1_PROD=0`, dev machine, ~15 min each):
+
+**Zero non-timing differences.** `rounds`, `commits_conflict`,
+`commits_per_round`, `check_sat_count`, `n_ref`/`n_raw`/`n_own` (+ d0),
+`sinks_leaked`, `sources_leaked`, `selectors` — identical program for program;
+status `ok` on all 20 both sides. Timing columns excluded as non-semantic, and
+that exclusion is stated rather than silent.
+
+The measurement's risk basis held: **order varied, models did not.** The sort
+ships. No previously reported row is byte-comparable to a post-sort row, but
+that was already true — the pre-sort order was itself unstable across processes.
+
+### Export-on/off identity — PASSES
+
+`with_bo_export` has no non-test caller (D4 removed ambient enablement), so
+"export-on" was produced by **temporarily** reinstating the ambient path in
+`capturing()` — three lines, uncommitted, reverted after the run — rather than
+wrapping the sweep's solve region, which is large and full of early returns.
+That makes every capture point genuinely record at corpus scale.
+
+**Zero non-timing differences** vs the capture-off baseline across all 20
+programs; all `ok`; no OOM and no timeout despite the ambient path never
+bracketing its buffers. Recording-only holds at corpus scale.
+
+### Guardrail: TRIGGERED (second time)
+
+**ADV-1 (HIGH, confirmed by reading source):** §2's "all four corrupting probe
+surfaces" is **false**. `solve_with_demotion` does a full `KindSolver::new` →
+`emit_crate_ownership_constraints` → `add_coherence` →
+`verify_to_fixpoint_with_flows`, and is reached from `measure_collateral`
+(`CRAT_BOC1_COLLATERAL=1`) **43 lines above** the `CHECK_REAL` block that WAS
+wrapped — plus a sixth surface via `explain_unsat`. Latent (capture has no
+non-test caller), but it is the claim M1 would build on.
+
+**Why my enumeration missed it:** I searched for solver constructions *in the
+probe region*; `solve_with_demotion` builds its solver inside a helper, so it
+was invisible to that search. This is the **second** enumeration-completeness
+HIGH in two cycles (F1 was the first) — the pattern the guardrail exists to
+catch. NOT patched. The remedy is structural, not another wrapper: a greppable
+assertion that every `KindSolver::new*` reachable from `boc1_run_one` other
+than the reported one is suspension-wrapped.
+
+### Record corrections made (docs-only, not a fix cycle)
+
+- **ADV-2:** the mutation recipe recorded for
+  `loan_keys_are_stable_across_reinference` ("compare `run_local_handle` sets")
+  is **weaker than the mutation actually run** and would not fail — handles are
+  `0..n_f-1` per function in both runs, so bare-handle sets are equal by
+  construction. The 8/8 measurement is real; it used
+  `(fn_did, run_local_handle, place.local)` triples. Corrected in place, with
+  the remaining gap recorded: nothing asserts a permutation *occurred*, so the
+  witness dies silently if `union_find` ever becomes deterministic.
+- **ADV-3:** the non-vacuity proxy (>1 loan per site) is satisfiable by a
+  two-pointer-argument call, which is deterministic and has no `group()`
+  involvement. Recorded as an accepted limitation at the assertion.
+
+### Open from this cycle's verification (NOT fixed)
+
+- **ADV-1 (HIGH)** — above.
+- **ADV-4 (MEDIUM)** — the F4 decline witness is vacuous under
+  `CRAT_BO_L2_GUARDED_COMMITS=1` (the L2 loop never records residuals, so
+  `is_none()` holds for an unrelated reason) and carries no liveness marker on
+  the Mode-A arm. Its two sibling certificate tests already branch on the
+  profile; this one does not.
+- **ADV-5 (LOW)** — `loans` and the certificate are emitted in the very
+  iteration order §3 declared unstable, while the new derived `PartialEq`
+  compares those `Vec`s order-sensitively. Forward-looking only.
+- **ADV-6 (LOW)** — the handle guard covers a 177-line skeleton and only that
+  directory, while the field is `pub` on a `pub(crate)` struct.
+- Testing gaps recorded: no test exercises any of the bo_c1 suspension sites
+  (deleting any of the four wrappers leaves the suite green — which is why
+  ADV-1 was undetectable by test); nothing pins Mode-A's emission order.
+
+### Confirmed clean by this verification
+
+`PlaceKey::from_place` is total **and compiler-enforced** (no wildcard arm);
+`LoanKey`'s manual `Ord` is consistent with its derived `Eq`;
+`OwnerKey::from_owner` is lossless; the four closure wrappings preserved `?`,
+`pop_scope` and borrow semantics; §3's tie argument is rigorous
+(`conflict_sort_key` is injective over exactly what `representative` reads);
+the necessity audit's over-pin numbers are unaffected; recording-only holds.
+
+---
+
 **Status after fix cycle 4: D1–D4, D10–D12, D14, D16, D17, D18 CLOSED, every
 witness mutation-tested in Rider 0 order. D13 RETRACTED. D5–D9 and D15 remain
 open. One NEW HIGH — D19 — was found during implementation.**
