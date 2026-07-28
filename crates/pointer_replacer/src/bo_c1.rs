@@ -1330,6 +1330,8 @@ mod ownership_yield {
         path::Path,
     };
 
+    use crate::analyses::borrow_ownership::SlotKind;
+
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub enum OwnerClass {
         Local,
@@ -1343,6 +1345,14 @@ mod ownership_yield {
         pub depth: u8,
         pub owning: bool,
         pub forced_output: bool,
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub struct ModelKindRecord {
+        pub key: String,
+        pub owner: OwnerClass,
+        pub depth: u8,
+        pub kind: SlotKind,
     }
 
     #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -1606,6 +1616,94 @@ mod ownership_yield {
         indexed(&records, "snapshot")?;
         records.sort_by(|left, right| left.key.cmp(&right.key));
         Ok(records)
+    }
+
+    pub fn model_kind_snapshot_tsv(records: &[ModelKindRecord]) -> String {
+        let mut records = records.to_vec();
+        records.sort_by(|left, right| left.key.cmp(&right.key));
+        let mut out = String::from("key_hex\towner\tdepth\tkind\n");
+        for record in records {
+            let owner = match record.owner {
+                OwnerClass::Local => "local",
+                OwnerClass::Field => "field",
+            };
+            let kind = match record.kind {
+                SlotKind::Raw => "raw",
+                SlotKind::Ref => "ref",
+                SlotKind::Owning => "owning",
+            };
+            out.push_str(&format!(
+                "{}\t{owner}\t{}\t{kind}\n",
+                hex_encode(&record.key),
+                record.depth,
+            ));
+        }
+        out
+    }
+
+    pub fn parse_model_kind_snapshot_tsv(input: &str) -> Result<Vec<ModelKindRecord>, String> {
+        let mut records = input
+            .lines()
+            .skip(1)
+            .enumerate()
+            .filter(|(_, line)| !line.trim().is_empty())
+            .map(|(index, line)| {
+                let fields = line.split('\t').collect::<Vec<_>>();
+                if fields.len() != 4 {
+                    return Err(format!(
+                        "model-kind snapshot line {} has {} fields, expected 4",
+                        index + 2,
+                        fields.len()
+                    ));
+                }
+                let owner = match fields[1] {
+                    "local" => OwnerClass::Local,
+                    "field" => OwnerClass::Field,
+                    other => {
+                        return Err(format!(
+                            "model-kind snapshot line {} owner: {other}",
+                            index + 2
+                        ));
+                    }
+                };
+                let kind = match fields[3] {
+                    "raw" => SlotKind::Raw,
+                    "ref" => SlotKind::Ref,
+                    "owning" => SlotKind::Owning,
+                    other => {
+                        return Err(format!(
+                            "model-kind snapshot line {} kind: {other}",
+                            index + 2
+                        ));
+                    }
+                };
+                Ok(ModelKindRecord {
+                    key: hex_decode(fields[0])?,
+                    owner,
+                    depth: fields[2].parse().map_err(|error| {
+                        format!("model-kind snapshot line {} depth: {error}", index + 2)
+                    })?,
+                    kind,
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut keys = BTreeSet::new();
+        if let Some(record) = records.iter().find(|record| !keys.insert(&record.key)) {
+            return Err(format!(
+                "duplicate model-kind snapshot canonical key: {}",
+                record.key
+            ));
+        }
+        records.sort_by(|left, right| left.key.cmp(&right.key));
+        Ok(records)
+    }
+
+    pub fn write_model_kind_snapshot(
+        path: &Path,
+        records: &[ModelKindRecord],
+    ) -> Result<(), String> {
+        fs::write(path, model_kind_snapshot_tsv(records))
+            .map_err(|error| format!("write model-kind snapshot {}: {error}", path.display()))
     }
 
     fn depth(counts: &BTreeMap<u8, usize>, exact: u8) -> usize {
@@ -1955,6 +2053,38 @@ mod ownership_yield {
             assert_eq!(encoded, snapshot_tsv(&right));
             assert!(encoded.ends_with('\n'));
             assert_eq!(parse_snapshot_tsv(&encoded).expect("parse"), right);
+        }
+
+        #[test]
+        fn ownership_yield_model_kind_snapshot_is_byte_stable_and_round_trips() {
+            let left = vec![
+                ModelKindRecord {
+                    key: "z::_2@d1".to_string(),
+                    owner: OwnerClass::Local,
+                    depth: 1,
+                    kind: SlotKind::Raw,
+                },
+                ModelKindRecord {
+                    key: "a::field0@d0".to_string(),
+                    owner: OwnerClass::Field,
+                    depth: 0,
+                    kind: SlotKind::Owning,
+                },
+                ModelKindRecord {
+                    key: "m::_1@d0".to_string(),
+                    owner: OwnerClass::Local,
+                    depth: 0,
+                    kind: SlotKind::Ref,
+                },
+            ];
+            let right = vec![left[1].clone(), left[2].clone(), left[0].clone()];
+            let encoded = model_kind_snapshot_tsv(&left);
+            assert_eq!(encoded, model_kind_snapshot_tsv(&right));
+            assert!(encoded.ends_with('\n'));
+            assert_eq!(
+                parse_model_kind_snapshot_tsv(&encoded).expect("parse"),
+                right
+            );
         }
 
         #[test]
@@ -4125,7 +4255,7 @@ mod run {
             self, FunctionPrecisionRecord, NecessityEvidence, PairRemovalOutcome,
             ProductionPrecisionEvidence, RemovalFilter,
         },
-        ownership_yield::{self, OwnerClass, SlotRecord},
+        ownership_yield::{self, ModelKindRecord, OwnerClass, SlotRecord},
         report::Row,
         selector_leak_diagnosis::{
             self, CommitEvent, CoreEvidence, DetailEvidence, OutParamTag, SelectorClass, TracePhase,
@@ -4187,6 +4317,41 @@ mod run {
         )
     }
 
+    fn bo_slot_metadata(
+        tcx: TyCtxt<'_>,
+        slots: &CrateSlots,
+        slot_ref: SlotRef,
+    ) -> (String, OwnerClass, u8) {
+        match slot_ref {
+            SlotRef::Local(fn_did, slot_id) => {
+                let slot = slots
+                    .fn_local_slots
+                    .get(&fn_did)
+                    .unwrap_or_else(|| panic!("missing BO local universe for {fn_did:?}"))
+                    .slot(slot_id);
+                let SlotOwner::Local(local) = slot.owner else {
+                    panic!("local SlotRef has non-local owner: {slot_ref:?}");
+                };
+                (
+                    local_key(tcx, fn_did, local.index(), slot.depth),
+                    OwnerClass::Local,
+                    slot.depth,
+                )
+            }
+            SlotRef::Field(slot_id) => {
+                let slot = slots.field_slots.slot(slot_id);
+                let SlotOwner::Field(field) = slot.owner else {
+                    panic!("field SlotRef has non-field owner: {slot_ref:?}");
+                };
+                (
+                    field_key(tcx, field.struct_did, field.field_index, slot.depth),
+                    OwnerClass::Field,
+                    slot.depth,
+                )
+            }
+        }
+    }
+
     fn bo_slot_records(
         tcx: TyCtxt<'_>,
         slots: &CrateSlots,
@@ -4194,34 +4359,7 @@ mod run {
     ) -> Vec<SlotRecord> {
         let mut records = Vec::with_capacity(model.len());
         for (&slot_ref, &kind) in model {
-            let (key, owner, depth) = match slot_ref {
-                SlotRef::Local(fn_did, slot_id) => {
-                    let slot = slots
-                        .fn_local_slots
-                        .get(&fn_did)
-                        .unwrap_or_else(|| panic!("missing BO local universe for {fn_did:?}"))
-                        .slot(slot_id);
-                    let SlotOwner::Local(local) = slot.owner else {
-                        panic!("local SlotRef has non-local owner: {slot_ref:?}");
-                    };
-                    (
-                        local_key(tcx, fn_did, local.index(), slot.depth),
-                        OwnerClass::Local,
-                        slot.depth,
-                    )
-                }
-                SlotRef::Field(slot_id) => {
-                    let slot = slots.field_slots.slot(slot_id);
-                    let SlotOwner::Field(field) = slot.owner else {
-                        panic!("field SlotRef has non-field owner: {slot_ref:?}");
-                    };
-                    (
-                        field_key(tcx, field.struct_did, field.field_index, slot.depth),
-                        OwnerClass::Field,
-                        slot.depth,
-                    )
-                }
-            };
+            let (key, owner, depth) = bo_slot_metadata(tcx, slots, slot_ref);
             records.push(SlotRecord {
                 key,
                 owner,
@@ -4231,6 +4369,25 @@ mod run {
             });
         }
         records
+    }
+
+    fn bo_model_kind_records(
+        tcx: TyCtxt<'_>,
+        slots: &CrateSlots,
+        model: &FxHashMap<SlotRef, SlotKind>,
+    ) -> Vec<ModelKindRecord> {
+        model
+            .iter()
+            .map(|(&slot_ref, &kind)| {
+                let (key, owner, depth) = bo_slot_metadata(tcx, slots, slot_ref);
+                ModelKindRecord {
+                    key,
+                    owner,
+                    depth,
+                    kind,
+                }
+            })
+            .collect()
     }
 
     fn certified_context_enabled() -> bool {
@@ -6285,6 +6442,12 @@ mod run {
                 }
                 row.set("s23_owning_model", s23_owning_model);
                 row.set("s23_fields_raw", s23_fields_raw);
+                if let Some(path) = std::env::var_os("CRAT_BOC1_MODEL_KIND_SNAPSHOT") {
+                    let records = bo_model_kind_records(tcx, &slots, m);
+                    ownership_yield::write_model_kind_snapshot(Path::new(&path), &records)
+                        .unwrap_or_else(|error| panic!("{error}"));
+                    row.set("model_kind_snapshot", records.len());
+                }
                 if ownership_yield::enabled() {
                     let records = bo_slot_records(tcx, &slots, m);
                     ownership_yield::write_worker_snapshot(&records)
