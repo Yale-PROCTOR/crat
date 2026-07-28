@@ -44,6 +44,19 @@
 
 #![allow(dead_code)]
 
+use rustc_hir::{ItemKind, OwnerNode};
+use rustc_middle::{mir::Local, ty::TyCtxt};
+
+use crate::{
+    analyses::borrow_ownership::{
+        CrateCtxt, borrow_verify::verify_to_fixpoint, coherence::add_coherence,
+        crate_slots::CrateSlots, emit_crate_ownership_constraints,
+        export::with_bo_export, mutability_facts::MutFacts, origins::compute_origins,
+        solver::KindSolver,
+    },
+    utils::rustc::RustProgram,
+};
+
 pub(crate) mod apply;
 pub(crate) mod decision;
 pub(crate) mod plan;
@@ -74,14 +87,146 @@ pub(crate) enum RewriteOutcome {
     Degraded { reason: &'static str },
 }
 
-/// M1 entry point. **Not implemented at S0** — see [`RewriteOutcome`].
+/// M1 entry point: source in, rewritten source out.
 ///
-/// Returning `Degraded` rather than `unimplemented!()` is deliberate: it makes
-/// the ten golden tests fail as *assertions about a missing emitter* instead of
-/// as panics, which is the difference between a RED suite that reads as a
-/// to-do list and one that reads as a crash.
-pub(crate) fn rewrite_m1(_input: &str) -> RewriteOutcome {
-    RewriteOutcome::Degraded {
-        reason: "M1 emitter not implemented (S0 skeleton)",
+/// The four phases run in order, each handed the previous one's finished value:
+/// `decision` (the only phase that reads analyses) → `plan` (edits as data) →
+/// `apply` (analysis-blind splice) → `verify` (gates).
+///
+/// # Capture scope
+///
+/// The driver opens [`with_bo_export`] explicitly. The ambient `CRAT_BO_EXPORT`
+/// flag is for corpus workers; the driver **is** the consumer, so it arms
+/// unconditionally and pays the capture cost by design.
+///
+/// # S1 scope
+///
+/// Depth-0 pointer *parameters* decided `Ref`. Everything else degrades in the
+/// decision phase with a named reason.
+pub(crate) fn rewrite_m1(input: &str) -> RewriteOutcome {
+    let owned = input.to_owned();
+    let result = ::utils::compilation::run_compiler_on_str(input, move |tcx| {
+        let program = collect_program(tcx);
+        let slots = CrateSlots::build(&program);
+        let mut_facts = MutFacts::from_program(&program);
+
+        // Phase 1 input: the BO run, under an explicit capture scope.
+        let (model, _export) = with_bo_export(|| {
+            let crate_ctxt = CrateCtxt::new(&program);
+            let solver = KindSolver::new(&slots);
+            let Ok((_stats, selectors)) = emit_crate_ownership_constraints(
+                &crate_ctxt,
+                &slots,
+                &compute_origins(&program),
+                &solver,
+            ) else {
+                return None;
+            };
+            for &g in &program.functions {
+                let body = tcx.mir_drops_elaborated_and_const_checked(g).borrow();
+                add_coherence(&solver, &slots, g, &body);
+            }
+            verify_to_fixpoint(&program, &slots, &solver, &selectors, &mut_facts)
+        });
+        let Some(model) = model else {
+            return Err("BO declined — no accepted model");
+        };
+
+        let subjects = collect_subjects(tcx, &program, &mut_facts);
+        let subject_count = subjects.len();
+        let table = decision::decide(subjects, &model, &slots);
+
+        // Structural gate: decision coverage.
+        if !table.is_total_over(subject_count) {
+            return Err("decision table is not total over its subjects");
+        }
+
+        let source_map = tcx.sess.source_map();
+        let plan = plan::plan(&table, &owned, |span| {
+            let lo = source_map.lookup_byte_offset(span.lo()).pos.0 as usize;
+            let hi = source_map.lookup_byte_offset(span.hi()).pos.0 as usize;
+            (lo <= hi && hi <= owned.len()).then_some((lo, hi))
+        });
+
+        let applied = apply::apply(&owned, &plan);
+        // Structural gate: rollbacks must be zero.
+        if !applied.rollbacks.is_empty() {
+            return Err("apply rolled back at least one edit");
+        }
+        Ok(applied.source)
+    });
+
+    match result {
+        Ok(Ok(emitted)) => {
+            // Hard gate: the emitted crate type-checks.
+            if verify::type_checks(&emitted) {
+                RewriteOutcome::Emitted(emitted)
+            } else {
+                RewriteOutcome::Degraded {
+                    reason: "emitted crate failed the type-check gate",
+                }
+            }
+        }
+        Ok(Err(reason)) => RewriteOutcome::Degraded { reason },
+        Err(_) => RewriteOutcome::Degraded {
+            reason: "input crate did not compile",
+        },
     }
+}
+
+/// Every top-level fn/struct item, in HIR owner order (the `bo_c1` shape).
+fn collect_program(tcx: TyCtxt<'_>) -> RustProgram<'_> {
+    let mut functions = Vec::new();
+    let mut structs = Vec::new();
+    for maybe_owner in tcx.hir_crate(()).owners.iter() {
+        let Some(owner) = maybe_owner.as_owner() else {
+            continue;
+        };
+        let OwnerNode::Item(item) = owner.node() else {
+            continue;
+        };
+        match item.kind {
+            ItemKind::Fn { .. } => functions.push(item.owner_id.def_id),
+            ItemKind::Struct(..) => structs.push(item.owner_id.def_id),
+            _ => {}
+        }
+    }
+    RustProgram {
+        tcx,
+        functions,
+        structs,
+    }
+}
+
+/// S1 subjects: each pointer-typed parameter of each local function.
+///
+/// The MIR local of parameter `i` is `_{i+1}` — params occupy `_1 ..= arg_count`
+/// — which is what lets a HIR-side span pair with a MIR-side slot lookup.
+fn collect_subjects(
+    tcx: TyCtxt<'_>,
+    program: &RustProgram<'_>,
+    mut_facts: &MutFacts,
+) -> Vec<decision::Subject> {
+    let mut subjects = Vec::new();
+    for &fn_did in &program.functions {
+        let Some(decl) = tcx.hir_node_by_def_id(fn_did).fn_decl() else {
+            continue;
+        };
+        for (index, input) in decl.inputs.iter().enumerate() {
+            let rustc_hir::TyKind::Ptr(mut_ty) = input.kind else {
+                continue;
+            };
+            let local = Local::from_usize(index + 1);
+            subjects.push(decision::Subject {
+                fn_did,
+                local,
+                ty_span: input.span,
+                pointee_span: mut_ty.ty.span,
+                // The declared `*mut`/`*const` is a ceiling, not the decision:
+                // BO's mutability facts decide whether a `&mut` is warranted.
+                mutable: mut_ty.mutbl.is_mut() && mut_facts.is_mutable(fn_did, local),
+            });
+        }
+    }
+    subjects
 }

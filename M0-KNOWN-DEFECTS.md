@@ -778,6 +778,24 @@ every future verification list that uses the symlink; if it moves, the frozen
 corpus was written through the link and comparability with CROWN's published
 numbers is void.
 
+**RTK hook — observation distortion (STANDING, 2026-07-28).** The hook
+filters and sometimes fabricates command output. Two confirmed incidents, now
+three:
+
+1. A canned `[ok] Files are identical` returned for `diff` on files that
+   **differ** — first seen re-verifying golden pairs (caught by SHA-256), and
+   seen AGAIN in M1/S1 on `g01`/`g03`/`g10`, where it contradicted a hash check
+   performed moments earlier.
+2. `cargo test` summary counts differ from raw: the M0 merge report published
+   "848 passed, 7 ignored" from the filtered summary; raw is **854/0/9**.
+
+**Rules, binding on all future reports:** cite RAW `cargo test` output only
+(`rtk proxy cargo test …`), never the filtered summary; never use `diff` to
+establish file equality — hash, or compare in a language runtime. Two
+observation-distortion incidents from one hook is a pattern, not bad luck: a
+tool that answers questions it was not asked will eventually answer one that
+matters.
+
 **Machine scope.** Unit scope only throughout. No corpus-scale run; those
 remain queued behind the pairwise-probing sweep, which owns the corpus machine.
 `cargo build` / `cargo test -p pointer_replacer` at `-j 6` only.

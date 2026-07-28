@@ -1,14 +1,170 @@
-//! **Phase 3 — apply.** Plan in, rewritten AST out. **Analysis-blind.**
+//! **Phase 3 — apply.** Plan in, rewritten source out. **Analysis-blind.**
 //!
-//! This phase imports plan structs and the AST, and nothing else. It performs
-//! no lookup, no inference, and no decision: if a question arises here that the
-//! plan does not already answer, that is a plan defect, not a reason to import
-//! an analysis.
+//! This phase imports plan structs and nothing else. It performs no lookup, no
+//! inference, and no decision: if a question arises here that the plan does not
+//! already answer, that is a plan defect, not a reason to import an analysis.
 //!
-//! The import-denylist test enforces exactly that — see
-//! [`super::import_denylist`]. `apply/` may not name `crate::analyses`,
-//! the export, or `super::decision`.
+//! The import-denylist test enforces exactly that — `apply/` may not name
+//! `crate::analyses`, the export, or `super::decision`.
 //!
-//! # Status
+//! # Rollbacks
 //!
-//! S0 lands the phase boundary and the denylist rule. The applier arrives in S1.
+//! An edit this phase cannot apply is **rolled back and counted**, never
+//! applied partially. The structural gate requires the count to be zero: a
+//! nonzero count means the plan asked for something incoherent, and the right
+//! response is to fix the plan, not to let a half-applied edit reach the
+//! emitted crate.
+
+use super::plan::{Edit, Plan};
+
+/// Outcome of applying a plan.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Applied {
+    pub source: String,
+    /// Edits rejected as incoherent. **Gate requires 0.**
+    pub rollbacks: Vec<Rollback>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Rollback {
+    pub edit: Edit,
+    pub reason: &'static str,
+}
+
+/// Splice a plan's edits into the source.
+///
+/// Edits address the ORIGINAL source, so they are applied back-to-front: a
+/// later edit's offsets are then still valid when an earlier one has already
+/// changed the string length. Overlapping edits are rejected rather than
+/// resolved — a plan that wants two rewrites of one range has not decided.
+pub(crate) fn apply(source: &str, plan: &Plan) -> Applied {
+    let mut ordered: Vec<&Edit> = plan.edits.iter().collect();
+    ordered.sort_by_key(|e| (e.lo, e.hi));
+
+    let mut rollbacks = Vec::new();
+    let mut accepted: Vec<&Edit> = Vec::new();
+    let mut prev_hi: Option<usize> = None;
+    for edit in ordered {
+        if edit.lo > edit.hi || edit.hi > source.len() {
+            rollbacks.push(Rollback {
+                edit: edit.clone(),
+                reason: "edit range is out of bounds or inverted",
+            });
+            continue;
+        }
+        if !source.is_char_boundary(edit.lo) || !source.is_char_boundary(edit.hi) {
+            rollbacks.push(Rollback {
+                edit: edit.clone(),
+                reason: "edit range does not fall on UTF-8 char boundaries",
+            });
+            continue;
+        }
+        if prev_hi.is_some_and(|hi| edit.lo < hi) {
+            rollbacks.push(Rollback {
+                edit: edit.clone(),
+                reason: "edit overlaps an earlier edit",
+            });
+            continue;
+        }
+        prev_hi = Some(edit.hi);
+        accepted.push(edit);
+    }
+
+    let mut out = source.to_owned();
+    for edit in accepted.iter().rev() {
+        out.replace_range(edit.lo..edit.hi, &edit.replacement);
+    }
+    Applied {
+        source: out,
+        rollbacks,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::bo_rewriter::plan::{Edit, Justification, Plan};
+
+    fn edit(lo: usize, hi: usize, text: &str) -> Edit {
+        Edit {
+            lo,
+            hi,
+            replacement: text.to_owned(),
+            justification: Justification::KindDecision { kind: "test" },
+        }
+    }
+
+    /// The happy path: disjoint edits apply, no rollbacks.
+    #[test]
+    fn disjoint_edits_apply_with_no_rollbacks() {
+        let src = "abcdef";
+        let plan = Plan {
+            edits: vec![edit(0, 1, "X"), edit(4, 6, "YZ!")],
+        };
+        let applied = apply(src, &plan);
+        assert_eq!(applied.source, "XbcdYZ!");
+        assert!(
+            applied.rollbacks.is_empty(),
+            "clean plan produced rollbacks: {:?}",
+            applied.rollbacks
+        );
+    }
+
+    /// **Structural gate input.** Overlapping edits are rejected and COUNTED,
+    /// never partially applied.
+    ///
+    /// *Mutation-tested, Rider 0 order.* **Deletion first:** remove the overlap
+    /// check in `apply` and this fails — the second edit applies over the first
+    /// and `rollbacks` is empty.
+    #[test]
+    fn overlapping_edits_roll_back_and_are_counted() {
+        let src = "abcdef";
+        let plan = Plan {
+            edits: vec![edit(0, 3, "X"), edit(2, 5, "Y")],
+        };
+        let applied = apply(src, &plan);
+        assert_eq!(
+            applied.rollbacks.len(),
+            1,
+            "an overlapping edit must be rolled back and counted"
+        );
+        assert_eq!(
+            applied.rollbacks[0].reason, "edit overlaps an earlier edit",
+            "rollback must name its reason"
+        );
+        // The surviving edit applied; the rejected one did not.
+        assert_eq!(applied.source, "Xdef");
+    }
+
+    /// Out-of-bounds and inverted ranges are rejected rather than panicking.
+    #[test]
+    fn out_of_bounds_edits_roll_back() {
+        let src = "abc";
+        let plan = Plan {
+            edits: vec![edit(2, 99, "X")],
+        };
+        let applied = apply(src, &plan);
+        assert_eq!(applied.rollbacks.len(), 1);
+        assert_eq!(applied.source, src, "a rolled-back edit must not apply");
+    }
+
+    /// Edits address the ORIGINAL source, so a length-changing earlier edit
+    /// must not shift a later one. Back-to-front application is what buys this.
+    ///
+    /// *Mutation-tested:* applying front-to-back instead corrupts the second
+    /// edit's target and this fails.
+    #[test]
+    fn length_changing_edits_do_not_shift_later_offsets() {
+        let src = "aXbYc";
+        let plan = Plan {
+            edits: vec![
+                edit(1, 2, "LONGER"),
+                // Addresses the ORIGINAL offsets of "Y".
+                edit(3, 4, "Z"),
+            ],
+        };
+        let applied = apply(src, &plan);
+        assert!(applied.rollbacks.is_empty());
+        assert_eq!(applied.source, "aLONGERbZc");
+    }
+}
