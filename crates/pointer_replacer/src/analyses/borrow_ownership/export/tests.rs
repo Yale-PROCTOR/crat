@@ -152,16 +152,19 @@ fn export_off_records_nothing() {
     // Recording outside a scope must be a no-op, not a panic.
     record_selector(BoundaryRole::Source, Var::from_u32(0));
     record_loan(LoanIdentity {
-        fn_did: rustc_hir::def_id::CRATE_DEF_ID,
-        loan: 0,
-        location: MirLocationKey::new(0, 0),
-        borrowed: PlaceKey {
-            local: Local::from_u32(0),
-            derefs: 0,
-            fields: Vec::new(),
+        key: LoanKey {
+            fn_did: rustc_hir::def_id::CRATE_DEF_ID,
+            place: PlaceKey {
+                local: Local::from_u32(0),
+                proj: Vec::new(),
+            },
+            location: MirLocationKey::new(0, 0),
+            borrower: BorrowerKind::Assign {
+                owner: OwnerKey::Local(0),
+            },
         },
+        run_local_handle: 0,
         kind: LoanKind::NoProvenance,
-        borrower: BorrowerKind::Assign,
         invalid: false,
     });
     assert!(!capturing(), "capture must still be inactive");
@@ -295,11 +298,10 @@ fn loan_identity_covers_the_complete_borrow_set() {
     let mut seen = rustc_hash::FxHashSet::default();
     for loan in &export.loans {
         assert!(
-            seen.insert((loan.fn_did, loan.loan)),
-            "loan ({:?}, {}) recorded more than once — the export is accumulating \
+            seen.insert(loan.key.clone()),
+            "loan {:?} recorded more than once — the export is accumulating \
              across validation rounds instead of holding the accepted round (D1)",
-            loan.fn_did,
-            loan.loan
+            loan.key
         );
     }
 }
@@ -312,7 +314,7 @@ fn loan_identity_carries_place_and_borrower() {
         export
             .loans
             .iter()
-            .any(|l| matches!(l.borrower, BorrowerKind::CallArg { .. })),
+            .any(|l| matches!(l.key.borrower, BorrowerKind::CallArg { .. })),
         "no CallArg loan recorded for a fixture whose only borrow is a call argument"
     );
 }
@@ -325,16 +327,16 @@ fn loan_kind_keyed_on_base_local() {
     let call_args: Vec<_> = export
         .loans
         .iter()
-        .filter(|l| matches!(l.borrower, BorrowerKind::CallArg { .. }))
+        .filter(|l| matches!(l.key.borrower, BorrowerKind::CallArg { .. }))
         .collect();
     assert!(!call_args.is_empty(), "expected a CallArg loan");
     for loan in call_args {
         // The construction applies a Deref, so the projected place has depth
         // >= 1 while the KEY stays the base local.
         assert!(
-            loan.borrowed.derefs >= 1,
+            loan.key.place.derefs() >= 1,
             "CallArg loan should carry the deref projection: {:?}",
-            loan.borrowed
+            loan.key.place
         );
         assert_ne!(
             loan.kind,
@@ -435,7 +437,7 @@ fn loan_kind_matches_ground_truth_provider() {
 
     let mut checked = 0usize;
     for loan in &export.loans {
-        let expected = if loan.borrowed.local == Local::from_u32(1) {
+        let expected = if loan.key.place.local == Local::from_u32(1) {
             // Provenance exists (it is a pointer argument) and we declared it
             // immutable, so the engine's guard fires: Shared.
             LoanKind::Shared
@@ -445,7 +447,7 @@ fn loan_kind_matches_ground_truth_provider() {
                 loan.kind,
                 LoanKind::Shared,
                 "loan rooted at {:?} derived Shared, but only local 1 was declared immutable",
-                loan.borrowed.local
+                loan.key.place.local
             );
             checked += 1;
             continue;
@@ -454,7 +456,7 @@ fn loan_kind_matches_ground_truth_provider() {
             loan.kind, expected,
             "derivation disagreed with the supplied provider for base local {:?} \
              (borrowed place {:?}) — the key or the lookup has drifted",
-            loan.borrowed.local, loan.borrowed
+            loan.key.place.local, loan.key.place
         );
         checked += 1;
     }
@@ -492,7 +494,7 @@ fn place_key_counts_derefs_and_fields() {
     // outside a TyCtxt is not possible.
     let (_model, export) = capture_solve(CALL_ARG);
     assert!(
-        export.loans.iter().any(|l| l.borrowed.derefs >= 1),
+        export.loans.iter().any(|l| l.key.place.derefs() >= 1),
         "expected at least one deref-projected borrowed place"
     );
 }
@@ -568,6 +570,76 @@ fn certificate_is_recorded_at_the_accept_point() {
     // shape D15 is hunting, so on the one day the loop could have run it would
     // have reported the wrong diagnosis. A missing check is honest; a check
     // that would misclassify the thing it fires on is not.
+}
+
+/// **F4** — a DECLINING run records no certificate.
+///
+/// This is the invariant the `Option` exists to carry and the half the positive
+/// witness cannot reach: `None` must mean "the accept point never ran". The
+/// positive test can only show that an accepting run records `Some`.
+///
+/// The decline is forced with a solver contradiction (a slot both assumed
+/// `Ref` and excluded from `Ref`) rather than with a fixture, because no
+/// declining fixture was found — see the limitation below.
+///
+/// **Stated limitation, not papered over.** This exercises the *pre-loop*
+/// decline (the first solve returns UNSAT), so it pins the invariant for that
+/// route only. It does **not** exercise the in-loop `residual_nonref_field`
+/// decline, and therefore does NOT catch the specific relocation F4 named —
+/// moving `record_residuals` above that decline. Four candidate fixtures were
+/// probed for an in-loop decline (field own+borrow, aliased double free,
+/// cross-function field escape, address-of-local store); all four accepted.
+/// Recorded as residual rather than claimed as covered.
+///
+/// *Mutation-tested, Rider 0 order.* **Deletion first:** make the decline path
+/// record a certificate — e.g. `record_residuals(vec![])` before the early
+/// return — and this fails.
+#[test]
+fn declining_run_records_no_certificate() {
+    ::utils::compilation::run_compiler_on_str(CALL_ARG, |tcx| {
+        let program = collect_program(tcx);
+        let slots = CrateSlots::build(&program);
+        let (model, export) = with_bo_export(|| {
+            let crate_ctxt = CrateCtxt::new(&program);
+            let solver = KindSolver::new(&slots);
+            let (_stats, selectors) = emit_crate_ownership_constraints(
+                &crate_ctxt,
+                &slots,
+                &compute_origins(&program),
+                &solver,
+            )
+            .expect("emission");
+            for &g in &program.functions {
+                let body = tcx.mir_drops_elaborated_and_const_checked(g).borrow();
+                add_coherence(&solver, &slots, g, &body);
+            }
+            // Force a contradiction on some slot: assumed `Ref` and excluded
+            // from `Ref` at once.
+            let victim = slots
+                .fn_local_slots
+                .iter()
+                .find(|(_, universe)| universe.len() > 0)
+                .map(|(did, _)| {
+                    SlotRef::Local(*did, super::super::slots::SlotId::from_usize(0))
+                })
+                .expect("fixture has at least one local slot");
+            solver.assume(victim, super::SlotKindAlias::Ref);
+            solver.add_borrow_exclusion(Some(victim), &[]);
+            verify_to_fixpoint(&program, &slots, &solver, &selectors, true)
+        });
+        assert!(
+            model.is_none(),
+            "the contradiction did not force a decline — witness would be inert"
+        );
+        assert!(
+            export.residual_conflicts.is_none(),
+            "F4: a DECLINING run recorded a certificate. `None` must mean the \
+             accept point never ran; anything else destroys the invariant the \
+             Option was introduced to carry. Got {:?}",
+            export.residual_conflicts
+        );
+    })
+    .unwrap_or_else(|e| e.raise())
 }
 
 /// RED 17 — the exported candidacy agrees with the accepted model.
@@ -798,10 +870,9 @@ fn l2_path_records_loans() {
     let mut seen = rustc_hash::FxHashSet::default();
     for loan in &export.loans {
         assert!(
-            seen.insert((loan.fn_did, loan.loan)),
-            "D1 regression on the L2 path: loan ({:?}, {}) recorded twice",
-            loan.fn_did,
-            loan.loan
+            seen.insert(loan.key.clone()),
+            "D1 regression on the L2 path: loan {:?} recorded twice",
+            loan.key
         );
     }
 }
@@ -833,10 +904,9 @@ fn multi_round_export_holds_only_the_final_round() {
     let mut seen = rustc_hash::FxHashSet::default();
     for loan in &export.loans {
         assert!(
-            seen.insert((loan.fn_did, loan.loan)),
-            "D1: loan ({:?}, {}) appears more than once — rounds are accumulating",
-            loan.fn_did,
-            loan.loan
+            seen.insert(loan.key.clone()),
+            "D1: loan {:?} appears more than once — rounds are accumulating",
+            loan.key
         );
     }
 }
@@ -894,6 +964,161 @@ fn l2_door_rejects_a_tracked_solver() {
         None::<()>
     })
     .unwrap_or_else(|e| e.raise());
+}
+
+/// **§1.5 / D19** — loan KEYS are stable across re-inference; indices are not.
+///
+/// This is the witness the whole content-key change exists for. `BorrowSet`
+/// numbering permutes because `utils/dsa/union_find.rs` hashes with
+/// `RandomState` and `borrow/mod.rs` pushes sibling loans in `group()` order,
+/// and a fresh `UnionFind` is built per inference — so two analyses of the same
+/// program can number the same loans differently.
+///
+/// **Non-vacuity is asserted, not assumed:** the fixture must produce sibling
+/// loans (more than one loan at one location), or the permutation has nothing
+/// to permute and the test proves nothing.
+///
+/// *Mutation-tested, Rider 0 order.* **Deletion first:** revert the key to the
+/// run-local index — i.e. compare `run_local_handle` sets instead of `key`
+/// sets — and this fails whenever the two runs number siblings differently.
+#[test]
+fn loan_keys_are_stable_across_reinference() {
+    let first = capture_solve(CASCADE).1;
+    let second = capture_solve(CASCADE).1;
+
+    assert!(!first.loans.is_empty(), "no loans recorded — witness inert");
+    // Non-vacuity: sibling loans exist (>1 loan sharing one (fn, location)).
+    let mut per_site: rustc_hash::FxHashMap<_, usize> = Default::default();
+    for l in &first.loans {
+        *per_site
+            .entry((l.key.fn_did, l.key.location))
+            .or_default() += 1;
+    }
+    assert!(
+        per_site.values().any(|n| *n > 1),
+        "fixture has no sibling loans, so nothing can permute — this witness \
+         would be vacuous. Pick a fixture whose group() returns >1 member."
+    );
+
+    let keys_a: std::collections::BTreeSet<_> = first.loans.iter().map(|l| l.key.clone()).collect();
+    let keys_b: std::collections::BTreeSet<_> = second.loans.iter().map(|l| l.key.clone()).collect();
+    assert_eq!(
+        keys_a, keys_b,
+        "D19: loan CONTENT keys differed between two analyses of the same \
+         program. The key is supposed to be numbering-independent."
+    );
+    assert_eq!(
+        first.loans.len(),
+        second.loans.len(),
+        "loan COUNT differed between runs"
+    );
+}
+
+/// **§1.5** — the run-local handle must not leak into the consumer as identity.
+///
+/// A grep-shaped guard in the same family as the import-denylist test: the
+/// greenfield rewriter module may name the content key, never the handle.
+///
+/// *Mutation-tested, Rider 0 order.* **Deletion first:** add a single
+/// `run_local_handle` mention under `bo_rewriter/` and this fails.
+#[test]
+fn run_local_handle_is_not_used_as_identity() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/bo_rewriter");
+    let mut offenders = Vec::new();
+    let mut stack = vec![root.clone()];
+    let mut files_scanned = 0usize;
+    while let Some(dir) = stack.pop() {
+        let Ok(rd) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in rd.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if path.extension().is_some_and(|e| e == "rs") {
+                files_scanned += 1;
+                let text = std::fs::read_to_string(&path).expect("read bo_rewriter source");
+                if text.contains("run_local_handle") {
+                    offenders.push(path);
+                }
+            }
+        }
+    }
+    assert!(
+        files_scanned > 0,
+        "scanned no files under {root:?} — the guard would be vacuous"
+    );
+    assert!(
+        offenders.is_empty(),
+        "bo_rewriter names the run-local loan handle, which is NOT an identity \
+         (D19 permutes it between runs and between CEGAR rounds). Use \
+         `LoanIdentity::key`. Offending files: {offenders:?}"
+    );
+}
+
+/// **§2.3 / F1** — re-running EMISSION inside a capture scope must not append.
+///
+/// This is the failure mode of the probe-base surface, reproduced at unit scope
+/// so it is guarded permanently rather than only at the moment the suspension
+/// was added. A probe base re-runs `emit_crate_ownership_constraints`; without
+/// suspension that appends a second full copy of every selector site —
+/// falsifying `SelectorSite`'s documented by-construction index-alignment with
+/// `Selectors` — and doubles the version sites.
+///
+/// *Mutation-tested (standing rule), Rider 0 order.* **Deletion first:** drop
+/// the `with_capture_suspended` wrapper below and the counts double.
+#[test]
+fn re_emission_under_suspension_does_not_append() {
+    ::utils::compilation::run_compiler_on_str(MALLOC_FREE, |tcx| {
+        let program = collect_program(tcx);
+        let slots = CrateSlots::build(&program);
+        let (_out, export) = with_bo_export(|| {
+            let crate_ctxt = CrateCtxt::new(&program);
+            let solver = KindSolver::new(&slots);
+            let (_stats, _selectors) = emit_crate_ownership_constraints(
+                &crate_ctxt,
+                &slots,
+                &compute_origins(&program),
+                &solver,
+            )
+            .expect("emission");
+            let first = snapshot().expect("capture active");
+            // Non-vacuity: the first emission must have recorded something, or
+            // "no change" below would be trivially true.
+            assert!(
+                !first.source_sites.is_empty() || !first.sink_sites.is_empty(),
+                "first emission recorded no selector sites — witness inert"
+            );
+            assert!(
+                !first.version_sites.is_empty(),
+                "first emission recorded no version sites — witness inert"
+            );
+
+            // A probe base, as bo_c1 builds one: a SECOND full emission.
+            with_capture_suspended(|| {
+                let ctxt2 = CrateCtxt::new(&program);
+                let solver2 = KindSolver::new(&slots);
+                let _ = emit_crate_ownership_constraints(
+                    &ctxt2,
+                    &slots,
+                    &compute_origins(&program),
+                    &solver2,
+                )
+                .expect("second emission");
+            });
+
+            let second = snapshot().expect("capture survives");
+            assert_eq!(
+                first, second,
+                "F1: a suspended re-emission still changed the export — selector \
+                 index-alignment with `Selectors` is stated as by-construction, \
+                 so a second copy makes that claim false with nothing to catch it"
+            );
+            Some(())
+        });
+        drop(export);
+    })
+    .unwrap_or_else(|e| e.raise())
 }
 
 /// **D16** — a probe must leave the export byte-identical.
@@ -955,26 +1180,31 @@ fn probe_after_accept_leaves_the_export_unchanged() {
                  inert (F3: `None` is correct only on the L2 path)"
             );
 
+            // F5: pin that this IS a counterfactual. If the accepted model were
+            // already all-`Ref`, forcing all-`Ref` would probe the accepted
+            // model and the comparison would lose its power silently.
+            assert!(
+                model.values().any(|k| *k != super::SlotKindAlias::Ref),
+                "the accepted model is already all-Ref, so the 'counterfactual' \
+                 below is the accepted model — witness would be non-distinguishing"
+            );
             let counterfactual: FxHashMap<SlotRef, super::SlotKindAlias> =
                 model.keys().map(|k| (*k, super::SlotKindAlias::Ref)).collect();
             let _ = model_accepts(&program, &slots, &counterfactual, true);
 
+            // F5: compare the WHOLE record. The previous version compared
+            // `loans`, `residual_conflicts` and `version_sites.len()` — 3 of 6
+            // fields — while calling itself "byte-identical"; the three it
+            // skipped are exactly the ones the uncovered probe surfaces corrupt.
             let after = snapshot().expect("capture must survive the probe");
             assert_eq!(
-                before.loans, after.loans,
-                "D16: a probe changed the exported loans. The export must describe \
-                 the ACCEPTED run; a probe is not part of it."
-            );
-            assert_eq!(
-                before.residual_conflicts, after.residual_conflicts,
-                "D16: a probe changed the exported certificate"
-            );
-            assert_eq!(
-                before.version_sites.len(),
-                after.version_sites.len(),
-                "D16: a probe changed the exported version sites"
+                before, after,
+                "D16: a probe changed the export. It must describe the ACCEPTED \
+                 run; a probe is not part of that run."
             );
         });
     })
     .unwrap_or_else(|e| e.raise())
 }
+
+

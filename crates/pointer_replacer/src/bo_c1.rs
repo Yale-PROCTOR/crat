@@ -4031,19 +4031,27 @@ mod run {
         slots: &CrateSlots,
         origins: &crate::analyses::borrow_ownership::origin_summary::OriginSummaries,
     ) -> Option<(KindSolver, Selectors)> {
-        let crate_ctxt = CrateCtxt::new(program);
-        let solver = KindSolver::new(slots);
-        let (_stats, selectors) =
-            emit_crate_ownership_constraints(&crate_ctxt, slots, origins, &solver).ok()?;
-        for &g in &program.functions {
-            let body = program
-                .tcx
-                .mir_drops_elaborated_and_const_checked(g)
-                .borrow();
-            add_coherence(&solver, slots, g, &body);
-        }
-        constrain_field_ownership(&solver, slots, program);
-        Some((solver, selectors))
+        // §2.3 (F1): a probe base RE-RUNS emission. Inside an open capture scope
+        // that appends a second full copy of every selector site — falsifying
+        // `SelectorSite`'s documented by-construction index-alignment with
+        // `Selectors` — doubles the version sites, and replaces VERSION_ASTS
+        // with Bools belonging to a different `Optimize`. A probe is not the
+        // accepted run, so capture is suspended for the whole construction.
+        crate::analyses::borrow_ownership::export::with_capture_suspended(|| {
+            let crate_ctxt = CrateCtxt::new(program);
+            let solver = KindSolver::new(slots);
+            let (_stats, selectors) =
+                emit_crate_ownership_constraints(&crate_ctxt, slots, origins, &solver).ok()?;
+            for &g in &program.functions {
+                let body = program
+                    .tcx
+                    .mir_drops_elaborated_and_const_checked(g)
+                    .borrow();
+                add_coherence(&solver, slots, g, &body);
+            }
+            constrain_field_ownership(&solver, slots, program);
+            Some((solver, selectors))
+        })
     }
 
     /// §NB5-L2 — the leave-one-out primitive on a PREBUILT base (the ratified Q2 MECHANISM: ONE solve +
@@ -4071,7 +4079,11 @@ mod run {
         for &d in demote {
             base.add_borrow_exclusion(Some(d), &[]);
         }
-        let verdict = match base.model_kinds_relaxing(selectors) {
+        // §2.3 (F1): the SOLVE below records `version_owns` from a
+        // counterfactual model the loop never accepted. Suspension has to wrap
+        // the solve, not just the oracle call inside `model_accepts_with_flows`.
+        let verdict = crate::analyses::borrow_ownership::export::with_capture_suspended(|| {
+        match base.model_kinds_relaxing(selectors) {
             Some(model) => {
                 model.get(&target) == Some(&SlotKind::Ref)
                     && model_accepts_with_flows(
@@ -4084,7 +4096,8 @@ mod run {
             }
             // UNSAT even without `target` ⇒ `target` is not the reason it declines; NOT removable.
             None => false,
-        };
+        }
+        });
         base.pop_scope();
         verdict
     }
@@ -4387,7 +4400,10 @@ mod run {
         for &d in &final_demote {
             base.add_borrow_exclusion(Some(d), &[]);
         }
-        let witnessed = match base.model_kinds_relaxing(&selectors) {
+        // §2.3 (F1): same reason as `probe_accepts_with_ref` — this solve
+        // records `version_owns` for a pinned counterfactual.
+        let witnessed = crate::analyses::borrow_ownership::export::with_capture_suspended(|| {
+        match base.model_kinds_relaxing(&selectors) {
             // Removed slots are hard-pinned `Ref`, so a SAT model has them all `Ref` by construction;
             // only acceptance remains to check.
             Some(m) => model_accepts_with_flows(
@@ -4399,7 +4415,8 @@ mod run {
             ),
             // UNSAT under the pins ⇒ the removed set is NOT jointly `Ref`-recoverable (unless empty).
             None => removed.is_empty(),
-        };
+        }
+        });
         base.pop_scope();
         row.set("na_joint_witnessed", witnessed);
 
@@ -5891,7 +5908,11 @@ mod run {
             .unwrap_or(false)
         {
             let t = Instant::now();
-            let real = {
+            // §2.3 (F1): a SECOND full fixpoint inside one capture scope. Its
+            // `begin_round()` would wipe the first run's loans and certificate
+            // — the export must describe the run that produced the reported
+            // model, not a fidelity cross-check.
+            let real = crate::analyses::borrow_ownership::export::with_capture_suspended(|| {
                 let crate_ctxt = CrateCtxt::new(&program);
                 let solver = KindSolver::new(&slots);
                 // §NB4-4c F3: CHECK_REAL reuses run_bo's `origins` — the SAME demotion seed as run_bo's
@@ -5915,7 +5936,7 @@ mod run {
                     }
                     Err(_) => None,
                 }
-            };
+            });
             phase("check_real_done", t0);
             match real {
                 None => row.set("real_status", "emit-error"),

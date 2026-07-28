@@ -742,10 +742,35 @@ pub(crate) fn verify_to_fixpoint_counting_with_flows(
         let mut committed = 0;
         match repair {
             // §NB5-L Mode A (shipped through NB5-F2): one monotone `¬ref(representative)` per residual
-            // edge. Iteration order left on FxHash — Mode-A's z3 assertion order (hence its corpus
-            // numbers) stays byte-comparable to every prior row (the S5 asymmetry: sort Lemmas ONLY).
+            // edge.
+            //
+            // RETRACTED (§3.3, 2026-07-28): this used to read "Iteration order left on FxHash —
+            // Mode-A's z3 assertion order (hence its corpus numbers) stays byte-comparable to every
+            // prior row (the S5 asymmetry: sort Lemmas ONLY)". The premise was FALSE. `FxHashMap`
+            // iteration is deterministic, but the inner `Vec<ConflictEdge>` follows loan-index order,
+            // and loan numbering is not stable (D19). Mode-A is now sorted for the same reason the
+            // Lemmas arm always was; the asymmetry is gone.
             RepairMode::ModeA => {
-                for conflict in conflicts.values().flatten() {
+                // §3/R4 (D19): the inner `Vec<ConflictEdge>` follows loan-INDEX
+                // order, and loan numbering permutes between runs and between
+                // CEGAR rounds (`utils/dsa/union_find.rs` hashes with
+                // `RandomState`; `borrow/mod.rs` pushes siblings in `group()`
+                // order). So the emitted z3 assertion sequence was not stable.
+                //
+                // Sorted by `conflict_sort_key` — the SAME key the Lemmas arm
+                // already uses — which is built from slot keys and is therefore
+                // numbering-independent. Ties need no further tiebreak: two
+                // conflicts with equal keys have equal issuer and requirers, so
+                // `representative` returns the same slot for both and they emit
+                // IDENTICAL assertions. Tie order cannot change the sequence.
+                let mut ordered: Vec<(LocalDefId, &SlotConflict)> = conflicts
+                    .iter()
+                    .flat_map(|(did, cs)| cs.iter().map(move |c| (*did, c)))
+                    .collect();
+                ordered.sort_by(|(da, ca), (db, cb)| {
+                    conflict_sort_key(*da, ca).cmp(&conflict_sort_key(*db, cb))
+                });
+                for (_did, conflict) in ordered {
                     if let Some(slot) = representative(conflict, &model) {
                         // Single-literal exclusion = a monotone `¬ref(slot)` commitment.
                         solver.add_borrow_exclusion(Some(slot), &[]);
