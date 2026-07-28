@@ -13,6 +13,7 @@ pub(crate) mod origin_flow;
 pub(crate) mod origin_summary;
 pub(crate) mod origins;
 mod domain;
+pub(crate) mod export;
 mod infer;
 pub(crate) mod borrow_verify;
 pub mod coherence;
@@ -304,6 +305,9 @@ pub(crate) fn emit_crate_ownership_constraints<'tcx>(
         kind_solver.add_borrow_exclusion(Some(slot), &[]); // ¬ref (may-supply)
     }
 
+    // E-R2: snapshot the Var -> Bool map before the database is dropped.
+    database.snapshot_version_asts();
+
     let selectors = Selectors::new(
         database.source_selectors().to_vec(),
         database.sink_selectors().to_vec(),
@@ -387,10 +391,14 @@ fn link_versions_to_slots<'tcx>(
                 statement_index,
             };
             for (local, consume) in summary.location_results(location) {
-                for var in [consume.r#use.clone().next(), consume.def.clone().next()]
-                    .into_iter()
-                    .flatten()
-                {
+                let use_var = consume.r#use.clone().next();
+                let def_var = consume.def.clone().next();
+                // E-R2 capture: this loop already visits exactly the tuples the
+                // export needs, and the `Location` association is discarded
+                // immediately below when the vars are ORed into `depth0_owns`.
+                // Recording-only; a no-op unless a capture scope is active.
+                export::record_version_site(fn_did, local, location, use_var, def_var);
+                for var in [use_var, def_var].into_iter().flatten() {
                     depth0_owns.entry(local).or_default().push(var);
                 }
             }

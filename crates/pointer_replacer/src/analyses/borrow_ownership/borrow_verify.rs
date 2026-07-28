@@ -676,6 +676,10 @@ pub(crate) fn verify_to_fixpoint_counting_with_flows(
     record_dropped(&mut stats, selectors, &dropped);
     for _ in 0..cap {
         stats.rounds += 1;
+        // D1: each round re-runs the oracle under a DIFFERENT candidacy
+        // predicate. Reset so the export holds the FINAL round's BorrowSet,
+        // not the union over rejected intermediate models.
+        super::export::begin_round();
         let conflicts = revalidate_replaying_with_flows(
             program,
             slots,
@@ -738,10 +742,35 @@ pub(crate) fn verify_to_fixpoint_counting_with_flows(
         let mut committed = 0;
         match repair {
             // §NB5-L Mode A (shipped through NB5-F2): one monotone `¬ref(representative)` per residual
-            // edge. Iteration order left on FxHash — Mode-A's z3 assertion order (hence its corpus
-            // numbers) stays byte-comparable to every prior row (the S5 asymmetry: sort Lemmas ONLY).
+            // edge.
+            //
+            // RETRACTED (§3.3, 2026-07-28): this used to read "Iteration order left on FxHash —
+            // Mode-A's z3 assertion order (hence its corpus numbers) stays byte-comparable to every
+            // prior row (the S5 asymmetry: sort Lemmas ONLY)". The premise was FALSE. `FxHashMap`
+            // iteration is deterministic, but the inner `Vec<ConflictEdge>` follows loan-index order,
+            // and loan numbering is not stable (D19). Mode-A is now sorted for the same reason the
+            // Lemmas arm always was; the asymmetry is gone.
             RepairMode::ModeA => {
-                for conflict in conflicts.values().flatten() {
+                // §3/R4 (D19): the inner `Vec<ConflictEdge>` follows loan-INDEX
+                // order, and loan numbering permutes between runs and between
+                // CEGAR rounds (`utils/dsa/union_find.rs` hashes with
+                // `RandomState`; `borrow/mod.rs` pushes siblings in `group()`
+                // order). So the emitted z3 assertion sequence was not stable.
+                //
+                // Sorted by `conflict_sort_key` — the SAME key the Lemmas arm
+                // already uses — which is built from slot keys and is therefore
+                // numbering-independent. Ties need no further tiebreak: two
+                // conflicts with equal keys have equal issuer and requirers, so
+                // `representative` returns the same slot for both and they emit
+                // IDENTICAL assertions. Tie order cannot change the sequence.
+                let mut ordered: Vec<(LocalDefId, &SlotConflict)> = conflicts
+                    .iter()
+                    .flat_map(|(did, cs)| cs.iter().map(move |c| (*did, c)))
+                    .collect();
+                ordered.sort_by(|(da, ca), (db, cb)| {
+                    conflict_sort_key(*da, ca).cmp(&conflict_sort_key(*db, cb))
+                });
+                for (_did, conflict) in ordered {
                     if let Some(slot) = representative(conflict, &model) {
                         // Single-literal exclusion = a monotone `¬ref(slot)` commitment.
                         solver.add_borrow_exclusion(Some(slot), &[]);
@@ -796,6 +825,21 @@ pub(crate) fn verify_to_fixpoint_counting_with_flows(
         }
         stats.commits_per_round.push(committed);
         if committed == 0 {
+            // E-R4 certificate: record the residuals the accepted model
+            // TOLERATES. Acceptance is `committed == 0`, not an empty conflict
+            // set, so this is non-empty in general. Recording-only.
+            super::export::record_residuals(
+                conflicts
+                    .iter()
+                    .flat_map(|(did, cs)| {
+                        cs.iter().map(move |c| super::export::ResidualConflict {
+                            fn_did: *did,
+                            issuer: c.issuer,
+                            requirers: c.requirers.clone(),
+                        })
+                    })
+                    .collect(),
+            );
             // No committable residual: a genuine fixpoint. Every non-`Ref` slot was a replay
             // candidate above, so an empty residual means the surviving `Ref` slots genuinely do not
             // alias (no `Owning` slot's reference role is hidden). §NB5-F: a `Ref` field residual is
@@ -897,7 +941,36 @@ impl L2TransitionDiagnostics {
     }
 }
 
-fn verify_l2_to_fixpoint_counting(
+/// D10: `pub(crate)` so a test can route through the L2 loop **directly**
+/// instead of mutating `CRAT_BO_L2_GUARDED_COMMITS` inside a parallel test
+/// binary. The env switch remains the production entry — resolved once in
+/// `verify_to_fixpoint_counting_with_flows` — and this changes nothing about
+/// it; it only removes the need to perturb process-wide state to reach the same
+/// loop.
+///
+/// # Preconditions this door must carry (D17)
+///
+/// The env entry asserts **two** things before delegating here, and neither is
+/// what an earlier version of this doc claimed:
+///
+/// - **`solver.tracker().is_none()`.** A tracked solver's hard constraints are
+///   track-gated, so every solve here would be vacuously SAT and the accepted
+///   model meaningless. Opening this door does **not** leave that unguarded:
+///   `KindSolver::check`, `model_kinds`, and `model_kinds_relaxing` each carry
+///   their own release-active guard, and the loop cannot extract a model
+///   without passing one. The `debug_assert!` below is a *fail-earlier*
+///   tripwire — it names the door in the message instead of the accessor — not
+///   the only thing standing between a tracked solver and a meaningless model.
+///   (The review finding that prompted this called the guard bypassed; that was
+///   checked and is wrong.)
+/// - **`RepairMode::current() == ModeA` — INERT here.** This loop stamps
+///   `repair: RepairMode::ModeA` into its own stats and never reads
+///   `RepairMode::current()`, so violating it changes nothing about what runs.
+///   Documented for callers, not enforced.
+///
+/// An earlier version of this doc named only the inert one, and called the
+/// other load-bearing.
+pub(crate) fn verify_l2_to_fixpoint_counting(
     program: &RustProgram,
     slots: &CrateSlots,
     origin_flows: &OriginFlowResults,
@@ -905,6 +978,13 @@ fn verify_l2_to_fixpoint_counting(
     selectors: &Selectors,
     is_mutable: impl MutProvider + Copy,
 ) -> (Option<FxHashMap<SlotRef, SlotKind>>, RoundStats) {
+    // D17: re-assert the load-bearing precondition at the door, not only at the
+    // env entry. `debug_assert!` rather than `assert!` so the release-path cost
+    // and behaviour of the existing single choke point are unchanged.
+    debug_assert!(
+        solver.tracker().is_none(),
+        "tracked KindSolver must not enter the l2 door (constraints are track-gated)"
+    );
     let diagnostics_enabled = l2::diagnostics_enabled_from_env();
     let mut transition_diagnostics =
         l2::transition_diagnostics_enabled_from_env().then(L2TransitionDiagnostics::default);
@@ -952,6 +1032,8 @@ fn verify_l2_to_fixpoint_counting(
         if let Some(diagnostics) = &transition_diagnostics {
             diagnostics.emit_round(stats.rounds, &planner, &model);
         }
+        // D1: same per-round reset on the L2 path.
+        super::export::begin_round();
         let conflicts = revalidate_replaying_witnessed(
             program,
             slots,
@@ -1174,6 +1256,23 @@ pub(crate) fn model_accepts_with_flows(
     model: &FxHashMap<SlotRef, SlotKind>,
     is_mutable: impl MutProvider + Copy,
 ) -> bool {
+    // ALLOW-LIST TRIPWIRE (ruling on ADV-1). This is a PROBE — an oracle run
+    // outside either CEGAR loop, on a model the loop may never have accepted.
+    // Under the allow-list it is outside the armed region and records nothing
+    // by construction, so the previous `with_capture_suspended` here is
+    // redundant.
+    //
+    // It is replaced by an assertion rather than deleted, and that choice is
+    // deliberate: suspension would MASK a violation of the allow-list (a probe
+    // that somehow ran inside the armed region would quietly record nothing and
+    // look fine), whereas this fails loudly and names the invariant. A backstop
+    // that hides the bug it backstops is worse than no backstop.
+    debug_assert!(
+        !super::export::capturing(),
+        "allow-list violation: a probe entry point ran INSIDE the armed capture \
+         region. Capture must be armed only around the accepted run; move the \
+         arm, do not suspend here."
+    );
     let conflicts = revalidate_replaying_with_flows(
         program,
         slots,

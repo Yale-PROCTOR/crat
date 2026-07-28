@@ -108,6 +108,58 @@ fn invalid_loan_set(inference: &BorrowInferenceResults<'_>) -> DenseBitSet<Loan>
     invalid_loans
 }
 
+/// E-R4 capture: record loan-level identity for the COMPLETE final `BorrowSet`.
+///
+/// Deliberately NOT folded into `extract_conflict_edges`: that function is a
+/// verbatim mirror of `borrow/mod.rs` and must stay so, and
+/// `extract_witnessed_conflict_edges` zips its output against
+/// `invalid_loans.iter()` — any reordering or filtering there would silently
+/// mis-associate loans.
+///
+/// It is also called BEFORE the callers' `invalid_loans.is_empty()` early exit,
+/// because a conflict-free function is precisely the case where every loan
+/// SURVIVED and a re-route has something to match against.
+///
+/// The kind derivation is textually the engine's own expression (`invalidates.rs`,
+/// both `is_mutable` sites) applied to the loan record, keyed on the BASE local
+/// with projections ignored (R-Q1a §0.4).
+fn record_loan_identities(
+    fn_did: LocalDefId,
+    inference: &BorrowInferenceResults<'_>,
+    provenance_set: &ProvenanceSet,
+    invalid_loans: &DenseBitSet<Loan>,
+) {
+    use crate::analyses::borrow_ownership::export;
+    if !export::capturing() {
+        return;
+    }
+    for (loan, data) in inference.borrow_set.loans.iter_enumerated() {
+        let mutable = provenance_set.local_data[data.borrowed.local]
+            .map(|p| provenance_set.provenance_data[p].is_mutable());
+        // D5 payloads restored: both are key components now (§1.1 correction 2).
+        let borrower = match data.assigned {
+            Borrower::Assign(owner) => export::BorrowerKind::Assign {
+                owner: export::OwnerKey::from_owner(owner),
+            },
+            Borrower::CallArg(callee, arg_index) => export::BorrowerKind::CallArg {
+                callee: callee.local_def_index.as_u32(),
+                arg_index,
+            },
+        };
+        export::record_loan(export::LoanIdentity {
+            key: export::LoanKey {
+                fn_did,
+                place: export::PlaceKey::from_place(data.borrowed),
+                location: export::location_key(data.location()),
+                borrower,
+            },
+            run_local_handle: loan.index(),
+            kind: export::LoanKind::from_provenance_mutability(mutable),
+            invalid: invalid_loans.contains(loan),
+        });
+    }
+}
+
 /// Attribute each invalid loan to its issuer + the live provenances that required it.
 /// (Verbatim from `borrow/mod.rs::extract_conflict_edges` @ fc3bd4cf.)
 fn extract_conflict_edges(
@@ -338,6 +390,16 @@ where
             overwrite_with_engine_facts(program.tcx, f, &ctxt.borrow, &mut inference);
             let invalid_loans = invalid_loan_set(&inference);
             if invalid_loans.is_empty() {
+                // E-R4: a conflict-free function is exactly the case where every
+                // loan SURVIVED, so this branch must record rather than exit
+                // silently. Capturing only where edges are extracted would export
+                // the invalid subset and nothing else.
+                record_loan_identities(
+                    f,
+                    &inference,
+                    ctxt.borrow.provenances.get(&f).unwrap(),
+                    &invalid_loans,
+                );
                 break Vec::new();
             }
 
@@ -356,6 +418,10 @@ where
 
             if to_demote.is_empty() {
                 let provenance_set = ctxt.borrow.provenances.get(&f).unwrap();
+                // E-R4: record from the FINAL inference — the loop above may
+                // replay demotions, so earlier iterations are not the accepted
+                // borrow set.
+                record_loan_identities(f, &inference, provenance_set, &invalid_loans);
                 break extract_conflict_edges(&inference, provenance_set, &invalid_loans);
             }
 
@@ -442,6 +508,17 @@ where
                 overwrite_with_engine_facts_capturing(program.tcx, f, &ctxt.borrow, &mut inference);
             let invalid_loans = invalid_loan_set(&inference);
             if invalid_loans.is_empty() {
+                // D2: the witnessed/L2 replay is structurally identical to the
+                // Mode-A one and had no capture at all, so `loans` was silently
+                // empty under CRAT_BO_L2_GUARDED_COMMITS=1 — the plan-of-record
+                // configuration. Same Gap-B reasoning applies here: a
+                // conflict-free function is where every loan SURVIVED.
+                record_loan_identities(
+                    f,
+                    &inference,
+                    ctxt.borrow.provenances.get(&f).unwrap(),
+                    &invalid_loans,
+                );
                 break Vec::new();
             }
 
@@ -460,6 +537,9 @@ where
 
             if to_demote.is_empty() {
                 let provenance_set = ctxt.borrow.provenances.get(&f).unwrap();
+                // D2: record from the FINAL inference of this call, exactly as
+                // the Mode-A path does.
+                record_loan_identities(f, &inference, provenance_set, &invalid_loans);
                 break extract_witnessed_conflict_edges(
                     &inference,
                     provenance_set,
