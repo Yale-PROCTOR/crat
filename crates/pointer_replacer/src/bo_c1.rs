@@ -4613,19 +4613,22 @@ mod run {
         slots: &CrateSlots,
         origins: &crate::analyses::borrow_ownership::origin_summary::OriginSummaries,
     ) -> Option<(KindSolver, Selectors)> {
-        let crate_ctxt = CrateCtxt::new(program);
-        let solver = KindSolver::new(slots);
-        let (_stats, selectors) =
-            emit_crate_ownership_constraints(&crate_ctxt, slots, origins, &solver).ok()?;
-        for &g in &program.functions {
-            let body = program
-                .tcx
-                .mir_drops_elaborated_and_const_checked(g)
-                .borrow();
-            add_coherence(&solver, slots, g, &body);
+        // Allow-list: this is outside the armed region, so it records nothing.
+        {
+            let crate_ctxt = CrateCtxt::new(program);
+            let solver = KindSolver::new(slots);
+            let (_stats, selectors) =
+                emit_crate_ownership_constraints(&crate_ctxt, slots, origins, &solver).ok()?;
+            for &g in &program.functions {
+                let body = program
+                    .tcx
+                    .mir_drops_elaborated_and_const_checked(g)
+                    .borrow();
+                add_coherence(&solver, slots, g, &body);
+            }
+            constrain_field_ownership(&solver, slots, program);
+            Some((solver, selectors))
         }
-        constrain_field_ownership(&solver, slots, program);
-        Some((solver, selectors))
     }
 
     /// §NB5-L2 — the leave-one-out primitive on a PREBUILT base (the ratified Q2 MECHANISM: ONE solve +
@@ -4653,6 +4656,7 @@ mod run {
         for &d in demote {
             base.add_borrow_exclusion(Some(d), &[]);
         }
+        // Allow-list: outside the armed region ⇒ records nothing.
         let verdict = match base.model_kinds_relaxing(selectors) {
             Some(model) => {
                 model.get(&target) == Some(&SlotKind::Ref)
@@ -4957,6 +4961,7 @@ mod run {
         for &d in &final_demote {
             base.add_borrow_exclusion(Some(d), &[]);
         }
+        // Allow-list: outside the armed region ⇒ records nothing.
         let witnessed = match base.model_kinds_relaxing(&selectors) {
             // Removed slots are hard-pinned `Ref`, so a SAT model has them all `Ref` by construction;
             // only acceptance remains to check.
@@ -6139,6 +6144,18 @@ mod run {
             return row;
         }
 
+        // ALLOW-LIST capture (ruling on ADV-1). Capture is armed HERE and
+        // disarmed immediately after the fixpoint, so the export describes the
+        // accepted run and nothing else. Every probe below — `explain_unsat`,
+        // `measure_collateral`/`solve_with_demotion`, the CHECK_REAL second
+        // fixpoint, and any surface added later — is outside this scope and
+        // therefore records nothing BY CONSTRUCTION, with no enumeration to
+        // keep in sync. Two prior cycles shipped an incomplete deny-list.
+        //
+        // RAII rather than a closure: the emit-error path below does an early
+        // `return row`, and `Drop` ends the scope correctly on that path
+        // without restructuring the region.
+        let capture_arm = crate::analyses::borrow_ownership::export::arm_capture();
         let crate_ctxt = CrateCtxt::new(&program);
         let solver = KindSolver::new(&slots);
         let t = Instant::now();
@@ -6257,6 +6274,10 @@ mod run {
                 None,
             )
         };
+        // End of the accepted-run region: everything after this point is
+        // reporting or probing, and must not reach the recorder. M1 replaces
+        // this `drop` with `capture_arm.finish()` to consume the export.
+        drop(capture_arm);
         row.set("t_fixpoint_s", secs(t.elapsed()));
         phase("fixpoint_done", t0);
 
@@ -6534,6 +6555,7 @@ mod run {
             .unwrap_or(false)
         {
             let t = Instant::now();
+            // Allow-list: outside the armed region ⇒ records nothing.
             let real = {
                 let crate_ctxt = CrateCtxt::new(&program);
                 let solver = KindSolver::new(&slots);

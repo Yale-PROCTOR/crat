@@ -723,7 +723,20 @@ where
                     // extern
                     rustc_hir::Node::ForeignItem(foreign_item) => {
                         with_own_assume_site(OwnAssumeSite::LibcRule, || {
-                            infer_cx.libc_call(destination, &args, callee, foreign_item.ident)
+                            // E-R3 capture: the callee-name half of the call
+                            // cursor, joined with the location half at the
+                            // selector push site.
+                            crate::analyses::borrow_ownership::export::with_callee(
+                                foreign_item.ident.as_str(),
+                                || {
+                                    infer_cx.libc_call(
+                                        destination,
+                                        &args,
+                                        callee,
+                                        foreign_item.ident,
+                                    )
+                                },
+                            )
                         })
                     }
                     // in libxml2.rust/src/xmlschemastypes.rs/{} impl_xmlSchemaValDate/set_mon
