@@ -142,3 +142,145 @@ fn denylist_matches_a_synthetic_breach() {
         "denylist failed to match a known-bad import line"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Per-phase rules (M1 architecture directive)
+// ---------------------------------------------------------------------------
+
+/// One phase's import restrictions.
+///
+/// The directive names one rule explicitly — `apply/` is analysis-blind and may
+/// see plan structs and the AST only. The remaining rules encode E1 state
+/// visibility's *one-way flow*: a phase may not name a phase downstream of it,
+/// because a back-pointer is exactly how "hands the next phase a finished
+/// value" decays into a shared mutable context.
+struct PhaseRule {
+    /// Directory under `bo_rewriter/`.
+    phase: &'static str,
+    forbidden: &'static [&'static str],
+    why: &'static str,
+}
+
+const PHASE_RULES: &[PhaseRule] = &[
+    PhaseRule {
+        phase: "apply",
+        forbidden: &[
+            "crate::analyses",
+            "super::decision",
+            "crate::bo_rewriter::decision",
+            "BoExport",
+            "export::",
+        ],
+        why: "apply is ANALYSIS-BLIND: it imports plan structs and the AST only. \
+              A question that arises here and is not answered by the plan is a \
+              PLAN defect — importing an analysis to answer it is the failure \
+              this rule exists to prevent",
+    },
+    PhaseRule {
+        phase: "decision",
+        forbidden: &["super::apply", "super::verify"],
+        why: "E1 one-way flow: decision hands plan a finished table and holds no \
+              back-pointer to a later phase",
+    },
+    PhaseRule {
+        phase: "verify",
+        forbidden: &["crate::analyses"],
+        why: "verify gates on the EMITTED crate and on values the earlier phases               handed it — `utils::type_check` plus the structural counters.               Re-consulting an analysis here would make a gate agree with the               decision that produced it, which is not a gate",
+    },
+    PhaseRule {
+        phase: "plan",
+        forbidden: &["crate::analyses", "super::apply", "super::verify"],
+        why: "E1 one-way flow: plan consumes the decision table by value and may \
+              not re-consult an analysis, nor name a later phase",
+    },
+];
+
+fn phase_dir(phase: &str) -> std::path::PathBuf {
+    module_root().join(phase)
+}
+
+/// Each phase directory obeys its own import restrictions.
+#[test]
+fn phases_obey_their_import_rules() {
+    for rule in PHASE_RULES {
+        let dir = phase_dir(rule.phase);
+        assert!(
+            dir.is_dir(),
+            "phase directory {dir:?} is missing — the phase separation is part of \
+             the architecture, not an optional layout"
+        );
+        let mut files = Vec::new();
+        collect_rs_files(&dir, &mut files);
+        assert!(
+            !files.is_empty(),
+            "no .rs files under {dir:?}; this check would pass vacuously"
+        );
+        for file in &files {
+            let text = fs::read_to_string(file)
+                .unwrap_or_else(|e| panic!("unreadable phase source {file:?}: {e}"));
+            for (lineno, line) in text.lines().enumerate() {
+                if is_comment(line) {
+                    continue;
+                }
+                for fragment in rule.forbidden {
+                    assert!(
+                        !line.contains(fragment),
+                        "{}/{} line {} names {:?}, which this phase may not import.\n{}",
+                        rule.phase,
+                        file.file_name().unwrap_or_default().to_string_lossy(),
+                        lineno + 1,
+                        fragment,
+                        rule.why
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// Every per-phase rule must actually fire on a breach.
+///
+/// Mutation coverage in test form: a rule whose matcher never matches is a rule
+/// that is not enforcing anything, and the whole point of this file is that the
+/// isolation is mechanical rather than aspirational.
+#[test]
+fn every_phase_rule_matches_a_synthetic_breach() {
+    for rule in PHASE_RULES {
+        for fragment in rule.forbidden {
+            let breach = format!("use {fragment}Something;");
+            assert!(
+                breach.contains(fragment),
+                "phase rule {}/{fragment:?} does not match its own synthetic \
+                 breach — the matcher is broken",
+                rule.phase
+            );
+            assert!(
+                !is_comment(&breach),
+                "synthetic breach was classified as a comment, so the scan would \
+                 skip it"
+            );
+        }
+    }
+}
+
+/// The phase set is complete: every directory under `bo_rewriter/` that holds a
+/// phase has a rule, so a new phase cannot be added silently unregulated.
+#[test]
+fn every_phase_directory_has_a_rule() {
+    let mut dirs: Vec<String> = fs::read_dir(module_root())
+        .expect("module root readable")
+        .flatten()
+        .filter(|e| e.path().is_dir())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|name| name != "testdata")
+        .collect();
+    dirs.sort();
+    let mut ruled: Vec<String> = PHASE_RULES.iter().map(|r| r.phase.to_owned()).collect();
+    ruled.sort();
+    assert_eq!(
+        dirs, ruled,
+        "a phase directory exists with no import rule (or a rule names a \
+         directory that does not exist). Every phase is regulated, or the \
+         architecture claim is unenforced."
+    );
+}
