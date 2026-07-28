@@ -1033,6 +1033,91 @@ fn loan_keys_are_stable_across_reinference() {
     );
 }
 
+/// **§1.5 (deterministic form)** — an INJECTED push-order permutation leaves
+/// the key set unchanged while the handles move.
+///
+/// This replaces the hash-seed-dependent half of the stability witness. The
+/// previous form ran the analysis twice and relied on `RandomState` actually
+/// permuting `group()` between the two runs — true today (measured 8/8), but
+/// contingent: it would silently stop guarding if `utils/dsa/union_find.rs`
+/// ever used a deterministic hasher, and its "sibling loans exist" proxy is
+/// satisfiable by two `CallArg` loans at one terminator, which come from a
+/// deterministic `args.iter().enumerate()` and cannot permute at all (ADV-3).
+///
+/// Here the permutation is INJECTED rather than hoped for: the same loan
+/// records are built twice with explicitly reversed push order. Content keys
+/// must be identical as a SET; handles must actually differ, which is asserted
+/// so the test cannot pass by accident on an empty or singleton set.
+///
+/// *Mutation-tested, Rider 0 order.* **Deletion first:** put
+/// `run_local_handle` back into `LoanKey` (or key the set on
+/// `(key, run_local_handle)`) and the two key sets diverge — deterministically,
+/// on every run, with no hash-seed reliance.
+#[test]
+fn injected_push_order_permutation_preserves_keys() {
+    fn identity(handle: usize, local: u32, field: u32) -> LoanIdentity {
+        LoanIdentity {
+            key: LoanKey {
+                fn_did: rustc_hir::def_id::CRATE_DEF_ID,
+                place: PlaceKey {
+                    local: Local::from_u32(local),
+                    proj: vec![ProjKey::Deref, ProjKey::Field(field)],
+                },
+                location: MirLocationKey::new(1, 3),
+                borrower: BorrowerKind::Assign {
+                    owner: OwnerKey::Local(local),
+                },
+            },
+            run_local_handle: handle,
+            kind: LoanKind::Mut,
+            invalid: false,
+        }
+    }
+
+    // Sibling loans at ONE location, exactly the shape `group()` produces:
+    // same owner, same point, distinct base locals.
+    let siblings: Vec<(u32, u32)> = vec![(1, 0), (2, 1), (3, 2)];
+
+    let forward: Vec<LoanIdentity> = siblings
+        .iter()
+        .enumerate()
+        .map(|(h, (local, field))| identity(h, *local, *field))
+        .collect();
+    // The injected permutation: same loans, reversed push order, so the
+    // handles land on different loans.
+    let reversed: Vec<LoanIdentity> = siblings
+        .iter()
+        .rev()
+        .enumerate()
+        .map(|(h, (local, field))| identity(h, *local, *field))
+        .collect();
+
+    let keys_forward: std::collections::BTreeSet<_> =
+        forward.iter().map(|l| l.key.clone()).collect();
+    let keys_reversed: std::collections::BTreeSet<_> =
+        reversed.iter().map(|l| l.key.clone()).collect();
+    assert_eq!(
+        keys_forward, keys_reversed,
+        "content keys must be invariant under push-order permutation — that is \
+         the whole reason LoanKey exists (D19)"
+    );
+
+    // Non-vacuity, deterministic: the permutation genuinely moved the handles.
+    let pairs_forward: std::collections::BTreeSet<_> = forward
+        .iter()
+        .map(|l| (l.run_local_handle, l.key.place.local))
+        .collect();
+    let pairs_reversed: std::collections::BTreeSet<_> = reversed
+        .iter()
+        .map(|l| (l.run_local_handle, l.key.place.local))
+        .collect();
+    assert_ne!(
+        pairs_forward, pairs_reversed,
+        "the injected permutation did not move any handle, so the key-invariance \
+         assertion above proves nothing"
+    );
+}
+
 /// **§1.5** — the run-local handle must not leak into the consumer as identity.
 ///
 /// A grep-shaped guard in the same family as the import-denylist test: the
@@ -1075,103 +1160,36 @@ fn run_local_handle_is_not_used_as_identity() {
     );
 }
 
-/// **§2.3 / F1** — re-running EMISSION inside a capture scope must not append.
+/// **ALLOW-LIST (ruling on ADV-1)** — probe barrage: work outside the armed
+/// region records nothing, and the region's boundary is load-bearing.
 ///
-/// This is the failure mode of the probe-base surface, reproduced at unit scope
-/// so it is guarded permanently rather than only at the moment the suspension
-/// was added. A probe base re-runs `emit_crate_ownership_constraints`; without
-/// suspension that appends a second full copy of every selector site —
-/// falsifying `SelectorSite`'s documented by-construction index-alignment with
-/// `Selectors` — and doubles the version sites.
+/// Replaces the two suspension-era witnesses. Those tested a DENY-LIST — "each
+/// probe surface suspends capture" — which shipped incomplete twice (F1 found
+/// four surfaces; ADV-1 then found a fifth and sixth reached through a helper).
+/// The property is positional now: capture is armed only around the accepted
+/// run, so anything outside it records nothing with no list to maintain.
 ///
-/// *Mutation-tested (standing rule), Rider 0 order.* **Deletion first:** drop
-/// the `with_capture_suspended` wrapper below and the counts double.
+/// The barrage runs representatives of the shapes that corrupted the export
+/// under the deny-list: a full RE-EMISSION (the `build_probe_base` shape, which
+/// appended a second copy of every selector site), a SECOND full fixpoint (the
+/// CHECK_REAL shape, whose `begin_round()` wiped the certificate), and a
+/// COUNTERFACTUAL oracle probe (the `probe_accepts_with_ref` /
+/// `measure_collateral` shape, which overwrote `version_owns`).
+///
+/// Two assertions, the second keeping the first honest:
+/// 1. the NARROW (shipped) arm yields exactly the accepted run's export;
+/// 2. a WIDE arm that swallows the barrage yields a DIFFERENT export.
+///
+/// (2) is the mutation, built in: it proves the barrage genuinely corrupts, so
+/// (1) cannot pass vacuously. Widening the shipped arm in `run_bo` reproduces
+/// case (2); this test pins case (1) as the contract.
 #[test]
-fn re_emission_under_suspension_does_not_append() {
-    ::utils::compilation::run_compiler_on_str(MALLOC_FREE, |tcx| {
-        let program = collect_program(tcx);
-        let slots = CrateSlots::build(&program);
-        let (_out, export) = with_bo_export(|| {
-            let crate_ctxt = CrateCtxt::new(&program);
-            let solver = KindSolver::new(&slots);
-            let (_stats, _selectors) = emit_crate_ownership_constraints(
-                &crate_ctxt,
-                &slots,
-                &compute_origins(&program),
-                &solver,
-            )
-            .expect("emission");
-            let first = snapshot().expect("capture active");
-            // Non-vacuity: the first emission must have recorded something, or
-            // "no change" below would be trivially true.
-            assert!(
-                !first.source_sites.is_empty() || !first.sink_sites.is_empty(),
-                "first emission recorded no selector sites — witness inert"
-            );
-            assert!(
-                !first.version_sites.is_empty(),
-                "first emission recorded no version sites — witness inert"
-            );
-
-            // A probe base, as bo_c1 builds one: a SECOND full emission.
-            with_capture_suspended(|| {
-                let ctxt2 = CrateCtxt::new(&program);
-                let solver2 = KindSolver::new(&slots);
-                let _ = emit_crate_ownership_constraints(
-                    &ctxt2,
-                    &slots,
-                    &compute_origins(&program),
-                    &solver2,
-                )
-                .expect("second emission");
-            });
-
-            let second = snapshot().expect("capture survives");
-            assert_eq!(
-                first, second,
-                "F1: a suspended re-emission still changed the export — selector \
-                 index-alignment with `Selectors` is stated as by-construction, \
-                 so a second copy makes that claim false with nothing to catch it"
-            );
-            Some(())
-        });
-        drop(export);
-    })
-    .unwrap_or_else(|e| e.raise())
-}
-
-/// **D16** — a probe must leave the export byte-identical.
-///
-/// The export represents the ACCEPTED CEGAR run. `model_accepts` is a probe on
-/// a model the loop may never have accepted, so capture is SUSPENDED for its
-/// duration: the probe neither appends to the recording nor resets it.
-///
-/// This supersedes the cycle-3 witness, which asserted only that a probe adds
-/// no DUPLICATE loans. That was the right assertion for the reset contract and
-/// the wrong one for this contract: a reset passes it too, while silently
-/// replacing the accepted run's loans with a counterfactual's.
-///
-/// **Single-run by construction.** An earlier draft compared two separate
-/// compiler runs and failed — not because the probe changed anything, but
-/// because loan NUMBERING differs between runs (ledger D19: pre-existing,
-/// production-side, in `BorrowSet` construction). Snapshotting before and after
-/// the probe inside ONE run removes that variable and keeps the comparison
-/// order-sensitive, which sorting or set-comparison would have given up.
-///
-/// The probed model is a COUNTERFACTUAL (every slot forced `Ref`), mirroring
-/// the necessity audit's leave-one-out probes. Probing the accepted model would
-/// re-record loans identical to the fixpoint's and hide the difference.
-///
-/// *Mutation-tested (standing rule), Rider 0 order.* **Deletion first:**
-/// removing `with_capture_suspended` from `model_accepts_with_flows` fails this
-/// test. Restoring the cycle-3 `begin_round()` in its place fails it too —
-/// which is the erratum this defect records.
-#[test]
-fn probe_after_accept_leaves_the_export_unchanged() {
+fn probes_outside_the_armed_region_record_nothing() {
     ::utils::compilation::run_compiler_on_str(CASCADE, |tcx| {
         let program = collect_program(tcx);
         let slots = CrateSlots::build(&program);
-        with_bo_export(|| {
+
+        let accepted_run = || {
             let crate_ctxt = CrateCtxt::new(&program);
             let solver = KindSolver::new(&slots);
             let (_stats, selectors) = emit_crate_ownership_constraints(
@@ -1185,45 +1203,98 @@ fn probe_after_accept_leaves_the_export_unchanged() {
                 let body = tcx.mir_drops_elaborated_and_const_checked(g).borrow();
                 add_coherence(&solver, &slots, g, &body);
             }
-            let model = verify_to_fixpoint(&program, &slots, &solver, &selectors, true)
-                .expect("cascade fixture accepts");
+            verify_to_fixpoint(&program, &slots, &solver, &selectors, true)
+                .expect("cascade fixture accepts")
+        };
 
-            let before = snapshot().expect("capture is active inside the scope");
-            assert!(
-                !before.loans.is_empty(),
-                "the fixpoint recorded no loans — the comparison would be inert"
-            );
-            assert!(
-                before.residual_conflicts.is_some() || l2::enabled_from_env(),
-                "the fixpoint recorded no certificate — the comparison would be \
-                 inert (F3: `None` is correct only on the L2 path)"
-            );
-
-            // F5: pin that this IS a counterfactual. If the accepted model were
-            // already all-`Ref`, forcing all-`Ref` would probe the accepted
-            // model and the comparison would lose its power silently.
-            assert!(
-                model.values().any(|k| *k != super::SlotKindAlias::Ref),
-                "the accepted model is already all-Ref, so the 'counterfactual' \
-                 below is the accepted model — witness would be non-distinguishing"
-            );
+        // Recording shapes: safe to run in either position.
+        let barrage = || {
+            // (i) re-emission — the probe-base shape.
+            let ctxt2 = CrateCtxt::new(&program);
+            let solver2 = KindSolver::new(&slots);
+            let (_s2, sel2) = emit_crate_ownership_constraints(
+                &ctxt2,
+                &slots,
+                &compute_origins(&program),
+                &solver2,
+            )
+            .expect("re-emission");
+            // (ii) a second full fixpoint — the CHECK_REAL shape.
+            let _ = verify_to_fixpoint(&program, &slots, &solver2, &sel2, true);
+        };
+        // (iii) the counterfactual ORACLE probe. Only legal outside the arm:
+        // inside it, the allow-list tripwire in `model_accepts_with_flows`
+        // fires by design (witnessed by
+        // `oracle_probe_inside_the_armed_region_trips_the_wire`).
+        let oracle_probe = |model: &FxHashMap<SlotRef, super::SlotKindAlias>| {
             let counterfactual: FxHashMap<SlotRef, super::SlotKindAlias> =
                 model.keys().map(|k| (*k, super::SlotKindAlias::Ref)).collect();
             let _ = model_accepts(&program, &slots, &counterfactual, true);
+        };
 
-            // F5: compare the WHOLE record. The previous version compared
-            // `loans`, `residual_conflicts` and `version_sites.len()` — 3 of 6
-            // fields — while calling itself "byte-identical"; the three it
-            // skipped are exactly the ones the uncovered probe surfaces corrupt.
-            let after = snapshot().expect("capture must survive the probe");
-            assert_eq!(
-                before, after,
-                "D16: a probe changed the export. It must describe the ACCEPTED \
-                 run; a probe is not part of that run."
-            );
-        });
+        // (1) NARROW arm — the shipped boundary; barrage runs after finish().
+        let arm = arm_capture();
+        let model = accepted_run();
+        let narrow = arm.finish();
+        barrage();
+        oracle_probe(&model);
+        assert!(!narrow.loans.is_empty(), "accepted run recorded nothing — inert");
+        assert!(
+            narrow.residual_conflicts.is_some(),
+            "accepted run recorded no certificate — inert"
+        );
+
+        // Reference: the accepted run with no barrage at all.
+        let arm2 = arm_capture();
+        let _ = accepted_run();
+        let reference = arm2.finish();
+        assert_eq!(
+            narrow, reference,
+            "the barrage changed the export even though it ran OUTSIDE the arm"
+        );
+
+        // (2) WIDE arm — the built-in mutation.
+        let arm3 = arm_capture();
+        let _model3 = accepted_run();
+        barrage();
+        let wide = arm3.finish();
+        assert_ne!(
+            wide, narrow,
+            "the barrage did NOT corrupt an over-wide arm, so assertion (1) \
+             proves nothing — pick probes that actually record"
+        );
     })
     .unwrap_or_else(|e| e.raise())
 }
 
 
+
+/// **ALLOW-LIST TRIPWIRE** — an oracle probe inside the armed region fails loud.
+///
+/// The `with_capture_suspended` that used to sit in `model_accepts_with_flows`
+/// was replaced by an assertion rather than deleted. Suspension would MASK an
+/// allow-list violation — a probe that somehow ran inside the armed region
+/// would quietly record nothing and look correct; the assertion names the
+/// invariant instead. A backstop that hides the bug it backstops is worse than
+/// no backstop.
+///
+/// `#[cfg(debug_assertions)]` for the same reason as the L2 door witness: a
+/// `debug_assert!` is compiled out in release, where this would not panic.
+///
+/// *Mutation-tested, Rider 0 order.* **Deletion first:** remove the
+/// `debug_assert!` and no panic occurs, so `should_panic` is unsatisfied.
+#[test]
+#[cfg(debug_assertions)]
+#[should_panic(expected = "allow-list violation")]
+fn oracle_probe_inside_the_armed_region_trips_the_wire() {
+    ::utils::compilation::run_compiler_on_str(CALL_ARG, |tcx| {
+        let program = collect_program(tcx);
+        let slots = CrateSlots::build(&program);
+        let _arm = arm_capture();
+        let model: FxHashMap<SlotRef, super::SlotKindAlias> = FxHashMap::default();
+        // Armed region + probe entry point = the violation the wire names.
+        let _ = model_accepts(&program, &slots, &model, true);
+        None::<()>
+    })
+    .unwrap_or_else(|e| e.raise());
+}

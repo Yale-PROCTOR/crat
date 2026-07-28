@@ -283,7 +283,14 @@ impl PartialOrd for LoanKey {
 
 /// Ruling Q11: borrowed place, kind, program point — all three present, now
 /// carried by a content key rather than by a run-local index.
-#[derive(Clone, Debug, PartialEq, Eq)]
+///
+/// `PartialEq` is **hand-written to exclude `run_local_handle`**, and that is a
+/// contract requirement rather than a convenience. The handle is documented as
+/// "never compare across runs"; deriving equality made the compiler compare it
+/// across runs anyway, so two exports with identical CONTENT compared unequal
+/// whenever D19 permuted the numbering. A field that is not identity must not
+/// participate in identity.
+#[derive(Clone, Debug, Eq)]
 pub(crate) struct LoanIdentity {
     pub key: LoanKey,
     /// Run-local handle. **NOT an identity** (D19): `BorrowSet` numbering
@@ -296,6 +303,13 @@ pub(crate) struct LoanIdentity {
     /// Whether this loan was in the final round's invalid set. **Surviving
     /// loans are `false`** — those are the ones a re-route must match against.
     pub invalid: bool,
+}
+
+impl PartialEq for LoanIdentity {
+    fn eq(&self, other: &Self) -> bool {
+        // `run_local_handle` deliberately excluded — see the type doc.
+        self.key == other.key && self.kind == other.kind && self.invalid == other.invalid
+    }
 }
 
 /// One residual conflict the accepted model tolerated, flattened to owner keys.
@@ -453,27 +467,80 @@ thread_local! {
     static BO_EXPORT_CAPTURE: RefCell<Option<BoExport>> = const { RefCell::new(None) };
 }
 
+/// RAII arm for the **allow-list** capture discipline.
+///
+/// # Why an allow-list
+///
+/// M0 spent two cycles trying to make a deny-list work: suspend capture at
+/// every probe surface that must not record. Both cycles shipped an
+/// enumeration that turned out to be incomplete (F1 found four surfaces; ADV-1
+/// then found a fifth and sixth reached through a helper). Enumeration is the
+/// wrong correctness input — it fails open, silently, and each new probe
+/// surface is a new chance to miss one.
+///
+/// Inverted: capture is armed **only** around the accepted-run region. Anything
+/// outside that scope — probes, helpers, `solve_with_demotion`,
+/// `explain_unsat`, and every surface not yet written — records nothing **by
+/// construction**, with no list to maintain and nothing to keep in sync.
+///
+/// Drop ends the scope, so an early `return` out of the armed region is
+/// correct without restructuring the region into a closure.
+pub(crate) struct CaptureArm {
+    prev: Option<BoExport>,
+}
+
+impl Drop for CaptureArm {
+    fn drop(&mut self) {
+        BO_EXPORT_CAPTURE.with(|c| *c.borrow_mut() = self.prev.take());
+        // Non-`Send` scaffolding must not outlive the scope.
+        VERSION_ASTS.with(|c| *c.borrow_mut() = None);
+    }
+}
+
+impl CaptureArm {
+    /// Take the recording and end the scope, in CANONICAL order.
+    ///
+    /// `loans` is sorted by [`LoanKey`] before it leaves the scope. Without
+    /// this the vector carries `BorrowSet` index order, which D19 permutes
+    /// between runs and between CEGAR rounds — so two analyses of the same
+    /// program produced exports with identical CONTENT in different ORDER, and
+    /// `BoExport`'s derived `PartialEq` compares `Vec`s order-sensitively.
+    ///
+    /// That was not hypothetical: it made the probe-barrage witness flake
+    /// (838/1 then 839/0 on consecutive runs), differing only in two loans
+    /// swapping position. Canonicalising here is what makes E-R4 reproducible
+    /// for the consumer the content key was introduced for — an unordered
+    /// identity set is not much use if the container it ships in is unordered
+    /// too.
+    ///
+    /// Recording-only is unaffected: this runs after the analysis, on the way
+    /// out of the scope.
+    pub(crate) fn finish(self) -> BoExport {
+        let mut captured = BO_EXPORT_CAPTURE
+            .with(|c| c.borrow_mut().take())
+            .unwrap_or_default();
+        captured.loans.sort_by(|a, b| a.key.cmp(&b.key));
+        // `self`'s Drop still runs, restoring the previous scope.
+        captured
+    }
+}
+
+/// Arm capture for the accepted-run region. See [`CaptureArm`].
+pub(crate) fn arm_capture() -> CaptureArm {
+    let prev = BO_EXPORT_CAPTURE.with(|c| c.replace(Some(BoExport::default())));
+    VERSION_ASTS.with(|c| *c.borrow_mut() = None);
+    CaptureArm { prev }
+}
+
 /// Run `f` with export capture active, returning its result and the recording.
 ///
 /// The returned value is the exact result of `f`; the capture cannot influence
 /// it. Nesting is safe — the previous capture is restored on unwind as well as
 /// on normal return.
 pub(crate) fn with_bo_export<T>(f: impl FnOnce() -> T) -> (T, BoExport) {
-    struct Restore(Option<BoExport>);
-    impl Drop for Restore {
-        fn drop(&mut self) {
-            BO_EXPORT_CAPTURE.with(|c| *c.borrow_mut() = self.0.take());
-        }
-    }
-    let _restore = Restore(BO_EXPORT_CAPTURE.with(|c| c.replace(Some(BoExport::default()))));
-    VERSION_ASTS.with(|c| *c.borrow_mut() = None);
+    let arm = arm_capture();
     let output = f();
-    let captured = BO_EXPORT_CAPTURE
-        .with(|c| c.borrow_mut().take())
-        .unwrap_or_default();
-    // Drop the non-`Send` scaffolding before the result crosses any boundary.
-    VERSION_ASTS.with(|c| *c.borrow_mut() = None);
-    (output, captured)
+    (output, arm.finish())
 }
 
 /// Whether capture is active.
