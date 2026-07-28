@@ -1256,28 +1256,34 @@ pub(crate) fn model_accepts_with_flows(
     model: &FxHashMap<SlotRef, SlotKind>,
     is_mutable: impl MutProvider + Copy,
 ) -> bool {
-    // D16: this is a PROBE, not the analysis — an oracle run outside either
-    // CEGAR loop, on a model the loop may never have accepted (the necessity
-    // audit calls it once per leave-one-out counterfactual). The export
-    // represents the ACCEPTED run, so capture is suspended for the duration:
-    // the probe neither appends to the recording nor resets it.
+    // ALLOW-LIST TRIPWIRE (ruling on ADV-1). This is a PROBE — an oracle run
+    // outside either CEGAR loop, on a model the loop may never have accepted.
+    // Under the allow-list it is outside the armed region and records nothing
+    // by construction, so the previous `with_capture_suspended` here is
+    // redundant.
     //
-    // This replaces a per-round reset (D11), which did prevent accumulation
-    // but silently overwrote the accepted run's loans with a counterfactual's
-    // — trading a loud defect for a quiet one.
-    let conflicts = super::export::with_capture_suspended(|| {
-        revalidate_replaying_with_flows(
-            program,
-            slots,
-            origin_flows,
-            |s| model.get(&s) == Some(&SlotKind::Ref),
-            |s| match s {
-                SlotRef::Field(_) => model.get(&s) == Some(&SlotKind::Raw),
-                SlotRef::Local(..) => model.get(&s) != Some(&SlotKind::Ref),
-            },
-            is_mutable,
-        )
-    });
+    // It is replaced by an assertion rather than deleted, and that choice is
+    // deliberate: suspension would MASK a violation of the allow-list (a probe
+    // that somehow ran inside the armed region would quietly record nothing and
+    // look fine), whereas this fails loudly and names the invariant. A backstop
+    // that hides the bug it backstops is worse than no backstop.
+    debug_assert!(
+        !super::export::capturing(),
+        "allow-list violation: a probe entry point ran INSIDE the armed capture \
+         region. Capture must be armed only around the accepted run; move the \
+         arm, do not suspend here."
+    );
+    let conflicts = revalidate_replaying_with_flows(
+        program,
+        slots,
+        origin_flows,
+        |s| model.get(&s) == Some(&SlotKind::Ref),
+        |s| match s {
+            SlotRef::Field(_) => model.get(&s) == Some(&SlotKind::Raw),
+            SlotRef::Local(..) => model.get(&s) != Some(&SlotKind::Ref),
+        },
+        is_mutable,
+    );
     // The loop's accept is `committed == 0` reached WITHOUT tripping either of its two guards: the
     // `residual_nonref_field` decline (non-`Ref` FIELD residual) and the `guard_slots_are_ref`
     // invariant (a residual whose owners are not all `Ref`, which the release-active loop treats as a
