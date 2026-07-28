@@ -3,16 +3,28 @@
 Five adversarial review lenses ran against `f9ee8fee` (read-only). 38 raw
 findings; nine re-verified and accepted. Four were HIGH and blocked merge.
 
-**Status after fix cycle 3 + its adversarial verification: D1, D2, D3, D4,
-D10, D11 CLOSED. D12 is NOT closed — its replacement assertion cannot detect
-deletion of the code it guards, verified by running the mutation. D13 is
-RETRACTED as stated; the reasoning behind it was invalid. D5–D9 remain open,
-joined by D14–D18. M0 is NOT merge-ready.**
+**Status after fix cycle 4: D1–D4, D10–D12, D14, D16, D17, D18 CLOSED, every
+witness mutation-tested in Rider 0 order. D13 RETRACTED. D5–D9 and D15 remain
+open. One NEW HIGH — D19 — was found during implementation.**
+
+> ## CONVERGENCE GUARDRAIL: TRIGGERED
+>
+> Cycle 4's success condition was "close the listed items with zero new HIGH
+> findings". **D19 is a new HIGH**, so per the standing instruction cycle 5 is
+> NOT opened; this stops for a design review of the recorder architecture.
+>
+> D19 is not a defect in the recorder's code — the recorder is faithful. It is
+> a defect in the recorder's **premise**: E-R4 exists to give a rewriter a
+> stable per-loan identity, and `LoanIdentity.loan` is not stable across runs.
+> That is an architecture question (what is a loan's identity?), not something
+> another patch cycle should answer, which is exactly the condition the
+> guardrail describes.
 
 Cycle-3 delta verification: 7 findings, **all 7 confirmed** — 2 by running the
-mutation, 5 by direct source reading. None refuted.
+mutation, 5 by direct source reading. None refuted. Cycle 4 later **partly
+refuted one of them** (D17's premise) by running its deletion mutation.
 
-Suite: **833 passed, 0 failed, 7 ignored.**
+Suite after cycle 4: **834 passed, 0 failed, 7 ignored.**
 
 > **The standing rule was violated one commit after it was written.** The rule
 > says: *delete or break the exact branch the witness claims to guard*. For
@@ -252,7 +264,14 @@ D4, but the witness makes it non-latent: the test constructs the scope itself.
 (DefId(0:3 ~ rust_out[96a3]::id), 0) recorded twice — the probe appended to the
 fixpoint's loans instead of starting a fresh round", and fails only it.
 
-### D12 — `certificate_residuals_may_be_nonempty` was vacuous — **NOT CLOSED**
+### D12 — `certificate_residuals_may_be_nonempty` was vacuous — **CLOSED in cycle 4**
+
+Closed by the `Option` change described under D14: the obligation was "the
+certificate is recorded", and it was unwitnessable while "recorded empty" and
+"never recorded" were the same value. The cycle-3 history below is kept because
+the *reason* it stayed open for two cycles is the more useful record.
+
+
 
 *Was:* the core assertion was `export.residual_conflicts.len() < usize::MAX`.
 Same tautology class as D3, written by me in `ad79b01a`.
@@ -328,21 +347,94 @@ say exactly this; the spec deviation note is corrected likewise.
 
 Outside the authorized fix scope; recommended for M0.1.
 
+### REVIEWER ERRATUM (recorded as the reviewer's, at their instruction)
+
+> The cycle-3 prescription for D11 — give `model_accepts_with_flows` "the same
+> per-round reset discipline" as the CEGAR loops — **was the wrong contract for
+> a probe path.** A reset converts a loud defect into a silent one, exactly as
+> the delta verification argued in D16. The correct contract is **suspension**:
+> the export represents the accepted CEGAR run only, and capture is inactive
+> during probe entry points.
+>
+> This erratum is the reviewer's, not the implementer's. Recorded here at their
+> instruction, and implemented in cycle 4 as D16.
+
+Worth keeping alongside it: cycle 3 implemented the prescription as given
+rather than raising the objection, even though the concern was visible at
+implementation time. Both the erratum and the silent compliance are on the
+record.
+
 ### From the cycle-3 delta verification (all confirmed)
 
-- **D14 (HIGH)** The E-R4 certificate has **no recording witness at all** —
-  see D12 above. Deleting `record_residuals` leaves the suite green. This is
-  the item that keeps M0 from being merge-ready.
-- **D15 (MEDIUM)** **No fixture constructs an owner-less residual edge**, the
-  single shape that decides D13 either way. The construction is available from
-  source: a residual whose only invalid loan is a `Borrower::CallArg` loan.
-  Until it exists, the certificate's emptiness is an empirical observation over
-  a handful of fixtures, not a property. Related: nothing covers
-  `representative`'s `None` arm on either loop (`if let Some(slot)` in Mode-A;
-  the `else { … continue; }` in L2) — both are written as reachable and
-  neither has a fixture.
-- **D16 (MEDIUM)** **D11's reset makes the export last-writer-wins across the
-  audit probe path.** `run_necessity_audit` calls `model_accepts_with_flows`
+- **D14 (HIGH) — CLOSED in cycle 4.** The E-R4 certificate had no recording
+  witness: deleting `record_residuals` left the suite green.
+
+  *Fix:* `residual_conflicts` is now `Option<Vec<ResidualConflict>>`. `None`
+  means the accept point never ran; `Some(vec![])` means it ran and tolerated
+  nothing. **That type change is the whole fix** — as a bare `Vec` the default
+  value and the recorded value were the same value, so no assertion could
+  distinguish them, and every attempt to witness "it was recorded" was doomed
+  before it was written. `begin_round()` resets to `None`, not to an empty vec.
+
+  *Witness:* `certificate_is_recorded_at_the_accept_point`, asserting
+  `is_some()`. **Mutation-tested, deletion first (Rider 0):** removing the
+  `record_residuals` call fails it with the D14 message — the same mutation
+  that previously left all 833 tests green.
+
+  *What was NOT achieved.* The authorization asked for the witness to be built
+  on a fixture producing an owner-less edge that survives to a Mode-A accept
+  with a non-empty residual set. **No such fixture was found**, so the content
+  assertion is emptiness, not non-emptiness. See D15 — the search is recorded
+  there rather than being quietly dropped.
+- **D15 (MEDIUM, open — searched, not found)** No fixture constructs an
+  owner-less residual edge, the shape that would decide D13 either way.
+
+  *Cycle-4 search, recorded so the next attempt does not repeat it.* 14 shapes
+  probed (write-after-call, aliased two-arg, call-then-call, struct field
+  aliasing, nested fields, array locals, cast chains, read-only callees).
+  **Zero produced an invalid `CallArg` loan**, at any round.
+
+  *Why, from source.* A `CallArg` loan gets no membership constraint, so no
+  provenance `requires` it; `LoanLiveAt::apply_location_effect` begins with
+  `state.intersect(&required)`, which therefore drops it at the very next
+  location. Combined with `seek_before_primary_effect`, the loan is live at
+  **exactly one point** — the location following its call. To be invalid it
+  needs an invalidating access at that one location, which source-level
+  fixtures cannot reliably place (MIR bookkeeping intervenes). The self-loan
+  skip is NOT the blocker: it matches only `Borrower::Assign(Local(l))`, so
+  `CallArg` loans are not skipped. `local_map` includes every loan, so that is
+  not the blocker either. Both were checked and ruled out.
+
+  *Status:* the D13-retraction mechanism (guards are vacuous on an owner-less
+  edge) still stands as source-level fact. Its **reachability** is unresolved,
+  and neither "reachable" nor "unreachable" is claimed. The remaining untried
+  route is an `Assign` loan whose owners all fail `owner_to_slot` (a Local or
+  Field with no depth-0 slot).
+
+  Related and still uncovered: `representative`'s `None` arm on either loop.
+- **D16 (MEDIUM) — CLOSED in cycle 4** by replacing the reset with
+  **suspension**, per the reviewer's erratum above. `model_accepts_with_flows`
+  now wraps its oracle call in `export::with_capture_suspended`, so a probe
+  neither appends to the recording nor resets it, and the export continues to
+  describe the accepted run.
+
+  *Witness:* `probe_after_accept_leaves_the_export_unchanged`. It snapshots the
+  export before and after a **counterfactual** probe (every slot forced `Ref`,
+  mirroring the necessity audit's leave-one-out direction) — a probe on the
+  accepted model would re-record identical loans and hide the difference.
+
+  *Single-run by construction, and that detail is load-bearing.* The first
+  draft compared two separate compiler runs and failed — not because the probe
+  changed anything, but because of D19. Snapshotting inside one run removes
+  that variable while keeping the comparison **order-sensitive**; sorting or
+  set-comparison would have accommodated D19 by weakening the assertion, which
+  is the RED-weakening trap wearing a different hat.
+
+  *Mutation-tested, both directions:* deleting `with_capture_suspended` fails
+  it, and **restoring cycle 3's `begin_round()` in its place fails it too** —
+  the erratum made executable.
+
+  The original finding, for the record: `run_necessity_audit` calls `model_accepts_with_flows`
   on the anchor model and then once per leave-one-out **counterfactual** model
   (`probe_accepts_with_ref`). Each now clears and re-records, so after such a
   run `export.loans` describes the last counterfactual — a model that was
@@ -361,31 +453,73 @@ Outside the authorized fix scope; recommended for M0.1.
   still prevents D1-style accumulation. I did not make that change: the
   authorization specified "the same per-round reset discipline as the CEGAR
   loops", and switching to suspension is a contract change, not a fix.
-- **D17 (LOW)** The new `pub(crate)` door into the L2 loop bypasses the
-  release-active tracked-solver guard. The env entry asserts **two**
-  preconditions — `solver.tracker().is_none()` and `RepairMode::ModeA` — and
-  my doc names only the second. The reviewer's sharper point: the L2 loop
-  hardcodes `repair: ModeA` and never re-reads `RepairMode::current()`, so the
-  precondition I documented is the **inert** one and the one I omitted is
-  **load-bearing** (a tracked solver makes every solve vacuously SAT). Not
-  violated today — the only two callers are the env entry and the test helper,
-  which builds a fresh untracked solver. Fix: assert the tracker inside
-  `verify_l2_to_fixpoint_counting`, or at minimum document both.
-- **D18 (LOW)** Two overclaims in cycle 3's own record, both now corrected in
-  place but recorded here because they are the same class:
-  (a) `l2_path_records_loans`' added `stats.l2_decline.is_none()` assertion
-  **cannot fire** — every `record_l2_decline` call site is immediately followed
-  by `return (None, stats)`, so it is implied by the preceding
-  `model.is_some()`. It was counted as "strengthening"; it adds no
-  discriminating power. (b) The structural loop at the end of the certificate
-  test is **unreachable by construction** — it iterates a collection the
-  preceding assert has just required to be empty, and on failure the assert
-  aborts first. Its comment ("live for the day the arm becomes reachable") is
-  false, and worse, if reordered it would call D13's owner-less edge
-  "malformed" — the wrong diagnosis.
-  Also noted: `export_off_records_nothing`'s doc claims it shows capture
-  "allocates nothing when off"; the body asserts only `!capturing()`. The
-  claim exceeds the assertion.
+- **D17 (LOW) — CLOSED in cycle 4, with the finding itself partly REFUTED.**
+
+  *The finding said:* the new `pub(crate)` door bypasses the release-active
+  tracked-solver guard, and my doc named only the inert precondition
+  (`RepairMode`, which the L2 loop hardcodes and never re-reads — that part is
+  correct).
+
+  *What checking it showed:* **the hazard was never unguarded.**
+  `KindSolver::check`, `model_kinds`, and `model_kinds_relaxing` each carry
+  their own release-active guard with the same message prefix, and the loop
+  cannot extract a model without passing one. So the door bypasses a
+  *wrapper-level* tripwire, not the protection.
+
+  *How that surfaced — Rider 1 earning its place.* My first witness was
+  `should_panic(expected = "tracked KindSolver must not enter")`, and the
+  deletion mutation **did not fail it**: the panic came from
+  `model_kinds_relaxing`'s own guard, whose message shares that prefix. Had I
+  not run the deletion mutation, I would have shipped a false witness AND kept
+  the false claim. The `expected` string is now door-specific, and the deletion
+  mutation fails the test.
+
+  *Shipped:* a `debug_assert!` at the door, documented for what it is — a
+  fail-earlier tripwire naming the door, not the thing preventing a meaningless
+  model. `debug_assert!` rather than `assert!` so release behaviour at the
+  existing choke points is untouched.
+- **D18 (LOW) — CLOSED in cycle 4.**
+  (a) The cannot-fire `stats.l2_decline.is_none()` assertion is **removed**
+  rather than left as decoration.
+  (b) The "well-formedness" loop is **deleted, not repaired**. It was shadowed
+  (it iterated a collection the preceding assert had just required to be
+  empty), and repairing the shadowing would have made it worse: an owner-less
+  residual is not malformed, it is precisely the shape D15 hunts, so on the one
+  day it could have run it would have reported the wrong diagnosis. A missing
+  check is honest; a check that misclassifies what it fires on is not.
+  (c) `export_off_records_nothing`'s doc no longer claims to show capture
+  "allocates nothing when off" — the body asserts only `!capturing()` and that
+  recording is a no-op. The zero-allocation property rests on `record`'s early
+  return, which is an argument, not a measurement.
+
+### New in cycle 4
+
+- **D19 (HIGH, open — pre-existing, production-side) — loan numbering is not
+  stable across runs.** Identical source, identical binary, same process: some
+  runs record loan 2 → `_2` and loan 3 → `_3`, others the reverse. Observed
+  directly, four consecutive runs of one fixture (runs 0–1 one order, runs 2–3
+  the other).
+
+  *Not an export defect.* `record_loan_identities` iterates
+  `borrow_set.loans.iter_enumerated()` — an `IndexVec`, iterated by index, so
+  the recorder is faithful to whatever numbering it is given. The instability
+  is in **`BorrowSet` construction** in `analyses/borrow/`, which is production
+  and out of bounds for this milestone; three loans in the fixture share one
+  location, and their relative order varies.
+
+  *Why HIGH.* E-R4's purpose, per ruling Q11, is a stable per-loan identity a
+  re-route can match against. `LoanIdentity.loan` is a `usize` index into that
+  numbering, so **it is not a valid cross-run key** — which is the property the
+  export was built to provide. `surviving_loans()` hands a consumer indices
+  that mean different loans on different runs.
+
+  *Blast radius beyond the export is unassessed* and should be part of the
+  design review: anything comparing analysis output across runs (sweep rows,
+  byte-comparability claims, cached artifacts) rests on the same numbering.
+
+  *Discovered* by D16's first draft, which compared two runs and failed for
+  this reason rather than the one it was testing. The failure was investigated
+  rather than accommodated — sorting the comparison would have hidden it.
 
 ### Carried from earlier cycles
 
