@@ -255,12 +255,22 @@ pub(crate) struct BoExport {
     /// set intact.
     ///
     /// What is NOT established is whether such an edge can survive to an
-    /// *accepting* round; no fixture exhibits one. So: empty in practice,
-    /// unproven in general, and a consumer must not assume either way.
+    /// *accepting* round; no fixture exhibits one (ledger D15). So: empty in
+    /// practice, unproven in general, and a consumer must not assume either
+    /// way.
     ///
-    /// **Never written on the L2 path at all** (see the ledger's D2 adjacent
-    /// gap): `record_residuals`' sole call site is inside the Mode-A accept.
-    pub residual_conflicts: Vec<ResidualConflict>,
+    /// **`Option`, not `Vec` — D14.** `None` means the accept point never ran,
+    /// so nothing was recorded; `Some(vec![])` means it ran and tolerated no
+    /// residual. As a bare `Vec` those two states were indistinguishable, and
+    /// that is exactly why no test could detect deletion of the recorder: the
+    /// default value and the recorded value were the same value. A consumer
+    /// must not read `None` as "no residuals".
+    ///
+    /// **`None` on the L2 path** (see the ledger's D2 adjacent gap):
+    /// `record_residuals`' sole call site is inside the Mode-A accept, so under
+    /// `CRAT_BO_L2_GUARDED_COMMITS=1` the certificate is never recorded — which
+    /// this type now says out loud instead of presenting as an empty set.
+    pub residual_conflicts: Option<Vec<ResidualConflict>>,
 }
 
 impl BoExport {
@@ -500,8 +510,47 @@ pub(crate) fn record_loan(identity: LoanIdentity) {
 pub(crate) fn begin_round() {
     record(|export| {
         export.loans.clear();
-        export.residual_conflicts.clear();
+        // Back to "not recorded this round" — NOT to "recorded, none found".
+        export.residual_conflicts = None;
     });
+}
+
+/// Clone the active capture without ending the scope, or `None` when off.
+///
+/// Exists so a test can compare the recording at two points **inside one
+/// analysis run**. That matters: loan *numbering* is not stable across runs
+/// (ledger D19), so a two-run comparison cannot distinguish "the probe changed
+/// the export" from "the two runs numbered loans differently". Within a single
+/// run the order is fixed, and the comparison is exact.
+pub(crate) fn snapshot() -> Option<BoExport> {
+    BO_EXPORT_CAPTURE.with(|c| c.borrow().clone())
+}
+
+/// Run `f` with capture SUSPENDED, restoring it afterwards (D16).
+///
+/// The export represents **the accepted CEGAR run**. A probe entry point —
+/// `model_accepts`, and anything else that runs the oracle on a model the loop
+/// did not accept — is not part of that run, and must neither append to the
+/// recording nor reset it.
+///
+/// Resetting was the previous behaviour and was wrong in a way worth naming:
+/// it turned a loud defect into a silent one. Appending produced *duplicate*
+/// loans, which the uniqueness witnesses catch immediately; resetting produces
+/// a unique, plausible loan set belonging to a model that was never accepted,
+/// which nothing catches. Suspension keeps the accepted run's recording intact
+/// and still cannot accumulate.
+///
+/// Restores on unwind as well as on normal return, and costs one thread-local
+/// read when capture is off.
+pub(crate) fn with_capture_suspended<T>(f: impl FnOnce() -> T) -> T {
+    struct Restore(Option<BoExport>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            BO_EXPORT_CAPTURE.with(|c| *c.borrow_mut() = self.0.take());
+        }
+    }
+    let _restore = Restore(BO_EXPORT_CAPTURE.with(|c| c.borrow_mut().take()));
+    f()
 }
 
 /// Record the residual conflicts present at acceptance (E-R4 certificate).
@@ -509,7 +558,7 @@ pub(crate) fn begin_round() {
 /// Called at the `committed == 0` accept point, where the residual set is the
 /// one the accepted model tolerates.
 pub(crate) fn record_residuals(residuals: Vec<ResidualConflict>) {
-    record(|export| export.residual_conflicts = residuals);
+    record(|export| export.residual_conflicts = Some(residuals));
 }
 
 /// E-R1 is the accepted model itself, which existing entry points already

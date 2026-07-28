@@ -921,8 +921,30 @@ impl L2TransitionDiagnostics {
 /// binary. The env switch remains the production entry — resolved once in
 /// `verify_to_fixpoint_counting_with_flows` — and this changes nothing about
 /// it; it only removes the need to perturb process-wide state to reach the same
-/// loop. Callers taking this door are responsible for the `RepairMode::ModeA`
-/// precondition the env entry asserts.
+/// loop.
+///
+/// # Preconditions this door must carry (D17)
+///
+/// The env entry asserts **two** things before delegating here, and neither is
+/// what an earlier version of this doc claimed:
+///
+/// - **`solver.tracker().is_none()`.** A tracked solver's hard constraints are
+///   track-gated, so every solve here would be vacuously SAT and the accepted
+///   model meaningless. Opening this door does **not** leave that unguarded:
+///   `KindSolver::check`, `model_kinds`, and `model_kinds_relaxing` each carry
+///   their own release-active guard, and the loop cannot extract a model
+///   without passing one. The `debug_assert!` below is a *fail-earlier*
+///   tripwire — it names the door in the message instead of the accessor — not
+///   the only thing standing between a tracked solver and a meaningless model.
+///   (The review finding that prompted this called the guard bypassed; that was
+///   checked and is wrong.)
+/// - **`RepairMode::current() == ModeA` — INERT here.** This loop stamps
+///   `repair: RepairMode::ModeA` into its own stats and never reads
+///   `RepairMode::current()`, so violating it changes nothing about what runs.
+///   Documented for callers, not enforced.
+///
+/// An earlier version of this doc named only the inert one, and called the
+/// other load-bearing.
 pub(crate) fn verify_l2_to_fixpoint_counting(
     program: &RustProgram,
     slots: &CrateSlots,
@@ -931,6 +953,13 @@ pub(crate) fn verify_l2_to_fixpoint_counting(
     selectors: &Selectors,
     is_mutable: impl MutProvider + Copy,
 ) -> (Option<FxHashMap<SlotRef, SlotKind>>, RoundStats) {
+    // D17: re-assert the load-bearing precondition at the door, not only at the
+    // env entry. `debug_assert!` rather than `assert!` so the release-path cost
+    // and behaviour of the existing single choke point are unchanged.
+    debug_assert!(
+        solver.tracker().is_none(),
+        "tracked KindSolver must not enter the l2 door (constraints are track-gated)"
+    );
     let diagnostics_enabled = l2::diagnostics_enabled_from_env();
     let mut transition_diagnostics =
         l2::transition_diagnostics_enabled_from_env().then(L2TransitionDiagnostics::default);
@@ -1202,24 +1231,28 @@ pub(crate) fn model_accepts_with_flows(
     model: &FxHashMap<SlotRef, SlotKind>,
     is_mutable: impl MutProvider + Copy,
 ) -> bool {
-    // D11: this is an oracle run OUTSIDE either CEGAR loop, so nothing else
-    // would reset the recorder before it. Without this, a probe issued inside
-    // an open capture scope would APPEND its loans to the fixpoint's and
-    // reopen D1 by another route. The reset gives the same guarantee the loops
-    // have: what the export holds afterwards is exactly the last oracle run's
-    // `BorrowSet` — here, this probe's.
-    super::export::begin_round();
-    let conflicts = revalidate_replaying_with_flows(
-        program,
-        slots,
-        origin_flows,
-        |s| model.get(&s) == Some(&SlotKind::Ref),
-        |s| match s {
-            SlotRef::Field(_) => model.get(&s) == Some(&SlotKind::Raw),
-            SlotRef::Local(..) => model.get(&s) != Some(&SlotKind::Ref),
-        },
-        is_mutable,
-    );
+    // D16: this is a PROBE, not the analysis — an oracle run outside either
+    // CEGAR loop, on a model the loop may never have accepted (the necessity
+    // audit calls it once per leave-one-out counterfactual). The export
+    // represents the ACCEPTED run, so capture is suspended for the duration:
+    // the probe neither appends to the recording nor resets it.
+    //
+    // This replaces a per-round reset (D11), which did prevent accumulation
+    // but silently overwrote the accepted run's loans with a counterfactual's
+    // — trading a loud defect for a quiet one.
+    let conflicts = super::export::with_capture_suspended(|| {
+        revalidate_replaying_with_flows(
+            program,
+            slots,
+            origin_flows,
+            |s| model.get(&s) == Some(&SlotKind::Ref),
+            |s| match s {
+                SlotRef::Field(_) => model.get(&s) == Some(&SlotKind::Raw),
+                SlotRef::Local(..) => model.get(&s) != Some(&SlotKind::Ref),
+            },
+            is_mutable,
+        )
+    });
     // The loop's accept is `committed == 0` reached WITHOUT tripping either of its two guards: the
     // `residual_nonref_field` decline (non-`Ref` FIELD residual) and the `guard_slots_are_ref`
     // invariant (a residual whose owners are not all `Ref`, which the release-active loop treats as a

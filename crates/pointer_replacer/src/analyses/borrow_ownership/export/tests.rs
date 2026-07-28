@@ -132,13 +132,19 @@ unsafe fn f(p: *mut i32) -> i32 {
 // asserts the stronger property: capture is off unless a scope opened it, with
 // no ambient path that can turn it on.
 
-/// RED 4 — capture is inert unless scoped, and allocates nothing when off.
+/// RED 4 — capture is inert unless a scope is open.
 ///
 /// **Also the D4 witness.** The first assertion fails if ambient enablement is
 /// ever reintroduced — an env flag, a global, a lazy install inside
 /// `capturing()` — because this test runs with no scope open. Mutation-tested:
 /// restoring the `if flag_enabled() { install }` branch with the flag forced on
 /// fails it here.
+///
+/// D18: this doc used to add "and allocates nothing when off". It does not
+/// show that — the body observes `capturing()` and that recording is a no-op,
+/// and asserts nothing about allocation. The zero-allocation property rests on
+/// `record`'s early return, which is an argument, not a measurement. Claim
+/// narrowed to what is actually asserted.
 #[test]
 fn export_off_records_nothing() {
     assert!(!capturing(), "capture must be inactive by default");
@@ -494,55 +500,58 @@ fn place_key_counts_derefs_and_fields() {
 // RED 16-17: the E-R4 certificate
 // -------------------------------------------------------------------------
 
-/// RED 16 — the E-R4 certificate at a Mode-A accept.
+/// RED 16 — **D14**: the E-R4 certificate is RECORDED at the accept point.
 ///
-/// **This docstring previously asserted the OPPOSITE of the body below** (that
-/// an accepted model may carry a non-empty residual set). The rename and the
-/// assertion change landed without updating it, so the file carried a contract
-/// and its negation five lines apart. Corrected here.
+/// This is the assertion the previous two versions could not make. As a bare
+/// `Vec`, "recorded, none tolerated" and "never recorded" were the same value,
+/// so `is_empty()` held with the recorder deleted and the whole suite stayed
+/// green — verified by running that mutation. `Option` separates the states and
+/// `is_some()` is exactly the obligation.
 ///
-/// **Known-insufficient, not yet fixed (ledger D14).** The emptiness assertion
-/// cannot detect DELETION of `record_residuals` — with the sole writer removed
-/// the field defaults to empty and the whole suite stays green (verified). It
-/// detects only a wrong-content recording. The obligation "the certificate is
-/// recorded at the accept point" is therefore still unwitnessed, and the
-/// failure message below overclaims by naming a move it cannot see. Closing it
-/// needs a shape that distinguishes "recorded empty" from "never recorded".
+/// *Mutation-tested, Rider 0 order.* **Deletion first:** removing the
+/// `record_residuals` call at the accept point leaves the field `None` and
+/// fails this test. Only then the weaker perturbation: recording a fabricated
+/// residual fails the emptiness assertion.
+///
+/// The emptiness assertion is retained but is **no longer load-bearing for
+/// D14** — it records an empirical fact (ledger D15: no fixture is known that
+/// tolerates a residual at accept, and the claim that none *can* was retracted).
 #[test]
-fn certificate_holds_the_accepting_rounds_residuals() {
-    // A multi-round fixture: rounds 1 and 2 each carry a NON-EMPTY residual
-    // conflict set (that is what they commit on), round 3 accepts. So a
-    // recorder that captured the wrong round, or captured every round, is
-    // distinguishable here from one that captures the accepting round.
+fn certificate_is_recorded_at_the_accept_point() {
+    // A multi-round fixture: rounds 1 and 2 each commit, round 3 accepts — so a
+    // recorder that fired on the wrong round is distinguishable from one that
+    // fires at the accept.
     let (model, stats, export) = capture_solve_counting(CASCADE);
     assert!(model.is_some(), "fixture must be accepted");
     assert_eq!(stats.rounds, 3, "the witness needs the committing rounds");
     assert_eq!(
         stats.commits_per_round,
         vec![1, 1, 0],
-        "rounds 1-2 must have committable residuals for this to distinguish"
+        "rounds 1-2 must commit for this fixture to distinguish rounds"
     );
-    // On the live Mode-A path acceptance (`committed == 0`) is REACHED ONLY
-    // WITH AN EMPTY CONFLICT SET: every conflict that reaches the commit stage
-    // has a committable `Ref` owner (`representative`'s contract — non-`Ref`
-    // fields decline and non-`Ref` locals assert, both before it runs), so a
-    // non-empty set always commits at least once. The certificate is therefore
-    // empty at a Mode-A accept, and `BoExport::residual_conflicts`' doc says so.
+    let residuals = export.residual_conflicts.as_ref().expect(
+        "D14: the accept point ran but recorded no certificate — `record_residuals` \
+         is missing from the `committed == 0` accept, or `begin_round()` cleared it \
+         afterwards. `None` means NEVER RECORDED, which is not `Some(vec![])`",
+    );
+    // Empirical, not a theorem: no known fixture tolerates a residual at accept,
+    // but the argument that none can was retracted (ledger D13/D15).
     assert!(
-        export.residual_conflicts.is_empty(),
-        "a Mode-A accept committed nothing, so its residual set must be empty; \
-         got {:?} — either `record_residuals` moved off the accept point or \
-         `representative`'s no-committable-owner arm became reachable, and the \
-         E-R4 certificate's meaning has changed",
-        export.residual_conflicts
+        residuals.is_empty(),
+        "this fixture accepted while tolerating residuals {residuals:?} — that is \
+         not wrong, but it is new: it would be the first known witness for D15, \
+         and `BoExport::residual_conflicts`' doc should be updated to say the \
+         shape is reachable"
     );
-    // Structural check, live for the day the arm above does become reachable.
-    for r in &export.residual_conflicts {
-        assert!(
-            r.issuer.is_some() || !r.requirers.is_empty(),
-            "a residual with neither issuer nor requirer is malformed: {r:?}"
-        );
-    }
+    // D18b: a "well-formedness" loop stood here asserting every residual has an
+    // issuer or a requirer. It was DELETED, not repaired, for two reasons.
+    // First it was unreachable either way — it iterated a collection the assert
+    // above had just required to be empty, and on failure that assert aborted
+    // first. Second, and worse, it was WRONG: an owner-less residual
+    // (`issuer: None, requirers: []`) is not malformed, it is precisely the
+    // shape D15 is hunting, so on the one day the loop could have run it would
+    // have reported the wrong diagnosis. A missing check is honest; a check
+    // that would misclassify the thing it fires on is not.
 }
 
 /// RED 17 — the exported candidacy agrees with the accepted model.
@@ -550,9 +559,13 @@ fn certificate_holds_the_accepting_rounds_residuals() {
 fn certificate_candidacy_matches_model() {
     let (model, export) = capture_solve(MALLOC_FREE);
     let model = model.expect("accepted");
+    let residuals = export
+        .residual_conflicts
+        .as_ref()
+        .expect("the accept point must have recorded a certificate");
     // Every residual slot mentioned must exist in the accepted model, so the
     // certificate and the model describe the same slot universe.
-    for r in &export.residual_conflicts {
+    for r in residuals {
         for slot in r.issuer.iter().chain(r.requirers.iter()) {
             assert!(
                 model.contains_key(slot),
@@ -750,13 +763,12 @@ fn capture_solve_l2(
 /// distinguishing power the previous env-based helper lacked.
 #[test]
 fn l2_path_records_loans() {
-    let (model, stats, export) = capture_solve_l2(CALL_ARG);
+    // D18a: an `l2_decline.is_none()` assertion stood here and was counted as
+    // strengthening. It CANNOT FIRE — every `record_l2_decline` call site is
+    // immediately followed by `return (None, stats)`, so it is implied by the
+    // `model.is_some()` below. Removed rather than left as decoration.
+    let (model, _stats, export) = capture_solve_l2(CALL_ARG);
     assert!(model.is_some(), "L2-on fixture must be accepted");
-    assert!(
-        stats.l2_decline.is_none(),
-        "fixture must accept, not take an L2 controlled decline: {:?}",
-        stats.l2_decline
-    );
     assert!(
         !export.loans.is_empty(),
         "D2: the L2 replay path recorded no loans — capture is missing on that path"
@@ -808,20 +820,85 @@ fn multi_round_export_holds_only_the_final_round() {
     }
 }
 
-/// **D11** — `model_accepts` runs the oracle OUTSIDE either CEGAR loop, so
-/// nothing else resets the recorder before it. Without its own
-/// `begin_round()`, a probe issued inside an open capture scope appends to the
-/// fixpoint's loans and reopens D1 by another route.
+/// **D17** — the `pub(crate)` L2 door carries the load-bearing precondition.
 ///
-/// *Mutation-tested (standing rule).* Deleting the `begin_round()` call at the
-/// top of `model_accepts_with_flows` fails this test with the duplicate
-/// message below.
+/// A tracked solver's hard constraints are track-gated, so every solve in this
+/// loop would be vacuously SAT and the accepted model meaningless. The door
+/// refuses one, naming itself in the message.
+///
+/// **The `expected` string is deliberately door-specific.** The first version
+/// matched "tracked KindSolver must not enter", and passed with the door's
+/// assert DELETED — because `KindSolver::model_kinds_relaxing` carries its own
+/// release-active guard whose message shares that prefix, and the loop hits it
+/// moments later. That is worth stating plainly: the hazard was already guarded
+/// release-active, so this door's `debug_assert!` is a fail-earlier tripwire,
+/// not the thing preventing a meaningless model.
+///
+/// *Mutation-tested (standing rule), Rider 0 order.* **Deletion first:**
+/// removing the `debug_assert!` makes this test fail — the panic that does
+/// occur comes from the solver accessor and no longer matches `expected`.
 #[test]
-fn probe_after_fixpoint_does_not_accumulate_loans() {
+#[should_panic(expected = "must not enter the l2 door")]
+fn l2_door_rejects_a_tracked_solver() {
+    ::utils::compilation::run_compiler_on_str(CALL_ARG, |tcx| {
+        let program = collect_program(tcx);
+        let slots = CrateSlots::build(&program);
+        let origin_flows = analyze_program_origin_flow(&program);
+        let crate_ctxt = CrateCtxt::new(&program);
+        // The one thing the door must refuse.
+        let solver = KindSolver::new_tracked(&slots);
+        let (_stats, selectors) = emit_crate_ownership_constraints(
+            &crate_ctxt,
+            &slots,
+            &compute_origins(&program),
+            &solver,
+        )
+        .expect("emission");
+        let _ = verify_l2_to_fixpoint_counting(
+            &program,
+            &slots,
+            &origin_flows,
+            &solver,
+            &selectors,
+            true,
+        );
+        None::<()>
+    })
+    .unwrap_or_else(|e| e.raise());
+}
+
+/// **D16** — a probe must leave the export byte-identical.
+///
+/// The export represents the ACCEPTED CEGAR run. `model_accepts` is a probe on
+/// a model the loop may never have accepted, so capture is SUSPENDED for its
+/// duration: the probe neither appends to the recording nor resets it.
+///
+/// This supersedes the cycle-3 witness, which asserted only that a probe adds
+/// no DUPLICATE loans. That was the right assertion for the reset contract and
+/// the wrong one for this contract: a reset passes it too, while silently
+/// replacing the accepted run's loans with a counterfactual's.
+///
+/// **Single-run by construction.** An earlier draft compared two separate
+/// compiler runs and failed — not because the probe changed anything, but
+/// because loan NUMBERING differs between runs (ledger D19: pre-existing,
+/// production-side, in `BorrowSet` construction). Snapshotting before and after
+/// the probe inside ONE run removes that variable and keeps the comparison
+/// order-sensitive, which sorting or set-comparison would have given up.
+///
+/// The probed model is a COUNTERFACTUAL (every slot forced `Ref`), mirroring
+/// the necessity audit's leave-one-out probes. Probing the accepted model would
+/// re-record loans identical to the fixpoint's and hide the difference.
+///
+/// *Mutation-tested (standing rule), Rider 0 order.* **Deletion first:**
+/// removing `with_capture_suspended` from `model_accepts_with_flows` fails this
+/// test. Restoring the cycle-3 `begin_round()` in its place fails it too —
+/// which is the erratum this defect records.
+#[test]
+fn probe_after_accept_leaves_the_export_unchanged() {
     ::utils::compilation::run_compiler_on_str(CASCADE, |tcx| {
         let program = collect_program(tcx);
         let slots = CrateSlots::build(&program);
-        let (_model, export) = with_bo_export(|| {
+        with_bo_export(|| {
             let crate_ctxt = CrateCtxt::new(&program);
             let solver = KindSolver::new(&slots);
             let (_stats, selectors) = emit_crate_ownership_constraints(
@@ -837,27 +914,37 @@ fn probe_after_fixpoint_does_not_accumulate_loans() {
             }
             let model = verify_to_fixpoint(&program, &slots, &solver, &selectors, true)
                 .expect("cascade fixture accepts");
-            // The audit's probe, inside the SAME capture scope as the fixpoint.
+
+            let before = snapshot().expect("capture is active inside the scope");
             assert!(
-                model_accepts(&program, &slots, &model, true),
-                "the accepted model must re-validate"
+                !before.loans.is_empty(),
+                "the fixpoint recorded no loans — the comparison would be inert"
             );
-            Some(model)
+            assert!(
+                before.residual_conflicts.is_some(),
+                "the fixpoint recorded no certificate — the comparison would be inert"
+            );
+
+            let counterfactual: FxHashMap<SlotRef, super::SlotKindAlias> =
+                model.keys().map(|k| (*k, super::SlotKindAlias::Ref)).collect();
+            let _ = model_accepts(&program, &slots, &counterfactual, true);
+
+            let after = snapshot().expect("capture must survive the probe");
+            assert_eq!(
+                before.loans, after.loans,
+                "D16: a probe changed the exported loans. The export must describe \
+                 the ACCEPTED run; a probe is not part of it."
+            );
+            assert_eq!(
+                before.residual_conflicts, after.residual_conflicts,
+                "D16: a probe changed the exported certificate"
+            );
+            assert_eq!(
+                before.version_sites.len(),
+                after.version_sites.len(),
+                "D16: a probe changed the exported version sites"
+            );
         });
-        assert!(
-            !export.loans.is_empty(),
-            "the probe recorded no loans — the witness would be inert"
-        );
-        let mut seen = rustc_hash::FxHashSet::default();
-        for loan in &export.loans {
-            assert!(
-                seen.insert((loan.fn_did, loan.loan)),
-                "D11: loan ({:?}, {}) recorded twice — the probe appended to the \
-                 fixpoint's loans instead of starting a fresh round",
-                loan.fn_did,
-                loan.loan
-            );
-        }
     })
     .unwrap_or_else(|e| e.raise())
 }
