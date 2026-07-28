@@ -18,6 +18,7 @@ use crate::{
         coherence::add_coherence,
         crate_slots::CrateSlots,
         emit_crate_ownership_constraints,
+        l2,
         origin_flow::analyze_program_origin_flow,
         origins::compute_origins,
         solver::{KindSolver, SlotRef},
@@ -529,6 +530,21 @@ fn certificate_is_recorded_at_the_accept_point() {
         vec![1, 1, 0],
         "rounds 1-2 must commit for this fixture to distinguish rounds"
     );
+    // F3: `verify_to_fixpoint*` dispatches on `CRAT_BO_L2_GUARDED_COMMITS`, and
+    // the L2 accept never calls `record_residuals` — a documented gap (D2
+    // adjacent), so `None` there is CORRECT, not a defect. The first version of
+    // this test asserted `is_some()` unconditionally and therefore FAILED under
+    // the plan-of-record profile while blaming the accept point. Assert the
+    // behaviour each path actually has: this turns an env-sensitivity that used
+    // to be invisible under `Vec` into a tested property of both paths.
+    if l2::enabled_from_env() {
+        assert!(
+            export.residual_conflicts.is_none(),
+            "the L2 accept records no certificate, so it must be None — if this \
+             fires, L2 grew a `record_residuals` call and the gap is closed"
+        );
+        return;
+    }
     let residuals = export.residual_conflicts.as_ref().expect(
         "D14: the accept point ran but recorded no certificate — `record_residuals` \
          is missing from the `committed == 0` accept, or `begin_round()` cleared it \
@@ -559,6 +575,11 @@ fn certificate_is_recorded_at_the_accept_point() {
 fn certificate_candidacy_matches_model() {
     let (model, export) = capture_solve(MALLOC_FREE);
     let model = model.expect("accepted");
+    // F3, as above: `None` is the correct L2 behaviour.
+    if l2::enabled_from_env() {
+        assert!(export.residual_conflicts.is_none());
+        return;
+    }
     let residuals = export
         .residual_conflicts
         .as_ref()
@@ -838,6 +859,14 @@ fn multi_round_export_holds_only_the_final_round() {
 /// removing the `debug_assert!` makes this test fail — the panic that does
 /// occur comes from the solver accessor and no longer matches `expected`.
 #[test]
+// F2: `debug_assert!` is compiled out in release, where the panic instead comes
+// from `model_kinds_relaxing`'s own release-active guard with a DIFFERENT
+// message — so this `expected` would not match and the test would fail on
+// `cargo test --release`. Gate it on the profile that has the assert. The
+// hazard itself remains guarded in release by that downstream assert, which is
+// the finding that made this door's tripwire fail-earlier rather than
+// load-bearing.
+#[cfg(debug_assertions)]
 #[should_panic(expected = "must not enter the l2 door")]
 fn l2_door_rejects_a_tracked_solver() {
     ::utils::compilation::run_compiler_on_str(CALL_ARG, |tcx| {
@@ -921,8 +950,9 @@ fn probe_after_accept_leaves_the_export_unchanged() {
                 "the fixpoint recorded no loans — the comparison would be inert"
             );
             assert!(
-                before.residual_conflicts.is_some(),
-                "the fixpoint recorded no certificate — the comparison would be inert"
+                before.residual_conflicts.is_some() || l2::enabled_from_env(),
+                "the fixpoint recorded no certificate — the comparison would be \
+                 inert (F3: `None` is correct only on the L2 path)"
             );
 
             let counterfactual: FxHashMap<SlotRef, super::SlotKindAlias> =
