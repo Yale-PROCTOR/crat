@@ -136,17 +136,25 @@ fn record_loan_identities(
     for (loan, data) in inference.borrow_set.loans.iter_enumerated() {
         let mutable = provenance_set.local_data[data.borrowed.local]
             .map(|p| provenance_set.provenance_data[p].is_mutable());
+        // D5 payloads restored: both are key components now (§1.1 correction 2).
         let borrower = match data.assigned {
-            Borrower::Assign(_) => export::BorrowerKind::Assign,
-            Borrower::CallArg(_, arg_index) => export::BorrowerKind::CallArg { arg_index },
+            Borrower::Assign(owner) => export::BorrowerKind::Assign {
+                owner: export::OwnerKey::from_owner(owner),
+            },
+            Borrower::CallArg(callee, arg_index) => export::BorrowerKind::CallArg {
+                callee: callee.local_def_index.as_u32(),
+                arg_index,
+            },
         };
         export::record_loan(export::LoanIdentity {
-            fn_did,
-            loan: loan.index(),
-            location: export::location_key(data.location()),
-            borrowed: export::PlaceKey::from_place(data.borrowed),
+            key: export::LoanKey {
+                fn_did,
+                place: export::PlaceKey::from_place(data.borrowed),
+                location: export::location_key(data.location()),
+                borrower,
+            },
+            run_local_handle: loan.index(),
             kind: export::LoanKind::from_provenance_mutability(mutable),
-            borrower,
             invalid: invalid_loans.contains(loan),
         });
     }

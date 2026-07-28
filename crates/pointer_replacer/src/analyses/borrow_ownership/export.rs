@@ -59,37 +59,98 @@ use super::{l2::MirLocationKey, solver::SlotRef, ssa::constraint::Var};
 // §1.2 Lifetime-free keys
 // ---------------------------------------------------------------------------
 
-/// Lifetime-free projection of a MIR [`Place`].
+/// One MIR projection element, lifetime-free and **total**.
+///
+/// D19/§1.2: the previous `PlaceKey` kept only `Deref` (as a *count*) and
+/// `Field`, discarding `Index`, `ConstantIndex`, `Subslice`, `Downcast` and
+/// `OpaqueCast`. That made `arr[i]` and `arr[j]` the SAME key, and — because
+/// derefs were counted rather than sequenced — made `(*p).f` and `*(p.f)`
+/// indistinguishable. A key built on that is not a key, so the encoding is
+/// total and ordered now.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub(crate) enum ProjKey {
+    Deref,
+    Field(u32),
+    /// The MIR `Local` holding the index. Body-scoped, which is fine because
+    /// `LoanKey` is scoped by `fn_did`; do NOT "normalize" it away.
+    Index(u32),
+    ConstantIndex {
+        offset: u64,
+        min_length: u64,
+        from_end: bool,
+    },
+    Subslice {
+        from: u64,
+        to: u64,
+        from_end: bool,
+    },
+    /// `VariantIdx`. The symbol name in the real `ProjectionElem` is not
+    /// identity and is dropped deliberately.
+    Downcast(u32),
+    OpaqueCast,
+    Subtype,
+    UnwrapUnsafeBinder,
+}
+
+/// Lifetime-free, **order-preserving** projection of a MIR [`Place`].
 ///
 /// `Place<'tcx>` cannot escape the analysis, so it is projected here — the same
 /// pattern L2 established with [`MirLocationKey`].
-///
-/// M1 interprets only `local` and `derefs`; `fields` is recorded for M3 and is
-/// not read before then.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub(crate) struct PlaceKey {
     pub local: Local,
-    pub derefs: u8,
-    pub fields: Vec<u32>,
+    pub proj: Vec<ProjKey>,
 }
 
 impl PlaceKey {
     pub(crate) fn from_place(place: Place<'_>) -> Self {
         use rustc_middle::mir::ProjectionElem;
-        let mut derefs = 0u8;
-        let mut fields = Vec::new();
-        for elem in place.projection {
-            match elem {
-                ProjectionElem::Deref => derefs = derefs.saturating_add(1),
-                ProjectionElem::Field(f, _) => fields.push(f.as_u32()),
-                _ => {}
-            }
-        }
+        let proj = place
+            .projection
+            .iter()
+            .map(|elem| match elem {
+                ProjectionElem::Deref => ProjKey::Deref,
+                ProjectionElem::Field(f, _) => ProjKey::Field(f.as_u32()),
+                ProjectionElem::Index(local) => ProjKey::Index(local.as_u32()),
+                ProjectionElem::ConstantIndex {
+                    offset,
+                    min_length,
+                    from_end,
+                } => ProjKey::ConstantIndex {
+                    offset,
+                    min_length,
+                    from_end,
+                },
+                ProjectionElem::Subslice { from, to, from_end } => {
+                    ProjKey::Subslice { from, to, from_end }
+                }
+                ProjectionElem::Downcast(_, variant) => ProjKey::Downcast(variant.as_u32()),
+                ProjectionElem::OpaqueCast(_) => ProjKey::OpaqueCast,
+                ProjectionElem::Subtype(_) => ProjKey::Subtype,
+                ProjectionElem::UnwrapUnsafeBinder(_) => ProjKey::UnwrapUnsafeBinder,
+            })
+            .collect();
         PlaceKey {
             local: place.local,
-            derefs,
-            fields,
+            proj,
         }
+    }
+
+    /// Derived view, kept so E-R2/E-R4 consumers written against the old shape
+    /// do not change. The lossy form is no longer what is STORED.
+    pub(crate) fn derefs(&self) -> usize {
+        self.proj.iter().filter(|p| matches!(p, ProjKey::Deref)).count()
+    }
+
+    /// Derived view; see [`PlaceKey::derefs`].
+    pub(crate) fn fields(&self) -> Vec<u32> {
+        self.proj
+            .iter()
+            .filter_map(|p| match p {
+                ProjKey::Field(f) => Some(*f),
+                _ => None,
+            })
+            .collect()
     }
 }
 
@@ -137,23 +198,101 @@ impl LoanKind {
     }
 }
 
-/// Which loan this is. Orthogonal to [`LoanKind`]: it feeds the access-dependent
-/// self-loan skip, not the kind derivation (R-Q1a §0.5).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum BorrowerKind {
-    Assign,
-    CallArg { arg_index: usize },
+/// Owner of an `Assign` borrow, mirrored lifetime-free with a total order.
+///
+/// D5 payload, restored: the spec always required it, M0 dropped it. As a
+/// display field that was a precision loss; as a **key** component it is a
+/// correctness question, which is why D5 became blocking for §1.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub(crate) enum OwnerKey {
+    Local(u32),
+    Field { struct_did: u32, field_index: usize },
 }
 
-/// Ruling Q11: borrowed place, kind, program point — all three present.
+impl OwnerKey {
+    pub(crate) fn from_owner(owner: crate::analyses::borrow::ProvenanceOwner) -> Self {
+        use crate::analyses::borrow::ProvenanceOwner;
+        match owner {
+            ProvenanceOwner::Local(l) => OwnerKey::Local(l.as_u32()),
+            ProvenanceOwner::Field(f) => OwnerKey::Field {
+                struct_did: f.struct_did.local_def_index.as_u32(),
+                field_index: f.field_index,
+            },
+        }
+    }
+}
+
+/// Which loan this is. Orthogonal to [`LoanKind`]: it feeds the access-dependent
+/// self-loan skip, not the kind derivation (R-Q1a §0.5).
+///
+/// Both payloads are the D5 restoration. `arg_index` alone happened to separate
+/// two `CallArg` loans at one terminator, but only because a terminator has one
+/// callee — an accident of the current shape, not a property of the key.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub(crate) enum BorrowerKind {
+    Assign { owner: OwnerKey },
+    CallArg { callee: u32, arg_index: usize },
+}
+
+/// The **stable content identity** of one loan (§1.3).
+///
+/// D19: `BorrowSet` loan *numbering* permutes between runs and between CEGAR
+/// rounds, because `utils/dsa/union_find.rs` uses a `RandomState`-hashed
+/// `HashSet` and `borrow/mod.rs` pushes sibling loans in `group()` iteration
+/// order. An index into that numbering is therefore not an identity, which is
+/// exactly what E-R4 was created to provide (ruling Q11).
+///
+/// **`kind` is deliberately NOT a component.** It is a pure function of
+/// `fn_did` and the borrowed base local (R-Q1a §0.4), so it adds zero
+/// discriminating power — and a *derived* component in an identity key is a
+/// drift hazard: if the derivation ever moved, one loan would silently become
+/// two identities. Keys are built from inputs, not from analysis outputs.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct LoanKey {
+    pub fn_did: LocalDefId,
+    pub place: PlaceKey,
+    pub location: MirLocationKey,
+    pub borrower: BorrowerKind,
+}
+
+impl LoanKey {
+    /// Total order over primitives. `LocalDefId` is projected through
+    /// `local_def_index.as_u32()`, the idiom `l2::StableLoanKey` already uses.
+    fn ord_key(&self) -> (u32, &Local, &Vec<ProjKey>, MirLocationKey, BorrowerKind) {
+        (
+            self.fn_did.local_def_index.as_u32(),
+            &self.place.local,
+            &self.place.proj,
+            self.location,
+            self.borrower,
+        )
+    }
+}
+
+impl Ord for LoanKey {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.ord_key().cmp(&other.ord_key())
+    }
+}
+
+impl PartialOrd for LoanKey {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+/// Ruling Q11: borrowed place, kind, program point — all three present, now
+/// carried by a content key rather than by a run-local index.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct LoanIdentity {
-    pub fn_did: LocalDefId,
-    pub loan: usize,
-    pub location: MirLocationKey,
-    pub borrowed: PlaceKey,
+    pub key: LoanKey,
+    /// Run-local handle. **NOT an identity** (D19): `BorrowSet` numbering
+    /// permutes between runs AND between CEGAR rounds. Valid only for
+    /// correlating against other facts from the SAME inference — never
+    /// serialize it, never compare it across runs, never use it as a map key.
+    pub run_local_handle: usize,
+    /// Attribute, not key — see [`LoanKey`].
     pub kind: LoanKind,
-    pub borrower: BorrowerKind,
     /// Whether this loan was in the final round's invalid set. **Surviving
     /// loans are `false`** — those are the ones a re-route must match against.
     pub invalid: bool,
@@ -217,7 +356,11 @@ pub(crate) struct CallSite {
 // ---------------------------------------------------------------------------
 
 /// Everything the export records during one analysis run.
-#[derive(Clone, Debug, Default)]
+///
+/// `PartialEq` is derived so a witness can compare the WHOLE record rather than
+/// a hand-picked subset of fields (F5: the previous D16 witness compared 3 of 6
+/// and called it "byte-identical").
+#[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) struct BoExport {
     /// E-R2 consume sites, in emission order.
     pub version_sites: Vec<VersionSite>,
