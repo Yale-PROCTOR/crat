@@ -3,6 +3,34 @@
 Five adversarial review lenses ran against `f9ee8fee` (read-only). 38 raw
 findings; nine re-verified and accepted. Four were HIGH and blocked merge.
 
+## SUPPORTED SUITE MATRIX — read before filing a phantom finding
+
+**The supported matrix is `CRAT_BO_MUT_FACTS` on/off** (plus unset = default).
+All three are green: **841 passed, 0 failed, 7 ignored.**
+
+**A suite-wide `CRAT_BO_L2_GUARDED_COMMITS=1` run is NOT a supported
+configuration.** Under it, a set of `bo_c1` tests fails **by design**, not as
+defects: Mode-A-only tests (`nb5l2_capture_is_mode_a_only`, `nb5l_*`) and the
+feature-off golden (`l2_red_feature_off_matches_base_ae6f334`) each exclude the
+global env they are being handed. Recorded here so they are never registered as
+findings by a future reviewer or by a broad-sweep run.
+
+*What the L2 profile IS good for:* targeted runs of the code under test. The
+export suite is green under it — `cargo test … -- export::` → **30 passed** with
+`CRAT_BO_L2_GUARDED_COMMITS=1` — and that targeted run is what surfaced the real
+witness gap below.
+
+*The gap it surfaced (fixed):* `probes_outside_the_armed_region_record_nothing`
+asserted `residual_conflicts.is_some()` unconditionally, which is false under
+L2 because the L2 accept never calls `record_residuals` (the documented
+D2-adjacent gap). Now branches on `l2::enabled_from_env()` and asserts
+`is_none()` explicitly on that path — the F3 pattern its two sibling
+certificate tests already carried, which I had failed to apply to this witness
+when I wrote it. The env-sensitivity is a tested property of both paths rather
+than a failure blaming the accepted run.
+
+---
+
 ## FINAL CYCLE + CORPUS GATES (2026-07-28)
 
 **Both corpus-scale gates PASS, and the guardrail FIRED on a new HIGH.**

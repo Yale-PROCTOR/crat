@@ -1239,10 +1239,21 @@ fn probes_outside_the_armed_region_record_nothing() {
         barrage();
         oracle_probe(&model);
         assert!(!narrow.loans.is_empty(), "accepted run recorded nothing — inert");
-        assert!(
-            narrow.residual_conflicts.is_some(),
-            "accepted run recorded no certificate — inert"
-        );
+        // F3 pattern: the L2 accept never calls `record_residuals` (the
+        // documented D2-adjacent gap), so `None` there is CORRECT. Asserting
+        // it explicitly turns that env-sensitivity into a tested property of
+        // both paths instead of a failure that blames the accepted run.
+        if l2::enabled_from_env() {
+            assert!(
+                narrow.residual_conflicts.is_none(),
+                "the L2 accept records no certificate, so it must be None"
+            );
+        } else {
+            assert!(
+                narrow.residual_conflicts.is_some(),
+                "accepted run recorded no certificate — inert"
+            );
+        }
 
         // Reference: the accepted run with no barrage at all.
         let arm2 = arm_scope();
