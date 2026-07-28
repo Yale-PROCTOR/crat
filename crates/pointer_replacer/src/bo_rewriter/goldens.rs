@@ -22,11 +22,22 @@
 //! "no emitter yet" and "pretty-printer spaces differently" — and S1 would then
 //! meet the second disguised as a contract mismatch.
 //!
-//! # Why these are RED at S0
+//! # What RED means here, and how it shifted
 //!
-//! [`super::rewrite_m1`] returns [`super::RewriteOutcome::Degraded`], so every
-//! test below fails on the *outcome assertion* — a stated missing emitter —
-//! rather than on a diff or a panic.
+//! At S0 every golden failed on the *outcome* assertion, because `rewrite_m1`
+//! degraded unconditionally.
+//!
+//! From S1 that is no longer uniform, and the distinction is worth stating so a
+//! red test is read correctly:
+//!
+//! - **g02/g06** degrade, now with **attributed** per-subject reasons (S2a).
+//! - **g04/g05/g07/g08** have no pointer *parameters*, so S1–S2a produce no
+//!   subjects for them and `rewrite_m1` returns the input unchanged. They fail
+//!   on the **diff**, not on a missing-emitter message — their shapes (Box,
+//!   drops, stores) arrive in S3. Their RED therefore signals "shape not yet
+//!   implemented" only by virtue of the diff, which is weaker than the S0
+//!   signal and is recorded rather than papered over.
+//! - **g09** passes trivially — see its companion assertion below.
 
 use std::{
     io::Write,
@@ -108,12 +119,13 @@ macro_rules! golden_test {
                 .find(|g| g.name == $golden)
                 .expect("golden is registered in GOLDENS");
             let emitted = match rewrite_m1(golden.input) {
-                RewriteOutcome::Emitted(src) => src,
-                RewriteOutcome::Degraded { reason } => panic!(
-                    "{}: no emission — degraded with reason {reason:?}. This is the \
-                     expected S0 state; it turns GREEN when the emitter handles \
-                     this shape.",
-                    golden.name
+                RewriteOutcome::Emitted { source, .. } => source,
+                RewriteOutcome::Degraded {
+                    reason,
+                    degradations,
+                } => panic!(
+                    "{}: no emission — {reason}. Attributed degradations: {:#?}",
+                    golden.name, degradations
                 ),
             };
             let emitted = canonicalize("emitted", &emitted);
@@ -171,5 +183,150 @@ fn every_golden_pair_is_present() {
             "{}: empty .expected.rs",
             g.name
         );
+    }
+}
+
+/// **G09 companion assertion (approved remedy).**
+///
+/// `g09_pdrop_suppression`'s input and expected are byte-identical, so the text
+/// comparison passes for any rewriter that emits its input — including a
+/// completely broken one. The expected text is NOT edited; instead this asserts
+/// the outcome is unchanged *for a stated reason* rather than by accident.
+///
+/// At S2a the reason available is that the fixture yields **no emitted
+/// subject**: `emitted_count == 0`. When S3 lands P-drop, this tightens to
+/// asserting the table recorded the suppression itself.
+///
+/// *Mutation-tested, Rider 0 order.* **Deletion first:** make `rewrite_m1`
+/// return a non-zero `emitted_count` for this fixture (e.g. by removing the
+/// A1 raw-pointer-operation check so a subject is emitted) and this fails,
+/// where the text comparison alone would not.
+#[test]
+fn g09_is_unchanged_for_a_stated_reason_not_by_accident() {
+    let golden = GOLDENS
+        .iter()
+        .find(|g| g.name == "g09_pdrop_suppression")
+        .expect("g09 is registered");
+    assert_eq!(
+        golden.input, golden.expected,
+        "this companion exists BECAUSE the pair is byte-identical; if that \
+         changed, the ordinary golden test is now doing real work and this \
+         assertion should be revisited"
+    );
+    match rewrite_m1(golden.input) {
+        RewriteOutcome::Emitted {
+            source,
+            emitted_count,
+            ..
+        } => {
+            assert_eq!(source, golden.expected, "g09 emitted a changed crate");
+            assert_eq!(
+                emitted_count, 0,
+                "g09 emitted {emitted_count} subject(s); its expected text is \
+                 identical to its input, so any emission means the text \
+                 comparison is passing for the wrong reason"
+            );
+        }
+        RewriteOutcome::Degraded {
+            reason,
+            degradations,
+        } => panic!("g09 degraded: {reason}; {degradations:#?}"),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// S2a exit gate: attribution at DECISION time
+// ---------------------------------------------------------------------------
+
+/// Find the degradations `rewrite_m1` attributed for one golden's input.
+fn degradations_for(name: &str) -> Vec<super::decision::Degradation> {
+    let golden = GOLDENS
+        .iter()
+        .find(|g| g.name == name)
+        .expect("golden is registered");
+    match rewrite_m1(golden.input) {
+        RewriteOutcome::Emitted { degradations, .. } => degradations,
+        RewriteOutcome::Degraded { degradations, .. } => degradations,
+    }
+}
+
+/// **S2a exit gate (g02 class).** A parameter used in a raw-pointer-only
+/// operation is degraded IN THE DECISION PHASE, with its own site and reason.
+///
+/// Before S2a this parameter was decided `Ref`, emitted, and killed by the
+/// whole-crate type-check gate as the anonymous string "emitted crate failed
+/// the type-check gate" — no site, no subject. That made the envelope counters
+/// wrong by construction: the subject was recorded as a success.
+///
+/// *Mutation-tested, Rider 0 order.* **Deletion first:** remove the
+/// `raw_only_uses` check from `decide_one` and this fails — the subject is
+/// decided `Ref` again and no degradation is attributed.
+#[test]
+fn g02_class_is_attributed_at_decision_time() {
+    use super::decision::DegradeReason;
+    let records = degradations_for("g02_opt_ref");
+    let hit = records
+        .iter()
+        .find(|d| matches!(d.reason, DegradeReason::RawPointerOperation { .. }))
+        .unwrap_or_else(|| {
+            panic!("no raw-pointer-operation degradation was attributed; got {records:#?}")
+        });
+    assert!(
+        hit.subject.contains("g02_maybe"),
+        "degradation names the wrong subject: {hit:?}"
+    );
+    assert!(
+        !hit.site.is_empty() && hit.site.contains(':'),
+        "degradation carries no usable site: {hit:?}"
+    );
+    let DegradeReason::RawPointerOperation { op } = &hit.reason else {
+        unreachable!()
+    };
+    assert_eq!(op, "is_null", "the attributed operation should be the real one");
+}
+
+/// **S2a exit gate (g06 class).** A function with an in-crate caller is degraded
+/// in the decision phase, naming the call site — not discovered later as a
+/// crate-wide type error.
+///
+/// This reason is explicitly **temporary**: S3's call-site adaptation retires
+/// `CallSiteNotAdapted`, and the typed variant is what makes that retirement
+/// visible in the counters rather than silent.
+///
+/// *Mutation-tested, Rider 0 order.* **Deletion first:** remove the `callers`
+/// check from `decide_one` and this fails.
+#[test]
+fn g06_class_is_attributed_at_decision_time() {
+    use super::decision::DegradeReason;
+    let records = degradations_for("g06_move_reroute");
+    let hit = records
+        .iter()
+        .find(|d| d.reason == DegradeReason::CallSiteNotAdapted)
+        .unwrap_or_else(|| {
+            panic!("no call-site-not-adapted degradation was attributed; got {records:#?}")
+        });
+    assert!(
+        !hit.site.is_empty() && hit.site.contains(':'),
+        "degradation must name the CALL SITE: {hit:?}"
+    );
+}
+
+/// **S2a exit gate (negative).** No golden may reach the whole-crate anonymous
+/// gate failure any more.
+///
+/// This is the property the slice exists to establish: unemittable subjects are
+/// refused where the decision is made, so `verify` never has to report a
+/// failure it cannot attribute.
+#[test]
+fn no_golden_dies_at_the_anonymous_whole_crate_gate() {
+    for golden in GOLDENS {
+        if let RewriteOutcome::Degraded { reason, .. } = rewrite_m1(golden.input) {
+            assert!(
+                !reason.contains("failed the type-check gate"),
+                "{}: still dying at the anonymous whole-crate gate ({reason}) — \
+                 S2a requires the cause to be attributed at decision time",
+                golden.name
+            );
+        }
     }
 }

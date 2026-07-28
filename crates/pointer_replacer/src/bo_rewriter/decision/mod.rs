@@ -21,10 +21,14 @@
 
 use rustc_hash::FxHashMap;
 use rustc_hir::def_id::LocalDefId;
-use rustc_middle::mir::Local;
+use rustc_middle::{mir::Local, ty::TyCtxt};
 use rustc_span::Span;
 
 use crate::analyses::borrow_ownership::{SlotKind, crate_slots::CrateSlots, solver::SlotRef};
+
+pub(crate) mod emitability;
+
+use emitability::EmitabilityFacts;
 
 /// One thing M1 must decide about. **Depth-0 pointer parameters only at S1.**
 ///
@@ -36,6 +40,11 @@ pub(crate) struct Subject {
     pub fn_did: LocalDefId,
     /// MIR local of the parameter: params are `_1 ..= arg_count`.
     pub local: Local,
+    /// HIR binding of the same parameter, used to attribute uses to it without
+    /// relying on a name that could be shadowed.
+    pub hir_id: rustc_hir::HirId,
+    /// Human-readable identity for attribution: `fn_name::param_name`.
+    pub label: String,
     /// Source span of the parameter's declared **type**.
     pub ty_span: Span,
     /// Source span of the pointee type, kept so the plan can preserve the
@@ -44,17 +53,61 @@ pub(crate) struct Subject {
     pub mutable: bool,
 }
 
+/// Why a subject was not emitted.
+///
+/// A typed reason rather than a string: the counters S2b aggregates need to
+/// group by cause, and `CallSiteNotAdapted` in particular is **temporary** —
+/// S3's call-site adaptation retires it, and a free-text reason would make that
+/// transition invisible in the data.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum DegradeReason {
+    /// BO decided the slot is a raw pointer; leaving the source alone is the
+    /// decision, not a failure.
+    KindRaw,
+    /// BO decided owning; Box forms and the drop policy arrive in S3.
+    KindOwning,
+    /// The parameter is used in an operation that exists only on raw pointers.
+    RawPointerOperation { op: String },
+    /// The function has an in-crate caller and call sites are not yet adapted.
+    /// **Retired by S3.**
+    CallSiteNotAdapted,
+    /// Structural: the subject has no depth-0 slot, or none in the model.
+    NoSlot,
+}
+
+impl DegradeReason {
+    /// Stable key for counter aggregation (S2b).
+    pub(crate) fn key(&self) -> &'static str {
+        match self {
+            DegradeReason::KindRaw => "kind-raw",
+            DegradeReason::KindOwning => "kind-owning",
+            DegradeReason::RawPointerOperation { .. } => "raw-pointer-operation",
+            DegradeReason::CallSiteNotAdapted => "call-site-not-adapted",
+            DegradeReason::NoSlot => "no-slot",
+        }
+    }
+}
+
+/// A degradation, **attributed**: subject, site and reason.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Degradation {
+    pub subject: String,
+    pub site: String,
+    pub reason: DegradeReason,
+}
+
 /// What M1 decided for one subject.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Decision {
     /// Emit a reference form: `&T` or `&mut T`.
     Ref { mutable: bool },
-    /// Not emitted, with the reason recorded. **A first-class outcome.**
+    /// Not emitted, with the reason ATTRIBUTED. **A first-class outcome.**
     ///
     /// §1.6 admits only conflict-non-increasing rewrites; everything outside
-    /// that envelope degrades *here*, with a reason — never silently, and never
-    /// by an emitter discovering downstream that it cannot proceed.
-    Degraded { reason: &'static str },
+    /// that envelope degrades *here*, with a subject and a site — never
+    /// silently, and never by an emitter discovering downstream that it cannot
+    /// proceed and reporting it as a property of the whole crate.
+    Degraded(Degradation),
 }
 
 /// The finished, immutable table handed to [`super::plan`].
@@ -64,71 +117,132 @@ pub(crate) struct DecisionTable {
 }
 
 impl DecisionTable {
-    /// Structural gate input: every subject has exactly one decision.
-    pub(crate) fn is_total_over(&self, subjects: usize) -> bool {
-        self.entries.len() == subjects
+    /// Structural gate: the table covers exactly the subjects it was given,
+    /// once each.
+    ///
+    /// The previous form compared `entries.len()` against a count captured from
+    /// the same `Vec` one line earlier, over a total `map` with no filter — it
+    /// could not fail in any execution. This checks the two properties that
+    /// *can*: **no duplicate subject** (a collector emitting one parameter
+    /// twice would otherwise plan two edits for one span, which `apply` would
+    /// only catch as an overlap rollback), and **every input subject present**.
+    pub(crate) fn coverage_over(&self, subjects: &[Subject]) -> Result<(), String> {
+        let mut seen = rustc_hash::FxHashSet::default();
+        for (subject, _) in &self.entries {
+            let key = (subject.fn_did.local_def_index.as_u32(), subject.local);
+            if !seen.insert(key) {
+                return Err(format!("duplicate decision for subject {}", subject.label));
+            }
+        }
+        for subject in subjects {
+            if !seen.contains(&(subject.fn_did.local_def_index.as_u32(), subject.local)) {
+                return Err(format!("no decision for subject {}", subject.label));
+            }
+        }
+        if self.entries.len() != subjects.len() {
+            return Err(format!(
+                "table has {} entries for {} subjects",
+                self.entries.len(),
+                subjects.len()
+            ));
+        }
+        Ok(())
     }
 
-    /// S2 aggregates these into the envelope-demotion counters.
-    pub(crate) fn degraded(&self) -> impl Iterator<Item = (&Subject, &'static str)> {
-        self.entries.iter().filter_map(|(s, d)| match d {
-            Decision::Degraded { reason } => Some((s, *reason)),
+    /// The envelope-demotion records. S2b aggregates these into the counters.
+    pub(crate) fn degradations(&self) -> impl Iterator<Item = &Degradation> {
+        self.entries.iter().filter_map(|(_, d)| match d {
+            Decision::Degraded(record) => Some(record),
             Decision::Ref { .. } => None,
         })
     }
+
+    /// Subjects the table decided to emit.
+    pub(crate) fn emitted_count(&self) -> usize {
+        self.entries
+            .iter()
+            .filter(|(_, d)| matches!(d, Decision::Ref { .. }))
+            .count()
+    }
 }
 
-/// Build the decision table from BO's accepted model.
+/// Build the decision table from BO's accepted model **and the A1 facts**.
 ///
-/// The accepted model is the **only** BO input S1 consumes. `BoExport`
-/// (E-R2..E-R4) is opened by the driver but deliberately not read here: G01
-/// needs no move point, no loan identity and no certificate, and consuming
-/// facts the arm does not use would make this phase's dependencies a lie.
+/// The accepted model is the only BO input S1/S2a consume. `BoExport`
+/// (E-R2..E-R4) is opened by the driver but deliberately not read here: the
+/// reference arm needs no move point, no loan identity and no certificate, and
+/// consuming facts the arm does not use would make this phase's dependencies a
+/// lie.
 pub(crate) fn decide(
-    subjects: Vec<Subject>,
+    tcx: TyCtxt<'_>,
+    subjects: &[Subject],
     model: &FxHashMap<SlotRef, SlotKind>,
     slots: &CrateSlots,
+    facts: &EmitabilityFacts,
 ) -> DecisionTable {
     let entries = subjects
-        .into_iter()
+        .iter()
         .map(|subject| {
-            let decision = decide_one(&subject, model, slots);
-            (subject, decision)
+            let decision = decide_one(tcx, subject, model, slots, facts);
+            (subject.clone(), decision)
         })
         .collect();
     DecisionTable { entries }
 }
 
+fn degrade(subject: &Subject, site: String, reason: DegradeReason) -> Decision {
+    Decision::Degraded(Degradation {
+        subject: subject.label.clone(),
+        site,
+        reason,
+    })
+}
+
 fn decide_one(
+    tcx: TyCtxt<'_>,
     subject: &Subject,
     model: &FxHashMap<SlotRef, SlotKind>,
     slots: &CrateSlots,
+    facts: &EmitabilityFacts,
 ) -> Decision {
+    let decl_site = EmitabilityFacts::site(tcx, subject.ty_span);
+
     let Some(universe) = slots.fn_local_slots.get(&subject.fn_did) else {
-        return Decision::Degraded {
-            reason: "function has no slot universe",
-        };
+        return degrade(subject, decl_site, DegradeReason::NoSlot);
     };
     let Some(slot_id) = universe.slot_for_local_depth(subject.local, 0) else {
-        return Decision::Degraded {
-            reason: "parameter has no depth-0 slot",
-        };
+        return degrade(subject, decl_site, DegradeReason::NoSlot);
     };
+
+    // BO's kind first: it is the authority on WHETHER a reference is sound.
     match model.get(&SlotRef::Local(subject.fn_did, slot_id)) {
-        Some(SlotKind::Ref) => Decision::Ref {
-            mutable: subject.mutable,
-        },
-        // A1 emitability, S1 scope: the reference form and nothing else. `Raw`
-        // is a decision to leave the source alone; `Owning` needs the Box forms
-        // and the drop policy, which arrive in S3.
-        Some(SlotKind::Raw) => Decision::Degraded {
-            reason: "BO kind Raw — no rewrite at M1",
-        },
-        Some(SlotKind::Owning) => Decision::Degraded {
-            reason: "BO kind Owning — Box forms arrive in S3",
-        },
-        None => Decision::Degraded {
-            reason: "slot absent from the accepted model",
-        },
+        Some(SlotKind::Ref) => {}
+        Some(SlotKind::Raw) => return degrade(subject, decl_site, DegradeReason::KindRaw),
+        Some(SlotKind::Owning) => return degrade(subject, decl_site, DegradeReason::KindOwning),
+        None => return degrade(subject, decl_site, DegradeReason::NoSlot),
+    }
+
+    // A1 emitability: BO says a reference is SOUND; these say whether one can
+    // actually be EMITTED. Both are decision-phase questions, which is the
+    // whole point — S1 let them fall through to an anonymous gate failure.
+    if let Some((op, span)) = facts.raw_only_uses.get(&(subject.fn_did, subject.hir_id)) {
+        return degrade(
+            subject,
+            EmitabilityFacts::site(tcx, *span),
+            DegradeReason::RawPointerOperation { op: op.clone() },
+        );
+    }
+    if let Some(callers) = facts.callers.get(&subject.fn_did)
+        && let Some((_, span)) = callers.first()
+    {
+        return degrade(
+            subject,
+            EmitabilityFacts::site(tcx, *span),
+            DegradeReason::CallSiteNotAdapted,
+        );
+    }
+
+    Decision::Ref {
+        mutable: subject.mutable,
     }
 }
