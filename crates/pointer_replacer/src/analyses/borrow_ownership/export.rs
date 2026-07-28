@@ -29,27 +29,27 @@
 //! changes, it is `None` (and therefore free) on the production path, and its
 //! scope is established by the caller before any capture point runs.
 //!
-//! # Why there is no env switch (D4, descoped)
+//! # The env switch (`CRAT_BO_EXPORT`), and why it exists now
 //!
-//! M0.5 specified a `CRAT_BO_EXPORT` binary switch on the premise that "a
-//! corpus worker needs to request capture without a Rust-level scope". Recon
-//! against `bo_c1`'s sweep refutes that premise: the sweep re-invokes the test
-//! binary as a worker (`bo_c1.rs:7573`) whose entry point is
-//! `bo_c1::boc1_run_one` — Rust code, where [`with_bo_export`] is directly
-//! available. The in-tree idiom for every comparable feature
-//! (`CRAT_BOC1_SELECTOR_TRACE`, `CRAT_BOC1_SELECTOR_CORE`,
-//! `CRAT_BOC1_YIELD_SNAPSHOT`) is exactly that: the env var names a
-//! destination, and worker Rust code drives the capture. Env gating therefore
-//! belongs to the bo_c1 integration, not to this module, and arrives with it.
+//! D4 descoped an earlier `CRAT_BO_EXPORT` because it gated onto **nothing** —
+//! it turned on a recorder no one read. That objection is spent: the switch now
+//! gates [`arm_capture`], the production arm in `bo_c1::run::run_bo`, which is
+//! a real consumer of the decision.
 //!
-//! Capture is enabled by [`with_bo_export`] or [`arm_capture`], and by nothing
-//! else. **`run_bo` arms it around the accepted-run region**, so the corpus
-//! worker path DOES record — with no consumer yet, since `run_bo` drops the
-//! result. Two consequences, stated rather than left to be discovered:
-//! recording cost is now paid on the reported-numbers path, so `t_emit_s` and
-//! `t_fixpoint_s` from a NEW sweep are not comparable to rows banked before it;
-//! and the env gating this module says belongs to the bo_c1 integration has not
-//! arrived, so the arm is unconditional.
+//! Semantics: resolve-once per process, fail loud on anything other than `0`
+//! or `1`, **default OFF**.
+//!
+//! - **Off (default):** `arm_capture` is inert, so the corpus worker pays no
+//!   recording cost and its `t_emit_s`/`t_fixpoint_s` stay comparable to rows
+//!   banked before the arm existed.
+//! - **On:** the accepted-run region records, which makes the corpus-scale
+//!   export-identity check reproducible directly — no temporary ambient patch
+//!   of the kind the first such measurement needed.
+//!
+//! [`with_bo_export`] is **not** gated. It is the explicit-scope API used by
+//! tests and by any future in-process consumer that has already decided it
+//! wants a recording; the flag governs the *ambient* arm, not the explicit one.
+
 
 use std::cell::RefCell;
 
@@ -60,6 +60,38 @@ use rustc_middle::mir::{Local, Location, Place};
 use z3::ast::Bool;
 
 use super::{l2::MirLocationKey, solver::SlotRef, ssa::constraint::Var};
+
+// ---------------------------------------------------------------------------
+// Flag gating — resolve once, fail loud, default off
+// ---------------------------------------------------------------------------
+
+/// `CRAT_BO_EXPORT ∈ {0,1}`; unset means `0`. Anything else fails loudly.
+///
+/// Pure parse, so every branch is testable without touching the process
+/// environment — mutating env in a parallel test binary is the D10 race class
+/// this project has already paid for twice.
+pub(crate) fn export_enabled_from_value(value: Option<&str>) -> bool {
+    match value {
+        None | Some("0") => false,
+        Some("1") => true,
+        Some(other) => panic!("CRAT_BO_EXPORT must be 0 or 1, got {other:?}"),
+    }
+}
+
+fn export_enabled_from_env() -> bool {
+    match std::env::var("CRAT_BO_EXPORT") {
+        Ok(value) => export_enabled_from_value(Some(&value)),
+        Err(std::env::VarError::NotPresent) => export_enabled_from_value(None),
+        Err(error) => panic!("CRAT_BO_EXPORT is not valid Unicode: {error}"),
+    }
+}
+
+/// Resolved at most once per process, so no two capture points can disagree.
+static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+pub(crate) fn flag_enabled() -> bool {
+    *FLAG.get_or_init(export_enabled_from_env)
+}
 
 // ---------------------------------------------------------------------------
 // §1.2 Lifetime-free keys
@@ -498,10 +530,16 @@ thread_local! {
 /// correct without restructuring the region into a closure.
 pub(crate) struct CaptureArm {
     prev: Option<BoExport>,
+    /// `false` when `CRAT_BO_EXPORT` is off: the arm installed nothing and must
+    /// therefore restore nothing, or it would clobber an enclosing scope.
+    armed: bool,
 }
 
 impl Drop for CaptureArm {
     fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
         BO_EXPORT_CAPTURE.with(|c| *c.borrow_mut() = self.prev.take());
         // Non-`Send` scaffolding must not outlive the scope.
         VERSION_ASTS.with(|c| *c.borrow_mut() = None);
@@ -527,6 +565,9 @@ impl CaptureArm {
     /// Recording-only is unaffected: this runs after the analysis, on the way
     /// out of the scope.
     pub(crate) fn finish(self) -> BoExport {
+        if !self.armed {
+            return BoExport::default();
+        }
         let mut captured = BO_EXPORT_CAPTURE
             .with(|c| c.borrow_mut().take())
             .unwrap_or_default();
@@ -536,11 +577,34 @@ impl CaptureArm {
     }
 }
 
-/// Arm capture for the accepted-run region. See [`CaptureArm`].
+/// Arm capture for the accepted-run region, **if `CRAT_BO_EXPORT=1`**.
+///
+/// Off by default, in which case this is one `OnceLock` read and the returned
+/// arm is inert: nothing is installed, nothing is restored on drop, and
+/// `finish()` yields an empty export. See the module doc for why the flag
+/// exists now when D4 removed its predecessor.
 pub(crate) fn arm_capture() -> CaptureArm {
+    if !flag_enabled() {
+        return CaptureArm {
+            prev: None,
+            armed: false,
+        };
+    }
+    arm_scope()
+}
+
+/// Unconditional arm — the explicit-scope primitive behind [`with_bo_export`],
+/// deliberately NOT flag-gated.
+///
+/// Witnesses of the *positional* allow-list property use this rather than
+/// [`arm_capture`]: "probes outside the armed region record nothing" is
+/// orthogonal to whether the ambient flag is set, and testing it through the
+/// gated entry would make it pass vacuously whenever the flag is off (i.e.
+/// always, by default).
+pub(crate) fn arm_scope() -> CaptureArm {
     let prev = BO_EXPORT_CAPTURE.with(|c| c.replace(Some(BoExport::default())));
     VERSION_ASTS.with(|c| *c.borrow_mut() = None);
-    CaptureArm { prev }
+    CaptureArm { prev, armed: true }
 }
 
 /// Run `f` with export capture active, returning its result and the recording.
@@ -549,7 +613,7 @@ pub(crate) fn arm_capture() -> CaptureArm {
 /// it. Nesting is safe — the previous capture is restored on unwind as well as
 /// on normal return.
 pub(crate) fn with_bo_export<T>(f: impl FnOnce() -> T) -> (T, BoExport) {
-    let arm = arm_capture();
+    let arm = arm_scope();
     let output = f();
     (output, arm.finish())
 }

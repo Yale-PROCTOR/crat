@@ -1233,7 +1233,7 @@ fn probes_outside_the_armed_region_record_nothing() {
         };
 
         // (1) NARROW arm — the shipped boundary; barrage runs after finish().
-        let arm = arm_capture();
+        let arm = arm_scope();
         let model = accepted_run();
         let narrow = arm.finish();
         barrage();
@@ -1245,7 +1245,7 @@ fn probes_outside_the_armed_region_record_nothing() {
         );
 
         // Reference: the accepted run with no barrage at all.
-        let arm2 = arm_capture();
+        let arm2 = arm_scope();
         let _ = accepted_run();
         let reference = arm2.finish();
         assert_eq!(
@@ -1254,7 +1254,7 @@ fn probes_outside_the_armed_region_record_nothing() {
         );
 
         // (2) WIDE arm — the built-in mutation.
-        let arm3 = arm_capture();
+        let arm3 = arm_scope();
         let _model3 = accepted_run();
         barrage();
         let wide = arm3.finish();
@@ -1290,11 +1290,79 @@ fn oracle_probe_inside_the_armed_region_trips_the_wire() {
     ::utils::compilation::run_compiler_on_str(CALL_ARG, |tcx| {
         let program = collect_program(tcx);
         let slots = CrateSlots::build(&program);
-        let _arm = arm_capture();
+        let _arm = arm_scope();
         let model: FxHashMap<SlotRef, super::SlotKindAlias> = FxHashMap::default();
         // Armed region + probe entry point = the violation the wire names.
         let _ = model_accepts(&program, &slots, &model, true);
         None::<()>
+    })
+    .unwrap_or_else(|e| e.raise());
+}
+
+/// **GATE (closing addendum)** — `CRAT_BO_EXPORT` is fail-loud on bad values.
+///
+/// Exercised through the pure parse, never by mutating the process
+/// environment: the suite runs tests in parallel, and env mutation is the D10
+/// race class this project has already paid for twice.
+#[test]
+fn export_flag_rejects_invalid_value() {
+    assert!(!export_enabled_from_value(None), "unset must mean off");
+    assert!(!export_enabled_from_value(Some("0")));
+    assert!(export_enabled_from_value(Some("1")));
+    let bad = std::panic::catch_unwind(|| export_enabled_from_value(Some("2")));
+    assert!(bad.is_err(), "CRAT_BO_EXPORT=2 must fail loudly");
+}
+
+/// **GATE (closing addendum)** — with the flag OFF (the default), the ambient
+/// arm records nothing.
+///
+/// This is what restores timing comparability for the sweep: `run_bo` arms
+/// through `arm_capture`, so an unset flag means the corpus worker pays no
+/// recording cost and its `t_emit_s`/`t_fixpoint_s` stay comparable to rows
+/// banked before the arm existed.
+///
+/// *Mutation-tested, Rider 0 order.* **Deletion first:** remove the
+/// `if !flag_enabled()` early return from `arm_capture` and this fails — the
+/// arm installs a buffer, the accepted run records, and the export is
+/// non-empty.
+#[test]
+fn ambient_arm_is_inert_when_the_flag_is_off() {
+    assert!(
+        !flag_enabled(),
+        "this test characterises the DEFAULT; CRAT_BO_EXPORT is set in this \
+         process, so it cannot"
+    );
+    ::utils::compilation::run_compiler_on_str(CALL_ARG, |tcx| {
+        let program = collect_program(tcx);
+        let slots = CrateSlots::build(&program);
+        let arm = arm_capture();
+        // A real accepted run, so the capture points genuinely execute.
+        let crate_ctxt = CrateCtxt::new(&program);
+        let solver = KindSolver::new(&slots);
+        let (_stats, selectors) = emit_crate_ownership_constraints(
+            &crate_ctxt,
+            &slots,
+            &compute_origins(&program),
+            &solver,
+        )
+        .expect("emission");
+        for &g in &program.functions {
+            let body = tcx.mir_drops_elaborated_and_const_checked(g).borrow();
+            add_coherence(&solver, &slots, g, &body);
+        }
+        let model = verify_to_fixpoint(&program, &slots, &solver, &selectors, true);
+        assert!(model.is_some(), "fixture must be accepted — else witness inert");
+        assert!(
+            !capturing(),
+            "flag off, yet capture is active — the ambient arm is not gated"
+        );
+        let export = arm.finish();
+        assert_eq!(
+            export,
+            BoExport::default(),
+            "flag off, yet the ambient arm recorded: {export:?}"
+        );
+        Some(())
     })
     .unwrap_or_else(|e| e.raise());
 }
