@@ -230,23 +230,33 @@ pub(crate) struct BoExport {
     pub loans: Vec<LoanIdentity>,
     /// E-R4 certificate: the residual conflicts the accepted model TOLERATES.
     ///
-    /// **Empty on the live Mode-A path today — the M0.5 spec's "non-empty in
-    /// general" is wrong, and so was this doc before D12.** Acceptance is
-    /// `committed == 0`, a round in which no residual was *committable*, which
-    /// is indeed weaker than "no residuals" in principle. But every conflict
-    /// that reaches the commit stage has a committable `Ref` owner: a
-    /// non-`Ref` FIELD residual declines (`residual_nonref_field`) and a
-    /// non-`Ref` LOCAL residual trips a release-active assert
-    /// (`guard_slots_are_ref`), both before `representative` runs, and
-    /// `representative`'s `None` arm is documented as defensive-only. So
-    /// `committed == 0` currently implies the conflict set was empty, and this
-    /// certificate carries no content on an accept.
+    /// **Empty on every fixture measured so far, but NOT provably empty — an
+    /// earlier version of this doc claimed it was, and that claim is
+    /// RETRACTED.** Acceptance is `committed == 0`, a round in which no
+    /// residual was *committable*, which is weaker than "no residuals".
     ///
-    /// It is kept because the emptiness is a property of the *current* repair
-    /// strategy, not of the export: it stops holding the moment
-    /// `representative`'s `None` arm becomes reachable. Witnessed by
-    /// `certificate_holds_the_accepting_rounds_residuals`, which fails if that
-    /// changes rather than silently reinterpreting the field.
+    /// The retracted argument ran: every conflict reaching the commit stage
+    /// has a committable `Ref` owner, because a non-`Ref` FIELD residual
+    /// declines (`residual_nonref_field`) and a non-`Ref` LOCAL residual trips
+    /// `guard_slots_are_ref`. **Both guards are vacuous on an edge with no
+    /// owners at all** — `.find()` over an empty iterator is `None`, `.all()`
+    /// over an empty iterator is `true` — so they wave such an edge through,
+    /// `representative` returns `None`, and it contributes nothing to
+    /// `committed`. `representative`'s own doc names this case: "kept
+    /// defensive (e.g. an empty edge)".
+    ///
+    /// Owner-less edges are producible by construction, not hypothetically: a
+    /// `Borrower::CallArg` loan gets `issuer: None`
+    /// (`borrow_engine/conflicts.rs`, the `Borrower::CallArg(..) => None`
+    /// arm) and no membership constraint (`borrow_engine/origin_replay.rs`
+    /// skips every non-`Assign` borrower), so no provenance can ever `require`
+    /// it and its requirer list is necessarily empty. `map_edges_to_slots`
+    /// `.map()`s rather than filters, so the empty edge reaches the conflict
+    /// set intact.
+    ///
+    /// What is NOT established is whether such an edge can survive to an
+    /// *accepting* round; no fixture exhibits one. So: empty in practice,
+    /// unproven in general, and a consumer must not assume either way.
     ///
     /// **Never written on the L2 path at all** (see the ledger's D2 adjacent
     /// gap): `record_residuals`' sole call site is inside the Mode-A accept.

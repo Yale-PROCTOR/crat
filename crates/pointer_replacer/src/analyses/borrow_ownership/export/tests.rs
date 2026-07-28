@@ -494,11 +494,20 @@ fn place_key_counts_derefs_and_fields() {
 // RED 16-17: the E-R4 certificate
 // -------------------------------------------------------------------------
 
-/// RED 16 — an accepted model may carry a NON-EMPTY residual conflict set.
+/// RED 16 — the E-R4 certificate at a Mode-A accept.
 ///
-/// This test exists specifically to prevent regression to the "empty on
-/// acceptance" error the M0.5 review corrected: acceptance is `committed == 0`
-/// (no *committable* residual), not "no conflicts".
+/// **This docstring previously asserted the OPPOSITE of the body below** (that
+/// an accepted model may carry a non-empty residual set). The rename and the
+/// assertion change landed without updating it, so the file carried a contract
+/// and its negation five lines apart. Corrected here.
+///
+/// **Known-insufficient, not yet fixed (ledger D14).** The emptiness assertion
+/// cannot detect DELETION of `record_residuals` — with the sole writer removed
+/// the field defaults to empty and the whole suite stays green (verified). It
+/// detects only a wrong-content recording. The obligation "the certificate is
+/// recorded at the accept point" is therefore still unwitnessed, and the
+/// failure message below overclaims by naming a move it cannot see. Closing it
+/// needs a shape that distinguishes "recorded empty" from "never recorded".
 #[test]
 fn certificate_holds_the_accepting_rounds_residuals() {
     // A multi-round fixture: rounds 1 and 2 each carry a NON-EMPTY residual

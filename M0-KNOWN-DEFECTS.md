@@ -3,12 +3,25 @@
 Five adversarial review lenses ran against `f9ee8fee` (read-only). 38 raw
 findings; nine re-verified and accepted. Four were HIGH and blocked merge.
 
-**Status after fix cycle 3: D1, D2, D3, D4, D10, D11, D12 CLOSED — every
-closure mutation-tested. D5–D9 remain open, plus one new spec-vs-reality
-finding (D13). M0 is merge-ready on the export surface's own terms; the
-corpus-scale identity check remains queued behind the pairwise sweep.**
+**Status after fix cycle 3 + its adversarial verification: D1, D2, D3, D4,
+D10, D11 CLOSED. D12 is NOT closed — its replacement assertion cannot detect
+deletion of the code it guards, verified by running the mutation. D13 is
+RETRACTED as stated; the reasoning behind it was invalid. D5–D9 remain open,
+joined by D14–D18. M0 is NOT merge-ready.**
+
+Cycle-3 delta verification: 7 findings, **all 7 confirmed** — 2 by running the
+mutation, 5 by direct source reading. None refuted.
 
 Suite: **833 passed, 0 failed, 7 ignored.**
+
+> **The standing rule was violated one commit after it was written.** The rule
+> says: *delete or break the exact branch the witness claims to guard*. For
+> D12 I mutated the recorded **content** (a fabricated residual) instead of
+> **deleting the call**, and reported the witness closed. Deleting
+> `record_residuals` outright leaves all 833 tests green. Running the wrong
+> mutation is the same failure as not running one — a content mutation
+> witnesses content, and the obligation was existence. **Rider 4: run the
+> deletion mutation first; only then consider weaker perturbations.**
 
 ---
 
@@ -21,8 +34,15 @@ test fails. A witness that cannot fail is not a witness.**
 This carries to all future milestones, not just M0. It is the systematic
 counter to M0's recorded failure classes below.
 
-Two operational riders learned in cycle 3:
+Four operational riders learned in cycle 3 — rider 4 the hard way, by
+violating the rule one commit after writing it:
 
+0. **Run the DELETION mutation first.** "Delete **or** break" are not
+   equivalent, and deletion is the stronger test. For D12 I broke the recorded
+   *content* and declared the witness closed; deleting the recorder outright
+   leaves the whole suite green. A content mutation witnesses content — if the
+   obligation is "this code runs at all", only deletion tests it. Weaker
+   perturbations come after, never instead.
 1. **Verify the mutation was effective.** Two of this cycle's five mutation
    attempts produced no signal for the wrong reason — one panicked before
    reaching the assertion (`conflicts.keys().next().unwrap()` on an empty map),
@@ -37,6 +57,11 @@ Two operational riders learned in cycle 3:
    mutation test while proving nothing about the L2-specific claim. Cut on
    syntactic boundaries and confirm the sites you did not intend to touch are
    intact.
+3. **A good mutation fails its witness and nothing else.** Each of cycle 3's
+   effective mutations failed exactly one of the 22 export tests. That
+   one-to-one property is itself the evidence the witness is *distinguishing*
+   — it is what closed the D2 caveat, where the prior test asserted only
+   properties that also held on the path it was not testing.
 
 ### M0's two recorded failure classes
 
@@ -114,8 +139,10 @@ Capture now exists on all four replay exits across the two paths.
 caveat).* The witness previously reached L2 by mutating the env var, so nothing
 guaranteed the L2 route was taken and every assertion it made also held on
 Mode-A. It now routes **directly** into `verify_l2_to_fixpoint_counting`, so
-the path is a fact of the call rather than of process state, and it asserts
-`stats.l2_decline.is_none()` (accepted, not controlled-declined).
+the path is a fact of the call rather than of process state. (The added
+`stats.l2_decline.is_none()` assertion was **also** claimed as strengthening;
+that claim is withdrawn — it cannot fire, see D18a. The direct routing is the
+whole of the strengthening.)
 
 *Mutation-tested:* commenting out **only the two L2-half capture sites**
 (`conflicts.rs:508` and `:534`), leaving the two Mode-A sites intact, fails
@@ -225,21 +252,75 @@ D4, but the witness makes it non-latent: the test constructs the scope itself.
 (DefId(0:3 ~ rust_out[96a3]::id), 0) recorded twice — the probe appended to the
 fixpoint's loans instead of starting a fresh round", and fails only it.
 
-### D12 — `certificate_residuals_may_be_nonempty` was vacuous — **CLOSED**
+### D12 — `certificate_residuals_may_be_nonempty` was vacuous — **NOT CLOSED**
 
 *Was:* the core assertion was `export.residual_conflicts.len() < usize::MAX`.
 Same tautology class as D3, written by me in `ad79b01a`.
 
-*Fix:* replaced with `certificate_holds_the_accepting_rounds_residuals`, which
-runs the multi-round `CASCADE` fixture (rounds 1 and 2 carry committable
-residuals, round 3 accepts) and asserts the certificate is **empty** — with the
-derivation for why, and a diagnostic that names both ways the property could
-break.
+*Attempted fix:* replaced with `certificate_holds_the_accepting_rounds_
+residuals`, which runs the multi-round `CASCADE` fixture and asserts the
+certificate is **empty**.
 
-*Mutation-tested:* replacing the accept-point `record_residuals` call with a
-fabricated non-empty residual fails it with the full diagnostic, and fails only
-it. (Two earlier mutation attempts were ineffective — see the standing rule's
-rider 1.)
+*Why it does not close.* `record_residuals` (`borrow_verify.rs:806`) is the
+field's **only** writer, and `BoExport` derives `Default`, so with the call
+deleted the field is empty and `is_empty()` still holds. **Verified by running
+it: the entire suite stays green — 833 passed, 0 failed — with
+`record_residuals` removed.** The only other consumer,
+`certificate_candidacy_matches_model`, is a loop over the same collection and
+is likewise vacuous when empty. So D12's actual obligation — *the certificate
+is recorded at the accept point* — remains unwitnessed, and the test's own
+failure message ("either `record_residuals` moved off the accept point …")
+names a mutation it cannot detect.
+
+The mutation I did run (fabricating a non-empty residual) fails the test, so it
+is not a tautology in D3's sense — it is falsifiable but guards the wrong
+thing. Closing it needs a shape that distinguishes "recorded empty" from "never
+recorded": an `Option<Vec<_>>`, or a recorded round index, or a fixture that
+genuinely yields a residual at accept (see D13).
+
+Two earlier mutation attempts in this cycle were also ineffective for
+mechanical reasons — see the standing rule's rider 1.
+
+### D13 — "the certificate is always empty at a Mode-A accept" — **RETRACTED**
+
+Recorded in cycle 3 as a new finding. **The derivation is invalid and the
+claim is withdrawn.**
+
+*What I argued:* every conflict reaching the commit stage has a committable
+`Ref` owner, because a non-`Ref` FIELD residual declines
+(`residual_nonref_field`) and a non-`Ref` LOCAL residual trips
+`guard_slots_are_ref`; therefore `committed == 0` implies an empty conflict
+set.
+
+*Why it fails.* **Both guards are vacuous on an edge with no owners at all.**
+`residual_nonref_field` is a `.find()` over `issuer.into_iter().chain(
+requirers)` — `None` on an empty iterator, so no decline. `guard_slots_are_ref`
+is an `.all()` over the same iterator — `true` on an empty iterator, so no
+trip. Neither guard intercepts such an edge; both wave it through,
+`representative` returns `None`, and it contributes 0 to `committed`. The
+conclusion does not follow from the premises.
+
+*And owner-less edges are producible by construction.* A `Borrower::CallArg`
+loan takes the `Borrower::CallArg(..) => None` arm for its issuer in
+`extract_conflict_edges`, and `origin_replay.rs`'s membership loop opens with
+`let Borrower::Assign(owner) = data.assigned else { continue; }` — so a CallArg
+loan never acquires a membership constraint, no provenance can ever `require`
+it, and the requirer walk (gated on `requires.contains(provenance, loan)`) can
+never fire. Its edge is necessarily `{ issuer: None, requirers: [] }`.
+`map_edges_to_slots` `.map()`s rather than filters, so it survives into the
+conflict set intact. All four steps re-read and confirmed in source.
+
+*I also misquoted my own authority.* I cited `representative`'s doc as saying
+the `None` arm is "defensive-only". It reads: "The `None` arm is kept defensive
+**(e.g. an empty edge)**" — the clause I dropped names the exact
+counterexample. Corroborating: the L2 loop's `representative == None` arm is
+written to `continue`, which would be dead code if the claim held.
+
+*What is actually established:* the certificate is empty on every fixture
+measured, and **not proven empty in general**. Whether an owner-less edge can
+survive to an *accepting* round is open — no fixture exhibits one, and
+constructing one is now the concrete task (D15). The field doc is corrected to
+say exactly this; the spec deviation note is corrected likewise.
 
 ---
 
@@ -247,23 +328,67 @@ rider 1.)
 
 Outside the authorized fix scope; recommended for M0.1.
 
-- **D13 (MEDIUM, new)** **The E-R4 certificate is content-free at a Mode-A
-  accept, and the M0.5 spec says the opposite.** The spec, and the field's own
-  doc before this cycle, asserted `residual_conflicts` is "non-empty in
-  general" on the reasoning that acceptance is `committed == 0` (no residual
-  was *committable*) rather than "no residuals". That reasoning is sound in
-  principle and false in this implementation: every conflict reaching the
-  commit stage has a committable `Ref` owner — a non-`Ref` FIELD residual
-  declines (`residual_nonref_field`) and a non-`Ref` LOCAL residual trips a
-  release-active assert (`guard_slots_are_ref`), both **before**
-  `representative` runs, whose `None` arm is documented as defensive-only. So
-  `committed == 0` currently implies the conflict set was empty. Discovered
-  while replacing D12's tautology — the vacuous assertion had been hiding it.
-  The field's doc is corrected in place; the **spec** still needs amending, and
-  a consumer relying on E-R4 carrying a tolerated-conflict set needs to know it
-  carries nothing today. The emptiness is a property of the current repair
-  strategy, not of the export, which is why the field is retained and
-  `certificate_holds_the_accepting_rounds_residuals` fires if it changes.
+### From the cycle-3 delta verification (all confirmed)
+
+- **D14 (HIGH)** The E-R4 certificate has **no recording witness at all** —
+  see D12 above. Deleting `record_residuals` leaves the suite green. This is
+  the item that keeps M0 from being merge-ready.
+- **D15 (MEDIUM)** **No fixture constructs an owner-less residual edge**, the
+  single shape that decides D13 either way. The construction is available from
+  source: a residual whose only invalid loan is a `Borrower::CallArg` loan.
+  Until it exists, the certificate's emptiness is an empirical observation over
+  a handful of fixtures, not a property. Related: nothing covers
+  `representative`'s `None` arm on either loop (`if let Some(slot)` in Mode-A;
+  the `else { … continue; }` in L2) — both are written as reachable and
+  neither has a fixture.
+- **D16 (MEDIUM)** **D11's reset makes the export last-writer-wins across the
+  audit probe path.** `run_necessity_audit` calls `model_accepts_with_flows`
+  on the anchor model and then once per leave-one-out **counterfactual** model
+  (`probe_accepts_with_ref`). Each now clears and re-records, so after such a
+  run `export.loans` describes the last counterfactual — a model that was
+  never accepted — and `surviving_loans()` would hand a rewriter loans from
+  the wrong model. `residual_conflicts` is wiped by the first probe and never
+  re-recorded. `begin_round()`'s own doc ("leaves exactly the accepted round's
+  `BorrowSet` behind") is false in the presence of any post-loop probe.
+  **Latent, not live** — `with_bo_export` has no non-test caller and `mod
+  bo_c1` is `#[cfg(test)]`, so `capturing()` is false on every audit path
+  today. Severity direction matters: before the fix this scenario produced
+  *duplicate* loans, which the uniqueness assertions catch loudly; after it,
+  the corruption is a unique, plausible loan set from the wrong model —
+  silent. The reviewer's alternative is better than what I shipped:
+  **suspend** capture for the duration of a probe rather than reset it, since
+  a probe is not the analysis. That preserves the fixpoint's E-R4 data and
+  still prevents D1-style accumulation. I did not make that change: the
+  authorization specified "the same per-round reset discipline as the CEGAR
+  loops", and switching to suspension is a contract change, not a fix.
+- **D17 (LOW)** The new `pub(crate)` door into the L2 loop bypasses the
+  release-active tracked-solver guard. The env entry asserts **two**
+  preconditions — `solver.tracker().is_none()` and `RepairMode::ModeA` — and
+  my doc names only the second. The reviewer's sharper point: the L2 loop
+  hardcodes `repair: ModeA` and never re-reads `RepairMode::current()`, so the
+  precondition I documented is the **inert** one and the one I omitted is
+  **load-bearing** (a tracked solver makes every solve vacuously SAT). Not
+  violated today — the only two callers are the env entry and the test helper,
+  which builds a fresh untracked solver. Fix: assert the tracker inside
+  `verify_l2_to_fixpoint_counting`, or at minimum document both.
+- **D18 (LOW)** Two overclaims in cycle 3's own record, both now corrected in
+  place but recorded here because they are the same class:
+  (a) `l2_path_records_loans`' added `stats.l2_decline.is_none()` assertion
+  **cannot fire** — every `record_l2_decline` call site is immediately followed
+  by `return (None, stats)`, so it is implied by the preceding
+  `model.is_some()`. It was counted as "strengthening"; it adds no
+  discriminating power. (b) The structural loop at the end of the certificate
+  test is **unreachable by construction** — it iterates a collection the
+  preceding assert has just required to be empty, and on failure the assert
+  aborts first. Its comment ("live for the day the arm becomes reachable") is
+  false, and worse, if reordered it would call D13's owner-less edge
+  "malformed" — the wrong diagnosis.
+  Also noted: `export_off_records_nothing`'s doc claims it shows capture
+  "allocates nothing when off"; the body asserts only `!capturing()`. The
+  claim exceeds the assertion.
+
+### Carried from earlier cycles
+
 - **D5 (MEDIUM)** `BorrowerKind` drops both payloads the spec requires (the
   `Assign` `ProvenanceOwner`, the `CallArg` callee `LocalDefId`). §0.5's stated
   reason for exporting `BorrowerKind` — letting a consumer reproduce the
