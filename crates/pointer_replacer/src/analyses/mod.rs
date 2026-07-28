@@ -7,6 +7,8 @@ pub mod fn_ptr_groups;
 pub mod fn_ptr_rewrite_decision;
 mod lattice;
 mod liveness;
+#[cfg(test)]
+pub(crate) use liveness::DefUse;
 mod mir;
 pub mod mir_variable_grouping;
 pub mod nullity;

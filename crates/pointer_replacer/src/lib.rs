@@ -37,4 +37,6 @@ pub use rewriter::{
 #[cfg(test)]
 mod bo_c1;
 #[cfg(test)]
+mod crown_usage_metric;
+#[cfg(test)]
 mod tests;
