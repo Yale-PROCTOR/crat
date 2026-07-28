@@ -46,8 +46,8 @@ test fails. A witness that cannot fail is not a witness.**
 This carries to all future milestones, not just M0. It is the systematic
 counter to M0's recorded failure classes below.
 
-Four operational riders learned in cycle 3 — rider 4 the hard way, by
-violating the rule one commit after writing it:
+Four operational riders, riders 1-3 learned in cycle 3 and rider 0 the hard
+way — by violating the rule one commit after writing it:
 
 0. **Run the DELETION mutation first.** "Delete **or** break" are not
    equivalent, and deletion is the stronger test. For D12 I broke the recorded
