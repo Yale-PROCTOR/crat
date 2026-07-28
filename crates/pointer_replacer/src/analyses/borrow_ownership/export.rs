@@ -42,8 +42,14 @@
 //! destination, and worker Rust code drives the capture. Env gating therefore
 //! belongs to the bo_c1 integration, not to this module, and arrives with it.
 //!
-//! Capture is enabled by [`with_bo_export`] and by nothing else. There is no
-//! ambient path that can turn it on.
+//! Capture is enabled by [`with_bo_export`] or [`arm_capture`], and by nothing
+//! else. **`run_bo` arms it around the accepted-run region**, so the corpus
+//! worker path DOES record — with no consumer yet, since `run_bo` drops the
+//! result. Two consequences, stated rather than left to be discovered:
+//! recording cost is now paid on the reported-numbers path, so `t_emit_s` and
+//! `t_fixpoint_s` from a NEW sweep are not comparable to rows banked before it;
+//! and the env gating this module says belongs to the bo_c1 integration has not
+//! arrived, so the arm is unconditional.
 
 use std::cell::RefCell;
 
@@ -462,8 +468,13 @@ impl BoExport {
 }
 
 thread_local! {
-    /// `None` by default: the production path performs no allocation, no
-    /// collection, and no sorting. Mirrors `solver::SELECTOR_TRACE_CAPTURE`.
+    /// `None` by default, so any path that has NOT armed performs no
+    /// allocation, no collection and no sorting. Mirrors
+    /// `solver::SELECTOR_TRACE_CAPTURE`.
+    ///
+    /// No longer the same as "the production path": `run_bo` arms the recorder
+    /// around its accepted-run region, so the sweep worker does allocate and
+    /// collect. See the module doc.
     static BO_EXPORT_CAPTURE: RefCell<Option<BoExport>> = const { RefCell::new(None) };
 }
 
@@ -545,10 +556,10 @@ pub(crate) fn with_bo_export<T>(f: impl FnOnce() -> T) -> (T, BoExport) {
 
 /// Whether capture is active.
 ///
-/// Active if and only if a [`with_bo_export`] scope is open. There is no
-/// ambient or env-driven enablement (D4, descoped — see the module doc), so off
-/// the scope this is one thread-local read of an `Option`, and every capture
-/// point short-circuits on it.
+/// Active if and only if a scope is open — [`with_bo_export`] or
+/// [`arm_capture`]. There is no env-driven enablement (D4, descoped), and off
+/// any scope this is one thread-local read of an `Option` with every capture
+/// point short-circuiting on it. Inside `run_bo`'s armed region it is true.
 pub(crate) fn capturing() -> bool {
     BO_EXPORT_CAPTURE.with(|c| c.borrow().is_some())
 }
@@ -725,43 +736,14 @@ pub(crate) fn begin_round() {
     });
 }
 
-/// Clone the active capture without ending the scope, or `None` when off.
-///
-/// Exists so a test can compare the recording at two points **inside one
-/// analysis run**. That matters: loan *numbering* is not stable across runs
-/// (ledger D19), so a two-run comparison cannot distinguish "the probe changed
-/// the export" from "the two runs numbered loans differently". Within a single
-/// run the order is fixed, and the comparison is exact.
-pub(crate) fn snapshot() -> Option<BoExport> {
-    BO_EXPORT_CAPTURE.with(|c| c.borrow().clone())
-}
-
-/// Run `f` with capture SUSPENDED, restoring it afterwards (D16).
-///
-/// The export represents **the accepted CEGAR run**. A probe entry point —
-/// `model_accepts`, and anything else that runs the oracle on a model the loop
-/// did not accept — is not part of that run, and must neither append to the
-/// recording nor reset it.
-///
-/// Resetting was the previous behaviour and was wrong in a way worth naming:
-/// it turned a loud defect into a silent one. Appending produced *duplicate*
-/// loans, which the uniqueness witnesses catch immediately; resetting produces
-/// a unique, plausible loan set belonging to a model that was never accepted,
-/// which nothing catches. Suspension keeps the accepted run's recording intact
-/// and still cannot accumulate.
-///
-/// Restores on unwind as well as on normal return, and costs one thread-local
-/// read when capture is off.
-pub(crate) fn with_capture_suspended<T>(f: impl FnOnce() -> T) -> T {
-    struct Restore(Option<BoExport>);
-    impl Drop for Restore {
-        fn drop(&mut self) {
-            BO_EXPORT_CAPTURE.with(|c| *c.borrow_mut() = self.0.take());
-        }
-    }
-    let _restore = Restore(BO_EXPORT_CAPTURE.with(|c| c.borrow_mut().take()));
-    f()
-}
+// `snapshot()` and `with_capture_suspended()` were DELETED in the allow-list
+// cycle, and the second deletion is not merely tidying orphaned code.
+// `with_capture_suspended` IS the deny-list primitive: leaving it callable
+// would let one line silently re-create the discipline this module just
+// abandoned, and make the tripwire in `model_accepts_with_flows` unreachable
+// for whatever it wrapped. Capture is positional now — armed around the
+// accepted run, inert everywhere else — and there is deliberately no API for
+// making an exception.
 
 /// Record the residual conflicts present at acceptance (E-R4 certificate).
 ///
