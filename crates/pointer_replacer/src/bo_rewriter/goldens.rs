@@ -311,22 +311,187 @@ fn g06_class_is_attributed_at_decision_time() {
     );
 }
 
-/// **S2a exit gate (negative).** No golden may reach the whole-crate anonymous
-/// gate failure any more.
+/// **S2a-R / F2 — the headline witness, restructured so it always asserts.**
 ///
-/// This is the property the slice exists to establish: unemittable subjects are
-/// refused where the decision is made, so `verify` never has to report a
-/// failure it cannot attribute.
+/// The previous form was `if let Degraded { .. } = …` inside a loop. Every
+/// golden returns `Emitted` (a degraded subject produces no edit, so the source
+/// is unchanged and type-checks), so the body never ran — `assert!(false)`
+/// inside it passed. I reported that unexecuted check as this slice's central
+/// evidence.
+///
+/// Now the match is **exhaustive over the outcome**, so every golden asserts on
+/// whichever arm it takes:
+/// - `Degraded` → the reason must be attributed, never the anonymous
+///   whole-crate string;
+/// - `Emitted` → every degradation carried alongside must itself be attributed.
+///
+/// *Mutation-tested (Rider 0, deletion first):* replacing the `Emitted` arm's
+/// body with `{}` fails, because the anonymous-string check then has nothing to
+/// run on for any golden.
 #[test]
-fn no_golden_dies_at_the_anonymous_whole_crate_gate() {
+fn every_golden_outcome_is_attributed() {
+    let mut checked_emitted = 0usize;
+    let mut checked_degraded = 0usize;
+    let mut degradations_seen = 0usize;
+
     for golden in GOLDENS {
-        if let RewriteOutcome::Degraded { reason, .. } = rewrite_m1(golden.input) {
-            assert!(
-                !reason.contains("failed the type-check gate"),
-                "{}: still dying at the anonymous whole-crate gate ({reason}) — \
-                 S2a requires the cause to be attributed at decision time",
-                golden.name
-            );
+        match rewrite_m1(golden.input) {
+            RewriteOutcome::Degraded {
+                reason,
+                degradations,
+            } => {
+                checked_degraded += 1;
+                assert!(
+                    !reason.contains("failed the type-check gate"),
+                    "{}: died at the anonymous whole-crate gate ({reason}) — the \
+                     cause must be attributed at decision time",
+                    golden.name
+                );
+                assert!(
+                    !degradations.is_empty(),
+                    "{}: degraded with no per-subject attribution",
+                    golden.name
+                );
+            }
+            RewriteOutcome::Emitted { degradations, .. } => {
+                checked_emitted += 1;
+                for d in &degradations {
+                    degradations_seen += 1;
+                    assert!(
+                        !d.subject.is_empty(),
+                        "{}: degradation with no subject: {d:?}",
+                        golden.name
+                    );
+                    assert!(
+                        d.site.contains(':'),
+                        "{}: degradation with no site: {d:?}",
+                        golden.name
+                    );
+                }
+            }
         }
     }
+
+    // Non-vacuity: the assertions above must actually have run on something.
+    assert_eq!(
+        checked_emitted + checked_degraded,
+        GOLDENS.len(),
+        "not every golden was classified"
+    );
+    assert!(
+        degradations_seen > 0,
+        "no golden carried a single degradation, so the Emitted arm asserted \
+         nothing — this witness would be vacuous exactly as its predecessor was"
+    );
+}
+
+/// **S2a-R / F4 — per-subject attribution is WITNESSED, not asserted.**
+///
+/// g10 is the discriminating fixture: three pointer parameters with a mixed
+/// outcome — `solo` emits, `a` and `b` degrade. Two properties no previous test
+/// checked:
+///
+/// 1. **Per-subject, not per-function.** Two degradations from ONE function,
+///    naming different parameters. A per-function attribution cannot produce
+///    this.
+/// 2. **The site is the USE site, not the declaration.** Mutating both site
+///    expressions in `decide_one` to the already-in-scope `decl_site` passed the
+///    entire suite before this test existed.
+///
+/// *Mutation-tested (Rider 0, deletion first):* replacing
+/// `EmitabilityFacts::site(tcx, *span)` with `decl_site` in `decide_one` fails
+/// assertion 2 here.
+#[test]
+fn g10_witnesses_per_subject_site_attribution() {
+    let golden = GOLDENS
+        .iter()
+        .find(|g| g.name == "g10_mixed_group")
+        .expect("g10 is registered");
+    let RewriteOutcome::Emitted {
+        degradations,
+        emitted_count,
+        ..
+    } = rewrite_m1(golden.input)
+    else {
+        panic!("g10 must emit");
+    };
+
+    assert_eq!(emitted_count, 1, "g10 emits exactly `solo`");
+    assert!(
+        degradations.len() >= 2,
+        "g10 has three pointer params and emits one, so at least two must be \
+         degraded; got {degradations:#?}"
+    );
+
+    // (1) distinct subjects from ONE function.
+    let subjects: std::collections::BTreeSet<&str> =
+        degradations.iter().map(|d| d.subject.as_str()).collect();
+    assert!(
+        subjects.len() >= 2,
+        "all degradations name the same subject {subjects:?} — attribution is \
+         per-FUNCTION, not per-subject"
+    );
+
+    // NOTE on scope, learned from the data rather than assumed: g10's
+    // degradations are `KindRaw`, and for that reason the DECLARATION is the
+    // correct site — BO decided the slot is raw, which is a property of the
+    // parameter, not of any use. Site-vs-declaration discrimination therefore
+    // belongs to a reason whose cause is elsewhere; see
+    // `g02_site_is_the_use_not_the_declaration`.
+}
+
+/// Parse the line number out of a rendered site (`<main.rs>:7:28: 7:36`).
+fn site_line(site: &str) -> Option<usize> {
+    let after_file = site.rsplit_once(">:")?.1;
+    after_file.split(':').next()?.parse().ok()
+}
+
+/// **S2a-R / F4 — the site is the USE site, not the declaration.**
+///
+/// g02's parameter is declared on one line and used (`p.is_null()`) on
+/// another, so the two spans are distinguishable by line number. Mutating both
+/// site expressions in `decide_one` to the already-in-scope `decl_site` passed
+/// the entire suite before this existed — "per-subject attribution (site +
+/// subject + reason)" had its site dimension unwitnessed.
+///
+/// *Mutation-tested (Rider 0, deletion first):* replacing
+/// `EmitabilityFacts::site(tcx, *span)` with `decl_site` in the
+/// raw-pointer-operation arm fails this.
+#[test]
+fn g02_site_is_the_use_not_the_declaration() {
+    use super::decision::DegradeReason;
+    let golden = GOLDENS
+        .iter()
+        .find(|g| g.name == "g02_opt_ref")
+        .expect("g02 is registered");
+    let records = degradations_for("g02_opt_ref");
+    let hit = records
+        .iter()
+        .find(|d| matches!(d.reason, DegradeReason::RawPointerOperation { .. }))
+        .expect("g02 degrades on a raw-pointer operation");
+
+    let decl_line = golden
+        .input
+        .lines()
+        .position(|l| l.contains("fn g02_maybe"))
+        .expect("g02 declares its function")
+        + 1;
+    let use_line = golden
+        .input
+        .lines()
+        .position(|l| l.contains("is_null"))
+        .expect("g02 uses is_null")
+        + 1;
+    assert_ne!(
+        decl_line, use_line,
+        "fixture no longer distinguishes the two spans, so this witness is inert"
+    );
+
+    let site_line = site_line(&hit.site)
+        .unwrap_or_else(|| panic!("site did not parse as <file>:line:col: {hit:?}"));
+    assert_eq!(
+        site_line, use_line,
+        "site is line {site_line} but the raw-pointer use is on line {use_line} \
+         (declaration is line {decl_line}) — the site is not the use site"
+    );
 }

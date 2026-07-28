@@ -145,7 +145,7 @@ pub(crate) fn rewrite_m1(input: &str) -> RewriteOutcome {
         let table = decision::decide(tcx, &subjects, &model, &slots, &facts);
 
         // Structural gate: decision coverage (real, not a self-comparison).
-        if let Err(why) = table.coverage_over(&subjects) {
+        if let Err(why) = table.coverage_over(&subjects, count_pointer_params(tcx, &program)) {
             return Err(format!("decision coverage gate: {why}"));
         }
 
@@ -244,8 +244,18 @@ fn collect_subjects(
             };
             // The parameter's BINDING, so a use can be attributed to it without
             // relying on a name that might be shadowed in an inner scope.
+            //
+            // F3: this used to `continue`, dropping the subject from BOTH the
+            // table and the count it was checked against — a double-sided drop
+            // the gate could not see. The independent count now catches it, and
+            // a mismatch here is a collector bug rather than a degradation, so
+            // it fails loudly instead of shrinking the work silently.
             let Some(param) = body.params.get(index) else {
-                continue;
+                panic!(
+                    "HIR fn_decl has input {index} but the body has no matching \
+                     param binding for {:?} — collector invariant broken",
+                    fn_did
+                );
             };
             let local = Local::from_usize(index + 1);
             subjects.push(decision::Subject {
@@ -262,6 +272,22 @@ fn collect_subjects(
         }
     }
     subjects
+}
+
+/// **F3: the independent reference for the coverage gate.**
+///
+/// Counts pointer-typed parameters by walking HIR directly, deliberately
+/// sharing no code with `collect_subjects`. That is the whole point: a gate
+/// that compares the collector against itself cannot fail, so the reference
+/// must be produced by a path that can disagree.
+fn count_pointer_params(tcx: TyCtxt<'_>, program: &RustProgram<'_>) -> usize {
+    program
+        .functions
+        .iter()
+        .filter_map(|&fn_did| tcx.hir_node_by_def_id(fn_did).fn_decl())
+        .flat_map(|decl| decl.inputs.iter())
+        .filter(|input| matches!(input.kind, rustc_hir::TyKind::Ptr(_)))
+        .count()
 }
 
 /// Source name of a parameter binding, for attribution.

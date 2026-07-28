@@ -61,25 +61,42 @@ const RAW_ONLY_METHODS: &[&str] = &[
 
 #[derive(Debug, Default)]
 pub(crate) struct EmitabilityFacts {
-    /// `callee -> (caller, call span)`. Non-empty means a signature change
-    /// would break an unadapted call site.
-    pub callers: FxHashMap<LocalDefId, Vec<(LocalDefId, Span)>>,
+    /// `callee -> reference spans`. Non-empty means a signature change would
+    /// break an unadapted USE — not only a call.
+    ///
+    /// **F1:** this was `ExprKind::Call` only, which missed the C2Rust
+    /// callback-table shape (`descent as unsafe extern "C" fn(..)`): the
+    /// function is never *called* directly, so its signature was rewritten
+    /// while a fn-item cast still referred to the old type, and the crate died
+    /// at the anonymous whole-crate gate — the exact class A1 exists to retire.
+    /// Any path reference to a local fn now counts, which subsumes direct
+    /// calls, address-taking, and fn-pointer casts uniformly.
+    pub referenced: FxHashMap<LocalDefId, Vec<Span>>,
     /// `(fn, param HirId) -> (method name, use span)` — first raw-only use.
     pub raw_only_uses: FxHashMap<(LocalDefId, HirId), (String, Span)>,
+    /// **F5:** `(fn, param HirId) -> comparison span`.
+    ///
+    /// A pointer comparison is a blocking precondition in BOTH directions, and
+    /// the second is the dangerous one: `p > limit` on two raw pointers
+    /// compares ADDRESSES, while the same expression on two references
+    /// compares POINTEES. That version type-checks, passes the gate, and
+    /// silently inverts a bounds check — so it must be refused at decision
+    /// time, not discovered by a behavioral test that does not exist yet.
+    pub ptr_comparisons: FxHashMap<(LocalDefId, HirId), Span>,
 }
 
 /// Gather A1 facts for the whole crate in one HIR pass per function body.
 pub(crate) fn collect(tcx: TyCtxt<'_>, functions: &[LocalDefId]) -> EmitabilityFacts {
     let mut facts = EmitabilityFacts::default();
     let local: Vec<LocalDefId> = functions.to_vec();
-    for &fn_did in functions {
-        let Some(body_id) = tcx.hir_node_by_def_id(fn_did).body_id() else {
-            continue;
-        };
-        let body = tcx.hir_body(body_id);
+    // EVERY body in the crate, not only the functions under consideration:
+    // a `static` initializer holding a callback table references functions
+    // (F1) and would otherwise never be visited at all.
+    for owner in tcx.hir_body_owners() {
+        let body = tcx.hir_body_owned_by(owner);
         let mut visitor = BodyFacts {
             tcx,
-            fn_did,
+            fn_did: owner,
             locals: &local,
             facts: &mut facts,
         };
@@ -125,18 +142,33 @@ impl<'a, 'tcx> Visitor<'tcx> for BodyFacts<'a, 'tcx> {
                         .or_insert((method, expr.span));
                 }
             }
-            // (2) in-crate call
-            ExprKind::Call(callee, _) => {
-                if let ExprKind::Path(QPath::Resolved(_, path)) = &callee.kind
-                    && let Res::Def(_, def_id) = path.res
+            // (2) ANY reference to a local fn — call, address-taken, or the
+            // operand of a fn-pointer cast. F1: matching only `Call` missed the
+            // callback-table shape entirely.
+            ExprKind::Path(QPath::Resolved(_, path)) => {
+                if let Res::Def(rustc_hir::def::DefKind::Fn, def_id) = path.res
                     && let Some(local_did) = def_id.as_local()
                     && self.locals.contains(&local_did)
                 {
                     self.facts
-                        .callers
+                        .referenced
                         .entry(local_did)
                         .or_default()
-                        .push((self.fn_did, expr.span));
+                        .push(expr.span);
+                }
+            }
+            // (4) pointer comparison — F5.
+            ExprKind::Binary(op, lhs, rhs) => {
+                use rustc_hir::BinOpKind::*;
+                if matches!(op.node, Lt | Le | Gt | Ge | Eq | Ne) {
+                    for side in [lhs, rhs] {
+                        if let Some(hir_id) = Self::resolved_local(side) {
+                            self.facts
+                                .ptr_comparisons
+                                .entry((self.fn_did, hir_id))
+                                .or_insert(expr.span);
+                        }
+                    }
                 }
             }
             // (3) a cast of a local to a raw pointer or integer keeps it raw

@@ -68,9 +68,17 @@ pub(crate) enum DegradeReason {
     KindOwning,
     /// The parameter is used in an operation that exists only on raw pointers.
     RawPointerOperation { op: String },
-    /// The function has an in-crate caller and call sites are not yet adapted.
-    /// **Retired by S3.**
+    /// The function is referenced in-crate — called, address-taken, or cast to
+    /// a fn pointer — and use sites are not yet adapted. **Retired by S3.**
     CallSiteNotAdapted,
+    /// The parameter is compared with `<`, `==`, … (F5).
+    ///
+    /// Blocking in both directions. The dangerous one is silent: the same
+    /// expression compares ADDRESSES on raw pointers and POINTEES on
+    /// references, so a rewritten bounds check type-checks, passes the gate,
+    /// and inverts. Refusing here is the only place that catches it before a
+    /// behavioral gate exists.
+    PtrComparison,
     /// Structural: the subject has no depth-0 slot, or none in the model.
     NoSlot,
 }
@@ -83,6 +91,7 @@ impl DegradeReason {
             DegradeReason::KindOwning => "kind-owning",
             DegradeReason::RawPointerOperation { .. } => "raw-pointer-operation",
             DegradeReason::CallSiteNotAdapted => "call-site-not-adapted",
+            DegradeReason::PtrComparison => "ptr-comparison",
             DegradeReason::NoSlot => "no-slot",
         }
     }
@@ -118,7 +127,7 @@ pub(crate) struct DecisionTable {
 
 impl DecisionTable {
     /// Structural gate: the table covers exactly the subjects it was given,
-    /// once each.
+    /// once each, **and as many subjects as the crate independently has**.
     ///
     /// The previous form compared `entries.len()` against a count captured from
     /// the same `Vec` one line earlier, over a total `map` with no filter — it
@@ -126,7 +135,11 @@ impl DecisionTable {
     /// *can*: **no duplicate subject** (a collector emitting one parameter
     /// twice would otherwise plan two edits for one span, which `apply` would
     /// only catch as an overlap rollback), and **every input subject present**.
-    pub(crate) fn coverage_over(&self, subjects: &[Subject]) -> Result<(), String> {
+    pub(crate) fn coverage_over(
+        &self,
+        subjects: &[Subject],
+        independent_ptr_params: usize,
+    ) -> Result<(), String> {
         let mut seen = rustc_hash::FxHashSet::default();
         for (subject, _) in &self.entries {
             let key = (subject.fn_did.local_def_index.as_u32(), subject.local);
@@ -144,6 +157,25 @@ impl DecisionTable {
                 "table has {} entries for {} subjects",
                 self.entries.len(),
                 subjects.len()
+            ));
+        }
+        // F3: the load-bearing comparison. The three checks above compare the
+        // table against the collector's OWN OUTPUT, which is unfailable by
+        // construction — `decide` is a total map over `subjects` and the same
+        // slice is passed here. A coverage gate that compares a pipeline
+        // against itself cannot fail; it needs an outside reference.
+        //
+        // `independent_ptr_params` is counted in a separate walk that does not
+        // consult `collect_subjects`, so a subject dropped anywhere in the
+        // collector — including the `body.params.get(index)` path, which used
+        // to drop it from BOTH sides at once and stay invisible — shows up
+        // here as a mismatch.
+        if self.entries.len() != independent_ptr_params {
+            return Err(format!(
+                "table covers {} subjects but the crate has {independent_ptr_params} \
+                 pointer parameters — {} were dropped before a decision was made",
+                self.entries.len(),
+                independent_ptr_params.saturating_sub(self.entries.len())
             ));
         }
         Ok(())
@@ -232,8 +264,15 @@ fn decide_one(
             DegradeReason::RawPointerOperation { op: op.clone() },
         );
     }
-    if let Some(callers) = facts.callers.get(&subject.fn_did)
-        && let Some((_, span)) = callers.first()
+    if let Some(span) = facts.ptr_comparisons.get(&(subject.fn_did, subject.hir_id)) {
+        return degrade(
+            subject,
+            EmitabilityFacts::site(tcx, *span),
+            DegradeReason::PtrComparison,
+        );
+    }
+    if let Some(spans) = facts.referenced.get(&subject.fn_did)
+        && let Some(span) = spans.first()
     {
         return degrade(
             subject,
@@ -244,5 +283,73 @@ fn decide_one(
 
     Decision::Ref {
         mutable: subject.mutable,
+    }
+}
+
+#[cfg(test)]
+mod coverage_tests {
+    use super::*;
+
+    fn subject(local: u32, label: &str) -> Subject {
+        Subject {
+            fn_did: rustc_hir::def_id::CRATE_DEF_ID,
+            local: Local::from_u32(local),
+            hir_id: rustc_hir::CRATE_HIR_ID,
+            label: label.to_owned(),
+            ty_span: rustc_span::DUMMY_SP,
+            pointee_span: rustc_span::DUMMY_SP,
+            mutable: true,
+        }
+    }
+
+    fn table(entries: Vec<Subject>) -> DecisionTable {
+        DecisionTable {
+            entries: entries
+                .into_iter()
+                .map(|s| (s, Decision::Ref { mutable: true }))
+                .collect(),
+        }
+    }
+
+    /// The gate accepts a table that covers its subjects and matches the
+    /// independent count.
+    #[test]
+    fn matching_coverage_is_ok() {
+        let subjects = vec![subject(1, "f::a"), subject(2, "f::b")];
+        assert!(table(subjects.clone()).coverage_over(&subjects, 2).is_ok());
+    }
+
+    /// **F3's load-bearing arm.** A subject dropped by the collector shrinks
+    /// BOTH the table and the slice it is compared against, so only the
+    /// independent count can see it.
+    ///
+    /// This is the arm the previous `is_total_over` — and its first replacement
+    /// — could not have: both compared the pipeline against its own output.
+    ///
+    /// *Mutation-tested (Rider 0, deletion first):* removing the
+    /// `entries.len() != independent_ptr_params` arm makes this pass.
+    #[test]
+    fn a_dropped_subject_is_caught_only_by_the_independent_count() {
+        let subjects = vec![subject(1, "f::a")];
+        // Table and slice agree with each other; the CRATE has two pointer
+        // params. Every self-referential check passes; this must not.
+        let err = table(subjects.clone())
+            .coverage_over(&subjects, 2)
+            .expect_err("a dropped subject must fail the coverage gate");
+        assert!(
+            err.contains("dropped before a decision"),
+            "wrong failure arm: {err}"
+        );
+    }
+
+    /// A duplicate subject is caught before it can plan two edits for one span.
+    #[test]
+    fn a_duplicate_subject_is_rejected() {
+        let subjects = vec![subject(1, "f::a")];
+        let dup = table(vec![subject(1, "f::a"), subject(1, "f::a")]);
+        let err = dup
+            .coverage_over(&subjects, 1)
+            .expect_err("a duplicate decision must fail the gate");
+        assert!(err.contains("duplicate"), "wrong failure arm: {err}");
     }
 }
