@@ -3,6 +3,48 @@
 Five adversarial review lenses ran against `f9ee8fee` (read-only). 38 raw
 findings; nine re-verified and accepted. Four were HIGH and blocked merge.
 
+## M1 open items with a ruled home
+
+Recorded so a future reviewer does not re-file them, and so each has a slice
+rather than sitting as an unowned "known weakness".
+
+### F6, split by ruling (2026-07-29)
+
+**(a) `emitted_count` has no non-zero witness — S2b.** `emitted_count` is the
+field whose documented job is telling a real rewrite from a no-op, and today
+`fn emitted_count(&self) -> usize { 0 }` passes the entire suite: the only
+assertion on it is `== 0`, on a fixture with no pointer parameters. The fix is
+cheap and lands in S2b — an emitting golden (g01) asserts its exact count, with
+the deletion mutation being to hardcode `0`.
+
+**(b) g09's companion strengthening — S3, deliberately not sooner.** g09's
+input and expected are byte-identical and its fixture has **zero pointer
+parameters**, so `emitted_count == 0` holds regardless of anything in
+`decide_one`, and the mutation its own doc prescribes is ineffective. The
+honest strengthening needs a *subject-bearing* suppression fixture, which
+requires P-drop to exist. Strengthening it now would witness a mechanism that
+has not been built — a witness for absent behaviour is the tautology class in
+another costume, so it waits.
+
+### Carried from the S2a delta, ruled into later slices
+
+- **`CallSiteNotAdapted` saturation (S2b label, S3 fix).** ≥69.4% of rs-crown
+  pointer parameters sit in functions with an in-crate call site, so every
+  counter emitted before S3 is dominated by a reason with no analytic content.
+  S2b's counter output carries the label "pre-S3 — measures S3's absence"; the
+  M1-final report after S3 is the only data that feeds the
+  emission-guided-refinement decision.
+- **A1 models no borrowck precondition.** `tcx.analysis(())` includes
+  borrowck, so the anonymous whole-crate gate failure remains reachable for
+  that class. Not in A1's scope; the per-function gate in S2b bounds the blast
+  radius to one function rather than the crate.
+- **`plan`'s `continue` arms (F7) — S2b.** Two silent `continue`s drop an edit
+  for a subject already decided `Ref`, producing no edit, no rollback and no
+  record, while `emitted_count` still counts it as emitted.
+- **Closures and impl/trait methods are not visited (F9).** C2Rust emits
+  neither, so reachability against the target corpus is low; recorded rather
+  than fixed.
+
 ## SUPPORTED SUITE MATRIX — read before filing a phantom finding
 
 **The supported matrix is `CRAT_BO_MUT_FACTS` on/off** (plus unset = default).
