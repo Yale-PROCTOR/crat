@@ -492,6 +492,63 @@ record.
   recording is a no-op. The zero-allocation property rests on `record`'s early
   return, which is an argument, not a measurement.
 
+### From the cycle-4 delta verification
+
+6 findings. **F3 and the D19 mechanism were confirmed by running or reading
+them myself; the rest are accepted on the reviewer's evidence.** F3 and F2 were
+regressions in cycle 4's own deliverable and are FIXED here — a test that fails
+in a supported configuration is an incomplete D14, not a new work item. The
+rest are recorded for the design review.
+
+- **F3 (MEDIUM) — FIXED.** My `Option` change made the certificate tests fail
+  under `CRAT_BO_L2_GUARDED_COMMITS=1`, the plan-of-record profile, where they
+  had passed. `verify_to_fixpoint*` dispatches on that env var and the L2
+  accept never calls `record_residuals` — so `None` there is **correct**, and
+  the test blamed the accept point for it. **Verified by running:** 3 failures
+  under that profile before the fix, 23/23 after. The tests now assert what
+  each path actually does, converting an env-sensitivity that was invisible
+  under `Vec` into a tested property of both paths. The D14 deletion mutation
+  was re-run afterwards to confirm the added early return did not make the
+  witness inert — it still fails.
+- **F2 (MEDIUM) — FIXED.** `l2_door_rejects_a_tracked_solver` would fail under
+  `cargo test --release`: `debug_assert!` is compiled out, the panic then comes
+  from `model_kinds_relaxing`'s release-active guard with a different message,
+  and `should_panic(expected = …)` no longer matches. Now
+  `#[cfg(debug_assertions)]`. The corollary is worth stating plainly: in the
+  release binaries the sweep actually runs, the door assert does not exist at
+  all — D17 buys no release protection, consistent with it being a fail-earlier
+  tripwire rather than the guard.
+- **F1 (MEDIUM; HIGH once the bo_c1 integration lands) — OPEN.** D16's
+  suspension sits inside `model_accepts_with_flows`, but the real probe
+  (`bo_c1::probe_accepts_with_ref`) extracts a model **before** calling it, and
+  `build_probe_base` re-runs `emit_crate_ownership_constraints` in the same
+  scope. So `version_owns` would be overwritten with the counterfactual's
+  ownership and `source_sites`/`sink_sites`/`version_sites` doubled — breaking
+  `SelectorSite`'s documented index-alignment. Loans and certificate are
+  protected; **E-R2 and E-R3 are not.** The suspension belongs at the probe
+  boundary, not inside the oracle adapter. Latent today, but D16's own hazard
+  was equally latent and was fixed anyway, and my doc claimed to cover
+  "anything else that runs the oracle on a model the loop did not accept" — it
+  does not. Same family: a second `verify_to_fixpoint` in one scope
+  (`CRAT_BOC1_CHECK_REAL=1`) wipes the first run's certificate via
+  `begin_round()`.
+- **F4 (MEDIUM) — OPEN.** D14's witness detects **deletion** but not
+  **relocation**, and its docstring claims round-distinguishing power it does
+  not have: `begin_round()` resets the field every round, so the terminal value
+  depends only on the last round and "record every round" is indistinguishable
+  from "record at accept" *for this field* — the pinned `rounds == 3` /
+  `commits_per_round == [1,1,0]` buy nothing here. The semantically dangerous
+  relocation is the same one: recording above the `residual_nonref_field`
+  decline would leave a **declining** run holding `Some(...)`, destroying the
+  very invariant the `Option` exists to carry. **Nothing asserts `is_none()` on
+  a declining run.**
+- **F5 (LOW) — OPEN.** The D16 witness calls itself "byte-identical" but
+  compares 3 of 6 fields (`version_sites` by `.len()`, and not
+  `source_sites` / `sink_sites` / `version_owns` — exactly the fields F1
+  corrupts), and never pins its counterfactual as genuinely differing from the
+  accepted model. Not vacuous today, but the guarantee its doc names is held up
+  by sibling tests rather than by itself.
+
 ### New in cycle 4
 
 - **D19 (HIGH, open — pre-existing, production-side) — loan numbering is not
@@ -502,10 +559,34 @@ record.
 
   *Not an export defect.* `record_loan_identities` iterates
   `borrow_set.loans.iter_enumerated()` — an `IndexVec`, iterated by index, so
-  the recorder is faithful to whatever numbering it is given. The instability
-  is in **`BorrowSet` construction** in `analyses/borrow/`, which is production
-  and out of bounds for this milestone; three loans in the fixture share one
-  location, and their relative order varies.
+  the recorder is faithful to whatever numbering it is given.
+
+  *Root cause, located by the cycle-4 review and confirmed here:*
+  `utils/dsa/union_find.rs` opens with `use std::collections::HashSet` — the
+  **default `RandomState`** hasher (verified: no `rustc_hash`/`FxHash` import in
+  that file). `UnionFind::group()` returns a clone of one of those sets, and
+  `analyses/borrow/mod.rs` pushes sibling loans into the `IndexVec<Loan,
+  BorrowData>` **in `group()` iteration order**. `RandomState` is seeded per
+  process and bumped per instance, so the order varies both run to run and
+  between `UnionFind` instances.
+
+  *Worse than first recorded, in two ways.* (1) `NativeBorrowContext::new`
+  rebuilds each function's `ProvenanceSet` — and therefore a fresh `UnionFind`
+  — on **every CEGAR round**, so loan numbering can permute *within a single
+  run*, not only across runs. That falsifies `snapshot()`'s justifying doc
+  ("within a single run the order is fixed"); the D16 witness is still sound,
+  but for a different reason — with suspension active, nothing is recorded
+  between the two snapshots. (2) `extract_conflict_edges` walks
+  `invalid_loans.iter()` in loan-index order, so the per-function
+  `Vec<ConflictEdge>` follows the permuted numbering and **Mode-A issues
+  `add_borrow_exclusion` in that order**. The comment there — "Iteration order
+  left on FxHash — Mode-A's z3 assertion order (hence its corpus numbers) stays
+  byte-comparable to every prior row" — rests on a false premise: `FxHashMap`
+  order is deterministic, but the inner `Vec` order is not. (The Lemmas arm
+  sorts explicitly for exactly this reason; Mode-A deliberately does not.)
+  Whether a permuted assertion order actually moves an accepted model is
+  **unmeasured exposure**, not demonstrated divergence — z3 `Optimize`
+  tie-breaking makes it possible.
 
   *Why HIGH.* E-R4's purpose, per ruling Q11, is a stable per-loan identity a
   re-route can match against. `LoanIdentity.loan` is a `usize` index into that
@@ -513,9 +594,9 @@ record.
   export was built to provide. `surviving_loans()` hands a consumer indices
   that mean different loans on different runs.
 
-  *Blast radius beyond the export is unassessed* and should be part of the
-  design review: anything comparing analysis output across runs (sweep rows,
-  byte-comparability claims, cached artifacts) rests on the same numbering.
+  *Blast radius* is therefore not confined to the export: the Mode-A z3
+  assertion-order claim above is the load-bearing one, and it should be
+  measured before any corpus number is cited as byte-comparable.
 
   *Discovered* by D16's first draft, which compared two runs and failed for
   this reason rather than the one it was testing. The failure was investigated
