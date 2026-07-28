@@ -218,18 +218,36 @@ fn phases_obey_their_import_rules() {
         for file in &files {
             let text = fs::read_to_string(file)
                 .unwrap_or_else(|e| panic!("unreadable phase source {file:?}: {e}"));
+            let name = file.file_name().unwrap_or_default().to_string_lossy().into_owned();
+
+            // (a) IMPORTS — resolved from the use-tree, so a brace-merged form
+            // is matched on its full path rather than on the text of one line.
+            for path in imported_paths(&text) {
+                for fragment in rule.forbidden {
+                    assert!(
+                        !path.contains(fragment),
+                        "{}/{name} imports {path:?}, which contains {fragment:?} \
+                         and this phase may not import it.\n{}",
+                        rule.phase,
+                        rule.why
+                    );
+                }
+            }
+
+            // (b) NON-IMPORT references — an inline path expression such as
+            // `crate::rewriter::f()` is not a use-tree, so the textual scan is
+            // still needed. It is sound HERE because a path expression cannot be
+            // split across lines by the formatter the way a use-tree can.
             for (lineno, line) in text.lines().enumerate() {
-                if is_comment(line) {
+                if is_comment(line) || line.trim_start().starts_with("use ") {
                     continue;
                 }
                 for fragment in rule.forbidden {
                     assert!(
                         !line.contains(fragment),
-                        "{}/{} line {} names {:?}, which this phase may not import.\n{}",
+                        "{}/{name} line {} names {fragment:?} outside an import.\n{}",
                         rule.phase,
-                        file.file_name().unwrap_or_default().to_string_lossy(),
                         lineno + 1,
-                        fragment,
                         rule.why
                     );
                 }
@@ -282,5 +300,142 @@ fn every_phase_directory_has_a_rule() {
         "a phase directory exists with no import rule (or a rule names a \
          directory that does not exist). Every phase is regulated, or the \
          architecture claim is unenforced."
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Syntax-aware import resolution (H1)
+// ---------------------------------------------------------------------------
+
+/// Fully-qualified import paths for one source file, with **merged and braced
+/// use-trees flattened**.
+///
+/// # Why this replaced a line scan
+///
+/// The previous matcher tested `line.contains(fragment)`. This repository's
+/// `rustfmt.toml` sets `imports_granularity = "Crate"`, which merges sibling
+/// imports into a braced tree and wraps it — so `use crate::analyses::X;`
+/// becomes
+///
+/// ```text
+/// use crate::{
+///     analyses::X,
+///     utils::Y,
+/// };
+/// ```
+///
+/// and **no line contains `crate::analyses`**. Every `crate::`-prefixed rule
+/// evaded simultaneously, and not hypothetically: `bo_rewriter/mod.rs` already
+/// carries exactly that form, so the rule was already blind to a real import at
+/// the moment it was written. A rule that cannot see the shape its own
+/// formatter produces is not enforcement.
+///
+/// Resolving the use-tree removes the formatter from the trust chain entirely:
+/// `use crate::{analyses::X}` and `use crate::analyses::X;` flatten to the same
+/// path, so how the source is wrapped stops mattering.
+fn imported_paths(text: &str) -> Vec<String> {
+    let Ok(file) = syn::parse_file(text) else {
+        // A file that does not parse cannot be cleared by this check. Returning
+        // a sentinel keeps the failure loud rather than silently vacuous.
+        return vec!["<unparseable — import check could not run>".to_owned()];
+    };
+    let mut out = Vec::new();
+    collect_use_items(&file.items, &mut out);
+    out
+}
+
+fn collect_use_items(items: &[syn::Item], out: &mut Vec<String>) {
+    for item in items {
+        match item {
+            syn::Item::Use(use_item) => flatten_use_tree(&use_item.tree, String::new(), out),
+            syn::Item::Mod(m) => {
+                if let Some((_, inner)) = &m.content {
+                    collect_use_items(inner, out);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn flatten_use_tree(tree: &syn::UseTree, prefix: String, out: &mut Vec<String>) {
+    let join = |prefix: &str, seg: &str| {
+        if prefix.is_empty() {
+            seg.to_owned()
+        } else {
+            format!("{prefix}::{seg}")
+        }
+    };
+    match tree {
+        syn::UseTree::Path(p) => {
+            flatten_use_tree(&p.tree, join(&prefix, &p.ident.to_string()), out)
+        }
+        syn::UseTree::Name(n) => out.push(join(&prefix, &n.ident.to_string())),
+        syn::UseTree::Rename(r) => out.push(join(&prefix, &r.ident.to_string())),
+        syn::UseTree::Glob(_) => out.push(join(&prefix, "*")),
+        syn::UseTree::Group(g) => {
+            for item in &g.items {
+                flatten_use_tree(item, prefix.clone(), out);
+            }
+        }
+    }
+}
+
+/// **H1 regression witness.** The matcher must catch BOTH breach shapes —
+/// the brace-merged form the formatter actually produces, and the single-line
+/// form. The old line scan caught only the second.
+///
+/// *Mutation-tested, Rider 0 order.* **Deletion first:** revert
+/// `phases_obey_their_import_rules` to a line scan and the merged case here
+/// stops being detected.
+#[test]
+fn matcher_catches_both_breach_shapes() {
+    let single_line = "use crate::analyses::borrow_ownership::SlotKind;\nfn f() {}\n";
+    let brace_merged = "use crate::{\n    analyses::borrow_ownership::SlotKind,\n    utils::rustc::RustProgram,\n};\nfn f() {}\n";
+
+    for (label, src) in [("single-line", single_line), ("brace-merged", brace_merged)] {
+        let paths = imported_paths(src);
+        assert!(
+            paths.iter().any(|p| p.contains("crate::analyses")),
+            "{label} breach was NOT resolved to a crate::analyses path; \
+             resolved paths were {paths:?}"
+        );
+    }
+
+    // And the shape that defeated the old matcher must be one no LINE contains.
+    assert!(
+        !brace_merged
+            .lines()
+            .any(|l| l.contains("crate::analyses")),
+        "the brace-merged fixture no longer exercises the evasion it exists to \
+         reproduce — a line scan would catch it, so this witness is inert"
+    );
+}
+
+/// **H1's first real input.** The matcher is pointed at the merged import that
+/// was already in the tree and already invisible to the line scan.
+///
+/// `mod.rs` is the driver, not a phase, so importing analyses there is
+/// legitimate — what is asserted is that the MATCHER SEES IT. If this stops
+/// resolving, the enforcement has gone blind again in exactly the way H1
+/// described.
+#[test]
+fn matcher_resolves_the_existing_merged_import_in_mod_rs() {
+    let mod_rs = module_root().join("mod.rs");
+    let text = fs::read_to_string(&mod_rs).expect("driver source readable");
+    let paths = imported_paths(&text);
+    assert!(
+        paths.iter().any(|p| p.starts_with("crate::analyses")),
+        "the matcher did not resolve the driver's brace-merged analyses import; \
+         resolved paths were {paths:?}"
+    );
+    // The property that made H1 a HIGH: no single LINE carries the fragment.
+    assert!(
+        !text
+            .lines()
+            .filter(|l| !is_comment(l))
+            .any(|l| l.contains("crate::analyses")),
+        "the driver's import is now on one line, so this file no longer \
+         witnesses the evasion H1 was about — pick another real input"
     );
 }
