@@ -1,0 +1,15 @@
+[package]
+name = "crown_usage_metric"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+c2rust-bitfields = "=0.3.0"
+libc = "=0.2.149"
+proc-macro2 = "=1.0.69"
+quote = "=1.0.33"
+syn = "=1.0.109"
+unicode-ident = "=1.0.12"
+
+[workspace]
