@@ -916,7 +916,14 @@ impl L2TransitionDiagnostics {
     }
 }
 
-fn verify_l2_to_fixpoint_counting(
+/// D10: `pub(crate)` so a test can route through the L2 loop **directly**
+/// instead of mutating `CRAT_BO_L2_GUARDED_COMMITS` inside a parallel test
+/// binary. The env switch remains the production entry — resolved once in
+/// `verify_to_fixpoint_counting_with_flows` — and this changes nothing about
+/// it; it only removes the need to perturb process-wide state to reach the same
+/// loop. Callers taking this door are responsible for the `RepairMode::ModeA`
+/// precondition the env entry asserts.
+pub(crate) fn verify_l2_to_fixpoint_counting(
     program: &RustProgram,
     slots: &CrateSlots,
     origin_flows: &OriginFlowResults,
@@ -1195,6 +1202,13 @@ pub(crate) fn model_accepts_with_flows(
     model: &FxHashMap<SlotRef, SlotKind>,
     is_mutable: impl MutProvider + Copy,
 ) -> bool {
+    // D11: this is an oracle run OUTSIDE either CEGAR loop, so nothing else
+    // would reset the recorder before it. Without this, a probe issued inside
+    // an open capture scope would APPEND its loans to the fixpoint's and
+    // reopen D1 by another route. The reset gives the same guarantee the loops
+    // have: what the export holds afterwards is exactly the last oracle run's
+    // `BorrowSet` — here, this probe's.
+    super::export::begin_round();
     let conflicts = revalidate_replaying_with_flows(
         program,
         slots,

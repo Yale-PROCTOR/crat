@@ -29,9 +29,21 @@
 //! changes, it is `None` (and therefore free) on the production path, and its
 //! scope is established by the caller before any capture point runs.
 //!
-//! The env flag [`export_enabled_from_env`] is retained because the spec
-//! mandates a fail-loud binary switch, and because a corpus worker needs to
-//! request capture without a Rust-level scope.
+//! # Why there is no env switch (D4, descoped)
+//!
+//! M0.5 specified a `CRAT_BO_EXPORT` binary switch on the premise that "a
+//! corpus worker needs to request capture without a Rust-level scope". Recon
+//! against `bo_c1`'s sweep refutes that premise: the sweep re-invokes the test
+//! binary as a worker (`bo_c1.rs:7573`) whose entry point is
+//! `bo_c1::boc1_run_one` — Rust code, where [`with_bo_export`] is directly
+//! available. The in-tree idiom for every comparable feature
+//! (`CRAT_BOC1_SELECTOR_TRACE`, `CRAT_BOC1_SELECTOR_CORE`,
+//! `CRAT_BOC1_YIELD_SNAPSHOT`) is exactly that: the env var names a
+//! destination, and worker Rust code drives the capture. Env gating therefore
+//! belongs to the bo_c1 integration, not to this module, and arrives with it.
+//!
+//! Capture is enabled by [`with_bo_export`] and by nothing else. There is no
+//! ambient path that can turn it on.
 
 use std::cell::RefCell;
 
@@ -42,49 +54,6 @@ use rustc_middle::mir::{Local, Location, Place};
 use z3::ast::Bool;
 
 use super::{l2::MirLocationKey, solver::SlotRef, ssa::constraint::Var};
-
-// ---------------------------------------------------------------------------
-// §1.3 Flag gating — fail loud, resolve once
-// ---------------------------------------------------------------------------
-
-/// `CRAT_BO_EXPORT ∈ {0,1}`; unset means `0`. Any other value fails loudly.
-///
-/// Modelled on [`super::l2::enabled_from_env`], the in-tree contract for a
-/// binary switch. Callers must resolve this **once** and thread the resulting
-/// `bool`; capture points never call it themselves.
-/// Pure parse, so a test can exercise every branch without touching the
-/// process environment — the same split `rewriter::decision_snapshot_pre_
-/// transform_enabled_from_value` uses. Mutating `CRAT_BO_EXPORT` in a test is
-/// unsafe now that `capturing()` consults it: the suite runs tests in parallel
-/// and another thread's `capturing()` would observe the temporary value.
-pub(crate) fn export_enabled_from_value(value: Option<&str>) -> bool {
-    match value {
-        None | Some("0") => false,
-        Some("1") => true,
-        Some(other) => panic!("CRAT_BO_EXPORT must be 0 or 1, got {other:?}"),
-    }
-}
-
-pub(crate) fn export_enabled_from_env() -> bool {
-    match std::env::var("CRAT_BO_EXPORT") {
-        Ok(value) => export_enabled_from_value(Some(&value)),
-        Err(std::env::VarError::NotPresent) => export_enabled_from_value(None),
-        Err(error) => panic!("CRAT_BO_EXPORT is not valid Unicode: {error}"),
-    }
-}
-
-/// Resolve-once cache for [`export_enabled_from_env`].
-///
-/// D4: the flag has to actually gate, not merely exist. Resolved at most once
-/// per process so a mid-run env change cannot make two capture points disagree
-/// — the same discipline L2 applies with its per-invocation resolve.
-static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-
-fn flag_enabled() -> bool {
-    *FLAG.get_or_init(export_enabled_from_env)
-}
-
-
 
 // ---------------------------------------------------------------------------
 // §1.2 Lifetime-free keys
@@ -261,10 +230,26 @@ pub(crate) struct BoExport {
     pub loans: Vec<LoanIdentity>,
     /// E-R4 certificate: the residual conflicts the accepted model TOLERATES.
     ///
-    /// **Non-empty in general.** Acceptance is `committed == 0` — a round in
-    /// which no residual was *committable* — not an empty conflict set. A
-    /// consumer that assumes emptiness here is reading the spec's corrected
-    /// §1.2 limit 1 backwards.
+    /// **Empty on the live Mode-A path today — the M0.5 spec's "non-empty in
+    /// general" is wrong, and so was this doc before D12.** Acceptance is
+    /// `committed == 0`, a round in which no residual was *committable*, which
+    /// is indeed weaker than "no residuals" in principle. But every conflict
+    /// that reaches the commit stage has a committable `Ref` owner: a
+    /// non-`Ref` FIELD residual declines (`residual_nonref_field`) and a
+    /// non-`Ref` LOCAL residual trips a release-active assert
+    /// (`guard_slots_are_ref`), both before `representative` runs, and
+    /// `representative`'s `None` arm is documented as defensive-only. So
+    /// `committed == 0` currently implies the conflict set was empty, and this
+    /// certificate carries no content on an accept.
+    ///
+    /// It is kept because the emptiness is a property of the *current* repair
+    /// strategy, not of the export: it stops holding the moment
+    /// `representative`'s `None` arm becomes reachable. Witnessed by
+    /// `certificate_holds_the_accepting_rounds_residuals`, which fails if that
+    /// changes rather than silently reinterpreting the field.
+    ///
+    /// **Never written on the L2 path at all** (see the ledger's D2 adjacent
+    /// gap): `record_residuals`' sole call site is inside the Mode-A accept.
     pub residual_conflicts: Vec<ResidualConflict>,
 }
 
@@ -330,25 +315,12 @@ pub(crate) fn with_bo_export<T>(f: impl FnOnce() -> T) -> (T, BoExport) {
 
 /// Whether capture is active.
 ///
-/// Active when either a [`with_bo_export`] scope is open (the test path) **or**
-/// `CRAT_BO_EXPORT=1` resolved on (the corpus-worker path, D4). In the latter
-/// case the buffer is installed lazily on first use, so a worker gets capture
-/// without a Rust-level scope — which is what the flag was always documented to
-/// provide.
-///
-/// When the flag is off and no scope is open this is one thread-local read of
-/// an `Option`, and every capture point short-circuits on it.
+/// Active if and only if a [`with_bo_export`] scope is open. There is no
+/// ambient or env-driven enablement (D4, descoped — see the module doc), so off
+/// the scope this is one thread-local read of an `Option`, and every capture
+/// point short-circuits on it.
 pub(crate) fn capturing() -> bool {
-    BO_EXPORT_CAPTURE.with(|c| {
-        if c.borrow().is_some() {
-            return true;
-        }
-        if flag_enabled() {
-            *c.borrow_mut() = Some(BoExport::default());
-            return true;
-        }
-        false
-    })
+    BO_EXPORT_CAPTURE.with(|c| c.borrow().is_some())
 }
 
 /// Mutate the active capture, or do nothing when inactive.

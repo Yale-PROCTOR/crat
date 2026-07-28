@@ -11,10 +11,14 @@ use super::*;
 use crate::{
     analyses::borrow_ownership::{
         CrateCtxt,
-        borrow_verify::verify_to_fixpoint,
+        borrow_verify::{
+            RepairMode, RoundStats, model_accepts, verify_l2_to_fixpoint_counting,
+            verify_to_fixpoint, verify_to_fixpoint_counting,
+        },
         coherence::add_coherence,
         crate_slots::CrateSlots,
         emit_crate_ownership_constraints,
+        origin_flow::analyze_program_origin_flow,
         origins::compute_origins,
         solver::{KindSolver, SlotRef},
     },
@@ -122,21 +126,19 @@ unsafe fn f(p: *mut i32) -> i32 {
 // 1-4: gating and identity
 // -------------------------------------------------------------------------
 
-/// RED 1 — the flag is fail-loud.
-///
-/// Exercised through the pure parse rather than the process environment:
-/// `capturing()` now consults the flag (D4), so mutating `CRAT_BO_EXPORT` here
-/// would race every other test's capture state.
-#[test]
-fn export_flag_rejects_invalid_value() {
-    assert!(!export_enabled_from_value(None), "unset must mean off");
-    assert!(!export_enabled_from_value(Some("0")));
-    assert!(export_enabled_from_value(Some("1")));
-    let bad = std::panic::catch_unwind(|| export_enabled_from_value(Some("2")));
-    assert!(bad.is_err(), "CRAT_BO_EXPORT=2 must fail loudly");
-}
+// RED 1 (the `CRAT_BO_EXPORT` fail-loud parse) is GONE, not weakened: D4 was
+// closed by DESCOPING the env switch, so there is no flag left to reject a bad
+// value. `export_off_records_nothing` is now the gating witness, and it
+// asserts the stronger property: capture is off unless a scope opened it, with
+// no ambient path that can turn it on.
 
 /// RED 4 — capture is inert unless scoped, and allocates nothing when off.
+///
+/// **Also the D4 witness.** The first assertion fails if ambient enablement is
+/// ever reintroduced — an env flag, a global, a lazy install inside
+/// `capturing()` — because this test runs with no scope open. Mutation-tested:
+/// restoring the `if flag_enabled() { install }` branch with the flag forced on
+/// fails it here.
 #[test]
 fn export_off_records_nothing() {
     assert!(!capturing(), "capture must be inactive by default");
@@ -498,19 +500,34 @@ fn place_key_counts_derefs_and_fields() {
 /// acceptance" error the M0.5 review corrected: acceptance is `committed == 0`
 /// (no *committable* residual), not "no conflicts".
 #[test]
-fn certificate_residuals_may_be_nonempty() {
-    // The field must exist and be populated from the accept point, even when
-    // this particular fixture happens to accept with zero residuals.
-    let (model, export) = capture_solve(CALL_ARG);
+fn certificate_holds_the_accepting_rounds_residuals() {
+    // A multi-round fixture: rounds 1 and 2 each carry a NON-EMPTY residual
+    // conflict set (that is what they commit on), round 3 accepts. So a
+    // recorder that captured the wrong round, or captured every round, is
+    // distinguishable here from one that captures the accepting round.
+    let (model, stats, export) = capture_solve_counting(CASCADE);
     assert!(model.is_some(), "fixture must be accepted");
-    // A residual list is a Vec, not an Option: "recorded, possibly empty" is
-    // distinguishable from "never recorded" only if acceptance ran.
-    assert!(
-        export.residual_conflicts.len() < usize::MAX,
-        "residual_conflicts must be recorded at the accept point"
+    assert_eq!(stats.rounds, 3, "the witness needs the committing rounds");
+    assert_eq!(
+        stats.commits_per_round,
+        vec![1, 1, 0],
+        "rounds 1-2 must have committable residuals for this to distinguish"
     );
-    // Every recorded residual must name a real function and, per the A-prime
-    // invariant, carry at least one requirer or an issuer.
+    // On the live Mode-A path acceptance (`committed == 0`) is REACHED ONLY
+    // WITH AN EMPTY CONFLICT SET: every conflict that reaches the commit stage
+    // has a committable `Ref` owner (`representative`'s contract — non-`Ref`
+    // fields decline and non-`Ref` locals assert, both before it runs), so a
+    // non-empty set always commits at least once. The certificate is therefore
+    // empty at a Mode-A accept, and `BoExport::residual_conflicts`' doc says so.
+    assert!(
+        export.residual_conflicts.is_empty(),
+        "a Mode-A accept committed nothing, so its residual set must be empty; \
+         got {:?} — either `record_residuals` moved off the accept point or \
+         `representative`'s no-committable-owner arm became reachable, and the \
+         E-R4 certificate's meaning has changed",
+        export.residual_conflicts
+    );
+    // Structural check, live for the day the arm above does become reachable.
     for r in &export.residual_conflicts {
         assert!(
             r.issuer.is_some() || !r.requirers.is_empty(),
@@ -604,17 +621,111 @@ unsafe fn f() -> i32 {
 }
 
 // -------------------------------------------------------------------------
-// D2 / D4 regression witnesses
+// D1 / D2 / D10 / D11 regression witnesses
 // -------------------------------------------------------------------------
 
-/// Solve with L2 guarded commits ON, under export capture (D2).
-fn capture_solve_l2(code: &str) -> (Option<FxHashMap<SlotRef, super::SlotKindAlias>>, BoExport) {
-    // SAFETY: the BO suite runs single-threaded (`test_threads = 1` in the
-    // corpus contract); the var is removed before returning.
-    unsafe { std::env::set_var("CRAT_BO_L2_GUARDED_COMMITS", "1") };
-    let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| capture_solve(code)));
-    unsafe { std::env::remove_var("CRAT_BO_L2_GUARDED_COMMITS") };
-    out.unwrap_or_else(|e| std::panic::resume_unwind(e))
+/// A shape that forces the CEGAR loop to commit and re-solve before accepting.
+///
+/// `x = id(p)` is a live `Ref` requirer invalidated by the write through the
+/// base `b = p` (A′), so the loop commits twice and accepts on round 3. The
+/// round count is pinned by `bo_c1.rs:6461` (`commit.rounds == 3`), and this
+/// test pins it again locally so a change in fixture behaviour cannot silently
+/// turn the D1 witness into a single-round no-op.
+const CASCADE: &str = "unsafe fn id(p: *mut i32) -> *mut i32 { p } \
+     unsafe fn f(p: *mut i32) -> i32 { let x = id(p); *x = 1; let b = p; *b = 2; *x }";
+
+/// Solve with capture, returning the round counters as well.
+///
+/// `verify_to_fixpoint` is a documented-thin wrapper over the counting loop
+/// (`verify_to_fixpoint_is_thin_wrapper`), so this observes the same run
+/// `capture_solve` does, plus the stats needed to pin the round count.
+fn capture_solve_counting(
+    code: &str,
+) -> (
+    Option<FxHashMap<SlotRef, super::SlotKindAlias>>,
+    RoundStats,
+    BoExport,
+) {
+    ::utils::compilation::run_compiler_on_str(code, |tcx| {
+        let program = collect_program(tcx);
+        let slots = CrateSlots::build(&program);
+        let ((model, stats), export) = with_bo_export(|| {
+            let crate_ctxt = CrateCtxt::new(&program);
+            let solver = KindSolver::new(&slots);
+            let (_stats, selectors) = emit_crate_ownership_constraints(
+                &crate_ctxt,
+                &slots,
+                &compute_origins(&program),
+                &solver,
+            )
+            .expect("emission");
+            for &g in &program.functions {
+                let body = tcx.mir_drops_elaborated_and_const_checked(g).borrow();
+                add_coherence(&solver, &slots, g, &body);
+            }
+            verify_to_fixpoint_counting(&program, &slots, &solver, &selectors, true)
+        });
+        (model, stats, export)
+    })
+    .unwrap_or_else(|e| e.raise())
+}
+
+/// Solve through the **L2 guarded-commit loop**, under export capture (D2).
+///
+/// **D10** — this used to `set_var("CRAT_BO_L2_GUARDED_COMMITS", "1")` inside a
+/// parallel test binary: the same data-race class already fixed for
+/// `CRAT_BO_EXPORT`, one helper over. The safety comment claiming the suite is
+/// single-threaded was wrong — `test_threads = 1` is a *corpus-sweep* setting,
+/// not a property of `cargo test -p pointer_replacer`.
+///
+/// Restructured instead of serialized: route straight into the L2 loop. That
+/// removes the env mutation entirely **and** makes the path taken a fact of
+/// the call rather than of process state, which is what closes D2's
+/// "non-distinguishing" caveat — there is no Mode-A route through this helper.
+/// `RepairMode::ModeA` (the default) satisfies the precondition the env entry
+/// asserts.
+fn capture_solve_l2(
+    code: &str,
+) -> (
+    Option<FxHashMap<SlotRef, super::SlotKindAlias>>,
+    RoundStats,
+    BoExport,
+) {
+    ::utils::compilation::run_compiler_on_str(code, |tcx| {
+        let program = collect_program(tcx);
+        let slots = CrateSlots::build(&program);
+        let origin_flows = analyze_program_origin_flow(&program);
+        assert_eq!(
+            RepairMode::current(),
+            RepairMode::ModeA,
+            "the L2 loop requires Mode-A repair"
+        );
+        let ((model, stats), export) = with_bo_export(|| {
+            let crate_ctxt = CrateCtxt::new(&program);
+            let solver = KindSolver::new(&slots);
+            let (_stats, selectors) = emit_crate_ownership_constraints(
+                &crate_ctxt,
+                &slots,
+                &compute_origins(&program),
+                &solver,
+            )
+            .expect("emission");
+            for &g in &program.functions {
+                let body = tcx.mir_drops_elaborated_and_const_checked(g).borrow();
+                add_coherence(&solver, &slots, g, &body);
+            }
+            verify_l2_to_fixpoint_counting(
+                &program,
+                &slots,
+                &origin_flows,
+                &solver,
+                &selectors,
+                true,
+            )
+        });
+        (model, stats, export)
+    })
+    .unwrap_or_else(|e| e.raise())
 }
 
 /// **D2** — the witnessed/L2 replay path must capture loans too.
@@ -622,10 +733,21 @@ fn capture_solve_l2(code: &str) -> (Option<FxHashMap<SlotRef, super::SlotKindAli
 /// Before the fix this path had no `record_loan_identities` call on either
 /// loop exit, so `loans` was silently empty under exactly the configuration
 /// the plan of record ships.
+///
+/// *Mutation-tested (standing rule).* Deleting either `record_loan_identities`
+/// call in `borrow_conflicts_replaying_witnessed` fails this test, because
+/// `capture_solve_l2` reaches the L2 loop by direct call — the Mode-A capture
+/// sites are not on this path and cannot mask the deletion. That is the
+/// distinguishing power the previous env-based helper lacked.
 #[test]
 fn l2_path_records_loans() {
-    let (model, export) = capture_solve_l2(CALL_ARG);
+    let (model, stats, export) = capture_solve_l2(CALL_ARG);
     assert!(model.is_some(), "L2-on fixture must be accepted");
+    assert!(
+        stats.l2_decline.is_none(),
+        "fixture must accept, not take an L2 controlled decline: {:?}",
+        stats.l2_decline
+    );
     assert!(
         !export.loans.is_empty(),
         "D2: the L2 replay path recorded no loans — capture is missing on that path"
@@ -644,20 +766,28 @@ fn l2_path_records_loans() {
 
 /// **D1** — a fixture that drives more than one validation round must still
 /// export exactly one record per loan.
+///
+/// The round count is **pinned**, per the delta review: without it, a fixture
+/// that quietly collapsed to one round would make the uniqueness assertion
+/// inert (duplicates can only arise ACROSS rounds), and the test would pass
+/// with the `begin_round()` reset deleted. `model.is_some()` and non-emptiness
+/// are asserted for the same reason — a first-solve decline would otherwise
+/// satisfy an empty-loan-set uniqueness check with zero signal.
+///
+/// *Mutation-tested (standing rule).* Deleting `export::begin_round()` from
+/// the Mode-A loop fails this test with "loan … appears more than once".
 #[test]
 fn multi_round_export_holds_only_the_final_round() {
-    // A shape that forces the CEGAR loop to commit and re-solve: two aliasing
-    // mutable arguments both flowing into one local.
-    const MULTI: &str = r#"
-unsafe fn g(p: *mut i32) { *p = 1; }
-unsafe fn f(a: *mut i32, b: *mut i32, c: i32) -> i32 {
-    let mut q: *mut i32 = a;
-    if c > 0 { q = b; }
-    g(q);
-    *a + *b
-}
-"#;
-    let (_model, export) = capture_solve(MULTI);
+    let (model, stats, export) = capture_solve_counting(CASCADE);
+    assert!(model.is_some(), "the cascade fixture must be ACCEPTED");
+    assert_eq!(
+        stats.rounds, 3,
+        "the D1 witness needs a genuinely multi-round fixture (2 commits + accept)"
+    );
+    assert!(
+        !export.loans.is_empty(),
+        "a multi-round accept recorded no loans at all — nothing is being witnessed"
+    );
     let mut seen = rustc_hash::FxHashSet::default();
     for loan in &export.loans {
         assert!(
@@ -669,24 +799,56 @@ unsafe fn f(a: *mut i32, b: *mut i32, c: i32) -> i32 {
     }
 }
 
-/// **D4** — the flag must actually gate.
+/// **D11** — `model_accepts` runs the oracle OUTSIDE either CEGAR loop, so
+/// nothing else resets the recorder before it. Without its own
+/// `begin_round()`, a probe issued inside an open capture scope appends to the
+/// fixpoint's loans and reopens D1 by another route.
 ///
-/// Before the fix `CRAT_BO_EXPORT` was resolved, validated, and then ignored:
-/// nothing on any capture path consulted it, so setting it to 1 recorded
-/// nothing. A flag that exists must gate.
+/// *Mutation-tested (standing rule).* Deleting the `begin_round()` call at the
+/// top of `model_accepts_with_flows` fails this test with the duplicate
+/// message below.
 #[test]
-fn export_flag_gates_capture() {
-    // The flag is resolve-once per process, so this test asserts the WIRING
-    // (that `capturing()` consults it at all) rather than flipping it live.
-    // With the flag unset, capture is off outside a scope...
-    assert!(
-        !capturing() || export_enabled_from_value(std::env::var("CRAT_BO_EXPORT").ok().as_deref()),
-        "capture is active with no scope and the flag off — the gate is inverted"
-    );
-    // ...and inside a scope it is on regardless of the flag.
-    let (inner, _) = with_bo_export(|| capturing());
-    assert!(inner, "scope must enable capture independently of the flag");
-    // The flag path is exercised by `flag_enabled()` inside `capturing()`;
-    // asserting it here without a resettable OnceLock would only re-test
-    // `export_enabled_from_env`, which RED 1 already covers.
+fn probe_after_fixpoint_does_not_accumulate_loans() {
+    ::utils::compilation::run_compiler_on_str(CASCADE, |tcx| {
+        let program = collect_program(tcx);
+        let slots = CrateSlots::build(&program);
+        let (_model, export) = with_bo_export(|| {
+            let crate_ctxt = CrateCtxt::new(&program);
+            let solver = KindSolver::new(&slots);
+            let (_stats, selectors) = emit_crate_ownership_constraints(
+                &crate_ctxt,
+                &slots,
+                &compute_origins(&program),
+                &solver,
+            )
+            .expect("emission");
+            for &g in &program.functions {
+                let body = tcx.mir_drops_elaborated_and_const_checked(g).borrow();
+                add_coherence(&solver, &slots, g, &body);
+            }
+            let model = verify_to_fixpoint(&program, &slots, &solver, &selectors, true)
+                .expect("cascade fixture accepts");
+            // The audit's probe, inside the SAME capture scope as the fixpoint.
+            assert!(
+                model_accepts(&program, &slots, &model, true),
+                "the accepted model must re-validate"
+            );
+            Some(model)
+        });
+        assert!(
+            !export.loans.is_empty(),
+            "the probe recorded no loans — the witness would be inert"
+        );
+        let mut seen = rustc_hash::FxHashSet::default();
+        for loan in &export.loans {
+            assert!(
+                seen.insert((loan.fn_did, loan.loan)),
+                "D11: loan ({:?}, {}) recorded twice — the probe appended to the \
+                 fixpoint's loans instead of starting a fresh round",
+                loan.fn_did,
+                loan.loan
+            );
+        }
+    })
+    .unwrap_or_else(|e| e.raise())
 }
