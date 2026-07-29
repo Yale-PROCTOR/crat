@@ -372,9 +372,22 @@ fn every_golden_outcome_is_attributed() {
         }
     }
 
-    // Non-vacuity: the assertions above must actually have run on something.
+    // ADV-R4: the previous "non-vacuity" assert here summed two counters that
+    // are each incremented exactly once per iteration and compared the total to
+    // the loop bound — unfailable, and labelled non-vacuity inside a commit
+    // whose purpose was deleting checks that cannot fail.
+    //
+    // Replaced by the TRUE present-tense property, which can fail: today every
+    // golden emits, so the Degraded arm runs zero times. If that changes, this
+    // says so instead of quietly shifting which arm carries the weight.
     assert_eq!(
-        checked_emitted + checked_degraded,
+        checked_degraded, 0,
+        "a golden now takes the Degraded arm ({checked_degraded} of them). That \
+         is not itself wrong, but this test's coverage has moved: re-check that \
+         the Degraded arm's assertions are the ones you want load-bearing."
+    );
+    assert_eq!(
+        checked_emitted,
         GOLDENS.len(),
         "not every golden was classified"
     );
@@ -493,5 +506,150 @@ fn g02_site_is_the_use_not_the_declaration() {
         site_line, use_line,
         "site is line {site_line} but the raw-pointer use is on line {use_line} \
          (declaration is line {decl_line}) — the site is not the use site"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// S2a-R2: fixtures for A1 arms that had none, and for the universe gate
+// ---------------------------------------------------------------------------
+
+/// Degradation reasons `rewrite_m1` attributes for an inline source.
+fn reasons_for_source(src: &str) -> Vec<super::decision::Degradation> {
+    match rewrite_m1(src) {
+        RewriteOutcome::Emitted { degradations, .. } => degradations,
+        RewriteOutcome::Degraded { degradations, .. } => degradations,
+    }
+}
+
+const PREAMBLE: &str = "#![allow(dead_code, unused_unsafe, unused_mut, unused_assignments)]\n";
+
+/// **F5 fixture — the bounds-check shape, which had NO fixture.**
+///
+/// Modelled on the corpus sites (`binn::AdvanceDataPos`,
+/// `lodepng::lodepng_chunk_next`): two pointer parameters compared with `>`.
+/// This is the case F5 exists for and the dangerous half of it — on raw
+/// pointers the comparison is on ADDRESSES, on references it is on POINTEES,
+/// so a rewrite that type-checks would silently invert the bound.
+///
+/// *Mutation-tested (Rider 0, deletion first):* deleting the `ptr_comparisons`
+/// arm in `decide_one` fails this — the parameters are decided `Ref` and no
+/// `PtrComparison` degradation is attributed.
+#[test]
+fn ptr_comparison_shape_is_degraded_with_its_own_reason() {
+    use super::decision::DegradeReason;
+    let src = format!(
+        "{PREAMBLE}pub unsafe fn advance(p: *mut u8, plimit: *mut u8) -> i32 {{\n    \
+         if p > plimit {{ return 0; }}\n    1\n}}\n"
+    );
+    let records = reasons_for_source(&src);
+    let hit = records
+        .iter()
+        .find(|d| d.reason == DegradeReason::PtrComparison)
+        .unwrap_or_else(|| panic!("no PtrComparison degradation attributed; got {records:#?}"));
+    assert!(
+        hit.subject.contains("advance"),
+        "degradation names the wrong subject: {hit:?}"
+    );
+    assert!(hit.site.contains(':'), "no site: {hit:?}");
+}
+
+/// **F1 fixture — the fn-table / address-taken shape, which had NO fixture.**
+///
+/// This is F1's own motivating case: the function is never *called*, so the
+/// pre-repair `ExprKind::Call`-only detector missed it entirely, rewrote the
+/// signature, and left the fn-item cast referring to the old type — dying at
+/// the anonymous whole-crate gate. Reverting F1 left the suite green precisely
+/// because this shape was untested.
+///
+/// *Mutation-tested (Rider 0, deletion first):* narrowing the `ExprKind::Path`
+/// arm back to `ExprKind::Call` fails this.
+#[test]
+fn address_taken_function_is_degraded_not_silently_rewritten() {
+    use super::decision::DegradeReason;
+    let src = format!(
+        "{PREAMBLE}pub unsafe fn descent(node: *mut i32) -> i32 {{ *node }}\n\
+         pub unsafe fn table() -> Option<unsafe fn(*mut i32) -> i32> {{\n    \
+         Some(descent as unsafe fn(*mut i32) -> i32)\n}}\n"
+    );
+    let records = reasons_for_source(&src);
+    assert!(
+        records
+            .iter()
+            .any(|d| d.reason == DegradeReason::CallSiteNotAdapted
+                && d.subject.contains("descent")),
+        "an address-taken function's parameter was not degraded; got {records:#?}"
+    );
+    // And the crate must not have died anonymously.
+    if let RewriteOutcome::Degraded { reason, .. } = rewrite_m1(&src) {
+        assert!(
+            !reason.contains("failed the type-check gate"),
+            "address-taken shape still reaches the anonymous gate: {reason}"
+        );
+    }
+}
+
+/// **RAW_ONLY_METHODS mechanism fixture.**
+///
+/// Proportionality call, recorded rather than assumed: the list is **data, not
+/// arms**. One `contains` check consumes every entry, so a per-entry fixture
+/// would test `slice::contains` sixteen times and add bloat without adding
+/// coverage. This proves the mechanism over a few representative entries
+/// (`offset`, `wrapping_add`); a new entry is a data edit, and the risk it
+/// carries is a wrong *name*, which no fixture of this shape would catch either.
+///
+/// *Mutation-tested (Rider 0, deletion first):* emptying `RAW_ONLY_METHODS`
+/// fails this.
+#[test]
+fn raw_only_method_mechanism_covers_representative_entries() {
+    use super::decision::DegradeReason;
+    for method in ["offset", "wrapping_add"] {
+        let src = format!(
+            "{PREAMBLE}pub unsafe fn f(p: *mut u8) -> *mut u8 {{ p.{method}(1) }}\n"
+        );
+        let records = reasons_for_source(&src);
+        assert!(
+            records.iter().any(|d| matches!(
+                &d.reason,
+                DegradeReason::RawPointerOperation { op } if op == method
+            )),
+            "`{method}` did not degrade its parameter; got {records:#?}"
+        );
+    }
+}
+
+/// **ADV-R1 fixture — the impl-method case the old gate could not see.**
+///
+/// An inherent method with a pointer parameter is out of M1's subject universe
+/// **by ruling** (not a C-source shape). The point of this test is that the
+/// exclusion is a COUNTED, attributed quantity: the old "independent" count
+/// re-walked `program.functions`, so it skipped this item exactly as the
+/// collector did, agreed at zero, and the parameter vanished silently.
+///
+/// *Mutation-tested (Rider 0, deletion first):* removing the `ImplItem` arm
+/// from `universe::classify` fails this — the exclusion goes back to zero and
+/// becomes invisible.
+#[test]
+fn impl_method_pointer_params_are_counted_as_excluded_not_invisible() {
+    let src = format!(
+        "{PREAMBLE}pub struct S;\nimpl S {{\n    pub unsafe fn m(&self, p: *mut i32) -> i32 {{ *p }}\n}}\n\
+         pub unsafe fn free_fn(q: *mut i32) -> i32 {{ *q }}\n"
+    );
+    let report = ::utils::compilation::run_compiler_on_str(&src, |tcx| {
+        super::decision::universe::classify(tcx)
+    })
+    .expect("fixture compiles");
+
+    assert_eq!(
+        report.excluded_impl, 1,
+        "the impl method's pointer parameter must be COUNTED as excluded, not \
+         skipped silently; report was {report:?}"
+    );
+    assert_eq!(
+        report.subjects, 1,
+        "the free function is the only M1 subject; report was {report:?}"
+    );
+    assert!(
+        report.excluded_total() > 0,
+        "excluded population must be visible as a number"
     );
 }

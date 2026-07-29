@@ -27,6 +27,7 @@ use rustc_span::Span;
 use crate::analyses::borrow_ownership::{SlotKind, crate_slots::CrateSlots, solver::SlotRef};
 
 pub(crate) mod emitability;
+pub(crate) mod universe;
 
 use emitability::EmitabilityFacts;
 
@@ -159,17 +160,19 @@ impl DecisionTable {
                 subjects.len()
             ));
         }
-        // F3: the load-bearing comparison. The three checks above compare the
-        // table against the collector's OWN OUTPUT, which is unfailable by
-        // construction — `decide` is a total map over `subjects` and the same
-        // slice is passed here. A coverage gate that compares a pipeline
-        // against itself cannot fail; it needs an outside reference.
+        // ADV-R1: the load-bearing comparison, against a DIFFERENT SOURCE OF
+        // TRUTH. The three checks above compare the table against the
+        // collector's own output and are unfailable by construction.
         //
-        // `independent_ptr_params` is counted in a separate walk that does not
-        // consult `collect_subjects`, so a subject dropped anywhere in the
-        // collector — including the `body.params.get(index)` path, which used
-        // to drop it from BOTH sides at once and stay invisible — shows up
-        // here as a mismatch.
+        // The first attempt at this arm was independent in code path but not in
+        // source: it re-walked `program.functions` with the same filter, so it
+        // agreed with the collector on every input — including the impl-method
+        // case, which BOTH walks skipped, agreeing at zero while a pointer
+        // parameter went unrewritten and unattributed.
+        //
+        // `independent_ptr_params` now comes from `universe::classify`, which
+        // starts at the crate's item list and visits every item kind. It can
+        // disagree, which is the only property that makes a gate a gate.
         if self.entries.len() != independent_ptr_params {
             return Err(format!(
                 "table covers {} subjects but the crate has {independent_ptr_params} \

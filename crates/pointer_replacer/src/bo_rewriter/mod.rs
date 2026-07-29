@@ -145,7 +145,8 @@ pub(crate) fn rewrite_m1(input: &str) -> RewriteOutcome {
         let table = decision::decide(tcx, &subjects, &model, &slots, &facts);
 
         // Structural gate: decision coverage (real, not a self-comparison).
-        if let Err(why) = table.coverage_over(&subjects, count_pointer_params(tcx, &program)) {
+        let universe = decision::universe::classify(tcx);
+        if let Err(why) = table.coverage_over(&subjects, universe.subjects) {
             return Err(format!("decision coverage gate: {why}"));
         }
 
@@ -272,22 +273,6 @@ fn collect_subjects(
         }
     }
     subjects
-}
-
-/// **F3: the independent reference for the coverage gate.**
-///
-/// Counts pointer-typed parameters by walking HIR directly, deliberately
-/// sharing no code with `collect_subjects`. That is the whole point: a gate
-/// that compares the collector against itself cannot fail, so the reference
-/// must be produced by a path that can disagree.
-fn count_pointer_params(tcx: TyCtxt<'_>, program: &RustProgram<'_>) -> usize {
-    program
-        .functions
-        .iter()
-        .filter_map(|&fn_did| tcx.hir_node_by_def_id(fn_did).fn_decl())
-        .flat_map(|decl| decl.inputs.iter())
-        .filter(|input| matches!(input.kind, rustc_hir::TyKind::Ptr(_)))
-        .count()
 }
 
 /// Source name of a parameter binding, for attribution.

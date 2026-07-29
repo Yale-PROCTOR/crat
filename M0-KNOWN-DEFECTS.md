@@ -3,6 +3,53 @@
 Five adversarial review lenses ran against `f9ee8fee` (read-only). 38 raw
 findings; nine re-verified and accepted. Four were HIGH and blocked merge.
 
+## M1 subject universe — ruling and census (2026-07-29)
+
+**M1's subjects are free functions with bodies** — the C2Rust output shape.
+Impl/trait items and foreign items are out of scope **by ruling**: foreign items
+have no body and an ABI-fixed signature (M4 territory), impl methods are not a
+C-source shape.
+
+The exclusions are **counted, not silent**. `decision::universe::classify`
+walks every item kind from the crate's item list — a different source of truth
+from the collector — and the coverage gate compares against it. That is what
+makes the gate falsifiable: the two previous forms both compared the decision
+table against the collector's own output, and the second only *looked*
+independent because it re-walked `program.functions` with the same filter.
+
+### Census on frozen rs-crown (read-only, syn walk)
+
+| class | count |
+|---|---|
+| **subjects** (free-fn pointer params) | **4171** |
+| excluded: impl methods | **0** |
+| excluded: trait items | **0** |
+| excluded: foreign (`extern` decls) | **2039** |
+
+**The impl/trait exclusion is stated-and-vacuous on this corpus** — zero across
+all 20 programs — so the ruling costs nothing measurable here. The foreign
+population is real (2039) and correctly excluded; it is the M4 boundary, and it
+appears in S2b's counters as out-of-scope-M1 rather than as an absence.
+
+### Proportionality call: `RAW_ONLY_METHODS` fixtures
+
+The list is **data, not arms**. One `contains` check consumes every entry, so a
+per-entry fixture would exercise `slice::contains` sixteen times without adding
+coverage. One mechanism fixture over representative entries (`offset`,
+`wrapping_add`) is the proportionate test; a new entry is a data edit whose real
+risk is a wrong *name*, which a per-entry fixture would not catch either.
+Recorded so the thin coverage is a decision rather than an oversight.
+
+### ADV-R3 — dialect-scoped limitation
+
+A1's fact collection sees only **syntactic operands**: one local copy of a
+parameter (`let x = p; x == y`) defeats both `ptr_comparisons` and
+`raw_only_uses`. On C2Rust input this is degradation-safe rather than silent,
+because C2Rust annotates its locals (`let mut cur: *mut u8 = p;`) and the
+annotation turns the alias into a type error. That is a property of the input
+dialect, not of the guard. **Revisit only if the input dialect widens** beyond
+C2Rust output.
+
 ## M1 open items with a ruled home
 
 Recorded so a future reviewer does not re-file them, and so each has a slice
