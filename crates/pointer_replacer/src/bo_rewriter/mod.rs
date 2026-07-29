@@ -458,3 +458,9 @@ pub(crate) fn artifact_rows(
 pub(crate) fn goldens_for_reconciliation() -> Vec<(&'static str, &'static str)> {
     goldens::GOLDENS.iter().map(|g| (g.name, g.input)).collect()
 }
+
+/// The item-axis census, for the corpus harness (C.6's owed exclusion numbers).
+#[cfg(test)]
+pub(crate) fn classify_universe(tcx: TyCtxt<'_>) -> decision::universe::UniverseReport {
+    decision::universe::classify(tcx)
+}

@@ -6918,6 +6918,106 @@ mod run {
         row
     }
 
+    /// **S2a-H corpus reconciliation** (C.4 + C.5).
+    ///
+    /// Emits producer A's and producer B's artifacts for one program and
+    /// reconciles them. The comparison itself lives in `coverage_recon`; this
+    /// is the harness that feeds it and reports the per-program verdict.
+    ///
+    /// # Per-program verdict (C.5)
+    ///
+    /// A pairing mismatch is **fail-loud at PROGRAM granularity**: this
+    /// program's `recon` is `FAIL` and its rewriter output is untrusted, but
+    /// the row is still printed and **the sweep continues**, so one run yields
+    /// the full incidence rather than halting at the first program. Every
+    /// violation is enumerated with both sides' name and index.
+    ///
+    /// # Aggregates
+    ///
+    /// Every finding class is reported **even at zero**, so the corpus gate can
+    /// pin it. Attribution without aggregation is how downgrades go silent.
+    ///
+    /// # Provenance
+    ///
+    /// The artifacts are run-products, not repo-committed: each is stamped with
+    /// its SHA-256 and the row counts it summarises, so a reported number can be
+    /// tied back to the exact bytes that produced it.
+    pub fn run_m1_recon(tcx: TyCtxt<'_>, t_tcx: Duration) -> Row {
+        use crate::coverage_recon::{compare, producer_b, schema};
+
+        let t0 = Instant::now();
+        let mut row = Row::default();
+        row.set("t_tcx_s", secs(t_tcx));
+
+        let a = match crate::bo_rewriter::artifact_rows(tcx) {
+            Ok(rows) => rows,
+            Err(why) => {
+                row.set("status", "producer-a-declined");
+                row.set("detail", super::report::sanitize(&why));
+                row.set("t_total_s", secs(t0.elapsed() + t_tcx));
+                return row;
+            }
+        };
+        let b = producer_b::rows(tcx);
+
+        let a_text = schema::encode(&a);
+        let b_text = schema::encode(&b);
+        row.set("a_rows", a.len());
+        row.set("b_rows", b.len());
+
+        // Provenance: the artifacts are RUN-PRODUCTS, written to disk so a
+        // reported number can be tied to the exact bytes that produced it, and
+        // hashed by `shasum` — the same tool that guards the frozen-corpus
+        // digest — rather than by a crypto dependency added for one stamp.
+        if let Some(dir) = std::env::var_os("CRAT_BOC1_ARTIFACT_DIR") {
+            let dir = std::path::PathBuf::from(dir);
+            let name = std::env::var("CRAT_BOC1_NAME").unwrap_or_else(|_| "unnamed".to_string());
+            if std::fs::create_dir_all(&dir).is_ok() {
+                let a_path = dir.join(format!("{name}.a.jsonl"));
+                let b_path = dir.join(format!("{name}.b.jsonl"));
+                let wrote_a = std::fs::write(&a_path, &a_text).is_ok();
+                let wrote_b = std::fs::write(&b_path, &b_text).is_ok();
+                if wrote_a && wrote_b {
+                    row.set("a_path", a_path.display());
+                    row.set("b_path", b_path.display());
+                }
+            }
+        }
+
+        let verdict = compare::compare(&a, &b);
+        for class in compare::FINDING_CLASSES {
+            let n = verdict.aggregates.get(class).copied().unwrap_or(0);
+            row.set(&format!("agg_{}", class.replace('-', "_")), n);
+        }
+        row.set("violations", verdict.violations.len());
+        row.set("findings", verdict.findings.len());
+        row.set("recon", if verdict.passed() { "PASS" } else { "FAIL" });
+
+        // Enumerate rather than summarise: full incidence in one run.
+        for v in &verdict.violations {
+            println!(
+                "BOC1-RECON-VIOLATION class={} fn={} local={} detail={}",
+                v.class, v.fn_path, v.mir_local, v.detail
+            );
+        }
+        for f in &verdict.findings {
+            println!(
+                "BOC1-RECON-FINDING class={} fn={} local={} detail={}",
+                f.class, f.fn_path, f.mir_local, f.detail
+            );
+        }
+
+        // The owed exclusion census, from the same classify invocation.
+        let universe = crate::bo_rewriter::classify_universe(tcx);
+        row.set("excl_impl", universe.excluded.impl_items);
+        row.set("excl_trait", universe.excluded.trait_items);
+        row.set("excl_foreign", universe.excluded.foreign_items);
+
+        row.set("t_total_s", secs(t0.elapsed() + t_tcx));
+        row.set("status", "ok");
+        row
+    }
+
     /// **M1 collector census** (coverage-apparatus review §3).
     ///
     /// Runs the SHIPPING subject collector and reports what it sees, so the
@@ -7808,6 +7908,7 @@ fn boc1_run_one() {
             "prod-precision" => run::run_prod_ownership(tcx, t_tcx),
             "prod-box" => run::run_prod_box(tcx, t_tcx),
             "m1-census" => run::run_m1_census(tcx, t_tcx),
+            "m1-recon" => run::run_m1_recon(tcx, t_tcx),
             "selector-core" => run::run_selector_core(tcx, t_tcx),
             "selector-necessity" => run::run_selector_necessity(tcx, t_tcx),
             detail if detail.starts_with("selector-detail-") => {
