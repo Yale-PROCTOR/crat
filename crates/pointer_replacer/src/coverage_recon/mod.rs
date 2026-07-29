@@ -35,6 +35,7 @@
 //! `bo_rewriter::import_denylist::coverage_recon_never_imports_from_bo_rewriter`.
 
 pub(crate) mod compare;
+pub(crate) mod producer_b;
 pub(crate) mod schema;
 
 #[cfg(test)]
