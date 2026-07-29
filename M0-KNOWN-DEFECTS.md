@@ -56,8 +56,47 @@ Corpus-neutrality note, since R-A widened the predicate's meaning: adopting
 **worth exactly zero** — `reference = 0` in all 19 programs. It is visible only
 in fixtures with an `&self` receiver.
 
-The `impl = 0 / trait = 0` rows stand as corroborated by direct grep (`0` impl
-blocks in 290 `.rs` files under `benchmarks/rs-crown`).
+### CORRECTION 2026-07-29 — the `impl = 0` row is FALSIFIED
+
+~~The `impl = 0 / trait = 0` rows stand as corroborated by direct grep (`0` impl
+blocks in 290 `.rs` files under `benchmarks/rs-crown`).~~ **Struck, not erased.**
+
+**The grep fact stands. The inference drawn from it is dead.**
+
+- **Still true:** there are **0 source-written `impl` blocks** in 290 `.rs`
+  files under `benchmarks/rs-crown`.
+- **Dead:** the inference *text-zero ⇒ HIR-zero*. C2Rust emits
+  `#[derive(Copy, Clone)]` on its structs; **derive-generated impls are
+  macro-expanded into HIR**, where no text grep can reach them, and their
+  `&self` receivers are pointer parameters under the R-A predicate —
+  `ptr_chain_depth` counts `TyKind::Ref` as depth-bearing.
+
+**Measured by the shipping `universe::classify` (Slice 0 spike, 2026-07-29).
+PARTIAL — three programs only:**
+
+| program | `impl_items` | `trait_items` | `foreign_items` |
+|---|---|---|---|
+| lil | **9** | 0 | 62 |
+| binn | **3** | 0 | 19 |
+| lodepng | **19** | 0 | 11 |
+
+**Corpus-wide numbers are PENDING C.6's `classify` run** and are not stated
+here. These three are partial measurements, not a corpus figure.
+
+**Scope of the correction, so it is not over-read:** no real C pointer parameter
+is excluded, so M1's impl/trait scope ruling still costs nothing *substantive*.
+Wrong were **the number** and **the stated reason** — nothing else. What the
+exclusion census counts on this corpus is largely **derive-generated
+receivers**, a reporting artifact of the R-A predicate widening; it does not
+measure excluded C pointer parameters, and must not be read as doing so.
+
+Same root cause as the 892-checkpoint's seventh failure (`&self` is a pointer
+parameter by the shared predicate's definition). That was recorded for fixtures;
+its corpus-scale consequence went unmeasured because nothing had run `classify`
+over the corpus until the Slice 0 spike.
+
+**On the record:** the dead inference also passed the review gate uncontested —
+a shared miss, carried on the reviewer's ledger as well as this one.
 
 **Not re-measured, still UNVERIFIED:** the foreign-declaration count (prior
 figure 2039). `run_m1_census` reports the collector's own subjects; the
@@ -79,14 +118,28 @@ reproducible from the repository.
 in-tree code path, with its invocation recorded beside it. Scratchpad
 reimplementations are banned as a source for ledger figures.
 
-The `0 impl / 0 trait` rows survive as corroborated, because they rest on a
+~~The `0 impl / 0 trait` rows survive as corroborated, because they rest on a
 direct grep (`0` impl blocks in 290 `.rs` files under `benchmarks/rs-crown`)
-rather than on a reimplementation.
+rather than on a reimplementation.~~
 
-**The impl/trait exclusion is stated-and-vacuous on this corpus** — zero across
-all 20 programs — so the ruling costs nothing measurable here. The foreign
-population is the M4 boundary and is correctly excluded; its count is owed a
-re-measurement (see above) rather than carried forward from the retired scan.
+~~**The impl/trait exclusion is stated-and-vacuous on this corpus** — zero across
+all 20 programs — so the ruling costs nothing measurable here.~~
+
+**Both struck 2026-07-29 — see the CORRECTION above.** `impl_items` is non-zero
+(lil 9, binn 3, lodepng 19, partial); the exclusion is **not** vacuous, and the
+grep could not have detected that because derive-generated impls never appear in
+source text. `trait_items = 0` survives, measured rather than inferred.
+
+A second lesson for the census discipline, since this row satisfied it and was
+still wrong: *"a recorded number comes from a committed, in-tree code path"* is
+necessary, not sufficient. **A number may not be inferred from a different
+instrument than the one that will report it** — the grep measured source text
+while the classifier measures HIR, and the gap between them is exactly where
+macro expansion lives.
+
+The foreign population is the M4 boundary and is correctly excluded; its count
+is **owed**, to be discharged at C.6 from the same `classify` invocation with
+the invocation recorded beside it. No interim scratch figure enters this ledger.
 
 **Exclusions now reach a consumer.** They ride out on `RewriteOutcome`, which is
 what makes the "visible as a number rather than as an absence" claim true of a
