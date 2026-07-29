@@ -98,10 +98,42 @@ over the corpus until the Slice 0 spike.
 **On the record:** the dead inference also passed the review gate uncontested —
 a shared miss, carried on the reviewer's ledger as well as this one.
 
-**Not re-measured, still UNVERIFIED:** the foreign-declaration count (prior
-figure 2039). `run_m1_census` reports the collector's own subjects; the
-`Excluded` census reaches `RewriteOutcome` but no corpus mode emits it yet.
-Recorded as owed rather than carried forward as a fact.
+### Exclusion census — DISCHARGED at S2a-H/C.6 (2026-07-29)
+
+The owed numbers, measured by the shipping `universe::classify` from the same
+invocation as the reconciliation. **All 20 programs — tulipindicators did NOT
+resource-defer** (150 s; the recon path is analysis-free, so the standing
+deferral does not apply to it):
+
+```
+DYLD_LIBRARY_PATH="$(rustc --print sysroot)/lib" \
+CRAT_BOC1_INPUT=benchmarks/rs-crown/<prog>/<lib.rs|c2rust-lib.rs> \
+CRAT_BOC1_MODE=m1-recon CRAT_BOC1_NAME=<prog> \
+CRAT_BOC1_ARTIFACT_DIR=<dir> DIR=<worktree> \
+  <test-bin> bo_c1::boc1_run_one --exact --ignored --nocapture
+```
+
+| class | count (20 programs) |
+|---|---|
+| subjects (producer A rows) | **4306** |
+| producer B rows | **4306** — identical |
+| excluded: impl items | **522** |
+| excluded: trait items | **0** |
+| excluded: foreign (`extern` decls) | **2058** |
+
+**The retired figure was 2039 foreign**; the measured value is **2058**. The
+old scan was low by 19, and it also could not see the 522 impl-item receivers
+at all.
+
+**Read `excluded: impl = 522` correctly.** It is overwhelmingly
+**derive-generated receivers** — `&self` on `Clone`/`Copy` impls that C2Rust
+emits and that no text grep can see — not excluded C pointer parameters. The
+corpus still has **0 source-written `impl` blocks**. This row measures what the
+R-A predicate counts, and the predicate counts `TyKind::Ref`.
+
+**Reconciliation result, same run: 20/20 PASS.** Zero violations, zero
+findings, all three finding-class aggregates zero, and producer A's and
+producer B's row counts identical on every program.
 
 ### Why the previous census was retired
 
