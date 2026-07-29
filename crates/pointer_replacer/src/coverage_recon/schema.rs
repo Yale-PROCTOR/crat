@@ -101,10 +101,24 @@ pub(crate) struct Row {
     pub mir_local: u32,
     /// Pairing term 1. `None` for an unnamed parameter.
     pub param_name: Option<String>,
-    /// Pairing term 2. **1-based**, matching `VarDebugInfo::argument_index` and
-    /// MIR's parameter locals. Producer A records its own HIR position + 1 —
-    /// derived independently of its `mir_local`, so the field is not a restatement
-    /// of the alignment key.
+    /// Pairing term 2.
+    ///
+    /// # The basis is PINNED HERE: **1-BASED**
+    ///
+    /// This doc comment is normative for both producers; the design document is
+    /// descriptive of it. Matching `VarDebugInfo::argument_index` and MIR's
+    /// parameter locals means the **reference side stays transformation-free** —
+    /// producer B emits `argument_index` verbatim, and producer A converts
+    /// (`hir_index + 1`). The side that transforms is the one whose native basis
+    /// differs, and that is the collector, not the reference.
+    ///
+    /// Two bases would not degrade gracefully: they would fail *every* row's
+    /// pairing at first contact, a systematic off-by-one presenting as total
+    /// disagreement.
+    ///
+    /// Producer A derives this from its recorded HIR position, **never from
+    /// `mir_local`** — a pairing field that restates the alignment key can never
+    /// disagree with it, which is what F1 was.
     pub arg_index: Option<u32>,
     /// Pointer-chain depth of the resolved parameter type.
     pub ptr_depth: u8,
