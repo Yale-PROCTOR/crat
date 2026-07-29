@@ -48,49 +48,107 @@ fn collect_rs_files(dir: &Path, out: &mut Vec<std::path::PathBuf>) {
     }
 }
 
+/// Scan every `.rs` file under `root`, reporting one entry per offending line.
+///
+/// # The F3 repair, applied once for every scan in this file
+///
+/// A scan whose accumulation is exercised **only** by the production call has
+/// no witness for its own wiring: on clean sources it returns empty, so
+/// deleting the accumulation is invisible — the suite stays green and the rule
+/// silently stops being enforced. That defect was found in the R-C `if let`
+/// scan, then reproduced by its author in the `coverage_recon` rule one slice
+/// later, and the audit found it in two more. Four instances is a pattern, not
+/// four mistakes.
+///
+/// The repair is structural: **the production checks and their
+/// synthetic-corpus witnesses call this same function.** A synthetic corpus
+/// containing a real violation drives the same accumulate path the production
+/// call uses, so deleting that path fails a standing test.
+///
+/// Comments are skipped here, uniformly: a comment cannot import, and
+/// documentation has to be able to name what a rule forbids in order to
+/// explain it.
+fn scan_root(
+    root: &Path,
+    skip: &dyn Fn(&Path) -> bool,
+    offense: &dyn Fn(&str) -> Option<String>,
+) -> Vec<String> {
+    let mut files = Vec::new();
+    collect_rs_files(root, &mut files);
+    assert!(
+        !files.is_empty(),
+        "no .rs files found under {root:?} — the scan would pass vacuously"
+    );
+    let mut hits = Vec::new();
+    for file in &files {
+        if skip(file) {
+            continue;
+        }
+        let text = fs::read_to_string(file)
+            .unwrap_or_else(|e| panic!("source unreadable at {file:?}: {e}"));
+        for (index, line) in text.lines().enumerate() {
+            if is_comment(line) {
+                continue;
+            }
+            if let Some(detail) = offense(line) {
+                hits.push(format!(
+                    "{}:{}: {detail}",
+                    file.strip_prefix(root).unwrap_or(file).display(),
+                    index + 1
+                ));
+            }
+        }
+    }
+    hits
+}
+
+/// Write a throwaway source tree and return its root.
+///
+/// This is what makes the scans' accumulation witnessable: a corpus that
+/// genuinely violates the rule, fed to the production scan function.
+///
+/// Callers clean up with [`drop_corpus`] **after** their assertions, so a
+/// FAILING test leaves its corpus on disk to be inspected. The pid in the path
+/// keeps concurrent `cargo test` processes from colliding on a shared tag.
+#[cfg(test)]
+fn temp_corpus(tag: &str, files: &[(&str, &str)]) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!(
+        "crat-denylist-{}-{tag}",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).expect("create temp corpus");
+    for (name, body) in files {
+        let path = dir.join(name);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).expect("create temp corpus subdir");
+        }
+        fs::write(&path, body).expect("write temp source");
+    }
+    dir
+}
+
+/// A line referencing the frozen `rewriter` tree, or `None`.
+fn frozen_rewriter_offense(line: &str) -> Option<String> {
+    FORBIDDEN
+        .iter()
+        .find(|needle| line.contains(**needle))
+        .map(|needle| format!("matched {needle:?} in: {}", line.trim()))
+}
+
 /// Every `.rs` file under `bo_rewriter/` must be free of any reference to the
 /// frozen `rewriter` tree.
 #[test]
 fn bo_rewriter_never_references_the_frozen_rewriter() {
     let root = module_root();
-    let mut files = Vec::new();
-    collect_rs_files(root, &mut files);
-
-    // Fail loudly rather than vacuously: an empty scan would "pass" while
-    // checking nothing, which is exactly how this class of test rots.
-    assert!(
-        !files.is_empty(),
-        "no .rs files found under {root:?} — the denylist scan would pass vacuously"
+    // This file necessarily *spells* the forbidden fragments — in `FORBIDDEN`
+    // and in its fixtures — so it cannot scan itself without indicting its own
+    // implementation.
+    let breaches = scan_root(
+        root,
+        &|file| is_denylist_self_reference(file, root),
+        &frozen_rewriter_offense,
     );
-
-    let mut breaches = Vec::new();
-    for file in &files {
-        // This file necessarily *spells* the forbidden fragments — in its
-        // `FORBIDDEN` table and in the synthetic-breach fixture — so it cannot
-        // scan itself without indicting its own implementation.
-        if is_denylist_self_reference(file, root) {
-            continue;
-        }
-        let text = fs::read_to_string(file)
-            .unwrap_or_else(|e| panic!("bo_rewriter source unreadable at {file:?}: {e}"));
-        for (lineno, line) in text.lines().enumerate() {
-            // Comments cannot import. Documentation is expected to name the
-            // frozen tree in order to explain the rule, so scanning comments
-            // would make the module undocumentable.
-            if is_comment(line) {
-                continue;
-            }
-            if let Some(needle) = FORBIDDEN.iter().find(|needle| line.contains(**needle)) {
-                breaches.push(format!(
-                    "{}:{}: matched {:?} in: {}",
-                    file.display(),
-                    lineno + 1,
-                    needle,
-                    line.trim()
-                ));
-            }
-        }
-    }
 
     assert!(
         breaches.is_empty(),
@@ -218,51 +276,62 @@ fn phases_obey_their_import_rules() {
             "phase directory {dir:?} is missing — the phase separation is part of \
              the architecture, not an optional layout"
         );
-        let mut files = Vec::new();
-        collect_rs_files(&dir, &mut files);
+        let hits = scan_phase(&dir, rule);
         assert!(
-            !files.is_empty(),
-            "no .rs files under {dir:?}; this check would pass vacuously"
+            hits.is_empty(),
+            "phase `{}` violates its import rule.\n{}\n{}",
+            rule.phase,
+            rule.why,
+            hits.join("\n")
         );
-        for file in &files {
-            let text = fs::read_to_string(file)
-                .unwrap_or_else(|e| panic!("unreadable phase source {file:?}: {e}"));
-            let name = file.file_name().unwrap_or_default().to_string_lossy().into_owned();
+    }
+}
 
-            // (a) IMPORTS — resolved from the use-tree, so a brace-merged form
-            // is matched on its full path rather than on the text of one line.
-            for path in imported_paths(&text) {
-                for fragment in rule.forbidden {
-                    assert!(
-                        !path.contains(fragment),
-                        "{}/{name} imports {path:?}, which contains {fragment:?} \
-                         and this phase may not import it.\n{}",
-                        rule.phase,
-                        rule.why
-                    );
+/// One phase directory's violations. Extracted for the same reason as
+/// [`scan_root`]: asserting inline left this scan's accumulation unwitnessed,
+/// so deleting it would have gone unnoticed on clean sources.
+fn scan_phase(dir: &Path, rule: &PhaseRule) -> Vec<String> {
+    let mut files = Vec::new();
+    collect_rs_files(dir, &mut files);
+    assert!(
+        !files.is_empty(),
+        "no .rs files under {dir:?}; this check would pass vacuously"
+    );
+    let mut hits = Vec::new();
+    for file in &files {
+        let text = fs::read_to_string(file)
+            .unwrap_or_else(|e| panic!("unreadable phase source {file:?}: {e}"));
+        let name = file.file_name().unwrap_or_default().to_string_lossy().into_owned();
+
+        // (a) IMPORTS — resolved from the use-tree, so a brace-merged form is
+        // matched on its full path rather than on the text of one line.
+        for path in imported_paths(&text) {
+            for fragment in rule.forbidden {
+                if path.contains(fragment) {
+                    hits.push(format!("{name}: imports {path:?} containing {fragment:?}"));
                 }
             }
+        }
 
-            // (b) NON-IMPORT references — an inline path expression such as
-            // `crate::rewriter::f()` is not a use-tree, so the textual scan is
-            // still needed. It is sound HERE because a path expression cannot be
-            // split across lines by the formatter the way a use-tree can.
-            for (lineno, line) in text.lines().enumerate() {
-                if is_comment(line) || line.trim_start().starts_with("use ") {
-                    continue;
-                }
-                for fragment in rule.forbidden {
-                    assert!(
-                        !line.contains(fragment),
-                        "{}/{name} line {} names {fragment:?} outside an import.\n{}",
-                        rule.phase,
-                        lineno + 1,
-                        rule.why
-                    );
+        // (b) NON-IMPORT references — an inline path expression such as
+        // `crate::rewriter::f()` is not a use-tree, so the textual scan is still
+        // needed. It is sound HERE because a path expression cannot be split
+        // across lines by the formatter the way a use-tree can.
+        for (lineno, line) in text.lines().enumerate() {
+            if is_comment(line) || line.trim_start().starts_with("use ") {
+                continue;
+            }
+            for fragment in rule.forbidden {
+                if line.contains(fragment) {
+                    hits.push(format!(
+                        "{name}:{}: names {fragment:?} outside an import",
+                        lineno + 1
+                    ));
                 }
             }
         }
     }
+    hits
 }
 
 /// Every per-phase rule must actually fire on a breach.
@@ -477,29 +546,11 @@ fn matcher_resolves_the_existing_merged_import_in_mod_rs() {
 #[test]
 fn witnesses_never_inspect_an_outcome_with_a_bare_if_let() {
     let root = module_root();
-    let mut files = Vec::new();
-    collect_rs_files(root, &mut files);
-    assert!(!files.is_empty(), "no sources scanned");
-
-    let mut violations = Vec::new();
-    for file in &files {
-        if is_denylist_self_reference(file, root) {
-            continue;
-        }
-        let text = fs::read_to_string(file).expect("source file is readable");
-        for (index, line) in text.lines().enumerate() {
-            if is_comment(line) {
-                continue;
-            }
-            if let Some(offense) = if_let_offense(line) {
-                violations.push(format!(
-                    "{}:{}: {offense}",
-                    file.strip_prefix(root).unwrap_or(file).display(),
-                    index + 1
-                ));
-            }
-        }
-    }
+    let violations = scan_root(
+        root,
+        &|file| is_denylist_self_reference(file, root),
+        &if_let_offense,
+    );
 
     assert!(
         violations.is_empty(),
@@ -512,7 +563,7 @@ fn witnesses_never_inspect_an_outcome_with_a_bare_if_let() {
 }
 
 /// The banned shape on one line, or `None`.
-fn if_let_offense(line: &str) -> Option<&'static str> {
+fn if_let_offense(line: &str) -> Option<String> {
     let trimmed = line.trim_start();
     if !trimmed.starts_with("if let ") {
         return None;
@@ -520,7 +571,7 @@ fn if_let_offense(line: &str) -> Option<&'static str> {
     if !trimmed.contains("RewriteOutcome::") {
         return None;
     }
-    Some("bare `if let` on a RewriteOutcome")
+    Some("bare `if let` on a RewriteOutcome".to_owned())
 }
 
 /// The R-C check must reject a real violation, not merely pass on clean code.
@@ -583,30 +634,7 @@ fn coverage_recon_never_imports_from_bo_rewriter() {
         .parent()
         .expect("bo_rewriter has a parent")
         .join("coverage_recon");
-    let mut files = Vec::new();
-    collect_rs_files(&root, &mut files);
-    assert!(
-        !files.is_empty(),
-        "no coverage_recon sources scanned at {root:?} — the rule would pass \
-         vacuously"
-    );
-
-    let mut violations = Vec::new();
-    for file in &files {
-        let text = fs::read_to_string(file).expect("source file is readable");
-        for (index, line) in text.lines().enumerate() {
-            if is_comment(line) {
-                continue;
-            }
-            if let Some(offense) = bo_rewriter_reference(line) {
-                violations.push(format!(
-                    "{}:{}: {offense}",
-                    file.strip_prefix(&root).unwrap_or(file).display(),
-                    index + 1
-                ));
-            }
-        }
-    }
+    let violations = scan_root(&root, &|_| false, &bo_rewriter_reference);
     assert!(
         violations.is_empty(),
         "coverage_recon must not reference bo_rewriter — producer B's \
@@ -616,9 +644,9 @@ fn coverage_recon_never_imports_from_bo_rewriter() {
 }
 
 /// A reference to `bo_rewriter` on one line, or `None`.
-fn bo_rewriter_reference(line: &str) -> Option<&'static str> {
+fn bo_rewriter_reference(line: &str) -> Option<String> {
     if line.contains("bo_rewriter") {
-        return Some("reference to bo_rewriter");
+        return Some("reference to bo_rewriter".to_owned());
     }
     None
 }
@@ -641,4 +669,130 @@ fn coverage_recon_rule_matches_a_synthetic_breach() {
         bo_rewriter_reference("use crate::analyses::borrow_ownership::SlotKind;").is_none(),
         "an unrelated import must not be flagged"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Slice D — synthetic-corpus witnesses: every scan's ACCUMULATION is exercised
+// ---------------------------------------------------------------------------
+//
+// Before these, each rule had a "synthetic breach" test that exercised only its
+// MATCHER (`FORBIDDEN.contains`, `if_let_offense`, `bo_rewriter_reference`) and
+// never the scan that calls it. On clean sources the scans return empty, so the
+// accumulation could be deleted with the whole suite still green — verified, at
+// 912/6 unchanged, for the `coverage_recon` rule.
+//
+// Each test below feeds a corpus that genuinely violates its rule to the SAME
+// scan function the production check uses, plus a clean file so the assertion
+// is not satisfied by indiscriminate matching.
+
+/// **Frozen-rewriter scan** reports a real violation in a real corpus.
+///
+/// *Mutation-tested (Rider 0, deletion first):* deleting the `hits.push(...)`
+/// in [`scan_root`] fails this.
+#[test]
+fn frozen_rewriter_scan_reports_a_synthetic_corpus_violation() {
+    let dir = temp_corpus(
+        "frozen",
+        &[
+            ("bad.rs", "use crate::rewriter::decision::PtrKind;\n"),
+            ("good.rs", "use crate::analyses::borrow_ownership::SlotKind;\n"),
+        ],
+    );
+    let hits = scan_root(&dir, &|_| false, &frozen_rewriter_offense);
+    assert_eq!(hits.len(), 1, "expected exactly the one violation: {hits:?}");
+    assert!(hits[0].starts_with("bad.rs:1:"), "{hits:?}");
+    drop_corpus(&dir);
+}
+
+/// **R-C `if let` scan** reports a real violation in a real corpus.
+///
+/// This is the F3 repair proper: the rule's previous witness called
+/// `if_let_offense` directly and never touched the scan.
+///
+/// *Mutation-tested (Rider 0, deletion first):* deleting the `hits.push(...)`
+/// in [`scan_root`] fails this.
+#[test]
+fn if_let_scan_reports_a_synthetic_corpus_violation() {
+    let dir = temp_corpus(
+        "iflet",
+        &[
+            (
+                "bad.rs",
+                "fn t() {\n    if let RewriteOutcome::Degraded { .. } = out {}\n}\n",
+            ),
+            ("good.rs", "fn t() {\n    match out {\n        _ => {}\n    }\n}\n"),
+        ],
+    );
+    let hits = scan_root(&dir, &|_| false, &if_let_offense);
+    assert_eq!(hits.len(), 1, "expected exactly the one violation: {hits:?}");
+    assert!(hits[0].starts_with("bad.rs:2:"), "{hits:?}");
+    drop_corpus(&dir);
+}
+
+/// **`coverage_recon` one-way rule** reports a real violation in a real corpus.
+///
+/// The instance this author introduced one slice after diagnosing the pattern.
+///
+/// *Mutation-tested (Rider 0, deletion first):* deleting the `hits.push(...)`
+/// in [`scan_root`] fails this.
+#[test]
+fn coverage_recon_scan_reports_a_synthetic_corpus_violation() {
+    let dir = temp_corpus(
+        "recon",
+        &[
+            ("bad.rs", "use crate::bo_rewriter::decision::Subject;\n"),
+            ("good.rs", "use super::schema::Row;\n"),
+        ],
+    );
+    let hits = scan_root(&dir, &|_| false, &bo_rewriter_reference);
+    assert_eq!(hits.len(), 1, "expected exactly the one violation: {hits:?}");
+    assert!(hits[0].starts_with("bad.rs:1:"), "{hits:?}");
+    drop_corpus(&dir);
+}
+
+/// **Per-phase scan** reports a real violation in a real corpus, in BOTH of its
+/// detection modes — the resolved use-tree and the inline path expression.
+///
+/// The fourth instance of the pattern, found by Slice D's audit rather than
+/// named in its scope.
+///
+/// *Mutation-tested (Rider 0, deletion first):* deleting either `hits.push(...)`
+/// in [`scan_phase`] fails this — the two assertions below separate the modes,
+/// so neither deletion hides behind the other.
+#[test]
+fn phase_scan_reports_a_synthetic_corpus_violation() {
+    let rule = PhaseRule {
+        phase: "synthetic",
+        forbidden: &["crate::analyses"],
+        why: "synthetic rule for the witness",
+    };
+    let dir = temp_corpus(
+        "phase",
+        &[
+            ("bad_import.rs", "use crate::analyses::borrow_ownership::SlotKind;\n"),
+            ("bad_path.rs", "fn f() {\n    let _ = crate::analyses::thing();\n}\n"),
+            ("good.rs", "use super::schema::Row;\n"),
+        ],
+    );
+    let hits = scan_phase(&dir, &rule);
+    assert!(
+        hits.iter().any(|h| h.starts_with("bad_import.rs: imports")),
+        "the use-tree mode did not report its violation: {hits:?}"
+    );
+    assert!(
+        hits.iter().any(|h| h.starts_with("bad_path.rs:2:")),
+        "the inline-path mode did not report its violation: {hits:?}"
+    );
+    assert!(
+        !hits.iter().any(|h| h.starts_with("good.rs")),
+        "a clean file was reported: {hits:?}"
+    );
+    drop_corpus(&dir);
+}
+
+/// Remove a temp corpus. Called only after assertions pass, so a failing test
+/// leaves its inputs on disk.
+#[cfg(test)]
+fn drop_corpus(dir: &Path) {
+    let _ = fs::remove_dir_all(dir);
 }
