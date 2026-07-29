@@ -17,14 +17,31 @@ makes the gate falsifiable: the two previous forms both compared the decision
 table against the collector's own output, and the second only *looked*
 independent because it re-walked `program.functions` with the same filter.
 
-### Census on frozen rs-crown (read-only, syn walk)
+### Census on frozen rs-crown — **UNVERIFIED, pending re-run** (2026-07-29)
 
-| class | count |
-|---|---|
-| **subjects** (free-fn pointer params) | **4171** |
-| excluded: impl methods | **0** |
-| excluded: trait items | **0** |
-| excluded: foreign (`extern` decls) | **2039** |
+| class | count | status |
+|---|---|---|
+| **subjects** (free-fn pointer params) | 4171 | **UNVERIFIED** |
+| excluded: impl methods | 0 | corroborated by direct grep |
+| excluded: trait items | 0 | corroborated by direct grep |
+| excluded: foreign (`extern` decls) | 2039 | **UNVERIFIED** |
+
+**Why unverified.** These came from a scratchpad `syn` walk, not from the
+shipping `universe::classify`. The walk applied the same syntactic
+`*mut`/`*const` test as the classifier, so it **inherited the classifier's blind
+spot** and could not have detected it — and the alias-typed population
+(`pub type lil_value_t = *mut _lil_value_t`) is exactly what that blind spot
+hides. A census that shares the classifier's blind spot cannot validate the
+classifier. The script was also never committed, so the numbers are not
+reproducible from the repository.
+
+**Census discipline, now standing:** a recorded number comes from a committed,
+in-tree code path, with its invocation recorded beside it. Scratchpad
+reimplementations are banned as a source for ledger figures.
+
+The `0 impl / 0 trait` rows survive as corroborated, because they rest on a
+direct grep (`0` impl blocks in 290 `.rs` files under `benchmarks/rs-crown`)
+rather than on a reimplementation.
 
 **The impl/trait exclusion is stated-and-vacuous on this corpus** — zero across
 all 20 programs — so the ruling costs nothing measurable here. The foreign
