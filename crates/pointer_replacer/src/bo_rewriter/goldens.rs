@@ -48,9 +48,9 @@ use super::{RewriteOutcome, rewrite_m1};
 
 /// One golden pair, embedded at compile time so the test binary is
 /// self-contained.
-struct Golden {
-    name: &'static str,
-    input: &'static str,
+pub(super) struct Golden {
+    pub(super) name: &'static str,
+    pub(super) input: &'static str,
     expected: &'static str,
 }
 
@@ -64,7 +64,7 @@ macro_rules! goldens {
     };
 }
 
-const GOLDENS: &[Golden] = goldens![
+pub(super) const GOLDENS: &[Golden] = goldens![
     "g01_ref_mut",
     "g02_opt_ref",
     "g03_ref_shared",

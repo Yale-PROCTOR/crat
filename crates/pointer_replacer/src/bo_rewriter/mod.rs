@@ -132,61 +132,7 @@ pub(crate) enum RewriteOutcome {
 pub(crate) fn rewrite_m1(input: &str) -> RewriteOutcome {
     let owned = input.to_owned();
     let result = ::utils::compilation::run_compiler_on_str(input, move |tcx| {
-        let program = collect_program(tcx);
-        let slots = CrateSlots::build(&program);
-        let mut_facts = MutFacts::from_program(&program);
-
-        // Phase 1 input: the BO run, under an explicit capture scope.
-        let (model, _export) = with_bo_export(|| {
-            let crate_ctxt = CrateCtxt::new(&program);
-            let solver = KindSolver::new(&slots);
-            let Ok((_stats, selectors)) = emit_crate_ownership_constraints(
-                &crate_ctxt,
-                &slots,
-                &compute_origins(&program),
-                &solver,
-            ) else {
-                return None;
-            };
-            for &g in &program.functions {
-                let body = tcx.mir_drops_elaborated_and_const_checked(g).borrow();
-                add_coherence(&solver, &slots, g, &body);
-            }
-            verify_to_fixpoint(&program, &slots, &solver, &selectors, &mut_facts)
-        });
-        let Some(model) = model else {
-            return Err("BO declined — no accepted model".to_owned());
-        };
-
-        let subjects = collect_subjects(tcx, &program, &mut_facts);
-        let facts = decision::emitability::collect(tcx, &program.functions);
-        let mut table = decision::decide(tcx, &subjects, &model, &slots, &facts);
-
-        // Structural self-check: the table matches the subjects it was handed.
-        // NOT the coverage gate — every comparison in it is against the
-        // collector's own output.
-        if let Err(why) = table.is_self_consistent_over(&subjects) {
-            return Err(format!("decision table self-consistency: {why}"));
-        }
-
-        // The coverage gate proper: two axes, two references, sets not counts.
-        // Reference surplus becomes attributed degradations (R-B); collector
-        // surplus fails loudly inside `reconcile`.
-        let universe = decision::universe::classify(tcx);
-        let mut arg_counts = FxHashMap::default();
-        for &g in &program.functions {
-            let body = tcx.mir_drops_elaborated_and_const_checked(g).borrow();
-            arg_counts.insert(g, body.arg_count);
-        }
-        let reconciliation = decision::coverage::reconcile(
-            tcx,
-            &program.functions,
-            &subjects,
-            &slots,
-            &arg_counts,
-            &universe,
-        );
-        table.coverage_gaps = reconciliation.gaps;
+        let table = decide_table(tcx)?;
 
         let source_map = tcx.sess.source_map();
         let plan = plan::plan(&table, &owned, |span| {
@@ -209,7 +155,7 @@ pub(crate) fn rewrite_m1(input: &str) -> RewriteOutcome {
             applied.source,
             degradations,
             table.emitted_count(),
-            universe.excluded,
+            decision::universe::classify(tcx).excluded,
         ))
     });
 
@@ -430,4 +376,88 @@ fn param_name(param: &rustc_hir::Param<'_>) -> Option<String> {
         rustc_hir::PatKind::Binding(_, _, ident, _) => Some(ident.name.to_string()),
         _ => None,
     }
+}
+
+/// The analysis front-end: everything from BO's model to a finished decision
+/// table, with the structural self-check and the coverage gate applied.
+///
+/// Extracted so producer A's artifact is reachable without a second copy of the
+/// pipeline — and, deliberately, **without moving any comparison into this
+/// module**. `bo_rewriter` emits; `coverage_recon` compares.
+fn decide_table<'tcx>(tcx: TyCtxt<'tcx>) -> Result<decision::DecisionTable, String> {
+    let program = collect_program(tcx);
+    let slots = CrateSlots::build(&program);
+    let mut_facts = MutFacts::from_program(&program);
+
+    // Phase 1 input: the BO run, under an explicit capture scope.
+    let (model, _export) = with_bo_export(|| {
+        let crate_ctxt = CrateCtxt::new(&program);
+        let solver = KindSolver::new(&slots);
+        let Ok((_stats, selectors)) = emit_crate_ownership_constraints(
+            &crate_ctxt,
+            &slots,
+            &compute_origins(&program),
+            &solver,
+        ) else {
+            return None;
+        };
+        for &g in &program.functions {
+            let body = tcx.mir_drops_elaborated_and_const_checked(g).borrow();
+            add_coherence(&solver, &slots, g, &body);
+        }
+        verify_to_fixpoint(&program, &slots, &solver, &selectors, &mut_facts)
+    });
+    let Some(model) = model else {
+        return Err("BO declined — no accepted model".to_owned());
+    };
+
+    let subjects = collect_subjects(tcx, &program, &mut_facts);
+    let facts = decision::emitability::collect(tcx, &program.functions);
+    let mut table = decision::decide(tcx, &subjects, &model, &slots, &facts);
+
+    // Structural self-check: the table matches the subjects it was handed. NOT
+    // the coverage gate — every comparison in it is against the collector's own
+    // output.
+    if let Err(why) = table.is_self_consistent_over(&subjects) {
+        return Err(format!("decision table self-consistency: {why}"));
+    }
+
+    // The in-process gate. Superseded by the harness reconciliation and deleted
+    // at C.2; during this window it carries NO evidentiary weight, being the
+    // instrument the escalation indicted.
+    let universe = decision::universe::classify(tcx);
+    let mut arg_counts = FxHashMap::default();
+    for &g in &program.functions {
+        let body = tcx.mir_drops_elaborated_and_const_checked(g).borrow();
+        arg_counts.insert(g, body.arg_count);
+    }
+    let reconciliation = decision::coverage::reconcile(
+        tcx,
+        &program.functions,
+        &subjects,
+        &slots,
+        &arg_counts,
+        &universe,
+    );
+    table.coverage_gaps = reconciliation.gaps;
+    Ok(table)
+}
+
+/// **Producer A's artifact** for the crate in `tcx`.
+///
+/// The reconciliation's caller lives outside this module; this only emits.
+pub(crate) fn artifact_rows(
+    tcx: TyCtxt<'_>,
+) -> Result<Vec<crate::coverage_recon::schema::Row>, String> {
+    decide_table(tcx).map(|table| artifact::rows(tcx, &table))
+}
+
+/// The golden inputs, for the out-of-module reconciliation harness (C.1).
+///
+/// Exposed as `(name, source)` pairs rather than by making `goldens` public:
+/// the harness needs the INPUTS, not the golden machinery, and a narrower
+/// surface is a narrower coupling.
+#[cfg(test)]
+pub(crate) fn goldens_for_reconciliation() -> Vec<(&'static str, &'static str)> {
+    goldens::GOLDENS.iter().map(|g| (g.name, g.input)).collect()
 }
