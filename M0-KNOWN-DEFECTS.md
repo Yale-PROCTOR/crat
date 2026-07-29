@@ -29,17 +29,23 @@ CRAT_BOC1_MODE=m1-census CRAT_BOC1_NAME=<prog> DIR=<worktree> \
   <test-bin> bo_c1::boc1_run_one --exact --ignored --nocapture
 ```
 
-19 of 20 programs. **tulipindicators is resource-deferred** by the standing
-benchmark-scope ruling (SLOC > brotli), so it is absent from these totals.
+**All 20 programs.** First recorded at 19, with tulipindicators excluded under
+the standing resource-deferral; C.6 then showed that deferral does not apply
+here — it was set for **solver-backed** runs, and this path is analysis-free.
+tulipindicators completes the census in **0.3 s** (and the full reconciliation
+in 150 s). Re-measured and completed rather than left as a documented gap.
 
 | quantity | count |
 |---|---|
-| subjects, resolved predicate (`ptr_chain_depth > 0`) | **3872** |
-| of which the retired SYNTACTIC `TyKind::Ptr` predicate saw | 3737 |
+| subjects, resolved predicate (`ptr_chain_depth > 0`) | **4306** |
+| of which the retired SYNTACTIC `TyKind::Ptr` predicate saw | 4171 |
 | **resolved-only — invisible to the retired predicate** | **135** |
 | …declared through a path (the C2Rust alias class) | 135 |
 | …already a reference in source | 0 |
 | …some other declaration form | 0 |
+
+tulipindicators contributes **434 subjects, all syntactic** — 0 alias, 0
+reference — so it moves the totals without changing the alias finding.
 
 **The alias population is 135, concentrated in two programs** — lil 117,
 brotli 18; every other program is 0. This is the delta §1.3 called an
@@ -53,7 +59,7 @@ balanced-paren text scan and over-counted by 19 (12%).
 Corpus-neutrality note, since R-A widened the predicate's meaning: adopting
 `ptr_chain_depth` brings already-reference parameters into the subject universe
 (it counts `TyKind::Ref` as depth-bearing). On this corpus that widening is
-**worth exactly zero** — `reference = 0` in all 19 programs. It is visible only
+**worth exactly zero** — `reference = 0` in all 20 programs. It is visible only
 in fixtures with an `&self` receiver.
 
 ### CORRECTION 2026-07-29 — the `impl = 0` row is FALSIFIED
