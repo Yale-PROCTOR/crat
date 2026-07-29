@@ -26,7 +26,6 @@ use rustc_span::Span;
 
 use crate::analyses::borrow_ownership::{SlotKind, crate_slots::CrateSlots, solver::SlotRef};
 
-pub(crate) mod coverage;
 pub(crate) mod emitability;
 pub(crate) mod universe;
 
@@ -149,13 +148,6 @@ pub(crate) enum DegradeReason {
     /// conflating it with the collection fix would repeat this milestone's
     /// pattern of bundling.
     NonPointerDecl { shape: &'static str },
-    /// A reference instrument saw a pointer parameter that the collector never
-    /// produced a subject for. **R-B: this direction is a coverage gap**, not a
-    /// contract violation — loud in the counters, run continues, because a
-    /// parameter the collector cannot see is exactly a subject that should be
-    /// recorded as unhandled. (The other direction — a subject no reference
-    /// knows — is a mapping bug and fails loudly; see [`coverage`].)
-    OutOfCoverage { reference: &'static str },
 }
 
 impl DegradeReason {
@@ -175,7 +167,6 @@ impl DegradeReason {
             DegradeReason::PtrComparison => "ptr-comparison",
             DegradeReason::NoSlot => "no-slot",
             DegradeReason::NonPointerDecl { .. } => "non-pointer-decl",
-            DegradeReason::OutOfCoverage { .. } => "out-of-coverage",
         }
     }
 }
@@ -206,13 +197,6 @@ pub(crate) enum Decision {
 #[derive(Clone, Debug, Default)]
 pub(crate) struct DecisionTable {
     pub entries: Vec<(Subject, Decision)>,
-    /// Coverage gaps from [`coverage::reconcile`]: pointer parameters a
-    /// reference instrument saw and the collector never produced a subject for.
-    ///
-    /// They are not entries — there is no `Subject` to pair them with, which is
-    /// precisely the defect they record — but they **are** degradations, so
-    /// [`Self::degradations`] yields them and the S2b counters will see them.
-    pub coverage_gaps: Vec<Degradation>,
 }
 
 impl DecisionTable {
@@ -256,17 +240,15 @@ impl DecisionTable {
 
     /// The envelope-demotion records. S2b aggregates these into the counters.
     ///
-    /// Coverage gaps are included: a parameter no subject was built for is an
-    /// unhandled parameter, and reporting it anywhere other than alongside the
-    /// ordinary degradations would let it be filtered out of the counters.
+    /// C.2: coverage gaps no longer live here. A parameter no subject was
+    /// built for is now detected by the harness reconciliation as a
+    /// producer-B-only row, which is a property of the ARTIFACTS rather than of
+    /// this table — and S2b's coverage-class counters consume those artifacts.
     pub(crate) fn degradations(&self) -> impl Iterator<Item = &Degradation> {
-        self.entries
-            .iter()
-            .filter_map(|(_, d)| match d {
-                Decision::Degraded(record) => Some(record),
-                Decision::Ref { .. } => None,
-            })
-            .chain(self.coverage_gaps.iter())
+        self.entries.iter().filter_map(|(_, d)| match d {
+            Decision::Degraded(record) => Some(record),
+            Decision::Ref { .. } => None,
+        })
     }
 
     /// Subjects the table decided to emit.
@@ -299,10 +281,7 @@ pub(crate) fn decide(
             (subject.clone(), decision)
         })
         .collect();
-    DecisionTable {
-        entries,
-        coverage_gaps: Vec::new(),
-    }
+    DecisionTable { entries }
 }
 
 fn degrade(subject: &Subject, site: String, reason: DegradeReason) -> Decision {
@@ -429,7 +408,6 @@ mod self_consistency_tests {
                 .into_iter()
                 .map(|s| (s, Decision::Ref { mutable: true }))
                 .collect(),
-            coverage_gaps: Vec::new(),
         }
     }
 
@@ -484,28 +462,4 @@ mod self_consistency_tests {
         assert!(err.contains("no decision for"), "wrong failure arm: {err}");
     }
 
-    /// Coverage gaps are yielded as degradations. A gap reported anywhere else
-    /// would be filtered out of S2b's counters.
-    ///
-    /// *Mutation-tested (Rider 0, deletion first):* removing the
-    /// `.chain(self.coverage_gaps.iter())` makes this fail.
-    #[test]
-    fn coverage_gaps_are_yielded_as_degradations() {
-        let subjects = vec![subject(1, "f::a")];
-        let mut t = table(subjects);
-        t.coverage_gaps.push(Degradation {
-            subject: "f::_2".to_owned(),
-            site: "<main.rs>:1:1".to_owned(),
-            reason: DegradeReason::OutOfCoverage {
-                reference: "er1-depth0-param-slots",
-            },
-        });
-        let seen: Vec<&Degradation> = t.degradations().collect();
-        assert_eq!(
-            seen.len(),
-            1,
-            "the coverage gap did not reach the degradation stream: {seen:#?}"
-        );
-        assert_eq!(seen[0].subject, "f::_2");
-    }
 }

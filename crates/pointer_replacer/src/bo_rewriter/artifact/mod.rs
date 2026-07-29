@@ -119,10 +119,7 @@ mod tests {
     }
 
     fn table(entries: Vec<(Subject, Decision)>) -> DecisionTable {
-        DecisionTable {
-            entries,
-            coverage_gaps: Vec::new(),
-        }
+        DecisionTable { entries }
     }
 
     /// **A.10 — a kept-`Raw` subject EMITS A ROW.**

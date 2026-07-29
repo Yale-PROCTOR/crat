@@ -42,7 +42,6 @@
 //! isolation checks. The decision table, edit plan and applier arrive in S1
 //! (G01 walking skeleton) and S2–S3 (breadth).
 
-use rustc_hash::FxHashMap;
 use rustc_hir::{ItemKind, OwnerNode};
 use rustc_middle::{
     mir::Local,
@@ -413,7 +412,7 @@ fn decide_table<'tcx>(tcx: TyCtxt<'tcx>) -> Result<decision::DecisionTable, Stri
 
     let subjects = collect_subjects(tcx, &program, &mut_facts);
     let facts = decision::emitability::collect(tcx, &program.functions);
-    let mut table = decision::decide(tcx, &subjects, &model, &slots, &facts);
+    let table = decision::decide(tcx, &subjects, &model, &slots, &facts);
 
     // Structural self-check: the table matches the subjects it was handed. NOT
     // the coverage gate — every comparison in it is against the collector's own
@@ -422,30 +421,28 @@ fn decide_table<'tcx>(tcx: TyCtxt<'tcx>) -> Result<decision::DecisionTable, Stri
         return Err(format!("decision table self-consistency: {why}"));
     }
 
-    // The in-process gate. Superseded by the harness reconciliation and deleted
-    // at C.2; during this window it carries NO evidentiary weight, being the
-    // instrument the escalation indicted.
-    let universe = decision::universe::classify(tcx);
-    let mut arg_counts = FxHashMap::default();
-    for &g in &program.functions {
-        let body = tcx.mir_drops_elaborated_and_const_checked(g).borrow();
-        arg_counts.insert(g, body.arg_count);
-    }
-    let reconciliation = decision::coverage::reconcile(
-        tcx,
-        &program.functions,
-        &subjects,
-        &slots,
-        &arg_counts,
-        &universe,
-    );
-    table.coverage_gaps = reconciliation.gaps;
+    // C.2: the in-process coverage gate is GONE. Its replacement is the
+    // harness reconciliation in `coverage_recon`, driven from outside this
+    // module — see `recon_fixtures` (C.1) and the corpus mode (C.4).
+    //
+    // Deleted rather than demoted to a smoke check: a weakened gate that still
+    // READS like a coverage gate is the hazard itself. Four rounds of this
+    // milestone were spent on apparatus that claimed more than it checked, and
+    // leaving a demoted version behind preserves the claim while removing the
+    // substance.
     Ok(table)
 }
 
 /// **Producer A's artifact** for the crate in `tcx`.
 ///
 /// The reconciliation's caller lives outside this module; this only emits.
+#[allow(
+    dead_code,
+    reason = "producer A's artifact has no non-test consumer until the rewriter \
+              is wired into the pipeline — the same standing as `rewrite_m1`. \
+              Its test consumers are the C.1 reconciliation and C.4's corpus \
+              mode. Targeted so dead_code stays live over everything reachable."
+)]
 pub(crate) fn artifact_rows(
     tcx: TyCtxt<'_>,
 ) -> Result<Vec<crate::coverage_recon::schema::Row>, String> {
