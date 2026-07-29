@@ -188,6 +188,15 @@ const PHASE_RULES: &[PhaseRule] = &[
         why: "verify gates on the EMITTED crate and on values the earlier phases               handed it — `utils::type_check` plus the structural counters.               Re-consulting an analysis here would make a gate agree with the               decision that produced it, which is not a gate",
     },
     PhaseRule {
+        phase: "artifact",
+        forbidden: &["super::apply", "super::verify", "super::plan"],
+        why: "producer A SERIALIZES the decision table and compares nothing. It \
+              may read `decision` (that is its input) and \
+              `coverage_recon::schema` (the wire contract), and nothing else — \
+              a comparison appearing here would put the gate back beside the \
+              collector, which is the co-location this whole slice moved out",
+    },
+    PhaseRule {
         phase: "plan",
         forbidden: &["crate::analyses", "super::apply", "super::verify"],
         why: "E1 one-way flow: plan consumes the decision table by value and may \
@@ -546,5 +555,90 @@ fn if_let_ban_matches_a_synthetic_breach() {
     assert!(
         if_let_offense("    if let Some(span) = spans.first() {").is_none(),
         "an `if let` on an unrelated type must not be flagged"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// S2a-H amendment (b): the import direction is ONE-WAY
+// ---------------------------------------------------------------------------
+
+/// **`coverage_recon/` imports NOTHING from `bo_rewriter`.**
+///
+/// Only the reverse direction is licensed — `bo_rewriter::artifact` reads
+/// `coverage_recon::schema`, the wire contract. **Producer B is the point of
+/// this rule.** An import from `bo_rewriter` into the independent reference
+/// walker is exactly the conceptual leakage the authorship split exists to
+/// prevent, and unlike the leakage that can hide in a specification, this form
+/// is mechanically detectable — so it is mechanized.
+///
+/// This is the compensating control for keeping `coverage_recon` in-crate
+/// rather than behind a crate boundary: the boundary is enforced by test
+/// instead of by the module system.
+///
+/// *Mutation-tested (Rider 0, deletion first):* deleting the violation
+/// accumulation makes `coverage_recon_rule_matches_a_synthetic_breach` fail.
+#[test]
+fn coverage_recon_never_imports_from_bo_rewriter() {
+    let root = module_root()
+        .parent()
+        .expect("bo_rewriter has a parent")
+        .join("coverage_recon");
+    let mut files = Vec::new();
+    collect_rs_files(&root, &mut files);
+    assert!(
+        !files.is_empty(),
+        "no coverage_recon sources scanned at {root:?} — the rule would pass \
+         vacuously"
+    );
+
+    let mut violations = Vec::new();
+    for file in &files {
+        let text = fs::read_to_string(file).expect("source file is readable");
+        for (index, line) in text.lines().enumerate() {
+            if is_comment(line) {
+                continue;
+            }
+            if let Some(offense) = bo_rewriter_reference(line) {
+                violations.push(format!(
+                    "{}:{}: {offense}",
+                    file.strip_prefix(&root).unwrap_or(file).display(),
+                    index + 1
+                ));
+            }
+        }
+    }
+    assert!(
+        violations.is_empty(),
+        "coverage_recon must not reference bo_rewriter — producer B's \
+         independence is the point of this rule:\n  {}",
+        violations.join("\n  ")
+    );
+}
+
+/// A reference to `bo_rewriter` on one line, or `None`.
+fn bo_rewriter_reference(line: &str) -> Option<&'static str> {
+    if line.contains("bo_rewriter") {
+        return Some("reference to bo_rewriter");
+    }
+    None
+}
+
+/// The one-way rule must reject a real breach, not merely pass on clean code.
+///
+/// *Mutation-tested (Rider 0, deletion first):* deleting the `line.contains`
+/// check in [`bo_rewriter_reference`] fails this.
+#[test]
+fn coverage_recon_rule_matches_a_synthetic_breach() {
+    assert!(
+        bo_rewriter_reference("use crate::bo_rewriter::decision::Subject;").is_some(),
+        "a direct import from bo_rewriter was not detected"
+    );
+    assert!(
+        bo_rewriter_reference("    let x = super::super::bo_rewriter::rewrite_m1(s);").is_some(),
+        "a path reference to bo_rewriter was not detected"
+    );
+    assert!(
+        bo_rewriter_reference("use crate::analyses::borrow_ownership::SlotKind;").is_none(),
+        "an unrelated import must not be flagged"
     );
 }

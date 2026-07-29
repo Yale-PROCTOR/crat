@@ -60,6 +60,7 @@ use crate::{
 };
 
 pub(crate) mod apply;
+pub(crate) mod artifact;
 pub(crate) mod decision;
 pub(crate) mod plan;
 pub(crate) mod verify;
@@ -344,11 +345,15 @@ fn collect_subjects(
                 _ => (decision::DeclShape::Other, None),
             };
             let local = Local::from_usize(index + 1);
+            let name = param_name(param);
             subjects.push(decision::Subject {
                 fn_did,
                 local,
                 hir_id: param.pat.hir_id,
-                label: format!("{fn_name}::{}", param_name(param)),
+                param_name: name.clone(),
+                hir_index: index,
+                ptr_depth: ptr_chain_depth(*param_ty),
+                label: format!("{fn_name}::{}", name.as_deref().unwrap_or("<pattern>")),
                 ty_span: input.span,
                 pointee_span,
                 decl_shape,
@@ -413,10 +418,16 @@ pub(crate) fn census(tcx: TyCtxt<'_>) -> CollectorCensus {
     census
 }
 
-/// Source name of a parameter binding, for attribution.
-fn param_name(param: &rustc_hir::Param<'_>) -> String {
+/// Source name of a parameter binding.
+///
+/// `None` rather than a `"<pattern>"` placeholder: this feeds the artifact's
+/// `param_name` pairing term, and a placeholder would compare *equal* between
+/// two different pattern parameters — a pairing term that silently agrees is
+/// the F1 failure mode in miniature. The placeholder is applied only where it
+/// belongs, in the human-readable `label`.
+fn param_name(param: &rustc_hir::Param<'_>) -> Option<String> {
     match param.pat.kind {
-        rustc_hir::PatKind::Binding(_, _, ident, _) => ident.name.to_string(),
-        _ => "<pattern>".to_owned(),
+        rustc_hir::PatKind::Binding(_, _, ident, _) => Some(ident.name.to_string()),
+        _ => None,
     }
 }

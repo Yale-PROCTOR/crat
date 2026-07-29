@@ -26,6 +26,7 @@ extern crate thin_vec;
 
 mod analyses;
 mod bo_rewriter;
+mod coverage_recon;
 mod rewriter;
 mod utils;
 

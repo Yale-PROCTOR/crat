@@ -78,6 +78,20 @@ pub(crate) struct Subject {
     /// HIR binding of the same parameter, used to attribute uses to it without
     /// relying on a name that could be shadowed.
     pub hir_id: rustc_hir::HirId,
+    /// **Pairing term 1** in the reconciliation artifact: the parameter's
+    /// source name. `None` when the pattern is not a plain binding.
+    pub param_name: Option<String>,
+    /// **Pairing term 2**: the parameter's position in the HIR declaration,
+    /// **0-based**, recorded as collected.
+    ///
+    /// Kept separately from [`Self::local`] deliberately. The two coincide
+    /// today (`local == hir_index + 1`), but deriving the artifact's
+    /// `arg_index` *from* the local would make it a restatement of the
+    /// alignment key — and a pairing field that restates the key can never
+    /// disagree with it. F1 is precisely what such a field looks like.
+    pub hir_index: usize,
+    /// Pointer-chain depth of the RESOLVED parameter type.
+    pub ptr_depth: u8,
     /// Human-readable identity for attribution: `fn_name::param_name`.
     pub label: String,
     /// Source span of the parameter's declared **type**.
@@ -398,6 +412,9 @@ mod self_consistency_tests {
             fn_did: rustc_hir::def_id::CRATE_DEF_ID,
             local: Local::from_u32(local),
             hir_id: rustc_hir::CRATE_HIR_ID,
+            param_name: Some(label.rsplit("::").next().unwrap_or(label).to_owned()),
+            hir_index: local as usize - 1,
+            ptr_depth: 1,
             label: label.to_owned(),
             ty_span: rustc_span::DUMMY_SP,
             pointee_span: Some(rustc_span::DUMMY_SP),
