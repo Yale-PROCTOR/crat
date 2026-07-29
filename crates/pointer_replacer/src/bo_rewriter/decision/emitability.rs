@@ -95,7 +95,6 @@ pub(crate) fn collect(tcx: TyCtxt<'_>, functions: &[LocalDefId]) -> EmitabilityF
     for owner in tcx.hir_body_owners() {
         let body = tcx.hir_body_owned_by(owner);
         let mut visitor = BodyFacts {
-            tcx,
             fn_did: owner,
             locals: &local,
             facts: &mut facts,
@@ -105,14 +104,17 @@ pub(crate) fn collect(tcx: TyCtxt<'_>, functions: &[LocalDefId]) -> EmitabilityF
     facts
 }
 
-struct BodyFacts<'a, 'tcx> {
-    tcx: TyCtxt<'tcx>,
+/// Note the absent `tcx`: this visitor works entirely on HIR nodes and
+/// resolutions. It *did* carry a `TyCtxt` that nothing ever read — dead weight
+/// that the module-wide `allow(dead_code)` hid, and that the lint reported the
+/// moment the blanket came off.
+struct BodyFacts<'a> {
     fn_did: LocalDefId,
     locals: &'a [LocalDefId],
     facts: &'a mut EmitabilityFacts,
 }
 
-impl<'a, 'tcx> BodyFacts<'a, 'tcx> {
+impl BodyFacts<'_> {
     /// The `HirId` of the binding a path expression resolves to, if it is a
     /// local. That is how a use is attributed to a specific parameter rather
     /// than to a name that might be shadowed.
@@ -127,7 +129,7 @@ impl<'a, 'tcx> BodyFacts<'a, 'tcx> {
     }
 }
 
-impl<'a, 'tcx> Visitor<'tcx> for BodyFacts<'a, 'tcx> {
+impl<'tcx> Visitor<'tcx> for BodyFacts<'_> {
     fn visit_expr(&mut self, expr: &'tcx Expr<'tcx>) {
         match &expr.kind {
             // (1) raw-pointer-only method on a local

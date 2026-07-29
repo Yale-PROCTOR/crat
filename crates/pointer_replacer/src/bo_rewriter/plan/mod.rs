@@ -40,6 +40,12 @@ use super::decision::{Decision, DecisionTable};
 /// every golden now means S3 adds construction sites, not a new type — and the
 /// breadth hedge for the walking-skeleton cut rests on exactly that.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[allow(
+    dead_code,
+    reason = "S1 builds only KindDecision; the other arms are shaped against \
+              the remaining goldens on purpose, so S3 adds construction sites \
+              rather than reshaping the type"
+)]
 pub(crate) enum Justification {
     /// G01–G03: BO decided this slot is a reference. **Live at S1.**
     KindDecision { kind: &'static str },
@@ -86,10 +92,15 @@ pub(crate) fn plan(table: &DecisionTable, source: &str, span_to_range: impl Fn(r
             // authority the architecture puts in one place.
             continue;
         };
-        let (Some((ty_lo, ty_hi)), Some((p_lo, p_hi))) = (
-            span_to_range(subject.ty_span),
-            span_to_range(subject.pointee_span),
-        ) else {
+        // A `Ref` decision implies a syntactic raw-pointer declaration:
+        // `decide_one` degrades every other shape with `NonPointerDecl`,
+        // precisely because there is no pointee text to copy through an alias.
+        let Some(pointee_span) = subject.pointee_span else {
+            continue;
+        };
+        let (Some((ty_lo, ty_hi)), Some((p_lo, p_hi))) =
+            (span_to_range(subject.ty_span), span_to_range(pointee_span))
+        else {
             continue;
         };
         let Some(pointee) = source.get(p_lo..p_hi) else {

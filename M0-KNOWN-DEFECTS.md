@@ -17,16 +17,56 @@ makes the gate falsifiable: the two previous forms both compared the decision
 table against the collector's own output, and the second only *looked*
 independent because it re-walked `program.functions` with the same filter.
 
-### Census on frozen rs-crown — **UNVERIFIED, pending re-run** (2026-07-29)
+### Collector census on frozen rs-crown — **MEASURED** (2026-07-29)
 
-| class | count | status |
-|---|---|---|
-| **subjects** (free-fn pointer params) | 4171 | **UNVERIFIED** |
-| excluded: impl methods | 0 | corroborated by direct grep |
-| excluded: trait items | 0 | corroborated by direct grep |
-| excluded: foreign (`extern` decls) | 2039 | **UNVERIFIED** |
+Produced by the SHIPPING collector via a committed in-tree path. Invocation,
+recorded beside the numbers as the discipline requires:
 
-**Why unverified.** These came from a scratchpad `syn` walk, not from the
+```
+DYLD_LIBRARY_PATH="$(rustc --print sysroot)/lib" \
+CRAT_BOC1_INPUT=benchmarks/rs-crown/<prog>/<lib.rs|c2rust-lib.rs> \
+CRAT_BOC1_MODE=m1-census CRAT_BOC1_NAME=<prog> DIR=<worktree> \
+  <test-bin> bo_c1::boc1_run_one --exact --ignored --nocapture
+```
+
+19 of 20 programs. **tulipindicators is resource-deferred** by the standing
+benchmark-scope ruling (SLOC > brotli), so it is absent from these totals.
+
+| quantity | count |
+|---|---|
+| subjects, resolved predicate (`ptr_chain_depth > 0`) | **3872** |
+| of which the retired SYNTACTIC `TyKind::Ptr` predicate saw | 3737 |
+| **resolved-only — invisible to the retired predicate** | **135** |
+| …declared through a path (the C2Rust alias class) | 135 |
+| …already a reference in source | 0 |
+| …some other declaration form | 0 |
+
+**The alias population is 135, concentrated in two programs** — lil 117,
+brotli 18; every other program is 0. This is the delta §1.3 called an
+obligation: it is the population that was collected, decided and attributed for
+the first time this round, and that the syntactic collector dropped with no
+`Decision`, no `Degradation`, no site and no reason.
+
+The prior figure of **154** (lil 131, brotli 23) is **retired**: it came from a
+balanced-paren text scan and over-counted by 19 (12%).
+
+Corpus-neutrality note, since R-A widened the predicate's meaning: adopting
+`ptr_chain_depth` brings already-reference parameters into the subject universe
+(it counts `TyKind::Ref` as depth-bearing). On this corpus that widening is
+**worth exactly zero** — `reference = 0` in all 19 programs. It is visible only
+in fixtures with an `&self` receiver.
+
+The `impl = 0 / trait = 0` rows stand as corroborated by direct grep (`0` impl
+blocks in 290 `.rs` files under `benchmarks/rs-crown`).
+
+**Not re-measured, still UNVERIFIED:** the foreign-declaration count (prior
+figure 2039). `run_m1_census` reports the collector's own subjects; the
+`Excluded` census reaches `RewriteOutcome` but no corpus mode emits it yet.
+Recorded as owed rather than carried forward as a fact.
+
+### Why the previous census was retired
+
+**Why it was unverified.** These came from a scratchpad `syn` walk, not from the
 shipping `universe::classify`. The walk applied the same syntactic
 `*mut`/`*const` test as the classifier, so it **inherited the classifier's blind
 spot** and could not have detected it — and the alias-typed population
@@ -45,8 +85,17 @@ rather than on a reimplementation.
 
 **The impl/trait exclusion is stated-and-vacuous on this corpus** — zero across
 all 20 programs — so the ruling costs nothing measurable here. The foreign
-population is real (2039) and correctly excluded; it is the M4 boundary, and it
-appears in S2b's counters as out-of-scope-M1 rather than as an absence.
+population is the M4 boundary and is correctly excluded; its count is owed a
+re-measurement (see above) rather than carried forward from the retired scan.
+
+**Exclusions now reach a consumer.** They ride out on `RewriteOutcome`, which is
+what makes the "visible as a number rather than as an absence" claim true of a
+code path — it previously was not: the buckets were written and read by nothing
+outside one test. `excluded_other` was **deleted, not fixed**: no `OwnerNode`
+could increment it, so asserting it was zero passed vacuously — the same
+unfailable-check class, sitting in the field documented as the blind-spot
+detector. Blind-spot detection is now `coverage::reconcile`'s set comparison,
+which can fail and is mutation-tested in all four directions.
 
 ### Proportionality call: `RAW_ONLY_METHODS` fixtures
 

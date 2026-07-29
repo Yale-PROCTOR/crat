@@ -26,10 +26,44 @@ use rustc_span::Span;
 
 use crate::analyses::borrow_ownership::{SlotKind, crate_slots::CrateSlots, solver::SlotRef};
 
+pub(crate) mod coverage;
 pub(crate) mod emitability;
 pub(crate) mod universe;
 
 use emitability::EmitabilityFacts;
+
+/// How the parameter's **declaration** is written in source, for a subject
+/// whose **resolved** type is a pointer.
+///
+/// The two can disagree, and that disagreement is the whole reason subject
+/// collection moved to resolved types: a C2Rust alias
+/// (`pub type lil_value_t = *mut _lil_value_t`) is a pointer parameter that
+/// *reads* as a path. Under R-A such parameters are collected — they are real C
+/// pointer parameters and excluding them would shrink the universe artificially
+/// — and the shape is carried so that an emission obstacle specific to the
+/// shape can be attributed with its own reason instead of vanishing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DeclShape {
+    /// `*mut T` / `*const T`, written literally. The only emittable shape at M1.
+    RawPtr,
+    /// A path that resolves to a pointer — the C2Rust type-alias class.
+    Alias,
+    /// Already a reference in source.
+    Reference,
+    /// Resolved as a pointer through some other declaration form.
+    Other,
+}
+
+impl DeclShape {
+    fn key(self) -> &'static str {
+        match self {
+            DeclShape::RawPtr => "raw-ptr",
+            DeclShape::Alias => "alias",
+            DeclShape::Reference => "reference",
+            DeclShape::Other => "other",
+        }
+    }
+}
 
 /// One thing M1 must decide about. **Depth-0 pointer parameters only at S1.**
 ///
@@ -50,7 +84,14 @@ pub(crate) struct Subject {
     pub ty_span: Span,
     /// Source span of the pointee type, kept so the plan can preserve the
     /// pointee's text verbatim rather than re-render it.
-    pub pointee_span: Span,
+    ///
+    /// `None` when the declaration is not a syntactic raw pointer: an alias
+    /// carries its pointer-ness inside the alias, so there is no pointee text
+    /// to copy. Such subjects are degraded in [`decide_one`], so a `Ref`
+    /// decision always has a pointee span.
+    pub pointee_span: Option<Span>,
+    /// How the declaration is written — see [`DeclShape`].
+    pub decl_shape: DeclShape,
     pub mutable: bool,
 }
 
@@ -82,10 +123,35 @@ pub(crate) enum DegradeReason {
     PtrComparison,
     /// Structural: the subject has no depth-0 slot, or none in the model.
     NoSlot,
+    /// The resolved parameter type is a pointer but the **declaration** is not
+    /// a syntactic `*mut`/`*const` — the C2Rust alias class, or a parameter
+    /// that is already a reference.
+    ///
+    /// R-A: collect these, do not exclude them. They are real C pointer
+    /// parameters, so excluding them would shrink the universe artificially;
+    /// what they get instead is a decision and an attributed reason. Emitting
+    /// *through* an alias is a separate design question — the alias already
+    /// contains the `*mut`, so `&mut lil_value_t` would be wrong — and
+    /// conflating it with the collection fix would repeat this milestone's
+    /// pattern of bundling.
+    NonPointerDecl { shape: &'static str },
+    /// A reference instrument saw a pointer parameter that the collector never
+    /// produced a subject for. **R-B: this direction is a coverage gap**, not a
+    /// contract violation — loud in the counters, run continues, because a
+    /// parameter the collector cannot see is exactly a subject that should be
+    /// recorded as unhandled. (The other direction — a subject no reference
+    /// knows — is a mapping bug and fails loudly; see [`coverage`].)
+    OutOfCoverage { reference: &'static str },
 }
 
 impl DegradeReason {
     /// Stable key for counter aggregation (S2b).
+    #[allow(
+        dead_code,
+        reason = "the aggregation that consumes this is S2b, the next slice. \
+                  Targeted rather than module-wide so the lint keeps working \
+                  everywhere else."
+    )]
     pub(crate) fn key(&self) -> &'static str {
         match self {
             DegradeReason::KindRaw => "kind-raw",
@@ -94,6 +160,8 @@ impl DegradeReason {
             DegradeReason::CallSiteNotAdapted => "call-site-not-adapted",
             DegradeReason::PtrComparison => "ptr-comparison",
             DegradeReason::NoSlot => "no-slot",
+            DegradeReason::NonPointerDecl { .. } => "non-pointer-decl",
+            DegradeReason::OutOfCoverage { .. } => "out-of-coverage",
         }
     }
 }
@@ -124,23 +192,32 @@ pub(crate) enum Decision {
 #[derive(Clone, Debug, Default)]
 pub(crate) struct DecisionTable {
     pub entries: Vec<(Subject, Decision)>,
+    /// Coverage gaps from [`coverage::reconcile`]: pointer parameters a
+    /// reference instrument saw and the collector never produced a subject for.
+    ///
+    /// They are not entries — there is no `Subject` to pair them with, which is
+    /// precisely the defect they record — but they **are** degradations, so
+    /// [`Self::degradations`] yields them and the S2b counters will see them.
+    pub coverage_gaps: Vec<Degradation>,
 }
 
 impl DecisionTable {
-    /// Structural gate: the table covers exactly the subjects it was given,
-    /// once each, **and as many subjects as the crate independently has**.
+    /// Structural self-consistency: the table covers exactly the subjects it
+    /// was given, once each.
     ///
-    /// The previous form compared `entries.len()` against a count captured from
-    /// the same `Vec` one line earlier, over a total `map` with no filter — it
-    /// could not fail in any execution. This checks the two properties that
-    /// *can*: **no duplicate subject** (a collector emitting one parameter
-    /// twice would otherwise plan two edits for one span, which `apply` would
-    /// only catch as an overlap rollback), and **every input subject present**.
-    pub(crate) fn coverage_over(
-        &self,
-        subjects: &[Subject],
-        independent_ptr_params: usize,
-    ) -> Result<(), String> {
+    /// **This is not the coverage gate**, and the distinction is the lesson of
+    /// three failed rounds. Every check here compares the table against the
+    /// collector's own output, so none of them can detect a subject the
+    /// collector never produced. They catch two real but narrower defects: a
+    /// **duplicate subject** (which would otherwise plan two edits for one span
+    /// and surface only as an `apply` overlap rollback) and a **dropped
+    /// decision**.
+    ///
+    /// Detecting a subject that was never collected requires an instrument with
+    /// a different derivation — see [`coverage::reconcile`], which owns that
+    /// job and is the only thing in this module entitled to be called a
+    /// coverage gate.
+    pub(crate) fn is_self_consistent_over(&self, subjects: &[Subject]) -> Result<(), String> {
         let mut seen = rustc_hash::FxHashSet::default();
         for (subject, _) in &self.entries {
             let key = (subject.fn_did.local_def_index.as_u32(), subject.local);
@@ -160,36 +237,22 @@ impl DecisionTable {
                 subjects.len()
             ));
         }
-        // ADV-R1: the load-bearing comparison, against a DIFFERENT SOURCE OF
-        // TRUTH. The three checks above compare the table against the
-        // collector's own output and are unfailable by construction.
-        //
-        // The first attempt at this arm was independent in code path but not in
-        // source: it re-walked `program.functions` with the same filter, so it
-        // agreed with the collector on every input — including the impl-method
-        // case, which BOTH walks skipped, agreeing at zero while a pointer
-        // parameter went unrewritten and unattributed.
-        //
-        // `independent_ptr_params` now comes from `universe::classify`, which
-        // starts at the crate's item list and visits every item kind. It can
-        // disagree, which is the only property that makes a gate a gate.
-        if self.entries.len() != independent_ptr_params {
-            return Err(format!(
-                "table covers {} subjects but the crate has {independent_ptr_params} \
-                 pointer parameters — {} were dropped before a decision was made",
-                self.entries.len(),
-                independent_ptr_params.saturating_sub(self.entries.len())
-            ));
-        }
         Ok(())
     }
 
     /// The envelope-demotion records. S2b aggregates these into the counters.
+    ///
+    /// Coverage gaps are included: a parameter no subject was built for is an
+    /// unhandled parameter, and reporting it anywhere other than alongside the
+    /// ordinary degradations would let it be filtered out of the counters.
     pub(crate) fn degradations(&self) -> impl Iterator<Item = &Degradation> {
-        self.entries.iter().filter_map(|(_, d)| match d {
-            Decision::Degraded(record) => Some(record),
-            Decision::Ref { .. } => None,
-        })
+        self.entries
+            .iter()
+            .filter_map(|(_, d)| match d {
+                Decision::Degraded(record) => Some(record),
+                Decision::Ref { .. } => None,
+            })
+            .chain(self.coverage_gaps.iter())
     }
 
     /// Subjects the table decided to emit.
@@ -222,7 +285,10 @@ pub(crate) fn decide(
             (subject.clone(), decision)
         })
         .collect();
-    DecisionTable { entries }
+    DecisionTable {
+        entries,
+        coverage_gaps: Vec::new(),
+    }
 }
 
 fn degrade(subject: &Subject, site: String, reason: DegradeReason) -> Decision {
@@ -241,6 +307,30 @@ fn decide_one(
     facts: &EmitabilityFacts,
 ) -> Decision {
     let decl_site = EmitabilityFacts::site(tcx, subject.ty_span);
+
+    // The declaration's SHAPE comes FIRST, before any analysis is consulted.
+    //
+    // R-A collects alias-typed parameters so they are decided rather than
+    // dropped; this is where that collection turns into an attributed reason.
+    // It is checked ahead of BO's kind because it is knowable without any
+    // analysis at all — the plan copies the pointee's source text and an alias
+    // has none to copy, whatever BO concluded. Ordering it first also keeps the
+    // witness for this class independent of the solver's verdict, which is the
+    // §5.3 rule: test the layer you name, not a composition that routes through
+    // it.
+    //
+    // The cost, stated: an alias-typed parameter's BO kind does not reach the
+    // counters. That is S2b's question to reopen with a reason if it wants the
+    // "how many alias params would have been Ref" breakdown.
+    if subject.decl_shape != DeclShape::RawPtr {
+        return degrade(
+            subject,
+            decl_site,
+            DegradeReason::NonPointerDecl {
+                shape: subject.decl_shape.key(),
+            },
+        );
+    }
 
     let Some(universe) = slots.fn_local_slots.get(&subject.fn_did) else {
         return degrade(subject, decl_site, DegradeReason::NoSlot);
@@ -290,7 +380,17 @@ fn decide_one(
 }
 
 #[cfg(test)]
-mod coverage_tests {
+mod self_consistency_tests {
+    //! Witnesses for [`DecisionTable::is_self_consistent_over`] — and for what
+    //! it deliberately does **not** do.
+    //!
+    //! The dropped-subject arm that used to live here has moved to
+    //! [`super::coverage`], where it belongs: detecting a subject the collector
+    //! never produced needs an instrument with a different derivation, and this
+    //! check has none — every comparison in it is against the collector's own
+    //! output. Keeping a "coverage" test next to a self-comparison is how three
+    //! rounds of unfailable gates read as covered.
+
     use super::*;
 
     fn subject(local: u32, label: &str) -> Subject {
@@ -300,7 +400,8 @@ mod coverage_tests {
             hir_id: rustc_hir::CRATE_HIR_ID,
             label: label.to_owned(),
             ty_span: rustc_span::DUMMY_SP,
-            pointee_span: rustc_span::DUMMY_SP,
+            pointee_span: Some(rustc_span::DUMMY_SP),
+            decl_shape: DeclShape::RawPtr,
             mutable: true,
         }
     }
@@ -311,48 +412,83 @@ mod coverage_tests {
                 .into_iter()
                 .map(|s| (s, Decision::Ref { mutable: true }))
                 .collect(),
+            coverage_gaps: Vec::new(),
         }
     }
 
-    /// The gate accepts a table that covers its subjects and matches the
-    /// independent count.
+    /// A table that covers its subjects, once each, is self-consistent.
+    ///
+    /// **Positive control, and no deletion mutation fails it** — recorded
+    /// rather than dressed up. A test asserting that a checker *accepts* valid
+    /// input cannot be broken by deleting one of that checker's rejection arms;
+    /// only making the function unconditionally reject would fail it. Its job is
+    /// to prove the three negatives below are not passing because
+    /// `is_self_consistent_over` errors on everything.
     #[test]
-    fn matching_coverage_is_ok() {
+    fn matching_entries_are_self_consistent() {
         let subjects = vec![subject(1, "f::a"), subject(2, "f::b")];
-        assert!(table(subjects.clone()).coverage_over(&subjects, 2).is_ok());
-    }
-
-    /// **F3's load-bearing arm.** A subject dropped by the collector shrinks
-    /// BOTH the table and the slice it is compared against, so only the
-    /// independent count can see it.
-    ///
-    /// This is the arm the previous `is_total_over` — and its first replacement
-    /// — could not have: both compared the pipeline against its own output.
-    ///
-    /// *Mutation-tested (Rider 0, deletion first):* removing the
-    /// `entries.len() != independent_ptr_params` arm makes this pass.
-    #[test]
-    fn a_dropped_subject_is_caught_only_by_the_independent_count() {
-        let subjects = vec![subject(1, "f::a")];
-        // Table and slice agree with each other; the CRATE has two pointer
-        // params. Every self-referential check passes; this must not.
-        let err = table(subjects.clone())
-            .coverage_over(&subjects, 2)
-            .expect_err("a dropped subject must fail the coverage gate");
         assert!(
-            err.contains("dropped before a decision"),
-            "wrong failure arm: {err}"
+            table(subjects.clone())
+                .is_self_consistent_over(&subjects)
+                .is_ok()
         );
     }
 
-    /// A duplicate subject is caught before it can plan two edits for one span.
+    /// A duplicate subject is caught before it can plan two edits for one span
+    /// — which `apply` would otherwise surface only as an overlap rollback.
+    ///
+    /// *Mutation-tested (Rider 0, deletion first):* deleting the `seen.insert`
+    /// arm makes this pass.
     #[test]
     fn a_duplicate_subject_is_rejected() {
         let subjects = vec![subject(1, "f::a")];
         let dup = table(vec![subject(1, "f::a"), subject(1, "f::a")]);
         let err = dup
-            .coverage_over(&subjects, 1)
-            .expect_err("a duplicate decision must fail the gate");
+            .is_self_consistent_over(&subjects)
+            .expect_err("a duplicate decision must be rejected");
         assert!(err.contains("duplicate"), "wrong failure arm: {err}");
+    }
+
+    /// A subject with no decision is caught.
+    ///
+    /// *Mutation-tested (Rider 0, deletion first):* deleting the
+    /// `for subject in subjects` arm makes this pass — the length check alone
+    /// does not catch it, because the perturbation changes membership without
+    /// changing the count.
+    #[test]
+    fn a_subject_with_no_decision_is_rejected() {
+        let subjects = vec![subject(1, "f::a"), subject(2, "f::b")];
+        // Same cardinality, different membership: `f::b` has no decision and
+        // `f::c` has one for a subject that was never handed in.
+        let skewed = table(vec![subject(1, "f::a"), subject(3, "f::c")]);
+        let err = skewed
+            .is_self_consistent_over(&subjects)
+            .expect_err("a subject with no decision must be rejected");
+        assert!(err.contains("no decision for"), "wrong failure arm: {err}");
+    }
+
+    /// Coverage gaps are yielded as degradations. A gap reported anywhere else
+    /// would be filtered out of S2b's counters.
+    ///
+    /// *Mutation-tested (Rider 0, deletion first):* removing the
+    /// `.chain(self.coverage_gaps.iter())` makes this fail.
+    #[test]
+    fn coverage_gaps_are_yielded_as_degradations() {
+        let subjects = vec![subject(1, "f::a")];
+        let mut t = table(subjects);
+        t.coverage_gaps.push(Degradation {
+            subject: "f::_2".to_owned(),
+            site: "<main.rs>:1:1".to_owned(),
+            reason: DegradeReason::OutOfCoverage {
+                reference: "er1-depth0-param-slots",
+            },
+        });
+        let seen: Vec<&Degradation> = t.degradations().collect();
+        assert_eq!(
+            seen.len(),
+            1,
+            "the coverage gap did not reach the degradation stream: {seen:#?}"
+        );
+        assert_eq!(seen[0].subject, "f::_2");
     }
 }

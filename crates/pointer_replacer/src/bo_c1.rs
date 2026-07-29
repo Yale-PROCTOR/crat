@@ -6918,6 +6918,40 @@ mod run {
         row
     }
 
+    /// **M1 collector census** (coverage-apparatus review §3).
+    ///
+    /// Runs the SHIPPING subject collector and reports what it sees, so the
+    /// alias population is a number produced by the code that matters rather
+    /// than by a scratchpad reimplementation. The retired `4171/0/0/2039`
+    /// census applied the same syntactic `*mut`/`*const` test as the classifier
+    /// it was meant to validate, so it inherited the alias blind spot and could
+    /// not have detected it.
+    ///
+    /// `resolved_only = resolved - syntactic_ptr` is the population the retired
+    /// predicate could not see; `alias` is the C2Rust type-alias class within
+    /// it.
+    ///
+    /// Analysis-free by design: no solver, no BO run. This measures the
+    /// collector's predicate and nothing downstream of it.
+    pub fn run_m1_census(tcx: TyCtxt<'_>, t_tcx: Duration) -> Row {
+        let t0 = Instant::now();
+        let mut row = Row::default();
+        row.set("t_tcx_s", secs(t_tcx));
+        let census = crate::bo_rewriter::census(tcx);
+        row.set("resolved", census.resolved);
+        row.set("syntactic_ptr", census.syntactic_ptr);
+        row.set(
+            "resolved_only",
+            census.resolved.saturating_sub(census.syntactic_ptr),
+        );
+        row.set("alias", census.resolved_only_alias);
+        row.set("reference", census.resolved_only_reference);
+        row.set("other", census.resolved_only_other);
+        row.set("t_total_s", secs(t0.elapsed() + t_tcx));
+        row.set("status", "ok");
+        row
+    }
+
     /// Production end-to-end decision worker. The generated source is
     /// intentionally discarded; final pointer decisions are emitted by the
     /// existing full diagnostics surface and parsed by the parent harness.
@@ -7773,6 +7807,7 @@ fn boc1_run_one() {
             "prod-own" => run::run_prod_ownership(tcx, t_tcx),
             "prod-precision" => run::run_prod_ownership(tcx, t_tcx),
             "prod-box" => run::run_prod_box(tcx, t_tcx),
+            "m1-census" => run::run_m1_census(tcx, t_tcx),
             "selector-core" => run::run_selector_core(tcx, t_tcx),
             "selector-necessity" => run::run_selector_necessity(tcx, t_tcx),
             detail if detail.starts_with("selector-detail-") => {

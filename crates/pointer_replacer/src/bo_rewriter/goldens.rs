@@ -123,6 +123,7 @@ macro_rules! golden_test {
                 RewriteOutcome::Degraded {
                     reason,
                     degradations,
+                    ..
                 } => panic!(
                     "{}: no emission — {reason}. Attributed degradations: {:#?}",
                     golden.name, degradations
@@ -230,6 +231,7 @@ fn g09_is_unchanged_for_a_stated_reason_not_by_accident() {
         RewriteOutcome::Degraded {
             reason,
             degradations,
+            ..
         } => panic!("g09 degraded: {reason}; {degradations:#?}"),
     }
 }
@@ -248,6 +250,52 @@ fn degradations_for(name: &str) -> Vec<super::decision::Degradation> {
         RewriteOutcome::Emitted { degradations, .. } => degradations,
         RewriteOutcome::Degraded { degradations, .. } => degradations,
     }
+}
+
+/// A1 facts for an inline source, **without running BO**.
+///
+/// §5.3: the A1 mechanism fixtures used to assert on `rewrite_m1`'s
+/// degradations, so they passed only because the solver happened to return
+/// `Ref` for the parameter in question — an unrelated precision change would
+/// have turned a mechanism test into a false red. Asserting on the fact
+/// collector directly tests the layer the test names.
+#[derive(Debug, Default)]
+struct FactSnapshot {
+    /// `(fn path, raw-only operation)`.
+    raw_only: Vec<(String, String)>,
+    /// Functions referenced in-crate — called, address-taken, or cast.
+    referenced: Vec<String>,
+    /// Functions with a pointer parameter used in a comparison.
+    compared: Vec<String>,
+}
+
+fn facts_for_source(src: &str) -> FactSnapshot {
+    ::utils::compilation::run_compiler_on_str(src, |tcx| {
+        let program = super::collect_program(tcx);
+        let facts = super::decision::emitability::collect(tcx, &program.functions);
+        let mut snapshot = FactSnapshot {
+            raw_only: facts
+                .raw_only_uses
+                .iter()
+                .map(|((did, _), (op, _))| (tcx.def_path_str(did.to_def_id()), op.clone()))
+                .collect(),
+            referenced: facts
+                .referenced
+                .keys()
+                .map(|did| tcx.def_path_str(did.to_def_id()))
+                .collect(),
+            compared: facts
+                .ptr_comparisons
+                .keys()
+                .map(|(did, _)| tcx.def_path_str(did.to_def_id()))
+                .collect(),
+        };
+        snapshot.raw_only.sort();
+        snapshot.referenced.sort();
+        snapshot.compared.sort();
+        snapshot
+    })
+    .expect("fixture compiles")
 }
 
 /// **S2a exit gate (g02 class).** A parameter used in a raw-pointer-only
@@ -331,7 +379,7 @@ fn g06_class_is_attributed_at_decision_time() {
 #[test]
 fn every_golden_outcome_is_attributed() {
     let mut checked_emitted = 0usize;
-    let mut checked_degraded = 0usize;
+    let mut degraded: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
     let mut degradations_seen = 0usize;
 
     for golden in GOLDENS {
@@ -339,8 +387,9 @@ fn every_golden_outcome_is_attributed() {
             RewriteOutcome::Degraded {
                 reason,
                 degradations,
+                ..
             } => {
-                checked_degraded += 1;
+                degraded.insert(golden.name);
                 assert!(
                     !reason.contains("failed the type-check gate"),
                     "{}: died at the anonymous whole-crate gate ({reason}) — the \
@@ -377,14 +426,30 @@ fn every_golden_outcome_is_attributed() {
     // the loop bound — unfailable, and labelled non-vacuity inside a commit
     // whose purpose was deleting checks that cannot fail.
     //
-    // Replaced by the TRUE present-tense property, which can fail: today every
-    // golden emits, so the Degraded arm runs zero times. If that changes, this
-    // says so instead of quietly shifting which arm carries the weight.
+    // §5.2: its replacement was `assert_eq!(checked_degraded, 0)`, which pins
+    // the Degraded arm as permanently dead-while-green and inverts into an
+    // obstacle the moment a golden correctly degrades — the maintainer's
+    // response would be to bump the constant, which is the change-detector loop.
+    //
+    // The EXPECTED SET instead: a golden that starts degrading fails with
+    // *which* golden, and the fix is to add it here with a reason — an
+    // intentional edit that records a decision, not a number bumped to restore
+    // green.
+    //
+    // Stated plainly so it is not over-read: with the set EMPTY and no golden
+    // degrading today, this assertion is no more load-bearing right now than
+    // the zero-pin it replaces. The change buys a better failure mode later,
+    // not more coverage now. What is load-bearing today is the Emitted arm
+    // below and the non-vacuity assertion after it — the former verified by
+    // emptying its loop, which fails this test.
+    const EXPECTED_DEGRADED: &[&str] = &[];
     assert_eq!(
-        checked_degraded, 0,
-        "a golden now takes the Degraded arm ({checked_degraded} of them). That \
-         is not itself wrong, but this test's coverage has moved: re-check that \
-         the Degraded arm's assertions are the ones you want load-bearing."
+        degraded.iter().copied().collect::<Vec<_>>(),
+        EXPECTED_DEGRADED,
+        "the set of goldens taking the Degraded arm changed. That is not itself \
+         wrong — but this test's coverage has MOVED, so re-check that the \
+         Degraded arm's assertions are the ones you want load-bearing, then add \
+         the golden to EXPECTED_DEGRADED with a reason."
     );
     assert_eq!(
         checked_emitted,
@@ -531,9 +596,15 @@ const PREAMBLE: &str = "#![allow(dead_code, unused_unsafe, unused_mut, unused_as
 /// pointers the comparison is on ADDRESSES, on references it is on POINTEES,
 /// so a rewrite that type-checks would silently invert the bound.
 ///
-/// *Mutation-tested (Rider 0, deletion first):* deleting the `ptr_comparisons`
-/// arm in `decide_one` fails this — the parameters are decided `Ref` and no
-/// `PtrComparison` degradation is attributed.
+/// *Mutation-tested (Rider 0, deletion first):* deleting the `ExprKind::Binary`
+/// arm in `emitability::collect` fails the mechanism half; deleting the
+/// `ptr_comparisons` arm in `decide_one` fails the attribution half.
+///
+/// §5.3: the mechanism half asserts on `EmitabilityFacts::collect` directly.
+/// The attribution half still goes through `rewrite_m1` — that composition IS
+/// the property it names — but it can no longer be the only evidence, so a
+/// solver change that stops returning `Ref` here degrades one assertion instead
+/// of erasing the fixture's whole meaning.
 #[test]
 fn ptr_comparison_shape_is_degraded_with_its_own_reason() {
     use super::decision::DegradeReason;
@@ -541,6 +612,15 @@ fn ptr_comparison_shape_is_degraded_with_its_own_reason() {
         "{PREAMBLE}pub unsafe fn advance(p: *mut u8, plimit: *mut u8) -> i32 {{\n    \
          if p > plimit {{ return 0; }}\n    1\n}}\n"
     );
+
+    // (1) mechanism, solver-independent.
+    let facts = facts_for_source(&src);
+    assert!(
+        facts.compared.iter().any(|f| f.contains("advance")),
+        "the comparison fact was not collected at all; got {facts:#?}"
+    );
+
+    // (2) attribution, end to end.
     let records = reasons_for_source(&src);
     let hit = records
         .iter()
@@ -563,6 +643,14 @@ fn ptr_comparison_shape_is_degraded_with_its_own_reason() {
 ///
 /// *Mutation-tested (Rider 0, deletion first):* narrowing the `ExprKind::Path`
 /// arm back to `ExprKind::Call` fails this.
+///
+/// §5.1/§5.3, two repairs folded in. The second assertion used to be
+/// `if let RewriteOutcome::Degraded { .. }` with no `else`, in a fixture that
+/// returns `Emitted` — so it never ran; it is now an exhaustive `match` where
+/// **both** arms assert. The first assertion is sound and does discriminate the
+/// F1 repair (the old `Call`-only detector would not have caught
+/// `Some(descent as unsafe fn(..))`), so only the dead half changed — and it is
+/// now taken at the fact layer, independent of the solver.
 #[test]
 fn address_taken_function_is_degraded_not_silently_rewritten() {
     use super::decision::DegradeReason;
@@ -571,6 +659,16 @@ fn address_taken_function_is_degraded_not_silently_rewritten() {
          pub unsafe fn table() -> Option<unsafe fn(*mut i32) -> i32> {{\n    \
          Some(descent as unsafe fn(*mut i32) -> i32)\n}}\n"
     );
+
+    // (1) F1's mechanism: the fn-item cast counts as a reference.
+    let facts = facts_for_source(&src);
+    assert!(
+        facts.referenced.iter().any(|f| f.contains("descent")),
+        "the address-taken reference was not collected; the detector is back to \
+         `ExprKind::Call` only. Facts: {facts:#?}"
+    );
+
+    // (2) and it is attributed, per subject.
     let records = reasons_for_source(&src);
     assert!(
         records
@@ -579,12 +677,31 @@ fn address_taken_function_is_degraded_not_silently_rewritten() {
                 && d.subject.contains("descent")),
         "an address-taken function's parameter was not degraded; got {records:#?}"
     );
-    // And the crate must not have died anonymously.
-    if let RewriteOutcome::Degraded { reason, .. } = rewrite_m1(&src) {
-        assert!(
-            !reason.contains("failed the type-check gate"),
-            "address-taken shape still reaches the anonymous gate: {reason}"
-        );
+
+    // (3) and the crate did not die anonymously. Exhaustive: the Emitted arm is
+    // the one this fixture actually takes, and it asserted nothing before.
+    match rewrite_m1(&src) {
+        RewriteOutcome::Degraded { reason, .. } => panic!(
+            "address-taken shape must not reach a whole-crate verdict at all; \
+             degraded with: {reason}"
+        ),
+        RewriteOutcome::Emitted {
+            source,
+            emitted_count,
+            ..
+        } => {
+            assert_eq!(
+                emitted_count, 0,
+                "`descent` is address-taken, so nothing in this fixture is \
+                 emittable; emitting {emitted_count} means the degradation was \
+                 recorded but not honoured"
+            );
+            assert_eq!(
+                source, src,
+                "no subject was emitted, so the source must come through byte \
+                 for byte"
+            );
+        }
     }
 }
 
@@ -599,20 +716,24 @@ fn address_taken_function_is_degraded_not_silently_rewritten() {
 ///
 /// *Mutation-tested (Rider 0, deletion first):* emptying `RAW_ONLY_METHODS`
 /// fails this.
+///
+/// §5.3: asserted at the fact layer, which is the layer the test names. Going
+/// through `rewrite_m1` made this pass only because BO returned `Ref` for `p`,
+/// so a solver precision change could have turned a `RAW_ONLY_METHODS`
+/// mechanism test into a false red.
 #[test]
 fn raw_only_method_mechanism_covers_representative_entries() {
-    use super::decision::DegradeReason;
     for method in ["offset", "wrapping_add"] {
         let src = format!(
             "{PREAMBLE}pub unsafe fn f(p: *mut u8) -> *mut u8 {{ p.{method}(1) }}\n"
         );
-        let records = reasons_for_source(&src);
+        let facts = facts_for_source(&src);
         assert!(
-            records.iter().any(|d| matches!(
-                &d.reason,
-                DegradeReason::RawPointerOperation { op } if op == method
-            )),
-            "`{method}` did not degrade its parameter; got {records:#?}"
+            facts
+                .raw_only
+                .iter()
+                .any(|(f, op)| f.contains("f") && op == method),
+            "`{method}` was not collected as a raw-only use; got {facts:#?}"
         );
     }
 }
@@ -639,17 +760,122 @@ fn impl_method_pointer_params_are_counted_as_excluded_not_invisible() {
     })
     .expect("fixture compiles");
 
+    // TWO, not one — and the second is `&self`.
+    //
+    // `ptr_chain_depth` (the predicate R-A made shared between the collector,
+    // E-R1 and this walk) counts `TyKind::Ref` as depth-bearing, so a `&self`
+    // receiver is a depth-1 parameter by its definition. That is a real
+    // consequence of adopting one predicate everywhere rather than a defect:
+    // sharing it is what makes the type-axis mapping check meaningful, so
+    // "pointer parameter" in M1's vocabulary means `ptr_chain_depth > 0` and
+    // the counts are read that way. Asserted at its true value with the reason
+    // named, rather than weakened to `>= 1`.
     assert_eq!(
-        report.excluded_impl, 1,
-        "the impl method's pointer parameter must be COUNTED as excluded, not \
-         skipped silently; report was {report:?}"
+        report.excluded.impl_items, 2,
+        "the impl method's parameters (`&self` and `p: *mut i32`) must be \
+         COUNTED as excluded, not skipped silently; report was {report:?}"
     );
     assert_eq!(
         report.subjects, 1,
         "the free function is the only M1 subject; report was {report:?}"
     );
+}
+
+/// **The exclusion counts reach a CONSUMER** (§4).
+///
+/// The buckets used to be written and read by nothing outside one test, while
+/// the ledger claimed they "flow into S2b's counters, visible as a number
+/// rather than as an absence". They now ride out on `RewriteOutcome`, which is
+/// what makes that claim true of a code path.
+///
+/// *Mutation-tested (Rider 0, deletion first):* delete `excluded` from the
+/// `Emitted` variant's construction site (returning `Excluded::default()`
+/// instead) and this fails.
+#[test]
+fn exclusion_counts_reach_the_outcome() {
+    let src = format!(
+        "{PREAMBLE}unsafe extern \"C\" {{\n    pub fn ext(p: *mut i32) -> i32;\n}}\n\
+         pub unsafe fn free_fn(q: *mut i32) -> i32 {{ *q }}\n"
+    );
+    match rewrite_m1(&src) {
+        RewriteOutcome::Emitted { excluded, .. } => assert_eq!(
+            excluded.foreign_items, 1,
+            "the extern declaration's pointer parameter must reach the outcome"
+        ),
+        RewriteOutcome::Degraded {
+            reason, excluded, ..
+        } => panic!("fixture degraded ({reason}); excluded was {excluded:?}"),
+    }
+}
+
+/// **R-A witness — the C2Rust alias class is COLLECTED and ATTRIBUTED.**
+///
+/// `pub type lil_value_t = *mut _lil_value_t` lowers to `TyKind::Path`, so the
+/// retired syntactic collector produced no subject for a parameter declared
+/// `val: lil_value_t`: BO decided it, and the rewriter discarded that decision
+/// with no `Decision`, no `Degradation`, no site and no reason. That is exactly
+/// the "unrewritten and unattributed" class the A1 layer exists to retire, and
+/// it is present in the evaluation corpus.
+///
+/// R-A rules these **collected, not excluded**. They are real C pointer
+/// parameters; what they get is a decision and an attributed reason, because
+/// emitting *through* an alias is a separate design question — the alias
+/// already contains the `*mut`, so `&mut lil_value_t` would be wrong.
+///
+/// *Mutation-tested (Rider 0, deletion first):* revert `collect_subjects` to
+/// the syntactic `let rustc_hir::TyKind::Ptr(..) = input.kind else { continue }`
+/// predicate and this fails — no subject is produced, so no degradation is
+/// attributed and the parameter is invisible again.
+#[test]
+fn alias_typed_pointer_params_are_collected_and_attributed() {
+    use super::decision::DegradeReason;
+    let src = format!(
+        "{PREAMBLE}pub struct _lil_value_t {{ pub n: i32 }}\n\
+         pub type lil_value_t = *mut _lil_value_t;\n\
+         pub unsafe fn take(val: lil_value_t) -> i32 {{ (*val).n }}\n"
+    );
+    let records = reasons_for_source(&src);
+    let hit = records
+        .iter()
+        .find(|d| d.reason == DegradeReason::NonPointerDecl { shape: "alias" })
+        .unwrap_or_else(|| {
+            panic!(
+                "the alias-typed parameter produced no attributed degradation — \
+                 it is invisible to the rewriter again; got {records:#?}"
+            )
+        });
     assert!(
-        report.excluded_total() > 0,
-        "excluded population must be visible as a number"
+        hit.subject.contains("take::val"),
+        "degradation names the wrong subject: {hit:?}"
+    );
+    assert!(hit.site.contains(':'), "no site: {hit:?}");
+}
+
+/// **The other half of the shared-predicate consequence: reference params.**
+///
+/// `ptr_chain_depth` counts `TyKind::Ref` as depth-bearing, so adopting it as
+/// the shared predicate (R-A) brings already-reference parameters into the
+/// subject universe too. That is deliberate — the collector and E-R1 must apply
+/// the SAME predicate or the type-axis comparison reports noise instead of
+/// mapping failures — and it is why [`DeclShape`] distinguishes `Reference`
+/// from `Alias`: they are one collection rule and two different reasons.
+///
+/// *Mutation-tested (Rider 0, deletion first):* delete the `TyKind::Ref` arm of
+/// the `decl_shape` match in `collect_subjects` (so it falls through to
+/// `Other`) and this fails on the shape string.
+#[test]
+fn reference_typed_params_are_collected_with_their_own_shape() {
+    use super::decision::DegradeReason;
+    let src = format!("{PREAMBLE}pub fn borrowed(v: &mut i32) -> i32 {{ *v }}\n");
+    let records = reasons_for_source(&src);
+    let hit = records
+        .iter()
+        .find(|d| d.reason == DegradeReason::NonPointerDecl { shape: "reference" })
+        .unwrap_or_else(|| {
+            panic!("the reference-typed parameter was not attributed; got {records:#?}")
+        });
+    assert!(
+        hit.subject.contains("borrowed::v"),
+        "degradation names the wrong subject: {hit:?}"
     );
 }

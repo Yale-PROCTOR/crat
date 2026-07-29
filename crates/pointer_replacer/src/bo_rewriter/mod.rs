@@ -42,17 +42,19 @@
 //! isolation checks. The decision table, edit plan and applier arrive in S1
 //! (G01 walking skeleton) and S2–S3 (breadth).
 
-#![allow(dead_code)]
-
+use rustc_hash::FxHashMap;
 use rustc_hir::{ItemKind, OwnerNode};
-use rustc_middle::{mir::Local, ty::TyCtxt};
+use rustc_middle::{
+    mir::Local,
+    ty::{Mutability, TyCtxt, TyKind},
+};
 
 use crate::{
     analyses::borrow_ownership::{
         CrateCtxt, borrow_verify::verify_to_fixpoint, coherence::add_coherence,
-        crate_slots::CrateSlots, emit_crate_ownership_constraints,
-        export::with_bo_export, mutability_facts::MutFacts, origins::compute_origins,
-        solver::KindSolver,
+        crate_slots::{CrateSlots, ptr_chain_depth},
+        emit_crate_ownership_constraints, export::with_bo_export, mutability_facts::MutFacts,
+        origins::compute_origins, solver::KindSolver,
     },
     utils::rustc::RustProgram,
 };
@@ -87,11 +89,17 @@ pub(crate) enum RewriteOutcome {
         source: String,
         degradations: Vec<decision::Degradation>,
         emitted_count: usize,
+        /// Pointer parameters on item kinds M1 does not rewrite. Carried out
+        /// here so the exclusions reach a consumer **by construction** — the
+        /// previous buckets were written and read by nothing outside one test,
+        /// while the ledger claimed they "flow into S2b's counters".
+        excluded: decision::universe::Excluded,
     },
     /// No emission, with whatever attribution was available.
     Degraded {
         reason: String,
         degradations: Vec<decision::Degradation>,
+        excluded: decision::universe::Excluded,
     },
 }
 
@@ -111,6 +119,15 @@ pub(crate) enum RewriteOutcome {
 ///
 /// Depth-0 pointer *parameters* decided `Ref`. Everything else degrades in the
 /// decision phase with a named reason.
+#[allow(
+    dead_code,
+    reason = "M1's only entry point, and it has no non-test caller until the \
+              rewriter is wired into the pipeline. The allow is HERE, on one \
+              item, rather than module-wide: seeding this as a live root keeps \
+              dead_code active over everything reachable from it, which is what \
+              the module-wide blanket switched off — it hid the two dead \
+              universe fields the lint exists to catch."
+)]
 pub(crate) fn rewrite_m1(input: &str) -> RewriteOutcome {
     let owned = input.to_owned();
     let result = ::utils::compilation::run_compiler_on_str(input, move |tcx| {
@@ -142,13 +159,33 @@ pub(crate) fn rewrite_m1(input: &str) -> RewriteOutcome {
 
         let subjects = collect_subjects(tcx, &program, &mut_facts);
         let facts = decision::emitability::collect(tcx, &program.functions);
-        let table = decision::decide(tcx, &subjects, &model, &slots, &facts);
+        let mut table = decision::decide(tcx, &subjects, &model, &slots, &facts);
 
-        // Structural gate: decision coverage (real, not a self-comparison).
-        let universe = decision::universe::classify(tcx);
-        if let Err(why) = table.coverage_over(&subjects, universe.subjects) {
-            return Err(format!("decision coverage gate: {why}"));
+        // Structural self-check: the table matches the subjects it was handed.
+        // NOT the coverage gate — every comparison in it is against the
+        // collector's own output.
+        if let Err(why) = table.is_self_consistent_over(&subjects) {
+            return Err(format!("decision table self-consistency: {why}"));
         }
+
+        // The coverage gate proper: two axes, two references, sets not counts.
+        // Reference surplus becomes attributed degradations (R-B); collector
+        // surplus fails loudly inside `reconcile`.
+        let universe = decision::universe::classify(tcx);
+        let mut arg_counts = FxHashMap::default();
+        for &g in &program.functions {
+            let body = tcx.mir_drops_elaborated_and_const_checked(g).borrow();
+            arg_counts.insert(g, body.arg_count);
+        }
+        let reconciliation = decision::coverage::reconcile(
+            tcx,
+            &program.functions,
+            &subjects,
+            &slots,
+            &arg_counts,
+            &universe,
+        );
+        table.coverage_gaps = reconciliation.gaps;
 
         let source_map = tcx.sess.source_map();
         let plan = plan::plan(&table, &owned, |span| {
@@ -167,11 +204,16 @@ pub(crate) fn rewrite_m1(input: &str) -> RewriteOutcome {
             ));
         }
         let degradations: Vec<decision::Degradation> = table.degradations().cloned().collect();
-        Ok((applied.source, degradations, table.emitted_count()))
+        Ok((
+            applied.source,
+            degradations,
+            table.emitted_count(),
+            universe.excluded,
+        ))
     });
 
     match result {
-        Ok(Ok((emitted, degradations, emitted_count))) => {
+        Ok(Ok((emitted, degradations, emitted_count, excluded))) => {
             // Hard gate: the emitted crate type-checks. S2b replaces this
             // whole-crate verdict with per-function granularity.
             if verify::type_checks(&emitted) {
@@ -179,21 +221,25 @@ pub(crate) fn rewrite_m1(input: &str) -> RewriteOutcome {
                     source: emitted,
                     degradations,
                     emitted_count,
+                    excluded,
                 }
             } else {
                 RewriteOutcome::Degraded {
                     reason: "emitted crate failed the type-check gate".to_owned(),
                     degradations,
+                    excluded,
                 }
             }
         }
         Ok(Err(reason)) => RewriteOutcome::Degraded {
             reason,
             degradations: Vec::new(),
+            excluded: decision::universe::Excluded::default(),
         },
         Err(_) => RewriteOutcome::Degraded {
             reason: "input crate did not compile".to_owned(),
             degradations: Vec::new(),
+            excluded: decision::universe::Excluded::default(),
         },
     }
 }
@@ -222,10 +268,33 @@ fn collect_program(tcx: TyCtxt<'_>) -> RustProgram<'_> {
     }
 }
 
-/// S1 subjects: each pointer-typed parameter of each local function.
+/// M1 subjects: each pointer-typed parameter of each local function, decided on
+/// the **resolved** type.
+///
+/// # Why resolved, not syntactic (R-A)
+///
+/// The previous collector matched `rustc_hir::TyKind::Ptr` on the syntactic HIR
+/// type node. A C2Rust type alias — `pub type lil_value_t = *mut _lil_value_t`
+/// — lowers to `TyKind::Path`, so a parameter declared `val: lil_value_t` was
+/// not a subject at all: BO decided it (MIR types are resolved) and the
+/// rewriter discarded that decision with no `Decision`, no `Degradation`, no
+/// site and no reason. That is the "unrewritten and unattributed" class the
+/// whole A1 layer exists to retire, and it is present in the evaluation corpus.
+///
+/// The predicate is now [`ptr_chain_depth`] over `tcx.fn_sig`'s inputs — the
+/// same in-tree function `CrateSlots` builds the slot universe from. **HIR
+/// supplies where, tcx supplies whether:** the plan edits source bytes, so the
+/// declaration span and the pointee span still come from HIR.
+///
+/// R-A rules these subjects **collected, not excluded** — they are real C
+/// pointer parameters. Whether each *emits* is A1's per-subject decision like
+/// any other, and the alias-specific emission obstacle (the alias already
+/// contains the `*mut`, so there is no pointee text to copy) degrades with its
+/// own attributed reason in [`decision::decide_one`].
 ///
 /// The MIR local of parameter `i` is `_{i+1}` — params occupy `_1 ..= arg_count`
-/// — which is what lets a HIR-side span pair with a MIR-side slot lookup.
+/// — which is what lets a HIR-side span pair with a MIR-side slot lookup. That
+/// mapping is what [`decision::coverage`]'s fail-loud arm guards.
 fn collect_subjects(
     tcx: TyCtxt<'_>,
     program: &RustProgram<'_>,
@@ -239,24 +308,40 @@ fn collect_subjects(
         };
         let body = tcx.hir_body(body_id);
         let fn_name = tcx.item_name(fn_did.to_def_id());
-        for (index, input) in decl.inputs.iter().enumerate() {
-            let rustc_hir::TyKind::Ptr(mut_ty) = input.kind else {
+        let sig = tcx.fn_sig(fn_did).skip_binder().skip_binder();
+        for (index, param_ty) in sig.inputs().iter().enumerate() {
+            if ptr_chain_depth(*param_ty) == 0 {
                 continue;
+            }
+            // F3: these used to `continue`, dropping the subject from BOTH the
+            // table and the count it was checked against — a double-sided drop
+            // no self-comparison could see. A mismatch here is a collector bug
+            // rather than a degradation, so it fails loudly instead of
+            // shrinking the work silently.
+            let Some(input) = decl.inputs.get(index) else {
+                panic!(
+                    "resolved signature of {fn_did:?} has input {index} but the HIR \
+                     declaration has only {} — parameter mapping broken",
+                    decl.inputs.len()
+                );
             };
             // The parameter's BINDING, so a use can be attributed to it without
             // relying on a name that might be shadowed in an inner scope.
-            //
-            // F3: this used to `continue`, dropping the subject from BOTH the
-            // table and the count it was checked against — a double-sided drop
-            // the gate could not see. The independent count now catches it, and
-            // a mismatch here is a collector bug rather than a degradation, so
-            // it fails loudly instead of shrinking the work silently.
             let Some(param) = body.params.get(index) else {
                 panic!(
                     "HIR fn_decl has input {index} but the body has no matching \
-                     param binding for {:?} — collector invariant broken",
-                    fn_did
+                     param binding for {fn_did:?} — collector invariant broken"
                 );
+            };
+            let (decl_shape, pointee_span) = match input.kind {
+                rustc_hir::TyKind::Ptr(mut_ty) => {
+                    (decision::DeclShape::RawPtr, Some(mut_ty.ty.span))
+                }
+                rustc_hir::TyKind::Ref(_, mut_ty) => {
+                    (decision::DeclShape::Reference, Some(mut_ty.ty.span))
+                }
+                rustc_hir::TyKind::Path(_) => (decision::DeclShape::Alias, None),
+                _ => (decision::DeclShape::Other, None),
             };
             let local = Local::from_usize(index + 1);
             subjects.push(decision::Subject {
@@ -265,14 +350,67 @@ fn collect_subjects(
                 hir_id: param.pat.hir_id,
                 label: format!("{fn_name}::{}", param_name(param)),
                 ty_span: input.span,
-                pointee_span: mut_ty.ty.span,
-                // The declared `*mut`/`*const` is a ceiling, not the decision:
-                // BO's mutability facts decide whether a `&mut` is warranted.
-                mutable: mut_ty.mutbl.is_mut() && mut_facts.is_mutable(fn_did, local),
+                pointee_span,
+                decl_shape,
+                // The declared mutability is a ceiling, not the decision: BO's
+                // mutability facts decide whether a `&mut` is warranted. Read
+                // off the RESOLVED type so it sees through an alias exactly as
+                // the pointer predicate above does.
+                mutable: matches!(
+                    param_ty.kind(),
+                    TyKind::RawPtr(_, Mutability::Mut) | TyKind::Ref(_, _, Mutability::Mut)
+                ) && mut_facts.is_mutable(fn_did, local),
             });
         }
     }
     subjects
+}
+
+/// **Census of the collector's own predicate** (§3, census discipline).
+///
+/// The ledger's `4171/0/0/2039` census came from an uncommitted scratchpad
+/// `syn` walk applying the same syntactic `*mut`/`*const` test as the
+/// classifier — so it inherited the alias blind spot and *could not have
+/// detected it*. A number enters the ledger only via a committed, in-tree code
+/// path; this is that path, and it runs the shipping collector.
+///
+/// `resolved - syntactic_ptr` is the population the retired predicate could not
+/// see, broken down by declaration shape so the alias class is a datum rather
+/// than a residual.
+// `cfg(test)` rather than `allow(dead_code)`: the only consumer is `bo_c1`'s
+// corpus harness, which is itself `cfg(test)`. Saying so is more honest than
+// silencing the lint, and it keeps the lint working here.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct CollectorCensus {
+    /// Subjects the shipping (resolved-type) collector produces.
+    pub resolved: usize,
+    /// What the retired syntactic `TyKind::Ptr` predicate would have produced.
+    pub syntactic_ptr: usize,
+    /// Resolved-only, declared through a path — **the C2Rust alias class**.
+    pub resolved_only_alias: usize,
+    /// Resolved-only, already a reference in source.
+    pub resolved_only_reference: usize,
+    /// Resolved-only, some other declaration form.
+    pub resolved_only_other: usize,
+}
+
+/// Run the shipping collector over `tcx` and count what it sees.
+#[cfg(test)]
+pub(crate) fn census(tcx: TyCtxt<'_>) -> CollectorCensus {
+    let program = collect_program(tcx);
+    let mut_facts = MutFacts::from_program(&program);
+    let mut census = CollectorCensus::default();
+    for subject in collect_subjects(tcx, &program, &mut_facts) {
+        census.resolved += 1;
+        match subject.decl_shape {
+            decision::DeclShape::RawPtr => census.syntactic_ptr += 1,
+            decision::DeclShape::Alias => census.resolved_only_alias += 1,
+            decision::DeclShape::Reference => census.resolved_only_reference += 1,
+            decision::DeclShape::Other => census.resolved_only_other += 1,
+        }
+    }
+    census
 }
 
 /// Source name of a parameter binding, for attribution.

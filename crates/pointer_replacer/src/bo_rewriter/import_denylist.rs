@@ -439,3 +439,112 @@ fn matcher_resolves_the_existing_merged_import_in_mod_rs() {
          witnesses the evasion H1 was about — pick another real input"
     );
 }
+
+// ---------------------------------------------------------------------------
+// R-C: the `if let` ban on outcome inspection, mechanized
+// ---------------------------------------------------------------------------
+
+/// **`if let RewriteOutcome::` is banned in this module tree.**
+///
+/// Twice a witness placed its load-bearing assertion inside
+/// `if let RewriteOutcome::Degraded { .. } = …` with no `else`, in a fixture
+/// that returns `Emitted` — so the assertion never ran. The second instance was
+/// written *in the commit that repaired the first*. A rule violated twice by
+/// the same author in consecutive rounds is the signature of something that
+/// needs a machine rather than a review note (R-C).
+///
+/// The check is deliberately narrow, and that is what makes it exact: clippy
+/// has no "if let without else" lint (`single_match_else` is the opposite
+/// shape), but the *type name* makes this shape unambiguous. Inspecting an
+/// outcome uses an exhaustive `match`, with every arm either asserting or
+/// documenting why it is unreachable.
+///
+/// A `let …else` (`let RewriteOutcome::Emitted { .. } = x else { panic!() }`)
+/// is NOT banned: its else branch is mandatory and diverging, so the
+/// unexecuted-assertion failure mode cannot arise.
+///
+/// *Mutation-tested (Rider 0, deletion first):* deleting the violation loop
+/// makes `if_let_ban_matches_a_synthetic_breach` fail.
+#[test]
+fn witnesses_never_inspect_an_outcome_with_a_bare_if_let() {
+    let root = module_root();
+    let mut files = Vec::new();
+    collect_rs_files(root, &mut files);
+    assert!(!files.is_empty(), "no sources scanned");
+
+    let mut violations = Vec::new();
+    for file in &files {
+        if is_denylist_self_reference(file, root) {
+            continue;
+        }
+        let text = fs::read_to_string(file).expect("source file is readable");
+        for (index, line) in text.lines().enumerate() {
+            if is_comment(line) {
+                continue;
+            }
+            if let Some(offense) = if_let_offense(line) {
+                violations.push(format!(
+                    "{}:{}: {offense}",
+                    file.strip_prefix(root).unwrap_or(file).display(),
+                    index + 1
+                ));
+            }
+        }
+    }
+
+    assert!(
+        violations.is_empty(),
+        "witnesses inspecting a RewriteOutcome must use an exhaustive `match` \
+         (or a diverging `let …else`), never a bare `if let` — the body is \
+         skipped for the arm the fixture actually takes, which is how two \
+         load-bearing assertions shipped unexecuted:\n  {}",
+        violations.join("\n  ")
+    );
+}
+
+/// The banned shape on one line, or `None`.
+fn if_let_offense(line: &str) -> Option<&'static str> {
+    let trimmed = line.trim_start();
+    if !trimmed.starts_with("if let ") {
+        return None;
+    }
+    if !trimmed.contains("RewriteOutcome::") {
+        return None;
+    }
+    Some("bare `if let` on a RewriteOutcome")
+}
+
+/// The R-C check must reject a real violation, not merely pass on clean code.
+///
+/// *Mutation-tested (Rider 0, deletion first):* deleting the
+/// `trimmed.contains("RewriteOutcome::")` guard in [`if_let_offense`] makes the
+/// negative cases below fail; deleting the `starts_with` guard makes the
+/// `match`/`let …else` cases fail.
+#[test]
+fn if_let_ban_matches_a_synthetic_breach() {
+    // The shape that shipped twice.
+    assert!(
+        if_let_offense("    if let RewriteOutcome::Degraded { reason, .. } = rewrite_m1(&src) {")
+            .is_some(),
+        "the exact shape this ban exists for was not detected"
+    );
+    // Indentation must not matter.
+    assert!(
+        if_let_offense("if let RewriteOutcome::Emitted { .. } = outcome {").is_some(),
+        "detection is indentation-sensitive"
+    );
+    // Permitted shapes.
+    assert!(
+        if_let_offense("    match rewrite_m1(&src) {").is_none(),
+        "an exhaustive match must not be flagged"
+    );
+    assert!(
+        if_let_offense("    let RewriteOutcome::Emitted { source, .. } = out else {").is_none(),
+        "a diverging `let …else` must not be flagged — its else branch is \
+         mandatory, so the unexecuted-assertion failure mode cannot arise"
+    );
+    assert!(
+        if_let_offense("    if let Some(span) = spans.first() {").is_none(),
+        "an `if let` on an unrelated type must not be flagged"
+    );
+}
