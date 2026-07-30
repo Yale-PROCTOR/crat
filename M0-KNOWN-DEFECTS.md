@@ -137,9 +137,46 @@ emits and that no text grep can see — not excluded C pointer parameters. The
 corpus still has **0 source-written `impl` blocks**. This row measures what the
 R-A predicate counts, and the predicate counts `TyKind::Ref`.
 
-**Reconciliation result, same run: 20/20 PASS.** Zero violations, zero
-findings, all three finding-class aggregates zero, and producer A's and
-producer B's row counts identical on every program.
+### Reconciliation — **GATE-ESTABLISHED 20/20** (re-run under enforcement, 2026-07-30)
+
+**The earlier 20/20 was row data read by a human, not a gate.** The worker set
+`status=ok` unconditionally after recording `recon=FAIL`, and no driver
+asserted anything — recorded as a round-end HIGH and repaired in Track 1. This
+row is the re-run **under enforcement**:
+
+```
+cargo test -p pointer_replacer --lib -- m1_recon_corpus --ignored --nocapture
+```
+
+`m1_recon_corpus` spawns one worker per program, continues past failures,
+enumerates every one, and **asserts** at sweep end on `status`, on `recon`, and
+on every finding-class aggregate against its expected-zero pin. The verdict
+itself is computed from the **written, re-read, decoded** artifacts, so an
+encoder or persistence defect reaches it.
+
+| | |
+|---|---|
+| programs | **20 / 20 PASS**, gate-established |
+| producer A rows / producer B rows | **4306 / 4306** |
+| violations · findings | **0 · 0** |
+| all three aggregates | **0** |
+| wall | 1063 s (brotli 577 s, bzip2 175 s, tulipindicators 156 s) |
+
+Every program's artifacts carry a `shasum`-computed SHA-256 in the sweep
+output, so each number is tied to the exact bytes behind it.
+
+**Read the agreement correctly.** Two independent derivations concurring is the
+expected result and is not, by itself, evidence the gate works — the four
+superseded gates agreed too. What differs is that this instrument is
+demonstrably *failable*: the permutation, single-term, five-severity-class,
+scan-accumulation and enforcement witnesses each fail on deletion. The corpus
+result says the derivations concur; the mutation matrix says the instrument
+could have said otherwise.
+
+**Residual, on the record:** the pairing axis compares `param_name` and
+`arg_index`, not the **span** — so a mis-association between a parameter's
+identity and the source bytes rewritten for it is not gated (round-end HIGH-1,
+Track 2, design pending).
 
 ### Why the previous census was retired
 
