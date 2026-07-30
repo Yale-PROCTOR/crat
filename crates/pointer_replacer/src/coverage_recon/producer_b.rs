@@ -8,11 +8,13 @@ use super::schema::{PairingConfidence, Row, sort_rows};
 
 #[allow(
     dead_code,
-    reason = "producer B's consumers land in later slices of S2a-H: the fixture \
-              reconciliation (C.1) and the corpus mode (C.4). Targeted on the \
-              entry point rather than module-wide — allowing an item makes it a \
-              live root, so dead_code stays active over everything reachable \
-              from it. Added at the B.3 merge (criterion 7)."
+    reason = "no non-test consumer until the rewriter is wired into \
+              the pipeline. EXPIRY-CORRECTED 2026-07-30: this reason used to \
+              say 'consumers land at C.1/C.4'. Both landed and the allow is \
+              still required, because both consumers are `cfg(test)` — a dated \
+              promise that came due and did not settle. Targeted on the entry \
+              point rather than module-wide: allowing an item makes it a live \
+              root, so the lint stays active over everything reachable from it."
 )]
 pub(crate) fn rows(tcx: TyCtxt<'_>) -> Vec<Row> {
     let mut rows = Vec::new();

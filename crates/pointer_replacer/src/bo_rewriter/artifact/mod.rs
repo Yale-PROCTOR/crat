@@ -46,10 +46,13 @@ fn wire_shape(shape: DeclShape) -> WireShape {
 /// Serialize the decision table as producer-A rows.
 #[allow(
     dead_code,
-    reason = "producer A's consumers land in later slices of S2a-H: the fixture \
-              reconciliation (C.1) and the corpus mode (C.4). Targeted rather \
-              than module-wide, and named with the slice, so it is a dated \
-              obligation rather than a blanket."
+    reason = "no non-test consumer until the rewriter is wired into \
+              the pipeline. EXPIRY-CORRECTED 2026-07-30: this reason used to \
+              say 'consumers land at C.1/C.4'. Both landed and the allow is \
+              still required, because both consumers are `cfg(test)` — a dated \
+              promise that came due and did not settle. Targeted on the entry \
+              point rather than module-wide: allowing an item makes it a live \
+              root, so the lint stays active over everything reachable from it."
 )]
 pub(crate) fn rows(tcx: TyCtxt<'_>, table: &DecisionTable) -> Vec<Row> {
     table

@@ -370,3 +370,53 @@ fn identical_artifacts_reconcile_clean() {
     assert!(v.passed(), "{v:#?}");
     assert!(v.findings.is_empty(), "{v:#?}");
 }
+
+// ---------------------------------------------------------------------------
+// T1.4-iv (residue B) — equal cardinality, DISJOINT membership
+// ---------------------------------------------------------------------------
+
+/// **Equal counts with different members must still fail.**
+///
+/// Restored: `equal_counts_with_different_members_still_fail` was deleted with
+/// `decision/coverage.rs` at C.2, and no surviving witness had its shape. The
+/// A-only and B-only tests use *unequal* counts; the permutation test uses
+/// equal counts with *equal keys*. Count-only agreement is exactly what the
+/// sets-not-cardinalities rule was written against, so it may not be the one
+/// property with no witness.
+///
+/// **Amendment 1 — why `!passed()` alone is not enough.** This fixture produces
+/// findings in BOTH directions: the A-only row is a violation, the B-only row a
+/// finding. Asserting only `!passed()` would survive deletion of the *B-only*
+/// loop, because the A-only violation alone still fails the verdict. So each
+/// direction is asserted non-empty separately, and both loop deletions are run
+/// as separate mutations. This is amendment (a)'s single-term lesson in set
+/// form.
+///
+/// *Mutation-tested (Rider 0, deletion first):* deleting the A-only loop fails
+/// the violation assertion; deleting the B-only loop fails the finding
+/// assertion. Neither hides behind the other.
+#[test]
+fn equal_counts_with_disjoint_members_fail_in_both_directions() {
+    let a = vec![
+        bare_row("f", 1, Some("p"), Some(1), 1),
+        bare_row("f", 9, Some("ghost"), Some(9), 1),
+    ];
+    let b = vec![
+        bare_row("f", 1, Some("p"), Some(1), 1),
+        bare_row("f", 2, Some("q"), Some(2), 1),
+    ];
+    assert_eq!(a.len(), b.len(), "the fixture must have EQUAL cardinality");
+
+    let v = compare(&a, &b);
+    assert!(
+        v.violations.iter().any(|x| x.class == "collector-surplus" && x.mir_local == 9),
+        "the A-only member produced no violation — a count-only comparison \
+         would accept this input: {v:#?}"
+    );
+    assert!(
+        v.findings.iter().any(|x| x.class == "out-of-coverage" && x.mir_local == 2),
+        "the B-only member produced no finding — a count-only comparison \
+         would accept this input: {v:#?}"
+    );
+    assert_eq!(v.aggregates["out-of-coverage"], 1, "{v:#?}");
+}

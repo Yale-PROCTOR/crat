@@ -104,12 +104,13 @@ fn pairing_agrees(a: &Row, b: &Row) -> bool {
 /// Reconcile producer A's rows against producer B's.
 #[allow(
     dead_code,
-    reason = "S2a-H lands its consumers in later slices: the fixture \
-              reconciliation (C.1) and the corpus mode (C.4). Targeted on the \
-              entry points rather than module-wide — allowing an item makes it \
-              a live root, so the lint stays active over everything reachable \
-              from it. A module-wide blanket is what hid two dead fields in the \
-              round this design replaces."
+    reason = "no non-test consumer until the rewriter is wired into \
+              the pipeline. EXPIRY-CORRECTED 2026-07-30: this reason used to \
+              say 'consumers land at C.1/C.4'. Both landed and the allow is \
+              still required, because both consumers are `cfg(test)` — a dated \
+              promise that came due and did not settle. Targeted on the entry \
+              point rather than module-wide: allowing an item makes it a live \
+              root, so the lint stays active over everything reachable from it."
 )]
 pub(crate) fn compare(a_rows: &[Row], b_rows: &[Row]) -> Verdict {
     let mut verdict = Verdict::default();

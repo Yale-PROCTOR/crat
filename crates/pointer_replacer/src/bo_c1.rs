@@ -6918,36 +6918,50 @@ mod run {
         row
     }
 
-    /// **S2a-H corpus reconciliation** (C.4 + C.5).
+    /// **S2a-H corpus reconciliation** (C.4 + C.5, repaired in Track 1).
     ///
     /// Emits producer A's and producer B's artifacts for one program and
     /// reconciles them. The comparison itself lives in `coverage_recon`; this
     /// is the harness that feeds it and reports the per-program verdict.
     ///
+    /// # The verdict flows THROUGH THE FILES
+    ///
+    /// The artifacts are written, read back, decoded, and the **decoded** rows
+    /// are what `compare` sees. That is the ratified architecture — the
+    /// comparison is an artifact diff — and the first implementation quietly
+    /// deviated from it by comparing the in-memory rows, which meant `decode`
+    /// had no consumer and an encoder defect could not reach a verdict.
+    ///
+    /// `CRAT_BOC1_ARTIFACT_DIR` is therefore **mandatory** for this mode: no
+    /// files, no verdict. Write failures panic rather than being swallowed.
+    ///
     /// # Per-program verdict (C.5)
     ///
-    /// A pairing mismatch is **fail-loud at PROGRAM granularity**: this
-    /// program's `recon` is `FAIL` and its rewriter output is untrusted, but
-    /// the row is still printed and **the sweep continues**, so one run yields
-    /// the full incidence rather than halting at the first program. Every
-    /// violation is enumerated with both sides' name and index.
-    ///
-    /// # Aggregates
-    ///
-    /// Every finding class is reported **even at zero**, so the corpus gate can
-    /// pin it. Attribution without aggregation is how downgrades go silent.
+    /// `status` DERIVES from the verdict; it is never an unconditional `ok`.
+    /// A pairing mismatch fails this program and its rewriter output is
+    /// untrusted, but the row is still printed and **the sweep continues**, so
+    /// one run yields full incidence rather than halting at the first failure.
     ///
     /// # Provenance
     ///
-    /// The artifacts are run-products, not repo-committed: each is stamped with
-    /// its SHA-256 and the row counts it summarises, so a reported number can be
-    /// tied back to the exact bytes that produced it.
+    /// The artifacts are run-products. Their SHA-256 digests are computed by
+    /// the DRIVER with `shasum` — the tool that already guards the
+    /// frozen-corpus digest — rather than in-process by a crypto dependency
+    /// added for one stamp. This function records the paths; the driver
+    /// records the digests.
     pub fn run_m1_recon(tcx: TyCtxt<'_>, t_tcx: Duration) -> Row {
         use crate::coverage_recon::{compare, producer_b, schema};
 
         let t0 = Instant::now();
         let mut row = Row::default();
         row.set("t_tcx_s", secs(t_tcx));
+
+        let dir = std::env::var_os("CRAT_BOC1_ARTIFACT_DIR").map(std::path::PathBuf::from).expect(
+            "m1-recon requires CRAT_BOC1_ARTIFACT_DIR: the verdict is computed \
+             from the written artifacts, so without a directory there is no \
+             verdict to compute",
+        );
+        let name = std::env::var("CRAT_BOC1_NAME").unwrap_or_else(|_| "unnamed".to_string());
 
         let a = match crate::bo_rewriter::artifact_rows(tcx) {
             Ok(rows) => rows,
@@ -6960,38 +6974,79 @@ mod run {
         };
         let b = producer_b::rows(tcx);
 
-        let a_text = schema::encode(&a);
-        let b_text = schema::encode(&b);
-        row.set("a_rows", a.len());
-        row.set("b_rows", b.len());
-
-        // Provenance: the artifacts are RUN-PRODUCTS, written to disk so a
-        // reported number can be tied to the exact bytes that produced it, and
-        // hashed by `shasum` — the same tool that guards the frozen-corpus
-        // digest — rather than by a crypto dependency added for one stamp.
-        if let Some(dir) = std::env::var_os("CRAT_BOC1_ARTIFACT_DIR") {
-            let dir = std::path::PathBuf::from(dir);
-            let name = std::env::var("CRAT_BOC1_NAME").unwrap_or_else(|_| "unnamed".to_string());
-            if std::fs::create_dir_all(&dir).is_ok() {
-                let a_path = dir.join(format!("{name}.a.jsonl"));
-                let b_path = dir.join(format!("{name}.b.jsonl"));
-                let wrote_a = std::fs::write(&a_path, &a_text).is_ok();
-                let wrote_b = std::fs::write(&b_path, &b_text).is_ok();
-                if wrote_a && wrote_b {
-                    row.set("a_path", a_path.display());
-                    row.set("b_path", b_path.display());
-                }
-            }
+        // TEST SEAM. Refused unless the fault variable is set; it exists so the
+        // enforcement path has a witness that a real defect would trigger.
+        let fault = std::env::var("CRAT_BOC1_RECON_FAULT").unwrap_or_default();
+        let mut a_text = schema::encode(&a);
+        if fault == "drop-a-row" {
+            a_text = a_text.lines().skip(1).collect::<Vec<_>>().join("\n") + "\n";
         }
+        let b_text = schema::encode(&b);
 
-        let verdict = compare::compare(&a, &b);
+        std::fs::create_dir_all(&dir)
+            .unwrap_or_else(|e| panic!("artifact dir {dir:?} not creatable: {e}"));
+        let a_path = dir.join(format!("{name}.a.jsonl"));
+        let b_path = dir.join(format!("{name}.b.jsonl"));
+        std::fs::write(&a_path, &a_text)
+            .unwrap_or_else(|e| panic!("artifact {a_path:?} not writable: {e}"));
+        std::fs::write(&b_path, &b_text)
+            .unwrap_or_else(|e| panic!("artifact {b_path:?} not writable: {e}"));
+        if fault == "corrupt-a-file" {
+            let corrupted = std::fs::read_to_string(&a_path).expect("written artifact readable");
+            std::fs::write(&a_path, corrupted.replacen('{', "{,", 1)).expect("corrupt artifact");
+        }
+        if fault == "alter-a-file" {
+            // VALID JSONL, different VALUE. This is the fault that proves the
+            // verdict reads the FILE: a syntactic corruption is caught by the
+            // decode step alone and would leave an in-memory comparison passing.
+            let text = std::fs::read_to_string(&a_path).expect("written artifact readable");
+            std::fs::write(&a_path, text.replacen("\"param_name\":\"p\"", "\"param_name\":\"ZZ\"", 1))
+                .expect("alter artifact");
+        }
+        row.set("a_path", a_path.display());
+        row.set("b_path", b_path.display());
+
+        // THE VERDICT IS COMPUTED FROM THE FILES.
+        let a_decoded = match schema::decode(
+            &std::fs::read_to_string(&a_path).expect("producer A artifact readable"),
+        ) {
+            Ok(rows) => rows,
+            Err(why) => {
+                row.set("status", "artifact-a-undecodable");
+                row.set("detail", super::report::sanitize(&why));
+                row.set("recon", "FAIL");
+                row.set("t_total_s", secs(t0.elapsed() + t_tcx));
+                return row;
+            }
+        };
+        let b_decoded = match schema::decode(
+            &std::fs::read_to_string(&b_path).expect("producer B artifact readable"),
+        ) {
+            Ok(rows) => rows,
+            Err(why) => {
+                row.set("status", "artifact-b-undecodable");
+                row.set("detail", super::report::sanitize(&why));
+                row.set("recon", "FAIL");
+                row.set("t_total_s", secs(t0.elapsed() + t_tcx));
+                return row;
+            }
+        };
+        row.set("a_rows", a_decoded.len());
+        row.set("b_rows", b_decoded.len());
+
+        let verdict = compare::compare(&a_decoded, &b_decoded);
+        let mut aggregates_clean = true;
         for class in compare::FINDING_CLASSES {
             let n = verdict.aggregates.get(class).copied().unwrap_or(0);
+            if n != 0 {
+                aggregates_clean = false;
+            }
             row.set(&format!("agg_{}", class.replace('-', "_")), n);
         }
         row.set("violations", verdict.violations.len());
         row.set("findings", verdict.findings.len());
-        row.set("recon", if verdict.passed() { "PASS" } else { "FAIL" });
+        let passed = verdict.passed() && aggregates_clean;
+        row.set("recon", if passed { "PASS" } else { "FAIL" });
 
         // Enumerate rather than summarise: full incidence in one run.
         for v in &verdict.violations {
@@ -7014,7 +7069,8 @@ mod run {
         row.set("excl_foreign", universe.excluded.foreign_items);
 
         row.set("t_total_s", secs(t0.elapsed() + t_tcx));
-        row.set("status", "ok");
+        // DERIVED, never an unconditional ok.
+        row.set("status", if passed { "ok" } else { "recon-fail" });
         row
     }
 
@@ -7861,6 +7917,121 @@ fn nbr_tracked_solver_guard_panics() {
 }
 
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// S2a-H — the ASSERTING corpus driver (Track 1, T1.2)
+// ---------------------------------------------------------------------------
+
+/// SHA-256 of a file via `shasum`, the tool that already guards the
+/// frozen-corpus digest. Driver-side on purpose: a crypto dependency added for
+/// one provenance stamp would be disproportionate.
+#[cfg(test)]
+fn shasum_of(path: &std::path::Path) -> String {
+    let out = std::process::Command::new("shasum")
+        .args(["-a", "256"])
+        .arg(path)
+        .output()
+        .unwrap_or_else(|e| panic!("shasum not runnable for {path:?}: {e}"));
+    assert!(out.status.success(), "shasum failed on {path:?}");
+    String::from_utf8_lossy(&out.stdout)
+        .split_whitespace()
+        .next()
+        .unwrap_or("")
+        .to_owned()
+}
+
+/// **The corpus reconciliation gate.**
+///
+/// Before Track 1 this sweep was report-only: the worker recorded `recon=FAIL`
+/// and then set `status=ok`, no driver asserted anything, and a 20/20 PASS was
+/// established by a human reading rows. This test is the enforcement.
+///
+/// It **continues past failures** and enumerates them all before asserting, so
+/// one run yields full incidence rather than halting at the first program.
+#[test]
+#[ignore = "S2a-H corpus gate: spawns one worker per program"]
+fn m1_recon_corpus() {
+    use std::{fs, time::Duration};
+
+    let root = orchestrate::workspace_root();
+    let art = orchestrate::out_dir().join("m1-recon-artifacts");
+    let _ = fs::remove_dir_all(&art);
+    fs::create_dir_all(&art).expect("artifact dir");
+
+    let timeout = Duration::from_secs(
+        std::env::var("CRAT_BOC1_RECON_TIMEOUT_SECS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(3000),
+    );
+
+    let mut failures: Vec<String> = Vec::new();
+    let mut rows: Vec<report::Row> = Vec::new();
+
+    for program in CORPUS {
+        let input = program.input_path(&root);
+        assert!(input.is_file(), "missing rs-crown input: {input:?}");
+        let outcome = orchestrate::run_child_env(
+            program.name,
+            &input,
+            "m1-recon",
+            timeout,
+            &[("CRAT_BOC1_ARTIFACT_DIR", art.display().to_string())],
+        );
+
+        let Some(row) = outcome.row.clone() else {
+            failures.push(format!(
+                "{}: no sentinel row (orchestrator status={})",
+                program.name, outcome.status
+            ));
+            continue;
+        };
+        let recon = row.get("recon").unwrap_or("missing").to_owned();
+        let status = row.get("status").unwrap_or("missing").to_owned();
+
+        if status != "ok" {
+            failures.push(format!("{}: status={status} recon={recon}", program.name));
+        }
+        if recon != "PASS" {
+            failures.push(format!("{}: recon={recon}", program.name));
+        }
+        for class in crate::coverage_recon::compare::FINDING_CLASSES {
+            let key = format!("agg_{}", class.replace('-', "_"));
+            let n: usize = row.get(&key).and_then(|v| v.parse().ok()).unwrap_or(0);
+            if n != 0 {
+                // The expected-zero pin. A nonzero class is a gate-level
+                // finding to rule on, never auto-green: attribution without
+                // aggregation is how downgrades go silent.
+                failures.push(format!("{}: {key}={n} (expected 0)", program.name));
+            }
+        }
+
+        // Provenance: digests of the exact bytes the verdict was computed from.
+        let mut stamped = row.clone();
+        for (key, suffix) in [("a_sha256", "a"), ("b_sha256", "b")] {
+            let path = art.join(format!("{}.{suffix}.jsonl", program.name));
+            if path.is_file() {
+                stamped.set(key, shasum_of(&path));
+            }
+        }
+        rows.push(stamped);
+    }
+
+    for row in &rows {
+        println!("{}", report::to_kv_line(row));
+    }
+    assert_eq!(
+        rows.len() + failures.iter().filter(|f| f.contains("no sentinel")).count(),
+        CORPUS.len(),
+        "every corpus program must be attempted"
+    );
+    assert!(
+        failures.is_empty(),
+        "S2a-H corpus reconciliation FAILED ({} finding(s)) — full incidence:\n  {}",
+        failures.len(),
+        failures.join("\n  ")
+    );
+}
+
 // Worker (one program, one mode, one process).
 // ---------------------------------------------------------------------------
 
@@ -7934,6 +8105,25 @@ fn boc1_run_one() {
     ident.set("mode", &mode);
     ident.0.extend(row.0.drain(..));
     println!("{}", report::to_kv_line(&ident));
+
+    // T1.2b — the worker PROCESS fails when the reconciliation does.
+    //
+    // Deliberately scoped to `m1-recon`. Applying it to every mode would change
+    // how the solver sweeps treat `compile-error` and `decline`, silently
+    // shifting results the ledger already cites — a blast radius well outside
+    // this repair.
+    //
+    // The panic comes AFTER the sentinel line, so a failing program still
+    // reports its row and the driver still sees full incidence.
+    if mode == "m1-recon" {
+        let status = ident.get("status").unwrap_or("missing");
+        assert_eq!(
+            status, "ok",
+            "m1-recon: {name} did not reconcile (status={status}). The verdict \
+             is the process result — a run that reports FAIL and exits green is \
+             report-only, which is exactly the defect this scoping repairs."
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -8396,6 +8586,29 @@ mod orchestrate {
     /// file-redirected stdio; supervise with deadline + RSS cap; classify.
     pub fn run_child(program: &str, input: &Path, mode: &str, timeout: Duration) -> ChildOutcome {
         run_child_labeled(program, input, mode, mode, timeout)
+    }
+
+    /// `run_child` with extra environment for the child.
+    ///
+    /// Added for S2a-H's corpus gate: `m1-recon` computes its verdict from
+    /// written artifacts, so the child needs a directory to write them into.
+    pub fn run_child_env(
+        program: &str,
+        input: &Path,
+        mode: &str,
+        timeout: Duration,
+        extra: &[(&str, String)],
+    ) -> ChildOutcome {
+        for (key, value) in extra {
+            // SAFETY-adjacent note: the corpus driver is single-threaded at
+            // this point and the child inherits the environment at spawn.
+            unsafe { std::env::set_var(key, value) };
+        }
+        let outcome = run_child_labeled(program, input, mode, mode, timeout);
+        for (key, _) in extra {
+            unsafe { std::env::remove_var(key) };
+        }
+        outcome
     }
 
     pub fn run_child_labeled(

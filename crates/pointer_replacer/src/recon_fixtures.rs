@@ -73,3 +73,152 @@ fn the_reconciliation_compares_a_non_empty_population() {
     assert_eq!(rows.len(), 2, "fixture must yield two rows: {rows:#?}");
     assert!(reconcile(src).passed());
 }
+
+// ---------------------------------------------------------------------------
+// T1.4 (i)–(iii) — the ENFORCEMENT witnesses
+// ---------------------------------------------------------------------------
+//
+// Before Track 1 the corpus path recorded `recon=FAIL` and exited green. These
+// drive the real worker through the real fault seams and assert the PROCESS
+// result, because a verdict that does not change an exit code is a report.
+
+use std::{path::PathBuf, process::Command};
+
+/// Run the `m1-recon` worker on a tiny fixture crate, returning (success, log).
+fn run_worker(tag: &str, fault: Option<&str>, artifact_dir: &PathBuf) -> (bool, String) {
+    let src_dir = std::env::temp_dir().join(format!("crat-recon-{}-{tag}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&src_dir);
+    std::fs::create_dir_all(&src_dir).expect("fixture dir");
+    let input = src_dir.join("lib.rs");
+    std::fs::write(
+        &input,
+        "#![allow(dead_code)]\npub unsafe fn f(p: *mut i32, q: *mut u8) -> i32 { *p }\n",
+    )
+    .expect("write fixture");
+
+    let mut cmd = Command::new(std::env::current_exe().expect("current_exe"));
+    cmd.args(["bo_c1::boc1_run_one", "--exact", "--ignored", "--nocapture"])
+        .env("CRAT_BOC1_INPUT", &input)
+        .env("CRAT_BOC1_MODE", "m1-recon")
+        .env("CRAT_BOC1_NAME", tag)
+        .env("CRAT_BOC1_ARTIFACT_DIR", artifact_dir)
+        .env("DIR", env!("CARGO_MANIFEST_DIR"));
+    if let Some(f) = fault {
+        cmd.env("CRAT_BOC1_RECON_FAULT", f);
+    }
+    let out = cmd.output().expect("worker runs");
+    let log = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    (out.status.success(), log)
+}
+
+fn artifact_dir(tag: &str) -> PathBuf {
+    let d = std::env::temp_dir().join(format!("crat-recon-art-{}-{tag}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&d);
+    std::fs::create_dir_all(&d).expect("artifact dir");
+    d
+}
+
+/// **(i) A verdict failure fails the PROCESS.**
+///
+/// *Mutation-tested (Rider 0, deletion first):* delete the derived
+/// `row.set("status", …)` in `run_m1_recon` (restoring an unconditional `ok`)
+/// and this passes — which is precisely the report-only defect.
+#[test]
+#[ignore = "spawns a worker process"]
+fn an_injected_row_drop_fails_the_worker_process() {
+    let art = artifact_dir("drop");
+    let (ok, log) = run_worker("faulty", Some("drop-a-row"), &art);
+    assert!(
+        !ok,
+        "the worker exited GREEN on a failed reconciliation — the verdict is \
+         report-only:\n{log}"
+    );
+    assert!(log.contains("recon=FAIL"), "no FAIL verdict recorded:\n{log}");
+}
+
+/// **(ii-a) A syntactically corrupt ARTIFACT fails through the DECODE path.**
+///
+/// *Mutation-tested (Rider 0, deletion first):* deleting the decode-error arm
+/// fails this.
+#[test]
+#[ignore = "spawns a worker process"]
+fn a_corrupted_artifact_fails_the_verdict() {
+    let art = artifact_dir("corrupt");
+    let (ok, log) = run_worker("corrupt", Some("corrupt-a-file"), &art);
+    assert!(!ok, "a corrupted artifact did not fail:\n{log}");
+    assert!(
+        log.contains("artifact-a-undecodable"),
+        "the failure did not come through the DECODE path:\n{log}"
+    );
+}
+
+/// **(ii-b) An ALTERED artifact — valid JSONL, different value — fails the
+/// verdict.**
+///
+/// This is the witness that actually proves the comparison reads the FILE.
+/// (ii-a) does not: a syntactic corruption is caught by the decode step alone,
+/// so rerouting `compare` to the in-memory rows leaves (ii-a) passing — which
+/// it demonstrably did, as a SURVIVING mutant, until this test existed.
+///
+/// The fault here writes a well-formed row with a different `param_name`, so
+/// decode succeeds and only the comparison's *input* decides the outcome.
+///
+/// *Mutation-tested (Rider 0, deletion first):* rerouting `compare` to
+/// `(&a, &b)` — the in-memory rows — fails this.
+#[test]
+#[ignore = "spawns a worker process"]
+fn an_altered_artifact_fails_the_verdict_through_the_file() {
+    let art = artifact_dir("alter");
+    let (ok, log) = run_worker("alter", Some("alter-a-file"), &art);
+    assert!(
+        !ok,
+        "an altered-but-valid artifact did not fail — the comparison is reading \
+         the in-memory rows, not the files:\n{log}"
+    );
+    assert!(
+        log.contains("pairing-mismatch") || log.contains("recon=FAIL"),
+        "the failure did not come through the COMPARISON:\n{log}"
+    );
+}
+
+/// **(iii) An unwritable artifact directory fails loudly.**
+///
+/// **Multi-guard control — no SINGLE deletion defeats it, and that is stated
+/// rather than dressed up.** Swallowing the write alone was run as a mutation
+/// and SURVIVED: with the verdict computed from the files, an unwritten
+/// artifact is caught again by the read-back, and again by the decode, and
+/// again by the comparison seeing an empty side. The property is guarded in
+/// depth, so the honest claim is that this witness proves the END-TO-END
+/// behaviour, not that it isolates the write's `expect`.
+#[test]
+#[ignore = "spawns a worker process"]
+fn an_unwritable_artifact_dir_fails_loudly() {
+    // A regular FILE where a directory is required.
+    let blocker = std::env::temp_dir().join(format!("crat-recon-blocker-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&blocker);
+    std::fs::write(&blocker, b"not a directory").expect("write blocker");
+    let (ok, log) = run_worker("unwritable", None, &blocker);
+    assert!(
+        !ok,
+        "a write failure was SWALLOWED — the verdict would rest on artifacts \
+         that were never persisted:\n{log}"
+    );
+}
+
+/// The clean path still passes, so the three negatives above are not passing
+/// because the worker always fails.
+///
+/// **Positive control; no deletion mutation fails it** — stated rather than
+/// dressed up.
+#[test]
+#[ignore = "spawns a worker process"]
+fn the_clean_worker_path_still_succeeds() {
+    let art = artifact_dir("clean");
+    let (ok, log) = run_worker("clean", None, &art);
+    assert!(ok, "the unfaulted worker failed:\n{log}");
+    assert!(log.contains("recon=PASS"), "no PASS verdict:\n{log}");
+}
