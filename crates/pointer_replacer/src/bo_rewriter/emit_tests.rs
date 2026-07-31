@@ -537,18 +537,28 @@ fn direction_identifies_a_rewritten_value_flowing_into_a_raw_context() {
     );
 }
 
-/// **Non-vacuity.** A crate that type-checks yields no errors and no
-/// diagnostics — without this, every count above is compatible with a capture
-/// that reports errors unconditionally.
+/// **Non-vacuity, and the WARNING filter.** A crate that type-checks yields no
+/// errors — without this, every count above is compatible with a capture that
+/// reports errors unconditionally.
+///
+/// The fixture **deliberately emits a warning** (`unused_variables`, with no
+/// crate-level `allow`) so that the `Level` filter is load-bearing here.
 ///
 /// *Mutation-tested, Rider 0 order.* **Deletion first:** drop the `Level` filter
-/// in `emit_diagnostic` (count warnings too) and this fails — the fixture emits
-/// warnings.
+/// in `emit_diagnostic` and this fails — the warning is counted as an error.
+///
+/// **Written after the first version SURVIVED that deletion.** It used the
+/// `ROOT_WITH_MODULE` fixture, whose `#![allow(dead_code, unused_unsafe)]`
+/// suppresses every warning, so there was nothing for the filter to filter and
+/// the doc comment's claim that "the fixture emits warnings" was simply untrue.
 #[test]
 fn a_clean_crate_yields_no_diagnostics() {
     let (d, _fixture) = diagnose_after_rewrite(&[
-        ("lib.rs", ROOT_WITH_MODULE),
-        ("m.rs", MODULE_SUBJECT),
+        ("lib.rs", "pub mod m;\n"),
+        (
+            "m.rs",
+            "pub unsafe fn bump(p: *mut i32) -> i32 {\n    let unused_thing = 5;\n    *p += 1;\n    *p\n}\n",
+        ),
     ]);
     assert_eq!(d.errors, 0, "a clean rewrite reported errors: {d:?}");
     assert!(d.diags.is_empty(), "{d:?}");
