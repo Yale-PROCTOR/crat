@@ -642,3 +642,70 @@ fn the_round_cap_stops_the_loop() {
         }
     }
 }
+
+/// `caller` passes one rewritten parameter (`q`) through and one raw parameter
+/// (`r`) to `callee`, which IS rewritten. That is heman's inverted shape: the
+/// culprit is the CALLEE, while the error lands inside the caller.
+const INVERTED: &str = "pub unsafe fn callee(p: *mut i32) -> i32 {\n    *p\n}\npub unsafe fn caller(q: *mut i32, r: *mut i32) -> i32 {\n    *q + callee(r)\n}\n";
+
+/// Force `caller`'s `r` to stay raw, so the rewritten `callee` is reached with a
+/// raw pointer. A1's `CallSiteNotAdapted` normally prevents this — which is why
+/// it is injected at the phase boundary rather than written as source.
+fn keep_r_raw(table: &mut super::decision::DecisionTable) {
+    for (subject, decision) in &mut table.entries {
+        // Force the CALLEE to be rewritten — A1 degrades it precisely because
+        // its call site is unadapted, which is the guard this injection exists
+        // to step around.
+        if subject.param_name.as_deref() == Some("p") {
+            *decision = super::decision::Decision::Ref { mutable: false };
+        }
+        if subject.param_name.as_deref() == Some("q") {
+            *decision = super::decision::Decision::Ref { mutable: false };
+        }
+        if subject.param_name.as_deref() == Some("r") {
+            *decision = super::decision::Decision::Degraded(super::decision::Degradation {
+                subject: "caller::r".to_owned(),
+                site: "<injected>".to_owned(),
+                reason: super::decision::DegradeReason::CallSiteNotAdapted,
+            });
+        }
+    }
+}
+
+/// **S2b.1.3 — the NO-PROGRESS DETECTOR arm, witnessed.**
+///
+/// The inverted-direction shape: the error lands inside `caller`, so span
+/// attribution reverts `caller` — but the culprit is `callee`, and the error
+/// survives. The detector sees the error count fail to fall and escalates.
+///
+/// **Why injection is legitimate here.** This is a DERIVED breach shape, not an
+/// invention: reality emits it (1 of 86 corpus diagnostics, in heman), and A1's
+/// `CallSiteNotAdapted` is exactly what normally prevents it — so it cannot be
+/// written as ordinary source. The between-phase hook exists to test downstream
+/// phases against shapes the upstream guard suppresses.
+///
+/// *Mutation-tested, Rider 0 order.* **Deletion first:** disable the
+/// no-progress check and this fails — the loop no longer escalates.
+#[test]
+fn the_no_progress_detector_escalates_when_attribution_is_wrong() {
+    let fixture = Fixture::new(&[
+        ("lib.rs", "#![allow(dead_code, unused_unsafe)]\npub mod m;\n"),
+        ("m.rs", INVERTED),
+    ]);
+    match super::rewrite_m1_path_injected(&fixture.root(), 8, &keep_r_raw) {
+        super::RewriteOutcome::Degraded { reason, .. } => {
+            assert!(
+                reason.contains("no progress"),
+                "escalated, but not via the detector: {reason}"
+            );
+            assert!(
+                reason.contains("bisect"),
+                "the escalation must name its successor mechanism: {reason}"
+            );
+        }
+        super::RewriteOutcome::Emitted { emitted_count, .. } => panic!(
+            "the loop converged on a shape whose culprit it cannot attribute \
+             (emitted {emitted_count}) — attribution silently got away with it"
+        ),
+    }
+}
