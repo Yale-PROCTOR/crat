@@ -7,12 +7,13 @@
 //! is not a question the goldens could ever have asked.
 
 use std::{
+    collections::BTreeMap,
     fs,
     path::PathBuf,
     sync::atomic::{AtomicUsize, Ordering},
 };
 
-use super::{Emission, decide_table, emit_files, plan::FileKey};
+use super::{Emission, decide_table, emit_files, plan::FileKey, verify};
 
 static NEXT_FIXTURE: AtomicUsize = AtomicUsize::new(0);
 
@@ -33,6 +34,30 @@ impl Fixture {
         Self(dir)
     }
 
+    fn root(&self) -> PathBuf {
+        self.0.join("lib.rs")
+    }
+
+    /// Every file in the fixture tree, by relative path, with its bytes.
+    /// Compared in-process rather than shelling out — a byte comparison here is
+    /// the evidence, not a tool's summary of one.
+    fn snapshot(&self) -> BTreeMap<PathBuf, Vec<u8>> {
+        fn walk(dir: &std::path::Path, base: &std::path::Path, out: &mut BTreeMap<PathBuf, Vec<u8>>) {
+            for entry in fs::read_dir(dir).expect("fixture tree readable") {
+                let entry = entry.expect("fixture entry");
+                let path = entry.path();
+                if entry.file_type().expect("file type").is_dir() {
+                    walk(&path, base, out);
+                } else {
+                    let key = path.strip_prefix(base).expect("under base").to_path_buf();
+                    out.insert(key, fs::read(&path).expect("fixture file readable"));
+                }
+            }
+        }
+        let mut out = BTreeMap::new();
+        walk(&self.0, &self.0, &mut out);
+        out
+    }
 }
 
 impl Drop for Fixture {
@@ -178,5 +203,86 @@ fn a_macro_generated_declaration_is_recorded_as_unplaceable() {
         emission.files.is_empty(),
         "nothing is emitted for an unplaceable subject: {:?}",
         emission.files.keys().collect::<Vec<_>>()
+    );
+}
+
+// ---------------------------------------------------------------------------
+// S2b.0a.2 — verify from a temp copy. The isolation witness lands HERE, before
+// any corpus contact, by ruling: the frozen tree's digest is a standing
+// invariant, so the guard that protects it must exist before the first run that
+// could threaten it.
+// ---------------------------------------------------------------------------
+
+/// **RED.** A rewritten two-file crate compiles *as a crate* from the temp copy
+/// — which the string gate cannot express, because modules resolve relative to
+/// the root's directory.
+///
+/// *Mutation-tested, Rider 0 order.* **Deletion first:** remove the overwrite
+/// loop in `materialize` and this fails. The `contains` assertion is what makes
+/// that deletion detectable: the untouched copy still type-checks, so a witness
+/// that only asserted the gate passed would survive the deletion — the
+/// outcome-counting shape that already cost one repair this slice.
+#[test]
+fn a_rewritten_two_file_crate_type_checks_from_a_temp_copy() {
+    let fixture = Fixture::new(&[("lib.rs", ROOT_WITH_MODULE), ("m.rs", MODULE_SUBJECT)]);
+    let emission = emit(&fixture);
+    let temp = verify::materialize(&fixture.root(), &emission.files).expect("materialize");
+
+    let copied = fs::read_to_string(temp.root().parent().expect("temp dir").join("m.rs"))
+        .expect("module present in the copy");
+    assert!(
+        copied.contains("p: &mut i32"),
+        "the copy does not carry the rewrite: {copied}"
+    );
+    assert!(
+        verify::type_checks_crate(temp.root()),
+        "the rewritten crate must type-check as a crate"
+    );
+}
+
+/// **Non-vacuity.** The temp-copy gate can FAIL. Without this, every passing
+/// result above is compatible with a gate that always says yes.
+///
+/// *Mutation-tested, Rider 0 order.* **Deletion first:** make
+/// `type_checks_crate` return `true` unconditionally and this fails.
+#[test]
+fn a_broken_rewrite_fails_the_temp_copy_gate() {
+    let fixture = Fixture::new(&[("lib.rs", ROOT_WITH_MODULE), ("m.rs", MODULE_SUBJECT)]);
+    let mut emission = emit(&fixture);
+    for text in emission.files.values_mut() {
+        *text = "pub unsafe fn bump(p: &mut i32) -> i32 {\n    let _x: u8 = \"not a u8\";\n    *p\n}\n"
+            .to_owned();
+    }
+    let temp = verify::materialize(&fixture.root(), &emission.files).expect("materialize");
+
+    assert!(
+        !verify::type_checks_crate(temp.root()),
+        "a crate with a type error passed the hard gate"
+    );
+}
+
+/// **THE ISOLATION WITNESS.** Emitting and verifying leaves the input tree
+/// byte-identical.
+///
+/// This is the guard standing between the rewriter and the frozen `rs-crown`
+/// corpus, whose digest is an invariant of the whole evaluation. It is asserted
+/// on a throwaway fixture precisely so it never has to be discovered on the
+/// corpus.
+///
+/// *Mutation-tested, Rider 0 order.* **Deletion first:** point `materialize`'s
+/// write at the ORIGINAL path instead of the copy and this fails.
+#[test]
+fn materializing_never_touches_the_original_tree() {
+    let fixture = Fixture::new(&[("lib.rs", ROOT_WITH_MODULE), ("m.rs", MODULE_SUBJECT)]);
+    let before = fixture.snapshot();
+
+    let emission = emit(&fixture);
+    let temp = verify::materialize(&fixture.root(), &emission.files).expect("materialize");
+    let _ = verify::type_checks_crate(temp.root());
+
+    let after = fixture.snapshot();
+    assert_eq!(
+        before, after,
+        "the input tree was modified by emit+verify; the frozen corpus would be next"
     );
 }
