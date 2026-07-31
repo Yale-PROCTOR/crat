@@ -11764,8 +11764,8 @@ unsafe fn f(mut p: *mut i32) -> i32 {
     }
 
     /// S1 helper: solve the ordinary Mode-A path and return its accepted model.
-    /// The caller owns the semantic assertion so the RED witness, negative
-    /// control, and caught contrasts all exercise the same setup.
+    /// The caller owns the semantic assertion so the premise control and
+    /// coverage contrasts all exercise the same setup.
     fn s1_accept_model(
         program: &RustProgram<'_>,
         f: LocalDefId,
@@ -11808,15 +11808,20 @@ unsafe fn f(mut p: *mut i32) -> i32 {
         model
     }
 
-    /// S1 RED: `q = p` creates a loan on `*p`, then the bare assignment
-    /// `p = other` kills it.  If both source and destination survive as `Ref`,
-    /// lowering the copy as a mutable reborrow makes the assignment to `p`
-    /// illegal while `q` remains live.
+    /// S1 premise control: `q = p` creates a loan on `*p`, then the bare
+    /// assignment `p = other` kills it.  Rust accepts the same-lifetime
+    /// reference lowering while `q` remains live: replacing the reference
+    /// local does not access the old pointee, which remains borrowed through
+    /// `q`.  The kill is therefore the correct boundary, not a missed error.
     #[test]
-    #[ignore = "S1 RED: enable explicitly while the source-place loan repair is absent"]
-    fn s1_loan_kill_plain_overwrite_must_reject_all_ref_model() {
+    #[ignore = "S1 premise control: run explicitly with the coverage investigation"]
+    fn s1_loan_kill_plain_overwrite_is_valid_ref_replacement() {
         run_compiler(
-            "unsafe fn f(mut p: *mut i32, other: *mut i32) -> i32 { \
+            "#[allow(unused_assignments)] \
+             fn lowered<'a>(mut p: &'a mut i32, other: &'a mut i32) -> i32 { \
+                 let q = &mut *p; *q = 1; p = other; *q \
+             } \
+             unsafe fn f(mut p: *mut i32, other: *mut i32) -> i32 { \
                  let q = p; *q = 1; p = other; *q \
              }",
             |tcx| {
@@ -11842,12 +11847,11 @@ unsafe fn f(mut p: *mut i32) -> i32 {
                     model.get(&p),
                     model.get(&q)
                 );
-                assert_ne!(
+                assert_eq!(
                     (model.get(&p), model.get(&q)),
                     (Some(&SlotKind::Ref), Some(&SlotKind::Ref)),
-                    "RED: Mode-A ACCEPTED p=Ref and q=Ref across `p = other`; q is a mutable \
-                     reborrow (written before the overwrite) and remains live afterward, so \
-                     reassignment of p should be a borrow conflict"
+                    "Rust accepted the explicit same-lifetime reference lowering in this same \
+                     crate; Mode A should preserve the valid Ref/Ref replacement shape"
                 );
             },
         );
@@ -11857,7 +11861,7 @@ unsafe fn f(mut p: *mut i32) -> i32 {
     /// reads through `p`; the existing deep-access path may catch this before
     /// the destination assignment kills loans rooted at `p`.
     #[test]
-    #[ignore = "S1 boundary fixture: run explicitly with the RED investigation"]
+    #[ignore = "S1 boundary fixture: run explicitly with the coverage investigation"]
     fn s1_loan_kill_c_next_overwrite_must_reject_all_ref_model() {
         run_compiler(
             "#[repr(C)] struct Node { next: *mut Node, value: i32 } \
@@ -11900,7 +11904,7 @@ unsafe fn f(mut p: *mut i32) -> i32 {
     /// S1 negative control: without the reassignment of the borrowed source,
     /// the pointer copy and exclusive use through `q` are a valid reborrow.
     #[test]
-    #[ignore = "S1 negative control: run explicitly with the RED investigation"]
+    #[ignore = "S1 negative control: run explicitly with the coverage investigation"]
     fn s1_loan_kill_no_overwrite_control_stays_accepted() {
         run_compiler(
             "unsafe fn f(p: *mut i32) -> i32 { let q = p; *q = 1; *q }",
@@ -11944,13 +11948,19 @@ unsafe fn f(mut p: *mut i32) -> i32 {
     }
 
     /// S1 nearest-shape contrast: if the use after `p = other` writes through
-    /// `q`, NB4-R's cross-alias write routing recovers a conflict even though
-    /// the original `*p` loan was already killed at the bare assignment.
+    /// `q`, the current provenance/`requires` routing rejects the all-Ref
+    /// model even though Rust accepts the same-lifetime reference lowering.
+    /// This is a conservative compensation, not evidence that the bare kill
+    /// should have been an error.
     #[test]
-    #[ignore = "S1 routing contrast: run explicitly with the RED investigation"]
-    fn s1_post_overwrite_write_routing_contrast_rejects_all_ref_model() {
+    #[ignore = "S1 routing contrast: run explicitly with the coverage investigation"]
+    fn s1_post_overwrite_write_routing_is_conservative() {
         run_compiler(
-            "unsafe fn f(mut p: *mut i32, other: *mut i32) -> i32 { \
+            "#[allow(unused_assignments)] \
+             fn lowered<'a>(mut p: &'a mut i32, other: &'a mut i32) -> i32 { \
+                 let q = &mut *p; p = other; *q = 1; *q \
+             } \
+             unsafe fn f(mut p: *mut i32, other: *mut i32) -> i32 { \
                  let q = p; p = other; *q = 1; *q \
              }",
             |tcx| {
@@ -11980,7 +11990,7 @@ unsafe fn f(mut p: *mut i32) -> i32 {
                 let facts = MutFacts::from_program(&program);
                 assert!(
                     !model_accepts(&program, &slots, &all_ref, &facts),
-                    "NB4-R must reject the all-Ref model when q writes after the overwrite"
+                    "current boundary: provenance/requirements reject all-Ref after q writes"
                 );
             },
         );
@@ -11991,7 +12001,7 @@ unsafe fn f(mut p: *mut i32) -> i32 {
     /// bare group-member loan on `r`, so `r = other` surfaces a conflict owned
     /// and required by `q` even though the copy arm still skips bare `p`.
     #[test]
-    #[ignore = "S1 grouping contrast: run explicitly with the RED investigation"]
+    #[ignore = "S1 grouping contrast: run explicitly with the coverage investigation"]
     fn s1_tree_group_member_contrast_catches_sibling_overwrite() {
         run_compiler(
             "unsafe fn f(mut r: *mut i32, other: *mut i32) -> i32 { \
