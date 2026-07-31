@@ -143,6 +143,11 @@ pub struct WriteForReturn {
     pub statement_index: usize,
     pub mays: BTreeSet<usize>,
     pub musts: BTreeSet<usize>,
+    /// Params fully written in every return-state where the param's own pointer
+    /// is not null. The transformed pointer (`&mut _v`) is never null, so these
+    /// are as good as must-written after the transformation.
+    #[serde(default)]
+    pub nonnull_musts: BTreeSet<usize>,
 }
 
 // Removable checks for Write s
@@ -315,6 +320,8 @@ pub fn analyze(
     let mut wfrs: FxHashMap<DefId, Vec<WriteForReturn>> = FxHashMap::default();
     let mut bb_musts: FxHashMap<DefId, BTreeMap<BasicBlock, BTreeSet<usize>>> =
         FxHashMap::default();
+    let mut bb_nonnull_musts: FxHashMap<DefId, BTreeMap<BasicBlock, BTreeSet<usize>>> =
+        FxHashMap::default();
     let mut time = 0;
 
     let mut rcfws = FxHashMap::default();
@@ -432,6 +439,7 @@ pub fn analyze(
 
                 let mut wfr = vec![];
                 let mut bb_must = BTreeMap::new();
+                let mut bb_nonnull_must = BTreeMap::new();
 
                 let mut stack = vec![];
 
@@ -458,12 +466,9 @@ pub fn analyze(
 
                     let empty_map = BTreeMap::new();
                     for (ret_loc, assign_loc) in stack.iter() {
-                        let writes: Vec<_> = states
-                            .get(ret_loc)
-                            .unwrap_or(&empty_map)
-                            .values()
-                            .map(|st| st.writes.as_set())
-                            .collect();
+                        let sts = states.get(ret_loc).unwrap_or(&empty_map);
+                        let writes: Vec<_> =
+                            sts.values().map(|st| st.writes.as_set()).collect();
                         let musts: BTreeSet<_> = writes
                             .iter()
                             .copied()
@@ -482,18 +487,51 @@ pub fn analyze(
                             .flatten()
                             .map(|p| p.base.index() - 1)
                             .collect();
+                        let nonnull_musts: BTreeSet<_> = analyzer
+                            .ptr_params_inv
+                            .iter()
+                            .filter_map(|(l, arg)| {
+                                let filtered: Vec<_> = sts
+                                    .values()
+                                    .filter(|st| !st.nulls.is_null(*arg))
+                                    .map(|st| st.writes.as_set())
+                                    .collect();
+                                if filtered.is_empty() {
+                                    return None;
+                                }
+                                let must_write = filtered
+                                    .iter()
+                                    .copied()
+                                    .fold(None, |acc: Option<BTreeSet<_>>, ws| {
+                                        Some(match acc {
+                                            Some(acc) => {
+                                                acc.intersection(ws).cloned().collect()
+                                            }
+                                            None => ws.clone(),
+                                        })
+                                    })
+                                    .unwrap_or_default();
+                                must_write
+                                    .iter()
+                                    .any(|p| p.base == *l)
+                                    .then(|| l.index() - 1)
+                            })
+                            .collect();
                         bb_must.insert(ret_loc.block, musts.clone());
+                        bb_nonnull_must.insert(ret_loc.block, nonnull_musts.clone());
                         wfr.push(WriteForReturn {
                             block: assign_loc.block.as_usize(),
                             statement_index: assign_loc.statement_index,
                             mays,
                             musts,
+                            nonnull_musts,
                         });
                     }
                 }
 
                 wfrs.insert(*def_id, wfr);
                 bb_musts.insert(*def_id, bb_must);
+                bb_nonnull_musts.insert(*def_id, bb_nonnull_must);
 
                 // Handle unremovable parameters
                 for st in return_states.values_mut() {
@@ -573,6 +611,7 @@ pub fn analyze(
                     }
 
                     let bb_must = &bb_musts[def_id];
+                    let bb_nonnull_must = &bb_nonnull_musts[def_id];
                     let mut rcfw: Rcfws = BTreeMap::new();
 
                     if !analyzer.info.is_unit {
@@ -596,6 +635,9 @@ pub fn analyze(
                                     if let Some(bb) = stack.pop() {
                                         if let Some(musts) = bb_must.get(&bb)
                                             && !musts.contains(index)
+                                            && !bb_nonnull_must
+                                                .get(&bb)
+                                                .is_some_and(|s| s.contains(index))
                                         {
                                             break false;
                                         }

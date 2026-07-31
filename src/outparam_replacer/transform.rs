@@ -44,6 +44,7 @@ struct Counter {
     failure_returns: usize,
     removed_flag_sets: usize,
     removed_flag_defs: usize,
+    nonnull_success_returns: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -94,7 +95,8 @@ rustc_index::newtype_index! {
     pub struct RetIdx {}
 }
 
-type WriteForReturn = FxHashMap<Location, (FxHashSet<ParamIdx>, FxHashSet<ParamIdx>)>;
+type WriteForReturn =
+    FxHashMap<Location, (FxHashSet<ParamIdx>, FxHashSet<ParamIdx>, FxHashSet<ParamIdx>)>;
 
 struct Func {
     is_unit: bool,
@@ -287,6 +289,10 @@ pub fn transform(
                                     .map(|i| ParamIdx::from_usize(*i))
                                     .collect::<FxHashSet<_>>(),
                                 wfr.musts
+                                    .iter()
+                                    .map(|i| ParamIdx::from_usize(*i))
+                                    .collect::<FxHashSet<_>>(),
+                                wfr.nonnull_musts
                                     .iter()
                                     .map(|i| ParamIdx::from_usize(*i))
                                     .collect::<FxHashSet<_>>(),
@@ -564,7 +570,7 @@ pub fn transform(
 
     if config.simplify {
         println!(
-            "{} {} {} {} {} {} {} {}",
+            "{} {} {} {} {} {} {} {} {}",
             counter.removed_value_defs,
             counter.removed_pointer_defs,
             counter.removed_pointer_uses,
@@ -573,6 +579,7 @@ pub fn transform(
             counter.failure_returns,
             counter.removed_flag_sets,
             counter.removed_flag_defs,
+            counter.nonnull_success_returns,
         );
     }
 
@@ -664,7 +671,7 @@ impl TransformVisitor<'_, '_> {
     fn get_return_value(
         &mut self,
         func: &Func,
-        wfr: Option<&(FxHashSet<ParamIdx>, FxHashSet<ParamIdx>)>,
+        wfr: Option<&(FxHashSet<ParamIdx>, FxHashSet<ParamIdx>, FxHashSet<ParamIdx>)>,
         orig_ret: Option<String>,
         hir_id: Option<HirId>,
     ) -> String {
@@ -676,9 +683,12 @@ impl TransformVisitor<'_, '_> {
                 ReturnTyItem::Type(param) => self.get_name(param, hir_id),
                 ReturnTyItem::Result(param) => {
                     let name = self.get_name(param, hir_id);
-                    if let Some((may, must)) = wfr {
+                    if let Some((may, must, nonnull_must)) = wfr {
                         if must.contains(&param.index) {
                             self.counter.success_returns += 1;
+                            format!("Ok({name})")
+                        } else if nonnull_must.contains(&param.index) {
+                            self.counter.nonnull_success_returns += 1;
                             format!("Ok({name})")
                         } else if !may.contains(&param.index) {
                             self.counter.failure_returns += 1;
@@ -702,9 +712,12 @@ impl TransformVisitor<'_, '_> {
                 }
                 ReturnTyItem::Option(param) => {
                     let name = self.get_name(param, hir_id);
-                    if let Some((may, must)) = wfr {
+                    if let Some((may, must, nonnull_must)) = wfr {
                         if must.contains(&param.index) {
                             self.counter.success_returns += 1;
+                            format!("Some({name})")
+                        } else if nonnull_must.contains(&param.index) {
+                            self.counter.nonnull_success_returns += 1;
                             format!("Some({name})")
                         } else if !may.contains(&param.index) {
                             self.counter.failure_returns += 1;
@@ -924,9 +937,11 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                         .unwrap_or_else(|| panic!("Failed to find HIR expr for return expr"));
                     let hir_id = hir_expr.hir_id;
 
-                    let wfr: Option<(FxHashSet<ParamIdx>, FxHashSet<ParamIdx>)> = if func.is_unit
-                        || func.wfrs.is_none()
-                    {
+                    let wfr: Option<(
+                        FxHashSet<ParamIdx>,
+                        FxHashSet<ParamIdx>,
+                        FxHashSet<ParamIdx>,
+                    )> = if func.is_unit || func.wfrs.is_none() {
                         None
                     } else {
                         let wfrs = func.wfrs.as_ref().unwrap();
@@ -949,18 +964,42 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                         }
 
                         Some(expr_locs.iter().fold(
-                            (FxHashSet::default(), FxHashSet::default()),
-                            |(mays, musts), loc| {
-                                if let Some((loc_mays, loc_musts)) = wfrs.get(loc) {
+                            (
+                                FxHashSet::default(),
+                                FxHashSet::default(),
+                                FxHashSet::default(),
+                            ),
+                            |(mays, musts, nonnull_musts): (
+                                FxHashSet<ParamIdx>,
+                                FxHashSet<ParamIdx>,
+                                FxHashSet<ParamIdx>,
+                            ),
+                             loc| {
+                                if let Some((loc_mays, loc_musts, loc_nonnull_musts)) =
+                                    wfrs.get(loc)
+                                {
                                     let mays = mays.union(loc_mays).cloned().collect();
-                                    let musts = if musts.is_empty() {
+                                    let musts: FxHashSet<_> = if musts.is_empty() {
                                         loc_musts.clone()
                                     } else {
                                         musts.intersection(loc_musts).cloned().collect()
                                     };
-                                    (mays, musts)
+                                    // intersect the union of must and nonnull-must per
+                                    // location, so a param that is plain-must at one
+                                    // location and nonnull-must at another stays in
+                                    let loc_nonnull_musts: FxHashSet<_> =
+                                        loc_musts.union(loc_nonnull_musts).cloned().collect();
+                                    let nonnull_musts = if nonnull_musts.is_empty() {
+                                        loc_nonnull_musts
+                                    } else {
+                                        nonnull_musts
+                                            .intersection(&loc_nonnull_musts)
+                                            .cloned()
+                                            .collect()
+                                    };
+                                    (mays, musts, nonnull_musts)
                                 } else {
-                                    (mays, musts)
+                                    (mays, musts, nonnull_musts)
                                 }
                             },
                         ))
