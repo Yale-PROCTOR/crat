@@ -241,6 +241,14 @@ mod binding_span_witnesses {
             .expect("coordinate parameter occurs in fixture") as u32;
 
         assert_eq!(row.binding_span_lo, Some(expected));
+        // The END bound, in the SAME file-relative system. Without this, `hi` is
+        // constrained only by `lo < hi`, which a raw `BytePos` satisfies — so a
+        // hi-only coordinate regression survived the whole unit suite and waited
+        // for the corpus interleave to notice it.
+        assert_eq!(
+            row.binding_span_hi,
+            Some(expected + "coordinate_param".len() as u32)
+        );
     }
 
     #[test]
