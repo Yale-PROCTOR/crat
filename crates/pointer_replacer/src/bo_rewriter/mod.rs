@@ -543,7 +543,6 @@ fn rewrite_core_injected(
                 };
             }
 
-            let mut staged_keep: Option<verify::TempCrate> = None;
             let (final_reverted, probes) = bisect(&candidates, &reverted, |trial| {
                 let (trial_files, rollbacks) = render(&emission_plan, &emission_texts, trial);
                 if !rollbacks.is_empty() {
@@ -556,11 +555,7 @@ fn rewrite_core_injected(
                 let Ok(staged) = materialized else {
                     return false;
                 };
-                let clean = verify::diagnose_crate(staged.root()).errors == 0;
-                if clean {
-                    staged_keep = Some(staged);
-                }
-                clean
+                verify::diagnose_crate(staged.root()).errors == 0
             });
 
             let (final_files, rollbacks) =
@@ -569,7 +564,6 @@ fn rewrite_core_injected(
                 Some(root) => verify::materialize(root, &final_files),
                 None => verify::materialize_single_file(&root_text),
             };
-            let _ = &staged_keep;
             match materialized {
                 Ok(staged) if rollbacks.is_empty() && verify::type_checks_crate(staged.root()) => {
                     let source = std::fs::read_to_string(staged.root()).unwrap_or_default();
