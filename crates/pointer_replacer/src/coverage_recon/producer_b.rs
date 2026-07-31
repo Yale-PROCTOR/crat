@@ -50,16 +50,32 @@ pub(crate) fn rows(tcx: TyCtxt<'_>) -> Vec<Row> {
             });
             let first = debug_entries.next();
             let second = debug_entries.next();
-            let (param_name, arg_index, pairing_confidence) = match (first, second) {
+            let (
+                param_name,
+                arg_index,
+                pairing_confidence,
+                binding_span_lo,
+                binding_span_hi,
+            ) = match (first, second) {
                 (Some(info), None) => match info.argument_index {
-                    Some(arg_index) => (
-                        Some(info.name.to_string()),
-                        Some(arg_index as u32),
-                        PairingConfidence::High,
-                    ),
-                    None => (None, None, PairingConfidence::Low),
+                    Some(arg_index) => {
+                        let source_map = tcx.sess.source_map();
+                        let span = info.source_info.span;
+                        let binding_span_lo =
+                            Some(source_map.lookup_byte_offset(span.lo()).pos.0);
+                        let binding_span_hi =
+                            Some(source_map.lookup_byte_offset(span.hi()).pos.0);
+                        (
+                            Some(info.name.to_string()),
+                            Some(arg_index as u32),
+                            PairingConfidence::High,
+                            binding_span_lo,
+                            binding_span_hi,
+                        )
+                    }
+                    None => (None, None, PairingConfidence::Low, None, None),
                 },
-                _ => (None, None, PairingConfidence::Low),
+                _ => (None, None, PairingConfidence::Low, None, None),
             };
 
             rows.push(Row {
@@ -72,11 +88,8 @@ pub(crate) fn rows(tcx: TyCtxt<'_>) -> Vec<Row> {
                 decl_span: None,
                 decl_span_lo: None,
                 decl_span_hi: None,
-                // Filled by the gated Codex follow-on (Track 2, T2.5). While
-                // these are None everywhere, the span axis reports INACTIVE and
-                // `span_axis_is_active_on_producer_b` is RED by design.
-                binding_span_lo: None,
-                binding_span_hi: None,
+                binding_span_lo,
+                binding_span_hi,
                 decl_shape: None,
                 outcome: None,
                 degrade_reason: None,
@@ -86,6 +99,164 @@ pub(crate) fn rows(tcx: TyCtxt<'_>) -> Vec<Row> {
 
     sort_rows(&mut rows);
     rows
+}
+
+#[cfg(test)]
+mod binding_span_witnesses {
+    extern crate rustc_driver;
+    extern crate rustc_interface;
+
+    use std::{
+        fs,
+        path::{Path, PathBuf},
+        sync::atomic::{AtomicUsize, Ordering},
+    };
+
+    use rustc_driver::{Callbacks, Compilation, run_compiler};
+    use rustc_interface::interface;
+    use rustc_middle::ty::TyCtxt;
+
+    use super::{Row, rows};
+
+    static NEXT_FIXTURE: AtomicUsize = AtomicUsize::new(0);
+
+    #[derive(Default)]
+    struct CaptureRows {
+        rows: Vec<Row>,
+    }
+
+    impl Callbacks for CaptureRows {
+        fn after_analysis<'tcx>(
+            &mut self,
+            _compiler: &interface::Compiler,
+            tcx: TyCtxt<'tcx>,
+        ) -> Compilation {
+            self.rows = rows(tcx);
+            Compilation::Stop
+        }
+    }
+
+    struct FixtureDir(PathBuf);
+
+    impl FixtureDir {
+        fn new() -> Self {
+            let sequence = NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "pointer-replacer-binding-span-{}-{sequence}",
+                std::process::id()
+            ));
+            fs::create_dir(&path).expect("create binding-span fixture directory");
+            Self(path)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for FixtureDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn rows_for_fixture(root_source: &str, extra_files: &[(&str, &str)]) -> Vec<Row> {
+        let fixture_dir = FixtureDir::new();
+        let input = fixture_dir.path().join("lib.rs");
+        fs::write(&input, root_source).expect("write binding-span fixture root");
+        for &(name, source) in extra_files {
+            fs::write(fixture_dir.path().join(name), source)
+                .expect("write binding-span fixture module");
+        }
+
+        let args = vec![
+            "rustc".to_owned(),
+            input.to_string_lossy().into_owned(),
+            "--crate-name=binding_span_witness".to_owned(),
+            "--crate-type=lib".to_owned(),
+            "--edition=2021".to_owned(),
+            "--emit=metadata".to_owned(),
+            format!("--out-dir={}", fixture_dir.path().display()),
+        ];
+        let mut capture = CaptureRows::default();
+        run_compiler(&args, &mut capture);
+        capture.rows
+    }
+
+    fn row_for<'a>(rows: &'a [Row], fn_suffix: &str) -> &'a Row {
+        rows.iter()
+            .find(|row| row.fn_path.ends_with(fn_suffix))
+            .unwrap_or_else(|| panic!("missing producer-B row for {fn_suffix}"))
+    }
+
+    #[test]
+    fn binding_span_is_present_on_named_parameters() {
+        let rows = rows_for_fixture(
+            "#![allow(dead_code, unused_variables)]\nfn named(first: *mut i32, second: *mut i32) {}\n",
+            &[],
+        );
+        let named_rows: Vec<_> = rows
+            .iter()
+            .filter(|row| row.fn_path.ends_with("named"))
+            .collect();
+
+        assert_eq!(named_rows.len(), 2);
+        for row in named_rows {
+            assert!(row.binding_span_lo.is_some());
+            assert!(row.binding_span_hi.is_some());
+        }
+    }
+
+    /// Positive control only: the reachable non-High case has no debug entry,
+    /// so no deletion can expose a span source for this parameter.
+    #[test]
+    fn binding_span_is_absent_on_unnamed_parameter_positive_control() {
+        let rows = rows_for_fixture(
+            "#![allow(dead_code)]\nfn unnamed(_: *mut i32) {}\n",
+            &[],
+        );
+        let row = row_for(&rows, "unnamed");
+
+        assert_eq!(row.binding_span_lo, None);
+        assert_eq!(row.binding_span_hi, None);
+    }
+
+    #[test]
+    fn binding_span_uses_file_relative_offsets() {
+        let fixture_source =
+            "#![allow(dead_code, unused_variables)]\npub fn coordinate_target(coordinate_param: *mut i32) {}\n";
+        let rows = rows_for_fixture(
+            "#![allow(dead_code)]\nmod padding;\nmod fixture;\n",
+            &[
+                (
+                    "padding.rs",
+                    "#![allow(dead_code)]\npub static PADDING: [u8; 64] = [0; 64];\n",
+                ),
+                ("fixture.rs", fixture_source),
+            ],
+        );
+        let row = row_for(&rows, "fixture::coordinate_target");
+        let expected = fixture_source
+            .find("coordinate_param")
+            .expect("coordinate parameter occurs in fixture") as u32;
+
+        assert_eq!(row.binding_span_lo, Some(expected));
+    }
+
+    #[test]
+    fn binding_span_bounds_are_strictly_ordered() {
+        let rows = rows_for_fixture(
+            "#![allow(dead_code, unused_variables)]\nfn ordered(parameter: *mut i32) {}\n",
+            &[],
+        );
+        let row = row_for(&rows, "ordered");
+        let (lo, hi) = row
+            .binding_span_lo
+            .zip(row.binding_span_hi)
+            .expect("named parameter has both binding-span bounds");
+
+        assert!(lo < hi, "binding span must be nonempty: {lo}..{hi}");
+    }
 }
 
 #[cfg(test)]
