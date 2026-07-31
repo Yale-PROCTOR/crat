@@ -384,6 +384,26 @@ fn param_name(param: &rustc_hir::Param<'_>) -> Option<String> {
 /// pipeline — and, deliberately, **without moving any comparison into this
 /// module**. `bo_rewriter` emits; `coverage_recon` compares.
 fn decide_table<'tcx>(tcx: TyCtxt<'tcx>) -> Result<decision::DecisionTable, String> {
+    decide_table_perturbed(tcx, |_| {})
+}
+
+/// [`decide_table`] with a hook applied to the collector's real output at the
+/// PHASE BOUNDARY, before `decide` runs.
+///
+/// The hook is a no-op in production (`decide_table` passes `|_| {}`) and exists
+/// so a test can inject the exact defect this axis guards — a mis-associated
+/// span on the collector's own `Subject` type — and then drive it through the
+/// real `decide → artifact → encode → decode → compare` path.
+///
+/// **This is deliberately not a production fault seam.** A `CRAT_*`-gated seam
+/// inside decision-phase code was considered and DENIED; a collector fault
+/// manifests as exactly the mis-associated output a boundary hook injects, so
+/// the verification power is the same at zero production-code cost. That is the
+/// phase-separated architecture paying for itself.
+fn decide_table_perturbed<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    perturb: impl FnOnce(&mut Vec<decision::Subject>),
+) -> Result<decision::DecisionTable, String> {
     let program = collect_program(tcx);
     let slots = CrateSlots::build(&program);
     let mut_facts = MutFacts::from_program(&program);
@@ -410,7 +430,8 @@ fn decide_table<'tcx>(tcx: TyCtxt<'tcx>) -> Result<decision::DecisionTable, Stri
         return Err("BO declined — no accepted model".to_owned());
     };
 
-    let subjects = collect_subjects(tcx, &program, &mut_facts);
+    let mut subjects = collect_subjects(tcx, &program, &mut_facts);
+    perturb(&mut subjects);
     let facts = decision::emitability::collect(tcx, &program.functions);
     let table = decision::decide(tcx, &subjects, &model, &slots, &facts);
 
@@ -463,4 +484,21 @@ pub(crate) fn goldens_for_reconciliation() -> Vec<(&'static str, &'static str)> 
 #[cfg(test)]
 pub(crate) fn classify_universe(tcx: TyCtxt<'_>) -> decision::universe::UniverseReport {
     decision::universe::classify(tcx)
+}
+
+/// Producer A's artifact with the span association SWAPPED between the first two
+/// subjects of the crate — injected at the phase boundary, on the collector's
+/// real `Subject` type, then driven through the real pipeline.
+#[cfg(test)]
+pub(crate) fn artifact_rows_span_swapped(
+    tcx: TyCtxt<'_>,
+) -> Result<Vec<crate::coverage_recon::schema::Row>, String> {
+    decide_table_perturbed(tcx, |subjects| {
+        if subjects.len() >= 2 {
+            let (lo, hi) = (subjects[0].ty_span, subjects[1].ty_span);
+            subjects[0].ty_span = hi;
+            subjects[1].ty_span = lo;
+        }
+    })
+    .map(|table| artifact::rows(tcx, &table))
 }

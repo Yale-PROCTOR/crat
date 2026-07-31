@@ -70,6 +70,13 @@ pub(crate) fn rows(tcx: TyCtxt<'_>) -> Vec<Row> {
                 ptr_depth,
                 pairing_confidence,
                 decl_span: None,
+                decl_span_lo: None,
+                decl_span_hi: None,
+                // Filled by the gated Codex follow-on (Track 2, T2.5). While
+                // these are None everywhere, the span axis reports INACTIVE and
+                // `span_axis_is_active_on_producer_b` is RED by design.
+                binding_span_lo: None,
+                binding_span_hi: None,
                 decl_shape: None,
                 outcome: None,
                 degrade_reason: None,

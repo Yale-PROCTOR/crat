@@ -229,3 +229,105 @@ fn the_clean_worker_path_still_succeeds() {
     assert!(ok, "the unfaulted worker failed:\n{log}");
     assert!(log.contains("recon=PASS"), "no PASS verdict:\n{log}");
 }
+
+// ---------------------------------------------------------------------------
+// T2.4b / T2.4d — the SPAN axis, live path
+// ---------------------------------------------------------------------------
+
+/// **T2.4b — the between-phase LIVE witness.**
+///
+/// The span association is swapped on the collector's real `Subject` output at
+/// the phase boundary, then driven through the **real** pipeline:
+/// `decide → artifact → encode → decode → compare`. Nothing is hand-built
+/// except the perturbation itself, and the perturbation is the exact defect
+/// this axis guards.
+///
+/// The ruled alternative — a `CRAT_*` fault seam inside decision-phase code —
+/// was denied and is not needed: a collector fault manifests as precisely this
+/// mis-associated output, so the verification power is the same at zero
+/// production-code cost.
+///
+/// **Residual, recorded honestly:** collector-internal failure modes that do
+/// *not* manifest as output mis-association are outside this witness — and, by
+/// the axis's own definition, outside its scope. The seam question reopens only
+/// on evidence of such a mode.
+///
+/// *Mutation-tested (Rider 0):* deleting the interleave block in `compare`
+/// fails this.
+#[test]
+#[ignore = "runs the full BO pipeline twice"]
+fn a_live_span_swap_is_caught_end_to_end() {
+    let src = "#![allow(dead_code)]\npub unsafe fn f(p: *mut i32, q: *const u8) -> i32 { *p as i32 }\n";
+    let (verdict, active) = ::utils::compilation::run_compiler_on_str(src, |tcx| {
+        let a = crate::bo_rewriter::artifact_rows_span_swapped(tcx).expect("producer A");
+        let mut b = producer_b::rows(tcx);
+        // STAND-IN for producer B's binding spans until the gated follow-on
+        // lands. Producer A's half is real end-to-end; this half is filled from
+        // the same `var_debug_info` fact the follow-on will use, so the witness
+        // exercises the comparator's live inputs rather than hand-built rows.
+        // When the follow-on lands, this block is DELETED and B supplies them.
+        let sm = tcx.sess.source_map();
+        for row in &mut b {
+            let Some(did) = tcx
+                .mir_keys(())
+                .iter()
+                .find(|d| tcx.def_path_str(d.to_def_id()) == row.fn_path)
+                .copied()
+            else {
+                continue;
+            };
+            let body = tcx.mir_drops_elaborated_and_const_checked(did).borrow();
+            let local = rustc_middle::mir::Local::from_u32(row.mir_local);
+            for info in &body.var_debug_info {
+                if let rustc_middle::mir::VarDebugInfoContents::Place(pl) = &info.value
+                    && pl.as_local() == Some(local)
+                    && info.argument_index.is_some()
+                {
+                    row.binding_span_lo =
+                        Some(sm.lookup_byte_offset(info.source_info.span.lo()).pos.0);
+                    row.binding_span_hi =
+                        Some(sm.lookup_byte_offset(info.source_info.span.hi()).pos.0);
+                }
+            }
+        }
+        let active = crate::coverage_recon::compare::span_axis_active(&b);
+        let encoded_a = crate::coverage_recon::schema::encode(&a);
+        let encoded_b = crate::coverage_recon::schema::encode(&b);
+        let a = crate::coverage_recon::schema::decode(&encoded_a).expect("A decodes");
+        let b = crate::coverage_recon::schema::decode(&encoded_b).expect("B decodes");
+        (crate::coverage_recon::compare::compare(&a, &b), active)
+    })
+    .expect("fixture compiles");
+
+    assert!(active, "the span axis must be ACTIVE for this witness to mean anything");
+    assert!(
+        verdict
+            .violations
+            .iter()
+            .any(|v| v.class == "span-interleave-breach"),
+        "a LIVE span swap reached the artifact and was accepted — the splice \
+         target is not under gate: {verdict:#?}"
+    );
+}
+
+/// **T2.4d — PRE-DECLARED RED.** Producer B does not yet emit `binding_span`,
+/// so the span axis is INACTIVE on its real artifact.
+///
+/// Booked with the six S3 goldens as a known-red: it flips GREEN when the gated
+/// Codex follow-on lands producer B's binding spans, and then **stays forever**
+/// as the post-activation regression guard — a broken fill re-REDs it.
+///
+/// **S2a-H cannot close while this is red**, by rule. The dormant window is
+/// bounded by the round itself rather than by anyone remembering.
+#[test]
+fn span_axis_is_active_on_producer_b() {
+    let src = "#![allow(dead_code)]\npub unsafe fn f(p: *mut i32, q: *const u8) -> i32 { *p as i32 }\n";
+    let rows = ::utils::compilation::run_compiler_on_str(src, |tcx| producer_b::rows(tcx))
+        .expect("fixture compiles");
+    assert!(
+        crate::coverage_recon::compare::span_axis_active(&rows),
+        "producer B emits no binding_span, so the SPAN AXIS IS INACTIVE. This \
+         test is pre-declared RED and flips green with the gated follow-on; \
+         S2a-H cannot close while it is red."
+    );
+}

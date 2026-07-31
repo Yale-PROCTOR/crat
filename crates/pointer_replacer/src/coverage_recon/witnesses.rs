@@ -17,6 +17,10 @@ fn full_row() -> Row {
         ptr_depth: 1,
         pairing_confidence: PairingConfidence::High,
         decl_span: Some("<main.rs>:3:14: 3:22".to_owned()),
+        decl_span_lo: Some(50),
+        decl_span_hi: Some(58),
+        binding_span_lo: None,
+        binding_span_hi: None,
         decl_shape: Some(DeclShape::RawPtr),
         outcome: Some(Outcome::Degraded),
         degrade_reason: Some("kind-raw".to_owned()),
@@ -33,10 +37,28 @@ fn bare_row(fn_path: &str, local: u32, name: Option<&str>, arg: Option<u32>, dep
         ptr_depth: depth,
         pairing_confidence: PairingConfidence::High,
         decl_span: None,
+        decl_span_lo: None,
+        decl_span_hi: None,
+        binding_span_lo: None,
+        binding_span_hi: None,
         decl_shape: None,
         outcome: None,
         degrade_reason: None,
     }
+}
+
+/// A pair of rows carrying the span axis: A supplies the ty extent, B the
+/// binding extent.
+fn span_pair(
+    local: u32, name: &str, bind: (u32, u32), ty: (u32, u32),
+) -> (Row, Row) {
+    let mut a = bare_row("f", local, Some(name), Some(local), 1);
+    a.decl_span_lo = Some(ty.0);
+    a.decl_span_hi = Some(ty.1);
+    let mut b = bare_row("f", local, Some(name), Some(local), 1);
+    b.binding_span_lo = Some(bind.0);
+    b.binding_span_hi = Some(bind.1);
+    (a, b)
 }
 
 // ---------------------------------------------------------------------------
@@ -56,12 +78,19 @@ fn bare_row(fn_path: &str, local: u32, name: Option<&str>, arg: Option<u32>, dep
 /// *Mutation-tested (Rider 0, deletion first):* adding
 /// `#[serde(skip_serializing_if = "Option::is_none")]` to any optional field in
 /// `schema.rs` fails this — which is why no such attribute exists there.
+///
+/// **Golden updated 2026-07-31, deliberately.** Track 2 added four numeric span
+/// fields, so the wire form changed. This is a §5.2-discipline edit with a
+/// stated reason — a schema extension whose new bytes are *specified* — not a
+/// RED-weakening: the structural half below still enumerates **every** field
+/// name, including the four new ones, so the explicit-null pin cannot be
+/// satisfied by omission.
 #[test]
 fn encoding_is_byte_exact_and_never_omits_a_field() {
     let full = encode(&[full_row()]);
     assert_eq!(
         full,
-        r#"{"fn_path":"m::f","mir_local":1,"param_name":"p","arg_index":1,"ptr_depth":1,"pairing_confidence":"high","decl_span":"<main.rs>:3:14: 3:22","decl_shape":"raw-ptr","outcome":"degraded","degrade_reason":"kind-raw"}
+        r#"{"fn_path":"m::f","mir_local":1,"param_name":"p","arg_index":1,"ptr_depth":1,"pairing_confidence":"high","decl_span":"<main.rs>:3:14: 3:22","decl_span_lo":50,"decl_span_hi":58,"binding_span_lo":null,"binding_span_hi":null,"decl_shape":"raw-ptr","outcome":"degraded","degrade_reason":"kind-raw"}
 "#,
         "fully-populated row encoding drifted"
     );
@@ -69,7 +98,7 @@ fn encoding_is_byte_exact_and_never_omits_a_field() {
     let bare = encode(&[bare_row("g", 2, None, None, 0)]);
     assert_eq!(
         bare,
-        r#"{"fn_path":"g","mir_local":2,"param_name":null,"arg_index":null,"ptr_depth":0,"pairing_confidence":"high","decl_span":null,"decl_shape":null,"outcome":null,"degrade_reason":null}
+        r#"{"fn_path":"g","mir_local":2,"param_name":null,"arg_index":null,"ptr_depth":0,"pairing_confidence":"high","decl_span":null,"decl_span_lo":null,"decl_span_hi":null,"binding_span_lo":null,"binding_span_hi":null,"decl_shape":null,"outcome":null,"degrade_reason":null}
 "#,
         "all-optionals-absent row encoding drifted"
     );
@@ -84,6 +113,10 @@ fn encoding_is_byte_exact_and_never_omits_a_field() {
         "ptr_depth",
         "pairing_confidence",
         "decl_span",
+        "decl_span_lo",
+        "decl_span_hi",
+        "binding_span_lo",
+        "binding_span_hi",
         "decl_shape",
         "outcome",
         "degrade_reason",
@@ -483,4 +516,147 @@ fn equal_counts_with_disjoint_members_fail_in_both_directions() {
          would accept this input: {v:#?}"
     );
     assert_eq!(v.aggregates["out-of-coverage"], 1, "{v:#?}");
+}
+
+// ---------------------------------------------------------------------------
+// T2.4a — the SPAN axis, comparator level
+// ---------------------------------------------------------------------------
+
+/// The interleave holds on real corpus geometry.
+///
+/// Numbers are the measured `two(p: *mut i32, q: *const u8)` spans from the
+/// Track 2 dump, not invented ones.
+#[test]
+fn the_span_interleave_accepts_real_geometry() {
+    let (a0, b0) = span_pair(1, "p", (47, 48), (50, 58));
+    let (a1, b1) = span_pair(2, "q", (60, 61), (63, 72));
+    let v = compare(&[a0, a1], &[b0, b1]);
+    assert!(v.passed(), "real span geometry was rejected: {v:#?}");
+}
+
+/// **A span PERMUTATION is caught, and the finding names the failing index.**
+///
+/// This is the defect HIGH-1 named: identity intact, splice target detached.
+/// `param_name`, `arg_index`, `mir_local` and `ptr_depth` are all unchanged —
+/// only the ty extents are swapped — so every pre-Track-2 check passes.
+///
+/// The breach fires at index 1, not index 0 (verified against the real
+/// numbers): at i=0 the swapped extent still follows its binding. A witness
+/// asserting "every row is flagged" would be wrong.
+///
+/// *Mutation-tested (Rider 0):* deleting the `b_hi > ty_lo` conjunct fails this;
+/// deleting `prev_ty_hi > b_lo` is covered separately below.
+#[test]
+fn a_span_permutation_is_caught_and_names_the_index() {
+    let (mut a0, b0) = span_pair(1, "p", (47, 48), (50, 58));
+    let (mut a1, b1) = span_pair(2, "q", (60, 61), (63, 72));
+    // Swap ONLY the ty extents — identity untouched.
+    std::mem::swap(&mut a0.decl_span_lo, &mut a1.decl_span_lo);
+    std::mem::swap(&mut a0.decl_span_hi, &mut a1.decl_span_hi);
+
+    let v = compare(&[a0, a1], &[b0, b1]);
+    assert!(!v.passed(), "a detached splice target was accepted: {v:#?}");
+    let breach: Vec<_> = v
+        .violations
+        .iter()
+        .filter(|x| x.class == "span-interleave-breach")
+        .collect();
+    assert_eq!(breach.len(), 1, "expected exactly the one index: {v:#?}");
+    assert_eq!(breach[0].mir_local, 2, "the breach is at the second parameter");
+    assert!(breach[0].detail.contains("index 1"), "{:#?}", breach[0]);
+}
+
+/// The **follows** conjunct on its own: a type extent that starts before its
+/// OWN binding ends, with nothing preceding it.
+///
+/// Added after `T2-conj-follows` **survived**: deleting `b_hi > ty_lo` left the
+/// permutation witness green, because a permutation is caught by the ORDERING
+/// conjunct at index 1. Rider 5 — the survivor was closed by supplying the
+/// missing witness, not by an argument that the conjunct was covered.
+///
+/// The fixture is a single parameter, so `prev_ty_hi` is 0 and the ordering
+/// conjunct cannot fire; only the follows conjunct can.
+///
+/// *Mutation-tested (Rider 0):* deleting `b_hi > ty_lo` fails this and nothing
+/// else.
+#[test]
+fn the_span_follows_conjunct_is_compared() {
+    // ty (47,49) starts BEFORE the binding (50,58) ends — a type detached from
+    // the parameter it is supposed to belong to.
+    let (a0, b0) = span_pair(1, "p", (50, 58), (47, 49));
+    let v = compare(&[a0], &[b0]);
+    assert!(
+        v.violations.iter().any(|x| x.class == "span-interleave-breach"),
+        "a type extent preceding its own binding was accepted — the \
+         follows conjunct is not being compared: {v:#?}"
+    );
+}
+
+/// The **ordering** conjunct on its own: a type that runs past the next
+/// binding, with its own binding still ahead of it.
+///
+/// Single-term coverage, per the standing lesson: the permutation witness flips
+/// geometry in a way that can satisfy one conjunct, so each is killed alone.
+///
+/// *Mutation-tested (Rider 0):* deleting `prev_ty_hi > b_lo` fails this and
+/// not the permutation witness.
+#[test]
+fn the_span_ordering_conjunct_is_compared() {
+    let (a0, b0) = span_pair(1, "p", (47, 48), (50, 90)); // ty overruns q's binding
+    let (a1, b1) = span_pair(2, "q", (60, 61), (95, 99));
+    let v = compare(&[a0, a1], &[b0, b1]);
+    assert!(
+        v.violations.iter().any(|x| x.class == "span-interleave-breach"),
+        "an overrunning type extent was accepted: {v:#?}"
+    );
+}
+
+/// A row without a usable extent pair is `span-check-not-evaluable` — its own
+/// class, not folded into the pairing class.
+///
+/// *Mutation-tested (Rider 0):* changing the class string to
+/// `"pairing-mismatch-low-confidence"` fails this.
+#[test]
+fn an_unevaluable_span_row_gets_its_own_class() {
+    let (a0, b0) = span_pair(1, "p", (47, 48), (50, 58));
+    let (mut a1, b1) = span_pair(2, "q", (60, 61), (63, 72));
+    a1.decl_span_lo = None; // producer A could not supply an extent
+    let v = compare(&[a0, a1], &[b0, b1]);
+    assert_eq!(v.aggregates["span-check-not-evaluable"], 1, "{v:#?}");
+    assert!(
+        v.findings.iter().any(|f| f.class == "span-check-not-evaluable"),
+        "{v:#?}"
+    );
+}
+
+/// **The activation predicate is all-or-nothing.** Zero `binding_span_lo`
+/// anywhere ⇒ inactive; ANY present ⇒ active, and absent bindings become real
+/// findings. No gray zone.
+///
+/// *Mutation-tested (Rider 0):* changing `any` to `all` in `span_axis_active`
+/// fails the second half.
+#[test]
+fn the_span_axis_activation_predicate_has_no_gray_zone() {
+    let plain = vec![bare_row("f", 1, Some("p"), Some(1), 1)];
+    assert!(
+        !super::compare::span_axis_active(&plain),
+        "an artifact with no binding spans must report INACTIVE"
+    );
+
+    let (a0, b0) = span_pair(1, "p", (47, 48), (50, 58));
+    let mut b1 = bare_row("f", 2, Some("q"), Some(2), 1); // no binding span
+    b1.pairing_confidence = PairingConfidence::High;
+    let mut a1 = bare_row("f", 2, Some("q"), Some(2), 1);
+    a1.decl_span_lo = Some(63);
+    a1.decl_span_hi = Some(72);
+    assert!(
+        super::compare::span_axis_active(&[b0.clone(), b1.clone()]),
+        "ONE present binding span must make the whole artifact ACTIVE"
+    );
+    let v = compare(&[a0, a1], &[b0, b1]);
+    assert_eq!(
+        v.aggregates["span-check-not-evaluable"], 1,
+        "a mixed artifact must treat the absent binding as a real finding, not \
+         as tolerated dormancy: {v:#?}"
+    );
 }

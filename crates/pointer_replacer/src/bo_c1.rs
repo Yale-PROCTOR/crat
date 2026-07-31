@@ -7034,6 +7034,17 @@ mod run {
         row.set("a_rows", a_decoded.len());
         row.set("b_rows", b_decoded.len());
 
+        // Activation contract (c): the axis state is printed PER PROGRAM, in
+        // every sweep line. Dormancy must be visible, never inferred silence.
+        row.set(
+            "span_axis",
+            if compare::span_axis_active(&b_decoded) {
+                "ACTIVE"
+            } else {
+                "INACTIVE"
+            },
+        );
+
         let verdict = compare::compare(&a_decoded, &b_decoded);
         let aggregates_clean = record_expected_zero_aggregates(&mut row, &verdict);
         row.set("violations", verdict.violations.len());

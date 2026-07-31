@@ -32,15 +32,18 @@
 //! | `ptr_depth` | ✓ | ✓ | classification — attributed finding |
 //! | `pairing_confidence` | ✓ | ✓ | gates the severity of a pairing mismatch |
 //! | `decl_span`, `decl_shape` | ✓ | `null` | attribution only, not compared |
+//! | `decl_span_lo/hi` | ✓ | `null` | **SPAN axis** — A's half of the interleave |
+//! | `binding_span_lo/hi` | `null` | ✓ | **SPAN axis** — B's half, and the activation signal |
 //! | `outcome`, `degrade_reason` | ✓ | `null` | S2b consumes; not compared |
 //!
-//! `decl_span` is deliberately **not** a reconciled field even though §1 first
-//! grouped it under pairing. A's span is the declared *type*'s span (it is what
-//! the plan splices); the nearest MIR-side equivalent is the local's
-//! `source_info.span`, which denotes the *binding*. Comparing them would report
-//! a guaranteed difference as a finding on every row. Amendment (a) settles the
-//! question by naming the two pairing terms explicitly: `param_name` and
-//! `arg_index`.
+//! `decl_span` (the rendered string) is not reconciled: A's span is the declared
+//! *type*'s span, and the nearest MIR-side fact is the *binding*'s span, so an
+//! EQUALITY comparison would report a guaranteed difference on every row. That
+//! reasoning was correct but **incomplete** — equality is not the only relation
+//! available. Track 2 adds the numeric fields and compares them by **order**:
+//! `binding_i.hi ≤ ty_i.lo` and `ty_{i-1}.hi ≤ binding_i.lo`. Measured on 3173
+//! corpus parameters with zero exceptions, and it breaks under a permutation,
+//! which equality could never have detected without a shared derivation.
 
 use serde::{Deserialize, Serialize};
 
@@ -131,8 +134,30 @@ pub(crate) struct Row {
     /// Pointer-chain depth of the resolved parameter type.
     pub ptr_depth: u8,
     pub pairing_confidence: PairingConfidence,
-    /// Producer A only.
+    /// Producer A only. Rendered `file:line:col`, for **attribution**; not
+    /// orderable, so it is never used to decide the span axis.
     pub decl_span: Option<String>,
+    /// Producer A only — the declared type's extent, **numeric**.
+    ///
+    /// # Coordinate system, pinned
+    ///
+    /// **File-relative byte offsets**, obtained via
+    /// `SourceMap::lookup_byte_offset(..).pos.0` — *not* raw `BytePos`, which is
+    /// global across the source map and would be meaningless to compare between
+    /// files. Both producers use the same call, and the plan splices with the
+    /// same one, so the audited number **is** the edit target.
+    pub decl_span_lo: Option<u32>,
+    pub decl_span_hi: Option<u32>,
+    /// Producer B only — the parameter BINDING's extent, same coordinate
+    /// system. Sourced from `VarDebugInfo.source_info.span`.
+    ///
+    /// Its presence is also the **span-axis activation signal**: an artifact
+    /// with zero `binding_span_lo` anywhere has an inactive axis (producer B
+    /// does not emit the field yet); *any* present value makes the axis ACTIVE
+    /// for that artifact, with absent bindings on High rows becoming real
+    /// findings. There is deliberately no gray zone.
+    pub binding_span_lo: Option<u32>,
+    pub binding_span_hi: Option<u32>,
     /// Producer A only.
     pub decl_shape: Option<DeclShape>,
     /// Producer A only. Its presence is what distinguishes covered-but-unchanged

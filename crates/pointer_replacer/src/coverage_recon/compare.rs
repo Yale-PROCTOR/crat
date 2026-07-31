@@ -63,7 +63,26 @@ pub(crate) const FINDING_CLASSES: &[&str] = &[
     "out-of-coverage",
     "pairing-mismatch-low-confidence",
     "classification-mismatch",
+    // Track 2. Its OWN class rather than folded into the pairing class: they
+    // answer different questions — is the PAIRING trustworthy vs is the SPLICE
+    // TARGET trustworthy — and folding them would make a nonzero aggregate
+    // ambiguous about which axis degraded.
+    "span-check-not-evaluable",
 ];
+
+/// Is the span axis ACTIVE for this artifact pair?
+///
+/// The predicate is exactly **"zero `binding_span_lo` in the entire producer-B
+/// artifact"** ⇒ inactive. *Any* present value ⇒ ACTIVE, and absent bindings on
+/// High rows are then real findings. **No gray zone** — a per-row fallback would
+/// let a partly-filled artifact look healthy while most of the axis was dark.
+///
+/// Inactive is a bounded, declared state: producer B's `binding_span` arrives
+/// via the gated follow-on, `span_axis_is_active_on_producer_b` is RED until it
+/// does, and S2a-H cannot close while either holds.
+pub(crate) fn span_axis_active(b_rows: &[Row]) -> bool {
+    b_rows.iter().any(|r| r.binding_span_lo.is_some())
+}
 
 /// An attributed finding.
 ///
@@ -226,6 +245,72 @@ pub(crate) fn compare(a_rows: &[Row], b_rows: &[Row]) -> Verdict {
                 .aggregates
                 .entry("classification-mismatch")
                 .or_default() += 1;
+        }
+    }
+
+    // ---- span axis (Track 2) -------------------------------------------
+    if span_axis_active(b_rows) {
+        let mut by_fn: BTreeMap<&str, Vec<(&Row, &Row)>> = BTreeMap::new();
+        for (key, a) in &a_by_key {
+            if let Some(b) = b_by_key.get(key) {
+                by_fn.entry(key.0).or_default().push((a, b));
+            }
+        }
+        for (fn_path, mut pairs) in by_fn {
+            pairs.sort_by_key(|(a, _)| a.mir_local);
+            let mut prev_ty_hi: u32 = 0;
+            for (index, (a, b)) in pairs.iter().enumerate() {
+                let evaluable = a.decl_span_lo.zip(a.decl_span_hi).zip(
+                    b.binding_span_lo.zip(b.binding_span_hi),
+                );
+                match evaluable {
+                    Some(((ty_lo, ty_hi), (b_lo, b_hi)))
+                        if a.pairing_confidence == PairingConfidence::High
+                            && b.pairing_confidence == PairingConfidence::High =>
+                    {
+                        if b_hi > ty_lo || prev_ty_hi > b_lo {
+                            // NAMES THE FAILING INDEX: the conjunction fires at
+                            // >= 1 index under a permutation, not at every one,
+                            // so reporting the function alone would imply every
+                            // row is detached.
+                            verdict.violations.push(Violation {
+                                class: "span-interleave-breach",
+                                fn_path: fn_path.to_owned(),
+                                mir_local: a.mir_local,
+                                detail: format!(
+                                    "index {index}: binding=({b_lo},{b_hi}) ty=({ty_lo},{ty_hi}) \
+                                     prev_ty_hi={prev_ty_hi} — the declared type is not \
+                                     positioned within its own parameter's extent, so the \
+                                     splice target is mis-associated"
+                                ),
+                            });
+                        }
+                        prev_ty_hi = ty_hi;
+                    }
+                    _ => {
+                        verdict.findings.push(Finding {
+                            class: "span-check-not-evaluable",
+                            fn_path: fn_path.to_owned(),
+                            mir_local: a.mir_local,
+                            detail: format!(
+                                "index {index}: span axis active but this row lacks a \
+                                 usable extent pair (A={:?}..{:?}, B={:?}..{:?}, \
+                                 confidence A={:?} B={:?})",
+                                a.decl_span_lo, a.decl_span_hi,
+                                b.binding_span_lo, b.binding_span_hi,
+                                a.pairing_confidence, b.pairing_confidence
+                            ),
+                        });
+                        *verdict
+                            .aggregates
+                            .entry("span-check-not-evaluable")
+                            .or_default() += 1;
+                        if let Some(hi) = a.decl_span_hi {
+                            prev_ty_hi = hi;
+                        }
+                    }
+                }
+            }
         }
     }
 

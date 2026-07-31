@@ -55,6 +55,7 @@ fn wire_shape(shape: DeclShape) -> WireShape {
               root, so the lint stays active over everything reachable from it."
 )]
 pub(crate) fn rows(tcx: TyCtxt<'_>, table: &DecisionTable) -> Vec<Row> {
+    let source_map = tcx.sess.source_map();
     table
         .entries
         .iter()
@@ -90,6 +91,13 @@ pub(crate) fn rows(tcx: TyCtxt<'_>, table: &DecisionTable) -> Vec<Row> {
                     PairingConfidence::Low
                 },
                 decl_span: Some(EmitabilityFacts::site(tcx, subject.ty_span)),
+                // Through the SAME `lookup_byte_offset` the plan splices with,
+                // so the audited number IS the edit target rather than a
+                // parallel derivation that could drift from it.
+                decl_span_lo: Some(source_map.lookup_byte_offset(subject.ty_span.lo()).pos.0),
+                decl_span_hi: Some(source_map.lookup_byte_offset(subject.ty_span.hi()).pos.0),
+                binding_span_lo: None,
+                binding_span_hi: None,
                 decl_shape: Some(wire_shape(subject.decl_shape)),
                 outcome: Some(outcome),
                 degrade_reason,
