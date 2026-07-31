@@ -427,8 +427,20 @@ fn a_crate_that_fails_the_gate_still_reports_what_it_attempted() {
             );
             let site = &emitted_sites[0];
             assert!(
-                site.lo_line <= site.hi_line && site.fn_path.contains("stash"),
-                "site does not locate the rewritten subject's own fn: {site:?}"
+                site.fn_path.contains("stash"),
+                "site does not name the rewritten subject's own fn: {site:?}"
+            );
+            // THE EXTENT MUST COVER THE BODY. `stash` is declared on line 4 of
+            // `m.rs` and the offending store is on line 5. A signature-only span
+            // measures 4..4, so every diagnostic falls outside every extent and
+            // the own-fn bucket can only ever report zero — which is exactly
+            // what the first re-sweep produced, uniformly and plausibly.
+            assert!(
+                site.lo_line <= 5 && 5 <= site.hi_line,
+                "the fn extent {}..{} does not contain its own body line 5 — the \
+                 own-fn bucket would be unfailable by construction: {site:?}",
+                site.lo_line,
+                site.hi_line
             );
         }
         super::RewriteOutcome::Emitted { .. } => {

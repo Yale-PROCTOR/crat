@@ -210,7 +210,14 @@ fn rewrite_core(
             if !seen_fns.insert(subject.fn_did) {
                 continue;
             }
-            let fn_span = tcx.hir_span(tcx.local_def_id_to_hir_id(subject.fn_did));
+            // The signature span ALONE is not the function: `hir_span` on a fn
+            // returns its header, so `ht_iterator` measured as lines 207..207
+            // while the error it caused sat at 214. Every diagnostic then fell
+            // outside every extent and the own-fn bucket was unfailable by
+            // construction — it could only ever report zero. Union with the
+            // body's span.
+            let signature = tcx.hir_span(tcx.local_def_id_to_hir_id(subject.fn_did));
+            let fn_span = signature.to(tcx.hir_body_owned_by(subject.fn_did).value.span);
             let source_map = tcx.sess.source_map();
             let (lo, hi) = (
                 source_map.lookup_char_pos(fn_span.lo()),
