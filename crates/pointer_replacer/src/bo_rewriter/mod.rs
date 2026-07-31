@@ -560,10 +560,58 @@ pub(crate) struct EmittedSite {
 /// The rewritten source of every file the plan touched, plus what could not be
 /// placed. **This is the general emission path**; the string entry point is its
 /// single-file case.
+#[allow(
+    dead_code,
+    reason = "`plan` and `texts` are read by S2b.1.2's revert loop, landing in \
+              this slice; extracted here so a round needs no second compiler \
+              session. Correct this reason when the loop lands."
+)]
 pub(crate) struct Emission {
     pub files: std::collections::BTreeMap<plan::FileKey, String>,
     pub rollbacks: Vec<apply::Rollback>,
     pub unplaceable: Vec<plan::Unplaceable>,
+    /// **Extracted once, inside the single compiler session.** The verify loop's
+    /// rounds re-render from these rather than re-planning, so a round needs no
+    /// second session — nesting one rustc session inside another was rejected
+    /// for lack of soundness evidence. Re-planning degenerates to re-RENDERING,
+    /// which is the phase architecture's own claim taken seriously: `plan`
+    /// produces edits as DATA.
+    pub plan: plan::Plan,
+    pub texts: std::collections::BTreeMap<plan::FileKey, String>,
+}
+
+/// Apply a plan's edits, minus the reverted owners, to the original texts.
+///
+/// Pure: no compiler session, no analysis. This is what a revert round runs.
+pub(crate) fn render(
+    planned: &plan::Plan,
+    texts: &std::collections::BTreeMap<plan::FileKey, String>,
+    reverted: &std::collections::BTreeSet<String>,
+) -> (
+    std::collections::BTreeMap<plan::FileKey, String>,
+    Vec<apply::Rollback>,
+) {
+    let mut files = std::collections::BTreeMap::new();
+    let mut rollbacks = Vec::new();
+    for (key, edits) in &planned.by_file {
+        // Revert by JUSTIFICATION, not geography: an edit survives only if the
+        // subject that justifies it has not been taken back.
+        let kept: Vec<plan::Edit> = edits
+            .iter()
+            .filter(|edit| !reverted.contains(&edit.owner_fn))
+            .cloned()
+            .collect();
+        if kept.is_empty() {
+            continue;
+        }
+        let Some(source) = texts.get(key) else {
+            continue;
+        };
+        let applied = apply::apply(source, &kept);
+        rollbacks.extend(applied.rollbacks);
+        files.insert(key.clone(), applied.source);
+    }
+    (files, rollbacks)
 }
 
 /// A source file's identity for editing. `None` for anything not written back
@@ -621,24 +669,28 @@ pub(crate) fn emit_files<'tcx>(
             Ok((lo_key, lo, hi))
         };
 
-    let planned = plan::plan(table, text_of, span_to_loc, &|subject| {
-        reverted.contains(&subject.fn_did)
-    });
+    let planned = plan::plan(
+        table,
+        text_of,
+        span_to_loc,
+        |subject| tcx.def_path_str(subject.fn_did.to_def_id()),
+        &|subject: &decision::Subject| reverted.contains(&subject.fn_did),
+    );
 
-    let mut files = std::collections::BTreeMap::new();
-    let mut rollbacks = Vec::new();
-    for (key, edits) in &planned.by_file {
+    let mut texts = std::collections::BTreeMap::new();
+    for key in planned.by_file.keys() {
         let Some(source) = text_of(key) else {
             return Err(format!("no source text for planned file {key:?}"));
         };
-        let applied = apply::apply(&source, edits);
-        rollbacks.extend(applied.rollbacks);
-        files.insert(key.clone(), applied.source);
+        texts.insert(key.clone(), source);
     }
+    let (files, rollbacks) = render(&planned, &texts, &std::collections::BTreeSet::new());
     Ok(Emission {
         files,
         rollbacks,
-        unplaceable: planned.unplaceable,
+        unplaceable: planned.unplaceable.clone(),
+        plan: planned,
+        texts,
     })
 }
 

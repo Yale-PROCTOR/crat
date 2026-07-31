@@ -97,6 +97,7 @@ mod tests {
             hi,
             replacement: text.to_owned(),
             justification: Justification::KindDecision { kind: "test" },
+            owner_fn: "test::owner".to_owned(),
         }
     }
 

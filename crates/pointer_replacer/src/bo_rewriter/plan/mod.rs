@@ -100,6 +100,19 @@ pub(crate) struct Edit {
     pub hi: usize,
     pub replacement: String,
     pub justification: Justification,
+    /// **The subject whose rewrite JUSTIFIES this edit** — not the file the edit
+    /// lands in, and not necessarily the function containing it.
+    ///
+    /// In M1 the two coincide: a parameter's type is rewritten inside its own
+    /// declaration. **They diverge at S3**, whose call-site adaptation emits
+    /// edits into CALLER files while the edit is justified by the CALLEE's
+    /// subject. The verify loop reverts by JUSTIFICATION, never by geography —
+    /// reverting the file or the containing function would take back edits the
+    /// culprit did not cause and leave the ones it did.
+    ///
+    /// Carried as a rendered path rather than a `LocalDefId` so no compiler type
+    /// enters `plan`.
+    pub owner_fn: String,
 }
 
 /// The finished plan handed to [`super::apply`], **grouped by file**.
@@ -146,6 +159,7 @@ pub(crate) fn plan(
     table: &DecisionTable,
     source_of: impl Fn(&FileKey) -> Option<String>,
     span_to_loc: impl Fn(rustc_span::Span) -> Result<(FileKey, usize, usize), &'static str>,
+    owner_of: impl Fn(&super::decision::Subject) -> String,
     reverted: &dyn Fn(&super::decision::Subject) -> bool,
 ) -> Plan {
     let mut by_file: BTreeMap<FileKey, Vec<Edit>> = BTreeMap::new();
@@ -224,6 +238,7 @@ pub(crate) fn plan(
             justification: Justification::KindDecision {
                 kind: if *mutable { "Ref(mut)" } else { "Ref(shared)" },
             },
+            owner_fn: owner_of(subject),
         });
     }
     Plan { by_file, unplaceable }
