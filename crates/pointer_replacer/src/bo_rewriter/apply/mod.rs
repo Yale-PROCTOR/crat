@@ -139,12 +139,28 @@ mod tests {
     }
 
     /// Out-of-bounds and inverted ranges are rejected rather than panicking.
+    ///
+    /// *Mutation-tested, Rider 0 order.* **Deletion first:** remove the bounds
+    /// check and this fails.
+    ///
+    /// **The reason assertion is load-bearing, and was added after the deletion
+    /// SURVIVED without it (S2b.0a.1).** With the bounds check gone, an
+    /// out-of-range `hi` is caught one guard later by `is_char_boundary`, which
+    /// returns false for any index past the end — so a witness that only counted
+    /// rollbacks saw exactly one either way and could not tell which guard
+    /// fired. Naming the reason is what makes the two distinguishable, exactly
+    /// as the overlap witness above already did.
     #[test]
     fn out_of_bounds_edits_roll_back() {
         let src = "abc";
         let edits = vec![edit(2, 99, "X")];
         let applied = apply(src, &edits);
         assert_eq!(applied.rollbacks.len(), 1);
+        assert_eq!(
+            applied.rollbacks[0].reason, "edit range is out of bounds or inverted",
+            "the rollback must come from the BOUNDS guard, not from a later one \
+             that happens to reject the same edit for a different reason"
+        );
         assert_eq!(applied.source, src, "a rolled-back edit must not apply");
     }
 
