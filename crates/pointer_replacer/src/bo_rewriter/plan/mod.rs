@@ -137,14 +137,23 @@ pub(crate) struct Plan {
 /// invocation. A per-file invocation would have to be unwound the moment S3
 /// lands, and the unwinding would be silent — the code would still compile and
 /// simply place S3's edits in the wrong file.
+///
+/// `reverted` names subjects the verify loop has already taken back: they are
+/// skipped here rather than removed from the table, so the decision phase stays
+/// the single authority on what was decided and the loop only decides what is
+/// *emitted*.
 pub(crate) fn plan(
     table: &DecisionTable,
     source_of: impl Fn(&FileKey) -> Option<String>,
     span_to_loc: impl Fn(rustc_span::Span) -> Result<(FileKey, usize, usize), &'static str>,
+    reverted: &dyn Fn(&super::decision::Subject) -> bool,
 ) -> Plan {
     let mut by_file: BTreeMap<FileKey, Vec<Edit>> = BTreeMap::new();
     let mut unplaceable = Vec::new();
     for (subject, decision) in &table.entries {
+        if reverted(subject) {
+            continue;
+        }
         let Decision::Ref { mutable } = decision else {
             // Degraded subjects produce no edit BY DESIGN — the decision phase
             // already recorded why, and re-deciding here would duplicate the

@@ -191,7 +191,7 @@ fn rewrite_core(
     let root_hint = tree_base;
     let result = ::utils::compilation::run_compiler_on_input(input, |tcx| {
         let table = decide_table(tcx)?;
-        let emission = emit_files(tcx, &table)?;
+        let emission = emit_files(tcx, &table, &rustc_hash::FxHashSet::default())?;
         // Structural gate: rollbacks must be zero.
         if !emission.rollbacks.is_empty() {
             return Err(format!(
@@ -587,6 +587,7 @@ fn file_key(name: &rustc_span::FileName) -> Option<plan::FileKey> {
 pub(crate) fn emit_files<'tcx>(
     tcx: TyCtxt<'tcx>,
     table: &decision::DecisionTable,
+    reverted: &rustc_hash::FxHashSet<rustc_hir::def_id::LocalDefId>,
 ) -> Result<Emission, String> {
     let source_map = tcx.sess.source_map();
     let text_of = |key: &plan::FileKey| -> Option<String> {
@@ -620,7 +621,9 @@ pub(crate) fn emit_files<'tcx>(
             Ok((lo_key, lo, hi))
         };
 
-    let planned = plan::plan(table, text_of, span_to_loc);
+    let planned = plan::plan(table, text_of, span_to_loc, &|subject| {
+        reverted.contains(&subject.fn_did)
+    });
 
     let mut files = std::collections::BTreeMap::new();
     let mut rollbacks = Vec::new();

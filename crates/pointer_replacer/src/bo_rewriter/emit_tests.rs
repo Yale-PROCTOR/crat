@@ -69,7 +69,7 @@ impl Drop for Fixture {
 fn emit(fixture: &Fixture) -> Emission {
     ::utils::compilation::run_compiler_on_path(&fixture.0.join("lib.rs"), |tcx| {
         let table = decide_table(tcx).expect("fixture yields a decision table");
-        emit_files(tcx, &table).expect("emission succeeds")
+        emit_files(tcx, &table, &rustc_hash::FxHashSet::default()).expect("emission succeeds")
     })
     .expect("fixture compiles")
 }
