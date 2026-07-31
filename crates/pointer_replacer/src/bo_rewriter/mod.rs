@@ -246,10 +246,13 @@ fn rewrite_core(
             // replaces this verdict with per-function granularity, after the
             // S2b.0 measurement chooses its mechanism.
             if verify::type_checks_crate(staged.root()) {
-                let source = match tree_base {
-                    Some(_) => std::fs::read_to_string(staged.root()).unwrap_or_default(),
-                    None => root_text,
-                };
+                // Read back from the MATERIALIZED copy in both cases, so the
+                // bytes returned are the bytes the gate just accepted. Deriving
+                // them separately let a broken materialization gate an empty
+                // crate while the caller still received the real source — the
+                // gate would have been checking something it did not return.
+                let _ = &root_text;
+                let source = std::fs::read_to_string(staged.root()).unwrap_or_default();
                 RewriteOutcome::Emitted {
                     source,
                     files,
