@@ -1,8 +1,9 @@
 #![feature(rustc_private)]
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use clap::{Parser, Subcommand};
+use serde::Serialize;
 use utils::compilation::run_compiler_on_path;
 
 #[derive(Parser)]
@@ -35,8 +36,38 @@ enum Command {
         request: PathBuf,
         #[arg(long)]
         output: PathBuf,
+        #[arg(long)]
+        statement_pairs_output: PathBuf,
         current_project: PathBuf,
     },
+}
+
+#[derive(Serialize)]
+struct StatementPairsSidecar<'a> {
+    schema_version: u64,
+    statements: &'a [tools::ReplacementStatementPair],
+}
+
+fn serialize_replacement_outputs(
+    output: tools::ReplacementOutput,
+) -> Result<(String, String), serde_json::Error> {
+    let sidecar = serde_json::to_string_pretty(&StatementPairsSidecar {
+        schema_version: 1,
+        statements: &output.statement_pairs,
+    })?;
+    Ok((output.source, sidecar))
+}
+
+fn validate_replace_output_paths(
+    output: &Path,
+    statement_pairs_output: &Path,
+) -> Result<(), String> {
+    if output == statement_pairs_output {
+        return Err(
+            "`--output` and `--statement-pairs-output` must name distinct paths".to_owned(),
+        );
+    }
+    Ok(())
 }
 
 fn main() {
@@ -74,8 +105,15 @@ fn main() {
         Command::Replace {
             request,
             output,
+            statement_pairs_output,
             current_project,
         } => {
+            validate_replace_output_paths(&output, &statement_pairs_output).unwrap_or_else(
+                |error| {
+                    eprintln!("{error}");
+                    std::process::exit(1);
+                },
+            );
             let request = std::fs::read_to_string(request)
                 .map_err(|error| error.to_string())
                 .and_then(|request| {
@@ -101,7 +139,105 @@ fn main() {
                 eprintln!("{:?}: {}", error.kind, error.message);
                 std::process::exit(1);
             });
-            std::fs::write(output, replaced).unwrap();
+            let (source, sidecar) = serialize_replacement_outputs(replaced).unwrap();
+            std::fs::write(output, source).unwrap();
+            std::fs::write(statement_pairs_output, sidecar).unwrap();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn replace_cli_helper_serializes_both_outputs_exactly() {
+        let output = tools::ReplacementOutput {
+            source: "pub unsafe fn f() {}\n".to_owned(),
+            statement_pairs: vec![
+                tools::ReplacementStatementPair {
+                    item_id: 2,
+                    path: "z::f".to_owned(),
+                    label: 0,
+                    after_statement: "#[proctor(0)]\nreturn \"quoted\";".to_owned(),
+                },
+                tools::ReplacementStatementPair {
+                    item_id: 7,
+                    path: "a::g".to_owned(),
+                    label: 3,
+                    after_statement: "#[proctor(3)]\ng();".to_owned(),
+                },
+            ],
+        };
+        let (source, sidecar) = serialize_replacement_outputs(output).unwrap();
+        assert_eq!(source.as_bytes(), b"pub unsafe fn f() {}\n");
+        assert_eq!(
+            sidecar,
+            r##"{
+  "schema_version": 1,
+  "statements": [
+    {
+      "item_id": 2,
+      "path": "z::f",
+      "label": 0,
+      "after_statement": "#[proctor(0)]\nreturn \"quoted\";"
+    },
+    {
+      "item_id": 7,
+      "path": "a::g",
+      "label": 3,
+      "after_statement": "#[proctor(3)]\ng();"
+    }
+  ]
+}"##
+        );
+        assert!(!sidecar.ends_with('\n'));
+
+        let (_, empty) = serialize_replacement_outputs(tools::ReplacementOutput {
+            source: String::new(),
+            statement_pairs: vec![],
+        })
+        .unwrap();
+        assert_eq!(
+            empty,
+            "{\n  \"schema_version\": 1,\n  \"statements\": []\n}"
+        );
+
+        assert!(
+            Args::try_parse_from([
+                "crat-tool",
+                "replace",
+                "--request",
+                "request.json",
+                "--output",
+                "candidate.rs",
+                "project",
+            ])
+            .is_err()
+        );
+        let args = Args::try_parse_from([
+            "crat-tool",
+            "replace",
+            "--request",
+            "request.json",
+            "--output",
+            "candidate.rs",
+            "--statement-pairs-output",
+            "pairs.json",
+            "project",
+        ])
+        .unwrap();
+        let Command::Replace {
+            output,
+            statement_pairs_output,
+            ..
+        } = args.command
+        else {
+            panic!("expected replace command")
+        };
+        assert_eq!(output, PathBuf::from("candidate.rs"));
+        assert_eq!(statement_pairs_output, PathBuf::from("pairs.json"));
+        assert!(validate_replace_output_paths(&output, &statement_pairs_output).is_ok());
+        assert!(validate_replace_output_paths(&output, &output).is_err());
     }
 }

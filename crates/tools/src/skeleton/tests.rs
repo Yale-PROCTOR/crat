@@ -1906,6 +1906,7 @@ fn record_variants_serialize_only_their_defined_fields() {
             "target_signature",
             "needs_transformation",
             "statements_requiring_transformation",
+            "statement_pair_metadata",
             "foreign_function_names",
             "signature_dependencies",
             "dependencies"
@@ -3966,7 +3967,8 @@ fn generated_local_name_validates_replaces_and_compiles_in_original_module() {
         )
         .unwrap()
     })
-    .unwrap();
+    .unwrap()
+    .source;
     assert!(replaced.contains("let mut init: cb_rgb"));
     assert!(replaced.contains("pub unsafe fn cb_remove_gamma_rgb"));
     assert!(!replaced.contains("#[proctor("));
@@ -4311,6 +4313,7 @@ fn existing_function_records_and_helpers_adopt_the_final_shape() {
     "target_signature": "pub unsafe fn scalar(mut value: i32) -> i32",
     "needs_transformation": false,
     "statements_requiring_transformation": [],
+    "statement_pair_metadata": [],
     "foreign_function_names": [],
     "signature_dependencies": [],
     "dependencies": []
@@ -5096,5 +5099,512 @@ fn exact_unsupported_callable_and_desugar_matrix() {
     assert_eq!(
         function(&assembly, "assembly").statements_requiring_transformation,
         [0]
+    );
+}
+
+#[test]
+fn records_parameter_and_inferred_local_types_from_source_and_target_asts() {
+    let records = generate(
+        r#"pub unsafe fn update(mut pointer: *mut i32, mut amount: i32) -> i32 {
+            let mut alias = pointer;
+            *alias += amount;
+            *pointer + *alias
+        }"#,
+    );
+    let record = function(&records, "update");
+    assert_eq!(
+        record
+            .statement_pair_metadata
+            .iter()
+            .map(|entry| entry.label)
+            .collect::<Vec<_>>(),
+        record.statements_requiring_transformation
+    );
+    assert!(
+        record
+            .statement_pair_metadata
+            .iter()
+            .all(|entry| entry.pointer_variables_complete)
+    );
+    assert_eq!(
+        record
+            .statement_pair_metadata
+            .iter()
+            .map(|entry| {
+                (
+                    entry.label,
+                    entry.before_statement.as_str(),
+                    entry
+                        .pointer_variables
+                        .iter()
+                        .map(|variable| variable.name.as_str())
+                        .collect::<Vec<_>>(),
+                )
+            })
+            .collect::<Vec<_>>(),
+        [
+            (
+                0,
+                "#[proctor(0)]\nlet mut alias = pointer;",
+                vec!["alias", "pointer"],
+            ),
+            (1, "#[proctor(1)]\n(*alias += amount);", vec!["alias"],),
+            (
+                2,
+                "#[proctor(2)]\n(*pointer + *alias)",
+                vec!["pointer", "alias"],
+            ),
+        ]
+    );
+    let pointer = &record.statement_pair_metadata[0].pointer_variables[1];
+    assert_eq!(pointer.before_type, "*mut i32");
+    assert!(!pointer.before_type_is_inferred);
+    assert_eq!(
+        pointer.origin,
+        PointerVariableOrigin::Parameter { index: 0 }
+    );
+    assert_eq!(pointer.selected_target_type, "&mut i32");
+    assert!(record.target_signature.contains("pointer: &mut i32"));
+    let alias = &record.statement_pair_metadata[0].pointer_variables[0];
+    assert_eq!(alias.before_type, "*mut i32");
+    assert!(alias.before_type_is_inferred);
+    assert_eq!(
+        alias.origin,
+        PointerVariableOrigin::Local {
+            declaration_label: 0
+        }
+    );
+    assert_eq!(alias.selected_target_type, "*mut i32");
+    assert!(record.annotated_skeleton.contains("alias: *mut i32"));
+    assert!(
+        record
+            .statement_pair_metadata
+            .iter()
+            .flat_map(|entry| &entry.pointer_variables)
+            .all(|variable| variable.name != "amount")
+    );
+
+    let long = generate(
+        r#"pub unsafe fn long(
+            mut pointer: *mut core::option::Option<
+                core::result::Result<
+                    [core::mem::MaybeUninit<i32>; 32],
+                    core::convert::Infallible,
+                >,
+            >,
+        ) {
+            *pointer = None;
+        }"#,
+    );
+    let long_type =
+        &function(&long, "long").statement_pair_metadata[0].pointer_variables[0].before_type;
+    assert_eq!(
+        long_type,
+        "*mut core::option::Option<core::result::Result<[core::mem::MaybeUninit<i32>; 32],\n\
+         core::convert::Infallible>>"
+    );
+    assert!(long_type.contains('\n'));
+}
+
+#[test]
+fn deduplicates_by_binding_identity_in_first_occurrence_order() {
+    let records = generate(
+        r#"pub unsafe fn shadow(mut pointer: *mut i32) -> i32 {
+            if pointer.is_null() {
+                0
+            } else {
+                let mut value = pointer;
+                {
+                    let mut value = pointer;
+                    *value += 1;
+                }
+                *value
+            }
+        }"#,
+    );
+    let record = function(&records, "shadow");
+    let parent = record
+        .statement_pair_metadata
+        .iter()
+        .find(|entry| {
+            entry
+                .pointer_variables
+                .iter()
+                .filter(|variable| variable.name == "value")
+                .count()
+                == 2
+        })
+        .expect("the transformed parent contains both shadowed bindings");
+    let values = parent
+        .pointer_variables
+        .iter()
+        .filter(|variable| variable.name == "value")
+        .collect::<Vec<_>>();
+    assert_eq!(
+        parent
+            .pointer_variables
+            .iter()
+            .map(|variable| (variable.name.as_str(), variable.origin.clone()))
+            .collect::<Vec<_>>(),
+        [
+            ("pointer", PointerVariableOrigin::Parameter { index: 0 },),
+            (
+                "value",
+                PointerVariableOrigin::Local {
+                    declaration_label: 2,
+                },
+            ),
+            (
+                "value",
+                PointerVariableOrigin::Local {
+                    declaration_label: 4,
+                },
+            ),
+        ]
+    );
+    assert_eq!(
+        values
+            .iter()
+            .map(|variable| variable.origin.clone())
+            .collect::<Vec<_>>(),
+        [
+            PointerVariableOrigin::Local {
+                declaration_label: 2,
+            },
+            PointerVariableOrigin::Local {
+                declaration_label: 4,
+            },
+        ]
+    );
+    let json = skeletons_to_json(&records).unwrap();
+    assert!(!json.contains("HirId"));
+}
+
+#[test]
+fn before_statement_is_the_complete_prompt_facing_source_subtree() {
+    let records = generate(
+        r#"pub unsafe fn choose(mut pointer: *mut i32, mut flag: bool) -> i32 {
+            if flag {
+                *pointer += 1;
+                *pointer
+            } else {
+                0
+            }
+        }"#,
+    );
+    let record = function(&records, "choose");
+    let parent = record
+        .statement_pair_metadata
+        .iter()
+        .find(|entry| entry.before_statement.contains("if flag"))
+        .unwrap();
+    assert_eq!(
+        parent.before_statement,
+        "#[proctor(0)]\nif flag {\n\n    #[proctor(1)]\n    (*pointer += 1);\n\n    \
+         #[proctor(2)]\n    *pointer\n} else {\n\n    #[proctor(3)]\n    0\n}"
+    );
+    assert_eq!(
+        record
+            .statement_pair_metadata
+            .iter()
+            .find(|entry| entry.label == 1)
+            .unwrap()
+            .before_statement,
+        "#[proctor(1)]\n(*pointer += 1);"
+    );
+    assert_eq!(
+        record
+            .statement_pair_metadata
+            .iter()
+            .find(|entry| entry.label == 2)
+            .unwrap()
+            .before_statement,
+        "#[proctor(2)]\n*pointer"
+    );
+    assert!(record.annotated_source.contains("mut pointer"));
+    assert!(record.annotated_source.contains("mut flag"));
+}
+
+#[test]
+fn includes_only_outer_raw_pointer_parameters_and_simple_locals() {
+    let records = generate(
+        r#"pub struct Holder { pub pointer: *mut i32 }
+        pub static mut GLOBAL: *mut i32 = core::ptr::null_mut();
+        pub unsafe fn exclusions(mut holder: Holder, mut pointer: *mut i32) -> i32 {
+            let mut copied = holder.pointer;
+            let mut tuple = (pointer, 1_i32);
+            let mut scalar = *pointer;
+            scalar += *GLOBAL;
+            scalar + tuple.1 + *copied
+        }"#,
+    );
+    let names = function(&records, "exclusions")
+        .statement_pair_metadata
+        .iter()
+        .flat_map(|entry| &entry.pointer_variables)
+        .map(|variable| variable.name.as_str())
+        .collect::<FxHashSet<_>>();
+    assert_eq!(names, ["pointer", "copied"].into_iter().collect());
+    assert!(
+        !names
+            .iter()
+            .any(|name| name.starts_with("proctor_temp_var_"))
+    );
+
+    let source = "pub unsafe fn source(mut pointer: *mut i32) { *pointer += 1; }";
+    run_compiler_on_str(source, |tcx| {
+        let mut surface = utils::ast::parse_crate(source.to_owned());
+        let mut mapper = utils::ir::AstToHirMapper::new(tcx);
+        mapper.map_crate_to_mod(&mut surface, tcx.hir_root_module(), false);
+        let generated =
+            utils::ast::parse_stmt("let proctor_temp_var_0: *mut i32 = pointer;".to_owned());
+        let catalog = PointerBindingCatalog {
+            variables: FxHashMap::default(),
+            known_ineligible: FxHashSet::default(),
+        };
+        let mut collector = PointerOccurrenceCollector {
+            ast_to_hir: &mapper.ast_to_hir,
+            catalog: &catalog,
+            complete: true,
+            seen: FxHashSet::default(),
+            variables: vec![],
+            tcx,
+        };
+        collector.visit_stmt(&generated);
+        assert!(
+            collector.variables.is_empty(),
+            "a parser-only generated binding has no immutable source identity"
+        );
+        assert!(!collector.complete);
+    })
+    .unwrap();
+}
+
+#[test]
+fn metadata_labels_exactly_match_transformation_dispositions() {
+    let preserved = generate("pub unsafe fn f(mut value: i32) -> i32 { value + 1 }");
+    let record = function(&preserved, "f");
+    assert!(record.statements_requiring_transformation.is_empty());
+    assert!(record.statement_pair_metadata.is_empty());
+
+    let transformed =
+        generate("pub unsafe fn f(mut pointer: *mut i32) -> i32 { *pointer += 1; *pointer }");
+    let record = function(&transformed, "f");
+    assert_eq!(
+        record
+            .statement_pair_metadata
+            .iter()
+            .map(|entry| entry.label)
+            .collect::<Vec<_>>(),
+        record.statements_requiring_transformation
+    );
+    assert_eq!(
+        skeletons_to_json(&transformed).unwrap(),
+        skeletons_to_json(&transformed).unwrap()
+    );
+    let json = skeletons_to_json(&transformed).unwrap();
+    let positions = [
+        "\"statements_requiring_transformation\"",
+        "\"statement_pair_metadata\"",
+        "\"foreign_function_names\"",
+    ]
+    .map(|key| json.find(key).unwrap());
+    assert!(positions.windows(2).all(|pair| pair[0] < pair[1]));
+
+    let empty_rows = generate(
+        r#"unsafe extern "C" { fn foreign(); }
+        pub unsafe fn invoke() { foreign(); }"#,
+    );
+    let entry = &function(&empty_rows, "invoke").statement_pair_metadata[0];
+    assert!(entry.pointer_variables_complete);
+    assert!(entry.pointer_variables.is_empty());
+
+    let populated = generate("pub unsafe fn pointer(mut pointer: *mut i32) -> i32 { *pointer }");
+    let json = skeletons_to_json(&populated).unwrap();
+    let statement_keys = [
+        "\"label\"",
+        "\"before_statement\"",
+        "\"pointer_variables_complete\"",
+        "\"pointer_variables\"",
+    ]
+    .map(|key| json.find(key).unwrap());
+    assert!(statement_keys.windows(2).all(|pair| pair[0] < pair[1]));
+    let variable_keys = [
+        "\"name\"",
+        "\"origin\"",
+        "\"before_type\"",
+        "\"selected_target_type\"",
+        "\"before_type_is_inferred\"",
+    ]
+    .map(|key| {
+        if key == "\"name\"" {
+            json.rfind(key).unwrap()
+        } else {
+            json.find(key).unwrap()
+        }
+    });
+    assert!(variable_keys.windows(2).all(|pair| pair[0] < pair[1]));
+    assert!(
+        serde_json::to_string(&populated)
+            .unwrap()
+            .contains("\"origin\":{\"kind\":\"parameter\",\"index\":0}")
+    );
+}
+
+#[test]
+fn main_override_aliases_and_raw_fallbacks_report_actual_skeleton_types() {
+    let records = generate(
+        r#"type Pointer = *mut i32;
+        pub unsafe fn alias(mut pointer: Pointer) { *pointer += 1; }
+        pub unsafe fn main_0(
+            mut argc: core::ffi::c_int,
+            mut argv: *mut *mut core::ffi::c_char,
+        ) -> core::ffi::c_int {
+            let _ = argv;
+            argc
+        }"#,
+    );
+    let alias = function(&records, "alias");
+    let pointer = alias
+        .statement_pair_metadata
+        .iter()
+        .flat_map(|entry| &entry.pointer_variables)
+        .find(|variable| variable.name == "pointer")
+        .unwrap();
+    assert_eq!(pointer.before_type, "Pointer");
+    assert_eq!(pointer.selected_target_type, "&mut i32");
+    assert!(alias.target_signature.contains("pointer: &mut i32"));
+
+    let main = function(&records, "main_0");
+    let argv = main
+        .statement_pair_metadata
+        .iter()
+        .flat_map(|entry| &entry.pointer_variables)
+        .find(|variable| variable.name == "argv")
+        .unwrap();
+    assert_eq!(argv.before_type, "*mut *mut core::ffi::c_char");
+    assert_eq!(argv.selected_target_type, "&mut [&mut [i8]]");
+
+    let raw = generate(raw_pointer_fixture());
+    let retained = function(&raw, "keep_alias_raw")
+        .statement_pair_metadata
+        .iter()
+        .flat_map(|entry| &entry.pointer_variables)
+        .find(|variable| variable.name == "a")
+        .unwrap();
+    assert_eq!(retained.before_type, "*mut i32");
+    assert_eq!(retained.selected_target_type, "*mut i32");
+}
+
+#[test]
+fn unmappable_statement_emits_resolvable_rows_and_incomplete_flag() {
+    let records = generate(
+        r#"macro_rules! bump {
+            ($pointer:expr) => {{ *$pointer += 1; }};
+        }
+        pub unsafe fn incomplete(mut pointer: *mut i32) -> i32 {
+            if !pointer.is_null() {
+                bump!(pointer);
+            }
+            *pointer
+        }"#,
+    );
+    let entry = function(&records, "incomplete")
+        .statement_pair_metadata
+        .iter()
+        .find(|entry| entry.before_statement.contains("if !pointer.is_null()"))
+        .unwrap();
+    assert!(!entry.pointer_variables_complete);
+    assert_eq!(entry.pointer_variables.len(), 1);
+    let pointer = &entry.pointer_variables[0];
+    assert_eq!(pointer.name, "pointer");
+    assert_eq!(
+        pointer.origin,
+        PointerVariableOrigin::Parameter { index: 0 }
+    );
+    assert_eq!(pointer.before_type, "*mut i32");
+    assert_eq!(pointer.selected_target_type, "Option<&mut i32>");
+    assert!(!pointer.before_type_is_inferred);
+
+    let source = "pub unsafe fn missing(mut value: i32) { value += 1; }";
+    run_compiler_on_str(source, |tcx| {
+        let mut surface = utils::ast::parse_crate(source.to_owned());
+        let mut mapper = utils::ir::AstToHirMapper::new(tcx);
+        mapper.map_crate_to_mod(&mut surface, tcx.hir_root_module(), false);
+        let mut ast_to_hir = mapper.ast_to_hir;
+        let ItemKind::Fn(box function) = &surface.items[0].kind else { unreachable!() };
+        let statement = &function.body.as_ref().unwrap().stmts[0];
+        ast_to_hir.local_map.remove(&statement.id);
+        let catalog = PointerBindingCatalog {
+            variables: FxHashMap::default(),
+            known_ineligible: FxHashSet::default(),
+        };
+        let mut collector = PointerOccurrenceCollector {
+            ast_to_hir: &ast_to_hir,
+            catalog: &catalog,
+            complete: true,
+            seen: FxHashSet::default(),
+            variables: vec![],
+            tcx,
+        };
+        collector.visit_stmt(statement);
+        collector.collect_hir_root(statement);
+        assert!(!collector.complete);
+        assert!(collector.variables.is_empty());
+    })
+    .unwrap();
+
+    let source = "pub unsafe fn missing(mut pointer: *mut i32) { *pointer += 1; }";
+    run_compiler_on_str(source, |tcx| {
+        let mut surface = utils::ast::parse_crate(source.to_owned());
+        let mut mapper = utils::ir::AstToHirMapper::new(tcx);
+        mapper.map_crate_to_mod(&mut surface, tcx.hir_root_module(), false);
+        let ast_to_hir = mapper.ast_to_hir;
+        let ItemKind::Fn(box function) = &surface.items[0].kind else { unreachable!() };
+        let statement = &function.body.as_ref().unwrap().stmts[0];
+        let catalog = PointerBindingCatalog {
+            variables: FxHashMap::default(),
+            known_ineligible: FxHashSet::default(),
+        };
+        let mut collector = PointerOccurrenceCollector {
+            ast_to_hir: &ast_to_hir,
+            catalog: &catalog,
+            complete: true,
+            seen: FxHashSet::default(),
+            variables: vec![],
+            tcx,
+        };
+        collector.visit_stmt(statement);
+        collector.collect_hir_root(statement);
+        assert!(
+            !collector.complete,
+            "a resolved raw-pointer use absent from the catalog is incomplete"
+        );
+        assert!(collector.variables.is_empty());
+    })
+    .unwrap();
+
+    let known_ineligible = generate(
+        r#"pub unsafe fn destructured(mut pair: (*mut i32, i32)) -> i32 {
+            let (mut pointer, mut scalar) = pair;
+            *pointer += scalar;
+            *pointer
+        }"#,
+    );
+    let record = function(&known_ineligible, "destructured");
+    assert!(!record.statement_pair_metadata.is_empty());
+    assert!(
+        record
+            .statement_pair_metadata
+            .iter()
+            .all(|entry| entry.pointer_variables_complete),
+        "resolved raw-pointer destructuring bindings are known exclusions"
+    );
+    assert!(
+        record
+            .statement_pair_metadata
+            .iter()
+            .flat_map(|entry| &entry.pointer_variables)
+            .all(|variable| variable.name != "pointer")
     );
 }

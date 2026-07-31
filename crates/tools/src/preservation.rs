@@ -1021,6 +1021,39 @@ fn groups(statements: &[Stmt]) -> Vec<Group> {
     output
 }
 
+pub(crate) fn canonical_statement_group(item: &Item, target: u32) -> Option<Vec<Stmt>> {
+    struct Collector {
+        target: u32,
+        statements: Option<Vec<Stmt>>,
+    }
+
+    impl<'ast> Visitor<'ast> for Collector {
+        fn visit_block(&mut self, block: &'ast rustc_ast::Block) {
+            if self.statements.is_some() {
+                return;
+            }
+            if let Some(group) = groups(&block.stmts)
+                .into_iter()
+                .find(|group| group.label == Some(self.target))
+            {
+                self.statements = Some(group.statements);
+                return;
+            }
+            visit::walk_block(self, block);
+        }
+    }
+
+    let ItemKind::Fn(box function) = &item.kind else {
+        return None;
+    };
+    let mut collector = Collector {
+        target,
+        statements: None,
+    };
+    collector.visit_block(function.body.as_ref()?);
+    collector.statements
+}
+
 fn statement_label(statement: &Stmt) -> Option<u32> {
     effective_statement_attributes(statement)
         .iter()

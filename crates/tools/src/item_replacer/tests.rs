@@ -105,6 +105,16 @@ fn request_with_items(mut items: Vec<ReplacementItem>, transformation: &str) -> 
 }
 
 fn replace(source: &str, request: &ReplacementRequest) -> Result<String, ReplacementError> {
+    run_compiler_on_str(source, |tcx| {
+        replace_items(source, request, tcx).map(|output| output.source)
+    })
+    .unwrap()
+}
+
+fn replace_output(
+    source: &str,
+    request: &ReplacementRequest,
+) -> Result<ReplacementOutput, ReplacementError> {
     run_compiler_on_str(source, |tcx| replace_items(source, request, tcx)).unwrap()
 }
 
@@ -1884,4 +1894,302 @@ unsafe fn bad(value: Box<[i32]>) { #[proctor(0)] drop(value); }
     let error = replace(source, &request).unwrap_err();
     assert_eq!(error.kind, ReplacementErrorKind::UnsupportedConversion);
     assert_eq!(error.item.unwrap().id, 8);
+}
+
+#[test]
+fn replacement_output_has_exact_source_and_sorted_sidecar_shape() {
+    let source = "pub unsafe fn first() {} pub unsafe fn second() {}";
+    let request = ReplacementRequest {
+        schema_version: 1,
+        items: vec![
+            preservation_item(
+                9,
+                "second",
+                "second",
+                "unsafe fn second() { #[proctor(0)] todo!(); }",
+                vec![0],
+            ),
+            preservation_item(
+                2,
+                "first",
+                "first",
+                "unsafe fn first() { #[proctor(0)] todo!(); }",
+                vec![0],
+            ),
+        ],
+        transformation: r#"
+            unsafe fn second() { #[proctor(0)] return; }
+            unsafe fn first() { #[proctor(0)] return; }
+        "#
+        .to_owned(),
+    };
+    let output = replace_output(source, &request).unwrap();
+    assert_eq!(
+        compact(&output.source),
+        "pub unsafe fn first() { return; } pub unsafe fn second() { return; }"
+    );
+    assert_eq!(
+        output.statement_pairs,
+        [
+            ReplacementStatementPair {
+                item_id: 2,
+                path: "first".to_owned(),
+                label: 0,
+                after_statement: "#[proctor(0)]\nreturn;".to_owned(),
+            },
+            ReplacementStatementPair {
+                item_id: 9,
+                path: "second".to_owned(),
+                label: 0,
+                after_statement: "#[proctor(0)]\nreturn;".to_owned(),
+            },
+        ]
+    );
+
+    let preserved = ReplacementRequest {
+        schema_version: 1,
+        items: vec![preservation_item(
+            1,
+            "first",
+            "first",
+            "unsafe fn first() { #[proctor(0)] () }",
+            vec![],
+        )],
+        transformation: "unsafe fn first() { #[proctor(0)] return; }".to_owned(),
+    };
+    assert!(
+        replace_output(source, &preserved)
+            .unwrap()
+            .statement_pairs
+            .is_empty()
+    );
+}
+
+#[test]
+fn one_source_statement_reports_the_complete_canonical_expansion_group() {
+    let source = "pub unsafe fn expansion(mut pointer: *mut i32) -> i32 { *pointer }";
+    let request = ReplacementRequest {
+        schema_version: 1,
+        items: vec![preservation_item(
+            7,
+            "expansion",
+            "expansion",
+            "unsafe fn expansion(mut pointer: *mut i32) -> i32 { #[proctor(0)] todo!() }",
+            vec![0],
+        )],
+        transformation: r#"unsafe fn expansion(mut pointer: *mut i32) -> i32 {
+            #[proctor(0)] let proctor_temp_var_0 = *pointer;
+            #[proctor(0)] proctor_temp_var_0
+        }"#
+        .to_owned(),
+    };
+    let output = replace_output(source, &request).unwrap();
+    assert_eq!(output.statement_pairs.len(), 1);
+    let after = &output.statement_pairs[0].after_statement;
+    assert_eq!(
+        after,
+        "#[proctor(0)]\nlet proctor_temp_var_0 = *pointer;\n\n#[proctor(0)]\n\
+         proctor_temp_var_0"
+    );
+    assert!(!output.source.contains("#[proctor("));
+}
+
+#[test]
+fn canonical_after_restores_preserved_descendants_before_capture() {
+    let source = "pub unsafe fn choose(mut pointer: *mut i32) -> i32 { if pointer.is_null() { 0 } else { *pointer } }";
+    let request = ReplacementRequest {
+        schema_version: 1,
+        items: vec![preservation_item(
+            7,
+            "choose",
+            "choose",
+            r#"unsafe fn choose(mut pointer: *mut i32) -> i32 {
+                #[proctor(0)] if pointer.is_null() {
+                    #[proctor(1)] 0
+                } else {
+                    #[proctor(2)] todo!()
+                }
+            }"#,
+            vec![0, 2],
+        )],
+        transformation: r#"unsafe fn choose(mut pointer: *mut i32) -> i32 {
+            #[proctor(0)] if pointer.is_null() {
+                #[proctor(1)] 99
+            } else {
+                #[proctor(2)] *pointer
+            }
+        }"#
+        .to_owned(),
+    };
+    let output = replace_output(source, &request).unwrap();
+    let parent = output
+        .statement_pairs
+        .iter()
+        .find(|pair| pair.label == 0)
+        .unwrap();
+    assert!(parent.after_statement.contains("#[proctor(1)]"));
+    assert!(parent.after_statement.contains('0'));
+    assert!(!parent.after_statement.contains("99"));
+}
+
+#[test]
+fn overlapping_parent_and_descendant_labels_each_get_one_entry() {
+    let source = "pub unsafe fn choose(mut pointer: *mut i32) -> i32 { if pointer.is_null() { 0 } else { *pointer } }";
+    let request = ReplacementRequest {
+        schema_version: 1,
+        items: vec![preservation_item(
+            7,
+            "choose",
+            "choose",
+            r#"unsafe fn choose(mut pointer: *mut i32) -> i32 {
+                #[proctor(0)] if pointer.is_null() {
+                    #[proctor(1)] 0
+                } else {
+                    #[proctor(2)] todo!()
+                }
+            }"#,
+            vec![0, 2],
+        )],
+        transformation: r#"unsafe fn choose(mut pointer: *mut i32) -> i32 {
+            #[proctor(0)] if pointer.is_null() {
+                #[proctor(1)] 0
+            } else {
+                #[proctor(2)] *pointer
+            }
+        }"#
+        .to_owned(),
+    };
+    let output = replace_output(source, &request).unwrap();
+    assert_eq!(
+        output
+            .statement_pairs
+            .iter()
+            .map(|pair| pair.label)
+            .collect::<Vec<_>>(),
+        [0, 2]
+    );
+    assert!(
+        output.statement_pairs[0]
+            .after_statement
+            .contains("#[proctor(2)]")
+    );
+    assert!(
+        !output.statement_pairs[1]
+            .after_statement
+            .contains("#[proctor(0)]")
+    );
+}
+
+#[test]
+fn sidecar_excludes_preserved_labels_and_generated_variable_type_rows() {
+    let source =
+        "pub unsafe fn f(mut pointer: *mut i32) -> i32 { let value = 1; *pointer + value }";
+    let request = ReplacementRequest {
+        schema_version: 1,
+        items: vec![preservation_item(
+            7,
+            "f",
+            "f",
+            r#"unsafe fn f(mut pointer: *mut i32) -> i32 {
+                #[proctor(0)] let value = 1;
+                #[proctor(1)] todo!()
+            }"#,
+            vec![1],
+        )],
+        transformation: r#"unsafe fn f(mut pointer: *mut i32) -> i32 {
+            #[proctor(0)] let value = 100;
+            #[proctor(1)] let proctor_temp_var_0 = *pointer;
+            #[proctor(1)] proctor_temp_var_0 + value
+        }"#
+        .to_owned(),
+    };
+    let output = replace_output(source, &request).unwrap();
+    assert_eq!(output.statement_pairs.len(), 1);
+    assert_eq!(output.statement_pairs[0].label, 1);
+    assert!(
+        output.statement_pairs[0]
+            .after_statement
+            .contains("proctor_temp_var_0")
+    );
+}
+
+#[test]
+fn replacement_library_failures_return_no_typed_output() {
+    let cases = [
+        (
+            "malformed label",
+            "pub unsafe fn f() {}",
+            ReplacementRequest {
+                schema_version: 1,
+                items: vec![preservation_item(
+                    7,
+                    "f",
+                    "f",
+                    "unsafe fn f() { #[proctor(0)] todo!(); }",
+                    vec![0],
+                )],
+                transformation: "unsafe fn f() { #[proctor(0)] return; #[proctor(1)] return; }"
+                    .to_owned(),
+            },
+            ReplacementErrorKind::InvalidTransformation,
+        ),
+        (
+            "target resolution",
+            "pub unsafe fn f() {}",
+            ReplacementRequest {
+                schema_version: 1,
+                items: vec![preservation_item(
+                    7,
+                    "missing",
+                    "missing",
+                    "unsafe fn missing() {}",
+                    vec![],
+                )],
+                transformation: "unsafe fn missing() {}".to_owned(),
+            },
+            ReplacementErrorKind::TargetResolution,
+        ),
+        (
+            "unsupported conversion",
+            "pub unsafe fn f(pointer: *mut i32) {}",
+            request(
+                "f",
+                "f",
+                "unsafe fn f(pointer: Box<[i32]>) { drop(pointer); }",
+            ),
+            ReplacementErrorKind::UnsupportedConversion,
+        ),
+        (
+            "call rewrite",
+            r#"
+                pub unsafe fn f(value: *const i32) -> i32 { *value }
+                pub unsafe fn caller(value: *const i32) -> i32 { dbg!(f(value)) }
+            "#,
+            request("f", "f", "unsafe fn f(value: &i32) -> i32 { *value + 1 }"),
+            ReplacementErrorKind::UnsupportedCallRewrite,
+        ),
+        (
+            "source rewrite",
+            r#"
+                pub unsafe fn main_0(argc: i32, argv: *mut *mut i8) -> i32 {
+                    let _ = argv;
+                    argc
+                }
+            "#,
+            request(
+                "main_0",
+                "main_0",
+                r#"unsafe fn main_0(argc: i32, argv: &mut [&mut [i8]]) -> i32 {
+                    let _ = argv;
+                    argc
+                }"#,
+            ),
+            ReplacementErrorKind::RewriteFailure,
+        ),
+    ];
+    for (name, source, request, expected_kind) in cases {
+        let error = replace_output(source, &request)
+            .expect_err("a failed replacement cannot return partial typed output");
+        assert_eq!(error.kind, expected_kind, "{name}");
+    }
 }

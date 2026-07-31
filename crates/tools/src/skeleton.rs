@@ -50,9 +50,34 @@ pub struct FunctionRecord {
     pub target_signature: String,
     pub needs_transformation: bool,
     pub statements_requiring_transformation: Vec<u32>,
+    pub statement_pair_metadata: Vec<StatementPairMetadata>,
     pub foreign_function_names: Vec<String>,
     pub signature_dependencies: Vec<u64>,
     pub dependencies: Vec<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StatementPairMetadata {
+    pub label: u32,
+    pub before_statement: String,
+    pub pointer_variables_complete: bool,
+    pub pointer_variables: Vec<PointerVariableMetadata>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PointerVariableMetadata {
+    pub name: String,
+    pub origin: PointerVariableOrigin,
+    pub before_type: String,
+    pub selected_target_type: String,
+    pub before_type_is_inferred: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum PointerVariableOrigin {
+    Parameter { index: u32 },
+    Local { declaration_label: u32 },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -388,6 +413,15 @@ fn make_function_record<'tcx>(
     }
     let source_signature = render_signature(&source);
     let target_signature = render_signature(&skeleton);
+    let statement_pair_metadata = collect_statement_pair_metadata(
+        &source,
+        &skeleton,
+        &statements_requiring_transformation,
+        ast_to_hir,
+        &type_speller,
+        &surface.path,
+        tcx,
+    )?;
     let name = surface.item.kind.ident().unwrap().to_string();
     Ok(ItemRecord::Function(FunctionRecord {
         id: surface.id,
@@ -402,10 +436,423 @@ fn make_function_record<'tcx>(
         statements_requiring_transformation: statements_requiring_transformation
             .into_iter()
             .collect(),
+        statement_pair_metadata,
         foreign_function_names,
         signature_dependencies,
         dependencies,
     }))
+}
+
+fn collect_statement_pair_metadata<'tcx>(
+    source: &Item,
+    skeleton: &Item,
+    transformed: &BTreeSet<u32>,
+    ast_to_hir: &utils::ir::AstToHir,
+    type_speller: &TypeSpeller<'_, 'tcx>,
+    function_path: &str,
+    tcx: TyCtxt<'tcx>,
+) -> Result<Vec<StatementPairMetadata>, GenerationError> {
+    let catalog = collect_pointer_binding_catalog(
+        source,
+        skeleton,
+        ast_to_hir,
+        type_speller,
+        function_path,
+        tcx,
+    )?;
+    let ItemKind::Fn(box function) = &source.kind else { unreachable!() };
+    let mut statements = FxHashMap::default();
+    StatementByLabelCollector {
+        statements: &mut statements,
+    }
+    .visit_block(function.body.as_ref().unwrap());
+
+    Ok(transformed
+        .iter()
+        .map(|label| {
+            let statement = statements
+                .get(label)
+                .expect("classification labels originate in the annotated source");
+            let mut collector = PointerOccurrenceCollector {
+                ast_to_hir,
+                catalog: &catalog,
+                complete: true,
+                seen: FxHashSet::default(),
+                variables: vec![],
+                tcx,
+            };
+            collector.visit_stmt(statement);
+            collector.collect_hir_root(statement);
+            StatementPairMetadata {
+                label: *label,
+                before_statement: render_statement_group(std::slice::from_ref(*statement)),
+                pointer_variables_complete: collector.complete,
+                pointer_variables: collector.variables,
+            }
+        })
+        .collect())
+}
+
+struct PointerBindingCatalog {
+    variables: FxHashMap<HirId, PointerVariableMetadata>,
+    known_ineligible: FxHashSet<HirId>,
+}
+
+fn collect_pointer_binding_catalog<'tcx>(
+    source: &Item,
+    skeleton: &Item,
+    ast_to_hir: &utils::ir::AstToHir,
+    type_speller: &TypeSpeller<'_, 'tcx>,
+    function_path: &str,
+    tcx: TyCtxt<'tcx>,
+) -> Result<PointerBindingCatalog, GenerationError> {
+    let ItemKind::Fn(box source_function) = &source.kind else { unreachable!() };
+    let ItemKind::Fn(box skeleton_function) = &skeleton.kind else { unreachable!() };
+    let mut catalog = FxHashMap::default();
+    for (index, (source_parameter, target_parameter)) in source_function
+        .sig
+        .decl
+        .inputs
+        .iter()
+        .zip(&skeleton_function.sig.decl.inputs)
+        .enumerate()
+    {
+        let PatKind::Ident(_, name, _) = source_parameter.pat.kind else {
+            continue;
+        };
+        let Some(pattern_hir_id) = ast_to_hir.local_map.get(&source_parameter.pat.id).copied()
+        else {
+            continue;
+        };
+        let Some(pattern) = ast_to_hir.get_pat(source_parameter.pat.id, tcx) else {
+            continue;
+        };
+        let hir::PatKind::Binding(_, hir_id, ..) = pattern.kind else {
+            continue;
+        };
+        if !tcx
+            .typeck(pattern_hir_id.owner)
+            .node_type(pattern_hir_id)
+            .is_raw_ptr()
+        {
+            continue;
+        }
+        catalog.insert(
+            hir_id,
+            PointerVariableMetadata {
+                name: name.to_string(),
+                origin: PointerVariableOrigin::Parameter {
+                    index: index
+                        .try_into()
+                        .expect("Rust function parameter count fits in u32"),
+                },
+                before_type: pprust::ty_to_string(&source_parameter.ty),
+                selected_target_type: pprust::ty_to_string(&target_parameter.ty),
+                before_type_is_inferred: false,
+            },
+        );
+    }
+
+    let mut target_types = FxHashMap::default();
+    TargetLocalTypeCollector {
+        target_types: &mut target_types,
+    }
+    .visit_block(skeleton_function.body.as_ref().unwrap());
+    let mut locals = SourceLocalCatalogCollector {
+        ast_to_hir,
+        catalog: &mut catalog,
+        function_path,
+        target_types: &target_types,
+        type_speller,
+        error: None,
+        tcx,
+    };
+    locals.visit_block(source_function.body.as_ref().unwrap());
+    if let Some(error) = locals.error {
+        return Err(error);
+    }
+    let mut known_ineligible = FxHashSet::default();
+    KnownIneligibleBindingCollector {
+        ast_to_hir,
+        catalog: &catalog,
+        known_ineligible: &mut known_ineligible,
+        tcx,
+    }
+    .visit_item(source);
+    Ok(PointerBindingCatalog {
+        variables: catalog,
+        known_ineligible,
+    })
+}
+
+struct KnownIneligibleBindingCollector<'a, 'tcx> {
+    ast_to_hir: &'a utils::ir::AstToHir,
+    catalog: &'a FxHashMap<HirId, PointerVariableMetadata>,
+    known_ineligible: &'a mut FxHashSet<HirId>,
+    tcx: TyCtxt<'tcx>,
+}
+
+impl<'ast> visit::Visitor<'ast> for KnownIneligibleBindingCollector<'_, '_> {
+    fn visit_pat(&mut self, pattern: &'ast Pat) {
+        if let Some(pattern) = self.ast_to_hir.get_pat(pattern.id, self.tcx)
+            && let hir::PatKind::Binding(_, hir_id, ..) = pattern.kind
+            && !self.catalog.contains_key(&hir_id)
+        {
+            self.known_ineligible.insert(hir_id);
+        }
+        visit::walk_pat(self, pattern);
+    }
+}
+
+struct TargetLocalTypeCollector<'a> {
+    target_types: &'a mut FxHashMap<NodeId, String>,
+}
+
+impl<'ast> visit::Visitor<'ast> for TargetLocalTypeCollector<'_> {
+    fn visit_stmt(&mut self, statement: &'ast Stmt) {
+        if let StmtKind::Let(local) = &statement.kind
+            && matches!(local.pat.kind, PatKind::Ident(_, _, None))
+            && let Some(ty) = &local.ty
+        {
+            self.target_types
+                .insert(local.pat.id, pprust::ty_to_string(ty));
+        }
+        visit::walk_stmt(self, statement);
+    }
+}
+
+struct SourceLocalCatalogCollector<'a, 'tcx> {
+    ast_to_hir: &'a utils::ir::AstToHir,
+    catalog: &'a mut FxHashMap<HirId, PointerVariableMetadata>,
+    function_path: &'a str,
+    target_types: &'a FxHashMap<NodeId, String>,
+    type_speller: &'a TypeSpeller<'a, 'tcx>,
+    error: Option<GenerationError>,
+    tcx: TyCtxt<'tcx>,
+}
+
+impl<'ast> visit::Visitor<'ast> for SourceLocalCatalogCollector<'_, '_> {
+    fn visit_stmt(&mut self, statement: &'ast Stmt) {
+        if self.error.is_some() {
+            return;
+        }
+        if let StmtKind::Let(local) = &statement.kind
+            && let PatKind::Ident(_, name, None) = local.pat.kind
+            && let Some(pattern_hir_id) = self.ast_to_hir.local_map.get(&local.pat.id).copied()
+            && let Some(pattern) = self.ast_to_hir.get_pat(local.pat.id, self.tcx)
+            && let hir::PatKind::Binding(_, hir_id, ..) = pattern.kind
+        {
+            let inferred = self
+                .tcx
+                .typeck(pattern_hir_id.owner)
+                .node_type(pattern_hir_id);
+            if inferred.is_raw_ptr() {
+                let before_type = match &local.ty {
+                    Some(ty) => pprust::ty_to_string(ty),
+                    None => match self.type_speller.render_semantic_type(inferred) {
+                        Ok(ty) => pprust::ty_to_string(&ty),
+                        Err(reason) => {
+                            self.error = Some(type_spelling_error(
+                                self.function_path,
+                                &format!("local `{name}`"),
+                                inferred,
+                                reason,
+                                self.tcx,
+                            ));
+                            return;
+                        }
+                    },
+                };
+                let selected_target_type = self
+                    .target_types
+                    .get(&local.pat.id)
+                    .expect("raw-pointer locals are materialized in the target skeleton")
+                    .clone();
+                self.catalog.insert(
+                    hir_id,
+                    PointerVariableMetadata {
+                        name: name.to_string(),
+                        origin: PointerVariableOrigin::Local {
+                            declaration_label: statement_numeric_label(statement)
+                                .expect("annotated source statements have labels"),
+                        },
+                        before_type,
+                        selected_target_type,
+                        before_type_is_inferred: local.ty.is_none(),
+                    },
+                );
+            }
+        }
+        visit::walk_stmt(self, statement);
+    }
+}
+
+struct StatementByLabelCollector<'a, 'ast> {
+    statements: &'a mut FxHashMap<u32, &'ast Stmt>,
+}
+
+impl<'ast> visit::Visitor<'ast> for StatementByLabelCollector<'_, 'ast> {
+    fn visit_stmt(&mut self, statement: &'ast Stmt) {
+        if let Some(label) = statement_numeric_label(statement) {
+            self.statements.insert(label, statement);
+        }
+        visit::walk_stmt(self, statement);
+    }
+}
+
+struct PointerOccurrenceCollector<'a, 'tcx> {
+    ast_to_hir: &'a utils::ir::AstToHir,
+    catalog: &'a PointerBindingCatalog,
+    complete: bool,
+    seen: FxHashSet<HirId>,
+    variables: Vec<PointerVariableMetadata>,
+    tcx: TyCtxt<'tcx>,
+}
+
+impl PointerOccurrenceCollector<'_, '_> {
+    fn add(&mut self, hir_id: HirId) {
+        if self.seen.insert(hir_id) {
+            if let Some(metadata) = self.catalog.variables.get(&hir_id) {
+                self.variables.push(metadata.clone());
+            } else if !self.catalog.known_ineligible.contains(&hir_id)
+                && self.tcx.typeck(hir_id.owner).node_type(hir_id).is_raw_ptr()
+            {
+                // A resolved raw-pointer identity that was absent from the
+                // source catalog means its source declaration could not be
+                // correlated with a stable report origin.
+                self.complete = false;
+            }
+        }
+    }
+
+    fn collect_hir_root(&mut self, statement: &Stmt) {
+        let Some(node) = self.ast_to_hir.get_local_node(statement.id, self.tcx) else {
+            self.complete = false;
+            return;
+        };
+        let mut collector = HirPointerOccurrenceCollector {
+            catalog: self.catalog,
+            complete: &mut self.complete,
+            seen: &mut self.seen,
+            variables: &mut self.variables,
+            tcx: self.tcx,
+        };
+        match node {
+            hir::Node::Stmt(statement) => collector.visit_stmt(statement),
+            hir::Node::Expr(expression) => collector.visit_expr(expression),
+            _ => self.complete = false,
+        }
+    }
+}
+
+impl<'ast> visit::Visitor<'ast> for PointerOccurrenceCollector<'_, '_> {
+    fn visit_pat(&mut self, pattern: &'ast Pat) {
+        if matches!(pattern.kind, PatKind::Ident(..)) {
+            match self.ast_to_hir.get_pat(pattern.id, self.tcx) {
+                Some(pattern) => {
+                    if let hir::PatKind::Binding(_, hir_id, ..) = pattern.kind {
+                        self.add(hir_id);
+                    } else {
+                        self.complete = false;
+                    }
+                }
+                _ => self.complete = false,
+            }
+        }
+        visit::walk_pat(self, pattern);
+    }
+
+    fn visit_expr(&mut self, expression: &'ast Expr) {
+        if matches!(expression.kind, ExprKind::Path(..)) {
+            let Some(hir_expression) = self.ast_to_hir.get_expr(expression.id, self.tcx) else {
+                self.complete = false;
+                visit::walk_expr(self, expression);
+                return;
+            };
+            let hir::ExprKind::Path(path) = hir_expression.kind else {
+                self.complete = false;
+                visit::walk_expr(self, expression);
+                return;
+            };
+            match self
+                .tcx
+                .typeck(hir_expression.hir_id.owner)
+                .qpath_res(&path, hir_expression.hir_id)
+            {
+                Res::Local(hir_id) => self.add(hir_id),
+                Res::Err => self.complete = false,
+                _ => {}
+            }
+        }
+        visit::walk_expr(self, expression);
+    }
+
+    fn visit_mac_call(&mut self, mac: &'ast rustc_ast::MacCall) {
+        self.complete = false;
+        visit::walk_mac(self, mac);
+    }
+}
+
+struct HirPointerOccurrenceCollector<'a, 'tcx> {
+    catalog: &'a PointerBindingCatalog,
+    complete: &'a mut bool,
+    seen: &'a mut FxHashSet<HirId>,
+    variables: &'a mut Vec<PointerVariableMetadata>,
+    tcx: TyCtxt<'tcx>,
+}
+
+impl HirPointerOccurrenceCollector<'_, '_> {
+    fn add(&mut self, hir_id: HirId) {
+        if self.seen.insert(hir_id) {
+            if let Some(metadata) = self.catalog.variables.get(&hir_id) {
+                self.variables.push(metadata.clone());
+            } else if !self.catalog.known_ineligible.contains(&hir_id)
+                && self.tcx.typeck(hir_id.owner).node_type(hir_id).is_raw_ptr()
+            {
+                *self.complete = false;
+            }
+        }
+    }
+}
+
+impl<'tcx> Visitor<'tcx> for HirPointerOccurrenceCollector<'_, 'tcx> {
+    fn visit_pat(&mut self, pattern: &'tcx hir::Pat<'tcx>) {
+        if let hir::PatKind::Binding(_, hir_id, ..) = pattern.kind {
+            self.add(hir_id);
+        }
+        intravisit::walk_pat(self, pattern);
+    }
+
+    fn visit_expr(&mut self, expression: &'tcx hir::Expr<'tcx>) {
+        if let hir::ExprKind::Path(path) = expression.kind
+            && let Res::Local(hir_id) = self
+                .tcx
+                .typeck(expression.hir_id.owner)
+                .qpath_res(&path, expression.hir_id)
+        {
+            self.add(hir_id);
+        }
+        intravisit::walk_expr(self, expression);
+    }
+}
+
+pub(crate) fn render_statement_group(statements: &[Stmt]) -> String {
+    let mut item = utils::ast::parse_item("fn __proctor_statement_render() {}".to_owned());
+    let ItemKind::Fn(box function) = &mut item.kind else { unreachable!() };
+    function.body.as_mut().unwrap().stmts = statements.iter().cloned().collect();
+    let rendered = pprust::item_to_string(&item);
+    let start = rendered
+        .find('{')
+        .expect("synthetic function rendering has a body")
+        + 1;
+    let end = rendered
+        .rfind('}')
+        .expect("synthetic function rendering closes its body");
+    let body = rendered[start..end].trim();
+    body.lines()
+        .map(|line| line.strip_prefix("    ").unwrap_or(line))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn sanitize_item(item: &mut Item) {

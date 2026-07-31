@@ -24,7 +24,13 @@ use serde::{Deserialize, Serialize};
 use smallvec::SmallVec;
 use thin_vec::ThinVec;
 
-use crate::preservation::{canonicalize_function_for_replacement, validate_preservation_metadata};
+use crate::{
+    preservation::{
+        canonical_statement_group, canonicalize_function_for_replacement,
+        validate_preservation_metadata,
+    },
+    skeleton::render_statement_group,
+};
 
 const REPLACEMENT_SCHEMA_VERSION: u64 = 1;
 
@@ -45,6 +51,20 @@ pub struct ReplacementItem {
     pub skeleton: String,
     pub needs_transformation: bool,
     pub statements_requiring_transformation: Vec<u32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReplacementOutput {
+    pub source: String,
+    pub statement_pairs: Vec<ReplacementStatementPair>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ReplacementStatementPair {
+    pub item_id: u64,
+    pub path: String,
+    pub label: u32,
+    pub after_statement: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -88,10 +108,11 @@ pub fn replace_items(
     source: &str,
     request: &ReplacementRequest,
     tcx: TyCtxt<'_>,
-) -> Result<String, ReplacementError> {
+) -> Result<ReplacementOutput, ReplacementError> {
     validate_request(request)?;
     let returned_transformations = parse_transformations(request)?;
     let mut transformations = HashMap::new();
+    let mut statement_pairs = vec![];
     for requested in &request.items {
         let expected = parse_replacement_skeleton(requested)?;
         let returned = returned_transformations
@@ -110,8 +131,24 @@ pub fn replace_items(
                 format!("{}: {}", problem.code, problem.message),
             )
         })?;
+        for label in &requested.statements_requiring_transformation {
+            let group = canonical_statement_group(&canonical, *label).ok_or_else(|| {
+                item_error(
+                    ReplacementErrorKind::InvalidTransformation,
+                    requested,
+                    format!("canonical replacement contains no expansion group for label {label}"),
+                )
+            })?;
+            statement_pairs.push(ReplacementStatementPair {
+                item_id: requested.id,
+                path: requested.path.clone(),
+                label: *label,
+                after_statement: render_statement_group(&group),
+            });
+        }
         transformations.insert(requested.name.clone(), canonical);
     }
+    statement_pairs.sort_by_key(|pair| (pair.item_id, pair.label));
     let mut surface = parse_crate(source, ReplacementErrorKind::RewriteFailure)?;
     let ast_to_hir = map_surface_to_hir(&mut surface, tcx)?;
 
@@ -202,7 +239,10 @@ pub fn replace_items(
     let mut call_rewriter = CallRewriter { rewrites };
     call_rewriter.visit_crate(&mut surface);
     apply_replacements(&mut surface.items, &plans)?;
-    Ok(pprust::crate_to_string_for_macros(&surface))
+    Ok(ReplacementOutput {
+        source: pprust::crate_to_string_for_macros(&surface),
+        statement_pairs,
+    })
 }
 
 struct SafetyNormalizer;
