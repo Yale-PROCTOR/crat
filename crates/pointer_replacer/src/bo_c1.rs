@@ -7135,9 +7135,31 @@ mod run {
                 degradations,
                 emitted_count,
                 unplaceable,
+                bisect_probes,
+                escalated,
                 ..
             } => {
                 row.set("verdict", "PASS");
+                row.set("bisect_probes", bisect_probes);
+                row.set(
+                    "escalated",
+                    match &escalated {
+                        Some(why) if why.contains("no progress") => "detector",
+                        Some(why) if why.contains("round cap") => "round-cap",
+                        Some(_) => "other",
+                        None => "no",
+                    },
+                );
+                row.set(
+                    "reverted",
+                    degradations
+                        .iter()
+                        .filter(|d| {
+                            d.reason
+                                == crate::bo_rewriter::decision::DegradeReason::RevertedAfterVerifyFailure
+                        })
+                        .count(),
+                );
                 row.set("emitted", emitted_count);
                 row.set("degraded", degradations.len());
                 row.set("files_touched", files.len());
@@ -7150,8 +7172,12 @@ mod run {
                 emitted_count,
                 files_touched,
                 emitted_sites,
+                bisect_probes,
                 ..
             } => {
+                row.set("bisect_probes", bisect_probes);
+                row.set("escalated", "failed");
+                row.set("reverted", 0usize);
                 // A gate failure is DATA, not an error to repair mid-run — and
                 // what the run ATTEMPTED is reported, never zeroed.
                 row.set("verdict", "FAIL");
