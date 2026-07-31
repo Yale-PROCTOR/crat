@@ -714,3 +714,49 @@ fn the_no_progress_detector_escalates_when_attribution_is_wrong() {
         }
     }
 }
+
+/// Duplicate every entry, so `plan` emits two identical edits per subject and
+/// `apply` must reject the second as overlapping.
+fn duplicate_entries(table: &mut super::decision::DecisionTable) {
+    let cloned = table.entries.clone();
+    table.entries.extend(cloned);
+}
+
+/// **S2b.1.3 — the ROLLBACK guard, witnessed where it actually fires.**
+///
+/// An incoherent plan (two identical edits per subject) is rejected by the
+/// PRE-LOOP structural gate, before any revert round and before bisect —
+/// `bisect_probes == 0` is what proves it never got that far.
+///
+/// **This also locates the arm.** The post-bisect guard's `rollbacks` check was
+/// suspected unwitnessed; measuring shows it is *unreachable* rather than
+/// untested, because `render` applies a SUBSET of edits that already produced no
+/// rollbacks, and dropping edits cannot create an overlap, an out-of-bounds
+/// range, or a char-boundary violation. That arm is a stated control at its
+/// guard; this witness covers the arm that can fire.
+///
+/// *Mutation-tested, Rider 0 order.* **Deletion first:** remove the
+/// `emission.rollbacks` check and this fails — the deduped edit set emits and
+/// type-checks, so an incoherent plan passes silently.
+#[test]
+fn an_incoherent_plan_is_rejected_before_the_loop() {
+    let fixture = Fixture::new(&[
+        ("lib.rs", "#![allow(dead_code, unused_unsafe)]\npub mod m;\n"),
+        ("m.rs", MODULE_SUBJECT),
+    ]);
+    match super::rewrite_m1_path_injected(&fixture.root(), 8, &duplicate_entries) {
+        super::RewriteOutcome::Degraded { reason, bisect_probes, .. } => {
+            assert!(
+                reason.contains("rolled back"),
+                "rejected for the wrong reason: {reason}"
+            );
+            assert_eq!(
+                bisect_probes, 0,
+                "an incoherent plan reached bisect instead of being rejected"
+            );
+        }
+        super::RewriteOutcome::Emitted { .. } => {
+            panic!("an incoherent plan emitted")
+        }
+    }
+}

@@ -564,6 +564,25 @@ fn rewrite_core_injected(
                 Some(root) => verify::materialize(root, &final_files),
                 None => verify::materialize_single_file(&root_text),
             };
+            // STATED CONTROL — defense in depth over an UNREACHABLE case.
+            //
+            // `type_checks_crate` here can never be the thing that fails:
+            // `bisect` only ever assigns `hi` a `mid` it just tested true, so
+            // the returned `k` either compiled under test or equals
+            // `candidates.len()` — reverting every owner, which drops every
+            // edit and reduces the crate to the original input. The input
+            // compiled, or `decide_table` would not have produced a table.
+            // Non-monotonicity costs MINIMALITY, never correctness.
+            //
+            // `rollbacks` likewise cannot fire here: `render` applies a SUBSET
+            // of the edits that produced no rollbacks initially, and dropping
+            // edits cannot create an overlap, an out-of-bounds range, or a
+            // char-boundary violation.
+            //
+            // Kept anyway, and deliberately NOT given a witness: a mutation
+            // removing either arm survives because the case is unreachable, and
+            // a fixture forcing it would be manufacturing a shape the search's
+            // own invariant excludes.
             match materialized {
                 Ok(staged) if rollbacks.is_empty() && verify::type_checks_crate(staged.root()) => {
                     let source = std::fs::read_to_string(staged.root()).unwrap_or_default();
