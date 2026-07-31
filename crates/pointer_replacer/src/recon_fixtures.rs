@@ -185,27 +185,34 @@ fn an_altered_artifact_fails_the_verdict_through_the_file() {
     );
 }
 
-/// **(iii) An unwritable artifact directory fails loudly.**
+/// **(iii) An artifact WRITE failure fails loudly at the write call site.**
 ///
-/// **Multi-guard control — no SINGLE deletion defeats it, and that is stated
-/// rather than dressed up.** Swallowing the write alone was run as a mutation
-/// and SURVIVED: with the verdict computed from the files, an unwritten
-/// artifact is caught again by the read-back, and again by the decode, and
-/// again by the comparison seeing an empty side. The property is guarded in
-/// depth, so the honest claim is that this witness proves the END-TO-END
-/// behaviour, not that it isolates the write's `expect`.
+/// The artifact directory itself is valid, but the producer-A artifact path is
+/// pre-created as a directory. `create_dir_all` therefore succeeds and the
+/// first `std::fs::write` is the operation that must fail.
+///
+/// *Mutation-tested:* swallowing that write with `.is_ok()` moves the panic to
+/// the later read-back and fails the call-site assertions below. Rider 5
+/// reachability is the original panic at `bo_c1.rs` with `not writable`.
 #[test]
 #[ignore = "spawns a worker process"]
 fn an_unwritable_artifact_dir_fails_loudly() {
-    // A regular FILE where a directory is required.
-    let blocker = std::env::temp_dir().join(format!("crat-recon-blocker-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&blocker);
-    std::fs::write(&blocker, b"not a directory").expect("write blocker");
-    let (ok, log) = run_worker("unwritable", None, &blocker);
+    let art = artifact_dir("unwritable");
+    std::fs::create_dir(art.join("unwritable.a.jsonl")).expect("pre-create A path as directory");
+    let (ok, log) = run_worker("unwritable", None, &art);
+    eprintln!("write-failure reachability:\n{log}");
     assert!(
         !ok,
         "a write failure was SWALLOWED — the verdict would rest on artifacts \
          that were never persisted:\n{log}"
+    );
+    assert!(
+        log.contains("unwritable.a.jsonl") && log.contains("not writable"),
+        "the failure did not come from the producer-A write call:\n{log}"
+    );
+    assert!(
+        log.contains("crates/pointer_replacer/src/bo_c1.rs:"),
+        "the panic did not cite the write call site:\n{log}"
     );
 }
 

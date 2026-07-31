@@ -70,8 +70,9 @@ pub(crate) struct Verdict {
 }
 
 impl Verdict {
-    /// A program passes when nothing fails loudly. Findings are loud but not
-    /// fatal — that is R-B's asymmetry, not an oversight.
+    /// The expected-zero enforcement verdict passes only when there is nothing
+    /// to report. The driver still continues to the next program after a
+    /// finding so one run yields full incidence.
     #[allow(
         dead_code,
         reason = "the per-program corpus verdict (C.5) is this method's \
@@ -79,6 +80,10 @@ impl Verdict {
     )]
     pub(crate) fn passed(&self) -> bool {
         self.violations.is_empty()
+            && self.findings.is_empty()
+            && FINDING_CLASSES
+                .iter()
+                .all(|class| self.aggregates.contains_key(class))
     }
 }
 

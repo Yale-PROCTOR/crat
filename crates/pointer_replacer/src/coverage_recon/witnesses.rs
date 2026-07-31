@@ -4,7 +4,7 @@
 //! is enumerated in the slice report with its result (Rider 4).
 
 use super::{
-    compare::{FINDING_CLASSES, compare},
+    compare::{FINDING_CLASSES, Finding, compare},
     schema::{DeclShape, Outcome, PairingConfidence, Row, decode, encode},
 };
 
@@ -150,7 +150,10 @@ fn a_row_only_producer_b_has_is_an_attributed_finding() {
         bare_row("f", 2, Some("q"), Some(2), 1),
     ];
     let v = compare(&a, &b);
-    assert!(v.passed(), "a coverage gap must NOT halt the run: {v:#?}");
+    assert!(
+        !v.passed(),
+        "the expected-zero corpus verdict must reject every finding: {v:#?}"
+    );
     assert_eq!(v.findings.len(), 1, "{v:#?}");
     assert_eq!(v.findings[0].class, "out-of-coverage");
     assert_eq!(v.findings[0].mir_local, 2, "the finding must name the subject");
@@ -209,7 +212,10 @@ fn a_low_confidence_pairing_mismatch_is_downgraded_to_a_finding() {
     let a = vec![a_row];
     let b = vec![bare_row("f", 1, None, None, 1)];
     let v = compare(&a, &b);
-    assert!(v.passed(), "a low-confidence pairing must not halt: {v:#?}");
+    assert!(
+        !v.passed(),
+        "the expected-zero corpus verdict must reject every finding: {v:#?}"
+    );
     assert_eq!(v.findings[0].class, "pairing-mismatch-low-confidence");
     assert_eq!(v.aggregates["pairing-mismatch-low-confidence"], 1);
 }
@@ -227,7 +233,10 @@ fn a_classification_mismatch_is_an_attributed_finding() {
     let a = vec![bare_row("f", 1, Some("p"), Some(1), 2)];
     let b = vec![bare_row("f", 1, Some("p"), Some(1), 1)];
     let v = compare(&a, &b);
-    assert!(v.passed(), "a predicate divergence must not halt: {v:#?}");
+    assert!(
+        !v.passed(),
+        "the expected-zero corpus verdict must reject every finding: {v:#?}"
+    );
     assert_eq!(v.findings[0].class, "classification-mismatch");
     assert!(v.findings[0].detail.contains("A=2"), "{:#?}", v.findings[0]);
     assert_eq!(v.aggregates["classification-mismatch"], 1);
@@ -352,6 +361,46 @@ fn every_finding_class_is_aggregated_even_at_zero() {
             v.aggregates
         );
     }
+}
+
+/// A future writer cannot introduce an unregistered finding class and have the
+/// reader interpret its absent aggregate as zero.
+///
+/// *Mutation-tested:* restoring the old violations-only/default-to-zero verdict
+/// makes this crafted writer/reader mismatch pass.
+#[test]
+fn an_unknown_finding_class_fails_the_verdict() {
+    let rows = vec![bare_row("f", 1, Some("p"), Some(1), 1)];
+    let mut verdict = compare(&rows, &rows);
+    verdict.findings.push(Finding {
+        class: "future-writer-class",
+        fn_path: "f".to_owned(),
+        mir_local: 1,
+        detail: "crafted writer/reader mismatch".to_owned(),
+    });
+
+    assert!(
+        !verdict.passed(),
+        "an unregistered finding class was accepted because its missing \
+         aggregate defaulted to zero: {verdict:#?}"
+    );
+}
+
+/// A registered expected-zero class may not disappear from the map and be read
+/// as zero.
+///
+/// *Mutation-tested:* restoring the old default-to-zero verdict makes this
+/// crafted missing-key breach pass.
+#[test]
+fn a_missing_registered_aggregate_fails_the_verdict() {
+    let rows = vec![bare_row("f", 1, Some("p"), Some(1), 1)];
+    let mut verdict = compare(&rows, &rows);
+    verdict.aggregates.remove("out-of-coverage");
+
+    assert!(
+        !verdict.passed(),
+        "a missing registered aggregate was accepted as zero: {verdict:#?}"
+    );
 }
 
 /// The clean case: identical artifacts reconcile with nothing to report.

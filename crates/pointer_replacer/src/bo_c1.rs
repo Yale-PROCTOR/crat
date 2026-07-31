@@ -7035,14 +7035,7 @@ mod run {
         row.set("b_rows", b_decoded.len());
 
         let verdict = compare::compare(&a_decoded, &b_decoded);
-        let mut aggregates_clean = true;
-        for class in compare::FINDING_CLASSES {
-            let n = verdict.aggregates.get(class).copied().unwrap_or(0);
-            if n != 0 {
-                aggregates_clean = false;
-            }
-            row.set(&format!("agg_{}", class.replace('-', "_")), n);
-        }
+        let aggregates_clean = record_expected_zero_aggregates(&mut row, &verdict);
         row.set("violations", verdict.violations.len());
         row.set("findings", verdict.findings.len());
         let passed = verdict.passed() && aggregates_clean;
@@ -7072,6 +7065,29 @@ mod run {
         // DERIVED, never an unconditional ok.
         row.set("status", if passed { "ok" } else { "recon-fail" });
         row
+    }
+
+    pub(super) fn record_expected_zero_aggregates(
+        row: &mut Row,
+        verdict: &crate::coverage_recon::compare::Verdict,
+    ) -> bool {
+        let mut aggregates_clean = true;
+        for class in crate::coverage_recon::compare::FINDING_CLASSES {
+            let key = format!("agg_{}", class.replace('-', "_"));
+            match verdict.aggregates.get(class).copied() {
+                Some(n) => {
+                    if n != 0 {
+                        aggregates_clean = false;
+                    }
+                    row.set(&key, n);
+                }
+                None => {
+                    aggregates_clean = false;
+                    row.set(&key, "missing");
+                }
+            }
+        }
+        aggregates_clean
     }
 
     /// **M1 collector census** (coverage-apparatus review §3).
@@ -7939,6 +7955,59 @@ fn shasum_of(path: &std::path::Path) -> String {
         .to_owned()
 }
 
+#[cfg(test)]
+fn expected_zero_aggregate(row: &report::Row, class: &str) -> Result<(), String> {
+    let key = format!("agg_{}", class.replace('-', "_"));
+    let raw = row
+        .get(&key)
+        .ok_or_else(|| format!("{key}=missing (expected 0)"))?;
+    let n: usize = raw
+        .parse()
+        .map_err(|_| format!("{key}={raw:?} (unparseable; expected 0)"))?;
+    if n == 0 {
+        Ok(())
+    } else {
+        Err(format!("{key}={n} (expected 0)"))
+    }
+}
+
+#[test]
+fn a_missing_aggregate_fails_closed() {
+    let row = report::Row::default();
+    let err = expected_zero_aggregate(&row, "out-of-coverage")
+        .expect_err("a missing expected-zero aggregate must fail");
+    assert!(err.contains("missing"), "wrong failure: {err}");
+}
+
+#[test]
+fn an_unparseable_aggregate_fails_closed() {
+    let mut row = report::Row::default();
+    row.set("agg_out_of_coverage", "not-a-number");
+    let err = expected_zero_aggregate(&row, "out-of-coverage")
+        .expect_err("an unparseable expected-zero aggregate must fail");
+    assert!(err.contains("unparseable"), "wrong failure: {err}");
+}
+
+#[test]
+fn a_missing_worker_aggregate_fails_closed() {
+    let mut verdict = crate::coverage_recon::compare::Verdict::default();
+    for class in crate::coverage_recon::compare::FINDING_CLASSES {
+        verdict.aggregates.insert(class, 0);
+    }
+    verdict.aggregates.remove("out-of-coverage");
+    let mut row = report::Row::default();
+
+    assert!(
+        !run::record_expected_zero_aggregates(&mut row, &verdict),
+        "the worker accepted a missing aggregate as zero"
+    );
+    assert_eq!(
+        row.get("agg_out_of_coverage"),
+        Some("missing"),
+        "the worker did not carry the missing state to the driver"
+    );
+}
+
 /// **The corpus reconciliation gate.**
 ///
 /// Before Track 1 this sweep was report-only: the worker recorded `recon=FAIL`
@@ -7995,13 +8064,11 @@ fn m1_recon_corpus() {
             failures.push(format!("{}: recon={recon}", program.name));
         }
         for class in crate::coverage_recon::compare::FINDING_CLASSES {
-            let key = format!("agg_{}", class.replace('-', "_"));
-            let n: usize = row.get(&key).and_then(|v| v.parse().ok()).unwrap_or(0);
-            if n != 0 {
+            if let Err(detail) = expected_zero_aggregate(&row, class) {
                 // The expected-zero pin. A nonzero class is a gate-level
                 // finding to rule on, never auto-green: attribution without
                 // aggregation is how downgrades go silent.
-                failures.push(format!("{}: {key}={n} (expected 0)", program.name));
+                failures.push(format!("{}: {detail}", program.name));
             }
         }
 
@@ -8585,7 +8652,7 @@ mod orchestrate {
     /// Spawn one worker (this test binary, `--exact bo_c1::boc1_run_one`) with
     /// file-redirected stdio; supervise with deadline + RSS cap; classify.
     pub fn run_child(program: &str, input: &Path, mode: &str, timeout: Duration) -> ChildOutcome {
-        run_child_labeled(program, input, mode, mode, timeout)
+        run_child_labeled(program, input, mode, mode, timeout, &[])
     }
 
     /// `run_child` with extra environment for the child.
@@ -8599,16 +8666,7 @@ mod orchestrate {
         timeout: Duration,
         extra: &[(&str, String)],
     ) -> ChildOutcome {
-        for (key, value) in extra {
-            // SAFETY-adjacent note: the corpus driver is single-threaded at
-            // this point and the child inherits the environment at spawn.
-            unsafe { std::env::set_var(key, value) };
-        }
-        let outcome = run_child_labeled(program, input, mode, mode, timeout);
-        for (key, _) in extra {
-            unsafe { std::env::remove_var(key) };
-        }
-        outcome
+        run_child_labeled(program, input, mode, mode, timeout, extra)
     }
 
     pub fn run_child_labeled(
@@ -8617,6 +8675,7 @@ mod orchestrate {
         mode: &str,
         log_label: &str,
         timeout: Duration,
+        extra: &[(&str, String)],
     ) -> ChildOutcome {
         let mem_cap_kb = env_u64("CRAT_BOC1_MEM_MB", 8192) * 1024;
         let logs = out_dir().join("logs");
@@ -8638,6 +8697,9 @@ mod orchestrate {
             .stdin(Stdio::null())
             .stdout(Stdio::from(out_file))
             .stderr(Stdio::from(err_file));
+        for (key, value) in extra {
+            command.env(key, value);
+        }
         if ownership_yield::enabled() {
             let snapshot = yield_snapshot_path(program, mode);
             fs::create_dir_all(snapshot.parent().expect("snapshot parent"))
@@ -10159,6 +10221,7 @@ fn boc1_corpus() {
                 "prod-box",
                 "prod-box-retry",
                 retry_timeout,
+                &[],
             );
             let row = rows
                 .iter_mut()
@@ -10726,6 +10789,7 @@ fn boc1_corpus() {
                 "selector-core",
                 "selector-core-retry",
                 retry_timeout,
+                &[],
             );
             let m = merged
                 .iter_mut()
@@ -10809,7 +10873,8 @@ fn boc1_corpus() {
                 program.name,
                 retry_timeout.as_secs()
             );
-            let retried = run_child_labeled(program.name, &input, mode, &label, retry_timeout);
+            let retried =
+                run_child_labeled(program.name, &input, mode, &label, retry_timeout, &[]);
             let m = merged
                 .iter_mut()
                 .find(|row| row.get("program") == Some(program.name))
@@ -11207,6 +11272,7 @@ fn boc1_corpus() {
                         &mode,
                         &format!("{mode}-retry"),
                         Duration::from_secs(3600),
+                        &[],
                     );
                     match diagnostic_worker_disposition(&retry.status) {
                         DiagnosticWorkerDisposition::Complete => Some(retry.wall_s),
