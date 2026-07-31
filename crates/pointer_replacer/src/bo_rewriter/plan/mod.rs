@@ -32,7 +32,37 @@
 //! type. [`Justification`] is shaped against all ten goldens' expected text so
 //! the breadth in S2–S3 fills arms rather than reshaping the type.
 
+use std::{collections::BTreeMap, path::PathBuf};
+
 use super::decision::{Decision, DecisionTable};
+
+/// Which source file an edit belongs to.
+///
+/// # Why an enum rather than a `PathBuf`
+///
+/// The string entry point compiles through `FileName::Custom("main.rs")`, **not**
+/// `FileName::Real` — so a key that could only hold a real path would reject
+/// every golden. Both cases are first-class here; only [`FileKey::Real`] is
+/// writable back to disk, which is the emit layer's concern, not the plan's.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum FileKey {
+    /// A file on disk.
+    Real(PathBuf),
+    /// A virtual root — the string entry point's `main.rs`.
+    Virtual(String),
+}
+
+/// A decision that could not be turned into a placed edit.
+///
+/// **Counted and attributed, never silently dropped.** Its reason key is
+/// aggregate-pinned expected-zero on the frozen corpus, so an occurrence is a
+/// finding to rule on rather than a number that quietly moves.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Unplaceable {
+    pub reason: &'static str,
+    /// Attribution — which subject, in the artifact's own terms.
+    pub detail: String,
+}
 
 /// Why an edit is licensed. **Shaped against all ten goldens; one arm live.**
 ///
@@ -72,10 +102,24 @@ pub(crate) struct Edit {
     pub justification: Justification,
 }
 
-/// The finished plan handed to [`super::apply`].
+/// The finished plan handed to [`super::apply`], **grouped by file**.
+///
+/// # Why a map keyed by file
+///
+/// An edit's byte offsets are **file-relative**, so a flat list of edits across
+/// a multi-file crate is ambiguous by construction: two edits in different files
+/// can carry identical `(lo, hi)`. Keying by file makes *an edit with no file*
+/// unrepresentable rather than merely tested, and `BTreeMap` keeps file
+/// iteration deterministic (D19: a report whose order permutes between runs is
+/// not comparable).
+///
+/// 10 of the 20 frozen-corpus programs carry subjects across 2–110 source files,
+/// which is why the flat shape could not survive contact with the corpus.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Plan {
-    pub edits: Vec<Edit>,
+    pub by_file: BTreeMap<FileKey, Vec<Edit>>,
+    /// Decisions that produced no placed edit, with attribution.
+    pub unplaceable: Vec<Unplaceable>,
 }
 
 /// Turn decisions into edits.
@@ -83,8 +127,23 @@ pub(crate) struct Plan {
 /// `source` is read only to copy the pointee's text verbatim: an emitted
 /// `&mut i32` keeps the input's own `i32` rather than a re-rendered type, which
 /// is what keeps generics, paths and whitespace inside the pointee intact.
-pub(crate) fn plan(table: &DecisionTable, source: &str, span_to_range: impl Fn(rustc_span::Span) -> Option<(usize, usize)>) -> Plan {
-    let mut edits = Vec::new();
+/// # Why `source_of` is a per-file lookup and not one `&str`
+///
+/// **S3-proofing — do not "simplify" this back.** It would be tempting to invoke
+/// `plan` once per file with that file's text. That works today, because every
+/// edit S1 emits lands in the same file as the subject's declaration. **It
+/// breaks at S3:** call-site adaptation emits edits into files *other* than the
+/// declaring one, so file identity belongs to the **edit**, not to the
+/// invocation. A per-file invocation would have to be unwound the moment S3
+/// lands, and the unwinding would be silent — the code would still compile and
+/// simply place S3's edits in the wrong file.
+pub(crate) fn plan(
+    table: &DecisionTable,
+    source_of: impl Fn(&FileKey) -> Option<String>,
+    span_to_loc: impl Fn(rustc_span::Span) -> Result<(FileKey, usize, usize), &'static str>,
+) -> Plan {
+    let mut by_file: BTreeMap<FileKey, Vec<Edit>> = BTreeMap::new();
+    let mut unplaceable = Vec::new();
     for (subject, decision) in &table.entries {
         let Decision::Ref { mutable } = decision else {
             // Degraded subjects produce no edit BY DESIGN — the decision phase
@@ -92,18 +151,56 @@ pub(crate) fn plan(table: &DecisionTable, source: &str, span_to_range: impl Fn(r
             // authority the architecture puts in one place.
             continue;
         };
+        let attribution = || {
+            format!(
+                "{} (param #{})",
+                subject.param_name.as_deref().unwrap_or("<unnamed>"),
+                subject.hir_index
+            )
+        };
         // A `Ref` decision implies a syntactic raw-pointer declaration:
         // `decide_one` degrades every other shape with `NonPointerDecl`,
         // precisely because there is no pointee text to copy through an alias.
         let Some(pointee_span) = subject.pointee_span else {
             continue;
         };
-        let (Some((ty_lo, ty_hi)), Some((p_lo, p_hi))) =
-            (span_to_range(subject.ty_span), span_to_range(pointee_span))
-        else {
+        let (ty_file, ty_lo, ty_hi) = match span_to_loc(subject.ty_span) {
+            Ok(located) => located,
+            Err(reason) => {
+                unplaceable.push(Unplaceable { reason, detail: attribution() });
+                continue;
+            }
+        };
+        let (pointee_file, p_lo, p_hi) = match span_to_loc(pointee_span) {
+            Ok(located) => located,
+            Err(reason) => {
+                unplaceable.push(Unplaceable { reason, detail: attribution() });
+                continue;
+            }
+        };
+        // The pointee's text is copied through verbatim, so it must come from
+        // the same file the type is spliced into. Different files here would
+        // mean copying bytes across a file boundary by offset — exactly the
+        // collapse this grouping exists to prevent.
+        if pointee_file != ty_file {
+            unplaceable.push(Unplaceable {
+                reason: "pointee text is in a different file from the declaration",
+                detail: attribution(),
+            });
+            continue;
+        }
+        let Some(source) = source_of(&ty_file) else {
+            unplaceable.push(Unplaceable {
+                reason: "no source text available for the declaring file",
+                detail: attribution(),
+            });
             continue;
         };
         let Some(pointee) = source.get(p_lo..p_hi) else {
+            unplaceable.push(Unplaceable {
+                reason: "pointee range is outside its own file's source",
+                detail: attribution(),
+            });
             continue;
         };
         let replacement = if *mutable {
@@ -111,7 +208,7 @@ pub(crate) fn plan(table: &DecisionTable, source: &str, span_to_range: impl Fn(r
         } else {
             format!("&{pointee}")
         };
-        edits.push(Edit {
+        by_file.entry(ty_file).or_default().push(Edit {
             lo: ty_lo,
             hi: ty_hi,
             replacement,
@@ -120,5 +217,5 @@ pub(crate) fn plan(table: &DecisionTable, source: &str, span_to_range: impl Fn(r
             },
         });
     }
-    Plan { edits }
+    Plan { by_file, unplaceable }
 }

@@ -15,7 +15,7 @@
 //! response is to fix the plan, not to let a half-applied edit reach the
 //! emitted crate.
 
-use super::plan::{Edit, Plan};
+use super::plan::Edit;
 
 /// Outcome of applying a plan.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -31,14 +31,20 @@ pub(crate) struct Rollback {
     pub reason: &'static str,
 }
 
-/// Splice a plan's edits into the source.
+/// Splice **one file's** edits into that file's source.
 ///
 /// Edits address the ORIGINAL source, so they are applied back-to-front: a
 /// later edit's offsets are then still valid when an earlier one has already
 /// changed the string length. Overlapping edits are rejected rather than
 /// resolved — a plan that wants two rewrites of one range has not decided.
-pub(crate) fn apply(source: &str, plan: &Plan) -> Applied {
-    let mut ordered: Vec<&Edit> = plan.edits.iter().collect();
+///
+/// Takes a slice rather than the whole [`super::plan::Plan`] because edit
+/// offsets are **file-relative**: this function has no way to tell which file a
+/// given `(lo, hi)` belongs to, so handing it the whole plan would let a
+/// cross-file mix-up look like an ordinary splice. The caller groups; this
+/// splices.
+pub(crate) fn apply(source: &str, edits: &[Edit]) -> Applied {
+    let mut ordered: Vec<&Edit> = edits.iter().collect();
     ordered.sort_by_key(|e| (e.lo, e.hi));
 
     let mut rollbacks = Vec::new();
@@ -83,7 +89,7 @@ pub(crate) fn apply(source: &str, plan: &Plan) -> Applied {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bo_rewriter::plan::{Edit, Justification, Plan};
+    use crate::bo_rewriter::plan::{Edit, Justification};
 
     fn edit(lo: usize, hi: usize, text: &str) -> Edit {
         Edit {
@@ -98,10 +104,8 @@ mod tests {
     #[test]
     fn disjoint_edits_apply_with_no_rollbacks() {
         let src = "abcdef";
-        let plan = Plan {
-            edits: vec![edit(0, 1, "X"), edit(4, 6, "YZ!")],
-        };
-        let applied = apply(src, &plan);
+        let edits = vec![edit(0, 1, "X"), edit(4, 6, "YZ!")];
+        let applied = apply(src, &edits);
         assert_eq!(applied.source, "XbcdYZ!");
         assert!(
             applied.rollbacks.is_empty(),
@@ -119,10 +123,8 @@ mod tests {
     #[test]
     fn overlapping_edits_roll_back_and_are_counted() {
         let src = "abcdef";
-        let plan = Plan {
-            edits: vec![edit(0, 3, "X"), edit(2, 5, "Y")],
-        };
-        let applied = apply(src, &plan);
+        let edits = vec![edit(0, 3, "X"), edit(2, 5, "Y")];
+        let applied = apply(src, &edits);
         assert_eq!(
             applied.rollbacks.len(),
             1,
@@ -140,10 +142,8 @@ mod tests {
     #[test]
     fn out_of_bounds_edits_roll_back() {
         let src = "abc";
-        let plan = Plan {
-            edits: vec![edit(2, 99, "X")],
-        };
-        let applied = apply(src, &plan);
+        let edits = vec![edit(2, 99, "X")];
+        let applied = apply(src, &edits);
         assert_eq!(applied.rollbacks.len(), 1);
         assert_eq!(applied.source, src, "a rolled-back edit must not apply");
     }
@@ -156,14 +156,12 @@ mod tests {
     #[test]
     fn length_changing_edits_do_not_shift_later_offsets() {
         let src = "aXbYc";
-        let plan = Plan {
-            edits: vec![
+        let edits = vec![
                 edit(1, 2, "LONGER"),
                 // Addresses the ORIGINAL offsets of "Y".
                 edit(3, 4, "Z"),
-            ],
-        };
-        let applied = apply(src, &plan);
+            ];
+        let applied = apply(src, &edits);
         assert!(applied.rollbacks.is_empty());
         assert_eq!(applied.source, "aLONGERbZc");
     }

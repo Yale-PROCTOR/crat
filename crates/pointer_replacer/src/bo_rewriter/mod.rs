@@ -65,6 +65,8 @@ pub(crate) mod plan;
 pub(crate) mod verify;
 
 #[cfg(test)]
+mod emit_tests;
+#[cfg(test)]
 mod goldens;
 #[cfg(test)]
 mod import_denylist;
@@ -94,6 +96,12 @@ pub(crate) enum RewriteOutcome {
         /// previous buckets were written and read by nothing outside one test,
         /// while the ledger claimed they "flow into S2b's counters".
         excluded: decision::universe::Excluded,
+        /// Decisions that could not be turned into a placed edit — a
+        /// macro-generated span, a span straddling two files, a file with no
+        /// editable identity. Carried out for the same reason as `excluded`:
+        /// counted and attributed, never silently dropped. Expected zero on the
+        /// frozen corpus; a nonzero count is a finding to rule on.
+        unplaceable: Vec<plan::Unplaceable>,
     },
     /// No emission, with whatever attribution was available.
     Degraded {
@@ -133,33 +141,37 @@ pub(crate) fn rewrite_m1(input: &str) -> RewriteOutcome {
     let result = ::utils::compilation::run_compiler_on_str(input, move |tcx| {
         let table = decide_table(tcx)?;
 
-        let source_map = tcx.sess.source_map();
-        let plan = plan::plan(&table, &owned, |span| {
-            let lo = source_map.lookup_byte_offset(span.lo()).pos.0 as usize;
-            let hi = source_map.lookup_byte_offset(span.hi()).pos.0 as usize;
-            (lo <= hi && hi <= owned.len()).then_some((lo, hi))
-        });
-
-        let applied = apply::apply(&owned, &plan);
+        let emission = emit_files(tcx, &table)?;
         // Structural gate: rollbacks must be zero.
-        if !applied.rollbacks.is_empty() {
+        if !emission.rollbacks.is_empty() {
             return Err(format!(
                 "apply rolled back {} edit(s): {:?}",
-                applied.rollbacks.len(),
-                applied.rollbacks.iter().map(|r| r.reason).collect::<Vec<_>>()
+                emission.rollbacks.len(),
+                emission.rollbacks.iter().map(|r| r.reason).collect::<Vec<_>>()
+            ));
+        }
+        // The string entry point is the SINGLE-FILE CASE of the general path.
+        // An edit landing anywhere but the virtual root means the general path
+        // produced something this entry point cannot represent — fail loudly
+        // rather than silently emit one file and drop the rest.
+        let root = plan::FileKey::Virtual("main.rs".to_owned());
+        if let Some(stray) = emission.files.keys().find(|k| **k != root) {
+            return Err(format!(
+                "string entry point produced an edit outside its virtual root: {stray:?}"
             ));
         }
         let degradations: Vec<decision::Degradation> = table.degradations().cloned().collect();
         Ok((
-            applied.source,
+            emission.files.get(&root).cloned().unwrap_or_else(|| owned.clone()),
             degradations,
             table.emitted_count(),
             decision::universe::classify(tcx).excluded,
+            emission.unplaceable,
         ))
     });
 
     match result {
-        Ok(Ok((emitted, degradations, emitted_count, excluded))) => {
+        Ok(Ok((emitted, degradations, emitted_count, excluded, unplaceable))) => {
             // Hard gate: the emitted crate type-checks. S2b replaces this
             // whole-crate verdict with per-function granularity.
             if verify::type_checks(&emitted) {
@@ -168,6 +180,7 @@ pub(crate) fn rewrite_m1(input: &str) -> RewriteOutcome {
                     degradations,
                     emitted_count,
                     excluded,
+                    unplaceable,
                 }
             } else {
                 RewriteOutcome::Degraded {
@@ -385,6 +398,88 @@ fn param_name(param: &rustc_hir::Param<'_>) -> Option<String> {
 /// module**. `bo_rewriter` emits; `coverage_recon` compares.
 fn decide_table<'tcx>(tcx: TyCtxt<'tcx>) -> Result<decision::DecisionTable, String> {
     decide_table_perturbed(tcx, |_| {})
+}
+
+/// The rewritten source of every file the plan touched, plus what could not be
+/// placed. **This is the general emission path**; the string entry point is its
+/// single-file case.
+pub(crate) struct Emission {
+    pub files: std::collections::BTreeMap<plan::FileKey, String>,
+    pub rollbacks: Vec<apply::Rollback>,
+    pub unplaceable: Vec<plan::Unplaceable>,
+}
+
+/// A source file's identity for editing. `None` for anything not written back
+/// to a nameable file (macro-expansion contexts, synthetic inputs).
+fn file_key(name: &rustc_span::FileName) -> Option<plan::FileKey> {
+    match name {
+        rustc_span::FileName::Real(real) => real
+            .local_path()
+            .map(|path| plan::FileKey::Real(path.to_path_buf())),
+        rustc_span::FileName::Custom(name) => Some(plan::FileKey::Virtual(name.clone())),
+        _ => None,
+    }
+}
+
+/// Plan and apply, **grouped by file**.
+///
+/// Grouping is what makes the offsets meaningful: `lookup_byte_offset` yields
+/// *file-relative* positions, so two edits in different files can carry
+/// identical `(lo, hi)`. Applying them against one string would splice each into
+/// whichever file happened to be passed — silently, and with a plausible result.
+pub(crate) fn emit_files<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    table: &decision::DecisionTable,
+) -> Result<Emission, String> {
+    let source_map = tcx.sess.source_map();
+    let text_of = |key: &plan::FileKey| -> Option<String> {
+        source_map
+            .files()
+            .iter()
+            .find(|sf| file_key(&sf.name).as_ref() == Some(key))
+            .and_then(|sf| sf.src.as_ref().map(|src| src.to_string()))
+    };
+    let span_to_loc =
+        |span: rustc_span::Span| -> Result<(plan::FileKey, usize, usize), &'static str> {
+            // A macro-generated span points into an expansion, not into source
+            // anyone can edit. Splicing it would corrupt the file it nominally
+            // resolves to.
+            if span.from_expansion() {
+                return Err("span is macro-generated and cannot be spliced into source");
+            }
+            let lo = source_map.lookup_byte_offset(span.lo());
+            let hi = source_map.lookup_byte_offset(span.hi());
+            let (Some(lo_key), Some(hi_key)) = (file_key(&lo.sf.name), file_key(&hi.sf.name))
+            else {
+                return Err("span resolves to a file with no editable identity");
+            };
+            if lo_key != hi_key {
+                return Err("span straddles two source files");
+            }
+            let (lo, hi) = (lo.pos.0 as usize, hi.pos.0 as usize);
+            if lo > hi {
+                return Err("span bounds are inverted");
+            }
+            Ok((lo_key, lo, hi))
+        };
+
+    let planned = plan::plan(table, text_of, span_to_loc);
+
+    let mut files = std::collections::BTreeMap::new();
+    let mut rollbacks = Vec::new();
+    for (key, edits) in &planned.by_file {
+        let Some(source) = text_of(key) else {
+            return Err(format!("no source text for planned file {key:?}"));
+        };
+        let applied = apply::apply(&source, edits);
+        rollbacks.extend(applied.rollbacks);
+        files.insert(key.clone(), applied.source);
+    }
+    Ok(Emission {
+        files,
+        rollbacks,
+        unplaceable: planned.unplaceable,
+    })
 }
 
 /// [`decide_table`] with a hook applied to the collector's real output at the
