@@ -254,42 +254,19 @@ fn the_clean_worker_path_still_succeeds() {
 ///
 /// *Mutation-tested (Rider 0):* deleting the interleave block in `compare`
 /// fails this.
+///
+/// **Stand-in DELETED 2026-07-31**, at the `binding_span` follow-on's merge.
+/// Until then this witness filled producer B's binding spans itself; both halves
+/// are now real, so it consumes B's actual rows end-to-end. The deletion mutation
+/// was re-run after the swap — a witness that passed against a stand-in has not
+/// been shown to bite against the real producer.
 #[test]
 #[ignore = "runs the full BO pipeline twice"]
 fn a_live_span_swap_is_caught_end_to_end() {
     let src = "#![allow(dead_code)]\npub unsafe fn f(p: *mut i32, q: *const u8) -> i32 { *p as i32 }\n";
     let (verdict, active) = ::utils::compilation::run_compiler_on_str(src, |tcx| {
         let a = crate::bo_rewriter::artifact_rows_span_swapped(tcx).expect("producer A");
-        let mut b = producer_b::rows(tcx);
-        // STAND-IN for producer B's binding spans until the gated follow-on
-        // lands. Producer A's half is real end-to-end; this half is filled from
-        // the same `var_debug_info` fact the follow-on will use, so the witness
-        // exercises the comparator's live inputs rather than hand-built rows.
-        // When the follow-on lands, this block is DELETED and B supplies them.
-        let sm = tcx.sess.source_map();
-        for row in &mut b {
-            let Some(did) = tcx
-                .mir_keys(())
-                .iter()
-                .find(|d| tcx.def_path_str(d.to_def_id()) == row.fn_path)
-                .copied()
-            else {
-                continue;
-            };
-            let body = tcx.mir_drops_elaborated_and_const_checked(did).borrow();
-            let local = rustc_middle::mir::Local::from_u32(row.mir_local);
-            for info in &body.var_debug_info {
-                if let rustc_middle::mir::VarDebugInfoContents::Place(pl) = &info.value
-                    && pl.as_local() == Some(local)
-                    && info.argument_index.is_some()
-                {
-                    row.binding_span_lo =
-                        Some(sm.lookup_byte_offset(info.source_info.span.lo()).pos.0);
-                    row.binding_span_hi =
-                        Some(sm.lookup_byte_offset(info.source_info.span.hi()).pos.0);
-                }
-            }
-        }
+        let b = producer_b::rows(tcx);
         let active = crate::coverage_recon::compare::span_axis_active(&b);
         let encoded_a = crate::coverage_recon::schema::encode(&a);
         let encoded_b = crate::coverage_recon::schema::encode(&b);
