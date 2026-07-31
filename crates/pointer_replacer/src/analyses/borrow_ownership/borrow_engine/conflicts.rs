@@ -205,6 +205,237 @@ fn extract_conflict_edges(
     edges
 }
 
+/// S1 diagnosis-only dump of the exact BO-native replay facts.  It deliberately
+/// drives the same `NativeBorrowContext`, invalidation overwrite, Raw-demotion,
+/// and `tree_borrow_local` union loop as the oracle, then renders every MIR
+/// location with the pre-effect live set and the effect-local killed set.
+#[cfg(test)]
+pub(crate) fn debug_borrow_replay_dump<I, J, M, N, K, L>(
+    program: &RustProgram,
+    f: LocalDefId,
+    is_ref: I,
+    is_raw: M,
+    is_mutable: K,
+) -> String
+where
+    I: Fn(LocalDefId) -> J,
+    J: Fn(Local) -> bool,
+    M: Fn(LocalDefId) -> N,
+    N: Fn(Local) -> bool,
+    K: Fn(LocalDefId) -> L,
+    L: Fn(Local) -> bool,
+{
+    use std::{collections::BTreeSet, fmt::Write as _};
+
+    use rustc_index::bit_set::SparseBitMatrix;
+    use rustc_mir_dataflow::points::PointIndex;
+
+    fn sparse_loan_ids(
+        matrix: &SparseBitMatrix<PointIndex, Loan>,
+        point: PointIndex,
+    ) -> Vec<usize> {
+        matrix
+            .row(point)
+            .into_iter()
+            .flat_map(|row| row.iter())
+            .map(|loan| loan.index())
+            .collect()
+    }
+
+    let flows =
+        crate::analyses::borrow_ownership::origin_flow::analyze_program_origin_flow(program);
+    let raw_for_f = is_raw(f);
+    let is_ref_ref = &is_ref;
+    let is_raw_ref = &is_raw;
+    let is_candidate = move |did: LocalDefId| {
+        let ref_for_f = is_ref_ref(did);
+        let raw_for_f = is_raw_ref(did);
+        move |local: Local| ref_for_f(local) || raw_for_f(local)
+    };
+    let mut ctxt = NativeBorrowContext::new(program, &flows, is_candidate, is_mutable);
+    let body = &*program
+        .tcx
+        .mir_drops_elaborated_and_const_checked(f)
+        .borrow();
+    let mut out = String::new();
+    writeln!(
+        out,
+        "FUNCTION {:?}",
+        program.tcx.def_path_str(f.to_def_id())
+    )
+    .unwrap();
+    writeln!(out, "MIR LOCALS").unwrap();
+    for (local, decl) in body.local_decls.iter_enumerated() {
+        writeln!(out, "  {:?}: {:?}", local, decl.ty).unwrap();
+    }
+    writeln!(out, "MIR DEBUG NAMES").unwrap();
+    for info in &body.var_debug_info {
+        writeln!(out, "  {} = {:?}", info.name, info.value).unwrap();
+    }
+
+    for iteration in 0..=body.local_decls.len() {
+        let mut inference = ctxt.infer(program.tcx, f, &[]);
+        overwrite_with_engine_facts(program.tcx, f, &ctxt.borrow, &mut inference);
+        let provenance_set = ctxt.borrow.provenances.get(&f).unwrap();
+
+        writeln!(out, "ITERATION {iteration}").unwrap();
+        let mut groups = BTreeSet::new();
+        for local in body.local_decls.indices() {
+            let mut members: Vec<_> = provenance_set
+                .tree_borrow_local
+                .borrow_mut()
+                .group(local)
+                .into_iter()
+                .map(|member| member.index())
+                .collect();
+            members.sort_unstable();
+            groups.insert(members);
+        }
+        writeln!(out, "GROUPS {groups:?}").unwrap();
+
+        writeln!(out, "LOANS").unwrap();
+        for (loan, data) in inference.borrow_set.loans.iter_enumerated() {
+            let mut required_by = Vec::new();
+            for provenance in provenance_set.provenance_data.indices() {
+                if inference.requires.contains(provenance, loan) {
+                    required_by.push(format!(
+                        "{:?}",
+                        provenance_set.provenance_data[provenance].owner()
+                    ));
+                }
+            }
+            required_by.sort();
+            writeln!(
+                out,
+                "  L{} create={:?} borrowed={:?} assigned={:?} required_by={:?}",
+                loan.index(),
+                data.location(),
+                data.borrowed,
+                data.assigned,
+                required_by
+            )
+            .unwrap();
+        }
+
+        writeln!(out, "MIR AND LOCATION FACTS").unwrap();
+        for (bb, data) in body.basic_blocks.iter_enumerated() {
+            let locations = data.statements.len() + usize::from(data.terminator.is_some());
+            for statement_index in 0..locations {
+                let location = rustc_middle::mir::Location {
+                    block: bb,
+                    statement_index,
+                };
+                let point = inference.location_map.point_from_location(location);
+                let mir = if statement_index < data.statements.len() {
+                    format!("{:?}", data.statements[statement_index].kind)
+                } else {
+                    format!(
+                        "{:?}",
+                        data.terminator.as_ref().expect("terminator location").kind
+                    )
+                };
+                let created: Vec<_> = inference
+                    .borrow_set
+                    .loans
+                    .iter_enumerated()
+                    .filter_map(|(loan, borrow)| {
+                        (borrow.location() == location).then_some(loan.index())
+                    })
+                    .collect();
+                let killed: Vec<_> = inference.killed[point]
+                    .iter()
+                    .map(|loan| loan.index())
+                    .collect();
+                let live = sparse_loan_ids(&inference.loan_liveness, point);
+                let invalidates = sparse_loan_ids(&inference.invalidates, point);
+                let errors = sparse_loan_ids(&inference.errors, point);
+                let mut live_provenances = Vec::new();
+                let mut required = BTreeSet::new();
+                for provenance in inference
+                    .provenance_liveness
+                    .row(point)
+                    .into_iter()
+                    .flat_map(|row| row.iter())
+                {
+                    live_provenances.push(format!(
+                        "{:?}",
+                        provenance_set.provenance_data[provenance].owner()
+                    ));
+                    if let Some(loans) = inference.requires.row(provenance) {
+                        required.extend(loans.iter().map(|loan| loan.index()));
+                    }
+                }
+                live_provenances.sort();
+                writeln!(
+                    out,
+                    "  {:?} point={} mir={} created={:?} live_prov={:?} required={:?} \
+                     live={:?} killed={:?} invalidates={:?} errors={:?}",
+                    location,
+                    point.index(),
+                    mir,
+                    created,
+                    live_provenances,
+                    required,
+                    live,
+                    killed,
+                    invalidates,
+                    errors
+                )
+                .unwrap();
+            }
+        }
+
+        let invalid_loans = invalid_loan_set(&inference);
+        let to_demote: Vec<(Local, Local)> = {
+            let demotions =
+                collect_invalid_loan_demotions(&inference, provenance_set, &invalid_loans);
+            demotions
+                .local_witnesses
+                .into_iter()
+                .filter(|(local, _)| {
+                    raw_for_f(*local) && provenance_set.local_data[*local].is_some()
+                })
+                .collect()
+        };
+        writeln!(
+            out,
+            "INVALID_LOANS {:?}",
+            invalid_loans
+                .iter()
+                .map(|loan| loan.index())
+                .collect::<Vec<_>>()
+        )
+        .unwrap();
+        writeln!(
+            out,
+            "TO_DEMOTE {:?}",
+            to_demote
+                .iter()
+                .map(|(local, base)| (local.index(), base.index()))
+                .collect::<Vec<_>>()
+        )
+        .unwrap();
+
+        if to_demote.is_empty() {
+            let edges = extract_conflict_edges(&inference, provenance_set, &invalid_loans);
+            writeln!(out, "FINAL_EDGES {edges:?}").unwrap();
+            break;
+        }
+
+        drop(inference);
+        let provenance_set = ctxt.borrow.provenances.get_mut(&f).unwrap();
+        for (local, base) in to_demote {
+            provenance_set.local_data[local] = None;
+            provenance_set
+                .tree_borrow_local
+                .get_mut()
+                .union(local, base);
+        }
+    }
+
+    out
+}
+
 /// Attach the invalidating access roots to the unchanged one-edge-per-loan
 /// aggregation. Event unioning happens only on the L2 feature-on path.
 fn extract_witnessed_conflict_edges(

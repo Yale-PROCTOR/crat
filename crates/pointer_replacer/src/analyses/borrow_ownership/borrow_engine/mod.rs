@@ -45,6 +45,8 @@ pub(crate) use conflicts::{
     borrow_conflicts_with_flows,
 };
 #[cfg(test)]
+pub(crate) use conflicts::debug_borrow_replay_dump;
+#[cfg(test)]
 pub(crate) use conflicts::{borrow_conflicts, borrow_conflicts_replaying};
 // §NB4-R: the compose/type-check decision, re-exported so its fallback is unit-testable in isolation
 // (grouping-independent — see `nb4r_route_compose_fallback_on_type_mismatch`).
