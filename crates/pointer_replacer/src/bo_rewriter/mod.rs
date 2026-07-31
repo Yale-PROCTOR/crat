@@ -160,7 +160,7 @@ pub(crate) fn rewrite_m1(input: &str) -> RewriteOutcome {
     // the ten goldens exercise exactly the mechanism the corpus will. A parallel
     // string pipeline is the hazard class this milestone exists to remove: it
     // would be exercised by every test and by nothing real.
-    rewrite_core(::utils::compilation::str_to_input(input), None)
+    rewrite_core(::utils::compilation::str_to_input(input), None, MAX_REVERT_ROUNDS)
 }
 
 /// M1's **general** entry point: a crate rooted at `root`, rewritten into a temp
@@ -170,7 +170,7 @@ pub(crate) fn rewrite_m1(input: &str) -> RewriteOutcome {
     reason = "no caller until 0a.4's corpus smoke; `rewrite_m1` reaches the same               core through the other entry. Targeted here rather than               module-wide so the lint stays live over everything reachable."
 )]
 pub(crate) fn rewrite_m1_path(root: &std::path::Path) -> RewriteOutcome {
-    rewrite_core(::utils::compilation::path_to_input(root), Some(root))
+    rewrite_core(::utils::compilation::path_to_input(root), Some(root), MAX_REVERT_ROUNDS)
 }
 
 /// **The one emission path.** Both entry points funnel here; they differ only in
@@ -184,9 +184,21 @@ pub(crate) fn rewrite_m1_path(root: &std::path::Path) -> RewriteOutcome {
 /// report whose values permute between runs is not comparable. Compiling the
 /// string as `<main.rs>` keeps attribution stable, and the emission logic below
 /// is shared regardless, which is what the one-path ruling is actually about.
+/// Test-only entry that lowers the round cap, so the CAP arm of the dual
+/// termination can be witnessed without manufacturing a looping fixture.
+/// A parameter rather than an env knob: no production seam.
+#[cfg(test)]
+pub(crate) fn rewrite_m1_path_with_cap(
+    root: &std::path::Path,
+    max_rounds: usize,
+) -> RewriteOutcome {
+    rewrite_core(::utils::compilation::path_to_input(root), Some(root), max_rounds)
+}
+
 fn rewrite_core(
     input: rustc_session::config::Input,
     tree_base: Option<&std::path::Path>,
+    max_rounds: usize,
 ) -> RewriteOutcome {
     let root_hint = tree_base;
     let result = ::utils::compilation::run_compiler_on_input(input, |tcx| {
@@ -375,9 +387,9 @@ fn rewrite_core(
                 }
                 previous_errors = Some(diagnosis.errors);
                 rounds += 1;
-                if rounds > MAX_REVERT_ROUNDS {
+                if rounds > max_rounds {
                     escalation = Some(format!(
-                        "escalation-required: round cap {MAX_REVERT_ROUNDS} reached with \
+                        "escalation-required: round cap {max_rounds} reached with \
                          {} error(s) outstanding",
                         diagnosis.errors
                     ));

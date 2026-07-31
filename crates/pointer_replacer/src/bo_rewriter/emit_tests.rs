@@ -606,3 +606,54 @@ fn a_clean_crate_yields_no_diagnostics() {
     assert!(d.diags.is_empty(), "{d:?}");
     assert_eq!(d.unrenderable, 0, "{d:?}");
 }
+
+/// Coupled functions: `outer` calls `inner`, both have rewritable pointer
+/// parameters, and `inner`'s body carries the S3-absence error (a rewritten
+/// value stored into a raw-pointer field).
+///
+/// Reverting `inner` is expected to break `outer`'s call site, forcing a SECOND
+/// round — the shape that makes the round cap reachable.
+const COUPLED: &str = "pub struct Holder {\n    pub slot: *mut i32,\n}\npub unsafe fn inner(value: *mut i32, holder: *mut Holder) {\n    (*holder).slot = value;\n}\npub unsafe fn outer(v: *mut i32, h: *mut Holder) {\n    inner(v, h);\n}\n";
+
+fn coupled_fixture() -> Fixture {
+    Fixture::new(&[
+        ("lib.rs", "#![allow(dead_code, unused_unsafe)]\npub mod m;\n"),
+        ("m.rs", COUPLED),
+    ])
+}
+
+/// **S2b.1.3 — the CAP arm of the dual termination, witnessed.**
+///
+/// The cap is configured to its boundary (0 rounds) on a fixture that genuinely
+/// needs one, so reaching the cap is real behaviour rather than a manufactured
+/// loop.
+///
+/// **Why the boundary rather than a multi-round fixture.** The coupled shape
+/// (`outer` calls `inner`, both rewritten, `inner`'s body carrying the error)
+/// was built and MEASURED: it converges in ONE round, `reverted=2`, because
+/// BATCH-revert takes every attributed function in the same round. Constraint
+/// (a) is precisely what collapses a cascade into one round, so multi-round
+/// convergence is rare *by design* and the cap is hard to reach naturally. That
+/// is the mechanism working, not a gap in the fixture.
+///
+/// *Mutation-tested, Rider 0 order.* **Deletion first:** disable the cap check
+/// and this fails — the loop converges and returns `Emitted`.
+#[test]
+fn the_round_cap_stops_the_loop() {
+    let fixture = Fixture::new(&[
+        ("lib.rs", "#![allow(dead_code, unused_unsafe)]\npub mod good;\npub mod bad;\n"),
+        ("good.rs", "pub unsafe fn bump(p: *mut i32) -> i32 {\n    *p += 1;\n    *p\n}\n"),
+        ("bad.rs", BREAKS_ON_REWRITE),
+    ]);
+    match super::rewrite_m1_path_with_cap(&fixture.root(), 0) {
+        super::RewriteOutcome::Degraded { reason, .. } => {
+            assert!(
+                reason.contains("round cap"),
+                "escalated for the wrong reason: {reason}"
+            );
+        }
+        super::RewriteOutcome::Emitted { .. } => {
+            panic!("the loop ran a revert round despite a cap of 0")
+        }
+    }
+}
