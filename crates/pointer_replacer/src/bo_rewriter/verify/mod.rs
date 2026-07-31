@@ -76,6 +76,12 @@ pub(crate) struct TempCrate {
 
 impl TempCrate {
     /// The crate root inside the copy — hand this to [`type_checks_crate`].
+    #[allow(
+        dead_code,
+        reason = "same expiry as `materialize`: reached only from witnesses \
+                  until 0a.3 wires the path-based flow. Correct this reason \
+                  when that lands rather than leaving it standing."
+    )]
     pub(crate) fn root(&self) -> &Path {
         &self.root
     }
