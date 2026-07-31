@@ -607,21 +607,6 @@ fn a_clean_crate_yields_no_diagnostics() {
     assert_eq!(d.unrenderable, 0, "{d:?}");
 }
 
-/// Coupled functions: `outer` calls `inner`, both have rewritable pointer
-/// parameters, and `inner`'s body carries the S3-absence error (a rewritten
-/// value stored into a raw-pointer field).
-///
-/// Reverting `inner` is expected to break `outer`'s call site, forcing a SECOND
-/// round — the shape that makes the round cap reachable.
-const COUPLED: &str = "pub struct Holder {\n    pub slot: *mut i32,\n}\npub unsafe fn inner(value: *mut i32, holder: *mut Holder) {\n    (*holder).slot = value;\n}\npub unsafe fn outer(v: *mut i32, h: *mut Holder) {\n    inner(v, h);\n}\n";
-
-fn coupled_fixture() -> Fixture {
-    Fixture::new(&[
-        ("lib.rs", "#![allow(dead_code, unused_unsafe)]\npub mod m;\n"),
-        ("m.rs", COUPLED),
-    ])
-}
-
 /// **S2b.1.3 — the CAP arm of the dual termination, witnessed.**
 ///
 /// The cap is configured to its boundary (0 rounds) on a fixture that genuinely
