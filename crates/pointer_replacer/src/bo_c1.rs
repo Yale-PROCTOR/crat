@@ -7116,6 +7116,52 @@ mod run {
     ///
     /// Analysis-free by design: no solver, no BO run. This measures the
     /// collector's predicate and nothing downstream of it.
+    /// **S2b.0 — full M1 pipeline on one program.** decide → plan → apply →
+    /// verify, whole-crate gate, temp copies only.
+    ///
+    /// Takes a PATH rather than a `TyCtxt`: `rewrite_m1_path` opens its own
+    /// compiler session, and nesting one inside the worker's would run two
+    /// rustc invocations in one process for no reason.
+    pub fn run_m1_emit(input: &std::path::Path) -> Row {
+        use crate::bo_rewriter::{RewriteOutcome, rewrite_m1_path};
+
+        let t0 = Instant::now();
+        let mut row = Row::default();
+        let outcome = rewrite_m1_path(input);
+        row.set("t_total_s", secs(t0.elapsed()));
+        match outcome {
+            RewriteOutcome::Emitted {
+                files,
+                degradations,
+                emitted_count,
+                unplaceable,
+                ..
+            } => {
+                row.set("verdict", "PASS");
+                row.set("emitted", emitted_count);
+                row.set("degraded", degradations.len());
+                row.set("files_touched", files.len());
+                row.set("unplaceable", unplaceable.len());
+                row.set("status", "ok");
+            }
+            RewriteOutcome::Degraded {
+                reason,
+                degradations,
+                ..
+            } => {
+                // A gate failure is DATA, not an error to repair mid-run.
+                row.set("verdict", "FAIL");
+                row.set("emitted", 0usize);
+                row.set("degraded", degradations.len());
+                row.set("files_touched", 0usize);
+                row.set("unplaceable", 0usize);
+                row.set("detail", super::report::sanitize(&reason));
+                row.set("status", "gate-fail");
+            }
+        }
+        row
+    }
+
     pub fn run_m1_census(tcx: TyCtxt<'_>, t_tcx: Duration) -> Row {
         let t0 = Instant::now();
         let mut row = Row::default();
@@ -8110,6 +8156,81 @@ fn m1_recon_corpus() {
     );
 }
 
+/// **S2b.0 — the pinned measurement.** Full M1 pipeline over all 20 programs.
+///
+/// # Measurement discipline
+///
+/// Verdicts are **DATA**. This driver asserts only that every program was
+/// ATTEMPTED; it does not assert that any program passes, and nothing is
+/// patched mid-run. A measurement run becomes a repair run only by ruling.
+///
+/// Counts carry the **pre-S3** label: `CallSiteNotAdapted` saturates at ≥69.4%
+/// of corpus pointer params before S3 exists, so the emitted/degraded split here
+/// is "pre-S3 — measures S3's absence". Only the M1-final report after S3 feeds
+/// the emission-guided-refinement decision.
+#[test]
+#[ignore = "S2b.0 measurement: spawns one worker per program"]
+fn m1_emit_corpus() {
+    use std::{fs, time::Duration};
+
+    let root = orchestrate::workspace_root();
+    let timeout = Duration::from_secs(
+        std::env::var("CRAT_BOC1_EMIT_TIMEOUT_SECS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(900),
+    );
+
+    let mut attempted = 0usize;
+    let mut missing: Vec<String> = Vec::new();
+    let mut rows: Vec<report::Row> = Vec::new();
+
+    for program in CORPUS {
+        let input = program.input_path(&root);
+        assert!(input.is_file(), "missing rs-crown input: {input:?}");
+        attempted += 1;
+        let outcome = orchestrate::run_child_env(program.name, &input, "m1-emit", timeout, &[]);
+        let Some(mut row) = outcome.row.clone() else {
+            // DEFERRAL IS RECORDED, NEVER ZEROED.
+            missing.push(format!(
+                "{}: no sentinel row (orchestrator status={})",
+                program.name, outcome.status
+            ));
+            continue;
+        };
+        row.set("program", program.name);
+
+        // Span buckets for the type errors the gate reported, read from the
+        // child's own stderr. Empty when the verdict is PASS — in which case
+        // "zero whole-crate failures pre-S3" is itself the datum.
+        if row.get("verdict") == Some("FAIL") {
+            let log = orchestrate::out_dir()
+                .join("logs")
+                .join(format!("{}.m1-emit.err", program.name));
+            let text = fs::read_to_string(&log).unwrap_or_default();
+            let errors = text.matches("error[").count();
+            row.set("type_errors", errors);
+            for line in text.lines().filter(|l| l.trim_start().starts_with("--> ")) {
+                println!("M1EMIT-DIAG program={} site={}", program.name, line.trim());
+            }
+        }
+        rows.push(row);
+    }
+
+    for row in &rows {
+        println!("{}", report::to_kv_line(row));
+    }
+    for note in &missing {
+        println!("M1EMIT-DEFERRED {note}");
+    }
+    assert_eq!(
+        rows.len() + missing.len(),
+        attempted,
+        "every corpus program must be attempted"
+    );
+    assert_eq!(attempted, CORPUS.len(), "the corpus is 20 programs");
+}
+
 // Worker (one program, one mode, one process).
 // ---------------------------------------------------------------------------
 
@@ -8145,6 +8266,13 @@ fn boc1_run_one() {
     {
         z3::set_global_param("smt.random_seed", "0");
         z3::set_global_param("sat.random_seed", "0");
+    }
+
+    if mode == "m1-emit" {
+        let mut row = run::run_m1_emit(Path::new(&input));
+        row.set("program", name.clone());
+        println!("{}", report::to_kv_line(&row));
+        return;
     }
 
     let t0 = Instant::now();
