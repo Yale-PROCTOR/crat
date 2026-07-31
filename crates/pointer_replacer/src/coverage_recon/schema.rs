@@ -84,9 +84,22 @@ pub(crate) enum Outcome {
 /// Whether the pairing for this row can be trusted.
 ///
 /// `Low` is set when a parameter's `var_debug_info` entry count is not exactly
-/// one — zero covers an unnamed `_`, and more than one covers a pattern
-/// parameter such as `fn f((a, b): (*mut i32, *mut i32))`, whose entries name
-/// the *bindings* rather than the parameter. A `Low` row's pairing disagreement
+/// one. **On the emittable universe the reachable case is count 0** (measured
+/// 2026-07-31), and it covers both an unnamed `_` and a **pattern parameter**,
+/// whose bindings become fresh non-parameter locals and so match nothing:
+/// `fn s(&x: &*mut i32)` is depth 2, emits a row, and lands here with entry
+/// count 0.
+///
+/// **Corrected 2026-07-31.** This comment previously said "more than one covers
+/// a pattern parameter such as `fn f((a, b): (*mut i32, *mut i32))`". That was
+/// false twice over: the tuple parameter's argument local is a **tuple at
+/// pointer depth 0**, so it emits **no row at all** and cannot illustrate any
+/// `PairingConfidence` value; and its matching entry count is **0**, not "more
+/// than one". No probed shape produced a count above one — that branch is
+/// phase-defensive, not an observed population, which is why its incidence is
+/// aggregate-pinned rather than exercised by a fixture.
+///
+/// A `Low` row's pairing disagreement
 /// is classified as an attributed finding rather than a violation, because the
 /// instrument — not necessarily the collector — is the thing in doubt.
 ///
