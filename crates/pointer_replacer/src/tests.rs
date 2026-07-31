@@ -9720,16 +9720,17 @@ mod borrow_ownership_coherence {
             borrow::{GBorrowInferCtxt, demote_pointers_iterative_with_fields},
             borrow_ownership::{
                 CrateCtxt, SlotKind,
+                borrow_engine::debug_borrow_replay_dump,
                 borrow_verify::{
-                    SlotConflict, materialize_guards, revalidate, revalidate_replaying,
-                    verify_to_fixpoint,
+                    SlotConflict, materialize_guards, model_accepts, revalidate,
+                    revalidate_replaying, verify_to_fixpoint,
                 },
                 coherence::{add_coherence, constrain_field_ownership},
                 crate_slots::CrateSlots,
                 emit_crate_ownership_constraints,
                 mutability_facts::MutFacts,
                 origins::{collect_no_borrow_origin_slots, compute_origins},
-                slots::StructFieldSlot,
+                slots::{SlotId, StructFieldSlot},
                 solver::{KindSolver, SlotRef},
                 sources::collect_malloc_source_slots,
             },
@@ -11760,6 +11761,276 @@ unsafe fn f(mut p: *mut i32) -> i32 {
                 (model.get(&slot).copied(), facts.is_mutable(f, l))
             })
             .collect()
+    }
+
+    /// S1 helper: solve the ordinary Mode-A path and return its accepted model.
+    /// The caller owns the semantic assertion so the RED witness, negative
+    /// control, and caught contrasts all exercise the same setup.
+    fn s1_accept_model(
+        program: &RustProgram<'_>,
+        f: LocalDefId,
+    ) -> (CrateSlots, FxHashMap<SlotRef, SlotKind>) {
+        let body = program.tcx.mir_drops_elaborated_and_const_checked(f).borrow();
+        let slots = CrateSlots::build(program);
+        let crate_ctxt = CrateCtxt::new(program);
+        let facts = MutFacts::from_program(program);
+        let solver = KindSolver::new(&slots);
+        let (_stats, selectors) = emit_crate_ownership_constraints(
+            &crate_ctxt,
+            &slots,
+            &compute_origins(program),
+            &solver,
+        )
+        .expect("S1 ownership emission");
+        add_coherence(&solver, &slots, f, &body);
+        let model = verify_to_fixpoint(program, &slots, &solver, &selectors, &facts)
+            .expect("S1 fixture must reach a Mode-A acceptance");
+        assert!(
+            model_accepts(program, &slots, &model, &facts),
+            "the model returned by Mode-A must be accepted by the same oracle"
+        );
+        (slots, model)
+    }
+
+    fn s1_all_ref_model(slots: &CrateSlots) -> FxHashMap<SlotRef, SlotKind> {
+        let mut model = FxHashMap::default();
+        for index in 0..slots.field_slots.len() {
+            model.insert(SlotRef::Field(SlotId::from_usize(index)), SlotKind::Ref);
+        }
+        for (&did, universe) in &slots.fn_local_slots {
+            for index in 0..universe.len() {
+                model.insert(
+                    SlotRef::Local(did, SlotId::from_usize(index)),
+                    SlotKind::Ref,
+                );
+            }
+        }
+        model
+    }
+
+    /// S1 RED: `q = p` creates a loan on `*p`, then the bare assignment
+    /// `p = other` kills it.  If both source and destination survive as `Ref`,
+    /// lowering the copy as a mutable reborrow makes the assignment to `p`
+    /// illegal while `q` remains live.
+    #[test]
+    #[ignore = "S1 RED: enable explicitly while the source-place loan repair is absent"]
+    fn s1_loan_kill_plain_overwrite_must_reject_all_ref_model() {
+        run_compiler(
+            "unsafe fn f(mut p: *mut i32, other: *mut i32) -> i32 { \
+                 let q = p; *q = 1; p = other; *q \
+             }",
+            |tcx| {
+                let program = collect_program(tcx);
+                let f = function_by_name(&program, "f");
+                let p = local_by_var_name(tcx, f, "p");
+                let q = local_by_var_name(tcx, f, "q");
+                eprintln!(
+                    "S1 PLAIN FACT DUMP\n{}",
+                    debug_borrow_replay_dump(
+                        &program,
+                        f,
+                        |_: LocalDefId| |_: Local| true,
+                        |_: LocalDefId| |_: Local| false,
+                        |_: LocalDefId| |_: Local| true,
+                    )
+                );
+                let (slots, model) = s1_accept_model(&program, f);
+                let p = local_slot(&slots, f, p, 0);
+                let q = local_slot(&slots, f, q, 0);
+                eprintln!(
+                    "S1 plain accepted kinds: p={:?} q={:?}",
+                    model.get(&p),
+                    model.get(&q)
+                );
+                assert_ne!(
+                    (model.get(&p), model.get(&q)),
+                    (Some(&SlotKind::Ref), Some(&SlotKind::Ref)),
+                    "RED: Mode-A ACCEPTED p=Ref and q=Ref across `p = other`; q is a mutable \
+                     reborrow (written before the overwrite) and remains live afterward, so \
+                     reassignment of p should be a borrow conflict"
+                );
+            },
+        );
+    }
+
+    /// S1 C-idiomatic variant.  Unlike the plain overwrite, the right-hand side
+    /// reads through `p`; the existing deep-access path may catch this before
+    /// the destination assignment kills loans rooted at `p`.
+    #[test]
+    #[ignore = "S1 boundary fixture: run explicitly with the RED investigation"]
+    fn s1_loan_kill_c_next_overwrite_must_reject_all_ref_model() {
+        run_compiler(
+            "#[repr(C)] struct Node { next: *mut Node, value: i32 } \
+             unsafe fn f(mut p: *mut Node) -> i32 { \
+                 let q = p; (*q).value = 1; p = (*p).next; (*q).value \
+             }",
+            |tcx| {
+                let program = collect_program(tcx);
+                let f = function_by_name(&program, "f");
+                let p = local_by_var_name(tcx, f, "p");
+                let q = local_by_var_name(tcx, f, "q");
+                eprintln!(
+                    "S1 C-NEXT FACT DUMP\n{}",
+                    debug_borrow_replay_dump(
+                        &program,
+                        f,
+                        |_: LocalDefId| |_: Local| true,
+                        |_: LocalDefId| |_: Local| false,
+                        |_: LocalDefId| |_: Local| true,
+                    )
+                );
+                let (slots, model) = s1_accept_model(&program, f);
+                let p = local_slot(&slots, f, p, 0);
+                let q = local_slot(&slots, f, q, 0);
+                eprintln!(
+                    "S1 C-next accepted kinds: p={:?} q={:?}",
+                    model.get(&p),
+                    model.get(&q)
+                );
+                let all_ref = s1_all_ref_model(&slots);
+                let facts = MutFacts::from_program(&program);
+                assert!(
+                    !model_accepts(&program, &slots, &all_ref, &facts),
+                    "the C-style dereferenced RHS must invalidate q's required loan before kill"
+                );
+            },
+        );
+    }
+
+    /// S1 negative control: without the reassignment of the borrowed source,
+    /// the pointer copy and exclusive use through `q` are a valid reborrow.
+    #[test]
+    #[ignore = "S1 negative control: run explicitly with the RED investigation"]
+    fn s1_loan_kill_no_overwrite_control_stays_accepted() {
+        run_compiler(
+            "unsafe fn f(p: *mut i32) -> i32 { let q = p; *q = 1; *q }",
+            |tcx| {
+                let program = collect_program(tcx);
+                let f = function_by_name(&program, "f");
+                let p = local_by_var_name(tcx, f, "p");
+                let q = local_by_var_name(tcx, f, "q");
+                eprintln!(
+                    "S1 CONTROL FACT DUMP\n{}",
+                    debug_borrow_replay_dump(
+                        &program,
+                        f,
+                        |_: LocalDefId| |_: Local| true,
+                        |_: LocalDefId| |_: Local| false,
+                        |_: LocalDefId| |_: Local| true,
+                    )
+                );
+                let (slots, model) = s1_accept_model(&program, f);
+                eprintln!(
+                    "S1 control accepted kinds: p={:?} q={:?}",
+                    model.get(&local_slot(&slots, f, p, 0)),
+                    model.get(&local_slot(&slots, f, q, 0))
+                );
+                let all_ref = s1_all_ref_model(&slots);
+                let facts = MutFacts::from_program(&program);
+                assert!(
+                    model_accepts(&program, &slots, &all_ref, &facts),
+                    "control: without a source overwrite the all-Ref reborrow remains valid"
+                );
+                assert_eq!(
+                    (
+                        model.get(&local_slot(&slots, f, p, 0)),
+                        model.get(&local_slot(&slots, f, q, 0)),
+                    ),
+                    (Some(&SlotKind::Ref), Some(&SlotKind::Ref)),
+                    "control: the no-overwrite reborrow should remain accepted as Ref/Ref"
+                );
+            },
+        );
+    }
+
+    /// S1 nearest-shape contrast: if the use after `p = other` writes through
+    /// `q`, NB4-R's cross-alias write routing recovers a conflict even though
+    /// the original `*p` loan was already killed at the bare assignment.
+    #[test]
+    #[ignore = "S1 routing contrast: run explicitly with the RED investigation"]
+    fn s1_post_overwrite_write_routing_contrast_rejects_all_ref_model() {
+        run_compiler(
+            "unsafe fn f(mut p: *mut i32, other: *mut i32) -> i32 { \
+                 let q = p; p = other; *q = 1; *q \
+             }",
+            |tcx| {
+                let program = collect_program(tcx);
+                let f = function_by_name(&program, "f");
+                let p = local_by_var_name(tcx, f, "p");
+                let q = local_by_var_name(tcx, f, "q");
+                eprintln!(
+                    "S1 POST-WRITE FACT DUMP\n{}",
+                    debug_borrow_replay_dump(
+                        &program,
+                        f,
+                        |_: LocalDefId| |_: Local| true,
+                        |_: LocalDefId| |_: Local| false,
+                        |_: LocalDefId| |_: Local| true,
+                    )
+                );
+                let (slots, model) = s1_accept_model(&program, f);
+                let p = local_slot(&slots, f, p, 0);
+                let q = local_slot(&slots, f, q, 0);
+                eprintln!(
+                    "S1 post-write accepted kinds: p={:?} q={:?}",
+                    model.get(&p),
+                    model.get(&q)
+                );
+                let all_ref = s1_all_ref_model(&slots);
+                let facts = MutFacts::from_program(&program);
+                assert!(
+                    !model_accepts(&program, &slots, &all_ref, &facts),
+                    "NB4-R must reject the all-Ref model when q writes after the overwrite"
+                );
+            },
+        );
+    }
+
+    /// S1 tree-grouping contrast: force `p` Raw in replay.  Its earlier invalid
+    /// loan unions `p` with `r`; rebuilding `q = p` must then add the existing
+    /// bare group-member loan on `r`, so `r = other` surfaces a conflict owned
+    /// and required by `q` even though the copy arm still skips bare `p`.
+    #[test]
+    #[ignore = "S1 grouping contrast: run explicitly with the RED investigation"]
+    fn s1_tree_group_member_contrast_catches_sibling_overwrite() {
+        run_compiler(
+            "unsafe fn f(mut r: *mut i32, other: *mut i32) -> i32 { \
+                 let p = r; *r = 1; let q = p; r = other; *q = 2; *q \
+             }",
+            |tcx| {
+                let program = collect_program(tcx);
+                let f = function_by_name(&program, "f");
+                let p = local_by_var_name(tcx, f, "p");
+                let q = local_by_var_name(tcx, f, "q");
+                let slots = CrateSlots::build(&program);
+                let p_slot = local_slot(&slots, f, p, 0);
+                let q_slot = local_slot(&slots, f, q, 0);
+                eprintln!(
+                    "S1 TREE-GROUP FACT DUMP\n{}",
+                    debug_borrow_replay_dump(
+                        &program,
+                        f,
+                        move |did: LocalDefId| move |local: Local| !(did == f && local == p),
+                        move |did: LocalDefId| move |local: Local| did == f && local == p,
+                        |_: LocalDefId| |_: Local| true,
+                    )
+                );
+                let conflicts = revalidate_replaying(
+                    &program,
+                    &slots,
+                    |slot| slot != p_slot,
+                    |slot| slot == p_slot,
+                    true,
+                );
+                assert!(
+                    conflicts.get(&f).is_some_and(|edges| edges.iter().any(|edge| {
+                        edge.issuer == Some(q_slot) || edge.requirers.contains(&q_slot)
+                    })),
+                    "tree-group replay must catch the sibling overwrite through q's bare group \
+                     member loan; got {conflicts:?}"
+                );
+            },
+        );
     }
 
     const NB4_ID: &str = "#[inline(never)] unsafe fn id(q: *mut i32) -> *mut i32 { q } ";
