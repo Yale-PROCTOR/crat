@@ -187,6 +187,22 @@ pub(crate) fn rewrite_m1_path(root: &std::path::Path) -> RewriteOutcome {
 /// Test-only entry that lowers the round cap, so the CAP arm of the dual
 /// termination can be witnessed without manufacturing a looping fixture.
 /// A parameter rather than an env knob: no production seam.
+/// Test-only: force decisions at the phase boundary, reproducing a shape the
+/// decision phase would not itself emit.
+#[cfg(test)]
+pub(crate) fn rewrite_m1_path_injected(
+    root: &std::path::Path,
+    max_rounds: usize,
+    inject: &(dyn Fn(&mut decision::DecisionTable) + Sync),
+) -> RewriteOutcome {
+    rewrite_core_injected(
+        ::utils::compilation::path_to_input(root),
+        Some(root),
+        max_rounds,
+        inject,
+    )
+}
+
 #[cfg(test)]
 pub(crate) fn rewrite_m1_path_with_cap(
     root: &std::path::Path,
@@ -200,9 +216,27 @@ fn rewrite_core(
     tree_base: Option<&std::path::Path>,
     max_rounds: usize,
 ) -> RewriteOutcome {
+    rewrite_core_injected(input, tree_base, max_rounds, &|_| {})
+}
+
+/// [`rewrite_core`] with a hook applied to the finished decision table at the
+/// PHASE BOUNDARY, before `plan` sees it.
+///
+/// No-op in production. It exists so a test can hand the downstream phases a
+/// shape A1's envelope normally prevents — the `decide_table_perturbed`
+/// precedent, at the table rather than the subject. **Not a production fault
+/// seam:** a parameter with a no-op default, not an env-gated branch.
+fn rewrite_core_injected(
+    input: rustc_session::config::Input,
+    tree_base: Option<&std::path::Path>,
+    max_rounds: usize,
+    inject: &(dyn Fn(&mut decision::DecisionTable) + Sync),
+) -> RewriteOutcome {
     let root_hint = tree_base;
     let result = ::utils::compilation::run_compiler_on_input(input, |tcx| {
-        let table = decide_table(tcx)?;
+        let mut table = decide_table(tcx)?;
+        inject(&mut table);
+        let table = table;
         let emission = emit_files(tcx, &table, &rustc_hash::FxHashSet::default())?;
         let (emission_plan, emission_texts) = (emission.plan.clone(), emission.texts.clone());
         // Structural gate: rollbacks must be zero.
