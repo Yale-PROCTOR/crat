@@ -7147,16 +7147,26 @@ mod run {
             RewriteOutcome::Degraded {
                 reason,
                 degradations,
+                emitted_count,
+                files_touched,
+                emitted_sites,
                 ..
             } => {
-                // A gate failure is DATA, not an error to repair mid-run.
+                // A gate failure is DATA, not an error to repair mid-run — and
+                // what the run ATTEMPTED is reported, never zeroed.
                 row.set("verdict", "FAIL");
-                row.set("emitted", 0usize);
+                row.set("emitted", emitted_count);
                 row.set("degraded", degradations.len());
-                row.set("files_touched", 0usize);
+                row.set("files_touched", files_touched);
                 row.set("unplaceable", 0usize);
                 row.set("detail", super::report::sanitize(&reason));
                 row.set("status", "gate-fail");
+                for site in &emitted_sites {
+                    println!(
+                        "M1EMIT-SITE file={} lo={} hi={} fn={}",
+                        site.file, site.lo_line, site.hi_line, site.fn_path
+                    );
+                }
             }
         }
         row
@@ -8204,15 +8214,88 @@ fn m1_emit_corpus() {
         // child's own stderr. Empty when the verdict is PASS — in which case
         // "zero whole-crate failures pre-S3" is itself the datum.
         if row.get("verdict") == Some("FAIL") {
-            let log = orchestrate::out_dir()
-                .join("logs")
-                .join(format!("{}.m1-emit.err", program.name));
-            let text = fs::read_to_string(&log).unwrap_or_default();
-            let errors = text.matches("error[").count();
-            row.set("type_errors", errors);
-            for line in text.lines().filter(|l| l.trim_start().starts_with("--> ")) {
-                println!("M1EMIT-DIAG program={} site={}", program.name, line.trim());
+            let logs = orchestrate::out_dir().join("logs");
+            let err_text =
+                fs::read_to_string(logs.join(format!("{}.m1-emit.err", program.name)))
+                    .unwrap_or_default();
+            let out_text =
+                fs::read_to_string(logs.join(format!("{}.m1-emit.out", program.name)))
+                    .unwrap_or_default();
+            row.set("type_errors", err_text.matches("error[").count());
+
+            // Rewritten subjects' own functions, as (crate-relative file, lo, hi).
+            let crate_dir = input.parent().expect("crate dir");
+            let sites: Vec<(String, usize, usize)> = out_text
+                .lines()
+                .filter_map(|line| {
+                    let rest = line.strip_prefix("M1EMIT-SITE file=")?;
+                    let (file, rest) = rest.split_once(" lo=")?;
+                    let (lo, rest) = rest.split_once(" hi=")?;
+                    let (hi, _) = rest.split_once(" fn=")?;
+                    let rel = std::path::Path::new(file)
+                        .strip_prefix(crate_dir)
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_else(|_| file.to_string());
+                    Some((rel, lo.parse().ok()?, hi.parse().ok()?))
+                })
+                .collect();
+
+            // Bucket each diagnostic. The verify compile runs on a TEMP COPY, so
+            // its paths carry a `crat-verify-<pid>-<n>/` prefix; strip it to get
+            // the same crate-relative key the sites use.
+            let (mut own_fn, mut caller, mut elsewhere) = (0usize, 0usize, 0usize);
+            let mut pending: Option<String> = None;
+            for line in err_text.lines() {
+                let trimmed = line.trim_start();
+                if trimmed.starts_with("error[") || trimmed.starts_with("error:") {
+                    pending = Some(trimmed.to_owned());
+                    continue;
+                }
+                let Some(site) = trimmed.strip_prefix("--> ") else {
+                    continue;
+                };
+                if pending.take().is_none() {
+                    continue;
+                }
+                let mut parts = site.rsplitn(3, ':');
+                let (_col, line_no, path) = (parts.next(), parts.next(), parts.next());
+                let (Some(line_no), Some(path)) = (line_no, path) else {
+                    continue;
+                };
+                let Ok(line_no) = line_no.parse::<usize>() else {
+                    continue;
+                };
+                let rel = path
+                    .split_once("crat-verify-")
+                    .and_then(|(_, tail)| tail.split_once('/'))
+                    .map(|(_, rest)| rest.to_string())
+                    .unwrap_or_else(|| path.to_string());
+                let in_own_fn = sites
+                    .iter()
+                    .any(|(f, lo, hi)| *f == rel && *lo <= line_no && line_no <= *hi);
+                let same_file_rewritten = sites.iter().any(|(f, _, _)| *f == rel);
+                if in_own_fn {
+                    own_fn += 1;
+                } else if same_file_rewritten {
+                    caller += 1;
+                } else {
+                    elsewhere += 1;
+                }
+                println!(
+                    "M1EMIT-DIAG program={} bucket={} site={rel}:{line_no}",
+                    program.name,
+                    if in_own_fn {
+                        "own-fn"
+                    } else if same_file_rewritten {
+                        "same-file-other-fn"
+                    } else {
+                        "elsewhere"
+                    }
+                );
             }
+            row.set("bucket_own_fn", own_fn);
+            row.set("bucket_same_file_other_fn", caller);
+            row.set("bucket_elsewhere", elsewhere);
         }
         rows.push(row);
     }

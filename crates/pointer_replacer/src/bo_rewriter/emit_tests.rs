@@ -379,3 +379,60 @@ fn rgba_smoke_emits_and_verifies_from_a_temp_copy() {
         }
     }
 }
+
+/// **S2b.0 instrument repair.** A crate that FAILS the gate still reports what
+/// it attempted.
+///
+/// S2b.0's first sweep reported `emitted=0` for all ten failing programs,
+/// because the `Degraded` arm carried no counts — so the corpus emission yield
+/// was an undercount and the span-bucket axis was blocked outright. The failing
+/// programs had of course emitted subjects; that is what broke their crates.
+///
+/// The fixture mirrors `ht`'s real shape: a rewritten parameter stored into a
+/// raw-pointer struct field.
+///
+/// *Mutation-tested, Rider 0 order.* **Deletion first:** re-zero the `Degraded`
+/// arm (`emitted_count: 0`, `emitted_sites: Vec::new()`) and this fails.
+#[test]
+fn a_crate_that_fails_the_gate_still_reports_what_it_attempted() {
+    let fixture = Fixture::new(&[
+        ("lib.rs", "#![allow(dead_code, unused_unsafe)]\npub mod m;\n"),
+        (
+            "m.rs",
+            "pub struct Holder {\n    pub slot: *mut i32,\n}\npub unsafe fn stash(value: *mut i32, holder: *mut Holder) {\n    (*holder).slot = value;\n}\n",
+        ),
+    ]);
+
+    match super::rewrite_m1_path(&fixture.root()) {
+        super::RewriteOutcome::Degraded {
+            emitted_count,
+            files_touched,
+            emitted_sites,
+            reason,
+            ..
+        } => {
+            assert!(
+                reason.contains("type-check gate"),
+                "this witness needs a GATE failure, got: {reason}"
+            );
+            assert!(
+                emitted_count >= 1,
+                "a failing crate reported {emitted_count} emitted subjects — the \
+                 attempt is unobservable and the yield figure is an undercount"
+            );
+            assert!(files_touched >= 1, "files_touched was zeroed: {files_touched}");
+            assert!(
+                !emitted_sites.is_empty(),
+                "no emitted sites recorded — the span-bucket axis stays blocked"
+            );
+            let site = &emitted_sites[0];
+            assert!(
+                site.lo_line <= site.hi_line && site.fn_path.contains("stash"),
+                "site does not locate the rewritten subject's own fn: {site:?}"
+            );
+        }
+        super::RewriteOutcome::Emitted { .. } => {
+            panic!("the fixture must FAIL the gate for this witness to mean anything")
+        }
+    }
+}

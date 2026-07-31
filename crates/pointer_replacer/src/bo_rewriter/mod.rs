@@ -104,6 +104,7 @@ pub(crate) enum RewriteOutcome {
         /// previous buckets were written and read by nothing outside one test,
         /// while the ledger claimed they "flow into S2b's counters".
         excluded: decision::universe::Excluded,
+        emitted_sites: Vec<EmittedSite>,
         /// Decisions that could not be turned into a placed edit — a
         /// macro-generated span, a span straddling two files, a file with no
         /// editable identity. Carried out for the same reason as `excluded`:
@@ -116,6 +117,15 @@ pub(crate) enum RewriteOutcome {
         reason: String,
         degradations: Vec<decision::Degradation>,
         excluded: decision::universe::Excluded,
+        /// **Observability of the ATTEMPT.** A crate that fails the gate still
+        /// rewrote subjects — that is usually WHY it failed. Reporting zero here
+        /// is the "deferral recorded, never zeroed" rule violated at the
+        /// instrument, and it blocked S2b.0's span-bucket axis outright.
+        emitted_count: usize,
+        files_touched: usize,
+        /// The rewritten subjects' own functions, so a verify diagnostic can be
+        /// attributed to one.
+        emitted_sites: Vec<EmittedSite>,
     },
 }
 
@@ -191,6 +201,34 @@ fn rewrite_core(
             ));
         }
         let degradations: Vec<decision::Degradation> = table.degradations().cloned().collect();
+        let mut emitted_sites: Vec<EmittedSite> = Vec::new();
+        let mut seen_fns = rustc_hash::FxHashSet::default();
+        for (subject, decision) in &table.entries {
+            if !matches!(decision, decision::Decision::Ref { .. }) {
+                continue;
+            }
+            if !seen_fns.insert(subject.fn_did) {
+                continue;
+            }
+            let fn_span = tcx.hir_span(tcx.local_def_id_to_hir_id(subject.fn_did));
+            let source_map = tcx.sess.source_map();
+            let (lo, hi) = (
+                source_map.lookup_char_pos(fn_span.lo()),
+                source_map.lookup_char_pos(fn_span.hi()),
+            );
+            let Some(key) = file_key(&lo.file.name) else {
+                continue;
+            };
+            emitted_sites.push(EmittedSite {
+                file: match key {
+                    plan::FileKey::Real(path) => path.display().to_string(),
+                    plan::FileKey::Virtual(name) => name,
+                },
+                fn_path: tcx.def_path_str(subject.fn_did.to_def_id()),
+                lo_line: lo.line,
+                hi_line: hi.line,
+            });
+        }
         // The crate ROOT's final text: its emitted version if the root was
         // edited, otherwise its original source. Computed here because only the
         // compiler session can supply the unedited text.
@@ -221,11 +259,20 @@ fn rewrite_core(
             table.emitted_count(),
             decision::universe::classify(tcx).excluded,
             root_text,
+            emitted_sites,
         ))
     });
 
     match result {
-        Ok(Ok((files, unplaceable, degradations, emitted_count, excluded, root_text))) => {
+        Ok(Ok((
+            files,
+            unplaceable,
+            degradations,
+            emitted_count,
+            excluded,
+            root_text,
+            emitted_sites,
+        ))) => {
             // Materialize onto the original tree when there is one; otherwise
             // the emission is a single virtual file and becomes a one-file crate.
             let materialized = match tree_base {
@@ -239,6 +286,9 @@ fn rewrite_core(
                         reason: format!("could not materialize the emitted crate: {err}"),
                         degradations,
                         excluded,
+                        emitted_count,
+                        files_touched: files.len(),
+                        emitted_sites,
                     };
                 }
             };
@@ -259,6 +309,7 @@ fn rewrite_core(
                     degradations,
                     emitted_count,
                     excluded,
+                    emitted_sites,
                     unplaceable,
                 }
             } else {
@@ -266,6 +317,9 @@ fn rewrite_core(
                     reason: "emitted crate failed the type-check gate".to_owned(),
                     degradations,
                     excluded,
+                    emitted_count,
+                    files_touched: files.len(),
+                    emitted_sites,
                 }
             }
         }
@@ -273,11 +327,17 @@ fn rewrite_core(
             reason,
             degradations: Vec::new(),
             excluded: decision::universe::Excluded::default(),
+            emitted_count: 0,
+            files_touched: 0,
+            emitted_sites: Vec::new(),
         },
         Err(_) => RewriteOutcome::Degraded {
             reason: "input crate did not compile".to_owned(),
             degradations: Vec::new(),
             excluded: decision::universe::Excluded::default(),
+            emitted_count: 0,
+            files_touched: 0,
+            emitted_sites: Vec::new(),
         },
     }
 }
@@ -478,6 +538,16 @@ fn param_name(param: &rustc_hir::Param<'_>) -> Option<String> {
 /// module**. `bo_rewriter` emits; `coverage_recon` compares.
 fn decide_table<'tcx>(tcx: TyCtxt<'tcx>) -> Result<decision::DecisionTable, String> {
     decide_table_perturbed(tcx, |_| {})
+}
+
+/// Where a rewritten subject's own function lives, for attributing a verify
+/// diagnostic to it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct EmittedSite {
+    pub file: String,
+    pub fn_path: String,
+    pub lo_line: usize,
+    pub hi_line: usize,
 }
 
 /// The rewritten source of every file the plan touched, plus what could not be
