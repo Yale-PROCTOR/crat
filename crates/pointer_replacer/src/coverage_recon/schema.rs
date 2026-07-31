@@ -84,8 +84,16 @@ pub(crate) enum Outcome {
 /// one — zero covers an unnamed `_`, and more than one covers a pattern
 /// parameter such as `fn f((a, b): (*mut i32, *mut i32))`, whose entries name
 /// the *bindings* rather than the parameter. A `Low` row's pairing disagreement
-/// is an attributed finding rather than a fail-loud, because the instrument —
-/// not necessarily the collector — is the thing in doubt.
+/// is classified as an attributed finding rather than a violation, because the
+/// instrument — not necessarily the collector — is the thing in doubt.
+///
+/// **That classification does not currently change the program outcome**
+/// (ruling 2026-07-31, option A): every finding class is pinned to
+/// expected-zero, so a low-confidence mismatch fails its program exactly as a
+/// violation does. The downgrade buys triage today; its verdict-level effect is
+/// registered as option (B) and triggers when a corpus with legitimate
+/// low-confidence incidence enters scope. On frozen rs-crown that incidence is
+/// zero — C2Rust emits no pattern or unnamed parameters.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub(crate) enum PairingConfidence {

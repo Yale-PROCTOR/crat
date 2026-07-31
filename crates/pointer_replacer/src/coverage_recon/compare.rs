@@ -6,13 +6,38 @@
 //!
 //! # Severity, direction-asymmetric (R-B)
 //!
-//! | condition | severity |
-//! |---|---|
-//! | row in B only | attributed `OutOfCoverage` finding; the run continues |
-//! | row in A only | **fail-loud** |
-//! | pairing fields disagree, `pairing_confidence = high` | **fail-loud** |
-//! | pairing fields disagree, `pairing_confidence = low` | attributed finding |
-//! | classification fields disagree (`ptr_depth`) | attributed finding |
+//! | condition | class | program outcome |
+//! |---|---|---|
+//! | row in B only | `out-of-coverage` finding | **FAIL** |
+//! | row in A only | violation | **FAIL** |
+//! | pairing disagrees, confidence `high` | violation | **FAIL** |
+//! | pairing disagrees, confidence `low` | finding | **FAIL** |
+//! | classification disagrees (`ptr_depth`) | finding | **FAIL** |
+//!
+//! # R-B's verdict-level asymmetry is DEFERRED, not deleted (ruling 2026-07-31)
+//!
+//! R-B graded a coverage gap as *loud but not fatal* and a contract violation
+//! as fatal. At the **verdict** level that distinction is currently inert:
+//! every finding class is pinned to expected-zero, so any finding fails its
+//! program whatever `passed()` says — the inertness follows from the
+//! expected-zero generalization, not from `passed()`, and reverting `passed()`
+//! alone would not restore it.
+//!
+//! Option (A) is in force: accept the inertness and say so. Option (B) — a
+//! declared nonzero budget for `pairing-mismatch-low-confidence`, which
+//! reactivates the downgrade — is **registered with a trigger**: on frozen
+//! rs-crown the legitimate incidence of low-confidence pairing is genuinely
+//! **zero** (C2Rust emits no pattern or unnamed parameters), so the only honest
+//! budget today is 0 — and a budget of 0 *is* option (A). A nonzero budget now
+//! would be speculative configurability for a class with no incidence: dead
+//! machinery of the `excluded_other` kind.
+//!
+//! **Decision rule:** when a corpus with legitimate low-confidence incidence
+//! enters scope (un-tamed robustness runs, M4-era), set the budget from
+//! MEASURED incidence and the verdict-level downgrade activates.
+//!
+//! What the class still buys today: triage. The record says which instrument
+//! is in doubt, and the sweep still continues past it to full incidence.
 //!
 //! A parameter the collector cannot see is an unhandled subject, and halting
 //! the crate for it reproduces the whole-crate-verdict problem S2b is separately
@@ -40,7 +65,11 @@ pub(crate) const FINDING_CLASSES: &[&str] = &[
     "classification-mismatch",
 ];
 
-/// A non-halting finding, attributed.
+/// An attributed finding.
+///
+/// **Not "non-halting" at the verdict level** — see the module docs. It does
+/// not halt the *sweep* (the driver continues to the next program), but it does
+/// fail its own program while every finding class is pinned to expected-zero.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Finding {
     pub class: &'static str,

@@ -138,7 +138,13 @@ fn rows_are_emitted_in_canonical_order() {
 // A.6 — the five severity classes
 // ---------------------------------------------------------------------------
 
-/// **Class 1 — B-only row is an attributed finding, and the run continues.**
+/// **Class 1 — a B-only row is an attributed `out-of-coverage` finding.**
+///
+/// The NAME is kept because it is still accurate: this is about CLASSIFICATION,
+/// which is unchanged. What was corrected (ruling 2026-07-31) is the claim that
+/// "the run continues" describes the verdict — it describes the SWEEP. The
+/// program itself fails, because every finding class is pinned to
+/// expected-zero.
 ///
 /// *Mutation-tested (Rider 0, deletion first):* deleting the `for (key, b) in
 /// &b_by_key` loop fails this.
@@ -196,12 +202,18 @@ fn a_high_confidence_pairing_mismatch_is_a_violation() {
     }
 }
 
-/// **Class 4 — the low-confidence downgrade.** A `pairing_confidence = low` row
-/// with a pairing disagreement is an attributed finding, NOT fail-loud, and it
-/// increments the low-confidence aggregate.
+/// **Class 4 — the low-confidence downgrade, which is a CLASS change, not an
+/// outcome change.**
 ///
-/// The instrument, not necessarily the collector, is what is in doubt when
-/// `var_debug_info` gave no usable entry.
+/// A `pairing_confidence = low` row with a pairing disagreement is recorded as
+/// a finding rather than a violation, and increments the low-confidence
+/// aggregate — the instrument, not necessarily the collector, is what is in
+/// doubt when `var_debug_info` gave no usable entry.
+///
+/// **It does not currently change the program outcome** (ruling 2026-07-31,
+/// option A). The name is kept because the downgrade is real at the
+/// classification level; the verdict-level effect is registered as option (B)
+/// with a measured-incidence trigger.
 ///
 /// *Mutation-tested (Rider 0, deletion first):* deleting the `let low = …`
 /// branch (so every mismatch is a violation) fails this.
@@ -221,6 +233,9 @@ fn a_low_confidence_pairing_mismatch_is_downgraded_to_a_finding() {
 }
 
 /// **Class 5 — a classification disagreement is an attributed finding.**
+///
+/// Attributed, and — like every finding class while the expected-zero pin
+/// stands — failing for its program. The sweep still continues past it.
 ///
 /// `ptr_depth` is the one field both producers derive with *different*
 /// implementations of the depth predicate (§2.2), so a disagreement is
