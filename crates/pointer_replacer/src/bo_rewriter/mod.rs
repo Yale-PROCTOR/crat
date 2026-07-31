@@ -192,6 +192,7 @@ fn rewrite_core(
     let result = ::utils::compilation::run_compiler_on_input(input, |tcx| {
         let table = decide_table(tcx)?;
         let emission = emit_files(tcx, &table, &rustc_hash::FxHashSet::default())?;
+        let (emission_plan, emission_texts) = (emission.plan.clone(), emission.texts.clone());
         // Structural gate: rollbacks must be zero.
         if !emission.rollbacks.is_empty() {
             return Err(format!(
@@ -202,11 +203,25 @@ fn rewrite_core(
         }
         let degradations: Vec<decision::Degradation> = table.degradations().cloned().collect();
         let mut emitted_sites: Vec<EmittedSite> = Vec::new();
+        // One entry per EMITTED SUBJECT (not per function), so a revert can move
+        // exactly the right number of subjects from emitted to degraded and the
+        // accounting identity survives the loop.
+        let mut emitted_subjects: Vec<(String, String, String)> = Vec::new();
         let mut seen_fns = rustc_hash::FxHashSet::default();
         for (subject, decision) in &table.entries {
             if !matches!(decision, decision::Decision::Ref { .. }) {
                 continue;
             }
+            let owner = tcx.def_path_str(subject.fn_did.to_def_id());
+            emitted_subjects.push((
+                owner.clone(),
+                format!(
+                    "{}::{}",
+                    owner,
+                    subject.param_name.as_deref().unwrap_or("<unnamed>")
+                ),
+                decision::emitability::EmitabilityFacts::site(tcx, subject.ty_span),
+            ));
             if !seen_fns.insert(subject.fn_did) {
                 continue;
             }
@@ -261,73 +276,147 @@ fn rewrite_core(
             .unwrap_or_default();
         Ok((
             emission.files,
+            emission_plan,
+            emission_texts,
             emission.unplaceable,
             degradations,
             table.emitted_count(),
             decision::universe::classify(tcx).excluded,
             root_text,
             emitted_sites,
+            emitted_subjects,
         ))
     });
 
     match result {
         Ok(Ok((
             files,
+            emission_plan,
+            emission_texts,
             unplaceable,
             degradations,
             emitted_count,
             excluded,
             root_text,
             emitted_sites,
+            emitted_subjects,
         ))) => {
-            // Materialize onto the original tree when there is one; otherwise
-            // the emission is a single virtual file and becomes a one-file crate.
-            let materialized = match tree_base {
-                Some(root) => verify::materialize(root, &files),
-                None => verify::materialize_single_file(&root_text),
-            };
-            let staged = match materialized {
-                Ok(staged) => staged,
-                Err(err) => {
-                    return RewriteOutcome::Degraded {
-                        reason: format!("could not materialize the emitted crate: {err}"),
+            let crate_dir = tree_base.and_then(|root| root.parent()).map(|d| d.to_path_buf());
+            let mut reverted: std::collections::BTreeSet<String> =
+                std::collections::BTreeSet::new();
+            let mut files = files;
+            let mut rounds = 0usize;
+            let mut previous_errors: Option<usize> = None;
+            let escalation: Option<String>;
+
+            loop {
+                let materialized = match tree_base {
+                    Some(root) => verify::materialize(root, &files),
+                    None => verify::materialize_single_file(&root_text),
+                };
+                let staged = match materialized {
+                    Ok(staged) => staged,
+                    Err(err) => {
+                        return RewriteOutcome::Degraded {
+                            reason: format!("could not materialize the emitted crate: {err}"),
+                            degradations,
+                            excluded,
+                            emitted_count,
+                            files_touched: files.len(),
+                            emitted_sites,
+                        };
+                    }
+                };
+                let diagnosis = verify::diagnose_crate(staged.root());
+                if diagnosis.errors == 0 {
+                    escalation = None;
+                    // Read back from the MATERIALIZED copy, so the bytes
+                    // returned are the bytes the gate just accepted.
+                    let source = std::fs::read_to_string(staged.root()).unwrap_or_default();
+                    let (kept, taken): (Vec<_>, Vec<_>) = emitted_subjects
+                        .iter()
+                        .partition(|(owner, _, _)| !reverted.contains(owner));
+                    // ACCOUNTING: a reverted subject moves from emitted to
+                    // degraded under its OWN reason key, so
+                    // `emitted_final + degraded == row count` survives the loop.
+                    let mut degradations = degradations;
+                    for (_, subject, site) in &taken {
+                        degradations.push(decision::Degradation {
+                            subject: subject.clone(),
+                            site: site.clone(),
+                            reason: decision::DegradeReason::RevertedAfterVerifyFailure,
+                        });
+                    }
+                    let _ = &escalation;
+                    return RewriteOutcome::Emitted {
+                        source,
+                        files,
                         degradations,
+                        emitted_count: kept.len(),
                         excluded,
-                        emitted_count,
-                        files_touched: files.len(),
                         emitted_sites,
+                        unplaceable,
                     };
                 }
-            };
-            // Hard gate: the emitted crate type-checks, WHOLE-CRATE. S2b.1
-            // replaces this verdict with per-function granularity, after the
-            // S2b.0 measurement chooses its mechanism.
-            if verify::type_checks_crate(staged.root()) {
-                // Read back from the MATERIALIZED copy in both cases, so the
-                // bytes returned are the bytes the gate just accepted. Deriving
-                // them separately let a broken materialization gate an empty
-                // crate while the caller still received the real source — the
-                // gate would have been checking something it did not return.
-                let _ = &root_text;
-                let source = std::fs::read_to_string(staged.root()).unwrap_or_default();
-                RewriteOutcome::Emitted {
-                    source,
-                    files,
-                    degradations,
-                    emitted_count,
-                    excluded,
-                    emitted_sites,
-                    unplaceable,
+
+                // DUAL TERMINATION, both arms. Neither alone: a no-progress
+                // detector can be starved by a loop that keeps finding new
+                // attributions, and a cap alone burns every round on a case
+                // that stopped improving after the first.
+                if previous_errors.is_some_and(|prev| diagnosis.errors >= prev) {
+                    escalation = Some(format!(
+                        "escalation-required: no progress ({} error(s) after \
+                         reverting {} function(s)) — attribution is wrong here \
+                         and (C) bisect must take over",
+                        diagnosis.errors,
+                        reverted.len()
+                    ));
+                    break;
                 }
-            } else {
-                RewriteOutcome::Degraded {
-                    reason: "emitted crate failed the type-check gate".to_owned(),
-                    degradations,
-                    excluded,
-                    emitted_count,
-                    files_touched: files.len(),
-                    emitted_sites,
+                previous_errors = Some(diagnosis.errors);
+                rounds += 1;
+                if rounds > MAX_REVERT_ROUNDS {
+                    escalation = Some(format!(
+                        "escalation-required: round cap {MAX_REVERT_ROUNDS} reached with \
+                         {} error(s) outstanding",
+                        diagnosis.errors
+                    ));
+                    break;
                 }
+
+                let newly = attribute(&diagnosis.diags, &emitted_sites, crate_dir.as_deref())
+                    .difference(&reverted)
+                    .cloned()
+                    .collect::<std::collections::BTreeSet<_>>();
+                if newly.is_empty() {
+                    escalation = Some(format!(
+                        "escalation-required: {} error(s) attributed to no rewritten \
+                         function",
+                        diagnosis.errors
+                    ));
+                    break;
+                }
+                // BATCH revert: the union of this round's attributions, not one
+                // at a time — one compile per round rather than one per function.
+                reverted.extend(newly);
+                let (next_files, rollbacks) = render(&emission_plan, &emission_texts, &reverted);
+                if !rollbacks.is_empty() {
+                    escalation = Some(format!(
+                        "escalation-required: re-render rolled back {} edit(s)",
+                        rollbacks.len()
+                    ));
+                    break;
+                }
+                files = next_files;
+            }
+
+            RewriteOutcome::Degraded {
+                reason: escalation.unwrap_or_else(|| "escalation-required".to_owned()),
+                degradations,
+                excluded,
+                emitted_count,
+                files_touched: files.len(),
+                emitted_sites,
             }
         }
         Ok(Err(reason)) => RewriteOutcome::Degraded {
@@ -545,6 +634,58 @@ fn param_name(param: &rustc_hir::Param<'_>) -> Option<String> {
 /// module**. `bo_rewriter` emits; `coverage_recon` compares.
 fn decide_table<'tcx>(tcx: TyCtxt<'tcx>) -> Result<decision::DecisionTable, String> {
     decide_table_perturbed(tcx, |_| {})
+}
+
+/// Hard ceiling on revert rounds. Paired with the no-progress detector, never
+/// relied on alone: a cap that fires is a loop that stopped being understood.
+const MAX_REVERT_ROUNDS: usize = 8;
+
+/// Crate-relative form of a path, so a diagnostic from the TEMP COPY can be
+/// compared with a site recorded against the ORIGINAL tree.
+fn crate_relative(path: &str, crate_dir: Option<&std::path::Path>) -> String {
+    if let Some((_, tail)) = path.split_once("crat-verify") {
+        if let Some((_, rest)) = tail.split_once('/') {
+            return rest.to_owned();
+        }
+    }
+    if let Some(dir) = crate_dir {
+        if let Ok(rel) = std::path::Path::new(path).strip_prefix(dir) {
+            return rel.display().to_string();
+        }
+    }
+    path.to_owned()
+}
+
+/// Functions whose own rewrite is implicated by these diagnostics.
+///
+/// Attribution is by SPAN CONTAINMENT against each rewritten subject's own
+/// function. Direction is recorded on the diagnostic and reported, but is
+/// deliberately NOT consulted here: it is diagnostic, not a router — the
+/// no-progress detector decides escalation, so a mis-attribution is caught by
+/// measurement rather than pre-empted by a heuristic that could be wrong.
+fn attribute(
+    diags: &[verify::Diag],
+    sites: &[EmittedSite],
+    crate_dir: Option<&std::path::Path>,
+) -> std::collections::BTreeSet<String> {
+    let single_file = {
+        let mut files: Vec<&str> = sites.iter().map(|s| s.file.as_str()).collect();
+        files.sort_unstable();
+        files.dedup();
+        files.len() <= 1
+    };
+    let mut owners = std::collections::BTreeSet::new();
+    for diag in diags {
+        let diag_rel = crate_relative(&diag.file, crate_dir);
+        for site in sites {
+            let same_file =
+                single_file || crate_relative(&site.file, crate_dir) == diag_rel;
+            if same_file && site.lo_line <= diag.line && diag.line <= site.hi_line {
+                owners.insert(site.fn_path.clone());
+            }
+        }
+    }
+    owners
 }
 
 /// Where a rewritten subject's own function lives, for attributing a verify

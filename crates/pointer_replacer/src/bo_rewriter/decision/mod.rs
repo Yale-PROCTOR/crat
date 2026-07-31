@@ -116,6 +116,16 @@ pub(crate) struct Subject {
 /// transition invisible in the data.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum DegradeReason {
+    /// The verify loop took this subject's rewrite back after the emitted crate
+    /// failed to type-check, and its own function was attributed the error.
+    ///
+    /// **Its own reason key so the accounting identity survives the loop:** a
+    /// reverted subject moves from emitted to degraded, keeping
+    /// `emitted_final + degraded == row count`. Folding it into an existing
+    /// reason would make a loop-driven revert indistinguishable from a
+    /// decision-phase degradation, which is a different thing entirely — the
+    /// decision stands; only the emission was withdrawn.
+    RevertedAfterVerifyFailure,
     /// BO decided the slot is a raw pointer; leaving the source alone is the
     /// decision, not a failure.
     KindRaw,
@@ -160,6 +170,7 @@ impl DegradeReason {
     )]
     pub(crate) fn key(&self) -> &'static str {
         match self {
+            DegradeReason::RevertedAfterVerifyFailure => "reverted-after-verify-failure",
             DegradeReason::KindRaw => "kind-raw",
             DegradeReason::KindOwning => "kind-owning",
             DegradeReason::RawPointerOperation { .. } => "raw-pointer-operation",

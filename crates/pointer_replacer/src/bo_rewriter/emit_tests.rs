@@ -380,72 +380,114 @@ fn rgba_smoke_emits_and_verifies_from_a_temp_copy() {
     }
 }
 
-/// **S2b.0 instrument repair.** A crate that FAILS the gate still reports what
-/// it attempted.
+/// **S2b.1.2 RED — the batch revert loop.** A crate with one GOOD rewrite and
+/// one that breaks type-checking: the bad one is taken back, the good one
+/// survives, and the crate emits.
 ///
-/// S2b.0's first sweep reported `emitted=0` for all ten failing programs,
-/// because the `Degraded` arm carried no counts — so the corpus emission yield
-/// was an undercount and the span-bucket axis was blocked outright. The failing
-/// programs had of course emitted subjects; that is what broke their crates.
+/// This is the whole point of the per-function gate. Under the old whole-crate
+/// verdict this crate produced NOTHING — one bad subject discarded every good
+/// rewrite in the program, which S2b.0 measured as 10 of 20 corpus programs.
 ///
-/// The fixture mirrors `ht`'s real shape: a rewritten parameter stored into a
-/// raw-pointer struct field.
+/// `bad.rs` mirrors `ht`'s real corpus shape (a rewritten parameter stored into
+/// a raw-pointer struct field); `good.rs` mirrors `g01`.
 ///
-/// *Mutation-tested, Rider 0 order.* **Deletion first:** re-zero the `Degraded`
-/// arm (`emitted_count: 0`, `emitted_sites: Vec::new()`) and this fails.
+/// *Mutation-tested, Rider 0 order.* **Deletion first:** remove
+/// `reverted.extend(newly)` so nothing is ever taken back — the loop makes no
+/// progress, escalates, and this fails.
 #[test]
-fn a_crate_that_fails_the_gate_still_reports_what_it_attempted() {
+fn a_bad_rewrite_is_reverted_and_the_good_one_survives() {
     let fixture = Fixture::new(&[
-        ("lib.rs", "#![allow(dead_code, unused_unsafe)]\npub mod m;\n"),
-        (
-            "m.rs",
-            "pub struct Holder {\n    pub slot: *mut i32,\n}\npub unsafe fn stash(value: *mut i32, holder: *mut Holder) {\n    (*holder).slot = value;\n}\n",
-        ),
+        ("lib.rs", "#![allow(dead_code, unused_unsafe)]\npub mod good;\npub mod bad;\n"),
+        ("good.rs", "pub unsafe fn bump(p: *mut i32) -> i32 {\n    *p += 1;\n    *p\n}\n"),
+        ("bad.rs", BREAKS_ON_REWRITE),
     ]);
 
     match super::rewrite_m1_path(&fixture.root()) {
-        super::RewriteOutcome::Degraded {
+        super::RewriteOutcome::Emitted {
+            files,
             emitted_count,
-            files_touched,
-            emitted_sites,
-            reason,
+            degradations,
             ..
         } => {
+            let reverted: Vec<_> = degradations
+                .iter()
+                .filter(|d| {
+                    d.reason == super::decision::DegradeReason::RevertedAfterVerifyFailure
+                })
+                .collect();
             assert!(
-                reason.contains("type-check gate"),
-                "this witness needs a GATE failure, got: {reason}"
+                !reverted.is_empty(),
+                "nothing was recorded as reverted, so the crate passed for some \
+                 other reason: {degradations:?}"
             );
             assert!(
                 emitted_count >= 1,
-                "a failing crate reported {emitted_count} emitted subjects — the \
-                 attempt is unobservable and the yield figure is an undercount"
+                "the GOOD rewrite was discarded too — the loop reverted more \
+                 than the error attributed"
             );
-            assert!(files_touched >= 1, "files_touched was zeroed: {files_touched}");
+            let good = files
+                .iter()
+                .find(|(k, _)| format!("{k:?}").contains("good.rs"))
+                .map(|(_, text)| text.clone())
+                .expect("good.rs was emitted");
             assert!(
-                !emitted_sites.is_empty(),
-                "no emitted sites recorded — the span-bucket axis stays blocked"
+                good.contains("p: &mut i32"),
+                "the good rewrite did not survive: {good}"
             );
-            let site = &emitted_sites[0];
+            let bad = files.iter().find(|(k, _)| format!("{k:?}").contains("bad.rs"));
             assert!(
-                site.fn_path.contains("stash"),
-                "site does not name the rewritten subject's own fn: {site:?}"
-            );
-            // THE EXTENT MUST COVER THE BODY. `stash` is declared on line 4 of
-            // `m.rs` and the offending store is on line 5. A signature-only span
-            // measures 4..4, so every diagnostic falls outside every extent and
-            // the own-fn bucket can only ever report zero — which is exactly
-            // what the first re-sweep produced, uniformly and plausibly.
-            assert!(
-                site.lo_line <= 5 && 5 <= site.hi_line,
-                "the fn extent {}..{} does not contain its own body line 5 — the \
-                 own-fn bucket would be unfailable by construction: {site:?}",
-                site.lo_line,
-                site.hi_line
+                bad.is_none_or(|(_, text)| !text.contains("value: &")),
+                "the bad rewrite survived the revert: {bad:?}"
             );
         }
-        super::RewriteOutcome::Emitted { .. } => {
-            panic!("the fixture must FAIL the gate for this witness to mean anything")
+        super::RewriteOutcome::Degraded { reason, .. } => {
+            panic!("the loop failed to recover a partially-bad crate: {reason}")
         }
+    }
+}
+
+/// **S2b.1.2 RED — ACCOUNTING through the loop.** A reverted subject moves from
+/// emitted to degraded under its own reason key, so
+/// `emitted_final + degraded` still equals the subject count.
+///
+/// *Mutation-tested, Rider 0 order.* **Deletion first:** stop pushing the
+/// `RevertedAfterVerifyFailure` degradations and this fails — the identity
+/// loses exactly the reverted subjects.
+#[test]
+fn the_accounting_identity_survives_a_revert() {
+    let fixture = Fixture::new(&[
+        ("lib.rs", "#![allow(dead_code, unused_unsafe)]\npub mod good;\npub mod bad;\n"),
+        ("good.rs", "pub unsafe fn bump(p: *mut i32) -> i32 {\n    *p += 1;\n    *p\n}\n"),
+        ("bad.rs", BREAKS_ON_REWRITE),
+    ]);
+    // Subject count from a NO-LOOP emission: what the decision phase decided,
+    // which the loop must not change.
+    let subjects = {
+        let emission = emit(&fixture);
+        emission.plan.by_file.values().map(Vec::len).sum::<usize>()
+            + emission.unplaceable.len()
+    };
+
+    match super::rewrite_m1_path(&fixture.root()) {
+        super::RewriteOutcome::Emitted {
+            emitted_count,
+            degradations,
+            ..
+        } => {
+            let reverted = degradations
+                .iter()
+                .filter(|d| {
+                    d.reason == super::decision::DegradeReason::RevertedAfterVerifyFailure
+                })
+                .count();
+            assert_eq!(
+                emitted_count + reverted,
+                subjects,
+                "emitted {emitted_count} + reverted {reverted} != {subjects} \
+                 planned subjects — the loop lost or invented one"
+            );
+        }
+        super::RewriteOutcome::Degraded { reason, .. } => panic!("{reason}"),
     }
 }
 
