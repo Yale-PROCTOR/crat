@@ -286,3 +286,96 @@ fn materializing_never_touches_the_original_tree() {
         "the input tree was modified by emit+verify; the frozen corpus would be next"
     );
 }
+
+// ---------------------------------------------------------------------------
+// S2b.0a.4 — CORPUS SMOKE. First contact between emission and a real
+// multi-file program. rgba is the smallest genuinely CROSS-FILE program in the
+// frozen corpus (14 subject rows over 2 files); bst and avl are multi-file
+// crates whose subjects all sit in one file, so they would not exercise
+// grouping at all.
+//
+// Guards, per ruling: temp copies only, and the frozen tree is asserted
+// byte-identical afterwards. The corpus-wide digest is checked by the
+// invocation around this test.
+// ---------------------------------------------------------------------------
+
+/// Bytes of every `.rs` file under `dir`, by path.
+fn tree_snapshot(dir: &std::path::Path) -> BTreeMap<PathBuf, Vec<u8>> {
+    fn walk(dir: &std::path::Path, out: &mut BTreeMap<PathBuf, Vec<u8>>) {
+        for entry in fs::read_dir(dir).expect("corpus dir readable") {
+            let entry = entry.expect("corpus entry");
+            let path = entry.path();
+            if entry.file_type().expect("file type").is_dir() {
+                walk(&path, out);
+            } else {
+                out.insert(path.clone(), fs::read(&path).expect("corpus file readable"));
+            }
+        }
+    }
+    let mut out = BTreeMap::new();
+    walk(dir, &mut out);
+    out
+}
+
+#[test]
+#[ignore = "S2b.0a.4 corpus smoke: reads the frozen rs-crown tree"]
+fn rgba_smoke_emits_and_verifies_from_a_temp_copy() {
+    let crate_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../benchmarks/rs-crown/rgba");
+    let root = crate_dir.join("lib.rs");
+    assert!(root.is_file(), "frozen corpus input missing: {root:?}");
+
+    let before = tree_snapshot(&crate_dir);
+    let outcome = super::rewrite_m1_path(&root);
+    let after = tree_snapshot(&crate_dir);
+
+    assert_eq!(
+        before, after,
+        "THE FROZEN CORPUS WAS MODIFIED by an emission run — temp copies only"
+    );
+
+    match outcome {
+        super::RewriteOutcome::Emitted {
+            files,
+            emitted_count,
+            degradations,
+            unplaceable,
+            ..
+        } => {
+            println!(
+                "RGBA-SMOKE emitted_count={emitted_count} files_touched={} \
+                 degradations={} unplaceable={}",
+                files.len(),
+                degradations.len(),
+                unplaceable.len()
+            );
+            for key in files.keys() {
+                println!("RGBA-SMOKE file={key:?}");
+            }
+            assert!(
+                unplaceable.is_empty(),
+                "unplaceable is expected-zero on this corpus: {unplaceable:?}"
+            );
+            // The POINT of this smoke: emission reached more than one file of a
+            // real program. Without these two, the witness passes on an
+            // emission that touched nothing — the outcome-counting shape that
+            // has already cost two repairs in this slice sequence.
+            assert!(
+                emitted_count >= 1,
+                "the smoke must emit at least one subject, not merely succeed"
+            );
+            assert!(
+                files.len() >= 2,
+                "rgba's subjects span two files; a run that touched {} file(s) \
+                 did not exercise cross-file emission at all",
+                files.len()
+            );
+        }
+        super::RewriteOutcome::Degraded { reason, degradations, .. } => {
+            panic!(
+                "rgba did not emit: {reason} ({} degradation(s))",
+                degradations.len()
+            );
+        }
+    }
+}
