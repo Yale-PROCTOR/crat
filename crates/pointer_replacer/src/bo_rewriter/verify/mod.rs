@@ -213,6 +213,13 @@ pub(crate) struct Diag {
 }
 
 #[derive(Clone, Debug, Default)]
+#[allow(
+    dead_code,
+    reason = "`diags` and `unrenderable` are read by S2b.1.2's revert loop, \
+              which is the next slice; `errors` is live now through \
+              `type_checks_crate`. Correct this reason when 1.2 lands rather \
+              than leaving it standing."
+)]
 pub(crate) struct Diagnosis {
     /// Error-level diagnostics, counted from `Level` **alone**.
     pub errors: usize,
@@ -223,6 +230,11 @@ pub(crate) struct Diagnosis {
     pub diags: Vec<Diag>,
     /// Counted diagnostics that carried no `Str` content. Loud rather than
     /// silent: the text degraded, the count did not.
+    ///
+    /// **Currently unexercised**: both probed error kinds (E0308 mismatch, E0425
+    /// unresolved name) carry `Str` messages, so no fixture yet drives this
+    /// above zero. Recorded as a fixture gap rather than given a witness that
+    /// could not fail.
     pub unrenderable: usize,
 }
 
