@@ -105,6 +105,15 @@ pub(crate) enum RewriteOutcome {
         /// while the ledger claimed they "flow into S2b's counters".
         excluded: decision::universe::Excluded,
         emitted_sites: Vec<EmittedSite>,
+        /// Bisect probes spent. **0 means the revert loop converged on its own**;
+        /// nonzero means attribution failed, the detector fired, and (C) found
+        /// the culprit the containing-function heuristic could not.
+        bisect_probes: usize,
+        /// Why the loop escalated, when it did. `None` means it never had to.
+        /// Carried on the SUCCESS outcome because a crate recovered by bisect is
+        /// still a crate whose attribution was wrong — collapsing that into a
+        /// plain success would hide the very case (C) exists for.
+        escalated: Option<String>,
         /// Decisions that could not be turned into a placed edit — a
         /// macro-generated span, a span straddling two files, a file with no
         /// editable identity. Carried out for the same reason as `excluded`:
@@ -126,6 +135,8 @@ pub(crate) enum RewriteOutcome {
         /// The rewritten subjects' own functions, so a verify diagnostic can be
         /// attributed to one.
         emitted_sites: Vec<EmittedSite>,
+        /// Bisect probes spent before giving up.
+        bisect_probes: usize,
     },
 }
 
@@ -184,6 +195,42 @@ pub(crate) fn rewrite_m1_path(root: &std::path::Path) -> RewriteOutcome {
 /// report whose values permute between runs is not comparable. Compiling the
 /// string as `<main.rs>` keeps attribution stable, and the emission logic below
 /// is shared regardless, which is what the one-path ruling is actually about.
+/// **(C) — threshold bisect.** Escalation path when attribution is wrong.
+///
+/// Binary-searches the smallest `k` such that reverting the first `k` candidates
+/// (in deterministic sorted order) makes the crate compile. Reverting ALL of
+/// them always compiles — that is the original program — so the search always
+/// terminates, in `ceil(log2(n+1))` probes.
+///
+/// **NOT minimal-set ddmin, and deliberately so.** The result depends on the
+/// candidate order, so it may revert more than strictly necessary. What it buys
+/// is a bounded, terminating escalation that does not trust attribution — which
+/// is exactly what the detector escalated for. A minimal-set search is
+/// `O(n log n)` probes in the bad case, and at brotli's 566 s per compile that
+/// is not affordable; the non-minimality is the price of the budget.
+fn bisect(
+    candidates: &[String],
+    base: &std::collections::BTreeSet<String>,
+    mut compiles: impl FnMut(&std::collections::BTreeSet<String>) -> bool,
+) -> (std::collections::BTreeSet<String>, usize) {
+    let (mut lo, mut hi) = (0usize, candidates.len());
+    let mut probes = 0usize;
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        let mut trial = base.clone();
+        trial.extend(candidates[..mid].iter().cloned());
+        probes += 1;
+        if compiles(&trial) {
+            hi = mid;
+        } else {
+            lo = mid + 1;
+        }
+    }
+    let mut result = base.clone();
+    result.extend(candidates[..lo].iter().cloned());
+    (result, probes)
+}
+
 /// Test-only entry that lowers the round cap, so the CAP arm of the dual
 /// termination can be witnessed without manufacturing a looping fixture.
 /// A parameter rather than an env knob: no production seam.
@@ -353,6 +400,7 @@ fn rewrite_core_injected(
             let mut files = files;
             let mut rounds = 0usize;
             let mut previous_errors: Option<usize> = None;
+            let mut probe_secs = 0.0f64;
             let escalation: Option<String>;
 
             loop {
@@ -370,10 +418,13 @@ fn rewrite_core_injected(
                             emitted_count,
                             files_touched: files.len(),
                             emitted_sites,
+                            bisect_probes: 0,
                         };
                     }
                 };
+                let probe_started = std::time::Instant::now();
                 let diagnosis = verify::diagnose_crate(staged.root());
+                probe_secs = probe_secs.max(probe_started.elapsed().as_secs_f64());
                 if diagnosis.errors == 0 {
                     escalation = None;
                     // Read back from the MATERIALIZED copy, so the bytes
@@ -401,6 +452,8 @@ fn rewrite_core_injected(
                         emitted_count: kept.len(),
                         excluded,
                         emitted_sites,
+                        bisect_probes: 0,
+                        escalated: None,
                         unplaceable,
                     };
                 }
@@ -456,13 +509,102 @@ fn rewrite_core_injected(
                 files = next_files;
             }
 
-            RewriteOutcome::Degraded {
-                reason: escalation.unwrap_or_else(|| "escalation-required".to_owned()),
-                degradations,
-                excluded,
-                emitted_count,
-                files_touched: files.len(),
-                emitted_sites,
+            // ---- (C) BISECT: the escalation path ----
+            let escalation = escalation.unwrap_or_else(|| "escalation-required".to_owned());
+            let candidates: Vec<String> = emitted_sites
+                .iter()
+                .map(|site| site.fn_path.clone())
+                .filter(|owner| !reverted.contains(owner))
+                .collect::<std::collections::BTreeSet<_>>()
+                .into_iter()
+                .collect();
+
+            // ESCALATION BUDGET. A bisect that cannot finish inside the worker
+            // budget is DEFERRED LOUDLY with its attribution state, never
+            // silently truncated — a truncated bisect returns a wrong answer
+            // that looks like a right one.
+            let projected = (candidates.len() + 1).next_power_of_two().trailing_zeros() as f64;
+            let budget_secs = std::env::var("CRAT_BOC1_EMIT_TIMEOUT_SECS")
+                .ok()
+                .and_then(|v| v.parse::<f64>().ok())
+                .unwrap_or(900.0);
+            if projected * probe_secs > budget_secs {
+                return RewriteOutcome::Degraded {
+                    reason: format!(
+                        "escalation-deferred: {escalation}; bisect needs ~{projected} probe(s)                          at ~{probe_secs:.1}s each against a {budget_secs:.0}s budget, with                          {} function(s) already reverted",
+                        reverted.len()
+                    ),
+                    degradations,
+                    excluded,
+                    emitted_count,
+                    files_touched: files.len(),
+                    emitted_sites,
+                    bisect_probes: 0,
+                };
+            }
+
+            let mut staged_keep: Option<verify::TempCrate> = None;
+            let (final_reverted, probes) = bisect(&candidates, &reverted, |trial| {
+                let (trial_files, rollbacks) = render(&emission_plan, &emission_texts, trial);
+                if !rollbacks.is_empty() {
+                    return false;
+                }
+                let materialized = match tree_base {
+                    Some(root) => verify::materialize(root, &trial_files),
+                    None => verify::materialize_single_file(&root_text),
+                };
+                let Ok(staged) = materialized else {
+                    return false;
+                };
+                let clean = verify::diagnose_crate(staged.root()).errors == 0;
+                if clean {
+                    staged_keep = Some(staged);
+                }
+                clean
+            });
+
+            let (final_files, rollbacks) =
+                render(&emission_plan, &emission_texts, &final_reverted);
+            let materialized = match tree_base {
+                Some(root) => verify::materialize(root, &final_files),
+                None => verify::materialize_single_file(&root_text),
+            };
+            let _ = &staged_keep;
+            match materialized {
+                Ok(staged) if rollbacks.is_empty() && verify::type_checks_crate(staged.root()) => {
+                    let source = std::fs::read_to_string(staged.root()).unwrap_or_default();
+                    let (kept, taken): (Vec<_>, Vec<_>) = emitted_subjects
+                        .iter()
+                        .partition(|(owner, _, _)| !final_reverted.contains(owner));
+                    let mut degradations = degradations;
+                    for (_, subject, site) in &taken {
+                        degradations.push(decision::Degradation {
+                            subject: subject.clone(),
+                            site: site.clone(),
+                            reason: decision::DegradeReason::RevertedAfterVerifyFailure,
+                        });
+                    }
+                    RewriteOutcome::Emitted {
+                        source,
+                        files: final_files,
+                        degradations,
+                        emitted_count: kept.len(),
+                        excluded,
+                        emitted_sites,
+                        bisect_probes: probes,
+                        escalated: Some(escalation.clone()),
+                        unplaceable,
+                    }
+                }
+                _ => RewriteOutcome::Degraded {
+                    reason: format!("{escalation}; bisect did not recover the crate"),
+                    degradations,
+                    excluded,
+                    emitted_count,
+                    files_touched: files.len(),
+                    emitted_sites,
+                    bisect_probes: probes,
+                },
             }
         }
         Ok(Err(reason)) => RewriteOutcome::Degraded {
@@ -472,6 +614,7 @@ fn rewrite_core_injected(
             emitted_count: 0,
             files_touched: 0,
             emitted_sites: Vec::new(),
+            bisect_probes: 0,
         },
         Err(_) => RewriteOutcome::Degraded {
             reason: "input crate did not compile".to_owned(),
@@ -480,6 +623,7 @@ fn rewrite_core_injected(
             emitted_count: 0,
             files_touched: 0,
             emitted_sites: Vec::new(),
+            bisect_probes: 0,
         },
     }
 }

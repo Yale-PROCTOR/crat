@@ -631,14 +631,16 @@ fn the_round_cap_stops_the_loop() {
         ("bad.rs", BREAKS_ON_REWRITE),
     ]);
     match super::rewrite_m1_path_with_cap(&fixture.root(), 0) {
-        super::RewriteOutcome::Degraded { reason, .. } => {
+        super::RewriteOutcome::Emitted { escalated, bisect_probes, .. } => {
+            let reason = escalated.expect("the cap must have escalated");
             assert!(
                 reason.contains("round cap"),
                 "escalated for the wrong reason: {reason}"
             );
+            assert!(bisect_probes > 0, "escalation did not reach bisect");
         }
-        super::RewriteOutcome::Emitted { .. } => {
-            panic!("the loop ran a revert round despite a cap of 0")
+        super::RewriteOutcome::Degraded { reason, .. } => {
+            panic!("bisect failed to recover after the cap fired: {reason}")
         }
     }
 }
@@ -693,19 +695,22 @@ fn the_no_progress_detector_escalates_when_attribution_is_wrong() {
         ("m.rs", INVERTED),
     ]);
     match super::rewrite_m1_path_injected(&fixture.root(), 8, &keep_r_raw) {
-        super::RewriteOutcome::Degraded { reason, .. } => {
+        super::RewriteOutcome::Emitted { escalated, bisect_probes, .. } => {
+            let reason = escalated.expect(
+                "the loop converged on a shape whose culprit it cannot \
+                 attribute — attribution silently got away with it",
+            );
             assert!(
                 reason.contains("no progress"),
                 "escalated, but not via the detector: {reason}"
             );
             assert!(
-                reason.contains("bisect"),
-                "the escalation must name its successor mechanism: {reason}"
+                bisect_probes > 0,
+                "the detector fired but (C) never ran: {reason}"
             );
         }
-        super::RewriteOutcome::Emitted { emitted_count, .. } => panic!(
-            "the loop converged on a shape whose culprit it cannot attribute \
-             (emitted {emitted_count}) — attribution silently got away with it"
-        ),
+        super::RewriteOutcome::Degraded { reason, .. } => {
+            panic!("bisect failed to recover the inverted shape: {reason}")
+        }
     }
 }
