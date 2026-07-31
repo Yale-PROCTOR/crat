@@ -80,10 +80,12 @@ fn scan_root(
         "no .rs files found under {root:?} — the scan would pass vacuously"
     );
     let mut hits = Vec::new();
+    let mut scanned = 0usize;
     for file in &files {
         if skip(file) {
             continue;
         }
+        scanned += 1;
         let text = fs::read_to_string(file)
             .unwrap_or_else(|e| panic!("source unreadable at {file:?}: {e}"));
         for (index, line) in text.lines().enumerate() {
@@ -99,6 +101,16 @@ fn scan_root(
             }
         }
     }
+    // The `files.is_empty()` assert above runs BEFORE `skip`, so an over-broad
+    // skip predicate left every production scan examining nothing and reporting
+    // clean — permanently. Measured 2026-07-31: making
+    // `is_denylist_self_reference` match every file kept all 20 tests in this
+    // module green. Asserting SURVIVORS converts every caller at one site.
+    assert!(
+        scanned > 0,
+        "every file under {root:?} was skipped — the scan examined nothing and \
+         would report clean regardless of what the sources contain"
+    );
     hits
 }
 
@@ -820,10 +832,12 @@ fn emission_call_sites(root: &Path, skip: &dyn Fn(&Path) -> bool) -> Vec<String>
         "no .rs files found under {root:?} — the scan would pass vacuously"
     );
     let mut hits = Vec::new();
+    let mut scanned = 0usize;
     for file in &files {
         if skip(file) {
             continue;
         }
+        scanned += 1;
         let text = fs::read_to_string(file)
             .unwrap_or_else(|e| panic!("source unreadable at {file:?}: {e}"));
         // Stop at an inline `#[cfg(test)] mod x {` BLOCK, not at a
@@ -853,6 +867,10 @@ fn emission_call_sites(root: &Path, skip: &dyn Fn(&Path) -> bool) -> Vec<String>
             }
         }
     }
+    assert!(
+        scanned > 0,
+        "every file under {root:?} was skipped — the scan examined nothing"
+    );
     hits
 }
 
