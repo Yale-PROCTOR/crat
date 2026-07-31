@@ -448,3 +448,109 @@ fn a_crate_that_fails_the_gate_still_reports_what_it_attempted() {
         }
     }
 }
+
+
+// ---------------------------------------------------------------------------
+// S2b.1.1 witnesses — structural diagnostic capture. FIXTURE-VALIDATED; the
+// cross-check against the rendered parser's 86 corpus diagnostics runs at 1.4.
+// ---------------------------------------------------------------------------
+
+/// The two-file crate whose rewrite breaks it, mirroring `ht`'s corpus shape:
+/// a rewritten parameter stored into a raw-pointer struct field.
+const BREAKS_ON_REWRITE: &str = "pub struct Holder {\n    pub slot: *mut i32,\n}\npub unsafe fn stash(value: *mut i32, holder: *mut Holder) {\n    (*holder).slot = value;\n}\n";
+
+fn diagnose_after_rewrite(files: &[(&str, &str)]) -> (verify::Diagnosis, Fixture) {
+    let fixture = Fixture::new(files);
+    let emission = emit(&fixture);
+    let temp = verify::materialize(&fixture.root(), &emission.files).expect("materialize");
+    let diagnosis = verify::diagnose_crate(temp.root());
+    (diagnosis, fixture)
+}
+
+/// **RED.** A type error is located structurally — file and line, straight from
+/// the diagnostic's primary span, with no rendered text parsed.
+///
+/// *Mutation-tested, Rider 0 order.* **Deletion first:** remove the
+/// `diags.lock().push(..)` in `Capture::emit_diagnostic` and this fails.
+#[test]
+fn structural_capture_locates_a_type_error() {
+    let (d, _fixture) = diagnose_after_rewrite(&[
+        ("lib.rs", "#![allow(dead_code, unused_unsafe)]\npub mod m;\n"),
+        ("m.rs", BREAKS_ON_REWRITE),
+    ]);
+    assert_eq!(d.diags.len(), 1, "expected one located diagnostic: {d:?}");
+    assert_eq!(d.diags[0].line, 5, "the store is on line 5: {:?}", d.diags[0]);
+    assert!(
+        d.diags[0].file.ends_with("m.rs"),
+        "located in the wrong file: {:?}",
+        d.diags[0]
+    );
+}
+
+/// **RED — COUNT INDEPENDENCE.** The error count comes from `Level` alone, never
+/// from extraction. rustc emits a spanless error-level summary alongside the
+/// located error, so the counts genuinely differ: **2 counted, 1 located**.
+///
+/// That gap is what makes this witness able to fail at all — without a naturally
+/// spanless diagnostic, `errors == diags.len()` would hold either way and the
+/// mutation below would be ineffective.
+///
+/// *Mutation-tested, Rider 0 order.* **Deletion first:** derive the count from
+/// extraction (`errors: diags.len()`) and this fails, 1 against 2.
+#[test]
+fn the_error_count_comes_from_level_not_from_extraction() {
+    let (d, _fixture) = diagnose_after_rewrite(&[
+        ("lib.rs", "#![allow(dead_code, unused_unsafe)]\npub mod m;\n"),
+        ("m.rs", BREAKS_ON_REWRITE),
+    ]);
+    assert_eq!(d.errors, 2, "error count must come from Level: {d:?}");
+    assert_eq!(
+        d.diags.len(),
+        1,
+        "one of the two errors is spanless and cannot be located — that is \
+         precisely why the count must not be derived from extraction: {d:?}"
+    );
+    assert!(
+        d.errors > d.diags.len(),
+        "a dropped diagnostic would lower the count and fake progress for the \
+         no-progress detector"
+    );
+}
+
+/// **RED.** Direction is what distinguishes whose rewrite caused the error;
+/// containment only says where it is.
+///
+/// *Mutation-tested, Rider 0 order.* **Deletion first:** swap the two arms of
+/// `classify` and this fails.
+#[test]
+fn direction_identifies_a_rewritten_value_flowing_into_a_raw_context() {
+    let (d, _fixture) = diagnose_after_rewrite(&[
+        ("lib.rs", "#![allow(dead_code, unused_unsafe)]\npub mod m;\n"),
+        ("m.rs", BREAKS_ON_REWRITE),
+    ]);
+    assert_eq!(
+        d.diags[0].direction,
+        verify::Direction::RewrittenIntoRaw,
+        "the rewritten parameter flows INTO a raw context, so the containing \
+         function's own rewrite is the culprit: {:?}",
+        d.diags[0]
+    );
+}
+
+/// **Non-vacuity.** A crate that type-checks yields no errors and no
+/// diagnostics — without this, every count above is compatible with a capture
+/// that reports errors unconditionally.
+///
+/// *Mutation-tested, Rider 0 order.* **Deletion first:** drop the `Level` filter
+/// in `emit_diagnostic` (count warnings too) and this fails — the fixture emits
+/// warnings.
+#[test]
+fn a_clean_crate_yields_no_diagnostics() {
+    let (d, _fixture) = diagnose_after_rewrite(&[
+        ("lib.rs", ROOT_WITH_MODULE),
+        ("m.rs", MODULE_SUBJECT),
+    ]);
+    assert_eq!(d.errors, 0, "a clean rewrite reported errors: {d:?}");
+    assert!(d.diags.is_empty(), "{d:?}");
+    assert_eq!(d.unrenderable, 0, "{d:?}");
+}

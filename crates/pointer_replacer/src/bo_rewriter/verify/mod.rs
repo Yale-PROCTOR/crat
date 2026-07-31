@@ -40,10 +40,10 @@ use super::plan::FileKey;
               note from a dated promise that came due and did not settle."
 )]
 pub(crate) fn type_checks_crate(root: &Path) -> bool {
-    ::utils::compilation::run_compiler_on_path(root, |tcx| {
-        ::utils::type_check(tcx);
-    })
-    .is_ok()
+    // Routed through `diagnose_crate` so there is ONE diagnostic path. A gate
+    // that counted errors differently from the loop that attributes them would
+    // be two sources of truth about the same compile.
+    diagnose_crate(root).errors == 0
 }
 
 static NEXT_TEMP: AtomicUsize = AtomicUsize::new(0);
@@ -160,4 +160,168 @@ pub(crate) fn materialize_single_file(source: &str) -> io::Result<TempCrate> {
     let root = dir.join("lib.rs");
     fs::write(&root, source)?;
     Ok(TempCrate { dir, root })
+}
+
+// ---------------------------------------------------------------------------
+// S2b.1.1 — STRUCTURAL diagnostic capture.
+//
+// Extracted from `DiagInner`, not from rendered text: eliminating the
+// parse-failure class beats guarding it. A dropped diagnostic would lower the
+// error count and fake progress for 1.2's no-progress detector, so the COUNT is
+// derived from `Level` ALONE — an unrenderable message degrades the TEXT, never
+// the COUNT.
+//
+// **FIXTURE-VALIDATED.** This path does NOT inherit the rendered parser's
+// 86-diagnostic corpus credit; the cross-check against it runs at 1.4.
+// ---------------------------------------------------------------------------
+
+/// Which way a type error points — what distinguishes *whose* rewrite caused it.
+/// Span containment alone cannot.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Direction {
+    /// `expected raw pointer, found reference` — a rewritten value flowing into
+    /// an unrewritten context, so the CONTAINING function's own rewrite is the
+    /// culprit and reverting it fixes the error.
+    RewrittenIntoRaw,
+    /// `expected reference, found raw pointer` — a rewritten CALLEE with an
+    /// unrewritten caller. Reverting the containing function does NOT fix it.
+    /// Measured once corpus-wide, on heman.
+    RawIntoRewritten,
+    Other,
+}
+
+fn classify(message: &str) -> Direction {
+    let expects_raw = message.contains("expected raw pointer");
+    let found_ref = message.contains("found reference") || message.contains("found `&");
+    let expects_ref = message.contains("expected reference") || message.contains("expected `&");
+    let found_raw = message.contains("found raw pointer");
+    if expects_raw && found_ref {
+        Direction::RewrittenIntoRaw
+    } else if expects_ref && found_raw {
+        Direction::RawIntoRewritten
+    } else {
+        Direction::Other
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Diag {
+    pub file: String,
+    pub line: usize,
+    pub message: String,
+    pub direction: Direction,
+}
+
+#[derive(Clone, Debug, Default)]
+pub(crate) struct Diagnosis {
+    /// Error-level diagnostics, counted from `Level` **alone**.
+    pub errors: usize,
+    /// Located diagnostics. **Fewer than `errors` in practice**: rustc emits a
+    /// spanless error-level summary ("aborting due to N previous errors") that
+    /// is counted and not located. Measured 2 vs 1 on the fixture below, which
+    /// is what makes the count-independence witness able to fail.
+    pub diags: Vec<Diag>,
+    /// Counted diagnostics that carried no `Str` content. Loud rather than
+    /// silent: the text degraded, the count did not.
+    pub unrenderable: usize,
+}
+
+struct Capture {
+    diags: std::sync::Arc<std::sync::Mutex<Vec<Diag>>>,
+    errors: std::sync::Arc<std::sync::Mutex<usize>>,
+    unrenderable: std::sync::Arc<std::sync::Mutex<usize>>,
+    source_map: std::sync::Arc<rustc_span::source_map::SourceMap>,
+    /// **Measured unreached in this design** (setting it to `unimplemented!()`
+    /// does not panic, because nothing here delegates to an inner emitter).
+    /// Kept because the trait requires the method and a future emission path
+    /// may call it — but deliberately NOT given a witness: no mutation of it
+    /// can fail, so a witness would be a manufactured one. Stated control.
+    translator: rustc_errors::translation::Translator,
+}
+
+impl rustc_errors::emitter::Emitter for Capture {
+    fn source_map(&self) -> Option<&rustc_span::source_map::SourceMap> {
+        Some(&self.source_map)
+    }
+
+    fn translator(&self) -> &rustc_errors::translation::Translator {
+        &self.translator
+    }
+
+    fn emit_diagnostic(
+        &mut self,
+        diag: rustc_errors::DiagInner,
+        _registry: &rustc_errors::registry::Registry,
+    ) {
+        if !matches!(
+            diag.level(),
+            rustc_errors::Level::Fatal | rustc_errors::Level::Error
+        ) {
+            return;
+        }
+        // COUNT FIRST, from Level alone. Nothing below can reduce it.
+        *self.errors.lock().unwrap() += 1;
+
+        let mut message = String::new();
+        for (msg, _) in &diag.messages {
+            if let rustc_errors::DiagMessage::Str(text) = msg {
+                message.push_str(text);
+            }
+        }
+        for child in &diag.children {
+            for (msg, _) in &child.messages {
+                if let rustc_errors::DiagMessage::Str(text) = msg {
+                    message.push(' ');
+                    message.push_str(text);
+                }
+            }
+        }
+        if message.is_empty() {
+            *self.unrenderable.lock().unwrap() += 1;
+        }
+        if let Some(span) = diag.span.primary_span() {
+            let loc = self.source_map.lookup_char_pos(span.lo());
+            let direction = classify(&message);
+            self.diags.lock().unwrap().push(Diag {
+                file: loc.file.name.prefer_local().to_string(),
+                line: loc.line,
+                message,
+                direction,
+            });
+        }
+    }
+}
+
+/// Type-check the crate at `root` and return its error-level diagnostics.
+pub(crate) fn diagnose_crate(root: &Path) -> Diagnosis {
+    let diags = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let errors = std::sync::Arc::new(std::sync::Mutex::new(0usize));
+    let unrenderable = std::sync::Arc::new(std::sync::Mutex::new(0usize));
+
+    let mut config = ::utils::compilation::make_config(::utils::compilation::path_to_input(root));
+    let (d, e, u) = (diags.clone(), errors.clone(), unrenderable.clone());
+    config.psess_created = Some(Box::new(move |psess| {
+        let source_map = psess.clone_source_map();
+        psess.dcx().set_emitter(Box::new(Capture {
+            diags: d.clone(),
+            errors: e.clone(),
+            unrenderable: u.clone(),
+            source_map,
+            translator: rustc_driver::default_translator(),
+        }));
+    }));
+
+    let ran = ::utils::compilation::run_compiler(config, |tcx| {
+        ::utils::type_check(tcx);
+    });
+    let mut errors = *errors.lock().unwrap();
+    // A fatal abort that emitted nothing still means the crate failed.
+    if ran.is_err() && errors == 0 {
+        errors = 1;
+    }
+    Diagnosis {
+        errors,
+        diags: diags.lock().unwrap().clone(),
+        unrenderable: *unrenderable.lock().unwrap(),
+    }
 }
