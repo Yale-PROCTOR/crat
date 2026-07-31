@@ -41,6 +41,17 @@ pub(crate) fn type_checks(emitted: &str) -> bool {
 ///
 /// The gate stays **whole-crate** here by ruling — per-function granularity is
 /// S2b.1's business, after the measurement that chooses its mechanism.
+#[allow(
+    dead_code,
+    reason = "no NON-TEST consumer until 0a.3 routes `rewrite_m1` through the \
+              path-based flow; the string gate is still the live one. Targeted \
+              on the entry points rather than module-wide so the lint stays \
+              active over everything reachable from them — `TempCrate`, \
+              `copy_tree` and the counter are seeded live through these two. If \
+              0a.3 lands and this is still needed, CORRECT the reason rather \
+              than leaving it: this crate already carries one EXPIRY-CORRECTED \
+              note from a dated promise that came due and did not settle."
+)]
 pub(crate) fn type_checks_crate(root: &Path) -> bool {
     ::utils::compilation::run_compiler_on_path(root, |tcx| {
         ::utils::type_check(tcx);
@@ -92,6 +103,17 @@ fn copy_tree(from: &Path, to: &Path) -> io::Result<()> {
 
 /// Copy the crate rooted at `original_root`, then write the rewritten files into
 /// **the copy**. The original tree is never opened for writing.
+#[allow(
+    dead_code,
+    reason = "no NON-TEST consumer until 0a.3 routes `rewrite_m1` through the \
+              path-based flow; the string gate is still the live one. Targeted \
+              on the entry points rather than module-wide so the lint stays \
+              active over everything reachable from them — `TempCrate`, \
+              `copy_tree` and the counter are seeded live through these two. If \
+              0a.3 lands and this is still needed, CORRECT the reason rather \
+              than leaving it: this crate already carries one EXPIRY-CORRECTED \
+              note from a dated promise that came due and did not settle."
+)]
 pub(crate) fn materialize(
     original_root: &Path,
     files: &BTreeMap<FileKey, String>,
