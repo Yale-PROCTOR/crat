@@ -796,3 +796,151 @@ fn phase_scan_reports_a_synthetic_corpus_violation() {
 fn drop_corpus(dir: &Path) {
     let _ = fs::remove_dir_all(dir);
 }
+
+// ---------------------------------------------------------------------------
+// S2b.0a.3 — ONE EMISSION PATH.
+//
+// The ruling: the string entry point becomes a thin wrapper over the per-file
+// mechanism, or is retired; no second parallel emission path survives. A second
+// path is the hazard class this milestone exists to remove, because it would be
+// exercised by every test and by nothing real — which is exactly how M1's
+// single-source assumption reached first corpus contact undetected.
+//
+// Mechanized as: **no production code under `bo_rewriter/` compiles a crate
+// from a STRING.** `run_compiler_on_path` is the one compiler entry.
+// ---------------------------------------------------------------------------
+
+/// Non-comment lines under `root` that CALL the emission core, ignoring each
+/// file's inline `#[cfg(test)]` module and the definition itself.
+fn emission_call_sites(root: &Path, skip: &dyn Fn(&Path) -> bool) -> Vec<String> {
+    let mut files = Vec::new();
+    collect_rs_files(root, &mut files);
+    assert!(
+        !files.is_empty(),
+        "no .rs files found under {root:?} — the scan would pass vacuously"
+    );
+    let mut hits = Vec::new();
+    for file in &files {
+        if skip(file) {
+            continue;
+        }
+        let text = fs::read_to_string(file)
+            .unwrap_or_else(|e| panic!("source unreadable at {file:?}: {e}"));
+        // Stop at an inline `#[cfg(test)] mod x {` BLOCK, not at a
+        // `#[cfg(test)] mod x;` DECLARATION. The declarations sit at the TOP of
+        // a module file, so truncating on them would hide the whole production
+        // body — which is exactly what the first version of this rule did, and
+        // the production check caught it by reporting zero call sites.
+        let lines: Vec<&str> = text.lines().collect();
+        for (index, line) in lines.iter().enumerate() {
+            let is_test_block = line.trim() == "#[cfg(test)]"
+                && lines
+                    .get(index + 1)
+                    .is_some_and(|next| next.contains("mod ") && next.trim_end().ends_with('{'));
+            if is_test_block {
+                break;
+            }
+            if is_comment(line) || line.contains("fn emit_files") {
+                continue;
+            }
+            if line.contains("emit_files(") {
+                hits.push(format!(
+                    "{}:{}: {}",
+                    file.strip_prefix(root).unwrap_or(file).display(),
+                    index + 1,
+                    line.trim()
+                ));
+            }
+        }
+    }
+    hits
+}
+
+/// Whole-file test modules: these are `#[cfg(test)] mod x;` at their parent, so
+/// there is no `#[cfg(test)]` line inside them to truncate at.
+fn is_test_only_file(path: &Path) -> bool {
+    matches!(
+        path.file_name().and_then(|n| n.to_str()),
+        Some("goldens.rs" | "emit_tests.rs" | "import_denylist.rs")
+    )
+}
+
+/// **Production check — ONE EMISSION PATH.** Exactly one production call site
+/// drives `decide → plan → apply → verify`.
+///
+/// The check was first written as "no production code compiles a crate from a
+/// string". That was the wrong invariant: the ruling is about a second
+/// *emission* path, not about the compiler's input form, and the string entry
+/// point legitimately compiles a string — staging it to disk instead made every
+/// span render against a pid-bearing temp directory. Counting emission call
+/// sites tests the property that was actually ruled.
+#[test]
+fn production_code_has_exactly_one_emission_path() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/bo_rewriter");
+    let hits = emission_call_sites(&root, &is_test_only_file);
+    assert_eq!(
+        hits.len(),
+        1,
+        "expected exactly one production emission call site; a second parallel \
+         path would be exercised by every test and by nothing real:\n  {}",
+        hits.join("\n  ")
+    );
+}
+
+/// **Witness — the scan can fail.** Same function, synthetic corpus with two
+/// call sites. Without this the production check is an unwitnessed scan, which
+/// this file already records four instances of.
+#[test]
+fn the_emission_path_scan_counts_every_call_site() {
+    let dir = temp_corpus(
+        "emission-two-sites",
+        &[
+            ("one.rs", "fn a() {\n    let x = emit_files(tcx, &table);\n}\n"),
+            ("two.rs", "fn b() {\n    let y = emit_files(tcx, &table);\n}\n"),
+        ],
+    );
+    let hits = emission_call_sites(&dir, &|_| false);
+    assert_eq!(hits.len(), 2, "the scan missed a second emission path: {hits:?}");
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// **Witness — the truncation rule is what makes it selective.** The same call
+/// in a `#[cfg(test)]` tail is not a production path; without truncation the
+/// crate's own witnesses would trip the production check.
+#[test]
+fn the_emission_path_scan_ignores_the_test_tail() {
+    let dir = temp_corpus(
+        "emission-test-tail",
+        &[(
+            "tailed.rs",
+            "fn f() {}\n#[cfg(test)]\nmod tests {\n    fn t() { emit_files(tcx, &table); }\n}\n",
+        )],
+    );
+    let hits = emission_call_sites(&dir, &|_| false);
+    assert!(hits.is_empty(), "a test-tail call was reported as production: {hits:?}");
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// **Witness — a `#[cfg(test)] mod x;` DECLARATION is not a test tail.**
+///
+/// These sit at the top of a module file. The first version of the rule stopped
+/// at any `#[cfg(test)]`, so it truncated `bo_rewriter/mod.rs` at its test-module
+/// declarations and reported ZERO production call sites — a scan that would
+/// have passed forever once someone "fixed" the expected count.
+#[test]
+fn the_emission_path_scan_does_not_stop_at_a_test_module_declaration() {
+    let dir = temp_corpus(
+        "emission-mod-decl",
+        &[(
+            "decl.rs",
+            "#[cfg(test)]\nmod tests;\n\nfn production() {\n    emit_files(tcx, &table);\n}\n",
+        )],
+    );
+    let hits = emission_call_sites(&dir, &|_| false);
+    assert_eq!(
+        hits.len(),
+        1,
+        "a test-module DECLARATION hid the production body: {hits:?}"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}

@@ -88,7 +88,15 @@ pub(crate) enum RewriteOutcome {
     /// did not say so would let a 100%-degraded program count as a success.
     /// `emitted_count` is how a caller tells a real rewrite from a no-op.
     Emitted {
+        /// The crate **root's** final text. For a single-file crate this is the
+        /// whole emitted crate; for a multi-file crate it is the root only, and
+        /// [`Self::Emitted::files`] carries every file the rewrite changed.
+        ///
+        /// Read back from the materialized copy rather than reconstructed, so it
+        /// is correct whether or not the root itself was edited.
         source: String,
+        /// Every file the rewrite changed, keyed by file.
+        files: std::collections::BTreeMap<plan::FileKey, String>,
         degradations: Vec<decision::Degradation>,
         emitted_count: usize,
         /// Pointer parameters on item kinds M1 does not rewrite. Carried out
@@ -137,10 +145,42 @@ pub(crate) enum RewriteOutcome {
               universe fields the lint exists to catch."
 )]
 pub(crate) fn rewrite_m1(input: &str) -> RewriteOutcome {
-    let owned = input.to_owned();
-    let result = ::utils::compilation::run_compiler_on_str(input, move |tcx| {
-        let table = decide_table(tcx)?;
+    // **The single-file case of the general path — not a second path.** The
+    // input is staged as a one-file crate and handed to `rewrite_m1_path`, so
+    // the ten goldens exercise exactly the mechanism the corpus will. A parallel
+    // string pipeline is the hazard class this milestone exists to remove: it
+    // would be exercised by every test and by nothing real.
+    rewrite_core(::utils::compilation::str_to_input(input), None)
+}
 
+/// M1's **general** entry point: a crate rooted at `root`, rewritten into a temp
+/// copy and gated there.
+#[allow(
+    dead_code,
+    reason = "no caller until 0a.4's corpus smoke; `rewrite_m1` reaches the same               core through the other entry. Targeted here rather than               module-wide so the lint stays live over everything reachable."
+)]
+pub(crate) fn rewrite_m1_path(root: &std::path::Path) -> RewriteOutcome {
+    rewrite_core(::utils::compilation::path_to_input(root), Some(root))
+}
+
+/// **The one emission path.** Both entry points funnel here; they differ only in
+/// the compiler input and in what the emitted files are materialized *onto*.
+///
+/// # Why the string entry is not staged to disk first
+///
+/// Staging it would make every span render against a temp directory — an
+/// absolute, machine-specific path containing a pid and a counter. Sites would
+/// stop being reproducible between runs, which is the D19 failure again: a
+/// report whose values permute between runs is not comparable. Compiling the
+/// string as `<main.rs>` keeps attribution stable, and the emission logic below
+/// is shared regardless, which is what the one-path ruling is actually about.
+fn rewrite_core(
+    input: rustc_session::config::Input,
+    tree_base: Option<&std::path::Path>,
+) -> RewriteOutcome {
+    let root_hint = tree_base;
+    let result = ::utils::compilation::run_compiler_on_input(input, |tcx| {
+        let table = decide_table(tcx)?;
         let emission = emit_files(tcx, &table)?;
         // Structural gate: rollbacks must be zero.
         if !emission.rollbacks.is_empty() {
@@ -150,33 +190,69 @@ pub(crate) fn rewrite_m1(input: &str) -> RewriteOutcome {
                 emission.rollbacks.iter().map(|r| r.reason).collect::<Vec<_>>()
             ));
         }
-        // The string entry point is the SINGLE-FILE CASE of the general path.
-        // An edit landing anywhere but the virtual root means the general path
-        // produced something this entry point cannot represent — fail loudly
-        // rather than silently emit one file and drop the rest.
-        let root = plan::FileKey::Virtual("main.rs".to_owned());
-        if let Some(stray) = emission.files.keys().find(|k| **k != root) {
-            return Err(format!(
-                "string entry point produced an edit outside its virtual root: {stray:?}"
-            ));
-        }
         let degradations: Vec<decision::Degradation> = table.degradations().cloned().collect();
+        // The crate ROOT's final text: its emitted version if the root was
+        // edited, otherwise its original source. Computed here because only the
+        // compiler session can supply the unedited text.
+        let source_map = tcx.sess.source_map();
+        let root_text = source_map
+            .files()
+            .iter()
+            .find_map(|sf| {
+                let key = file_key(&sf.name)?;
+                let is_root = match &key {
+                    plan::FileKey::Virtual(_) => true,
+                    plan::FileKey::Real(path) => Some(path.as_path()) == root_hint,
+                };
+                if !is_root {
+                    return None;
+                }
+                emission
+                    .files
+                    .get(&key)
+                    .cloned()
+                    .or_else(|| sf.src.as_ref().map(|src| src.to_string()))
+            })
+            .unwrap_or_default();
         Ok((
-            emission.files.get(&root).cloned().unwrap_or_else(|| owned.clone()),
+            emission.files,
+            emission.unplaceable,
             degradations,
             table.emitted_count(),
             decision::universe::classify(tcx).excluded,
-            emission.unplaceable,
+            root_text,
         ))
     });
 
     match result {
-        Ok(Ok((emitted, degradations, emitted_count, excluded, unplaceable))) => {
-            // Hard gate: the emitted crate type-checks. S2b replaces this
-            // whole-crate verdict with per-function granularity.
-            if verify::type_checks(&emitted) {
+        Ok(Ok((files, unplaceable, degradations, emitted_count, excluded, root_text))) => {
+            // Materialize onto the original tree when there is one; otherwise
+            // the emission is a single virtual file and becomes a one-file crate.
+            let materialized = match tree_base {
+                Some(root) => verify::materialize(root, &files),
+                None => verify::materialize_single_file(&root_text),
+            };
+            let staged = match materialized {
+                Ok(staged) => staged,
+                Err(err) => {
+                    return RewriteOutcome::Degraded {
+                        reason: format!("could not materialize the emitted crate: {err}"),
+                        degradations,
+                        excluded,
+                    };
+                }
+            };
+            // Hard gate: the emitted crate type-checks, WHOLE-CRATE. S2b.1
+            // replaces this verdict with per-function granularity, after the
+            // S2b.0 measurement chooses its mechanism.
+            if verify::type_checks_crate(staged.root()) {
+                let source = match tree_base {
+                    Some(_) => std::fs::read_to_string(staged.root()).unwrap_or_default(),
+                    None => root_text,
+                };
                 RewriteOutcome::Emitted {
-                    source: emitted,
+                    source,
+                    files,
                     degradations,
                     emitted_count,
                     excluded,
@@ -202,6 +278,7 @@ pub(crate) fn rewrite_m1(input: &str) -> RewriteOutcome {
         },
     }
 }
+
 
 /// Every top-level fn/struct item, in HIR owner order (the `bo_c1` shape).
 fn collect_program(tcx: TyCtxt<'_>) -> RustProgram<'_> {

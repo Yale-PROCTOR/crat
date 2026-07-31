@@ -879,3 +879,4 @@ fn reference_typed_params_are_collected_with_their_own_shape() {
         "degradation names the wrong subject: {hit:?}"
     );
 }
+

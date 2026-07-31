@@ -20,19 +20,6 @@ use std::{
 
 use super::plan::FileKey;
 
-/// Hard gate — the emitted crate passes `tcx.analysis(())`.
-///
-/// Runs a full compiler invocation over the emitted source. A type error is a
-/// gate failure, not a panic to be caught: `run_compiler_on_str` surfaces a
-/// `FatalError`, and the emitted crate failing to type-check is exactly the
-/// condition this gate exists to report.
-pub(crate) fn type_checks(emitted: &str) -> bool {
-    ::utils::compilation::run_compiler_on_str(emitted, |tcx| {
-        ::utils::type_check(tcx);
-    })
-    .is_ok()
-}
-
 /// The same hard gate, over a crate **rooted at a path**.
 ///
 /// A multi-file crate cannot be handed to the string gate: its modules resolve
@@ -155,5 +142,22 @@ pub(crate) fn materialize(
         io::Error::new(io::ErrorKind::InvalidInput, "crate root has no file name")
     })?;
     let root = dir.join(root_name);
+    Ok(TempCrate { dir, root })
+}
+
+/// Stage a single-file crate from emitted text, so the whole-crate gate can run
+/// on it. The virtual counterpart of [`materialize`].
+#[allow(
+    dead_code,
+    reason = "same expiry as `materialize`: the string entry point's gate path. \
+              Correct this reason when the rewriter is wired into the pipeline."
+)]
+pub(crate) fn materialize_single_file(source: &str) -> io::Result<TempCrate> {
+    let sequence = NEXT_TEMP.fetch_add(1, Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!("crat-verify1-{}-{sequence}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir)?;
+    let root = dir.join("lib.rs");
+    fs::write(&root, source)?;
     Ok(TempCrate { dir, root })
 }
