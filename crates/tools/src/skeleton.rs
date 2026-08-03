@@ -1000,7 +1000,7 @@ fn stmt_attrs_mut(stmt: &mut Stmt) -> &mut rustc_ast::AttrVec {
     }
 }
 
-fn annotate_function(item: &mut Item, opaque_nested_ifs: &FxHashSet<NodeId>) {
+pub(crate) fn annotate_function(item: &mut Item, opaque_nested_ifs: &FxHashSet<NodeId>) {
     let mut labeler = Labeler {
         next: 0,
         opaque_nested_ifs,

@@ -6,7 +6,7 @@ use std::{
 use rustc_ast::{
     AngleBracketedArg, AttrKind, Attribute, BindingMode, ByRef, Crate, Expr, ExprKind, Extern,
     FnRetTy, GenericArg, GenericArgs, GenericParamKind, Item, ItemKind, Mutability, NodeId,
-    PatKind, Safety, Stmt, StmtKind, Ty, TyKind,
+    PatKind, Safety, Stmt, StmtKind, Ty, TyKind, VisibilityKind,
     mut_visit::{self, MutVisitor},
     ptr::P,
     visit::{self, Visitor},
@@ -29,7 +29,7 @@ use crate::{
         canonical_statement_group, canonicalize_function_for_replacement,
         validate_preservation_metadata,
     },
-    skeleton::render_statement_group,
+    skeleton::{annotate_function, collect_opaque_nested_ifs, render_statement_group},
 };
 
 const REPLACEMENT_SCHEMA_VERSION: u64 = 1;
@@ -40,6 +40,16 @@ pub struct ReplacementRequest {
     pub schema_version: u64,
     pub items: Vec<ReplacementItem>,
     pub transformation: String,
+    pub accepted_correspondence: Vec<CallableCorrespondence>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CallableCorrespondence {
+    pub item_id: u64,
+    pub logical_path: String,
+    pub implementation_path: String,
+    pub wrapper_path: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -57,6 +67,26 @@ pub struct ReplacementItem {
 pub struct ReplacementOutput {
     pub source: String,
     pub statement_pairs: Vec<ReplacementStatementPair>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExtendedReplacementOutput {
+    pub replacement: ReplacementOutput,
+    pub observation_source: String,
+    pub accepted_correspondence: Vec<CallableCorrespondence>,
+    pub new_correspondence: Vec<CallableCorrespondence>,
+    pub current_items: Vec<CurrentObservationItem>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CurrentObservationItem {
+    pub item_id: u64,
+    pub logical_path: String,
+    pub source_copy_path: String,
+    pub implementation_path: String,
+    pub wrapper_path: Option<String>,
+    pub transform_labels: Vec<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -109,6 +139,14 @@ pub fn replace_items(
     request: &ReplacementRequest,
     tcx: TyCtxt<'_>,
 ) -> Result<ReplacementOutput, ReplacementError> {
+    replace_items_with_observations(source, request, tcx).map(|output| output.replacement)
+}
+
+pub fn replace_items_with_observations(
+    source: &str,
+    request: &ReplacementRequest,
+    tcx: TyCtxt<'_>,
+) -> Result<ExtendedReplacementOutput, ReplacementError> {
     validate_request(request)?;
     let returned_transformations = parse_transformations(request)?;
     let mut transformations = HashMap::new();
@@ -210,8 +248,16 @@ pub fn replace_items(
             .as_ref()
             .map(|name| build_wrapper(current, transformed_fn, requested, name))
             .transpose()?;
-        let implementation =
+        let observation_implementation =
             compose_implementation(&current.item, transformation, needs_wrapper, requested)?;
+        let mut implementation = observation_implementation.clone();
+        let ItemKind::Fn(box implementation_fn) = &mut implementation.kind else { unreachable!() };
+        ProctorLabelRemover.visit_block(
+            implementation_fn
+                .body
+                .as_mut()
+                .expect("composed implementations always have a body"),
+        );
 
         let main_node = if executable_arity == Some(2) {
             Some(find_sibling_main(
@@ -227,21 +273,89 @@ pub fn replace_items(
             current_node: current.item.id,
             current_def_id: current.def_id,
             implementation,
+            observation_implementation,
             wrapper,
-            wrapper_path: wrapper_name.map(|name| absolute_item_path(&current.module_path, &name)),
+            wrapper_path: wrapper_name.map(|name| {
+                absolute_item_path(&current.module_path, &name)
+                    .strip_prefix("crate::")
+                    .unwrap_or(&name)
+                    .to_owned()
+            }),
+            source_copy_name: String::new(),
+            source_copy_path: String::new(),
             main_node,
         });
+    }
+
+    // Candidate wrapper allocation is deliberately complete before observation-only
+    // source-copy names reserve anything in the module namespace.
+    for plan in &mut plans {
+        let current = current_functions
+            .iter()
+            .find(|function| function.item.id == plan.current_node)
+            .expect("replacement plans originate in current functions");
+        let name = allocate_generated_name(current, &mut reserved, "__proctor_source");
+        plan.source_copy_path = absolute_item_path(&current.module_path, &name)
+            .strip_prefix("crate::")
+            .unwrap_or(&name)
+            .to_owned();
+        plan.source_copy_name = name;
     }
 
     validate_macro_call_rewrites(&surface, &ast_to_hir, &plans, &current_functions, tcx)?;
     let rewrites = collect_call_rewrites(&surface, &ast_to_hir, &plans, tcx)?;
 
+    let mut observation_surface = surface.clone();
+    validate_source_copy_macro_rewrites(
+        &observation_surface,
+        &ast_to_hir,
+        &plans,
+        &current_functions,
+        tcx,
+    )?;
+    let source_copy_rewrites =
+        collect_source_copy_call_rewrites(&observation_surface, &ast_to_hir, &plans, tcx);
+    CallRewriter {
+        rewrites: source_copy_rewrites,
+    }
+    .visit_crate(&mut observation_surface);
+    apply_observation_replacements(&mut observation_surface.items, &plans)?;
+
     let mut call_rewriter = CallRewriter { rewrites };
     call_rewriter.visit_crate(&mut surface);
     apply_replacements(&mut surface.items, &plans)?;
-    Ok(ReplacementOutput {
-        source: pprust::crate_to_string_for_macros(&surface),
-        statement_pairs,
+    let new_correspondence: Vec<CallableCorrespondence> = plans
+        .iter()
+        .map(|plan| CallableCorrespondence {
+            item_id: plan.requested.id,
+            logical_path: plan.requested.path.clone(),
+            implementation_path: plan.requested.path.clone(),
+            wrapper_path: plan.wrapper_path.clone(),
+        })
+        .collect();
+    let mut combined_correspondence = request.accepted_correspondence.clone();
+    combined_correspondence.extend(new_correspondence.iter().cloned());
+    validate_correspondence(&combined_correspondence)?;
+    let current_items = plans
+        .iter()
+        .map(|plan| CurrentObservationItem {
+            item_id: plan.requested.id,
+            logical_path: plan.requested.path.clone(),
+            source_copy_path: plan.source_copy_path.clone(),
+            implementation_path: plan.requested.path.clone(),
+            wrapper_path: plan.wrapper_path.clone(),
+            transform_labels: plan.requested.statements_requiring_transformation.clone(),
+        })
+        .collect();
+    Ok(ExtendedReplacementOutput {
+        replacement: ReplacementOutput {
+            source: pprust::crate_to_string_for_macros(&surface),
+            statement_pairs,
+        },
+        observation_source: pprust::crate_to_string_for_macros(&observation_surface),
+        accepted_correspondence: request.accepted_correspondence.clone(),
+        new_correspondence,
+        current_items,
     })
 }
 
@@ -272,8 +386,11 @@ struct ReplacementPlan {
     current_node: NodeId,
     current_def_id: LocalDefId,
     implementation: P<Item>,
+    observation_implementation: P<Item>,
     wrapper: Option<P<Item>>,
     wrapper_path: Option<String>,
+    source_copy_name: String,
+    source_copy_path: String,
     main_node: Option<NodeId>,
 }
 
@@ -296,6 +413,7 @@ fn validate_request(request: &ReplacementRequest) -> Result<(), ReplacementError
     let mut ids = HashSet::new();
     let mut paths = HashSet::new();
     let mut names = HashSet::new();
+    validate_correspondence(&request.accepted_correspondence)?;
     for item in &request.items {
         if !ids.insert(item.id) {
             return Err(item_error(
@@ -341,6 +459,87 @@ fn validate_request(request: &ReplacementRequest) -> Result<(), ReplacementError
         parse_replacement_skeleton(item)?;
     }
     parse_transformations(request)?;
+    Ok(())
+}
+
+fn validate_correspondence(records: &[CallableCorrespondence]) -> Result<(), ReplacementError> {
+    let mut item_ids = HashSet::new();
+    let mut logical = HashSet::new();
+    let mut implementations = HashSet::new();
+    let mut wrappers = HashSet::new();
+    for record in records {
+        if !item_ids.insert(record.item_id) {
+            return Err(global_error(
+                ReplacementErrorKind::InvalidRequest,
+                format!(
+                    "accepted correspondence item ID {} is duplicated",
+                    record.item_id
+                ),
+            ));
+        }
+        for (kind, path) in [
+            ("logical", &record.logical_path),
+            ("implementation", &record.implementation_path),
+        ] {
+            if valid_full_path(path).is_none() {
+                return Err(global_error(
+                    ReplacementErrorKind::InvalidRequest,
+                    format!("accepted correspondence {kind} path `{path}` is invalid"),
+                ));
+            }
+        }
+        if !logical.insert(record.logical_path.as_str()) {
+            return Err(global_error(
+                ReplacementErrorKind::InvalidRequest,
+                format!(
+                    "accepted correspondence logical path `{}` is duplicated",
+                    record.logical_path
+                ),
+            ));
+        }
+        if !implementations.insert(record.implementation_path.as_str()) {
+            return Err(global_error(
+                ReplacementErrorKind::InvalidRequest,
+                format!(
+                    "accepted correspondence implementation path `{}` is duplicated",
+                    record.implementation_path
+                ),
+            ));
+        }
+        if let Some(wrapper) = &record.wrapper_path
+            && (valid_full_path(wrapper).is_none() || !wrappers.insert(wrapper.as_str()))
+        {
+            return Err(global_error(
+                ReplacementErrorKind::InvalidRequest,
+                format!(
+                    "accepted correspondence wrapper path `{wrapper}` is invalid or duplicated"
+                ),
+            ));
+        }
+    }
+    for (index, record) in records.iter().enumerate() {
+        for (other_index, other) in records.iter().enumerate() {
+            if index != other_index && record.logical_path == other.implementation_path {
+                return Err(global_error(
+                    ReplacementErrorKind::InvalidRequest,
+                    format!(
+                        "accepted correspondence path `{}` has contradictory roles",
+                        record.logical_path
+                    ),
+                ));
+            }
+        }
+        if let Some(wrapper) = &record.wrapper_path
+            && (logical.contains(wrapper.as_str()) || implementations.contains(wrapper.as_str()))
+        {
+            return Err(global_error(
+                ReplacementErrorKind::InvalidRequest,
+                format!(
+                    "accepted correspondence wrapper path `{wrapper}` collides with a logical or implementation path"
+                ),
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -782,6 +981,27 @@ fn allocate_wrapper_name(
     unreachable!("wrapper name space is infinite for {}", requested.path)
 }
 
+fn allocate_generated_name(
+    current: &CurrentFunction,
+    occupied: &mut HashMap<Vec<String>, HashSet<String>>,
+    prefix: &str,
+) -> String {
+    let ItemKind::Fn(box function) = &current.item.kind else { unreachable!() };
+    let base = format!("{prefix}_{}", function.ident.name.as_str());
+    let names = occupied.entry(current.module_path.clone()).or_default();
+    for suffix in 0usize.. {
+        let candidate = if suffix == 0 {
+            base.clone()
+        } else {
+            format!("{base}_{}", suffix - 1)
+        };
+        if names.insert(candidate.clone()) {
+            return candidate;
+        }
+    }
+    unreachable!("generated name space is infinite")
+}
+
 fn find_sibling_main(
     functions: &[CurrentFunction],
     module_path: &[String],
@@ -828,14 +1048,13 @@ fn compose_implementation(
             .attrs
             .retain(|attribute| !is_export_attribute(attribute));
     }
-    let Some(body) = &mut output_fn.body else {
+    if output_fn.body.is_none() {
         return Err(item_error(
             ReplacementErrorKind::InvalidTransformation,
             requested,
             "returned function has no body".to_owned(),
         ));
-    };
-    ProctorLabelRemover.visit_block(body);
+    }
     Ok(output)
 }
 
@@ -1296,7 +1515,7 @@ fn collect_call_rewrites(
         .filter_map(|plan| {
             plan.wrapper_path
                 .as_ref()
-                .map(|path| (plan.current_def_id, path.clone()))
+                .map(|path| (plan.current_def_id, format!("crate::{path}")))
         })
         .collect::<FxHashMap<_, _>>();
     let current_scc = plans
@@ -1313,6 +1532,67 @@ fn collect_call_rewrites(
     };
     collector.visit_crate(surface);
     Ok(collector.rewrites)
+}
+
+fn collect_source_copy_call_rewrites(
+    surface: &Crate,
+    ast_to_hir: &utils::ir::AstToHir,
+    plans: &[ReplacementPlan],
+    tcx: TyCtxt<'_>,
+) -> FxHashMap<NodeId, String> {
+    let source_paths = plans
+        .iter()
+        .map(|plan| {
+            (
+                plan.current_def_id,
+                format!("crate::{}", plan.source_copy_path),
+            )
+        })
+        .collect::<FxHashMap<_, _>>();
+    let current_scc = source_paths.keys().copied().collect::<FxHashSet<_>>();
+    let mut collector = SourceCopyCallCollector {
+        ast_to_hir,
+        tcx,
+        source_paths: &source_paths,
+        current_scc: &current_scc,
+        current_function: None,
+        rewrites: FxHashMap::default(),
+    };
+    collector.visit_crate(surface);
+    collector.rewrites
+}
+
+struct SourceCopyCallCollector<'a, 'tcx> {
+    ast_to_hir: &'a utils::ir::AstToHir,
+    tcx: TyCtxt<'tcx>,
+    source_paths: &'a FxHashMap<LocalDefId, String>,
+    current_scc: &'a FxHashSet<LocalDefId>,
+    current_function: Option<LocalDefId>,
+    rewrites: FxHashMap<NodeId, String>,
+}
+
+impl<'ast> Visitor<'ast> for SourceCopyCallCollector<'_, '_> {
+    fn visit_item(&mut self, item: &'ast Item) {
+        let previous = self.current_function;
+        if matches!(item.kind, ItemKind::Fn(..)) {
+            self.current_function = self.ast_to_hir.global_map.get(&item.id).copied();
+        }
+        visit::walk_item(self, item);
+        self.current_function = previous;
+    }
+
+    fn visit_expr(&mut self, expression: &'ast Expr) {
+        if self
+            .current_function
+            .is_some_and(|caller| self.current_scc.contains(&caller))
+            && let ExprKind::Call(callee, _) = &expression.kind
+            && let Some(target) = resolved_local_function(callee, self.ast_to_hir, self.tcx)
+            && let Some(path) = self.source_paths.get(&target)
+        {
+            self.rewrites.insert(callee.id, path.clone());
+        }
+        visit::walk_expr(self, expression);
+    }
 }
 
 struct AstCallCollector<'a, 'tcx> {
@@ -1419,6 +1699,7 @@ fn validate_macro_call_rewrites(
         };
         let mut counter = HirDirectCallCounter {
             wrapped: &wrapped,
+            include_expansions: false,
             counts: FxHashMap::default(),
         };
         counter.visit_body(tcx.hir_body(body));
@@ -1445,6 +1726,97 @@ fn validate_macro_call_rewrites(
         }
     }
     Ok(())
+}
+
+fn validate_source_copy_macro_rewrites(
+    surface: &Crate,
+    ast_to_hir: &utils::ir::AstToHir,
+    plans: &[ReplacementPlan],
+    functions: &[CurrentFunction],
+    tcx: TyCtxt<'_>,
+) -> Result<(), ReplacementError> {
+    let targets = plans
+        .iter()
+        .map(|plan| plan.current_def_id)
+        .collect::<FxHashSet<_>>();
+    let mut ast_counts = FxHashMap::default();
+    let mut scanner = CurrentSurfaceCallCounter {
+        ast_to_hir,
+        tcx,
+        targets: &targets,
+        current_function: None,
+        ast_counts: &mut ast_counts,
+    };
+    scanner.visit_crate(surface);
+    for function in functions
+        .iter()
+        .filter(|function| targets.contains(&function.def_id))
+    {
+        let hir::ItemKind::Fn { body, .. } =
+            tcx.hir_node_by_def_id(function.def_id).expect_item().kind
+        else {
+            continue;
+        };
+        let mut counter = HirDirectCallCounter {
+            wrapped: &targets,
+            include_expansions: true,
+            counts: FxHashMap::default(),
+        };
+        counter.visit_body(tcx.hir_body(body));
+        for plan in plans {
+            let hir_count = counter
+                .counts
+                .get(&plan.current_def_id)
+                .copied()
+                .unwrap_or(0);
+            let ast_count = ast_counts
+                .get(&(function.def_id, plan.current_def_id))
+                .copied()
+                .unwrap_or(0);
+            if hir_count > ast_count {
+                return Err(item_error(
+                    ReplacementErrorKind::UnsupportedCallRewrite,
+                    &plan.requested,
+                    format!(
+                        "a required source-copy call redirect in `{}` occurs inside a macro token input",
+                        function.path
+                    ),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+struct CurrentSurfaceCallCounter<'a, 'tcx> {
+    ast_to_hir: &'a utils::ir::AstToHir,
+    tcx: TyCtxt<'tcx>,
+    targets: &'a FxHashSet<LocalDefId>,
+    current_function: Option<LocalDefId>,
+    ast_counts: &'a mut FxHashMap<(LocalDefId, LocalDefId), usize>,
+}
+
+impl<'ast> Visitor<'ast> for CurrentSurfaceCallCounter<'_, '_> {
+    fn visit_item(&mut self, item: &'ast Item) {
+        let previous = self.current_function;
+        if matches!(item.kind, ItemKind::Fn(..)) {
+            self.current_function = self.ast_to_hir.global_map.get(&item.id).copied();
+        }
+        visit::walk_item(self, item);
+        self.current_function = previous;
+    }
+
+    fn visit_expr(&mut self, expression: &'ast Expr) {
+        if let Some(caller) = self.current_function
+            && self.targets.contains(&caller)
+            && let ExprKind::Call(callee, _) = &expression.kind
+            && let Some(target) = resolved_local_function(callee, self.ast_to_hir, self.tcx)
+            && self.targets.contains(&target)
+        {
+            *self.ast_counts.entry((caller, target)).or_default() += 1;
+        }
+        visit::walk_expr(self, expression);
+    }
 }
 
 struct SurfaceCallCounter<'a, 'tcx> {
@@ -1481,13 +1853,14 @@ impl<'ast> Visitor<'ast> for SurfaceCallCounter<'_, '_> {
 
 struct HirDirectCallCounter<'a> {
     wrapped: &'a FxHashSet<LocalDefId>,
+    include_expansions: bool,
     counts: FxHashMap<LocalDefId, usize>,
 }
 
 impl<'tcx> HirVisitor<'tcx> for HirDirectCallCounter<'_> {
     fn visit_expr(&mut self, expression: &'tcx hir::Expr<'tcx>) {
         if let hir::ExprKind::Call(callee, _) = expression.kind
-            && !callee.span.from_expansion()
+            && (self.include_expansions || !callee.span.from_expansion())
             && let hir::ExprKind::Path(hir::QPath::Resolved(_, path)) = callee.kind
             && let Res::Def(DefKind::Fn, def_id) = path.res
             && let Some(def_id) = def_id.as_local()
@@ -1512,6 +1885,72 @@ fn apply_replacements(
         .filter_map(|plan| plan.main_node.map(|node| (node, &plan.requested)))
         .collect::<FxHashMap<_, _>>();
     rewrite_item_list(items, &by_node, &mains)
+}
+
+fn apply_observation_replacements(
+    items: &mut ThinVec<P<Item>>,
+    plans: &[ReplacementPlan],
+) -> Result<(), ReplacementError> {
+    let by_node = plans
+        .iter()
+        .map(|plan| (plan.current_node, plan))
+        .collect::<FxHashMap<_, _>>();
+    let mains = plans
+        .iter()
+        .filter_map(|plan| plan.main_node.map(|node| (node, &plan.requested)))
+        .collect::<FxHashMap<_, _>>();
+    rewrite_observation_item_list(items, &by_node, &mains)
+}
+
+fn rewrite_observation_item_list(
+    items: &mut ThinVec<P<Item>>,
+    plans: &FxHashMap<NodeId, &ReplacementPlan>,
+    mains: &FxHashMap<NodeId, &ReplacementItem>,
+) -> Result<(), ReplacementError> {
+    let mut output = ThinVec::with_capacity(items.len() + plans.len() * 2);
+    for mut item in std::mem::take(items) {
+        if let ItemKind::Mod(_, _, rustc_ast::ModKind::Loaded(children, ..)) = &mut item.kind {
+            rewrite_observation_item_list(children, plans, mains)?;
+        }
+        if let Some(requested) = mains.get(&item.id) {
+            item = fixed_main_item().map_err(|mut error| {
+                error.item = Some(Box::new((*requested).clone()));
+                error
+            })?;
+            item.attrs.clear();
+        }
+        if let Some(plan) = plans.get(&item.id) {
+            let mut implementation = plan.observation_implementation.clone();
+            implementation.attrs.clear();
+            output.push(implementation);
+            if let Some(wrapper) = &plan.wrapper {
+                let mut wrapper = wrapper.clone();
+                wrapper.attrs.clear();
+                output.push(wrapper);
+            }
+            let mut source_copy = item;
+            source_copy.attrs.clear();
+            source_copy.vis.kind = VisibilityKind::Inherited;
+            let opaque =
+                collect_opaque_nested_ifs(&source_copy, &plan.requested.path).map_err(|error| {
+                    item_error(
+                        ReplacementErrorKind::RewriteFailure,
+                        &plan.requested,
+                        error.message,
+                    )
+                })?;
+            let ItemKind::Fn(box function) = &mut source_copy.kind else { unreachable!() };
+            function.ident = parsed_ident(&plan.source_copy_name);
+            function.sig.header.ext = Extern::None;
+            ProctorLabelRemover.visit_block(function.body.as_mut().unwrap());
+            annotate_function(&mut source_copy, &opaque);
+            output.push(source_copy);
+        } else {
+            output.push(item);
+        }
+    }
+    *items = output;
+    Ok(())
 }
 
 fn rewrite_item_list(

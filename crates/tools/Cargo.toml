@@ -8,6 +8,7 @@ pointer_replacer = { path = "../pointer_replacer" }
 utils = { path = "../utils" }
 serde.workspace = true
 serde_json.workspace = true
+unicode-ident = "1"
 
 [package.metadata.rust-analyzer]
 rustc_private = true

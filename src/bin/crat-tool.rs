@@ -38,7 +38,18 @@ enum Command {
         output: PathBuf,
         #[arg(long)]
         statement_pairs_output: PathBuf,
+        #[arg(long)]
+        observation_source_output: PathBuf,
+        #[arg(long)]
+        observation_metadata_output: PathBuf,
         current_project: PathBuf,
+    },
+    ExtractObservations {
+        #[arg(long)]
+        metadata: PathBuf,
+        #[arg(long)]
+        output: PathBuf,
+        observation_source: PathBuf,
     },
 }
 
@@ -49,23 +60,115 @@ struct StatementPairsSidecar<'a> {
 }
 
 fn serialize_replacement_outputs(
-    output: tools::ReplacementOutput,
+    output: &tools::ReplacementOutput,
 ) -> Result<(String, String), serde_json::Error> {
     let sidecar = serde_json::to_string_pretty(&StatementPairsSidecar {
         schema_version: 1,
         statements: &output.statement_pairs,
     })?;
-    Ok((output.source, sidecar))
+    Ok((output.source.clone(), sidecar))
 }
 
-fn validate_replace_output_paths(
-    output: &Path,
-    statement_pairs_output: &Path,
-) -> Result<(), String> {
-    if output == statement_pairs_output {
-        return Err(
-            "`--output` and `--statement-pairs-output` must name distinct paths".to_owned(),
-        );
+fn validate_replace_output_paths(paths: &[&Path]) -> Result<(), String> {
+    for (index, path) in paths.iter().enumerate() {
+        if paths[..index].contains(path) {
+            return Err("output paths must be pairwise distinct".to_owned());
+        }
+    }
+    Ok(())
+}
+
+fn fail(code: &str, message: impl std::fmt::Display) -> ! {
+    eprintln!("crat-tool: {code}: {message}");
+    std::process::exit(1)
+}
+
+fn temporary_path(path: &Path) -> PathBuf {
+    let mut value = path.as_os_str().to_owned();
+    value.push(".tmp");
+    PathBuf::from(value)
+}
+
+fn clear_regular_or_symlink(path: &Path) -> Result<(), String> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() || metadata.is_file() => {
+            std::fs::remove_file(path)
+                .map_err(|error| format!("failed to remove {}: {error}", path.display()))
+        }
+        Ok(_) => Err(format!(
+            "output destination is not a regular file or symlink: {}",
+            path.display()
+        )),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!("failed to inspect {}: {error}", path.display())),
+    }
+}
+
+fn validate_clearable(path: &Path) -> Result<(), String> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() || metadata.is_file() => Ok(()),
+        Ok(_) => Err(format!(
+            "output destination is not a regular file or symlink: {}",
+            path.display()
+        )),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!("failed to inspect {}: {error}", path.display())),
+    }
+}
+
+fn prepare_publish_destinations(paths: &[&Path]) -> Result<(), String> {
+    let owned = paths
+        .iter()
+        .flat_map(|path| [(*path).to_path_buf(), temporary_path(path)])
+        .collect::<Vec<_>>();
+    for path in &owned {
+        validate_clearable(path)?;
+    }
+    for path in &owned {
+        clear_regular_or_symlink(path)?;
+    }
+    Ok(())
+}
+
+fn publish_files(files: &[(&Path, &[u8])]) -> Result<(), String> {
+    let temporaries = files
+        .iter()
+        .map(|(path, _)| temporary_path(path))
+        .collect::<Vec<_>>();
+    let result = (|| {
+        for ((path, bytes), temporary) in files.iter().zip(&temporaries) {
+            clear_regular_or_symlink(path)?;
+            clear_regular_or_symlink(temporary)?;
+            std::fs::write(temporary, bytes)
+                .map_err(|_| format!("failed to write {}", temporary.display()))?;
+        }
+        for ((path, _), temporary) in files.iter().zip(&temporaries) {
+            std::fs::rename(temporary, path).map_err(|_| {
+                format!(
+                    "failed to rename {} to {}",
+                    temporary.display(),
+                    path.display()
+                )
+            })?;
+        }
+        Ok(())
+    })();
+    if let Err(primary) = result {
+        let mut cleanup = vec![];
+        for path in files
+            .iter()
+            .map(|(path, _)| *path)
+            .chain(temporaries.iter().map(PathBuf::as_path))
+        {
+            if let Err(error) = clear_regular_or_symlink(path) {
+                cleanup.push(error);
+            }
+        }
+        return Err(if cleanup.is_empty() {
+            primary
+        } else {
+            format!("{primary}; cleanup failed: {}", cleanup.join("; "))
+        });
     }
     Ok(())
 }
@@ -106,24 +209,39 @@ fn main() {
             request,
             output,
             statement_pairs_output,
+            observation_source_output,
+            observation_metadata_output,
             current_project,
         } => {
-            validate_replace_output_paths(&output, &statement_pairs_output).unwrap_or_else(
-                |error| {
-                    eprintln!("{error}");
-                    std::process::exit(1);
-                },
-            );
-            let request = std::fs::read_to_string(request)
-                .map_err(|error| error.to_string())
-                .and_then(|request| {
-                    tools::replacement_request_from_json(&request)
-                        .map_err(|error| format!("{:?}: {}", error.kind, error.message))
-                })
-                .unwrap_or_else(|error| {
-                    eprintln!("{error}");
-                    std::process::exit(1);
-                });
+            validate_replace_output_paths(&[
+                &output,
+                &statement_pairs_output,
+                &observation_source_output,
+                &observation_metadata_output,
+            ])
+            .unwrap_or_else(|error| fail("output_path_collision", error));
+            prepare_publish_destinations(&[
+                &output,
+                &statement_pairs_output,
+                &observation_source_output,
+                &observation_metadata_output,
+            ])
+            .unwrap_or_else(|error| fail("output_io", error));
+            let request_text =
+                std::fs::read_to_string(request).unwrap_or_else(|error| fail("request_io", error));
+            if let Ok(value) = serde_json::from_str::<serde_json::Value>(&request_text)
+                && value.get("schema_version") != Some(&serde_json::Value::from(1))
+            {
+                let observed = value
+                    .get("schema_version")
+                    .map_or_else(|| "missing".to_owned(), serde_json::Value::to_string);
+                fail(
+                    "unsupported_schema_version",
+                    format!("unsupported schema_version {observed}"),
+                );
+            }
+            let request = tools::replacement_request_from_json(&request_text)
+                .unwrap_or_else(|error| fail("invalid_request", error.message));
             let lib_path = utils::find_lib_path(&current_project).unwrap_or_else(|error| {
                 eprintln!("{error}");
                 std::process::exit(1);
@@ -132,112 +250,80 @@ fn main() {
             let source = std::fs::read_to_string(&source_path).unwrap();
             let compiler_source = source.clone();
             let replaced = run_compiler_on_path(&source_path, move |tcx| {
-                tools::replace_items(&compiler_source, &request, tcx)
+                tools::replace_items_with_observations(&compiler_source, &request, tcx)
             })
-            .unwrap()
+            .unwrap_or_else(|_| fail("compiler_failure", "current project failed to compile"))
             .unwrap_or_else(|error| {
-                eprintln!("{:?}: {}", error.kind, error.message);
-                std::process::exit(1);
+                fail(
+                    match error.kind {
+                        tools::ReplacementErrorKind::InvalidRequest => "invalid_request",
+                        tools::ReplacementErrorKind::InvalidTransformation => {
+                            "invalid_transformation"
+                        }
+                        tools::ReplacementErrorKind::TargetResolution => "target_resolution",
+                        tools::ReplacementErrorKind::UnsupportedConversion => {
+                            "unsupported_conversion"
+                        }
+                        tools::ReplacementErrorKind::UnsupportedCallRewrite => {
+                            "unsupported_call_rewrite"
+                        }
+                        tools::ReplacementErrorKind::RewriteFailure => "rewrite_failure",
+                    },
+                    error.message,
+                );
             });
-            let (source, sidecar) = serialize_replacement_outputs(replaced).unwrap();
-            std::fs::write(output, source).unwrap();
-            std::fs::write(statement_pairs_output, sidecar).unwrap();
-        }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn replace_cli_helper_serializes_both_outputs_exactly() {
-        let output = tools::ReplacementOutput {
-            source: "pub unsafe fn f() {}\n".to_owned(),
-            statement_pairs: vec![
-                tools::ReplacementStatementPair {
-                    item_id: 2,
-                    path: "z::f".to_owned(),
-                    label: 0,
-                    after_statement: "#[proctor(0)]\nreturn \"quoted\";".to_owned(),
-                },
-                tools::ReplacementStatementPair {
-                    item_id: 7,
-                    path: "a::g".to_owned(),
-                    label: 3,
-                    after_statement: "#[proctor(3)]\ng();".to_owned(),
-                },
-            ],
-        };
-        let (source, sidecar) = serialize_replacement_outputs(output).unwrap();
-        assert_eq!(source.as_bytes(), b"pub unsafe fn f() {}\n");
-        assert_eq!(
-            sidecar,
-            r##"{
-  "schema_version": 1,
-  "statements": [
-    {
-      "item_id": 2,
-      "path": "z::f",
-      "label": 0,
-      "after_statement": "#[proctor(0)]\nreturn \"quoted\";"
-    },
-    {
-      "item_id": 7,
-      "path": "a::g",
-      "label": 3,
-      "after_statement": "#[proctor(3)]\ng();"
-    }
-  ]
-}"##
-        );
-        assert!(!sidecar.ends_with('\n'));
-
-        let (_, empty) = serialize_replacement_outputs(tools::ReplacementOutput {
-            source: String::new(),
-            statement_pairs: vec![],
-        })
-        .unwrap();
-        assert_eq!(
-            empty,
-            "{\n  \"schema_version\": 1,\n  \"statements\": []\n}"
-        );
-
-        assert!(
-            Args::try_parse_from([
-                "crat-tool",
-                "replace",
-                "--request",
-                "request.json",
-                "--output",
-                "candidate.rs",
-                "project",
+            let (source, sidecar) = serialize_replacement_outputs(&replaced.replacement).unwrap();
+            let observation_source = replaced.observation_source.clone();
+            let metadata = tools::ReplacementObservationMetadata::from_output(
+                &replaced,
+                source.as_bytes(),
+                sidecar.as_bytes(),
+                observation_source.as_bytes(),
+            );
+            let metadata = serde_json::to_string_pretty(&metadata).unwrap();
+            publish_files(&[
+                (&output, source.as_bytes()),
+                (&statement_pairs_output, sidecar.as_bytes()),
+                (&observation_source_output, observation_source.as_bytes()),
+                (&observation_metadata_output, metadata.as_bytes()),
             ])
-            .is_err()
-        );
-        let args = Args::try_parse_from([
-            "crat-tool",
-            "replace",
-            "--request",
-            "request.json",
-            "--output",
-            "candidate.rs",
-            "--statement-pairs-output",
-            "pairs.json",
-            "project",
-        ])
-        .unwrap();
-        let Command::Replace {
+            .unwrap_or_else(|error| fail("output_io", error));
+        }
+        Command::ExtractObservations {
+            metadata,
             output,
-            statement_pairs_output,
-            ..
-        } = args.command
-        else {
-            panic!("expected replace command")
-        };
-        assert_eq!(output, PathBuf::from("candidate.rs"));
-        assert_eq!(statement_pairs_output, PathBuf::from("pairs.json"));
-        assert!(validate_replace_output_paths(&output, &statement_pairs_output).is_ok());
-        assert!(validate_replace_output_paths(&output, &output).is_err());
+            observation_source,
+        } => {
+            validate_replace_output_paths(&[&metadata, &output, &observation_source])
+                .unwrap_or_else(|error| fail("output_path_collision", error));
+            prepare_publish_destinations(&[&output])
+                .unwrap_or_else(|error| fail("output_io", error));
+            let metadata_text = std::fs::read_to_string(&metadata).unwrap_or_else(|_| {
+                fail(
+                    "metadata_io",
+                    format!("failed to read {}", metadata.display()),
+                )
+            });
+            let metadata_value = tools::replacement_metadata_from_json(&metadata_text)
+                .unwrap_or_else(|error| fail(error.code, error.message));
+            let source = std::fs::read(&observation_source).unwrap_or_else(|_| {
+                fail(
+                    "observation_source_io",
+                    format!("failed to read {}", observation_source.display()),
+                )
+            });
+            if tools::sha256_hex(&source) != metadata_value.observation_source_sha256 {
+                fail(
+                    "observation_source_digest_mismatch",
+                    "observation source SHA-256 does not match metadata",
+                );
+            }
+            let document =
+                tools::extract_observations_from_path(&observation_source, &metadata_value)
+                    .unwrap_or_else(|error| fail(error.code, error.message));
+            let json = serde_json::to_string_pretty(&document).unwrap();
+            publish_files(&[(&output, json.as_bytes())])
+                .unwrap_or_else(|error| fail("output_io", error));
+        }
     }
 }

@@ -39,6 +39,7 @@ fn request(path: &str, name: &str, transformation: &str) -> ReplacementRequest {
         item.skeleton = transformation.clone();
     }
     ReplacementRequest {
+        accepted_correspondence: vec![],
         schema_version: 1,
         items: vec![item],
         transformation,
@@ -98,6 +99,7 @@ fn request_with_items(mut items: Vec<ReplacementItem>, transformation: &str) -> 
     })
     .unwrap();
     ReplacementRequest {
+        accepted_correspondence: vec![],
         schema_version: 1,
         items,
         transformation,
@@ -116,6 +118,546 @@ fn replace_output(
     request: &ReplacementRequest,
 ) -> Result<ReplacementOutput, ReplacementError> {
     run_compiler_on_str(source, |tcx| replace_items(source, request, tcx)).unwrap()
+}
+
+fn replace_extended(
+    source: &str,
+    request: &ReplacementRequest,
+) -> Result<ExtendedReplacementOutput, ReplacementError> {
+    run_compiler_on_str(source, |tcx| {
+        replace_items_with_observations(source, request, tcx)
+    })
+    .unwrap()
+}
+
+#[test]
+fn ordinary_candidate_and_statement_pairs_remain_exact() {
+    let source = "pub unsafe fn read(mut pointer: *const i32) -> i32 { *pointer }";
+    let request = ReplacementRequest {
+        schema_version: 1,
+        items: vec![preservation_item(
+            7,
+            "read",
+            "read",
+            "pub unsafe fn read<'a>(mut pointer: &'a i32) -> i32 { #[proctor(0)] *pointer }",
+            vec![0],
+        )],
+        transformation:
+            "pub unsafe fn read<'a>(mut pointer: &'a i32) -> i32 { #[proctor(0)] *pointer }".into(),
+        accepted_correspondence: vec![],
+    };
+    let ordinary = replace_output(source, &request).unwrap();
+    let extended = replace_extended(source, &request).unwrap();
+    assert_eq!(extended.replacement, ordinary);
+    assert_eq!(
+        extended.replacement.source.as_bytes(),
+        concat!(
+            "pub unsafe fn read<'a>(mut pointer: &'a i32) -> i32 { *pointer }\n",
+            "pub unsafe fn __proctor_wrapper_read(mut pointer: *const i32) -> i32 {\n",
+            "    let __proctor_result = crate::read(&*(pointer as *const i32));\n",
+            "    __proctor_result\n",
+            "}",
+        )
+        .as_bytes()
+    );
+    assert_eq!(
+        extended.replacement.statement_pairs,
+        vec![ReplacementStatementPair {
+            item_id: 7,
+            path: "read".to_owned(),
+            label: 0,
+            after_statement: "#[proctor(0)]\n*pointer".to_owned(),
+        }]
+    );
+    assert_eq!(
+        extended.new_correspondence[0].wrapper_path.as_deref(),
+        Some("__proctor_wrapper_read")
+    );
+    assert_eq!(
+        extended.current_items[0].source_copy_path,
+        "__proctor_source_read"
+    );
+    assert_eq!(extended.current_items[0].transform_labels, vec![0]);
+    let sidecar = concat!(
+        "{\n  \"schema_version\": 1,\n  \"statements\": [\n    {\n",
+        "      \"item_id\": 7,\n      \"path\": \"read\",\n      \"label\": 0,\n",
+        "      \"after_statement\": \"#[proctor(0)]\\n*pointer\"\n    }\n  ]\n}",
+    );
+    let metadata = crate::ReplacementObservationMetadata::from_output(
+        &extended,
+        extended.replacement.source.as_bytes(),
+        sidecar.as_bytes(),
+        extended.observation_source.as_bytes(),
+    );
+    assert_eq!(
+        metadata.candidate_sha256,
+        crate::sha256_hex(extended.replacement.source.as_bytes())
+    );
+    assert_eq!(
+        metadata.statement_pairs_sha256,
+        crate::sha256_hex(sidecar.as_bytes())
+    );
+    assert_eq!(
+        metadata.observation_source_sha256,
+        crate::sha256_hex(extended.observation_source.as_bytes())
+    );
+}
+
+#[test]
+fn source_copy_names_avoid_module_collisions_without_moving_wrappers() {
+    let source = r#"
+mod a {
+    fn __proctor_source_read() {}
+    fn __proctor_source_read_0() {}
+    fn __proctor_wrapper_read() {}
+    pub unsafe fn read(mut pointer: *const i32) -> i32 { *pointer }
+}
+mod b { pub unsafe fn read(mut pointer: *const i32) -> i32 { *pointer } }
+"#;
+    let target = "unsafe fn read(mut pointer: &i32) -> i32 { #[proctor(0)] *pointer }";
+    let request_for = |id, path| ReplacementRequest {
+        schema_version: 1,
+        items: vec![preservation_item(id, path, "read", target, vec![0])],
+        transformation: target.into(),
+        accepted_correspondence: vec![],
+    };
+    let a = replace_extended(source, &request_for(7, "a::read")).unwrap();
+    assert_eq!(
+        a.current_items[0].source_copy_path,
+        "a::__proctor_source_read_1"
+    );
+    assert_eq!(
+        a.new_correspondence[0].wrapper_path.as_deref(),
+        Some("a::__proctor_wrapper_read_0")
+    );
+    let mut b_request = request_for(8, "b::read");
+    b_request.accepted_correspondence = a.new_correspondence.clone();
+    let b = replace_extended(&a.replacement.source, &b_request).unwrap();
+    assert_eq!(
+        b.current_items[0].source_copy_path,
+        "b::__proctor_source_read"
+    );
+    assert_eq!(
+        b.new_correspondence[0].wrapper_path.as_deref(),
+        Some("b::__proctor_wrapper_read")
+    );
+
+    let raw = replace_extended(
+        "pub unsafe fn r#type(pointer: *const i32) -> i32 { *pointer }",
+        &ReplacementRequest {
+            schema_version: 1,
+            items: vec![preservation_item(
+                9,
+                "r#type",
+                "r#type",
+                "unsafe fn r#type(pointer: &i32) -> i32 { #[proctor(0)] *pointer }",
+                vec![0],
+            )],
+            transformation: "unsafe fn r#type(pointer: &i32) -> i32 { #[proctor(0)] *pointer }"
+                .into(),
+            accepted_correspondence: vec![],
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        raw.current_items[0].source_copy_path,
+        "__proctor_source_type"
+    );
+}
+
+#[test]
+fn observation_functions_strip_outer_attributes_but_keep_statement_labels() {
+    let source = "#[inline(never)] #[no_mangle] pub unsafe extern \"C\" fn read(mut pointer: *const i32) -> i32 { *pointer }";
+    let request = ReplacementRequest {
+        schema_version: 1,
+        items: vec![preservation_item(
+            7,
+            "read",
+            "read",
+            "pub unsafe fn read(mut pointer: &i32) -> i32 { #[proctor(0)] *pointer }",
+            vec![0],
+        )],
+        transformation: "pub unsafe fn read(mut pointer: &i32) -> i32 { #[proctor(0)] *pointer }"
+            .into(),
+        accepted_correspondence: vec![],
+    };
+    let ordinary = replace_output(source, &request).unwrap();
+    let extended = replace_extended(source, &request).unwrap();
+    assert_eq!(extended.replacement, ordinary);
+    let output = extended.observation_source;
+    assert!(!output.contains("no_mangle"));
+    assert!(!output.contains("inline"));
+    assert_eq!(output.matches("#[proctor(0)]").count(), 2);
+    assert!(output.contains("unsafe fn __proctor_source_read"));
+    assert!(output.contains("fn __proctor_wrapper_read"));
+    compile(&output.replace("#[proctor(0)]", ""));
+}
+
+#[test]
+fn deterministic_relabeler_labels_real_source_after_earlier_call_redirect() {
+    let source = r#"
+unsafe fn callee(pointer: &i32) -> i32 { *pointer }
+unsafe fn __proctor_wrapper_callee(pointer: *const i32) -> i32 { callee(&*pointer) }
+pub unsafe fn caller(pointer: *const i32) -> i32 { __proctor_wrapper_callee(pointer) }
+"#;
+    let target = "pub unsafe fn caller(pointer: &i32) -> i32 { #[proctor(0)] callee(pointer) }";
+    let output = replace_extended(
+        source,
+        &ReplacementRequest {
+            schema_version: 1,
+            items: vec![preservation_item(7, "caller", "caller", target, vec![0])],
+            transformation: target.into(),
+            accepted_correspondence: vec![CallableCorrespondence {
+                item_id: 3,
+                logical_path: "callee".into(),
+                implementation_path: "callee".into(),
+                wrapper_path: Some("__proctor_wrapper_callee".into()),
+            }],
+        },
+    )
+    .unwrap();
+    let observation = compact(&output.observation_source);
+    assert!(observation.contains(
+        "unsafe fn __proctor_source_caller(pointer: *const i32) -> i32 { #[proctor(0)] __proctor_wrapper_callee(pointer) }"
+    ));
+    assert!(observation.contains("#[proctor(0)] callee(pointer)"));
+}
+
+#[test]
+fn source_clone_relabeling_needs_no_expected_label_sidecar() {
+    let source = r#"pub unsafe fn read(pointer: *const i32) -> i32 {
+        let value = 1;
+        *pointer + value
+    }"#;
+    let target = r#"pub unsafe fn read(pointer: &i32) -> i32 {
+        #[proctor(0)] let value: i32 = 1;
+        #[proctor(1)] *pointer + value
+    }"#;
+    let output = replace_extended(
+        source,
+        &ReplacementRequest {
+            schema_version: 1,
+            items: vec![preservation_item(7, "read", "read", target, vec![1])],
+            transformation: target.into(),
+            accepted_correspondence: vec![],
+        },
+    )
+    .unwrap();
+    assert_eq!(output.current_items[0].transform_labels, vec![1]);
+    assert_eq!(
+        output.observation_source.matches("#[proctor(0)]").count(),
+        2
+    );
+    assert_eq!(
+        output.observation_source.matches("#[proctor(1)]").count(),
+        2
+    );
+    let metadata = crate::ReplacementObservationMetadata::from_output(
+        &output,
+        output.replacement.source.as_bytes(),
+        b"",
+        output.observation_source.as_bytes(),
+    );
+    let document =
+        crate::observation::extract_observations_from_source(&output.observation_source, &metadata)
+            .unwrap();
+    assert_eq!(document.observations.len(), 1);
+    let observation = &document.observations[0];
+    assert_eq!(observation.pointer_anchors[0].id, "<id0>");
+    assert!(matches!(
+        observation.pointer_anchors[0].source_type,
+        crate::TypeTree::RawPointer { .. }
+    ));
+    assert!(matches!(
+        observation.pointer_anchors[0].target_type,
+        crate::TypeTree::Reference { .. }
+    ));
+    for ty in [
+        &observation.source_type,
+        &observation.source_adjusted_type,
+        &observation.target_type,
+        &observation.target_adjusted_type,
+    ] {
+        assert_eq!(ty, &crate::TypeTree::Primitive { name: "i32".into() });
+    }
+}
+
+#[test]
+fn source_copy_recursion_uses_absolute_copy_path() {
+    let source = r#"
+mod nested {
+    pub unsafe fn sum(mut pointer: *const i32, mut count: usize) -> i32 {
+        if count == 0 { 0 } else { *pointer + sum(pointer.add(1), count - 1) }
+    }
+}
+"#;
+    let target = r#"
+unsafe fn sum(mut pointer: &[i32], mut count: usize) -> i32 {
+    #[proctor(0)]
+    if count == 0 {
+        #[proctor(1)]
+        0
+    } else {
+        #[proctor(2)]
+        pointer[0] + sum(&pointer[1..], count - 1)
+    }
+}
+"#;
+    let request = ReplacementRequest {
+        schema_version: 1,
+        items: vec![preservation_item(
+            7,
+            "nested::sum",
+            "sum",
+            target,
+            vec![0, 1, 2],
+        )],
+        transformation: target.into(),
+        accepted_correspondence: vec![],
+    };
+    let output = replace_extended(source, &request).unwrap();
+    assert_eq!(output.current_items[0].logical_path, "nested::sum");
+    assert_eq!(
+        output.current_items[0].source_copy_path,
+        "nested::__proctor_source_sum"
+    );
+    let observation = compact(&output.observation_source);
+    assert!(observation.contains("crate::nested::__proctor_source_sum(pointer.add(1), count - 1)"));
+    assert!(observation.contains("pointer[0] + sum(&pointer[1..], count - 1)"));
+    assert!(!observation.contains("pointer[0] + crate::nested::sum("));
+    let label_free = output
+        .observation_source
+        .replace("#[proctor(0)]", "")
+        .replace("#[proctor(1)]", "")
+        .replace("#[proctor(2)]", "");
+    compile(&label_free);
+}
+
+#[test]
+fn mutual_scc_copies_call_each_other_in_item_order() {
+    let source = r#"
+pub unsafe fn even(pointer: *const i32, n: usize) -> i32 {
+    if n == 0 { *pointer } else { odd(pointer, n - 1) }
+}
+pub unsafe fn odd(pointer: *const i32, n: usize) -> i32 {
+    if n == 0 { *pointer } else { even(pointer, n - 1) }
+}
+"#;
+    let target = r#"
+unsafe fn even(pointer: &i32, n: usize) -> i32 {
+    #[proctor(0)] if n == 0 { #[proctor(1)] *pointer } else { #[proctor(2)] odd(pointer, n - 1) }
+}
+unsafe fn odd(pointer: &i32, n: usize) -> i32 {
+    #[proctor(0)] if n == 0 { #[proctor(1)] *pointer } else { #[proctor(2)] even(pointer, n - 1) }
+}
+"#;
+    let output = replace_extended(
+        source,
+        &request_with_items(
+            vec![
+                preservation_item(7, "odd", "odd", "", vec![0, 1, 2]),
+                preservation_item(3, "even", "even", "", vec![0, 1, 2]),
+            ],
+            target,
+        ),
+    )
+    .unwrap();
+    assert_eq!(
+        output.new_correspondence,
+        vec![
+            CallableCorrespondence {
+                item_id: 7,
+                logical_path: "odd".into(),
+                implementation_path: "odd".into(),
+                wrapper_path: Some("__proctor_wrapper_odd".into()),
+            },
+            CallableCorrespondence {
+                item_id: 3,
+                logical_path: "even".into(),
+                implementation_path: "even".into(),
+                wrapper_path: Some("__proctor_wrapper_even".into()),
+            },
+        ]
+    );
+    assert_eq!(
+        output
+            .current_items
+            .iter()
+            .map(|item| (
+                item.item_id,
+                item.logical_path.as_str(),
+                item.source_copy_path.as_str(),
+                item.implementation_path.as_str(),
+                item.wrapper_path.as_deref(),
+                item.transform_labels.as_slice(),
+            ))
+            .collect::<Vec<_>>(),
+        vec![
+            (
+                7,
+                "odd",
+                "__proctor_source_odd",
+                "odd",
+                Some("__proctor_wrapper_odd"),
+                &[0, 1, 2][..]
+            ),
+            (
+                3,
+                "even",
+                "__proctor_source_even",
+                "even",
+                Some("__proctor_wrapper_even"),
+                &[0, 1, 2][..]
+            ),
+        ]
+    );
+    let observation = compact(&output.observation_source);
+    assert!(observation.contains("crate::__proctor_source_even(pointer, n - 1)"));
+    assert!(observation.contains("crate::__proctor_source_odd(pointer, n - 1)"));
+    assert!(observation.contains("odd(pointer, n - 1)"));
+    assert!(observation.contains("even(pointer, n - 1)"));
+}
+
+#[test]
+fn two_argument_main_boundary_has_no_logical_copy() {
+    let source = r#"
+pub unsafe fn main_0(argc: i32, argv: *mut *mut i8) -> i32 { argc + (**argv != 0) as i32 }
+pub fn main() {
+    unsafe { std::process::exit(main_0(0, std::ptr::null_mut())) }
+}
+"#;
+    let target = r#"pub unsafe fn main_0(argc: i32, argv: &mut [&mut [i8]]) -> i32 {
+        #[proctor(0)] argc + (argv[0][0] != 0) as i32
+    }"#;
+    let output = replace_extended(
+        source,
+        &ReplacementRequest {
+            schema_version: 1,
+            items: vec![preservation_item(7, "main_0", "main_0", target, vec![0])],
+            transformation: target.into(),
+            accepted_correspondence: vec![],
+        },
+    )
+    .unwrap();
+    assert_eq!(output.current_items.len(), 1);
+    assert_eq!(output.current_items[0].logical_path, "main_0");
+    assert_eq!(output.new_correspondence.len(), 1);
+    assert!(!output.observation_source.contains("__proctor_source_main("));
+    assert!(
+        compact(&output.observation_source)
+            .contains("main_0(argc, command_line_arg_slices.as_mut_slice())")
+    );
+}
+
+#[test]
+fn macro_hidden_copy_call_rewrite_is_fatal() {
+    let source = r#"
+macro_rules! recurse { ($p:expr) => { read($p) }; }
+pub unsafe fn read(pointer: *const i32) -> i32 {
+    if pointer.is_null() { 0 } else { recurse!(pointer) }
+}
+"#;
+    let target = r#"pub unsafe fn read(pointer: Option<&i32>) -> i32 {
+        #[proctor(0)] if pointer.is_none() {
+            #[proctor(1)] 0
+        } else {
+            #[proctor(2)] read(pointer)
+        }
+    }"#;
+    let error = replace_extended(
+        source,
+        &ReplacementRequest {
+            schema_version: 1,
+            items: vec![preservation_item(7, "read", "read", target, vec![0, 1, 2])],
+            transformation: target.into(),
+            accepted_correspondence: vec![],
+        },
+    )
+    .unwrap_err();
+    assert_eq!(error.kind, ReplacementErrorKind::UnsupportedCallRewrite);
+}
+
+#[test]
+fn accepted_wrapper_correspondence_is_echoed_and_used() {
+    let source = r#"
+unsafe fn callee(mut pointer: &i32) -> i32 { *pointer }
+unsafe fn __proctor_wrapper_callee(mut pointer: *const i32) -> i32 {
+    callee(&*pointer)
+}
+pub unsafe fn caller(mut pointer: *const i32) -> i32 {
+    __proctor_wrapper_callee(pointer)
+}
+"#;
+    let target = r#"
+pub unsafe fn caller(mut pointer: &i32) -> i32 {
+    #[proctor(0)]
+    callee(pointer)
+}
+"#;
+    let accepted = CallableCorrespondence {
+        item_id: 3,
+        logical_path: "callee".into(),
+        implementation_path: "callee".into(),
+        wrapper_path: Some("__proctor_wrapper_callee".into()),
+    };
+    let request = ReplacementRequest {
+        schema_version: 1,
+        items: vec![preservation_item(7, "caller", "caller", target, vec![0])],
+        transformation: target.into(),
+        accepted_correspondence: vec![accepted.clone()],
+    };
+    let output = replace_extended(source, &request).unwrap();
+    assert_eq!(output.accepted_correspondence, vec![accepted]);
+    assert_eq!(
+        output.new_correspondence,
+        vec![CallableCorrespondence {
+            item_id: 7,
+            logical_path: "caller".into(),
+            implementation_path: "caller".into(),
+            wrapper_path: Some("__proctor_wrapper_caller".into()),
+        }]
+    );
+    assert_eq!(
+        output.current_items[0].source_copy_path,
+        "__proctor_source_caller"
+    );
+    assert_eq!(output.current_items[0].transform_labels, vec![0]);
+
+    let metadata = crate::ReplacementObservationMetadata::from_output(
+        &output,
+        output.replacement.source.as_bytes(),
+        b"",
+        output.observation_source.as_bytes(),
+    );
+    let document =
+        crate::observation::extract_observations_from_source(&output.observation_source, &metadata)
+            .unwrap();
+    assert_eq!(document.observations.len(), 1);
+    let observation = &document.observations[0];
+    assert_eq!(observation.pointer_anchors.len(), 1);
+    assert_eq!(observation.pointer_anchors[0].id, "<id0>");
+    assert_eq!(
+        observation.source_type,
+        crate::TypeTree::RawPointer {
+            mutability: crate::RawMutability::Const,
+            pointee: Box::new(crate::TypeTree::Primitive { name: "i32".into() }),
+        }
+    );
+    assert_eq!(
+        observation.target_type,
+        crate::TypeTree::Reference {
+            mutability: crate::RefMutability::Shared,
+            pointee: Box::new(crate::TypeTree::Primitive { name: "i32".into() }),
+        }
+    );
+    let mut omitted = metadata;
+    omitted.accepted_correspondence.clear();
+    assert!(
+        crate::observation::extract_observations_from_source(&output.observation_source, &omitted)
+            .unwrap()
+            .observations
+            .is_empty()
+    );
 }
 
 fn compile(source: &str) {
@@ -183,7 +725,8 @@ fn versioned_request_json_round_trip_preserves_rust() {
     let json = r#"{
   "schema_version": 1,
   "items": [{"id":7,"path":"f","name":"f","skeleton":"unsafe fn f(value: i32) -> i32 { #[proctor(0)] todo!() }","needs_transformation":true,"statements_requiring_transformation":[0]}],
-  "transformation": "unsafe fn f(value: i32) -> i32 {\n #[proctor(0)]\n value + 1\n}"
+  "transformation": "unsafe fn f(value: i32) -> i32 {\n #[proctor(0)]\n value + 1\n}",
+  "accepted_correspondence": []
 }"#;
     let request = replacement_request_from_json(json).unwrap();
     assert_eq!(request.schema_version, 1);
@@ -196,6 +739,7 @@ fn versioned_request_json_round_trip_preserves_rust() {
 fn replacement_discards_preserved_groups_without_validator() {
     let source = "pub unsafe fn f(value: i32) -> i32 { value + 1 }";
     let request = ReplacementRequest {
+        accepted_correspondence: vec![],
         schema_version: 1,
         items: vec![preservation_item(
             7,
@@ -217,6 +761,7 @@ fn preserved_restricted_conditional_has_only_its_outer_label() {
     let source =
         "pub unsafe fn f(value: i32) -> i32 { return value + (if value > 0 { -1 } else { 1 }); }";
     let request = ReplacementRequest {
+        accepted_correspondence: vec![],
         schema_version: 1,
         items: vec![preservation_item(
             7,
@@ -249,6 +794,7 @@ pub unsafe fn f(mut pointer: *mut i32, value: i32, flag: bool) -> i32 {
 }
 "#;
     let request = ReplacementRequest {
+        accepted_correspondence: vec![],
         schema_version: 1,
         items: vec![preservation_item(
             7,
@@ -309,6 +855,7 @@ pub unsafe fn f(mut state: State, value: i32) -> State {
 }
 "#;
     let request = ReplacementRequest {
+        accepted_correspondence: vec![],
         schema_version: 1,
         items: vec![preservation_item(
             7,
@@ -378,6 +925,7 @@ unsafe fn validate_me(flag: bool, pointer: *mut i32) -> i32 {
 }
 "#;
     let request = ReplacementRequest {
+        accepted_correspondence: vec![],
         schema_version: 1,
         items: vec![preservation_item(
             7,
@@ -409,6 +957,7 @@ fn replacement_rejects_extra_outer_groups_without_validator() {
         "unsafe fn f(value: i32) -> i32 { #[proctor(99)] attacker(); #[proctor(0)] 999 }",
     ] {
         let request = ReplacementRequest {
+            accepted_correspondence: vec![],
             schema_version: 1,
             items: vec![preservation_item(
                 7,
@@ -428,6 +977,7 @@ fn replacement_rejects_extra_outer_groups_without_validator() {
 fn replacement_uses_immutable_skeleton_header() {
     let source = "pub unsafe fn f(value: i32) -> i32 { value + 1 }";
     let request = ReplacementRequest {
+        accepted_correspondence: vec![],
         schema_version: 1,
         items: vec![preservation_item(
             7,
@@ -450,6 +1000,7 @@ fn replacement_uses_immutable_skeleton_header() {
 fn fully_preserved_body_can_change_signature_and_create_wrapper() {
     let source = "pub unsafe fn f(pointer: *mut i32) -> bool { pointer.is_null() }";
     let request = ReplacementRequest {
+        accepted_correspondence: vec![],
         schema_version: 1,
         items: vec![preservation_item(
             7,
@@ -472,6 +1023,7 @@ fn fully_preserved_body_can_change_signature_and_create_wrapper() {
 fn metadata_failure_is_atomic() {
     let source = "pub unsafe fn f(value: i32) -> i32 { value + 1 }";
     let request = ReplacementRequest {
+        accepted_correspondence: vec![],
         schema_version: 1,
         items: vec![ReplacementItem {
             id: 7,
@@ -510,6 +1062,7 @@ pub unsafe fn f(flag: bool, pointer: *mut i32) {
         (vec![0, 2], misplaced, "descendant_location_mismatch"),
     ] {
         let request = ReplacementRequest {
+            accepted_correspondence: vec![],
             schema_version: 1,
             items: vec![preservation_item(7, "f", "f", skeleton, labels)],
             transformation: transformation.to_owned(),
@@ -591,11 +1144,13 @@ fn request_json_rejects_unknown_fields_and_non_u64_numbers() {
 fn unsupported_version_and_empty_items_are_rejected() {
     for request in [
         ReplacementRequest {
+            accepted_correspondence: vec![],
             schema_version: 2,
             items: vec![replacement_item(7, "f".to_owned(), "f".to_owned())],
             transformation: "unsafe fn f() {}".to_owned(),
         },
         ReplacementRequest {
+            accepted_correspondence: vec![],
             schema_version: 1,
             items: vec![],
             transformation: String::new(),
@@ -617,6 +1172,7 @@ fn duplicate_ids_paths_and_names_are_rejected_deterministically() {
         vec![(7, "f", "f"), (8, "g", "f")],
     ] {
         let request = ReplacementRequest {
+            accepted_correspondence: vec![],
             schema_version: 1,
             items: items
                 .into_iter()
@@ -658,6 +1214,7 @@ fn transformation_must_be_exact_supported_requested_function_set() {
         "unsafe extern \"C\" fn f(mut count: i32, mut args: ...) { let _ = count; } unsafe fn g() {}",
     ] {
         let request = ReplacementRequest {
+            accepted_correspondence: vec![],
             schema_version: 1,
             items: items.clone(),
             transformation: transformation.to_owned(),
@@ -670,6 +1227,7 @@ fn transformation_must_be_exact_supported_requested_function_set() {
     }
 
     let unexpected = ReplacementRequest {
+        accepted_correspondence: vec![],
         schema_version: 1,
         items: vec![items[0].clone()],
         transformation: "unsafe fn f() {} unsafe fn z() {} unsafe fn a() {}".to_owned(),
@@ -1626,6 +2184,7 @@ pub unsafe fn caller(pointer: *mut i32, value: i32) -> i32 {
 }
 "#;
     let callee_request = ReplacementRequest {
+        accepted_correspondence: vec![],
         schema_version: 1,
         items: vec![preservation_item(
             7,
@@ -1642,6 +2201,7 @@ pub unsafe fn caller(pointer: *mut i32, value: i32) -> i32 {
     assert!(compact(&after_callee).contains("crate::__proctor_wrapper_callee(pointer, value)"));
 
     let caller_request = ReplacementRequest {
+        accepted_correspondence: vec![],
         schema_version: 1,
         items: vec![preservation_item(
             8,
@@ -1900,6 +2460,7 @@ unsafe fn bad(value: Box<[i32]>) { #[proctor(0)] drop(value); }
 fn replacement_output_has_exact_source_and_sorted_sidecar_shape() {
     let source = "pub unsafe fn first() {} pub unsafe fn second() {}";
     let request = ReplacementRequest {
+        accepted_correspondence: vec![],
         schema_version: 1,
         items: vec![
             preservation_item(
@@ -1947,6 +2508,7 @@ fn replacement_output_has_exact_source_and_sorted_sidecar_shape() {
     );
 
     let preserved = ReplacementRequest {
+        accepted_correspondence: vec![],
         schema_version: 1,
         items: vec![preservation_item(
             1,
@@ -1969,6 +2531,7 @@ fn replacement_output_has_exact_source_and_sorted_sidecar_shape() {
 fn one_source_statement_reports_the_complete_canonical_expansion_group() {
     let source = "pub unsafe fn expansion(mut pointer: *mut i32) -> i32 { *pointer }";
     let request = ReplacementRequest {
+        accepted_correspondence: vec![],
         schema_version: 1,
         items: vec![preservation_item(
             7,
@@ -1998,6 +2561,7 @@ fn one_source_statement_reports_the_complete_canonical_expansion_group() {
 fn canonical_after_restores_preserved_descendants_before_capture() {
     let source = "pub unsafe fn choose(mut pointer: *mut i32) -> i32 { if pointer.is_null() { 0 } else { *pointer } }";
     let request = ReplacementRequest {
+        accepted_correspondence: vec![],
         schema_version: 1,
         items: vec![preservation_item(
             7,
@@ -2036,6 +2600,7 @@ fn canonical_after_restores_preserved_descendants_before_capture() {
 fn overlapping_parent_and_descendant_labels_each_get_one_entry() {
     let source = "pub unsafe fn choose(mut pointer: *mut i32) -> i32 { if pointer.is_null() { 0 } else { *pointer } }";
     let request = ReplacementRequest {
+        accepted_correspondence: vec![],
         schema_version: 1,
         items: vec![preservation_item(
             7,
@@ -2085,6 +2650,7 @@ fn sidecar_excludes_preserved_labels_and_generated_variable_type_rows() {
     let source =
         "pub unsafe fn f(mut pointer: *mut i32) -> i32 { let value = 1; *pointer + value }";
     let request = ReplacementRequest {
+        accepted_correspondence: vec![],
         schema_version: 1,
         items: vec![preservation_item(
             7,
@@ -2120,6 +2686,7 @@ fn replacement_library_failures_return_no_typed_output() {
             "malformed label",
             "pub unsafe fn f() {}",
             ReplacementRequest {
+                accepted_correspondence: vec![],
                 schema_version: 1,
                 items: vec![preservation_item(
                     7,
@@ -2137,6 +2704,7 @@ fn replacement_library_failures_return_no_typed_output() {
             "target resolution",
             "pub unsafe fn f() {}",
             ReplacementRequest {
+                accepted_correspondence: vec![],
                 schema_version: 1,
                 items: vec![preservation_item(
                     7,

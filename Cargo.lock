@@ -1523,6 +1523,7 @@ dependencies = [
  "pointer_replacer",
  "serde",
  "serde_json",
+ "unicode-ident",
  "utils",
 ]
 

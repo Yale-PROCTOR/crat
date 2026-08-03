@@ -3434,6 +3434,7 @@ fn existing_pointer_and_protocol_regressions_change_only_rendered_tools_types() 
     );
 
     let replacement_request = ReplacementRequest {
+        accepted_correspondence: vec![],
         schema_version: 1,
         items: vec![ReplacementItem {
             id: tree_function.id,
@@ -3950,6 +3951,7 @@ fn generated_local_name_validates_replaces_and_compiles_in_original_module() {
         replace_items(
             &normalized,
             &ReplacementRequest {
+                accepted_correspondence: vec![],
                 schema_version: 1,
                 items: vec![ReplacementItem {
                     id: record.id,
