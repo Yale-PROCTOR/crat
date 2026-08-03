@@ -951,11 +951,14 @@ fn extract_with_tcx(
             let mut selected = vec![];
             for anchor in &tree.anchors {
                 let Some(target_binding) = bindings.get(&anchor.binding) else { continue };
-                let Some(root) = select_region(anchor.expression, &tree, &ast_to_hir, tcx) else {
+                let Some((root, promoted_field)) =
+                    select_region(anchor.expression, &tree, &ast_to_hir, tcx)
+                else {
                     continue;
                 };
                 selected.push(SelectedRegion {
                     root,
+                    promoted_field,
                     anchors: vec![AnchorPair {
                         source_binding: anchor.binding,
                         target_binding: *target_binding,
@@ -966,16 +969,25 @@ fn extract_with_tcx(
             if regions_overlap(&selected, &tree) {
                 continue;
             }
+            let promoted_field_ids = selected
+                .iter()
+                .filter(|region| region.promoted_field)
+                .map(|region| region.root)
+                .collect::<HashSet<_>>();
             let mut selected_ids = selected
                 .iter()
                 .map(|region| region.root)
                 .collect::<HashSet<_>>();
             selected_ids.extend(tree.opaque.iter().copied());
+            let selected_expressions = SelectedExpressions {
+                all: &selected_ids,
+                promoted_fields: &promoted_field_ids,
+            };
             let mut mappings = HashMap::new();
             if !align_expression(
                 source_expression,
                 target_expression,
-                &selected_ids,
+                &selected_expressions,
                 &bindings,
                 &callable_correspondence,
                 &ast_to_hir,
@@ -1529,7 +1541,13 @@ struct AnchorPair {
 
 struct SelectedRegion {
     root: NodeId,
+    promoted_field: bool,
     anchors: Vec<AnchorPair>,
+}
+
+struct SelectedExpressions<'a> {
+    all: &'a HashSet<NodeId>,
+    promoted_fields: &'a HashSet<NodeId>,
 }
 
 fn select_region(
@@ -1537,8 +1555,9 @@ fn select_region(
     tree: &ExpressionTree<'_>,
     ast_to_hir: &utils::ir::AstToHir,
     tcx: TyCtxt<'_>,
-) -> Option<NodeId> {
+) -> Option<(NodeId, bool)> {
     let mut current = start;
+    let mut promoted_field = false;
     while let Some(edge) = tree.parents.get(&current).copied() {
         let expression = tree.expressions[&current];
         let parent = tree.expressions.get(&edge.parent).copied();
@@ -1649,12 +1668,17 @@ fn select_region(
             | ParentRole::ReturnOperand
             | ParentRole::StructField
             | ParentRole::Boundary => 0,
-            ParentRole::BranchTail | ParentRole::MatchScrutinee | ParentRole::FieldBase => {
+            ParentRole::BranchTail | ParentRole::MatchScrutinee => {
                 if current_pointer_like {
                     return None;
                 } else {
                     0
                 }
+            }
+            ParentRole::FieldBase => {
+                current = edge.parent;
+                promoted_field = true;
+                break;
             }
             ParentRole::IndexIndex => {
                 let parent = parent?;
@@ -1678,7 +1702,7 @@ fn select_region(
         }
         current = edge.parent;
     }
-    Some(current)
+    Some((current, promoted_field))
 }
 
 fn resolved_builtin_raw_pointer_method(
@@ -1783,6 +1807,7 @@ fn merge_regions(regions: &mut Vec<SelectedRegion>) {
             .iter_mut()
             .find(|existing| existing.root == region.root)
         {
+            existing.promoted_field |= region.promoted_field;
             for anchor in region.anchors {
                 if !existing
                     .anchors
@@ -1820,14 +1845,29 @@ fn regions_overlap(regions: &[SelectedRegion], tree: &ExpressionTree<'_>) -> boo
 fn align_expression<'a>(
     source: &Expr,
     target: &'a Expr,
-    selected: &HashSet<NodeId>,
+    selected: &SelectedExpressions<'_>,
     bindings: &HashMap<hir::HirId, hir::HirId>,
     callables: &HashMap<DefId, u64>,
     ast_to_hir: &utils::ir::AstToHir,
     tcx: TyCtxt<'_>,
     mappings: &mut HashMap<NodeId, &'a Expr>,
 ) -> bool {
-    if selected.contains(&source.id) {
+    if selected.all.contains(&source.id) {
+        if selected.promoted_fields.contains(&source.id) {
+            let (
+                ExprKind::Field(source_base, source_field),
+                ExprKind::Field(target_base, target_field),
+            ) = (&source.kind, &target.kind)
+            else {
+                return false;
+            };
+            if !same_resolved(
+                resolved_field(source_base, source_field.name, ast_to_hir, tcx),
+                resolved_field(target_base, target_field.name, ast_to_hir, tcx),
+            ) {
+                return false;
+            }
+        }
         mappings.insert(source.id, target);
         return true;
     }
@@ -2069,7 +2109,7 @@ fn align_expression<'a>(
 fn align_optional_expression<'a>(
     source: Option<&Expr>,
     target: Option<&'a Expr>,
-    selected: &HashSet<NodeId>,
+    selected: &SelectedExpressions<'_>,
     bindings: &HashMap<hir::HirId, hir::HirId>,
     callables: &HashMap<DefId, u64>,
     ast_to_hir: &utils::ir::AstToHir,
@@ -2089,7 +2129,7 @@ fn align_optional_expression<'a>(
 fn align_block<'a>(
     source: &rustc_ast::Block,
     target: &'a rustc_ast::Block,
-    selected: &HashSet<NodeId>,
+    selected: &SelectedExpressions<'_>,
     bindings: &HashMap<hir::HirId, hir::HirId>,
     callables: &HashMap<DefId, u64>,
     ast_to_hir: &utils::ir::AstToHir,
@@ -5239,7 +5279,7 @@ unsafe fn target(mut pointer: &[i32]) -> i32 {
     }
 
     #[test]
-    fn field_base_allows_deref_removal_and_anonymizes_field() {
+    fn promotes_immediate_field_and_serializes_owner() {
         let source = r#"
 struct Pair { value: i32 }
 unsafe fn source_copy(mut pointer: *const Pair) -> i32 {
@@ -5251,13 +5291,141 @@ unsafe fn target(mut pointer: &Pair) -> i32 {
 "#;
         let document = extract_case(source, "source_copy", "target", vec![0]).unwrap();
         assert_eq!(document.observations.len(), 1);
+        let observation = &document.observations[0];
+        let expected_field = FieldIdentity::Local {
+            owner: AdtIdentity::Local {
+                id: "<struct0>".into(),
+            },
+            id: "<field0>".into(),
+        };
+        let Expression::Field {
+            base: source_base,
+            field: source_field,
+        } = &observation.source_expression
+        else {
+            panic!("source root was not the promoted field")
+        };
+        assert_eq!(source_field, &expected_field);
         assert!(matches!(
-            document.observations[0].source_expression,
+            source_base.as_ref(),
+            Expression::Unary {
+                operator: UnaryOperator::Deref,
+                operand,
+            } if matches!(operand.as_ref(), Expression::Path { .. })
+        ));
+        let Expression::Field {
+            base: target_base,
+            field: target_field,
+        } = &observation.target_expression
+        else {
+            panic!("target root was not the promoted field")
+        };
+        assert_eq!(target_field, &expected_field);
+        assert!(matches!(target_base.as_ref(), Expression::Path { .. }));
+        assert_eq!(observation.pointer_anchors.len(), 1);
+        assert_eq!(observation.pointer_anchors[0].id, "<id0>");
+    }
+
+    #[test]
+    fn nested_field_promotes_only_inner_parent() {
+        let source = r#"
+struct Inner { value: i32 }
+struct Outer { inner: Inner }
+unsafe fn source_copy(mut pointer: *const Outer) -> i32 {
+    #[proctor(0)] (*pointer).inner.value
+}
+unsafe fn target(mut pointer: &Outer) -> i32 {
+    #[proctor(0)] pointer.inner.value
+}
+"#;
+        let document = extract_case(source, "source_copy", "target", vec![0]).unwrap();
+        assert_eq!(document.observations.len(), 1);
+        let observation = &document.observations[0];
+        let expected_field = FieldIdentity::Local {
+            owner: AdtIdentity::Local {
+                id: "<struct0>".into(),
+            },
+            id: "<field0>".into(),
+        };
+        let Expression::Field {
+            base: source_base,
+            field: source_field,
+        } = &observation.source_expression
+        else {
+            panic!("source root was not the immediate promoted field")
+        };
+        assert_eq!(source_field, &expected_field);
+        assert!(matches!(
+            source_base.as_ref(),
             Expression::Unary {
                 operator: UnaryOperator::Deref,
                 ..
             }
         ));
+        let Expression::Field {
+            base: target_base,
+            field: target_field,
+        } = &observation.target_expression
+        else {
+            panic!("target root was not the immediate promoted field")
+        };
+        assert_eq!(target_field, &expected_field);
+        assert!(matches!(target_base.as_ref(), Expression::Path { .. }));
+    }
+
+    #[test]
+    fn different_resolved_field_skips_unit() {
+        let source = r#"
+struct Pair { left: i32, right: i32 }
+unsafe fn source_copy(mut pointer: *const Pair) -> i32 {
+    #[proctor(0)] (*pointer).left
+}
+unsafe fn target(mut pointer: &Pair) -> i32 {
+    #[proctor(0)] pointer.right
+}
+"#;
+        let document = extract_case(source, "source_copy", "target", vec![0]).unwrap();
+        assert!(document.observations.is_empty());
+    }
+
+    #[test]
+    fn promoted_regions_participate_in_overlap_check() {
+        let source = r#"
+struct Pair { value: i32 }
+unsafe fn source_copy(mut pointer: *const Pair, mut index: *const isize) -> i32 {
+    #[proctor(0)] (*pointer.offset(*index)).value
+}
+unsafe fn target(mut pointer: &[Pair], mut index: &isize) -> i32 {
+    #[proctor(0)] pointer[*index as usize].value
+}
+"#;
+        let document = extract_case(source, "source_copy", "target", vec![0]).unwrap();
+        assert!(document.observations.is_empty());
+    }
+
+    #[test]
+    fn nonfield_region_behavior_is_unchanged() {
+        let source = r#"
+unsafe fn source_copy(mut pointer: *const i32) -> i32 {
+    #[proctor(0)] *pointer
+}
+unsafe fn target(mut pointer: &i32) -> i32 {
+    #[proctor(0)] *pointer
+}
+"#;
+        let document = extract_case(source, "source_copy", "target", vec![0]).unwrap();
+        assert_eq!(document.observations.len(), 1);
+        let observation = &document.observations[0];
+        let expected = Expression::Unary {
+            operator: UnaryOperator::Deref,
+            operand: Box::new(Expression::Path {
+                value: ValueIdentity::Binding { id: "<id0>".into() },
+            }),
+        };
+        assert_eq!(observation.source_expression, expected);
+        assert_eq!(observation.target_expression, expected);
+        assert_eq!(observation.pointer_anchors.len(), 1);
+        assert_eq!(observation.pointer_anchors[0].id, "<id0>");
     }
 
     #[test]
