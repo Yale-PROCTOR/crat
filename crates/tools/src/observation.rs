@@ -900,22 +900,12 @@ fn extract_with_tcx(
                     message: format!("target label {} ordinal disappeared", label.label),
                 });
             };
-            let source_expression =
-                statement_expression(source_statement).ok_or_else(|| ObservationError {
-                    code: "ast_hir_mapping",
-                    message: format!(
-                        "source statement for transform label {} has no expression",
-                        label.label
-                    ),
-                })?;
-            let target_expression =
-                statement_expression(target_statement).ok_or_else(|| ObservationError {
-                    code: "ast_hir_mapping",
-                    message: format!(
-                        "target statement for transform label {} has no expression",
-                        label.label
-                    ),
-                })?;
+            let (Some(source_expression), Some(target_expression)) = (
+                statement_expression(source_statement),
+                statement_expression(target_statement),
+            ) else {
+                continue;
+            };
             for (side, expression) in [("source", source_expression), ("target", target_expression)]
             {
                 if ast_to_hir.get_expr(expression.id, tcx).is_none() {
@@ -1320,7 +1310,9 @@ impl<'a> ExpressionTree<'a> {
         ast_to_hir: &utils::ir::AstToHir,
         tcx: TyCtxt<'_>,
     ) {
-        if let ExprKind::Paren(inner) = &expression.kind {
+        if !self.opaque.contains(&expression.id)
+            && let ExprKind::Paren(inner) = &expression.kind
+        {
             self.add(inner, parent, role, ast_to_hir, tcx);
             return;
         }
@@ -4127,6 +4119,30 @@ unsafe fn target(mut pointer: &mut i32) -> i32 {
     }
 
     #[test]
+    fn uninitialized_type_changing_local_declaration_is_skipped() {
+        let source = r#"
+unsafe fn source_copy(pointer: *mut f32) -> *mut f32 {
+    #[proctor(0)] let mut k: *mut f32;
+    #[proctor(1)] pointer
+}
+unsafe fn target(pointer: &mut [f32]) -> &mut [f32] {
+    #[proctor(0)] let mut k: &mut [f32];
+    #[proctor(1)] pointer
+}
+"#;
+        let document = extract_case(source, "source_copy", "target", vec![0, 1]).unwrap();
+        assert_eq!(document.observations.len(), 1, "{document:?}");
+        assert!(matches!(
+            document.observations[0].source_expression,
+            Expression::Path { .. }
+        ));
+        assert!(matches!(
+            document.observations[0].target_expression,
+            Expression::Path { .. }
+        ));
+    }
+
+    #[test]
     fn shadowed_locals_remain_distinct() {
         let source = r#"
 unsafe fn read(pointer: &mut i32) -> i32 {
@@ -4339,6 +4355,43 @@ unsafe fn target(mut pointer: Option<&i32>) -> i32 {
             serde_json::to_value(&document.observations).unwrap(),
             exact_optional_pointer_observations()
         );
+    }
+
+    #[test]
+    fn parenthesized_nested_assignment_stays_opaque_to_outer_control() {
+        let source = r#"
+struct Pair { first: i32, second: i32 }
+unsafe fn source_copy(mut condition: *const Pair, mut output: *mut Pair) {
+    #[proctor(0)]
+    if (*condition).first < (*condition).second {
+        #[proctor(1)] ((*output).first = 0);
+    }
+}
+unsafe fn target(mut condition: &Pair, mut output: &mut Pair) {
+    #[proctor(0)]
+    if condition.first < condition.second {
+        #[proctor(1)] output.first = 0;
+    }
+}
+"#;
+        let document = extract_case(source, "source_copy", "target", vec![0, 1]).unwrap();
+        assert_eq!(document.observations.len(), 3);
+        for observation in &document.observations[..2] {
+            assert!(matches!(
+                observation.pointer_anchors[0].target_type,
+                TypeTree::Reference {
+                    mutability: RefMutability::Shared,
+                    ..
+                }
+            ));
+        }
+        assert!(matches!(
+            document.observations[2].pointer_anchors[0].target_type,
+            TypeTree::Reference {
+                mutability: RefMutability::Mutable,
+                ..
+            }
+        ));
     }
 
     #[test]
