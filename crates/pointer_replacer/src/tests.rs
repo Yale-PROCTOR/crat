@@ -9720,7 +9720,6 @@ mod borrow_ownership_coherence {
             borrow::{GBorrowInferCtxt, demote_pointers_iterative_with_fields},
             borrow_ownership::{
                 CrateCtxt, SlotKind,
-                borrow_engine::debug_borrow_replay_dump,
                 borrow_verify::{
                     SlotConflict, materialize_guards, model_accepts, revalidate,
                     revalidate_replaying, verify_to_fixpoint,
@@ -11829,16 +11828,6 @@ unsafe fn f(mut p: *mut i32) -> i32 {
                 let f = function_by_name(&program, "f");
                 let p = local_by_var_name(tcx, f, "p");
                 let q = local_by_var_name(tcx, f, "q");
-                eprintln!(
-                    "S1 PLAIN FACT DUMP\n{}",
-                    debug_borrow_replay_dump(
-                        &program,
-                        f,
-                        |_: LocalDefId| |_: Local| true,
-                        |_: LocalDefId| |_: Local| false,
-                        |_: LocalDefId| |_: Local| true,
-                    )
-                );
                 let (slots, model) = s1_accept_model(&program, f);
                 let p = local_slot(&slots, f, p, 0);
                 let q = local_slot(&slots, f, q, 0);
@@ -11873,16 +11862,6 @@ unsafe fn f(mut p: *mut i32) -> i32 {
                 let f = function_by_name(&program, "f");
                 let p = local_by_var_name(tcx, f, "p");
                 let q = local_by_var_name(tcx, f, "q");
-                eprintln!(
-                    "S1 C-NEXT FACT DUMP\n{}",
-                    debug_borrow_replay_dump(
-                        &program,
-                        f,
-                        |_: LocalDefId| |_: Local| true,
-                        |_: LocalDefId| |_: Local| false,
-                        |_: LocalDefId| |_: Local| true,
-                    )
-                );
                 let (slots, model) = s1_accept_model(&program, f);
                 let p = local_slot(&slots, f, p, 0);
                 let q = local_slot(&slots, f, q, 0);
@@ -11913,16 +11892,6 @@ unsafe fn f(mut p: *mut i32) -> i32 {
                 let f = function_by_name(&program, "f");
                 let p = local_by_var_name(tcx, f, "p");
                 let q = local_by_var_name(tcx, f, "q");
-                eprintln!(
-                    "S1 CONTROL FACT DUMP\n{}",
-                    debug_borrow_replay_dump(
-                        &program,
-                        f,
-                        |_: LocalDefId| |_: Local| true,
-                        |_: LocalDefId| |_: Local| false,
-                        |_: LocalDefId| |_: Local| true,
-                    )
-                );
                 let (slots, model) = s1_accept_model(&program, f);
                 eprintln!(
                     "S1 control accepted kinds: p={:?} q={:?}",
@@ -11968,16 +11937,6 @@ unsafe fn f(mut p: *mut i32) -> i32 {
                 let f = function_by_name(&program, "f");
                 let p = local_by_var_name(tcx, f, "p");
                 let q = local_by_var_name(tcx, f, "q");
-                eprintln!(
-                    "S1 POST-WRITE FACT DUMP\n{}",
-                    debug_borrow_replay_dump(
-                        &program,
-                        f,
-                        |_: LocalDefId| |_: Local| true,
-                        |_: LocalDefId| |_: Local| false,
-                        |_: LocalDefId| |_: Local| true,
-                    )
-                );
                 let (slots, model) = s1_accept_model(&program, f);
                 let p = local_slot(&slots, f, p, 0);
                 let q = local_slot(&slots, f, q, 0);
@@ -12015,16 +11974,6 @@ unsafe fn f(mut p: *mut i32) -> i32 {
                 let slots = CrateSlots::build(&program);
                 let p_slot = local_slot(&slots, f, p, 0);
                 let q_slot = local_slot(&slots, f, q, 0);
-                eprintln!(
-                    "S1 TREE-GROUP FACT DUMP\n{}",
-                    debug_borrow_replay_dump(
-                        &program,
-                        f,
-                        move |did: LocalDefId| move |local: Local| !(did == f && local == p),
-                        move |did: LocalDefId| move |local: Local| did == f && local == p,
-                        |_: LocalDefId| |_: Local| true,
-                    )
-                );
                 let conflicts = revalidate_replaying(
                     &program,
                     &slots,
