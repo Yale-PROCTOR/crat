@@ -21,6 +21,7 @@ if [ -d "$1/$name" ]; then
     chmod -R u+w "$1/$name"
 fi
 rm -rf "$1/$name"
+mkdir -p "$1"
 cp -r "$script_dir/$name" $1
 
 (
