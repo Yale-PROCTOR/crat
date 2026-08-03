@@ -31,7 +31,7 @@ mod utils;
 
 pub use rewriter::{
     BytemuckDependency, Config, replace_local_borrows, rewrite_array_local_provenance,
-    rewrite_struct_arrays,
+    rewrite_epoch_split, rewrite_struct_arrays,
 };
 
 #[cfg(test)]

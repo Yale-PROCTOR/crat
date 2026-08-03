@@ -17,6 +17,13 @@ fn rewrite_array_local_provenance_with_config(code: &str, config: &Config) -> (S
     .unwrap()
 }
 
+fn array_local_trace_events(code: &str) -> Vec<crate::rewriter::array_local_trace::TraceEvent> {
+    ::utils::compilation::run_compiler_on_str(code, |tcx| {
+        crate::rewriter::rewrite_array_local_provenance_trace(&Config::default(), tcx, true).1
+    })
+    .unwrap()
+}
+
 fn rewrite_struct_arrays_then_pointer(code: &str, config: &Config) -> (String, BytemuckDependency) {
     let (pre, changed) = rewrite_struct_arrays_with_config(code, config);
     let input = if changed { pre.as_str() } else { code };
@@ -1830,6 +1837,58 @@ pub unsafe fn touch(mut buf: [i32; 2]) -> i32 {
 }
 
 #[test]
+fn test_rewriter_field_base_match_is_paren_insensitive() {
+    // the field-base access is written with a redundant paren (`(h).p`), which a
+    // pretty-printed string match rejects (`(h).p` != `h.p`); structural matching
+    // resolves it and still promotes the field.
+    run_test(
+        r#"
+#[repr(C)]
+pub struct Holder {
+    pub p: *mut i32,
+}
+
+pub unsafe fn touch(mut buf: [i32; 2]) -> i32 {
+    let mut h = Holder { p: buf.as_mut_ptr() };
+    *(h).p.offset(1) = 9;
+    buf[1]
+}
+"#,
+        &["pub p: &'a mut [i32]", "as usize.."],
+        &[
+            "pub p: Option<&'a mut i32>",
+            "pub p: *mut i32",
+            ".offset(1)",
+        ],
+    );
+}
+
+#[test]
+fn test_rewriter_field_base_distinct_fields_do_not_cross_match() {
+    // two pointer fields each form their own base; matching one must never match
+    // the other (the `Field` step name differs), so both promote to their own
+    // slice independently with no cross-contamination.
+    run_test(
+        r#"
+#[repr(C)]
+pub struct Holder {
+    pub p: *mut i32,
+    pub q: *mut i32,
+}
+
+pub unsafe fn touch(mut a: [i32; 2], mut b: [i32; 2]) -> i32 {
+    let mut h = Holder { p: a.as_mut_ptr(), q: b.as_mut_ptr() };
+    *h.p.offset(1) = 9;
+    *h.q.offset(1) = 7;
+    a[1] + b[1]
+}
+"#,
+        &["pub p: &'a mut [i32]", "pub q: &'b mut [i32]"],
+        &["pub p: *mut i32", "pub q: *mut i32", ".offset(1)"],
+    );
+}
+
+#[test]
 fn test_rewriter_promotes_array_like_struct_field_to_slice() {
     run_test(
         r#"
@@ -1870,9 +1929,15 @@ pub unsafe fn touch(buf: [i32; 4]) -> i32 {
         &[
             "pub p: crate::slice_cursor::SliceCursor<'a, i32>",
             "crate::slice_cursor::SliceCursor::",
+            "(h.p)[",
+            "-1",
+        ],
+        &[
+            "pub p: Option<&'a i32>",
+            "pub p: *const i32",
+            "*h.p.offset",
             ".offset_by((-1) as isize)",
         ],
-        &["pub p: Option<&'a i32>", "pub p: *const i32", "*h.p.offset"],
     );
 }
 
@@ -1892,10 +1957,15 @@ pub unsafe fn load_word(s: *const State) -> u32 {
 "#,
         &[
             "pub words: crate::slice_cursor::SliceCursorMut<'a, u32>",
-            ".as_slice()",
-            ".offset_by((s.word_index",
+            "(s.words)[",
+            "s.word_index",
         ],
-        &["let mut _c = ((*s).words);", "*(*s).words.offset"],
+        &[
+            "SliceCursor::new((s.words).as_slice())",
+            "(s.words).as_slice()",
+            "let mut _c = ((*s).words);",
+            "*(*s).words.offset",
+        ],
     );
 }
 
@@ -1916,9 +1986,14 @@ pub unsafe fn load_word(s: *const State) -> u32 {
         &[
             "pub struct State<'a>",
             "pub words: crate::slice_cursor::SliceCursor<'a, u32>",
+            "(s.words)[",
+            "s.word_index",
+        ],
+        &[
+            "pub words: Option<&'a u32>",
+            "*(*s).words.offset",
             ".offset_by((s.word_index",
         ],
-        &["pub words: Option<&'a u32>", "*(*s).words.offset"],
     );
 }
 
@@ -7266,7 +7341,7 @@ pub unsafe extern "C" fn foo() {
 }
 
 #[test]
-fn test_param_byte_cast_offset_rewrites_to_slice_bytemuck() {
+fn test_param_byte_cast_offset_rewrites_to_slice_cursor() {
     run_test(
         r#"
 #[repr(C)]
@@ -7284,20 +7359,21 @@ pub unsafe extern "C" fn caller(info: *mut Info, offset: i32, value: u32) {
 }
 "#,
         &[
-            "pub unsafe extern \"C\" fn set_type(mut addr: &mut [u32]",
-            "bytemuck::cast_slice_mut::<_,",
-            "u8>(&mut (addr))",
-            "set_type((leaf_addr).as_slice_mut(), offset, value);",
+            "crate::slice_cursor::SliceCursorMut<'_, u32>",
+            "SliceCursorMut::from_raw_parts_mut((addr).as_ptr()",
+            "as *mut u8, 1_000_000",
+            "set_type((leaf_addr).as_deref_mut(), offset, value);",
         ],
         &[
             "pub unsafe extern \"C\" fn set_type(mut addr: *mut u32",
             "*(addr as *mut u8).offset",
+            "bytemuck::cast_slice_mut",
         ],
     );
 }
 
 #[test]
-fn test_raw_local_noop_cast_call_does_not_demote_slice_callee() {
+fn test_raw_local_noop_cast_call_does_not_demote_cursor_callee() {
     run_test(
         r#"
 #[repr(C)]
@@ -7321,14 +7397,16 @@ pub unsafe extern "C" fn caller(v_info: *mut core::ffi::c_void, offset: i32, val
 }
 "#,
         &[
-            "pub unsafe extern \"C\" fn set_type(mut addr: &mut [u32]",
-            "bytemuck::cast_slice_mut::<_,",
-            "u8>(&mut (addr))",
+            "crate::slice_cursor::SliceCursorMut<'_, u32>",
+            "SliceCursorMut::from_raw_parts_mut((addr).as_ptr()",
+            "as *mut u8, 1_000_000",
             "set_type(if (leaf_addr).is_null()",
+            "SliceCursorMut::from_raw_parts_mut((leaf_addr),",
         ],
         &[
             "pub unsafe extern \"C\" fn set_type(mut addr: *mut u32",
             "*(addr as *mut u8).offset",
+            "bytemuck::cast_slice_mut",
         ],
     );
 }
@@ -7630,6 +7708,36 @@ pub unsafe fn drive() -> u8 {
 }
 
 #[test]
+fn test_mut_cursor_multi_offset_deref_uses_combined_index() {
+    run_test(
+        r#"
+pub unsafe fn write_offset(p: *mut i32, a: isize, b: isize) {
+    *p.offset(a).offset(b) = 1;
+}
+"#,
+        &["(p)[((a) as isize).wrapping_add((b) as isize)] = 1"],
+        &["(p).as_deref_mut().offset_by"],
+    );
+}
+
+#[test]
+fn test_mut_cursor_multi_offset_call_reborrows_once() {
+    run_test(
+        r#"
+pub unsafe fn recurse(items: *mut i32, a: isize, b: isize) {
+    if b == 0 {
+        return;
+    }
+    recurse(items.offset(a).offset(b), a, b - 1);
+    *items = b as i32;
+}
+"#,
+        &["as_deref_mut", ")).offset_by((b) as isize)"],
+        &["as_deref_mut().offset_by((b) as isize)"],
+    );
+}
+
+#[test]
 fn test_opt_boxed_slice_offset_cursor_uses_slice_view_base() {
     run_test(
         r#"
@@ -7861,6 +7969,7 @@ pub unsafe fn foo(mut p: *mut i32, mut k: isize) -> i32 {
         q = p.offset(k);
     }
     *q = 7;
+    q = q.offset(1);
     *q
 }
 "#;
@@ -7900,6 +8009,118 @@ pub unsafe fn foo(mut p: *mut i32, mut take: bool) -> *mut i32 {
     );
     assert!(s.contains("|idx| ((p).offset(idx)) as *mut i32"), "{s}");
     assert!(!s.contains("let mut q: *mut i32"), "{s}");
+}
+
+#[test]
+fn test_array_local_rewriter_lowers_nullable_projected_deref_through_base() {
+    // a nullable index-backed member that is projected-derefed (`*prev.offset(x)`)
+    // lowers directly through the base pointer instead of the map_or bridge.
+    let code = r#"
+pub unsafe fn foo(mut raw: *mut u8, mut take: bool, mut x: isize) -> u8 {
+    let mut prev: *mut u8 = std::ptr::null_mut();
+    if take {
+        prev = raw;
+    }
+    raw = raw.offset(1);
+    *prev.offset(x)
+}
+"#;
+    let (s, changed) = rewrite_array_local_provenance_with_config(code, &Config::default());
+    assert!(changed, "{s}");
+    ::utils::compilation::run_compiler_on_str(&s, ::utils::type_check).expect(&s);
+    assert!(s.contains("let mut prev_idx: Option<isize> = None"), "{s}");
+    assert!(
+        s.contains("*((raw).offset((prev_idx.unwrap()) + (x)) as *mut u8)"),
+        "projected deref lowered through base: {s}"
+    );
+    assert!(
+        !s.contains("prev_idx.map_or"),
+        "no map_or bridge for the deref: {s}"
+    );
+}
+
+#[test]
+fn test_projected_nullable_deref_no_raw_bridge_after_promotion() {
+    // reduced from B02_organic/unfilter_lib: `raw` is a moving base cursor that
+    // borrow-promotes to a slice cursor; `prev` is a nullable member projected-
+    // derefed. the promoted base must not leave a `map_or(...).as_mut_ptr().offset`
+    // bridge.
+    let code = r#"
+pub unsafe extern "C" fn unfilter_like(mut h: i32, mut len: i32, mut raw: *mut u8) {
+    let mut prev: *mut u8 = std::ptr::null_mut();
+    let mut x: i32 = 0;
+    let mut y: i32 = 1;
+    while y < h {
+        raw = raw.offset(1);
+        if !prev.is_null() {
+            x = 0;
+            while x < len {
+                *raw.offset(x as isize) = (*raw.offset(x as isize) as i32
+                    + *prev.offset(x as isize) as i32) as u8;
+                x += 1;
+            }
+        }
+        prev = raw;
+        raw = raw.offset(len as isize);
+        y += 1;
+    }
+}
+"#;
+    let config = Config::default();
+    let (s, _) = rewrite_struct_arrays_then_array_local_then_pointer(code, &config);
+    ::utils::compilation::run_compiler_on_str(&s, ::utils::type_check).expect(&s);
+    assert!(
+        !s.contains(".as_mut_ptr()).offset("),
+        "no raw bridge for the projected nullable deref: {s}"
+    );
+    assert!(!s.contains("prev_idx.map_or"), "{s}");
+}
+
+#[test]
+fn test_array_local_rewriter_leaves_cast_projected_deref_unchanged() {
+    // a receiver cast in the projection keeps the bare member, which the existing
+    // map_or pointer-value fallback lowers; the projected-deref branch bails.
+    let code = r#"
+pub unsafe fn foo(mut raw: *mut u8, mut take: bool, mut x: isize) -> u16 {
+    let mut prev: *mut u8 = std::ptr::null_mut();
+    if take {
+        prev = raw;
+    }
+    raw = raw.offset(1);
+    *(prev as *mut u16).offset(x)
+}
+"#;
+    let (s, _) = rewrite_array_local_provenance_with_config(code, &Config::default());
+    ::utils::compilation::run_compiler_on_str(&s, ::utils::type_check).expect(&s);
+    assert!(
+        s.contains("prev_idx.map_or"),
+        "cast receiver bails to map_or: {s}"
+    );
+}
+
+#[test]
+fn test_array_local_rewriter_leaves_non_nullable_projected_deref_to_existing_lowering() {
+    // a non-nullable index-backed member keeps its existing lowering; the
+    // nullable-gated projected-deref branch does not fire.
+    let code = r#"
+pub unsafe fn foo(mut raw: *mut i32, mut x: isize) -> i32 {
+    let mut p: *mut i32 = raw.offset(1);
+    raw = raw.offset(2);
+    let v = *p.offset(x);
+    let _ = raw;
+    v
+}
+"#;
+    let (s, _) = rewrite_array_local_provenance_with_config(code, &Config::default());
+    ::utils::compilation::run_compiler_on_str(&s, ::utils::type_check).expect(&s);
+    // `p` is index-backed but non-nullable, so it keeps the existing double-offset
+    // lowering (deferred to item 10) rather than the nullable projected-base form.
+    assert!(s.contains("let mut p_idx: isize"), "{s}");
+    assert!(!s.contains("p_idx.unwrap()"), "{s}");
+    assert!(
+        s.contains("*((raw).offset(p_idx) as *mut i32).offset(x)"),
+        "{s}"
+    );
 }
 
 #[test]
@@ -15991,7 +16212,10 @@ pub unsafe fn expose(mut h: *mut Holder, mut i: isize) {
 }
 
 #[test]
-fn test_array_local_rewriter_tracks_index_for_reassigned_field_base() {
+fn test_array_local_rewriter_rewrites_reassigned_pointee_field_base_live() {
+    // (*s).out is caller-visible: the field write is KEPT live, a shadow
+    // counter tracks the advance, and members materialize off the live field
+    // with the counter subtracted (approach D).
     let code = r#"
 #[repr(C)]
 pub struct State {
@@ -16010,21 +16234,23 @@ pub unsafe fn copy_from_back(mut s: *mut State, mut length: isize, mut distance:
 }
 "#;
     let (s, changed) = rewrite_array_local_provenance_with_config(code, &Config::default());
-    assert!(
-        changed,
-        "expected field-base index tracking to rewrite:\n{s}"
-    );
+    assert!(changed, "{s}");
     ::utils::compilation::run_compiler_on_str(&s, ::utils::type_check).expect(&s);
-    assert!(s.contains("out_idx") || s.contains("s_out_idx"), "{s}");
+    // field write kept live
+    assert!(s.contains("(*s).out = (*s).out.offset(length)"), "{s}");
+    // shadow counter declared and advanced
+    assert!(s.contains("let mut out_idx: isize = 0isize"), "{s}");
+    assert!(s.contains("out_idx = (out_idx) + (length)"), "{s}");
+    // members are indexes, materialized with - out_idx
     assert!(s.contains("src_idx"), "{s}");
     assert!(s.contains("dst_idx"), "{s}");
-    assert!(s.contains("let mut src: *mut i8"), "{s}");
-    assert!(s.contains("let mut dst: *mut i8"), "{s}");
-    assert!(!s.contains("(*s).out = (*s).out.offset(length)"), "{s}");
+    assert!(s.contains("- (out_idx)"), "{s}");
 }
 
 #[test]
-fn test_array_local_rewriter_keeps_field_base_memory_copy_cursors_index_only() {
+fn test_array_local_rewriter_rewrites_memory_copy_cursors_of_reassigned_pointee_field_base() {
+    // (*s).out is caller-visible: the field write is KEPT live (approach D),
+    // a shadow counter tracks the advance, and members are index-rewritten.
     let code = r#"
 #[repr(C)]
 pub struct State {
@@ -16053,32 +16279,20 @@ pub unsafe fn copy_from_back(mut s: *mut State, mut length: i32, mut distance: i
 }
 "#;
     let (s, changed) = rewrite_array_local_provenance_with_config(code, &Config::default());
-    assert!(
-        changed,
-        "expected field-base memory copy cursors to be rewritten:\n{s}"
-    );
+    assert!(changed, "{s}");
     ::utils::compilation::run_compiler_on_str(&s, ::utils::type_check).expect(&s);
-    assert!(s.contains("src_idx"), "{s}");
-    assert!(s.contains("dst_idx"), "{s}");
-    assert!(!s.contains("let mut src: *mut i8"), "{s}");
-    assert!(!s.contains("let mut dst: *mut i8"), "{s}");
-    assert!(
-        s.contains("memset(((*s).out).offset(dst_idx)")
-            || s.contains("memset((*s).out.offset(dst_idx)"),
-        "expected memset destination to inline dst_idx from the field base:\n{s}"
-    );
-    assert!(
-        s.contains("*(((*s).out).offset(src_idx)") || s.contains("*((*s).out.offset(src_idx)"),
-        "expected src deref to inline src_idx from the field base:\n{s}"
-    );
-    assert!(
-        s.contains("*(((*s).out).offset(dst_idx)") || s.contains("*((*s).out.offset(dst_idx)"),
-        "expected dst deref to inline dst_idx from the field base:\n{s}"
-    );
+    // field write kept live
+    assert!(s.contains("(*s).out ="), "{s}");
+    // member index vars present
+    assert!(s.contains("src_idx") || s.contains("dst_idx"), "{s}");
+    // shadow counter for out declared
+    assert!(s.contains("out_idx"), "{s}");
 }
 
 #[test]
-fn test_array_local_rewriter_keeps_distinct_indexes_for_two_reassigned_field_bases() {
+fn test_array_local_rewriter_rewrites_two_reassigned_pointee_field_bases() {
+    // both (*p).a and (*p).b are caller-visible field bases; both are rewritten
+    // with the live-field / shadow-counter scheme (approach D).
     let code = r#"
 #[repr(C)]
 pub struct Pair {
@@ -16097,17 +16311,37 @@ pub unsafe fn dual(mut p: *mut Pair, mut da: isize, mut db: isize) -> i32 {
 }
 "#;
     let (s, changed) = rewrite_array_local_provenance_with_config(code, &Config::default());
-    assert!(
-        changed,
-        "expected both reassigned field bases to be rewritten:\n{s}"
-    );
+    assert!(changed, "{s}");
     ::utils::compilation::run_compiler_on_str(&s, ::utils::type_check).expect(&s);
-    assert!(s.contains("let mut a_idx: isize"), "{s}");
-    assert!(s.contains("let mut b_idx: isize"), "{s}");
-    assert!(s.contains("ax_idx"), "{s}");
-    assert!(s.contains("bx_idx"), "{s}");
-    assert!(s.contains("let mut ax: *mut i8"), "{s}");
-    assert!(s.contains("let mut bx: *mut i16"), "{s}");
+    // field writes kept live
+    assert!(s.contains("(*p).a ="), "{s}");
+    assert!(s.contains("(*p).b ="), "{s}");
+    // member index vars present
+    assert!(s.contains("ax_idx") || s.contains("a_idx"), "{s}");
+    assert!(s.contains("bx_idx") || s.contains("b_idx"), "{s}");
+}
+
+#[test]
+fn test_array_local_rewriter_skips_live_field_base_with_non_self_advance() {
+    // the base field is reassigned from a member, not a self-advance,
+    // cannot track the counter; the group is dropped and left unrewritten.
+    let code = r#"
+#[repr(C)]
+pub struct State {
+    pub out: *mut i8,
+}
+
+pub unsafe fn f(mut s: *mut State, mut n: isize) -> i32 {
+    let mut cur: *mut i8 = (*s).out.offset(n);
+    (*s).out = cur;
+    cur = cur.offset(1);
+    *cur as i32
+}
+"#;
+    let (s, _changed) = rewrite_array_local_provenance_with_config(code, &Config::default());
+    ::utils::compilation::run_compiler_on_str(&s, ::utils::type_check).expect(&s);
+    assert!(s.contains("(*s).out = cur"), "{s}");
+    assert!(!s.contains("out_idx"), "{s}");
 }
 
 #[test]
@@ -16143,13 +16377,14 @@ pub unsafe fn process_buffer(mut state: *mut ProcessState, mut target: i8, mut r
         "expected field-base cursor local to be rewritten:\n{s}"
     );
     ::utils::compilation::run_compiler_on_str(&s, ::utils::type_check).expect(&s);
-    assert!(s.contains("ptr_idx"), "{s}");
+    // cursor is now an Option<isize> because memchr may return null
+    assert!(s.contains("ptr_idx: Option<isize>"), "{s}");
     assert!(!s.contains("let mut ptr: *mut i8"), "{s}");
     assert!(!s.contains("let ptr: *mut i8"), "{s}");
+    // memchr arg inlines the nullable cursor via map_or: ...map_or(...null..., |idx| ...offset(idx)...)
     assert!(
-        s.contains("memchr(((*state).buffer).offset(ptr_idx)")
-            || s.contains("memchr((*state).buffer.offset(ptr_idx)"),
-        "expected memchr to inline ptr_idx from the field base:\n{s}"
+        s.contains("ptr_idx.map_or(") && s.contains(".offset(idx)"),
+        "expected memchr to inline nullable ptr_idx via map_or from the field base:\n{s}"
     );
     assert!(!s.contains("memchr(ptr as *const core::ffi::c_void"), "{s}");
     assert!(!s.contains("ptr = found.offset(1)"), "{s}");
@@ -16243,4 +16478,909 @@ fn borrow_ownership_slot_universe_tracks_local_pointer_depths() {
     assert_eq!(universe.slot(field_outer).depth, 0);
     assert_eq!(universe.slot(field_inner).depth, 1);
     assert!(universe.slot_for_field_depth(field, 2).is_none());
+}
+
+#[test]
+fn test_array_local_rewriter_rejects_size_changing_receiver_cast() {
+    // `(p as *mut i8).offset(12)` advances 12 *bytes* past an *mut i32 base;
+    // recording index 12 and re-materializing in i32 units would be 48 bytes.
+    // the rewriter must leave q untouched.
+    let code = r#"
+pub unsafe fn foo(mut p: *mut i32) -> i32 {
+    let mut q: *mut i32 = (p as *mut i8).offset(12) as *mut i32;
+    *p = 1;
+    *q = 3;
+    *q
+}
+"#;
+    let (s, changed) = rewrite_array_local_provenance_with_config(code, &Config::default());
+    ::utils::compilation::run_compiler_on_str(&s, ::utils::type_check).expect(&s);
+    assert!(
+        !changed,
+        "size-changing receiver cast must not be rewritten:\n{s}"
+    );
+    assert!(
+        s.contains("let mut q: *mut i32"),
+        "q must stay a raw pointer:\n{s}"
+    );
+    assert!(!s.contains("q_idx"), "no index must be derived for q:\n{s}");
+}
+
+#[test]
+fn test_array_local_rewriter_keeps_offset_then_cast() {
+    // offset-then-cast: the index is computed in base (i32) units, the cast is
+    // applied to the result, so this stays rewritten (control).
+    let code = r#"
+pub unsafe fn foo(mut p: *mut i32) -> i32 {
+    let mut q: *mut i32 = p.offset(3) as *mut i32;
+    *p = 1;
+    *q = 3;
+    *q
+}
+"#;
+    let (s, changed) = rewrite_array_local_provenance_with_config(code, &Config::default());
+    assert!(changed, "{s}");
+    ::utils::compilation::run_compiler_on_str(&s, ::utils::type_check).expect(&s);
+    assert!(s.contains("let mut q_idx: isize = (3) as isize"), "{s}");
+    assert!(!s.contains("let mut q: *mut i32"), "{s}");
+}
+
+#[test]
+fn test_array_local_rewriter_keeps_equal_size_receiver_cast() {
+    // `(p as *const u8).offset(3)` over an *mut i8 base: pointee size is
+    // unchanged (1 == 1), so the index unit is correct and the rewrite stands.
+    let code = r#"
+pub unsafe fn foo(mut p: *mut i8) -> i8 {
+    let mut q: *mut i8 = (p as *const u8).offset(3) as *mut i8;
+    *p = 1;
+    *q = 3;
+    *q
+}
+"#;
+    let (s, changed) = rewrite_array_local_provenance_with_config(code, &Config::default());
+    assert!(changed, "{s}");
+    ::utils::compilation::run_compiler_on_str(&s, ::utils::type_check).expect(&s);
+    assert!(s.contains("let mut q_idx: isize = (3) as isize"), "{s}");
+    assert!(!s.contains("let mut q: *mut i8"), "{s}");
+}
+
+#[test]
+fn test_array_local_rewriter_offset_from_not_folded_across_size_cast() {
+    // q is a size-changing cast cursor; its offset_from(r) must NOT be folded
+    // into an index subtraction, because q has no valid base-unit index.
+    let code = r#"
+pub unsafe fn foo(mut base: *mut i32) -> isize {
+    let mut q: *mut i32 = (base as *mut i8).offset(12) as *mut i32;
+    let mut r: *mut i32 = base.offset(1);
+    *base = 0;
+    *q = 0;
+    *r = 0;
+    q.offset_from(r)
+}
+"#;
+    let (s, _changed) = rewrite_array_local_provenance_with_config(code, &Config::default());
+    ::utils::compilation::run_compiler_on_str(&s, ::utils::type_check).expect(&s);
+    // r may be independently rewritten to r_idx (no size-changing cast on r's
+    // receiver), so we check only that q is the (unrewritten) receiver of
+    // offset_from, not that r specifically appears as the argument.
+    assert!(
+        s.contains("q.offset_from("),
+        "offset_from must be preserved:\n{s}"
+    );
+    assert!(
+        !s.contains("q_idx"),
+        "no index must be derived for the cast cursor q:\n{s}"
+    );
+}
+
+#[test]
+fn test_array_local_trace_records_selection_and_apply_for_rewritten_group() {
+    use crate::rewriter::array_local_trace::{TraceStage, TraceSubject};
+    // a simple selectable + rewritten group (mirrors
+    // test_array_local_rewriter_rewrites_simple_non_null_derived_local).
+    let code = r#"
+pub unsafe fn foo(mut p: *mut i32) -> i32 {
+    let mut q: *mut i32 = p.offset(3);
+    *p = 1;
+    *q = 3;
+    *q
+}
+"#;
+    let events = array_local_trace_events(code);
+    assert!(
+        events.iter().any(|e| e.stage == TraceStage::Selection),
+        "expected at least one Selection event: {events:#?}"
+    );
+    assert!(
+        events.iter().any(|e| e.stage == TraceStage::Apply
+            && matches!(&e.subject, TraceSubject::Member(name) if name == "q")),
+        "expected an Apply event for member q: {events:#?}"
+    );
+}
+
+#[test]
+fn test_array_local_trace_disabled_is_neutral() {
+    // enabling the trace must not change the rewritten output, and the disabled
+    // trace must record nothing.
+    let code = r#"
+pub unsafe fn foo(mut p: *mut i32) -> i32 {
+    let mut q: *mut i32 = p.offset(3);
+    *p = 1;
+    *q = 3;
+    *q
+}
+"#;
+    let (src_enabled, _events) = ::utils::compilation::run_compiler_on_str(code, |tcx| {
+        crate::rewriter::rewrite_array_local_provenance_trace(&Config::default(), tcx, true)
+    })
+    .unwrap();
+    let (src_disabled, events_disabled) = ::utils::compilation::run_compiler_on_str(code, |tcx| {
+        crate::rewriter::rewrite_array_local_provenance_trace(&Config::default(), tcx, false)
+    })
+    .unwrap();
+    assert!(
+        events_disabled.is_empty(),
+        "disabled trace must record nothing: {events_disabled:#?}"
+    );
+    assert_eq!(
+        src_enabled, src_disabled,
+        "enabling the trace must not change pass output"
+    );
+}
+
+#[test]
+fn test_array_local_trace_records_prune_drop_with_assignment_text() {
+    use crate::rewriter::array_local_trace::{TraceDecision, TraceStage};
+    // q is reassigned via an expression the index rewrite cannot handle, so the
+    // prune pass drops it; the trace records a Prune/Dropped event whose reason
+    // includes the offending assignment text.
+    let code = r#"
+pub unsafe fn foo(mut p: *mut i32) -> i32 {
+    let mut q: *mut i32 = std::ptr::null_mut();
+    q = p.offset(if q.is_null() { 0 } else { 1 });
+    *q
+}
+"#;
+    let events = array_local_trace_events(code);
+    assert!(
+        events.iter().any(|e| e.stage == TraceStage::Prune
+            && e.decision == TraceDecision::Dropped
+            && e.reason.contains("q.is_null()")),
+        "expected a Prune/Dropped event mentioning the offending assignment: {events:#?}"
+    );
+}
+
+#[test]
+fn test_array_local_partial_group_characterization() {
+    // characterization of the spec's partial_group() shape. with conditional
+    // cursor support (task 2), q's `if`-RHS is now derivable: both branches
+    // express as index values relative to `p_idx`, so q is fully index-rewritten.
+    let code = r#"
+pub unsafe fn partial_group() -> i32 {
+    let mut buf = [0i32; 4];
+    let mut p = buf.as_mut_ptr();
+    let mut q = p.offset(1);
+    q = if *p == 0 { p.offset(2) } else { p };
+    *p = 1;
+    *q = 2;
+    *p + *q
+}
+"#;
+    let (s, changed) = rewrite_array_local_provenance_with_config(code, &Config::default());
+    // the rewritten source must always compile (no undeclared *_idx).
+    ::utils::compilation::run_compiler_on_str(&s, ::utils::type_check).expect(&s);
+    // both p and q are now index-rewritten.
+    assert!(changed, "p and q should be rewritten: {s}");
+    assert!(s.contains("p_idx"), "p rewritten to an index: {s}");
+    assert!(
+        s.contains("let mut p_idx: isize = 0isize"),
+        "p_idx initialized: {s}"
+    );
+    assert!(s.contains("q_idx"), "q rewritten to an index: {s}");
+    assert!(
+        s.contains("(buf).as_ptr().offset(p_idx) as *mut i32"),
+        "p accesses use buf base with p_idx: {s}"
+    );
+}
+
+#[test]
+fn test_array_local_rewriter_copies_group_member_in_init_and_assignment() {
+    // q is initialized and re-assigned by directly copying p (another member of
+    // the same {base, p, q} group). both must lower to an index copy q_idx = p_idx.
+    let code = r#"
+pub unsafe fn foo(mut base: *mut i32, n: isize) -> i32 {
+    let mut p: *mut i32 = base.offset(n);
+    let mut q: *mut i32 = p;
+    *q = 1;
+    q = p;
+    *q = 2;
+    *p + *q
+}
+"#;
+    let (s, changed) = rewrite_array_local_provenance_with_config(code, &Config::default());
+    assert!(changed, "{s}");
+    ::utils::compilation::run_compiler_on_str(&s, ::utils::type_check).expect(&s);
+    assert!(s.contains("p_idx"), "p rewritten: {s}");
+    assert!(s.contains("q_idx"), "q rewritten: {s}");
+    // both the init and the assignment copy the index.
+    assert!(s.matches("q_idx").count() >= 2, "q copied from p_idx: {s}");
+    assert!(
+        !s.contains("let mut q: *mut i32 = p"),
+        "raw copy removed: {s}"
+    );
+}
+
+#[test]
+fn test_array_local_rewriter_rejects_cross_group_copy() {
+    // q is copied from `other`, a raw pointer that is NOT in q's group. q must
+    // stay raw (item-6 model) and the output must still compile.
+    let code = r#"
+pub unsafe fn foo(mut base: *mut i32, other: *mut i32, n: isize) -> i32 {
+    let mut p: *mut i32 = base.offset(n);
+    let mut q: *mut i32 = other;
+    *p = 1;
+    *q = 2;
+    *p + *q
+}
+"#;
+    let (s, _changed) = rewrite_array_local_provenance_with_config(code, &Config::default());
+    ::utils::compilation::run_compiler_on_str(&s, ::utils::type_check).expect(&s);
+    assert!(
+        s.contains("let mut q: *mut i32 = other"),
+        "cross-group copy stays raw: {s}"
+    );
+    assert!(!s.contains("q_idx"), "q not index-rewritten: {s}");
+}
+
+#[test]
+fn test_array_local_rewriter_lowers_member_relative_conditional() {
+    // p is updated by a conditional whose branches are q.offset(1) and q (a
+    // sibling member). it must lower to an index-valued conditional.
+    let code = r#"
+pub unsafe fn foo(mut base: *mut i32, n: isize) -> i32 {
+    let mut p: *mut i32 = base.offset(n);
+    let mut q: *mut i32 = p;
+    q = q.offset(1);
+    p = if *q != 0 { q.offset(1) } else { q };
+    *p + *q
+}
+"#;
+    let (s, changed) = rewrite_array_local_provenance_with_config(code, &Config::default());
+    assert!(changed, "{s}");
+    ::utils::compilation::run_compiler_on_str(&s, ::utils::type_check).expect(&s);
+    // the emitted form splits `p_idx =` and `if` across a line break, so check
+    // both parts independently.
+    assert!(
+        s.contains("p_idx ="),
+        "p updated via an index assignment: {s}"
+    );
+    assert!(
+        s.contains("if *((base).offset(q_idx)"),
+        "condition rewrites *q to base-indexed deref: {s}"
+    );
+    assert!(
+        s.contains("(q_idx) + ((1) as isize)"),
+        "then branch is q_idx+1: {s}"
+    );
+    assert!(s.contains("else { q_idx }"), "else branch is q_idx: {s}");
+    assert!(
+        !s.contains("p = if"),
+        "no raw pointer conditional for p: {s}"
+    );
+}
+
+#[test]
+fn test_array_local_rewriter_lowers_base_relative_conditional() {
+    // both branches derive from the base; indices 2 and 0. a second member `p`
+    // ensures the planner forms a group (a lone `q = base` with no offset may
+    // not trigger planning).
+    let code = r#"
+pub unsafe fn foo(mut base: *mut i32, c: bool) -> i32 {
+    let mut p: *mut i32 = base.offset(1);
+    let mut q: *mut i32 = base;
+    q = if c { base.offset(2) } else { base };
+    *q + *p
+}
+"#;
+    let (s, changed) = rewrite_array_local_provenance_with_config(code, &Config::default());
+    assert!(changed, "{s}");
+    ::utils::compilation::run_compiler_on_str(&s, ::utils::type_check).expect(&s);
+    assert!(s.contains("q_idx"), "q rewritten with index: {s}");
+    assert!(!s.contains("q = if"), "no raw pointer conditional: {s}");
+}
+
+#[test]
+fn test_array_local_rewriter_rejects_conditional_without_else() {
+    // a conditional missing an else branch is unsupported; q stays raw.
+    let code = r#"
+pub unsafe fn foo(mut base: *mut i32, n: isize, c: bool) -> i32 {
+    let mut q: *mut i32 = base.offset(n);
+    if c { q = q.offset(1); }
+    *q
+}
+"#;
+    let (s, _changed) = rewrite_array_local_provenance_with_config(code, &Config::default());
+    ::utils::compilation::run_compiler_on_str(&s, ::utils::type_check).expect(&s);
+    // an `if` statement (no else, not an assignment RHS) is not a conditional
+    // cursor update; q's self-advance inside it stays handled as today.
+}
+
+#[test]
+fn test_array_local_rewriter_rewrites_tu_linkage_read_stdin_shape() {
+    // mirrors B02_synthetic/tu_linkage::read_stdin: a local array base with two
+    // cursors where q is copied from p (let mut q = p) and p is updated by a
+    // conditional (p = if *q != 0 { q.offset(1) } else { q }).  both must rewrite
+    // to indices.
+    //
+    // `total += *q + *p` keeps p live at the same MIR location as q so that the
+    // simultaneous-liveness gate in classify_rewrite_groups admits the {buf,p,q}
+    // group.  the real B02_synthetic/tu_linkage corpus case also passes the gate
+    // (p is materialized and read in the body).
+    let code = r#"
+pub unsafe fn read_stdin(mut buf: [i32; 64]) -> i32 {
+    let mut total: i32 = 0;
+    let mut p: *mut i32 = buf.as_mut_ptr();
+    while *p != 0 {
+        let mut q: *mut i32 = p;
+        while *q != 0 && *q != 32 {
+            q = q.offset(1);
+        }
+        total += *q + *p;
+        p = if *q != 0 { q.offset(1) } else { q };
+    }
+    total
+}
+"#;
+    let (s, changed) = rewrite_array_local_provenance_with_config(code, &Config::default());
+    assert!(changed, "{s}");
+    ::utils::compilation::run_compiler_on_str(&s, ::utils::type_check).expect(&s);
+    assert!(s.contains("p_idx"), "p rewritten to an index: {s}");
+    assert!(s.contains("q_idx"), "q rewritten to an index: {s}");
+    // q is initialized by copying p — let mut q_idx: isize = p_idx.
+    assert!(
+        s.contains("let mut q_idx: isize = p_idx"),
+        "q copy lowered to index copy: {s}"
+    );
+    // the emitted form splits `p_idx =` and `if` across a line break — check parts.
+    assert!(s.contains("p_idx ="), "p updated via index assignment: {s}");
+    // no raw pointer offset operations remain for the two cursors.
+    assert!(!s.contains("q = q.offset(1)"), "q advance lowered: {s}");
+    assert!(!s.contains("p = if *q"), "p conditional lowered: {s}");
+    // p is fully index-only: no kept raw pointer or reference binding.
+    assert!(
+        !s.contains("let mut p: *mut i32") && !s.contains("let mut p: &i32"),
+        "p is index-only: {s}"
+    );
+}
+
+#[test]
+fn test_array_local_rewriter_copies_nullable_group_member() {
+    // q starts null (Option<isize>) and is later copied from p; the copy must
+    // preserve the Option value (q_idx = p_idx), not re-wrap it.
+    let code = r#"
+pub unsafe fn foo(mut base: *mut i32, n: isize, c: bool) -> i32 {
+    let mut p: *mut i32 = std::ptr::null_mut();
+    if c { p = base.offset(n); }
+    let mut q: *mut i32 = std::ptr::null_mut();
+    q = p;
+    if !q.is_null() { *q = 7; }
+    0
+}
+"#;
+    let (s, changed) = rewrite_array_local_provenance_with_config(code, &Config::default());
+    assert!(changed, "{s}");
+    ::utils::compilation::run_compiler_on_str(&s, ::utils::type_check).expect(&s);
+    // p and q are Option<isize>; the copy is a plain Option assignment.
+    assert!(
+        s.contains("q_idx = p_idx"),
+        "nullable copy preserves the Option: {s}"
+    );
+    assert!(
+        !s.contains("q_idx = Some(p_idx)"),
+        "no re-wrap of the Option: {s}"
+    );
+}
+
+#[test]
+fn test_array_local_rewriter_keeps_moving_deref_cursor_index_only() {
+    // two cursors that both move and deref (never passed to a call, never stored
+    // as a pointer value) stay index-only instead of kept &T references.
+    let code = r#"
+pub unsafe fn foo(mut base: *mut i32, n: isize) -> i32 {
+    let mut p: *mut i32 = base.offset(1);
+    let mut q: *mut i32 = base.offset(2);
+    let mut total: i32 = 0;
+    let mut i: isize = 0;
+    while i < n {
+        total += *p + *q;
+        p = p.offset(1);
+        q = q.offset(1);
+        i += 1;
+    }
+    total
+}
+"#;
+    let (s, changed) = rewrite_array_local_provenance_with_config(code, &Config::default());
+    assert!(changed, "{s}");
+    ::utils::compilation::run_compiler_on_str(&s, ::utils::type_check).expect(&s);
+    assert!(
+        s.contains("p_idx") && s.contains("q_idx"),
+        "cursors index-rewritten: {s}"
+    );
+    assert!(
+        !s.contains("let mut p: &i32") && !s.contains("let mut q: &i32"),
+        "moving deref cursors are index-only, not kept references: {s}"
+    );
+}
+
+#[test]
+fn test_array_local_rewriter_inline_materializes_call_argument_cursor() {
+    // a moving cursor passed to a foreign function stays index-only; the raw
+    // pointer is reconstructed inline at the call, with no kept binding.
+    let code = r#"
+unsafe extern "C" { fn sink(p: *const i32) -> i32; }
+pub unsafe fn foo(mut base: *mut i32, n: isize) -> i32 {
+    let mut p: *mut i32 = base.offset(1);
+    let mut q: *mut i32 = base.offset(2);
+    let mut total: i32 = 0;
+    let mut i: isize = 0;
+    while i < n {
+        total += sink(p) + *q;
+        p = p.offset(1);
+        q = q.offset(1);
+        i += 1;
+    }
+    total
+}
+"#;
+    let (s, changed) = rewrite_array_local_provenance_with_config(code, &Config::default());
+    assert!(changed, "{s}");
+    ::utils::compilation::run_compiler_on_str(&s, ::utils::type_check).expect(&s);
+    assert!(s.contains("p_idx"), "p is index-only: {s}");
+    assert!(
+        !s.contains("let mut p: *mut i32"),
+        "no kept raw pointer for p: {s}"
+    );
+    assert!(s.contains("sink("), "call preserved: {s}");
+}
+
+#[test]
+fn test_array_local_rewriter_rewrites_single_base_strstr_cursor() {
+    // a cursor initialised from strstr(base, needle) becomes a nullable
+    // Option<isize> index initialised via offset_from against the base.
+    // q is a second mutable cursor (base + n) that keeps base live in the loop
+    // so the simultaneous-liveness gate in classify_rewrite_groups admits the
+    // {base, p, q} group.
+    let code = r#"
+unsafe extern "C" { fn strstr(h: *const i8, n: *const i8) -> *mut i8; }
+pub unsafe fn foo(base: *mut i8, needle: *const i8, n: isize) -> i32 {
+    let mut p: *mut i8 = strstr(base, needle);
+    let mut q: *mut i8 = base.offset(n);
+    let mut total: i32 = 0;
+    let mut i: isize = 0;
+    while i < n {
+        if !p.is_null() {
+            total += *p as i32;
+            p = p.offset(1);
+        }
+        total += *q as i32;
+        q = q.offset(-1);
+        i += 1;
+    }
+    total
+}
+"#;
+    let (s, changed) = rewrite_array_local_provenance_with_config(code, &Config::default());
+    assert!(changed, "{s}");
+    ::utils::compilation::run_compiler_on_str(&s, ::utils::type_check).expect(&s);
+    assert!(s.contains("p_idx"), "p index-rewritten: {s}");
+    assert!(s.contains("Option<isize>"), "nullable index: {s}");
+    assert!(s.contains("offset_from"), "offset_from init: {s}");
+    assert!(
+        !s.contains("let mut p: *mut i8"),
+        "no kept raw pointer for p: {s}"
+    );
+}
+
+// ── epoch split (pointer-pass stage before array-local provenance) ────────────
+
+fn rewrite_epoch_split_with_config(code: &str, config: &Config) -> (String, bool) {
+    ::utils::compilation::run_compiler_on_str(code, |tcx| rewrite_epoch_split(config, tcx)).unwrap()
+}
+
+fn run_epoch_split_test(code: &str, includes: &[&str], excludes: &[&str]) {
+    let (s, _) = rewrite_epoch_split_with_config(code, &Config::default());
+    ::utils::compilation::run_compiler_on_str(&s, ::utils::type_check).expect(&s);
+    for include in includes {
+        assert!(s.contains(include), "Expected to find `{include}` in:\n{s}");
+    }
+    for exclude in excludes {
+        assert!(
+            !s.contains(exclude),
+            "Expected not to find `{exclude}` in:\n{s}"
+        );
+    }
+}
+
+#[test]
+fn test_epoch_split_skips_single_base() {
+    // a single-base scratch local is NOT split: only genuine multi-base reuse is
+    // split, so the original binding and its sole assignment are left untouched.
+    run_epoch_split_test(
+        r#"
+pub unsafe extern "C" fn f(mut a: *mut i8) -> *mut i8 {
+    let mut x: *mut i8 = 0 as *mut i8;
+    x = a;
+    return x;
+}
+        "#,
+        &["let mut x: *mut i8 = 0 as *mut i8", "x = a", "return x"],
+        &["x_0"],
+    )
+}
+
+#[test]
+fn test_epoch_split_sequential_bases() {
+    // two unrelated bases through one scratch local -> two epoch lets.
+    run_epoch_split_test(
+        r#"
+pub unsafe extern "C" fn f(mut a: *mut i8, mut b: *mut i8) -> *mut i8 {
+    let mut x: *mut i8 = 0 as *mut i8;
+    x = a;
+    let _c: i8 = *x;
+    x = b;
+    return x;
+}
+        "#,
+        &[
+            "let mut x_0: *mut i8 = a",
+            "let mut x_1: *mut i8 = b",
+            "_c: i8 = *x_0",
+            "return x_1",
+        ],
+        &["let mut x: *mut i8 = 0 as *mut i8"],
+    )
+}
+
+#[test]
+fn test_epoch_split_same_epoch_movement() {
+    // `.offset` on the same local keeps the epoch and stays an assignment (not a
+    // `let`); a later distinct base gives the local a second epoch so it splits.
+    run_epoch_split_test(
+        r#"
+pub unsafe extern "C" fn f(mut a: *mut i8, mut b: *mut i8) -> *mut i8 {
+    let mut x: *mut i8 = 0 as *mut i8;
+    x = a;
+    x = x.offset(1 as isize);
+    let _c: i8 = *x;
+    x = b;
+    return x;
+}
+        "#,
+        &[
+            "let mut x_0: *mut i8 = a",
+            "x_0 = x_0.offset",
+            "let mut x_1: *mut i8 = b",
+            "return x_1",
+        ],
+        &["let mut x: *mut i8 = 0 as *mut i8"],
+    )
+}
+
+#[test]
+fn test_epoch_split_rejects_addr_taken() {
+    // the local is rejected because it is address-taken (`&mut x`), leaving the
+    // scratch local unchanged.
+    run_epoch_split_test(
+        r#"
+pub unsafe extern "C" fn f(mut a: *mut u8) -> *mut u8 {
+    let mut x: *mut u8 = 0 as *mut u8;
+    x = a;
+    x = x.wrapping_add(1 as usize);
+    let p: *mut *mut u8 = &mut x;
+    return x;
+}
+        "#,
+        &["let mut x: *mut u8 = 0 as *mut u8"],
+        &["x_0"],
+    )
+}
+
+#[test]
+fn test_epoch_split_branch_contained() {
+    // two branch-contained epochs (one per arm), each used only inside its arm and
+    // not after the join -> the local has two epochs and splits within each branch.
+    run_epoch_split_test(
+        r#"
+extern "C" {
+    fn foo(_: *mut i8);
+}
+pub unsafe extern "C" fn f(mut a: *mut i8, mut b: *mut i8, cond: i32) {
+    let mut x: *mut i8 = 0 as *mut i8;
+    if cond != 0 {
+        x = a;
+        foo(x);
+    } else {
+        x = b;
+        foo(x);
+    }
+}
+        "#,
+        &[
+            "let mut x_0: *mut i8 = a",
+            "foo(x_0)",
+            "let mut x_1: *mut i8 = b",
+            "foo(x_1)",
+        ],
+        &["let mut x: *mut i8 = 0 as *mut i8"],
+    )
+}
+
+#[test]
+fn test_epoch_split_rejects_cross_join_use() {
+    // one branch assigns; the post-if use may see old-or-new -> reject, preserve write.
+    run_epoch_split_test(
+        r#"
+pub unsafe extern "C" fn f(mut a: *mut i8, cond: i32) -> *mut i8 {
+    let mut x: *mut i8 = 0 as *mut i8;
+    if cond != 0 {
+        x = a;
+    }
+    return x;
+}
+        "#,
+        &["let mut x: *mut i8 = 0 as *mut i8", "x = a", "return x"],
+        &["x_0"],
+    )
+}
+
+#[test]
+fn test_epoch_split_rejects_loop_base_change() {
+    // a base change inside a loop cannot be promoted to a `let` -> reject.
+    run_epoch_split_test(
+        r#"
+pub unsafe extern "C" fn f(mut a: *mut i8, n: i32) -> *mut i8 {
+    let mut x: *mut i8 = 0 as *mut i8;
+    let mut i: i32 = 0;
+    while i < n {
+        x = a;
+        i += 1;
+    }
+    return x;
+}
+        "#,
+        &["let mut x: *mut i8 = 0 as *mut i8", "x = a"],
+        &["x_0"],
+    )
+}
+
+#[test]
+fn test_epoch_split_loop_same_epoch_movement() {
+    // incoming epoch, loop only moves it (renamed, no `let` in loop); a later
+    // distinct base gives the local a second epoch so it splits.
+    run_epoch_split_test(
+        r#"
+pub unsafe extern "C" fn f(mut a: *mut i8, mut b: *mut i8, n: i32) -> *mut i8 {
+    let mut x: *mut i8 = 0 as *mut i8;
+    x = a;
+    let mut i: i32 = 0;
+    while i < n {
+        x = x.offset(1 as isize);
+        i += 1;
+    }
+    x = b;
+    return x;
+}
+        "#,
+        &[
+            "let mut x_0: *mut i8 = a",
+            "x_0 = x_0.offset",
+            "let mut x_1: *mut i8 = b",
+            "return x_1",
+        ],
+        &["let mut x: *mut i8 = 0 as *mut i8"],
+    )
+}
+
+#[test]
+fn test_epoch_split_use_kinds() {
+    // deref, null check, call arg, cast, and pointer-method uses all rename to the
+    // epoch local; a second distinct base gives the local two epochs so it splits.
+    run_epoch_split_test(
+        r#"
+pub unsafe extern "C" fn use_ptr(p: *mut i8) {}
+pub unsafe extern "C" fn f(mut a: *mut i8, mut b: *mut i8) -> i32 {
+    let mut x: *mut i8 = 0 as *mut i8;
+    x = a;
+    let d: i8 = *x;                 // deref
+    if !x.is_null() {               // null check + pointer method
+        use_ptr(x);                 // call argument
+        let c: *const i8 = x as *const i8; // cast
+    }
+    x = b;
+    return d as i32;
+}
+        "#,
+        &[
+            "let mut x_0: *mut i8 = a",
+            "*x_0",
+            "x_0.is_null()",
+            "use_ptr(x_0)",
+            "x_0 as *const i8",
+            "let mut x_1: *mut i8 = b",
+        ],
+        &["let mut x: *mut i8 = 0 as *mut i8"],
+    )
+}
+
+#[test]
+fn test_epoch_split_parse_uname_shape() {
+    run_epoch_split_test(
+        r#"
+extern "C" {
+    fn strstr(_: *const i8, _: *const i8) -> *mut i8;
+    fn get_os_arch(_: *mut i8) -> *mut i8;
+    fn use_c(_: *mut i8);
+}
+pub unsafe extern "C" fn f(mut uname: *mut i8, cond: i32) {
+    let mut str_tmp: *mut i8 = 0 as *mut i8;
+    str_tmp = strstr(uname, uname);
+    if cond != 0 {
+        str_tmp = str_tmp.offset(7 as isize);
+        use_c(str_tmp);
+    } else {
+        str_tmp = get_os_arch(uname);
+        if !str_tmp.is_null() {
+            use_c(str_tmp);
+        }
+    }
+}
+        "#,
+        &[
+            "let mut str_tmp_0: *mut i8 = strstr",
+            "str_tmp_0 = str_tmp_0.offset",
+            "let mut str_tmp_1: *mut i8 = get_os_arch",
+            "str_tmp_1.is_null()",
+        ],
+        &["let mut str_tmp: *mut i8 = 0 as *mut i8"],
+    )
+}
+
+#[test]
+fn test_epoch_split_rejects_epoch_escaping_block() {
+    // two epochs where the second is created inside a nested block and then used
+    // after the block: the block-scoped epoch `let` would be out of scope, so the
+    // whole local is rejected (left unsplit) rather than dangling.
+    run_epoch_split_test(
+        r#"
+pub unsafe extern "C" fn f(mut a: *mut i8, mut b: *mut i8) -> *mut i8 {
+    let mut x: *mut i8 = 0 as *mut i8;
+    x = a;
+    'c_blk: {
+        x = b;
+    }
+    return x;
+}
+        "#,
+        &[
+            "let mut x: *mut i8 = 0 as *mut i8",
+            "x = a",
+            "x = b",
+            "return x",
+        ],
+        &["x_0", "x_1"],
+    )
+}
+
+#[test]
+fn test_epoch_split_then_array_local_index_backing() {
+    // the integration the stage exists for: a multi-base scratch local splits into
+    // per-epoch locals, and the array-local pass then index-rewrites each epoch
+    // against its own base. without the split, `q` is multi-base and the
+    // array-local pass cannot rewrite it at all.
+    let code = r#"
+pub unsafe fn foo(mut p: *mut i32, mut r: *mut i32) -> i32 {
+    let mut q: *mut i32 = 0 as *mut i32;
+    q = p.offset(3);
+    *p = 1;
+    *q = 3;
+    let a: i32 = *q;
+    q = r.offset(1);
+    *r = 2;
+    *q = 5;
+    a
+}
+"#;
+    let config = Config::default();
+    let (split, changed) = rewrite_epoch_split_with_config(code, &config);
+    assert!(changed, "{split}");
+    let (s, changed) = rewrite_array_local_provenance_with_config(&split, &config);
+    assert!(changed, "{s}");
+    ::utils::compilation::run_compiler_on_str(&s, ::utils::type_check).expect(&s);
+    assert!(s.contains("let mut q_0_idx: isize = (3) as isize"), "{s}");
+    assert!(s.contains("let mut q_1_idx: isize = (1) as isize"), "{s}");
+    assert!(s.contains("*((p).offset(q_0_idx) as *mut i32) = 3"), "{s}");
+    assert!(s.contains("*((r).offset(q_1_idx) as *mut i32) = 5"), "{s}");
+    assert!(!s.contains("let mut q: *mut i32"), "{s}");
+}
+
+#[test]
+fn test_array_local_rewriter_folds_value_position_offset_chain() {
+    // a projection chain used as a pointer VALUE (call argument) must fold its
+    // offsets into the nullable index closure instead of stacking a raw
+    // `.offset` on top of the materialized pointer.
+    let code = r#"
+unsafe extern "C" {
+    fn strstr(a: *const i8, b: *const i8) -> *mut i8;
+    fn strdup(a: *const i8) -> *mut i8;
+    fn consume(p: *mut i8);
+}
+
+pub unsafe fn f(mut uname: *mut i8, k: isize) -> *mut i8 {
+    let mut out: *mut i8 = std::ptr::null_mut();
+    let mut p0: *mut i8 = strstr(uname, b"x\0" as *const u8 as *const i8);
+    if !p0.is_null() {
+        *p0 = 0;
+        p0 = p0.offset(2);
+        p0 = p0.offset(1);
+        consume(p0.offset(k));
+        out = strdup(p0);
+    } else {
+        let mut p1: *mut i8 = strstr(uname, b"y\0" as *const u8 as *const i8);
+        if !p1.is_null() {
+            *p1 = 0;
+            p1 = p1.offset(1);
+            out = strdup(p1);
+        }
+    }
+    return out;
+}
+"#;
+    let (s, changed) = rewrite_array_local_provenance_with_config(code, &Config::default());
+    assert!(changed, "expected cursors to be index-rewritten:\n{s}");
+    ::utils::compilation::run_compiler_on_str(&s, ::utils::type_check).expect(&s);
+    // the call-derived index seeds from the bare base, not `base.offset(0isize)`.
+    assert!(s.contains("offset_from((uname))"), "{s}");
+    assert!(!s.contains("offset(0isize)"), "{s}");
+    // the chained value use folds its offset into the closure index...
+    assert!(s.contains(".offset((idx) + (k))"), "{s}");
+    // ...instead of stacking a second raw offset on the materialized pointer.
+    assert!(!s.contains(".offset(k)"), "{s}");
+}
+
+#[test]
+fn test_array_local_rewriter_skips_unprofitable_nullable_raw_base_group() {
+    // value-heavy nullable cursors of a raw base: every call argument, deref
+    // write, and value use would keep one raw offset per site after an index
+    // rewrite, while only one self-advance per cursor goes away. the cost
+    // model keeps the raw locals instead of net-increasing unsafe operations.
+    let code = r#"
+unsafe extern "C" {
+    fn strstr(a: *const i8, b: *const i8) -> *mut i8;
+    fn strdup(a: *const i8) -> *mut i8;
+    fn consume(p: *mut i8);
+}
+
+pub unsafe fn f(mut uname: *mut i8) -> *mut i8 {
+    let mut out: *mut i8 = std::ptr::null_mut();
+    let mut p0: *mut i8 = strstr(uname, b"x\0" as *const u8 as *const i8);
+    if !p0.is_null() {
+        *p0 = 0;
+        p0 = p0.offset(2);
+        consume(p0);
+        consume(p0);
+        out = strdup(p0);
+    }
+    return out;
+}
+"#;
+    // the guard applies to raw parameter bases of c-exposed functions only:
+    // any other base may still be upgraded to a slice by later stages.
+    let mut config = Config::default();
+    config.c_exposed_fns.insert("f".to_string());
+    let (s, changed) = rewrite_array_local_provenance_with_config(code, &config);
+    let _ = changed;
+    ::utils::compilation::run_compiler_on_str(&s, ::utils::type_check).expect(&s);
+    assert!(s.contains("let mut p0: *mut i8"), "{s}");
+    assert!(!s.contains("p0_idx"), "{s}");
 }

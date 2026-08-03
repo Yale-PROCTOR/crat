@@ -3,7 +3,7 @@ use std::cell::{Cell, RefCell};
 use etrace::some_or;
 use rustc_abi::FieldIdx;
 use rustc_ast::{
-    mut_visit::{self, MutVisitor},
+    mut_visit::{self, FnKind, MutVisitor},
     ptr::P,
     *,
 };
@@ -121,6 +121,9 @@ impl LocalRawParamSummary {
 impl MutVisitor for TransformVisitor<'_, '_> {
     fn visit_crate(&mut self, krate: &mut Crate) {
         mut_visit::walk_crate(self, krate);
+        if self.slice_cursor.get() {
+            CursorProjectionSimplifier::default().visit_crate(krate);
+        }
 
         if self.bytemuck_derives.borrow().is_empty() {
             return;
@@ -1159,20 +1162,15 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                     let hir_inner = hir_unwrap_addr_of_deref(hir_unwrap_cast(hir_e));
                     let pe = self.ptr_expr(inner, hir_inner);
                     if let Some(pe) = pe
-                        && let PtrExprBaseKind::Path(Res::Local(hir_id)) = pe.base_kind
-                        && matches!(
-                            self.effective_ptr_kind(hir_id),
-                            Some(PtrKind::SliceCursor(_))
-                        )
-                        && pe.projs.len() == 1
-                        && let PtrExprProj::Offset(offset) = &pe.projs[0]
+                        && self.ptr_expr_base_is_cursor(&pe)
+                        && let Some(offset) = combined_cursor_offset(&pe.projs)
                         && !pe.addr_of
                         && !pe.as_ptr
                         && !pe.cast_int
                     {
                         let base_str = pprust::expr_to_string(pe.base);
-                        let offset_str = pprust::expr_to_string(offset);
-                        *expr = utils::expr!("({})[({}) as isize]", base_str, offset_str)
+                        let offset_str = pprust::expr_to_string(&offset);
+                        *expr = utils::expr!("({})[{}]", base_str, offset_str)
                     } else {
                         match self.transform_ptr(e, hir_e, PtrCtx::Deref(m)) {
                             PtrKind::Raw(_) => {}
@@ -1242,7 +1240,11 @@ enum PtrCtx {
     Deref(bool),
 }
 
-fn is_c_exposed_fn(tcx: TyCtxt<'_>, did: LocalDefId, c_exposed_fns: &FxHashSet<String>) -> bool {
+pub(crate) fn is_c_exposed_fn(
+    tcx: TyCtxt<'_>,
+    did: LocalDefId,
+    c_exposed_fns: &FxHashSet<String>,
+) -> bool {
     let name = tcx.item_name(did.to_def_id());
     c_exposed_fns.contains(name.as_str())
         || tcx
@@ -4483,8 +4485,19 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
                     unreachable!("non-optional pointer targets are handled before as_ptr")
                 }
                 PtrCtx::Rhs(PtrKind::Raw(m)) => {
+                    // when the source used as_ptr() (const) but there is an offset projection
+                    // (a materialized cursor), the outer as-*mut cast was stripped by
+                    // transform_ptr before ptr_expr ran, so projected_expr produces a const
+                    // slice view. we must restore the mut intent via .cast_mut().
+                    let has_offset_proj =
+                        pe.projs.iter().any(|p| matches!(p, PtrExprProj::Offset(_)));
+                    let needs_mut_cast = m && !pe.as_mut_ptr && has_offset_proj;
                     if !need_cast {
-                        *ptr = raw_expr;
+                        *ptr = if needs_mut_cast {
+                            utils::expr!("({}).cast_mut()", pprust::expr_to_string(&raw_expr))
+                        } else {
+                            raw_expr
+                        };
                     } else {
                         *ptr = utils::expr!(
                             "({}) as *{} _",
@@ -5223,6 +5236,19 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
             return self.sig_decs.data.get(&def_id).and_then(|sd| sd.output_dec);
         }
         None
+    }
+
+    fn ptr_expr_base_is_cursor(&self, pe: &PtrExpr<'_, 'tcx>) -> bool {
+        match pe.base_kind {
+            PtrExprBaseKind::Path(Res::Local(hir_id)) => matches!(
+                self.effective_ptr_kind(hir_id),
+                Some(PtrKind::SliceCursor(_))
+            ),
+            _ => self
+                .promoted_field_slot_for_hir_field(pe.hir_base)
+                .and_then(|field| self.field_ptr_kind(field))
+                .is_some_and(|kind| matches!(kind, PtrKind::SliceCursor(_))),
+        }
     }
 
     fn allocator_root<'a>(&self, expr: &'a Expr) -> Option<AllocatorRoot<'a>> {
@@ -7429,6 +7455,7 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
             );
         let is_mut_cursor_base =
             matches!(self.ptr_source_kind(pe), Some(PtrKind::SliceCursor(true)));
+        let mut owns_cursor = false;
         let mut e = pe.base.clone();
         if pe.projs.is_empty() {
             return e;
@@ -7466,11 +7493,20 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
                         }
                     } else if is_mut_cursor_base {
                         if m {
-                            e = utils::expr!(
-                                "({}).as_deref_mut().offset_by(({}) as isize)",
-                                pprust::expr_to_string(&e),
-                                pprust::expr_to_string(offset),
-                            );
+                            if owns_cursor {
+                                e = utils::expr!(
+                                    "({}).offset_by(({}) as isize)",
+                                    pprust::expr_to_string(&e),
+                                    pprust::expr_to_string(offset),
+                                );
+                            } else {
+                                e = utils::expr!(
+                                    "({}).as_deref_mut().offset_by(({}) as isize)",
+                                    pprust::expr_to_string(&e),
+                                    pprust::expr_to_string(offset),
+                                );
+                                owns_cursor = true;
+                            }
                         } else if is_slice_cursor_mut_constructor_call(&e) {
                             e = utils::expr!(
                                 "({}).as_deref().offset_by(({}) as isize)",
@@ -7493,6 +7529,7 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
                     }
                 }
                 PtrExprProj::Cast(ty) if ty.is_usize() => {
+                    owns_cursor = false;
                     if is_raw {
                         e = utils::expr!("({}) as usize", pprust::expr_to_string(&e),);
                     } else {
@@ -7505,6 +7542,7 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
                     is_raw = true;
                 }
                 PtrExprProj::Cast(ty) => {
+                    owns_cursor = false;
                     let (to_ty, _) = unwrap_ptr_from_mir_ty(*ty).unwrap();
                     if is_raw {
                         e = utils::expr!(
@@ -7535,6 +7573,7 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
                     }
                 }
                 PtrExprProj::IntegerOp(expr, op) => {
+                    owns_cursor = false;
                     let method = match op {
                         OpKind::WrappingAdd => "wrapping_add",
                         OpKind::WrappingSub => "wrapping_sub",
@@ -7547,6 +7586,7 @@ impl<'analysis, 'tcx> TransformVisitor<'analysis, 'tcx> {
                     );
                 }
                 PtrExprProj::IntegerBinOp(expr, op) => {
+                    owns_cursor = false;
                     let op_str = match op {
                         BinOpKind::BitAnd => "&",
                         BinOpKind::BitOr => "|",
@@ -7819,6 +7859,299 @@ impl<'a, 'tcx> PtrExpr<'a, 'tcx> {
             && !self.addr_of
             && !self.as_ptr
     }
+}
+
+fn combined_offsets(offsets: &[&Expr], cast_to_isize: bool) -> Option<Expr> {
+    let (first, rest) = offsets.split_first()?;
+    let format_offset = |offset: &Expr| {
+        let offset = if cast_to_isize {
+            offset
+        } else {
+            remove_redundant_isize_casts(offset)
+        };
+        let offset = pprust::expr_to_string(offset);
+        if cast_to_isize {
+            format!("({offset}) as isize")
+        } else {
+            format!("({offset})")
+        }
+    };
+    let mut combined = format_offset(first);
+    for offset in rest {
+        combined = format!("({combined}).wrapping_add({})", format_offset(offset));
+    }
+    Some(utils::expr!("{combined}"))
+}
+
+fn remove_redundant_isize_casts(mut expr: &Expr) -> &Expr {
+    loop {
+        let ExprKind::Cast(inner, ty) = &unwrap_paren(expr).kind else {
+            return expr;
+        };
+        let ExprKind::Cast(_, inner_ty) = &unwrap_paren(inner).kind else {
+            return expr;
+        };
+        if !is_isize_ty(ty) || !is_isize_ty(inner_ty) {
+            return expr;
+        }
+        expr = inner;
+    }
+}
+
+fn is_isize_ty(ty: &Ty) -> bool {
+    let TyKind::Path(None, path) = &ty.kind else {
+        return false;
+    };
+    path.segments.len() == 1 && path.segments[0].ident.name.as_str() == "isize"
+}
+
+fn combined_cursor_offset(projs: &[PtrExprProj<'_, '_>]) -> Option<Expr> {
+    let offsets = projs
+        .iter()
+        .map(|proj| match proj {
+            PtrExprProj::Offset(offset) => Some(*offset),
+            _ => None,
+        })
+        .collect::<Option<Vec<_>>>()?;
+    combined_offsets(&offsets, true)
+}
+
+#[derive(Default)]
+struct CursorProjectionSimplifier {
+    binding_scopes: Vec<FxHashMap<Symbol, bool>>,
+    binding_counts: FxHashMap<Symbol, usize>,
+}
+
+impl MutVisitor for CursorProjectionSimplifier {
+    fn visit_item(&mut self, item: &mut Item) {
+        let outer_scopes = std::mem::take(&mut self.binding_scopes);
+        let outer_counts = std::mem::take(&mut self.binding_counts);
+        mut_visit::walk_item(self, item);
+        self.binding_scopes = outer_scopes;
+        self.binding_counts = outer_counts;
+    }
+
+    fn visit_fn(&mut self, fn_kind: FnKind<'_>, _span: rustc_span::Span, _id: NodeId) {
+        match fn_kind {
+            FnKind::Fn(context, visibility, function) => {
+                let outer_scopes = std::mem::take(&mut self.binding_scopes);
+                let outer_counts = std::mem::take(&mut self.binding_counts);
+
+                let mut counter = BindingCounter::default();
+                for param in &mut function.sig.decl.inputs {
+                    counter.visit_pat(&mut param.pat);
+                }
+                if let Some(body) = &mut function.body {
+                    counter.visit_block(body);
+                }
+                self.binding_counts = counter.counts;
+
+                let mut param_scope = FxHashMap::default();
+                for param in &function.sig.decl.inputs {
+                    if let Some(name) = simple_binding_name(&param.pat) {
+                        param_scope.insert(name, is_cursor_ty(&param.ty));
+                    }
+                }
+                self.binding_scopes.push(param_scope);
+                mut_visit::walk_fn(self, FnKind::Fn(context, visibility, function));
+
+                self.binding_scopes = outer_scopes;
+                self.binding_counts = outer_counts;
+            }
+            FnKind::Closure(binder, coroutine_kind, decl, body) => {
+                let mut param_scope = FxHashMap::default();
+                for param in &decl.inputs {
+                    if let Some(name) = simple_binding_name(&param.pat) {
+                        param_scope.insert(name, is_cursor_ty(&param.ty));
+                    }
+                }
+                self.binding_scopes.push(param_scope);
+                mut_visit::walk_fn(self, FnKind::Closure(binder, coroutine_kind, decl, body));
+                self.binding_scopes.pop();
+            }
+        }
+    }
+
+    fn visit_block(&mut self, block: &mut Block) {
+        self.binding_scopes.push(FxHashMap::default());
+        mut_visit::walk_block(self, block);
+        self.binding_scopes.pop();
+    }
+
+    fn visit_local(&mut self, local: &mut Local) {
+        let binding = simple_binding_name(&local.pat)
+            .map(|name| (name, local.ty.as_deref().is_some_and(is_cursor_ty)));
+        mut_visit::walk_local(self, local);
+        if let Some((name, is_cursor)) = binding {
+            self.binding_scopes
+                .last_mut()
+                .expect("local outside a lexical scope")
+                .insert(name, is_cursor);
+        }
+    }
+
+    fn visit_expr(&mut self, expr: &mut Expr) {
+        mut_visit::walk_expr(self, expr);
+
+        if let ExprKind::MethodCall(call) = &mut unwrap_paren_mut(expr).kind
+            && call.seg.ident.name.as_str() == "offset_by"
+            && let Some(receiver) = cursor_offset_without_reborrow(&call.receiver)
+        {
+            call.receiver = receiver;
+        }
+
+        let replacement = if let ExprKind::Index(base, index, _) = &unwrap_paren(expr).kind
+            && is_zero_integer_expr(index)
+        {
+            let mut offsets = Vec::new();
+            self.cursor_offset_chain(base, &mut offsets)
+                .and_then(|base| {
+                    let offset = combined_offsets(&offsets, false)?;
+                    let offset = pprust::expr_to_string(&offset);
+                    Some(match base {
+                        CursorIndexBase::Cursor(base) => {
+                            let base = pprust::expr_to_string(base);
+                            utils::expr!("({base})[{offset}]")
+                        }
+                        CursorIndexBase::Slice(slice) => {
+                            let slice = pprust::expr_to_string(slice);
+                            utils::expr!("({slice})[({offset}) as usize]")
+                        }
+                    })
+                })
+        } else {
+            None
+        };
+        if let Some(replacement) = replacement {
+            *expr = replacement;
+        }
+    }
+}
+
+impl CursorProjectionSimplifier {
+    fn cursor_offset_chain<'a>(
+        &self,
+        expr: &'a Expr,
+        offsets: &mut Vec<&'a Expr>,
+    ) -> Option<CursorIndexBase<'a>> {
+        match &unwrap_paren(expr).kind {
+            ExprKind::MethodCall(call) => match call.seg.ident.name.as_str() {
+                "offset_by" if call.args.len() == 1 => {
+                    let base = self.cursor_offset_chain(&call.receiver, offsets)?;
+                    offsets.push(&call.args[0]);
+                    Some(base)
+                }
+                "as_deref_mut" if call.args.is_empty() => {
+                    Some(CursorIndexBase::Cursor(&call.receiver))
+                }
+                _ => None,
+            },
+            ExprKind::Call(callee, args) if args.len() == 1 && is_slice_cursor_new(callee) => {
+                let ExprKind::MethodCall(as_slice) = &unwrap_paren(&args[0]).kind else {
+                    return None;
+                };
+                if as_slice.seg.ident.name.as_str() != "as_slice" || !as_slice.args.is_empty() {
+                    return None;
+                }
+                self.cursor_offset_chain(&as_slice.receiver, offsets)
+                    .or_else(|| {
+                        self.is_cursor_binding(&as_slice.receiver)
+                            .then_some(CursorIndexBase::Cursor(&as_slice.receiver))
+                    })
+                    .or(Some(CursorIndexBase::Slice(&args[0])))
+            }
+            _ => None,
+        }
+    }
+
+    fn is_cursor_binding(&self, expr: &Expr) -> bool {
+        let ExprKind::Path(None, path) = &unwrap_paren(expr).kind else {
+            return false;
+        };
+        let [segment] = path.segments.as_slice() else {
+            return false;
+        };
+        self.binding_scopes
+            .iter()
+            .rev()
+            .find_map(|scope| scope.get(&segment.ident.name).copied())
+            .unwrap_or(false)
+            && self.binding_counts.get(&segment.ident.name) == Some(&1)
+    }
+}
+
+#[derive(Default)]
+struct BindingCounter {
+    counts: FxHashMap<Symbol, usize>,
+}
+
+impl MutVisitor for BindingCounter {
+    fn visit_pat(&mut self, pat: &mut Pat) {
+        if let PatKind::Ident(_, ident, _) = &pat.kind {
+            *self.counts.entry(ident.name).or_default() += 1;
+        }
+        mut_visit::walk_pat(self, pat);
+    }
+}
+
+fn simple_binding_name(pat: &Pat) -> Option<Symbol> {
+    let PatKind::Ident(_, ident, None) = &pat.kind else {
+        return None;
+    };
+    Some(ident.name)
+}
+
+fn is_cursor_ty(ty: &Ty) -> bool {
+    match &ty.kind {
+        TyKind::Paren(ty) => is_cursor_ty(ty),
+        TyKind::Path(None, path) => {
+            let [crate_segment, module_segment, ty_segment] = path.segments.as_slice() else {
+                return false;
+            };
+            crate_segment.ident.name.as_str() == "crate"
+                && module_segment.ident.name.as_str() == "slice_cursor"
+                && matches!(
+                    ty_segment.ident.name.as_str(),
+                    "SliceCursor" | "SliceCursorMut"
+                )
+        }
+        _ => false,
+    }
+}
+
+fn cursor_offset_without_reborrow(expr: &Expr) -> Option<P<Expr>> {
+    let ExprKind::MethodCall(reborrow) = &unwrap_paren(expr).kind else {
+        return None;
+    };
+    if reborrow.seg.ident.name.as_str() != "as_deref_mut" || !reborrow.args.is_empty() {
+        return None;
+    }
+    let ExprKind::MethodCall(offset) = &unwrap_paren(&reborrow.receiver).kind else {
+        return None;
+    };
+    (offset.seg.ident.name.as_str() == "offset_by").then(|| reborrow.receiver.clone())
+}
+
+enum CursorIndexBase<'a> {
+    Cursor(&'a Expr),
+    Slice(&'a Expr),
+}
+
+fn is_slice_cursor_new(expr: &Expr) -> bool {
+    let ExprKind::Path(_, path) = &unwrap_paren(expr).kind else {
+        return false;
+    };
+    let segments = &path.segments;
+    segments.len() >= 2
+        && segments[segments.len() - 2].ident.name.as_str() == "SliceCursor"
+        && segments[segments.len() - 1].ident.name.as_str() == "new"
+}
+
+fn is_zero_integer_expr(expr: &Expr) -> bool {
+    let ExprKind::Lit(lit) = &unwrap_cast_and_paren(expr).kind else {
+        return false;
+    };
+    lit.kind == token::LitKind::Integer && lit.symbol.as_str() == "0"
 }
 
 fn unwrap_addr_of_deref(expr: &Expr) -> &Expr {
@@ -16037,6 +16370,494 @@ mod tests {
         rewriter::{Config, replace_local_borrows},
         utils::rustc::RustProgram,
     };
+
+    fn with_simplified_cursor_projection(source: &str, check: impl FnOnce(&Expr) + Send) {
+        utils::compilation::run_compiler_on_str("fn f() {}", move |_| {
+            let mut krate = utils::ast::parse_crate(source.to_string());
+            CursorProjectionSimplifier::default().visit_crate(&mut krate);
+
+            #[derive(Default)]
+            struct WildInitializer(Option<P<Expr>>);
+
+            impl MutVisitor for WildInitializer {
+                fn visit_local(&mut self, local: &mut Local) {
+                    if matches!(local.pat.kind, PatKind::Wild)
+                        && let Some(init) = local.kind.init()
+                    {
+                        assert!(self.0.is_none(), "multiple wildcard initializers");
+                        self.0 = Some(Box::new(init.clone()));
+                    }
+                    mut_visit::walk_local(self, local);
+                }
+            }
+
+            let mut initializer = WildInitializer::default();
+            initializer.visit_crate(&mut krate);
+            check(&initializer.0.expect("missing wildcard initializer"));
+        })
+        .unwrap();
+    }
+
+    fn assert_path(expr: &Expr, expected: &str) {
+        let ExprKind::Path(None, path) = &unwrap_paren(expr).kind else {
+            panic!(
+                "expected path {expected}, got {}",
+                pprust::expr_to_string(expr)
+            );
+        };
+        assert_eq!(path.segments.len(), 1, "{}", pprust::expr_to_string(expr));
+        assert_eq!(path.segments[0].ident.name.as_str(), expected);
+    }
+
+    fn assert_simple_ty(ty: &Ty, expected: &str) {
+        let TyKind::Path(None, path) = &ty.kind else {
+            panic!("expected type {expected}, got {}", pprust::ty_to_string(ty));
+        };
+        assert_eq!(path.segments.len(), 1, "{}", pprust::ty_to_string(ty));
+        assert_eq!(path.segments[0].ident.name.as_str(), expected);
+    }
+
+    fn assert_combined_cursor_index(index: &Expr) {
+        let ExprKind::MethodCall(call) = &unwrap_paren(index).kind else {
+            panic!(
+                "expected wrapping_add, got {}",
+                pprust::expr_to_string(index)
+            );
+        };
+        assert_eq!(call.seg.ident.name.as_str(), "wrapping_add");
+        assert_path(&call.receiver, "raw_idx");
+        let [offset] = call.args.as_slice() else {
+            panic!("expected one wrapping_add argument");
+        };
+        let ExprKind::Cast(offset, ty) = &unwrap_paren(offset).kind else {
+            panic!(
+                "expected x as isize, got {}",
+                pprust::expr_to_string(offset)
+            );
+        };
+        assert_path(offset, "x");
+        assert_simple_ty(ty, "isize");
+    }
+
+    #[test]
+    fn cursor_projection_simplifier_indexes_proven_cursor_parameter() {
+        with_simplified_cursor_projection(
+            r#"
+            fn f(
+                raw: crate::slice_cursor::SliceCursorMut<'_, u8>,
+                raw_idx: isize,
+                x: i32,
+            ) {
+                let _ = crate::slice_cursor::SliceCursor::new(
+                    crate::slice_cursor::SliceCursor::new(raw.as_slice())
+                        .offset_by(raw_idx)
+                        .as_slice(),
+                )
+                .offset_by(x as isize)[0usize];
+            }
+            "#,
+            |initializer| {
+                let ExprKind::Index(base, index, _) = &unwrap_paren(initializer).kind else {
+                    panic!(
+                        "expected index, got {}",
+                        pprust::expr_to_string(initializer)
+                    );
+                };
+                assert_path(base, "raw");
+                assert_combined_cursor_index(index);
+            },
+        );
+    }
+
+    #[test]
+    fn cursor_projection_simplifier_indexes_proven_cursor_local() {
+        with_simplified_cursor_projection(
+            r#"
+            fn f(
+                cursor: crate::slice_cursor::SliceCursorMut<'_, u8>,
+                raw_idx: isize,
+                x: i32,
+            ) {
+                let raw: crate::slice_cursor::SliceCursorMut<'_, u8> = cursor;
+                let _ = crate::slice_cursor::SliceCursor::new(
+                    crate::slice_cursor::SliceCursor::new(raw.as_slice())
+                        .offset_by(raw_idx)
+                        .as_slice(),
+                )
+                .offset_by(x as isize)[0usize];
+            }
+            "#,
+            |initializer| {
+                let ExprKind::Index(base, index, _) = &unwrap_paren(initializer).kind else {
+                    panic!(
+                        "expected index, got {}",
+                        pprust::expr_to_string(initializer)
+                    );
+                };
+                assert_path(base, "raw");
+                assert_combined_cursor_index(index);
+            },
+        );
+    }
+
+    #[test]
+    fn cursor_projection_simplifier_respects_non_cursor_shadowing() {
+        with_simplified_cursor_projection(
+            r#"
+            fn f(
+                raw: crate::slice_cursor::SliceCursorMut<'_, u8>,
+                values: &[u8],
+                raw_idx: isize,
+                x: i32,
+            ) {
+                {
+                    let raw: &[u8] = values;
+                    let _ = crate::slice_cursor::SliceCursor::new(
+                        crate::slice_cursor::SliceCursor::new(raw.as_slice())
+                            .offset_by(raw_idx)
+                            .as_slice(),
+                    )
+                    .offset_by(x as isize)[0usize];
+                }
+            }
+            "#,
+            |initializer| {
+                let ExprKind::Index(base, index, _) = &unwrap_paren(initializer).kind else {
+                    panic!(
+                        "expected index, got {}",
+                        pprust::expr_to_string(initializer)
+                    );
+                };
+                let ExprKind::MethodCall(call) = &unwrap_paren(base).kind else {
+                    panic!(
+                        "expected raw.as_slice(), got {}",
+                        pprust::expr_to_string(base)
+                    );
+                };
+                assert_eq!(call.seg.ident.name.as_str(), "as_slice");
+                assert!(call.args.is_empty());
+                assert_path(&call.receiver, "raw");
+
+                let ExprKind::Cast(index, ty) = &unwrap_paren(index).kind else {
+                    panic!("expected usize cast, got {}", pprust::expr_to_string(index));
+                };
+                assert_simple_ty(ty, "usize");
+                assert_combined_cursor_index(index);
+            },
+        );
+    }
+
+    #[test]
+    fn cursor_projection_simplifier_respects_closure_parameter_shadowing() {
+        with_simplified_cursor_projection(
+            r#"
+            fn f(
+                raw: crate::slice_cursor::SliceCursorMut<'_, u8>,
+                raw_idx: isize,
+                x: i32,
+            ) {
+                let _closure = |raw: &[u8]| {
+                    let _ = crate::slice_cursor::SliceCursor::new(
+                        crate::slice_cursor::SliceCursor::new(raw.as_slice())
+                            .offset_by(raw_idx)
+                            .as_slice(),
+                    )
+                    .offset_by(x as isize)[0usize];
+                };
+            }
+            "#,
+            |initializer| {
+                let ExprKind::Index(base, index, _) = &unwrap_paren(initializer).kind else {
+                    panic!(
+                        "expected index, got {}",
+                        pprust::expr_to_string(initializer)
+                    );
+                };
+                let ExprKind::MethodCall(call) = &unwrap_paren(base).kind else {
+                    panic!(
+                        "expected raw.as_slice(), got {}",
+                        pprust::expr_to_string(base)
+                    );
+                };
+                assert_eq!(call.seg.ident.name.as_str(), "as_slice");
+                assert!(call.args.is_empty());
+                assert_path(&call.receiver, "raw");
+
+                let ExprKind::Cast(index, ty) = &unwrap_paren(index).kind else {
+                    panic!("expected usize cast, got {}", pprust::expr_to_string(index));
+                };
+                assert_simple_ty(ty, "usize");
+                assert_combined_cursor_index(index);
+            },
+        );
+    }
+
+    #[test]
+    fn cursor_projection_simplifier_simplifies_unshadowed_closure_capture() {
+        with_simplified_cursor_projection(
+            r#"
+            fn f(
+                raw: crate::slice_cursor::SliceCursorMut<'_, u8>,
+                raw_idx: isize,
+                x: i32,
+            ) {
+                let _closure = || {
+                    let _ = crate::slice_cursor::SliceCursor::new(
+                        crate::slice_cursor::SliceCursor::new(raw.as_slice())
+                            .offset_by(raw_idx)
+                            .as_slice(),
+                    )
+                    .offset_by(x as isize)[0usize];
+                };
+            }
+            "#,
+            |initializer| {
+                let ExprKind::Index(base, index, _) = &unwrap_paren(initializer).kind else {
+                    panic!(
+                        "expected index, got {}",
+                        pprust::expr_to_string(initializer)
+                    );
+                };
+                assert_path(base, "raw");
+                assert_combined_cursor_index(index);
+            },
+        );
+    }
+
+    #[test]
+    fn cursor_projection_simplifier_isolates_nested_items() {
+        with_simplified_cursor_projection(
+            r#"
+            fn f(
+                raw: crate::slice_cursor::SliceCursorMut<'_, u8>,
+                raw_idx: isize,
+                x: i32,
+            ) {
+                static raw: &[u8] = &[];
+                const VALUE: () = {
+                    let _ = crate::slice_cursor::SliceCursor::new(
+                        crate::slice_cursor::SliceCursor::new(raw.as_slice())
+                            .offset_by(raw_idx)
+                            .as_slice(),
+                    )
+                    .offset_by(x as isize)[0usize];
+                };
+            }
+            "#,
+            |initializer| {
+                let ExprKind::Index(base, index, _) = &unwrap_paren(initializer).kind else {
+                    panic!(
+                        "expected index, got {}",
+                        pprust::expr_to_string(initializer)
+                    );
+                };
+                let ExprKind::MethodCall(call) = &unwrap_paren(base).kind else {
+                    panic!(
+                        "expected raw.as_slice(), got {}",
+                        pprust::expr_to_string(base)
+                    );
+                };
+                assert_eq!(call.seg.ident.name.as_str(), "as_slice");
+                assert!(call.args.is_empty());
+                assert_path(&call.receiver, "raw");
+
+                let ExprKind::Cast(index, ty) = &unwrap_paren(index).kind else {
+                    panic!("expected usize cast, got {}", pprust::expr_to_string(index));
+                };
+                assert_simple_ty(ty, "usize");
+                assert_combined_cursor_index(index);
+            },
+        );
+    }
+
+    #[test]
+    fn cursor_projection_simplifier_respects_destructuring_shadowing() {
+        with_simplified_cursor_projection(
+            r#"
+            fn f(
+                raw: crate::slice_cursor::SliceCursorMut<'_, u8>,
+                values: (&[u8],),
+                raw_idx: isize,
+                x: i32,
+            ) {
+                let (raw,) = values;
+                let _ = crate::slice_cursor::SliceCursor::new(
+                    crate::slice_cursor::SliceCursor::new(raw.as_slice())
+                        .offset_by(raw_idx)
+                        .as_slice(),
+                )
+                .offset_by(x as isize)[0usize];
+            }
+            "#,
+            |initializer| {
+                let ExprKind::Index(base, index, _) = &unwrap_paren(initializer).kind else {
+                    panic!(
+                        "expected index, got {}",
+                        pprust::expr_to_string(initializer)
+                    );
+                };
+                let ExprKind::MethodCall(call) = &unwrap_paren(base).kind else {
+                    panic!(
+                        "expected raw.as_slice(), got {}",
+                        pprust::expr_to_string(base)
+                    );
+                };
+                assert_eq!(call.seg.ident.name.as_str(), "as_slice");
+                assert!(call.args.is_empty());
+                assert_path(&call.receiver, "raw");
+
+                let ExprKind::Cast(index, ty) = &unwrap_paren(index).kind else {
+                    panic!("expected usize cast, got {}", pprust::expr_to_string(index));
+                };
+                assert_simple_ty(ty, "usize");
+                assert_combined_cursor_index(index);
+            },
+        );
+    }
+
+    #[test]
+    fn cursor_projection_simplifier_indexes_proven_associated_function_parameter() {
+        with_simplified_cursor_projection(
+            r#"
+            struct S;
+
+            impl S {
+                fn f(
+                    raw: crate::slice_cursor::SliceCursorMut<'_, u8>,
+                    raw_idx: isize,
+                    x: i32,
+                ) {
+                    let _ = crate::slice_cursor::SliceCursor::new(
+                        crate::slice_cursor::SliceCursor::new(raw.as_slice())
+                            .offset_by(raw_idx)
+                            .as_slice(),
+                    )
+                    .offset_by(x as isize)[0usize];
+                }
+            }
+            "#,
+            |initializer| {
+                let ExprKind::Index(base, index, _) = &unwrap_paren(initializer).kind else {
+                    panic!(
+                        "expected index, got {}",
+                        pprust::expr_to_string(initializer)
+                    );
+                };
+                assert_path(base, "raw");
+                assert_combined_cursor_index(index);
+            },
+        );
+    }
+
+    #[test]
+    fn cursor_projection_simplifier_rejects_noncanonical_cursor_type() {
+        with_simplified_cursor_projection(
+            r#"
+            fn f(
+                raw: other::SliceCursor<'_, u8>,
+                raw_idx: isize,
+                x: i32,
+            ) {
+                let _ = crate::slice_cursor::SliceCursor::new(
+                    crate::slice_cursor::SliceCursor::new(raw.as_slice())
+                        .offset_by(raw_idx)
+                        .as_slice(),
+                )
+                .offset_by(x as isize)[0usize];
+            }
+            "#,
+            |initializer| {
+                let ExprKind::Index(base, index, _) = &unwrap_paren(initializer).kind else {
+                    panic!(
+                        "expected index, got {}",
+                        pprust::expr_to_string(initializer)
+                    );
+                };
+                let ExprKind::MethodCall(call) = &unwrap_paren(base).kind else {
+                    panic!(
+                        "expected raw.as_slice(), got {}",
+                        pprust::expr_to_string(base)
+                    );
+                };
+                assert_eq!(call.seg.ident.name.as_str(), "as_slice");
+                assert!(call.args.is_empty());
+                assert_path(&call.receiver, "raw");
+
+                let ExprKind::Cast(index, ty) = &unwrap_paren(index).kind else {
+                    panic!("expected usize cast, got {}", pprust::expr_to_string(index));
+                };
+                assert_simple_ty(ty, "usize");
+                assert_combined_cursor_index(index);
+            },
+        );
+    }
+
+    #[test]
+    fn cursor_projection_simplifier_combines_offset_index() {
+        utils::compilation::run_compiler_on_str("fn f() {}", |_| {
+            let mut expr = utils::expr!(
+                "p.as_deref_mut().offset_by(a).as_deref_mut().offset_by(b)[0 as usize]"
+            );
+            CursorProjectionSimplifier::default().visit_expr(&mut expr);
+            let expr = pprust::expr_to_string(&expr);
+            assert!(expr.contains("wrapping_add"), "{expr}");
+            assert!(!expr.contains("as_deref_mut"), "{expr}");
+            assert!(!expr.contains("offset_by"), "{expr}");
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn cursor_projection_simplifier_reborrows_once() {
+        utils::compilation::run_compiler_on_str("fn f() {}", |_| {
+            let mut expr =
+                utils::expr!("p.as_deref_mut().offset_by(a).as_deref_mut().offset_by(b)");
+            CursorProjectionSimplifier::default().visit_expr(&mut expr);
+            let expr = pprust::expr_to_string(&expr);
+            assert_eq!(expr.matches("as_deref_mut").count(), 1, "{expr}");
+            assert_eq!(expr.matches("offset_by").count(), 2, "{expr}");
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn cursor_projection_simplifier_removes_shared_cursor_constructors() {
+        utils::compilation::run_compiler_on_str("fn f() {}", |_| {
+            let mut expr = utils::expr!(
+                "crate::slice_cursor::SliceCursor::new(
+                    crate::slice_cursor::SliceCursor::new(raw.as_slice())
+                        .offset_by(a)
+                        .as_slice()
+                )
+                .offset_by(b)[0usize]"
+            );
+            CursorProjectionSimplifier::default().visit_expr(&mut expr);
+            let expr = pprust::expr_to_string(&expr);
+            assert!(expr.contains("wrapping_add"), "{expr}");
+            assert!(expr.contains("raw.as_slice"), "{expr}");
+            assert!(expr.contains("as usize"), "{expr}");
+            assert!(!expr.contains("SliceCursor::new"), "{expr}");
+            assert!(!expr.contains("offset_by"), "{expr}");
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn cursor_projection_simplifier_indexes_unproven_as_slice_receiver() {
+        utils::compilation::run_compiler_on_str("fn f() {}", |_| {
+            let mut expr = utils::expr!(
+                "crate::slice_cursor::SliceCursor::new(values.as_slice()).offset_by(a)[0usize]"
+            );
+            CursorProjectionSimplifier::default().visit_expr(&mut expr);
+            let expr = pprust::expr_to_string(&expr);
+            assert!(expr.contains("values.as_slice"), "{expr}");
+            assert!(expr.contains("as usize"), "{expr}");
+            assert!(!expr.contains("SliceCursor::new"), "{expr}");
+            assert!(!expr.contains("offset_by"), "{expr}");
+            assert!(!expr.starts_with("(values)["), "{expr}");
+        })
+        .unwrap();
+    }
 
     fn collect_program(tcx: TyCtxt<'_>) -> RustProgram<'_> {
         let mut functions = Vec::new();
