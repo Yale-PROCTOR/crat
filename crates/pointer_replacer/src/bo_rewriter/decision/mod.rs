@@ -262,13 +262,16 @@ impl DecisionTable {
         })
     }
 
-    /// Subjects the table decided to emit.
-    pub(crate) fn emitted_count(&self) -> usize {
-        self.entries
-            .iter()
-            .filter(|(_, d)| matches!(d, Decision::Ref { .. }))
-            .count()
-    }
+    // `emitted_count()` — a count of `Ref` DECISIONS — lived here until S2b.3
+    // made `emitted` count PLACEMENTS. It is deleted rather than kept behind an
+    // allow: it is orphaned by that change, and what it computes is now
+    // precisely the wrong number to report. Leaving it available is an
+    // invitation to re-adopt it.
+    //
+    // The placement-truth witnesses define themselves against it as a
+    // counterfactual, so their recorded mutation names the expression
+    // (`entries.iter().filter(|(_, d)| matches!(d, Decision::Ref { .. })).count()`)
+    // rather than a call, and stays runnable without it.
 }
 
 /// Build the decision table from BO's accepted model **and the A1 facts**.

@@ -193,12 +193,22 @@ pub(crate) struct Plan {
 /// | no source text for the file | `Unplaceable` |
 /// | pointee range outside its file | `Unplaceable` |
 ///
-/// **Counting, stated so it is not mistaken for settled:** the reported
-/// `emitted` is `DecisionTable::emitted_count()` — a count of *decisions*, not
-/// of *placements* — so any `Unplaceable` here would leave `emitted`
-/// over-reporting by that many subjects. Exposure is zero today (measured
-/// across all 20 frozen programs). **S2b.2 makes the arm attributable; S2b.3
-/// makes it counted**, and lands the pin.
+/// **Counting — SETTLED AT S2b.3.** The reported `emitted` counts *placements*:
+/// every `Unplaceable` recorded here is subtracted from the emitted-subject set
+/// by its [`Unplaceable::subject`] identity, so a decision that produced no edit
+/// is not reported as a rewrite. It was a count of *decisions* through S2b.2,
+/// over-reporting by exactly the unplaceable set.
+///
+/// Exposure was zero across all 20 frozen programs both before and after, which
+/// is why this was a derivation fix rather than a number change — and why it was
+/// worth making: a counter that is right by measurement is one corpus change
+/// away from being wrong, and the wrongness would present as a yield figure
+/// rather than as a failure.
+///
+/// The count is now also **pinned**: `m1_emit_corpus` fails on a nonzero
+/// `unplaceable`, fail-closed on a missing or unparseable value. The pin is
+/// meaningful on FAIL rows only because `RewriteOutcome::Degraded` carries the
+/// count as of S2b.3; before that it reported a constant.
 ///
 /// **Where alias-typed subjects land today:** a parameter whose *resolved* type
 /// is a pointer but whose declaration is a type alias is collected (R-A) with

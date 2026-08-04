@@ -8301,7 +8301,7 @@ fn an_unparseable_aggregate_fails_closed() {
 /// assertion: delete the `unplaceable_subjects.contains(..)` skip in
 /// `rewrite_core_injected` and this fails 1 vs 0.
 ///
-/// Restoring `table.emitted_count()` at the tuple site **survives** this test,
+/// Putting the decision count back at the tuple site **survives** this test,
 /// and correctly so: the fixture takes the emitting path, where
 /// `facts.emitted_count` is overwritten by the already-filtered `kept.len()`.
 /// That site reaches a consumer only on a `Degraded` return, which is why it has

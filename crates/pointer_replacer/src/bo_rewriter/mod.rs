@@ -454,7 +454,8 @@ fn rewrite_core_injected(
             emission_texts,
             emission.unplaceable,
             degradations,
-            // NOT `table.emitted_count()` — that counts `Ref` DECISIONS. This
+            // NOT a count of `Ref` DECISIONS (which is what the deleted
+            // `emitted_count()` computed). This
             // is the placed set, already filtered above, so `emitted` names
             // what the rewrite actually did to the source.
             emitted_subjects.len(),

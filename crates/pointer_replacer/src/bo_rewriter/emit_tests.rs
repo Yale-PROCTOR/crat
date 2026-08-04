@@ -1343,8 +1343,8 @@ fn a_degraded_outcome_still_reports_its_unplaceable_decisions() {
 ///
 /// *Mutation-tested, Rider 0 order.* **Deletion first:** delete the
 /// `unplaceable_subjects.contains(..)` skip in `rewrite_core_injected` and this
-/// fails 1 vs 0 on the emitting leg. Second: restore `table.emitted_count()` at
-/// the tuple site — **this SURVIVED the emitting leg alone**, which is how the
+/// fails 1 vs 0 on the emitting leg. Second: put the decision count back at
+/// the tuple site — `entries.iter().filter(|(_, d)| matches!(d, Decision::Ref { .. })).count()` — **this SURVIVED the emitting leg alone**, which is how the
 /// second route was found; it fails the probe leg below.
 #[test]
 fn emitted_counts_placements_not_ref_decisions() {
@@ -1400,8 +1400,8 @@ fn emitted_counts_placements_not_ref_decisions() {
 ///
 /// *Mutation-tested, Rider 0 order.* **Deletion first:** the tuple site's
 /// `emitted_subjects.len()` has no deletion that compiles, so the faithful
-/// mutation is the original expression — restore `table.emitted_count()` and
-/// this fails 1 vs 0. That mutation SURVIVES the emitting leg, which is exactly
+/// mutation is the original expression — put the decision count back,
+/// `entries.iter().filter(|(_, d)| matches!(d, Decision::Ref { .. })).count()`, and this fails 1 vs 0. That mutation SURVIVES the emitting leg, which is exactly
 /// why this leg exists.
 #[test]
 fn a_degraded_outcome_reports_placements_too() {
