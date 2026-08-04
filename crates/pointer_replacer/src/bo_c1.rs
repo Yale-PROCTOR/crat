@@ -8114,11 +8114,15 @@ fn shasum_of(path: &std::path::Path) -> String {
         .to_owned()
 }
 
+/// A row field that must read `0`, **fail-closed on absence**.
+///
+/// Missing and unparseable are failures, not zeros: an expected-zero check that
+/// reads a missing key as satisfied passes hardest exactly when the instrument
+/// has stopped reporting.
 #[cfg(test)]
-fn expected_zero_aggregate(row: &report::Row, class: &str) -> Result<(), String> {
-    let key = format!("agg_{}", class.replace('-', "_"));
+fn expected_zero_field(row: &report::Row, key: &str) -> Result<(), String> {
     let raw = row
-        .get(&key)
+        .get(key)
         .ok_or_else(|| format!("{key}=missing (expected 0)"))?;
     let n: usize = raw
         .parse()
@@ -8128,6 +8132,16 @@ fn expected_zero_aggregate(row: &report::Row, class: &str) -> Result<(), String>
     } else {
         Err(format!("{key}={n} (expected 0)"))
     }
+}
+
+/// The finding-class aggregates — the same check over a derived key.
+///
+/// Delegated rather than reimplemented: two zero-checks are two places for the
+/// fail-closed behaviour to drift apart, and this is a canonicalizer, not a
+/// reconciliation. The rule of record says those are single.
+#[cfg(test)]
+fn expected_zero_aggregate(row: &report::Row, class: &str) -> Result<(), String> {
+    expected_zero_field(row, &format!("agg_{}", class.replace('-', "_")))
 }
 
 #[test]
@@ -8145,6 +8159,46 @@ fn an_unparseable_aggregate_fails_closed() {
     let err = expected_zero_aggregate(&row, "out-of-coverage")
         .expect_err("an unparseable expected-zero aggregate must fail");
     assert!(err.contains("unparseable"), "wrong failure: {err}");
+}
+
+/// **S2b.3 — the `unplaceable` pin, all four verdicts.**
+///
+/// The pin's whole value is the two non-obvious cases: a sweep whose worker
+/// stopped emitting the key, and one emitting garbage, must FAIL rather than
+/// read as zero. The nonzero case is here too because nothing exercised the
+/// `n != 0` arm of the shared checker — the aggregate tests cover only missing
+/// and unparseable — and the accepting case because a pin that rejects a
+/// measured zero can never let the corpus sweep pass.
+///
+/// *Mutation-tested, Rider 0 order.* **Deletion first:** delete the
+/// `ok_or_else` and default a missing key to `"0"` — this fails on the missing
+/// case. Second: neuter the `n == 0` arm to an unconditional `Ok` — this fails
+/// on the nonzero case.
+#[test]
+fn the_unplaceable_pin_is_fail_closed() {
+    let missing = report::Row::default();
+    let err = expected_zero_field(&missing, "unplaceable")
+        .expect_err("a missing unplaceable count must fail, never read as zero");
+    assert!(err.contains("missing"), "wrong failure: {err}");
+
+    let mut garbage = report::Row::default();
+    garbage.set("unplaceable", "not-a-number");
+    let err = expected_zero_field(&garbage, "unplaceable")
+        .expect_err("an unparseable unplaceable count must fail");
+    assert!(err.contains("unparseable"), "wrong failure: {err}");
+
+    let mut nonzero = report::Row::default();
+    nonzero.set("unplaceable", 3usize);
+    let err = expected_zero_field(&nonzero, "unplaceable")
+        .expect_err("a nonzero unplaceable count must fail the pin");
+    assert!(err.contains('3'), "the failure must name the count: {err}");
+
+    let mut clean = report::Row::default();
+    clean.set("unplaceable", 0usize);
+    assert!(
+        expected_zero_field(&clean, "unplaceable").is_ok(),
+        "the pin must accept a measured zero, or the corpus sweep can never pass"
+    );
 }
 
 #[test]
@@ -8437,6 +8491,9 @@ fn m1_emit_corpus() {
     let mut attempted = 0usize;
     let mut missing: Vec<String> = Vec::new();
     let mut rows: Vec<report::Row> = Vec::new();
+    // S2b.3: the sweep now ENFORCES one thing. Everything else it reports stays
+    // measurement-only.
+    let mut failures: Vec<String> = Vec::new();
 
     for program in CORPUS {
         let input = program.input_path(&root);
@@ -8540,6 +8597,18 @@ fn m1_emit_corpus() {
             row.set("bucket_same_file_other_fn", caller);
             row.set("bucket_elsewhere", elsewhere);
         }
+        // THE PIN (S2b.3). `unplaceable` was measured-zero on the corpus and
+        // asserted nowhere; the plan doc read "aggregate-pinned" while nothing
+        // was pinned. Enforced here on every row INCLUDING FAIL rows — which is
+        // only meaningful because `RewriteOutcome::Degraded` now carries the
+        // count instead of reporting a constant. Pinning before that repair
+        // would have built a gate that cannot fail where it matters.
+        //
+        // Continues past a failure and enumerates, as the recon sweep does: one
+        // run yields full incidence rather than halting at the first program.
+        if let Err(detail) = expected_zero_field(&row, "unplaceable") {
+            failures.push(format!("{}: {detail}", program.name));
+        }
         rows.push(row);
     }
 
@@ -8555,6 +8624,14 @@ fn m1_emit_corpus() {
         "every corpus program must be attempted"
     );
     assert_eq!(attempted, CORPUS.len(), "the corpus is 20 programs");
+    assert!(
+        failures.is_empty(),
+        "unplaceable is expected-zero corpus-wide ({} finding(s)) — a nonzero \
+         count is a decision that reached `plan` and produced no edit, which is \
+         a finding to rule on, never auto-green:\n  {}",
+        failures.len(),
+        failures.join("\n  ")
+    );
 }
 
 // Worker (one program, one mode, one process).
