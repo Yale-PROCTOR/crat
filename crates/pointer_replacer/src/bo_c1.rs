@@ -8296,9 +8296,17 @@ fn an_unparseable_aggregate_fails_closed() {
 ///
 /// *Mutation-tested, Rider 0 order.* **Deletion first:** delete the
 /// `row.set("unplaceable", ..)` from the Emitted arm — the key goes missing and
-/// this fails on the `expect`. Second, the faithful one: write `0usize` there,
-/// the exact pre-S2b.3 defect, and this fails 0 vs 1. Third: restore
-/// `table.emitted_count()` in `rewrite_core_injected` and this fails 1 vs 0.
+/// this fails. Second, the faithful one: write `0usize` there, the exact
+/// pre-S2b.3 defect, and this fails 0 vs 1. Third, for the `emitted`
+/// assertion: delete the `unplaceable_subjects.contains(..)` skip in
+/// `rewrite_core_injected` and this fails 1 vs 0.
+///
+/// Restoring `table.emitted_count()` at the tuple site **survives** this test,
+/// and correctly so: the fixture takes the emitting path, where
+/// `facts.emitted_count` is overwritten by the already-filtered `kept.len()`.
+/// That site reaches a consumer only on a `Degraded` return, which is why it has
+/// its own witness in `a_degraded_outcome_reports_placements_too` rather than
+/// being claimed here.
 #[test]
 fn run_m1_emit_reports_its_counters_at_fixture_scale() {
     let dir = std::env::temp_dir().join(format!("crat-m1emit-smoke-{}", std::process::id()));
