@@ -622,6 +622,215 @@ fn if_let_ban_matches_a_synthetic_breach() {
 }
 
 // ---------------------------------------------------------------------------
+// S3.0 (ruling 5): every PRODUCTION consumer of a `Decision` is exhaustive
+// ---------------------------------------------------------------------------
+
+/// True at the line that opens a file's inline `#[cfg(test)]` module BLOCK.
+///
+/// **One definition of "where production ends", shared by every
+/// production-scoped scan** — [`emission_call_sites`] and [`scan_production`]
+/// both consult it. It was inlined in the former until S3.0 needed the same
+/// rule; a second copy is how two scans start disagreeing about which lines are
+/// production.
+///
+/// It matches the `#[cfg(test)] mod x {` BLOCK, never the `#[cfg(test)] mod x;`
+/// DECLARATION: declarations sit at the TOP of a module file, so truncating on
+/// one would hide the whole production body — which is what the first version of
+/// this rule did.
+fn is_inline_test_block_start(lines: &[&str], index: usize) -> bool {
+    lines[index].trim() == "#[cfg(test)]"
+        && lines
+            .get(index + 1)
+            .is_some_and(|next| next.contains("mod ") && next.trim_end().ends_with('{'))
+}
+
+/// [`scan_root`], restricted to each file's PRODUCTION region.
+///
+/// Separate from `scan_root` because that function deliberately scans whole
+/// files: an import rule binds in tests too. An exhaustiveness rule does not —
+/// a test may legitimately branch on one variant — so the ruling scopes this
+/// class to production sites, and the scan has to agree with the ruling.
+fn scan_production(
+    root: &Path,
+    skip: &dyn Fn(&Path) -> bool,
+    offense: &dyn Fn(&str) -> Option<String>,
+) -> Vec<String> {
+    let mut files = Vec::new();
+    collect_rs_files(root, &mut files);
+    assert!(
+        !files.is_empty(),
+        "no .rs files found under {root:?} — the scan would pass vacuously"
+    );
+    let mut hits = Vec::new();
+    let mut scanned = 0usize;
+    for file in &files {
+        if skip(file) {
+            continue;
+        }
+        scanned += 1;
+        let text = fs::read_to_string(file)
+            .unwrap_or_else(|e| panic!("source unreadable at {file:?}: {e}"));
+        let lines: Vec<&str> = text.lines().collect();
+        for index in 0..lines.len() {
+            if is_inline_test_block_start(&lines, index) {
+                break;
+            }
+            if is_comment(lines[index]) {
+                continue;
+            }
+            if let Some(detail) = offense(lines[index]) {
+                hits.push(format!(
+                    "{}:{}: {detail}",
+                    file.strip_prefix(root).unwrap_or(file).display(),
+                    index + 1
+                ));
+            }
+        }
+    }
+    // Same survivor assert as `scan_root`, and for the same measured reason: an
+    // over-broad skip left a scan examining nothing and reporting clean.
+    assert!(
+        scanned > 0,
+        "every file under {root:?} was skipped — the scan examined nothing and \
+         would report clean regardless of what the sources contain"
+    );
+    hits
+}
+
+/// The pattern side of a `let`-family binder — the text between the keyword and
+/// the `=` — or `None` when the line is not one.
+///
+/// Splitting on `=` is what separates **destructuring** from **construction**:
+/// `let Decision::Ref { .. } = d` has `Decision::` on the pattern side and is a
+/// bypass; `let x = Decision::Ref { .. }` has it on the value side and is a
+/// perfectly ordinary construction. A predicate keyed on "the line mentions
+/// `Decision::`" would flag both, and would have been rewritten to silence the
+/// false positives.
+fn let_pattern(trimmed: &str) -> Option<&str> {
+    ["let ", "if let ", "while let "]
+        .iter()
+        .find_map(|kw| trimmed.strip_prefix(kw))
+        .map(|rest| rest.split('=').next().unwrap_or(""))
+}
+
+/// **Bypass shapes on a `Decision` are banned in production code.**
+///
+/// A `Decision` consumer must be an exhaustive `match`, so that adding a
+/// disposition is a compile error at every site that consumes one. Measured at
+/// S3.0 with a temporary third variant: `plan`'s `let …else` and the driver's
+/// `matches!` both compiled clean and silently dropped the subject — no edit, no
+/// `Unplaceable` record, no counted placement — while the two exhaustive sites
+/// failed the build as intended.
+///
+/// **The carve-out is the OPPOSITE of R-C's, and that is not an oversight.**
+/// R-C *permits* `let …else` on a `RewriteOutcome`, because its failure mode is
+/// an unexecuted assertion and a mandatory diverging `else` cannot produce one.
+/// Here `let …else` is the *primary* banned shape, because the failure mode is a
+/// **new variant** silently taking the `else` path. A guard written by analogy to
+/// R-C would miss the very site this rule exists for.
+///
+/// **Stated limitation: a wildcard `_` arm is beyond a line scan.**
+/// `match d { Decision::Ref { .. } => …, _ => … }` bypasses exhaustiveness and is
+/// not detectable here. This guard bans bypass **shapes**; wildcard vigilance
+/// stays with the site comments and review. Saying so at the predicate is the
+/// point — a guard whose reach is overstated is worse than one whose reach is
+/// known.
+fn decision_offense(line: &str) -> Option<String> {
+    let trimmed = line.trim_start();
+    if !trimmed.contains("Decision::") {
+        return None;
+    }
+    if let_pattern(trimmed).is_some_and(|pattern| pattern.contains("Decision::")) {
+        return Some(
+            "`let` / `if let` / `while let` destructuring a Decision — use an \
+             exhaustive `match`"
+                .to_owned(),
+        );
+    }
+    if trimmed.contains("matches!(") {
+        return Some("`matches!` on a Decision — use an exhaustive `match`".to_owned());
+    }
+    None
+}
+
+/// *Mutation-tested (Rider 0, deletion first):* deleting either repaired
+/// `match` — reverting `plan/mod.rs` to its `let …else` or `mod.rs` to its
+/// `matches!` — makes this test FAIL and name that file. That is simultaneously
+/// this guard's witness and the S3.0 repair's own.
+#[test]
+fn production_decision_consumers_are_exhaustive() {
+    let root = module_root();
+    let violations = scan_production(root, &is_test_only_file, &decision_offense);
+
+    assert!(
+        violations.is_empty(),
+        "production code must consume a `Decision` through an exhaustive \
+         `match`, never a bypass shape — a bypass compiles clean against a new \
+         disposition and drops the subject silently:\n  {}",
+        violations.join("\n  ")
+    );
+}
+
+/// The S3.0 check must reject real violations, not merely pass on clean code.
+///
+/// *Mutation-tested (Rider 0, deletion first):* deleting the
+/// `trimmed.contains("Decision::")` early return makes the unrelated-type cases
+/// fail; deleting the `let_pattern` branch makes the three destructuring cases
+/// fail; deleting the `matches!` branch makes that case fail; and narrowing
+/// `let_pattern` to `matches!` alone makes the `let …else` case fail.
+#[test]
+fn decision_ban_matches_a_synthetic_breach() {
+    // The two shapes S3.0 repaired.
+    assert!(
+        decision_offense("        let Decision::Ref { mutable } = decision else {").is_some(),
+        "the `let …else` shape this ban exists for was not detected"
+    );
+    assert!(
+        decision_offense("            if !matches!(decision, decision::Decision::Ref { .. }) {")
+            .is_some(),
+        "the `matches!` shape this ban exists for was not detected"
+    );
+    // The mandated amendment: the else-less `if let` is the original member of
+    // R-C's shape family and skips new variants just as silently.
+    assert!(
+        decision_offense("    if let Decision::Ref { mutable } = decision {").is_some(),
+        "a bare `if let` on a Decision must be flagged"
+    );
+    assert!(
+        decision_offense("    while let Decision::Ref { .. } = next() {").is_some(),
+        "a `while let` on a Decision must be flagged"
+    );
+    // Indentation must not matter.
+    assert!(
+        decision_offense("if let Decision::Degraded(r) = d {").is_some(),
+        "detection is indentation-sensitive"
+    );
+    // Permitted shapes.
+    assert!(
+        decision_offense("        let mutable = match decision {").is_none(),
+        "an exhaustive match must not be flagged"
+    );
+    assert!(
+        decision_offense("            Decision::Degraded(_) => continue,").is_none(),
+        "a match ARM must not be flagged"
+    );
+    assert!(
+        decision_offense("    let x = Decision::Ref { mutable: true };").is_none(),
+        "CONSTRUCTING a Decision must not be flagged — only destructuring bypasses"
+    );
+    assert!(
+        decision_offense("    let d = if c { Decision::Ref { mutable: true } } else { other };")
+            .is_none(),
+        "an `if`/`else` VALUE containing a construction must not be flagged — \
+         this is why the predicate splits on `=` rather than looking for ` else`"
+    );
+    assert!(
+        decision_offense("    if let Some(span) = spans.first() {").is_none(),
+        "a binder on an unrelated type must not be flagged"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // S2a-H amendment (b): the import direction is ONE-WAY
 // ---------------------------------------------------------------------------
 
@@ -840,18 +1049,13 @@ fn emission_call_sites(root: &Path, skip: &dyn Fn(&Path) -> bool) -> Vec<String>
         scanned += 1;
         let text = fs::read_to_string(file)
             .unwrap_or_else(|e| panic!("source unreadable at {file:?}: {e}"));
-        // Stop at an inline `#[cfg(test)] mod x {` BLOCK, not at a
-        // `#[cfg(test)] mod x;` DECLARATION. The declarations sit at the TOP of
-        // a module file, so truncating on them would hide the whole production
-        // body — which is exactly what the first version of this rule did, and
-        // the production check caught it by reporting zero call sites.
+        // Truncation rule extracted to `is_inline_test_block_start` at S3.0 —
+        // ONE definition of "where production ends", now shared with
+        // `scan_production`. Its doc carries the block-vs-declaration reasoning
+        // that lived here.
         let lines: Vec<&str> = text.lines().collect();
         for (index, line) in lines.iter().enumerate() {
-            let is_test_block = line.trim() == "#[cfg(test)]"
-                && lines
-                    .get(index + 1)
-                    .is_some_and(|next| next.contains("mod ") && next.trim_end().ends_with('{'));
-            if is_test_block {
+            if is_inline_test_block_start(&lines, index) {
                 break;
             }
             if is_comment(line) || line.contains("fn emit_files") {
