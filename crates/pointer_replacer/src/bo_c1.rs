@@ -8264,6 +8264,75 @@ fn an_unparseable_aggregate_fails_closed() {
     assert!(err.contains("unparseable"), "wrong failure: {err}");
 }
 
+/// **S2b.3 Item 4 — `run_m1_emit` GRADUATES out of the ignored-only class.**
+///
+/// The instrument's only in-suite consumer was `#[ignore]`d, so `cargo test`
+/// could not see it — the enabling condition behind both S2b.2-era instrument
+/// failures, and the reason the class register exists. This is the fixture-scale
+/// smoke that ends it for this member.
+///
+/// # Measured, not assumed: what this closes
+///
+/// Reverting `run_m1_emit`'s `unplaceable` read to the old `0usize` constant
+/// **survived the entire suite** when Item 0 landed — 1062/6/25 either way. The
+/// outcome-level witnesses cover the data path up to the instrument's read; this
+/// covers the read.
+///
+/// The MACRO fixture rather than a clean one, deliberately. A clean crate has
+/// `unplaceable == 0`, so a constant-zero mutation of the reporting line is
+/// indistinguishable from the truth, and the smoke would pin nothing. This
+/// fixture reports `unplaceable = 1` **and** `emitted = 0`, so one row
+/// discriminates both S2b.3 counters at the instrument layer.
+///
+/// # Residual, registered rather than forced
+///
+/// The **FAIL arm's** read stays uncovered. Discriminating it needs a crate that
+/// compiles, carries an unplaceable subject, AND fails the gate irrecoverably;
+/// the revert loop recovers every fixture-scale breakage, and forcing escalation
+/// needs a round cap `run_m1_emit` does not expose. A non-compiling crate
+/// reaches the arm but through `OutcomeFacts::default()`, whose count is
+/// genuinely zero — it exercises the line without discriminating it. Per the
+/// self-limiting clause this is registered, not manufactured.
+///
+/// *Mutation-tested, Rider 0 order.* **Deletion first:** delete the
+/// `row.set("unplaceable", ..)` from the Emitted arm — the key goes missing and
+/// this fails on the `expect`. Second, the faithful one: write `0usize` there,
+/// the exact pre-S2b.3 defect, and this fails 0 vs 1. Third: restore
+/// `table.emitted_count()` in `rewrite_core_injected` and this fails 1 vs 0.
+#[test]
+fn run_m1_emit_reports_its_counters_at_fixture_scale() {
+    let dir = std::env::temp_dir().join(format!("crat-m1emit-smoke-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("smoke fixture dir");
+    std::fs::write(
+        dir.join("lib.rs"),
+        "#![allow(dead_code, unused_unsafe)]\nmacro_rules! mk {\n    () => {\n        pub unsafe fn mac_bump(p: *mut i32) -> i32 {\n            *p += 1;\n            *p\n        }\n    };\n}\nmk!();\n",
+    )
+    .expect("smoke fixture source");
+
+    let row = run::run_m1_emit(&dir.join("lib.rs"));
+    let _ = std::fs::remove_dir_all(&dir);
+
+    assert_eq!(row.get("status"), Some("ok"), "row: {row:?}");
+    assert_eq!(row.get("verdict"), Some("PASS"), "row: {row:?}");
+    assert_eq!(
+        row.get("unplaceable"),
+        Some("1"),
+        "the instrument did not report the plan's unplaceable decision: {row:?}"
+    );
+    assert_eq!(
+        row.get("emitted"),
+        Some("0"),
+        "the instrument counted a decision that placed no edit: {row:?}"
+    );
+    // The pin's own checker, over a real instrument row rather than a
+    // hand-built one — a nonzero here is what the corpus sweep now fails on.
+    assert!(
+        expected_zero_field(&row, "unplaceable").is_err(),
+        "the pin accepted a row carrying an unplaceable decision"
+    );
+}
+
 /// A producer-A-shaped row, for the counter witnesses.
 #[cfg(test)]
 fn counted_row(
