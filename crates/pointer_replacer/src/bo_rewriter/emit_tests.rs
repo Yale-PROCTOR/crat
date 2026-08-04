@@ -1115,7 +1115,18 @@ fn a_path_outside_the_crate_root_keys_as_itself() {
 /// has a baseline to find.
 ///
 /// *Mutation-tested, Rider 0 order.* **Deletion first:** restore the
-/// unconditional `baseline_of` above the `probe_only` return and this fails.
+/// unconditional `baseline_of` above the `probe_only` return — in the shape it
+/// actually had, feeding the `OutcomeFacts` literal — and this fails.
+///
+/// **A residual, measured rather than assumed.** A first mutation that computed
+/// the baseline eagerly but left the counters assigned below the return
+/// **survived**: the assertion reads the reported counters, so it detects "a
+/// baseline reached the outcome", not "a compile executed". A compile whose
+/// result is discarded would evade it and still contaminate stderr. Catching
+/// that needs an execution counter — a test-only seam in shipping code, which
+/// this track has ruled against where a data-level route exists; here there is
+/// no data-level route, so the residual is stated and left to the corpus
+/// transfer, which observes the stderr end-to-end.
 #[test]
 fn a_probe_does_not_compile_the_baseline_it_never_consults() {
     let fixture = Fixture::new(&[
