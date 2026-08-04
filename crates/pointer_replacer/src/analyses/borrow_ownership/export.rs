@@ -470,8 +470,15 @@ pub(crate) struct BoExport {
     /// for MORE caution here, not less.** Nothing upholds it deliberately, and
     /// the three mechanisms are unrelated to one another: sampling liveness
     /// post-effect instead would make every call-argument loan self-invalidate
-    /// at its own call site. Each conjunct now carries a tripwire
-    /// (`callarg_loan_linkage_tripwire`, branch `callarg-loan-linkage`).
+    /// at its own call site. Each conjunct carries a tripwire, in the test
+    /// module accompanying that investigation — currently unmerged, so grep the
+    /// names: `tripwire_no_ownerless_conflict_edge` (the outcome, with an
+    /// instrument control),
+    /// `tripwire_arg_temp_is_inert_and_successor_head_is_storage_dead`
+    /// (mechanisms 2 and 3), and `tripwire_default_engine_is_the_fork` (the
+    /// engine mechanism 1 is derived against). A fourth,
+    /// `tripwire_may_alias_params_settle_ref_ref`, pins a related finding from
+    /// the same investigation rather than a conjunct of this argument.
     ///
     /// This closes ONE constructor. The others are unexamined — the
     /// edge-to-slot translation silently drops participants that have no
