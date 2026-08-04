@@ -354,12 +354,39 @@ fn rewrite_core_injected(
         // exactly the right number of subjects from emitted to degraded and the
         // accounting identity survives the loop.
         let mut emitted_subjects: Vec<(String, String, String)> = Vec::new();
+        // PLACEMENT-TRUTH (S2b.3). A `Ref` decision that `plan` could not place
+        // produced no edit, so counting it as emitted over-reports the rewrite
+        // by exactly the unplaceable set. Exposure is zero on the frozen corpus
+        // today, which is the reason to fix the derivation NOW: a counter that
+        // is right by measurement rather than by construction is one corpus
+        // change away from being wrong, and the wrongness would present as a
+        // yield number rather than as a failure.
+        //
+        // Subtracted here, at the one place `emitted_subjects` is built, rather
+        // than from the total afterwards: `emitted_sites` is derived in the same
+        // loop, and a function whose only subject went unplaced is NOT a
+        // rewritten site — attributing a verify diagnostic to it would blame a
+        // function this run never touched.
+        let unplaceable_subjects: std::collections::BTreeSet<&str> = emission
+            .unplaceable
+            .iter()
+            .map(|u| u.subject.as_str())
+            .collect();
         let mut seen_fns = rustc_hash::FxHashSet::default();
         for (subject, decision) in &table.entries {
             if !matches!(decision, decision::Decision::Ref { .. }) {
                 continue;
             }
             let owner = tcx.def_path_str(subject.fn_did.to_def_id());
+            if unplaceable_subjects.contains(
+                format!(
+                    "{owner}::{}",
+                    subject.param_name.as_deref().unwrap_or("<unnamed>")
+                )
+                .as_str(),
+            ) {
+                continue;
+            }
             emitted_subjects.push((
                 owner.clone(),
                 format!(
@@ -427,7 +454,10 @@ fn rewrite_core_injected(
             emission_texts,
             emission.unplaceable,
             degradations,
-            table.emitted_count(),
+            // NOT `table.emitted_count()` — that counts `Ref` DECISIONS. This
+            // is the placed set, already filtered above, so `emitted` names
+            // what the rewrite actually did to the source.
+            emitted_subjects.len(),
             decision::universe::classify(tcx).excluded,
             root_text,
             emitted_sites,

@@ -466,10 +466,14 @@ fn the_accounting_identity_survives_a_revert() {
     ]);
     // Subject count from a NO-LOOP emission: what the decision phase decided,
     // which the loop must not change.
+    // PLACED subjects only, as of S2b.3. `emitted` counts placements, so an
+    // unplaceable decision belongs to neither side of this identity — it is
+    // accounted for in the corpus identity `emitted + degraded + unplaceable`,
+    // not in the loop's. Zero on this fixture either way; the derivation is
+    // corrected so it stays true when it is not.
     let subjects = {
         let emission = emit(&fixture);
         emission.plan.by_file.values().map(Vec::len).sum::<usize>()
-            + emission.unplaceable.len()
     };
 
     match super::rewrite_m1_path(&fixture.root()) {
@@ -1307,6 +1311,71 @@ fn a_degraded_outcome_still_reports_its_unplaceable_decisions() {
         }
         super::RewriteOutcome::Emitted { .. } => {
             panic!("probe mode returns before emission and cannot report Emitted")
+        }
+    }
+}
+
+/// **S2b.3 Item 1 — `emitted` COUNTS PLACEMENTS, NOT DECISIONS.**
+///
+/// The reported `emitted` was `DecisionTable::emitted_count()`, a count of `Ref`
+/// decisions. A decision `plan` cannot place produces no edit, so the two
+/// numbers differ by exactly the unplaceable set and the source is unchanged in
+/// that difference. Corpus exposure is zero, which is *why* this is fixed at the
+/// derivation: a counter right by measurement is one corpus change from wrong,
+/// and it would present as a yield figure rather than as a failure.
+///
+/// The macro fixture is the discriminating case — its single subject IS a `Ref`
+/// decision (the non-`Ref` arm returns before the span is ever located), so the
+/// old derivation reports **1** for a run that edited nothing.
+///
+/// The emptiness assertions are the anchor: they are what make `0` the RIGHT
+/// answer rather than merely the expected one.
+///
+/// *Mutation-tested, Rider 0 order.* **Deletion first:** delete the
+/// `unplaceable_subjects.contains(..)` skip in `rewrite_core_injected` and this
+/// fails 1 vs 0. Second: restore `table.emitted_count()` at the tuple site —
+/// the same failure by the other route, since both must hold for the count to
+/// be placement-true.
+#[test]
+fn emitted_counts_placements_not_ref_decisions() {
+    let fixture = Fixture::new(&[(
+        "lib.rs",
+        "#![allow(dead_code, unused_unsafe)]\nmacro_rules! mk {\n    () => {\n        pub unsafe fn mac_bump(p: *mut i32) -> i32 {\n            *p += 1;\n            *p\n        }\n    };\n}\nmk!();\n",
+    )]);
+
+    // NON-VACUITY: the subject must reach `plan` as a `Ref` decision and fail to
+    // place. A fixture that degraded it earlier would satisfy the count below
+    // for a reason that has nothing to do with placement.
+    let planned = emit(&fixture);
+    assert_eq!(
+        planned.unplaceable.len(),
+        1,
+        "the fixture stopped producing an unplaceable Ref decision, so the \
+         count below no longer discriminates: {:?}",
+        planned.unplaceable
+    );
+
+    match super::rewrite_m1_path(&fixture.root()) {
+        super::RewriteOutcome::Emitted {
+            emitted_count,
+            files,
+            unplaceable,
+            ..
+        } => {
+            assert!(
+                files.is_empty(),
+                "nothing should have been written: {:?}",
+                files.keys().collect::<Vec<_>>()
+            );
+            assert_eq!(unplaceable.len(), 1, "{unplaceable:?}");
+            assert_eq!(
+                emitted_count, 0,
+                "a decision that produced no edit was counted as emitted — \
+                 `emitted` is still decision-shaped"
+            );
+        }
+        super::RewriteOutcome::Degraded { reason, .. } => {
+            panic!("an unplaceable-only crate emits nothing and still passes: {reason}")
         }
     }
 }

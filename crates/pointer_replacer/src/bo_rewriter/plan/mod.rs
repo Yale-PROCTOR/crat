@@ -73,6 +73,14 @@ pub(crate) struct Unplaceable {
     pub reason: &'static str,
     /// Attribution — which subject, in the artifact's own terms.
     pub detail: String,
+    /// **Identity**, in the `owner_fn::param` form the driver keys emitted
+    /// subjects by — which [`Self::detail`] is not: `"p (param #0)"` compares
+    /// equal for the `p` of every function in the crate.
+    ///
+    /// Its purpose is subtraction, not display. `emitted` counts PLACEMENTS as
+    /// of S2b.3, and the only way to exclude a decision that produced no edit is
+    /// to name it in the same terms the emitting side names its own.
+    pub subject: String,
 }
 
 /// Why an edit is licensed. **Shaped against all ten goldens; one arm live.**
@@ -225,6 +233,17 @@ pub(crate) fn plan(
                 subject.hir_index
             )
         };
+        // The SAME recipe the driver builds its emitted-subject labels with.
+        // Two spellings of one identity would make the subtraction silently
+        // empty — the failure mode would be `emitted` staying decision-shaped
+        // while looking placement-shaped.
+        let identity = || {
+            format!(
+                "{}::{}",
+                owner_of(subject),
+                subject.param_name.as_deref().unwrap_or("<unnamed>")
+            )
+        };
         // A `Ref` decision implies a syntactic raw-pointer declaration:
         // `decide_one` degrades every other shape with `NonPointerDecl`,
         // precisely because there is no pointee text to copy through an alias.
@@ -240,20 +259,29 @@ pub(crate) fn plan(
             unplaceable.push(Unplaceable {
                 reason: "Ref decision on a declaration with no pointee span",
                 detail: attribution(),
+                subject: identity(),
             });
             continue;
         };
         let (ty_file, ty_lo, ty_hi) = match span_to_loc(subject.ty_span) {
             Ok(located) => located,
             Err(reason) => {
-                unplaceable.push(Unplaceable { reason, detail: attribution() });
+                unplaceable.push(Unplaceable {
+                    reason,
+                    detail: attribution(),
+                    subject: identity(),
+                });
                 continue;
             }
         };
         let (pointee_file, p_lo, p_hi) = match span_to_loc(pointee_span) {
             Ok(located) => located,
             Err(reason) => {
-                unplaceable.push(Unplaceable { reason, detail: attribution() });
+                unplaceable.push(Unplaceable {
+                    reason,
+                    detail: attribution(),
+                    subject: identity(),
+                });
                 continue;
             }
         };
@@ -265,6 +293,7 @@ pub(crate) fn plan(
             unplaceable.push(Unplaceable {
                 reason: "pointee text is in a different file from the declaration",
                 detail: attribution(),
+                subject: identity(),
             });
             continue;
         }
@@ -272,6 +301,7 @@ pub(crate) fn plan(
             unplaceable.push(Unplaceable {
                 reason: "no source text available for the declaring file",
                 detail: attribution(),
+                subject: identity(),
             });
             continue;
         };
@@ -279,6 +309,7 @@ pub(crate) fn plan(
             unplaceable.push(Unplaceable {
                 reason: "pointee range is outside its own file's source",
                 detail: attribution(),
+                subject: identity(),
             });
             continue;
         };
