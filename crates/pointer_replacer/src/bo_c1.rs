@@ -8260,16 +8260,36 @@ fn m1_diag_transfer() {
                 Some((crate_relative_for_test(file), line.parse().ok()?))
             })
             .collect();
-        // RENDERED: the parser validated on 86 corpus diagnostics at S2b.0.
-        let mut rendered: Vec<(String, usize)> = err_text
-            .lines()
-            .filter_map(|l| {
-                let site = l.trim_start().strip_prefix("--> ")?;
-                let mut parts = site.rsplitn(3, ':');
-                let (_c, line, path) = (parts.next()?, parts.next()?, parts.next()?);
-                Some((crate_relative_for_test(path), line.parse().ok()?))
-            })
-            .collect();
+        // RENDERED: the parser validated on 86 corpus diagnostics at S2b.0 —
+        // INCLUDING its error-pairing. A rendered diagnostic emits a `-->` for
+        // its primary span AND one per labelled note ("function defined here"),
+        // so counting every `-->` over-counts: it reported 163 against
+        // structural's 86, the extras being callee declaration sites. Pairing
+        // each `error[` with only the FIRST following `-->` is what makes the
+        // comparison 1:1, and is exactly what the S2b.0 driver does.
+        let mut rendered: Vec<(String, usize)> = Vec::new();
+        let mut pending = false;
+        for l in err_text.lines() {
+            let trimmed = l.trim_start();
+            if trimmed.starts_with("error[") || trimmed.starts_with("error:") {
+                pending = true;
+                continue;
+            }
+            let Some(site) = trimmed.strip_prefix("--> ") else {
+                continue;
+            };
+            if !pending {
+                continue;
+            }
+            pending = false;
+            let mut parts = site.rsplitn(3, ':');
+            let (_c, line, path) = (parts.next(), parts.next(), parts.next());
+            if let (Some(line), Some(path)) = (line, path)
+                && let Ok(line) = line.parse::<usize>()
+            {
+                rendered.push((crate_relative_for_test(path), line));
+            }
+        }
         structural.sort();
         rendered.sort();
         total_struct += structural.len();
