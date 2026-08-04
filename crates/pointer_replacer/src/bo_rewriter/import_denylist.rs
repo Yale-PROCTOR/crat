@@ -773,11 +773,20 @@ fn production_decision_consumers_are_exhaustive() {
 
 /// The S3.0 check must reject real violations, not merely pass on clean code.
 ///
-/// *Mutation-tested (Rider 0, deletion first):* deleting the
-/// `trimmed.contains("Decision::")` early return makes the unrelated-type cases
-/// fail; deleting the `let_pattern` branch makes the three destructuring cases
-/// fail; deleting the `matches!` branch makes that case fail; and narrowing
-/// `let_pattern` to `matches!` alone makes the `let …else` case fail.
+/// *Mutation-tested (Rider 0, deletion first), with one claim CORRECTED after
+/// measurement:* deleting the `let_pattern` branch makes the three destructuring
+/// cases fail; deleting the `matches!` branch makes that case fail; narrowing
+/// `let_pattern` makes the `let …else` case fail.
+///
+/// Deleting the `trimmed.contains("Decision::")` early return does **NOT** fail
+/// this test — an earlier draft of this comment claimed it would, and the
+/// mutation refuted it. That case (`if let Some(span) = spans.first()`) has no
+/// `Decision::` in its pattern and no `matches!(`, so it returns `None` either
+/// way. The early return is still load-bearing, but it is witnessed by
+/// [`production_decision_consumers_are_exhaustive`] instead: without it, every
+/// production `matches!(` on any other type is flagged and the scan fails.
+/// Recorded rather than silently re-pointed, because a mutation claim that was
+/// wrong is the kind of thing that gets copied forward.
 #[test]
 fn decision_ban_matches_a_synthetic_breach() {
     // The two shapes S3.0 repaired.
