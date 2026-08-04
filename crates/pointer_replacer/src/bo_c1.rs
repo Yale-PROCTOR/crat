@@ -8114,6 +8114,109 @@ fn shasum_of(path: &std::path::Path) -> String {
         .to_owned()
 }
 
+/// **The yield label, verbatim.** Every aggregate this path reports carries it.
+///
+/// It is not decoration. `CallSiteNotAdapted` saturates the degraded side
+/// pre-S3, so the emitted/degraded split measures S3's absence rather than M1's
+/// ceiling, and a bare ratio lifted out of a table reads as the latter. Only the
+/// M1-final report after S3 feeds the emission-guided-refinement decision.
+#[cfg(test)]
+const PRE_S3_LABEL: &str = "pre-S3 — measures S3's absence.";
+
+/// Outcome counters over producer A's **decoded artifact rows**.
+///
+/// # Why the decoded rows and not the in-memory table
+///
+/// The same reason `run_m1_recon`'s verdict is computed from the files: an
+/// encoder defect that never reaches a reader is a defect no number can see.
+/// Counting the bytes the driver already digests into `a_sha256` gives one
+/// stamp covering both the compared and the counted artifact — provenance for
+/// the yield figures comes free rather than as a parallel derivation that could
+/// drift from what was compared.
+#[cfg(test)]
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct OutcomeCounts {
+    rows: usize,
+    ref_mut: usize,
+    ref_shared: usize,
+    degraded: usize,
+    /// Rows carrying **no** outcome. Producer A sets one on every row it emits,
+    /// so this is a schema violation rather than a category — recorded, never
+    /// folded into `degraded`, which is how a decoding regression would present
+    /// as a plausible yield shift instead of a failure.
+    unclassified: usize,
+    /// Degradation reasons by key. The distribution is the point: a single
+    /// `degraded` total cannot show that one reason saturates it.
+    by_reason: std::collections::BTreeMap<String, usize>,
+}
+
+#[cfg(test)]
+impl OutcomeCounts {
+    fn merge(&mut self, other: &Self) {
+        self.rows += other.rows;
+        self.ref_mut += other.ref_mut;
+        self.ref_shared += other.ref_shared;
+        self.degraded += other.degraded;
+        self.unclassified += other.unclassified;
+        for (reason, n) in &other.by_reason {
+            *self.by_reason.entry(reason.clone()).or_default() += n;
+        }
+    }
+
+    /// `ref_mut + ref_shared` — the converted side, in the artifact's terms.
+    fn converted(&self) -> usize {
+        self.ref_mut + self.ref_shared
+    }
+}
+
+/// Count decoded rows by outcome.
+///
+/// **Exhaustive, with no `_` arm.** When S3 adds a `Box` disposition to
+/// `Outcome`, this fails to compile rather than silently counting the new
+/// variant as nothing — the same rule the artifact's construction site carries,
+/// applied to the consumer, because totality that holds only on the way in is
+/// half a guarantee.
+#[cfg(test)]
+fn count_outcomes(rows: &[crate::coverage_recon::schema::Row]) -> OutcomeCounts {
+    use crate::coverage_recon::schema::Outcome;
+
+    let mut c = OutcomeCounts { rows: rows.len(), ..OutcomeCounts::default() };
+    for row in rows {
+        match row.outcome {
+            Some(Outcome::RefMut) => c.ref_mut += 1,
+            Some(Outcome::RefShared) => c.ref_shared += 1,
+            Some(Outcome::Degraded) => {
+                c.degraded += 1;
+                // A degraded row with no reason is counted under an explicit
+                // key, not dropped: an unattributed degradation must be visible
+                // in the distribution it distorts.
+                let reason = row.degrade_reason.clone().unwrap_or_else(|| "<none>".to_owned());
+                *c.by_reason.entry(reason).or_default() += 1;
+            }
+            None => c.unclassified += 1,
+        }
+    }
+    c
+}
+
+/// One reported line, label attached.
+///
+/// Rendering is a function so the label can be *witnessed* rather than trusted
+/// to a `println!` nobody asserts on.
+#[cfg(test)]
+fn count_line(scope: &str, c: &OutcomeCounts) -> String {
+    format!(
+        "M1COUNT {scope} rows={} converted={} ref_mut={} ref_shared={} \
+         degraded={} unclassified={} label={PRE_S3_LABEL:?}",
+        c.rows,
+        c.converted(),
+        c.ref_mut,
+        c.ref_shared,
+        c.degraded,
+        c.unclassified,
+    )
+}
+
 /// A row field that must read `0`, **fail-closed on absence**.
 ///
 /// Missing and unparseable are failures, not zeros: an expected-zero check that
@@ -8159,6 +8262,130 @@ fn an_unparseable_aggregate_fails_closed() {
     let err = expected_zero_aggregate(&row, "out-of-coverage")
         .expect_err("an unparseable expected-zero aggregate must fail");
     assert!(err.contains("unparseable"), "wrong failure: {err}");
+}
+
+/// A producer-A-shaped row, for the counter witnesses.
+#[cfg(test)]
+fn counted_row(
+    local: u32,
+    outcome: crate::coverage_recon::schema::Outcome,
+    reason: Option<&str>,
+) -> crate::coverage_recon::schema::Row {
+    use crate::coverage_recon::schema::{DeclShape, PairingConfidence, Row};
+    Row {
+        fn_path: format!("k::f{local}"),
+        mir_local: local,
+        param_name: Some("p".to_owned()),
+        arg_index: Some(1),
+        ptr_depth: 1,
+        pairing_confidence: PairingConfidence::High,
+        decl_span: Some("<t>:1:1".to_owned()),
+        decl_span_lo: Some(0),
+        decl_span_hi: Some(1),
+        binding_span_lo: None,
+        binding_span_hi: None,
+        decl_shape: Some(DeclShape::RawPtr),
+        outcome: Some(outcome),
+        degrade_reason: reason.map(str::to_owned),
+    }
+}
+
+/// **S2b.3 Item 2 — the counters bucket DECODED rows.**
+///
+/// Encoded and decoded first, deliberately: the corpus path counts bytes read
+/// back from disk, so a witness over in-memory rows would pass on a shape the
+/// real path never sees. This is the same reason `run_m1_recon`'s verdict is
+/// computed from the files.
+///
+/// *Mutation-tested, Rider 0 order.* **Deletion first:** delete the
+/// `Some(Outcome::RefShared)` arm — the match is exhaustive with no `_`, so the
+/// BUILD fails. That is the totality property, and it is the arm S3 will add a
+/// sibling to. The faithful behavioural mutation follows: fold `RefShared` into
+/// `ref_mut` and this fails on both bucket counts.
+#[test]
+fn counters_bucket_decoded_rows_by_outcome() {
+    use crate::coverage_recon::schema::{self, Outcome};
+
+    let rows = vec![
+        counted_row(1, Outcome::RefMut, None),
+        counted_row(2, Outcome::RefShared, None),
+        counted_row(3, Outcome::Degraded, Some("call-site-not-adapted")),
+        counted_row(4, Outcome::Degraded, Some("call-site-not-adapted")),
+        counted_row(5, Outcome::Degraded, Some("kind-raw")),
+    ];
+    let decoded = schema::decode(&schema::encode(&rows)).expect("round-trips");
+    assert_eq!(decoded.len(), rows.len(), "the wire lost a row");
+
+    let c = count_outcomes(&decoded);
+    assert_eq!(
+        (c.rows, c.ref_mut, c.ref_shared, c.degraded, c.unclassified),
+        (5, 1, 1, 3, 0)
+    );
+    assert_eq!(c.converted(), 2, "converted is ref_mut + ref_shared");
+    assert_eq!(c.by_reason.get("call-site-not-adapted"), Some(&2));
+    assert_eq!(c.by_reason.get("kind-raw"), Some(&1));
+    assert_eq!(
+        c.by_reason.values().sum::<usize>(),
+        c.degraded,
+        "the reason distribution must account for every degraded row, or the \
+         saturation figure is computed over a subset"
+    );
+
+    // Merging is what produces the corpus total.
+    let mut total = OutcomeCounts::default();
+    total.merge(&c);
+    total.merge(&c);
+    assert_eq!((total.rows, total.degraded), (10, 6));
+    assert_eq!(total.by_reason.get("call-site-not-adapted"), Some(&4));
+}
+
+/// **S2b.3 Item 2 — a row with NO outcome is `unclassified`, never `degraded`.**
+///
+/// Producer A writes an outcome on every row, so this shape means the schema or
+/// the decoder moved. Folding it into `degraded` would render a decoding
+/// regression as a plausible yield shift; the corpus path fails the program on
+/// a nonzero count.
+///
+/// *Mutation-tested, Rider 0 order.* **Deletion first:** the `None` arm cannot
+/// be deleted — the match is exhaustive and the build fails, which is itself the
+/// guarantee. Faithful mutation: route `None` to `c.degraded += 1` and this
+/// fails on both fields.
+#[test]
+fn a_row_with_no_outcome_is_unclassified_not_degraded() {
+    use crate::coverage_recon::schema::Outcome;
+
+    let mut orphan = counted_row(9, Outcome::RefMut, None);
+    orphan.outcome = None;
+    let c = count_outcomes(&[orphan]);
+    assert_eq!(c.unclassified, 1, "an outcome-less row was silently bucketed");
+    assert_eq!(c.degraded, 0, "it was folded into the degraded population");
+}
+
+/// **S2b.3 Item 2 — the pre-S3 label rides every reported aggregate, VERBATIM.**
+///
+/// The label is the reason the emitted/degraded split cannot be read as M1's
+/// ceiling. A number reported without it is a number that will be quoted
+/// without it.
+///
+/// *Mutation-tested, Rider 0 order.* **Deletion first:** drop `label=` from
+/// `count_line`'s format string and this fails. Second: reword the constant by
+/// one character and the verbatim assertion fails.
+#[test]
+fn every_reported_aggregate_carries_the_pre_s3_label() {
+    assert_eq!(
+        PRE_S3_LABEL, "pre-S3 — measures S3's absence.",
+        "the label is quoted verbatim from the S2b.0/S2b.1 records; rewording it \
+         silently re-labels every yield figure this path has ever reported"
+    );
+    let line = count_line("program=x", &OutcomeCounts::default());
+    assert!(
+        line.contains(PRE_S3_LABEL),
+        "a reported aggregate carried no yield label: {line}"
+    );
+    assert!(
+        count_line("TOTAL", &OutcomeCounts::default()).contains(PRE_S3_LABEL),
+        "the corpus TOTAL is the line most likely to be quoted alone"
+    );
 }
 
 /// **S2b.3 — the `unplaceable` pin, all four verdicts.**
@@ -8248,6 +8475,8 @@ fn m1_recon_corpus() {
 
     let mut failures: Vec<String> = Vec::new();
     let mut rows: Vec<report::Row> = Vec::new();
+    let mut totals = OutcomeCounts::default();
+    let mut counted = 0usize;
 
     for program in CORPUS {
         let input = program.input_path(&root);
@@ -8293,12 +8522,57 @@ fn m1_recon_corpus() {
                 stamped.set(key, shasum_of(&path));
             }
         }
+
+        // S2b.3 COUNTERS — from the decoded artifact, i.e. the same bytes
+        // `a_sha256` above stamps. Read back from the file rather than counted
+        // in the worker: the digest then covers the compared AND the counted
+        // artifact, and a count computed in-process would be a second
+        // derivation with nothing tying it to what was diffed.
+        let a_path = art.join(format!("{}.a.jsonl", program.name));
+        match fs::read_to_string(&a_path)
+            .map_err(|e| e.to_string())
+            .and_then(|text| crate::coverage_recon::schema::decode(&text))
+        {
+            Ok(decoded) => {
+                let c = count_outcomes(&decoded);
+                println!("{}", count_line(&format!("program={}", program.name), &c));
+                // FAIL-CLOSED, not a bucket: producer A writes an outcome on
+                // every row, so a row without one means the schema or the
+                // decoder moved under us.
+                if c.unclassified > 0 {
+                    failures.push(format!(
+                        "{}: {} artifact row(s) carry no outcome",
+                        program.name, c.unclassified
+                    ));
+                }
+                totals.merge(&c);
+                counted += 1;
+            }
+            // An artifact that will not decode is a MISSING measurement. The
+            // verdict above already read these bytes, so this can only fire on
+            // a real regression — and a zero here would be indistinguishable
+            // from a program with no rows.
+            Err(why) => failures.push(format!(
+                "{}: producer-A artifact not countable: {}",
+                program.name,
+                report::sanitize(&why)
+            )),
+        }
         rows.push(stamped);
     }
 
     for row in &rows {
         println!("{}", report::to_kv_line(row));
     }
+    println!("{}", count_line("TOTAL", &totals));
+    for (reason, n) in &totals.by_reason {
+        println!("M1COUNT-REASON {reason}={n} label={PRE_S3_LABEL:?}");
+    }
+    assert_eq!(
+        counted,
+        rows.len(),
+        "every program with a verdict must also have counted artifact rows"
+    );
     assert_eq!(
         rows.len() + failures.iter().filter(|f| f.contains("no sentinel")).count(),
         CORPUS.len(),
