@@ -935,6 +935,7 @@ fn a_repeat_of_a_masked_class_is_still_novel() {
     let baseline = verify::Baseline {
         keys: std::iter::once((verify::baseline_key(&diag(1), root), 1)).collect(),
         errors: 1,
+        messages_embedding_root: 0,
     };
 
     // One occurrence: masked — and at a DIFFERENT line, so the key is stable

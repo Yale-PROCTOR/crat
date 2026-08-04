@@ -268,10 +268,19 @@ pub(crate) fn baseline_of(root: &Path) -> Baseline {
     let crate_root = root.parent().unwrap_or(root).to_path_buf();
     let diagnosis = diagnose_crate(root);
     let mut keys = std::collections::BTreeMap::new();
+    let root_text = crate_root.display().to_string();
+    let mut messages_embedding_root = 0usize;
     for diag in &diagnosis.diags {
+        if diag.message.contains(&root_text) {
+            messages_embedding_root += 1;
+        }
         *keys.entry(baseline_key(diag, &crate_root)).or_insert(0usize) += 1;
     }
-    Baseline { keys, errors: diagnosis.errors }
+    Baseline {
+        keys,
+        errors: diagnosis.errors,
+        messages_embedding_root,
+    }
 }
 
 /// What the UNMODIFIED input already reports. The gate judges the rewrite's
@@ -281,6 +290,14 @@ pub(crate) struct Baseline {
     pub keys: std::collections::BTreeMap<(String, String, String), usize>,
     /// Includes spanless error-level diagnostics, which have no key.
     pub errors: usize,
+    /// Baseline messages that EMBED THEIR OWN CRATE ROOT.
+    ///
+    /// The key's message component is comparable across the two sides only if no
+    /// message carries its environment: the baseline compiles in the original
+    /// tree and the observed side in a temp copy, so an embedded path would
+    /// diverge the key exactly as the file component did. Measured rather than
+    /// assumed; expected zero.
+    pub messages_embedding_root: usize,
 }
 
 impl Baseline {

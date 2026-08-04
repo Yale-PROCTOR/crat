@@ -7159,7 +7159,17 @@ mod run {
         // matched on the variant and hand-filled each arm, which zeroed a real
         // value twice — `emitted` at S2b.0 and then `reverted` while repairing
         // it. Fields that exist on both arms are read once, before the branch.
-        let (emitted, degraded, files_touched, reverted, blind, probes) = match &outcome {
+        let (
+            emitted,
+            degraded,
+            files_touched,
+            reverted,
+            blind,
+            probes,
+            base_keys,
+            base_errors,
+            base_msg_env,
+        ) = match &outcome {
             RewriteOutcome::Emitted {
                 emitted_count,
                 degradations,
@@ -7167,6 +7177,9 @@ mod run {
                 reverted_count,
                 attribution_blind,
                 bisect_probes,
+                baseline_keys,
+                baseline_errors,
+                baseline_msg_env,
                 ..
             } => (
                 *emitted_count,
@@ -7175,6 +7188,9 @@ mod run {
                 *reverted_count,
                 *attribution_blind,
                 *bisect_probes,
+                *baseline_keys,
+                *baseline_errors,
+                *baseline_msg_env,
             ),
             RewriteOutcome::Degraded {
                 emitted_count,
@@ -7183,6 +7199,9 @@ mod run {
                 reverted_count,
                 attribution_blind,
                 bisect_probes,
+                baseline_keys,
+                baseline_errors,
+                baseline_msg_env,
                 ..
             } => (
                 *emitted_count,
@@ -7191,6 +7210,9 @@ mod run {
                 *reverted_count,
                 *attribution_blind,
                 *bisect_probes,
+                *baseline_keys,
+                *baseline_errors,
+                *baseline_msg_env,
             ),
         };
         row.set("emitted", emitted);
@@ -7199,6 +7221,9 @@ mod run {
         row.set("reverted", reverted);
         row.set("attribution_blind", blind);
         row.set("bisect_probes", probes);
+        row.set("baseline_keys", base_keys);
+        row.set("baseline_errors", base_errors);
+        row.set("baseline_msg_env", base_msg_env);
 
         match &outcome {
             RewriteOutcome::Emitted {

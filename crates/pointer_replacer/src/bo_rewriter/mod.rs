@@ -120,6 +120,9 @@ pub(crate) enum RewriteOutcome {
         attribution_blind: usize,
         /// The first verify's diagnostics.
         first_diags: Vec<verify::Diag>,
+        baseline_keys: usize,
+        baseline_errors: usize,
+        baseline_msg_env: usize,
         /// Decisions that could not be turned into a placed edit — a
         /// macro-generated span, a span straddling two files, a file with no
         /// editable identity. Carried out for the same reason as `excluded`:
@@ -150,6 +153,9 @@ pub(crate) enum RewriteOutcome {
         attribution_blind: usize,
         /// The first verify's diagnostics.
         first_diags: Vec<verify::Diag>,
+        baseline_keys: usize,
+        baseline_errors: usize,
+        baseline_msg_env: usize,
     },
 }
 
@@ -426,19 +432,6 @@ fn rewrite_core_injected(
                 .collect::<std::collections::BTreeSet<_>>()
                 .difference(&site_owners)
                 .count();
-            let mut facts = OutcomeFacts {
-                degradations,
-                excluded,
-                emitted_count,
-                files_touched: files.len(),
-                reverted_count: 0,
-                emitted_sites,
-                unplaceable,
-                bisect_probes: 0,
-                escalated: None,
-                attribution_blind,
-                first_diags: Vec::new(),
-            };
             // BASELINE-DIFFERENTIAL GATE. The gate judges what the REWRITE
             // introduced, not what the input already reported: brotli's frozen
             // source trips a deny-by-default lint unedited, which made
@@ -453,6 +446,22 @@ fn rewrite_core_injected(
                     Err(_) => verify::Baseline::default(),
                 },
                 (None, None) => verify::Baseline::default(),
+            };
+            let mut facts = OutcomeFacts {
+                degradations,
+                excluded,
+                emitted_count,
+                files_touched: files.len(),
+                reverted_count: 0,
+                emitted_sites,
+                unplaceable,
+                bisect_probes: 0,
+                escalated: None,
+                attribution_blind,
+                first_diags: Vec::new(),
+                baseline_keys: baseline.keys.values().sum(),
+                baseline_errors: baseline.errors,
+                baseline_msg_env: baseline.messages_embedding_root,
             };
             let crate_dir = tree_base.and_then(|root| root.parent()).map(|d| d.to_path_buf());
             let mut reverted: std::collections::BTreeSet<String> =
@@ -962,6 +971,13 @@ struct OutcomeFacts {
     /// The FIRST verify's diagnostics, before any revert round. The validation
     /// transfer compares these against the rendered parser 1:1.
     first_diags: Vec<verify::Diag>,
+    /// What the UNMODIFIED input already reported — the differential's masking
+    /// power per program, and the scope measurement for how many programs
+    /// beyond brotli carry a load-bearing baseline.
+    baseline_keys: usize,
+    baseline_errors: usize,
+    /// Baseline messages embedding their own crate root. Expected zero.
+    baseline_msg_env: usize,
     /// Edit owners with no `emitted_sites` entry: they carry edits but are
     /// invisible to span attribution. brotli's divergence class, now counted.
     attribution_blind: usize,
@@ -1005,6 +1021,9 @@ impl OutcomeFacts {
             reverted_count: self.reverted_count,
             attribution_blind: self.attribution_blind,
             first_diags: self.first_diags,
+            baseline_keys: self.baseline_keys,
+            baseline_errors: self.baseline_errors,
+            baseline_msg_env: self.baseline_msg_env,
         }
     }
 
@@ -1020,6 +1039,9 @@ impl OutcomeFacts {
             reverted_count: self.reverted_count,
             attribution_blind: self.attribution_blind,
             first_diags: self.first_diags,
+            baseline_keys: self.baseline_keys,
+            baseline_errors: self.baseline_errors,
+            baseline_msg_env: self.baseline_msg_env,
         }
     }
 }
