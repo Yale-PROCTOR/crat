@@ -490,6 +490,28 @@ fn rewrite_core_injected(
                 let diagnosis = verify::diagnose_crate(staged.root());
                 probe_secs = probe_secs.max(probe_started.elapsed().as_secs_f64());
                 if probe_only {
+                    // INSTRUMENTS MEASURE THE CAPTURE; GATES CONSUME THE
+                    // FILTERED VIEW. The probe payload is the RAW diagnosis and
+                    // gets its own assignment statement here, above the early
+                    // return; the gate's baseline-subtracted `novel` is assigned
+                    // separately below. The two never share an assignment site
+                    // again.
+                    //
+                    // This is not a style preference. The payloads were shared
+                    // once: the differential gate rewrote the single assignment
+                    // to `novel`, which needs a root and a baseline, so it had
+                    // to move BELOW this return — and the return did not move
+                    // with it. `diagnose_once` then returned empty and
+                    // `run_m1_diag` reported `struct_diags=0 status=ok` for
+                    // every program, a zeroed payload wearing an ok status.
+                    //
+                    // Raw is also the SEMANTICALLY required payload, not merely
+                    // the restored one: the transfer harness compares these
+                    // against the child's unfiltered stderr, so subtracting a
+                    // baseline from one side of that comparison would bias it.
+                    // Baseline diagnostics appear on both sides, which is what
+                    // makes the equality mean anything.
+                    facts.first_diags = diagnosis.diags.clone();
                     facts.files_touched = files.len();
                     return facts.degraded("probe-only: first diagnose recorded".to_owned());
                 }
@@ -990,10 +1012,6 @@ impl RewriteOutcome {
     /// scan is textual and cannot tell a construction from a destructuring, so
     /// every avoidable naming of a variant outside the two constructors is one
     /// less false positive for a guard that is otherwise exact.
-    #[allow(
-        dead_code,
-        reason = "consumed by `diagnose_once`, itself test-only for now."
-    )]
     fn into_first_diags(self) -> Vec<verify::Diag> {
         match self {
             RewriteOutcome::Emitted { first_diags, .. }

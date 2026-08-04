@@ -855,6 +855,61 @@ fn zz_brotli_pristine_copy_control() {
     }
 }
 
+/// **S2b.2 repair — the probe instrument must carry its payload.**
+///
+/// `diagnose_once` returns what the verify compile CAPTURED. This pins that it
+/// is non-empty for a fixture with a known diagnostic — the test that did not
+/// exist when the differential gate moved the payload assignment below the
+/// `probe_only` early return, leaving `run_m1_diag` reporting
+/// `struct_diags=0 status=ok` for every program from 2026-08-04 14:49 until
+/// this repair.
+///
+/// # Why this fixture cannot go quiet
+///
+/// Non-emptiness rests on a **pre-existing** `invalid_reference_casting` error
+/// in the unmodified source, not on the rewriter producing one. A witness that
+/// depended on the rewrite emitting a *bad* rewrite would go silently vacuous
+/// the moment the rewriter improved — which is the failure shape this file
+/// already records four instances of. Probe mode returns the RAW capture, so
+/// the baseline diagnostic is exactly what reaches the assertion.
+///
+/// # Branch taken (Rider 7)
+///
+/// `tree_base = Some(root)` — a real multi-file tree materialized to a temp
+/// copy, returning through the `probe_only` arm on the loop's FIRST iteration.
+/// **This is the corpus's branch**: `run_m1_diag` drives every one of the 20
+/// programs through the same path. The string-entry branch
+/// (`materialize_single_file`) is not exercised here and is not what the
+/// transfer measures.
+///
+/// *Mutation-tested, Rider 0 order.* **Deletion first:** delete
+/// `facts.first_diags = diagnosis.diags.clone()` from the `probe_only` block —
+/// reproducing the regression exactly — and this fails on an empty set.
+#[test]
+fn diagnose_once_returns_the_captured_diagnostics_not_an_empty_set() {
+    let fixture = Fixture::new(&[
+        ("lib.rs", "#![allow(dead_code, unused_unsafe)]\npub mod m;\n"),
+        (
+            "m.rs",
+            "pub unsafe fn preexisting(v: &i32) {\n    *(v as *const i32 as *mut i32) = 7;\n}\npub unsafe fn bump(p: *mut i32) -> i32 {\n    *p += 1;\n    *p\n}\n",
+        ),
+    ]);
+
+    let diags = super::diagnose_once(&fixture.root()).expect("the probe ran");
+
+    assert!(
+        !diags.is_empty(),
+        "the probe returned an empty capture for a fixture with a known \
+         diagnostic — this is the zeroed payload wearing an ok status, and it \
+         is what `run_m1_diag` reported for all 20 programs"
+    );
+    assert!(
+        diags.iter().any(|d| d.line > 0 && !d.file.is_empty()),
+        "the payload carries no located diagnostic, so the transfer would have \
+         nothing to compare: {diags:?}"
+    );
+}
+
 /// **S2b.1 — a BASELINE-MASKED error must not gate.**
 ///
 /// The fixture denies `unused_variables`, so its UNMODIFIED source already
