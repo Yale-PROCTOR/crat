@@ -8163,7 +8163,28 @@ impl OutcomeCounts {
         }
     }
 
-    /// `ref_mut + ref_shared` — the converted side, in the artifact's terms.
+    /// `ref_mut + ref_shared` — the converted side **in the artifact's frame**.
+    ///
+    /// # This is NOT `m1_emit_corpus`'s `emitted`, and the gap is exact
+    ///
+    /// The artifact is a **pre-revert decision snapshot**: `artifact_rows` runs
+    /// off `decide_table`, which never sees the verify loop. `emitted` is
+    /// **post-revert**. A subject the loop took back is `Ref` here and a
+    /// `RevertedAfterVerifyFailure` degradation there, so
+    ///
+    /// ```text
+    ///   converted      = emitted   + reverted
+    ///   degraded(here) = degraded(emit) - reverted
+    /// ```
+    ///
+    /// and both frames sum to the same row count. Measured 2026-08-04 at
+    /// `5bbde5ab`: **818 = 771 + 47**, holding on **every one of the 20
+    /// programs**, not merely in aggregate.
+    ///
+    /// Recorded because the two numbers will be read side by side, and
+    /// `converted 818` next to `emitted 771` looks like a discrepancy in one of
+    /// them. It is neither: it is the revert loop, which is the whole subject of
+    /// S2b.1.
     fn converted(&self) -> usize {
         self.ref_mut + self.ref_shared
     }
