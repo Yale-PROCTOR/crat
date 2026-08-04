@@ -449,7 +449,20 @@ fn rewrite_core_injected(
             // absolute gate. Excluding lints wholesale would instead blind the
             // gate to rewrite-INTRODUCED violations of exactly our risk class
             // (reference casting), so the baseline is subtracted, not the class.
-            let baseline = match (tree_base, &virtual_original) {
+            // NOT COMPUTED HERE — see the loop, below the `probe_only` return.
+            // `baseline_of` COMPILES the unmodified crate, and its diagnostics
+            // are forwarded to the same stderr an instrument's consumer reads.
+            // Computed on the instrument path it would be dead work (probe mode
+            // returns before `novel` is ever consulted) whose only effect is to
+            // contaminate that stderr with a second crate's diagnostics — which
+            // is exactly what it did to brotli: 4 frozen-tree entries appeared
+            // on the rendered side of a transfer that measures the temp copy.
+            //
+            // The placement is the enforcement. A predicate here would work
+            // today and be one careless edit from unconditional again; below
+            // the return, "gate machinery does not run on instrument paths"
+            // holds by position.
+            let compute_baseline = || match (tree_base, &virtual_original) {
                 (Some(root), _) => verify::baseline_of(root),
                 (None, Some(text)) => match verify::materialize_single_file(text) {
                     Ok(staged) => verify::baseline_of(staged.root()),
@@ -457,6 +470,7 @@ fn rewrite_core_injected(
                 },
                 (None, None) => verify::Baseline::default(),
             };
+            let mut baseline: Option<verify::Baseline> = None;
             let mut facts = OutcomeFacts {
                 degradations,
                 excluded,
@@ -470,9 +484,13 @@ fn rewrite_core_injected(
                 attribution_blind,
                 first_diags: Vec::new(),
                 observed_root: None,
-                baseline_keys: baseline.keys.values().sum(),
-                baseline_errors: baseline.errors,
-                baseline_msg_env: baseline.messages_embedding_root,
+                // Filled below, on the gate path, when the baseline is
+                // actually computed. Probe mode HAS no baseline — its payload
+                // is the raw capture — so zero here is "not applicable in this
+                // mode", not a measured value that was zeroed.
+                baseline_keys: 0,
+                baseline_errors: 0,
+                baseline_msg_env: 0,
             };
             let crate_dir = tree_base.and_then(|root| root.parent()).map(|d| d.to_path_buf());
             let mut reverted: std::collections::BTreeSet<String> =
@@ -528,6 +546,13 @@ fn rewrite_core_injected(
                     facts.files_touched = files.len();
                     return facts.degraded("probe-only: first diagnose recorded".to_owned());
                 }
+                // GATE MACHINERY STARTS HERE. Everything below the probe
+                // return belongs to the differential; the baseline compile is
+                // the first of it, computed once and reused across rounds.
+                let baseline = baseline.get_or_insert_with(|| compute_baseline());
+                facts.baseline_keys = baseline.keys.values().sum();
+                facts.baseline_errors = baseline.errors;
+                facts.baseline_msg_env = baseline.messages_embedding_root;
                 let observed_root = staged.root().parent().unwrap_or(staged.root()).to_path_buf();
                 let novel: Vec<verify::Diag> = baseline
                     .novel(&diagnosis.diags, &observed_root)
@@ -618,6 +643,18 @@ fn rewrite_core_injected(
             }
 
             // ---- (C) BISECT: the escalation path ----
+            // Reaching here means the loop BROKE, and only the gate path can
+            // break: probe mode returns from inside it. So the baseline exists
+            // by construction — and it is asserted rather than defaulted,
+            // because a `Baseline::default()` fallback here would silently turn
+            // the differential into an absolute gate, which is the exact defect
+            // brotli's frozen source exposed in the first place.
+            let baseline = baseline.expect(
+                "the gate path computes a baseline on its first round; reaching \
+                 the post-loop stages without one means the loop was exited by a \
+                 path that skipped it",
+            );
+
             let escalation = escalation.unwrap_or_else(|| "escalation-required".to_owned());
             // Candidates come from the PLAN's `owner_fn` domain — the exact key
             // `render` filters on — so `base ∪ candidates` drops EVERY edit and

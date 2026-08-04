@@ -1092,6 +1092,84 @@ fn a_path_outside_the_crate_root_keys_as_itself() {
     );
 }
 
+/// **S2b.2 repair-2 — gate machinery does not run on instrument paths.**
+///
+/// `baseline_of` COMPILES the unmodified crate. Probe mode returns before
+/// `novel` is ever consulted, so on that path the compile is dead work — and
+/// not harmlessly: its diagnostics are forwarded to the SAME stderr the
+/// validation transfer parses as its rendered side, which put four
+/// frozen-tree entries against a structural side that measures the temp copy.
+///
+/// # What this asserts, and what it does not
+///
+/// The stderr contamination is not observable in-process — the emitter writes
+/// to the process's own stderr, not to anything a test can capture. So this
+/// pins the CAUSE rather than the symptom: no baseline is computed at all on
+/// the probe path. That implies the absence of leakage (a compile that does
+/// not run emits nothing) and is strictly narrower than "only-rendered is
+/// empty", which the corpus transfer checks end-to-end. Stated rather than
+/// substituted silently.
+///
+/// **Rider 7 branch: the PROBE path on a baseline-dirty input — brotli's
+/// shape**, nested two components below the root so the gate path genuinely
+/// has a baseline to find.
+///
+/// *Mutation-tested, Rider 0 order.* **Deletion first:** restore the
+/// unconditional `baseline_of` above the `probe_only` return and this fails.
+#[test]
+fn a_probe_does_not_compile_the_baseline_it_never_consults() {
+    let fixture = Fixture::new(&[
+        ("lib.rs", "#![allow(dead_code, unused_unsafe)]\npub mod deep;\n"),
+        ("deep.rs", "pub mod inner;\n"),
+        (
+            "deep/inner.rs",
+            "pub unsafe fn preexisting(v: &i32) {\n    *(v as *const i32 as *mut i32) = 7;\n}\npub unsafe fn bump(p: *mut i32) -> i32 {\n    *p += 1;\n    *p\n}\n",
+        ),
+    ]);
+
+    // NON-VACUITY CONTROL, first: the GATE path on this same fixture must see a
+    // real baseline. Without it, a fixture that simply has no baseline would
+    // satisfy the probe assertion below and the witness would pin nothing.
+    let gate_baseline_errors = match super::rewrite_m1_path(&fixture.root()) {
+        super::RewriteOutcome::Emitted { baseline_errors, .. } => baseline_errors,
+        super::RewriteOutcome::Degraded { baseline_errors, .. } => baseline_errors,
+    };
+    assert!(
+        gate_baseline_errors > 0,
+        "the fixture is not baseline-dirty, so the probe assertion below would \
+         hold vacuously"
+    );
+
+    // THE PROBE, on the same input: no baseline is computed at all.
+    let probe = super::rewrite_core_injected(
+        ::utils::compilation::path_to_input(&fixture.root()),
+        Some(&fixture.root()),
+        super::MAX_REVERT_ROUNDS,
+        &|_| {},
+        true,
+    );
+    match probe {
+        super::RewriteOutcome::Degraded {
+            baseline_keys,
+            baseline_errors,
+            ..
+        } => {
+            assert_eq!(
+                (baseline_keys, baseline_errors),
+                (0, 0),
+                "probe mode compiled a baseline it returns before consulting. \
+                 That compile's diagnostics reach the SAME stderr an \
+                 instrument's consumer parses, which is how four frozen-tree \
+                 entries appeared on the rendered side of a transfer that \
+                 measures the temp copy"
+            );
+        }
+        super::RewriteOutcome::Emitted { .. } => {
+            panic!("probe mode returns before emission and cannot report Emitted")
+        }
+    }
+}
+
 /// **F.2 — the differential gate, END-TO-END on a NESTED crate.**
 ///
 /// **Rider 7 branch: UNDER-ROOT — the branch the corpus takes.** The subject
