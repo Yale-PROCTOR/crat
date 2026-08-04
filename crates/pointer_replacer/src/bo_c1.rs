@@ -8646,11 +8646,6 @@ fn m1_recon_corpus() {
         println!("M1COUNT-REASON {reason}={n} label={PRE_S3_LABEL:?}");
     }
     assert_eq!(
-        counted,
-        rows.len(),
-        "every program with a verdict must also have counted artifact rows"
-    );
-    assert_eq!(
         rows.len() + failures.iter().filter(|f| f.contains("no sentinel")).count(),
         CORPUS.len(),
         "every corpus program must be attempted"
@@ -8660,6 +8655,16 @@ fn m1_recon_corpus() {
         "S2a-H corpus reconciliation FAILED ({} finding(s)) — full incidence:\n  {}",
         failures.len(),
         failures.join("\n  ")
+    );
+    // LAST, as a structural backstop. Every way counting can fail already
+    // pushes a named failure above, so this fires only if one stopped doing so
+    // — and putting it first would preempt that enumeration with a bare
+    // arithmetic mismatch on exactly the runs where the names matter most.
+    assert_eq!(
+        counted,
+        rows.len(),
+        "a program produced a verdict but no counted artifact rows, without \
+         recording why"
     );
 }
 
