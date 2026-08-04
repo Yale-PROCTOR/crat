@@ -1441,3 +1441,252 @@ fn ambient_arm_is_inert_when_the_flag_is_off() {
     })
     .unwrap_or_else(|e| e.raise());
 }
+
+// =========================================================================
+// Call-argument loan linkage — tripwire for the (c) UNREACHABLE verdict
+// (`docs/agents/tasks/2026-08-04-callarg-loan-linkage.md`).
+//
+// The verdict is that a `Borrower::CallArg` loan never reaches `invalid_loans`,
+// so the owner-less conflict edge (`issuer: None, requirers: []`) that both
+// residual guards wave through vacuously is never produced. That is NOT an
+// invariant anyone enforces — it is an emergent conjunction of three unrelated
+// choices, so each conjunct gets a tripwire here rather than a comment.
+//
+// M1 (temporal) is a code-level derivation and is not re-asserted: the loan is
+// live at exactly one point because no provenance requires it
+// (`origin_replay.rs:131-134` skips non-`Assign` borrowers) and liveness is
+// sampled pre-effect (`loan_liveness.rs:54`). What IS asserted is the two
+// empirical conjuncts and the outcome.
+// =========================================================================
+mod callarg_loan_linkage_tripwire {
+    use super::*;
+    use crate::analyses::borrow_ownership::{
+        borrow_engine::ForkEngineMode, borrow_verify::revalidate_replaying,
+    };
+    use rustc_middle::mir::visit::{
+        MutatingUseContext, NonMutatingUseContext, NonUseContext, PlaceContext, Visitor,
+    };
+    use rustc_middle::mir::{Body, Location, StatementKind, TerminatorKind};
+
+    /// The two-argument may-alias pair (Q2) and a write-after-call (Q1).
+    const MAY_ALIAS: &str = r#"
+unsafe fn two(x: *mut i32, y: *mut i32) { *x = *y + 1; }
+unsafe fn f(p: *mut i32, q: *mut i32) -> i32 { two(p, q); *p }
+"#;
+
+    const WRITE_AFTER_CALL: &str = r#"
+unsafe fn g(p: *mut i32) { *p = 9; }
+unsafe fn f(p: *mut i32) -> i32 { g(p); *p = 1; 2 }
+"#;
+
+    /// MUST-alias by syntax. Non-vacuity anchor for the owner-less assertion:
+    /// the other fixtures produce ZERO edges, so `ownerless == 0` holds trivially
+    /// on them. This one produces a real edge, so the assertion actually
+    /// discriminates owner-less from slot-linked.
+    const MUST_ALIAS_SAME_ARG: &str = r#"
+unsafe fn two(x: *mut i32, y: *mut i32) { *x = *y + 1; }
+unsafe fn f(p: *mut i32) -> i32 { two(p, p); *p }
+"#;
+
+    struct Mentions {
+        target: Local,
+        hits: Vec<(Location, PlaceContext)>,
+    }
+
+    impl<'tcx> Visitor<'tcx> for Mentions {
+        fn visit_local(&mut self, local: Local, context: PlaceContext, location: Location) {
+            if local == self.target {
+                self.hits.push((location, context));
+            }
+        }
+    }
+
+    fn mentions_of(body: &Body<'_>, target: Local) -> Vec<(Location, PlaceContext)> {
+        let mut v = Mentions {
+            target,
+            hits: Vec::new(),
+        };
+        v.visit_body(body);
+        v.hits
+    }
+
+    /// The engine whose liveness behaviour the verdict describes. If the default
+    /// flips back to production, the M1 derivation no longer covers the path the
+    /// rest of this module measures.
+    #[test]
+    fn tripwire_default_engine_is_the_fork() {
+        assert!(
+            matches!(ForkEngineMode::current(), ForkEngineMode::Fork),
+            "the (c) verdict's liveness derivation is written against the fork engine \
+             (`borrow_engine/`); the default is no longer Fork, so the verdict's scope \
+             and the measurements below have come apart"
+        );
+    }
+
+    /// **M2 (occupancy) + M3 (spatial), the two empirical conjuncts.**
+    ///
+    /// M2: the loan's single live point — the head of the call's return successor
+    /// — holds `StorageDead(arg_temp)`, a SHALLOW write, which cannot reach the
+    /// loan's `(*arg_temp)` borrow (`places_conflict.rs:156-161`).
+    ///
+    /// M3: nothing else in the body reads the arg temp. This is what closes the
+    /// NB4-R routing walk, which starts at `issued_loans[access.local]` and walks
+    /// to each edge's `borrowed.local` (`invalidates.rs:349-359`) — reaching a
+    /// `CallArg` loan would require an assignment copying FROM the arg temp, and
+    /// `CallArg` loans are explicitly NOT skipped by the routed self-loan check
+    /// (`invalidates.rs:376-383`).
+    #[test]
+    fn tripwire_arg_temp_is_inert_and_successor_head_is_storage_dead() {
+        for code in [MAY_ALIAS, WRITE_AFTER_CALL, CALL_ARG] {
+            ::utils::compilation::run_compiler_on_str(code, |tcx| {
+                let program = collect_program(tcx);
+                let mut checked = 0usize;
+                for &f in &program.functions {
+                    let body = tcx.mir_drops_elaborated_and_const_checked(f).borrow();
+                    for (bb, data) in body.basic_blocks.iter_enumerated() {
+                        let Some(term) = &data.terminator else {
+                            continue;
+                        };
+                        let TerminatorKind::Call { args, target, .. } = &term.kind else {
+                            continue;
+                        };
+                        let call_loc = Location {
+                            block: bb,
+                            statement_index: data.statements.len(),
+                        };
+                        for arg in args.iter() {
+                            let Some(place) = arg.node.place() else {
+                                continue;
+                            };
+                            let temp = place.local;
+                            checked += 1;
+
+                            // M3: every READ of the arg temp is the call operand itself.
+                            for (loc, ctx) in mentions_of(&body, temp) {
+                                match ctx {
+                                    PlaceContext::NonUse(
+                                        NonUseContext::StorageLive | NonUseContext::StorageDead,
+                                    )
+                                    | PlaceContext::MutatingUse(MutatingUseContext::Store) => {}
+                                    PlaceContext::NonMutatingUse(
+                                        NonMutatingUseContext::Move
+                                        | NonMutatingUseContext::Copy,
+                                    ) => assert_eq!(
+                                        loc, call_loc,
+                                        "arg temp {temp:?} is read at {loc:?}, away from its own \
+                                         call at {call_loc:?} — M3 has regressed and the NB4-R \
+                                         routing walk may now reach the CallArg loan"
+                                    ),
+                                    other => panic!(
+                                        "arg temp {temp:?} has an unexpected use {other:?} at \
+                                         {loc:?}; the (c) verdict assumed the temp is written \
+                                         once and consumed by the call"
+                                    ),
+                                }
+                            }
+
+                            // M2: the loan's single live point — the successor head —
+                            // holds a `StorageDead`, i.e. a SHALLOW write to a BARE
+                            // local. That cannot reach any `(*temp)` borrow, for either
+                            // of two reasons: same local ⇒ Deref-under-Shallow returns
+                            // false (`places_conflict.rs:156-161`); different local ⇒
+                            // disjoint bases. Which local it is does NOT matter, and
+                            // with two arguments it is NOT this temp's own — the head is
+                            // `StorageDead(<last arg temp>)` and both loans share that
+                            // single live point.
+                            if let Some(succ) = target {
+                                let head = body.basic_blocks[*succ].statements.first();
+                                assert!(
+                                    matches!(
+                                        head.map(|s| &s.kind),
+                                        Some(StatementKind::StorageDead(_))
+                                    ),
+                                    "the CallArg loan's single live point ({succ:?}[0]) is {head:?}, \
+                                     not a StorageDead — M2 has regressed; a DEEP access here that \
+                                     aliases (*{temp:?}) makes the owner-less edge producible"
+                                );
+                            }
+                        }
+                    }
+                }
+                assert!(checked > 0, "fixture produced no call with a place argument");
+                Some(())
+            })
+            .unwrap_or_else(|e| e.raise());
+        }
+    }
+
+    /// The outcome itself: no owner-less conflict edge, at the maximally
+    /// conflicting all-`Ref` candidacy. `CASCADE` is the instrument control — it
+    /// needs two repair commits, so it MUST show an edge; without it a green run
+    /// here would be unfalsifiable. (An earlier version of this probe observed
+    /// `export.loans[].invalid` instead, which reads the final, already-repaired
+    /// round and could never report a positive; its control caught that.)
+    #[test]
+    fn tripwire_no_ownerless_conflict_edge() {
+        let edges = |code: &str| -> (usize, usize) {
+            ::utils::compilation::run_compiler_on_str(code, |tcx| {
+                let program = collect_program(tcx);
+                let slots = CrateSlots::build(&program);
+                let conflicts = revalidate_replaying(&program, &slots, |_| true, |_| false, true);
+                let all = conflicts.values().flatten();
+                let mut total = 0usize;
+                let mut ownerless = 0usize;
+                for c in all {
+                    total += 1;
+                    if c.issuer.is_none() && c.requirers.is_empty() {
+                        ownerless += 1;
+                    }
+                }
+                Some((total, ownerless))
+            })
+            .unwrap_or_else(|e| e.raise())
+            .expect("compilation produced no result")
+        };
+
+        let (control, _) = edges(CASCADE);
+        assert!(
+            control > 0,
+            "INSTRUMENT BROKEN: the control fixture yields no conflict edge at all-Ref, \
+             so the negatives below would be unfalsifiable"
+        );
+
+        // `MUST_ALIAS_SAME_ARG` must contribute an edge, or the loop is vacuous.
+        let (anchor_total, _) = edges(MUST_ALIAS_SAME_ARG);
+        assert!(
+            anchor_total > 0,
+            "the non-vacuity anchor produced no edge, so `ownerless == 0` below holds \
+             trivially on every fixture and discriminates nothing"
+        );
+
+        for code in [MAY_ALIAS, WRITE_AFTER_CALL, CALL_ARG, MUST_ALIAS_SAME_ARG] {
+            let (_total, ownerless) = edges(code);
+            assert_eq!(
+                ownerless, 0,
+                "an owner-less conflict edge was produced — the (c) verdict of \
+                 `2026-08-04-callarg-loan-linkage.md` is falsified, and the residual guards \
+                 (`borrow_verify.rs:1438-1464`) wave such an edge through vacuously"
+            );
+        }
+    }
+
+    /// Q2, pinned: a may-aliasing mutable parameter pair settles `Ref`/`Ref` and
+    /// is accepted. Nothing in BO blocks it — its only alias relation
+    /// (`origin_flow`'s `storage_aliases`) is derived from copy/flow edges, and
+    /// there is no flow edge between two independent parameters.
+    #[test]
+    fn tripwire_may_alias_params_settle_ref_ref() {
+        let (model, _export) = capture_solve(MAY_ALIAS);
+        let model = model.expect("the may-alias fixture is accepted today");
+        let refs = model
+            .values()
+            .filter(|k| **k == crate::analyses::borrow_ownership::SlotKind::Ref)
+            .count();
+        assert_eq!(
+            refs,
+            model.len(),
+            "not every slot settled Ref in the may-alias fixture; the Q2 NOT-DETECTED \
+             finding rested on both callee parameters settling Ref: {model:?}"
+        );
+    }
+}
