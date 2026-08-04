@@ -54,9 +54,20 @@ pub(crate) enum FileKey {
 
 /// A decision that could not be turned into a placed edit.
 ///
-/// **Counted and attributed, never silently dropped.** Its reason key is
-/// aggregate-pinned expected-zero on the frozen corpus, so an occurrence is a
-/// finding to rule on rather than a number that quietly moves.
+/// **Counted and attributed, never silently dropped.**
+///
+/// # Expected zero — what is true today, stated exactly
+///
+/// **Measured** zero on all 20 frozen-corpus programs (S2b.1's emit run), and
+/// **not asserted anywhere**: `m1_emit_corpus` reports the count into its row
+/// under its measurement-only discipline, and nothing fails on a nonzero. The
+/// pin is **scheduled for S2b.3**, alongside the placement-true counters that
+/// give it something to be consistent with.
+///
+/// This doc previously read "aggregate-pinned expected-zero on the frozen
+/// corpus". It was pinned nowhere. Prose asserting a check the code does not
+/// have is this track's founding failure class, so the claim does not outlive
+/// the slice that measured it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Unplaceable {
     pub reason: &'static str,
@@ -155,6 +166,39 @@ pub(crate) struct Plan {
 /// skipped here rather than removed from the table, so the decision phase stays
 /// the single authority on what was decided and the loop only decides what is
 /// *emitted*.
+///
+/// # The non-placing arms, and what each one owes (S2b.2 audit)
+///
+/// Every path out of the loop that produces no edit is listed here, so *"which
+/// arms are silent"* is answerable by reading this file rather than by
+/// re-deriving it. A bare `continue` is legitimate only when some **other**
+/// component already holds the attribution.
+///
+/// | arm | disposition |
+/// |---|---|
+/// | `reverted(subject)` | bare `continue` — the verify loop owns the count |
+/// | decision is not `Ref` | bare `continue` — the table holds the `Degradation`, with subject, site and reason |
+/// | `pointee_span` is `None` | **`Unplaceable`** — unreachable through the pipeline, so nothing else would hold it |
+/// | `span_to_loc(ty_span)` errs | `Unplaceable`, reason from the locator |
+/// | `span_to_loc(pointee_span)` errs | `Unplaceable`, reason from the locator |
+/// | pointee file ≠ declaration file | `Unplaceable` |
+/// | no source text for the file | `Unplaceable` |
+/// | pointee range outside its file | `Unplaceable` |
+///
+/// **Counting, stated so it is not mistaken for settled:** the reported
+/// `emitted` is `DecisionTable::emitted_count()` — a count of *decisions*, not
+/// of *placements* — so any `Unplaceable` here would leave `emitted`
+/// over-reporting by that many subjects. Exposure is zero today (measured
+/// across all 20 frozen programs). **S2b.2 makes the arm attributable; S2b.3
+/// makes it counted**, and lands the pin.
+///
+/// **Where alias-typed subjects land today:** a parameter whose *resolved* type
+/// is a pointer but whose declaration is a type alias is collected (R-A) with
+/// `DeclShape::Alias`, and `decide_one` degrades it as
+/// `NonPointerDecl { shape: "alias" }` — a reason named for the declaration
+/// shape, which is true but says nothing about what BO concluded for it. The
+/// alias-specific relabel is **registered**, to ride whichever slice first makes
+/// alias emission live (S3 at the earliest).
 pub(crate) fn plan(
     table: &DecisionTable,
     source_of: impl Fn(&FileKey) -> Option<String>,
@@ -184,7 +228,19 @@ pub(crate) fn plan(
         // A `Ref` decision implies a syntactic raw-pointer declaration:
         // `decide_one` degrades every other shape with `NonPointerDecl`,
         // precisely because there is no pointee text to copy through an alias.
+        //
+        // So this arm is UNREACHABLE through the shipping pipeline — which is
+        // exactly why it is ATTRIBUTED rather than skipped. An unreachable arm
+        // that `continue`s silently is a subject that vanishes leaving no
+        // counter behind the moment its premise stops holding, and the premise
+        // lives in a different phase. Backstop against our own bugs, in the
+        // shape design counter (c) requires; witnessed by a data-level
+        // injection, since nothing in the pipeline can reach it.
         let Some(pointee_span) = subject.pointee_span else {
+            unplaceable.push(Unplaceable {
+                reason: "Ref decision on a declaration with no pointee span",
+                detail: attribution(),
+            });
             continue;
         };
         let (ty_file, ty_lo, ty_hi) = match span_to_loc(subject.ty_span) {
@@ -242,4 +298,130 @@ pub(crate) fn plan(
         });
     }
     Plan { by_file, unplaceable }
+}
+
+#[cfg(test)]
+mod tests {
+    use rustc_middle::mir::Local;
+
+    use super::*;
+    use crate::bo_rewriter::decision::{DeclShape, Subject};
+
+    /// A subject the collector really does build: an alias-typed declaration
+    /// whose RESOLVED type is a pointer. It carries `pointee_span: None`,
+    /// because an alias hides the `*mut` and there is no pointee text to copy.
+    fn alias_subject() -> Subject {
+        Subject {
+            fn_did: rustc_hir::def_id::CRATE_DEF_ID,
+            local: Local::from_u32(1),
+            hir_id: rustc_hir::CRATE_HIR_ID,
+            param_name: Some("p".to_owned()),
+            hir_index: 0,
+            ptr_depth: 1,
+            label: "f::p".to_owned(),
+            ty_span: rustc_span::DUMMY_SP,
+            pointee_span: None,
+            decl_shape: DeclShape::Alias,
+            mutable: false,
+        }
+    }
+
+    /// **The arm-3 witness.** A `Ref` decision on a declaration with no pointee
+    /// span is recorded as `Unplaceable`, not skipped.
+    ///
+    /// # Why the injection is data-level
+    ///
+    /// `decide_one` degrades every non-`RawPtr` declaration shape, so no input
+    /// program can reach this arm — it is a backstop, and a backstop that
+    /// cannot be exercised is indistinguishable from one that is not there.
+    /// The reachability Rider 5 asks for is supplied HERE, by handing `plan` a
+    /// table it could not have produced itself: `plan` is a pure function over
+    /// its input, so the constructed table is the whole seam. **No `cfg` or env
+    /// hook exists in shipping code for this** — phase separation is what makes
+    /// the cheap route also the clean one.
+    ///
+    /// *Mutation-tested (Rider 0, deletion first):* delete the
+    /// `unplaceable.push(..)` in that arm and this fails on the length.
+    #[test]
+    fn a_ref_decision_with_no_pointee_span_is_attributed_not_skipped() {
+        let table = DecisionTable {
+            entries: vec![(alias_subject(), Decision::Ref { mutable: false })],
+        };
+
+        let planned = plan(
+            &table,
+            |_| Some("fn f(p: PtrAlias) {}".to_owned()),
+            // Doubles as an ORDERING assertion: the arm must short-circuit
+            // before anything tries to locate a span, because the span it would
+            // locate is the one that does not exist.
+            |_: rustc_span::Span| -> Result<(FileKey, usize, usize), &'static str> {
+                panic!("the missing-pointee arm must fire before any span is located")
+            },
+            |_| "f".to_owned(),
+            &|_| false,
+        );
+
+        assert!(
+            planned.by_file.is_empty(),
+            "no edit can be placed without a pointee span, yet one was: {:?}",
+            planned.by_file
+        );
+        assert_eq!(
+            planned.unplaceable.len(),
+            1,
+            "the subject vanished with no attribution — this is the silent \
+             `continue` the arm was replaced to prevent: {:?}",
+            planned.unplaceable
+        );
+        assert_eq!(
+            planned.unplaceable[0].reason,
+            "Ref decision on a declaration with no pointee span"
+        );
+        assert!(
+            planned.unplaceable[0].detail.contains("p (param #0)"),
+            "the record must name WHICH subject, in the artifact's own terms: {:?}",
+            planned.unplaceable[0].detail
+        );
+    }
+
+    /// The same table with the same subject **decided as degraded** places
+    /// nothing and records nothing — the decision table already holds that
+    /// attribution, so a second record here would double-count it.
+    ///
+    /// Without this, the arm above could be "satisfied" by an implementation
+    /// that reports every non-emitting subject as unplaceable, which would make
+    /// the corpus's measured zero meaningless.
+    #[test]
+    fn a_degraded_subject_is_not_also_reported_unplaceable() {
+        let table = DecisionTable {
+            entries: vec![(
+                alias_subject(),
+                Decision::Degraded(crate::bo_rewriter::decision::Degradation {
+                    subject: "f::p".to_owned(),
+                    site: "f.rs:1".to_owned(),
+                    reason: crate::bo_rewriter::decision::DegradeReason::NonPointerDecl {
+                        shape: "alias",
+                    },
+                }),
+            )],
+        };
+
+        let planned = plan(
+            &table,
+            |_| Some("fn f(p: PtrAlias) {}".to_owned()),
+            |_: rustc_span::Span| -> Result<(FileKey, usize, usize), &'static str> {
+                panic!("a degraded subject must not reach span location")
+            },
+            |_| "f".to_owned(),
+            &|_| false,
+        );
+
+        assert!(planned.by_file.is_empty(), "{:?}", planned.by_file);
+        assert!(
+            planned.unplaceable.is_empty(),
+            "a degradation the TABLE already attributes was recorded a second \
+             time here: {:?}",
+            planned.unplaceable
+        );
+    }
 }
