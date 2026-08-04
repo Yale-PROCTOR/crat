@@ -51,7 +51,7 @@ pub(crate) use conflicts::{borrow_conflicts, borrow_conflicts_replaying};
 #[cfg(test)]
 pub(crate) use invalidates::{RoutedCompose, route_compose};
 
-/// §NB3-3a — routes the `borrow_verify` seam (and the `bo_c1` mirror) to the forked BO engine vs
+/// §NB3-3a — routes the `borrow_verify` seam (and the evaluation mirror) to the forked BO engine vs
 /// the production `borrow` engine. **Default = `Fork` (flipped at 3a merge, A1).** During 3a dev the
 /// default was `Production` so the equivalence differential could compare the two; the equivalence
 /// row is frozen and the engines are model-equal (edge multiset ⇒ demotion set ⇒ model), so the

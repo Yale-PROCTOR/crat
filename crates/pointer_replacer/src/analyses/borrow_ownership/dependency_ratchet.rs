@@ -16,12 +16,16 @@
 //! false-match class present in this tree: `borrow_ownership::` substring hits (word-boundary
 //! guard), doc/line/block comments (stripped), `std::borrow` re-exports (`Borrow`/`BorrowMut`/`Cow`/
 //! `ToOwned` excluded), multi-line `use borrow::{ … }` groups (whole-file scan), and `#[cfg(test)]`
-//! modules (stripped — test-only baselines are a sanctioned §0.2 exception).
+//! modules (stripped — test-only baselines are a sanctioned §0.2 exception). The separately-filed
+//! `paper_evaluation/` module is skipped only while `paper_evaluation_directory_is_test_only`
+//! proves its declaration remains `#[cfg(test)]`.
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeSet;
-    use std::path::{Path, PathBuf};
+    use std::{
+        collections::BTreeSet,
+        path::{Path, PathBuf},
+    };
 
     /// Every permitted `analyses::borrow::<seg>` reference in non-test BO code, with its §0.2
     /// ledger retirement milestone. MAY ONLY SHRINK.
@@ -31,6 +35,7 @@ mod tests {
         "borrow_inference",
         "BorrowInferenceResults",
         "GBorrowInferCtxt",
+        "HasProvenanceSet",
         "collect_invalid_loan_demotions",
         // → with `borrow_inference` retirement (BO-native data model replaces the imported types):
         "BorrowSet",
@@ -62,16 +67,24 @@ mod tests {
 
     /// The ratchet does not scan itself (its allowlist entries are string literals anyway).
     const SELF_FILE: &str = "dependency_ratchet.rs";
+    const TEST_ONLY_DIR: &str = "paper_evaluation";
 
     fn bo_dir() -> PathBuf {
         Path::new(env!("CARGO_MANIFEST_DIR")).join("src/analyses/borrow_ownership")
     }
 
-    fn collect_rs(dir: &Path, out: &mut Vec<PathBuf>) {
+    fn is_excluded_dir(path: &Path, excluded_dir: &Path) -> bool {
+        path == excluded_dir
+    }
+
+    fn collect_rs(dir: &Path, excluded_dir: &Path, out: &mut Vec<PathBuf>) {
         for entry in std::fs::read_dir(dir).expect("read borrow_ownership dir") {
             let p = entry.expect("dir entry").path();
             if p.is_dir() {
-                collect_rs(&p, out);
+                if is_excluded_dir(&p, excluded_dir) {
+                    continue;
+                }
+                collect_rs(&p, excluded_dir, out);
             } else if p.extension().is_some_and(|e| e == "rs")
                 && p.file_name().is_none_or(|n| n != SELF_FILE)
             {
@@ -110,17 +123,15 @@ mod tests {
                     }
                 }
                 out.push(' ');
-            } else if c == b'r'
-                && {
-                    // Raw string prefix `r` `#`×N `"` (also matches the `r` of a byte-raw `br"…"`,
-                    // whose leading `b` is pushed harmlessly). NOT a raw identifier `r#ident` (no `"`).
-                    let mut h = i + 1;
-                    while h < b.len() && b[h] == b'#' {
-                        h += 1;
-                    }
-                    h < b.len() && b[h] == b'"'
+            } else if c == b'r' && {
+                // Raw string prefix `r` `#`×N `"` (also matches the `r` of a byte-raw `br"…"`,
+                // whose leading `b` is pushed harmlessly). NOT a raw identifier `r#ident` (no `"`).
+                let mut h = i + 1;
+                while h < b.len() && b[h] == b'#' {
+                    h += 1;
                 }
-            {
+                h < b.len() && b[h] == b'"'
+            } {
                 // Raw string `r #×N " … " #×N` — content is uninterpreted; find the closing `"`
                 // followed by exactly N `#` and blank the whole literal, so an interior `"` (or `/*`)
                 // cannot desync the scanner and swallow the following code.
@@ -132,7 +143,12 @@ mod tests {
                 let mut m = h + 1;
                 while m < b.len() {
                     if b[m] == b'"'
-                        && b[m + 1..].iter().take(hashes).filter(|&&x| x == b'#').count() == hashes
+                        && b[m + 1..]
+                            .iter()
+                            .take(hashes)
+                            .filter(|&&x| x == b'#')
+                            .count()
+                            == hashes
                     {
                         m += 1 + hashes;
                         break;
@@ -162,14 +178,13 @@ mod tests {
                 // swallow real code). A lifetime (`'a`, `'static`: ident chars, no closing quote) is
                 // left untouched. Heuristic: it's a char literal iff the char after `'` is `\`
                 // (escape) or is followed immediately by a closing `'`.
-                let is_char_lit =
-                    b.get(i + 1) == Some(&b'\\') || b.get(i + 2) == Some(&b'\'');
+                let is_char_lit = b.get(i + 1) == Some(&b'\\') || b.get(i + 2) == Some(&b'\'');
                 if is_char_lit {
                     i += 1; // opening '
                     if b.get(i) == Some(&b'\\') {
                         i += 1; // backslash
                         match b.get(i) {
-                            Some(&b'x') => i += 3,      // \xNN
+                            Some(&b'x') => i += 3, // \xNN
                             Some(&b'u') => {
                                 while i < b.len() && b[i] != b'}' {
                                     i += 1;
@@ -372,26 +387,55 @@ mod tests {
     }
 
     fn scan() -> (BTreeSet<String>, BTreeSet<String>) {
+        let root = bo_dir();
         let mut files = vec![];
-        collect_rs(&bo_dir(), &mut files);
-        assert!(files.len() > 10, "expected the BO source tree; found {} files", files.len());
+        collect_rs(&root, &root.join(TEST_ONLY_DIR), &mut files);
+        assert!(
+            files.len() > 10,
+            "expected the BO source tree; found {} files",
+            files.len()
+        );
         let (mut borrow, mut ownership) = (BTreeSet::new(), BTreeSet::new());
         for f in &files {
             let src = std::fs::read_to_string(f).expect("read BO source file");
             let clean = strip_cfg_test(strip_comments_and_strings(&src));
+            assert_no_indirect_module_inclusion(f, &clean);
             extract("borrow", &clean, &mut borrow);
             extract("ownership", &clean, &mut ownership);
         }
         (borrow, ownership)
     }
 
+    fn assert_no_indirect_module_inclusion(path: &Path, source: &str) {
+        let compact: String = source.chars().filter(|c| !c.is_whitespace()).collect();
+        assert!(
+            !compact.contains("#[path=")
+                && !compact.contains(",path=")
+                && !compact.contains("include!("),
+            "BO dependency ratchet cannot follow indirect module inclusion in {}; use an ordinary module declaration",
+            path.display(),
+        );
+    }
+
     fn diff(actual: &BTreeSet<String>, allow: &[&str]) -> (Vec<String>, Vec<String>) {
         let allow: BTreeSet<&str> = allow.iter().copied().collect();
-        let unexpected: Vec<String> =
-            actual.iter().filter(|s| !allow.contains(s.as_str())).cloned().collect();
-        let stale: Vec<String> =
-            allow.iter().filter(|s| !actual.contains(**s)).map(|s| s.to_string()).collect();
+        let unexpected: Vec<String> = actual
+            .iter()
+            .filter(|s| !allow.contains(s.as_str()))
+            .cloned()
+            .collect();
+        let stale: Vec<String> = allow
+            .iter()
+            .filter(|s| !actual.contains(**s))
+            .map(|s| s.to_string())
+            .collect();
         (unexpected, stale)
+    }
+
+    fn is_test_only_module_decl(src: &str, module: &str) -> bool {
+        let declaration = format!("mod {module};");
+        let cleaned = strip_comments_and_strings(src);
+        cleaned.contains(&declaration) && !strip_cfg_test(cleaned).contains(&declaration)
     }
 
     /// The ratchet: the actual non-test BO reference surface must EQUAL the allowlist, both
@@ -414,15 +458,68 @@ mod tests {
         );
     }
 
+    /// The directory exclusion above is sound only while the entire paper-evaluation subtree is
+    /// absent from production builds. If the module gate moves or disappears, fail before the
+    /// scanner can hide those dependencies.
+    #[test]
+    fn paper_evaluation_directory_is_test_only() {
+        let module_root = std::fs::read_to_string(bo_dir().join("mod.rs"))
+            .expect("read borrow_ownership module root");
+        assert!(
+            is_test_only_module_decl(&module_root, "paper_evaluation"),
+            "paper_evaluation must remain cfg(test) while excluded from the production dependency ratchet",
+        );
+    }
+
+    #[test]
+    fn test_only_module_gate_ignores_commented_declarations() {
+        assert!(!is_test_only_module_decl(
+            "// #[cfg(test)]\n// mod paper_evaluation;",
+            "paper_evaluation",
+        ));
+    }
+
+    #[test]
+    fn directory_exclusion_is_exact_not_basename_based() {
+        let root = bo_dir();
+        let excluded = root.join(TEST_ONLY_DIR);
+        assert!(is_excluded_dir(&excluded, &excluded));
+        assert!(!is_excluded_dir(
+            &root.join("nested").join(TEST_ONLY_DIR),
+            &excluded,
+        ));
+    }
+
+    #[test]
+    #[should_panic(expected = "cannot follow indirect module inclusion")]
+    fn production_path_alias_fails_loudly() {
+        let source = r#"#[path = "paper_evaluation/mod.rs"] mod evaluation;"#;
+        let clean = strip_cfg_test(strip_comments_and_strings(source));
+        assert_no_indirect_module_inclusion(Path::new("fixture.rs"), &clean);
+    }
+
+    #[test]
+    #[should_panic(expected = "cannot follow indirect module inclusion")]
+    fn production_include_macro_fails_loudly() {
+        let source = r#"include!("paper_evaluation/mod.rs");"#;
+        let clean = strip_cfg_test(strip_comments_and_strings(source));
+        assert_no_indirect_module_inclusion(Path::new("fixture.rs"), &clean);
+    }
+
     /// A glob import `borrow::*` pulls in the entire module surface. `extract` must record it as `*`
     /// (which is in no allowlist ⇒ the ratchet trips) rather than capturing nothing and silently
     /// passing — the whole-surface false-negative.
     #[test]
     fn scanner_catches_glob_import() {
-        let cleaned = strip_cfg_test(strip_comments_and_strings("use crate::analyses::borrow::*;"));
+        let cleaned = strip_cfg_test(strip_comments_and_strings(
+            "use crate::analyses::borrow::*;",
+        ));
         let mut set = BTreeSet::new();
         extract("borrow", &cleaned, &mut set);
-        assert!(set.contains("*"), "glob `borrow::*` must be recorded, not silently missed; got {set:?}");
+        assert!(
+            set.contains("*"),
+            "glob `borrow::*` must be recorded, not silently missed; got {set:?}"
+        );
     }
 
     /// A `'{'` char literal inside a `#[cfg(test)]` block must not make `strip_cfg_test` over-consume
@@ -435,8 +532,14 @@ mod tests {
         let cleaned = strip_cfg_test(strip_comments_and_strings(src));
         let mut set = BTreeSet::new();
         extract("borrow", &cleaned, &mut set);
-        assert!(set.contains("REAL_DEP"), "real ref after the block must survive; got {set:?}");
-        assert!(!set.contains("TEST_ONLY"), "test-only ref inside the block must be stripped; got {set:?}");
+        assert!(
+            set.contains("REAL_DEP"),
+            "real ref after the block must survive; got {set:?}"
+        );
+        assert!(
+            !set.contains("TEST_ONLY"),
+            "test-only ref inside the block must be stripped; got {set:?}"
+        );
     }
 
     /// A comma-terminated `#[cfg(test)]` FIELD (the `call_graph.rs:109` shape) must be stripped at its
@@ -449,39 +552,55 @@ mod tests {
         let cleaned = strip_cfg_test(strip_comments_and_strings(src));
         let mut set = BTreeSet::new();
         extract("borrow", &cleaned, &mut set);
-        assert!(set.contains("REAL_DEP"), "real ref after a cfg-gated field must survive; got {set:?}");
+        assert!(
+            set.contains("REAL_DEP"),
+            "real ref after a cfg-gated field must survive; got {set:?}"
+        );
     }
 
     /// A spaced path separator `borrow :: X` (or `borrow:: X`) must not evade the scanner — a
     /// hand-written space around `::` would otherwise hide a real dependency.
     #[test]
     fn scanner_handles_spaced_path_separator() {
-        let cleaned = strip_cfg_test(strip_comments_and_strings("fn f() { let _ = borrow :: SpacedDep; }"));
+        let cleaned = strip_cfg_test(strip_comments_and_strings(
+            "fn f() { let _ = borrow :: SpacedDep; }",
+        ));
         let mut set = BTreeSet::new();
         extract("borrow", &cleaned, &mut set);
-        assert!(set.contains("SpacedDep"), "space around `::` must not evade the scanner; got {set:?}");
+        assert!(
+            set.contains("SpacedDep"),
+            "space around `::` must not evade the scanner; got {set:?}"
+        );
     }
 
     /// A grouped glob `borrow::{self, *}` must record `*` — not silently capture only the sibling
     /// `self` (Codex re-review). The `*` imports the whole surface.
     #[test]
     fn scanner_catches_grouped_glob() {
-        let cleaned =
-            strip_cfg_test(strip_comments_and_strings("use crate::analyses::borrow::{self, *};"));
+        let cleaned = strip_cfg_test(strip_comments_and_strings(
+            "use crate::analyses::borrow::{self, *};",
+        ));
         let mut set = BTreeSet::new();
         extract("borrow", &cleaned, &mut set);
-        assert!(set.contains("*"), "grouped glob `borrow::{{self, *}}` must record `*`; got {set:?}");
+        assert!(
+            set.contains("*"),
+            "grouped glob `borrow::{{self, *}}` must record `*`; got {set:?}"
+        );
     }
 
     /// A module alias `use borrow as prod;` imports the whole surface under a new name — record `*`
     /// (the alias would otherwise hide every `prod::X` use from segment tracking) (Codex re-review).
     #[test]
     fn scanner_catches_module_alias() {
-        let cleaned =
-            strip_cfg_test(strip_comments_and_strings("use crate::analyses::borrow as prod;"));
+        let cleaned = strip_cfg_test(strip_comments_and_strings(
+            "use crate::analyses::borrow as prod;",
+        ));
         let mut set = BTreeSet::new();
         extract("borrow", &cleaned, &mut set);
-        assert!(set.contains("*"), "module alias `borrow as prod` must record `*`; got {set:?}");
+        assert!(
+            set.contains("*"),
+            "module alias `borrow as prod` must record `*`; got {set:?}"
+        );
     }
 
     /// A raw string with an interior `"` must not desync the scanner and blank the following code —
@@ -492,15 +611,19 @@ mod tests {
         let cleaned = strip_cfg_test(strip_comments_and_strings(src));
         let mut set = BTreeSet::new();
         extract("borrow", &cleaned, &mut set);
-        assert!(set.contains("REAL_DEP"), "dep after a raw string must survive scanning; got {set:?}");
+        assert!(
+            set.contains("REAL_DEP"),
+            "dep after a raw string must survive scanning; got {set:?}"
+        );
     }
 
     /// A self-aliased group `borrow::{self as prod}` aliases the WHOLE module — must record `*`, not
     /// just capture the sibling `self` (Codex 3rd review).
     #[test]
     fn scanner_catches_grouped_self_alias() {
-        let cleaned =
-            strip_cfg_test(strip_comments_and_strings("use crate::analyses::borrow::{self as prod};"));
+        let cleaned = strip_cfg_test(strip_comments_and_strings(
+            "use crate::analyses::borrow::{self as prod};",
+        ));
         let mut set = BTreeSet::new();
         extract("borrow", &cleaned, &mut set);
         assert!(
@@ -513,10 +636,14 @@ mod tests {
     /// cfg token cannot make strip_cfg_test remove a real dependency after it (Codex 3rd review).
     #[test]
     fn scanner_nested_block_comment() {
-        let src = "/* outer /* inner */ #[cfg(test)] */ type H = crate::analyses::borrow::REAL_DEP;";
+        let src =
+            "/* outer /* inner */ #[cfg(test)] */ type H = crate::analyses::borrow::REAL_DEP;";
         let cleaned = strip_cfg_test(strip_comments_and_strings(src));
         let mut set = BTreeSet::new();
         extract("borrow", &cleaned, &mut set);
-        assert!(set.contains("REAL_DEP"), "dep after a nested block comment must survive; got {set:?}");
+        assert!(
+            set.contains("REAL_DEP"),
+            "dep after a nested block comment must survive; got {set:?}"
+        );
     }
 }

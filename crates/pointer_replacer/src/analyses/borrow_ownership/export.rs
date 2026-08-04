@@ -33,7 +33,7 @@
 //!
 //! D4 descoped an earlier `CRAT_BO_EXPORT` because it gated onto **nothing** —
 //! it turned on a recorder no one read. That objection is spent: the switch now
-//! gates [`arm_capture`], the production arm in `bo_c1::run::run_bo`, which is
+//! gates [`arm_capture`], the production arm in the paper-evaluation corpus runner, which is
 //! a real consumer of the decision.
 //!
 //! Semantics: resolve-once per process, fail loud on anything other than `0`

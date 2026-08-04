@@ -1,3 +1,7 @@
+//! Calibration harness that derives and validates CROWN's official usage
+//! metric for the BO paper evaluation. The pinned counter itself lives under
+//! `tools/crown_usage_metric/`.
+
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs,

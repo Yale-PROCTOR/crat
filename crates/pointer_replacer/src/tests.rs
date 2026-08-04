@@ -9950,6 +9950,7 @@ mod borrow_ownership_coherence {
                 emit_crate_ownership_constraints,
                 mutability_facts::MutFacts,
                 origins::{collect_no_borrow_origin_slots, compute_origins},
+                paper_evaluation::corpus::{CollateralMeasurement, measure_collateral},
                 slots::{SlotId, StructFieldSlot},
                 solver::{KindSolver, SlotRef},
                 sources::collect_malloc_source_slots,
@@ -11530,7 +11531,7 @@ unsafe fn f(mut p: *mut i32) -> i32 {
 
     /// §NB4-4c-Q RED (item-4 sizing gate, 2026-07-17): the coherence-collateral measurement, validated
     /// against the INDEPENDENT multi-agent derivation (user ruling 2026-07-17). Exercises the EXACT
-    /// harness code (`bo_c1::measure_collateral`) the corpus sweep runs.
+    /// harness code (`paper_evaluation::corpus::measure_collateral`) the corpus sweep runs.
     ///
     /// GRANULARITY (user-ruled MIR-slot-level 2026-07-17): the collateral is measured in the `n_ref` /
     /// `n_ref_d0` metric's own units — MIR SLOTS, not source variables. The agents' source-variable
@@ -11541,14 +11542,14 @@ unsafe fn f(mut p: *mut i32) -> i32 {
     /// +2 because the depth-0 field-store equate skip (`coherence.rs:45-47`) blocks the drag.
     #[test]
     fn nb4_4c_q_collateral_shapes() {
-        fn measure(code: &str) -> crate::bo_c1::CollateralMeasurement {
+        fn measure(code: &str) -> CollateralMeasurement {
             let mut out = None;
             run_compiler(code, |tcx| {
                 let program = collect_program(tcx);
                 let slots = CrateSlots::build(&program);
                 let origins = compute_origins(&program);
                 let mut_facts = MutFacts::from_program(&program);
-                out = Some(crate::bo_c1::measure_collateral(&program, &slots, &origins, &mut_facts));
+                out = Some(measure_collateral(&program, &slots, &origins, &mut_facts));
             });
             out.expect("run_compiler ran the callback")
         }

@@ -122,7 +122,7 @@ impl RepairMode {
 thread_local! {
     /// §NB5-L2 commit-necessity audit — when `Some`, the CEGAR loop's **Mode-A** commit records every
     /// `(committed slot, round)` pair here. `None` (the default) = OFF, zero overhead on the sweep/suite
-    /// path. Only the audit driver (`bo_c1::run::run_necessity_audit`) turns it on, via `with_capture`.
+    /// path. Only the paper-evaluation audit driver turns it on, via `with_capture`.
     /// Mode-A ONLY: the audit measures the shipped repair mode; the `Lemmas` branch (dead axis) is not
     /// captured. Nesting is unsupported (the audit never nests).
     static AUDIT_CAPTURE: RefCell<Option<Vec<(SlotRef, usize)>>> = const { RefCell::new(None) };
@@ -550,7 +550,7 @@ pub(crate) fn verify_to_fixpoint_with_flows(
 ) -> Option<FxHashMap<SlotRef, SlotKind>> {
     // §NB5-M: thin wrapper over the single counting loop (model only). KEEP THIN — any logic
     // added here but not in `verify_to_fixpoint_counting` diverges the sweep's counters from what
-    // the suite verifies (exactly the mirror-drift the retired bo_c1 mirror guarded; wrapper-
+    // the suite verifies (exactly the mirror drift the retired evaluation mirror guarded; wrapper-
     // thinness is now the guard — see `verify_to_fixpoint_is_thin_wrapper`).
     verify_to_fixpoint_counting_with_flows(
         program,
@@ -563,7 +563,7 @@ pub(crate) fn verify_to_fixpoint_with_flows(
     .0
 }
 
-/// §NB5-M CEGAR round/commit counters, native to the fork — retires the bo_c1 mirror
+/// §NB5-M CEGAR round/commit counters, native to the fork — retires the evaluation mirror
 /// (`mirror::verify_to_fixpoint_counting`). `None` (decline) carries the stats of the rounds that
 /// ran. `verify_to_fixpoint` is the model-only wrapper over this.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -581,7 +581,7 @@ pub(crate) struct RoundStats {
     /// FIELD slot (the A′ principle extended to field requirers — the field is a live requirer the
     /// Local-only replay candidacy cannot soundly demote, so decline is the sound outcome). Carries
     /// the offending field slot for the sweep's per-program attribution (which field). `None` for an
-    /// accept or an UNSAT-family decline (bo_c1 classifies those via its selector-core
+    /// accept or an UNSAT-family decline (the evaluation harness classifies those via its selector-core
     /// `decline_reason`).
     pub field_conflict_decline: Option<SlotRef>,
     /// §NB5-L guard 3 — the `RepairMode` that produced these stats (the mode-stamp). Self-describing
@@ -590,7 +590,8 @@ pub(crate) struct RoundStats {
     pub repair: RepairMode,
     /// §NB5-L (Codex MEDIUM) — set when the loop declined because the `Lemmas` round cap was exhausted
     /// (the controlled backstop for a hypothetical subset-oscillation blowup, which does not manifest
-    /// empirically). A distinct decline KIND: `bo_c1` must tag it before `decline_reason`, which would
+    /// empirically). A distinct decline KIND: the evaluation harness must tag it before
+    /// `decline_reason`, which would
     /// otherwise mislabel this relaxed-SAT decline as `sat-in-replay` and hide the cap exhaustion. Never
     /// set under `ModeA` (that path panics — its linear bound is proven).
     pub cap_exhausted: bool,
@@ -872,7 +873,7 @@ pub(crate) fn verify_to_fixpoint_counting_with_flows(
         ),
         RepairMode::Lemmas => {
             // Non-monotone lemma loop hit the cap (subset oscillation): controlled decline, not panic.
-            // Tag the decline KIND so `bo_c1` reports it as cap-exhaustion, not a mislabeled
+            // Tag the decline KIND so the evaluation harness reports it as cap-exhaustion, not a mislabeled
             // `sat-in-replay` (Codex MEDIUM).
             stats.cap_exhausted = true;
             (None, stats)

@@ -18,6 +18,8 @@ use super::{
     ssa::constraint::{Database, Gen, Var},
     SlotKind,
 };
+#[cfg(test)]
+use super::paper_evaluation::corpus::ownership_diagnostic_package;
 
 /// Global identity for a flattened pointer slot.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -1104,12 +1106,12 @@ fn assert_hard(
     constraint: &Bool,
 ) {
     #[cfg(test)]
-    if crate::bo_c1::ownership_diagnostic_package::removal_filter_active() {
+    if ownership_diagnostic_package::removal_filter_active() {
         assert!(
             tracker.is_none(),
             "family-removal diagnosis must remain untracked"
         );
-        if crate::bo_c1::ownership_diagnostic_package::suppresses_label(label) {
+        if ownership_diagnostic_package::suppresses_label(label) {
             return;
         }
         solver.assert(constraint);

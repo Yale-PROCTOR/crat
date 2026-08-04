@@ -35,6 +35,8 @@ mod vec_vec;
 pub mod ssa;
 #[cfg(test)]
 mod dependency_ratchet;
+#[cfg(test)]
+pub(crate) mod paper_evaluation;
 
 #[allow(unused_imports)]
 pub use domain::SlotKind;
@@ -45,6 +47,7 @@ use z3::ast::Bool;
 
 use crate::{
     analyses::{
+        borrow::{HasProvenanceSet, ProvenanceSet},
         borrow_ownership::{
             call_graph::FnSig,
             crate_slots::CrateSlots,
@@ -61,6 +64,21 @@ use crate::{
     },
     utils::rustc::RustProgram,
 };
+
+/// Construct the production borrow analysis's provenance representation for
+/// the BO-owned replay engine. Keeping this narrow seam inside BO makes the
+/// remaining production dependency explicit to the dependency ratchet.
+pub(crate) fn production_provenance_set<I, J>(
+    body: &Body<'_>,
+    is_candidate: I,
+    is_mutable: J,
+) -> ProvenanceSet
+where
+    I: Fn(Local) -> bool,
+    J: Fn(Local) -> bool,
+{
+    body.provenance_set(is_candidate, is_mutable)
+}
 
 pub type Precision = u8;
 
@@ -120,7 +138,7 @@ impl SafeMonoMode {
         }
     }
 
-    /// Stable label for reporting (bo_c1 row column).
+    /// Stable label for the paper-evaluation corpus report.
     pub(crate) fn label(self) -> &'static str {
         match self {
             SafeMonoMode::Off => "off",

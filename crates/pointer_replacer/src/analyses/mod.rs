@@ -1,5 +1,4 @@
 pub mod array_local_provenance;
-pub(crate) mod bo_adapter;
 pub mod borrow;
 pub mod borrow_ownership;
 mod encoding;

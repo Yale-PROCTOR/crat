@@ -13,13 +13,13 @@ use smallvec::{SmallVec, smallvec};
 use super::loan_liveness;
 use crate::{
     analyses::{
-        bo_adapter,
         borrow::{
             BorrowInferenceResults, Borrower, GBorrowInferCtxt, Loan, Provenance, ProvenanceOwner,
             ProvenanceSet, StructFieldSlot, borrow_inference,
         },
         borrow_ownership::{
             origin_flow::{self, OriginFlowResults},
+            production_provenance_set,
             slots::SlotOwner,
         },
     },
@@ -53,7 +53,8 @@ impl<'a> NativeBorrowContext<'a> {
                 .tcx
                 .mir_drops_elaborated_and_const_checked(f)
                 .borrow();
-            let provenance_set = bo_adapter::provenance_set(&body, is_candidate(f), is_mutable(f));
+            let provenance_set =
+                production_provenance_set(&body, is_candidate(f), is_mutable(f));
             for data in provenance_set.provenance_data.iter() {
                 if let ProvenanceOwner::Field(field) = data.owner() {
                     field_users.entry(field).or_default().insert(f);

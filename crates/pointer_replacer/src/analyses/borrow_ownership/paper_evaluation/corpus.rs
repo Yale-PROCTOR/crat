@@ -1,4 +1,4 @@
-//! C1-lite corpus runner for the experimental BO (borrow_ownership) analysis.
+//! Corpus runner and diagnostic harness for the BO paper evaluation.
 //!
 //! Harness and test-only diagnostic hooks: production analysis semantics stay
 //! untouched. Runs BO exactly as
@@ -24,9 +24,11 @@
 //!
 //! Entry points (all `#[ignore]`d except the guards):
 //!   worker:      CRAT_BOC1_INPUT=<crate-root.rs> [CRAT_BOC1_MODE=bo|prod]
-//!                cargo test -p pointer_replacer --release bo_c1::boc1_run_one \
+//!                cargo test -p pointer_replacer --release \
+//!                  analyses::borrow_ownership::paper_evaluation::corpus::boc1_run_one \
 //!                  -- --exact --ignored --nocapture
-//!   orchestrator: cargo test -p pointer_replacer --release bo_c1::boc1_corpus \
+//!   orchestrator: cargo test -p pointer_replacer --release \
+//!                  analyses::borrow_ownership::paper_evaluation::corpus::boc1_corpus \
 //!                  -- --exact --ignored --nocapture
 //!                env: CRAT_BOC1_PROGRAMS=a,b,c  CRAT_BOC1_TIMEOUT_SECS=900
 //!                     CRAT_BOC1_PROD_TIMEOUT_SECS=900  CRAT_BOC1_PROD=0
@@ -40,6 +42,13 @@ use self::ownership_diagnostic_package::{
     ProductionPrecisionEvidence,
 };
 use crate::{analyses::borrow_ownership::solver::CORE_LABEL_FAMILIES, utils::rustc::RustProgram};
+
+fn corpus_worker_test() -> String {
+    let (_, module) = module_path!()
+        .split_once("::")
+        .expect("module path includes the crate name");
+    format!("{module}::boc1_run_one")
+}
 
 /// Copy of tests.rs `borrow_ownership_coherence::collect_program` (kept local so
 /// tests.rs stays untouched): every top-level fn/struct item, in HIR owner order.
@@ -3896,10 +3905,8 @@ mod l2_red_gate {
 
     use super::{CorpusProgram, report::Row};
 
-    const BASE: &str =
-        include_str!("analyses/borrow_ownership/testdata/l2_rs_crown_base_ae6f334.csv");
-    const TARGETS: &str =
-        include_str!("analyses/borrow_ownership/testdata/l2_rs_crown_targets.csv");
+    const BASE: &str = include_str!("../testdata/l2_rs_crown_base_ae6f334.csv");
+    const TARGETS: &str = include_str!("../testdata/l2_rs_crown_targets.csv");
     pub const ENV: &str = "CRAT_BOC1_L2_RED_GATE";
 
     #[derive(Clone, Debug, PartialEq, Eq)]
@@ -6198,7 +6205,7 @@ mod run {
         row.set("t_mut_facts_s", secs(t.elapsed()));
 
         let t = Instant::now();
-        // §NB5-M: native fork counters (the bo_c1 mirror is RETIRED — parity was proven at the NB5-M
+        // §NB5-M: native fork counters (the evaluation mirror is RETIRED — parity was proven at the NB5-M
         // gate, byte-identical to the NB5-Z baseline on all 19 both profiles). `verify_to_fixpoint_counting`
         // is the single CEGAR loop; `verify_to_fixpoint` is its model-only wrapper.
         // §NB5-L2: under `CRAT_BOC1_NECESSITY_AUDIT`, wrap the SAME solve in `with_capture` so Mode-A's
@@ -7686,7 +7693,7 @@ fn nbr_witness_core_family_regression() {
 /// §NB-R R2a — manual core printer for the deleteNode witness. `#[ignore]`d:
 /// run explicitly to (re)produce the diagnosis recorded in the task doc.
 #[test]
-#[ignore = "NB-R diagnosis printer: run with --exact bo_c1::nbr_print_witness_core --ignored --nocapture"]
+#[ignore = "NB-R diagnosis printer: run the exact paper_evaluation::corpus::nbr_print_witness_core test"]
 fn nbr_print_witness_core() {
     ::utils::compilation::run_compiler_on_str(DELETE_NODE_WITNESS, |tcx| {
         match explain::explain_unsat(tcx) {
@@ -8127,7 +8134,7 @@ mod orchestrate {
     };
 
     use super::{
-        ownership_diagnostic_package, ownership_yield,
+        corpus_worker_test, ownership_diagnostic_package, ownership_yield,
         report::{self, Row},
         selector_leak_diagnosis,
     };
@@ -8256,7 +8263,7 @@ mod orchestrate {
         String::from_utf8_lossy(&out.stdout).trim().parse().ok()
     }
 
-    /// Spawn one worker (this test binary, `--exact bo_c1::boc1_run_one`) with
+    /// Spawn one worker (this test binary, using the exact `boc1_run_one` path) with
     /// file-redirected stdio; supervise with deadline + RSS cap; classify.
     pub fn run_child(program: &str, input: &Path, mode: &str, timeout: Duration) -> ChildOutcome {
         run_child_labeled(program, input, mode, mode, timeout)
@@ -8281,7 +8288,8 @@ mod orchestrate {
         let t0 = Instant::now();
         let mut command = Command::new(exe);
         command
-            .args(["bo_c1::boc1_run_one", "--exact", "--ignored", "--nocapture"])
+            .arg(corpus_worker_test())
+            .args(["--exact", "--ignored", "--nocapture"])
             .env("CRAT_BOC1_INPUT", input)
             .env("CRAT_BOC1_MODE", mode)
             .env("CRAT_BOC1_NAME", program)
@@ -9361,7 +9369,7 @@ fn boc1_crown_projection_combine() {
 }
 
 #[test]
-#[ignore = "C1-lite corpus sweep: run explicitly with --exact bo_c1::boc1_corpus --ignored --nocapture"]
+#[ignore = "BO paper corpus sweep: run explicitly with the exact paper_evaluation::corpus::boc1_corpus path"]
 fn boc1_corpus() {
     use std::{
         collections::{BTreeMap, BTreeSet},
@@ -12607,10 +12615,8 @@ const L2_FEATURE_OFF_BASE_SHA: &str = "ae6f334eca78cbaa254bfb3afc65e3c31130153d"
 const L2_FEATURE_OFF_OUTPUT_LEN: usize = 212;
 const L2_FEATURE_OFF_OUTPUT_SHA256: &str =
     "7e625bb8120839583f7cf64d19c6b87a342d2525bca5bf36dfc115e4a003a17a";
-const L2_FEATURE_OFF_SOURCE_DROP: &str =
-    include_str!("analyses/borrow_ownership/testdata/l2_feature_off_source_drop.rs");
-const L2_FEATURE_OFF_SINK_DROP: &str =
-    include_str!("analyses/borrow_ownership/testdata/l2_feature_off_sink_drop.rs");
+const L2_FEATURE_OFF_SOURCE_DROP: &str = include_str!("../testdata/l2_feature_off_source_drop.rs");
+const L2_FEATURE_OFF_SINK_DROP: &str = include_str!("../testdata/l2_feature_off_sink_drop.rs");
 
 fn l2_feature_off_capture_program(fixture: &str, source: &str) -> String {
     use std::fmt::Write;
@@ -12934,7 +12940,7 @@ fn l2_red_feature_off_matches_base_ae6f334() {
     let (actual_snapshot, actual_output, actual_bytemuck) = l2_feature_off_capture();
     assert_eq!(
         actual_snapshot,
-        include_str!("analyses/borrow_ownership/testdata/l2_feature_off_base_ae6f334.snap"),
+        include_str!("../testdata/l2_feature_off_base_ae6f334.snap"),
         "feature-off Mode-A semantics drifted from the approved ae6f334 base"
     );
     assert_eq!(
@@ -12947,7 +12953,7 @@ fn l2_red_feature_off_matches_base_ae6f334() {
     // either side or replace this with raw-text include_bytes!: both alternatives
     // weaken the exact base anchor.
     let golden_output = l2_decode_hex(include_str!(
-        "analyses/borrow_ownership/testdata/l2_feature_off_base_ae6f334.output.hex"
+        "../testdata/l2_feature_off_base_ae6f334.output.hex"
     ));
     assert_eq!(
         l2_sha256_hex(b""),

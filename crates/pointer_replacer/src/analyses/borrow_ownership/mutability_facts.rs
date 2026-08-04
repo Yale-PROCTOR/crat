@@ -72,7 +72,8 @@ impl MutProvider for &MutFacts {
 /// §NB2 switch. `On` (default) consults Foster; `Off` reproduces the pre-NB2 forced-mutable
 /// behavior. Env `CRAT_BO_MUT_FACTS ∈ {off, on}` flips the corpus sweep with no recompile;
 /// fixtures never set it and build `MutFacts` directly, so they are deterministic. Only the
-/// `bo_c1` driver consults `current()` (to choose `all_mut()` vs `from_program`).
+/// The paper-evaluation corpus driver consults `current()` (to choose `all_mut()` vs
+/// `from_program`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum MutFactsMode {
     Off,
@@ -90,7 +91,7 @@ impl MutFactsMode {
         }
     }
 
-    /// Stable label for reporting (bo_c1 row column).
+    /// Stable label for the paper-evaluation corpus report.
     pub(crate) fn label(self) -> &'static str {
         match self {
             MutFactsMode::Off => "off",
@@ -134,7 +135,7 @@ impl MutFacts {
     }
 
     /// Per-local outermost-provenance mutability. Missing data (unseen `did` / out-of-range
-    /// `Local`) ⇒ `Mut` (the sole sound default). Inherent so the bo_c1 readout can query it
+    /// `Local`) ⇒ `Mut` (the sole sound default). Inherent so the evaluation readout can query it
     /// directly (the `&T`/`&mut` split); the `MutProvider` impl delegates here.
     pub(crate) fn is_mutable(&self, fn_did: LocalDefId, local: Local) -> bool {
         if self.all_mut {

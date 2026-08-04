@@ -26,8 +26,8 @@ use crate::{
     utils::rustc::RustProgram,
 };
 
-/// Local copy of `bo_c1::collect_program` (bo_c1.rs:46): every top-level
-/// fn/struct item, in HIR owner order. Kept local so bo_c1 stays untouched.
+/// Local copy of the paper-evaluation corpus harness's `collect_program`: every top-level
+/// fn/struct item, in HIR owner order. Kept local so the harness stays untouched.
 fn collect_program(tcx: TyCtxt<'_>) -> RustProgram<'_> {
     let mut functions = Vec::new();
     let mut structs = Vec::new();
@@ -51,7 +51,7 @@ fn collect_program(tcx: TyCtxt<'_>) -> RustProgram<'_> {
     }
 }
 
-/// Solve one inline program under export capture, exactly as `bo_c1`'s
+/// Solve one inline program under export capture, exactly as the corpus harness's
 /// smallest harness does, and hand back both the model and the recording.
 fn capture_solve(code: &str) -> (Option<FxHashMap<SlotRef, super::SlotKindAlias>>, BoExport) {
     ::utils::compilation::run_compiler_on_str(code, |tcx| {
@@ -807,7 +807,7 @@ unsafe fn f() -> i32 {
 ///
 /// `x = id(p)` is a live `Ref` requirer invalidated by the write through the
 /// base `b = p` (A′), so the loop commits twice and accepts on round 3. The
-/// round count is pinned by `bo_c1.rs:6461` (`commit.rounds == 3`), and this
+/// round count is pinned by `paper_evaluation/corpus.rs` (`commit.rounds == 3`), and this
 /// test pins it again locally so a change in fixture behaviour cannot silently
 /// turn the D1 witness into a single-round no-op.
 const CASCADE: &str = "unsafe fn id(p: *mut i32) -> *mut i32 { p } \
