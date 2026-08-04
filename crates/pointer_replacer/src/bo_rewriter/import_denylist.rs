@@ -999,6 +999,21 @@ fn outcome_construction_sites(root: &Path, skip: &dyn Fn(&Path) -> bool) -> Vec<
             if is_comment(line) {
                 continue;
             }
+            // A CONSTRUCTION lists every field; a PATTERN elides with `..`.
+            //
+            // SOUNDNESS: functional record update (`..other`) is not available
+            // on enum variants in Rust, so a variant construction MUST name
+            // every field — `..` in a variant-with-braces line is therefore
+            // always a rest-pattern, never a construction. The scan is textual
+            // and cannot parse; this is what makes the discriminator exact
+            // rather than heuristic. If variants are ever replaced by structs,
+            // functional update becomes legal and this argument LAPSES — the
+            // guard must be revisited, not just re-run.
+            //
+            // Witnessed in both directions below rather than assumed.
+            if line.contains("..") {
+                continue;
+            }
             if line.contains("RewriteOutcome::Emitted {")
                 || line.contains("RewriteOutcome::Degraded {")
             {
@@ -1051,5 +1066,25 @@ fn the_outcome_site_scan_reports_a_hand_filled_arm() {
     );
     let hits = outcome_construction_sites(&dir, &|_| false);
     assert_eq!(hits.len(), 2, "the scan missed a hand-filled arm: {hits:?}");
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// **Witness — a DESTRUCTURING is not a construction.** Without this the scan
+/// flags every `match` arm, and the production check fails on code that only
+/// reads an outcome.
+#[test]
+fn the_outcome_site_scan_ignores_a_destructuring() {
+    let dir = temp_corpus(
+        "outcome-destructure",
+        &[(
+            "reader.rs",
+            "fn f(o: RewriteOutcome) {\n    match o {\n        RewriteOutcome::Emitted { source, .. } => source,\n        RewriteOutcome::Degraded { reason, .. } => reason,\n    }\n}\n",
+        )],
+    );
+    let hits = outcome_construction_sites(&dir, &|_| false);
+    assert!(
+        hits.is_empty(),
+        "a destructuring was reported as a construction: {hits:?}"
+    );
     let _ = fs::remove_dir_all(&dir);
 }

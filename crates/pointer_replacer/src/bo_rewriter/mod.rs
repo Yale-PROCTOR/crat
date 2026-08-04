@@ -118,6 +118,8 @@ pub(crate) enum RewriteOutcome {
         reverted_count: usize,
         /// Edit owners invisible to span attribution.
         attribution_blind: usize,
+        /// The first verify's diagnostics.
+        first_diags: Vec<verify::Diag>,
         /// Decisions that could not be turned into a placed edit — a
         /// macro-generated span, a span straddling two files, a file with no
         /// editable identity. Carried out for the same reason as `excluded`:
@@ -146,6 +148,8 @@ pub(crate) enum RewriteOutcome {
         reverted_count: usize,
         /// Edit owners invisible to span attribution.
         attribution_blind: usize,
+        /// The first verify's diagnostics.
+        first_diags: Vec<verify::Diag>,
     },
 }
 
@@ -256,6 +260,7 @@ pub(crate) fn rewrite_m1_path_injected(
         Some(root),
         max_rounds,
         inject,
+        false,
     )
 }
 
@@ -272,7 +277,7 @@ fn rewrite_core(
     tree_base: Option<&std::path::Path>,
     max_rounds: usize,
 ) -> RewriteOutcome {
-    rewrite_core_injected(input, tree_base, max_rounds, &|_| {})
+    rewrite_core_injected(input, tree_base, max_rounds, &|_| {}, false)
 }
 
 /// [`rewrite_core`] with a hook applied to the finished decision table at the
@@ -287,6 +292,7 @@ fn rewrite_core_injected(
     tree_base: Option<&std::path::Path>,
     max_rounds: usize,
     inject: &(dyn Fn(&mut decision::DecisionTable) + Sync),
+    probe_only: bool,
 ) -> RewriteOutcome {
     let root_hint = tree_base;
     let result = ::utils::compilation::run_compiler_on_input(input, |tcx| {
@@ -426,6 +432,7 @@ fn rewrite_core_injected(
                 bisect_probes: 0,
                 escalated: None,
                 attribution_blind,
+                first_diags: Vec::new(),
             };
             let crate_dir = tree_base.and_then(|root| root.parent()).map(|d| d.to_path_buf());
             let mut reverted: std::collections::BTreeSet<String> =
@@ -453,6 +460,13 @@ fn rewrite_core_injected(
                 let probe_started = std::time::Instant::now();
                 let diagnosis = verify::diagnose_crate(staged.root());
                 probe_secs = probe_secs.max(probe_started.elapsed().as_secs_f64());
+                if facts.first_diags.is_empty() {
+                    facts.first_diags = diagnosis.diags.clone();
+                }
+                if probe_only {
+                    facts.files_touched = files.len();
+                    return facts.degraded("probe-only: first diagnose recorded".to_owned());
+                }
                 if diagnosis.errors == 0 {
                     let source = std::fs::read_to_string(staged.root()).unwrap_or_default();
                     let (kept, taken): (Vec<_>, Vec<_>) = emitted_subjects
@@ -855,15 +869,25 @@ fn decide_table<'tcx>(tcx: TyCtxt<'tcx>) -> Result<decision::DecisionTable, Stri
 /// rendered comparison cannot be made 1:1 against it. This reproduces S2b.0's
 /// conditions exactly — a single verify of the fully-emitted crate — so the two
 /// extraction paths can be compared on the same diagnostics.
+#[allow(
+    dead_code,
+    reason = "reached only from bo_c1's `m1-diag` validation-transfer driver, \
+              which is #[cfg(test)]. Correct this reason if a non-test consumer \
+              appears."
+)]
 pub(crate) fn diagnose_once(root: &std::path::Path) -> Result<Vec<verify::Diag>, String> {
-    let emitted = ::utils::compilation::run_compiler_on_path(root, |tcx| {
-        let table = decide_table(tcx)?;
-        let emission = emit_files(tcx, &table, &rustc_hash::FxHashSet::default())?;
-        Ok::<_, String>(emission.files)
-    })
-    .map_err(|_| "input crate did not compile".to_owned())??;
-    let staged = verify::materialize(root, &emitted).map_err(|e| e.to_string())?;
-    Ok(verify::diagnose_crate(staged.root()).diags)
+    // Routes through `rewrite_core` in probe mode rather than calling
+    // `emit_files` itself: a second call site would be a second emission path,
+    // which the one-path scan correctly rejected when this was first written
+    // that way.
+    let outcome = rewrite_core_injected(
+        ::utils::compilation::path_to_input(root),
+        Some(root),
+        MAX_REVERT_ROUNDS,
+        &|_| {},
+        true,
+    );
+    Ok(outcome.into_first_diags())
 }
 
 /// Everything BOTH outcomes carry, built once and filled in one place.
@@ -891,9 +915,31 @@ struct OutcomeFacts {
     unplaceable: Vec<plan::Unplaceable>,
     bisect_probes: usize,
     escalated: Option<String>,
+    /// The FIRST verify's diagnostics, before any revert round. The validation
+    /// transfer compares these against the rendered parser 1:1.
+    first_diags: Vec<verify::Diag>,
     /// Edit owners with no `emitted_sites` entry: they carry edits but are
     /// invisible to span attribution. brotli's divergence class, now counted.
     attribution_blind: usize,
+}
+
+impl RewriteOutcome {
+    /// The first verify's diagnostics, whichever way the run ended.
+    ///
+    /// An accessor rather than a `match` at the call site: the one-filling-site
+    /// scan is textual and cannot tell a construction from a destructuring, so
+    /// every avoidable naming of a variant outside the two constructors is one
+    /// less false positive for a guard that is otherwise exact.
+    #[allow(
+        dead_code,
+        reason = "consumed by `diagnose_once`, itself test-only for now."
+    )]
+    fn into_first_diags(self) -> Vec<verify::Diag> {
+        match self {
+            RewriteOutcome::Emitted { first_diags, .. }
+            | RewriteOutcome::Degraded { first_diags, .. } => first_diags,
+        }
+    }
 }
 
 impl OutcomeFacts {
@@ -914,6 +960,7 @@ impl OutcomeFacts {
             unplaceable: self.unplaceable,
             reverted_count: self.reverted_count,
             attribution_blind: self.attribution_blind,
+            first_diags: self.first_diags,
         }
     }
 
@@ -928,6 +975,7 @@ impl OutcomeFacts {
             bisect_probes: self.bisect_probes,
             reverted_count: self.reverted_count,
             attribution_blind: self.attribution_blind,
+            first_diags: self.first_diags,
         }
     }
 }
