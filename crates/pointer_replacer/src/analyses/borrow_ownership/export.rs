@@ -440,19 +440,45 @@ pub(crate) struct BoExport {
     /// `committed`. `representative`'s own doc names this case: "kept
     /// defensive (e.g. an empty edge)".
     ///
-    /// Owner-less edges are producible by construction, not hypothetically: a
-    /// `Borrower::CallArg` loan gets `issuer: None`
-    /// (`borrow_engine/conflicts.rs`, the `Borrower::CallArg(..) => None`
-    /// arm) and no membership constraint (`borrow_engine/origin_replay.rs`
-    /// skips every non-`Assign` borrower), so no provenance can ever `require`
-    /// it and its requirer list is necessarily empty. `map_edges_to_slots`
-    /// `.map()`s rather than filters, so the empty edge reaches the conflict
-    /// set intact.
+    /// **The `CallArg` constructor does NOT produce one** — corrected
+    /// 2026-08-04, `docs/agents/tasks/2026-08-04-callarg-loan-linkage.md`. This
+    /// doc used to cite it as proof that owner-less edges are "producible by
+    /// construction". The premise holds and the conclusion does not: a
+    /// `Borrower::CallArg` loan does get `issuer: None`
+    /// (`borrow_engine/conflicts.rs`, the `Borrower::CallArg(..) => None` arm)
+    /// and no membership constraint (`borrow_engine/origin_replay.rs` skips
+    /// every non-`Assign` borrower), so its requirer list *would* necessarily
+    /// be empty — but no such edge is ever built. The loan never enters the
+    /// invalid set that `extract_conflict_edges` iterates, so nothing reaches
+    /// `map_edges_to_slots` for it and that function's `.map()`-rather-than-
+    /// filter shape is beside the point for this constructor.
     ///
-    /// What is NOT established is whether such an edge can survive to an
-    /// *accepting* round; no fixture exhibits one (ledger D15). So: empty in
-    /// practice, unproven in general, and a consumer must not assume either
-    /// way.
+    /// Three unrelated mechanisms compose to cover the whole body. A reader
+    /// asking "is this still true?" should re-check exactly these:
+    /// 1. liveness is sampled BEFORE the primary effect
+    ///    (`borrow_engine/loan_liveness.rs`). The loan *is* invalidated at its
+    ///    own call site — the `Operand::Move` argument is a DEEP access and the
+    ///    only self-loan skip is `Assign`-specific — but it is not yet live
+    ///    there;
+    /// 2. its single live point is occupied by a `StorageDead`: a SHALLOW write
+    ///    to a bare local, which cannot reach a `(*temp)` borrow
+    ///    (`borrow_engine/places_conflict.rs`, the Deref-under-Shallow arm);
+    /// 3. MIR's argument lowering mentions the temp exactly four times —
+    ///    StorageLive, Store, Move, StorageDead — with no deref among them.
+    ///
+    /// **That is an emergent conjunction, not an enforced invariant — a reason
+    /// for MORE caution here, not less.** Nothing upholds it deliberately, and
+    /// the three mechanisms are unrelated to one another: sampling liveness
+    /// post-effect instead would make every call-argument loan self-invalidate
+    /// at its own call site. Each conjunct now carries a tripwire
+    /// (`callarg_loan_linkage_tripwire`, branch `callarg-loan-linkage`).
+    ///
+    /// This closes ONE constructor. The others are unexamined — the
+    /// edge-to-slot translation silently drops participants that have no
+    /// registered depth-0 slot, and the guards above are vacuous on *any*
+    /// participant-less edge, however it arose. Whether an owner-less edge can
+    /// survive to an *accepting* round is still not established (ledger D15).
+    /// A consumer must not assume the set is empty.
     ///
     /// **`Option`, not `Vec` — D14.** `None` means the accept point never ran,
     /// so nothing was recorded; `Some(vec![])` means it ran and tolerated no
