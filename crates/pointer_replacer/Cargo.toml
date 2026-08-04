@@ -21,7 +21,6 @@ serde.workspace = true
 [dev-dependencies]
 similar = "2.7.0"
 serde_json.workspace = true
-syn = { version = "2.0.117", features = ["full", "visit"] }
 
 [package.metadata.rust-analyzer]
 rustc_private = true

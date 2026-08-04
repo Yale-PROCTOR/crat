@@ -30,7 +30,6 @@ dependencies = [
  "libc",
  "proc-macro2",
  "quote",
- "syn",
  "unicode-ident",
 ]
 

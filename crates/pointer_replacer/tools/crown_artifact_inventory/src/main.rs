@@ -1,3 +1,7 @@
+#![feature(rustc_private)]
+
+extern crate rustc_driver;
+
 use std::{
     collections::{BTreeMap, BTreeSet},
     env,

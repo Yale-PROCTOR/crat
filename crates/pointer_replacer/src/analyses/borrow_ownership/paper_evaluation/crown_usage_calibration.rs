@@ -36,7 +36,7 @@ use crate::{
 mod artifact_inventory {
     include!(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/tools/crown_artifact_inventory/src/lib.rs"
+        "/tools/crown_artifact_inventory/src/inventory.rs"
     ));
 }
 

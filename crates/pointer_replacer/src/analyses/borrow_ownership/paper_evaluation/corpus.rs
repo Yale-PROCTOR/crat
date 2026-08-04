@@ -253,7 +253,7 @@ mod report {
 mod crown_artifact_walker {
     include!(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/tools/crown_artifact_inventory/src/lib.rs"
+        "/tools/crown_artifact_inventory/src/inventory.rs"
     ));
 }
 
