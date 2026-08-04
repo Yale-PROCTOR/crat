@@ -1034,14 +1034,22 @@ fn each_outcome_variant_has_exactly_one_filling_site() {
 /// extra hand-filled site.
 #[test]
 fn the_outcome_site_scan_reports_a_hand_filled_arm() {
+    // BOTH shapes: a corpus with only one of them leaves the other arm of the
+    // match unwitnessed, and a mutation disabling it survives.
     let dir = temp_corpus(
         "outcome-extra-site",
-        &[(
-            "sneaky.rs",
-            "fn f() {\n    RewriteOutcome::Degraded {\n        reason: r,\n    }\n}\n",
-        )],
+        &[
+            (
+                "sneaky.rs",
+                "fn f() {\n    RewriteOutcome::Degraded {\n        reason: r,\n    }\n}\n",
+            ),
+            (
+                "sneakier.rs",
+                "fn g() {\n    RewriteOutcome::Emitted {\n        source: s,\n    }\n}\n",
+            ),
+        ],
     );
     let hits = outcome_construction_sites(&dir, &|_| false);
-    assert_eq!(hits.len(), 1, "the scan missed a hand-filled arm: {hits:?}");
+    assert_eq!(hits.len(), 2, "the scan missed a hand-filled arm: {hits:?}");
     let _ = fs::remove_dir_all(&dir);
 }
