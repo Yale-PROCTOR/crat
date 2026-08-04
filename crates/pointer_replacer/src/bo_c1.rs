@@ -7116,6 +7116,31 @@ mod run {
     ///
     /// Analysis-free by design: no solver, no BO run. This measures the
     /// collector's predicate and nothing downstream of it.
+    /// **1.4 validation transfer** — one diagnose, both extraction paths live.
+    pub fn run_m1_diag(input: &std::path::Path) -> Row {
+        let t0 = Instant::now();
+        let mut row = Row::default();
+        match crate::bo_rewriter::diagnose_once(input) {
+            Ok(diags) => {
+                for d in &diags {
+                    println!(
+                        "M1DIAG-STRUCT file={} line={} dir={:?}",
+                        d.file, d.line, d.direction
+                    );
+                }
+                row.set("struct_diags", diags.len());
+                row.set("status", "ok");
+            }
+            Err(why) => {
+                row.set("struct_diags", 0usize);
+                row.set("detail", super::report::sanitize(&why));
+                row.set("status", "diag-error");
+            }
+        }
+        row.set("t_total_s", secs(t0.elapsed()));
+        row
+    }
+
     /// **S2b.0 — full M1 pipeline on one program.** decide → plan → apply →
     /// verify, whole-crate gate, temp copies only.
     ///
@@ -8200,6 +8225,93 @@ fn m1_recon_corpus() {
     );
 }
 
+/// **1.4 VALIDATION TRANSFER.** Structural extraction vs the rendered parser, on
+/// the same diagnostics, both paths live for this one run.
+///
+/// Any mismatch is a FINDING and stops the run: the structural path is labelled
+/// FIXTURE-VALIDATED until this passes, and it does not inherit the rendered
+/// parser's 86-diagnostic corpus credit by assertion.
+#[test]
+#[ignore = "1.4 validation transfer: spawns one worker per program"]
+fn m1_diag_transfer() {
+    use std::{fs, time::Duration};
+
+    let root = orchestrate::workspace_root();
+    let timeout = Duration::from_secs(900);
+    let mut mismatches: Vec<String> = Vec::new();
+    let (mut total_struct, mut total_rendered) = (0usize, 0usize);
+
+    for program in CORPUS {
+        let input = program.input_path(&root);
+        let outcome = orchestrate::run_child_env(program.name, &input, "m1-diag", timeout, &[]);
+        let logs = orchestrate::out_dir().join("logs");
+        let out_text = fs::read_to_string(logs.join(format!("{}.m1-diag.out", program.name)))
+            .unwrap_or_default();
+        let err_text = fs::read_to_string(logs.join(format!("{}.m1-diag.err", program.name)))
+            .unwrap_or_default();
+
+        // STRUCTURAL: (crate-relative file, line)
+        let mut structural: Vec<(String, usize)> = out_text
+            .lines()
+            .filter_map(|l| {
+                let rest = l.strip_prefix("M1DIAG-STRUCT file=")?;
+                let (file, rest) = rest.split_once(" line=")?;
+                let (line, _) = rest.split_once(" dir=")?;
+                Some((crate_relative_for_test(file), line.parse().ok()?))
+            })
+            .collect();
+        // RENDERED: the parser validated on 86 corpus diagnostics at S2b.0.
+        let mut rendered: Vec<(String, usize)> = err_text
+            .lines()
+            .filter_map(|l| {
+                let site = l.trim_start().strip_prefix("--> ")?;
+                let mut parts = site.rsplitn(3, ':');
+                let (_c, line, path) = (parts.next()?, parts.next()?, parts.next()?);
+                Some((crate_relative_for_test(path), line.parse().ok()?))
+            })
+            .collect();
+        structural.sort();
+        rendered.sort();
+        total_struct += structural.len();
+        total_rendered += rendered.len();
+        if structural != rendered {
+            mismatches.push(format!(
+                "{}: structural {} vs rendered {}\n    only-structural={:?}\n    only-rendered={:?}",
+                program.name,
+                structural.len(),
+                rendered.len(),
+                structural.iter().filter(|x| !rendered.contains(x)).collect::<Vec<_>>(),
+                rendered.iter().filter(|x| !structural.contains(x)).collect::<Vec<_>>(),
+            ));
+        }
+        println!(
+            "M1DIAG program={} structural={} rendered={} status={}",
+            program.name,
+            structural.len(),
+            rendered.len(),
+            outcome.status
+        );
+    }
+
+    println!("M1DIAG-TOTAL structural={total_struct} rendered={total_rendered}");
+    assert!(
+        mismatches.is_empty(),
+        "the two extraction paths disagree — structural must not inherit the \
+         rendered parser's credit:\n  {}",
+        mismatches.join("\n  ")
+    );
+}
+
+/// Crate-relative form, stripping the temp-copy prefix the verify compile uses.
+fn crate_relative_for_test(path: &str) -> String {
+    if let Some((_, tail)) = path.split_once("crat-verify") {
+        if let Some((_, rest)) = tail.split_once('/') {
+            return rest.to_owned();
+        }
+    }
+    path.rsplit('/').next().unwrap_or(path).to_owned()
+}
+
 /// **S2b.0 — the pinned measurement.** Full M1 pipeline over all 20 programs.
 ///
 /// # Measurement discipline
@@ -8383,6 +8495,13 @@ fn boc1_run_one() {
     {
         z3::set_global_param("smt.random_seed", "0");
         z3::set_global_param("sat.random_seed", "0");
+    }
+
+    if mode == "m1-diag" {
+        let mut row = run::run_m1_diag(Path::new(&input));
+        row.set("program", name.clone());
+        println!("{}", report::to_kv_line(&row));
+        return;
     }
 
     if mode == "m1-emit" {

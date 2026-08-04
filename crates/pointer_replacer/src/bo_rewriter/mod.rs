@@ -849,6 +849,23 @@ fn decide_table<'tcx>(tcx: TyCtxt<'tcx>) -> Result<decision::DecisionTable, Stri
     decide_table_perturbed(tcx, |_| {})
 }
 
+/// **Validation-transfer entry.** One emit, one diagnose, no revert loop.
+///
+/// The loop's `.err` log concatenates every round's compile, so a structural-vs-
+/// rendered comparison cannot be made 1:1 against it. This reproduces S2b.0's
+/// conditions exactly — a single verify of the fully-emitted crate — so the two
+/// extraction paths can be compared on the same diagnostics.
+pub(crate) fn diagnose_once(root: &std::path::Path) -> Result<Vec<verify::Diag>, String> {
+    let emitted = ::utils::compilation::run_compiler_on_path(root, |tcx| {
+        let table = decide_table(tcx)?;
+        let emission = emit_files(tcx, &table, &rustc_hash::FxHashSet::default())?;
+        Ok::<_, String>(emission.files)
+    })
+    .map_err(|_| "input crate did not compile".to_owned())??;
+    let staged = verify::materialize(root, &emitted).map_err(|e| e.to_string())?;
+    Ok(verify::diagnose_crate(staged.root()).diags)
+}
+
 /// Everything BOTH outcomes carry, built once and filled in one place.
 ///
 /// # Why this exists

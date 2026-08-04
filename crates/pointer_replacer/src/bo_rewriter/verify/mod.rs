@@ -249,6 +249,15 @@ struct Capture {
     /// may call it — but deliberately NOT given a witness: no mutation of it
     /// can fail, so a witness would be a manufactured one. Stated control.
     translator: rustc_errors::translation::Translator,
+    /// Forwards to stderr as the default emitter did.
+    ///
+    /// Installing `Capture` REPLACES the session's emitter, so without this the
+    /// rendered diagnostics stop existing — the worker logs go silent and the
+    /// rendered extraction path has nothing to validate against. Both paths must
+    /// be live for the 1.4 validation transfer, and restoring stderr also
+    /// restores the behaviour the corpus logs had before structural capture
+    /// landed.
+    inner: rustc_errors::emitter::HumanEmitter,
 }
 
 impl rustc_errors::emitter::Emitter for Capture {
@@ -301,6 +310,8 @@ impl rustc_errors::emitter::Emitter for Capture {
                 direction,
             });
         }
+        // Forward LAST: extraction borrows, rendering consumes.
+        self.inner.emit_diagnostic(diag, _registry);
     }
 }
 
@@ -314,12 +325,18 @@ pub(crate) fn diagnose_crate(root: &Path) -> Diagnosis {
     let (d, e, u) = (diags.clone(), errors.clone(), unrenderable.clone());
     config.psess_created = Some(Box::new(move |psess| {
         let source_map = psess.clone_source_map();
+        let source_map2 = psess.clone_source_map();
         psess.dcx().set_emitter(Box::new(Capture {
             diags: d.clone(),
             errors: e.clone(),
             unrenderable: u.clone(),
             source_map,
             translator: rustc_driver::default_translator(),
+            inner: rustc_errors::emitter::HumanEmitter::new(
+                rustc_errors::emitter::stderr_destination(rustc_errors::ColorConfig::Never),
+                rustc_driver::default_translator(),
+            )
+            .sm(Some(source_map2)),
         }));
     }));
 
