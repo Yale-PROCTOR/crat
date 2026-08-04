@@ -962,3 +962,86 @@ fn the_emission_path_scan_does_not_stop_at_a_test_module_declaration() {
     );
     let _ = fs::remove_dir_all(&dir);
 }
+
+// ---------------------------------------------------------------------------
+// S2b.1 F3 — ONE FILLING SITE PER OUTCOME VARIANT.
+//
+// The outcome variants were hand-filled at seven sites, and twice a `Degraded`
+// arm hardcoded a field to `0` that had a real value: `emitted_count` at S2b.0
+// (which blocked the span-bucket axis outright), then `reverted_count` while
+// repairing that. Two instances of one shape is a pattern; this prevents the
+// third structurally rather than by a third patch.
+// ---------------------------------------------------------------------------
+
+/// Production lines that construct a `RewriteOutcome` variant directly.
+fn outcome_construction_sites(root: &Path, skip: &dyn Fn(&Path) -> bool) -> Vec<String> {
+    let mut files = Vec::new();
+    collect_rs_files(root, &mut files);
+    assert!(!files.is_empty(), "no .rs files under {root:?}");
+    let mut hits = Vec::new();
+    let mut scanned = 0usize;
+    for file in &files {
+        if skip(file) {
+            continue;
+        }
+        scanned += 1;
+        let text = fs::read_to_string(file)
+            .unwrap_or_else(|e| panic!("source unreadable at {file:?}: {e}"));
+        let lines: Vec<&str> = text.lines().collect();
+        for (index, line) in lines.iter().enumerate() {
+            let is_test_block = line.trim() == "#[cfg(test)]"
+                && lines
+                    .get(index + 1)
+                    .is_some_and(|next| next.contains("mod ") && next.trim_end().ends_with('{'));
+            if is_test_block {
+                break;
+            }
+            if is_comment(line) {
+                continue;
+            }
+            if line.contains("RewriteOutcome::Emitted {")
+                || line.contains("RewriteOutcome::Degraded {")
+            {
+                hits.push(format!(
+                    "{}:{}: {}",
+                    file.strip_prefix(root).unwrap_or(file).display(),
+                    index + 1,
+                    line.trim()
+                ));
+            }
+        }
+    }
+    assert!(scanned > 0, "every file under {root:?} was skipped");
+    hits
+}
+
+/// **Production check.** Exactly two construction sites — the two constructors
+/// on `OutcomeFacts`. Any third is an arm that can omit a field.
+#[test]
+fn each_outcome_variant_has_exactly_one_filling_site() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/bo_rewriter");
+    let hits = outcome_construction_sites(&root, &is_test_only_file);
+    assert_eq!(
+        hits.len(),
+        2,
+        "expected exactly the two `OutcomeFacts` constructors; a hand-filled \
+         site can omit a field, which has already zeroed a real value twice:\n  {}",
+        hits.join("\n  ")
+    );
+}
+
+/// **Witness — the scan can fail.** Same function, synthetic corpus with an
+/// extra hand-filled site.
+#[test]
+fn the_outcome_site_scan_reports_a_hand_filled_arm() {
+    let dir = temp_corpus(
+        "outcome-extra-site",
+        &[(
+            "sneaky.rs",
+            "fn f() {\n    RewriteOutcome::Degraded {\n        reason: r,\n    }\n}\n",
+        )],
+    );
+    let hits = outcome_construction_sites(&dir, &|_| false);
+    assert_eq!(hits.len(), 1, "the scan missed a hand-filled arm: {hits:?}");
+    let _ = fs::remove_dir_all(&dir);
+}

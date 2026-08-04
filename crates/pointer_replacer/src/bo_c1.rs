@@ -7129,70 +7129,78 @@ mod run {
         let mut row = Row::default();
         let outcome = rewrite_m1_path(input);
         row.set("t_total_s", secs(t0.elapsed()));
-        match outcome {
+
+        // ONE filling site, reading the outcome uniformly. The previous shape
+        // matched on the variant and hand-filled each arm, which zeroed a real
+        // value twice — `emitted` at S2b.0 and then `reverted` while repairing
+        // it. Fields that exist on both arms are read once, before the branch.
+        let (emitted, degraded, files_touched, reverted, blind, probes) = match &outcome {
             RewriteOutcome::Emitted {
-                files,
-                degradations,
                 emitted_count,
-                unplaceable,
+                degradations,
+                files,
+                reverted_count,
+                attribution_blind,
                 bisect_probes,
+                ..
+            } => (
+                *emitted_count,
+                degradations.len(),
+                files.len(),
+                *reverted_count,
+                *attribution_blind,
+                *bisect_probes,
+            ),
+            RewriteOutcome::Degraded {
+                emitted_count,
+                degradations,
+                files_touched,
+                reverted_count,
+                attribution_blind,
+                bisect_probes,
+                ..
+            } => (
+                *emitted_count,
+                degradations.len(),
+                *files_touched,
+                *reverted_count,
+                *attribution_blind,
+                *bisect_probes,
+            ),
+        };
+        row.set("emitted", emitted);
+        row.set("degraded", degraded);
+        row.set("files_touched", files_touched);
+        row.set("reverted", reverted);
+        row.set("attribution_blind", blind);
+        row.set("bisect_probes", probes);
+
+        match &outcome {
+            RewriteOutcome::Emitted {
+                unplaceable,
                 escalated,
                 ..
             } => {
                 row.set("verdict", "PASS");
-                row.set("bisect_probes", bisect_probes);
+                row.set("unplaceable", unplaceable.len());
                 row.set(
                     "escalated",
-                    match &escalated {
+                    match escalated.as_deref() {
                         Some(why) if why.contains("no progress") => "detector",
                         Some(why) if why.contains("round cap") => "round-cap",
                         Some(_) => "other",
                         None => "no",
                     },
                 );
-                row.set(
-                    "reverted",
-                    degradations
-                        .iter()
-                        .filter(|d| {
-                            d.reason
-                                == crate::bo_rewriter::decision::DegradeReason::RevertedAfterVerifyFailure
-                        })
-                        .count(),
-                );
-                row.set("emitted", emitted_count);
-                row.set("degraded", degradations.len());
-                row.set("files_touched", files.len());
-                row.set("unplaceable", unplaceable.len());
                 row.set("status", "ok");
             }
-            RewriteOutcome::Degraded {
-                reason,
-                degradations,
-                emitted_count,
-                files_touched,
-                emitted_sites,
-                bisect_probes,
-                ..
-            } => {
-                row.set("bisect_probes", bisect_probes);
-                row.set("escalated", "failed");
-                row.set("reverted", 0usize);
-                // A gate failure is DATA, not an error to repair mid-run — and
-                // what the run ATTEMPTED is reported, never zeroed.
+            RewriteOutcome::Degraded { reason, .. } => {
+                // A gate failure is DATA, not an error to repair mid-run.
                 row.set("verdict", "FAIL");
-                row.set("emitted", emitted_count);
-                row.set("degraded", degradations.len());
-                row.set("files_touched", files_touched);
                 row.set("unplaceable", 0usize);
-                row.set("detail", super::report::sanitize(&reason));
+                row.set("escalated", "failed");
+                row.set("detail", super::report::sanitize(reason));
                 row.set("status", "gate-fail");
-                for site in &emitted_sites {
-                    println!(
-                        "M1EMIT-SITE file={} lo={} hi={} fn={}",
-                        site.file, site.lo_line, site.hi_line, site.fn_path
-                    );
-                }
             }
         }
         row

@@ -114,6 +114,10 @@ pub(crate) enum RewriteOutcome {
         /// still a crate whose attribution was wrong — collapsing that into a
         /// plain success would hide the very case (C) exists for.
         escalated: Option<String>,
+        /// Subjects the verify loop took back.
+        reverted_count: usize,
+        /// Edit owners invisible to span attribution.
+        attribution_blind: usize,
         /// Decisions that could not be turned into a placed edit — a
         /// macro-generated span, a span straddling two files, a file with no
         /// editable identity. Carried out for the same reason as `excluded`:
@@ -137,6 +141,11 @@ pub(crate) enum RewriteOutcome {
         emitted_sites: Vec<EmittedSite>,
         /// Bisect probes spent before giving up.
         bisect_probes: usize,
+        /// Subjects the verify loop took back. **Measured, never zeroed** — the
+        /// defect this structure exists to prevent.
+        reverted_count: usize,
+        /// Edit owners invisible to span attribution.
+        attribution_blind: usize,
     },
 }
 
@@ -394,6 +403,30 @@ fn rewrite_core_injected(
             emitted_sites,
             emitted_subjects,
         ))) => {
+            // Built ONCE. Every return below goes through `facts.emitted(..)`
+            // or `facts.degraded(..)`; no site hand-fills a field.
+            let site_owners: std::collections::BTreeSet<&str> =
+                emitted_sites.iter().map(|s| s.fn_path.as_str()).collect();
+            let attribution_blind = emission_plan
+                .by_file
+                .values()
+                .flatten()
+                .map(|edit| edit.owner_fn.as_str())
+                .collect::<std::collections::BTreeSet<_>>()
+                .difference(&site_owners)
+                .count();
+            let mut facts = OutcomeFacts {
+                degradations,
+                excluded,
+                emitted_count,
+                files_touched: files.len(),
+                reverted_count: 0,
+                emitted_sites,
+                unplaceable,
+                bisect_probes: 0,
+                escalated: None,
+                attribution_blind,
+            };
             let crate_dir = tree_base.and_then(|root| root.parent()).map(|d| d.to_path_buf());
             let mut reverted: std::collections::BTreeSet<String> =
                 std::collections::BTreeSet::new();
@@ -411,24 +444,16 @@ fn rewrite_core_injected(
                 let staged = match materialized {
                     Ok(staged) => staged,
                     Err(err) => {
-                        return RewriteOutcome::Degraded {
-                            reason: format!("could not materialize the emitted crate: {err}"),
-                            degradations,
-                            excluded,
-                            emitted_count,
-                            files_touched: files.len(),
-                            emitted_sites,
-                            bisect_probes: 0,
-                        };
+                        facts.files_touched = files.len();
+                        facts.reverted_count = reverted.len();
+                        return facts
+                            .degraded(format!("could not materialize the emitted crate: {err}"));
                     }
                 };
                 let probe_started = std::time::Instant::now();
                 let diagnosis = verify::diagnose_crate(staged.root());
                 probe_secs = probe_secs.max(probe_started.elapsed().as_secs_f64());
                 if diagnosis.errors == 0 {
-                    escalation = None;
-                    // Read back from the MATERIALIZED copy, so the bytes
-                    // returned are the bytes the gate just accepted.
                     let source = std::fs::read_to_string(staged.root()).unwrap_or_default();
                     let (kept, taken): (Vec<_>, Vec<_>) = emitted_subjects
                         .iter()
@@ -436,26 +461,17 @@ fn rewrite_core_injected(
                     // ACCOUNTING: a reverted subject moves from emitted to
                     // degraded under its OWN reason key, so
                     // `emitted_final + degraded == row count` survives the loop.
-                    let mut degradations = degradations;
                     for (_, subject, site) in &taken {
-                        degradations.push(decision::Degradation {
+                        facts.degradations.push(decision::Degradation {
                             subject: subject.clone(),
                             site: site.clone(),
                             reason: decision::DegradeReason::RevertedAfterVerifyFailure,
                         });
                     }
-                    let _ = &escalation;
-                    return RewriteOutcome::Emitted {
-                        source,
-                        files,
-                        degradations,
-                        emitted_count: kept.len(),
-                        excluded,
-                        emitted_sites,
-                        bisect_probes: 0,
-                        escalated: None,
-                        unplaceable,
-                    };
+                    facts.emitted_count = kept.len();
+                    facts.reverted_count = taken.len();
+                    facts.files_touched = files.len();
+                    return facts.emitted(source, files);
                 }
 
                 // DUAL TERMINATION, both arms. Neither alone: a no-progress
@@ -483,7 +499,7 @@ fn rewrite_core_injected(
                     break;
                 }
 
-                let newly = attribute(&diagnosis.diags, &emitted_sites, crate_dir.as_deref())
+                let newly = attribute(&diagnosis.diags, &facts.emitted_sites, crate_dir.as_deref())
                     .difference(&reverted)
                     .cloned()
                     .collect::<std::collections::BTreeSet<_>>();
@@ -511,9 +527,22 @@ fn rewrite_core_injected(
 
             // ---- (C) BISECT: the escalation path ----
             let escalation = escalation.unwrap_or_else(|| "escalation-required".to_owned());
-            let candidates: Vec<String> = emitted_sites
-                .iter()
-                .map(|site| site.fn_path.clone())
+            // Candidates come from the PLAN's `owner_fn` domain — the exact key
+            // `render` filters on — so `base ∪ candidates` drops EVERY edit and
+            // the base case (revert-all compiles) holds BY CONSTRUCTION.
+            //
+            // They were previously derived from `emitted_sites`, a DIFFERENT
+            // derivation: it skips a subject whose enclosing function's span has
+            // no editable file identity, while the edit is keyed on the
+            // subject's own `ty_span`. brotli found the divergence (2026-07-31):
+            // reverting every candidate left edits standing, the crate still
+            // failed, and bisect returned a non-compiling set. Two derivations
+            // assumed identical — the founding class.
+            let candidates: Vec<String> = emission_plan
+                .by_file
+                .values()
+                .flatten()
+                .map(|edit| edit.owner_fn.clone())
                 .filter(|owner| !reverted.contains(owner))
                 .collect::<std::collections::BTreeSet<_>>()
                 .into_iter()
@@ -529,18 +558,13 @@ fn rewrite_core_injected(
                 .and_then(|v| v.parse::<f64>().ok())
                 .unwrap_or(900.0);
             if projected * probe_secs > budget_secs {
-                return RewriteOutcome::Degraded {
-                    reason: format!(
-                        "escalation-deferred: {escalation}; bisect needs ~{projected} probe(s)                          at ~{probe_secs:.1}s each against a {budget_secs:.0}s budget, with                          {} function(s) already reverted",
-                        reverted.len()
-                    ),
-                    degradations,
-                    excluded,
-                    emitted_count,
-                    files_touched: files.len(),
-                    emitted_sites,
-                    bisect_probes: 0,
-                };
+                facts.files_touched = files.len();
+                facts.reverted_count = reverted.len();
+                facts.escalated = Some(escalation.clone());
+                return facts.degraded(format!(
+                    "escalation-deferred: {escalation}; bisect needs ~{projected} probe(s)                          at ~{probe_secs:.1}s each against a {budget_secs:.0}s budget, with                          {} function(s) already reverted",
+                    reverted.len()
+                ));
             }
 
             let (final_reverted, probes) = bisect(&candidates, &reverted, |trial| {
@@ -564,7 +588,7 @@ fn rewrite_core_injected(
                 Some(root) => verify::materialize(root, &final_files),
                 None => verify::materialize_single_file(&root_text),
             };
-            // STATED CONTROL — defense in depth over an UNREACHABLE case.
+            // INCIDENT-PROVEN DEFENSE — not a control over an unreachable case.
             //
             // `type_checks_crate` here can never be the thing that fails:
             // `bisect` only ever assigns `hi` a `mid` it just tested true, so
@@ -579,65 +603,51 @@ fn rewrite_core_injected(
             // edits cannot create an overlap, an out-of-bounds range, or a
             // char-boundary violation.
             //
-            // Kept anyway, and deliberately NOT given a witness: a mutation
-            // removing either arm survives because the case is unreachable, and
-            // a fixture forcing it would be manufacturing a shape the search's
-            // own invariant excludes.
+            // **This guard FIRED on brotli, 2026-07-31**, when `candidates` was
+            // derived from `emitted_sites` rather than from the plan's
+            // `owner_fn` domain: the two sets diverged, revert-all left edits
+            // standing, and bisect returned a set that did not compile. The
+            // derivation is fixed above; the guard stays because it is what
+            // turned a silently wrong emission into a loud `Degraded`.
+            //
+            // The `rollbacks` arm remains unreachable (a SUBSET of edits that
+            // produced no rollbacks cannot produce new ones); the reachable
+            // rollback path is the pre-loop structural gate, witnessed there.
             match materialized {
                 Ok(staged) if rollbacks.is_empty() && verify::type_checks_crate(staged.root()) => {
                     let source = std::fs::read_to_string(staged.root()).unwrap_or_default();
                     let (kept, taken): (Vec<_>, Vec<_>) = emitted_subjects
                         .iter()
                         .partition(|(owner, _, _)| !final_reverted.contains(owner));
-                    let mut degradations = degradations;
                     for (_, subject, site) in &taken {
-                        degradations.push(decision::Degradation {
+                        facts.degradations.push(decision::Degradation {
                             subject: subject.clone(),
                             site: site.clone(),
                             reason: decision::DegradeReason::RevertedAfterVerifyFailure,
                         });
                     }
-                    RewriteOutcome::Emitted {
-                        source,
-                        files: final_files,
-                        degradations,
-                        emitted_count: kept.len(),
-                        excluded,
-                        emitted_sites,
-                        bisect_probes: probes,
-                        escalated: Some(escalation.clone()),
-                        unplaceable,
-                    }
+                    facts.emitted_count = kept.len();
+                    facts.reverted_count = taken.len();
+                    facts.files_touched = final_files.len();
+                    facts.bisect_probes = probes;
+                    facts.escalated = Some(escalation);
+                    facts.emitted(source, final_files)
                 }
-                _ => RewriteOutcome::Degraded {
-                    reason: format!("{escalation}; bisect did not recover the crate"),
-                    degradations,
-                    excluded,
-                    emitted_count,
-                    files_touched: files.len(),
-                    emitted_sites,
-                    bisect_probes: probes,
-                },
+                _ => {
+                    facts.files_touched = files.len();
+                    facts.reverted_count = final_reverted.len();
+                    facts.bisect_probes = probes;
+                    facts.escalated = Some(escalation.clone());
+                    facts.degraded(format!("{escalation}; bisect did not recover the crate"))
+                }
             }
         }
-        Ok(Err(reason)) => RewriteOutcome::Degraded {
-            reason,
-            degradations: Vec::new(),
-            excluded: decision::universe::Excluded::default(),
-            emitted_count: 0,
-            files_touched: 0,
-            emitted_sites: Vec::new(),
-            bisect_probes: 0,
-        },
-        Err(_) => RewriteOutcome::Degraded {
-            reason: "input crate did not compile".to_owned(),
-            degradations: Vec::new(),
-            excluded: decision::universe::Excluded::default(),
-            emitted_count: 0,
-            files_touched: 0,
-            emitted_sites: Vec::new(),
-            bisect_probes: 0,
-        },
+        // Nothing was decided, so the facts are genuinely empty here — the one
+        // place a zero is the measurement rather than an omission.
+        Ok(Err(reason)) => OutcomeFacts::default().degraded(reason),
+        Err(_) => {
+            OutcomeFacts::default().degraded("input crate did not compile".to_owned())
+        }
     }
 }
 
@@ -837,6 +847,72 @@ fn param_name(param: &rustc_hir::Param<'_>) -> Option<String> {
 /// module**. `bo_rewriter` emits; `coverage_recon` compares.
 fn decide_table<'tcx>(tcx: TyCtxt<'tcx>) -> Result<decision::DecisionTable, String> {
     decide_table_perturbed(tcx, |_| {})
+}
+
+/// Everything BOTH outcomes carry, built once and filled in one place.
+///
+/// # Why this exists
+///
+/// The outcome variants used to be hand-filled at seven construction sites, and
+/// twice a `Degraded` arm hardcoded a field to `0` that had a real value —
+/// S2b.0's `emitted_count` (which blocked the span-bucket axis outright) and
+/// then `reverted_count`, introduced while repairing the first. Two instances of
+/// one shape is a pattern; the third is prevented STRUCTURALLY rather than by
+/// another patch. Every field is filled here, once, and the constructors below
+/// are the only places the variants may be built — enforced by a scan.
+#[derive(Clone, Debug, Default)]
+struct OutcomeFacts {
+    degradations: Vec<decision::Degradation>,
+    excluded: decision::universe::Excluded,
+    /// Subjects still emitted. **Observability of the ATTEMPT** on a failure —
+    /// a crate that fails the gate still rewrote subjects; that is usually why.
+    emitted_count: usize,
+    files_touched: usize,
+    /// Subjects the verify loop took back. Measured on BOTH arms.
+    reverted_count: usize,
+    emitted_sites: Vec<EmittedSite>,
+    unplaceable: Vec<plan::Unplaceable>,
+    bisect_probes: usize,
+    escalated: Option<String>,
+    /// Edit owners with no `emitted_sites` entry: they carry edits but are
+    /// invisible to span attribution. brotli's divergence class, now counted.
+    attribution_blind: usize,
+}
+
+impl OutcomeFacts {
+    fn emitted(
+        self,
+        source: String,
+        files: std::collections::BTreeMap<plan::FileKey, String>,
+    ) -> RewriteOutcome {
+        RewriteOutcome::Emitted {
+            source,
+            files,
+            degradations: self.degradations,
+            emitted_count: self.emitted_count,
+            excluded: self.excluded,
+            emitted_sites: self.emitted_sites,
+            bisect_probes: self.bisect_probes,
+            escalated: self.escalated,
+            unplaceable: self.unplaceable,
+            reverted_count: self.reverted_count,
+            attribution_blind: self.attribution_blind,
+        }
+    }
+
+    fn degraded(self, reason: String) -> RewriteOutcome {
+        RewriteOutcome::Degraded {
+            reason,
+            degradations: self.degradations,
+            excluded: self.excluded,
+            emitted_count: self.emitted_count,
+            files_touched: self.files_touched,
+            emitted_sites: self.emitted_sites,
+            bisect_probes: self.bisect_probes,
+            reverted_count: self.reverted_count,
+            attribution_blind: self.attribution_blind,
+        }
+    }
 }
 
 /// Hard ceiling on revert rounds. Paired with the no-progress detector, never

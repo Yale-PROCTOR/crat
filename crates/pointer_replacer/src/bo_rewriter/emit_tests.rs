@@ -760,3 +760,50 @@ fn an_incoherent_plan_is_rejected_before_the_loop() {
         }
     }
 }
+
+/// **S2b.1 F3 — a FAILING outcome carries what the run attempted.**
+///
+/// Both outcome variants are built at exactly one site each (enforced by
+/// `each_outcome_variant_has_exactly_one_filling_site`), so this witnesses the
+/// field at the site every `Degraded` flows through.
+///
+/// **Why not an end-to-end brotli-shaped fixture.** brotli's `Degraded` arose
+/// because bisect returned a non-compiling set — the F2 defect. With candidates
+/// derived from the plan's `owner_fn` domain the base case holds by
+/// construction, so that shape should no longer be reachable; the remaining
+/// `Degraded`-with-reverted paths are the budget deferral and a materialize IO
+/// error, neither constructible in a unit test without an env knob or an
+/// injected filesystem failure. Witnessing the filling site is the honest
+/// substitute, and the corpus re-run is what checks the shape is gone.
+///
+/// *Mutation-tested, Rider 0 order.* **Deletion first:** re-zero
+/// `reverted_count` in `OutcomeFacts::degraded` and this fails.
+#[test]
+fn a_failing_outcome_carries_its_reverted_count() {
+    let facts = super::OutcomeFacts {
+        emitted_count: 7,
+        reverted_count: 3,
+        files_touched: 2,
+        attribution_blind: 1,
+        ..Default::default()
+    };
+    match facts.degraded("escalation-deferred: budget".to_owned()) {
+        super::RewriteOutcome::Degraded {
+            emitted_count,
+            reverted_count,
+            files_touched,
+            attribution_blind,
+            ..
+        } => {
+            assert_eq!(
+                reverted_count, 3,
+                "a failing outcome zeroed its revert count — the defect this \
+                 structure exists to prevent, twice over"
+            );
+            assert_eq!(emitted_count, 7, "the ATTEMPT must survive the failure");
+            assert_eq!(files_touched, 2);
+            assert_eq!(attribution_blind, 1);
+        }
+        super::RewriteOutcome::Emitted { .. } => panic!("degraded() built an Emitted"),
+    }
+}
