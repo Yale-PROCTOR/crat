@@ -530,6 +530,10 @@ thread_local! {
 /// correct without restructuring the region into a closure.
 pub(crate) struct CaptureArm {
     prev: Option<BoExport>,
+    /// The enclosing scope's non-`Send` model-evaluation snapshot. This lives
+    /// beside, rather than inside, `BoExport`, but follows the same nesting
+    /// boundary.
+    prev_version_asts: Option<IndexVec<Var, Bool>>,
     /// `false` when `CRAT_BO_EXPORT` is off: the arm installed nothing and must
     /// therefore restore nothing, or it would clobber an enclosing scope.
     armed: bool,
@@ -541,8 +545,7 @@ impl Drop for CaptureArm {
             return;
         }
         BO_EXPORT_CAPTURE.with(|c| *c.borrow_mut() = self.prev.take());
-        // Non-`Send` scaffolding must not outlive the scope.
-        VERSION_ASTS.with(|c| *c.borrow_mut() = None);
+        VERSION_ASTS.with(|c| *c.borrow_mut() = self.prev_version_asts.take());
     }
 }
 
@@ -587,6 +590,7 @@ pub(crate) fn arm_capture() -> CaptureArm {
     if !flag_enabled() {
         return CaptureArm {
             prev: None,
+            prev_version_asts: None,
             armed: false,
         };
     }
@@ -603,8 +607,12 @@ pub(crate) fn arm_capture() -> CaptureArm {
 /// always, by default).
 pub(crate) fn arm_scope() -> CaptureArm {
     let prev = BO_EXPORT_CAPTURE.with(|c| c.replace(Some(BoExport::default())));
-    VERSION_ASTS.with(|c| *c.borrow_mut() = None);
-    CaptureArm { prev, armed: true }
+    let prev_version_asts = VERSION_ASTS.with(|c| c.replace(None));
+    CaptureArm {
+        prev,
+        prev_version_asts,
+        armed: true,
+    }
 }
 
 /// Run `f` with export capture active, returning its result and the recording.

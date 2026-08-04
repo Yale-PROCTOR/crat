@@ -179,6 +179,70 @@ fn export_scope_restores_on_unwind() {
     assert!(!capturing(), "capture leaked after an unwinding scope");
 }
 
+fn one_version_ast() -> IndexVec<Var, Bool> {
+    let mut asts = IndexVec::new();
+    asts.push(Bool::from_bool(true));
+    asts
+}
+
+fn evaluate_one_version_ast(asts: &IndexVec<Var, Bool>) -> IndexVec<Var, bool> {
+    assert_eq!(asts.len(), 1, "outer AST snapshot changed length");
+    assert_eq!(
+        asts[Var::from_u32(0)].as_bool(),
+        Some(true),
+        "outer AST snapshot changed value"
+    );
+    let mut owns = IndexVec::new();
+    owns.push(true);
+    owns
+}
+
+/// A nested scope must restore the outer scope's non-`Send` AST snapshot on
+/// normal return, not only its `BoExport` recording.
+#[test]
+fn nested_export_scope_restores_outer_version_asts() {
+    let (_, outer) = with_bo_export(|| {
+        let asts = one_version_ast();
+        record_version_asts(&asts);
+
+        let (_, inner) = with_bo_export(|| {});
+        assert!(
+            inner.version_owns.is_none(),
+            "the inner scope must start without the outer AST snapshot"
+        );
+
+        record_version_owns_from(evaluate_one_version_ast);
+    });
+
+    assert_eq!(
+        outer.version_owns,
+        Some(IndexVec::from_elem_n(true, 1)),
+        "the inner scope discarded the outer AST snapshot"
+    );
+}
+
+/// The same outer AST snapshot must be restored when the nested scope unwinds.
+#[test]
+fn unwinding_nested_export_scope_restores_outer_version_asts() {
+    let (_, outer) = with_bo_export(|| {
+        let asts = one_version_ast();
+        record_version_asts(&asts);
+
+        let unwind = std::panic::catch_unwind(|| {
+            with_bo_export(|| panic!("nested boom"));
+        });
+        assert!(unwind.is_err(), "nested scope unexpectedly returned");
+
+        record_version_owns_from(evaluate_one_version_ast);
+    });
+
+    assert_eq!(
+        outer.version_owns,
+        Some(IndexVec::from_elem_n(true, 1)),
+        "the unwinding inner scope discarded the outer AST snapshot"
+    );
+}
+
 /// RED 3 — capture must not perturb the analysis.
 ///
 /// The spec's full gate is corpus-scale (`export-on == export-off` on every
