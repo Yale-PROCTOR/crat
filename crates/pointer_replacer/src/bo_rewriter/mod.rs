@@ -166,6 +166,24 @@ pub(crate) enum RewriteOutcome {
         baseline_keys: usize,
         baseline_errors: usize,
         baseline_msg_env: usize,
+        /// Decisions that could not be turned into a placed edit. **Measured,
+        /// never zeroed** — carried here for exactly the reason `emitted_count`
+        /// and `reverted_count` above are.
+        ///
+        /// This is the THIRD instance of the shape those two document, and it
+        /// survived the structure built to prevent a third: [`OutcomeFacts`]
+        /// stopped any site from *hand-filling* a field, but `degraded()` could
+        /// still DROP one, because the variant had nowhere to put it. A
+        /// one-filling-site rule constrains how a field is written and says
+        /// nothing about whether it is written at all.
+        ///
+        /// The reported zero was a constant on every FAIL row from `fb82552e`
+        /// until S2b.3, which made two S2b.0 claims — `unplaceable` "sound on
+        /// every row" and "0 on all 20" — hold over 10 programs rather than 20.
+        /// A pin on the constant would have been unfailable precisely where it
+        /// matters, so this is the precondition for S2b.3's `unplaceable == 0`
+        /// gate rather than a tidy-up.
+        unplaceable: Vec<plan::Unplaceable>,
     },
 }
 
@@ -1147,6 +1165,7 @@ impl OutcomeFacts {
             files_touched: self.files_touched,
             emitted_sites: self.emitted_sites,
             bisect_probes: self.bisect_probes,
+            unplaceable: self.unplaceable,
             reverted_count: self.reverted_count,
             attribution_blind: self.attribution_blind,
             first_diags: self.first_diags,

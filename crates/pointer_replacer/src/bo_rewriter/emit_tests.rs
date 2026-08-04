@@ -1242,3 +1242,71 @@ fn a_nested_crate_masks_its_baseline_and_still_emits() {
         ),
     }
 }
+
+/// **S2b.3 Item 0 — `unplaceable` SURVIVES A `Degraded` OUTCOME.**
+///
+/// Two pre-existing facts, which until S2b.3 could not both be observed: a
+/// macro-generated declaration has no spliceable range and is recorded as
+/// `Unplaceable`, and probe mode returns `Degraded` before the gate. The second
+/// discarded the first — `RewriteOutcome::Degraded` had no field to carry it,
+/// so `OutcomeFacts::degraded` dropped it and `run_m1_emit`'s FAIL arm wrote a
+/// literal `0usize` in its place.
+///
+/// The fixture is the one from
+/// `a_macro_generated_declaration_is_recorded_as_unplaceable`, but driven
+/// through the **full pipeline** rather than `emit_files` alone. That
+/// reachability was checked before this witness was written, per the ruling that
+/// a fixture which does not produce a nonzero count through the shipping
+/// pipeline is a finding to report and not a fixture to force.
+///
+/// The `> 0` assertion is a NON-VACUITY guard, not decoration: a zero would mean
+/// the fixture had stopped producing an `Unplaceable` at all, at which point the
+/// equality below would hold for the wrong reason.
+///
+/// *Mutation-tested, Rider 0 order.* **Deletion first:** remove
+/// `unplaceable: self.unplaceable` from `OutcomeFacts::degraded` — the variant
+/// then has an unfilled field and the BUILD fails, which is the strongest form
+/// this witness can take. Deletion cannot produce a running-but-wrong binary
+/// here, so the semantically faithful mutation follows it: `Vec::new()` in that
+/// same position restores the original defect exactly, and this test fails on
+/// the count.
+#[test]
+fn a_degraded_outcome_still_reports_its_unplaceable_decisions() {
+    let fixture = Fixture::new(&[(
+        "lib.rs",
+        "#![allow(dead_code, unused_unsafe)]\nmacro_rules! mk {\n    () => {\n        pub unsafe fn mac_bump(p: *mut i32) -> i32 {\n            *p += 1;\n            *p\n        }\n    };\n}\nmk!();\n",
+    )]);
+
+    // The reference value, from the phase that produces it.
+    let planned = emit(&fixture).unplaceable;
+    assert!(
+        !planned.is_empty(),
+        "the fixture no longer yields an Unplaceable, so this witness would \
+         pass on a zero == zero comparison"
+    );
+
+    let probe = super::rewrite_core_injected(
+        ::utils::compilation::path_to_input(&fixture.root()),
+        Some(&fixture.root()),
+        super::MAX_REVERT_ROUNDS,
+        &|_| {},
+        true,
+    );
+    match probe {
+        super::RewriteOutcome::Degraded { unplaceable, .. } => {
+            assert_eq!(
+                unplaceable.len(),
+                planned.len(),
+                "the Degraded arm lost the plan's unplaceable decisions — the \
+                 shape that made every FAIL row's count a constant"
+            );
+            assert_eq!(
+                unplaceable[0].reason, planned[0].reason,
+                "the count survived but the attribution did not"
+            );
+        }
+        super::RewriteOutcome::Emitted { .. } => {
+            panic!("probe mode returns before emission and cannot report Emitted")
+        }
+    }
+}

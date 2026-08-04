@@ -7249,10 +7249,13 @@ mod run {
                 );
                 row.set("status", "ok");
             }
-            RewriteOutcome::Degraded { reason, .. } => {
+            RewriteOutcome::Degraded { reason, unplaceable, .. } => {
                 // A gate failure is DATA, not an error to repair mid-run.
                 row.set("verdict", "FAIL");
-                row.set("unplaceable", 0usize);
+                // READ, not written as `0usize`. The constant here made every
+                // FAIL row's `unplaceable` a claim about nothing, and S2b.3's
+                // pin would have inherited it.
+                row.set("unplaceable", unplaceable.len());
                 row.set("escalated", "failed");
                 row.set("detail", super::report::sanitize(reason));
                 row.set("status", "gate-fail");
