@@ -29,7 +29,11 @@ impl Fixture {
         ));
         fs::create_dir_all(&dir).expect("create emission fixture directory");
         for (name, text) in files {
-            fs::write(dir.join(name), text).expect("write emission fixture file");
+            let path = dir.join(name);
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent).expect("create fixture subdirectory");
+            }
+            fs::write(path, text).expect("write emission fixture file");
         }
         Self(dir)
     }
@@ -1018,4 +1022,59 @@ fn a_path_outside_the_crate_root_keys_as_itself() {
         verify::crate_relative("/p/b/x.rs", root),
         "distinct files collapsed to one key"
     );
+}
+
+/// **F.2 — the differential gate, END-TO-END on a NESTED crate.**
+///
+/// **Rider 7 branch: UNDER-ROOT — the branch the corpus takes.** The subject
+/// lives at `deep/inner.rs`, two components below the crate root, so no basename
+/// accident can make the two sides agree: the flat fixture keyed `m.rs` on both
+/// sides even while the canonicalizer was broken, which is exactly how the
+/// corpus defect survived its own witness.
+///
+/// The baseline dirt is `invalid_reference_casting` — brotli's real class,
+/// deny-by-default at verify and harmless to the decision phase.
+///
+/// *Mutation-tested, Rider 0 order.* **Deletion first:** gate on the absolute
+/// count instead of the differential and this fails.
+#[test]
+fn a_nested_crate_masks_its_baseline_and_still_emits() {
+    let fixture = Fixture::new(&[
+        ("lib.rs", "#![allow(dead_code, unused_unsafe)]\npub mod deep;\n"),
+        ("deep.rs", "pub mod inner;\n"),
+        (
+            "deep/inner.rs",
+            "pub unsafe fn preexisting(v: &i32) {\n    *(v as *const i32 as *mut i32) = 7;\n}\npub unsafe fn bump(p: *mut i32) -> i32 {\n    *p += 1;\n    *p\n}\n",
+        ),
+    ]);
+
+    match super::rewrite_m1_path(&fixture.root()) {
+        super::RewriteOutcome::Emitted {
+            files,
+            bisect_probes,
+            escalated,
+            ..
+        } => {
+            let nested = files
+                .iter()
+                .find(|(k, _)| format!("{k:?}").contains("inner.rs"))
+                .map(|(_, text)| text.clone())
+                .expect("the nested module was emitted");
+            assert!(
+                nested.contains("p: &mut i32"),
+                "the rewrite was withheld by the nested crate's baseline: {nested}"
+            );
+            // PATH-PINNED, as in the flat witness: it must emit on the loop's
+            // clean exit, not be recovered by bisect.
+            assert_eq!(
+                bisect_probes, 0,
+                "the nested baseline forced an escalation instead of being masked"
+            );
+            assert!(escalated.is_none(), "escalated: {escalated:?}");
+        }
+        super::RewriteOutcome::Degraded { reason, .. } => panic!(
+            "a nested crate's baseline gated its rewrite — the corpus shape, \
+             which the flat fixture could not detect: {reason}"
+        ),
+    }
 }
