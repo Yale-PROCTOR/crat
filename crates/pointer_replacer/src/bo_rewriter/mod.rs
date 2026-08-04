@@ -484,8 +484,12 @@ fn rewrite_core_injected(
                     facts.files_touched = files.len();
                     return facts.degraded("probe-only: first diagnose recorded".to_owned());
                 }
-                let novel: Vec<verify::Diag> =
-                    baseline.novel(&diagnosis.diags).into_iter().cloned().collect();
+                let observed_root = staged.root().parent().unwrap_or(staged.root()).to_path_buf();
+                let novel: Vec<verify::Diag> = baseline
+                    .novel(&diagnosis.diags, &observed_root)
+                    .into_iter()
+                    .cloned()
+                    .collect();
                 let novel_errors = diagnosis.errors.saturating_sub(baseline.errors);
                 if facts.first_diags.is_empty() {
                     facts.first_diags = novel.clone();
@@ -537,7 +541,12 @@ fn rewrite_core_injected(
                     break;
                 }
 
-                let newly = attribute(&novel, &facts.emitted_sites, crate_dir.as_deref())
+                let newly = attribute(
+                    &novel,
+                    &observed_root,
+                    &facts.emitted_sites,
+                    crate_dir.as_deref().unwrap_or(std::path::Path::new("")),
+                )
                     .difference(&reverted)
                     .cloned()
                     .collect::<std::collections::BTreeSet<_>>();
@@ -618,7 +627,8 @@ fn rewrite_core_injected(
                     return false;
                 };
                 let probe = verify::diagnose_crate(staged.root());
-                baseline.novel(&probe.diags).is_empty()
+                let probe_root = staged.root().parent().unwrap_or(staged.root());
+                baseline.novel(&probe.diags, probe_root).is_empty()
                     && probe.errors.saturating_sub(baseline.errors) == 0
             });
 
@@ -657,7 +667,9 @@ fn rewrite_core_injected(
                 Ok(staged)
                     if rollbacks.is_empty() && {
                         let final_diag = verify::diagnose_crate(staged.root());
-                        baseline.novel(&final_diag.diags).is_empty()
+                        let final_root =
+                            staged.root().parent().unwrap_or(staged.root());
+                        baseline.novel(&final_diag.diags, final_root).is_empty()
                             && final_diag.errors.saturating_sub(baseline.errors) == 0
                     } =>
                 {
@@ -1016,22 +1028,6 @@ impl OutcomeFacts {
 /// relied on alone: a cap that fires is a loop that stopped being understood.
 const MAX_REVERT_ROUNDS: usize = 8;
 
-/// Crate-relative form of a path, so a diagnostic from the TEMP COPY can be
-/// compared with a site recorded against the ORIGINAL tree.
-fn crate_relative(path: &str, crate_dir: Option<&std::path::Path>) -> String {
-    if let Some((_, tail)) = path.split_once("crat-verify") {
-        if let Some((_, rest)) = tail.split_once('/') {
-            return rest.to_owned();
-        }
-    }
-    if let Some(dir) = crate_dir {
-        if let Ok(rel) = std::path::Path::new(path).strip_prefix(dir) {
-            return rel.display().to_string();
-        }
-    }
-    path.to_owned()
-}
-
 /// Functions whose own rewrite is implicated by these diagnostics.
 ///
 /// Attribution is by SPAN CONTAINMENT against each rewritten subject's own
@@ -1041,9 +1037,14 @@ fn crate_relative(path: &str, crate_dir: Option<&std::path::Path>) -> String {
 /// measurement rather than pre-empted by a heuristic that could be wrong.
 fn attribute(
     diags: &[verify::Diag],
+    observed_root: &std::path::Path,
     sites: &[EmittedSite],
-    crate_dir: Option<&std::path::Path>,
+    original_root: &std::path::Path,
 ) -> std::collections::BTreeSet<String> {
+    // The SAME canonicalizer as the differential gate, each side against its own
+    // root: sites were recorded in the original tree, diagnostics come from the
+    // temp copy. A second normalization here would drift attribution away from
+    // the gate — the same defect class, one layer over.
     let single_file = {
         let mut files: Vec<&str> = sites.iter().map(|s| s.file.as_str()).collect();
         files.sort_unstable();
@@ -1052,10 +1053,10 @@ fn attribute(
     };
     let mut owners = std::collections::BTreeSet::new();
     for diag in diags {
-        let diag_rel = crate_relative(&diag.file, crate_dir);
+        let diag_rel = verify::crate_relative(&diag.file, observed_root);
         for site in sites {
             let same_file =
-                single_file || crate_relative(&site.file, crate_dir) == diag_rel;
+                single_file || verify::crate_relative(&site.file, original_root) == diag_rel;
             if same_file && site.lo_line <= diag.line && diag.line <= site.hi_line {
                 owners.insert(site.fn_path.clone());
             }

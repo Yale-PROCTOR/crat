@@ -920,31 +920,102 @@ fn text_for_any(files: &BTreeMap<FileKey, String>) -> Option<String> {
 /// than count in `Baseline::novel` and this fails — the repeat is masked.
 #[test]
 fn a_repeat_of_a_masked_class_is_still_novel() {
+    let root = std::path::Path::new("/p/crate");
     let diag = |line: usize| verify::Diag {
-        file: "src/x.rs".to_owned(),
+        file: "/p/crate/src/x.rs".to_owned(),
         line,
         message: "reference casting".to_owned(),
         direction: verify::Direction::Other,
         code: None,
     };
     let baseline = verify::Baseline {
-        keys: std::iter::once((verify::baseline_key(&diag(1)), 1)).collect(),
+        keys: std::iter::once((verify::baseline_key(&diag(1), root), 1)).collect(),
         errors: 1,
     };
 
     // One occurrence: masked — and at a DIFFERENT line, so the key is stable
     // under the line drift every edit above it causes.
     assert!(
-        baseline.novel(&[diag(42)]).is_empty(),
+        baseline.novel(&[diag(42)], root).is_empty(),
         "a baseline error moved by an edit was reported as novel"
     );
     // Two occurrences: the second is novel.
     let pair = [diag(42), diag(99)];
-    let novel = baseline.novel(&pair);
+    let novel = baseline.novel(&pair, root);
     assert_eq!(
         novel.len(),
         1,
         "a rewrite-introduced repeat of a masked class was masked too"
     );
     assert_eq!(novel[0].line, 99);
+}
+
+// ---------------------------------------------------------------------------
+// F.1 — the canonicalizer's KEY AGREEMENT. Rider 7: each fixture names the
+// branch it exercises, and the corpus branch is covered.
+// ---------------------------------------------------------------------------
+
+/// **W1 — the two sides key the same logical file identically.**
+///
+/// **Rider 7 branch: UNDER-ROOT — the branch the corpus takes.** The roots are
+/// deliberately CORPUS-SHAPED: one carries `rs-crown` as a path component, the
+/// other a `crat-verify`-style temp name. With neutral roots a resurrected
+/// string special case would take its magic branch on neither side and this
+/// witness would pass while the resurrection survived.
+///
+/// *Mutation-tested, Rider 0 order.* **Deletions, each must fail:**
+/// (i) reintroduce a basename normalization on one side;
+/// (ii) reintroduce the `/rs-crown/` split.
+#[test]
+fn both_sides_key_the_same_file_identically() {
+    let original_root = std::path::Path::new("/home/u/dev/benchmarks/rs-crown/brotli");
+    let observed_root = std::path::Path::new("/var/folders/T/crat-verify-4242-0");
+
+    let key_of = |path: &str, root: &std::path::Path| {
+        verify::baseline_key(
+            &verify::Diag {
+                file: path.to_owned(),
+                line: 1,
+                message: "same message".to_owned(),
+                direction: verify::Direction::Other,
+                code: None,
+            },
+            root,
+        )
+    };
+
+    let baseline = key_of("/home/u/dev/benchmarks/rs-crown/brotli/src/enc/encode.rs", original_root);
+    let observed = key_of("/var/folders/T/crat-verify-4242-0/src/enc/encode.rs", observed_root);
+    assert_eq!(
+        baseline, observed,
+        "the two sides key the same file differently — the baseline masks \
+         nothing and the gate silently no-ops on the corpus"
+    );
+    assert_eq!(baseline.0, "src/enc/encode.rs", "key is relative to the crate root");
+}
+
+/// **W2 — a path NOT under the given root keys as ITSELF.**
+///
+/// **Rider 7 branch: FALLBACK.** Never a basename: basenames merge distinct
+/// files into one key, so a novel error in `a/x.rs` could read as the baseline
+/// of `b/x.rs` and the gate would fail OPEN.
+///
+/// *Mutation-tested, Rider 0 order.* **Deletion first:** restore a basename
+/// fallback and this fails.
+#[test]
+fn a_path_outside_the_crate_root_keys_as_itself() {
+    let root = std::path::Path::new("/home/u/dev/benchmarks/rs-crown/brotli");
+    let outside = "/somewhere/else/src/enc/encode.rs";
+    assert_eq!(
+        verify::crate_relative(outside, root),
+        outside,
+        "a path outside the root was rewritten — a basename here would merge \
+         distinct files into one key"
+    );
+    // And two distinct files sharing a basename must NOT collide.
+    assert_ne!(
+        verify::crate_relative("/p/a/x.rs", root),
+        verify::crate_relative("/p/b/x.rs", root),
+        "distinct files collapsed to one key"
+    );
 }

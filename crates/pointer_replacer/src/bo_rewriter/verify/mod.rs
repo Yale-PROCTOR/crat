@@ -223,34 +223,53 @@ pub(crate) struct Diag {
 /// in the same file is novel rather than masked: the gate must judge the
 /// rewrite's delta without going blind to rewrite-introduced violations of
 /// exactly the class it is masking (reference casting).
-pub(crate) fn baseline_key(diag: &Diag) -> (String, String, String) {
+pub(crate) fn baseline_key(
+    diag: &Diag,
+    crate_root: &Path,
+) -> (String, String, String) {
     (
-        crate_relative(&diag.file),
+        crate_relative(&diag.file, crate_root),
         diag.code.clone().unwrap_or_default(),
         diag.message.clone(),
     )
 }
 
-/// Crate-relative path, so a baseline taken in place compares with a diagnostic
-/// from the materialized copy.
-pub(crate) fn crate_relative(path: &str) -> String {
-    if let Some((_, tail)) = path.split_once("crat-verify") {
-        if let Some((_, rest)) = tail.split_once('/') {
-            return rest.to_owned();
-        }
-    }
-    match path.rsplit_once("/rs-crown/") {
-        Some((_, rest)) => rest.to_owned(),
-        None => path.rsplit('/').next().unwrap_or(path).to_owned(),
+/// A path relative to the crate root it belongs to.
+///
+/// # This is a CANONICALIZATION, not a derivation
+///
+/// Both sides of the differential — the baseline compiled in the original tree
+/// and the observed crate compiled in a temp copy — must compute the SAME key
+/// for the same logical file, each from its own root. A second implementation
+/// here does not create a comparison, it destroys one: S2a-H duplicates
+/// derivations because disagreement is the signal; a canonicalizer is shared
+/// because disagreement is the defect.
+///
+/// It had two implementations, which disagreed. The baseline side split on a
+/// hardcoded `/rs-crown/` and the observed side stripped a `crat-verify` temp
+/// prefix, so the same file keyed as `brotli/src/enc/encode.rs` against
+/// `src/enc/encode.rs` and the gate masked NOTHING on the corpus while passing
+/// its flat fixture, whose basename fallback made both sides agree by accident.
+///
+/// **No directory layout is known here.** The root is passed in; there is no
+/// corpus name, no temp-prefix pattern, and NO BASENAME FALLBACK — a basename
+/// merges distinct files into one key, which would let a novel error in one file
+/// read as another file's baseline. The gate would fail OPEN. A path not under
+/// the given root keys as itself.
+pub(crate) fn crate_relative(path: &str, crate_root: &Path) -> String {
+    match Path::new(path).strip_prefix(crate_root) {
+        Ok(relative) => relative.display().to_string(),
+        Err(_) => path.to_owned(),
     }
 }
 
 /// Multiset of baseline diagnostic identities for an UNMODIFIED crate.
 pub(crate) fn baseline_of(root: &Path) -> Baseline {
+    let crate_root = root.parent().unwrap_or(root).to_path_buf();
     let diagnosis = diagnose_crate(root);
     let mut keys = std::collections::BTreeMap::new();
     for diag in &diagnosis.diags {
-        *keys.entry(baseline_key(diag)).or_insert(0usize) += 1;
+        *keys.entry(baseline_key(diag, &crate_root)).or_insert(0usize) += 1;
     }
     Baseline { keys, errors: diagnosis.errors }
 }
@@ -266,13 +285,17 @@ pub(crate) struct Baseline {
 
 impl Baseline {
     /// Diagnostics NOT already present in the unmodified input.
-    pub(crate) fn novel<'a>(&self, diags: &'a [Diag]) -> Vec<&'a Diag> {
+    /// `observed_root` is the crate root the OBSERVED diagnostics were compiled
+    /// under — the temp copy's directory, not the original's. Each side
+    /// canonicalizes against its own root, which is what makes the keys
+    /// comparable at all.
+    pub(crate) fn novel<'a>(&self, diags: &'a [Diag], observed_root: &Path) -> Vec<&'a Diag> {
         let mut seen: std::collections::BTreeMap<(String, String, String), usize> =
             std::collections::BTreeMap::new();
         diags
             .iter()
             .filter(|diag| {
-                let key = baseline_key(diag);
+                let key = baseline_key(diag, observed_root);
                 let count = seen.entry(key.clone()).or_insert(0);
                 *count += 1;
                 // MULTISET: the Nth occurrence is novel once it exceeds the
