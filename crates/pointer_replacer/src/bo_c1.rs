@@ -8163,7 +8163,7 @@ impl OutcomeCounts {
         }
     }
 
-    /// `ref_mut + ref_shared` — the converted side **in the artifact's frame**.
+    /// `ref_mut + ref_shared` — the `Ref`-DECIDED count, **in the artifact's frame**.
     ///
     /// # This is NOT `m1_emit_corpus`'s `emitted`, and the gap is exact
     ///
@@ -8173,7 +8173,7 @@ impl OutcomeCounts {
     /// `RevertedAfterVerifyFailure` degradation there, so
     ///
     /// ```text
-    ///   converted      = emitted   + reverted
+    ///   decided_ref    = emitted   + reverted
     ///   degraded(here) = degraded(emit) - reverted
     /// ```
     ///
@@ -8181,11 +8181,15 @@ impl OutcomeCounts {
     /// `5bbde5ab`: **818 = 771 + 47**, holding on **every one of the 20
     /// programs**, not merely in aggregate.
     ///
-    /// Recorded because the two numbers will be read side by side, and
-    /// `converted 818` next to `emitted 771` looks like a discrepancy in one of
-    /// them. It is neither: it is the revert loop, which is the whole subject of
-    /// S2b.1.
-    fn converted(&self) -> usize {
+    /// # Why the printed key says `decided_ref` and not `converted`
+    ///
+    /// The two figures get read side by side, and `converted 818` beside
+    /// `emitted 771` reads as a discrepancy in one of them. It is neither: it is
+    /// the revert loop, which is the entire subject of S2b.1. A note on this
+    /// accessor cannot defend the misread, because the misread happens at the
+    /// printed line — so the NAME carries the frame. The wire schema's field is
+    /// untouched; this is the report's vocabulary, not the artifact's.
+    fn decided_ref(&self) -> usize {
         self.ref_mut + self.ref_shared
     }
 }
@@ -8227,10 +8231,10 @@ fn count_outcomes(rows: &[crate::coverage_recon::schema::Row]) -> OutcomeCounts 
 #[cfg(test)]
 fn count_line(scope: &str, c: &OutcomeCounts) -> String {
     format!(
-        "M1COUNT {scope} rows={} converted={} ref_mut={} ref_shared={} \
+        "M1COUNT {scope} rows={} decided_ref={} ref_mut={} ref_shared={} \
          degraded={} unclassified={} label={PRE_S3_LABEL:?}",
         c.rows,
-        c.converted(),
+        c.decided_ref(),
         c.ref_mut,
         c.ref_shared,
         c.degraded,
@@ -8419,7 +8423,7 @@ fn counters_bucket_decoded_rows_by_outcome() {
         (c.rows, c.ref_mut, c.ref_shared, c.degraded, c.unclassified),
         (5, 1, 1, 3, 0)
     );
-    assert_eq!(c.converted(), 2, "converted is ref_mut + ref_shared");
+    assert_eq!(c.decided_ref(), 2, "decided_ref is ref_mut + ref_shared");
     assert_eq!(c.by_reason.get("call-site-not-adapted"), Some(&2));
     assert_eq!(c.by_reason.get("kind-raw"), Some(&1));
     assert_eq!(
