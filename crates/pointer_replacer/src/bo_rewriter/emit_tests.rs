@@ -874,11 +874,28 @@ fn a_baseline_error_does_not_gate_the_rewrite() {
         ),
     ]);
     match super::rewrite_m1_path(&fixture.root()) {
-        super::RewriteOutcome::Emitted { files, .. } => {
+        super::RewriteOutcome::Emitted {
+            files,
+            bisect_probes,
+            escalated,
+            ..
+        } => {
             let text = text_for_any(&files).expect("something was emitted");
             assert!(
                 text.contains("p: &mut i32"),
                 "the rewrite was withheld because of a pre-existing error: {text}"
+            );
+            // It must emit on the LOOP's clean exit, not be recovered by bisect.
+            // The differential lives at three sites (loop exit, bisect probe,
+            // final guard); without pinning the path, mutating one leaves the
+            // fixture recoverable by the others and the witness survives.
+            assert_eq!(
+                bisect_probes, 0,
+                "the baseline error forced an escalation instead of being masked"
+            );
+            assert!(
+                escalated.is_none(),
+                "escalated on a baseline-masked error: {escalated:?}"
             );
         }
         super::RewriteOutcome::Degraded { reason, .. } => panic!(
