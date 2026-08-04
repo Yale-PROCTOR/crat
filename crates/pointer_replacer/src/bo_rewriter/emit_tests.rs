@@ -1127,6 +1127,13 @@ fn a_path_outside_the_crate_root_keys_as_itself() {
 /// this track has ruled against where a data-level route exists; here there is
 /// no data-level route, so the residual is stated and left to the corpus
 /// transfer, which observes the stderr end-to-end.
+///
+/// **That coverage is compelled, not hoped for.** Under the staleness rule, a
+/// change touching the probe or baseline path makes every prior transfer result
+/// stale, so the transfer must be re-run before its numbers are cited again —
+/// which is exactly the change class that could reintroduce a discarded
+/// compile. The residual is therefore a MANAGED one: the only edits that can
+/// open it are the edits that force the run that would close it.
 #[test]
 fn a_probe_does_not_compile_the_baseline_it_never_consults() {
     let fixture = Fixture::new(&[
