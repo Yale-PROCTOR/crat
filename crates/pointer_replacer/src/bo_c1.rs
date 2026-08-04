@@ -7121,7 +7121,12 @@ mod run {
         let t0 = Instant::now();
         let mut row = Row::default();
         match crate::bo_rewriter::diagnose_once(input) {
-            Ok(diags) => {
+            Ok((observed_root, diags)) => {
+                // The FRAME, emitted once. Both extraction paths canonicalize
+                // against it with the production canonicalizer, so neither side
+                // carries a normalization of its own — the instrument emits the
+                // raw capture and the comparison layer normalizes it.
+                println!("M1DIAG-ROOT dir={}", observed_root.display());
                 for d in &diags {
                     println!(
                         "M1DIAG-STRUCT file={} line={} dir={:?}",
@@ -8275,6 +8280,13 @@ fn m1_diag_transfer() {
         let err_text = fs::read_to_string(logs.join(format!("{}.m1-diag.err", program.name)))
             .unwrap_or_default();
 
+        // The frame both sides canonicalize against, from the worker itself.
+        // FAIL-CLOSED: no root means no comparable keys, and the fallback this
+        // replaced keyed distinct files alike by basename — it failed OPEN.
+        let observed_root = diag_root(&out_text)
+            .unwrap_or_else(|why| panic!("{}: {why}", program.name));
+        let observed_root = std::path::Path::new(&observed_root);
+
         // STRUCTURAL: (crate-relative file, line)
         let mut structural: Vec<(String, usize)> = out_text
             .lines()
@@ -8282,7 +8294,10 @@ fn m1_diag_transfer() {
                 let rest = l.strip_prefix("M1DIAG-STRUCT file=")?;
                 let (file, rest) = rest.split_once(" line=")?;
                 let (line, _) = rest.split_once(" dir=")?;
-                Some((crate_relative_for_test(file), line.parse().ok()?))
+                Some((
+                    crate::bo_rewriter::verify::crate_relative(file, observed_root),
+                    line.parse().ok()?,
+                ))
             })
             .collect();
         // RENDERED: the parser validated on 86 corpus diagnostics at S2b.0 —
@@ -8312,7 +8327,10 @@ fn m1_diag_transfer() {
             if let (Some(line), Some(path)) = (line, path)
                 && let Ok(line) = line.parse::<usize>()
             {
-                rendered.push((crate_relative_for_test(path), line));
+                rendered.push((
+                    crate::bo_rewriter::verify::crate_relative(path, observed_root),
+                    line,
+                ));
             }
         }
         structural.sort();
@@ -8347,14 +8365,45 @@ fn m1_diag_transfer() {
     );
 }
 
-/// Crate-relative form, stripping the temp-copy prefix the verify compile uses.
-fn crate_relative_for_test(path: &str) -> String {
-    if let Some((_, tail)) = path.split_once("crat-verify") {
-        if let Some((_, rest)) = tail.split_once('/') {
-            return rest.to_owned();
-        }
-    }
-    path.rsplit('/').next().unwrap_or(path).to_owned()
+/// The observed root the worker compiled in, read from its own stdout.
+///
+/// # Fail-closed, and why the polarity is the whole point
+///
+/// This replaced a local canonicalizer that pattern-matched a `crat-verify`
+/// temp prefix and, failing that, **fell back to the basename**. That fallback
+/// failed OPEN: two distinct files sharing a basename keyed alike, so a genuine
+/// structural-vs-rendered disagreement could read as agreement. Returning an
+/// error when the frame is absent fails CLOSED — the transfer stops and says
+/// so, rather than quietly comparing keys that mean nothing.
+///
+/// The rule of record this serves: reconciliation gates duplicate their
+/// derivations, because disagreement is the signal; canonicalizers are single,
+/// because disagreement is the defect. Both sides here canonicalize with
+/// [`crate::bo_rewriter::verify::crate_relative`], the production one.
+fn diag_root(out_text: &str) -> Result<String, String> {
+    out_text
+        .lines()
+        .find_map(|l| l.strip_prefix("M1DIAG-ROOT dir="))
+        .map(|dir| dir.trim().to_owned())
+        .ok_or_else(|| {
+            "no `M1DIAG-ROOT` line in the worker's stdout — the capture has no \
+             frame, so its paths cannot be canonicalized"
+                .to_owned()
+        })
+}
+
+#[test]
+fn the_transfer_refuses_a_capture_with_no_frame() {
+    assert_eq!(
+        diag_root("M1DIAG-ROOT dir=/tmp/crat-verify-1-0/src\nM1DIAG-STRUCT file=x\n").as_deref(),
+        Ok("/tmp/crat-verify-1-0/src"),
+        "the frame was not read from a well-formed capture"
+    );
+    // The shape that matters: structural output present, frame absent. The
+    // deleted fallback turned this into basename keys and carried on.
+    let err = diag_root("M1DIAG-STRUCT file=/a/b/node.rs line=4 dir=Other\n")
+        .expect_err("a capture with no frame must be refused, never normalized by guesswork");
+    assert!(err.contains("M1DIAG-ROOT"), "the error must name what is missing: {err}");
 }
 
 /// **S2b.0 — the pinned measurement.** Full M1 pipeline over all 20 programs.

@@ -120,6 +120,11 @@ pub(crate) enum RewriteOutcome {
         attribution_blind: usize,
         /// The first verify's diagnostics.
         first_diags: Vec<verify::Diag>,
+        /// The temp-copy root those diagnostics' paths are absolute within.
+        /// Captured with them, from the SAME round — each revert round
+        /// materializes its own temp directory, so a later round's root would
+        /// not canonicalize the first round's paths.
+        observed_root: Option<std::path::PathBuf>,
         baseline_keys: usize,
         baseline_errors: usize,
         baseline_msg_env: usize,
@@ -153,6 +158,11 @@ pub(crate) enum RewriteOutcome {
         attribution_blind: usize,
         /// The first verify's diagnostics.
         first_diags: Vec<verify::Diag>,
+        /// The temp-copy root those diagnostics' paths are absolute within.
+        /// Captured with them, from the SAME round — each revert round
+        /// materializes its own temp directory, so a later round's root would
+        /// not canonicalize the first round's paths.
+        observed_root: Option<std::path::PathBuf>,
         baseline_keys: usize,
         baseline_errors: usize,
         baseline_msg_env: usize,
@@ -459,6 +469,7 @@ fn rewrite_core_injected(
                 escalated: None,
                 attribution_blind,
                 first_diags: Vec::new(),
+                observed_root: None,
                 baseline_keys: baseline.keys.values().sum(),
                 baseline_errors: baseline.errors,
                 baseline_msg_env: baseline.messages_embedding_root,
@@ -512,6 +523,8 @@ fn rewrite_core_injected(
                     // Baseline diagnostics appear on both sides, which is what
                     // makes the equality mean anything.
                     facts.first_diags = diagnosis.diags.clone();
+                    facts.observed_root =
+                        Some(staged.root().parent().unwrap_or(staged.root()).to_path_buf());
                     facts.files_touched = files.len();
                     return facts.degraded("probe-only: first diagnose recorded".to_owned());
                 }
@@ -524,6 +537,7 @@ fn rewrite_core_injected(
                 let novel_errors = diagnosis.errors.saturating_sub(baseline.errors);
                 if facts.first_diags.is_empty() {
                     facts.first_diags = novel.clone();
+                    facts.observed_root = Some(observed_root.clone());
                 }
                 if novel.is_empty() && novel_errors == 0 {
                     let source = std::fs::read_to_string(staged.root()).unwrap_or_default();
@@ -950,7 +964,9 @@ fn decide_table<'tcx>(tcx: TyCtxt<'tcx>) -> Result<decision::DecisionTable, Stri
               which is #[cfg(test)]. Correct this reason if a non-test consumer \
               appears."
 )]
-pub(crate) fn diagnose_once(root: &std::path::Path) -> Result<Vec<verify::Diag>, String> {
+pub(crate) fn diagnose_once(
+    root: &std::path::Path,
+) -> Result<(std::path::PathBuf, Vec<verify::Diag>), String> {
     // Routes through `rewrite_core` in probe mode rather than calling
     // `emit_files` itself: a second call site would be a second emission path,
     // which the one-path scan correctly rejected when this was first written
@@ -962,7 +978,18 @@ pub(crate) fn diagnose_once(root: &std::path::Path) -> Result<Vec<verify::Diag>,
         &|_| {},
         true,
     );
-    Ok(outcome.into_first_diags())
+    let (observed_root, diags) = outcome.into_capture();
+    // FAIL-CLOSED. A capture without its frame cannot be canonicalized, and the
+    // only remaining way to compare it against rendered output would be to
+    // invent a normalization at the consumer — the exact move that produced a
+    // second and a third canonicalizer. An error here is loud; a fallback would
+    // be silent and would key distinct files alike.
+    let observed_root = observed_root.ok_or_else(|| {
+        "the probe returned diagnostics with no observed root; their paths \
+         cannot be canonicalized"
+            .to_owned()
+    })?;
+    Ok((observed_root, diags))
 }
 
 /// Everything BOTH outcomes carry, built once and filled in one place.
@@ -1003,6 +1030,15 @@ struct OutcomeFacts {
     /// Edit owners with no `emitted_sites` entry: they carry edits but are
     /// invisible to span attribution. brotli's divergence class, now counted.
     attribution_blind: usize,
+    /// The crate root the diagnostics above were OBSERVED against — the temp
+    /// copy's root, not the input tree's.
+    ///
+    /// Carried with [`Self::first_diags`] because the two are one fact: those
+    /// paths are absolute inside a per-run temp directory, so a consumer that
+    /// receives the payload without its frame cannot canonicalize them and is
+    /// left inventing a normalization. That is precisely how a second and then
+    /// a third path canonicalizer came to exist.
+    observed_root: Option<std::path::PathBuf>,
 }
 
 impl RewriteOutcome {
@@ -1012,10 +1048,29 @@ impl RewriteOutcome {
     /// scan is textual and cannot tell a construction from a destructuring, so
     /// every avoidable naming of a variant outside the two constructors is one
     /// less false positive for a guard that is otherwise exact.
-    fn into_first_diags(self) -> Vec<verify::Diag> {
+    ///
+    /// Hands out the payload and its frame **together** — a caller that could
+    /// take the diagnostics alone would have to invent a normalization for
+    /// their temp-absolute paths, which is how the second and third path
+    /// canonicalizers came to exist.
+    ///
+    /// No `#[allow(dead_code)]`, and the reason is measured rather than
+    /// assumed: `mod bo_c1` IS `#[cfg(test)]`, so in a non-test build the only
+    /// caller is gone — but `diagnose_once` carries its own `allow`, and
+    /// rustc's dead-code pass treats an `allow`ed item as a live root, which
+    /// keeps this reachable. `cargo check` on the non-test build is clean.
+    fn into_capture(self) -> (Option<std::path::PathBuf>, Vec<verify::Diag>) {
+        // ONE LINE PER PATTERN, deliberately: the one-filling-site scan skips a
+        // line carrying `..`, so a destructuring split across lines leaves
+        // `RewriteOutcome::Emitted {` alone on a line and is counted as a
+        // construction. That direction is safe — a multi-line CONSTRUCTION is
+        // still caught by its own first line — but it does fail the guard, as
+        // it did here. Keep these patterns single-line.
         match self {
-            RewriteOutcome::Emitted { first_diags, .. }
-            | RewriteOutcome::Degraded { first_diags, .. } => first_diags,
+            RewriteOutcome::Emitted { first_diags, observed_root, .. }
+            | RewriteOutcome::Degraded { first_diags, observed_root, .. } => {
+                (observed_root, first_diags)
+            }
         }
     }
 }
@@ -1039,6 +1094,7 @@ impl OutcomeFacts {
             reverted_count: self.reverted_count,
             attribution_blind: self.attribution_blind,
             first_diags: self.first_diags,
+            observed_root: self.observed_root,
             baseline_keys: self.baseline_keys,
             baseline_errors: self.baseline_errors,
             baseline_msg_env: self.baseline_msg_env,
@@ -1057,6 +1113,7 @@ impl OutcomeFacts {
             reverted_count: self.reverted_count,
             attribution_blind: self.attribution_blind,
             first_diags: self.first_diags,
+            observed_root: self.observed_root,
             baseline_keys: self.baseline_keys,
             baseline_errors: self.baseline_errors,
             baseline_msg_env: self.baseline_msg_env,

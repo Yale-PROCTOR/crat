@@ -895,7 +895,7 @@ fn diagnose_once_returns_the_captured_diagnostics_not_an_empty_set() {
         ),
     ]);
 
-    let diags = super::diagnose_once(&fixture.root()).expect("the probe ran");
+    let (observed_root, diags) = super::diagnose_once(&fixture.root()).expect("the probe ran");
 
     assert!(
         !diags.is_empty(),
@@ -907,6 +907,18 @@ fn diagnose_once_returns_the_captured_diagnostics_not_an_empty_set() {
         diags.iter().any(|d| d.line > 0 && !d.file.is_empty()),
         "the payload carries no located diagnostic, so the transfer would have \
          nothing to compare: {diags:?}"
+    );
+    // The FRAME must fit the payload. A root that does not canonicalize its own
+    // diagnostics is worse than no root: every path would key as itself and the
+    // transfer would compare absolute paths while believing it compared
+    // relative ones.
+    assert!(
+        diags.iter().any(|d| {
+            let relative = verify::crate_relative(&d.file, &observed_root);
+            relative != d.file && !relative.starts_with('/')
+        }),
+        "no diagnostic is under the observed root {observed_root:?}, so the \
+         frame does not describe the capture: {diags:?}"
     );
 }
 
