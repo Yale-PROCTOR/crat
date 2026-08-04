@@ -807,3 +807,127 @@ fn a_failing_outcome_carries_its_reverted_count() {
         super::RewriteOutcome::Emitted { .. } => panic!("degraded() built an Emitted"),
     }
 }
+
+/// **brotli investigation (a) — PRISTINE-COPY CONTROL.**
+///
+/// Materialize brotli with ZERO edits and type-check the copy. This is the
+/// `k == candidates.len()` base case in isolation: if an unedited copy does not
+/// compile, the base case was never testable for brotli and the failure is an
+/// environment/temp-copy defect rather than a loop defect.
+#[test]
+#[ignore = "brotli control: one full type-check of the frozen corpus program"]
+fn zz_brotli_pristine_copy_control() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../benchmarks/rs-crown/brotli/lib.rs");
+    assert!(root.is_file(), "frozen input missing: {root:?}");
+
+    // IN PLACE, no copy: distinguishes "the temp copy breaks it" from "the
+    // input never passed this gate".
+    let in_place = verify::diagnose_crate(&root);
+    println!(
+        "BROTLI-CONTROL in_place errors={} diags={}",
+        in_place.errors,
+        in_place.diags.len()
+    );
+    let empty = BTreeMap::new();
+    let temp = verify::materialize(&root, &empty).expect("materialize pristine copy");
+    let d = verify::diagnose_crate(temp.root());
+    println!(
+        "BROTLI-CONTROL pristine errors={} diags={} unrenderable={}",
+        d.errors,
+        d.diags.len(),
+        d.unrenderable
+    );
+    // The OLD gate semantics: FatalError propagation only, which is what
+    // `type_checks_crate` meant before 1.1 routed it through `diagnose_crate`.
+    let old_gate = ::utils::compilation::run_compiler_on_path(temp.root(), |tcx| {
+        ::utils::type_check(tcx);
+    })
+    .is_ok();
+    println!("BROTLI-CONTROL old_gate_is_ok={old_gate} new_gate_passes={}", d.errors == 0);
+    for x in d.diags.iter().take(8) {
+        println!("BROTLI-CONTROL diag {}:{} {:?}", x.file, x.line, x.direction);
+        println!("BROTLI-CONTROL   msg={}", &x.message[..x.message.len().min(160)]);
+    }
+}
+
+/// **S2b.1 — a BASELINE-MASKED error must not gate.**
+///
+/// The fixture denies `unused_variables`, so its UNMODIFIED source already
+/// reports an error-level diagnostic. The rewrite does not add one, so the crate
+/// must still emit — brotli's shape in miniature, where an absolute gate made
+/// even revert-all unsatisfiable.
+///
+/// *Mutation-tested, Rider 0 order.* **Deletion first:** gate on the absolute
+/// count (`diagnosis.errors == 0`) instead of the differential and this fails.
+#[test]
+fn a_baseline_error_does_not_gate_the_rewrite() {
+    // Mirrors brotli's ACTUAL baseline diagnostic: `invalid_reference_casting`
+    // is deny-by-default and, unlike a crate-level `#![deny(..)]`, does not
+    // abort the decision-phase compile — which is why brotli decides 126
+    // subjects and only fails at verify.
+    let fixture = Fixture::new(&[
+        ("lib.rs", "#![allow(dead_code, unused_unsafe)]\npub mod m;\n"),
+        (
+            "m.rs",
+            "pub unsafe fn preexisting(v: &i32) {\n    *(v as *const i32 as *mut i32) = 7;\n}\npub unsafe fn bump(p: *mut i32) -> i32 {\n    *p += 1;\n    *p\n}\n",
+        ),
+    ]);
+    match super::rewrite_m1_path(&fixture.root()) {
+        super::RewriteOutcome::Emitted { files, .. } => {
+            let text = text_for_any(&files).expect("something was emitted");
+            assert!(
+                text.contains("p: &mut i32"),
+                "the rewrite was withheld because of a pre-existing error: {text}"
+            );
+        }
+        super::RewriteOutcome::Degraded { reason, .. } => panic!(
+            "a pre-existing baseline error gated the rewrite — the absolute-gate \
+             failure mode that made brotli's base case unsatisfiable: {reason}"
+        ),
+    }
+}
+
+fn text_for_any(files: &BTreeMap<FileKey, String>) -> Option<String> {
+    files.values().next().cloned()
+}
+
+/// **S2b.1 — a NEW error of a MASKED class must still gate.**
+///
+/// Multiset semantics, witnessed directly: one occurrence of a key is masked by
+/// a baseline of one; a SECOND occurrence is novel. Without this the gate would
+/// go blind to rewrite-introduced violations of exactly the class it masks,
+/// which for the real corpus is reference casting.
+///
+/// *Mutation-tested, Rider 0 order.* **Deletion first:** compare presence rather
+/// than count in `Baseline::novel` and this fails — the repeat is masked.
+#[test]
+fn a_repeat_of_a_masked_class_is_still_novel() {
+    let diag = |line: usize| verify::Diag {
+        file: "src/x.rs".to_owned(),
+        line,
+        message: "reference casting".to_owned(),
+        direction: verify::Direction::Other,
+        code: None,
+    };
+    let baseline = verify::Baseline {
+        keys: std::iter::once((verify::baseline_key(&diag(1)), 1)).collect(),
+        errors: 1,
+    };
+
+    // One occurrence: masked — and at a DIFFERENT line, so the key is stable
+    // under the line drift every edit above it causes.
+    assert!(
+        baseline.novel(&[diag(42)]).is_empty(),
+        "a baseline error moved by an edit was reported as novel"
+    );
+    // Two occurrences: the second is novel.
+    let pair = [diag(42), diag(99)];
+    let novel = baseline.novel(&pair);
+    assert_eq!(
+        novel.len(),
+        1,
+        "a rewrite-introduced repeat of a masked class was masked too"
+    );
+    assert_eq!(novel[0].line, 99);
+}

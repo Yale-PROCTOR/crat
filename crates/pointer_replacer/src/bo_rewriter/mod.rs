@@ -294,6 +294,11 @@ fn rewrite_core_injected(
     inject: &(dyn Fn(&mut decision::DecisionTable) + Sync),
     probe_only: bool,
 ) -> RewriteOutcome {
+    // The string entry's original text, so a baseline exists for it too.
+    let virtual_original = match &input {
+        rustc_session::config::Input::Str { input, .. } => Some(input.clone()),
+        rustc_session::config::Input::File(_) => None,
+    };
     let root_hint = tree_base;
     let result = ::utils::compilation::run_compiler_on_input(input, |tcx| {
         let mut table = decide_table(tcx)?;
@@ -434,6 +439,21 @@ fn rewrite_core_injected(
                 attribution_blind,
                 first_diags: Vec::new(),
             };
+            // BASELINE-DIFFERENTIAL GATE. The gate judges what the REWRITE
+            // introduced, not what the input already reported: brotli's frozen
+            // source trips a deny-by-default lint unedited, which made
+            // revert-all — the bisect base case — impossible to satisfy under an
+            // absolute gate. Excluding lints wholesale would instead blind the
+            // gate to rewrite-INTRODUCED violations of exactly our risk class
+            // (reference casting), so the baseline is subtracted, not the class.
+            let baseline = match (tree_base, &virtual_original) {
+                (Some(root), _) => verify::baseline_of(root),
+                (None, Some(text)) => match verify::materialize_single_file(text) {
+                    Ok(staged) => verify::baseline_of(staged.root()),
+                    Err(_) => verify::Baseline::default(),
+                },
+                (None, None) => verify::Baseline::default(),
+            };
             let crate_dir = tree_base.and_then(|root| root.parent()).map(|d| d.to_path_buf());
             let mut reverted: std::collections::BTreeSet<String> =
                 std::collections::BTreeSet::new();
@@ -460,14 +480,17 @@ fn rewrite_core_injected(
                 let probe_started = std::time::Instant::now();
                 let diagnosis = verify::diagnose_crate(staged.root());
                 probe_secs = probe_secs.max(probe_started.elapsed().as_secs_f64());
-                if facts.first_diags.is_empty() {
-                    facts.first_diags = diagnosis.diags.clone();
-                }
                 if probe_only {
                     facts.files_touched = files.len();
                     return facts.degraded("probe-only: first diagnose recorded".to_owned());
                 }
-                if diagnosis.errors == 0 {
+                let novel: Vec<verify::Diag> =
+                    baseline.novel(&diagnosis.diags).into_iter().cloned().collect();
+                let novel_errors = diagnosis.errors.saturating_sub(baseline.errors);
+                if facts.first_diags.is_empty() {
+                    facts.first_diags = novel.clone();
+                }
+                if novel.is_empty() && novel_errors == 0 {
                     let source = std::fs::read_to_string(staged.root()).unwrap_or_default();
                     let (kept, taken): (Vec<_>, Vec<_>) = emitted_subjects
                         .iter()
@@ -492,28 +515,29 @@ fn rewrite_core_injected(
                 // detector can be starved by a loop that keeps finding new
                 // attributions, and a cap alone burns every round on a case
                 // that stopped improving after the first.
-                if previous_errors.is_some_and(|prev| diagnosis.errors >= prev) {
+                let outstanding = novel.len().max(novel_errors);
+                if previous_errors.is_some_and(|prev| outstanding >= prev) {
                     escalation = Some(format!(
                         "escalation-required: no progress ({} error(s) after \
                          reverting {} function(s)) — attribution is wrong here \
                          and (C) bisect must take over",
-                        diagnosis.errors,
+                        outstanding,
                         reverted.len()
                     ));
                     break;
                 }
-                previous_errors = Some(diagnosis.errors);
+                previous_errors = Some(outstanding);
                 rounds += 1;
                 if rounds > max_rounds {
                     escalation = Some(format!(
                         "escalation-required: round cap {max_rounds} reached with \
                          {} error(s) outstanding",
-                        diagnosis.errors
+                        outstanding
                     ));
                     break;
                 }
 
-                let newly = attribute(&diagnosis.diags, &facts.emitted_sites, crate_dir.as_deref())
+                let newly = attribute(&novel, &facts.emitted_sites, crate_dir.as_deref())
                     .difference(&reverted)
                     .cloned()
                     .collect::<std::collections::BTreeSet<_>>();
@@ -521,7 +545,7 @@ fn rewrite_core_injected(
                     escalation = Some(format!(
                         "escalation-required: {} error(s) attributed to no rewritten \
                          function",
-                        diagnosis.errors
+                        outstanding
                     ));
                     break;
                 }
@@ -593,7 +617,9 @@ fn rewrite_core_injected(
                 let Ok(staged) = materialized else {
                     return false;
                 };
-                verify::diagnose_crate(staged.root()).errors == 0
+                let probe = verify::diagnose_crate(staged.root());
+                baseline.novel(&probe.diags).is_empty()
+                    && probe.errors.saturating_sub(baseline.errors) == 0
             });
 
             let (final_files, rollbacks) =
@@ -628,7 +654,13 @@ fn rewrite_core_injected(
             // produced no rollbacks cannot produce new ones); the reachable
             // rollback path is the pre-loop structural gate, witnessed there.
             match materialized {
-                Ok(staged) if rollbacks.is_empty() && verify::type_checks_crate(staged.root()) => {
+                Ok(staged)
+                    if rollbacks.is_empty() && {
+                        let final_diag = verify::diagnose_crate(staged.root());
+                        baseline.novel(&final_diag.diags).is_empty()
+                            && final_diag.errors.saturating_sub(baseline.errors) == 0
+                    } =>
+                {
                     let source = std::fs::read_to_string(staged.root()).unwrap_or_default();
                     let (kept, taken): (Vec<_>, Vec<_>) = emitted_subjects
                         .iter()

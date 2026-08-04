@@ -210,6 +210,78 @@ pub(crate) struct Diag {
     pub line: usize,
     pub message: String,
     pub direction: Direction,
+    /// `E0308` and the like. `None` for lint errors, which carry no code — the
+    /// distinction that made S2b.0's `error[`-counting instrument blind to
+    /// deny-by-default lints.
+    pub code: Option<String>,
+}
+
+/// Identity of a diagnostic that is STABLE UNDER LINE DRIFT.
+///
+/// Keyed on file, code and message — never the line, which every edit above it
+/// moves. Compared as a MULTISET so a second occurrence of the same lint class
+/// in the same file is novel rather than masked: the gate must judge the
+/// rewrite's delta without going blind to rewrite-introduced violations of
+/// exactly the class it is masking (reference casting).
+pub(crate) fn baseline_key(diag: &Diag) -> (String, String, String) {
+    (
+        crate_relative(&diag.file),
+        diag.code.clone().unwrap_or_default(),
+        diag.message.clone(),
+    )
+}
+
+/// Crate-relative path, so a baseline taken in place compares with a diagnostic
+/// from the materialized copy.
+pub(crate) fn crate_relative(path: &str) -> String {
+    if let Some((_, tail)) = path.split_once("crat-verify") {
+        if let Some((_, rest)) = tail.split_once('/') {
+            return rest.to_owned();
+        }
+    }
+    match path.rsplit_once("/rs-crown/") {
+        Some((_, rest)) => rest.to_owned(),
+        None => path.rsplit('/').next().unwrap_or(path).to_owned(),
+    }
+}
+
+/// Multiset of baseline diagnostic identities for an UNMODIFIED crate.
+pub(crate) fn baseline_of(root: &Path) -> Baseline {
+    let diagnosis = diagnose_crate(root);
+    let mut keys = std::collections::BTreeMap::new();
+    for diag in &diagnosis.diags {
+        *keys.entry(baseline_key(diag)).or_insert(0usize) += 1;
+    }
+    Baseline { keys, errors: diagnosis.errors }
+}
+
+/// What the UNMODIFIED input already reports. The gate judges the rewrite's
+/// DELTA against this, never the absolute count.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct Baseline {
+    pub keys: std::collections::BTreeMap<(String, String, String), usize>,
+    /// Includes spanless error-level diagnostics, which have no key.
+    pub errors: usize,
+}
+
+impl Baseline {
+    /// Diagnostics NOT already present in the unmodified input.
+    pub(crate) fn novel<'a>(&self, diags: &'a [Diag]) -> Vec<&'a Diag> {
+        let mut seen: std::collections::BTreeMap<(String, String, String), usize> =
+            std::collections::BTreeMap::new();
+        diags
+            .iter()
+            .filter(|diag| {
+                let key = baseline_key(diag);
+                let count = seen.entry(key.clone()).or_insert(0);
+                *count += 1;
+                // MULTISET: the Nth occurrence is novel once it exceeds the
+                // baseline's N, so a rewrite-introduced repeat of a masked lint
+                // class still gates.
+                *count > *self.keys.get(&key).unwrap_or(&0)
+            })
+            .collect()
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -308,6 +380,7 @@ impl rustc_errors::emitter::Emitter for Capture {
                 line: loc.line,
                 message,
                 direction,
+                code: diag.code.map(|c| format!("{c:?}")),
             });
         }
         // Forward LAST: extraction borrows, rendering consumes.
