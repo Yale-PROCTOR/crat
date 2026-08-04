@@ -1331,11 +1331,21 @@ fn a_degraded_outcome_still_reports_its_unplaceable_decisions() {
 /// The emptiness assertions are the anchor: they are what make `0` the RIGHT
 /// answer rather than merely the expected one.
 ///
+/// # Both arms, because the count reaches them by different routes
+///
+/// On a success path `facts.emitted_count` is **overwritten** by `kept.len()`,
+/// which derives from the already-filtered `emitted_subjects`. The value built
+/// at the tuple site therefore survives only on a `Degraded` return — the FAIL
+/// rows. A witness on the emitting arm alone leaves the tuple site uncovered,
+/// and the fix would be half-applied: placement-true on PASS rows and
+/// decision-shaped on FAIL rows, the same arm asymmetry Item 0 repaired one
+/// field over. So this drives the same fixture down both routes.
+///
 /// *Mutation-tested, Rider 0 order.* **Deletion first:** delete the
 /// `unplaceable_subjects.contains(..)` skip in `rewrite_core_injected` and this
-/// fails 1 vs 0. Second: restore `table.emitted_count()` at the tuple site —
-/// the same failure by the other route, since both must hold for the count to
-/// be placement-true.
+/// fails 1 vs 0 on the emitting leg. Second: restore `table.emitted_count()` at
+/// the tuple site — **this SURVIVED the emitting leg alone**, which is how the
+/// second route was found; it fails the probe leg below.
 #[test]
 fn emitted_counts_placements_not_ref_decisions() {
     let fixture = Fixture::new(&[(
@@ -1376,6 +1386,48 @@ fn emitted_counts_placements_not_ref_decisions() {
         }
         super::RewriteOutcome::Degraded { reason, .. } => {
             panic!("an unplaceable-only crate emits nothing and still passes: {reason}")
+        }
+    }
+}
+
+/// **S2b.3 Item 1, second leg — the `Degraded` arm's `emitted_count`.**
+///
+/// See `emitted_counts_placements_not_ref_decisions` for why this is a separate
+/// route rather than a second assertion: the success paths overwrite
+/// `facts.emitted_count` with `kept.len()`, so only a non-emitting return
+/// reports the value the tuple site built. Probe mode is the reachable
+/// non-emitting return that does not require manufacturing a gate failure.
+///
+/// *Mutation-tested, Rider 0 order.* **Deletion first:** the tuple site's
+/// `emitted_subjects.len()` has no deletion that compiles, so the faithful
+/// mutation is the original expression — restore `table.emitted_count()` and
+/// this fails 1 vs 0. That mutation SURVIVES the emitting leg, which is exactly
+/// why this leg exists.
+#[test]
+fn a_degraded_outcome_reports_placements_too() {
+    let fixture = Fixture::new(&[(
+        "lib.rs",
+        "#![allow(dead_code, unused_unsafe)]\nmacro_rules! mk {\n    () => {\n        pub unsafe fn mac_bump(p: *mut i32) -> i32 {\n            *p += 1;\n            *p\n        }\n    };\n}\nmk!();\n",
+    )]);
+    // NON-VACUITY, as on the emitting leg: one unplaceable `Ref` decision, or
+    // the zero below means nothing.
+    assert_eq!(emit(&fixture).unplaceable.len(), 1);
+
+    let probe = super::rewrite_core_injected(
+        ::utils::compilation::path_to_input(&fixture.root()),
+        Some(&fixture.root()),
+        super::MAX_REVERT_ROUNDS,
+        &|_| {},
+        true,
+    );
+    match probe {
+        super::RewriteOutcome::Degraded { emitted_count, .. } => assert_eq!(
+            emitted_count, 0,
+            "the non-emitting arm still reports Ref DECISIONS — placement-truth \
+             stopped at the success paths"
+        ),
+        super::RewriteOutcome::Emitted { .. } => {
+            panic!("probe mode returns before emission and cannot report Emitted")
         }
     }
 }
