@@ -76,6 +76,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .clone(),
         )?);
     }
+    ensure_complete_inputs(&inventories)?;
 
     fs::create_dir_all(&out_dir)?;
     write_code_csv(&out_dir.join(CODE_CSV), &inventories)?;
@@ -84,25 +85,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     write_paper_csv(&out_dir.join(PAPER_CSV), &inventories)?;
     write_official_csv(&out_dir.join(OFFICIAL_CSV), &inventories)?;
 
-    let partial: Vec<_> = inventories
-        .iter()
-        .filter(|row| {
-            !row.rust_file_sets_match
-                || !row.rust_parse_failures.is_empty()
-                || !row.missing_json.is_empty()
-        })
-        .map(|row| row.name.as_str())
-        .collect();
     println!("programs={}", inventories.len());
     println!("directory_names_match=true");
-    println!(
-        "partial_or_failed={}",
-        if partial.is_empty() {
-            "none".to_owned()
-        } else {
-            partial.join(";")
-        }
-    );
+    println!("partial_or_failed=none");
     for name in [CODE_CSV, SITE_CSV, JSON_CSV, PAPER_CSV, OFFICIAL_CSV] {
         println!("{}", out_dir.join(name).display());
     }
@@ -120,10 +105,16 @@ fn inventory_program(
     let original_rel = relative_set(original_dir, &original_files);
     let transformed_rel = relative_set(transformed_dir, &transformed_files);
     let mut rust_parse_failures = Vec::new();
-    let original = inventory_rust_files(original_dir, &original_files, &mut rust_parse_failures)?;
+    let original = inventory_rust_files(
+        original_dir,
+        &original_files,
+        "original",
+        &mut rust_parse_failures,
+    )?;
     let transformed = inventory_rust_files(
         transformed_dir,
         &transformed_files,
+        "transformed",
         &mut rust_parse_failures,
     )?;
 
@@ -170,6 +161,7 @@ fn inventory_program(
 fn inventory_rust_files(
     root: &Path,
     files: &[PathBuf],
+    input_kind: &str,
     failures: &mut Vec<String>,
 ) -> io::Result<RustCounts> {
     let mut sources = Vec::new();
@@ -186,7 +178,7 @@ fn inventory_rust_files(
             for (path, (_, source)) in files.iter().zip(&sources) {
                 if let Err(error) = analyze_rust_source(source) {
                     failures.push(format!(
-                        "{}:{}",
+                        "{input_kind}:{}:{}",
                         path.strip_prefix(root).unwrap_or(path).display(),
                         error
                     ));
@@ -194,6 +186,38 @@ fn inventory_rust_files(
             }
             Ok(RustCounts::default())
         }
+    }
+}
+
+fn ensure_complete_inputs(rows: &[ProgramInventory]) -> Result<(), String> {
+    let mut failures = Vec::new();
+    for row in rows {
+        if row.original_rust_files == 0 || row.transformed_rust_files == 0 {
+            failures.push(format!(
+                "{}: missing required Rust input files (original={}, transformed={})",
+                row.name, row.original_rust_files, row.transformed_rust_files
+            ));
+        }
+        if !row.rust_file_sets_match {
+            failures.push(format!("{}: Rust input file sets do not match", row.name));
+        }
+        for failure in &row.rust_parse_failures {
+            failures.push(format!("{}: unparseable Rust input: {failure}", row.name));
+        }
+        for missing in &row.missing_json {
+            failures.push(format!(
+                "{}: missing required analysis JSON: {missing}",
+                row.name
+            ));
+        }
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "inventory inputs are incomplete; refusing to write authoritative CSV:\n{}",
+            failures.join("\n")
+        ))
     }
 }
 
@@ -275,7 +299,7 @@ fn write_code_csv(path: &Path, rows: &[ProgramInventory]) -> io::Result<()> {
             + declarations.field_option_mut_ref;
         let values = [
             row.name.clone(),
-            status(row).to_owned(),
+            "ok".to_owned(),
             row.original_rust_files.to_string(),
             row.transformed_rust_files.to_string(),
             row.rust_file_sets_match.to_string(),
@@ -586,15 +610,6 @@ fn paper_metrics(program: &str) -> PaperMetrics {
         declaration_percent_tenths,
         pointer_usages,
         use_percent_tenths,
-    }
-}
-
-fn status(row: &ProgramInventory) -> &'static str {
-    if row.rust_file_sets_match && row.rust_parse_failures.is_empty() && row.missing_json.is_empty()
-    {
-        "ok"
-    } else {
-        "partial"
     }
 }
 
