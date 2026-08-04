@@ -374,8 +374,14 @@ fn rewrite_core_injected(
             .collect();
         let mut seen_fns = rustc_hash::FxHashSet::default();
         for (subject, decision) in &table.entries {
-            if !matches!(decision, decision::Decision::Ref { .. }) {
-                continue;
+            // EXHAUSTIVE (S3.0, ruling 5). A `matches!` here compiled clean
+            // against a third `Decision` variant and silently dropped the
+            // subject from `emitted_subjects` — measured with a variant probe
+            // before the repair. A `match` makes the next disposition a compile
+            // error at this site.
+            match decision {
+                decision::Decision::Ref { .. } => {}
+                decision::Decision::Degraded(_) => continue,
             }
             let owner = tcx.def_path_str(subject.fn_did.to_def_id());
             if unplaceable_subjects.contains(

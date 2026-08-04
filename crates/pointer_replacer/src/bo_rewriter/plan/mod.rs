@@ -230,11 +230,17 @@ pub(crate) fn plan(
         if reverted(subject) {
             continue;
         }
-        let Decision::Ref { mutable } = decision else {
+        // EXHAUSTIVE (S3.0, ruling 5). A `let …else` here compiled clean against
+        // a third `Decision` variant and silently produced no edit AND no
+        // `Unplaceable` record — measured with a variant probe before the
+        // repair: the build named only `artifact::rows` and `degradations()`.
+        // A `match` makes the next disposition a compile error at this site.
+        let mutable = match decision {
+            Decision::Ref { mutable } => mutable,
             // Degraded subjects produce no edit BY DESIGN — the decision phase
             // already recorded why, and re-deciding here would duplicate the
             // authority the architecture puts in one place.
-            continue;
+            Decision::Degraded(_) => continue,
         };
         let attribution = || {
             format!(
