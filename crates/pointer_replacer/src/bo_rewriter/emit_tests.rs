@@ -1645,8 +1645,18 @@ fn reason_of(got: &[(String, bool, String)], name: &str, is_param: bool) -> Stri
 /// against the pre-repair build first: `p` came back `ref-shared`, so it
 /// genuinely reached the gate and was waved through.
 ///
-/// *Mutation-tested (Rider 0, deletion first):* deleting the `binding_hir`
-/// insert in `collect_local_subjects` restores `ref-shared` here.
+/// *Mutation-tested (Rider 0, deletion first), with the claim CORRECTED after
+/// measurement:* deleting the `binding_hir` insert does **not** restore
+/// `ref-shared` — an earlier draft of this comment said it would. With the map
+/// empty the attribution lookup finds nothing and the collector **panics** by
+/// design, naming the local and its span. Killed, but through the contradiction
+/// arm rather than through this assertion.
+///
+/// The mutation that reproduces the ORIGINAL defect is restoring
+/// `hir_id: rustc_hir::CRATE_HIR_ID` at the construction site: `p` comes back
+/// `<emitted>` and this test fails on exactly that. Recorded rather than
+/// silently re-pointed — a wrong mutation claim is the kind of thing that gets
+/// copied forward.
 #[test]
 fn a_raw_only_method_on_a_local_degrades_it() {
     let got = decisions_of(
@@ -1672,9 +1682,16 @@ fn a_raw_only_method_on_a_local_degrades_it() {
 /// still pass if a later change killed the gate for *everyone*, and would
 /// report that as success.
 ///
-/// *Mutation-tested:* deleting the `binding_hir` insert fails the local
-/// assertion and leaves the parameter one green — reproducing the defect
-/// exactly, and naming which half of the pair detects it.
+/// *Mutation-tested (defect restoration — `hir_id` back to `CRATE_HIR_ID`;
+/// the earlier draft named the `binding_hir` DELETION here, which panics
+/// instead and so proves nothing about this pair):* the measured failure is
+///
+/// ```text
+/// local operand: [("a", true, "<emitted>"), ("b", true, "ptr-comparison"), ("q", false, "<emitted>")]
+/// ```
+///
+/// — the parameter assertion green, the local one red, with both operands of
+/// the one comparison printed side by side. That single line **is** the defect.
 #[test]
 fn one_comparison_degrades_its_parameter_and_its_local_operand_alike() {
     let got = decisions_of(
@@ -1700,8 +1717,17 @@ fn one_comparison_degrades_its_parameter_and_its_local_operand_alike() {
 /// repair must gate exactly the locals carrying a raw-only use, not the
 /// population.
 ///
-/// *Mutation-tested:* degrading unconditionally at the A1 arms fails this while
-/// leaving the two witnesses above green — which is why it exists.
+/// *Mutation-tested, claim CORRECTED after measurement:* injecting an
+/// unconditional degrade before the A1 arms fails this test — and also fails
+/// `a_raw_only_method_on_a_local_degrades_it`, which an earlier draft said
+/// would stay green. It cannot: that witness asserts a *specific* reason, and
+/// the injected one is a different reason. Only
+/// `one_comparison_degrades_its_parameter_and_its_local_operand_alike` survives,
+/// because the injected reason happens to be the one it expects.
+///
+/// The point stands, and is what the mutation establishes: this control is the
+/// only test in the trio that can distinguish *"the gate works"* from *"every
+/// local degrades"*. 24 tests died with it, so the injection was effective.
 #[test]
 fn a_local_with_no_raw_only_use_is_still_emitted() {
     let got = decisions_of(
