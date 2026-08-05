@@ -17,6 +17,10 @@ use utils::ir::AstToHir;
 #[derive(Debug, Default, Clone, Deserialize)]
 pub struct Config {
     pub c_exposed_fns: FxHashSet<String>,
+    // struct-param field specialization records produced by the pointer pass;
+    // consumed by the interface pass to synthesize c-facing wrappers (task 3)
+    #[serde(default)]
+    pub field_spec: utils::field_spec::FieldSpecMap,
 }
 
 pub fn fix_interfaces(config: &Config, tcx: TyCtxt<'_>) -> String {
@@ -258,6 +262,7 @@ pub unsafe extern "C" fn match_0(test: &[f64], reference: &[f64], bins: i32) -> 
 "#;
         let config = super::Config {
             c_exposed_fns: FxHashSet::from_iter(["match".to_string()]),
+            ..Default::default()
         };
         let transformed = utils::compilation::run_compiler_on_str(code, |tcx| {
             super::fix_interfaces(&config, tcx)
@@ -269,5 +274,15 @@ pub unsafe extern "C" fn match_0(test: &[f64], reference: &[f64], bins: i32) -> 
         assert!(transformed.contains("fn match_0_internal"));
         assert!(transformed.contains("fn match_0(test: *const f64"));
         assert_eq!(transformed.matches("#[export_name = \"match\"]").count(), 1);
+    }
+
+    // backward compat: config text written before field_spec existed still
+    // deserializes, with field_spec defaulting to an empty map
+    #[test]
+    fn config_without_field_spec_deserializes_with_default() {
+        let text = r#"{"c_exposed_fns": ["foo"]}"#;
+        let config: super::Config = serde_json::from_str(text).unwrap();
+        assert!(config.field_spec.is_empty());
+        assert!(config.c_exposed_fns.contains("foo"));
     }
 }

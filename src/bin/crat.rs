@@ -477,8 +477,13 @@ fn main() {
                 run_compiler_on_path(&file, formatter::format).unwrap();
             }
             Pass::Interface => {
+                let mut icfg = config.interface.clone();
+                let field_spec_path = dir.join("field_spec_map.json");
+                if let Ok(text) = std::fs::read_to_string(&field_spec_path) {
+                    icfg.field_spec = serde_json::from_str(&text).unwrap();
+                }
                 let s = run_compiler_on_path(&file, |tcx| {
-                    interface_fixer::fix_interfaces(&config.interface, tcx)
+                    interface_fixer::fix_interfaces(&icfg, tcx)
                 })
                 .unwrap();
                 std::fs::write(&file, s).unwrap();
@@ -561,7 +566,14 @@ fn main() {
                     pointer_replacer::rewrite_struct_param_fields(&config.pointer, tcx)
                 })
                 .unwrap();
-                let _ = field_specs; // consumed by the interface pass in the next task
+                if !field_specs.is_empty() {
+                    let field_spec_path = dir.join("field_spec_map.json");
+                    std::fs::write(
+                        &field_spec_path,
+                        serde_json::to_string_pretty(&field_specs).unwrap(),
+                    )
+                    .unwrap();
+                }
                 if changed {
                     std::fs::write(&file, s).unwrap();
                 }
