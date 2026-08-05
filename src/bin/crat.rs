@@ -557,10 +557,11 @@ fn main() {
                     std::fs::write(&file, s).unwrap();
                 }
 
-                let (s, changed) = run_compiler_on_path(&file, |tcx| {
+                let (s, changed, field_specs) = run_compiler_on_path(&file, |tcx| {
                     pointer_replacer::rewrite_struct_param_fields(&config.pointer, tcx)
                 })
                 .unwrap();
+                let _ = field_specs; // consumed by the interface pass in the next task
                 if changed {
                     std::fs::write(&file, s).unwrap();
                 }

@@ -225,7 +225,10 @@ pub fn rewrite_struct_arrays(config: &Config, tcx: TyCtxt<'_>) -> (String, bool)
     (pprust::crate_to_string_for_macros(&krate), changed)
 }
 
-pub fn rewrite_struct_param_fields(config: &Config, tcx: TyCtxt<'_>) -> (String, bool) {
+pub fn rewrite_struct_param_fields(
+    config: &Config,
+    tcx: TyCtxt<'_>,
+) -> (String, bool, utils::field_spec::FieldSpecMap) {
     let mut krate = utils::ast::expanded_ast(tcx);
     let ast_to_hir = utils::ast::make_ast_to_hir(&mut krate, tcx);
     utils::ast::remove_unnecessary_items_from_ast(&mut krate);
@@ -256,9 +259,13 @@ pub fn rewrite_struct_param_fields(config: &Config, tcx: TyCtxt<'_>) -> (String,
         &config.c_exposed_fns,
     );
 
-    let changed =
+    let (changed, field_specs) =
         struct_param_field_spec::apply_struct_param_field_spec(&mut krate, &plan, tcx, &ast_to_hir);
-    (pprust::crate_to_string_for_macros(&krate), changed)
+    (
+        pprust::crate_to_string_for_macros(&krate),
+        changed,
+        field_specs,
+    )
 }
 
 pub fn rewrite_array_local_provenance(config: &Config, tcx: TyCtxt<'_>) -> (String, bool) {

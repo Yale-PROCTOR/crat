@@ -4,8 +4,6 @@
 //! before any mutation; an unresolvable function drops out together with the
 //! targets that forward into it (group-atomic, no partial rewrites).
 
-use std::fmt::Write as _;
-
 use rustc_ast::{
     mut_visit::{self, MutVisitor},
     ptr::P,
@@ -20,7 +18,10 @@ use rustc_hir::def::{DefKind, Res};
 use rustc_middle::ty::{self, TyCtxt};
 use rustc_span::{Ident, Symbol, def_id::LocalDefId, sym};
 use thin_vec::{ThinVec, thin_vec};
-use utils::ir::AstToHir;
+use utils::{
+    field_spec::{FieldSpecAttr, FieldSpecEntry, FieldSpecMap, FieldSpecParam},
+    ir::AstToHir,
+};
 
 use crate::analyses::struct_param_field_spec::{SiteEmission, SpecPlan, SpecTarget};
 
@@ -39,8 +40,12 @@ struct FnPlan {
     // and signature emission keep using `field_ty` (same-module, unaffected)
     field_mir_ty_str: String,
     mutbl: Mutability,
-    // Some(new name) when the fn is c-exposed: rename to `{name}_field`, strip
-    // abi attrs, emit an original-signature wrapper
+    // the target field's declaring struct's own name (`tcx.item_name` of
+    // `SpecTarget::struct_def`), carried for `FieldSpecParam::struct_name`
+    struct_name: String,
+    // Some(new name) when the fn is c-exposed: rename to `{name}_field`,
+    // strip abi attrs, and record a `FieldSpecEntry` (no wrapper emitted
+    // here; a later pass consumes the record to synthesize the ABI shim)
     exposed_rename: Option<Symbol>,
 }
 
@@ -49,11 +54,11 @@ pub(crate) fn apply_struct_param_field_spec(
     plan: &SpecPlan,
     tcx: TyCtxt<'_>,
     ast_to_hir: &AstToHir,
-) -> bool {
+) -> (bool, FieldSpecMap) {
     let field_tys = collect_field_tys(krate, plan, ast_to_hir);
     let fn_plans = resolve_and_validate(krate, plan, &field_tys, tcx, ast_to_hir);
     if fn_plans.is_empty() {
-        return false;
+        return (false, FieldSpecMap::new());
     }
     let exposed_renames: FxHashMap<LocalDefId, Symbol> = fn_plans
         .iter()
@@ -70,9 +75,10 @@ pub(crate) fn apply_struct_param_field_spec(
         pending_renames: FxHashMap::default(),
         guard_counter: 0,
         changed: false,
+        field_specs: FieldSpecMap::new(),
     };
     visitor.visit_crate(krate);
-    visitor.changed
+    (visitor.changed, visitor.field_specs)
 }
 
 // recurses into `ItemKind::Mod` so callers see every item regardless of how
@@ -260,6 +266,19 @@ fn field_mir_ty_string(
     utils::ir::mir_ty_to_string(field_ty, tcx)
 }
 
+// the fn's c2rust module path: `tcx.def_path_str` minus the fn's own
+// trailing segment. e.g. a fn nested in c2rust's `pub mod src { pub mod lib
+// { ... } }` wrapper prints as `src::lib::foo`, so its module is `src::lib`;
+// a crate-root fn's path has no `::` at all, so its module is `""`. pinned
+// exactly by `test_field_module_path_format` below
+fn field_module_path(tcx: TyCtxt<'_>, did: LocalDefId) -> String {
+    let path = tcx.def_path_str(did.to_def_id());
+    match path.rsplit_once("::") {
+        Some((prefix, _)) => prefix.to_string(),
+        None => String::new(),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn resolve_fn_plan(
     func: &Fn,
@@ -290,6 +309,7 @@ fn resolve_fn_plan(
         ok: true,
     };
     checker.visit_block(body);
+    let struct_name = tcx.item_name(target.struct_def.to_def_id()).to_string();
     checker.ok.then_some(FnPlan {
         param_idx,
         param_name: param_ident.name,
@@ -297,6 +317,7 @@ fn resolve_fn_plan(
         field_ty,
         field_mir_ty_str,
         mutbl: target.mutbl,
+        struct_name,
         exposed_rename,
     })
 }
@@ -528,6 +549,10 @@ struct SpecTransformVisitor<'a, 'tcx> {
     // per-function counter for unique `__crat_g{n}` names
     guard_counter: u32,
     changed: bool,
+    // one FieldSpecEntry per surviving exposed target, keyed by the C symbol
+    // (original ident for name-exposure, export_name value otherwise);
+    // consumed by a later pass to synthesize the ABI shim
+    field_specs: FieldSpecMap,
 }
 
 // a hoisted null-checked guard for one guarded-emission call argument
@@ -553,8 +578,10 @@ impl MutVisitor for SpecTransformVisitor<'_, '_> {
         }
 
         let mut entered = false;
-        // (orig-signature snapshot, new name) for wrapper emission
-        let mut wrapper_info: Option<(P<Item>, Symbol)> = None;
+        // (orig-signature snapshot, new name, fn did) for field-spec record
+        // building; the snapshot is taken before rename/attr-strip below so
+        // the record captures the pre-mutation ident and attrs
+        let mut exposed_snapshot: Option<(P<Item>, Symbol, LocalDefId)> = None;
         // current_fn_did is tracked for every fn item, not just target fns:
         // the hoist scan needs it to key site_emissions lookups regardless
         // of whether the enclosing fn itself specializes a param
@@ -578,7 +605,7 @@ impl MutVisitor for SpecTransformVisitor<'_, '_> {
             }
             if let Some(new_name) = rename {
                 // snapshot the original item (name, attrs, signature) before mutation
-                wrapper_info = Some((item.clone(), new_name));
+                exposed_snapshot = Some((item.clone(), new_name, did));
             }
             let ItemKind::Fn(func) = &mut item.kind else { unreachable!() };
             for fn_plan in by_name.values() {
@@ -595,7 +622,7 @@ impl MutVisitor for SpecTransformVisitor<'_, '_> {
                 });
                 self.changed = true;
             }
-            if let Some((_, new_name)) = &wrapper_info {
+            if let Some((_, new_name, _)) = &exposed_snapshot {
                 func.ident.name = *new_name;
                 item.attrs.retain(|attr| {
                     !attr.has_name(sym::export_name) && !attr.has_name(sym::no_mangle)
@@ -607,15 +634,15 @@ impl MutVisitor for SpecTransformVisitor<'_, '_> {
             }
         }
 
-        let mut items = mut_visit::walk_flat_map_item(self, item);
+        let items = mut_visit::walk_flat_map_item(self, item);
         if entered {
             self.current_fn = None;
         }
         if entered_fn_did {
             self.current_fn_did = outer_fn_did;
         }
-        if let Some((orig_item, new_name)) = wrapper_info {
-            items.push(self.build_wrapper(orig_item, new_name));
+        if let Some((orig_item, new_name, did)) = exposed_snapshot {
+            self.record_field_spec(&orig_item, new_name, did);
         }
         items
     }
@@ -702,52 +729,49 @@ impl SpecTransformVisitor<'_, '_> {
         Some(sibling)
     }
 
-    // original name/attrs/signature; body forwards to the renamed function,
-    // converting each specialized param to a null-guarded field address
-    fn build_wrapper(&mut self, mut wrapper: P<Item>, new_name: Symbol) -> P<Item> {
-        let ItemKind::Fn(func) = &mut wrapper.kind else { unreachable!() };
-        let did = self.ast_to_hir.global_map[&wrapper.id];
-        // each specialized param's null-guarded conversion is hoisted into its own
-        // `let` statement ahead of the call, instead of being embedded inline in the
-        // call argument. this lets the downstream borrow-promotion pass transform the
-        // guard and the field-address branch together, under one context, instead of
-        // two independent call-argument-scoped rewrite rules colliding on the same
-        // source variable (see wrapper-io-diagnosis.md)
-        let mut lets = Vec::new();
-        let mut call = format!("{new_name}(");
-        for (i, param) in func.sig.decl.inputs.iter().enumerate() {
-            let PatKind::Ident(_, ident, _) = param.pat.kind else { unreachable!() };
-            let x = ident.name;
-            if let Some(fn_plan) = self.fn_plans.get(&(did, i)) {
-                let m = match fn_plan.mutbl {
-                    Mutability::Mut => "mut",
-                    Mutability::Not => "const",
-                };
-                let mm = match fn_plan.mutbl {
-                    Mutability::Mut => "mut ",
-                    Mutability::Not => "",
-                };
-                // module-independent spelling: this guard may be printed into
-                // a module that never imports the field's declaring module's
-                // c2rust type aliases (see field_mir_ty_string)
-                let ty = &fn_plan.field_mir_ty_str;
-                let fld = fn_plan.field_name;
-                let local = format!("__crat_{x}_field");
-                lets.push(utils::stmt!(
-                    "let {local} = if {x}.is_null() {{ 0 as *{m} {ty} }} else {{ &{mm}(*{x}).{fld} as *{m} {ty} }};",
-                ));
-                write!(call, "{local}, ").unwrap();
-            } else {
-                write!(call, "{x}, ").unwrap();
-            }
-        }
-        call.push(')');
-        let body = func.body.as_mut().unwrap();
-        body.stmts.clear();
-        body.stmts.extend(lets);
-        body.stmts.push(utils::stmt!("{call}"));
-        self.changed = true;
-        wrapper
+    // builds one FieldSpecEntry for a surviving exposed target, from the
+    // pre-rename/pre-strip item snapshot and this fn's fn_plans. the exported
+    // symbol (map key) is the original ident for name-based exposure, or the
+    // export_name attr's value when present -- i.e. the C symbol external
+    // callers resolve against; a later pass consumes the record to
+    // synthesize the actual ABI shim
+    fn record_field_spec(&mut self, orig_item: &Item, new_name: Symbol, did: LocalDefId) {
+        let ItemKind::Fn(orig_func) = &orig_item.kind else { unreachable!() };
+        let attr = orig_item
+            .attrs
+            .iter()
+            .find(|attr| attr.has_name(sym::export_name))
+            .and_then(|attr| attr.value_str())
+            .map(|s| FieldSpecAttr::ExportName(s.to_string()))
+            .unwrap_or(FieldSpecAttr::NoMangle);
+        let exported_symbol = match &attr {
+            FieldSpecAttr::ExportName(s) => s.clone(),
+            FieldSpecAttr::NoMangle => orig_func.ident.name.to_string(),
+        };
+        let mut params: Vec<FieldSpecParam> = self
+            .fn_plans
+            .iter()
+            .filter(|&(&(target_did, _), _)| target_did == did)
+            .map(|(&(_, index), fn_plan)| FieldSpecParam {
+                index,
+                struct_name: fn_plan.struct_name.clone(),
+                field: fn_plan.field_name.to_string(),
+                mutbl: match fn_plan.mutbl {
+                    Mutability::Mut => "mut".to_string(),
+                    Mutability::Not => "const".to_string(),
+                },
+            })
+            .collect();
+        params.sort_by_key(|p| p.index);
+        self.field_specs.insert(
+            exported_symbol,
+            FieldSpecEntry {
+                internal: new_name.to_string(),
+                module: field_module_path(self.tcx, did),
+                attr,
+                params,
+            },
+        );
     }
 
     // `(*s).field` -> `(*s)` inside a specialized function
