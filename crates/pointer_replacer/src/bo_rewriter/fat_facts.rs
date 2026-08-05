@@ -56,8 +56,24 @@ impl FatFacts {
     /// The raw verdict for a local's **depth-0** pointer position.
     ///
     /// `None` when the local carries no pointer variable at all — a non-pointer
-    /// local, or an index past the function's locals. Distinct from `Ptr`:
-    /// absence of a variable is not a verdict.
+    /// local, or an index past the function's locals. **Distinct from `Ptr`:
+    /// absence of a variable is a LOOKUP MISS, not a verdict**, and this method
+    /// keeps them apart so instruments can measure the raw capture.
+    ///
+    /// # The `None` policy, for S3.2′-4's wiring (ruling A-1′, 2026-08-06)
+    ///
+    /// At the **decision layer** `None` is treated as `Ptr` (thin), on legacy
+    /// parity — `rewriter/decision.rs:144` does exactly this
+    /// (`.map(|f| f.is_arr()).unwrap_or(false)`). Two conditions ride with it
+    /// and neither is discretionary:
+    ///
+    /// - **`None`-derived thin decisions are ATTRIBUTED separately**, never
+    ///   folded into `Some(Ptr)` counts. Like `param-no-site`, it is a
+    ///   statement about this analysis's *reach*, not about the program.
+    /// - **The mapping is decision-layer behaviour only.** Measurement records
+    ///   the raw lookup — see [`Self::render`], which emits `-` for `None`.
+    ///   Applying the policy at measurement time would make the instrument
+    ///   report the decision instead of the capture.
     pub(crate) fn verdict(&self, fn_did: LocalDefId, local: Local) -> Option<Fatness> {
         self.result.function_body_fact(fn_did, local.index(), 0)
     }
