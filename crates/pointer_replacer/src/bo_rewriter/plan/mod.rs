@@ -253,13 +253,10 @@ pub(crate) fn plan(
         // Two spellings of one identity would make the subtraction silently
         // empty — the failure mode would be `emitted` staying decision-shaped
         // while looking placement-shaped.
-        let identity = || {
-            format!(
-                "{}::{}",
-                owner_of(subject),
-                subject.param_name.as_deref().unwrap_or("<unnamed>")
-            )
-        };
+        // S3.0′: ONE definition, in `decision`. This site used to build the key
+        // by hand and the driver built the same string by hand beside it — a
+        // duplicated canonicalizer whose two copies had to be edited together.
+        let identity = || subject.identity_key(&owner_of(subject));
         // A `Ref` decision implies a syntactic raw-pointer declaration:
         // `decide_one` degrades every other shape with `NonPointerDecl`,
         // precisely because there is no pointee text to copy through an alias.

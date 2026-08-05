@@ -384,22 +384,17 @@ fn rewrite_core_injected(
                 decision::Decision::Degraded(_) => continue,
             }
             let owner = tcx.def_path_str(subject.fn_did.to_def_id());
-            if unplaceable_subjects.contains(
-                format!(
-                    "{owner}::{}",
-                    subject.param_name.as_deref().unwrap_or("<unnamed>")
-                )
-                .as_str(),
-            ) {
+            // S3.0′: the SAME key `plan` stamped into `Unplaceable::subject`.
+            // Built here by hand until S3.0′, beside an identical hand-built
+            // copy in `plan` — and both keyed on the NAME, so two subjects that
+            // render the same name in one function collapsed into one.
+            let key = subject.identity_key(&owner);
+            if unplaceable_subjects.contains(key.as_str()) {
                 continue;
             }
             emitted_subjects.push((
                 owner.clone(),
-                format!(
-                    "{}::{}",
-                    owner,
-                    subject.param_name.as_deref().unwrap_or("<unnamed>")
-                ),
+                key,
                 decision::emitability::EmitabilityFacts::site(tcx, subject.ty_span),
             ));
             if !seen_fns.insert(subject.fn_did) {

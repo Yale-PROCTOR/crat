@@ -1431,3 +1431,63 @@ fn a_degraded_outcome_reports_placements_too() {
         }
     }
 }
+
+/// **S3.0′ — two subjects that render the SAME NAME stay distinct.**
+///
+/// `mixed` has two anonymous pointer parameters, so both carry
+/// `param_name: None`. Both reach `Decision::Ref` (measured, not assumed), and
+/// the second one's type comes from a macro, so its span cannot be spliced and
+/// `plan` records it as unplaceable. That is the shape a name-keyed identity
+/// cannot represent: both parameters render `mixed::<unnamed>`, the driver's
+/// unplaceable subtraction matches the FIRST one against the SECOND one's
+/// record, and skips a placement that actually happened.
+///
+/// Measured at `ebeb99fd`, before the key was repaired: `emitted_count == 0`
+/// while the emitted source read `fn mixed(_: &i32, _: ty2!())` — the rewrite is
+/// right there in the output — and the ratified identity
+/// `emitted + degraded + unplaceable == rows` failed `0 + 0 + 1 != 2`.
+///
+/// **Reachability (Rider 5) is shown, not asserted:** the assertion below is on
+/// `emitted_count`, the driver's real counter, reached through `rewrite_m1` —
+/// the same path the corpus sweep uses. The corpus has never exposed this only
+/// because `unplaceable == 0` there, so the `contains` check never matches.
+///
+/// *Mutation-tested (Rider 0, deletion first):* deleting the `#{mir_local}`
+/// suffix from [`Subject::identity_key`] — i.e. reverting to the name-only key —
+/// makes this fail with `emitted_count` 0 instead of 1.
+#[test]
+fn two_subjects_with_the_same_rendered_name_stay_distinct() {
+    let src = "#![allow(dead_code, unused_unsafe)]\nmacro_rules! ty2 { () => { *mut i32 } }\npub unsafe fn mixed(_: *mut i32, _: ty2!()) -> i32 { 0 }\n";
+    let super::RewriteOutcome::Emitted {
+        emitted_count,
+        unplaceable,
+        degradations,
+        source,
+        ..
+    } = super::rewrite_m1(src)
+    else {
+        panic!("fixture must emit");
+    };
+
+    assert_eq!(
+        unplaceable.len(),
+        1,
+        "the macro-typed parameter is the unplaceable one: {unplaceable:?}"
+    );
+    assert_eq!(
+        emitted_count, 1,
+        "the PLACEABLE parameter must still be counted — a name-keyed identity \
+         matches it against the other parameter's unplaceable record and drops \
+         it. Emitted source was:\n{source}"
+    );
+    assert!(
+        source.contains("_: &i32"),
+        "the placement the count claims must be visible in the output:\n{source}"
+    );
+    // The identity the corpus pin enforces, on the fixture that breaks it.
+    assert_eq!(
+        emitted_count + degradations.len() + unplaceable.len(),
+        2,
+        "emitted + degraded + unplaceable == rows, over 2 subjects"
+    );
+}

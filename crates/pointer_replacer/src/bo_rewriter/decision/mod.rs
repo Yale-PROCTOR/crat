@@ -108,6 +108,43 @@ pub(crate) struct Subject {
     pub mutable: bool,
 }
 
+impl Subject {
+    /// **THE subject identity — one definition, three consumers.**
+    ///
+    /// `plan` stamps it into [`super::plan::Unplaceable::subject`], the driver
+    /// rebuilds it to subtract unplaceable decisions from the emitted set, and
+    /// it is the string rendering of the pair the artifact `Row` already keys
+    /// by: `fn_path` + `mir_local` (`artifact/mod.rs`). Those three must agree
+    /// or the accounting identity compares different populations, so there is
+    /// one function rather than three `format!`s.
+    ///
+    /// **The identity is `owner` + `mir_local`. The name is carried for
+    /// READABILITY and carries none of it.** Two subjects in one function can
+    /// render the same name:
+    ///
+    /// - **today** — `fn anon(_: *mut i32, _: *mut i32)` gives both parameters
+    ///   `param_name: None`, so a name-keyed identity renders `anon::<unnamed>`
+    ///   twice. Measured: both reach `Decision::Ref`, so this is on the emitting
+    ///   path, not a curiosity. With one of them unplaceable, the driver's
+    ///   `contains` check then skips the OTHER — the emitted source shows the
+    ///   rewrite while `emitted_count` reports 0, and
+    ///   `emitted + degraded + unplaceable == rows` fails 1 ≠ 2. It has never
+    ///   fired on the corpus only because `unplaceable == 0` there.
+    /// - **S3.1** — locals may legitimately share a name: `let p = …; let p = …;`
+    ///   binds two distinct locals, each with its own `var_debug_info` entry,
+    ///   both named `p`.
+    ///
+    /// `Local::as_u32` rather than `Local`'s `Debug` so the rendering matches
+    /// the artifact's `mir_local` exactly rather than approximately.
+    pub(crate) fn identity_key(&self, owner: &str) -> String {
+        format!(
+            "{owner}::{}#{}",
+            self.param_name.as_deref().unwrap_or("<unnamed>"),
+            self.local.as_u32()
+        )
+    }
+}
+
 /// Why a subject was not emitted.
 ///
 /// A typed reason rather than a string: the counters S2b aggregates need to
