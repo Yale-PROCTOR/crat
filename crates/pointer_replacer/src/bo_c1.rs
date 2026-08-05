@@ -8272,6 +8272,98 @@ fn expected_zero_aggregate(row: &report::Row, class: &str) -> Result<(), String>
     expected_zero_field(row, &format!("agg_{}", class.replace('-', "_")))
 }
 
+/// **Ruling F — the per-program expected-N table for non-evaluable LOCALS.**
+///
+/// Parameters keep expected-ZERO (`expected_zero_aggregate`, Track 2's
+/// calibration, untouched). Locals cannot: 2628 of 3142 corpus locals are
+/// unannotated C2Rust bindings with no declared type, so producer A has no
+/// splice target to offer and the evaluable conjunction cannot be satisfied.
+///
+/// **A fixed table rather than "nonzero is fine", because it catches BOTH
+/// regression directions.** A DROP means spans appeared where none should exist
+/// — annotation synthesis, or a producer emitting a non-splice-target. A RISE
+/// means annotation detection broke and real declarations stopped resolving.
+/// "Some number ≥ 0" would catch neither.
+///
+/// Measured by the E′ probe at code `75a2d8fe` (2026-08-05, digest
+/// `9fc912af…0e621`), and cross-checked against an independent offline analyzer
+/// that agreed exactly. **Values change only by ruling, and only re-measured.**
+#[cfg(test)]
+const EXPECTED_NOT_EVALUABLE_LOCAL: &[(&str, u64)] = &[
+    ("avl", 16),
+    ("binn", 132),
+    ("brotli", 800),
+    ("bst", 12),
+    ("buffer", 40),
+    ("bzip2", 15),
+    ("genann", 61),
+    ("heman", 378),
+    ("ht", 12),
+    ("json.h", 228),
+    ("libcsv", 25),
+    ("libtree", 59),
+    ("libzahl", 67),
+    ("lil", 303),
+    ("lodepng", 248),
+    ("quadtree", 40),
+    ("rgba", 7),
+    ("robotfindskitten", 1),
+    ("tulipindicators", 115),
+    ("urlparser", 69),
+];
+
+/// The locals aggregate against its per-program expectation.
+///
+/// Fail-closed on a missing program exactly as the zero-pin is on a missing
+/// field: an unpinned program is a hole in the table, not a pass.
+#[cfg(test)]
+fn expected_not_evaluable_local(row: &report::Row, program: &str) -> Result<(), String> {
+    let key = "agg_span_check_not_evaluable_local";
+    let want = EXPECTED_NOT_EVALUABLE_LOCAL
+        .iter()
+        .find(|(name, _)| *name == program)
+        .map(|(_, n)| *n)
+        .ok_or_else(|| format!("{program}: absent from EXPECTED_NOT_EVALUABLE_LOCAL"))?;
+    let raw = row
+        .get(key)
+        .ok_or_else(|| format!("{key}=missing (expected {want})"))?;
+    let got: u64 = raw
+        .parse()
+        .map_err(|_| format!("{key}={raw:?} (unparseable; expected {want})"))?;
+    if got == want {
+        Ok(())
+    } else {
+        Err(format!(
+            "{key}={got} (expected {want}) — a DROP means spans appeared where \
+             no declaration exists; a RISE means annotation detection broke"
+        ))
+    }
+}
+
+#[test]
+fn the_local_not_evaluable_pin_is_fail_closed() {
+    let mut row = report::Row::default();
+    // Missing field.
+    assert!(
+        expected_not_evaluable_local(&row, "bst")
+            .expect_err("a missing aggregate must fail")
+            .contains("missing"),
+    );
+    // Unpinned program.
+    row.set("agg_span_check_not_evaluable_local", "12");
+    assert!(
+        expected_not_evaluable_local(&row, "not-a-program")
+            .expect_err("an unpinned program must fail")
+            .contains("absent from"),
+    );
+    // Exact match passes; either direction fails.
+    assert!(expected_not_evaluable_local(&row, "bst").is_ok());
+    row.set("agg_span_check_not_evaluable_local", "11");
+    assert!(expected_not_evaluable_local(&row, "bst").is_err(), "a DROP must fail");
+    row.set("agg_span_check_not_evaluable_local", "13");
+    assert!(expected_not_evaluable_local(&row, "bst").is_err(), "a RISE must fail");
+}
+
 #[test]
 fn a_missing_aggregate_fails_closed() {
     let row = report::Row::default();
@@ -8608,12 +8700,23 @@ fn m1_recon_corpus() {
             failures.push(format!("{}: recon={recon}", program.name));
         }
         for class in crate::coverage_recon::compare::FINDING_CLASSES {
+            // POPULATION-AWARE (ruling F). Every class keeps its expected-ZERO
+            // pin except the locals non-evaluable one, which has a per-program
+            // expectation instead — see `EXPECTED_NOT_EVALUABLE_LOCAL`. The
+            // exclusion is by NAME rather than by index so reordering
+            // `FINDING_CLASSES` cannot silently re-point it.
+            if *class == "span-check-not-evaluable-local" {
+                continue;
+            }
             if let Err(detail) = expected_zero_aggregate(&row, class) {
                 // The expected-zero pin. A nonzero class is a gate-level
                 // finding to rule on, never auto-green: attribution without
                 // aggregation is how downgrades go silent.
                 failures.push(format!("{}: {detail}", program.name));
             }
+        }
+        if let Err(detail) = expected_not_evaluable_local(&row, program.name) {
+            failures.push(format!("{}: {detail}", program.name));
         }
 
         // Provenance: digests of the exact bytes the verdict was computed from.

@@ -660,3 +660,53 @@ fn the_span_axis_activation_predicate_has_no_gray_zone() {
          as tolerated dormancy: {v:#?}"
     );
 }
+
+/// **Ruling F — an unannotated LOCAL is non-evaluable under its OWN class.**
+///
+/// The population split exists because the two halves have different expected
+/// values: a parameter always has a declared type, so a non-evaluable parameter
+/// is an instrument fault (expected zero); an unannotated local has no
+/// declaration to point at, and 83.6% of corpus locals are exactly that.
+///
+/// The assertion is two-sided on purpose. Counting the local is half the
+/// property; the other half is that it did **not** land in the parameter class,
+/// because that class keeps a zero-pin and a mis-routed local would break the
+/// Track 2 calibration rather than its own.
+///
+/// *Mutation-tested (Rider 0, deletion first):* deleting the
+/// `span-check-not-evaluable-local` arm in `compare`'s population split — so the
+/// local is counted under the parameter class — fails this on BOTH assertions.
+#[test]
+fn an_unannotated_local_counts_under_the_locals_class() {
+    // A: a local (arg_index None) with NO decl_span — the unannotated shape.
+    let mut a_local = bare_row("m::f", 2, Some("p"), None, 1);
+    a_local.outcome = Some(Outcome::Degraded);
+    a_local.degrade_reason = Some("no-declared-type".to_owned());
+    // A parameter alongside it, fully evaluable, so the span axis has a
+    // parameter to walk and the parameter class is exercised rather than empty.
+    let a_param = full_row();
+
+    // B: binding spans present, which is what makes the axis ACTIVE.
+    let mut b_local = bare_row("m::f", 2, Some("p"), None, 1);
+    b_local.binding_span_lo = Some(70);
+    b_local.binding_span_hi = Some(71);
+    let mut b_param = bare_row("m::f", 1, Some("p"), Some(1), 1);
+    b_param.binding_span_lo = Some(44);
+    b_param.binding_span_hi = Some(45);
+
+    let verdict = compare(&[a_param, a_local], &[b_param, b_local]);
+
+    assert_eq!(
+        verdict.aggregates.get("span-check-not-evaluable-local"),
+        Some(&1),
+        "the unannotated local must be counted under the LOCALS class: {:?}",
+        verdict.aggregates
+    );
+    assert_eq!(
+        verdict.aggregates.get("span-check-not-evaluable"),
+        Some(&0),
+        "the parameter class keeps its zero — a mis-routed local would break \
+         Track 2's calibration instead of its own: {:?}",
+        verdict.aggregates
+    );
+}

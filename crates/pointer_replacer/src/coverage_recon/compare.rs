@@ -68,6 +68,18 @@ pub(crate) const FINDING_CLASSES: &[&str] = &[
     // TARGET trustworthy — and folding them would make a nonzero aggregate
     // ambiguous about which axis degraded.
     "span-check-not-evaluable",
+    // POPULATION-AWARE (ruling F, 2026-08-05). Split from the class above
+    // because the two have different expected values, and one class cannot
+    // carry two calibrations.
+    //
+    // Parameters keep expected-ZERO: a parameter always has a declared type, so
+    // a non-evaluable parameter row means an instrument fault. Locals pin to a
+    // per-program expected-N table instead, because 2628 of 3142 corpus locals
+    // (83.6%) are unannotated C2Rust bindings — `let fresh0 = malloc(4) as *mut
+    // T;` — and have no declared type for producer A to point at. Synthesizing
+    // one was rejected: it would put a non-splice-target into a field whose doc
+    // says the audited number IS the edit target.
+    "span-check-not-evaluable-local",
 ];
 
 /// Is the span axis ACTIVE for this artifact pair?
@@ -303,8 +315,16 @@ pub(crate) fn compare(a_rows: &[Row], b_rows: &[Row]) -> Verdict {
                         prev_ty_hi = ty_hi;
                     }
                     _ => {
+                        // Population decides the class, and `arg_index` is the
+                        // discriminant: `None` means *not a parameter*, which
+                        // is exactly the locals population (S3.1 pre-flight).
+                        let class = if a.arg_index.is_some() {
+                            "span-check-not-evaluable"
+                        } else {
+                            "span-check-not-evaluable-local"
+                        };
                         verdict.findings.push(Finding {
-                            class: "span-check-not-evaluable",
+                            class,
                             fn_path: fn_path.to_owned(),
                             mir_local: a.mir_local,
                             detail: format!(
@@ -316,10 +336,7 @@ pub(crate) fn compare(a_rows: &[Row], b_rows: &[Row]) -> Verdict {
                                 a.pairing_confidence, b.pairing_confidence
                             ),
                         });
-                        *verdict
-                            .aggregates
-                            .entry("span-check-not-evaluable")
-                            .or_default() += 1;
+                        *verdict.aggregates.entry(class).or_default() += 1;
                         if let Some(hi) = a.decl_span_hi {
                             prev_ty_hi = hi;
                         }
