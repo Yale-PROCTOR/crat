@@ -1,6 +1,6 @@
 use rustc_hir::def::DefKind;
 use rustc_middle::{
-    mir::VarDebugInfoContents,
+    mir::{Local, VarDebugInfoContents},
     ty::{TyCtxt, TyKind},
 };
 
@@ -83,6 +83,81 @@ pub(crate) fn rows(tcx: TyCtxt<'_>) -> Vec<Row> {
                 mir_local: local.as_u32(),
                 param_name,
                 arg_index,
+                ptr_depth,
+                pairing_confidence,
+                decl_span: None,
+                decl_span_lo: None,
+                decl_span_hi: None,
+                binding_span_lo,
+                binding_span_hi,
+                decl_shape: None,
+                outcome: None,
+                degrade_reason: None,
+            });
+        }
+
+        for local_index in body.arg_count + 1..=body.local_decls.len() - 1 {
+            let local = Local::from_usize(local_index);
+            let mut ty = body.local_decls[local].ty;
+            let mut ptr_depth = 0;
+            while ptr_depth < 3 {
+                ty = match ty.kind() {
+                    TyKind::RawPtr(inner, _) | TyKind::Ref(_, inner, _) => *inner,
+                    _ => break,
+                };
+                ptr_depth += 1;
+            }
+            if ptr_depth == 0 {
+                continue;
+            }
+
+            let mut debug_entries = body.var_debug_info.iter().filter(|info| {
+                matches!(
+                    &info.value,
+                    VarDebugInfoContents::Place(place)
+                        if place.as_local() == Some(local)
+                )
+            });
+            let first = debug_entries.next();
+            let second = debug_entries.next();
+            if first.is_none() {
+                continue;
+            }
+
+            let paired_info: Option<&rustc_middle::mir::VarDebugInfo<'_>> =
+                match (first, second) {
+                    (Some(info), None) if info.argument_index.is_none() => Some(info),
+                    (Some(info), None) => {
+                        assert!(
+                            info.argument_index.is_none(),
+                            "non-parameter MIR local {local:?} unexpectedly carries argument_index {:?}",
+                            info.argument_index
+                        );
+                        None
+                    }
+                    (Some(_), Some(_)) => None,
+                    _ => None,
+                };
+            let (param_name, pairing_confidence, binding_span_lo, binding_span_hi) =
+                match paired_info {
+                    Some(info) => {
+                        let source_map = tcx.sess.source_map();
+                        let span = info.source_info.span;
+                        (
+                            Some(info.name.to_string()),
+                            PairingConfidence::High,
+                            Some(source_map.lookup_byte_offset(span.lo()).pos.0),
+                            Some(source_map.lookup_byte_offset(span.hi()).pos.0),
+                        )
+                    }
+                    None => (None, PairingConfidence::Low, None, None),
+                };
+
+            rows.push(Row {
+                fn_path: fn_path.clone(),
+                mir_local: local.as_u32(),
+                param_name,
+                arg_index: None,
                 ptr_depth,
                 pairing_confidence,
                 decl_span: None,
@@ -312,8 +387,9 @@ mod tests {
     }
 
     /// Positive control: the shadowing body binding receives a fresh MIR local
-    /// at this body-query phase, so no deletion mutation exists for this test.
-    /// It is a tripwire for a future body-query change that merges those locals.
+    /// at this body-query phase, so it cannot contaminate the parameter row.
+    /// The locals universe emits that fresh binding separately. No deletion
+    /// mutation exists for the parameter-pairing invariant this test pins.
     #[test]
     fn ignores_a_later_shadowing_binding() {
         let rows = fixture_rows(
@@ -326,10 +402,24 @@ mod tests {
             "#,
         );
 
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].param_name.as_deref(), Some("pointer"));
-        assert_eq!(rows[0].arg_index, Some(1));
-        assert_eq!(rows[0].pairing_confidence, PairingConfidence::High);
+        let pairing: Vec<_> = rows
+            .iter()
+            .map(|row| {
+                (
+                    row.mir_local,
+                    row.param_name.as_deref(),
+                    row.arg_index,
+                    row.pairing_confidence,
+                )
+            })
+            .collect();
+        assert_eq!(
+            pairing,
+            vec![
+                (1, Some("pointer"), Some(1), PairingConfidence::High),
+                (2, Some("pointer"), None, PairingConfidence::High),
+            ]
+        );
     }
 
     /// Replacing the entry-count branch with unconditional `High` fails this
@@ -382,5 +472,155 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].param_name.as_deref(), Some("h"));
         assert_eq!(rows[0].ptr_depth, 1);
+    }
+
+    /// L1: deleting the local `argument_index.is_none()` arm makes `_2`
+    /// low-confidence and fails this witness.
+    #[test]
+    fn locals_plain_named_binding_is_high_confidence() {
+        let rows = fixture_rows(
+            r#"
+            #![allow(dead_code, unused_variables)]
+            unsafe fn f(q: *mut i32) -> i32 {
+                let p: *mut i32 = q;
+                *p = 1;
+                *p + *q
+            }
+            "#,
+        );
+
+        let pairing: Vec<_> = rows
+            .iter()
+            .map(|row| {
+                (
+                    row.mir_local,
+                    row.param_name.as_deref(),
+                    row.arg_index,
+                    row.pairing_confidence,
+                )
+            })
+            .collect();
+        assert_eq!(
+            pairing,
+            vec![
+                (1, Some("q"), Some(1), PairingConfidence::High),
+                (2, Some("p"), None, PairingConfidence::High),
+            ]
+        );
+    }
+
+    /// L2: deleting the locals-row emission removes both shadow bindings and
+    /// fails this witness; the two equal names must not be used as row keys.
+    #[test]
+    fn locals_shadowed_bindings_remain_distinct_rows() {
+        let rows = fixture_rows(
+            r#"
+            #![allow(dead_code, unused_variables)]
+            unsafe extern "C" {
+                fn malloc(size: usize) -> *mut core::ffi::c_void;
+            }
+            unsafe fn f() -> i32 {
+                let p: *mut i32 = malloc(4) as *mut i32;
+                *p = 1;
+                let p: *mut i32 = malloc(4) as *mut i32;
+                *p = 2;
+                *p
+            }
+            "#,
+        );
+
+        let pairing: Vec<_> = rows
+            .iter()
+            .map(|row| {
+                (
+                    row.mir_local,
+                    row.param_name.as_deref(),
+                    row.arg_index,
+                    row.pairing_confidence,
+                )
+            })
+            .collect();
+        assert_eq!(
+            pairing,
+            vec![
+                (1, Some("p"), None, PairingConfidence::High),
+                (3, Some("p"), None, PairingConfidence::High),
+            ]
+        );
+    }
+
+    /// L3: deleting the zero-entry exclusion emits the pointer temporary and
+    /// fails this witness.
+    #[test]
+    fn locals_bare_pointer_temporary_is_excluded() {
+        let rows = fixture_rows(
+            r#"
+            #![allow(dead_code, unused_variables)]
+            unsafe extern "C" {
+                fn malloc(size: usize) -> *mut core::ffi::c_void;
+            }
+            unsafe fn f() -> i32 {
+                *(malloc(4) as *mut i32) = 3;
+                0
+            }
+            "#,
+        );
+
+        assert!(rows.is_empty());
+    }
+
+    /// L4: deleting the locals range's `arg_count + 1` lower bound admits the
+    /// named parameter and fires the local contradiction assertion.
+    #[test]
+    fn locals_and_parameters_are_disjoint_universes() {
+        let rows = fixture_rows(
+            r#"
+            #![allow(dead_code, unused_variables)]
+            unsafe fn f(q: *mut i32) -> i32 {
+                let p: *mut i32 = q;
+                *p = 1;
+                *p + *q
+            }
+            "#,
+        );
+
+        let keys: Vec<_> = rows
+            .iter()
+            .map(|row| (row.mir_local, row.arg_index))
+            .collect();
+        assert_eq!(keys, vec![(1, Some(1)), (2, None)]);
+    }
+
+    /// L5: deleting the depth test emits tuple parameter `_1` and fails this
+    /// witness; its component bindings `_2` and `_3` are ordinary locals rows.
+    #[test]
+    fn locals_pattern_parameter_components_are_rows() {
+        let rows = fixture_rows(
+            r#"
+            #![allow(dead_code, unused_variables)]
+            unsafe fn f((a, b): (*mut i32, *mut i32)) -> i32 {
+                *a + *b
+            }
+            "#,
+        );
+
+        let pairing: Vec<_> = rows
+            .iter()
+            .map(|row| {
+                (
+                    row.mir_local,
+                    row.param_name.as_deref(),
+                    row.arg_index,
+                    row.pairing_confidence,
+                )
+            })
+            .collect();
+        assert_eq!(
+            pairing,
+            vec![
+                (2, Some("a"), None, PairingConfidence::High),
+                (3, Some("b"), None, PairingConfidence::High),
+            ]
+        );
     }
 }
