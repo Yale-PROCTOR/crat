@@ -77,9 +77,24 @@ pub(crate) const FINDING_CLASSES: &[&str] = &[
 /// High rows are then real findings. **No gray zone** — a per-row fallback would
 /// let a partly-filled artifact look healthy while most of the axis was dark.
 ///
-/// Inactive is a bounded, declared state: producer B's `binding_span` arrives
-/// via the gated follow-on, `span_axis_is_active_on_producer_b` is RED until it
-/// does, and S2a-H cannot close while either holds.
+/// **STALE TEXT CORRECTED 2026-08-05 — the axis is ACTIVE and has been.**
+/// This comment used to read: *"Inactive is a bounded, declared state: producer
+/// B's `binding_span` arrives via the gated follow-on,
+/// `span_axis_is_active_on_producer_b` is RED until it does, and S2a-H cannot
+/// close while either holds."* That described the state before Track 2 landed.
+/// Producer B has emitted `binding_span_lo/hi` on High-confidence rows since,
+/// `span_axis_is_active_on_producer_b` **passes**, and the S2b.3 close records
+/// "span axis ACTIVE on all 20" in as many words.
+///
+/// It is corrected rather than deleted because it did real damage: an S3.1
+/// analysis read it as current, concluded the axis was dormant, and
+/// pre-registered a checkpoint prediction on that. **A doc comment naming a test
+/// is an instruction to RUN it, never a substitute for running it.**
+///
+/// As of S3.1 the axis spans **both** populations — parameters and named
+/// pointer locals. A local with no declared type has no `decl_span_lo`, so
+/// `span-check-not-evaluable` incidence is genuinely nonzero on that population;
+/// that is measured under ruling E′, not assumed here.
 pub(crate) fn span_axis_active(b_rows: &[Row]) -> bool {
     b_rows.iter().any(|r| r.binding_span_lo.is_some())
 }
