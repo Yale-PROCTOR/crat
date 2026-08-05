@@ -1711,6 +1711,62 @@ fn one_comparison_degrades_its_parameter_and_its_local_operand_alike() {
     );
 }
 
+/// **The facts join reports a fact the DECISION never reached.**
+///
+/// This is the instrument's whole purpose, so it is what the witness tests. The
+/// fixture's local is **unannotated**, so `decide_one` degrades it at
+/// `no-declared-type` — the first predicate — and never consults A1 at all. A
+/// reason-field tally therefore records nothing about its `.offset()` use, and
+/// would report the op population as smaller than it is.
+///
+/// The join must still report `annotated=0` **and** `raw_op=offset` on that
+/// same subject. If it cannot, it has inherited the ordering it exists to
+/// bypass, and every "zero" it certifies in the reachability table is worth
+/// nothing.
+///
+/// *Mutation-tested (Rider 0, deletion first):* replacing the `raw_only_uses`
+/// lookup with `"-"` fails on the op column; deriving the row from
+/// `decide_one`'s reason instead of from the facts fails the same way, which is
+/// the substantive mutation — it reintroduces exactly the coupling.
+#[test]
+fn the_facts_join_reports_facts_the_decision_never_reached() {
+    let src = "#![allow(dead_code, unused_unsafe, unused_variables)]\n\
+               pub unsafe fn f(a: *mut i32) -> i32 { let p = a; *p.offset(1) }\n";
+    let fixture = Fixture::new(&[("lib.rs", src)]);
+    let (reason, facts) = ::utils::compilation::run_compiler_on_path(
+        &fixture.0.join("lib.rs"),
+        |tcx| {
+            let table = super::decide_table(tcx).expect("table");
+            let rows = super::artifact::rows(tcx, &table);
+            let reason = rows
+                .iter()
+                .find(|r| r.arg_index.is_none())
+                .and_then(|r| r.degrade_reason.clone())
+                .unwrap_or_default();
+            (reason, super::facts_join_tsv(tcx).expect("facts join"))
+        },
+    )
+    .expect("fixture compiles");
+
+    assert_eq!(
+        reason, "no-declared-type",
+        "the fixture must degrade UPSTREAM of A1, or it witnesses nothing"
+    );
+    let local_row = facts
+        .lines()
+        .skip(1)
+        .map(|l| l.split('\t').collect::<Vec<_>>())
+        // is_param == "0"
+        .find(|c| c[2] == "0")
+        .unwrap_or_else(|| panic!("no local row in the facts join:\n{facts}"));
+    assert_eq!(local_row[3], "0", "the local is unannotated: {local_row:?}");
+    assert_eq!(
+        local_row[6], "offset",
+        "the join lost the op the decision never reached — it has inherited \
+         decide_one's ordering: {local_row:?}"
+    );
+}
+
 /// **The negative control: a clean local is still emitted.**
 ///
 /// Without it, "every local now degrades" would pass both witnesses above. The

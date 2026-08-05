@@ -7045,6 +7045,22 @@ mod run {
             },
         );
 
+        // S3.2′-0 — the facts-side join, written beside the artifacts it
+        // explains. Ordering-independent by construction: it reads the facts,
+        // not the decision, which is the whole reason the ruled method is a
+        // join rather than a reason-field tally.
+        //
+        // MEASUREMENT ONLY: written before the verdict is computed and read by
+        // nothing that computes it.
+        match crate::bo_rewriter::facts_join_tsv(tcx) {
+            Ok(tsv) => {
+                let path = dir.join(format!("{name}.facts.tsv"));
+                std::fs::write(&path, tsv)
+                    .unwrap_or_else(|e| panic!("write facts join {}: {e}", path.display()));
+            }
+            Err(why) => row.set("facts_join", super::report::sanitize(&why)),
+        }
+
         let verdict = compare::compare(&a_decoded, &b_decoded);
         let aggregates_clean = record_expected_zero_aggregates(&mut row, &verdict);
         row.set("violations", verdict.violations.len());

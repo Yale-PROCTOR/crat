@@ -50,10 +50,11 @@ use rustc_middle::{
 
 use crate::{
     analyses::borrow_ownership::{
-        CrateCtxt, borrow_verify::verify_to_fixpoint, coherence::add_coherence,
+        CrateCtxt, SlotKind, borrow_verify::verify_to_fixpoint, coherence::add_coherence,
         crate_slots::{CrateSlots, ptr_chain_depth},
         emit_crate_ownership_constraints, export::with_bo_export, mutability_facts::MutFacts,
-        origins::compute_origins, solver::KindSolver,
+        origins::compute_origins,
+        solver::{KindSolver, SlotRef},
     },
     utils::rustc::RustProgram,
 };
@@ -1682,6 +1683,107 @@ pub(crate) fn artifact_rows(
     tcx: TyCtxt<'_>,
 ) -> Result<Vec<crate::coverage_recon::schema::Row>, String> {
     decide_table(tcx).map(|table| artifact::rows(tcx, &table))
+}
+
+/// **S3.2′-0 — the FACTS-SIDE JOIN.** One TSV row per subject, reporting the
+/// analysis facts *directly*, before `decide_one`'s ordering collapses them.
+///
+/// # Why the artifact cannot answer these questions
+///
+/// `decide_one` returns at the **first** failing predicate, so its reason names
+/// the earliest test that fired, not the set of facts that hold. Any
+/// reason-field measurement therefore inherits that ordering and is blind to
+/// every population filtered earlier — which is how a predicate reads as "never
+/// fires" when it is merely never reached. That is the shape the locals-A1
+/// defect wore, and the same trap made `degrade_reason == "kind-owning"` a
+/// circular instrument for the box-candidate split.
+///
+/// | column | question |
+/// |---|---|
+/// | `is_param`, `annotated` | which population the subject belongs to |
+/// | `slot` | does BO have a depth-0 slot — the **`no-slot`** cell, measured zero in **all four** populations |
+/// | `kind` | BO's verdict, independent of whether the decision reached it |
+/// | `raw_op` | the raw-only operation — the **op split** `key()` collapses |
+/// | `ptr_cmp` | whether a comparison fact exists — the **`ptr-comparison` × locals** cell |
+///
+/// `raw_op` and `ptr_cmp` are both reported per subject, so masking is readable
+/// rather than inferred: the order-swap probe showed masking is real for
+/// parameters and absent for locals, and this makes that visible per row.
+///
+/// MEASUREMENT ONLY. Nothing branches on it; no gate reads it.
+#[allow(
+    dead_code,
+    reason = "S3.2'-0 measurement instrument; consumed by the corpus worker \
+              behind an env var and by the test that pins its header. Not part \
+              of the pipeline."
+)]
+pub(crate) fn facts_join_tsv(tcx: TyCtxt<'_>) -> Result<String, String> {
+    // `SlotKind` / `SlotRef` join the driver's existing brace-merged import
+    // rather than getting a local `use` here. A single-line
+    // `use crate::analyses::…` would have destroyed the property that makes
+    // this file H1's real-input witness — that no LINE carries the fragment —
+    // and `matcher_resolves_the_existing_merged_import_in_mod_rs` caught it
+    // immediately. The guard did its job; the import goes where the others are.
+    let program = collect_program(tcx);
+    let slots = CrateSlots::build(&program);
+    let mut_facts = MutFacts::from_program(&program);
+
+    let (model, _export) = with_bo_export(|| {
+        let crate_ctxt = CrateCtxt::new(&program);
+        let solver = KindSolver::new(&slots);
+        let Ok((_stats, selectors)) = emit_crate_ownership_constraints(
+            &crate_ctxt,
+            &slots,
+            &compute_origins(&program),
+            &solver,
+        ) else {
+            return None;
+        };
+        for &g in &program.functions {
+            let body = tcx.mir_drops_elaborated_and_const_checked(g).borrow();
+            add_coherence(&solver, &slots, g, &body);
+        }
+        verify_to_fixpoint(&program, &slots, &solver, &selectors, &mut_facts)
+    });
+    let Some(model) = model else {
+        return Err("BO declined — no accepted model".to_owned());
+    };
+
+    let mut subjects = collect_subjects(tcx, &program, &mut_facts);
+    subjects.extend(collect_local_subjects(tcx, &program, &mut_facts));
+    let facts = decision::emitability::collect(tcx, &program.functions);
+
+    let mut out =
+        String::from("fn_path\tmir_local\tis_param\tannotated\tslot\tkind\traw_op\tptr_cmp\n");
+    for s in &subjects {
+        let slot = slots
+            .fn_local_slots
+            .get(&s.fn_did)
+            .and_then(|u| u.slot_for_local_depth(s.local, 0));
+        let kind = slot
+            .and_then(|id| model.get(&SlotRef::Local(s.fn_did, id)))
+            .map(|k| match k {
+                SlotKind::Ref => "ref",
+                SlotKind::Raw => "raw",
+                SlotKind::Owning => "owning",
+            })
+            .unwrap_or("-");
+        let raw_op = facts
+            .raw_only_uses
+            .get(&(s.fn_did, s.hir_id))
+            .map(|(op, _)| op.as_str())
+            .unwrap_or("-");
+        out.push_str(&format!(
+            "{}\t{}\t{}\t{}\t{}\t{kind}\t{raw_op}\t{}\n",
+            tcx.def_path_str(s.fn_did.to_def_id()),
+            s.local.as_u32(),
+            u8::from(matches!(s.kind, decision::SubjectKind::Param { .. })),
+            u8::from(s.ty_span.is_some()),
+            u8::from(slot.is_some()),
+            u8::from(facts.ptr_comparisons.contains_key(&(s.fn_did, s.hir_id))),
+        ));
+    }
+    Ok(out)
 }
 
 /// The golden inputs, for the out-of-module reconciliation harness (C.1).
