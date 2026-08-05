@@ -90,6 +90,16 @@ pub(crate) enum Outcome {
 /// `fn s(&x: &*mut i32)` is depth 2, emits a row, and lands here with entry
 /// count 0.
 ///
+/// > **"and so match nothing" SUPERSEDED at S3.1** (ruling C, 2026-08-05) —
+/// > annotated in place, not erased, because it is the correct reading of the
+/// > **parameter-only** universe this row was written for. Once the LOCALS
+/// > universe exists, a pattern parameter's component bindings are exactly the
+/// > fresh non-parameter locals that universe enumerates, so they **do** match —
+/// > as ordinary locals rows. Measured 2026-08-05:
+/// > `fn patterned((a, b): (*mut i32, *mut i32))` gives `_2`/`_3`, one entry
+/// > each, `argument_index: None`. Nothing about the *parameter* row changes:
+/// > the tuple local is still depth 0 and still emits no row.
+///
 /// **Corrected 2026-07-31.** This comment previously said "more than one covers
 /// a pattern parameter such as `fn f((a, b): (*mut i32, *mut i32))`". That was
 /// false twice over: the tuple parameter's argument local is a **tuple at
@@ -121,9 +131,14 @@ pub(crate) enum PairingConfidence {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct Row {
     pub fn_path: String,
-    /// MIR local of the parameter. With `fn_path`, the alignment key.
+    /// MIR local of the **subject**. With `fn_path`, the alignment key.
+    ///
+    /// "Subject" rather than "parameter" since S3.1 (H-3, 2026-08-05): the row
+    /// population is parameters **and** named pointer locals. Doc text only —
+    /// the field, its type and its wire position are unchanged.
     pub mir_local: u32,
-    /// Pairing term 1. `None` for an unnamed parameter.
+    /// Pairing term 1. `None` for an unnamed parameter, and for any subject
+    /// whose `var_debug_info` entry count is not exactly one.
     pub param_name: Option<String>,
     /// Pairing term 2.
     ///
@@ -143,8 +158,15 @@ pub(crate) struct Row {
     /// Producer A derives this from its recorded HIR position, **never from
     /// `mir_local`** — a pairing field that restates the alignment key can never
     /// disagree with it, which is what F1 was.
+    ///
+    /// **`None` means "not a parameter", never "unpaired"** (S3.1 pre-flight,
+    /// 2026-08-05). A named pointer LOCAL has no argument position and carries
+    /// `None` here legitimately. The only consumer, `compare::pairing_agrees`,
+    /// compares this field by **equality** — `None == None` agrees — and no site
+    /// anywhere presence-tests it. Stated at the field so the locals population
+    /// is not later mistaken for a pairing failure.
     pub arg_index: Option<u32>,
-    /// Pointer-chain depth of the resolved parameter type.
+    /// Pointer-chain depth of the resolved subject type.
     pub ptr_depth: u8,
     pub pairing_confidence: PairingConfidence,
     /// Producer A only. Rendered `file:line:col`, for **attribution**; not
