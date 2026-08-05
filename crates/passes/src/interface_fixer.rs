@@ -426,9 +426,12 @@ fn detect_slice_cursor_fixes<'tcx>(
 // looks up the `field_spec` entry (if any) whose `internal` name matches
 // `name`. names are guaranteed crate-unique by the pointer pass, so a single
 // match is the normal case; if more than one entry happens to share the same
-// internal name, `module` is used to disambiguate and uniqueness after that
-// is asserted (a remaining ambiguity is a real bug upstream, not something to
-// silently paper over)
+// internal name (only possible from hand-edited or otherwise corrupt sidecar
+// data, since the pointer pass itself never emits this), `module` is used to
+// disambiguate. a remaining ambiguity after that is fail-closed: skip (no
+// wrapper for any of the colliding entries) with a diagnostic, consistent
+// with every other "don't synthesize a wrapper from data we can't fully
+// trust" case in this file — corrupt sidecar data must not panic the pass
 fn find_field_spec_entry<'a>(
     config: &'a Config,
     tcx: TyCtxt<'_>,
@@ -444,10 +447,14 @@ fn find_field_spec_entry<'a>(
     if matches.len() > 1 {
         let module = field_module_path(tcx, def_id);
         matches.retain(|(_, e)| e.module == module);
-        assert!(
-            matches.len() <= 1,
-            "field_spec: ambiguous internal fn name {name:?} even after module disambiguation",
-        );
+        if matches.len() > 1 {
+            eprintln!(
+                "[interface-fixer] skipping field specialization wrapper(s) for internal fn {name:?}: \
+                 ambiguous field_spec entries even after module disambiguation ({} candidates)",
+                matches.len(),
+            );
+            return None;
+        }
     }
     matches.into_iter().next()
 }
@@ -759,6 +766,134 @@ pub unsafe extern "C" fn build_field(p: i32) -> i32 {
         // no wrapper synthesized; the internal fn is untouched and appears once
         assert_eq!(transformed.matches("fn build_field").count(), 1);
         assert!(!transformed.contains("fn build("));
+    }
+
+    #[test]
+    fn field_spec_ambiguous_internal_after_module_disambiguation_fails_closed() {
+        // two entries share the same `internal` name AND the same recorded
+        // `module`, so module-based disambiguation can't tell them apart.
+        // this can only arise from a corrupt/hand-edited sidecar (the
+        // pointer pass itself never emits colliding internal names) -- it
+        // must skip both, not panic
+        let code = r#"
+pub struct st {
+    pub lookup: [u16; 4],
+}
+
+pub unsafe extern "C" fn build_field(p: Option<&mut [u16; 4]>) {
+    if let Some(p) = p {
+        p[0] = 1;
+    }
+}
+"#;
+        let mut field_spec = FieldSpecMap::new();
+        field_spec.insert(
+            "build_a".to_string(),
+            FieldSpecEntry {
+                internal: "build_field".to_string(),
+                module: String::new(),
+                attr: FieldSpecAttr::NoMangle,
+                params: vec![FieldSpecParam {
+                    index: 0,
+                    struct_name: "st".to_string(),
+                    field: "lookup".to_string(),
+                    mutbl: "mut".to_string(),
+                }],
+            },
+        );
+        field_spec.insert(
+            "build_b".to_string(),
+            FieldSpecEntry {
+                internal: "build_field".to_string(),
+                module: String::new(),
+                attr: FieldSpecAttr::NoMangle,
+                params: vec![FieldSpecParam {
+                    index: 0,
+                    struct_name: "st".to_string(),
+                    field: "lookup".to_string(),
+                    mutbl: "mut".to_string(),
+                }],
+            },
+        );
+        let config = super::Config {
+            field_spec,
+            ..Default::default()
+        };
+        let transformed = utils::compilation::run_compiler_on_str(code, |tcx| {
+            super::fix_interfaces(&config, tcx)
+        })
+        .unwrap();
+        utils::compilation::run_compiler_on_str(&transformed, utils::type_check)
+            .expect(&transformed);
+
+        // no panic, and neither candidate wrapper is synthesized; the
+        // internal fn is untouched and appears exactly once
+        assert!(!transformed.contains("fn build_a("));
+        assert!(!transformed.contains("fn build_b("));
+        assert_eq!(transformed.matches("fn build_field").count(), 1);
+    }
+
+    #[test]
+    fn field_spec_disambiguated_by_module_succeeds() {
+        // two entries share the same `internal` name but record different
+        // `module`s; only one module matches the fn's actual (crate-root,
+        // i.e. empty) module path, so disambiguation should resolve to
+        // exactly that entry and synthesize its wrapper (not the other
+        // entry's)
+        let code = r#"
+pub struct st {
+    pub lookup: [u16; 4],
+}
+
+pub unsafe extern "C" fn build_field(p: Option<&mut [u16; 4]>) {
+    if let Some(p) = p {
+        p[0] = 1;
+    }
+}
+"#;
+        let mut field_spec = FieldSpecMap::new();
+        field_spec.insert(
+            "correct_name".to_string(),
+            FieldSpecEntry {
+                internal: "build_field".to_string(),
+                module: String::new(), // matches the fn's real (crate-root) module
+                attr: FieldSpecAttr::NoMangle,
+                params: vec![FieldSpecParam {
+                    index: 0,
+                    struct_name: "st".to_string(),
+                    field: "lookup".to_string(),
+                    mutbl: "mut".to_string(),
+                }],
+            },
+        );
+        field_spec.insert(
+            "wrong_name".to_string(),
+            FieldSpecEntry {
+                internal: "build_field".to_string(),
+                module: "some::other::mod".to_string(), // does not match
+                attr: FieldSpecAttr::NoMangle,
+                params: vec![FieldSpecParam {
+                    index: 0,
+                    struct_name: "st".to_string(),
+                    field: "lookup".to_string(),
+                    mutbl: "mut".to_string(),
+                }],
+            },
+        );
+        let config = super::Config {
+            field_spec,
+            ..Default::default()
+        };
+        let transformed = utils::compilation::run_compiler_on_str(code, |tcx| {
+            super::fix_interfaces(&config, tcx)
+        })
+        .unwrap();
+        utils::compilation::run_compiler_on_str(&transformed, utils::type_check)
+            .expect(&transformed);
+
+        assert!(transformed.contains("fn correct_name(p: *mut st)"));
+        assert!(!transformed.contains("fn wrong_name("));
+        assert!(transformed.contains("fn build_field(p: Option<&mut [u16; 4]>)"));
     }
 
     #[test]
