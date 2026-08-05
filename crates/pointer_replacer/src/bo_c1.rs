@@ -7241,13 +7241,39 @@ mod run {
                 RewriteOutcome::Emitted { degradations, .. }
                 | RewriteOutcome::Degraded { degradations, .. } => degradations,
             };
-            for d in degradations.iter().filter(|d| {
-                matches!(
-                    d.reason,
-                    crate::bo_rewriter::decision::DegradeReason::RevertedAfterVerifyFailure
-                )
-            }) {
-                println!("M1EMIT-REVERT subject={}", d.subject);
+            let ids: Vec<&str> = degradations
+                .iter()
+                .filter(|d| {
+                    matches!(
+                        d.reason,
+                        crate::bo_rewriter::decision::DegradeReason::RevertedAfterVerifyFailure
+                    )
+                })
+                .map(|d| d.subject.as_str())
+                .collect();
+            for id in &ids {
+                println!("M1EMIT-REVERT subject={id}");
+            }
+            // Stdout is NOT a channel to the sweep. `ChildOutcome` carries the
+            // sentinel row and `stderr`; everything else the worker prints is
+            // parsed for the row and discarded. The `println!` above is for
+            // running this worker DIRECTLY; the file below is what the corpus
+            // sweep can actually read — the same shape as
+            // `CRAT_BOC1_ARTIFACT_DIR`.
+            //
+            // Measured the hard way: the first version printed only, was
+            // de-risked by invoking the worker directly (where stdout IS
+            // visible), and produced zero lines across a full 18-minute sweep.
+            // The de-risk exercised a different invocation path from the real
+            // run, which is the one property it needed to share.
+            if let Some(dir) = std::env::var_os("CRAT_BOC1_REVERT_DIR") {
+                let name = std::env::var("CRAT_BOC1_NAME").unwrap_or_else(|_| "unnamed".into());
+                let path = std::path::Path::new(&dir).join(format!("{name}.reverts.txt"));
+                // Trailing newline: without it `wc -l` reports N-1 and an
+                // empty list is indistinguishable from a one-entry list.
+                let body: String = ids.iter().map(|id| format!("{id}\n")).collect();
+                std::fs::write(&path, body)
+                    .unwrap_or_else(|e| panic!("write revert list {}: {e}", path.display()));
             }
         }
         row.set("emitted", emitted);
@@ -9009,11 +9035,23 @@ fn m1_emit_corpus() {
     // measurement-only.
     let mut failures: Vec<String> = Vec::new();
 
+    // S3.1′ E3c. Cleared per run, like the recon artifact dir: a stale file from
+    // an earlier sweep reads as this run's data, which is the staleness rule.
+    let revert_dir = orchestrate::out_dir().join("m1-emit-reverts");
+    let _ = fs::remove_dir_all(&revert_dir);
+    fs::create_dir_all(&revert_dir).expect("revert dir");
+
     for program in CORPUS {
         let input = program.input_path(&root);
         assert!(input.is_file(), "missing rs-crown input: {input:?}");
         attempted += 1;
-        let outcome = orchestrate::run_child_env(program.name, &input, "m1-emit", timeout, &[]);
+        let outcome = orchestrate::run_child_env(
+            program.name,
+            &input,
+            "m1-emit",
+            timeout,
+            &[("CRAT_BOC1_REVERT_DIR", revert_dir.display().to_string())],
+        );
         let Some(mut row) = outcome.row.clone() else {
             // DEFERRAL IS RECORDED, NEVER ZEROED.
             missing.push(format!(
