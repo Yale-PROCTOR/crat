@@ -1752,16 +1752,18 @@ fn the_facts_join_reports_facts_the_decision_never_reached() {
         reason, "no-declared-type",
         "the fixture must degrade UPSTREAM of A1, or it witnesses nothing"
     );
+    let hdr: Vec<&str> = facts.lines().next().expect("header").split('\t').collect();
+    let col = |n: &str| hdr.iter().position(|h| *h == n).expect("column present");
+    let (c_param, c_ann, c_op) = (col("is_param"), col("annotated"), col("raw_op"));
     let local_row = facts
         .lines()
         .skip(1)
         .map(|l| l.split('\t').collect::<Vec<_>>())
-        // is_param == "0"
-        .find(|c| c[2] == "0")
+        .find(|c| c[c_param] == "0")
         .unwrap_or_else(|| panic!("no local row in the facts join:\n{facts}"));
-    assert_eq!(local_row[3], "0", "the local is unannotated: {local_row:?}");
+    assert_eq!(local_row[c_ann], "0", "the local is unannotated: {local_row:?}");
     assert_eq!(
-        local_row[6], "offset",
+        local_row[c_op], "offset",
         "the join lost the op the decision never reached — it has inherited \
          decide_one's ordering: {local_row:?}"
     );
@@ -1799,12 +1801,23 @@ fn calloc_and_realloc_are_told_apart_by_callee_not_arity() {
     })
     .expect("fixture compiles");
 
+    // Indexed BY HEADER NAME, never by position. Adding the `fatness` column
+    // in S3.2′-1 shifted every later index and broke this test — the exact
+    // hazard `construction.rs` warns about for tabs inside snippets, one level
+    // up. A positional read is a latent break for every future column.
+    let hdr: Vec<&str> = tsv.lines().next().expect("header").split('\t').collect();
+    let col = |name: &str| {
+        hdr.iter()
+            .position(|h| *h == name)
+            .unwrap_or_else(|| panic!("facts join has no `{name}` column: {hdr:?}"))
+    };
+    let (c_param, c_len, c_size) = (col("is_param"), col("len_class"), col("size_expr"));
     let classes: Vec<(String, String)> = tsv
         .lines()
         .skip(1)
         .map(|l| l.split('\t').collect::<Vec<_>>())
-        .filter(|c| c[2] == "0") // locals only
-        .map(|c| (c[9].to_owned(), c[10].to_owned()))
+        .filter(|c| c[c_param] == "0") // locals only
+        .map(|c| (c[c_len].to_owned(), c[c_size].to_owned()))
         .collect();
 
     assert!(
@@ -1822,6 +1835,102 @@ fn calloc_and_realloc_are_told_apart_by_callee_not_arity() {
             .any(|(k, expr)| k == "alloc-count" && expr.contains("c_void")),
         "a POINTER expression was reported as an element count — the arity \
          defect is back: {classes:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// S3.2′-1 — the fatness ENTRY VALIDATION (A-2's discipline, applied to fatness)
+// ---------------------------------------------------------------------------
+
+/// `(local name, fatness verdict)` for every pointer local in a fixture.
+fn fatness_of(src: &str) -> Vec<(String, &'static str)> {
+    let fixture = Fixture::new(&[("lib.rs", src)]);
+    ::utils::compilation::run_compiler_on_path(&fixture.0.join("lib.rs"), |tcx| {
+        let program = super::collect_program(tcx);
+        let mut_facts =
+            crate::analyses::borrow_ownership::mutability_facts::MutFacts::from_program(&program);
+        let fat = super::fat_facts::FatFacts::from_program(&program);
+        super::collect_local_subjects(tcx, &program, &mut_facts)
+            .iter()
+            .map(|s| {
+                (
+                    s.param_name.clone().unwrap_or_else(|| "<unnamed>".to_owned()),
+                    fat.render(s.fn_did, s.local),
+                )
+            })
+            .collect::<Vec<_>>()
+    })
+    .expect("fixture compiles")
+}
+
+const FAT_HDR: &str = "#![allow(dead_code, unused_unsafe, unused_mut, unused_variables, unused_assignments)]\nextern \"C\" { fn malloc(size: usize) -> *mut core::ffi::c_void; }\n";
+
+/// **Fatness is MEASURED in, not assumed in** — A-2's condition, applied to a
+/// second dependency that has never been on BO's path either.
+///
+/// The two positive controls live in **one function** deliberately. Either
+/// alone would pass against an analysis that returns a constant, which is the
+/// same defect shape the locals-A1 population pair was built to exclude: a
+/// control that cannot distinguish is not a control.
+///
+/// *Mutation-tested (Rider 0, deletion first):* replacing `FatFacts::verdict`
+/// with a constant `Some(Fatness::Arr)` — or `Ptr` — fails this test, because
+/// the assertion is that the two locals **differ**, not that either has a
+/// particular value.
+#[test]
+fn fatness_entry_validation_distinguishes_array_from_single_object() {
+    let got = fatness_of(&format!(
+        "{FAT_HDR}pub unsafe fn f(c: i32) -> i32 {{\n\
+         let mut arr: [i32; 8] = [0; 8];\n\
+         let decayed: *mut i32 = arr.as_mut_ptr();\n\
+         let single: *mut i32 = malloc(4) as *mut i32;\n\
+         *single = c;\n\
+         *decayed.offset(1) + *single\n\
+         }}\n"
+    ));
+    let of = |n: &str| {
+        got.iter()
+            .find(|(name, _)| name == n)
+            .unwrap_or_else(|| panic!("no local `{n}`: {got:?}"))
+            .1
+    };
+    assert_eq!(of("decayed"), "arr", "array decay must read as array: {got:?}");
+    assert_eq!(
+        of("single"),
+        "ptr",
+        "a single-object allocation must not read as array: {got:?}"
+    );
+}
+
+/// **`ptr` is a DEFAULT, not a conclusion** — the control the ruling did not
+/// ask for, and the one that decides how the verdict may be used.
+///
+/// `Fatness::Arr ⊑ Fatness::Ptr` and the solver takes the **greatest** model,
+/// so an unconstrained variable is maximized to `Ptr`. This fixture gives the
+/// analysis *no information at all* about `opaque` — no arithmetic, no
+/// indexing, no allocation — and pins that the answer is still `ptr`.
+///
+/// The consequence is load-bearing and runs opposite to the naive reading of
+/// ruling A-1: this analysis never says *unknown*, so `ptr` **cannot** be read
+/// as evidence of single-object allocation. Emitting a slice on `arr` is
+/// licensed because `arr` is forced by constraints; treating `ptr` as proof of
+/// thinness is not, and the `Box<T>` / `Box<[T]>` discriminator must therefore
+/// rest on the allocation-size expression with fatness as corroboration only.
+///
+/// *Mutation-tested:* making `verdict` return `None` for unconstrained locals —
+/// i.e. pretending the analysis abstains — fails this test, which is the point:
+/// it does not abstain.
+#[test]
+fn a_pointer_with_no_array_evidence_reads_thin_by_default() {
+    let got = fatness_of(&format!(
+        "{FAT_HDR}pub unsafe fn f(q: *mut i32) -> i32 {{ let opaque: *mut i32 = q; 0 }}\n"
+    ));
+    assert_eq!(
+        got.iter().find(|(n, _)| n == "opaque").map(|(_, v)| *v),
+        Some("ptr"),
+        "an unconstrained pointer must still receive a verdict, and it is the \
+         top of the lattice — `ptr` here means NO ARRAY EVIDENCE, not `thin`: \
+         {got:?}"
     );
 }
 

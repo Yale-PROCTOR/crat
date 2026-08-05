@@ -62,6 +62,7 @@ use crate::{
 pub(crate) mod apply;
 pub(crate) mod artifact;
 pub(crate) mod decision;
+pub(crate) mod fat_facts;
 pub(crate) mod plan;
 pub(crate) mod verify;
 
@@ -1754,9 +1755,13 @@ pub(crate) fn facts_join_tsv(tcx: TyCtxt<'_>) -> Result<String, String> {
     let facts = decision::emitability::collect(tcx, &program.functions);
 
     let ctors = decision::construction::collect(tcx, &program.functions);
+    // S3.2′-1: measurement only. The decision phase does NOT consult this —
+    // the wiring is S3.2′-4's named task, and until then the ban in
+    // `import_denylist` keeps `decision/**` from naming it at all.
+    let fat = fat_facts::FatFacts::from_program(&program);
 
     let mut out = String::from(
-        "fn_path\tmir_local\tis_param\tannotated\tslot\tkind\traw_op\tptr_cmp\tctor\tlen_class\tsize_expr\n",
+        "fn_path\tmir_local\tis_param\tannotated\tslot\tkind\traw_op\tptr_cmp\tctor\tlen_class\tfatness\tsize_expr\n",
     );
     for s in &subjects {
         let slot = slots
@@ -1797,13 +1802,14 @@ pub(crate) fn facts_join_tsv(tcx: TyCtxt<'_>) -> Result<String, String> {
             (false, None) => ("-", "no-init", String::new()),
         };
         out.push_str(&format!(
-            "{}\t{}\t{}\t{}\t{}\t{kind}\t{raw_op}\t{}\t{ctor_key}\t{len_class}\t{size_expr}\n",
+            "{}\t{}\t{}\t{}\t{}\t{kind}\t{raw_op}\t{}\t{ctor_key}\t{len_class}\t{}\t{size_expr}\n",
             tcx.def_path_str(s.fn_did.to_def_id()),
             s.local.as_u32(),
             u8::from(is_param),
             u8::from(s.ty_span.is_some()),
             u8::from(slot.is_some()),
             u8::from(facts.ptr_comparisons.contains_key(&(s.fn_did, s.hir_id))),
+            fat.render(s.fn_did, s.local),
         ));
     }
     Ok(out)

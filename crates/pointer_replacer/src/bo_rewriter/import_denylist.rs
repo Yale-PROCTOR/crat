@@ -753,6 +753,37 @@ fn decision_offense(line: &str) -> Option<String> {
     None
 }
 
+/// **Fatness must not be named in the emission phases — or, for now, in the
+/// decision phase either.**
+///
+/// Two bans with different lifetimes, deliberately expressed as one predicate
+/// and separated by the SCOPE the caller passes:
+///
+/// - **`apply/**` and `plan/**` — PERMANENT.** This half is architecture:
+///   emission consumes a `Decision`, never an analysis result. E1 states it;
+///   this enforces it.
+/// - **`decision/**` — FOR THE DURATION OF S3.2′-1** (reviewer amendment A).
+///   The slice claims it changes no decision, and a wired-but-dormant path
+///   would satisfy every corpus invariant while violating exactly that claim.
+///   Mechanized rather than left to inspection. **S3.2′-4's micro-plan carries a
+///   named task to lift this entry**, at the point a fat verdict has a form to
+///   select.
+fn fatness_offense(line: &str) -> Option<String> {
+    let t = line.trim_start();
+    for needle in ["FatnessResult", "FatFacts", "type_qualifier"] {
+        if t.contains(needle) {
+            return Some(format!("names `{needle}`"));
+        }
+    }
+    // Bare `Fatness` last, and word-boundary-ish: `FatnessResult` is already
+    // caught above, and matching a bare substring would flag it twice with the
+    // wrong detail.
+    if t.contains("Fatness") {
+        return Some("names `Fatness`".to_owned());
+    }
+    None
+}
+
 /// **A `Subject::hir_id` initialised to `CRATE_HIR_ID` is banned in production.**
 ///
 /// Why a *source* ban and not a runtime assert: the damage a placeholder does
@@ -894,6 +925,59 @@ fn production_subjects_carry_a_real_hir_binding() {
          emitability gates key on it and cannot hit, so the subject skips them \
          silently and is emitted with no reason attributed:\n  {}",
         violations.join("\n  ")
+    );
+}
+
+/// **No emission phase names fatness — and, for S3.2′-1, nor does `decision`.**
+///
+/// The `decision/**` half is what makes S3.2′-1's central claim checkable: the
+/// slice asserts it changes no decision, and only a mechanized ban distinguishes
+/// *"not wired"* from *"wired but currently dormant"*. The two look identical in
+/// every corpus number.
+///
+/// *Mutation-tested (Rider 0, deletion first):* adding
+/// `use crate::analyses::type_qualifier::…` to `decision/mod.rs` — the exact
+/// shape S3.2′-4 will add deliberately — fails this test and names the file.
+#[test]
+fn emission_and_decision_phases_do_not_name_fatness() {
+    let root = module_root();
+    let scoped = |p: &Path| {
+        let s = p.display().to_string();
+        // Skip everything that is NOT one of the three regulated phases.
+        !(s.contains("/decision/") || s.contains("/apply/") || s.contains("/plan/"))
+            || is_test_only_file(p)
+    };
+    let violations = scan_production(root, &scoped, &fatness_offense);
+    assert!(
+        violations.is_empty(),
+        "a regulated phase names fatness. `apply/` and `plan/` are banned \
+         permanently — emission consumes a `Decision`, never an analysis \
+         result. `decision/` is banned for the duration of S3.2′-1, whose \
+         claim is that it changes no decision; S3.2′-4 lifts that entry as a \
+         named task:\n  {}",
+        violations.join("\n  ")
+    );
+}
+
+/// The fatness ban must reject a real breach, not merely pass on clean code.
+#[test]
+fn fatness_ban_matches_a_synthetic_breach() {
+    assert!(
+        fatness_offense("use crate::analyses::type_qualifier::foster::fatness::Fatness;").is_some(),
+        "the import shape S3.2′-4 will add was not detected"
+    );
+    assert!(
+        fatness_offense("    let f: FatnessResult = fatness_analysis(&program);").is_some(),
+        "a FatnessResult binding was not detected"
+    );
+    assert!(
+        fatness_offense("    if fat.is_array(s.fn_did, s.local) {").is_none(),
+        "the ban is on NAMING the analysis types, not on any identifier — \
+         `fat.is_array(..)` through an adapter parameter is not itself a breach"
+    );
+    assert!(
+        fatness_offense("    let x = 1;").is_none(),
+        "an unrelated line must not be flagged"
     );
 }
 
