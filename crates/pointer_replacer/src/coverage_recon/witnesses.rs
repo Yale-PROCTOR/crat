@@ -752,3 +752,35 @@ fn a_verdict_passes_on_population_pinned_findings_alone() {
         verdict2.findings
     );
 }
+
+/// **Every expected-zero consumer asks `expects_zero`, none tests the name.**
+///
+/// The S3.1 lesson, mechanized. The same exclusion was written by hand in three
+/// consumers — the corpus driver, `Verdict::passed`, and the worker's aggregate
+/// recorder — and each by-instance repair looked complete while the next
+/// consumer still failed all 20 programs. The predicate is the single
+/// definition; this witness pins that it says the right thing in both
+/// directions, so a future class added to `FINDING_CLASSES` inherits a
+/// deliberate answer rather than a default.
+///
+/// *Mutation-tested (Rider 0, deletion first):* making `expects_zero` return
+/// `true` unconditionally fails the first assertion; returning `false`
+/// unconditionally fails the second.
+#[test]
+fn expects_zero_answers_both_ways() {
+    use super::compare::{POPULATION_PINNED_CLASS, expects_zero};
+    assert!(
+        !expects_zero(POPULATION_PINNED_CLASS),
+        "the population-pinned class is checked against a per-program table, \
+         not against zero"
+    );
+    for class in FINDING_CLASSES {
+        if *class == POPULATION_PINNED_CLASS {
+            continue;
+        }
+        assert!(
+            expects_zero(class),
+            "{class} must keep expected-zero — only ONE class is table-pinned"
+        );
+    }
+}

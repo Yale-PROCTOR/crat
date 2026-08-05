@@ -91,6 +91,18 @@ pub(crate) const FINDING_CLASSES: &[&str] = &[
 /// `recon=FAIL` while every aggregate was exactly on its pin.
 pub(crate) const POPULATION_PINNED_CLASS: &str = "span-check-not-evaluable-local";
 
+/// **Does a nonzero count in this class mean failure?**
+///
+/// THE definition, and every consumer asks it rather than testing the class
+/// name itself. S3.1 shipped the same exclusion three times by hand — the corpus
+/// driver, `Verdict::passed`, and the worker's aggregate recorder — and each
+/// by-instance repair looked complete while the next consumer still failed the
+/// whole corpus. A predicate cannot be forgotten by a consumer that has to call
+/// something to get an answer.
+pub(crate) fn expects_zero(class: &str) -> bool {
+    class != POPULATION_PINNED_CLASS
+}
+
 /// Is the span axis ACTIVE for this artifact pair?
 ///
 /// The predicate is exactly **"zero `binding_span_lo` in the entire producer-B
@@ -171,7 +183,7 @@ impl Verdict {
             && self
                 .findings
                 .iter()
-                .all(|f| f.class == POPULATION_PINNED_CLASS)
+                .all(|f| !expects_zero(f.class))
             && FINDING_CLASSES
                 .iter()
                 .all(|class| self.aggregates.contains_key(class))

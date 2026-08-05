@@ -7087,7 +7087,11 @@ mod run {
             let key = format!("agg_{}", class.replace('-', "_"));
             match verdict.aggregates.get(class).copied() {
                 Some(n) => {
-                    if n != 0 {
+                    // The VALUE is always recorded — the corpus driver checks
+                    // the population-pinned class against its per-program table
+                    // and needs the number present. Only the zero JUDGEMENT is
+                    // class-dependent.
+                    if n != 0 && crate::coverage_recon::compare::expects_zero(class) {
                         aggregates_clean = false;
                     }
                     row.set(&key, n);
@@ -8705,7 +8709,7 @@ fn m1_recon_corpus() {
             // expectation instead — see `EXPECTED_NOT_EVALUABLE_LOCAL`. The
             // exclusion is by NAME rather than by index so reordering
             // `FINDING_CLASSES` cannot silently re-point it.
-            if *class == crate::coverage_recon::compare::POPULATION_PINNED_CLASS {
+            if !crate::coverage_recon::compare::expects_zero(class) {
                 continue;
             }
             if let Err(detail) = expected_zero_aggregate(&row, class) {
