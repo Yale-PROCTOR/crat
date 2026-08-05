@@ -1005,9 +1005,25 @@ fn collect_local_subjects(
 ) -> Vec<decision::Subject> {
     use rustc_hir::intravisit::Visitor;
 
-    /// Simple-binding `let` declarations, keyed by the binding pattern's span.
+    /// Two maps over the same body, with **deliberately different predicates**.
+    ///
+    /// They are not merged into one entry, and must not be: they answer
+    /// different questions and their correct domains differ.
+    ///
+    /// - [`Self::by_pat_span`] — *what type was DECLARED here.* Simple-binding
+    ///   `let`s only, because a destructuring pattern's annotation belongs to
+    ///   the pattern and not to any component.
+    /// - [`Self::binding_hir`] — *which HIR binding IS this.* **Every** binding
+    ///   pattern, wherever it appears: destructuring components, `match` arms,
+    ///   `for` bindings. A binding has an identity even where it has no
+    ///   annotation of its own.
+    ///
+    /// Merging them would silently narrow the identity map to simple `let`s and
+    /// leave every other binding unattributable — the same shape of defect as
+    /// the placeholder this slice repairs, one level down.
     struct Lets<'hir> {
         by_pat_span: rustc_hash::FxHashMap<rustc_span::Span, Option<&'hir rustc_hir::Ty<'hir>>>,
+        binding_hir: rustc_hash::FxHashMap<rustc_span::Span, rustc_hir::HirId>,
     }
     impl<'hir> Visitor<'hir> for Lets<'hir> {
         fn visit_stmt(&mut self, stmt: &'hir rustc_hir::Stmt<'hir>) {
@@ -1021,6 +1037,17 @@ fn collect_local_subjects(
             }
             rustc_hir::intravisit::walk_stmt(self, stmt);
         }
+
+        fn visit_pat(&mut self, pat: &'hir rustc_hir::Pat<'hir>) {
+            // `hir_id` here is exactly the id `Res::Local` resolves a *use* to,
+            // which is what makes the A1 emitability lookup hit. S3.1 shipped a
+            // `CRATE_HIR_ID` placeholder instead, and both gates were dead over
+            // every local as a result.
+            if let rustc_hir::PatKind::Binding(..) = pat.kind {
+                self.binding_hir.insert(pat.span, pat.hir_id);
+            }
+            rustc_hir::intravisit::walk_pat(self, pat);
+        }
     }
 
     let mut subjects = Vec::new();
@@ -1030,6 +1057,7 @@ fn collect_local_subjects(
         };
         let mut lets = Lets {
             by_pat_span: rustc_hash::FxHashMap::default(),
+            binding_hir: rustc_hash::FxHashMap::default(),
         };
         lets.visit_body(tcx.hir_body(body_id));
 
@@ -1104,10 +1132,23 @@ fn collect_local_subjects(
                 // it ever consults the shape.
                 None => (decision::DeclShape::Other, None, None),
             };
+            // Attribution, not a placeholder. Absence is a contradiction, not a
+            // fallback: this local HAS a `var_debug_info` span, and a
+            // `CRATE_HIR_ID` here is what made both A1 gates dead for every
+            // local. Loud, on the same reasoning as the `argument_index` assert
+            // above — a silent default would restore the defect exactly.
+            let Some(&hir_id) = lets.binding_hir.get(&binding_span) else {
+                panic!(
+                    "local {local:?} of {fn_did:?} has debug-info span \
+                     {binding_span:?} matching no binding pattern in the body — \
+                     `var_debug_info`'s relationship to HIR bindings has changed \
+                     and the locals attribution rule must be re-derived"
+                );
+            };
             subjects.push(decision::Subject {
                 fn_did,
                 local,
-                hir_id: rustc_hir::CRATE_HIR_ID,
+                hir_id,
                 param_name: name.clone(),
                 kind: decision::SubjectKind::Local,
                 ptr_depth: ptr_chain_depth(ty),

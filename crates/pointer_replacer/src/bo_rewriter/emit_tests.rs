@@ -1599,3 +1599,118 @@ fn a_locals_row_carries_no_arg_index_while_a_parameter_keeps_one() {
     assert!(pairs.contains(&(1, Some(1))), "the parameter keeps its index: {pairs:?}");
     assert!(pairs.contains(&(2, None)), "the local carries None: {pairs:?}");
 }
+
+// ---------------------------------------------------------------------------
+// S3.1′ — the A1 emitability gates over the LOCALS population
+// ---------------------------------------------------------------------------
+
+/// Every subject's `(name, is_param, reason)` — parameters included.
+///
+/// A sibling of [`locals_of`] rather than a widening of it: `locals_of` is the
+/// instrument the S3.1 witnesses above are written against, and changing what
+/// it returns would put those tests under Rider 4 for no gain here.
+fn decisions_of(src: &str) -> Vec<(String, bool, String)> {
+    let fixture = Fixture::new(&[("lib.rs", src)]);
+    ::utils::compilation::run_compiler_on_path(&fixture.0.join("lib.rs"), |tcx| {
+        let table = super::decide_table(tcx).expect("fixture yields a decision table");
+        super::artifact::rows(tcx, &table)
+            .iter()
+            .map(|r| {
+                (
+                    r.param_name.clone().unwrap_or_else(|| "<unnamed>".to_owned()),
+                    r.arg_index.is_some(),
+                    r.degrade_reason.clone().unwrap_or_else(|| "<emitted>".to_owned()),
+                )
+            })
+            .collect::<Vec<_>>()
+    })
+    .expect("fixture compiles")
+}
+
+fn reason_of(got: &[(String, bool, String)], name: &str, is_param: bool) -> String {
+    got.iter()
+        .find(|(n, p, _)| n == name && *p == is_param)
+        .unwrap_or_else(|| panic!("no subject {name} (param={is_param}): {got:?}"))
+        .2
+        .clone()
+}
+
+/// **A raw-only method call on a LOCAL degrades it** — gate one, over the
+/// population that had it dead.
+///
+/// The subject must survive shape *and* kind to reach A1 at all, so `p` is a
+/// copy of a parameter (BO calls it `Ref`) rather than a `malloc` result (BO
+/// would call that `Owning` or `Raw` and degrade it earlier). **A fixture that
+/// degrades upstream witnesses nothing**, which is why this shape was measured
+/// against the pre-repair build first: `p` came back `ref-shared`, so it
+/// genuinely reached the gate and was waved through.
+///
+/// *Mutation-tested (Rider 0, deletion first):* deleting the `binding_hir`
+/// insert in `collect_local_subjects` restores `ref-shared` here.
+#[test]
+fn a_raw_only_method_on_a_local_degrades_it() {
+    let got = decisions_of(
+        "#![allow(dead_code, unused_unsafe, unused_variables)]\n\
+         pub unsafe fn f(a: *mut i32) -> i32 { let p: *mut i32 = a; *p.offset(1) }\n",
+    );
+    assert_eq!(
+        reason_of(&got, "p", false),
+        "raw-pointer-operation",
+        "the local reached A1 and was not stopped by it: {got:?}"
+    );
+}
+
+/// **Both operands of ONE comparison degrade — the parameter and the local.**
+///
+/// The population pair with no confound left: same function, same expression,
+/// same span. Before the repair the parameter operand of `q == b` degraded
+/// `ptr-comparison` while the local operand came back `ref-shared` — one
+/// comparison, one gate, two answers, decided purely by which population the
+/// operand belonged to.
+///
+/// Keeping the parameter assertion here is the point. A locals-only test would
+/// still pass if a later change killed the gate for *everyone*, and would
+/// report that as success.
+///
+/// *Mutation-tested:* deleting the `binding_hir` insert fails the local
+/// assertion and leaves the parameter one green — reproducing the defect
+/// exactly, and naming which half of the pair detects it.
+#[test]
+fn one_comparison_degrades_its_parameter_and_its_local_operand_alike() {
+    let got = decisions_of(
+        "#![allow(dead_code, unused_unsafe, unused_variables)]\n\
+         pub unsafe fn f(a: *mut i32, b: *mut i32) -> i32 { \
+         let q: *mut i32 = a; if q == b { return 1; } 0 }\n",
+    );
+    assert_eq!(
+        reason_of(&got, "b", true),
+        "ptr-comparison",
+        "parameter operand: {got:?}"
+    );
+    assert_eq!(
+        reason_of(&got, "q", false),
+        "ptr-comparison",
+        "local operand: {got:?}"
+    );
+}
+
+/// **The negative control: a clean local is still emitted.**
+///
+/// Without it, "every local now degrades" would pass both witnesses above. The
+/// repair must gate exactly the locals carrying a raw-only use, not the
+/// population.
+///
+/// *Mutation-tested:* degrading unconditionally at the A1 arms fails this while
+/// leaving the two witnesses above green — which is why it exists.
+#[test]
+fn a_local_with_no_raw_only_use_is_still_emitted() {
+    let got = decisions_of(
+        "#![allow(dead_code, unused_unsafe, unused_variables)]\n\
+         pub unsafe fn f(a: *mut i32) -> i32 { let p: *mut i32 = a; *p }\n",
+    );
+    assert_eq!(
+        reason_of(&got, "p", false),
+        "<emitted>",
+        "a clean local must survive A1: {got:?}"
+    );
+}

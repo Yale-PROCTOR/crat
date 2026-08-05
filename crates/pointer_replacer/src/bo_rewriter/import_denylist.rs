@@ -753,6 +753,38 @@ fn decision_offense(line: &str) -> Option<String> {
     None
 }
 
+/// **A `Subject::hir_id` initialised to `CRATE_HIR_ID` is banned in production.**
+///
+/// Why a *source* ban and not a runtime assert: the damage a placeholder does
+/// here is silent by nature. The two A1 emitability gates key on
+/// `(fn_did, hir_id)`, and `CRATE_HIR_ID` is never what `Res::Local` resolves a
+/// use to — so a placeholder does not weaken the gates, it makes the lookup
+/// **unable to hit**. Nothing fails, no reason is attributed, and the subject
+/// is emitted. S3.1 shipped exactly this for every local: 0 of 3,142 locals
+/// stopped at A1, against 1,231 of 4,306 parameters.
+///
+/// The predicate is deliberately narrow — a **field initialiser** whose name is
+/// `hir_id` — rather than "the line mentions `CRATE_HIR_ID`". A broad version
+/// would flag prose and the `use` item and would have been loosened the first
+/// time it cried wolf, which is how a guard stops being one.
+///
+/// Production-scoped per the ratified deviation: the three synthetic test
+/// constructors carry `CRATE_HIR_ID` beside `CRATE_DEF_ID` and `DUMMY_SP` as a
+/// fixture convention, reach no A1 gate, and are not a defect to repair.
+fn hir_placeholder_offense(line: &str) -> Option<String> {
+    let trimmed = line.trim_start();
+    let (field, value) = trimmed.split_once(':')?;
+    if field.trim() != "hir_id" || !value.contains("CRATE_HIR_ID") {
+        return None;
+    }
+    Some(
+        "`Subject::hir_id` initialised to the `CRATE_HIR_ID` placeholder — the \
+         A1 emitability lookups key on it, so a placeholder makes them \
+         unreachable rather than merely weak"
+            .to_owned(),
+    )
+}
+
 /// *Mutation-tested (Rider 0, deletion first):* deleting either repaired
 /// `match` — reverting `plan/mod.rs` to its `let …else` or `mod.rs` to its
 /// `matches!` — makes this test FAIL and name that file. That is simultaneously
@@ -836,6 +868,71 @@ fn decision_ban_matches_a_synthetic_breach() {
     assert!(
         decision_offense("    if let Some(span) = spans.first() {").is_none(),
         "a binder on an unrelated type must not be flagged"
+    );
+}
+
+/// **No production `Subject` is built with a placeholder HIR binding.**
+///
+/// The S3.1′ guard. It is the generalization the locals-A1 HIGH was missing:
+/// the defect was not that *this* field was wrong, it was that a new population
+/// was admitted without asking whether every `Subject` field keeps its meaning
+/// across populations. This catches the next population — S3.2's owning locals,
+/// M2's struct fields — rather than the one already repaired.
+///
+/// *Mutation-tested (Rider 0, deletion first):* restoring
+/// `hir_id: rustc_hir::CRATE_HIR_ID` in `collect_local_subjects` makes this test
+/// FAIL and name `mod.rs` with the line number. That is simultaneously this
+/// guard's witness and the S3.1′ repair's own.
+#[test]
+fn production_subjects_carry_a_real_hir_binding() {
+    let root = module_root();
+    let violations = scan_production(root, &is_test_only_file, &hir_placeholder_offense);
+
+    assert!(
+        violations.is_empty(),
+        "a production `Subject` carries a placeholder HIR binding — the A1 \
+         emitability gates key on it and cannot hit, so the subject skips them \
+         silently and is emitted with no reason attributed:\n  {}",
+        violations.join("\n  ")
+    );
+}
+
+/// The guard must reject a real violation, not merely pass on clean code.
+///
+/// Deliberately includes the near-misses. A guard keyed on "the line mentions
+/// `CRATE_HIR_ID`" would flag the `use` item and every doc line that explains
+/// *why* the placeholder is banned — and would then be loosened, which is how
+/// this class of guard dies.
+#[test]
+fn hir_placeholder_ban_matches_a_synthetic_breach() {
+    assert!(
+        hir_placeholder_offense("                hir_id: rustc_hir::CRATE_HIR_ID,").is_some(),
+        "the exact shape S3.1 shipped was not detected"
+    );
+    assert!(
+        hir_placeholder_offense("hir_id: CRATE_HIR_ID,").is_some(),
+        "detection must not depend on the path prefix or on indentation"
+    );
+    // Near-misses that must NOT be flagged.
+    assert!(
+        hir_placeholder_offense("                hir_id,").is_none(),
+        "field shorthand carrying a real binding must not be flagged"
+    );
+    assert!(
+        hir_placeholder_offense("                hir_id: pat.hir_id,").is_none(),
+        "a real binding must not be flagged"
+    );
+    assert!(
+        hir_placeholder_offense("use rustc_hir::CRATE_HIR_ID;").is_none(),
+        "the `use` item is not a Subject field initialiser"
+    );
+    assert!(
+        hir_placeholder_offense("    let x = CRATE_HIR_ID;").is_none(),
+        "an unrelated binding of the constant is not this offense"
+    );
+    assert!(
+        hir_placeholder_offense("    other_id: rustc_hir::CRATE_HIR_ID,").is_none(),
+        "the ban is on `hir_id` specifically, not on any field"
     );
 }
 

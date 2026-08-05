@@ -98,8 +98,21 @@ pub(crate) struct Subject {
     pub fn_did: LocalDefId,
     /// MIR local of the parameter: params are `_1 ..= arg_count`.
     pub local: Local,
-    /// HIR binding of the same parameter, used to attribute uses to it without
+    /// HIR binding of this subject, used to attribute uses to it without
     /// relying on a name that could be shadowed.
+    ///
+    /// **Must be the binding's real `HirId` — the one `Res::Local` resolves a
+    /// use to.** The two A1 emitability gates key on `(fn_did, hir_id)`, so a
+    /// placeholder here does not weaken them, it makes them *unreachable*: the
+    /// lookup cannot hit and the subject sails past both checks. S3.1 shipped
+    /// `CRATE_HIR_ID` for every local, and both gates were dead over that whole
+    /// population — 0 of 3,142 locals stopped, against 1,231 of 4,306
+    /// parameters. `production_subjects_carry_a_real_hir_binding` bans the
+    /// placeholder in production source so the next population cannot repeat it.
+    ///
+    /// Said the other way: this field is not describable as "a parameter's".
+    /// The doc that said so predated the locals universe and read as true while
+    /// half the population carried a placeholder.
     pub hir_id: rustc_hir::HirId,
     /// **Pairing term 1** in the reconciliation artifact: the parameter's
     /// source name. `None` when the pattern is not a plain binding.
