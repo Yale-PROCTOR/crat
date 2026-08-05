@@ -7274,6 +7274,36 @@ mod run {
                 let body: String = ids.iter().map(|id| format!("{id}\n")).collect();
                 std::fs::write(&path, body)
                     .unwrap_or_else(|e| panic!("write revert list {}: {e}", path.display()));
+
+                // S3.2′-0 — THE OP SPLIT.
+                //
+                // `DegradeReason::key()` collapses every raw-pointer operation
+                // to the single string `"raw-pointer-operation"`, so the
+                // artifact cannot distinguish `offset` (the real slice market)
+                // from `is_null` (already served by the Option forms) or from
+                // `as-cast` (frequently just a `free`-site cast). That makes
+                // the 1,440-subject market an UPPER BOUND with unknown
+                // composition, and no yield claim may rest on it until this is
+                // measured.
+                //
+                // Written as a side file rather than added to `Row`: this is a
+                // measurement, not part of the reconciliation wire contract.
+                // A new column would oblige producer B to carry a field it has
+                // no opinion on — B is a coverage walker, not a decision
+                // oracle — for no gain, and would perturb the row-equality
+                // controls for every future sweep comparison.
+                let ops: String = degradations
+                    .iter()
+                    .filter_map(|d| match &d.reason {
+                        crate::bo_rewriter::decision::DegradeReason::RawPointerOperation {
+                            op,
+                        } => Some(format!("{}\t{op}\n", d.subject)),
+                        _ => None,
+                    })
+                    .collect();
+                let op_path = std::path::Path::new(&dir).join(format!("{name}.ops.tsv"));
+                std::fs::write(&op_path, ops)
+                    .unwrap_or_else(|e| panic!("write op split {}: {e}", op_path.display()));
             }
         }
         row.set("emitted", emitted);
