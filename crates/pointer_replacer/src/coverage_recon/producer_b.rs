@@ -124,19 +124,20 @@ pub(crate) fn rows(tcx: TyCtxt<'_>) -> Vec<Row> {
                 continue;
             }
 
-            let paired_info = match (first, second) {
-                (Some(info), None) if info.argument_index.is_none() => Some(info),
-                (Some(info), None) => {
-                    assert!(
-                        info.argument_index.is_none(),
-                        "non-parameter MIR local {local:?} unexpectedly carries argument_index {:?}",
-                        info.argument_index
-                    );
-                    None
-                }
-                (Some(_), Some(_)) => None,
-                _ => None,
-            };
+            let paired_info: Option<&rustc_middle::mir::VarDebugInfo<'_>> =
+                match (first, second) {
+                    (Some(info), None) if info.argument_index.is_none() => Some(info),
+                    (Some(info), None) => {
+                        assert!(
+                            info.argument_index.is_none(),
+                            "non-parameter MIR local {local:?} unexpectedly carries argument_index {:?}",
+                            info.argument_index
+                        );
+                        None
+                    }
+                    (Some(_), Some(_)) => None,
+                    _ => None,
+                };
             let (param_name, pairing_confidence, binding_span_lo, binding_span_hi) =
                 match paired_info {
                     Some(info) => {
