@@ -1491,3 +1491,111 @@ fn two_subjects_with_the_same_rendered_name_stay_distinct() {
         "emitted + degraded + unplaceable == rows, over 2 subjects"
     );
 }
+
+// ---------------------------------------------------------------------------
+// S3.1 A-side — the locals subject universe
+// ---------------------------------------------------------------------------
+
+/// Decision-table rows for a fixture, as `(mir_local, name, reason)`.
+fn locals_of(src: &str) -> Vec<(u32, Option<String>, String)> {
+    let fixture = Fixture::new(&[("lib.rs", src)]);
+    ::utils::compilation::run_compiler_on_path(&fixture.0.join("lib.rs"), |tcx| {
+        let table = super::decide_table(tcx).expect("fixture yields a decision table");
+        let rows = super::artifact::rows(tcx, &table);
+        rows.iter()
+            .filter(|r| r.arg_index.is_none())
+            .map(|r| {
+                (
+                    r.mir_local,
+                    r.param_name.clone(),
+                    r.degrade_reason.clone().unwrap_or_else(|| "<emitted>".to_owned()),
+                )
+            })
+            .collect::<Vec<_>>()
+    })
+    .expect("fixture compiles")
+}
+
+const MALLOC: &str = "#![allow(dead_code, unused_unsafe, unused_mut, unused_variables, unused_assignments)]\nextern \"C\" { fn malloc(size: usize) -> *mut core::ffi::c_void; }\n";
+
+/// **A named pointer local is a subject; a MIR temporary is not.**
+///
+/// Both halves in one witness because they share a fixture and the interesting
+/// property is the BOUNDARY between them: `p` is a named binding and becomes a
+/// subject, while the `*mut c_void` the `malloc` call lands in is a depth-1
+/// pointer with no debug entry and must not. Depth alone would admit it.
+///
+/// *Mutation-tested (Rider 0, deletion first):* deleting the locals range from
+/// `collect_local_subjects` yields zero rows; deleting the entry-count guard
+/// admits the temporary.
+#[test]
+fn a_named_pointer_local_is_a_subject_and_a_temporary_is_not() {
+    let got = locals_of(&format!(
+        "{MALLOC}pub unsafe fn f() -> i32 {{ let p: *mut i32 = malloc(4) as *mut i32; *p = 1; *p }}\n"
+    ));
+    assert_eq!(
+        got.iter().map(|(l, n, _)| (*l, n.as_deref())).collect::<Vec<_>>(),
+        // `_1`, not `_2`: this fn has no parameters, so `arg_count == 0` and the
+        // locals range opens at `_1`. The malloc temporary is absent because it
+        // carries no debug entry, which is the half of this witness that depth
+        // alone would get wrong.
+        vec![(1, Some("p"))],
+        "exactly the named local, and no temporary: {got:?}"
+    );
+}
+
+/// **Two shadowing locals are two subjects.** Name is not a key.
+///
+/// *Mutation-tested:* keying the universe by name collapses these to one row.
+#[test]
+fn two_shadowing_locals_are_two_subjects() {
+    let got = locals_of(&format!(
+        "{MALLOC}pub unsafe fn f() -> i32 {{ let p: *mut i32 = malloc(4) as *mut i32; *p = 1; \
+         let p: *mut i32 = malloc(4) as *mut i32; *p = 2; *p }}\n"
+    ));
+    let names: Vec<_> = got.iter().map(|(_, n, _)| n.as_deref()).collect();
+    assert_eq!(got.len(), 2, "two distinct locals, both named p: {got:?}");
+    assert_eq!(names, vec![Some("p"), Some("p")]);
+    assert_ne!(got[0].0, got[1].0, "distinct mir_locals: {got:?}");
+}
+
+/// **An unannotated pointer local degrades with its OWN reason**, and carries no
+/// `arg_index`.
+///
+/// The dominant corpus shape: 2628 of 3142 locals are C2Rust bindings with no
+/// declared type. Routing them through the decl-shape arm would attribute them
+/// to a syntax they do not have, which is why `NoDeclaredType` is tested first.
+///
+/// *Mutation-tested:* removing the `ty_span.is_none()` arm in `decide_one`
+/// re-routes this to `unsupported-decl-shape`.
+#[test]
+fn an_unannotated_pointer_local_degrades_with_its_own_reason() {
+    let got = locals_of(&format!(
+        "{MALLOC}pub unsafe fn f() -> i32 {{ let p = malloc(4) as *mut i32; *p = 1; *p }}\n"
+    ));
+    assert_eq!(got.len(), 1, "{got:?}");
+    assert_eq!(got[0].2, "no-declared-type", "{got:?}");
+}
+
+/// **A locals row carries `arg_index: None`** — *not a parameter*, never
+/// *unpaired* — while the parameter beside it keeps its 1-based index.
+///
+/// *Mutation-tested:* removing the `SubjectKind::Local => None` arm in
+/// `artifact::rows` is a compile error; returning `Some(0)` fails this.
+#[test]
+fn a_locals_row_carries_no_arg_index_while_a_parameter_keeps_one() {
+    let src = format!(
+        "{MALLOC}pub unsafe fn f(q: *mut i32) -> i32 {{ let p: *mut i32 = malloc(4) as *mut i32; *p = 1; *p + *q }}\n"
+    );
+    let fixture = Fixture::new(&[("lib.rs", &src)]);
+    let pairs = ::utils::compilation::run_compiler_on_path(&fixture.0.join("lib.rs"), |tcx| {
+        let table = super::decide_table(tcx).expect("table");
+        super::artifact::rows(tcx, &table)
+            .iter()
+            .map(|r| (r.mir_local, r.arg_index))
+            .collect::<Vec<_>>()
+    })
+    .expect("compiles");
+    assert!(pairs.contains(&(1, Some(1))), "the parameter keeps its index: {pairs:?}");
+    assert!(pairs.contains(&(2, None)), "the local carries None: {pairs:?}");
+}
