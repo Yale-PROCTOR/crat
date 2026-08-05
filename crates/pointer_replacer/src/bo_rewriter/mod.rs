@@ -1753,8 +1753,11 @@ pub(crate) fn facts_join_tsv(tcx: TyCtxt<'_>) -> Result<String, String> {
     subjects.extend(collect_local_subjects(tcx, &program, &mut_facts));
     let facts = decision::emitability::collect(tcx, &program.functions);
 
-    let mut out =
-        String::from("fn_path\tmir_local\tis_param\tannotated\tslot\tkind\traw_op\tptr_cmp\n");
+    let ctors = decision::construction::collect(tcx, &program.functions);
+
+    let mut out = String::from(
+        "fn_path\tmir_local\tis_param\tannotated\tslot\tkind\traw_op\tptr_cmp\tctor\tlen_class\tsize_expr\n",
+    );
     for s in &subjects {
         let slot = slots
             .fn_local_slots
@@ -1773,11 +1776,31 @@ pub(crate) fn facts_join_tsv(tcx: TyCtxt<'_>) -> Result<String, String> {
             .get(&(s.fn_did, s.hir_id))
             .map(|(op, _)| op.as_str())
             .unwrap_or("-");
+        // A parameter has NO construction site in this function by definition;
+        // reported as `param-no-site` rather than folded into "unrecoverable",
+        // because those are different claims — one about this analysis's reach,
+        // one about the program.
+        let is_param = matches!(s.kind, decision::SubjectKind::Param { .. });
+        let ctor = ctors.by_binding.get(&(s.fn_did, s.hir_id));
+        let (ctor_key, len_class, size_expr) = match (is_param, ctor) {
+            (true, _) => ("param", "param-no-site", String::new()),
+            (false, Some(c)) => (
+                c.key(),
+                c.len_class(),
+                match c {
+                    decision::construction::Construction::Alloc { size, count, .. } => {
+                        count.clone().map_or_else(|| size.clone(), |n| format!("{n} x {size}"))
+                    }
+                    _ => String::new(),
+                },
+            ),
+            (false, None) => ("-", "no-init", String::new()),
+        };
         out.push_str(&format!(
-            "{}\t{}\t{}\t{}\t{}\t{kind}\t{raw_op}\t{}\n",
+            "{}\t{}\t{}\t{}\t{}\t{kind}\t{raw_op}\t{}\t{ctor_key}\t{len_class}\t{size_expr}\n",
             tcx.def_path_str(s.fn_did.to_def_id()),
             s.local.as_u32(),
-            u8::from(matches!(s.kind, decision::SubjectKind::Param { .. })),
+            u8::from(is_param),
             u8::from(s.ty_span.is_some()),
             u8::from(slot.is_some()),
             u8::from(facts.ptr_comparisons.contains_key(&(s.fn_did, s.hir_id))),

@@ -1767,6 +1767,64 @@ fn the_facts_join_reports_facts_the_decision_never_reached() {
     );
 }
 
+/// **`calloc` and `realloc` are told apart by CALLEE, never by arity.**
+///
+/// Both take two arguments, and only `calloc`'s first is an element count —
+/// `realloc`'s is the pointer being resized. An arity test therefore reports a
+/// **pointer expression as a length**, which is not a near-miss: it is a length
+/// the emitted code would claim for a slice.
+///
+/// This is a regression pin on a defect that reached a de-risk run: every
+/// `realloc` in libtree came back `alloc-count` with `(*v).p` as its "count".
+/// Caught because the de-risk printed the size expressions rather than only
+/// counting the classes — a tally would have shown a plausible histogram.
+///
+/// *Mutation-tested (Rider 0, deletion first):* replacing the callee match with
+/// `if args.len() == 2` restores the defect and fails this test on `b`.
+#[test]
+fn calloc_and_realloc_are_told_apart_by_callee_not_arity() {
+    let src = "#![allow(dead_code, unused_unsafe, unused_variables)]\n\
+        extern \"C\" {\n\
+            fn calloc(n: usize, sz: usize) -> *mut core::ffi::c_void;\n\
+            fn realloc(p: *mut core::ffi::c_void, sz: usize) -> *mut core::ffi::c_void;\n\
+        }\n\
+        pub unsafe fn f(n: usize) -> i32 {\n\
+            let a: *mut i32 = calloc(n, 4) as *mut i32;\n\
+            let b: *mut i32 = realloc(a as *mut core::ffi::c_void, 8) as *mut i32;\n\
+            *b\n\
+        }\n";
+    let fixture = Fixture::new(&[("lib.rs", src)]);
+    let tsv = ::utils::compilation::run_compiler_on_path(&fixture.0.join("lib.rs"), |tcx| {
+        super::facts_join_tsv(tcx).expect("facts join")
+    })
+    .expect("fixture compiles");
+
+    let classes: Vec<(String, String)> = tsv
+        .lines()
+        .skip(1)
+        .map(|l| l.split('\t').collect::<Vec<_>>())
+        .filter(|c| c[2] == "0") // locals only
+        .map(|c| (c[9].to_owned(), c[10].to_owned()))
+        .collect();
+
+    assert!(
+        classes.iter().any(|(k, expr)| k == "alloc-count" && expr.contains('n')),
+        "calloc's element count must be recovered from its FIRST argument: {classes:?}"
+    );
+    assert!(
+        classes.iter().any(|(k, _)| k == "alloc-size-literal"),
+        "realloc must be classified by its SIZE argument, not by treating its \
+         pointer argument as a count: {classes:?}"
+    );
+    assert!(
+        !classes
+            .iter()
+            .any(|(k, expr)| k == "alloc-count" && expr.contains("c_void")),
+        "a POINTER expression was reported as an element count — the arity \
+         defect is back: {classes:?}"
+    );
+}
+
 /// **The negative control: a clean local is still emitted.**
 ///
 /// Without it, "every local now degrades" would pass both witnesses above. The

@@ -26,6 +26,7 @@ use rustc_span::Span;
 
 use crate::analyses::borrow_ownership::{SlotKind, crate_slots::CrateSlots, solver::SlotRef};
 
+pub(crate) mod construction;
 pub(crate) mod emitability;
 pub(crate) mod universe;
 
