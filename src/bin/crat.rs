@@ -573,6 +573,9 @@ fn main() {
                         serde_json::to_string_pretty(&field_specs).unwrap(),
                     )
                     .unwrap();
+                } else {
+                    // a rerun that no longer specializes must not leave a stale sidecar
+                    let _ = std::fs::remove_file(dir.join("field_spec_map.json"));
                 }
                 if changed {
                     std::fs::write(&file, s).unwrap();
