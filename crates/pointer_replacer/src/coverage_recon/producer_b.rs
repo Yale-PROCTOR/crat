@@ -623,4 +623,43 @@ mod tests {
             ]
         );
     }
+
+    /// L6: deleting the locals-loop depth test emits scalar local `_1` while
+    /// leaving pointer local `_2` unchanged, and fails this witness.
+    #[test]
+    fn locals_named_scalar_is_excluded_beside_pointer_local() {
+        let rows = fixture_rows(
+            r#"
+            #![allow(dead_code, unused_variables)]
+            unsafe fn f() -> i32 {
+                let n: i32 = 5;
+                let p: *const i32 = &n;
+                *p
+            }
+            "#,
+        );
+
+        let pairing: Vec<_> = rows
+            .iter()
+            .map(|row| {
+                (
+                    row.mir_local,
+                    row.param_name.as_deref(),
+                    row.arg_index,
+                    row.ptr_depth,
+                    row.pairing_confidence,
+                )
+            })
+            .collect();
+        assert_eq!(
+            pairing,
+            vec![(
+                2,
+                Some("p"),
+                None,
+                1,
+                PairingConfidence::High,
+            )]
+        );
+    }
 }
