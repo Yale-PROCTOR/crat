@@ -82,6 +82,15 @@ pub(crate) const FINDING_CLASSES: &[&str] = &[
     "span-check-not-evaluable-local",
 ];
 
+/// The one class whose expectation is a per-program **table**, not zero.
+///
+/// Named once and consumed by BOTH gates — [`Verdict::passed`] and the corpus
+/// driver's aggregate loop. Two hard-coded copies of this string is exactly the
+/// duplicated-canonicalizer shape: S3.1 shipped the driver half first and left
+/// `passed()` still demanding `findings.is_empty()`, so every program reported
+/// `recon=FAIL` while every aggregate was exactly on its pin.
+pub(crate) const POPULATION_PINNED_CLASS: &str = "span-check-not-evaluable-local";
+
 /// Is the span axis ACTIVE for this artifact pair?
 ///
 /// The predicate is exactly **"zero `binding_span_lo` in the entire producer-B
@@ -155,7 +164,14 @@ impl Verdict {
     )]
     pub(crate) fn passed(&self) -> bool {
         self.violations.is_empty()
-            && self.findings.is_empty()
+            // Findings in the population-pinned class are EXPECTED at a
+            // per-program count, so their presence is not a failure here; the
+            // corpus driver checks them against the table. Every other class
+            // keeps expected-zero, and one of those still fails the verdict.
+            && self
+                .findings
+                .iter()
+                .all(|f| f.class == POPULATION_PINNED_CLASS)
             && FINDING_CLASSES
                 .iter()
                 .all(|class| self.aggregates.contains_key(class))

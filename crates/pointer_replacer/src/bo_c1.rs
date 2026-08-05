@@ -8705,7 +8705,7 @@ fn m1_recon_corpus() {
             // expectation instead — see `EXPECTED_NOT_EVALUABLE_LOCAL`. The
             // exclusion is by NAME rather than by index so reordering
             // `FINDING_CLASSES` cannot silently re-point it.
-            if *class == "span-check-not-evaluable-local" {
+            if *class == crate::coverage_recon::compare::POPULATION_PINNED_CLASS {
                 continue;
             }
             if let Err(detail) = expected_zero_aggregate(&row, class) {

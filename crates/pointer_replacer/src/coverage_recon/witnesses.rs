@@ -710,3 +710,45 @@ fn an_unannotated_local_counts_under_the_locals_class() {
         verdict.aggregates
     );
 }
+
+/// **Both gates agree on which class is table-pinned.**
+///
+/// `Verdict::passed()` and the corpus driver each decide whether a finding is a
+/// failure. S3.1 changed one and not the other: every aggregate sat exactly on
+/// its pin while every program still reported `recon=FAIL`. A shared constant
+/// is the repair; this is the witness that the shared reading is the intended
+/// one in both directions.
+///
+/// *Mutation-tested (Rider 0, deletion first):* deleting the
+/// `f.class == POPULATION_PINNED_CLASS` allowance in `passed()` — restoring
+/// `findings.is_empty()` — fails the first assertion. Pointing the allowance at
+/// any other class fails the second.
+#[test]
+fn a_verdict_passes_on_population_pinned_findings_alone() {
+    let mut a_local = bare_row("m::f", 2, Some("p"), None, 1);
+    a_local.outcome = Some(Outcome::Degraded);
+    let mut b_local = bare_row("m::f", 2, Some("p"), None, 1);
+    b_local.binding_span_lo = Some(70);
+    b_local.binding_span_hi = Some(71);
+
+    let verdict = compare(&[a_local], &[b_local]);
+    assert_eq!(verdict.aggregates.get(super::compare::POPULATION_PINNED_CLASS), Some(&1));
+    assert!(
+        verdict.passed(),
+        "a verdict whose ONLY findings are population-pinned must pass — the \
+         per-program table is what checks them: {:?}",
+        verdict.findings
+    );
+
+    // A finding in any other class still fails the verdict.
+    let a_only = bare_row("m::g", 1, Some("q"), Some(1), 1);
+    let mut b_mismatch = bare_row("m::g", 1, Some("DIFFERENT"), Some(1), 1);
+    b_mismatch.pairing_confidence = PairingConfidence::Low;
+    let verdict2 = compare(&[a_only], &[b_mismatch]);
+    assert!(
+        !verdict2.passed(),
+        "a low-confidence pairing mismatch keeps expected-zero and must still \
+         fail: {:?}",
+        verdict2.findings
+    );
+}
