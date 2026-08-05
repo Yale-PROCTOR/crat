@@ -81,7 +81,18 @@ pub(crate) fn rows(tcx: TyCtxt<'_>, table: &DecisionTable) -> Vec<Row> {
                 // 1-based on the wire, matching `VarDebugInfo::argument_index`
                 // and MIR's parameter locals. Derived from the HIR position the
                 // collector recorded, NOT from `mir_local`.
-                arg_index: Some(subject.hir_index as u32 + 1),
+                //
+                // EXHAUSTIVE (S3.1). `None` on a local means **not a
+                // parameter**, never *unpaired*: `compare::pairing_agrees`
+                // compares this field by equality (`None == None` agrees), and
+                // nothing anywhere presence-tests it — swept crate-wide in the
+                // S3.1 pre-flight.
+                arg_index: match subject.kind {
+                    super::decision::SubjectKind::Param { hir_index } => {
+                        Some(hir_index as u32 + 1)
+                    }
+                    super::decision::SubjectKind::Local => None,
+                },
                 ptr_depth: subject.ptr_depth,
                 // Producer A's own doubt, which is narrower than producer B's:
                 // A knows only whether the pattern gave it a name.
@@ -90,12 +101,23 @@ pub(crate) fn rows(tcx: TyCtxt<'_>, table: &DecisionTable) -> Vec<Row> {
                 } else {
                     PairingConfidence::Low
                 },
-                decl_span: Some(EmitabilityFacts::site(tcx, subject.ty_span)),
+                // Attribution: always present, falling back to the binding
+                // when there is no declared type. Distinct from the splice
+                // target below, which is honestly absent in that case.
+                decl_span: Some(EmitabilityFacts::site(tcx, subject.attribution_span())),
                 // Through the SAME `lookup_byte_offset` the plan splices with,
                 // so the audited number IS the edit target rather than a
                 // parallel derivation that could drift from it.
-                decl_span_lo: Some(source_map.lookup_byte_offset(subject.ty_span.lo()).pos.0),
-                decl_span_hi: Some(source_map.lookup_byte_offset(subject.ty_span.hi()).pos.0),
+                // The SPLICE TARGET. `None` when the subject has no declared
+                // type — an unannotated or destructured local. Emitting the
+                // binding span here instead would make this field disagree with
+                // its own doc ("the audited number IS the edit target").
+                decl_span_lo: subject
+                    .ty_span
+                    .map(|s| source_map.lookup_byte_offset(s.lo()).pos.0),
+                decl_span_hi: subject
+                    .ty_span
+                    .map(|s| source_map.lookup_byte_offset(s.hi()).pos.0),
                 binding_span_lo: None,
                 binding_span_hi: None,
                 decl_shape: Some(wire_shape(subject.decl_shape)),
@@ -119,10 +141,13 @@ mod tests {
             local: Local::from_u32(local),
             hir_id: rustc_hir::CRATE_HIR_ID,
             param_name: name.map(str::to_owned),
-            hir_index: local as usize - 1,
+            kind: crate::bo_rewriter::decision::SubjectKind::Param {
+                hir_index: local as usize - 1,
+            },
             ptr_depth: 1,
             label: format!("f::{}", name.unwrap_or("<pattern>")),
-            ty_span: rustc_span::DUMMY_SP,
+            ty_span: Some(rustc_span::DUMMY_SP),
+            binding_span: rustc_span::DUMMY_SP,
             pointee_span: Some(rustc_span::DUMMY_SP),
             decl_shape: DeclShape::RawPtr,
             mutable: true,
@@ -187,7 +212,7 @@ mod tests {
     fn arg_index_comes_from_the_hir_position_not_the_mir_local() {
         ::utils::compilation::run_compiler_on_str("pub fn nothing() {}", |tcx| {
             let mut s = subject(7, Some("p"));
-            s.hir_index = 0;
+            s.kind = crate::bo_rewriter::decision::SubjectKind::Param { hir_index: 0 };
             let emitted = rows(tcx, &table(vec![(s, Decision::Ref { mutable: false })]));
             assert_eq!(emitted[0].mir_local, 7);
             assert_eq!(

@@ -64,7 +64,31 @@ impl DeclShape {
     }
 }
 
-/// One thing M1 must decide about. **Depth-0 pointer parameters only at S1.**
+/// Which universe a [`Subject`] came from.
+///
+/// The two universes are **disjoint by construction**: parameters occupy MIR
+/// locals `_1 ..= arg_count`, locals occupy `_(arg_count + 1) ..`. Nothing
+/// reconciles them afterwards because nothing has to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SubjectKind {
+    /// A pointer parameter. Carries its position in the HIR declaration,
+    /// **0-based**, recorded as collected.
+    ///
+    /// Kept separate from [`Subject::local`] deliberately. The two coincide
+    /// (`local == hir_index + 1`), but deriving the artifact's `arg_index`
+    /// *from* the local would make it a restatement of the alignment key — and a
+    /// pairing field that restates the key can never disagree with it. F1 is
+    /// precisely what such a field looks like.
+    Param { hir_index: usize },
+    /// A named pointer local. **Has no argument position**, so the artifact's
+    /// `arg_index` is `None` for it — which means *not a parameter*, never
+    /// *unpaired*: `compare::pairing_agrees` compares that field by equality and
+    /// nothing presence-tests it (S3.1 pre-flight, swept).
+    Local,
+}
+
+/// One thing M1 must decide about: a pointer **parameter** or a named pointer
+/// **local**.
 ///
 /// Subjects and decisions are counted against each other by the structural gate
 /// (`|decisions| == |subjects|`), so a subject that is silently skipped rather
@@ -80,21 +104,42 @@ pub(crate) struct Subject {
     /// **Pairing term 1** in the reconciliation artifact: the parameter's
     /// source name. `None` when the pattern is not a plain binding.
     pub param_name: Option<String>,
-    /// **Pairing term 2**: the parameter's position in the HIR declaration,
-    /// **0-based**, recorded as collected.
+    /// Which universe this subject came from — and, for a parameter, **pairing
+    /// term 2**.
     ///
-    /// Kept separately from [`Self::local`] deliberately. The two coincide
-    /// today (`local == hir_index + 1`), but deriving the artifact's
-    /// `arg_index` *from* the local would make it a restatement of the
-    /// alignment key — and a pairing field that restates the key can never
-    /// disagree with it. F1 is precisely what such a field looks like.
-    pub hir_index: usize,
-    /// Pointer-chain depth of the RESOLVED parameter type.
+    /// **An enum rather than `Option<usize>`, deliberately (S3.1).** The
+    /// artifact's `arg_index` derivation matches on this, so adding the locals
+    /// kind made every consumer a compile error until it said what it meant.
+    /// An `Option` would have let a consumer write `unwrap_or(0)` and compile —
+    /// the same silent-acceptance shape S3.0 removed from the `Decision`
+    /// consumers.
+    pub kind: SubjectKind,
+    /// Pointer-chain depth of the RESOLVED subject type.
     pub ptr_depth: u8,
     /// Human-readable identity for attribution: `fn_name::param_name`.
     pub label: String,
-    /// Source span of the parameter's declared **type**.
-    pub ty_span: Span,
+    /// Source span of the subject's declared **type** — the splice target.
+    ///
+    /// **`None` when there is no declared type**, which S3.1 makes reachable:
+    /// `let p = malloc(4) as *mut i32;` has no annotation, and a
+    /// tuple-destructuring `let (a, b): (…)` annotates the *pattern*, not its
+    /// components (measured 2026-08-05: MIR reports per-binding spans while the
+    /// HIR `let` carries one whole-pattern type). Such subjects degrade with
+    /// [`DegradeReason::NoDeclaredType`]; nothing splices them.
+    ///
+    /// Kept distinct from [`Self::binding_span`] because they mean different
+    /// things: this one is *where an edit would go*, that one is *where the
+    /// subject is*. Using the binding span here would put a non-splice-target
+    /// into the artifact's `decl_span_lo/hi`, whose doc says the audited number
+    /// IS the edit target.
+    pub ty_span: Option<Span>,
+    /// Source span of the subject's **binding** — always present.
+    ///
+    /// Attribution only: it is what a site string renders when there is no
+    /// declared type to point at. For a parameter this is the pattern; for a
+    /// local it is the `var_debug_info` entry's span, which is exactly the HIR
+    /// binding pattern's span (measured, including the `mut p` case).
+    pub binding_span: Span,
     /// Source span of the pointee type, kept so the plan can preserve the
     /// pointee's text verbatim rather than re-render it.
     ///
@@ -136,6 +181,13 @@ impl Subject {
     ///
     /// `Local::as_u32` rather than `Local`'s `Debug` so the rendering matches
     /// the artifact's `mir_local` exactly rather than approximately.
+    /// The span a human-facing site string points at: the declared type when
+    /// there is one, the binding otherwise. Never `None`, so attribution never
+    /// degrades along with the type.
+    pub(crate) fn attribution_span(&self) -> Span {
+        self.ty_span.unwrap_or(self.binding_span)
+    }
+
     pub(crate) fn identity_key(&self, owner: &str) -> String {
         format!(
             "{owner}::{}#{}",
@@ -187,6 +239,12 @@ pub(crate) enum DegradeReason {
     /// a syntactic `*mut`/`*const` — the C2Rust alias class, or a parameter
     /// that is already a reference.
     ///
+    /// **Renamed from `UnsupportedDeclShape` at S3.1** (register 4, reason honesty).
+    /// The old name asserted the opposite of the truth for its largest
+    /// population: a C2Rust alias declaration IS a pointer declaration, just not
+    /// one M1 can splice. The new name is true of every shape it carries —
+    /// `alias`, `reference`, `other` — and prejudges none of them.
+    ///
     /// R-A: collect these, do not exclude them. They are real C pointer
     /// parameters, so excluding them would shrink the universe artificially;
     /// what they get instead is a decision and an attributed reason. Emitting
@@ -194,7 +252,19 @@ pub(crate) enum DegradeReason {
     /// contains the `*mut`, so `&mut lil_value_t` would be wrong — and
     /// conflating it with the collection fix would repeat this milestone's
     /// pattern of bundling.
-    NonPointerDecl { shape: &'static str },
+    UnsupportedDeclShape { shape: &'static str },
+    /// The subject has **no declared type**, so there is no splice target.
+    ///
+    /// Locals only, and reachable two ways (both measured 2026-08-05):
+    /// an unannotated `let p = malloc(4) as *mut i32;`, and a destructuring
+    /// `let (a, b): (*mut i32, *mut i32)` whose annotation belongs to the
+    /// PATTERN — MIR reports per-binding spans while the HIR `let` carries one
+    /// whole-pattern type, so a component has no type of its own.
+    ///
+    /// A parameter always has a declared type, so this reason never appears on
+    /// the parameter universe. A count of 0 means the locals universe is empty,
+    /// not that the reason is inert.
+    NoDeclaredType,
 }
 
 impl DegradeReason {
@@ -214,7 +284,8 @@ impl DegradeReason {
             DegradeReason::CallSiteNotAdapted => "call-site-not-adapted",
             DegradeReason::PtrComparison => "ptr-comparison",
             DegradeReason::NoSlot => "no-slot",
-            DegradeReason::NonPointerDecl { .. } => "non-pointer-decl",
+            DegradeReason::UnsupportedDeclShape { .. } => "unsupported-decl-shape",
+            DegradeReason::NoDeclaredType => "no-declared-type",
         }
     }
 }
@@ -350,7 +421,7 @@ fn decide_one(
     slots: &CrateSlots,
     facts: &EmitabilityFacts,
 ) -> Decision {
-    let decl_site = EmitabilityFacts::site(tcx, subject.ty_span);
+    let decl_site = EmitabilityFacts::site(tcx, subject.attribution_span());
 
     // The declaration's SHAPE comes FIRST, before any analysis is consulted.
     //
@@ -366,11 +437,17 @@ fn decide_one(
     // The cost, stated: an alias-typed parameter's BO kind does not reach the
     // counters. That is S2b's question to reopen with a reason if it wants the
     // "how many alias params would have been Ref" breakdown.
+    // BEFORE the shape test, because "no declared type" is not a shape. A local
+    // with no annotation has no `decl_shape` worth reporting, and routing it
+    // through the shape arm would attribute it to a syntax it does not have.
+    if subject.ty_span.is_none() {
+        return degrade(subject, decl_site, DegradeReason::NoDeclaredType);
+    }
     if subject.decl_shape != DeclShape::RawPtr {
         return degrade(
             subject,
             decl_site,
-            DegradeReason::NonPointerDecl {
+            DegradeReason::UnsupportedDeclShape {
                 shape: subject.decl_shape.key(),
             },
         );
@@ -443,10 +520,11 @@ mod self_consistency_tests {
             local: Local::from_u32(local),
             hir_id: rustc_hir::CRATE_HIR_ID,
             param_name: Some(label.rsplit("::").next().unwrap_or(label).to_owned()),
-            hir_index: local as usize - 1,
+            kind: SubjectKind::Param { hir_index: local as usize - 1 },
             ptr_depth: 1,
             label: label.to_owned(),
-            ty_span: rustc_span::DUMMY_SP,
+            ty_span: Some(rustc_span::DUMMY_SP),
+            binding_span: rustc_span::DUMMY_SP,
             pointee_span: Some(rustc_span::DUMMY_SP),
             decl_shape: DeclShape::RawPtr,
             mutable: true,

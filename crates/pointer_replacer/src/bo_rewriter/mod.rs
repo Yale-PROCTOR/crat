@@ -395,7 +395,7 @@ fn rewrite_core_injected(
             emitted_subjects.push((
                 owner.clone(),
                 key,
-                decision::emitability::EmitabilityFacts::site(tcx, subject.ty_span),
+                decision::emitability::EmitabilityFacts::site(tcx, subject.attribution_span()),
             ));
             if !seen_fns.insert(subject.fn_did) {
                 continue;
@@ -948,10 +948,11 @@ fn collect_subjects(
                 local,
                 hir_id: param.pat.hir_id,
                 param_name: name.clone(),
-                hir_index: index,
+                kind: decision::SubjectKind::Param { hir_index: index },
                 ptr_depth: ptr_chain_depth(*param_ty),
                 label: format!("{fn_name}::{}", name.as_deref().unwrap_or("<pattern>")),
-                ty_span: input.span,
+                ty_span: Some(input.span),
+                binding_span: param.pat.span,
                 pointee_span,
                 decl_shape,
                 // The declared mutability is a ceiling, not the decision: BO's
@@ -960,6 +961,163 @@ fn collect_subjects(
                 // the pointer predicate above does.
                 mutable: matches!(
                     param_ty.kind(),
+                    TyKind::RawPtr(_, Mutability::Mut) | TyKind::Ref(_, _, Mutability::Mut)
+                ) && mut_facts.is_mutable(fn_did, local),
+            });
+        }
+    }
+    subjects
+}
+
+/// M1 subjects, second universe: each **named pointer local** of each local
+/// function (S3.1).
+///
+/// # The universe rule — depth + named binding, and nothing else
+///
+/// A local is a subject iff its type has pointer depth > 0 **and** at least one
+/// `var_debug_info` entry keys to it. There is deliberately **no third
+/// condition**: a local BO has no slot for is collected and *degraded with a
+/// reason*, never omitted. The rule is structurally identical to the reference
+/// walker's, and that identity of shape is what makes a producer-B-only row a
+/// clean signal instead of an expected difference.
+///
+/// **Zero entries is the universe exclusion**, and it is what keeps MIR
+/// temporaries out: measured, the `*mut c_void` a `malloc` call lands in carries
+/// no debug entry at all, while being a depth-1 pointer. Depth alone would
+/// admit it, and it has no source binding anyone could rewrite.
+///
+/// # Mapping a MIR local back to its declaration
+///
+/// The `var_debug_info` entry's span **is** the HIR binding pattern's span —
+/// measured on this toolchain, `mut` included (`let mut p` reports `4:9:4:14` on
+/// both sides). So a map from simple-binding `let` pattern spans to their type
+/// annotation resolves the declaration exactly, without a name lookup that
+/// shadowing would break.
+///
+/// A local not found in that map has no declared type of its own: it is either
+/// unannotated, or a component of a destructuring pattern whose annotation
+/// belongs to the pattern. Both carry `ty_span: None` and degrade with
+/// [`decision::DegradeReason::NoDeclaredType`].
+fn collect_local_subjects(
+    tcx: TyCtxt<'_>,
+    program: &RustProgram<'_>,
+    mut_facts: &MutFacts,
+) -> Vec<decision::Subject> {
+    use rustc_hir::intravisit::Visitor;
+
+    /// Simple-binding `let` declarations, keyed by the binding pattern's span.
+    struct Lets<'hir> {
+        by_pat_span: rustc_hash::FxHashMap<rustc_span::Span, Option<&'hir rustc_hir::Ty<'hir>>>,
+    }
+    impl<'hir> Visitor<'hir> for Lets<'hir> {
+        fn visit_stmt(&mut self, stmt: &'hir rustc_hir::Stmt<'hir>) {
+            if let rustc_hir::StmtKind::Let(local) = stmt.kind
+                && matches!(local.pat.kind, rustc_hir::PatKind::Binding(..))
+            {
+                // Only SIMPLE bindings: a destructuring pattern's annotation is
+                // the pattern's, not any component's, so recording it here would
+                // hand a component a type it does not have.
+                self.by_pat_span.insert(local.pat.span, local.ty);
+            }
+            rustc_hir::intravisit::walk_stmt(self, stmt);
+        }
+    }
+
+    let mut subjects = Vec::new();
+    for &fn_did in &program.functions {
+        let Some(body_id) = tcx.hir_node_by_def_id(fn_did).body_id() else {
+            continue;
+        };
+        let mut lets = Lets {
+            by_pat_span: rustc_hash::FxHashMap::default(),
+        };
+        lets.visit_body(tcx.hir_body(body_id));
+
+        let mir = tcx.mir_drops_elaborated_and_const_checked(fn_did).borrow();
+        let fn_name = tcx.item_name(fn_did.to_def_id());
+
+        // Entries per local, so the one-vs-more split is a count and not a
+        // first-match. Deterministic order: BTreeMap keyed by local index.
+        let mut entries: std::collections::BTreeMap<Local, Vec<&rustc_middle::mir::VarDebugInfo<'_>>> =
+            std::collections::BTreeMap::new();
+        for info in &mir.var_debug_info {
+            if let rustc_middle::mir::VarDebugInfoContents::Place(place) = info.value
+                && let Some(local) = place.as_local()
+            {
+                entries.entry(local).or_default().push(info);
+            }
+        }
+
+        for (local, infos) in entries {
+            // Locals are `_(arg_count + 1) ..`; `_0` is the return place and
+            // `_1 ..= arg_count` is the parameter universe. Stated as a bound on
+            // the local rather than as "not a parameter", so the two universes
+            // are disjoint by construction rather than by filtering.
+            if local.index() <= mir.arg_count {
+                continue;
+            }
+            let ty = mir.local_decls[local].ty;
+            if ptr_chain_depth(ty) == 0 {
+                continue;
+            }
+            // The contradiction case: `argument_index` is set only on parameter
+            // locals. One here would mean the toolchain changed what it means,
+            // and reclassifying silently would hide that. Measured across plain
+            // locals, shadowing pairs, temporaries, tuple-pattern components and
+            // a reference pattern: never `Some` off the parameter universe.
+            for info in &infos {
+                assert!(
+                    info.argument_index.is_none(),
+                    "non-parameter local {local:?} of {fn_did:?} carries \
+                     argument_index {:?} — `var_debug_info`'s meaning has \
+                     changed and the locals universe rule must be re-derived",
+                    info.argument_index
+                );
+            }
+            let binding_span = infos[0].source_info.span;
+            // Exactly one entry names the local; more than one is defensive and
+            // NOT known to be reachable, so it declines to name rather than
+            // picking. `param_name: None` is what makes the artifact report Low.
+            let name = (infos.len() == 1).then(|| infos[0].name.to_string());
+            let declared = name
+                .is_some()
+                .then(|| lets.by_pat_span.get(&binding_span).copied())
+                .flatten()
+                .flatten();
+            let (decl_shape, pointee_span, ty_span) = match declared.map(|t| (t, t.kind)) {
+                Some((t, rustc_hir::TyKind::Ptr(mut_ty))) => (
+                    decision::DeclShape::RawPtr,
+                    Some(mut_ty.ty.span),
+                    Some(t.span),
+                ),
+                Some((t, rustc_hir::TyKind::Ref(_, mut_ty))) => (
+                    decision::DeclShape::Reference,
+                    Some(mut_ty.ty.span),
+                    Some(t.span),
+                ),
+                Some((t, rustc_hir::TyKind::Path(_))) => {
+                    (decision::DeclShape::Alias, None, Some(t.span))
+                }
+                Some((t, _)) => (decision::DeclShape::Other, None, Some(t.span)),
+                // No declared type of its own — unannotated, or a destructuring
+                // component. `decide_one` degrades on `ty_span.is_none()` before
+                // it ever consults the shape.
+                None => (decision::DeclShape::Other, None, None),
+            };
+            subjects.push(decision::Subject {
+                fn_did,
+                local,
+                hir_id: rustc_hir::CRATE_HIR_ID,
+                param_name: name.clone(),
+                kind: decision::SubjectKind::Local,
+                ptr_depth: ptr_chain_depth(ty),
+                label: format!("{fn_name}::{}", name.as_deref().unwrap_or("<unnamed>")),
+                ty_span,
+                binding_span,
+                pointee_span,
+                decl_shape,
+                mutable: matches!(
+                    ty.kind(),
                     TyKind::RawPtr(_, Mutability::Mut) | TyKind::Ref(_, _, Mutability::Mut)
                 ) && mut_facts.is_mutable(fn_did, local),
             });
@@ -1441,6 +1599,11 @@ fn decide_table_perturbed<'tcx>(
     };
 
     let mut subjects = collect_subjects(tcx, &program, &mut_facts);
+    // S3.1: the second universe. Appended rather than merged into
+    // `collect_subjects` so the parameter census keeps measuring the parameter
+    // predicate — a census whose denominator silently gained a population is not
+    // the same instrument.
+    subjects.extend(collect_local_subjects(tcx, &program, &mut_facts));
     perturb(&mut subjects);
     let facts = decision::emitability::collect(tcx, &program.functions);
     let table = decision::decide(tcx, &subjects, &model, &slots, &facts);

@@ -837,7 +837,7 @@ fn alias_typed_pointer_params_are_collected_and_attributed() {
     let records = reasons_for_source(&src);
     let hit = records
         .iter()
-        .find(|d| d.reason == DegradeReason::NonPointerDecl { shape: "alias" })
+        .find(|d| d.reason == DegradeReason::UnsupportedDeclShape { shape: "alias" })
         .unwrap_or_else(|| {
             panic!(
                 "the alias-typed parameter produced no attributed degradation — \
@@ -870,7 +870,7 @@ fn reference_typed_params_are_collected_with_their_own_shape() {
     let records = reasons_for_source(&src);
     let hit = records
         .iter()
-        .find(|d| d.reason == DegradeReason::NonPointerDecl { shape: "reference" })
+        .find(|d| d.reason == DegradeReason::UnsupportedDeclShape { shape: "reference" })
         .unwrap_or_else(|| {
             panic!("the reference-typed parameter was not attributed; got {records:#?}")
         });

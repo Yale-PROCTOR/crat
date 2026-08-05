@@ -213,7 +213,7 @@ pub(crate) struct Plan {
 /// **Where alias-typed subjects land today:** a parameter whose *resolved* type
 /// is a pointer but whose declaration is a type alias is collected (R-A) with
 /// `DeclShape::Alias`, and `decide_one` degrades it as
-/// `NonPointerDecl { shape: "alias" }` — a reason named for the declaration
+/// `UnsupportedDeclShape { shape: "alias" }` — a reason named for the declaration
 /// shape, which is true but says nothing about what BO concluded for it. The
 /// alias-specific relabel is **registered**, to ride whichever slice first makes
 /// alias emission live (S3 at the earliest).
@@ -242,12 +242,21 @@ pub(crate) fn plan(
             // authority the architecture puts in one place.
             Decision::Degraded(_) => continue,
         };
-        let attribution = || {
-            format!(
-                "{} (param #{})",
+        // Attribution names the universe, so a locals record does not read as a
+        // parameter at position 0 — `detail` is what a human reads in an
+        // `Unplaceable`, and "p (param #0)" for a local would be a false
+        // statement, not merely a vague one. Identity still lives in
+        // `Unplaceable::subject`; this is display.
+        let attribution = || match subject.kind {
+            super::decision::SubjectKind::Param { hir_index } => format!(
+                "{} (param #{hir_index})",
+                subject.param_name.as_deref().unwrap_or("<unnamed>")
+            ),
+            super::decision::SubjectKind::Local => format!(
+                "{} (local {:?})",
                 subject.param_name.as_deref().unwrap_or("<unnamed>"),
-                subject.hir_index
-            )
+                subject.local
+            ),
         };
         // The SAME recipe the driver builds its emitted-subject labels with.
         // Two spellings of one identity would make the subtraction silently
@@ -258,7 +267,7 @@ pub(crate) fn plan(
         // duplicated canonicalizer whose two copies had to be edited together.
         let identity = || subject.identity_key(&owner_of(subject));
         // A `Ref` decision implies a syntactic raw-pointer declaration:
-        // `decide_one` degrades every other shape with `NonPointerDecl`,
+        // `decide_one` degrades every other shape with `UnsupportedDeclShape`,
         // precisely because there is no pointee text to copy through an alias.
         //
         // So this arm is UNREACHABLE through the shipping pipeline — which is
@@ -276,7 +285,22 @@ pub(crate) fn plan(
             });
             continue;
         };
-        let (ty_file, ty_lo, ty_hi) = match span_to_loc(subject.ty_span) {
+        // S3.1: a subject with no DECLARED TYPE has no splice target. Reachable
+        // only for locals (an unannotated `let`, or a destructuring pattern
+        // whose annotation belongs to the pattern rather than the component),
+        // and such subjects degrade in the decision phase — so this arm is a
+        // backstop over a population the decision phase has already removed,
+        // not the place the case is handled. Recorded because S2b.2's audit
+        // requires every non-placing arm to be listed with what it owes.
+        let Some(subject_ty_span) = subject.ty_span else {
+            unplaceable.push(Unplaceable {
+                reason: "subject has no declared type to splice",
+                detail: attribution(),
+                subject: identity(),
+            });
+            continue;
+        };
+        let (ty_file, ty_lo, ty_hi) = match span_to_loc(subject_ty_span) {
             Ok(located) => located,
             Err(reason) => {
                 unplaceable.push(Unplaceable {
@@ -360,10 +384,11 @@ mod tests {
             local: Local::from_u32(1),
             hir_id: rustc_hir::CRATE_HIR_ID,
             param_name: Some("p".to_owned()),
-            hir_index: 0,
+            kind: crate::bo_rewriter::decision::SubjectKind::Param { hir_index: 0 },
             ptr_depth: 1,
             label: "f::p".to_owned(),
-            ty_span: rustc_span::DUMMY_SP,
+            ty_span: Some(rustc_span::DUMMY_SP),
+            binding_span: rustc_span::DUMMY_SP,
             pointee_span: None,
             decl_shape: DeclShape::Alias,
             mutable: false,
@@ -443,7 +468,7 @@ mod tests {
                 Decision::Degraded(crate::bo_rewriter::decision::Degradation {
                     subject: "f::p".to_owned(),
                     site: "f.rs:1".to_owned(),
-                    reason: crate::bo_rewriter::decision::DegradeReason::NonPointerDecl {
+                    reason: crate::bo_rewriter::decision::DegradeReason::UnsupportedDeclShape {
                         shape: "alias",
                     },
                 }),
