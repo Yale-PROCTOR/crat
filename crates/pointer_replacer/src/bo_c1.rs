@@ -7224,6 +7224,32 @@ mod run {
                 *baseline_msg_env,
             ),
         };
+        // S3.1′ E3c — the reverted subjects BY IDENTITY, not just a count.
+        //
+        // `reverted` is an aggregate, and the question it is being asked (how
+        // much of the revert load belongs to LOCALS) is a per-population one.
+        // Rather than thread `SubjectKind` down through two partition sites,
+        // this prints the identity `plan` already stamps —
+        // `{owner}::{name}#{mir_local}` — which joins against the recon
+        // artifact's `(fn_path, mir_local)` to recover the population. An
+        // independent join beats new plumbing, per the box-candidate-split
+        // precedent.
+        //
+        // MEASUREMENT ONLY: nothing branches on this, and no gate reads it.
+        {
+            let degradations = match &outcome {
+                RewriteOutcome::Emitted { degradations, .. }
+                | RewriteOutcome::Degraded { degradations, .. } => degradations,
+            };
+            for d in degradations.iter().filter(|d| {
+                matches!(
+                    d.reason,
+                    crate::bo_rewriter::decision::DegradeReason::RevertedAfterVerifyFailure
+                )
+            }) {
+                println!("M1EMIT-REVERT subject={}", d.subject);
+            }
+        }
         row.set("emitted", emitted);
         row.set("degraded", degraded);
         row.set("files_touched", files_touched);
