@@ -11756,8 +11756,11 @@ fn test_struct_param_field_cross_module_guarded_exposed_call_site_compiles() {
     // hoisted guard whose cast type comes from the field's declared AST
     // type, which spells the c2rust alias `myint_t` -- a type module `b`
     // never imports. two bugs, reproduced together:
-    // - bug A (E0425): the call site rewrite retargets to `build_field`,
-    //   but no `use ... build_field` sibling import is emitted for module b
+    // - bug A (E0425/E0432): the call site rewrite retargets to
+    //   `build_field`, so module b's `use crate::a::build;` must be renamed
+    //   to `use crate::a::build_field;` in place -- no wrapper preserves the
+    //   original `build` name any more, so leaving the old import in place
+    //   (even alongside a new one) would dangle
     // - bug B (E0412): the hoisted guard casts through `myint_t`, which is
     //   only in scope inside module `a`
     let mut config = Config::default();
@@ -11802,18 +11805,11 @@ pub mod b {
 }
 "#;
     let (s, _) = rewrite_struct_param_fields_with_config(code, &config);
-    // sibling-uses injection is untouched (out of scope for this task): it
-    // still leaves the pre-existing `use crate::a::build;` import in place
-    // alongside the new sibling import. that import dangles now that no
-    // wrapper preserves the old `build` name -- cleaning up stale imports
-    // for renamed exposed fns is the interface pass's job (a later task);
-    // strip it here so this test can isolate its own concern (the sibling
-    // `build_field` import and the alias-free hoisted guard cast)
-    let stripped = s.replace("use crate::a::build;", "");
-    ::utils::compilation::run_compiler_on_str(&stripped, ::utils::type_check).expect(&stripped);
-    // bug A fix: module b imports the `_field` redirect target alongside the
-    // original (now-stale) import
+    ::utils::compilation::run_compiler_on_str(&s, ::utils::type_check).expect(&s);
+    // bug A fix: module b's import is renamed in place to the `_field`
+    // redirect target; the original (now-dangling) name must not remain
     assert!(s.contains("use crate::a::build_field"), "{s}");
+    assert!(!s.contains("use crate::a::build;"), "{s}");
     assert!(s.contains("build_field(__crat_g0_field"), "{s}");
     // bug B fix: module b's hoisted guard casts through the alias-free MIR
     // spelling `[u16; 4]`, not the c2rust alias `myint_t` (which module b
@@ -11827,7 +11823,7 @@ pub mod b {
 
 #[test]
 fn test_struct_param_field_glob_use_no_corrupted_sibling_import() {
-    // guards `sibling_field_use`'s UseTreeKind::Simple-only gate. before the
+    // guards `renamed_field_use`'s UseTreeKind::Simple-only gate. before the
     // gate, the prefix-truncation (`rfind("::")` + truncate, meant to drop a
     // Simple use's trailing symbol segment) was applied uniformly to every
     // `use` item's `tree.prefix`. for a non-Simple tree the last `::`
@@ -11838,7 +11834,7 @@ fn test_struct_param_field_glob_use_no_corrupted_sibling_import() {
     // rather than either the correct sibling or nothing.
     //
     // empirically, `crate::a::*` already resolves `build_field` into scope
-    // by itself (that's the point of a glob import), so `sibling_field_use`
+    // by itself (that's the point of a glob import), so `renamed_field_use`
     // never reaches the corrupting code even pre-gate: HIR resolves a glob
     // `use` item's `value_ns` to the module, not to the specific fn, so the
     // `Res::Def(DefKind::Fn, _)` match fails before the prefix is ever
@@ -11855,7 +11851,7 @@ fn test_struct_param_field_glob_use_no_corrupted_sibling_import() {
     // direct probe (`thread 'rustc' panicked at
     // crates/utils/src/ir/ast_to_hir.rs:90:22: explicit panic`). that panic
     // fires regardless of this fix, so no test (e2e or otherwise, since
-    // `sibling_field_use` requires a live `TyCtxt` to call at all) can drive
+    // `renamed_field_use` requires a live `TyCtxt` to call at all) can drive
     // a Nested tree into this gate; the Simple-only match is verified here
     // for Glob, and by code inspection for Nested (structurally identical:
     // `tree.prefix` for `use crate::a::{b, c};` is `crate::a`, the same

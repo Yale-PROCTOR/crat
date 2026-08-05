@@ -564,17 +564,14 @@ struct Hoist {
 
 impl MutVisitor for SpecTransformVisitor<'_, '_> {
     fn flat_map_item(&mut self, mut item: P<Item>) -> smallvec::SmallVec<[P<Item>; 1]> {
-        // a `use` item resolving to a renamed (exposed) fn: the wrapper still
-        // exists under the original name (build_wrapper preserves it), so the
-        // original import keeps working, but call sites in this module that
-        // got retargeted to the `_field` name (rewrite_call_args) also need
-        // that name in scope. emit an additional sibling import for it rather
-        // than renaming in place
-        if let Some(sibling) = self.sibling_field_use(&item) {
-            let mut items = smallvec::SmallVec::new();
-            items.push(item);
-            items.push(sibling);
-            return items;
+        // a `use` item resolving to a renamed (exposed) fn: nothing occupies
+        // the original name any more (no wrapper preserves it -- the pointer
+        // pass just returns a record for a later pass to synthesize the ABI
+        // shim from), so an import of the original name would dangle
+        // (E0432). rename the use's final segment to the `_field` name in
+        // place instead of keeping the original and adding a sibling
+        if let Some(renamed) = self.renamed_field_use(&item) {
+            return smallvec::smallvec![renamed];
         }
 
         let mut entered = false;
@@ -683,14 +680,14 @@ impl MutVisitor for SpecTransformVisitor<'_, '_> {
 
 impl SpecTransformVisitor<'_, '_> {
     // if `item` is a `use` item resolving (via HIR) to a fn that got renamed
-    // to `{name}_field`, build an additional sibling `use` item importing
-    // that new name, so cross-module call sites retargeted by
-    // rewrite_call_args (which rewrites the call-expr path segment, not the
-    // module's imports) resolve. the original `use` item is left untouched:
-    // the wrapper still exists under the original name (build_wrapper), so
-    // the pre-existing import keeps working for callers of the ABI-preserving
-    // wrapper
-    fn sibling_field_use(&self, item: &Item) -> Option<P<Item>> {
+    // to `{name}_field`, build a replacement `use` item importing the new
+    // name instead. cross-module call sites retargeted by rewrite_call_args
+    // (which rewrites the call-expr path segment, not the module's imports)
+    // need that name in scope; the original name must NOT be reachable
+    // either, since nothing in the output occupies it any more (no wrapper
+    // preserves it) -- an import of the original name would be a dangling
+    // reference (E0432) at the very next compiler pass
+    fn renamed_field_use(&self, item: &Item) -> Option<P<Item>> {
         let ItemKind::Use(tree) = &item.kind else {
             return None;
         };
@@ -724,9 +721,9 @@ impl SpecTransformVisitor<'_, '_> {
         } else {
             return None;
         }
-        let mut sibling = P(utils::item!("use {prefix}::{new_name};"));
-        sibling.vis = item.vis.clone();
-        Some(sibling)
+        let mut renamed = P(utils::item!("use {prefix}::{new_name};"));
+        renamed.vis = item.vis.clone();
+        Some(renamed)
     }
 
     // builds one FieldSpecEntry for a surviving exposed target, from the
