@@ -970,6 +970,20 @@ fn fatness_ban_matches_a_synthetic_breach() {
         fatness_offense("    let f: FatnessResult = fatness_analysis(&program);").is_some(),
         "a FatnessResult binding was not detected"
     );
+    // The case a surviving mutation exposed. Emptying the needle list left
+    // this test green, because the bare-`Fatness` fallback catches the two
+    // shapes above. It does NOT catch a lowercase import of the analysis
+    // ENTRY POINT — no `Fatness` token appears on the line — and that is the
+    // most natural way to wire the analysis in. Only the `type_qualifier`
+    // needle sees it, so only this assertion pins that needle.
+    assert!(
+        fatness_offense(
+            "use crate::analyses::type_qualifier::foster::fatness::fatness_analysis;"
+        )
+        .is_some(),
+        "a lowercase import of the analysis entry point carries no `Fatness` \
+         token — the `type_qualifier` needle is the only thing that catches it"
+    );
     assert!(
         fatness_offense("    if fat.is_array(s.fn_did, s.local) {").is_none(),
         "the ban is on NAMING the analysis types, not on any identifier — \
