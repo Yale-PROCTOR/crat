@@ -41,6 +41,10 @@
 //! M1/S0 lands the phase skeleton, the goldens as RED, and the per-phase
 //! isolation checks. The decision table, edit plan and applier arrive in S1
 //! (G01 walking skeleton) and S2–S3 (breadth).
+//!
+//! **Substrate of record.** Every corpus number attributed to this module
+//! derives from the post-`expand`→`extern`→`preprocess` form; see
+//! `docs/agents/2026-08-06-substrate-of-record.md`.
 
 use rustc_hir::{ItemKind, OwnerNode};
 use rustc_middle::{
