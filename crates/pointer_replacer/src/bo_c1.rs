@@ -4292,30 +4292,7 @@ mod run {
         eprintln!("BOC1PHASE {name} t={:.2}", since.elapsed().as_secs_f64());
     }
 
-    fn local_key(
-        tcx: TyCtxt<'_>,
-        fn_did: rustc_span::def_id::LocalDefId,
-        local: usize,
-        depth: u8,
-    ) -> String {
-        format!(
-            "{}::_{}@d{depth}",
-            tcx.def_path_str(fn_did.to_def_id()),
-            local
-        )
-    }
-
-    fn field_key(
-        tcx: TyCtxt<'_>,
-        struct_did: rustc_span::def_id::LocalDefId,
-        field_index: usize,
-        depth: u8,
-    ) -> String {
-        format!(
-            "{}::field{field_index}@d{depth}",
-            tcx.def_path_str(struct_did.to_def_id())
-        )
-    }
+    use crate::analyses::borrow_ownership::slot_key::{field_key, local_key};
 
     fn bo_slot_metadata(
         tcx: TyCtxt<'_>,

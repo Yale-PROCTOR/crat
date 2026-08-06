@@ -22,6 +22,7 @@ pub(crate) mod sources;
 pub mod resolve;
 pub(crate) mod mutability_facts;
 pub(crate) mod safety_mono;
+pub(crate) mod slot_key;
 pub mod solver;
 pub mod slots;
 mod assoc;
