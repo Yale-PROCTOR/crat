@@ -9710,6 +9710,8 @@ mod orchestrate {
         pub status: String,
         pub row: Option<Row>,
         pub wall_s: f64,
+        /// Maximum worker RSS observed by the 200 ms supervision loop.
+        pub peak_rss_kb: u64,
         pub note: String,
         /// Exact child stdout. A5 consumes its registered raw sentinel here,
         /// without projecting through the generic BOC1 row.
@@ -10000,16 +10002,21 @@ mod orchestrate {
         let mut child = command.spawn().expect("spawn worker");
 
         let mut killed_for: Option<&str> = None;
+        let mut peak_rss_kb = 0;
         let status = loop {
             match child.try_wait().expect("try_wait") {
                 Some(status) => break status,
                 None => {
+                    let current_rss_kb = rss_kb(child.id());
+                    if let Some(rss_kb) = current_rss_kb {
+                        peak_rss_kb = peak_rss_kb.max(rss_kb);
+                    }
                     if t0.elapsed() >= timeout && killed_for.is_none() {
                         killed_for = Some("timeout");
                         let _ = child.kill();
                     } else if killed_for.is_none()
                         && t0.elapsed().as_millis() % 1000 < 200
-                        && rss_kb(child.id()).is_some_and(|kb| kb > mem_cap_kb)
+                        && current_rss_kb.is_some_and(|kb| kb > mem_cap_kb)
                     {
                         killed_for = Some("oom-kill");
                         let _ = child.kill();
@@ -10071,6 +10078,7 @@ mod orchestrate {
             status: classification,
             row,
             wall_s,
+            peak_rss_kb,
             note,
             stdout,
             stderr,

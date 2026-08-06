@@ -1077,6 +1077,143 @@ struct FinalRun {
     wall_seconds: f64,
 }
 
+#[derive(Clone, Debug)]
+enum CompletedBase {
+    Final(FinalRun),
+    NeedsDepth {
+        counts: ProgramCounts,
+        wall_seconds: f64,
+    },
+}
+
+fn parse_completed_base(
+    expected_program: &str,
+    stdout: &str,
+    stderr: &str,
+) -> Result<CompletedBase, String> {
+    if !stderr.is_empty() {
+        return Err(format!(
+            "{expected_program}: preserved base stderr is nonempty"
+        ));
+    }
+    let mut metadata_rows = stdout
+        .lines()
+        .filter_map(super::report::parse_kv_line)
+        .collect::<Vec<_>>();
+    if metadata_rows.len() != 1 {
+        return Err(format!(
+            "{expected_program}: expected exactly one BOC1 row, found {}",
+            metadata_rows.len()
+        ));
+    }
+    let metadata = metadata_rows.pop().expect("one metadata row");
+    if metadata.get("program") != Some(expected_program) {
+        return Err(format!(
+            "{expected_program}: BOC1 program mismatch {:?}",
+            metadata.get("program")
+        ));
+    }
+    if metadata.get("mode") != Some("a5-p1") {
+        return Err(format!(
+            "{expected_program}: BOC1 mode mismatch {:?}",
+            metadata.get("mode")
+        ));
+    }
+    let wall_seconds = metadata
+        .get("t_total_s")
+        .ok_or_else(|| format!("{expected_program}: missing t_total_s"))?
+        .parse::<f64>()
+        .map_err(|why| format!("{expected_program}: invalid t_total_s: {why}"))?;
+    match metadata.get("status") {
+        Some("ok") => {
+            let (raw_line, counts) = parse_single_raw_line(stdout, COUNT_SENTINEL)?;
+            if counts.program != expected_program || counts.sites_not_proven_disjoint != 0 {
+                return Err(format!(
+                    "{expected_program}: invalid final base counts {counts:?}"
+                ));
+            }
+            Ok(CompletedBase::Final(FinalRun {
+                counts,
+                metadata,
+                raw_line,
+                wall_seconds,
+            }))
+        }
+        Some("needs-depth") => {
+            let (_, counts) = parse_single_raw_line(stdout, BASE_SENTINEL)?;
+            if counts.program != expected_program || counts.sites_not_proven_disjoint == 0 {
+                return Err(format!(
+                    "{expected_program}: invalid needs-depth base counts {counts:?}"
+                ));
+            }
+            Ok(CompletedBase::NeedsDepth {
+                counts,
+                wall_seconds,
+            })
+        }
+        other => Err(format!(
+            "{expected_program}: preserved base status is not complete: {other:?}"
+        )),
+    }
+}
+
+fn load_preserved_bases(directory: &Path) -> Result<BTreeMap<String, CompletedBase>, String> {
+    let expected_names = super::CORPUS
+        .iter()
+        .filter(|program| program.name != "brotli")
+        .flat_map(|program| {
+            [
+                format!("{}.a5-p1.out", program.name),
+                format!("{}.a5-p1.err", program.name),
+            ]
+        })
+        .collect::<BTreeSet<_>>();
+    let actual_names = fs::read_dir(directory)
+        .map_err(|why| format!("read preserved base directory: {why}"))?
+        .map(|entry| {
+            let entry = entry.map_err(|why| format!("read preserved base entry: {why}"))?;
+            if !entry
+                .file_type()
+                .map_err(|why| format!("read preserved base file type: {why}"))?
+                .is_file()
+            {
+                return Err(format!(
+                    "preserved base entry is not a file: {}",
+                    entry.path().display()
+                ));
+            }
+            entry
+                .file_name()
+                .into_string()
+                .map_err(|_| "preserved base filename is not UTF-8".to_owned())
+        })
+        .collect::<Result<BTreeSet<_>, _>>()?;
+    if actual_names != expected_names {
+        return Err(format!(
+            "preserved base inventory mismatch: expected {} files, found {}",
+            expected_names.len(),
+            actual_names.len()
+        ));
+    }
+
+    super::CORPUS
+        .iter()
+        .filter(|program| program.name != "brotli")
+        .map(|program| {
+            let stdout = fs::read_to_string(
+                directory.join(format!("{}.a5-p1.out", program.name)),
+            )
+            .map_err(|why| format!("{}: read preserved stdout: {why}", program.name))?;
+            let stderr = fs::read_to_string(
+                directory.join(format!("{}.a5-p1.err", program.name)),
+            )
+            .map_err(|why| format!("{}: read preserved stderr: {why}", program.name))?;
+            parse_completed_base(program.name, &stdout, &stderr)
+                .map(|row| (program.name.to_owned(), row))
+        })
+        .collect()
+}
+
 #[test]
 #[ignore = "A5/P1 artifact-first corpus measurement; requires CRAT_A5_SNAPSHOT and a private CRAT_BOC1_OUT"]
 fn a5_p1_corpus() {
@@ -1213,48 +1350,147 @@ fn a5_p1_corpus() {
     );
     let snapshot_env = snapshot.display().to_string();
 
-    let mut final_runs = BTreeMap::new();
-    let mut needs_depth = Vec::new();
-    for program in super::CORPUS {
+    if std::env::var("CRAT_A5_RECOVER_BROTLI").as_deref() == Ok("1") {
+        assert_eq!(
+            std::env::var("CRAT_BOC1_MEM_MB").as_deref(),
+            Ok("24576"),
+            "the one-shot brotli recovery is authorized only at the 24,576-MiB cap"
+        );
+        assert!(
+            std::env::var_os("CRAT_A5_PRESERVED_BASE_DIR").is_none(),
+            "the one-shot recovery must classify brotli only"
+        );
+        let program = super::CORPUS
+            .iter()
+            .find(|program| program.name == "brotli")
+            .expect("brotli catalog row");
         let input = corpus_link.join(program.name).join(program.lib_root);
-        let outcome = super::orchestrate::run_child_env(
+        let outcome = super::orchestrate::run_child_labeled(
             program.name,
             &input,
             "a5-p1",
+            "a5-p1-recovery",
             base_timeout,
             &[("CRAT_A5_SNAPSHOT", snapshot_env.clone())],
         );
-        match outcome.status.as_str() {
-            "ok" => {
-                let (raw_line, counts) = parse_single_raw_line(&outcome.stdout, COUNT_SENTINEL)
-                    .unwrap_or_else(|why| panic!("{}: {why}", program.name));
-                assert_eq!(counts.program, program.name);
-                assert_eq!(
-                    counts.sites_not_proven_disjoint, 0,
-                    "{} returned a final base row despite needing a depth export",
-                    program.name
-                );
-                final_runs.insert(
-                    program.name,
-                    FinalRun {
-                        counts,
-                        metadata: outcome.row.expect("final worker BOC1 row"),
-                        raw_line,
-                        wall_seconds: outcome.wall_s,
-                    },
-                );
+        let recovery_output = out.join("a5-p1-recovery");
+        fs::create_dir_all(&recovery_output).expect("create P1 recovery output directory");
+        let receipt = format!(
+            "program=brotli\nstatus={}\nmem_cap_mib=24576\npeak_rss_kb={}\npeak_rss_mib={:.3}\nwall_s={:.3}\nanalysis_worktree_head={analysis_head}\nsnapshot_producer_head={SNAPSHOT_PRODUCER_HEAD}\nmanifest_commit={MANIFEST_COMMIT}\nderived_substrate_sha256={DERIVED_SUBSTRATE_DIGEST}\nmachine_quiet_precondition=externally-verified\n",
+            outcome.status,
+            outcome.peak_rss_kb,
+            outcome.peak_rss_kb as f64 / 1024.0,
+            outcome.wall_s,
+        );
+        fs::write(recovery_output.join("receipt.txt"), &receipt)
+            .expect("write P1 recovery receipt");
+        println!(
+            "A5P1RECOVERY program=brotli status={} mem_cap_mib=24576 peak_rss_kb={} peak_rss_mib={:.3} wall_s={:.3}",
+            outcome.status,
+            outcome.peak_rss_kb,
+            outcome.peak_rss_kb as f64 / 1024.0,
+            outcome.wall_s,
+        );
+        assert!(
+            matches!(outcome.status.as_str(), "ok" | "needs-depth"),
+            "brotli recovery status={} note={}",
+            outcome.status,
+            outcome.note
+        );
+        parse_completed_base(program.name, &outcome.stdout, &outcome.stderr)
+            .expect("complete brotli base recovery row");
+        return;
+    }
+
+    let mut final_runs = BTreeMap::new();
+    let mut needs_depth = Vec::new();
+    let mut brotli_peak_rss_kb = None;
+    if let Some(directory) = std::env::var_os("CRAT_A5_PRESERVED_BASE_DIR") {
+        assert_eq!(
+            std::env::var("CRAT_BOC1_MEM_MB").as_deref(),
+            Ok("8192"),
+            "targeted depth exports after recovery return to the default 8,192-MiB cap"
+        );
+        let mut bases = load_preserved_bases(Path::new(&directory))
+            .unwrap_or_else(|why| panic!("preserved base gate failed: {why}"));
+        let recovery_logs = out.join("logs");
+        let recovery_stdout = fs::read_to_string(recovery_logs.join("brotli.a5-p1-recovery.out"))
+            .expect("read brotli recovery stdout");
+        let recovery_stderr = fs::read_to_string(recovery_logs.join("brotli.a5-p1-recovery.err"))
+            .expect("read brotli recovery stderr");
+        bases.insert(
+            "brotli".to_owned(),
+            parse_completed_base("brotli", &recovery_stdout, &recovery_stderr)
+                .expect("complete brotli recovery row"),
+        );
+        assert_eq!(bases.len(), super::CORPUS.len());
+        let receipt = fs::read_to_string(out.join("a5-p1-recovery/receipt.txt"))
+            .expect("read brotli recovery receipt");
+        brotli_peak_rss_kb = Some(
+            receipt
+                .lines()
+                .find_map(|line| line.strip_prefix("peak_rss_kb="))
+                .expect("recovery receipt peak_rss_kb")
+                .parse::<u64>()
+                .expect("numeric recovery peak_rss_kb"),
+        );
+        for program in super::CORPUS {
+            match bases
+                .remove(program.name)
+                .expect("completed base row for every catalog program")
+            {
+                CompletedBase::Final(run) => {
+                    final_runs.insert(program.name, run);
+                }
+                CompletedBase::NeedsDepth {
+                    counts,
+                    wall_seconds,
+                } => needs_depth.push((*program, counts, wall_seconds)),
             }
-            "needs-depth" => {
-                let (_, counts) = parse_single_raw_line(&outcome.stdout, BASE_SENTINEL)
-                    .unwrap_or_else(|why| panic!("{}: {why}", program.name));
-                assert_eq!(counts.program, program.name);
-                assert!(counts.sites_not_proven_disjoint > 0);
-                needs_depth.push((*program, counts, outcome.wall_s));
+        }
+        assert!(bases.is_empty());
+    } else {
+        for program in super::CORPUS {
+            let input = corpus_link.join(program.name).join(program.lib_root);
+            let outcome = super::orchestrate::run_child_env(
+                program.name,
+                &input,
+                "a5-p1",
+                base_timeout,
+                &[("CRAT_A5_SNAPSHOT", snapshot_env.clone())],
+            );
+            match outcome.status.as_str() {
+                "ok" => {
+                    let (raw_line, counts) = parse_single_raw_line(&outcome.stdout, COUNT_SENTINEL)
+                        .unwrap_or_else(|why| panic!("{}: {why}", program.name));
+                    assert_eq!(counts.program, program.name);
+                    assert_eq!(
+                        counts.sites_not_proven_disjoint, 0,
+                        "{} returned a final base row despite needing a depth export",
+                        program.name
+                    );
+                    final_runs.insert(
+                        program.name,
+                        FinalRun {
+                            counts,
+                            metadata: outcome.row.expect("final worker BOC1 row"),
+                            raw_line,
+                            wall_seconds: outcome.wall_s,
+                        },
+                    );
+                }
+                "needs-depth" => {
+                    let (_, counts) = parse_single_raw_line(&outcome.stdout, BASE_SENTINEL)
+                        .unwrap_or_else(|why| panic!("{}: {why}", program.name));
+                    assert_eq!(counts.program, program.name);
+                    assert!(counts.sites_not_proven_disjoint > 0);
+                    needs_depth.push((*program, counts, outcome.wall_s));
+                }
+                other => panic!(
+                    "{}: base worker status={other} note={}",
+                    program.name, outcome.note
+                ),
             }
-            other => panic!(
-                "{}: base worker status={other} note={}",
-                program.name, outcome.note
-            ),
         }
     }
 
@@ -1376,8 +1612,29 @@ fn a5_p1_corpus() {
         total.local_functions,
         100.0 * total.unknown_caller_reachable as f64 / total.local_functions as f64,
     ));
+    if let Some(peak_rss_kb) = brotli_peak_rss_kb {
+        markdown.push_str(&format!(
+            "\nResource note: derived expansion collapsed brotli into one ~500k-SLOC file; its one-shot 24,576-MiB base-classification recovery peaked at {:.3} MiB RSS (200 ms sampling).\n",
+            peak_rss_kb as f64 / 1024.0,
+        ));
+    }
+    let preserved_base_dir = std::env::var("CRAT_A5_PRESERVED_BASE_DIR")
+        .unwrap_or_else(|_| "none".to_owned());
+    let preserved_hash_manifest_sha256 = std::env::var(
+        "CRAT_A5_PRESERVED_HASH_MANIFEST_SHA256",
+    )
+    .unwrap_or_else(|_| "none".to_owned());
+    if preserved_base_dir != "none" {
+        assert_ne!(
+            preserved_hash_manifest_sha256, "none",
+            "resumed P1 requires the externally re-verified hash-manifest digest"
+        );
+    }
+    let brotli_peak_rss_kb = brotli_peak_rss_kb
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "not-applicable".to_owned());
     let provenance = format!(
-        "date={DATE}\nanalysis_worktree_head={analysis_head}\nsnapshot_producer_head={SNAPSHOT_PRODUCER_HEAD}\nsnapshot_producer_branch_head={SNAPSHOT_PRODUCER_BRANCH_HEAD}\nsnapshot_producer_branch_delta=one-test-only-commit-after-capture\nmanifest_commit={MANIFEST_COMMIT}\nraw_frozen_corpus_sha256={RAW_FROZEN_DIGEST}\nderived_substrate_sha256={DERIVED_SUBSTRATE_DIGEST}\nsubstrate=derived\nsubstrate_selector={}\nrepair=mode_a\nl2=0\nsafe_mono=per_site\nfork_engine=fork\nmutability_facts=on-direct-from-program\nz3_smt_seed=0\nz3_sat_seed=0\ncorpus_shape=read-only-symlink-to-main-checkout-derived-corpus\ncorpus_link={}\ncorpus_target={}\nsnapshot={}\ndeps_shape=read-only-symlink-to-main-checkout-build\ndeps_link={}\ndeps_target={}\ndeps_rlibs={}\ndeps_bytemuck_derive=present\nresolver_DIR={}\nresolver_CWD={}\nbase_timeout_s={}\ndeep_timeout_s={}\ntargeted_programs={}\n",
+        "date={DATE}\nanalysis_worktree_head={analysis_head}\nsnapshot_producer_head={SNAPSHOT_PRODUCER_HEAD}\nsnapshot_producer_branch_head={SNAPSHOT_PRODUCER_BRANCH_HEAD}\nsnapshot_producer_branch_delta=one-test-only-commit-after-capture\nmanifest_commit={MANIFEST_COMMIT}\nraw_frozen_corpus_sha256={RAW_FROZEN_DIGEST}\nderived_substrate_sha256={DERIVED_SUBSTRATE_DIGEST}\nsubstrate=derived\nsubstrate_selector={}\nrepair=mode_a\nl2=0\nsafe_mono=per_site\nfork_engine=fork\nmutability_facts=on-direct-from-program\nz3_smt_seed=0\nz3_sat_seed=0\ncorpus_shape=read-only-symlink-to-main-checkout-derived-corpus\ncorpus_link={}\ncorpus_target={}\nsnapshot={}\ndeps_shape=read-only-symlink-to-main-checkout-build\ndeps_link={}\ndeps_target={}\ndeps_rlibs={}\ndeps_bytemuck_derive=present\nresolver_DIR={}\nresolver_CWD={}\nbase_timeout_s={}\ndeep_timeout_s={}\ntargeted_programs={}\npreserved_base_dir={}\npreserved_base_rows={}\npreserved_base_hash_manifest_sha256={}\npreserved_base_wall_source=child-t_total_s\nbrotli_recovery_mem_cap_mib={}\nbrotli_recovery_peak_rss_kb={}\nbrotli_single_file_side_effect=derived-expand-collapsed-to-about-500k-sloc\n",
         substrate_selector.as_deref().unwrap_or("default-derived"),
         corpus_link.display(),
         corpus_target.display(),
@@ -1390,6 +1647,15 @@ fn a5_p1_corpus() {
         base_timeout.as_secs(),
         deep_timeout.as_secs(),
         targeted_count,
+        preserved_base_dir,
+        if preserved_base_dir == "none" { 0 } else { 19 },
+        preserved_hash_manifest_sha256,
+        if brotli_peak_rss_kb == "not-applicable" {
+            "not-applicable"
+        } else {
+            "24576"
+        },
+        brotli_peak_rss_kb,
     );
     fs::write(output.join("raw-counts.txt"), raw).expect("write raw P1 rows");
     fs::write(output.join("per-program.tsv"), tsv).expect("write P1 TSV");
@@ -1639,6 +1905,32 @@ mod tests {
             Ok("benchmarks/rs-crown-derived")
         );
         assert!(a5_substrate_dir(Some("raw")).is_err());
+    }
+
+    #[test]
+    fn p1_resume_accepts_only_complete_independent_base_rows() {
+        let stdout = concat!(
+            "noise\n",
+            "A5P1BASE program=fixture c1=7 c2=5 c3=0 c3_depth0=0 cg_num=2 cg_den=6\n",
+            "BOC1 program=fixture mode=a5-p1 status=needs-depth t_total_s=1.250\n",
+        );
+
+        let row = parse_completed_base("fixture", stdout, "").expect("complete base row");
+        match row {
+            CompletedBase::NeedsDepth {
+                counts,
+                wall_seconds,
+            } => {
+                assert_eq!(counts.program, "fixture");
+                assert_eq!(counts.sites_not_proven_disjoint, 5);
+                assert_eq!(wall_seconds, 1.25);
+            }
+            CompletedBase::Final(_) => panic!("fixture needs the depth export"),
+        }
+
+        assert!(parse_completed_base("fixture", stdout, "warning").is_err());
+        assert!(parse_completed_base("other", stdout, "").is_err());
+        assert!(parse_completed_base("fixture", "running 1 test\n", "").is_err());
     }
 
     #[test]
