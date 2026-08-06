@@ -297,10 +297,7 @@ fn call_target(_tcx: TyCtxt<'_>, func: &Operand<'_>) -> Option<LocalDefId> {
 
 /// call sites that alias a struct-pointer candidate argument with a pointer
 /// derived from a field of the same struct object passed in another argument
-/// of the same call. these are the sites the specialization plan (Task 3)
-/// must be able to rewrite: after the struct param is replaced by the field's
-/// value, the aliasing field-pointer argument would otherwise observe stale
-/// data.
+/// of the same call.
 pub(crate) fn collect_triggered(
     input: &RustProgram<'_>,
     flows: &FxHashMap<LocalDefId, PointerFlowResult>,

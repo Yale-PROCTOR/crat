@@ -199,9 +199,6 @@ fn resolve_and_validate(
     // argument must have a known, hoistable emission (forwarding shape,
     // null literal, or a site_emissions entry that is not Guarded-in-a-
     // while-head); violations drop the callee target before the cascade.
-    // own_param_names mirrors the transform phase's `current_fn` map: a bare
-    // path only counts as forwarding when it names the enclosing fn's own
-    // already-specialized parameter, not any arbitrary local variable
     let mut own_param_names: FxHashMap<LocalDefId, FxHashSet<Symbol>> = FxHashMap::default();
     for (&(fn_did, _), fn_plan) in &fn_plans {
         own_param_names
@@ -415,8 +412,7 @@ struct CallSiteAuditor<'a, 'tcx> {
     ast_to_hir: &'a AstToHir,
     plan: &'a SpecPlan,
     // fn did -> names of that fn's own already-specialized parameters, used
-    // to recognize genuine forwarding shapes (mirrors the transform phase's
-    // `current_fn` map)
+    // to recognize genuine forwarding shapes
     own_param_names: &'a FxHashMap<LocalDefId, FxHashSet<Symbol>>,
     // the enclosing fn's did, set by visit_item
     current_fn: Option<LocalDefId>,
