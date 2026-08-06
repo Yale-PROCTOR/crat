@@ -7075,6 +7075,18 @@ mod run {
             Err(_) => row.set("fatness_pass", "panicked"),
         }
 
+        // §5 — solve provenance IN THE ROW. A gate sweep that had silently read
+        // a cache would say so here in its own output.
+        row.set(
+            "solve",
+            crate::analyses::borrow_ownership::model_cache::render_provenance(),
+        );
+        // §7 — the per-phase split: what the cache saves, and the residual
+        // floor the rewriter always pays.
+        if let Some(p) = crate::analyses::borrow_ownership::model_cache::last_solve() {
+            row.set("t_solve_s", format!("{:.3}", p.solve_secs));
+        }
+
         let verdict = compare::compare(&a_decoded, &b_decoded);
         let aggregates_clean = record_expected_zero_aggregates(&mut row, &verdict);
         row.set("violations", verdict.violations.len());

@@ -315,3 +315,53 @@ mod tests {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Solve provenance (§5) and per-phase timing (§7)
+// ---------------------------------------------------------------------------
+
+/// Where the accepted model came from, and what it cost.
+///
+/// Recorded so the **row** carries it, not a human's memory. §5's rule is that
+/// a number produced under cache cites `solve: cache@<fingerprint>` and a gate
+/// sweep says `solve: real` — and the reader cannot tell by looking, which is
+/// exactly the staleness rule's reasoning applied to one more axis. Mechanized
+/// here rather than remembered at the call site.
+#[derive(Clone, Debug)]
+pub(crate) struct SolveProvenance {
+    /// `"real"` or `"cache"`.
+    pub source: &'static str,
+    pub fingerprint: String,
+    /// Wall seconds spent in the BO solve — **0.0 on a cache hit**, which is
+    /// the saving, and the residual is everything else the pipeline still pays.
+    pub solve_secs: f64,
+}
+
+thread_local! {
+    static LAST_SOLVE: std::cell::RefCell<Option<SolveProvenance>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+pub(crate) fn record_solve(p: SolveProvenance) {
+    LAST_SOLVE.with(|c| *c.borrow_mut() = Some(p));
+}
+
+/// The provenance of the most recent solve in this process.
+///
+/// `None` means no solve ran, which a caller must report as such rather than
+/// defaulting to `"real"` — a defaulted provenance is the failure this field
+/// exists to prevent.
+pub(crate) fn last_solve() -> Option<SolveProvenance> {
+    LAST_SOLVE.with(|c| c.borrow().clone())
+}
+
+/// Render for a report row: `real` or `cache@<first 12 hex>`.
+pub(crate) fn render_provenance() -> String {
+    match last_solve() {
+        None => "none".to_owned(),
+        Some(p) if p.source == "cache" => {
+            format!("cache@{}", &p.fingerprint[..12.min(p.fingerprint.len())])
+        }
+        Some(_) => "real".to_owned(),
+    }
+}

@@ -1639,8 +1639,14 @@ fn decide_table_perturbed<'tcx>(
     // `None` can only be answered by solving. Dev iteration reads it; every
     // gate sweep bypasses it and refreshes it.
     if let Some(cached) = model_cache::load(tcx, &program, &slots) {
+        model_cache::record_solve(model_cache::SolveProvenance {
+            source: "cache",
+            fingerprint: model_cache::fingerprint(&program),
+            solve_secs: 0.0,
+        });
         return finish_decide(tcx, program, slots, mut_facts, cached, perturb);
     }
+    let solve_t0 = std::time::Instant::now();
     let (model, _export) = with_bo_export(|| {
         let crate_ctxt = CrateCtxt::new(&program);
         let solver = KindSolver::new(&slots);
@@ -1663,6 +1669,11 @@ fn decide_table_perturbed<'tcx>(
     };
     // Write-through on every real solve, so a bypassed gate sweep refreshes
     // what dev iteration reads next.
+    model_cache::record_solve(model_cache::SolveProvenance {
+        source: "real",
+        fingerprint: model_cache::fingerprint(&program),
+        solve_secs: solve_t0.elapsed().as_secs_f64(),
+    });
     model_cache::store(tcx, &program, &slots, &model);
 
     finish_decide(tcx, program, slots, mut_facts, model, perturb)
