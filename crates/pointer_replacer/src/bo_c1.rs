@@ -9287,7 +9287,12 @@ fn boc1_run_one() {
     // `z3_full_version` stamp.
     if matches!(
         mode.as_str(),
-        "bo" | "prod-own" | "prod-precision" | "prod-box" | "selector-core" | "selector-necessity"
+        "bo" | "prod-own"
+            | "prod-precision"
+            | "prod-box"
+            | "selector-core"
+            | "selector-necessity"
+            | "a5-p1"
     ) || mode.starts_with("selector-detail-")
     {
         z3::set_global_param("smt.random_seed", "0");
@@ -9319,6 +9324,7 @@ fn boc1_run_one() {
             "prod-box" => run::run_prod_box(tcx, t_tcx),
             "m1-census" => run::run_m1_census(tcx, t_tcx),
             "m1-recon" => run::run_m1_recon(tcx, t_tcx),
+            "a5-p1" => a5_measurement::run_worker(tcx, t_tcx),
             "selector-core" => run::run_selector_core(tcx, t_tcx),
             "selector-necessity" => run::run_selector_necessity(tcx, t_tcx),
             detail if detail.starts_with("selector-detail-") => {
@@ -9705,6 +9711,9 @@ mod orchestrate {
         pub row: Option<Row>,
         pub wall_s: f64,
         pub note: String,
+        /// Exact child stdout. A5 consumes its registered raw sentinel here,
+        /// without projecting through the generic BOC1 row.
+        pub stdout: String,
         pub stderr: String,
     }
 
@@ -10063,6 +10072,7 @@ mod orchestrate {
             row,
             wall_s,
             note,
+            stdout,
             stderr,
         }
     }
