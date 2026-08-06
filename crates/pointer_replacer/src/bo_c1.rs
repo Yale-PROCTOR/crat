@@ -7440,10 +7440,17 @@ mod run {
         // between substrates, the question is *which* function, and a count
         // cannot answer it. Off by default because brotli's list is 867 rows.
         if let Some(path) = std::env::var_os("CRAT_BOC1_SANITY_FNS") {
-            std::fs::write(path, s.fn_paths.join("\n") + "\n")
-                .expect("write substrate-sanity fn list");
+            let mut text = String::new();
+            for f in &s.fn_paths {
+                text.push_str(&format!("fn\t{f}\n"));
+            }
+            for f in &s.referenced_paths {
+                text.push_str(&format!("referenced\t{f}\n"));
+            }
+            std::fs::write(path, text).expect("write substrate-sanity fn list");
         }
         row.set("functions", s.functions);
+        row.set("referenced_fns", s.referenced_fns);
         row.set("free_resolved", s.free_resolved);
         row.set("free_unresolved", s.free_unresolved);
         row.set("free_sites", s.free_resolved + s.free_unresolved);

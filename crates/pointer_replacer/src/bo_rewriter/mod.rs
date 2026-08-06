@@ -1999,12 +1999,17 @@ pub(crate) struct SubstrateSanity {
     pub(crate) alloc_by_callee: Vec<(String, usize)>,
     pub(crate) ctor_bindings: usize,
     pub(crate) fn_paths: Vec<String>,
+    pub(crate) referenced_fns: usize,
+    pub(crate) referenced_paths: Vec<String>,
 }
 
 pub(crate) fn substrate_sanity(tcx: TyCtxt<'_>) -> SubstrateSanity {
     let program = collect_program(tcx);
     let sites = free_sites(tcx, &program.functions);
     let ctors = decision::construction::collect(tcx, &program.functions);
+    // A1's `referenced` set: any path reference to a local fn, from ANY body
+    // including static initializers. This is what gates CallSiteNotAdapted.
+    let emit = decision::emitability::collect(tcx, &program.functions);
 
     let mut by_callee: std::collections::BTreeMap<String, usize> = Default::default();
     let mut alloc_bindings = 0;
@@ -2022,6 +2027,16 @@ pub(crate) fn substrate_sanity(tcx: TyCtxt<'_>) -> SubstrateSanity {
         alloc_bindings,
         alloc_by_callee: by_callee.into_iter().collect(),
         ctor_bindings: ctors.by_binding.len(),
+        referenced_fns: emit.referenced.len(),
+        referenced_paths: {
+            let mut v: Vec<_> = emit
+                .referenced
+                .keys()
+                .map(|&f| tcx.def_path_str(f.to_def_id()))
+                .collect();
+            v.sort();
+            v
+        },
         fn_paths: {
             let mut v: Vec<_> = program
                 .functions
