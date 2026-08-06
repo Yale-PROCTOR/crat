@@ -1237,6 +1237,19 @@ fn param_name(param: &rustc_hir::Param<'_>) -> Option<String> {
 /// pipeline — and, deliberately, **without moving any comparison into this
 /// module**. `bo_rewriter` emits; `coverage_recon` compares.
 fn decide_table<'tcx>(tcx: TyCtxt<'tcx>) -> Result<decision::DecisionTable, String> {
+    decide_table_perturbed(tcx, |_| {}).map(|(table, _ctx)| table)
+}
+
+/// [`decide_table`], keeping the pipeline's by-products (**R1**).
+///
+/// Exists so a caller that needs the slots, the accepted model or the
+/// emitability facts gets **the ones the table was built from**, instead of
+/// re-deriving them — which for the facts join meant a second BO solve per
+/// program. Kept as a sibling rather than by widening `decide_table`, so the
+/// existing call sites (and their witnesses) are untouched.
+fn decide_table_with_ctx<'tcx>(
+    tcx: TyCtxt<'tcx>,
+) -> Result<(decision::DecisionTable, DecideCtx), String> {
     decide_table_perturbed(tcx, |_| {})
 }
 
@@ -1614,7 +1627,7 @@ pub(crate) fn emit_files<'tcx>(
 fn decide_table_perturbed<'tcx>(
     tcx: TyCtxt<'tcx>,
     perturb: impl FnOnce(&mut Vec<decision::Subject>),
-) -> Result<decision::DecisionTable, String> {
+) -> Result<(decision::DecisionTable, DecideCtx), String> {
     let program = collect_program(tcx);
     let slots = CrateSlots::build(&program);
     let mut_facts = MutFacts::from_program(&program);
@@ -1667,7 +1680,27 @@ fn decide_table_perturbed<'tcx>(
     // milestone were spent on apparatus that claimed more than it checked, and
     // leaving a demoted version behind preserves the claim while removing the
     // substance.
-    Ok(table)
+    Ok((
+        table,
+        DecideCtx {
+            slots,
+            model,
+            facts,
+        },
+    ))
+}
+
+/// **R1 — the pipeline's by-products, returned instead of recomputed.**
+///
+/// `facts_join_tsv` used to re-derive all of this itself, which meant the recon
+/// worker ran the **BO solve twice per program**. That was affordable until the
+/// fatness pass landed on top of it and three programs blew the 3,000 s cap.
+/// The duplicate is removed by handing the caller what the pipeline already
+/// built, not by making the second copy cheaper.
+pub(crate) struct DecideCtx {
+    slots: CrateSlots,
+    model: rustc_hash::FxHashMap<SlotRef, SlotKind>,
+    facts: decision::emitability::EmitabilityFacts,
 }
 
 /// **Producer A's artifact** for the crate in `tcx`.
@@ -1719,72 +1752,32 @@ pub(crate) fn artifact_rows(
               of the pipeline."
 )]
 pub(crate) fn facts_join_tsv(tcx: TyCtxt<'_>) -> Result<String, String> {
-    // `SlotKind` / `SlotRef` join the driver's existing brace-merged import
-    // rather than getting a local `use` here. A single-line
-    // `use crate::analyses::…` would have destroyed the property that makes
-    // this file H1's real-input witness — that no LINE carries the fragment —
-    // and `matcher_resolves_the_existing_merged_import_in_mod_rs` caught it
-    // immediately. The guard did its job; the import goes where the others are.
-    let program = collect_program(tcx);
-    let slots = CrateSlots::build(&program);
-    let mut_facts = MutFacts::from_program(&program);
-
-    let (model, _export) = with_bo_export(|| {
-        let crate_ctxt = CrateCtxt::new(&program);
-        let solver = KindSolver::new(&slots);
-        let Ok((_stats, selectors)) = emit_crate_ownership_constraints(
-            &crate_ctxt,
-            &slots,
-            &compute_origins(&program),
-            &solver,
-        ) else {
-            return None;
-        };
-        for &g in &program.functions {
-            let body = tcx.mir_drops_elaborated_and_const_checked(g).borrow();
-            add_coherence(&solver, &slots, g, &body);
-        }
-        verify_to_fixpoint(&program, &slots, &solver, &selectors, &mut_facts)
-    });
-    let Some(model) = model else {
-        return Err("BO declined — no accepted model".to_owned());
-    };
-
-    let mut subjects = collect_subjects(tcx, &program, &mut_facts);
-    subjects.extend(collect_local_subjects(tcx, &program, &mut_facts));
-    let facts = decision::emitability::collect(tcx, &program.functions);
-
-    let ctors = decision::construction::collect(tcx, &program.functions);
-    // S3.2′-1: measurement only. The decision phase does NOT consult this —
-    // the wiring is S3.2′-4's named task, and until then the ban in
-    // `import_denylist` keeps `decision/**` from naming it at all.
-    let fat = fat_facts::FatFacts::from_program(&program);
+    let (table, ctx) = decide_table_with_ctx(tcx)?;
+    let ctors = decision::construction::collect(tcx, &collect_program(tcx).functions);
 
     let mut out = String::from(
-        "fn_path\tmir_local\tis_param\tannotated\tslot\tkind\traw_op\tptr_cmp\tctor\tlen_class\tfatness\tsize_expr\n",
+        "fn_path\tmir_local\tis_param\tannotated\tslot\tkind\traw_op\tptr_cmp\tctor\tlen_class\tsize_expr\n",
     );
-    for s in &subjects {
-        let slot = slots
+    for (s, _decision) in &table.entries {
+        let slot = ctx
+            .slots
             .fn_local_slots
             .get(&s.fn_did)
             .and_then(|u| u.slot_for_local_depth(s.local, 0));
         let kind = slot
-            .and_then(|id| model.get(&SlotRef::Local(s.fn_did, id)))
+            .and_then(|id| ctx.model.get(&SlotRef::Local(s.fn_did, id)))
             .map(|k| match k {
                 SlotKind::Ref => "ref",
                 SlotKind::Raw => "raw",
                 SlotKind::Owning => "owning",
             })
             .unwrap_or("-");
-        let raw_op = facts
+        let raw_op = ctx
+            .facts
             .raw_only_uses
             .get(&(s.fn_did, s.hir_id))
             .map(|(op, _)| op.as_str())
             .unwrap_or("-");
-        // A parameter has NO construction site in this function by definition;
-        // reported as `param-no-site` rather than folded into "unrecoverable",
-        // because those are different claims — one about this analysis's reach,
-        // one about the program.
         let is_param = matches!(s.kind, decision::SubjectKind::Param { .. });
         let ctor = ctors.by_binding.get(&(s.fn_did, s.hir_id));
         let (ctor_key, len_class, size_expr) = match (is_param, ctor) {
@@ -1793,22 +1786,57 @@ pub(crate) fn facts_join_tsv(tcx: TyCtxt<'_>) -> Result<String, String> {
                 c.key(),
                 c.len_class(),
                 match c {
-                    decision::construction::Construction::Alloc { size, count, .. } => {
-                        count.clone().map_or_else(|| size.clone(), |n| format!("{n} x {size}"))
-                    }
+                    decision::construction::Construction::Alloc { size, count, .. } => count
+                        .clone()
+                        .map_or_else(|| size.clone(), |n| format!("{n} x {size}")),
                     _ => String::new(),
                 },
             ),
             (false, None) => ("-", "no-init", String::new()),
         };
         out.push_str(&format!(
-            "{}\t{}\t{}\t{}\t{}\t{kind}\t{raw_op}\t{}\t{ctor_key}\t{len_class}\t{}\t{size_expr}\n",
+            "{}\t{}\t{}\t{}\t{}\t{kind}\t{raw_op}\t{}\t{ctor_key}\t{len_class}\t{size_expr}\n",
             tcx.def_path_str(s.fn_did.to_def_id()),
             s.local.as_u32(),
             u8::from(is_param),
             u8::from(s.ty_span.is_some()),
             u8::from(slot.is_some()),
-            u8::from(facts.ptr_comparisons.contains_key(&(s.fn_did, s.hir_id))),
+            u8::from(ctx.facts.ptr_comparisons.contains_key(&(s.fn_did, s.hir_id))),
+        ));
+    }
+    Ok(out)
+}
+
+/// **R2 — the fatness measurement, as its OWN pass.**
+///
+/// Split out for a reason measured the hard way: when fatness rode inside the
+/// facts join, `fatness_analysis` panicking on one program took down the whole
+/// invariant sweep, and three more programs timed out behind it. **One
+/// program's analysis failure must not be able to void twenty programs of
+/// invariant evidence.**
+///
+/// It runs **no BO solve** — fatness needs only the program — so it is far
+/// cheaper than the pass it was extracted from, and its failure is now
+/// recoverable at the call site rather than fatal to the sweep.
+///
+/// The raw lookup is reported, `None` included (`-`): ruling A-1′ maps `None`
+/// to thin **at the decision layer**, never at measurement time. Instruments
+/// measure the capture.
+pub(crate) fn fatness_tsv(tcx: TyCtxt<'_>) -> Result<String, String> {
+    let program = collect_program(tcx);
+    let mut_facts = MutFacts::from_program(&program);
+    let fat = fat_facts::FatFacts::from_program(&program);
+
+    let mut subjects = collect_subjects(tcx, &program, &mut_facts);
+    subjects.extend(collect_local_subjects(tcx, &program, &mut_facts));
+
+    let mut out = String::from("fn_path\tmir_local\tis_param\tfatness\n");
+    for s in &subjects {
+        out.push_str(&format!(
+            "{}\t{}\t{}\t{}\n",
+            tcx.def_path_str(s.fn_did.to_def_id()),
+            s.local.as_u32(),
+            u8::from(matches!(s.kind, decision::SubjectKind::Param { .. })),
             fat.render(s.fn_did, s.local),
         ));
     }
@@ -1845,5 +1873,5 @@ pub(crate) fn artifact_rows_span_swapped(
             subjects[1].ty_span = lo;
         }
     })
-    .map(|table| artifact::rows(tcx, &table))
+    .map(|(table, _ctx)| artifact::rows(tcx, &table))
 }

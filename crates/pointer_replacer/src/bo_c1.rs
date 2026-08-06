@@ -7057,8 +7057,30 @@ mod run {
                 let path = dir.join(format!("{name}.facts.tsv"));
                 std::fs::write(&path, tsv)
                     .unwrap_or_else(|e| panic!("write facts join {}: {e}", path.display()));
+                row.set("facts_join", "ok");
             }
+            // R3 — no silent caps. A program the pass cannot cover is recorded
+            // WITH ITS CAUSE, in the row, so an absent artifact is never read as
+            // an absent finding.
             Err(why) => row.set("facts_join", super::report::sanitize(&why)),
+        }
+
+        // R2 — the fatness pass is SEPARATE, and its failure is caught here.
+        // When fatness rode inside the facts join, one program's panic took the
+        // whole invariant sweep with it. `catch_unwind` because the failure mode
+        // measured on urlparser was a panic in a shared utility, not an `Err`.
+        let fatness = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            crate::bo_rewriter::fatness_tsv(tcx)
+        }));
+        match fatness {
+            Ok(Ok(tsv)) => {
+                let path = dir.join(format!("{name}.fatness.tsv"));
+                std::fs::write(&path, tsv)
+                    .unwrap_or_else(|e| panic!("write fatness {}: {e}", path.display()));
+                row.set("fatness_pass", "ok");
+            }
+            Ok(Err(why)) => row.set("fatness_pass", super::report::sanitize(&why)),
+            Err(_) => row.set("fatness_pass", "panicked"),
         }
 
         let verdict = compare::compare(&a_decoded, &b_decoded);
