@@ -1893,15 +1893,29 @@ pub(crate) fn facts_join_tsv(tcx: TyCtxt<'_>) -> Result<String, String> {
               artifact dir. Not part of the pipeline."
 )]
 pub(crate) fn freed_slots_tsv(tcx: TyCtxt<'_>) -> Result<String, String> {
+    let (table, ctx) = decide_table_with_ctx(tcx)?;
+    let program = collect_program(tcx);
+    let sites = free_sites(tcx, &program.functions);
+    freed_slots_tsv_from(tcx, table, ctx, sites)
+}
+
+const DEALLOCATORS: &[&str] = &["free", "xfree", "cfree", "g_free"];
+
+/// Free sites, from HIR alone.
+///
+/// Split out of `freed_slots_tsv` so the substrate sanity census can ask
+/// "do the deallocator recognizers still resolve?" **without** paying for a BO
+/// solve — and, more importantly, so it asks that question of THIS recognizer
+/// rather than a second copy of the name table that could drift from it.
+pub(crate) struct FreeSites {
+    /// `(hir_id_of_resolved_local, had_cast)` and the unresolved tally.
+    pub(crate) resolved: Vec<(rustc_hir::HirId, bool)>,
+    pub(crate) unresolved: Vec<(&'static str, String)>,
+}
+
+pub(crate) fn free_sites(tcx: TyCtxt<'_>, fns: &[rustc_hir::def_id::LocalDefId]) -> FreeSites {
     use rustc_hir::intravisit::Visitor;
 
-    const DEALLOCATORS: &[&str] = &["free", "xfree", "cfree", "g_free"];
-
-    struct FreeSites {
-        /// `(hir_id_of_resolved_local, had_cast)` and the unresolved tally.
-        resolved: Vec<(rustc_hir::HirId, bool)>,
-        unresolved: Vec<(&'static str, String)>,
-    }
     struct V<'a, 'tcx> {
         tcx: TyCtxt<'tcx>,
         out: &'a mut FreeSites,
@@ -1949,16 +1963,83 @@ pub(crate) fn freed_slots_tsv(tcx: TyCtxt<'_>) -> Result<String, String> {
         }
     }
 
-    let (table, ctx) = decide_table_with_ctx(tcx)?;
-    let program = collect_program(tcx);
-
-    let mut sites = FreeSites { resolved: Vec::new(), unresolved: Vec::new() };
-    for &fn_did in &program.functions {
-        let Some(body_id) = tcx.hir_node_by_def_id(fn_did).body_id() else { continue };
+    let mut sites = FreeSites {
+        resolved: Vec::new(),
+        unresolved: Vec::new(),
+    };
+    for &fn_did in fns {
+        let Some(body_id) = tcx.hir_node_by_def_id(fn_did).body_id() else {
+            continue;
+        };
         let mut v = V { tcx, out: &mut sites };
         v.visit_body(tcx.hir_body(body_id));
     }
+    sites
+}
 
+/// §2's recognizer populations, from HIR alone.
+///
+/// `extern_resolver` rewrites `extern` items into `use` declarations, and the
+/// callee-name recognizers key on the resolved path's last segment. A silent
+/// collapse there is the migration's most dangerous failure mode, because every
+/// downstream census would still run and would simply report fewer sites — a
+/// number that looks like a finding rather than like a broken recognizer.
+///
+/// So this asks the production recognizers themselves: `free_sites` for the
+/// deallocator family and `construction::collect` for the allocator family. It
+/// deliberately does not restate either name table.
+///
+/// No solve — which is the point: the answer is needed BEFORE anything is
+/// re-pinned, on both substrates, for all 20 programs.
+pub(crate) struct SubstrateSanity {
+    pub(crate) functions: usize,
+    pub(crate) free_resolved: usize,
+    pub(crate) free_unresolved: usize,
+    pub(crate) alloc_bindings: usize,
+    pub(crate) alloc_by_callee: Vec<(String, usize)>,
+    pub(crate) ctor_bindings: usize,
+    pub(crate) fn_paths: Vec<String>,
+}
+
+pub(crate) fn substrate_sanity(tcx: TyCtxt<'_>) -> SubstrateSanity {
+    let program = collect_program(tcx);
+    let sites = free_sites(tcx, &program.functions);
+    let ctors = decision::construction::collect(tcx, &program.functions);
+
+    let mut by_callee: std::collections::BTreeMap<String, usize> = Default::default();
+    let mut alloc_bindings = 0;
+    for c in ctors.by_binding.values() {
+        if let decision::construction::Construction::Alloc { callee, .. } = c {
+            alloc_bindings += 1;
+            *by_callee.entry(callee.clone()).or_default() += 1;
+        }
+    }
+
+    SubstrateSanity {
+        functions: program.functions.len(),
+        free_resolved: sites.resolved.len(),
+        free_unresolved: sites.unresolved.len(),
+        alloc_bindings,
+        alloc_by_callee: by_callee.into_iter().collect(),
+        ctor_bindings: ctors.by_binding.len(),
+        fn_paths: {
+            let mut v: Vec<_> = program
+                .functions
+                .iter()
+                .map(|&f| tcx.def_path_str(f.to_def_id()))
+                .collect();
+            v.sort();
+            v
+        },
+    }
+}
+
+fn freed_slots_tsv_from(
+    tcx: TyCtxt<'_>,
+    table: decision::DecisionTable,
+    ctx: DecideCtx,
+    sites: FreeSites,
+) -> Result<String, String> {
     // Subjects indexed by their HIR binding — the same key A1 uses.
     let by_hir: rustc_hash::FxHashMap<_, _> = table
         .entries

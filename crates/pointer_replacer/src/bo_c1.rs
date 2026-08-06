@@ -7425,6 +7425,47 @@ mod run {
         row
     }
 
+    /// §2 substrate sanity: does the program compile, and do the callee-name
+    /// recognizers still resolve on it?
+    ///
+    /// Reaching this function at all is the compile answer — `run_compiler_on_path`
+    /// returns `Err` on a fatal, and the caller records `compile-error`. The
+    /// recognizer populations are the answer §2 refuses to assume.
+    pub fn run_substrate_sanity(tcx: TyCtxt<'_>, t_tcx: Duration) -> Row {
+        let t0 = Instant::now();
+        let mut row = Row::default();
+        row.set("t_tcx_s", secs(t_tcx));
+        let s = crate::bo_rewriter::substrate_sanity(tcx);
+        // A de-risk prints VALUES, not tallies: when the function count moves
+        // between substrates, the question is *which* function, and a count
+        // cannot answer it. Off by default because brotli's list is 867 rows.
+        if let Some(path) = std::env::var_os("CRAT_BOC1_SANITY_FNS") {
+            std::fs::write(path, s.fn_paths.join("\n") + "\n")
+                .expect("write substrate-sanity fn list");
+        }
+        row.set("functions", s.functions);
+        row.set("free_resolved", s.free_resolved);
+        row.set("free_unresolved", s.free_unresolved);
+        row.set("free_sites", s.free_resolved + s.free_unresolved);
+        row.set("alloc_bindings", s.alloc_bindings);
+        row.set("ctor_bindings", s.ctor_bindings);
+        row.set(
+            "alloc_by_callee",
+            if s.alloc_by_callee.is_empty() {
+                "none".to_owned()
+            } else {
+                s.alloc_by_callee
+                    .iter()
+                    .map(|(c, n)| format!("{c}:{n}"))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            },
+        );
+        row.set("t_total_s", secs(t0.elapsed() + t_tcx));
+        row.set("status", "ok");
+        row
+    }
+
     /// Production end-to-end decision worker. The generated source is
     /// intentionally discarded; final pointer decisions are emitted by the
     /// existing full diagnostics surface and parsed by the parent harness.
@@ -9344,6 +9385,7 @@ fn boc1_run_one() {
             "prod-precision" => run::run_prod_ownership(tcx, t_tcx),
             "prod-box" => run::run_prod_box(tcx, t_tcx),
             "m1-census" => run::run_m1_census(tcx, t_tcx),
+            "substrate-sanity" => run::run_substrate_sanity(tcx, t_tcx),
             "m1-recon" => run::run_m1_recon(tcx, t_tcx),
             "selector-core" => run::run_selector_core(tcx, t_tcx),
             "selector-necessity" => run::run_selector_necessity(tcx, t_tcx),
@@ -9405,9 +9447,44 @@ struct CorpusProgram {
     sloc: usize,
 }
 
+/// The substrate directory M1 measures on, selected by `CRAT_BOC1_SUBSTRATE`.
+///
+/// - `raw` (the default) — `benchmarks/rs-crown`, the c2rust output as shipped.
+/// - `derived` — `benchmarks/rs-crown-derived`, the same 20 programs after
+///   `expand → extern → preprocess`, produced by
+///   `docs/agents/tools/derive_substrate.py`.
+///
+/// **One place.** Thirteen call sites reach the corpus, all through
+/// `input_path`, so the substrate is chosen here and nowhere else; a second
+/// notion of "which tree is this" would eventually disagree with this one and
+/// the disagreement would surface as numbers measured on a mixture.
+///
+/// An unrecognized value is a hard error rather than a fallback to `raw`: a
+/// typo that silently measured the old substrate is exactly the failure this
+/// selector exists to prevent.
+pub(crate) fn substrate_dir() -> &'static str {
+    substrate_dir_of(std::env::var("CRAT_BOC1_SUBSTRATE").ok().as_deref())
+}
+
+/// The selection itself, as a pure function of the setting.
+///
+/// Split out from the env read so it can be witnessed without `set_var`:
+/// the suite runs its tests as threads of one process, so a test that mutated
+/// this variable would be mutating it for every concurrently running test.
+pub(crate) fn substrate_dir_of(setting: Option<&str>) -> &'static str {
+    match setting {
+        None | Some("raw") => "benchmarks/rs-crown",
+        Some("derived") => "benchmarks/rs-crown-derived",
+        other => panic!(
+            "CRAT_BOC1_SUBSTRATE must be `raw` or `derived`, got {other:?}; \
+             an unrecognized value is never silently treated as `raw`"
+        ),
+    }
+}
+
 impl CorpusProgram {
     fn input_path(self, root: &std::path::Path) -> std::path::PathBuf {
-        root.join("benchmarks/rs-crown")
+        root.join(substrate_dir())
             .join(self.name)
             .join(self.lib_root)
     }
@@ -9545,6 +9622,27 @@ const PAIRWISE_EXPECTED_JOINT_BY_PROGRAM: [(&str, usize); 20] = [
     ("brotli", 2),
 ];
 
+/// The substrate selector: both accepted settings, and the refusal to guess.
+///
+/// The unrecognized-value arm is the load-bearing one. A selector that fell
+/// back to `raw` on a typo would report numbers measured on the OLD substrate
+/// under the new substrate's name, and nothing downstream could tell.
+#[test]
+fn the_substrate_selector_names_both_trees_and_refuses_to_guess() {
+    assert_eq!(substrate_dir_of(None), "benchmarks/rs-crown");
+    assert_eq!(substrate_dir_of(Some("raw")), "benchmarks/rs-crown");
+    assert_eq!(
+        substrate_dir_of(Some("derived")),
+        "benchmarks/rs-crown-derived"
+    );
+
+    for bad in ["", "Derived", "rs-crown-derived", "1"] {
+        let refused =
+            std::panic::catch_unwind(|| substrate_dir_of(Some(bad))).is_err();
+        assert!(refused, "{bad:?} must be refused, never read as `raw`");
+    }
+}
+
 #[test]
 fn rs_crown_catalog_contract() {
     let expected = [
@@ -9593,7 +9691,7 @@ fn rs_crown_catalog_contract() {
             "missing rs-crown input for {}: {input:?}",
             program.name
         );
-        assert!(input.starts_with(root.join("benchmarks/rs-crown")));
+        assert!(input.starts_with(root.join(substrate_dir())));
 
         let expected_root = if matches!(program.name, "bzip2" | "tulipindicators") {
             "c2rust-lib.rs"
