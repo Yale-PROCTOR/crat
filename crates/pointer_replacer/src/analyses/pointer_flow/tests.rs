@@ -975,3 +975,17 @@ pub unsafe fn f(ip: *mut Inner, r: *mut i32) -> *mut i32 {
     );
     assert!(return_bases(&result).contains(&param_base(&result, 1)));
 }
+
+#[test]
+fn repeat_array_elements_reach_operand_base() {
+    let result = analyze_single(
+        r#"
+pub unsafe fn f(p: *mut i32) -> *mut i32 {
+    let arr = [p; 2];
+    arr[1]
+}
+"#,
+        "f",
+    );
+    assert!(return_bases(&result).contains(&param_base(&result, 0)));
+}

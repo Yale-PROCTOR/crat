@@ -285,6 +285,10 @@ impl<'tcx> Collector<'_, 'tcx> {
                     }
                 }
             },
+            Rvalue::Repeat(operand, _) => {
+                // all elements share the same slot range; one link covers them
+                self.collect_composite_operand(operand, dst_slots.clone(), location);
+            }
             _ => {
                 // only emit a conservative Unknown edge when the rvalue is itself
                 // a raw-pointer value we do not specifically handle.  Non-pointer
