@@ -120,14 +120,21 @@ pub(crate) struct CallEffects {
 fn summary_source_for_base(base: &BaseId, result: &PointerFlowResult) -> SummarySource {
     match base {
         BaseId::Param { local, slot } => {
-            let arg_index = param_index_for_local(*local).unwrap_or(0);
-            let path = result
-                .slot_table
-                .slot_infos
-                .get(*slot)
-                .map(|info| info.path.clone())
-                .unwrap_or_default();
-            SummarySource::ParamSlot { arg_index, path }
+            // param bases are minted only from body.args_iter() (Collector::collect),
+            // so the local is always a real parameter; if that invariant ever breaks,
+            // degrade to Unknown instead of mis-attributing the flow to arg 0
+            match param_index_for_local(*local) {
+                Some(arg_index) => {
+                    let path = result
+                        .slot_table
+                        .slot_infos
+                        .get(*slot)
+                        .map(|info| info.path.clone())
+                        .unwrap_or_default();
+                    SummarySource::ParamSlot { arg_index, path }
+                }
+                None => SummarySource::Unknown(UnknownReason::UnsupportedMemoryLoad),
+            }
         }
         BaseId::HeapAlloc { .. } => SummarySource::HeapAlloc,
         BaseId::OpaqueReturn { .. } => SummarySource::OpaqueReturn,
