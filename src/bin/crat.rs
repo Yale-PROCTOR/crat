@@ -482,10 +482,9 @@ fn main() {
                 if let Ok(text) = std::fs::read_to_string(&field_spec_path) {
                     icfg.field_spec = serde_json::from_str(&text).unwrap();
                 }
-                let s = run_compiler_on_path(&file, |tcx| {
-                    interface_fixer::fix_interfaces(&icfg, tcx)
-                })
-                .unwrap();
+                let s =
+                    run_compiler_on_path(&file, |tcx| interface_fixer::fix_interfaces(&icfg, tcx))
+                        .unwrap();
                 std::fs::write(&file, s).unwrap();
             }
             Pass::Libc => {
@@ -567,15 +566,16 @@ fn main() {
                 })
                 .unwrap();
                 if !field_specs.is_empty() {
+                    // the sidecar persists across reruns on purpose: a rerun over
+                    // already-specialized output finds nothing to specialize (empty map)
+                    // but the existing records are still what the interface pass needs;
+                    // genuinely stale entries fail closed there (no {name}_field fn)
                     let field_spec_path = dir.join("field_spec_map.json");
                     std::fs::write(
                         &field_spec_path,
                         serde_json::to_string_pretty(&field_specs).unwrap(),
                     )
                     .unwrap();
-                } else {
-                    // a rerun that no longer specializes must not leave a stale sidecar
-                    let _ = std::fs::remove_file(dir.join("field_spec_map.json"));
                 }
                 if changed {
                     std::fs::write(&file, s).unwrap();

@@ -70,7 +70,9 @@ enum FixAction {
     // fn itself to `internal_name` and strip its export_name/no_mangle
     // attrs; the wrapper (cloned before the strip) keeps the original
     // ident and attrs and forwards into `internal_name`
-    Rename { internal_name: Symbol },
+    Rename {
+        internal_name: Symbol,
+    },
     // field specialization flow (task 3): the internal `_field` fn is left
     // completely untouched (already renamed and attr-stripped by the
     // pointer pass); a NEW wrapper item is synthesized under
@@ -196,9 +198,15 @@ impl mut_visit::MutVisitor for AstVisitor<'_> {
                         !attr.has_name(sym::export_name) && !attr.has_name(sym::no_mangle)
                     });
                 }
-                FixAction::FieldSpec { exported_name, attr } => {
+                FixAction::FieldSpec {
+                    exported_name,
+                    attr,
+                } => {
                     let ItemKind::Fn(f) = &mut new_item.kind else { panic!() };
                     f.ident.name = *exported_name;
+                    // wholesale replace, not merge: the fresh wrapper is a new
+                    // C-facing entry point and deliberately does not inherit
+                    // the internal `_field` fn's attrs
                     new_item.attrs = match attr {
                         FieldSpecAttr::NoMangle => utils::attr!("#[no_mangle]"),
                         FieldSpecAttr::ExportName(s) => utils::attr!("#[export_name = {s:?}]"),
@@ -486,6 +494,8 @@ fn resolve_struct_field_fix<'tcx>(
     let hir_param = body.params.get(param.index)?;
     let ty = typeck.node_type(hir_param.pat.hir_id);
     let expected = *struct_fields.get(&(param.struct_name.clone(), param.field.clone()))?;
+    // mutability below is derived from `ty.kind()`, the observed promoted
+    // shape, which is authoritative; `param.mutbl` is not consulted here
 
     let (pointee, mutability, option_wrapped) = match ty.kind() {
         ty::TyKind::Adt(adt_def, generic_args) if utils::ir::is_option(adt_def.did(), tcx) => {

@@ -7,6 +7,9 @@ pub struct FieldSpecParam {
     pub index: usize,
     pub struct_name: String,
     pub field: String,
+    // diagnostic/future-use metadata: the interface side re-derives
+    // mutability from the observed promoted shape (that is authoritative),
+    // it does not read this field
     pub mutbl: String, // "const" | "mut"
 }
 
