@@ -969,6 +969,8 @@ fn collect_subjects(
                     param_ty.kind(),
                     TyKind::RawPtr(_, Mutability::Mut) | TyKind::Ref(_, _, Mutability::Mut)
                 ) && mut_facts.is_mutable(fn_did, local),
+                // Stamped in `finish_decide`, once, over both universes.
+                freed_at: None,
             });
         }
     }
@@ -1167,6 +1169,8 @@ fn collect_local_subjects(
                     ty.kind(),
                     TyKind::RawPtr(_, Mutability::Mut) | TyKind::Ref(_, _, Mutability::Mut)
                 ) && mut_facts.is_mutable(fn_did, local),
+                // Stamped in `finish_decide`, once, over both universes.
+                freed_at: None,
             });
         }
     }
@@ -1719,6 +1723,21 @@ fn finish_decide<'tcx>(
     // predicate — a census whose denominator silently gained a population is not
     // the same instrument.
     subjects.extend(collect_local_subjects(tcx, &program, &mut_facts));
+
+    // The freed-slot fact, stamped over BOTH universes from ONE walk of the
+    // production recognizer — the same `free_sites` the S2-2 census asks. Two
+    // properties follow by construction rather than by test: the parameter and
+    // locals populations cannot acquire different freed-ness, and the gate
+    // cannot disagree with the census about which bindings are freed.
+    //
+    // BEFORE `perturb`, so a test hook can perturb this field like any other.
+    let freed = decision::FreedBindings::from_resolved(
+        &free_sites(tcx, &program.functions).resolved,
+    );
+    for subject in &mut subjects {
+        subject.freed_at = freed.site_of(subject.fn_did, subject.hir_id);
+    }
+
     perturb(&mut subjects);
     let facts = decision::emitability::collect(tcx, &program.functions);
     let table = decision::decide(tcx, &subjects, &model, &slots, &facts);
@@ -1912,17 +1931,68 @@ const DEALLOCATORS: &[&str] = &["free", "xfree", "cfree", "g_free"];
 /// solve — and, more importantly, so it asks that question of THIS recognizer
 /// rather than a second copy of the name table that could drift from it.
 pub(crate) struct FreeSites {
-    /// `(hir_id_of_resolved_local, had_cast)` and the unresolved tally.
-    pub(crate) resolved: Vec<(rustc_hir::HirId, bool)>,
-    pub(crate) unresolved: Vec<(&'static str, String)>,
+    /// `(hir_id_of_resolved_local, had_cast, call_span)` and the unresolved
+    /// tally.
+    ///
+    /// The span is the **free call's**, not the binding's: it is what the
+    /// freed-slot gate attributes a degradation to, exactly as A1's other gates
+    /// attribute to the offending use rather than to the declaration.
+    pub(crate) resolved: Vec<(rustc_hir::HirId, bool, rustc_span::Span)>,
+    pub(crate) unresolved: Vec<UnresolvedFree>,
+}
+
+/// A free whose argument did not resolve to a binding — `free((*s).f)`,
+/// `free(arr[i])`, `free(g())`.
+///
+/// Carries the bindings referenced **anywhere inside** the argument expression,
+/// which is what the overlap check measures: the resolved arm can only see
+/// arguments that *are* a binding, so a subject reachable through a field or an
+/// index projection would otherwise be invisible to it. Collected here rather
+/// than by a second walk so the overlap check and the census cannot disagree
+/// about which sites are unresolved.
+pub(crate) struct UnresolvedFree {
+    pub(crate) cause: &'static str,
+    pub(crate) site: String,
+    pub(crate) locals: Vec<(rustc_hir::def_id::LocalDefId, rustc_hir::HirId)>,
 }
 
 pub(crate) fn free_sites(tcx: TyCtxt<'_>, fns: &[rustc_hir::def_id::LocalDefId]) -> FreeSites {
     use rustc_hir::intravisit::Visitor;
 
+    /// Every binding a subexpression resolves to, in source order.
+    struct Bindings(Vec<rustc_hir::HirId>);
+    impl<'tcx> Visitor<'tcx> for Bindings {
+        fn visit_expr(&mut self, e: &'tcx rustc_hir::Expr<'tcx>) {
+            if let rustc_hir::ExprKind::Path(rustc_hir::QPath::Resolved(_, path)) = &e.kind
+                && let rustc_hir::def::Res::Local(hid) = path.res
+            {
+                self.0.push(hid);
+            }
+            rustc_hir::intravisit::walk_expr(self, e);
+        }
+    }
+
     struct V<'a, 'tcx> {
         tcx: TyCtxt<'tcx>,
         out: &'a mut FreeSites,
+    }
+    impl V<'_, '_> {
+        fn unresolved(&mut self, cause: &'static str, e: &rustc_hir::Expr<'_>, arg: &rustc_hir::Expr<'_>) {
+            let mut bindings = Bindings(Vec::new());
+            bindings.visit_expr(arg);
+            let mut locals: Vec<_> = bindings
+                .0
+                .into_iter()
+                .map(|hid| (hid.owner.def_id, hid))
+                .collect();
+            locals.sort_by_key(|(_, hid)| hid.local_id.as_u32());
+            locals.dedup();
+            self.out.unresolved.push(UnresolvedFree {
+                cause,
+                site: self.tcx.sess.source_map().span_to_diagnostic_string(e.span),
+                locals,
+            });
+        }
     }
     impl<'tcx> Visitor<'tcx> for V<'_, 'tcx> {
         fn visit_expr(&mut self, e: &'tcx rustc_hir::Expr<'tcx>) {
@@ -1941,26 +2011,14 @@ pub(crate) fn free_sites(tcx: TyCtxt<'_>, fns: &[rustc_hir::def_id::LocalDefId])
                 match &inner.kind {
                     rustc_hir::ExprKind::Path(rustc_hir::QPath::Resolved(_, path)) => {
                         if let rustc_hir::def::Res::Local(hid) = path.res {
-                            self.out.resolved.push((hid, cast));
+                            self.out.resolved.push((hid, cast, e.span));
                         } else {
-                            self.out.unresolved.push((
-                                "non-local-path",
-                                self.tcx.sess.source_map().span_to_diagnostic_string(e.span),
-                            ));
+                            self.unresolved("non-local-path", e, inner);
                         }
                     }
-                    rustc_hir::ExprKind::Field(..) => self.out.unresolved.push((
-                        "field",
-                        self.tcx.sess.source_map().span_to_diagnostic_string(e.span),
-                    )),
-                    rustc_hir::ExprKind::Index(..) => self.out.unresolved.push((
-                        "index",
-                        self.tcx.sess.source_map().span_to_diagnostic_string(e.span),
-                    )),
-                    _ => self.out.unresolved.push((
-                        "other",
-                        self.tcx.sess.source_map().span_to_diagnostic_string(e.span),
-                    )),
+                    rustc_hir::ExprKind::Field(..) => self.unresolved("field", e, inner),
+                    rustc_hir::ExprKind::Index(..) => self.unresolved("index", e, inner),
+                    _ => self.unresolved("other", e, inner),
                 }
             }
             rustc_hir::intravisit::walk_expr(self, e);
@@ -1979,6 +2037,72 @@ pub(crate) fn free_sites(tcx: TyCtxt<'_>, fns: &[rustc_hir::def_id::LocalDefId])
         v.visit_body(tcx.hir_body(body_id));
     }
     sites
+}
+
+/// **The unresolved-overlap check.** Does any M1 subject hide inside a free
+/// whose argument the census could not resolve?
+///
+/// The freed-slot gate keys on [`FreeSites::resolved`], so its completeness over
+/// the free population is exactly the question of whether the *unresolved* arm
+/// hides a subject. `free((*s).buf)` frees a struct field, not `s` — but if `s`
+/// is itself a subject, a reader of the census cannot tell from the outside
+/// whether the gate missed something, because the unresolved rows carry only a
+/// cause and a span.
+///
+/// So this reports the join: every subject referenced **anywhere inside** an
+/// unresolved free argument, with the site that referenced it. That is the
+/// **broad** reading deliberately — the strict one ("the argument IS a subject")
+/// is vacuously zero, since such an argument would have resolved and landed in
+/// the other arm. A check that cannot fail is not a check.
+///
+/// Runs **no BO solve**: subject collection needs the program and `MutFacts`
+/// only, so this is affordable in the recon worker beside the census.
+pub(crate) struct FreeOverlap {
+    /// One entry per (unresolved site × referenced subject) pair.
+    pub(crate) hits: Vec<FreeOverlapHit>,
+    /// Unresolved sites examined — the denominator, so a zero can be told apart
+    /// from a walk that found nothing to examine.
+    pub(crate) sites: usize,
+}
+
+pub(crate) struct FreeOverlapHit {
+    pub(crate) cause: &'static str,
+    pub(crate) site: String,
+    pub(crate) fn_path: String,
+    pub(crate) mir_local: u32,
+    pub(crate) is_param: bool,
+}
+
+pub(crate) fn free_overlap(tcx: TyCtxt<'_>) -> FreeOverlap {
+    let program = collect_program(tcx);
+    let mut_facts = MutFacts::from_program(&program);
+    let mut subjects = collect_subjects(tcx, &program, &mut_facts);
+    subjects.extend(collect_local_subjects(tcx, &program, &mut_facts));
+    let by_binding: rustc_hash::FxHashMap<_, _> = subjects
+        .iter()
+        .map(|s| ((s.fn_did, s.hir_id), s))
+        .collect();
+
+    let sites = free_sites(tcx, &program.functions);
+    let mut hits = Vec::new();
+    for u in &sites.unresolved {
+        for key in &u.locals {
+            let Some(s) = by_binding.get(key) else {
+                continue;
+            };
+            hits.push(FreeOverlapHit {
+                cause: u.cause,
+                site: u.site.clone(),
+                fn_path: tcx.def_path_str(s.fn_did.to_def_id()),
+                mir_local: s.local.as_u32(),
+                is_param: matches!(s.kind, decision::SubjectKind::Param { .. }),
+            });
+        }
+    }
+    FreeOverlap {
+        hits,
+        sites: sites.unresolved.len(),
+    }
 }
 
 /// §2's recognizer populations, from HIR alone.
@@ -2087,7 +2211,7 @@ fn freed_slots_tsv_from(
 
     let mut out =
         String::from("fn_path\tmir_local\tcast\tkind\toutcome\tresolution\tdetail\n");
-    for (hid, cast) in &sites.resolved {
+    for (hid, cast, _) in &sites.resolved {
         let owner = hid.owner.def_id;
         let Some(s) = by_hir.get(&(owner, *hid)) else {
             out.push_str(&format!(
@@ -2118,8 +2242,11 @@ fn freed_slots_tsv_from(
             u8::from(*cast),
         ));
     }
-    for (cause, site) in &sites.unresolved {
-        out.push_str(&format!("-\t-\t-\t-\t-\tnon-local\t{cause} @ {site}\n"));
+    for u in &sites.unresolved {
+        out.push_str(&format!(
+            "-\t-\t-\t-\t-\tnon-local\t{} @ {}\n",
+            u.cause, u.site
+        ));
     }
     Ok(out)
 }

@@ -35,6 +35,7 @@
 //! | `decl_span_lo/hi` | ✓ | `null` | **SPAN axis** — A's half of the interleave |
 //! | `binding_span_lo/hi` | `null` | ✓ | **SPAN axis** — B's half, and the activation signal |
 //! | `outcome`, `degrade_reason` | ✓ | `null` | S2b consumes; not compared |
+//! | `freed` | ✓ | `null` | co-attribution; not compared |
 //!
 //! `decl_span` (the rendered string) is not reconciled: A's span is the declared
 //! *type*'s span, and the nearest MIR-side fact is the *binding*'s span, so an
@@ -200,6 +201,28 @@ pub(crate) struct Row {
     pub outcome: Option<Outcome>,
     /// Producer A only; `Some` exactly when `outcome` is `Degraded`.
     pub degrade_reason: Option<String>,
+    /// **The freed-slot attribution.** Producer A only: `Some(true)` when this
+    /// subject's binding is passed to a deallocator, `Some(false)` when it is
+    /// not, `None` on a producer-B row.
+    ///
+    /// # A column, not a reason — and why both exist
+    ///
+    /// `degrade_reason` names the FIRST test that fired, because `decide_one`
+    /// returns at it. The freed-slot gate fires last, so on today's corpus every
+    /// freed subject is attributed to something else and the reason field alone
+    /// reports the freed population as **empty**. That is the ordering blindness
+    /// `facts_join_tsv` exists to defeat, one axis at a time; this is the same
+    /// remedy for this fact.
+    ///
+    /// So the two are **co-attribution**, deliberately: a row may read
+    /// `degrade_reason: "call-site-not-adapted"` and `freed: true` at once, and
+    /// that pair is exactly the population S3 must not silently convert when it
+    /// retires the first of them.
+    ///
+    /// `Option<bool>` rather than `bool`: producer B is MIR-derived and has no
+    /// derivation for this, so a `false` from B would be a claim it cannot
+    /// support — the silently-agreeing field that F1 was.
+    pub freed: Option<bool>,
 }
 
 impl Row {

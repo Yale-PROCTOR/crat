@@ -1611,22 +1611,26 @@ fn a_locals_row_carries_no_arg_index_while_a_parameter_keeps_one() {
 /// A sibling of [`locals_of`] rather than a widening of it: `locals_of` is the
 /// instrument the S3.1 witnesses above are written against, and changing what
 /// it returns would put those tests under Rider 4 for no gain here.
-fn decisions_of(src: &str) -> Vec<(String, bool, String)> {
+fn artifact_rows_of(src: &str) -> Vec<crate::coverage_recon::schema::Row> {
     let fixture = Fixture::new(&[("lib.rs", src)]);
     ::utils::compilation::run_compiler_on_path(&fixture.0.join("lib.rs"), |tcx| {
         let table = super::decide_table(tcx).expect("fixture yields a decision table");
         super::artifact::rows(tcx, &table)
-            .iter()
-            .map(|r| {
-                (
-                    r.param_name.clone().unwrap_or_else(|| "<unnamed>".to_owned()),
-                    r.arg_index.is_some(),
-                    r.degrade_reason.clone().unwrap_or_else(|| "<emitted>".to_owned()),
-                )
-            })
-            .collect::<Vec<_>>()
     })
     .expect("fixture compiles")
+}
+
+fn decisions_of(src: &str) -> Vec<(String, bool, String)> {
+    artifact_rows_of(src)
+        .iter()
+        .map(|r| {
+            (
+                r.param_name.clone().unwrap_or_else(|| "<unnamed>".to_owned()),
+                r.arg_index.is_some(),
+                r.degrade_reason.clone().unwrap_or_else(|| "<emitted>".to_owned()),
+            )
+        })
+        .collect()
 }
 
 fn reason_of(got: &[(String, bool, String)], name: &str, is_param: bool) -> String {
@@ -1963,5 +1967,156 @@ fn a_local_with_no_raw_only_use_is_still_emitted() {
         reason_of(&got, "p", false),
         "<emitted>",
         "a clean local must survive A1: {got:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The freed-slot gate
+// ---------------------------------------------------------------------------
+
+/// The two freed-slot fixtures, differing in **one token**: the callee of the
+/// call that consumes `p`.
+///
+/// # Why the free is conditional — measured, not styled
+///
+/// The obvious fixture does not reach the gate, and why is worth recording.
+/// With an unconditional `free` as the only thing that happens to the binding,
+/// BO settles the slot **`Owning`** and `kind-owning` fires three arms earlier.
+/// Measured on four such shapes: `free` of a parameter, of a copy of one, of a
+/// `malloc` result, and of a parameter beside a second live pointer — all four
+/// `owning`/`kind-owning`. **A fixture that degrades upstream witnesses
+/// nothing.**
+///
+/// Under a *conditional* free the slot is not owning on all paths, BO retracts
+/// the sink, and the kind settles `Ref` — while the program still frees it.
+/// That is the leaked-free shape backlog S2-2 named, and a reference for it is a
+/// reference to memory freed on the other path.
+///
+/// The corpus has 44 freed-`Ref` subjects, and none is reproducible in its own
+/// shape here: its cast-free specimen, `lodepng_free`, settles `Ref` only
+/// because a caller retracts the sink — and that same caller makes
+/// `call-site-not-adapted` fire, so reproducing it would witness the reason
+/// rather than the gate. This shape reaches the gate on its own.
+///
+/// Everything but the callee is held fixed — declaration, control flow, and the
+/// absence of any in-crate reference to the function under test — and `keeper`
+/// is declared in the same `extern` block with the same signature, so even the
+/// callee's kind is fixed. Only the NAME differs, which is exactly what
+/// `DEALLOCATORS` keys on.
+fn freed_fixture(callee: &str) -> String {
+    format!(
+        "#![allow(dead_code, unused_unsafe, unused_mut, unused_variables)]\n\
+         extern \"C\" {{\n\
+         \x20   fn free(p: *mut core::ffi::c_void);\n\
+         \x20   fn keeper(p: *mut core::ffi::c_void);\n\
+         }}\n\
+         pub unsafe fn releases(a: *mut core::ffi::c_void, b: i32) {{\n\
+         \x20   let p: *mut core::ffi::c_void = a;\n\
+         \x20   if b > 0 {{ {callee}(p); }}\n\
+         }}\n"
+    )
+}
+
+/// **The gate — a subject that would otherwise emit is degraded as
+/// `freed-slot`.**
+///
+/// The control half is what makes this a witness rather than an assertion: it
+/// establishes that this subject reaches `Decision::Ref` when the same call goes
+/// to a non-deallocator, so the freed half's degradation cannot be an artefact
+/// of the fixture failing some earlier test.
+///
+/// *Mutation-tested (Rider 0, deletion first):* deleting the `subject.freed_at`
+/// arm at the end of `decide_one` makes the freed half read `<emitted>` and
+/// fails this. Second mutation: moving that arm ABOVE the `referenced` arm keeps
+/// this green and fails the corpus zero-movement check instead — recorded
+/// because it is the one mutation this witness deliberately does **not** catch,
+/// and the reason the corpus assertion is not redundant with it.
+#[test]
+fn a_freed_subject_that_would_otherwise_emit_is_degraded_as_freed_slot() {
+    let control = decisions_of(&freed_fixture("keeper"));
+    assert_eq!(
+        reason_of(&control, "p", false),
+        "<emitted>",
+        "the control subject must reach Ref, or the freed half witnesses \
+         nothing: {control:?}"
+    );
+
+    let freed = decisions_of(&freed_fixture("free"));
+    assert_eq!(
+        reason_of(&freed, "p", false),
+        "freed-slot",
+        "a freed subject that passed every other test was still emitted: \
+         {freed:?}"
+    );
+}
+
+/// **Co-attribution.** A freed subject stopped by an EARLIER reason keeps that
+/// reason and still carries the `freed` column.
+///
+/// This is the population the corpus actually has: 44 freed subjects whose BO
+/// kind is `Ref`, every one of them stopped before the gate. A reason-derived
+/// freed count reports that population as **empty**, because `decide_one`
+/// returns at the first failing test — the same ordering blindness
+/// `facts_join_tsv` exists to defeat.
+///
+/// *Mutation-tested (Rider 0, deletion first):* replacing `freed` in
+/// `artifact::rows` with a derivation from the reason —
+/// `Some(matches!(decision, Decision::Degraded(r) if r.reason.key() ==
+/// "freed-slot"))` — fails this: the row reads `false` while the program plainly
+/// frees the binding. The obvious spelling of that mutation,
+/// `degrade_reason.as_deref() == …`, does **not compile** — the field is moved
+/// into the row two lines above — which is mild structural evidence in its own
+/// right that this column cannot restate the reason without going back to the
+/// decision.
+#[test]
+fn a_freed_subject_stopped_earlier_keeps_its_reason_and_carries_the_column() {
+    let src = "#![allow(dead_code, unused_unsafe, unused_mut, unused_variables)]\n\
+               extern \"C\" {\n\
+               \x20   fn free(p: *mut core::ffi::c_void);\n\
+               }\n\
+               pub unsafe fn releases(a: *mut core::ffi::c_void, b: i32) -> bool {\n\
+               \x20   let p: *mut core::ffi::c_void = a;\n\
+               \x20   let dead = p.is_null();\n\
+               \x20   if b > 0 { free(p); }\n\
+               \x20   dead\n\
+               }\n";
+    let rows = artifact_rows_of(src);
+    let row = rows
+        .iter()
+        .find(|r| r.param_name.as_deref() == Some("p") && r.arg_index.is_none())
+        .unwrap_or_else(|| panic!("no subject `p`: {rows:?}"));
+
+    assert_eq!(
+        row.degrade_reason.as_deref(),
+        Some("raw-pointer-operation"),
+        "the gate displaced an earlier reason — it must fire LAST: {row:?}"
+    );
+    assert_eq!(
+        row.freed,
+        Some(true),
+        "the freed fact vanished behind the earlier reason: {row:?}"
+    );
+}
+
+/// The column is a FACT about the subject, not a restatement of the reason: an
+/// unfreed subject reads `Some(false)`, never `None`.
+///
+/// `None` is producer B's value — "no derivation for this" — and producer A
+/// always has one. Without this, a producer A that emitted `None` everywhere
+/// would satisfy the co-attribution witness above on its `Some(true)` row alone.
+///
+/// *Mutation-tested (Rider 0, deletion first):* changing `artifact::rows` to
+/// emit `subject.freed_at.is_some().then_some(true)` fails this.
+#[test]
+fn an_unfreed_subject_carries_a_present_false_not_an_absent_column() {
+    let rows = artifact_rows_of(&freed_fixture("keeper"));
+    let row = rows
+        .iter()
+        .find(|r| r.param_name.as_deref() == Some("p") && r.arg_index.is_none())
+        .unwrap_or_else(|| panic!("no subject `p`: {rows:?}"));
+    assert_eq!(
+        row.freed,
+        Some(false),
+        "producer A must state the fact it has, not abstain: {row:?}"
     );
 }

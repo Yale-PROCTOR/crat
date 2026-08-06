@@ -392,6 +392,7 @@ mod tests {
             pointee_span: None,
             decl_shape: DeclShape::Alias,
             mutable: false,
+            freed_at: None,
         }
     }
 

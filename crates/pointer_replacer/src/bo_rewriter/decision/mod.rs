@@ -165,6 +165,47 @@ pub(crate) struct Subject {
     /// How the declaration is written — see [`DeclShape`].
     pub decl_shape: DeclShape,
     pub mutable: bool,
+    /// **The freed-slot fact**: the span of the first deallocator call this
+    /// subject's binding is passed to, or `None`.
+    ///
+    /// Stamped once, in `finish_decide`, over BOTH universes from a single
+    /// [`super::free_sites`] walk — the same call the S2-2 census asks. One
+    /// stamping site rather than one per collector, so the parameter and locals
+    /// populations cannot acquire different freed-ness by construction, and one
+    /// recognizer rather than two so the gate below and the census cannot
+    /// disagree about what "freed" means.
+    ///
+    /// An `Option<Span>` rather than a `bool` + lookup: the predicate and the
+    /// attribution site are the same fact, and splitting them is how a gate
+    /// ends up degrading with a declaration site that says nothing about why.
+    pub freed_at: Option<Span>,
+}
+
+/// Bindings passed to a deallocator, keyed exactly as A1's emitability gates are
+/// — `(owner, HirId)`.
+///
+/// Takes the resolved slice rather than the parent's `FreeSites` struct: this
+/// phase needs the *fact*, not the recognizer's return type, and a narrower
+/// surface is a narrower coupling.
+#[derive(Default)]
+pub(crate) struct FreedBindings(FxHashMap<(LocalDefId, rustc_hir::HirId), Span>);
+
+impl FreedBindings {
+    /// First site wins, so the attribution is deterministic under a program with
+    /// several frees of one binding — `bst::deleteNode::_1` is freed twice on
+    /// the corpus, and a last-wins rule would make the reported site depend on
+    /// HIR walk order.
+    pub(crate) fn from_resolved(resolved: &[(rustc_hir::HirId, bool, Span)]) -> Self {
+        let mut map = FxHashMap::default();
+        for (hir_id, _cast, span) in resolved {
+            map.entry((hir_id.owner.def_id, *hir_id)).or_insert(*span);
+        }
+        Self(map)
+    }
+
+    pub(crate) fn site_of(&self, fn_did: LocalDefId, hir_id: rustc_hir::HirId) -> Option<Span> {
+        self.0.get(&(fn_did, hir_id)).copied()
+    }
 }
 
 impl Subject {
@@ -279,6 +320,33 @@ pub(crate) enum DegradeReason {
     /// the parameter universe. A count of 0 means the locals universe is empty,
     /// not that the reason is inert.
     NoDeclaredType,
+    /// **The freed-slot gate.** The subject's binding is passed to a
+    /// deallocator, so emitting a reference form for it would hand codegen a
+    /// reference to freed memory.
+    ///
+    /// # Why this is its own reason and fires LAST
+    ///
+    /// Backlog S2-2 recorded that a leaked free's value kind is *observed, not
+    /// designed*: a freed slot can settle `Ref` in the model, and the census
+    /// measured 44 such subjects on the derived corpus. None of them reaches
+    /// `Decision::Ref` today — every one is stopped earlier, mostly by an
+    /// `as`-cast on the free argument or by having no declared type. That is an
+    /// **incidental** mitigation, not a discharge: it is a property of how
+    /// C2Rust happens to spell `free`, and `lodepng_free` already shows the
+    /// shape that survives it (`free(ptr)` with no cast, stopped only by
+    /// `call-site-not-adapted` — which **S3 retires**).
+    ///
+    /// So the gate is placed **last**, immediately before the `Ref` return: it
+    /// vetoes an emission nothing else stopped, and it displaces no existing
+    /// attribution. That ordering is what makes it a zero-movement change on
+    /// today's corpus and a live veto the moment S3 removes the reason that is
+    /// carrying it.
+    ///
+    /// Never folded into [`Self::KindOwning`]. Those are different claims —
+    /// "BO says this slot owns" versus "the program frees this binding" — and a
+    /// freed subject whose kind is `Ref` is exactly the case that has neither
+    /// name nor counter if they are merged.
+    FreedSlot,
 }
 
 impl DegradeReason {
@@ -300,6 +368,7 @@ impl DegradeReason {
             DegradeReason::NoSlot => "no-slot",
             DegradeReason::UnsupportedDeclShape { .. } => "unsupported-decl-shape",
             DegradeReason::NoDeclaredType => "no-declared-type",
+            DegradeReason::FreedSlot => "freed-slot",
         }
     }
 }
@@ -509,6 +578,19 @@ fn decide_one(
         );
     }
 
+    // LAST — see `DegradeReason::FreedSlot`. A veto on emission, not a
+    // reordering: every subject that reaches here passed every other test, so
+    // this arm can only ever convert a `Ref` into a `freed-slot` degradation and
+    // can never displace another reason. That is what makes it measurable as
+    // zero decision movement rather than merely asserted to be.
+    if let Some(span) = subject.freed_at {
+        return degrade(
+            subject,
+            EmitabilityFacts::site(tcx, span),
+            DegradeReason::FreedSlot,
+        );
+    }
+
     Decision::Ref {
         mutable: subject.mutable,
     }
@@ -542,6 +624,7 @@ mod self_consistency_tests {
             pointee_span: Some(rustc_span::DUMMY_SP),
             decl_shape: DeclShape::RawPtr,
             mutable: true,
+            freed_at: None,
         }
     }
 

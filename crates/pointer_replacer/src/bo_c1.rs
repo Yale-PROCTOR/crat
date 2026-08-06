@@ -7090,6 +7090,28 @@ mod run {
             Err(_) => row.set("freed_pass", "panicked"),
         }
 
+        // The freed-slot gate's COMPLETENESS over the free population: subjects
+        // hiding inside a free the census could not resolve. Reported per
+        // program in the row (so a nonzero can be pinned) and enumerated on
+        // stdout (so it can be triaged without a second run).
+        //
+        // The denominator travels with it: `free_overlap=0 / sites=0` and
+        // `free_overlap=0 / sites=81` are different claims, and only the second
+        // one is evidence.
+        let overlap = crate::bo_rewriter::free_overlap(tcx);
+        row.set("free_overlap", overlap.hits.len());
+        row.set("free_unresolved_sites", overlap.sites);
+        for h in &overlap.hits {
+            println!(
+                "BOC1-FREE-OVERLAP program={name} cause={} fn={} local={} is_param={} site={}",
+                h.cause,
+                h.fn_path,
+                h.mir_local,
+                u8::from(h.is_param),
+                h.site
+            );
+        }
+
         // R2 — the fatness pass is SEPARATE, and its failure is caught here.
         // When fatness rode inside the facts join, one program's panic took the
         // whole invariant sweep with it. `catch_unwind` because the failure mode
@@ -7449,6 +7471,47 @@ mod run {
         row.set("alias", census.resolved_only_alias);
         row.set("reference", census.resolved_only_reference);
         row.set("other", census.resolved_only_other);
+        row.set("t_total_s", secs(t0.elapsed() + t_tcx));
+        row.set("status", "ok");
+        row
+    }
+
+    /// **The freed-slot gate's completeness triage.** Subjects hiding inside a
+    /// free the census could not resolve.
+    ///
+    /// The recon sweep already carries the *counts* (`free_overlap` and its
+    /// denominator `free_unresolved_sites`) in every row, which is the standing
+    /// signal. This is the instrument that answers the question a count cannot:
+    /// **which** subject, through **which** argument shape. A count of 44 is
+    /// consistent both with "the gate misses 44 freed subjects" and with "44
+    /// subjects appear as the BASE of a projection whose field is what gets
+    /// freed", and those have opposite dispositions.
+    ///
+    /// No BO solve — subject collection needs the program and `MutFacts` only —
+    /// so this is affordable over the whole corpus without a second sweep. The
+    /// decision each subject received is joined **offline**, from the published
+    /// producer-A artifact, rather than re-derived here.
+    pub fn run_free_overlap(tcx: TyCtxt<'_>, t_tcx: Duration) -> Row {
+        let t0 = Instant::now();
+        let mut row = Row::default();
+        row.set("t_tcx_s", secs(t_tcx));
+        let o = crate::bo_rewriter::free_overlap(tcx);
+        if let Some(path) = std::env::var_os("CRAT_BOC1_FREE_OVERLAP_OUT") {
+            let mut text = String::new();
+            for h in &o.hits {
+                text.push_str(&format!(
+                    "{}\t{}\t{}\t{}\t{}\n",
+                    h.cause,
+                    h.fn_path,
+                    h.mir_local,
+                    u8::from(h.is_param),
+                    h.site
+                ));
+            }
+            std::fs::write(path, text).expect("write free-overlap dump");
+        }
+        row.set("free_overlap", o.hits.len());
+        row.set("free_unresolved_sites", o.sites);
         row.set("t_total_s", secs(t0.elapsed() + t_tcx));
         row.set("status", "ok");
         row
@@ -8706,6 +8769,143 @@ fn run_m1_emit_reports_its_counters_at_fixture_scale() {
     );
 }
 
+/// **The freed-slot corpus assertion.** Every binding the S2-2 census resolved
+/// as freed must carry `freed: true` in producer A's artifact.
+///
+/// # Why the join is against the CENSUS and not against the reason field
+///
+/// `decide_one` returns at the first failing test, so on today's corpus the
+/// `freed-slot` reason is empty — every freed subject is stopped earlier. A
+/// check written against the reason would therefore pass over an empty
+/// population and read as covered. This joins two independently produced
+/// artifacts instead: the census walks HIR for deallocator calls, the artifact
+/// serializes the decision table, and the column has to agree with the census on
+/// every row or the program fails.
+///
+/// The ruling asks for the **kind-`ref`** subset; this asserts over the whole
+/// resolved population, which contains it. A superset assertion cannot be
+/// satisfied by a subset that happens to be empty.
+///
+/// Returns one string per gap rather than asserting, so a run enumerates full
+/// incidence — the same contract as the reconciliation's own findings.
+#[cfg(test)]
+fn freed_attribution_gaps(
+    census: &str,
+    rows: &[crate::coverage_recon::schema::Row],
+) -> Vec<String> {
+    let by_key: std::collections::HashMap<(&str, u32), &crate::coverage_recon::schema::Row> =
+        rows.iter().map(|r| ((r.fn_path.as_str(), r.mir_local), r)).collect();
+    let mut gaps = Vec::new();
+    for line in census.lines().skip(1) {
+        let f: Vec<&str> = line.split('\t').collect();
+        // Only the rows the census RESOLVED to a subject. The unresolved and
+        // unmapped arms carry `-` in every key column and are the
+        // overlap check's business, not this one's.
+        if f.len() < 6 || f[5] != "subject" {
+            continue;
+        }
+        let Ok(local) = f[1].parse::<u32>() else {
+            gaps.push(format!("census subject row with unparseable mir_local: {line}"));
+            continue;
+        };
+        match by_key.get(&(f[0], local)) {
+            // Fail-closed: a census row with no artifact row is a missing
+            // measurement, never an absent finding.
+            None => gaps.push(format!(
+                "{}::_{local}: the freed census resolved this binding, and \
+                 producer A has no row for it",
+                f[0]
+            )),
+            Some(row) if row.freed != Some(true) => gaps.push(format!(
+                "{}::_{local} (kind={}, outcome={}): producer A says freed={:?} \
+                 for a binding the census resolved as freed",
+                f[0], f[3], f[4], row.freed
+            )),
+            Some(_) => {}
+        }
+    }
+    gaps
+}
+
+/// Census subject rows, and the kind-`ref` subset the ruling names.
+#[cfg(test)]
+fn freed_census_population(census: &str) -> (usize, usize) {
+    let mut subjects = 0;
+    let mut ref_model = 0;
+    for line in census.lines().skip(1) {
+        let f: Vec<&str> = line.split('\t').collect();
+        if f.len() < 6 || f[5] != "subject" {
+            continue;
+        }
+        subjects += 1;
+        if f[3] == "ref" {
+            ref_model += 1;
+        }
+    }
+    (subjects, ref_model)
+}
+
+/// **The freed-slot corpus checker is fail-closed**, over all three ways it can
+/// be wrong.
+///
+/// A gate written for a population that is currently EMPTY is exactly the shape
+/// this milestone has spent four rounds removing, so the checker is witnessed
+/// here against hand-built inputs rather than only exercised by a corpus run
+/// that happens to have nothing to report.
+///
+/// *Mutation-tested, Rider 0 order.* **Deletion first:** delete the
+/// `Some(row) if row.freed != Some(true)` arm — the false and absent cases stop
+/// being reported and this fails on both. Second: relax the guard to
+/// `row.freed.is_none()` — the `Some(false)` case passes and this fails on it.
+/// Third: drop the `None =>` arm — the missing-row case fails.
+#[test]
+fn the_freed_attribution_check_is_fail_closed() {
+    use crate::coverage_recon::schema::Outcome;
+    const HEADER: &str = "fn_path\tmir_local\tcast\tkind\toutcome\tresolution\tdetail\n";
+    let census = format!(
+        "{HEADER}k::f1\t1\t0\tref\tcall-site-not-adapted\tsubject\t\n\
+         -\t-\t-\t-\t-\tnon-local\tfield @ x.rs:1:1\n"
+    );
+
+    let mut good = counted_row(1, Outcome::Degraded, Some("call-site-not-adapted"));
+    good.freed = Some(true);
+    assert!(
+        freed_attribution_gaps(&census, std::slice::from_ref(&good)).is_empty(),
+        "the checker must accept a correctly attributed row, or the corpus \
+         sweep can never pass"
+    );
+
+    let mut wrong = good.clone();
+    wrong.freed = Some(false);
+    let gaps = freed_attribution_gaps(&census, std::slice::from_ref(&wrong));
+    assert_eq!(gaps.len(), 1, "a false attribution must be reported: {gaps:?}");
+    assert!(gaps[0].contains("Some(false)"), "the gap must name the value: {gaps:?}");
+
+    let mut absent = good.clone();
+    absent.freed = None;
+    assert_eq!(
+        freed_attribution_gaps(&census, std::slice::from_ref(&absent)).len(),
+        1,
+        "an ABSENT attribution must be reported, not read as unknown-therefore-fine"
+    );
+
+    assert_eq!(
+        freed_attribution_gaps(&census, &[]).len(),
+        1,
+        "a census row with no producer-A row is a missing measurement"
+    );
+
+    // The unresolved row must NOT be counted as a subject in either function —
+    // it carries `-` in every key column, and treating it as one would make the
+    // checker demand an artifact row for a binding that was never resolved.
+    assert_eq!(freed_census_population(&census), (1, 1));
+    assert_eq!(
+        freed_census_population(HEADER),
+        (0, 0),
+        "an empty census must report an empty population, not a parse artefact"
+    );
+}
+
 /// A producer-A-shaped row, for the counter witnesses.
 #[cfg(test)]
 fn counted_row(
@@ -8729,6 +8929,7 @@ fn counted_row(
         decl_shape: Some(DeclShape::RawPtr),
         outcome: Some(outcome),
         degrade_reason: reason.map(str::to_owned),
+        freed: Some(false),
     }
 }
 
@@ -9008,6 +9209,34 @@ fn m1_recon_corpus() {
                         "{}: {} artifact row(s) carry no outcome",
                         program.name, c.unclassified
                     ));
+                }
+                // The freed-slot co-attribution, joined against the census the
+                // worker just wrote — two independently derived artifacts, not
+                // the reason field checking itself.
+                let census_path = art.join(format!("{}.freed.tsv", program.name));
+                match fs::read_to_string(&census_path) {
+                    Ok(text) => {
+                        let (subjects, ref_model) = freed_census_population(&text);
+                        let gaps = freed_attribution_gaps(&text, &decoded);
+                        println!(
+                            "M1FREED program={} subjects={subjects} ref_model={ref_model} \
+                             gaps={}",
+                            program.name,
+                            gaps.len()
+                        );
+                        for gap in gaps {
+                            failures.push(format!("{}: {gap}", program.name));
+                        }
+                    }
+                    // Fail-closed with the worker's own verdict in the message:
+                    // an unreadable census is a missing check, and a silent skip
+                    // here would read exactly like a clean one.
+                    Err(why) => failures.push(format!(
+                        "{}: freed census unreadable ({}) — worker said freed_pass={}",
+                        program.name,
+                        report::sanitize(&why.to_string()),
+                        row.get("freed_pass").unwrap_or("missing")
+                    )),
                 }
                 totals.merge(&c);
                 counted += 1;
@@ -9451,6 +9680,7 @@ fn boc1_run_one() {
             "prod-box" => run::run_prod_box(tcx, t_tcx),
             "m1-census" => run::run_m1_census(tcx, t_tcx),
             "substrate-sanity" => run::run_substrate_sanity(tcx, t_tcx),
+            "free-overlap" => run::run_free_overlap(tcx, t_tcx),
             "m1-recon" => run::run_m1_recon(tcx, t_tcx),
             "selector-core" => run::run_selector_core(tcx, t_tcx),
             "selector-necessity" => run::run_selector_necessity(tcx, t_tcx),

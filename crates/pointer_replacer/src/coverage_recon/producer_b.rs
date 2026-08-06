@@ -93,6 +93,9 @@ pub(crate) fn rows(tcx: TyCtxt<'_>) -> Vec<Row> {
                 decl_shape: None,
                 outcome: None,
                 degrade_reason: None,
+                // Producer B is MIR-derived and has no deallocator
+                // recognizer: `null` is the honest value, not `false`.
+                freed: None,
             });
         }
 
@@ -168,6 +171,9 @@ pub(crate) fn rows(tcx: TyCtxt<'_>) -> Vec<Row> {
                 decl_shape: None,
                 outcome: None,
                 degrade_reason: None,
+                // Producer B is MIR-derived and has no deallocator
+                // recognizer: `null` is the honest value, not `false`.
+                freed: None,
             });
         }
     }

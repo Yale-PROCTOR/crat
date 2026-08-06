@@ -24,6 +24,7 @@ fn full_row() -> Row {
         decl_shape: Some(DeclShape::RawPtr),
         outcome: Some(Outcome::Degraded),
         degrade_reason: Some("kind-raw".to_owned()),
+        freed: Some(true),
     }
 }
 
@@ -44,6 +45,7 @@ fn bare_row(fn_path: &str, local: u32, name: Option<&str>, arg: Option<u32>, dep
         decl_shape: None,
         outcome: None,
         degrade_reason: None,
+        freed: None,
     }
 }
 
@@ -85,12 +87,18 @@ fn span_pair(
 /// RED-weakening: the structural half below still enumerates **every** field
 /// name, including the four new ones, so the explicit-null pin cannot be
 /// satisfied by omission.
+///
+/// **Golden updated again 2026-08-07**, on the same terms: the freed-slot gate
+/// adds the `freed` co-attribution column. Both halves are re-specified rather
+/// than relaxed — the fully-populated row now pins `"freed":true` and the bare
+/// row pins `"freed":null`, so producer B emitting a `false` it cannot derive
+/// would fail here.
 #[test]
 fn encoding_is_byte_exact_and_never_omits_a_field() {
     let full = encode(&[full_row()]);
     assert_eq!(
         full,
-        r#"{"fn_path":"m::f","mir_local":1,"param_name":"p","arg_index":1,"ptr_depth":1,"pairing_confidence":"high","decl_span":"<main.rs>:3:14: 3:22","decl_span_lo":50,"decl_span_hi":58,"binding_span_lo":null,"binding_span_hi":null,"decl_shape":"raw-ptr","outcome":"degraded","degrade_reason":"kind-raw"}
+        r#"{"fn_path":"m::f","mir_local":1,"param_name":"p","arg_index":1,"ptr_depth":1,"pairing_confidence":"high","decl_span":"<main.rs>:3:14: 3:22","decl_span_lo":50,"decl_span_hi":58,"binding_span_lo":null,"binding_span_hi":null,"decl_shape":"raw-ptr","outcome":"degraded","degrade_reason":"kind-raw","freed":true}
 "#,
         "fully-populated row encoding drifted"
     );
@@ -98,7 +106,7 @@ fn encoding_is_byte_exact_and_never_omits_a_field() {
     let bare = encode(&[bare_row("g", 2, None, None, 0)]);
     assert_eq!(
         bare,
-        r#"{"fn_path":"g","mir_local":2,"param_name":null,"arg_index":null,"ptr_depth":0,"pairing_confidence":"high","decl_span":null,"decl_span_lo":null,"decl_span_hi":null,"binding_span_lo":null,"binding_span_hi":null,"decl_shape":null,"outcome":null,"degrade_reason":null}
+        r#"{"fn_path":"g","mir_local":2,"param_name":null,"arg_index":null,"ptr_depth":0,"pairing_confidence":"high","decl_span":null,"decl_span_lo":null,"decl_span_hi":null,"binding_span_lo":null,"binding_span_hi":null,"decl_shape":null,"outcome":null,"degrade_reason":null,"freed":null}
 "#,
         "all-optionals-absent row encoding drifted"
     );
@@ -120,6 +128,7 @@ fn encoding_is_byte_exact_and_never_omits_a_field() {
         "decl_shape",
         "outcome",
         "degrade_reason",
+        "freed",
     ] {
         assert!(
             bare.contains(&format!("\"{field}\":")),

@@ -123,6 +123,12 @@ pub(crate) fn rows(tcx: TyCtxt<'_>, table: &DecisionTable) -> Vec<Row> {
                 decl_shape: Some(wire_shape(subject.decl_shape)),
                 outcome: Some(outcome),
                 degrade_reason,
+                // Co-attribution, from the subject's own stamped fact rather
+                // than from the reason field: `decide_one` returns at the FIRST
+                // failing test, so a reason-derived freed count would report the
+                // population as empty for exactly as long as something else
+                // happens to stop it first.
+                freed: Some(subject.freed_at.is_some()),
             }
         })
         .collect()
@@ -151,6 +157,7 @@ mod tests {
             pointee_span: Some(rustc_span::DUMMY_SP),
             decl_shape: DeclShape::RawPtr,
             mutable: true,
+            freed_at: None,
         }
     }
 
