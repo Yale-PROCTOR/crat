@@ -7,8 +7,8 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_hir::def_id::LocalDefId;
 use rustc_middle::{
     mir::{
-        self, BasicBlock, Body, CastKind, Local, Location, Operand, Place, ProjectionElem, Rvalue,
-        StatementKind, TerminatorKind,
+        self, AggregateKind, BasicBlock, Body, CastKind, Local, Location, Operand, Place,
+        ProjectionElem, Rvalue, StatementKind, TerminatorKind,
     },
     ty::{self, Ty, TyCtxt},
 };
@@ -242,6 +242,49 @@ impl<'tcx> Collector<'_, 'tcx> {
             Rvalue::Ref(_, _, place) => {
                 self.collect_raw_borrow_flow(*lhs, *place, dst.clone(), &dst_slots, location);
             }
+            Rvalue::Aggregate(kind, operands) => match kind.as_ref() {
+                AggregateKind::Array(_) => {
+                    // array elements share one slot range; every operand flows there
+                    for operand in operands {
+                        self.collect_composite_operand(operand, dst_slots.clone(), location);
+                    }
+                }
+                AggregateKind::Adt(..) | AggregateKind::Tuple => {
+                    // struct/tuple operands are in field order, so a running
+                    // slot offset maps each operand to its own field slots.
+                    // union and enum aggregates never get here: their types
+                    // contribute zero slots, so dst_slots is empty above.
+                    let mut offset = 0;
+                    for operand in operands {
+                        let width = count_slots(
+                            operand.ty(self.body, self.tcx),
+                            self.tcx,
+                            &mut FxHashSet::default(),
+                        );
+                        if width == 0 {
+                            continue;
+                        }
+                        let start = dst_slots.start + offset;
+                        let end = (start + width).min(dst_slots.end);
+                        self.collect_composite_operand(operand, start..end, location);
+                        offset += width;
+                    }
+                }
+                _ => {
+                    // RawPtr aggregates (closure/coroutine types have no slots);
+                    // conservative per-slot Unknown, matching what the old
+                    // catch-all did for raw-pointer rvalues
+                    for slot in dst_slots.clone() {
+                        self.graph.add_base_edge(
+                            BaseId::Unknown {
+                                location,
+                                reason: UnknownReason::UnsupportedProjection,
+                            },
+                            PfgNode::Slot(slot),
+                        );
+                    }
+                }
+            },
             _ => {
                 // only emit a conservative Unknown edge when the rvalue is itself
                 // a raw-pointer value we do not specifically handle.  Non-pointer
@@ -794,6 +837,37 @@ impl<'tcx> Collector<'_, 'tcx> {
                         reason: constant_pointer_reason(operand, self.tcx),
                     },
                     dst,
+                );
+            }
+        }
+    }
+
+    // links one aggregate/repeat operand into the destination slot range with
+    // the same head-unidirectional / tail-bidirectional pairing as Rvalue::Use;
+    // when the operand cannot be resolved to slots (constants, unsupported
+    // projections), the head gets its usual edge from collect_operand_flow and
+    // the nested pointer slots degrade to per-slot Unknown
+    fn collect_composite_operand(
+        &mut self,
+        operand: &Operand<'tcx>,
+        dst_slots: Range<SlotIdx>,
+        location: Location,
+    ) {
+        if dst_slots.is_empty() {
+            return;
+        }
+        let dst = PfgNode::Slot(dst_slots.start);
+        let resolvable =
+            operand_place(operand).is_some_and(|place| self.source_node(place).is_some());
+        self.collect_operand_flow(operand, dst, location);
+        if !resolvable {
+            for slot in dst_slots.skip(1) {
+                self.graph.add_base_edge(
+                    BaseId::Unknown {
+                        location,
+                        reason: UnknownReason::UnsupportedProjection,
+                    },
+                    PfgNode::Slot(slot),
                 );
             }
         }

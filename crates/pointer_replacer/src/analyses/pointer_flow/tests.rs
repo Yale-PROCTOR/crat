@@ -9,7 +9,7 @@ use super::{
         FieldAccess, FieldAccessKind, FieldAccessReject, FieldAccessRejectKind,
         field_accesses_reachable_from_param,
     },
-    graph::BaseId,
+    graph::{BaseId, PfgNode, UnknownReason},
     pointer_flow_analysis,
 };
 use crate::utils::rustc::RustProgram;
@@ -111,6 +111,24 @@ fn rejects_reaching_param(
         })
         .cloned()
         .collect()
+}
+
+fn return_node(result: &PointerFlowResult) -> PfgNode {
+    PfgNode::Slot(
+        result
+            .slot_table
+            .local_head_slot(Local::from_usize(0))
+            .expect("return place has no pointer slot"),
+    )
+}
+
+fn return_bases(result: &PointerFlowResult) -> FxHashSet<BaseId> {
+    result
+        .provenance
+        .reachable_bases
+        .get(&return_node(result))
+        .cloned()
+        .unwrap_or_default()
 }
 
 #[test]
@@ -835,4 +853,125 @@ pub unsafe fn chase(n: *mut Node) -> i32 {
     let summary = param_query(&result, 0);
     let fields: Vec<usize> = summary.fields.iter().map(|f| f.index()).collect();
     assert_eq!(fields, vec![1]); // only `next`
+}
+
+#[test]
+fn aggregate_field_conditionally_overwritten_is_multi_base() {
+    // the soundness bug: without an aggregate edge, the field slot sees only
+    // the conditional overwrite and unique_base wrongly returns q's base
+    let result = analyze_single(
+        r#"
+pub struct Holder {
+    pub ptr: *mut i32,
+    pub x: i32,
+}
+pub unsafe fn f(p: *mut i32, q: *mut i32, cond: bool) -> *mut i32 {
+    let mut c = Holder { ptr: p, x: 0 };
+    if cond {
+        c.ptr = q;
+    }
+    c.ptr
+}
+"#,
+        "f",
+    );
+    let bases = return_bases(&result);
+    assert!(
+        bases.contains(&param_base(&result, 0)),
+        "aggregate init flow missing: {bases:?}"
+    );
+    assert!(bases.contains(&param_base(&result, 1)));
+    assert_eq!(result.provenance.unique_base(&return_node(&result)), None);
+}
+
+#[test]
+fn aggregate_null_init_then_assign_has_unique_non_null_base() {
+    let result = analyze_single(
+        r#"
+pub struct Holder {
+    pub ptr: *mut i32,
+    pub x: i32,
+}
+pub unsafe fn f(p: *mut i32) -> *mut i32 {
+    let mut c = Holder { ptr: core::ptr::null_mut(), x: 0 };
+    c.ptr = p;
+    c.ptr
+}
+"#,
+        "f",
+    );
+    let bases = return_bases(&result);
+    assert!(
+        bases.iter().any(|b| matches!(
+            b,
+            BaseId::Unknown {
+                reason: UnknownReason::NullLike,
+                ..
+            }
+        )),
+        "NullLike from aggregate init should propagate: {bases:?}"
+    );
+    assert_eq!(
+        result.provenance.unique_non_null_base(&return_node(&result)),
+        Some(param_base(&result, 0))
+    );
+}
+
+#[test]
+fn array_literal_elements_reach_all_operand_bases() {
+    let result = analyze_single(
+        r#"
+pub unsafe fn f(p: *mut i32, q: *mut i32) -> *mut i32 {
+    let arr = [p, q];
+    arr[0]
+}
+"#,
+        "f",
+    );
+    let bases = return_bases(&result);
+    assert!(bases.contains(&param_base(&result, 0)));
+    assert!(bases.contains(&param_base(&result, 1)));
+}
+
+#[test]
+fn tuple_aggregate_maps_operands_to_distinct_fields() {
+    // precision check: the running slot offset must map each operand to its
+    // own field slot, not smear all operands over the whole range
+    let result = analyze_single(
+        r#"
+pub unsafe fn f(p: *mut i32, q: *mut i32) -> *mut i32 {
+    let t = (p, q);
+    t.1
+}
+"#,
+        "f",
+    );
+    assert_eq!(
+        result.provenance.unique_base(&return_node(&result)),
+        Some(param_base(&result, 1))
+    );
+}
+
+#[test]
+fn aggregate_links_nested_pointer_slots_bidirectionally() {
+    // tail-slot pairing: a write through the aggregate copy must be visible
+    // through the original pointer's pointee slot
+    let result = analyze_single(
+        r#"
+pub struct Inner {
+    pub q: *mut i32,
+}
+pub struct Outer {
+    pub inner_ptr: *mut Inner,
+    pub x: i32,
+}
+pub unsafe fn f(ip: *mut Inner, r: *mut i32) -> *mut i32 {
+    let o = Outer { inner_ptr: ip, x: 0 };
+    (*o.inner_ptr).q = r;
+    (*ip).q
+}
+"#,
+        "f",
+    );
+    assert!(return_bases(&result).contains(&param_base(&result, 1)));
 }
