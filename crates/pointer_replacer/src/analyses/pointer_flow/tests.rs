@@ -912,7 +912,9 @@ pub unsafe fn f(p: *mut i32) -> *mut i32 {
         "NullLike from aggregate init should propagate: {bases:?}"
     );
     assert_eq!(
-        result.provenance.unique_non_null_base(&return_node(&result)),
+        result
+            .provenance
+            .unique_non_null_base(&return_node(&result)),
         Some(param_base(&result, 0))
     );
 }
