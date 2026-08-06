@@ -22,6 +22,7 @@ serde.workspace = true
 # encoder cannot be test-only. Already a workspace dependency and already
 # compiled for this crate's test target, so the promotion costs nothing.
 serde_json.workspace = true
+sha2.workspace = true
 
 [dev-dependencies]
 similar = "2.7.0"

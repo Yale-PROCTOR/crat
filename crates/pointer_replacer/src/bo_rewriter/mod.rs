@@ -52,8 +52,8 @@ use crate::{
     analyses::borrow_ownership::{
         CrateCtxt, SlotKind, borrow_verify::verify_to_fixpoint, coherence::add_coherence,
         crate_slots::{CrateSlots, ptr_chain_depth},
-        emit_crate_ownership_constraints, export::with_bo_export, mutability_facts::MutFacts,
-        origins::compute_origins,
+        emit_crate_ownership_constraints, export::with_bo_export, model_cache,
+        mutability_facts::MutFacts, origins::compute_origins,
         solver::{KindSolver, SlotRef},
     },
     utils::rustc::RustProgram,
@@ -1633,6 +1633,14 @@ fn decide_table_perturbed<'tcx>(
     let mut_facts = MutFacts::from_program(&program);
 
     // Phase 1 input: the BO run, under an explicit capture scope.
+    //
+    // The cache is consulted FIRST and is fail-closed: `load` returns `None` on
+    // absence, corruption, fingerprint mismatch or an unresolvable key, and
+    // `None` can only be answered by solving. Dev iteration reads it; every
+    // gate sweep bypasses it and refreshes it.
+    if let Some(cached) = model_cache::load(tcx, &program, &slots) {
+        return finish_decide(tcx, program, slots, mut_facts, cached, perturb);
+    }
     let (model, _export) = with_bo_export(|| {
         let crate_ctxt = CrateCtxt::new(&program);
         let solver = KindSolver::new(&slots);
@@ -1653,7 +1661,27 @@ fn decide_table_perturbed<'tcx>(
     let Some(model) = model else {
         return Err("BO declined — no accepted model".to_owned());
     };
+    // Write-through on every real solve, so a bypassed gate sweep refreshes
+    // what dev iteration reads next.
+    model_cache::store(tcx, &program, &slots, &model);
 
+    finish_decide(tcx, program, slots, mut_facts, model, perturb)
+}
+
+/// The phases after the solve, shared by the cached and real-solve paths.
+///
+/// Extracted so the two paths cannot drift: everything downstream of the model
+/// runs from one body, and a cache hit differs from a real solve **only** in
+/// where the model came from. That is what makes the byte-identity acceptance
+/// meaningful rather than a coincidence.
+fn finish_decide<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    program: RustProgram<'tcx>,
+    slots: CrateSlots,
+    mut_facts: MutFacts,
+    model: rustc_hash::FxHashMap<SlotRef, SlotKind>,
+    perturb: impl FnOnce(&mut Vec<decision::Subject>),
+) -> Result<(decision::DecisionTable, DecideCtx), String> {
     let mut subjects = collect_subjects(tcx, &program, &mut_facts);
     // S3.1: the second universe. Appended rather than merged into
     // `collect_subjects` so the parameter census keeps measuring the parameter

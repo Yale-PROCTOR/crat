@@ -27,6 +27,12 @@ toml = "0.8.23"
 toml_edit = "0.22.27"
 lazy_static = "1.5.0"
 tracing = "0.1.41"
+# Added 2026-08-06 for the analysis-model cache fingerprint. The ruling
+# specifies SHA-256, the project already publishes SHA-256 manifests, and the
+# std hashers are explicitly NOT stable across toolchain releases — a cache key
+# that silently changes with the compiler would be safe (refuse -> recompute)
+# but useless.
+sha2 = "0.10"
 
 [dependencies]
 finders = { path = "crates/finders" }
