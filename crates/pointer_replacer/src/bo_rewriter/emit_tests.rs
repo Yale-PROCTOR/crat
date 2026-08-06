@@ -1562,9 +1562,11 @@ fn two_shadowing_locals_are_two_subjects() {
 /// **An unannotated pointer local degrades with its OWN reason**, and carries no
 /// `arg_index`.
 ///
-/// The dominant corpus shape: 2628 of 3142 locals are C2Rust bindings with no
-/// declared type. Routing them through the decl-shape arm would attribute them
-/// to a syntax they do not have, which is why `NoDeclaredType` is tested first.
+/// The dominant corpus shape: **1,196 of 1,710** locals on the substrate of
+/// record are C2Rust bindings with no declared type (raw-form era: 2,628 of
+/// 3,142 — `preprocess` removed the `fresh_N` temporaries, not the class).
+/// Routing them through the decl-shape arm would attribute them to a syntax
+/// they do not have, which is why `NoDeclaredType` is tested first.
 ///
 /// *Mutation-tested:* removing the `ty_span.is_none()` arm in `decide_one`
 /// re-routes this to `unsupported-decl-shape`.

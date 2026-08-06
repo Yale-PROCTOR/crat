@@ -1,0 +1,25 @@
+# substrate=benchmarks/rs-crown-derived
+# substrate_digest=db96829b5c2b0db28fb4bb9ddd3d32901b5d4e6e4134da07ada0d513d94eb4c6
+# source=re-derived for the 2026-08-06 substrate migration; plain Mode-A solve, 20/20 status=ok
+# supersedes=l2_rs_crown_base_ae6f334.csv (raw-form era; still reproducible under CRAT_BOC1_SUBSTRATE=raw)
+program,n_ref,n_ref_d0
+bst,14,14
+avl,14,14
+ht,76,72
+libcsv,300,282
+buffer,867,863
+quadtree,633,631
+urlparser,1227,1218
+robotfindskitten,399,309
+rgba,467,465
+genann,1542,1509
+libtree,1511,1374
+json.h,835,833
+binn,1757,1715
+libzahl,2118,2102
+lil,2986,2484
+heman,4309,4241
+bzip2,4889,4577
+lodepng,5627,5328
+tulipindicators,6195,5345
+brotli,14568,14345

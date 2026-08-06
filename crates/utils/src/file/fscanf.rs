@@ -736,9 +736,24 @@ fn harvest_corpus_format_literals() -> Vec<(String, String)> {
     out
 }
 
+/// The substrate of record, as of the 2026-08-06 migration.
+///
+/// F-1's safety claim belongs to the form the tool actually runs on, so this
+/// follows the corpus rather than the raw c2rust output. Re-measured on the
+/// derived tree: **211 harvested / 189 old-parser-accepted / 22 rejected**,
+/// differential passing, against the raw era's 213 / 190 / 23.
+///
+/// The −2 is not lost coverage. Both are `buffer` literals — `" - 0x%08X"` and
+/// `"%d %s"` — and both sit inside **commented-out** c2rust code. This
+/// harvester scans source text, so it collected them; the derived tree is
+/// regenerated from the AST and carries no comments. Neither was ever compiled,
+/// so neither was ever reachable at run time: the raw census was the over-count.
 #[cfg(test)]
 fn corpus_root() -> &'static std::path::Path {
-    std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../../benchmarks/rs-crown"))
+    std::path::Path::new(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../benchmarks/rs-crown-derived"
+    ))
 }
 
 /// **G1 — the differential.** Everything the old parser accepted parses

@@ -3896,8 +3896,13 @@ mod l2_red_gate {
 
     use super::{CorpusProgram, report::Row};
 
-    const BASE: &str =
-        include_str!("analyses/borrow_ownership/testdata/l2_rs_crown_base_ae6f334.csv");
+    /// **Re-derived 2026-08-06 on the substrate of record** (digest
+    /// `db96829b…4eb4c6`), by a plain Mode-A solve, 20/20 `status=ok`. The
+    /// raw-era fixture `l2_rs_crown_base_ae6f334.csv` is retained in the tree
+    /// and stays reproducible under `CRAT_BOC1_SUBSTRATE=raw`.
+    const BASE: &str = include_str!(
+        "analyses/borrow_ownership/testdata/l2_rs_crown_derived_base_db96829b.csv"
+    );
     const TARGETS: &str =
         include_str!("analyses/borrow_ownership/testdata/l2_rs_crown_targets.csv");
     pub const ENV: &str = "CRAT_BOC1_L2_RED_GATE";
@@ -3956,7 +3961,21 @@ mod l2_red_gate {
             .collect()
     }
 
+    /// The certified 26-slot recovery inventory.
+    ///
+    /// **RAW-ERA. Guarded.** The slot keys embed MIR local numbers
+    /// (`…::print_line::_11@d0`), which the substrate migration moves, so this
+    /// inventory does not survive the change of substrate verbatim. Its
+    /// re-derivation is DEFERRED to M1-close/evaluation by user ruling
+    /// (2026-08-07): its real consumer is evaluation-time numbers, and a
+    /// re-certification now would be voided by the analysis-lane merges anyway.
+    ///
+    /// The L2 RED **base** re-anchored to the derived substrate and stays live
+    /// as the official-metric regression guard; only the inventory is frozen in
+    /// the raw era. Reading it under the derived substrate fails loudly here,
+    /// at the single point every consumer passes through.
     pub fn targets() -> Vec<Target> {
+        super::assert_raw_era_substrate("the L2 certified 26-slot inventory");
         let mut lines = data_lines(TARGETS);
         assert_eq!(
             lines.next(),
@@ -4002,15 +4021,22 @@ mod l2_red_gate {
         );
         assert_eq!(
             bases.iter().map(|row| row.n_ref).sum::<usize>(),
-            52_810,
-            "L2 RED aggregate base n_ref drifted"
+            50_334,
+            "L2 RED aggregate base n_ref drifted (raw-form era: 52,810)"
         );
         assert_eq!(
             bases.iter().map(|row| row.n_ref_d0).sum::<usize>(),
-            49_459,
-            "L2 RED aggregate base n_ref_d0 drifted"
+            47_721,
+            "L2 RED aggregate base n_ref_d0 drifted (raw-form era: 49,459)"
         );
 
+        // The BASE is re-anchored and checked unconditionally above. The
+        // INVENTORY is raw-era and deferred, so it is only checked where it can
+        // still mean something: `targets()` itself refuses under the derived
+        // substrate, so this returns early rather than failing the base gate.
+        if super::substrate_dir() != "benchmarks/rs-crown" {
+            return;
+        }
         let targets = targets();
         assert_eq!(
             targets.len(),
@@ -4204,7 +4230,10 @@ mod l2_red_gate {
             .iter()
             .map(|row| usize_field(row, "l2_base_n_ref"))
             .sum::<usize>();
-        assert_eq!(base_n_ref, 52_810, "L2 RED aggregate base n_ref drifted");
+        assert_eq!(
+            base_n_ref, 50_334,
+            "L2 RED aggregate base n_ref drifted (raw-form era: 52,810)"
+        );
         assert!(
             actual_n_ref >= base_n_ref,
             "L2 RED violates the corpus-wide n_ref non-regression gate: \
@@ -8465,9 +8494,11 @@ fn expected_zero_aggregate(row: &report::Row, class: &str) -> Result<(), String>
 /// **Ruling F — the per-program expected-N table for non-evaluable LOCALS.**
 ///
 /// Parameters keep expected-ZERO (`expected_zero_aggregate`, Track 2's
-/// calibration, untouched). Locals cannot: 2628 of 3142 corpus locals are
-/// unannotated C2Rust bindings with no declared type, so producer A has no
-/// splice target to offer and the evaluable conjunction cannot be satisfied.
+/// calibration, untouched). Locals cannot: **1,196 of 1,710** corpus locals on
+/// the substrate of record are unannotated C2Rust bindings with no declared
+/// type (raw-form era: 2,628 of 3,142), so producer A has no splice target to
+/// offer and the evaluable conjunction cannot be satisfied. The shape still
+/// dominates; `preprocess` removed the `fresh_N` temporaries, not the class.
 ///
 /// **A fixed table rather than "nonzero is fine", because it catches BOTH
 /// regression directions.** A DROP means spans appeared where none should exist
@@ -8475,31 +8506,46 @@ fn expected_zero_aggregate(row: &report::Row, class: &str) -> Result<(), String>
 /// means annotation detection broke and real declarations stopped resolving.
 /// "Some number ≥ 0" would catch neither.
 ///
-/// Measured by the E′ probe at code `75a2d8fe` (2026-08-05, digest
-/// `9fc912af…0e621`), and cross-checked against an independent offline analyzer
-/// that agreed exactly. **Values change only by ruling, and only re-measured.**
+/// **Re-pinned 2026-08-06 for the substrate migration** against the derived
+/// tree (digest `db96829b…4eb4c6`), measured by the corpus sweep at code
+/// `90616705`. Every value fell, on all 20 programs, from ONE cause: these rows
+/// are locals with no declared type, so they have no declaration span; the
+/// c2rust `let ref mut fresh_N` temporaries that supplied them are eliminated
+/// by `preprocess`. The universe shrank 7,448 → 6,015 (−1,433) against a
+/// `no-declared-type` fall of −1,432 — off by one — which is the same
+/// population seen from the decision side.
+///
+/// The RAW-era values, measured by the E′ probe at code `75a2d8fe`
+/// (2026-08-05, digest `9fc912af…0e621`) and cross-checked against an
+/// independent offline analyzer that agreed exactly, were: avl 16, binn 132,
+/// brotli 800, bst 12, buffer 40, bzip2 15, genann 61, heman 378, ht 12,
+/// json.h 228, libcsv 25, libtree 59, libzahl 67, lil 303, lodepng 248,
+/// quadtree 40, rgba 7, robotfindskitten 1, tulipindicators 115, urlparser 69.
+/// They remain reproducible under `CRAT_BOC1_SUBSTRATE=raw`.
+///
+/// **Values change only by ruling, and only re-measured.**
 #[cfg(test)]
 const EXPECTED_NOT_EVALUABLE_LOCAL: &[(&str, u64)] = &[
-    ("avl", 16),
-    ("binn", 132),
-    ("brotli", 800),
-    ("bst", 12),
-    ("buffer", 40),
-    ("bzip2", 15),
-    ("genann", 61),
-    ("heman", 378),
-    ("ht", 12),
-    ("json.h", 228),
-    ("libcsv", 25),
-    ("libtree", 59),
-    ("libzahl", 67),
-    ("lil", 303),
-    ("lodepng", 248),
-    ("quadtree", 40),
-    ("rgba", 7),
-    ("robotfindskitten", 1),
-    ("tulipindicators", 115),
-    ("urlparser", 69),
+    ("avl", 5),
+    ("binn", 73),
+    ("brotli", 335),
+    ("bst", 4),
+    ("buffer", 30),
+    ("bzip2", 0),
+    ("genann", 31),
+    ("heman", 251),
+    ("ht", 3),
+    ("json.h", 59),
+    ("libcsv", 5),
+    ("libtree", 34),
+    ("libzahl", 9),
+    ("lil", 178),
+    ("lodepng", 91),
+    ("quadtree", 17),
+    ("rgba", 0),
+    ("robotfindskitten", 0),
+    ("tulipindicators", 15),
+    ("urlparser", 56),
 ];
 
 /// The locals aggregate against its per-program expectation.
@@ -8539,8 +8585,20 @@ fn the_local_not_evaluable_pin_is_fail_closed() {
             .expect_err("a missing aggregate must fail")
             .contains("missing"),
     );
+    // The witness READS the pin rather than restating it. It used to hard-code
+    // bst's raw-era 12, so the 2026-08-06 re-pin left the table saying 4 and its
+    // own witness still asserting 12 — a half-applied re-pin that the suite
+    // caught only because the exact-match arm then failed. Sourced from the
+    // table, this arm cannot drift from it again.
+    let want = EXPECTED_NOT_EVALUABLE_LOCAL
+        .iter()
+        .find(|(name, _)| *name == "bst")
+        .map(|(_, n)| *n)
+        .expect("bst is pinned");
+    assert!(want > 0, "this witness needs a nonzero pin to test both directions");
+
     // Unpinned program.
-    row.set("agg_span_check_not_evaluable_local", "12");
+    row.set("agg_span_check_not_evaluable_local", want.to_string());
     assert!(
         expected_not_evaluable_local(&row, "not-a-program")
             .expect_err("an unpinned program must fail")
@@ -8548,9 +8606,9 @@ fn the_local_not_evaluable_pin_is_fail_closed() {
     );
     // Exact match passes; either direction fails.
     assert!(expected_not_evaluable_local(&row, "bst").is_ok());
-    row.set("agg_span_check_not_evaluable_local", "11");
+    row.set("agg_span_check_not_evaluable_local", (want - 1).to_string());
     assert!(expected_not_evaluable_local(&row, "bst").is_err(), "a DROP must fail");
-    row.set("agg_span_check_not_evaluable_local", "13");
+    row.set("agg_span_check_not_evaluable_local", (want + 1).to_string());
     assert!(expected_not_evaluable_local(&row, "bst").is_err(), "a RISE must fail");
 }
 
@@ -9456,19 +9514,30 @@ struct CorpusProgram {
 
 /// The substrate directory M1 measures on, selected by `CRAT_BOC1_SUBSTRATE`.
 ///
-/// - `raw` (the default) — `benchmarks/rs-crown`, the c2rust output as shipped.
-/// - `derived` — `benchmarks/rs-crown-derived`, the same 20 programs after
+/// - `derived` (**the default, and the substrate of record**) —
+///   `benchmarks/rs-crown-derived`: the 20 programs after
 ///   `expand → extern → preprocess`, produced by
-///   `docs/agents/tools/derive_substrate.py`.
+///   `docs/agents/tools/derive_substrate.py`, digest
+///   `db96829b5c2b0db28fb4bb9ddd3d32901b5d4e6e4134da07ada0d513d94eb4c6`.
+/// - `raw` — `benchmarks/rs-crown`, the c2rust output as shipped. Retained so
+///   the raw era stays reproducible; **not** what M1 reports.
+///
+/// The default flipped with the 2026-08-06 substrate migration. The tool's real
+/// input is the post-pre-pass form, so measuring the raw form measures a
+/// configuration nobody runs — and one the analysis sees *less* of: on raw,
+/// c2rust's per-module `extern "C"` blocks put intra-crate function references
+/// behind foreign `DefId`s, so A1's `referenced` set under-fires and 291
+/// parameters were decided `Ref` while the crate held fn-pointer casts of their
+/// functions. See `docs/agents/2026-08-06-substrate-of-record.md`.
 ///
 /// **One place.** Thirteen call sites reach the corpus, all through
 /// `input_path`, so the substrate is chosen here and nowhere else; a second
 /// notion of "which tree is this" would eventually disagree with this one and
 /// the disagreement would surface as numbers measured on a mixture.
 ///
-/// An unrecognized value is a hard error rather than a fallback to `raw`: a
-/// typo that silently measured the old substrate is exactly the failure this
-/// selector exists to prevent.
+/// An unrecognized value is a hard error rather than a fallback: a typo that
+/// silently measured the other substrate is exactly the failure this selector
+/// exists to prevent.
 pub(crate) fn substrate_dir() -> &'static str {
     substrate_dir_of(std::env::var("CRAT_BOC1_SUBSTRATE").ok().as_deref())
 }
@@ -9480,13 +9549,40 @@ pub(crate) fn substrate_dir() -> &'static str {
 /// this variable would be mutating it for every concurrently running test.
 pub(crate) fn substrate_dir_of(setting: Option<&str>) -> &'static str {
     match setting {
-        None | Some("raw") => "benchmarks/rs-crown",
-        Some("derived") => "benchmarks/rs-crown-derived",
+        None | Some("derived") => "benchmarks/rs-crown-derived",
+        Some("raw") => "benchmarks/rs-crown",
         other => panic!(
             "CRAT_BOC1_SUBSTRATE must be `raw` or `derived`, got {other:?}; \
-             an unrecognized value is never silently treated as `raw`"
+             an unrecognized value is never silently treated as either"
         ),
     }
+}
+
+/// Guard for sweeps whose expectations are still **raw-form era** constants.
+///
+/// The 2026-08-06 substrate migration re-derived what it measured — the L2 RED
+/// base, the recon population pins, the emit counters. It did **not** re-run
+/// the CROWN-projection, pairwise-family-removal, ownership-diagnostic or
+/// selector sweeps, whose pinned totals (`n_ref = 52,810`, `n_own = 230`,
+/// `sources_leaked_sel = 114`, …) were all measured on the raw tree.
+///
+/// Those constants are not wrong; they are *raw-era*. Left unguarded, running
+/// one of these sweeps under the new default would compare derived numbers
+/// against raw pins and report a drift that is really a substrate mismatch.
+/// This turns that into an immediate, explanatory stop.
+///
+/// **This is a stated scope boundary, not a silent cap:** re-pinning these
+/// needs the sweeps re-run, which is a separate commission.
+#[cfg(test)]
+fn assert_raw_era_substrate(sweep: &str) {
+    assert_eq!(
+        substrate_dir(),
+        "benchmarks/rs-crown",
+        "{sweep} carries RAW-FORM ERA expectations and must run with \
+         CRAT_BOC1_SUBSTRATE=raw. Its totals were measured before the \
+         2026-08-06 substrate migration and have not been re-derived on the \
+         derived tree; see docs/agents/2026-08-06-substrate-of-record.md."
+    );
 }
 
 impl CorpusProgram {
@@ -9636,17 +9732,19 @@ const PAIRWISE_EXPECTED_JOINT_BY_PROGRAM: [(&str, usize); 20] = [
 /// under the new substrate's name, and nothing downstream could tell.
 #[test]
 fn the_substrate_selector_names_both_trees_and_refuses_to_guess() {
-    assert_eq!(substrate_dir_of(None), "benchmarks/rs-crown");
-    assert_eq!(substrate_dir_of(Some("raw")), "benchmarks/rs-crown");
+    // The DEFAULT is the substrate of record. This assertion is the migration:
+    // an unset variable must reach the derived tree, not the raw one.
+    assert_eq!(substrate_dir_of(None), "benchmarks/rs-crown-derived");
     assert_eq!(
         substrate_dir_of(Some("derived")),
         "benchmarks/rs-crown-derived"
     );
+    assert_eq!(substrate_dir_of(Some("raw")), "benchmarks/rs-crown");
 
     for bad in ["", "Derived", "rs-crown-derived", "1"] {
         let refused =
             std::panic::catch_unwind(|| substrate_dir_of(Some(bad))).is_err();
-        assert!(refused, "{bad:?} must be refused, never read as `raw`");
+        assert!(refused, "{bad:?} must be refused, never guessed");
     }
 }
 
@@ -10204,6 +10302,8 @@ mod orchestrate {
 fn boc1_crown_projection_corpus() {
     use std::{fs, path::PathBuf, time::Duration};
 
+    assert_raw_era_substrate("boc1_crown_projection_corpus");
+
     use crown_projection::{
         load_official_program, parse_legacy_decisions, project_legacy_for_universe,
         write_legacy_snapshot,
@@ -10390,6 +10490,8 @@ fn boc1_crown_projection_corpus() {
 #[ignore = "combine completed Mode-A/L2 projection sweeps into the three review CSVs"]
 fn boc1_crown_projection_combine() {
     use std::{collections::BTreeMap, fs, path::PathBuf};
+
+    assert_raw_era_substrate("boc1_crown_projection_combine");
 
     use crown_projection::{
         BO_FULL_SCOPE_CSV_HEADER, BoFullScopeCounts, CROWN_LABEL, CrownRealizedKind,
@@ -12304,6 +12406,7 @@ fn boc1_corpus() {
     }
 
     if pairwise_probe {
+        assert_raw_era_substrate("pairwise_probe");
         let parse_total = |key: &str| {
             merged
                 .iter()
@@ -12761,6 +12864,7 @@ fn boc1_corpus() {
     }
 
     if selector_leak_diag {
+        assert_raw_era_substrate("selector_leak_diag");
         let parse_total = |key: &str| {
             merged
                 .iter()
@@ -13149,6 +13253,7 @@ fn boc1_corpus() {
     }
 
     if diagnostic_package {
+        assert_raw_era_substrate("diagnostic_package");
         let parse_total = |key: &str| {
             merged
                 .iter()
