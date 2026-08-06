@@ -41,6 +41,9 @@ use self::ownership_diagnostic_package::{
 };
 use crate::{analyses::borrow_ownership::solver::CORE_LABEL_FAMILIES, utils::rustc::RustProgram};
 
+#[path = "a5_measurement.rs"]
+mod a5_measurement;
+
 /// Copy of tests.rs `borrow_ownership_coherence::collect_program` (kept local so
 /// tests.rs stays untouched): every top-level fn/struct item, in HIR owner order.
 fn collect_program(tcx: TyCtxt<'_>) -> RustProgram<'_> {
