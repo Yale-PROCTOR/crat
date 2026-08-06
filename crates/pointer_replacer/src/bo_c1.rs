@@ -7065,6 +7065,21 @@ mod run {
             Err(why) => row.set("facts_join", super::report::sanitize(&why)),
         }
 
+        // S2-2 — the freed-slot census, its own pass (R2), caught (R3).
+        let freed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            crate::bo_rewriter::freed_slots_tsv(tcx)
+        }));
+        match freed {
+            Ok(Ok(tsv)) => {
+                let path = dir.join(format!("{name}.freed.tsv"));
+                std::fs::write(&path, tsv)
+                    .unwrap_or_else(|e| panic!("write freed census {}: {e}", path.display()));
+                row.set("freed_pass", "ok");
+            }
+            Ok(Err(why)) => row.set("freed_pass", super::report::sanitize(&why)),
+            Err(_) => row.set("freed_pass", "panicked"),
+        }
+
         // R2 — the fatness pass is SEPARATE, and its failure is caught here.
         // When fatness rode inside the facts join, one program's panic took the
         // whole invariant sweep with it. `catch_unwind` because the failure mode

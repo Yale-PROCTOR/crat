@@ -1807,6 +1807,168 @@ pub(crate) fn facts_join_tsv(tcx: TyCtxt<'_>) -> Result<String, String> {
     Ok(out)
 }
 
+/// **S2-2 — the freed-slot kind census.**
+///
+/// A leaked free's value kind is *observed, not designed* (backlog S2-2,
+/// 2026-07-04): a leaked free can in principle settle `Ref`, and a freed-`Ref`
+/// consumed by codegen is a reference to freed memory. The sink-slot collector
+/// the item asked for was never built and **no `freed_ref` count has ever been
+/// taken**. This takes it.
+///
+/// Reuses [`decide_table_with_ctx`] so no extra BO solve runs (R1), and is its
+/// own pass so a failure here voids nothing else (R2).
+///
+/// # Why the argument shape is read at HIR
+///
+/// The cast arm — `free(p as *mut c_void)` versus `free(p)` on an already-`*mut
+/// c_void` local — is a **syntactic** question, and only HIR answers it. It
+/// matters because the cast is what A1 degrades on, which is the incidental
+/// mitigation the reconciliation refused to treat as a discharge.
+///
+/// # No silent caps
+///
+/// An argument that does not resolve to a subject — `free((*s).field)`,
+/// `free(arr[i])`, `free(f())` — is recorded with its cause, never dropped.
+/// **An unresolved argument is not evidence of absence**, and a census that
+/// counted only the easy shapes would under-report in exactly the direction
+/// that makes the gate look discharged.
+#[allow(
+    dead_code,
+    reason = "S2-2 measurement pass; consumed by the corpus worker behind the \
+              artifact dir. Not part of the pipeline."
+)]
+pub(crate) fn freed_slots_tsv(tcx: TyCtxt<'_>) -> Result<String, String> {
+    use rustc_hir::intravisit::Visitor;
+
+    const DEALLOCATORS: &[&str] = &["free", "xfree", "cfree", "g_free"];
+
+    struct FreeSites {
+        /// `(hir_id_of_resolved_local, had_cast)` and the unresolved tally.
+        resolved: Vec<(rustc_hir::HirId, bool)>,
+        unresolved: Vec<(&'static str, String)>,
+    }
+    struct V<'a, 'tcx> {
+        tcx: TyCtxt<'tcx>,
+        out: &'a mut FreeSites,
+    }
+    impl<'tcx> Visitor<'tcx> for V<'_, 'tcx> {
+        fn visit_expr(&mut self, e: &'tcx rustc_hir::Expr<'tcx>) {
+            if let rustc_hir::ExprKind::Call(callee, args) = &e.kind
+                && let rustc_hir::ExprKind::Path(rustc_hir::QPath::Resolved(_, p)) = &callee.kind
+                && let Some(seg) = p.segments.last()
+                && DEALLOCATORS.contains(&seg.ident.name.to_string().as_str())
+                && let Some(arg) = args.first()
+            {
+                let mut inner = arg;
+                let mut cast = false;
+                while let rustc_hir::ExprKind::Cast(i, _) = &inner.kind {
+                    cast = true;
+                    inner = i;
+                }
+                match &inner.kind {
+                    rustc_hir::ExprKind::Path(rustc_hir::QPath::Resolved(_, path)) => {
+                        if let rustc_hir::def::Res::Local(hid) = path.res {
+                            self.out.resolved.push((hid, cast));
+                        } else {
+                            self.out.unresolved.push((
+                                "non-local-path",
+                                self.tcx.sess.source_map().span_to_diagnostic_string(e.span),
+                            ));
+                        }
+                    }
+                    rustc_hir::ExprKind::Field(..) => self.out.unresolved.push((
+                        "field",
+                        self.tcx.sess.source_map().span_to_diagnostic_string(e.span),
+                    )),
+                    rustc_hir::ExprKind::Index(..) => self.out.unresolved.push((
+                        "index",
+                        self.tcx.sess.source_map().span_to_diagnostic_string(e.span),
+                    )),
+                    _ => self.out.unresolved.push((
+                        "other",
+                        self.tcx.sess.source_map().span_to_diagnostic_string(e.span),
+                    )),
+                }
+            }
+            rustc_hir::intravisit::walk_expr(self, e);
+        }
+    }
+
+    let (table, ctx) = decide_table_with_ctx(tcx)?;
+    let program = collect_program(tcx);
+
+    let mut sites = FreeSites { resolved: Vec::new(), unresolved: Vec::new() };
+    for &fn_did in &program.functions {
+        let Some(body_id) = tcx.hir_node_by_def_id(fn_did).body_id() else { continue };
+        let mut v = V { tcx, out: &mut sites };
+        v.visit_body(tcx.hir_body(body_id));
+    }
+
+    // Subjects indexed by their HIR binding — the same key A1 uses.
+    let by_hir: rustc_hash::FxHashMap<_, _> = table
+        .entries
+        .iter()
+        .map(|(s, _)| ((s.fn_did, s.hir_id), s))
+        .collect();
+
+    // The DECISION for each subject, keyed as the artifact keys it. S2-2's
+    // hazard is a freed-`Ref` **consumed by codegen**, and the settled kind
+    // alone does not say that: a subject can settle `Ref` in the model and
+    // still be degraded at decision time (A1's as-cast arm, for one). Without
+    // this column the census would answer a question adjacent to the gate's.
+    let decision_of: rustc_hash::FxHashMap<_, _> = table
+        .entries
+        .iter()
+        .map(|(s, d)| {
+            (
+                (s.fn_did, s.local),
+                match d {
+                    decision::Decision::Ref { .. } => "emitted-ref".to_owned(),
+                    decision::Decision::Degraded(r) => r.reason.key().to_owned(),
+                },
+            )
+        })
+        .collect();
+
+    let mut out =
+        String::from("fn_path\tmir_local\tcast\tkind\toutcome\tresolution\tdetail\n");
+    for (hid, cast) in &sites.resolved {
+        let owner = hid.owner.def_id;
+        let Some(s) = by_hir.get(&(owner, *hid)) else {
+            out.push_str(&format!(
+                "-\t-\t{}\t-\t-\tunmapped\tno subject for the binding\n",
+                u8::from(*cast)
+            ));
+            continue;
+        };
+        let kind = ctx
+            .slots
+            .fn_local_slots
+            .get(&s.fn_did)
+            .and_then(|u| u.slot_for_local_depth(s.local, 0))
+            .and_then(|id| ctx.model.get(&SlotRef::Local(s.fn_did, id)))
+            .map(|k| match k {
+                SlotKind::Ref => "ref",
+                SlotKind::Raw => "raw",
+                SlotKind::Owning => "owning",
+            })
+            .unwrap_or("-");
+        let outcome = decision_of
+            .get(&(s.fn_did, s.local))
+            .map_or("-", String::as_str);
+        out.push_str(&format!(
+            "{}\t{}\t{}\t{kind}\t{outcome}\tsubject\t\n",
+            tcx.def_path_str(s.fn_did.to_def_id()),
+            s.local.as_u32(),
+            u8::from(*cast),
+        ));
+    }
+    for (cause, site) in &sites.unresolved {
+        out.push_str(&format!("-\t-\t-\t-\t-\tnon-local\t{cause} @ {site}\n"));
+    }
+    Ok(out)
+}
+
 /// **R2 — the fatness measurement, as its OWN pass.**
 ///
 /// Split out for a reason measured the hard way: when fatness rode inside the
