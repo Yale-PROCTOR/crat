@@ -62,6 +62,9 @@ struct LocalFacts {
     unique: Option<BaseId>,
     unique_non_null: Option<BaseId>,
     admissibility: Option<BaseAdmissibility>,
+    // admissibility of the unique non-null base; mirrors production group
+    // selection, which pairs unique_non_null_base with admissibility_of_base
+    admissibility_non_null: Option<BaseAdmissibility>,
 }
 
 fn run_analysis(code: &str) -> FxHashMap<(String, String), LocalFacts> {
@@ -106,6 +109,9 @@ fn run_analysis(code: &str) -> FxHashMap<(String, String), LocalFacts> {
                 let admissibility = unique
                     .as_ref()
                     .map(|base| result.admissibility_of_base(base));
+                let admissibility_non_null = unique_non_null
+                    .as_ref()
+                    .map(|base| result.admissibility_of_base(base));
                 facts.insert(
                     (fn_name.clone(), var_name.clone()),
                     LocalFacts {
@@ -113,6 +119,7 @@ fn run_analysis(code: &str) -> FxHashMap<(String, String), LocalFacts> {
                         unique,
                         unique_non_null,
                         admissibility,
+                        admissibility_non_null,
                     },
                 );
             }
@@ -168,6 +175,9 @@ fn run_interprocedural_analysis(code: &str) -> FxHashMap<(String, String), Local
                 let admissibility = unique
                     .as_ref()
                     .map(|base| result.admissibility_of_base(base));
+                let admissibility_non_null = unique_non_null
+                    .as_ref()
+                    .map(|base| result.admissibility_of_base(base));
                 facts.insert(
                     (fn_name.clone(), var_name.clone()),
                     LocalFacts {
@@ -175,6 +185,7 @@ fn run_interprocedural_analysis(code: &str) -> FxHashMap<(String, String), Local
                         unique,
                         unique_non_null,
                         admissibility,
+                        admissibility_non_null,
                     },
                 );
             }
@@ -330,6 +341,21 @@ fn assert_unique_param(fact: &LocalFacts) {
     );
     assert_eq!(
         fact.admissibility,
+        Some(BaseAdmissibility::DirectlyRewriteable)
+    );
+}
+
+// like assert_unique_param, but for locals whose slot also carries a NullLike
+// base from a null-initializing aggregate (struct literal / [null_mut(); N]):
+// production group selection uses unique_non_null_base, so the param base must
+// be unique modulo null-transparency
+fn assert_unique_param_modulo_null(fact: &LocalFacts) {
+    assert!(
+        matches!(fact.unique_non_null, Some(BaseId::Param { .. })),
+        "expected unique non-null param base, got {fact:#?}"
+    );
+    assert_eq!(
+        fact.admissibility_non_null,
         Some(BaseAdmissibility::DirectlyRewriteable)
     );
 }
@@ -1226,11 +1252,9 @@ fn array_local_provenance_simple_field_store_and_load_preserves_base() {
     );
 
     let q = facts(&map, "f", "q");
-    assert!(matches!(q.unique, Some(BaseId::Param { .. })));
-    assert_eq!(
-        q.admissibility,
-        Some(BaseAdmissibility::DirectlyRewriteable)
-    );
+    // the aggregate null-init contributes a NullLike base; param provenance is
+    // unique modulo null-transparency
+    assert_unique_param_modulo_null(q);
 }
 
 #[test]
@@ -1255,9 +1279,10 @@ fn array_local_provenance_field_slots_are_per_local() {
 
     let q = facts(&map, "f", "q");
     let t = facts(&map, "f", "t");
-    assert_unique_param(q);
-    assert_unique_param(t);
-    assert_ne!(q.unique, t.unique);
+    // aggregate null-inits contribute NullLike bases; compare modulo null
+    assert_unique_param_modulo_null(q);
+    assert_unique_param_modulo_null(t);
+    assert_ne!(q.unique_non_null, t.unique_non_null);
 }
 
 #[test]
@@ -1273,7 +1298,9 @@ fn array_local_provenance_array_index_slots_are_collapsed() {
         "#,
     );
 
-    assert_unique_param(facts(&map, "f", "q"));
+    // the [null_mut(); 2] repeat contributes a NullLike base to the shared
+    // element slot; param provenance is unique modulo null-transparency
+    assert_unique_param_modulo_null(facts(&map, "f", "q"));
 }
 
 #[test]
@@ -1316,11 +1343,9 @@ fn array_local_provenance_raw_address_load_reads_pointer_field() {
     );
 
     let q = facts(&map, "f", "q");
-    assert!(matches!(q.unique, Some(BaseId::Param { .. })));
-    assert_eq!(
-        q.admissibility,
-        Some(BaseAdmissibility::DirectlyRewriteable)
-    );
+    // the aggregate null-init contributes a NullLike base; param provenance is
+    // unique modulo null-transparency
+    assert_unique_param_modulo_null(q);
 }
 
 #[test]
@@ -1342,11 +1367,9 @@ fn array_local_provenance_raw_address_store_updates_pointer_field() {
     );
 
     let q = facts(&map, "f", "q");
-    assert!(matches!(q.unique, Some(BaseId::Param { .. })));
-    assert_eq!(
-        q.admissibility,
-        Some(BaseAdmissibility::DirectlyRewriteable)
-    );
+    // the aggregate null-init contributes a NullLike base; param provenance is
+    // unique modulo null-transparency
+    assert_unique_param_modulo_null(q);
 }
 
 #[test]
@@ -1369,11 +1392,9 @@ fn array_local_provenance_copied_raw_address_preserves_pointee_slot() {
     );
 
     let q = facts(&map, "f", "q");
-    assert!(matches!(q.unique, Some(BaseId::Param { .. })));
-    assert_eq!(
-        q.admissibility,
-        Some(BaseAdmissibility::DirectlyRewriteable)
-    );
+    // the aggregate null-init contributes a NullLike base; param provenance is
+    // unique modulo null-transparency
+    assert_unique_param_modulo_null(q);
 }
 
 #[test]
@@ -1426,11 +1447,25 @@ fn array_local_provenance_call_invalidates_pointer_fields_through_struct_pointer
     );
 
     let q = facts(&map, "f", "q");
+    // the aggregate edge keeps the original Param flow visible, so the call's
+    // invalidation manifests as multi-base (Param + UnsupportedMemoryLoad)
+    // rather than a lone Unknown; either way no unique base survives and the
+    // field stays non-rewritable
     assert!(
-        matches!(q.unique, Some(BaseId::Unknown { .. })),
+        q.bases.iter().any(|b| matches!(
+            b,
+            BaseId::Unknown {
+                reason: UnknownReason::UnsupportedMemoryLoad,
+                ..
+            }
+        )),
         "call invalidation should mark the field unknown: {q:#?}"
     );
-    assert_eq!(q.admissibility, Some(BaseAdmissibility::Reject));
+    assert!(q.unique.is_none(), "no unique base may survive: {q:#?}");
+    assert!(
+        q.unique_non_null.is_none(),
+        "no unique non-null base may survive: {q:#?}"
+    );
 }
 
 #[test]
@@ -1907,31 +1942,32 @@ fn array_local_provenance_use_rvalue_struct_copy_pairs_all_pointer_slots() {
     let q = facts(&map, "f", "q");
     let r = facts(&map, "f", "r");
 
-    // head slot (a): provenance should flow from p1 via the unidirectional edge
+    // head slot (a): provenance should flow from p1 via the unidirectional
+    // edge; the aggregate null-init adds a NullLike base, so compare modulo null
     assert!(
-        matches!(q.unique, Some(BaseId::Param { .. })),
+        matches!(q.unique_non_null, Some(BaseId::Param { .. })),
         "s2.a should carry p1's Param base after struct copy: {q:#?}"
     );
     assert_eq!(
-        q.admissibility,
+        q.admissibility_non_null,
         Some(BaseAdmissibility::DirectlyRewriteable),
         "p1's base must be DirectlyRewriteable: {q:#?}"
     );
 
     // tail slot (b): provenance should flow from p2 via the bidirectional edge
     assert!(
-        matches!(r.unique, Some(BaseId::Param { .. })),
+        matches!(r.unique_non_null, Some(BaseId::Param { .. })),
         "s2.b should carry p2's Param base after struct copy: {r:#?}"
     );
     assert_eq!(
-        r.admissibility,
+        r.admissibility_non_null,
         Some(BaseAdmissibility::DirectlyRewriteable),
         "p2's base must be DirectlyRewriteable: {r:#?}"
     );
 
     // the two fields must trace back to distinct parameters
     assert_ne!(
-        q.unique, r.unique,
+        q.unique_non_null, r.unique_non_null,
         "s2.a and s2.b must have distinct Param bases after copying a Pair"
     );
 }
@@ -1976,30 +2012,31 @@ fn array_local_provenance_struct_copy_all_pointer_slots_receive_flow_edges() {
     let r = facts(&map, "f", "r");
     let s = facts(&map, "f", "s");
 
-    // every pointer slot in dst must carry its respective Param base
+    // every pointer slot in dst must carry its respective Param base; the
+    // aggregate null-init adds NullLike bases, so compare modulo null
     assert!(
-        matches!(q.unique, Some(BaseId::Param { .. })),
+        matches!(q.unique_non_null, Some(BaseId::Param { .. })),
         "dst.a should carry p1 Param base after struct copy: {q:#?}"
     );
     assert!(
-        matches!(r.unique, Some(BaseId::Param { .. })),
+        matches!(r.unique_non_null, Some(BaseId::Param { .. })),
         "dst.b should carry p2 Param base after struct copy: {r:#?}"
     );
     assert!(
-        matches!(s.unique, Some(BaseId::Param { .. })),
+        matches!(s.unique_non_null, Some(BaseId::Param { .. })),
         "dst.c should carry p3 Param base after struct copy: {s:#?}"
     );
     // each field must trace back to a *distinct* parameter
     assert_ne!(
-        q.unique, r.unique,
+        q.unique_non_null, r.unique_non_null,
         "a and b must trace back to distinct params"
     );
     assert_ne!(
-        r.unique, s.unique,
+        r.unique_non_null, s.unique_non_null,
         "b and c must trace back to distinct params"
     );
     assert_ne!(
-        q.unique, s.unique,
+        q.unique_non_null, s.unique_non_null,
         "a and c must trace back to distinct params"
     );
 }
@@ -2036,13 +2073,15 @@ fn array_local_provenance_through_pointer_write_struct_field_gets_edge() {
     );
 
     let q = facts(&map, "f", "q");
+    // both aggregate null-inits contribute NullLike bases; param provenance is
+    // unique modulo null-transparency
     assert!(
-        matches!(q.unique, Some(BaseId::Param { .. })),
+        matches!(q.unique_non_null, Some(BaseId::Param { .. })),
         "through-pointer struct write should propagate param provenance to the \
-         local field slot — q must have a unique Param base: {q:#?}"
+         local field slot — q must have a unique non-null Param base: {q:#?}"
     );
     assert_eq!(
-        q.admissibility,
+        q.admissibility_non_null,
         Some(BaseAdmissibility::DirectlyRewriteable),
         "param base must be DirectlyRewriteable: {q:#?}"
     );
@@ -2073,14 +2112,16 @@ fn array_local_provenance_through_pointer_nested_field_write_slot_gets_edge() {
     );
 
     let q = facts(&map, "f", "q");
+    // both aggregate null-inits contribute NullLike bases; param provenance is
+    // unique modulo null-transparency
     assert!(
-        matches!(q.unique, Some(BaseId::Param { .. })),
+        matches!(q.unique_non_null, Some(BaseId::Param { .. })),
         "through-pointer write to a struct field (Inner) containing a pointer must \
          propagate param provenance to the nested pointer slot — q must have a \
-         unique Param base (AC 8): {q:#?}"
+         unique non-null Param base (AC 8): {q:#?}"
     );
     assert_eq!(
-        q.admissibility,
+        q.admissibility_non_null,
         Some(BaseAdmissibility::DirectlyRewriteable),
         "param base must be DirectlyRewriteable: {q:#?}"
     );
