@@ -1117,10 +1117,16 @@ fn a5_p1_corpus() {
         !super::orchestrate::git_dirty(),
         "commit the green harness before running P1"
     );
+    let resolver_cwd = root.join("crates/pointer_replacer");
     assert_eq!(
-        std::env::current_dir().expect("current directory"),
-        root,
-        "run from the analysis worktree root; workers resolve deps through DIR=<root>"
+        std::env::current_dir()
+            .expect("current directory")
+            .canonicalize()
+            .expect("canonical current directory"),
+        resolver_cwd
+            .canonicalize()
+            .expect("canonical pointer_replacer directory"),
+        "Cargo must run the driver with CWD=crates/pointer_replacer; workers resolve deps through DIR=<root>"
     );
     let corpus_link = root.join("benchmarks/rs-crown");
     assert!(
@@ -1362,7 +1368,7 @@ fn a5_p1_corpus() {
         deps_target.display(),
         rlibs,
         root.display(),
-        root.display(),
+        resolver_cwd.display(),
         base_timeout.as_secs(),
         deep_timeout.as_secs(),
         targeted_count,
