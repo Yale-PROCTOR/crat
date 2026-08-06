@@ -1060,6 +1060,15 @@ fn aggregate(rows: &[ProgramCounts]) -> Result<ProgramCounts, String> {
     Ok(total)
 }
 
+fn a5_substrate_dir(selector: Option<&str>) -> Result<&'static str, String> {
+    match selector {
+        None | Some("derived") => Ok("benchmarks/rs-crown-derived"),
+        Some(other) => Err(format!(
+            "A5/P1 is anchored to the derived substrate; got CRAT_BOC1_SUBSTRATE={other:?}"
+        )),
+    }
+}
+
 #[derive(Clone, Debug)]
 struct FinalRun {
     counts: ProgramCounts,
@@ -1073,11 +1082,14 @@ struct FinalRun {
 fn a5_p1_corpus() {
     use std::{fs, path::PathBuf};
 
-    const DATE: &str = "2026-08-06";
-    const BASELINE_HEAD: &str = "92cddb0f630c14a46a999c44d9b3bac5bd1629c0";
-    const SNAPSHOT_HEAD: &str = "2b6be11fbbe0a5f9ec3424aed9956c04b231a709";
-    const MANIFEST_COMMIT: &str = "c4c3388ff6500f4e2a5ed6a7560001bf24ed9b32";
-    const FROZEN_DIGEST: &str = "9fc912af10fd3b235fe4d444d2fbac0bc521509b1c9447fc551acd0130e0e621";
+    const DATE: &str = "2026-08-07";
+    const SNAPSHOT_PRODUCER_HEAD: &str = "3b26a0ff85517a33acf916e8dbe2624ffc924a85";
+    const SNAPSHOT_PRODUCER_BRANCH_HEAD: &str = "52da86648db9d76d8945063792f37da61bf8c8b9";
+    const MANIFEST_COMMIT: &str = "a654d5ecde8a0ea9fccc8a3e7b9caaa8fac5812d";
+    const RAW_FROZEN_DIGEST: &str =
+        "9fc912af10fd3b235fe4d444d2fbac0bc521509b1c9447fc551acd0130e0e621";
+    const DERIVED_SUBSTRATE_DIGEST: &str =
+        "db96829b5c2b0db28fb4bb9ddd3d32901b5d4e6e4134da07ada0d513d94eb4c6";
 
     assert_eq!(
         super::CORPUS.len(),
@@ -1128,15 +1140,20 @@ fn a5_p1_corpus() {
             .expect("canonical pointer_replacer directory"),
         "Cargo must run the driver with CWD=crates/pointer_replacer; workers resolve deps through DIR=<root>"
     );
-    let corpus_link = root.join("benchmarks/rs-crown");
+    let substrate_selector = std::env::var("CRAT_BOC1_SUBSTRATE").ok();
+    let substrate_dir = a5_substrate_dir(substrate_selector.as_deref())
+        .expect("P1 requires the derived substrate/default selector");
+    let corpus_link = root.join(substrate_dir);
     assert!(
         fs::symlink_metadata(&corpus_link)
-            .expect("frozen corpus metadata")
+            .expect("derived corpus metadata")
             .file_type()
             .is_symlink(),
-        "P1 records the guarded read-only frozen-corpus symlink shape"
+        "P1 records the guarded read-only derived-corpus symlink shape"
     );
-    let corpus_target = corpus_link.canonicalize().expect("canonical frozen corpus");
+    let corpus_target = corpus_link
+        .canonicalize()
+        .expect("canonical derived corpus");
     let out = PathBuf::from(
         std::env::var_os("CRAT_BOC1_OUT").expect("P1 requires an explicit private CRAT_BOC1_OUT"),
     );
@@ -1199,7 +1216,7 @@ fn a5_p1_corpus() {
     let mut final_runs = BTreeMap::new();
     let mut needs_depth = Vec::new();
     for program in super::CORPUS {
-        let input = program.input_path(&root);
+        let input = corpus_link.join(program.name).join(program.lib_root);
         let outcome = super::orchestrate::run_child_env(
             program.name,
             &input,
@@ -1247,7 +1264,7 @@ fn a5_p1_corpus() {
     );
     let targeted_count = needs_depth.len();
     for (program, base, base_wall) in needs_depth {
-        let input = program.input_path(&root);
+        let input = corpus_link.join(program.name).join(program.lib_root);
         let outcome = super::orchestrate::run_child_env(
             program.name,
             &input,
@@ -1360,7 +1377,8 @@ fn a5_p1_corpus() {
         100.0 * total.unknown_caller_reachable as f64 / total.local_functions as f64,
     ));
     let provenance = format!(
-        "date={DATE}\nanalysis_head={analysis_head}\nbaseline_head={BASELINE_HEAD}\nsnapshot_head={SNAPSHOT_HEAD}\nmanifest_commit={MANIFEST_COMMIT}\nfrozen_corpus_sha256={FROZEN_DIGEST}\nrepair=mode_a\nl2=0\nsafe_mono=per_site\nfork_engine=fork\nmutability_facts=on-direct-from-program\nz3_smt_seed=0\nz3_sat_seed=0\ncorpus_shape=read-only-symlink-to-main-checkout-frozen-corpus\ncorpus_link={}\ncorpus_target={}\nsnapshot={}\ndeps_shape=read-only-symlink-to-main-checkout-build\ndeps_link={}\ndeps_target={}\ndeps_rlibs={}\ndeps_bytemuck_derive=present\nresolver_DIR={}\nresolver_CWD={}\nbase_timeout_s={}\ndeep_timeout_s={}\ntargeted_programs={}\n",
+        "date={DATE}\nanalysis_worktree_head={analysis_head}\nsnapshot_producer_head={SNAPSHOT_PRODUCER_HEAD}\nsnapshot_producer_branch_head={SNAPSHOT_PRODUCER_BRANCH_HEAD}\nsnapshot_producer_branch_delta=one-test-only-commit-after-capture\nmanifest_commit={MANIFEST_COMMIT}\nraw_frozen_corpus_sha256={RAW_FROZEN_DIGEST}\nderived_substrate_sha256={DERIVED_SUBSTRATE_DIGEST}\nsubstrate=derived\nsubstrate_selector={}\nrepair=mode_a\nl2=0\nsafe_mono=per_site\nfork_engine=fork\nmutability_facts=on-direct-from-program\nz3_smt_seed=0\nz3_sat_seed=0\ncorpus_shape=read-only-symlink-to-main-checkout-derived-corpus\ncorpus_link={}\ncorpus_target={}\nsnapshot={}\ndeps_shape=read-only-symlink-to-main-checkout-build\ndeps_link={}\ndeps_target={}\ndeps_rlibs={}\ndeps_bytemuck_derive=present\nresolver_DIR={}\nresolver_CWD={}\nbase_timeout_s={}\ndeep_timeout_s={}\ntargeted_programs={}\n",
+        substrate_selector.as_deref().unwrap_or("default-derived"),
         corpus_link.display(),
         corpus_target.display(),
         snapshot.display(),
@@ -1611,6 +1629,16 @@ mod tests {
         assert_eq!(total.attributed_predicted_refs_depth0, 4);
         assert_eq!(total.unknown_caller_reachable, 10);
         assert_eq!(total.local_functions, 12);
+    }
+
+    #[test]
+    fn p1_substrate_defaults_to_derived_and_refuses_raw() {
+        assert_eq!(a5_substrate_dir(None), Ok("benchmarks/rs-crown-derived"));
+        assert_eq!(
+            a5_substrate_dir(Some("derived")),
+            Ok("benchmarks/rs-crown-derived")
+        );
+        assert!(a5_substrate_dir(Some("raw")).is_err());
     }
 
     #[test]
