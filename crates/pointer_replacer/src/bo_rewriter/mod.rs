@@ -1638,12 +1638,27 @@ fn decide_table_perturbed<'tcx>(
     // absence, corruption, fingerprint mismatch or an unresolvable key, and
     // `None` can only be answered by solving. Dev iteration reads it; every
     // gate sweep bypasses it and refreshes it.
+    // ONE fingerprint computation, shared by the memo and the on-disk cache —
+    // they are two tiers of the same question, so they must not disagree about
+    // which program this is.
+    let fp = model_cache::fingerprint(&program);
+
+    // Tier 1: the in-process memo. The recon worker has three independent
+    // consumers of the decision table, and before this each ran the entire
+    // pipeline — `total ≈ 3 × solve` on every program. Reusing the model here
+    // makes a consumer's cost its own work, not another whole solve.
+    if let Some(memo) = model_cache::memo_get(&fp) {
+        return finish_decide(tcx, program, slots, mut_facts, memo, perturb);
+    }
+
+    // Tier 2: the on-disk cache.
     if let Some(cached) = model_cache::load(tcx, &program, &slots) {
         model_cache::record_solve(model_cache::SolveProvenance {
             source: "cache",
-            fingerprint: model_cache::fingerprint(&program),
+            fingerprint: fp.clone(),
             solve_secs: 0.0,
         });
+        model_cache::memo_put(&fp, &cached);
         return finish_decide(tcx, program, slots, mut_facts, cached, perturb);
     }
     let solve_t0 = std::time::Instant::now();
@@ -1671,9 +1686,10 @@ fn decide_table_perturbed<'tcx>(
     // what dev iteration reads next.
     model_cache::record_solve(model_cache::SolveProvenance {
         source: "real",
-        fingerprint: model_cache::fingerprint(&program),
+        fingerprint: fp.clone(),
         solve_secs: solve_t0.elapsed().as_secs_f64(),
     });
+    model_cache::memo_put(&fp, &model);
     model_cache::store(tcx, &program, &slots, &model);
 
     finish_decide(tcx, program, slots, mut_facts, model, perturb)

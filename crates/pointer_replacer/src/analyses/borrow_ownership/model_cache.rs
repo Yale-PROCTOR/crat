@@ -83,7 +83,7 @@ pub(crate) fn fingerprint(program: &RustProgram<'_>) -> String {
 
     // 2. The analysis code. Any edit under `analyses/` changes what a solve
     //    means, so a cache written by the old code must not be read by the new.
-    h.update(analysis_code_fingerprint().as_bytes());
+    h.update(code_fingerprint_cached().as_bytes());
 
     // 3. The toolchain.
     h.update(
@@ -364,4 +364,57 @@ pub(crate) fn render_provenance() -> String {
         }
         Some(_) => "real".to_owned(),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Per-process memoization, and the counter that keeps it honest
+// ---------------------------------------------------------------------------
+
+/// How many times the model was **DERIVED** in this process — solved or loaded
+/// from the on-disk cache — as opposed to reused from the in-process memo.
+///
+/// The recon worker has three independent consumers of the decision table
+/// (`artifact_rows`, `facts_join_tsv`, `freed_slots_tsv`), and before
+/// memoization each ran the whole pipeline: `total ≈ 3 × solve` on every
+/// program, 2.83–3.15 measured. The redundancy was invisible because each
+/// consumer looked cheap in isolation, and it was *mistaken for front-end cost*
+/// in a subtraction-derived timing split that has since been retracted.
+///
+/// **This counter is what stops it returning silently.** The sweep asserts
+/// exactly one derivation per program, so adding a fourth consumer that forgets
+/// the memo fails a gate instead of quietly tripling a sweep.
+pub(crate) fn derivations() -> usize {
+    DERIVATIONS.with(|c| c.get())
+}
+
+thread_local! {
+    static DERIVATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static MEMO: std::cell::RefCell<Option<(String, FxHashMap<SlotRef, SlotKind>)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// The analyses-tree hash is constant for the life of the process; computing it
+/// walks and reads the whole source tree, which is cheap once and silly thrice.
+fn code_fingerprint_cached() -> &'static str {
+    static ONCE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    ONCE.get_or_init(analysis_code_fingerprint)
+}
+
+/// The in-process memo, keyed by the **same fingerprint the on-disk cache
+/// uses** — one notion of "which program is this", not two.
+///
+/// Keyed rather than unconditional because the test suite runs many fixtures in
+/// one process: an unkeyed memo would serve fixture A's model to fixture B.
+pub(crate) fn memo_get(fp: &str) -> Option<FxHashMap<SlotRef, SlotKind>> {
+    MEMO.with(|m| {
+        m.borrow()
+            .as_ref()
+            .filter(|(k, _)| k == fp)
+            .map(|(_, v)| v.clone())
+    })
+}
+
+pub(crate) fn memo_put(fp: &str, model: &FxHashMap<SlotRef, SlotKind>) {
+    MEMO.with(|m| *m.borrow_mut() = Some((fp.to_owned(), model.clone())));
+    DERIVATIONS.with(|c| c.set(c.get() + 1));
 }

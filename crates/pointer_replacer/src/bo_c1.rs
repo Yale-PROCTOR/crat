@@ -6940,6 +6940,7 @@ mod run {
         );
         let name = std::env::var("CRAT_BOC1_NAME").unwrap_or_else(|_| "unnamed".to_string());
 
+        let t_phase_a = std::time::Instant::now();
         let a = match crate::bo_rewriter::artifact_rows(tcx) {
             Ok(rows) => rows,
             Err(why) => {
@@ -7022,6 +7023,9 @@ mod run {
             },
         );
 
+        row.set("t_producer_a_s", format!("{:.3}", t_phase_a.elapsed().as_secs_f64()));
+        let t_phase_i = std::time::Instant::now();
+
         // S3.2′-0 — the facts-side join, written beside the artifacts it
         // explains. Ordering-independent by construction: it reads the facts,
         // not the decision, which is the whole reason the ruled method is a
@@ -7074,6 +7078,16 @@ mod run {
             Ok(Err(why)) => row.set("fatness_pass", super::report::sanitize(&why)),
             Err(_) => row.set("fatness_pass", "panicked"),
         }
+
+        row.set("t_instruments_s", format!("{:.3}", t_phase_i.elapsed().as_secs_f64()));
+        // MECHANIZED: how many times the model was DERIVED (solved or loaded)
+        // rather than reused from the in-process memo. Exactly one per program;
+        // the sweep asserts it, so a fourth consumer that forgets the memo
+        // fails a gate instead of quietly tripling a sweep.
+        row.set(
+            "derivations",
+            crate::analyses::borrow_ownership::model_cache::derivations(),
+        );
 
         // §5 — solve provenance IN THE ROW. A gate sweep that had silently read
         // a cache would say so here in its own output.
@@ -8818,6 +8832,17 @@ fn m1_recon_corpus() {
             ));
             continue;
         };
+        // One derivation per program. A regression here is the 3x-solve
+        // duplication returning, which cost a full sweep and a wrong published
+        // timing split before it was found.
+        match row.get("derivations").map(str::parse::<usize>) {
+            Some(Ok(1)) => {}
+            other => failures.push(format!(
+                "{}: expected exactly 1 model derivation, got {other:?} — the \
+                 per-consumer solve duplication has returned",
+                program.name
+            )),
+        }
         let recon = row.get("recon").unwrap_or("missing").to_owned();
         let status = row.get("status").unwrap_or("missing").to_owned();
 
