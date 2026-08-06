@@ -9730,6 +9730,33 @@ const PAIRWISE_EXPECTED_JOINT_BY_PROGRAM: [(&str, usize); 20] = [
 /// The unrecognized-value arm is the load-bearing one. A selector that fell
 /// back to `raw` on a typo would report numbers measured on the OLD substrate
 /// under the new substrate's name, and nothing downstream could tell.
+/// The certified inventory refuses to be read on the substrate of record.
+///
+/// The deferral ruling says consuming it against the derived substrate must
+/// FAIL LOUDLY until it is re-derived. That is a claim about behaviour, so it
+/// is witnessed rather than asserted in prose: the suite runs with
+/// `CRAT_BOC1_SUBSTRATE` unset, which is the derived tree, and `targets()` is
+/// the single reader every consumer passes through.
+///
+/// The base is deliberately NOT guarded — it re-anchored and stays live as the
+/// official-metric regression guard — so this also pins the split.
+#[test]
+fn the_certified_inventory_refuses_the_derived_substrate() {
+    assert_eq!(substrate_dir(), "benchmarks/rs-crown-derived", "suite default");
+
+    let read = std::panic::catch_unwind(l2_red_gate::targets);
+    assert!(
+        read.is_err(),
+        "the raw-era certified inventory must not be readable on the substrate \
+         of record; it is deferred to M1-close, not silently reusable"
+    );
+
+    // The base is the control: same fixture module, not guarded, still live.
+    let bases = l2_red_gate::bases();
+    assert_eq!(bases.len(), 20);
+    assert_eq!(bases.iter().map(|b| b.n_ref).sum::<usize>(), 50_334);
+}
+
 #[test]
 fn the_substrate_selector_names_both_trees_and_refuses_to_guess() {
     // The DEFAULT is the substrate of record. This assertion is the migration:
