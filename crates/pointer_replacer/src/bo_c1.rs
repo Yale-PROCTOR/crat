@@ -7491,6 +7491,47 @@ mod run {
     /// so this is affordable over the whole corpus without a second sweep. The
     /// decision each subject received is joined **offline**, from the published
     /// producer-A artifact, rather than re-derived here.
+    /// **S3.2′-3 task 0** — the use-class census, one program per process.
+    ///
+    /// Writes `<name>.usecensus.tsv` beside the recon artifacts, so the join is
+    /// a file join on `(fn_path, mir_local)` and needs no re-derivation. No BO
+    /// solve; the row carries the subject and use totals so a silently empty
+    /// census cannot pass for a measured zero.
+    pub fn run_use_census(tcx: TyCtxt<'_>, t_tcx: Duration) -> Row {
+        let t0 = Instant::now();
+        let mut row = Row::default();
+        row.set("t_tcx_s", secs(t_tcx));
+        match crate::bo_rewriter::use_census_tsv(tcx) {
+            Ok(tsv) => {
+                let name = std::env::var("CRAT_BOC1_NAME").unwrap_or_else(|_| "unnamed".into());
+                let dir = std::env::var_os("CRAT_BOC1_ARTIFACT_DIR")
+                    .map(std::path::PathBuf::from)
+                    .expect("use-census requires CRAT_BOC1_ARTIFACT_DIR");
+                // The denominators travel with the artifact: `subjects=0` and a
+                // missing file are different claims.
+                row.set("subjects", tsv.lines().count().saturating_sub(1));
+                row.set(
+                    "uses",
+                    tsv.lines()
+                        .skip(1)
+                        .filter_map(|l| l.split('\t').nth(3))
+                        .filter_map(|n| n.parse::<u64>().ok())
+                        .sum::<u64>(),
+                );
+                let path = dir.join(format!("{name}.usecensus.tsv"));
+                std::fs::write(&path, tsv)
+                    .unwrap_or_else(|e| panic!("write use census {}: {e}", path.display()));
+                row.set("status", "ok");
+            }
+            Err(why) => {
+                row.set("status", "census-failed");
+                row.set("detail", super::report::sanitize(&why));
+            }
+        }
+        row.set("t_total_s", secs(t0.elapsed() + t_tcx));
+        row
+    }
+
     pub fn run_free_overlap(tcx: TyCtxt<'_>, t_tcx: Duration) -> Row {
         let t0 = Instant::now();
         let mut row = Row::default();
@@ -9111,6 +9152,70 @@ fn a_missing_worker_aggregate_fails_closed() {
     );
 }
 
+/// **S3.2′-3 task 0 — the use-class census sweep.**
+///
+/// Measurement only, and deliberately NOT folded into `m1_recon_corpus`: the
+/// recon sweep is a gate, and a measurement that rides a gate makes the gate
+/// slower and the measurement harder to re-run. It writes into the same
+/// artifact directory (without clearing it) so the census joins the facts and
+/// fatness tables on `(fn_path, mir_local)` as plain files.
+///
+/// Asserts only that every program produced a census — the numbers themselves
+/// are read offline and scored against the pre-registered criterion.
+#[test]
+#[ignore = "S3.2′-3 census: spawns one worker per program"]
+fn m1_use_census_corpus() {
+    use std::{fs, time::Duration};
+
+    let root = orchestrate::workspace_root();
+    let art = orchestrate::out_dir().join("m1-recon-artifacts");
+    fs::create_dir_all(&art).expect("artifact dir");
+
+    let timeout = Duration::from_secs(
+        std::env::var("CRAT_BOC1_CENSUS_TIMEOUT_SECS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1200),
+    );
+
+    let mut failures: Vec<String> = Vec::new();
+    let (mut subjects, mut uses) = (0u64, 0u64);
+
+    for program in CORPUS {
+        let input = program.input_path(&root);
+        assert!(input.is_file(), "missing rs-crown input: {input:?}");
+        let outcome = orchestrate::run_child_env(
+            program.name,
+            &input,
+            "use-census",
+            timeout,
+            &[("CRAT_BOC1_ARTIFACT_DIR", art.display().to_string())],
+        );
+        let Some(row) = outcome.row.clone() else {
+            failures.push(format!(
+                "{}: no sentinel row (orchestrator status={})",
+                program.name, outcome.status
+            ));
+            continue;
+        };
+        match row.get("status") {
+            Some("ok") => {}
+            other => failures.push(format!("{}: status={other:?}", program.name)),
+        }
+        subjects += row.get("subjects").and_then(|v| v.parse::<u64>().ok()).unwrap_or(0);
+        uses += row.get("uses").and_then(|v| v.parse::<u64>().ok()).unwrap_or(0);
+        println!("{}", report::to_kv_line(&row));
+    }
+
+    println!("BOC1-USE-CENSUS total_subjects={subjects} total_uses={uses}");
+    assert!(
+        failures.is_empty(),
+        "use-census sweep incomplete ({} program(s)):\n  {}",
+        failures.len(),
+        failures.join("\n  ")
+    );
+}
+
 /// **The corpus reconciliation gate.**
 ///
 /// Before Track 1 this sweep was report-only: the worker recorded `recon=FAIL`
@@ -9701,6 +9806,7 @@ fn boc1_run_one() {
             "m1-census" => run::run_m1_census(tcx, t_tcx),
             "substrate-sanity" => run::run_substrate_sanity(tcx, t_tcx),
             "free-overlap" => run::run_free_overlap(tcx, t_tcx),
+            "use-census" => run::run_use_census(tcx, t_tcx),
             "m1-recon" => run::run_m1_recon(tcx, t_tcx),
             "selector-core" => run::run_selector_core(tcx, t_tcx),
             "selector-necessity" => run::run_selector_necessity(tcx, t_tcx),

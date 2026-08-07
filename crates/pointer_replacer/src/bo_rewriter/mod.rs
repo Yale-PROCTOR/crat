@@ -68,6 +68,7 @@ pub(crate) mod artifact;
 pub(crate) mod decision;
 pub(crate) mod fat_facts;
 pub(crate) mod plan;
+pub(crate) mod use_census;
 pub(crate) mod verify;
 
 #[cfg(test)]
@@ -2320,6 +2321,48 @@ pub(crate) fn fatness_tsv(tcx: TyCtxt<'_>) -> Result<String, String> {
             u8::from(matches!(s.kind, decision::SubjectKind::Param { .. })),
             fat.render(s.fn_did, s.local),
         ));
+    }
+    Ok(out)
+}
+
+/// **S3.2′-3 task 0 — the use-class census, as its own pass.**
+///
+/// Runs **no BO solve** (the `fatness_tsv` precedent): the subject universe
+/// needs the program and `MutFacts`, and the classification is HIR-only. So the
+/// census is cheap enough to sweep on its own rather than riding the recon
+/// worker, which keeps a measurement out of the gate's critical path.
+///
+/// One row per subject, counts parallel to [`use_census::CLASSES`]. The
+/// split-back criterion is **not** evaluated here — see the module doc.
+pub(crate) fn use_census_tsv(tcx: TyCtxt<'_>) -> Result<String, String> {
+    let program = collect_program(tcx);
+    let mut_facts = MutFacts::from_program(&program);
+    let mut subjects = collect_subjects(tcx, &program, &mut_facts);
+    subjects.extend(collect_local_subjects(tcx, &program, &mut_facts));
+
+    let uses = use_census::collect(tcx, &program.functions);
+
+    let mut out = String::from("fn_path\tmir_local\tis_param\tn_uses");
+    for c in use_census::CLASSES {
+        out.push('\t');
+        out.push_str(c);
+    }
+    out.push('\n');
+
+    for s in &subjects {
+        let counts = uses.get(&(s.fn_did, s.hir_id));
+        let total: u32 = counts.map(|c| c.iter().sum()).unwrap_or(0);
+        out.push_str(&format!(
+            "{}\t{}\t{}\t{total}",
+            tcx.def_path_str(s.fn_did.to_def_id()),
+            s.local.as_u32(),
+            u8::from(matches!(s.kind, decision::SubjectKind::Param { .. })),
+        ));
+        for i in 0..use_census::CLASSES.len() {
+            out.push('\t');
+            out.push_str(&counts.map(|c| c[i]).unwrap_or(0).to_string());
+        }
+        out.push('\n');
     }
     Ok(out)
 }
