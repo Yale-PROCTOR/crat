@@ -100,6 +100,17 @@ pub(super) const GOLDENS: &[Golden] = goldens![
     // both halves are already ratified and inventing a third idiom for their
     // intersection would be a spec act, not a transcription.
     "g13_opt_slice",
+    // **S3.2′-2b, ratified 2026-08-07.** The bundled amendment's pair. Numbered
+    // g17/g18 because g14 (`boxed_slice`, S3.2′-4), g15 (`cursor_backwards`,
+    // S3.2′-5) and g16 (unannotated-`let` Box, S3.2) are all ratified and
+    // allocated — an allocation of free numbers, not a reassignment.
+    //
+    // **g18 lands RED and stays RED.** Its market is 0 today and S3.6-gated, so
+    // the rebind ARM is not built here: mechanism follows market. It enters the
+    // standing red set as ratified spec, the same standing as g04–g08 —
+    // goldens are spec, not census.
+    "g17_reslice_advance",
+    "g18_reslice_rebind",
 ];
 
 /// Run `rustfmt` over a source string with pinned settings.
@@ -179,6 +190,8 @@ golden_test!(g10_mixed_group, "g10_mixed_group");
 golden_test!(g11_slice_shared, "g11_slice_shared");
 golden_test!(g12_slice_mut, "g12_slice_mut");
 golden_test!(g13_opt_slice, "g13_opt_slice");
+golden_test!(g17_reslice_advance, "g17_reslice_advance");
+golden_test!(g18_reslice_rebind, "g18_reslice_rebind");
 
 /// The canonicalizer must be a real normalizer, not a pass-through.
 ///
@@ -206,9 +219,10 @@ fn canonicalization_normalizes_whitespace() {
 fn every_golden_pair_is_present() {
     assert_eq!(
         GOLDENS.len(),
-        13,
+        15,
         "the M0.5 package specifies ten pairs; U-5 slice 1 transcribes g11/g12 \
-         from the ratified §8 table, and slice 3 transcribes g13"
+         from the ratified §8 table, slice 3 transcribes g13, and 2b adds \
+         g17/g18"
     );
     for g in GOLDENS {
         assert!(!g.input.trim().is_empty(), "{}: empty .input.rs", g.name);
