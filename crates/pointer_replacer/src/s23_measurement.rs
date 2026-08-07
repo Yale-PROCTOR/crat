@@ -1189,6 +1189,61 @@ fn s23_p2_corpus() {
         "P2 force-own entering population must be nonempty"
     );
     let eligible_len = eligible.len();
+    match std::env::var("CRAT_S23_DISCOVERY_ONLY").as_deref() {
+        Ok("1") => {
+            let candidate_universe = out.join("candidate-universe.tsv");
+            assert_eq!(
+                sha256_file(&candidate_universe).expect("hash candidate universe"),
+                P2_CANDIDATE_UNIVERSE_SHA256,
+                "Linux discovery does not reproduce the macOS checkpoint universe"
+            );
+            let bootstrap_provenance = out.join("bootstrap-provenance.txt");
+            fs::write(
+                &bootstrap_provenance,
+                format!(
+                    "machine_id={}\nplatform={}\nstatus=discovery-only\nanalysis_head={}\nmac_base_manifest_sha256={}\ncandidate_universe_sha256={}\nscreened={}\neligible={}\n",
+                    measurement_identity.machine_id,
+                    measurement_identity.platform,
+                    super::orchestrate::git_sha(),
+                    P2_BASE_MANIFEST_SHA256,
+                    P2_CANDIDATE_UNIVERSE_SHA256,
+                    all_candidates.len(),
+                    eligible_len,
+                ),
+            )
+            .expect("write discovery-only provenance");
+            let mut artifacts = vec![
+                candidate_universe,
+                out.join("store-sites.tsv"),
+                bootstrap_provenance,
+            ];
+            for phase in ["discovery", "stores"] {
+                artifacts.extend(
+                    fs::read_dir(out.join(phase))
+                        .expect("read discovery-only phase")
+                        .filter_map(Result::ok)
+                        .map(|entry| entry.path()),
+                );
+            }
+            artifacts.sort();
+            let manifest = out.join("artifact-manifest.sha256");
+            write_sha256_manifest(&out, &artifacts, &manifest)
+                .unwrap_or_else(|error| panic!("write discovery-only manifest: {error}"));
+            verify_sha256_manifest(&out, &manifest)
+                .unwrap_or_else(|error| panic!("verify discovery-only manifest: {error}"));
+            println!(
+                "S23P2BOOTSTRAP machine_id={} platform={} screened={} eligible={} candidate_universe_sha256={}",
+                measurement_identity.machine_id,
+                measurement_identity.platform,
+                all_candidates.len(),
+                eligible_len,
+                P2_CANDIDATE_UNIVERSE_SHA256,
+            );
+            return;
+        }
+        Err(_) | Ok("0") => {}
+        Ok(other) => panic!("CRAT_S23_DISCOVERY_ONLY must be 0 or 1, got {other:?}"),
+    }
     let query_budget = env_usize("CRAT_S23_QUERY_BUDGET", DEFAULT_QUERY_BUDGET);
     assert!(query_budget > 0, "P2 query budget must be positive");
     let selected = eligible
@@ -1457,6 +1512,7 @@ struct CheckpointContract {
     base: PathBuf,
     batches: PathBuf,
     identity: MeasurementIdentity,
+    base_manifest_sha256: String,
 }
 
 fn checkpoint_contract() -> CheckpointContract {
@@ -1529,11 +1585,7 @@ fn checkpoint_contract() -> CheckpointContract {
         std::env::var_os("CRAT_S23_BASE_ROOT").expect("P2 requires CRAT_S23_BASE_ROOT"),
     );
     let base_manifest = base.join("artifact-manifest.sha256");
-    assert_eq!(
-        sha256_file(&base_manifest).expect("hash base manifest"),
-        P2_BASE_MANIFEST_SHA256,
-        "preserved P2 manifest identity drifted"
-    );
+    let base_manifest_sha256 = sha256_file(&base_manifest).expect("hash base manifest");
     verify_sha256_manifest(&base, &base_manifest)
         .unwrap_or_else(|error| panic!("preserved P2 artifacts failed re-verification: {error}"));
     assert_eq!(
@@ -1541,6 +1593,28 @@ fn checkpoint_contract() -> CheckpointContract {
         P2_CANDIDATE_UNIVERSE_SHA256,
         "candidate universe identity drifted"
     );
+    if base_manifest_sha256 != P2_BASE_MANIFEST_SHA256 {
+        let provenance = parse_receipt(&base.join("bootstrap-provenance.txt"))
+            .unwrap_or_else(|error| panic!("Linux bootstrap provenance: {error}"));
+        assert_eq!(
+            provenance.get("status").map(String::as_str),
+            Some("discovery-only")
+        );
+        assert_eq!(
+            provenance.get("machine_id").map(String::as_str),
+            Some(identity.machine_id.as_str())
+        );
+        assert_eq!(
+            provenance.get("platform").map(String::as_str),
+            Some(identity.platform.as_str())
+        );
+        assert_eq!(
+            provenance
+                .get("candidate_universe_sha256")
+                .map(String::as_str),
+            Some(P2_CANDIDATE_UNIVERSE_SHA256)
+        );
+    }
     let batches = PathBuf::from(
         std::env::var_os("CRAT_S23_BATCH_ROOT").expect("P2 requires CRAT_S23_BATCH_ROOT"),
     );
@@ -1554,6 +1628,7 @@ fn checkpoint_contract() -> CheckpointContract {
         base,
         batches,
         identity,
+        base_manifest_sha256,
     }
 }
 
@@ -1770,12 +1845,13 @@ fn s23_p2_brotli_checkpoint() {
     fs::write(
         &receipt,
         format!(
-            "machine_id={}\nplatform={}\nmachine_protocol=dedicated-host\nbatch={batch_index}\nprogram=brotli\nstatus={}\nanalysis_head={}\nbase_harness_head={}\nbase_manifest_sha256={}\nsnapshot={}\nbatch_size={}\nwall_cap_s={}\nrange_start={}\nrange_end={}\nqueried={}\nfirst_key={}\nlast_key={}\nwall_s={:.3}\nwall_s_per_candidate={:.6}\npeak_rss_kb={}\nworker_t_total_s={}\nhard_unsat={}\nforce_sat={}\nsolver_unknown={}\naccepted_owning={}\n",
+            "machine_id={}\nplatform={}\nmachine_protocol=dedicated-host\nbatch={batch_index}\nprogram=brotli\nstatus={}\nanalysis_head={}\nbase_harness_head={}\nbase_manifest_sha256={}\nmac_base_manifest_sha256={}\nsnapshot={}\nbatch_size={}\nwall_cap_s={}\nrange_start={}\nrange_end={}\nqueried={}\nfirst_key={}\nlast_key={}\nwall_s={:.3}\nwall_s_per_candidate={:.6}\npeak_rss_kb={}\nworker_t_total_s={}\nhard_unsat={}\nforce_sat={}\nsolver_unknown={}\naccepted_owning={}\n",
             contract.identity.machine_id,
             contract.identity.platform,
             outcome.status,
             super::orchestrate::git_sha(),
             P2_BASE_HARNESS_HEAD,
+            contract.base_manifest_sha256,
             P2_BASE_MANIFEST_SHA256,
             contract.snapshot.display(),
             batch_size,
