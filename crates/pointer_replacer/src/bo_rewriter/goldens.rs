@@ -66,6 +66,20 @@ macro_rules! goldens {
 
 pub(super) const GOLDENS: &[Golden] = goldens![
     "g01_ref_mut",
+    // **AMENDED 2026-08-07 (user ruling A, S3.2′-3 close).**
+    //
+    // SUPERSEDED EXPECTED TEXT: `p: Option<&mut i32>`. The hand-written expected
+    // followed the C declaration and predates the mechanism; the mutability
+    // authority ratified in §1 is USE-DERIVED — `subject.mutable`, the same
+    // field the plain-`Ref` arm reads — and g02's body only reads through `p`.
+    // The amendment conforms the text to that authority: a text correction, not
+    // a behaviour change, with nothing in the mechanism moved for it.
+    // Corrected, never erased.
+    //
+    // The note lives HERE and not in the fixture because the two fixture halves
+    // are compared byte for byte: a comment in only one of them is a diff.
+    // g02's own header — present in BOTH halves — carries the dimension it
+    // pins, which is what has to survive the amendment.
     "g02_opt_ref",
     "g03_ref_shared",
     "g04_box_drop",
