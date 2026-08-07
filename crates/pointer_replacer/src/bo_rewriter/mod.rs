@@ -68,6 +68,7 @@ pub(crate) mod artifact;
 pub(crate) mod decision;
 pub(crate) mod fat_facts;
 pub(crate) mod plan;
+pub(crate) mod sign_facts;
 pub(crate) mod use_census;
 pub(crate) mod verify;
 
@@ -2341,8 +2342,14 @@ pub(crate) fn use_census_tsv(tcx: TyCtxt<'_>) -> Result<String, String> {
     subjects.extend(collect_local_subjects(tcx, &program, &mut_facts));
 
     let uses = use_census::collect(tcx, &program.functions);
+    // **Task 2's other axis.** The sign rides the census artifact and NOT the
+    // facts join, because §6 pins every `.facts.tsv` byte-identical except the
+    // one column task 3 adds — a measurement must not spend a pre-registration
+    // it did not ask for. The RAW capture is what lands here (`render`), so the
+    // `None`-is-conservative decision policy never reaches an instrument.
+    let sign = sign_facts::SignFacts::from_program(&program);
 
-    let mut out = String::from("fn_path\tmir_local\tis_param\tn_uses");
+    let mut out = String::from("fn_path\tmir_local\tis_param\tsign\tn_uses");
     for c in use_census::CLASSES {
         out.push('\t');
         out.push_str(c);
@@ -2353,10 +2360,11 @@ pub(crate) fn use_census_tsv(tcx: TyCtxt<'_>) -> Result<String, String> {
         let counts = uses.get(&(s.fn_did, s.hir_id));
         let total: u32 = counts.map(|c| c.iter().sum()).unwrap_or(0);
         out.push_str(&format!(
-            "{}\t{}\t{}\t{total}",
+            "{}\t{}\t{}\t{}\t{total}",
             tcx.def_path_str(s.fn_did.to_def_id()),
             s.local.as_u32(),
             u8::from(matches!(s.kind, decision::SubjectKind::Param { .. })),
+            sign.render(s.fn_did, s.local),
         ));
         for i in 0..use_census::CLASSES.len() {
             out.push('\t');
