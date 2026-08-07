@@ -886,6 +886,21 @@ fn checkpoint_batch_ranges(total: usize, batch_size: usize) -> Result<Vec<Range<
         .collect())
 }
 
+fn checkpoint_batch_timeout_s(value: Option<&str>) -> Result<usize, String> {
+    let timeout_s = match value {
+        Some(value) => value
+            .parse::<usize>()
+            .map_err(|_| format!("invalid checkpoint wall cap: {value}"))?,
+        None => 7200,
+    };
+    if timeout_s != 7200 {
+        return Err(format!(
+            "Linux checkpoint wall cap must be exactly 7,200s, got {timeout_s}s"
+        ));
+    }
+    Ok(timeout_s)
+}
+
 fn sha256_file(path: &Path) -> Result<String, String> {
     let output = Command::new("shasum")
         .args(["-a", "256"])
@@ -1795,6 +1810,9 @@ fn s23_p2_brotli_checkpoint() {
         );
         return;
     }
+    let timeout_override = std::env::var("CRAT_S23_BATCH_TIMEOUT_SECS").ok();
+    let timeout_s = checkpoint_batch_timeout_s(timeout_override.as_deref())
+        .unwrap_or_else(|error| panic!("{error}"));
     assert!(
         !batch_dir.exists(),
         "P2 STOP: unmanifested partial batch exists at {}; preserve it for inspection",
@@ -1808,11 +1826,6 @@ fn s23_p2_brotli_checkpoint() {
     let stderr = batch_dir.join("stderr.txt");
     let receipt = batch_dir.join("receipt.txt");
     write_targets(&targets, keys).unwrap_or_else(|error| panic!("{error}"));
-    let timeout_s = env_usize("CRAT_S23_BATCH_TIMEOUT_SECS", 3600);
-    assert_eq!(
-        timeout_s, 3600,
-        "checkpoint wall cap must be exactly 3,600s"
-    );
     let corpus_program = super::CORPUS
         .iter()
         .find(|program| program.name == "brotli")
@@ -2367,6 +2380,10 @@ mod tests {
         assert_eq!(identity.platform, "linux-x86_64");
         assert!(MeasurementIdentity::parse("", "linux-x86_64").is_err());
         assert!(MeasurementIdentity::parse("lambda7", "linux\tx86_64").is_err());
+
+        assert_eq!(checkpoint_batch_timeout_s(None), Ok(7200));
+        assert_eq!(checkpoint_batch_timeout_s(Some("7200")), Ok(7200));
+        assert!(checkpoint_batch_timeout_s(Some("3600")).is_err());
 
         let ranges = checkpoint_batch_ranges(112, 24).expect("valid checkpoint plan");
         assert_eq!(
