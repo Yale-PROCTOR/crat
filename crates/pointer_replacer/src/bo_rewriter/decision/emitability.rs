@@ -236,6 +236,27 @@ pub(crate) struct SliceUses {
     pub unsupported: Option<Span>,
 }
 
+/// Is `rhs` this binding's own pointer arithmetic — the right-hand side of a
+/// self-advance?
+fn self_advance_rhs(tcx: TyCtxt<'_>, rhs: &Expr<'_>, key: (LocalDefId, HirId)) -> Option<()> {
+    let ExprKind::MethodCall(seg, receiver, _, _) = &rhs.kind else {
+        return None;
+    };
+    if !SLICE_ARITHMETIC_OPS.contains(&seg.ident.name.to_string().as_str()) {
+        return None;
+    }
+    let _ = tcx;
+    self_advance_lhs(receiver, key).then_some(())
+}
+
+/// Does this expression name the binding `key` refers to?
+fn self_advance_lhs(expr: &Expr<'_>, key: (LocalDefId, HirId)) -> bool {
+    matches!(
+        &expr.kind,
+        ExprKind::Path(QPath::Resolved(_, path)) if matches!(path.res, Res::Local(id) if id == key.1)
+    )
+}
+
 /// The index expression's source text, **typed as a `usize`**.
 ///
 /// C2Rust writes `p.offset(i as isize)`; the `as isize` exists only to satisfy
@@ -276,20 +297,35 @@ fn index_text(tcx: TyCtxt<'_>, arg: &Expr<'_>) -> Option<String> {
             })
     }
 
+    /// A non-negative integer LITERAL indexes bare.
+    ///
+    /// **S3.2′-2b.** `p.offset(1)`'s argument is an `isize` literal, so the
+    /// type test below renders it `(1) as usize` — correct, and not what any
+    /// human writes or what the ratified golden text says. A literal is
+    /// representable as a `usize` when it is non-negative, and a negative one
+    /// cannot reach here: the sign verdict gates that class to `SliceCursor`.
+    ///
+    /// This is a rendering rule, not a typing one, so it lives with the other
+    /// rendering rules rather than as a special case at the reslice position —
+    /// the same index expression must render the same way in every position.
+    fn is_bare_literal(expr: &Expr<'_>) -> bool {
+        matches!(&expr.kind, ExprKind::Lit(lit) if matches!(lit.node, rustc_ast::LitKind::Int(..)))
+    }
+
     let sm = tcx.sess.source_map();
     if let ExprKind::Cast(inner, ty) = &arg.kind
         && let rustc_hir::TyKind::Path(rustc_hir::QPath::Resolved(_, p)) = &ty.kind
         && p.segments.last().is_some_and(|s| s.ident.name.as_str() == "isize")
     {
         let text = sm.span_to_snippet(inner.span).ok()?;
-        return Some(if is_usize(tcx, inner) {
+        return Some(if is_usize(tcx, inner) || is_bare_literal(inner) {
             text
         } else {
             format!("({text}) as usize")
         });
     }
     let text = sm.span_to_snippet(arg.span).ok()?;
-    Some(if is_usize(tcx, arg) {
+    Some(if is_usize(tcx, arg) || is_bare_literal(arg) {
         text
     } else {
         format!("({text}) as usize")
@@ -555,12 +591,20 @@ pub(crate) fn collect_slice_uses(
     tcx: TyCtxt<'_>,
     functions: &[LocalDefId],
     name_of: &FxHashMap<(LocalDefId, HirId), String>,
+    mutable_of: &rustc_hash::FxHashSet<(LocalDefId, HirId)>,
+    advance_ok: &rustc_hash::FxHashSet<(LocalDefId, HirId)>,
 ) -> FxHashMap<(LocalDefId, HirId), SliceUses> {
     struct V<'a, 'tcx> {
         tcx: TyCtxt<'tcx>,
         fn_did: LocalDefId,
         out: &'a mut FxHashMap<(LocalDefId, HirId), SliceUses>,
         name_of: &'a FxHashMap<(LocalDefId, HirId), String>,
+        mutable_of: &'a rustc_hash::FxHashSet<(LocalDefId, HirId)>,
+        /// Subjects a self-advance may be emitted for: **non-negative sign**
+        /// (the negative class is `SliceCursor`'s, S3.2′-5's) **and** a `mut`
+        /// binding (`p = …` needs one). Both gates are decided where the facts
+        /// live and handed here as one set.
+        advance_ok: &'a rustc_hash::FxHashSet<(LocalDefId, HirId)>,
     }
     impl<'tcx> Visitor<'tcx> for V<'_, 'tcx> {
         fn visit_expr(&mut self, expr: &'tcx Expr<'tcx>) {
@@ -573,7 +617,14 @@ pub(crate) fn collect_slice_uses(
                 let classified = self.classify(expr, key);
                 let entry = self.out.entry(key).or_default();
                 match classified {
-                    Some(edit) => entry.rewrites.push(edit),
+                    // **S3.2′-2b — three outcomes, not two.** The self-advance
+                    // assignment's TARGET (`p` on the left of `p = p.offset(1)`)
+                    // is a use that is in scope and needs NO edit: the binding
+                    // keeps its name. Folding it into the reject arm would make
+                    // the whole subject unsupported; folding it into the accept
+                    // arm would need an edit it does not have.
+                    Some(Some(edit)) => entry.rewrites.push(edit),
+                    Some(None) => {}
                     None => {
                         if entry.unsupported.is_none() {
                             entry.unsupported = Some(expr.span);
@@ -590,13 +641,47 @@ pub(crate) fn collect_slice_uses(
             &self,
             use_expr: &Expr<'_>,
             key: (LocalDefId, HirId),
-        ) -> Option<UseEdit> {
+        ) -> Option<Option<UseEdit>> {
             let name = self.name_of.get(&key)?;
-            // parent must be `p.offset(e)` with THIS expression as receiver
             let parent = self.tcx.parent_hir_node(use_expr.hir_id);
             let rustc_hir::Node::Expr(call) = parent else {
                 return None;
             };
+
+            // **S3.2′-2b — the PLAIN dereference.** `*p` with no arithmetic
+            // under it. On `&[T]` its image is `p[0]`, and it is admitted here
+            // because the census showed it never occurs alone: every subject it
+            // would unblock also self-advances, which is why the two positions
+            // were ratified as one bundle.
+            if matches!(call.kind, ExprKind::Unary(rustc_hir::UnOp::Deref, _)) {
+                // -2's accept-set restoration, unchanged: a BORROW of the deref
+                // is a third position and is still out of scope.
+                if matches!(
+                    self.tcx.parent_hir_node(call.hir_id),
+                    rustc_hir::Node::Expr(e) if matches!(e.kind, ExprKind::AddrOf(..))
+                ) {
+                    return None;
+                }
+                return Some(Some(UseEdit {
+                    span: call.span,
+                    replacement: format!("{name}[0]"),
+                }));
+            }
+
+            // **S3.2′-2b — the self-advance TARGET.** `p` on the left of
+            // `p = p.offset(1)`. In scope, and it needs no edit: the binding
+            // keeps its name. Admitted only when the right-hand side is this
+            // same binding's own arithmetic, so an assignment FROM anything
+            // else stays unsupported.
+            if let ExprKind::Assign(lhs, rhs, _) = &call.kind
+                && lhs.hir_id == use_expr.hir_id
+            {
+                if !self.advance_ok.contains(&key) {
+                    return None;
+                }
+                return self_advance_rhs(self.tcx, rhs, key).map(|_| None);
+            }
+
             let ExprKind::MethodCall(seg, receiver, args, _) = &call.kind else {
                 return None;
             };
@@ -606,10 +691,29 @@ pub(crate) fn collect_slice_uses(
                 return None;
             }
             let [arg] = args else { return None };
-            // grandparent must be the deref
             let rustc_hir::Node::Expr(deref) = self.tcx.parent_hir_node(call.hir_id) else {
                 return None;
             };
+
+            // **S3.2′-2b — the self-advance SOURCE.** `p.offset(e)` on the right
+            // of `p = …`. Its image is the reslice, and the `&mut` form is the
+            // naive reborrow — compiler-witnessed on the pinned toolchain, so no
+            // `mem::take` is needed. Under the NON-NEGATIVE sign verdict only;
+            // the negative class is `SliceCursor`'s, which S3.2′-5 owns.
+            if let ExprKind::Assign(lhs, rhs, _) = &deref.kind
+                && rhs.hir_id == call.hir_id
+                && lhs.hir_id != use_expr.hir_id
+                && self_advance_lhs(lhs, key)
+                && self.advance_ok.contains(&key)
+            {
+                let index = index_text(self.tcx, arg)?;
+                let amp = if self.mutable_of.contains(&key) { "&mut " } else { "&" };
+                return Some(Some(UseEdit {
+                    span: call.span,
+                    replacement: format!("{amp}{name}[{index}..]"),
+                }));
+            }
+
             if !matches!(deref.kind, ExprKind::Unary(rustc_hir::UnOp::Deref, _)) {
                 return None;
             }
@@ -635,10 +739,10 @@ pub(crate) fn collect_slice_uses(
                 return None;
             }
             let index = self.index_text(arg)?;
-            Some(UseEdit {
+            Some(Some(UseEdit {
                 span: deref.span,
                 replacement: format!("{name}[{index}]"),
-            })
+            }))
         }
 
         /// The index expression's source text, **typed as a `usize`**.
@@ -670,7 +774,7 @@ pub(crate) fn collect_slice_uses(
         let Some(body_id) = tcx.hir_node_by_def_id(fn_did).body_id() else {
             continue;
         };
-        let mut v = V { tcx, fn_did, out: &mut out, name_of };
+        let mut v = V { tcx, fn_did, out: &mut out, name_of, mutable_of, advance_ok };
         v.visit_body(tcx.hir_body(body_id));
     }
     out

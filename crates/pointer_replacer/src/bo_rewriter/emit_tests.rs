@@ -2388,6 +2388,10 @@ fn the_classifier_accept_set_equals_the_approved_scope() {
     for (label, body) in [
         ("deref read", "    let mut i: usize = 0;\n    let mut t = 0;\n    while i < n { t += *p.offset(i as isize); i += 1; }\n    core::ptr::null_mut()"),
         ("deref write", "    let mut i: usize = 0;\n    while i < n { *p.offset(i as isize) = 1; i += 1; }\n    core::ptr::null_mut()"),
+        // **S3.2′-2b moved these two INTO the approved scope**, by ruling. The
+        // guard tracks the scope; it does not defend the old one.
+        ("plain deref", "    let _v = *p;\n    core::ptr::null_mut()"),
+        ("self-advance", "    p = p.offset(1);\n    let _v = *p;\n    core::ptr::null_mut()"),
     ] {
         assert_eq!(
             reason_for(body),
@@ -2399,17 +2403,16 @@ fn the_classifier_accept_set_equals_the_approved_scope() {
     // NEGATIVE — every known neighbour, each refused with its own attribution.
     for (label, body) in [
         ("borrow of deref", "    &mut *p.offset(1 as isize)"),
+        // **REBIND is ratified spec (g18) but its ARM is not built** — its
+        // market is 0 and S3.6-gated, so mechanism follows market. It stays a
+        // negative control, and the reason it is refused has changed from "out
+        // of scope" to "in scope, unbuilt". Both mean: must not emit.
         ("rebind", "    let q: *mut i32 = p.offset(1 as isize);\n    q"),
-        // The subject ITSELF advances -- an earlier draft advanced a local copy,
-        // which left `p` with no arithmetic use at all, so it was never a slice
-        // candidate and emitted as a plain `Ref`. The fixture has to make the
-        // SUBJECT carry the position under test.
-        ("self-advance", "    p = p.offset(1 as isize);\n    let _v = *p;\n    core::ptr::null_mut()"),
     ] {
         let got = reason_for(body);
         assert!(
             got == "slice-use-unsupported" || got == "raw-pointer-operation",
-            "{label} is OUTSIDE the approved scope and must be refused with an \
+            "{label} is not emittable today and must be refused with an \
              attribution, got {got:?}"
         );
         assert_ne!(got, "<emitted>", "{label} must not emit");

@@ -1783,7 +1783,29 @@ fn finish_decide<'tcx>(
         .iter()
         .filter_map(|s| s.param_name.clone().map(|n| ((s.fn_did, s.hir_id), n)))
         .collect();
-    let slice_uses = decision::emitability::collect_slice_uses(tcx, &program.functions, &names);
+    // **S3.2′-2b.** The self-advance arm's two gates, decided where their facts
+    // live: the NON-NEGATIVE sign verdict (the negative class is `SliceCursor`'s,
+    // which S3.2′-5 owns) and a `mut` binding, which `p = …` needs. `SignFacts`
+    // becomes load-bearing here — it shipped entry-validated at -3 and read by
+    // nothing.
+    let sign = sign_facts::SignFacts::from_program(&program);
+    let mutable_of: rustc_hash::FxHashSet<_> = subjects
+        .iter()
+        .filter(|s| s.mutable)
+        .map(|s| (s.fn_did, s.hir_id))
+        .collect();
+    let advance_ok: rustc_hash::FxHashSet<_> = subjects
+        .iter()
+        .filter(|s| s.mut_binding && !sign.may_be_negative(s.fn_did, s.local))
+        .map(|s| (s.fn_did, s.hir_id))
+        .collect();
+    let slice_uses = decision::emitability::collect_slice_uses(
+        tcx,
+        &program.functions,
+        &names,
+        &mutable_of,
+        &advance_ok,
+    );
     // **S3.2′-3.** The accessor a subject's uses are rewritten through, chosen
     // per subject by the idiom rule (micro-plan §9c): `unwrap()` where the
     // optional is `Copy` or used once, `as_mut()` otherwise. It has to be

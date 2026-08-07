@@ -529,7 +529,13 @@ fn every_golden_outcome_is_attributed() {
     // not more coverage now. What is load-bearing today is the Emitted arm
     // below and the non-vacuity assertion after it — the former verified by
     // emptying its loop, which fails this test.
-    const EXPECTED_DEGRADED: &[&str] = &[];
+    //
+    // **S3.2′-2b registers the first member.** g18's rebind ARM is deliberately
+    // unbuilt — its market is 0 today and S3.6-gated, and mechanism follows
+    // market — so the golden is ratified spec that degrades. Registering it
+    // here is the intentional edit this guard was designed to force, and it
+    // makes the Degraded arm's assertions load-bearing for the first time.
+    const EXPECTED_DEGRADED: &[&str] = &["g18_reslice_rebind"];
     assert_eq!(
         degraded.iter().copied().collect::<Vec<_>>(),
         EXPECTED_DEGRADED,
@@ -538,9 +544,15 @@ fn every_golden_outcome_is_attributed() {
          Degraded arm's assertions are the ones you want load-bearing, then add \
          the golden to EXPECTED_DEGRADED with a reason."
     );
+    // Against the EXPECTED SET, not against the total: with g18 correctly
+    // degrading, `checked_emitted == GOLDENS.len()` is simply false. Summing the
+    // two arms instead would be unfailable — the match is exhaustive, so the sum
+    // is the total by construction, which is the shape ADV-R4 deleted from this
+    // very test. Subtracting the registered set keeps it failable: a golden that
+    // silently stops emitting drops this count AND changes the set above.
     assert_eq!(
         checked_emitted,
-        GOLDENS.len(),
+        GOLDENS.len() - EXPECTED_DEGRADED.len(),
         "not every golden was classified"
     );
     assert!(
