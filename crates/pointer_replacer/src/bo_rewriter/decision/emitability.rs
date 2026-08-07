@@ -312,21 +312,57 @@ pub(crate) fn collect_slice_uses(
             })
         }
 
-        /// The index expression's source text, as a `usize`.
+        /// The index expression's source text, **typed as a `usize`**.
         ///
         /// C2Rust writes `p.offset(i as isize)`; the `as isize` exists only to
         /// satisfy `offset`, so stripping it recovers the author's index rather
-        /// than inventing a conversion. Anything else is parenthesised and cast,
-        /// which is always well-typed but never pretty — and never silent.
+        /// than inventing a conversion.
+        ///
+        /// # Stripping is not enough, and the corpus said so
+        ///
+        /// The real idiom is a **double** cast — `p.offset(1 as libc::c_int as
+        /// isize)` — so stripping the outer cast leaves a `c_int`, and a slice
+        /// indexed by `i32` is `error[E0277]`. Measured: all 14 decided slices
+        /// reverted, taking two sibling `Ref` emissions down with them, because
+        /// revert granularity is per function.
+        ///
+        /// So the stripped expression's TYPE decides. Already `usize` — the
+        /// shape g11/g12 pin — renders bare, which is what keeps the ratified
+        /// golden text untouched rather than bending spec around a defect.
+        /// Anything else is parenthesised and cast: parenthesised because
+        /// `i + 1 as usize` parses as `i + (1 as usize)`.
         fn index_text(&self, arg: &Expr<'_>) -> Option<String> {
             let sm = self.tcx.sess.source_map();
             if let ExprKind::Cast(inner, ty) = &arg.kind
                 && let rustc_hir::TyKind::Path(rustc_hir::QPath::Resolved(_, p)) = &ty.kind
                 && p.segments.last().is_some_and(|s| s.ident.name.as_str() == "isize")
             {
-                return sm.span_to_snippet(inner.span).ok();
+                let text = sm.span_to_snippet(inner.span).ok()?;
+                return Some(if self.is_usize(inner) {
+                    text
+                } else {
+                    format!("({text}) as usize")
+                });
             }
-            sm.span_to_snippet(arg.span).ok().map(|t| format!("({t}) as usize"))
+            let text = sm.span_to_snippet(arg.span).ok()?;
+            Some(if self.is_usize(arg) {
+                text
+            } else {
+                format!("({text}) as usize")
+            })
+        }
+
+        /// Is this expression already a `usize`?
+        ///
+        /// Asked of the type checker rather than of the syntax: `i`, `n as
+        /// usize` and a `usize`-returning call are all bare-renderable and no
+        /// syntactic test recognises the three.
+        fn is_usize(&self, expr: &Expr<'_>) -> bool {
+            let owner = expr.hir_id.owner.def_id;
+            self.tcx
+                .typeck(owner)
+                .expr_ty_adjusted_opt(expr)
+                .is_some_and(|t| matches!(t.kind(), rustc_middle::ty::TyKind::Uint(rustc_middle::ty::UintTy::Usize)))
         }
     }
 

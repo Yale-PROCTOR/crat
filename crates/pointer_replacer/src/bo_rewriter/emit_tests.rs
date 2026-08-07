@@ -2219,3 +2219,72 @@ fn an_arithmetic_parameter_emits_a_slice_form() {
          and the counter must say so: {row:?}"
     );
 }
+
+/// **The index rendering must survive a NON-`usize` counter — the shape the
+/// corpus actually has.**
+///
+/// c2rust writes `*p.offset(1 as libc::c_int as isize)`: a **double** cast.
+/// Stripping only the outer `as isize` leaves a `c_int`, and
+/// `error[E0277]: the type `[*mut i8]` cannot be indexed by `i32`` is what the
+/// corpus returned — every one of the 14 decided slices reverted, taking two
+/// sibling `Ref` emissions in `heman_draw_colored_circles` with them, because
+/// revert granularity is per-function.
+///
+/// **g11/g12 could not have caught this.** They were transcribed with a `usize`
+/// counter, so stripping the cast happened to yield the right type. A golden
+/// pins the dimensions it fixes; the counter type was left free, and free
+/// dimensions must be either measured-representative of the corpus or covered
+/// by a witness. This is that witness.
+///
+/// *Mutation-tested (Rider 0, deletion first):* reverting `index_text` to strip
+/// the cast unconditionally — dropping the `usize` type test — makes the first
+/// assertion fail, because the rewrite is then ill-typed and the verify loop
+/// reverts it, leaving the source unchanged.
+#[test]
+fn a_non_usize_counter_is_cast_rather_than_stripped() {
+    let src = "#![allow(dead_code, unused_unsafe, unused_mut, unused_variables)]\n\
+               pub unsafe fn f(p: *mut i32) -> i32 {\n\
+               \x20   *p.offset(1 as core::ffi::c_int as isize)\n\
+               }\n";
+    let super::RewriteOutcome::Emitted { source, .. } = super::rewrite_m1(src) else {
+        panic!("fixture must emit");
+    };
+    assert!(
+        source.contains("p[(1 as core::ffi::c_int) as usize]"),
+        "a non-usize index must be parenthesised and cast, or the slice is \
+         indexed by the wrong type:\n{source}"
+    );
+    assert!(
+        source.contains("p: &[i32]"),
+        "the declaration must still become a slice:\n{source}"
+    );
+}
+
+/// **The `usize` path stays byte-identical to the ratified golden text.**
+///
+/// The type-aware repair must not buy corpus correctness by changing what g11
+/// and g12 emit. Asserted on the emitted BYTES rather than left to the goldens'
+/// rustfmt-canonicalised comparison, which would absorb a spurious cast as
+/// whitespace-adjacent noise.
+///
+/// *Mutation-tested (Rider 0, deletion first):* making `index_text` cast
+/// unconditionally emits `p[i as usize]` and fails this — which is exactly the
+/// spec-bending option this repair declined.
+#[test]
+fn a_usize_counter_still_renders_a_bare_index() {
+    let golden = super::goldens_for_reconciliation()
+        .into_iter()
+        .find(|(name, _)| *name == "g11_slice_shared")
+        .expect("g11 is registered");
+    let super::RewriteOutcome::Emitted { source, .. } = super::rewrite_m1(golden.1) else {
+        panic!("g11 must emit");
+    };
+    assert!(
+        source.contains("total += p[i];"),
+        "a usize counter must still render bare — the ratified golden text:\n{source}"
+    );
+    assert!(
+        !source.contains("p[i as usize]"),
+        "the repair added a cast the golden does not have:\n{source}"
+    );
+}
