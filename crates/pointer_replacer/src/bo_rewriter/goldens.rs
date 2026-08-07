@@ -75,6 +75,11 @@ pub(super) const GOLDENS: &[Golden] = goldens![
     "g08_drop_all_paths",
     "g09_pdrop_suppression",
     "g10_mixed_group",
+    // U-5 slice 1. TRANSCRIBED from the ratified §8 table, not authored:
+    // g11 `*const i32` + `len`, indexed read -> `&[i32]`; g12 `*mut i32` +
+    // `len`, indexed write -> `&mut [i32]`. They land with their slice.
+    "g11_slice_shared",
+    "g12_slice_mut",
 ];
 
 /// Run `rustfmt` over a source string with pinned settings.
@@ -151,6 +156,8 @@ golden_test!(g07_non_dropping_store, "g07_nonDropping_store");
 golden_test!(g08_drop_all_paths, "g08_drop_all_paths");
 golden_test!(g09_pdrop_suppression, "g09_pdrop_suppression");
 golden_test!(g10_mixed_group, "g10_mixed_group");
+golden_test!(g11_slice_shared, "g11_slice_shared");
+golden_test!(g12_slice_mut, "g12_slice_mut");
 
 /// The canonicalizer must be a real normalizer, not a pass-through.
 ///
@@ -176,7 +183,12 @@ fn canonicalization_normalizes_whitespace() {
 /// as a confusing diff much later.
 #[test]
 fn every_golden_pair_is_present() {
-    assert_eq!(GOLDENS.len(), 10, "the M0.5 package specifies ten pairs");
+    assert_eq!(
+        GOLDENS.len(),
+        12,
+        "the M0.5 package specifies ten pairs; U-5 slice 1 transcribes g11/g12 \
+         from the ratified §8 table"
+    );
     for g in GOLDENS {
         assert!(!g.input.trim().is_empty(), "{}: empty .input.rs", g.name);
         assert!(
