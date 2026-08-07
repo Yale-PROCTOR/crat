@@ -2288,3 +2288,75 @@ fn a_usize_counter_still_renders_a_bare_index() {
         "the repair added a cast the golden does not have:\n{source}"
     );
 }
+
+/// **THE ACCEPT-SET IS THE SCOPE.** Both authorised positions emit; every known
+/// neighbour position is refused with its own attribution.
+///
+/// # Why this test exists, stated plainly
+///
+/// Twice in this slice the implementation was wider than its own approved
+/// scope: Amendment 1 named the use-site work only after the goldens implied
+/// it, and the classifier then accepted `&mut *p.offset(e)` — a third position —
+/// because it tested the deref's SHAPE without testing its CONTEXT. Scope is
+/// whatever the classifier accepts, so the accept-set has to be pinned against
+/// the scope rather than described in prose beside it.
+///
+/// Positive controls are the two authorised positions; negative controls are the
+/// three neighbours the corpus actually contains. A fourth neighbour appearing
+/// later fails nothing here — but it will be one line to add, and its absence is
+/// now visible rather than assumed.
+///
+/// *Mutation-tested (Rider 0, deletion first):* removing the parent-borrow check
+/// in `classify` makes the borrow-of-deref case emit, failing this.
+#[test]
+fn the_classifier_accept_set_equals_the_approved_scope() {
+    fn reason_for(body: &str) -> String {
+        let src = format!(
+            "#![allow(dead_code, unused_unsafe, unused_mut, unused_variables)]\n\
+             pub unsafe fn f(mut p: *mut i32, n: usize) -> *mut i32 {{\n{body}\n}}\n"
+        );
+        let got = decisions_of(&src);
+        reason_of(&got, "p", true)
+    }
+
+    // POSITIVE — the two positions Amendment 1 authorises.
+    // Control: `p` is ALSO returned bare here, which is itself an unsupported
+    // use, so the subject is refused even though the deref position is
+    // authorised. It pins that the harness is not trivially green — and, more
+    // usefully, that the accept-set is a property of ALL of a subject's uses
+    // rather than of the one the test happens to be looking at.
+    assert_eq!(
+        reason_for("    let mut i: usize = 0;\n    while i < n { let _v = *p.offset(i as isize); i += 1; }\n    p"),
+        "slice-use-unsupported",
+        "an authorised position plus a bare use must still be refused"
+    );
+    for (label, body) in [
+        ("deref read", "    let mut i: usize = 0;\n    let mut t = 0;\n    while i < n { t += *p.offset(i as isize); i += 1; }\n    core::ptr::null_mut()"),
+        ("deref write", "    let mut i: usize = 0;\n    while i < n { *p.offset(i as isize) = 1; i += 1; }\n    core::ptr::null_mut()"),
+    ] {
+        assert_eq!(
+            reason_for(body),
+            "<emitted>",
+            "{label} is an AUTHORISED position and must emit"
+        );
+    }
+
+    // NEGATIVE — every known neighbour, each refused with its own attribution.
+    for (label, body) in [
+        ("borrow of deref", "    &mut *p.offset(1 as isize)"),
+        ("rebind", "    let q: *mut i32 = p.offset(1 as isize);\n    q"),
+        // The subject ITSELF advances -- an earlier draft advanced a local copy,
+        // which left `p` with no arithmetic use at all, so it was never a slice
+        // candidate and emitted as a plain `Ref`. The fixture has to make the
+        // SUBJECT carry the position under test.
+        ("self-advance", "    p = p.offset(1 as isize);\n    let _v = *p;\n    core::ptr::null_mut()"),
+    ] {
+        let got = reason_for(body);
+        assert!(
+            got == "slice-use-unsupported" || got == "raw-pointer-operation",
+            "{label} is OUTSIDE the approved scope and must be refused with an \
+             attribution, got {got:?}"
+        );
+        assert_ne!(got, "<emitted>", "{label} must not emit");
+    }
+}

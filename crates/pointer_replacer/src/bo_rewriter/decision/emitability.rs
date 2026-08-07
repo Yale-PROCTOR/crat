@@ -305,6 +305,27 @@ pub(crate) fn collect_slice_uses(
             if !matches!(deref.kind, ExprKind::Unary(rustc_hir::UnOp::Deref, _)) {
                 return None;
             }
+            // **SCOPE RESTORATION.** Amendment 1 authorises exactly two
+            // positions — the deref READ and the deref WRITE. A BORROW of the
+            // deref is a third, and this classifier accepted it because it
+            // tested the deref's shape without testing its context.
+            //
+            // Measured on the corpus: `lodepng_chunk_data` reads
+            // `return &mut *chunk.offset(8) as *mut c_uchar`, and rewriting it
+            // gave `error[E0596]: cannot borrow chunk[_] as mutable, as it is
+            // behind a & reference`.
+            //
+            // **Scope is whatever the classifier accepts.** The approved scope
+            // and the accept-set are the same object, so the accept-set is
+            // witnessed against the scope — positive controls for both
+            // authorised positions, a negative control for each known
+            // neighbour (borrow-of-deref, rebind, self-advance).
+            if matches!(
+                self.tcx.parent_hir_node(deref.hir_id),
+                rustc_hir::Node::Expr(e) if matches!(e.kind, ExprKind::AddrOf(..))
+            ) {
+                return None;
+            }
             let index = self.index_text(arg)?;
             Some(UseEdit {
                 span: deref.span,
