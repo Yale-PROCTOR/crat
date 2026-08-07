@@ -990,9 +990,9 @@ struct FinalRecord {
     core_families: Vec<String>,
 }
 
-fn render_final_tsv(records: &[FinalRecord]) -> String {
+fn render_final_tsv(records: &[FinalRecord], identity: &MeasurementIdentity) -> String {
     let mut out = String::from(
-        "program\tfield_key\tfield_slot\tdiscovery_class\tresolved_stores\tblocked_address_of\tblocked_unresolved\taccepted_kind\tforce_result\tterminal_bucket\tcore_families\n",
+        "platform\tmachine_id\tprogram\tfield_key\tfield_slot\tdiscovery_class\tresolved_stores\tblocked_address_of\tblocked_unresolved\taccepted_kind\tforce_result\tterminal_bucket\tcore_families\n",
     );
     for record in records {
         let discovery = match record.candidate.discovery {
@@ -1007,7 +1007,9 @@ fn render_final_tsv(records: &[FinalRecord]) -> String {
             ForceResult::Unknown => "unknown",
         };
         out.push_str(&format!(
-            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+            identity.platform,
+            identity.machine_id,
             record.candidate.program,
             record.candidate.field_key,
             record.candidate.field_slot,
@@ -1034,6 +1036,7 @@ fn artifact_path(root: &Path, phase: &str, program: &str, suffix: &str) -> PathB
 #[test]
 #[ignore = "P2/S2-3 derived-corpus diagnosis; run explicitly"]
 fn s23_p2_corpus() {
+    let measurement_identity = MeasurementIdentity::from_env();
     let root = super::orchestrate::workspace_root()
         .canonicalize()
         .expect("canonical workspace root");
@@ -1269,7 +1272,7 @@ fn s23_p2_corpus() {
     }
     fs::write(
         out.join("classification.tsv"),
-        render_final_tsv(&final_records),
+        render_final_tsv(&final_records, &measurement_identity),
     )
     .expect("write final classification");
 
@@ -1326,6 +1329,7 @@ fn s23_p2_corpus() {
     };
     let report = format!(
         "# P2 / S2-3 derived-substrate diagnosis\n\n\
+         - Measurement identity: machine `{}`, platform `{}`; every count and timing below belongs to this identity, and timings are not compared across machines.\n\
          - Screened depth-0 pointer-field universe: **{}**.\n\
          - Re-derived eligible owning-store candidates: **{}** (historical raw-form 155 is context only, not inherited).\n\
          - Targeted tracked-query budget: **{}**; queried **{}**; budget-not-queried **{}**.\n\
@@ -1337,6 +1341,8 @@ fn s23_p2_corpus() {
          ## Deterministic first witnesses\n\n{}\n\
          ## Controls and scope\n\n\
          Discovery completed and the combined candidate/store artifacts were written before any BO solve. The classifier unit test exercises every terminal bucket, including a positive synthetic `Owning accepted` control. A zero bucket is interpreted only against the nonempty screened/eligible populations above. Production analysis code was read-only.\n",
+        measurement_identity.machine_id,
+        measurement_identity.platform,
         final_records.len(),
         eligible_len,
         query_budget,
@@ -1367,7 +1373,9 @@ fn s23_p2_corpus() {
     );
     fs::write(out.join("report.md"), report).expect("write P2 report");
     let provenance = format!(
-        "analysis_worktree_head={}\nsubstrate=derived\nsubstrate_selector={}\nsnapshot={}\nsnapshot_files=100\ndeps_shape=read-only-symlink\nrepair=mode_a\nl2=0\nsafe_mono=per_site\nfork_engine=fork\nmem_cap_mib=8192\nquery_budget={}\nqueried={}\nprobe_wall_sum_s={:.3}\nprobe_peak_rss_kb={:?}\n",
+        "machine_id={}\nplatform={}\nanalysis_worktree_head={}\nsubstrate=derived\nsubstrate_selector={}\nsnapshot={}\nsnapshot_files=100\ndeps_shape=read-only-symlink\nrepair=mode_a\nl2=0\nsafe_mono=per_site\nfork_engine=fork\nmem_cap_mib=8192\nquery_budget={}\nqueried={}\nprobe_wall_sum_s={:.3}\nprobe_peak_rss_kb={:?}\n",
+        measurement_identity.machine_id,
+        measurement_identity.platform,
         super::orchestrate::git_sha(),
         std::env::var("CRAT_BOC1_SUBSTRATE").unwrap_or_else(|_| "default-derived".to_owned()),
         snapshot.display(),
@@ -1379,7 +1387,9 @@ fn s23_p2_corpus() {
     fs::write(out.join("provenance.txt"), provenance).expect("write P2 provenance");
 
     println!(
-        "S23P2 fields={} eligible={} queried={} hard_unsat={} own_assume_cores={} force_sat={} owning_accepted={} budget_not_queried={}",
+        "S23P2 machine_id={} platform={} fields={} eligible={} queried={} hard_unsat={} own_assume_cores={} force_sat={} owning_accepted={} budget_not_queried={}",
+        measurement_identity.machine_id,
+        measurement_identity.platform,
         final_records.len(),
         eligible_len,
         selected.len(),
@@ -1405,14 +1415,52 @@ const P2_CANDIDATE_UNIVERSE_SHA256: &str =
 const P2_QUERY_BUDGET: usize = 200;
 const P2_BROTLI_ELIGIBLE: usize = 112;
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct MeasurementIdentity {
+    machine_id: String,
+    platform: String,
+}
+
+impl MeasurementIdentity {
+    fn parse(machine_id: &str, platform: &str) -> Result<Self, String> {
+        let valid = |value: &str| {
+            !value.is_empty()
+                && value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || b"._-".contains(&byte))
+        };
+        if !valid(machine_id) {
+            return Err("machine identifier must use only [A-Za-z0-9._-]".to_owned());
+        }
+        if !valid(platform) {
+            return Err("platform must use only [A-Za-z0-9._-]".to_owned());
+        }
+        Ok(Self {
+            machine_id: machine_id.to_owned(),
+            platform: platform.to_owned(),
+        })
+    }
+
+    fn from_env() -> Self {
+        let machine_id = std::env::var("CRAT_MEASUREMENT_MACHINE_ID")
+            .expect("measurement requires CRAT_MEASUREMENT_MACHINE_ID");
+        let platform = std::env::var("CRAT_MEASUREMENT_PLATFORM")
+            .expect("measurement requires CRAT_MEASUREMENT_PLATFORM");
+        Self::parse(&machine_id, &platform)
+            .unwrap_or_else(|error| panic!("invalid measurement identity: {error}"))
+    }
+}
+
 struct CheckpointContract {
     corpus_link: PathBuf,
     snapshot: PathBuf,
     base: PathBuf,
     batches: PathBuf,
+    identity: MeasurementIdentity,
 }
 
 fn checkpoint_contract() -> CheckpointContract {
+    let identity = MeasurementIdentity::from_env();
     let root = super::orchestrate::workspace_root()
         .canonicalize()
         .expect("canonical workspace root");
@@ -1505,6 +1553,7 @@ fn checkpoint_contract() -> CheckpointContract {
         snapshot,
         base,
         batches,
+        identity,
     }
 }
 
@@ -1582,14 +1631,9 @@ fn insert_probe_artifact(
 /// and skipped; any unmanifested batch directory is a STOP rather than an
 /// implicit overwrite.
 #[test]
-#[ignore = "P2 brotli checkpoint; run one machine-quiet batch explicitly"]
+#[ignore = "P2 brotli checkpoint; run one dedicated-host batch explicitly"]
 fn s23_p2_brotli_checkpoint() {
     let contract = checkpoint_contract();
-    assert_eq!(
-        std::env::var("CRAT_S23_MACHINE_QUIET").as_deref(),
-        Ok("verified"),
-        "each batch requires a fresh external machine-quiet check"
-    );
     let candidates = checkpoint_candidates(&contract.base);
     let brotli = candidates
         .iter()
@@ -1638,6 +1682,16 @@ fn s23_p2_brotli_checkpoint() {
             "P2 STOP: preserved batch is a failed attempt, not a resumable completion"
         );
         assert_eq!(
+            receipt.get("machine_id").map(String::as_str),
+            Some(contract.identity.machine_id.as_str()),
+            "completed batch belongs to another machine"
+        );
+        assert_eq!(
+            receipt.get("platform").map(String::as_str),
+            Some(contract.identity.platform.as_str()),
+            "completed batch belongs to another platform"
+        );
+        assert_eq!(
             read_target_keys(&batch_dir.join("targets.txt"))
                 .unwrap_or_else(|error| panic!("completed batch targets: {error}")),
             keys,
@@ -1658,7 +1712,9 @@ fn s23_p2_brotli_checkpoint() {
             "P2 STOP: completed checkpoint contains solver Unknown"
         );
         println!(
-            "S23P2BATCH batch={} status=verified-skip candidates={}",
+            "S23P2BATCH machine_id={} platform={} batch={} status=verified-skip candidates={}",
+            contract.identity.machine_id,
+            contract.identity.platform,
             batch_index,
             range.end - range.start
         );
@@ -1714,7 +1770,9 @@ fn s23_p2_brotli_checkpoint() {
     fs::write(
         &receipt,
         format!(
-            "batch={batch_index}\nprogram=brotli\nstatus={}\nanalysis_head={}\nbase_harness_head={}\nbase_manifest_sha256={}\nsnapshot={}\nmachine_quiet=verified\nbatch_size={}\nwall_cap_s={}\nrange_start={}\nrange_end={}\nqueried={}\nfirst_key={}\nlast_key={}\nwall_s={:.3}\nwall_s_per_candidate={:.6}\npeak_rss_kb={}\nworker_t_total_s={}\nhard_unsat={}\nforce_sat={}\nsolver_unknown={}\naccepted_owning={}\n",
+            "machine_id={}\nplatform={}\nmachine_protocol=dedicated-host\nbatch={batch_index}\nprogram=brotli\nstatus={}\nanalysis_head={}\nbase_harness_head={}\nbase_manifest_sha256={}\nsnapshot={}\nbatch_size={}\nwall_cap_s={}\nrange_start={}\nrange_end={}\nqueried={}\nfirst_key={}\nlast_key={}\nwall_s={:.3}\nwall_s_per_candidate={:.6}\npeak_rss_kb={}\nworker_t_total_s={}\nhard_unsat={}\nforce_sat={}\nsolver_unknown={}\naccepted_owning={}\n",
+            contract.identity.machine_id,
+            contract.identity.platform,
             outcome.status,
             super::orchestrate::git_sha(),
             P2_BASE_HARNESS_HEAD,
@@ -1775,7 +1833,9 @@ fn s23_p2_brotli_checkpoint() {
     );
     seal_batch();
     println!(
-        "S23P2BATCH batch={} status=ok candidates={} wall_s={:.3} wall_s_per_candidate={:.6} peak_rss_kb={}",
+        "S23P2BATCH machine_id={} platform={} batch={} status=ok candidates={} wall_s={:.3} wall_s_per_candidate={:.6} peak_rss_kb={}",
+        contract.identity.machine_id,
+        contract.identity.platform,
         batch_index,
         keys.len(),
         outcome.wall_s,
@@ -1791,6 +1851,12 @@ fn s23_p2_brotli_checkpoint() {
 #[ignore = "P2 checkpoint aggregate; run after all brotli batches"]
 fn s23_p2_checkpoint_aggregate() {
     let contract = checkpoint_contract();
+    let platform_equivalence = std::env::var("CRAT_S23_PLATFORM_EQUIVALENCE")
+        .expect("aggregate requires the recorded batch-0 platform-equivalence verdict");
+    assert_eq!(
+        platform_equivalence, "brotli-batch-000-verdict-and-core-families-identical",
+        "aggregate refuses an unrecognized platform-equivalence verdict"
+    );
     let candidates = checkpoint_candidates(&contract.base);
     assert_eq!(candidates.len(), 410, "screened field population drifted");
     let selected = selected_checkpoint_candidates(&candidates);
@@ -1882,8 +1948,12 @@ fn s23_p2_checkpoint_aggregate() {
             .unwrap_or_else(|error| panic!("batch {batch_index} receipt: {error}"));
         assert_eq!(receipt.get("status").map(String::as_str), Some("ok"));
         assert_eq!(
-            receipt.get("machine_quiet").map(String::as_str),
-            Some("verified")
+            receipt.get("machine_id").map(String::as_str),
+            Some(contract.identity.machine_id.as_str())
+        );
+        assert_eq!(
+            receipt.get("platform").map(String::as_str),
+            Some(contract.identity.platform.as_str())
         );
         assert_eq!(
             receipt.get("queried").and_then(|value| value.parse().ok()),
@@ -1994,7 +2064,10 @@ fn s23_p2_checkpoint_aggregate() {
     let batch_table = batch_stats
         .iter()
         .map(|(index, queried, wall, per_candidate, peak)| {
-            format!("| {index} | {queried} | {wall:.3} | {per_candidate:.6} | {peak} |")
+            format!(
+                "| {} | {} | {index} | {queried} | {wall:.3} | {per_candidate:.6} | {peak} |",
+                contract.identity.platform, contract.identity.machine_id
+            )
         })
         .collect::<Vec<_>>()
         .join("\n");
@@ -2015,10 +2088,13 @@ fn s23_p2_checkpoint_aggregate() {
     let per_program = aggregate.join("per-program.tsv");
     let report = aggregate.join("report.md");
     let provenance = aggregate.join("provenance.txt");
-    fs::write(&classification, render_final_tsv(&final_records))
-        .expect("write checkpoint classification");
+    fs::write(
+        &classification,
+        render_final_tsv(&final_records, &contract.identity),
+    )
+    .expect("write checkpoint classification");
     let mut combined = String::from(
-        "program\tfield_key\tfield_slot\taccepted_kind\tforce_result\tcore_families\tcore_labels\n",
+        "platform\tmachine_id\tprogram\tfield_key\tfield_slot\taccepted_kind\tforce_result\tcore_families\tcore_labels\n",
     );
     for ((program, _), probe) in &probes {
         let force = match probe.force_result {
@@ -2028,7 +2104,9 @@ fn s23_p2_checkpoint_aggregate() {
             ForceResult::NotQueried => "not-queried",
         };
         combined.push_str(&format!(
-            "{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+            contract.identity.platform,
+            contract.identity.machine_id,
             program,
             probe.field_key,
             probe.field_slot,
@@ -2040,7 +2118,7 @@ fn s23_p2_checkpoint_aggregate() {
     }
     fs::write(&combined_probes, combined).expect("write combined probes");
     let mut per_program_rows = String::from(
-        "program\tscreened\teligible\tno_owned_capable_store\tstore_blocked\tqueried\thard_unsat\tforce_sat\tsolver_unknown\tbudget_not_queried\taccepted_raw\taccepted_ref\taccepted_owning\n",
+        "platform\tmachine_id\tprogram\tscreened\teligible\tno_owned_capable_store\tstore_blocked\tqueried\thard_unsat\tforce_sat\tsolver_unknown\tbudget_not_queried\taccepted_raw\taccepted_ref\taccepted_owning\n",
     );
     for corpus_program in super::CORPUS {
         let rows = final_records
@@ -2059,7 +2137,9 @@ fn s23_p2_checkpoint_aggregate() {
                 .count()
         };
         per_program_rows.push_str(&format!(
-            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+            contract.identity.platform,
+            contract.identity.machine_id,
             corpus_program.name,
             rows.len(),
             count_discovery(DiscoveryClass::Eligible),
@@ -2083,7 +2163,10 @@ fn s23_p2_checkpoint_aggregate() {
     fs::write(
         &report,
         format!(
-            "# P2 / S2-3 checkpointed derived-substrate diagnosis\n\n- Screened depth-0 pointer-field universe: **{}**.\n- Eligible owning-store candidates: **261**; no owned-capable store: **{}**; store-blocked: **{}**.\n- Capped tracked-query partition: **200 queried + {} budget-not-queried = 261**.\n- Query result: hard-UNSAT **{}**; force-own SAT **{}**; solver Unknown **0**.\n- Ordinary accepted kinds among queried candidates: Raw **{}**, Ref **{}**, Owning **{}**.\n- Preserved non-brotli rows: **88**, reverified through base manifest `{}`.\n- Brotli checkpoint rows: **112**; batch wall sum **{wall_sum:.3}s**; default cap **8,192 MiB**.\n- Raw tracked cores containing `own-assume`: **{own_assume}/{}**; containing `link-own`: **{link_own}/{}**.\n- Terminal counts: `{terminal_counts}`.\n- Core-family incidence (raw tracked cores; incidence, not necessity): `{core_counts}`.\n\n## Brotli checkpoints\n\n| batch | candidates | wall s | wall s / candidate | peak RSS KiB |\n|---:|---:|---:|---:|---:|\n{batch_table}\n\nThe first batch supplies the observed per-candidate sizing number. Every batch was launched separately under the machine-quiet precondition and wrote its own SHA-256 manifest before the next launch. The aggregate launched no corpus worker and formed only after all 200 selected candidates were present exactly once. Production analysis code remained read-only.\n",
+            "# P2 / S2-3 checkpointed derived-substrate diagnosis\n\n- Measurement identity: machine `{}`, platform `{}`; every count and timing below belongs to this identity. Timings are not compared across machines.\n- Cross-platform control: `{}`.\n- Screened depth-0 pointer-field universe: **{}**.\n- Eligible owning-store candidates: **261**; no owned-capable store: **{}**; store-blocked: **{}**.\n- Capped tracked-query partition: **200 queried + {} budget-not-queried = 261**.\n- Query result: hard-UNSAT **{}**; force-own SAT **{}**; solver Unknown **0**.\n- Ordinary accepted kinds among queried candidates: Raw **{}**, Ref **{}**, Owning **{}**.\n- Preserved non-brotli rows: **88**, reverified through base manifest `{}`.\n- Brotli checkpoint rows: **112**; Linux-local batch wall sum **{wall_sum:.3}s**; default cap **8,192 MiB**.\n- Raw tracked cores containing `own-assume`: **{own_assume}/{}**; containing `link-own`: **{link_own}/{}**.\n- Terminal counts: `{terminal_counts}`.\n- Core-family incidence (raw tracked cores; incidence, not necessity): `{core_counts}`.\n\n## Brotli checkpoints\n\n| platform | machine id | batch | candidates | wall s | wall s / candidate | peak RSS KiB |\n|---|---|---:|---:|---:|---:|---:|\n{batch_table}\n\nThe first batch supplies only this machine's sizing number. Every batch ran serially on the dedicated Linux lane and wrote its own SHA-256 manifest before the next launch. The aggregate launched no corpus worker and formed only after all 200 selected candidates were present exactly once. Production analysis code remained read-only.\n",
+            contract.identity.machine_id,
+            contract.identity.platform,
+            platform_equivalence,
             final_records.len(),
             bucket_counts
                 .get(TerminalBucket::NoOwnedCapableStore.label())
@@ -2111,7 +2194,10 @@ fn s23_p2_checkpoint_aggregate() {
     fs::write(
         &provenance,
         format!(
-            "analysis_worktree_head={}\nbase_harness_head={}\nbase_manifest_sha256={}\ncandidate_universe_sha256={}\nsubstrate=derived\nsubstrate_selector={}\nsnapshot={}\nsnapshot_files=100\ndeps_shape=read-only-symlink\nrepair=mode_a\nl2=0\nsafe_mono=per_site\nfork_engine=fork\nmem_cap_mib=8192\nquery_budget={}\nqueried={}\npreserved_rows={}\nbrotli_rows={}\nbatch_size={}\nbatches={}\nbatch_wall_sum_s={:.3}\n",
+            "machine_id={}\nplatform={}\nplatform_equivalence={}\nanalysis_worktree_head={}\nbase_harness_head={}\nbase_manifest_sha256={}\ncandidate_universe_sha256={}\nsubstrate=derived\nsubstrate_selector={}\nsnapshot={}\nsnapshot_files=100\ndeps_shape=read-only-symlink\nrepair=mode_a\nl2=0\nsafe_mono=per_site\nfork_engine=fork\nmem_cap_mib=8192\nquery_budget={}\nqueried={}\npreserved_rows={}\nbrotli_rows={}\nbatch_size={}\nbatches={}\nbatch_wall_sum_s={:.3}\ntiming_comparison=forbidden-across-machines\n",
+            contract.identity.machine_id,
+            contract.identity.platform,
+            platform_equivalence,
             super::orchestrate::git_sha(),
             P2_BASE_HARNESS_HEAD,
             P2_BASE_MANIFEST_SHA256,
@@ -2144,7 +2230,9 @@ fn s23_p2_checkpoint_aggregate() {
     verify_sha256_manifest(&aggregate, &aggregate_manifest)
         .unwrap_or_else(|error| panic!("verify aggregate manifest: {error}"));
     println!(
-        "S23P2AGG fields={} eligible=261 queried={} hard_unsat={} force_sat={} accepted_raw={} accepted_ref={} accepted_owning={} budget_not_queried={} own_assume_cores={} link_own_cores={}",
+        "S23P2AGG machine_id={} platform={} fields={} eligible=261 queried={} hard_unsat={} force_sat={} accepted_raw={} accepted_ref={} accepted_owning={} budget_not_queried={} own_assume_cores={} link_own_cores={}",
+        contract.identity.machine_id,
+        contract.identity.platform,
         final_records.len(),
         probes.len(),
         hard_unsat.len(),
@@ -2167,6 +2255,13 @@ mod tests {
 
     #[test]
     fn checkpoint_batches_cover_112_once_with_bounded_sizes() {
+        let identity = MeasurementIdentity::parse("lambda7", "linux-x86_64")
+            .expect("valid measurement identity");
+        assert_eq!(identity.machine_id, "lambda7");
+        assert_eq!(identity.platform, "linux-x86_64");
+        assert!(MeasurementIdentity::parse("", "linux-x86_64").is_err());
+        assert!(MeasurementIdentity::parse("lambda7", "linux\tx86_64").is_err());
+
         let ranges = checkpoint_batch_ranges(112, 24).expect("valid checkpoint plan");
         assert_eq!(
             ranges
