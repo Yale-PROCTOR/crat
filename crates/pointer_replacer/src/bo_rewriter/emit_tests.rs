@@ -1651,6 +1651,13 @@ fn reason_of(got: &[(String, bool, String)], name: &str, is_param: bool) -> Stri
 /// against the pre-repair build first: `p` came back `ref-shared`, so it
 /// genuinely reached the gate and was waved through.
 ///
+/// **Fixture op changed at S3.2′-2, deliberately.** It was `*p.offset(1)`.
+/// `offset` is now a slice-ARITHMETIC op, so an arithmetic use on a local takes
+/// the new `slice-local-construction` arm and this test would have been
+/// asserting the wrong gate. `is_null` is a raw-only use that is *not*
+/// arithmetic, so the fixture again exercises exactly the gate the test names.
+/// The arithmetic case is not lost — it has its own witness below.
+///
 /// *Mutation-tested (Rider 0, deletion first), with the claim CORRECTED after
 /// measurement:* deleting the `binding_hir` insert does **not** restore
 /// `ref-shared` — an earlier draft of this comment said it would. With the map
@@ -1667,7 +1674,7 @@ fn reason_of(got: &[(String, bool, String)], name: &str, is_param: bool) -> Stri
 fn a_raw_only_method_on_a_local_degrades_it() {
     let got = decisions_of(
         "#![allow(dead_code, unused_unsafe, unused_variables)]\n\
-         pub unsafe fn f(a: *mut i32) -> i32 { let p: *mut i32 = a; *p.offset(1) }\n",
+         pub unsafe fn f(a: *mut i32) -> bool { let p: *mut i32 = a; p.is_null() }\n",
     );
     assert_eq!(
         reason_of(&got, "p", false),
@@ -2118,5 +2125,97 @@ fn an_unfreed_subject_carries_a_present_false_not_an_absent_column() {
         row.freed,
         Some(false),
         "producer A must state the fact it has, not abstain: {row:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// S3.2′-2 — borrowed slices
+// ---------------------------------------------------------------------------
+
+/// **An arithmetic op on a LOCAL takes the slice arm, and stops at
+/// construction.**
+///
+/// The counterpart to `a_raw_only_method_on_a_local_degrades_it`: the same
+/// shape, an arithmetic op instead of a non-arithmetic one, landing on a
+/// different reason. A parameter needs no construction — the caller supplies the
+/// slice — but a local's initializer is a raw-pointer expression that would need
+/// `from_raw_parts` and a length. Scoped out and counted, not attempted.
+///
+/// *Mutation-tested (Rider 0, deletion first):* deleting the `SubjectKind::Local`
+/// arm in `decide_one` makes this read `slice-use-unsupported` (the local's own
+/// initializer use is not `*p.offset(e)`), so the local would be silently
+/// reclassified rather than named.
+#[test]
+fn an_arithmetic_op_on_a_local_stops_at_slice_construction() {
+    let got = decisions_of(
+        "#![allow(dead_code, unused_unsafe, unused_variables)]\n\
+         pub unsafe fn f(a: *mut i32) -> i32 { let p: *mut i32 = a; *p.offset(1) }\n",
+    );
+    assert_eq!(
+        reason_of(&got, "p", false),
+        "slice-local-construction",
+        "an arithmetic use on a local must take the slice arm and stop at \
+         construction, with its own reason: {got:?}"
+    );
+}
+
+/// **A non-arithmetic raw-only use blocks the slice arm — checked over the WHOLE
+/// use set, not the first.**
+///
+/// `p` carries `offset` *and* `is_null`. A first-wins reading of
+/// `raw_only_uses` meets `offset` first and concludes "arithmetic, emit a
+/// slice" — and `p.is_null()` on `&[i32]` does not compile. This is the reason
+/// that map holds a vector.
+///
+/// *Mutation-tested (Rider 0, deletion first):* replacing the `all(..)` in
+/// `decide_one` with a test of `uses.first()` makes this emit a slice, and the
+/// emitted crate does not type-check.
+#[test]
+fn a_mixed_use_set_refuses_the_slice_arm() {
+    let got = decisions_of(
+        "#![allow(dead_code, unused_unsafe, unused_variables)]\n\
+         pub unsafe fn f(p: *mut i32) -> i32 { if p.is_null() { return 0; } *p.offset(1) }\n",
+    );
+    assert_eq!(
+        reason_of(&got, "p", true),
+        "raw-pointer-operation",
+        "a subject with a non-arithmetic use must not reach the slice arm: {got:?}"
+    );
+}
+
+/// **The fatness LICENSE is required, not merely corroborating in name.**
+///
+/// Op-facts supply the need; fatness supplies the license. Mutating the
+/// conjunct away is the check that it is wired at all — on the corpus it
+/// excludes 0 of 1,690, so only a fixture can distinguish "required" from
+/// "present but unread".
+///
+/// *Mutation-tested (Rider 0, deletion first):* deleting
+/// `&& fat.is_array(..)` from `decide_one`'s guard leaves this green (the
+/// subject reads `arr` anyway) — recorded as the mutation this witness does
+/// **not** kill, which is why the conjunct's vacuity is reported as measured
+/// rather than claimed as load-bearing. What it does pin is that an arithmetic
+/// subject reaching the slice arm emits a slice form at all.
+#[test]
+fn an_arithmetic_parameter_emits_a_slice_form() {
+    let rows = artifact_rows_of(
+        "#![allow(dead_code, unused_unsafe, unused_variables)]\n\
+         pub unsafe fn f(p: *mut i32, n: usize) { let mut i: usize = 0; \
+         while i < n { *p.offset(i as isize) = 1; i += 1; } }\n",
+    );
+    let row = rows
+        .iter()
+        .find(|r| r.param_name.as_deref() == Some("p"))
+        .unwrap_or_else(|| panic!("no subject p: {rows:?}"));
+    assert_eq!(
+        row.outcome,
+        Some(crate::coverage_recon::schema::Outcome::SliceMut),
+        "an arithmetic, array-licensed parameter must take a slice form: {row:?}"
+    );
+    assert_eq!(
+        row.approx_len,
+        Some(true),
+        "a parameter has no construction site, so its length is approximated \
+         and the counter must say so: {row:?}"
     );
 }

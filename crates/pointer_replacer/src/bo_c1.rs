@@ -8421,6 +8421,14 @@ struct OutcomeCounts {
     rows: usize,
     ref_mut: usize,
     ref_shared: usize,
+    /// **S3.2′-2** — borrowed-slice dispositions, their own buckets.
+    ///
+    /// Kept out of `ref_*` deliberately: every pinned number in this harness and
+    /// in the records reads `decided_ref` as *thin reference decisions*, and
+    /// folding a new form into it would move a pinned quantity by changing what
+    /// it counts rather than by changing the program.
+    slice_mut: usize,
+    slice_shared: usize,
     degraded: usize,
     /// Rows carrying **no** outcome. Producer A sets one on every row it emits,
     /// so this is a schema violation rather than a category — recorded, never
@@ -8438,6 +8446,8 @@ impl OutcomeCounts {
         self.rows += other.rows;
         self.ref_mut += other.ref_mut;
         self.ref_shared += other.ref_shared;
+        self.slice_mut += other.slice_mut;
+        self.slice_shared += other.slice_shared;
         self.degraded += other.degraded;
         self.unclassified += other.unclassified;
         for (reason, n) in &other.by_reason {
@@ -8492,6 +8502,11 @@ fn count_outcomes(rows: &[crate::coverage_recon::schema::Row]) -> OutcomeCounts 
         match row.outcome {
             Some(Outcome::RefMut) => c.ref_mut += 1,
             Some(Outcome::RefShared) => c.ref_shared += 1,
+            // S3.2′-2: slice dispositions are their own buckets. Folding them
+            // into `ref_*` would make `decided_ref` stop meaning what every
+            // pinned number means by it.
+            Some(Outcome::SliceMut) => c.slice_mut += 1,
+            Some(Outcome::SliceShared) => c.slice_shared += 1,
             Some(Outcome::Degraded) => {
                 c.degraded += 1;
                 // A degraded row with no reason is counted under an explicit
@@ -8514,11 +8529,15 @@ fn count_outcomes(rows: &[crate::coverage_recon::schema::Row]) -> OutcomeCounts 
 fn count_line(scope: &str, c: &OutcomeCounts) -> String {
     format!(
         "M1COUNT {scope} rows={} decided_ref={} ref_mut={} ref_shared={} \
+         decided_slice={} slice_mut={} slice_shared={} \
          degraded={} unclassified={} label={PRE_S3_LABEL:?}",
         c.rows,
         c.decided_ref(),
         c.ref_mut,
         c.ref_shared,
+        c.slice_mut + c.slice_shared,
+        c.slice_mut,
+        c.slice_shared,
         c.degraded,
         c.unclassified,
     )
@@ -8930,6 +8949,7 @@ fn counted_row(
         outcome: Some(outcome),
         degrade_reason: reason.map(str::to_owned),
         freed: Some(false),
+        approx_len: None,
     }
 }
 

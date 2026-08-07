@@ -36,6 +36,7 @@
 //! | `binding_span_lo/hi` | `null` | ✓ | **SPAN axis** — B's half, and the activation signal |
 //! | `outcome`, `degrade_reason` | ✓ | `null` | S2b consumes; not compared |
 //! | `freed` | ✓ | `null` | co-attribution; not compared |
+//! | `approx_len` | ✓ | `null` | U-2′ counter; not compared |
 //!
 //! `decl_span` (the rendered string) is not reconciled: A's span is the declared
 //! *type*'s span, and the nearest MIR-side fact is the *binding*'s span, so an
@@ -80,6 +81,9 @@ pub(crate) enum Outcome {
     RefMut,
     RefShared,
     Degraded,
+    /// **S3.2′-2** — a borrowed slice form, `&[T]` / `&mut [T]`.
+    SliceShared,
+    SliceMut,
 }
 
 /// Whether the pairing for this row can be trusted.
@@ -223,6 +227,15 @@ pub(crate) struct Row {
     /// derivation for this, so a `false` from B would be a claim it cannot
     /// support — the silently-agreeing field that F1 was.
     pub freed: Option<bool>,
+    /// **U-2′'s assumption-violation counter.** `Some(true)` when a slice
+    /// subject's length was approximated rather than recovered at a construction
+    /// site; `None` on any non-slice row, so the counter's denominator is the
+    /// slice population.
+    ///
+    /// Producer A only. Under theorem option (ii) the exact-length assumption
+    /// fails exactly on the flagged set, so this is a **measured number** the
+    /// paper reports per program and corpus-wide, not a caveat.
+    pub approx_len: Option<bool>,
 }
 
 impl Row {

@@ -928,33 +928,44 @@ fn production_subjects_carry_a_real_hir_binding() {
     );
 }
 
-/// **No emission phase names fatness — and, for S3.2′-1, nor does `decision`.**
+/// **No EMISSION phase names fatness.**
 ///
-/// The `decision/**` half is what makes S3.2′-1's central claim checkable: the
-/// slice asserts it changes no decision, and only a mechanized ban distinguishes
-/// *"not wired"* from *"wired but currently dormant"*. The two look identical in
-/// every corpus number.
+/// # The `decision/` entry was LIFTED at S3.2′-2 (U-5), as a named task
+///
+/// The ban covered `decision/` for the duration of S3.2′-1, whose claim was that
+/// it changed no decision — and only a mechanized ban distinguishes *"not
+/// wired"* from *"wired but currently dormant"*, since the two look identical in
+/// every corpus number. That claim is spent: S3.2′-2 consumes fatness as the
+/// borrowed-slice **license**, so the entry is lifted deliberately rather than
+/// eroded.
+///
+/// The lift was scheduled for S3.2′-4 by U-4. **U-5 re-sequenced the ladder and
+/// -2 now leads it**, so the entry moves with the slice that needs it, not with
+/// the slice number that happened to be written down.
+///
+/// `apply/` and `plan/` stay banned **permanently**: emission consumes a
+/// `Decision`, never an analysis result. Narrowing the scan rather than deleting
+/// the test is the point — the ban still has teeth over the two phases whose
+/// analysis-blindness is architectural.
 ///
 /// *Mutation-tested (Rider 0, deletion first):* adding
-/// `use crate::analyses::type_qualifier::…` to `decision/mod.rs` — the exact
-/// shape S3.2′-4 will add deliberately — fails this test and names the file.
+/// `use crate::analyses::type_qualifier::…` to `plan/mod.rs` or `apply/mod.rs`
+/// fails this test and names the file.
 #[test]
 fn emission_and_decision_phases_do_not_name_fatness() {
     let root = module_root();
     let scoped = |p: &Path| {
         let s = p.display().to_string();
         // Skip everything that is NOT one of the three regulated phases.
-        !(s.contains("/decision/") || s.contains("/apply/") || s.contains("/plan/"))
-            || is_test_only_file(p)
+        !(s.contains("/apply/") || s.contains("/plan/")) || is_test_only_file(p)
     };
     let violations = scan_production(root, &scoped, &fatness_offense);
     assert!(
         violations.is_empty(),
-        "a regulated phase names fatness. `apply/` and `plan/` are banned \
+        "an EMISSION phase names fatness. `apply/` and `plan/` are banned \
          permanently — emission consumes a `Decision`, never an analysis \
-         result. `decision/` is banned for the duration of S3.2′-1, whose \
-         claim is that it changes no decision; S3.2′-4 lifts that entry as a \
-         named task:\n  {}",
+         result. (`decision/` was lifted at S3.2′-2 under U-5, deliberately: it \
+         consumes fatness as the borrowed-slice license.):\n  {}",
         violations.join("\n  ")
     );
 }

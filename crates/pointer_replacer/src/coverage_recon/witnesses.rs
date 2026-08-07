@@ -25,6 +25,7 @@ fn full_row() -> Row {
         outcome: Some(Outcome::Degraded),
         degrade_reason: Some("kind-raw".to_owned()),
         freed: Some(true),
+        approx_len: Some(false),
     }
 }
 
@@ -46,6 +47,7 @@ fn bare_row(fn_path: &str, local: u32, name: Option<&str>, arg: Option<u32>, dep
         outcome: None,
         degrade_reason: None,
         freed: None,
+        approx_len: None,
     }
 }
 
@@ -98,7 +100,7 @@ fn encoding_is_byte_exact_and_never_omits_a_field() {
     let full = encode(&[full_row()]);
     assert_eq!(
         full,
-        r#"{"fn_path":"m::f","mir_local":1,"param_name":"p","arg_index":1,"ptr_depth":1,"pairing_confidence":"high","decl_span":"<main.rs>:3:14: 3:22","decl_span_lo":50,"decl_span_hi":58,"binding_span_lo":null,"binding_span_hi":null,"decl_shape":"raw-ptr","outcome":"degraded","degrade_reason":"kind-raw","freed":true}
+        r#"{"fn_path":"m::f","mir_local":1,"param_name":"p","arg_index":1,"ptr_depth":1,"pairing_confidence":"high","decl_span":"<main.rs>:3:14: 3:22","decl_span_lo":50,"decl_span_hi":58,"binding_span_lo":null,"binding_span_hi":null,"decl_shape":"raw-ptr","outcome":"degraded","degrade_reason":"kind-raw","freed":true,"approx_len":false}
 "#,
         "fully-populated row encoding drifted"
     );
@@ -106,7 +108,7 @@ fn encoding_is_byte_exact_and_never_omits_a_field() {
     let bare = encode(&[bare_row("g", 2, None, None, 0)]);
     assert_eq!(
         bare,
-        r#"{"fn_path":"g","mir_local":2,"param_name":null,"arg_index":null,"ptr_depth":0,"pairing_confidence":"high","decl_span":null,"decl_span_lo":null,"decl_span_hi":null,"binding_span_lo":null,"binding_span_hi":null,"decl_shape":null,"outcome":null,"degrade_reason":null,"freed":null}
+        r#"{"fn_path":"g","mir_local":2,"param_name":null,"arg_index":null,"ptr_depth":0,"pairing_confidence":"high","decl_span":null,"decl_span_lo":null,"decl_span_hi":null,"binding_span_lo":null,"binding_span_hi":null,"decl_shape":null,"outcome":null,"degrade_reason":null,"freed":null,"approx_len":null}
 "#,
         "all-optionals-absent row encoding drifted"
     );
@@ -129,6 +131,7 @@ fn encoding_is_byte_exact_and_never_omits_a_field() {
         "outcome",
         "degrade_reason",
         "freed",
+        "approx_len",
     ] {
         assert!(
             bare.contains(&format!("\"{field}\":")),

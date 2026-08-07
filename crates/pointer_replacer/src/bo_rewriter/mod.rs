@@ -386,7 +386,7 @@ fn rewrite_core_injected(
             // before the repair. A `match` makes the next disposition a compile
             // error at this site.
             match decision {
-                decision::Decision::Ref { .. } => {}
+                decision::Decision::Ref { .. } | decision::Decision::Slice { .. } => {}
                 decision::Decision::Degraded(_) => continue,
             }
             let owner = tcx.def_path_str(subject.fn_did.to_def_id());
@@ -971,6 +971,7 @@ fn collect_subjects(
                 ) && mut_facts.is_mutable(fn_did, local),
                 // Stamped in `finish_decide`, once, over both universes.
                 freed_at: None,
+                len_recovered: false,
             });
         }
     }
@@ -1171,6 +1172,7 @@ fn collect_local_subjects(
                 ) && mut_facts.is_mutable(fn_did, local),
                 // Stamped in `finish_decide`, once, over both universes.
                 freed_at: None,
+                len_recovered: false,
             });
         }
     }
@@ -1734,13 +1736,31 @@ fn finish_decide<'tcx>(
     let freed = decision::FreedBindings::from_resolved(
         &free_sites(tcx, &program.functions).resolved,
     );
+    // U-2′'s length recovery, from the SAME construction recognizer the facts
+    // join reports `len_class` from — one authority, so the flag and the census
+    // cannot disagree about which subjects have a recovered length.
+    let ctors = decision::construction::collect(tcx, &program.functions);
     for subject in &mut subjects {
         subject.freed_at = freed.site_of(subject.fn_did, subject.hir_id);
+        subject.len_recovered = !matches!(subject.kind, decision::SubjectKind::Param { .. })
+            && ctors
+                .by_binding
+                .get(&(subject.fn_did, subject.hir_id))
+                .is_some_and(|c| matches!(c.len_class(), "array-len" | "alloc-count"));
     }
 
     perturb(&mut subjects);
     let facts = decision::emitability::collect(tcx, &program.functions);
-    let table = decision::decide(tcx, &subjects, &model, &slots, &facts);
+    // S3.2′-2: the fatness LICENSE and the use-site rewrites, both consumed
+    // here in the decision phase and nowhere later — E1's rule that no phase
+    // after this one asks an analysis a question.
+    let fat = fat_facts::FatFacts::from_program(&program);
+    let names: rustc_hash::FxHashMap<_, _> = subjects
+        .iter()
+        .filter_map(|s| s.param_name.clone().map(|n| ((s.fn_did, s.hir_id), n)))
+        .collect();
+    let slice_uses = decision::emitability::collect_slice_uses(tcx, &program.functions, &names);
+    let table = decision::decide(tcx, &subjects, &model, &slots, &facts, &fat, &slice_uses);
 
     // Structural self-check: the table matches the subjects it was handed. NOT
     // the coverage gate — every comparison in it is against the collector's own
@@ -1854,6 +1874,9 @@ pub(crate) fn facts_join_tsv(tcx: TyCtxt<'_>) -> Result<String, String> {
             .facts
             .raw_only_uses
             .get(&(s.fn_did, s.hir_id))
+            // FIRST, as before: the reported op and site are unchanged byte for
+            // byte by the vector change.
+            .and_then(|uses| uses.first())
             .map(|(op, _)| op.as_str())
             .unwrap_or("-");
         let is_param = matches!(s.kind, decision::SubjectKind::Param { .. });
@@ -2216,6 +2239,7 @@ fn freed_slots_tsv_from(
                 (s.fn_did, s.local),
                 match d {
                     decision::Decision::Ref { .. } => "emitted-ref".to_owned(),
+                    decision::Decision::Slice { .. } => "emitted-slice".to_owned(),
                     decision::Decision::Degraded(r) => r.reason.key().to_owned(),
                 },
             )

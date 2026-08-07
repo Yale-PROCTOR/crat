@@ -179,6 +179,17 @@ pub(crate) struct Subject {
     /// attribution site are the same fact, and splitting them is how a gate
     /// ends up degrading with a declaration site that says nothing about why.
     pub freed_at: Option<Span>,
+    /// **U-2′** — did the construction-site recognizer recover a real length?
+    ///
+    /// Stamped alongside `freed_at`, from the same single pass. `false` is the
+    /// approximation path, which U-2′ ratified as the PRIMARY one for borrowed
+    /// forms (measured 2.8 % recoverable over the slice market), with this flag
+    /// as the assumption-violation counter rather than a caveat.
+    ///
+    /// A parameter has no construction site in its own crate, so it reads
+    /// `false` — *"this analysis did not recover a length"*, a statement about
+    /// reach, never a claim about the program. Same rule as `param-no-site`.
+    pub len_recovered: bool,
 }
 
 /// Bindings passed to a deallocator, keyed exactly as A1's emitability gates are
@@ -347,6 +358,23 @@ pub(crate) enum DegradeReason {
     /// freed subject whose kind is `Ref` is exactly the case that has neither
     /// name nor counter if they are merged.
     FreedSlot,
+    /// The subject is a borrowed-slice candidate whose **uses** cannot all be
+    /// rewritten — some occurrence is not `*p.offset(e)`.
+    ///
+    /// Blocking for the whole subject, never partially applied: `&[T]` changes
+    /// the type at every occurrence, so rewriting the recognized uses and
+    /// leaving the rest is an ill-typed crate rather than a partial win.
+    SliceUseUnsupported,
+    /// The subject is a borrowed-slice candidate but is a **local**, so a slice
+    /// value would have to be CONSTRUCTED at its initializer.
+    ///
+    /// A parameter needs no construction — the caller supplies the slice, and on
+    /// this market no in-crate caller exists (every subject is
+    /// non-`referenced`). A local's initializer is a raw-pointer expression that
+    /// would need `from_raw_parts` and a length, which is a different mechanism
+    /// with a different soundness argument. Scoped out of this slice explicitly
+    /// and counted, rather than attempted.
+    SliceLocalConstruction,
 }
 
 impl DegradeReason {
@@ -369,6 +397,8 @@ impl DegradeReason {
             DegradeReason::UnsupportedDeclShape { .. } => "unsupported-decl-shape",
             DegradeReason::NoDeclaredType => "no-declared-type",
             DegradeReason::FreedSlot => "freed-slot",
+            DegradeReason::SliceUseUnsupported => "slice-use-unsupported",
+            DegradeReason::SliceLocalConstruction => "slice-local-construction",
         }
     }
 }
@@ -386,6 +416,18 @@ pub(crate) struct Degradation {
 pub(crate) enum Decision {
     /// Emit a reference form: `&T` or `&mut T`.
     Ref { mutable: bool },
+    /// **S3.2′-2 — emit a borrowed slice form: `&[T]` or `&mut [T]`.**
+    ///
+    /// Carries its use-site rewrites, because a slice form is the first M1
+    /// disposition that is **not declaration-only**: `p.offset(i)` does not
+    /// exist on `&[T]`, so the declaration edit alone yields an ill-typed
+    /// crate. The rewrites are computed HERE, where HIR and the analyses are
+    /// available, and handed to `plan` as data — E1's rule that no later phase
+    /// asks an analysis a question.
+    Slice {
+        mutable: bool,
+        uses: Vec<emitability::UseEdit>,
+    },
     /// Not emitted, with the reason ATTRIBUTED. **A first-class outcome.**
     ///
     /// §1.6 admits only conflict-non-increasing rewrites; everything outside
@@ -449,7 +491,7 @@ impl DecisionTable {
     pub(crate) fn degradations(&self) -> impl Iterator<Item = &Degradation> {
         self.entries.iter().filter_map(|(_, d)| match d {
             Decision::Degraded(record) => Some(record),
-            Decision::Ref { .. } => None,
+            Decision::Ref { .. } | Decision::Slice { .. } => None,
         })
     }
 
@@ -478,11 +520,13 @@ pub(crate) fn decide(
     model: &FxHashMap<SlotRef, SlotKind>,
     slots: &CrateSlots,
     facts: &EmitabilityFacts,
+    fat: &super::fat_facts::FatFacts,
+    slice_uses: &FxHashMap<(LocalDefId, rustc_hir::HirId), emitability::SliceUses>,
 ) -> DecisionTable {
     let entries = subjects
         .iter()
         .map(|subject| {
-            let decision = decide_one(tcx, subject, model, slots, facts);
+            let decision = decide_one(tcx, subject, model, slots, facts, fat, slice_uses);
             (subject.clone(), decision)
         })
         .collect();
@@ -503,6 +547,8 @@ fn decide_one(
     model: &FxHashMap<SlotRef, SlotKind>,
     slots: &CrateSlots,
     facts: &EmitabilityFacts,
+    fat: &super::fat_facts::FatFacts,
+    slice_uses: &FxHashMap<(LocalDefId, rustc_hir::HirId), emitability::SliceUses>,
 ) -> Decision {
     let decl_site = EmitabilityFacts::site(tcx, subject.attribution_span());
 
@@ -554,13 +600,39 @@ fn decide_one(
     // A1 emitability: BO says a reference is SOUND; these say whether one can
     // actually be EMITTED. Both are decision-phase questions, which is the
     // whole point — S1 let them fall through to an anonymous gate failure.
-    if let Some((op, span)) = facts.raw_only_uses.get(&(subject.fn_did, subject.hir_id)) {
-        return degrade(
-            subject,
-            EmitabilityFacts::site(tcx, *span),
-            DegradeReason::RawPointerOperation { op: op.clone() },
-        );
-    }
+    // **S3.2′-2 — the borrowed-slice arm.** A raw-only use is not automatically
+    // a degradation any more: if EVERY such use is arithmetic and fatness
+    // independently concludes array, the subject wants a slice form rather than
+    // a reference.
+    //
+    // The authority split is deliberate and measured (micro-plan §1):
+    // **op-facts supply the NEED** — this pointer indexes, so a slice is the
+    // form — and **fatness supplies the LICENSE**, since `Arr` is evidence
+    // forced down the lattice while `Ptr` is an unconstrained default that
+    // licenses nothing. Fatness ALONE would convert 138 subjects that already
+    // emit thin references, inventing a length for pointers that never index.
+    //
+    // `all` over the whole use vector, never the first: a subject carrying both
+    // `offset` and `is_null` must not read as arithmetic because the walk met
+    // `offset` first.
+    let raw_uses = facts.raw_only_uses.get(&(subject.fn_did, subject.hir_id));
+    let wants_slice = match raw_uses {
+        Some(uses) => {
+            let all_arithmetic = uses
+                .iter()
+                .all(|(op, _)| emitability::SLICE_ARITHMETIC_OPS.contains(&op.as_str()));
+            if !all_arithmetic || !fat.is_array(subject.fn_did, subject.local) {
+                let (op, span) = uses.first().expect("a recorded use vector is non-empty");
+                return degrade(
+                    subject,
+                    EmitabilityFacts::site(tcx, *span),
+                    DegradeReason::RawPointerOperation { op: op.clone() },
+                );
+            }
+            true
+        }
+        None => false,
+    };
     if let Some(span) = facts.ptr_comparisons.get(&(subject.fn_did, subject.hir_id)) {
         return degrade(
             subject,
@@ -591,8 +663,32 @@ fn decide_one(
         );
     }
 
-    Decision::Ref {
+    if !wants_slice {
+        return Decision::Ref {
+            mutable: subject.mutable,
+        };
+    }
+
+    // A local would need the slice VALUE constructed at its initializer —
+    // `from_raw_parts` and a length. Different mechanism, different soundness
+    // argument; scoped out of this slice and counted rather than attempted.
+    if matches!(subject.kind, SubjectKind::Local) {
+        return degrade(subject, decl_site, DegradeReason::SliceLocalConstruction);
+    }
+    let uses = slice_uses
+        .get(&(subject.fn_did, subject.hir_id))
+        .cloned()
+        .unwrap_or_default();
+    if let Some(span) = uses.unsupported {
+        return degrade(
+            subject,
+            EmitabilityFacts::site(tcx, span),
+            DegradeReason::SliceUseUnsupported,
+        );
+    }
+    Decision::Slice {
         mutable: subject.mutable,
+        uses: uses.rewrites,
     }
 }
 
@@ -625,6 +721,7 @@ mod self_consistency_tests {
             decl_shape: DeclShape::RawPtr,
             mutable: true,
             freed_at: None,
+            len_recovered: false,
         }
     }
 

@@ -70,6 +70,14 @@ pub(crate) fn rows(tcx: TyCtxt<'_>, table: &DecisionTable) -> Vec<Row> {
                     },
                     None,
                 ),
+                Decision::Slice { mutable, .. } => (
+                    if *mutable {
+                        Outcome::SliceMut
+                    } else {
+                        Outcome::SliceShared
+                    },
+                    None,
+                ),
                 Decision::Degraded(record) => {
                     (Outcome::Degraded, Some(record.reason.key().to_owned()))
                 }
@@ -129,6 +137,16 @@ pub(crate) fn rows(tcx: TyCtxt<'_>, table: &DecisionTable) -> Vec<Row> {
                 // population as empty for exactly as long as something else
                 // happens to stop it first.
                 freed: Some(subject.freed_at.is_some()),
+                // U-2′'s assumption-violation counter. `Some(true)` means this
+                // subject's length was NOT recovered at a construction site, so
+                // the emitted form rests on the approximation rather than on a
+                // measured extent. Only meaningful on a slice disposition;
+                // `None` elsewhere, so the counter's denominator is the slice
+                // population and not the universe.
+                approx_len: match decision {
+                    Decision::Slice { .. } => Some(!subject.len_recovered),
+                    _ => None,
+                },
             }
         })
         .collect()
@@ -158,6 +176,7 @@ mod tests {
             decl_shape: DeclShape::RawPtr,
             mutable: true,
             freed_at: None,
+            len_recovered: false,
         }
     }
 

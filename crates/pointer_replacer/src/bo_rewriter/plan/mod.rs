@@ -235,8 +235,10 @@ pub(crate) fn plan(
         // `Unplaceable` record — measured with a variant probe before the
         // repair: the build named only `artifact::rows` and `degradations()`.
         // A `match` makes the next disposition a compile error at this site.
-        let mutable = match decision {
-            Decision::Ref { mutable } => mutable,
+        let (mutable, slice_uses) = match decision {
+            Decision::Ref { mutable } => (mutable, None),
+            // S3.2′-2: the first disposition that is not declaration-only.
+            Decision::Slice { mutable, uses } => (mutable, Some(uses)),
             // Degraded subjects produce no edit BY DESIGN — the decision phase
             // already recorded why, and re-deciding here would duplicate the
             // authority the architecture puts in one place.
@@ -350,18 +352,51 @@ pub(crate) fn plan(
             });
             continue;
         };
-        let replacement = if *mutable {
-            format!("&mut {pointee}")
-        } else {
-            format!("&{pointee}")
+        let replacement = match (slice_uses.is_some(), *mutable) {
+            (false, true) => format!("&mut {pointee}"),
+            (false, false) => format!("&{pointee}"),
+            (true, true) => format!("&mut [{pointee}]"),
+            (true, false) => format!("&[{pointee}]"),
         };
+        // The USE-SITE edits, placed before the declaration edit is pushed so a
+        // use that cannot be located takes the whole subject with it. A subject
+        // whose declaration is spliced while one use is left raw is an
+        // ill-typed crate, not a partial rewrite.
+        let mut use_edits = Vec::new();
+        let mut use_failure = None;
+        for use_edit in slice_uses.into_iter().flatten() {
+            match span_to_loc(use_edit.span) {
+                Ok((file, lo, hi)) if file == ty_file => use_edits.push(Edit {
+                    lo,
+                    hi,
+                    replacement: use_edit.replacement.clone(),
+                    justification: Justification::KindDecision { kind: "Slice(use)" },
+                    owner_fn: owner_of(subject),
+                }),
+                Ok(_) => use_failure = Some("slice use is in a different file from the declaration"),
+                Err(reason) => use_failure = Some(reason),
+            }
+        }
+        if let Some(reason) = use_failure {
+            unplaceable.push(Unplaceable {
+                reason,
+                detail: attribution(),
+                subject: identity(),
+            });
+            continue;
+        }
+        let kind = match (slice_uses.is_some(), *mutable) {
+            (false, true) => "Ref(mut)",
+            (false, false) => "Ref(shared)",
+            (true, true) => "Slice(mut)",
+            (true, false) => "Slice(shared)",
+        };
+        by_file.entry(ty_file.clone()).or_default().extend(use_edits);
         by_file.entry(ty_file).or_default().push(Edit {
             lo: ty_lo,
             hi: ty_hi,
             replacement,
-            justification: Justification::KindDecision {
-                kind: if *mutable { "Ref(mut)" } else { "Ref(shared)" },
-            },
+            justification: Justification::KindDecision { kind },
             owner_fn: owner_of(subject),
         });
     }
@@ -393,6 +428,7 @@ mod tests {
             decl_shape: DeclShape::Alias,
             mutable: false,
             freed_at: None,
+            len_recovered: false,
         }
     }
 

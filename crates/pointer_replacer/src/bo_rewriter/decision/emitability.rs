@@ -72,8 +72,19 @@ pub(crate) struct EmitabilityFacts {
     /// Any path reference to a local fn now counts, which subsumes direct
     /// calls, address-taking, and fn-pointer casts uniformly.
     pub referenced: FxHashMap<LocalDefId, Vec<Span>>,
-    /// `(fn, param HirId) -> (method name, use span)` — first raw-only use.
-    pub raw_only_uses: FxHashMap<(LocalDefId, HirId), (String, Span)>,
+    /// `(fn, param HirId) -> every raw-only use, in HIR walk order`.
+    ///
+    /// **A `Vec`, not a first-wins entry, since S3.2′-2.** Attribution still
+    /// takes `.first()` — the reported op and site are unchanged, byte for byte.
+    /// What the vector adds is the question the slice arm has to ask and a
+    /// first-wins map cannot answer: *are ALL of this subject's raw-only uses
+    /// arithmetic?*
+    ///
+    /// The hazard is concrete. A subject carrying both `offset` and `is_null`
+    /// records whichever the walk met first. If that is `offset`, a first-wins
+    /// reading says "arithmetic, emit a slice" — and `p.is_null()` on `&[T]`
+    /// does not compile. The slice arm needs the whole set or it is unsound.
+    pub raw_only_uses: FxHashMap<(LocalDefId, HirId), Vec<(String, Span)>>,
     /// **F5:** `(fn, param HirId) -> comparison span`.
     ///
     /// A pointer comparison is a blocking precondition in BOTH directions, and
@@ -141,7 +152,8 @@ impl<'tcx> Visitor<'tcx> for BodyFacts<'_> {
                     self.facts
                         .raw_only_uses
                         .entry((self.fn_did, hir_id))
-                        .or_insert((method, expr.span));
+                        .or_default()
+                        .push((method, expr.span));
                 }
             }
             // (2) ANY reference to a local fn — call, address-taken, or the
@@ -179,7 +191,8 @@ impl<'tcx> Visitor<'tcx> for BodyFacts<'_> {
                     self.facts
                         .raw_only_uses
                         .entry((self.fn_did, hir_id))
-                        .or_insert(("as-cast".to_owned(), expr.span));
+                        .or_default()
+                        .push(("as-cast".to_owned(), expr.span));
                 }
             }
             _ => {}
@@ -194,4 +207,136 @@ impl EmitabilityFacts {
     pub(crate) fn site(tcx: TyCtxt<'_>, span: Span) -> String {
         tcx.sess.source_map().span_to_diagnostic_string(span)
     }
+}
+
+/// The arithmetic ops a borrowed-slice form can absorb.
+///
+/// A strict subset of [`RAW_ONLY_METHODS`], and deliberately narrower than the
+/// §1(g) op table: only the two the addressable market actually carries. Adding
+/// a member is adding a rewrite rule, so the list grows from evidence like its
+/// parent does.
+pub(crate) const SLICE_ARITHMETIC_OPS: &[&str] = &["offset", "offset_from"];
+
+/// One rewritable use of a slice subject: the span to replace, and the text.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct UseEdit {
+    pub span: Span,
+    pub replacement: String,
+}
+
+/// What a subject's uses permit.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct SliceUses {
+    pub rewrites: Vec<UseEdit>,
+    /// A use that is **not** `*p.offset(e)`.
+    ///
+    /// Any such use blocks the whole subject. `&[T]` changes the type at every
+    /// occurrence, so a rewrite that fixes the uses it recognizes and leaves the
+    /// rest is not a partial win — it is an ill-typed crate.
+    pub unsupported: Option<Span>,
+}
+
+/// Collect, per binding, the `*p.offset(e)` uses and whether anything else uses
+/// the binding at all.
+///
+/// **Total over uses, not over recognized uses** — the distinction is the whole
+/// soundness argument. The walk visits every path expression resolving to a
+/// local and classifies it; a use that does not match the rewritable shape sets
+/// `unsupported` rather than being skipped.
+pub(crate) fn collect_slice_uses(
+    tcx: TyCtxt<'_>,
+    functions: &[LocalDefId],
+    name_of: &FxHashMap<(LocalDefId, HirId), String>,
+) -> FxHashMap<(LocalDefId, HirId), SliceUses> {
+    struct V<'a, 'tcx> {
+        tcx: TyCtxt<'tcx>,
+        fn_did: LocalDefId,
+        out: &'a mut FxHashMap<(LocalDefId, HirId), SliceUses>,
+        name_of: &'a FxHashMap<(LocalDefId, HirId), String>,
+    }
+    impl<'tcx> Visitor<'tcx> for V<'_, 'tcx> {
+        fn visit_expr(&mut self, expr: &'tcx Expr<'tcx>) {
+            if let ExprKind::Path(QPath::Resolved(_, path)) = &expr.kind
+                && let Res::Local(hir_id) = path.res
+            {
+                let key = (self.fn_did, hir_id);
+                // Classify BEFORE taking the entry: `classify` reads `self`, and
+                // holding the map entry across it would be a borrow conflict.
+                let classified = self.classify(expr, key);
+                let entry = self.out.entry(key).or_default();
+                match classified {
+                    Some(edit) => entry.rewrites.push(edit),
+                    None => {
+                        if entry.unsupported.is_none() {
+                            entry.unsupported = Some(expr.span);
+                        }
+                    }
+                }
+            }
+            intravisit::walk_expr(self, expr);
+        }
+    }
+    impl V<'_, '_> {
+        /// `*p.offset(e)` — and nothing else — yields an edit.
+        fn classify(
+            &self,
+            use_expr: &Expr<'_>,
+            key: (LocalDefId, HirId),
+        ) -> Option<UseEdit> {
+            let name = self.name_of.get(&key)?;
+            // parent must be `p.offset(e)` with THIS expression as receiver
+            let parent = self.tcx.parent_hir_node(use_expr.hir_id);
+            let rustc_hir::Node::Expr(call) = parent else {
+                return None;
+            };
+            let ExprKind::MethodCall(seg, receiver, args, _) = &call.kind else {
+                return None;
+            };
+            if receiver.hir_id != use_expr.hir_id
+                || !SLICE_ARITHMETIC_OPS.contains(&seg.ident.name.to_string().as_str())
+            {
+                return None;
+            }
+            let [arg] = args else { return None };
+            // grandparent must be the deref
+            let rustc_hir::Node::Expr(deref) = self.tcx.parent_hir_node(call.hir_id) else {
+                return None;
+            };
+            if !matches!(deref.kind, ExprKind::Unary(rustc_hir::UnOp::Deref, _)) {
+                return None;
+            }
+            let index = self.index_text(arg)?;
+            Some(UseEdit {
+                span: deref.span,
+                replacement: format!("{name}[{index}]"),
+            })
+        }
+
+        /// The index expression's source text, as a `usize`.
+        ///
+        /// C2Rust writes `p.offset(i as isize)`; the `as isize` exists only to
+        /// satisfy `offset`, so stripping it recovers the author's index rather
+        /// than inventing a conversion. Anything else is parenthesised and cast,
+        /// which is always well-typed but never pretty — and never silent.
+        fn index_text(&self, arg: &Expr<'_>) -> Option<String> {
+            let sm = self.tcx.sess.source_map();
+            if let ExprKind::Cast(inner, ty) = &arg.kind
+                && let rustc_hir::TyKind::Path(rustc_hir::QPath::Resolved(_, p)) = &ty.kind
+                && p.segments.last().is_some_and(|s| s.ident.name.as_str() == "isize")
+            {
+                return sm.span_to_snippet(inner.span).ok();
+            }
+            sm.span_to_snippet(arg.span).ok().map(|t| format!("({t}) as usize"))
+        }
+    }
+
+    let mut out = FxHashMap::default();
+    for &fn_did in functions {
+        let Some(body_id) = tcx.hir_node_by_def_id(fn_did).body_id() else {
+            continue;
+        };
+        let mut v = V { tcx, fn_did, out: &mut out, name_of };
+        v.visit_body(tcx.hir_body(body_id));
+    }
+    out
 }

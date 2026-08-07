@@ -289,7 +289,10 @@ fn facts_for_source(src: &str) -> FactSnapshot {
             raw_only: facts
                 .raw_only_uses
                 .iter()
-                .map(|((did, _), (op, _))| (tcx.def_path_str(did.to_def_id()), op.clone()))
+                .filter_map(|((did, _), uses)| {
+                    uses.first()
+                        .map(|(op, _)| (tcx.def_path_str(did.to_def_id()), op.clone()))
+                })
                 .collect(),
             referenced: facts
                 .referenced
