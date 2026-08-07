@@ -84,6 +84,14 @@ pub(crate) enum Outcome {
     /// **S3.2′-2** — a borrowed slice form, `&[T]` / `&mut [T]`.
     SliceShared,
     SliceMut,
+    /// **S3.2′-3** — an optional form, `Option<&T>` / `Option<&mut T>` and their
+    /// fat twins. Four values rather than two because the reference axis and the
+    /// fatness axis are independently reported everywhere else, and collapsing
+    /// them here would make the artifact the one place they are not.
+    OptRefShared,
+    OptRefMut,
+    OptSliceShared,
+    OptSliceMut,
 }
 
 /// Whether the pairing for this row can be trusted.

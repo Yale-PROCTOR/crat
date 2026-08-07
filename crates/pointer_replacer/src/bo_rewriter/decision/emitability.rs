@@ -236,6 +236,314 @@ pub(crate) struct SliceUses {
     pub unsupported: Option<Span>,
 }
 
+/// The index expression's source text, **typed as a `usize`**.
+///
+/// C2Rust writes `p.offset(i as isize)`; the `as isize` exists only to satisfy
+/// `offset`, so stripping it recovers the author's index rather than inventing
+/// a conversion.
+///
+/// # Stripping is not enough, and the corpus said so
+///
+/// The real idiom is a **double** cast — `p.offset(1 as libc::c_int as isize)` —
+/// so stripping the outer cast leaves a `c_int`, and a slice indexed by `i32` is
+/// `error[E0277]`. Measured: all 14 decided slices reverted, taking two sibling
+/// `Ref` emissions down with them, because revert granularity is per function.
+///
+/// So the stripped expression's TYPE decides. Already `usize` — the shape
+/// g11/g12 pin — renders bare, which is what keeps the ratified golden text
+/// untouched rather than bending spec around a defect. Anything else is
+/// parenthesised and cast: parenthesised because `i + 1 as usize` parses as
+/// `i + (1 as usize)`.
+///
+/// **S3.2′-3: lifted out of the slice collector unchanged**, so the optional
+/// slice twin renders indices by the same rule rather than by a second copy of
+/// it. One canonicalizer, the standing rule.
+fn index_text(tcx: TyCtxt<'_>, arg: &Expr<'_>) -> Option<String> {
+    /// Is this expression already a `usize`?
+    ///
+    /// Asked of the type checker rather than of the syntax: `i`, `n as usize`
+    /// and a `usize`-returning call are all bare-renderable and no syntactic
+    /// test recognises the three.
+    fn is_usize(tcx: TyCtxt<'_>, expr: &Expr<'_>) -> bool {
+        let owner = expr.hir_id.owner.def_id;
+        tcx.typeck(owner)
+            .expr_ty_adjusted_opt(expr)
+            .is_some_and(|t| {
+                matches!(
+                    t.kind(),
+                    rustc_middle::ty::TyKind::Uint(rustc_middle::ty::UintTy::Usize)
+                )
+            })
+    }
+
+    let sm = tcx.sess.source_map();
+    if let ExprKind::Cast(inner, ty) = &arg.kind
+        && let rustc_hir::TyKind::Path(rustc_hir::QPath::Resolved(_, p)) = &ty.kind
+        && p.segments.last().is_some_and(|s| s.ident.name.as_str() == "isize")
+    {
+        let text = sm.span_to_snippet(inner.span).ok()?;
+        return Some(if is_usize(tcx, inner) {
+            text
+        } else {
+            format!("({text}) as usize")
+        });
+    }
+    let text = sm.span_to_snippet(arg.span).ok()?;
+    Some(if is_usize(tcx, arg) {
+        text
+    } else {
+        format!("({text}) as usize")
+    })
+}
+
+/// How many of a binding's uses are **not** the null test.
+///
+/// The multiplicity half of the idiom rule, needed *before* the collector runs
+/// because it decides which accessor the collector substitutes. Counting the
+/// same walk twice is the price of that ordering, and it is a cheap HIR pass —
+/// the alternative is a collector that rewrites its own output after the fact.
+pub(crate) fn non_test_use_count(tcx: TyCtxt<'_>, fn_did: LocalDefId, binding: HirId) -> usize {
+    struct V<'a, 'tcx> {
+        tcx: TyCtxt<'tcx>,
+        binding: HirId,
+        count: &'a mut usize,
+    }
+    impl<'tcx> Visitor<'tcx> for V<'_, 'tcx> {
+        fn visit_expr(&mut self, expr: &'tcx Expr<'tcx>) {
+            if let ExprKind::Path(QPath::Resolved(_, path)) = &expr.kind
+                && let Res::Local(hir_id) = path.res
+                && hir_id == self.binding
+            {
+                let is_null_test = matches!(
+                    self.tcx.parent_hir_node(expr.hir_id),
+                    rustc_hir::Node::Expr(p)
+                        if matches!(
+                            &p.kind,
+                            ExprKind::MethodCall(seg, receiver, _, _)
+                                if receiver.hir_id == expr.hir_id
+                                    && seg.ident.name.as_str() == "is_null"
+                        )
+                );
+                if !is_null_test {
+                    *self.count += 1;
+                }
+            }
+            intravisit::walk_expr(self, expr);
+        }
+    }
+    let Some(body_id) = tcx.hir_node_by_def_id(fn_did).body_id() else {
+        return 0;
+    };
+    let mut count = 0;
+    let mut v = V {
+        tcx,
+        binding,
+        count: &mut count,
+    };
+    v.visit_body(tcx.hir_body(body_id));
+    count
+}
+
+/// The two spellings one optional subject needs, because `unwrap()` and
+/// `as_mut()` unwrap to different depths.
+///
+/// `Option<&T>::unwrap()` yields `&T` — one deref to the pointee.
+/// `Option<&mut T>::as_mut().unwrap()` yields `&mut &mut T` — two. So the
+/// dereferencing position needs an extra `*` in the second case, while the
+/// indexing position needs none in either (indexing auto-derefs). Carrying both
+/// spellings is what keeps that asymmetry out of the call sites.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Accessor {
+    /// Substituted for the binding at a `*p` position.
+    pub deref: String,
+    /// The base, for `…[i]`.
+    pub index: String,
+}
+
+/// **S3.2′-3 — what an OPTIONAL subject's uses permit.**
+///
+/// Same all-or-nothing contract as [`SliceUses`], and for a stronger reason:
+/// `Option<&T>` changes the type at *every* occurrence, including the plain
+/// `*p` a reference form left alone. There is no partial optional rewrite.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct OptUses {
+    pub rewrites: Vec<UseEdit>,
+    /// A use with no image under the wrapper.
+    pub unsupported: Option<Span>,
+    /// Uses that are not the null test — the multiplicity half of the idiom
+    /// rule (micro-plan §9c).
+    pub non_test_uses: usize,
+}
+
+/// Collect, per binding, the uses an **optional** form must rewrite.
+///
+/// # The two ratified idioms, and why the choice is not stylistic
+///
+/// - `Option<&T>` is `Copy`, so `unwrap()` may be spelled at every use.
+/// - `Option<&mut T>` is **not**. `unwrap()` moves it — fine exactly once, which
+///   is g02's ratified text, and ill-typed twice. More than one use therefore
+///   takes `as_mut()`, which is g05's.
+///
+/// # One substitution, three positions
+///
+/// The edit replaces the **binding's own path expression**, not the enclosing
+/// expression, so a single replacement text serves every dereferencing position:
+///
+/// | source | replacement of `p` | result |
+/// |---|---|---|
+/// | `*p` | `p.unwrap()` | `*p.unwrap()` |
+/// | `*p = e` | `p.unwrap()` | `*p.unwrap() = e` |
+/// | `(*p).f` | `p.unwrap()` | `(*p.unwrap()).f` |
+/// | `*p` (mut, multi-use) | `*p.as_mut().unwrap()` | `**p.as_mut().unwrap()` |
+///
+/// The null test is the one exception: it replaces the whole call, because
+/// `is_null` and `is_none` are different names — and `!p.is_null()` collapses to
+/// `p.is_some()`, g05's spelling, rather than the correct-but-graceless
+/// `!p.is_none()`.
+pub(crate) fn collect_opt_uses(
+    tcx: TyCtxt<'_>,
+    functions: &[LocalDefId],
+    name_of: &FxHashMap<(LocalDefId, HirId), String>,
+    accessor_of: &FxHashMap<(LocalDefId, HirId), Accessor>,
+    fat: &rustc_hash::FxHashSet<(LocalDefId, HirId)>,
+) -> FxHashMap<(LocalDefId, HirId), OptUses> {
+    struct V<'a, 'tcx> {
+        tcx: TyCtxt<'tcx>,
+        fn_did: LocalDefId,
+        out: &'a mut FxHashMap<(LocalDefId, HirId), OptUses>,
+        name_of: &'a FxHashMap<(LocalDefId, HirId), String>,
+        accessor_of: &'a FxHashMap<(LocalDefId, HirId), Accessor>,
+        fat: &'a rustc_hash::FxHashSet<(LocalDefId, HirId)>,
+    }
+    impl<'tcx> Visitor<'tcx> for V<'_, 'tcx> {
+        fn visit_expr(&mut self, expr: &'tcx Expr<'tcx>) {
+            if let ExprKind::Path(QPath::Resolved(_, path)) = &expr.kind
+                && let Res::Local(hir_id) = path.res
+                && self.name_of.contains_key(&(self.fn_did, hir_id))
+            {
+                let key = (self.fn_did, hir_id);
+                let classified = self.classify(expr, key);
+                let entry = self.out.entry(key).or_default();
+                match classified {
+                    Some((edit, is_non_test)) => {
+                        entry.rewrites.push(edit);
+                        entry.non_test_uses += usize::from(is_non_test);
+                    }
+                    None => {
+                        entry.non_test_uses += 1;
+                        if entry.unsupported.is_none() {
+                            entry.unsupported = Some(expr.span);
+                        }
+                    }
+                }
+            }
+            intravisit::walk_expr(self, expr);
+        }
+    }
+    impl V<'_, '_> {
+        /// `Some((edit, is_a_non_test_use))`, or `None` for a use with no image.
+        fn classify(
+            &self,
+            use_expr: &Expr<'_>,
+            key: (LocalDefId, HirId),
+        ) -> Option<(UseEdit, bool)> {
+            let name = self.name_of.get(&key)?;
+            let accessor = self.accessor_of.get(&key)?;
+            let rustc_hir::Node::Expr(p) = self.tcx.parent_hir_node(use_expr.hir_id) else {
+                return None;
+            };
+            match &p.kind {
+                ExprKind::MethodCall(seg, receiver, _, _)
+                    if receiver.hir_id == use_expr.hir_id
+                        && seg.ident.name.as_str() == "is_null" =>
+                {
+                    if let rustc_hir::Node::Expr(not) = self.tcx.parent_hir_node(p.hir_id)
+                        && matches!(not.kind, ExprKind::Unary(rustc_hir::UnOp::Not, _))
+                    {
+                        return Some((
+                            UseEdit {
+                                span: not.span,
+                                replacement: format!("{name}.is_some()"),
+                            },
+                            false,
+                        ));
+                    }
+                    Some((
+                        UseEdit {
+                            span: p.span,
+                            replacement: format!("{name}.is_none()"),
+                        },
+                        false,
+                    ))
+                }
+                ExprKind::Unary(rustc_hir::UnOp::Deref, _) => Some((
+                    UseEdit {
+                        span: use_expr.span,
+                        replacement: accessor.deref.clone(),
+                    },
+                    true,
+                )),
+                // **The fat twin's arithmetic position.** `*p.offset(e)` on an
+                // `Option<&[T]>` is `p.unwrap()[e]` — the -2 rewrite with the
+                // wrapper's accessor in front of it, which is why the index is
+                // rendered by the SAME `index_text` and not a second copy.
+                //
+                // Admitted only for subjects fatness licensed: on a thin
+                // optional this position has no image, and falling through to
+                // `None` is the correct refusal.
+                ExprKind::MethodCall(seg, receiver, args, _)
+                    if receiver.hir_id == use_expr.hir_id
+                        && self.fat.contains(&key)
+                        && SLICE_ARITHMETIC_OPS.contains(&seg.ident.name.to_string().as_str()) =>
+                {
+                    let [arg] = args else { return None };
+                    let rustc_hir::Node::Expr(deref) = self.tcx.parent_hir_node(p.hir_id) else {
+                        return None;
+                    };
+                    if !matches!(deref.kind, ExprKind::Unary(rustc_hir::UnOp::Deref, _)) {
+                        return None;
+                    }
+                    // -2's accept-set restoration carries over verbatim: a
+                    // BORROW of the deref is a third position, and it is not in
+                    // scope here either.
+                    if matches!(
+                        self.tcx.parent_hir_node(deref.hir_id),
+                        rustc_hir::Node::Expr(e) if matches!(e.kind, ExprKind::AddrOf(..))
+                    ) {
+                        return None;
+                    }
+                    let index = index_text(self.tcx, arg)?;
+                    Some((
+                        UseEdit {
+                            span: deref.span,
+                            replacement: format!("{}[{index}]", accessor.index),
+                        },
+                        true,
+                    ))
+                }
+                _ => None,
+            }
+        }
+    }
+
+    let mut out = FxHashMap::default();
+    for &fn_did in functions {
+        let Some(body_id) = tcx.hir_node_by_def_id(fn_did).body_id() else {
+            continue;
+        };
+        let mut v = V {
+            tcx,
+            fn_did,
+            out: &mut out,
+            name_of,
+            accessor_of,
+            fat,
+        };
+        v.visit_body(tcx.hir_body(body_id));
+    }
+    out
+}
+
 /// Collect, per binding, the `*p.offset(e)` uses and whether anything else uses
 /// the binding at all.
 ///
@@ -353,37 +661,7 @@ pub(crate) fn collect_slice_uses(
         /// Anything else is parenthesised and cast: parenthesised because
         /// `i + 1 as usize` parses as `i + (1 as usize)`.
         fn index_text(&self, arg: &Expr<'_>) -> Option<String> {
-            let sm = self.tcx.sess.source_map();
-            if let ExprKind::Cast(inner, ty) = &arg.kind
-                && let rustc_hir::TyKind::Path(rustc_hir::QPath::Resolved(_, p)) = &ty.kind
-                && p.segments.last().is_some_and(|s| s.ident.name.as_str() == "isize")
-            {
-                let text = sm.span_to_snippet(inner.span).ok()?;
-                return Some(if self.is_usize(inner) {
-                    text
-                } else {
-                    format!("({text}) as usize")
-                });
-            }
-            let text = sm.span_to_snippet(arg.span).ok()?;
-            Some(if self.is_usize(arg) {
-                text
-            } else {
-                format!("({text}) as usize")
-            })
-        }
-
-        /// Is this expression already a `usize`?
-        ///
-        /// Asked of the type checker rather than of the syntax: `i`, `n as
-        /// usize` and a `usize`-returning call are all bare-renderable and no
-        /// syntactic test recognises the three.
-        fn is_usize(&self, expr: &Expr<'_>) -> bool {
-            let owner = expr.hir_id.owner.def_id;
-            self.tcx
-                .typeck(owner)
-                .expr_ty_adjusted_opt(expr)
-                .is_some_and(|t| matches!(t.kind(), rustc_middle::ty::TyKind::Uint(rustc_middle::ty::UintTy::Usize)))
+            index_text(self.tcx, arg)
         }
     }
 

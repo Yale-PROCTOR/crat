@@ -235,10 +235,18 @@ pub(crate) fn plan(
         // `Unplaceable` record — measured with a variant probe before the
         // repair: the build named only `artifact::rows` and `degradations()`.
         // A `match` makes the next disposition a compile error at this site.
-        let (mutable, slice_uses) = match decision {
-            Decision::Ref { mutable } => (mutable, None),
+        let (mutable, use_edits_in, optional, fat) = match decision {
+            Decision::Ref { mutable } => (mutable, None, false, false),
             // S3.2′-2: the first disposition that is not declaration-only.
-            Decision::Slice { mutable, uses } => (mutable, Some(uses)),
+            Decision::Slice { mutable, uses } => (mutable, Some(uses), false, true),
+            // S3.2′-3: an optional form, thin or fat. Its uses travel the same
+            // channel — declaration and uses move together or not at all, which
+            // `use_failure` below enforces for every form that has uses.
+            Decision::Opt {
+                mutable,
+                slice,
+                uses,
+            } => (mutable, Some(uses), true, *slice),
             // Degraded subjects produce no edit BY DESIGN — the decision phase
             // already recorded why, and re-deciding here would duplicate the
             // authority the architecture puts in one place.
@@ -352,11 +360,16 @@ pub(crate) fn plan(
             });
             continue;
         };
-        let replacement = match (slice_uses.is_some(), *mutable) {
+        let base = match (fat, *mutable) {
             (false, true) => format!("&mut {pointee}"),
             (false, false) => format!("&{pointee}"),
             (true, true) => format!("&mut [{pointee}]"),
             (true, false) => format!("&[{pointee}]"),
+        };
+        let replacement = if optional {
+            format!("Option<{base}>")
+        } else {
+            base
         };
         // The USE-SITE edits, placed before the declaration edit is pushed so a
         // use that cannot be located takes the whole subject with it. A subject
@@ -364,13 +377,15 @@ pub(crate) fn plan(
         // ill-typed crate, not a partial rewrite.
         let mut use_edits = Vec::new();
         let mut use_failure = None;
-        for use_edit in slice_uses.into_iter().flatten() {
+        for use_edit in use_edits_in.into_iter().flatten() {
             match span_to_loc(use_edit.span) {
                 Ok((file, lo, hi)) if file == ty_file => use_edits.push(Edit {
                     lo,
                     hi,
                     replacement: use_edit.replacement.clone(),
-                    justification: Justification::KindDecision { kind: "Slice(use)" },
+                    justification: Justification::KindDecision {
+                        kind: if optional { "Opt(use)" } else { "Slice(use)" },
+                    },
                     owner_fn: owner_of(subject),
                 }),
                 Ok(_) => use_failure = Some("slice use is in a different file from the declaration"),
@@ -385,11 +400,15 @@ pub(crate) fn plan(
             });
             continue;
         }
-        let kind = match (slice_uses.is_some(), *mutable) {
-            (false, true) => "Ref(mut)",
-            (false, false) => "Ref(shared)",
-            (true, true) => "Slice(mut)",
-            (true, false) => "Slice(shared)",
+        let kind = match (optional, fat, *mutable) {
+            (false, false, true) => "Ref(mut)",
+            (false, false, false) => "Ref(shared)",
+            (false, true, true) => "Slice(mut)",
+            (false, true, false) => "Slice(shared)",
+            (true, false, true) => "OptRef(mut)",
+            (true, false, false) => "OptRef(shared)",
+            (true, true, true) => "OptSlice(mut)",
+            (true, true, false) => "OptSlice(shared)",
         };
         by_file.entry(ty_file.clone()).or_default().extend(use_edits);
         by_file.entry(ty_file).or_default().push(Edit {
@@ -429,6 +448,8 @@ mod tests {
             mutable: false,
             freed_at: None,
             len_recovered: false,
+            null_init: false,
+            mut_binding: false,
         }
     }
 

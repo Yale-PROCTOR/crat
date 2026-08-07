@@ -70,7 +70,16 @@ pub(crate) fn rows(tcx: TyCtxt<'_>, table: &DecisionTable) -> Vec<Row> {
                     },
                     None,
                 ),
-                Decision::Slice { mutable, .. } => (
+                Decision::Opt { mutable, slice, .. } => (
+                match (slice, mutable) {
+                    (true, true) => Outcome::OptSliceMut,
+                    (true, false) => Outcome::OptSliceShared,
+                    (false, true) => Outcome::OptRefMut,
+                    (false, false) => Outcome::OptRefShared,
+                },
+                None,
+            ),
+            Decision::Slice { mutable, .. } => (
                     if *mutable {
                         Outcome::SliceMut
                     } else {
@@ -145,6 +154,9 @@ pub(crate) fn rows(tcx: TyCtxt<'_>, table: &DecisionTable) -> Vec<Row> {
                 // population and not the universe.
                 approx_len: match decision {
                     Decision::Slice { .. } => Some(!subject.len_recovered),
+            // An optional FAT form carries the same length assumption as its
+            // plain twin; an optional thin one carries none.
+            Decision::Opt { slice, .. } => slice.then(|| !subject.len_recovered),
                     _ => None,
                 },
             }
@@ -177,6 +189,8 @@ mod tests {
             mutable: true,
             freed_at: None,
             len_recovered: false,
+            null_init: false,
+            mut_binding: false,
         }
     }
 

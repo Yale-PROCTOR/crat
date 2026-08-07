@@ -388,7 +388,9 @@ fn rewrite_core_injected(
             // before the repair. A `match` makes the next disposition a compile
             // error at this site.
             match decision {
-                decision::Decision::Ref { .. } | decision::Decision::Slice { .. } => {}
+                decision::Decision::Ref { .. }
+                | decision::Decision::Slice { .. }
+                | decision::Decision::Opt { .. } => {}
                 decision::Decision::Degraded(_) => continue,
             }
             let owner = tcx.def_path_str(subject.fn_did.to_def_id());
@@ -974,6 +976,8 @@ fn collect_subjects(
                 // Stamped in `finish_decide`, once, over both universes.
                 freed_at: None,
                 len_recovered: false,
+            null_init: false,
+            mut_binding: false,
             });
         }
     }
@@ -1175,6 +1179,8 @@ fn collect_local_subjects(
                 // Stamped in `finish_decide`, once, over both universes.
                 freed_at: None,
                 len_recovered: false,
+            null_init: false,
+            mut_binding: false,
             });
         }
     }
@@ -1749,6 +1755,22 @@ fn finish_decide<'tcx>(
                 .by_binding
                 .get(&(subject.fn_did, subject.hir_id))
                 .is_some_and(|c| matches!(c.len_class(), "array-len" | "alloc-count"));
+        // **S3.2′-3** — the two facts the optional forms need, from the same
+        // pass, for the same reason: one authority per fact.
+        subject.null_init = ctors
+            .by_binding
+            .get(&(subject.fn_did, subject.hir_id))
+            .is_some_and(|c| matches!(c, decision::construction::Construction::NullLit));
+        subject.mut_binding = matches!(
+            tcx.hir_node(subject.hir_id),
+            rustc_hir::Node::Pat(pat) if matches!(
+                pat.kind,
+                rustc_hir::PatKind::Binding(
+                    rustc_hir::BindingMode(_, rustc_hir::Mutability::Mut),
+                    ..
+                )
+            )
+        );
     }
 
     perturb(&mut subjects);
@@ -1762,7 +1784,48 @@ fn finish_decide<'tcx>(
         .filter_map(|s| s.param_name.clone().map(|n| ((s.fn_did, s.hir_id), n)))
         .collect();
     let slice_uses = decision::emitability::collect_slice_uses(tcx, &program.functions, &names);
-    let table = decision::decide(tcx, &subjects, &model, &slots, &facts, &fat, &slice_uses);
+    // **S3.2′-3.** The accessor a subject's uses are rewritten through, chosen
+    // per subject by the idiom rule (micro-plan §9c): `unwrap()` where the
+    // optional is `Copy` or used once, `as_mut()` otherwise. It has to be
+    // decided HERE because it depends on the use count, which is what the
+    // collector is about to produce — so the count is taken from the raw walk
+    // and the collector is handed the answer.
+    //
+    // `deref` and `index` differ by one `*`: `Option<&mut T>::as_mut().unwrap()`
+    // is `&mut &mut T`, two derefs from the pointee, where `unwrap()` is one.
+    let opt_accessors: rustc_hash::FxHashMap<_, _> = subjects
+        .iter()
+        .filter_map(|s| {
+            let name = s.param_name.clone()?;
+            let uses = decision::emitability::non_test_use_count(tcx, s.fn_did, s.hir_id);
+            let as_mut = s.mutable && uses > 1;
+            Some((
+                (s.fn_did, s.hir_id),
+                decision::emitability::Accessor {
+                    deref: if as_mut {
+                        format!("*{name}.as_mut().unwrap()")
+                    } else {
+                        format!("{name}.unwrap()")
+                    },
+                    index: if as_mut {
+                        format!("{name}.as_mut().unwrap()")
+                    } else {
+                        format!("{name}.unwrap()")
+                    },
+                },
+            ))
+        })
+        .collect();
+    let opt_fat: rustc_hash::FxHashSet<_> = subjects
+        .iter()
+        .filter(|s| fat.is_array(s.fn_did, s.local))
+        .map(|s| (s.fn_did, s.hir_id))
+        .collect();
+    let opt_uses =
+        decision::emitability::collect_opt_uses(tcx, &program.functions, &names, &opt_accessors, &opt_fat);
+    let table = decision::decide(
+        tcx, &subjects, &model, &slots, &facts, &fat, &slice_uses, &opt_uses,
+    );
 
     // Structural self-check: the table matches the subjects it was handed. NOT
     // the coverage gate — every comparison in it is against the collector's own
@@ -2242,6 +2305,9 @@ fn freed_slots_tsv_from(
                 match d {
                     decision::Decision::Ref { .. } => "emitted-ref".to_owned(),
                     decision::Decision::Slice { .. } => "emitted-slice".to_owned(),
+                    decision::Decision::Opt { slice, .. } => {
+                        if *slice { "emitted-opt-slice".to_owned() } else { "emitted-opt-ref".to_owned() }
+                    }
                     decision::Decision::Degraded(r) => r.reason.key().to_owned(),
                 },
             )

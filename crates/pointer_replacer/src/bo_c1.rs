@@ -8470,6 +8470,13 @@ struct OutcomeCounts {
     /// it counts rather than by changing the program.
     slice_mut: usize,
     slice_shared: usize,
+    /// **S3.2′-3** — optional forms, counted apart from their plain twins for
+    /// the same reason the slice buckets are: `decided_ref` is pinned across the
+    /// milestone's records and an optional reference is not one.
+    opt_ref_mut: usize,
+    opt_ref_shared: usize,
+    opt_slice_mut: usize,
+    opt_slice_shared: usize,
     degraded: usize,
     /// Rows carrying **no** outcome. Producer A sets one on every row it emits,
     /// so this is a schema violation rather than a category — recorded, never
@@ -8548,6 +8555,12 @@ fn count_outcomes(rows: &[crate::coverage_recon::schema::Row]) -> OutcomeCounts 
             // pinned number means by it.
             Some(Outcome::SliceMut) => c.slice_mut += 1,
             Some(Outcome::SliceShared) => c.slice_shared += 1,
+            // S3.2′-3: optional dispositions likewise. `decided_ref` is pinned
+            // across the milestone's records; an optional reference is not one.
+            Some(Outcome::OptRefMut) => c.opt_ref_mut += 1,
+            Some(Outcome::OptRefShared) => c.opt_ref_shared += 1,
+            Some(Outcome::OptSliceMut) => c.opt_slice_mut += 1,
+            Some(Outcome::OptSliceShared) => c.opt_slice_shared += 1,
             Some(Outcome::Degraded) => {
                 c.degraded += 1;
                 // A degraded row with no reason is counted under an explicit

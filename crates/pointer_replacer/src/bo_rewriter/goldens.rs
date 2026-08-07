@@ -80,6 +80,12 @@ pub(super) const GOLDENS: &[Golden] = goldens![
     // `len`, indexed write -> `&mut [i32]`. They land with their slice.
     "g11_slice_shared",
     "g12_slice_mut",
+    // **S3.2′-3, transcribed from the slice addendum's §8 row**: "nullable
+    // pointer + `len` → `Option<&[i32]>`". Its text is the g11 × g02
+    // composition — g11's indexed read, g02's null test and `unwrap()` — because
+    // both halves are already ratified and inventing a third idiom for their
+    // intersection would be a spec act, not a transcription.
+    "g13_opt_slice",
 ];
 
 /// Run `rustfmt` over a source string with pinned settings.
@@ -158,6 +164,7 @@ golden_test!(g09_pdrop_suppression, "g09_pdrop_suppression");
 golden_test!(g10_mixed_group, "g10_mixed_group");
 golden_test!(g11_slice_shared, "g11_slice_shared");
 golden_test!(g12_slice_mut, "g12_slice_mut");
+golden_test!(g13_opt_slice, "g13_opt_slice");
 
 /// The canonicalizer must be a real normalizer, not a pass-through.
 ///
@@ -185,9 +192,9 @@ fn canonicalization_normalizes_whitespace() {
 fn every_golden_pair_is_present() {
     assert_eq!(
         GOLDENS.len(),
-        12,
+        13,
         "the M0.5 package specifies ten pairs; U-5 slice 1 transcribes g11/g12 \
-         from the ratified §8 table"
+         from the ratified §8 table, and slice 3 transcribes g13"
     );
     for g in GOLDENS {
         assert!(!g.input.trim().is_empty(), "{}: empty .input.rs", g.name);
@@ -325,9 +332,17 @@ fn facts_for_source(src: &str) -> FactSnapshot {
 /// `raw_only_uses` check from `decide_one` and this fails — the subject is
 /// decided `Ref` again and no degradation is attributed.
 #[test]
-fn g02_class_is_attributed_at_decision_time() {
+fn a_raw_pointer_operation_is_attributed_at_decision_time() {
     use super::decision::DegradeReason;
-    let records = degradations_for("g02_opt_ref");
+    // **Re-based at S3.2′-3, not deleted.** This witness used to run on g02,
+    // whose `is_null` was the representative raw-only operation. The optional
+    // forms retire exactly that class — `is_null` now SELECTS a form instead of
+    // blocking one — so the witness moves to an operation that still has no
+    // image, and keeps testing what it always tested: attribution, subject and
+    // site, at decision time.
+    const SRC: &str = "#![allow(dead_code, unused_unsafe)]\n\
+         pub unsafe fn reader(p: *mut i32) -> i32 { p.read() }\n";
+    let records = reasons_for_source(SRC);
     let hit = records
         .iter()
         .find(|d| matches!(d.reason, DegradeReason::RawPointerOperation { .. }))
@@ -335,7 +350,7 @@ fn g02_class_is_attributed_at_decision_time() {
             panic!("no raw-pointer-operation degradation was attributed; got {records:#?}")
         });
     assert!(
-        hit.subject.contains("g02_maybe"),
+        hit.subject.contains("reader"),
         "degradation names the wrong subject: {hit:?}"
     );
     assert!(
@@ -345,7 +360,36 @@ fn g02_class_is_attributed_at_decision_time() {
     let DegradeReason::RawPointerOperation { op } = &hit.reason else {
         unreachable!()
     };
-    assert_eq!(op, "is_null", "the attributed operation should be the real one");
+    assert_eq!(op, "read", "the attributed operation should be the real one");
+}
+
+/// **S3.2′-3 — the class g02 used to witness, in its new disposition.**
+///
+/// The pair above and this one together say what changed: a null-tested pointer
+/// no longer degrades, and no OTHER raw-only operation started emitting.
+#[test]
+fn a_null_tested_pointer_takes_an_optional_form_instead_of_degrading() {
+    use super::decision::DegradeReason;
+    let records = degradations_for("g02_opt_ref");
+    assert!(
+        !records
+            .iter()
+            .any(|d| matches!(d.reason, DegradeReason::RawPointerOperation { .. })),
+        "g02's null test still degrades: {records:#?}"
+    );
+    let RewriteOutcome::Emitted { source, .. } = rewrite_m1(
+        GOLDENS
+            .iter()
+            .find(|g| g.name == "g02_opt_ref")
+            .expect("g02 is registered")
+            .input,
+    ) else {
+        panic!("g02 no longer emits");
+    };
+    assert!(
+        source.contains("Option<&") && source.contains("is_none()") && source.contains("unwrap()"),
+        "g02 emitted without the optional form: {source}"
+    );
 }
 
 /// **S2a exit gate (g06 class).** A function with an in-crate caller is degraded
@@ -551,29 +595,31 @@ fn site_line(site: &str) -> Option<usize> {
 /// `EmitabilityFacts::site(tcx, *span)` with `decl_site` in the
 /// raw-pointer-operation arm fails this.
 #[test]
-fn g02_site_is_the_use_not_the_declaration() {
+fn a_raw_pointer_site_is_the_use_not_the_declaration() {
     use super::decision::DegradeReason;
-    let golden = GOLDENS
-        .iter()
-        .find(|g| g.name == "g02_opt_ref")
-        .expect("g02 is registered");
-    let records = degradations_for("g02_opt_ref");
+    // Re-based with its sibling: same witness, an operation that still degrades.
+    // The fixture is multi-line ON PURPOSE — a one-line fixture would make the
+    // declaration and the use share a line and the assertion inert, which the
+    // guard below re-checks rather than trusts.
+    const SRC: &str = "#![allow(dead_code, unused_unsafe)]\n\
+         pub unsafe fn reader(p: *mut i32) -> i32 {\n\
+         \x20   p.read()\n\
+         }\n";
+    let records = reasons_for_source(SRC);
     let hit = records
         .iter()
         .find(|d| matches!(d.reason, DegradeReason::RawPointerOperation { .. }))
-        .expect("g02 degrades on a raw-pointer operation");
+        .expect("the fixture degrades on a raw-pointer operation");
 
-    let decl_line = golden
-        .input
+    let decl_line = SRC
         .lines()
-        .position(|l| l.contains("fn g02_maybe"))
-        .expect("g02 declares its function")
+        .position(|l| l.contains("fn reader"))
+        .expect("the fixture declares its function")
         + 1;
-    let use_line = golden
-        .input
+    let use_line = SRC
         .lines()
-        .position(|l| l.contains("is_null"))
-        .expect("g02 uses is_null")
+        .position(|l| l.contains("p.read()"))
+        .expect("the fixture uses read")
         + 1;
     assert_ne!(
         decl_line, use_line,

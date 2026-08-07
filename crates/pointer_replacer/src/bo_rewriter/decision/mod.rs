@@ -190,6 +190,23 @@ pub(crate) struct Subject {
     /// `false` — *"this analysis did not recover a length"*, a statement about
     /// reach, never a claim about the program. Same rule as `param-no-site`.
     pub len_recovered: bool,
+    /// **S3.2′-3** — is this binding CONSTRUCTED from a null literal?
+    ///
+    /// Stamped from the same construction pass as `len_recovered`. It is the
+    /// second of the two in-force nullability signals (micro-plan §1): the
+    /// first is a use-site `is_null`, this one is `0 as *mut T` at the
+    /// initializer.
+    ///
+    /// A parameter has no construction site, so it reads `false` — reach, not a
+    /// claim, the `param-no-site` rule again.
+    pub null_init: bool,
+    /// **S3.2′-3** — is the binding itself declared `mut`?
+    ///
+    /// A mutable optional with more than one use is accessed through
+    /// `as_mut()`, and `as_mut()` takes `&mut self`. Without a `mut` binding
+    /// that is `error[E0596]`, so the fact has to be available where the form is
+    /// chosen rather than discovered by the verify loop.
+    pub mut_binding: bool,
 }
 
 /// Bindings passed to a deallocator, keyed exactly as A1's emitability gates are
@@ -375,6 +392,38 @@ pub(crate) enum DegradeReason {
     /// with a different soundness argument. Scoped out of this slice explicitly
     /// and counted, rather than attempted.
     SliceLocalConstruction,
+    /// **S3.2′-3 — positive evidence of nullness, so no plain form may emit.**
+    ///
+    /// The binding is initialized from a null literal. `Option` would serve it,
+    /// but only with the INITIALIZER rewritten to `None` — a construction-site
+    /// edit this slice does not own — so the disposition is an attributed
+    /// degrade.
+    ///
+    /// **Fires after every other gate, including the freed-slot veto**, so it
+    /// can only ever convert a would-be emission. That bounds its transitions
+    /// to the subjects that emit today, which is what the pre-registration
+    /// counts.
+    NullInit,
+    /// An optional subject carries a use the wrapper has no image for.
+    OptUseUnsupported,
+    /// A LOCAL cannot take an optional form without its initializer rewritten.
+    ///
+    /// `let p: Option<&i32> = <a raw pointer expression>` is `E0308` whatever
+    /// the uses do, so the blocker is the construction site and not the uses —
+    /// the same shape as [`Self::SliceLocalConstruction`], and its own key
+    /// because "slice" would misreport a thin optional.
+    ///
+    /// **Found by a fixture, not by the corpus**: every subject in this slice's
+    /// measured market is a parameter, so the corpus could not have exercised
+    /// this arm at all.
+    OptLocalConstruction,
+    /// A mutable optional subject with more than one use needs `as_mut()`, and
+    /// `as_mut()` needs a `mut` binding this declaration does not have.
+    ///
+    /// Its own key rather than folded into `OptUseUnsupported`: the blocker is
+    /// the *binding mode*, one edit away, where a genuinely unsupported use is
+    /// a missing capability. Two different owed items must not read as one.
+    OptNeedsMutBinding,
 }
 
 impl DegradeReason {
@@ -399,6 +448,10 @@ impl DegradeReason {
             DegradeReason::FreedSlot => "freed-slot",
             DegradeReason::SliceUseUnsupported => "slice-use-unsupported",
             DegradeReason::SliceLocalConstruction => "slice-local-construction",
+            DegradeReason::NullInit => "null-init",
+            DegradeReason::OptUseUnsupported => "opt-use-unsupported",
+            DegradeReason::OptLocalConstruction => "opt-local-construction",
+            DegradeReason::OptNeedsMutBinding => "opt-needs-mut-binding",
         }
     }
 }
@@ -426,6 +479,24 @@ pub(crate) enum Decision {
     /// asks an analysis a question.
     Slice {
         mutable: bool,
+        uses: Vec<emitability::UseEdit>,
+    },
+    /// **S3.2′-3 — emit an optional form: `Option<&T>`, `Option<&mut T>`, or
+    /// their slice twins.**
+    ///
+    /// Taken when a use-site `is_null` is present: the program itself says this
+    /// pointer may be null, and the nullability directive's optional form is
+    /// what a nullable pointer maps to. `slice` selects the fat twin, on
+    /// exactly the -2 authority rule — op-facts supply the need, fatness the
+    /// licence.
+    ///
+    /// Carries its use rewrites for the same reason `Slice` does, plus one more:
+    /// `p.is_null()` has no image on an `Option` and `*p` has no image either,
+    /// so **every** use of an optional subject moves, not only the arithmetic
+    /// ones.
+    Opt {
+        mutable: bool,
+        slice: bool,
         uses: Vec<emitability::UseEdit>,
     },
     /// Not emitted, with the reason ATTRIBUTED. **A first-class outcome.**
@@ -491,7 +562,7 @@ impl DecisionTable {
     pub(crate) fn degradations(&self) -> impl Iterator<Item = &Degradation> {
         self.entries.iter().filter_map(|(_, d)| match d {
             Decision::Degraded(record) => Some(record),
-            Decision::Ref { .. } | Decision::Slice { .. } => None,
+            Decision::Ref { .. } | Decision::Slice { .. } | Decision::Opt { .. } => None,
         })
     }
 
@@ -522,11 +593,13 @@ pub(crate) fn decide(
     facts: &EmitabilityFacts,
     fat: &super::fat_facts::FatFacts,
     slice_uses: &FxHashMap<(LocalDefId, rustc_hir::HirId), emitability::SliceUses>,
+    opt_uses: &FxHashMap<(LocalDefId, rustc_hir::HirId), emitability::OptUses>,
 ) -> DecisionTable {
     let entries = subjects
         .iter()
         .map(|subject| {
-            let decision = decide_one(tcx, subject, model, slots, facts, fat, slice_uses);
+            let decision =
+                decide_one(tcx, subject, model, slots, facts, fat, slice_uses, opt_uses);
             (subject.clone(), decision)
         })
         .collect();
@@ -549,6 +622,7 @@ fn decide_one(
     facts: &EmitabilityFacts,
     fat: &super::fat_facts::FatFacts,
     slice_uses: &FxHashMap<(LocalDefId, rustc_hir::HirId), emitability::SliceUses>,
+    opt_uses: &FxHashMap<(LocalDefId, rustc_hir::HirId), emitability::OptUses>,
 ) -> Decision {
     let decl_site = EmitabilityFacts::site(tcx, subject.attribution_span());
 
@@ -616,12 +690,44 @@ fn decide_one(
     // `offset` and `is_null` must not read as arithmetic because the walk met
     // `offset` first.
     let raw_uses = facts.raw_only_uses.get(&(subject.fn_did, subject.hir_id));
-    let wants_slice = match raw_uses {
+    // **S3.2′-3 — the OPTIONAL arm shares this block**, because both forms are
+    // selected from the same fact: the set of raw-only uses. A subject the
+    // program itself null-tests is nullable *by the program's own evidence*, and
+    // the nullability directive's optional form is what it maps to.
+    //
+    // The disjunctive authority (micro-plan §1) is why `is_null` alone is
+    // enough. It runs opposite to -2's conjunction on purpose: there the unsafe
+    // direction was ADOPTING a form (fatness alone would invent a length), here
+    // it is REFUSING one (an optional costs ergonomics, never soundness).
+    let form = match raw_uses {
         Some(uses) => {
-            let all_arithmetic = uses
-                .iter()
-                .all(|(op, _)| emitability::SLICE_ARITHMETIC_OPS.contains(&op.as_str()));
-            if !all_arithmetic || !fat.is_array(subject.fn_did, subject.local) {
+            let arith = |op: &str| emitability::SLICE_ARITHMETIC_OPS.contains(&op);
+            let all_arithmetic = uses.iter().all(|(op, _)| arith(op));
+            let is_array = fat.is_array(subject.fn_did, subject.local);
+            let null_tested = uses.iter().any(|(op, _)| op == "is_null");
+            let has_arithmetic = uses.iter().any(|(op, _)| arith(op));
+            // Everything that is not the null test must be arithmetic: any other
+            // raw-only method (`read`, `copy_to`, …) has no image under the
+            // wrapper, and admitting it would be the mixed-use hazard again.
+            let rest_arithmetic = uses.iter().all(|(op, _)| op == "is_null" || arith(op));
+
+            if all_arithmetic && is_array {
+                Form::Slice
+            } else if null_tested
+                && rest_arithmetic
+                // A null-initialized binding needs its INITIALIZER rewritten to
+                // `None`, which is a construction-site edit this slice does not
+                // own. Falling through to the existing degrade leaves such a
+                // subject exactly where it is today.
+                && !subject.null_init
+                // A thin optional has no image for arithmetic; the fat twin does,
+                // and fatness is the licence for it — the -2 rule, unchanged.
+                && (!has_arithmetic || is_array)
+            {
+                Form::Opt {
+                    slice: has_arithmetic && is_array,
+                }
+            } else {
                 let (op, span) = uses.first().expect("a recorded use vector is non-empty");
                 return degrade(
                     subject,
@@ -629,9 +735,8 @@ fn decide_one(
                     DegradeReason::RawPointerOperation { op: op.clone() },
                 );
             }
-            true
         }
-        None => false,
+        None => Form::Plain,
     };
     if let Some(span) = facts.ptr_comparisons.get(&(subject.fn_did, subject.hir_id)) {
         return degrade(
@@ -663,9 +768,53 @@ fn decide_one(
         );
     }
 
-    if !wants_slice {
+    // **S3.2′-3 — the null-init gate.** Positive evidence of nullness, so no
+    // PLAIN form may emit.
+    //
+    // Placed after every degrade arm, including the freed veto, so it can only
+    // ever convert a subject that would otherwise emit. That is what bounds its
+    // transitions to the emitting population and makes the pre-registered count
+    // a count rather than an estimate — the same construction that made the
+    // freed gate's zero movement structural.
+    if matches!(form, Form::Plain) {
+        if subject.null_init {
+            return degrade(subject, decl_site, DegradeReason::NullInit);
+        }
         return Decision::Ref {
             mutable: subject.mutable,
+        };
+    }
+
+    if let Form::Opt { slice } = form {
+        // The construction-site guard, exactly as the slice arm has one: an
+        // optional's VALUE has to be built at the initializer, and this phase
+        // owns declarations and uses, not initializers.
+        if matches!(subject.kind, SubjectKind::Local) {
+            return degrade(subject, decl_site, DegradeReason::OptLocalConstruction);
+        }
+        let uses = opt_uses
+            .get(&(subject.fn_did, subject.hir_id))
+            .cloned()
+            .unwrap_or_default();
+        if let Some(span) = uses.unsupported {
+            return degrade(
+                subject,
+                EmitabilityFacts::site(tcx, span),
+                DegradeReason::OptUseUnsupported,
+            );
+        }
+        // The idiom rule, from the corpus (micro-plan §9c): multiplicity ×
+        // mutability. One use of a mutable optional takes `unwrap()` — g02's
+        // ratified text, and the move is fine exactly once. More than one needs
+        // `as_mut()`, and `as_mut()` needs a `mut` binding, which is one edit
+        // away in a phase that does not own the binding pattern.
+        if subject.mutable && uses.non_test_uses > 1 && !subject.mut_binding {
+            return degrade(subject, decl_site, DegradeReason::OptNeedsMutBinding);
+        }
+        return Decision::Opt {
+            mutable: subject.mutable,
+            slice,
+            uses: uses.rewrites,
         };
     }
 
@@ -686,10 +835,29 @@ fn decide_one(
             DegradeReason::SliceUseUnsupported,
         );
     }
+    // The same gate as the plain arm: a slice form is still not an optional one,
+    // so positive evidence of nullness blocks it too. Unreachable on the current
+    // corpus — every null-initialized slice candidate is a local and degrades
+    // above — and kept as the backstop that keeps the rule "no plain form on
+    // positive null evidence" true of every form rather than of one.
+    if subject.null_init {
+        return degrade(subject, decl_site, DegradeReason::NullInit);
+    }
     Decision::Slice {
         mutable: subject.mutable,
         uses: uses.rewrites,
     }
+}
+
+/// Which form `decide_one` selected, before the gates that can still refuse it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Form {
+    /// `&T` / `&mut T`.
+    Plain,
+    /// `&[T]` / `&mut [T]`.
+    Slice,
+    /// `Option<…>`; `slice` picks the fat twin.
+    Opt { slice: bool },
 }
 
 #[cfg(test)]
@@ -722,6 +890,8 @@ mod self_consistency_tests {
             mutable: true,
             freed_at: None,
             len_recovered: false,
+            null_init: false,
+            mut_binding: false,
         }
     }
 

@@ -1672,14 +1672,40 @@ fn reason_of(got: &[(String, bool, String)], name: &str, is_param: bool) -> Stri
 /// copied forward.
 #[test]
 fn a_raw_only_method_on_a_local_degrades_it() {
+    // RE-BASED at S3.2′-3: `is_null` on a local now selects the optional form
+    // and is refused by its CONSTRUCTION guard, which is a different arm with a
+    // different reason. `read` still has no image, so it is what this witness
+    // needs to keep testing A1 reach over the locals universe.
     let got = decisions_of(
         "#![allow(dead_code, unused_unsafe, unused_variables)]\n\
-         pub unsafe fn f(a: *mut i32) -> bool { let p: *mut i32 = a; p.is_null() }\n",
+         pub unsafe fn f(a: *mut i32) -> i32 { let p: *mut i32 = a; p.read() }\n",
     );
     assert_eq!(
         reason_of(&got, "p", false),
         "raw-pointer-operation",
         "the local reached A1 and was not stopped by it: {got:?}"
+    );
+}
+
+/// **An optional LOCAL is refused at its construction site.**
+///
+/// `let p: Option<&i32> = <raw pointer>` is `E0308` however the uses read, so
+/// the blocker is the initializer — the arm the slice forms already have.
+///
+/// **This arm exists because a fixture found it.** Every subject in S3.2′-3's
+/// measured market is a parameter, so the corpus could not have exercised it,
+/// and the first thing to reach it would have been an emitted crate that does
+/// not compile.
+#[test]
+fn an_optional_local_is_refused_at_its_construction_site() {
+    let got = decisions_of(
+        "#![allow(dead_code, unused_unsafe, unused_variables)]\n\
+         pub unsafe fn f(a: *mut i32) -> i32 { let p: *mut i32 = a; if p.is_null() { return 0; } *p }\n",
+    );
+    assert_eq!(
+        reason_of(&got, "p", false),
+        "opt-local-construction",
+        "an optional local was not stopped at its construction site: {got:?}"
     );
 }
 
@@ -2077,14 +2103,19 @@ fn a_freed_subject_that_would_otherwise_emit_is_degraded_as_freed_slot() {
 /// decision.
 #[test]
 fn a_freed_subject_stopped_earlier_keeps_its_reason_and_carries_the_column() {
+    // **RE-BASED at S3.2′-3.** The earlier blocker used to be `p.is_null()`,
+    // which no longer fires before the freed gate — a null test now selects the
+    // optional form, whose own refusals come after it. `read` still degrades in
+    // the raw-use block, which is where this witness needs its earlier reason to
+    // come from.
     let src = "#![allow(dead_code, unused_unsafe, unused_mut, unused_variables)]\n\
                extern \"C\" {\n\
                \x20   fn free(p: *mut core::ffi::c_void);\n\
                }\n\
-               pub unsafe fn releases(a: *mut core::ffi::c_void, b: i32) -> bool {\n\
-               \x20   let p: *mut core::ffi::c_void = a;\n\
-               \x20   let dead = p.is_null();\n\
-               \x20   if b > 0 { free(p); }\n\
+               pub unsafe fn releases(a: *mut i32, b: i32) -> i32 {\n\
+               \x20   let p: *mut i32 = a;\n\
+               \x20   let dead = p.read();\n\
+               \x20   if b > 0 { free(p as *mut core::ffi::c_void); }\n\
                \x20   dead\n\
                }\n";
     let rows = artifact_rows_of(src);
@@ -2162,10 +2193,16 @@ fn an_arithmetic_op_on_a_local_stops_at_slice_construction() {
 /// **A non-arithmetic raw-only use blocks the slice arm — checked over the WHOLE
 /// use set, not the first.**
 ///
-/// `p` carries `offset` *and* `is_null`. A first-wins reading of
-/// `raw_only_uses` meets `offset` first and concludes "arithmetic, emit a
-/// slice" — and `p.is_null()` on `&[i32]` does not compile. This is the reason
-/// that map holds a vector.
+/// `p` carries `offset` *and* `read`. A first-wins reading of `raw_only_uses`
+/// meets `offset` first and concludes "arithmetic, emit a slice" — and
+/// `p.read()` on `&[i32]` does not compile. This is the reason that map holds a
+/// vector.
+///
+/// **RE-BASED at S3.2′-3.** The original fixture paired `offset` with
+/// `is_null`, and that pair is no longer mixed-and-unsupported: it is exactly
+/// g13's shape, and now selects `Option<&[T]>`. Re-basing onto `read` keeps the
+/// witness testing what it was written to test — the whole-set reading — rather
+/// than letting it pass by accident on a class that moved.
 ///
 /// *Mutation-tested (Rider 0, deletion first):* replacing the `all(..)` in
 /// `decide_one` with a test of `uses.first()` makes this emit a slice, and the
@@ -2174,12 +2211,30 @@ fn an_arithmetic_op_on_a_local_stops_at_slice_construction() {
 fn a_mixed_use_set_refuses_the_slice_arm() {
     let got = decisions_of(
         "#![allow(dead_code, unused_unsafe, unused_variables)]\n\
-         pub unsafe fn f(p: *mut i32) -> i32 { if p.is_null() { return 0; } *p.offset(1) }\n",
+         pub unsafe fn f(p: *mut i32) -> i32 { let v = p.read(); v + *p.offset(1) }\n",
     );
     assert_eq!(
         reason_of(&got, "p", true),
         "raw-pointer-operation",
         "a subject with a non-arithmetic use must not reach the slice arm: {got:?}"
+    );
+}
+
+/// **The pair that MOVED, pinned in its new disposition.**
+///
+/// `{offset, is_null}` on a fat subject is g13's shape. Asserting where it lands
+/// now is what keeps the re-basing above honest: without this, "the mixed-use
+/// guard still works" and "the optional arm swallowed the case" look identical.
+#[test]
+fn arithmetic_with_a_null_test_takes_the_optional_slice_form() {
+    let got = decisions_of(
+        "#![allow(dead_code, unused_unsafe, unused_variables)]\n\
+         pub unsafe fn f(p: *mut i32) -> i32 { if p.is_null() { return 0; } *p.offset(1) }\n",
+    );
+    assert_eq!(
+        reason_of(&got, "p", true),
+        "<emitted>",
+        "the fat optional twin did not take this subject: {got:?}"
     );
 }
 
