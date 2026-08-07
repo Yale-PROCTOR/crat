@@ -873,16 +873,20 @@ fn write_targets(path: &Path, keys: &[String]) -> Result<(), String> {
     fs::write(path, out).map_err(|error| format!("write targets {}: {error}", path.display()))
 }
 
-fn checkpoint_batch_ranges(total: usize, batch_size: usize) -> Result<Vec<Range<usize>>, String> {
-    if total == 0 {
-        return Err("checkpoint plan requires a nonempty candidate set".to_owned());
+fn checkpoint_batch_ranges(total: usize) -> Result<Vec<Range<usize>>, String> {
+    if total != P2_BROTLI_ELIGIBLE {
+        return Err(format!(
+            "checkpoint plan requires exactly {P2_BROTLI_ELIGIBLE} candidates, got {total}"
+        ));
     }
-    if batch_size == 0 {
-        return Err("checkpoint batch size must be positive".to_owned());
-    }
-    Ok((0..total)
-        .step_by(batch_size)
-        .map(|start| start..(start + batch_size).min(total))
+    let mut start = 0usize;
+    Ok(P2_CHECKPOINT_BATCH_SIZES
+        .iter()
+        .map(|size| {
+            let range = start..start + size;
+            start = range.end;
+            range
+        })
         .collect())
 }
 
@@ -1484,6 +1488,8 @@ const P2_CANDIDATE_UNIVERSE_SHA256: &str =
     "56ca571ac8a6b99e42884b6495a6bab4a0ad46a4e2c1ac6a9bac30df5ff95527";
 const P2_QUERY_BUDGET: usize = 200;
 const P2_BROTLI_ELIGIBLE: usize = 112;
+const P2_CHECKPOINT_BATCH_SIZES: [usize; 8] = [24, 24, 12, 12, 12, 12, 12, 4];
+const P2_CHECKPOINT_BATCH_PLAN: &str = "24,24,12,12,12,12,12,4";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct MeasurementIdentity {
@@ -1744,12 +1750,11 @@ fn s23_p2_brotli_checkpoint() {
             .all(|key| selected.contains(&("brotli".to_owned(), key.clone()))),
         "checkpoint candidates must remain inside the registered 200-query budget"
     );
-    let batch_size = env_usize("CRAT_S23_BATCH_SIZE", 24);
     assert!(
-        (20..=30).contains(&batch_size),
-        "initial checkpoint size must stay within the authorized 20–30 range"
+        std::env::var_os("CRAT_S23_BATCH_SIZE").is_none(),
+        "CRAT_S23_BATCH_SIZE is retired; the checkpoint uses its registered heterogeneous plan"
     );
-    let ranges = checkpoint_batch_ranges(brotli.len(), batch_size)
+    let ranges = checkpoint_batch_ranges(brotli.len())
         .unwrap_or_else(|error| panic!("checkpoint plan: {error}"));
     let batch_index = std::env::var("CRAT_S23_BATCH_INDEX")
         .expect("checkpoint requires CRAT_S23_BATCH_INDEX")
@@ -1858,7 +1863,7 @@ fn s23_p2_brotli_checkpoint() {
     fs::write(
         &receipt,
         format!(
-            "machine_id={}\nplatform={}\nmachine_protocol=dedicated-host\nmemory_limit=uncapped\nbatch={batch_index}\nprogram=brotli\nstatus={}\nanalysis_head={}\nbase_harness_head={}\nbase_manifest_sha256={}\nmac_base_manifest_sha256={}\nsnapshot={}\nbatch_size={}\nwall_cap_s={}\nrange_start={}\nrange_end={}\nqueried={}\nfirst_key={}\nlast_key={}\nwall_s={:.3}\nwall_s_per_candidate={:.6}\npeak_rss_kb={}\nworker_t_total_s={}\nhard_unsat={}\nforce_sat={}\nsolver_unknown={}\naccepted_owning={}\n",
+            "machine_id={}\nplatform={}\nmachine_protocol=dedicated-host\nmemory_limit=uncapped\nbatch={batch_index}\nprogram=brotli\nstatus={}\nanalysis_head={}\nbase_harness_head={}\nbase_manifest_sha256={}\nmac_base_manifest_sha256={}\nsnapshot={}\nbatch_size={}\nbatch_plan={}\nwall_cap_s={}\nrange_start={}\nrange_end={}\nqueried={}\nfirst_key={}\nlast_key={}\nwall_s={:.3}\nwall_s_per_candidate={:.6}\npeak_rss_kb={}\nworker_t_total_s={}\nhard_unsat={}\nforce_sat={}\nsolver_unknown={}\naccepted_owning={}\n",
             contract.identity.machine_id,
             contract.identity.platform,
             outcome.status,
@@ -1867,7 +1872,8 @@ fn s23_p2_brotli_checkpoint() {
             contract.base_manifest_sha256,
             P2_BASE_MANIFEST_SHA256,
             contract.snapshot.display(),
-            batch_size,
+            keys.len(),
+            P2_CHECKPOINT_BATCH_PLAN,
             timeout_s,
             range.start,
             range.end,
@@ -1933,7 +1939,7 @@ fn s23_p2_brotli_checkpoint() {
     );
 }
 
-/// Combine the 88 preserved rows with five manifested brotli checkpoints.
+/// Combine the 88 preserved rows with eight manifested brotli checkpoints.
 /// This phase launches no corpus worker and forms the aggregate only after the
 /// selected 200/261 eligible candidates are complete exactly once.
 #[test]
@@ -2008,8 +2014,11 @@ fn s23_p2_checkpoint_aggregate() {
         .filter(|(program, _)| program == "brotli")
         .map(|(_, key)| key.clone())
         .collect::<Vec<_>>();
-    let batch_size = env_usize("CRAT_S23_BATCH_SIZE", 24);
-    let ranges = checkpoint_batch_ranges(brotli_keys.len(), batch_size)
+    assert!(
+        std::env::var_os("CRAT_S23_BATCH_SIZE").is_none(),
+        "CRAT_S23_BATCH_SIZE is retired; the aggregate uses the registered heterogeneous plan"
+    );
+    let ranges = checkpoint_batch_ranges(brotli_keys.len())
         .unwrap_or_else(|error| panic!("checkpoint plan: {error}"));
     let mut batch_stats = Vec::new();
     let mut brotli_rows = 0usize;
@@ -2048,6 +2057,39 @@ fn s23_p2_checkpoint_aggregate() {
             receipt.get("queried").and_then(|value| value.parse().ok()),
             Some(expected.len())
         );
+        assert_eq!(
+            receipt.get("batch").and_then(|value| value.parse().ok()),
+            Some(batch_index),
+            "batch {batch_index} receipt index drift"
+        );
+        assert_eq!(
+            receipt
+                .get("range_start")
+                .and_then(|value| value.parse().ok()),
+            Some(range.start),
+            "batch {batch_index} range start drift"
+        );
+        assert_eq!(
+            receipt
+                .get("range_end")
+                .and_then(|value| value.parse().ok()),
+            Some(range.end),
+            "batch {batch_index} range end drift"
+        );
+        assert_eq!(
+            receipt
+                .get("batch_size")
+                .and_then(|value| value.parse().ok()),
+            Some(expected.len()),
+            "batch {batch_index} candidate-count drift"
+        );
+        if batch_index >= 2 {
+            assert_eq!(
+                receipt.get("batch_plan").map(String::as_str),
+                Some(P2_CHECKPOINT_BATCH_PLAN),
+                "batch {batch_index} plan provenance drift"
+            );
+        }
         let memory_limit = match receipt.get("memory_limit") {
             Some(value) => {
                 assert_eq!(value, "uncapped", "batch {batch_index} memory limit drift");
@@ -2266,7 +2308,7 @@ fn s23_p2_checkpoint_aggregate() {
     fs::write(
         &report,
         format!(
-            "# P2 / S2-3 checkpointed derived-substrate diagnosis\n\n- Measurement identity: machine `{}`, platform `{}`; every count and timing below belongs to this identity. Timings are not compared across machines.\n- Cross-platform control: `{}`.\n- Screened depth-0 pointer-field universe: **{}**.\n- Eligible owning-store candidates: **261**; no owned-capable store: **{}**; store-blocked: **{}**.\n- Capped tracked-query partition: **200 queried + {} budget-not-queried = 261**.\n- Query result: hard-UNSAT **{}**; force-own SAT **{}**; solver Unknown **0**.\n- Ordinary accepted kinds among queried candidates: Raw **{}**, Ref **{}**, Owning **{}**.\n- Preserved non-brotli rows: **88**, reverified through base manifest `{}`.\n- Brotli checkpoint rows: **112**; Linux-local batch wall sum **{wall_sum:.3}s**. Batch 0 retained its registered 8,192-MiB control cap; batches 1–4 ran uncapped after the server-cap ruling.\n- Raw tracked cores containing `own-assume`: **{own_assume}/{}**; containing `link-own`: **{link_own}/{}**.\n- Terminal counts: `{terminal_counts}`.\n- Core-family incidence (raw tracked cores; incidence, not necessity): `{core_counts}`.\n\n## Brotli checkpoints\n\n| platform | machine id | memory limit | batch | candidates | wall s | wall s / candidate | peak RSS KiB |\n|---|---|---|---:|---:|---:|---:|---:|\n{batch_table}\n\nThe first batch supplies only this machine's sizing number. Every batch ran serially on the dedicated Linux lane and wrote its own SHA-256 manifest before the next launch. The aggregate launched no corpus worker and formed only after all 200 selected candidates were present exactly once. Production analysis code remained read-only.\n",
+            "# P2 / S2-3 checkpointed derived-substrate diagnosis\n\n- Measurement identity: machine `{}`, platform `{}`; every count and timing below belongs to this identity. Timings are not compared across machines.\n- Cross-platform control: `{}`.\n- Screened depth-0 pointer-field universe: **{}**.\n- Eligible owning-store candidates: **261**; no owned-capable store: **{}**; store-blocked: **{}**.\n- Capped tracked-query partition: **200 queried + {} budget-not-queried = 261**.\n- Query result: hard-UNSAT **{}**; force-own SAT **{}**; solver Unknown **0**.\n- Ordinary accepted kinds among queried candidates: Raw **{}**, Ref **{}**, Owning **{}**.\n- Preserved non-brotli rows: **88**, reverified through base manifest `{}`.\n- Brotli checkpoint rows: **112**; Linux-local batch wall sum **{wall_sum:.3}s**. Batch 0 retained its registered 8,192-MiB control cap; batches 1–7 ran uncapped after the server-cap ruling.\n- Registered batch plan: **{P2_CHECKPOINT_BATCH_PLAN}** candidates.\n- Raw tracked cores containing `own-assume`: **{own_assume}/{}**; containing `link-own`: **{link_own}/{}**.\n- Terminal counts: `{terminal_counts}`.\n- Core-family incidence (raw tracked cores; incidence, not necessity): `{core_counts}`.\n\n## Brotli checkpoints\n\n| platform | machine id | memory limit | batch | candidates | wall s | wall s / candidate | peak RSS KiB |\n|---|---|---|---:|---:|---:|---:|---:|\n{batch_table}\n\nThe first batch supplies only this machine's sizing number. Every batch ran serially on the dedicated Linux lane and wrote its own SHA-256 manifest before the next launch. The aggregate launched no corpus worker and formed only after all 200 selected candidates were present exactly once. Production analysis code remained read-only.\n",
             contract.identity.machine_id,
             contract.identity.platform,
             platform_equivalence,
@@ -2297,7 +2339,7 @@ fn s23_p2_checkpoint_aggregate() {
     fs::write(
         &provenance,
         format!(
-            "machine_id={}\nplatform={}\nplatform_equivalence={}\nanalysis_worktree_head={}\nbase_harness_head={}\nbase_manifest_sha256={}\nmac_base_manifest_sha256={}\ncandidate_universe_sha256={}\nsubstrate=derived\nsubstrate_selector={}\nsnapshot={}\nsnapshot_files=100\ndeps_shape=read-only-symlink\nrepair=mode_a\nl2=0\nsafe_mono=per_site\nfork_engine=fork\nmemory_limit=batch0:8192-mib-control,batches1-4:uncapped\nquery_budget={}\nqueried={}\npreserved_rows={}\nbrotli_rows={}\nbatch_size={}\nbatches={}\nbatch_wall_sum_s={:.3}\ntiming_comparison=forbidden-across-machines\n",
+            "machine_id={}\nplatform={}\nplatform_equivalence={}\nanalysis_worktree_head={}\nbase_harness_head={}\nbase_manifest_sha256={}\nmac_base_manifest_sha256={}\ncandidate_universe_sha256={}\nsubstrate=derived\nsubstrate_selector={}\nsnapshot={}\nsnapshot_files=100\ndeps_shape=read-only-symlink\nrepair=mode_a\nl2=0\nsafe_mono=per_site\nfork_engine=fork\nmemory_limit=batch0:8192-mib-control,batches1-7:uncapped\nquery_budget={}\nqueried={}\npreserved_rows={}\nbrotli_rows={}\nbatch_plan={}\nbatches={}\nbatch_wall_sum_s={:.3}\ntiming_comparison=forbidden-across-machines\n",
             contract.identity.machine_id,
             contract.identity.platform,
             platform_equivalence,
@@ -2313,7 +2355,7 @@ fn s23_p2_checkpoint_aggregate() {
             probes.len(),
             preserved_rows,
             brotli_rows,
-            batch_size,
+            P2_CHECKPOINT_BATCH_PLAN,
             ranges.len(),
             wall_sum,
         ),
@@ -2358,7 +2400,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn checkpoint_batches_cover_112_once_with_bounded_sizes() {
+    fn checkpoint_batches_preserve_completed_prefix_and_cover_112_once() {
         assert_eq!(
             std::any::TypeId::of::<std::os::raw::c_char>(),
             std::any::TypeId::of::<i8>(),
@@ -2385,16 +2427,19 @@ mod tests {
         assert_eq!(checkpoint_batch_timeout_s(Some("7200")), Ok(7200));
         assert!(checkpoint_batch_timeout_s(Some("3600")).is_err());
 
-        let ranges = checkpoint_batch_ranges(112, 24).expect("valid checkpoint plan");
+        let ranges = checkpoint_batch_ranges(112).expect("valid checkpoint plan");
         assert_eq!(
             ranges
                 .iter()
                 .map(|range| range.end - range.start)
                 .collect::<Vec<_>>(),
-            vec![24, 24, 24, 24, 16]
+            vec![24, 24, 12, 12, 12, 12, 12, 4]
         );
         assert_eq!(ranges.first().map(|range| range.start), Some(0));
         assert_eq!(ranges.last().map(|range| range.end), Some(112));
+        assert_eq!(ranges.len(), 8);
+        assert_eq!(ranges[0], 0..24);
+        assert_eq!(ranges[1], 24..48);
         for pair in ranges.windows(2) {
             assert_eq!(pair[0].end, pair[1].start);
         }
@@ -2402,8 +2447,8 @@ mod tests {
 
     #[test]
     fn checkpoint_batch_plan_rejects_empty_inputs() {
-        assert!(checkpoint_batch_ranges(0, 24).is_err());
-        assert!(checkpoint_batch_ranges(112, 0).is_err());
+        assert!(checkpoint_batch_ranges(0).is_err());
+        assert!(checkpoint_batch_ranges(111).is_err());
     }
 
     #[test]
