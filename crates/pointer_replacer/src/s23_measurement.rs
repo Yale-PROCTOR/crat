@@ -1072,9 +1072,9 @@ fn s23_p2_corpus() {
         "P2 profile requires the fork engine"
     );
     assert_eq!(
-        env_usize("CRAT_BOC1_MEM_MB", 8192),
-        8192,
-        "P2 uses the standing default cap; no high-cap run is authorized"
+        std::env::var("CRAT_BOC1_MEM_MB").as_deref(),
+        Ok("uncapped"),
+        "the dedicated Linux P2 lane runs without a harness RSS cap"
     );
 
     let corpus_link = root.join("benchmarks/rs-crown-derived");
@@ -1390,7 +1390,7 @@ fn s23_p2_corpus() {
          - Targeted tracked-query budget: **{}**; queried **{}**; budget-not-queried **{}**.\n\
          - Hard-UNSAT: **{}**; cores containing `own-assume`: **{}**.\n\
          - Force-own SAT: **{}**; Owning in the accepted ordinary model: **{}**.\n\
-         - Probe wall sum: **{:.3}s** (programs serialized); default memory cap: **8192 MiB**.\n\
+         - Probe wall sum: **{:.3}s** (programs serialized); harness memory limit: **uncapped**.\n\
          - Terminal counts: `{}`.\n\
          - Core-family incidence (raw tracked cores; families are incidence, not necessity): `{}`.\n\n\
          ## Deterministic first witnesses\n\n{}\n\
@@ -1428,7 +1428,7 @@ fn s23_p2_corpus() {
     );
     fs::write(out.join("report.md"), report).expect("write P2 report");
     let provenance = format!(
-        "machine_id={}\nplatform={}\nanalysis_worktree_head={}\nsubstrate=derived\nsubstrate_selector={}\nsnapshot={}\nsnapshot_files=100\ndeps_shape=read-only-symlink\nrepair=mode_a\nl2=0\nsafe_mono=per_site\nfork_engine=fork\nmem_cap_mib=8192\nquery_budget={}\nqueried={}\nprobe_wall_sum_s={:.3}\nprobe_peak_rss_kb={:?}\n",
+        "machine_id={}\nplatform={}\nanalysis_worktree_head={}\nsubstrate=derived\nsubstrate_selector={}\nsnapshot={}\nsnapshot_files=100\ndeps_shape=read-only-symlink\nrepair=mode_a\nl2=0\nsafe_mono=per_site\nfork_engine=fork\nmemory_limit=uncapped\nquery_budget={}\nqueried={}\nprobe_wall_sum_s={:.3}\nprobe_peak_rss_kb={:?}\n",
         measurement_identity.machine_id,
         measurement_identity.platform,
         super::orchestrate::git_sha(),
@@ -1549,9 +1549,9 @@ fn checkpoint_contract() -> CheckpointContract {
         "P2 profile requires mutability facts on"
     );
     assert_eq!(
-        env_usize("CRAT_BOC1_MEM_MB", 8192),
-        8192,
-        "checkpoint probes retain the standing default memory cap"
+        std::env::var("CRAT_BOC1_MEM_MB").as_deref(),
+        Ok("uncapped"),
+        "the dedicated Linux checkpoint lane runs without a harness RSS cap"
     );
 
     let corpus_link = root.join("benchmarks/rs-crown-derived");
@@ -1845,7 +1845,7 @@ fn s23_p2_brotli_checkpoint() {
     fs::write(
         &receipt,
         format!(
-            "machine_id={}\nplatform={}\nmachine_protocol=dedicated-host\nbatch={batch_index}\nprogram=brotli\nstatus={}\nanalysis_head={}\nbase_harness_head={}\nbase_manifest_sha256={}\nmac_base_manifest_sha256={}\nsnapshot={}\nbatch_size={}\nwall_cap_s={}\nrange_start={}\nrange_end={}\nqueried={}\nfirst_key={}\nlast_key={}\nwall_s={:.3}\nwall_s_per_candidate={:.6}\npeak_rss_kb={}\nworker_t_total_s={}\nhard_unsat={}\nforce_sat={}\nsolver_unknown={}\naccepted_owning={}\n",
+            "machine_id={}\nplatform={}\nmachine_protocol=dedicated-host\nmemory_limit=uncapped\nbatch={batch_index}\nprogram=brotli\nstatus={}\nanalysis_head={}\nbase_harness_head={}\nbase_manifest_sha256={}\nmac_base_manifest_sha256={}\nsnapshot={}\nbatch_size={}\nwall_cap_s={}\nrange_start={}\nrange_end={}\nqueried={}\nfirst_key={}\nlast_key={}\nwall_s={:.3}\nwall_s_per_candidate={:.6}\npeak_rss_kb={}\nworker_t_total_s={}\nhard_unsat={}\nforce_sat={}\nsolver_unknown={}\naccepted_owning={}\n",
             contract.identity.machine_id,
             contract.identity.platform,
             outcome.status,
@@ -1909,7 +1909,7 @@ fn s23_p2_brotli_checkpoint() {
     );
     seal_batch();
     println!(
-        "S23P2BATCH machine_id={} platform={} batch={} status=ok candidates={} wall_s={:.3} wall_s_per_candidate={:.6} peak_rss_kb={}",
+        "S23P2BATCH machine_id={} platform={} memory_limit=uncapped batch={} status=ok candidates={} wall_s={:.3} wall_s_per_candidate={:.6} peak_rss_kb={}",
         contract.identity.machine_id,
         contract.identity.platform,
         batch_index,
@@ -2035,6 +2035,19 @@ fn s23_p2_checkpoint_aggregate() {
             receipt.get("queried").and_then(|value| value.parse().ok()),
             Some(expected.len())
         );
+        let memory_limit = match receipt.get("memory_limit") {
+            Some(value) => {
+                assert_eq!(value, "uncapped", "batch {batch_index} memory limit drift");
+                value.clone()
+            }
+            None => {
+                assert_eq!(
+                    batch_index, 0,
+                    "only the completed cross-platform control may use the retired cap"
+                );
+                "8192-mib-control".to_owned()
+            }
+        };
         batch_stats.push((
             batch_index,
             expected.len(),
@@ -2045,6 +2058,7 @@ fn s23_p2_checkpoint_aggregate() {
             receipt["peak_rss_kb"]
                 .parse::<u64>()
                 .expect("batch peak RSS"),
+            memory_limit,
         ));
     }
     assert_eq!(brotli_rows, P2_BROTLI_ELIGIBLE);
@@ -2135,14 +2149,14 @@ fn s23_p2_checkpoint_aggregate() {
         .count();
     let wall_sum = batch_stats
         .iter()
-        .map(|(_, _, wall, _, _)| wall)
+        .map(|(_, _, wall, _, _, _)| wall)
         .sum::<f64>();
     let batch_table = batch_stats
         .iter()
-        .map(|(index, queried, wall, per_candidate, peak)| {
+        .map(|(index, queried, wall, per_candidate, peak, memory_limit)| {
             format!(
-                "| {} | {} | {index} | {queried} | {wall:.3} | {per_candidate:.6} | {peak} |",
-                contract.identity.platform, contract.identity.machine_id
+                "| {} | {} | {memory_limit} | {index} | {queried} | {wall:.3} | {per_candidate:.6} | {peak} |",
+                contract.identity.platform, contract.identity.machine_id,
             )
         })
         .collect::<Vec<_>>()
@@ -2239,7 +2253,7 @@ fn s23_p2_checkpoint_aggregate() {
     fs::write(
         &report,
         format!(
-            "# P2 / S2-3 checkpointed derived-substrate diagnosis\n\n- Measurement identity: machine `{}`, platform `{}`; every count and timing below belongs to this identity. Timings are not compared across machines.\n- Cross-platform control: `{}`.\n- Screened depth-0 pointer-field universe: **{}**.\n- Eligible owning-store candidates: **261**; no owned-capable store: **{}**; store-blocked: **{}**.\n- Capped tracked-query partition: **200 queried + {} budget-not-queried = 261**.\n- Query result: hard-UNSAT **{}**; force-own SAT **{}**; solver Unknown **0**.\n- Ordinary accepted kinds among queried candidates: Raw **{}**, Ref **{}**, Owning **{}**.\n- Preserved non-brotli rows: **88**, reverified through base manifest `{}`.\n- Brotli checkpoint rows: **112**; Linux-local batch wall sum **{wall_sum:.3}s**; default cap **8,192 MiB**.\n- Raw tracked cores containing `own-assume`: **{own_assume}/{}**; containing `link-own`: **{link_own}/{}**.\n- Terminal counts: `{terminal_counts}`.\n- Core-family incidence (raw tracked cores; incidence, not necessity): `{core_counts}`.\n\n## Brotli checkpoints\n\n| platform | machine id | batch | candidates | wall s | wall s / candidate | peak RSS KiB |\n|---|---|---:|---:|---:|---:|---:|\n{batch_table}\n\nThe first batch supplies only this machine's sizing number. Every batch ran serially on the dedicated Linux lane and wrote its own SHA-256 manifest before the next launch. The aggregate launched no corpus worker and formed only after all 200 selected candidates were present exactly once. Production analysis code remained read-only.\n",
+            "# P2 / S2-3 checkpointed derived-substrate diagnosis\n\n- Measurement identity: machine `{}`, platform `{}`; every count and timing below belongs to this identity. Timings are not compared across machines.\n- Cross-platform control: `{}`.\n- Screened depth-0 pointer-field universe: **{}**.\n- Eligible owning-store candidates: **261**; no owned-capable store: **{}**; store-blocked: **{}**.\n- Capped tracked-query partition: **200 queried + {} budget-not-queried = 261**.\n- Query result: hard-UNSAT **{}**; force-own SAT **{}**; solver Unknown **0**.\n- Ordinary accepted kinds among queried candidates: Raw **{}**, Ref **{}**, Owning **{}**.\n- Preserved non-brotli rows: **88**, reverified through base manifest `{}`.\n- Brotli checkpoint rows: **112**; Linux-local batch wall sum **{wall_sum:.3}s**. Batch 0 retained its registered 8,192-MiB control cap; batches 1–4 ran uncapped after the server-cap ruling.\n- Raw tracked cores containing `own-assume`: **{own_assume}/{}**; containing `link-own`: **{link_own}/{}**.\n- Terminal counts: `{terminal_counts}`.\n- Core-family incidence (raw tracked cores; incidence, not necessity): `{core_counts}`.\n\n## Brotli checkpoints\n\n| platform | machine id | memory limit | batch | candidates | wall s | wall s / candidate | peak RSS KiB |\n|---|---|---|---:|---:|---:|---:|---:|\n{batch_table}\n\nThe first batch supplies only this machine's sizing number. Every batch ran serially on the dedicated Linux lane and wrote its own SHA-256 manifest before the next launch. The aggregate launched no corpus worker and formed only after all 200 selected candidates were present exactly once. Production analysis code remained read-only.\n",
             contract.identity.machine_id,
             contract.identity.platform,
             platform_equivalence,
@@ -2261,7 +2275,7 @@ fn s23_p2_checkpoint_aggregate() {
             accepted(SlotKind::Raw),
             accepted(SlotKind::Ref),
             accepted(SlotKind::Owning),
-            P2_BASE_MANIFEST_SHA256,
+            contract.base_manifest_sha256,
             hard_unsat.len(),
             hard_unsat.len(),
         ),
@@ -2270,12 +2284,13 @@ fn s23_p2_checkpoint_aggregate() {
     fs::write(
         &provenance,
         format!(
-            "machine_id={}\nplatform={}\nplatform_equivalence={}\nanalysis_worktree_head={}\nbase_harness_head={}\nbase_manifest_sha256={}\ncandidate_universe_sha256={}\nsubstrate=derived\nsubstrate_selector={}\nsnapshot={}\nsnapshot_files=100\ndeps_shape=read-only-symlink\nrepair=mode_a\nl2=0\nsafe_mono=per_site\nfork_engine=fork\nmem_cap_mib=8192\nquery_budget={}\nqueried={}\npreserved_rows={}\nbrotli_rows={}\nbatch_size={}\nbatches={}\nbatch_wall_sum_s={:.3}\ntiming_comparison=forbidden-across-machines\n",
+            "machine_id={}\nplatform={}\nplatform_equivalence={}\nanalysis_worktree_head={}\nbase_harness_head={}\nbase_manifest_sha256={}\nmac_base_manifest_sha256={}\ncandidate_universe_sha256={}\nsubstrate=derived\nsubstrate_selector={}\nsnapshot={}\nsnapshot_files=100\ndeps_shape=read-only-symlink\nrepair=mode_a\nl2=0\nsafe_mono=per_site\nfork_engine=fork\nmemory_limit=batch0:8192-mib-control,batches1-4:uncapped\nquery_budget={}\nqueried={}\npreserved_rows={}\nbrotli_rows={}\nbatch_size={}\nbatches={}\nbatch_wall_sum_s={:.3}\ntiming_comparison=forbidden-across-machines\n",
             contract.identity.machine_id,
             contract.identity.platform,
             platform_equivalence,
             super::orchestrate::git_sha(),
             P2_BASE_HARNESS_HEAD,
+            contract.base_manifest_sha256,
             P2_BASE_MANIFEST_SHA256,
             P2_CANDIDATE_UNIVERSE_SHA256,
             std::env::var("CRAT_BOC1_SUBSTRATE")
@@ -2331,6 +2346,21 @@ mod tests {
 
     #[test]
     fn checkpoint_batches_cover_112_once_with_bounded_sizes() {
+        assert_eq!(
+            std::any::TypeId::of::<std::os::raw::c_char>(),
+            std::any::TypeId::of::<i8>(),
+            "named platform risk: c_char must be signed on the Linux control host"
+        );
+        assert_eq!(
+            super::super::orchestrate::memory_limit_kb(Some("uncapped")),
+            Ok(None)
+        );
+        assert_eq!(
+            super::super::orchestrate::memory_limit_kb(Some("8192")),
+            Ok(Some(8192 * 1024))
+        );
+        assert!(super::super::orchestrate::memory_limit_kb(Some("0")).is_err());
+
         let identity = MeasurementIdentity::parse("lambda7", "linux-x86_64")
             .expect("valid measurement identity");
         assert_eq!(identity.machine_id, "lambda7");

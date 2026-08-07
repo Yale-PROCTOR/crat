@@ -9725,11 +9725,20 @@ mod orchestrate {
         pub stderr: String,
     }
 
-    fn env_u64(key: &str, default: u64) -> u64 {
-        std::env::var(key)
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(default)
+    pub(super) fn memory_limit_kb(raw: Option<&str>) -> Result<Option<u64>, String> {
+        let mib = match raw {
+            Some("uncapped") => return Ok(None),
+            Some(value) => value
+                .parse::<u64>()
+                .map_err(|error| format!("invalid CRAT_BOC1_MEM_MB {value:?}: {error}"))?,
+            None => 8192,
+        };
+        if mib == 0 {
+            return Err("CRAT_BOC1_MEM_MB=0 is ambiguous; use `uncapped`".to_owned());
+        }
+        mib.checked_mul(1024)
+            .map(Some)
+            .ok_or_else(|| format!("CRAT_BOC1_MEM_MB={mib} overflows KiB"))
     }
 
     pub fn workspace_root() -> PathBuf {
@@ -9866,7 +9875,9 @@ mod orchestrate {
         timeout: Duration,
         extra: &[(&str, String)],
     ) -> ChildOutcome {
-        let mem_cap_kb = env_u64("CRAT_BOC1_MEM_MB", 8192) * 1024;
+        let memory_limit_raw = std::env::var("CRAT_BOC1_MEM_MB").ok();
+        let mem_cap_kb = memory_limit_kb(memory_limit_raw.as_deref())
+            .unwrap_or_else(|error| panic!("memory-limit configuration: {error}"));
         let logs = out_dir().join("logs");
         fs::create_dir_all(&logs).expect("create log dir");
         let out_path = logs.join(format!("{program}.{log_label}.out"));
@@ -10022,7 +10033,9 @@ mod orchestrate {
                         let _ = child.kill();
                     } else if killed_for.is_none()
                         && t0.elapsed().as_millis() % 1000 < 200
-                        && current_rss_kb.is_some_and(|kb| kb > mem_cap_kb)
+                        && mem_cap_kb.is_some_and(|cap| {
+                            current_rss_kb.is_some_and(|kb| kb > cap)
+                        })
                     {
                         killed_for = Some("oom-kill");
                         let _ = child.kill();
