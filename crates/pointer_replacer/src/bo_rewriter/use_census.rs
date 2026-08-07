@@ -236,6 +236,85 @@ fn classify(tcx: TyCtxt<'_>, use_expr: &Expr<'_>) -> &'static str {
     }
 }
 
+/// `*p`'s class, from what encloses the deref.
+fn classify_deref(tcx: TyCtxt<'_>, deref: &Expr<'_>) -> &'static str {
+    let Node::Expr(g) = tcx.parent_hir_node(deref.hir_id) else {
+        return "deref-read";
+    };
+    match &g.kind {
+        ExprKind::Assign(lhs, ..) if lhs.hir_id == deref.hir_id => "deref-write",
+        ExprKind::AssignOp(_, lhs, _) if lhs.hir_id == deref.hir_id => "deref-write",
+        ExprKind::Field(base, _) if base.hir_id == deref.hir_id => "field-deref",
+        ExprKind::AddrOf(..) => "addr-of",
+        _ => "deref-read",
+    }
+}
+
+
+/// **Where an arithmetic result lands** — the reslice decision's other axis.
+///
+/// `call` is the `p.offset(e)` expression itself. -2 authorised exactly two of
+/// these positions (`arith-deref-read`, `arith-deref-write`); the rest are the
+/// scope-amendment docket, and `arith-self-advance` versus `arith-rebind` is the
+/// distinction the reslice idiom turns on — `p = &p[k..]` against
+/// `let q = &p[k..]`.
+fn arith_position(tcx: TyCtxt<'_>, call: &Expr<'_>) -> &'static str {
+    match tcx.parent_hir_node(call.hir_id) {
+        Node::Expr(p) => match &p.kind {
+            ExprKind::Unary(UnOp::Deref, _) => match tcx.parent_hir_node(p.hir_id) {
+                Node::Expr(g) => match &g.kind {
+                    ExprKind::Assign(lhs, ..) if lhs.hir_id == p.hir_id => "arith-deref-write",
+                    ExprKind::AssignOp(_, lhs, _) if lhs.hir_id == p.hir_id => "arith-deref-write",
+                    ExprKind::Field(base, _) if base.hir_id == p.hir_id => "arith-field",
+                    ExprKind::AddrOf(..) => "arith-borrow",
+                    _ => "arith-deref-read",
+                },
+                _ => "arith-deref-read",
+            },
+            // `p = p.offset(e)` advances the subject itself; `q = p.offset(e)`
+            // binds a new one. Only the first needs the `&mut` reslice idiom.
+            ExprKind::Assign(lhs, rhs, _) if rhs.hir_id == call.hir_id => {
+                if same_binding(lhs, call) {
+                    "arith-self-advance"
+                } else {
+                    "arith-rebind"
+                }
+            }
+            ExprKind::AddrOf(..) => "arith-borrow",
+            ExprKind::Cast(..) => "arith-cast",
+            ExprKind::Call(_, args) if args.iter().any(|a| a.hir_id == call.hir_id) => {
+                "arith-call-arg"
+            }
+            ExprKind::MethodCall(_, _, args, _) if args.iter().any(|a| a.hir_id == call.hir_id) => {
+                "arith-call-arg"
+            }
+            _ => "arith-other",
+        },
+        Node::LetStmt(_) => "arith-rebind",
+        _ => "arith-other",
+    }
+}
+
+/// Does the assignment target name the same binding the arithmetic reads?
+fn same_binding(lhs: &Expr<'_>, call: &Expr<'_>) -> bool {
+    fn binding_of(e: &Expr<'_>) -> Option<HirId> {
+        match &e.kind {
+            ExprKind::Path(QPath::Resolved(_, path)) => match path.res {
+                Res::Local(id) => Some(id),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+    let ExprKind::MethodCall(_, receiver, ..) = &call.kind else {
+        return false;
+    };
+    match (binding_of(lhs), binding_of(receiver)) {
+        (Some(a), Some(b)) => a == b,
+        _ => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     /// **The classifier's accept-set, pinned per class.**
@@ -350,83 +429,5 @@ pub unsafe fn c_arith_other(p: *mut i32) -> *mut i32 { p.offset(1) }
                 super::CLASSES
             );
         }
-    }
-}
-
-/// **Where an arithmetic result lands** — the reslice decision's other axis.
-///
-/// `call` is the `p.offset(e)` expression itself. -2 authorised exactly two of
-/// these positions (`arith-deref-read`, `arith-deref-write`); the rest are the
-/// scope-amendment docket, and `arith-self-advance` versus `arith-rebind` is the
-/// distinction the reslice idiom turns on — `p = &p[k..]` against
-/// `let q = &p[k..]`.
-fn arith_position(tcx: TyCtxt<'_>, call: &Expr<'_>) -> &'static str {
-    match tcx.parent_hir_node(call.hir_id) {
-        Node::Expr(p) => match &p.kind {
-            ExprKind::Unary(UnOp::Deref, _) => match tcx.parent_hir_node(p.hir_id) {
-                Node::Expr(g) => match &g.kind {
-                    ExprKind::Assign(lhs, ..) if lhs.hir_id == p.hir_id => "arith-deref-write",
-                    ExprKind::AssignOp(_, lhs, _) if lhs.hir_id == p.hir_id => "arith-deref-write",
-                    ExprKind::Field(base, _) if base.hir_id == p.hir_id => "arith-field",
-                    ExprKind::AddrOf(..) => "arith-borrow",
-                    _ => "arith-deref-read",
-                },
-                _ => "arith-deref-read",
-            },
-            // `p = p.offset(e)` advances the subject itself; `q = p.offset(e)`
-            // binds a new one. Only the first needs the `&mut` reslice idiom.
-            ExprKind::Assign(lhs, rhs, _) if rhs.hir_id == call.hir_id => {
-                if same_binding(lhs, call) {
-                    "arith-self-advance"
-                } else {
-                    "arith-rebind"
-                }
-            }
-            ExprKind::AddrOf(..) => "arith-borrow",
-            ExprKind::Cast(..) => "arith-cast",
-            ExprKind::Call(_, args) if args.iter().any(|a| a.hir_id == call.hir_id) => {
-                "arith-call-arg"
-            }
-            ExprKind::MethodCall(_, _, args, _) if args.iter().any(|a| a.hir_id == call.hir_id) => {
-                "arith-call-arg"
-            }
-            _ => "arith-other",
-        },
-        Node::LetStmt(_) => "arith-rebind",
-        _ => "arith-other",
-    }
-}
-
-/// Does the assignment target name the same binding the arithmetic reads?
-fn same_binding(lhs: &Expr<'_>, call: &Expr<'_>) -> bool {
-    fn binding_of(e: &Expr<'_>) -> Option<HirId> {
-        match &e.kind {
-            ExprKind::Path(QPath::Resolved(_, path)) => match path.res {
-                Res::Local(id) => Some(id),
-                _ => None,
-            },
-            _ => None,
-        }
-    }
-    let ExprKind::MethodCall(_, receiver, ..) = &call.kind else {
-        return false;
-    };
-    match (binding_of(lhs), binding_of(receiver)) {
-        (Some(a), Some(b)) => a == b,
-        _ => false,
-    }
-}
-
-/// `*p`'s class, from what encloses the deref.
-fn classify_deref(tcx: TyCtxt<'_>, deref: &Expr<'_>) -> &'static str {
-    let Node::Expr(g) = tcx.parent_hir_node(deref.hir_id) else {
-        return "deref-read";
-    };
-    match &g.kind {
-        ExprKind::Assign(lhs, ..) if lhs.hir_id == deref.hir_id => "deref-write",
-        ExprKind::AssignOp(_, lhs, _) if lhs.hir_id == deref.hir_id => "deref-write",
-        ExprKind::Field(base, _) if base.hir_id == deref.hir_id => "field-deref",
-        ExprKind::AddrOf(..) => "addr-of",
-        _ => "deref-read",
     }
 }
