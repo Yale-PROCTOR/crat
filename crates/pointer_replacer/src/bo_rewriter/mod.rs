@@ -1834,7 +1834,7 @@ pub(crate) fn facts_join_tsv(tcx: TyCtxt<'_>) -> Result<String, String> {
     let ctors = decision::construction::collect(tcx, &collect_program(tcx).functions);
 
     let mut out = String::from(
-        "fn_path\tmir_local\tis_param\tannotated\tslot\tkind\traw_op\tptr_cmp\tctor\tlen_class\tsize_expr\n",
+        "fn_path\tmir_local\tis_param\tannotated\tslot\tkind\traw_op\tptr_cmp\treferenced\tctor\tlen_class\tsize_expr\n",
     );
     for (s, _decision) in &table.entries {
         let slot = ctx
@@ -1873,13 +1873,26 @@ pub(crate) fn facts_join_tsv(tcx: TyCtxt<'_>) -> Result<String, String> {
             (false, None) => ("-", "no-init", String::new()),
         };
         out.push_str(&format!(
-            "{}\t{}\t{}\t{}\t{}\t{kind}\t{raw_op}\t{}\t{ctor_key}\t{len_class}\t{size_expr}\n",
+            "{}\t{}\t{}\t{}\t{}\t{kind}\t{raw_op}\t{}\t{}\t{ctor_key}\t{len_class}\t{size_expr}\n",
             tcx.def_path_str(s.fn_did.to_def_id()),
             s.local.as_u32(),
             u8::from(is_param),
             u8::from(s.ty_span.is_some()),
             u8::from(slot.is_some()),
             u8::from(ctx.facts.ptr_comparisons.contains_key(&(s.fn_did, s.hir_id))),
+            // **S3.2′-2 task 1.** A1's `referenced` gate, reported per subject
+            // and INDEPENDENT of whether the decision reached it.
+            //
+            // It fires after `raw-pointer-operation`, so for the whole slice
+            // market the reason field is silent about it and the market's true
+            // size is unknowable from the artifact — which is exactly where the
+            // raw-form reference blindness (291 params decided `Ref` behind
+            // foreign-`DefId` extern blocks) hid. Measured, not inferred.
+            //
+            // A per-FUNCTION fact, restated per subject: the gate degrades every
+            // subject of a referenced function, so a subject-level column is the
+            // form the market join needs.
+            u8::from(ctx.facts.referenced.contains_key(&s.fn_did)),
         ));
     }
     Ok(out)
