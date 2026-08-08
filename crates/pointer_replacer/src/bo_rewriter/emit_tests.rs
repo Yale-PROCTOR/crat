@@ -2408,13 +2408,90 @@ fn the_classifier_accept_set_equals_the_approved_scope() {
         // negative control, and the reason it is refused has changed from "out
         // of scope" to "in scope, unbuilt". Both mean: must not emit.
         ("rebind", "    let q: *mut i32 = p.offset(1 as isize);\n    q"),
+        // **S3.2′-5 registers the SIGN as a refusal axis in this vocabulary.**
+        // Every other entry here is refused for the shape of a *use*; this one
+        // has an authorised use shape and is refused for the *argument's sign*.
+        // It is listed here so the accept-set is read as "which subjects emit",
+        // not merely "which use shapes are recognised" — and so a future slice
+        // that lifts the gate has to edit this list to do it.
+        (
+            "may-be-negative offset",
+            "    let _v = *p.offset(-1 as isize);\n    core::ptr::null_mut()",
+        ),
     ] {
         let got = reason_for(body);
         assert!(
-            got == "slice-use-unsupported" || got == "raw-pointer-operation",
+            got == "slice-use-unsupported"
+                || got == "raw-pointer-operation"
+                || got == "slice-neg-or-unknown-offset",
             "{label} is not emittable today and must be refused with an \
              attribution, got {got:?}"
         );
         assert_ne!(got, "<emitted>", "{label} must not emit");
     }
+}
+
+/// **S3.2′-5 — the sign gate on the deref-through-arithmetic positions.**
+///
+/// The `-2` arm authorised `*p.offset(e)` ⇒ `p[(e) as usize]` while consulting
+/// no sign information at all. When `e` is negative at runtime the cast wraps to
+/// a huge index and the bounds check panics: memory-safe, and a **behaviour
+/// change** against a program that legitimately indexed backwards. `SignFacts`
+/// shipped at `-3` read by nothing and gained its first consumer at `2b` on the
+/// self-advance arm *only*; this closes the remaining position.
+///
+/// One sign authority, no parallel notion — the gate reads the same
+/// `SignFacts::may_be_negative` verdict `advance_ok` reads at `mod.rs:1799`.
+///
+/// **Two-sided by construction.** The `nonneg` half is not decoration: without
+/// it, a gate that degraded *every* fat arithmetic subject would pass the
+/// `neg-or-unknown` half alone. Deleting the gate fails the negative half;
+/// widening it to unconditional fails the positive half.
+#[test]
+fn a_may_be_negative_offset_refuses_the_slice_form_with_its_own_reason() {
+    fn reason_for(body: &str) -> String {
+        let src = format!(
+            "#![allow(dead_code, unused_unsafe, unused_mut, unused_variables)]\n\
+             pub unsafe fn f(mut p: *mut i32, n: usize, k: isize) -> *mut i32 {{\n{body}\n}}\n"
+        );
+        let got = decisions_of(&src);
+        reason_of(&got, "p", true)
+    }
+
+    // NEGATIVE HALF — a may-be-negative offset must be refused, and refused
+    // with the reason that names the *sign*, not the op and not the use shape.
+    // `k` is an unconstrained `isize` parameter, so the offset-sign lattice
+    // settles `Top`, which `needs_cursor()` admits through the same door as
+    // `Neg`. The taint is per-LOCAL, so one tainted position taints `p`.
+    for (label, body) in [
+        (
+            "unbounded offset",
+            "    let _v = *p.offset(k);\n    core::ptr::null_mut()",
+        ),
+        (
+            "negative literal offset",
+            "    let _v = *p.offset(-1 as isize);\n    core::ptr::null_mut()",
+        ),
+    ] {
+        assert_eq!(
+            reason_for(body),
+            "slice-neg-or-unknown-offset",
+            "{label}: a may-be-negative offset must degrade with its own \
+             attributed reason — the op is fine and the use shape is fine, so \
+             neither `raw-pointer-operation` nor `slice-use-unsupported` names \
+             what actually blocked it"
+        );
+    }
+
+    // POSITIVE HALF — the gate must NOT swallow the `-2` arm it is protecting.
+    // `i` is `usize`, so every offset is provably non-negative and the slice
+    // form still emits. This is what makes the gate a gate rather than a veto.
+    assert_eq!(
+        reason_for(
+            "    let mut i: usize = 0;\n    let mut t = 0;\n    while i < n { t += *p.offset(i as isize); i += 1; }\n    core::ptr::null_mut()"
+        ),
+        "<emitted>",
+        "a provably non-negative offset must still emit — the gate keys on the \
+         SIGN, not on the presence of arithmetic"
+    );
 }

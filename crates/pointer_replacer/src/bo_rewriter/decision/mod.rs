@@ -382,6 +382,31 @@ pub(crate) enum DegradeReason {
     /// the type at every occurrence, so rewriting the recognized uses and
     /// leaving the rest is an ill-typed crate rather than a partial win.
     SliceUseUnsupported,
+    /// **S3.2′-5 — the offset may be negative, so no `&[T]` form may emit.**
+    ///
+    /// `*p.offset(e)` becomes `p[(e) as usize]`. Where `e` is negative at
+    /// runtime the cast wraps to a huge index and the bounds check panics:
+    /// memory-safe, and a **behaviour change** against a program that
+    /// legitimately indexed backwards. The `-2` arm authorised that position
+    /// while consulting no sign at all; this is the gate that closes it.
+    ///
+    /// **Its own key rather than folded into `SliceUseUnsupported`**, on the
+    /// `OptNeedsMutBinding` precedent: the occurrence *is* `*p.offset(e)`, so
+    /// the use shape is supported and nothing about it is unsupported. What
+    /// blocks it is the argument's sign, and the form that serves a negative
+    /// offset — `SliceCursor` — is an owed capability, not a missing use
+    /// rewrite. Two different owed items must not read as one.
+    ///
+    /// **The verdict is two-way, and the name says so.** `SignFacts` fuses
+    /// `Neg` and `Top` into one taint bit (`sign_facts.rs:7-24`), so a subject
+    /// counted here may be *unknown* rather than *provably negative* — the key
+    /// reads `neg-or-unknown` and never `negative` for that reason.
+    ///
+    /// **Fires in the `Form::Slice` arm only.** Placed there rather than
+    /// earlier because 61 of the 534 emitting `Ref` subjects also read
+    /// `neg-or-unknown`; they are thin, form no index, and a gate above form
+    /// selection would move every one of them.
+    SliceNegOrUnknownOffset,
     /// The subject is a borrowed-slice candidate but is a **local**, so a slice
     /// value would have to be CONSTRUCTED at its initializer.
     ///
@@ -447,6 +472,7 @@ impl DegradeReason {
             DegradeReason::NoDeclaredType => "no-declared-type",
             DegradeReason::FreedSlot => "freed-slot",
             DegradeReason::SliceUseUnsupported => "slice-use-unsupported",
+            DegradeReason::SliceNegOrUnknownOffset => "slice-neg-or-unknown-offset",
             DegradeReason::SliceLocalConstruction => "slice-local-construction",
             DegradeReason::NullInit => "null-init",
             DegradeReason::OptUseUnsupported => "opt-use-unsupported",
@@ -592,14 +618,16 @@ pub(crate) fn decide(
     slots: &CrateSlots,
     facts: &EmitabilityFacts,
     fat: &super::fat_facts::FatFacts,
+    sign: &super::sign_facts::SignFacts,
     slice_uses: &FxHashMap<(LocalDefId, rustc_hir::HirId), emitability::SliceUses>,
     opt_uses: &FxHashMap<(LocalDefId, rustc_hir::HirId), emitability::OptUses>,
 ) -> DecisionTable {
     let entries = subjects
         .iter()
         .map(|subject| {
-            let decision =
-                decide_one(tcx, subject, model, slots, facts, fat, slice_uses, opt_uses);
+            let decision = decide_one(
+                tcx, subject, model, slots, facts, fat, sign, slice_uses, opt_uses,
+            );
             (subject.clone(), decision)
         })
         .collect();
@@ -621,6 +649,7 @@ fn decide_one(
     slots: &CrateSlots,
     facts: &EmitabilityFacts,
     fat: &super::fat_facts::FatFacts,
+    sign: &super::sign_facts::SignFacts,
     slice_uses: &FxHashMap<(LocalDefId, rustc_hir::HirId), emitability::SliceUses>,
     opt_uses: &FxHashMap<(LocalDefId, rustc_hir::HirId), emitability::OptUses>,
 ) -> Decision {
@@ -842,6 +871,19 @@ fn decide_one(
     // positive null evidence" true of every form rather than of one.
     if subject.null_init {
         return degrade(subject, decl_site, DegradeReason::NullInit);
+    }
+    // **S3.2′-5 — LAST in this arm**, on the freed-slot placement rule: every
+    // subject reaching here has passed every other test, so this can only ever
+    // convert a would-be `Slice` emission and can never displace another
+    // reason. That is what makes its movement measurable as a pre-registered
+    // count rather than merely asserted to be bounded.
+    //
+    // The same verdict the self-advance gate reads at `mod.rs:1799` — one sign
+    // authority, no parallel notion. `may_be_negative` folds a lookup miss to
+    // the conservative side, so an unanalyzed local is refused rather than
+    // emitted on absent evidence.
+    if sign.may_be_negative(subject.fn_did, subject.local) {
+        return degrade(subject, decl_site, DegradeReason::SliceNegOrUnknownOffset);
     }
     Decision::Slice {
         mutable: subject.mutable,
