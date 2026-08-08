@@ -8496,6 +8496,17 @@ impl OutcomeCounts {
         self.ref_shared += other.ref_shared;
         self.slice_mut += other.slice_mut;
         self.slice_shared += other.slice_shared;
+        // **S3.2′-5 hardening.** S3.2′-3 added these four buckets to
+        // `count_outcomes` — where the compiler forced it — and to neither
+        // `merge` nor `count_line`, where it did not. The corpus TOTAL line
+        // therefore reported the 50 optional emissions **nowhere** for two
+        // slices, and `rows` stayed consistent only because it is a length
+        // rather than a sum of buckets. `every_bucket_is_merged_and_reported`
+        // now makes that omission impossible to repeat silently.
+        self.opt_ref_mut += other.opt_ref_mut;
+        self.opt_ref_shared += other.opt_ref_shared;
+        self.opt_slice_mut += other.opt_slice_mut;
+        self.opt_slice_shared += other.opt_slice_shared;
         self.degraded += other.degraded;
         self.unclassified += other.unclassified;
         for (reason, n) in &other.by_reason {
@@ -8531,6 +8542,13 @@ impl OutcomeCounts {
     /// untouched; this is the report's vocabulary, not the artifact's.
     fn decided_ref(&self) -> usize {
         self.ref_mut + self.ref_shared
+    }
+
+    /// `opt_ref_* + opt_slice_*` — the `Opt`-DECIDED count, artifact frame.
+    ///
+    /// Same frame caveat as [`Self::decided_ref`]: pre-revert.
+    fn decided_opt(&self) -> usize {
+        self.opt_ref_mut + self.opt_ref_shared + self.opt_slice_mut + self.opt_slice_shared
     }
 }
 
@@ -8584,6 +8602,8 @@ fn count_line(scope: &str, c: &OutcomeCounts) -> String {
     format!(
         "M1COUNT {scope} rows={} decided_ref={} ref_mut={} ref_shared={} \
          decided_slice={} slice_mut={} slice_shared={} \
+         decided_opt={} opt_ref_mut={} opt_ref_shared={} opt_slice_mut={} \
+         opt_slice_shared={} \
          degraded={} unclassified={} label={PRE_S3_LABEL:?}",
         c.rows,
         c.decided_ref(),
@@ -8592,9 +8612,106 @@ fn count_line(scope: &str, c: &OutcomeCounts) -> String {
         c.slice_mut + c.slice_shared,
         c.slice_mut,
         c.slice_shared,
+        c.decided_opt(),
+        c.opt_ref_mut,
+        c.opt_ref_shared,
+        c.opt_slice_mut,
+        c.opt_slice_shared,
         c.degraded,
         c.unclassified,
     )
+}
+
+/// **Every bucket must be merged AND reported** — the guard that makes the
+/// S3.2′-3 omission impossible to repeat silently.
+///
+/// # Why this shape
+///
+/// `count_outcomes` is exhaustive over `Outcome` and the compiler enforces it,
+/// so a new variant cannot be *counted* as nothing. But `merge` and
+/// `count_line` are plain field lists the compiler does not police, and
+/// S3.2′-3 added four `opt_*` buckets to the enforced site and to neither
+/// unenforced one. The corpus TOTAL therefore under-reported by exactly the
+/// optional population for two slices, silently, because `rows` is a length and
+/// not a sum of buckets.
+///
+/// The mechanization is the **exhaustive struct literal** below: it has no
+/// `..rest`, so adding a field to `OutcomeCounts` breaks *this test's
+/// compilation*. Whoever adds a bucket is then standing in the one place that
+/// checks both `merge` and `count_line`, and must satisfy both to get green. A
+/// test that merely summed the fields would not do this — the sum would be
+/// written by the same hand that forgot the bucket.
+///
+/// Distinct primes per field so a copy-paste inside `merge` cannot cancel out.
+#[test]
+fn every_bucket_is_merged_and_reported() {
+    let one = OutcomeCounts {
+        rows: 2,
+        ref_mut: 3,
+        ref_shared: 5,
+        slice_mut: 7,
+        slice_shared: 11,
+        opt_ref_mut: 13,
+        opt_ref_shared: 17,
+        opt_slice_mut: 19,
+        opt_slice_shared: 23,
+        degraded: 29,
+        unclassified: 31,
+        by_reason: [("a-reason".to_owned(), 37usize)].into_iter().collect(),
+    };
+
+    let mut got = OutcomeCounts::default();
+    got.merge(&one);
+    got.merge(&one);
+
+    // EXHAUSTIVE literal, no `..` — a new bucket fails to COMPILE here.
+    let want = OutcomeCounts {
+        rows: 4,
+        ref_mut: 6,
+        ref_shared: 10,
+        slice_mut: 14,
+        slice_shared: 22,
+        opt_ref_mut: 26,
+        opt_ref_shared: 34,
+        opt_slice_mut: 38,
+        opt_slice_shared: 46,
+        degraded: 58,
+        unclassified: 62,
+        by_reason: [("a-reason".to_owned(), 74usize)].into_iter().collect(),
+    };
+    assert_eq!(
+        got, want,
+        "merge dropped or double-counted a bucket. Every field must accumulate; \
+         a bucket that merges to less than the sum of its parts under-reports \
+         the corpus TOTAL exactly as the opt_* buckets did from S3.2′-3 until \
+         S3.2′-5."
+    );
+
+    // REPORTED — every bucket must reach the printed line under its own key.
+    // The `decided_*` roll-ups are asserted too: a roll-up that silently omits
+    // a component is the same defect one level up.
+    let line = count_line("scope", &one);
+    for (key, value) in [
+        ("rows", 2),
+        ("decided_ref", 8),
+        ("ref_mut", 3),
+        ("ref_shared", 5),
+        ("decided_slice", 18),
+        ("slice_mut", 7),
+        ("slice_shared", 11),
+        ("decided_opt", 72),
+        ("opt_ref_mut", 13),
+        ("opt_ref_shared", 17),
+        ("opt_slice_mut", 19),
+        ("opt_slice_shared", 23),
+        ("degraded", 29),
+        ("unclassified", 31),
+    ] {
+        assert!(
+            line.contains(&format!("{key}={value}")),
+            "the reported line omits or misreports {key}={value}: {line}"
+        );
+    }
 }
 
 /// A row field that must read `0`, **fail-closed on absence**.
