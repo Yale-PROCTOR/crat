@@ -43,6 +43,8 @@ use crate::{analyses::borrow_ownership::solver::CORE_LABEL_FAMILIES, utils::rust
 
 #[path = "a5_measurement.rs"]
 mod a5_measurement;
+#[path = "p_b_measurement.rs"]
+mod p_b_measurement;
 #[path = "s23_measurement.rs"]
 mod s23_measurement;
 
@@ -9329,6 +9331,7 @@ fn boc1_run_one() {
             "m1-census" => run::run_m1_census(tcx, t_tcx),
             "m1-recon" => run::run_m1_recon(tcx, t_tcx),
             "a5-p1" => a5_measurement::run_worker(tcx, t_tcx),
+            "p-b" => p_b_measurement::run_worker(tcx, t_tcx),
             "s23-discover" => s23_measurement::run_discovery_worker(tcx, t_tcx),
             "s23-probe" => s23_measurement::run_probe_worker(tcx, t_tcx),
             "selector-core" => run::run_selector_core(tcx, t_tcx),
