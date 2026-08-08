@@ -464,6 +464,86 @@ fn write_probe(path: &Path, program: &str, records: &[ProbeRecord]) -> Result<()
     fs::write(path, out).map_err(|error| format!("write {}: {error}", path.display()))
 }
 
+fn probe_checkpoint_temp_path(path: &Path) -> PathBuf {
+    path.with_extension("tsv.tmp")
+}
+
+fn write_probe_checkpoint(
+    path: &Path,
+    program: &str,
+    records: &[ProbeRecord],
+) -> Result<(), String> {
+    let temp = probe_checkpoint_temp_path(path);
+    write_probe(&temp, program, records)?;
+    fs::rename(&temp, path).map_err(|error| {
+        format!(
+            "publish checkpoint {} from {}: {error}",
+            path.display(),
+            temp.display()
+        )
+    })
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CheckpointProgress {
+    phase: String,
+    candidate: Option<String>,
+    completed: usize,
+    elapsed_s: String,
+}
+
+fn checkpoint_phase_line(
+    phase: &str,
+    candidate: Option<&str>,
+    completed: usize,
+    elapsed: Duration,
+) -> String {
+    assert!(
+        !phase.is_empty() && !phase.bytes().any(|byte| byte.is_ascii_whitespace()),
+        "checkpoint phase must be one nonempty token"
+    );
+    let candidate = candidate.unwrap_or("none");
+    assert!(
+        !candidate.bytes().any(|byte| byte.is_ascii_whitespace()),
+        "checkpoint candidate must be one token"
+    );
+    format!(
+        "BOC1PHASE s23-probe phase={phase} candidate={candidate} completed={completed} t_s={:.3}",
+        elapsed.as_secs_f64()
+    )
+}
+
+fn emit_checkpoint_phase(started: Instant, phase: &str, candidate: Option<&str>, completed: usize) {
+    eprintln!(
+        "{}",
+        checkpoint_phase_line(phase, candidate, completed, started.elapsed())
+    );
+}
+
+fn parse_checkpoint_phase(line: &str) -> Option<CheckpointProgress> {
+    let mut tokens = line.split_whitespace();
+    if tokens.next()? != "BOC1PHASE" || tokens.next()? != "s23-probe" {
+        return None;
+    }
+    let fields = tokens
+        .filter_map(|token| token.split_once('='))
+        .collect::<BTreeMap<_, _>>();
+    let phase = fields.get("phase")?.to_string();
+    let candidate = match *fields.get("candidate")? {
+        "none" => None,
+        candidate => Some(candidate.to_owned()),
+    };
+    let completed = fields.get("completed")?.parse().ok()?;
+    let elapsed_s = fields.get("t_s")?.to_string();
+    elapsed_s.parse::<f64>().ok()?;
+    Some(CheckpointProgress {
+        phase,
+        candidate,
+        completed,
+        elapsed_s,
+    })
+}
+
 pub(super) fn run_probe_worker(tcx: TyCtxt<'_>, t_tcx: Duration) -> Row {
     let started = Instant::now();
     let program_name = std::env::var("CRAT_BOC1_NAME").expect("probe requires program name");
@@ -471,6 +551,8 @@ pub(super) fn run_probe_worker(tcx: TyCtxt<'_>, t_tcx: Duration) -> Row {
         std::env::var("CRAT_S23_TARGET_KEYS").expect("probe requires CRAT_S23_TARGET_KEYS");
     let probe_path =
         std::env::var("CRAT_S23_PROBE_ARTIFACT").expect("probe requires artifact path");
+    let checkpoint_path = std::env::var_os("CRAT_S23_CHECKPOINT_ARTIFACT").map(PathBuf::from);
+    emit_checkpoint_phase(started, "worker-start", None, 0);
     let targets =
         read_target_keys(Path::new(&targets_path)).unwrap_or_else(|error| panic!("{error}"));
     assert!(
@@ -478,6 +560,7 @@ pub(super) fn run_probe_worker(tcx: TyCtxt<'_>, t_tcx: Duration) -> Row {
         "probe worker requires nonempty targets"
     );
 
+    emit_checkpoint_phase(started, "collect-program-start", None, 0);
     let program = super::collect_program(tcx);
     let fields = scan_fields(tcx);
     for key in &targets {
@@ -490,7 +573,9 @@ pub(super) fn run_probe_worker(tcx: TyCtxt<'_>, t_tcx: Duration) -> Row {
             "target field is not eligible: {key}"
         );
     }
+    emit_checkpoint_phase(started, "collect-program-complete", None, 0);
 
+    emit_checkpoint_phase(started, "ordinary-start", None, 0);
     let origins = compute_origins(&program);
     let slots = CrateSlots::build(&program);
     let crate_ctxt = CrateCtxt::new(&program);
@@ -523,7 +608,9 @@ pub(super) fn run_probe_worker(tcx: TyCtxt<'_>, t_tcx: Duration) -> Row {
             repair_stats.cap_exhausted, repair_stats.field_conflict_decline
         )
     });
+    emit_checkpoint_phase(started, "ordinary-complete", None, 0);
 
+    emit_checkpoint_phase(started, "tracked-start", None, 0);
     let tracked = KindSolver::new_tracked(&slots);
     let (_stats, _selectors) =
         emit_crate_ownership_constraints(&crate_ctxt, &slots, &origins, &tracked)
@@ -545,9 +632,11 @@ pub(super) fn run_probe_worker(tcx: TyCtxt<'_>, t_tcx: Duration) -> Row {
         SatResult::Sat,
         "tracked hard baseline is not SAT before force-own queries"
     );
+    emit_checkpoint_phase(started, "tracked-baseline-complete", None, 0);
 
     let mut records = Vec::with_capacity(targets.len());
     for key in targets {
+        emit_checkpoint_phase(started, "force-own-start", Some(&key), records.len());
         let field = &fields[&key];
         let slot = SlotRef::Field(SlotId::from_usize(field.field_slot));
         let accepted_kind = *model
@@ -578,7 +667,7 @@ pub(super) fn run_probe_worker(tcx: TyCtxt<'_>, t_tcx: Duration) -> Row {
             .collect::<Vec<_>>();
         tracked.pop_scope();
         records.push(ProbeRecord {
-            field_key: key,
+            field_key: key.clone(),
             field_slot: field.field_slot,
             accepted_kind,
             force_result: match result {
@@ -589,9 +678,18 @@ pub(super) fn run_probe_worker(tcx: TyCtxt<'_>, t_tcx: Duration) -> Row {
             core_families: families,
             core_labels: labels,
         });
+        if let Some(checkpoint_path) = &checkpoint_path {
+            write_probe_checkpoint(checkpoint_path, &program_name, &records)
+                .unwrap_or_else(|error| panic!("{error}"));
+            emit_checkpoint_phase(started, "checkpoint-written", Some(&key), records.len());
+        } else {
+            emit_checkpoint_phase(started, "force-own-complete", Some(&key), records.len());
+        }
     }
+    emit_checkpoint_phase(started, "finalize-start", None, records.len());
     write_probe(Path::new(&probe_path), &program_name, &records)
         .unwrap_or_else(|error| panic!("{error}"));
+    emit_checkpoint_phase(started, "complete", None, records.len());
 
     let mut row = Row::default();
     row.set("t_tcx_s", format!("{:.3}", t_tcx.as_secs_f64()));
@@ -895,14 +993,18 @@ fn checkpoint_batch_timeout_s(value: Option<&str>) -> Result<usize, String> {
         Some(value) => value
             .parse::<usize>()
             .map_err(|_| format!("invalid checkpoint wall cap: {value}"))?,
-        None => 7200,
+        None => 14400,
     };
-    if timeout_s != 7200 {
+    if timeout_s != 14400 {
         return Err(format!(
-            "Linux checkpoint wall cap must be exactly 7,200s, got {timeout_s}s"
+            "Linux checkpoint wall-liveness bound must be exactly 14,400s, got {timeout_s}s"
         ));
     }
     Ok(timeout_s)
+}
+
+fn checkpoint_data_value(status: &str) -> &'static str {
+    if status == "ok" { "true" } else { "false" }
 }
 
 fn sha256_file(path: &Path) -> Result<String, String> {
@@ -1827,6 +1929,8 @@ fn s23_p2_brotli_checkpoint() {
 
     let targets = batch_dir.join("targets.txt");
     let probe = batch_dir.join("probes.tsv");
+    let checkpoint = batch_dir.join("partial-probes.tsv");
+    let checkpoint_temp = probe_checkpoint_temp_path(&checkpoint);
     let stdout = batch_dir.join("stdout.txt");
     let stderr = batch_dir.join("stderr.txt");
     let receipt = batch_dir.join("receipt.txt");
@@ -1848,6 +1952,10 @@ fn s23_p2_brotli_checkpoint() {
         &[
             ("CRAT_S23_TARGET_KEYS", targets.display().to_string()),
             ("CRAT_S23_PROBE_ARTIFACT", probe.display().to_string()),
+            (
+                "CRAT_S23_CHECKPOINT_ARTIFACT",
+                checkpoint.display().to_string(),
+            ),
         ],
     );
     fs::write(&stdout, &outcome.stdout).expect("write batch stdout");
@@ -1859,14 +1967,40 @@ fn s23_p2_brotli_checkpoint() {
             .and_then(|row| row.get(key))
             .unwrap_or("-")
     };
+    let progress = outcome
+        .stderr
+        .lines()
+        .filter_map(parse_checkpoint_phase)
+        .next_back()
+        .unwrap_or_else(|| CheckpointProgress {
+            phase: "worker-not-entered".to_owned(),
+            candidate: None,
+            completed: 0,
+            elapsed_s: format!("{:.3}", outcome.wall_s),
+        });
+    let checkpoint_rows = if checkpoint.is_file() {
+        parse_probe(&checkpoint).unwrap_or_else(|error| panic!("partial checkpoint: {error}"))
+    } else {
+        Vec::new()
+    };
+    assert!(
+        checkpoint_rows.len() == progress.completed
+            || (progress.phase == "force-own-start"
+                && checkpoint_rows.len() == progress.completed + 1),
+        "partial checkpoint row count {} disagrees with last progress marker {:?}",
+        checkpoint_rows.len(),
+        progress
+    );
+    let data = checkpoint_data_value(&outcome.status);
     let amortized = outcome.wall_s / keys.len() as f64;
     fs::write(
         &receipt,
         format!(
-            "machine_id={}\nplatform={}\nmachine_protocol=dedicated-host\nmemory_limit=uncapped\nbatch={batch_index}\nprogram=brotli\nstatus={}\nanalysis_head={}\nbase_harness_head={}\nbase_manifest_sha256={}\nmac_base_manifest_sha256={}\nsnapshot={}\nbatch_size={}\nbatch_plan={}\nwall_cap_s={}\nrange_start={}\nrange_end={}\nqueried={}\nfirst_key={}\nlast_key={}\nwall_s={:.3}\nwall_s_per_candidate={:.6}\npeak_rss_kb={}\nworker_t_total_s={}\nhard_unsat={}\nforce_sat={}\nsolver_unknown={}\naccepted_owning={}\n",
+            "machine_id={}\nplatform={}\nmachine_protocol=dedicated-host\nmemory_limit=uncapped\nwall_bound_kind=liveness\nbatch={batch_index}\nprogram=brotli\nstatus={}\ndata={}\ncheckpoint_data=false\nanalysis_head={}\nbase_harness_head={}\nbase_manifest_sha256={}\nmac_base_manifest_sha256={}\nsnapshot={}\nbatch_size={}\nbatch_plan={}\nwall_cap_s={}\nrange_start={}\nrange_end={}\nplanned_targets={}\nqueried={}\nfirst_key={}\nlast_key={}\nlast_phase={}\nlast_candidate={}\nlast_phase_t_s={}\ncheckpoint_rows={}\ncheckpoint_last_key={}\nwall_s={:.3}\nwall_s_per_candidate={:.6}\npeak_rss_kb={}\nworker_t_total_s={}\nhard_unsat={}\nforce_sat={}\nsolver_unknown={}\naccepted_owning={}\n",
             contract.identity.machine_id,
             contract.identity.platform,
             outcome.status,
+            data,
             super::orchestrate::git_sha(),
             P2_BASE_HARNESS_HEAD,
             contract.base_manifest_sha256,
@@ -1878,8 +2012,17 @@ fn s23_p2_brotli_checkpoint() {
             range.start,
             range.end,
             keys.len(),
+            checkpoint_rows.len(),
             keys.first().expect("nonempty batch"),
             keys.last().expect("nonempty batch"),
+            progress.phase,
+            progress.candidate.as_deref().unwrap_or("none"),
+            progress.elapsed_s,
+            checkpoint_rows.len(),
+            checkpoint_rows
+                .last()
+                .map(|row| row.field_key.as_str())
+                .unwrap_or("none"),
             outcome.wall_s,
             amortized,
             outcome.peak_rss_kb,
@@ -1900,6 +2043,12 @@ fn s23_p2_brotli_checkpoint() {
         ];
         if probe.is_file() {
             artifacts.push(probe.clone());
+        }
+        if checkpoint.is_file() {
+            artifacts.push(checkpoint.clone());
+        }
+        if checkpoint_temp.is_file() {
+            artifacts.push(checkpoint_temp.clone());
         }
         write_sha256_manifest(&batch_dir, &artifacts, &manifest)
             .unwrap_or_else(|error| panic!("write batch manifest: {error}"));
@@ -2034,17 +2183,33 @@ fn s23_p2_checkpoint_aggregate() {
             expected,
             "batch {batch_index} target slice drifted"
         );
-        brotli_rows += insert_probe_artifact(
-            "brotli",
-            &batch_dir.join("probes.tsv"),
-            &candidate_slots,
-            &selected,
-            &mut probes,
-        )
-        .unwrap_or_else(|error| panic!("batch {batch_index} probes: {error}"));
         let receipt = parse_receipt(&batch_dir.join("receipt.txt"))
             .unwrap_or_else(|error| panic!("batch {batch_index} receipt: {error}"));
         assert_eq!(receipt.get("status").map(String::as_str), Some("ok"));
+        if batch_index >= 2 {
+            assert_eq!(
+                receipt.get("data").map(String::as_str),
+                Some("true"),
+                "batch {batch_index} is not a completed data-bearing run"
+            );
+            assert_eq!(
+                receipt.get("checkpoint_data").map(String::as_str),
+                Some("false"),
+                "batch {batch_index} checkpoint artifact must remain provenance-only"
+            );
+            assert_eq!(
+                receipt.get("wall_bound_kind").map(String::as_str),
+                Some("liveness"),
+                "batch {batch_index} wall bound kind drift"
+            );
+            assert_eq!(
+                receipt
+                    .get("wall_cap_s")
+                    .and_then(|value| value.parse().ok()),
+                Some(14400usize),
+                "batch {batch_index} wall-liveness bound drift"
+            );
+        }
         assert_eq!(
             receipt.get("machine_id").map(String::as_str),
             Some(contract.identity.machine_id.as_str())
@@ -2103,6 +2268,14 @@ fn s23_p2_checkpoint_aggregate() {
                 "8192-mib-control".to_owned()
             }
         };
+        brotli_rows += insert_probe_artifact(
+            "brotli",
+            &batch_dir.join("probes.tsv"),
+            &candidate_slots,
+            &selected,
+            &mut probes,
+        )
+        .unwrap_or_else(|error| panic!("batch {batch_index} probes: {error}"));
         batch_stats.push((
             batch_index,
             expected.len(),
@@ -2423,9 +2596,62 @@ mod tests {
         assert!(MeasurementIdentity::parse("", "linux-x86_64").is_err());
         assert!(MeasurementIdentity::parse("lambda7", "linux\tx86_64").is_err());
 
-        assert_eq!(checkpoint_batch_timeout_s(None), Ok(7200));
-        assert_eq!(checkpoint_batch_timeout_s(Some("7200")), Ok(7200));
+        assert_eq!(checkpoint_batch_timeout_s(None), Ok(14400));
+        assert_eq!(checkpoint_batch_timeout_s(Some("14400")), Ok(14400));
+        assert!(checkpoint_batch_timeout_s(Some("7200")).is_err());
         assert!(checkpoint_batch_timeout_s(Some("3600")).is_err());
+        assert_eq!(checkpoint_data_value("ok"), "true");
+        for status in ["timeout", "oom-kill", "panic", "crash", "no-output"] {
+            assert_eq!(checkpoint_data_value(status), "false");
+        }
+
+        let witness_root = std::env::temp_dir().join(format!(
+            "crat-s23-checkpoint-control-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("control clock")
+                .as_nanos()
+        ));
+        fs::create_dir(&witness_root).expect("create checkpoint control directory");
+        let witness_path = witness_root.join("partial-probes.tsv");
+        let witness_key = "fixture::H0::field0@d0";
+        let witness_records = vec![ProbeRecord {
+            field_key: witness_key.to_owned(),
+            field_slot: 0,
+            accepted_kind: SlotKind::Raw,
+            force_result: ForceResult::Unsat,
+            core_families: vec!["own-assume".to_owned(), "link-own".to_owned()],
+            core_labels: Vec::new(),
+        }];
+        write_probe_checkpoint(&witness_path, "fixture", &witness_records)
+            .expect("write positive-control checkpoint");
+        assert!(
+            !probe_checkpoint_temp_path(&witness_path).exists(),
+            "atomic checkpoint publish must not leave its temporary file"
+        );
+        let marker = checkpoint_phase_line(
+            "checkpoint-written",
+            Some(witness_key),
+            1,
+            Duration::from_millis(1250),
+        );
+        eprintln!("{marker}");
+        eprintln!(
+            "S23CHECKPOINT data=false path={} rows=1",
+            witness_path.display()
+        );
+        let progress = parse_checkpoint_phase(&marker).expect("parse checkpoint marker");
+        assert_eq!(progress.phase, "checkpoint-written");
+        assert_eq!(progress.candidate.as_deref(), Some(witness_key));
+        assert_eq!(progress.completed, 1);
+        assert_eq!(progress.elapsed_s, "1.250");
+        assert_eq!(
+            parse_probe(&witness_path).expect("parse positive-control checkpoint"),
+            witness_records
+        );
+        fs::remove_file(&witness_path).expect("remove checkpoint control artifact");
+        fs::remove_dir(&witness_root).expect("remove checkpoint control directory");
 
         let ranges = checkpoint_batch_ranges(112).expect("valid checkpoint plan");
         assert_eq!(
