@@ -840,6 +840,26 @@ fn decide_one(
         if subject.mutable && uses.non_test_uses > 1 && !subject.mut_binding {
             return degrade(subject, decl_site, DegradeReason::OptNeedsMutBinding);
         }
+        // **S3.2′-5 hardening — LAST in this arm**, the same placement rule the
+        // plain-slice twin uses, so it can only ever convert a would-be `Opt`
+        // emission and never displace `OptUseUnsupported` or
+        // `OptNeedsMutBinding`.
+        //
+        // **Gated on `slice`** — the narrowest arm that owns the hazard. The
+        // index is what can wrap, and only the FAT twin forms one: form
+        // selection admits `Opt { slice: false }` only under
+        // `!has_arithmetic || is_array` with `slice = has_arithmetic &&
+        // is_array`, so a thin optional has no arithmetic at all. Gating the
+        // whole arm would additionally degrade any thin optional whose sign
+        // lookup MISSES, because `may_be_negative` folds `None` conservatively
+        // — the 61-thin-`Ref` mistake in a second place.
+        //
+        // Reason key **shared** with the plain arm by ruling: the hazard and
+        // the owed capability are the same, and the subject's own outcome keeps
+        // the two arms attributable in the facts join.
+        if slice && sign.may_be_negative(subject.fn_did, subject.local) {
+            return degrade(subject, decl_site, DegradeReason::SliceNegOrUnknownOffset);
+        }
         return Decision::Opt {
             mutable: subject.mutable,
             slice,

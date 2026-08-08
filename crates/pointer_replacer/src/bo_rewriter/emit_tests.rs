@@ -2521,3 +2521,78 @@ fn a_may_be_negative_offset_refuses_the_slice_form_with_its_own_reason() {
     );
 }
 
+/// **S3.2′-5 hardening — the FAT-OPTIONAL twin carries the identical hazard.**
+///
+/// `Form::Opt { slice: true }` reaches the same `*p.offset(e)` position through
+/// `accessor[index]` (`emitability.rs:522-559`) and the same `(e) as usize`
+/// rendering. Before this gate it emitted unconditionally: the plain-slice arm
+/// was closed and its optional twin was not, so "one sign authority, no
+/// parallel notion" was a statement about one arm rather than about the
+/// emitter. Zero-expected-delta debut — all 50 optional emissions measure
+/// `nonneg`, so this moves nothing on the corpus and everything in principle.
+///
+/// **Gated on `slice`, the narrowest arm that owns the hazard.** A thin
+/// optional provably has no arithmetic — form selection admits
+/// `Opt { slice: false }` only under `!has_arithmetic || is_array` with
+/// `slice = has_arithmetic && is_array` — so it forms no index and the sign
+/// verdict is irrelevant to it. Gating the whole arm would also degrade any
+/// thin optional whose sign lookup MISSES, since `may_be_negative` folds
+/// `None` conservatively. That is the 61-thin-`Ref` finding a second time.
+#[test]
+fn a_may_be_negative_offset_refuses_the_fat_optional_form_too() {
+    fn reason_for(body: &str) -> String {
+        let src = format!(
+            "#![allow(dead_code, unused_unsafe, unused_mut, unused_variables)]\n\
+             pub unsafe fn f(mut p: *mut i32, n: usize, k: isize) -> *mut i32 {{\n{body}\n}}\n"
+        );
+        let got = decisions_of(&src);
+        reason_of(&got, "p", true)
+    }
+    const NULL_TEST: &str = "    if p.is_null() { return core::ptr::null_mut(); }\n";
+
+    // NEGATIVE — the probe that exposed the gap, now a permanent fixture.
+    assert_eq!(
+        reason_for(&[NULL_TEST, "    let _v = *p.offset(k);\n    core::ptr::null_mut()"].concat()),
+        "slice-neg-or-unknown-offset",
+        "a fat OPTIONAL with a may-be-negative offset must be refused for the \
+         same reason its plain twin is — the hazard is the index, and the \
+         `Option` wrapper does not change it"
+    );
+
+    // POSITIVE — the fat-optional arm must still emit on a provable non-negative.
+    assert_eq!(
+        reason_for(&[NULL_TEST, "    let mut i: usize = 0;\n    let mut t = 0;\n    while i < n { t += *p.offset(i as isize); i += 1; }\n    core::ptr::null_mut()"].concat()),
+        "<emitted>",
+        "a provably non-negative fat optional must still emit"
+    );
+
+    // THIN optional — a REGRESSION PIN, **not a control**, and the difference
+    // was measured rather than assumed.
+    //
+    // Dropping the `slice &&` conjunct leaves this assertion GREEN, so it does
+    // NOT witness that conjunct. Measured reason: `SignFacts` inserts a taint
+    // bit only at an offset use, and a thin optional has none, so its verdict
+    // is always `Some(false)` and an ungated sign check would pass it anyway.
+    // The conjunct earns its place only on a lookup MISS, where
+    // `may_be_negative` folds `None` to `true` — and no fixture can produce a
+    // miss, since that needs the local to outrun the analysis domain.
+    //
+    // So the conjunct is defense-in-depth against the conservative fold, kept
+    // on the P-drop precedent (retain, and state the measurement that explains
+    // why nothing exercises it) rather than deleted as unreachable. This line
+    // pins that thin optionals keep emitting; it does not pretend to more.
+    assert_eq!(
+        reason_for(&[NULL_TEST, "    let _v = *p;\n    core::ptr::null_mut()"].concat()),
+        "<emitted>",
+        "a THIN optional forms no index and must keep emitting"
+    );
+
+    // PRECEDENCE — last in its own arm, same rule as the slice twin.
+    assert_eq!(
+        reason_for(&[NULL_TEST, "    let _v = *p.offset(k);\n    p"].concat()),
+        "opt-use-unsupported",
+        "the fat-optional sign gate must fire LAST in its arm: a subject that \
+         is ALSO unsupported for its use shape keeps the earlier attribution"
+    );
+}
+
