@@ -2420,12 +2420,18 @@ fn the_classifier_accept_set_equals_the_approved_scope() {
         ),
     ] {
         let got = reason_for(body);
+        // **Per-entry, not one shared disjunction.** S3.2′-5 adds a third
+        // admissible reason; widening a single `||` for the whole loop would
+        // let ANY negative control drift onto ANY of the three unnoticed, which
+        // is exactly the coverage this guard exists to deny.
+        let allowed: &[&str] = match label {
+            "may-be-negative offset" => &["slice-neg-or-unknown-offset"],
+            _ => &["slice-use-unsupported", "raw-pointer-operation"],
+        };
         assert!(
-            got == "slice-use-unsupported"
-                || got == "raw-pointer-operation"
-                || got == "slice-neg-or-unknown-offset",
-            "{label} is not emittable today and must be refused with an \
-             attribution, got {got:?}"
+            allowed.contains(&got.as_str()),
+            "{label} is not emittable today and must be refused with the \
+             attribution that names WHY: expected one of {allowed:?}, got {got:?}"
         );
         assert_ne!(got, "<emitted>", "{label} must not emit");
     }
@@ -2494,4 +2500,24 @@ fn a_may_be_negative_offset_refuses_the_slice_form_with_its_own_reason() {
         "a provably non-negative offset must still emit — the gate keys on the \
          SIGN, not on the presence of arithmetic"
     );
+
+    // **PRECEDENCE — the gate must stay LAST in the arm.**
+    //
+    // The two halves above pin that the gate fires and that it is conditional;
+    // neither pins WHERE. Moving it above the `SliceUseUnsupported` check would
+    // leave both green while silently displacing an earlier, more specific
+    // reason — the "can only convert a would-be emission" property that makes
+    // its movement a pre-registered count rather than an unbounded one.
+    //
+    // This subject is may-be-negative AND separately unsupported (`p` is also
+    // returned bare). The earlier reason must win.
+    assert_eq!(
+        reason_for("    let _v = *p.offset(k);\n    p"),
+        "slice-use-unsupported",
+        "the sign gate must fire LAST: a subject that is ALSO unsupported for \
+         its use shape must keep the earlier, more specific attribution. If \
+         this reads `slice-neg-or-unknown-offset`, the gate has been hoisted \
+         above a reason it must never displace."
+    );
 }
+
