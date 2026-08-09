@@ -956,6 +956,77 @@ fn parse_probe_for_program(
     Ok(rows)
 }
 
+fn parse_combined_probe(
+    path: &Path,
+    identity: &MeasurementIdentity,
+) -> Result<Vec<(String, ProbeRecord)>, String> {
+    const HEADER: &str = "platform\tmachine_id\tprogram\tfield_key\tfield_slot\taccepted_kind\tforce_result\tcore_families\tcore_labels";
+    let input = fs::read_to_string(path)
+        .map_err(|error| format!("read combined probe {}: {error}", path.display()))?;
+    let mut lines = input.lines();
+    if lines.next() != Some(HEADER) {
+        return Err(format!("combined probe header drift: {}", path.display()));
+    }
+    let mut rows = Vec::new();
+    for (offset, line) in lines.enumerate() {
+        let columns = line.split('\t').collect::<Vec<_>>();
+        if columns.len() != 9 {
+            return Err(format!(
+                "combined probe {} line {} has {} columns",
+                path.display(),
+                offset + 2,
+                columns.len()
+            ));
+        }
+        if columns[0] != identity.platform || columns[1] != identity.machine_id {
+            return Err(format!(
+                "combined probe {} line {} measurement identity mismatch",
+                path.display(),
+                offset + 2
+            ));
+        }
+        let accepted_kind = match columns[5] {
+            "raw" => SlotKind::Raw,
+            "ref" => SlotKind::Ref,
+            "owning" => SlotKind::Owning,
+            other => return Err(format!("unknown accepted kind {other:?}")),
+        };
+        let force_result = match columns[6] {
+            "sat" => ForceResult::Sat,
+            "unsat" => ForceResult::Unsat,
+            "unknown" => ForceResult::Unknown,
+            "not-queried" => ForceResult::NotQueried,
+            other => return Err(format!("unknown force result {other:?}")),
+        };
+        rows.push((
+            columns[2].to_owned(),
+            ProbeRecord {
+                field_key: columns[3].to_owned(),
+                field_slot: columns[4].parse().map_err(|error| {
+                    format!(
+                        "combined probe {} line {} field_slot: {error}",
+                        path.display(),
+                        offset + 2
+                    )
+                })?,
+                accepted_kind,
+                force_result,
+                core_families: if columns[7].is_empty() {
+                    Vec::new()
+                } else {
+                    columns[7].split('|').map(str::to_owned).collect()
+                },
+                core_labels: if columns[8].is_empty() {
+                    Vec::new()
+                } else {
+                    columns[8].split('|').map(str::to_owned).collect()
+                },
+            },
+        ));
+    }
+    Ok(rows)
+}
+
 fn append_artifact(combined: &mut String, path: &Path) -> Result<(), String> {
     let input = fs::read_to_string(path)
         .map_err(|error| format!("read artifact {}: {error}", path.display()))?;
@@ -1644,6 +1715,19 @@ const P2_CHECKPOINT_BATCH_PLAN: &str = "24,24,12,12,12,12,12,4";
 const P2_MAC_BROTLI_COMPLETED: usize = 24;
 const P2_NON_BROTLI_IDENTITY_SHA256: &str =
     "45d335cbed633056ac80cb89da546e6572b7145ec4d134e3df3f5c07e564abe9";
+const P2_ACCEPTED_AGGREGATE_MANIFEST_SHA256: &str =
+    "3ef9b9406b5fc88f06a7c3ac31f00c15eea0b7730bfedb6fb4ce8b5cbef0c9ee";
+const P2_COMPLETION_IDENTITY_SHA256: &str =
+    "6fe2fd3e95580e6cd2eb2d841aa9560ae8d3b010c25f69d75336e10fe7848d74";
+const P2_COMPLETION_CANDIDATES: usize = 61;
+const P2_COMPLETION_ORDER: &str = "quadtree,urlparser,rgba,lil,lodepng";
+const P2_COMPLETION_PROGRAMS: [(&str, usize); 5] = [
+    ("quadtree", 10),
+    ("urlparser", 11),
+    ("rgba", 1),
+    ("lil", 8),
+    ("lodepng", 31),
+];
 const P2_FIRST_TIME_BROTLI_FORCE_SAT: [&str; 3] = [
     "src::enc::backward_references::H35::field4@d0",
     "src::enc::backward_references::H55::field4@d0",
@@ -1855,6 +1939,135 @@ fn selected_checkpoint_candidates(candidates: &[CandidateSummary]) -> BTreeSet<(
     eligible.into_iter().take(P2_QUERY_BUDGET).collect()
 }
 
+fn validate_exact_candidate_partition(
+    universe: &[(String, String)],
+    completed: &[(String, String)],
+    completion: &[(String, String)],
+) -> Result<(), String> {
+    let unique = |label: &str, rows: &[(String, String)]| {
+        let set = rows.iter().cloned().collect::<BTreeSet<_>>();
+        if set.len() != rows.len() {
+            Err(format!("{label} candidate partition contains a duplicate"))
+        } else {
+            Ok(set)
+        }
+    };
+    let universe = unique("universe", universe)?;
+    let completed = unique("completed", completed)?;
+    let completion = unique("completion", completion)?;
+    let overlap = completed
+        .intersection(&completion)
+        .cloned()
+        .collect::<Vec<_>>();
+    if !overlap.is_empty() {
+        return Err(format!("candidate partition overlap: {overlap:?}"));
+    }
+    let combined = completed
+        .union(&completion)
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let extra = combined.difference(&universe).cloned().collect::<Vec<_>>();
+    if !extra.is_empty() {
+        return Err(format!(
+            "candidate partition contains extra identities: {extra:?}"
+        ));
+    }
+    let missing = universe.difference(&combined).cloned().collect::<Vec<_>>();
+    if !missing.is_empty() {
+        return Err(format!(
+            "candidate partition is missing identities: {missing:?}"
+        ));
+    }
+    Ok(())
+}
+
+fn completion_checkpoint_programs(
+    candidates: &[CandidateSummary],
+) -> Result<Vec<(String, Vec<String>)>, String> {
+    let eligible = candidates
+        .iter()
+        .filter(|candidate| candidate.discovery == DiscoveryClass::Eligible)
+        .map(|candidate| (candidate.program.clone(), candidate.field_key.clone()))
+        .collect::<Vec<_>>();
+    if eligible.len() != P2_QUERY_BUDGET + P2_COMPLETION_CANDIDATES {
+        return Err(format!(
+            "completion universe drifted: expected {}, got {}",
+            P2_QUERY_BUDGET + P2_COMPLETION_CANDIDATES,
+            eligible.len()
+        ));
+    }
+    let completed = selected_checkpoint_candidates(candidates)
+        .into_iter()
+        .collect::<Vec<_>>();
+    let completed_set = completed.iter().cloned().collect::<BTreeSet<_>>();
+    let completion = eligible
+        .iter()
+        .filter(|identity| !completed_set.contains(*identity))
+        .cloned()
+        .collect::<Vec<_>>();
+    validate_exact_candidate_partition(&eligible, &completed, &completion)?;
+    if completion.len() != P2_COMPLETION_CANDIDATES {
+        return Err(format!(
+            "completion population drifted: expected {P2_COMPLETION_CANDIDATES}, got {}",
+            completion.len()
+        ));
+    }
+
+    let candidate_slots = candidates
+        .iter()
+        .map(|candidate| {
+            (
+                (candidate.program.clone(), candidate.field_key.clone()),
+                candidate.field_slot,
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    let mut identity_list = String::new();
+    for (program, key) in &completion {
+        let slot = candidate_slots
+            .get(&(program.clone(), key.clone()))
+            .ok_or_else(|| format!("completion identity lacks slot: {program} {key}"))?;
+        identity_list.push_str(&format!("{program}\t{key}\t{slot}\n"));
+    }
+    let digest = sha256_text(&identity_list)?;
+    if digest != P2_COMPLETION_IDENTITY_SHA256 {
+        return Err(format!(
+            "completion identity digest drifted: expected {P2_COMPLETION_IDENTITY_SHA256}, got {digest}"
+        ));
+    }
+
+    let grouped = completion.into_iter().fold(
+        BTreeMap::<String, Vec<String>>::new(),
+        |mut programs, (program, key)| {
+            programs.entry(program).or_default().push(key);
+            programs
+        },
+    );
+    let actual = grouped
+        .iter()
+        .map(|(program, keys)| (program.as_str(), keys.len()))
+        .collect::<BTreeMap<_, _>>();
+    let expected = P2_COMPLETION_PROGRAMS
+        .iter()
+        .copied()
+        .collect::<BTreeMap<_, _>>();
+    if actual != expected {
+        return Err(format!(
+            "completion program partition drifted: expected {expected:?}, got {actual:?}"
+        ));
+    }
+    P2_COMPLETION_PROGRAMS
+        .iter()
+        .map(|(program, _)| {
+            grouped
+                .get(*program)
+                .cloned()
+                .map(|keys| ((*program).to_owned(), keys))
+                .ok_or_else(|| format!("completion program {program} is missing"))
+        })
+        .collect()
+}
+
 fn non_brotli_checkpoint_programs(
     candidates: &[CandidateSummary],
 ) -> Result<BTreeMap<String, Vec<String>>, String> {
@@ -2026,6 +2239,177 @@ fn validate_completed_recovery_shard(
         }
     }
     validate_recovery_rows(program, expected_keys, rows, candidate_slots)
+}
+
+fn validate_completion_rows(
+    program: &str,
+    expected_keys: &[String],
+    rows: &[ProbeRecord],
+    candidate_slots: &BTreeMap<(String, String), usize>,
+) -> Result<(), String> {
+    if rows.len() != expected_keys.len() {
+        return Err(format!(
+            "identity mismatch for {program}: expected {} rows, got {}",
+            expected_keys.len(),
+            rows.len()
+        ));
+    }
+    for (row, expected_key) in rows.iter().zip(expected_keys) {
+        if &row.field_key != expected_key {
+            return Err(format!(
+                "identity mismatch for {program}: expected {expected_key}, got {}",
+                row.field_key
+            ));
+        }
+        let expected_slot = candidate_slots
+            .get(&(program.to_owned(), expected_key.clone()))
+            .ok_or_else(|| {
+                format!("identity mismatch for {program}: {expected_key} lacks a candidate slot")
+            })?;
+        if row.field_slot != *expected_slot {
+            return Err(format!(
+                "identity mismatch for {program}::{expected_key}: expected field_slot={expected_slot}, got {}",
+                row.field_slot
+            ));
+        }
+        match row.force_result {
+            ForceResult::Sat | ForceResult::Unsat => {}
+            ForceResult::Unknown => {
+                return Err(format!("solver Unknown at {program}::{expected_key}"));
+            }
+            ForceResult::NotQueried => {
+                return Err(format!(
+                    "identity mismatch for {program}::{expected_key}: completed row is not-queried"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn completion_row_failure_candidate(
+    program: &str,
+    expected_keys: &[String],
+    rows: &[ProbeRecord],
+    candidate_slots: &BTreeMap<(String, String), usize>,
+) -> String {
+    if rows.len() < expected_keys.len() {
+        return expected_keys[rows.len()].clone();
+    }
+    if rows.len() > expected_keys.len() {
+        return rows[expected_keys.len()].field_key.clone();
+    }
+    for (row, expected_key) in rows.iter().zip(expected_keys) {
+        let identity = (program.to_owned(), expected_key.clone());
+        if &row.field_key != expected_key
+            || candidate_slots.get(&identity).copied() != Some(row.field_slot)
+            || matches!(
+                row.force_result,
+                ForceResult::Unknown | ForceResult::NotQueried
+            )
+        {
+            return if row.field_key.is_empty() {
+                expected_key.clone()
+            } else {
+                row.field_key.clone()
+            };
+        }
+    }
+    "<completion-row>".to_owned()
+}
+
+fn validate_completed_completion_shard(
+    program: &str,
+    expected_keys: &[String],
+    receipt: &BTreeMap<String, String>,
+    rows: &[ProbeRecord],
+    identity: &MeasurementIdentity,
+    candidate_slots: &BTreeMap<(String, String), usize>,
+) -> Result<(), String> {
+    let require = |field: &str, expected: &str| match receipt.get(field) {
+        Some(actual) if actual == expected => Ok(()),
+        actual => Err(format!(
+            "completed completion shard {program} requires {field}={expected:?}, got {actual:?}"
+        )),
+    };
+    require("machine_id", &identity.machine_id)?;
+    require("platform", &identity.platform)?;
+    require("program", program)?;
+    require("status", "ok")?;
+    require("worker_status", "ok")?;
+    require("data", "true")?;
+    require("checkpoint_data", "false")?;
+    require("memory_limit", "uncapped")?;
+    require("wall_bound_kind", "liveness")?;
+    require("wall_cap_s", "14400")?;
+    require("last_phase", "complete")?;
+    require("candidate_universe_sha256", P2_CANDIDATE_UNIVERSE_SHA256)?;
+    require(
+        "completion_identity_list_sha256",
+        P2_COMPLETION_IDENTITY_SHA256,
+    )?;
+    require(
+        "accepted_aggregate_manifest_sha256",
+        P2_ACCEPTED_AGGREGATE_MANIFEST_SHA256,
+    )?;
+    if let Some(index) = P2_COMPLETION_PROGRAMS
+        .iter()
+        .position(|(candidate_program, _)| *candidate_program == program)
+    {
+        require("completion_order", P2_COMPLETION_ORDER)?;
+        require(
+            "completed_predecessors",
+            &P2_COMPLETION_PROGRAMS[..index]
+                .iter()
+                .map(|(candidate_program, _)| *candidate_program)
+                .collect::<Vec<_>>()
+                .join(","),
+        )?;
+    }
+    require("validation_error", "none")?;
+    for field in ["planned_targets", "queried", "checkpoint_rows"] {
+        let actual = receipt
+            .get(field)
+            .ok_or_else(|| format!("completed completion shard {program} lacks {field}"))?
+            .parse::<usize>()
+            .map_err(|error| {
+                format!("completed completion shard {program} has invalid {field}: {error}")
+            })?;
+        if actual != expected_keys.len() {
+            return Err(format!(
+                "completed completion shard {program} requires {field}={}, got {actual}",
+                expected_keys.len()
+            ));
+        }
+    }
+    validate_completion_rows(program, expected_keys, rows, candidate_slots)?;
+    let hard_unsat = rows
+        .iter()
+        .filter(|row| row.force_result == ForceResult::Unsat)
+        .count();
+    let force_sat = rows
+        .iter()
+        .filter(|row| row.force_result == ForceResult::Sat)
+        .count();
+    for (field, expected) in [
+        ("hard_unsat", hard_unsat),
+        ("force_sat", force_sat),
+        ("solver_unknown", 0),
+    ] {
+        let actual = receipt
+            .get(field)
+            .ok_or_else(|| format!("completed completion shard {program} lacks {field}"))?
+            .parse::<usize>()
+            .map_err(|error| {
+                format!("completed completion shard {program} has invalid {field}: {error}")
+            })?;
+        if actual != expected {
+            return Err(format!(
+                "completed completion shard {program} requires {field}={expected}, got {actual}"
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn validate_brotli_mac_overlap(
@@ -2686,6 +3070,495 @@ fn s23_p2_non_brotli_recovery_shard() {
     );
 }
 
+/// Measure one program from the exact 61-candidate complement of the accepted
+/// 200-row aggregate. SAT and UNSAT are both first-time result classes here;
+/// Unknown, identity drift, or an incomplete worker is a manifested data=false
+/// STOP and is never eligible for aggregation.
+#[test]
+#[ignore = "P2 61-candidate completion; run one dedicated-host shard explicitly"]
+fn s23_p2_completion_shard() {
+    let contract = checkpoint_contract();
+    let candidates = checkpoint_candidates(&contract.base);
+    let candidate_slots = candidates
+        .iter()
+        .map(|candidate| {
+            (
+                (candidate.program.clone(), candidate.field_key.clone()),
+                candidate.field_slot,
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    let programs = completion_checkpoint_programs(&candidates)
+        .unwrap_or_else(|error| panic!("P2 completion partition: {error}"));
+    let program = std::env::var("CRAT_S23_COMPLETION_PROGRAM")
+        .expect("completion requires CRAT_S23_COMPLETION_PROGRAM");
+    let program_index = programs
+        .iter()
+        .position(|(candidate_program, _)| candidate_program == &program)
+        .unwrap_or_else(|| {
+            panic!(
+                "completion program {program:?} is outside the registered order {:?}",
+                programs
+                    .iter()
+                    .map(|(candidate_program, _)| candidate_program)
+                    .collect::<Vec<_>>()
+            )
+        });
+    let keys = &programs[program_index].1;
+    let completed_predecessors = programs[..program_index]
+        .iter()
+        .map(|(candidate_program, _)| candidate_program.as_str())
+        .collect::<Vec<_>>()
+        .join(",");
+    for (predecessor, predecessor_keys) in &programs[..program_index] {
+        let predecessor_dir = contract
+            .batches
+            .join("completion-shards")
+            .join(predecessor);
+        let predecessor_manifest = predecessor_dir.join("artifact-manifest.sha256");
+        let stop_candidate = keys
+            .first()
+            .map(String::as_str)
+            .unwrap_or("<empty-shard>");
+        verify_sha256_manifest(&predecessor_dir, &predecessor_manifest).unwrap_or_else(|error| {
+            panic!(
+                "P2 completion STOP: program={program} status=sequence-violation phase=predecessor-manifest candidate={stop_candidate} detail={predecessor}:{error}"
+            )
+        });
+        let predecessor_receipt = parse_receipt(&predecessor_dir.join("receipt.txt"))
+            .unwrap_or_else(|error| {
+                panic!(
+                    "P2 completion STOP: program={program} status=sequence-violation phase=predecessor-receipt candidate={stop_candidate} detail={predecessor}:{error}"
+                )
+            });
+        if predecessor_receipt.get("data").map(String::as_str) != Some("true") {
+            panic!(
+                "P2 completion STOP: program={program} status=sequence-violation phase=predecessor-data candidate={stop_candidate} detail={predecessor}:data-false"
+            );
+        }
+        let predecessor_rows = parse_probe_for_program(
+            &predecessor_dir.join("probes.tsv"),
+            Some(predecessor),
+        )
+        .unwrap_or_else(|error| {
+            panic!(
+                "P2 completion STOP: program={program} status=sequence-violation phase=predecessor-probes candidate={stop_candidate} detail={predecessor}:{error}"
+            )
+        });
+        validate_completed_completion_shard(
+            predecessor,
+            predecessor_keys,
+            &predecessor_receipt,
+            &predecessor_rows,
+            &contract.identity,
+            &candidate_slots,
+        )
+        .unwrap_or_else(|error| {
+            panic!(
+                "P2 completion STOP: program={program} status=sequence-violation phase=predecessor-validation candidate={stop_candidate} detail={predecessor}:{error}"
+            )
+        });
+        assert_eq!(
+            read_target_keys(&predecessor_dir.join("targets.txt"))
+                .unwrap_or_else(|error| panic!("predecessor targets {predecessor}: {error}")),
+            *predecessor_keys,
+            "P2 completion STOP: program={program} status=sequence-violation phase=predecessor-targets candidate={stop_candidate} detail={predecessor}"
+        );
+        assert_eq!(
+            parse_probe_for_program(
+                &predecessor_dir.join("partial-probes.tsv"),
+                Some(predecessor),
+            )
+            .unwrap_or_else(|error| panic!("predecessor checkpoint {predecessor}: {error}")),
+            predecessor_rows,
+            "P2 completion STOP: program={program} status=sequence-violation phase=predecessor-checkpoint candidate={stop_candidate} detail={predecessor}"
+        );
+        assert!(
+            !probe_checkpoint_temp_path(&predecessor_dir.join("partial-probes.tsv")).exists(),
+            "P2 completion STOP: program={program} status=sequence-violation phase=predecessor-checkpoint candidate={stop_candidate} detail={predecessor}:temporary-file"
+        );
+    }
+    let timeout_override = std::env::var("CRAT_S23_BATCH_TIMEOUT_SECS").ok();
+    let timeout_s = checkpoint_batch_timeout_s(timeout_override.as_deref())
+        .unwrap_or_else(|error| panic!("completion liveness bound: {error}"));
+    let shard_dir = contract.batches.join("completion-shards").join(&program);
+    let manifest = shard_dir.join("artifact-manifest.sha256");
+    let targets = shard_dir.join("targets.txt");
+    let probe = shard_dir.join("probes.tsv");
+    let checkpoint = shard_dir.join("partial-probes.tsv");
+    let checkpoint_temp = probe_checkpoint_temp_path(&checkpoint);
+    let stdout = shard_dir.join("stdout.txt");
+    let stderr = shard_dir.join("stderr.txt");
+    let receipt_path = shard_dir.join("receipt.txt");
+
+    if manifest.is_file() {
+        verify_sha256_manifest(&shard_dir, &manifest)
+            .unwrap_or_else(|error| panic!("completed completion shard manifest: {error}"));
+        let receipt = parse_receipt(&receipt_path)
+            .unwrap_or_else(|error| panic!("completed completion shard receipt: {error}"));
+        if receipt.get("data").map(String::as_str) != Some("true") {
+            panic!(
+                "P2 completion STOP: program={} status={} phase={} candidate={}; manifested data=false shard is provenance-only",
+            program,
+                receipt
+                    .get("status")
+                    .map(String::as_str)
+                    .unwrap_or("missing"),
+                receipt
+                    .get("stop_phase")
+                    .map(String::as_str)
+                    .unwrap_or("missing"),
+                receipt
+                    .get("stop_candidate")
+                    .map(String::as_str)
+                    .unwrap_or("missing"),
+            );
+        }
+        let rows = parse_probe_for_program(&probe, Some(&program))
+            .unwrap_or_else(|error| panic!("completed completion shard probes: {error}"));
+        validate_completed_completion_shard(
+            &program,
+            keys,
+            &receipt,
+            &rows,
+            &contract.identity,
+            &candidate_slots,
+        )
+        .unwrap_or_else(|error| panic!("P2 completion STOP: {error}"));
+        assert_eq!(
+            read_target_keys(&targets)
+                .unwrap_or_else(|error| panic!("completed completion targets: {error}")),
+            *keys,
+            "completed completion target identity drifted"
+        );
+        assert_eq!(
+            parse_probe_for_program(&checkpoint, Some(&program))
+                .unwrap_or_else(|error| panic!("completed completion checkpoint: {error}")),
+            rows,
+            "completed completion checkpoint/final drifted"
+        );
+        assert!(
+            !checkpoint_temp.exists(),
+            "completed completion shard retained a temporary checkpoint"
+        );
+        println!(
+            "S23P2COMPLETION machine_id={} platform={} program={} status=verified-skip candidates={}",
+            contract.identity.machine_id,
+            contract.identity.platform,
+            program,
+            keys.len()
+        );
+        return;
+    }
+    assert!(
+        !shard_dir.exists(),
+        "P2 STOP: unmanifested completion shard exists at {}; preserve it for inspection",
+        shard_dir.display()
+    );
+    fs::create_dir_all(&shard_dir).expect("create completion shard directory");
+    write_targets(&targets, keys).unwrap_or_else(|error| panic!("completion targets: {error}"));
+
+    let corpus_program = super::CORPUS
+        .iter()
+        .find(|entry| entry.name == program)
+        .unwrap_or_else(|| panic!("completion program {program} lacks a corpus entry"));
+    let input = contract
+        .corpus_link
+        .join(corpus_program.name)
+        .join(corpus_program.lib_root);
+    let outcome = super::orchestrate::run_child_labeled(
+        &program,
+        &input,
+        "s23-probe",
+        &format!("s23-p2-completion-{program}"),
+        Duration::from_secs(timeout_s as u64),
+        &[
+            ("CRAT_S23_TARGET_KEYS", targets.display().to_string()),
+            ("CRAT_S23_PROBE_ARTIFACT", probe.display().to_string()),
+            (
+                "CRAT_S23_CHECKPOINT_ARTIFACT",
+                checkpoint.display().to_string(),
+            ),
+        ],
+    );
+    fs::write(&stdout, &outcome.stdout).expect("write completion stdout");
+    fs::write(&stderr, &outcome.stderr).expect("write completion stderr");
+    let progress = outcome
+        .stderr
+        .lines()
+        .filter_map(parse_checkpoint_phase)
+        .next_back()
+        .unwrap_or_else(|| CheckpointProgress {
+            phase: "worker-not-entered".to_owned(),
+            candidate: None,
+            completed: 0,
+            elapsed_s: format!("{:.3}", outcome.wall_s),
+        });
+    let mut failure_phase = None::<String>;
+    let mut failure_candidate = None::<String>;
+    let (checkpoint_rows, mut validation_error) = if checkpoint.is_file() {
+        match parse_probe_for_program(&checkpoint, Some(&program)) {
+            Ok(rows) => (rows, None),
+            Err(error) => {
+                failure_phase = Some("checkpoint-parse".to_owned());
+                failure_candidate = Some("<partial-probes.tsv>".to_owned());
+                (
+                    Vec::new(),
+                    Some(format!(
+                        "identity mismatch for {program}: invalid partial checkpoint: {error}"
+                    )),
+                )
+            }
+        }
+    } else {
+        (Vec::new(), None)
+    };
+    if validation_error.is_none()
+        && !(checkpoint_rows.len() == progress.completed
+            || (progress.phase == "force-own-start"
+                && checkpoint_rows.len() == progress.completed + 1))
+    {
+        failure_phase = Some("checkpoint-progress".to_owned());
+        failure_candidate = progress.candidate.clone().or_else(|| {
+            keys.get(checkpoint_rows.len().min(keys.len() - 1))
+                .cloned()
+        });
+        validation_error = Some(format!(
+            "identity mismatch for {program}: partial checkpoint rows={} disagree with phase={} completed={}",
+            checkpoint_rows.len(),
+            progress.phase,
+            progress.completed
+        ));
+    }
+    if validation_error.is_none() {
+        if checkpoint_rows.len() > keys.len() {
+            failure_phase = Some("checkpoint-identity".to_owned());
+            failure_candidate = checkpoint_rows
+                .get(keys.len())
+                .map(|row| row.field_key.clone());
+            validation_error = Some(format!(
+                "identity mismatch for {program}: partial checkpoint has {} rows for {} targets",
+                checkpoint_rows.len(),
+                keys.len()
+            ));
+        } else if let Err(error) = validate_completion_rows(
+            &program,
+            &keys[..checkpoint_rows.len()],
+            &checkpoint_rows,
+            &candidate_slots,
+        ) {
+            failure_phase = Some("checkpoint-row-validation".to_owned());
+            failure_candidate = Some(completion_row_failure_candidate(
+                &program,
+                &keys[..checkpoint_rows.len()],
+                &checkpoint_rows,
+                &candidate_slots,
+            ));
+            validation_error = Some(error);
+        }
+    }
+    let mut final_rows = Vec::new();
+    if outcome.status == "ok" {
+        match parse_probe_for_program(&probe, Some(&program)) {
+            Ok(rows) => {
+                if validation_error.is_none() {
+                    if let Err(error) =
+                        validate_completion_rows(&program, keys, &rows, &candidate_slots)
+                    {
+                        failure_phase = Some("final-row-validation".to_owned());
+                        failure_candidate = Some(completion_row_failure_candidate(
+                            &program,
+                            keys,
+                            &rows,
+                            &candidate_slots,
+                        ));
+                        validation_error = Some(error);
+                    } else if rows != checkpoint_rows {
+                        let mismatch = rows
+                            .iter()
+                            .zip(&checkpoint_rows)
+                            .position(|(final_row, checkpoint_row)| final_row != checkpoint_row)
+                            .unwrap_or(rows.len().min(checkpoint_rows.len()));
+                        failure_phase = Some("checkpoint-final-identity".to_owned());
+                        failure_candidate = rows
+                            .get(mismatch)
+                            .or_else(|| checkpoint_rows.get(mismatch))
+                            .map(|row| row.field_key.clone())
+                            .or_else(|| keys.get(mismatch).cloned());
+                        validation_error = Some(format!(
+                            "identity mismatch for {program}: completed checkpoint/final tables differ"
+                        ));
+                    } else if checkpoint_temp.exists() {
+                        failure_phase = Some("checkpoint-publish".to_owned());
+                        failure_candidate = keys.last().cloned();
+                        validation_error = Some(format!(
+                            "identity mismatch for {program}: temporary checkpoint survived publish"
+                        ));
+                    }
+                }
+                final_rows = rows;
+            }
+            Err(error) => {
+                failure_phase = Some("final-probe-parse".to_owned());
+                failure_candidate = Some("<probes.tsv>".to_owned());
+                validation_error = Some(format!(
+                    "identity mismatch for {program}: invalid final probe artifact: {error}"
+                ));
+            }
+        }
+    }
+    let observed_rows = if final_rows.is_empty() {
+        &checkpoint_rows
+    } else {
+        &final_rows
+    };
+    let unknown_candidate = observed_rows
+        .iter()
+        .find(|row| row.force_result == ForceResult::Unknown)
+        .map(|row| row.field_key.as_str());
+    let effective_status = if unknown_candidate.is_some() {
+        "solver-unknown".to_owned()
+    } else if validation_error.is_some() {
+        "identity-mismatch".to_owned()
+    } else if outcome.status != "ok" {
+        outcome.status.clone()
+    } else {
+        "ok".to_owned()
+    };
+    let stop_phase = if unknown_candidate.is_some() {
+        "force-own-result"
+    } else if let Some(failure_phase) = failure_phase.as_deref() {
+        failure_phase
+    } else {
+        progress.phase.as_str()
+    };
+    let stop_candidate = unknown_candidate
+        .or(failure_candidate.as_deref())
+        .or(progress.candidate.as_deref())
+        .or_else(|| {
+            keys.get(progress.completed.min(keys.len() - 1))
+                .map(String::as_str)
+        })
+        .unwrap_or("none");
+    let queried = observed_rows.len();
+    let hard_unsat = observed_rows
+        .iter()
+        .filter(|row| row.force_result == ForceResult::Unsat)
+        .count();
+    let force_sat = observed_rows
+        .iter()
+        .filter(|row| row.force_result == ForceResult::Sat)
+        .count();
+    let solver_unknown = observed_rows
+        .iter()
+        .filter(|row| row.force_result == ForceResult::Unknown)
+        .count();
+    let accepted_owning = observed_rows
+        .iter()
+        .filter(|row| row.accepted_kind == SlotKind::Owning)
+        .count();
+    fs::write(
+        &receipt_path,
+        format!(
+            "machine_id={}\nplatform={}\nmachine_protocol=dedicated-host\nmemory_limit=uncapped\nwall_bound_kind=liveness\nprogram={}\nstatus={}\nworker_status={}\ndata={}\ncheckpoint_data=false\nanalysis_head={}\nbase_harness_head={}\nbase_manifest_sha256={}\naccepted_aggregate_manifest_sha256={}\ncandidate_universe_sha256={}\ncompletion_identity_list_sha256={}\ncompletion_order={}\ncompleted_predecessors={}\nsnapshot={}\nwall_cap_s={}\nplanned_targets={}\nqueried={}\nfirst_key={}\nlast_key={}\nlast_phase={}\nlast_candidate={}\nlast_phase_t_s={}\nstop_phase={}\nstop_candidate={}\ncheckpoint_rows={}\ncheckpoint_last_key={}\nwall_s={:.3}\nwall_s_per_candidate={:.6}\npeak_rss_kb={}\nhard_unsat={}\nforce_sat={}\nsolver_unknown={}\naccepted_owning={}\nvalidation_error={}\n",
+            contract.identity.machine_id,
+            contract.identity.platform,
+            program,
+            effective_status,
+            outcome.status,
+            checkpoint_data_value(&effective_status),
+            super::orchestrate::git_sha(),
+            P2_BASE_HARNESS_HEAD,
+            contract.base_manifest_sha256,
+            P2_ACCEPTED_AGGREGATE_MANIFEST_SHA256,
+            P2_CANDIDATE_UNIVERSE_SHA256,
+            P2_COMPLETION_IDENTITY_SHA256,
+            P2_COMPLETION_ORDER,
+            completed_predecessors,
+            contract.snapshot.display(),
+            timeout_s,
+            keys.len(),
+            queried,
+            keys.first().expect("nonempty completion shard"),
+            keys.last().expect("nonempty completion shard"),
+            progress.phase,
+            progress.candidate.as_deref().unwrap_or("none"),
+            progress.elapsed_s,
+            stop_phase,
+            stop_candidate,
+            checkpoint_rows.len(),
+            checkpoint_rows
+                .last()
+                .map(|row| row.field_key.as_str())
+                .unwrap_or("none"),
+            outcome.wall_s,
+            outcome.wall_s / keys.len() as f64,
+            outcome.peak_rss_kb,
+            hard_unsat,
+            force_sat,
+            solver_unknown,
+            accepted_owning,
+            validation_error.as_deref().unwrap_or("none"),
+        ),
+    )
+    .expect("write completion receipt");
+    let mut artifacts = vec![
+        targets.clone(),
+        stdout.clone(),
+        stderr.clone(),
+        receipt_path.clone(),
+    ];
+    if probe.is_file() {
+        artifacts.push(probe.clone());
+    }
+    if checkpoint.is_file() {
+        artifacts.push(checkpoint.clone());
+    }
+    if checkpoint_temp.is_file() {
+        artifacts.push(checkpoint_temp.clone());
+    }
+    write_sha256_manifest(&shard_dir, &artifacts, &manifest)
+        .unwrap_or_else(|error| panic!("write completion shard manifest: {error}"));
+    verify_sha256_manifest(&shard_dir, &manifest)
+        .unwrap_or_else(|error| panic!("verify completion shard manifest: {error}"));
+
+    if effective_status != "ok" {
+        panic!(
+            "P2 completion STOP: program={} status={} phase={} candidate={} peak_rss_kb={} wall_s={:.3} detail={}",
+            program,
+            effective_status,
+            stop_phase,
+            stop_candidate,
+            outcome.peak_rss_kb,
+            outcome.wall_s,
+            validation_error.as_deref().unwrap_or(&outcome.note),
+        );
+    }
+    let receipt = parse_receipt(&receipt_path)
+        .unwrap_or_else(|error| panic!("completed completion receipt: {error}"));
+    validate_completed_completion_shard(
+        &program,
+        keys,
+        &receipt,
+        &final_rows,
+        &contract.identity,
+        &candidate_slots,
+    )
+    .unwrap_or_else(|error| panic!("P2 completion STOP: {error}"));
+    println!(
+        "S23P2COMPLETION machine_id={} platform={} memory_limit=uncapped program={} status=ok candidates={} hard_unsat={} force_sat={} wall_s={:.3} wall_s_per_candidate={:.6} peak_rss_kb={}",
+        contract.identity.machine_id,
+        contract.identity.platform,
+        program,
+        keys.len(),
+        hard_unsat,
+        force_sat,
+        outcome.wall_s,
+        outcome.wall_s / keys.len() as f64,
+        outcome.peak_rss_kb,
+    );
+}
+
 /// Combine 13 manifested Linux recovery shards with eight manifested brotli
 /// checkpoints. No private-directory-only input is accepted.
 /// This phase launches no corpus worker and forms the aggregate only after the
@@ -3207,9 +4080,9 @@ fn s23_p2_checkpoint_aggregate() {
     );
     for corpus_program in super::CORPUS {
         let rows = final_records
-            .iter()
+        .iter()
             .filter(|record| record.candidate.program == corpus_program.name)
-            .collect::<Vec<_>>();
+        .collect::<Vec<_>>();
         let count_discovery = |class| {
             rows.iter()
                 .filter(|record| record.candidate.discovery == class)
@@ -3333,6 +4206,526 @@ fn s23_p2_checkpoint_aggregate() {
             .unwrap_or(0),
         own_assume,
         link_own,
+        );
+}
+
+/// Form a new full-population aggregate from the immutable accepted 200-row
+/// aggregate plus the five completed 61-candidate shards. The predecessor is
+/// verified and never rewritten.
+#[test]
+#[ignore = "P2 261-row completion aggregate; run after all five completion shards"]
+fn s23_p2_completion_aggregate() {
+    let contract = checkpoint_contract();
+    let analysis_head = super::orchestrate::git_sha();
+    let candidates = checkpoint_candidates(&contract.base);
+    let selected = selected_checkpoint_candidates(&candidates);
+    let completion_programs = completion_checkpoint_programs(&candidates)
+        .unwrap_or_else(|error| panic!("P2 completion partition: {error}"));
+    let candidate_slots = candidates
+        .iter()
+        .map(|candidate| {
+            (
+                (candidate.program.clone(), candidate.field_key.clone()),
+                candidate.field_slot,
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    let eligible = candidates
+        .iter()
+        .filter(|candidate| candidate.discovery == DiscoveryClass::Eligible)
+        .map(|candidate| (candidate.program.clone(), candidate.field_key.clone()))
+        .collect::<BTreeSet<_>>();
+    assert_eq!(eligible.len(), P2_QUERY_BUDGET + P2_COMPLETION_CANDIDATES);
+
+    let predecessor = contract.batches.join("aggregate");
+    let predecessor_manifest = predecessor.join("artifact-manifest.sha256");
+    verify_sha256_manifest(&predecessor, &predecessor_manifest)
+        .unwrap_or_else(|error| panic!("P2 completion STOP: predecessor manifest: {error}"));
+            assert_eq!(
+        sha256_file(&predecessor_manifest).expect("hash predecessor manifest"),
+        P2_ACCEPTED_AGGREGATE_MANIFEST_SHA256,
+        "P2 completion STOP: immutable accepted-200 aggregate identity mismatch"
+            );
+    let predecessor_provenance = parse_receipt(&predecessor.join("provenance.txt"))
+        .unwrap_or_else(|error| panic!("P2 completion STOP: predecessor provenance: {error}"));
+    for (field, expected) in [
+        ("machine_id", contract.identity.machine_id.as_str()),
+        ("platform", contract.identity.platform.as_str()),
+        ("candidate_universe_sha256", P2_CANDIDATE_UNIVERSE_SHA256),
+        ("query_budget", "200"),
+        ("queried", "200"),
+    ] {
+            assert_eq!(
+            predecessor_provenance.get(field).map(String::as_str),
+            Some(expected),
+            "P2 completion STOP: predecessor {field} identity mismatch"
+            );
+    }
+
+    let aggregate = contract.batches.join("aggregate-261");
+    let aggregate_manifest = aggregate.join("artifact-manifest.sha256");
+    if aggregate_manifest.is_file() {
+        verify_sha256_manifest(&aggregate, &aggregate_manifest)
+            .unwrap_or_else(|error| panic!("completed 261 aggregate manifest: {error}"));
+        let provenance = parse_receipt(&aggregate.join("provenance.txt"))
+            .unwrap_or_else(|error| panic!("completed 261 aggregate provenance: {error}"));
+        for (field, expected) in [
+            ("machine_id", contract.identity.machine_id.as_str()),
+            ("platform", contract.identity.platform.as_str()),
+            ("analysis_head", analysis_head.as_str()),
+            (
+                "accepted_aggregate_manifest_sha256",
+                P2_ACCEPTED_AGGREGATE_MANIFEST_SHA256,
+            ),
+            (
+                "completion_identity_list_sha256",
+                P2_COMPLETION_IDENTITY_SHA256,
+            ),
+            ("queried", "261"),
+            ("solver_unknown", "0"),
+        ] {
+            assert_eq!(
+                provenance.get(field).map(String::as_str),
+                Some(expected),
+                "completed 261 aggregate {field} drifted"
+            );
+        }
+        println!(
+            "S23P2FULLAGG machine_id={} platform={} status=verified-skip queried=261",
+            contract.identity.machine_id, contract.identity.platform
+            );
+        return;
+        }
+    assert!(
+        !aggregate.exists(),
+        "P2 completion STOP: unmanifested partial aggregate exists at {}",
+        aggregate.display()
+        );
+
+    let mut probes = BTreeMap::<(String, String), ProbeRecord>::new();
+    for (program, row) in
+        parse_combined_probe(&predecessor.join("combined-probes.tsv"), &contract.identity)
+            .unwrap_or_else(|error| panic!("P2 completion STOP: predecessor probes: {error}"))
+    {
+        let identity = (program.clone(), row.field_key.clone());
+        assert!(
+            selected.contains(&identity),
+            "P2 completion STOP: predecessor emitted unselected identity {identity:?}"
+        );
+        assert_eq!(
+            candidate_slots.get(&identity).copied(),
+            Some(row.field_slot),
+            "P2 completion STOP: predecessor field-slot identity mismatch at {identity:?}"
+        );
+        assert!(
+            matches!(row.force_result, ForceResult::Sat | ForceResult::Unsat),
+            "P2 completion STOP: predecessor has non-result at {identity:?}"
+        );
+        assert!(
+            probes.insert(identity.clone(), row).is_none(),
+            "P2 completion STOP: predecessor duplicate at {identity:?}"
+        );
+    }
+    assert_eq!(probes.len(), P2_QUERY_BUDGET);
+    assert_eq!(
+        probes.keys().cloned().collect::<BTreeSet<_>>(),
+        selected,
+        "P2 completion STOP: predecessor is not the exact accepted 200"
+        );
+    let predecessor_hard_unsat = probes
+        .values()
+        .filter(|row| row.force_result == ForceResult::Unsat)
+        .collect::<Vec<_>>();
+    assert_eq!(predecessor_hard_unsat.len(), 197);
+        assert_eq!(
+        probes
+            .values()
+            .filter(|row| row.force_result == ForceResult::Sat)
+            .count(),
+        3
+        );
+    for family in ["own-assume", "link-own"] {
+            assert_eq!(
+            predecessor_hard_unsat
+                .iter()
+                .filter(|row| row
+                    .core_families
+                    .iter()
+                    .any(|candidate| candidate == family))
+                .count(),
+            197,
+            "P2 completion STOP: predecessor {family} incidence drifted"
+            );
+        }
+
+    let mut completion_identities = Vec::new();
+    let mut shard_stats = Vec::new();
+    for (program, keys) in &completion_programs {
+        let shard_dir = contract.batches.join("completion-shards").join(program);
+        let manifest = shard_dir.join("artifact-manifest.sha256");
+        verify_sha256_manifest(&shard_dir, &manifest).unwrap_or_else(|error| {
+            panic!(
+                "P2 completion STOP: phase=aggregate-shard-manifest candidate={program}::<shard> detail={error}"
+            )
+        });
+        let receipt = parse_receipt(&shard_dir.join("receipt.txt")).unwrap_or_else(|error| {
+            panic!(
+                "P2 completion STOP: phase=aggregate-shard-receipt candidate={program}::<shard> detail={error}"
+            )
+        });
+        for (field, expected) in [
+            ("analysis_head", analysis_head.as_str()),
+            (
+                "base_manifest_sha256",
+                contract.base_manifest_sha256.as_str(),
+            ),
+            (
+                "accepted_aggregate_manifest_sha256",
+                P2_ACCEPTED_AGGREGATE_MANIFEST_SHA256,
+            ),
+        ] {
+                assert_eq!(
+                receipt.get(field).map(String::as_str),
+                Some(expected),
+                "P2 completion STOP: phase=aggregate-shard-identity candidate={program}::<shard> field={field}"
+                );
+            }
+        let rows = parse_probe_for_program(&shard_dir.join("probes.tsv"), Some(program))
+            .unwrap_or_else(|error| {
+                panic!(
+                    "P2 completion STOP: phase=aggregate-shard-probes candidate={program}::<shard> detail={error}"
+                )
+            });
+        validate_completed_completion_shard(
+            program,
+            keys,
+            &receipt,
+            &rows,
+            &contract.identity,
+            &candidate_slots,
+        )
+        .unwrap_or_else(|error| {
+            panic!(
+                "P2 completion STOP: phase=aggregate-shard-validation candidate={program}::<shard> detail={error}"
+            )
+        });
+        assert_eq!(
+            read_target_keys(&shard_dir.join("targets.txt"))
+                .unwrap_or_else(|error| panic!("completion targets {program}: {error}")),
+            *keys,
+            "P2 completion STOP: phase=aggregate-shard-targets candidate={program}::<shard>"
+        );
+        assert_eq!(
+            parse_probe_for_program(&shard_dir.join("partial-probes.tsv"), Some(program))
+                .unwrap_or_else(|error| panic!("completion checkpoint {program}: {error}")),
+            rows,
+            "P2 completion STOP: phase=aggregate-shard-checkpoint candidate={program}::<shard>"
+        );
+        assert!(
+            !probe_checkpoint_temp_path(&shard_dir.join("partial-probes.tsv")).exists(),
+            "P2 completion STOP: phase=aggregate-shard-checkpoint candidate={program}::<temporary>"
+        );
+        for row in rows {
+            let identity = (program.clone(), row.field_key.clone());
+            completion_identities.push(identity.clone());
+            assert!(
+                probes.insert(identity.clone(), row).is_none(),
+                "P2 completion STOP: phase=aggregate-union candidate={identity:?} overlap"
+            );
+        }
+        shard_stats.push((
+            program.clone(),
+            keys.len(),
+            receipt["hard_unsat"]
+                .parse::<usize>()
+                .expect("completion hard-UNSAT count"),
+            receipt["force_sat"]
+                .parse::<usize>()
+                .expect("completion force-SAT count"),
+            receipt["wall_s"].parse::<f64>().expect("completion wall"),
+            receipt["wall_s_per_candidate"]
+                .parse::<f64>()
+                .expect("completion wall per candidate"),
+            receipt["peak_rss_kb"]
+                .parse::<u64>()
+                .expect("completion peak RSS"),
+            sha256_file(&manifest).expect("hash completion manifest"),
+        ));
+    }
+    validate_exact_candidate_partition(
+        &eligible.iter().cloned().collect::<Vec<_>>(),
+        &selected.iter().cloned().collect::<Vec<_>>(),
+        &completion_identities,
+    )
+    .unwrap_or_else(|error| {
+        panic!("P2 completion STOP: phase=aggregate-union candidate=<partition> detail={error}")
+    });
+    assert_eq!(probes.len(), 261);
+    assert_eq!(probes.keys().cloned().collect::<BTreeSet<_>>(), eligible);
+
+    let mut final_records = Vec::with_capacity(candidates.len());
+    for candidate in candidates {
+        let identity = (candidate.program.clone(), candidate.field_key.clone());
+        let probe = probes.get(&identity);
+        let (force_result, accepted_kind, core_families) = match probe {
+            Some(probe) => (
+                probe.force_result,
+                Some(probe.accepted_kind),
+                probe.core_families.clone(),
+            ),
+            None => (ForceResult::NotQueried, None, Vec::new()),
+        };
+        final_records.push(FinalRecord {
+            bucket: terminal_bucket(candidate.discovery, force_result, accepted_kind),
+            candidate,
+            accepted_kind,
+            force_result,
+            core_families,
+        });
+    }
+    let mut bucket_counts = BTreeMap::new();
+    for record in &final_records {
+        *bucket_counts.entry(record.bucket.label()).or_insert(0usize) += 1;
+    }
+    assert_eq!(bucket_counts.values().sum::<usize>(), final_records.len());
+    assert_eq!(
+        bucket_counts
+            .get(TerminalBucket::BudgetNotQueried.label())
+            .copied()
+            .unwrap_or(0),
+        0
+    );
+    assert_eq!(
+        bucket_counts
+            .get(TerminalBucket::SolverUnknown.label())
+            .copied()
+            .unwrap_or(0),
+        0,
+        "P2 completion STOP: phase=aggregate-classification candidate=<unknown>"
+    );
+    let hard_unsat = final_records
+        .iter()
+        .filter(|record| record.force_result == ForceResult::Unsat)
+        .collect::<Vec<_>>();
+    let force_sat = final_records
+        .iter()
+        .filter(|record| record.force_result == ForceResult::Sat)
+        .count();
+    let own_assume = hard_unsat
+        .iter()
+        .filter(|record| {
+            record
+                .core_families
+                .iter()
+                .any(|family| family == "own-assume")
+        })
+        .count();
+    let link_own = hard_unsat
+        .iter()
+        .filter(|record| {
+            record
+                .core_families
+        .iter()
+                .any(|family| family == "link-own")
+        })
+        .count();
+    let own_assume_missing = hard_unsat.len() - own_assume;
+    let link_own_missing = hard_unsat.len() - link_own;
+    let accepted = |kind| {
+        final_records
+        .iter()
+            .filter(|record| record.accepted_kind == Some(kind))
+            .count()
+    };
+    let completion_hard_unsat = shard_stats
+        .iter()
+        .map(|(_, _, count, _, _, _, _, _)| count)
+        .sum::<usize>();
+    let completion_force_sat = shard_stats
+        .iter()
+        .map(|(_, _, _, count, _, _, _, _)| count)
+        .sum::<usize>();
+    assert_eq!(
+        hard_unsat.len() + force_sat,
+        P2_QUERY_BUDGET + P2_COMPLETION_CANDIDATES
+    );
+    assert_eq!(hard_unsat.len(), 197 + completion_hard_unsat);
+    assert_eq!(force_sat, 3 + completion_force_sat);
+
+    fs::create_dir_all(&aggregate).expect("create 261 aggregate directory");
+    let classification = aggregate.join("classification.tsv");
+    let combined_probes = aggregate.join("combined-probes.tsv");
+    let per_program = aggregate.join("per-program.tsv");
+    let report = aggregate.join("report.md");
+    let provenance = aggregate.join("provenance.txt");
+    fs::write(
+        &classification,
+        render_final_tsv(&final_records, &contract.identity),
+    )
+    .expect("write 261 classification");
+    let mut combined = String::from(
+        "platform\tmachine_id\tprogram\tfield_key\tfield_slot\taccepted_kind\tforce_result\tcore_families\tcore_labels\n",
+    );
+    for ((program, _), probe) in &probes {
+        let force = match probe.force_result {
+            ForceResult::Sat => "sat",
+            ForceResult::Unsat => "unsat",
+            ForceResult::Unknown => "unknown",
+            ForceResult::NotQueried => "not-queried",
+        };
+        combined.push_str(&format!(
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+            contract.identity.platform,
+            contract.identity.machine_id,
+            program,
+            probe.field_key,
+            probe.field_slot,
+            kind_label(probe.accepted_kind),
+            force,
+            probe.core_families.join("|"),
+            probe.core_labels.join("|")
+        ));
+    }
+    fs::write(&combined_probes, combined).expect("write 261 combined probes");
+    let mut per_program_rows = String::from(
+        "platform\tmachine_id\tprogram\tscreened\teligible\tno_owned_capable_store\tstore_blocked\tqueried\thard_unsat\tforce_sat\tsolver_unknown\tbudget_not_queried\taccepted_raw\taccepted_ref\taccepted_owning\n",
+    );
+    for corpus_program in super::CORPUS {
+        let rows = final_records
+            .iter()
+            .filter(|record| record.candidate.program == corpus_program.name)
+            .collect::<Vec<_>>();
+        let count_discovery = |class| {
+            rows.iter()
+                .filter(|record| record.candidate.discovery == class)
+                .count()
+        };
+        let count_bucket = |bucket| rows.iter().filter(|record| record.bucket == bucket).count();
+        let count_kind = |kind| {
+            rows.iter()
+                .filter(|record| record.accepted_kind == Some(kind))
+                .count()
+        };
+        per_program_rows.push_str(&format!(
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+            contract.identity.platform,
+            contract.identity.machine_id,
+            corpus_program.name,
+            rows.len(),
+            count_discovery(DiscoveryClass::Eligible),
+            count_discovery(DiscoveryClass::NoOwnedCapableStore),
+            count_discovery(DiscoveryClass::StoreBlocked),
+            rows.iter()
+                .filter(|record| record.force_result != ForceResult::NotQueried)
+                .count(),
+            count_bucket(TerminalBucket::HardUnsat),
+            rows.iter()
+                .filter(|record| record.force_result == ForceResult::Sat)
+                .count(),
+            count_bucket(TerminalBucket::SolverUnknown),
+            count_bucket(TerminalBucket::BudgetNotQueried),
+            count_kind(SlotKind::Raw),
+            count_kind(SlotKind::Ref),
+            count_kind(SlotKind::Owning),
+        ));
+    }
+    fs::write(&per_program, per_program_rows).expect("write 261 per-program aggregate");
+
+    let completion_table = shard_stats
+        .iter()
+        .map(|(program, candidates, unsat, sat, wall, per_candidate, peak, _)| {
+            format!(
+                "| {} | {} | {program} | {candidates} | {unsat} | {sat} | {wall:.3} | {per_candidate:.6} | {peak} |",
+                contract.identity.platform, contract.identity.machine_id,
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let completion_wall_sum = shard_stats
+        .iter()
+        .map(|(_, _, _, _, wall, _, _, _)| wall)
+        .sum::<f64>();
+    let completion_manifests = shard_stats
+        .iter()
+        .map(|(program, _, _, _, _, _, _, digest)| format!("{program}:{digest}"))
+        .collect::<Vec<_>>()
+        .join(",");
+    fs::write(
+        &report,
+        format!(
+            "# P2 / S2-3 complete 261-candidate diagnosis\n\n- Measurement identity: machine `{}`, platform `{}`. Every count, wall time, and peak RSS below belongs to this machine; timings are not compared across machines.\n- Immutable predecessor: **200 completed** rows, manifest `{}`. Its **61 budget-not-queried** state is superseded by the five completion shards and is retained as predecessor provenance.\n- Full eligible partition: **261 completed = {} hard-UNSAT + {} force-own SAT + 0 Unknown + 0 budget-not-queried**.\n- Completion-only classes: **61 completed = {} hard-UNSAT + {} force-own SAT + 0 Unknown**.\n- Hard-UNSAT core-family incidence: `own-assume` **{}/{}** (missing **{}**), `link-own` **{}/{}** (missing **{}**). SAT rows have no UNSAT core and are excluded from these denominators.\n- Ordinary accepted kinds among 261 queried candidates: Raw **{}**, Ref **{}**, Owning **{}**.\n- Completion-shard Linux-local wall sum: **{:.3}s**. Each shard ran sequentially with uncapped RAM/CPU and an exact 14,400-second wall liveness bound.\n\n## Completion shards\n\n| platform | machine id | program | candidates | hard-UNSAT | force-SAT | wall s | wall s / candidate | peak RSS KiB |\n|---|---|---|---:|---:|---:|---:|---:|---:|\n{}\n\nOnly the verified immutable 200-row aggregate and five completed, SHA-256-manifested `data=true` shards feed this aggregate. Atomic partial checkpoints remain `data=false` provenance and are excluded. Production analysis code remained read-only.\n",
+            contract.identity.machine_id,
+            contract.identity.platform,
+            P2_ACCEPTED_AGGREGATE_MANIFEST_SHA256,
+            hard_unsat.len(),
+            force_sat,
+            completion_hard_unsat,
+            completion_force_sat,
+            own_assume,
+            hard_unsat.len(),
+            own_assume_missing,
+            link_own,
+            hard_unsat.len(),
+            link_own_missing,
+            accepted(SlotKind::Raw),
+            accepted(SlotKind::Ref),
+            accepted(SlotKind::Owning),
+            completion_wall_sum,
+            completion_table,
+        ),
+    )
+    .expect("write 261 report");
+    fs::write(
+        &provenance,
+        format!(
+            "machine_id={}\nplatform={}\nanalysis_head={}\nbase_harness_head={}\nbase_manifest_sha256={}\ncandidate_universe_sha256={}\naccepted_aggregate_manifest_sha256={}\ncompletion_identity_list_sha256={}\nsubstrate=derived\nsnapshot={}\nsnapshot_files=100\ndeps_shape=read-only-symlink\nrepair=mode_a\nl2=0\nsafe_mono=per_site\nfork_engine=fork\nmemory_limit=uncapped\nwall_bound_kind=liveness\nwall_cap_s=14400\npredecessor_queried=200\npredecessor_budget_not_queried=61\npredecessor_state=superseded-not-erased\ncompletion_candidates=61\ncompletion_shards=5\ncompletion_shard_order=quadtree,urlparser,rgba,lil,lodepng\ncompletion_manifest_sha256s={}\ncompletion_wall_sum_s={:.3}\nqueried=261\nhard_unsat={}\nforce_sat={}\nsolver_unknown=0\nbudget_not_queried=0\nown_assume_core_incidence={}\nlink_own_core_incidence={}\nown_assume_core_missing={}\nlink_own_core_missing={}\naccepted_raw={}\naccepted_ref={}\naccepted_owning={}\naggregation_input_policy=manifested-published-completed-data-true-only\ntiming_comparison=forbidden-across-machines\n",
+            contract.identity.machine_id,
+            contract.identity.platform,
+            analysis_head,
+            P2_BASE_HARNESS_HEAD,
+            contract.base_manifest_sha256,
+            P2_CANDIDATE_UNIVERSE_SHA256,
+            P2_ACCEPTED_AGGREGATE_MANIFEST_SHA256,
+            P2_COMPLETION_IDENTITY_SHA256,
+            contract.snapshot.display(),
+            completion_manifests,
+            completion_wall_sum,
+            hard_unsat.len(),
+            force_sat,
+            own_assume,
+            link_own,
+            own_assume_missing,
+            link_own_missing,
+            accepted(SlotKind::Raw),
+            accepted(SlotKind::Ref),
+            accepted(SlotKind::Owning),
+        ),
+    )
+    .expect("write 261 provenance");
+    write_sha256_manifest(
+        &aggregate,
+        &[
+            classification,
+            combined_probes,
+            per_program,
+            report,
+            provenance,
+        ],
+        &aggregate_manifest,
+    )
+    .unwrap_or_else(|error| panic!("write 261 aggregate manifest: {error}"));
+    verify_sha256_manifest(&aggregate, &aggregate_manifest)
+        .unwrap_or_else(|error| panic!("verify 261 aggregate manifest: {error}"));
+    println!(
+        "S23P2FULLAGG machine_id={} platform={} queried=261 hard_unsat={} force_sat={} solver_unknown=0 budget_not_queried=0 own_assume_cores={} link_own_cores={} own_assume_missing={} link_own_missing={}",
+        contract.identity.machine_id,
+        contract.identity.platform,
+        hard_unsat.len(),
+        force_sat,
+        own_assume,
+        link_own,
+        own_assume_missing,
+        link_own_missing,
     );
 }
 
@@ -3701,5 +5094,148 @@ mod tests {
         assert_eq!(classify_field(2, 1, 0), DiscoveryClass::StoreBlocked);
         assert_eq!(classify_field(2, 0, 1), DiscoveryClass::StoreBlocked);
         assert_eq!(classify_field(2, 0, 0), DiscoveryClass::Eligible);
+    }
+
+    #[test]
+    fn p2_completion_partition_identity_gate_is_two_sided() {
+        assert_eq!(
+            P2_COMPLETION_PROGRAMS
+                .iter()
+                .map(|(program, _)| *program)
+                .collect::<Vec<_>>()
+                .join(","),
+            P2_COMPLETION_ORDER
+        );
+        assert_eq!(
+            P2_COMPLETION_PROGRAMS
+                .iter()
+                .map(|(_, count)| count)
+                .sum::<usize>(),
+            P2_COMPLETION_CANDIDATES
+        );
+        let id = |key: &str| ("fixture".to_owned(), key.to_owned());
+        let universe = vec![id("a"), id("b"), id("c")];
+        let completed = vec![id("a"), id("b")];
+        let completion = vec![id("c")];
+
+        assert_eq!(
+            validate_exact_candidate_partition(&universe, &completed, &completion),
+            Ok(())
+        );
+        assert!(
+            validate_exact_candidate_partition(&universe, &completed, &[])
+                .is_err_and(|error| error.contains("missing"))
+        );
+        assert!(
+            validate_exact_candidate_partition(&universe, &completed, &[id("b"), id("c")])
+                .is_err_and(|error| error.contains("overlap"))
+        );
+        assert!(
+            validate_exact_candidate_partition(&universe, &completed, &[id("c"), id("c")])
+                .is_err_and(|error| error.contains("duplicate"))
+        );
+    }
+
+    #[test]
+    fn p2_completion_completed_data_gate_is_two_sided() {
+        let identity = MeasurementIdentity::parse("lambda7", "linux-x86_64")
+            .expect("valid completion identity");
+        let key = "fixture::H0::field0@d0".to_owned();
+        let expected = vec![key.clone()];
+        let rows = vec![ProbeRecord {
+            field_key: key.clone(),
+            field_slot: 0,
+            accepted_kind: SlotKind::Raw,
+            force_result: ForceResult::Sat,
+            core_families: Vec::new(),
+            core_labels: Vec::new(),
+        }];
+        let candidate_slots = BTreeMap::from([(("fixture".to_owned(), key), 0usize)]);
+        let receipt = BTreeMap::from([
+            ("machine_id".to_owned(), "lambda7".to_owned()),
+            ("platform".to_owned(), "linux-x86_64".to_owned()),
+            ("program".to_owned(), "fixture".to_owned()),
+            ("status".to_owned(), "ok".to_owned()),
+            ("worker_status".to_owned(), "ok".to_owned()),
+            ("data".to_owned(), "true".to_owned()),
+            ("checkpoint_data".to_owned(), "false".to_owned()),
+            ("memory_limit".to_owned(), "uncapped".to_owned()),
+            ("wall_bound_kind".to_owned(), "liveness".to_owned()),
+            ("wall_cap_s".to_owned(), "14400".to_owned()),
+            ("planned_targets".to_owned(), "1".to_owned()),
+            ("queried".to_owned(), "1".to_owned()),
+            ("checkpoint_rows".to_owned(), "1".to_owned()),
+            ("last_phase".to_owned(), "complete".to_owned()),
+            ("hard_unsat".to_owned(), "0".to_owned()),
+            ("force_sat".to_owned(), "1".to_owned()),
+            ("solver_unknown".to_owned(), "0".to_owned()),
+            ("validation_error".to_owned(), "none".to_owned()),
+            (
+                "candidate_universe_sha256".to_owned(),
+                P2_CANDIDATE_UNIVERSE_SHA256.to_owned(),
+            ),
+            (
+                "completion_identity_list_sha256".to_owned(),
+                P2_COMPLETION_IDENTITY_SHA256.to_owned(),
+            ),
+            (
+                "accepted_aggregate_manifest_sha256".to_owned(),
+                P2_ACCEPTED_AGGREGATE_MANIFEST_SHA256.to_owned(),
+            ),
+        ]);
+
+        let mut incomplete = receipt.clone();
+        incomplete.insert("status".to_owned(), "timeout".to_owned());
+        incomplete.insert("data".to_owned(), "false".to_owned());
+        incomplete.insert("queried".to_owned(), "0".to_owned());
+        incomplete.insert("checkpoint_rows".to_owned(), "0".to_owned());
+        incomplete.insert("last_phase".to_owned(), "force-own-start".to_owned());
+        assert!(
+            validate_completed_completion_shard(
+                "fixture",
+                &expected,
+                &incomplete,
+                &[],
+                &identity,
+                &candidate_slots,
+            )
+            .is_err(),
+            "incomplete data=false fixture must be rejected"
+        );
+
+        assert_eq!(
+            validate_completed_completion_shard(
+                "fixture",
+                &expected,
+                &receipt,
+                &rows,
+                &identity,
+                &candidate_slots,
+            ),
+            Ok(())
+        );
+
+        let mut unknown_rows = rows;
+        unknown_rows[0].force_result = ForceResult::Unknown;
+        assert_eq!(
+            completion_row_failure_candidate(
+                "fixture",
+                &expected,
+                &unknown_rows,
+                &candidate_slots,
+            ),
+            expected[0]
+        );
+        assert!(
+            validate_completed_completion_shard(
+                "fixture",
+                &expected,
+                &receipt,
+                &unknown_rows,
+                &identity,
+                &candidate_slots,
+            )
+            .is_err_and(|error| error.contains("Unknown"))
+        );
     }
 }
