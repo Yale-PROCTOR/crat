@@ -2596,3 +2596,67 @@ fn a_may_be_negative_offset_refuses_the_fat_optional_form_too() {
     );
 }
 
+
+/// **The g16 capability's witness — at the DECISION level, because it has to be.**
+///
+/// This capability's entire effect is on the ledger: an unannotated local whose
+/// initializer already yields the right type is *counted* as emitted instead of
+/// degraded `no-declared-type`. **It moves no emitted text at all.** g19 was
+/// ratified as a text golden for it and retired without ever being green — its
+/// no-edit expected text was byte-identical to what the pipeline already
+/// emitted, so amending it would have made it pass before the mechanism
+/// existed. A golden that is green before its mechanism is vacuous; the witness
+/// belongs where the change is observable, which is here.
+///
+/// **Two-sided, and the widening side is the load-bearing one.** `call-result`
+/// and `place-read` locals must STAY degraded: their initializer type comes
+/// from a callee's return type or a pointee/struct field, neither of which is
+/// in M1's parameters-and-locals subject universe, so no annotation and no
+/// inference makes them references. Measured, not assumed — an inserted
+/// `: &mut i32` is `E0308` on both, and inference leaves both raw.
+#[test]
+fn an_unannotated_local_decides_ref_when_its_initializer_already_carries_one() {
+    fn reason_for_q(body: &str) -> String {
+        let src = format!(
+            "#![allow(dead_code, unused_unsafe, unused_mut, unused_variables)]\n\
+             pub unsafe fn src_of() -> *mut i32 {{ core::ptr::null_mut() }}\n\
+             pub unsafe fn f(p: *mut i32, pp: *mut *mut i32, n: usize) -> i32 {{\n{body}\n}}\n"
+        );
+        reason_of(&decisions_of(&src), "q", false)
+    }
+
+    // POSITIVE — the two inference-carried classes. `p` is decided `Ref`, so
+    // `q`'s initializer already yields `&mut i32` and the local needs no edit.
+    for (label, body) in [
+        ("copy", "    let q = p;\n    *q = 7;\n    *q"),
+        (
+            "other",
+            "    let q = if n > 0 { p } else { p };\n    *q = 7;\n    *q",
+        ),
+    ] {
+        assert_eq!(
+            reason_for_q(body),
+            "<emitted>",
+            "{label}: the initializer already carries a reference, so the \
+             unannotated local is decidable — leaving it `no-declared-type` \
+             counts a correct emission as a degradation"
+        );
+    }
+
+    // NEGATIVE — the two classes no reading can carry. This half is what a
+    // widening mutation breaks: refining the gate to "any unannotated local"
+    // turns these green and the capability starts claiming subjects whose
+    // emitted type would still be raw.
+    for (label, body) in [
+        ("call-result", "    let q = src_of();\n    *q = 7;\n    *q"),
+        ("place-read", "    let q = *pp;\n    *q = 7;\n    *q"),
+    ] {
+        assert_eq!(
+            reason_for_q(body),
+            "no-declared-type",
+            "{label}: the initializer's type comes from a callee return or a \
+             pointee — neither is in M1's subject universe — so this local must \
+             STAY degraded. An inserted `: &mut i32` is E0308 here, measured."
+        );
+    }
+}
