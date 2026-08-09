@@ -51,13 +51,57 @@ fn every_golden_reconciles_between_the_two_producers() {
             golden.0,
             verdict.violations
         );
+        // **The population-pinned class is ASKED ABOUT, never hand-excluded.**
+        //
+        // `expects_zero` is the ONE definition of "does a nonzero count in this
+        // class mean failure", and `compare.rs` says in as many words that a
+        // consumer testing the class name itself will be forgotten. This gate
+        // was a FOURTH by-hand copy — it demanded `findings.is_empty()` outright
+        // — and no golden exposed it because every golden before g19 is
+        // annotated.
+        //
+        // `span-check-not-evaluable-local` is STRUCTURAL, not a disagreement: an
+        // unannotated `let` has no declared type, so producer A has no span to
+        // point at, and synthesizing one was REJECTED (`compare.rs:79-81`)
+        // because it would put a non-splice-target into the field whose doc says
+        // the audited number IS the edit target. The corpus gate has tolerated
+        // it through the per-program table since ruling F; this gate now agrees
+        // with it instead of contradicting it.
+        //
+        // **The gate is not weakened**: a finding of any other class still fails
+        // here, which is what the mutation witness below pins.
+        let unexpected: Vec<_> = verdict
+            .findings
+            .iter()
+            .filter(|f| crate::coverage_recon::compare::expects_zero(&f.class))
+            .collect();
         assert!(
-            verdict.findings.is_empty(),
+            unexpected.is_empty(),
             "{}: producers disagree — FINDINGS: {:#?}",
             golden.0,
-            verdict.findings
+            unexpected
         );
     }
+}
+
+/// The fixture gate still fails on a NON-pinned finding.
+///
+/// Without this, relaxing the assertion above to `expects_zero` could not be
+/// told apart from deleting it. Synthesizes a finding of an ordinary class and
+/// checks the same predicate the gate uses.
+#[test]
+fn the_fixture_gate_still_rejects_an_ordinary_finding() {
+    use crate::coverage_recon::compare::expects_zero;
+    assert!(
+        expects_zero("ptr-depth-mismatch"),
+        "an ordinary class must still be expected-zero, or the gate above \
+         tolerates real disagreements"
+    );
+    assert!(
+        !expects_zero("span-check-not-evaluable-local"),
+        "the population-pinned class must be the ONLY tolerated one; if this \
+         flips, the gate above silently starts failing every unannotated local"
+    );
 }
 
 /// Non-vacuity: the reconciliation is comparing a non-empty population.
