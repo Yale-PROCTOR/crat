@@ -2659,3 +2659,77 @@ fn every_unannotated_local_class_still_degrades_no_declared_type() {
         );
     }
 }
+
+/// **S3.6-0 — the reference KIND is recorded, one positive fixture per kind.**
+///
+/// The split this enables was unmeasurable before: `referenced` was one map
+/// fired by any `Path` resolution to a local `fn`, keeping spans and not kinds,
+/// so direct calls, address-taking and fn-pointer casts — three populations with
+/// three different adaptation stories — were indistinguishable.
+///
+/// **Each kind gets its own positive fixture**, because a classifier witnessed
+/// on one kind is a classifier witnessed on nothing: the `_ => AddrTaken`
+/// fallback would swallow both others and still pass a call-only test.
+///
+/// `is_adaptable` is asserted alongside, since it is what the census reports and
+/// what any future slicing would be scoped against.
+#[test]
+fn a_local_fn_reference_records_which_kind_it_is() {
+    use crate::bo_rewriter::decision::emitability::RefKind;
+
+    fn kinds_of(src: &str) -> Vec<&'static str> {
+        ::utils::compilation::run_compiler_on_str(src, |tcx| {
+            let program = crate::bo_rewriter::collect_program(tcx);
+            let facts = crate::bo_rewriter::decision::emitability::collect(tcx, &program.functions);
+            let mut out: Vec<_> = facts
+                .referenced
+                .iter()
+                .filter(|(did, _)| tcx.def_path_str(did.to_def_id()).contains("target"))
+                .flat_map(|(_, refs)| refs.iter().map(|(k, _)| k.key()))
+                .collect();
+            out.sort_unstable();
+            out.dedup();
+            out
+        })
+        .expect("fixture compiles")
+    }
+    const PRE: &str = "#![allow(dead_code, unused_unsafe, unused_mut, unused_variables)]\n\
+                       pub unsafe fn target(p: *mut i32) -> i32 { *p }\n";
+
+    assert_eq!(
+        kinds_of(&format!("{PRE}pub unsafe fn c(p: *mut i32) -> i32 {{ target(p) }}\n")),
+        vec!["call"],
+        "a direct call must record `call` — this is the ADAPTABLE population, \
+         and mislabelling it pinned would understate every future market"
+    );
+    assert_eq!(
+        kinds_of(&format!(
+            "{PRE}pub unsafe fn c() -> unsafe fn(*mut i32) -> i32 {{ target }}\n"
+        )),
+        vec!["addr-taken"],
+        "a bare path reference must record `addr-taken` — the signature is \
+         pinned by whatever consumes the value"
+    );
+    assert_eq!(
+        kinds_of(&format!(
+            "{PRE}pub unsafe fn c() -> usize {{ target as unsafe fn(*mut i32) -> i32 as usize }}\n"
+        )),
+        vec!["fnptr-cast"],
+        "a cast operand must record `fnptr-cast` — the callback-table shape F1 \
+         widened this arm for, and the one it must not be conflated with"
+    );
+
+    // `is_adaptable` is ALL-or-nothing: one pinning reference is enough.
+    let span = rustc_span::DUMMY_SP;
+    assert!(RefKind::is_adaptable(&[(RefKind::Call, span)]));
+    assert!(!RefKind::is_adaptable(&[
+        (RefKind::Call, span),
+        (RefKind::AddrTaken, span)
+    ]));
+    assert!(
+        !RefKind::is_adaptable(&[]),
+        "an empty reference set is not adaptable — it is NOT REFERENCED, a \
+         different population, and conflating them would count the 385 \
+         already-emitting functions as an S3.6 market"
+    );
+}

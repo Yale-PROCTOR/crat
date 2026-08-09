@@ -58,6 +58,46 @@ const RAW_ONLY_METHODS: &[&str] = &[
     "as_ref",
     "as_mut",
 ];
+/// **How a local `fn` is referred to — S3.6-0.**
+///
+/// The single `referenced` boolean this replaces was widened deliberately (F1:
+/// matching only `Call` missed the callback-table shape), and that widening is
+/// exactly what made the adaptable/pinned split unmeasurable: the map kept
+/// spans, not kinds, so three populations with three different adaptation
+/// stories were indistinguishable.
+///
+/// **The decision layer still treats all three identically** — any reference
+/// degrades `call-site-not-adapted`, unchanged. This records *which*, so the
+/// split can be measured before any capability is scoped against it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum RefKind {
+    /// The path is the callee of a direct call — **adaptable**: every site is
+    /// visible and rewritable.
+    Call,
+    /// The operand of a cast to a fn pointer — **pins** the signature to the
+    /// cast's target type.
+    FnPtrCast,
+    /// Any other path reference: stored in a table, passed as an argument,
+    /// returned. **Pins** the signature to whatever consumes it.
+    AddrTaken,
+}
+
+impl RefKind {
+    pub(crate) fn key(self) -> &'static str {
+        match self {
+            RefKind::Call => "call",
+            RefKind::FnPtrCast => "fnptr-cast",
+            RefKind::AddrTaken => "addr-taken",
+        }
+    }
+
+    /// A function is adaptable only if EVERY reference to it is a direct call.
+    /// One pinning reference is enough to fix the signature.
+    pub(crate) fn is_adaptable(refs: &[(RefKind, Span)]) -> bool {
+        !refs.is_empty() && refs.iter().all(|(k, _)| *k == RefKind::Call)
+    }
+}
+
 
 #[derive(Debug, Default)]
 pub(crate) struct EmitabilityFacts {
@@ -71,7 +111,7 @@ pub(crate) struct EmitabilityFacts {
     /// at the anonymous whole-crate gate — the exact class A1 exists to retire.
     /// Any path reference to a local fn now counts, which subsumes direct
     /// calls, address-taking, and fn-pointer casts uniformly.
-    pub referenced: FxHashMap<LocalDefId, Vec<Span>>,
+    pub referenced: FxHashMap<LocalDefId, Vec<(RefKind, Span)>>,
     /// `(fn, param HirId) -> every raw-only use, in HIR walk order`.
     ///
     /// **A `Vec`, not a first-wins entry, since S3.2′-2.** Attribution still
@@ -106,6 +146,7 @@ pub(crate) fn collect(tcx: TyCtxt<'_>, functions: &[LocalDefId]) -> EmitabilityF
     for owner in tcx.hir_body_owners() {
         let body = tcx.hir_body_owned_by(owner);
         let mut visitor = BodyFacts {
+            tcx,
             fn_did: owner,
             locals: &local,
             facts: &mut facts,
@@ -119,13 +160,17 @@ pub(crate) fn collect(tcx: TyCtxt<'_>, functions: &[LocalDefId]) -> EmitabilityF
 /// resolutions. It *did* carry a `TyCtxt` that nothing ever read — dead weight
 /// that the module-wide `allow(dead_code)` hid, and that the lint reported the
 /// moment the blanket came off.
-struct BodyFacts<'a> {
+struct BodyFacts<'a, 'tcx> {
+    /// **S3.6-0** — carried solely to read a path expression's PARENT node, so
+    /// a reference to a local `fn` can be classified `Call` / `FnPtrCast` /
+    /// `AddrTaken`. Nothing else in this visitor consults it.
+    tcx: TyCtxt<'tcx>,
     fn_did: LocalDefId,
     locals: &'a [LocalDefId],
     facts: &'a mut EmitabilityFacts,
 }
 
-impl BodyFacts<'_> {
+impl BodyFacts<'_, '_> {
     /// The `HirId` of the binding a path expression resolves to, if it is a
     /// local. That is how a use is attributed to a specific parameter rather
     /// than to a name that might be shadowed.
@@ -140,7 +185,7 @@ impl BodyFacts<'_> {
     }
 }
 
-impl<'tcx> Visitor<'tcx> for BodyFacts<'_> {
+impl<'tcx> Visitor<'tcx> for BodyFacts<'_, 'tcx> {
     fn visit_expr(&mut self, expr: &'tcx Expr<'tcx>) {
         match &expr.kind {
             // (1) raw-pointer-only method on a local
@@ -164,11 +209,25 @@ impl<'tcx> Visitor<'tcx> for BodyFacts<'_> {
                     && let Some(local_did) = def_id.as_local()
                     && self.locals.contains(&local_did)
                 {
+                    // **S3.6-0** — the KIND, read from the parent node. The
+                    // decision layer ignores it (any reference still
+                    // degrades); it exists so the adaptable/pinned split is
+                    // measurable at all.
+                    let kind = match self.tcx.parent_hir_node(expr.hir_id) {
+                        rustc_hir::Node::Expr(parent) => match parent.kind {
+                            ExprKind::Call(callee, _) if callee.hir_id == expr.hir_id => {
+                                RefKind::Call
+                            }
+                            ExprKind::Cast(..) => RefKind::FnPtrCast,
+                            _ => RefKind::AddrTaken,
+                        },
+                        _ => RefKind::AddrTaken,
+                    };
                     self.facts
                         .referenced
                         .entry(local_did)
                         .or_default()
-                        .push(expr.span);
+                        .push((kind, expr.span));
                 }
             }
             // (4) pointer comparison — F5.

@@ -1951,7 +1951,7 @@ pub(crate) fn facts_join_tsv(tcx: TyCtxt<'_>) -> Result<String, String> {
     let ctors = decision::construction::collect(tcx, &collect_program(tcx).functions);
 
     let mut out = String::from(
-        "fn_path\tmir_local\tis_param\tannotated\tslot\tkind\traw_op\tptr_cmp\treferenced\tctor\tlen_class\tsize_expr\n",
+        "fn_path\tmir_local\tis_param\tannotated\tslot\tkind\traw_op\tptr_cmp\treferenced\tref_kinds\tref_class\tctor\tlen_class\tsize_expr\n",
     );
     for (s, _decision) in &table.entries {
         let slot = ctx
@@ -1993,7 +1993,7 @@ pub(crate) fn facts_join_tsv(tcx: TyCtxt<'_>) -> Result<String, String> {
             (false, None) => ("-", "no-init", String::new()),
         };
         out.push_str(&format!(
-            "{}\t{}\t{}\t{}\t{}\t{kind}\t{raw_op}\t{}\t{}\t{ctor_key}\t{len_class}\t{size_expr}\n",
+            "{}\t{}\t{}\t{}\t{}\t{kind}\t{raw_op}\t{}\t{}\t{}\t{}\t{ctor_key}\t{len_class}\t{size_expr}\n",
             tcx.def_path_str(s.fn_did.to_def_id()),
             s.local.as_u32(),
             u8::from(is_param),
@@ -2013,6 +2013,27 @@ pub(crate) fn facts_join_tsv(tcx: TyCtxt<'_>) -> Result<String, String> {
             // subject of a referenced function, so a subject-level column is the
             // form the market join needs.
             u8::from(ctx.facts.referenced.contains_key(&s.fn_did)),
+            // **S3.6-0** — the split, exported beside the boolean rather than
+            // replacing it: every pinned number and every prior analysis of
+            // `referenced` keeps meaning what it meant.
+            match ctx.facts.referenced.get(&s.fn_did) {
+                None => "-".to_owned(),
+                Some(refs) => {
+                    let mut kinds: Vec<_> = refs
+                        .iter()
+                        .map(|(k, _)| k.key())
+                        .collect::<std::collections::BTreeSet<_>>()
+                        .into_iter()
+                        .collect();
+                    kinds.sort_unstable();
+                    kinds.join(",")
+                }
+            },
+            match ctx.facts.referenced.get(&s.fn_did) {
+                None => "-",
+                Some(refs) if decision::emitability::RefKind::is_adaptable(refs) => "adaptable",
+                Some(_) => "pinned",
+            },
         ));
     }
     Ok(out)

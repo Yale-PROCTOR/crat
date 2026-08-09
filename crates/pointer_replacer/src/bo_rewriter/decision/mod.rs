@@ -782,8 +782,11 @@ fn decide_one(ctx: &Ctx<'_, '_>, subject: &Subject) -> Decision {
             DegradeReason::PtrComparison,
         );
     }
-    if let Some(spans) = facts.referenced.get(&subject.fn_did)
-        && let Some(span) = spans.first()
+    // **S3.6-0 records the reference KIND; this arm deliberately ignores it.**
+    // Any reference still degrades, adaptable or pinned alike, so the split is
+    // measurable without moving a single decision.
+    if let Some(refs) = facts.referenced.get(&subject.fn_did)
+        && let Some((_kind, span)) = refs.first()
     {
         return degrade(
             subject,
