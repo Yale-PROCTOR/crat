@@ -2597,25 +2597,40 @@ fn a_may_be_negative_offset_refuses_the_fat_optional_form_too() {
 }
 
 
-/// **The g16 capability's witness — at the DECISION level, because it has to be.**
+/// **STATUS-QUO PIN — the g16 work-unit RETIRED (user ruling C, 2026-08-09).**
 ///
-/// This capability's entire effect is on the ledger: an unannotated local whose
-/// initializer already yields the right type is *counted* as emitted instead of
-/// degraded `no-declared-type`. **It moves no emitted text at all.** g19 was
-/// ratified as a text golden for it and retired without ever being green — its
-/// no-edit expected text was byte-identical to what the pipeline already
-/// emitted, so amending it would have made it pass before the mechanism
-/// existed. A golden that is green before its mechanism is vacuous; the witness
-/// belongs where the change is observable, which is here.
+/// This began as the g16 capability's decision-level witness, RED, after g19
+/// was retired for being invisible to a text golden. The work-unit then retired
+/// too, on **F1**: the capability emits nothing, so no gate could validate the
+/// counter it moved — byte identity would have been satisfied by a broken
+/// implementation exactly as well as by a correct one.
 ///
-/// **Two-sided, and the widening side is the load-bearing one.** `call-result`
-/// and `place-read` locals must STAY degraded: their initializer type comes
-/// from a callee's return type or a pointee/struct field, neither of which is
-/// in M1's parameters-and-locals subject universe, so no annotation and no
-/// inference makes them references. Measured, not assumed — an inserted
-/// `: &mut i32` is `E0308` on both, and inference leaves both raw.
+/// **It is inverted rather than deleted, and it is a PIN, not a witness.** It
+/// asserts today's behaviour: all four classes of unannotated local degrade
+/// `no-declared-type`. That is precisely the independent check F1's banked rule
+/// asks for — *no counter moves on trust* — because it fails the moment
+/// anything starts claiming this population without a ruling. It witnesses no
+/// capability, and is labelled so it can never be mistaken for one.
+///
+/// The per-class measurement it was built on is preserved because it is what
+/// retired the step, and it is what S3.6/M3 inherit:
+///
+/// | class | n | inference gives a reference? | insertion `: &T` compiles? |
+/// |---|---:|---|---|
+/// | `copy` | 3 | yes | compiles |
+/// | `other` | 2 | yes | compiles |
+/// | `call-result` | 17 | no | `E0308` |
+/// | `place-read` | 1 | no | `E0308` |
+///
+/// `call-result` and `place-read` fail structurally: their initializer type
+/// comes from a callee **return type** or a **pointee/struct field**, and
+/// neither is in M1's parameters-and-locals subject universe. They are S3.6/M3
+/// work. `copy` and `other` are inference-carried, and whether an unannotated
+/// local realized as a reference by inference counts toward a *declaration*
+/// metric is registered for evaluation — **neither layer moves until that is
+/// ruled**.
 #[test]
-fn an_unannotated_local_decides_ref_when_its_initializer_already_carries_one() {
+fn every_unannotated_local_class_still_degrades_no_declared_type() {
     fn reason_for_q(body: &str) -> String {
         let src = format!(
             "#![allow(dead_code, unused_unsafe, unused_mut, unused_variables)]\n\
@@ -2625,38 +2640,22 @@ fn an_unannotated_local_decides_ref_when_its_initializer_already_carries_one() {
         reason_of(&decisions_of(&src), "q", false)
     }
 
-    // POSITIVE — the two inference-carried classes. `p` is decided `Ref`, so
-    // `q`'s initializer already yields `&mut i32` and the local needs no edit.
     for (label, body) in [
         ("copy", "    let q = p;\n    *q = 7;\n    *q"),
         (
             "other",
             "    let q = if n > 0 { p } else { p };\n    *q = 7;\n    *q",
         ),
-    ] {
-        assert_eq!(
-            reason_for_q(body),
-            "<emitted>",
-            "{label}: the initializer already carries a reference, so the \
-             unannotated local is decidable — leaving it `no-declared-type` \
-             counts a correct emission as a degradation"
-        );
-    }
-
-    // NEGATIVE — the two classes no reading can carry. This half is what a
-    // widening mutation breaks: refining the gate to "any unannotated local"
-    // turns these green and the capability starts claiming subjects whose
-    // emitted type would still be raw.
-    for (label, body) in [
         ("call-result", "    let q = src_of();\n    *q = 7;\n    *q"),
         ("place-read", "    let q = *pp;\n    *q = 7;\n    *q"),
     ] {
         assert_eq!(
             reason_for_q(body),
             "no-declared-type",
-            "{label}: the initializer's type comes from a callee return or a \
-             pointee — neither is in M1's subject universe — so this local must \
-             STAY degraded. An inserted `: &mut i32` is E0308 here, measured."
+            "{label}: the g16 work-unit is RETIRED, so every class of \
+             unannotated local must still degrade. If this moved, something is \
+             claiming this population without a ruling — which is exactly the \
+             unwitnessable ledger movement F1 refused."
         );
     }
 }
