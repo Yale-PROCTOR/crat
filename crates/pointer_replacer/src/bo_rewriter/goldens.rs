@@ -111,21 +111,28 @@ pub(super) const GOLDENS: &[Golden] = goldens![
     // goldens are spec, not census.
     "g17_reslice_advance",
     "g18_reslice_rebind",
-    // **g16 slice, ratified 2026-08-09.** A NEW allocation, not a
-    // transcription: U-1 ratified **g16** as an unannotated-`let` **Box**
-    // conversion, and under the amended ladder (D+C) the Box form is not built
-    // at this position — S3.2 now sits behind S3.6. So g16 stays RED as S3.2's
-    // ratified spec, g18's exact standing, and this slice ships the
-    // type-insertion CAPABILITY whose realizable market is REFERENCES. g19 is
-    // that capability's witness: the g16 shape with the form swapped, which is
-    // the only change.
+    // **g19 `unannotated_let_ref` — RATIFIED 2026-08-09, RETIRED 2026-08-09.
+    // The NUMBER STAYS CONSUMED: it must never be reallocated.**
     //
-    // Ratified on compile-verified text, both halves, **accepting one recorded
-    // contingency**: if task 1 shows inference alone carries every surviving
-    // class — no declaration edit needed — g19 returns for a one-round
-    // amendment to the no-edit text, on the g02 precedent. The user chose to
-    // ratify now with that contingency on the record.
-    "g19_unannotated_let_ref",
+    // It was ratified as this slice's witness, landed RED, and retires **without
+    // ever having been green** — superseded by measurement, not erased. What it
+    // did before retiring is why it existed:
+    //
+    // 1. Its RED was a ONE-TOKEN diff — emitted `let q = p;` against expected
+    //    `let q: &mut i32 = p;` — and the emitted crate ALREADY COMPILED,
+    //    because `p` was rewritten and inference typed `q`. That is the proof
+    //    that answered §3: no surviving class needs the insertion.
+    // 2. It was the first golden with an UNANNOTATED local, and it exposed the
+    //    reconciliation fixture gate hand-copying `findings.is_empty()` instead
+    //    of asking `expects_zero` — a fourth by-hand copy no annotated golden
+    //    could reach. Repaired in `recon_fixtures.rs`.
+    //
+    // **Why it cannot be amended into a green golden** (user ruling B): its
+    // no-edit expected text IS what the pipeline already emits, so amending it
+    // would make it pass before the mechanism existed. A capability whose entire
+    // effect is on the LEDGER — `+N decided_ref` / `−N no-declared-type`, zero
+    // text delta — is invisible to a text-comparing golden by construction. The
+    // witness moved to the decision level, in `emit_tests`, where it can fail.
 ];
 
 /// Run `rustfmt` over a source string with pinned settings.
@@ -207,7 +214,6 @@ golden_test!(g12_slice_mut, "g12_slice_mut");
 golden_test!(g13_opt_slice, "g13_opt_slice");
 golden_test!(g17_reslice_advance, "g17_reslice_advance");
 golden_test!(g18_reslice_rebind, "g18_reslice_rebind");
-golden_test!(g19_unannotated_let_ref, "g19_unannotated_let_ref");
 
 /// The canonicalizer must be a real normalizer, not a pass-through.
 ///
@@ -235,11 +241,11 @@ fn canonicalization_normalizes_whitespace() {
 fn every_golden_pair_is_present() {
     assert_eq!(
         GOLDENS.len(),
-        16,
+        15,
         "the M0.5 package specifies ten pairs; U-5 slice 1 transcribes g11/g12 \
-         from the ratified §8 table, slice 3 transcribes g13, 2b adds g17/g18, \
-         and the g16 slice adds g19 as a NEW allocation — g16 itself stays RED \
-         as S3.2's, since the Box form moved behind S3.6"
+         from the ratified §8 table, slice 3 transcribes g13, and 2b adds \
+         g17/g18. g19 was added and RETIRED in the g16 slice — back to 15, with \
+         the number consumed"
     );
     for g in GOLDENS {
         assert!(!g.input.trim().is_empty(), "{}: empty .input.rs", g.name);
