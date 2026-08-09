@@ -1846,7 +1846,17 @@ fn finish_decide<'tcx>(
     let opt_uses =
         decision::emitability::collect_opt_uses(tcx, &program.functions, &names, &opt_accessors, &opt_fat);
     let table = decision::decide(
-        tcx, &subjects, &model, &slots, &facts, &fat, &sign, &slice_uses, &opt_uses,
+        &decision::Ctx {
+            tcx,
+            model: &model,
+            slots: &slots,
+            facts: &facts,
+            fat: &fat,
+            sign: &sign,
+            slice_uses: &slice_uses,
+            opt_uses: &opt_uses,
+        },
+        &subjects,
     );
 
     // Structural self-check: the table matches the subjects it was handed. NOT

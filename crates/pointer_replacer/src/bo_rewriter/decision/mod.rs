@@ -611,25 +611,33 @@ impl DecisionTable {
 /// reference arm needs no move point, no loan identity and no certificate, and
 /// consuming facts the arm does not use would make this phase's dependencies a
 /// lie.
-pub(crate) fn decide(
-    tcx: TyCtxt<'_>,
-    subjects: &[Subject],
-    model: &FxHashMap<SlotRef, SlotKind>,
-    slots: &CrateSlots,
-    facts: &EmitabilityFacts,
-    fat: &super::fat_facts::FatFacts,
-    sign: &super::sign_facts::SignFacts,
-    slice_uses: &FxHashMap<(LocalDefId, rustc_hir::HirId), emitability::SliceUses>,
-    opt_uses: &FxHashMap<(LocalDefId, rustc_hir::HirId), emitability::OptUses>,
-) -> DecisionTable {
+/// Everything `decide_one` reads, gathered once.
+///
+/// **Carried from S3.2′-3 and 2b, landed at the touch they named.** Both slices
+/// recorded this as owed "at the next natural touch of those signatures";
+/// S3.2′-5 was that touch and deliberately declined it, because a signature
+/// refactor inside a gate-only slice adds churn its must-not-move discipline
+/// could not cheaply verify. It lands here instead, alone, before any mechanism.
+///
+/// **Every field is a read-only borrow**, which is the phase-separation rule
+/// (E1) expressed in a type: the decision phase reads analyses and hands the
+/// next phase a finished value, so a context that could not be mutated is the
+/// honest shape for it.
+pub(crate) struct Ctx<'a, 'tcx> {
+    pub(crate) tcx: TyCtxt<'tcx>,
+    pub(crate) model: &'a FxHashMap<SlotRef, SlotKind>,
+    pub(crate) slots: &'a CrateSlots,
+    pub(crate) facts: &'a EmitabilityFacts,
+    pub(crate) fat: &'a super::fat_facts::FatFacts,
+    pub(crate) sign: &'a super::sign_facts::SignFacts,
+    pub(crate) slice_uses: &'a FxHashMap<(LocalDefId, rustc_hir::HirId), emitability::SliceUses>,
+    pub(crate) opt_uses: &'a FxHashMap<(LocalDefId, rustc_hir::HirId), emitability::OptUses>,
+}
+
+pub(crate) fn decide(ctx: &Ctx<'_, '_>, subjects: &[Subject]) -> DecisionTable {
     let entries = subjects
         .iter()
-        .map(|subject| {
-            let decision = decide_one(
-                tcx, subject, model, slots, facts, fat, sign, slice_uses, opt_uses,
-            );
-            (subject.clone(), decision)
-        })
+        .map(|subject| (subject.clone(), decide_one(ctx, subject)))
         .collect();
     DecisionTable { entries }
 }
@@ -642,17 +650,17 @@ fn degrade(subject: &Subject, site: String, reason: DegradeReason) -> Decision {
     })
 }
 
-fn decide_one(
-    tcx: TyCtxt<'_>,
-    subject: &Subject,
-    model: &FxHashMap<SlotRef, SlotKind>,
-    slots: &CrateSlots,
-    facts: &EmitabilityFacts,
-    fat: &super::fat_facts::FatFacts,
-    sign: &super::sign_facts::SignFacts,
-    slice_uses: &FxHashMap<(LocalDefId, rustc_hir::HirId), emitability::SliceUses>,
-    opt_uses: &FxHashMap<(LocalDefId, rustc_hir::HirId), emitability::OptUses>,
-) -> Decision {
+fn decide_one(ctx: &Ctx<'_, '_>, subject: &Subject) -> Decision {
+    let &Ctx {
+        tcx,
+        model,
+        slots,
+        facts,
+        fat,
+        sign,
+        slice_uses,
+        opt_uses,
+    } = ctx;
     let decl_site = EmitabilityFacts::site(tcx, subject.attribution_span());
 
     // The declaration's SHAPE comes FIRST, before any analysis is consulted.
