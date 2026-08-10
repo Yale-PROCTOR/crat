@@ -41,6 +41,1057 @@ fn rewrite_struct_arrays_then_array_local_then_pointer(
     rewrite_with_config(input, config)
 }
 
+fn rewrite_struct_param_fields_with_config(code: &str, config: &Config) -> (String, bool) {
+    let (s, changed, _) = rewrite_struct_param_fields_full(code, config);
+    (s, changed)
+}
+
+fn rewrite_struct_param_fields_full(
+    code: &str,
+    config: &Config,
+) -> (String, bool, ::utils::field_spec::FieldSpecMap) {
+    ::utils::compilation::run_compiler_on_str(code, |tcx| rewrite_struct_param_fields(config, tcx))
+        .unwrap()
+}
+
+fn rewrite_struct_param_fields_then_pointer(
+    code: &str,
+    config: &Config,
+) -> (String, BytemuckDependency) {
+    let (pre, changed) = rewrite_struct_param_fields_with_config(code, config);
+    let input = if changed { pre.as_str() } else { code };
+    rewrite_with_config(input, config)
+}
+
+fn run_param_field_test(code: &str, includes: &[&str], excludes: &[&str]) {
+    let config = Config::default();
+    let (s, _) = rewrite_struct_param_fields_with_config(code, &config);
+    ::utils::compilation::run_compiler_on_str(&s, ::utils::type_check).expect(&s);
+    for include in includes {
+        assert!(s.contains(include), "Expected to find `{include}` in:\n{s}");
+    }
+    for exclude in excludes {
+        assert!(
+            !s.contains(exclude),
+            "Expected not to find `{exclude}` in:\n{s}",
+        );
+    }
+}
+
+fn run_param_field_test_with_config(
+    code: &str,
+    config: &Config,
+    includes: &[&str],
+    excludes: &[&str],
+) {
+    let (s, _) = rewrite_struct_param_fields_with_config(code, config);
+    ::utils::compilation::run_compiler_on_str(&s, ::utils::type_check).expect(&s);
+    for include in includes {
+        assert!(s.contains(include), "Expected to find `{include}` in:\n{s}");
+    }
+    for exclude in excludes {
+        assert!(
+            !s.contains(exclude),
+            "Expected not to find `{exclude}` in:\n{s}",
+        );
+    }
+}
+
+#[test]
+fn test_struct_param_field_basic_specialization() {
+    run_param_field_test(
+        r#"
+use ::libc;
+#[repr(C)]
+pub struct st {
+    pub lookup: [u16; 4],
+    pub lit: [u32; 4],
+}
+pub unsafe extern "C" fn build(mut s: *mut st, mut tree: *mut u32) -> libc::c_int {
+    if !s.is_null() {
+        (*s).lookup[0] = 1 as u16;
+    }
+    *tree.offset(0) = 0 as u32;
+    return 0 as libc::c_int;
+}
+pub unsafe extern "C" fn fixed(mut s: *mut st) -> libc::c_int {
+    return build(s, ((*s).lit).as_mut_ptr());
+}
+pub unsafe extern "C" fn dynamic(mut s: *mut st) -> libc::c_int {
+    return build(0 as *mut st, ((*s).lit).as_mut_ptr());
+}
+"#,
+        &[
+            "fn build(mut s: *mut [u16; 4]",
+            "(*s)[0] = 1 as u16",
+            "&mut (*s).lookup as *mut [u16; 4]",
+            "0 as *mut [u16; 4]",
+        ],
+        &["build(s,", "build(0 as *mut st"],
+    );
+}
+
+#[test]
+fn test_struct_param_field_no_trigger_no_rewrite() {
+    // no call site aliases the struct-pointer arg with a sibling field
+    // pointer, so build never becomes a trigger and the 2-field struct stays
+    // unspecialized; excludes prove no narrowing happened anywhere
+    run_param_field_test(
+        r#"
+use ::libc;
+#[repr(C)]
+pub struct st {
+    pub lookup: [u16; 4],
+    pub lit: [u32; 4],
+}
+pub unsafe extern "C" fn build(mut s: *mut st, mut tree: *mut u32) -> libc::c_int {
+    (*s).lookup[0] = 1 as u16;
+    *tree.offset(0) = 0 as u32;
+    return 0 as libc::c_int;
+}
+pub unsafe extern "C" fn fixed(mut s: *mut st, mut tree: *mut u32) -> libc::c_int {
+    return build(s, tree);
+}
+"#,
+        &["fn build(mut s: *mut st"],
+        &["as *mut [u16; 4]", "*mut [u16; 4]"],
+    );
+}
+
+#[test]
+fn test_struct_param_field_forwarding_chain() {
+    run_param_field_test(
+        r#"
+use ::libc;
+#[repr(C)]
+pub struct st {
+    pub lookup: [u16; 4],
+    pub lit: [u32; 4],
+}
+pub unsafe extern "C" fn inner(mut s: *mut st) -> libc::c_int {
+    (*s).lookup[1] = 2 as u16;
+    return 0 as libc::c_int;
+}
+pub unsafe extern "C" fn outer(mut s: *mut st, mut tree: *mut u32) -> libc::c_int {
+    (*s).lookup[0] = 1 as u16;
+    *tree.offset(0) = 0 as u32;
+    return inner(s);
+}
+pub unsafe extern "C" fn top(mut s: *mut st) -> libc::c_int {
+    return outer(s, ((*s).lit).as_mut_ptr());
+}
+"#,
+        &[
+            "fn inner(mut s: *mut [u16; 4]",
+            "fn outer(mut s: *mut [u16; 4]",
+            "inner(s)",
+            "&mut (*s).lookup as *mut [u16; 4]",
+        ],
+        &["fn inner(mut s: *mut st", "fn outer(mut s: *mut st"],
+    );
+}
+
+#[test]
+fn test_struct_param_field_source_alias_blocks_rewrite() {
+    // `let t = s;` passes the MIR gate but fails AST edit resolution:
+    // the group must be dropped whole
+    run_param_field_test(
+        r#"
+use ::libc;
+#[repr(C)]
+pub struct st {
+    pub lookup: [u16; 4],
+    pub lit: [u32; 4],
+}
+pub unsafe extern "C" fn build(mut s: *mut st, mut tree: *mut u32) -> libc::c_int {
+    let mut t: *mut st = s;
+    (*t).lookup[0] = 1 as u16;
+    *tree.offset(0) = 0 as u32;
+    return 0 as libc::c_int;
+}
+pub unsafe extern "C" fn fixed(mut s: *mut st) -> libc::c_int {
+    return build(s, ((*s).lit).as_mut_ptr());
+}
+"#,
+        &["fn build(mut s: *mut st"],
+        &["as *mut [u16; 4]", "*mut [u16; 4]"],
+    );
+}
+
+#[test]
+fn test_maybe_null_caller_gets_guarded_site() {
+    // stray's `p = s;` assigns the bare param outside any rewritable AST
+    // shape, but under guarded emission this no longer drops inner/outer:
+    // stray is never selected (trigger-based selection), so no AST drop and
+    // no cascade fire for it. instead, once inner/outer specialize via
+    // top's trigger, stray's call site into inner receives a hoisted guard.
+    // stray's own signature is unchanged (it is not itself selected); the
+    // guard soundly preserves the null sentinel (null -> null field pointer)
+    run_param_field_test(
+        r#"
+use ::libc;
+#[repr(C)]
+pub struct st {
+    pub lookup: [u16; 4],
+    pub lit: [u32; 4],
+}
+pub unsafe extern "C" fn inner(mut s: *mut st) -> libc::c_int {
+    if !s.is_null() {
+        (*s).lookup[1] = 2 as u16;
+    }
+    return 0 as libc::c_int;
+}
+pub unsafe extern "C" fn outer(mut s: *mut st, mut tree: *mut u32) -> libc::c_int {
+    (*s).lookup[0] = 1 as u16;
+    *tree.offset(0) = 0 as u32;
+    return inner(s);
+}
+pub unsafe extern "C" fn top(mut s: *mut st) -> libc::c_int {
+    return outer(s, ((*s).lit).as_mut_ptr());
+}
+pub unsafe extern "C" fn stray(mut s: *mut st, mut flag: libc::c_int) -> libc::c_int {
+    let mut p: *mut st = 0 as *mut st;
+    if flag != 0 {
+        p = s;
+    }
+    return inner(p);
+}
+"#,
+        &[
+            "fn inner(mut s: *mut [u16; 4]",
+            "fn outer(mut s: *mut [u16; 4]",
+            "fn stray(mut s: *mut st",
+            "let __crat_g0 = p;",
+            "if __crat_g0.is_null()",
+            "inner(__crat_g0_field",
+        ],
+        &["inner(p)"],
+    );
+}
+
+#[test]
+fn test_struct_param_field_specializes_inside_mod_wrapper() {
+    // c2rust wraps everything in `pub mod src { pub mod lib { ... } }`;
+    // the rewriter must recurse into nested modules to find struct/fn items
+    run_param_field_test(
+        r#"
+use ::libc;
+pub mod src {
+    pub mod lib {
+        use ::libc;
+        #[repr(C)]
+        pub struct st {
+            pub lookup: [u16; 4],
+            pub lit: [u32; 4],
+        }
+        pub unsafe extern "C" fn build(mut s: *mut st, mut tree: *mut u32) -> libc::c_int {
+            if !s.is_null() {
+                (*s).lookup[0] = 1 as u16;
+            }
+            *tree.offset(0) = 0 as u32;
+            return 0 as libc::c_int;
+        }
+        pub unsafe extern "C" fn fixed(mut s: *mut st) -> libc::c_int {
+            return build(s, ((*s).lit).as_mut_ptr());
+        }
+        pub unsafe extern "C" fn dynamic(mut s: *mut st) -> libc::c_int {
+            return build(0 as *mut st, ((*s).lit).as_mut_ptr());
+        }
+    }
+}
+"#,
+        &[
+            "fn build(mut s: *mut [u16; 4]",
+            "(*s)[0] = 1 as u16",
+            "&mut (*s).lookup as *mut [u16; 4]",
+            "0 as *mut [u16; 4]",
+        ],
+        &["build(s,", "build(0 as *mut st"],
+    );
+}
+
+#[test]
+fn test_struct_param_field_const_param_specialization() {
+    run_param_field_test(
+        r#"
+use ::libc;
+#[repr(C)]
+pub struct st {
+    pub lookup: [u16; 4],
+    pub lit: [u32; 4],
+}
+pub unsafe extern "C" fn probe(mut s: *const st, mut tree: *mut u32) -> libc::c_int {
+    if !s.is_null() {
+        return (*s).lookup[0] as libc::c_int;
+    }
+    *tree.offset(0) = 0 as u32;
+    return 0 as libc::c_int;
+}
+pub unsafe extern "C" fn fixed(mut s: *mut st) -> libc::c_int {
+    return probe(s, ((*s).lit).as_mut_ptr());
+}
+pub unsafe extern "C" fn dynamic(mut s: *mut st) -> libc::c_int {
+    return probe(0 as *const st, ((*s).lit).as_mut_ptr());
+}
+"#,
+        &[
+            "fn probe(mut s: *const [u16; 4]",
+            "&(*s).lookup as *const [u16; 4]",
+            "0 as *const [u16; 4]",
+        ],
+        &["probe(s,", "probe(0 as *const st"],
+    );
+}
+
+#[test]
+fn test_struct_param_field_mixed_mut_forwarding() {
+    // a *mut caller param forwards into a *const callee param: both specialize,
+    // the forwarding arg stays bare (implicit *mut -> *const coercion)
+    run_param_field_test(
+        r#"
+use ::libc;
+#[repr(C)]
+pub struct st {
+    pub lookup: [u16; 4],
+    pub lit: [u32; 4],
+}
+pub unsafe extern "C" fn inner(mut s: *const st) -> libc::c_int {
+    return (*s).lookup[1] as libc::c_int;
+}
+pub unsafe extern "C" fn outer(mut s: *mut st, mut tree: *mut u32) -> libc::c_int {
+    (*s).lookup[0] = 1 as u16;
+    *tree.offset(0) = 0 as u32;
+    return inner(s);
+}
+pub unsafe extern "C" fn top(mut s: *mut st) -> libc::c_int {
+    return outer(s, ((*s).lit).as_mut_ptr());
+}
+"#,
+        &[
+            "fn inner(mut s: *const [u16; 4]",
+            "fn outer(mut s: *mut [u16; 4]",
+            "inner(s)",
+        ],
+        &["fn inner(mut s: *const st", "fn outer(mut s: *mut st"],
+    );
+}
+
+#[test]
+fn test_struct_param_field_exposed_renamed_with_record() {
+    // exposed by config name match, no attribute on the fn: the internal fn
+    // is renamed and stripped as before, but no wrapper is emitted -- the
+    // original `build` name disappears entirely, replaced by one
+    // FieldSpecEntry the caller (a later pass) can use to synthesize the
+    // ABI shim
+    let code = r#"
+use ::libc;
+#[repr(C)]
+pub struct st {
+    pub lookup: [u16; 4],
+    pub lit: [u32; 4],
+}
+pub unsafe extern "C" fn build(mut s: *mut st, mut tree: *mut u32) -> libc::c_int {
+    if !s.is_null() {
+        (*s).lookup[0] = 1 as u16;
+    }
+    *tree.offset(0) = 0 as u32;
+    return 0 as libc::c_int;
+}
+pub unsafe extern "C" fn fixed(mut s: *mut st) -> libc::c_int {
+    return build(s, ((*s).lit).as_mut_ptr());
+}
+"#;
+    let mut config = Config::default();
+    config.c_exposed_fns.insert("build".to_string());
+    let (s, _, map) = rewrite_struct_param_fields_full(code, &config);
+    ::utils::compilation::run_compiler_on_str(&s, ::utils::type_check).expect(&s);
+    assert!(s.contains("fn build_field(mut s: *mut [u16; 4]"), "{s}");
+    assert!(!s.contains("fn build("), "{s}");
+    assert!(!s.contains("no_mangle"), "{s}");
+
+    let entry = map.get("build").unwrap_or_else(|| panic!("{map:?}"));
+    assert_eq!(entry.internal, "build_field");
+    assert!(matches!(
+        entry.attr,
+        ::utils::field_spec::FieldSpecAttr::NoMangle
+    ));
+    assert_eq!(entry.params.len(), 1);
+    assert_eq!(entry.params[0].index, 0);
+    assert_eq!(entry.params[0].struct_name, "st");
+    assert_eq!(entry.params[0].field, "lookup");
+    assert_eq!(entry.params[0].mutbl, "mut");
+    // module-path format, crate-root case: `tcx.def_path_str` for a
+    // top-level fn is just its own name (no `::`), so the module is empty
+    assert_eq!(entry.module, "");
+}
+
+#[test]
+fn test_struct_param_field_module_path_format() {
+    // pins the module-path format for a fn nested in c2rust's `pub mod src {
+    // pub mod lib { ... } }` wrapper: `tcx.def_path_str` prints
+    // `src::lib::build`, so the record's module (the fn's own trailing
+    // segment stripped off) is `src::lib`
+    let code = r#"
+use ::libc;
+pub mod src {
+    pub mod lib {
+        use ::libc;
+        #[repr(C)]
+        pub struct st {
+            pub lookup: [u16; 4],
+            pub lit: [u32; 4],
+        }
+        pub unsafe extern "C" fn build(mut s: *mut st, mut tree: *mut u32) -> libc::c_int {
+            if !s.is_null() {
+                (*s).lookup[0] = 1 as u16;
+            }
+            *tree.offset(0) = 0 as u32;
+            return 0 as libc::c_int;
+        }
+        pub unsafe extern "C" fn fixed(mut s: *mut st) -> libc::c_int {
+            return build(s, ((*s).lit).as_mut_ptr());
+        }
+    }
+}
+"#;
+    let mut config = Config::default();
+    config.c_exposed_fns.insert("build".to_string());
+    let (s, _, map) = rewrite_struct_param_fields_full(code, &config);
+    ::utils::compilation::run_compiler_on_str(&s, ::utils::type_check).expect(&s);
+    let entry = map.get("build").unwrap_or_else(|| panic!("{map:?}"));
+    assert_eq!(entry.module, "src::lib");
+}
+
+#[test]
+fn test_struct_param_field_export_name_records_export_name() {
+    // the exposed C symbol comes from #[export_name]: the renamed internal
+    // function loses the attribute (no wrapper is emitted to carry it), and
+    // the record's attr captures the export_name value instead
+    let code = r#"
+use ::libc;
+#[repr(C)]
+pub struct st {
+    pub lookup: [u16; 4],
+    pub lit: [u32; 4],
+}
+#[export_name = "build"]
+pub unsafe extern "C" fn build_impl(mut s: *mut st, mut tree: *mut u32) -> libc::c_int {
+    if !s.is_null() {
+        (*s).lookup[0] = 1 as u16;
+    }
+    *tree.offset(0) = 0 as u32;
+    return 0 as libc::c_int;
+}
+pub unsafe extern "C" fn fixed(mut s: *mut st) -> libc::c_int {
+    return build_impl(s, ((*s).lit).as_mut_ptr());
+}
+"#;
+    let mut config = Config::default();
+    config.c_exposed_fns.insert("build".to_string());
+    let (s, _, map) = rewrite_struct_param_fields_full(code, &config);
+    ::utils::compilation::run_compiler_on_str(&s, ::utils::type_check).expect(&s);
+    assert!(
+        s.contains("fn build_impl_field(mut s: *mut [u16; 4]"),
+        "{s}"
+    );
+    assert!(!s.contains("fn build_impl(mut s: *mut st"), "{s}");
+    assert_eq!(s.matches("export_name").count(), 0, "{s}");
+
+    let entry = map.get("build").unwrap_or_else(|| panic!("{map:?}"));
+    assert_eq!(entry.internal, "build_impl_field");
+    assert!(matches!(
+        &entry.attr,
+        ::utils::field_spec::FieldSpecAttr::ExportName(s) if s == "build"
+    ));
+}
+
+#[test]
+fn test_struct_param_field_wrapper_name_collision_skips() {
+    // a pre-existing `build_field` item blocks the rename; the target is dropped
+    let code = r#"
+use ::libc;
+#[repr(C)]
+pub struct st {
+    pub lookup: [u16; 4],
+    pub lit: [u32; 4],
+}
+pub unsafe extern "C" fn build_field() {}
+pub unsafe extern "C" fn build(mut s: *mut st, mut tree: *mut u32) -> libc::c_int {
+    if !s.is_null() {
+        (*s).lookup[0] = 1 as u16;
+    }
+    *tree.offset(0) = 0 as u32;
+    return 0 as libc::c_int;
+}
+pub unsafe extern "C" fn fixed(mut s: *mut st) -> libc::c_int {
+    return build(s, ((*s).lit).as_mut_ptr());
+}
+"#;
+    let mut config = Config::default();
+    config.c_exposed_fns.insert("build".to_string());
+    let (s, _, map) = rewrite_struct_param_fields_full(code, &config);
+    ::utils::compilation::run_compiler_on_str(&s, ::utils::type_check).expect(&s);
+    assert!(s.contains("fn build(mut s: *mut st"), "{s}");
+    assert!(!s.contains("as *mut [u16; 4]"), "{s}");
+    assert!(!map.contains_key("build"), "{map:?}");
+}
+
+#[test]
+fn test_struct_param_field_forward_into_exposed_retargets() {
+    // non-exposed outer forwards into exposed inner: outer's forwarding call
+    // must retarget to the renamed inner_field
+    let code = r#"
+use ::libc;
+#[repr(C)]
+pub struct st {
+    pub lookup: [u16; 4],
+    pub lit: [u32; 4],
+}
+pub unsafe extern "C" fn inner(mut s: *mut st) -> libc::c_int {
+    (*s).lookup[1] = 2 as u16;
+    return 0 as libc::c_int;
+}
+pub unsafe extern "C" fn outer(mut s: *mut st, mut tree: *mut u32) -> libc::c_int {
+    (*s).lookup[0] = 1 as u16;
+    *tree.offset(0) = 0 as u32;
+    return inner(s);
+}
+pub unsafe extern "C" fn top(mut s: *mut st) -> libc::c_int {
+    return outer(s, ((*s).lit).as_mut_ptr());
+}
+"#;
+    let mut config = Config::default();
+    config.c_exposed_fns.insert("inner".to_string());
+    run_param_field_test_with_config(
+        code,
+        &config,
+        &[
+            "fn inner_field(mut s: *mut [u16; 4]",
+            "inner_field(s)",
+            "fn outer(mut s: *mut [u16; 4]",
+        ],
+        &["fn inner(mut s: *mut st", "fn inner(mut s: *mut [u16; 4]"],
+    );
+}
+
+#[test]
+fn test_struct_param_field_no_mangle_records_no_mangle() {
+    // the internal fn must lose #[no_mangle] (no wrapper is emitted to keep
+    // it); the record's attr is NoMangle. fixed's call site aliases s with a
+    // sibling field pointer, triggering build's selection under the
+    // trigger-based policy
+    let code = r#"
+use ::libc;
+#[repr(C)]
+pub struct st {
+    pub lookup: [u16; 4],
+    pub lit: [u32; 4],
+}
+#[no_mangle]
+pub unsafe extern "C" fn build(mut s: *mut st, mut tree: *mut u32) -> libc::c_int {
+    if !s.is_null() {
+        (*s).lookup[0] = 1 as u16;
+    }
+    *tree.offset(0) = 0 as u32;
+    return 0 as libc::c_int;
+}
+pub unsafe extern "C" fn fixed(mut s: *mut st) -> libc::c_int {
+    return build(s, ((*s).lit).as_mut_ptr());
+}
+"#;
+    let mut config = Config::default();
+    config.c_exposed_fns.insert("build".to_string());
+    let (s, _, map) = rewrite_struct_param_fields_full(code, &config);
+    ::utils::compilation::run_compiler_on_str(&s, ::utils::type_check).expect(&s);
+    assert!(s.contains("fn build_field(mut s: *mut [u16; 4]"), "{s}");
+    assert!(!s.contains("fn build(mut s: *mut st"), "{s}");
+    assert_eq!(s.matches("no_mangle").count(), 0, "{s}");
+
+    let entry = map.get("build").unwrap_or_else(|| panic!("{map:?}"));
+    assert_eq!(entry.internal, "build_field");
+    assert!(matches!(
+        entry.attr,
+        ::utils::field_spec::FieldSpecAttr::NoMangle
+    ));
+}
+
+#[test]
+fn test_struct_param_field_const_to_const_forwarding() {
+    // top's call site aliases s with a sibling field pointer, triggering
+    // outer's selection; outer forwards s into inner, which the forward
+    // closure then selects too
+    run_param_field_test(
+        r#"
+use ::libc;
+#[repr(C)]
+pub struct st {
+    pub lookup: [u16; 4],
+    pub lit: [u32; 4],
+}
+pub unsafe extern "C" fn inner(mut s: *const st) -> libc::c_int {
+    return (*s).lookup[1] as libc::c_int;
+}
+pub unsafe extern "C" fn outer(mut s: *const st, mut tree: *mut u32) -> libc::c_int {
+    if (*s).lookup[0] as libc::c_int != 0 {
+        return inner(s);
+    }
+    *tree.offset(0) = 0 as u32;
+    return 0 as libc::c_int;
+}
+pub unsafe extern "C" fn top(mut s: *mut st) -> libc::c_int {
+    return outer(s, ((*s).lit).as_mut_ptr());
+}
+"#,
+        &[
+            "fn inner(mut s: *const [u16; 4]",
+            "fn outer(mut s: *const [u16; 4]",
+            "inner(s)",
+        ],
+        &["*const st"],
+    );
+}
+
+#[test]
+fn test_struct_param_field_const_record() {
+    // a read-only param specializes to a *const field pointer; the record's
+    // param mutbl must reflect that, and no wrapper body (the old
+    // null-guard-conversion `let` text) should appear anywhere. fixed's call
+    // site aliases s with a sibling field pointer, triggering probe's
+    // selection under the trigger-based policy
+    let code = r#"
+use ::libc;
+#[repr(C)]
+pub struct st {
+    pub lookup: [u16; 4],
+    pub lit: [u32; 4],
+}
+pub unsafe extern "C" fn probe(mut s: *const st, mut tree: *mut u32) -> libc::c_int {
+    if !s.is_null() {
+        return (*s).lookup[0] as libc::c_int;
+    }
+    *tree.offset(0) = 0 as u32;
+    return 0 as libc::c_int;
+}
+pub unsafe extern "C" fn fixed(mut s: *mut st) -> libc::c_int {
+    return probe(s, ((*s).lit).as_mut_ptr());
+}
+"#;
+    let mut config = Config::default();
+    config.c_exposed_fns.insert("probe".to_string());
+    let (s, _, map) = rewrite_struct_param_fields_full(code, &config);
+    ::utils::compilation::run_compiler_on_str(&s, ::utils::type_check).expect(&s);
+    assert!(s.contains("fn probe_field(mut s: *const [u16; 4]"), "{s}");
+    assert!(!s.contains("fn probe(mut s: *const st"), "{s}");
+    assert!(!s.contains("__crat_s_field"), "{s}");
+    assert!(!s.contains("if s.is_null() { 0 as *const"), "{s}");
+
+    let entry = map.get("probe").unwrap_or_else(|| panic!("{map:?}"));
+    assert_eq!(entry.internal, "probe_field");
+    assert_eq!(entry.params.len(), 1);
+    assert_eq!(entry.params[0].mutbl, "const");
+}
+
+#[test]
+fn test_struct_param_field_renamed_fn_survives_borrow_promotion() {
+    // regression (adapted): the wrapper's null-guarded field conversion used
+    // to be emitted inline in the call argument, which collided with
+    // replace_local_borrows's independent hoist-opt-ref-borrow and
+    // is_null->is_none rewrite rules, producing E0502/E0284-shaped output
+    // (see generic_foreach corpus case). the wrapper is gone now, but the
+    // chained harness still pins that the renamed fns and their retargeted
+    // call sites type-check cleanly once chained through borrow promotion.
+    // clear/get each stay single-field candidates (clear touches only size;
+    // get only touches data). fixed_clear/fixed_get each pass s alongside a
+    // sibling field-address argument on the same base (the standard trigger
+    // idiom), triggering clear's and get's selection under the trigger-based
+    // policy; use_clear_null exercises a plain null-literal call site, valid
+    // once clear is already selected
+    let code = r#"
+use ::libc;
+#[repr(C)]
+pub struct st {
+    pub size: usize,
+    pub data: *mut i32,
+    pub lit: [u32; 4],
+}
+pub unsafe extern "C" fn clear(mut s: *mut st, mut tree: *mut u32) {
+    if !s.is_null() {
+        (*s).size = 0 as usize;
+    }
+    *tree.offset(0) = 0 as u32;
+}
+pub unsafe extern "C" fn get(mut s: *mut st, mut index: usize, mut tree: *mut u32) -> i32 {
+    *tree.offset(0) = 0 as u32;
+    return *((*s).data).offset(index as isize);
+}
+pub unsafe extern "C" fn use_clear_null() {
+    clear(0 as *mut st, 0 as *mut u32);
+}
+pub unsafe extern "C" fn fixed_clear(mut s: *mut st) {
+    clear(s, ((*s).lit).as_mut_ptr());
+}
+pub unsafe extern "C" fn fixed_get(mut s: *mut st, mut index: usize) -> i32 {
+    return get(s, index, ((*s).lit).as_mut_ptr());
+}
+"#;
+    let mut config = Config::default();
+    config.c_exposed_fns.insert("clear".to_string());
+    config.c_exposed_fns.insert("get".to_string());
+    let (s, _) = rewrite_struct_param_fields_then_pointer(code, &config);
+    ::utils::compilation::run_compiler_on_str(&s, ::utils::type_check).expect(&s);
+    assert!(s.contains("fn clear_field"), "{s}");
+    assert!(s.contains("fn get_field"), "{s}");
+    assert!(s.contains("clear_field("), "{s}");
+    assert!(s.contains("get_field("), "{s}");
+    assert!(!s.contains("fn clear("), "{s}");
+    assert!(!s.contains("fn get("), "{s}");
+    assert!(!s.contains("_borrowed = None"), "{s}");
+    assert!(!s.contains("None.as_deref_mut"), "{s}");
+    assert!(!s.contains("(None).as_deref"), "{s}");
+}
+
+#[test]
+fn test_guarded_site_statement_mut() {
+    // stranger passes a maybe-null local p to selected build in statement
+    // position: no sibling field pointer, no nullity fact, so the site gets
+    // a hoisted guard rather than dropping build's selection
+    run_param_field_test(
+        r#"
+use ::libc;
+#[repr(C)]
+pub struct st {
+    pub lookup: [u16; 4],
+    pub lit: [u32; 4],
+}
+pub unsafe extern "C" fn build(mut s: *mut st, mut tree: *mut u32) -> libc::c_int {
+    if !s.is_null() {
+        (*s).lookup[0] = 1 as u16;
+    }
+    *tree.offset(0) = 0 as u32;
+    return 0 as libc::c_int;
+}
+pub unsafe extern "C" fn fixed(mut s: *mut st) -> libc::c_int {
+    return build(s, ((*s).lit).as_mut_ptr());
+}
+pub unsafe extern "C" fn stranger(mut s: *mut st, mut tree: *mut u32, mut flag: libc::c_int) -> libc::c_int {
+    let mut p: *mut st = 0 as *mut st;
+    if flag != 0 {
+        p = s;
+    }
+    build(p, tree);
+    return 0 as libc::c_int;
+}
+"#,
+        &[
+            "fn build(mut s: *mut [u16; 4]",
+            "if __crat_g0.is_null()",
+            "0 as *mut [u16; 4]",
+            "&mut (*__crat_g0).lookup as *mut [u16; 4]",
+            "build(__crat_g0_field",
+        ],
+        &["build(p,"],
+    );
+}
+
+#[test]
+fn test_guarded_site_const() {
+    // const-demoted callee (reads only): guarded caller gets the const-branch
+    // shape
+    run_param_field_test(
+        r#"
+use ::libc;
+#[repr(C)]
+pub struct st {
+    pub lookup: [u16; 4],
+    pub lit: [u32; 4],
+}
+pub unsafe extern "C" fn probe(mut s: *const st, mut tree: *mut u32) -> libc::c_int {
+    if !s.is_null() {
+        return (*s).lookup[0] as libc::c_int;
+    }
+    *tree.offset(0) = 0 as u32;
+    return 0 as libc::c_int;
+}
+pub unsafe extern "C" fn fixed(mut s: *mut st) -> libc::c_int {
+    return probe(s, ((*s).lit).as_mut_ptr());
+}
+pub unsafe extern "C" fn stranger(mut s: *mut st, mut tree: *mut u32, mut flag: libc::c_int) -> libc::c_int {
+    let mut p: *const st = 0 as *const st;
+    if flag != 0 {
+        p = s;
+    }
+    probe(p, tree);
+    return 0 as libc::c_int;
+}
+"#,
+        &[
+            "fn probe(mut s: *const [u16; 4]",
+            "&(*__crat_g0).lookup as *const [u16; 4]",
+            "0 as *const [u16; 4]",
+        ],
+        &["probe(p,"],
+    );
+}
+
+#[test]
+fn test_guarded_site_in_if_condition() {
+    // the two lets appear before the `if` statement; the call inside the
+    // condition uses the hoisted name
+    run_param_field_test(
+        r#"
+use ::libc;
+#[repr(C)]
+pub struct st {
+    pub lookup: [u16; 4],
+    pub lit: [u32; 4],
+}
+pub unsafe extern "C" fn build(mut s: *mut st, mut tree: *mut u32) -> libc::c_int {
+    if !s.is_null() {
+        (*s).lookup[0] = 1 as u16;
+    }
+    *tree.offset(0) = 0 as u32;
+    return 0 as libc::c_int;
+}
+pub unsafe extern "C" fn fixed(mut s: *mut st) -> libc::c_int {
+    return build(s, ((*s).lit).as_mut_ptr());
+}
+pub unsafe extern "C" fn stranger(mut s: *mut st, mut tree: *mut u32, mut flag: libc::c_int) -> libc::c_int {
+    let mut p: *mut st = 0 as *mut st;
+    if flag != 0 {
+        p = s;
+    }
+    if build(p, tree) != 0 as libc::c_int {
+        return 1 as libc::c_int;
+    }
+    return 0 as libc::c_int;
+}
+"#,
+        &[
+            "let __crat_g0 = p;",
+            "if __crat_g0.is_null()",
+            "if build(__crat_g0_field",
+        ],
+        &["build(p,"],
+    );
+}
+
+#[test]
+fn test_guarded_site_in_loop_body() {
+    // the guarded call as a statement inside a while body: lets emitted
+    // inside the loop body immediately before the call statement
+    run_param_field_test(
+        r#"
+use ::libc;
+#[repr(C)]
+pub struct st {
+    pub lookup: [u16; 4],
+    pub lit: [u32; 4],
+}
+pub unsafe extern "C" fn build(mut s: *mut st, mut tree: *mut u32) -> libc::c_int {
+    if !s.is_null() {
+        (*s).lookup[0] = 1 as u16;
+    }
+    *tree.offset(0) = 0 as u32;
+    return 0 as libc::c_int;
+}
+pub unsafe extern "C" fn fixed(mut s: *mut st) -> libc::c_int {
+    return build(s, ((*s).lit).as_mut_ptr());
+}
+pub unsafe extern "C" fn stranger(mut s: *mut st, mut tree: *mut u32, mut flag: libc::c_int) -> libc::c_int {
+    let mut p: *mut st = 0 as *mut st;
+    if flag != 0 {
+        p = s;
+    }
+    while flag != 0 as libc::c_int {
+        flag -= 1;
+        build(p, tree);
+        flag -= 1;
+    }
+    return 0 as libc::c_int;
+}
+"#,
+        &[
+            "flag -= 1;\n        let __crat_g0 = p;",
+            "if __crat_g0.is_null()",
+            "build(__crat_g0_field",
+        ],
+        &["build(p,"],
+    );
+}
+
+#[test]
+fn test_two_guarded_args_mixed() {
+    // callee with two specialized params (one mut, one const); one caller
+    // passes two maybe-null locals: two capture/guard pairs with distinct
+    // names
+    run_param_field_test(
+        r#"
+use ::libc;
+#[repr(C)]
+pub struct st {
+    pub lookup: [u16; 4],
+    pub lit: [u32; 4],
+}
+#[repr(C)]
+pub struct rd {
+    pub val: [u8; 4],
+    pub tag: [u8; 4],
+}
+pub unsafe extern "C" fn build(mut s: *mut st, mut r: *const rd, mut tree: *mut u8) -> libc::c_int {
+    if !s.is_null() {
+        (*s).lookup[0] = 1 as u16;
+    }
+    if !r.is_null() {
+        *tree.offset(0) = (*r).val[0];
+    }
+    return 0 as libc::c_int;
+}
+pub unsafe extern "C" fn fixed(mut s: *mut st, mut r0: *const rd) -> libc::c_int {
+    return build(s, r0, ((*s).lit).as_mut_ptr() as *mut u8);
+}
+pub unsafe extern "C" fn fixed2(mut s: *mut st, mut r0: *const rd) -> libc::c_int {
+    return build(s, r0, ((*r0).tag).as_ptr() as *mut u8);
+}
+pub unsafe extern "C" fn stranger(mut s: *mut st, mut r0: *const rd, mut tree: *mut u8, mut flag: libc::c_int) -> libc::c_int {
+    let mut p: *mut st = 0 as *mut st;
+    let mut q: *const rd = 0 as *const rd;
+    if flag != 0 {
+        p = s;
+        q = r0;
+    }
+    build(p, q, tree);
+    return 0 as libc::c_int;
+}
+"#,
+        &[
+            "fn build(mut s: *mut [u16; 4]",
+            "fn build(",
+            "let __crat_g0 = p;",
+            "let __crat_g1 = q;",
+            "&mut (*__crat_g0).lookup as *mut [u16; 4]",
+            "&(*__crat_g1).val as *const [u8; 4]",
+        ],
+        &["build(p, q,"],
+    );
+}
+
+#[test]
+fn test_guarded_site_in_while_head_drops_target() {
+    // the guarded call inside a while HEAD has no sound hoist point: the
+    // target must be dropped, and the trigger caller alone must not keep it
+    // alive (dropping cascades)
+    run_param_field_test(
+        r#"
+use ::libc;
+#[repr(C)]
+pub struct st {
+    pub lookup: [u16; 4],
+    pub lit: [u32; 4],
+}
+pub unsafe extern "C" fn build(mut s: *mut st, mut tree: *mut u32) -> libc::c_int {
+    if !s.is_null() {
+        (*s).lookup[0] = 1 as u16;
+    }
+    *tree.offset(0) = 0 as u32;
+    return 0 as libc::c_int;
+}
+pub unsafe extern "C" fn fixed(mut s: *mut st) -> libc::c_int {
+    return build(s, ((*s).lit).as_mut_ptr());
+}
+pub unsafe extern "C" fn stranger(mut s: *mut st, mut tree: *mut u32, mut flag: libc::c_int) -> libc::c_int {
+    let mut p: *mut st = 0 as *mut st;
+    if flag != 0 {
+        p = s;
+    }
+    while build(p, tree) != 0 as libc::c_int {
+        flag -= 1;
+    }
+    return 0 as libc::c_int;
+}
+"#,
+        &["fn build(mut s: *mut st"],
+        &["__crat_", "*mut [u16; 4]"],
+    );
+}
+
+#[test]
+fn test_direct_and_guarded_in_one_fn() {
+    // one function with both a FieldSibling site (Direct inline wrap) and a
+    // guarded site: both emissions correct side by side
+    run_param_field_test(
+        r#"
+use ::libc;
+#[repr(C)]
+pub struct st {
+    pub lookup: [u16; 4],
+    pub lit: [u32; 4],
+}
+pub unsafe extern "C" fn build(mut s: *mut st, mut tree: *mut u32) -> libc::c_int {
+    if !s.is_null() {
+        (*s).lookup[0] = 1 as u16;
+    }
+    *tree.offset(0) = 0 as u32;
+    return 0 as libc::c_int;
+}
+pub unsafe extern "C" fn fixed(mut s: *mut st) -> libc::c_int {
+    return build(s, ((*s).lit).as_mut_ptr());
+}
+pub unsafe extern "C" fn both(mut s: *mut st, mut tree: *mut u32, mut flag: libc::c_int) -> libc::c_int {
+    build(s, ((*s).lit).as_mut_ptr());
+    let mut p: *mut st = 0 as *mut st;
+    if flag != 0 {
+        p = s;
+    }
+    build(p, tree);
+    return 0 as libc::c_int;
+}
+"#,
+        &[
+            "&mut (*s).lookup as *mut [u16; 4]",
+            "let __crat_g0 = p;",
+            "if __crat_g0.is_null()",
+            "build(__crat_g0_field",
+        ],
+        &["build(p,", "build(s,"],
+    );
+}
+
+#[test]
+fn test_guarded_site_survives_borrow_promotion() {
+    // chained specialize -> replace_local_borrows: a guarded site's hoisted
+    // guard must not collide with the downstream borrow-promotion pass
+    let code = r#"
+use ::libc;
+#[repr(C)]
+pub struct st {
+    pub lookup: [u16; 4],
+    pub lit: [u32; 4],
+}
+pub unsafe extern "C" fn build(mut s: *mut st, mut tree: *mut u32) -> libc::c_int {
+    if !s.is_null() {
+        (*s).lookup[0] = 1 as u16;
+    }
+    *tree.offset(0) = 0 as u32;
+    return 0 as libc::c_int;
+}
+pub unsafe extern "C" fn fixed(mut s: *mut st) -> libc::c_int {
+    return build(s, ((*s).lit).as_mut_ptr());
+}
+pub unsafe extern "C" fn stranger(mut s: *mut st, mut tree: *mut u32, mut flag: libc::c_int) -> libc::c_int {
+    let mut p: *mut st = 0 as *mut st;
+    if flag != 0 {
+        p = s;
+    }
+    build(p, tree);
+    return 0 as libc::c_int;
+}
+"#;
+    let config = Config::default();
+    let (s, _) = rewrite_struct_param_fields_then_pointer(code, &config);
+    ::utils::compilation::run_compiler_on_str(&s, ::utils::type_check).expect(&s);
+    assert!(!s.contains("None.as_deref_mut"), "{s}");
+}
+
 fn run_test(code: &str, includes: &[&str], excludes: &[&str]) {
     let config = Config::default();
     let (s, _) = rewrite_with_config(code, &config);
@@ -10693,4 +11744,164 @@ pub unsafe fn f(mut uname: *mut i8) -> *mut i8 {
     ::utils::compilation::run_compiler_on_str(&s, ::utils::type_check).expect(&s);
     assert!(s.contains("let mut p0: *mut i8"), "{s}");
     assert!(!s.contains("p0_idx"), "{s}");
+}
+
+#[test]
+fn test_struct_param_field_cross_module_guarded_exposed_call_site_compiles() {
+    // c2rust merges translation units as sibling modules importing each
+    // other via plain `use` items (not the single-crate-body shape every
+    // other struct_param_field_spec test uses). module `b`'s `stranger`
+    // reaches the exposed, `_field`-renamed `build` through
+    // `use crate::a::build;` and specializes a maybe-null argument into a
+    // hoisted guard whose cast type comes from the field's declared AST
+    // type, which spells the c2rust alias `myint_t` -- a type module `b`
+    // never imports. two bugs, reproduced together:
+    // - bug A (E0425/E0432): the call site rewrite retargets to
+    //   `build_field`, so module b's `use crate::a::build;` must be renamed
+    //   to `use crate::a::build_field;` in place -- no wrapper preserves the
+    //   original `build` name any more, so leaving the old import in place
+    //   (even alongside a new one) would dangle
+    // - bug B (E0412): the hoisted guard casts through `myint_t`, which is
+    //   only in scope inside module `a`
+    let mut config = Config::default();
+    config.c_exposed_fns.insert("build".to_string());
+    let code = r#"
+use ::libc;
+pub mod a {
+    use ::libc;
+    pub type myint_t = u16;
+    #[repr(C)]
+    pub struct st {
+        pub lookup: [myint_t; 4],
+        pub lit: [u32; 4],
+    }
+    pub unsafe extern "C" fn build(mut s: *mut st, mut tree: *mut u32) -> libc::c_int {
+        if !s.is_null() {
+            (*s).lookup[0] = 1 as myint_t;
+        }
+        *tree.offset(0) = 0 as u32;
+        return 0 as libc::c_int;
+    }
+    pub unsafe extern "C" fn fixed(mut s: *mut st) -> libc::c_int {
+        return build(s, ((*s).lit).as_mut_ptr());
+    }
+}
+pub mod b {
+    use ::libc;
+    use crate::a::build;
+    use crate::a::st;
+    pub unsafe extern "C" fn stranger(
+        mut s: *mut st,
+        mut tree: *mut u32,
+        mut flag: libc::c_int,
+    ) -> libc::c_int {
+        let mut p: *mut st = 0 as *mut st;
+        if flag != 0 {
+            p = s;
+        }
+        build(p, tree);
+        return 0 as libc::c_int;
+    }
+}
+"#;
+    let (s, _) = rewrite_struct_param_fields_with_config(code, &config);
+    ::utils::compilation::run_compiler_on_str(&s, ::utils::type_check).expect(&s);
+    // bug A fix: module b's import is renamed in place to the `_field`
+    // redirect target; the original (now-dangling) name must not remain
+    assert!(s.contains("use crate::a::build_field"), "{s}");
+    assert!(!s.contains("use crate::a::build;"), "{s}");
+    assert!(s.contains("build_field(__crat_g0_field"), "{s}");
+    // bug B fix: module b's hoisted guard casts through the alias-free MIR
+    // spelling `[u16; 4]`, not the c2rust alias `myint_t` (which module b
+    // never imports). `myint_t` legitimately still appears in module `a`
+    // (the alias definition itself, and the same-module signature emission
+    // this task does not touch), so isolate module b's text
+    let mod_b = s.split("pub mod b").nth(1).expect("module b present");
+    assert!(mod_b.contains("*mut [u16; 4]"), "{s}");
+    assert!(!mod_b.contains("myint_t"), "{s}");
+}
+
+#[test]
+fn test_struct_param_field_glob_use_no_corrupted_sibling_import() {
+    // guards `renamed_field_use`'s UseTreeKind::Simple-only gate. before the
+    // gate, the prefix-truncation (`rfind("::")` + truncate, meant to drop a
+    // Simple use's trailing symbol segment) was applied uniformly to every
+    // `use` item's `tree.prefix`. for a non-Simple tree the last `::`
+    // segment of `prefix` is a real module path component, not a symbol --
+    // for `use crate::a::*;` (Glob), `tree.prefix` is `crate::a`, so the old
+    // code would truncate at the `crate`/`a` boundary and emit the corrupted
+    // `use crate::build_field;` (missing the `a::` module segment entirely),
+    // rather than either the correct sibling or nothing.
+    //
+    // empirically, `crate::a::*` already resolves `build_field` into scope
+    // by itself (that's the point of a glob import), so `renamed_field_use`
+    // never reaches the corrupting code even pre-gate: HIR resolves a glob
+    // `use` item's `value_ns` to the module, not to the specific fn, so the
+    // `Res::Def(DefKind::Fn, _)` match fails before the prefix is ever
+    // touched. this test pins that (the output must compile and must NOT
+    // contain a second, corrupted `use crate::build_field;`), and the gate
+    // added above is the documented, fail-closed backstop for any future
+    // change to the HIR resolution path that would otherwise let a Glob (or
+    // Nested) tree reach the truncation logic.
+    //
+    // a true `UseTreeKind::Nested` case (`use crate::a::{build, st};`)
+    // cannot be exercised end-to-end here: `AstToHirMapper::map_item_to_item`
+    // (crates/utils/src/ir/ast_to_hir.rs:90) panics unconditionally on any
+    // Nested use tree, crate-wide, before rewriting begins -- confirmed by
+    // direct probe (`thread 'rustc' panicked at
+    // crates/utils/src/ir/ast_to_hir.rs:90:22: explicit panic`). that panic
+    // fires regardless of this fix, so no test (e2e or otherwise, since
+    // `renamed_field_use` requires a live `TyCtxt` to call at all) can drive
+    // a Nested tree into this gate; the Simple-only match is verified here
+    // for Glob, and by code inspection for Nested (structurally identical:
+    // `tree.prefix` for `use crate::a::{b, c};` is `crate::a`, the same
+    // "prefix has no symbol segment" shape as Glob).
+    let mut config = Config::default();
+    config.c_exposed_fns.insert("build".to_string());
+    let code = r#"
+use ::libc;
+pub mod a {
+    use ::libc;
+    pub type myint_t = u16;
+    #[repr(C)]
+    pub struct st {
+        pub lookup: [myint_t; 4],
+        pub lit: [u32; 4],
+    }
+    pub unsafe extern "C" fn build(mut s: *mut st, mut tree: *mut u32) -> libc::c_int {
+        if !s.is_null() {
+            (*s).lookup[0] = 1 as myint_t;
+        }
+        *tree.offset(0) = 0 as u32;
+        return 0 as libc::c_int;
+    }
+    pub unsafe extern "C" fn fixed(mut s: *mut st) -> libc::c_int {
+        return build(s, ((*s).lit).as_mut_ptr());
+    }
+}
+pub mod b {
+    use ::libc;
+    use crate::a::*;
+    pub unsafe extern "C" fn stranger(
+        mut s: *mut st,
+        mut tree: *mut u32,
+        mut flag: libc::c_int,
+    ) -> libc::c_int {
+        let mut p: *mut st = 0 as *mut st;
+        if flag != 0 {
+            p = s;
+        }
+        build(p, tree);
+        return 0 as libc::c_int;
+    }
+}
+"#;
+    let (s, _) = rewrite_struct_param_fields_with_config(code, &config);
+    ::utils::compilation::run_compiler_on_str(&s, ::utils::type_check).expect(&s);
+    // the glob import brings `build_field` into module b's scope on its
+    // own; no additional sibling `use` should be injected for it, and in
+    // particular no corrupted `use crate::build_field;` (missing `a::`)
+    let mod_b = s.split("pub mod b").nth(1).expect("module b present");
+    assert!(!mod_b.contains("use crate::build_field"), "{s}");
+    assert!(!mod_b.contains("use crate::a::build_field"), "{s}");
 }
