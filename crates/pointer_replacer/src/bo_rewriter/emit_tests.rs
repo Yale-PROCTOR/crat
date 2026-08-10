@@ -3172,6 +3172,33 @@ mod coconv_witnesses {
         assert_eq!(src["admissible"], "0", "{src:?}");
     }
 
+    /// **A converting binding into a DIFFERENTLY-FORMED parameter is its own
+    /// reason**, because it is its own hazard class.
+    ///
+    /// `&mut T` into `*mut T` coerces silently and is caught here or nowhere.
+    /// `&mut T` into `Option<&i32>` is `E0308` — the compiler catches it, so it
+    /// costs a revert rather than soundness. Banked rule 1 is exactly that
+    /// distinction, and a census reporting both as `flows-into-raw-param` files
+    /// a checked risk under an unchecked reason.
+    ///
+    /// *Mutation-tested (deletion first):* dropping the `other_form` arm makes
+    /// this read `flows-into-raw-param` and fails.
+    #[test]
+    fn a_binding_flowing_into_a_differently_formed_parameter_has_its_own_reason() {
+        let rows = census(&format!(
+            "{PRE}pub unsafe fn opty(o: *mut i32) -> i32 {{ if o.is_null() {{ 0 }} else {{ *o }} }}\n\
+             pub unsafe fn feeder(r: *mut i32) -> i32 {{ *r = 1; opty(r) }}\n"
+        ));
+        let o = row(&rows, "opty", 1);
+        let r = row(&rows, "feeder", 1);
+        assert_eq!(
+            o["class_id"], "-",
+            "`opty`'s parameter takes the OPTIONAL form, so it is not a class \
+             node — if it were a plain `Ref` this fixture witnesses nothing: {o:?}"
+        );
+        assert_eq!(r["node_block"], "flows-into-other-form", "{r:?}");
+    }
+
     /// **The PINNED population is excluded structurally, not in prose.**
     ///
     /// A function reached by a fn-pointer cast has its signature fixed by every
