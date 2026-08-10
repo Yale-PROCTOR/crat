@@ -130,7 +130,19 @@ pub(crate) enum ArgShape {
     BareLocal(HirId),
     /// `&mut e` / `&e`, already written. Needs no edit either way — `&mut T`
     /// coerces to `*mut T` today and satisfies `&mut T`/`&T` after.
-    AddrOf { mutable: bool },
+    ///
+    /// **`base` is the borrowed place's ROOT binding, and it is what makes the
+    /// within-site overlap gate possible at all.** Overlap is not textual
+    /// identity: brotli's
+    /// `BrotliDecoderHuffmanTreeGroupInit(s, &mut (*s).literal_hgroup, …)`
+    /// passes `s` at one `*mut` position and a place *inside* `*s` at another.
+    /// Without the root this arm carries nothing to see that with, and the gate
+    /// would let a certain-overlap class through.
+    ///
+    /// `None` when the operand is not rooted at a local binding (a static, a
+    /// temporary). `None` is **not** "no overlap" — the gate must treat an
+    /// unknown root conservatively.
+    AddrOf { mutable: bool, base: Option<HirId> },
     /// `&mut e as *mut T` — the cast is the only thing to remove.
     AddrOfCast { mutable: bool, inner: Span },
     /// `q as *mut T` where `q` is a local binding.
@@ -147,14 +159,53 @@ impl ArgShape {
     pub(crate) fn key(self) -> &'static str {
         match self {
             ArgShape::BareLocal(_) => "bare-local",
-            ArgShape::AddrOf { mutable: true } => "addr-of-mut",
-            ArgShape::AddrOf { mutable: false } => "addr-of",
+            ArgShape::AddrOf { mutable: true, .. } => "addr-of-mut",
+            ArgShape::AddrOf { mutable: false, .. } => "addr-of",
             ArgShape::AddrOfCast { mutable: true, .. } => "addr-of-mut-cast",
             ArgShape::AddrOfCast { mutable: false, .. } => "addr-of-cast",
             ArgShape::CastOfLocal { .. } => "cast-of-local",
             ArgShape::NullLit => "null-lit",
             ArgShape::Cast { .. } => "cast",
             ArgShape::Other => "other",
+        }
+    }
+
+    /// The **place root** this argument reads or borrows, when it is a local
+    /// binding.
+    ///
+    /// This is the key the within-site overlap gate compares. Two argument
+    /// positions at one call site sharing a root **may alias**, and after
+    /// conversion that is `E0499` (or `E0502` — demoting one side to shared
+    /// does *not* rescue it, measured). A shared root is a MAY-overlap, so
+    /// blocking on it costs yield and never soundness.
+    ///
+    /// Shapes that cannot convert at all return `None` and are irrelevant here:
+    /// they block on their own account before overlap is asked about.
+    pub(crate) fn place_root(self) -> Option<HirId> {
+        match self {
+            ArgShape::BareLocal(id) | ArgShape::CastOfLocal { binding: id, .. } => Some(id),
+            ArgShape::AddrOf { base, .. } => base,
+            _ => None,
+        }
+    }
+}
+
+/// Walk a place expression down to the local binding it is rooted at.
+///
+/// `(*s).literal_hgroup` roots at `s`; `v[i].f` roots at `v`; a static or a
+/// temporary roots at nothing. Deref is included deliberately — that is the
+/// C2Rust shape, and stopping at it would make every `(*p).field` argument look
+/// unrelated to `p`.
+fn place_root(expr: &Expr<'_>) -> Option<HirId> {
+    let mut cur = expr;
+    loop {
+        match &cur.kind {
+            ExprKind::Field(base, _)
+            | ExprKind::Index(base, _, _)
+            | ExprKind::Unary(rustc_hir::UnOp::Deref, base)
+            | ExprKind::AddrOf(_, _, base)
+            | ExprKind::DropTemps(base) => cur = base,
+            _ => return BodyFacts::resolved_local(cur),
         }
     }
 }
@@ -224,8 +275,9 @@ fn classify_arg(expr: &Expr<'_>) -> ArgShape {
                 ArgShape::Cast { inner: inner.span }
             }
         }
-        ExprKind::AddrOf(_, mutability, _) => ArgShape::AddrOf {
+        ExprKind::AddrOf(_, mutability, operand) => ArgShape::AddrOf {
             mutable: matches!(mutability, Mutability::Mut),
+            base: place_root(operand),
         },
         _ => match BodyFacts::resolved_local(expr) {
             Some(binding) => ArgShape::BareLocal(binding),

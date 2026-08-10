@@ -2871,3 +2871,69 @@ fn only_direct_calls_record_arguments() {
          pinned population a market it cannot have"
     );
 }
+
+/// **S3.6-1 task 0a — a borrowed argument records its PLACE ROOT.**
+///
+/// The within-site overlap gate must block a call site where two pointer
+/// parameters receive *overlapping* places, and overlap is not textual
+/// identity. The corpus witness is brotli's
+/// `BrotliDecoderHuffmanTreeGroupInit(s, &mut (*s).literal_hgroup, …)`
+/// (`brotli/lib.rs:113893`): parameter 0 gets `s`, parameter 1 gets a place
+/// **inside `*s`**, both declared `*mut`, certain overlap. `heman`'s
+/// `kmVec3Normalize(pOut, pOut)` (×7) is the easy case — same binding — and a
+/// gate built only for it would miss brotli entirely.
+///
+/// So the assertion is not "a root is recorded" but **"the two arguments share
+/// the same root"**, which is the question the gate actually asks.
+#[test]
+fn a_borrowed_argument_records_the_place_it_is_rooted_at() {
+    fn roots_match(src: &str) -> (bool, usize) {
+        ::utils::compilation::run_compiler_on_str(src, |tcx| {
+            let program = crate::bo_rewriter::collect_program(tcx);
+            let facts = crate::bo_rewriter::decision::emitability::collect(tcx, &program.functions);
+            let site = facts
+                .call_args
+                .iter()
+                .find(|(did, _)| tcx.def_path_str(did.to_def_id()).contains("target"))
+                .map(|(_, sites)| sites[0].clone())
+                .expect("the call site is recorded");
+            let roots: Vec<_> = site.args.iter().map(|a| a.shape.place_root()).collect();
+            let known = roots.iter().filter(|r| r.is_some()).count();
+            (roots.len() == 2 && roots[0].is_some() && roots[0] == roots[1], known)
+        })
+        .expect("fixture compiles")
+    }
+
+    // The brotli shape: a bare binding, and a borrow of a place INSIDE it.
+    let (overlap, known) = roots_match(
+        "#![allow(dead_code, unused_unsafe, unused_variables)]\n\
+         pub struct Grp { pub n: i32 }\n\
+         pub struct St { pub g: Grp }\n\
+         pub unsafe fn target(s: *mut St, g: *mut Grp) { (*g).n = 1; let _ = s; }\n\
+         pub unsafe fn c(s: *mut St) { target(s, &mut (*s).g); }\n",
+    );
+    assert_eq!(known, 2, "both arguments must resolve a root");
+    assert!(
+        overlap,
+        "`s` and `&mut (*s).g` must share a place root — this is brotli's \
+         BrotliDecoderHuffmanTreeGroupInit shape, certain overlap at two *mut \
+         positions, and a gate that cannot see it spends a revert instead of \
+         avoiding one"
+    );
+
+    // The NEGATIVE, so the test cannot be satisfied by returning one constant
+    // root for everything: two genuinely distinct bases must NOT match.
+    let (overlap_distinct, known_distinct) = roots_match(
+        "#![allow(dead_code, unused_unsafe, unused_variables)]\n\
+         pub struct Grp { pub n: i32 }\n\
+         pub struct St { pub g: Grp }\n\
+         pub unsafe fn target(s: *mut St, g: *mut Grp) { (*g).n = 1; let _ = s; }\n\
+         pub unsafe fn c(s: *mut St, t: *mut St) { target(s, &mut (*t).g); }\n",
+    );
+    assert_eq!(known_distinct, 2);
+    assert!(
+        !overlap_distinct,
+        "distinct bases must not share a root — a gate that reported overlap \
+         for everything would block the whole adaptable population"
+    );
+}
