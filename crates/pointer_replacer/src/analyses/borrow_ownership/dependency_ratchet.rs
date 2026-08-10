@@ -20,8 +20,10 @@
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeSet;
-    use std::path::{Path, PathBuf};
+    use std::{
+        collections::BTreeSet,
+        path::{Path, PathBuf},
+    };
 
     /// Every permitted `analyses::borrow::<seg>` reference in non-test BO code, with its §0.2
     /// ledger retirement milestone. MAY ONLY SHRINK.
@@ -110,17 +112,15 @@ mod tests {
                     }
                 }
                 out.push(' ');
-            } else if c == b'r'
-                && {
-                    // Raw string prefix `r` `#`×N `"` (also matches the `r` of a byte-raw `br"…"`,
-                    // whose leading `b` is pushed harmlessly). NOT a raw identifier `r#ident` (no `"`).
-                    let mut h = i + 1;
-                    while h < b.len() && b[h] == b'#' {
-                        h += 1;
-                    }
-                    h < b.len() && b[h] == b'"'
+            } else if c == b'r' && {
+                // Raw string prefix `r` `#`×N `"` (also matches the `r` of a byte-raw `br"…"`,
+                // whose leading `b` is pushed harmlessly). NOT a raw identifier `r#ident` (no `"`).
+                let mut h = i + 1;
+                while h < b.len() && b[h] == b'#' {
+                    h += 1;
                 }
-            {
+                h < b.len() && b[h] == b'"'
+            } {
                 // Raw string `r #×N " … " #×N` — content is uninterpreted; find the closing `"`
                 // followed by exactly N `#` and blank the whole literal, so an interior `"` (or `/*`)
                 // cannot desync the scanner and swallow the following code.
@@ -132,7 +132,12 @@ mod tests {
                 let mut m = h + 1;
                 while m < b.len() {
                     if b[m] == b'"'
-                        && b[m + 1..].iter().take(hashes).filter(|&&x| x == b'#').count() == hashes
+                        && b[m + 1..]
+                            .iter()
+                            .take(hashes)
+                            .filter(|&&x| x == b'#')
+                            .count()
+                            == hashes
                     {
                         m += 1 + hashes;
                         break;
@@ -162,14 +167,13 @@ mod tests {
                 // swallow real code). A lifetime (`'a`, `'static`: ident chars, no closing quote) is
                 // left untouched. Heuristic: it's a char literal iff the char after `'` is `\`
                 // (escape) or is followed immediately by a closing `'`.
-                let is_char_lit =
-                    b.get(i + 1) == Some(&b'\\') || b.get(i + 2) == Some(&b'\'');
+                let is_char_lit = b.get(i + 1) == Some(&b'\\') || b.get(i + 2) == Some(&b'\'');
                 if is_char_lit {
                     i += 1; // opening '
                     if b.get(i) == Some(&b'\\') {
                         i += 1; // backslash
                         match b.get(i) {
-                            Some(&b'x') => i += 3,      // \xNN
+                            Some(&b'x') => i += 3, // \xNN
                             Some(&b'u') => {
                                 while i < b.len() && b[i] != b'}' {
                                     i += 1;
@@ -374,7 +378,11 @@ mod tests {
     fn scan() -> (BTreeSet<String>, BTreeSet<String>) {
         let mut files = vec![];
         collect_rs(&bo_dir(), &mut files);
-        assert!(files.len() > 10, "expected the BO source tree; found {} files", files.len());
+        assert!(
+            files.len() > 10,
+            "expected the BO source tree; found {} files",
+            files.len()
+        );
         let (mut borrow, mut ownership) = (BTreeSet::new(), BTreeSet::new());
         for f in &files {
             let src = std::fs::read_to_string(f).expect("read BO source file");
@@ -387,10 +395,16 @@ mod tests {
 
     fn diff(actual: &BTreeSet<String>, allow: &[&str]) -> (Vec<String>, Vec<String>) {
         let allow: BTreeSet<&str> = allow.iter().copied().collect();
-        let unexpected: Vec<String> =
-            actual.iter().filter(|s| !allow.contains(s.as_str())).cloned().collect();
-        let stale: Vec<String> =
-            allow.iter().filter(|s| !actual.contains(**s)).map(|s| s.to_string()).collect();
+        let unexpected: Vec<String> = actual
+            .iter()
+            .filter(|s| !allow.contains(s.as_str()))
+            .cloned()
+            .collect();
+        let stale: Vec<String> = allow
+            .iter()
+            .filter(|s| !actual.contains(**s))
+            .map(|s| s.to_string())
+            .collect();
         (unexpected, stale)
     }
 
@@ -419,10 +433,15 @@ mod tests {
     /// passing — the whole-surface false-negative.
     #[test]
     fn scanner_catches_glob_import() {
-        let cleaned = strip_cfg_test(strip_comments_and_strings("use crate::analyses::borrow::*;"));
+        let cleaned = strip_cfg_test(strip_comments_and_strings(
+            "use crate::analyses::borrow::*;",
+        ));
         let mut set = BTreeSet::new();
         extract("borrow", &cleaned, &mut set);
-        assert!(set.contains("*"), "glob `borrow::*` must be recorded, not silently missed; got {set:?}");
+        assert!(
+            set.contains("*"),
+            "glob `borrow::*` must be recorded, not silently missed; got {set:?}"
+        );
     }
 
     /// A `'{'` char literal inside a `#[cfg(test)]` block must not make `strip_cfg_test` over-consume
@@ -435,8 +454,14 @@ mod tests {
         let cleaned = strip_cfg_test(strip_comments_and_strings(src));
         let mut set = BTreeSet::new();
         extract("borrow", &cleaned, &mut set);
-        assert!(set.contains("REAL_DEP"), "real ref after the block must survive; got {set:?}");
-        assert!(!set.contains("TEST_ONLY"), "test-only ref inside the block must be stripped; got {set:?}");
+        assert!(
+            set.contains("REAL_DEP"),
+            "real ref after the block must survive; got {set:?}"
+        );
+        assert!(
+            !set.contains("TEST_ONLY"),
+            "test-only ref inside the block must be stripped; got {set:?}"
+        );
     }
 
     /// A comma-terminated `#[cfg(test)]` FIELD (the `call_graph.rs:109` shape) must be stripped at its
@@ -449,39 +474,55 @@ mod tests {
         let cleaned = strip_cfg_test(strip_comments_and_strings(src));
         let mut set = BTreeSet::new();
         extract("borrow", &cleaned, &mut set);
-        assert!(set.contains("REAL_DEP"), "real ref after a cfg-gated field must survive; got {set:?}");
+        assert!(
+            set.contains("REAL_DEP"),
+            "real ref after a cfg-gated field must survive; got {set:?}"
+        );
     }
 
     /// A spaced path separator `borrow :: X` (or `borrow:: X`) must not evade the scanner — a
     /// hand-written space around `::` would otherwise hide a real dependency.
     #[test]
     fn scanner_handles_spaced_path_separator() {
-        let cleaned = strip_cfg_test(strip_comments_and_strings("fn f() { let _ = borrow :: SpacedDep; }"));
+        let cleaned = strip_cfg_test(strip_comments_and_strings(
+            "fn f() { let _ = borrow :: SpacedDep; }",
+        ));
         let mut set = BTreeSet::new();
         extract("borrow", &cleaned, &mut set);
-        assert!(set.contains("SpacedDep"), "space around `::` must not evade the scanner; got {set:?}");
+        assert!(
+            set.contains("SpacedDep"),
+            "space around `::` must not evade the scanner; got {set:?}"
+        );
     }
 
     /// A grouped glob `borrow::{self, *}` must record `*` — not silently capture only the sibling
     /// `self` (Codex re-review). The `*` imports the whole surface.
     #[test]
     fn scanner_catches_grouped_glob() {
-        let cleaned =
-            strip_cfg_test(strip_comments_and_strings("use crate::analyses::borrow::{self, *};"));
+        let cleaned = strip_cfg_test(strip_comments_and_strings(
+            "use crate::analyses::borrow::{self, *};",
+        ));
         let mut set = BTreeSet::new();
         extract("borrow", &cleaned, &mut set);
-        assert!(set.contains("*"), "grouped glob `borrow::{{self, *}}` must record `*`; got {set:?}");
+        assert!(
+            set.contains("*"),
+            "grouped glob `borrow::{{self, *}}` must record `*`; got {set:?}"
+        );
     }
 
     /// A module alias `use borrow as prod;` imports the whole surface under a new name — record `*`
     /// (the alias would otherwise hide every `prod::X` use from segment tracking) (Codex re-review).
     #[test]
     fn scanner_catches_module_alias() {
-        let cleaned =
-            strip_cfg_test(strip_comments_and_strings("use crate::analyses::borrow as prod;"));
+        let cleaned = strip_cfg_test(strip_comments_and_strings(
+            "use crate::analyses::borrow as prod;",
+        ));
         let mut set = BTreeSet::new();
         extract("borrow", &cleaned, &mut set);
-        assert!(set.contains("*"), "module alias `borrow as prod` must record `*`; got {set:?}");
+        assert!(
+            set.contains("*"),
+            "module alias `borrow as prod` must record `*`; got {set:?}"
+        );
     }
 
     /// A raw string with an interior `"` must not desync the scanner and blank the following code —
@@ -492,15 +533,19 @@ mod tests {
         let cleaned = strip_cfg_test(strip_comments_and_strings(src));
         let mut set = BTreeSet::new();
         extract("borrow", &cleaned, &mut set);
-        assert!(set.contains("REAL_DEP"), "dep after a raw string must survive scanning; got {set:?}");
+        assert!(
+            set.contains("REAL_DEP"),
+            "dep after a raw string must survive scanning; got {set:?}"
+        );
     }
 
     /// A self-aliased group `borrow::{self as prod}` aliases the WHOLE module — must record `*`, not
     /// just capture the sibling `self` (Codex 3rd review).
     #[test]
     fn scanner_catches_grouped_self_alias() {
-        let cleaned =
-            strip_cfg_test(strip_comments_and_strings("use crate::analyses::borrow::{self as prod};"));
+        let cleaned = strip_cfg_test(strip_comments_and_strings(
+            "use crate::analyses::borrow::{self as prod};",
+        ));
         let mut set = BTreeSet::new();
         extract("borrow", &cleaned, &mut set);
         assert!(
@@ -513,10 +558,14 @@ mod tests {
     /// cfg token cannot make strip_cfg_test remove a real dependency after it (Codex 3rd review).
     #[test]
     fn scanner_nested_block_comment() {
-        let src = "/* outer /* inner */ #[cfg(test)] */ type H = crate::analyses::borrow::REAL_DEP;";
+        let src =
+            "/* outer /* inner */ #[cfg(test)] */ type H = crate::analyses::borrow::REAL_DEP;";
         let cleaned = strip_cfg_test(strip_comments_and_strings(src));
         let mut set = BTreeSet::new();
         extract("borrow", &cleaned, &mut set);
-        assert!(set.contains("REAL_DEP"), "dep after a nested block comment must survive; got {set:?}");
+        assert!(
+            set.contains("REAL_DEP"),
+            "dep after a nested block comment must survive; got {set:?}"
+        );
     }
 }

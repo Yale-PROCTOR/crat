@@ -94,16 +94,20 @@ impl<'tcx> Visitor<'tcx> for SafeMonoWalker<'_, 'tcx> {
         // Tracked as S2-5 in the stage-2 backlog; C2 gates on it.
         let emits = matches!(
             context,
-            PlaceContext::NonMutatingUse(_)
-                | PlaceContext::MutatingUse(MutatingUseContext::Borrow)
+            PlaceContext::NonMutatingUse(_) | PlaceContext::MutatingUse(MutatingUseContext::Borrow)
         );
         if !emits {
             return;
         }
         let mut layers = Vec::new();
-        let Some(target) =
-            resolve_place(self.slots, self.fn_did, self.body, *place, 0, Some(&mut layers))
-        else {
+        let Some(target) = resolve_place(
+            self.slots,
+            self.fn_did,
+            self.body,
+            *place,
+            0,
+            Some(&mut layers),
+        ) else {
             return;
         };
         let target = to_slot_ref(target, self.fn_did);

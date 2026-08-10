@@ -223,10 +223,7 @@ pub(crate) struct Diag {
 /// in the same file is novel rather than masked: the gate must judge the
 /// rewrite's delta without going blind to rewrite-introduced violations of
 /// exactly the class it is masking (reference casting).
-pub(crate) fn baseline_key(
-    diag: &Diag,
-    crate_root: &Path,
-) -> (String, String, String) {
+pub(crate) fn baseline_key(diag: &Diag, crate_root: &Path) -> (String, String, String) {
     (
         crate_relative(&diag.file, crate_root),
         diag.code.clone().unwrap_or_default(),
@@ -274,7 +271,9 @@ pub(crate) fn baseline_of(root: &Path) -> Baseline {
         if diag.message.contains(&root_text) {
             messages_embedding_root += 1;
         }
-        *keys.entry(baseline_key(diag, &crate_root)).or_insert(0usize) += 1;
+        *keys
+            .entry(baseline_key(diag, &crate_root))
+            .or_insert(0usize) += 1;
     }
     Baseline {
         keys,

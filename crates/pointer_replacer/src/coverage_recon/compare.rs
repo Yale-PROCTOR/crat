@@ -315,9 +315,10 @@ pub(crate) fn compare(a_rows: &[Row], b_rows: &[Row]) -> Verdict {
             pairs.sort_by_key(|(a, _)| a.mir_local);
             let mut prev_ty_hi: u32 = 0;
             for (index, (a, b)) in pairs.iter().enumerate() {
-                let evaluable = a.decl_span_lo.zip(a.decl_span_hi).zip(
-                    b.binding_span_lo.zip(b.binding_span_hi),
-                );
+                let evaluable = a
+                    .decl_span_lo
+                    .zip(a.decl_span_hi)
+                    .zip(b.binding_span_lo.zip(b.binding_span_hi));
                 match evaluable {
                     Some(((ty_lo, ty_hi), (b_lo, b_hi)))
                         if a.pairing_confidence == PairingConfidence::High
@@ -359,9 +360,12 @@ pub(crate) fn compare(a_rows: &[Row], b_rows: &[Row]) -> Verdict {
                                 "index {index}: span axis active but this row lacks a \
                                  usable extent pair (A={:?}..{:?}, B={:?}..{:?}, \
                                  confidence A={:?} B={:?})",
-                                a.decl_span_lo, a.decl_span_hi,
-                                b.binding_span_lo, b.binding_span_hi,
-                                a.pairing_confidence, b.pairing_confidence
+                                a.decl_span_lo,
+                                a.decl_span_hi,
+                                b.binding_span_lo,
+                                b.binding_span_hi,
+                                a.pairing_confidence,
+                                b.pairing_confidence
                             ),
                         });
                         *verdict.aggregates.entry(class).or_default() += 1;

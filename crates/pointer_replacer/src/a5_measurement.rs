@@ -1200,14 +1200,10 @@ fn load_preserved_bases(directory: &Path) -> Result<BTreeMap<String, CompletedBa
         .iter()
         .filter(|program| program.name != "brotli")
         .map(|program| {
-            let stdout = fs::read_to_string(
-                directory.join(format!("{}.a5-p1.out", program.name)),
-            )
-            .map_err(|why| format!("{}: read preserved stdout: {why}", program.name))?;
-            let stderr = fs::read_to_string(
-                directory.join(format!("{}.a5-p1.err", program.name)),
-            )
-            .map_err(|why| format!("{}: read preserved stderr: {why}", program.name))?;
+            let stdout = fs::read_to_string(directory.join(format!("{}.a5-p1.out", program.name)))
+                .map_err(|why| format!("{}: read preserved stdout: {why}", program.name))?;
+            let stderr = fs::read_to_string(directory.join(format!("{}.a5-p1.err", program.name)))
+                .map_err(|why| format!("{}: read preserved stderr: {why}", program.name))?;
             parse_completed_base(program.name, &stdout, &stderr)
                 .map(|row| (program.name.to_owned(), row))
         })
@@ -1500,14 +1496,12 @@ fn a5_p1_corpus() {
         }
         assert!(rows.is_empty());
         let recovery_logs = out.join("logs");
-        let recovery_stdout = fs::read_to_string(
-            recovery_logs.join("brotli.a5-p1-depth-recovery.out"),
-        )
-        .expect("read brotli depth recovery stdout");
-        let recovery_stderr = fs::read_to_string(
-            recovery_logs.join("brotli.a5-p1-depth-recovery.err"),
-        )
-        .expect("read brotli depth recovery stderr");
+        let recovery_stdout =
+            fs::read_to_string(recovery_logs.join("brotli.a5-p1-depth-recovery.out"))
+                .expect("read brotli depth recovery stdout");
+        let recovery_stderr =
+            fs::read_to_string(recovery_logs.join("brotli.a5-p1-depth-recovery.err"))
+                .expect("read brotli depth recovery stderr");
         match parse_completed_base("brotli", &recovery_stdout, &recovery_stderr)
             .expect("complete brotli depth recovery row")
         {
@@ -1767,33 +1761,29 @@ fn a5_p1_corpus() {
             peak_rss_kb as f64 / 1024.0,
         ));
     }
-    if let (Some(peak_rss_kb), Some(wall_s)) =
-        (brotli_depth_peak_rss_kb, brotli_depth_wall_s)
-    {
+    if let (Some(peak_rss_kb), Some(wall_s)) = (brotli_depth_peak_rss_kb, brotli_depth_wall_s) {
         markdown.push_str(&format!(
             "Targeted-depth note: the separate one-shot 24,576-MiB brotli export peaked at {:.3} MiB RSS (200 ms sampling) and took {:.3} s wall.\n",
             peak_rss_kb as f64 / 1024.0,
             wall_s,
         ));
     }
-    let preserved_base_dir = std::env::var("CRAT_A5_PRESERVED_BASE_DIR")
-        .unwrap_or_else(|_| "none".to_owned());
-    let preserved_base_hash_manifest_sha256 = std::env::var(
-        "CRAT_A5_PRESERVED_HASH_MANIFEST_SHA256",
-    )
-    .unwrap_or_else(|_| "none".to_owned());
+    let preserved_base_dir =
+        std::env::var("CRAT_A5_PRESERVED_BASE_DIR").unwrap_or_else(|_| "none".to_owned());
+    let preserved_base_hash_manifest_sha256 =
+        std::env::var("CRAT_A5_PRESERVED_HASH_MANIFEST_SHA256")
+            .unwrap_or_else(|_| "none".to_owned());
     if preserved_base_dir != "none" {
         assert_ne!(
             preserved_base_hash_manifest_sha256, "none",
             "resumed P1 requires the externally re-verified hash-manifest digest"
         );
     }
-    let preserved_final_dir = std::env::var("CRAT_A5_PRESERVED_FINAL_DIR")
-        .unwrap_or_else(|_| "none".to_owned());
-    let preserved_final_hash_manifest_sha256 = std::env::var(
-        "CRAT_A5_PRESERVED_FINAL_HASH_MANIFEST_SHA256",
-    )
-    .unwrap_or_else(|_| "none".to_owned());
+    let preserved_final_dir =
+        std::env::var("CRAT_A5_PRESERVED_FINAL_DIR").unwrap_or_else(|_| "none".to_owned());
+    let preserved_final_hash_manifest_sha256 =
+        std::env::var("CRAT_A5_PRESERVED_FINAL_HASH_MANIFEST_SHA256")
+            .unwrap_or_else(|_| "none".to_owned());
     if preserved_final_dir != "none" {
         assert_ne!(
             preserved_final_hash_manifest_sha256, "none",

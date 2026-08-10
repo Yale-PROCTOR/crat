@@ -137,7 +137,10 @@ fn an_injected_row_drop_fails_the_worker_process() {
         "the worker exited GREEN on a failed reconciliation — the verdict is \
          report-only:\n{log}"
     );
-    assert!(log.contains("recon=FAIL"), "no FAIL verdict recorded:\n{log}");
+    assert!(
+        log.contains("recon=FAIL"),
+        "no FAIL verdict recorded:\n{log}"
+    );
 }
 
 /// **(ii-a) A syntactically corrupt ARTIFACT fails through the DECODE path.**
@@ -263,7 +266,8 @@ fn the_clean_worker_path_still_succeeds() {
 #[test]
 #[ignore = "runs the full BO pipeline twice"]
 fn a_live_span_swap_is_caught_end_to_end() {
-    let src = "#![allow(dead_code)]\npub unsafe fn f(p: *mut i32, q: *const u8) -> i32 { *p as i32 }\n";
+    let src =
+        "#![allow(dead_code)]\npub unsafe fn f(p: *mut i32, q: *const u8) -> i32 { *p as i32 }\n";
     let (verdict, active) = ::utils::compilation::run_compiler_on_str(src, |tcx| {
         let a = crate::bo_rewriter::artifact_rows_span_swapped(tcx).expect("producer A");
         let b = producer_b::rows(tcx);
@@ -276,7 +280,10 @@ fn a_live_span_swap_is_caught_end_to_end() {
     })
     .expect("fixture compiles");
 
-    assert!(active, "the span axis must be ACTIVE for this witness to mean anything");
+    assert!(
+        active,
+        "the span axis must be ACTIVE for this witness to mean anything"
+    );
     assert!(
         verdict
             .violations
@@ -298,7 +305,8 @@ fn a_live_span_swap_is_caught_end_to_end() {
 /// bounded by the round itself rather than by anyone remembering.
 #[test]
 fn span_axis_is_active_on_producer_b() {
-    let src = "#![allow(dead_code)]\npub unsafe fn f(p: *mut i32, q: *const u8) -> i32 { *p as i32 }\n";
+    let src =
+        "#![allow(dead_code)]\npub unsafe fn f(p: *mut i32, q: *const u8) -> i32 { *p as i32 }\n";
     let rows = ::utils::compilation::run_compiler_on_str(src, |tcx| producer_b::rows(tcx))
         .expect("fixture compiles");
     assert!(

@@ -17,8 +17,7 @@ use crate::{
         },
         coherence::add_coherence,
         crate_slots::CrateSlots,
-        emit_crate_ownership_constraints,
-        l2,
+        emit_crate_ownership_constraints, l2,
         origin_flow::analyze_program_origin_flow,
         origins::compute_origins,
         solver::{KindSolver, SlotRef},
@@ -460,7 +459,10 @@ fn loan_kind_matches_ground_truth_provider() {
         );
         checked += 1;
     }
-    assert!(checked > 0, "no loan was actually checked against ground truth");
+    assert!(
+        checked > 0,
+        "no loan was actually checked against ground truth"
+    );
 }
 
 /// The same fixture with NOTHING declared immutable must derive no `Shared`
@@ -619,9 +621,7 @@ fn declining_run_records_no_certificate() {
                 .fn_local_slots
                 .iter()
                 .find(|(_, universe)| universe.len() > 0)
-                .map(|(did, _)| {
-                    SlotRef::Local(*did, super::super::slots::SlotId::from_usize(0))
-                })
+                .map(|(did, _)| SlotRef::Local(*did, super::super::slots::SlotId::from_usize(0)))
                 .expect("fixture has at least one local slot");
             solver.assume(victim, super::SlotKindAlias::Ref);
             solver.add_borrow_exclusion(Some(victim), &[]);
@@ -676,7 +676,11 @@ fn selector_provenance_index_aligned() {
     // Sources and sinks are recorded into separate vectors in push order, so
     // their indices are the `Selectors::sources()` / `sinks()` indices.
     for (i, s) in export.source_sites.iter().enumerate() {
-        assert_eq!(s.role, BoundaryRole::Source, "source vector index {i} misfiled");
+        assert_eq!(
+            s.role,
+            BoundaryRole::Source,
+            "source vector index {i} misfiled"
+        );
     }
     for (i, s) in export.sink_sites.iter().enumerate() {
         assert_eq!(s.role, BoundaryRole::Sink, "sink vector index {i} misfiled");
@@ -727,8 +731,11 @@ unsafe fn f() -> i32 {
     // At least one local in the transfer fixture must have a candidate site.
     // `LocalDefId` is not `Ord`, so dedupe via the hash set the crate already
     // uses rather than a BTreeSet.
-    let pairs: rustc_hash::FxHashSet<_> =
-        export.version_sites.iter().map(|s| (s.fn_did, s.local)).collect();
+    let pairs: rustc_hash::FxHashSet<_> = export
+        .version_sites
+        .iter()
+        .map(|s| (s.fn_did, s.local))
+        .collect();
     let any = pairs
         .into_iter()
         .any(|(f, l)| !export.move_point_candidates(f, l).is_empty());
@@ -1003,9 +1010,7 @@ fn loan_keys_are_stable_across_reinference() {
     // Non-vacuity: sibling loans exist (>1 loan sharing one (fn, location)).
     let mut per_site: rustc_hash::FxHashMap<_, usize> = Default::default();
     for l in &first.loans {
-        *per_site
-            .entry((l.key.fn_did, l.key.location))
-            .or_default() += 1;
+        *per_site.entry((l.key.fn_did, l.key.location)).or_default() += 1;
     }
     // NOTE (accepted limitation): >1 loan at one site is a PROXY for a
     // multi-member `group()`, and it is not exact — a call with two pointer
@@ -1020,7 +1025,8 @@ fn loan_keys_are_stable_across_reinference() {
     );
 
     let keys_a: std::collections::BTreeSet<_> = first.loans.iter().map(|l| l.key.clone()).collect();
-    let keys_b: std::collections::BTreeSet<_> = second.loans.iter().map(|l| l.key.clone()).collect();
+    let keys_b: std::collections::BTreeSet<_> =
+        second.loans.iter().map(|l| l.key.clone()).collect();
     assert_eq!(
         keys_a, keys_b,
         "D19: loan CONTENT keys differed between two analyses of the same \
@@ -1227,8 +1233,10 @@ fn probes_outside_the_armed_region_record_nothing() {
         // fires by design (witnessed by
         // `oracle_probe_inside_the_armed_region_trips_the_wire`).
         let oracle_probe = |model: &FxHashMap<SlotRef, super::SlotKindAlias>| {
-            let counterfactual: FxHashMap<SlotRef, super::SlotKindAlias> =
-                model.keys().map(|k| (*k, super::SlotKindAlias::Ref)).collect();
+            let counterfactual: FxHashMap<SlotRef, super::SlotKindAlias> = model
+                .keys()
+                .map(|k| (*k, super::SlotKindAlias::Ref))
+                .collect();
             let _ = model_accepts(&program, &slots, &counterfactual, true);
         };
 
@@ -1238,7 +1246,10 @@ fn probes_outside_the_armed_region_record_nothing() {
         let narrow = arm.finish();
         barrage();
         oracle_probe(&model);
-        assert!(!narrow.loans.is_empty(), "accepted run recorded nothing — inert");
+        assert!(
+            !narrow.loans.is_empty(),
+            "accepted run recorded nothing — inert"
+        );
         // F3 pattern: the L2 accept never calls `record_residuals` (the
         // documented D2-adjacent gap), so `None` there is CORRECT. Asserting
         // it explicitly turns that env-sensitivity into a tested property of
@@ -1277,8 +1288,6 @@ fn probes_outside_the_armed_region_record_nothing() {
     })
     .unwrap_or_else(|e| e.raise())
 }
-
-
 
 /// **ALLOW-LIST TRIPWIRE** — an oracle probe inside the armed region fails loud.
 ///
@@ -1362,7 +1371,10 @@ fn ambient_arm_is_inert_when_the_flag_is_off() {
             add_coherence(&solver, &slots, g, &body);
         }
         let model = verify_to_fixpoint(&program, &slots, &solver, &selectors, true);
-        assert!(model.is_some(), "fixture must be accepted — else witness inert");
+        assert!(
+            model.is_some(),
+            "fixture must be accepted — else witness inert"
+        );
         assert!(
             !capturing(),
             "flag off, yet capture is active — the ambient arm is not gated"

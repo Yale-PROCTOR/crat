@@ -174,10 +174,10 @@ mod tests {
     fn length_changing_edits_do_not_shift_later_offsets() {
         let src = "aXbYc";
         let edits = vec![
-                edit(1, 2, "LONGER"),
-                // Addresses the ORIGINAL offsets of "Y".
-                edit(3, 4, "Z"),
-            ];
+            edit(1, 2, "LONGER"),
+            // Addresses the ORIGINAL offsets of "Y".
+            edit(3, 4, "Z"),
+        ];
         let applied = apply(src, &edits);
         assert!(applied.rollbacks.is_empty());
         assert_eq!(applied.source, "aLONGERbZc");

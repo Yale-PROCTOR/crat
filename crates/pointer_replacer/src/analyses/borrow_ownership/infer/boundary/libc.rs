@@ -4,12 +4,12 @@ use rustc_hir::def_id::DefId;
 use rustc_span::symbol::Ident;
 
 use crate::analyses::borrow_ownership::{
+    AnalysisKind,
     infer::{CallArgs, InferCtxt},
     ssa::{
-        constraint::{infer::InferMode, Var},
+        constraint::{Var, infer::InferMode},
         consume::Consume,
     },
-    AnalysisKind,
 };
 
 impl<'infercx, 'db, 'tcx, Analysis> InferCtxt<'infercx, 'db, 'tcx, Analysis>

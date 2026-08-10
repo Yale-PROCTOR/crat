@@ -3111,15 +3111,9 @@ fn s23_p2_completion_shard() {
         .collect::<Vec<_>>()
         .join(",");
     for (predecessor, predecessor_keys) in &programs[..program_index] {
-        let predecessor_dir = contract
-            .batches
-            .join("completion-shards")
-            .join(predecessor);
+        let predecessor_dir = contract.batches.join("completion-shards").join(predecessor);
         let predecessor_manifest = predecessor_dir.join("artifact-manifest.sha256");
-        let stop_candidate = keys
-            .first()
-            .map(String::as_str)
-            .unwrap_or("<empty-shard>");
+        let stop_candidate = keys.first().map(String::as_str).unwrap_or("<empty-shard>");
         verify_sha256_manifest(&predecessor_dir, &predecessor_manifest).unwrap_or_else(|error| {
             panic!(
                 "P2 completion STOP: program={program} status=sequence-violation phase=predecessor-manifest candidate={stop_candidate} detail={predecessor}:{error}"
@@ -3199,7 +3193,7 @@ fn s23_p2_completion_shard() {
         if receipt.get("data").map(String::as_str) != Some("true") {
             panic!(
                 "P2 completion STOP: program={} status={} phase={} candidate={}; manifested data=false shard is provenance-only",
-            program,
+                program,
                 receipt
                     .get("status")
                     .map(String::as_str)
@@ -3319,10 +3313,10 @@ fn s23_p2_completion_shard() {
                 && checkpoint_rows.len() == progress.completed + 1))
     {
         failure_phase = Some("checkpoint-progress".to_owned());
-        failure_candidate = progress.candidate.clone().or_else(|| {
-            keys.get(checkpoint_rows.len().min(keys.len() - 1))
-                .cloned()
-        });
+        failure_candidate = progress
+            .candidate
+            .clone()
+            .or_else(|| keys.get(checkpoint_rows.len().min(keys.len() - 1)).cloned());
         validation_error = Some(format!(
             "identity mismatch for {program}: partial checkpoint rows={} disagree with phase={} completed={}",
             checkpoint_rows.len(),
@@ -4080,9 +4074,9 @@ fn s23_p2_checkpoint_aggregate() {
     );
     for corpus_program in super::CORPUS {
         let rows = final_records
-        .iter()
+            .iter()
             .filter(|record| record.candidate.program == corpus_program.name)
-        .collect::<Vec<_>>();
+            .collect::<Vec<_>>();
         let count_discovery = |class| {
             rows.iter()
                 .filter(|record| record.candidate.discovery == class)
@@ -4206,7 +4200,7 @@ fn s23_p2_checkpoint_aggregate() {
             .unwrap_or(0),
         own_assume,
         link_own,
-        );
+    );
 }
 
 /// Form a new full-population aggregate from the immutable accepted 200-row
@@ -4241,11 +4235,11 @@ fn s23_p2_completion_aggregate() {
     let predecessor_manifest = predecessor.join("artifact-manifest.sha256");
     verify_sha256_manifest(&predecessor, &predecessor_manifest)
         .unwrap_or_else(|error| panic!("P2 completion STOP: predecessor manifest: {error}"));
-            assert_eq!(
+    assert_eq!(
         sha256_file(&predecessor_manifest).expect("hash predecessor manifest"),
         P2_ACCEPTED_AGGREGATE_MANIFEST_SHA256,
         "P2 completion STOP: immutable accepted-200 aggregate identity mismatch"
-            );
+    );
     let predecessor_provenance = parse_receipt(&predecessor.join("provenance.txt"))
         .unwrap_or_else(|error| panic!("P2 completion STOP: predecessor provenance: {error}"));
     for (field, expected) in [
@@ -4255,11 +4249,11 @@ fn s23_p2_completion_aggregate() {
         ("query_budget", "200"),
         ("queried", "200"),
     ] {
-            assert_eq!(
+        assert_eq!(
             predecessor_provenance.get(field).map(String::as_str),
             Some(expected),
             "P2 completion STOP: predecessor {field} identity mismatch"
-            );
+        );
     }
 
     let aggregate = contract.batches.join("aggregate-261");
@@ -4293,14 +4287,14 @@ fn s23_p2_completion_aggregate() {
         println!(
             "S23P2FULLAGG machine_id={} platform={} status=verified-skip queried=261",
             contract.identity.machine_id, contract.identity.platform
-            );
+        );
         return;
-        }
+    }
     assert!(
         !aggregate.exists(),
         "P2 completion STOP: unmanifested partial aggregate exists at {}",
         aggregate.display()
-        );
+    );
 
     let mut probes = BTreeMap::<(String, String), ProbeRecord>::new();
     for (program, row) in
@@ -4331,21 +4325,21 @@ fn s23_p2_completion_aggregate() {
         probes.keys().cloned().collect::<BTreeSet<_>>(),
         selected,
         "P2 completion STOP: predecessor is not the exact accepted 200"
-        );
+    );
     let predecessor_hard_unsat = probes
         .values()
         .filter(|row| row.force_result == ForceResult::Unsat)
         .collect::<Vec<_>>();
     assert_eq!(predecessor_hard_unsat.len(), 197);
-        assert_eq!(
+    assert_eq!(
         probes
             .values()
             .filter(|row| row.force_result == ForceResult::Sat)
             .count(),
         3
-        );
+    );
     for family in ["own-assume", "link-own"] {
-            assert_eq!(
+        assert_eq!(
             predecessor_hard_unsat
                 .iter()
                 .filter(|row| row
@@ -4355,8 +4349,8 @@ fn s23_p2_completion_aggregate() {
                 .count(),
             197,
             "P2 completion STOP: predecessor {family} incidence drifted"
-            );
-        }
+        );
+    }
 
     let mut completion_identities = Vec::new();
     let mut shard_stats = Vec::new();
@@ -4384,12 +4378,12 @@ fn s23_p2_completion_aggregate() {
                 P2_ACCEPTED_AGGREGATE_MANIFEST_SHA256,
             ),
         ] {
-                assert_eq!(
+            assert_eq!(
                 receipt.get(field).map(String::as_str),
                 Some(expected),
                 "P2 completion STOP: phase=aggregate-shard-identity candidate={program}::<shard> field={field}"
-                );
-            }
+            );
+        }
         let rows = parse_probe_for_program(&shard_dir.join("probes.tsv"), Some(program))
             .unwrap_or_else(|error| {
                 panic!(
@@ -4525,7 +4519,7 @@ fn s23_p2_completion_aggregate() {
         .filter(|record| {
             record
                 .core_families
-        .iter()
+                .iter()
                 .any(|family| family == "link-own")
         })
         .count();
@@ -4533,7 +4527,7 @@ fn s23_p2_completion_aggregate() {
     let link_own_missing = hard_unsat.len() - link_own;
     let accepted = |kind| {
         final_records
-        .iter()
+            .iter()
             .filter(|record| record.accepted_kind == Some(kind))
             .count()
     };
@@ -5218,12 +5212,7 @@ mod tests {
         let mut unknown_rows = rows;
         unknown_rows[0].force_result = ForceResult::Unknown;
         assert_eq!(
-            completion_row_failure_candidate(
-                "fixture",
-                &expected,
-                &unknown_rows,
-                &candidate_slots,
-            ),
+            completion_row_failure_candidate("fixture", &expected, &unknown_rows, &candidate_slots,),
             expected[0]
         );
         assert!(

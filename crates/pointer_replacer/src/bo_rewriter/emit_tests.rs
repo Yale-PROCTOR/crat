@@ -46,7 +46,11 @@ impl Fixture {
     /// Compared in-process rather than shelling out — a byte comparison here is
     /// the evidence, not a tool's summary of one.
     fn snapshot(&self) -> BTreeMap<PathBuf, Vec<u8>> {
-        fn walk(dir: &std::path::Path, base: &std::path::Path, out: &mut BTreeMap<PathBuf, Vec<u8>>) {
+        fn walk(
+            dir: &std::path::Path,
+            base: &std::path::Path,
+            out: &mut BTreeMap<PathBuf, Vec<u8>>,
+        ) {
             for entry in fs::read_dir(dir).expect("fixture tree readable") {
                 let entry = entry.expect("fixture entry");
                 let path = entry.path();
@@ -88,8 +92,7 @@ fn text_for<'a>(emission: &'a Emission, name: &str) -> Option<&'a String> {
 }
 
 const ROOT_WITH_MODULE: &str = "#![allow(dead_code, unused_unsafe)]\npub mod m;\n";
-const MODULE_SUBJECT: &str =
-    "pub unsafe fn bump(p: *mut i32) -> i32 {\n    *p += 1;\n    *p\n}\n";
+const MODULE_SUBJECT: &str = "pub unsafe fn bump(p: *mut i32) -> i32 {\n    *p += 1;\n    *p\n}\n";
 
 /// **RED (i).** A crate root plus a module, with the subject in the *module*:
 /// the module's text is rewritten and the root — which has no subject — is not
@@ -117,7 +120,11 @@ fn a_subject_in_a_module_is_emitted_into_that_module() {
         emission.files.keys().collect::<Vec<_>>()
     );
     assert!(emission.rollbacks.is_empty(), "{:?}", emission.rollbacks);
-    assert!(emission.unplaceable.is_empty(), "{:?}", emission.unplaceable);
+    assert!(
+        emission.unplaceable.is_empty(),
+        "{:?}",
+        emission.unplaceable
+    );
 }
 
 /// **RED (ii) — the file-collapse witness.** Subjects in BOTH files, with
@@ -254,8 +261,9 @@ fn a_broken_rewrite_fails_the_temp_copy_gate() {
     let fixture = Fixture::new(&[("lib.rs", ROOT_WITH_MODULE), ("m.rs", MODULE_SUBJECT)]);
     let mut emission = emit(&fixture);
     for text in emission.files.values_mut() {
-        *text = "pub unsafe fn bump(p: &mut i32) -> i32 {\n    let _x: u8 = \"not a u8\";\n    *p\n}\n"
-            .to_owned();
+        *text =
+            "pub unsafe fn bump(p: &mut i32) -> i32 {\n    let _x: u8 = \"not a u8\";\n    *p\n}\n"
+                .to_owned();
     }
     let temp = verify::materialize(&fixture.root(), &emission.files).expect("materialize");
 
@@ -324,8 +332,8 @@ fn tree_snapshot(dir: &std::path::Path) -> BTreeMap<PathBuf, Vec<u8>> {
 #[test]
 #[ignore = "S2b.0a.4 corpus smoke: reads the frozen rs-crown tree"]
 fn rgba_smoke_emits_and_verifies_from_a_temp_copy() {
-    let crate_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../benchmarks/rs-crown/rgba");
+    let crate_dir =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../benchmarks/rs-crown/rgba");
     let root = crate_dir.join("lib.rs");
     assert!(root.is_file(), "frozen corpus input missing: {root:?}");
 
@@ -375,7 +383,11 @@ fn rgba_smoke_emits_and_verifies_from_a_temp_copy() {
                 files.len()
             );
         }
-        super::RewriteOutcome::Degraded { reason, degradations, .. } => {
+        super::RewriteOutcome::Degraded {
+            reason,
+            degradations,
+            ..
+        } => {
             panic!(
                 "rgba did not emit: {reason} ({} degradation(s))",
                 degradations.len()
@@ -401,8 +413,14 @@ fn rgba_smoke_emits_and_verifies_from_a_temp_copy() {
 #[test]
 fn a_bad_rewrite_is_reverted_and_the_good_one_survives() {
     let fixture = Fixture::new(&[
-        ("lib.rs", "#![allow(dead_code, unused_unsafe)]\npub mod good;\npub mod bad;\n"),
-        ("good.rs", "pub unsafe fn bump(p: *mut i32) -> i32 {\n    *p += 1;\n    *p\n}\n"),
+        (
+            "lib.rs",
+            "#![allow(dead_code, unused_unsafe)]\npub mod good;\npub mod bad;\n",
+        ),
+        (
+            "good.rs",
+            "pub unsafe fn bump(p: *mut i32) -> i32 {\n    *p += 1;\n    *p\n}\n",
+        ),
         ("bad.rs", BREAKS_ON_REWRITE),
     ]);
 
@@ -415,9 +433,7 @@ fn a_bad_rewrite_is_reverted_and_the_good_one_survives() {
         } => {
             let reverted: Vec<_> = degradations
                 .iter()
-                .filter(|d| {
-                    d.reason == super::decision::DegradeReason::RevertedAfterVerifyFailure
-                })
+                .filter(|d| d.reason == super::decision::DegradeReason::RevertedAfterVerifyFailure)
                 .collect();
             assert!(
                 !reverted.is_empty(),
@@ -438,7 +454,9 @@ fn a_bad_rewrite_is_reverted_and_the_good_one_survives() {
                 good.contains("p: &mut i32"),
                 "the good rewrite did not survive: {good}"
             );
-            let bad = files.iter().find(|(k, _)| format!("{k:?}").contains("bad.rs"));
+            let bad = files
+                .iter()
+                .find(|(k, _)| format!("{k:?}").contains("bad.rs"));
             assert!(
                 bad.is_none_or(|(_, text)| !text.contains("value: &")),
                 "the bad rewrite survived the revert: {bad:?}"
@@ -460,8 +478,14 @@ fn a_bad_rewrite_is_reverted_and_the_good_one_survives() {
 #[test]
 fn the_accounting_identity_survives_a_revert() {
     let fixture = Fixture::new(&[
-        ("lib.rs", "#![allow(dead_code, unused_unsafe)]\npub mod good;\npub mod bad;\n"),
-        ("good.rs", "pub unsafe fn bump(p: *mut i32) -> i32 {\n    *p += 1;\n    *p\n}\n"),
+        (
+            "lib.rs",
+            "#![allow(dead_code, unused_unsafe)]\npub mod good;\npub mod bad;\n",
+        ),
+        (
+            "good.rs",
+            "pub unsafe fn bump(p: *mut i32) -> i32 {\n    *p += 1;\n    *p\n}\n",
+        ),
         ("bad.rs", BREAKS_ON_REWRITE),
     ]);
     // Subject count from a NO-LOOP emission: what the decision phase decided,
@@ -484,9 +508,7 @@ fn the_accounting_identity_survives_a_revert() {
         } => {
             let reverted = degradations
                 .iter()
-                .filter(|d| {
-                    d.reason == super::decision::DegradeReason::RevertedAfterVerifyFailure
-                })
+                .filter(|d| d.reason == super::decision::DegradeReason::RevertedAfterVerifyFailure)
                 .count();
             assert_eq!(
                 emitted_count + reverted,
@@ -498,7 +520,6 @@ fn the_accounting_identity_survives_a_revert() {
         super::RewriteOutcome::Degraded { reason, .. } => panic!("{reason}"),
     }
 }
-
 
 // ---------------------------------------------------------------------------
 // S2b.1.1 witnesses — structural diagnostic capture. FIXTURE-VALIDATED; the
@@ -525,11 +546,18 @@ fn diagnose_after_rewrite(files: &[(&str, &str)]) -> (verify::Diagnosis, Fixture
 #[test]
 fn structural_capture_locates_a_type_error() {
     let (d, _fixture) = diagnose_after_rewrite(&[
-        ("lib.rs", "#![allow(dead_code, unused_unsafe)]\npub mod m;\n"),
+        (
+            "lib.rs",
+            "#![allow(dead_code, unused_unsafe)]\npub mod m;\n",
+        ),
         ("m.rs", BREAKS_ON_REWRITE),
     ]);
     assert_eq!(d.diags.len(), 1, "expected one located diagnostic: {d:?}");
-    assert_eq!(d.diags[0].line, 5, "the store is on line 5: {:?}", d.diags[0]);
+    assert_eq!(
+        d.diags[0].line, 5,
+        "the store is on line 5: {:?}",
+        d.diags[0]
+    );
     assert!(
         d.diags[0].file.ends_with("m.rs"),
         "located in the wrong file: {:?}",
@@ -550,7 +578,10 @@ fn structural_capture_locates_a_type_error() {
 #[test]
 fn the_error_count_comes_from_level_not_from_extraction() {
     let (d, _fixture) = diagnose_after_rewrite(&[
-        ("lib.rs", "#![allow(dead_code, unused_unsafe)]\npub mod m;\n"),
+        (
+            "lib.rs",
+            "#![allow(dead_code, unused_unsafe)]\npub mod m;\n",
+        ),
         ("m.rs", BREAKS_ON_REWRITE),
     ]);
     assert_eq!(d.errors, 2, "error count must come from Level: {d:?}");
@@ -575,7 +606,10 @@ fn the_error_count_comes_from_level_not_from_extraction() {
 #[test]
 fn direction_identifies_a_rewritten_value_flowing_into_a_raw_context() {
     let (d, _fixture) = diagnose_after_rewrite(&[
-        ("lib.rs", "#![allow(dead_code, unused_unsafe)]\npub mod m;\n"),
+        (
+            "lib.rs",
+            "#![allow(dead_code, unused_unsafe)]\npub mod m;\n",
+        ),
         ("m.rs", BREAKS_ON_REWRITE),
     ]);
     assert_eq!(
@@ -634,12 +668,22 @@ fn a_clean_crate_yields_no_diagnostics() {
 #[test]
 fn the_round_cap_stops_the_loop() {
     let fixture = Fixture::new(&[
-        ("lib.rs", "#![allow(dead_code, unused_unsafe)]\npub mod good;\npub mod bad;\n"),
-        ("good.rs", "pub unsafe fn bump(p: *mut i32) -> i32 {\n    *p += 1;\n    *p\n}\n"),
+        (
+            "lib.rs",
+            "#![allow(dead_code, unused_unsafe)]\npub mod good;\npub mod bad;\n",
+        ),
+        (
+            "good.rs",
+            "pub unsafe fn bump(p: *mut i32) -> i32 {\n    *p += 1;\n    *p\n}\n",
+        ),
         ("bad.rs", BREAKS_ON_REWRITE),
     ]);
     match super::rewrite_m1_path_with_cap(&fixture.root(), 0) {
-        super::RewriteOutcome::Emitted { escalated, bisect_probes, .. } => {
+        super::RewriteOutcome::Emitted {
+            escalated,
+            bisect_probes,
+            ..
+        } => {
             let reason = escalated.expect("the cap must have escalated");
             assert!(
                 reason.contains("round cap"),
@@ -699,11 +743,18 @@ fn keep_r_raw(table: &mut super::decision::DecisionTable) {
 #[test]
 fn the_no_progress_detector_escalates_when_attribution_is_wrong() {
     let fixture = Fixture::new(&[
-        ("lib.rs", "#![allow(dead_code, unused_unsafe)]\npub mod m;\n"),
+        (
+            "lib.rs",
+            "#![allow(dead_code, unused_unsafe)]\npub mod m;\n",
+        ),
         ("m.rs", INVERTED),
     ]);
     match super::rewrite_m1_path_injected(&fixture.root(), 8, &keep_r_raw) {
-        super::RewriteOutcome::Emitted { escalated, bisect_probes, .. } => {
+        super::RewriteOutcome::Emitted {
+            escalated,
+            bisect_probes,
+            ..
+        } => {
             let reason = escalated.expect(
                 "the loop converged on a shape whose culprit it cannot \
                  attribute — attribution silently got away with it",
@@ -749,11 +800,18 @@ fn duplicate_entries(table: &mut super::decision::DecisionTable) {
 #[test]
 fn an_incoherent_plan_is_rejected_before_the_loop() {
     let fixture = Fixture::new(&[
-        ("lib.rs", "#![allow(dead_code, unused_unsafe)]\npub mod m;\n"),
+        (
+            "lib.rs",
+            "#![allow(dead_code, unused_unsafe)]\npub mod m;\n",
+        ),
         ("m.rs", MODULE_SUBJECT),
     ]);
     match super::rewrite_m1_path_injected(&fixture.root(), 8, &duplicate_entries) {
-        super::RewriteOutcome::Degraded { reason, bisect_probes, .. } => {
+        super::RewriteOutcome::Degraded {
+            reason,
+            bisect_probes,
+            ..
+        } => {
             assert!(
                 reason.contains("rolled back"),
                 "rejected for the wrong reason: {reason}"
@@ -852,10 +910,19 @@ fn zz_brotli_pristine_copy_control() {
         ::utils::type_check(tcx);
     })
     .is_ok();
-    println!("BROTLI-CONTROL old_gate_is_ok={old_gate} new_gate_passes={}", d.errors == 0);
+    println!(
+        "BROTLI-CONTROL old_gate_is_ok={old_gate} new_gate_passes={}",
+        d.errors == 0
+    );
     for x in d.diags.iter().take(8) {
-        println!("BROTLI-CONTROL diag {}:{} {:?}", x.file, x.line, x.direction);
-        println!("BROTLI-CONTROL   msg={}", &x.message[..x.message.len().min(160)]);
+        println!(
+            "BROTLI-CONTROL diag {}:{} {:?}",
+            x.file, x.line, x.direction
+        );
+        println!(
+            "BROTLI-CONTROL   msg={}",
+            &x.message[..x.message.len().min(160)]
+        );
     }
 }
 
@@ -892,7 +959,10 @@ fn zz_brotli_pristine_copy_control() {
 #[test]
 fn diagnose_once_returns_the_captured_diagnostics_not_an_empty_set() {
     let fixture = Fixture::new(&[
-        ("lib.rs", "#![allow(dead_code, unused_unsafe)]\npub mod m;\n"),
+        (
+            "lib.rs",
+            "#![allow(dead_code, unused_unsafe)]\npub mod m;\n",
+        ),
         (
             "m.rs",
             "pub unsafe fn preexisting(v: &i32) {\n    *(v as *const i32 as *mut i32) = 7;\n}\npub unsafe fn bump(p: *mut i32) -> i32 {\n    *p += 1;\n    *p\n}\n",
@@ -942,7 +1012,10 @@ fn a_baseline_error_does_not_gate_the_rewrite() {
     // abort the decision-phase compile — which is why brotli decides 126
     // subjects and only fails at verify.
     let fixture = Fixture::new(&[
-        ("lib.rs", "#![allow(dead_code, unused_unsafe)]\npub mod m;\n"),
+        (
+            "lib.rs",
+            "#![allow(dead_code, unused_unsafe)]\npub mod m;\n",
+        ),
         (
             "m.rs",
             "pub unsafe fn preexisting(v: &i32) {\n    *(v as *const i32 as *mut i32) = 7;\n}\npub unsafe fn bump(p: *mut i32) -> i32 {\n    *p += 1;\n    *p\n}\n",
@@ -1060,14 +1133,23 @@ fn both_sides_key_the_same_file_identically() {
         )
     };
 
-    let baseline = key_of("/home/u/dev/benchmarks/rs-crown/brotli/src/enc/encode.rs", original_root);
-    let observed = key_of("/var/folders/T/crat-verify-4242-0/src/enc/encode.rs", observed_root);
+    let baseline = key_of(
+        "/home/u/dev/benchmarks/rs-crown/brotli/src/enc/encode.rs",
+        original_root,
+    );
+    let observed = key_of(
+        "/var/folders/T/crat-verify-4242-0/src/enc/encode.rs",
+        observed_root,
+    );
     assert_eq!(
         baseline, observed,
         "the two sides key the same file differently — the baseline masks \
          nothing and the gate silently no-ops on the corpus"
     );
-    assert_eq!(baseline.0, "src/enc/encode.rs", "key is relative to the crate root");
+    assert_eq!(
+        baseline.0, "src/enc/encode.rs",
+        "key is relative to the crate root"
+    );
 }
 
 /// **W2 — a path NOT under the given root keys as ITSELF.**
@@ -1141,7 +1223,10 @@ fn a_path_outside_the_crate_root_keys_as_itself() {
 #[test]
 fn a_probe_does_not_compile_the_baseline_it_never_consults() {
     let fixture = Fixture::new(&[
-        ("lib.rs", "#![allow(dead_code, unused_unsafe)]\npub mod deep;\n"),
+        (
+            "lib.rs",
+            "#![allow(dead_code, unused_unsafe)]\npub mod deep;\n",
+        ),
         ("deep.rs", "pub mod inner;\n"),
         (
             "deep/inner.rs",
@@ -1153,8 +1238,12 @@ fn a_probe_does_not_compile_the_baseline_it_never_consults() {
     // real baseline. Without it, a fixture that simply has no baseline would
     // satisfy the probe assertion below and the witness would pin nothing.
     let gate_baseline_errors = match super::rewrite_m1_path(&fixture.root()) {
-        super::RewriteOutcome::Emitted { baseline_errors, .. } => baseline_errors,
-        super::RewriteOutcome::Degraded { baseline_errors, .. } => baseline_errors,
+        super::RewriteOutcome::Emitted {
+            baseline_errors, ..
+        } => baseline_errors,
+        super::RewriteOutcome::Degraded {
+            baseline_errors, ..
+        } => baseline_errors,
     };
     assert!(
         gate_baseline_errors > 0,
@@ -1208,7 +1297,10 @@ fn a_probe_does_not_compile_the_baseline_it_never_consults() {
 #[test]
 fn a_nested_crate_masks_its_baseline_and_still_emits() {
     let fixture = Fixture::new(&[
-        ("lib.rs", "#![allow(dead_code, unused_unsafe)]\npub mod deep;\n"),
+        (
+            "lib.rs",
+            "#![allow(dead_code, unused_unsafe)]\npub mod deep;\n",
+        ),
         ("deep.rs", "pub mod inner;\n"),
         (
             "deep/inner.rs",
@@ -1508,7 +1600,9 @@ fn locals_of(src: &str) -> Vec<(u32, Option<String>, String)> {
                 (
                     r.mir_local,
                     r.param_name.clone(),
-                    r.degrade_reason.clone().unwrap_or_else(|| "<emitted>".to_owned()),
+                    r.degrade_reason
+                        .clone()
+                        .unwrap_or_else(|| "<emitted>".to_owned()),
                 )
             })
             .collect::<Vec<_>>()
@@ -1534,7 +1628,9 @@ fn a_named_pointer_local_is_a_subject_and_a_temporary_is_not() {
         "{MALLOC}pub unsafe fn f() -> i32 {{ let p: *mut i32 = malloc(4) as *mut i32; *p = 1; *p }}\n"
     ));
     assert_eq!(
-        got.iter().map(|(l, n, _)| (*l, n.as_deref())).collect::<Vec<_>>(),
+        got.iter()
+            .map(|(l, n, _)| (*l, n.as_deref()))
+            .collect::<Vec<_>>(),
         // `_1`, not `_2`: this fn has no parameters, so `arg_count == 0` and the
         // locals range opens at `_1`. The malloc temporary is absent because it
         // carries no debug entry, which is the half of this witness that depth
@@ -1596,8 +1692,14 @@ fn a_locals_row_carries_no_arg_index_while_a_parameter_keeps_one() {
             .collect::<Vec<_>>()
     })
     .expect("compiles");
-    assert!(pairs.contains(&(1, Some(1))), "the parameter keeps its index: {pairs:?}");
-    assert!(pairs.contains(&(2, None)), "the local carries None: {pairs:?}");
+    assert!(
+        pairs.contains(&(1, Some(1))),
+        "the parameter keeps its index: {pairs:?}"
+    );
+    assert!(
+        pairs.contains(&(2, None)),
+        "the local carries None: {pairs:?}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1617,9 +1719,13 @@ fn decisions_of(src: &str) -> Vec<(String, bool, String)> {
             .iter()
             .map(|r| {
                 (
-                    r.param_name.clone().unwrap_or_else(|| "<unnamed>".to_owned()),
+                    r.param_name
+                        .clone()
+                        .unwrap_or_else(|| "<unnamed>".to_owned()),
                     r.arg_index.is_some(),
-                    r.degrade_reason.clone().unwrap_or_else(|| "<emitted>".to_owned()),
+                    r.degrade_reason
+                        .clone()
+                        .unwrap_or_else(|| "<emitted>".to_owned()),
                 )
             })
             .collect::<Vec<_>>()
@@ -1733,9 +1839,8 @@ fn the_facts_join_reports_facts_the_decision_never_reached() {
     let src = "#![allow(dead_code, unused_unsafe, unused_variables)]\n\
                pub unsafe fn f(a: *mut i32) -> i32 { let p = a; *p.offset(1) }\n";
     let fixture = Fixture::new(&[("lib.rs", src)]);
-    let (reason, facts) = ::utils::compilation::run_compiler_on_path(
-        &fixture.0.join("lib.rs"),
-        |tcx| {
+    let (reason, facts) =
+        ::utils::compilation::run_compiler_on_path(&fixture.0.join("lib.rs"), |tcx| {
             let table = super::decide_table(tcx).expect("table");
             let rows = super::artifact::rows(tcx, &table);
             let reason = rows
@@ -1744,9 +1849,8 @@ fn the_facts_join_reports_facts_the_decision_never_reached() {
                 .and_then(|r| r.degrade_reason.clone())
                 .unwrap_or_default();
             (reason, super::facts_join_tsv(tcx).expect("facts join"))
-        },
-    )
-    .expect("fixture compiles");
+        })
+        .expect("fixture compiles");
 
     assert_eq!(
         reason, "no-declared-type",
@@ -1761,7 +1865,10 @@ fn the_facts_join_reports_facts_the_decision_never_reached() {
         .map(|l| l.split('\t').collect::<Vec<_>>())
         .find(|c| c[c_param] == "0")
         .unwrap_or_else(|| panic!("no local row in the facts join:\n{facts}"));
-    assert_eq!(local_row[c_ann], "0", "the local is unannotated: {local_row:?}");
+    assert_eq!(
+        local_row[c_ann], "0",
+        "the local is unannotated: {local_row:?}"
+    );
     assert_eq!(
         local_row[c_op], "offset",
         "the join lost the op the decision never reached — it has inherited \
@@ -1821,7 +1928,9 @@ fn calloc_and_realloc_are_told_apart_by_callee_not_arity() {
         .collect();
 
     assert!(
-        classes.iter().any(|(k, expr)| k == "alloc-count" && expr.contains('n')),
+        classes
+            .iter()
+            .any(|(k, expr)| k == "alloc-count" && expr.contains('n')),
         "calloc's element count must be recovered from its FIRST argument: {classes:?}"
     );
     assert!(
@@ -1854,7 +1963,9 @@ fn fatness_of(src: &str) -> Vec<(String, &'static str)> {
             .iter()
             .map(|s| {
                 (
-                    s.param_name.clone().unwrap_or_else(|| "<unnamed>".to_owned()),
+                    s.param_name
+                        .clone()
+                        .unwrap_or_else(|| "<unnamed>".to_owned()),
                     fat.render(s.fn_did, s.local),
                 )
             })
@@ -1894,7 +2005,11 @@ fn fatness_entry_validation_distinguishes_array_from_single_object() {
             .unwrap_or_else(|| panic!("no local `{n}`: {got:?}"))
             .1
     };
-    assert_eq!(of("decayed"), "arr", "array decay must read as array: {got:?}");
+    assert_eq!(
+        of("decayed"),
+        "arr",
+        "array decay must read as array: {got:?}"
+    );
     assert_eq!(
         of("single"),
         "ptr",

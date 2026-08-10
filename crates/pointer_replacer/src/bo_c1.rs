@@ -6963,11 +6963,13 @@ mod run {
         let mut row = Row::default();
         row.set("t_tcx_s", secs(t_tcx));
 
-        let dir = std::env::var_os("CRAT_BOC1_ARTIFACT_DIR").map(std::path::PathBuf::from).expect(
-            "m1-recon requires CRAT_BOC1_ARTIFACT_DIR: the verdict is computed \
+        let dir = std::env::var_os("CRAT_BOC1_ARTIFACT_DIR")
+            .map(std::path::PathBuf::from)
+            .expect(
+                "m1-recon requires CRAT_BOC1_ARTIFACT_DIR: the verdict is computed \
              from the written artifacts, so without a directory there is no \
              verdict to compute",
-        );
+            );
         let name = std::env::var("CRAT_BOC1_NAME").unwrap_or_else(|_| "unnamed".to_string());
 
         let a = match crate::bo_rewriter::artifact_rows(tcx) {
@@ -7007,8 +7009,11 @@ mod run {
             // verdict reads the FILE: a syntactic corruption is caught by the
             // decode step alone and would leave an in-memory comparison passing.
             let text = std::fs::read_to_string(&a_path).expect("written artifact readable");
-            std::fs::write(&a_path, text.replacen("\"param_name\":\"p\"", "\"param_name\":\"ZZ\"", 1))
-                .expect("alter artifact");
+            std::fs::write(
+                &a_path,
+                text.replacen("\"param_name\":\"p\"", "\"param_name\":\"ZZ\"", 1),
+            )
+            .expect("alter artifact");
         }
         row.set("a_path", a_path.display());
         row.set("b_path", b_path.display());
@@ -7340,9 +7345,9 @@ mod run {
                 let ops: String = degradations
                     .iter()
                     .filter_map(|d| match &d.reason {
-                        crate::bo_rewriter::decision::DegradeReason::RawPointerOperation {
-                            op,
-                        } => Some(format!("{}\t{op}\n", d.subject)),
+                        crate::bo_rewriter::decision::DegradeReason::RawPointerOperation { op } => {
+                            Some(format!("{}\t{op}\n", d.subject))
+                        }
                         _ => None,
                     })
                     .collect();
@@ -7380,7 +7385,11 @@ mod run {
                 );
                 row.set("status", "ok");
             }
-            RewriteOutcome::Degraded { reason, unplaceable, .. } => {
+            RewriteOutcome::Degraded {
+                reason,
+                unplaceable,
+                ..
+            } => {
                 // A gate failure is DATA, not an error to repair mid-run.
                 row.set("verdict", "FAIL");
                 // READ, not written as `0usize`. The constant here made every
@@ -8336,7 +8345,10 @@ impl OutcomeCounts {
 fn count_outcomes(rows: &[crate::coverage_recon::schema::Row]) -> OutcomeCounts {
     use crate::coverage_recon::schema::Outcome;
 
-    let mut c = OutcomeCounts { rows: rows.len(), ..OutcomeCounts::default() };
+    let mut c = OutcomeCounts {
+        rows: rows.len(),
+        ..OutcomeCounts::default()
+    };
     for row in rows {
         match row.outcome {
             Some(Outcome::RefMut) => c.ref_mut += 1,
@@ -8346,7 +8358,10 @@ fn count_outcomes(rows: &[crate::coverage_recon::schema::Row]) -> OutcomeCounts 
                 // A degraded row with no reason is counted under an explicit
                 // key, not dropped: an unattributed degradation must be visible
                 // in the distribution it distorts.
-                let reason = row.degrade_reason.clone().unwrap_or_else(|| "<none>".to_owned());
+                let reason = row
+                    .degrade_reason
+                    .clone()
+                    .unwrap_or_else(|| "<none>".to_owned());
                 *c.by_reason.entry(reason).or_default() += 1;
             }
             None => c.unclassified += 1,
@@ -8490,9 +8505,15 @@ fn the_local_not_evaluable_pin_is_fail_closed() {
     // Exact match passes; either direction fails.
     assert!(expected_not_evaluable_local(&row, "bst").is_ok());
     row.set("agg_span_check_not_evaluable_local", "11");
-    assert!(expected_not_evaluable_local(&row, "bst").is_err(), "a DROP must fail");
+    assert!(
+        expected_not_evaluable_local(&row, "bst").is_err(),
+        "a DROP must fail"
+    );
     row.set("agg_span_check_not_evaluable_local", "13");
-    assert!(expected_not_evaluable_local(&row, "bst").is_err(), "a RISE must fail");
+    assert!(
+        expected_not_evaluable_local(&row, "bst").is_err(),
+        "a RISE must fail"
+    );
 }
 
 #[test]
@@ -8682,7 +8703,10 @@ fn a_row_with_no_outcome_is_unclassified_not_degraded() {
     let mut orphan = counted_row(9, Outcome::RefMut, None);
     orphan.outcome = None;
     let c = count_outcomes(&[orphan]);
-    assert_eq!(c.unclassified, 1, "an outcome-less row was silently bucketed");
+    assert_eq!(
+        c.unclassified, 1,
+        "an outcome-less row was silently bucketed"
+    );
     assert_eq!(c.degraded, 0, "it was folded into the degraded population");
 }
 
@@ -8905,7 +8929,11 @@ fn m1_recon_corpus() {
         println!("M1COUNT-REASON {reason}={n} label={PRE_S3_LABEL:?}");
     }
     assert_eq!(
-        rows.len() + failures.iter().filter(|f| f.contains("no sentinel")).count(),
+        rows.len()
+            + failures
+                .iter()
+                .filter(|f| f.contains("no sentinel"))
+                .count(),
         CORPUS.len(),
         "every corpus program must be attempted"
     );
@@ -8955,8 +8983,8 @@ fn m1_diag_transfer() {
         // The frame both sides canonicalize against, from the worker itself.
         // FAIL-CLOSED: no root means no comparable keys, and the fallback this
         // replaced keyed distinct files alike by basename — it failed OPEN.
-        let observed_root = diag_root(&out_text)
-            .unwrap_or_else(|why| panic!("{}: {why}", program.name));
+        let observed_root =
+            diag_root(&out_text).unwrap_or_else(|why| panic!("{}: {why}", program.name));
         let observed_root = std::path::Path::new(&observed_root);
 
         // STRUCTURAL: (crate-relative file, line)
@@ -9075,7 +9103,10 @@ fn the_transfer_refuses_a_capture_with_no_frame() {
     // deleted fallback turned this into basename keys and carried on.
     let err = diag_root("M1DIAG-STRUCT file=/a/b/node.rs line=4 dir=Other\n")
         .expect_err("a capture with no frame must be refused, never normalized by guesswork");
-    assert!(err.contains("M1DIAG-ROOT"), "the error must name what is missing: {err}");
+    assert!(
+        err.contains("M1DIAG-ROOT"),
+        "the error must name what is missing: {err}"
+    );
 }
 
 /// **S2b.0 — the pinned measurement.** Full M1 pipeline over all 20 programs.
@@ -9142,12 +9173,10 @@ fn m1_emit_corpus() {
         // "zero whole-crate failures pre-S3" is itself the datum.
         if row.get("verdict") == Some("FAIL") {
             let logs = orchestrate::out_dir().join("logs");
-            let err_text =
-                fs::read_to_string(logs.join(format!("{}.m1-emit.err", program.name)))
-                    .unwrap_or_default();
-            let out_text =
-                fs::read_to_string(logs.join(format!("{}.m1-emit.out", program.name)))
-                    .unwrap_or_default();
+            let err_text = fs::read_to_string(logs.join(format!("{}.m1-emit.err", program.name)))
+                .unwrap_or_default();
+            let out_text = fs::read_to_string(logs.join(format!("{}.m1-emit.out", program.name)))
+                .unwrap_or_default();
             row.set("type_errors", err_text.matches("error[").count());
 
             // Rewritten subjects' own functions, as (crate-relative file, lo, hi).
@@ -10036,9 +10065,7 @@ mod orchestrate {
                         let _ = child.kill();
                     } else if killed_for.is_none()
                         && t0.elapsed().as_millis() % 1000 < 200
-                        && mem_cap_kb.is_some_and(|cap| {
-                            current_rss_kb.is_some_and(|kb| kb > cap)
-                        })
+                        && mem_cap_kb.is_some_and(|cap| current_rss_kb.is_some_and(|kb| kb > cap))
                     {
                         killed_for = Some("oom-kill");
                         let _ = child.kill();
@@ -12085,8 +12112,7 @@ fn boc1_corpus() {
                 program.name,
                 retry_timeout.as_secs()
             );
-            let retried =
-                run_child_labeled(program.name, &input, mode, &label, retry_timeout, &[]);
+            let retried = run_child_labeled(program.name, &input, mode, &label, retry_timeout, &[]);
             let m = merged
                 .iter_mut()
                 .find(|row| row.get("program") == Some(program.name))

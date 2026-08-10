@@ -50,9 +50,13 @@ use rustc_middle::{
 
 use crate::{
     analyses::borrow_ownership::{
-        CrateCtxt, SlotKind, borrow_verify::verify_to_fixpoint, coherence::add_coherence,
+        CrateCtxt, SlotKind,
+        borrow_verify::verify_to_fixpoint,
+        coherence::add_coherence,
         crate_slots::{CrateSlots, ptr_chain_depth},
-        emit_crate_ownership_constraints, export::with_bo_export, mutability_facts::MutFacts,
+        emit_crate_ownership_constraints,
+        export::with_bo_export,
+        mutability_facts::MutFacts,
         origins::compute_origins,
         solver::{KindSolver, SlotRef},
     },
@@ -220,7 +224,11 @@ pub(crate) fn rewrite_m1(input: &str) -> RewriteOutcome {
     // the ten goldens exercise exactly the mechanism the corpus will. A parallel
     // string pipeline is the hazard class this milestone exists to remove: it
     // would be exercised by every test and by nothing real.
-    rewrite_core(::utils::compilation::str_to_input(input), None, MAX_REVERT_ROUNDS)
+    rewrite_core(
+        ::utils::compilation::str_to_input(input),
+        None,
+        MAX_REVERT_ROUNDS,
+    )
 }
 
 /// M1's **general** entry point: a crate rooted at `root`, rewritten into a temp
@@ -230,7 +238,11 @@ pub(crate) fn rewrite_m1(input: &str) -> RewriteOutcome {
     reason = "no caller until 0a.4's corpus smoke; `rewrite_m1` reaches the same               core through the other entry. Targeted here rather than               module-wide so the lint stays live over everything reachable."
 )]
 pub(crate) fn rewrite_m1_path(root: &std::path::Path) -> RewriteOutcome {
-    rewrite_core(::utils::compilation::path_to_input(root), Some(root), MAX_REVERT_ROUNDS)
+    rewrite_core(
+        ::utils::compilation::path_to_input(root),
+        Some(root),
+        MAX_REVERT_ROUNDS,
+    )
 }
 
 /// **The one emission path.** Both entry points funnel here; they differ only in
@@ -305,7 +317,11 @@ pub(crate) fn rewrite_m1_path_with_cap(
     root: &std::path::Path,
     max_rounds: usize,
 ) -> RewriteOutcome {
-    rewrite_core(::utils::compilation::path_to_input(root), Some(root), max_rounds)
+    rewrite_core(
+        ::utils::compilation::path_to_input(root),
+        Some(root),
+        max_rounds,
+    )
 }
 
 fn rewrite_core(
@@ -347,7 +363,11 @@ fn rewrite_core_injected(
             return Err(format!(
                 "apply rolled back {} edit(s): {:?}",
                 emission.rollbacks.len(),
-                emission.rollbacks.iter().map(|r| r.reason).collect::<Vec<_>>()
+                emission
+                    .rollbacks
+                    .iter()
+                    .map(|r| r.reason)
+                    .collect::<Vec<_>>()
             ));
         }
         let degradations: Vec<decision::Degradation> = table.degradations().cloned().collect();
@@ -544,7 +564,9 @@ fn rewrite_core_injected(
                 baseline_errors: 0,
                 baseline_msg_env: 0,
             };
-            let crate_dir = tree_base.and_then(|root| root.parent()).map(|d| d.to_path_buf());
+            let crate_dir = tree_base
+                .and_then(|root| root.parent())
+                .map(|d| d.to_path_buf());
             let mut reverted: std::collections::BTreeSet<String> =
                 std::collections::BTreeSet::new();
             let mut files = files;
@@ -593,8 +615,13 @@ fn rewrite_core_injected(
                     // Baseline diagnostics appear on both sides, which is what
                     // makes the equality mean anything.
                     facts.first_diags = diagnosis.diags.clone();
-                    facts.observed_root =
-                        Some(staged.root().parent().unwrap_or(staged.root()).to_path_buf());
+                    facts.observed_root = Some(
+                        staged
+                            .root()
+                            .parent()
+                            .unwrap_or(staged.root())
+                            .to_path_buf(),
+                    );
                     facts.files_touched = files.len();
                     return facts.degraded("probe-only: first diagnose recorded".to_owned());
                 }
@@ -605,7 +632,11 @@ fn rewrite_core_injected(
                 facts.baseline_keys = baseline.keys.values().sum();
                 facts.baseline_errors = baseline.errors;
                 facts.baseline_msg_env = baseline.messages_embedding_root;
-                let observed_root = staged.root().parent().unwrap_or(staged.root()).to_path_buf();
+                let observed_root = staged
+                    .root()
+                    .parent()
+                    .unwrap_or(staged.root())
+                    .to_path_buf();
                 let novel: Vec<verify::Diag> = baseline
                     .novel(&diagnosis.diags, &observed_root)
                     .into_iter()
@@ -669,9 +700,9 @@ fn rewrite_core_injected(
                     &facts.emitted_sites,
                     crate_dir.as_deref().unwrap_or(std::path::Path::new("")),
                 )
-                    .difference(&reverted)
-                    .cloned()
-                    .collect::<std::collections::BTreeSet<_>>();
+                .difference(&reverted)
+                .cloned()
+                .collect::<std::collections::BTreeSet<_>>();
                 if newly.is_empty() {
                     escalation = Some(format!(
                         "escalation-required: {} error(s) attributed to no rewritten \
@@ -766,8 +797,7 @@ fn rewrite_core_injected(
                     && probe.errors.saturating_sub(baseline.errors) == 0
             });
 
-            let (final_files, rollbacks) =
-                render(&emission_plan, &emission_texts, &final_reverted);
+            let (final_files, rollbacks) = render(&emission_plan, &emission_texts, &final_reverted);
             let materialized = match tree_base {
                 Some(root) => verify::materialize(root, &final_files),
                 None => verify::materialize_single_file(&root_text),
@@ -801,8 +831,7 @@ fn rewrite_core_injected(
                 Ok(staged)
                     if rollbacks.is_empty() && {
                         let final_diag = verify::diagnose_crate(staged.root());
-                        let final_root =
-                            staged.root().parent().unwrap_or(staged.root());
+                        let final_root = staged.root().parent().unwrap_or(staged.root());
                         baseline.novel(&final_diag.diags, final_root).is_empty()
                             && final_diag.errors.saturating_sub(baseline.errors) == 0
                     } =>
@@ -837,12 +866,9 @@ fn rewrite_core_injected(
         // Nothing was decided, so the facts are genuinely empty here — the one
         // place a zero is the measurement rather than an omission.
         Ok(Err(reason)) => OutcomeFacts::default().degraded(reason),
-        Err(_) => {
-            OutcomeFacts::default().degraded("input crate did not compile".to_owned())
-        }
+        Err(_) => OutcomeFacts::default().degraded("input crate did not compile".to_owned()),
     }
 }
-
 
 /// Every top-level fn/struct item, in HIR owner order (the `bo_c1` shape).
 fn collect_program(tcx: TyCtxt<'_>) -> RustProgram<'_> {
@@ -1068,8 +1094,10 @@ fn collect_local_subjects(
 
         // Entries per local, so the one-vs-more split is a count and not a
         // first-match. Deterministic order: BTreeMap keyed by local index.
-        let mut entries: std::collections::BTreeMap<Local, Vec<&rustc_middle::mir::VarDebugInfo<'_>>> =
-            std::collections::BTreeMap::new();
+        let mut entries: std::collections::BTreeMap<
+            Local,
+            Vec<&rustc_middle::mir::VarDebugInfo<'_>>,
+        > = std::collections::BTreeMap::new();
         for info in &mir.var_debug_info {
             if let rustc_middle::mir::VarDebugInfoContents::Place(place) = info.value
                 && let Some(local) = place.as_local()
@@ -1368,10 +1396,16 @@ impl RewriteOutcome {
         // still caught by its own first line — but it does fail the guard, as
         // it did here. Keep these patterns single-line.
         match self {
-            RewriteOutcome::Emitted { first_diags, observed_root, .. }
-            | RewriteOutcome::Degraded { first_diags, observed_root, .. } => {
-                (observed_root, first_diags)
+            RewriteOutcome::Emitted {
+                first_diags,
+                observed_root,
+                ..
             }
+            | RewriteOutcome::Degraded {
+                first_diags,
+                observed_root,
+                ..
+            } => (observed_root, first_diags),
         }
     }
 }
@@ -1801,7 +1835,11 @@ pub(crate) fn facts_join_tsv(tcx: TyCtxt<'_>) -> Result<String, String> {
             u8::from(is_param),
             u8::from(s.ty_span.is_some()),
             u8::from(slot.is_some()),
-            u8::from(ctx.facts.ptr_comparisons.contains_key(&(s.fn_did, s.hir_id))),
+            u8::from(
+                ctx.facts
+                    .ptr_comparisons
+                    .contains_key(&(s.fn_did, s.hir_id))
+            ),
         ));
     }
     Ok(out)

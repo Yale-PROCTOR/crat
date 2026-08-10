@@ -365,7 +365,10 @@ pub(crate) fn plan(
             owner_fn: owner_of(subject),
         });
     }
-    Plan { by_file, unplaceable }
+    Plan {
+        by_file,
+        unplaceable,
+    }
 }
 
 #[cfg(test)]

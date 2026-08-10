@@ -28,10 +28,8 @@
 
 use rustc_middle::ty::TyCtxt;
 
-use super::decision::{DeclShape, Decision, DecisionTable, emitability::EmitabilityFacts};
-use crate::coverage_recon::schema::{
-    DeclShape as WireShape, Outcome, PairingConfidence, Row,
-};
+use super::decision::{Decision, DecisionTable, DeclShape, emitability::EmitabilityFacts};
+use crate::coverage_recon::schema::{DeclShape as WireShape, Outcome, PairingConfidence, Row};
 
 fn wire_shape(shape: DeclShape) -> WireShape {
     // Exhaustive by construction: no `_` arm here either.
@@ -88,9 +86,7 @@ pub(crate) fn rows(tcx: TyCtxt<'_>, table: &DecisionTable) -> Vec<Row> {
                 // nothing anywhere presence-tests it — swept crate-wide in the
                 // S3.1 pre-flight.
                 arg_index: match subject.kind {
-                    super::decision::SubjectKind::Param { hir_index } => {
-                        Some(hir_index as u32 + 1)
-                    }
+                    super::decision::SubjectKind::Param { hir_index } => Some(hir_index as u32 + 1),
                     super::decision::SubjectKind::Local => None,
                 },
                 ptr_depth: subject.ptr_depth,
@@ -133,7 +129,7 @@ mod tests {
     use rustc_middle::mir::Local;
 
     use super::*;
-    use crate::bo_rewriter::decision::{DegradeReason, Degradation, Subject};
+    use crate::bo_rewriter::decision::{Degradation, DegradeReason, Subject};
 
     fn subject(local: u32, name: Option<&str>) -> Subject {
         Subject {

@@ -12,10 +12,10 @@ use std::{
 use points_to::andersen;
 use rustc_hash::FxHashSet;
 use rustc_hir::{
+    ExprKind, QPath,
     def::{DefKind, Res},
     def_id::LocalDefId,
-    intravisit::{walk_expr, Visitor},
-    ExprKind, QPath,
+    intravisit::{Visitor, walk_expr},
 };
 use rustc_middle::{
     mir::{BasicBlock, TerminatorKind},
@@ -3154,13 +3154,13 @@ mod tests {
     };
 
     use super::{
-        add_local_call_edges, classify_call_route, collect_reference_sites, derived_corpus_digest,
-        measure_graph, measure_web, parse_reconciled_worker_artifact, parse_s36_program,
-        parse_worker_artifact, raw_corpus_digest, reconcile_roots,
+        BodyOwnerKind, CallRoute, CoverageCounts, DERIVED_CORPUS_SHA256, GraphNode,
+        RAW_CORPUS_SHA256, ReferenceKind, ReferenceSite, RootDifferenceCause, S36FunctionEvidence,
+        WorkerArtifact, add_local_call_edges, classify_call_route, collect_reference_sites,
+        derived_corpus_digest, measure_graph, measure_web, parse_reconciled_worker_artifact,
+        parse_s36_program, parse_worker_artifact, raw_corpus_digest, reconcile_roots,
         render_reconciled_worker_artifact, render_worker_artifact, resolution_counts_for_web,
-        validate_completed_state, wall_liveness, write_phase_checkpoint, BodyOwnerKind, CallRoute,
-        CoverageCounts, GraphNode, ReferenceKind, ReferenceSite, RootDifferenceCause,
-        S36FunctionEvidence, WorkerArtifact, DERIVED_CORPUS_SHA256, RAW_CORPUS_SHA256,
+        validate_completed_state, wall_liveness, write_phase_checkpoint,
     };
 
     fn node(fn_ptr_root: bool, public_root: bool, callees: &[&str]) -> GraphNode {
@@ -3314,16 +3314,11 @@ mod tests {
             calls_total: 1,
             ..Default::default()
         };
-        assert!(render_worker_artifact(
-            "lambda7",
-            "linux-x86_64",
-            "fixture",
-            &measured,
-            1,
-            coverage,
-        )
-        .expect_err("coverage mismatch must fail")
-        .contains("call coverage mismatch"));
+        assert!(
+            render_worker_artifact("lambda7", "linux-x86_64", "fixture", &measured, 1, coverage,)
+                .expect_err("coverage mismatch must fail")
+                .contains("call coverage mismatch")
+        );
     }
 
     #[test]
@@ -3371,14 +3366,16 @@ mod tests {
                 .map(str::to_owned)
                 .collect()
         );
-        assert!(add_local_call_edges(
-            &mut graph,
-            "root",
-            CallRoute::UnsupportedConstant,
-            ["direct".to_owned()],
-        )
-        .expect_err("unsupported constant must STOP")
-        .contains("Andersen has no indirect-call site"));
+        assert!(
+            add_local_call_edges(
+                &mut graph,
+                "root",
+                CallRoute::UnsupportedConstant,
+                ["direct".to_owned()],
+            )
+            .expect_err("unsupported constant must STOP")
+            .contains("Andersen has no indirect-call site")
+        );
     }
 
     #[test]
@@ -3476,9 +3473,11 @@ mod tests {
             )],
         )]);
 
-        assert!(reconcile_roots(&BTreeSet::new(), &s36, &sites)
-            .expect_err("a function-body cast missed by collect_fn_ptrs is unexplained")
-            .contains("unexplained"));
+        assert!(
+            reconcile_roots(&BTreeSet::new(), &s36, &sites)
+                .expect_err("a function-body cast missed by collect_fn_ptrs is unexplained")
+                .contains("unexplained")
+        );
     }
 
     #[test]
@@ -3491,9 +3490,11 @@ mod tests {
         assert_eq!(parsed["crate::target"].blocked_subjects, 1);
 
         let incomplete = "{\"fn_path\":\"crate::missing\",\"mir_local\":9,\"outcome\":\"degraded\",\"degrade_reason\":\"call-site-not-adapted\"}\n";
-        assert!(parse_s36_program(facts, incomplete)
-            .expect_err("blocked subject without a facts identity must fail")
-            .contains("missing facts identity"));
+        assert!(
+            parse_s36_program(facts, incomplete)
+                .expect_err("blocked subject without a facts identity must fail")
+                .contains("missing facts identity")
+        );
     }
 
     #[test]
@@ -3502,9 +3503,11 @@ mod tests {
                      crate::target\t1\t1\t1\t1\tref\t-\t0\t0\t-\t-\tparam\tparam-no-site\t\n";
         let outcomes = "{\"fn_path\":\"crate::target\",\"mir_local\":1,\"outcome\":\"degraded\",\"degrade_reason\":\"call-site-not-adapted\"}\n";
 
-        assert!(parse_s36_program(facts, outcomes)
-            .expect_err("blocked unreferenced subjects must fail")
-            .contains("unreferenced"));
+        assert!(
+            parse_s36_program(facts, outcomes)
+                .expect_err("blocked unreferenced subjects must fail")
+                .contains("unreferenced")
+        );
     }
 
     #[test]
@@ -3574,14 +3577,11 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(parse_reconciled_worker_artifact(
-            "lambda7",
-            "linux-x86_64",
-            "fixture",
-            &incomplete,
-        )
-        .expect_err("incomplete aligned inventory must fail")
-        .contains("aligned inventory"));
+        assert!(
+            parse_reconciled_worker_artifact("lambda7", "linux-x86_64", "fixture", &incomplete,)
+                .expect_err("incomplete aligned inventory must fail")
+                .contains("aligned inventory")
+        );
     }
 
     #[test]

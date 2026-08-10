@@ -40,12 +40,12 @@ mod places_conflict;
 
 // Name-parity re-exports: callers reach `borrow_engine::borrow_conflicts[_replaying]`, matching
 // production `borrow::borrow_conflicts[_replaying]` (the module path is the only distinguisher).
-pub(crate) use conflicts::{
-    borrow_conflicts_replaying_witnessed, borrow_conflicts_replaying_with_flows,
-    borrow_conflicts_with_flows,
-};
 #[cfg(test)]
 pub(crate) use conflicts::{borrow_conflicts, borrow_conflicts_replaying};
+pub(crate) use conflicts::{
+    borrow_conflicts_replaying_with_flows, borrow_conflicts_replaying_witnessed,
+    borrow_conflicts_with_flows,
+};
 // §NB4-R: the compose/type-check decision, re-exported so its fallback is unit-testable in isolation
 // (grouping-independent — see `nb4r_route_compose_fallback_on_type_mismatch`).
 #[cfg(test)]

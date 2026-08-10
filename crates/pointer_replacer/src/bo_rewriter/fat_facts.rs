@@ -34,8 +34,8 @@
 //! no `is_thin`, because a caller that could ask that question would be asking
 //! the one this analysis cannot answer.
 
-use rustc_middle::mir::Local;
 use rustc_hir::def_id::LocalDefId;
+use rustc_middle::mir::Local;
 
 use crate::{
     analyses::type_qualifier::foster::fatness::{Fatness, FatnessResult, fatness_analysis},
