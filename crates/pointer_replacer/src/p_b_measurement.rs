@@ -40,6 +40,7 @@ const S36_RS_CORPUS_SHA256: &str =
     "f158c7c81c6f96b1710afa1450a03b434853f4abad8d5b64c34e922276121b57";
 const HISTORICAL_AGGREGATE_MANIFEST_SHA256: &str =
     "12acf99ef73dbea55cb869351840dceac7004732b008d4c6c9b574c54826f961";
+const LIBTEST_WORKER_PREFIX: &str = "test bo_c1::boc1_run_one ... ";
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct CoverageCounts {
@@ -943,6 +944,14 @@ fn parse_usize(field: &str, value: &str) -> Result<usize, String> {
         .map_err(|error| format!("invalid {field} {value:?}: {error}"))
 }
 
+fn p_b_schema_line(line: &str) -> Option<&str> {
+    if line.starts_with("PB") {
+        return Some(line);
+    }
+    line.strip_prefix(LIBTEST_WORKER_PREFIX)
+        .filter(|line| line.starts_with("PBCOUNT\t"))
+}
+
 fn parse_worker_artifact(
     machine_id: &str,
     platform: &str,
@@ -953,10 +962,10 @@ fn parse_worker_artifact(
     let mut roots = BTreeMap::new();
     let mut public_roots = BTreeSet::new();
     let mut reachable = BTreeMap::new();
-    for (offset, line) in text.lines().enumerate() {
-        if !line.starts_with("PB") {
+    for (offset, raw_line) in text.lines().enumerate() {
+        let Some(line) = p_b_schema_line(raw_line) else {
             continue;
-        }
+        };
         let fields = line.split('\t').collect::<Vec<_>>();
         let check_identity = |expected_len: usize| -> Result<(), String> {
             if fields.len() != expected_len {
@@ -3265,6 +3274,35 @@ mod tests {
                 .expect("complete fixture")
                 .graph,
             measured
+        );
+    }
+
+    #[test]
+    fn p_b_schema_accepts_exact_libtest_prefix_on_first_count_row() {
+        let graph = BTreeMap::from([("root".to_owned(), node(true, false, &[]))]);
+        let measured = measure_graph(&graph).expect("valid fixture");
+        let text = render_worker_artifact(
+            "lambda7",
+            "linux-x86_64",
+            "fixture",
+            &measured,
+            1,
+            Default::default(),
+        )
+        .expect("render fixture");
+        let wrapped = text.replacen("PBCOUNT\t", "test bo_c1::boc1_run_one ... PBCOUNT\t", 1);
+
+        assert_eq!(
+            parse_worker_artifact("lambda7", "linux-x86_64", "fixture", &wrapped)
+                .expect("the exact libtest framing prefix must be accepted")
+                .graph,
+            measured
+        );
+        let near_match = text.replacen("PBCOUNT\t", "test other::worker ... PBCOUNT\t", 1);
+        assert!(
+            parse_worker_artifact("lambda7", "linux-x86_64", "fixture", &near_match)
+                .expect_err("other stdout prefixes must remain rejected")
+                .contains("missing PBCOUNT")
         );
     }
 
