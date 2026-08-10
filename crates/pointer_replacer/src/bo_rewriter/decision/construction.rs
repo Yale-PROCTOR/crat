@@ -32,12 +32,12 @@
 //! apart: the first is a statement about this analysis's scope, the second
 //! would be a statement about the program.
 
+use rustc_hash::FxHashMap;
 use rustc_hir::{
     HirId,
     def_id::LocalDefId,
     intravisit::{self, Visitor},
 };
-use rustc_hash::FxHashMap;
 use rustc_middle::ty::TyCtxt;
 
 /// How a pointer binding got its value.
@@ -117,7 +117,9 @@ pub(crate) struct ConstructionFacts {
     pub by_binding: FxHashMap<(LocalDefId, HirId), Construction>,
 }
 
-const ALLOCATORS: &[&str] = &["malloc", "calloc", "realloc", "xmalloc", "xcalloc", "strdup"];
+const ALLOCATORS: &[&str] = &[
+    "malloc", "calloc", "realloc", "xmalloc", "xcalloc", "strdup",
+];
 
 pub(crate) fn collect(tcx: TyCtxt<'_>, fns: &[LocalDefId]) -> ConstructionFacts {
     let mut facts = ConstructionFacts::default();
@@ -187,7 +189,9 @@ impl Collector<'_, '_> {
                         ("realloc", 2) => (None, self.snippet(args[1].span)),
                         _ => (
                             None,
-                            args.first().map(|a| self.snippet(a.span)).unwrap_or_default(),
+                            args.first()
+                                .map(|a| self.snippet(a.span))
+                                .unwrap_or_default(),
                         ),
                     };
                     Construction::Alloc {
@@ -232,9 +236,8 @@ impl Collector<'_, '_> {
             rustc_hir::ExprKind::Index(..) => Construction::IndexAddr,
             // `(*s).field` and `*p` — the length lives with the source place,
             // which this analysis does not chase.
-            rustc_hir::ExprKind::Field(..) | rustc_hir::ExprKind::Unary(rustc_hir::UnOp::Deref, _) => {
-                Construction::PlaceRead
-            }
+            rustc_hir::ExprKind::Field(..)
+            | rustc_hir::ExprKind::Unary(rustc_hir::UnOp::Deref, _) => Construction::PlaceRead,
             _ => Construction::Other,
         }
     }

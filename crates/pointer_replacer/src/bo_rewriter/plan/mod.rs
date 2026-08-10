@@ -388,7 +388,9 @@ pub(crate) fn plan(
                     },
                     owner_fn: owner_of(subject),
                 }),
-                Ok(_) => use_failure = Some("slice use is in a different file from the declaration"),
+                Ok(_) => {
+                    use_failure = Some("slice use is in a different file from the declaration")
+                }
                 Err(reason) => use_failure = Some(reason),
             }
         }
@@ -410,7 +412,10 @@ pub(crate) fn plan(
             (true, true, true) => "OptSlice(mut)",
             (true, true, false) => "OptSlice(shared)",
         };
-        by_file.entry(ty_file.clone()).or_default().extend(use_edits);
+        by_file
+            .entry(ty_file.clone())
+            .or_default()
+            .extend(use_edits);
         by_file.entry(ty_file).or_default().push(Edit {
             lo: ty_lo,
             hi: ty_hi,
@@ -419,7 +424,10 @@ pub(crate) fn plan(
             owner_fn: owner_of(subject),
         });
     }
-    Plan { by_file, unplaceable }
+    Plan {
+        by_file,
+        unplaceable,
+    }
 }
 
 #[cfg(test)]

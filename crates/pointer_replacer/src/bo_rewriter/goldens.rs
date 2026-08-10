@@ -445,10 +445,11 @@ fn a_raw_pointer_operation_is_attributed_at_decision_time() {
         !hit.site.is_empty() && hit.site.contains(':'),
         "degradation carries no usable site: {hit:?}"
     );
-    let DegradeReason::RawPointerOperation { op } = &hit.reason else {
-        unreachable!()
-    };
-    assert_eq!(op, "read", "the attributed operation should be the real one");
+    let DegradeReason::RawPointerOperation { op } = &hit.reason else { unreachable!() };
+    assert_eq!(
+        op, "read",
+        "the attributed operation should be the real one"
+    );
 }
 
 /// **S3.2′-3 — the class g02 used to witness, in its new disposition.**
@@ -885,9 +886,7 @@ fn address_taken_function_is_degraded_not_silently_rewritten() {
 #[test]
 fn raw_only_method_mechanism_covers_representative_entries() {
     for method in ["offset", "wrapping_add"] {
-        let src = format!(
-            "{PREAMBLE}pub unsafe fn f(p: *mut u8) -> *mut u8 {{ p.{method}(1) }}\n"
-        );
+        let src = format!("{PREAMBLE}pub unsafe fn f(p: *mut u8) -> *mut u8 {{ p.{method}(1) }}\n");
         let facts = facts_for_source(&src);
         assert!(
             facts
@@ -1040,4 +1039,3 @@ fn reference_typed_params_are_collected_with_their_own_shape() {
         "degradation names the wrong subject: {hit:?}"
     );
 }
-

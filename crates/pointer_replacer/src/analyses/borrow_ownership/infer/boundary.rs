@@ -7,18 +7,18 @@ use rustc_middle::{
     ty::{Ty, TyCtxt, TyKind},
 };
 
-use super::{matcher, CallArgs, InferCtxt};
+use super::{CallArgs, InferCtxt, matcher};
 use crate::analyses::{
     borrow_ownership::{
+        AnalysisKind, BoOwnershipProbe, CrateCtxt,
         call_graph::Monotonicity,
         ptr::Measurable,
-        solver::{with_own_assume_site, OwnAssumeSite},
+        solver::{OwnAssumeSite, with_own_assume_site},
         ssa::{
-            constraint::{infer::InferMode, Database, GlobalAssumptions, Var},
+            constraint::{Database, GlobalAssumptions, Var, infer::InferMode},
             consume::Consume,
         },
         struct_ctxt::StructCtxt,
-        AnalysisKind, BoOwnershipProbe, CrateCtxt,
     },
     lattice::FlatSet,
 };
@@ -324,11 +324,12 @@ where 'tcx: 'infercx
                 };
                 assert_eq!(arg.size_hint().1.unwrap(), param.size_hint().1.unwrap());
                 for (arg, param) in arg.zip(param) {
-                    database.push_equal::<crate::analyses::borrow_ownership::ssa::constraint::Debug>(
-                        (),
-                        arg,
-                        param,
-                    );
+                    database
+                        .push_equal::<crate::analyses::borrow_ownership::ssa::constraint::Debug>(
+                            (),
+                            arg,
+                            param,
+                        );
                 }
             }
         }

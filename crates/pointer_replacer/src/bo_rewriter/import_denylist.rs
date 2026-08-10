@@ -124,10 +124,7 @@ fn scan_root(
 /// keeps concurrent `cargo test` processes from colliding on a shared tag.
 #[cfg(test)]
 fn temp_corpus(tag: &str, files: &[(&str, &str)]) -> std::path::PathBuf {
-    let dir = std::env::temp_dir().join(format!(
-        "crat-denylist-{}-{tag}",
-        std::process::id()
-    ));
+    let dir = std::env::temp_dir().join(format!("crat-denylist-{}-{tag}", std::process::id()));
     let _ = fs::remove_dir_all(&dir);
     fs::create_dir_all(&dir).expect("create temp corpus");
     for (name, body) in files {
@@ -313,7 +310,11 @@ fn scan_phase(dir: &Path, rule: &PhaseRule) -> Vec<String> {
     for file in &files {
         let text = fs::read_to_string(file)
             .unwrap_or_else(|e| panic!("unreadable phase source {file:?}: {e}"));
-        let name = file.file_name().unwrap_or_default().to_string_lossy().into_owned();
+        let name = file
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned();
 
         // (a) IMPORTS — resolved from the use-tree, so a brace-merged form is
         // matched on its full path rather than on the text of one line.
@@ -494,9 +495,7 @@ fn matcher_catches_both_breach_shapes() {
 
     // And the shape that defeated the old matcher must be one no LINE contains.
     assert!(
-        !brace_merged
-            .lines()
-            .any(|l| l.contains("crate::analyses")),
+        !brace_merged.lines().any(|l| l.contains("crate::analyses")),
         "the brace-merged fixture no longer exercises the evasion it exists to \
          reproduce — a line scan would catch it, so this witness is inert"
     );
@@ -988,10 +987,8 @@ fn fatness_ban_matches_a_synthetic_breach() {
     // most natural way to wire the analysis in. Only the `type_qualifier`
     // needle sees it, so only this assertion pins that needle.
     assert!(
-        fatness_offense(
-            "use crate::analyses::type_qualifier::foster::fatness::fatness_analysis;"
-        )
-        .is_some(),
+        fatness_offense("use crate::analyses::type_qualifier::foster::fatness::fatness_analysis;")
+            .is_some(),
         "a lowercase import of the analysis entry point carries no `Fatness` \
          token — the `type_qualifier` needle is the only thing that catches it"
     );
@@ -1131,11 +1128,18 @@ fn frozen_rewriter_scan_reports_a_synthetic_corpus_violation() {
         "frozen",
         &[
             ("bad.rs", "use crate::rewriter::decision::PtrKind;\n"),
-            ("good.rs", "use crate::analyses::borrow_ownership::SlotKind;\n"),
+            (
+                "good.rs",
+                "use crate::analyses::borrow_ownership::SlotKind;\n",
+            ),
         ],
     );
     let hits = scan_root(&dir, &|_| false, &frozen_rewriter_offense);
-    assert_eq!(hits.len(), 1, "expected exactly the one violation: {hits:?}");
+    assert_eq!(
+        hits.len(),
+        1,
+        "expected exactly the one violation: {hits:?}"
+    );
     assert!(hits[0].starts_with("bad.rs:1:"), "{hits:?}");
     drop_corpus(&dir);
 }
@@ -1156,11 +1160,18 @@ fn if_let_scan_reports_a_synthetic_corpus_violation() {
                 "bad.rs",
                 "fn t() {\n    if let RewriteOutcome::Degraded { .. } = out {}\n}\n",
             ),
-            ("good.rs", "fn t() {\n    match out {\n        _ => {}\n    }\n}\n"),
+            (
+                "good.rs",
+                "fn t() {\n    match out {\n        _ => {}\n    }\n}\n",
+            ),
         ],
     );
     let hits = scan_root(&dir, &|_| false, &if_let_offense);
-    assert_eq!(hits.len(), 1, "expected exactly the one violation: {hits:?}");
+    assert_eq!(
+        hits.len(),
+        1,
+        "expected exactly the one violation: {hits:?}"
+    );
     assert!(hits[0].starts_with("bad.rs:2:"), "{hits:?}");
     drop_corpus(&dir);
 }
@@ -1181,7 +1192,11 @@ fn coverage_recon_scan_reports_a_synthetic_corpus_violation() {
         ],
     );
     let hits = scan_root(&dir, &|_| false, &bo_rewriter_reference);
-    assert_eq!(hits.len(), 1, "expected exactly the one violation: {hits:?}");
+    assert_eq!(
+        hits.len(),
+        1,
+        "expected exactly the one violation: {hits:?}"
+    );
     assert!(hits[0].starts_with("bad.rs:1:"), "{hits:?}");
     drop_corpus(&dir);
 }
@@ -1205,8 +1220,14 @@ fn phase_scan_reports_a_synthetic_corpus_violation() {
     let dir = temp_corpus(
         "phase",
         &[
-            ("bad_import.rs", "use crate::analyses::borrow_ownership::SlotKind;\n"),
-            ("bad_path.rs", "fn f() {\n    let _ = crate::analyses::thing();\n}\n"),
+            (
+                "bad_import.rs",
+                "use crate::analyses::borrow_ownership::SlotKind;\n",
+            ),
+            (
+                "bad_path.rs",
+                "fn f() {\n    let _ = crate::analyses::thing();\n}\n",
+            ),
             ("good.rs", "use super::schema::Row;\n"),
         ],
     );
@@ -1332,12 +1353,22 @@ fn the_emission_path_scan_counts_every_call_site() {
     let dir = temp_corpus(
         "emission-two-sites",
         &[
-            ("one.rs", "fn a() {\n    let x = emit_files(tcx, &table);\n}\n"),
-            ("two.rs", "fn b() {\n    let y = emit_files(tcx, &table);\n}\n"),
+            (
+                "one.rs",
+                "fn a() {\n    let x = emit_files(tcx, &table);\n}\n",
+            ),
+            (
+                "two.rs",
+                "fn b() {\n    let y = emit_files(tcx, &table);\n}\n",
+            ),
         ],
     );
     let hits = emission_call_sites(&dir, &|_| false);
-    assert_eq!(hits.len(), 2, "the scan missed a second emission path: {hits:?}");
+    assert_eq!(
+        hits.len(),
+        2,
+        "the scan missed a second emission path: {hits:?}"
+    );
     let _ = fs::remove_dir_all(&dir);
 }
 
@@ -1354,7 +1385,10 @@ fn the_emission_path_scan_ignores_the_test_tail() {
         )],
     );
     let hits = emission_call_sites(&dir, &|_| false);
-    assert!(hits.is_empty(), "a test-tail call was reported as production: {hits:?}");
+    assert!(
+        hits.is_empty(),
+        "a test-tail call was reported as production: {hits:?}"
+    );
     let _ = fs::remove_dir_all(&dir);
 }
 

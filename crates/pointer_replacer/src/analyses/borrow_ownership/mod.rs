@@ -6,37 +6,37 @@
 
 use std::ops::Range;
 
-pub(crate) mod boundary_table;
+mod assoc;
 pub(crate) mod borrow_engine;
-pub(crate) mod l2;
-pub(crate) mod origin_flow;
-pub(crate) mod origin_summary;
-pub(crate) mod origins;
+pub(crate) mod borrow_verify;
+pub(crate) mod boundary_table;
+mod call_graph;
+pub mod coherence;
+pub mod crate_slots;
+#[cfg(test)]
+mod dependency_ratchet;
 mod domain;
 pub(crate) mod export;
 mod infer;
-pub(crate) mod borrow_verify;
-pub mod coherence;
-pub mod crate_slots;
-pub(crate) mod sources;
-pub mod resolve;
-pub(crate) mod mutability_facts;
-pub(crate) mod safety_mono;
+pub(crate) mod l2;
 pub(crate) mod model_cache;
-pub(crate) mod slot_key;
-pub mod solver;
-pub mod slots;
-mod assoc;
-mod call_graph;
+pub(crate) mod mutability_facts;
+pub(crate) mod origin_flow;
+pub(crate) mod origin_summary;
+pub(crate) mod origins;
 #[cfg(not(test))]
 mod ptr;
 #[cfg(test)]
 pub(crate) mod ptr;
+pub mod resolve;
+pub(crate) mod safety_mono;
+pub(crate) mod slot_key;
+pub mod slots;
+pub mod solver;
+pub(crate) mod sources;
+pub mod ssa;
 mod struct_ctxt;
 mod vec_vec;
-pub mod ssa;
-#[cfg(test)]
-mod dependency_ratchet;
 
 #[allow(unused_imports)]
 pub use domain::SlotKind;
@@ -46,19 +46,17 @@ use rustc_middle::mir::{Body, Local, Location};
 use z3::ast::Bool;
 
 use crate::{
-    analyses::{
-        borrow_ownership::{
-            call_graph::FnSig,
-            crate_slots::CrateSlots,
-            infer::{FnSummary, InferCtxt},
-            solver::{BoOwnDatabase, KindSolver, Selectors, SlotRef},
-            ssa::{
-                FnResults,
-                constraint::{Database, Gen, GlobalAssumptions, Var, initialize_local},
-                consume::{Consume, initial_definitions},
-                dom::compute_dominance_frontier,
-                state::SSAState,
-            },
+    analyses::borrow_ownership::{
+        call_graph::FnSig,
+        crate_slots::CrateSlots,
+        infer::{FnSummary, InferCtxt},
+        solver::{BoOwnDatabase, KindSolver, Selectors, SlotRef},
+        ssa::{
+            FnResults,
+            constraint::{Database, Gen, GlobalAssumptions, Var, initialize_local},
+            consume::{Consume, initial_definitions},
+            dom::compute_dominance_frontier,
+            state::SSAState,
         },
     },
     utils::rustc::RustProgram,
@@ -474,7 +472,8 @@ fn initial_crate_inter_ctxt<'tcx>(
                 // param settles to Ref via the soft objective; `*out = malloc`
                 // settles to Ref-over-Owning. Hard-seeding here would force every
                 // param Owning (regressing read-only/borrowed caller storage).
-                r#use.zip(def)
+                r#use
+                    .zip(def)
                     .map(|(r#use, def)| Param::Output(Consume { r#use, def }))
             })
             .collect();

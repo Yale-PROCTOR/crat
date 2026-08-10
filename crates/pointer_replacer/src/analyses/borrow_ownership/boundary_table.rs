@@ -176,8 +176,18 @@ const fn entry(
 pub(crate) const TABLE: &[Entry] = &[
     // --- extern "C" callees (ForeignC): BO libc hooks + sources.rs +
     // --- call_graph.rs monotonicity ranking.
-    entry("malloc", Matcher::ForeignC, &[Role::Source], "libc.rs call_malloc; sources.rs; call_graph Alloc"),
-    entry("calloc", Matcher::ForeignC, &[Role::Source], "libc.rs call_calloc; sources.rs; call_graph Alloc"),
+    entry(
+        "malloc",
+        Matcher::ForeignC,
+        &[Role::Source],
+        "libc.rs call_malloc; sources.rs; call_graph Alloc",
+    ),
+    entry(
+        "calloc",
+        Matcher::ForeignC,
+        &[Role::Source],
+        "libc.rs call_calloc; sources.rs; call_graph Alloc",
+    ),
     entry(
         "strdup",
         Matcher::ForeignC,
@@ -200,7 +210,12 @@ pub(crate) const TABLE: &[Entry] = &[
         "libc.rs call_free: sink(arg0); call_graph Dealloc. \
          Sink owning selector-retractable since NB-F (leak-the-free).",
     ),
-    entry("memset", Matcher::ForeignC, &[Role::FlowTransfer], "libc.rs call_memset: transfer(dest, arg)"),
+    entry(
+        "memset",
+        Matcher::ForeignC,
+        &[Role::FlowTransfer],
+        "libc.rs call_memset: transfer(dest, arg)",
+    ),
     // --- BO library hooks (RustPtrPath: def_path starts at TypeNs("ptr")).
     entry(
         "offset",
@@ -216,47 +231,192 @@ pub(crate) const TABLE: &[Entry] = &[
          outer-reference slot peeled before the lend (the former uthash tripwire \
          assert!(!is_ref) is gone)",
     ),
-    entry("addr", Matcher::RustPtrPath, &[Role::Ignore], "library.rs call_addr: arg ignored"),
+    entry(
+        "addr",
+        Matcher::RustPtrPath,
+        &[Role::Ignore],
+        "library.rs call_addr: arg ignored",
+    ),
     // --- production is_borrowing_method (borrow/mod.rs:779-785): reborrow of
     // --- arg0 into the destination = loan creation.
-    entry("offset", Matcher::RustLibAssoc, &[Role::LoanCreating], "is_borrowing_method"),
-    entry("as_ptr", Matcher::RustLibAssoc, &[Role::LoanCreating], "is_borrowing_method"),
-    entry("as_mut_ptr", Matcher::RustLibAssoc, &[Role::LoanCreating], "is_borrowing_method"),
+    entry(
+        "offset",
+        Matcher::RustLibAssoc,
+        &[Role::LoanCreating],
+        "is_borrowing_method",
+    ),
+    entry(
+        "as_ptr",
+        Matcher::RustLibAssoc,
+        &[Role::LoanCreating],
+        "is_borrowing_method",
+    ),
+    entry(
+        "as_mut_ptr",
+        Matcher::RustLibAssoc,
+        &[Role::LoanCreating],
+        "is_borrowing_method",
+    ),
     // --- production lifetime_flow pointer arithmetic (:1314-1334).
-    entry("wrapping_offset", Matcher::RustLibAssoc, &[Role::ProvenanceFlow], "lifetime_flow arith: arg0 -> return"),
-    entry("byte_offset", Matcher::RustLibAssoc, &[Role::ProvenanceFlow], "lifetime_flow arith: arg0 -> return"),
-    entry("wrapping_byte_offset", Matcher::RustLibAssoc, &[Role::ProvenanceFlow], "lifetime_flow arith: arg0 -> return"),
-    entry("add", Matcher::RustLibAssoc, &[Role::ProvenanceFlow], "lifetime_flow arith: arg0 -> return"),
-    entry("wrapping_add", Matcher::RustLibAssoc, &[Role::ProvenanceFlow], "lifetime_flow arith: arg0 -> return"),
-    entry("sub", Matcher::RustLibAssoc, &[Role::ProvenanceFlow], "lifetime_flow arith: arg0 -> return"),
-    entry("wrapping_sub", Matcher::RustLibAssoc, &[Role::ProvenanceFlow], "lifetime_flow arith: arg0 -> return"),
+    entry(
+        "wrapping_offset",
+        Matcher::RustLibAssoc,
+        &[Role::ProvenanceFlow],
+        "lifetime_flow arith: arg0 -> return",
+    ),
+    entry(
+        "byte_offset",
+        Matcher::RustLibAssoc,
+        &[Role::ProvenanceFlow],
+        "lifetime_flow arith: arg0 -> return",
+    ),
+    entry(
+        "wrapping_byte_offset",
+        Matcher::RustLibAssoc,
+        &[Role::ProvenanceFlow],
+        "lifetime_flow arith: arg0 -> return",
+    ),
+    entry(
+        "add",
+        Matcher::RustLibAssoc,
+        &[Role::ProvenanceFlow],
+        "lifetime_flow arith: arg0 -> return",
+    ),
+    entry(
+        "wrapping_add",
+        Matcher::RustLibAssoc,
+        &[Role::ProvenanceFlow],
+        "lifetime_flow arith: arg0 -> return",
+    ),
+    entry(
+        "sub",
+        Matcher::RustLibAssoc,
+        &[Role::ProvenanceFlow],
+        "lifetime_flow arith: arg0 -> return",
+    ),
+    entry(
+        "wrapping_sub",
+        Matcher::RustLibAssoc,
+        &[Role::ProvenanceFlow],
+        "lifetime_flow arith: arg0 -> return",
+    ),
     // --- production lifetime_flow slice views (:1336-1350; RustLib without a
     // --- def-kind check; guarded on a slice-like-ref destination type).
-    entry("cast_slice", Matcher::RustLibNonLocal, &[Role::ProvenanceFlow], "lifetime_flow slice view; dest must be slice-like ref"),
-    entry("cast_slice_mut", Matcher::RustLibNonLocal, &[Role::ProvenanceFlow], "lifetime_flow slice view; dest must be slice-like ref"),
-    entry("from_raw_parts", Matcher::RustLibNonLocal, &[Role::ProvenanceFlow], "lifetime_flow slice view; dest must be slice-like ref"),
-    entry("from_raw_parts_mut", Matcher::RustLibNonLocal, &[Role::ProvenanceFlow], "lifetime_flow slice view; dest must be slice-like ref"),
+    entry(
+        "cast_slice",
+        Matcher::RustLibNonLocal,
+        &[Role::ProvenanceFlow],
+        "lifetime_flow slice view; dest must be slice-like ref",
+    ),
+    entry(
+        "cast_slice_mut",
+        Matcher::RustLibNonLocal,
+        &[Role::ProvenanceFlow],
+        "lifetime_flow slice view; dest must be slice-like ref",
+    ),
+    entry(
+        "from_raw_parts",
+        Matcher::RustLibNonLocal,
+        &[Role::ProvenanceFlow],
+        "lifetime_flow slice view; dest must be slice-like ref",
+    ),
+    entry(
+        "from_raw_parts_mut",
+        Matcher::RustLibNonLocal,
+        &[Role::ProvenanceFlow],
+        "lifetime_flow slice view; dest must be slice-like ref",
+    ),
     // --- production lifetime_flow slice indexing (:1352-1366; arg0 must be
     // --- slice-like ref).
-    entry("index", Matcher::RustLibAssoc, &[Role::ProvenanceFlow], "lifetime_flow slice index; arg0 must be slice-like ref"),
-    entry("index_mut", Matcher::RustLibAssoc, &[Role::ProvenanceFlow], "lifetime_flow slice index; arg0 must be slice-like ref"),
-    entry("get_unchecked", Matcher::RustLibAssoc, &[Role::ProvenanceFlow], "lifetime_flow slice index; arg0 must be slice-like ref"),
-    entry("get_unchecked_mut", Matcher::RustLibAssoc, &[Role::ProvenanceFlow], "lifetime_flow slice index; arg0 must be slice-like ref"),
+    entry(
+        "index",
+        Matcher::RustLibAssoc,
+        &[Role::ProvenanceFlow],
+        "lifetime_flow slice index; arg0 must be slice-like ref",
+    ),
+    entry(
+        "index_mut",
+        Matcher::RustLibAssoc,
+        &[Role::ProvenanceFlow],
+        "lifetime_flow slice index; arg0 must be slice-like ref",
+    ),
+    entry(
+        "get_unchecked",
+        Matcher::RustLibAssoc,
+        &[Role::ProvenanceFlow],
+        "lifetime_flow slice index; arg0 must be slice-like ref",
+    ),
+    entry(
+        "get_unchecked_mut",
+        Matcher::RustLibAssoc,
+        &[Role::ProvenanceFlow],
+        "lifetime_flow slice index; arg0 must be slice-like ref",
+    ),
     // --- production lifetime_flow slice splits (:1368-1382; suppression only
     // --- — no flow edge; arg0 slice-like ref AND dest a slice-ref pair).
-    entry("split_at", Matcher::RustLibAssoc, &[Role::FlowSuppression], "lifetime_flow split; suppresses poisoning, adds no edge"),
-    entry("split_at_mut", Matcher::RustLibAssoc, &[Role::FlowSuppression], "lifetime_flow split; suppresses poisoning, adds no edge"),
-    entry("split_at_unchecked", Matcher::RustLibAssoc, &[Role::FlowSuppression], "lifetime_flow split; suppresses poisoning, adds no edge"),
-    entry("split_at_mut_unchecked", Matcher::RustLibAssoc, &[Role::FlowSuppression], "lifetime_flow split; suppresses poisoning, adds no edge"),
+    entry(
+        "split_at",
+        Matcher::RustLibAssoc,
+        &[Role::FlowSuppression],
+        "lifetime_flow split; suppresses poisoning, adds no edge",
+    ),
+    entry(
+        "split_at_mut",
+        Matcher::RustLibAssoc,
+        &[Role::FlowSuppression],
+        "lifetime_flow split; suppresses poisoning, adds no edge",
+    ),
+    entry(
+        "split_at_unchecked",
+        Matcher::RustLibAssoc,
+        &[Role::FlowSuppression],
+        "lifetime_flow split; suppresses poisoning, adds no edge",
+    ),
+    entry(
+        "split_at_mut_unchecked",
+        Matcher::RustLibAssoc,
+        &[Role::FlowSuppression],
+        "lifetime_flow split; suppresses poisoning, adds no edge",
+    ),
     // --- production lifetime_flow C-string search (:1384-1408; bare name
     // --- across EVERY callee kind — no foreign/local gate at all).
-    entry("strchr", Matcher::AnyName, &[Role::ProvenanceFlow], "lifetime_flow C-string search: arg0 -> return"),
-    entry("strrchr", Matcher::AnyName, &[Role::ProvenanceFlow], "lifetime_flow C-string search: arg0 -> return"),
-    entry("strstr", Matcher::AnyName, &[Role::ProvenanceFlow], "lifetime_flow C-string search: arg0 -> return"),
-    entry("memchr", Matcher::AnyName, &[Role::ProvenanceFlow], "lifetime_flow memchr; arg0 must be slice-like ref"),
+    entry(
+        "strchr",
+        Matcher::AnyName,
+        &[Role::ProvenanceFlow],
+        "lifetime_flow C-string search: arg0 -> return",
+    ),
+    entry(
+        "strrchr",
+        Matcher::AnyName,
+        &[Role::ProvenanceFlow],
+        "lifetime_flow C-string search: arg0 -> return",
+    ),
+    entry(
+        "strstr",
+        Matcher::AnyName,
+        &[Role::ProvenanceFlow],
+        "lifetime_flow C-string search: arg0 -> return",
+    ),
+    entry(
+        "memchr",
+        Matcher::AnyName,
+        &[Role::ProvenanceFlow],
+        "lifetime_flow memchr; arg0 must be slice-like ref",
+    ),
     // --- production lifetime_flow null constructors (:1306-1312).
-    entry("null", Matcher::RustLibNonLocal, &[Role::NullConstructor], "lifetime_flow: fresh pointer, no provenance"),
-    entry("null_mut", Matcher::RustLibNonLocal, &[Role::NullConstructor], "lifetime_flow: fresh pointer, no provenance"),
+    entry(
+        "null",
+        Matcher::RustLibNonLocal,
+        &[Role::NullConstructor],
+        "lifetime_flow: fresh pointer, no provenance",
+    ),
+    entry(
+        "null_mut",
+        Matcher::RustLibNonLocal,
+        &[Role::NullConstructor],
+        "lifetime_flow: fresh pointer, no provenance",
+    ),
 ];
 
 /// The allocator names `sources.rs` consumes: ForeignC rows carrying
@@ -325,7 +485,10 @@ mod tests {
         derived.sort_unstable();
         let mut expected = legacy;
         expected.sort_unstable();
-        assert_eq!(derived, expected, "sources_foreign() must equal the legacy set");
+        assert_eq!(
+            derived, expected,
+            "sources_foreign() must equal the legacy set"
+        );
     }
 
     /// Legacy list 2 — production `borrow/mod.rs:779-785 is_borrowing_method`
@@ -366,7 +529,12 @@ mod tests {
                 "`{name}` must be RustLibAssoc ProvenanceFlow (pointer arithmetic)"
             );
         }
-        for name in ["cast_slice", "cast_slice_mut", "from_raw_parts", "from_raw_parts_mut"] {
+        for name in [
+            "cast_slice",
+            "cast_slice_mut",
+            "from_raw_parts",
+            "from_raw_parts_mut",
+        ] {
             assert!(
                 has_role(name, Matcher::RustLibNonLocal, Role::ProvenanceFlow),
                 "`{name}` must be RustLibNonLocal ProvenanceFlow (slice view)"
@@ -378,7 +546,12 @@ mod tests {
                 "`{name}` must be RustLibAssoc ProvenanceFlow (slice index)"
             );
         }
-        for name in ["split_at", "split_at_mut", "split_at_unchecked", "split_at_mut_unchecked"] {
+        for name in [
+            "split_at",
+            "split_at_mut",
+            "split_at_unchecked",
+            "split_at_mut_unchecked",
+        ] {
             assert!(
                 has_role(name, Matcher::RustLibAssoc, Role::FlowSuppression),
                 "`{name}` must be RustLibAssoc FlowSuppression (slice split)"

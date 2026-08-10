@@ -50,7 +50,6 @@
 //! tests and by any future in-process consumer that has already decided it
 //! wants a recording; the flag governs the *ambient* arm, not the explicit one.
 
-
 use std::cell::RefCell;
 
 use rustc_hash::FxHashMap;
@@ -177,7 +176,10 @@ impl PlaceKey {
     /// Derived view, kept so E-R2/E-R4 consumers written against the old shape
     /// do not change. The lossy form is no longer what is STORED.
     pub(crate) fn derefs(&self) -> usize {
-        self.proj.iter().filter(|p| matches!(p, ProjKey::Deref)).count()
+        self.proj
+            .iter()
+            .filter(|p| matches!(p, ProjKey::Deref))
+            .count()
     }
 
     /// Derived view; see [`PlaceKey::derefs`].

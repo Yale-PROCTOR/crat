@@ -5,8 +5,8 @@ use rustc_span::def_id::LocalDefId;
 use super::{
     crate_slots::{CrateSlots, MAX_SLOT_DEPTH},
     resolve::{ResolvedSlot, resolve_place},
-    solver::{KindSolver, SlotRef},
     slots::StructFieldSlot,
+    solver::{KindSolver, SlotRef},
 };
 use crate::utils::rustc::RustProgram;
 
@@ -180,7 +180,10 @@ fn scan_field_stores(
                 {
                     for (field_idx, operand) in operands.iter_enumerated() {
                         let Some(fid) = slots.field_slots.slot_for_field_depth(
-                            StructFieldSlot { struct_did, field_index: field_idx.index() },
+                            StructFieldSlot {
+                                struct_did,
+                                field_index: field_idx.index(),
+                            },
                             0,
                         ) else {
                             continue;
@@ -189,9 +192,10 @@ fn scan_field_stores(
                         match operand {
                             Operand::Copy(p) | Operand::Move(p) => {
                                 match resolve_place(slots, fn_did, body, *p, 0, None) {
-                                    Some(r) => {
-                                        owned_stores.entry(f).or_default().push(to_slot_ref(r, fn_did))
-                                    }
+                                    Some(r) => owned_stores
+                                        .entry(f)
+                                        .or_default()
+                                        .push(to_slot_ref(r, fn_did)),
                                     None => {
                                         blocked.insert(f);
                                     }
@@ -204,7 +208,8 @@ fn scan_field_stores(
                 }
 
                 // Non-aggregate: is `lhs` a struct-field store?
-                let Some(ResolvedSlot::Field(fid)) = resolve_place(slots, fn_did, body, *lhs, 0, None)
+                let Some(ResolvedSlot::Field(fid)) =
+                    resolve_place(slots, fn_did, body, *lhs, 0, None)
                 else {
                     continue;
                 };
@@ -217,13 +222,17 @@ fn scan_field_stores(
                     Rvalue::Use(Operand::Copy(p) | Operand::Move(p))
                     | Rvalue::CopyForDeref(p)
                     | Rvalue::Cast(_, Operand::Copy(p) | Operand::Move(p), _) => Some(*p),
-                    Rvalue::Use(Operand::Constant(_)) | Rvalue::Cast(_, Operand::Constant(_), _) => {
+                    Rvalue::Use(Operand::Constant(_))
+                    | Rvalue::Cast(_, Operand::Constant(_), _) => {
                         continue;
                     }
                     _ => None,
                 };
                 match rhs_place.and_then(|p| resolve_place(slots, fn_did, body, p, 0, None)) {
-                    Some(r) => owned_stores.entry(f).or_default().push(to_slot_ref(r, fn_did)),
+                    Some(r) => owned_stores
+                        .entry(f)
+                        .or_default()
+                        .push(to_slot_ref(r, fn_did)),
                     None => {
                         blocked.insert(f);
                     }

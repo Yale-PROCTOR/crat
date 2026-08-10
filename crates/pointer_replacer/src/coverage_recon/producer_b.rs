@@ -50,33 +50,28 @@ pub(crate) fn rows(tcx: TyCtxt<'_>) -> Vec<Row> {
             });
             let first = debug_entries.next();
             let second = debug_entries.next();
-            let (
-                param_name,
-                arg_index,
-                pairing_confidence,
-                binding_span_lo,
-                binding_span_hi,
-            ) = match (first, second) {
-                (Some(info), None) => match info.argument_index {
-                    Some(arg_index) => {
-                        let source_map = tcx.sess.source_map();
-                        let span = info.source_info.span;
-                        let binding_span_lo =
-                            Some(source_map.lookup_byte_offset(span.lo()).pos.0);
-                        let binding_span_hi =
-                            Some(source_map.lookup_byte_offset(span.hi()).pos.0);
-                        (
-                            Some(info.name.to_string()),
-                            Some(arg_index as u32),
-                            PairingConfidence::High,
-                            binding_span_lo,
-                            binding_span_hi,
-                        )
-                    }
-                    None => (None, None, PairingConfidence::Low, None, None),
-                },
-                _ => (None, None, PairingConfidence::Low, None, None),
-            };
+            let (param_name, arg_index, pairing_confidence, binding_span_lo, binding_span_hi) =
+                match (first, second) {
+                    (Some(info), None) => match info.argument_index {
+                        Some(arg_index) => {
+                            let source_map = tcx.sess.source_map();
+                            let span = info.source_info.span;
+                            let binding_span_lo =
+                                Some(source_map.lookup_byte_offset(span.lo()).pos.0);
+                            let binding_span_hi =
+                                Some(source_map.lookup_byte_offset(span.hi()).pos.0);
+                            (
+                                Some(info.name.to_string()),
+                                Some(arg_index as u32),
+                                PairingConfidence::High,
+                                binding_span_lo,
+                                binding_span_hi,
+                            )
+                        }
+                        None => (None, None, PairingConfidence::Low, None, None),
+                    },
+                    _ => (None, None, PairingConfidence::Low, None, None),
+                };
 
             rows.push(Row {
                 fn_path: fn_path.clone(),
@@ -128,20 +123,19 @@ pub(crate) fn rows(tcx: TyCtxt<'_>) -> Vec<Row> {
                 continue;
             }
 
-            let paired_info: Option<&rustc_middle::mir::VarDebugInfo<'_>> =
-                match (first, second) {
-                    (Some(info), None) if info.argument_index.is_none() => Some(info),
-                    (Some(info), None) => {
-                        assert!(
-                            info.argument_index.is_none(),
-                            "non-parameter MIR local {local:?} unexpectedly carries argument_index {:?}",
-                            info.argument_index
-                        );
-                        None
-                    }
-                    (Some(_), Some(_)) => None,
-                    _ => None,
-                };
+            let paired_info: Option<&rustc_middle::mir::VarDebugInfo<'_>> = match (first, second) {
+                (Some(info), None) if info.argument_index.is_none() => Some(info),
+                (Some(info), None) => {
+                    assert!(
+                        info.argument_index.is_none(),
+                        "non-parameter MIR local {local:?} unexpectedly carries argument_index {:?}",
+                        info.argument_index
+                    );
+                    None
+                }
+                (Some(_), Some(_)) => None,
+                _ => None,
+            };
             let (param_name, pairing_confidence, binding_span_lo, binding_span_hi) =
                 match paired_info {
                     Some(info) => {
@@ -294,10 +288,7 @@ mod binding_span_witnesses {
     /// so no deletion can expose a span source for this parameter.
     #[test]
     fn binding_span_is_absent_on_unnamed_parameter_positive_control() {
-        let rows = rows_for_fixture(
-            "#![allow(dead_code)]\nfn unnamed(_: *mut i32) {}\n",
-            &[],
-        );
+        let rows = rows_for_fixture("#![allow(dead_code)]\nfn unnamed(_: *mut i32) {}\n", &[]);
         let row = row_for(&rows, "unnamed");
 
         assert_eq!(row.binding_span_lo, None);
@@ -306,8 +297,7 @@ mod binding_span_witnesses {
 
     #[test]
     fn binding_span_uses_file_relative_offsets() {
-        let fixture_source =
-            "#![allow(dead_code, unused_variables)]\npub fn coordinate_target(coordinate_param: *mut i32) {}\n";
+        let fixture_source = "#![allow(dead_code, unused_variables)]\npub fn coordinate_target(coordinate_param: *mut i32) {}\n";
         let rows = rows_for_fixture(
             "#![allow(dead_code)]\nmod padding;\nmod fixture;\n",
             &[
@@ -661,13 +651,7 @@ mod tests {
             .collect();
         assert_eq!(
             pairing,
-            vec![(
-                2,
-                Some("p"),
-                None,
-                1,
-                PairingConfidence::High,
-            )]
+            vec![(2, Some("p"), None, 1, PairingConfidence::High,)]
         );
     }
 }

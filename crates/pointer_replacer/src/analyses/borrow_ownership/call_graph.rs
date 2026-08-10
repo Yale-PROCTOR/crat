@@ -11,9 +11,9 @@ use rustc_middle::{
 use rustc_type_ir::TyKind::FnDef;
 use smallvec::SmallVec;
 
-use crate::analyses::lattice::{FlatSet, Lattice};
 #[cfg(test)]
 use crate::analyses::borrow_ownership::vec_vec::VecVec;
+use crate::analyses::lattice::{FlatSet, Lattice};
 
 pub struct FnSig<T> {
     pub ret: T,

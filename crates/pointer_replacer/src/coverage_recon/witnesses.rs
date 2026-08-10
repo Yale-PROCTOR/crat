@@ -53,9 +53,7 @@ fn bare_row(fn_path: &str, local: u32, name: Option<&str>, arg: Option<u32>, dep
 
 /// A pair of rows carrying the span axis: A supplies the ty extent, B the
 /// binding extent.
-fn span_pair(
-    local: u32, name: &str, bind: (u32, u32), ty: (u32, u32),
-) -> (Row, Row) {
+fn span_pair(local: u32, name: &str, bind: (u32, u32), ty: (u32, u32)) -> (Row, Row) {
     let mut a = bare_row("f", local, Some(name), Some(local), 1);
     a.decl_span_lo = Some(ty.0);
     a.decl_span_hi = Some(ty.1);
@@ -148,7 +146,10 @@ fn encoding_is_byte_exact_and_never_omits_a_field() {
 fn a_malformed_line_is_an_error_not_a_silent_drop() {
     let text = format!("{}{{not json}}\n", encode(&[full_row()]));
     let err = decode(&text).expect_err("a malformed line must not decode");
-    assert!(err.starts_with("line 2:"), "error must name the line: {err}");
+    assert!(
+        err.starts_with("line 2:"),
+        "error must name the line: {err}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -207,7 +208,10 @@ fn a_row_only_producer_b_has_is_an_attributed_finding() {
     );
     assert_eq!(v.findings.len(), 1, "{v:#?}");
     assert_eq!(v.findings[0].class, "out-of-coverage");
-    assert_eq!(v.findings[0].mir_local, 2, "the finding must name the subject");
+    assert_eq!(
+        v.findings[0].mir_local, 2,
+        "the finding must name the subject"
+    );
     assert_eq!(v.aggregates["out-of-coverage"], 1);
 }
 
@@ -242,7 +246,12 @@ fn a_high_confidence_pairing_mismatch_is_a_violation() {
     assert!(!v.passed(), "a mis-pairing must fail loudly");
     assert_eq!(v.violations[0].class, "pairing-mismatch");
     let d = &v.violations[0].detail;
-    for expected in [r#"name=Some("r")"#, r#"name=Some("q")"#, "arg_index=Some(2)", "arg_index=Some(1)"] {
+    for expected in [
+        r#"name=Some("r")"#,
+        r#"name=Some("q")"#,
+        "arg_index=Some(2)",
+        "arg_index=Some(1)",
+    ] {
         assert!(d.contains(expected), "detail must carry both sides: {d}");
     }
 }
@@ -518,12 +527,16 @@ fn equal_counts_with_disjoint_members_fail_in_both_directions() {
 
     let v = compare(&a, &b);
     assert!(
-        v.violations.iter().any(|x| x.class == "collector-surplus" && x.mir_local == 9),
+        v.violations
+            .iter()
+            .any(|x| x.class == "collector-surplus" && x.mir_local == 9),
         "the A-only member produced no violation — a count-only comparison \
          would accept this input: {v:#?}"
     );
     assert!(
-        v.findings.iter().any(|x| x.class == "out-of-coverage" && x.mir_local == 2),
+        v.findings
+            .iter()
+            .any(|x| x.class == "out-of-coverage" && x.mir_local == 2),
         "the B-only member produced no finding — a count-only comparison \
          would accept this input: {v:#?}"
     );
@@ -574,7 +587,10 @@ fn a_span_permutation_is_caught_and_names_the_index() {
         .filter(|x| x.class == "span-interleave-breach")
         .collect();
     assert_eq!(breach.len(), 1, "expected exactly the one index: {v:#?}");
-    assert_eq!(breach[0].mir_local, 2, "the breach is at the second parameter");
+    assert_eq!(
+        breach[0].mir_local, 2,
+        "the breach is at the second parameter"
+    );
     assert!(breach[0].detail.contains("index 1"), "{:#?}", breach[0]);
 }
 
@@ -598,7 +614,9 @@ fn the_span_follows_conjunct_is_compared() {
     let (a0, b0) = span_pair(1, "p", (50, 58), (47, 49));
     let v = compare(&[a0], &[b0]);
     assert!(
-        v.violations.iter().any(|x| x.class == "span-interleave-breach"),
+        v.violations
+            .iter()
+            .any(|x| x.class == "span-interleave-breach"),
         "a type extent preceding its own binding was accepted — the \
          follows conjunct is not being compared: {v:#?}"
     );
@@ -618,7 +636,9 @@ fn the_span_ordering_conjunct_is_compared() {
     let (a1, b1) = span_pair(2, "q", (60, 61), (95, 99));
     let v = compare(&[a0, a1], &[b0, b1]);
     assert!(
-        v.violations.iter().any(|x| x.class == "span-interleave-breach"),
+        v.violations
+            .iter()
+            .any(|x| x.class == "span-interleave-breach"),
         "an overrunning type extent was accepted: {v:#?}"
     );
 }
@@ -636,7 +656,9 @@ fn an_unevaluable_span_row_gets_its_own_class() {
     let v = compare(&[a0, a1], &[b0, b1]);
     assert_eq!(v.aggregates["span-check-not-evaluable"], 1, "{v:#?}");
     assert!(
-        v.findings.iter().any(|f| f.class == "span-check-not-evaluable"),
+        v.findings
+            .iter()
+            .any(|f| f.class == "span-check-not-evaluable"),
         "{v:#?}"
     );
 }
@@ -744,7 +766,12 @@ fn a_verdict_passes_on_population_pinned_findings_alone() {
     b_local.binding_span_hi = Some(71);
 
     let verdict = compare(&[a_local], &[b_local]);
-    assert_eq!(verdict.aggregates.get(super::compare::POPULATION_PINNED_CLASS), Some(&1));
+    assert_eq!(
+        verdict
+            .aggregates
+            .get(super::compare::POPULATION_PINNED_CLASS),
+        Some(&1)
+    );
     assert!(
         verdict.passed(),
         "a verdict whose ONLY findings are population-pinned must pass — the \

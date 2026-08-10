@@ -250,7 +250,6 @@ fn classify_deref(tcx: TyCtxt<'_>, deref: &Expr<'_>) -> &'static str {
     }
 }
 
-
 /// **Where an arithmetic result lands** — the reslice decision's other axis.
 ///
 /// `call` is the `p.offset(e)` expression itself. -2 authorised exactly two of
@@ -403,7 +402,10 @@ pub unsafe fn c_arith_other(p: *mut i32) -> *mut i32 { p.offset(1) }
             ("c_arith_write", &[("arith-deref-write", 1)]),
             ("c_arith_field", &[("arith-field", 1)]),
             ("c_arith_borrow", &[("arith-borrow", 1)]),
-            ("c_arith_self", &[("assign-target", 1), ("arith-self-advance", 1)]),
+            (
+                "c_arith_self",
+                &[("assign-target", 1), ("arith-self-advance", 1)],
+            ),
             ("c_arith_rebind", &[("arith-rebind", 1)]),
             ("c_arith_callarg", &[("arith-call-arg", 1)]),
             ("c_arith_cast", &[("arith-cast", 1)]),
@@ -424,7 +426,8 @@ pub unsafe fn c_arith_other(p: *mut i32) -> *mut i32 { p.offset(1) }
                 })
                 .collect();
             assert_eq!(
-                got, &want,
+                got,
+                &want,
                 "{func}: expected {classes:?}.\n  classes: {:?}\n  got:     {got:?}",
                 super::CLASSES
             );

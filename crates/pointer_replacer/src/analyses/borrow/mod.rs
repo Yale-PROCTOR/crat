@@ -1046,7 +1046,10 @@ where
             let provenance_set = ctxt.provenances.get_mut(&f).unwrap();
             for (local, base) in to_demote {
                 provenance_set.disable_owner(ProvenanceOwner::Local(local));
-                provenance_set.tree_borrow_local.get_mut().union(local, base);
+                provenance_set
+                    .tree_borrow_local
+                    .get_mut()
+                    .union(local, base);
             }
         };
 
@@ -1371,7 +1374,10 @@ pub fn demote_pointers_iterative_with_fields(
             } = collect_invalid_loan_demotions(&inference, provenance_set, &invalid_loans);
             for (local, base) in local_witnesses {
                 demoted_locals.insert(local);
-                provenance_set.tree_borrow_local.get_mut().union(local, base);
+                provenance_set
+                    .tree_borrow_local
+                    .get_mut()
+                    .union(local, base);
             }
             demoted_field_slots.extend(demoted_fields);
 

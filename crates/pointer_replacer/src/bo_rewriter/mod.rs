@@ -54,10 +54,15 @@ use rustc_middle::{
 
 use crate::{
     analyses::borrow_ownership::{
-        CrateCtxt, SlotKind, borrow_verify::verify_to_fixpoint, coherence::add_coherence,
+        CrateCtxt, SlotKind,
+        borrow_verify::verify_to_fixpoint,
+        coherence::add_coherence,
         crate_slots::{CrateSlots, ptr_chain_depth},
-        emit_crate_ownership_constraints, export::with_bo_export, model_cache,
-        mutability_facts::MutFacts, origins::compute_origins,
+        emit_crate_ownership_constraints,
+        export::with_bo_export,
+        model_cache,
+        mutability_facts::MutFacts,
+        origins::compute_origins,
         solver::{KindSolver, SlotRef},
     },
     utils::rustc::RustProgram,
@@ -226,7 +231,11 @@ pub(crate) fn rewrite_m1(input: &str) -> RewriteOutcome {
     // the ten goldens exercise exactly the mechanism the corpus will. A parallel
     // string pipeline is the hazard class this milestone exists to remove: it
     // would be exercised by every test and by nothing real.
-    rewrite_core(::utils::compilation::str_to_input(input), None, MAX_REVERT_ROUNDS)
+    rewrite_core(
+        ::utils::compilation::str_to_input(input),
+        None,
+        MAX_REVERT_ROUNDS,
+    )
 }
 
 /// M1's **general** entry point: a crate rooted at `root`, rewritten into a temp
@@ -236,7 +245,11 @@ pub(crate) fn rewrite_m1(input: &str) -> RewriteOutcome {
     reason = "no caller until 0a.4's corpus smoke; `rewrite_m1` reaches the same               core through the other entry. Targeted here rather than               module-wide so the lint stays live over everything reachable."
 )]
 pub(crate) fn rewrite_m1_path(root: &std::path::Path) -> RewriteOutcome {
-    rewrite_core(::utils::compilation::path_to_input(root), Some(root), MAX_REVERT_ROUNDS)
+    rewrite_core(
+        ::utils::compilation::path_to_input(root),
+        Some(root),
+        MAX_REVERT_ROUNDS,
+    )
 }
 
 /// **The one emission path.** Both entry points funnel here; they differ only in
@@ -311,7 +324,11 @@ pub(crate) fn rewrite_m1_path_with_cap(
     root: &std::path::Path,
     max_rounds: usize,
 ) -> RewriteOutcome {
-    rewrite_core(::utils::compilation::path_to_input(root), Some(root), max_rounds)
+    rewrite_core(
+        ::utils::compilation::path_to_input(root),
+        Some(root),
+        max_rounds,
+    )
 }
 
 fn rewrite_core(
@@ -353,7 +370,11 @@ fn rewrite_core_injected(
             return Err(format!(
                 "apply rolled back {} edit(s): {:?}",
                 emission.rollbacks.len(),
-                emission.rollbacks.iter().map(|r| r.reason).collect::<Vec<_>>()
+                emission
+                    .rollbacks
+                    .iter()
+                    .map(|r| r.reason)
+                    .collect::<Vec<_>>()
             ));
         }
         let degradations: Vec<decision::Degradation> = table.degradations().cloned().collect();
@@ -558,7 +579,9 @@ fn rewrite_core_injected(
                 baseline_errors: 0,
                 baseline_msg_env: 0,
             };
-            let crate_dir = tree_base.and_then(|root| root.parent()).map(|d| d.to_path_buf());
+            let crate_dir = tree_base
+                .and_then(|root| root.parent())
+                .map(|d| d.to_path_buf());
             let mut reverted: std::collections::BTreeSet<String> =
                 std::collections::BTreeSet::new();
             let mut files = files;
@@ -607,8 +630,13 @@ fn rewrite_core_injected(
                     // Baseline diagnostics appear on both sides, which is what
                     // makes the equality mean anything.
                     facts.first_diags = diagnosis.diags.clone();
-                    facts.observed_root =
-                        Some(staged.root().parent().unwrap_or(staged.root()).to_path_buf());
+                    facts.observed_root = Some(
+                        staged
+                            .root()
+                            .parent()
+                            .unwrap_or(staged.root())
+                            .to_path_buf(),
+                    );
                     facts.files_touched = files.len();
                     return facts.degraded("probe-only: first diagnose recorded".to_owned());
                 }
@@ -619,7 +647,11 @@ fn rewrite_core_injected(
                 facts.baseline_keys = baseline.keys.values().sum();
                 facts.baseline_errors = baseline.errors;
                 facts.baseline_msg_env = baseline.messages_embedding_root;
-                let observed_root = staged.root().parent().unwrap_or(staged.root()).to_path_buf();
+                let observed_root = staged
+                    .root()
+                    .parent()
+                    .unwrap_or(staged.root())
+                    .to_path_buf();
                 let novel: Vec<verify::Diag> = baseline
                     .novel(&diagnosis.diags, &observed_root)
                     .into_iter()
@@ -685,9 +717,9 @@ fn rewrite_core_injected(
                     &reverted,
                     crate_dir.as_deref().unwrap_or(std::path::Path::new("")),
                 )
-                    .difference(&reverted)
-                    .cloned()
-                    .collect::<std::collections::BTreeSet<_>>();
+                .difference(&reverted)
+                .cloned()
+                .collect::<std::collections::BTreeSet<_>>();
                 if newly.is_empty() {
                     escalation = Some(format!(
                         "escalation-required: {} error(s) attributed to no rewritten \
@@ -782,8 +814,7 @@ fn rewrite_core_injected(
                     && probe.errors.saturating_sub(baseline.errors) == 0
             });
 
-            let (final_files, rollbacks) =
-                render(&emission_plan, &emission_texts, &final_reverted);
+            let (final_files, rollbacks) = render(&emission_plan, &emission_texts, &final_reverted);
             let materialized = match tree_base {
                 Some(root) => verify::materialize(root, &final_files),
                 None => verify::materialize_single_file(&root_text),
@@ -817,8 +848,7 @@ fn rewrite_core_injected(
                 Ok(staged)
                     if rollbacks.is_empty() && {
                         let final_diag = verify::diagnose_crate(staged.root());
-                        let final_root =
-                            staged.root().parent().unwrap_or(staged.root());
+                        let final_root = staged.root().parent().unwrap_or(staged.root());
                         baseline.novel(&final_diag.diags, final_root).is_empty()
                             && final_diag.errors.saturating_sub(baseline.errors) == 0
                     } =>
@@ -853,12 +883,9 @@ fn rewrite_core_injected(
         // Nothing was decided, so the facts are genuinely empty here — the one
         // place a zero is the measurement rather than an omission.
         Ok(Err(reason)) => OutcomeFacts::default().degraded(reason),
-        Err(_) => {
-            OutcomeFacts::default().degraded("input crate did not compile".to_owned())
-        }
+        Err(_) => OutcomeFacts::default().degraded("input crate did not compile".to_owned()),
     }
 }
-
 
 /// Every top-level fn/struct item, in HIR owner order (the `bo_c1` shape).
 fn collect_program(tcx: TyCtxt<'_>) -> RustProgram<'_> {
@@ -984,8 +1011,8 @@ fn collect_subjects(
                 // Stamped in `finish_decide`, once, over both universes.
                 freed_at: None,
                 len_recovered: false,
-            null_init: false,
-            mut_binding: false,
+                null_init: false,
+                mut_binding: false,
             });
         }
     }
@@ -1089,8 +1116,10 @@ fn collect_local_subjects(
 
         // Entries per local, so the one-vs-more split is a count and not a
         // first-match. Deterministic order: BTreeMap keyed by local index.
-        let mut entries: std::collections::BTreeMap<Local, Vec<&rustc_middle::mir::VarDebugInfo<'_>>> =
-            std::collections::BTreeMap::new();
+        let mut entries: std::collections::BTreeMap<
+            Local,
+            Vec<&rustc_middle::mir::VarDebugInfo<'_>>,
+        > = std::collections::BTreeMap::new();
         for info in &mir.var_debug_info {
             if let rustc_middle::mir::VarDebugInfoContents::Place(place) = info.value
                 && let Some(local) = place.as_local()
@@ -1187,8 +1216,8 @@ fn collect_local_subjects(
                 // Stamped in `finish_decide`, once, over both universes.
                 freed_at: None,
                 len_recovered: false,
-            null_init: false,
-            mut_binding: false,
+                null_init: false,
+                mut_binding: false,
             });
         }
     }
@@ -1394,10 +1423,16 @@ impl RewriteOutcome {
         // still caught by its own first line — but it does fail the guard, as
         // it did here. Keep these patterns single-line.
         match self {
-            RewriteOutcome::Emitted { first_diags, observed_root, .. }
-            | RewriteOutcome::Degraded { first_diags, observed_root, .. } => {
-                (observed_root, first_diags)
+            RewriteOutcome::Emitted {
+                first_diags,
+                observed_root,
+                ..
             }
+            | RewriteOutcome::Degraded {
+                first_diags,
+                observed_root,
+                ..
+            } => (observed_root, first_diags),
         }
     }
 }
@@ -1471,7 +1506,10 @@ pub(crate) struct EditSite {
 
 /// Line range of a byte range in `text`, 1-based, inclusive.
 fn line_span(text: &str, lo: usize, hi: usize) -> (usize, usize) {
-    let count = |upto: usize| text.get(..upto.min(text.len())).map_or(1, |s| s.matches('\n').count() + 1);
+    let count = |upto: usize| {
+        text.get(..upto.min(text.len()))
+            .map_or(1, |s| s.matches('\n').count() + 1)
+    };
     (count(lo), count(hi))
 }
 
@@ -1860,9 +1898,8 @@ fn finish_decide<'tcx>(
     // cannot disagree with the census about which bindings are freed.
     //
     // BEFORE `perturb`, so a test hook can perturb this field like any other.
-    let freed = decision::FreedBindings::from_resolved(
-        &free_sites(tcx, &program.functions).resolved,
-    );
+    let freed =
+        decision::FreedBindings::from_resolved(&free_sites(tcx, &program.functions).resolved);
     // U-2′'s length recovery, from the SAME construction recognizer the facts
     // join reports `len_class` from — one authority, so the flag and the census
     // cannot disagree about which subjects have a recovered length.
@@ -1962,8 +1999,13 @@ fn finish_decide<'tcx>(
         .filter(|s| fat.is_array(s.fn_did, s.local))
         .map(|s| (s.fn_did, s.hir_id))
         .collect();
-    let opt_uses =
-        decision::emitability::collect_opt_uses(tcx, &program.functions, &names, &opt_accessors, &opt_fat);
+    let opt_uses = decision::emitability::collect_opt_uses(
+        tcx,
+        &program.functions,
+        &names,
+        &opt_accessors,
+        &opt_fat,
+    );
     let ctx_of = |gate| decision::Ctx {
         tcx,
         model: &model,
@@ -2262,7 +2304,8 @@ pub(crate) fn facts_join_tsv(tcx: TyCtxt<'_>) -> Result<String, String> {
 )]
 pub(crate) fn coconv_tsv(tcx: TyCtxt<'_>) -> Result<String, String> {
     let (table, ctx) = decide_table_with_ctx(tcx)?;
-    let mut escapes_of: rustc_hash::FxHashMap<_, Vec<&'static str>> = rustc_hash::FxHashMap::default();
+    let mut escapes_of: rustc_hash::FxHashMap<_, Vec<&'static str>> =
+        rustc_hash::FxHashMap::default();
     for escape in &ctx.escapes {
         let bucket = escapes_of.entry(escape.subject).or_default();
         if !bucket.contains(&escape.kind.key()) {
@@ -2288,19 +2331,22 @@ pub(crate) fn coconv_tsv(tcx: TyCtxt<'_>) -> Result<String, String> {
                     class.blocked.map_or("-", |r| r.key()).to_owned(),
                 )
             }
-            None => ("-".to_owned(), "0".to_owned(), "-".to_owned(), "-".to_owned()),
+            None => (
+                "-".to_owned(),
+                "0".to_owned(),
+                "-".to_owned(),
+                "-".to_owned(),
+            ),
         };
         let sites = match s.kind {
-            decision::SubjectKind::Param { hir_index } => ctx
-                .facts
-                .call_args
-                .get(&s.fn_did)
-                .map_or(0, |sites| {
+            decision::SubjectKind::Param { hir_index } => {
+                ctx.facts.call_args.get(&s.fn_did).map_or(0, |sites| {
                     sites
                         .iter()
                         .filter(|site| site.args.iter().any(|a| a.index == hir_index))
                         .count()
-                }),
+                })
+            }
             decision::SubjectKind::Local => 0,
         };
         let mut escapes = escapes_of.get(&key).cloned().unwrap_or_default();
@@ -2413,7 +2459,12 @@ pub(crate) fn free_sites(tcx: TyCtxt<'_>, fns: &[rustc_hir::def_id::LocalDefId])
         out: &'a mut FreeSites,
     }
     impl V<'_, '_> {
-        fn unresolved(&mut self, cause: &'static str, e: &rustc_hir::Expr<'_>, arg: &rustc_hir::Expr<'_>) {
+        fn unresolved(
+            &mut self,
+            cause: &'static str,
+            e: &rustc_hir::Expr<'_>,
+            arg: &rustc_hir::Expr<'_>,
+        ) {
             let mut bindings = Bindings(Vec::new());
             bindings.visit_expr(arg);
             let mut locals: Vec<_> = bindings
@@ -2469,7 +2520,10 @@ pub(crate) fn free_sites(tcx: TyCtxt<'_>, fns: &[rustc_hir::def_id::LocalDefId])
         let Some(body_id) = tcx.hir_node_by_def_id(fn_did).body_id() else {
             continue;
         };
-        let mut v = V { tcx, out: &mut sites };
+        let mut v = V {
+            tcx,
+            out: &mut sites,
+        };
         v.visit_body(tcx.hir_body(body_id));
     }
     sites
@@ -2514,10 +2568,8 @@ pub(crate) fn free_overlap(tcx: TyCtxt<'_>) -> FreeOverlap {
     let mut_facts = MutFacts::from_program(&program);
     let mut subjects = collect_subjects(tcx, &program, &mut_facts);
     subjects.extend(collect_local_subjects(tcx, &program, &mut_facts));
-    let by_binding: rustc_hash::FxHashMap<_, _> = subjects
-        .iter()
-        .map(|s| ((s.fn_did, s.hir_id), s))
-        .collect();
+    let by_binding: rustc_hash::FxHashMap<_, _> =
+        subjects.iter().map(|s| ((s.fn_did, s.hir_id), s)).collect();
 
     let sites = free_sites(tcx, &program.functions);
     let mut hits = Vec::new();
@@ -2641,7 +2693,11 @@ fn freed_slots_tsv_from(
                     decision::Decision::Ref { .. } => "emitted-ref".to_owned(),
                     decision::Decision::Slice { .. } => "emitted-slice".to_owned(),
                     decision::Decision::Opt { slice, .. } => {
-                        if *slice { "emitted-opt-slice".to_owned() } else { "emitted-opt-ref".to_owned() }
+                        if *slice {
+                            "emitted-opt-slice".to_owned()
+                        } else {
+                            "emitted-opt-ref".to_owned()
+                        }
                     }
                     decision::Decision::Degraded(r) => r.reason.key().to_owned(),
                 },
@@ -2649,8 +2705,7 @@ fn freed_slots_tsv_from(
         })
         .collect();
 
-    let mut out =
-        String::from("fn_path\tmir_local\tcast\tkind\toutcome\tresolution\tdetail\n");
+    let mut out = String::from("fn_path\tmir_local\tcast\tkind\toutcome\tresolution\tdetail\n");
     for (hid, cast, _) in &sites.resolved {
         let owner = hid.owner.def_id;
         let Some(s) = by_hir.get(&(owner, *hid)) else {

@@ -6,9 +6,10 @@ use std::{
 use rustc_hash::FxHashMap;
 use rustc_index::IndexVec;
 use rustc_span::def_id::LocalDefId;
-use z3::{ast::Bool, Model, Optimize, SatResult};
+use z3::{Model, Optimize, SatResult, ast::Bool};
 
 use super::{
+    SlotKind,
     crate_slots::CrateSlots,
     l2::{
         CommitAction, CommitActionKind, GUARDED_COMMIT_CORE_FAMILY,
@@ -16,7 +17,6 @@ use super::{
     },
     slots::{SlotId, SlotUniverse},
     ssa::constraint::{Database, Gen, Var},
-    SlotKind,
 };
 
 /// Global identity for a flattened pointer slot.

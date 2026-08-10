@@ -530,14 +530,7 @@ pub(crate) fn verify_to_fixpoint(
     is_mutable: impl MutProvider + Copy,
 ) -> Option<FxHashMap<SlotRef, SlotKind>> {
     let origin_flows = super::origin_flow::analyze_program_origin_flow(program);
-    verify_to_fixpoint_with_flows(
-        program,
-        slots,
-        &origin_flows,
-        solver,
-        selectors,
-        is_mutable,
-    )
+    verify_to_fixpoint_with_flows(program, slots, &origin_flows, solver, selectors, is_mutable)
 }
 
 pub(crate) fn verify_to_fixpoint_with_flows(

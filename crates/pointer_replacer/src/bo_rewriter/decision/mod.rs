@@ -1006,7 +1006,9 @@ mod self_consistency_tests {
             local: Local::from_u32(local),
             hir_id: rustc_hir::CRATE_HIR_ID,
             param_name: Some(label.rsplit("::").next().unwrap_or(label).to_owned()),
-            kind: SubjectKind::Param { hir_index: local as usize - 1 },
+            kind: SubjectKind::Param {
+                hir_index: local as usize - 1,
+            },
             ptr_depth: 1,
             label: label.to_owned(),
             ty_span: Some(rustc_span::DUMMY_SP),
@@ -1080,5 +1082,4 @@ mod self_consistency_tests {
             .expect_err("a subject with no decision must be rejected");
         assert!(err.contains("no decision for"), "wrong failure arm: {err}");
     }
-
 }

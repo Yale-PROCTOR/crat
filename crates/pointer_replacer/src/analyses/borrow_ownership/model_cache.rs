@@ -74,7 +74,10 @@ pub(crate) fn fingerprint(program: &RustProgram<'_>) -> String {
         if let rustc_span::FileName::Real(rp) = &f.name
             && let Some(p) = rp.local_path()
         {
-            files.push((p.display().to_string(), f.src_hash.hash_bytes().len() as u64));
+            files.push((
+                p.display().to_string(),
+                f.src_hash.hash_bytes().len() as u64,
+            ));
             h.update(p.display().to_string().as_bytes());
             h.update(f.src_hash.hash_bytes());
         }
@@ -87,8 +90,11 @@ pub(crate) fn fingerprint(program: &RustProgram<'_>) -> String {
 
     // 3. The toolchain.
     h.update(
-        std::fs::read(concat!(env!("CARGO_MANIFEST_DIR"), "/../../rust-toolchain.toml"))
-            .unwrap_or_default(),
+        std::fs::read(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../rust-toolchain.toml"
+        ))
+        .unwrap_or_default(),
     );
 
     // 4. Mode flags that reach the solver.

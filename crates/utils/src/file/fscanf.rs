@@ -523,7 +523,6 @@ fn test_scanf_parse() {
     assert!(specs[1].trailing_space);
 }
 
-
 // ---------------------------------------------------------------------------
 // F-1 (2026-08-06) — the scanset non-leading-`^` fix, and its gates
 // ---------------------------------------------------------------------------
@@ -715,7 +714,11 @@ fn harvest_corpus_format_literals() -> Vec<(String, String)> {
                 let prog = p
                     .strip_prefix(corpus_root())
                     .ok()
-                    .and_then(|r| r.components().next().map(|c| c.as_os_str().to_string_lossy().into_owned()))
+                    .and_then(|r| {
+                        r.components()
+                            .next()
+                            .map(|c| c.as_os_str().to_string_lossy().into_owned())
+                    })
                     .unwrap_or_default();
                 // `b"...\0"` literals, the shape C2Rust emits for format strings.
                 for (idx, _) in text.match_indices("b\"") {
@@ -816,9 +819,7 @@ fn the_fix_only_changes_executions_that_previously_panicked() {
 fn f1_urlparser_scanset_parses_with_the_caret_as_an_ordinary_member() {
     let specs = parse_specs(b"%[^? | ^#]");
     assert_eq!(specs.len(), 1, "one conversion: {specs:?}");
-    let Conversion::ScanSet(set) = &specs[0].conversion else {
-        panic!("not a scanset: {specs:?}")
-    };
+    let Conversion::ScanSet(set) = &specs[0].conversion else { panic!("not a scanset: {specs:?}") };
     assert!(set.negative, "the LEADING `^` still negates: {specs:?}");
     assert_eq!(
         set.chars, b"? | ^#",
@@ -844,8 +845,9 @@ fn the_f2_scanset_shapes_behave_as_witnessed() {
     );
     let quiet = std::panic::catch_unwind(|| parse_specs(b"%[^]abc]"))
         .expect("F-2b completes rather than panicking");
-    let Conversion::ScanSet(set) = &quiet[0].conversion else {
-        panic!("not a scanset: {quiet:?}")
-    };
-    assert!(set.negative && set.chars.is_empty(), "F-2b: empty negated set — the silent misparse: {quiet:?}");
+    let Conversion::ScanSet(set) = &quiet[0].conversion else { panic!("not a scanset: {quiet:?}") };
+    assert!(
+        set.negative && set.chars.is_empty(),
+        "F-2b: empty negated set — the silent misparse: {quiet:?}"
+    );
 }

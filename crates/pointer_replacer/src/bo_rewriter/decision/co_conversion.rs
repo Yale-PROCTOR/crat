@@ -187,7 +187,6 @@ impl CoConv {
     pub(crate) fn node_block(&self, key: NodeKey) -> Option<BlockReason> {
         self.node_block.get(&key).copied()
     }
-
 }
 
 /// A tiny disjoint-set over dense node ids.
@@ -263,17 +262,11 @@ pub(crate) fn build(
         .entries
         .iter()
         .filter_map(|(subject, decision)| match decision {
-            Decision::Slice { .. } | Decision::Opt { .. } => {
-                Some((subject.fn_did, subject.hir_id))
-            }
+            Decision::Slice { .. } | Decision::Opt { .. } => Some((subject.fn_did, subject.hir_id)),
             Decision::Ref { .. } | Decision::Degraded(_) => None,
         })
         .collect();
-    let index: FxHashMap<NodeKey, usize> = order
-        .iter()
-        .enumerate()
-        .map(|(i, k)| (*k, i))
-        .collect();
+    let index: FxHashMap<NodeKey, usize> = order.iter().enumerate().map(|(i, k)| (*k, i)).collect();
     let converts: FxHashSet<NodeKey> = order.iter().copied().collect();
 
     // Every parameter POSITION that is a subject at all — node or not. The
@@ -284,7 +277,10 @@ pub(crate) fn build(
     let mut param_key: FxHashMap<(LocalDefId, usize), NodeKey> = FxHashMap::default();
     for subject in subjects {
         if let SubjectKind::Param { hir_index } = subject.kind {
-            param_key.insert((subject.fn_did, hir_index), (subject.fn_did, subject.hir_id));
+            param_key.insert(
+                (subject.fn_did, hir_index),
+                (subject.fn_did, subject.hir_id),
+            );
         }
     }
 
@@ -292,11 +288,7 @@ pub(crate) fn build(
     let mut node_block: FxHashMap<NodeKey, BlockReason> = FxHashMap::default();
     /// First reason wins, so the census is deterministic under a node that
     /// contributes two.
-    fn block(
-        node_block: &mut FxHashMap<NodeKey, BlockReason>,
-        key: NodeKey,
-        reason: BlockReason,
-    ) {
+    fn block(node_block: &mut FxHashMap<NodeKey, BlockReason>, key: NodeKey, reason: BlockReason) {
         node_block.entry(key).or_insert(reason);
     }
 
@@ -433,7 +425,11 @@ pub(crate) fn build(
                         block(&mut node_block, callee_key, BlockReason::ArgNullLiteral);
                     }
                     ArgShape::Cast { .. } | ArgShape::Other => {
-                        block(&mut node_block, callee_key, BlockReason::ArgUnadaptableShape);
+                        block(
+                            &mut node_block,
+                            callee_key,
+                            BlockReason::ArgUnadaptableShape,
+                        );
                     }
                 }
             }

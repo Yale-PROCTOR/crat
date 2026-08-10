@@ -23,12 +23,7 @@
 use rustc_middle::ty::TyCtxt;
 use rustc_span::def_id::LocalDefId;
 
-pub(crate) fn local_key(
-    tcx: TyCtxt<'_>,
-    fn_did: LocalDefId,
-    local: usize,
-    depth: u8,
-) -> String {
+pub(crate) fn local_key(tcx: TyCtxt<'_>, fn_did: LocalDefId, local: usize, depth: u8) -> String {
     format!(
         "{}::_{}@d{depth}",
         tcx.def_path_str(fn_did.to_def_id()),

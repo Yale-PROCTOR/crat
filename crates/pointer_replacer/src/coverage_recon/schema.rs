@@ -298,8 +298,8 @@ pub(crate) fn decode(text: &str) -> Result<Vec<Row>, String> {
         if line.trim().is_empty() {
             continue;
         }
-        let row = serde_json::from_str::<Row>(line)
-            .map_err(|e| format!("line {}: {e}", index + 1))?;
+        let row =
+            serde_json::from_str::<Row>(line).map_err(|e| format!("line {}: {e}", index + 1))?;
         rows.push(row);
     }
     Ok(rows)

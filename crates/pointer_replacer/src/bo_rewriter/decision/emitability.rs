@@ -98,7 +98,6 @@ impl RefKind {
     }
 }
 
-
 /// **What a call site actually supplies at one argument position — S3.6-1.**
 ///
 /// The gate that blocks the adaptable population is a *signature* fact
@@ -608,7 +607,9 @@ fn index_text(tcx: TyCtxt<'_>, arg: &Expr<'_>) -> Option<String> {
     let sm = tcx.sess.source_map();
     if let ExprKind::Cast(inner, ty) = &arg.kind
         && let rustc_hir::TyKind::Path(rustc_hir::QPath::Resolved(_, p)) = &ty.kind
-        && p.segments.last().is_some_and(|s| s.ident.name.as_str() == "isize")
+        && p.segments
+            .last()
+            .is_some_and(|s| s.ident.name.as_str() == "isize")
     {
         let text = sm.span_to_snippet(inner.span).ok()?;
         return Some(if is_usize(tcx, inner) || is_bare_literal(inner) {
@@ -1000,7 +1001,11 @@ pub(crate) fn collect_slice_uses(
                 && self.advance_ok.contains(&key)
             {
                 let index = index_text(self.tcx, arg)?;
-                let amp = if self.mutable_of.contains(&key) { "&mut " } else { "&" };
+                let amp = if self.mutable_of.contains(&key) {
+                    "&mut "
+                } else {
+                    "&"
+                };
                 return Some(Some(UseEdit {
                     span: call.span,
                     replacement: format!("{amp}{name}[{index}..]"),
@@ -1067,7 +1072,14 @@ pub(crate) fn collect_slice_uses(
         let Some(body_id) = tcx.hir_node_by_def_id(fn_did).body_id() else {
             continue;
         };
-        let mut v = V { tcx, fn_did, out: &mut out, name_of, mutable_of, advance_ok };
+        let mut v = V {
+            tcx,
+            fn_did,
+            out: &mut out,
+            name_of,
+            mutable_of,
+            advance_ok,
+        };
         v.visit_body(tcx.hir_body(body_id));
     }
     out
