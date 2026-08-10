@@ -2041,7 +2041,7 @@ fn finish_decide<'tcx>(
         &subjects,
         &hypothetical,
         &escapes,
-        decision::co_conversion::OverlapRule::RootDisjoint,
+        decision::co_conversion::OverlapRule::BlindOnly,
     );
 
     // Structural self-check: the table matches the subjects it was handed. NOT

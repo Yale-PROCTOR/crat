@@ -163,13 +163,20 @@ impl BlockReason {
 /// counting positions.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum OverlapRule {
-    /// Today's rule: two positions are disjoint when both roots are KNOWN and
-    /// DIFFERENT. **Unsound as a disjointness proof** — a `HirId` names a
-    /// binding, not an allocation (P2).
+    /// The pre-P2 rule: two positions are disjoint when both roots are KNOWN
+    /// and DIFFERENT. **Unsound as a disjointness proof** — a `HirId` names a
+    /// binding, not an allocation (P2). Retained as the measurement baseline
+    /// the split census is read against; **not** the production rule.
     RootDisjoint,
-    /// Block a pair only where the compiler cannot see it: at least one side is
-    /// a place reached through a base that stays RAW after conversion, or has
-    /// an unknown root.
+    /// **PRODUCTION, ruled 2026-08-10 on the split census.** Block a pair only
+    /// where the compiler cannot see it: at least one side is a place reached
+    /// through a base that stays RAW after conversion, or has an unknown root.
+    ///
+    /// Measured, class-level: this costs **8** admissible nodes against the
+    /// unsound baseline and **zero** additional regression — the 8 all sit in
+    /// the gate-blocked population. Maximal conservatism costs **391** and
+    /// turns the slice negative (net −137). Banked rule 1 in one line:
+    /// conservatism belongs where the compiler cannot see, and nowhere else.
     ///
     /// The other pairs are in the **checked** region — if they really alias,
     /// borrowck answers `E0499`/`E0502`, which costs a revert. Yield, not
