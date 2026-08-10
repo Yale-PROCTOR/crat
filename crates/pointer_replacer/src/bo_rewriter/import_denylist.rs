@@ -1392,6 +1392,55 @@ fn the_emission_path_scan_does_not_stop_at_a_test_module_declaration() {
 // third structurally rather than by a third patch.
 // ---------------------------------------------------------------------------
 
+/// The brace group opened on `start`, joined to its closing brace.
+///
+/// Comment lines are dropped: a comment can hold a `..` that belongs to prose,
+/// and including it would make a construction read as a pattern — the
+/// fail-OPEN direction.
+///
+/// Bounded, and the bound is stated rather than assumed safe: an unbalanced
+/// group (a brace inside a string literal, say) stops at the cap and is judged
+/// on what was seen. Judging on LESS text can only lose a rest token, and
+/// losing one reports a construction — the fail-CLOSED direction, which is
+/// where this guard must land when it is unsure.
+fn logical_item(lines: &[&str], start: usize) -> String {
+    const MAX_LINES: usize = 64;
+    let mut depth = 0i32;
+    let mut joined = String::new();
+    for line in lines.iter().skip(start).take(MAX_LINES) {
+        if is_comment(line) {
+            continue;
+        }
+        joined.push_str(line.trim());
+        joined.push(' ');
+        for ch in line.chars() {
+            match ch {
+                '{' => depth += 1,
+                '}' => depth -= 1,
+                _ => {}
+            }
+        }
+        if depth <= 0 {
+            break;
+        }
+    }
+    joined
+}
+
+/// Does this brace group ELIDE fields — i.e. is it a pattern?
+///
+/// The rest token counts only where a FIELD would go: directly after the
+/// opening brace, or after a comma. **A plain `item.contains("..")` would be
+/// wrong in the dangerous direction**: a field's value may legitimately hold a
+/// range (`source: text[..n].to_owned()`), and reading that as elision would
+/// skip a real construction — the one failure mode this guard exists to
+/// prevent. Whitespace is collapsed first so the test is indifferent to where
+/// a formatter puts the newline.
+fn elides_fields(item: &str) -> bool {
+    let flat = item.split_whitespace().collect::<Vec<_>>().join(" ");
+    flat.contains("{ ..") || flat.contains(", ..")
+}
+
 /// Production lines that construct a `RewriteOutcome` variant directly.
 fn outcome_construction_sites(root: &Path, skip: &dyn Fn(&Path) -> bool) -> Vec<String> {
     let mut files = Vec::new();
@@ -1418,35 +1467,150 @@ fn outcome_construction_sites(root: &Path, skip: &dyn Fn(&Path) -> bool) -> Vec<
             if is_comment(line) {
                 continue;
             }
+            if !(line.contains("RewriteOutcome::Emitted {")
+                || line.contains("RewriteOutcome::Degraded {"))
+            {
+                continue;
+            }
             // A CONSTRUCTION lists every field; a PATTERN elides with `..`.
             //
             // SOUNDNESS: functional record update (`..other`) is not available
             // on enum variants in Rust, so a variant construction MUST name
-            // every field — `..` in a variant-with-braces line is therefore
-            // always a rest-pattern, never a construction. The scan is textual
-            // and cannot parse; this is what makes the discriminator exact
-            // rather than heuristic. If variants are ever replaced by structs,
-            // functional update becomes legal and this argument LAPSES — the
-            // guard must be revisited, not just re-run.
+            // every field — a rest token in a variant's brace group is
+            // therefore always a rest-pattern, never a construction. If
+            // variants are ever replaced by structs, functional update becomes
+            // legal and this argument LAPSES — the guard must be revisited,
+            // not just re-run.
             //
-            // Witnessed in both directions below rather than assumed.
-            if line.contains("..") {
+            // **The discriminator reads the LOGICAL ITEM, not the physical
+            // line.** It used to test the opening line alone, and that made
+            // its "exact rather than heuristic" claim rest on a formatting
+            // accident: `cargo fmt` splits the two-variant `match` in
+            // `OutcomeFacts::into_capture` across lines, leaving each arm's
+            // brace alone on a line with its `..` three lines away, and both
+            // arms were then counted as constructions. The `match` even
+            // carried a comment instructing the next author to keep the
+            // patterns single-line. An instrument's exactness may not rest on
+            // formatting; this reads to the closing brace instead, so the
+            // verdict is the same under any formatter.
+            if elides_fields(&logical_item(&lines, index)) {
                 continue;
             }
-            if line.contains("RewriteOutcome::Emitted {")
-                || line.contains("RewriteOutcome::Degraded {")
-            {
-                hits.push(format!(
-                    "{}:{}: {}",
-                    file.strip_prefix(root).unwrap_or(file).display(),
-                    index + 1,
-                    line.trim()
-                ));
-            }
+            hits.push(format!(
+                "{}:{}: {}",
+                file.strip_prefix(root).unwrap_or(file).display(),
+                index + 1,
+                line.trim()
+            ));
         }
     }
     assert!(scanned > 0, "every file under {root:?} was skipped");
     hits
+}
+
+/// **The formatted-`match` witness — the fmt-gate ruling's positive side.**
+///
+/// `cargo fmt` splits a two-variant match arm so each variant's brace lands
+/// alone on a line and its `..` sits three lines below. The line-based
+/// discriminator counted both as constructions; the logical-item one must not.
+///
+/// *Mutation-tested (deletion first):* reverting `elides_fields(&logical_item(..))`
+/// to `line.contains("..")` makes this report 2 hits and fail.
+#[test]
+fn a_formatter_split_destructuring_is_not_a_construction() {
+    let dir = std::env::temp_dir().join(format!("crat-fmtsplit-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).expect("fixture dir");
+    fs::write(
+        dir.join("m.rs"),
+        "fn f(o: RewriteOutcome) -> u8 {\n\
+         \x20   match o {\n\
+         \x20       RewriteOutcome::Emitted {\n\
+         \x20           first_diags,\n\
+         \x20           ..\n\
+         \x20       }\n\
+         \x20       | RewriteOutcome::Degraded {\n\
+         \x20           first_diags,\n\
+         \x20           ..\n\
+         \x20       } => first_diags,\n\
+         \x20   }\n\
+         }\n",
+    )
+    .expect("write fixture");
+    let hits = outcome_construction_sites(&dir, &|_| false);
+    assert!(
+        hits.is_empty(),
+        "a destructuring the FORMATTER split across lines was counted as a \
+         construction — the exactness claim still rests on hand-formatting: {hits:?}"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// **The negative side: a real double-construction still fails.**
+///
+/// Without this, the repair above could have been "report nothing", which
+/// satisfies every positive case at once and removes the guard entirely.
+#[test]
+fn a_second_construction_is_still_reported_after_the_repair() {
+    let dir = std::env::temp_dir().join(format!("crat-doubleconstruct-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).expect("fixture dir");
+    fs::write(
+        dir.join("m.rs"),
+        "fn a() -> RewriteOutcome {\n\
+         \x20   RewriteOutcome::Emitted {\n\
+         \x20       source,\n\
+         \x20       files,\n\
+         \x20   }\n\
+         }\n\
+         fn b() -> RewriteOutcome {\n\
+         \x20   RewriteOutcome::Degraded { reason }\n\
+         }\n",
+    )
+    .expect("write fixture");
+    let hits = outcome_construction_sites(&dir, &|_| false);
+    assert_eq!(
+        hits.len(),
+        2,
+        "both hand-filled sites must still be reported — a multi-line one and \
+         a single-line one: {hits:?}"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// **The FAIL-OPEN guard.** A construction whose field value holds a RANGE is
+/// still a construction.
+///
+/// A whole-item `contains("..")` would read `text[..n]` as elision and skip a
+/// real hand-filled site — silently removing the check this whole apparatus
+/// exists to be. `elides_fields` therefore accepts the rest token only where a
+/// field would go.
+///
+/// *Mutation-tested:* replacing `elides_fields` with a bare
+/// `item.contains("..")` makes this report 0 hits and fail.
+#[test]
+fn a_range_expression_in_a_field_value_is_not_elision() {
+    let dir = std::env::temp_dir().join(format!("crat-rangefield-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).expect("fixture dir");
+    fs::write(
+        dir.join("m.rs"),
+        "fn a(text: &str, n: usize) -> RewriteOutcome {\n\
+         \x20   RewriteOutcome::Emitted {\n\
+         \x20       source: text[..n].to_owned(),\n\
+         \x20       files,\n\
+         \x20   }\n\
+         }\n",
+    )
+    .expect("write fixture");
+    let hits = outcome_construction_sites(&dir, &|_| false);
+    assert_eq!(
+        hits.len(),
+        1,
+        "a range inside a field VALUE is not a rest-pattern; reading it as one \
+         skips a real construction, which is the fail-OPEN direction: {hits:?}"
+    );
+    let _ = fs::remove_dir_all(&dir);
 }
 
 /// **Production check.** Exactly two construction sites — the two constructors
