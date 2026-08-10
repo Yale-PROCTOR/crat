@@ -3277,7 +3277,10 @@ mod coconv_witnesses {
 
 /// **S3.6-1 task 2 — the attribution repair, and the escape census.**
 mod attribution_and_escapes {
-    use std::{collections::BTreeMap, path::Path};
+    use std::{
+        collections::{BTreeMap, BTreeSet},
+        path::Path,
+    };
 
     use super::Fixture;
     use crate::bo_rewriter::{
@@ -3331,7 +3334,7 @@ mod attribution_and_escapes {
         }];
         let diags = [diag("/crate/caller.rs", 10)];
 
-        let owners = attribute(&diags, root, &sites, &edits, root);
+        let owners = attribute(&diags, root, &sites, &edits, &BTreeSet::new(), root);
         assert_eq!(
             owners.into_iter().collect::<Vec<_>>(),
             vec!["k::callee".to_owned()],
@@ -3339,7 +3342,7 @@ mod attribution_and_escapes {
              justifies the edit"
         );
 
-        let blind = attribute(&diags, root, &sites, &[], root);
+        let blind = attribute(&diags, root, &sites, &[], &BTreeSet::new(), root);
         assert!(
             blind.is_empty(),
             "the pre-repair derivation must attribute this to NOBODY, or the \
@@ -3368,8 +3371,50 @@ mod attribution_and_escapes {
             lo_line: 1,
             hi_line: 1,
         }];
-        let owners = attribute(&[diag("/crate/callee.rs", 20)], root, &sites, &edits, root);
+        let owners = attribute(&[diag("/crate/callee.rs", 20)], root, &sites, &edits, &BTreeSet::new(), root);
         assert_eq!(owners.into_iter().collect::<Vec<_>>(), vec!["k::callee".to_owned()]);
+    }
+
+    /// **A STALE edit must not blind attribution — Codex adversarial review,
+    /// finding P3(a), CONFIRMED by reading before it was accepted.**
+    ///
+    /// `edit_sites` is built once from the whole plan; `render` keeps an edit
+    /// only while its owner is not reverted. Attributing through the unfiltered
+    /// list is a second derivation of *"which edits are live"*, and once
+    /// anything is reverted the two diverge: the stale edit matches,
+    /// short-circuits the extent pass, contributes only an already-reverted
+    /// owner, and the caller's `.difference(&reverted)` then empties the
+    /// result — a convergent run sent to bisect.
+    ///
+    /// Here the caller's own function extent IS the right answer, and the fix
+    /// is to filter by the same predicate `render` filters by.
+    ///
+    /// *Mutation-tested (deletion first):* removing the `!reverted.contains`
+    /// filter makes this return empty and fails.
+    #[test]
+    fn a_reverted_owners_edit_does_not_blind_attribution() {
+        let root = Path::new("/crate");
+        let sites = [EmittedSite {
+            file: "/crate/m.rs".to_owned(),
+            fn_path: "k::caller".to_owned(),
+            lo_line: 5,
+            hi_line: 15,
+        }];
+        let edits = [EditSite {
+            file: "/crate/m.rs".to_owned(),
+            fn_path: "k::callee".to_owned(),
+            lo_line: 10,
+            hi_line: 10,
+        }];
+        let reverted = BTreeSet::from(["k::callee".to_owned()]);
+
+        let owners = attribute(&[diag("/crate/m.rs", 10)], root, &sites, &edits, &reverted, root);
+        assert_eq!(
+            owners.into_iter().collect::<Vec<_>>(),
+            vec!["k::caller".to_owned()],
+            "the reverted owner's edit is no longer applied, so it must not \
+             suppress the extent owner that still is"
+        );
     }
 
     /// `edit_sites` converts byte ranges to the LINES a diagnostic reports in.

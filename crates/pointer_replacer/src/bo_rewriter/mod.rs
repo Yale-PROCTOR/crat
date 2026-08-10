@@ -682,6 +682,7 @@ fn rewrite_core_injected(
                     &observed_root,
                     &facts.emitted_sites,
                     &planned_edit_sites,
+                    &reverted,
                     crate_dir.as_deref().unwrap_or(std::path::Path::new("")),
                 )
                     .difference(&reverted)
@@ -1534,8 +1535,27 @@ fn attribute(
     observed_root: &std::path::Path,
     sites: &[EmittedSite],
     edits: &[EditSite],
+    reverted: &std::collections::BTreeSet<String>,
     original_root: &std::path::Path,
 ) -> std::collections::BTreeSet<String> {
+    // **ONLY THE EDITS THIS ROUND ACTUALLY APPLIED.**
+    //
+    // `edit_sites` is built once from the whole plan, but `render` keeps an
+    // edit only while `!reverted.contains(&edit.owner_fn)`. Attributing through
+    // the unfiltered list is therefore a SECOND derivation of "which edits are
+    // live", and the two diverge the moment anything is reverted: a stale edit
+    // matches a later round's diagnostic, contributes only an already-reverted
+    // owner, short-circuits the extent pass below, and is then removed by the
+    // caller's `.difference(&reverted)` — leaving the diagnostic attributed to
+    // nobody and sending a convergent run to bisect.
+    //
+    // Two derivations assumed identical is this module's founding defect class
+    // (it cost a brotli sweep when `candidates` and `emitted_sites` diverged),
+    // so attribution filters by the SAME predicate `render` filters by.
+    let edits: Vec<&EditSite> = edits
+        .iter()
+        .filter(|edit| !reverted.contains(&edit.fn_path))
+        .collect();
     // The SAME canonicalizer as the differential gate, each side against its own
     // root: sites were recorded in the original tree, diagnostics come from the
     // temp copy. A second normalization here would drift attribution away from
@@ -1559,7 +1579,7 @@ fn attribute(
     for diag in diags {
         let diag_rel = verify::crate_relative(&diag.file, observed_root);
         let mut by_edit = std::collections::BTreeSet::new();
-        for edit in edits {
+        for edit in &edits {
             let same_file =
                 single_file || verify::crate_relative(&edit.file, original_root) == diag_rel;
             if same_file && edit.lo_line <= diag.line && diag.line <= edit.hi_line {
