@@ -25,7 +25,7 @@
 
 use rustc_hash::FxHashMap;
 use rustc_hir::{
-    Expr, ExprKind, HirId, QPath,
+    Expr, ExprKind, HirId, Mutability, QPath,
     def::Res,
     def_id::LocalDefId,
     intravisit::{self, Visitor},
@@ -99,6 +99,143 @@ impl RefKind {
 }
 
 
+/// **What a call site actually supplies at one argument position — S3.6-1.**
+///
+/// The gate that blocks the adaptable population is a *signature* fact
+/// (`referenced`), but adapting a call site is an *argument* question, and no
+/// argument fact existed: the `Call` arm bound its arguments to `_`, so the
+/// index, the span, the shape and the caller were all discarded at the exact
+/// site that could have recorded them.
+///
+/// **The classification is by outermost operator**, which is what decides the
+/// edit. `&mut *p.offset(1)` is an address-of, not arithmetic — the arithmetic
+/// is inside the place being borrowed and does not reach the argument's own
+/// form.
+///
+/// # The checked/unchecked distinction this domain has to carry
+///
+/// Banked rule (2026-08-09): the compiler sees aliasing through **real places**
+/// and is **blind through a raw-pointer deref**. [`Self::BareLocal`] and
+/// [`Self::AddrOf`] land in the CHECKED region — a mistake there is an
+/// `E0499`/`E0502`, i.e. a revert. A bridge that borrows through a raw base
+/// lands in the UNCHECKED region, where the same mistake compiles. That is why
+/// no shape here constructs such a bridge: the reborrow arm is **parked**.
+// No `Ord`: `HirId` has none, and nothing needs it — the census sorts the
+// rendered `key()` strings, not the shapes themselves.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ArgShape {
+    /// A bare path resolving to a local binding. **The dominant shape**, and the
+    /// propagation edge: whether it needs an edit depends entirely on whether
+    /// that binding converts too, which is what makes conversion joint.
+    BareLocal(HirId),
+    /// `&mut e` / `&e`, already written. Needs no edit either way — `&mut T`
+    /// coerces to `*mut T` today and satisfies `&mut T`/`&T` after.
+    AddrOf { mutable: bool },
+    /// `&mut e as *mut T` — the cast is the only thing to remove.
+    AddrOfCast { mutable: bool, inner: Span },
+    /// `q as *mut T` where `q` is a local binding.
+    CastOfLocal { binding: HirId, inner: Span },
+    /// A null pointer literal. **Blocks**: `&mut T` cannot represent null.
+    NullLit,
+    /// Any other cast.
+    Cast { inner: Span },
+    /// Anything else — a call result, an index, a field, arithmetic.
+    Other,
+}
+
+impl ArgShape {
+    pub(crate) fn key(self) -> &'static str {
+        match self {
+            ArgShape::BareLocal(_) => "bare-local",
+            ArgShape::AddrOf { mutable: true } => "addr-of-mut",
+            ArgShape::AddrOf { mutable: false } => "addr-of",
+            ArgShape::AddrOfCast { mutable: true, .. } => "addr-of-mut-cast",
+            ArgShape::AddrOfCast { mutable: false, .. } => "addr-of-cast",
+            ArgShape::CastOfLocal { .. } => "cast-of-local",
+            ArgShape::NullLit => "null-lit",
+            ArgShape::Cast { .. } => "cast",
+            ArgShape::Other => "other",
+        }
+    }
+}
+
+/// One argument at one call site.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Arg {
+    /// The callee's **0-based parameter index**, which is `SubjectKind::Param`'s
+    /// `hir_index` — the same key, so the join needs no translation.
+    pub index: usize,
+    pub span: Span,
+    pub shape: ArgShape,
+}
+
+/// One direct call to a local `fn`, with everything adaptation needs.
+///
+/// Grouped **by site** rather than flattened per `(callee, index)` because the
+/// duplicate-argument gate is a *within-site* question — "do two pointer
+/// parameters of this call receive the same place?" — and a flattened map
+/// cannot answer it. The per-index view is a cheap projection of this one;
+/// the reverse is not true.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct CallSite {
+    pub caller: LocalDefId,
+    pub span: Span,
+    pub args: Vec<Arg>,
+}
+
+/// Peel `as` casts to reach the underlying operand.
+///
+/// C2Rust writes null as `0 as *mut T` but also as `0 as libc::c_int as *mut T`,
+/// so a single-level test would classify the second as an ordinary cast and let
+/// a null through the gate that exists to stop it.
+fn peel_casts<'e>(mut expr: &'e Expr<'e>) -> &'e Expr<'e> {
+    while let ExprKind::Cast(inner, _) = &expr.kind {
+        expr = inner;
+    }
+    expr
+}
+
+fn is_zero_literal(expr: &Expr<'_>) -> bool {
+    matches!(
+        &peel_casts(expr).kind,
+        ExprKind::Lit(lit) if matches!(lit.node, rustc_ast::LitKind::Int(v, _) if v == 0)
+    )
+}
+
+/// Classify an argument expression by its **outermost** operator.
+fn classify_arg(expr: &Expr<'_>) -> ArgShape {
+    match &expr.kind {
+        // Casts first: both the null form and the strip-the-cast forms are
+        // casts, and testing the operand is the only way to tell them apart.
+        ExprKind::Cast(inner, _) => {
+            if is_zero_literal(inner) {
+                ArgShape::NullLit
+            } else if let ExprKind::AddrOf(_, mutability, _) = &inner.kind {
+                ArgShape::AddrOfCast {
+                    mutable: matches!(mutability, Mutability::Mut),
+                    inner: inner.span,
+                }
+            } else if let Some(binding) = BodyFacts::resolved_local(inner) {
+                ArgShape::CastOfLocal {
+                    binding,
+                    inner: inner.span,
+                }
+            } else {
+                ArgShape::Cast { inner: inner.span }
+            }
+        }
+        ExprKind::AddrOf(_, mutability, _) => ArgShape::AddrOf {
+            mutable: matches!(mutability, Mutability::Mut),
+        },
+        _ => match BodyFacts::resolved_local(expr) {
+            Some(binding) => ArgShape::BareLocal(binding),
+            // A bare `0` with no cast still cannot become a reference.
+            None if is_zero_literal(expr) => ArgShape::NullLit,
+            None => ArgShape::Other,
+        },
+    }
+}
+
 #[derive(Debug, Default)]
 pub(crate) struct EmitabilityFacts {
     /// `callee -> reference spans`. Non-empty means a signature change would
@@ -134,6 +271,20 @@ pub(crate) struct EmitabilityFacts {
     /// silently inverts a bounds check — so it must be refused at decision
     /// time, not discovered by a behavioral test that does not exist yet.
     pub ptr_comparisons: FxHashMap<(LocalDefId, HirId), Span>,
+    /// **S3.6-1** — `callee -> every direct call site, with its arguments`.
+    ///
+    /// Recorded here rather than derived later, because it is not derivable
+    /// later: this is the third time a quantity absent at collection time
+    /// proved unrecoverable by post-hoc joining (S3.6-0's `ref_kinds`, the
+    /// failed name-keyed `#[no_mangle]` join, and now the argument facts).
+    ///
+    /// **Only direct calls appear.** A function reached by a fn-pointer cast has
+    /// no visible argument list, which is exactly why it is `pinned` and not
+    /// this slice's business.
+    ///
+    /// **The decision layer must not read this at task 0** — the S3.6-0 pattern
+    /// that makes zero corpus delta structural rather than lucky.
+    pub call_args: FxHashMap<LocalDefId, Vec<CallSite>>,
 }
 
 /// Gather A1 facts for the whole crate in one HIR pass per function body.
@@ -228,6 +379,37 @@ impl<'tcx> Visitor<'tcx> for BodyFacts<'_, 'tcx> {
                         .entry(local_did)
                         .or_default()
                         .push((kind, expr.span));
+                }
+            }
+            // (5) **S3.6-1** — a DIRECT call to a local fn, with its arguments.
+            //
+            // Separate from arm (2), which classifies the callee PATH by its
+            // parent. That arm answers "is this function referenced, and how";
+            // this one answers "what is supplied to it", and only the direct-call
+            // shape has an answer at all.
+            ExprKind::Call(callee, args) => {
+                if let ExprKind::Path(QPath::Resolved(_, path)) = &callee.kind
+                    && let Res::Def(rustc_hir::def::DefKind::Fn, def_id) = path.res
+                    && let Some(local_did) = def_id.as_local()
+                    && self.locals.contains(&local_did)
+                {
+                    self.facts
+                        .call_args
+                        .entry(local_did)
+                        .or_default()
+                        .push(CallSite {
+                            caller: self.fn_did,
+                            span: expr.span,
+                            args: args
+                                .iter()
+                                .enumerate()
+                                .map(|(index, arg)| Arg {
+                                    index,
+                                    span: arg.span,
+                                    shape: classify_arg(arg),
+                                })
+                                .collect(),
+                        });
                 }
             }
             // (4) pointer comparison — F5.

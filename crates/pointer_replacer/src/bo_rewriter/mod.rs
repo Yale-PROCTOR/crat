@@ -1934,6 +1934,7 @@ pub(crate) fn artifact_rows(
 /// | `kind` | BO's verdict, independent of whether the decision reached it |
 /// | `raw_op` | the raw-only operation — the **op split** `key()` collapses |
 /// | `ptr_cmp` | whether a comparison fact exists — the **`ptr-comparison` × locals** cell |
+/// | `arg_shapes`, `arg_sites` | **S3.6-1**: what direct call sites supply at this parameter's position, and how many do. `-`/0 for locals and for uncalled functions |
 ///
 /// `raw_op` and `ptr_cmp` are both reported per subject, so masking is readable
 /// rather than inferred: the order-swap probe showed masking is real for
@@ -1951,7 +1952,7 @@ pub(crate) fn facts_join_tsv(tcx: TyCtxt<'_>) -> Result<String, String> {
     let ctors = decision::construction::collect(tcx, &collect_program(tcx).functions);
 
     let mut out = String::from(
-        "fn_path\tmir_local\tis_param\tannotated\tslot\tkind\traw_op\tptr_cmp\treferenced\tref_kinds\tref_class\tctor\tlen_class\tsize_expr\n",
+        "fn_path\tmir_local\tis_param\tannotated\tslot\tkind\traw_op\tptr_cmp\treferenced\tref_kinds\tref_class\tctor\tlen_class\tsize_expr\targ_shapes\targ_sites\n",
     );
     for (s, _decision) in &table.entries {
         let slot = ctx
@@ -1977,6 +1978,36 @@ pub(crate) fn facts_join_tsv(tcx: TyCtxt<'_>) -> Result<String, String> {
             .map(|(op, _)| op.as_str())
             .unwrap_or("-");
         let is_param = matches!(s.kind, decision::SubjectKind::Param { .. });
+        // **S3.6-1 task 0.** What the call sites actually supply at THIS
+        // subject's parameter position, reported per subject and independent of
+        // whether the decision reached the gate — the same discipline
+        // `referenced` is reported under, and for the same reason: the reason
+        // field names the earliest gate, never the whole blocker set.
+        //
+        // Locals get `-`/0: a local is not a parameter position, so no call
+        // site supplies it. That is a different fact from "no call sites", and
+        // conflating them would read 283 blocked locals as an adaptation market.
+        let (arg_shapes, arg_sites) = match s.kind {
+            decision::SubjectKind::Param { hir_index } => {
+                let mut shapes: Vec<&'static str> = Vec::new();
+                let mut sites = 0usize;
+                for site in ctx.facts.call_args.get(&s.fn_did).into_iter().flatten() {
+                    if let Some(arg) = site.args.iter().find(|a| a.index == hir_index) {
+                        shapes.push(arg.shape.key());
+                        sites += 1;
+                    }
+                }
+                shapes.sort_unstable();
+                shapes.dedup();
+                let rendered = if shapes.is_empty() {
+                    "-".to_owned()
+                } else {
+                    shapes.join(",")
+                };
+                (rendered, sites)
+            }
+            decision::SubjectKind::Local => ("-".to_owned(), 0),
+        };
         let ctor = ctors.by_binding.get(&(s.fn_did, s.hir_id));
         let (ctor_key, len_class, size_expr) = match (is_param, ctor) {
             (true, _) => ("param", "param-no-site", String::new()),
@@ -1993,7 +2024,7 @@ pub(crate) fn facts_join_tsv(tcx: TyCtxt<'_>) -> Result<String, String> {
             (false, None) => ("-", "no-init", String::new()),
         };
         out.push_str(&format!(
-            "{}\t{}\t{}\t{}\t{}\t{kind}\t{raw_op}\t{}\t{}\t{}\t{}\t{ctor_key}\t{len_class}\t{size_expr}\n",
+            "{}\t{}\t{}\t{}\t{}\t{kind}\t{raw_op}\t{}\t{}\t{}\t{}\t{ctor_key}\t{len_class}\t{size_expr}\t{arg_shapes}\t{arg_sites}\n",
             tcx.def_path_str(s.fn_did.to_def_id()),
             s.local.as_u32(),
             u8::from(is_param),

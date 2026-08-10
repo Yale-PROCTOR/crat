@@ -2733,3 +2733,141 @@ fn a_local_fn_reference_records_which_kind_it_is() {
          already-emitting functions as an S3.6 market"
     );
 }
+
+/// **S3.6-1 task 0 — the call ARGUMENT is recorded, one fixture per shape.**
+///
+/// The gate that blocks the adaptable population is a *signature* fact, but
+/// adapting a call site is an *argument* question, and no argument fact existed:
+/// `ExprKind::Call(callee, _)` bound its arguments to `_`, discarding the index,
+/// the span, the shape and the caller at the one site that could record them.
+///
+/// **One positive fixture per shape**, for the reason S3.6-0 recorded: a
+/// classifier witnessed on one value is a classifier witnessed on nothing —
+/// the `_ => Other` fallback would swallow every other arm and still pass a
+/// bare-local-only test.
+///
+/// *Mutation-tested on a committed baseline (see the slice record):* each
+/// assertion below fails under a distinct single-arm deletion in
+/// `classify_arg`.
+#[test]
+fn a_direct_call_records_each_argument_shape() {
+    fn shapes_of(src: &str) -> Vec<&'static str> {
+        ::utils::compilation::run_compiler_on_str(src, |tcx| {
+            let program = crate::bo_rewriter::collect_program(tcx);
+            let facts = crate::bo_rewriter::decision::emitability::collect(tcx, &program.functions);
+            facts
+                .call_args
+                .iter()
+                .filter(|(did, _)| tcx.def_path_str(did.to_def_id()).contains("target"))
+                .flat_map(|(_, sites)| sites.iter())
+                .flat_map(|site| site.args.iter().map(|a| a.shape.key()))
+                .collect()
+        })
+        .expect("fixture compiles")
+    }
+    const PRE: &str = "#![allow(dead_code, unused_unsafe, unused_mut, unused_variables)]\n\
+                       pub unsafe fn target(p: *mut i32) { *p = 1; }\n";
+    let call = |body: &str| format!("{PRE}pub unsafe fn c(q: *mut i32) {{ {body} }}\n");
+
+    assert_eq!(shapes_of(&call("target(q)")), vec!["bare-local"]);
+    assert_eq!(
+        shapes_of(&call("let mut x: i32 = 0; target(&mut x)")),
+        vec!["addr-of-mut"],
+        "an already-written `&mut` needs NO edit — it coerces to `*mut T` today \
+         and satisfies `&mut T` after, so mislabelling it would invent work"
+    );
+    assert_eq!(
+        shapes_of(&call("let mut x: i32 = 0; target(&mut x as *mut i32)")),
+        vec!["addr-of-mut-cast"],
+        "the cast is the only thing to remove; conflating it with a bare cast \
+         would lose the fact that the operand is ALREADY a reference"
+    );
+    assert_eq!(shapes_of(&call("target(q as *mut i32)")), vec!["cast-of-local"]);
+    assert_eq!(
+        shapes_of(&call("target(0 as *mut i32)")),
+        vec!["null-lit"],
+        "a null literal BLOCKS: `&mut T` cannot represent null (E0308, measured)"
+    );
+    assert_eq!(
+        shapes_of(&call("target(0 as usize as *mut i32)")),
+        vec!["null-lit"],
+        "C2Rust also writes null through an intermediate cast — a single-level \
+         test would classify this as an ordinary cast and let it past the gate"
+    );
+    assert_eq!(
+        shapes_of(&call("target(q.offset(1))")),
+        vec!["other"],
+        "arithmetic is NOT a shape this slice can adapt"
+    );
+
+    // The INDEX is the callee's 0-based parameter position — the same key as
+    // `SubjectKind::Param { hir_index }`, so the join needs no translation.
+    // Without this the census could attribute every argument to parameter 0.
+    let indices = ::utils::compilation::run_compiler_on_str(
+        "#![allow(dead_code, unused_unsafe, unused_variables)]\n\
+         pub unsafe fn target(a: *mut i32, b: *mut i32) { *a = *b; }\n\
+         pub unsafe fn c(q: *mut i32, r: *mut i32) { target(r, q); }\n",
+        |tcx| {
+            let program = crate::bo_rewriter::collect_program(tcx);
+            let facts = crate::bo_rewriter::decision::emitability::collect(tcx, &program.functions);
+            facts
+                .call_args
+                .iter()
+                .filter(|(did, _)| tcx.def_path_str(did.to_def_id()).contains("target"))
+                .flat_map(|(_, sites)| sites.iter().map(|s| s.args.len()))
+                .chain(
+                    facts
+                        .call_args
+                        .iter()
+                        .filter(|(did, _)| tcx.def_path_str(did.to_def_id()).contains("target"))
+                        .flat_map(|(_, sites)| sites.iter())
+                        .flat_map(|s| s.args.iter().map(|a| a.index)),
+                )
+                .collect::<Vec<_>>()
+        },
+    )
+    .expect("fixture compiles");
+    assert_eq!(indices, vec![2, 0, 1], "one site, two args, indices 0 then 1");
+}
+
+/// **Only DIRECT calls carry arguments** — the pinned population has none.
+///
+/// A function reached by a fn-pointer cast has no visible argument list, which
+/// is *why* it is pinned. If this arm recorded anything for that shape, the
+/// pinned 640 would appear to have an adaptation market they cannot have.
+///
+/// The negative is paired with a positive in ONE fixture so a mechanism that
+/// records nothing at all cannot satisfy it — the g19 rule.
+#[test]
+fn only_direct_calls_record_arguments() {
+    let (called, cast) = ::utils::compilation::run_compiler_on_str(
+        "#![allow(dead_code, unused_unsafe, unused_variables)]\n\
+         pub unsafe fn called(p: *mut i32) { *p = 1; }\n\
+         pub unsafe fn pinned(p: *mut i32) { *p = 2; }\n\
+         pub unsafe fn c(q: *mut i32) -> usize {\n\
+             called(q);\n\
+             pinned as unsafe fn(*mut i32) as usize\n\
+         }\n",
+        |tcx| {
+            let program = crate::bo_rewriter::collect_program(tcx);
+            let facts = crate::bo_rewriter::decision::emitability::collect(tcx, &program.functions);
+            let count = |needle: &str| {
+                facts
+                    .call_args
+                    .iter()
+                    .filter(|(did, _)| tcx.def_path_str(did.to_def_id()).contains(needle))
+                    .map(|(_, sites)| sites.len())
+                    .sum::<usize>()
+            };
+            (count("called"), count("pinned"))
+        },
+    )
+    .expect("fixture compiles");
+
+    assert_eq!(called, 1, "the direct call must be recorded");
+    assert_eq!(
+        cast, 0,
+        "a fn-pointer cast supplies NO arguments — recording one would give the \
+         pinned population a market it cannot have"
+    );
+}
