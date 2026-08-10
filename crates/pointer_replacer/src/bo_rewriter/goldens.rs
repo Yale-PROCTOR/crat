@@ -111,6 +111,39 @@ pub(super) const GOLDENS: &[Golden] = goldens![
     // goldens are spec, not census.
     "g17_reslice_advance",
     "g18_reslice_rebind",
+    // **S3.6-1, RATIFIED 2026-08-09 on their sha256-anchored bytes.** Call-site
+    // adaptation: the first goldens whose expected text depends on a function
+    // OTHER than the one holding the subject.
+    //
+    // **g20** pins the dominant shape and the two-level chain. Its two call
+    // sites are byte-identical across the pair — the adaptation is that the
+    // declarations may now move at all, which is the capability. It CANNOT be
+    // satisfied by a partial implementation: converting `g20_bump` without
+    // `g20_via` is `E0308` (measured), so byte identity here is unreachable
+    // without the joint decision.
+    //
+    // **g21** is the negative control, made discriminating by pairing it with a
+    // positive IN THE SAME FILE: `g21_ok` converts, the `g21_aliased`/`g21_dirty`
+    // class does not, because one call site passes the same binding to two
+    // `*mut` positions. Convert nothing and `g21_ok` fails; convert everything
+    // and the emitted crate is `E0499`. A no-edit golden ALONE is not a witness
+    // — that is g19's rule, honoured rather than restated.
+    "g20_callsite_adapt_propagate",
+    "g21_callsite_blocked_class",
+    // **g22 `callsite_reborrow_bridge` — PARKED 2026-08-09, deliberately NOT
+    // authored. The NUMBER IS CONSUMED and must never be reallocated.**
+    //
+    // It was proposed with both halves compile-verified, and the ruling declined
+    // it: the reborrow bridge (`f(&mut *r)` where `r` stays raw) trades lost
+    // yield for **silent UB in exactly the region the compiler cannot check**.
+    // Measured: aliasing through a real place is `E0499`, and the same aliasing
+    // through a raw-pointer deref compiles with zero diagnostics. Under full
+    // co-conversion that shape is a caught error — a revert, i.e. lost yield;
+    // under the bridge it is a clean compile.
+    //
+    // Its market is real and priced (1,733 raw-base slots; libzahl's 104-node
+    // class), and it is revisited only when an **independent UB-safety oracle**
+    // exists — not a compile pass. No fixture files exist for it on purpose.
     // **g19 `unannotated_let_ref` — RATIFIED 2026-08-09, RETIRED 2026-08-09.
     // The NUMBER STAYS CONSUMED: it must never be reallocated.**
     //
@@ -214,6 +247,8 @@ golden_test!(g12_slice_mut, "g12_slice_mut");
 golden_test!(g13_opt_slice, "g13_opt_slice");
 golden_test!(g17_reslice_advance, "g17_reslice_advance");
 golden_test!(g18_reslice_rebind, "g18_reslice_rebind");
+golden_test!(g20_callsite_adapt_propagate, "g20_callsite_adapt_propagate");
+golden_test!(g21_callsite_blocked_class, "g21_callsite_blocked_class");
 
 /// The canonicalizer must be a real normalizer, not a pass-through.
 ///
@@ -241,11 +276,13 @@ fn canonicalization_normalizes_whitespace() {
 fn every_golden_pair_is_present() {
     assert_eq!(
         GOLDENS.len(),
-        15,
+        17,
         "the M0.5 package specifies ten pairs; U-5 slice 1 transcribes g11/g12 \
          from the ratified §8 table, slice 3 transcribes g13, and 2b adds \
          g17/g18. g19 was added and RETIRED in the g16 slice — back to 15, with \
-         the number consumed"
+         the number consumed. S3.6-1 ratifies g20/g21 → 17. **g22 was proposed \
+         and PARKED**, so its number is consumed and 17 is NOT 15+3: a count \
+         that quietly became 18 would mean the parked bridge had been authored"
     );
     for g in GOLDENS {
         assert!(!g.input.trim().is_empty(), "{}: empty .input.rs", g.name);
