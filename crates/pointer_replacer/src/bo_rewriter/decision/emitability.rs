@@ -141,7 +141,19 @@ pub(crate) enum ArgShape {
     /// `None` when the operand is not rooted at a local binding (a static, a
     /// temporary). `None` is **not** "no overlap" — the gate must treat an
     /// unknown root conservatively.
-    AddrOf { mutable: bool, base: Option<HirId> },
+    AddrOf {
+        mutable: bool,
+        base: Option<HirId>,
+        /// Did the walk to `base` traverse a **deref**?
+        ///
+        /// **P2's visibility split turns on this.** `&mut x` on a local is a
+        /// real place whatever happens. `&mut (*s).g` is a place *through* `s`
+        /// — and §5a measured that the compiler CATCHES overlap when that base
+        /// is a reference and is BLIND when it is a raw pointer. So the same
+        /// expression is checked or unchecked depending on whether `s` itself
+        /// converts, which cannot be asked without knowing a deref happened.
+        through_deref: bool,
+    },
     /// `&mut e as *mut T` — the cast is the only thing to remove.
     AddrOfCast { mutable: bool, inner: Span },
     /// `q as *mut T` where `q` is a local binding.
@@ -195,16 +207,20 @@ impl ArgShape {
 /// temporary roots at nothing. Deref is included deliberately — that is the
 /// C2Rust shape, and stopping at it would make every `(*p).field` argument look
 /// unrelated to `p`.
-fn place_root(expr: &Expr<'_>) -> Option<HirId> {
+fn place_root(expr: &Expr<'_>) -> (Option<HirId>, bool) {
     let mut cur = expr;
+    let mut through_deref = false;
     loop {
         match &cur.kind {
+            ExprKind::Unary(rustc_hir::UnOp::Deref, base) => {
+                through_deref = true;
+                cur = base;
+            }
             ExprKind::Field(base, _)
             | ExprKind::Index(base, _, _)
-            | ExprKind::Unary(rustc_hir::UnOp::Deref, base)
             | ExprKind::AddrOf(_, _, base)
             | ExprKind::DropTemps(base) => cur = base,
-            _ => return BodyFacts::resolved_local(cur),
+            _ => return (BodyFacts::resolved_local(cur), through_deref),
         }
     }
 }
@@ -274,10 +290,14 @@ fn classify_arg(expr: &Expr<'_>) -> ArgShape {
                 ArgShape::Cast { inner: inner.span }
             }
         }
-        ExprKind::AddrOf(_, mutability, operand) => ArgShape::AddrOf {
-            mutable: matches!(mutability, Mutability::Mut),
-            base: place_root(operand),
-        },
+        ExprKind::AddrOf(_, mutability, operand) => {
+            let (base, through_deref) = place_root(operand);
+            ArgShape::AddrOf {
+                mutable: matches!(mutability, Mutability::Mut),
+                base,
+                through_deref,
+            }
+        }
         _ => match BodyFacts::resolved_local(expr) {
             Some(binding) => ArgShape::BareLocal(binding),
             // A bare `0` with no cast still cannot become a reference.

@@ -2036,7 +2036,13 @@ fn finish_decide<'tcx>(
     // report, so `build` consumes them rather than the census reading them
     // alongside.
     let escapes = decision::co_conversion::escapes(tcx, &program.functions, &subjects);
-    let coconv = decision::co_conversion::build(&facts, &subjects, &hypothetical, &escapes);
+    let coconv = decision::co_conversion::build(
+        &facts,
+        &subjects,
+        &hypothetical,
+        &escapes,
+        decision::co_conversion::OverlapRule::RootDisjoint,
+    );
 
     // Structural self-check: the table matches the subjects it was handed. NOT
     // the coverage gate — every comparison in it is against the collector's own
@@ -2062,6 +2068,8 @@ fn finish_decide<'tcx>(
             facts,
             coconv,
             escapes,
+            subjects,
+            hypothetical,
         },
     ))
 }
@@ -2091,6 +2099,11 @@ pub(crate) struct DecideCtx {
     /// population ~4× but does not introduce the class. Measured here so it is
     /// neither folded in silently nor omitted silently.
     escapes: Vec<decision::co_conversion::Escape>,
+    /// **P2 measurement.** The inputs the class builder consumed, kept so an
+    /// alternative overlap rule can be priced without a second front-end pass —
+    /// R1's rule, the one that stopped the recon worker solving BO twice.
+    subjects: Vec<decision::Subject>,
+    hypothetical: decision::DecisionTable,
 }
 
 impl DecideCtx {
@@ -2315,8 +2328,31 @@ pub(crate) fn coconv_tsv(tcx: TyCtxt<'_>) -> Result<String, String> {
             bucket.push(escape.kind.key());
         }
     }
+    // **P2 measurement columns.** The two candidate overlap rules, priced at
+    // CLASS level by re-running the whole builder under each — not estimated
+    // from position counts, because blocking a node blocks its class and a
+    // per-node count is not a bound on a per-class outcome (the 831 → 788
+    // lesson, banked).
+    //
+    // `storage_aliases` is deliberately absent: it is a MUST-alias relation, so
+    // it can confirm an overlap and never refute one. Using it to PASS a pair
+    // would be unsound, and was refused in advance by ruling.
+    let blind_only = decision::co_conversion::build(
+        &ctx.facts,
+        &ctx.subjects,
+        &ctx.hypothetical,
+        &ctx.escapes,
+        decision::co_conversion::OverlapRule::BlindOnly,
+    );
+    let all_pairs = decision::co_conversion::build(
+        &ctx.facts,
+        &ctx.subjects,
+        &ctx.hypothetical,
+        &ctx.escapes,
+        decision::co_conversion::OverlapRule::AllPairs,
+    );
     let mut out = String::from(
-        "fn_path\tmir_local\tis_param\tclass_id\tclass_size\tadmissible\tclass_block\tnode_block\tsites\tescapes\n",
+        "fn_path\tmir_local\tis_param\tclass_id\tclass_size\tadmissible\tclass_block\tnode_block\tsites\tescapes\tp2_blind_only\tp2_all_pairs\n",
     );
     for (s, _decision) in &table.entries {
         let key = (s.fn_did, s.hir_id);
@@ -2354,8 +2390,15 @@ pub(crate) fn coconv_tsv(tcx: TyCtxt<'_>) -> Result<String, String> {
         };
         let mut escapes = escapes_of.get(&key).cloned().unwrap_or_default();
         escapes.sort_unstable();
+        // `-` where the subject is not a node under the production build, so
+        // the two columns are never read as a verdict on a non-member.
+        let verdict = |c: &decision::co_conversion::CoConv| match c.class_of(key) {
+            Some(_) => u8::from(c.admits(key)).to_string(),
+            None => "-".to_owned(),
+        };
+        let (p2_blind, p2_all) = (verdict(&blind_only), verdict(&all_pairs));
         out.push_str(&format!(
-            "{}\t{}\t{}\t{class_id}\t{class_size}\t{admissible}\t{class_block}\t{}\t{sites}\t{}\n",
+            "{}\t{}\t{}\t{class_id}\t{class_size}\t{admissible}\t{class_block}\t{}\t{sites}\t{}\t{p2_blind}\t{p2_all}\n",
             tcx.def_path_str(s.fn_did.to_def_id()),
             s.local.as_u32(),
             u8::from(matches!(s.kind, decision::SubjectKind::Param { .. })),

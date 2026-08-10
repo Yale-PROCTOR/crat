@@ -154,6 +154,31 @@ impl BlockReason {
     }
 }
 
+/// **P2 — how the within-site overlap gate treats two node positions.**
+///
+/// A measurement parameter, not a policy: production passes
+/// [`Self::RootDisjoint`], so nothing moves while the two candidate rules are
+/// priced at CLASS level. The per-node lesson applies to this estimate too —
+/// blocking a node blocks its class, so neither option can be costed by
+/// counting positions.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum OverlapRule {
+    /// Today's rule: two positions are disjoint when both roots are KNOWN and
+    /// DIFFERENT. **Unsound as a disjointness proof** — a `HirId` names a
+    /// binding, not an allocation (P2).
+    RootDisjoint,
+    /// Block a pair only where the compiler cannot see it: at least one side is
+    /// a place reached through a base that stays RAW after conversion, or has
+    /// an unknown root.
+    ///
+    /// The other pairs are in the **checked** region — if they really alias,
+    /// borrowck answers `E0499`/`E0502`, which costs a revert. Yield, not
+    /// soundness.
+    BlindOnly,
+    /// Block every mutable pair regardless of roots — maximal conservatism.
+    AllPairs,
+}
+
 /// One connected component.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Class {
@@ -255,6 +280,7 @@ pub(crate) fn build(
     subjects: &[Subject],
     hypothetical: &DecisionTable,
     escapes: &[Escape],
+    overlap: OverlapRule,
 ) -> CoConv {
     // ---- 1. the node set: subjects that would emit a PLAIN reference ----
     //
@@ -372,7 +398,13 @@ pub(crate) fn build(
             // unconditional and no later slice retires it, so it is named
             // first. Measured on the g21 fixture, which reported the wrong
             // reason until this pass was split out.
-            let node_positions: Vec<(NodeKey, Option<HirId>, bool)> = site
+            // `blind` = the compiler cannot see an overlap at this position
+            // after conversion. §5a measured the rule: a borrow rooted at a
+            // REAL place (a local, or a place through a REFERENCE) is checked;
+            // one rooted through a RAW-pointer deref compiles with zero
+            // diagnostics. So `&mut (*s).g` is checked exactly when `s` itself
+            // converts, and an unknown root is treated as blind.
+            let node_positions: Vec<(NodeKey, Option<HirId>, bool, bool)> = site
                 .args
                 .iter()
                 .filter_map(|arg| {
@@ -380,25 +412,35 @@ pub(crate) fn build(
                         .get(&(*callee, arg.index))
                         .copied()
                         .filter(|k| converts.contains(k))?;
-                    Some((key, arg.shape.place_root(), wants_mut[&key]))
+                    let blind = match arg.shape {
+                        ArgShape::AddrOf { base: None, .. } => true,
+                        ArgShape::AddrOf {
+                            base: Some(b),
+                            through_deref: true,
+                            ..
+                        } => !converts.contains(&(b.owner.def_id, b)),
+                        _ => false,
+                    };
+                    Some((key, arg.shape.place_root(), wants_mut[&key], blind))
                 })
                 .collect();
             for i in 0..node_positions.len() {
                 for j in (i + 1)..node_positions.len() {
-                    let (a, root_a, mut_a) = node_positions[i];
-                    let (b, root_b, mut_b) = node_positions[j];
+                    let (a, root_a, mut_a, blind_a) = node_positions[i];
+                    let (b, root_b, mut_b, blind_b) = node_positions[j];
                     // Two SHARED borrows of one place are legal, so a conflict
                     // needs at least one `&mut`; H6 measured that demoting the
                     // other side to shared does not rescue it.
                     if !mut_a && !mut_b {
                         continue;
                     }
-                    // Disjoint only when both roots are KNOWN and different. An
-                    // unknown root — `&mut` of a static or a temporary — is a
-                    // may-overlap, and blocking a may-overlap costs yield and
-                    // never soundness.
-                    let disjoint = matches!((root_a, root_b), (Some(x), Some(y)) if x != y);
-                    if !disjoint {
+                    let same_root = !matches!((root_a, root_b), (Some(x), Some(y)) if x != y);
+                    let conflicts = match overlap {
+                        OverlapRule::RootDisjoint => same_root,
+                        OverlapRule::BlindOnly => same_root || blind_a || blind_b,
+                        OverlapRule::AllPairs => true,
+                    };
+                    if conflicts {
                         block(&mut node_block, a, BlockReason::DuplicatePlaceRoot);
                         block(&mut node_block, b, BlockReason::DuplicatePlaceRoot);
                     }

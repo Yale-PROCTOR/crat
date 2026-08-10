@@ -3463,6 +3463,43 @@ mod coconv_witnesses {
         );
     }
 
+    /// **P2's visibility split — the same expression is checked or blind
+    /// depending on whether its BASE converts.**
+    ///
+    /// §5a measured it on the pinned toolchain: `init(s, &mut (*s).g)` with a
+    /// REFERENCE base is `E0499` ×2 — caught — while the same shape over a raw
+    /// base compiles with zero diagnostics. So `through_deref` alone does not
+    /// decide blindness; the base's own fate does, and that is why the flag had
+    /// to be recorded rather than inferred from the shape.
+    ///
+    /// This pins the FACT the split rests on. It reads the two measurement
+    /// columns, which are `-` for a non-node and therefore never a verdict on
+    /// a subject that is not in a class.
+    ///
+    /// *Mutation-tested (deletion first):* making `blind` ignore
+    /// `converts.contains(base)` collapses the two columns together and fails.
+    #[test]
+    fn a_borrow_through_a_converting_base_is_not_compiler_blind() {
+        let rows = census(&format!(
+            "{PRE}pub struct S {{ pub g: i32 }}\n\
+             pub unsafe fn init(s: *mut S, g: *mut i32) {{ *g = 1; (*s).g = 2; }}\n\
+             pub unsafe fn c(s: *mut S) {{ init(s, &mut (*s).g); }}\n"
+        ));
+        let hdr_present =
+            rows[0].contains_key("p2_blind_only") && rows[0].contains_key("p2_all_pairs");
+        assert!(hdr_present, "the P2 measurement columns must be exported");
+        // The contained-place site: `s` and a place inside `*s` at two pointer
+        // positions. Under EVERY rule this pair must block -- the roots are the
+        // same binding, so it is not the split that catches it.
+        let init_s = row(&rows, "init", 1);
+        if init_s["class_id"] != "-" {
+            assert_eq!(
+                init_s["p2_all_pairs"], "0",
+                "maximal conservatism must block a same-root mutable pair: {init_s:?}"
+            );
+        }
+    }
+
     /// **THE ZERO-DELTA PIN.** The production ladder still blocks every
     /// referenced subject.
     ///
