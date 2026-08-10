@@ -2032,8 +2032,11 @@ fn finish_decide<'tcx>(
     // corpus delta structural rather than lucky. Task 3 is where the verdict
     // reaches a gate.
     let hypothetical = decision::decide(&ctx_of(decision::RefGate::LiftAdaptable), &subjects);
-    let coconv = decision::co_conversion::build(&facts, &subjects, &hypothetical);
+    // Escapes are computed BEFORE the classes now: P1 makes them a gate, not a
+    // report, so `build` consumes them rather than the census reading them
+    // alongside.
     let escapes = decision::co_conversion::escapes(tcx, &program.functions, &subjects);
+    let coconv = decision::co_conversion::build(&facts, &subjects, &hypothetical, &escapes);
 
     // Structural self-check: the table matches the subjects it was handed. NOT
     // the coverage gate — every comparison in it is against the collector's own

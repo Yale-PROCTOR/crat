@@ -3377,6 +3377,92 @@ mod coconv_witnesses {
         );
     }
 
+    /// **P1 — each escape shape blocks under its OWN reason.**
+    ///
+    /// Approved conservative reading (ruling 2026-08-10): a node whose
+    /// reference can leave through a return, a foreign call, a field store or
+    /// a `static mut` store is not safely convertible, and each gets its own
+    /// key so the population stays separately attributable and the scope is
+    /// reversible by ruling rather than by archaeology.
+    ///
+    /// **Paired with a non-escaping node in the same crate** — a gate that
+    /// blocked everything would satisfy every positive case at once.
+    ///
+    /// *Mutation-tested (deletion first):* deleting the escape loop makes each
+    /// of these read `-` and fails.
+    #[test]
+    fn each_escape_shape_blocks_its_node_under_its_own_reason() {
+        // One whole source per case: the shapes need different signatures, and
+        // splicing a signature through a helper is how the first draft of this
+        // fixture produced a crate that did not compile.
+        const HDR: &str = "extern \"C\" { fn sink(p: *mut i32); }\n\
+             pub struct S { pub f: *mut i32 }\n\
+             pub static mut G: *mut i32 = 0 as *mut i32;\n\
+             pub unsafe fn safe_one(k: *mut i32) { *k = 9; }\n";
+        let case = |sig: &str| {
+            let rows = census(&format!("{PRE}{HDR}{sig}"));
+            (
+                row(&rows, "subject", 1)["node_block"].clone(),
+                row(&rows, "safe_one", 1)["admissible"].clone(),
+            )
+        };
+        let cases = [
+            (
+                "pub unsafe fn subject(p: *mut i32) -> *mut i32 { *p = 1; return p; }\n",
+                "escapes-via-return",
+            ),
+            (
+                "pub unsafe fn subject(p: *mut i32) { *p = 1; sink(p); }\n",
+                "escapes-via-foreign-arg",
+            ),
+            (
+                "pub unsafe fn subject(p: *mut i32, s: *mut S) { *p = 1; (*s).f = p; }\n",
+                "escapes-via-field-store",
+            ),
+            (
+                "pub unsafe fn subject(p: *mut i32) { *p = 1; G = p; }\n",
+                "escapes-via-static-store",
+            ),
+        ];
+        for (sig, expected) in cases {
+            let (blocked, beside) = case(sig);
+            assert_eq!(blocked, expected, "for {sig}");
+            assert_eq!(
+                beside, "1",
+                "the non-escaping node beside it must stay admissible, or the \
+                 gate is satisfied by blocking everything: {sig}"
+            );
+        }
+    }
+
+    /// **P1 — a BORROW of a converting binding into a raw parameter blocks.**
+    ///
+    /// `f(&mut *r)` today reborrows a raw pointer; after `r` converts it
+    /// reborrows a **reference**, so the raw pointer the callee retains can
+    /// outlive the borrow. The conversion changes the case's character, which
+    /// is what puts it inside banked rule 2 — the gap the adversarial review
+    /// named, and the one the record did not previously cover.
+    ///
+    /// **Its own reason, not `flows-into-raw-param`**: the argument is a
+    /// reborrow rather than the binding, so it forms no class edge and the
+    /// owed repair differs.
+    #[test]
+    fn a_borrow_of_a_converting_binding_into_a_raw_parameter_blocks() {
+        let rows = census(&format!(
+            "{PRE}pub unsafe fn sink(p: *mut i32) -> usize {{ p as usize }}\n\
+             pub unsafe fn src(r: *mut i32) -> usize {{ *r = 1; sink(&mut *r) }}\n"
+        ));
+        assert_eq!(
+            row(&rows, "sink", 1)["class_id"],
+            "-",
+            "the callee parameter must stay raw, or the fixture witnesses nothing"
+        );
+        assert_eq!(
+            row(&rows, "src", 1)["node_block"],
+            "borrowed-into-raw-param"
+        );
+    }
+
     /// **THE ZERO-DELTA PIN.** The production ladder still blocks every
     /// referenced subject.
     ///

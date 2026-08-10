@@ -103,6 +103,24 @@ pub(crate) enum BlockReason {
     ArgSharedIntoMut,
     /// A cast, a call result, an index, arithmetic — no adaptation form exists.
     ArgUnadaptableShape,
+    /// The member's binding is **borrowed** at a call site (`f(&mut *r)`) and
+    /// the parameter it reaches does not convert.
+    ///
+    /// Today `&mut *r` on a raw `r` already coerces to `*mut T`. After `r`
+    /// converts, the same expression reborrows a **reference**, so the raw
+    /// pointer the callee keeps can outlive the borrow. **S3.6-1's conversion
+    /// changes the case's character**, which puts it inside banked rule 2
+    /// rather than outside it — the gap the adversarial review named (P1).
+    BorrowedIntoRawParam,
+    /// The member's reference can leave through a **`return`**.
+    EscapesViaReturn,
+    /// … through an argument to a callee the class machinery cannot see —
+    /// `extern` block entries and anything not a direct call to a local `fn`.
+    EscapesViaForeignArg,
+    /// … through a store into a place projection (`(*t).f = p`).
+    EscapesViaFieldStore,
+    /// … through a store into a `static mut`.
+    EscapesViaStaticStore,
     /// Two argument positions at one call site may name overlapping places, and
     /// both would become references: `E0499`.
     ///
@@ -126,6 +144,11 @@ impl BlockReason {
             BlockReason::ArgNullLiteral => "arg-null-literal",
             BlockReason::ArgSharedIntoMut => "arg-shared-into-mut",
             BlockReason::ArgUnadaptableShape => "arg-unadaptable-shape",
+            BlockReason::BorrowedIntoRawParam => "borrowed-into-raw-param",
+            BlockReason::EscapesViaReturn => "escapes-via-return",
+            BlockReason::EscapesViaForeignArg => "escapes-via-foreign-arg",
+            BlockReason::EscapesViaFieldStore => "escapes-via-field-store",
+            BlockReason::EscapesViaStaticStore => "escapes-via-static-store",
             BlockReason::DuplicatePlaceRoot => "duplicate-place-root",
         }
     }
@@ -231,6 +254,7 @@ pub(crate) fn build(
     facts: &EmitabilityFacts,
     subjects: &[Subject],
     hypothetical: &DecisionTable,
+    escapes: &[Escape],
 ) -> CoConv {
     // ---- 1. the node set: subjects that would emit a PLAIN reference ----
     //
@@ -290,6 +314,29 @@ pub(crate) fn build(
     /// contributes two.
     fn block(node_block: &mut FxHashMap<NodeKey, BlockReason>, key: NodeKey, reason: BlockReason) {
         node_block.entry(key).or_insert(reason);
+    }
+
+    // ---- 1b. THE ESCAPE GATE — P1, and it runs FIRST ----
+    //
+    // An escape is a property of the node alone, unconditional, and no later
+    // slice of this ladder retires it. The reason-honesty rule therefore names
+    // it before any call-site reason: a census must never name a reason whose
+    // removal would not unblock the class.
+    //
+    // **One variant per shape, by ruling**, so the population stays separately
+    // attributable and the conservative scope is reversible by a ruling rather
+    // than by archaeology.
+    for escape in escapes {
+        if !converts.contains(&escape.subject) {
+            continue;
+        }
+        let reason = match escape.kind {
+            EscapeKind::Return => BlockReason::EscapesViaReturn,
+            EscapeKind::ForeignArg => BlockReason::EscapesViaForeignArg,
+            EscapeKind::FieldStore => BlockReason::EscapesViaFieldStore,
+            EscapeKind::StaticStore => BlockReason::EscapesViaStaticStore,
+        };
+        block(&mut node_block, escape.subject, reason);
     }
 
     // ---- 2. edges and argument admissibility, in ONE pass over call sites ----
@@ -364,9 +411,17 @@ pub(crate) fn build(
 
                 // The CALLER side of this argument: the binding whose own
                 // conversion this argument would carry.
-                let caller_binding = match arg.shape {
-                    ArgShape::BareLocal(b) | ArgShape::CastOfLocal { binding: b, .. } => Some(b),
-                    _ => None,
+                // `via_borrow` distinguishes `f(r)` from `f(&mut *r)`. Both
+                // put `r`'s value in front of the callee, but only the first
+                // can form a class EDGE — a reborrow's type is not the
+                // binding's, so joining them would be a category error. The
+                // borrow case is a P1 hazard and nothing else.
+                let (caller_binding, via_borrow) = match arg.shape {
+                    ArgShape::BareLocal(b) | ArgShape::CastOfLocal { binding: b, .. } => {
+                        (Some(b), false)
+                    }
+                    ArgShape::AddrOf { base: Some(b), .. } => (Some(b), true),
+                    _ => (None, false),
                 };
                 let caller_node = caller_binding
                     .map(|b| (b.owner.def_id, b))
@@ -382,7 +437,9 @@ pub(crate) fn build(
                         // pinned callee's parameters degrade
                         // `call-site-not-adapted` even under `LiftAdaptable`,
                         // so they are never `other_form` either.
-                        let reason = if callee_subject.is_some_and(|k| other_form.contains(&k)) {
+                        let reason = if via_borrow {
+                            BlockReason::BorrowedIntoRawParam
+                        } else if callee_subject.is_some_and(|k| other_form.contains(&k)) {
                             BlockReason::FlowsIntoOtherForm
                         } else if pinned {
                             BlockReason::FlowsIntoPinnedCallee
