@@ -7130,6 +7130,40 @@ mod run {
             Err(_) => row.set("fatness_pass", "panicked"),
         }
 
+        // **S3.6-1 task 2 — the co-conversion class census.** Its own pass (R2),
+        // caught (R3), written beside the artifacts it explains.
+        //
+        // MEASUREMENT ONLY: the decision layer runs under `RefGate::BlockAll`,
+        // so nothing in this file can move a corpus line. Task 3 is where the
+        // verdict reaches a gate.
+        let coconv = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            crate::bo_rewriter::coconv_tsv(tcx)
+        }));
+        match coconv {
+            Ok(Ok(tsv)) => {
+                let path = dir.join(format!("{name}.coconv.tsv"));
+                std::fs::write(&path, &tsv)
+                    .unwrap_or_else(|e| panic!("write coconv census {}: {e}", path.display()));
+                let summary = coconv_summary(&tsv);
+                row.set("coconv_nodes", summary.nodes);
+                row.set("coconv_classes", summary.classes);
+                row.set("coconv_admissible", summary.admissible);
+                row.set("coconv_max_class", summary.max_class);
+                row.set("coconv_escaping", summary.escaping);
+                // Enumerate rather than summarise: full incidence in one run,
+                // the same discipline the recon findings are printed under.
+                for (reason, n) in &summary.blocked_by {
+                    println!("M1COCONV program={name} class_block={reason} nodes={n}");
+                }
+                for (kind, n) in &summary.escapes_by {
+                    println!("M1ESCAPE program={name} kind={kind} subjects={n}");
+                }
+                row.set("coconv_pass", "ok");
+            }
+            Ok(Err(why)) => row.set("coconv_pass", super::report::sanitize(&why)),
+            Err(_) => row.set("coconv_pass", "panicked"),
+        }
+
         row.set("t_instruments_s", format!("{:.3}", t_phase_i.elapsed().as_secs_f64()));
         // MECHANIZED: how many times the model was DERIVED (solved or loaded)
         // rather than reused from the in-process memo. Exactly one per program;
@@ -7183,6 +7217,77 @@ mod run {
         // DERIVED, never an unconditional ok.
         row.set("status", if passed { "ok" } else { "recon-fail" });
         row
+    }
+
+    /// What one program's co-conversion census says, in one struct.
+    ///
+    /// **Derived from the written TSV**, not recomputed from a second in-process
+    /// pass: the file is the artifact, and a summary derived any other way could
+    /// disagree with the bytes it claims to summarise. Same rule the S2b.3
+    /// counters follow — read back what was written.
+    #[derive(Default)]
+    pub(super) struct CoconvSummary {
+        pub nodes: usize,
+        pub classes: usize,
+        pub admissible: usize,
+        pub max_class: usize,
+        pub escaping: usize,
+        pub blocked_by: std::collections::BTreeMap<String, usize>,
+        pub escapes_by: std::collections::BTreeMap<String, usize>,
+    }
+
+    /// Parse the census **by header name**, never by position: every column
+    /// added since S3.2′-1 has shifted the indices under a positional reader.
+    pub(super) fn coconv_summary(tsv: &str) -> CoconvSummary {
+        let mut out = CoconvSummary::default();
+        let mut lines = tsv.lines();
+        let Some(header) = lines.next() else {
+            return out;
+        };
+        let hdr: Vec<&str> = header.split('\t').collect();
+        let col = |name: &str| hdr.iter().position(|h| *h == name);
+        let (Some(c_class), Some(c_size), Some(c_adm), Some(c_block), Some(c_esc)) = (
+            col("class_id"),
+            col("class_size"),
+            col("admissible"),
+            col("class_block"),
+            col("escapes"),
+        ) else {
+            return out;
+        };
+        let mut seen = std::collections::BTreeSet::new();
+        for line in lines {
+            let cells: Vec<&str> = line.split('\t').collect();
+            let Some(class) = cells.get(c_class) else {
+                continue;
+            };
+            if *class != "-" {
+                out.nodes += 1;
+                seen.insert((*class).to_owned());
+                if cells.get(c_adm) == Some(&"1") {
+                    out.admissible += 1;
+                } else if let Some(reason) = cells.get(c_block) {
+                    *out.blocked_by.entry((*reason).to_owned()).or_default() += 1;
+                }
+                if let Some(size) = cells.get(c_size).and_then(|s| s.parse::<usize>().ok()) {
+                    out.max_class = out.max_class.max(size);
+                }
+            }
+            // Escapes are counted over EVERY subject, node or not. The class
+            // machinery gates the call-argument flow only; the other shapes are
+            // a standing M1 property and their denominator is the whole
+            // population, not the class one.
+            if let Some(esc) = cells.get(c_esc)
+                && *esc != "-"
+            {
+                out.escaping += 1;
+                for kind in esc.split(',') {
+                    *out.escapes_by.entry(kind.to_owned()).or_default() += 1;
+                }
+            }
+        }
+        out.classes = seen.len();
+        out
     }
 
     pub(super) fn record_expected_zero_aggregates(

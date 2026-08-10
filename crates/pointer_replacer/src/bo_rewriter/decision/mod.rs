@@ -26,11 +26,50 @@ use rustc_span::Span;
 
 use crate::analyses::borrow_ownership::{SlotKind, crate_slots::CrateSlots, solver::SlotRef};
 
+pub(crate) mod co_conversion;
 pub(crate) mod construction;
 pub(crate) mod emitability;
 pub(crate) mod universe;
 
 use emitability::EmitabilityFacts;
+
+/// **S3.6-1 — what the `referenced` gate does on this pass.**
+///
+/// The gate at `decide_one` position 8 degrades every subject of an in-crate
+/// referenced function. S3.6-1 is the slice that lifts it, and lifting it needs
+/// a question asked one step earlier: *which subjects would convert if the gate
+/// were not there?* That question is what builds the co-conversion classes, and
+/// it must be answered by **this** ladder rather than by a replay of it —
+/// micro-plan §1b measured what a replay costs (a `facts.tsv`-only replay
+/// reported 2,133 against a true 2,075 and was retracted).
+///
+/// So the gate becomes a mode, and the class builder runs the real
+/// [`decide_one`] under [`Self::LiftAdaptable`].
+///
+/// # Why the lifting variant names ADAPTABLE, and why that is not a comment
+///
+/// The pinned population — 295 functions / 640 subjects, 87 % of it
+/// tulipindicators — is **excluded from M1** and deferred to M2/M3 (ruling
+/// 2026-08-10). A variant spelled `Lift` would have made every pinned
+/// parameter a class node, and the exclusion would then have lived only in
+/// prose. Banked rule (2026-08-10): *a parked capability is excluded
+/// structurally — in the types and the count pins — never in prose alone.*
+/// This enum is where that rule is paid for at the decision layer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RefGate {
+    /// **Every** in-crate reference blocks — M1's behaviour through S3.6-0, and
+    /// task 2's production setting.
+    ///
+    /// Task 2 computes classes and decides nothing, so the production call site
+    /// passes this and the corpus cannot move. Zero delta is a property of the
+    /// code, not an outcome of a run — the S3.6-0 pattern.
+    BlockAll,
+    /// Adaptable functions pass the gate; **pinned ones still block**.
+    ///
+    /// The hypothetical the class builder asks about. Task 3 is where a
+    /// production call site may pass it, and then only for admissible classes.
+    LiftAdaptable,
+}
 
 /// How the parameter's **declaration** is written in source, for a subject
 /// whose **resolved** type is a pointer.
@@ -632,6 +671,9 @@ pub(crate) struct Ctx<'a, 'tcx> {
     pub(crate) sign: &'a super::sign_facts::SignFacts,
     pub(crate) slice_uses: &'a FxHashMap<(LocalDefId, rustc_hir::HirId), emitability::SliceUses>,
     pub(crate) opt_uses: &'a FxHashMap<(LocalDefId, rustc_hir::HirId), emitability::OptUses>,
+    /// **S3.6-1** — see [`RefGate`]. A mode rather than a fact, which is why it
+    /// is `Copy` and not a borrow like everything else here.
+    pub(crate) gate: RefGate,
 }
 
 pub(crate) fn decide(ctx: &Ctx<'_, '_>, subjects: &[Subject]) -> DecisionTable {
@@ -660,6 +702,7 @@ fn decide_one(ctx: &Ctx<'_, '_>, subject: &Subject) -> Decision {
         sign,
         slice_uses,
         opt_uses,
+        gate,
     } = ctx;
     let decl_site = EmitabilityFacts::site(tcx, subject.attribution_span());
 
@@ -782,17 +825,27 @@ fn decide_one(ctx: &Ctx<'_, '_>, subject: &Subject) -> Decision {
             DegradeReason::PtrComparison,
         );
     }
-    // **S3.6-0 records the reference KIND; this arm deliberately ignores it.**
-    // Any reference still degrades, adaptable or pinned alike, so the split is
-    // measurable without moving a single decision.
+    // **S3.6-0 recorded the reference KIND; S3.6-1 makes the gate a MODE.**
+    //
+    // Under [`RefGate::BlockAll`] — task 2's production setting and every
+    // setting before it — any reference degrades, adaptable or pinned alike,
+    // exactly as it did at S3.6-0. Under [`RefGate::LiftAdaptable`] the
+    // adaptable population passes and the pinned population still blocks, which
+    // is the hypothetical `co_conversion` builds its node set from.
     if let Some(refs) = facts.referenced.get(&subject.fn_did)
         && let Some((_kind, span)) = refs.first()
     {
-        return degrade(
-            subject,
-            EmitabilityFacts::site(tcx, *span),
-            DegradeReason::CallSiteNotAdapted,
-        );
+        let blocks = match gate {
+            RefGate::BlockAll => true,
+            RefGate::LiftAdaptable => !emitability::RefKind::is_adaptable(refs),
+        };
+        if blocks {
+            return degrade(
+                subject,
+                EmitabilityFacts::site(tcx, *span),
+                DegradeReason::CallSiteNotAdapted,
+            );
+        }
     }
 
     // LAST — see `DegradeReason::FreedSlot`. A veto on emission, not a

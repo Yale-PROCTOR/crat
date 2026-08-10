@@ -530,6 +530,12 @@ fn rewrite_core_injected(
                 },
                 (None, None) => verify::Baseline::default(),
             };
+            // **S3.6-1 task 2.** Built ONCE, from the same plan and texts every
+            // revert round re-renders from, so attribution and rendering cannot
+            // drift apart across rounds — the divergence class that cost a
+            // brotli sweep when `candidates` and `emitted_sites` were derived
+            // two different ways.
+            let planned_edit_sites = edit_sites(&emission_plan, &emission_texts);
             let mut baseline: Option<verify::Baseline> = None;
             let mut facts = OutcomeFacts {
                 degradations,
@@ -675,6 +681,7 @@ fn rewrite_core_injected(
                     &novel,
                     &observed_root,
                     &facts.emitted_sites,
+                    &planned_edit_sites,
                     crate_dir.as_deref().unwrap_or(std::path::Path::new("")),
                 )
                     .difference(&reverted)
@@ -1445,25 +1452,105 @@ impl OutcomeFacts {
 /// relied on alone: a cap that fires is a loop that stopped being understood.
 const MAX_REVERT_ROUNDS: usize = 8;
 
+/// Where one planned edit landed, in the lines a diagnostic is reported in.
+///
+/// **S3.6-1 task 2.** The plan's edits are byte ranges into the original text;
+/// a diagnostic carries a line. The conversion is done once, in the driver,
+/// from the texts the plan was rendered against — no compiler session, and no
+/// second derivation of either quantity.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct EditSite {
+    pub file: String,
+    /// The **subject that justifies the edit**, which is `Edit::owner_fn` — not
+    /// the function the edit lands in. That difference is the whole repair.
+    pub fn_path: String,
+    pub lo_line: usize,
+    pub hi_line: usize,
+}
+
+/// Line range of a byte range in `text`, 1-based, inclusive.
+fn line_span(text: &str, lo: usize, hi: usize) -> (usize, usize) {
+    let count = |upto: usize| text.get(..upto.min(text.len())).map_or(1, |s| s.matches('\n').count() + 1);
+    (count(lo), count(hi))
+}
+
+/// Every planned edit, located in lines.
+fn edit_sites(
+    planned: &plan::Plan,
+    texts: &std::collections::BTreeMap<plan::FileKey, String>,
+) -> Vec<EditSite> {
+    let mut out = Vec::new();
+    for (key, edits) in &planned.by_file {
+        let Some(text) = texts.get(key) else {
+            continue;
+        };
+        let file = match key {
+            plan::FileKey::Real(path) => path.display().to_string(),
+            plan::FileKey::Virtual(name) => name.clone(),
+        };
+        for edit in edits {
+            let (lo_line, hi_line) = line_span(text, edit.lo, edit.hi);
+            out.push(EditSite {
+                file: file.clone(),
+                fn_path: edit.owner_fn.clone(),
+                lo_line,
+                hi_line,
+            });
+        }
+    }
+    out
+}
+
 /// Functions whose own rewrite is implicated by these diagnostics.
 ///
-/// Attribution is by SPAN CONTAINMENT against each rewritten subject's own
-/// function. Direction is recorded on the diagnostic and reported, but is
-/// deliberately NOT consulted here: it is diagnostic, not a router — the
-/// no-progress detector decides escalation, so a mis-attribution is caught by
-/// measurement rather than pre-empted by a heuristic that could be wrong.
+/// Direction is recorded on the diagnostic and reported, but is deliberately
+/// NOT consulted here: it is diagnostic, not a router — the no-progress
+/// detector decides escalation, so a mis-attribution is caught by measurement
+/// rather than pre-empted by a heuristic that could be wrong.
+///
+/// # The S3 repair (task 2), and what it does and does not fix
+///
+/// Attribution used to be span containment against each rewritten subject's own
+/// **function extent**, and nothing else. That is sound only while every edit
+/// sits inside a function that holds a subject — true through S3.2′, and
+/// **false the moment call-site adaptation emits into a caller file**: the
+/// diagnostic then lands in a function that may hold no subject at all, so it
+/// attributes to nobody, the revert loop cannot converge on the culprit, and it
+/// falls through to bisect, which "may revert more than strictly necessary".
+///
+/// So an **edit range is consulted first**: a diagnostic inside a planned
+/// edit's own lines names the subject that justifies that edit — which is
+/// `Edit::owner_fn`, the CALLEE, even when the edit is in the caller's file.
+/// Function-extent containment stays as the fallback, because most diagnostics
+/// land near an edit rather than on it.
+///
+/// **Stated as a residual rather than claimed away:** a diagnostic in a caller
+/// function that holds neither an edit nor a subject — the zero-text adaptation
+/// case, where the caller's argument needs no change at all — still attributes
+/// to nobody. That case is what escalation and bisect exist for, and
+/// `attribution_blind` is what counts it.
 fn attribute(
     diags: &[verify::Diag],
     observed_root: &std::path::Path,
     sites: &[EmittedSite],
+    edits: &[EditSite],
     original_root: &std::path::Path,
 ) -> std::collections::BTreeSet<String> {
     // The SAME canonicalizer as the differential gate, each side against its own
     // root: sites were recorded in the original tree, diagnostics come from the
     // temp copy. A second normalization here would drift attribution away from
     // the gate — the same defect class, one layer over.
+    //
+    // The single-file shortcut is computed over the UNION of both site kinds:
+    // computing it over `sites` alone would let a caller-file edit be matched
+    // file-blind whenever the subject functions happen to share one file, which
+    // is precisely the multi-file case this repair is for.
     let single_file = {
-        let mut files: Vec<&str> = sites.iter().map(|s| s.file.as_str()).collect();
+        let mut files: Vec<&str> = sites
+            .iter()
+            .map(|s| s.file.as_str())
+            .chain(edits.iter().map(|e| e.file.as_str()))
+            .collect();
         files.sort_unstable();
         files.dedup();
         files.len() <= 1
@@ -1471,6 +1558,18 @@ fn attribute(
     let mut owners = std::collections::BTreeSet::new();
     for diag in diags {
         let diag_rel = verify::crate_relative(&diag.file, observed_root);
+        let mut by_edit = std::collections::BTreeSet::new();
+        for edit in edits {
+            let same_file =
+                single_file || verify::crate_relative(&edit.file, original_root) == diag_rel;
+            if same_file && edit.lo_line <= diag.line && diag.line <= edit.hi_line {
+                by_edit.insert(edit.fn_path.clone());
+            }
+        }
+        if !by_edit.is_empty() {
+            owners.extend(by_edit);
+            continue;
+        }
         for site in sites {
             let same_file =
                 single_file || verify::crate_relative(&site.file, original_root) == diag_rel;
@@ -1845,19 +1944,34 @@ fn finish_decide<'tcx>(
         .collect();
     let opt_uses =
         decision::emitability::collect_opt_uses(tcx, &program.functions, &names, &opt_accessors, &opt_fat);
-    let table = decision::decide(
-        &decision::Ctx {
-            tcx,
-            model: &model,
-            slots: &slots,
-            facts: &facts,
-            fat: &fat,
-            sign: &sign,
-            slice_uses: &slice_uses,
-            opt_uses: &opt_uses,
-        },
-        &subjects,
-    );
+    let ctx_of = |gate| decision::Ctx {
+        tcx,
+        model: &model,
+        slots: &slots,
+        facts: &facts,
+        fat: &fat,
+        sign: &sign,
+        slice_uses: &slice_uses,
+        opt_uses: &opt_uses,
+        gate,
+    };
+    let table = decision::decide(&ctx_of(decision::RefGate::BlockAll), &subjects);
+
+    // **S3.6-1 task 2 — the co-conversion classes.**
+    //
+    // Built from a SECOND run of the same ladder under
+    // `RefGate::LiftAdaptable`, which answers *"what would convert if the gate
+    // were lifted for the adaptable population?"*. The real `decide_one` and
+    // never a replay of it: micro-plan §1b measured a `facts.tsv`-only replay
+    // reporting 2,133 against a true 2,075, and retracted it.
+    //
+    // **The production table above is built first and from `BlockAll`**, so
+    // nothing here can move a decision — the S3.6-0 pattern that makes zero
+    // corpus delta structural rather than lucky. Task 3 is where the verdict
+    // reaches a gate.
+    let hypothetical = decision::decide(&ctx_of(decision::RefGate::LiftAdaptable), &subjects);
+    let coconv = decision::co_conversion::build(&facts, &subjects, &hypothetical);
+    let escapes = decision::co_conversion::escapes(tcx, &program.functions, &subjects);
 
     // Structural self-check: the table matches the subjects it was handed. NOT
     // the coverage gate — every comparison in it is against the collector's own
@@ -1881,6 +1995,8 @@ fn finish_decide<'tcx>(
             slots,
             model,
             facts,
+            coconv,
+            escapes,
         },
     ))
 }
@@ -1896,6 +2012,32 @@ pub(crate) struct DecideCtx {
     slots: CrateSlots,
     model: rustc_hash::FxHashMap<SlotRef, SlotKind>,
     facts: decision::emitability::EmitabilityFacts,
+    /// **S3.6-1 task 2.** Carried out with the table rather than recomputed by
+    /// the census exporter, for R1's reason: the second derivation is what made
+    /// the recon worker solve BO twice per program.
+    coconv: decision::co_conversion::CoConv,
+    /// The escape shapes, measured **separately and deliberately not gated**.
+    ///
+    /// The handoff's boundary, kept: the pinned-callee flow is the hazard this
+    /// slice CREATES and is gated in `co_conversion`; a `static mut` store, a
+    /// field store and a return are **pre-existing and orthogonal** — the
+    /// already-emitting 562 carry the same shape, since a parameter of an
+    /// uncalled function escapes just as readily. S3.6-1 multiplies the
+    /// population ~4× but does not introduce the class. Measured here so it is
+    /// neither folded in silently nor omitted silently.
+    escapes: Vec<decision::co_conversion::Escape>,
+}
+
+impl DecideCtx {
+    /// The escape records, for the witness that each shape is recognised.
+    ///
+    /// A test accessor rather than a `pub` field: the production consumer is
+    /// `coconv_tsv`, and widening the field would invite a second reader that
+    /// counts them a second way.
+    #[cfg(test)]
+    pub(crate) fn escapes_for_test(&self) -> &[decision::co_conversion::Escape] {
+        &self.escapes
+    }
 }
 
 /// **Producer A's artifact** for the crate in `tcx`.
@@ -2064,6 +2206,95 @@ pub(crate) fn facts_join_tsv(tcx: TyCtxt<'_>) -> Result<String, String> {
                 None => "-",
                 Some(refs) if decision::emitability::RefKind::is_adaptable(refs) => "adaptable",
                 Some(_) => "pinned",
+            },
+        ));
+    }
+    Ok(out)
+}
+
+/// **S3.6-1 task 2 — the CO-CONVERSION CLASS CENSUS.**
+///
+/// One row per class **member**, not per class. The per-class view is a
+/// grouping of this one; the reverse is not true, and a per-class row carrying
+/// a member list would either truncate a 104-node class or be unreadable —
+/// silent caps being the thing this project's own rails forbid.
+///
+/// | column | question |
+/// |---|---|
+/// | `class_id`, `class_size` | which component, and how big |
+/// | `admissible` | does the whole class convert |
+/// | `class_block` | the reason the CLASS carries — one blocked member blocks it |
+/// | `node_block` | the reason THIS member contributed, `-` if it contributed none |
+/// | `sites` | how many direct call sites supply this parameter position |
+/// | `escapes` | the escape shapes this member's binding carries, measured and **not gated** |
+///
+/// The two block columns are separate because they answer different questions:
+/// the class one says why the component cannot convert, the node one says which
+/// member is responsible. A census with only the first cannot be acted on, and
+/// one with only the second cannot be summed.
+///
+/// MEASUREMENT ONLY. Nothing branches on it; no gate reads it.
+#[allow(
+    dead_code,
+    reason = "S3.6-1 task 2 measurement instrument; consumed by the corpus \
+              worker behind the artifact dir and by the test that pins its \
+              header. Not part of the pipeline."
+)]
+pub(crate) fn coconv_tsv(tcx: TyCtxt<'_>) -> Result<String, String> {
+    let (table, ctx) = decide_table_with_ctx(tcx)?;
+    let mut escapes_of: rustc_hash::FxHashMap<_, Vec<&'static str>> = rustc_hash::FxHashMap::default();
+    for escape in &ctx.escapes {
+        let bucket = escapes_of.entry(escape.subject).or_default();
+        if !bucket.contains(&escape.kind.key()) {
+            bucket.push(escape.kind.key());
+        }
+    }
+    let mut out = String::from(
+        "fn_path\tmir_local\tis_param\tclass_id\tclass_size\tadmissible\tclass_block\tnode_block\tsites\tescapes\n",
+    );
+    for (s, _decision) in &table.entries {
+        let key = (s.fn_did, s.hir_id);
+        // Every subject gets a row, node or not: "this subject is not in any
+        // class" is a fact the market join needs, and dropping such rows would
+        // make the census's denominator its own node set — an instrument that
+        // can only ever report full coverage of itself.
+        let (class_id, class_size, admissible, class_block) = match ctx.coconv.class_of(key) {
+            Some(id) => {
+                let class = &ctx.coconv.classes()[id];
+                (
+                    id.to_string(),
+                    class.members.len().to_string(),
+                    u8::from(class.blocked.is_none()).to_string(),
+                    class.blocked.map_or("-", |r| r.key()).to_owned(),
+                )
+            }
+            None => ("-".to_owned(), "0".to_owned(), "-".to_owned(), "-".to_owned()),
+        };
+        let sites = match s.kind {
+            decision::SubjectKind::Param { hir_index } => ctx
+                .facts
+                .call_args
+                .get(&s.fn_did)
+                .map_or(0, |sites| {
+                    sites
+                        .iter()
+                        .filter(|site| site.args.iter().any(|a| a.index == hir_index))
+                        .count()
+                }),
+            decision::SubjectKind::Local => 0,
+        };
+        let mut escapes = escapes_of.get(&key).cloned().unwrap_or_default();
+        escapes.sort_unstable();
+        out.push_str(&format!(
+            "{}\t{}\t{}\t{class_id}\t{class_size}\t{admissible}\t{class_block}\t{}\t{sites}\t{}\n",
+            tcx.def_path_str(s.fn_did.to_def_id()),
+            s.local.as_u32(),
+            u8::from(matches!(s.kind, decision::SubjectKind::Param { .. })),
+            ctx.coconv.node_block(key).map_or("-", |r| r.key()),
+            if escapes.is_empty() {
+                "-".to_owned()
+            } else {
+                escapes.join(",")
             },
         ));
     }

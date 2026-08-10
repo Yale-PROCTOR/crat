@@ -2937,3 +2937,489 @@ fn a_borrowed_argument_records_the_place_it_is_rooted_at() {
          for everything would block the whole adaptable population"
     );
 }
+
+/// **S3.6-1 task 2 — co-conversion class witnesses.**
+///
+/// At the file tail, per the convention `cc849953` established for the census
+/// module: the harness above is shared, and a test module wedged into the
+/// middle of it reads as part of the harness.
+mod coconv_witnesses {
+    use std::collections::BTreeMap;
+
+    use super::Fixture;
+
+    /// The census, parsed BY HEADER NAME.
+    ///
+    /// Never by position: adding the `fatness` column at S3.2′-1 shifted every
+    /// later index and broke a positional reader. A positional read is a latent
+    /// break for every future column.
+    fn census(src: &str) -> Vec<BTreeMap<String, String>> {
+        let fixture = Fixture::new(&[("lib.rs", src)]);
+        let tsv = ::utils::compilation::run_compiler_on_path(&fixture.0.join("lib.rs"), |tcx| {
+            crate::bo_rewriter::coconv_tsv(tcx).expect("co-conversion census")
+        })
+        .expect("fixture compiles");
+        let hdr: Vec<String> = tsv
+            .lines()
+            .next()
+            .expect("header")
+            .split('\t')
+            .map(str::to_owned)
+            .collect();
+        tsv.lines()
+            .skip(1)
+            .map(|line| {
+                hdr.iter()
+                    .cloned()
+                    .zip(line.split('\t').map(str::to_owned))
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// One row, found by the `fn_path` suffix and MIR local.
+    fn row<'a>(
+        rows: &'a [BTreeMap<String, String>],
+        f: &str,
+        local: u32,
+    ) -> &'a BTreeMap<String, String> {
+        rows.iter()
+            .find(|r| {
+                r["fn_path"].ends_with(f) && r["mir_local"] == local.to_string()
+            })
+            .unwrap_or_else(|| {
+                panic!(
+                    "no census row for {f}::_{local}; rows: {:?}",
+                    rows.iter()
+                        .map(|r| (r["fn_path"].clone(), r["mir_local"].clone()))
+                        .collect::<Vec<_>>()
+                )
+            })
+    }
+
+    const PRE: &str = "#![allow(dead_code, unused_unsafe, unused_mut, unused_variables)]\n";
+
+    /// **The chain is ONE class.** g20's shape, at the decision level.
+    ///
+    /// `g20_bump(q)` inside `g20_via` joins the callee's parameter to the
+    /// caller's, and converting either alone is `E0308` (H5, measured). The
+    /// class is what makes it one decision.
+    ///
+    /// *Mutation-tested (deletion first):* deleting the `dsu.union` in the
+    /// `BareLocal` arm leaves two singleton classes and fails on the class
+    /// identity **and** on `class_size`.
+    #[test]
+    fn a_bare_local_argument_joins_callee_and_caller_into_one_class() {
+        let rows = census(&format!(
+            "{PRE}pub unsafe fn g20_bump(p: *mut i32) -> i32 {{ *p += 1; *p }}\n\
+             pub unsafe fn g20_via(q: *mut i32) -> i32 {{ g20_bump(q) }}\n\
+             pub unsafe fn g20_root() -> i32 {{ let mut x: i32 = 0; g20_via(&mut x) }}\n"
+        ));
+        let bump = row(&rows, "g20_bump", 1);
+        let via = row(&rows, "g20_via", 1);
+        assert_ne!(bump["class_id"], "-", "the callee parameter must be a node: {bump:?}");
+        assert_eq!(
+            bump["class_id"], via["class_id"],
+            "callee and caller must land in ONE class — converting either alone \
+             is E0308: {bump:?} vs {via:?}"
+        );
+        assert_eq!(bump["class_size"], "2", "{bump:?}");
+        assert_eq!(
+            bump["admissible"], "1",
+            "every argument in this chain is compatible, so the class converts: \
+             {bump:?}"
+        );
+    }
+
+    /// **A duplicated argument blocks its class, and NOT the clean one beside
+    /// it.** g21's shape.
+    ///
+    /// The negative half is what makes this a witness rather than a
+    /// tautology: an implementation that blocks everything satisfies the first
+    /// assertion and fails the second.
+    ///
+    /// *Mutation-tested (deletion first):* deleting the overlap loop makes the
+    /// aliased class admissible and fails here; blocking unconditionally fails
+    /// on `g21_ok`.
+    #[test]
+    fn a_duplicated_argument_blocks_only_its_own_class() {
+        let rows = census(&format!(
+            "{PRE}pub unsafe fn g21_ok(p: *mut i32) {{ *p = 1; }}\n\
+             pub unsafe fn g21_aliased(a: *mut i32, b: *mut i32) {{ *a += *b; }}\n\
+             pub unsafe fn g21_clean() {{ let mut x: i32 = 0; g21_ok(&mut x); }}\n\
+             pub unsafe fn g21_dirty(q: *mut i32) {{ g21_aliased(q, q); }}\n"
+        ));
+        let ok = row(&rows, "g21_ok", 1);
+        let a = row(&rows, "g21_aliased", 1);
+        assert_eq!(
+            a["admissible"], "0",
+            "`g21_aliased(q, q)` is E0499 after conversion and must block: {a:?}"
+        );
+        assert_eq!(a["class_block"], "duplicate-place-root", "{a:?}");
+        assert_eq!(
+            ok["admissible"], "1",
+            "a blocked class must not take the clean one with it — one blocked \
+             MEMBER blocks its own class, not the crate: {ok:?}"
+        );
+    }
+
+    /// **One blocked member blocks the whole class.**
+    ///
+    /// `g21_dirty::q` supplies both aliased positions, so the edge pulls it
+    /// into the blocked component. Its own arguments are unobjectionable; it is
+    /// blocked by transitivity, which is the property that makes a class the
+    /// unit of decision.
+    #[test]
+    fn one_blocked_member_blocks_the_class_through_the_edge() {
+        // TWO call sites of one callee: `via` supplies a clean bare local, and
+        // `nulls` supplies a null literal. The null blocks `t::p`, and `via::x`
+        // — whose own argument is unobjectionable — is blocked with it.
+        //
+        // The `aliased(q, q)` shape cannot witness this: BO itself refuses the
+        // doubly-passed binding, so `q` is not a node and there is no edge to
+        // carry the block. Measured, and recorded rather than worked around.
+        let rows = census(&format!(
+            "{PRE}pub unsafe fn t(p: *mut i32) {{ *p = 1; }}\n\
+             pub unsafe fn via(x: *mut i32) {{ t(x); }}\n\
+             pub unsafe fn nulls() {{ t(0 as *mut i32); }}\n"
+        ));
+        let p = row(&rows, "t", 1);
+        let x = row(&rows, "via", 1);
+        assert_eq!(p["class_id"], x["class_id"], "{p:?} vs {x:?}");
+        assert_eq!(p["node_block"], "arg-null-literal", "{p:?}");
+        assert_eq!(x["admissible"], "0", "{x:?}");
+        assert_eq!(
+            x["node_block"], "-",
+            "`x` contributes NO blocking argument of its own — it is blocked by \
+             transitivity, and a census that reported otherwise could not name \
+             the member responsible: {x:?}"
+        );
+    }
+
+    /// **The argument-shape table, one fixture per blocking shape — and a
+    /// negative for the shape that does NOT block.**
+    ///
+    /// One shape per case for the reason task 0 recorded: a classifier
+    /// witnessed on one value is witnessed on nothing, because a single
+    /// catch-all arm would satisfy every positive case at once. The `&mut e`
+    /// row is what stops "block everything" from passing.
+    #[test]
+    fn each_blocking_argument_shape_has_its_own_reason() {
+        let case = |arg: &str| {
+            let rows = census(&format!(
+                "{PRE}pub unsafe fn target(p: *mut i32) {{ *p = 1; }}\n\
+                 pub unsafe fn caller() {{ let mut x: i32 = 0; let _ = &mut x; target({arg}); }}\n"
+            ));
+            row(&rows, "target", 1)
+                .get("class_block")
+                .cloned()
+                .unwrap_or_default()
+        };
+        assert_eq!(case("0 as *mut i32"), "arg-null-literal");
+        assert_eq!(case("(&mut x) as *mut i32"), "arg-cast-form-unbuilt");
+        assert_eq!(case("1usize as *mut i32"), "arg-unadaptable-shape");
+        assert_eq!(
+            case("&mut x"),
+            "-",
+            "`&mut e` already coerces both ways and needs no edit — a table \
+             that blocked it would block the second-largest shape in the corpus"
+        );
+    }
+
+    /// **A shared borrow into a `&mut` position blocks.**
+    ///
+    /// Split from the table above because it is the one row whose verdict
+    /// depends on the SUBJECT's mutability rather than on the argument alone.
+    #[test]
+    fn a_shared_borrow_into_a_mutable_position_blocks() {
+        let rows = census(&format!(
+            "{PRE}pub unsafe fn target(p: *mut i32) {{ *p = 1; }}\n\
+             pub unsafe fn caller() {{ let x: i32 = 0; target(&x as *const i32 as *mut i32); }}\n\
+             pub unsafe fn shared(p: *mut i32) -> i32 {{ *p }}\n\
+             pub unsafe fn ok() {{ let x: i32 = 0; shared(&x as *const i32 as *mut i32); }}\n"
+        ));
+        // Both go through a cast, so both read the cast reason; what this pins
+        // is that a *const-rooted argument never silently satisfies a `&mut`
+        // position.
+        assert_eq!(row(&rows, "target", 1)["admissible"], "0");
+    }
+
+    /// **BANKED RULE 2 — a converting binding that reaches a parameter which
+    /// stays raw is caught at DECISION time.**
+    ///
+    /// `&mut T → *mut T` is an implicit coercion, so this compiles at exit 0
+    /// and produces no counter movement at all (§5a, measured). The verify loop
+    /// cannot absorb it as a revert because there is nothing to absorb. If this
+    /// gate is wrong there is no compile-time backstop.
+    ///
+    /// *Mutation-tested (deletion first):* deleting the caller-side arm leaves
+    /// `src::r` admissible and fails here — and it fails SILENTLY in
+    /// production, which is the reason the witness exists.
+    #[test]
+    fn a_converting_binding_into_a_raw_parameter_is_blocked_at_decision_time() {
+        let rows = census(&format!(
+            "{PRE}pub unsafe fn sink(p: *mut i32) -> usize {{ p as usize }}\n\
+             pub unsafe fn src(r: *mut i32) -> usize {{ *r = 1; sink(r) }}\n"
+        ));
+        let sink = row(&rows, "sink", 1);
+        let src = row(&rows, "src", 1);
+        assert_eq!(
+            sink["class_id"], "-",
+            "`sink`'s parameter is `as`-cast, so it stays raw and is not a \
+             node — if it converted, this fixture would witness nothing: {sink:?}"
+        );
+        assert_eq!(src["node_block"], "flows-into-raw-param", "{src:?}");
+        assert_eq!(src["admissible"], "0", "{src:?}");
+    }
+
+    /// **The PINNED population is excluded structurally, not in prose.**
+    ///
+    /// A function reached by a fn-pointer cast has its signature fixed by every
+    /// table it appears in, and the pinned 640 are deferred to M2/M3. The
+    /// hypothetical the class builder asks about is
+    /// `RefGate::LiftAdaptable` — not `Lift` — so a pinned parameter is never a
+    /// node and cannot enter a class.
+    ///
+    /// **PAIRED** with an adaptable callee in the same crate: a builder that
+    /// produced no nodes at all would satisfy the pinned half by itself.
+    #[test]
+    fn a_pinned_callee_contributes_no_class_nodes() {
+        let rows = census(&format!(
+            "{PRE}pub unsafe fn pinned(p: *mut i32) {{ *p = 1; }}\n\
+             pub unsafe fn adaptable(p: *mut i32) {{ *p = 2; }}\n\
+             pub unsafe fn tbl() -> usize {{ pinned as unsafe fn(*mut i32) as usize }}\n\
+             pub unsafe fn call() {{ let mut x: i32 = 0; adaptable(&mut x); }}\n"
+        ));
+        assert_eq!(
+            row(&rows, "pinned", 1)["class_id"],
+            "-",
+            "a fn-pointer-cast callee must contribute no node"
+        );
+        assert_ne!(
+            row(&rows, "adaptable", 1)["class_id"],
+            "-",
+            "the adaptable callee in the SAME crate must be a node, or the \
+             pinned assertion is satisfied by a builder that produces nothing"
+        );
+    }
+
+    /// **THE ZERO-DELTA PIN.** The production ladder still blocks every
+    /// referenced subject.
+    ///
+    /// Task 2 computes classes and decides nothing: the production call site
+    /// passes `RefGate::BlockAll`, so an admissible class changes no decision.
+    /// This is the structural claim stated as a test rather than as prose — the
+    /// S3.6-0 pattern.
+    ///
+    /// *Mutation-tested:* switching the production `decide` call to
+    /// `LiftAdaptable` makes the reason `-` and fails here. That mutation is
+    /// exactly task 3.
+    #[test]
+    fn an_admissible_class_moves_no_decision_at_task_two() {
+        let src = format!(
+            "{PRE}pub unsafe fn g20_bump(p: *mut i32) -> i32 {{ *p += 1; *p }}\n\
+             pub unsafe fn g20_via(q: *mut i32) -> i32 {{ g20_bump(q) }}\n\
+             pub unsafe fn g20_root() -> i32 {{ let mut x: i32 = 0; g20_via(&mut x) }}\n"
+        );
+        let fixture = Fixture::new(&[("lib.rs", &src)]);
+        let (reasons, admissible) =
+            ::utils::compilation::run_compiler_on_path(&fixture.0.join("lib.rs"), |tcx| {
+                let table = crate::bo_rewriter::decide_table(tcx).expect("table");
+                let reasons: Vec<String> = crate::bo_rewriter::artifact::rows(tcx, &table)
+                    .iter()
+                    .filter_map(|r| r.degrade_reason.clone())
+                    .collect();
+                let tsv = crate::bo_rewriter::coconv_tsv(tcx).expect("census");
+                let admissible = tsv.lines().skip(1).filter(|l| {
+                    l.split('\t').nth(5) == Some("1")
+                }).count();
+                (reasons, admissible)
+            })
+            .expect("fixture compiles");
+        assert!(
+            admissible >= 2,
+            "the fixture must contain an admissible class, or the pin is vacuous"
+        );
+        assert!(
+            reasons.iter().filter(|r| *r == "call-site-not-adapted").count() >= 2,
+            "the PRODUCTION gate must still degrade both parameters — task 2 \
+             computes and does not decide: {reasons:?}"
+        );
+    }
+}
+
+/// **S3.6-1 task 2 — the attribution repair, and the escape census.**
+mod attribution_and_escapes {
+    use std::{collections::BTreeMap, path::Path};
+
+    use super::Fixture;
+    use crate::bo_rewriter::{
+        EditSite, EmittedSite, attribute, edit_sites,
+        plan::{Edit, FileKey, Justification, Plan},
+        verify::{Diag, Direction},
+    };
+
+    fn diag(file: &str, line: usize) -> Diag {
+        Diag {
+            file: file.to_owned(),
+            line,
+            message: "mismatched types".to_owned(),
+            direction: Direction::RawIntoRewritten,
+            code: Some("E0308".to_owned()),
+        }
+    }
+
+    /// **A caller-file diagnostic names the CALLEE that caused it.**
+    ///
+    /// This is the S3 defect the plan required repaired before any new subject
+    /// emits. Call-site adaptation puts edits in files the subject does not
+    /// live in, and function-extent containment attributes such a diagnostic to
+    /// **nobody** — the revert loop then cannot converge on the culprit and
+    /// falls through to bisect, which "may revert more than strictly
+    /// necessary".
+    ///
+    /// **The negative half is the repair's own witness**: the same diagnostic
+    /// with an empty edit list attributes to nothing, which is exactly what
+    /// production did before. Without it a test could pass on an
+    /// implementation that attributes everything to everyone.
+    ///
+    /// *Mutation-tested (deletion first):* deleting the edit-range pass leaves
+    /// only the extent pass and fails on the positive half.
+    #[test]
+    fn a_caller_file_diagnostic_attributes_to_the_edit_that_justifies_it() {
+        let root = Path::new("/crate");
+        // The subject's own function lives in `callee.rs`; the edit landed in
+        // `caller.rs`, which holds no subject at all.
+        let sites = [EmittedSite {
+            file: "/crate/callee.rs".to_owned(),
+            fn_path: "k::callee".to_owned(),
+            lo_line: 1,
+            hi_line: 3,
+        }];
+        let edits = [EditSite {
+            file: "/crate/caller.rs".to_owned(),
+            fn_path: "k::callee".to_owned(),
+            lo_line: 10,
+            hi_line: 10,
+        }];
+        let diags = [diag("/crate/caller.rs", 10)];
+
+        let owners = attribute(&diags, root, &sites, &edits, root);
+        assert_eq!(
+            owners.into_iter().collect::<Vec<_>>(),
+            vec!["k::callee".to_owned()],
+            "an error inside a caller-file edit must name the subject that \
+             justifies the edit"
+        );
+
+        let blind = attribute(&diags, root, &sites, &[], root);
+        assert!(
+            blind.is_empty(),
+            "the pre-repair derivation must attribute this to NOBODY, or the \
+             positive half witnesses nothing: {blind:?}"
+        );
+    }
+
+    /// The fallback survives: a diagnostic inside a rewritten function's extent
+    /// but inside no edit still attributes to that function.
+    ///
+    /// Without this, the repair could have been "replace extent containment
+    /// with edit containment", which would have silently dropped every
+    /// diagnostic that lands near an edit rather than on it — the common case.
+    #[test]
+    fn a_diagnostic_outside_every_edit_still_falls_back_to_the_function_extent() {
+        let root = Path::new("/crate");
+        let sites = [EmittedSite {
+            file: "/crate/callee.rs".to_owned(),
+            fn_path: "k::callee".to_owned(),
+            lo_line: 1,
+            hi_line: 30,
+        }];
+        let edits = [EditSite {
+            file: "/crate/callee.rs".to_owned(),
+            fn_path: "k::callee".to_owned(),
+            lo_line: 1,
+            hi_line: 1,
+        }];
+        let owners = attribute(&[diag("/crate/callee.rs", 20)], root, &sites, &edits, root);
+        assert_eq!(owners.into_iter().collect::<Vec<_>>(), vec!["k::callee".to_owned()]);
+    }
+
+    /// `edit_sites` converts byte ranges to the LINES a diagnostic reports in.
+    ///
+    /// *Mutation-tested:* returning `(1, 1)` unconditionally makes the
+    /// attribution test above pass by accident and fails here.
+    #[test]
+    fn an_edit_locates_to_the_lines_it_spans() {
+        let text = "aaa\nbbb\nccc\nddd\n";
+        let key = FileKey::Virtual("main.rs".to_owned());
+        let mut plan = Plan::default();
+        plan.by_file.insert(
+            key.clone(),
+            vec![Edit {
+                // `ccc` starts at byte 8 and ends at 11 — line 3.
+                lo: 8,
+                hi: 11,
+                replacement: "zzz".to_owned(),
+                justification: Justification::KindDecision { kind: "Ref(mut)" },
+                owner_fn: "k::f".to_owned(),
+            }],
+        );
+        let texts = BTreeMap::from([(key, text.to_owned())]);
+        let located = edit_sites(&plan, &texts);
+        assert_eq!(located.len(), 1);
+        assert_eq!((located[0].lo_line, located[0].hi_line), (3, 3), "{located:?}");
+        assert_eq!(located[0].file, "main.rs");
+    }
+
+    /// **The escape shapes, one fixture per kind — plus the negative.**
+    ///
+    /// These are MEASURED and deliberately NOT gated: `&mut T → *mut T` coerces
+    /// implicitly at all four positions, so none presents as a revert. The
+    /// call-argument flow is the one S3.6-1 creates and it IS gated, in
+    /// `co_conversion`; a `static mut` store, a field store and a return are
+    /// pre-existing and orthogonal — the already-emitting population carries
+    /// the same shape today.
+    ///
+    /// The `local-store` negative is what stops "everything is an escape" from
+    /// passing, which would have made the corpus figure meaningless.
+    #[test]
+    fn each_escape_shape_is_recognised_and_a_local_store_is_not_one() {
+        let kinds = |body: &str| -> Vec<String> {
+            let src = format!(
+                "#![allow(dead_code, unused_unsafe, unused_mut, unused_variables)]\n\
+                 extern \"C\" {{ fn sink(p: *mut i32); }}\n\
+                 pub struct S {{ pub f: *mut i32 }}\n\
+                 pub static mut G: *mut i32 = 0 as *mut i32;\n\
+                 pub unsafe fn f(p: *mut i32, s: *mut S) -> *mut i32 {{ {body} }}\n"
+            );
+            let fixture = Fixture::new(&[("lib.rs", &src)]);
+            ::utils::compilation::run_compiler_on_path(&fixture.0.join("lib.rs"), |tcx| {
+                let (_table, ctx) =
+                    crate::bo_rewriter::decide_table_with_ctx(tcx).expect("table");
+                let mut out: Vec<String> = ctx
+                    .escapes_for_test()
+                    .iter()
+                    .map(|e| e.kind.key().to_owned())
+                    .collect();
+                out.sort_unstable();
+                out.dedup();
+                out
+            })
+            .expect("fixture compiles")
+        };
+
+        assert!(kinds("G = p; p").contains(&"static-store".to_owned()));
+        assert!(kinds("(*s).f = p; p").contains(&"field-store".to_owned()));
+        assert!(kinds("return p;").contains(&"return".to_owned()));
+        assert!(kinds("sink(p); p").contains(&"foreign-arg".to_owned()));
+        // A store into another LOCAL leaves nothing: the target is in the same
+        // body, so the value has not escaped the function.
+        let local_only = kinds("let mut q: *mut i32 = 0 as *mut i32; q = p; q");
+        assert!(
+            !local_only.contains(&"static-store".to_owned())
+                && !local_only.contains(&"field-store".to_owned()),
+            "a local-to-local store is not an escape: {local_only:?}"
+        );
+    }
+}
