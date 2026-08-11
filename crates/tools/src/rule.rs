@@ -3,6 +3,10 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
+mod markdown;
+
+pub use markdown::rule_document_to_markdown;
+
 use crate::{
     AdtKind, BinaryOperator, BindingMutability, BorrowKind, ByRefKind, Expression,
     OBSERVATION_SCHEMA_VERSION, Observation, ObservationDocument, RangeLimits, RawMutability,
@@ -1143,6 +1147,16 @@ fn validate_rule_value(identity: &RuleValueIdentity, where_: &str) -> Result<(),
 
 fn validate_rule_literal(literal: &RuleLiteral, where_: &str) -> Result<(), DocumentError> {
     match literal {
+        RuleLiteral::Char { value } => {
+            let mut characters = value.chars();
+            if characters.next().is_some() && characters.next().is_none() {
+                Ok(())
+            } else {
+                Err(invalid(format!(
+                    "{where_} character literal must contain exactly one Unicode scalar"
+                )))
+            }
+        }
         RuleLiteral::Integer { value, ty } => {
             match value {
                 RuleIntegerMagnitude::Fixed(value)
