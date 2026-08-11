@@ -138,6 +138,14 @@ pub(crate) struct SeamEdit {
     /// the divergence `plan`'s `owner_fn` doc was written for.
     pub owner_fn: String,
     pub family: SeamFamily,
+    /// **Which adjacency arm licensed this slice seam's length** (ruling B,
+    /// 2026-08-11). `None` for every non-slice seam, which needs no length.
+    ///
+    /// Carried NOW rather than added when the bound-verification follow-up runs:
+    /// that check certifies or corrects each selection, and it can only be
+    /// surgical if it can tell a `following` selection from a `preceding` one
+    /// without re-deriving the choice.
+    pub len_arm: Option<LenEvidence>,
 }
 
 /// `&mut ` or `&`.
@@ -179,6 +187,7 @@ pub(crate) fn glue(
     expected: Form,
     found: Form,
     text: &str,
+    len: Option<&str>,
 ) -> Result<Option<(String, SeamFamily)>, SeamBlock> {
     use Form::*;
     // A shared borrow can never satisfy a `&mut` position, whatever the shapes
@@ -229,9 +238,49 @@ pub(crate) fn glue(
             SeamFamily::Reborrow,
         )),
 
-        // ---- slice seams: LENGTH-GATED, never fabricated ----
-        (Slice { .. }, Raw) | (Opt { slice: true, .. }, Raw) => {
-            return Err(SeamBlock::LengthUnknown);
+        // ---- slice seams: a length from the CALL SITE, or gated ----
+        //
+        // Ruling B (2026-08-11): both adjacency arms license the companion
+        // argument as the length. `len` is that argument's own source text,
+        // substituted verbatim and cast — the seam never invents a length, and
+        // `None` here still gates rather than guessing (ruling item 4 stands).
+        //
+        // `as usize` unconditionally: the C spelling is `size_t`, `c_int` or
+        // `c_ulong` depending on the header, and `from_raw_parts` takes `usize`.
+        // Parenthesised because the companion may be an arbitrary expression.
+        (Slice { mutable }, Raw) => {
+            let Some(len) = len else {
+                return Err(SeamBlock::LengthUnknown);
+            };
+            let ctor = if mutable {
+                "from_raw_parts_mut"
+            } else {
+                "from_raw_parts"
+            };
+            Some((
+                format!("core::slice::{ctor}({text}, ({len}) as usize)"),
+                SeamFamily::Reborrow,
+            ))
+        }
+        (
+            Opt {
+                mutable,
+                slice: true,
+            },
+            Raw,
+        ) => {
+            let Some(len) = len else {
+                return Err(SeamBlock::LengthUnknown);
+            };
+            let ctor = if mutable {
+                "from_raw_parts_mut"
+            } else {
+                "from_raw_parts"
+            };
+            Some((
+                format!("Some(core::slice::{ctor}({text}, ({len}) as usize))"),
+                SeamFamily::Reborrow,
+            ))
         }
 
         // ---- safe family ----
@@ -376,7 +425,7 @@ mod tests {
     const T: &str = "p";
 
     fn g(expected: Form, found: Form) -> Result<Option<(String, SeamFamily)>, SeamBlock> {
-        glue(expected, found, T)
+        glue(expected, found, T, None)
     }
 
     fn text(expected: Form, found: Form) -> String {
@@ -513,6 +562,72 @@ mod tests {
                 "raw → {expected:?} must gate, never fabricate a length"
             );
         }
+    }
+
+    /// **Ruling B — a companion length turns the gate into a seam.**
+    ///
+    /// The same pair that gates with no length produces `from_raw_parts` with
+    /// one, and the length is the caller's own text, cast rather than rendered.
+    ///
+    /// *Mutation-tested:* drop the `as usize` cast and the emitted call fails to
+    /// type-check against `from_raw_parts`, whose length is a `usize` while the
+    /// C spelling is `size_t`/`c_int`/`c_ulong` depending on the header.
+    #[test]
+    fn a_companion_length_converts_the_gate_into_a_slice_seam() {
+        assert_eq!(
+            glue(Slice { mutable: true }, Raw, "p", Some("n"))
+                .unwrap()
+                .unwrap()
+                .0,
+            "core::slice::from_raw_parts_mut(p, (n) as usize)"
+        );
+        assert_eq!(
+            glue(Slice { mutable: false }, Raw, "p", Some("len"))
+                .unwrap()
+                .unwrap()
+                .0,
+            "core::slice::from_raw_parts(p, (len) as usize)"
+        );
+        // The fat optional composes the wrap around it.
+        assert_eq!(
+            glue(
+                Opt {
+                    mutable: true,
+                    slice: true
+                },
+                Raw,
+                "p",
+                Some("n")
+            )
+            .unwrap()
+            .unwrap()
+            .0,
+            "Some(core::slice::from_raw_parts_mut(p, (n) as usize))"
+        );
+        // **The gate still holds without one** — ruling item 4 stands, and B
+        // widened which positions HAVE a length, never whether one may be
+        // invented.
+        assert_eq!(
+            glue(Slice { mutable: true }, Raw, "p", None),
+            Err(SeamBlock::LengthUnknown)
+        );
+    }
+
+    /// The length is a **raw base**, so a slice seam is REBORROW family however
+    /// safe its constructor name reads.
+    ///
+    /// `from_raw_parts` is `unsafe` and carries the pointer-validity obligation;
+    /// filing it under `Safe` would put the corpus's largest adapter population
+    /// in the column that means "compiler-checked end to end".
+    #[test]
+    fn a_slice_seam_over_a_raw_base_is_reborrow_family() {
+        assert_eq!(
+            glue(Slice { mutable: true }, Raw, "p", Some("n"))
+                .unwrap()
+                .unwrap()
+                .1,
+            SeamFamily::Reborrow
+        );
     }
 
     /// **A shared borrow never satisfies a `&mut` position**, in every pair that
@@ -807,7 +922,37 @@ pub(crate) fn synthesize(
                         .push((site.caller, pos.span, SeamBlock::UnnameableOperand));
                     continue;
                 };
-                match glue(pos.expected, pos.found, text) {
+                // **Ruling B — the companion length, resolved at the CALL
+                // SITE.** The evidence arm comes from the callee's signature
+                // (which parameter is the integer); the TEXT comes from this
+                // caller's argument in that position. Both are needed: the
+                // signature says where to look, only the site says what is
+                // actually passed.
+                let wants_len = matches!(
+                    (pos.expected, pos.found),
+                    (Form::Slice { .. }, Form::Raw) | (Form::Opt { slice: true, .. }, Form::Raw)
+                );
+                let (len_text, len_arm) = if wants_len {
+                    let arm = length_evidence(tcx, *callee, pos.index);
+                    let companion = match arm {
+                        LenEvidence::Following => Some(pos.index + 1),
+                        LenEvidence::Preceding => pos.index.checked_sub(1),
+                        // Ruling B licenses ADJACENCY ONLY. `Elsewhere` and
+                        // `Absent` stay gated — 93 of the 370 — because a
+                        // non-adjacent integer is not evidence of anything.
+                        LenEvidence::Elsewhere | LenEvidence::None => None,
+                    };
+                    let text = companion
+                        .and_then(|i| site.args.iter().find(|a| a.index == i))
+                        .and_then(|a| sm.span_to_snippet(a.span).ok());
+                    // The arm is recorded only when a length was actually
+                    // FOUND: an arm with no text placed no seam, and tagging it
+                    // would make the follow-up's population wrong.
+                    (text.clone(), text.map(|_| arm))
+                } else {
+                    (None, None)
+                };
+                match glue(pos.expected, pos.found, text, len_text.as_deref()) {
                     Ok(None) => {}
                     Ok(Some((replacement, family))) => {
                         // Rule 1 (2026-08-11): the census is a prioritization
@@ -821,6 +966,7 @@ pub(crate) fn synthesize(
                             replacement,
                             owner_fn: tcx.def_path_str(callee.to_def_id()),
                             family,
+                            len_arm,
                         });
                     }
                     Err(block) => {

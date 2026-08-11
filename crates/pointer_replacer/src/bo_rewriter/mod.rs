@@ -2960,14 +2960,19 @@ pub(crate) fn artifact_rows_span_swapped(
 pub(crate) fn seam_tsv(tcx: TyCtxt<'_>) -> Result<String, String> {
     let (table, _ctx) = decide_table_with_ctx(tcx)?;
     let sm = tcx.sess.source_map();
-    let mut out = String::from("kind\towner_fn\tfamily_or_reason\tsite\n");
+    let mut out = String::from("kind\towner_fn\tfamily_or_reason\tsite\tlen_arm\n");
     for edit in &table.seams.edits {
         let family = match edit.family {
             decision::seam::SeamFamily::Safe => "safe",
             decision::seam::SeamFamily::Reborrow => "reborrow",
         };
+        // The evidence arm rides the PLACED row (ruling B): the
+        // bound-verification follow-up certifies or corrects each selection,
+        // and it can only be surgical if a `following` selection is
+        // distinguishable from a `preceding` one without re-deriving it.
+        let arm = edit.len_arm.map_or("-", |a| a.key());
         out.push_str(&format!(
-            "placed\t{}\t{}\t{}\n",
+            "placed\t{}\t{}\t{}\t{arm}\n",
             edit.owner_fn,
             family,
             sm.span_to_diagnostic_string(edit.span)
