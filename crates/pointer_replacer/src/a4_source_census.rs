@@ -316,6 +316,7 @@ fn parse_provenance_tag(value: &str) -> Result<String, String> {
         "string-literal-root"
             | "external-parameter-pointee-load"
             | "indirect-external-parameter-callback"
+            | "public-setter-reachable"
     ) {
         return Ok(value.to_owned());
     }
@@ -340,6 +341,7 @@ fn parse_root_evidence(value: &str) -> Result<RootEvidence, String> {
             "string-literal-root"
                 | "external-parameter-pointee-load"
                 | "indirect-external-parameter-callback"
+                | "public-setter-reachable"
         ) || token.starts_with("indirect-resolved-target(")
         {
             provenance_tags.insert(parse_provenance_tag(token)?);
@@ -854,6 +856,17 @@ fn add_external_parameter_callback_root(
     );
 }
 
+fn add_public_setter_remainder_root(graph: &mut SourceGraph, node: String, call_location: &str) {
+    add_terminal_with_tags(
+        graph,
+        node,
+        TerminalKind::OpaqueExternalCall,
+        format!("public-setter-reachable:{call_location}"),
+        false,
+        BTreeSet::from(["public-setter-reachable".to_owned()]),
+    );
+}
+
 fn require_visible_targets<'a, T>(
     targets: &'a [T],
     call_location: &str,
@@ -870,20 +883,33 @@ fn require_visible_targets<'a, T>(
 enum IndirectCallArm {
     OutOfPopulation,
     VisibleTargets,
+    VisibleTargetsAndExternalRemainder,
     ExternalParameterCallback,
 }
 
 fn indirect_call_arm(
     result_is_data_pointer: bool,
     visible_target_count: usize,
+    has_external_parameter: bool,
     exclusively_external_parameter: bool,
+    public_setter_reachable: bool,
+    has_unexplained_predecessor: bool,
     call_location: &str,
 ) -> Result<IndirectCallArm, String> {
     if !result_is_data_pointer {
         Ok(IndirectCallArm::OutOfPopulation)
-    } else if visible_target_count > 0 {
+    } else if has_unexplained_predecessor {
+        Err(format!(
+            "unexplained predecessor in indirect-call target flow at {call_location}"
+        ))
+    } else if visible_target_count > 0 && public_setter_reachable {
+        Ok(IndirectCallArm::VisibleTargetsAndExternalRemainder)
+    } else if visible_target_count > 0 && !has_external_parameter {
         Ok(IndirectCallArm::VisibleTargets)
-    } else if exclusively_external_parameter {
+    } else if visible_target_count == 0
+        && exclusively_external_parameter
+        && !public_setter_reachable
+    {
         Ok(IndirectCallArm::ExternalParameterCallback)
     } else {
         Err(format!(
@@ -979,6 +1005,7 @@ struct IndirectTargetFlow {
     seeds: FxHashMap<String, FxHashSet<DefId>>,
     empty_value_seeds: BTreeSet<String>,
     external_parameter_seeds: BTreeSet<String>,
+    static_nodes: BTreeSet<String>,
     #[cfg(test)]
     parameter_remainders: BTreeMap<String, (bool, bool, bool)>,
     call_nodes: FxHashMap<(LocalDefId, usize), String>,
@@ -999,6 +1026,10 @@ impl IndirectTargetFlow {
 
     fn add_empty_value_seed(&mut self, node: String) {
         self.empty_value_seeds.insert(node);
+    }
+
+    fn add_static_node(&mut self, node: String) {
+        self.static_nodes.insert(node);
     }
 
     #[cfg(test)]
@@ -1027,31 +1058,49 @@ impl IndirectTargetFlow {
         targets
     }
 
-    fn exclusively_external_parameter(&self, node: &str) -> bool {
-        let mut work = VecDeque::from([node.to_owned()]);
+    fn summary(&self, node: &str) -> IndirectTargetSummary {
+        let mut work = VecDeque::from([(node.to_owned(), false)]);
         let mut seen = BTreeSet::new();
-        let mut saw_external_parameter = false;
-        while let Some(node) = work.pop_front() {
-            if !seen.insert(node.clone()) {
+        let mut summary = IndirectTargetSummary::default();
+        while let Some((node, crossed_static)) = work.pop_front() {
+            let crossed_static = crossed_static || self.static_nodes.contains(&node);
+            if !seen.insert((node.clone(), crossed_static)) {
                 continue;
             }
-            if self
-                .seeds
-                .get(&node)
-                .is_some_and(|targets| !targets.is_empty())
-            {
-                return false;
-            }
+            summary
+                .targets
+                .extend(self.seeds.get(&node).into_iter().flatten().copied());
             let is_external_parameter = self.external_parameter_seeds.contains(&node);
             let is_empty_value = self.empty_value_seeds.contains(&node);
-            saw_external_parameter |= is_external_parameter;
+            summary.has_external_parameter |= is_external_parameter;
+            summary.public_setter_reachable |= is_external_parameter && crossed_static;
             match self.incoming.get(&node) {
-                Some(incoming) if !incoming.is_empty() => work.extend(incoming.iter().cloned()),
-                _ if !is_external_parameter && !is_empty_value => return false,
+                Some(incoming) if !incoming.is_empty() => work.extend(
+                    incoming
+                        .iter()
+                        .cloned()
+                        .map(|predecessor| (predecessor, crossed_static)),
+                ),
+                _ if !is_external_parameter
+                    && !is_empty_value
+                    && !self
+                        .seeds
+                        .get(&node)
+                        .is_some_and(|targets| !targets.is_empty()) =>
+                {
+                    summary.unexplained_predecessors.insert(node);
+                }
                 _ => {}
             }
         }
-        saw_external_parameter
+        summary
+    }
+
+    fn exclusively_external_parameter(&self, node: &str) -> bool {
+        let summary = self.summary(node);
+        summary.targets.is_empty()
+            && summary.has_external_parameter
+            && summary.unexplained_predecessors.is_empty()
     }
 
     #[cfg(test)]
@@ -1084,16 +1133,77 @@ impl IndirectTargetFlow {
     }
 }
 
+#[derive(Clone, Debug, Default)]
+struct IndirectTargetSummary {
+    targets: FxHashSet<DefId>,
+    has_external_parameter: bool,
+    public_setter_reachable: bool,
+    unexplained_predecessors: BTreeSet<String>,
+}
+
 fn target_field_node(tcx: TyCtxt<'_>, owner: DefId, field: usize) -> String {
     format!("fn-hook:{}::field{field}", tcx.def_path_str(owner))
+}
+
+fn target_static_node(tcx: TyCtxt<'_>, static_did: DefId) -> String {
+    format!("fn-static:{}", tcx.def_path_str(static_did))
+}
+
+fn constant_static_target(tcx: TyCtxt<'_>, operand: &Operand<'_>) -> Option<DefId> {
+    let constant = operand.constant()?;
+    let Const::Val(ConstValue::Scalar(Scalar::Ptr(pointer, _)), _) = constant.const_ else {
+        return None;
+    };
+    match tcx.try_get_global_alloc(pointer.provenance.alloc_id()) {
+        Some(GlobalAlloc::Static(static_did)) => Some(static_did),
+        _ => None,
+    }
+}
+
+fn static_pointer_locals(
+    tcx: TyCtxt<'_>,
+    body: &Body<'_>,
+) -> Result<FxHashMap<Local, DefId>, String> {
+    let mut statics = FxHashMap::default();
+    for statement in body.basic_blocks.iter().flat_map(|data| &data.statements) {
+        let Some((local, static_did)) = (|| {
+            let StatementKind::Assign(box (lhs, rvalue)) = &statement.kind else {
+                return None;
+            };
+            let local = lhs.as_local()?;
+            let operand = match rvalue {
+                Rvalue::Use(operand) | Rvalue::Cast(_, operand, _) => operand,
+                _ => return None,
+            };
+            constant_static_target(tcx, operand).map(|static_did| (local, static_did))
+        })() else {
+            continue;
+        };
+        if let Some(previous) = statics.insert(local, static_did)
+            && previous != static_did
+        {
+            return Err(format!(
+                "one MIR local carries multiple static identities: {local:?} {} {}",
+                tcx.def_path_str(previous),
+                tcx.def_path_str(static_did)
+            ));
+        }
+    }
+    Ok(statics)
 }
 
 fn target_flow_node<'tcx>(
     tcx: TyCtxt<'tcx>,
     fn_did: LocalDefId,
     body: &Body<'tcx>,
+    static_pointers: &FxHashMap<Local, DefId>,
     place: Place<'tcx>,
 ) -> String {
+    if matches!(place.projection.first(), Some(ProjectionElem::Deref))
+        && let Some(static_did) = static_pointers.get(&place.local)
+    {
+        return target_static_node(tcx, *static_did);
+    }
     let mut field_node = None;
     for (index, projection) in place.projection.iter().enumerate() {
         let ProjectionElem::Field(field, _) = projection else {
@@ -1130,20 +1240,27 @@ fn add_target_operand_flow<'tcx>(
     tcx: TyCtxt<'tcx>,
     fn_did: LocalDefId,
     body: &Body<'tcx>,
+    static_pointers: &FxHashMap<Local, DefId>,
     operand: &Operand<'tcx>,
     target: String,
 ) {
     if let Some(function) = constant_function_target(operand) {
         flow.add_seed(target, function);
     } else if let Some(place) = operand.place() {
-        flow.add_edge(target_flow_node(tcx, fn_did, body, place), target);
+        flow.add_edge(
+            target_flow_node(tcx, fn_did, body, static_pointers, place),
+            target,
+        );
     }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct IndirectCallResolution {
     visible_targets: Vec<DefId>,
+    has_external_parameter: bool,
     exclusively_external_parameter: bool,
+    public_setter_reachable: bool,
+    has_unexplained_predecessor: bool,
     #[cfg(test)]
     diagnostic: Vec<String>,
 }
@@ -1153,17 +1270,40 @@ fn collect_indirect_call_resolutions(
     functions: &[LocalDefId],
 ) -> FxHashMap<(LocalDefId, usize), IndirectCallResolution> {
     let function_set = functions.iter().copied().collect::<FxHashSet<_>>();
+    let static_pointers = functions
+        .iter()
+        .copied()
+        .map(|function| {
+            let body_ref = tcx
+                .mir_drops_elaborated_and_const_checked(function)
+                .borrow();
+            let statics = static_pointer_locals(tcx, &body_ref).unwrap_or_else(|error| {
+                panic!(
+                    "A4C STOP phase=graph-construction candidate=none: static target identity in {}: {error}",
+                    tcx.def_path_str(function)
+                )
+            });
+            (function, statics)
+        })
+        .collect::<FxHashMap<_, _>>();
     let mut flow = IndirectTargetFlow::default();
+    for static_did in static_pointers
+        .values()
+        .flat_map(|statics| statics.values())
+    {
+        flow.add_static_node(target_static_node(tcx, *static_did));
+    }
     let mut parameter_nodes = Vec::new();
     let mut called_parameters = FxHashSet::default();
     for &fn_did in functions {
         let body_ref = tcx.mir_drops_elaborated_and_const_checked(fn_did).borrow();
         let body = &*body_ref;
+        let body_static_pointers = &static_pointers[&fn_did];
         for local in body.args_iter() {
             parameter_nodes.push((
                 fn_did,
                 local.index(),
-                target_flow_node(tcx, fn_did, body, Place::from(local)),
+                target_flow_node(tcx, fn_did, body, body_static_pointers, Place::from(local)),
             ));
         }
         for (bb, data) in body.basic_blocks.iter_enumerated() {
@@ -1181,13 +1321,14 @@ fn collect_indirect_call_resolutions(
                             tcx,
                             fn_did,
                             body,
+                            body_static_pointers,
                             operand,
                             target_field_node(tcx, *def_id, field.index()),
                         );
                     }
                     continue;
                 }
-                let target = target_flow_node(tcx, fn_did, body, *lhs);
+                let target = target_flow_node(tcx, fn_did, body, body_static_pointers, *lhs);
                 if let Rvalue::Aggregate(kind, operands) = rvalue
                     && let AggregateKind::Adt(def_id, variant, _, _, _) = kind.as_ref()
                     && tcx.is_diagnostic_item(rustc_span::sym::Option, *def_id)
@@ -1199,7 +1340,15 @@ fn collect_indirect_call_resolutions(
                 }
                 match rvalue {
                     Rvalue::Use(operand) | Rvalue::Cast(_, operand, _) => {
-                        add_target_operand_flow(&mut flow, tcx, fn_did, body, operand, target);
+                        add_target_operand_flow(
+                            &mut flow,
+                            tcx,
+                            fn_did,
+                            body,
+                            body_static_pointers,
+                            operand,
+                            target,
+                        );
                     }
                     Rvalue::Aggregate(_, operands) => {
                         for operand in operands {
@@ -1208,14 +1357,16 @@ fn collect_indirect_call_resolutions(
                                 tcx,
                                 fn_did,
                                 body,
+                                body_static_pointers,
                                 operand,
                                 target.clone(),
                             );
                         }
                     }
-                    Rvalue::CopyForDeref(place) => {
-                        flow.add_edge(target_flow_node(tcx, fn_did, body, *place), target)
-                    }
+                    Rvalue::CopyForDeref(place) => flow.add_edge(
+                        target_flow_node(tcx, fn_did, body, body_static_pointers, *place),
+                        target,
+                    ),
                     _ => {}
                 }
             }
@@ -1237,7 +1388,7 @@ fn collect_indirect_call_resolutions(
                 if let Some(place) = func.place() {
                     flow.call_nodes.insert(
                         (fn_did, bb.index()),
-                        target_flow_node(tcx, fn_did, body, place),
+                        target_flow_node(tcx, fn_did, body, body_static_pointers, place),
                     );
                 }
                 continue;
@@ -1247,6 +1398,7 @@ fn collect_indirect_call_resolutions(
                     let callee_body_ref =
                         tcx.mir_drops_elaborated_and_const_checked(callee).borrow();
                     let callee_body = &*callee_body_ref;
+                    let callee_static_pointers = &static_pointers[&callee];
                     for (index, argument) in args.iter().enumerate() {
                         let parameter = Local::from_usize(index + 1);
                         called_parameters.insert((callee, parameter.index()));
@@ -1255,13 +1407,26 @@ fn collect_indirect_call_resolutions(
                             tcx,
                             fn_did,
                             body,
+                            body_static_pointers,
                             &argument.node,
-                            target_flow_node(tcx, callee, callee_body, Place::from(parameter)),
+                            target_flow_node(
+                                tcx,
+                                callee,
+                                callee_body,
+                                callee_static_pointers,
+                                Place::from(parameter),
+                            ),
                         );
                     }
                     flow.add_edge(
-                        target_flow_node(tcx, callee, callee_body, Place::from(RETURN_PLACE)),
-                        target_flow_node(tcx, fn_did, body, destination),
+                        target_flow_node(
+                            tcx,
+                            callee,
+                            callee_body,
+                            callee_static_pointers,
+                            Place::from(RETURN_PLACE),
+                        ),
+                        target_flow_node(tcx, fn_did, body, body_static_pointers, destination),
                     );
                 }
                 HarnessCallKind::RustLib(callee)
@@ -1276,8 +1441,9 @@ fn collect_indirect_call_resolutions(
                             tcx,
                             fn_did,
                             body,
+                            body_static_pointers,
                             &argument.node,
-                            target_flow_node(tcx, fn_did, body, destination),
+                            target_flow_node(tcx, fn_did, body, body_static_pointers, destination),
                         );
                     }
                 }
@@ -1312,13 +1478,17 @@ fn collect_indirect_call_resolutions(
     flow.call_nodes
         .iter()
         .map(|(call, node)| {
-            let mut targets = flow.targets(node).into_iter().collect::<Vec<_>>();
+            let summary = flow.summary(node);
+            let mut targets = summary.targets.into_iter().collect::<Vec<_>>();
             targets.sort_by_key(|target| tcx.def_path_str(*target));
             (
                 *call,
                 IndirectCallResolution {
                     visible_targets: targets,
+                    has_external_parameter: summary.has_external_parameter,
                     exclusively_external_parameter: flow.exclusively_external_parameter(node),
+                    public_setter_reachable: summary.public_setter_reachable,
+                    has_unexplained_predecessor: !summary.unexplained_predecessors.is_empty(),
                     #[cfg(test)]
                     diagnostic: flow.diagnostic(tcx, node),
                 },
@@ -1779,7 +1949,10 @@ fn build_source_graph(tcx: TyCtxt<'_>, slots: &CrateSlots, export: &BoExport) ->
                     let arm = indirect_call_arm(
                         result_is_data_pointer,
                         resolution.visible_targets.len(),
+                        resolution.has_external_parameter,
                         resolution.exclusively_external_parameter,
+                        resolution.public_setter_reachable,
+                        resolution.has_unexplained_predecessor,
                         &call_location,
                     )
                     .unwrap_or_else(|error| {
@@ -1804,6 +1977,13 @@ fn build_source_graph(tcx: TyCtxt<'_>, slots: &CrateSlots, export: &BoExport) ->
                             &call_location,
                         );
                         continue;
+                    }
+                    if arm == IndirectCallArm::VisibleTargetsAndExternalRemainder {
+                        add_public_setter_remainder_root(
+                            &mut graph,
+                            destination.to_owned(),
+                            &call_location,
+                        );
                     }
                     for &resolved_target in &resolution.visible_targets {
                         let canonical_path = tcx.def_path_str(resolved_target);
@@ -2893,7 +3073,7 @@ const RAW_CORPUS_DIGEST: &str = "9fc912af10fd3b235fe4d444d2fbac0bc521509b1c9447f
 const DERIVED_SUBSTRATE_DIGEST: &str =
     "db96829b5c2b0db28fb4bb9ddd3d32901b5d4e6e4134da07ada0d513d94eb4c6";
 const SNAPSHOT_PATH: &str = "/home/p51lee/dev/agent-worktrees/m1-artifact-snapshots/3b26a0ff";
-const RETRY3_PREDECESSOR_SHARDS: [(&str, &str, &str); 10] = [
+const RETRY3_PREDECESSOR_SHARDS: [(&str, &str, &str); 11] = [
     (
         "bst",
         "ce11b3459c6fa46965e4cbe23ce11dffbdc7bf01",
@@ -2943,6 +3123,11 @@ const RETRY3_PREDECESSOR_SHARDS: [(&str, &str, &str); 10] = [
         "libtree",
         "1bd19c6a90082b87c82eb3bd35f5155db712fcf9",
         "f510473a443d12dd4c09964ed8290cc82e2255288a7ed9e3c96e48f080d7eb45",
+    ),
+    (
+        "json.h",
+        "bb8cead3695b42f5ef20a574000c51ba5dc5ebc6",
+        "fcb2a562d385483ebf7f1b65841e38a3cf3609339cc216a6da6989954d4de693",
     ),
 ];
 
@@ -3151,6 +3336,140 @@ const CANDIDATE_HEADER: &str =
 const ROOT_HEADER: &str =
     "population\tprogram\tfield_key\tstore_site\troot_id\troot_label\tcause_flags\tordered_path";
 const EXCEPTION_HEADER: &str = "program\tfield_key\tfield_slot\tordinary_kind\tforce_result\treplay_result\treplay_kind\tcausal_outcome\tsource_selectors\tsink_selectors\tsource_inventory\tsink_inventory\tordinary_dropped_sources\tordinary_dropped_sinks\tforced_dropped_sources\tforced_dropped_sinks\treplay_dropped_sources\treplay_dropped_sinks\tmodel_changes\tordinary_commits\tforced_commits\tgraph_root_count\tgraph_flags\tallocation_token_path\tunsupported_realloc\tcopy_clone_gate\tabi_gate\tfn_pointer_gate";
+const CANDIDATE_READINGS_HEADER: &str = "program\tfield_key\tfield_slot\tordinary_kind\tclosed_world_class\topen_class\tclosed_world_evidence\topen_evidence\tclosed_world_root_count\topen_root_count";
+const FULL_IDENTITY_HEADER: &str =
+    "program\tfield_key\tfield_slot\tordinary_kind\tbaseline_force\tproof_reason";
+const PUBLIC_SETTER_REACHABLE_TAG: &str = "public-setter-reachable";
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct DualReading {
+    closed_world_class: PrimaryClass,
+    open_class: PrimaryClass,
+    closed_world_evidence: RootEvidence,
+    open_evidence: RootEvidence,
+    closed_world_root_count: usize,
+    open_root_count: usize,
+}
+
+fn union_evidence(roots: &[RootEvidence]) -> RootEvidence {
+    RootEvidence {
+        flags: roots
+            .iter()
+            .flat_map(|root| root.flags.iter().copied())
+            .collect(),
+        provenance_tags: roots
+            .iter()
+            .flat_map(|root| root.provenance_tags.iter().cloned())
+            .collect(),
+    }
+}
+
+fn dual_reading(roots: &[RootEvidence]) -> Result<DualReading, String> {
+    let closed_world_roots = roots
+        .iter()
+        .filter(|root| !root.provenance_tags.contains(PUBLIC_SETTER_REACHABLE_TAG))
+        .cloned()
+        .collect::<Vec<_>>();
+    let closed_world_class = classify_roots(&closed_world_roots);
+    let open_class = classify_roots(roots);
+    if closed_world_class == PrimaryClass::Unresolved {
+        return Err("closed-world reading has no classified visible root".to_owned());
+    }
+    if open_class == PrimaryClass::Unresolved {
+        return Err("open reading contains an unclassified root".to_owned());
+    }
+    Ok(DualReading {
+        closed_world_class,
+        open_class,
+        closed_world_evidence: union_evidence(&closed_world_roots),
+        open_evidence: union_evidence(roots),
+        closed_world_root_count: closed_world_roots.len(),
+        open_root_count: roots.len(),
+    })
+}
+
+fn render_candidate_readings(
+    candidates: &[Vec<String>],
+    roots: &[Vec<String>],
+) -> Result<String, String> {
+    let mut root_evidence = BTreeMap::<(String, String), Vec<RootEvidence>>::new();
+    for row in roots.iter().filter(|row| row[0] == "census") {
+        root_evidence
+            .entry((row[1].clone(), row[2].clone()))
+            .or_default()
+            .push(parse_root_evidence(&row[6])?);
+    }
+    let mut rendered = format!("{CANDIDATE_READINGS_HEADER}\n");
+    for row in candidates {
+        let identity = (row[0].clone(), row[1].clone());
+        let roots = root_evidence
+            .get(&identity)
+            .ok_or_else(|| format!("candidate reading lacks roots: {} {}", row[0], row[1]))?;
+        let reading = dual_reading(roots)?;
+        let open_evidence = evidence_tokens(&reading.open_evidence).join("|");
+        if class_label(reading.open_class) != row[4]
+            || open_evidence != row[5]
+            || reading.open_root_count.to_string() != row[6]
+        {
+            return Err(format!(
+                "open reading does not reproduce manifested candidate row: {} {}",
+                row[0], row[1]
+            ));
+        }
+        rendered.push_str(&format!(
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+            row[0],
+            row[1],
+            row[2],
+            row[3],
+            class_label(reading.closed_world_class),
+            class_label(reading.open_class),
+            evidence_tokens(&reading.closed_world_evidence).join("|"),
+            open_evidence,
+            reading.closed_world_root_count,
+            reading.open_root_count,
+        ));
+    }
+    Ok(rendered)
+}
+
+fn render_full_identity(input: &[A4InputRow]) -> Result<String, String> {
+    let expected_counts = BTreeMap::from([
+        ("allocation-source-count-0", 237usize),
+        ("competing-live-use", 13),
+        ("ownership-erasing-cast", 6),
+        ("realloc-origin", 1),
+        ("baseline-force-sat-exception", 4),
+    ]);
+    let mut actual_counts = BTreeMap::<&str, usize>::new();
+    let mut identities = BTreeSet::new();
+    let mut rendered = format!("{FULL_IDENTITY_HEADER}\n");
+    for row in input {
+        if !identities.insert((row.program.as_str(), row.field_key.as_str())) {
+            return Err(format!(
+                "duplicate full identity: {} {}",
+                row.program, row.field_key
+            ));
+        }
+        *actual_counts.entry(row.proof_reason.as_str()).or_default() += 1;
+        rendered.push_str(&format!(
+            "{}\t{}\t{}\t{}\t{}\t{}\n",
+            row.program,
+            row.field_key,
+            row.field_slot,
+            kind_label(row.baseline_kind),
+            row.baseline_force,
+            row.proof_reason,
+        ));
+    }
+    if input.len() != 261 || actual_counts != expected_counts {
+        return Err(format!(
+            "full identity partition drift: rows={} counts={actual_counts:?}",
+            input.len()
+        ));
+    }
+    Ok(rendered)
+}
 
 fn identity_text(rows: impl Iterator<Item = Identity>) -> String {
     let mut rows = rows.collect::<Vec<_>>();
@@ -4099,6 +4418,8 @@ fn aggregate(contract: &MeasurementContract) {
     let candidates_path = aggregate_dir.join("candidates.tsv");
     let roots_path = aggregate_dir.join("roots.tsv");
     let exceptions_path = aggregate_dir.join("exceptions.tsv");
+    let candidate_readings_path = aggregate_dir.join("candidate-readings.tsv");
+    let identity_path = aggregate_dir.join("identity.tsv");
     fs::write(&candidates_path, combined_candidates).expect("write aggregate candidates");
     fs::write(&roots_path, combined_roots).expect("write aggregate roots");
     fs::write(&exceptions_path, combined_exceptions).expect("write aggregate exceptions");
@@ -4107,7 +4428,24 @@ fn aggregate(contract: &MeasurementContract) {
     let roots = parse_table(&roots_path, ROOT_HEADER, 8).expect("parse aggregate roots");
     let exceptions =
         parse_table(&exceptions_path, EXCEPTION_HEADER, 28).expect("parse aggregate exceptions");
+    fs::write(
+        &candidate_readings_path,
+        render_candidate_readings(&candidates, &roots)
+            .expect("derive closed/open candidate readings"),
+    )
+    .expect("write aggregate candidate readings");
+    fs::write(
+        &identity_path,
+        render_full_identity(&contract.input).expect("derive exact 261-row identity"),
+    )
+    .expect("write aggregate full identity");
+    let candidate_readings = parse_table(&candidate_readings_path, CANDIDATE_READINGS_HEADER, 10)
+        .expect("parse aggregate candidate readings");
+    let full_identity = parse_table(&identity_path, FULL_IDENTITY_HEADER, 6)
+        .expect("parse aggregate full identity");
     assert_eq!(candidates.len(), 237);
+    assert_eq!(candidate_readings.len(), 237);
+    assert_eq!(full_identity.len(), 261);
     assert_eq!(exceptions.len(), 4);
     let candidate_ids = candidates
         .iter()
@@ -4138,18 +4476,24 @@ fn aggregate(contract: &MeasurementContract) {
     validate_exact_identities(&expected_exceptions, &exception_ids)
         .expect("aggregate exact four-exception identity");
 
-    let mut class_counts = BTreeMap::<String, usize>::new();
+    let mut closed_class_counts = BTreeMap::<String, usize>::new();
+    let mut open_class_counts = BTreeMap::<String, usize>::new();
     let mut flag_counts = BTreeMap::<String, usize>::new();
     let mut provenance_tag_counts = BTreeMap::<String, usize>::new();
-    let mut class_witness = BTreeMap::<String, String>::new();
+    let mut closed_class_witness = BTreeMap::<String, String>::new();
+    let mut open_class_witness = BTreeMap::<String, String>::new();
     let mut flag_witness = BTreeMap::<String, String>::new();
     let mut provenance_tag_witness = BTreeMap::<String, String>::new();
-    for row in &candidates {
-        *class_counts.entry(row[4].clone()).or_default() += 1;
-        class_witness
+    for row in &candidate_readings {
+        *closed_class_counts.entry(row[4].clone()).or_default() += 1;
+        *open_class_counts.entry(row[5].clone()).or_default() += 1;
+        closed_class_witness
             .entry(row[4].clone())
             .or_insert_with(|| format!("{}::{}", row[0], row[1]));
-        let evidence = parse_root_evidence(&row[5]).expect("validated candidate evidence");
+        open_class_witness
+            .entry(row[5].clone())
+            .or_insert_with(|| format!("{}::{}", row[0], row[1]));
+        let evidence = parse_root_evidence(&row[7]).expect("validated open candidate evidence");
         for flag in evidence.flags {
             *flag_counts.entry(flag_label(flag).to_owned()).or_default() += 1;
         }
@@ -4178,7 +4522,8 @@ fn aggregate(contract: &MeasurementContract) {
             });
         }
     }
-    assert_eq!(class_counts.values().sum::<usize>(), 237);
+    assert_eq!(closed_class_counts.values().sum::<usize>(), 237);
+    assert_eq!(open_class_counts.values().sum::<usize>(), 237);
     for flag in flag_counts.keys() {
         assert!(flag_witness.contains_key(flag));
     }
@@ -4202,16 +4547,17 @@ fn aggregate(contract: &MeasurementContract) {
         .collect::<Vec<_>>()
         .join(",");
     let mut per_program = String::from(
-        "program\tcandidates\troots\texceptions\tinvisible\tabsent\tmixed\twall_s\tpeak_rss_kb\n",
+        "program\tcandidates\troots\texceptions\tclosed_invisible\tclosed_absent\tclosed_mixed\topen_invisible\topen_absent\topen_mixed\tstance_divergences\twall_s\tpeak_rss_kb\n",
     );
     for (program, receipt) in contract.programs.iter().zip(&receipts) {
-        let program_rows = candidates
+        let program_rows = candidate_readings
             .iter()
             .filter(|row| row[0] == program.name)
             .collect::<Vec<_>>();
-        let count_class = |class: &str| program_rows.iter().filter(|row| row[4] == class).count();
+        let count_closed = |class: &str| program_rows.iter().filter(|row| row[4] == class).count();
+        let count_open = |class: &str| program_rows.iter().filter(|row| row[5] == class).count();
         per_program.push_str(&format!(
-            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
             program.name,
             program_rows.len(),
             roots.iter().filter(|row| row[1] == program.name).count(),
@@ -4219,19 +4565,33 @@ fn aggregate(contract: &MeasurementContract) {
                 .iter()
                 .filter(|row| row[0] == program.name)
                 .count(),
-            count_class("invisible"),
-            count_class("absent"),
-            count_class("mixed"),
+            count_closed("invisible"),
+            count_closed("absent"),
+            count_closed("mixed"),
+            count_open("invisible"),
+            count_open("absent"),
+            count_open("mixed"),
+            program_rows.iter().filter(|row| row[4] != row[5]).count(),
             receipt["wall_s"],
             receipt["peak_rss_kb"],
         ));
     }
-    let class_summary = class_counts
+    let closed_class_summary = closed_class_counts
         .iter()
         .map(|(class, count)| {
             format!(
                 "- `{class}`: **{count}**, witness `{}`",
-                class_witness[class]
+                closed_class_witness[class]
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let open_class_summary = open_class_counts
+        .iter()
+        .map(|(class, count)| {
+            format!(
+                "- `{class}`: **{count}**, witness `{}`",
+                open_class_witness[class]
             )
         })
         .collect::<Vec<_>>()
@@ -4261,11 +4621,15 @@ fn aggregate(contract: &MeasurementContract) {
         })
         .collect::<Vec<_>>()
         .join("\n");
+    let stance_divergences = candidate_readings
+        .iter()
+        .filter(|row| row[4] != row[5])
+        .count();
     let report = format!(
-        "# A4 force-SAT exceptions and no-allocation-source census\n\nMachine `{MACHINE_ID}`, platform `{PLATFORM}`; RAM/CPU uncapped with a {LIVENESS_BOUND_S}-second per-program liveness bound. Wall/RSS values are machine-local and never compared across machines.\n\nExact identity: **237/237** preregistered no-allocation-source candidates and **4/4** force-SAT exceptions. No unresolved root entered the aggregate.\n\n## Deterministic primary partition\n\n{class_summary}\n\n## Overlapping cause flags\n\n{flag_summary}\n\n## Neutral indirect-target provenance tags\n\n{provenance_tag_summary}\n\nThese tags are reported separately and do not enter either deterministic partition predicate.\n\n## Force-SAT exceptions\n\n{exception_summary}\n\nSequential shard wall sum: **{total_wall:.3}s**. Maximum observed worker RSS: **{peak_rss} KiB**. Only SHA-manifested, completed `data=true` shards feed this report; atomic `data=false` checkpoints are excluded. Production analysis and rewriter behavior remained untouched.\n"
+        "# A4 force-SAT exceptions and no-allocation-source census\n\nMachine `{MACHINE_ID}`, platform `{PLATFORM}`; RAM/CPU uncapped with a {LIVENESS_BOUND_S}-second per-program liveness bound. Wall/RSS values are machine-local and never compared across machines.\n\nExact identity: **261/261** A4/P2 candidates plus **4/4** separately re-checked force-SAT exception rows (**261+4**), with **237/237** no-allocation-source candidates characterized. Unknown/unexplained: **0**.\n\n## Closed-world partition\n\nThe closed-world reading excludes only `public-setter-reachable` external-remainder rows.\n\n{closed_class_summary}\n\n## Open partition\n\nThe open reading includes every manifested path row and treats the public-setter remainder as opaque/absent.\n\n{open_class_summary}\n\nClosed/open class divergences: **{stance_divergences}**.\n\n## Overlapping cause flags (open reading)\n\n{flag_summary}\n\n## Indirect-target provenance tags\n\n{provenance_tag_summary}\n\nTags remain outside the invisible/absent predicates. `public-setter-reachable` controls only which manifested row enters the closed versus open reading.\n\n## Force-SAT exceptions\n\n{exception_summary}\n\nSequential shard wall sum: **{total_wall:.3}s**. Maximum observed worker RSS: **{peak_rss} KiB**. Only SHA-manifested, completed `data=true` shards feed this report; atomic `data=false` checkpoints are excluded. Production analysis and rewriter behavior remained untouched.\n"
     );
     let provenance = format!(
-        "machine_id={MACHINE_ID}\nplatform={PLATFORM}\nanalysis_head={}\nanalysis_branch=codex/a4-source-census\nbaseline_branch=analysis-lane\nbaseline_head=67bcd3cb67c1ae6f74463050033370b108854411\na4_input_root={}\na4_aggregate_manifest_sha256={A4_AGGREGATE_MANIFEST_SHA256}\na4_combined_sha256={A4_COMBINED_SHA256}\ncensus_identity_sha256={CENSUS_IDENTITY_SHA256}\nexception_identity_sha256={EXCEPTION_IDENTITY_SHA256}\nraw_corpus_digest={RAW_CORPUS_DIGEST}\nderived_substrate_digest={DERIVED_SUBSTRATE_DIGEST}\nsnapshot={SNAPSHOT_PATH}\nmemory_limit=uncapped\nwall_bound_kind=liveness\nwall_cap_s={LIVENESS_BOUND_S}\nprograms={}\ncandidates=237\nexceptions=4\nroots={}\nwall_sum_s={total_wall:.3}\npeak_rss_kb={peak_rss}\nshard_analysis_heads={shard_analysis_heads}\nshard_manifests={}\naggregation_input_policy=manifested-published-completed-data-true-only\ntiming_comparison=forbidden-across-machines\n",
+        "machine_id={MACHINE_ID}\nplatform={PLATFORM}\nanalysis_head={}\nanalysis_branch=codex/a4-source-census\nbaseline_branch=analysis-lane\nbaseline_head=67bcd3cb67c1ae6f74463050033370b108854411\na4_input_root={}\na4_aggregate_manifest_sha256={A4_AGGREGATE_MANIFEST_SHA256}\na4_combined_sha256={A4_COMBINED_SHA256}\ncensus_identity_sha256={CENSUS_IDENTITY_SHA256}\nexception_identity_sha256={EXCEPTION_IDENTITY_SHA256}\nraw_corpus_digest={RAW_CORPUS_DIGEST}\nderived_substrate_digest={DERIVED_SUBSTRATE_DIGEST}\nsnapshot={SNAPSHOT_PATH}\nmemory_limit=uncapped\nwall_bound_kind=liveness\nwall_cap_s={LIVENESS_BOUND_S}\nprograms={}\nfull_identity_rows=261\ncensus_candidates=237\nexception_rechecks=4\nidentity_accounting=261+4\nunknown=0\nunexplained=0\nclosed_open_divergences={stance_divergences}\nroots={}\nwall_sum_s={total_wall:.3}\npeak_rss_kb={peak_rss}\nshard_analysis_heads={shard_analysis_heads}\nshard_manifests={}\naggregation_input_policy=manifested-published-completed-data-true-only\ntiming_comparison=forbidden-across-machines\n",
         contract.head,
         contract.input_root.display(),
         contract.programs.len(),
@@ -4283,8 +4647,10 @@ fn aggregate(contract: &MeasurementContract) {
         &aggregate_dir,
         &[
             "candidates.tsv",
+            "candidate-readings.tsv",
             "roots.tsv",
             "exceptions.tsv",
+            "identity.tsv",
             "per-program.tsv",
             "report.md",
             "provenance.txt",
@@ -4292,7 +4658,7 @@ fn aggregate(contract: &MeasurementContract) {
     )
     .expect("manifest aggregate");
     eprintln!(
-        "A4C aggregate complete manifest={manifest} candidates=237 exceptions=4 roots={} classes={class_counts:?} flags={flag_counts:?}",
+        "A4C aggregate complete manifest={manifest} identity=261+4 candidates=237 exceptions=4 roots={} closed_classes={closed_class_counts:?} open_classes={open_class_counts:?} divergences={stance_divergences} flags={flag_counts:?}",
         roots.len()
     );
 }
@@ -4521,6 +4887,10 @@ mod tests {
         assert_eq!(
             parse_provenance_tag("indirect-external-parameter-callback"),
             Ok("indirect-external-parameter-callback".to_owned())
+        );
+        assert_eq!(
+            parse_provenance_tag("public-setter-reachable"),
+            Ok("public-setter-reachable".to_owned())
         );
         assert_eq!(
             parse_root_evidence("static-or-interior-root|string-literal-root"),
@@ -5114,23 +5484,37 @@ mod tests {
     }
 
     #[test]
-    fn indirect_call_taxonomy_is_a_closed_three_arm_enumeration() {
+    fn indirect_call_taxonomy_is_a_closed_composition() {
         assert_eq!(
-            indirect_call_arm(false, 0, false, "fixture:unit"),
+            indirect_call_arm(false, 0, false, false, false, false, "fixture:unit"),
             Ok(IndirectCallArm::OutOfPopulation)
         );
         assert_eq!(
-            indirect_call_arm(true, 1, false, "fixture:visible"),
+            indirect_call_arm(true, 1, false, false, false, false, "fixture:visible"),
             Ok(IndirectCallArm::VisibleTargets)
         );
         assert_eq!(
-            indirect_call_arm(true, 0, true, "fixture:external"),
+            indirect_call_arm(true, 0, true, true, false, false, "fixture:external"),
             Ok(IndirectCallArm::ExternalParameterCallback)
         );
+        assert_eq!(
+            indirect_call_arm(true, 1, true, false, true, false, "fixture:both"),
+            Ok(IndirectCallArm::VisibleTargetsAndExternalRemainder)
+        );
         assert!(
-            indirect_call_arm(true, 0, false, "fixture:fourth")
+            indirect_call_arm(true, 0, false, false, false, false, "fixture:fourth")
                 .expect_err("a fourth shape must STOP")
                 .contains("unclassified empty-target indirect call")
+        );
+        assert!(
+            indirect_call_arm(true, 0, true, true, true, false, "fixture:external-static")
+                .expect_err("a public-setter static without a visible target must STOP")
+                .contains("unclassified empty-target indirect call")
+        );
+        assert!(
+            indirect_call_arm(true, 1, false, false, false, true, "fixture:unexplained")
+                .expect_err("an unexplained predecessor must STOP")
+                .contains("unexplained predecessor")
         );
 
         let mut graph = SourceGraph::default();
@@ -5178,6 +5562,84 @@ mod tests {
             !mixed_unresolved.exclusively_external_parameter("call"),
             "a neutral empty path cannot conceal an unexplained predecessor"
         );
+    }
+
+    #[test]
+    fn public_setter_remainder_has_mechanical_closed_and_open_readings() {
+        let allocation = RootEvidence {
+            flags: BTreeSet::from([CauseFlag::InterproceduralAllocation]),
+            provenance_tags: BTreeSet::from(["indirect-resolved-target(malloc)".to_owned()]),
+        };
+        let external_remainder = RootEvidence {
+            flags: BTreeSet::from([CauseFlag::OpaqueExternalCallResult]),
+            provenance_tags: BTreeSet::from([PUBLIC_SETTER_REACHABLE_TAG.to_owned()]),
+        };
+        let reading = dual_reading(&[allocation.clone(), external_remainder.clone()]).unwrap();
+        assert_eq!(reading.closed_world_class, PrimaryClass::Invisible);
+        assert_eq!(reading.open_class, PrimaryClass::Mixed);
+        assert_eq!(reading.closed_world_root_count, 1);
+        assert_eq!(reading.open_root_count, 2);
+        assert_eq!(reading.closed_world_evidence, allocation);
+        assert!(
+            reading
+                .open_evidence
+                .provenance_tags
+                .contains(PUBLIC_SETTER_REACHABLE_TAG)
+        );
+
+        let visible_only = dual_reading(&[reading.closed_world_evidence.clone()]).unwrap();
+        assert_eq!(visible_only.closed_world_class, visible_only.open_class);
+        assert_eq!(visible_only.closed_world_root_count, 1);
+        assert_eq!(visible_only.open_root_count, 1);
+
+        assert!(
+            dual_reading(&[external_remainder])
+                .expect_err("external-only mutable static must STOP")
+                .contains("no classified visible root")
+        );
+
+        let candidates = vec![vec![
+            "binn".to_owned(),
+            "src::fixture::Field@d0".to_owned(),
+            "1".to_owned(),
+            "ref".to_owned(),
+            "mixed".to_owned(),
+            "interprocedural-allocation|opaque-external-call-result|indirect-resolved-target(malloc)|public-setter-reachable".to_owned(),
+            "2".to_owned(),
+        ]];
+        let roots = vec![
+            vec![
+                "census".to_owned(),
+                "binn".to_owned(),
+                "src::fixture::Field@d0".to_owned(),
+                "store-1".to_owned(),
+                "allocation".to_owned(),
+                "malloc".to_owned(),
+                "interprocedural-allocation|indirect-resolved-target(malloc)".to_owned(),
+                "allocation -> store".to_owned(),
+            ],
+            vec![
+                "census".to_owned(),
+                "binn".to_owned(),
+                "src::fixture::Field@d0".to_owned(),
+                "store-1".to_owned(),
+                "external".to_owned(),
+                "setter".to_owned(),
+                "opaque-external-call-result|public-setter-reachable".to_owned(),
+                "external -> store".to_owned(),
+            ],
+        ];
+        let rendered = render_candidate_readings(&candidates, &roots).unwrap();
+        let cells = rendered
+            .lines()
+            .nth(1)
+            .unwrap()
+            .split('\t')
+            .collect::<Vec<_>>();
+        assert_eq!(cells[4], "invisible");
+        assert_eq!(cells[5], "mixed");
+        assert_eq!(cells[8], "1");
+        assert_eq!(cells[9], "2");
     }
 
     #[test]
@@ -5305,6 +5767,165 @@ mod tests {
             };
             assert_eq!(call_scopes("empty_target"), vec![(true, true)]);
             assert_eq!(call_scopes("unit_callback"), vec![(false, false)]);
+        })
+        .unwrap_or_else(|error| error.raise());
+    }
+
+    #[test]
+    fn mutable_static_hook_resolution_has_visible_external_and_stop_controls() {
+        let source = r#"
+            use core::ffi::c_void;
+
+            extern "C" {
+                fn malloc(size: usize) -> *mut c_void;
+            }
+
+            type Alloc = unsafe extern "C" fn(usize) -> *mut c_void;
+
+            static mut VISIBLE_ONLY: Option<Alloc> = None;
+            static mut PUBLIC_SETTER: Option<Alloc> = None;
+            static mut NEITHER: Option<Alloc> = None;
+
+            unsafe fn install_visible_only() {
+                VISIBLE_ONLY = Some(malloc);
+            }
+
+            unsafe fn install_public_default() {
+                if PUBLIC_SETTER.is_none() {
+                    PUBLIC_SETTER = Some(malloc);
+                }
+            }
+
+            pub unsafe extern "C" fn set_public_hook(hook: Option<Alloc>) {
+                PUBLIC_SETTER = hook;
+            }
+
+            unsafe fn call_visible_only(size: usize) -> *mut c_void {
+                install_visible_only();
+                VISIBLE_ONLY.expect("visible only")(size)
+            }
+
+            unsafe fn call_public_setter(size: usize) -> *mut c_void {
+                install_public_default();
+                PUBLIC_SETTER.expect("visible plus external")(size)
+            }
+
+            unsafe fn call_neither(size: usize) -> *mut c_void {
+                NEITHER.expect("unclassified")(size)
+            }
+        "#;
+        ::utils::compilation::run_compiler_on_str(source, |tcx| {
+            let program = super::super::collect_program(tcx);
+            let resolutions = collect_indirect_call_resolutions(tcx, &program.functions);
+            let visible_targets = |suffix: &str| {
+                resolutions
+                    .iter()
+                    .filter(|((function, _), _)| tcx.def_path_str(*function).ends_with(suffix))
+                    .map(|(_, resolution)| {
+                        resolution
+                            .visible_targets
+                            .iter()
+                            .map(|target| tcx.def_path_str(*target))
+                            .collect::<BTreeSet<_>>()
+                    })
+                    .collect::<Vec<_>>()
+            };
+            let resolution_for = |suffix: &str| {
+                let mut matching = resolutions
+                    .iter()
+                    .filter(|((function, _), _)| tcx.def_path_str(*function).ends_with(suffix))
+                    .map(|(_, resolution)| resolution)
+                    .collect::<Vec<_>>();
+                assert_eq!(matching.len(), 1, "one indirect call in {suffix}");
+                matching.pop().unwrap()
+            };
+
+            assert_eq!(
+                visible_targets("call_visible_only"),
+                vec![BTreeSet::from(["malloc".to_owned()])],
+                "a visible-only mutable global must expand its installed target"
+            );
+            assert_eq!(
+                visible_targets("call_public_setter"),
+                vec![BTreeSet::from(["malloc".to_owned()])],
+                "a public-setter global must retain its visible default"
+            );
+            assert_eq!(
+                visible_targets("call_neither"),
+                vec![BTreeSet::new()],
+                "the neither control must remain target-empty and later STOP"
+            );
+
+            let visible_only = resolution_for("call_visible_only");
+            assert!(!visible_only.has_external_parameter);
+            assert!(!visible_only.public_setter_reachable);
+            assert!(!visible_only.has_unexplained_predecessor);
+            assert_eq!(
+                indirect_call_arm(true, 1, false, false, false, false, "visible-only"),
+                Ok(IndirectCallArm::VisibleTargets)
+            );
+
+            let public_setter = resolution_for("call_public_setter");
+            assert!(
+                public_setter.has_external_parameter,
+                "the public setter's external parameter must reach the static"
+            );
+            assert!(public_setter.public_setter_reachable);
+            assert!(!public_setter.has_unexplained_predecessor);
+            assert_eq!(
+                indirect_call_arm(true, 1, true, false, true, false, "public-setter"),
+                Ok(IndirectCallArm::VisibleTargetsAndExternalRemainder)
+            );
+
+            let neither = resolution_for("call_neither");
+            assert!(!neither.has_external_parameter);
+            assert!(!neither.public_setter_reachable);
+            assert!(neither.has_unexplained_predecessor);
+            assert!(
+                indirect_call_arm(true, 0, false, false, false, true, "neither")
+                    .expect_err("a static with neither source must STOP")
+                    .contains("unexplained predecessor")
+            );
+
+            let mut dual_graph = SourceGraph::default();
+            for root in expand_indirect_target_roots(
+                "result",
+                "fixture:public-setter",
+                &[IndirectTargetSpec {
+                    canonical_path: "malloc".to_owned(),
+                    kind: TerminalKind::RecognizedAllocation,
+                    realloc: false,
+                }],
+            )
+            .unwrap()
+            {
+                dual_graph.add_terminal(root);
+            }
+            add_public_setter_remainder_root(
+                &mut dual_graph,
+                "result".to_owned(),
+                "fixture:public-setter",
+            );
+            let dual_roots = trace_candidate(&dual_graph, "result");
+            assert_eq!(dual_roots.len(), 2, "both path rows must be emitted");
+            assert!(dual_roots.iter().any(|root| {
+                root.evidence
+                    .provenance_tags
+                    .contains("public-setter-reachable")
+                    && root
+                        .evidence
+                        .flags
+                        .contains(&CauseFlag::OpaqueExternalCallResult)
+            }));
+            let reading = dual_reading(
+                &dual_roots
+                    .iter()
+                    .map(|root| root.evidence.clone())
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap();
+            assert_eq!(reading.closed_world_class, PrimaryClass::Invisible);
+            assert_eq!(reading.open_class, PrimaryClass::Mixed);
         })
         .unwrap_or_else(|error| error.raise());
     }
