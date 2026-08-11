@@ -721,6 +721,19 @@ fn require_visible_targets<'a, T>(
     Ok(targets)
 }
 
+fn data_pointer_destination<'a>(
+    result_is_data_pointer: bool,
+    destination: Option<&'a str>,
+    call_location: &str,
+) -> Result<Option<&'a str>, String> {
+    if !result_is_data_pointer {
+        return Ok(None);
+    }
+    destination
+        .map(Some)
+        .ok_or_else(|| format!("data-pointer result has no source-graph node at {call_location}"))
+}
+
 fn expand_indirect_target_roots(
     node: &str,
     call_location: &str,
@@ -1331,14 +1344,26 @@ fn build_source_graph(tcx: TyCtxt<'_>, slots: &CrateSlots, export: &BoExport) ->
                     }
                 }
                 HarnessCallKind::Unresolved => {
+                    let result_is_data_pointer = call.destination.ty(body, tcx).ty.is_raw_ptr();
+                    let Some(destination) = data_pointer_destination(
+                        result_is_data_pointer,
+                        destination.as_deref(),
+                        &call_location,
+                    )
+                    .unwrap_or_else(|error| {
+                        panic!("A4C STOP phase=graph-construction candidate=none: {error}")
+                    }) else {
+                        continue;
+                    };
                     let resolved = visible_indirect_targets
                         .get(&(fn_did, bb.index()))
                         .cloned()
                         .unwrap_or_default();
-                    require_visible_targets(&resolved, &call_location).unwrap_or_else(|error| {
-                        panic!("A4C STOP phase=graph-construction candidate=none: {error}")
-                    });
-                    for resolved_target in resolved {
+                    let resolved = require_visible_targets(&resolved, &call_location)
+                        .unwrap_or_else(|error| {
+                            panic!("A4C STOP phase=graph-construction candidate=none: {error}")
+                        });
+                    for &resolved_target in resolved {
                         let canonical_path = tcx.def_path_str(resolved_target);
                         let provenance_tags =
                             BTreeSet::from([indirect_target_tag(&canonical_path)]);
@@ -1376,44 +1401,36 @@ fn build_source_graph(tcx: TyCtxt<'_>, slots: &CrateSlots, export: &BoExport) ->
                                         });
                                     }
                                 }
-                                if let Some(target) = destination.clone()
-                                    && let Some(source) = node_for_place(
+                                add_indirect_value_edge(
+                                    &mut graph,
+                                    node_for_place(
                                         tcx,
                                         slots,
                                         callee,
                                         callee_body,
                                         Place::from(RETURN_PLACE),
-                                    )
-                                {
-                                    graph.add_edge(FlowEdge {
-                                        source,
-                                        target,
-                                        kind: FlowEdgeKind::Call,
-                                        label: format!(
-                                            "indirect-call-return:{canonical_path}->{call_location}"
-                                        ),
-                                        provenance_tags,
-                                    });
-                                }
+                                    ),
+                                    destination.to_owned(),
+                                    format!(
+                                        "indirect-call-return:{canonical_path}->{call_location}"
+                                    ),
+                                    provenance_tags,
+                                );
                             }
                             HarnessCallKind::Local(_) => {
-                                if let Some(target) = destination.clone() {
-                                    add_terminal_with_tags(
-                                        &mut graph,
-                                        target,
-                                        TerminalKind::Unsupported,
-                                        format!(
-                                            "indirect-resolved-local-outside-program:{call_location}:{canonical_path}"
-                                        ),
-                                        false,
-                                        provenance_tags,
-                                    );
-                                }
+                                add_terminal_with_tags(
+                                    &mut graph,
+                                    destination.to_owned(),
+                                    TerminalKind::Unsupported,
+                                    format!(
+                                        "indirect-resolved-local-outside-program:{call_location}:{canonical_path}"
+                                    ),
+                                    false,
+                                    provenance_tags,
+                                );
                             }
                             HarnessCallKind::LibC(name) => {
-                                let Some(target) = destination.clone() else {
-                                    continue;
-                                };
+                                let target = destination.to_owned();
                                 let roles = roles_for_name(&name);
                                 if roles.contains(&Role::Source) {
                                     for root in expand_indirect_target_roots(
@@ -1463,9 +1480,7 @@ fn build_source_graph(tcx: TyCtxt<'_>, slots: &CrateSlots, export: &BoExport) ->
                                 }
                             }
                             HarnessCallKind::RustLib(callee) => {
-                                let Some(target) = destination.clone() else {
-                                    continue;
-                                };
+                                let target = destination.to_owned();
                                 let item_name = tcx.item_name(callee);
                                 let name = item_name.as_str();
                                 let roles = roles_for_name(name);
@@ -4215,6 +4230,35 @@ mod tests {
     }
 
     #[test]
+    fn indirect_empty_target_scope_is_data_pointer_sensitive() {
+        assert_eq!(
+            data_pointer_destination(false, None, "fixture:unit-callback:bb1:call"),
+            Ok(None),
+            "a unit-returning callback is outside the provenance-root population"
+        );
+
+        let unresolved_error =
+            data_pointer_destination(true, None, "fixture:pointer-hook:bb2:call")
+                .expect_err("a pointer result without a graph node must STOP");
+        assert!(unresolved_error.contains("data-pointer result has no source-graph node"));
+
+        assert_eq!(
+            data_pointer_destination(
+                true,
+                Some("pointer-result"),
+                "fixture:pointer-hook:bb3:call"
+            ),
+            Ok(Some("pointer-result"))
+        );
+
+        assert!(
+            require_visible_targets::<u8>(&[], "fixture:pointer-hook:bb3:call")
+                .expect_err("a pointer-returning empty hook must still STOP")
+                .contains("visible target set is empty")
+        );
+    }
+
+    #[test]
     fn indirect_resolved_flow_target_cannot_disappear() {
         let mut graph = SourceGraph::default();
         let tags = BTreeSet::from(["indirect-resolved-target(src::fixture::flow)".to_owned()]);
@@ -4262,9 +4306,16 @@ mod tests {
             unsafe fn empty_target(hook: *mut EmptyHook, p: *mut core::ffi::c_void) -> *mut core::ffi::c_void {
                 ((*hook).call).expect("no visible target")(p, 8)
             }
+            struct UnitHook {
+                call: Option<unsafe extern "C" fn(i32)>,
+            }
+            unsafe fn unit_callback(hook: *mut UnitHook) {
+                ((*hook).call).expect("no visible unit target")(1)
+            }
         "#;
         ::utils::compilation::run_compiler_on_str(source, |tcx| {
             let program = super::super::collect_program(tcx);
+            let slots = CrateSlots::build(&program);
             let targets = collect_visible_indirect_targets(tcx, &program.functions);
             let by_function = |suffix: &str| {
                 targets
@@ -4283,6 +4334,36 @@ mod tests {
                 vec![BTreeSet::from(["realloc".to_owned()])]
             );
             assert_eq!(by_function("empty_target"), vec![BTreeSet::new()]);
+            assert_eq!(by_function("unit_callback"), vec![BTreeSet::new()]);
+
+            let call_scopes = |suffix: &str| {
+                program
+                    .functions
+                    .iter()
+                    .copied()
+                    .filter(|function| tcx.def_path_str(*function).ends_with(suffix))
+                    .flat_map(|function| {
+                        let body_ref = tcx
+                            .mir_drops_elaborated_and_const_checked(function)
+                            .borrow();
+                        let body = &*body_ref;
+                        body.basic_blocks
+                            .iter()
+                            .filter_map(|data| harness_call(tcx, data.terminator()))
+                            .filter(|call| matches!(call.kind, HarnessCallKind::Unresolved))
+                            .map(|call| {
+                                (
+                                    call.destination.ty(body, tcx).ty.is_raw_ptr(),
+                                    node_for_place(tcx, &slots, function, body, call.destination)
+                                        .is_some(),
+                                )
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(call_scopes("empty_target"), vec![(true, true)]);
+            assert_eq!(call_scopes("unit_callback"), vec![(false, false)]);
         })
         .unwrap_or_else(|error| error.raise());
     }
