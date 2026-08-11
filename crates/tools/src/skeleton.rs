@@ -3213,11 +3213,6 @@ fn apply_rule_set(
         }
         let mut replacements = HashMap::new();
         let mut complete = true;
-        let tentative_transformed = transformed
-            .iter()
-            .copied()
-            .filter(|candidate| candidate != label && !applied.contains(candidate))
-            .collect::<BTreeSet<_>>();
         for region in regions {
             let target_adjusted_type = contextual_target_type(
                 region.root,
@@ -3273,7 +3268,7 @@ fn apply_rule_set(
                     }
                     .visit_item(&mut trial);
                     if trial_replacements.is_empty()
-                        && validate_rule_application_shape(&trial, &tentative_transformed).is_ok()
+                        && validate_rule_application_shape(&trial).is_ok()
                     {
                         break Some(expression);
                     }
@@ -3295,12 +3290,7 @@ fn apply_rule_set(
             }
         }
     }
-    let remaining = transformed
-        .iter()
-        .copied()
-        .filter(|label| !applied.contains(label))
-        .collect::<BTreeSet<_>>();
-    validate_rule_application_shape(target, &remaining).map_err(|message| GenerationError {
+    validate_rule_application_shape(target).map_err(|message| GenerationError {
         kind: GenerationErrorKind::AstHirMismatch,
         function_path: tcx.def_path_str(function.to_def_id()),
         message: format!("applied function failed structural validation: {message}"),
