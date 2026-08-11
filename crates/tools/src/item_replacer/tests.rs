@@ -11,6 +11,7 @@ fn skeleton_view(skeleton: &str, transformed: Vec<u32>, needs: bool) -> Skeleton
             &krate.items[0],
             &transformed_set,
             &HashSet::new(),
+            &HashSet::new(),
         )
         .map_err(|problem| global_error(ReplacementErrorKind::InvalidRequest, problem.message))?;
         Ok(SkeletonView {
@@ -66,6 +67,7 @@ fn mixed_preservation_item(
         let statement_dispositions = crate::preservation::make_disposition_forest(
             &krate.items[0],
             &transformed.iter().copied().collect(),
+            &HashSet::new(),
             &rule_applied.iter().copied().collect(),
         )
         .map_err(|problem| global_error(ReplacementErrorKind::InvalidRequest, problem.message))?;
@@ -1061,6 +1063,32 @@ fn replacement_independently_restores_mixed_rule_applied_topologies() {
         let output = replace(source, &request).unwrap();
         assert!(compact(&output).contains(expected), "{output}");
     }
+}
+
+#[test]
+fn replacement_restores_preserved_shell_and_keeps_transformed_child() {
+    let source =
+        "unsafe fn consume(_: i32) {} pub unsafe fn f(flag: bool) { if flag { consume(1); } }";
+    let skeleton = r#"unsafe fn f(flag: bool) {
+#[proctor(0)] if flag { #[proctor(1)] consume(1); }
+}"#;
+    let mut item = mixed_preservation_item(skeleton, &[1], &[]);
+    item.view.statement_dispositions[0].disposition = StatementDispositionKind::PreserveShell;
+    let request = ReplacementRequest {
+        accepted_correspondence: vec![],
+        schema_version: 1,
+        items: vec![item],
+        transformation: r#"unsafe fn f(flag: bool) {
+#[proctor(0)] if !flag { #[proctor(1)] consume(2); }
+}"#
+        .to_owned(),
+    };
+
+    let output = replace(source, &request).unwrap();
+    assert!(
+        compact(&output).contains("if flag { consume(2); }"),
+        "{output}"
+    );
 }
 
 #[test]

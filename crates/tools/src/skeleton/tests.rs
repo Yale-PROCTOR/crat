@@ -3934,7 +3934,7 @@ fn generated_local_name_validates_replaces_and_compiles_in_original_module() {
             record.target_signature,
             "pub unsafe fn cb_remove_gamma_rgb(mut rgb: cb_rgb) -> cb_rgb"
         );
-        assert_eq!(record.baseline.transform_labels(), [0, 1]);
+        assert_eq!(record.baseline.transform_labels(), [1]);
         let generated_labels = labels(&record.baseline.skeleton);
         assert_eq!(generated_labels, [0, 1, 2, 3]);
         let [result_label, init_label, init_tail_label, result_tail_label] = generated_labels[..]
@@ -4511,12 +4511,69 @@ pub unsafe fn mixed(mut p: *mut i32, flag: bool, y: i32, z: i32) -> i32 {
     let records = generate(source);
     let function = function(&records, "mixed");
     assert!(function.baseline.needs_transformation);
-    assert_eq!(function.baseline.transform_labels(), [0, 2]);
+    assert_eq!(function.baseline.transform_labels(), [2]);
+    assert_eq!(
+        function.baseline.statement_dispositions[0].disposition,
+        crate::StatementDispositionKind::PreserveShell
+    );
     let skeleton = compact(&function.baseline.skeleton);
-    assert!(skeleton.contains("if todo!()"));
+    assert!(skeleton.contains("if flag"));
     assert!(skeleton.contains("y + z"));
     assert!(skeleton.contains("y - z"));
     assert!(skeleton.contains("return difference"));
+}
+
+#[test]
+fn safe_if_and_while_shells_do_not_become_holes_for_transforming_bodies() {
+    let source = r#"
+pub unsafe fn controls(mut count: usize, flag: bool, pointer: *mut i32) {
+    if flag {
+        *pointer = 1;
+    }
+    while count > 0 {
+        *pointer = 2;
+        count -= 1;
+    }
+}
+"#;
+    let records = generate(source);
+    let function = function(&records, "controls");
+    let skeleton = compact(&function.baseline.skeleton);
+
+    assert!(skeleton.contains("if flag"), "{skeleton}");
+    assert!(skeleton.contains("while count > 0"), "{skeleton}");
+    assert!(!skeleton.contains("if todo!()"), "{skeleton}");
+    assert!(!skeleton.contains("while todo!()"), "{skeleton}");
+    assert_eq!(function.baseline.transform_labels(), [1, 3]);
+    assert_eq!(
+        function.baseline.statement_dispositions[0].disposition,
+        crate::StatementDispositionKind::PreserveShell
+    );
+    assert_eq!(
+        function.baseline.statement_dispositions[1].disposition,
+        crate::StatementDispositionKind::PreserveShell
+    );
+}
+
+#[test]
+fn sensitive_control_operands_remain_transformable() {
+    let source = r#"
+pub unsafe fn sensitive(mut pointer: *mut i32) {
+    if pointer.is_null() {
+        return;
+    }
+    while *pointer > 0 {
+        return;
+    }
+}
+"#;
+    let records = generate(source);
+    let function = function(&records, "sensitive");
+    let skeleton = compact(&function.baseline.skeleton);
+
+    assert!(skeleton.contains("if todo!()"), "{skeleton}");
+    assert!(skeleton.contains("while todo!()"), "{skeleton}");
+    assert_eq!(function.baseline.transform_labels(), [0, 2]);
 }
 
 #[test]
@@ -4732,12 +4789,14 @@ pub unsafe fn observe(pointer: *mut i32) -> bool {
         );
         decisions.bindings.insert(parameter_hir, PtrKind::Ref(true));
         let overrides = PreservationDecisionOverrides::default();
+        let excluded_roots = FxHashSet::default();
         let checker = HirPreservationCheck {
             tcx,
             decisions: &decisions,
             preservation_overrides: &overrides,
             owner: parameter_hir.owner,
             direct_callee: None,
+            excluded_roots: &excluded_roots,
             preservable: true,
             sensitive_types: FxHashMap::default(),
             visiting_types: FxHashSet::default(),
@@ -4779,12 +4838,14 @@ pub unsafe fn generic_values(
             tcx,
         );
         let overrides = PreservationDecisionOverrides::default();
+        let excluded_roots = FxHashSet::default();
         let mut checker = HirPreservationCheck {
             tcx,
             decisions: &decisions,
             preservation_overrides: &overrides,
             owner: hir::OwnerId { def_id: owner },
             direct_callee: None,
+            excluded_roots: &excluded_roots,
             preservable: true,
             sensitive_types: FxHashMap::default(),
             visiting_types: FxHashSet::default(),
@@ -4818,12 +4879,14 @@ pub unsafe fn projection<T: HasItem>(value: T::Item) { let _ = value; }
             tcx,
         );
         let overrides = PreservationDecisionOverrides::default();
+        let excluded_roots = FxHashSet::default();
         let mut checker = HirPreservationCheck {
             tcx,
             decisions: &decisions,
             preservation_overrides: &overrides,
             owner: hir::OwnerId { def_id: owner },
             direct_callee: None,
+            excluded_roots: &excluded_roots,
             preservable: true,
             sensitive_types: FxHashMap::default(),
             visiting_types: FxHashSet::default(),
@@ -5014,7 +5077,7 @@ fn exact_patterns_control_and_unsafe_storage_matrix() {
     );
     assert_eq!(
         function(&patterns, "patterns").baseline.transform_labels(),
-        [1, 3, 6]
+        [1, 6]
     );
 
     let safe_control = generate(
@@ -5106,7 +5169,7 @@ fn exact_validator_fixture_has_recursive_parent_disposition() {
         function(&records, "validate_me")
             .baseline
             .transform_labels(),
-        [1, 3]
+        [3]
     );
 }
 
@@ -5349,7 +5412,7 @@ fn deduplicates_by_binding_identity_in_first_occurrence_order() {
 fn before_statement_is_the_complete_prompt_facing_source_subtree() {
     let records = generate(
         r#"pub unsafe fn choose(mut pointer: *mut i32, mut flag: bool) -> i32 {
-            if flag {
+            if !pointer.is_null() && flag {
                 *pointer += 1;
                 *pointer
             } else {
@@ -5362,11 +5425,15 @@ fn before_statement_is_the_complete_prompt_facing_source_subtree() {
         .baseline
         .statement_pair_metadata
         .iter()
-        .find(|entry| entry.before_statement.contains("if flag"))
+        .find(|entry| {
+            entry
+                .before_statement
+                .contains("if !pointer.is_null() && flag")
+        })
         .unwrap();
     assert_eq!(
         parent.before_statement,
-        "#[proctor(0)]\nif flag {\n\n    #[proctor(1)]\n    (*pointer += 1);\n\n    \
+        "#[proctor(0)]\nif !pointer.is_null() && flag {\n\n    #[proctor(1)]\n    (*pointer += 1);\n\n    \
          #[proctor(2)]\n    *pointer\n} else {\n\n    #[proctor(3)]\n    0\n}"
     );
     assert_eq!(
@@ -6339,7 +6406,7 @@ pub unsafe fn mixed(p: *mut i32, flag: bool) -> bool {
             .clone();
         let opaque_nested_ifs = collect_opaque_nested_ifs(&item, "mixed").unwrap();
         annotate_function(&mut item, &opaque_nested_ifs);
-        let transformed = classify_function_statements(
+        let classification = classify_function_statements(
             &item,
             &opaque_nested_ifs,
             &ast_to_hir,
@@ -6347,7 +6414,7 @@ pub unsafe fn mixed(p: *mut i32, flag: bool) -> bool {
             &PreservationDecisionOverrides::default(),
             tcx,
         );
-        assert_eq!(transformed, BTreeSet::from([0, 1]));
+        assert_eq!(classification.transformed, BTreeSet::from([0, 1]));
 
         let catalog = rule_binding_catalog(&item, function, &decisions, &ast_to_hir, tcx);
         let ItemKind::Fn(box body) = &item.kind else { unreachable!() };
@@ -6375,7 +6442,7 @@ pub unsafe fn mixed(p: *mut i32, flag: bool) -> bool {
         let applied = apply_rule_set(
             &item,
             &mut target,
-            &transformed,
+            &classification.transformed,
             &rules,
             function,
             &decisions,

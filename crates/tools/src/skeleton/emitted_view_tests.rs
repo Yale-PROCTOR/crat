@@ -276,6 +276,59 @@ pub unsafe fn update(p: *mut i32) {
 }
 
 #[test]
+fn rule_complete_match_keeps_safe_scrutinee_without_llm_work() {
+    let source = r#"
+#[derive(Clone, Copy)]
+pub enum Mode { Left, Right }
+
+pub unsafe fn update(mode: Mode, p: *mut i32) {
+    match mode {
+        Mode::Left => { *p = 1; }
+        Mode::Right => { *p = 2; }
+    }
+}
+"#;
+    run_compiler_on_str(source, |tcx| {
+        let left = rule_for_region(
+            source,
+            "update",
+            1,
+            |region| region.observation.lhs,
+            RuleTarget::KeepSource,
+            tcx,
+        );
+        let right = rule_for_region(
+            source,
+            "update",
+            2,
+            |region| region.observation.lhs,
+            RuleTarget::KeepSource,
+            tcx,
+        );
+        let rules = merge_rules([left, right]);
+        let records = make_skeletons_with_rules(source, Some(&rules), tcx).unwrap();
+        let record = function_record(&records, "update");
+
+        assert!(!record.applied.needs_transformation);
+        assert_eq!(
+            record.applied.statement_dispositions[0].disposition,
+            crate::StatementDispositionKind::PreserveShell
+        );
+        assert!(
+            record.applied.skeleton.contains("match mode"),
+            "{}",
+            record.applied.skeleton
+        );
+        assert!(
+            !record.applied.skeleton.contains("match todo!()"),
+            "{}",
+            record.applied.skeleton
+        );
+    })
+    .unwrap();
+}
+
+#[test]
 fn partial_parent_coverage_keeps_its_baseline_payload_while_child_applies() {
     let source = r#"
 pub unsafe fn update(p: *mut i32, q: *mut i32, r: *mut i32) {
