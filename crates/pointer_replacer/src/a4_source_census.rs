@@ -12,13 +12,14 @@ use std::{
     time::{Duration, Instant},
 };
 
+use rustc_const_eval::interpret::{GlobalAlloc, Scalar};
 use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_middle::{
     mir::{
-        AggregateKind, Body, Local, Location, Operand, Place, PlaceRef, ProjectionElem,
-        RETURN_PLACE, Rvalue, StatementKind, Terminator, TerminatorKind,
+        AggregateKind, Body, Const, ConstValue, Local, Location, Operand, Place, PlaceRef,
+        ProjectionElem, RETURN_PLACE, Rvalue, StatementKind, Terminator, TerminatorKind,
     },
-    ty::{TyCtxt, TyKind},
+    ty::{TyCtxt, TyKind, UintTy},
 };
 use rustc_span::{
     def_id::{DefId, LocalDefId},
@@ -310,6 +311,9 @@ fn parse_cause_flag(value: &str) -> Result<CauseFlag, String> {
 }
 
 fn parse_provenance_tag(value: &str) -> Result<String, String> {
+    if value == "string-literal-root" {
+        return Ok(value.to_owned());
+    }
     let Some(target) = value
         .strip_prefix("indirect-resolved-target(")
         .and_then(|value| value.strip_suffix(')'))
@@ -326,7 +330,7 @@ fn parse_root_evidence(value: &str) -> Result<RootEvidence, String> {
     let mut flags = BTreeSet::new();
     let mut provenance_tags = BTreeSet::new();
     for token in value.split('|') {
-        if token.starts_with("indirect-resolved-target(") {
+        if token == "string-literal-root" || token.starts_with("indirect-resolved-target(") {
             provenance_tags.insert(parse_provenance_tag(token)?);
         } else {
             flags.insert(parse_cause_flag(token)?);
@@ -608,16 +612,47 @@ fn pointer_constant_terminal(is_literal_zero: bool) -> TerminalKind {
     }
 }
 
-fn constant_terminal(operand: &Operand<'_>) -> TerminalKind {
+fn is_byte_string_static_constant(tcx: TyCtxt<'_>, operand: &Operand<'_>) -> bool {
     let Some(constant) = operand.constant() else {
-        return TerminalKind::Unsupported;
+        return false;
+    };
+    let Const::Val(ConstValue::Scalar(Scalar::Ptr(pointer, _)), ty) = constant.const_ else {
+        return false;
+    };
+    let TyKind::Ref(_, pointee, _) = ty.kind() else {
+        return false;
+    };
+    let TyKind::Array(element, _) = pointee.kind() else {
+        return false;
+    };
+    if !matches!(element.kind(), TyKind::Uint(UintTy::U8)) {
+        return false;
+    }
+    matches!(
+        tcx.try_get_global_alloc(pointer.provenance.alloc_id()),
+        Some(GlobalAlloc::Memory(_) | GlobalAlloc::Static(_))
+    )
+}
+
+fn constant_root(tcx: TyCtxt<'_>, operand: &Operand<'_>) -> (TerminalKind, BTreeSet<String>) {
+    let Some(constant) = operand.constant() else {
+        return (TerminalKind::Unsupported, BTreeSet::new());
     };
     let is_literal_zero = constant
         .const_
         .try_to_scalar()
         .and_then(|scalar| scalar.try_to_scalar_int().ok())
         .is_some_and(|value| value.to_bits(value.size()) == 0);
-    pointer_constant_terminal(is_literal_zero)
+    if is_literal_zero {
+        (TerminalKind::NullLiteral, BTreeSet::new())
+    } else if is_byte_string_static_constant(tcx, operand) {
+        (
+            TerminalKind::StaticOrInterior,
+            BTreeSet::from(["string-literal-root".to_owned()]),
+        )
+    } else {
+        (TerminalKind::Unsupported, BTreeSet::new())
+    }
 }
 
 fn edge_kind(source: &str, target: &str) -> FlowEdgeKind {
@@ -1092,12 +1127,14 @@ fn build_source_graph(tcx: TyCtxt<'_>, slots: &CrateSlots, export: &BoExport) ->
                         if let Some(source) = node_for_operand(tcx, slots, fn_did, body, operand) {
                             add_value_edge(&mut graph, Some(source), target, label);
                         } else {
-                            add_terminal(
+                            let (terminal, provenance_tags) = constant_root(tcx, operand);
+                            add_terminal_with_tags(
                                 &mut graph,
                                 target,
-                                constant_terminal(operand),
+                                terminal,
                                 format!("constant-{label}"),
                                 false,
+                                provenance_tags,
                             );
                         }
                     }
@@ -1110,8 +1147,8 @@ fn build_source_graph(tcx: TyCtxt<'_>, slots: &CrateSlots, export: &BoExport) ->
                 match rvalue {
                     Rvalue::Use(operand @ Operand::Constant(_))
                     | Rvalue::Cast(_, operand @ Operand::Constant(_), _) => {
-                        let terminal = constant_terminal(operand);
-                        add_terminal(
+                        let (terminal, provenance_tags) = constant_root(tcx, operand);
+                        add_terminal_with_tags(
                             &mut graph,
                             target,
                             terminal,
@@ -1119,11 +1156,14 @@ fn build_source_graph(tcx: TyCtxt<'_>, slots: &CrateSlots, export: &BoExport) ->
                                 "{}:{location}",
                                 if terminal == TerminalKind::NullLiteral {
                                     "null-literal"
+                                } else if terminal == TerminalKind::StaticOrInterior {
+                                    "string-literal"
                                 } else {
                                     "constant-pointer"
                                 }
                             ),
                             false,
+                            provenance_tags,
                         );
                     }
                     Rvalue::Use(operand) | Rvalue::Cast(_, operand, _) => add_value_edge(
@@ -2349,19 +2389,36 @@ const RAW_CORPUS_DIGEST: &str = "9fc912af10fd3b235fe4d444d2fbac0bc521509b1c9447f
 const DERIVED_SUBSTRATE_DIGEST: &str =
     "db96829b5c2b0db28fb4bb9ddd3d32901b5d4e6e4134da07ada0d513d94eb4c6";
 const SNAPSHOT_PATH: &str = "/home/p51lee/dev/agent-worktrees/m1-artifact-snapshots/3b26a0ff";
-const RETRY3_PREDECESSOR_HEAD: &str = "ce11b3459c6fa46965e4cbe23ce11dffbdc7bf01";
-const RETRY3_PREDECESSOR_SHARDS: [(&str, &str); 3] = [
+const RETRY3_PREDECESSOR_SHARDS: [(&str, &str, &str); 6] = [
     (
         "bst",
+        "ce11b3459c6fa46965e4cbe23ce11dffbdc7bf01",
         "f9c23eddb3b9da283a2ebf82a4839f9f0e28c4d535f69923d38531ad397b90dd",
     ),
     (
         "avl",
+        "ce11b3459c6fa46965e4cbe23ce11dffbdc7bf01",
         "fa50b850af80fa56893fbcd1c2c6c7b57df5107df2ba661b0452ef63a41bac82",
     ),
     (
         "ht",
+        "ce11b3459c6fa46965e4cbe23ce11dffbdc7bf01",
         "01a6483456126ee0621cb133a009fae49edc768dda577ddb83c8d6ed27f4c72c",
+    ),
+    (
+        "libcsv",
+        "efd8e51df8f8ce5ba4edd2655f8b5b5bc9c0c6b8",
+        "b56635fec4f001702a2cb84ba2d1af63f2c5bba2bb20db695c0d7cf6471459b3",
+    ),
+    (
+        "buffer",
+        "efd8e51df8f8ce5ba4edd2655f8b5b5bc9c0c6b8",
+        "14c3c43e78d2e6818b2261e6e7738e7fe38065528a0c0ee4b6f639050f008286",
+    ),
+    (
+        "quadtree",
+        "efd8e51df8f8ce5ba4edd2655f8b5b5bc9c0c6b8",
+        "fe04dddb4495ad0824bab4a2756aa829c4d12c1cab29b99e5a6de44641cadc4a",
     ),
 ];
 
@@ -2653,12 +2710,13 @@ fn validate_receipt_head(
     if receipt_head == current_head {
         return Ok(());
     }
-    if receipt_head == RETRY3_PREDECESSOR_HEAD
-        && RETRY3_PREDECESSOR_SHARDS
-            .iter()
-            .any(|(allowed_program, allowed_manifest)| {
-                program == *allowed_program && manifest == *allowed_manifest
-            })
+    if RETRY3_PREDECESSOR_SHARDS
+        .iter()
+        .any(|(allowed_program, allowed_head, allowed_manifest)| {
+            program == *allowed_program
+                && receipt_head == *allowed_head
+                && manifest == *allowed_manifest
+        })
     {
         return Ok(());
     }
@@ -3921,12 +3979,100 @@ mod tests {
             Ok(CauseFlag::NullLiteralRoot)
         );
         assert!(parse_cause_flag("analyst-judgment").is_err());
+        assert_eq!(
+            parse_provenance_tag("string-literal-root"),
+            Ok("string-literal-root".to_owned())
+        );
+        assert_eq!(
+            parse_root_evidence("static-or-interior-root|string-literal-root"),
+            Ok(RootEvidence {
+                flags: BTreeSet::from([CauseFlag::StaticOrInteriorRoot]),
+                provenance_tags: BTreeSet::from(["string-literal-root".to_owned()]),
+            })
+        );
     }
 
     #[test]
     fn null_literal_is_distinct_from_other_pointer_constants() {
         assert_eq!(pointer_constant_terminal(true), TerminalKind::NullLiteral);
         assert_eq!(pointer_constant_terminal(false), TerminalKind::Unsupported);
+    }
+
+    #[test]
+    fn byte_string_constant_is_absent_but_integer_pointer_stops() {
+        let source = r#"
+            unsafe fn byte_string_root() -> *mut i8 {
+                b"fixture\0" as *const u8 as *mut i8
+            }
+            unsafe fn integer_pointer_root() -> *mut i8 {
+                1usize as *mut i8
+            }
+        "#;
+        ::utils::compilation::run_compiler_on_str(source, |tcx| {
+            let program = super::super::collect_program(tcx);
+            let roots_for = |suffix: &str| {
+                program
+                    .functions
+                    .iter()
+                    .copied()
+                    .filter(|function| tcx.def_path_str(*function).ends_with(suffix))
+                    .flat_map(|function| {
+                        let body_ref = tcx
+                            .mir_drops_elaborated_and_const_checked(function)
+                            .borrow();
+                        let body = &*body_ref;
+                        body.basic_blocks
+                            .iter()
+                            .flat_map(|data| data.statements.iter())
+                            .filter_map(|statement| {
+                                let StatementKind::Assign(box (_, rvalue)) = &statement.kind else {
+                                    return None;
+                                };
+                                let operand = match rvalue {
+                                    Rvalue::Use(operand @ Operand::Constant(_))
+                                    | Rvalue::Cast(_, operand @ Operand::Constant(_), _) => operand,
+                                    _ => return None,
+                                };
+                                Some(constant_root(tcx, operand))
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                    .collect::<Vec<_>>()
+            };
+
+            let byte_string = roots_for("byte_string_root");
+            assert_eq!(
+                byte_string,
+                vec![(
+                    TerminalKind::StaticOrInterior,
+                    BTreeSet::from(["string-literal-root".to_owned()]),
+                )]
+            );
+            assert_eq!(
+                flags_for_path(SyntheticPath {
+                    terminal: byte_string[0].0,
+                    crosses_call: false,
+                    crosses_field: false,
+                    realloc: false,
+                    same_function_scanner_gap: false,
+                }),
+                BTreeSet::from([CauseFlag::StaticOrInteriorRoot])
+            );
+            assert_eq!(
+                classify_roots(&[RootEvidence {
+                    flags: BTreeSet::from([CauseFlag::StaticOrInteriorRoot]),
+                    provenance_tags: byte_string[0].1.clone(),
+                }]),
+                PrimaryClass::Absent
+            );
+
+            assert_eq!(
+                roots_for("integer_pointer_root"),
+                vec![(TerminalKind::Unsupported, BTreeSet::new())],
+                "a nonzero integer-to-pointer constant must remain a STOP root"
+            );
+        })
+        .unwrap_or_else(|error| error.raise());
     }
 
     #[test]
@@ -4371,25 +4517,13 @@ mod tests {
     #[test]
     fn verified_skip_predecessor_is_exactly_manifest_pinned() {
         let current = "new-head";
-        assert!(
-            validate_receipt_head(
-                "bst",
-                "ce11b3459c6fa46965e4cbe23ce11dffbdc7bf01",
-                "f9c23eddb3b9da283a2ebf82a4839f9f0e28c4d535f69923d38531ad397b90dd",
-                current,
-            )
-            .is_ok()
-        );
+        for &(program, head, manifest) in &RETRY3_PREDECESSOR_SHARDS {
+            assert!(validate_receipt_head(program, head, manifest, current).is_ok());
+            assert!(validate_receipt_head("wrong-program", head, manifest, current).is_err());
+            assert!(validate_receipt_head(program, "wrong-head", manifest, current).is_err());
+            assert!(validate_receipt_head(program, head, "wrong-manifest", current).is_err());
+        }
         assert!(validate_receipt_head("bst", current, "any-current-manifest", current).is_ok());
-        assert!(
-            validate_receipt_head(
-                "bst",
-                "ce11b3459c6fa46965e4cbe23ce11dffbdc7bf01",
-                "wrong-manifest",
-                current,
-            )
-            .is_err()
-        );
         assert!(
             validate_receipt_head(
                 "libcsv",
