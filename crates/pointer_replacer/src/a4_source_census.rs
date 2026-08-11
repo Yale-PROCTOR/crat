@@ -311,7 +311,10 @@ fn parse_cause_flag(value: &str) -> Result<CauseFlag, String> {
 }
 
 fn parse_provenance_tag(value: &str) -> Result<String, String> {
-    if value == "string-literal-root" {
+    if matches!(
+        value,
+        "string-literal-root" | "external-parameter-pointee-load"
+    ) {
         return Ok(value.to_owned());
     }
     let Some(target) = value
@@ -330,7 +333,11 @@ fn parse_root_evidence(value: &str) -> Result<RootEvidence, String> {
     let mut flags = BTreeSet::new();
     let mut provenance_tags = BTreeSet::new();
     for token in value.split('|') {
-        if token == "string-literal-root" || token.starts_with("indirect-resolved-target(") {
+        if matches!(
+            token,
+            "string-literal-root" | "external-parameter-pointee-load"
+        ) || token.starts_with("indirect-resolved-target(")
+        {
             provenance_tags.insert(parse_provenance_tag(token)?);
         } else {
             flags.insert(parse_cause_flag(token)?);
@@ -585,7 +592,18 @@ fn node_for_place<'tcx>(
     body: &Body<'tcx>,
     place: Place<'tcx>,
 ) -> Option<String> {
-    resolve_place(slots, fn_did, body, place, 0, None)
+    node_for_place_depth(tcx, slots, fn_did, body, place, 0)
+}
+
+fn node_for_place_depth<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    slots: &CrateSlots,
+    fn_did: LocalDefId,
+    body: &Body<'tcx>,
+    place: Place<'tcx>,
+    depth: u8,
+) -> Option<String> {
+    resolve_place(slots, fn_did, body, place, depth, None)
         .map(|resolved| node_for_resolved(tcx, slots, fn_did, resolved))
 }
 
@@ -673,6 +691,79 @@ fn add_value_edge(graph: &mut SourceGraph, source: Option<String>, target: Strin
             provenance_tags: BTreeSet::new(),
         });
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn add_nested_exact_type_place_edges<'tcx>(
+    graph: &mut SourceGraph,
+    tcx: TyCtxt<'tcx>,
+    slots: &CrateSlots,
+    source_fn: LocalDefId,
+    source_body: &Body<'tcx>,
+    source_place: Place<'tcx>,
+    target_fn: LocalDefId,
+    target_body: &Body<'tcx>,
+    target_place: Place<'tcx>,
+    fixed_kind: Option<FlowEdgeKind>,
+    label: &str,
+    provenance_tags: &BTreeSet<String>,
+) {
+    if source_place.ty(source_body, tcx).ty != target_place.ty(target_body, tcx).ty {
+        return;
+    }
+    for depth in 1..=u8::MAX {
+        let Some(source) =
+            node_for_place_depth(tcx, slots, source_fn, source_body, source_place, depth)
+        else {
+            break;
+        };
+        let Some(target) =
+            node_for_place_depth(tcx, slots, target_fn, target_body, target_place, depth)
+        else {
+            break;
+        };
+        graph.add_edge(FlowEdge {
+            kind: fixed_kind.unwrap_or_else(|| edge_kind(&source, &target)),
+            source,
+            target,
+            label: format!("{label}:depth{depth}"),
+            provenance_tags: provenance_tags.clone(),
+        });
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn add_nested_exact_type_operand_edges<'tcx>(
+    graph: &mut SourceGraph,
+    tcx: TyCtxt<'tcx>,
+    slots: &CrateSlots,
+    source_fn: LocalDefId,
+    source_body: &Body<'tcx>,
+    source_operand: &Operand<'tcx>,
+    target_fn: LocalDefId,
+    target_body: &Body<'tcx>,
+    target_place: Place<'tcx>,
+    fixed_kind: Option<FlowEdgeKind>,
+    label: &str,
+    provenance_tags: &BTreeSet<String>,
+) {
+    let (Operand::Copy(source_place) | Operand::Move(source_place)) = source_operand else {
+        return;
+    };
+    add_nested_exact_type_place_edges(
+        graph,
+        tcx,
+        slots,
+        source_fn,
+        source_body,
+        *source_place,
+        target_fn,
+        target_body,
+        target_place,
+        fixed_kind,
+        label,
+        provenance_tags,
+    );
 }
 
 fn add_indirect_value_edge(
@@ -1076,6 +1167,10 @@ fn harness_call<'call, 'tcx>(
     }
 }
 
+fn parameter_has_external_remainder(public: bool, receives_in_crate_arguments: bool) -> bool {
+    public || !receives_in_crate_arguments
+}
+
 fn build_source_graph(tcx: TyCtxt<'_>, slots: &CrateSlots, export: &BoExport) -> SourceGraph {
     use crate::analyses::borrow_ownership::boundary_table::Role;
 
@@ -1084,7 +1179,8 @@ fn build_source_graph(tcx: TyCtxt<'_>, slots: &CrateSlots, export: &BoExport) ->
     let visible_indirect_targets = collect_visible_indirect_targets(tcx, &program.functions);
     let mut graph = SourceGraph::default();
     let mut parameter_nodes = Vec::<(LocalDefId, Local, String)>::new();
-    let mut called_parameters = BTreeSet::<String>::new();
+    let mut nested_parameter_nodes = Vec::<(LocalDefId, Local, u8, String)>::new();
+    let mut called_parameters = FxHashSet::<(LocalDefId, usize)>::default();
 
     for &fn_did in &program.functions {
         let body_ref = tcx.mir_drops_elaborated_and_const_checked(fn_did).borrow();
@@ -1092,6 +1188,14 @@ fn build_source_graph(tcx: TyCtxt<'_>, slots: &CrateSlots, export: &BoExport) ->
         for local in body.args_iter() {
             if let Some(node) = node_for_place(tcx, slots, fn_did, body, Place::from(local)) {
                 parameter_nodes.push((fn_did, local, node));
+            }
+            for depth in 1..=u8::MAX {
+                let Some(node) =
+                    node_for_place_depth(tcx, slots, fn_did, body, Place::from(local), depth)
+                else {
+                    break;
+                };
+                nested_parameter_nodes.push((fn_did, local, depth, node));
             }
         }
 
@@ -1166,7 +1270,29 @@ fn build_source_graph(tcx: TyCtxt<'_>, slots: &CrateSlots, export: &BoExport) ->
                             provenance_tags,
                         );
                     }
-                    Rvalue::Use(operand) | Rvalue::Cast(_, operand, _) => add_value_edge(
+                    Rvalue::Use(operand) => {
+                        add_value_edge(
+                            &mut graph,
+                            node_for_operand(tcx, slots, fn_did, body, operand),
+                            target,
+                            format!("transfer:{location}"),
+                        );
+                        add_nested_exact_type_operand_edges(
+                            &mut graph,
+                            tcx,
+                            slots,
+                            fn_did,
+                            body,
+                            operand,
+                            fn_did,
+                            body,
+                            *lhs,
+                            None,
+                            &format!("depth-transfer:{location}"),
+                            &BTreeSet::new(),
+                        );
+                    }
+                    Rvalue::Cast(_, operand, _) => add_value_edge(
                         &mut graph,
                         node_for_operand(tcx, slots, fn_did, body, operand),
                         target,
@@ -1248,21 +1374,50 @@ fn build_source_graph(tcx: TyCtxt<'_>, slots: &CrateSlots, export: &BoExport) ->
                         else {
                             continue;
                         };
+                        called_parameters.insert((callee, parameter.index()));
                         if let Some(source) =
                             node_for_operand(tcx, slots, fn_did, body, &argument.node)
                         {
-                            called_parameters.insert(target.clone());
+                            let label = format!(
+                                "call-arg:{call_location}->{}:arg{}",
+                                tcx.def_path_str(callee),
+                                index + 1
+                            );
                             graph.add_edge(FlowEdge {
                                 source,
                                 target,
                                 kind: FlowEdgeKind::Call,
-                                label: format!(
-                                    "call-arg:{call_location}->{}:arg{}",
+                                label: label.clone(),
+                                provenance_tags: BTreeSet::new(),
+                            });
+                            add_nested_exact_type_operand_edges(
+                                &mut graph,
+                                tcx,
+                                slots,
+                                fn_did,
+                                body,
+                                &argument.node,
+                                callee,
+                                callee_body,
+                                Place::from(parameter),
+                                Some(FlowEdgeKind::Call),
+                                &label,
+                                &BTreeSet::new(),
+                            );
+                        } else if matches!(&argument.node, Operand::Constant(_)) {
+                            let (terminal, provenance_tags) = constant_root(tcx, &argument.node);
+                            add_terminal_with_tags(
+                                &mut graph,
+                                target,
+                                terminal,
+                                format!(
+                                    "constant-call-arg:{call_location}->{}:arg{}",
                                     tcx.def_path_str(callee),
                                     index + 1
                                 ),
-                                provenance_tags: BTreeSet::new(),
-                            });
+                                false,
+                                provenance_tags,
+                            );
                         }
                     }
                     if let Some(target) = destination
@@ -1276,7 +1431,7 @@ fn build_source_graph(tcx: TyCtxt<'_>, slots: &CrateSlots, export: &BoExport) ->
                     {
                         graph.add_edge(FlowEdge {
                             source,
-                            target,
+                            target: target.clone(),
                             kind: FlowEdgeKind::Call,
                             label: format!(
                                 "call-return:{}->{call_location}",
@@ -1284,6 +1439,20 @@ fn build_source_graph(tcx: TyCtxt<'_>, slots: &CrateSlots, export: &BoExport) ->
                             ),
                             provenance_tags: BTreeSet::new(),
                         });
+                        add_nested_exact_type_place_edges(
+                            &mut graph,
+                            tcx,
+                            slots,
+                            callee,
+                            callee_body,
+                            Place::from(RETURN_PLACE),
+                            fn_did,
+                            body,
+                            call.destination,
+                            Some(FlowEdgeKind::Call),
+                            &format!("call-return:{}->{call_location}", tcx.def_path_str(callee)),
+                            &BTreeSet::new(),
+                        );
                     }
                 }
                 HarnessCallKind::Local(callee) => {
@@ -1328,14 +1497,31 @@ fn build_source_graph(tcx: TyCtxt<'_>, slots: &CrateSlots, export: &BoExport) ->
                                 Role::ProvenanceFlow | Role::LoanCreating | Role::FlowTransfer
                             )
                         }) {
+                            let label = format!("foreign-flow:{call_location}:{name}");
                             add_value_edge(
                                 &mut graph,
                                 call.args.first().and_then(|arg| {
                                     node_for_operand(tcx, slots, fn_did, body, &arg.node)
                                 }),
                                 target,
-                                format!("foreign-flow:{call_location}:{name}"),
+                                label.clone(),
                             );
+                            if let Some(argument) = call.args.first() {
+                                add_nested_exact_type_operand_edges(
+                                    &mut graph,
+                                    tcx,
+                                    slots,
+                                    fn_did,
+                                    body,
+                                    &argument.node,
+                                    fn_did,
+                                    body,
+                                    call.destination,
+                                    None,
+                                    &label,
+                                    &BTreeSet::new(),
+                                );
+                            }
                         } else {
                             add_terminal(
                                 &mut graph,
@@ -1356,14 +1542,31 @@ fn build_source_graph(tcx: TyCtxt<'_>, slots: &CrateSlots, export: &BoExport) ->
                             .iter()
                             .any(|role| matches!(role, Role::ProvenanceFlow | Role::LoanCreating))
                         {
+                            let label = format!("rust-flow:{call_location}:{name}");
                             add_value_edge(
                                 &mut graph,
                                 call.args.first().and_then(|arg| {
                                     node_for_operand(tcx, slots, fn_did, body, &arg.node)
                                 }),
                                 target,
-                                format!("rust-flow:{call_location}:{name}"),
+                                label.clone(),
                             );
+                            if let Some(argument) = call.args.first() {
+                                add_nested_exact_type_operand_edges(
+                                    &mut graph,
+                                    tcx,
+                                    slots,
+                                    fn_did,
+                                    body,
+                                    &argument.node,
+                                    fn_did,
+                                    body,
+                                    call.destination,
+                                    None,
+                                    &label,
+                                    &BTreeSet::new(),
+                                );
+                            }
                         } else if roles.contains(&Role::NullConstructor) {
                             add_terminal(
                                 &mut graph,
@@ -1425,22 +1628,68 @@ fn build_source_graph(tcx: TyCtxt<'_>, slots: &CrateSlots, export: &BoExport) ->
                                     ) else {
                                         continue;
                                     };
+                                    called_parameters.insert((callee, parameter.index()));
                                     if let Some(source) =
                                         node_for_operand(tcx, slots, fn_did, body, &argument.node)
                                     {
-                                        called_parameters.insert(parameter_target.clone());
+                                        let label = format!(
+                                            "indirect-call-arg:{call_location}->{canonical_path}:arg{}",
+                                            index + 1
+                                        );
                                         graph.add_edge(FlowEdge {
                                             source,
                                             target: parameter_target,
                                             kind: FlowEdgeKind::Call,
-                                            label: format!(
-                                                "indirect-call-arg:{call_location}->{canonical_path}:arg{}",
-                                                index + 1
-                                            ),
+                                            label: label.clone(),
                                             provenance_tags: BTreeSet::new(),
                                         });
+                                        add_nested_exact_type_operand_edges(
+                                            &mut graph,
+                                            tcx,
+                                            slots,
+                                            fn_did,
+                                            body,
+                                            &argument.node,
+                                            callee,
+                                            callee_body,
+                                            Place::from(parameter),
+                                            Some(FlowEdgeKind::Call),
+                                            &label,
+                                            &BTreeSet::new(),
+                                        );
+                                    } else if matches!(&argument.node, Operand::Constant(_)) {
+                                        let (terminal, mut constant_tags) =
+                                            constant_root(tcx, &argument.node);
+                                        constant_tags.extend(provenance_tags.iter().cloned());
+                                        add_terminal_with_tags(
+                                            &mut graph,
+                                            parameter_target,
+                                            terminal,
+                                            format!(
+                                                "constant-indirect-call-arg:{call_location}->{canonical_path}:arg{}",
+                                                index + 1
+                                            ),
+                                            false,
+                                            constant_tags,
+                                        );
                                     }
                                 }
+                                add_nested_exact_type_place_edges(
+                                    &mut graph,
+                                    tcx,
+                                    slots,
+                                    callee,
+                                    callee_body,
+                                    Place::from(RETURN_PLACE),
+                                    fn_did,
+                                    body,
+                                    call.destination,
+                                    Some(FlowEdgeKind::Call),
+                                    &format!(
+                                        "indirect-call-return:{canonical_path}->{call_location}"
+                                    ),
+                                    &provenance_tags,
+                                );
                                 add_indirect_value_edge(
                                     &mut graph,
                                     node_for_place(
@@ -1497,13 +1746,30 @@ fn build_source_graph(tcx: TyCtxt<'_>, slots: &CrateSlots, export: &BoExport) ->
                                     let source = call.args.first().and_then(|arg| {
                                         node_for_operand(tcx, slots, fn_did, body, &arg.node)
                                     });
+                                    let label = format!(
+                                        "indirect-foreign-flow:{call_location}:{canonical_path}"
+                                    );
+                                    if let Some(argument) = call.args.first() {
+                                        add_nested_exact_type_operand_edges(
+                                            &mut graph,
+                                            tcx,
+                                            slots,
+                                            fn_did,
+                                            body,
+                                            &argument.node,
+                                            fn_did,
+                                            body,
+                                            call.destination,
+                                            None,
+                                            &label,
+                                            &provenance_tags,
+                                        );
+                                    }
                                     add_indirect_value_edge(
                                         &mut graph,
                                         source,
                                         target,
-                                        format!(
-                                            "indirect-foreign-flow:{call_location}:{canonical_path}"
-                                        ),
+                                        label,
                                         provenance_tags,
                                     );
                                 } else {
@@ -1530,13 +1796,30 @@ fn build_source_graph(tcx: TyCtxt<'_>, slots: &CrateSlots, export: &BoExport) ->
                                     let source = call.args.first().and_then(|arg| {
                                         node_for_operand(tcx, slots, fn_did, body, &arg.node)
                                     });
+                                    let label = format!(
+                                        "indirect-rust-flow:{call_location}:{canonical_path}"
+                                    );
+                                    if let Some(argument) = call.args.first() {
+                                        add_nested_exact_type_operand_edges(
+                                            &mut graph,
+                                            tcx,
+                                            slots,
+                                            fn_did,
+                                            body,
+                                            &argument.node,
+                                            fn_did,
+                                            body,
+                                            call.destination,
+                                            None,
+                                            &label,
+                                            &provenance_tags,
+                                        );
+                                    }
                                     add_indirect_value_edge(
                                         &mut graph,
                                         source,
                                         target,
-                                        format!(
-                                            "indirect-rust-flow:{call_location}:{canonical_path}"
-                                        ),
+                                        label,
                                         provenance_tags,
                                     );
                                 } else if roles.contains(&Role::NullConstructor) {
@@ -1575,13 +1858,35 @@ fn build_source_graph(tcx: TyCtxt<'_>, slots: &CrateSlots, export: &BoExport) ->
 
     for (fn_did, local, node) in parameter_nodes {
         let public = tcx.visibility(fn_did.to_def_id()).is_public();
-        if public || !called_parameters.contains(&node) {
+        if parameter_has_external_remainder(
+            public,
+            called_parameters.contains(&(fn_did, local.index())),
+        ) {
             add_terminal(
                 &mut graph,
                 node,
                 TerminalKind::ExternalParameter,
                 format!("external-parameter:{}:{local:?}", tcx.def_path_str(fn_did)),
                 false,
+            );
+        }
+    }
+    for (fn_did, local, depth, node) in nested_parameter_nodes {
+        let public = tcx.visibility(fn_did.to_def_id()).is_public();
+        if parameter_has_external_remainder(
+            public,
+            called_parameters.contains(&(fn_did, local.index())),
+        ) {
+            add_terminal_with_tags(
+                &mut graph,
+                node,
+                TerminalKind::ExternalParameter,
+                format!(
+                    "external-parameter:{}:{local:?}:depth{depth}",
+                    tcx.def_path_str(fn_did)
+                ),
+                false,
+                BTreeSet::from(["external-parameter-pointee-load".to_owned()]),
             );
         }
     }
@@ -2389,7 +2694,7 @@ const RAW_CORPUS_DIGEST: &str = "9fc912af10fd3b235fe4d444d2fbac0bc521509b1c9447f
 const DERIVED_SUBSTRATE_DIGEST: &str =
     "db96829b5c2b0db28fb4bb9ddd3d32901b5d4e6e4134da07ada0d513d94eb4c6";
 const SNAPSHOT_PATH: &str = "/home/p51lee/dev/agent-worktrees/m1-artifact-snapshots/3b26a0ff";
-const RETRY3_PREDECESSOR_SHARDS: [(&str, &str, &str); 6] = [
+const RETRY3_PREDECESSOR_SHARDS: [(&str, &str, &str); 9] = [
     (
         "bst",
         "ce11b3459c6fa46965e4cbe23ce11dffbdc7bf01",
@@ -2419,6 +2724,21 @@ const RETRY3_PREDECESSOR_SHARDS: [(&str, &str, &str); 6] = [
         "quadtree",
         "efd8e51df8f8ce5ba4edd2655f8b5b5bc9c0c6b8",
         "fe04dddb4495ad0824bab4a2756aa829c4d12c1cab29b99e5a6de44641cadc4a",
+    ),
+    (
+        "urlparser",
+        "37b0fd5c043dcae653ff87ca343841cb6f45922a",
+        "4a11d1081783ec4e4c79d57311c8e7affbd3324233b4ba9f83ee9cb3a9d7eec3",
+    ),
+    (
+        "rgba",
+        "37b0fd5c043dcae653ff87ca343841cb6f45922a",
+        "4afdfffa3f05da0ff864be0fa283898200e3e0093ff38e35ee4e7763262d5419",
+    ),
+    (
+        "genann",
+        "37b0fd5c043dcae653ff87ca343841cb6f45922a",
+        "822cebcc9f43707f57e5d87149fbf103884e95be2b6eb0f0152fb58b88c46b53",
     ),
 ];
 
@@ -3969,6 +4289,13 @@ mod tests {
     }
 
     #[test]
+    fn closed_world_parameter_remainder_is_identity_based() {
+        assert!(!parameter_has_external_remainder(false, true));
+        assert!(parameter_has_external_remainder(false, false));
+        assert!(parameter_has_external_remainder(true, true));
+    }
+
+    #[test]
     fn strict_flag_parser_accepts_only_registered_schema() {
         assert_eq!(
             parse_cause_flag("interprocedural-allocation"),
@@ -3984,10 +4311,21 @@ mod tests {
             Ok("string-literal-root".to_owned())
         );
         assert_eq!(
+            parse_provenance_tag("external-parameter-pointee-load"),
+            Ok("external-parameter-pointee-load".to_owned())
+        );
+        assert_eq!(
             parse_root_evidence("static-or-interior-root|string-literal-root"),
             Ok(RootEvidence {
                 flags: BTreeSet::from([CauseFlag::StaticOrInteriorRoot]),
                 provenance_tags: BTreeSet::from(["string-literal-root".to_owned()]),
+            })
+        );
+        assert_eq!(
+            parse_root_evidence("externally-supplied-parameter|external-parameter-pointee-load"),
+            Ok(RootEvidence {
+                flags: BTreeSet::from([CauseFlag::ExternallySuppliedParameter]),
+                provenance_tags: BTreeSet::from(["external-parameter-pointee-load".to_owned()]),
             })
         );
     }
@@ -4070,6 +4408,169 @@ mod tests {
                 roots_for("integer_pointer_root"),
                 vec![(TerminalKind::Unsupported, BTreeSet::new())],
                 "a nonzero integer-to-pointer constant must remain a STOP root"
+            );
+        })
+        .unwrap_or_else(|error| error.raise());
+    }
+
+    #[test]
+    fn nested_external_parameter_flow_is_depth_sensitive_without_cast_expansion() {
+        let source = r#"
+            pub unsafe fn external_nested(
+                argv: *mut *mut i8,
+                index: isize,
+            ) -> *mut i8 {
+                let copied = argv;
+                *copied.offset(index)
+            }
+
+            unsafe fn private_nested(argv: *mut *mut i8) -> *mut i8 {
+                *argv
+            }
+
+            pub unsafe fn external_caller(argv: *mut *mut i8) -> *mut i8 {
+                private_nested(argv)
+            }
+
+            pub unsafe fn public_nested(argv: *mut *mut i8) -> *mut i8 {
+                *argv
+            }
+
+            pub unsafe fn external_calls_public(argv: *mut *mut i8) -> *mut i8 {
+                public_nested(argv)
+            }
+
+            unsafe fn private_constant(value: *mut i8) -> *mut i8 {
+                value
+            }
+
+            pub unsafe fn call_private_constant() -> *mut i8 {
+                private_constant(0 as *mut i8)
+            }
+
+            pub unsafe fn depth_changing_cast(argv: *mut *mut i8) -> *mut i8 {
+                let erased = argv as *mut i8;
+                let rebuilt = erased as *mut *mut i8;
+                *rebuilt
+            }
+        "#;
+        ::utils::compilation::run_compiler_on_str(source, |tcx| {
+            let program = super::super::collect_program(tcx);
+            let slots = CrateSlots::build(&program);
+            let graph = build_source_graph(tcx, &slots, &BoExport::default());
+            let function = |suffix: &str| {
+                program
+                    .functions
+                    .iter()
+                    .copied()
+                    .find(|function| tcx.def_path_str(*function).ends_with(suffix))
+                    .unwrap_or_else(|| panic!("missing fixture function {suffix}"))
+            };
+            let return_roots = |suffix: &str| {
+                let fn_did = function(suffix);
+                let body_ref = tcx.mir_drops_elaborated_and_const_checked(fn_did).borrow();
+                let body = &*body_ref;
+                let target = node_for_place(tcx, &slots, fn_did, body, Place::from(RETURN_PLACE))
+                    .expect("pointer return must have a source-graph node");
+                trace_candidate(&graph, &target)
+            };
+
+            let external = return_roots("external_nested");
+            assert_eq!(
+                classify_roots(
+                    &external
+                        .iter()
+                        .map(|root| root.evidence.clone())
+                        .collect::<Vec<_>>()
+                ),
+                PrimaryClass::Absent
+            );
+            assert!(external.iter().any(|root| {
+                root.evidence
+                    .provenance_tags
+                    .contains("external-parameter-pointee-load")
+            }));
+            assert!(external.iter().any(|root| {
+                root.path
+                    .iter()
+                    .any(|label| label.contains("depth-transfer") && label.contains("depth1"))
+            }));
+            assert!(external.iter().any(|root| {
+                root.path
+                    .iter()
+                    .any(|label| label.contains("rust-flow") && label.contains("depth1"))
+            }));
+
+            let private = function("private_nested");
+            let private_body_ref = tcx.mir_drops_elaborated_and_const_checked(private).borrow();
+            let private_body = &*private_body_ref;
+            let private_parameter = resolve_place(
+                &slots,
+                private,
+                private_body,
+                Place::from(Local::from_usize(1)),
+                1,
+                None,
+            )
+            .map(|resolved| node_for_resolved(tcx, &slots, private, resolved))
+            .expect("nested private parameter slot");
+            assert!(
+                graph.terminals.get(&private_parameter).is_none(),
+                "an in-crate-supplied private parameter has no direct external terminal"
+            );
+            assert_eq!(
+                classify_roots(
+                    &return_roots("external_caller")
+                        .iter()
+                        .map(|root| root.evidence.clone())
+                        .collect::<Vec<_>>()
+                ),
+                PrimaryClass::Absent,
+                "the in-crate argument path must reach the caller's external remainder"
+            );
+
+            let public = function("public_nested");
+            let public_body_ref = tcx.mir_drops_elaborated_and_const_checked(public).borrow();
+            let public_body = &*public_body_ref;
+            let public_parameter = resolve_place(
+                &slots,
+                public,
+                public_body,
+                Place::from(Local::from_usize(1)),
+                1,
+                None,
+            )
+            .map(|resolved| node_for_resolved(tcx, &slots, public, resolved))
+            .expect("nested public parameter slot");
+            assert!(
+                graph.terminals.get(&public_parameter).is_some(),
+                "a public parameter retains its externally reachable remainder"
+            );
+            assert!(
+                graph.incoming.get(&public_parameter).is_some(),
+                "the in-crate path into a public parameter remains distinct"
+            );
+
+            let constant = return_roots("call_private_constant");
+            assert!(constant.iter().all(|root| {
+                root.evidence.flags == BTreeSet::from([CauseFlag::NullLiteralRoot])
+            }));
+            assert!(constant.iter().all(|root| {
+                !root
+                    .evidence
+                    .flags
+                    .contains(&CauseFlag::ExternallySuppliedParameter)
+            }));
+
+            assert_eq!(
+                classify_roots(
+                    &return_roots("depth_changing_cast")
+                        .iter()
+                        .map(|root| root.evidence.clone())
+                        .collect::<Vec<_>>()
+                ),
+                PrimaryClass::Unresolved,
+                "a depth-changing cast must not synthesize nested provenance"
             );
         })
         .unwrap_or_else(|error| error.raise());
