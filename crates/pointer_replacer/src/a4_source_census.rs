@@ -977,7 +977,10 @@ fn harness_call_kind_for_def(tcx: TyCtxt<'_>, callee: DefId) -> HarnessCallKind 
 struct IndirectTargetFlow {
     incoming: BTreeMap<String, BTreeSet<String>>,
     seeds: FxHashMap<String, FxHashSet<DefId>>,
+    empty_value_seeds: BTreeSet<String>,
     external_parameter_seeds: BTreeSet<String>,
+    #[cfg(test)]
+    parameter_remainders: BTreeMap<String, (bool, bool, bool)>,
     call_nodes: FxHashMap<(LocalDefId, usize), String>,
 }
 
@@ -992,6 +995,22 @@ impl IndirectTargetFlow {
 
     fn add_external_parameter_seed(&mut self, node: String) {
         self.external_parameter_seeds.insert(node);
+    }
+
+    fn add_empty_value_seed(&mut self, node: String) {
+        self.empty_value_seeds.insert(node);
+    }
+
+    #[cfg(test)]
+    fn record_parameter_remainder(
+        &mut self,
+        node: String,
+        public: bool,
+        called: bool,
+        external: bool,
+    ) {
+        self.parameter_remainders
+            .insert(node, (public, called, external));
     }
 
     fn targets(&self, node: &str) -> FxHashSet<DefId> {
@@ -1024,14 +1043,44 @@ impl IndirectTargetFlow {
                 return false;
             }
             let is_external_parameter = self.external_parameter_seeds.contains(&node);
+            let is_empty_value = self.empty_value_seeds.contains(&node);
             saw_external_parameter |= is_external_parameter;
             match self.incoming.get(&node) {
                 Some(incoming) if !incoming.is_empty() => work.extend(incoming.iter().cloned()),
-                _ if !is_external_parameter => return false,
+                _ if !is_external_parameter && !is_empty_value => return false,
                 _ => {}
             }
         }
         saw_external_parameter
+    }
+
+    #[cfg(test)]
+    fn diagnostic(&self, tcx: TyCtxt<'_>, node: &str) -> Vec<String> {
+        let mut work = VecDeque::from([node.to_owned()]);
+        let mut seen = BTreeSet::new();
+        let mut rows = Vec::new();
+        while let Some(node) = work.pop_front() {
+            if !seen.insert(node.clone()) {
+                continue;
+            }
+            let incoming = self.incoming.get(&node).cloned().unwrap_or_default();
+            work.extend(incoming.iter().cloned());
+            let mut targets = self
+                .seeds
+                .get(&node)
+                .into_iter()
+                .flatten()
+                .map(|target| tcx.def_path_str(*target))
+                .collect::<Vec<_>>();
+            targets.sort();
+            rows.push(format!(
+                "node={node} incoming={incoming:?} target_seeds={targets:?} empty_value_seed={} external_seed={} parameter_remainder={:?}",
+                self.empty_value_seeds.contains(&node),
+                self.external_parameter_seeds.contains(&node),
+                self.parameter_remainders.get(&node),
+            ));
+        }
+        rows
     }
 }
 
@@ -1095,6 +1144,8 @@ fn add_target_operand_flow<'tcx>(
 struct IndirectCallResolution {
     visible_targets: Vec<DefId>,
     exclusively_external_parameter: bool,
+    #[cfg(test)]
+    diagnostic: Vec<String>,
 }
 
 fn collect_indirect_call_resolutions(
@@ -1137,6 +1188,15 @@ fn collect_indirect_call_resolutions(
                     continue;
                 }
                 let target = target_flow_node(tcx, fn_did, body, *lhs);
+                if let Rvalue::Aggregate(kind, operands) = rvalue
+                    && let AggregateKind::Adt(def_id, variant, _, _, _) = kind.as_ref()
+                    && tcx.is_diagnostic_item(rustc_span::sym::Option, *def_id)
+                    && variant.as_usize() == 0
+                    && operands.is_empty()
+                {
+                    flow.add_empty_value_seed(target);
+                    continue;
+                }
                 match rvalue {
                     Rvalue::Use(operand) | Rvalue::Cast(_, operand, _) => {
                         add_target_operand_flow(&mut flow, tcx, fn_did, body, operand, target);
@@ -1241,10 +1301,11 @@ fn collect_indirect_call_resolutions(
     }
     for (fn_did, parameter, node) in parameter_nodes {
         let public = tcx.visibility(fn_did.to_def_id()).is_public();
-        if parameter_has_external_remainder(
-            public,
-            called_parameters.contains(&(fn_did, parameter)),
-        ) {
+        let called = called_parameters.contains(&(fn_did, parameter));
+        let external = parameter_has_external_remainder(public, called);
+        #[cfg(test)]
+        flow.record_parameter_remainder(node.clone(), public, called, external);
+        if external {
             flow.add_external_parameter_seed(node);
         }
     }
@@ -1258,6 +1319,8 @@ fn collect_indirect_call_resolutions(
                 IndirectCallResolution {
                     visible_targets: targets,
                     exclusively_external_parameter: flow.exclusively_external_parameter(node),
+                    #[cfg(test)]
+                    diagnostic: flow.diagnostic(tcx, node),
                 },
             )
         })
@@ -5094,6 +5157,27 @@ mod tests {
             ),
             PrimaryClass::Absent
         );
+
+        let mut empty_only = IndirectTargetFlow::default();
+        empty_only.add_empty_value_seed("none".to_owned());
+        assert!(
+            !empty_only.exclusively_external_parameter("none"),
+            "a neutral empty value cannot make a non-external path external"
+        );
+
+        let mut external_with_none = IndirectTargetFlow::default();
+        external_with_none.add_external_parameter_seed("external".to_owned());
+        external_with_none.add_empty_value_seed("none".to_owned());
+        external_with_none.add_edge("external".to_owned(), "call".to_owned());
+        external_with_none.add_edge("none".to_owned(), "call".to_owned());
+        assert!(external_with_none.exclusively_external_parameter("call"));
+
+        let mut mixed_unresolved = external_with_none;
+        mixed_unresolved.add_edge("unresolved".to_owned(), "call".to_owned());
+        assert!(
+            !mixed_unresolved.exclusively_external_parameter("call"),
+            "a neutral empty path cannot conceal an unexplained predecessor"
+        );
     }
 
     #[test]
@@ -5221,6 +5305,96 @@ mod tests {
             };
             assert_eq!(call_scopes("empty_target"), vec![(true, true)]);
             assert_eq!(call_scopes("unit_callback"), vec![(false, false)]);
+        })
+        .unwrap_or_else(|error| error.raise());
+    }
+
+    #[test]
+    fn exact_json_callback_shape_is_externally_rooted() {
+        let source = r#"
+            pub mod src {
+                pub mod json {
+                    use core::ffi::c_void;
+
+                    extern "C" {
+                        fn malloc(size: usize) -> *mut c_void;
+                    }
+
+                    #[no_mangle]
+                    pub unsafe extern "C" fn json_parse_ex(
+                        mut src: *const c_void,
+                        mut src_size: usize,
+                        mut flags_bitset: usize,
+                        mut alloc_func_ptr: Option<
+                            unsafe extern "C" fn(*mut c_void, usize) -> *mut c_void,
+                        >,
+                        mut user_data: *mut c_void,
+                        mut result: *mut c_void,
+                    ) -> *mut c_void {
+                        let _ = (&mut src, &mut src_size, &mut flags_bitset, &mut result);
+                        let allocation;
+                        if alloc_func_ptr.is_none() {
+                            allocation = malloc(src_size);
+                        } else {
+                            allocation = alloc_func_ptr
+                                .expect("non-null function pointer")(user_data, src_size);
+                        }
+                        allocation
+                    }
+
+                    #[no_mangle]
+                    pub unsafe extern "C" fn json_parse(
+                        src: *const c_void,
+                        src_size: usize,
+                    ) -> *mut c_void {
+                        json_parse_ex(
+                            src,
+                            src_size,
+                            0,
+                            None,
+                            core::ptr::null_mut(),
+                            core::ptr::null_mut(),
+                        )
+                    }
+                }
+            }
+        "#;
+        ::utils::compilation::run_compiler_on_str(source, |tcx| {
+            let program = super::super::collect_program(tcx);
+            let resolutions = collect_indirect_call_resolutions(tcx, &program.functions);
+            let mut callback_resolutions = resolutions
+                .iter()
+                .filter(|((function, _), _)| {
+                    tcx.def_path_str(*function)
+                        .ends_with("src::json::json_parse_ex")
+                })
+                .map(|(_, resolution)| resolution)
+                .collect::<Vec<_>>();
+            assert_eq!(
+                callback_resolutions.len(),
+                1,
+                "the exact fixture must contain one indirect callback"
+            );
+            let resolution = callback_resolutions.pop().unwrap();
+            assert!(
+                resolution.visible_targets.is_empty(),
+                "the external callback must not acquire a visible target: {:?}",
+                resolution.diagnostic
+            );
+            assert!(
+                resolution.exclusively_external_parameter,
+                "the exact callback must be externally rooted:\n{}",
+                resolution.diagnostic.join("\n")
+            );
+            assert!(
+                resolution
+                    .diagnostic
+                    .iter()
+                    .any(|row| row.contains("src::json::json_parse:slot5")
+                        && row.contains("empty_value_seed=true")),
+                "the wrapper's literal None must be the diagnosed neutral edge:\n{}",
+                resolution.diagnostic.join("\n")
+            );
         })
         .unwrap_or_else(|error| error.raise());
     }
