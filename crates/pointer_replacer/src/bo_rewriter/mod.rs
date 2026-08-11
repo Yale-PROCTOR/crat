@@ -2058,10 +2058,18 @@ fn finish_decide<'tcx>(
     // with the class verdict in hand: the adaptable population passes the
     // `referenced` gate, and the class gate then governs every node uniformly.
     // The pinned population still blocks inside `LiftAdaptable`.
-    let table = decision::decide(
+    let mut table = decision::decide(
         &ctx_of(decision::RefGate::LiftAdaptable, Some(&coconv)),
         &subjects,
     );
+
+    // Use-edit nesting is a property of a PAIR of edits, so it cannot be seen by
+    // `decide_one`, which is handed one subject at a time. Runs here, over the
+    // finished table, where both the within-subject and the cross-subject case
+    // are visible — a per-subject check left 15 of brotli's 17 collisions
+    // standing, measured.
+    decision::refuse_nested_use_edits(tcx, &mut table);
+    let table = table;
 
     // Structural self-check: the table matches the subjects it was handed. NOT
     // the coverage gate — every comparison in it is against the collector's own

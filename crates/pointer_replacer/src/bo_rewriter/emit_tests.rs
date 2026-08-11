@@ -2486,6 +2486,61 @@ fn a_subject_whose_uses_nest_produces_no_overlapping_edits() {
     );
 }
 
+/// **Nesting across TWO subjects refuses the inner one and KEEPS the outer.**
+///
+/// brotli's second shape, and the 15 of 17 collisions a per-subject check left
+/// standing — `enc::block_splitter::RemapBlockIds*`,
+/// `enc::brotli_bit_stream::StoreSimpleHuffmanTree`, `enc::cluster::*`:
+///
+/// ```ignore
+/// *new_id.offset(*block_ids.offset(i as isize) as isize)
+/// ```
+///
+/// `new_id`'s edit spans the whole outer `offset` call; `block_ids`'s sits
+/// inside it. No per-subject check can see this, because neither subject's own
+/// rewrites nest.
+///
+/// **Refusing the INNER subject is the correct pick, not merely the safe one.**
+/// `index_text` renders the index by `span_to_snippet`, so the outer
+/// replacement embeds `*block_ids.offset(i as isize)` verbatim — and that text
+/// is well-typed precisely when `block_ids` is still a pointer. So the outer
+/// rewrite stays valid *because* the inner was refused, which is why this test
+/// asserts both halves: refusing the inner while also dropping the outer would
+/// be sound but would give away yield the defect does not cost.
+///
+/// *Mutation-tested (Rider 0, deletion first):* restrict the pass to same-entry
+/// pairs — the shape the first fix had — and this fails with brotli's own
+/// rollback.
+#[test]
+fn nesting_across_two_subjects_refuses_the_inner_and_keeps_the_outer() {
+    let src = "#![allow(dead_code, unused_unsafe, unused_mut, unused_variables)]\n\
+               pub unsafe fn f(new_id: *mut u32, block_ids: *mut u32, n: usize) {\n\
+               \x20   let mut i: usize = 0;\n\
+               \x20   while i < n {\n\
+               \x20       *new_id.offset(*block_ids.offset(i as isize) as isize) = 1;\n\
+               \x20       i += 1;\n\
+               \x20   }\n\
+               }\n";
+    let fixture = Fixture::new(&[("lib.rs", src)]);
+    assert!(
+        emit(&fixture).rollbacks.is_empty(),
+        "cross-subject nesting reached `apply`: {:?}",
+        emit(&fixture).rollbacks
+    );
+    let got = decisions_of(src);
+    assert_eq!(
+        reason_of(&got, "block_ids", true),
+        "nested-use-edits",
+        "the INNER subject is the one the nesting refuses: {got:?}"
+    );
+    assert_eq!(
+        reason_of(&got, "new_id", true),
+        "<emitted>",
+        "the OUTER subject must survive — its embedded snippet is valid exactly \
+         because the inner stayed raw: {got:?}"
+    );
+}
+
 /// **The nesting gate must not fire on a subject whose uses merely SIT SIDE BY
 /// SIDE** — the control for the witness above.
 ///

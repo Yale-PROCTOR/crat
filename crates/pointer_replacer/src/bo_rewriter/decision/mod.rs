@@ -757,6 +757,79 @@ pub(crate) fn decide(ctx: &Ctx<'_, '_>, subjects: &[Subject]) -> DecisionTable {
     DecisionTable { entries }
 }
 
+/// **Refuse every use-edit NESTING, across the whole table.**
+///
+/// `apply` rejects overlapping edits, and a plan that produces them has not
+/// decided. Nesting arises two ways, and only a table-level pass sees both:
+///
+/// - **within one subject** — `table = table.offset((*table).value as isize)`
+///   yields an edit for the whole `offset` call and another for the `(*table)`
+///   inside its index;
+/// - **across two subjects** — `*new_id.offset(*block_ids.offset(i) as isize)`
+///   yields `new_id`'s edit containing `block_ids`'s.
+///
+/// A per-subject check sees only the first. Measured, not reasoned: it left 15
+/// of brotli's 17 collisions standing.
+///
+/// # Which subject is refused, and why it differs by case
+///
+/// **The INNER one** — and for the cross-subject case that is not merely the
+/// conservative pick, it is the *correct* one. `index_text` renders an index by
+/// `span_to_snippet`, so the outer replacement embeds the inner expression's
+/// ORIGINAL text. If the inner subject stays raw, that text stays valid:
+/// `new_id[(*block_ids.offset(i as isize)) as usize]` is well-typed exactly
+/// when `block_ids` is still a pointer. Refusing the inner subject therefore
+/// removes the collision *and* leaves the outer rewrite correct.
+///
+/// When inner and outer are the SAME subject the two coincide, and refusing it
+/// drops both edits — which is the only sound answer there, since the outer's
+/// embedded text would otherwise name a binding that is no longer a pointer.
+///
+/// # Fixpoint
+///
+/// Refusing a subject removes its edits, which can leave a formerly-inner edit
+/// with no container. The loop repeats until no nesting remains, so a chain
+/// `a ⊃ b ⊃ c` refuses `b` and `c` but keeps `a` — never more than the
+/// containment relation forces.
+pub(crate) fn refuse_nested_use_edits(tcx: TyCtxt<'_>, table: &mut DecisionTable) {
+    loop {
+        // (entry index, edit span) for every entry still emitting use-edits.
+        let mut edits: Vec<(usize, Span)> = Vec::new();
+        for (i, (_, decision)) in table.entries.iter().enumerate() {
+            let uses = match decision {
+                Decision::Slice { uses, .. } | Decision::Opt { uses, .. } => uses.as_slice(),
+                _ => &[],
+            };
+            edits.extend(uses.iter().map(|u| (i, u.span)));
+        }
+        // Outermost first at equal starts, so the container is seen before what
+        // it contains.
+        edits.sort_by_key(|(_, s)| (s.lo(), std::cmp::Reverse(s.hi())));
+
+        let mut refuse: Option<(usize, Span)> = None;
+        let mut open: Vec<(usize, Span)> = Vec::new();
+        for (entry, span) in edits {
+            while open.last().is_some_and(|(_, o)| o.hi() <= span.lo()) {
+                open.pop();
+            }
+            // Same entry or not, the INNER one is refused; see above.
+            if open.last().is_some_and(|(_, outer)| outer.contains(span)) {
+                refuse = Some((entry, span));
+                break;
+            }
+            open.push((entry, span));
+        }
+
+        let Some((entry, span)) = refuse else { return };
+        let (subject, decision) = &mut table.entries[entry];
+        *decision = degrade(
+            subject,
+            EmitabilityFacts::site(tcx, span),
+            DegradeReason::NestedUseEdits,
+        );
+    }
+}
+
 fn degrade(subject: &Subject, site: String, reason: DegradeReason) -> Decision {
     Decision::Degraded(Degradation {
         subject: subject.label.clone(),
@@ -1031,18 +1104,6 @@ fn decide_one(ctx: &Ctx<'_, '_>, subject: &Subject) -> Decision {
         if slice && sign.may_be_negative(subject.fn_did, subject.local) {
             return degrade(subject, decl_site, DegradeReason::SliceNegOrUnknownOffset);
         }
-        // The same nesting gate as the plain-slice twin, and NOT gated on
-        // `slice`: an optional subject rewrites *every* use, so nesting is if
-        // anything more available here than on the slice arm. Reason key shared
-        // with that twin — the defect and the owed repair are one thing, and the
-        // subject's own outcome keeps the two arms attributable in the join.
-        if let Some(span) = emitability::nested_rewrite(&uses.rewrites) {
-            return degrade(
-                subject,
-                EmitabilityFacts::site(tcx, span),
-                DegradeReason::NestedUseEdits,
-            );
-        }
         return Decision::Opt {
             mutable: subject.mutable,
             slice,
@@ -1087,17 +1148,6 @@ fn decide_one(ctx: &Ctx<'_, '_>, subject: &Subject) -> Decision {
     // emitted on absent evidence.
     if sign.may_be_negative(subject.fn_did, subject.local) {
         return degrade(subject, decl_site, DegradeReason::SliceNegOrUnknownOffset);
-    }
-    // LAST, after every other gate: this one is about the edits themselves, so
-    // it can only refuse a subject that was otherwise about to emit — which is
-    // what makes its count exactly the cost of the defect rather than a number
-    // sharing a population with some earlier reason.
-    if let Some(span) = emitability::nested_rewrite(&uses.rewrites) {
-        return degrade(
-            subject,
-            EmitabilityFacts::site(tcx, span),
-            DegradeReason::NestedUseEdits,
-        );
     }
     Decision::Slice {
         mutable: subject.mutable,
