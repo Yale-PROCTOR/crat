@@ -313,7 +313,9 @@ fn parse_cause_flag(value: &str) -> Result<CauseFlag, String> {
 fn parse_provenance_tag(value: &str) -> Result<String, String> {
     if matches!(
         value,
-        "string-literal-root" | "external-parameter-pointee-load"
+        "string-literal-root"
+            | "external-parameter-pointee-load"
+            | "indirect-external-parameter-callback"
     ) {
         return Ok(value.to_owned());
     }
@@ -335,7 +337,9 @@ fn parse_root_evidence(value: &str) -> Result<RootEvidence, String> {
     for token in value.split('|') {
         if matches!(
             token,
-            "string-literal-root" | "external-parameter-pointee-load"
+            "string-literal-root"
+                | "external-parameter-pointee-load"
+                | "indirect-external-parameter-callback"
         ) || token.starts_with("indirect-resolved-target(")
         {
             provenance_tags.insert(parse_provenance_tag(token)?);
@@ -835,6 +839,21 @@ fn indirect_target_tag(canonical_path: &str) -> String {
     format!("indirect-resolved-target({canonical_path})")
 }
 
+fn add_external_parameter_callback_root(
+    graph: &mut SourceGraph,
+    node: String,
+    call_location: &str,
+) {
+    add_terminal_with_tags(
+        graph,
+        node,
+        TerminalKind::OpaqueExternalCall,
+        format!("indirect-external-parameter-callback:{call_location}"),
+        false,
+        BTreeSet::from(["indirect-external-parameter-callback".to_owned()]),
+    );
+}
+
 fn require_visible_targets<'a, T>(
     targets: &'a [T],
     call_location: &str,
@@ -845,6 +864,32 @@ fn require_visible_targets<'a, T>(
         ));
     }
     Ok(targets)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum IndirectCallArm {
+    OutOfPopulation,
+    VisibleTargets,
+    ExternalParameterCallback,
+}
+
+fn indirect_call_arm(
+    result_is_data_pointer: bool,
+    visible_target_count: usize,
+    exclusively_external_parameter: bool,
+    call_location: &str,
+) -> Result<IndirectCallArm, String> {
+    if !result_is_data_pointer {
+        Ok(IndirectCallArm::OutOfPopulation)
+    } else if visible_target_count > 0 {
+        Ok(IndirectCallArm::VisibleTargets)
+    } else if exclusively_external_parameter {
+        Ok(IndirectCallArm::ExternalParameterCallback)
+    } else {
+        Err(format!(
+            "unclassified empty-target indirect call at {call_location}"
+        ))
+    }
 }
 
 fn data_pointer_destination<'a>(
@@ -932,6 +977,7 @@ fn harness_call_kind_for_def(tcx: TyCtxt<'_>, callee: DefId) -> HarnessCallKind 
 struct IndirectTargetFlow {
     incoming: BTreeMap<String, BTreeSet<String>>,
     seeds: FxHashMap<String, FxHashSet<DefId>>,
+    external_parameter_seeds: BTreeSet<String>,
     call_nodes: FxHashMap<(LocalDefId, usize), String>,
 }
 
@@ -942,6 +988,10 @@ impl IndirectTargetFlow {
 
     fn add_seed(&mut self, node: String, target: DefId) {
         self.seeds.entry(node).or_default().insert(target);
+    }
+
+    fn add_external_parameter_seed(&mut self, node: String) {
+        self.external_parameter_seeds.insert(node);
     }
 
     fn targets(&self, node: &str) -> FxHashSet<DefId> {
@@ -956,6 +1006,32 @@ impl IndirectTargetFlow {
             work.extend(self.incoming.get(&node).into_iter().flatten().cloned());
         }
         targets
+    }
+
+    fn exclusively_external_parameter(&self, node: &str) -> bool {
+        let mut work = VecDeque::from([node.to_owned()]);
+        let mut seen = BTreeSet::new();
+        let mut saw_external_parameter = false;
+        while let Some(node) = work.pop_front() {
+            if !seen.insert(node.clone()) {
+                continue;
+            }
+            if self
+                .seeds
+                .get(&node)
+                .is_some_and(|targets| !targets.is_empty())
+            {
+                return false;
+            }
+            let is_external_parameter = self.external_parameter_seeds.contains(&node);
+            saw_external_parameter |= is_external_parameter;
+            match self.incoming.get(&node) {
+                Some(incoming) if !incoming.is_empty() => work.extend(incoming.iter().cloned()),
+                _ if !is_external_parameter => return false,
+                _ => {}
+            }
+        }
+        saw_external_parameter
     }
 }
 
@@ -1015,15 +1091,30 @@ fn add_target_operand_flow<'tcx>(
     }
 }
 
-fn collect_visible_indirect_targets(
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct IndirectCallResolution {
+    visible_targets: Vec<DefId>,
+    exclusively_external_parameter: bool,
+}
+
+fn collect_indirect_call_resolutions(
     tcx: TyCtxt<'_>,
     functions: &[LocalDefId],
-) -> FxHashMap<(LocalDefId, usize), Vec<DefId>> {
+) -> FxHashMap<(LocalDefId, usize), IndirectCallResolution> {
     let function_set = functions.iter().copied().collect::<FxHashSet<_>>();
     let mut flow = IndirectTargetFlow::default();
+    let mut parameter_nodes = Vec::new();
+    let mut called_parameters = FxHashSet::default();
     for &fn_did in functions {
         let body_ref = tcx.mir_drops_elaborated_and_const_checked(fn_did).borrow();
         let body = &*body_ref;
+        for local in body.args_iter() {
+            parameter_nodes.push((
+                fn_did,
+                local.index(),
+                target_flow_node(tcx, fn_did, body, Place::from(local)),
+            ));
+        }
         for (bb, data) in body.basic_blocks.iter_enumerated() {
             for statement in &data.statements {
                 let StatementKind::Assign(box (lhs, rvalue)) = &statement.kind else {
@@ -1098,6 +1189,7 @@ fn collect_visible_indirect_targets(
                     let callee_body = &*callee_body_ref;
                     for (index, argument) in args.iter().enumerate() {
                         let parameter = Local::from_usize(index + 1);
+                        called_parameters.insert((callee, parameter.index()));
                         add_target_operand_flow(
                             &mut flow,
                             tcx,
@@ -1133,12 +1225,41 @@ fn collect_visible_indirect_targets(
             }
         }
     }
+    for node in flow.call_nodes.values() {
+        for target in flow.targets(node) {
+            let Some(callee) = target.as_local() else {
+                continue;
+            };
+            if !function_set.contains(&callee) {
+                continue;
+            }
+            let callee_body_ref = tcx.mir_drops_elaborated_and_const_checked(callee).borrow();
+            for parameter in callee_body_ref.args_iter() {
+                called_parameters.insert((callee, parameter.index()));
+            }
+        }
+    }
+    for (fn_did, parameter, node) in parameter_nodes {
+        let public = tcx.visibility(fn_did.to_def_id()).is_public();
+        if parameter_has_external_remainder(
+            public,
+            called_parameters.contains(&(fn_did, parameter)),
+        ) {
+            flow.add_external_parameter_seed(node);
+        }
+    }
     flow.call_nodes
         .iter()
         .map(|(call, node)| {
             let mut targets = flow.targets(node).into_iter().collect::<Vec<_>>();
             targets.sort_by_key(|target| tcx.def_path_str(*target));
-            (*call, targets)
+            (
+                *call,
+                IndirectCallResolution {
+                    visible_targets: targets,
+                    exclusively_external_parameter: flow.exclusively_external_parameter(node),
+                },
+            )
         })
         .collect()
 }
@@ -1176,7 +1297,7 @@ fn build_source_graph(tcx: TyCtxt<'_>, slots: &CrateSlots, export: &BoExport) ->
 
     let program = collect_program(tcx);
     let program_functions = program.functions.iter().copied().collect::<FxHashSet<_>>();
-    let visible_indirect_targets = collect_visible_indirect_targets(tcx, &program.functions);
+    let indirect_call_resolutions = collect_indirect_call_resolutions(tcx, &program.functions);
     let mut graph = SourceGraph::default();
     let mut parameter_nodes = Vec::<(LocalDefId, Local, String)>::new();
     let mut nested_parameter_nodes = Vec::<(LocalDefId, Local, u8, String)>::new();
@@ -1588,25 +1709,40 @@ fn build_source_graph(tcx: TyCtxt<'_>, slots: &CrateSlots, export: &BoExport) ->
                 }
                 HarnessCallKind::Unresolved => {
                     let result_is_data_pointer = call.destination.ty(body, tcx).ty.is_raw_ptr();
-                    let Some(destination) = data_pointer_destination(
+                    let resolution = indirect_call_resolutions
+                        .get(&(fn_did, bb.index()))
+                        .cloned()
+                        .unwrap_or_default();
+                    let arm = indirect_call_arm(
+                        result_is_data_pointer,
+                        resolution.visible_targets.len(),
+                        resolution.exclusively_external_parameter,
+                        &call_location,
+                    )
+                    .unwrap_or_else(|error| {
+                        panic!("A4C STOP phase=graph-construction candidate=none: {error}")
+                    });
+                    if arm == IndirectCallArm::OutOfPopulation {
+                        continue;
+                    }
+                    let destination = data_pointer_destination(
                         result_is_data_pointer,
                         destination.as_deref(),
                         &call_location,
                     )
                     .unwrap_or_else(|error| {
                         panic!("A4C STOP phase=graph-construction candidate=none: {error}")
-                    }) else {
+                    })
+                    .expect("a classified data-pointer call has a destination");
+                    if arm == IndirectCallArm::ExternalParameterCallback {
+                        add_external_parameter_callback_root(
+                            &mut graph,
+                            destination.to_owned(),
+                            &call_location,
+                        );
                         continue;
-                    };
-                    let resolved = visible_indirect_targets
-                        .get(&(fn_did, bb.index()))
-                        .cloned()
-                        .unwrap_or_default();
-                    let resolved = require_visible_targets(&resolved, &call_location)
-                        .unwrap_or_else(|error| {
-                            panic!("A4C STOP phase=graph-construction candidate=none: {error}")
-                        });
-                    for &resolved_target in resolved {
+                    }
+                    for &resolved_target in &resolution.visible_targets {
                         let canonical_path = tcx.def_path_str(resolved_target);
                         let provenance_tags =
                             BTreeSet::from([indirect_target_tag(&canonical_path)]);
@@ -2694,7 +2830,7 @@ const RAW_CORPUS_DIGEST: &str = "9fc912af10fd3b235fe4d444d2fbac0bc521509b1c9447f
 const DERIVED_SUBSTRATE_DIGEST: &str =
     "db96829b5c2b0db28fb4bb9ddd3d32901b5d4e6e4134da07ada0d513d94eb4c6";
 const SNAPSHOT_PATH: &str = "/home/p51lee/dev/agent-worktrees/m1-artifact-snapshots/3b26a0ff";
-const RETRY3_PREDECESSOR_SHARDS: [(&str, &str, &str); 9] = [
+const RETRY3_PREDECESSOR_SHARDS: [(&str, &str, &str); 10] = [
     (
         "bst",
         "ce11b3459c6fa46965e4cbe23ce11dffbdc7bf01",
@@ -2739,6 +2875,11 @@ const RETRY3_PREDECESSOR_SHARDS: [(&str, &str, &str); 9] = [
         "genann",
         "37b0fd5c043dcae653ff87ca343841cb6f45922a",
         "822cebcc9f43707f57e5d87149fbf103884e95be2b6eb0f0152fb58b88c46b53",
+    ),
+    (
+        "libtree",
+        "1bd19c6a90082b87c82eb3bd35f5155db712fcf9",
+        "f510473a443d12dd4c09964ed8290cc82e2255288a7ed9e3c96e48f080d7eb45",
     ),
 ];
 
@@ -4315,6 +4456,10 @@ mod tests {
             Ok("external-parameter-pointee-load".to_owned())
         );
         assert_eq!(
+            parse_provenance_tag("indirect-external-parameter-callback"),
+            Ok("indirect-external-parameter-callback".to_owned())
+        );
+        assert_eq!(
             parse_root_evidence("static-or-interior-root|string-literal-root"),
             Ok(RootEvidence {
                 flags: BTreeSet::from([CauseFlag::StaticOrInteriorRoot]),
@@ -4906,6 +5051,52 @@ mod tests {
     }
 
     #[test]
+    fn indirect_call_taxonomy_is_a_closed_three_arm_enumeration() {
+        assert_eq!(
+            indirect_call_arm(false, 0, false, "fixture:unit"),
+            Ok(IndirectCallArm::OutOfPopulation)
+        );
+        assert_eq!(
+            indirect_call_arm(true, 1, false, "fixture:visible"),
+            Ok(IndirectCallArm::VisibleTargets)
+        );
+        assert_eq!(
+            indirect_call_arm(true, 0, true, "fixture:external"),
+            Ok(IndirectCallArm::ExternalParameterCallback)
+        );
+        assert!(
+            indirect_call_arm(true, 0, false, "fixture:fourth")
+                .expect_err("a fourth shape must STOP")
+                .contains("unclassified empty-target indirect call")
+        );
+
+        let mut graph = SourceGraph::default();
+        add_external_parameter_callback_root(
+            &mut graph,
+            "callback-result".to_owned(),
+            "fixture:external",
+        );
+        let roots = trace_candidate(&graph, "callback-result");
+        assert_eq!(
+            roots[0].evidence.flags,
+            BTreeSet::from([CauseFlag::OpaqueExternalCallResult])
+        );
+        assert_eq!(
+            roots[0].evidence.provenance_tags,
+            BTreeSet::from(["indirect-external-parameter-callback".to_owned()])
+        );
+        assert_eq!(
+            classify_roots(
+                &roots
+                    .iter()
+                    .map(|root| root.evidence.clone())
+                    .collect::<Vec<_>>()
+            ),
+            PrimaryClass::Absent
+        );
+    }
+
+    #[test]
     fn indirect_resolved_flow_target_cannot_disappear() {
         let mut graph = SourceGraph::default();
         let tags = BTreeSet::from(["indirect-resolved-target(src::fixture::flow)".to_owned()]);
@@ -4959,21 +5150,35 @@ mod tests {
             unsafe fn unit_callback(hook: *mut UnitHook) {
                 ((*hook).call).expect("no visible unit target")(1)
             }
+            pub unsafe fn external_callback(
+                callback: Option<unsafe extern "C" fn(*mut core::ffi::c_void, usize) -> *mut core::ffi::c_void>,
+                p: *mut core::ffi::c_void,
+            ) -> *mut core::ffi::c_void {
+                callback.expect("external callback")(p, 8)
+            }
         "#;
         ::utils::compilation::run_compiler_on_str(source, |tcx| {
             let program = super::super::collect_program(tcx);
             let slots = CrateSlots::build(&program);
-            let targets = collect_visible_indirect_targets(tcx, &program.functions);
+            let resolutions = collect_indirect_call_resolutions(tcx, &program.functions);
             let by_function = |suffix: &str| {
-                targets
+                resolutions
                     .iter()
                     .filter(|((function, _), _)| tcx.def_path_str(*function).ends_with(suffix))
-                    .map(|(_, targets)| {
-                        targets
+                    .map(|(_, resolution)| {
+                        resolution
+                            .visible_targets
                             .iter()
                             .map(|target| tcx.def_path_str(*target))
                             .collect::<BTreeSet<_>>()
                     })
+                    .collect::<Vec<_>>()
+            };
+            let external_by_function = |suffix: &str| {
+                resolutions
+                    .iter()
+                    .filter(|((function, _), _)| tcx.def_path_str(*function).ends_with(suffix))
+                    .map(|(_, resolution)| resolution.exclusively_external_parameter)
                     .collect::<Vec<_>>()
             };
             assert_eq!(
@@ -4982,6 +5187,11 @@ mod tests {
             );
             assert_eq!(by_function("empty_target"), vec![BTreeSet::new()]);
             assert_eq!(by_function("unit_callback"), vec![BTreeSet::new()]);
+            assert_eq!(by_function("external_callback"), vec![BTreeSet::new()]);
+            assert_eq!(external_by_function("visible_default"), vec![false]);
+            assert_eq!(external_by_function("empty_target"), vec![false]);
+            assert_eq!(external_by_function("unit_callback"), vec![false]);
+            assert_eq!(external_by_function("external_callback"), vec![true]);
 
             let call_scopes = |suffix: &str| {
                 program
