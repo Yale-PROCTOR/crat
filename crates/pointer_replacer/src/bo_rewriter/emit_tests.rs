@@ -3962,3 +3962,35 @@ mod attribution_and_escapes {
         );
     }
 }
+
+/// **THE SEAM, END TO END.** A callee whose parameter takes the optional form,
+/// called with a plain `&mut` — the caller's argument gets `Some(..)` glue.
+///
+/// This is the first witness that the adapter reaches emitted TEXT rather than
+/// only the glue table's unit tests. It pins the whole path: the call-site walk
+/// computes `(expected = Opt{mut,thin}, found = Ref{mut})`, `seam::glue`
+/// produces `Some(&mut x)`, `plan` places it in the CALLER's file under the
+/// CALLEE's `owner_fn`, and `apply` splices it.
+///
+/// *Mutation-tested (Rider 0, deletion first):* stop filling `table.seams` in
+/// the driver and the emitted source keeps the bare `&mut x`, which no longer
+/// satisfies `Option<&mut i32>`.
+#[test]
+fn a_mismatched_argument_gets_seam_glue_in_the_emitted_text() {
+    let src = "#![allow(dead_code, unused_unsafe, unused_mut, unused_variables)]\n\
+               pub unsafe fn callee(p: *mut i32) -> i32 {\n\
+               \x20   if p.is_null() { 0 } else { *p }\n\
+               }\n\
+               pub fn caller() {\n\
+               \x20   let mut x: i32 = 1;\n\
+               \x20   unsafe { callee(&mut x); }\n\
+               }\n";
+    let super::RewriteOutcome::Emitted { source, .. } = super::rewrite_m1(src) else {
+        panic!("fixture must emit");
+    };
+    assert!(
+        source.contains("callee(Some(&mut x))"),
+        "the argument must be wrapped by the seam, or the callee's optional \
+         parameter is left ill-typed:\n{source}"
+    );
+}

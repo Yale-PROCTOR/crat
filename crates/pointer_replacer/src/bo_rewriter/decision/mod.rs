@@ -647,6 +647,15 @@ pub(crate) enum Decision {
 #[derive(Clone, Debug, Default)]
 pub(crate) struct DecisionTable {
     pub entries: Vec<(Subject, Decision)>,
+    /// **S3.6-1 seam adapters.** Computed in this phase — it is the only phase
+    /// that may read an analysis — and handed to `plan` as data, exactly as
+    /// `Decision::Slice`'s use-edits are.
+    ///
+    /// Carried BESIDE `entries` rather than inside a `Decision` because a seam
+    /// belongs to a *pair*: the callee subject justifies it and the caller's
+    /// file receives it. Attaching it to either end alone would misplace one of
+    /// the two.
+    pub seams: seam::SeamPlan,
 }
 
 impl DecisionTable {
@@ -755,7 +764,12 @@ pub(crate) fn decide(ctx: &Ctx<'_, '_>, subjects: &[Subject]) -> DecisionTable {
         .iter()
         .map(|subject| (subject.clone(), decide_one(ctx, subject)))
         .collect();
-    DecisionTable { entries }
+    DecisionTable {
+        entries,
+        // `decide` stays PURE over subjects; seams need the call graph and are
+        // filled by the driver, which is also where the analyses live.
+        seams: Default::default(),
+    }
 }
 
 /// **Refuse every use-edit NESTING, across the whole table.**
@@ -1206,6 +1220,7 @@ mod self_consistency_tests {
 
     fn table(entries: Vec<Subject>) -> DecisionTable {
         DecisionTable {
+            seams: Default::default(),
             entries: entries
                 .into_iter()
                 .map(|s| (s, Decision::Ref { mutable: true }))

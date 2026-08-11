@@ -191,7 +191,10 @@ mod tests {
     }
 
     fn table(entries: Vec<(Subject, Decision)>) -> DecisionTable {
-        DecisionTable { entries }
+        DecisionTable {
+            entries,
+            seams: Default::default(),
+        }
     }
 
     /// **A.10 — a kept-`Raw` subject EMITS A ROW.**

@@ -62,6 +62,12 @@ pub(crate) enum SeamBlock {
     /// The argument's expression is not one this slice can name — a bare cast, a
     /// null literal, a call result, arithmetic.
     UnnameableOperand,
+    /// Two positions at one call site may borrow the same place, and at least
+    /// one wants `&mut`. **The gate applies to adapter-generated arguments
+    /// exactly as to converted ones** (ruling item 3, 2026-08-11): glue may not
+    /// bypass it, because the reborrow family places its borrow precisely where
+    /// §5a measured borrowck as blind.
+    SiteOverlap,
 }
 
 impl SeamBlock {
@@ -70,6 +76,7 @@ impl SeamBlock {
             SeamBlock::LengthUnknown => "seam-len-unknown",
             SeamBlock::SharedToMut => "seam-shared-to-mut",
             SeamBlock::UnnameableOperand => "seam-unnameable-operand",
+            SeamBlock::SiteOverlap => "seam-site-overlap",
         }
     }
 }
@@ -523,4 +530,254 @@ mod tests {
         // `&mut T` supplied where `&T` is wanted: coercion, still no edit.
         assert_eq!(g(Ref { mutable: false }, Ref { mutable: true }), Ok(None));
     }
+}
+
+// ---------------------------------------------------------------------------
+// The call-site walk
+// ---------------------------------------------------------------------------
+
+use rustc_hash::FxHashMap;
+use rustc_hir::{HirId, def_id::LocalDefId};
+use rustc_middle::ty::TyCtxt;
+
+use super::{Decision, DecisionTable, Subject, SubjectKind, emitability::ArgShape};
+
+/// What the walk produced: placed adapters, and every position it refused with
+/// the reason it refused it.
+///
+/// **Blocked positions are carried, not dropped.** The ledger rule this module
+/// exists under: an unadapted position becomes a revert, and a revert with no
+/// reason is a yield number nobody can attribute.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct SeamPlan {
+    pub edits: Vec<SeamEdit>,
+    /// `(caller, argument span, reason)`.
+    pub blocked: Vec<(LocalDefId, Span, SeamBlock)>,
+    /// Pairs that fired with **no row in the measured census** — rule 1
+    /// (2026-08-11): coverage derives from the type-level matrix, and the census
+    /// is a prioritization overlay. A pair appearing here is not an error; it is
+    /// the overlay being incomplete, which is expected and must be visible.
+    pub uncensused: Vec<(Form, Form)>,
+}
+
+/// The form a decision emits.
+fn form_of(decision: &Decision) -> Form {
+    match decision {
+        Decision::Ref { mutable } => Form::Ref { mutable: *mutable },
+        Decision::Slice { mutable, .. } => Form::Slice { mutable: *mutable },
+        Decision::Opt { mutable, slice, .. } => Form::Opt {
+            mutable: *mutable,
+            slice: *slice,
+        },
+        // A degraded subject keeps its raw pointer type.
+        Decision::Degraded(_) => Form::Raw,
+    }
+}
+
+/// The 17 `(found, expected)` rows the 2026-08-11 census measured. **Not a
+/// coverage bound** — see [`SeamPlan::uncensused`].
+fn in_census(found: Form, expected: Form) -> bool {
+    use Form::*;
+    matches!(
+        (found, expected),
+        (Raw, Ref { .. })
+            | (Raw, Slice { .. })
+            | (Raw, Opt { slice: false, .. })
+            | (Raw, Opt { slice: true, .. })
+            | (Ref { .. }, Opt { slice: false, .. })
+            | (Ref { .. }, Slice { .. })
+            | (Ref { .. }, Raw)
+    )
+}
+
+/// Compute every seam adapter the crate needs.
+///
+/// Driven by the **type-level matrix**: the walk asks [`glue`] about every
+/// `(expected, found)` pair it meets and the `match` there is exhaustive, so a
+/// pair with no census row is adapted rather than skipped. The census only says
+/// which pairs are *common*.
+pub(crate) fn synthesize(
+    tcx: TyCtxt<'_>,
+    facts: &super::emitability::EmitabilityFacts,
+    subjects: &[Subject],
+    table: &DecisionTable,
+) -> SeamPlan {
+    let sm = tcx.sess.source_map();
+    let mut plan = SeamPlan::default();
+
+    // subject key -> decision, and (fn, param index) -> subject key.
+    let mut decision_of: FxHashMap<(LocalDefId, HirId), &Decision> = FxHashMap::default();
+    for (subject, decision) in &table.entries {
+        decision_of.insert((subject.fn_did, subject.hir_id), decision);
+    }
+    let mut param_key: FxHashMap<(LocalDefId, usize), (LocalDefId, HirId)> = FxHashMap::default();
+    for subject in subjects {
+        if let SubjectKind::Param { hir_index } = subject.kind {
+            param_key.insert(
+                (subject.fn_did, hir_index),
+                (subject.fn_did, subject.hir_id),
+            );
+        }
+    }
+
+    // Deterministic callee order: `FxHashMap` iteration permutes between runs,
+    // and D19 makes a report whose order permutes non-comparable.
+    let mut callees: Vec<&LocalDefId> = facts.call_args.keys().collect();
+    callees.sort_unstable_by_key(|d| d.local_def_index.as_u32());
+
+    for callee in callees {
+        for site in &facts.call_args[callee] {
+            // ---- pass 1: what each position will look like after conversion ----
+            //
+            // Computed for the WHOLE site before any edit is emitted, because
+            // the overlap gate below is a within-site question and cannot be
+            // answered one argument at a time.
+            //
+            // A named struct rather than a tuple: `positions` deliberately does
+            // NOT align with `site.args` (raw and unnameable positions are
+            // dropped), so every field a later pass needs must be carried here.
+            // Recovering the span by re-searching `site.args` was the first
+            // shape and it reconstructed an alignment this list does not have.
+            struct Pos {
+                span: Span,
+                expected: Form,
+                found: Form,
+                text: Option<String>,
+                root: Option<HirId>,
+                blind: bool,
+            }
+            let mut positions: Vec<Pos> = Vec::new();
+            for arg in &site.args {
+                let expected = param_key
+                    .get(&(*callee, arg.index))
+                    .and_then(|k| decision_of.get(k))
+                    .map_or(Form::Raw, |d| form_of(d));
+                // A raw parameter needs nothing: a reference coerces to a raw
+                // pointer at a call, so every found form satisfies it.
+                if matches!(expected, Form::Raw) {
+                    continue;
+                }
+                let (found, text, blind) = match arg.shape {
+                    ArgShape::BareLocal(hir) => (
+                        decision_of
+                            .get(&(site.caller, hir))
+                            .map_or(Form::Raw, |d| form_of(d)),
+                        sm.span_to_snippet(arg.span).ok(),
+                        false,
+                    ),
+                    ArgShape::AddrOf {
+                        mutable,
+                        base,
+                        through_deref,
+                    } => {
+                        // §5a: a borrow rooted through a RAW deref is invisible
+                        // to borrowck. Blind exactly when the base does not
+                        // itself convert.
+                        let blind = match (base, through_deref) {
+                            (None, _) => true,
+                            (Some(b), true) => !decision_of
+                                .get(&(site.caller, b))
+                                .is_some_and(|d| !matches!(d, Decision::Degraded(_))),
+                            (Some(_), false) => false,
+                        };
+                        (
+                            Form::Ref { mutable },
+                            sm.span_to_snippet(arg.span).ok(),
+                            blind,
+                        )
+                    }
+                    ArgShape::AddrOfCast { mutable, inner } => {
+                        (Form::Ref { mutable }, sm.span_to_snippet(inner).ok(), true)
+                    }
+                    ArgShape::CastOfLocal { binding, inner } => (
+                        decision_of
+                            .get(&(site.caller, binding))
+                            .map_or(Form::Raw, |d| form_of(d)),
+                        sm.span_to_snippet(inner).ok(),
+                        false,
+                    ),
+                    // Not an expression this slice can name.
+                    ArgShape::NullLit | ArgShape::Cast { .. } | ArgShape::Other => {
+                        plan.blocked
+                            .push((site.caller, arg.span, SeamBlock::UnnameableOperand));
+                        continue;
+                    }
+                };
+                positions.push(Pos {
+                    span: arg.span,
+                    expected,
+                    found,
+                    text,
+                    root: arg.shape.place_root(),
+                    blind,
+                });
+            }
+
+            // ---- pass 2: THE SITE GATES, applied to adapter-generated
+            // arguments exactly as to converted ones (ruling item 3) ----
+            //
+            // No bypass. The reborrow family puts its borrow in the region §5a
+            // measured borrowck as blind in, so this gate is the only thing
+            // standing between a seam and silent UB.
+            let is_mut = |f: &Form| {
+                matches!(
+                    f,
+                    Form::Ref { mutable: true }
+                        | Form::Slice { mutable: true }
+                        | Form::Opt { mutable: true, .. }
+                )
+            };
+            let mut refused: Vec<usize> = Vec::new();
+            for i in 0..positions.len() {
+                for j in (i + 1)..positions.len() {
+                    // Two SHARED borrows of one place are legal, so a conflict
+                    // needs at least one `&mut`.
+                    if !is_mut(&positions[i].expected) && !is_mut(&positions[j].expected) {
+                        continue;
+                    }
+                    let same_root = !matches!(
+                        (positions[i].root, positions[j].root),
+                        (Some(x), Some(y)) if x != y
+                    );
+                    if same_root || positions[i].blind || positions[j].blind {
+                        refused.push(i);
+                        refused.push(j);
+                    }
+                }
+            }
+
+            // ---- pass 3: emit ----
+            for (idx, pos) in positions.iter().enumerate() {
+                if refused.contains(&idx) {
+                    plan.blocked
+                        .push((site.caller, pos.span, SeamBlock::SiteOverlap));
+                    continue;
+                }
+                let Some(text) = pos.text.as_deref() else {
+                    plan.blocked
+                        .push((site.caller, pos.span, SeamBlock::UnnameableOperand));
+                    continue;
+                };
+                match glue(pos.expected, pos.found, text) {
+                    Ok(None) => {}
+                    Ok(Some((replacement, family))) => {
+                        // Rule 1 (2026-08-11): the census is a prioritization
+                        // overlay, so a pair with no row is REPORTED, not
+                        // refused.
+                        if !in_census(pos.found, pos.expected) {
+                            plan.uncensused.push((pos.found, pos.expected));
+                        }
+                        plan.edits.push(SeamEdit {
+                            span: pos.span,
+                            replacement,
+                            owner_fn: tcx.def_path_str(callee.to_def_id()),
+                            family,
+                        });
+                    }
+                    Err(block) => plan.blocked.push((site.caller, pos.span, block)),
+                }
+            }
+        }
+    }
+    plan
 }

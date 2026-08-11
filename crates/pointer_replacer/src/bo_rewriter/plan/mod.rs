@@ -105,6 +105,10 @@ pub(crate) enum Justification {
     ReRoute { licensing_loan: String },
     /// G04/G05/G08: a drop-form edit (§5.3 (D)), motivated by a selector site.
     DropForm { selector_site: String },
+    /// **S3.6-1**: one expression of glue at a mismatched argument position.
+    /// `family` is `"safe"` or `"reborrow"` — the latter carries the aliasing
+    /// exposure §5a measured, so the two must stay countable apart.
+    SeamAdapter { family: &'static str },
     /// G07/G09: a store form that must NOT drop — (N-raw)/(N-safe)/(R) — or a
     /// P-drop suppression, carrying which rule applied.
     StoreForm { form: &'static str },
@@ -226,6 +230,44 @@ pub(crate) fn plan(
 ) -> Plan {
     let mut by_file: BTreeMap<FileKey, Vec<Edit>> = BTreeMap::new();
     let mut unplaceable = Vec::new();
+
+    // **S3.6-1 seam adapters, placed FIRST.**
+    //
+    // A seam edit lands in the CALLER's file and is justified by the CALLEE's
+    // subject, which is the divergence `Edit::owner_fn`'s doc was written for —
+    // and the reason the same-file guard further down does not apply to it. That
+    // guard exists because a subject's pointee text is copied by byte offset, so
+    // only a *use* edit may cross a file; a seam copies no pointee text, it
+    // wraps an expression already present in the caller.
+    //
+    // Reverting the callee reverts its seams with it, because `owner_fn` is the
+    // revert key and every seam carries the callee's path. That is what keeps a
+    // half-adapted call from surviving a revert.
+    for seam in &table.seams.edits {
+        match span_to_loc(seam.span) {
+            Ok((file, lo, hi)) => by_file.entry(file).or_default().push(Edit {
+                lo,
+                hi,
+                replacement: seam.replacement.clone(),
+                justification: Justification::SeamAdapter {
+                    family: match seam.family {
+                        super::decision::seam::SeamFamily::Safe => "safe",
+                        super::decision::seam::SeamFamily::Reborrow => "reborrow",
+                    },
+                },
+                owner_fn: seam.owner_fn.clone(),
+            }),
+            // A span that cannot be located is RECORDED, never dropped: a seam
+            // that silently vanishes leaves the callee converted and the call
+            // site raw, which is the `E0308` this whole slice exists to remove.
+            Err(reason) => unplaceable.push(Unplaceable {
+                reason,
+                detail: format!("seam adapter for {}", seam.owner_fn),
+                subject: seam.owner_fn.clone(),
+            }),
+        }
+    }
+
     for (subject, decision) in &table.entries {
         if reverted(subject) {
             continue;
@@ -480,6 +522,7 @@ mod tests {
     #[test]
     fn a_ref_decision_with_no_pointee_span_is_attributed_not_skipped() {
         let table = DecisionTable {
+            seams: Default::default(),
             entries: vec![(alias_subject(), Decision::Ref { mutable: false })],
         };
 
@@ -529,6 +572,7 @@ mod tests {
     #[test]
     fn a_degraded_subject_is_not_also_reported_unplaceable() {
         let table = DecisionTable {
+            seams: Default::default(),
             entries: vec![(
                 alias_subject(),
                 Decision::Degraded(crate::bo_rewriter::decision::Degradation {

@@ -2069,6 +2069,12 @@ fn finish_decide<'tcx>(
     // are visible — a per-subject check left 15 of brotli's 17 collisions
     // standing, measured.
     decision::refuse_nested_use_edits(tcx, &mut table);
+
+    // **S3.6-1 seam adapters.** Runs AFTER every gate that can still refuse a
+    // subject, including the nesting pass above: a seam is computed from the
+    // forms both ends actually settle on, so a subject withdrawn later would
+    // leave glue bridging to a form that no longer exists.
+    table.seams = decision::seam::synthesize(tcx, &facts, &subjects, &table);
     let table = table;
 
     // Structural self-check: the table matches the subjects it was handed. NOT
