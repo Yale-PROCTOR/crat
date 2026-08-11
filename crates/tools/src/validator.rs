@@ -13,7 +13,10 @@ use rustc_ast::{
 use rustc_ast_pretty::pprust;
 use serde::{Deserialize, Serialize, ser::SerializeStruct};
 
-use crate::preservation::{canonicalize_function, validate_preservation_metadata};
+use crate::{
+    SkeletonView,
+    preservation::{canonicalize_function_with_view, validate_skeleton_view},
+};
 
 const SCHEMA_VERSION: u64 = 1;
 const TEMP_PREFIX: &str = "proctor_temp_var_";
@@ -31,9 +34,7 @@ pub struct ValidationRequest {
 pub struct ExpectedFunction {
     pub id: u64,
     pub name: String,
-    pub skeleton: String,
-    pub needs_transformation: bool,
-    pub statements_requiring_transformation: Vec<u32>,
+    pub view: SkeletonView,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -279,7 +280,7 @@ fn parse_expected_functions(
 
     let mut parsed = vec![];
     for entry in &request.expected_functions {
-        let krate = parse_crate(&entry.skeleton).map_err(|detail| {
+        let krate = parse_crate(&entry.view.skeleton).map_err(|detail| {
             setup_error(
                 "expected_skeleton_parse_error",
                 format!(
@@ -329,9 +330,9 @@ fn validate_expected_skeleton(item: &Item, entry: &ExpectedFunction) -> Result<(
     })?;
     let body = function.body.as_ref().unwrap();
     let transformed = entry
-        .statements_requiring_transformation
-        .iter()
-        .copied()
+        .view
+        .transform_labels()
+        .into_iter()
         .collect::<HashSet<_>>();
     let preserved = statement_labels(body)
         .into_iter()
@@ -386,12 +387,7 @@ fn validate_expected_skeleton(item: &Item, entry: &ExpectedFunction) -> Result<(
             ));
         }
     }
-    validate_preservation_metadata(
-        item,
-        entry.needs_transformation,
-        &entry.statements_requiring_transformation,
-    )
-    .map_err(|error| {
+    validate_skeleton_view(item, &entry.view).map_err(|error| {
         format!(
             "Expected skeleton for `{}` (item {}) has invalid preservation metadata: {}",
             entry.name, entry.id, error.message
@@ -404,6 +400,70 @@ fn validate_expected_skeleton(item: &Item, entry: &ExpectedFunction) -> Result<(
         )
     })?;
     Ok(())
+}
+
+pub(crate) fn validate_rule_application_shape(
+    item: &Item,
+    transformed: &BTreeSet<u32>,
+) -> Result<(), String> {
+    let ItemKind::Fn(box function) = &item.kind else {
+        return Err("an applied skeleton item is not a function".to_owned());
+    };
+    validate_supported_target_signature(function)
+        .map_err(|detail| format!("unsupported target signature: {detail}"))?;
+    let body = function
+        .body
+        .as_ref()
+        .ok_or_else(|| "an applied function has no body".to_owned())?;
+    let labels = statement_labels(body);
+    let preserved = labels
+        .iter()
+        .copied()
+        .filter(|label| !transformed.contains(label))
+        .collect();
+    let mut scan = BodyScanner::new_with_preserved_labels(true, preserved);
+    scan.visit_block(body);
+    if let Some(problem) = scan.syntax_errors.first() {
+        return Err(problem.message.clone());
+    }
+    if let Some(path) = scan.unlabeled_statements.first() {
+        return Err(format!(
+            "an applied skeleton contains an unlabeled statement in {path}"
+        ));
+    }
+    if let Some(item) = scan.items.first() {
+        return Err(format!(
+            "an applied skeleton contains a function-local {} item{}",
+            item.kind,
+            label_context(item.label)
+        ));
+    }
+    if let Some(attribute) = scan.body_attributes.first() {
+        return Err(format!(
+            "an applied skeleton contains unsupported body attribute `{}`{}",
+            attribute.attribute,
+            label_context(attribute.label)
+        ));
+    }
+    if let Some(block) = scan.unsafe_blocks.first() {
+        return Err(format!(
+            "an applied skeleton contains an explicit unsafe block{}",
+            label_context(block.label)
+        ));
+    }
+    let mut seen = HashSet::new();
+    if let Some(label) = scan
+        .labels
+        .iter()
+        .map(|occurrence| occurrence.label)
+        .find(|label| !seen.insert(*label))
+    {
+        return Err(format!("an applied skeleton repeats label {label}"));
+    }
+    if seen != labels.into_iter().collect() {
+        return Err("an applied skeleton label scan is inconsistent".to_owned());
+    }
+    validate_expected_block(body, &transformed.iter().copied().collect())
 }
 
 fn validate_supported_target_signature(function: &rustc_ast::Fn) -> Result<(), &'static str> {
@@ -639,11 +699,11 @@ fn validate_function(expected: &ParsedExpected, result: &Item) -> Vec<Validation
     let ItemKind::Fn(box returned_fn) = &result.kind else { unreachable!() };
     let mut returned_scan = BodyScanner::new(false);
     returned_scan.visit_block(returned_fn.body.as_ref().unwrap());
-    let canonical = match canonicalize_function(
+    let canonical = match canonicalize_function_with_view(
         &expected.item,
         result,
-        expected.metadata.needs_transformation,
-        &expected.metadata.statements_requiring_transformation,
+        &expected.metadata.view,
+        false,
     ) {
         Ok(canonical) => canonical,
         Err(problem) => {
@@ -661,9 +721,9 @@ fn validate_function(expected: &ParsedExpected, result: &Item) -> Vec<Validation
 
     let transformed = expected
         .metadata
-        .statements_requiring_transformation
-        .iter()
-        .copied()
+        .view
+        .transform_labels()
+        .into_iter()
         .collect::<HashSet<_>>();
     let preserved = statement_labels(expected_body)
         .into_iter()

@@ -67,6 +67,41 @@ fn generate(source: &str) -> Vec<ItemRecord> {
 }
 
 #[test]
+fn source_type_and_const_generics_reject_before_rule_application() {
+    for (source, function, kind) in [
+        ("pub unsafe fn f<T>(p: *mut T) { let _ = p; }", "f", "type"),
+        (
+            "pub unsafe fn g<const N: usize>(p: *mut [i32; N]) { let _ = p; }",
+            "g",
+            "const",
+        ),
+    ] {
+        run_compiler_on_str(source, |tcx| {
+            let without_rules = make_skeletons(source, tcx).unwrap_err();
+            let empty = crate::RuleDocument::default();
+            let with_rules = make_skeletons_with_rules(source, Some(&empty), tcx).unwrap_err();
+            for error in [&without_rules, &with_rules] {
+                assert_eq!(error.kind, GenerationErrorKind::UnsupportedGeneric);
+                assert_eq!(error.function_path, function);
+                assert!(error.message.contains(kind), "{}", error.message);
+            }
+            assert_eq!(without_rules, with_rules);
+        })
+        .unwrap();
+    }
+
+    let lifetime_only = "pub unsafe fn h<'a>(p: *mut i32) { let _ = p; }";
+    run_compiler_on_str(lifetime_only, |tcx| {
+        assert!(make_skeletons(lifetime_only, tcx).is_ok());
+        assert!(
+            make_skeletons_with_rules(lifetime_only, Some(&crate::RuleDocument::default()), tcx,)
+                .is_ok()
+        );
+    })
+    .unwrap();
+}
+
+#[test]
 fn every_type_spelling_source_fixture_compiles_independently() {
     let names = [
         "motivating",
@@ -572,7 +607,7 @@ fn assert_skeleton(source: &str, path: &str, expected: &str) {
     run_compiler_on_str(source, |tcx| {
         let records = make_skeletons(source, tcx).unwrap();
         assert_eq!(
-            canonical_item(&function(&records, path).annotated_skeleton),
+            canonical_item(&function(&records, path).baseline.skeleton),
             {
                 let mut expected = utils::ast::parse_crate(expected.to_owned());
                 PresentationBindingNormalizer.visit_crate(&mut expected);
@@ -612,7 +647,7 @@ fn simple_local_types(source: &str) -> Vec<(String, String, String)> {
             let ItemRecord::Function(function) = record else {
                 continue;
             };
-            let krate = utils::ast::parse_crate(function.annotated_skeleton);
+            let krate = utils::ast::parse_crate(function.baseline.skeleton);
             let mut finder = Finder {
                 function_path: function.path,
                 locals: vec![],
@@ -648,11 +683,10 @@ fn assert_function_record_json_key_order(record: &ItemRecord) {
         "\"kind\"",
         "\"name\"",
         "\"annotated_source\"",
-        "\"annotated_skeleton\"",
+        "\"baseline\"",
+        "\"applied\"",
         "\"source_signature\"",
         "\"target_signature\"",
-        "\"needs_transformation\"",
-        "\"statements_requiring_transformation\"",
         "\"foreign_function_names\"",
         "\"signature_dependencies\"",
         "\"dependencies\"",
@@ -671,8 +705,8 @@ fn nested_same_module_inferred_local_uses_local_name() {
     let records = generate(type_spelling_source("motivating"));
     let record = function(&records, "src::lib::cb_remove_gamma_rgb");
     assert!(record.target_signature.contains("rgb: cb_rgb"));
-    assert!(record.annotated_skeleton.contains("let mut init: cb_rgb"));
-    assert!(!record.annotated_skeleton.contains("src::lib::cb_rgb"));
+    assert!(record.baseline.skeleton.contains("let mut init: cb_rgb"));
+    assert!(!record.baseline.skeleton.contains("src::lib::cb_rgb"));
 }
 
 #[test]
@@ -727,7 +761,8 @@ fn multiple_aliases_are_deterministic_and_source_hint_wins() {
     );
     assert!(
         function(&first, "aliases::inferred")
-            .annotated_skeleton
+            .baseline
+            .skeleton
             .contains("let mut value: Alpha")
     );
     let source_hint = &function(&first, "aliases::source_hint").target_signature;
@@ -810,7 +845,8 @@ fn wrong_same_spelling_binding_requires_absolute_local_fallback() {
     let inferred = function(&records, "collision::inferred");
     assert!(
         inferred
-            .annotated_skeleton
+            .baseline
+            .skeleton
             .contains("let mut value: crate::left::Thing")
     );
     let inferred_ty = simple_local_types(source)
@@ -881,7 +917,7 @@ fn local_visible_fallback_uses_public_reexport_not_private_definition_path() {
     })
     .unwrap();
     let records = generate(source);
-    let local = &function(&records, "consumer::local").annotated_skeleton;
+    let local = &function(&records, "consumer::local").baseline.skeleton;
     assert!(local.contains("let mut value: crate::api::Exposed"));
     assert!(!local.contains("hidden::Public"));
 
@@ -974,7 +1010,7 @@ fn external_visible_fallback_is_absolute_and_uses_public_reexport() {
     })
     .unwrap();
     let records = generate(reexports);
-    let external = &function(&records, "consumer::external").annotated_skeleton;
+    let external = &function(&records, "consumer::external").baseline.skeleton;
     assert!(compact(external).contains(&compact(
         "let mut value: ::std::hash::DefaultHasher = ::std::hash::DefaultHasher::new();"
     )));
@@ -1023,12 +1059,16 @@ fn external_visible_fallback_is_absolute_and_uses_public_reexport() {
         "::alt_std::hash::DefaultHasher".into()
     )));
     let alias_records = generate(alias_source);
-    assert!(compact(
-        &function(&alias_records, "consumer::external_alias").annotated_skeleton
-    )
-    .contains(&compact(
-        "let mut value: ::alt_std::hash::DefaultHasher = rust_std::hash::DefaultHasher::new();"
-    )));
+    assert!(
+        compact(
+            &function(&alias_records, "consumer::external_alias")
+                .baseline
+                .skeleton
+        )
+        .contains(&compact(
+            "let mut value: ::alt_std::hash::DefaultHasher = rust_std::hash::DefaultHasher::new();"
+        ))
+    );
 
     let renamed_extern = r#"
         #![no_std]
@@ -1077,7 +1117,8 @@ fn external_visible_fallback_is_absolute_and_uses_public_reexport() {
     let uses_alias = utils::compilation::run_compiler(config, |tcx| {
         let records = make_skeletons(renamed_extern, tcx).unwrap();
         function(&records, "external_alias")
-            .annotated_skeleton
+            .baseline
+            .skeleton
             .contains("let mut value: ::aliased_std::hash::DefaultHasher")
     })
     .unwrap();
@@ -1141,10 +1182,11 @@ fn source_alias_and_relative_pointee_paths_are_reused() {
     assert!(alias.contains("pointer: &P"), "{alias}");
     let local_alias = function(&records, "consumer::local_alias");
     assert!(local_alias.target_signature.contains("pointer: &P"));
-    assert!(local_alias.statements_requiring_transformation.contains(&0));
+    assert!(local_alias.baseline.transform_labels().contains(&0));
     assert!(
         local_alias
-            .annotated_skeleton
+            .baseline
+            .skeleton
             .contains("let mut local: &LocalP")
     );
     let alias_id = function(&records, "consumer::alias_id");
@@ -1185,7 +1227,8 @@ fn source_alias_and_relative_pointee_paths_are_reused() {
     );
     assert!(
         function(&records, "consumer::explicit_nominal")
-            .annotated_skeleton
+            .baseline
+            .skeleton
             .contains("let mut value: crate::model::PointAlias")
     );
     assert!(
@@ -1254,7 +1297,7 @@ fn same_module_parameter_return_local_and_lifetime_types_are_short() {
         "pub unsafe fn update_and_return<'a>(mut pointer: &'a mut Node) -> &'a mut Node"
     );
     assert!(!update.target_signature.contains("crate::Node"));
-    assert!(!update.annotated_skeleton.contains("crate::Node"));
+    assert!(!update.baseline.skeleton.contains("crate::Node"));
     let local_pointer = function(&records, "local_pointer");
     assert!(
         local_pointer
@@ -1268,10 +1311,11 @@ fn same_module_parameter_return_local_and_lifetime_types_are_short() {
     );
     assert!(
         local_pointer
-            .annotated_skeleton
+            .baseline
+            .skeleton
             .contains("let mut pointer: &mut Node")
     );
-    assert!(!local_pointer.annotated_skeleton.contains("crate::Node"));
+    assert!(!local_pointer.baseline.skeleton.contains("crate::Node"));
     assert!(!local_pointer.target_signature.contains("crate::Node"));
     let locals = simple_local_types(source);
     assert!(locals.contains(&("local_pointer".into(), "node".into(), "Node".into())));
@@ -1289,7 +1333,7 @@ fn raw_identifiers_remain_parseable_in_inferred_and_pointer_types() {
         assert_eq!(resolve_one_segment_type(inferred, "r#match", tcx), target);
         for record in make_skeletons(source, tcx).unwrap() {
             if let ItemRecord::Function(function) = record {
-                utils::ast::parse_crate(function.annotated_skeleton);
+                utils::ast::parse_crate(function.baseline.skeleton);
             }
         }
     })
@@ -1302,7 +1346,8 @@ fn raw_identifiers_remain_parseable_in_inferred_and_pointer_types() {
     );
     assert!(
         function(&records, "r#type::inferred")
-            .annotated_skeleton
+            .baseline
+            .skeleton
             .contains("let mut value: r#match")
     );
     let qualified = type_spelling_source("qualified-raw-fallback");
@@ -1326,7 +1371,7 @@ fn raw_identifiers_remain_parseable_in_inferred_and_pointer_types() {
         );
         for record in make_skeletons(qualified, tcx).unwrap() {
             if let ItemRecord::Function(function) = record {
-                utils::ast::parse_crate(function.annotated_skeleton);
+                utils::ast::parse_crate(function.baseline.skeleton);
             }
         }
     })
@@ -1334,7 +1379,8 @@ fn raw_identifiers_remain_parseable_in_inferred_and_pointer_types() {
     let records = generate(qualified);
     assert!(
         function(&records, "consumer::inferred")
-            .annotated_skeleton
+            .baseline
+            .skeleton
             .contains("let mut value: crate::r#type::r#match")
     );
 }
@@ -1433,12 +1479,14 @@ fn standard_constructors_require_exact_bare_prelude_resolution() {
     );
     assert!(
         function(&records, "wrapped::foo")
-            .annotated_skeleton
+            .baseline
+            .skeleton
             .contains("let mut p: Box<i32>")
     );
     assert!(
         function(&records, "wrapped::foo")
-            .annotated_skeleton
+            .baseline
+            .skeleton
             .contains("let mut q: Option<Box<i32>>")
     );
 
@@ -1482,7 +1530,8 @@ fn standard_constructors_require_exact_bare_prelude_resolution() {
     );
     assert!(
         function(&records, "imported::allocate")
-            .annotated_skeleton
+            .baseline
+            .skeleton
             .contains("let mut p: Box<i32>")
     );
 
@@ -1550,7 +1599,7 @@ fn standard_constructors_require_exact_bare_prelude_resolution() {
         function(&records, "consumer::foo").target_signature,
         "pub unsafe fn foo() -> Option<Box<ReturnP>>"
     );
-    let foo = &function(&records, "consumer::foo").annotated_skeleton;
+    let foo = &function(&records, "consumer::foo").baseline.skeleton;
     assert!(foo.contains("let mut p: Box<LocalP>"));
     assert!(foo.contains("let mut q: Option<Box<LocalQ>>"));
 
@@ -1600,10 +1649,10 @@ fn wholly_preserved_parent_does_not_materialize_nested_local() {
     let records = generate(source);
     let record = function(&records, "preserved");
     assert!(
-        !record.statements_requiring_transformation.contains(&0),
+        !record.baseline.transform_labels().contains(&0),
         "the containing `if` label must remain wholly preserved"
     );
-    let skeleton = &record.annotated_skeleton;
+    let skeleton = &record.baseline.skeleton;
     assert!(skeleton.contains("let mut value = Local { value: 1 }"));
     assert!(!skeleton.contains("let mut value: Local"));
 }
@@ -1794,7 +1843,7 @@ fn scope_tables_and_serialized_output_are_deterministic() {
             for record in make_skeletons(source, tcx).unwrap() {
                 if let ItemRecord::Function(function) = record {
                     utils::ast::parse_crate(function.annotated_source);
-                    utils::ast::parse_crate(function.annotated_skeleton);
+                    utils::ast::parse_crate(function.baseline.skeleton);
                 }
             }
         })
@@ -1804,7 +1853,8 @@ fn scope_tables_and_serialized_output_are_deterministic() {
     let candidates = generate(type_spelling_source("candidates"));
     assert!(
         function(&candidates, "aliases::inferred")
-            .annotated_skeleton
+            .baseline
+            .skeleton
             .contains("let mut value: Alpha")
     );
     assert!(
@@ -1814,18 +1864,21 @@ fn scope_tables_and_serialized_output_are_deterministic() {
     );
     assert!(
         function(&candidates, "collision::inferred")
-            .annotated_skeleton
+            .baseline
+            .skeleton
             .contains("crate::left::Thing")
     );
     let reexports = generate(type_spelling_source("reexports"));
     assert!(
         function(&reexports, "consumer::local")
-            .annotated_skeleton
+            .baseline
+            .skeleton
             .contains("crate::api::Exposed")
     );
     assert!(
         function(&reexports, "consumer::external")
-            .annotated_skeleton
+            .baseline
+            .skeleton
             .contains("::std::hash::DefaultHasher")
     );
     let routes = generate(type_spelling_source("local-fallback-routes"));
@@ -1834,12 +1887,13 @@ fn scope_tables_and_serialized_output_are_deterministic() {
         ("consumer::shortest", "crate::short::S"),
         ("consumer::tie", "crate::alpha::T"),
     ] {
-        assert!(function(&routes, path).annotated_skeleton.contains(ty));
+        assert!(function(&routes, path).baseline.skeleton.contains(ty));
     }
     let aliases = generate(type_spelling_source("external-root-alias"));
     assert!(
         function(&aliases, "consumer::external_alias")
-            .annotated_skeleton
+            .baseline
+            .skeleton
             .contains("::alt_std::hash::DefaultHasher")
     );
 
@@ -1901,12 +1955,10 @@ fn record_variants_serialize_only_their_defined_fields() {
             "kind",
             "name",
             "annotated_source",
-            "annotated_skeleton",
+            "baseline",
+            "applied",
             "source_signature",
             "target_signature",
-            "needs_transformation",
-            "statements_requiring_transformation",
-            "statement_pair_metadata",
             "foreign_function_names",
             "signature_dependencies",
             "dependencies"
@@ -1957,10 +2009,11 @@ fn json_round_trip_preserves_embedded_rust_text() {
     assert_eq!(before.source_signature, "pub unsafe fn text() -> usize");
     assert!(
         before
-            .annotated_skeleton
+            .baseline
+            .skeleton
             .contains("let mut s: &str = \"quote:"),
         "{}",
-        before.annotated_skeleton
+        before.baseline.skeleton
     );
 }
 
@@ -2394,7 +2447,7 @@ fn labels_let_semi_and_tail_statements() {
     );
     let f = function(&records, "f");
     assert_eq!(labels(&f.annotated_source), [0, 1, 2]);
-    assert_eq!(labels(&f.annotated_skeleton), [0, 1, 2]);
+    assert_eq!(labels(&f.baseline.skeleton), [0, 1, 2]);
 }
 
 #[test]
@@ -2404,7 +2457,7 @@ fn labels_reset_for_each_function() {
     );
     for path in ["a", "b"] {
         assert_eq!(labels(&function(&records, path).annotated_source), [0, 1]);
-        assert_eq!(labels(&function(&records, path).annotated_skeleton), [0, 1]);
+        assert_eq!(labels(&function(&records, path).baseline.skeleton), [0, 1]);
     }
 }
 
@@ -2424,7 +2477,7 @@ fn source_and_skeleton_have_identical_label_trees() {
     let records = generate(comprehensive_control_fixture());
     let f = function(&records, "comprehensive");
     assert_eq!(labels(&f.annotated_source), (0..=11).collect::<Vec<_>>());
-    assert_eq!(labels(&f.annotated_source), labels(&f.annotated_skeleton));
+    assert_eq!(labels(&f.annotated_source), labels(&f.baseline.skeleton));
 }
 
 #[test]
@@ -2507,7 +2560,7 @@ fn rejects_representative_other_local_items() {
 fn replaces_leaf_expression_payloads_with_todo() {
     let source = "unsafe fn callee(_x: i32) {} pub unsafe fn f() -> i32 { let x = 1; callee(x); println!(\"{x}\"); -x + 2 }";
     let records = generate(source);
-    let skeleton = &function(&records, "f").annotated_skeleton;
+    let skeleton = &function(&records, "f").baseline.skeleton;
     assert!(skeleton.contains("let mut x: i32 = 1;"));
     assert_eq!(skeleton.matches("todo!()").count(), 1);
     assert_eq!(labels(skeleton), [0, 1, 2, 3]);
@@ -2522,7 +2575,7 @@ fn replaces_leaf_expression_payloads_with_todo() {
 fn materializes_inferred_types_for_simple_bindings() {
     let source = "struct Local; pub unsafe fn f() { let b = true; let i = -1i32; let u = 1u64; let n = 1.5f32; let c = 'x'; let t = (1i32, 2u8); let a = [1u16; 3]; let r = &i; let l = Local; }";
     let records = generate(source);
-    let skeleton = compact(&function(&records, "f").annotated_skeleton);
+    let skeleton = compact(&function(&records, "f").baseline.skeleton);
     for declaration in [
         "let mut b: bool = true;",
         "let mut i: i32 = -1i32;",
@@ -2550,7 +2603,7 @@ fn materializes_inferred_types_for_simple_bindings() {
 fn preserves_mutability_declarations_and_existing_types() {
     let source = "struct T; type Count = i32; pub unsafe fn f() { let mut a = 1; let x: T; let y: Count = 2; x = T; let _ = (a, x, y); }";
     let records = generate(source);
-    let skeleton = compact(&function(&records, "f").annotated_skeleton);
+    let skeleton = compact(&function(&records, "f").baseline.skeleton);
     assert!(skeleton.contains("let mut a: i32 = 1;"));
     assert!(skeleton.contains("let mut x: T;"));
     assert!(skeleton.contains("let mut y: Count = 2;"));
@@ -2566,7 +2619,7 @@ fn preserves_mutability_declarations_and_existing_types() {
 fn holes_assignments_and_preserves_return_and_break_roles() {
     let source = "pub unsafe fn f(mut x: i32) -> i32 { x = 1; x += 2; let y = loop { break x; }; return y; }";
     let records = generate(source);
-    let skeleton = compact(&function(&records, "f").annotated_skeleton);
+    let skeleton = compact(&function(&records, "f").baseline.skeleton);
     assert!(skeleton.contains("let mut y: i32 = loop"));
     assert!(skeleton.contains("break x;"));
     assert!(skeleton.contains("return y;"));
@@ -2581,11 +2634,11 @@ fn holes_assignments_and_preserves_return_and_break_roles() {
 fn preserves_if_and_else_structure() {
     let source = "unsafe fn sink(_x: i32) {} pub unsafe fn f(flag: bool) { if flag { sink(1); } else { sink(2); } }";
     let records = generate(source);
-    let skeleton = compact(&function(&records, "f").annotated_skeleton);
+    let skeleton = compact(&function(&records, "f").baseline.skeleton);
     assert!(skeleton.contains("if flag"));
     assert!(skeleton.contains("} else {"));
     assert_eq!(
-        labels(&function(&records, "f").annotated_skeleton),
+        labels(&function(&records, "f").baseline.skeleton),
         [0, 1, 2]
     );
     assert_skeleton(
@@ -2600,8 +2653,8 @@ fn preserves_nested_if_and_else_if_structure() {
     let source = "pub unsafe fn f(a: bool, b: bool, c: bool) -> i32 { let x = if a { 1 } else { 2 }; if b { if c { x } else { 3 } } else if a { 4 } else { 5 } }";
     let records = generate(source);
     let f = function(&records, "f");
-    assert_eq!(labels(&f.annotated_skeleton), (0..=8).collect::<Vec<_>>());
-    assert_eq!(f.annotated_skeleton.matches("if ").count(), 4);
+    assert_eq!(labels(&f.baseline.skeleton), (0..=8).collect::<Vec<_>>());
+    assert_eq!(f.baseline.skeleton.matches("if ").count(), 4);
     assert_skeleton(
         source,
         "f",
@@ -2613,7 +2666,7 @@ fn preserves_nested_if_and_else_if_structure() {
 fn preserves_if_let_and_while_let_patterns() {
     let source = "unsafe fn sink(_x: i32) {} pub unsafe fn f(mut value: Option<i32>) { if let Some(x) = value { sink(x); } while let Some(x) = value { sink(x); value = None; } }";
     let records = generate(source);
-    let skeleton = compact(&function(&records, "f").annotated_skeleton);
+    let skeleton = compact(&function(&records, "f").baseline.skeleton);
     assert!(skeleton.contains("if let Some(mut x) = value"));
     assert!(skeleton.contains("while let Some(mut x) = value"));
     assert_skeleton(
@@ -2627,7 +2680,7 @@ fn preserves_if_let_and_while_let_patterns() {
 fn preserves_while_for_and_loop_constructs() {
     let source = "unsafe fn sink(_x: i32) {} pub unsafe fn f(mut n: i32, pairs: [(i32, i32); 2]) { 'w: while n > 0 { n -= 1; } for (x, y) in pairs { sink(x + y); } 'l: loop { break 'l; } }";
     let records = generate(source);
-    let skeleton = compact(&function(&records, "f").annotated_skeleton);
+    let skeleton = compact(&function(&records, "f").baseline.skeleton);
     assert!(skeleton.contains("'w: while n > 0"));
     assert!(skeleton.contains("for (mut x, mut y) in todo!()"));
     assert!(skeleton.contains("'l: loop"));
@@ -2643,8 +2696,8 @@ fn preserves_match_arms_patterns_guards_and_order() {
     let source = "enum E { Unit, Tuple(i32), Struct { x: i32 } } unsafe fn sink(_x: i32) {} pub unsafe fn f(e: E, n: i32, pair: (i32, i32)) -> i32 { let a = match e { E::Unit => { 0 } E::Tuple(x) if x > 0 => { x } E::Tuple(_) => { -1 } E::Struct { x } => { sink(x); x }, }; let b = match n { 0 => { 0 } 1..=3 => { 1 } _ => { 2 } }; match pair { (x, y) => { a + b + x + y } } }";
     let records = generate(source);
     let f = function(&records, "f");
-    assert_eq!(labels(&f.annotated_skeleton), (0..=11).collect::<Vec<_>>());
-    let skeleton = compact(&f.annotated_skeleton);
+    assert_eq!(labels(&f.baseline.skeleton), (0..=11).collect::<Vec<_>>());
+    let skeleton = compact(&f.baseline.skeleton);
     assert!(skeleton.contains("E::Tuple(mut x) if x > 0"));
     assert!(skeleton.contains("1..=3 =>"));
     assert_skeleton(
@@ -2659,8 +2712,8 @@ fn preserves_let_else_and_plain_nested_blocks() {
     let source = "unsafe fn sink(_x: i32) {} pub unsafe fn f(value: Option<i32>) -> i32 { let Some(x): Option<i32> = value else { return 0; }; let y = { sink(x); x + 1 }; y }";
     let records = generate(source);
     let f = function(&records, "f");
-    assert_eq!(labels(&f.annotated_skeleton), [0, 1, 2, 3, 4, 5]);
-    let skeleton = compact(&f.annotated_skeleton);
+    assert_eq!(labels(&f.baseline.skeleton), [0, 1, 2, 3, 4, 5]);
+    let skeleton = compact(&f.baseline.skeleton);
     assert!(skeleton.contains("let Some(mut x): Option<i32> = value else"));
     assert!(skeleton.contains("return 0;"));
     assert_skeleton(
@@ -2674,7 +2727,7 @@ fn preserves_let_else_and_plain_nested_blocks() {
 fn preserves_existing_identifiers_paths_and_patterns() {
     let source = "mod m { pub struct Pair { pub left: i32, pub right: i32 } } pub unsafe fn keep_names(mut input_value: m::Pair) -> i32 { let mut local_total = input_value.left; 'outer: loop { let m::Pair { left: bound_left, right: bound_right } = input_value; local_total += bound_left + bound_right; break 'outer; } local_total }";
     let records = generate(source);
-    let skeleton = &function(&records, "keep_names").annotated_skeleton;
+    let skeleton = &function(&records, "keep_names").baseline.skeleton;
     for name in ["input_value", "local_total", "bound_left", "bound_right"] {
         assert!(skeleton.contains(name));
     }
@@ -2698,7 +2751,7 @@ fn annotated_source_and_skeleton_snippets_parse_independently() {
     let f = function(&records, "comprehensive");
     assert_eq!(labels(&f.annotated_source), (0..=11).collect::<Vec<_>>());
     run_compiler_on_str(&f.annotated_source, |_| ()).unwrap();
-    run_compiler_on_str(&f.annotated_skeleton, |_| ()).unwrap();
+    run_compiler_on_str(&f.baseline.skeleton, |_| ()).unwrap();
 }
 
 #[test]
@@ -2706,7 +2759,7 @@ fn preserves_payloadless_control_expressions_without_holes() {
     let source =
         "pub unsafe fn f(flag: bool) { if flag { return; } loop { if flag { continue; } break; } }";
     let records = generate(source);
-    let skeleton = &function(&records, "f").annotated_skeleton;
+    let skeleton = &function(&records, "f").baseline.skeleton;
     for expression in ["return;", "continue;", "break;"] {
         assert_eq!(skeleton.matches(expression).count(), 1);
     }
@@ -2748,12 +2801,12 @@ fn allows_restricted_conditionals_beneath_non_control_payloads() {
     for path in ["assign", "wrapped_return"] {
         let function = function(&records, path);
         assert_eq!(labels(&function.annotated_source), [0]);
-        assert_eq!(labels(&function.annotated_skeleton), [0]);
-        assert!(function.annotated_skeleton.contains("if "));
+        assert_eq!(labels(&function.baseline.skeleton), [0]);
+        assert!(function.baseline.skeleton.contains("if "));
     }
     let wrapped_let = function(&records, "wrapped_let");
     assert_eq!(labels(&wrapped_let.annotated_source), [0, 1]);
-    assert_eq!(labels(&wrapped_let.annotated_skeleton), [0, 1]);
+    assert_eq!(labels(&wrapped_let.baseline.skeleton), [0, 1]);
     assert_skeleton(
         source,
         "assign",
@@ -2791,9 +2844,9 @@ fn allows_else_if_chains_and_recursive_branch_tail_conditionals() {
     for path in ["chained", "nested"] {
         let function = function(&records, path);
         assert_eq!(labels(&function.annotated_source), [0, 1]);
-        assert_eq!(labels(&function.annotated_skeleton), [0, 1]);
+        assert_eq!(labels(&function.baseline.skeleton), [0, 1]);
         assert_eq!(function.annotated_source.matches("if ").count(), 2);
-        assert!(function.annotated_skeleton.contains("if "));
+        assert!(function.baseline.skeleton.contains("if "));
         assert_skeleton(
             source,
             path,
@@ -2890,12 +2943,14 @@ fn selects_shared_and_mutable_scalar_references() {
     );
     assert!(
         function(&records, "write_local")
-            .annotated_skeleton
+            .baseline
+            .skeleton
             .contains("let mut p: &mut i32")
     );
     assert!(
         function(&records, "read_local")
-            .annotated_skeleton
+            .baseline
+            .skeleton
             .contains("let mut p: &i32")
     );
 }
@@ -2926,12 +2981,14 @@ fn selects_shared_and_mutable_slices_for_array_borrows() {
     let records = generate(array_pointer_fixture());
     assert!(
         function(&records, "read_array")
-            .annotated_skeleton
+            .baseline
+            .skeleton
             .contains("let mut p: &[i32]")
     );
     assert!(
         function(&records, "write_array")
-            .annotated_skeleton
+            .baseline
+            .skeleton
             .contains("let mut p: &mut [i32]")
     );
     assert!(!skeletons_to_json(&records).unwrap().contains("SliceCursor"));
@@ -2942,12 +2999,14 @@ fn promotes_array_derived_locals_to_explicit_slices() {
     let records = generate(array_pointer_fixture());
     assert!(
         function(&records, "read_array")
-            .annotated_skeleton
+            .baseline
+            .skeleton
             .contains("let mut p: &[i32] = todo!();")
     );
     assert!(
         function(&records, "write_array")
-            .annotated_skeleton
+            .baseline
+            .skeleton
             .contains("let mut p: &mut [i32] = todo!();")
     );
 }
@@ -2963,7 +3022,8 @@ fn selects_scalar_box_types_from_ownership_analysis() {
     assert_eq!(alloc.target_signature, "pub unsafe fn alloc() -> Box<i32>");
     assert!(
         alloc
-            .annotated_skeleton
+            .baseline
+            .skeleton
             .contains("let mut p: Box<i32> = todo!();")
     );
 }
@@ -2982,7 +3042,8 @@ fn selects_boxed_slice_types_from_ownership_and_fatness() {
     );
     assert!(
         alloc
-            .annotated_skeleton
+            .baseline
+            .skeleton
             .contains("let mut p: Box<[i32]> = todo!();")
     );
 }
@@ -3017,7 +3078,8 @@ fn preserves_nullable_returned_borrow_relationships() {
     }
     assert!(
         function(&records, "maybe_local")
-            .annotated_skeleton
+            .baseline
+            .skeleton
             .contains("let mut r: Option<&mut i32>")
     );
 }
@@ -3045,7 +3107,8 @@ fn keeps_required_raw_pointers_raw() {
     );
     assert!(
         function(&records, "global_escape")
-            .annotated_skeleton
+            .baseline
+            .skeleton
             .contains("let mut p: *mut *mut i32")
     );
 }
@@ -3202,7 +3265,7 @@ fn selects_optional_boxes_at_local_call_boundaries() {
             .target_signature
             .ends_with("-> Option<Box<i32>>")
     );
-    let skeleton = &function(&records, "foo").annotated_skeleton;
+    let skeleton = &function(&records, "foo").baseline.skeleton;
     assert!(skeleton.contains("let mut p: Box<i32>"));
     assert!(skeleton.contains("let mut q: Option<Box<i32>>"));
 }
@@ -3263,12 +3326,14 @@ fn tools_mode_disables_conservative_slice_cursors_without_changing_crat_default(
     );
     assert!(
         function(&records, "read_at")
-            .annotated_skeleton
+            .baseline
+            .skeleton
             .contains("let mut nonnegative: isize")
     );
     assert!(
         function(&records, "caller")
-            .annotated_skeleton
+            .baseline
+            .skeleton
             .contains("let mut values: [i32; 4]")
     );
 }
@@ -3298,11 +3363,11 @@ fn comprehensive_fixture_emits_consistent_records() {
             .contains("p: &Point")
     );
     assert_eq!(
-        labels(&function(&records, "model::read").annotated_skeleton),
+        labels(&function(&records, "model::read").baseline.skeleton),
         [0, 1, 2, 3]
     );
     assert_eq!(
-        labels(&function(&records, "helper").annotated_skeleton),
+        labels(&function(&records, "helper").baseline.skeleton),
         [0, 1, 2, 3, 4, 5]
     );
 }
@@ -3407,16 +3472,12 @@ fn existing_pointer_and_protocol_regressions_change_only_rendered_tools_types() 
     let expected = ExpectedFunction {
         id: tree_function.id,
         name: tree_function.name.clone(),
-        skeleton: tree_function.annotated_skeleton.clone(),
-        needs_transformation: tree_function.needs_transformation,
-        statements_requiring_transformation: tree_function
-            .statements_requiring_transformation
-            .clone(),
+        view: tree_function.baseline.clone(),
     };
     let validation_request = ValidationRequest {
         schema_version: 1,
         expected_functions: vec![expected],
-        transformation: tree_function.annotated_skeleton.clone(),
+        transformation: tree_function.baseline.skeleton.clone(),
     };
     let validation_json = serde_json::to_string(&validation_request).unwrap();
     assert_eq!(
@@ -3440,13 +3501,9 @@ fn existing_pointer_and_protocol_regressions_change_only_rendered_tools_types() 
             id: tree_function.id,
             path: tree_function.path.clone(),
             name: tree_function.name.clone(),
-            skeleton: tree_function.annotated_skeleton.clone(),
-            needs_transformation: tree_function.needs_transformation,
-            statements_requiring_transformation: tree_function
-                .statements_requiring_transformation
-                .clone(),
+            view: tree_function.baseline.clone(),
         }],
-        transformation: tree_function.annotated_skeleton.clone(),
+        transformation: tree_function.baseline.skeleton.clone(),
     };
     let replacement_json = serde_json::to_string(&replacement_request).unwrap();
     assert_eq!(
@@ -3877,8 +3934,8 @@ fn generated_local_name_validates_replaces_and_compiles_in_original_module() {
             record.target_signature,
             "pub unsafe fn cb_remove_gamma_rgb(mut rgb: cb_rgb) -> cb_rgb"
         );
-        assert_eq!(record.statements_requiring_transformation, [0, 1]);
-        let generated_labels = labels(&record.annotated_skeleton);
+        assert_eq!(record.baseline.transform_labels(), [0, 1]);
+        let generated_labels = labels(&record.baseline.skeleton);
         assert_eq!(generated_labels, [0, 1, 2, 3]);
         let [result_label, init_label, init_tail_label, result_tail_label] = generated_labels[..]
         else {
@@ -3911,11 +3968,7 @@ fn generated_local_name_validates_replaces_and_compiles_in_original_module() {
             expected_functions: vec![ExpectedFunction {
                 id: record.id,
                 name: record.name.clone(),
-                skeleton: record.annotated_skeleton.clone(),
-                needs_transformation: record.needs_transformation,
-                statements_requiring_transformation: record
-                    .statements_requiring_transformation
-                    .clone(),
+                view: record.baseline.clone(),
             }],
             transformation: transformation.clone(),
         });
@@ -3934,11 +3987,7 @@ fn generated_local_name_validates_replaces_and_compiles_in_original_module() {
             expected_functions: vec![ExpectedFunction {
                 id: record.id,
                 name: record.name.clone(),
-                skeleton: record.annotated_skeleton.clone(),
-                needs_transformation: record.needs_transformation,
-                statements_requiring_transformation: record
-                    .statements_requiring_transformation
-                    .clone(),
+                view: record.baseline.clone(),
             }],
             transformation: contrast,
         });
@@ -3957,11 +4006,7 @@ fn generated_local_name_validates_replaces_and_compiles_in_original_module() {
                     id: record.id,
                     path: record.path.clone(),
                     name: record.name.clone(),
-                    skeleton: record.annotated_skeleton.clone(),
-                    needs_transformation: record.needs_transformation,
-                    statements_requiring_transformation: record
-                        .statements_requiring_transformation
-                        .clone(),
+                    view: record.baseline.clone(),
                 }],
                 transformation,
             },
@@ -4095,7 +4140,7 @@ pub unsafe fn f(
 }"#;
     let records = generate(source);
     let record = function(&records, "f");
-    for rendering in [&record.annotated_source, &record.annotated_skeleton] {
+    for rendering in [&record.annotated_source, &record.baseline.skeleton] {
         for fragment in [
             "mut pair: (i32, i32)",
             "mut opt: Option<(i32, i32)>",
@@ -4125,7 +4170,7 @@ pub unsafe fn f(
     );
     let ref_mut = function(&ref_mut, "ref_mut_source");
     assert!(ref_mut.annotated_source.contains("let ref mut borrowed"));
-    assert!(ref_mut.annotated_skeleton.contains("let ref mut borrowed"));
+    assert!(ref_mut.baseline.skeleton.contains("let ref mut borrowed"));
 }
 
 #[test]
@@ -4141,9 +4186,10 @@ fn safe_source_functions_get_unsafe_target_headers() {
     );
     assert!(safe.annotated_source.starts_with("pub fn safe"));
     assert!(safe.annotated_source.contains("let mut value = input;"));
-    assert!(safe.annotated_skeleton.starts_with("pub unsafe fn safe"));
+    assert!(safe.baseline.skeleton.starts_with("pub unsafe fn safe"));
     assert!(
-        safe.annotated_skeleton
+        safe.baseline
+            .skeleton
             .contains("let mut value: i32 = input;")
     );
     assert_eq!(
@@ -4301,26 +4347,18 @@ fn existing_function_records_and_helpers_adopt_the_final_shape() {
     value + 1
 }"#;
     let records = generate(source);
+    let value: serde_json::Value =
+        serde_json::from_str(&skeletons_to_json(&records).unwrap()).unwrap();
+    let function = &value.as_array().unwrap()[0];
+    assert_eq!(function["baseline"], function["applied"]);
+    assert_eq!(function["baseline"]["needs_transformation"], false);
     assert_eq!(
-        skeletons_to_json(&records).unwrap(),
-        r#"[
-  {
-    "id": 0,
-    "path": "scalar",
-    "kind": "Fn",
-    "name": "scalar",
-    "annotated_source": "pub unsafe fn scalar(mut value: i32) -> i32 {\n    #[proctor(0)]\n    (value + 1)\n}",
-    "annotated_skeleton": "pub unsafe fn scalar(mut value: i32) -> i32 {\n    #[proctor(0)]\n    (value + 1)\n}",
-    "source_signature": "pub unsafe fn scalar(mut value: i32) -> i32",
-    "target_signature": "pub unsafe fn scalar(mut value: i32) -> i32",
-    "needs_transformation": false,
-    "statements_requiring_transformation": [],
-    "statement_pair_metadata": [],
-    "foreign_function_names": [],
-    "signature_dependencies": [],
-    "dependencies": []
-  }
-]"#
+        function["baseline"]["statement_pair_metadata"],
+        serde_json::json!([])
+    );
+    assert_eq!(
+        function["baseline"]["statement_dispositions"],
+        serde_json::json!([{"label": 0, "disposition": "preserve", "children": []}])
     );
 }
 
@@ -4447,9 +4485,9 @@ pub unsafe fn scalar(mut x: i32, y: i32, z: i32) -> i32 {
 "#;
     let records = generate(source);
     let function = function(&records, "scalar");
-    assert!(!function.needs_transformation);
-    assert!(function.statements_requiring_transformation.is_empty());
-    let skeleton = compact(&function.annotated_skeleton);
+    assert!(!function.baseline.needs_transformation);
+    assert!(function.baseline.transform_labels().is_empty());
+    let skeleton = compact(&function.baseline.skeleton);
     assert!(skeleton.contains("y + z"));
     assert!(skeleton.contains("sum * 2"));
     assert!(skeleton.contains("return x"));
@@ -4472,9 +4510,9 @@ pub unsafe fn mixed(mut p: *mut i32, flag: bool, y: i32, z: i32) -> i32 {
 "#;
     let records = generate(source);
     let function = function(&records, "mixed");
-    assert!(function.needs_transformation);
-    assert_eq!(function.statements_requiring_transformation, [0, 2]);
-    let skeleton = compact(&function.annotated_skeleton);
+    assert!(function.baseline.needs_transformation);
+    assert_eq!(function.baseline.transform_labels(), [0, 2]);
+    let skeleton = compact(&function.baseline.skeleton);
     assert!(skeleton.contains("if todo!()"));
     assert!(skeleton.contains("y + z"));
     assert!(skeleton.contains("y - z"));
@@ -4495,10 +4533,7 @@ pub unsafe fn caller(values: &[i32], left: i32, right: i32) -> i32 {
 "#;
     let records = generate(source);
     let caller = function(&records, "caller");
-    assert_eq!(
-        caller.statements_requiring_transformation,
-        Vec::<u32>::new()
-    );
+    assert_eq!(caller.baseline.transform_labels(), Vec::<u32>::new());
 }
 
 #[test]
@@ -4514,7 +4549,7 @@ pub unsafe fn cases(values: &[i32], pointer: *mut i32, value: i32) -> i32 {
 "#;
     let records = generate(source);
     let function = function(&records, "cases");
-    assert_eq!(function.statements_requiring_transformation, [0, 1, 2]);
+    assert_eq!(function.baseline.transform_labels(), [0, 1, 2]);
 }
 
 #[test]
@@ -4537,8 +4572,8 @@ pub unsafe fn values(
 "#;
     let records = generate(source);
     let function = function(&records, "values");
-    assert_eq!(function.statements_requiring_transformation, [0, 2]);
-    assert!(compact(&function.annotated_skeleton).contains("other_integers"));
+    assert_eq!(function.baseline.transform_labels(), [0, 2]);
+    assert!(compact(&function.baseline.skeleton).contains("other_integers"));
 }
 
 #[test]
@@ -4552,8 +4587,8 @@ pub unsafe fn conditional(mut x: i32, flag: bool, pointer: *mut i32) -> i32 {
 "#;
     let records = generate(source);
     let function = function(&records, "conditional");
-    assert_eq!(function.statements_requiring_transformation, [1]);
-    let skeleton = compact(&function.annotated_skeleton);
+    assert_eq!(function.baseline.transform_labels(), [1]);
+    let skeleton = compact(&function.baseline.skeleton);
     assert!(skeleton.contains("1 + if flag"));
     assert_eq!(skeleton.matches("todo!()").count(), 1);
 }
@@ -4571,7 +4606,8 @@ pub unsafe fn move_future(mut left: FutureField, right: FutureField) -> i32 {
     let ordinary = generate(source);
     assert!(
         function(&ordinary, "move_future")
-            .statements_requiring_transformation
+            .baseline
+            .transform_labels()
             .is_empty()
     );
     let changed = run_compiler_on_str(source, |tcx| {
@@ -4583,11 +4619,13 @@ pub unsafe fn move_future(mut left: FutureField, right: FutureField) -> i32 {
         overrides
             .changed_fields
             .insert(variant.fields()[0].def_id.to_def_id());
-        make_skeletons_with_preservation_overrides(source, tcx, &overrides).unwrap()
+        make_skeletons_with_preservation_overrides(source, None, tcx, &overrides).unwrap()
     })
     .unwrap();
     assert_eq!(
-        function(&changed, "move_future").statements_requiring_transformation,
+        function(&changed, "move_future")
+            .baseline
+            .transform_labels(),
         [0, 1]
     );
 }
@@ -4600,7 +4638,8 @@ pub unsafe fn scalar_caller(value: i32) -> i32 { scalar_callee(value) }
 "#;
     assert!(
         function(&generate(source), "scalar_caller")
-            .statements_requiring_transformation
+            .baseline
+            .transform_labels()
             .is_empty()
     );
     let changed = run_compiler_on_str(source, |tcx| {
@@ -4608,11 +4647,13 @@ pub unsafe fn scalar_caller(value: i32) -> i32 { scalar_callee(value) }
         overrides
             .changed_local_signatures
             .insert(local_def("scalar_callee", tcx));
-        make_skeletons_with_preservation_overrides(source, tcx, &overrides).unwrap()
+        make_skeletons_with_preservation_overrides(source, None, tcx, &overrides).unwrap()
     })
     .unwrap();
     assert_eq!(
-        function(&changed, "scalar_caller").statements_requiring_transformation,
+        function(&changed, "scalar_caller")
+            .baseline
+            .transform_labels(),
         [0]
     );
 }
@@ -4806,7 +4847,8 @@ fn exact_scalar_call_and_pointer_matrix() {
     );
     assert!(
         function(&scalar, "arithmetic")
-            .statements_requiring_transformation
+            .baseline
+            .transform_labels()
             .is_empty()
     );
 
@@ -4832,17 +4874,18 @@ fn exact_scalar_call_and_pointer_matrix() {
     for path in ["safe_calls", "local_call"] {
         assert!(
             function(&calls, path)
-                .statements_requiring_transformation
+                .baseline
+                .transform_labels()
                 .is_empty(),
             "{path}"
         );
     }
     assert_eq!(
-        function(&calls, "foreign_call").statements_requiring_transformation,
+        function(&calls, "foreign_call").baseline.transform_labels(),
         [0]
     );
     assert_eq!(
-        function(&calls, "unsafe_calls").statements_requiring_transformation,
+        function(&calls, "unsafe_calls").baseline.transform_labels(),
         [0, 1]
     );
 
@@ -4855,7 +4898,9 @@ fn exact_scalar_call_and_pointer_matrix() {
         }"#,
     );
     assert_eq!(
-        function(&pointers, "pointer_uses").statements_requiring_transformation,
+        function(&pointers, "pointer_uses")
+            .baseline
+            .transform_labels(),
         [0, 1, 2]
     );
 }
@@ -4873,7 +4918,9 @@ fn exact_declaration_generic_and_macro_matrix() {
         }"#,
     );
     assert_eq!(
-        function(&declarations, "declarations").statements_requiring_transformation,
+        function(&declarations, "declarations")
+            .baseline
+            .transform_labels(),
         [1, 3, 5]
     );
     let nested = generate(
@@ -4888,12 +4935,11 @@ fn exact_declaration_generic_and_macro_matrix() {
             size
         }"#,
     );
+    assert_eq!(function(&nested, "nested").baseline.transform_labels(), [0]);
     assert_eq!(
-        function(&nested, "nested").statements_requiring_transformation,
-        [0]
-    );
-    assert_eq!(
-        function(&nested, "type_arguments").statements_requiring_transformation,
+        function(&nested, "type_arguments")
+            .baseline
+            .transform_labels(),
         [0, 1, 2]
     );
     let macros = generate(
@@ -4905,7 +4951,7 @@ fn exact_declaration_generic_and_macro_matrix() {
         }"#,
     );
     assert_eq!(
-        function(&macros, "macros").statements_requiring_transformation,
+        function(&macros, "macros").baseline.transform_labels(),
         [0, 1, 2]
     );
 }
@@ -4942,7 +4988,9 @@ fn exact_local_adt_matrix_opens_alias_union_and_recursive_fields() {
         }"#,
     );
     assert_eq!(
-        function(&records, "move_values").statements_requiring_transformation,
+        function(&records, "move_values")
+            .baseline
+            .transform_labels(),
         [0, 1, 2, 3]
     );
 }
@@ -4965,7 +5013,7 @@ fn exact_patterns_control_and_unsafe_storage_matrix() {
         }"#,
     );
     assert_eq!(
-        function(&patterns, "patterns").statements_requiring_transformation,
+        function(&patterns, "patterns").baseline.transform_labels(),
         [1, 3, 6]
     );
 
@@ -4981,7 +5029,8 @@ fn exact_patterns_control_and_unsafe_storage_matrix() {
     );
     assert!(
         function(&safe_control, "control")
-            .statements_requiring_transformation
+            .baseline
+            .transform_labels()
             .is_empty()
     );
 
@@ -4995,7 +5044,7 @@ fn exact_patterns_control_and_unsafe_storage_matrix() {
         }"#,
     );
     assert_eq!(
-        function(&storage, "storage").statements_requiring_transformation,
+        function(&storage, "storage").baseline.transform_labels(),
         [0, 1, 2]
     );
 
@@ -5016,7 +5065,9 @@ fn exact_patterns_control_and_unsafe_storage_matrix() {
         }"#,
     );
     assert_eq!(
-        function(&control_patterns, "control_patterns").statements_requiring_transformation,
+        function(&control_patterns, "control_patterns")
+            .baseline
+            .transform_labels(),
         [0, 1, 2, 3, 4, 5]
     );
 
@@ -5030,7 +5081,9 @@ fn exact_patterns_control_and_unsafe_storage_matrix() {
         }"#,
     );
     assert_eq!(
-        function(&mixed_storage, "mixed_storage").statements_requiring_transformation,
+        function(&mixed_storage, "mixed_storage")
+            .baseline
+            .transform_labels(),
         [0]
     );
 }
@@ -5050,7 +5103,9 @@ fn exact_validator_fixture_has_recursive_parent_disposition() {
         }"#,
     );
     assert_eq!(
-        function(&records, "validate_me").statements_requiring_transformation,
+        function(&records, "validate_me")
+            .baseline
+            .transform_labels(),
         [1, 3]
     );
 }
@@ -5076,19 +5131,21 @@ fn exact_unsupported_callable_and_desugar_matrix() {
         }"#,
     );
     assert_eq!(
-        function(&functions, "invoke").statements_requiring_transformation,
+        function(&functions, "invoke").baseline.transform_labels(),
         [0]
     );
     assert_eq!(
-        function(&functions, "hold_callable").statements_requiring_transformation,
+        function(&functions, "hold_callable")
+            .baseline
+            .transform_labels(),
         [0, 1]
     );
     assert_eq!(
-        function(&functions, "closure").statements_requiring_transformation,
+        function(&functions, "closure").baseline.transform_labels(),
         [0, 1]
     );
     assert_eq!(
-        function(&functions, "question").statements_requiring_transformation,
+        function(&functions, "question").baseline.transform_labels(),
         [0]
     );
 
@@ -5099,7 +5156,7 @@ fn exact_unsupported_callable_and_desugar_matrix() {
         }"#,
     );
     assert_eq!(
-        function(&assembly, "assembly").statements_requiring_transformation,
+        function(&assembly, "assembly").baseline.transform_labels(),
         [0]
     );
 }
@@ -5116,20 +5173,23 @@ fn records_parameter_and_inferred_local_types_from_source_and_target_asts() {
     let record = function(&records, "update");
     assert_eq!(
         record
+            .baseline
             .statement_pair_metadata
             .iter()
             .map(|entry| entry.label)
             .collect::<Vec<_>>(),
-        record.statements_requiring_transformation
+        record.baseline.transform_labels()
     );
     assert!(
         record
+            .baseline
             .statement_pair_metadata
             .iter()
             .all(|entry| entry.pointer_variables_complete)
     );
     assert_eq!(
         record
+            .baseline
             .statement_pair_metadata
             .iter()
             .map(|entry| {
@@ -5158,7 +5218,7 @@ fn records_parameter_and_inferred_local_types_from_source_and_target_asts() {
             ),
         ]
     );
-    let pointer = &record.statement_pair_metadata[0].pointer_variables[1];
+    let pointer = &record.baseline.statement_pair_metadata[0].pointer_variables[1];
     assert_eq!(pointer.before_type, "*mut i32");
     assert!(!pointer.before_type_is_inferred);
     assert_eq!(
@@ -5167,7 +5227,7 @@ fn records_parameter_and_inferred_local_types_from_source_and_target_asts() {
     );
     assert_eq!(pointer.selected_target_type, "&mut i32");
     assert!(record.target_signature.contains("pointer: &mut i32"));
-    let alias = &record.statement_pair_metadata[0].pointer_variables[0];
+    let alias = &record.baseline.statement_pair_metadata[0].pointer_variables[0];
     assert_eq!(alias.before_type, "*mut i32");
     assert!(alias.before_type_is_inferred);
     assert_eq!(
@@ -5177,9 +5237,10 @@ fn records_parameter_and_inferred_local_types_from_source_and_target_asts() {
         }
     );
     assert_eq!(alias.selected_target_type, "*mut i32");
-    assert!(record.annotated_skeleton.contains("alias: *mut i32"));
+    assert!(record.baseline.skeleton.contains("alias: *mut i32"));
     assert!(
         record
+            .baseline
             .statement_pair_metadata
             .iter()
             .flat_map(|entry| &entry.pointer_variables)
@@ -5198,8 +5259,9 @@ fn records_parameter_and_inferred_local_types_from_source_and_target_asts() {
             *pointer = None;
         }"#,
     );
-    let long_type =
-        &function(&long, "long").statement_pair_metadata[0].pointer_variables[0].before_type;
+    let long_type = &function(&long, "long").baseline.statement_pair_metadata[0].pointer_variables
+        [0]
+    .before_type;
     assert_eq!(
         long_type,
         "*mut core::option::Option<core::result::Result<[core::mem::MaybeUninit<i32>; 32],\n\
@@ -5226,6 +5288,7 @@ fn deduplicates_by_binding_identity_in_first_occurrence_order() {
     );
     let record = function(&records, "shadow");
     let parent = record
+        .baseline
         .statement_pair_metadata
         .iter()
         .find(|entry| {
@@ -5296,6 +5359,7 @@ fn before_statement_is_the_complete_prompt_facing_source_subtree() {
     );
     let record = function(&records, "choose");
     let parent = record
+        .baseline
         .statement_pair_metadata
         .iter()
         .find(|entry| entry.before_statement.contains("if flag"))
@@ -5307,6 +5371,7 @@ fn before_statement_is_the_complete_prompt_facing_source_subtree() {
     );
     assert_eq!(
         record
+            .baseline
             .statement_pair_metadata
             .iter()
             .find(|entry| entry.label == 1)
@@ -5316,6 +5381,7 @@ fn before_statement_is_the_complete_prompt_facing_source_subtree() {
     );
     assert_eq!(
         record
+            .baseline
             .statement_pair_metadata
             .iter()
             .find(|entry| entry.label == 2)
@@ -5341,6 +5407,7 @@ fn includes_only_outer_raw_pointer_parameters_and_simple_locals() {
         }"#,
     );
     let names = function(&records, "exclusions")
+        .baseline
         .statement_pair_metadata
         .iter()
         .flat_map(|entry| &entry.pointer_variables)
@@ -5386,19 +5453,20 @@ fn includes_only_outer_raw_pointer_parameters_and_simple_locals() {
 fn metadata_labels_exactly_match_transformation_dispositions() {
     let preserved = generate("pub unsafe fn f(mut value: i32) -> i32 { value + 1 }");
     let record = function(&preserved, "f");
-    assert!(record.statements_requiring_transformation.is_empty());
-    assert!(record.statement_pair_metadata.is_empty());
+    assert!(record.baseline.transform_labels().is_empty());
+    assert!(record.baseline.statement_pair_metadata.is_empty());
 
     let transformed =
         generate("pub unsafe fn f(mut pointer: *mut i32) -> i32 { *pointer += 1; *pointer }");
     let record = function(&transformed, "f");
     assert_eq!(
         record
+            .baseline
             .statement_pair_metadata
             .iter()
             .map(|entry| entry.label)
             .collect::<Vec<_>>(),
-        record.statements_requiring_transformation
+        record.baseline.transform_labels()
     );
     assert_eq!(
         skeletons_to_json(&transformed).unwrap(),
@@ -5406,7 +5474,7 @@ fn metadata_labels_exactly_match_transformation_dispositions() {
     );
     let json = skeletons_to_json(&transformed).unwrap();
     let positions = [
-        "\"statements_requiring_transformation\"",
+        "\"statement_dispositions\"",
         "\"statement_pair_metadata\"",
         "\"foreign_function_names\"",
     ]
@@ -5417,7 +5485,9 @@ fn metadata_labels_exactly_match_transformation_dispositions() {
         r#"unsafe extern "C" { fn foreign(); }
         pub unsafe fn invoke() { foreign(); }"#,
     );
-    let entry = &function(&empty_rows, "invoke").statement_pair_metadata[0];
+    let entry = &function(&empty_rows, "invoke")
+        .baseline
+        .statement_pair_metadata[0];
     assert!(entry.pointer_variables_complete);
     assert!(entry.pointer_variables.is_empty());
 
@@ -5431,6 +5501,13 @@ fn metadata_labels_exactly_match_transformation_dispositions() {
     ]
     .map(|key| json.find(key).unwrap());
     assert!(statement_keys.windows(2).all(|pair| pair[0] < pair[1]));
+    let variable_json = serde_json::to_string(
+        &function(&populated, "pointer")
+            .baseline
+            .statement_pair_metadata[0]
+            .pointer_variables[0],
+    )
+    .unwrap();
     let variable_keys = [
         "\"name\"",
         "\"origin\"",
@@ -5438,13 +5515,7 @@ fn metadata_labels_exactly_match_transformation_dispositions() {
         "\"selected_target_type\"",
         "\"before_type_is_inferred\"",
     ]
-    .map(|key| {
-        if key == "\"name\"" {
-            json.rfind(key).unwrap()
-        } else {
-            json.find(key).unwrap()
-        }
-    });
+    .map(|key| variable_json.find(key).unwrap());
     assert!(variable_keys.windows(2).all(|pair| pair[0] < pair[1]));
     assert!(
         serde_json::to_string(&populated)
@@ -5468,6 +5539,7 @@ fn main_override_aliases_and_raw_fallbacks_report_actual_skeleton_types() {
     );
     let alias = function(&records, "alias");
     let pointer = alias
+        .baseline
         .statement_pair_metadata
         .iter()
         .flat_map(|entry| &entry.pointer_variables)
@@ -5479,6 +5551,7 @@ fn main_override_aliases_and_raw_fallbacks_report_actual_skeleton_types() {
 
     let main = function(&records, "main_0");
     let argv = main
+        .baseline
         .statement_pair_metadata
         .iter()
         .flat_map(|entry| &entry.pointer_variables)
@@ -5489,6 +5562,7 @@ fn main_override_aliases_and_raw_fallbacks_report_actual_skeleton_types() {
 
     let raw = generate(raw_pointer_fixture());
     let retained = function(&raw, "keep_alias_raw")
+        .baseline
         .statement_pair_metadata
         .iter()
         .flat_map(|entry| &entry.pointer_variables)
@@ -5512,6 +5586,7 @@ fn unmappable_statement_emits_resolvable_rows_and_incomplete_flag() {
         }"#,
     );
     let entry = function(&records, "incomplete")
+        .baseline
         .statement_pair_metadata
         .iter()
         .find(|entry| entry.before_statement.contains("if !pointer.is_null()"))
@@ -5594,9 +5669,10 @@ fn unmappable_statement_emits_resolvable_rows_and_incomplete_flag() {
         }"#,
     );
     let record = function(&known_ineligible, "destructured");
-    assert!(!record.statement_pair_metadata.is_empty());
+    assert!(!record.baseline.statement_pair_metadata.is_empty());
     assert!(
         record
+            .baseline
             .statement_pair_metadata
             .iter()
             .all(|entry| entry.pointer_variables_complete),
@@ -5604,9 +5680,1835 @@ fn unmappable_statement_emits_resolvable_rows_and_incomplete_flag() {
     );
     assert!(
         record
+            .baseline
             .statement_pair_metadata
             .iter()
             .flat_map(|entry| &entry.pointer_variables)
             .all(|variable| variable.name != "pointer")
+    );
+}
+
+#[test]
+fn contextual_rule_types_use_only_the_closed_expected_type_producers() {
+    fn expression_statement(statement: &Stmt) -> &Expr {
+        match &statement.kind {
+            StmtKind::Expr(expression) | StmtKind::Semi(expression) => expression,
+            _ => panic!("expected expression statement"),
+        }
+    }
+
+    fn strip_parentheses(mut expression: &Expr) -> &Expr {
+        while let ExprKind::Paren(inner) = &expression.kind {
+            expression = inner;
+        }
+        expression
+    }
+
+    let source = r#"
+struct Holder { ptr: *mut i32 }
+enum Choice { Value { ptr: *mut i32 } }
+struct Sink;
+impl Sink { unsafe fn consume(&self, _: *mut i32) {} }
+unsafe extern "C" { fn ffi_consume(_: *mut i32); }
+unsafe fn consume(_: *mut i32) {}
+unsafe fn get_slot() -> *mut *mut i32 { core::ptr::null_mut() }
+
+pub unsafe fn contexts(
+    mut q: *mut i32,
+    p: *mut i32,
+    fp: unsafe fn(*mut i32),
+    sink: Sink,
+    flag: bool,
+) -> *mut i32 {
+    let init: *mut i32 = (p);
+    q = p;
+    consume(p);
+    ffi_consume(p);
+    fp(p);
+    sink.consume(p);
+    let _branch = if flag { p } else { q };
+    Holder { ptr: p };
+    p;
+    return p;
+}
+
+pub unsafe fn tail(p: *mut i32) -> *mut i32 { p }
+pub unsafe fn place(mut out: *mut *mut i32, rhs: *mut i32) { *out = rhs; }
+pub unsafe fn boxed_place(
+    slot: *mut Option<&'static i32>,
+    rhs: Option<&'static i32>,
+) { *slot = rhs; }
+pub unsafe fn optional_place(
+    out: *mut Option<&'static i32>,
+    rhs: Option<&'static i32>,
+) { *out = rhs; }
+pub unsafe fn call_place(rhs: *mut i32) { *get_slot() = rhs; }
+pub unsafe fn parenthesized(mut q: *mut i32, rhs: *mut i32) { (q) = rhs; }
+pub unsafe fn indexed(slots: &mut [*mut i32], index: usize, rhs: *mut i32) {
+    slots[index] = rhs;
+}
+pub unsafe fn field_place(holder: *mut Holder, rhs: *mut i32) { (*holder).ptr = rhs; }
+pub unsafe fn variant_field(p: *mut i32) { Choice::Value { ptr: p }; }
+pub unsafe fn external_generic(p: *mut i32) { core::mem::drop::<*mut i32>(p); }
+"#;
+    run_compiler_on_str(source, |tcx| {
+        let mut surface = utils::ast::parse_crate(source.to_owned());
+        let mut mapper = utils::ir::AstToHirMapper::new(tcx);
+        mapper.map_crate_to_mod(&mut surface, tcx.hir_root_module(), false);
+        let ast_to_hir = mapper.ast_to_hir;
+        let find_item = |name: &str| {
+            surface
+                .items
+                .iter()
+                .find(|item| {
+                    item.kind
+                        .ident()
+                        .is_some_and(|ident| ident.name.as_str() == name)
+                })
+                .unwrap()
+        };
+        let primitive = || TypeTree::Primitive { name: "i32".into() };
+        let raw_i32 = || TypeTree::RawPointer {
+            mutability: RawMutability::Mut,
+            pointee: Box::new(primitive()),
+        };
+        let reference_slice = || TypeTree::Reference {
+            mutability: RefMutability::Mutable,
+            pointee: Box::new(TypeTree::Slice {
+                element: Box::new(primitive()),
+            }),
+        };
+        let option_reference = |mutable| TypeTree::Adt {
+            adt_kind: AdtKind::Enum,
+            identity: AdtIdentity::External {
+                crate_name: "core".into(),
+                path: vec!["option".into(), "Option".into()],
+            },
+            arguments: vec![TypeTree::Reference {
+                mutability: if mutable {
+                    RefMutability::Mutable
+                } else {
+                    RefMutability::Shared
+                },
+                pointee: Box::new(primitive()),
+            }],
+        };
+
+        let contexts = local_def("contexts", tcx);
+        let mut decisions = tools_pointer_decisions(tcx);
+        let signature = decisions.signatures.data.get_mut(&contexts).unwrap();
+        signature.input_decs[0] = Some(PtrKind::Slice(true));
+        signature.output_dec = Some(PtrKind::OptRef(false));
+        decisions
+            .signatures
+            .data
+            .get_mut(&local_def("consume", tcx))
+            .unwrap()
+            .input_decs[0] = Some(PtrKind::Slice(true));
+        let init_binding = local_binding_hir_id(contexts, "init", tcx);
+        decisions
+            .bindings
+            .insert(init_binding, PtrKind::OptRef(true));
+        let source_item = find_item("contexts");
+        let ItemKind::Fn(box function) = &source_item.kind else { unreachable!() };
+        let statements = &function.body.as_ref().unwrap().stmts;
+        let catalog =
+            rule_target_binding_catalog(source_item, contexts, &decisions, &ast_to_hir, tcx);
+        let infer = |root: &Expr, lhs| {
+            contextual_target_type(
+                root.id,
+                lhs,
+                source_item,
+                contexts,
+                &catalog,
+                &decisions,
+                &ast_to_hir,
+                tcx,
+            )
+        };
+
+        let StmtKind::Let(local) = &statements[0].kind else { unreachable!() };
+        let rustc_ast::LocalKind::Init(initializer) = &local.kind else { unreachable!() };
+        let initializer = strip_parentheses(initializer);
+        assert_eq!(infer(initializer, false), Some(option_reference(true)));
+
+        let ExprKind::Assign(left, right, _) = &expression_statement(&statements[1]).kind else {
+            unreachable!()
+        };
+        assert_eq!(infer(right, false), Some(reference_slice()));
+        assert_eq!(infer(left, true), Some(reference_slice()));
+        assert_eq!(infer(left, false), None);
+
+        let direct_argument = |index: usize| {
+            let ExprKind::Call(_, arguments) = &expression_statement(&statements[index]).kind else {
+                unreachable!()
+            };
+            arguments[0].as_ref()
+        };
+        assert_eq!(infer(direct_argument(2), false), Some(reference_slice()));
+        assert_eq!(infer(direct_argument(3), false), Some(raw_i32()));
+        assert_eq!(infer(direct_argument(4), false), None);
+
+        let ExprKind::MethodCall(method) = &expression_statement(&statements[5]).kind else {
+            unreachable!()
+        };
+        assert_eq!(infer(&method.args[0], false), None);
+
+        let StmtKind::Let(local) = &statements[6].kind else { unreachable!() };
+        let rustc_ast::LocalKind::Init(branch) = &local.kind else { unreachable!() };
+        let ExprKind::If(_, then, _) = &branch.kind else { unreachable!() };
+        let branch_value = expression_statement(then.stmts.last().unwrap());
+        assert_eq!(infer(branch_value, false), None);
+
+        let ExprKind::Struct(value) = &expression_statement(&statements[7]).kind else {
+            unreachable!()
+        };
+        assert_eq!(infer(&value.fields[0].expr, false), Some(raw_i32()));
+        assert_eq!(infer(expression_statement(&statements[8]), false), None);
+        let ExprKind::Ret(Some(returned)) = &expression_statement(&statements[9]).kind else {
+            unreachable!()
+        };
+        assert_eq!(infer(returned, false), Some(option_reference(false)));
+
+        let tail = local_def("tail", tcx);
+        decisions
+            .signatures
+            .data
+            .get_mut(&tail)
+            .unwrap()
+            .output_dec = Some(PtrKind::BoxedSlice);
+        let tail_item = find_item("tail");
+        let ItemKind::Fn(box tail_function) = &tail_item.kind else { unreachable!() };
+        let tail_expression =
+            expression_statement(tail_function.body.as_ref().unwrap().stmts.last().unwrap());
+        let tail_catalog = rule_binding_catalog(tail_item, tail, &decisions, &ast_to_hir, tcx);
+        let tail_type = contextual_target_type(
+            tail_expression.id,
+            false,
+            tail_item,
+            tail,
+            &tail_catalog,
+            &decisions,
+            &ast_to_hir,
+            tcx,
+        )
+        .unwrap();
+        let TypeTree::Adt { identity, arguments, .. } = tail_type else { unreachable!() };
+        assert!(matches!(identity, AdtIdentity::External { crate_name, path }
+            if crate_name == "alloc" && path == ["boxed", "Box"]));
+        assert_eq!(arguments.len(), 2, "Box retains its allocator argument");
+        assert!(matches!(&arguments[0], TypeTree::Slice { element }
+            if **element == primitive()));
+        assert!(matches!(&arguments[1], TypeTree::Adt { identity: AdtIdentity::External { crate_name, path }, arguments, .. }
+            if crate_name == "alloc" && path == &["alloc", "Global"] && arguments.is_empty()));
+
+        let place = local_def("place", tcx);
+        decisions.signatures.data.get_mut(&place).unwrap().input_decs[0] =
+            Some(PtrKind::OptRef(true));
+        let place_item = find_item("place");
+        let ItemKind::Fn(box place_function) = &place_item.kind else { unreachable!() };
+        let ExprKind::Assign(place_left, place_right, _) =
+            &expression_statement(&place_function.body.as_ref().unwrap().stmts[0]).kind
+        else {
+            unreachable!()
+        };
+        let place_catalog = rule_binding_catalog(place_item, place, &decisions, &ast_to_hir, tcx);
+        assert_eq!(
+            contextual_target_type(
+                place_right.id,
+                false,
+                place_item,
+                place,
+                &place_catalog,
+                &decisions,
+                &ast_to_hir,
+                tcx,
+            ),
+            Some(raw_i32())
+        );
+        assert_eq!(
+            contextual_target_type(
+                place_left.id,
+                true,
+                place_item,
+                place,
+                &place_catalog,
+                &decisions,
+                &ast_to_hir,
+                tcx,
+            ),
+            None,
+            "a dereference is not a bare-local assignment LHS"
+        );
+
+        for (function_name, decision) in [
+            ("boxed_place", PtrKind::Box),
+            ("optional_place", PtrKind::OptRef(true)),
+        ] {
+            let function_id = local_def(function_name, tcx);
+            decisions
+                .signatures
+                .data
+                .get_mut(&function_id)
+                .unwrap()
+                .input_decs[0] = Some(decision);
+            let item = find_item(function_name);
+            let ItemKind::Fn(box function) = &item.kind else { unreachable!() };
+            let ExprKind::Assign(_, right, _) =
+                &expression_statement(&function.body.as_ref().unwrap().stmts[0]).kind
+            else {
+                unreachable!()
+            };
+            let catalog = rule_binding_catalog(item, function_id, &decisions, &ast_to_hir, tcx);
+            assert_eq!(
+                contextual_target_type(
+                    right.id,
+                    false,
+                    item,
+                    function_id,
+                    &catalog,
+                    &decisions,
+                    &ast_to_hir,
+                    tcx,
+                ),
+                Some(option_reference(false)),
+                "{function_name}"
+            );
+        }
+
+        let call_place = local_def("call_place", tcx);
+        decisions
+            .signatures
+            .data
+            .get_mut(&local_def("get_slot", tcx))
+            .unwrap()
+            .output_dec = Some(PtrKind::Ref(true));
+        let call_place_item = find_item("call_place");
+        let ItemKind::Fn(box call_place_function) = &call_place_item.kind else { unreachable!() };
+        let ExprKind::Assign(_, call_place_right, _) =
+            &expression_statement(&call_place_function.body.as_ref().unwrap().stmts[0]).kind
+        else {
+            unreachable!()
+        };
+        let call_place_catalog =
+            rule_binding_catalog(call_place_item, call_place, &decisions, &ast_to_hir, tcx);
+        assert_eq!(
+            contextual_target_type(
+                call_place_right.id,
+                false,
+                call_place_item,
+                call_place,
+                &call_place_catalog,
+                &decisions,
+                &ast_to_hir,
+                tcx,
+            ),
+            Some(raw_i32())
+        );
+
+        let parenthesized = local_def("parenthesized", tcx);
+        decisions
+            .signatures
+            .data
+            .get_mut(&parenthesized)
+            .unwrap()
+            .input_decs[0] = Some(PtrKind::Box);
+        let parenthesized_item = find_item("parenthesized");
+        let ItemKind::Fn(box parenthesized_function) = &parenthesized_item.kind else {
+            unreachable!()
+        };
+        let ExprKind::Assign(parenthesized_left, _, _) =
+            &expression_statement(&parenthesized_function.body.as_ref().unwrap().stmts[0]).kind
+        else {
+            unreachable!()
+        };
+        let parenthesized_catalog = rule_binding_catalog(
+            parenthesized_item,
+            parenthesized,
+            &decisions,
+            &ast_to_hir,
+            tcx,
+        );
+        let mut root = parenthesized_left.as_ref();
+        while let ExprKind::Paren(inner) = &root.kind {
+            root = inner;
+        }
+        assert!(matches!(
+            contextual_target_type(
+                root.id,
+                true,
+                parenthesized_item,
+                parenthesized,
+                &parenthesized_catalog,
+                &decisions,
+                &ast_to_hir,
+                tcx,
+            ),
+            Some(TypeTree::Adt { identity: AdtIdentity::External { crate_name, path }, arguments, .. })
+                if crate_name == "alloc" && path == ["boxed", "Box"] && arguments.len() == 2
+        ));
+
+        for (function_name, configure) in [
+            ("indexed", None),
+            ("field_place", Some((0, PtrKind::Ref(true)))),
+        ] {
+            let function_id = local_def(function_name, tcx);
+            if let Some((index, decision)) = configure {
+                decisions
+                    .signatures
+                    .data
+                    .get_mut(&function_id)
+                    .unwrap()
+                    .input_decs[index] = Some(decision);
+            }
+            let item = find_item(function_name);
+            let ItemKind::Fn(box function) = &item.kind else { unreachable!() };
+            let ExprKind::Assign(_, right, _) =
+                &expression_statement(&function.body.as_ref().unwrap().stmts[0]).kind
+            else {
+                unreachable!()
+            };
+            let catalog =
+                rule_target_binding_catalog(item, function_id, &decisions, &ast_to_hir, tcx);
+            assert_eq!(
+                contextual_target_type(
+                    right.id,
+                    false,
+                    item,
+                    function_id,
+                    &catalog,
+                    &decisions,
+                    &ast_to_hir,
+                    tcx,
+                ),
+                Some(raw_i32()),
+                "{function_name}"
+            );
+        }
+
+        let external_generic = local_def("external_generic", tcx);
+        let external_item = find_item("external_generic");
+        let ItemKind::Fn(box external_function) = &external_item.kind else { unreachable!() };
+        let ExprKind::Call(_, arguments) =
+            &expression_statement(&external_function.body.as_ref().unwrap().stmts[0]).kind
+        else {
+            unreachable!()
+        };
+        let external_catalog = rule_target_binding_catalog(
+            external_item,
+            external_generic,
+            &decisions,
+            &ast_to_hir,
+            tcx,
+        );
+        assert_eq!(
+            contextual_target_type(
+                arguments[0].id,
+                false,
+                external_item,
+                external_generic,
+                &external_catalog,
+                &decisions,
+                &ast_to_hir,
+                tcx,
+            ),
+            Some(raw_i32())
+        );
+
+        let variant_field = local_def("variant_field", tcx);
+        let variant_item = find_item("variant_field");
+        let ItemKind::Fn(box variant_function) = &variant_item.kind else { unreachable!() };
+        let ExprKind::Struct(variant) =
+            &expression_statement(&variant_function.body.as_ref().unwrap().stmts[0]).kind
+        else {
+            unreachable!()
+        };
+        let variant_catalog = rule_target_binding_catalog(
+            variant_item,
+            variant_field,
+            &decisions,
+            &ast_to_hir,
+            tcx,
+        );
+        assert_eq!(
+            contextual_target_type(
+                variant.fields[0].expr.id,
+                false,
+                variant_item,
+                variant_field,
+                &variant_catalog,
+                &decisions,
+                &ast_to_hir,
+                tcx,
+            ),
+            Some(raw_i32())
+        );
+    })
+    .unwrap();
+}
+
+#[test]
+fn target_field_type_substitutes_evaluated_generic_base_arguments() {
+    let source = r#"
+struct Generic<T> { value: T }
+unsafe fn update(holder: *mut Generic<*mut i32>, rhs: *mut i32) {
+    (*holder).value = rhs;
+}
+"#;
+    run_compiler_on_str(source, |tcx| {
+        let mut surface = utils::ast::parse_crate(source.to_owned());
+        let mut mapper = utils::ir::AstToHirMapper::new(tcx);
+        mapper.map_crate_to_mod(&mut surface, tcx.hir_root_module(), false);
+        let ast_to_hir = mapper.ast_to_hir;
+        let item = surface
+            .items
+            .iter()
+            .find(|item| {
+                item.kind
+                    .ident()
+                    .is_some_and(|ident| ident.name.as_str() == "update")
+            })
+            .unwrap();
+        let ItemKind::Fn(box function) = &item.kind else { unreachable!() };
+        let StmtKind::Semi(assignment) = &function.body.as_ref().unwrap().stmts[0].kind else {
+            unreachable!()
+        };
+        let ExprKind::Assign(left, _, _) = &assignment.kind else { unreachable!() };
+        let ExprKind::Field(base, field) = &left.kind else { unreachable!() };
+        let hir_base = ast_to_hir.get_expr(base.id, tcx).unwrap();
+        let mut target_base = semantic_type_tree(
+            tcx.typeck(hir_base.hir_id.owner).expr_ty(hir_base),
+            &ast_to_hir,
+            tcx,
+        )
+        .unwrap();
+        let primitive = TypeTree::Primitive { name: "i32".into() };
+        let target_argument = TypeTree::Adt {
+            adt_kind: AdtKind::Enum,
+            identity: AdtIdentity::External {
+                crate_name: "core".into(),
+                path: vec!["option".into(), "Option".into()],
+            },
+            arguments: vec![TypeTree::Reference {
+                mutability: RefMutability::Shared,
+                pointee: Box::new(primitive),
+            }],
+        };
+        let TypeTree::Adt { arguments, .. } = &mut target_base else { unreachable!() };
+        *arguments = vec![target_argument.clone()];
+        assert_eq!(
+            target_field_type(base, field.name, target_base, &ast_to_hir, tcx),
+            Some(target_argument)
+        );
+    })
+    .unwrap();
+}
+
+#[test]
+fn rule_selection_materialization_and_statement_installation_are_integrated() {
+    let source = "pub unsafe fn f(p: *mut i32) -> bool { p.is_null() }";
+    run_compiler_on_str(source, |tcx| {
+        let mut surface = utils::ast::parse_crate(source.to_owned());
+        let mut mapper = utils::ir::AstToHirMapper::new(tcx);
+        mapper.map_crate_to_mod(&mut surface, tcx.hir_root_module(), false);
+        let ast_to_hir = mapper.ast_to_hir;
+        let function = local_def("f", tcx);
+        let mut decisions = tools_pointer_decisions(tcx);
+        decisions
+            .signatures
+            .data
+            .get_mut(&function)
+            .unwrap()
+            .input_decs[0] = Some(PtrKind::OptRef(false));
+        let mut item = surface.items[0].clone();
+        annotate_function(&mut item, &FxHashSet::default());
+        let catalog = rule_binding_catalog(&item, function, &decisions, &ast_to_hir, tcx);
+        assert_eq!(catalog.len(), 1);
+        let ItemKind::Fn(box body) = &item.kind else { unreachable!() };
+        let regions = select_rule_regions(
+            &body.body.as_ref().unwrap().stmts[0],
+            &catalog,
+            &ast_to_hir,
+            tcx,
+        )
+        .unwrap();
+        let [region] = &regions[..] else { panic!("expected one selected pointer region") };
+        let [_anchor] = &region.observation.pointer_anchors[..] else {
+            panic!("expected one pointer anchor")
+        };
+        let mut observation = region.observation.clone();
+        observation.target_expression = serde_json::from_value(serde_json::json!({
+            "kind": "literal",
+            "value": {"kind": "bool", "value": false}
+        }))
+        .unwrap();
+        let document = crate::ObservationDocument {
+            schema_version: crate::OBSERVATION_SCHEMA_VERSION,
+            observations: vec![observation.clone(), observation],
+        };
+        let mut rule = crate::synthesize_rules(&[document]).unwrap();
+        assert_eq!(rule.rules.len(), 1);
+        let mut unavailable = rule.rules[0].clone();
+        unavailable.target_pattern = crate::RuleExpression::Call {
+            callee: Box::new(crate::RuleExpression::Path {
+                value: crate::RuleValueIdentity::External {
+                    crate_name: "unavailable_crate".into(),
+                    path: vec!["unspellable".into()],
+                },
+            }),
+            arguments: vec![crate::RuleExpression::Path {
+                value: crate::RuleValueIdentity::Variable {
+                    sort: crate::VariableSort::Anchor,
+                    index: 0,
+                },
+            }],
+        };
+        rule.rules.push(unavailable);
+        let boolean = |value| crate::RuleExpression::Literal {
+            value: crate::RuleLiteral::Bool { value },
+        };
+        let tail = |expression| crate::RuleBlock {
+            statements: vec![crate::RuleStatement::Expression {
+                expression,
+                semicolon: false,
+            }],
+        };
+        let mut unsupported_shape = rule.rules[0].clone();
+        unsupported_shape.target_pattern = crate::RuleExpression::Unary {
+            operator: UnaryOperator::Not,
+            operand: Box::new(crate::RuleExpression::If {
+                condition: Box::new(boolean(true)),
+                then: tail(boolean(true)),
+                else_expression: Some(Box::new(boolean(false))),
+            }),
+        };
+        rule.rules.push(unsupported_shape);
+        let mut target = item.clone();
+        let type_speller = TypeSpeller::new(function, &ast_to_hir, tcx);
+        let applied = apply_rule_set(
+            &item,
+            &mut target,
+            &BTreeSet::from([0]),
+            &rule,
+            function,
+            &decisions,
+            &ast_to_hir,
+            &type_speller,
+            tcx,
+        )
+        .unwrap();
+        assert_eq!(applied, BTreeSet::from([0]));
+        let rendered = pprust::item_to_string(&target);
+        assert!(rendered.contains("false"), "{rendered}");
+        assert!(!rendered.contains("is_null"), "{rendered}");
+    })
+    .unwrap();
+}
+
+#[test]
+fn selected_region_dump_failure_keeps_a_multi_region_statement_unmodified() {
+    let source = r#"
+pub unsafe fn usable(p: *mut i32) { *p = 0; }
+pub unsafe fn atomic(p: *mut i32, q: *mut i32) {
+    *p = (*(q as *mut unsafe fn()), 0).1;
+}
+"#;
+    run_compiler_on_str(source, |tcx| {
+        let mut surface = utils::ast::parse_crate(source.to_owned());
+        let mut mapper = utils::ir::AstToHirMapper::new(tcx);
+        mapper.map_crate_to_mod(&mut surface, tcx.hir_root_module(), false);
+        let ast_to_hir = mapper.ast_to_hir;
+        let mut decisions = tools_pointer_decisions(tcx);
+        let usable_id = local_def("usable", tcx);
+        decisions
+            .signatures
+            .data
+            .get_mut(&usable_id)
+            .unwrap()
+            .input_decs[0] = Some(PtrKind::Ref(true));
+        let atomic_id = local_def("atomic", tcx);
+        let atomic_signature = decisions.signatures.data.get_mut(&atomic_id).unwrap();
+        atomic_signature.input_decs[0] = Some(PtrKind::Ref(true));
+        atomic_signature.input_decs[1] = Some(PtrKind::Ref(true));
+
+        let source_item = |name: &str| {
+            surface
+                .items
+                .iter()
+                .find(|item| {
+                    item.kind
+                        .ident()
+                        .is_some_and(|ident| ident.name.as_str() == name)
+                })
+                .unwrap()
+                .clone()
+        };
+        let mut usable = source_item("usable");
+        annotate_function(&mut usable, &FxHashSet::default());
+        let usable_catalog = rule_binding_catalog(&usable, usable_id, &decisions, &ast_to_hir, tcx);
+        let ItemKind::Fn(box usable_function) = &usable.kind else { unreachable!() };
+        let regions = select_rule_regions(
+            &usable_function.body.as_ref().unwrap().stmts[0],
+            &usable_catalog,
+            &ast_to_hir,
+            tcx,
+        )
+        .unwrap();
+        let [region] = &regions[..] else { panic!("expected one usable region") };
+        let anchor_id = region.observation.pointer_anchors[0].id.clone();
+        let mut observation = region.observation.clone();
+        observation.target_expression = crate::Expression::Path {
+            value: crate::ValueIdentity::Binding { id: anchor_id },
+        };
+        let rules = crate::synthesize_rules(&[crate::ObservationDocument {
+            schema_version: crate::OBSERVATION_SCHEMA_VERSION,
+            observations: vec![observation.clone(), observation],
+        }])
+        .unwrap();
+        assert_eq!(rules.rules.len(), 1);
+
+        let mut usable_target = usable.clone();
+        let usable_speller = TypeSpeller::new(usable_id, &ast_to_hir, tcx);
+        assert_eq!(
+            apply_rule_set(
+                &usable,
+                &mut usable_target,
+                &BTreeSet::from([0]),
+                &rules,
+                usable_id,
+                &decisions,
+                &ast_to_hir,
+                &usable_speller,
+                tcx,
+            )
+            .unwrap(),
+            BTreeSet::from([0]),
+            "the rule used in the atomicity check must itself be applicable"
+        );
+
+        let mut atomic = source_item("atomic");
+        annotate_function(&mut atomic, &FxHashSet::default());
+        let atomic_catalog = rule_binding_catalog(&atomic, atomic_id, &decisions, &ast_to_hir, tcx);
+        let ItemKind::Fn(box atomic_function) = &atomic.kind else { unreachable!() };
+        assert!(
+            select_rule_regions(
+                &atomic_function.body.as_ref().unwrap().stmts[0],
+                &atomic_catalog,
+                &ast_to_hir,
+                tcx,
+            )
+            .is_none(),
+            "one selected generic-typed region must invalidate the complete statement dump"
+        );
+        let mut atomic_target = atomic.clone();
+        let baseline = pprust::item_to_string(&atomic_target);
+        let atomic_speller = TypeSpeller::new(atomic_id, &ast_to_hir, tcx);
+        assert!(
+            apply_rule_set(
+                &atomic,
+                &mut atomic_target,
+                &BTreeSet::from([0]),
+                &rules,
+                atomic_id,
+                &decisions,
+                &ast_to_hir,
+                &atomic_speller,
+                tcx,
+            )
+            .unwrap()
+            .is_empty(),
+            "the statement disposition must remain transform"
+        );
+        assert_eq!(pprust::item_to_string(&atomic_target), baseline);
+    })
+    .unwrap();
+}
+
+#[test]
+fn two_disjoint_rule_regions_install_together_independently_of_rule_order() {
+    let source =
+        "pub unsafe fn dual(p: *mut i32, q: *mut i32) -> (i32, bool) { (*p, !q.is_null()) }";
+    run_compiler_on_str(source, |tcx| {
+        let mut surface = utils::ast::parse_crate(source.to_owned());
+        let mut mapper = utils::ir::AstToHirMapper::new(tcx);
+        mapper.map_crate_to_mod(&mut surface, tcx.hir_root_module(), false);
+        let ast_to_hir = mapper.ast_to_hir;
+        let function = local_def("dual", tcx);
+        let mut decisions = tools_pointer_decisions(tcx);
+        let signature = decisions.signatures.data.get_mut(&function).unwrap();
+        signature.input_decs[0] = Some(PtrKind::OptRef(false));
+        signature.input_decs[1] = Some(PtrKind::OptRef(false));
+        let mut item = surface.items[0].clone();
+        annotate_function(&mut item, &FxHashSet::default());
+        let catalog = rule_binding_catalog(&item, function, &decisions, &ast_to_hir, tcx);
+        let ItemKind::Fn(box body) = &item.kind else { unreachable!() };
+        let regions = select_rule_regions(
+            &body.body.as_ref().unwrap().stmts[0],
+            &catalog,
+            &ast_to_hir,
+            tcx,
+        )
+        .unwrap();
+        assert_eq!(regions.len(), 2);
+        let external = |name: &str| crate::ValueIdentity::External {
+            crate_name: "core".into(),
+            path: vec!["option".into(), name.into()],
+        };
+        let method = |receiver, name: &str| crate::Expression::MethodCall {
+            receiver: Box::new(receiver),
+            method: external(name),
+            arguments: vec![],
+        };
+        let mut observations = vec![];
+        for region in regions {
+            let anchor = crate::Expression::Path {
+                value: crate::ValueIdentity::Binding {
+                    id: region.observation.pointer_anchors[0].id.clone(),
+                },
+            };
+            let mut observation = region.observation;
+            observation.target_expression = match observation.source_expression {
+                crate::Expression::Unary {
+                    operator: UnaryOperator::Deref,
+                    ..
+                } => crate::Expression::Unary {
+                    operator: UnaryOperator::Deref,
+                    operand: Box::new(method(method(anchor, "as_deref"), "unwrap")),
+                },
+                crate::Expression::MethodCall { .. } => method(anchor, "is_none"),
+                ref other => panic!("unexpected selected region {other:?}"),
+            };
+            observations.extend([observation.clone(), observation]);
+        }
+        let rules = crate::synthesize_rules(&[crate::ObservationDocument {
+            schema_version: crate::OBSERVATION_SCHEMA_VERSION,
+            observations,
+        }])
+        .unwrap();
+        assert_eq!(rules.rules.len(), 2);
+        let type_speller = TypeSpeller::new(function, &ast_to_hir, tcx);
+        let apply = |document: &crate::RuleDocument| {
+            let mut target = item.clone();
+            let applied = apply_rule_set(
+                &item,
+                &mut target,
+                &BTreeSet::from([0]),
+                document,
+                function,
+                &decisions,
+                &ast_to_hir,
+                &type_speller,
+                tcx,
+            )
+            .unwrap();
+            (applied, pprust::item_to_string(&target))
+        };
+        let (forward_applied, forward) = apply(&rules);
+        assert_eq!(forward_applied, BTreeSet::from([0]));
+        assert!(forward.contains("as_deref"), "{forward}");
+        assert!(forward.contains("is_none"), "{forward}");
+        let mut reversed = rules.clone();
+        reversed.rules.reverse();
+        assert_eq!(apply(&reversed), (forward_applied, forward.clone()));
+
+        let incomplete = crate::RuleDocument {
+            schema_version: 1,
+            rules: vec![rules.rules[0].clone()],
+        };
+        let (applied, unchanged) = apply(&incomplete);
+        assert!(applied.is_empty());
+        assert_eq!(unchanged, pprust::item_to_string(&item));
+    })
+    .unwrap();
+}
+
+#[test]
+fn observation_and_application_share_identical_region_selection() {
+    let source = r#"
+struct Holder { ptr: *mut i32 }
+unsafe fn consume(_: *mut i32) {}
+unsafe fn selectors(
+    holder: *mut Holder,
+    p: *mut i32,
+    q: *mut i32,
+    indirect: unsafe fn(*mut i32),
+) {
+    let _ = (*holder).ptr;
+    let _ = p.is_null();
+    consume(p);
+    let _ = *p + *q;
+    let _ = p.offset(q as isize);
+    let _closure = || p;
+    indirect(p);
+    *p = 1;
+}
+"#;
+    run_compiler_on_str(source, |tcx| {
+        let mut surface = utils::ast::parse_crate(source.to_owned());
+        let mut mapper = utils::ir::AstToHirMapper::new(tcx);
+        mapper.map_crate_to_mod(&mut surface, tcx.hir_root_module(), false);
+        let item = surface
+            .items
+            .iter()
+            .find(|item| {
+                item.kind
+                    .ident()
+                    .is_some_and(|ident| ident.name.as_str() == "selectors")
+            })
+            .unwrap();
+        let ItemKind::Fn(box function) = &item.kind else { unreachable!() };
+        let mut saw_promotion = false;
+        let mut saw_overlap = false;
+        let mut saw_lhs = false;
+        let mut saw_two_regions = false;
+        let mut saw_empty = false;
+        for statement in &function.body.as_ref().unwrap().stmts {
+            let Some(expression) = crate::observation::statement_expression(statement) else {
+                continue;
+            };
+            let select = || {
+                crate::observation::select_expression_regions(
+                    expression,
+                    HashSet::new(),
+                    Some,
+                    &mapper.ast_to_hir,
+                    tcx,
+                )
+                .map(|(_, regions)| {
+                    regions
+                        .into_iter()
+                        .map(|region| {
+                            (
+                                region.root,
+                                region.promoted_field,
+                                region.lhs,
+                                region
+                                    .anchors
+                                    .into_iter()
+                                    .map(|anchor| (anchor.source_binding, anchor.target_binding))
+                                    .collect::<Vec<_>>(),
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                })
+            };
+            let observation = select();
+            let application = select();
+            assert_eq!(observation, application);
+            match observation {
+                None => saw_overlap = true,
+                Some(regions) => {
+                    saw_promotion |= regions.iter().any(|region| region.1);
+                    saw_lhs |= regions.iter().any(|region| region.2);
+                    saw_two_regions |= regions.len() == 2;
+                    saw_empty |= regions.is_empty();
+                }
+            }
+        }
+        assert!(saw_promotion);
+        assert!(saw_overlap);
+        assert!(saw_lhs);
+        assert!(saw_two_regions);
+        assert!(saw_empty);
+    })
+    .unwrap();
+}
+
+#[test]
+fn dependency_external_path_is_structurally_accepted_as_lhs_place() {
+    let source = "unsafe fn f() {}";
+    run_compiler_on_str(source, |tcx| {
+        let mut surface = utils::ast::parse_crate(source.to_owned());
+        let mut mapper = utils::ir::AstToHirMapper::new(tcx);
+        mapper.map_crate_to_mod(&mut surface, tcx.hir_root_module(), false);
+        let function = local_def("f", tcx);
+        let type_speller = TypeSpeller::new(function, &mapper.ast_to_hir, tcx);
+        let names = HashMap::new();
+        let syntax_overrides = BTreeMap::new();
+        let type_syntax = HashMap::new();
+        let renderer = RuleRenderer {
+            names: &names,
+            syntax_overrides: &syntax_overrides,
+            identity_syntax: &BTreeMap::new(),
+            syntax_cursor: Cell::new(0),
+            type_syntax: &type_syntax,
+            type_speller: &type_speller,
+        };
+        let expression = crate::Expression::Path {
+            value: crate::ValueIdentity::External {
+                crate_name: "core".into(),
+                path: vec!["mem".into(), "drop".into()],
+            },
+        };
+        let rendered = expression_spelling(&expression, &renderer).unwrap();
+        assert!(rendered.ends_with("core::mem::drop"), "{rendered}");
+        assert!(parse_rule_expression(rendered, true).is_some());
+    })
+    .unwrap();
+}
+
+#[test]
+fn materialization_and_shape_misses_are_local_but_corrupt_invariants_are_fatal() {
+    let source = "unsafe fn f(p: *mut i32) { let _ = p.is_null(); }";
+    run_compiler_on_str(source, |tcx| {
+        let mut surface = utils::ast::parse_crate(source.to_owned());
+        let mut mapper = utils::ir::AstToHirMapper::new(tcx);
+        mapper.map_crate_to_mod(&mut surface, tcx.hir_root_module(), false);
+        let function = local_def("f", tcx);
+        let type_speller = TypeSpeller::new(function, &mapper.ast_to_hir, tcx);
+        let names = HashMap::new();
+        let syntax = BTreeMap::new();
+        let identity_syntax = BTreeMap::new();
+        let type_syntax = HashMap::new();
+        let renderer = RuleRenderer {
+            names: &names,
+            syntax_overrides: &syntax,
+            identity_syntax: &identity_syntax,
+            syntax_cursor: Cell::new(0),
+            type_syntax: &type_syntax,
+            type_speller: &type_speller,
+        };
+        let unspellable = crate::Expression::Path {
+            value: crate::ValueIdentity::External {
+                crate_name: "unavailable_crate".into(),
+                path: vec!["missing".into()],
+            },
+        };
+        assert!(expression_spelling(&unspellable, &renderer).is_none());
+        assert!(parse_rule_expression("if".into(), false).is_none());
+        assert!(parse_rule_expression("f()".into(), true).is_none());
+
+        let unsupported =
+            utils::ast::parse_crate("unsafe fn f() { #[proctor(0)] unsafe { 1 }; }".into())
+                .items
+                .remove(0);
+        assert!(validate_rule_application_shape(&unsupported, &BTreeSet::new()).is_err());
+
+        let mut item = surface.items[0].clone();
+        annotate_function(&mut item, &FxHashSet::default());
+        let mut target = item.clone();
+        let invalid = crate::RuleDocument {
+            schema_version: crate::RULE_SCHEMA_VERSION + 1,
+            rules: vec![],
+        };
+        let error = apply_rule_set(
+            &item,
+            &mut target,
+            &BTreeSet::from([0]),
+            &invalid,
+            function,
+            &tools_pointer_decisions(tcx),
+            &mapper.ast_to_hir,
+            &type_speller,
+            tcx,
+        )
+        .unwrap_err();
+        assert_eq!(error.kind, GenerationErrorKind::AstHirMismatch);
+        assert_eq!(
+            pprust::item_to_string(&target),
+            pprust::item_to_string(&item)
+        );
+
+        let mismatch = make_skeletons("unsafe fn other() { let _ = 1; }", tcx).unwrap_err();
+        assert_eq!(mismatch.kind, GenerationErrorKind::AstHirMismatch);
+    })
+    .unwrap();
+}
+
+#[test]
+fn rule_type_materialization_reuses_body_alias_syntax() {
+    let source = "type Word = i32; unsafe fn f() { let _: Word = 0 as Word; }";
+    run_compiler_on_str(source, |tcx| {
+        let mut surface = utils::ast::parse_crate(source.to_owned());
+        let mut mapper = utils::ir::AstToHirMapper::new(tcx);
+        mapper.map_crate_to_mod(&mut surface, tcx.hir_root_module(), false);
+        let function = local_def("f", tcx);
+        let item = surface
+            .items
+            .iter()
+            .find(|item| {
+                item.kind
+                    .ident()
+                    .is_some_and(|name| name.name.as_str() == "f")
+            })
+            .unwrap();
+        let type_syntax = rule_type_syntax(item, &mapper.ast_to_hir, tcx);
+        let names = HashMap::new();
+        let syntax_overrides = BTreeMap::new();
+        let type_speller = TypeSpeller::new(function, &mapper.ast_to_hir, tcx);
+        let renderer = RuleRenderer {
+            names: &names,
+            syntax_overrides: &syntax_overrides,
+            identity_syntax: &BTreeMap::new(),
+            syntax_cursor: Cell::new(0),
+            type_syntax: &type_syntax,
+            type_speller: &type_speller,
+        };
+        assert_eq!(
+            type_tree_spelling(&TypeTree::Primitive { name: "i32".into() }, &renderer),
+            Some("Word".to_owned())
+        );
+    })
+    .unwrap();
+}
+
+#[test]
+fn closed_rule_literals_borrows_methods_and_external_structs_materialize() {
+    let source = "unsafe fn f(x: i32) {}";
+    run_compiler_on_str(source, |tcx| {
+        let mut surface = utils::ast::parse_crate(source.to_owned());
+        let mut mapper = utils::ir::AstToHirMapper::new(tcx);
+        mapper.map_crate_to_mod(&mut surface, tcx.hir_root_module(), false);
+        let function = local_def("f", tcx);
+        let type_speller = TypeSpeller::new(function, &mapper.ast_to_hir, tcx);
+        let names = HashMap::from([("<id0>".to_owned(), "x".to_owned())]);
+        let syntax_overrides = BTreeMap::new();
+        let type_syntax = HashMap::new();
+        let renderer = RuleRenderer {
+            names: &names,
+            syntax_overrides: &syntax_overrides,
+            identity_syntax: &BTreeMap::new(),
+            syntax_cursor: Cell::new(0),
+            type_syntax: &type_syntax,
+            type_speller: &type_speller,
+        };
+        let path = || crate::Expression::Path {
+            value: crate::ValueIdentity::Binding { id: "<id0>".into() },
+        };
+        let values = [
+            crate::Expression::Literal {
+                value: crate::Literal::Float {
+                    bits: "7fc0dead".into(),
+                    ty: "f32".into(),
+                },
+            },
+            crate::Expression::Literal {
+                value: crate::Literal::Char { value: "\n".into() },
+            },
+            crate::Expression::Literal {
+                value: crate::Literal::Char { value: "λ".into() },
+            },
+            crate::Expression::Literal {
+                value: crate::Literal::ByteString {
+                    value: vec![0xff, b'"', b'\\'],
+                },
+            },
+            crate::Expression::Literal {
+                value: crate::Literal::CString {
+                    value: vec![0xff, b'"', b'\\'],
+                },
+            },
+            crate::Expression::AddressOf {
+                borrow: BorrowKind::Raw,
+                mutability: RawMutability::Const,
+                expression: Box::new(path()),
+            },
+            crate::Expression::AddressOf {
+                borrow: BorrowKind::Raw,
+                mutability: RawMutability::Mut,
+                expression: Box::new(path()),
+            },
+            crate::Expression::MethodCall {
+                receiver: Box::new(path()),
+                method: crate::ValueIdentity::External {
+                    crate_name: "core".into(),
+                    path: vec!["option".into(), "Option".into(), "unwrap".into()],
+                },
+                arguments: vec![],
+            },
+            crate::Expression::Struct {
+                adt: crate::AdtIdentity::External {
+                    crate_name: "core".into(),
+                    path: vec!["ops".into(), "range".into(), "Range".into()],
+                },
+                variant: None,
+                fields: vec![
+                    crate::StructField {
+                        field: crate::FieldIdentity::External {
+                            crate_name: "core".into(),
+                            path: vec![
+                                "ops".into(),
+                                "range".into(),
+                                "Range".into(),
+                                "start".into(),
+                            ],
+                        },
+                        value: path(),
+                    },
+                    crate::StructField {
+                        field: crate::FieldIdentity::External {
+                            crate_name: "core".into(),
+                            path: vec!["ops".into(), "range".into(), "Range".into(), "end".into()],
+                        },
+                        value: path(),
+                    },
+                ],
+                rest: None,
+            },
+        ];
+        let rendered = values
+            .iter()
+            .map(|value| {
+                renderer.syntax_cursor.set(0);
+                expression_spelling(value, &renderer).unwrap()
+            })
+            .collect::<Vec<_>>();
+        assert!(rendered[0].contains("from_bits(0x7fc0dead)"));
+        assert_eq!(rendered[5], "&raw const x");
+        assert_eq!(rendered[6], "&raw mut x");
+        assert!(rendered[7].contains(".unwrap()"));
+        assert!(rendered[8].contains("Range"));
+        for value in rendered {
+            assert!(
+                parse_rule_expression(value.clone(), false).is_some(),
+                "{value}"
+            );
+        }
+        for value in ["", "ab"] {
+            renderer.syntax_cursor.set(0);
+            assert!(
+                expression_spelling(
+                    &crate::Expression::Literal {
+                        value: crate::Literal::Char {
+                            value: value.into(),
+                        },
+                    },
+                    &renderer,
+                )
+                .is_none()
+            );
+        }
+        assert_eq!(
+            type_tree_spelling(
+                &TypeTree::Primitive {
+                    name: "never".into(),
+                },
+                &renderer,
+            ),
+            Some("!".to_owned())
+        );
+    })
+    .unwrap();
+}
+
+#[test]
+fn rule_application_materializes_the_complete_expression_matrix_structurally() {
+    let source = "struct Holder { value: i32 } unsafe fn read(_: *mut i32) {} unsafe fn f() {}";
+    run_compiler_on_str(source, |tcx| {
+        fn shape(expression: &Expr) -> serde_json::Value {
+            match &expression.kind {
+                ExprKind::Paren(inner) => shape(inner),
+                ExprKind::Path(qself, path) => serde_json::json!({
+                    "path": path.segments.iter().map(|segment| segment.ident.to_string()).collect::<Vec<_>>(),
+                    "qualified": qself.is_some(),
+                }),
+                ExprKind::MethodCall(call) => serde_json::json!({
+                    "method": call.seg.ident.to_string(),
+                    "receiver": shape(&call.receiver),
+                    "arguments": call.args.iter().map(|argument| shape(argument)).collect::<Vec<_>>(),
+                }),
+                ExprKind::Call(callee, arguments) => serde_json::json!({
+                    "call": shape(callee),
+                    "arguments": arguments.iter().map(|argument| shape(argument)).collect::<Vec<_>>(),
+                }),
+                ExprKind::Unary(operator, operand) => serde_json::json!({
+                    "unary": format!("{operator:?}"),
+                    "operand": shape(operand),
+                }),
+                ExprKind::AddrOf(kind, mutability, operand) => serde_json::json!({
+                    "address": format!("{kind:?}"),
+                    "mutability": format!("{mutability:?}"),
+                    "operand": shape(operand),
+                }),
+                ExprKind::Index(base, index, _) => serde_json::json!({
+                    "index": shape(base),
+                    "with": shape(index),
+                }),
+                ExprKind::Cast(value, ty) => serde_json::json!({
+                    "cast": shape(value),
+                    "type": pprust::ty_to_string(ty),
+                }),
+                ExprKind::Field(base, field) => serde_json::json!({
+                    "field": field.to_string(),
+                    "base": shape(base),
+                }),
+                ExprKind::Binary(operator, left, right) => serde_json::json!({
+                    "binary": format!("{:?}", operator.node),
+                    "left": shape(left),
+                    "right": shape(right),
+                }),
+                ExprKind::Lit(_) => serde_json::json!({"literal": pprust::expr_to_string(expression)}),
+                other => panic!("unsupported application-matrix AST node: {other:?}"),
+            }
+        }
+
+        let mut surface = utils::ast::parse_crate(source.to_owned());
+        let mut mapper = utils::ir::AstToHirMapper::new(tcx);
+        mapper.map_crate_to_mod(&mut surface, tcx.hir_root_module(), false);
+        let function = local_def("f", tcx);
+        let primitive_rule = || crate::RuleTypeTree::Primitive { name: "i32".into() };
+        let primitive = || TypeTree::Primitive { name: "i32".into() };
+        let rule_anchor = |index| crate::RuleExpression::Path {
+            value: crate::RuleValueIdentity::Variable {
+                sort: crate::VariableSort::Anchor,
+                index,
+            },
+        };
+        let rule_expression = |index| crate::RuleExpression::Variable {
+            sort: crate::VariableSort::Expression,
+            index,
+        };
+        let concrete_path = |id: &str| crate::Expression::Path {
+            value: crate::ValueIdentity::Binding { id: id.into() },
+        };
+        let external_rule = |name: &str| crate::RuleValueIdentity::External {
+            crate_name: "core".into(),
+            path: vec!["ptr".into(), name.into()],
+        };
+        let external = |name: &str| crate::ValueIdentity::External {
+            crate_name: "core".into(),
+            path: vec!["ptr".into(), name.into()],
+        };
+        let rule_method = |receiver, name: &str, arguments| crate::RuleExpression::MethodCall {
+            receiver: Box::new(receiver),
+            method: external_rule(name),
+            arguments,
+        };
+        let method = |receiver, name: &str, arguments| crate::Expression::MethodCall {
+            receiver: Box::new(receiver),
+            method: external(name),
+            arguments,
+        };
+        let rule_unary = |operator, operand| crate::RuleExpression::Unary {
+            operator,
+            operand: Box::new(operand),
+        };
+        let unary = |operator, operand| crate::Expression::Unary {
+            operator,
+            operand: Box::new(operand),
+        };
+        let rule_cast = |expression, name: &str| crate::RuleExpression::Cast {
+            expression: Box::new(expression),
+            ty: crate::RuleTypeTree::Primitive { name: name.into() },
+        };
+        let cast = |expression, name: &str| crate::Expression::Cast {
+            expression: Box::new(expression),
+            ty: TypeTree::Primitive { name: name.into() },
+        };
+        let rule_index = |base, index| crate::RuleExpression::Index {
+            base: Box::new(base),
+            index: Box::new(index),
+        };
+        let rule_integer = |value| crate::RuleExpression::Literal {
+            value: crate::RuleLiteral::Integer {
+                value,
+                ty: "usize".into(),
+            },
+        };
+        let integer = |value: &str| crate::Expression::Literal {
+            value: crate::Literal::Integer {
+                value: value.into(),
+                ty: "usize".into(),
+            },
+        };
+        let chain = |receiver: crate::RuleExpression, first: &str| {
+            rule_method(rule_method(receiver, first, vec![]), "unwrap", vec![])
+        };
+        let offset_source = |name: &str, argument| {
+            rule_unary(
+                UnaryOperator::Deref,
+                rule_method(rule_anchor(0), name, vec![argument]),
+            )
+        };
+        let concrete_offset = |name: &str, argument| {
+            unary(
+                UnaryOperator::Deref,
+                method(concrete_path("<id0>"), name, vec![argument]),
+            )
+        };
+        let make_rule = |source_pattern, target_pattern| crate::Rule {
+            source_pattern,
+            target_pattern,
+            pointer_anchors: vec![crate::RulePointerAnchor {
+                id: crate::RuleVariable::new(crate::VariableSort::Anchor, 0),
+                source_type: crate::RuleTypeTree::RawPointer {
+                    mutability: RawMutability::Const,
+                    pointee: Box::new(primitive_rule()),
+                },
+                target_type: crate::RuleTypeTree::Reference {
+                    mutability: RefMutability::Shared,
+                    pointee: Box::new(primitive_rule()),
+                },
+            }],
+            lhs: false,
+            source_type: primitive_rule(),
+            source_adjusted_type: primitive_rule(),
+            target_type: primitive_rule(),
+            target_adjusted_type: primitive_rule(),
+        };
+        let input = |source_expression| crate::RuleMatchInput {
+            source_expression,
+            pointer_anchors: vec![crate::PointerAnchor {
+                id: "<id0>".into(),
+                source_type: TypeTree::RawPointer {
+                    mutability: RawMutability::Const,
+                    pointee: Box::new(primitive()),
+                },
+                target_type: TypeTree::Reference {
+                    mutability: RefMutability::Shared,
+                    pointee: Box::new(primitive()),
+                },
+            }],
+            lhs: false,
+            source_type: primitive(),
+            source_adjusted_type: primitive(),
+            target_type: Some(primitive()),
+            target_adjusted_type: Some(primitive()),
+        };
+        let expression_variable = rule_expression(0);
+        let concrete_variable = concrete_path("<id1>");
+        let isize_expression = rule_cast(expression_variable.clone(), "isize");
+        let concrete_isize = cast(concrete_variable.clone(), "isize");
+        let usize_expression = rule_cast(expression_variable.clone(), "usize");
+        let field_identity = crate::RuleMemberIdentity::External {
+            crate_name: "fixture".into(),
+            path: vec!["Holder".into(), "value".into()],
+        };
+        let concrete_field_identity = crate::FieldIdentity::External {
+            crate_name: "fixture".into(),
+            path: vec!["Holder".into(), "value".into()],
+        };
+        let magnitude = crate::RuleIntegerMagnitude::Variable(crate::RuleVariable::new(
+            crate::VariableSort::IntegerMagnitude,
+            0,
+        ));
+        let rule_sum = crate::RuleExpression::Binary {
+            operator: BinaryOperator::Add,
+            left: Box::new(expression_variable.clone()),
+            right: Box::new(rule_integer(magnitude.clone())),
+        };
+        let concrete_sum = crate::Expression::Binary {
+            operator: BinaryOperator::Add,
+            left: Box::new(concrete_variable.clone()),
+            right: Box::new(integer("1")),
+        };
+        let local_function = crate::RuleValueIdentity::Variable {
+            sort: crate::VariableSort::Function,
+            index: 0,
+        };
+        let concrete_function = crate::ValueIdentity::Function { id: "<fn0>".into() };
+        let cases = vec![
+            (
+                "offset index cast",
+                offset_source("offset", isize_expression.clone()),
+                rule_index(rule_anchor(0), usize_expression.clone()),
+                concrete_offset("offset", concrete_isize.clone()),
+                "p[i as usize]",
+            ),
+            (
+                "add index",
+                offset_source("add", expression_variable.clone()),
+                rule_index(rule_anchor(0), expression_variable.clone()),
+                concrete_offset("add", concrete_variable.clone()),
+                "p[i]",
+            ),
+            (
+                "null to none",
+                rule_method(rule_anchor(0), "is_null", vec![]),
+                rule_method(rule_anchor(0), "is_none", vec![]),
+                method(concrete_path("<id0>"), "is_null", vec![]),
+                "p.is_none()",
+            ),
+            (
+                "negated null to some",
+                rule_unary(
+                    UnaryOperator::Not,
+                    rule_method(rule_anchor(0), "is_null", vec![]),
+                ),
+                rule_method(rule_anchor(0), "is_some", vec![]),
+                unary(
+                    UnaryOperator::Not,
+                    method(concrete_path("<id0>"), "is_null", vec![]),
+                ),
+                "p.is_some()",
+            ),
+            (
+                "mutable address dereference simplification",
+                crate::RuleExpression::AddressOf {
+                    borrow: BorrowKind::Reference,
+                    mutability: RawMutability::Mut,
+                    expression: Box::new(rule_unary(UnaryOperator::Deref, rule_anchor(0))),
+                },
+                rule_anchor(0),
+                crate::Expression::AddressOf {
+                    borrow: BorrowKind::Reference,
+                    mutability: RawMutability::Mut,
+                    expression: Box::new(unary(
+                        UnaryOperator::Deref,
+                        concrete_path("<id0>"),
+                    )),
+                },
+                "p",
+            ),
+            (
+                "shared address dereference simplification",
+                crate::RuleExpression::AddressOf {
+                    borrow: BorrowKind::Reference,
+                    mutability: RawMutability::Const,
+                    expression: Box::new(rule_unary(UnaryOperator::Deref, rule_anchor(0))),
+                },
+                rule_anchor(0),
+                crate::Expression::AddressOf {
+                    borrow: BorrowKind::Reference,
+                    mutability: RawMutability::Const,
+                    expression: Box::new(unary(
+                        UnaryOperator::Deref,
+                        concrete_path("<id0>"),
+                    )),
+                },
+                "p",
+            ),
+            (
+                "optional shared dereference",
+                rule_unary(UnaryOperator::Deref, rule_anchor(0)),
+                rule_unary(UnaryOperator::Deref, chain(rule_anchor(0), "as_deref")),
+                unary(UnaryOperator::Deref, concrete_path("<id0>")),
+                "*p.as_deref().unwrap()",
+            ),
+            (
+                "optional mutable dereference",
+                rule_unary(UnaryOperator::Deref, rule_anchor(0)),
+                rule_unary(
+                    UnaryOperator::Deref,
+                    chain(rule_anchor(0), "as_deref_mut"),
+                ),
+                unary(UnaryOperator::Deref, concrete_path("<id0>")),
+                "*p.as_deref_mut().unwrap()",
+            ),
+            (
+                "field projection",
+                crate::RuleExpression::Field {
+                    base: Box::new(rule_unary(UnaryOperator::Deref, rule_anchor(0))),
+                    field: field_identity.clone(),
+                },
+                crate::RuleExpression::Field {
+                    base: Box::new(rule_anchor(0)),
+                    field: field_identity,
+                },
+                crate::Expression::Field {
+                    base: Box::new(unary(UnaryOperator::Deref, concrete_path("<id0>"))),
+                    field: concrete_field_identity,
+                },
+                "p.value",
+            ),
+            (
+                "local function identity",
+                crate::RuleExpression::Call {
+                    callee: Box::new(crate::RuleExpression::Path {
+                        value: local_function.clone(),
+                    }),
+                    arguments: vec![rule_anchor(0)],
+                },
+                crate::RuleExpression::Call {
+                    callee: Box::new(crate::RuleExpression::Path {
+                        value: local_function,
+                    }),
+                    arguments: vec![chain(rule_anchor(0), "as_deref")],
+                },
+                crate::Expression::Call {
+                    callee: Box::new(crate::Expression::Path {
+                        value: concrete_function,
+                    }),
+                    arguments: vec![concrete_path("<id0>")],
+                },
+                "read(p.as_deref().unwrap())",
+            ),
+            (
+                "addressed index",
+                rule_method(rule_anchor(0), "offset", vec![isize_expression.clone()]),
+                crate::RuleExpression::AddressOf {
+                    borrow: BorrowKind::Reference,
+                    mutability: RawMutability::Const,
+                    expression: Box::new(rule_index(rule_anchor(0), usize_expression)),
+                },
+                method(
+                    concrete_path("<id0>"),
+                    "offset",
+                    vec![concrete_isize.clone()],
+                ),
+                "&p[i as usize]",
+            ),
+            (
+                "optional indexed dereference",
+                offset_source("offset", isize_expression),
+                rule_index(chain(rule_anchor(0), "as_deref"), rule_cast(rule_expression(0), "usize")),
+                concrete_offset("offset", concrete_isize),
+                "p.as_deref().unwrap()[i as usize]",
+            ),
+            (
+                "integer magnitude",
+                offset_source("offset", rule_cast(rule_sum.clone(), "isize")),
+                rule_index(rule_anchor(0), rule_sum),
+                concrete_offset("offset", cast(concrete_sum.clone(), "isize")),
+                "p[i + 1usize]",
+            ),
+        ];
+        let names = HashMap::from([
+            ("<id0>".to_owned(), "p".to_owned()),
+            ("<id1>".to_owned(), "i".to_owned()),
+            ("<fn0>".to_owned(), "read".to_owned()),
+        ]);
+        let type_syntax = HashMap::new();
+        let type_speller = TypeSpeller::new(function, &mapper.ast_to_hir, tcx);
+        for (name, source_pattern, target_pattern, concrete, expected) in cases {
+            let selected = LoadedRuleSet::new(&crate::RuleDocument {
+                schema_version: 1,
+                rules: vec![make_rule(source_pattern, target_pattern)],
+            })
+            .unwrap()
+            .select(&input(concrete))
+            .unwrap_or_else(|| panic!("{name} did not select"));
+            let renderer = RuleRenderer {
+                names: &names,
+                syntax_overrides: &selected.syntax_overrides,
+                identity_syntax: &selected.identity_syntax,
+                syntax_cursor: Cell::new(0),
+                type_syntax: &type_syntax,
+                type_speller: &type_speller,
+            };
+            let rendered = expression_spelling(&selected.target_expression, &renderer)
+                .unwrap_or_else(|| panic!("{name} did not render"));
+            let actual = parse_rule_expression(rendered, false)
+                .unwrap_or_else(|| panic!("{name} did not parse"));
+            let expected = parse_rule_expression(expected.to_owned(), false).unwrap();
+            assert_eq!(shape(&actual), shape(&expected), "{name}");
+        }
+    })
+    .unwrap();
+}
+
+#[test]
+fn compiler_source_occurrences_drive_expression_and_identity_metavariables() {
+    let source = r#"
+unsafe fn read(value: i32) -> i32 { value }
+use self::read as alias;
+unsafe fn f() { let _ = (((1))) + (2); let _ = alias(1); }
+"#;
+    run_compiler_on_str(source, |tcx| {
+        let mut surface = utils::ast::parse_crate(source.to_owned());
+        let mut mapper = utils::ir::AstToHirMapper::new(tcx);
+        mapper.map_crate_to_mod(&mut surface, tcx.hir_root_module(), false);
+        let function = local_def("f", tcx);
+        let item = surface
+            .items
+            .iter()
+            .find(|item| {
+                item.kind
+                    .ident()
+                    .is_some_and(|name| name.name.as_str() == "f")
+            })
+            .unwrap();
+        let ItemKind::Fn(box function_item) = &item.kind else { unreachable!() };
+        let expressions = function_item
+            .body
+            .as_ref()
+            .unwrap()
+            .stmts
+            .iter()
+            .map(|statement| {
+                let StmtKind::Let(local) = &statement.kind else { unreachable!() };
+                let LocalKind::Init(expression) = &local.kind else { unreachable!() };
+                expression.as_ref()
+            })
+            .collect::<Vec<_>>();
+        fn syntax(expression: &Expr) -> Vec<String> {
+            struct Collector(Vec<String>);
+            impl<'ast> visit::Visitor<'ast> for Collector {
+                fn visit_expr(&mut self, expression: &'ast Expr) {
+                    self.0.push(pprust::expr_to_string(expression));
+                    let mut normalized = expression;
+                    while let ExprKind::Paren(inner) = &normalized.kind {
+                        normalized = inner;
+                    }
+                    if normalized.id != expression.id {
+                        visit::walk_expr(self, normalized);
+                    } else {
+                        visit::walk_expr(self, expression);
+                    }
+                }
+            }
+            let mut collector = Collector(vec![]);
+            collector.visit_expr(expression);
+            collector.0
+        }
+        let primitive = crate::RuleTypeTree::Primitive { name: "i32".into() };
+        let anchor = crate::RulePointerAnchor {
+            id: crate::RuleVariable::new(crate::VariableSort::Anchor, 0),
+            source_type: crate::RuleTypeTree::RawPointer {
+                mutability: RawMutability::Const,
+                pointee: Box::new(primitive.clone()),
+            },
+            target_type: crate::RuleTypeTree::Reference {
+                mutability: RefMutability::Shared,
+                pointee: Box::new(primitive.clone()),
+            },
+        };
+        let make_rule = |source_pattern, target_pattern| crate::Rule {
+            source_pattern,
+            target_pattern,
+            pointer_anchors: vec![anchor.clone()],
+            lhs: false,
+            source_type: primitive.clone(),
+            source_adjusted_type: primitive.clone(),
+            target_type: primitive.clone(),
+            target_adjusted_type: primitive.clone(),
+        };
+        let integer = |value: &str| crate::Expression::Literal {
+            value: crate::Literal::Integer {
+                value: value.into(),
+                ty: "i32".into(),
+            },
+        };
+        let input = |source_expression| crate::RuleMatchInput {
+            source_expression,
+            pointer_anchors: vec![crate::PointerAnchor {
+                id: "<id0>".into(),
+                source_type: TypeTree::RawPointer {
+                    mutability: RawMutability::Const,
+                    pointee: Box::new(TypeTree::Primitive { name: "i32".into() }),
+                },
+                target_type: TypeTree::Reference {
+                    mutability: RefMutability::Shared,
+                    pointee: Box::new(TypeTree::Primitive { name: "i32".into() }),
+                },
+            }],
+            lhs: false,
+            source_type: TypeTree::Primitive { name: "i32".into() },
+            source_adjusted_type: TypeTree::Primitive { name: "i32".into() },
+            target_type: Some(TypeTree::Primitive { name: "i32".into() }),
+            target_adjusted_type: Some(TypeTree::Primitive { name: "i32".into() }),
+        };
+        let expression_variable = |index| crate::RuleExpression::Variable {
+            sort: crate::VariableSort::Expression,
+            index,
+        };
+        let expression_rule = make_rule(
+            crate::RuleExpression::Binary {
+                operator: BinaryOperator::Add,
+                left: Box::new(expression_variable(0)),
+                right: Box::new(expression_variable(1)),
+            },
+            expression_variable(1),
+        );
+        let loaded = LoadedRuleSet::new(&crate::RuleDocument {
+            schema_version: 1,
+            rules: vec![expression_rule],
+        })
+        .unwrap();
+        let selected = loaded
+            .select_with_exclusions_and_syntax(
+                &input(crate::Expression::Binary {
+                    operator: BinaryOperator::Add,
+                    left: Box::new(integer("1")),
+                    right: Box::new(integer("2")),
+                }),
+                &BTreeSet::new(),
+                &syntax(expressions[0]),
+            )
+            .unwrap();
+        assert_eq!(selected.syntax_overrides.get(&0).unwrap(), "(2)");
+
+        let function_variable = crate::RuleExpression::Path {
+            value: crate::RuleValueIdentity::Variable {
+                sort: crate::VariableSort::Function,
+                index: 0,
+            },
+        };
+        let call_rule = make_rule(
+            crate::RuleExpression::Call {
+                callee: Box::new(function_variable.clone()),
+                arguments: vec![expression_variable(0)],
+            },
+            crate::RuleExpression::Call {
+                callee: Box::new(function_variable),
+                arguments: vec![crate::RuleExpression::Literal {
+                    value: crate::RuleLiteral::Integer {
+                        value: crate::RuleIntegerMagnitude::Fixed("2".into()),
+                        ty: "i32".into(),
+                    },
+                }],
+            },
+        );
+        let loaded = LoadedRuleSet::new(&crate::RuleDocument {
+            schema_version: 1,
+            rules: vec![call_rule],
+        })
+        .unwrap();
+        let selected = loaded
+            .select_with_exclusions_and_syntax(
+                &input(crate::Expression::Call {
+                    callee: Box::new(crate::Expression::Path {
+                        value: crate::ValueIdentity::Function { id: "<fn0>".into() },
+                    }),
+                    arguments: vec![integer("1")],
+                }),
+                &BTreeSet::new(),
+                &syntax(expressions[1]),
+            )
+            .unwrap();
+        assert_eq!(selected.identity_syntax.get("<fn0>").unwrap(), "alias");
+        let names = HashMap::from([("<fn0>".to_owned(), "read".to_owned())]);
+        let type_syntax = HashMap::new();
+        let type_speller = TypeSpeller::new(function, &mapper.ast_to_hir, tcx);
+        let renderer = RuleRenderer {
+            names: &names,
+            syntax_overrides: &selected.syntax_overrides,
+            identity_syntax: &selected.identity_syntax,
+            syntax_cursor: Cell::new(0),
+            type_syntax: &type_syntax,
+            type_speller: &type_speller,
+        };
+        assert_eq!(
+            expression_spelling(&selected.target_expression, &renderer).unwrap(),
+            "alias(2i32)"
+        );
+    })
+    .unwrap();
+}
+
+#[test]
+fn optional_pointee_requires_an_immediate_reference_or_box() {
+    let primitive = TypeTree::Primitive { name: "i32".into() };
+    let reference = TypeTree::Reference {
+        mutability: RefMutability::Shared,
+        pointee: Box::new(primitive.clone()),
+    };
+    let option = |argument| TypeTree::Adt {
+        adt_kind: AdtKind::Enum,
+        identity: AdtIdentity::External {
+            crate_name: "core".into(),
+            path: vec!["option".into(), "Option".into()],
+        },
+        arguments: vec![argument],
+    };
+    let boxed = TypeTree::Adt {
+        adt_kind: AdtKind::Struct,
+        identity: AdtIdentity::External {
+            crate_name: "alloc".into(),
+            path: vec!["boxed".into(), "Box".into()],
+        },
+        arguments: vec![primitive.clone()],
+    };
+    assert_eq!(
+        option_or_box_pointee(&option(reference)),
+        Some(primitive.clone())
+    );
+    assert_eq!(option_or_box_pointee(&option(boxed)), Some(primitive));
+    assert_eq!(
+        option_or_box_pointee(&option(option(TypeTree::Reference {
+            mutability: RefMutability::Shared,
+            pointee: Box::new(TypeTree::Primitive { name: "i32".into() }),
+        }))),
+        None
     );
 }

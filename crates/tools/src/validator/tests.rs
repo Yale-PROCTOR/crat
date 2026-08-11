@@ -1,4 +1,49 @@
 use super::*;
+use crate::{StatementDisposition, StatementDispositionKind, StatementPairMetadata};
+
+fn skeleton_view(skeleton: &str, transformed: Vec<u32>, needs: bool) -> SkeletonView {
+    rustc_span::create_session_if_not_set_then(rustc_span::edition::Edition::Edition2021, |_| {
+        let transformed_set = transformed.iter().copied().collect();
+        let statement_dispositions = std::panic::catch_unwind(|| parse_crate(skeleton))
+            .ok()
+            .and_then(Result::ok)
+            .and_then(|krate| {
+                krate.items.first().and_then(|item| {
+                    crate::preservation::make_disposition_forest(
+                        item,
+                        &transformed_set,
+                        &HashSet::new(),
+                    )
+                    .ok()
+                })
+            })
+            .unwrap_or_else(|| {
+                transformed
+                    .iter()
+                    .copied()
+                    .map(|label| StatementDisposition {
+                        label,
+                        disposition: StatementDispositionKind::Transform,
+                        children: vec![],
+                    })
+                    .collect()
+            });
+        SkeletonView {
+            skeleton: skeleton.to_owned(),
+            needs_transformation: needs,
+            statement_dispositions,
+            statement_pair_metadata: transformed
+                .into_iter()
+                .map(|label| StatementPairMetadata {
+                    label,
+                    before_statement: "test".to_owned(),
+                    pointer_variables_complete: true,
+                    pointer_variables: vec![],
+                })
+                .collect(),
+        }
+    })
+}
 
 fn expected_function(id: u64, name: &str, skeleton: &str) -> ExpectedFunction {
     let mut labels = skeleton
@@ -9,13 +54,10 @@ fn expected_function(id: u64, name: &str, skeleton: &str) -> ExpectedFunction {
         })
         .collect::<Vec<_>>();
     labels.sort_unstable();
-    labels.dedup();
     ExpectedFunction {
         id,
         name: name.to_owned(),
-        skeleton: skeleton.to_owned(),
-        needs_transformation: !labels.is_empty(),
-        statements_requiring_transformation: labels,
+        view: skeleton_view(skeleton, labels.clone(), !labels.is_empty()),
     }
 }
 
@@ -29,9 +71,50 @@ fn preservation_request(
         expected_functions: vec![ExpectedFunction {
             id: 7,
             name: "f".to_owned(),
-            skeleton: skeleton.to_owned(),
-            needs_transformation: !transformed.is_empty(),
-            statements_requiring_transformation: transformed,
+            view: skeleton_view(skeleton, transformed.clone(), !transformed.is_empty()),
+        }],
+        transformation: transformation.to_owned(),
+    }
+}
+
+fn mixed_preservation_request(
+    skeleton: &str,
+    transformed: &[u32],
+    rule_applied: &[u32],
+    transformation: &str,
+) -> ValidationRequest {
+    let view = rustc_span::create_session_if_not_set_then(
+        rustc_span::edition::Edition::Edition2021,
+        |_| {
+            let krate = parse_crate(skeleton).unwrap();
+            SkeletonView {
+                skeleton: skeleton.to_owned(),
+                needs_transformation: !transformed.is_empty(),
+                statement_dispositions: crate::preservation::make_disposition_forest(
+                    &krate.items[0],
+                    &transformed.iter().copied().collect(),
+                    &rule_applied.iter().copied().collect(),
+                )
+                .unwrap(),
+                statement_pair_metadata: transformed
+                    .iter()
+                    .copied()
+                    .map(|label| StatementPairMetadata {
+                        label,
+                        before_statement: "test".to_owned(),
+                        pointer_variables_complete: true,
+                        pointer_variables: vec![],
+                    })
+                    .collect(),
+            }
+        },
+    );
+    ValidationRequest {
+        schema_version: 1,
+        expected_functions: vec![ExpectedFunction {
+            id: 7,
+            name: "f".to_owned(),
+            view,
         }],
         transformation: transformation.to_owned(),
     }
@@ -76,6 +159,117 @@ fn assert_codes(skeleton: &str, transformation: &str, expected: &[&str]) {
 }
 
 const UNIT_SKELETON: &str = "unsafe fn f() { #[proctor(0)] todo!(); }";
+
+#[test]
+fn preservation_forest_must_follow_depth_first_lexical_order() {
+    let skeleton = r#"unsafe fn f() {
+#[proctor(7)] if true {
+    #[proctor(3)] return;
+    #[proctor(9)] return;
+}
+#[proctor(1)] return;
+}"#;
+    for mutation in ["roots", "siblings"] {
+        let mut expected = expected_function(7, "f", skeleton);
+        match mutation {
+            "roots" => expected.view.statement_dispositions.swap(0, 1),
+            "siblings" => expected.view.statement_dispositions[0].children.swap(0, 1),
+            _ => unreachable!(),
+        }
+        let response = validate(&ValidationRequest {
+            schema_version: 1,
+            expected_functions: vec![expected],
+            transformation: skeleton.to_owned(),
+        });
+        assert_eq!(codes(&response), ["invalid_expected_skeleton"]);
+    }
+}
+
+#[test]
+fn mixed_rule_applied_slots_validate_in_both_topologies() {
+    let outer_rule = r#"unsafe fn f(flag: bool) {
+#[proctor(0)] if flag {
+    #[proctor(1)] consume(1);
+    #[proctor(2)] consume(2);
+}
+}"#;
+    let valid_outer_rule = r#"unsafe fn f(flag: bool) {
+#[proctor(0)] if !flag {
+    #[proctor(1)] let proctor_temp_var_0 = 4;
+    #[proctor(1)] consume(proctor_temp_var_0);
+    #[proctor(2)] consume(5);
+}
+}"#;
+    assert!(
+        validate(&mixed_preservation_request(
+            outer_rule,
+            &[1, 2],
+            &[0],
+            valid_outer_rule,
+        ))
+        .is_valid()
+    );
+
+    let inner_rule = r#"unsafe fn f(flag: bool) {
+#[proctor(0)] if true {
+    #[proctor(1)] consume(1);
+    #[proctor(2)] consume(2);
+}
+}"#;
+    let valid_inner_rule = r#"unsafe fn f(flag: bool) {
+#[proctor(0)] if flag {
+    #[proctor(1)] consume(999);
+    #[proctor(2)] consume(3);
+}
+}"#;
+    assert!(
+        validate(&mixed_preservation_request(
+            inner_rule,
+            &[0, 2],
+            &[1],
+            valid_inner_rule,
+        ))
+        .is_valid()
+    );
+
+    let invalid_outer = [
+        r#"unsafe fn f(flag: bool) { #[proctor(0)] if flag { #[proctor(1)] consume(1); } }"#,
+        r#"unsafe fn f(flag: bool) { #[proctor(0)] if flag { #[proctor(1)] consume(1); #[proctor(2)] consume(2); #[proctor(1)] consume(3); } }"#,
+        r#"unsafe fn f(flag: bool) { #[proctor(0)] if flag { #[proctor(2)] consume(2); #[proctor(1)] consume(1); } }"#,
+        r#"unsafe fn f(flag: bool) { #[proctor(0)] if flag { #[proctor(1)] consume(1); } #[proctor(2)] consume(2); }"#,
+        r#"unsafe fn f(flag: bool) { #[proctor(0)] if flag { if true { #[proctor(1)] consume(1); } #[proctor(2)] consume(2); } }"#,
+    ];
+    for transformation in invalid_outer {
+        assert!(
+            !validate(&mixed_preservation_request(
+                outer_rule,
+                &[1, 2],
+                &[0],
+                transformation,
+            ))
+            .is_valid()
+        );
+    }
+
+    let invalid_inner = [
+        r#"unsafe fn f(flag: bool) { #[proctor(0)] if flag { #[proctor(2)] consume(2); } }"#,
+        r#"unsafe fn f(flag: bool) { #[proctor(0)] if flag { #[proctor(1)] consume(1); #[proctor(1)] consume(3); #[proctor(2)] consume(2); } }"#,
+        r#"unsafe fn f(flag: bool) { #[proctor(0)] if flag { #[proctor(2)] consume(2); #[proctor(1)] consume(1); } }"#,
+        r#"unsafe fn f(flag: bool) { #[proctor(0)] if flag { #[proctor(2)] consume(2); } #[proctor(1)] consume(1); }"#,
+        r#"unsafe fn f(flag: bool) { #[proctor(0)] if flag { if true { #[proctor(1)] consume(1); } #[proctor(2)] consume(2); } }"#,
+    ];
+    for transformation in invalid_inner {
+        assert!(
+            !validate(&mixed_preservation_request(
+                inner_rule,
+                &[0, 2],
+                &[1],
+                transformation,
+            ))
+            .is_valid()
+        );
+    }
+}
 
 #[test]
 fn preserved_leaf_and_expansion_group_are_canonicalized() {
@@ -248,9 +442,7 @@ fn invalid_preservation_metadata_is_setup_error() {
             expected_functions: vec![ExpectedFunction {
                 id: 7,
                 name: "f".to_owned(),
-                skeleton: skeleton.to_owned(),
-                needs_transformation: needs,
-                statements_requiring_transformation: labels,
+                view: skeleton_view(skeleton, labels, needs),
             }],
             transformation: "unsafe fn f() { #[proctor(0)] if true { #[proctor(1)] return; } }"
                 .to_owned(),
@@ -310,7 +502,7 @@ fn preserved_outer_alignment_keeps_stable_label_errors() {
 #[test]
 fn valid_response_has_explicit_status() {
     let response = validate_json(
-        r#"{"schema_version":1,"expected_functions":[{"id":7,"name":"f","skeleton":"unsafe fn f() { #[proctor(0)] todo!(); }","needs_transformation":true,"statements_requiring_transformation":[0]}],"transformation":"unsafe fn f() { #[proctor(0)] return; }"}"#,
+        r#"{"schema_version":1,"expected_functions":[{"id":7,"name":"f","view":{"skeleton":"unsafe fn f() { #[proctor(0)] todo!(); }","needs_transformation":true,"statement_dispositions":[{"label":0,"disposition":"transform","children":[]}],"statement_pair_metadata":[{"label":0,"before_statement":"test","pointer_variables_complete":true,"pointer_variables":[]}]}}],"transformation":"unsafe fn f() { #[proctor(0)] return; }"}"#,
     );
     assert_eq!(
         response,
@@ -346,7 +538,7 @@ fn setup_error_matches_schema_and_key_order() {
 fn json_round_trip_preserves_embedded_rust() {
     let input = r#"{
   "schema_version": 1,
-  "expected_functions": [{"id":7,"name":"f","skeleton":"unsafe fn f() -> &'static str {\n #[proctor(0)]\n todo!()\n}","needs_transformation":true,"statements_requiring_transformation":[0]}],
+  "expected_functions": [{"id":7,"name":"f","view":{"skeleton":"unsafe fn f() -> &'static str {\n #[proctor(0)]\n todo!()\n}","needs_transformation":true,"statement_dispositions":[{"label":0,"disposition":"transform","children":[]}],"statement_pair_metadata":[{"label":0,"before_statement":"test","pointer_variables_complete":true,"pointer_variables":[]}]}}],
   "transformation":"unsafe fn f() -> &'static str {\n #[proctor(0)]\n \"quote:\\\" slash:\\\\ line:\\n\"\n}"
 }"#;
     assert!(validate_json(input).contains("\"status\": \"valid\""));

@@ -16,10 +16,14 @@ extern crate thin_vec;
 mod item_replacer;
 mod observation;
 mod preservation;
+mod rule;
 mod skeleton;
 mod validator;
+mod view;
 
 pub use item_replacer::*;
 pub use observation::*;
+pub use rule::*;
 pub use skeleton::*;
 pub use validator::*;
+pub use view::*;

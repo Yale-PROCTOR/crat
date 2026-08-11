@@ -25,9 +25,9 @@ use smallvec::SmallVec;
 use thin_vec::ThinVec;
 
 use crate::{
+    SkeletonView,
     preservation::{
-        canonical_statement_group, canonicalize_function_for_replacement,
-        validate_preservation_metadata,
+        canonical_statement_group, canonicalize_function_with_view, validate_skeleton_view,
     },
     skeleton::{annotate_function, collect_opaque_nested_ifs, render_statement_group},
 };
@@ -58,9 +58,7 @@ pub struct ReplacementItem {
     pub id: u64,
     pub path: String,
     pub name: String,
-    pub skeleton: String,
-    pub needs_transformation: bool,
-    pub statements_requiring_transformation: Vec<u32>,
+    pub view: SkeletonView,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -156,21 +154,16 @@ pub fn replace_items_with_observations(
         let returned = returned_transformations
             .get(&requested.name)
             .expect("request validation established the function set");
-        let canonical = canonicalize_function_for_replacement(
-            &expected,
-            returned,
-            requested.needs_transformation,
-            &requested.statements_requiring_transformation,
-        )
-        .map_err(|problem| {
-            item_error(
-                ReplacementErrorKind::InvalidTransformation,
-                requested,
-                format!("{}: {}", problem.code, problem.message),
-            )
-        })?;
-        for label in &requested.statements_requiring_transformation {
-            let group = canonical_statement_group(&canonical, *label).ok_or_else(|| {
+        let canonical = canonicalize_function_with_view(&expected, returned, &requested.view, true)
+            .map_err(|problem| {
+                item_error(
+                    ReplacementErrorKind::InvalidTransformation,
+                    requested,
+                    format!("{}: {}", problem.code, problem.message),
+                )
+            })?;
+        for label in requested.view.transform_labels() {
+            let group = canonical_statement_group(&canonical, label).ok_or_else(|| {
                 item_error(
                     ReplacementErrorKind::InvalidTransformation,
                     requested,
@@ -180,7 +173,7 @@ pub fn replace_items_with_observations(
             statement_pairs.push(ReplacementStatementPair {
                 item_id: requested.id,
                 path: requested.path.clone(),
-                label: *label,
+                label,
                 after_statement: render_statement_group(&group),
             });
         }
@@ -344,7 +337,7 @@ pub fn replace_items_with_observations(
             source_copy_path: plan.source_copy_path.clone(),
             implementation_path: plan.requested.path.clone(),
             wrapper_path: plan.wrapper_path.clone(),
-            transform_labels: plan.requested.statements_requiring_transformation.clone(),
+            transform_labels: plan.requested.view.transform_labels(),
         })
         .collect();
     Ok(ExtendedReplacementOutput {
@@ -544,7 +537,7 @@ fn validate_correspondence(records: &[CallableCorrespondence]) -> Result<(), Rep
 }
 
 fn parse_replacement_skeleton(item: &ReplacementItem) -> Result<P<Item>, ReplacementError> {
-    let krate = parse_crate(&item.skeleton, ReplacementErrorKind::InvalidRequest)?;
+    let krate = parse_crate(&item.view.skeleton, ReplacementErrorKind::InvalidRequest)?;
     if krate.items.len() != 1 || !matches!(krate.items[0].kind, ItemKind::Fn(..)) {
         return Err(item_error(
             ReplacementErrorKind::InvalidRequest,
@@ -564,12 +557,7 @@ fn parse_replacement_skeleton(item: &ReplacementItem) -> Result<P<Item>, Replace
             ),
         ));
     }
-    validate_preservation_metadata(
-        &skeleton,
-        item.needs_transformation,
-        &item.statements_requiring_transformation,
-    )
-    .map_err(|problem| {
+    validate_skeleton_view(&skeleton, &item.view).map_err(|problem| {
         item_error(
             ReplacementErrorKind::InvalidRequest,
             item,
