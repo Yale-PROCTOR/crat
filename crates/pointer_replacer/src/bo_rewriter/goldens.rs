@@ -485,21 +485,45 @@ fn a_null_tested_pointer_takes_an_optional_form_instead_of_degrading() {
 /// in the decision phase, naming the call site — not discovered later as a
 /// crate-wide type error.
 ///
-/// This reason is explicitly **temporary**: S3's call-site adaptation retires
-/// `CallSiteNotAdapted`, and the typed variant is what makes that retirement
-/// visible in the counters rather than silent.
+/// # RE-POINTED at S3.6-1 step 3, and the reason it had to be
 ///
-/// *Mutation-tested, Rider 0 order.* **Deletion first:** remove the `callers`
-/// check from `decide_one` and this fails.
+/// This test used to require the reason `CallSiteNotAdapted`, and its own doc
+/// said that reason was **temporary**: *"S3's call-site adaptation retires
+/// `CallSiteNotAdapted`, and the typed variant is what makes that retirement
+/// visible in the counters rather than silent."*
+///
+/// The lift retired it, and the typed variant did exactly its job — the
+/// retirement surfaced as this failing assertion instead of silent counter
+/// drift. Measured: g06's subject still degrades **at decision time with its
+/// call site named**, now under the class vocabulary.
+///
+/// So the assertion re-points to **the property that was ever the point** —
+/// decision-time attribution with a site — and stops naming a reason that was
+/// documented as transient. Registry-layer only: g06's ratified fixture bytes
+/// are untouched, and `g06_move_reroute` keeps its own standing verdict.
+///
+/// *Mutation-tested, Rider 0 order.* **Deletion first:** remove the class gate
+/// from `decide_one` and the subject EMITS, so no degradation is found and this
+/// fails. A subject degrading without a site fails the second assertion.
 #[test]
 fn g06_class_is_attributed_at_decision_time() {
     use super::decision::DegradeReason;
     let records = degradations_for("g06_move_reroute");
     let hit = records
         .iter()
-        .find(|d| d.reason == DegradeReason::CallSiteNotAdapted)
+        .find(|d| {
+            matches!(
+                d.reason,
+                DegradeReason::CallSiteNotAdapted
+                    | DegradeReason::SilentCoercion { .. }
+                    | DegradeReason::ClassBlocked { .. }
+            )
+        })
         .unwrap_or_else(|| {
-            panic!("no call-site-not-adapted degradation was attributed; got {records:#?}")
+            panic!(
+                "the in-crate-caller subject emitted instead of being attributed \
+                 at decision time; got {records:#?}"
+            )
         });
     assert!(
         !hit.site.is_empty() && hit.site.contains(':'),

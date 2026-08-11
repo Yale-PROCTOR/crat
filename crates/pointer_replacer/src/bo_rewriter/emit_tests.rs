@@ -3543,53 +3543,51 @@ mod coconv_witnesses {
         }
     }
 
-    /// **THE ZERO-DELTA PIN.** The production ladder still blocks every
-    /// referenced subject.
+    /// **RETIRED and REPLACED — the task-2 zero-delta pin.**
     ///
-    /// Task 2 computes classes and decides nothing: the production call site
-    /// passes `RefGate::BlockAll`, so an admissible class changes no decision.
-    /// This is the structural claim stated as a test rather than as prose — the
-    /// S3.6-0 pattern.
+    /// `an_admissible_class_moves_no_decision_at_task_two` asserted that the
+    /// production ladder still degraded `call-site-not-adapted` for an
+    /// admissible class. Its own recorded mutation note read: *"switching the
+    /// production `decide` call to `LiftAdaptable` makes the reason `-` and
+    /// fails here. That mutation is exactly task 3."*
     ///
-    /// *Mutation-tested:* switching the production `decide` call to
-    /// `LiftAdaptable` makes the reason `-` and fails here. That mutation is
-    /// exactly task 3.
+    /// Step 3 **is** that mutation. The pin fired precisely as designed and its
+    /// era ended, so it is retired openly rather than edited into agreement —
+    /// the g19 rule. What replaces it is the lift-era invariant stated
+    /// positively, under **its own name**, so nothing pretends to be the old
+    /// pin still holding.
+    ///
+    /// *Mutation-tested (deletion first):* reverting production to
+    /// `RefGate::BlockAll` makes the chain degrade again and fails this.
     #[test]
-    fn an_admissible_class_moves_no_decision_at_task_two() {
+    fn an_admissible_class_converts_after_the_lift() {
+        let rows = census(&format!(
+            "{PRE}pub unsafe fn g20_bump(p: *mut i32) -> i32 {{ *p += 1; *p }}\n\
+             pub unsafe fn g20_via(q: *mut i32) -> i32 {{ g20_bump(q) }}\n\
+             pub unsafe fn g20_root() -> i32 {{ let mut x: i32 = 0; g20_via(&mut x) }}\n"
+        ));
+        let bump = row(&rows, "g20_bump", 1);
+        assert_eq!(bump["admissible"], "1", "{bump:?}");
+
         let src = format!(
             "{PRE}pub unsafe fn g20_bump(p: *mut i32) -> i32 {{ *p += 1; *p }}\n\
              pub unsafe fn g20_via(q: *mut i32) -> i32 {{ g20_bump(q) }}\n\
              pub unsafe fn g20_root() -> i32 {{ let mut x: i32 = 0; g20_via(&mut x) }}\n"
         );
         let fixture = Fixture::new(&[("lib.rs", &src)]);
-        let (reasons, admissible) =
+        let reasons =
             ::utils::compilation::run_compiler_on_path(&fixture.0.join("lib.rs"), |tcx| {
                 let table = crate::bo_rewriter::decide_table(tcx).expect("table");
-                let reasons: Vec<String> = crate::bo_rewriter::artifact::rows(tcx, &table)
+                crate::bo_rewriter::artifact::rows(tcx, &table)
                     .iter()
                     .filter_map(|r| r.degrade_reason.clone())
-                    .collect();
-                let tsv = crate::bo_rewriter::coconv_tsv(tcx).expect("census");
-                let admissible = tsv
-                    .lines()
-                    .skip(1)
-                    .filter(|l| l.split('\t').nth(5) == Some("1"))
-                    .count();
-                (reasons, admissible)
+                    .collect::<Vec<_>>()
             })
             .expect("fixture compiles");
         assert!(
-            admissible >= 2,
-            "the fixture must contain an admissible class, or the pin is vacuous"
-        );
-        assert!(
-            reasons
-                .iter()
-                .filter(|r| *r == "call-site-not-adapted")
-                .count()
-                >= 2,
-            "the PRODUCTION gate must still degrade both parameters — task 2 \
-             computes and does not decide: {reasons:?}"
+            !reasons.iter().any(|r| r == "call-site-not-adapted"),
+            "the lift must retire call-site-not-adapted for an admissible \
+             class: {reasons:?}"
         );
     }
 }

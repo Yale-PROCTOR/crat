@@ -2045,8 +2045,12 @@ fn finish_decide<'tcx>(
     );
     // **Production is decided AFTER the classes**, because step 2's gate reads
     // them. No cycle: the hypothetical above was decided with `None`.
+    // **S3.6-1 step 3 — THE LIFT.** Production decides under `LiftAdaptable`
+    // with the class verdict in hand: the adaptable population passes the
+    // `referenced` gate, and the class gate then governs every node uniformly.
+    // The pinned population still blocks inside `LiftAdaptable`.
     let table = decision::decide(
-        &ctx_of(decision::RefGate::BlockAll, Some(&coconv)),
+        &ctx_of(decision::RefGate::LiftAdaptable, Some(&coconv)),
         &subjects,
     );
 

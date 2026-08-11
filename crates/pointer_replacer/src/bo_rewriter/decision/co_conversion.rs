@@ -219,16 +219,19 @@ impl CoConv {
     /// A subject that is not a node at all answers `false`: it did not reach
     /// the gate under the hypothetical, so nothing about the class structure
     /// can license it.
-    #[allow(
-        dead_code,
-        reason = "task 2 COMPUTES and does not decide — the S3.6-0 pattern that \
-                  makes zero corpus delta structural. Task 3 is the consumer; \
-                  correct this reason when the gate reads it."
-    )]
     pub(crate) fn admits(&self, key: NodeKey) -> bool {
         self.class_of
             .get(&key)
             .is_some_and(|&id| self.classes[id].blocked.is_none())
+    }
+
+    /// The reason this subject's CLASS carries, as opposed to the one the
+    /// subject itself contributed. Step 3's collateral arm reads this: a
+    /// subject blocked through a class edge carries no hazard of its own, so
+    /// the reason field names the indirection and keeps the class's key as
+    /// payload.
+    pub(crate) fn class_block(&self, key: NodeKey) -> Option<BlockReason> {
+        self.class_of(key).and_then(|id| self.classes[id].blocked)
     }
 
     pub(crate) fn class_of(&self, key: NodeKey) -> Option<usize> {

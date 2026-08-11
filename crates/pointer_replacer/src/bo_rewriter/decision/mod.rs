@@ -500,6 +500,20 @@ pub(crate) enum DegradeReason {
     /// they are class nodes. A `&mut [T]` or `Option<&mut T>` reaching a raw
     /// context is the same hazard and is **not** gated here.
     SilentCoercion { via: co_conversion::BlockReason },
+    /// **S3.6-1 step 3 — the subject's CLASS cannot convert, though the subject
+    /// contributes no blocking fact of its own.**
+    ///
+    /// Conversion is a property of the connected component: converting a callee
+    /// parameter while the caller feeding it stays raw is `E0308`, so one
+    /// blocked member blocks the class, and a collateral member is blocked by
+    /// **transitivity**.
+    ///
+    /// **The variant names the INDIRECTION; the payload preserves the blocking
+    /// class's key.** Reporting the class's key directly would attribute to this
+    /// subject a hazard it does not carry — the third application of the
+    /// reason-honesty rule in this slice. The collateral itemization is read
+    /// from the census's `class_block` column: one vocabulary, two columns.
+    ClassBlocked { via: co_conversion::BlockReason },
     /// A mutable optional subject with more than one use needs `as_mut()`, and
     /// `as_mut()` needs a `mut` binding this declaration does not have.
     ///
@@ -538,6 +552,9 @@ impl DegradeReason {
             DegradeReason::OptNeedsMutBinding => "opt-needs-mut-binding",
             // ONE vocabulary with the census, deliberately.
             DegradeReason::SilentCoercion { via } => via.key(),
+            // Names the indirection: the class's key is payload, reported by
+            // the census and never conflated with a hazard this subject has.
+            DegradeReason::ClassBlocked { .. } => "class-blocked",
         }
     }
 }
@@ -907,8 +924,30 @@ fn decide_one(ctx: &Ctx<'_, '_>, subject: &Subject) -> Decision {
         // consulted: while the referenced gate still blocks, a blocked
         // classmate is not converting either, so nothing is jointly decided
         // yet. Collateral becomes load-bearing at the lift, not before.
-        if let Some(via) = coconv.and_then(|c| c.node_block((subject.fn_did, subject.hir_id))) {
-            return degrade(subject, decl_site, DegradeReason::SilentCoercion { via });
+        // **S3.6-1 step 3 — THE CLASS GATE, and it consults `admits`.**
+        //
+        // That is what UNIFORM means: the class verdict governs every node, not
+        // only those the `referenced` gate would have blocked. A subject whose
+        // function nothing calls is decided by its class exactly like one whose
+        // function is called — no vintage exemption.
+        if let Some(cc) = coconv {
+            let key = (subject.fn_did, subject.hir_id);
+            if !cc.admits(key) {
+                let reason = match cc.node_block(key) {
+                    Some(via) => DegradeReason::SilentCoercion { via },
+                    None => match cc.class_block(key) {
+                        Some(via) => DegradeReason::ClassBlocked { via },
+                        // Not a node. Unreachable through the pipeline —
+                        // production and the hypothetical differ ONLY by
+                        // `coconv` — and attributed rather than silently
+                        // emitted, because an unreachable arm that falls
+                        // through is how a subject escapes its own gate once
+                        // the premise stops holding.
+                        None => DegradeReason::CallSiteNotAdapted,
+                    },
+                };
+                return degrade(subject, decl_site, reason);
+            }
         }
         return Decision::Ref {
             mutable: subject.mutable,
