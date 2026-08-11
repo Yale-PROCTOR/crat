@@ -75,11 +75,47 @@ impl Drop for Fixture {
 }
 
 fn emit(fixture: &Fixture) -> Emission {
+    emit_injected(fixture, &|_| {})
+}
+
+/// **BRANCH 2 — an INJECTION at the plan boundary**, the `plan/mod.rs` arm-3
+/// precedent and the same seam `rewrite_m1_path_injected` already uses.
+///
+/// Since S3.6-1 step 2 the decision phase refuses every emission that would
+/// launder a reference into a raw context — which is the gate's whole job, and
+/// which makes a deliberately-broken emission **unconstructible from source**.
+/// Measured, not assumed: every raw context a converted value can reach is
+/// either gated (field store, return, foreign argument, `static mut`) or is
+/// itself a subject and converts with its source (an annotated local).
+///
+/// So the broken emission is injected as DATA rather than coaxed out of a
+/// fixture. The fixture text is unchanged; only the decision differs, which is
+/// what keeps every property the original witnesses rested on — line numbers,
+/// file names, error counts — true by construction rather than by re-derivation.
+fn emit_injected(
+    fixture: &Fixture,
+    inject: &(dyn Fn(&mut super::decision::DecisionTable) + Sync),
+) -> Emission {
     ::utils::compilation::run_compiler_on_path(&fixture.0.join("lib.rs"), |tcx| {
-        let table = decide_table(tcx).expect("fixture yields a decision table");
+        let mut table = decide_table(tcx).expect("fixture yields a decision table");
+        inject(&mut table);
         emit_files(tcx, &table, &rustc_hash::FxHashSet::default()).expect("emission succeeds")
     })
     .expect("fixture compiles")
+}
+
+/// Force `stash`'s parameter to a SHARED reference.
+///
+/// Shared is load-bearing: `&mut T → *mut T` coerces silently, so a mutable
+/// injection would emit a crate that COMPILES and witness nothing. `&T` into a
+/// `*mut T` field is `E0308` — the loud failure the verify layer exists to
+/// read, and the one the original fixture produced before step 2 refused it.
+fn force_stash_value_shared(table: &mut super::decision::DecisionTable) {
+    for (subject, decision) in &mut table.entries {
+        if subject.param_name.as_deref() == Some("value") {
+            *decision = super::decision::Decision::Ref { mutable: false };
+        }
+    }
 }
 
 /// Emitted text for a file, matched on the file's *name* so the assertion does
@@ -424,7 +460,10 @@ fn a_bad_rewrite_is_reverted_and_the_good_one_survives() {
         ("bad.rs", BREAKS_ON_REWRITE),
     ]);
 
-    match super::rewrite_m1_path(&fixture.root()) {
+    // INJECTED since step 2 — the broken emission is supplied as data, per
+    // `emit_injected`. The revert loop, the good rewrite and the crate are
+    // unchanged; only the source of the bad edit is.
+    match super::rewrite_m1_path_injected(&fixture.root(), 8, &force_stash_value_shared) {
         super::RewriteOutcome::Emitted {
             files,
             emitted_count,
@@ -532,7 +571,10 @@ const BREAKS_ON_REWRITE: &str = "pub struct Holder {\n    pub slot: *mut i32,\n}
 
 fn diagnose_after_rewrite(files: &[(&str, &str)]) -> (verify::Diagnosis, Fixture) {
     let fixture = Fixture::new(files);
-    let emission = emit(&fixture);
+    // INJECTED since step 2 — see `emit_injected`. The crate under diagnosis is
+    // the same one these witnesses always used; only the decision that produces
+    // it is now supplied rather than derived.
+    let emission = emit_injected(&fixture, &force_stash_value_shared);
     let temp = verify::materialize(&fixture.root(), &emission.files).expect("materialize");
     let diagnosis = verify::diagnose_crate(temp.root());
     (diagnosis, fixture)
@@ -678,7 +720,10 @@ fn the_round_cap_stops_the_loop() {
         ),
         ("bad.rs", BREAKS_ON_REWRITE),
     ]);
-    match super::rewrite_m1_path_with_cap(&fixture.root(), 0) {
+    // INJECTED since step 2 — the broken emission is supplied as data, per
+    // `emit_injected`. The cap is still 0 and the loop still cannot converge;
+    // only the source of the bad edit changed.
+    match super::rewrite_m1_path_injected(&fixture.root(), 0, &force_stash_value_shared) {
         super::RewriteOutcome::Emitted {
             escalated,
             bisect_probes,
@@ -2154,12 +2199,10 @@ fn a_local_with_no_raw_only_use_is_still_emitted() {
 fn freed_fixture(callee: &str) -> String {
     format!(
         "#![allow(dead_code, unused_unsafe, unused_mut, unused_variables)]\n\
-         extern \"C\" {{\n\
-         \x20   fn free(p: *mut core::ffi::c_void);\n\
-         \x20   fn keeper(p: *mut core::ffi::c_void);\n\
-         }}\n\
-         pub unsafe fn releases(a: *mut core::ffi::c_void, b: i32) {{\n\
-         \x20   let p: *mut core::ffi::c_void = a;\n\
+         pub unsafe fn free(q: *mut u8) {{ *q = 0; }}\n\
+         pub unsafe fn keeper(q: *mut u8) {{ *q = 0; }}\n\
+         pub unsafe fn releases(a: *mut u8, b: i32) {{\n\
+         \x20   let p: *mut u8 = a;\n\
          \x20   if b > 0 {{ {callee}(p); }}\n\
          }}\n"
     )

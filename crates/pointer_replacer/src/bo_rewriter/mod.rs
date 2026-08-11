@@ -2006,7 +2006,7 @@ fn finish_decide<'tcx>(
         &opt_accessors,
         &opt_fat,
     );
-    let ctx_of = |gate| decision::Ctx {
+    let ctx_of = |gate, coconv| decision::Ctx {
         tcx,
         model: &model,
         slots: &slots,
@@ -2016,8 +2016,8 @@ fn finish_decide<'tcx>(
         slice_uses: &slice_uses,
         opt_uses: &opt_uses,
         gate,
+        coconv,
     };
-    let table = decision::decide(&ctx_of(decision::RefGate::BlockAll), &subjects);
 
     // **S3.6-1 task 2 — the co-conversion classes.**
     //
@@ -2031,7 +2031,7 @@ fn finish_decide<'tcx>(
     // nothing here can move a decision — the S3.6-0 pattern that makes zero
     // corpus delta structural rather than lucky. Task 3 is where the verdict
     // reaches a gate.
-    let hypothetical = decision::decide(&ctx_of(decision::RefGate::LiftAdaptable), &subjects);
+    let hypothetical = decision::decide(&ctx_of(decision::RefGate::LiftAdaptable, None), &subjects);
     // Escapes are computed BEFORE the classes now: P1 makes them a gate, not a
     // report, so `build` consumes them rather than the census reading them
     // alongside.
@@ -2042,6 +2042,12 @@ fn finish_decide<'tcx>(
         &hypothetical,
         &escapes,
         decision::co_conversion::OverlapRule::BlindOnly,
+    );
+    // **Production is decided AFTER the classes**, because step 2's gate reads
+    // them. No cycle: the hypothetical above was decided with `None`.
+    let table = decision::decide(
+        &ctx_of(decision::RefGate::BlockAll, Some(&coconv)),
+        &subjects,
     );
 
     // Structural self-check: the table matches the subjects it was handed. NOT

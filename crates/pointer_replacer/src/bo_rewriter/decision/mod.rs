@@ -481,6 +481,25 @@ pub(crate) enum DegradeReason {
     /// measured market is a parameter, so the corpus could not have exercised
     /// this arm at all.
     OptLocalConstruction,
+    /// **S3.6-1 step 2 — the subject's own reference can reach a RAW context.**
+    ///
+    /// `&mut T → *mut T` is an implicit coercion at a call argument, a
+    /// `static mut` store, a field store and a return (§5a, compiler-measured,
+    /// all four exit 0). So this flow presents as **nothing at all**: it is not
+    /// ill-typed, the verify loop has nothing to absorb, and no counter moves.
+    /// The record's E3b premise said such flows are ill-typed; that was refuted,
+    /// and this reason is the decision-time gate replacing the retracted revert
+    /// prediction.
+    ///
+    /// **`via` itemizes, and the key IS the block reason's key**, so the census
+    /// and the reason field speak ONE vocabulary and a join between them needs
+    /// no translation. A ruling asked for the population itemized; a shared
+    /// `silent-coercion` bucket would have made that unrecoverable.
+    ///
+    /// **Scope, stated:** only plain-`Ref` subjects can carry it, because only
+    /// they are class nodes. A `&mut [T]` or `Option<&mut T>` reaching a raw
+    /// context is the same hazard and is **not** gated here.
+    SilentCoercion { via: co_conversion::BlockReason },
     /// A mutable optional subject with more than one use needs `as_mut()`, and
     /// `as_mut()` needs a `mut` binding this declaration does not have.
     ///
@@ -517,6 +536,8 @@ impl DegradeReason {
             DegradeReason::OptUseUnsupported => "opt-use-unsupported",
             DegradeReason::OptLocalConstruction => "opt-local-construction",
             DegradeReason::OptNeedsMutBinding => "opt-needs-mut-binding",
+            // ONE vocabulary with the census, deliberately.
+            DegradeReason::SilentCoercion { via } => via.key(),
         }
     }
 }
@@ -674,6 +695,10 @@ pub(crate) struct Ctx<'a, 'tcx> {
     /// **S3.6-1** — see [`RefGate`]. A mode rather than a fact, which is why it
     /// is `Copy` and not a borrow like everything else here.
     pub(crate) gate: RefGate,
+    /// **S3.6-1 step 2.** `None` while the classes are being BUILT — the
+    /// hypothetical pass must not consult a verdict derived from itself — and
+    /// `Some` on the production pass that consumes them.
+    pub(crate) coconv: Option<&'a co_conversion::CoConv>,
 }
 
 pub(crate) fn decide(ctx: &Ctx<'_, '_>, subjects: &[Subject]) -> DecisionTable {
@@ -703,6 +728,7 @@ fn decide_one(ctx: &Ctx<'_, '_>, subject: &Subject) -> Decision {
         slice_uses,
         opt_uses,
         gate,
+        coconv,
     } = ctx;
     let decl_site = EmitabilityFacts::site(tcx, subject.attribution_span());
 
@@ -872,6 +898,17 @@ fn decide_one(ctx: &Ctx<'_, '_>, subject: &Subject) -> Decision {
     if matches!(form, Form::Plain) {
         if subject.null_init {
             return degrade(subject, decl_site, DegradeReason::NullInit);
+        }
+        // **LAST, on the freed-slot placement rule.** Every subject reaching
+        // here passed every other test, so this arm can only convert a would-be
+        // emission and can never displace another reason.
+        //
+        // Only the subject's OWN blocking fact gates. Class collateral is not
+        // consulted: while the referenced gate still blocks, a blocked
+        // classmate is not converting either, so nothing is jointly decided
+        // yet. Collateral becomes load-bearing at the lift, not before.
+        if let Some(via) = coconv.and_then(|c| c.node_block((subject.fn_did, subject.hir_id))) {
+            return degrade(subject, decl_site, DegradeReason::SilentCoercion { via });
         }
         return Decision::Ref {
             mutable: subject.mutable,
