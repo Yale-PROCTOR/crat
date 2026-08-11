@@ -2942,3 +2942,50 @@ pub(crate) fn artifact_rows_span_swapped(
     })
     .map(|(table, _ctx)| artifact::rows(tcx, &table))
 }
+
+/// **S3.6-1 — the SEAM COLUMN** (ruling item 3, 2026-08-11): every adapter site
+/// and every refused one, with its reason.
+///
+/// A separate artifact rather than a column on `a.jsonl`, deliberately. A seam
+/// is a property of an argument POSITION, not of a subject: one subject can be
+/// served by many call sites and one site adapts many positions. Folding it into
+/// the per-subject row would need an aggregation that discards exactly the thing
+/// the ruling asks to see, and it would couple this to the reconciliation schema
+/// producer B is compared against.
+///
+/// **Per-subject accounting is unchanged**, which this artifact makes checkable:
+/// glue settles no subject, so a raw argument's own subject still reads
+/// `degraded` with its own reason in `a.jsonl` while appearing here as an
+/// adapted position.
+pub(crate) fn seam_tsv(tcx: TyCtxt<'_>) -> Result<String, String> {
+    let (table, _ctx) = decide_table_with_ctx(tcx)?;
+    let sm = tcx.sess.source_map();
+    let mut out = String::from("kind\towner_fn\tfamily_or_reason\tsite\n");
+    for edit in &table.seams.edits {
+        let family = match edit.family {
+            decision::seam::SeamFamily::Safe => "safe",
+            decision::seam::SeamFamily::Reborrow => "reborrow",
+        };
+        out.push_str(&format!(
+            "placed\t{}\t{}\t{}\n",
+            edit.owner_fn,
+            family,
+            sm.span_to_diagnostic_string(edit.span)
+        ));
+    }
+    for (caller, span, block) in &table.seams.blocked {
+        out.push_str(&format!(
+            "blocked\t{}\t{}\t{}\n",
+            tcx.def_path_str(caller.to_def_id()),
+            block.key(),
+            sm.span_to_diagnostic_string(*span)
+        ));
+    }
+    // Rule 1 (2026-08-11): a pair that fired with no census row is REPORTED.
+    // The census is a prioritization overlay and has already been shown
+    // incomplete twice; a silent adaptation would hide the third case.
+    for (found, expected) in &table.seams.uncensused {
+        out.push_str(&format!("uncensused\t-\t{found:?} -> {expected:?}\t-\n"));
+    }
+    Ok(out)
+}

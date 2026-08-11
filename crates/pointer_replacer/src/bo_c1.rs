@@ -7143,6 +7143,61 @@ mod run {
         // MEASUREMENT ONLY: the decision layer runs under `RefGate::BlockAll`,
         // so nothing in this file can move a corpus line. Task 3 is where the
         // verdict reaches a gate.
+        // **S3.6-1 SEAM COLUMN.** Written beside the other auxiliary censuses,
+        // and counted into the row so the site-gate refusal rate is a corpus
+        // number rather than something read off a file by hand.
+        let seams = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            crate::bo_rewriter::seam_tsv(tcx)
+        }));
+        match seams {
+            Ok(Ok(tsv)) => {
+                let path = dir.join(format!("{name}.seams.tsv"));
+                std::fs::write(&path, &tsv)
+                    .unwrap_or_else(|e| panic!("write seam census {}: {e}", path.display()));
+                let mut placed_safe = 0usize;
+                let mut placed_reborrow = 0usize;
+                let mut blocked: std::collections::BTreeMap<&str, usize> =
+                    std::collections::BTreeMap::new();
+                let mut uncensused = 0usize;
+                for line in tsv.lines().skip(1) {
+                    let mut f = line.split('\t');
+                    match (f.next(), f.next(), f.next()) {
+                        (Some("placed"), _, Some("safe")) => placed_safe += 1,
+                        (Some("placed"), _, Some("reborrow")) => placed_reborrow += 1,
+                        (Some("blocked"), _, Some(reason)) => {
+                            *blocked
+                                .entry(match reason {
+                                    "seam-len-unknown" => "seam_len_unknown",
+                                    "seam-shared-to-mut" => "seam_shared_to_mut",
+                                    "seam-site-overlap" => "seam_site_overlap",
+                                    _ => "seam_unnameable_operand",
+                                })
+                                .or_default() += 1;
+                        }
+                        (Some("uncensused"), ..) => uncensused += 1,
+                        _ => {}
+                    }
+                }
+                row.set("seam_safe", placed_safe);
+                row.set("seam_reborrow", placed_reborrow);
+                row.set("seam_uncensused", uncensused);
+                // EXHAUSTIVE over the reason vocabulary, so a reason that never
+                // fires still reports 0 rather than being absent. A missing key
+                // and a zero read the same way in a join, and that is how a
+                // population reports as empty when it is merely unmeasured.
+                for key in [
+                    "seam_len_unknown",
+                    "seam_shared_to_mut",
+                    "seam_site_overlap",
+                    "seam_unnameable_operand",
+                ] {
+                    row.set(key, blocked.get(key).copied().unwrap_or(0));
+                }
+            }
+            Ok(Err(why)) => row.set("seam_status", super::report::sanitize(&why)),
+            Err(_) => row.set("seam_status", "panicked"),
+        }
+
         let coconv = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             crate::bo_rewriter::coconv_tsv(tcx)
         }));
