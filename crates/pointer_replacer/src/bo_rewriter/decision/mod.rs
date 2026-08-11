@@ -456,6 +456,36 @@ pub(crate) enum DegradeReason {
     /// with a different soundness argument. Scoped out of this slice explicitly
     /// and counted, rather than attempted.
     SliceLocalConstruction,
+    /// **The subject's own use-edits NEST, so no flat splice can express them.**
+    ///
+    /// brotli's shape: `table = table.offset((*table).value as isize)`. The use
+    /// walk fires once per OCCURRENCE, so the self-advance source yields an edit
+    /// spanning the whole `offset` call and the plain deref inside its index
+    /// yields a second edit *within* that span.
+    ///
+    /// **Its own key rather than folded into `SliceUseUnsupported`**, on the
+    /// `SliceNegOrUnknownOffset` precedent: every occurrence here *is* a
+    /// supported shape — each would rewrite correctly in isolation. What blocks
+    /// the subject is that two correct rewrites overlap, which is a property of
+    /// the pair, not of either use. Two different owed items must not read as
+    /// one.
+    ///
+    /// **Degraded rather than resolved by picking a winner, because neither
+    /// choice is correct.** `index_text` renders the index with
+    /// `span_to_snippet`, so the outer replacement embeds the inner use's
+    /// ORIGINAL text — `(*table)`, which has no meaning on a `&[T]`. Dropping
+    /// the inner edit emits that stale text; dropping the outer leaves the
+    /// `offset` call. The rewrite is simply not expressible as byte splices, and
+    /// the honest response is to decline the subject.
+    ///
+    /// Resolving it properly means rendering the index from REWRITTEN text
+    /// rather than source — registered as a yield follow-up, not attempted here.
+    ///
+    /// **Fires LAST in its arm**, on the freed-slot placement rule: every
+    /// subject reaching it has passed every other gate, so its count is exactly
+    /// the population this defect costs and it can never displace another
+    /// reason.
+    NestedUseEdits,
     /// **S3.2′-3 — positive evidence of nullness, so no plain form may emit.**
     ///
     /// The binding is initialized from a null literal. `Option` would serve it,
@@ -544,6 +574,7 @@ impl DegradeReason {
             DegradeReason::NoDeclaredType => "no-declared-type",
             DegradeReason::FreedSlot => "freed-slot",
             DegradeReason::SliceUseUnsupported => "slice-use-unsupported",
+            DegradeReason::NestedUseEdits => "nested-use-edits",
             DegradeReason::SliceNegOrUnknownOffset => "slice-neg-or-unknown-offset",
             DegradeReason::SliceLocalConstruction => "slice-local-construction",
             DegradeReason::NullInit => "null-init",
@@ -1000,6 +1031,18 @@ fn decide_one(ctx: &Ctx<'_, '_>, subject: &Subject) -> Decision {
         if slice && sign.may_be_negative(subject.fn_did, subject.local) {
             return degrade(subject, decl_site, DegradeReason::SliceNegOrUnknownOffset);
         }
+        // The same nesting gate as the plain-slice twin, and NOT gated on
+        // `slice`: an optional subject rewrites *every* use, so nesting is if
+        // anything more available here than on the slice arm. Reason key shared
+        // with that twin — the defect and the owed repair are one thing, and the
+        // subject's own outcome keeps the two arms attributable in the join.
+        if let Some(span) = emitability::nested_rewrite(&uses.rewrites) {
+            return degrade(
+                subject,
+                EmitabilityFacts::site(tcx, span),
+                DegradeReason::NestedUseEdits,
+            );
+        }
         return Decision::Opt {
             mutable: subject.mutable,
             slice,
@@ -1044,6 +1087,17 @@ fn decide_one(ctx: &Ctx<'_, '_>, subject: &Subject) -> Decision {
     // emitted on absent evidence.
     if sign.may_be_negative(subject.fn_did, subject.local) {
         return degrade(subject, decl_site, DegradeReason::SliceNegOrUnknownOffset);
+    }
+    // LAST, after every other gate: this one is about the edits themselves, so
+    // it can only refuse a subject that was otherwise about to emit — which is
+    // what makes its count exactly the cost of the defect rather than a number
+    // sharing a population with some earlier reason.
+    if let Some(span) = emitability::nested_rewrite(&uses.rewrites) {
+        return degrade(
+            subject,
+            EmitabilityFacts::site(tcx, span),
+            DegradeReason::NestedUseEdits,
+        );
     }
     Decision::Slice {
         mutable: subject.mutable,

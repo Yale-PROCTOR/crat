@@ -7569,6 +7569,13 @@ mod run {
                 // pin would have inherited it.
                 row.set("unplaceable", unplaceable.len());
                 row.set("escalated", "failed");
+                // FULL reason on its own line, BEFORE the row's copy. The row
+                // field goes through `sanitize`, which truncates to 120 bytes —
+                // fine for a status token, useless for a 17-edit rollback list,
+                // where the truncation cut after the FIRST collision. A gate
+                // failure is data, and data that is 120 bytes of a 2 KB fact is
+                // an instrument reporting a population it cannot show.
+                println!("M1EMIT-GATEFAIL {reason}");
                 row.set("detail", super::report::sanitize(reason));
                 row.set("status", "gate-fail");
             }

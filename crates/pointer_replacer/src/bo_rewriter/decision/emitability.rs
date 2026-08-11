@@ -536,6 +536,27 @@ pub(crate) struct UseEdit {
     pub replacement: String,
 }
 
+/// The first use-edit that another one CONTAINS, if any.
+///
+/// Two rewrites of the same subject can nest when one occurrence sits inside
+/// another's span — `table = table.offset((*table).value as isize)` yields an
+/// edit for the whole `offset` call and a second for the `(*table)` inside its
+/// index. `apply` rejects overlapping edits by design, and it is right to: the
+/// outer replacement is rendered from the ORIGINAL snippet, so it already
+/// embeds the inner use's pre-rewrite text.
+///
+/// Equal spans count as containment, so a subject that somehow produced two
+/// edits for one occurrence is caught here too rather than reaching `apply`.
+pub(crate) fn nested_rewrite(rewrites: &[UseEdit]) -> Option<Span> {
+    rewrites.iter().enumerate().find_map(|(i, outer)| {
+        rewrites
+            .iter()
+            .enumerate()
+            .find(|(j, inner)| *j != i && outer.span.contains(inner.span))
+            .map(|(_, inner)| inner.span)
+    })
+}
+
 /// What a subject's uses permit.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct SliceUses {

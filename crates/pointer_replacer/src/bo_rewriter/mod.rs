@@ -367,14 +367,23 @@ fn rewrite_core_injected(
         let (emission_plan, emission_texts) = (emission.plan.clone(), emission.texts.clone());
         // Structural gate: rollbacks must be zero.
         if !emission.rollbacks.is_empty() {
+            // IDENTITY, not just a reason. The previous message mapped to
+            // `r.reason` alone, so a 17-edit rollback rendered as seventeen
+            // copies of one string with no way to tell WHICH edits collided —
+            // the plan defect it reports was undiagnosable from the row that
+            // reported it. Each rollback now names its owner and byte range.
             return Err(format!(
-                "apply rolled back {} edit(s): {:?}",
+                "apply rolled back {} edit(s): [{}]",
                 emission.rollbacks.len(),
                 emission
                     .rollbacks
                     .iter()
-                    .map(|r| r.reason)
+                    .map(|r| format!(
+                        "{} @{}..{} owner={} just={:?}",
+                        r.reason, r.edit.lo, r.edit.hi, r.edit.owner_fn, r.edit.justification
+                    ))
                     .collect::<Vec<_>>()
+                    .join(" | ")
             ));
         }
         let degradations: Vec<decision::Degradation> = table.degradations().cloned().collect();

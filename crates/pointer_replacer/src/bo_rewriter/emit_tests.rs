@@ -2433,6 +2433,81 @@ fn an_arithmetic_parameter_emits_a_slice_form() {
     );
 }
 
+/// **A subject whose use-edits NEST must not produce overlapping edits.**
+///
+/// brotli's `DecodeSymbol` shape, and the reason brotli contributed **zero**
+/// emit-frame rows to the S3.6-1 step-3 sweep: a self-advance whose index
+/// expression contains a plain dereference of the same binding —
+/// `table = table.offset((*table).value as isize)`.
+///
+/// The path visitor fires once per OCCURRENCE, so two edits are produced and
+/// the outer contains the inner:
+///
+/// - outer, the self-advance source: span `table.offset(…)` → `&mut table[…..]`
+/// - inner, the plain deref: span `(*table)` → `table[0]`
+///
+/// `apply` rejects the pair — "a plan that wants two rewrites of one range has
+/// not decided" — and is right to.
+///
+/// **The overlap is only the visible half.** `index_text` renders the index
+/// with `span_to_snippet`, so the outer replacement embeds `(*table)`
+/// **verbatim** — text with no meaning on a `&[T]`. Dropping either edit
+/// therefore yields an ill-typed crate rather than a smaller win, which is why
+/// the repair degrades the subject instead of picking a winner: the flat-splice
+/// model cannot express this rewrite at all.
+///
+/// *Mutation-tested (Rider 0, deletion first):* remove the nesting gate and
+/// this fails with a rollback reading "edit overlaps an earlier edit".
+#[test]
+fn a_subject_whose_uses_nest_produces_no_overlapping_edits() {
+    let src = "#![allow(dead_code, unused_unsafe, unused_mut, unused_variables)]\n\
+               pub struct HuffmanCode { pub value: u32 }\n\
+               pub unsafe fn decode(mut table: *mut HuffmanCode) -> u32 {\n\
+               \x20   table = table.offset((*table).value as isize);\n\
+               \x20   (*table).value\n\
+               }\n";
+    let fixture = Fixture::new(&[("lib.rs", src)]);
+    let emission = emit(&fixture);
+    assert!(
+        emission.rollbacks.is_empty(),
+        "nested use-edits reached `apply` and were rolled back; the nesting \
+         must be refused at DECISION time, where the subject can degrade with \
+         an attributed reason: {:?}",
+        emission.rollbacks
+    );
+    // Not merely "no rollback" — the subject must degrade UNDER ITS OWN REASON.
+    // An implementation that silently dropped one of the two edits would satisfy
+    // the assertion above while emitting the stale `(*table)` text, which is the
+    // failure this gate exists to prevent.
+    assert_eq!(
+        reason_of(&decisions_of(src), "table", true),
+        "nested-use-edits",
+        "the nesting must be attributed, not absorbed into another reason"
+    );
+}
+
+/// **The nesting gate must not fire on a subject whose uses merely SIT SIDE BY
+/// SIDE** — the control for the witness above.
+///
+/// Without it, a gate that refused every multi-use slice subject would pass the
+/// nesting test while destroying the whole slice population, and the corpus
+/// would report it as a yield loss rather than as a bug.
+#[test]
+fn disjoint_uses_of_one_subject_still_emit_a_slice() {
+    let src = "#![allow(dead_code, unused_unsafe, unused_mut, unused_variables)]\n\
+               pub unsafe fn f(p: *mut i32, n: usize) {\n\
+               \x20   let mut i: usize = 0;\n\
+               \x20   while i < n { *p.offset(i as isize) = 1; i += 1; }\n\
+               \x20   *p.offset(0) = 2;\n\
+               }\n";
+    assert_eq!(
+        reason_of(&decisions_of(src), "p", true),
+        "<emitted>",
+        "two DISJOINT arithmetic uses must still emit; the gate keys on \
+         containment, not on multiplicity"
+    );
+}
+
 /// **The index rendering must survive a NON-`usize` counter — the shape the
 /// corpus actually has.**
 ///
