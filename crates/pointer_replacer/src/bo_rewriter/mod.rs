@@ -2981,6 +2981,13 @@ pub(crate) fn seam_tsv(tcx: TyCtxt<'_>) -> Result<String, String> {
             sm.span_to_diagnostic_string(*span)
         ));
     }
+    // Item 4a: companion-length coverage, one row per LENGTH-GATED POSITION.
+    for (callee, index, evidence) in &table.seams.length_evidence {
+        out.push_str(&format!(
+            "lengated\t{callee}\t{}\t#{index}\n",
+            evidence.key()
+        ));
+    }
     // Rule 1 (2026-08-11): a pair that fired with no census row is REPORTED.
     // The census is a prioritization overlay and has already been shown
     // incomplete twice; a silent adaptation would hide the third case.

@@ -81,6 +81,43 @@ impl SeamBlock {
     }
 }
 
+/// What the callee's own signature says about a companion length.
+///
+/// Measured on the SIGNATURE rather than the call site, because the C idiom
+/// this is looking for — `void f(int *buf, size_t len)` — is a property of the
+/// declaration: every caller of such a function supplies the length in the same
+/// position, so the signature answers for all of them at once.
+///
+/// **Adjacency is evidence, not proof.** `f(dst, src, n)` has an integer in the
+/// position after `src` that is the length of BOTH pointers, and `f(p, flags)`
+/// has one that is a length of nothing. This enum records what was seen; it
+/// does not certify a length, and no seam is placed from it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum LenEvidence {
+    /// An integer-typed parameter immediately AFTER the pointer — the dominant
+    /// C spelling.
+    Following,
+    /// An integer-typed parameter immediately BEFORE it.
+    Preceding,
+    /// An integer parameter exists somewhere in the signature, but not adjacent.
+    Elsewhere,
+    /// The signature carries no integer parameter at all. **A length cannot come
+    /// from the call site**, so such a position can only ever be served by
+    /// certified `approx-len` (U-2') or stay gated.
+    None,
+}
+
+impl LenEvidence {
+    pub(crate) fn key(self) -> &'static str {
+        match self {
+            LenEvidence::Following => "len-following",
+            LenEvidence::Preceding => "len-preceding",
+            LenEvidence::Elsewhere => "len-elsewhere",
+            LenEvidence::None => "len-absent",
+        }
+    }
+}
+
 /// Which family a placed adapter came from. Reported in the artifacts' seam
 /// column so the reborrow population — the one carrying the aliasing exposure —
 /// stays countable on its own.
@@ -553,6 +590,14 @@ pub(crate) struct SeamPlan {
     pub edits: Vec<SeamEdit>,
     /// `(caller, argument span, reason)`.
     pub blocked: Vec<(LocalDefId, Span, SeamBlock)>,
+    /// **Ruling item 4a — companion-length coverage**, one row per
+    /// length-gated position: `(callee path, pointer param index, evidence)`.
+    ///
+    /// MEASUREMENT ONLY. Nothing branches on it and no seam is placed from it:
+    /// the ruling sequences the instrument ahead of the decision, so this
+    /// answers *whether a length exists* without yet claiming which expression
+    /// it is.
+    pub length_evidence: Vec<(String, usize, LenEvidence)>,
     /// Pairs that fired with **no row in the measured census** — rule 1
     /// (2026-08-11): coverage derives from the type-level matrix, and the census
     /// is a prioritization overlay. A pair appearing here is not an error; it is
@@ -640,6 +685,9 @@ pub(crate) fn synthesize(
             // shape and it reconstructed an alignment this list does not have.
             struct Pos {
                 span: Span,
+                /// The CALLEE's parameter index — item 4a asks about the
+                /// signature, so the position must carry which parameter it is.
+                index: usize,
                 expected: Form,
                 found: Form,
                 text: Option<String>,
@@ -705,6 +753,7 @@ pub(crate) fn synthesize(
                 };
                 positions.push(Pos {
                     span: arg.span,
+                    index: arg.index,
                     expected,
                     found,
                     text,
@@ -774,10 +823,49 @@ pub(crate) fn synthesize(
                             family,
                         });
                     }
-                    Err(block) => plan.blocked.push((site.caller, pos.span, block)),
+                    Err(block) => {
+                        // Item 4a: price the length question where it is asked,
+                        // so the coverage number is per BLOCKED POSITION rather
+                        // than per signature — one signature serves many calls.
+                        if block == SeamBlock::LengthUnknown {
+                            plan.length_evidence.push((
+                                tcx.def_path_str(callee.to_def_id()),
+                                pos.index,
+                                length_evidence(tcx, *callee, pos.index),
+                            ));
+                        }
+                        plan.blocked.push((site.caller, pos.span, block));
+                    }
                 }
             }
         }
     }
     plan
+}
+
+/// **Ruling item 4a — is there a companion length in the callee's signature?**
+///
+/// Reads the RESOLVED signature, on the `ptr_params` precedent: a C2Rust alias
+/// lowers to a path, so a syntactic test would miss exactly the parameters this
+/// corpus is made of.
+pub(crate) fn length_evidence(tcx: TyCtxt<'_>, callee: LocalDefId, index: usize) -> LenEvidence {
+    let sig = tcx.fn_sig(callee).skip_binder().skip_binder();
+    let inputs = sig.inputs();
+    let is_int = |i: usize| {
+        inputs.get(i).is_some_and(|ty| {
+            matches!(
+                ty.kind(),
+                rustc_middle::ty::TyKind::Int(_) | rustc_middle::ty::TyKind::Uint(_)
+            )
+        })
+    };
+    if index + 1 < inputs.len() && is_int(index + 1) {
+        LenEvidence::Following
+    } else if index > 0 && is_int(index - 1) {
+        LenEvidence::Preceding
+    } else if (0..inputs.len()).any(is_int) {
+        LenEvidence::Elsewhere
+    } else {
+        LenEvidence::None
+    }
 }
