@@ -1,12 +1,15 @@
-use std::collections::{BTreeSet, VecDeque};
+use std::{
+    cell::Cell,
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque},
+};
 
 use pointer_replacer::{
     InitialPointerDecisions, PointerDecisionOptions, PtrKind, initial_pointer_decisions,
 };
 use rustc_ast::{
-    AttrKind, BindingMode, ByRef, Crate, Expr, ExprKind, Extern, FnRetTy, Item, ItemKind,
-    LocalKind, Mutability, NodeId, Pat, PatKind, Safety, Stmt, StmtKind, Ty, TyKind, mut_visit,
-    mut_visit::MutVisitor, ptr::P, visit, visit::Visitor as _,
+    AttrKind, BindingMode, ByRef, Crate, Expr, ExprKind, Extern, FnRetTy, GenericParamKind, Item,
+    ItemKind, LocalKind, Mutability, NodeId, Pat, PatKind, Safety, Stmt, StmtKind, Ty, TyKind,
+    mut_visit, mut_visit::MutVisitor, ptr::P, visit, visit::Visitor as _,
 };
 use rustc_ast_pretty::pprust;
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -27,6 +30,16 @@ use rustc_span::{
 use serde::{Deserialize, Serialize};
 use smallvec::{SmallVec, smallvec};
 
+use crate::{
+    AdtIdentity, AdtKind, BinaryOperator, BindingMutability, BorrowKind, ByRefKind, Expression,
+    FieldIdentity, Literal, LoadedRuleSet, Pattern, PointerVariableMetadata, PointerVariableOrigin,
+    RangeLimits, RawMutability, RefMutability, RuleDocument, RuleMatchInput, SkeletonView,
+    Statement, StatementPairMetadata, TypeTree, UnaryOperator, ValueIdentity, VariantIdentity,
+    observation::{select_rule_regions, semantic_type_tree},
+    preservation::{make_disposition_forest, validate_cross_view_topology},
+    validator::validate_rule_application_shape,
+};
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ItemKindName {
     Fn,
@@ -45,39 +58,13 @@ pub struct FunctionRecord {
     pub kind: ItemKindName,
     pub name: String,
     pub annotated_source: String,
-    pub annotated_skeleton: String,
+    pub baseline: SkeletonView,
+    pub applied: SkeletonView,
     pub source_signature: String,
     pub target_signature: String,
-    pub needs_transformation: bool,
-    pub statements_requiring_transformation: Vec<u32>,
-    pub statement_pair_metadata: Vec<StatementPairMetadata>,
     pub foreign_function_names: Vec<String>,
     pub signature_dependencies: Vec<u64>,
     pub dependencies: Vec<u64>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct StatementPairMetadata {
-    pub label: u32,
-    pub before_statement: String,
-    pub pointer_variables_complete: bool,
-    pub pointer_variables: Vec<PointerVariableMetadata>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PointerVariableMetadata {
-    pub name: String,
-    pub origin: PointerVariableOrigin,
-    pub before_type: String,
-    pub selected_target_type: String,
-    pub before_type_is_inferred: bool,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum PointerVariableOrigin {
-    Parameter { index: u32 },
-    Local { declaration_label: u32 },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -102,7 +89,7 @@ pub struct TypeRecord {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum ItemRecord {
-    Function(FunctionRecord),
+    Function(Box<FunctionRecord>),
     Value(ValueRecord),
     Type(TypeRecord),
 }
@@ -149,6 +136,7 @@ pub enum GenerationErrorKind {
     NestedControlPayload,
     AstHirMismatch,
     TypeSpelling,
+    UnsupportedGeneric,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -174,8 +162,17 @@ struct PreservationDecisionOverrides {
 }
 
 pub fn make_skeletons(source: &str, tcx: TyCtxt<'_>) -> Result<Vec<ItemRecord>, GenerationError> {
+    make_skeletons_with_rules(source, None, tcx)
+}
+
+pub fn make_skeletons_with_rules(
+    source: &str,
+    rules: Option<&RuleDocument>,
+    tcx: TyCtxt<'_>,
+) -> Result<Vec<ItemRecord>, GenerationError> {
     make_skeletons_with_preservation_overrides(
         source,
+        rules,
         tcx,
         &PreservationDecisionOverrides::default(),
     )
@@ -183,10 +180,12 @@ pub fn make_skeletons(source: &str, tcx: TyCtxt<'_>) -> Result<Vec<ItemRecord>, 
 
 fn make_skeletons_with_preservation_overrides(
     source: &str,
+    rules: Option<&RuleDocument>,
     tcx: TyCtxt<'_>,
     preservation_overrides: &PreservationDecisionOverrides,
 ) -> Result<Vec<ItemRecord>, GenerationError> {
     let mut surface = utils::ast::parse_crate(source.to_owned());
+    reject_unsupported_function_generics(&surface.items, &mut vec![])?;
     let mut mapper = utils::ir::AstToHirMapper::new(tcx);
     if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         mapper.map_crate_to_mod(&mut surface, tcx.hir_root_module(), false);
@@ -229,10 +228,59 @@ fn make_skeletons_with_preservation_overrides(
                 &item_ids,
                 &decisions,
                 preservation_overrides,
+                rules,
                 tcx,
             )
         })
         .collect()
+}
+
+fn reject_unsupported_function_generics(
+    items: &[P<Item>],
+    path: &mut Vec<String>,
+) -> Result<(), GenerationError> {
+    for item in items {
+        if let ItemKind::Mod(_, ident, rustc_ast::ModKind::Loaded(children, ..)) = &item.kind {
+            path.push(ident.to_string());
+            reject_unsupported_function_generics(children, path)?;
+            path.pop();
+            continue;
+        }
+        let ItemKind::Fn(box function) = &item.kind else {
+            continue;
+        };
+        let name = item.kind.ident().unwrap().to_string();
+        if name == "main" {
+            continue;
+        }
+        let Some(parameter) = function
+            .generics
+            .params
+            .iter()
+            .find(|parameter| !matches!(parameter.kind, GenericParamKind::Lifetime))
+        else {
+            continue;
+        };
+        let function_path = path
+            .iter()
+            .cloned()
+            .chain(std::iter::once(name))
+            .collect::<Vec<_>>()
+            .join("::");
+        let kind = match parameter.kind {
+            GenericParamKind::Type { .. } => "type",
+            GenericParamKind::Const { .. } => "const",
+            GenericParamKind::Lifetime => unreachable!(),
+        };
+        return Err(GenerationError {
+            kind: GenerationErrorKind::UnsupportedGeneric,
+            function_path: function_path.clone(),
+            message: format!(
+                "source-defined transformable function `{function_path}` declares an unsupported {kind} generic parameter"
+            ),
+        });
+    }
+    Ok(())
 }
 
 pub fn skeletons_to_json(records: &[ItemRecord]) -> Result<String, serde_json::Error> {
@@ -321,6 +369,7 @@ fn make_record(
     item_ids: &FxHashMap<rustc_span::def_id::DefId, u64>,
     decisions: &InitialPointerDecisions,
     preservation_overrides: &PreservationDecisionOverrides,
+    rules: Option<&RuleDocument>,
     tcx: TyCtxt<'_>,
 ) -> Result<ItemRecord, GenerationError> {
     let hitem = tcx.hir_node_by_def_id(surface.def_id).expect_item();
@@ -332,6 +381,7 @@ fn make_record(
             item_ids,
             decisions,
             preservation_overrides,
+            rules,
             tcx,
         ),
         ItemKindName::Static | ItemKindName::Const => {
@@ -368,6 +418,7 @@ fn make_function_record<'tcx>(
     item_ids: &FxHashMap<rustc_span::def_id::DefId, u64>,
     decisions: &InitialPointerDecisions,
     preservation_overrides: &PreservationDecisionOverrides,
+    rules: Option<&RuleDocument>,
     tcx: TyCtxt<'tcx>,
 ) -> Result<ItemRecord, GenerationError> {
     let hitem = tcx.hir_node_by_def_id(surface.def_id).expect_item();
@@ -388,59 +439,157 @@ fn make_function_record<'tcx>(
         preservation_overrides,
         tcx,
     );
-    let mut skeleton = source.clone();
+    let mut target = source.clone();
     let type_speller = TypeSpeller::new(surface.def_id, ast_to_hir, tcx);
     apply_target_signature(
-        &mut skeleton,
+        &mut target,
         surface.def_id,
         decisions,
         &type_speller,
         &surface.path,
         tcx,
     )?;
+    let mut applied_target = target.clone();
+    let rule_applied_statements = match rules {
+        Some(rules) => apply_rule_set(
+            &source,
+            &mut applied_target,
+            &statements_requiring_transformation,
+            rules,
+            surface.def_id,
+            decisions,
+            ast_to_hir,
+            &type_speller,
+            tcx,
+        )?,
+        None => BTreeSet::new(),
+    };
+    let applied_transformations = statements_requiring_transformation
+        .difference(&rule_applied_statements)
+        .copied()
+        .collect::<BTreeSet<_>>();
+    let mut baseline_skeleton = target.clone();
+    let no_rule_applications = BTreeSet::new();
     let mut skeletonizer = Skeletonizer {
         ast_to_hir,
         decisions,
         statements_requiring_transformation: &statements_requiring_transformation,
+        rule_applied_statements: &no_rule_applications,
         type_speller: &type_speller,
         function_path: &surface.path,
         error: None,
         tcx,
     };
-    skeletonizer.visit_item(&mut skeleton);
+    skeletonizer.visit_item(&mut baseline_skeleton);
     if let Some(error) = skeletonizer.error {
         return Err(error);
     }
+    let mut applied_skeleton = applied_target;
+    let mut applied_skeletonizer = Skeletonizer {
+        ast_to_hir,
+        decisions,
+        statements_requiring_transformation: &applied_transformations,
+        rule_applied_statements: &rule_applied_statements,
+        type_speller: &type_speller,
+        function_path: &surface.path,
+        error: None,
+        tcx,
+    };
+    applied_skeletonizer.visit_item(&mut applied_skeleton);
+    if let Some(error) = applied_skeletonizer.error {
+        return Err(error);
+    }
+    if let Some(label) = statements_requiring_transformation.iter().find(|label| {
+        !applied_transformations.contains(label) && !rule_applied_statements.contains(label)
+    }) {
+        return Err(GenerationError {
+            kind: GenerationErrorKind::AstHirMismatch,
+            function_path: surface.path.clone(),
+            message: format!(
+                "baseline transform label {label} became preserved in the applied view"
+            ),
+        });
+    }
+    validate_cross_view_topology(&baseline_skeleton, &applied_skeleton).map_err(|error| {
+        GenerationError {
+            kind: GenerationErrorKind::AstHirMismatch,
+            function_path: surface.path.clone(),
+            message: error.message,
+        }
+    })?;
     let source_signature = render_signature(&source);
-    let target_signature = render_signature(&skeleton);
-    let statement_pair_metadata = collect_statement_pair_metadata(
+    let target_signature = render_signature(&baseline_skeleton);
+    let baseline_statement_pair_metadata = collect_statement_pair_metadata(
         &source,
-        &skeleton,
+        &baseline_skeleton,
         &statements_requiring_transformation,
         ast_to_hir,
         &type_speller,
         &surface.path,
         tcx,
     )?;
+    let applied_statement_pair_metadata = collect_statement_pair_metadata(
+        &source,
+        &applied_skeleton,
+        &applied_transformations,
+        ast_to_hir,
+        &type_speller,
+        &surface.path,
+        tcx,
+    )?;
+    let transformed = statements_requiring_transformation
+        .iter()
+        .copied()
+        .collect::<std::collections::HashSet<_>>();
+    let dispositions = make_disposition_forest(&baseline_skeleton, &transformed, &HashSet::new())
+        .map_err(|error| GenerationError {
+        kind: GenerationErrorKind::AstHirMismatch,
+        function_path: surface.path.clone(),
+        message: error.message,
+    })?;
+    let baseline = SkeletonView {
+        skeleton: render_annotated_item(&baseline_skeleton),
+        needs_transformation: !transformed.is_empty(),
+        statement_dispositions: dispositions,
+        statement_pair_metadata: baseline_statement_pair_metadata,
+    };
+    let applied_transformed = applied_transformations
+        .iter()
+        .copied()
+        .collect::<HashSet<_>>();
+    let applied_rules = rule_applied_statements
+        .iter()
+        .copied()
+        .collect::<HashSet<_>>();
+    let applied_dispositions =
+        make_disposition_forest(&applied_skeleton, &applied_transformed, &applied_rules).map_err(
+            |error| GenerationError {
+                kind: GenerationErrorKind::AstHirMismatch,
+                function_path: surface.path.clone(),
+                message: error.message,
+            },
+        )?;
+    let applied = SkeletonView {
+        skeleton: render_annotated_item(&applied_skeleton),
+        needs_transformation: !applied_transformations.is_empty(),
+        statement_dispositions: applied_dispositions,
+        statement_pair_metadata: applied_statement_pair_metadata,
+    };
     let name = surface.item.kind.ident().unwrap().to_string();
-    Ok(ItemRecord::Function(FunctionRecord {
+    Ok(ItemRecord::Function(Box::new(FunctionRecord {
         id: surface.id,
         path: surface.path,
         kind: ItemKindName::Fn,
         name,
         annotated_source: render_annotated_item(&source),
-        annotated_skeleton: render_annotated_item(&skeleton),
+        baseline: baseline.clone(),
+        applied,
         source_signature,
         target_signature,
-        needs_transformation: !statements_requiring_transformation.is_empty(),
-        statements_requiring_transformation: statements_requiring_transformation
-            .into_iter()
-            .collect(),
-        statement_pair_metadata,
         foreign_function_names,
         signature_dependencies,
         dependencies,
-    }))
+    })))
 }
 
 fn collect_statement_pair_metadata<'tcx>(
@@ -1199,6 +1348,7 @@ fn constructor_requirements(kind: PtrKind) -> ConstructorRequirements {
 struct ScopeCandidate {
     ident: Ident,
     def_id: DefId,
+    namespace: Namespace,
     own_definition: bool,
 }
 
@@ -1223,15 +1373,16 @@ impl<'a, 'tcx> TypeSpeller<'a, 'tcx> {
         let mut candidates = tcx
             .module_children_local(containing_module)
             .iter()
-            .filter(|child| child.res.ns() == Some(Namespace::TypeNS))
             .filter_map(|child| {
                 let def_id = child.res.opt_def_id()?;
+                let namespace = child.res.ns()?;
                 let own_definition = def_id.as_local().is_some_and(|local| {
                     LocalDefId::from(tcx.parent_module_from_def_id(local)) == containing_module
                 }) && child.reexport_chain.is_empty();
                 Some(ScopeCandidate {
                     ident: child.ident,
                     def_id,
+                    namespace,
                     own_definition,
                 })
             })
@@ -1332,14 +1483,18 @@ impl<'a, 'tcx> TypeSpeller<'a, 'tcx> {
         }
     }
 
-    fn preferred_one_segment(&self, def_id: DefId) -> Option<Ident> {
+    fn preferred_one_segment(&self, def_id: DefId, namespace: Namespace) -> Option<Ident> {
         self.candidates
             .iter()
-            .find(|candidate| candidate.def_id == def_id && candidate.own_definition)
+            .find(|candidate| {
+                candidate.def_id == def_id
+                    && candidate.namespace == namespace
+                    && candidate.own_definition
+            })
             .or_else(|| {
-                self.candidates
-                    .iter()
-                    .find(|candidate| candidate.def_id == def_id)
+                self.candidates.iter().find(|candidate| {
+                    candidate.def_id == def_id && candidate.namespace == namespace
+                })
             })
             .map(|candidate| candidate.ident)
     }
@@ -1369,13 +1524,13 @@ impl<'a, 'tcx> TypeSpeller<'a, 'tcx> {
     }
 
     fn nominal_path(&self, def_id: DefId) -> Result<String, String> {
-        if let Some(ident) = self.preferred_one_segment(def_id) {
+        if let Some(ident) = self.preferred_one_segment(def_id, Namespace::TypeNS) {
             return Ok(ident.to_string());
         }
         let candidates = if def_id.is_local() {
-            self.local_visible_paths(def_id)
+            self.local_visible_paths_in_namespace(def_id, Namespace::TypeNS)
         } else {
-            self.external_visible_paths(def_id)
+            self.external_visible_paths_in_namespace(def_id, Namespace::TypeNS)
         };
         candidates.into_iter().next().ok_or_else(|| {
             format!(
@@ -1385,7 +1540,52 @@ impl<'a, 'tcx> TypeSpeller<'a, 'tcx> {
         })
     }
 
-    fn local_visible_paths(&self, target: DefId) -> Vec<String> {
+    fn value_path(&self, def_id: DefId) -> Result<String, String> {
+        if let Some(ident) = self.preferred_one_segment(def_id, Namespace::ValueNS) {
+            return Ok(ident.to_string());
+        }
+        let candidates = if def_id.is_local() {
+            self.local_visible_paths_in_namespace(def_id, Namespace::ValueNS)
+        } else {
+            self.external_visible_paths_in_namespace(def_id, Namespace::ValueNS)
+        };
+        candidates.into_iter().next().ok_or_else(|| {
+            format!(
+                "no accessible source value path names `{}` from the containing module",
+                self.tcx.def_path_str(def_id)
+            )
+        })
+    }
+
+    fn resolve_external_identity(
+        &self,
+        crate_name: &str,
+        path: &[String],
+        namespace: Namespace,
+    ) -> Option<DefId> {
+        let crate_num = self
+            .tcx
+            .crates(())
+            .iter()
+            .copied()
+            .find(|crate_num| self.tcx.crate_name(*crate_num).as_str() == crate_name)?;
+        let mut module = crate_num.as_def_id();
+        for (index, segment) in path.iter().enumerate() {
+            let terminal = index + 1 == path.len();
+            let child = self.tcx.module_children(module).iter().find(|child| {
+                child.ident.name.as_str() == segment
+                    && if terminal {
+                        child.res.ns() == Some(namespace)
+                    } else {
+                        matches!(child.res, Res::Def(DefKind::Mod, _))
+                    }
+            })?;
+            module = child.res.opt_def_id()?;
+        }
+        Some(module)
+    }
+
+    fn local_visible_paths_in_namespace(&self, target: DefId, namespace: Namespace) -> Vec<String> {
         let mut paths = vec![];
         let mut queue = VecDeque::from([(CRATE_DEF_ID.to_def_id(), Vec::<String>::new())]);
         let mut best_modules = FxHashMap::<DefId, (usize, String)>::default();
@@ -1411,7 +1611,7 @@ impl<'a, 'tcx> TypeSpeller<'a, 'tcx> {
                 };
                 let mut child_path = prefix.clone();
                 child_path.push(child.ident.to_string());
-                if def_id == target && child.res.ns() == Some(Namespace::TypeNS) {
+                if def_id == target && child.res.ns() == Some(namespace) {
                     paths.push(format!("crate::{}", child_path.join("::")));
                 }
                 if matches!(child.res, Res::Def(DefKind::Mod, _)) && def_id.is_local() {
@@ -1428,7 +1628,16 @@ impl<'a, 'tcx> TypeSpeller<'a, 'tcx> {
         paths
     }
 
+    #[cfg(test)]
     fn external_visible_paths(&self, target: DefId) -> Vec<String> {
+        self.external_visible_paths_in_namespace(target, Namespace::TypeNS)
+    }
+
+    fn external_visible_paths_in_namespace(
+        &self,
+        target: DefId,
+        namespace: Namespace,
+    ) -> Vec<String> {
         let mut paths = vec![];
         for (root_name, root_def_id) in &self.external_roots {
             if root_def_id.krate != target.krate {
@@ -1448,7 +1657,7 @@ impl<'a, 'tcx> TypeSpeller<'a, 'tcx> {
                     };
                     let mut child_path = prefix.clone();
                     child_path.push(child.ident.to_string());
-                    if def_id == target && child.res.ns() == Some(Namespace::TypeNS) {
+                    if def_id == target && child.res.ns() == Some(namespace) {
                         paths.push(format!("::{root_name}::{}", child_path.join("::")));
                     }
                     if matches!(child.res, Res::Def(DefKind::Mod, _)) {
@@ -1509,11 +1718,9 @@ impl<'a, 'tcx> TypeSpeller<'a, 'tcx> {
         display: &str,
         kind: PtrKind,
     ) -> Result<(), String> {
-        if let Some(candidate) = self
-            .candidates
-            .iter()
-            .find(|candidate| candidate.ident.name == symbol)
-        {
+        if let Some(candidate) = self.candidates.iter().find(|candidate| {
+            candidate.namespace == Namespace::TypeNS && candidate.ident.name == symbol
+        }) {
             if self.tcx.is_lang_item(candidate.def_id, lang_item) {
                 return Ok(());
             }
@@ -1576,7 +1783,9 @@ impl MutVisitor for SourceTypeShortener<'_, '_, '_> {
             && let Some(res) = self.speller.ast_to_hir.path_span_to_res.get(&path.span)
             && let Some(def_id) = res.opt_def_id()
             && path.segments.len() != 1
-            && let Some(ident) = self.speller.preferred_one_segment(def_id)
+            && let Some(ident) = self
+                .speller
+                .preferred_one_segment(def_id, Namespace::TypeNS)
         {
             let args = path
                 .segments
@@ -1597,12 +1806,14 @@ impl MutVisitor for SemanticIdentRestorer<'_, '_, '_> {
     fn visit_ty(&mut self, ty: &mut Ty) {
         if let TyKind::Path(None, path) = &mut ty.kind
             && let [segment] = &path.segments[..]
-            && let Some(candidate) = self
+            && let Some(candidate) = self.speller.candidates.iter().find(|candidate| {
+                candidate.namespace == Namespace::TypeNS
+                    && candidate.ident.to_string() == segment.ident.to_string()
+            })
+            && self
                 .speller
-                .candidates
-                .iter()
-                .find(|candidate| candidate.ident.to_string() == segment.ident.to_string())
-            && self.speller.preferred_one_segment(candidate.def_id) == Some(candidate.ident)
+                .preferred_one_segment(candidate.def_id, Namespace::TypeNS)
+                == Some(candidate.ident)
         {
             path.segments[0].ident = candidate.ident;
         }
@@ -1675,6 +1886,1426 @@ fn target_type<'tcx>(
             type_speller.tcx,
         )
     })
+}
+
+fn selected_target_type_tree<'tcx>(
+    source: ty::Ty<'tcx>,
+    decision: PtrKind,
+    ast_to_hir: &utils::ir::AstToHir,
+    tcx: TyCtxt<'tcx>,
+) -> Option<TypeTree> {
+    let (ty::TyKind::RawPtr(inner, _) | ty::TyKind::Ref(_, inner, _)) = source.kind() else {
+        return semantic_type_tree(source, ast_to_hir, tcx);
+    };
+    let inner = semantic_type_tree(*inner, ast_to_hir, tcx)?;
+    let reference = |mutable, pointee| TypeTree::Reference {
+        mutability: if mutable {
+            RefMutability::Mutable
+        } else {
+            RefMutability::Shared
+        },
+        pointee: Box::new(pointee),
+    };
+    let raw = |mutable, pointee| TypeTree::RawPointer {
+        mutability: if mutable {
+            RawMutability::Mut
+        } else {
+            RawMutability::Const
+        },
+        pointee: Box::new(pointee),
+    };
+    let adt = |adt_kind, crate_name: &str, path: &[&str], arguments| TypeTree::Adt {
+        adt_kind,
+        identity: AdtIdentity::External {
+            crate_name: crate_name.to_owned(),
+            path: path.iter().map(|part| (*part).to_owned()).collect(),
+        },
+        arguments,
+    };
+    let global_allocator = || adt(AdtKind::Struct, "alloc", &["alloc", "Global"], vec![]);
+    let boxed = |pointee| {
+        adt(
+            AdtKind::Struct,
+            "alloc",
+            &["boxed", "Box"],
+            vec![pointee, global_allocator()],
+        )
+    };
+    let option = |value| adt(AdtKind::Enum, "core", &["option", "Option"], vec![value]);
+    Some(match decision {
+        PtrKind::Ref(mutable) => reference(mutable, inner),
+        PtrKind::OptRef(mutable) => option(reference(mutable, inner)),
+        PtrKind::Box => boxed(inner),
+        PtrKind::OptBox => option(boxed(inner)),
+        PtrKind::Raw(mutable) => raw(mutable, inner),
+        PtrKind::BoxedSlice => boxed(TypeTree::Slice {
+            element: Box::new(inner),
+        }),
+        PtrKind::OptBoxedSlice => option(boxed(TypeTree::Slice {
+            element: Box::new(inner),
+        })),
+        PtrKind::Slice(mutable) => reference(
+            mutable,
+            TypeTree::Slice {
+                element: Box::new(inner),
+            },
+        ),
+        PtrKind::SliceCursor(_) => return None,
+    })
+}
+
+fn rule_binding_catalog(
+    source: &Item,
+    function: LocalDefId,
+    decisions: &InitialPointerDecisions,
+    ast_to_hir: &utils::ir::AstToHir,
+    tcx: TyCtxt<'_>,
+) -> HashMap<hir::HirId, TypeTree> {
+    let mut result = HashMap::new();
+    let ItemKind::Fn(box source_function) = &source.kind else {
+        return result;
+    };
+    if let Some(signature) = decisions.signatures.data.get(&function) {
+        for (index, parameter) in source_function.sig.decl.inputs.iter().enumerate() {
+            let Some(decision) = signature.input_decs.get(index).copied().flatten() else {
+                continue;
+            };
+            let Some(pattern) = ast_to_hir.get_pat(parameter.pat.id, tcx) else {
+                continue;
+            };
+            let hir::PatKind::Binding(_, binding, _, None) = pattern.kind else {
+                continue;
+            };
+            let source_type = tcx.typeck(pattern.hir_id.owner).node_type(pattern.hir_id);
+            if source_type.is_raw_ptr()
+                && let Some(target) =
+                    selected_target_type_tree(source_type, decision, ast_to_hir, tcx)
+            {
+                result.insert(binding, target);
+            }
+        }
+    }
+    struct Locals<'a, 'tcx> {
+        result: &'a mut HashMap<hir::HirId, TypeTree>,
+        decisions: &'a InitialPointerDecisions,
+        ast_to_hir: &'a utils::ir::AstToHir,
+        tcx: TyCtxt<'tcx>,
+    }
+    impl<'ast> visit::Visitor<'ast> for Locals<'_, '_> {
+        fn visit_stmt(&mut self, statement: &'ast Stmt) {
+            if let StmtKind::Let(local) = &statement.kind
+                && matches!(local.pat.kind, PatKind::Ident(_, _, None))
+                && let Some(hir_pattern) = self.ast_to_hir.get_pat(local.pat.id, self.tcx)
+                && let hir::PatKind::Binding(_, binding, _, None) = hir_pattern.kind
+                && let Some(decision) = self.decisions.bindings.get(&binding).copied()
+            {
+                let source_type = self
+                    .tcx
+                    .typeck(hir_pattern.hir_id.owner)
+                    .node_type(hir_pattern.hir_id);
+                if source_type.is_raw_ptr()
+                    && let Some(target) =
+                        selected_target_type_tree(source_type, decision, self.ast_to_hir, self.tcx)
+                {
+                    self.result.insert(binding, target);
+                }
+            }
+            visit::walk_stmt(self, statement);
+        }
+    }
+    Locals {
+        result: &mut result,
+        decisions,
+        ast_to_hir,
+        tcx,
+    }
+    .visit_block(source_function.body.as_ref().unwrap());
+    result
+}
+
+fn rule_target_binding_catalog(
+    source: &Item,
+    function: LocalDefId,
+    decisions: &InitialPointerDecisions,
+    ast_to_hir: &utils::ir::AstToHir,
+    tcx: TyCtxt<'_>,
+) -> HashMap<hir::HirId, TypeTree> {
+    let mut result = rule_binding_catalog(source, function, decisions, ast_to_hir, tcx);
+    let ItemKind::Fn(box source_function) = &source.kind else {
+        return result;
+    };
+    let mut add_pattern = |pattern: &Pat| {
+        let Some(pattern) = ast_to_hir.get_pat(pattern.id, tcx) else {
+            return;
+        };
+        let hir::PatKind::Binding(_, binding, _, None) = pattern.kind else {
+            return;
+        };
+        if result.contains_key(&binding) {
+            return;
+        }
+        let source_type = tcx.typeck(pattern.hir_id.owner).node_type(pattern.hir_id);
+        if let Some(target) = semantic_type_tree(source_type, ast_to_hir, tcx) {
+            result.insert(binding, target);
+        }
+    };
+    for parameter in &source_function.sig.decl.inputs {
+        add_pattern(&parameter.pat);
+    }
+    struct Locals<'a> {
+        add_pattern: &'a mut dyn FnMut(&Pat),
+    }
+    impl<'ast> visit::Visitor<'ast> for Locals<'_> {
+        fn visit_stmt(&mut self, statement: &'ast Stmt) {
+            if let StmtKind::Let(local) = &statement.kind
+                && matches!(local.pat.kind, PatKind::Ident(_, _, None))
+            {
+                (self.add_pattern)(&local.pat);
+            }
+            visit::walk_stmt(self, statement);
+        }
+    }
+    Locals {
+        add_pattern: &mut add_pattern,
+    }
+    .visit_block(source_function.body.as_ref().unwrap());
+    result
+}
+
+fn rule_type_syntax(
+    source: &Item,
+    ast_to_hir: &utils::ir::AstToHir,
+    tcx: TyCtxt<'_>,
+) -> HashMap<String, String> {
+    struct Types<'a, 'tcx> {
+        ast_to_hir: &'a utils::ir::AstToHir,
+        result: HashMap<String, String>,
+        tcx: TyCtxt<'tcx>,
+    }
+    impl<'ast> visit::Visitor<'ast> for Types<'_, '_> {
+        fn visit_ty(&mut self, ty: &'ast Ty) {
+            if let Some(hir) = self.ast_to_hir.get_ty(ty.id, self.tcx)
+                && let Some(normalized) = semantic_type_tree(
+                    self.tcx.typeck(hir.hir_id.owner).node_type(hir.hir_id),
+                    self.ast_to_hir,
+                    self.tcx,
+                )
+                && let Ok(key) = serde_json::to_string(&normalized)
+            {
+                self.result
+                    .entry(key)
+                    .or_insert_with(|| pprust::ty_to_string(ty));
+            }
+            visit::walk_ty(self, ty);
+        }
+    }
+    let mut types = Types {
+        ast_to_hir,
+        result: HashMap::new(),
+        tcx,
+    };
+    if let ItemKind::Fn(box function) = &source.kind
+        && let Some(body) = &function.body
+    {
+        types.visit_block(body);
+    }
+    types.result
+}
+
+struct RuleRenderer<'a, 'map, 'tcx> {
+    names: &'a HashMap<String, String>,
+    syntax_overrides: &'a BTreeMap<usize, String>,
+    identity_syntax: &'a BTreeMap<String, String>,
+    syntax_cursor: Cell<usize>,
+    type_syntax: &'a HashMap<String, String>,
+    type_speller: &'a TypeSpeller<'map, 'tcx>,
+}
+
+fn member_spelling(identity: &FieldIdentity, names: &HashMap<String, String>) -> Option<String> {
+    match identity {
+        FieldIdentity::External { path, .. } => path.last().cloned(),
+        FieldIdentity::Local { id, .. } => names.get(id).cloned(),
+    }
+}
+
+fn variant_spelling(identity: &VariantIdentity, names: &HashMap<String, String>) -> Option<String> {
+    match identity {
+        VariantIdentity::External { path, .. } => path.last().cloned(),
+        VariantIdentity::Local { id, .. } => names.get(id).cloned(),
+    }
+}
+
+fn type_tree_spelling(value: &TypeTree, renderer: &RuleRenderer<'_, '_, '_>) -> Option<String> {
+    if let Ok(key) = serde_json::to_string(value)
+        && let Some(source) = renderer.type_syntax.get(&key)
+    {
+        return Some(source.clone());
+    }
+    Some(match value {
+        TypeTree::Primitive { name } if name == "never" => "!".to_owned(),
+        TypeTree::Primitive { name } => name.clone(),
+        TypeTree::Slice { element } => format!("[{}]", type_tree_spelling(element, renderer)?),
+        TypeTree::Array { element, length } => {
+            format!("[{}; {length}]", type_tree_spelling(element, renderer)?)
+        }
+        TypeTree::RawPointer {
+            mutability,
+            pointee,
+        } => format!(
+            "*{} {}",
+            if *mutability == RawMutability::Mut {
+                "mut"
+            } else {
+                "const"
+            },
+            type_tree_spelling(pointee, renderer)?
+        ),
+        TypeTree::Reference {
+            mutability,
+            pointee,
+        } => format!(
+            "&{}{}",
+            if *mutability == RefMutability::Mutable {
+                "mut "
+            } else {
+                ""
+            },
+            type_tree_spelling(pointee, renderer)?
+        ),
+        TypeTree::Tuple { elements } => {
+            let values = elements
+                .iter()
+                .map(|element| type_tree_spelling(element, renderer))
+                .collect::<Option<Vec<_>>>()?;
+            if values.len() == 1 {
+                format!("({},)", values[0])
+            } else {
+                format!("({})", values.join(", "))
+            }
+        }
+        TypeTree::Adt {
+            identity,
+            arguments,
+            ..
+        } => {
+            let path = match identity {
+                AdtIdentity::External { crate_name, path } => renderer
+                    .type_speller
+                    .resolve_external_identity(crate_name, path, Namespace::TypeNS)
+                    .and_then(|definition| renderer.type_speller.nominal_path(definition).ok())?,
+                AdtIdentity::Local { id } => renderer.names.get(id)?.clone(),
+            };
+            if arguments.is_empty() {
+                path
+            } else {
+                format!(
+                    "{path}<{}>",
+                    arguments
+                        .iter()
+                        .map(|argument| type_tree_spelling(argument, renderer))
+                        .collect::<Option<Vec<_>>>()?
+                        .join(", ")
+                )
+            }
+        }
+    })
+}
+
+fn value_spelling(value: &ValueIdentity, renderer: &RuleRenderer<'_, '_, '_>) -> Option<String> {
+    match value {
+        ValueIdentity::Binding { id }
+        | ValueIdentity::Function { id }
+        | ValueIdentity::Constant { id }
+        | ValueIdentity::Static { id } => renderer
+            .identity_syntax
+            .get(id)
+            .cloned()
+            .or_else(|| renderer.names.get(id).cloned()),
+        ValueIdentity::Method { id } => renderer.names.get(id).cloned(),
+        ValueIdentity::External { crate_name, path } => renderer
+            .type_speller
+            .resolve_external_identity(crate_name, path, Namespace::ValueNS)
+            .and_then(|definition| renderer.type_speller.value_path(definition).ok()),
+        ValueIdentity::ForeignFunction { symbol } | ValueIdentity::ForeignStatic { symbol } => {
+            Some(symbol.clone())
+        }
+        ValueIdentity::Constructor { adt, variant } => {
+            let adt = match adt {
+                AdtIdentity::External { crate_name, path } => renderer
+                    .type_speller
+                    .resolve_external_identity(crate_name, path, Namespace::TypeNS)
+                    .and_then(|definition| renderer.type_speller.nominal_path(definition).ok())?,
+                AdtIdentity::Local { id } => renderer.names.get(id)?.clone(),
+            };
+            Some(match variant {
+                Some(variant) => {
+                    format!("{adt}::{}", variant_spelling(variant, renderer.names)?)
+                }
+                None => adt,
+            })
+        }
+    }
+}
+
+fn binary_spelling(operator: BinaryOperator) -> &'static str {
+    match operator {
+        BinaryOperator::Add => "+",
+        BinaryOperator::Subtract => "-",
+        BinaryOperator::Multiply => "*",
+        BinaryOperator::Divide => "/",
+        BinaryOperator::Remainder => "%",
+        BinaryOperator::And => "&&",
+        BinaryOperator::Or => "||",
+        BinaryOperator::BitXor => "^",
+        BinaryOperator::BitAnd => "&",
+        BinaryOperator::BitOr => "|",
+        BinaryOperator::ShiftLeft => "<<",
+        BinaryOperator::ShiftRight => ">>",
+        BinaryOperator::Equal => "==",
+        BinaryOperator::NotEqual => "!=",
+        BinaryOperator::Less => "<",
+        BinaryOperator::LessEqual => "<=",
+        BinaryOperator::Greater => ">",
+        BinaryOperator::GreaterEqual => ">=",
+    }
+}
+
+fn byte_literal_contents(value: &[u8]) -> String {
+    value
+        .iter()
+        .map(|byte| match *byte {
+            b'\n' => "\\n".to_owned(),
+            b'\r' => "\\r".to_owned(),
+            b'\t' => "\\t".to_owned(),
+            b'\\' => "\\\\".to_owned(),
+            b'"' => "\\\"".to_owned(),
+            0x20..=0x7e => char::from(*byte).to_string(),
+            _ => format!("\\x{byte:02x}"),
+        })
+        .collect()
+}
+
+fn block_spelling(block: &crate::Block, renderer: &RuleRenderer<'_, '_, '_>) -> Option<String> {
+    let statements = block
+        .statements
+        .iter()
+        .map(|statement| statement_spelling(statement, renderer))
+        .collect::<Option<Vec<_>>>()?;
+    Some(format!("{{ {} }}", statements.join(" ")))
+}
+
+fn statement_spelling(
+    statement: &Statement,
+    renderer: &RuleRenderer<'_, '_, '_>,
+) -> Option<String> {
+    Some(match statement {
+        Statement::Let {
+            pattern,
+            ty,
+            initializer,
+        } => {
+            let pattern = match pattern {
+                Pattern::Binding {
+                    id,
+                    mutability,
+                    by_ref,
+                } => {
+                    let name = renderer.names.get(id)?;
+                    let prefix = match by_ref {
+                        ByRefKind::No => {
+                            if *mutability == BindingMutability::Mutable {
+                                "mut "
+                            } else {
+                                ""
+                            }
+                        }
+                        ByRefKind::Shared => "ref ",
+                        ByRefKind::Mutable => "ref mut ",
+                    };
+                    format!("{prefix}{name}")
+                }
+                Pattern::Wildcard => "_".to_owned(),
+            };
+            let ty = match ty {
+                Some(ty) => format!(": {}", type_tree_spelling(ty, renderer)?),
+                None => String::new(),
+            };
+            let initializer = match initializer {
+                Some(value) => format!(" = {}", expression_spelling(value, renderer)?),
+                None => String::new(),
+            };
+            format!("let {pattern}{ty}{initializer};")
+        }
+        Statement::Expression {
+            expression,
+            semicolon,
+        } => format!(
+            "{}{}",
+            expression_spelling(expression, renderer)?,
+            if *semicolon { ";" } else { "" }
+        ),
+    })
+}
+
+fn block_expression_count(block: &crate::Block) -> usize {
+    block
+        .statements
+        .iter()
+        .map(|statement| match statement {
+            Statement::Let { initializer, .. } => {
+                initializer.as_ref().map_or(0, expression_node_count)
+            }
+            Statement::Expression { expression, .. } => expression_node_count(expression),
+        })
+        .sum()
+}
+
+fn expression_node_count(expression: &Expression) -> usize {
+    let children = match expression {
+        Expression::Array { elements } | Expression::Tuple { elements } => {
+            elements.iter().map(expression_node_count).sum()
+        }
+        Expression::Call { callee, arguments } => {
+            expression_node_count(callee)
+                + arguments.iter().map(expression_node_count).sum::<usize>()
+        }
+        Expression::MethodCall {
+            receiver,
+            arguments,
+            ..
+        } => {
+            expression_node_count(receiver)
+                + arguments.iter().map(expression_node_count).sum::<usize>()
+        }
+        Expression::Binary { left, right, .. }
+        | Expression::Assign { left, right }
+        | Expression::AssignOp { left, right, .. }
+        | Expression::Index {
+            base: left,
+            index: right,
+        }
+        | Expression::Repeat {
+            value: left,
+            count: right,
+        } => expression_node_count(left) + expression_node_count(right),
+        Expression::Unary { operand, .. }
+        | Expression::Cast {
+            expression: operand,
+            ..
+        }
+        | Expression::Field { base: operand, .. }
+        | Expression::AddressOf {
+            expression: operand,
+            ..
+        } => expression_node_count(operand),
+        Expression::If {
+            condition,
+            then,
+            else_expression,
+        } => {
+            expression_node_count(condition)
+                + block_expression_count(then)
+                + else_expression.as_deref().map_or(0, expression_node_count)
+        }
+        Expression::While { condition, body } => {
+            expression_node_count(condition) + block_expression_count(body)
+        }
+        Expression::Loop { body } | Expression::Block { block: body } => {
+            block_expression_count(body)
+        }
+        Expression::Range { start, end, .. } => {
+            start.as_deref().map_or(0, expression_node_count)
+                + end.as_deref().map_or(0, expression_node_count)
+        }
+        Expression::Break { value } | Expression::Return { value } => {
+            value.as_deref().map_or(0, expression_node_count)
+        }
+        Expression::Struct { fields, rest, .. } => {
+            fields
+                .iter()
+                .map(|field| expression_node_count(&field.value))
+                .sum::<usize>()
+                + rest.as_deref().map_or(0, expression_node_count)
+        }
+        Expression::Literal { .. } | Expression::Path { .. } | Expression::Continue => 0,
+    };
+    1 + children
+}
+
+fn expression_spelling(
+    expression: &Expression,
+    renderer: &RuleRenderer<'_, '_, '_>,
+) -> Option<String> {
+    let ordinal = renderer.syntax_cursor.get();
+    renderer.syntax_cursor.set(ordinal + 1);
+    if let Some(source) = renderer.syntax_overrides.get(&ordinal) {
+        renderer
+            .syntax_cursor
+            .set(ordinal + expression_node_count(expression));
+        return Some(source.clone());
+    }
+    let recurse = |value: &Expression| expression_spelling(value, renderer);
+    Some(match expression {
+        Expression::Array { elements } => format!(
+            "[{}]",
+            elements
+                .iter()
+                .map(recurse)
+                .collect::<Option<Vec<_>>>()?
+                .join(", ")
+        ),
+        Expression::Call { callee, arguments } => format!(
+            "{}({})",
+            recurse(callee)?,
+            arguments
+                .iter()
+                .map(recurse)
+                .collect::<Option<Vec<_>>>()?
+                .join(", ")
+        ),
+        Expression::MethodCall {
+            receiver,
+            method,
+            arguments,
+        } => {
+            let method = match method {
+                ValueIdentity::External { path, .. } => path.last()?.clone(),
+                ValueIdentity::Method { id } => renderer.names.get(id)?.clone(),
+                _ => value_spelling(method, renderer)?
+                    .rsplit("::")
+                    .next()?
+                    .to_owned(),
+            };
+            format!(
+                "({}).{}({})",
+                recurse(receiver)?,
+                method,
+                arguments
+                    .iter()
+                    .map(recurse)
+                    .collect::<Option<Vec<_>>>()?
+                    .join(", ")
+            )
+        }
+        Expression::Tuple { elements } => {
+            let values = elements.iter().map(recurse).collect::<Option<Vec<_>>>()?;
+            if values.len() == 1 {
+                format!("({},)", values[0])
+            } else {
+                format!("({})", values.join(", "))
+            }
+        }
+        Expression::Binary {
+            operator,
+            left,
+            right,
+        } => {
+            format!(
+                "({} {} {})",
+                recurse(left)?,
+                binary_spelling(*operator),
+                recurse(right)?
+            )
+        }
+        Expression::Unary { operator, operand } => format!(
+            "({}{})",
+            match operator {
+                UnaryOperator::Deref => "*",
+                UnaryOperator::Not => "!",
+                UnaryOperator::Negate => "-",
+            },
+            recurse(operand)?
+        ),
+        Expression::Literal { value } => match value {
+            Literal::Bool { value } => value.to_string(),
+            Literal::Char { value } => {
+                let mut values = value.chars();
+                let value = values.next()?;
+                if values.next().is_some() {
+                    return None;
+                }
+                format!("'{}'", value.escape_default())
+            }
+            Literal::Byte { value } => format!("{value}u8"),
+            Literal::String { value } => format!("{value:?}"),
+            Literal::ByteString { value } => format!("b\"{}\"", byte_literal_contents(value)),
+            Literal::CString { value } => format!("c\"{}\"", byte_literal_contents(value)),
+            Literal::Integer { value, ty } => format!("{value}{ty}"),
+            Literal::Float { bits, ty } => format!("{ty}::from_bits(0x{bits})"),
+        },
+        Expression::Cast { expression, ty } => {
+            format!(
+                "({} as {})",
+                recurse(expression)?,
+                type_tree_spelling(ty, renderer)?
+            )
+        }
+        Expression::If {
+            condition,
+            then,
+            else_expression,
+        } => format!(
+            "if {} {}{}",
+            recurse(condition)?,
+            block_spelling(then, renderer)?,
+            match else_expression {
+                Some(value) => format!(" else {}", recurse(value)?),
+                None => String::new(),
+            }
+        ),
+        Expression::While { condition, body } => format!(
+            "while {} {}",
+            recurse(condition)?,
+            block_spelling(body, renderer)?
+        ),
+        Expression::Loop { body } => format!("loop {}", block_spelling(body, renderer)?),
+        Expression::Assign { left, right } => format!("({} = {})", recurse(left)?, recurse(right)?),
+        Expression::AssignOp {
+            operator,
+            left,
+            right,
+        } => format!(
+            "({} {}= {})",
+            recurse(left)?,
+            binary_spelling(*operator),
+            recurse(right)?
+        ),
+        Expression::Field { base, field } => {
+            format!(
+                "({}).{}",
+                recurse(base)?,
+                member_spelling(field, renderer.names)?
+            )
+        }
+        Expression::Index { base, index } => format!("({})[{}]", recurse(base)?, recurse(index)?),
+        Expression::Range { start, end, limits } => format!(
+            "{}{}{}",
+            match start {
+                Some(value) => recurse(value)?,
+                None => String::new(),
+            },
+            if *limits == RangeLimits::Closed {
+                "..="
+            } else {
+                ".."
+            },
+            match end {
+                Some(value) => recurse(value)?,
+                None => String::new(),
+            }
+        ),
+        Expression::Path { value } => value_spelling(value, renderer)?,
+        Expression::AddressOf {
+            borrow,
+            mutability,
+            expression,
+        } => format!(
+            "&{}{}{}",
+            if *borrow == BorrowKind::Raw {
+                "raw "
+            } else {
+                ""
+            },
+            match (borrow, mutability) {
+                (BorrowKind::Raw, RawMutability::Const) => "const ",
+                (_, RawMutability::Mut) => "mut ",
+                _ => "",
+            },
+            recurse(expression)?
+        ),
+        Expression::Break { value } => format!(
+            "break{}",
+            match value {
+                Some(value) => format!(" {}", recurse(value)?),
+                None => String::new(),
+            }
+        ),
+        Expression::Continue => "continue".to_owned(),
+        Expression::Return { value } => format!(
+            "return{}",
+            match value {
+                Some(value) => format!(" {}", recurse(value)?),
+                None => String::new(),
+            }
+        ),
+        Expression::Struct {
+            adt,
+            variant,
+            fields,
+            rest,
+        } => {
+            let mut path = match adt {
+                AdtIdentity::External { crate_name, path } => renderer
+                    .type_speller
+                    .resolve_external_identity(crate_name, path, Namespace::TypeNS)
+                    .and_then(|definition| renderer.type_speller.nominal_path(definition).ok())?,
+                AdtIdentity::Local { id } => renderer.names.get(id)?.clone(),
+            };
+            if let Some(variant) = variant {
+                path.push_str("::");
+                path.push_str(&variant_spelling(variant, renderer.names)?);
+            }
+            let mut values = fields
+                .iter()
+                .map(|field| {
+                    Some(format!(
+                        "{}: {}",
+                        member_spelling(&field.field, renderer.names)?,
+                        recurse(&field.value)?
+                    ))
+                })
+                .collect::<Option<Vec<_>>>()?;
+            if let Some(rest) = rest {
+                values.push(format!("..{}", recurse(rest)?));
+            }
+            format!("{path} {{ {} }}", values.join(", "))
+        }
+        Expression::Repeat { value, count } => {
+            format!("[{}; {}]", recurse(value)?, recurse(count)?)
+        }
+        Expression::Block { block } => block_spelling(block, renderer)?,
+    })
+}
+
+fn supported_assignment_place(expression: &Expr) -> bool {
+    match &expression.kind {
+        ExprKind::Path(..) => true,
+        ExprKind::Unary(rustc_ast::UnOp::Deref, value)
+        | ExprKind::Paren(value)
+        | ExprKind::Field(value, _)
+        | ExprKind::Index(value, _, _) => supported_assignment_place(value),
+        _ => false,
+    }
+}
+
+fn supported_normalized_assignment_place(expression: &Expression) -> bool {
+    match expression {
+        Expression::Path { value } => matches!(
+            value,
+            ValueIdentity::Binding { .. }
+                | ValueIdentity::Static { .. }
+                | ValueIdentity::ForeignStatic { .. }
+                | ValueIdentity::External { .. }
+        ),
+        Expression::Unary {
+            operator: UnaryOperator::Deref,
+            operand,
+        } => supported_normalized_assignment_place(operand),
+        Expression::Field { base, .. } | Expression::Index { base, .. } => {
+            supported_normalized_assignment_place(base)
+        }
+        _ => false,
+    }
+}
+
+fn parse_rule_expression(source: String, lhs: bool) -> Option<Expr> {
+    let expression = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        utils::ast::parse_expr(source)
+    }))
+    .ok()?;
+    struct ErrorFinder(bool);
+    impl<'ast> visit::Visitor<'ast> for ErrorFinder {
+        fn visit_expr(&mut self, expression: &'ast Expr) {
+            if matches!(expression.kind, ExprKind::Err(_)) {
+                self.0 = true;
+            } else {
+                visit::walk_expr(self, expression);
+            }
+        }
+    }
+    let mut errors = ErrorFinder(false);
+    errors.visit_expr(&expression);
+    (!errors.0 && (!lhs || supported_assignment_place(&expression))).then_some(expression)
+}
+
+struct RuleExpressionInstaller<'a> {
+    replacements: &'a mut HashMap<NodeId, Expr>,
+}
+
+fn same_rule_region(root: NodeId, expression: &Expr) -> bool {
+    if expression.id == root {
+        return true;
+    }
+    matches!(&expression.kind, ExprKind::Paren(inner) if same_rule_region(root, inner))
+}
+
+fn selected_signature_type<'tcx>(
+    definition: rustc_span::def_id::DefId,
+    arguments: ty::GenericArgsRef<'tcx>,
+    index: Option<usize>,
+    decisions: &InitialPointerDecisions,
+    ast_to_hir: &utils::ir::AstToHir,
+    tcx: TyCtxt<'tcx>,
+) -> Option<TypeTree> {
+    let signature = tcx
+        .fn_sig(definition)
+        .instantiate(tcx, arguments)
+        .skip_binder();
+    let source = match index {
+        Some(index) => *signature.inputs().get(index)?,
+        None => signature.output(),
+    };
+    let decision = (!tcx.is_foreign_item(definition))
+        .then(|| definition.as_local())
+        .flatten()
+        .and_then(|local| {
+            let signature = decisions.signatures.data.get(&local)?;
+            match index {
+                Some(index) => signature.input_decs.get(index).copied().flatten(),
+                None => signature.output_dec,
+            }
+        });
+    match decision {
+        Some(decision) => selected_target_type_tree(source, decision, ast_to_hir, tcx),
+        None => semantic_type_tree(source, ast_to_hir, tcx),
+    }
+}
+
+fn direct_call_type<'tcx>(
+    callee: &Expr,
+    index: Option<usize>,
+    decisions: &InitialPointerDecisions,
+    ast_to_hir: &utils::ir::AstToHir,
+    tcx: TyCtxt<'tcx>,
+) -> Option<TypeTree> {
+    let callee = ast_to_hir.get_expr(callee.id, tcx)?;
+    let typeck = tcx.typeck(callee.hir_id.owner);
+    let ty::TyKind::FnDef(definition, arguments) = typeck.expr_ty(callee).kind() else {
+        return None;
+    };
+    selected_signature_type(*definition, arguments, index, decisions, ast_to_hir, tcx)
+}
+
+fn option_or_box_pointee(value: &TypeTree) -> Option<TypeTree> {
+    match value {
+        TypeTree::RawPointer { pointee, .. } | TypeTree::Reference { pointee, .. } => {
+            Some((**pointee).clone())
+        }
+        TypeTree::Adt {
+            identity: AdtIdentity::External { crate_name, path },
+            arguments,
+            ..
+        } if crate_name == "alloc" && path == &["boxed", "Box"] => arguments.first().cloned(),
+        TypeTree::Adt {
+            identity: AdtIdentity::External { crate_name, path },
+            arguments,
+            ..
+        } if crate_name == "core" && path == &["option", "Option"] && arguments.len() == 1 => {
+            match &arguments[0] {
+                TypeTree::Reference { pointee, .. } => Some((**pointee).clone()),
+                TypeTree::Adt {
+                    identity: AdtIdentity::External { crate_name, path },
+                    arguments,
+                    ..
+                } if crate_name == "alloc"
+                    && path == &["boxed", "Box"]
+                    && !arguments.is_empty() =>
+                {
+                    arguments.first().cloned()
+                }
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+fn substitute_field_type_tree(
+    template: ty::Ty<'_>,
+    source: TypeTree,
+    substitutions: &HashMap<u32, TypeTree>,
+) -> Option<TypeTree> {
+    if let ty::TyKind::Param(parameter) = template.kind() {
+        return substitutions.get(&parameter.index).cloned();
+    }
+    Some(match (template.kind(), source) {
+        (ty::TyKind::Bool, value @ TypeTree::Primitive { .. })
+        | (ty::TyKind::Char, value @ TypeTree::Primitive { .. })
+        | (ty::TyKind::Int(_), value @ TypeTree::Primitive { .. })
+        | (ty::TyKind::Uint(_), value @ TypeTree::Primitive { .. })
+        | (ty::TyKind::Float(_), value @ TypeTree::Primitive { .. })
+        | (ty::TyKind::Str, value @ TypeTree::Primitive { .. }) => value,
+        (
+            ty::TyKind::RawPtr(element, _),
+            TypeTree::RawPointer {
+                mutability,
+                pointee,
+            },
+        ) => TypeTree::RawPointer {
+            mutability,
+            pointee: Box::new(substitute_field_type_tree(
+                *element,
+                *pointee,
+                substitutions,
+            )?),
+        },
+        (
+            ty::TyKind::Ref(_, element, _),
+            TypeTree::Reference {
+                mutability,
+                pointee,
+            },
+        ) => TypeTree::Reference {
+            mutability,
+            pointee: Box::new(substitute_field_type_tree(
+                *element,
+                *pointee,
+                substitutions,
+            )?),
+        },
+        (ty::TyKind::Slice(element), TypeTree::Slice { element: source }) => TypeTree::Slice {
+            element: Box::new(substitute_field_type_tree(
+                *element,
+                *source,
+                substitutions,
+            )?),
+        },
+        (
+            ty::TyKind::Array(element, _),
+            TypeTree::Array {
+                element: source,
+                length,
+            },
+        ) => TypeTree::Array {
+            element: Box::new(substitute_field_type_tree(
+                *element,
+                *source,
+                substitutions,
+            )?),
+            length,
+        },
+        (ty::TyKind::Tuple(elements), TypeTree::Tuple { elements: source })
+            if elements.len() == source.len() =>
+        {
+            TypeTree::Tuple {
+                elements: elements
+                    .iter()
+                    .zip(source)
+                    .map(|(template, source)| {
+                        substitute_field_type_tree(template, source, substitutions)
+                    })
+                    .collect::<Option<_>>()?,
+            }
+        }
+        (
+            ty::TyKind::Adt(_, arguments),
+            TypeTree::Adt {
+                adt_kind,
+                identity,
+                arguments: source,
+            },
+        ) => {
+            let templates = arguments.types().collect::<Vec<_>>();
+            if templates.len() != source.len() {
+                return None;
+            }
+            TypeTree::Adt {
+                adt_kind,
+                identity,
+                arguments: templates
+                    .into_iter()
+                    .zip(source)
+                    .map(|(template, source)| {
+                        substitute_field_type_tree(template, source, substitutions)
+                    })
+                    .collect::<Option<_>>()?,
+            }
+        }
+        _ => return None,
+    })
+}
+
+fn target_field_type<'tcx>(
+    base: &Expr,
+    field_name: rustc_span::Symbol,
+    target_base: TypeTree,
+    ast_to_hir: &utils::ir::AstToHir,
+    tcx: TyCtxt<'tcx>,
+) -> Option<TypeTree> {
+    let TypeTree::Adt {
+        arguments: target_arguments,
+        ..
+    } = target_base
+    else {
+        return None;
+    };
+    let base = ast_to_hir.get_expr(base.id, tcx)?;
+    let mut source_base = tcx.typeck(base.hir_id.owner).expr_ty_adjusted(base);
+    while let ty::TyKind::Ref(_, pointee, _) = source_base.kind() {
+        source_base = *pointee;
+    }
+    let ty::TyKind::Adt(definition, source_arguments) = source_base.kind() else {
+        return None;
+    };
+    let field = definition
+        .non_enum_variant()
+        .fields
+        .iter()
+        .find(|field| field.name == field_name)?;
+    let source_field = field.ty(tcx, source_arguments);
+    let source_tree = semantic_type_tree(source_field, ast_to_hir, tcx)?;
+    let identity_arguments = ty::GenericArgs::identity_for_item(tcx, definition.did());
+    let type_parameters = identity_arguments
+        .types()
+        .filter_map(|argument| match argument.kind() {
+            ty::TyKind::Param(parameter) => Some(parameter.index),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    if type_parameters.len() != target_arguments.len() {
+        return None;
+    }
+    let substitutions = type_parameters
+        .into_iter()
+        .zip(target_arguments)
+        .collect::<HashMap<_, _>>();
+    substitute_field_type_tree(
+        field.ty(tcx, identity_arguments),
+        source_tree,
+        &substitutions,
+    )
+}
+
+fn target_place_type<'tcx>(
+    expression: &Expr,
+    catalog: &HashMap<hir::HirId, TypeTree>,
+    decisions: &InitialPointerDecisions,
+    ast_to_hir: &utils::ir::AstToHir,
+    tcx: TyCtxt<'tcx>,
+) -> Option<TypeTree> {
+    match &expression.kind {
+        ExprKind::Paren(inner) => target_place_type(inner, catalog, decisions, ast_to_hir, tcx),
+        ExprKind::Path(..) => {
+            let expression = ast_to_hir.get_expr(expression.id, tcx)?;
+            let hir::ExprKind::Path(path) = expression.kind else { return None };
+            let hir::def::Res::Local(binding) = tcx
+                .typeck(expression.hir_id.owner)
+                .qpath_res(&path, expression.hir_id)
+            else {
+                return None;
+            };
+            catalog.get(&binding).cloned()
+        }
+        ExprKind::Call(callee, _) => direct_call_type(callee, None, decisions, ast_to_hir, tcx),
+        ExprKind::Unary(rustc_ast::UnOp::Deref, operand) => option_or_box_pointee(
+            &target_place_type(operand, catalog, decisions, ast_to_hir, tcx)?,
+        ),
+        ExprKind::Field(base, field) => target_field_type(
+            base,
+            field.name,
+            target_place_type(base, catalog, decisions, ast_to_hir, tcx)?,
+            ast_to_hir,
+            tcx,
+        ),
+        ExprKind::Index(base, _, _) => {
+            let base = target_place_type(base, catalog, decisions, ast_to_hir, tcx)?;
+            match base {
+                TypeTree::Array { element, .. } | TypeTree::Slice { element } => Some(*element),
+                TypeTree::Reference { pointee, .. } => match *pointee {
+                    TypeTree::Array { element, .. } | TypeTree::Slice { element } => Some(*element),
+                    _ => None,
+                },
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+fn simple_local_target(
+    local: &rustc_ast::Local,
+    catalog: &HashMap<hir::HirId, TypeTree>,
+    ast_to_hir: &utils::ir::AstToHir,
+    tcx: TyCtxt<'_>,
+) -> Option<TypeTree> {
+    let pattern = ast_to_hir.get_pat(local.pat.id, tcx)?;
+    let hir::PatKind::Binding(_, binding, _, None) = pattern.kind else { return None };
+    catalog.get(&binding).cloned()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn contextual_target_type<'tcx>(
+    root: NodeId,
+    lhs: bool,
+    source: &Item,
+    function: LocalDefId,
+    catalog: &HashMap<hir::HirId, TypeTree>,
+    decisions: &InitialPointerDecisions,
+    ast_to_hir: &utils::ir::AstToHir,
+    tcx: TyCtxt<'tcx>,
+) -> Option<TypeTree> {
+    let ItemKind::Fn(box source_function) = &source.kind else { return None };
+    let current_return = || {
+        selected_signature_type(
+            function.to_def_id(),
+            ty::GenericArgs::identity_for_item(tcx, function.to_def_id()),
+            None,
+            decisions,
+            ast_to_hir,
+            tcx,
+        )
+    };
+    if let Some(statement) = source_function.body.as_ref()?.stmts.last()
+        && let StmtKind::Expr(expression) = &statement.kind
+        && same_rule_region(root, expression)
+    {
+        return current_return();
+    }
+
+    struct Finder<'a, 'tcx> {
+        root: NodeId,
+        lhs: bool,
+        result: Option<TypeTree>,
+        catalog: &'a HashMap<hir::HirId, TypeTree>,
+        decisions: &'a InitialPointerDecisions,
+        ast_to_hir: &'a utils::ir::AstToHir,
+        current_return: &'a dyn Fn() -> Option<TypeTree>,
+        tcx: TyCtxt<'tcx>,
+    }
+    impl<'ast> visit::Visitor<'ast> for Finder<'_, '_> {
+        fn visit_local(&mut self, local: &'ast rustc_ast::Local) {
+            if self.result.is_none()
+                && let rustc_ast::LocalKind::Init(initializer)
+                | rustc_ast::LocalKind::InitElse(initializer, _) = &local.kind
+                && same_rule_region(self.root, initializer)
+            {
+                self.result = simple_local_target(local, self.catalog, self.ast_to_hir, self.tcx);
+                return;
+            }
+            visit::walk_local(self, local);
+        }
+
+        fn visit_expr(&mut self, expression: &'ast Expr) {
+            if self.result.is_some() {
+                return;
+            }
+            match &expression.kind {
+                ExprKind::Assign(left, right, _) if same_rule_region(self.root, right) => {
+                    self.result = target_place_type(
+                        left,
+                        self.catalog,
+                        self.decisions,
+                        self.ast_to_hir,
+                        self.tcx,
+                    );
+                }
+                ExprKind::Assign(left, _, _) if self.lhs && same_rule_region(self.root, left) => {
+                    let mut bare = left.as_ref();
+                    while let ExprKind::Paren(inner) = &bare.kind {
+                        bare = inner;
+                    }
+                    if matches!(bare.kind, ExprKind::Path(..)) {
+                        self.result = target_place_type(
+                            bare,
+                            self.catalog,
+                            self.decisions,
+                            self.ast_to_hir,
+                            self.tcx,
+                        );
+                    }
+                }
+                ExprKind::Call(callee, arguments) => {
+                    if let Some(index) = arguments
+                        .iter()
+                        .position(|argument| same_rule_region(self.root, argument))
+                    {
+                        self.result = direct_call_type(
+                            callee,
+                            Some(index),
+                            self.decisions,
+                            self.ast_to_hir,
+                            self.tcx,
+                        );
+                    }
+                }
+                ExprKind::Ret(Some(value)) if same_rule_region(self.root, value) => {
+                    self.result = (self.current_return)();
+                }
+                ExprKind::Struct(value) => {
+                    if let Some(field) = value
+                        .fields
+                        .iter()
+                        .find(|field| same_rule_region(self.root, &field.expr))
+                    {
+                        let field = self.ast_to_hir.get_expr(field.expr.id, self.tcx);
+                        self.result = field.and_then(|field| {
+                            semantic_type_tree(
+                                self.tcx.typeck(field.hir_id.owner).expr_ty_adjusted(field),
+                                self.ast_to_hir,
+                                self.tcx,
+                            )
+                        });
+                    }
+                }
+                _ => {}
+            }
+            if self.result.is_none() {
+                visit::walk_expr(self, expression);
+            }
+        }
+    }
+    let mut finder = Finder {
+        root,
+        lhs,
+        result: None,
+        catalog,
+        decisions,
+        ast_to_hir,
+        current_return: &current_return,
+        tcx,
+    };
+    finder.visit_block(source_function.body.as_ref()?);
+    finder.result
+}
+
+impl MutVisitor for RuleExpressionInstaller<'_> {
+    fn visit_expr(&mut self, expression: &mut Expr) {
+        if let Some(mut replacement) = self.replacements.remove(&expression.id) {
+            replacement.attrs = expression.attrs.clone();
+            *expression = replacement;
+            return;
+        }
+        mut_visit::walk_expr(self, expression);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn apply_rule_set(
+    source: &Item,
+    target: &mut Item,
+    transformed: &BTreeSet<u32>,
+    document: &RuleDocument,
+    function: LocalDefId,
+    decisions: &InitialPointerDecisions,
+    ast_to_hir: &utils::ir::AstToHir,
+    type_speller: &TypeSpeller<'_, '_>,
+    tcx: TyCtxt<'_>,
+) -> Result<BTreeSet<u32>, GenerationError> {
+    let loaded = LoadedRuleSet::new(document).map_err(|error| GenerationError {
+        kind: GenerationErrorKind::AstHirMismatch,
+        function_path: tcx.def_path_str(function.to_def_id()),
+        message: format!("invalid rule document: {error}"),
+    })?;
+    if loaded.rules().is_empty() {
+        return Ok(BTreeSet::new());
+    }
+    let catalog = rule_binding_catalog(source, function, decisions, ast_to_hir, tcx);
+    let target_catalog = rule_target_binding_catalog(source, function, decisions, ast_to_hir, tcx);
+    let type_syntax = rule_type_syntax(source, ast_to_hir, tcx);
+    let ItemKind::Fn(box source_function) = &source.kind else {
+        return Ok(BTreeSet::new());
+    };
+    let mut statements = FxHashMap::default();
+    StatementByLabelCollector {
+        statements: &mut statements,
+    }
+    .visit_block(source_function.body.as_ref().unwrap());
+    let mut applied = BTreeSet::new();
+    for label in transformed {
+        let Some(statement) = statements.get(label).copied() else {
+            continue;
+        };
+        let Some(regions) = select_rule_regions(statement, &catalog, ast_to_hir, tcx) else {
+            continue;
+        };
+        if regions.is_empty() {
+            continue;
+        }
+        let mut replacements = HashMap::new();
+        let mut complete = true;
+        let tentative_transformed = transformed
+            .iter()
+            .copied()
+            .filter(|candidate| candidate != label && !applied.contains(candidate))
+            .collect::<BTreeSet<_>>();
+        for region in regions {
+            let target_adjusted_type = contextual_target_type(
+                region.root,
+                region.observation.lhs,
+                source,
+                function,
+                &target_catalog,
+                decisions,
+                ast_to_hir,
+                tcx,
+            );
+            let input = RuleMatchInput {
+                source_expression: region.observation.source_expression,
+                pointer_anchors: region.observation.pointer_anchors,
+                lhs: region.observation.lhs,
+                source_type: region.observation.source_type,
+                source_adjusted_type: region.observation.source_adjusted_type,
+                target_type: None,
+                target_adjusted_type,
+            };
+            let mut excluded = BTreeSet::new();
+            let expression = loop {
+                let Some(selection) = loaded.select_with_exclusions_and_syntax(
+                    &input,
+                    &excluded,
+                    &region.source_syntax,
+                ) else {
+                    complete = false;
+                    break None;
+                };
+                if input.lhs && !supported_normalized_assignment_place(&selection.target_expression)
+                {
+                    excluded.insert(selection.rule_index);
+                    continue;
+                }
+                let renderer = RuleRenderer {
+                    names: &region.spellings,
+                    syntax_overrides: &selection.syntax_overrides,
+                    identity_syntax: &selection.identity_syntax,
+                    syntax_cursor: Cell::new(0),
+                    type_syntax: &type_syntax,
+                    type_speller,
+                };
+                let rendered = expression_spelling(&selection.target_expression, &renderer);
+                if let Some(expression) =
+                    rendered.and_then(|rendered| parse_rule_expression(rendered, input.lhs))
+                {
+                    let mut trial_replacements = replacements.clone();
+                    trial_replacements.insert(region.root, expression.clone());
+                    let mut trial = target.clone();
+                    RuleExpressionInstaller {
+                        replacements: &mut trial_replacements,
+                    }
+                    .visit_item(&mut trial);
+                    if trial_replacements.is_empty()
+                        && validate_rule_application_shape(&trial, &tentative_transformed).is_ok()
+                    {
+                        break Some(expression);
+                    }
+                }
+                excluded.insert(selection.rule_index);
+            };
+            let Some(expression) = expression else { break };
+            replacements.insert(region.root, expression);
+        }
+        if complete && !replacements.is_empty() {
+            let mut tentative = target.clone();
+            RuleExpressionInstaller {
+                replacements: &mut replacements,
+            }
+            .visit_item(&mut tentative);
+            if replacements.is_empty() {
+                *target = tentative;
+                applied.insert(*label);
+            }
+        }
+    }
+    let remaining = transformed
+        .iter()
+        .copied()
+        .filter(|label| !applied.contains(label))
+        .collect::<BTreeSet<_>>();
+    validate_rule_application_shape(target, &remaining).map_err(|message| GenerationError {
+        kind: GenerationErrorKind::AstHirMismatch,
+        function_path: tcx.def_path_str(function.to_def_id()),
+        message: format!("applied function failed structural validation: {message}"),
+    })?;
+    Ok(applied)
 }
 
 fn peel_source_pointer(ty: &Ty) -> Option<Ty> {
@@ -2153,6 +3784,7 @@ struct Skeletonizer<'a, 'tcx> {
     ast_to_hir: &'a utils::ir::AstToHir,
     decisions: &'a InitialPointerDecisions,
     statements_requiring_transformation: &'a BTreeSet<u32>,
+    rule_applied_statements: &'a BTreeSet<u32>,
     type_speller: &'a TypeSpeller<'a, 'tcx>,
     function_path: &'a str,
     error: Option<GenerationError>,
@@ -2166,6 +3798,8 @@ impl MutVisitor for Skeletonizer<'_, '_> {
         }
         let requires_transformation = statement_numeric_label(&stmt)
             .is_none_or(|label| self.statements_requiring_transformation.contains(&label));
+        let rule_applied = statement_numeric_label(&stmt)
+            .is_some_and(|label| self.rule_applied_statements.contains(&label));
         if let StmtKind::Let(local) = &mut stmt.kind
             && let PatKind::Ident(_, _, None) = local.pat.kind
             && let Some(hir_id) = self.ast_to_hir.local_map.get(&local.pat.id).copied()
@@ -2226,6 +3860,9 @@ impl MutVisitor for Skeletonizer<'_, '_> {
             }
         }
         if !requires_transformation {
+            if rule_applied {
+                self.visit_labeled_descendants(&mut stmt);
+            }
             return smallvec![stmt];
         }
         match &mut stmt.kind {
@@ -2249,6 +3886,63 @@ impl MutVisitor for Skeletonizer<'_, '_> {
             }
         }
         smallvec![stmt]
+    }
+}
+
+impl Skeletonizer<'_, '_> {
+    fn visit_labeled_descendants(&mut self, statement: &mut Stmt) {
+        if let StmtKind::Let(local) = &mut statement.kind
+            && let LocalKind::InitElse(_, else_block) = &mut local.kind
+        {
+            self.visit_block(else_block);
+        }
+        let expression = match &mut statement.kind {
+            StmtKind::Let(local) => match &mut local.kind {
+                LocalKind::Init(expression) | LocalKind::InitElse(expression, _) => expression,
+                LocalKind::Decl => return,
+            },
+            StmtKind::Expr(expression) | StmtKind::Semi(expression) => expression,
+            _ => return,
+        };
+        let expression = match &mut expression.kind {
+            ExprKind::Ret(Some(value)) | ExprKind::Break(_, Some(value)) => value,
+            _ => expression,
+        };
+        match &mut expression.kind {
+            ExprKind::If(_, then_block, else_expression) => {
+                self.visit_block(then_block);
+                if let Some(else_expression) = else_expression {
+                    self.visit_control_descendants(else_expression);
+                }
+            }
+            ExprKind::While(_, body, _) | ExprKind::Loop(body, ..) | ExprKind::Block(body, _) => {
+                self.visit_block(body)
+            }
+            ExprKind::ForLoop { body, .. } => self.visit_block(body),
+            ExprKind::Match(_, arms, _) => {
+                for arm in arms {
+                    if let Some(body) = &mut arm.body
+                        && let ExprKind::Block(block, _) = &mut body.kind
+                    {
+                        self.visit_block(block);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn visit_control_descendants(&mut self, expression: &mut Expr) {
+        match &mut expression.kind {
+            ExprKind::Block(block, _) => self.visit_block(block),
+            ExprKind::If(_, then_block, else_expression) => {
+                self.visit_block(then_block);
+                if let Some(else_expression) = else_expression {
+                    self.visit_control_descendants(else_expression);
+                }
+            }
+            _ => {}
+        }
     }
 }
 
@@ -2724,6 +4418,9 @@ fn collect_foreign_function_names<'tcx>(
     visitor.visit_body(tcx.hir_body(body));
     visitor.names.into_iter().collect()
 }
+
+#[cfg(test)]
+mod emitted_view_tests;
 
 #[cfg(test)]
 mod tests;

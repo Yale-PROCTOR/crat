@@ -78,6 +78,7 @@ pub struct Observation {
     pub source_expression: Expression,
     pub target_expression: Expression,
     pub pointer_anchors: Vec<PointerAnchor>,
+    pub lhs: bool,
     pub source_type: TypeTree,
     pub source_adjusted_type: TypeTree,
     pub target_type: TypeTree,
@@ -918,23 +919,21 @@ fn extract_with_tcx(
                     });
                 }
             }
-            let mut tree = ExpressionTree {
-                opaque: label
+            let Some((tree, selected)) = select_expression_regions(
+                source_expression,
+                label
                     .source_opaque_ordinals
                     .iter()
                     .filter_map(|ordinal| source_statements.get(*ordinal))
                     .filter_map(|statement| statement_expression(statement))
                     .map(|expression| expression.id)
                     .collect(),
-                ..ExpressionTree::default()
-            };
-            tree.add(
-                source_expression,
-                None,
-                ParentRole::Boundary,
+                |binding| bindings.get(&binding).copied(),
                 &ast_to_hir,
                 tcx,
-            );
+            ) else {
+                continue;
+            };
             if let Some(expression) = tree
                 .expressions
                 .values()
@@ -947,27 +946,6 @@ fn extract_with_tcx(
                         expression.id, label.label
                     ),
                 });
-            }
-            let mut selected = vec![];
-            for anchor in &tree.anchors {
-                let Some(target_binding) = bindings.get(&anchor.binding) else { continue };
-                let Some((root, promoted_field)) =
-                    select_region(anchor.expression, &tree, &ast_to_hir, tcx)
-                else {
-                    continue;
-                };
-                selected.push(SelectedRegion {
-                    root,
-                    promoted_field,
-                    anchors: vec![AnchorPair {
-                        source_binding: anchor.binding,
-                        target_binding: *target_binding,
-                    }],
-                });
-            }
-            merge_regions(&mut selected);
-            if regions_overlap(&selected, &tree) {
-                continue;
             }
             let promoted_field_ids = selected
                 .iter()
@@ -996,6 +974,8 @@ fn extract_with_tcx(
             ) {
                 continue;
             }
+            let mut statement_observations = vec![];
+            let mut complete = true;
             for region in selected {
                 let Some(target_root) = mappings.get(&region.root).copied() else {
                     return Err(ObservationError {
@@ -1006,17 +986,24 @@ fn extract_with_tcx(
                         ),
                     });
                 };
-                if let Some(observation) = dump_observation(
+                let observation = dump_observation(
                     tree.expressions[&region.root],
                     target_root,
                     &region.anchors,
+                    region.lhs,
                     &bindings,
                     &callable_correspondence,
                     &ast_to_hir,
                     tcx,
-                ) {
-                    output.push(observation);
-                }
+                );
+                let Some(observation) = observation else {
+                    complete = false;
+                    break;
+                };
+                statement_observations.push(observation);
+            }
+            if complete {
+                output.extend(statement_observations);
             }
         }
     }
@@ -1117,7 +1104,7 @@ fn plain_statements(item: &Item) -> Vec<&Stmt> {
     collector.0
 }
 
-fn statement_expression(statement: &Stmt) -> Option<&Expr> {
+pub(crate) fn statement_expression(statement: &Stmt) -> Option<&Expr> {
     match &statement.kind {
         StmtKind::Let(local) => match &local.kind {
             rustc_ast::LocalKind::Init(expression)
@@ -1281,7 +1268,8 @@ enum ParentRole {
     Condition,
     MatchScrutinee,
     BranchTail,
-    AssignOperand,
+    AssignLeft,
+    AssignRight,
     AssignOpOperand,
     FieldBase,
     IndexBase,
@@ -1306,7 +1294,7 @@ struct AnchorOccurrence {
 }
 
 #[derive(Default)]
-struct ExpressionTree<'a> {
+pub(crate) struct ExpressionTree<'a> {
     expressions: HashMap<NodeId, &'a Expr>,
     parents: HashMap<NodeId, ParentEdge>,
     anchors: Vec<AnchorOccurrence>,
@@ -1446,8 +1434,8 @@ impl<'a> ExpressionTree<'a> {
                 }
             }
             ExprKind::Assign(left, right, _) => {
-                self.add(left, Some(id), ParentRole::AssignOperand, ast_to_hir, tcx);
-                self.add(right, Some(id), ParentRole::AssignOperand, ast_to_hir, tcx);
+                self.add(left, Some(id), ParentRole::AssignLeft, ast_to_hir, tcx);
+                self.add(right, Some(id), ParentRole::AssignRight, ast_to_hir, tcx);
             }
             ExprKind::AssignOp(_, left, right) => {
                 self.add(left, Some(id), ParentRole::AssignOpOperand, ast_to_hir, tcx);
@@ -1534,15 +1522,202 @@ impl<'a> ExpressionTree<'a> {
 }
 
 #[derive(Clone)]
-struct AnchorPair {
-    source_binding: hir::HirId,
-    target_binding: hir::HirId,
+pub(crate) struct AnchorPair {
+    pub(crate) source_binding: hir::HirId,
+    pub(crate) target_binding: hir::HirId,
 }
 
-struct SelectedRegion {
-    root: NodeId,
-    promoted_field: bool,
-    anchors: Vec<AnchorPair>,
+pub(crate) struct SelectedRegion {
+    pub(crate) root: NodeId,
+    pub(crate) promoted_field: bool,
+    pub(crate) lhs: bool,
+    pub(crate) anchors: Vec<AnchorPair>,
+}
+
+pub(crate) fn select_expression_regions<'a>(
+    expression: &'a Expr,
+    opaque: HashSet<NodeId>,
+    mut target_binding: impl FnMut(hir::HirId) -> Option<hir::HirId>,
+    ast_to_hir: &utils::ir::AstToHir,
+    tcx: TyCtxt<'_>,
+) -> Option<(ExpressionTree<'a>, Vec<SelectedRegion>)> {
+    let mut tree = ExpressionTree {
+        opaque,
+        ..ExpressionTree::default()
+    };
+    tree.add(expression, None, ParentRole::Boundary, ast_to_hir, tcx);
+    let mut selected = vec![];
+    for anchor in &tree.anchors {
+        let Some(target_binding) = target_binding(anchor.binding) else {
+            continue;
+        };
+        let Some((root, promoted_field)) = select_region(anchor.expression, &tree, ast_to_hir, tcx)
+        else {
+            continue;
+        };
+        selected.push(SelectedRegion {
+            root,
+            promoted_field,
+            lhs: false,
+            anchors: vec![AnchorPair {
+                source_binding: anchor.binding,
+                target_binding,
+            }],
+        });
+    }
+    merge_regions(&mut selected);
+    for region in &mut selected {
+        region.lhs = tree.parents.get(&region.root).is_some_and(|edge| {
+            edge.role == ParentRole::AssignLeft
+                && tree
+                    .expressions
+                    .get(&edge.parent)
+                    .is_some_and(|parent| matches!(parent.kind, ExprKind::Assign(..)))
+        });
+    }
+    (!regions_overlap(&selected, &tree)).then_some((tree, selected))
+}
+
+pub(crate) struct RuleRegion {
+    pub root: NodeId,
+    pub observation: Observation,
+    pub spellings: HashMap<String, String>,
+    pub source_syntax: Vec<String>,
+}
+
+pub(crate) fn select_rule_regions(
+    statement: &Stmt,
+    eligible: &HashMap<hir::HirId, TypeTree>,
+    ast_to_hir: &utils::ir::AstToHir,
+    tcx: TyCtxt<'_>,
+) -> Option<Vec<RuleRegion>> {
+    let Some(expression) = statement_expression(statement) else {
+        return Some(vec![]);
+    };
+    let mut opaque = HashSet::new();
+    struct NestedLabelCollector<'a> {
+        root: NodeId,
+        opaque: &'a mut HashSet<NodeId>,
+    }
+    impl<'ast> Visitor<'ast> for NestedLabelCollector<'_> {
+        fn visit_stmt(&mut self, statement: &'ast Stmt) {
+            if statement.id != self.root
+                && statement_attributes(statement)
+                    .iter()
+                    .any(|attribute| numeric_proctor_label(attribute).is_some())
+            {
+                if let Some(expression) = statement_expression(statement) {
+                    self.opaque.insert(expression.id);
+                }
+                return;
+            }
+            visit::walk_stmt(self, statement);
+        }
+    }
+    NestedLabelCollector {
+        root: statement.id,
+        opaque: &mut opaque,
+    }
+    .visit_stmt(statement);
+    let (tree, selected) = select_expression_regions(
+        expression,
+        opaque,
+        |binding| eligible.contains_key(&binding).then_some(binding),
+        ast_to_hir,
+        tcx,
+    )?;
+    selected
+        .into_iter()
+        .map(|region| {
+            let root = tree.expressions[&region.root];
+            let bindings = HashMap::new();
+            let callables = HashMap::new();
+            let mut context = DumpContext::new(&bindings, &callables, ast_to_hir, tcx);
+            let source_expression = context.expression(root)?;
+            let source_hir = ast_to_hir.get_expr(root.id, tcx)?;
+            let typeck = tcx.typeck(source_hir.hir_id.owner);
+            let source_type = context.type_tree(typeck.expr_ty(source_hir))?;
+            let source_adjusted_type = context.type_tree(typeck.expr_ty_adjusted(source_hir))?;
+            let mut pointer_anchors = vec![];
+            for anchor in &region.anchors {
+                let id = context.binding_id(anchor.source_binding, true)?;
+                pointer_anchors.push(PointerAnchor {
+                    id,
+                    source_type: context.type_tree(binding_type(anchor.source_binding, tcx)?)?,
+                    target_type: eligible.get(&anchor.source_binding)?.clone(),
+                });
+            }
+            let mut spellings = HashMap::new();
+            for (binding, id) in &context.binding_ids {
+                spellings.insert(id.clone(), tcx.hir_name(*binding).to_string());
+            }
+            for (definition, id) in &context.local_function_ids {
+                spellings.insert(id.clone(), tcx.item_name(*definition).to_string());
+            }
+            for (definition, id) in &context.adt_ids {
+                spellings.insert(id.clone(), tcx.item_name(*definition).to_string());
+            }
+            for (definition, id) in &context.field_ids {
+                spellings.insert(id.clone(), tcx.item_name(*definition).to_string());
+            }
+            for (definition, id) in &context.variant_ids {
+                spellings.insert(id.clone(), tcx.item_name(*definition).to_string());
+            }
+            for (definition, id) in &context.constant_ids {
+                spellings.insert(id.clone(), tcx.item_name(*definition).to_string());
+            }
+            for (definition, id) in &context.static_ids {
+                spellings.insert(id.clone(), tcx.item_name(*definition).to_string());
+            }
+            for (definition, id) in &context.method_ids {
+                spellings.insert(id.clone(), tcx.item_name(*definition).to_string());
+            }
+            struct SyntaxCollector<'a, 'context, 'tcx> {
+                context: &'a mut DumpContext<'context, 'tcx>,
+                syntax: Vec<String>,
+            }
+            impl<'ast> Visitor<'ast> for SyntaxCollector<'_, '_, '_> {
+                fn visit_expr(&mut self, expression: &'ast Expr) {
+                    if self.context.expression(expression).is_some() {
+                        let mut rendered = expression.clone();
+                        rendered
+                            .attrs
+                            .retain(|attribute| numeric_proctor_label(attribute).is_none());
+                        self.syntax.push(pprust::expr_to_string(&rendered));
+                    }
+                    let mut normalized = expression;
+                    while let ExprKind::Paren(inner) = &normalized.kind {
+                        normalized = inner;
+                    }
+                    if normalized.id != expression.id {
+                        visit::walk_expr(self, normalized);
+                    } else {
+                        visit::walk_expr(self, expression);
+                    }
+                }
+            }
+            let mut syntax = SyntaxCollector {
+                context: &mut context,
+                syntax: vec![],
+            };
+            syntax.visit_expr(root);
+            Some(RuleRegion {
+                root: region.root,
+                observation: Observation {
+                    source_expression: source_expression.clone(),
+                    target_expression: source_expression,
+                    pointer_anchors,
+                    lhs: region.lhs,
+                    source_type: source_type.clone(),
+                    source_adjusted_type: source_adjusted_type.clone(),
+                    target_type: source_type,
+                    target_adjusted_type: source_adjusted_type,
+                },
+                spellings,
+                source_syntax: syntax.syntax,
+            })
+        })
+        .collect()
 }
 
 struct SelectedExpressions<'a> {
@@ -1664,7 +1839,8 @@ fn select_region(
                 }
             }
             ParentRole::Condition
-            | ParentRole::AssignOperand
+            | ParentRole::AssignLeft
+            | ParentRole::AssignRight
             | ParentRole::ReturnOperand
             | ParentRole::StructField
             | ParentRole::Boundary => 0,
@@ -2457,6 +2633,7 @@ fn dump_observation(
     source: &Expr,
     target: &Expr,
     anchors: &[AnchorPair],
+    lhs: bool,
     bindings: &HashMap<hir::HirId, hir::HirId>,
     callables: &HashMap<DefId, u64>,
     ast_to_hir: &utils::ir::AstToHir,
@@ -2486,6 +2663,7 @@ fn dump_observation(
         source_expression,
         target_expression,
         pointer_anchors,
+        lhs,
         source_type: context.type_tree(source_typeck.expr_ty(source_hir))?,
         source_adjusted_type: context.type_tree(source_typeck.expr_ty_adjusted(source_hir))?,
         target_type: context.type_tree(target_typeck.expr_ty(target_hir))?,
@@ -2495,6 +2673,16 @@ fn dump_observation(
 
 fn binding_type<'tcx>(binding: hir::HirId, tcx: TyCtxt<'tcx>) -> Option<ty::Ty<'tcx>> {
     Some(tcx.typeck(binding.owner).node_type(binding))
+}
+
+pub(crate) fn semantic_type_tree<'tcx>(
+    value: ty::Ty<'tcx>,
+    ast_to_hir: &utils::ir::AstToHir,
+    tcx: TyCtxt<'tcx>,
+) -> Option<TypeTree> {
+    let bindings = HashMap::new();
+    let callables = HashMap::new();
+    DumpContext::new(&bindings, &callables, ast_to_hir, tcx).type_tree(value)
 }
 
 struct DumpContext<'a, 'tcx> {
@@ -2747,7 +2935,11 @@ impl<'a, 'tcx> DumpContext<'a, 'tcx> {
     }
 
     fn expression(&mut self, value: &Expr) -> Option<Expression> {
-        if !value.attrs.is_empty() {
+        if value
+            .attrs
+            .iter()
+            .any(|attribute| numeric_proctor_label(attribute).is_none())
+        {
             return None;
         }
         match &value.kind {
@@ -3665,6 +3857,7 @@ mod tests {
                     "arguments": []
                 },
                 "pointer_anchors": [anchor.clone()],
+                "lhs": false,
                 "source_type": bool_type.clone(),
                 "source_adjusted_type": bool_type.clone(),
                 "target_type": bool_type.clone(),
@@ -3691,6 +3884,7 @@ mod tests {
                     }
                 },
                 "pointer_anchors": [anchor],
+                "lhs": false,
                 "source_type": primitive.clone(),
                 "source_adjusted_type": primitive.clone(),
                 "target_type": primitive.clone(),
@@ -4734,7 +4928,7 @@ unsafe fn values(pointer: *const i32) -> i32 {
     }
 
     #[test]
-    fn unsupported_dump_node_discards_only_mapped_observation() {
+    fn unsupported_dump_node_discards_all_regions_from_the_statement() {
         let source = r#"
 unsafe fn read(left: &i32, right: &i32) -> i32 { #[proctor(0)] (|| *left)() + *right }
 unsafe fn __proctor_source_read(left: *const i32, right: *const i32) -> i32 {
@@ -4742,16 +4936,7 @@ unsafe fn __proctor_source_read(left: *const i32, right: *const i32) -> i32 {
 }
 "#;
         let document = extract(source).unwrap();
-        assert_eq!(document.observations.len(), 1);
-        assert_eq!(
-            document.observations[0].source_expression,
-            Expression::Unary {
-                operator: UnaryOperator::Deref,
-                operand: Box::new(Expression::Path {
-                    value: ValueIdentity::Binding { id: "<id0>".into() }
-                })
-            }
-        );
+        assert!(document.observations.is_empty());
     }
 
     #[test]
@@ -4989,6 +5174,27 @@ unsafe fn __proctor_source_read(pointer: *const i32) -> i32 { #[proctor(0)] *poi
     }
 
     #[test]
+    fn complete_plain_assignment_left_region_is_marked_lhs() {
+        let source = r#"
+unsafe fn source_copy(mut left: *mut i32, mut right: *mut i32) {
+    #[proctor(0)] left = right;
+}
+unsafe fn target(mut left: *mut i32, mut right: *mut i32) {
+    #[proctor(0)] left = right;
+}
+"#;
+        let document = extract_case(source, "source_copy", "target", vec![0]).unwrap();
+        assert_eq!(
+            document
+                .observations
+                .iter()
+                .map(|observation| observation.lhs)
+                .collect::<Vec<_>>(),
+            vec![true, false]
+        );
+    }
+
+    #[test]
     fn raw_receiver_allowlist_grows_through_deref() {
         let source = r#"
 unsafe fn source_copy(mut pointer: *const i32, mut index: usize) -> i32 {
@@ -5040,6 +5246,7 @@ unsafe fn target(mut pointer: &[i32], mut index: usize) -> i32 {
                         }
                     }
                 }],
+                "lhs": false,
                 "source_type": primitive.clone(),
                 "source_adjusted_type": primitive.clone(),
                 "target_type": primitive.clone(),

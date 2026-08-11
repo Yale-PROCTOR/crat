@@ -8,107 +8,200 @@ use rustc_ast::{
 use rustc_ast_pretty::pprust;
 use thin_vec::ThinVec;
 
+use crate::{SkeletonView, StatementDisposition, StatementDispositionKind};
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PreservationError {
     pub code: &'static str,
     pub message: String,
 }
 
-pub(crate) fn validate_preservation_metadata(
+pub(crate) fn make_disposition_forest(
     item: &Item,
-    needs_transformation: bool,
-    statements_requiring_transformation: &[u32],
-) -> Result<(), PreservationError> {
-    if needs_transformation == statements_requiring_transformation.is_empty() {
-        return Err(metadata_error(
-            "inconsistent_preservation_metadata",
-            "`needs_transformation` must equal whether `statements_requiring_transformation` is nonempty",
-        ));
-    }
-    if statements_requiring_transformation
-        .windows(2)
-        .any(|pair| pair[0] >= pair[1])
+    transformed: &HashSet<u32>,
+    rule_applied: &HashSet<u32>,
+) -> Result<Vec<StatementDisposition>, PreservationError> {
+    let topology = collect_label_topology(item)?;
+    let parents = topology.iter().copied().collect::<HashMap<_, _>>();
+    if let Some(label) = transformed
+        .union(rule_applied)
+        .find(|label| !parents.contains_key(label))
     {
         return Err(metadata_error(
-            "invalid_transformation_labels",
-            "`statements_requiring_transformation` must be strictly increasing and unique",
+            "unknown_disposition_label",
+            format!("disposition label {label} does not occur in the skeleton"),
         ));
     }
+    if let Some(label) = transformed.intersection(rule_applied).next() {
+        return Err(metadata_error(
+            "conflicting_disposition",
+            format!("label {label} cannot be both transform and rule_applied"),
+        ));
+    }
+    fn build(
+        parent: Option<u32>,
+        topology: &[(u32, Option<u32>)],
+        transformed: &HashSet<u32>,
+        rule_applied: &HashSet<u32>,
+    ) -> Vec<StatementDisposition> {
+        let labels = topology
+            .iter()
+            .filter_map(|(label, actual)| (*actual == parent).then_some(*label))
+            .collect::<Vec<_>>();
+        labels
+            .into_iter()
+            .map(|label| StatementDisposition {
+                label,
+                disposition: if transformed.contains(&label) {
+                    StatementDispositionKind::Transform
+                } else if rule_applied.contains(&label) {
+                    StatementDispositionKind::RuleApplied
+                } else {
+                    StatementDispositionKind::Preserve
+                },
+                children: build(Some(label), topology, transformed, rule_applied),
+            })
+            .collect()
+    }
+    Ok(build(None, &topology, transformed, rule_applied))
+}
 
-    let parents = collect_label_parents(item)?;
-    let all_labels = parents.keys().copied().collect::<HashSet<_>>();
-    let transformed = statements_requiring_transformation
-        .iter()
-        .copied()
-        .collect::<HashSet<_>>();
-    if let Some(label) = statements_requiring_transformation
-        .iter()
-        .find(|label| !all_labels.contains(label))
-    {
-        return Err(metadata_error(
-            "unknown_transformation_label",
-            format!("transformation label {label} does not occur in the annotated target skeleton"),
-        ));
-    }
-    for label in statements_requiring_transformation {
-        let mut parent = parents[label];
-        while let Some(ancestor) = parent {
-            if !transformed.contains(&ancestor) {
+pub(crate) fn validate_skeleton_view(
+    item: &Item,
+    view: &SkeletonView,
+) -> Result<(), PreservationError> {
+    let topology = collect_label_topology(item)?;
+    let mut flattened = vec![];
+    fn flatten(
+        nodes: &[StatementDisposition],
+        parent: Option<u32>,
+        flattened: &mut Vec<(u32, Option<u32>, StatementDispositionKind)>,
+    ) -> Result<(), PreservationError> {
+        for node in nodes {
+            flattened.push((node.label, parent, node.disposition));
+            if node.disposition == StatementDispositionKind::Preserve
+                && node
+                    .children
+                    .iter()
+                    .any(|child| child.disposition != StatementDispositionKind::Preserve)
+            {
                 return Err(metadata_error(
                     "open_preserved_parent",
                     format!(
-                        "preserved label {ancestor} contains transformed descendant label {label}"
+                        "preserved label {} contains a non-preserved child",
+                        node.label
                     ),
                 ));
             }
-            parent = parents[&ancestor];
+            flatten(&node.children, Some(node.label), flattened)?;
         }
+        Ok(())
+    }
+    flatten(&view.statement_dispositions, None, &mut flattened)?;
+    if flattened.len() != topology.len() {
+        return Err(metadata_error(
+            "invalid_disposition_tree",
+            "statement disposition tree does not contain every skeleton label exactly once",
+        ));
+    }
+    let mut seen = HashSet::new();
+    for (index, (label, parent, _)) in flattened.iter().enumerate() {
+        if !seen.insert(*label) || topology.get(index) != Some(&(*label, *parent)) {
+            return Err(metadata_error(
+                "invalid_disposition_tree",
+                format!("statement disposition label {label} has invalid topology"),
+            ));
+        }
+    }
+    let transform_labels = flattened
+        .iter()
+        .filter_map(|(label, _, disposition)| {
+            (*disposition == StatementDispositionKind::Transform).then_some(*label)
+        })
+        .collect::<Vec<_>>();
+    if view.needs_transformation == transform_labels.is_empty() {
+        return Err(metadata_error(
+            "inconsistent_preservation_metadata",
+            "`needs_transformation` must equal whether a recursive disposition is `transform`",
+        ));
+    }
+    let metadata_labels = view
+        .statement_pair_metadata
+        .iter()
+        .map(|metadata| metadata.label)
+        .collect::<Vec<_>>();
+    if metadata_labels != transform_labels {
+        return Err(metadata_error(
+            "invalid_statement_pair_metadata",
+            "statement-pair metadata labels must equal transform labels in depth-first order",
+        ));
     }
     Ok(())
 }
 
-pub(crate) fn canonicalize_function(
-    expected: &Item,
-    result: &Item,
-    needs_transformation: bool,
-    statements_requiring_transformation: &[u32],
-) -> Result<P<Item>, PreservationError> {
-    canonicalize_function_impl(
-        expected,
-        result,
-        needs_transformation,
-        statements_requiring_transformation,
-        false,
-    )
+pub(crate) fn validate_cross_view_topology(
+    baseline: &Item,
+    applied: &Item,
+) -> Result<(), PreservationError> {
+    let baseline = collect_label_data(baseline)?;
+    let applied = collect_label_data(applied)?;
+    if baseline.topology != applied.topology || baseline.shells != applied.shells {
+        return Err(metadata_error(
+            "cross_view_topology_mismatch",
+            "baseline and applied skeletons have different depth-first label/control topology",
+        ));
+    }
+    Ok(())
 }
 
-pub(crate) fn canonicalize_function_for_replacement(
+pub(crate) fn canonicalize_function_with_view(
     expected: &Item,
     result: &Item,
-    needs_transformation: bool,
-    statements_requiring_transformation: &[u32],
-) -> Result<P<Item>, PreservationError> {
-    canonicalize_function_impl(
-        expected,
-        result,
-        needs_transformation,
-        statements_requiring_transformation,
-        true,
-    )
-}
-
-fn canonicalize_function_impl(
-    expected: &Item,
-    result: &Item,
-    needs_transformation: bool,
-    statements_requiring_transformation: &[u32],
+    view: &SkeletonView,
     require_complete_alignment: bool,
 ) -> Result<P<Item>, PreservationError> {
-    validate_preservation_metadata(
+    validate_skeleton_view(expected, view)?;
+    let mut transformed = HashSet::new();
+    let mut rule_applied = HashSet::new();
+    fn collect(
+        nodes: &[StatementDisposition],
+        transformed: &mut HashSet<u32>,
+        rule_applied: &mut HashSet<u32>,
+    ) {
+        for node in nodes {
+            match node.disposition {
+                StatementDispositionKind::Transform => {
+                    transformed.insert(node.label);
+                }
+                StatementDispositionKind::RuleApplied => {
+                    rule_applied.insert(node.label);
+                }
+                StatementDispositionKind::Preserve => {}
+            }
+            collect(&node.children, transformed, rule_applied);
+        }
+    }
+    collect(
+        &view.statement_dispositions,
+        &mut transformed,
+        &mut rule_applied,
+    );
+    canonicalize_function_impl_sets(
         expected,
-        needs_transformation,
-        statements_requiring_transformation,
-    )?;
+        result,
+        &transformed,
+        &rule_applied,
+        require_complete_alignment,
+    )
+}
+
+fn canonicalize_function_impl_sets(
+    expected: &Item,
+    result: &Item,
+    transformed: &HashSet<u32>,
+    rule_applied: &HashSet<u32>,
+    require_complete_alignment: bool,
+) -> Result<P<Item>, PreservationError> {
     let ItemKind::Fn(box expected_function) = &expected.kind else {
         return Err(metadata_error(
             "invalid_expected_skeleton",
@@ -116,7 +209,8 @@ fn canonicalize_function_impl(
         ));
     };
     if !require_complete_alignment
-        && collect_label_parents(expected)?.len() == statements_requiring_transformation.len()
+        && rule_applied.is_empty()
+        && collect_label_parents(expected)?.len() == transformed.len()
     {
         return Ok(P(result.clone()));
     }
@@ -131,8 +225,8 @@ fn canonicalize_function_impl(
         unreachable!("the expected item was checked above")
     };
     result_function.body = returned_function.body.clone();
-    let transformed = statements_requiring_transformation
-        .iter()
+    let editable_shells = transformed
+        .union(rule_applied)
         .copied()
         .collect::<HashSet<_>>();
     canonicalize_statement_list(
@@ -147,7 +241,8 @@ fn canonicalize_function_impl(
             .expect("returned function has a body")
             .stmts,
         false,
-        &transformed,
+        &editable_shells,
+        rule_applied,
     )?;
     Ok(canonical)
 }
@@ -167,6 +262,19 @@ fn structural_error(code: &'static str, message: impl Into<String>) -> Preservat
 }
 
 fn collect_label_parents(item: &Item) -> Result<HashMap<u32, Option<u32>>, PreservationError> {
+    Ok(collect_label_topology(item)?.into_iter().collect())
+}
+
+fn collect_label_topology(item: &Item) -> Result<Vec<(u32, Option<u32>)>, PreservationError> {
+    collect_label_data(item).map(|data| data.topology)
+}
+
+struct LabelData {
+    topology: Vec<(u32, Option<u32>)>,
+    shells: Vec<(u32, String)>,
+}
+
+fn collect_label_data(item: &Item) -> Result<LabelData, PreservationError> {
     let ItemKind::Fn(box function) = &item.kind else {
         return Err(metadata_error(
             "invalid_expected_skeleton",
@@ -184,6 +292,8 @@ fn collect_label_parents(item: &Item) -> Result<HashMap<u32, Option<u32>>, Prese
     })?;
     let mut collector = LabelTreeCollector {
         parents: HashMap::new(),
+        topology: vec![],
+        shells: vec![],
         parent: None,
         error: None,
     };
@@ -195,12 +305,17 @@ fn collect_label_parents(item: &Item) -> Result<HashMap<u32, Option<u32>>, Prese
     );
     match collector.error {
         Some(error) => Err(error),
-        None => Ok(collector.parents),
+        None => Ok(LabelData {
+            topology: collector.topology,
+            shells: collector.shells,
+        }),
     }
 }
 
 struct LabelTreeCollector {
     parents: HashMap<u32, Option<u32>>,
+    topology: Vec<(u32, Option<u32>)>,
+    shells: Vec<(u32, String)>,
     parent: Option<u32>,
     error: Option<PreservationError>,
 }
@@ -230,6 +345,24 @@ impl LabelTreeCollector {
             ));
             return;
         }
+        self.topology.push((label, self.parent));
+        let statement_kind = match &statement.kind {
+            StmtKind::Let(local) => match local.kind {
+                LocalKind::Decl => "let_declaration",
+                LocalKind::Init(_) => "let_initializer",
+                LocalKind::InitElse(..) => "let_else",
+            },
+            StmtKind::Expr(_) => "tail_expression",
+            StmtKind::Semi(_) => "semicolon_expression",
+            StmtKind::Item(_) => "item",
+            StmtKind::Empty => "empty",
+            StmtKind::MacCall(_) => "macro",
+        };
+        let control = control_root(statement, false)
+            .map(|root| format!("{:?}:{:?}", root.kind, root.role))
+            .unwrap_or_else(|| "payload".to_owned());
+        self.shells
+            .push((label, format!("{statement_kind}:{control}")));
         if non_control_payload(statement).is_some_and(contains_statement_label) {
             self.error = Some(metadata_error(
                 "invalid_expected_skeleton",
@@ -523,6 +656,7 @@ fn canonicalize_statement_list(
     result: &mut ThinVec<Stmt>,
     arm_tail: bool,
     transformed: &HashSet<u32>,
+    rule_applied: &HashSet<u32>,
 ) -> Result<(), PreservationError> {
     let expected_groups = groups(expected);
     let result_groups = groups(result);
@@ -614,6 +748,12 @@ fn canonicalize_statement_list(
                 ));
             }
         }
+        if rule_applied.contains(&label) && result_group.statements.len() != 1 {
+            return Err(structural_error(
+                "rule_applied_expansion",
+                format!("rule-applied label {label} must remain exactly one statement"),
+            ));
+        }
         if transformed.contains(&label) {
             canonicalize_transformed_group(
                 &expected_group.statements[0],
@@ -621,6 +761,7 @@ fn canonicalize_statement_list(
                 arm_tail,
                 label,
                 transformed,
+                rule_applied,
             )?;
         }
     }
@@ -640,7 +781,7 @@ fn canonicalize_statement_list(
 
     for expected_group in expected_groups.iter().rev() {
         let label = expected_group.label.expect("expected labels were checked");
-        if transformed.contains(&label) {
+        if transformed.contains(&label) && !rule_applied.contains(&label) {
             continue;
         }
         let current_groups = groups(result);
@@ -653,9 +794,19 @@ fn canonicalize_statement_list(
                 format!("preserved label {label} is not locatable"),
             ));
         };
+        let restored = if rule_applied.contains(&label) {
+            restore_rule_applied_statement(
+                &expected_group.statements[0],
+                &result[result_group.start..result_group.end],
+                arm_tail,
+                label,
+            )?
+        } else {
+            expected_group.statements[0].clone()
+        };
         result.splice(
             result_group.start..result_group.end,
-            std::iter::once(expected_group.statements[0].clone()),
+            std::iter::once(restored),
         );
     }
     Ok(())
@@ -667,6 +818,7 @@ fn canonicalize_transformed_group(
     arm_tail: bool,
     label: u32,
     transformed: &HashSet<u32>,
+    rule_applied: &HashSet<u32>,
 ) -> Result<(), PreservationError> {
     if let StmtKind::Let(expected_local) = &expected.kind
         && let LocalKind::InitElse(_, expected_else) = &expected_local.kind
@@ -708,6 +860,7 @@ fn canonicalize_transformed_group(
             &mut result_else.stmts,
             false,
             transformed,
+            rule_applied,
             &scope,
         );
     }
@@ -765,7 +918,134 @@ fn canonicalize_transformed_group(
         result_control.expression,
         label,
         transformed,
+        rule_applied,
     )
+}
+
+fn restore_rule_applied_statement(
+    expected: &Stmt,
+    returned_group: &[Stmt],
+    arm_tail: bool,
+    label: u32,
+) -> Result<Stmt, PreservationError> {
+    let mut restored = expected.clone();
+    if let StmtKind::Let(expected_local) = &mut restored.kind
+        && let LocalKind::InitElse(_, expected_else) = &mut expected_local.kind
+    {
+        let returned = returned_group.iter().find_map(|statement| {
+            let StmtKind::Let(local) = &statement.kind else {
+                return None;
+            };
+            let LocalKind::InitElse(_, else_block) = &local.kind else {
+                return None;
+            };
+            Some(else_block)
+        });
+        let Some(returned) = returned else {
+            return Err(structural_error(
+                "missing_control_root",
+                format!("label {label} lost its let-else descendant slots"),
+            ));
+        };
+        expected_else.stmts = returned.stmts.clone();
+        return Ok(restored);
+    }
+    let Some(expected_control) = control_root_mut(&mut restored, arm_tail) else {
+        return Ok(restored);
+    };
+    let returned_controls = returned_group
+        .iter()
+        .filter_map(|statement| control_root(statement, arm_tail))
+        .collect::<Vec<_>>();
+    if returned_controls.len() != 1 {
+        return Err(structural_error(
+            "missing_control_root",
+            format!("label {label} lost its rule-applied descendant slots"),
+        ));
+    }
+    copy_control_descendants(expected_control.expression, returned_controls[0].expression)?;
+    Ok(restored)
+}
+
+fn copy_control_descendants(expected: &mut Expr, returned: &Expr) -> Result<(), PreservationError> {
+    match (&mut expected.kind, &returned.kind) {
+        (
+            ExprKind::If(_, expected_then, expected_else),
+            ExprKind::If(_, returned_then, returned_else),
+        ) => {
+            expected_then.stmts = returned_then.stmts.clone();
+            copy_else_descendants(expected_else.as_deref_mut(), returned_else.as_deref())
+        }
+        (ExprKind::While(_, expected_body, _), ExprKind::While(_, returned_body, _))
+        | (ExprKind::Loop(expected_body, ..), ExprKind::Loop(returned_body, ..))
+        | (ExprKind::Block(expected_body, ..), ExprKind::Block(returned_body, ..)) => {
+            expected_body.stmts = returned_body.stmts.clone();
+            Ok(())
+        }
+        (
+            ExprKind::ForLoop {
+                body: expected_body,
+                ..
+            },
+            ExprKind::ForLoop {
+                body: returned_body,
+                ..
+            },
+        ) => {
+            expected_body.stmts = returned_body.stmts.clone();
+            Ok(())
+        }
+        (ExprKind::Match(_, expected_arms, _), ExprKind::Match(_, returned_arms, _)) => {
+            for (expected_arm, returned_arm) in expected_arms.iter_mut().zip(returned_arms) {
+                let (Some(expected_body), Some(returned_body)) =
+                    (&mut expected_arm.body, &returned_arm.body)
+                else {
+                    return Err(structural_error(
+                        "match_arm_shape_mismatch",
+                        "rule-applied match arm lost its block body",
+                    ));
+                };
+                let (ExprKind::Block(expected_block, _), ExprKind::Block(returned_block, _)) =
+                    (&mut expected_body.kind, &returned_body.kind)
+                else {
+                    return Err(structural_error(
+                        "match_arm_shape_mismatch",
+                        "rule-applied match arm lost its block body",
+                    ));
+                };
+                expected_block.stmts = returned_block.stmts.clone();
+            }
+            Ok(())
+        }
+        _ => Err(structural_error(
+            "control_kind_mismatch",
+            "rule-applied control changed shape",
+        )),
+    }
+}
+
+fn copy_else_descendants(
+    expected: Option<&mut Expr>,
+    returned: Option<&Expr>,
+) -> Result<(), PreservationError> {
+    match (expected, returned) {
+        (None, None) => Ok(()),
+        (Some(expected), Some(returned)) => match (&mut expected.kind, &returned.kind) {
+            (ExprKind::Block(expected, _), ExprKind::Block(returned, _)) => {
+                expected.stmts = returned.stmts.clone();
+                Ok(())
+            }
+            (ExprKind::If(..), ExprKind::If(..)) => copy_control_descendants(expected, returned),
+            _ => Err(structural_error(
+                "branch_shape_mismatch",
+                "rule-applied else branch changed shape",
+            )),
+        },
+        _ => Err(structural_error(
+            "branch_shape_mismatch",
+            "rule-applied statement changed else-branch presence",
+        )),
+    }
 }
 
 fn canonicalize_control(
@@ -773,6 +1053,7 @@ fn canonicalize_control(
     result: &mut Expr,
     label: u32,
     transformed: &HashSet<u32>,
+    rule_applied: &HashSet<u32>,
 ) -> Result<(), PreservationError> {
     let scope = expression_labels(result);
     match (&expected.kind, &mut result.kind) {
@@ -785,6 +1066,7 @@ fn canonicalize_control(
                 &mut result_then.stmts,
                 false,
                 transformed,
+                rule_applied,
                 &scope,
             )?;
             canonicalize_else(
@@ -792,6 +1074,7 @@ fn canonicalize_control(
                 result_else.as_deref_mut(),
                 label,
                 transformed,
+                rule_applied,
                 &scope,
             )
         }
@@ -803,6 +1086,7 @@ fn canonicalize_control(
                 &mut result_body.stmts,
                 false,
                 transformed,
+                rule_applied,
                 &scope,
             )
         }
@@ -819,6 +1103,7 @@ fn canonicalize_control(
             &mut result_body.stmts,
             false,
             transformed,
+            rule_applied,
             &scope,
         ),
         (ExprKind::Match(_, expected_arms, _), ExprKind::Match(_, result_arms, _)) => {
@@ -862,6 +1147,7 @@ fn canonicalize_control(
                     &mut result_block.stmts,
                     true,
                     transformed,
+                    rule_applied,
                     &scope,
                 )?;
             }
@@ -879,6 +1165,7 @@ fn canonicalize_else(
     result: Option<&mut Expr>,
     label: u32,
     transformed: &HashSet<u32>,
+    rule_applied: &HashSet<u32>,
     scope: &HashSet<u32>,
 ) -> Result<(), PreservationError> {
     match (expected, result) {
@@ -893,6 +1180,7 @@ fn canonicalize_else(
                         &mut result.stmts,
                         false,
                         transformed,
+                        rule_applied,
                         scope,
                     )
                 }
@@ -905,6 +1193,7 @@ fn canonicalize_else(
                         &mut result_then.stmts,
                         false,
                         transformed,
+                        rule_applied,
                         scope,
                     )?;
                     canonicalize_else(
@@ -912,6 +1201,7 @@ fn canonicalize_else(
                         result_else.as_deref_mut(),
                         label,
                         transformed,
+                        rule_applied,
                         scope,
                     )
                 }
@@ -933,13 +1223,14 @@ fn canonicalize_nested_statement_list(
     result: &mut ThinVec<Stmt>,
     arm_tail: bool,
     transformed: &HashSet<u32>,
+    rule_applied: &HashSet<u32>,
     scope: &HashSet<u32>,
 ) -> Result<(), PreservationError> {
     let local_labels = groups(result)
         .into_iter()
         .filter_map(|group| group.label)
         .collect::<HashSet<_>>();
-    match canonicalize_statement_list(expected, result, arm_tail, transformed) {
+    match canonicalize_statement_list(expected, result, arm_tail, transformed, rule_applied) {
         Err(error) if matches!(error.code, "missing_label" | "label_order_mismatch") => {
             let misplaced = groups(expected).into_iter().find_map(|group| {
                 let label = group.label?;

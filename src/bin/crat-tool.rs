@@ -1,6 +1,12 @@
 #![feature(rustc_private)]
 
-use std::path::{Path, PathBuf};
+use std::{
+    collections::HashSet,
+    fs::OpenOptions,
+    io::Write,
+    path::{Path, PathBuf},
+    sync::atomic::{AtomicU64, Ordering},
+};
 
 use clap::{Parser, Subcommand};
 use serde::Serialize;
@@ -18,6 +24,8 @@ enum Command {
     MakeSkeleton {
         #[arg(long)]
         output: PathBuf,
+        #[arg(long)]
+        rules: Option<PathBuf>,
         input: PathBuf,
     },
     Validate {
@@ -51,6 +59,17 @@ enum Command {
         output: PathBuf,
         observation_source: PathBuf,
     },
+    SynthesizeRules {
+        #[arg(long)]
+        output: PathBuf,
+        #[arg(num_args = 1..)]
+        observations: Vec<PathBuf>,
+    },
+    MergeObservations {
+        #[arg(long)]
+        output: PathBuf,
+        observations: Vec<PathBuf>,
+    },
 }
 
 #[derive(Serialize)]
@@ -71,22 +90,137 @@ fn serialize_replacement_outputs(
 
 fn validate_replace_output_paths(paths: &[&Path]) -> Result<(), String> {
     for (index, path) in paths.iter().enumerate() {
-        if paths[..index].contains(path) {
-            return Err("output paths must be pairwise distinct".to_owned());
+        for other in &paths[..index] {
+            if paths_alias(path, other)? {
+                return Err("output paths must be pairwise distinct".to_owned());
+            }
+        }
+    }
+    Ok(())
+}
+
+fn resolved_path(path: &Path) -> Result<PathBuf, String> {
+    match std::fs::canonicalize(path) {
+        Ok(path) => Ok(path),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let parent = path.parent().unwrap_or_else(|| Path::new("."));
+            let parent = std::fs::canonicalize(parent).map_err(|error| {
+                format!("failed to resolve parent of {}: {error}", path.display())
+            })?;
+            let name = path
+                .file_name()
+                .ok_or_else(|| format!("path has no file name: {}", path.display()))?;
+            Ok(parent.join(name))
+        }
+        Err(error) => Err(format!("failed to resolve {}: {error}", path.display())),
+    }
+}
+
+fn paths_alias(left: &Path, right: &Path) -> Result<bool, String> {
+    Ok(resolved_path(left)? == resolved_path(right)?)
+}
+
+fn validate_output_input_paths(outputs: &[&Path], inputs: &[&Path]) -> Result<(), String> {
+    validate_replace_output_paths(outputs)?;
+    for output in outputs {
+        for input in inputs {
+            if paths_alias(output, input)? {
+                return Err(format!(
+                    "output {} aliases input {}",
+                    output.display(),
+                    input.display()
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_observation_inputs(paths: &[PathBuf]) -> Result<(), String> {
+    let mut resolved = HashSet::new();
+    for path in paths {
+        let metadata = std::fs::symlink_metadata(path)
+            .map_err(|error| format!("failed to inspect {}: {error}", path.display()))?;
+        if metadata.file_type().is_symlink() {
+            return Err(format!(
+                "observation input must not be a symlink: {}",
+                path.display()
+            ));
+        }
+        let canonical = std::fs::canonicalize(path)
+            .map_err(|error| format!("failed to resolve {}: {error}", path.display()))?;
+        if !resolved.insert(canonical) {
+            return Err("observation input path is repeated".to_owned());
         }
     }
     Ok(())
 }
 
 fn fail(code: &str, message: impl std::fmt::Display) -> ! {
+    let message = message
+        .to_string()
+        .chars()
+        .map(|character| {
+            if character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect::<String>();
     eprintln!("crat-tool: {code}: {message}");
     std::process::exit(1)
 }
 
-fn temporary_path(path: &Path) -> PathBuf {
+static PUBLICATION_NONCE: AtomicU64 = AtomicU64::new(0);
+
+fn fresh_publication_path(path: &Path, role: &str) -> PathBuf {
     let mut value = path.as_os_str().to_owned();
-    value.push(".tmp");
+    value.push(format!(
+        ".{role}.{}.{}",
+        std::process::id(),
+        PUBLICATION_NONCE.fetch_add(1, Ordering::Relaxed)
+    ));
     PathBuf::from(value)
+}
+
+fn fresh_unused_publication_path(path: &Path, role: &str) -> Result<PathBuf, String> {
+    loop {
+        let candidate = fresh_publication_path(path, role);
+        match std::fs::symlink_metadata(&candidate) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(candidate),
+            Ok(_) => continue,
+            Err(error) => {
+                return Err(format!(
+                    "failed to inspect publication path {}: {error}",
+                    candidate.display()
+                ));
+            }
+        }
+    }
+}
+
+fn stage_file(path: &Path, bytes: &[u8]) -> Result<PathBuf, String> {
+    loop {
+        let temporary = fresh_publication_path(path, "tmp");
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)
+        {
+            Ok(mut file) => {
+                if let Err(error) = file.write_all(bytes).and_then(|_| file.sync_all()) {
+                    let _ = std::fs::remove_file(&temporary);
+                    return Err(format!("failed to write {}: {error}", temporary.display()));
+                }
+                return Ok(temporary);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                return Err(format!("failed to create {}: {error}", temporary.display()));
+            }
+        }
+    }
 }
 
 fn clear_regular_or_symlink(path: &Path) -> Result<(), String> {
@@ -117,50 +251,84 @@ fn validate_clearable(path: &Path) -> Result<(), String> {
 }
 
 fn prepare_publish_destinations(paths: &[&Path]) -> Result<(), String> {
-    let owned = paths
-        .iter()
-        .flat_map(|path| [(*path).to_path_buf(), temporary_path(path)])
-        .collect::<Vec<_>>();
-    for path in &owned {
+    for path in paths {
         validate_clearable(path)?;
-    }
-    for path in &owned {
-        clear_regular_or_symlink(path)?;
     }
     Ok(())
 }
 
 fn publish_files(files: &[(&Path, &[u8])]) -> Result<(), String> {
-    let temporaries = files
-        .iter()
-        .map(|(path, _)| temporary_path(path))
-        .collect::<Vec<_>>();
-    let result = (|| {
-        for ((path, bytes), temporary) in files.iter().zip(&temporaries) {
-            clear_regular_or_symlink(path)?;
-            clear_regular_or_symlink(temporary)?;
-            std::fs::write(temporary, bytes)
-                .map_err(|_| format!("failed to write {}", temporary.display()))?;
+    let mut temporaries = vec![];
+    for (path, bytes) in files {
+        match stage_file(path, bytes) {
+            Ok(temporary) => temporaries.push(temporary),
+            Err(error) => {
+                for temporary in &temporaries {
+                    let _ = clear_regular_or_symlink(temporary);
+                }
+                return Err(error);
+            }
         }
-        for ((path, _), temporary) in files.iter().zip(&temporaries) {
-            std::fs::rename(temporary, path).map_err(|_| {
-                format!(
-                    "failed to rename {} to {}",
+    }
+    let mut backups = vec![];
+    for (path, _) in files {
+        match fresh_unused_publication_path(path, "backup") {
+            Ok(backup) => backups.push(backup),
+            Err(error) => {
+                for temporary in &temporaries {
+                    let _ = clear_regular_or_symlink(temporary);
+                }
+                return Err(error);
+            }
+        }
+    }
+    let result = (|| {
+        for (published, (((path, _), temporary), backup)) in
+            files.iter().zip(&temporaries).zip(&backups).enumerate()
+        {
+            let existed = std::fs::symlink_metadata(path).is_ok();
+            if existed {
+                std::fs::rename(path, backup).map_err(|error| {
+                    format!(
+                        "failed to preserve existing {} as {}: {error}",
+                        path.display(),
+                        backup.display()
+                    )
+                })?;
+            }
+            if let Err(error) = std::fs::rename(temporary, path) {
+                if existed {
+                    let _ = std::fs::rename(backup, path);
+                }
+                return Err(format!(
+                    "failed to rename {} to {}: {error}; published {published} earlier outputs",
                     temporary.display(),
                     path.display()
-                )
-            })?;
+                ));
+            }
         }
         Ok(())
     })();
     if let Err(primary) = result {
         let mut cleanup = vec![];
-        for path in files
-            .iter()
-            .map(|(path, _)| *path)
-            .chain(temporaries.iter().map(PathBuf::as_path))
-        {
-            if let Err(error) = clear_regular_or_symlink(path) {
+        for (((path, _), temporary), backup) in files.iter().zip(&temporaries).zip(&backups) {
+            if std::fs::symlink_metadata(backup).is_ok() {
+                if let Err(error) = clear_regular_or_symlink(path) {
+                    cleanup.push(error);
+                }
+                if let Err(error) = std::fs::rename(backup, path) {
+                    cleanup.push(format!(
+                        "failed to restore {} from {}: {error}",
+                        path.display(),
+                        backup.display()
+                    ));
+                }
+            } else if std::fs::symlink_metadata(temporary).is_err()
+                && let Err(error) = clear_regular_or_symlink(path)
+            {
+                cleanup.push(error);
+            }
+            if let Err(error) = clear_regular_or_symlink(temporary) {
                 cleanup.push(error);
             }
         }
@@ -170,27 +338,48 @@ fn publish_files(files: &[(&Path, &[u8])]) -> Result<(), String> {
             format!("{primary}; cleanup failed: {}", cleanup.join("; "))
         });
     }
+    for backup in &backups {
+        let _ = clear_regular_or_symlink(backup);
+    }
     Ok(())
 }
 
 fn main() {
     match Args::parse().command {
-        Command::MakeSkeleton { output, input } => {
+        Command::MakeSkeleton {
+            output,
+            rules,
+            input,
+        } => {
+            if let Some(rules) = rules.as_deref() {
+                validate_output_input_paths(&[&output], &[rules])
+                    .unwrap_or_else(|error| fail("output_path_collision", error));
+            }
             let lib_path = utils::find_lib_path(&input).unwrap_or_else(|error| {
                 eprintln!("{error}");
                 std::process::exit(1);
             });
             let source_path = input.join(lib_path);
             let source = std::fs::read_to_string(&source_path).unwrap();
-            let records =
-                run_compiler_on_path(&source_path, move |tcx| tools::make_skeletons(&source, tcx))
-                    .unwrap()
-                    .unwrap_or_else(|error| {
-                        eprintln!("{}: {}", error.function_path, error.message);
-                        std::process::exit(1);
-                    });
+            let rules = rules.map(|path| {
+                let text =
+                    std::fs::read_to_string(path).unwrap_or_else(|error| fail("rule_io", error));
+                tools::rule_document_from_json(&text)
+                    .unwrap_or_else(|error| fail("invalid_rules", error))
+            });
+            let records = run_compiler_on_path(&source_path, move |tcx| {
+                tools::make_skeletons_with_rules(&source, rules.as_ref(), tcx)
+            })
+            .unwrap()
+            .unwrap_or_else(|error| {
+                eprintln!("{}: {}", error.function_path, error.message);
+                std::process::exit(1);
+            });
             let json = tools::skeletons_to_json(&records).unwrap();
-            std::fs::write(output, json).unwrap();
+            prepare_publish_destinations(&[&output])
+                .unwrap_or_else(|error| fail("output_io", error));
+            publish_files(&[(&output, json.as_bytes())])
+                .unwrap_or_else(|error| fail("output_io", error));
         }
         Command::Validate { input, output } => {
             let request = std::fs::read_to_string(input).unwrap();
@@ -321,7 +510,72 @@ fn main() {
             let document =
                 tools::extract_observations_from_path(&observation_source, &metadata_value)
                     .unwrap_or_else(|error| fail(error.code, error.message));
-            let json = serde_json::to_string_pretty(&document).unwrap();
+            let json = tools::observation_document_to_json(&document)
+                .unwrap_or_else(|error| fail("invalid_observations", error));
+            publish_files(&[(&output, json.as_bytes())])
+                .unwrap_or_else(|error| fail("output_io", error));
+        }
+        Command::SynthesizeRules {
+            output,
+            observations,
+        } => {
+            validate_observation_inputs(&observations)
+                .unwrap_or_else(|error| fail("observation_input", error));
+            validate_output_input_paths(
+                &[&output],
+                &observations
+                    .iter()
+                    .map(PathBuf::as_path)
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap_or_else(|error| fail("output_path_collision", error));
+            let documents = observations
+                .iter()
+                .map(|path| {
+                    let text = std::fs::read_to_string(path)
+                        .unwrap_or_else(|error| fail("observation_io", error));
+                    tools::observation_document_from_json(&text)
+                        .unwrap_or_else(|error| fail("invalid_observations", error))
+                })
+                .collect::<Vec<_>>();
+            let document = tools::synthesize_rules(&documents)
+                .unwrap_or_else(|error| fail("rule_synthesis", error));
+            let json = tools::rule_document_to_json(&document)
+                .unwrap_or_else(|error| fail("invalid_rules", error));
+            prepare_publish_destinations(&[&output])
+                .unwrap_or_else(|error| fail("output_io", error));
+            publish_files(&[(&output, json.as_bytes())])
+                .unwrap_or_else(|error| fail("output_io", error));
+        }
+        Command::MergeObservations {
+            output,
+            observations,
+        } => {
+            validate_observation_inputs(&observations)
+                .unwrap_or_else(|error| fail("observation_input", error));
+            validate_output_input_paths(
+                &[&output],
+                &observations
+                    .iter()
+                    .map(PathBuf::as_path)
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap_or_else(|error| fail("output_path_collision", error));
+            let documents = observations
+                .iter()
+                .map(|path| {
+                    let text = std::fs::read_to_string(path)
+                        .unwrap_or_else(|error| fail("observation_io", error));
+                    tools::observation_document_from_json(&text)
+                        .unwrap_or_else(|error| fail("invalid_observations", error))
+                })
+                .collect::<Vec<_>>();
+            let document = tools::merge_observation_documents(&documents)
+                .unwrap_or_else(|error| fail("observation_merge", error));
+            let json = tools::observation_document_to_json(&document)
+                .unwrap_or_else(|error| fail("invalid_observations", error));
+            prepare_publish_destinations(&[&output])
+                .unwrap_or_else(|error| fail("output_io", error));
             publish_files(&[(&output, json.as_bytes())])
                 .unwrap_or_else(|error| fail("output_io", error));
         }

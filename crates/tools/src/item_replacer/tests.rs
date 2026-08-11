@@ -1,16 +1,43 @@
 use utils::compilation::run_compiler_on_str;
 
 use super::*;
+use crate::{StatementDisposition, StatementDispositionKind, StatementPairMetadata};
+
+fn skeleton_view(skeleton: &str, transformed: Vec<u32>, needs: bool) -> SkeletonView {
+    with_parse_session(|| {
+        let krate = parse_crate(skeleton, ReplacementErrorKind::InvalidRequest)?;
+        let transformed_set = transformed.iter().copied().collect();
+        let statement_dispositions = crate::preservation::make_disposition_forest(
+            &krate.items[0],
+            &transformed_set,
+            &HashSet::new(),
+        )
+        .map_err(|problem| global_error(ReplacementErrorKind::InvalidRequest, problem.message))?;
+        Ok(SkeletonView {
+            skeleton: skeleton.to_owned(),
+            needs_transformation: needs,
+            statement_dispositions,
+            statement_pair_metadata: transformed
+                .into_iter()
+                .map(|label| StatementPairMetadata {
+                    label,
+                    before_statement: "test".to_owned(),
+                    pointer_variables_complete: true,
+                    pointer_variables: vec![],
+                })
+                .collect(),
+        })
+    })
+    .unwrap()
+}
 
 fn replacement_item(id: u64, path: impl Into<String>, name: impl Into<String>) -> ReplacementItem {
     let name = name.into();
     ReplacementItem {
         id,
         path: path.into(),
-        skeleton: format!("unsafe fn {name}() {{}}"),
+        view: skeleton_view(&format!("unsafe fn {name}() {{}}"), vec![], false),
         name,
-        needs_transformation: false,
-        statements_requiring_transformation: vec![],
     }
 }
 
@@ -25,9 +52,45 @@ fn preservation_item(
         id,
         path: path.to_owned(),
         name: name.to_owned(),
-        skeleton: skeleton.to_owned(),
-        needs_transformation: !transformed.is_empty(),
-        statements_requiring_transformation: transformed,
+        view: skeleton_view(skeleton, transformed.clone(), !transformed.is_empty()),
+    }
+}
+
+fn mixed_preservation_item(
+    skeleton: &str,
+    transformed: &[u32],
+    rule_applied: &[u32],
+) -> ReplacementItem {
+    let view = with_parse_session(|| {
+        let krate = parse_crate(skeleton, ReplacementErrorKind::InvalidRequest)?;
+        let statement_dispositions = crate::preservation::make_disposition_forest(
+            &krate.items[0],
+            &transformed.iter().copied().collect(),
+            &rule_applied.iter().copied().collect(),
+        )
+        .map_err(|problem| global_error(ReplacementErrorKind::InvalidRequest, problem.message))?;
+        Ok(SkeletonView {
+            skeleton: skeleton.to_owned(),
+            needs_transformation: !transformed.is_empty(),
+            statement_dispositions,
+            statement_pair_metadata: transformed
+                .iter()
+                .copied()
+                .map(|label| StatementPairMetadata {
+                    label,
+                    before_statement: "test".to_owned(),
+                    pointer_variables_complete: true,
+                    pointer_variables: vec![],
+                })
+                .collect(),
+        })
+    })
+    .unwrap();
+    ReplacementItem {
+        id: 7,
+        path: "f".to_owned(),
+        name: "f".to_owned(),
+        view,
     }
 }
 
@@ -36,7 +99,11 @@ fn request(path: &str, name: &str, transformation: &str) -> ReplacementRequest {
     let transformation =
         fully_annotated(transformation).unwrap_or_else(|| transformation.to_owned());
     if transformation.contains("#[proctor(") {
-        item.skeleton = transformation.clone();
+        item.view = skeleton_view(
+            &transformation,
+            item.view.transform_labels(),
+            item.view.needs_transformation,
+        );
     }
     ReplacementRequest {
         accepted_correspondence: vec![],
@@ -93,7 +160,12 @@ fn request_with_items(mut items: Vec<ReplacementItem>, transformation: &str) -> 
                         .is_some_and(|ident| ident.to_string() == requested.name)
                 })
                 .unwrap();
-            requested.skeleton = pprust::item_to_string(item);
+            let skeleton = pprust::item_to_string(item);
+            requested.view = skeleton_view(
+                &skeleton,
+                requested.view.transform_labels(),
+                requested.view.needs_transformation,
+            );
         }
         Ok(())
     })
@@ -451,12 +523,14 @@ unsafe fn odd(pointer: &i32, n: usize) -> i32 {
     #[proctor(0)] if n == 0 { #[proctor(1)] *pointer } else { #[proctor(2)] even(pointer, n - 1) }
 }
 "#;
+    let even_view = "unsafe fn even(pointer: &i32, n: usize) -> i32 { #[proctor(0)] if n == 0 { #[proctor(1)] *pointer } else { #[proctor(2)] odd(pointer, n - 1) } }";
+    let odd_view = "unsafe fn odd(pointer: &i32, n: usize) -> i32 { #[proctor(0)] if n == 0 { #[proctor(1)] *pointer } else { #[proctor(2)] even(pointer, n - 1) } }";
     let output = replace_extended(
         source,
         &request_with_items(
             vec![
-                preservation_item(7, "odd", "odd", "", vec![0, 1, 2]),
-                preservation_item(3, "even", "even", "", vec![0, 1, 2]),
+                preservation_item(7, "odd", "odd", odd_view, vec![0, 1, 2]),
+                preservation_item(3, "even", "even", even_view, vec![0, 1, 2]),
             ],
             target,
         ),
@@ -724,7 +798,7 @@ pub fn main() { unsafe { ::std::process::exit(main_0() as i32) } }
 fn versioned_request_json_round_trip_preserves_rust() {
     let json = r#"{
   "schema_version": 1,
-  "items": [{"id":7,"path":"f","name":"f","skeleton":"unsafe fn f(value: i32) -> i32 { #[proctor(0)] todo!() }","needs_transformation":true,"statements_requiring_transformation":[0]}],
+  "items": [{"id":7,"path":"f","name":"f","view":{"skeleton":"unsafe fn f(value: i32) -> i32 { #[proctor(0)] todo!() }","needs_transformation":true,"statement_dispositions":[{"label":0,"disposition":"transform","children":[]}],"statement_pair_metadata":[{"label":0,"before_statement":"test","pointer_variables_complete":true,"pointer_variables":[]}]}}],
   "transformation": "unsafe fn f(value: i32) -> i32 {\n #[proctor(0)]\n value + 1\n}",
   "accepted_correspondence": []
 }"#;
@@ -950,6 +1024,128 @@ unsafe fn validate_me(flag: bool, pointer: *mut i32) -> i32 {
 }
 
 #[test]
+fn replacement_independently_restores_mixed_rule_applied_topologies() {
+    let source =
+        "unsafe fn consume(_: i32) {} pub unsafe fn f(flag: bool) { if flag { consume(1); } }";
+    let cases = [
+        (
+            r#"unsafe fn f(flag: bool) {
+#[proctor(0)] if flag { #[proctor(1)] consume(1); }
+}"#,
+            vec![1],
+            vec![0],
+            r#"unsafe fn f(flag: bool) {
+#[proctor(0)] if !flag { #[proctor(1)] consume(5); }
+}"#,
+            "if flag { consume(5); }",
+        ),
+        (
+            r#"unsafe fn f(flag: bool) {
+#[proctor(0)] if true { #[proctor(1)] consume(2); }
+}"#,
+            vec![0],
+            vec![1],
+            r#"unsafe fn f(flag: bool) {
+#[proctor(0)] if flag { #[proctor(1)] consume(999); }
+}"#,
+            "if flag { consume(2); }",
+        ),
+    ];
+    for (skeleton, transformed, applied, transformation, expected) in cases {
+        let request = ReplacementRequest {
+            accepted_correspondence: vec![],
+            schema_version: 1,
+            items: vec![mixed_preservation_item(skeleton, &transformed, &applied)],
+            transformation: transformation.to_owned(),
+        };
+        let output = replace(source, &request).unwrap();
+        assert!(compact(&output).contains(expected), "{output}");
+    }
+}
+
+#[test]
+fn replacement_atomically_rejects_invalid_mixed_rule_applied_descendants() {
+    let source = "unsafe fn consume(_: i32) {} pub unsafe fn f(flag: bool) { if flag { consume(1); consume(2); } }";
+    let outer_rule = r#"unsafe fn f(flag: bool) {
+#[proctor(0)] if flag { #[proctor(1)] consume(1); #[proctor(2)] consume(2); }
+}"#;
+    let inner_rule = r#"unsafe fn f(flag: bool) {
+#[proctor(0)] if true { #[proctor(1)] consume(1); #[proctor(2)] consume(2); }
+}"#;
+    let cases = [
+        (
+            outer_rule,
+            vec![1, 2],
+            vec![0],
+            r#"unsafe fn f(flag: bool) { #[proctor(0)] if flag { #[proctor(1)] consume(1); } }"#,
+        ),
+        (
+            outer_rule,
+            vec![1, 2],
+            vec![0],
+            r#"unsafe fn f(flag: bool) { #[proctor(0)] if flag { #[proctor(1)] consume(1); #[proctor(2)] consume(2); #[proctor(1)] consume(3); } }"#,
+        ),
+        (
+            outer_rule,
+            vec![1, 2],
+            vec![0],
+            r#"unsafe fn f(flag: bool) { #[proctor(0)] if flag { #[proctor(2)] consume(2); #[proctor(1)] consume(1); } }"#,
+        ),
+        (
+            outer_rule,
+            vec![1, 2],
+            vec![0],
+            r#"unsafe fn f(flag: bool) { #[proctor(0)] if flag { #[proctor(1)] consume(1); } #[proctor(2)] consume(2); }"#,
+        ),
+        (
+            outer_rule,
+            vec![1, 2],
+            vec![0],
+            r#"unsafe fn f(flag: bool) { #[proctor(0)] if flag { if true { #[proctor(1)] consume(1); } #[proctor(2)] consume(2); } }"#,
+        ),
+        (
+            inner_rule,
+            vec![0, 2],
+            vec![1],
+            r#"unsafe fn f(flag: bool) { #[proctor(0)] if flag { #[proctor(2)] consume(2); } }"#,
+        ),
+        (
+            inner_rule,
+            vec![0, 2],
+            vec![1],
+            r#"unsafe fn f(flag: bool) { #[proctor(0)] if flag { #[proctor(1)] consume(1); #[proctor(1)] consume(3); #[proctor(2)] consume(2); } }"#,
+        ),
+        (
+            inner_rule,
+            vec![0, 2],
+            vec![1],
+            r#"unsafe fn f(flag: bool) { #[proctor(0)] if flag { #[proctor(2)] consume(2); #[proctor(1)] consume(1); } }"#,
+        ),
+        (
+            inner_rule,
+            vec![0, 2],
+            vec![1],
+            r#"unsafe fn f(flag: bool) { #[proctor(0)] if flag { #[proctor(2)] consume(2); } #[proctor(1)] consume(1); }"#,
+        ),
+        (
+            inner_rule,
+            vec![0, 2],
+            vec![1],
+            r#"unsafe fn f(flag: bool) { #[proctor(0)] if flag { if true { #[proctor(1)] consume(1); } #[proctor(2)] consume(2); } }"#,
+        ),
+    ];
+    for (skeleton, transformed, applied, transformation) in cases {
+        let request = ReplacementRequest {
+            accepted_correspondence: vec![],
+            schema_version: 1,
+            items: vec![mixed_preservation_item(skeleton, &transformed, &applied)],
+            transformation: transformation.to_owned(),
+        };
+        assert!(replace(source, &request).is_err(), "{transformation}");
+    }
+}
+
+#[test]
 fn replacement_rejects_extra_outer_groups_without_validator() {
     let source = "pub unsafe fn f(value: i32) -> i32 { value + 1 }";
     for transformation in [
@@ -1029,9 +1225,11 @@ fn metadata_failure_is_atomic() {
             id: 7,
             path: "f".to_owned(),
             name: "f".to_owned(),
-            skeleton: "unsafe fn f(value: i32) -> i32 { #[proctor(0)] value + 1 }".to_owned(),
-            needs_transformation: false,
-            statements_requiring_transformation: vec![0],
+            view: skeleton_view(
+                "unsafe fn f(value: i32) -> i32 { #[proctor(0)] value + 1 }",
+                vec![0],
+                false,
+            ),
         }],
         transformation: "unsafe fn f(value: i32) -> i32 { #[proctor(0)] 999 }".to_owned(),
     };
@@ -1057,14 +1255,35 @@ pub unsafe fn f(flag: bool, pointer: *mut i32) {
     let valid = "unsafe fn f(flag: bool, pointer: *mut i32) { #[proctor(0)] if flag { #[proctor(1)] let nested: i32 = 99; #[proctor(2)] (*pointer = 7); } else { #[proctor(3)] return; } }";
     let misplaced = "unsafe fn f(flag: bool, pointer: *mut i32) { #[proctor(0)] if flag { #[proctor(2)] (*pointer = 7); } else { #[proctor(1)] let nested: i32 = 99; #[proctor(3)] return; } }";
     for (labels, transformation, expected_code) in [
-        (vec![0, 2, 99], valid, "unknown_transformation_label"),
+        (vec![0, 2, 99], valid, "invalid_disposition_tree"),
         (vec![2], valid, "open_preserved_parent"),
         (vec![0, 2], misplaced, "descendant_location_mismatch"),
     ] {
+        let known_labels = labels
+            .iter()
+            .copied()
+            .filter(|label| *label != 99)
+            .collect();
+        let mut item = preservation_item(7, "f", "f", skeleton, known_labels);
+        if labels.contains(&99) {
+            item.view.statement_dispositions.push(StatementDisposition {
+                label: 99,
+                disposition: StatementDispositionKind::Transform,
+                children: vec![],
+            });
+            item.view
+                .statement_pair_metadata
+                .push(StatementPairMetadata {
+                    label: 99,
+                    before_statement: "test".to_owned(),
+                    pointer_variables_complete: true,
+                    pointer_variables: vec![],
+                });
+        }
         let request = ReplacementRequest {
             accepted_correspondence: vec![],
             schema_version: 1,
-            items: vec![preservation_item(7, "f", "f", skeleton, labels)],
+            items: vec![item],
             transformation: transformation.to_owned(),
         };
         let error = replace(source, &request).unwrap_err();
