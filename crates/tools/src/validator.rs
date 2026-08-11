@@ -402,10 +402,7 @@ fn validate_expected_skeleton(item: &Item, entry: &ExpectedFunction) -> Result<(
     Ok(())
 }
 
-pub(crate) fn validate_rule_application_shape(
-    item: &Item,
-    transformed: &BTreeSet<u32>,
-) -> Result<(), String> {
+pub(crate) fn validate_rule_application_shape(item: &Item) -> Result<(), String> {
     let ItemKind::Fn(box function) = &item.kind else {
         return Err("an applied skeleton item is not a function".to_owned());
     };
@@ -416,12 +413,9 @@ pub(crate) fn validate_rule_application_shape(
         .as_ref()
         .ok_or_else(|| "an applied function has no body".to_owned())?;
     let labels = statement_labels(body);
-    let preserved = labels
-        .iter()
-        .copied()
-        .filter(|label| !transformed.contains(label))
-        .collect();
-    let mut scan = BodyScanner::new_with_preserved_labels(true, preserved);
+    // Rule application runs before transformed payloads are skeletonized, so
+    // every source-shaped restricted conditional is still opaque here.
+    let mut scan = BodyScanner::new_with_preserved_labels(true, labels.clone());
     scan.visit_block(body);
     if let Some(problem) = scan.syntax_errors.first() {
         return Err(problem.message.clone());
@@ -463,7 +457,7 @@ pub(crate) fn validate_rule_application_shape(
     if seen != labels.into_iter().collect() {
         return Err("an applied skeleton label scan is inconsistent".to_owned());
     }
-    validate_expected_block(body, &transformed.iter().copied().collect())
+    validate_expected_block(body, &HashSet::new())
 }
 
 fn validate_supported_target_signature(function: &rustc_ast::Fn) -> Result<(), &'static str> {

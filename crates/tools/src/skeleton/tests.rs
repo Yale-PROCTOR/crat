@@ -6306,6 +6306,157 @@ fn rule_selection_materialization_and_statement_installation_are_integrated() {
 }
 
 #[test]
+fn unrelated_transformed_restricted_conditional_does_not_block_rule_application() {
+    let source = r#"
+extern "C" { fn opaque_value() -> bool; }
+pub unsafe fn mixed(p: *mut i32, flag: bool) -> bool {
+    let _conditional = Some(if flag { opaque_value() } else { false });
+    p.is_null()
+}
+"#;
+    run_compiler_on_str(source, |tcx| {
+        let mut surface = utils::ast::parse_crate(source.to_owned());
+        let mut mapper = utils::ir::AstToHirMapper::new(tcx);
+        mapper.map_crate_to_mod(&mut surface, tcx.hir_root_module(), false);
+        let ast_to_hir = mapper.ast_to_hir;
+        let function = local_def("mixed", tcx);
+        let mut decisions = tools_pointer_decisions(tcx);
+        decisions
+            .signatures
+            .data
+            .get_mut(&function)
+            .unwrap()
+            .input_decs[0] = Some(PtrKind::OptRef(false));
+        let mut item = surface
+            .items
+            .iter()
+            .find(|item| {
+                item.kind
+                    .ident()
+                    .is_some_and(|ident| ident.name.as_str() == "mixed")
+            })
+            .unwrap()
+            .clone();
+        let opaque_nested_ifs = collect_opaque_nested_ifs(&item, "mixed").unwrap();
+        annotate_function(&mut item, &opaque_nested_ifs);
+        let transformed = classify_function_statements(
+            &item,
+            &opaque_nested_ifs,
+            &ast_to_hir,
+            &decisions,
+            &PreservationDecisionOverrides::default(),
+            tcx,
+        );
+        assert_eq!(transformed, BTreeSet::from([0, 1]));
+
+        let catalog = rule_binding_catalog(&item, function, &decisions, &ast_to_hir, tcx);
+        let ItemKind::Fn(box body) = &item.kind else { unreachable!() };
+        let regions = select_rule_regions(
+            &body.body.as_ref().unwrap().stmts[1],
+            &catalog,
+            &ast_to_hir,
+            tcx,
+        )
+        .unwrap();
+        let [region] = &regions[..] else { panic!("expected one selected pointer region") };
+        let mut observation = region.observation.clone();
+        observation.target_expression = serde_json::from_value(serde_json::json!({
+            "kind": "literal",
+            "value": {"kind": "bool", "value": false}
+        }))
+        .unwrap();
+        let rules = crate::synthesize_rules(&[crate::ObservationDocument {
+            schema_version: crate::OBSERVATION_SCHEMA_VERSION,
+            observations: vec![observation.clone(), observation],
+        }])
+        .unwrap();
+        let mut target = item.clone();
+        let type_speller = TypeSpeller::new(function, &ast_to_hir, tcx);
+        let applied = apply_rule_set(
+            &item,
+            &mut target,
+            &transformed,
+            &rules,
+            function,
+            &decisions,
+            &ast_to_hir,
+            &type_speller,
+            tcx,
+        )
+        .unwrap();
+        assert_eq!(applied, BTreeSet::from([1]));
+        let rendered = pprust::item_to_string(&target);
+        assert!(rendered.contains("Some(if flag { opaque_value() } else { false })"));
+        assert!(!rendered.contains("is_null"), "{rendered}");
+    })
+    .unwrap();
+}
+
+#[test]
+fn nonmatching_rules_leave_transformed_restricted_conditional_view_unchanged() {
+    let source = r#"
+extern "C" { fn opaque_value() -> bool; }
+pub unsafe fn rule_source(p: *mut i32) -> bool { p.is_null() }
+pub unsafe fn no_match(flag: bool) -> Option<bool> {
+    Some(if flag { opaque_value() } else { false })
+}
+"#;
+    run_compiler_on_str(source, |tcx| {
+        let mut surface = utils::ast::parse_crate(source.to_owned());
+        let mut mapper = utils::ir::AstToHirMapper::new(tcx);
+        mapper.map_crate_to_mod(&mut surface, tcx.hir_root_module(), false);
+        let ast_to_hir = mapper.ast_to_hir;
+        let function_id = local_def("rule_source", tcx);
+        let mut decisions = tools_pointer_decisions(tcx);
+        decisions
+            .signatures
+            .data
+            .get_mut(&function_id)
+            .unwrap()
+            .input_decs[0] = Some(PtrKind::OptRef(false));
+        let mut item = surface
+            .items
+            .iter()
+            .find(|item| {
+                item.kind
+                    .ident()
+                    .is_some_and(|ident| ident.name.as_str() == "rule_source")
+            })
+            .unwrap()
+            .clone();
+        annotate_function(&mut item, &FxHashSet::default());
+        let catalog = rule_binding_catalog(&item, function_id, &decisions, &ast_to_hir, tcx);
+        let ItemKind::Fn(box body) = &item.kind else { unreachable!() };
+        let regions = select_rule_regions(
+            &body.body.as_ref().unwrap().stmts[0],
+            &catalog,
+            &ast_to_hir,
+            tcx,
+        )
+        .unwrap();
+        let [region] = &regions[..] else { panic!("expected one selected pointer region") };
+        let mut observation = region.observation.clone();
+        observation.target_expression = serde_json::from_value(serde_json::json!({
+            "kind": "literal",
+            "value": {"kind": "bool", "value": false}
+        }))
+        .unwrap();
+        let rules = crate::synthesize_rules(&[crate::ObservationDocument {
+            schema_version: crate::OBSERVATION_SCHEMA_VERSION,
+            observations: vec![observation.clone(), observation],
+        }])
+        .unwrap();
+        assert_eq!(rules.rules.len(), 1);
+
+        let records = make_skeletons_with_rules(source, Some(&rules), tcx).unwrap();
+        let no_match = function(&records, "no_match");
+        assert_eq!(no_match.baseline.transform_labels(), [0]);
+        assert_eq!(no_match.applied, no_match.baseline);
+    })
+    .unwrap();
+}
+
+#[test]
 fn selected_region_dump_failure_keeps_a_multi_region_statement_unmodified() {
     let source = r#"
 pub unsafe fn usable(p: *mut i32) { *p = 0; }
@@ -6682,7 +6833,7 @@ fn materialization_and_shape_misses_are_local_but_corrupt_invariants_are_fatal()
             utils::ast::parse_crate("unsafe fn f() { #[proctor(0)] unsafe { 1 }; }".into())
                 .items
                 .remove(0);
-        assert!(validate_rule_application_shape(&unsupported, &BTreeSet::new()).is_err());
+        assert!(validate_rule_application_shape(&unsupported).is_err());
 
         let mut item = surface.items[0].clone();
         annotate_function(&mut item, &FxHashSet::default());
