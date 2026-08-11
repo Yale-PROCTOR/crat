@@ -12,11 +12,11 @@ use std::{
     time::{Duration, Instant},
 };
 
-use rustc_hash::FxHashSet;
+use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_middle::{
     mir::{
-        AggregateKind, Body, Local, Location, Operand, Place, ProjectionElem, RETURN_PLACE, Rvalue,
-        StatementKind, Terminator, TerminatorKind,
+        AggregateKind, Body, Local, Location, Operand, Place, PlaceRef, ProjectionElem,
+        RETURN_PLACE, Rvalue, StatementKind, Terminator, TerminatorKind,
     },
     ty::{TyCtxt, TyKind},
 };
@@ -65,6 +65,7 @@ enum PrimaryClass {
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct RootEvidence {
     flags: BTreeSet<CauseFlag>,
+    provenance_tags: BTreeSet<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -120,6 +121,7 @@ struct FlowEdge {
     target: String,
     kind: FlowEdgeKind,
     label: String,
+    provenance_tags: BTreeSet<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -129,6 +131,7 @@ struct TerminalRoot {
     kind: TerminalKind,
     label: String,
     realloc: bool,
+    provenance_tags: BTreeSet<String>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -155,7 +158,12 @@ impl SourceGraph {
     fn canonicalize(&mut self) {
         for edges in self.incoming.values_mut() {
             edges.sort_by(|a, b| {
-                (&a.source, &a.target, &a.label).cmp(&(&b.source, &b.target, &b.label))
+                (&a.source, &a.target, &a.label, &a.provenance_tags).cmp(&(
+                    &b.source,
+                    &b.target,
+                    &b.label,
+                    &b.provenance_tags,
+                ))
             });
             edges.dedup();
         }
@@ -301,6 +309,35 @@ fn parse_cause_flag(value: &str) -> Result<CauseFlag, String> {
     }
 }
 
+fn parse_provenance_tag(value: &str) -> Result<String, String> {
+    let Some(target) = value
+        .strip_prefix("indirect-resolved-target(")
+        .and_then(|value| value.strip_suffix(')'))
+    else {
+        return Err(format!("unknown evidence flag {value:?}"));
+    };
+    if target.is_empty() || target.contains(['|', '\t', '\n', '\r']) {
+        return Err(format!("malformed indirect-target provenance {value:?}"));
+    }
+    Ok(value.to_owned())
+}
+
+fn parse_root_evidence(value: &str) -> Result<RootEvidence, String> {
+    let mut flags = BTreeSet::new();
+    let mut provenance_tags = BTreeSet::new();
+    for token in value.split('|') {
+        if token.starts_with("indirect-resolved-target(") {
+            provenance_tags.insert(parse_provenance_tag(token)?);
+        } else {
+            flags.insert(parse_cause_flag(token)?);
+        }
+    }
+    Ok(RootEvidence {
+        flags,
+        provenance_tags,
+    })
+}
+
 fn exception_specs() -> Vec<ExceptionSpec> {
     vec![
         ExceptionSpec {
@@ -352,10 +389,12 @@ fn trace_candidate(graph: &SourceGraph, target: &str) -> Vec<RootTrace> {
         store_site: String,
         crosses_call: bool,
         crosses_field: bool,
+        provenance_tags: BTreeSet<String>,
         path: Vec<String>,
     }
 
-    let mut roots = BTreeMap::<(String, String, BTreeSet<CauseFlag>), RootTrace>::new();
+    let mut roots =
+        BTreeMap::<(String, String, BTreeSet<CauseFlag>, BTreeSet<String>), RootTrace>::new();
     for terminal in graph.terminals.get(target).into_iter().flatten() {
         let flags = flags_for_path(SyntheticPath {
             terminal: terminal.kind,
@@ -366,12 +405,20 @@ fn trace_candidate(graph: &SourceGraph, target: &str) -> Vec<RootTrace> {
                 && !terminal.realloc,
         });
         roots.insert(
-            (terminal.label.clone(), terminal.id.clone(), flags.clone()),
+            (
+                terminal.label.clone(),
+                terminal.id.clone(),
+                flags.clone(),
+                terminal.provenance_tags.clone(),
+            ),
             RootTrace {
                 store_site: terminal.label.clone(),
                 root_id: terminal.id.clone(),
                 root_label: terminal.label.clone(),
-                evidence: RootEvidence { flags },
+                evidence: RootEvidence {
+                    flags,
+                    provenance_tags: terminal.provenance_tags.clone(),
+                },
                 path: vec![terminal.label.clone()],
             },
         );
@@ -386,6 +433,7 @@ fn trace_candidate(graph: &SourceGraph, target: &str) -> Vec<RootTrace> {
             // The first edge is the target field's own store and does not make
             // the source field-mediated.
             crosses_field: false,
+            provenance_tags: edge.provenance_tags.clone(),
             path: vec![edge.label.clone()],
         });
     }
@@ -396,6 +444,7 @@ fn trace_candidate(graph: &SourceGraph, target: &str) -> Vec<RootTrace> {
             root_label: "candidate has no relevant store input".to_owned(),
             evidence: RootEvidence {
                 flags: BTreeSet::new(),
+                provenance_tags: BTreeSet::new(),
             },
             path: Vec::new(),
         }];
@@ -408,6 +457,7 @@ fn trace_candidate(graph: &SourceGraph, target: &str) -> Vec<RootTrace> {
             state.node.clone(),
             state.crosses_call,
             state.crosses_field,
+            state.provenance_tags.clone(),
         )) {
             continue;
         }
@@ -427,8 +477,15 @@ fn trace_candidate(graph: &SourceGraph, target: &str) -> Vec<RootTrace> {
             let mut path = state.path.clone();
             path.push(terminal.label.clone());
             path.reverse();
+            let mut provenance_tags = state.provenance_tags.clone();
+            provenance_tags.extend(terminal.provenance_tags.iter().cloned());
             roots
-                .entry((state.store_site.clone(), terminal.id.clone(), flags.clone()))
+                .entry((
+                    state.store_site.clone(),
+                    terminal.id.clone(),
+                    flags.clone(),
+                    provenance_tags.clone(),
+                ))
                 .and_modify(|root| {
                     if path.len() < root.path.len()
                         || (path.len() == root.path.len() && path < root.path)
@@ -440,7 +497,10 @@ fn trace_candidate(graph: &SourceGraph, target: &str) -> Vec<RootTrace> {
                     store_site: state.store_site.clone(),
                     root_id: terminal.id.clone(),
                     root_label: terminal.label.clone(),
-                    evidence: RootEvidence { flags },
+                    evidence: RootEvidence {
+                        flags,
+                        provenance_tags,
+                    },
                     path,
                 });
         }
@@ -452,6 +512,7 @@ fn trace_candidate(graph: &SourceGraph, target: &str) -> Vec<RootTrace> {
                     state.store_site.clone(),
                     format!("unresolved:{}", state.node),
                     BTreeSet::new(),
+                    state.provenance_tags.clone(),
                 ))
                 .or_insert_with(|| {
                     let mut path = state.path.clone();
@@ -462,6 +523,7 @@ fn trace_candidate(graph: &SourceGraph, target: &str) -> Vec<RootTrace> {
                         root_label: format!("unclassified terminal {}", state.node),
                         evidence: RootEvidence {
                             flags: BTreeSet::new(),
+                            provenance_tags: state.provenance_tags.clone(),
                         },
                         path,
                     }
@@ -470,11 +532,14 @@ fn trace_candidate(graph: &SourceGraph, target: &str) -> Vec<RootTrace> {
         for edge in incoming.into_iter().flatten() {
             let mut path = state.path.clone();
             path.push(edge.label.clone());
+            let mut provenance_tags = state.provenance_tags.clone();
+            provenance_tags.extend(edge.provenance_tags.iter().cloned());
             work.push_back(Work {
                 node: edge.source.clone(),
                 store_site: state.store_site.clone(),
                 crosses_call: state.crosses_call || edge.kind == FlowEdgeKind::Call,
                 crosses_field: state.crosses_field || edge.kind == FlowEdgeKind::Field,
+                provenance_tags,
                 path,
             });
         }
@@ -570,7 +635,34 @@ fn add_value_edge(graph: &mut SourceGraph, source: Option<String>, target: Strin
             source,
             target,
             label,
+            provenance_tags: BTreeSet::new(),
         });
+    }
+}
+
+fn add_indirect_value_edge(
+    graph: &mut SourceGraph,
+    source: Option<String>,
+    target: String,
+    label: String,
+    provenance_tags: BTreeSet<String>,
+) {
+    match source {
+        Some(source) => graph.add_edge(FlowEdge {
+            kind: edge_kind(&source, &target),
+            source,
+            target,
+            label,
+            provenance_tags,
+        }),
+        None => add_terminal_with_tags(
+            graph,
+            target,
+            TerminalKind::Unsupported,
+            format!("indirect-resolved-flow-source-unavailable:{label}"),
+            false,
+            provenance_tags,
+        ),
     }
 }
 
@@ -585,13 +677,70 @@ fn add_terminal(
     label: String,
     realloc: bool,
 ) {
+    add_terminal_with_tags(graph, node, kind, label, realloc, BTreeSet::new());
+}
+
+fn add_terminal_with_tags(
+    graph: &mut SourceGraph,
+    node: String,
+    kind: TerminalKind,
+    label: String,
+    realloc: bool,
+    provenance_tags: BTreeSet<String>,
+) {
     graph.add_terminal(TerminalRoot {
         id: terminal_id(kind, &node, &label),
         node,
         kind,
         label,
         realloc,
+        provenance_tags,
     });
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct IndirectTargetSpec {
+    canonical_path: String,
+    kind: TerminalKind,
+    realloc: bool,
+}
+
+fn indirect_target_tag(canonical_path: &str) -> String {
+    format!("indirect-resolved-target({canonical_path})")
+}
+
+fn require_visible_targets<'a, T>(
+    targets: &'a [T],
+    call_location: &str,
+) -> Result<&'a [T], String> {
+    if targets.is_empty() {
+        return Err(format!(
+            "in-crate-visible target set is empty at {call_location}"
+        ));
+    }
+    Ok(targets)
+}
+
+fn expand_indirect_target_roots(
+    node: &str,
+    call_location: &str,
+    targets: &[IndirectTargetSpec],
+) -> Result<Vec<TerminalRoot>, String> {
+    Ok(require_visible_targets(targets, call_location)?
+        .iter()
+        .map(|target| {
+            let tag = indirect_target_tag(&target.canonical_path);
+            let label = format!("{tag}:{call_location}");
+            TerminalRoot {
+                id: terminal_id(target.kind, node, &label),
+                node: node.to_owned(),
+                kind: target.kind,
+                label,
+                realloc: target.realloc,
+                provenance_tags: BTreeSet::from([tag]),
+            }
+        })
+        .collect())
 }
 
 fn roles_for_name(name: &str) -> Vec<crate::analyses::borrow_ownership::boundary_table::Role> {
@@ -624,8 +773,12 @@ fn harness_call_kind(tcx: TyCtxt<'_>, function: &Operand<'_>) -> HarnessCallKind
     let TyKind::FnDef(callee, _) = constant.ty().kind() else {
         return HarnessCallKind::Unresolved;
     };
+    harness_call_kind_for_def(tcx, *callee)
+}
+
+fn harness_call_kind_for_def(tcx: TyCtxt<'_>, callee: DefId) -> HarnessCallKind {
     let Some(local) = callee.as_local() else {
-        return HarnessCallKind::RustLib(*callee);
+        return HarnessCallKind::RustLib(callee);
     };
     match tcx.hir_node_by_def_id(local) {
         rustc_hir::Node::Item(_) | rustc_hir::Node::ImplItem(_) => HarnessCallKind::Local(local),
@@ -634,6 +787,221 @@ fn harness_call_kind(tcx: TyCtxt<'_>, function: &Operand<'_>) -> HarnessCallKind
         }
         _ => HarnessCallKind::Unresolved,
     }
+}
+
+#[derive(Clone, Debug, Default)]
+struct IndirectTargetFlow {
+    incoming: BTreeMap<String, BTreeSet<String>>,
+    seeds: FxHashMap<String, FxHashSet<DefId>>,
+    call_nodes: FxHashMap<(LocalDefId, usize), String>,
+}
+
+impl IndirectTargetFlow {
+    fn add_edge(&mut self, source: String, target: String) {
+        self.incoming.entry(target).or_default().insert(source);
+    }
+
+    fn add_seed(&mut self, node: String, target: DefId) {
+        self.seeds.entry(node).or_default().insert(target);
+    }
+
+    fn targets(&self, node: &str) -> FxHashSet<DefId> {
+        let mut work = VecDeque::from([node.to_owned()]);
+        let mut seen = BTreeSet::new();
+        let mut targets = FxHashSet::default();
+        while let Some(node) = work.pop_front() {
+            if !seen.insert(node.clone()) {
+                continue;
+            }
+            targets.extend(self.seeds.get(&node).into_iter().flatten().copied());
+            work.extend(self.incoming.get(&node).into_iter().flatten().cloned());
+        }
+        targets
+    }
+}
+
+fn target_field_node(tcx: TyCtxt<'_>, owner: DefId, field: usize) -> String {
+    format!("fn-hook:{}::field{field}", tcx.def_path_str(owner))
+}
+
+fn target_flow_node<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    fn_did: LocalDefId,
+    body: &Body<'tcx>,
+    place: Place<'tcx>,
+) -> String {
+    let mut field_node = None;
+    for (index, projection) in place.projection.iter().enumerate() {
+        let ProjectionElem::Field(field, _) = projection else {
+            continue;
+        };
+        let prefix = PlaceRef {
+            local: place.local,
+            projection: &place.projection[..index],
+        };
+        let base_ty = prefix.ty(&body.local_decls, tcx).ty;
+        if let TyKind::Adt(def, _) = base_ty.kind() {
+            field_node = Some(target_field_node(tcx, def.did(), field.index()));
+        }
+    }
+    field_node.unwrap_or_else(|| {
+        format!(
+            "fn-local:{}:slot{}",
+            tcx.def_path_str(fn_did),
+            place.local.index()
+        )
+    })
+}
+
+fn constant_function_target(operand: &Operand<'_>) -> Option<DefId> {
+    let constant = operand.constant()?;
+    let TyKind::FnDef(target, _) = constant.ty().kind() else {
+        return None;
+    };
+    Some(*target)
+}
+
+fn add_target_operand_flow<'tcx>(
+    flow: &mut IndirectTargetFlow,
+    tcx: TyCtxt<'tcx>,
+    fn_did: LocalDefId,
+    body: &Body<'tcx>,
+    operand: &Operand<'tcx>,
+    target: String,
+) {
+    if let Some(function) = constant_function_target(operand) {
+        flow.add_seed(target, function);
+    } else if let Some(place) = operand.place() {
+        flow.add_edge(target_flow_node(tcx, fn_did, body, place), target);
+    }
+}
+
+fn collect_visible_indirect_targets(
+    tcx: TyCtxt<'_>,
+    functions: &[LocalDefId],
+) -> FxHashMap<(LocalDefId, usize), Vec<DefId>> {
+    let function_set = functions.iter().copied().collect::<FxHashSet<_>>();
+    let mut flow = IndirectTargetFlow::default();
+    for &fn_did in functions {
+        let body_ref = tcx.mir_drops_elaborated_and_const_checked(fn_did).borrow();
+        let body = &*body_ref;
+        for (bb, data) in body.basic_blocks.iter_enumerated() {
+            for statement in &data.statements {
+                let StatementKind::Assign(box (lhs, rvalue)) = &statement.kind else {
+                    continue;
+                };
+                if let Rvalue::Aggregate(kind, operands) = rvalue
+                    && let AggregateKind::Adt(def_id, _, _, _, _) = kind.as_ref()
+                    && def_id.as_local().is_some()
+                {
+                    for (field, operand) in operands.iter_enumerated() {
+                        add_target_operand_flow(
+                            &mut flow,
+                            tcx,
+                            fn_did,
+                            body,
+                            operand,
+                            target_field_node(tcx, *def_id, field.index()),
+                        );
+                    }
+                    continue;
+                }
+                let target = target_flow_node(tcx, fn_did, body, *lhs);
+                match rvalue {
+                    Rvalue::Use(operand) | Rvalue::Cast(_, operand, _) => {
+                        add_target_operand_flow(&mut flow, tcx, fn_did, body, operand, target);
+                    }
+                    Rvalue::Aggregate(_, operands) => {
+                        for operand in operands {
+                            add_target_operand_flow(
+                                &mut flow,
+                                tcx,
+                                fn_did,
+                                body,
+                                operand,
+                                target.clone(),
+                            );
+                        }
+                    }
+                    Rvalue::CopyForDeref(place) => {
+                        flow.add_edge(target_flow_node(tcx, fn_did, body, *place), target)
+                    }
+                    _ => {}
+                }
+            }
+
+            let terminator = data.terminator();
+            let (func, args, destination) = match &terminator.kind {
+                TerminatorKind::Call {
+                    func,
+                    args,
+                    destination,
+                    ..
+                } => (func, args.as_ref(), *destination),
+                TerminatorKind::TailCall { func, args, .. } => {
+                    (func, args.as_ref(), Place::return_place())
+                }
+                _ => continue,
+            };
+            let Some(direct) = constant_function_target(func) else {
+                if let Some(place) = func.place() {
+                    flow.call_nodes.insert(
+                        (fn_did, bb.index()),
+                        target_flow_node(tcx, fn_did, body, place),
+                    );
+                }
+                continue;
+            };
+            match harness_call_kind_for_def(tcx, direct) {
+                HarnessCallKind::Local(callee) if function_set.contains(&callee) => {
+                    let callee_body_ref =
+                        tcx.mir_drops_elaborated_and_const_checked(callee).borrow();
+                    let callee_body = &*callee_body_ref;
+                    for (index, argument) in args.iter().enumerate() {
+                        let parameter = Local::from_usize(index + 1);
+                        add_target_operand_flow(
+                            &mut flow,
+                            tcx,
+                            fn_did,
+                            body,
+                            &argument.node,
+                            target_flow_node(tcx, callee, callee_body, Place::from(parameter)),
+                        );
+                    }
+                    flow.add_edge(
+                        target_flow_node(tcx, callee, callee_body, Place::from(RETURN_PLACE)),
+                        target_flow_node(tcx, fn_did, body, destination),
+                    );
+                }
+                HarnessCallKind::RustLib(callee)
+                    if matches!(
+                        tcx.item_name(callee).as_str(),
+                        "expect" | "unwrap" | "unwrap_unchecked"
+                    ) =>
+                {
+                    if let Some(argument) = args.first() {
+                        add_target_operand_flow(
+                            &mut flow,
+                            tcx,
+                            fn_did,
+                            body,
+                            &argument.node,
+                            target_flow_node(tcx, fn_did, body, destination),
+                        );
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    flow.call_nodes
+        .iter()
+        .map(|(call, node)| {
+            let mut targets = flow.targets(node).into_iter().collect::<Vec<_>>();
+            targets.sort_by_key(|target| tcx.def_path_str(*target));
+            (*call, targets)
+        })
+        .collect()
 }
 
 fn harness_call<'call, 'tcx>(
@@ -665,10 +1033,10 @@ fn build_source_graph(tcx: TyCtxt<'_>, slots: &CrateSlots, export: &BoExport) ->
 
     let program = collect_program(tcx);
     let program_functions = program.functions.iter().copied().collect::<FxHashSet<_>>();
+    let visible_indirect_targets = collect_visible_indirect_targets(tcx, &program.functions);
     let mut graph = SourceGraph::default();
     let mut parameter_nodes = Vec::<(LocalDefId, Local, String)>::new();
     let mut called_parameters = BTreeSet::<String>::new();
-    let mut has_unresolved_indirect_call = false;
 
     for &fn_did in &program.functions {
         let body_ref = tcx.mir_drops_elaborated_and_const_checked(fn_did).borrow();
@@ -840,6 +1208,7 @@ fn build_source_graph(tcx: TyCtxt<'_>, slots: &CrateSlots, export: &BoExport) ->
                                     tcx.def_path_str(callee),
                                     index + 1
                                 ),
+                                provenance_tags: BTreeSet::new(),
                             });
                         }
                     }
@@ -860,6 +1229,7 @@ fn build_source_graph(tcx: TyCtxt<'_>, slots: &CrateSlots, export: &BoExport) ->
                                 "call-return:{}->{call_location}",
                                 tcx.def_path_str(callee)
                             ),
+                            provenance_tags: BTreeSet::new(),
                         });
                     }
                 }
@@ -961,15 +1331,187 @@ fn build_source_graph(tcx: TyCtxt<'_>, slots: &CrateSlots, export: &BoExport) ->
                     }
                 }
                 HarnessCallKind::Unresolved => {
-                    has_unresolved_indirect_call = true;
-                    if let Some(target) = destination {
-                        add_terminal(
-                            &mut graph,
-                            target,
-                            TerminalKind::Unsupported,
-                            format!("unresolved-indirect-call:{call_location}"),
-                            false,
-                        );
+                    let resolved = visible_indirect_targets
+                        .get(&(fn_did, bb.index()))
+                        .cloned()
+                        .unwrap_or_default();
+                    require_visible_targets(&resolved, &call_location).unwrap_or_else(|error| {
+                        panic!("A4C STOP phase=graph-construction candidate=none: {error}")
+                    });
+                    for resolved_target in resolved {
+                        let canonical_path = tcx.def_path_str(resolved_target);
+                        let provenance_tags =
+                            BTreeSet::from([indirect_target_tag(&canonical_path)]);
+                        match harness_call_kind_for_def(tcx, resolved_target) {
+                            HarnessCallKind::Local(callee)
+                                if program_functions.contains(&callee) =>
+                            {
+                                let callee_body_ref =
+                                    tcx.mir_drops_elaborated_and_const_checked(callee).borrow();
+                                let callee_body = &*callee_body_ref;
+                                for (index, argument) in call.args.iter().enumerate() {
+                                    let parameter = Local::from_usize(index + 1);
+                                    let Some(parameter_target) = node_for_place(
+                                        tcx,
+                                        slots,
+                                        callee,
+                                        callee_body,
+                                        Place::from(parameter),
+                                    ) else {
+                                        continue;
+                                    };
+                                    if let Some(source) =
+                                        node_for_operand(tcx, slots, fn_did, body, &argument.node)
+                                    {
+                                        called_parameters.insert(parameter_target.clone());
+                                        graph.add_edge(FlowEdge {
+                                            source,
+                                            target: parameter_target,
+                                            kind: FlowEdgeKind::Call,
+                                            label: format!(
+                                                "indirect-call-arg:{call_location}->{canonical_path}:arg{}",
+                                                index + 1
+                                            ),
+                                            provenance_tags: BTreeSet::new(),
+                                        });
+                                    }
+                                }
+                                if let Some(target) = destination.clone()
+                                    && let Some(source) = node_for_place(
+                                        tcx,
+                                        slots,
+                                        callee,
+                                        callee_body,
+                                        Place::from(RETURN_PLACE),
+                                    )
+                                {
+                                    graph.add_edge(FlowEdge {
+                                        source,
+                                        target,
+                                        kind: FlowEdgeKind::Call,
+                                        label: format!(
+                                            "indirect-call-return:{canonical_path}->{call_location}"
+                                        ),
+                                        provenance_tags,
+                                    });
+                                }
+                            }
+                            HarnessCallKind::Local(_) => {
+                                if let Some(target) = destination.clone() {
+                                    add_terminal_with_tags(
+                                        &mut graph,
+                                        target,
+                                        TerminalKind::Unsupported,
+                                        format!(
+                                            "indirect-resolved-local-outside-program:{call_location}:{canonical_path}"
+                                        ),
+                                        false,
+                                        provenance_tags,
+                                    );
+                                }
+                            }
+                            HarnessCallKind::LibC(name) => {
+                                let Some(target) = destination.clone() else {
+                                    continue;
+                                };
+                                let roles = roles_for_name(&name);
+                                if roles.contains(&Role::Source) {
+                                    for root in expand_indirect_target_roots(
+                                        &target,
+                                        &call_location,
+                                        &[IndirectTargetSpec {
+                                            canonical_path,
+                                            kind: TerminalKind::RecognizedAllocation,
+                                            realloc: name == "realloc",
+                                        }],
+                                    )
+                                    .expect("non-empty resolved target")
+                                    {
+                                        graph.add_terminal(root);
+                                    }
+                                } else if roles.iter().any(|role| {
+                                    matches!(
+                                        role,
+                                        Role::ProvenanceFlow
+                                            | Role::LoanCreating
+                                            | Role::FlowTransfer
+                                    )
+                                }) {
+                                    let source = call.args.first().and_then(|arg| {
+                                        node_for_operand(tcx, slots, fn_did, body, &arg.node)
+                                    });
+                                    add_indirect_value_edge(
+                                        &mut graph,
+                                        source,
+                                        target,
+                                        format!(
+                                            "indirect-foreign-flow:{call_location}:{canonical_path}"
+                                        ),
+                                        provenance_tags,
+                                    );
+                                } else {
+                                    add_terminal_with_tags(
+                                        &mut graph,
+                                        target,
+                                        TerminalKind::OpaqueExternalCall,
+                                        format!(
+                                            "indirect-foreign-result:{call_location}:{canonical_path}"
+                                        ),
+                                        false,
+                                        provenance_tags,
+                                    );
+                                }
+                            }
+                            HarnessCallKind::RustLib(callee) => {
+                                let Some(target) = destination.clone() else {
+                                    continue;
+                                };
+                                let item_name = tcx.item_name(callee);
+                                let name = item_name.as_str();
+                                let roles = roles_for_name(name);
+                                if roles.iter().any(|role| {
+                                    matches!(role, Role::ProvenanceFlow | Role::LoanCreating)
+                                }) {
+                                    let source = call.args.first().and_then(|arg| {
+                                        node_for_operand(tcx, slots, fn_did, body, &arg.node)
+                                    });
+                                    add_indirect_value_edge(
+                                        &mut graph,
+                                        source,
+                                        target,
+                                        format!(
+                                            "indirect-rust-flow:{call_location}:{canonical_path}"
+                                        ),
+                                        provenance_tags,
+                                    );
+                                } else if roles.contains(&Role::NullConstructor) {
+                                    add_terminal_with_tags(
+                                        &mut graph,
+                                        target,
+                                        TerminalKind::Unsupported,
+                                        format!(
+                                            "indirect-null-constructor:{call_location}:{canonical_path}"
+                                        ),
+                                        false,
+                                        provenance_tags,
+                                    );
+                                } else {
+                                    add_terminal_with_tags(
+                                        &mut graph,
+                                        target,
+                                        TerminalKind::OpaqueExternalCall,
+                                        format!(
+                                            "indirect-rust-result:{call_location}:{canonical_path}"
+                                        ),
+                                        false,
+                                        provenance_tags,
+                                    );
+                                }
+                            }
+                            HarnessCallKind::Unresolved => unreachable!(
+                                "a concrete visible target cannot remain an unresolved call kind"
+                            ),
+                        }
                     }
                 }
             }
@@ -982,15 +1524,8 @@ fn build_source_graph(tcx: TyCtxt<'_>, slots: &CrateSlots, export: &BoExport) ->
             add_terminal(
                 &mut graph,
                 node,
-                if public || !has_unresolved_indirect_call {
-                    TerminalKind::ExternalParameter
-                } else {
-                    TerminalKind::Unsupported
-                },
-                format!(
-                    "external-parameter:{}:{local:?}:unresolved-indirect={has_unresolved_indirect_call}",
-                    tcx.def_path_str(fn_did)
-                ),
+                TerminalKind::ExternalParameter,
+                format!("external-parameter:{}:{local:?}", tcx.def_path_str(fn_did)),
                 false,
             );
         }
@@ -1103,6 +1638,15 @@ fn flag_label(flag: CauseFlag) -> &'static str {
     }
 }
 
+fn evidence_tokens(evidence: &RootEvidence) -> Vec<String> {
+    evidence
+        .flags
+        .iter()
+        .map(|flag| flag_label(*flag).to_owned())
+        .chain(evidence.provenance_tags.iter().cloned())
+        .collect()
+}
+
 fn class_label(class: PrimaryClass) -> &'static str {
     match class {
         PrimaryClass::Invisible => "invisible",
@@ -1121,6 +1665,7 @@ struct CandidateRecord {
     input: A4InputRow,
     class: PrimaryClass,
     flags: BTreeSet<CauseFlag>,
+    provenance_tags: BTreeSet<String>,
     roots: Vec<RootTrace>,
 }
 
@@ -1136,12 +1681,11 @@ fn render_candidates(records: &[CandidateRecord]) -> String {
             record.input.field_slot,
             kind_label(record.input.baseline_kind),
             class_label(record.class),
-            record
-                .flags
-                .iter()
-                .map(|flag| flag_label(*flag))
-                .collect::<Vec<_>>()
-                .join("|"),
+            evidence_tokens(&RootEvidence {
+                flags: record.flags.clone(),
+                provenance_tags: record.provenance_tags.clone(),
+            })
+            .join("|"),
             record.roots.len(),
         ));
     }
@@ -1161,12 +1705,7 @@ fn render_roots(records: &[CandidateRecord], exceptions: &[ExceptionRecord]) -> 
                 clean_cell(&root.store_site),
                 clean_cell(&root.root_id),
                 clean_cell(&root.root_label),
-                root.evidence
-                    .flags
-                    .iter()
-                    .map(|flag| flag_label(*flag))
-                    .collect::<Vec<_>>()
-                    .join("|"),
+                evidence_tokens(&root.evidence).join("|"),
                 clean_cell(&root.path.join(" -> ")),
             ));
         }
@@ -1180,12 +1719,7 @@ fn render_roots(records: &[CandidateRecord], exceptions: &[ExceptionRecord]) -> 
                 clean_cell(&root.store_site),
                 clean_cell(&root.root_id),
                 clean_cell(&root.root_label),
-                root.evidence
-                    .flags
-                    .iter()
-                    .map(|flag| flag_label(*flag))
-                    .collect::<Vec<_>>()
-                    .join("|"),
+                evidence_tokens(&root.evidence).join("|"),
                 clean_cell(&root.path.join(" -> ")),
             ));
         }
@@ -1243,6 +1777,7 @@ struct ExceptionRecord {
     sink_inventory: Vec<String>,
     graph_root_count: usize,
     graph_flags: BTreeSet<CauseFlag>,
+    graph_provenance_tags: BTreeSet<String>,
     allocation_token_path: bool,
     unsupported_realloc: bool,
     roots: Vec<RootTrace>,
@@ -1284,12 +1819,11 @@ fn render_exceptions(records: &[ExceptionRecord]) -> String {
             clean_cell(&record.ordinary_commits.join("|")),
             clean_cell(&record.forced_commits.join("|")),
             record.graph_root_count,
-            record
-                .graph_flags
-                .iter()
-                .map(|flag| flag_label(*flag))
-                .collect::<Vec<_>>()
-                .join("|"),
+            evidence_tokens(&RootEvidence {
+                flags: record.graph_flags.clone(),
+                provenance_tags: record.graph_provenance_tags.clone(),
+            })
+            .join("|"),
             record.allocation_token_path,
             record.unsupported_realloc,
             "not-reached:ordinary-kind-not-owning",
@@ -1535,10 +2069,15 @@ pub(super) fn run_worker(tcx: TyCtxt<'_>, t_tcx: Duration) -> Row {
             .iter()
             .flat_map(|root| root.evidence.flags.iter().copied())
             .collect();
+        let provenance_tags = roots
+            .iter()
+            .flat_map(|root| root.evidence.provenance_tags.iter().cloned())
+            .collect();
         candidate_records.push(CandidateRecord {
             input: input_row,
             class,
             flags,
+            provenance_tags,
             roots,
         });
         write_atomic_checkpoint(
@@ -1679,6 +2218,10 @@ pub(super) fn run_worker(tcx: TyCtxt<'_>, t_tcx: Duration) -> Row {
             .iter()
             .flat_map(|root| root.evidence.flags.iter().copied())
             .collect::<BTreeSet<_>>();
+        let graph_provenance_tags = roots
+            .iter()
+            .flat_map(|root| root.evidence.provenance_tags.iter().cloned())
+            .collect::<BTreeSet<_>>();
         let allocation_token_path = graph_flags.iter().any(|flag| {
             matches!(
                 flag,
@@ -1722,6 +2265,7 @@ pub(super) fn run_worker(tcx: TyCtxt<'_>, t_tcx: Duration) -> Row {
             ),
             graph_root_count: roots.len(),
             graph_flags,
+            graph_provenance_tags,
             allocation_token_path,
             unsupported_realloc,
             roots,
@@ -1790,6 +2334,21 @@ const RAW_CORPUS_DIGEST: &str = "9fc912af10fd3b235fe4d444d2fbac0bc521509b1c9447f
 const DERIVED_SUBSTRATE_DIGEST: &str =
     "db96829b5c2b0db28fb4bb9ddd3d32901b5d4e6e4134da07ada0d513d94eb4c6";
 const SNAPSHOT_PATH: &str = "/home/p51lee/dev/agent-worktrees/m1-artifact-snapshots/3b26a0ff";
+const RETRY3_PREDECESSOR_HEAD: &str = "ce11b3459c6fa46965e4cbe23ce11dffbdc7bf01";
+const RETRY3_PREDECESSOR_SHARDS: [(&str, &str); 3] = [
+    (
+        "bst",
+        "f9c23eddb3b9da283a2ebf82a4839f9f0e28c4d535f69923d38531ad397b90dd",
+    ),
+    (
+        "avl",
+        "fa50b850af80fa56893fbcd1c2c6c7b57df5107df2ba661b0452ef63a41bac82",
+    ),
+    (
+        "ht",
+        "01a6483456126ee0621cb133a009fae49edc768dda577ddb83c8d6ed27f4c72c",
+    ),
+];
 
 fn command_stdout(mut command: Command, description: &str) -> String {
     let output = command
@@ -2028,6 +2587,7 @@ fn validate_completed_receipt(
     receipt: &BTreeMap<String, String>,
     contract: &MeasurementContract,
     program: &str,
+    manifest: &str,
 ) -> Result<(), String> {
     for (key, expected) in [
         ("status", "ok"),
@@ -2045,9 +2605,12 @@ fn validate_completed_receipt(
             ));
         }
     }
+    let receipt_head = receipt
+        .get("analysis_head")
+        .ok_or_else(|| "receipt lacks analysis_head".to_owned())?;
+    validate_receipt_head(program, receipt_head, manifest, &contract.head)?;
     for (key, expected) in [
         ("program", program),
-        ("analysis_head", contract.head.as_str()),
         ("a4_aggregate_manifest_sha256", A4_AGGREGATE_MANIFEST_SHA256),
         ("a4_combined_sha256", A4_COMBINED_SHA256),
         ("census_identity_sha256", CENSUS_IDENTITY_SHA256),
@@ -2064,6 +2627,29 @@ fn validate_completed_receipt(
         }
     }
     Ok(())
+}
+
+fn validate_receipt_head(
+    program: &str,
+    receipt_head: &str,
+    manifest: &str,
+    current_head: &str,
+) -> Result<(), String> {
+    if receipt_head == current_head {
+        return Ok(());
+    }
+    if receipt_head == RETRY3_PREDECESSOR_HEAD
+        && RETRY3_PREDECESSOR_SHARDS
+            .iter()
+            .any(|(allowed_program, allowed_manifest)| {
+                program == *allowed_program && manifest == *allowed_manifest
+            })
+    {
+        return Ok(());
+    }
+    Err(format!(
+        "receipt analysis_head/manifest is not an approved verified-skip tuple: program={program} head={receipt_head} manifest={manifest} current={current_head}"
+    ))
 }
 
 fn last_phase(stderr: &str) -> (String, String) {
@@ -2543,17 +3129,14 @@ fn validate_shard(contract: &MeasurementContract, program: &str, dir: &Path) -> 
         if row[6].is_empty() {
             return Err(format!("root lacks cause flag at {}: {}", row[2], row[4]));
         }
-        let flags = row[6]
-            .split('|')
-            .map(parse_cause_flag)
-            .collect::<Result<BTreeSet<_>, _>>()?;
+        let evidence = parse_root_evidence(&row[6])?;
         *root_counts
             .entry((identity.program.clone(), identity.field_key.clone()))
             .or_default() += 1;
         root_evidence
             .entry((identity.program, identity.field_key))
             .or_default()
-            .push(RootEvidence { flags });
+            .push(evidence);
     }
     for row in &candidates {
         if !matches!(row[4].as_str(), "invisible" | "absent" | "mixed") {
@@ -2572,15 +3155,17 @@ fn validate_shard(contract: &MeasurementContract, program: &str, dir: &Path) -> 
         if class_label(classify_roots(evidence)) != row[4] {
             return Err(format!("candidate primary class drift: {}", row[1]));
         }
-        let flags = evidence
-            .iter()
-            .flat_map(|root| root.flags.iter().copied())
-            .collect::<BTreeSet<_>>()
-            .iter()
-            .copied()
-            .map(flag_label)
-            .collect::<Vec<_>>()
-            .join("|");
+        let flags = evidence_tokens(&RootEvidence {
+            flags: evidence
+                .iter()
+                .flat_map(|root| root.flags.iter().copied())
+                .collect(),
+            provenance_tags: evidence
+                .iter()
+                .flat_map(|root| root.provenance_tags.iter().cloned())
+                .collect(),
+        })
+        .join("|");
         if flags != row[5] {
             return Err(format!("candidate cause-flag drift: {}", row[1]));
         }
@@ -2629,12 +3214,14 @@ fn validate_shard(contract: &MeasurementContract, program: &str, dir: &Path) -> 
             .iter()
             .flat_map(|root| root.flags.iter().copied())
             .collect::<BTreeSet<_>>();
-        let rendered_flags = flags
-            .iter()
-            .copied()
-            .map(flag_label)
-            .collect::<Vec<_>>()
-            .join("|");
+        let rendered_flags = evidence_tokens(&RootEvidence {
+            flags: flags.clone(),
+            provenance_tags: evidence
+                .iter()
+                .flat_map(|root| root.provenance_tags.iter().cloned())
+                .collect(),
+        })
+        .join("|");
         if rendered_flags != row[22] {
             return Err(format!("exception graph-flag drift: {}", row[1]));
         }
@@ -2724,12 +3311,14 @@ fn run_shard(contract: &MeasurementContract, program: super::CorpusProgram) {
             )
         });
         let receipt = parse_receipt(&dir.join("receipt.txt")).expect("parse skipped receipt");
-        validate_completed_receipt(&receipt, contract, program.name).unwrap_or_else(|error| {
-            panic!(
-                "A4C STOP phase=verified-skip candidate={}: {error}",
-                program.name
-            )
-        });
+        validate_completed_receipt(&receipt, contract, program.name, &manifest).unwrap_or_else(
+            |error| {
+                panic!(
+                    "A4C STOP phase=verified-skip candidate={}: {error}",
+                    program.name
+                )
+            },
+        );
         validate_shard(contract, program.name, &dir).unwrap_or_else(|error| {
             panic!(
                 "A4C STOP phase=verified-skip candidate={}: {error}",
@@ -2849,7 +3438,7 @@ fn run_shard(contract: &MeasurementContract, program: super::CorpusProgram) {
     let verified = verify_manifest(&dir).expect("verify newly completed shard manifest");
     assert_eq!(verified, manifest, "completed shard manifest digest drift");
     let receipt = parse_receipt(&dir.join("receipt.txt")).expect("reparse completed receipt");
-    validate_completed_receipt(&receipt, contract, program.name)
+    validate_completed_receipt(&receipt, contract, program.name, &manifest)
         .expect("validate newly completed receipt");
     validate_receipt_counts(&receipt, &dir).expect("validate newly completed receipt counts");
     eprintln!(
@@ -2888,10 +3477,10 @@ fn aggregate(contract: &MeasurementContract) {
     for program in &contract.programs {
         let dir = contract.run_root.join("shards").join(program.name);
         let manifest = verify_manifest(&dir).expect("verify completed shard");
-        shard_manifests.push((program.name, manifest));
         let receipt = parse_receipt(&dir.join("receipt.txt")).expect("parse completed receipt");
-        validate_completed_receipt(&receipt, contract, program.name)
+        validate_completed_receipt(&receipt, contract, program.name, &manifest)
             .expect("aggregate only completed data=true shards");
+        shard_manifests.push((program.name, manifest));
         validate_receipt_counts(&receipt, &dir).expect("aggregate receipt counts");
         receipts.push(receipt);
         append_table(
@@ -2954,20 +3543,37 @@ fn aggregate(contract: &MeasurementContract) {
 
     let mut class_counts = BTreeMap::<String, usize>::new();
     let mut flag_counts = BTreeMap::<String, usize>::new();
+    let mut provenance_tag_counts = BTreeMap::<String, usize>::new();
     let mut class_witness = BTreeMap::<String, String>::new();
     let mut flag_witness = BTreeMap::<String, String>::new();
+    let mut provenance_tag_witness = BTreeMap::<String, String>::new();
     for row in &candidates {
         *class_counts.entry(row[4].clone()).or_default() += 1;
         class_witness
             .entry(row[4].clone())
             .or_insert_with(|| format!("{}::{}", row[0], row[1]));
-        for flag in row[5].split('|') {
-            *flag_counts.entry(flag.to_owned()).or_default() += 1;
+        let evidence = parse_root_evidence(&row[5]).expect("validated candidate evidence");
+        for flag in evidence.flags {
+            *flag_counts.entry(flag_label(flag).to_owned()).or_default() += 1;
+        }
+        for tag in evidence.provenance_tags {
+            *provenance_tag_counts.entry(tag).or_default() += 1;
         }
     }
     for row in &roots {
-        for flag in row[6].split('|') {
-            flag_witness.entry(flag.to_owned()).or_insert_with(|| {
+        let evidence = parse_root_evidence(&row[6]).expect("validated root evidence");
+        for flag in evidence.flags {
+            flag_witness
+                .entry(flag_label(flag).to_owned())
+                .or_insert_with(|| {
+                    format!(
+                        "{}::{} store={} root={} path={}",
+                        row[1], row[2], row[3], row[4], row[7]
+                    )
+                });
+        }
+        for tag in evidence.provenance_tags {
+            provenance_tag_witness.entry(tag).or_insert_with(|| {
                 format!(
                     "{}::{} store={} root={} path={}",
                     row[1], row[2], row[3], row[4], row[7]
@@ -2979,6 +3585,9 @@ fn aggregate(contract: &MeasurementContract) {
     for flag in flag_counts.keys() {
         assert!(flag_witness.contains_key(flag));
     }
+    for tag in provenance_tag_counts.keys() {
+        assert!(provenance_tag_witness.contains_key(tag));
+    }
     let total_wall = receipts
         .iter()
         .map(|receipt| receipt["wall_s"].parse::<f64>().expect("wall float"))
@@ -2988,6 +3597,13 @@ fn aggregate(contract: &MeasurementContract) {
         .map(|receipt| receipt["peak_rss_kb"].parse::<u64>().expect("RSS integer"))
         .max()
         .unwrap_or(0);
+    let shard_analysis_heads = contract
+        .programs
+        .iter()
+        .zip(&receipts)
+        .map(|(program, receipt)| format!("{}:{}", program.name, receipt["analysis_head"]))
+        .collect::<Vec<_>>()
+        .join(",");
     let mut per_program = String::from(
         "program\tcandidates\troots\texceptions\tinvisible\tabsent\tmixed\twall_s\tpeak_rss_kb\n",
     );
@@ -3028,6 +3644,16 @@ fn aggregate(contract: &MeasurementContract) {
         .map(|(flag, count)| format!("- `{flag}`: **{count}**, witness `{}`", flag_witness[flag]))
         .collect::<Vec<_>>()
         .join("\n");
+    let provenance_tag_summary = provenance_tag_counts
+        .iter()
+        .map(|(tag, count)| {
+            format!(
+                "- `{tag}`: **{count}**, witness `{}`",
+                provenance_tag_witness[tag]
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
     let exception_summary = exceptions
         .iter()
         .map(|row| {
@@ -3039,10 +3665,10 @@ fn aggregate(contract: &MeasurementContract) {
         .collect::<Vec<_>>()
         .join("\n");
     let report = format!(
-        "# A4 force-SAT exceptions and no-allocation-source census\n\nMachine `{MACHINE_ID}`, platform `{PLATFORM}`; RAM/CPU uncapped with a {LIVENESS_BOUND_S}-second per-program liveness bound. Wall/RSS values are machine-local and never compared across machines.\n\nExact identity: **237/237** preregistered no-allocation-source candidates and **4/4** force-SAT exceptions. No unresolved root entered the aggregate.\n\n## Deterministic primary partition\n\n{class_summary}\n\n## Overlapping cause flags\n\n{flag_summary}\n\n## Force-SAT exceptions\n\n{exception_summary}\n\nSequential shard wall sum: **{total_wall:.3}s**. Maximum observed worker RSS: **{peak_rss} KiB**. Only SHA-manifested, completed `data=true` shards feed this report; atomic `data=false` checkpoints are excluded. Production analysis and rewriter behavior remained untouched.\n"
+        "# A4 force-SAT exceptions and no-allocation-source census\n\nMachine `{MACHINE_ID}`, platform `{PLATFORM}`; RAM/CPU uncapped with a {LIVENESS_BOUND_S}-second per-program liveness bound. Wall/RSS values are machine-local and never compared across machines.\n\nExact identity: **237/237** preregistered no-allocation-source candidates and **4/4** force-SAT exceptions. No unresolved root entered the aggregate.\n\n## Deterministic primary partition\n\n{class_summary}\n\n## Overlapping cause flags\n\n{flag_summary}\n\n## Neutral indirect-target provenance tags\n\n{provenance_tag_summary}\n\nThese tags are reported separately and do not enter either deterministic partition predicate.\n\n## Force-SAT exceptions\n\n{exception_summary}\n\nSequential shard wall sum: **{total_wall:.3}s**. Maximum observed worker RSS: **{peak_rss} KiB**. Only SHA-manifested, completed `data=true` shards feed this report; atomic `data=false` checkpoints are excluded. Production analysis and rewriter behavior remained untouched.\n"
     );
     let provenance = format!(
-        "machine_id={MACHINE_ID}\nplatform={PLATFORM}\nanalysis_head={}\nanalysis_branch=codex/a4-source-census\nbaseline_branch=analysis-lane\nbaseline_head=67bcd3cb67c1ae6f74463050033370b108854411\na4_input_root={}\na4_aggregate_manifest_sha256={A4_AGGREGATE_MANIFEST_SHA256}\na4_combined_sha256={A4_COMBINED_SHA256}\ncensus_identity_sha256={CENSUS_IDENTITY_SHA256}\nexception_identity_sha256={EXCEPTION_IDENTITY_SHA256}\nraw_corpus_digest={RAW_CORPUS_DIGEST}\nderived_substrate_digest={DERIVED_SUBSTRATE_DIGEST}\nsnapshot={SNAPSHOT_PATH}\nmemory_limit=uncapped\nwall_bound_kind=liveness\nwall_cap_s={LIVENESS_BOUND_S}\nprograms={}\ncandidates=237\nexceptions=4\nroots={}\nwall_sum_s={total_wall:.3}\npeak_rss_kb={peak_rss}\nshard_manifests={}\naggregation_input_policy=manifested-published-completed-data-true-only\ntiming_comparison=forbidden-across-machines\n",
+        "machine_id={MACHINE_ID}\nplatform={PLATFORM}\nanalysis_head={}\nanalysis_branch=codex/a4-source-census\nbaseline_branch=analysis-lane\nbaseline_head=67bcd3cb67c1ae6f74463050033370b108854411\na4_input_root={}\na4_aggregate_manifest_sha256={A4_AGGREGATE_MANIFEST_SHA256}\na4_combined_sha256={A4_COMBINED_SHA256}\ncensus_identity_sha256={CENSUS_IDENTITY_SHA256}\nexception_identity_sha256={EXCEPTION_IDENTITY_SHA256}\nraw_corpus_digest={RAW_CORPUS_DIGEST}\nderived_substrate_digest={DERIVED_SUBSTRATE_DIGEST}\nsnapshot={SNAPSHOT_PATH}\nmemory_limit=uncapped\nwall_bound_kind=liveness\nwall_cap_s={LIVENESS_BOUND_S}\nprograms={}\ncandidates=237\nexceptions=4\nroots={}\nwall_sum_s={total_wall:.3}\npeak_rss_kb={peak_rss}\nshard_analysis_heads={shard_analysis_heads}\nshard_manifests={}\naggregation_input_policy=manifested-published-completed-data-true-only\ntiming_comparison=forbidden-across-machines\n",
         contract.head,
         contract.input_root.display(),
         contract.programs.len(),
@@ -3094,6 +3720,7 @@ mod tests {
     fn singleton(flag: CauseFlag) -> RootEvidence {
         RootEvidence {
             flags: BTreeSet::from([flag]),
+            provenance_tags: BTreeSet::new(),
         }
     }
 
@@ -3222,6 +3849,7 @@ mod tests {
         assert_eq!(
             classify_roots(&[RootEvidence {
                 flags: BTreeSet::new(),
+                provenance_tags: BTreeSet::new(),
             }]),
             PrimaryClass::Unresolved
         );
@@ -3383,24 +4011,28 @@ mod tests {
             kind: TerminalKind::RecognizedAllocation,
             label: "malloc@bb0".to_owned(),
             realloc: false,
+            provenance_tags: BTreeSet::new(),
         });
         graph.add_edge(FlowEdge {
             source: "alloc-result".to_owned(),
             target: "callee-return".to_owned(),
             kind: FlowEdgeKind::Call,
             label: "return-edge".to_owned(),
+            provenance_tags: BTreeSet::new(),
         });
         graph.add_edge(FlowEdge {
             source: "callee-return".to_owned(),
             target: "other-field".to_owned(),
             kind: FlowEdgeKind::Field,
             label: "store-other-field".to_owned(),
+            provenance_tags: BTreeSet::new(),
         });
         graph.add_edge(FlowEdge {
             source: "other-field".to_owned(),
             target: "candidate".to_owned(),
             kind: FlowEdgeKind::Field,
             label: "store-candidate".to_owned(),
+            provenance_tags: BTreeSet::new(),
         });
 
         let roots = trace_candidate(&graph, "candidate");
@@ -3432,6 +4064,7 @@ mod tests {
             kind: TerminalKind::RecognizedAllocation,
             label: "malloc@bb0".to_owned(),
             realloc: true,
+            provenance_tags: BTreeSet::new(),
         });
         graph.add_terminal(TerminalRoot {
             id: "param-0".to_owned(),
@@ -3439,6 +4072,7 @@ mod tests {
             kind: TerminalKind::ExternalParameter,
             label: "public::arg1".to_owned(),
             realloc: false,
+            provenance_tags: BTreeSet::new(),
         });
         for source in ["alloc-result", "external-param", "dead-end"] {
             graph.add_edge(FlowEdge {
@@ -3446,6 +4080,7 @@ mod tests {
                 target: "candidate".to_owned(),
                 kind: FlowEdgeKind::Local,
                 label: format!("{source}->candidate"),
+                provenance_tags: BTreeSet::new(),
             });
         }
 
@@ -3484,12 +4119,14 @@ mod tests {
             kind: TerminalKind::StackOrLocalAddress,
             label: "address-of-local".to_owned(),
             realloc: false,
+            provenance_tags: BTreeSet::new(),
         });
         graph.add_edge(FlowEdge {
             source: "external-param".to_owned(),
             target: "candidate".to_owned(),
             kind: FlowEdgeKind::Local,
             label: "param-store".to_owned(),
+            provenance_tags: BTreeSet::new(),
         });
         graph.add_terminal(TerminalRoot {
             id: "external".to_owned(),
@@ -3497,6 +4134,7 @@ mod tests {
             kind: TerminalKind::ExternalParameter,
             label: "public-arg".to_owned(),
             realloc: false,
+            provenance_tags: BTreeSet::new(),
         });
 
         let roots = trace_candidate(&graph, "candidate");
@@ -3510,6 +4148,176 @@ mod tests {
                     .collect::<Vec<_>>()
             ),
             PrimaryClass::Absent
+        );
+    }
+
+    #[test]
+    fn indirect_hook_visible_default_expands_and_empty_target_stops() {
+        let targets = [IndirectTargetSpec {
+            canonical_path: "src::fixture::realloc".to_owned(),
+            kind: TerminalKind::RecognizedAllocation,
+            realloc: true,
+        }];
+        let roots = expand_indirect_target_roots("result", "fixture:bb4:call", &targets)
+            .expect("visible default target must expand");
+        assert_eq!(roots.len(), 1);
+        assert_eq!(
+            roots[0].provenance_tags,
+            BTreeSet::from(["indirect-resolved-target(src::fixture::realloc)".to_owned()])
+        );
+
+        let mut graph = SourceGraph::default();
+        for root in roots {
+            graph.add_terminal(root);
+        }
+        graph.add_edge(FlowEdge {
+            source: "result".to_owned(),
+            target: "candidate".to_owned(),
+            kind: FlowEdgeKind::Local,
+            label: "field-store".to_owned(),
+            provenance_tags: BTreeSet::new(),
+        });
+        let traced = trace_candidate(&graph, "candidate");
+        assert_eq!(
+            traced[0].evidence.flags,
+            BTreeSet::from([CauseFlag::ReallocAllocation])
+        );
+        assert_eq!(
+            traced[0].evidence.provenance_tags,
+            BTreeSet::from(["indirect-resolved-target(src::fixture::realloc)".to_owned()])
+        );
+        let rendered = evidence_tokens(&traced[0].evidence).join("|");
+        assert_eq!(
+            parse_root_evidence(&rendered),
+            Ok(traced[0].evidence.clone())
+        );
+        assert_eq!(
+            classify_roots(
+                &traced
+                    .iter()
+                    .map(|root| root.evidence.clone())
+                    .collect::<Vec<_>>()
+            ),
+            PrimaryClass::Invisible,
+            "the neutral target tag must not enter either R3 predicate"
+        );
+
+        assert!(
+            expand_indirect_target_roots("result", "fixture:bb5:call", &[])
+                .expect_err("an empty visible target set must STOP")
+                .contains("visible target set is empty")
+        );
+        assert!(
+            require_visible_targets::<u8>(&[], "fixture:bb5:call")
+                .expect_err("the production target-set gate must STOP")
+                .contains("visible target set is empty")
+        );
+    }
+
+    #[test]
+    fn indirect_resolved_flow_target_cannot_disappear() {
+        let mut graph = SourceGraph::default();
+        let tags = BTreeSet::from(["indirect-resolved-target(src::fixture::flow)".to_owned()]);
+        add_indirect_value_edge(
+            &mut graph,
+            None,
+            "candidate".to_owned(),
+            "fixture:bb6:call".to_owned(),
+            tags.clone(),
+        );
+        let roots = trace_candidate(&graph, "candidate");
+        assert_eq!(roots.len(), 1);
+        assert!(roots[0].evidence.flags.is_empty());
+        assert_eq!(roots[0].evidence.provenance_tags, tags);
+        assert_eq!(
+            classify_roots(
+                &roots
+                    .iter()
+                    .map(|root| root.evidence.clone())
+                    .collect::<Vec<_>>()
+            ),
+            PrimaryClass::Unresolved,
+            "a missing resolved flow source must STOP rather than vanish"
+        );
+    }
+
+    #[test]
+    fn mir_hook_target_collection_has_two_sided_witness() {
+        let source = r#"
+            unsafe extern "C" {
+                fn realloc(p: *mut core::ffi::c_void, n: usize) -> *mut core::ffi::c_void;
+            }
+            struct Hook {
+                call: Option<unsafe extern "C" fn(*mut core::ffi::c_void, usize) -> *mut core::ffi::c_void>,
+            }
+            unsafe fn init(hook: *mut Hook) {
+                (*hook).call = Some(realloc as unsafe extern "C" fn(*mut core::ffi::c_void, usize) -> *mut core::ffi::c_void);
+            }
+            unsafe fn visible_default(hook: *mut Hook, p: *mut core::ffi::c_void) -> *mut core::ffi::c_void {
+                ((*hook).call).expect("visible default")(p, 8)
+            }
+            struct EmptyHook {
+                call: Option<unsafe extern "C" fn(*mut core::ffi::c_void, usize) -> *mut core::ffi::c_void>,
+            }
+            unsafe fn empty_target(hook: *mut EmptyHook, p: *mut core::ffi::c_void) -> *mut core::ffi::c_void {
+                ((*hook).call).expect("no visible target")(p, 8)
+            }
+        "#;
+        ::utils::compilation::run_compiler_on_str(source, |tcx| {
+            let program = super::super::collect_program(tcx);
+            let targets = collect_visible_indirect_targets(tcx, &program.functions);
+            let by_function = |suffix: &str| {
+                targets
+                    .iter()
+                    .filter(|((function, _), _)| tcx.def_path_str(*function).ends_with(suffix))
+                    .map(|(_, targets)| {
+                        targets
+                            .iter()
+                            .map(|target| tcx.def_path_str(*target))
+                            .collect::<BTreeSet<_>>()
+                    })
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(
+                by_function("visible_default"),
+                vec![BTreeSet::from(["realloc".to_owned()])]
+            );
+            assert_eq!(by_function("empty_target"), vec![BTreeSet::new()]);
+        })
+        .unwrap_or_else(|error| error.raise());
+    }
+
+    #[test]
+    fn verified_skip_predecessor_is_exactly_manifest_pinned() {
+        let current = "new-head";
+        assert!(
+            validate_receipt_head(
+                "bst",
+                "ce11b3459c6fa46965e4cbe23ce11dffbdc7bf01",
+                "f9c23eddb3b9da283a2ebf82a4839f9f0e28c4d535f69923d38531ad397b90dd",
+                current,
+            )
+            .is_ok()
+        );
+        assert!(validate_receipt_head("bst", current, "any-current-manifest", current).is_ok());
+        assert!(
+            validate_receipt_head(
+                "bst",
+                "ce11b3459c6fa46965e4cbe23ce11dffbdc7bf01",
+                "wrong-manifest",
+                current,
+            )
+            .is_err()
+        );
+        assert!(
+            validate_receipt_head(
+                "libcsv",
+                "ce11b3459c6fa46965e4cbe23ce11dffbdc7bf01",
+                "668568ac540b2114f0b4f19728daaa82c69b5d4d7de88130ee77ba86531ff3bf",
+                current,
+            )
+            .is_err(),
+            "the data=false predecessor shard is never skippable"
         );
     }
 
