@@ -65,6 +65,11 @@ enum Command {
         #[arg(num_args = 1..)]
         observations: Vec<PathBuf>,
     },
+    PrettyPrintRules {
+        #[arg(long)]
+        output: PathBuf,
+        rules: PathBuf,
+    },
     MergeObservations {
         #[arg(long)]
         output: PathBuf,
@@ -545,6 +550,20 @@ fn main() {
             prepare_publish_destinations(&[&output])
                 .unwrap_or_else(|error| fail("output_io", error));
             publish_files(&[(&output, json.as_bytes())])
+                .unwrap_or_else(|error| fail("output_io", error));
+        }
+        Command::PrettyPrintRules { output, rules } => {
+            validate_output_input_paths(&[&output], &[&rules])
+                .unwrap_or_else(|error| fail("output_path_collision", error));
+            let text =
+                std::fs::read_to_string(&rules).unwrap_or_else(|error| fail("rule_io", error));
+            let document = tools::rule_document_from_json(&text)
+                .unwrap_or_else(|error| fail("invalid_rules", error));
+            let markdown = tools::rule_document_to_markdown(&document)
+                .unwrap_or_else(|error| fail("invalid_rules", error));
+            prepare_publish_destinations(&[&output])
+                .unwrap_or_else(|error| fail("output_io", error));
+            publish_files(&[(&output, markdown.as_bytes())])
                 .unwrap_or_else(|error| fail("output_io", error));
         }
         Command::MergeObservations {
