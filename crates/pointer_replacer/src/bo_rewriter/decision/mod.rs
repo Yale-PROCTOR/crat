@@ -29,6 +29,7 @@ use crate::analyses::borrow_ownership::{SlotKind, crate_slots::CrateSlots, solve
 pub(crate) mod co_conversion;
 pub(crate) mod construction;
 pub(crate) mod emitability;
+pub(crate) mod seam;
 pub(crate) mod universe;
 
 use emitability::EmitabilityFacts;
