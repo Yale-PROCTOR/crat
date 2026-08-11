@@ -3994,3 +3994,80 @@ fn a_mismatched_argument_gets_seam_glue_in_the_emitted_text() {
          parameter is left ill-typed:\n{source}"
     );
 }
+
+/// **REVERT COHERENCE, BOTH SIDES.** A callee's seams live and die with it.
+///
+/// # The failure mode this prevents
+///
+/// A callee reverts to a raw parameter while its caller keeps the `Some(..)`
+/// wrapping the seam inserted. That is a **reverse-direction `E0308`
+/// manufactured by our own glue** — the crate compiled before the rewrite and
+/// fails after, in a file the reverted function does not even live in. It is
+/// strictly worse than the mismatch the seam exists to fix, because the seam
+/// was supposed to be the repair.
+///
+/// # Why this is checkable at all
+///
+/// `render` filters edits by `!reverted.contains(&edit.owner_fn)`, and every
+/// seam carries the **callee's** path — not the caller's, though the edit lands
+/// in the caller's file. Reverting by justification rather than geography is
+/// what makes a caller-file edit revert with the callee that justifies it.
+///
+/// *Mutation-tested (Rider 0, deletion first):* key the seam on the CALLER
+/// (`site.caller`) instead of the callee and the reverted half fails — the glue
+/// survives its own callee's revert, which is the exact defect.
+#[test]
+fn a_reverted_callee_takes_its_seams_with_it() {
+    let src = "#![allow(dead_code, unused_unsafe, unused_mut, unused_variables)]\n\
+               pub unsafe fn callee(p: *mut i32) -> i32 {\n\
+               \x20   if p.is_null() { 0 } else { *p }\n\
+               }\n\
+               pub fn caller() {\n\
+               \x20   let mut x: i32 = 1;\n\
+               \x20   unsafe { callee(&mut x); }\n\
+               }\n";
+    let fixture = Fixture::new(&[("lib.rs", src)]);
+    let emission = emit(&fixture);
+
+    // The seam exists, and it is OWNED BY THE CALLEE — the half of the property
+    // that makes the other half possible.
+    let seam_owner = emission
+        .plan
+        .by_file
+        .values()
+        .flatten()
+        .find(|e| e.replacement.contains("Some("))
+        .map(|e| e.owner_fn.clone())
+        .expect("the fixture must produce a seam");
+    assert_eq!(
+        seam_owner, "callee",
+        "a seam must be justified by the CALLEE, though it lands in the \
+         caller's file: reverting by geography would strand it"
+    );
+
+    // ---- side 1: callee survives ⇒ the glue is present ----
+    let (kept, _) = super::render(
+        &emission.plan,
+        &emission.texts,
+        &std::collections::BTreeSet::new(),
+    );
+    assert!(
+        text_for_any(&kept).is_some_and(|t| t.contains("callee(Some(&mut x))")),
+        "with nothing reverted the seam must be in the emitted text"
+    );
+
+    // ---- side 2: callee reverts ⇒ the glue vanishes ----
+    let reverted: std::collections::BTreeSet<String> = [seam_owner].into_iter().collect();
+    let (after, _) = super::render(&emission.plan, &emission.texts, &reverted);
+    let text = text_for_any(&after).unwrap_or_default();
+    assert!(
+        !text.contains("Some("),
+        "the callee was reverted and its seam SURVIVED — the caller now wraps \
+         an argument for a parameter that went back to raw, which is a \
+         reverse-direction E0308 our own glue manufactured:\n{text}"
+    );
+    assert!(
+        !text.contains("Option<"),
+        "the callee's own declaration must revert with it:\n{text}"
+    );
+}
