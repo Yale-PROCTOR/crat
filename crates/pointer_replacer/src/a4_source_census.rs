@@ -1766,34 +1766,132 @@ fn command_stdout(mut command: Command, description: &str) -> String {
 }
 
 fn sha256(path: &Path) -> String {
-    let mut command = Command::new("sha256sum");
-    command.arg(path);
-    command_stdout(command, &format!("sha256 {}", path.display()))
-        .split_whitespace()
-        .next()
-        .expect("sha256sum emitted digest")
-        .to_owned()
+    try_sha256(path).unwrap_or_else(|error| panic!("sha256 {}: {error}", path.display()))
 }
 
 fn sha256_text(input: &str) -> String {
+    try_sha256_text(input).expect("sha256sum text failed")
+}
+
+fn try_sha256(path: &Path) -> Result<String, String> {
+    let output = Command::new("sha256sum")
+        .arg(path)
+        .output()
+        .map_err(|error| format!("spawn sha256sum: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "sha256sum failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    String::from_utf8_lossy(&output.stdout)
+        .split_whitespace()
+        .next()
+        .map(str::to_owned)
+        .ok_or_else(|| "sha256sum emitted no digest".to_owned())
+}
+
+fn try_sha256_text(input: &str) -> Result<String, String> {
     let mut child = Command::new("sha256sum")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .spawn()
-        .expect("spawn sha256sum");
+        .map_err(|error| format!("spawn sha256sum: {error}"))?;
     child
         .stdin
         .take()
-        .expect("sha256sum stdin")
+        .ok_or_else(|| "sha256sum stdin unavailable".to_owned())?
         .write_all(input.as_bytes())
-        .expect("write sha256sum input");
-    let output = child.wait_with_output().expect("wait for sha256sum");
-    assert!(output.status.success(), "sha256sum text failed");
+        .map_err(|error| format!("write sha256sum input: {error}"))?;
+    let output = child
+        .wait_with_output()
+        .map_err(|error| format!("wait for sha256sum: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "sha256sum text failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
     String::from_utf8_lossy(&output.stdout)
         .split_whitespace()
         .next()
-        .expect("sha256sum text emitted digest")
-        .to_owned()
+        .map(str::to_owned)
+        .ok_or_else(|| "sha256sum text emitted no digest".to_owned())
+}
+
+fn collect_digest_files(
+    root: &Path,
+    current: &Path,
+    files: &mut Vec<(String, String)>,
+) -> Result<(), String> {
+    let mut entries = fs::read_dir(current)
+        .map_err(|error| format!("read digest directory {}: {error}", current.display()))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("read digest entry in {}: {error}", current.display()))?;
+    entries.sort_by_key(|entry| entry.file_name());
+    for entry in entries {
+        let path = entry.path();
+        let metadata = fs::symlink_metadata(&path)
+            .map_err(|error| format!("inspect digest path {}: {error}", path.display()))?;
+        if metadata.file_type().is_symlink() {
+            continue;
+        }
+        if metadata.is_dir() {
+            if entry.file_name() != "target" {
+                collect_digest_files(root, &path, files)?;
+            }
+        } else if metadata.is_file() {
+            let relative = path
+                .strip_prefix(root)
+                .map_err(|error| format!("relativize {}: {error}", path.display()))?
+                .to_str()
+                .ok_or_else(|| format!("non-UTF-8 digest path: {}", path.display()))?
+                .to_owned();
+            files.push((relative, try_sha256(&path)?));
+        }
+    }
+    Ok(())
+}
+
+fn tree_digest(root: &Path) -> Result<String, String> {
+    let mut files = Vec::new();
+    collect_digest_files(root, root, &mut files)?;
+    files.sort();
+    let mut input = String::new();
+    for (relative, digest) in files {
+        input.push_str(&relative);
+        input.push('\0');
+        input.push_str(&digest);
+        input.push('\n');
+    }
+    try_sha256_text(&input)
+}
+
+fn derived_substrate_digest(root: &Path) -> Result<String, String> {
+    let mut programs = fs::read_dir(root)
+        .map_err(|error| format!("read substrate root {}: {error}", root.display()))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("read substrate entry in {}: {error}", root.display()))?;
+    programs.sort_by_key(|entry| entry.file_name());
+    let mut input = String::new();
+    for program in programs {
+        let path = program.path();
+        let metadata = fs::symlink_metadata(&path)
+            .map_err(|error| format!("inspect substrate path {}: {error}", path.display()))?;
+        if program.file_name() == "_logs" || metadata.file_type().is_symlink() || !metadata.is_dir()
+        {
+            continue;
+        }
+        let name = program
+            .file_name()
+            .into_string()
+            .map_err(|_| format!("non-UTF-8 program path: {}", path.display()))?;
+        input.push_str(&name);
+        input.push('\0');
+        input.push_str(&tree_digest(&path)?);
+        input.push('\n');
+    }
+    try_sha256_text(&input)
 }
 
 fn write_manifest(dir: &Path, files: &[&str]) -> Result<String, String> {
@@ -1959,6 +2057,251 @@ struct MeasurementContract {
     input: Vec<A4InputRow>,
     programs: Vec<super::CorpusProgram>,
     head: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SubstratePreflightStatus {
+    Ok,
+    LinkMissing,
+    LinkNotSymlink,
+    TargetUnreadable,
+    InputUnreadable,
+    DigestUnreadable,
+    DigestMismatch,
+}
+
+impl SubstratePreflightStatus {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Ok => "ok",
+            Self::LinkMissing => "substrate-link-missing",
+            Self::LinkNotSymlink => "substrate-link-not-symlink",
+            Self::TargetUnreadable => "substrate-target-unreadable",
+            Self::InputUnreadable => "substrate-input-unreadable",
+            Self::DigestUnreadable => "substrate-digest-unreadable",
+            Self::DigestMismatch => "substrate-digest-mismatch",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SubstratePreflight {
+    status: SubstratePreflightStatus,
+    link_path: PathBuf,
+    target_path: Option<PathBuf>,
+    expected_digest: String,
+    actual_digest: Option<String>,
+    inputs_verified: usize,
+    detail: String,
+}
+
+fn preflight_failure(
+    status: SubstratePreflightStatus,
+    link_path: PathBuf,
+    target_path: Option<PathBuf>,
+    expected_digest: &str,
+    actual_digest: Option<String>,
+    inputs_verified: usize,
+    detail: String,
+) -> SubstratePreflight {
+    SubstratePreflight {
+        status,
+        link_path,
+        target_path,
+        expected_digest: expected_digest.to_owned(),
+        actual_digest,
+        inputs_verified,
+        detail,
+    }
+}
+
+fn inspect_substrate(
+    workspace: &Path,
+    inputs: &[(&str, &str)],
+    expected_digest: &str,
+) -> SubstratePreflight {
+    let link_path = workspace.join("benchmarks/rs-crown-derived");
+    let metadata = match fs::symlink_metadata(&link_path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return preflight_failure(
+                SubstratePreflightStatus::LinkMissing,
+                link_path,
+                None,
+                expected_digest,
+                None,
+                0,
+                error.to_string(),
+            );
+        }
+        Err(error) => {
+            return preflight_failure(
+                SubstratePreflightStatus::TargetUnreadable,
+                link_path,
+                None,
+                expected_digest,
+                None,
+                0,
+                error.to_string(),
+            );
+        }
+    };
+    if !metadata.file_type().is_symlink() {
+        return preflight_failure(
+            SubstratePreflightStatus::LinkNotSymlink,
+            link_path,
+            None,
+            expected_digest,
+            None,
+            0,
+            "substrate path exists but is not a symlink".to_owned(),
+        );
+    }
+    let target_path = match fs::canonicalize(&link_path) {
+        Ok(target) if target.is_dir() => target,
+        Ok(target) => {
+            return preflight_failure(
+                SubstratePreflightStatus::TargetUnreadable,
+                link_path,
+                Some(target.clone()),
+                expected_digest,
+                None,
+                0,
+                format!("substrate target is not a directory: {}", target.display()),
+            );
+        }
+        Err(error) => {
+            return preflight_failure(
+                SubstratePreflightStatus::TargetUnreadable,
+                link_path,
+                None,
+                expected_digest,
+                None,
+                0,
+                error.to_string(),
+            );
+        }
+    };
+    let mut inputs_verified = 0;
+    for &(program, lib_root) in inputs {
+        let input = link_path.join(program).join(lib_root);
+        let readable = fs::metadata(&input).is_ok_and(|metadata| metadata.is_file())
+            && fs::File::open(&input).is_ok();
+        if !readable {
+            return preflight_failure(
+                SubstratePreflightStatus::InputUnreadable,
+                link_path,
+                Some(target_path),
+                expected_digest,
+                None,
+                inputs_verified,
+                format!("input is not a readable file: {}", input.display()),
+            );
+        }
+        inputs_verified += 1;
+    }
+    let actual_digest = match derived_substrate_digest(&target_path) {
+        Ok(digest) => digest,
+        Err(error) => {
+            return preflight_failure(
+                SubstratePreflightStatus::DigestUnreadable,
+                link_path,
+                Some(target_path),
+                expected_digest,
+                None,
+                inputs_verified,
+                error,
+            );
+        }
+    };
+    if actual_digest != expected_digest {
+        return preflight_failure(
+            SubstratePreflightStatus::DigestMismatch,
+            link_path,
+            Some(target_path),
+            expected_digest,
+            Some(actual_digest),
+            inputs_verified,
+            "derived substrate digest does not match the pinned digest".to_owned(),
+        );
+    }
+    SubstratePreflight {
+        status: SubstratePreflightStatus::Ok,
+        link_path,
+        target_path: Some(target_path),
+        expected_digest: expected_digest.to_owned(),
+        actual_digest: Some(actual_digest),
+        inputs_verified,
+        detail: "link, inputs, and digest verified".to_owned(),
+    }
+}
+
+fn receipt_value(value: &str) -> String {
+    value.replace(['\n', '\r', '\t'], " ")
+}
+
+fn write_substrate_preflight(
+    run_root: &Path,
+    head: &str,
+    result: &SubstratePreflight,
+) -> Result<String, String> {
+    fs::create_dir_all(run_root)
+        .map_err(|error| format!("create run root {}: {error}", run_root.display()))?;
+    let dir = run_root.join("preflight");
+    fs::create_dir_all(&dir)
+        .map_err(|error| format!("create preflight directory {}: {error}", dir.display()))?;
+    let target = result
+        .target_path
+        .as_deref()
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|| "none".to_owned());
+    let actual = result.actual_digest.as_deref().unwrap_or("none");
+    let receipt = format!(
+        "machine_id={MACHINE_ID}\nplatform={PLATFORM}\nphase=substrate-preflight\nstatus={}\nmeasurement_started=false\nanalysis_head={head}\nsubstrate_link={}\nsubstrate_target={}\nexpected_digest={}\nactual_digest={}\ninputs_verified={}\ndetail={}\n",
+        result.status.as_str(),
+        result.link_path.display(),
+        target,
+        result.expected_digest,
+        actual,
+        result.inputs_verified,
+        receipt_value(&result.detail),
+    );
+    write_atomic_checkpoint(&dir.join("receipt.txt"), &receipt)
+        .map_err(|error| format!("write substrate preflight receipt: {error}"))?;
+    let manifest = write_manifest(&dir, &["receipt.txt"])?;
+    let verified = verify_manifest(&dir)?;
+    if manifest != verified {
+        return Err("substrate preflight manifest digest drift".to_owned());
+    }
+    Ok(manifest)
+}
+
+fn enforce_substrate_preflight(contract: &MeasurementContract) {
+    use super::orchestrate::workspace_root;
+
+    let inputs = super::CORPUS
+        .iter()
+        .map(|program| (program.name, program.lib_root))
+        .collect::<Vec<_>>();
+    let result = inspect_substrate(&workspace_root(), &inputs, DERIVED_SUBSTRATE_DIGEST);
+    let manifest = write_substrate_preflight(&contract.run_root, &contract.head, &result)
+        .unwrap_or_else(|error| {
+            panic!(
+                "A4C STOP phase=substrate-preflight candidate=none status=preflight-receipt-error measurement_started=false: {error}"
+            )
+        });
+    assert_eq!(
+        result.status,
+        SubstratePreflightStatus::Ok,
+        "A4C STOP phase=substrate-preflight candidate=none status={} measurement_started=false manifest={manifest} detail={}",
+        result.status.as_str(),
+        result.detail,
+    );
+    eprintln!(
+        "A4C preflight complete status=ok inputs={} digest={} manifest={manifest}",
+        result.inputs_verified,
+        result.actual_digest.as_deref().unwrap_or("none"),
+    );
 }
 
 fn measurement_contract() -> MeasurementContract {
@@ -2685,9 +3028,7 @@ fn aggregate(contract: &MeasurementContract) {
 #[ignore = "A4 source census; run sequentially on the dedicated Linux lane"]
 fn a4_source_census() {
     let contract = measurement_contract();
-    if !contract.run_root.exists() {
-        fs::create_dir(&contract.run_root).expect("create run root");
-    }
+    enforce_substrate_preflight(&contract);
     for &program in &contract.programs {
         run_shard(&contract, program);
     }
@@ -3077,6 +3418,85 @@ mod tests {
                     .collect::<Vec<_>>()
             ),
             PrimaryClass::Absent
+        );
+    }
+
+    fn preflight_fixture(label: &str) -> (PathBuf, PathBuf) {
+        let root = std::env::temp_dir().join(format!(
+            "crat-a4-source-preflight-{label}-{}",
+            process::id()
+        ));
+        if root.exists() {
+            fs::remove_dir_all(&root).unwrap();
+        }
+        let workspace = root.join("worktree");
+        let substrate = root.join("substrate");
+        fs::create_dir_all(workspace.join("benchmarks")).unwrap();
+        fs::create_dir_all(substrate.join("bst")).unwrap();
+        fs::write(substrate.join("bst/lib.rs"), "pub fn fixture() {}\n").unwrap();
+        (workspace, substrate)
+    }
+
+    #[test]
+    fn substrate_preflight_missing_link_is_setup_not_shard_data() {
+        let (workspace, _substrate) = preflight_fixture("missing-link");
+        let run_root = workspace.parent().unwrap().join("run");
+        let result = inspect_substrate(&workspace, &[("bst", "lib.rs")], "unused");
+        assert_eq!(result.status, SubstratePreflightStatus::LinkMissing);
+
+        let manifest = write_substrate_preflight(&run_root, "fixture-head", &result).unwrap();
+        assert_eq!(
+            verify_manifest(&run_root.join("preflight")).unwrap(),
+            manifest
+        );
+        let receipt = fs::read_to_string(run_root.join("preflight/receipt.txt")).unwrap();
+        assert!(receipt.contains("status=substrate-link-missing\n"));
+        assert!(receipt.contains("measurement_started=false\n"));
+        assert!(!receipt.contains("data=false"));
+        assert!(!run_root.join("shards").exists());
+
+        fs::remove_dir_all(workspace.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn substrate_preflight_digest_gate_has_two_sided_witness() {
+        let (workspace, substrate) = preflight_fixture("digest");
+        std::os::unix::fs::symlink(&substrate, workspace.join("benchmarks/rs-crown-derived"))
+            .unwrap();
+
+        let actual = derived_substrate_digest(&substrate).unwrap();
+        let mismatch = inspect_substrate(&workspace, &[("bst", "lib.rs")], &"0".repeat(64));
+        assert_eq!(mismatch.status, SubstratePreflightStatus::DigestMismatch);
+        assert_eq!(mismatch.actual_digest.as_deref(), Some(actual.as_str()));
+
+        let valid = inspect_substrate(&workspace, &[("bst", "lib.rs")], &actual);
+        assert_eq!(valid.status, SubstratePreflightStatus::Ok);
+        assert_eq!(valid.inputs_verified, 1);
+
+        fs::remove_file(substrate.join("bst/lib.rs")).unwrap();
+        let unreadable = inspect_substrate(&workspace, &[("bst", "lib.rs")], &actual);
+        assert_eq!(unreadable.status, SubstratePreflightStatus::InputUnreadable);
+
+        fs::remove_dir_all(workspace.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    #[ignore = "lambda7 real-substrate preflight positive control"]
+    fn substrate_preflight_real_link_and_digest_match() {
+        let inputs = super::super::CORPUS
+            .iter()
+            .map(|program| (program.name, program.lib_root))
+            .collect::<Vec<_>>();
+        let result = inspect_substrate(
+            &super::super::orchestrate::workspace_root(),
+            &inputs,
+            DERIVED_SUBSTRATE_DIGEST,
+        );
+        assert_eq!(result.status, SubstratePreflightStatus::Ok, "{result:?}");
+        assert_eq!(result.inputs_verified, 20);
+        assert_eq!(
+            result.actual_digest.as_deref(),
+            Some(DERIVED_SUBSTRATE_DIGEST)
         );
     }
 }
