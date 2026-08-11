@@ -2469,6 +2469,27 @@ fn expected_identities(
         .collect()
 }
 
+fn validate_unique_root_rows(roots: &[Vec<String>]) -> Result<(), String> {
+    let mut seen = BTreeSet::new();
+    for row in roots {
+        let identity = (
+            row[0].clone(),
+            row[1].clone(),
+            row[2].clone(),
+            row[3].clone(),
+            row[4].clone(),
+            row[7].clone(),
+        );
+        if !seen.insert(identity) {
+            return Err(format!(
+                "duplicate root-path identity at {} {} path={}",
+                row[2], row[4], row[7]
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn validate_shard(contract: &MeasurementContract, program: &str, dir: &Path) -> Result<(), String> {
     let candidates = parse_table(&dir.join("candidates.tsv"), CANDIDATE_HEADER, 7)?;
     let roots = parse_table(&dir.join("roots.tsv"), ROOT_HEADER, 8)?;
@@ -2497,7 +2518,7 @@ fn validate_shard(contract: &MeasurementContract, program: &str, dir: &Path) -> 
     )?;
     let candidate_id_set = candidate_ids.iter().cloned().collect::<BTreeSet<_>>();
     let exception_id_set = exception_ids.iter().cloned().collect::<BTreeSet<_>>();
-    let mut seen_roots = BTreeSet::new();
+    validate_unique_root_rows(&roots)?;
     let mut root_counts = BTreeMap::<(String, String), usize>::new();
     let mut root_evidence = BTreeMap::<(String, String), Vec<RootEvidence>>::new();
     for row in &roots {
@@ -2526,15 +2547,6 @@ fn validate_shard(contract: &MeasurementContract, program: &str, dir: &Path) -> 
             .split('|')
             .map(parse_cause_flag)
             .collect::<Result<BTreeSet<_>, _>>()?;
-        if !seen_roots.insert((
-            row[0].clone(),
-            identity.program.clone(),
-            identity.field_key.clone(),
-            row[3].clone(),
-            row[4].clone(),
-        )) {
-            return Err(format!("duplicate root identity at {} {}", row[2], row[4]));
-        }
         *root_counts
             .entry((identity.program.clone(), identity.field_key.clone()))
             .or_default() += 1;
@@ -3296,6 +3308,24 @@ mod tests {
         fs::write(&path, "wrong\theader\n").unwrap();
         assert!(parse_table(&path, CANDIDATE_HEADER, 7).is_err());
         fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn root_row_identity_distinguishes_paths_and_rejects_exact_duplicates() {
+        let root = vec![
+            "census".to_owned(),
+            "bst".to_owned(),
+            "src::bst::node::field1@d0".to_owned(),
+            "transfer:src::bst::insert:bb7[2]".to_owned(),
+            "RecognizedAllocation:newNode:malloc".to_owned(),
+            "allocator:newNode:malloc".to_owned(),
+            "interprocedural-allocation".to_owned(),
+            "malloc -> insert-return -> field-store".to_owned(),
+        ];
+        let mut distinct_path = root.clone();
+        distinct_path[7] = "malloc -> insert-return -> recursive-arg -> field-store".to_owned();
+        assert!(validate_unique_root_rows(&[root.clone(), distinct_path]).is_ok());
+        assert!(validate_unique_root_rows(&[root.clone(), root]).is_err());
     }
 
     #[test]
