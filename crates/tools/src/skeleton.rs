@@ -431,7 +431,7 @@ fn make_function_record<'tcx>(
     let opaque_nested_ifs = collect_opaque_nested_ifs(&source, &surface.path)?;
     annotate_function(&mut source, &opaque_nested_ifs);
     PresentationBindingNormalizer.visit_item(&mut source);
-    let statements_requiring_transformation = classify_function_statements(
+    let statement_classification = classify_function_statements(
         &source,
         &opaque_nested_ifs,
         ast_to_hir,
@@ -439,6 +439,8 @@ fn make_function_record<'tcx>(
         preservation_overrides,
         tcx,
     );
+    let statements_requiring_transformation = statement_classification.transformed;
+    let preserved_shell_statements = statement_classification.preserved_shells;
     let mut target = source.clone();
     let type_speller = TypeSpeller::new(surface.def_id, ast_to_hir, tcx);
     apply_target_signature(
@@ -474,6 +476,7 @@ fn make_function_record<'tcx>(
         ast_to_hir,
         decisions,
         statements_requiring_transformation: &statements_requiring_transformation,
+        preserved_shell_statements: &preserved_shell_statements,
         rule_applied_statements: &no_rule_applications,
         type_speller: &type_speller,
         function_path: &surface.path,
@@ -489,6 +492,7 @@ fn make_function_record<'tcx>(
         ast_to_hir,
         decisions,
         statements_requiring_transformation: &applied_transformations,
+        preserved_shell_statements: &preserved_shell_statements,
         rule_applied_statements: &rule_applied_statements,
         type_speller: &type_speller,
         function_path: &surface.path,
@@ -541,8 +545,17 @@ fn make_function_record<'tcx>(
         .iter()
         .copied()
         .collect::<std::collections::HashSet<_>>();
-    let dispositions = make_disposition_forest(&baseline_skeleton, &transformed, &HashSet::new())
-        .map_err(|error| GenerationError {
+    let preserved_shells = preserved_shell_statements
+        .iter()
+        .copied()
+        .collect::<HashSet<_>>();
+    let dispositions = make_disposition_forest(
+        &baseline_skeleton,
+        &transformed,
+        &preserved_shells,
+        &HashSet::new(),
+    )
+    .map_err(|error| GenerationError {
         kind: GenerationErrorKind::AstHirMismatch,
         function_path: surface.path.clone(),
         message: error.message,
@@ -561,14 +574,17 @@ fn make_function_record<'tcx>(
         .iter()
         .copied()
         .collect::<HashSet<_>>();
-    let applied_dispositions =
-        make_disposition_forest(&applied_skeleton, &applied_transformed, &applied_rules).map_err(
-            |error| GenerationError {
-                kind: GenerationErrorKind::AstHirMismatch,
-                function_path: surface.path.clone(),
-                message: error.message,
-            },
-        )?;
+    let applied_dispositions = make_disposition_forest(
+        &applied_skeleton,
+        &applied_transformed,
+        &preserved_shells,
+        &applied_rules,
+    )
+    .map_err(|error| GenerationError {
+        kind: GenerationErrorKind::AstHirMismatch,
+        function_path: surface.path.clone(),
+        message: error.message,
+    })?;
     let applied = SkeletonView {
         skeleton: render_annotated_item(&applied_skeleton),
         needs_transformation: !applied_transformations.is_empty(),
@@ -3322,6 +3338,11 @@ fn type_spelling_error<'tcx>(
     }
 }
 
+struct StatementClassification {
+    transformed: BTreeSet<u32>,
+    preserved_shells: BTreeSet<u32>,
+}
+
 fn classify_function_statements(
     item: &Item,
     opaque_nested_ifs: &FxHashSet<NodeId>,
@@ -3329,7 +3350,7 @@ fn classify_function_statements(
     decisions: &InitialPointerDecisions,
     preservation_overrides: &PreservationDecisionOverrides,
     tcx: TyCtxt<'_>,
-) -> BTreeSet<u32> {
+) -> StatementClassification {
     let ItemKind::Fn(box function) = &item.kind else { unreachable!() };
     let mut classifier = StatementClassifier {
         ast_to_hir,
@@ -3338,6 +3359,7 @@ fn classify_function_statements(
         opaque_nested_ifs,
         tcx,
         transformed: BTreeSet::new(),
+        preserved_shells: BTreeSet::new(),
     };
     classifier.visit_block(
         function
@@ -3345,7 +3367,10 @@ fn classify_function_statements(
             .as_ref()
             .expect("source-defined function has a body"),
     );
-    classifier.transformed
+    StatementClassification {
+        transformed: classifier.transformed,
+        preserved_shells: classifier.preserved_shells,
+    }
 }
 
 struct StatementClassifier<'a, 'tcx> {
@@ -3355,6 +3380,7 @@ struct StatementClassifier<'a, 'tcx> {
     opaque_nested_ifs: &'a FxHashSet<NodeId>,
     tcx: TyCtxt<'tcx>,
     transformed: BTreeSet<u32>,
+    preserved_shells: BTreeSet<u32>,
 }
 
 impl<'ast> visit::Visitor<'ast> for StatementClassifier<'_, '_> {
@@ -3368,7 +3394,17 @@ impl<'ast> visit::Visitor<'ast> for StatementClassifier<'_, '_> {
             self.preservation_overrides,
             self.tcx,
         ) {
-            self.transformed.insert(label);
+            if statement_shell_is_preservable(
+                statement,
+                self.ast_to_hir,
+                self.decisions,
+                self.preservation_overrides,
+                self.tcx,
+            ) {
+                self.preserved_shells.insert(label);
+            } else {
+                self.transformed.insert(label);
+            }
         }
         visit::walk_stmt(self, statement);
     }
@@ -3388,9 +3424,83 @@ fn statement_is_preservable(
     preservation_overrides: &PreservationDecisionOverrides,
     tcx: TyCtxt<'_>,
 ) -> bool {
+    statement_is_preservable_excluding(
+        statement,
+        &FxHashSet::default(),
+        &FxHashSet::default(),
+        ast_to_hir,
+        decisions,
+        preservation_overrides,
+        tcx,
+    )
+}
+
+fn statement_shell_is_preservable(
+    statement: &Stmt,
+    ast_to_hir: &utils::ir::AstToHir,
+    decisions: &InitialPointerDecisions,
+    preservation_overrides: &PreservationDecisionOverrides,
+    tcx: TyCtxt<'_>,
+) -> bool {
+    let mut collector = NestedLabeledStatementCollector {
+        root: statement.id,
+        statements: FxHashSet::default(),
+    };
+    collector.visit_stmt(statement);
+    if collector.statements.is_empty() {
+        return false;
+    }
+    let mut excluded_hir = FxHashSet::default();
+    for node_id in &collector.statements {
+        let Some(node) = ast_to_hir.get_local_node(*node_id, tcx) else {
+            return false;
+        };
+        let hir_id = match node {
+            hir::Node::Stmt(statement) => statement.hir_id,
+            hir::Node::Expr(expression) => expression.hir_id,
+            _ => return false,
+        };
+        excluded_hir.insert(hir_id);
+    }
+    statement_is_preservable_excluding(
+        statement,
+        &collector.statements,
+        &excluded_hir,
+        ast_to_hir,
+        decisions,
+        preservation_overrides,
+        tcx,
+    )
+}
+
+struct NestedLabeledStatementCollector {
+    root: NodeId,
+    statements: FxHashSet<NodeId>,
+}
+
+impl<'ast> visit::Visitor<'ast> for NestedLabeledStatementCollector {
+    fn visit_stmt(&mut self, statement: &'ast Stmt) {
+        if statement.id != self.root && statement_numeric_label(statement).is_some() {
+            self.statements.insert(statement.id);
+            return;
+        }
+        visit::walk_stmt(self, statement);
+    }
+}
+
+fn statement_is_preservable_excluding(
+    statement: &Stmt,
+    excluded_ast: &FxHashSet<NodeId>,
+    excluded_hir: &FxHashSet<HirId>,
+    ast_to_hir: &utils::ir::AstToHir,
+    decisions: &InitialPointerDecisions,
+    preservation_overrides: &PreservationDecisionOverrides,
+    tcx: TyCtxt<'_>,
+) -> bool {
     let mut surface = SurfacePreservationCheck {
         ast_to_hir,
         tcx,
+        excluded_statements: excluded_ast,
         preservable: true,
     };
     surface.visit_stmt(statement);
@@ -3411,6 +3521,7 @@ fn statement_is_preservable(
         preservation_overrides,
         owner,
         direct_callee: None,
+        excluded_roots: excluded_hir,
         preservable: true,
         sensitive_types: FxHashMap::default(),
         visiting_types: FxHashSet::default(),
@@ -3426,11 +3537,15 @@ fn statement_is_preservable(
 struct SurfacePreservationCheck<'a, 'tcx> {
     ast_to_hir: &'a utils::ir::AstToHir,
     tcx: TyCtxt<'tcx>,
+    excluded_statements: &'a FxHashSet<NodeId>,
     preservable: bool,
 }
 
 impl<'ast> visit::Visitor<'ast> for SurfacePreservationCheck<'_, '_> {
     fn visit_stmt(&mut self, statement: &'ast Stmt) {
+        if self.excluded_statements.contains(&statement.id) {
+            return;
+        }
         if !self.ast_to_hir.local_map.contains_key(&statement.id)
             || matches!(statement.kind, StmtKind::MacCall(..))
         {
@@ -3487,6 +3602,7 @@ struct HirPreservationCheck<'tcx, 'a> {
     preservation_overrides: &'a PreservationDecisionOverrides,
     owner: hir::OwnerId,
     direct_callee: Option<HirId>,
+    excluded_roots: &'a FxHashSet<HirId>,
     preservable: bool,
     sensitive_types: FxHashMap<ty::Ty<'tcx>, bool>,
     visiting_types: FxHashSet<ty::Ty<'tcx>>,
@@ -3665,7 +3781,7 @@ impl<'tcx> HirPreservationCheck<'tcx, '_> {
 
 impl<'tcx> Visitor<'tcx> for HirPreservationCheck<'tcx, '_> {
     fn visit_stmt(&mut self, statement: &'tcx hir::Stmt<'tcx>) {
-        if !self.preservable {
+        if !self.preservable || self.excluded_roots.contains(&statement.hir_id) {
             return;
         }
         intravisit::walk_stmt(self, statement);
@@ -3686,7 +3802,7 @@ impl<'tcx> Visitor<'tcx> for HirPreservationCheck<'tcx, '_> {
     }
 
     fn visit_expr(&mut self, expression: &'tcx hir::Expr<'tcx>) {
-        if !self.preservable {
+        if !self.preservable || self.excluded_roots.contains(&expression.hir_id) {
             return;
         }
         self.check_expression_types(expression);
@@ -3774,6 +3890,7 @@ struct Skeletonizer<'a, 'tcx> {
     ast_to_hir: &'a utils::ir::AstToHir,
     decisions: &'a InitialPointerDecisions,
     statements_requiring_transformation: &'a BTreeSet<u32>,
+    preserved_shell_statements: &'a BTreeSet<u32>,
     rule_applied_statements: &'a BTreeSet<u32>,
     type_speller: &'a TypeSpeller<'a, 'tcx>,
     function_path: &'a str,
@@ -3790,6 +3907,8 @@ impl MutVisitor for Skeletonizer<'_, '_> {
             .is_none_or(|label| self.statements_requiring_transformation.contains(&label));
         let rule_applied = statement_numeric_label(&stmt)
             .is_some_and(|label| self.rule_applied_statements.contains(&label));
+        let preserved_shell = statement_numeric_label(&stmt)
+            .is_some_and(|label| self.preserved_shell_statements.contains(&label));
         if let StmtKind::Let(local) = &mut stmt.kind
             && let PatKind::Ident(_, _, None) = local.pat.kind
             && let Some(hir_id) = self.ast_to_hir.local_map.get(&local.pat.id).copied()
@@ -3850,7 +3969,7 @@ impl MutVisitor for Skeletonizer<'_, '_> {
             }
         }
         if !requires_transformation {
-            if rule_applied {
+            if rule_applied || preserved_shell {
                 self.visit_labeled_descendants(&mut stmt);
             }
             return smallvec![stmt];

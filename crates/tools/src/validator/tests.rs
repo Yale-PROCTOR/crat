@@ -13,6 +13,7 @@ fn skeleton_view(skeleton: &str, transformed: Vec<u32>, needs: bool) -> Skeleton
                         item,
                         &transformed_set,
                         &HashSet::new(),
+                        &HashSet::new(),
                     )
                     .ok()
                 })
@@ -93,6 +94,7 @@ fn mixed_preservation_request(
                 statement_dispositions: crate::preservation::make_disposition_forest(
                     &krate.items[0],
                     &transformed.iter().copied().collect(),
+                    &HashSet::new(),
                     &rule_applied.iter().copied().collect(),
                 )
                 .unwrap(),
@@ -269,6 +271,21 @@ fn mixed_rule_applied_slots_validate_in_both_topologies() {
             .is_valid()
         );
     }
+}
+
+#[test]
+fn preserved_shell_restores_control_operand_while_validating_open_child() {
+    let skeleton = r#"unsafe fn f(flag: bool) {
+#[proctor(0)] if flag { #[proctor(1)] consume(1); }
+}"#;
+    let transformation = r#"unsafe fn f(flag: bool) {
+#[proctor(0)] if !flag { #[proctor(1)] consume(2); }
+}"#;
+    let mut request = mixed_preservation_request(skeleton, &[1], &[], transformation);
+    request.expected_functions[0].view.statement_dispositions[0].disposition =
+        StatementDispositionKind::PreserveShell;
+
+    assert!(validate(&request).is_valid());
 }
 
 #[test]

@@ -46,6 +46,7 @@ pub struct StatementDisposition {
 #[serde(rename_all = "snake_case")]
 pub enum StatementDispositionKind {
     Preserve,
+    PreserveShell,
     Transform,
     RuleApplied,
 }

@@ -19,12 +19,15 @@ pub(crate) struct PreservationError {
 pub(crate) fn make_disposition_forest(
     item: &Item,
     transformed: &HashSet<u32>,
+    preserved_shells: &HashSet<u32>,
     rule_applied: &HashSet<u32>,
 ) -> Result<Vec<StatementDisposition>, PreservationError> {
     let topology = collect_label_topology(item)?;
     let parents = topology.iter().copied().collect::<HashMap<_, _>>();
     if let Some(label) = transformed
-        .union(rule_applied)
+        .union(preserved_shells)
+        .copied()
+        .chain(rule_applied.iter().copied())
         .find(|label| !parents.contains_key(label))
     {
         return Err(metadata_error(
@@ -38,10 +41,21 @@ pub(crate) fn make_disposition_forest(
             format!("label {label} cannot be both transform and rule_applied"),
         ));
     }
+    if let Some(label) = preserved_shells
+        .intersection(transformed)
+        .chain(preserved_shells.intersection(rule_applied))
+        .next()
+    {
+        return Err(metadata_error(
+            "conflicting_disposition",
+            format!("label {label} has conflicting statement dispositions"),
+        ));
+    }
     fn build(
         parent: Option<u32>,
         topology: &[(u32, Option<u32>)],
         transformed: &HashSet<u32>,
+        preserved_shells: &HashSet<u32>,
         rule_applied: &HashSet<u32>,
     ) -> Vec<StatementDisposition> {
         let labels = topology
@@ -54,16 +68,30 @@ pub(crate) fn make_disposition_forest(
                 label,
                 disposition: if transformed.contains(&label) {
                     StatementDispositionKind::Transform
+                } else if preserved_shells.contains(&label) {
+                    StatementDispositionKind::PreserveShell
                 } else if rule_applied.contains(&label) {
                     StatementDispositionKind::RuleApplied
                 } else {
                     StatementDispositionKind::Preserve
                 },
-                children: build(Some(label), topology, transformed, rule_applied),
+                children: build(
+                    Some(label),
+                    topology,
+                    transformed,
+                    preserved_shells,
+                    rule_applied,
+                ),
             })
             .collect()
     }
-    Ok(build(None, &topology, transformed, rule_applied))
+    Ok(build(
+        None,
+        &topology,
+        transformed,
+        preserved_shells,
+        rule_applied,
+    ))
 }
 
 pub(crate) fn validate_skeleton_view(
@@ -162,10 +190,12 @@ pub(crate) fn canonicalize_function_with_view(
 ) -> Result<P<Item>, PreservationError> {
     validate_skeleton_view(expected, view)?;
     let mut transformed = HashSet::new();
+    let mut preserved_shells = HashSet::new();
     let mut rule_applied = HashSet::new();
     fn collect(
         nodes: &[StatementDisposition],
         transformed: &mut HashSet<u32>,
+        preserved_shells: &mut HashSet<u32>,
         rule_applied: &mut HashSet<u32>,
     ) {
         for node in nodes {
@@ -176,20 +206,25 @@ pub(crate) fn canonicalize_function_with_view(
                 StatementDispositionKind::RuleApplied => {
                     rule_applied.insert(node.label);
                 }
+                StatementDispositionKind::PreserveShell => {
+                    preserved_shells.insert(node.label);
+                }
                 StatementDispositionKind::Preserve => {}
             }
-            collect(&node.children, transformed, rule_applied);
+            collect(&node.children, transformed, preserved_shells, rule_applied);
         }
     }
     collect(
         &view.statement_dispositions,
         &mut transformed,
+        &mut preserved_shells,
         &mut rule_applied,
     );
     canonicalize_function_impl_sets(
         expected,
         result,
         &transformed,
+        &preserved_shells,
         &rule_applied,
         require_complete_alignment,
     )
@@ -199,6 +234,7 @@ fn canonicalize_function_impl_sets(
     expected: &Item,
     result: &Item,
     transformed: &HashSet<u32>,
+    preserved_shells: &HashSet<u32>,
     rule_applied: &HashSet<u32>,
     require_complete_alignment: bool,
 ) -> Result<P<Item>, PreservationError> {
@@ -210,6 +246,7 @@ fn canonicalize_function_impl_sets(
     };
     if !require_complete_alignment
         && rule_applied.is_empty()
+        && preserved_shells.is_empty()
         && collect_label_parents(expected)?.len() == transformed.len()
     {
         return Ok(P(result.clone()));
@@ -226,8 +263,9 @@ fn canonicalize_function_impl_sets(
     };
     result_function.body = returned_function.body.clone();
     let editable_shells = transformed
-        .union(rule_applied)
+        .union(preserved_shells)
         .copied()
+        .chain(rule_applied.iter().copied())
         .collect::<HashSet<_>>();
     canonicalize_statement_list(
         &expected_function
@@ -242,6 +280,7 @@ fn canonicalize_function_impl_sets(
             .stmts,
         false,
         &editable_shells,
+        preserved_shells,
         rule_applied,
     )?;
     Ok(canonical)
@@ -656,6 +695,7 @@ fn canonicalize_statement_list(
     result: &mut ThinVec<Stmt>,
     arm_tail: bool,
     transformed: &HashSet<u32>,
+    preserved_shells: &HashSet<u32>,
     rule_applied: &HashSet<u32>,
 ) -> Result<(), PreservationError> {
     let expected_groups = groups(expected);
@@ -754,6 +794,12 @@ fn canonicalize_statement_list(
                 format!("rule-applied label {label} must remain exactly one statement"),
             ));
         }
+        if preserved_shells.contains(&label) && result_group.statements.len() != 1 {
+            return Err(structural_error(
+                "preserved_shell_expansion",
+                format!("preserved-shell label {label} must remain exactly one statement"),
+            ));
+        }
         if transformed.contains(&label) {
             canonicalize_transformed_group(
                 &expected_group.statements[0],
@@ -761,6 +807,7 @@ fn canonicalize_statement_list(
                 arm_tail,
                 label,
                 transformed,
+                preserved_shells,
                 rule_applied,
             )?;
         }
@@ -781,7 +828,10 @@ fn canonicalize_statement_list(
 
     for expected_group in expected_groups.iter().rev() {
         let label = expected_group.label.expect("expected labels were checked");
-        if transformed.contains(&label) && !rule_applied.contains(&label) {
+        if transformed.contains(&label)
+            && !preserved_shells.contains(&label)
+            && !rule_applied.contains(&label)
+        {
             continue;
         }
         let current_groups = groups(result);
@@ -794,8 +844,8 @@ fn canonicalize_statement_list(
                 format!("preserved label {label} is not locatable"),
             ));
         };
-        let restored = if rule_applied.contains(&label) {
-            restore_rule_applied_statement(
+        let restored = if rule_applied.contains(&label) || preserved_shells.contains(&label) {
+            restore_canonical_shell_statement(
                 &expected_group.statements[0],
                 &result[result_group.start..result_group.end],
                 arm_tail,
@@ -818,6 +868,7 @@ fn canonicalize_transformed_group(
     arm_tail: bool,
     label: u32,
     transformed: &HashSet<u32>,
+    preserved_shells: &HashSet<u32>,
     rule_applied: &HashSet<u32>,
 ) -> Result<(), PreservationError> {
     if let StmtKind::Let(expected_local) = &expected.kind
@@ -860,6 +911,7 @@ fn canonicalize_transformed_group(
             &mut result_else.stmts,
             false,
             transformed,
+            preserved_shells,
             rule_applied,
             &scope,
         );
@@ -918,11 +970,12 @@ fn canonicalize_transformed_group(
         result_control.expression,
         label,
         transformed,
+        preserved_shells,
         rule_applied,
     )
 }
 
-fn restore_rule_applied_statement(
+fn restore_canonical_shell_statement(
     expected: &Stmt,
     returned_group: &[Stmt],
     arm_tail: bool,
@@ -960,7 +1013,7 @@ fn restore_rule_applied_statement(
     if returned_controls.len() != 1 {
         return Err(structural_error(
             "missing_control_root",
-            format!("label {label} lost its rule-applied descendant slots"),
+            format!("label {label} lost its canonical-shell descendant slots"),
         ));
     }
     copy_control_descendants(expected_control.expression, returned_controls[0].expression)?;
@@ -1053,6 +1106,7 @@ fn canonicalize_control(
     result: &mut Expr,
     label: u32,
     transformed: &HashSet<u32>,
+    preserved_shells: &HashSet<u32>,
     rule_applied: &HashSet<u32>,
 ) -> Result<(), PreservationError> {
     let scope = expression_labels(result);
@@ -1066,6 +1120,7 @@ fn canonicalize_control(
                 &mut result_then.stmts,
                 false,
                 transformed,
+                preserved_shells,
                 rule_applied,
                 &scope,
             )?;
@@ -1074,6 +1129,7 @@ fn canonicalize_control(
                 result_else.as_deref_mut(),
                 label,
                 transformed,
+                preserved_shells,
                 rule_applied,
                 &scope,
             )
@@ -1086,6 +1142,7 @@ fn canonicalize_control(
                 &mut result_body.stmts,
                 false,
                 transformed,
+                preserved_shells,
                 rule_applied,
                 &scope,
             )
@@ -1103,6 +1160,7 @@ fn canonicalize_control(
             &mut result_body.stmts,
             false,
             transformed,
+            preserved_shells,
             rule_applied,
             &scope,
         ),
@@ -1147,6 +1205,7 @@ fn canonicalize_control(
                     &mut result_block.stmts,
                     true,
                     transformed,
+                    preserved_shells,
                     rule_applied,
                     &scope,
                 )?;
@@ -1165,6 +1224,7 @@ fn canonicalize_else(
     result: Option<&mut Expr>,
     label: u32,
     transformed: &HashSet<u32>,
+    preserved_shells: &HashSet<u32>,
     rule_applied: &HashSet<u32>,
     scope: &HashSet<u32>,
 ) -> Result<(), PreservationError> {
@@ -1180,6 +1240,7 @@ fn canonicalize_else(
                         &mut result.stmts,
                         false,
                         transformed,
+                        preserved_shells,
                         rule_applied,
                         scope,
                     )
@@ -1193,6 +1254,7 @@ fn canonicalize_else(
                         &mut result_then.stmts,
                         false,
                         transformed,
+                        preserved_shells,
                         rule_applied,
                         scope,
                     )?;
@@ -1201,6 +1263,7 @@ fn canonicalize_else(
                         result_else.as_deref_mut(),
                         label,
                         transformed,
+                        preserved_shells,
                         rule_applied,
                         scope,
                     )
@@ -1223,6 +1286,7 @@ fn canonicalize_nested_statement_list(
     result: &mut ThinVec<Stmt>,
     arm_tail: bool,
     transformed: &HashSet<u32>,
+    preserved_shells: &HashSet<u32>,
     rule_applied: &HashSet<u32>,
     scope: &HashSet<u32>,
 ) -> Result<(), PreservationError> {
@@ -1230,7 +1294,14 @@ fn canonicalize_nested_statement_list(
         .into_iter()
         .filter_map(|group| group.label)
         .collect::<HashSet<_>>();
-    match canonicalize_statement_list(expected, result, arm_tail, transformed, rule_applied) {
+    match canonicalize_statement_list(
+        expected,
+        result,
+        arm_tail,
+        transformed,
+        preserved_shells,
+        rule_applied,
+    ) {
         Err(error) if matches!(error.code, "missing_label" | "label_order_mismatch") => {
             let misplaced = groups(expected).into_iter().find_map(|group| {
                 let label = group.label?;
