@@ -51,6 +51,7 @@ enum CauseFlag {
     ExternallySuppliedParameter,
     OpaqueExternalCallResult,
     StackOrLocalAddress,
+    NullLiteralRoot,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -73,6 +74,7 @@ enum TerminalKind {
     ExternalParameter,
     OpaqueExternalCall,
     StackOrLocalAddress,
+    NullLiteral,
     Unsupported,
 }
 
@@ -202,6 +204,9 @@ fn flags_for_path(path: SyntheticPath) -> BTreeSet<CauseFlag> {
         TerminalKind::StackOrLocalAddress => {
             flags.insert(CauseFlag::StackOrLocalAddress);
         }
+        TerminalKind::NullLiteral => {
+            flags.insert(CauseFlag::NullLiteralRoot);
+        }
         TerminalKind::Unsupported => {}
     }
     flags
@@ -230,6 +235,7 @@ fn classify_roots(roots: &[RootEvidence]) -> PrimaryClass {
                     | CauseFlag::ExternallySuppliedParameter
                     | CauseFlag::OpaqueExternalCallResult
                     | CauseFlag::StackOrLocalAddress
+                    | CauseFlag::NullLiteralRoot
             )
         })
     });
@@ -290,6 +296,7 @@ fn parse_cause_flag(value: &str) -> Result<CauseFlag, String> {
         "externally-supplied-parameter" => Ok(CauseFlag::ExternallySuppliedParameter),
         "opaque-external-call-result" => Ok(CauseFlag::OpaqueExternalCallResult),
         "stack-or-local-address" => Ok(CauseFlag::StackOrLocalAddress),
+        "null-literal-root" => Ok(CauseFlag::NullLiteralRoot),
         _ => Err(format!("unknown cause flag {value:?}")),
     }
 }
@@ -528,6 +535,26 @@ fn node_for_operand<'tcx>(
     }
 }
 
+fn pointer_constant_terminal(is_literal_zero: bool) -> TerminalKind {
+    if is_literal_zero {
+        TerminalKind::NullLiteral
+    } else {
+        TerminalKind::Unsupported
+    }
+}
+
+fn constant_terminal(operand: &Operand<'_>) -> TerminalKind {
+    let Some(constant) = operand.constant() else {
+        return TerminalKind::Unsupported;
+    };
+    let is_literal_zero = constant
+        .const_
+        .try_to_scalar()
+        .and_then(|scalar| scalar.try_to_scalar_int().ok())
+        .is_some_and(|value| value.to_bits(value.size()) == 0);
+    pointer_constant_terminal(is_literal_zero)
+}
+
 fn edge_kind(source: &str, target: &str) -> FlowEdgeKind {
     if source.starts_with("src::") || target.starts_with("src::") {
         FlowEdgeKind::Field
@@ -687,7 +714,7 @@ fn build_source_graph(tcx: TyCtxt<'_>, slots: &CrateSlots, export: &BoExport) ->
                             add_terminal(
                                 &mut graph,
                                 target,
-                                TerminalKind::Unsupported,
+                                constant_terminal(operand),
                                 format!("constant-{label}"),
                                 false,
                             );
@@ -700,14 +727,24 @@ fn build_source_graph(tcx: TyCtxt<'_>, slots: &CrateSlots, export: &BoExport) ->
                     continue;
                 };
                 match rvalue {
-                    Rvalue::Use(Operand::Constant(_))
-                    | Rvalue::Cast(_, Operand::Constant(_), _) => add_terminal(
-                        &mut graph,
-                        target,
-                        TerminalKind::Unsupported,
-                        format!("constant-pointer:{location}"),
-                        false,
-                    ),
+                    Rvalue::Use(operand @ Operand::Constant(_))
+                    | Rvalue::Cast(_, operand @ Operand::Constant(_), _) => {
+                        let terminal = constant_terminal(operand);
+                        add_terminal(
+                            &mut graph,
+                            target,
+                            terminal,
+                            format!(
+                                "{}:{location}",
+                                if terminal == TerminalKind::NullLiteral {
+                                    "null-literal"
+                                } else {
+                                    "constant-pointer"
+                                }
+                            ),
+                            false,
+                        );
+                    }
                     Rvalue::Use(operand) | Rvalue::Cast(_, operand, _) => add_value_edge(
                         &mut graph,
                         node_for_operand(tcx, slots, fn_did, body, operand),
@@ -1062,6 +1099,7 @@ fn flag_label(flag: CauseFlag) -> &'static str {
         CauseFlag::ExternallySuppliedParameter => "externally-supplied-parameter",
         CauseFlag::OpaqueExternalCallResult => "opaque-external-call-result",
         CauseFlag::StackOrLocalAddress => "stack-or-local-address",
+        CauseFlag::NullLiteralRoot => "null-literal-root",
     }
 }
 
@@ -3130,6 +3168,16 @@ mod tests {
                 },
                 CauseFlag::StackOrLocalAddress,
             ),
+            (
+                SyntheticPath {
+                    terminal: TerminalKind::NullLiteral,
+                    crosses_call: false,
+                    crosses_field: false,
+                    realloc: false,
+                    same_function_scanner_gap: false,
+                },
+                CauseFlag::NullLiteralRoot,
+            ),
         ];
 
         for (path, expected) in cases {
@@ -3148,9 +3196,13 @@ mod tests {
             PrimaryClass::Absent
         );
         assert_eq!(
+            classify_roots(&[singleton(CauseFlag::NullLiteralRoot)]),
+            PrimaryClass::Absent
+        );
+        assert_eq!(
             classify_roots(&[
                 singleton(CauseFlag::FieldMediatedAllocation),
-                singleton(CauseFlag::StaticOrInteriorRoot),
+                singleton(CauseFlag::NullLiteralRoot),
             ]),
             PrimaryClass::Mixed
         );
@@ -3209,7 +3261,17 @@ mod tests {
             parse_cause_flag("interprocedural-allocation"),
             Ok(CauseFlag::InterproceduralAllocation)
         );
+        assert_eq!(
+            parse_cause_flag("null-literal-root"),
+            Ok(CauseFlag::NullLiteralRoot)
+        );
         assert!(parse_cause_flag("analyst-judgment").is_err());
+    }
+
+    #[test]
+    fn null_literal_is_distinct_from_other_pointer_constants() {
+        assert_eq!(pointer_constant_terminal(true), TerminalKind::NullLiteral);
+        assert_eq!(pointer_constant_terminal(false), TerminalKind::Unsupported);
     }
 
     #[test]
