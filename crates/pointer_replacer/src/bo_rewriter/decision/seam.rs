@@ -703,8 +703,19 @@ use super::{Decision, DecisionTable, Subject, SubjectKind, emitability::ArgShape
 #[derive(Clone, Debug, Default)]
 pub(crate) struct SeamPlan {
     pub edits: Vec<SeamEdit>,
-    /// `(caller, argument span, reason)`.
-    pub blocked: Vec<(LocalDefId, Span, SeamBlock)>,
+    /// `(caller, callee, argument span, reason)`.
+    ///
+    /// **The callee rides here because the CALLER is the wrong axis for
+    /// pricing** (2026-08-12). A refused seam costs the *callee's* conversion —
+    /// [`SeamEdit::owner_fn`] is the callee for exactly that reason, so that a
+    /// reverted callee takes its seams with it — while this row named only the
+    /// caller. Anything asking *"which functions would gain if this refusal
+    /// went away"* was therefore answerable only on the axis that does not
+    /// revert.
+    ///
+    /// Two names rather than one, because they are two different functions and
+    /// collapsing them is what made the question unanswerable.
+    pub blocked: Vec<(LocalDefId, LocalDefId, Span, SeamBlock)>,
     /// **Ruling item 4a — companion-length coverage**, one row per
     /// length-gated position: `(callee path, pointer param index, evidence)`.
     ///
@@ -861,8 +872,12 @@ pub(crate) fn synthesize(
                     ),
                     // Not an expression this slice can name.
                     ArgShape::NullLit | ArgShape::Cast { .. } | ArgShape::Other => {
-                        plan.blocked
-                            .push((site.caller, arg.span, SeamBlock::UnnameableOperand));
+                        plan.blocked.push((
+                            site.caller,
+                            *callee,
+                            arg.span,
+                            SeamBlock::UnnameableOperand,
+                        ));
                         continue;
                     }
                 };
@@ -914,12 +929,16 @@ pub(crate) fn synthesize(
             for (idx, pos) in positions.iter().enumerate() {
                 if refused.contains(&idx) {
                     plan.blocked
-                        .push((site.caller, pos.span, SeamBlock::SiteOverlap));
+                        .push((site.caller, *callee, pos.span, SeamBlock::SiteOverlap));
                     continue;
                 }
                 let Some(text) = pos.text.as_deref() else {
-                    plan.blocked
-                        .push((site.caller, pos.span, SeamBlock::UnnameableOperand));
+                    plan.blocked.push((
+                        site.caller,
+                        *callee,
+                        pos.span,
+                        SeamBlock::UnnameableOperand,
+                    ));
                     continue;
                 };
                 // **Ruling B — the companion length, resolved at the CALL
@@ -980,7 +999,7 @@ pub(crate) fn synthesize(
                                 length_evidence(tcx, *callee, pos.index),
                             ));
                         }
-                        plan.blocked.push((site.caller, pos.span, block));
+                        plan.blocked.push((site.caller, *callee, pos.span, block));
                     }
                 }
             }

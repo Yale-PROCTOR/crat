@@ -6970,6 +6970,44 @@ mod run {
             );
         let name = std::env::var("CRAT_BOC1_NAME").unwrap_or_else(|_| "unnamed".to_string());
 
+        // **PHASE 2's BAR — and it must run FIRST, before anything below builds
+        // the HIR.** `expanded_ast` clones the resolver's crate and the
+        // resolver is consumed by lowering, so a single query out of order
+        // turns this into a panic rather than a measurement.
+        //
+        // Written beside the other auxiliary censuses and counted into the row,
+        // so the resolution rate is a corpus number rather than something read
+        // off a file by hand — the same discipline the seam column landed
+        // under.
+        let bridge = crate::bo_rewriter::ast_bridge::census_tsv(tcx);
+        let bridge_path = dir.join(format!("{name}.astbridge.tsv"));
+        std::fs::write(&bridge_path, &bridge)
+            .unwrap_or_else(|e| panic!("write ast-bridge census {}: {e}", bridge_path.display()));
+        {
+            let (mut dec, mut dec_ok, mut deg, mut deg_ok, mut declined) = (0, 0, 0, 0, 0usize);
+            for line in bridge.lines().skip(1) {
+                let f: Vec<&str> = line.split('\t').collect();
+                if f.first() == Some(&"<declined>") {
+                    declined += 1;
+                    continue;
+                }
+                let Some(&decided) = f.get(3) else { continue };
+                let ok = f.get(4) == Some(&"1");
+                if decided == "1" {
+                    dec += 1;
+                    dec_ok += usize::from(ok);
+                } else {
+                    deg += 1;
+                    deg_ok += usize::from(ok);
+                }
+            }
+            row.set("astbridge_decided", dec.to_string());
+            row.set("astbridge_decided_resolved", dec_ok.to_string());
+            row.set("astbridge_degraded", deg.to_string());
+            row.set("astbridge_degraded_resolved", deg_ok.to_string());
+            row.set("astbridge_declined", declined.to_string());
+        }
+
         let t_phase_a = std::time::Instant::now();
         let a = match crate::bo_rewriter::artifact_rows(tcx) {
             Ok(rows) => rows,

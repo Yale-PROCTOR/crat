@@ -77,6 +77,11 @@ pub(crate) mod sign_facts;
 pub(crate) mod use_census;
 pub(crate) mod verify;
 
+/// **The AST application layer's bridge** — phases 1–2 of the migration back to
+/// standing decision 3. Test-only while the bar is measured; it becomes
+/// production when phase 3 ports the edit vocabulary onto it.
+#[cfg(test)]
+pub(crate) mod ast_bridge;
 #[cfg(test)]
 mod emit_tests;
 #[cfg(test)]
@@ -3025,7 +3030,8 @@ pub(crate) fn decisions_with_ty_span_erased(
 pub(crate) fn seam_tsv(tcx: TyCtxt<'_>) -> Result<String, String> {
     let (table, _ctx) = decide_table_with_ctx(tcx)?;
     let sm = tcx.sess.source_map();
-    let mut out = String::from("kind\towner_fn\tfamily_or_reason\tsite\tlen_arm\tglue_shape\n");
+    let mut out =
+        String::from("kind\towner_fn\tfamily_or_reason\tsite\tlen_arm\tglue_shape\tcaller\n");
     for edit in &table.seams.edits {
         let family = match edit.family {
             decision::seam::SeamFamily::Safe => "safe",
@@ -3063,18 +3069,26 @@ pub(crate) fn seam_tsv(tcx: TyCtxt<'_>) -> Result<String, String> {
             "index"
         };
         out.push_str(&format!(
-            "placed\t{}\t{}\t{}\t{arm}\t{shape}\n",
+            "placed\t{}\t{}\t{}\t{arm}\t{shape}\t-\n",
             edit.owner_fn,
             family,
             sm.span_to_diagnostic_string(edit.span)
         ));
     }
-    for (caller, span, block) in &table.seams.blocked {
+    // **`owner_fn` is the REVERT KEY on every row kind** (2026-08-12). It was
+    // the callee on `placed` rows and the CALLER on these, so the two kinds
+    // disagreed about what the column meant and no consumer could ask "which
+    // functions would gain if this refusal went away" — the refusal costs the
+    // CALLEE's conversion, which is why `SeamEdit::owner_fn` is the callee.
+    // The caller is real information and moves to its own column rather than
+    // being dropped.
+    for (caller, callee, span, block) in &table.seams.blocked {
         out.push_str(&format!(
-            "blocked\t{}\t{}\t{}\n",
-            tcx.def_path_str(caller.to_def_id()),
+            "blocked\t{}\t{}\t{}\t-\t-\t{}\n",
+            tcx.def_path_str(callee.to_def_id()),
             block.key(),
-            sm.span_to_diagnostic_string(*span)
+            sm.span_to_diagnostic_string(*span),
+            tcx.def_path_str(caller.to_def_id()),
         ));
     }
     // Item 4a: companion-length coverage, one row per LENGTH-GATED POSITION.

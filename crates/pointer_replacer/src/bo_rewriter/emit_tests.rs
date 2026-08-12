@@ -4150,6 +4150,58 @@ fn a_mismatched_argument_gets_seam_glue_in_the_emitted_text() {
     );
 }
 
+/// **A BLOCKED seam row names the CALLEE in `owner_fn`, and the caller in its
+/// own column.**
+///
+/// `owner_fn` is the REVERT KEY. On a `placed` row it has always been the
+/// callee — `a_reverted_callee_takes_its_seams_with_it` is the property — but a
+/// `blocked` row carried the CALLER there, so one column meant two things by
+/// row kind. The consequence was not cosmetic: a refused seam costs the
+/// **callee's** conversion, so *"which functions would gain if this refusal
+/// went away"* could only be answered on the axis that does not revert. That is
+/// how the fabricated-length slice's own upside was nearly priced wrong.
+///
+/// The caller is real information and moves to its own column rather than being
+/// dropped.
+///
+/// *Mutation-tested:* swapping the two back — `owner_fn` = caller, trailing
+/// column = callee — fails both assertions, and each on its own.
+#[test]
+fn a_blocked_seam_row_names_the_callee_as_its_revert_key() {
+    let src = "#![allow(dead_code, unused_unsafe, unused_mut, unused_variables)]\n\
+               pub unsafe fn callee(p: *mut i32) -> i32 {\n\
+               \x20   if p.is_null() { 0 } else { *p }\n\
+               }\n\
+               pub fn caller() {\n\
+               \x20   unsafe { callee(0 as *mut i32); }\n\
+               }\n";
+    let fixture = Fixture::new(&[("lib.rs", src)]);
+    let tsv = ::utils::compilation::run_compiler_on_path(&fixture.0.join("lib.rs"), |tcx| {
+        super::seam_tsv(tcx).expect("seam census")
+    })
+    .expect("fixture compiles");
+
+    let hdr: Vec<&str> = tsv.lines().next().expect("header").split('\t').collect();
+    let col = |n: &str| hdr.iter().position(|h| *h == n).expect("column present");
+    let (c_owner, c_caller) = (col("owner_fn"), col("caller"));
+    let blocked: Vec<Vec<&str>> = tsv
+        .lines()
+        .skip(1)
+        .map(|l| l.split('\t').collect::<Vec<_>>())
+        .filter(|f| f.first() == Some(&"blocked"))
+        .collect();
+    assert_eq!(blocked.len(), 1, "one refused position expected:\n{tsv}");
+    assert!(
+        blocked[0][c_owner].ends_with("callee"),
+        "`owner_fn` must be the CALLEE — it is the revert key on every row \
+         kind:\n{tsv}"
+    );
+    assert!(
+        blocked[0][c_caller].ends_with("caller"),
+        "the caller must be recorded, not dropped:\n{tsv}"
+    );
+}
+
 /// **REVERT COHERENCE, BOTH SIDES.** A callee's seams live and die with it.
 ///
 /// # The failure mode this prevents
