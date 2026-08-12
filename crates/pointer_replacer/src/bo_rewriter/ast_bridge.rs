@@ -64,10 +64,16 @@ use rustc_middle::ty::TyCtxt;
 pub(crate) struct IdemStats {
     pub functions: usize,
     pub stable: usize,
-    /// Function names whose print is not a fixed point, capped for the artifact.
+    /// Function names whose print is not a fixed point — **capped**, for the
+    /// artifact. Never the count: see [`Self::unstable_count`].
     pub unstable: Vec<String>,
-    /// Functions whose printed text did not reparse at all.
+    /// Functions whose printed text did not reparse at all — **capped**.
     pub unparseable: Vec<String>,
+    /// The UNCAPPED counts. Split from the name lists because reporting a
+    /// capped `Vec::len()` as a measurement makes every population read as the
+    /// cap.
+    pub unstable_count: usize,
+    pub unparseable_count: usize,
 }
 
 #[cfg(test)]
@@ -109,7 +115,28 @@ fn walk_items(items: &[rustc_ast::ptr::P<rustc_ast::Item>], tcx: TyCtxt<'_>, s: 
             .ident()
             .map_or_else(|| "<anon>".to_owned(), |i| i.to_string());
         let t1 = pprust::item_to_string(item);
-        let mut parser = ::utils::ast::new_parser_from_str(&tcx.sess.psess, t1.clone());
+        // **A UNIQUE FILE NAME PER PARSE, and it is load-bearing.**
+        //
+        // `utils::ast::new_parser_from_str` hardcodes `FileName::Custom(
+        // "main.rs")`, and `SourceMap::new_source_file` dedupes on a stable id
+        // derived from that name — so the second and every later parse in one
+        // session get back the FIRST function's source file. The measurement
+        // then compares every function against function #1 and reports
+        // "1 stable per program", which is precisely what it did: 1 in avl
+        // (9 fns) and 1 in brotli (867 fns), in all 20 programs.
+        //
+        // A shared helper cannot be fixed from here — `crates/utils` is outside
+        // this crate's boundary — so the parser is built locally with a
+        // per-item name.
+        let fname = rustc_span::FileName::Custom(format!("idem-{}.rs", s.functions));
+        let Ok(mut parser) =
+            rustc_parse::new_parser_from_source_str(&tcx.sess.psess, fname, t1.clone())
+        else {
+            if s.unparseable.len() < 20 {
+                s.unparseable.push(name);
+            }
+            continue;
+        };
         match parser.parse_crate_mod() {
             Ok(k2) => {
                 let t2 = k2
@@ -120,8 +147,15 @@ fn walk_items(items: &[rustc_ast::ptr::P<rustc_ast::Item>], tcx: TyCtxt<'_>, s: 
                     .join("\n");
                 if t2.trim() == t1.trim() {
                     s.stable += 1;
-                } else if s.unstable.len() < 20 {
-                    s.unstable.push(name);
+                } else {
+                    // COUNT and NAMES are separate: the names list is capped
+                    // for the artifact, the count is not. Reporting
+                    // `unstable.len()` as the count made every program read
+                    // exactly 20 — the cap, wearing a measurement's clothes.
+                    s.unstable_count += 1;
+                    if s.unstable.len() < 20 {
+                        s.unstable.push(name);
+                    }
                 }
             }
             Err(diag) => {
@@ -129,6 +163,7 @@ fn walk_items(items: &[rustc_ast::ptr::P<rustc_ast::Item>], tcx: TyCtxt<'_>, s: 
                 // that reports through the diagnostic stream would contaminate
                 // the verify loop's own attribution.
                 diag.cancel();
+                s.unparseable_count += 1;
                 if s.unparseable.len() < 20 {
                     s.unparseable.push(name);
                 }
@@ -240,8 +275,8 @@ pub(crate) fn census_tsv(tcx: TyCtxt<'_>) -> String {
                 "<idempotence>\t{}\t{}\t{}\t{}\t{}\n",
                 idem.functions,
                 idem.stable,
-                idem.unstable.len(),
-                idem.unparseable.len(),
+                idem.unstable_count,
+                idem.unparseable_count,
                 idem.unstable
                     .iter()
                     .chain(idem.unparseable.iter())
