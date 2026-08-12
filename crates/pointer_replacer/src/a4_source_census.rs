@@ -5,10 +5,12 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
+    ffi::OsString,
     fs,
     io::Write,
     path::{Path, PathBuf},
     process::{Command, Stdio},
+    sync::atomic::{AtomicU64, Ordering},
     time::{Duration, Instant},
 };
 
@@ -1195,12 +1197,108 @@ struct IndirectTargetSummary {
     unexplained_predecessors: BTreeSet<String>,
 }
 
+fn indirect_target_signature_compatible<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    call_ty: Ty<'tcx>,
+    target: DefId,
+) -> Result<bool, String> {
+    let TyKind::FnPtr(call_sig, call_header) = call_ty.kind() else {
+        return Err(format!(
+            "indirect call operand is not a function pointer: {call_ty}"
+        ));
+    };
+    let call_sig = call_sig.with(*call_header).skip_binder();
+    let target_sig = tcx.fn_sig(target).instantiate_identity().skip_binder();
+    if call_sig.inputs().len() != target_sig.inputs().len() {
+        return Ok(false);
+    }
+    let compatible_ty =
+        |left: Ty<'tcx>, right: Ty<'tcx>| tcx.erase_regions(left) == tcx.erase_regions(right);
+    Ok(call_sig
+        .inputs()
+        .iter()
+        .copied()
+        .zip(target_sig.inputs().iter().copied())
+        .all(|(call, target)| compatible_ty(call, target))
+        && compatible_ty(call_sig.output(), target_sig.output()))
+}
+
 fn target_field_node(tcx: TyCtxt<'_>, owner: DefId, field: usize) -> String {
     format!("fn-hook:{}::field{field}", tcx.def_path_str(owner))
 }
 
 fn target_static_node(tcx: TyCtxt<'_>, static_did: DefId) -> String {
     format!("fn-static:{}", tcx.def_path_str(static_did))
+}
+
+fn is_callback_storage_ty(tcx: TyCtxt<'_>, ty: Ty<'_>) -> bool {
+    match ty.kind() {
+        TyKind::FnPtr(..) => true,
+        TyKind::Adt(def, args) if tcx.is_diagnostic_item(rustc_span::sym::Option, def.did()) => {
+            args.types().any(|inner| is_callback_storage_ty(tcx, inner))
+        }
+        TyKind::Array(element, _) => is_callback_storage_ty(tcx, *element),
+        _ => false,
+    }
+}
+
+fn insert_target_reference_alias(
+    aliases: &mut FxHashMap<Local, String>,
+    local: Local,
+    node: String,
+) -> Result<(), String> {
+    if let Some(previous) = aliases.insert(local, node.clone())
+        && previous != node
+    {
+        return Err(format!(
+            "callback reference local {local:?} has conflicting referents: {previous} {node}"
+        ));
+    }
+    Ok(())
+}
+
+fn target_reference_aliases<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    fn_did: LocalDefId,
+    body: &Body<'tcx>,
+    static_pointers: &FxHashMap<Local, DefId>,
+) -> Result<FxHashMap<Local, String>, String> {
+    let mut aliases = FxHashMap::default();
+    for statement in body.basic_blocks.iter().flat_map(|data| &data.statements) {
+        let StatementKind::Assign(box (lhs, Rvalue::Ref(_, _, referent))) = &statement.kind else {
+            continue;
+        };
+        let Some(local) = lhs.as_local() else {
+            continue;
+        };
+        if !is_callback_storage_ty(tcx, referent.ty(body, tcx).ty) {
+            continue;
+        }
+        let node = target_flow_node(tcx, fn_did, body, static_pointers, *referent);
+        insert_target_reference_alias(&mut aliases, local, node)?;
+    }
+    Ok(aliases)
+}
+
+fn target_assignment_node<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    fn_did: LocalDefId,
+    body: &Body<'tcx>,
+    static_pointers: &FxHashMap<Local, DefId>,
+    reference_aliases: &FxHashMap<Local, String>,
+    lhs: Place<'tcx>,
+) -> Result<String, String> {
+    let Some(alias) = reference_aliases.get(&lhs.local) else {
+        return Ok(target_flow_node(tcx, fn_did, body, static_pointers, lhs));
+    };
+    match lhs.projection.as_ref() {
+        [ProjectionElem::Deref] => Ok(alias.clone()),
+        [] => Ok(target_flow_node(tcx, fn_did, body, static_pointers, lhs)),
+        projections if matches!(projections.first(), Some(ProjectionElem::Deref)) => Err(format!(
+            "unsupported projected callback-reference store {lhs:?} via {alias}"
+        )),
+        _ => Ok(target_flow_node(tcx, fn_did, body, static_pointers, lhs)),
+    }
 }
 
 fn constant_static_target(tcx: TyCtxt<'_>, operand: &Operand<'_>) -> Option<DefId> {
@@ -1483,6 +1581,127 @@ fn add_static_data_store_edges<'tcx>(
     Ok(())
 }
 
+fn exact_raw_pointer_aliases<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    body: &Body<'tcx>,
+) -> BTreeMap<Local, BTreeSet<Local>> {
+    let mut aliases = BTreeMap::<Local, BTreeSet<Local>>::new();
+    for data in body.basic_blocks.iter() {
+        for statement in &data.statements {
+            let StatementKind::Assign(box (lhs, rvalue)) = &statement.kind else {
+                continue;
+            };
+            let Some(target) = lhs.as_local() else {
+                continue;
+            };
+            let Rvalue::Use(Operand::Copy(source) | Operand::Move(source)) = rvalue else {
+                continue;
+            };
+            let Some(source) = source.as_local() else {
+                continue;
+            };
+            let source_ty = body.local_decls[source].ty;
+            if source_ty == body.local_decls[target].ty && source_ty.is_raw_ptr() {
+                aliases.entry(target).or_default().insert(source);
+            }
+        }
+
+        let Some(call) = harness_call(tcx, data.terminator()) else {
+            continue;
+        };
+        let HarnessCallKind::RustLib(callee) = call.kind else {
+            continue;
+        };
+        let Some(target) = call.destination.as_local() else {
+            continue;
+        };
+        let Some(source_operand) = call.args.first().map(|argument| &argument.node) else {
+            continue;
+        };
+        let Some(source) = source_operand.place().and_then(|place| place.as_local()) else {
+            continue;
+        };
+        if is_static_data_pointer_flow_call(
+            tcx,
+            callee,
+            source_operand.ty(body, tcx),
+            call.destination.ty(body, tcx).ty,
+        ) {
+            aliases.entry(target).or_default().insert(source);
+        }
+    }
+    aliases
+}
+
+fn add_realized_pointer_alias_store_edges<'tcx>(
+    graph: &mut SourceGraph,
+    tcx: TyCtxt<'tcx>,
+    slots: &CrateSlots,
+    fn_did: LocalDefId,
+    body: &Body<'tcx>,
+) -> Result<(), String> {
+    let aliases = exact_raw_pointer_aliases(tcx, body);
+    for (bb, data) in body.basic_blocks.iter_enumerated() {
+        for (statement_index, statement) in data.statements.iter().enumerate() {
+            let StatementKind::Assign(box (lhs, _)) = &statement.kind else {
+                continue;
+            };
+            let projections = lhs.projection.as_ref();
+            if !matches!(projections.first(), Some(ProjectionElem::Deref)) {
+                continue;
+            }
+            if projections != [ProjectionElem::Deref] {
+                if aliases.contains_key(&lhs.local)
+                    && node_for_place(tcx, slots, fn_did, body, *lhs).is_none()
+                {
+                    return Err(format!(
+                        "unsupported projected realized pointer-alias store {lhs:?}"
+                    ));
+                }
+                continue;
+            }
+            if !aliases.contains_key(&lhs.local) {
+                continue;
+            }
+            if !lhs.ty(body, tcx).ty.is_raw_ptr() {
+                continue;
+            }
+            let store_node = node_for_place(tcx, slots, fn_did, body, *lhs).ok_or_else(|| {
+                format!("realized pointer-alias store has no graph node: {lhs:?}")
+            })?;
+            let mut work = VecDeque::from([lhs.local]);
+            let mut seen = BTreeSet::new();
+            while let Some(local) = work.pop_front() {
+                if !seen.insert(local) {
+                    continue;
+                }
+                work.extend(aliases.get(&local).into_iter().flatten().copied());
+            }
+            seen.remove(&lhs.local);
+            for base in seen {
+                let base_node =
+                    node_for_place_depth(tcx, slots, fn_did, body, Place::from(base), 1)
+                        .ok_or_else(|| {
+                            format!("pointer-alias base has no depth-one graph node: {base:?}")
+                        })?;
+                graph.add_edge(FlowEdge {
+                    source: store_node.clone(),
+                    target: base_node,
+                    kind: FlowEdgeKind::Local,
+                    label: format!(
+                        "realized-pointer-alias-store:{}:bb{}[{}]:{base:?}",
+                        tcx.def_path_str(fn_did),
+                        bb.index(),
+                        statement_index
+                    ),
+                    provenance_tags: BTreeSet::new(),
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
 fn target_flow_node<'tcx>(
     tcx: TyCtxt<'tcx>,
     fn_did: LocalDefId,
@@ -1556,8 +1775,8 @@ struct IndirectCallResolution {
     diagnostic: Vec<String>,
 }
 
-fn collect_indirect_call_resolutions(
-    tcx: TyCtxt<'_>,
+fn collect_indirect_call_resolutions<'tcx>(
+    tcx: TyCtxt<'tcx>,
     functions: &[LocalDefId],
 ) -> FxHashMap<(LocalDefId, usize), IndirectCallResolution> {
     let function_set = functions.iter().copied().collect::<FxHashSet<_>>();
@@ -1586,10 +1805,20 @@ fn collect_indirect_call_resolutions(
     }
     let mut parameter_nodes = Vec::new();
     let mut called_parameters = FxHashSet::default();
+    let mut call_types = FxHashMap::<(LocalDefId, usize), Ty<'tcx>>::default();
     for &fn_did in functions {
         let body_ref = tcx.mir_drops_elaborated_and_const_checked(fn_did).borrow();
         let body = &*body_ref;
         let body_static_pointers = &static_pointers[&fn_did];
+        let reference_aliases =
+            target_reference_aliases(tcx, fn_did, body, body_static_pointers).unwrap_or_else(
+                |error| {
+                    panic!(
+                        "A4C STOP phase=graph-construction candidate=none: callback reference aliases in {}: {error}",
+                        tcx.def_path_str(fn_did)
+                    )
+                },
+            );
         for local in body.args_iter() {
             parameter_nodes.push((
                 fn_did,
@@ -1619,7 +1848,20 @@ fn collect_indirect_call_resolutions(
                     }
                     continue;
                 }
-                let target = target_flow_node(tcx, fn_did, body, body_static_pointers, *lhs);
+                let target = target_assignment_node(
+                    tcx,
+                    fn_did,
+                    body,
+                    body_static_pointers,
+                    &reference_aliases,
+                    *lhs,
+                )
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "A4C STOP phase=graph-construction candidate=none: callback reference store in {}: {error}",
+                        tcx.def_path_str(fn_did)
+                    )
+                });
                 if let Rvalue::Aggregate(kind, operands) = rvalue
                     && let AggregateKind::Adt(def_id, variant, _, _, _) = kind.as_ref()
                     && tcx.is_diagnostic_item(rustc_span::sym::Option, *def_id)
@@ -1677,10 +1919,12 @@ fn collect_indirect_call_resolutions(
             };
             let Some(direct) = constant_function_target(func) else {
                 if let Some(place) = func.place() {
+                    let call = (fn_did, bb.index());
                     flow.call_nodes.insert(
-                        (fn_did, bb.index()),
+                        call,
                         target_flow_node(tcx, fn_did, body, body_static_pointers, place),
                     );
+                    call_types.insert(call, func.ty(body, tcx));
                 }
                 continue;
             };
@@ -1742,8 +1986,20 @@ fn collect_indirect_call_resolutions(
             }
         }
     }
-    for node in flow.call_nodes.values() {
+    for (call, node) in &flow.call_nodes {
+        let call_ty = call_types[call];
         for target in flow.targets(node) {
+            let compatible = indirect_target_signature_compatible(tcx, call_ty, target)
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "A4C STOP phase=graph-construction candidate=none: signature filter at {}:bb{}: {error}",
+                        tcx.def_path_str(call.0),
+                        call.1,
+                    )
+                });
+            if !compatible {
+                continue;
+            }
             let Some(callee) = target.as_local() else {
                 continue;
             };
@@ -1770,15 +2026,35 @@ fn collect_indirect_call_resolutions(
         .iter()
         .map(|(call, node)| {
             let summary = flow.summary(node);
-            let mut targets = summary.targets.into_iter().collect::<Vec<_>>();
+            let call_ty = call_types[call];
+            let mut targets = summary
+                .targets
+                .into_iter()
+                .filter(|target| {
+                    indirect_target_signature_compatible(tcx, call_ty, *target).unwrap_or_else(
+                        |error| {
+                            panic!(
+                                "A4C STOP phase=graph-construction candidate=none: signature filter at {}:bb{}: {error}",
+                                tcx.def_path_str(call.0),
+                                call.1,
+                            )
+                        },
+                    )
+                })
+                .collect::<Vec<_>>();
             targets.sort_by_key(|target| tcx.def_path_str(*target));
+            let public_setter_reachable = summary.public_setter_reachable
+                || (summary.has_external_parameter && !targets.is_empty());
+            let exclusively_external_parameter = targets.is_empty()
+                && summary.has_external_parameter
+                && summary.unexplained_predecessors.is_empty();
             (
                 *call,
                 IndirectCallResolution {
                     visible_targets: targets,
                     has_external_parameter: summary.has_external_parameter,
-                    exclusively_external_parameter: flow.exclusively_external_parameter(node),
-                    public_setter_reachable: summary.public_setter_reachable,
+                    exclusively_external_parameter,
+                    public_setter_reachable,
                     has_unexplained_predecessor: !summary.unexplained_predecessors.is_empty(),
                     #[cfg(test)]
                     diagnostic: flow.diagnostic(tcx, node),
@@ -1871,6 +2147,13 @@ fn build_source_graph(tcx: TyCtxt<'_>, slots: &CrateSlots, export: &BoExport) ->
                 tcx.def_path_str(fn_did)
             )
         });
+        add_realized_pointer_alias_store_edges(&mut graph, tcx, slots, fn_did, body)
+            .unwrap_or_else(|error| {
+                panic!(
+                    "A4C STOP phase=graph-construction candidate=none: realized pointer-alias stores in {}: {error}",
+                    tcx.def_path_str(fn_did)
+                )
+            });
         for local in body.args_iter() {
             if let Some(node) = node_for_place(tcx, slots, fn_did, body, Place::from(local)) {
                 parameter_nodes.push((fn_did, local, node));
@@ -2288,7 +2571,10 @@ fn build_source_graph(tcx: TyCtxt<'_>, slots: &CrateSlots, export: &BoExport) ->
                         &call_location,
                     )
                     .unwrap_or_else(|error| {
-                        panic!("A4C STOP phase=graph-construction candidate=none: {error}")
+                        panic!(
+                            "A4C STOP phase=graph-construction candidate=none: {error}; target-flow diagnostic:\n{}",
+                            resolution.diagnostic.join("\n")
+                        )
                     });
                     if arm == IndirectCallArm::OutOfPopulation {
                         continue;
@@ -2615,6 +2901,37 @@ struct A4InputRow {
     baseline_kind: SlotKind,
     baseline_force: String,
     proof_reason: String,
+}
+
+fn select_isolated_input(
+    input: &[A4InputRow],
+    program: &str,
+    field_key: &str,
+) -> Result<(Vec<A4InputRow>, Vec<A4InputRow>), String> {
+    let census = input
+        .iter()
+        .filter(|row| {
+            row.program == program
+                && row.field_key == field_key
+                && row.proof_reason == "allocation-source-count-0"
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    let exceptions = input
+        .iter()
+        .filter(|row| {
+            row.program == program && row.field_key == field_key && row.baseline_force == "sat"
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    if census.len() + exceptions.len() != 1 {
+        return Err(format!(
+            "isolated identity must select exactly one population row: program={program} candidate={field_key} census={} exceptions={}",
+            census.len(),
+            exceptions.len()
+        ));
+    }
+    Ok((census, exceptions))
 }
 
 fn parse_kind(value: &str) -> Result<SlotKind, String> {
@@ -3006,24 +3323,28 @@ pub(super) fn run_worker(tcx: TyCtxt<'_>, t_tcx: Duration) -> Row {
     let checkpoint_path = PathBuf::from(
         std::env::var_os("CRAT_A4_SOURCE_CHECKPOINT").expect("source-census checkpoint"),
     );
+    let isolated_candidate = std::env::var("CRAT_A4_SOURCE_CANDIDATE")
+        .expect("source-census isolated candidate identity");
 
     emit_phase(started, "input-parse", None, 0);
     let input = parse_a4_input(&input_path)
         .unwrap_or_else(|error| panic!("A4C STOP phase=input-parse candidate=none: {error}"));
-    let census_input = input
+    let program_census_input = input
         .iter()
         .filter(|row| {
             row.program == program_name && row.proof_reason == "allocation-source-count-0"
         })
         .cloned()
         .collect::<Vec<_>>();
-    let exception_input = input
+    let program_exception_input = input
         .iter()
         .filter(|row| row.program == program_name && row.baseline_force == "sat")
         .cloned()
         .collect::<Vec<_>>();
     assert!(
-        census_input.iter().all(|row| row.baseline_force == "unsat"),
+        program_census_input
+            .iter()
+            .all(|row| row.baseline_force == "unsat"),
         "A4C STOP phase=input-partition candidate={program_name}: census row is not hard-UNSAT"
     );
     let expected_exceptions = exception_specs()
@@ -3031,7 +3352,7 @@ pub(super) fn run_worker(tcx: TyCtxt<'_>, t_tcx: Duration) -> Row {
         .filter(|spec| spec.program == program_name)
         .map(|spec| (spec.field_key, spec.ordinary_kind))
         .collect::<BTreeSet<_>>();
-    let actual_exceptions = exception_input
+    let actual_exceptions = program_exception_input
         .iter()
         .map(|row| (row.field_key.as_str(), kind_label(row.baseline_kind)))
         .collect::<BTreeSet<_>>();
@@ -3039,6 +3360,10 @@ pub(super) fn run_worker(tcx: TyCtxt<'_>, t_tcx: Duration) -> Row {
         actual_exceptions, expected_exceptions,
         "A4C STOP phase=exception-identity candidate={program_name}: exact exception drift"
     );
+    let (census_input, exception_input) =
+        select_isolated_input(&input, &program_name, &isolated_candidate).unwrap_or_else(|error| {
+            panic!("A4C STOP phase=input-partition candidate={isolated_candidate}: {error}")
+        });
 
     emit_phase(started, "analysis-start", None, 0);
     let program = collect_program(tcx);
@@ -3394,6 +3719,9 @@ pub(super) fn run_worker(tcx: TyCtxt<'_>, t_tcx: Duration) -> Row {
 const MACHINE_ID: &str = "lambda7";
 const PLATFORM: &str = "linux-x86_64";
 const LIVENESS_BOUND_S: u64 = 14_400;
+const CANDIDATE_MEMORY_MAX_BYTES: u64 = 100 * 1024 * 1024 * 1024;
+const RESOURCE_EXHAUSTED_HEADER: &str =
+    "program\tfield_key\tstatus\tmemory_max_bytes\tpeak_rss_kb\tphase\tdata";
 const A4_AGGREGATE_MANIFEST_SHA256: &str =
     "66f85f5a30b77ba7e26c66fda0cccb0becdff13b4a8a03da74bb8d08e34e7c71";
 const A4_COMBINED_SHA256: &str = "d89d69fd3c6d1e10e565d13a680e7e3af42bf3465851e31c0ceafa7dbbf6dcae";
@@ -3405,7 +3733,7 @@ const RAW_CORPUS_DIGEST: &str = "9fc912af10fd3b235fe4d444d2fbac0bc521509b1c9447f
 const DERIVED_SUBSTRATE_DIGEST: &str =
     "db96829b5c2b0db28fb4bb9ddd3d32901b5d4e6e4134da07ada0d513d94eb4c6";
 const SNAPSHOT_PATH: &str = "/home/p51lee/dev/agent-worktrees/m1-artifact-snapshots/3b26a0ff";
-const RETRY3_PREDECESSOR_SHARDS: [(&str, &str, &str); 12] = [
+const RETRY3_PREDECESSOR_SHARDS: [(&str, &str, &str); 13] = [
     (
         "bst",
         "ce11b3459c6fa46965e4cbe23ce11dffbdc7bf01",
@@ -3465,6 +3793,11 @@ const RETRY3_PREDECESSOR_SHARDS: [(&str, &str, &str); 12] = [
         "binn",
         "93f0bdf4f2e361743e651abf3c1884e70a4d4b19",
         "b516c79fd1b65f6805a3767713e9331cc86024d80c9c4467546c831fbf8ac1bd",
+    ),
+    (
+        "libzahl",
+        "d07bf0ad177b46d60d0aba975d7b830b3bb3007f",
+        "241ea04355b5a9f469d3d8f75d8ac70f98ff797bfb8e50e694fce13b90e8bd2a",
     ),
 ];
 
@@ -3647,9 +3980,18 @@ fn verify_manifest(dir: &Path) -> Result<String, String> {
 fn parse_table(path: &Path, header: &str, columns: usize) -> Result<Vec<Vec<String>>, String> {
     let input = fs::read_to_string(path)
         .map_err(|error| format!("read table {}: {error}", path.display()))?;
+    parse_table_text(&input, header, columns, &path.display().to_string())
+}
+
+fn parse_table_text(
+    input: &str,
+    header: &str,
+    columns: usize,
+    label: &str,
+) -> Result<Vec<Vec<String>>, String> {
     let mut lines = input.lines();
     if lines.next() != Some(header) {
-        return Err(format!("header drift: {}", path.display()));
+        return Err(format!("header drift: {label}"));
     }
     lines
         .enumerate()
@@ -3657,8 +3999,7 @@ fn parse_table(path: &Path, header: &str, columns: usize) -> Result<Vec<Vec<Stri
             let row = line.split('\t').map(str::to_owned).collect::<Vec<_>>();
             if row.len() != columns {
                 return Err(format!(
-                    "{} line {} has {} columns, expected {columns}",
-                    path.display(),
+                    "{label} line {} has {} columns, expected {columns}",
                     offset + 2,
                     row.len()
                 ));
@@ -3677,6 +4018,63 @@ const CANDIDATE_READINGS_HEADER: &str = "program\tfield_key\tfield_slot\tordinar
 const FULL_IDENTITY_HEADER: &str =
     "program\tfield_key\tfield_slot\tordinary_kind\tbaseline_force\tproof_reason";
 const PUBLIC_SETTER_REACHABLE_TAG: &str = "public-setter-reachable";
+
+fn classify_capped_candidate(
+    cap_verified: bool,
+    oom_kills: u64,
+    worker_ok: bool,
+) -> Result<&'static str, String> {
+    if !cap_verified {
+        return Err("candidate cgroup MemoryMax cap was not verified".to_owned());
+    }
+    if oom_kills > 0 {
+        return Ok("resource-exhausted");
+    }
+    Ok(if worker_ok { "ok" } else { "failed" })
+}
+
+fn render_resource_exhausted(
+    program: &str,
+    field_key: &str,
+    memory_max_bytes: u64,
+    peak_rss_kb: u64,
+    phase: &str,
+) -> String {
+    format!(
+        "{RESOURCE_EXHAUSTED_HEADER}\n{}\t{}\tresource-exhausted\t{memory_max_bytes}\t{peak_rss_kb}\t{}\tfalse\n",
+        clean_cell(program),
+        clean_cell(field_key),
+        clean_cell(phase),
+    )
+}
+
+fn validate_reusable_candidate_artifact(
+    program: &str,
+    field_key: &str,
+    candidates: &str,
+    roots: &str,
+) -> Result<(), String> {
+    let candidates = parse_table_text(candidates, CANDIDATE_HEADER, 7, "checkpoint candidates")?;
+    if candidates.len() != 1 || candidates[0][0] != program || candidates[0][1] != field_key {
+        return Err(format!(
+            "checkpoint candidate identity mismatch: program={program} candidate={field_key} rows={candidates:?}"
+        ));
+    }
+    let roots = parse_table_text(roots, ROOT_HEADER, 8, "checkpoint roots")?;
+    let matching = roots
+        .iter()
+        .filter(|row| row[1] == program && row[2] == field_key)
+        .count();
+    let expected = candidates[0][6]
+        .parse::<usize>()
+        .map_err(|error| format!("checkpoint candidate root count: {error}"))?;
+    if matching != expected || matching == 0 {
+        return Err(format!(
+            "checkpoint root inventory mismatch: program={program} candidate={field_key} expected={expected} actual={matching}"
+        ));
+    }
+    Ok(())
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct DualReading {
@@ -3847,7 +4245,6 @@ fn validate_completed_receipt(
         ("checkpoint_data", "false"),
         ("machine_id", MACHINE_ID),
         ("platform", PLATFORM),
-        ("memory_limit", "uncapped"),
         ("wall_cap_s", "14400"),
     ] {
         let actual = receipt.get(key).map(String::as_str);
@@ -3861,6 +4258,23 @@ fn validate_completed_receipt(
         .get("analysis_head")
         .ok_or_else(|| "receipt lacks analysis_head".to_owned())?;
     validate_receipt_head(program, receipt_head, manifest, &contract.head)?;
+    let expected_memory_limit = if receipt_head == &contract.head {
+        "cgroup-100GiB"
+    } else {
+        "uncapped"
+    };
+    if receipt.get("memory_limit").map(String::as_str) != Some(expected_memory_limit) {
+        return Err(format!(
+            "receipt memory_limit: expected {expected_memory_limit:?}, got {:?}",
+            receipt.get("memory_limit")
+        ));
+    }
+    if receipt_head == &contract.head
+        && (receipt.get("memory_max_bytes").map(String::as_str) != Some("107374182400")
+            || receipt.get("candidate_isolation").map(String::as_str) != Some("true"))
+    {
+        return Err("current-head receipt lacks candidate-isolation/cgroup contract".to_owned());
+    }
     for (key, expected) in [
         ("program", program),
         ("a4_aggregate_manifest_sha256", A4_AGGREGATE_MANIFEST_SHA256),
@@ -3925,6 +4339,184 @@ fn last_phase(stderr: &str) -> (String, String) {
             .unwrap_or("none")
             .to_owned(),
     )
+}
+
+#[derive(Debug)]
+struct CappedCandidateOutcome {
+    status: String,
+    wall_s: f64,
+    peak_rss_kb: u64,
+    stderr: String,
+    cap_verified: bool,
+    oom_kills: u64,
+}
+
+static CANDIDATE_UNIT_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+fn systemd_user_property(unit: &str, property: &str) -> Option<String> {
+    let output = Command::new("systemctl")
+        .args(["--user", "show", unit, "--property", property, "--value"])
+        .output()
+        .ok()?;
+    output
+        .status
+        .success()
+        .then(|| String::from_utf8_lossy(&output.stdout).trim().to_owned())
+}
+
+fn read_u64_file(path: &Path) -> Option<u64> {
+    fs::read_to_string(path).ok()?.trim().parse().ok()
+}
+
+fn read_oom_kills(path: &Path) -> Option<u64> {
+    fs::read_to_string(path)
+        .ok()?
+        .lines()
+        .find_map(|line| line.strip_prefix("oom_kill "))?
+        .parse()
+        .ok()
+}
+
+fn kill_systemd_unit(unit: &str) {
+    let _ = Command::new("systemctl")
+        .args(["--user", "kill", "--kill-whom=all", "--signal=KILL", unit])
+        .status();
+}
+
+fn run_capped_candidate_child(
+    program: &str,
+    input: &Path,
+    unit_dir: &Path,
+    extra: &[(&str, String)],
+) -> CappedCandidateOutcome {
+    use super::orchestrate::workspace_root;
+
+    let sequence = CANDIDATE_UNIT_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let unit = format!("crat-a4-{}-{sequence}.service", std::process::id());
+    let out_path = unit_dir.join("worker.out");
+    let err_path = unit_dir.join("worker.err");
+    let out_file = fs::File::create(&out_path).expect("create candidate worker stdout");
+    let err_file = fs::File::create(&err_path).expect("create candidate worker stderr");
+    let exe = std::env::current_exe().expect("current test executable");
+
+    let mut environment = std::env::vars_os().collect::<BTreeMap<OsString, OsString>>();
+    for (key, value) in [
+        ("CRAT_BOC1_INPUT", input.display().to_string()),
+        ("CRAT_BOC1_MODE", "a4-source-census".to_owned()),
+        ("CRAT_BOC1_NAME", program.to_owned()),
+        ("DIR", workspace_root().display().to_string()),
+    ]
+    .into_iter()
+    .chain(extra.iter().map(|(key, value)| (*key, value.clone())))
+    {
+        environment.insert(OsString::from(key), OsString::from(value));
+    }
+
+    let mut command = Command::new("systemd-run");
+    command.args([
+        "--user",
+        "--wait",
+        "--pipe",
+        "--quiet",
+        "--same-dir",
+        "--unit",
+        &unit,
+        "--property",
+        "Type=exec",
+        "--property",
+        "MemoryAccounting=yes",
+        "--property",
+        &format!("MemoryMax={CANDIDATE_MEMORY_MAX_BYTES}"),
+        "--property",
+        "OOMPolicy=stop",
+    ]);
+    for (key, value) in environment {
+        let mut assignment = key;
+        assignment.push("=");
+        assignment.push(value);
+        command.arg("--setenv").arg(assignment);
+    }
+    command
+        .arg(exe)
+        .args(["bo_c1::boc1_run_one", "--exact", "--ignored", "--nocapture"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(out_file))
+        .stderr(Stdio::from(err_file));
+
+    let started = Instant::now();
+    let mut child = command.spawn().expect("spawn capped candidate worker");
+    let mut cgroup_path = None;
+    let mut cap_verified = false;
+    let mut peak_bytes = 0;
+    let mut oom_kills = 0;
+    let mut timed_out = false;
+    let status = loop {
+        if cgroup_path.is_none()
+            && let Some(control_group) = systemd_user_property(&unit, "ControlGroup")
+            && !control_group.is_empty()
+        {
+            cgroup_path = Some(
+                PathBuf::from("/sys/fs/cgroup").join(
+                    control_group
+                        .strip_prefix('/')
+                        .unwrap_or(control_group.as_str()),
+                ),
+            );
+        }
+        if let Some(cgroup) = &cgroup_path {
+            if read_u64_file(&cgroup.join("memory.max")) == Some(CANDIDATE_MEMORY_MAX_BYTES) {
+                cap_verified = true;
+            }
+            peak_bytes = peak_bytes.max(read_u64_file(&cgroup.join("memory.peak")).unwrap_or(0));
+            oom_kills = oom_kills.max(read_oom_kills(&cgroup.join("memory.events")).unwrap_or(0));
+        }
+        match child.try_wait().expect("poll capped candidate worker") {
+            Some(status) => break status,
+            None if started.elapsed() >= Duration::from_secs(LIVENESS_BOUND_S) => {
+                timed_out = true;
+                kill_systemd_unit(&unit);
+                let _ = child.kill();
+            }
+            None => std::thread::sleep(Duration::from_millis(100)),
+        }
+    };
+    if systemd_user_property(&unit, "Result").as_deref() == Some("oom-kill") {
+        oom_kills = oom_kills.max(1);
+    }
+    let wall_s = started.elapsed().as_secs_f64();
+    let stdout = fs::read_to_string(&out_path).unwrap_or_default();
+    let stderr = fs::read_to_string(&err_path).unwrap_or_default();
+    let row = stdout.lines().rev().find_map(super::report::parse_kv_line);
+    let worker_ok = status.success()
+        && row
+            .as_ref()
+            .and_then(|row| row.get("status"))
+            .is_some_and(|status| status == "ok");
+    let classification = if timed_out {
+        "timeout".to_owned()
+    } else {
+        match classify_capped_candidate(cap_verified, oom_kills, worker_ok) {
+            Ok("failed") => row
+                .as_ref()
+                .and_then(|row| row.get("status"))
+                .unwrap_or(if status.success() {
+                    "no-output"
+                } else {
+                    "crash"
+                })
+                .to_owned(),
+            Ok(status) => status.to_owned(),
+            Err(_) => "cap-setup-failure".to_owned(),
+        }
+    };
+    CappedCandidateOutcome {
+        status: classification,
+        wall_s,
+        peak_rss_kb: peak_bytes.div_ceil(1024),
+        stderr,
+        cap_verified,
+        oom_kills,
+    }
 }
 
 struct MeasurementContract {
@@ -4520,43 +5112,140 @@ fn validate_receipt_counts(receipt: &BTreeMap<String, String>, dir: &Path) -> Re
     Ok(())
 }
 
-fn failed_receipt(
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct IsolatedIdentity {
+    identity: Identity,
+    population: &'static str,
+}
+
+fn isolated_identities(contract: &MeasurementContract, program: &str) -> Vec<IsolatedIdentity> {
+    expected_identities(contract, program, true)
+        .into_iter()
+        .map(|identity| IsolatedIdentity {
+            identity,
+            population: "census",
+        })
+        .chain(
+            expected_identities(contract, program, false)
+                .into_iter()
+                .map(|identity| IsolatedIdentity {
+                    identity,
+                    population: "exception",
+                }),
+        )
+        .collect()
+}
+
+fn validate_isolated_unit(
     contract: &MeasurementContract,
+    expected: &IsolatedIdentity,
     dir: &Path,
-    program: &str,
-    status: &str,
-    phase: &str,
-    candidate: &str,
-    wall_s: f64,
-    peak_rss_kb: u64,
-) -> String {
-    let receipt = format!(
-        "machine_id={MACHINE_ID}\nplatform={PLATFORM}\nmemory_limit=uncapped\nwall_bound_kind=liveness\nwall_cap_s={LIVENESS_BOUND_S}\nprogram={program}\nstatus={status}\ndata=false\ncheckpoint_data=false\nanalysis_head={}\nlast_phase={phase}\nlast_candidate={candidate}\nwall_s={wall_s:.3}\npeak_rss_kb={peak_rss_kb}\n",
-        contract.head
-    );
-    fs::write(dir.join("receipt.txt"), receipt).expect("write failed receipt");
-    let mut files = vec!["receipt.txt"];
-    for file in [
-        "candidates.tsv",
-        "roots.tsv",
-        "exceptions.tsv",
-        "partial.tsv",
-        "partial.tsv.tmp",
-        "worker.out",
-        "worker.err",
+) -> Result<(), String> {
+    let candidates = parse_table(&dir.join("candidates.tsv"), CANDIDATE_HEADER, 7)?;
+    let roots = parse_table(&dir.join("roots.tsv"), ROOT_HEADER, 8)?;
+    let exceptions = parse_table(&dir.join("exceptions.tsv"), EXCEPTION_HEADER, 28)?;
+    let expected_candidate_count = usize::from(expected.population == "census");
+    let expected_exception_count = usize::from(expected.population == "exception");
+    if candidates.len() != expected_candidate_count || exceptions.len() != expected_exception_count
+    {
+        return Err(format!(
+            "isolated population count mismatch for {}: population={} candidates={} exceptions={}",
+            expected.identity.field_key,
+            expected.population,
+            candidates.len(),
+            exceptions.len()
+        ));
+    }
+    let identity_row = candidates
+        .first()
+        .or_else(|| exceptions.first())
+        .ok_or_else(|| {
+            format!(
+                "isolated unit has no semantic row: {}",
+                expected.identity.field_key
+            )
+        })?;
+    if identity_row[0] != expected.identity.program
+        || identity_row[1] != expected.identity.field_key
+    {
+        return Err(format!(
+            "isolated semantic identity mismatch: expected={:?} row={identity_row:?}",
+            expected.identity
+        ));
+    }
+    if roots.is_empty()
+        || roots.iter().any(|row| {
+            row[0] != expected.population
+                || row[1] != expected.identity.program
+                || row[2] != expected.identity.field_key
+        })
+    {
+        return Err(format!(
+            "isolated ordered-root identity mismatch: {}",
+            expected.identity.field_key
+        ));
+    }
+    validate_unique_root_rows(&roots)?;
+    let reported = if expected.population == "census" {
+        identity_row[6].parse::<usize>()
+    } else {
+        identity_row[21].parse::<usize>()
+    }
+    .map_err(|error| format!("isolated root count: {error}"))?;
+    if roots.len() != reported {
+        return Err(format!(
+            "isolated root inventory mismatch: candidate={} reported={reported} actual={}",
+            expected.identity.field_key,
+            roots.len()
+        ));
+    }
+    let receipt = parse_receipt(&dir.join("receipt.txt"))?;
+    for (key, value) in [
+        ("status", "ok"),
+        ("data", "true"),
+        ("checkpoint_data", "false"),
+        ("analysis_head", contract.head.as_str()),
+        ("program", expected.identity.program.as_str()),
+        ("candidate", expected.identity.field_key.as_str()),
+        ("population", expected.population),
+        ("memory_limit", "cgroup-100GiB"),
+        ("memory_max_bytes", "107374182400"),
+        ("cap_verified", "true"),
     ] {
-        if dir.join(file).is_file() {
-            files.push(file);
+        if receipt.get(key).map(String::as_str) != Some(value) {
+            return Err(format!(
+                "isolated receipt {key} mismatch for {}",
+                expected.identity.field_key
+            ));
         }
     }
-    write_manifest(dir, &files).expect("manifest failed shard")
+    Ok(())
+}
+
+fn render_isolated_checkpoint(
+    program: &str,
+    units: &[(usize, IsolatedIdentity, String, f64, u64)],
+) -> String {
+    let mut out = format!(
+        "data=false\nprogram={}\nunits_completed={}\n\nindex\tpopulation\tfield_key\tmanifest_sha256\twall_s\tpeak_rss_kb\n",
+        clean_cell(program),
+        units.len()
+    );
+    for (index, identity, manifest, wall_s, peak_rss_kb) in units {
+        out.push_str(&format!(
+            "{index}\t{}\t{}\t{manifest}\t{wall_s:.3}\t{peak_rss_kb}\n",
+            identity.population,
+            clean_cell(&identity.identity.field_key),
+        ));
+    }
+    out
 }
 
 fn run_shard(contract: &MeasurementContract, program: super::CorpusProgram) {
-    use super::orchestrate::{run_child_env, workspace_root};
+    use super::orchestrate::workspace_root;
 
     let dir = contract.run_root.join("shards").join(program.name);
-    if dir.is_dir() {
+    if dir.join("receipt.txt").is_file() {
         let manifest = verify_manifest(&dir).unwrap_or_else(|error| {
             panic!(
                 "A4C STOP phase=verified-skip candidate={}: {error}",
@@ -4591,69 +5280,220 @@ fn run_shard(contract: &MeasurementContract, program: super::CorpusProgram) {
         return;
     }
     fs::create_dir_all(dir.parent().expect("shard parent")).expect("create shard parent");
-    fs::create_dir(&dir).expect("create fresh shard");
+    if !dir.exists() {
+        fs::create_dir(&dir).expect("create fresh shard");
+    }
+    let units_dir = dir.join("units");
+    fs::create_dir_all(&units_dir).expect("create candidate-unit directory");
     let input = workspace_root()
         .join("benchmarks/rs-crown-derived")
         .join(program.name)
         .join(program.lib_root);
-    let outcome = run_child_env(
-        program.name,
-        &input,
-        "a4-source-census",
-        Duration::from_secs(LIVENESS_BOUND_S),
-        &[
-            (
-                "CRAT_A4_SOURCE_INPUT",
-                contract.input_path.display().to_string(),
-            ),
-            (
-                "CRAT_A4_SOURCE_CANDIDATES",
-                dir.join("candidates.tsv").display().to_string(),
-            ),
-            (
-                "CRAT_A4_SOURCE_ROOTS",
-                dir.join("roots.tsv").display().to_string(),
-            ),
-            (
-                "CRAT_A4_SOURCE_EXCEPTIONS",
-                dir.join("exceptions.tsv").display().to_string(),
-            ),
-            (
-                "CRAT_A4_SOURCE_CHECKPOINT",
-                dir.join("partial.tsv").display().to_string(),
-            ),
-        ],
-    );
-    fs::write(dir.join("worker.out"), &outcome.stdout).expect("preserve worker stdout");
-    fs::write(dir.join("worker.err"), &outcome.stderr).expect("preserve worker stderr");
-    let (phase, candidate) = last_phase(&outcome.stderr);
-    if outcome.status != "ok" {
-        let manifest = failed_receipt(
-            contract,
-            &dir,
+    let identities = isolated_identities(contract, program.name);
+    let mut completed = Vec::<(usize, IsolatedIdentity, String, f64, u64)>::new();
+    for (index, identity) in identities.iter().cloned().enumerate() {
+        let unit_dir = units_dir.join(format!("{index:03}"));
+        if unit_dir.is_dir() {
+            let manifest = verify_manifest(&unit_dir).unwrap_or_else(|error| {
+                panic!(
+                    "A4C STOP phase=candidate-verified-skip candidate={}: {error}",
+                    identity.identity.field_key
+                )
+            });
+            validate_isolated_unit(contract, &identity, &unit_dir).unwrap_or_else(|error| {
+                panic!(
+                    "A4C STOP phase=candidate-verified-skip candidate={}: {error}",
+                    identity.identity.field_key
+                )
+            });
+            let receipt =
+                parse_receipt(&unit_dir.join("receipt.txt")).expect("parse candidate receipt");
+            completed.push((
+                index,
+                identity,
+                manifest,
+                receipt["wall_s"].parse().expect("candidate wall"),
+                receipt["peak_rss_kb"].parse().expect("candidate RSS"),
+            ));
+            continue;
+        }
+        fs::create_dir(&unit_dir).expect("create fresh candidate unit");
+        let outcome = run_capped_candidate_child(
             program.name,
-            &outcome.status,
-            &phase,
-            &candidate,
+            &input,
+            &unit_dir,
+            &[
+                (
+                    "CRAT_A4_SOURCE_INPUT",
+                    contract.input_path.display().to_string(),
+                ),
+                (
+                    "CRAT_A4_SOURCE_CANDIDATE",
+                    identity.identity.field_key.clone(),
+                ),
+                (
+                    "CRAT_A4_SOURCE_CANDIDATES",
+                    unit_dir.join("candidates.tsv").display().to_string(),
+                ),
+                (
+                    "CRAT_A4_SOURCE_ROOTS",
+                    unit_dir.join("roots.tsv").display().to_string(),
+                ),
+                (
+                    "CRAT_A4_SOURCE_EXCEPTIONS",
+                    unit_dir.join("exceptions.tsv").display().to_string(),
+                ),
+                (
+                    "CRAT_A4_SOURCE_CHECKPOINT",
+                    unit_dir.join("partial.tsv").display().to_string(),
+                ),
+            ],
+        );
+        let (phase, marker_candidate) = last_phase(&outcome.stderr);
+        if outcome.status != "ok" {
+            if outcome.status == "resource-exhausted" {
+                let resource = render_resource_exhausted(
+                    program.name,
+                    &identity.identity.field_key,
+                    CANDIDATE_MEMORY_MAX_BYTES,
+                    outcome.peak_rss_kb,
+                    &phase,
+                );
+                fs::write(unit_dir.join("resource-exhausted.tsv"), &resource)
+                    .expect("write candidate resource exception");
+                write_atomic_checkpoint(&dir.join("resource-exhausted.tsv"), &resource)
+                    .expect("write program resource exception");
+            }
+            let receipt = format!(
+                "machine_id={MACHINE_ID}\nplatform={PLATFORM}\nmemory_limit=cgroup-100GiB\nmemory_max_bytes={CANDIDATE_MEMORY_MAX_BYTES}\ncap_verified={}\noom_kills={}\nwall_bound_kind=liveness\nwall_cap_s={LIVENESS_BOUND_S}\nprogram={}\ncandidate={}\npopulation={}\nstatus={}\ndata=false\ncheckpoint_data=false\nanalysis_head={}\nlast_phase={phase}\nlast_candidate={marker_candidate}\nwall_s={:.3}\npeak_rss_kb={}\n",
+                outcome.cap_verified,
+                outcome.oom_kills,
+                program.name,
+                clean_cell(&identity.identity.field_key),
+                identity.population,
+                outcome.status,
+                contract.head,
+                outcome.wall_s,
+                outcome.peak_rss_kb,
+            );
+            fs::write(unit_dir.join("receipt.txt"), receipt).expect("write failed unit receipt");
+            let mut files = vec!["receipt.txt", "worker.out", "worker.err"];
+            for file in [
+                "candidates.tsv",
+                "roots.tsv",
+                "exceptions.tsv",
+                "partial.tsv",
+                "resource-exhausted.tsv",
+            ] {
+                if unit_dir.join(file).is_file() {
+                    files.push(file);
+                }
+            }
+            let manifest = write_manifest(&unit_dir, &files).expect("manifest failed unit");
+            write_atomic_checkpoint(
+                &dir.join("partial.tsv"),
+                &render_isolated_checkpoint(program.name, &completed),
+            )
+            .expect("write program checkpoint after failed unit");
+            panic!(
+                "A4C STOP phase={phase} candidate={} program={} status={} cap_bytes={} wall_s={:.3} peak_rss_kb={} manifest={manifest}",
+                identity.identity.field_key,
+                program.name,
+                outcome.status,
+                CANDIDATE_MEMORY_MAX_BYTES,
+                outcome.wall_s,
+                outcome.peak_rss_kb,
+            );
+        }
+        let candidates = parse_table(&unit_dir.join("candidates.tsv"), CANDIDATE_HEADER, 7)
+            .expect("parse isolated candidates");
+        let roots =
+            parse_table(&unit_dir.join("roots.tsv"), ROOT_HEADER, 8).expect("parse isolated roots");
+        let exceptions = parse_table(&unit_dir.join("exceptions.tsv"), EXCEPTION_HEADER, 28)
+            .expect("parse isolated exceptions");
+        let receipt = format!(
+            "machine_id={MACHINE_ID}\nplatform={PLATFORM}\nmemory_limit=cgroup-100GiB\nmemory_max_bytes={CANDIDATE_MEMORY_MAX_BYTES}\ncap_verified={}\noom_kills={}\nwall_bound_kind=liveness\nwall_cap_s={LIVENESS_BOUND_S}\nprogram={}\ncandidate={}\npopulation={}\nstatus=ok\ndata=true\ncheckpoint_data=false\nanalysis_head={}\ncandidates={}\nroots={}\nexceptions={}\nlast_phase={phase}\nlast_candidate={marker_candidate}\nwall_s={:.3}\npeak_rss_kb={}\n",
+            outcome.cap_verified,
+            outcome.oom_kills,
+            program.name,
+            clean_cell(&identity.identity.field_key),
+            identity.population,
+            contract.head,
+            candidates.len(),
+            roots.len(),
+            exceptions.len(),
             outcome.wall_s,
             outcome.peak_rss_kb,
         );
-        panic!(
-            "A4C STOP phase={phase} candidate={candidate} program={} status={} wall_s={:.3} peak_rss_kb={} manifest={manifest}",
-            program.name, outcome.status, outcome.wall_s, outcome.peak_rss_kb
+        fs::write(unit_dir.join("receipt.txt"), receipt).expect("write completed unit receipt");
+        let manifest = write_manifest(
+            &unit_dir,
+            &[
+                "candidates.tsv",
+                "roots.tsv",
+                "exceptions.tsv",
+                "partial.tsv",
+                "receipt.txt",
+                "worker.out",
+                "worker.err",
+            ],
+        )
+        .expect("manifest completed unit");
+        assert_eq!(
+            verify_manifest(&unit_dir).expect("verify completed unit manifest"),
+            manifest
+        );
+        validate_isolated_unit(contract, &identity, &unit_dir)
+            .expect("validate newly completed isolated unit");
+        completed.push((
+            index,
+            identity,
+            manifest,
+            outcome.wall_s,
+            outcome.peak_rss_kb,
+        ));
+        write_atomic_checkpoint(
+            &dir.join("partial.tsv"),
+            &render_isolated_checkpoint(program.name, &completed),
+        )
+        .expect("write program isolated checkpoint");
+    }
+
+    let mut combined_candidates = String::new();
+    let mut combined_roots = String::new();
+    let mut combined_exceptions = String::new();
+    for (index, identity, _, _, _) in &completed {
+        let unit_dir = units_dir.join(format!("{index:03}"));
+        validate_isolated_unit(contract, identity, &unit_dir)
+            .expect("revalidate isolated unit before program finalization");
+        append_table(
+            &mut combined_candidates,
+            &fs::read_to_string(unit_dir.join("candidates.tsv")).expect("read unit candidates"),
+            CANDIDATE_HEADER,
+        );
+        append_table(
+            &mut combined_roots,
+            &fs::read_to_string(unit_dir.join("roots.tsv")).expect("read unit roots"),
+            ROOT_HEADER,
+        );
+        append_table(
+            &mut combined_exceptions,
+            &fs::read_to_string(unit_dir.join("exceptions.tsv")).expect("read unit exceptions"),
+            EXCEPTION_HEADER,
         );
     }
+    write_atomic_checkpoint(&dir.join("candidates.tsv"), &combined_candidates)
+        .expect("write program candidates");
+    write_atomic_checkpoint(&dir.join("roots.tsv"), &combined_roots).expect("write program roots");
+    write_atomic_checkpoint(&dir.join("exceptions.tsv"), &combined_exceptions)
+        .expect("write program exceptions");
+    let units_index = render_isolated_checkpoint(program.name, &completed).replacen(
+        "data=false\n",
+        "data=true\n",
+        1,
+    );
+    write_atomic_checkpoint(&dir.join("units.tsv"), &units_index).expect("write unit index");
     validate_shard(contract, program.name, &dir).unwrap_or_else(|error| {
-        failed_receipt(
-            contract,
-            &dir,
-            program.name,
-            "schema-or-identity",
-            "result-validation",
-            program.name,
-            outcome.wall_s,
-            outcome.peak_rss_kb,
-        );
         panic!(
             "A4C STOP phase=result-validation candidate={}: {error}",
             program.name
@@ -4664,15 +5504,15 @@ fn run_shard(contract: &MeasurementContract, program: super::CorpusProgram) {
     let roots = parse_table(&dir.join("roots.tsv"), ROOT_HEADER, 8).expect("parse completed roots");
     let exceptions = parse_table(&dir.join("exceptions.tsv"), EXCEPTION_HEADER, 28)
         .expect("parse completed exceptions");
+    let wall_s = completed.iter().map(|unit| unit.3).sum::<f64>();
+    let peak_rss_kb = completed.iter().map(|unit| unit.4).max().unwrap_or(0);
     let receipt = format!(
-        "machine_id={MACHINE_ID}\nplatform={PLATFORM}\nmemory_limit=uncapped\nwall_bound_kind=liveness\nwall_cap_s={LIVENESS_BOUND_S}\nprogram={}\nstatus=ok\ndata=true\ncheckpoint_data=false\nanalysis_head={}\na4_aggregate_manifest_sha256={A4_AGGREGATE_MANIFEST_SHA256}\na4_combined_sha256={A4_COMBINED_SHA256}\ncensus_identity_sha256={CENSUS_IDENTITY_SHA256}\nexception_identity_sha256={EXCEPTION_IDENTITY_SHA256}\nraw_corpus_digest={RAW_CORPUS_DIGEST}\nderived_substrate_digest={DERIVED_SUBSTRATE_DIGEST}\nsnapshot={SNAPSHOT_PATH}\ncandidates={}\nroots={}\nexceptions={}\nlast_phase={phase}\nlast_candidate={candidate}\nwall_s={:.3}\npeak_rss_kb={}\n",
+        "machine_id={MACHINE_ID}\nplatform={PLATFORM}\nmemory_limit=cgroup-100GiB\nmemory_max_bytes={CANDIDATE_MEMORY_MAX_BYTES}\ncandidate_isolation=true\nwall_bound_kind=liveness\nwall_cap_s={LIVENESS_BOUND_S}\nprogram={}\nstatus=ok\ndata=true\ncheckpoint_data=false\nanalysis_head={}\na4_aggregate_manifest_sha256={A4_AGGREGATE_MANIFEST_SHA256}\na4_combined_sha256={A4_COMBINED_SHA256}\ncensus_identity_sha256={CENSUS_IDENTITY_SHA256}\nexception_identity_sha256={EXCEPTION_IDENTITY_SHA256}\nraw_corpus_digest={RAW_CORPUS_DIGEST}\nderived_substrate_digest={DERIVED_SUBSTRATE_DIGEST}\nsnapshot={SNAPSHOT_PATH}\ncandidates={}\nroots={}\nexceptions={}\nlast_phase=complete\nlast_candidate=none\nwall_s={wall_s:.3}\npeak_rss_kb={peak_rss_kb}\n",
         program.name,
         contract.head,
         candidates.len(),
         roots.len(),
         exceptions.len(),
-        outcome.wall_s,
-        outcome.peak_rss_kb,
     );
     fs::write(dir.join("receipt.txt"), receipt).expect("write completed receipt");
     let manifest = write_manifest(
@@ -4682,9 +5522,8 @@ fn run_shard(contract: &MeasurementContract, program: super::CorpusProgram) {
             "roots.tsv",
             "exceptions.tsv",
             "partial.tsv",
+            "units.tsv",
             "receipt.txt",
-            "worker.out",
-            "worker.err",
         ],
     )
     .expect("manifest completed shard");
@@ -4700,8 +5539,8 @@ fn run_shard(contract: &MeasurementContract, program: super::CorpusProgram) {
         candidates.len(),
         roots.len(),
         exceptions.len(),
-        outcome.wall_s,
-        outcome.peak_rss_kb
+        wall_s,
+        peak_rss_kb
     );
 }
 
@@ -5122,6 +5961,86 @@ mod tests {
         for (path, expected) in cases {
             assert_eq!(flags_for_path(path), BTreeSet::from([expected]));
         }
+    }
+
+    #[test]
+    fn candidate_isolation_selects_exactly_one_population_row() {
+        let row = |field_key: &str, baseline_force: &str, proof_reason: &str| A4InputRow {
+            program: "fixture".to_owned(),
+            field_key: field_key.to_owned(),
+            field_slot: 0,
+            baseline_kind: SlotKind::Raw,
+            baseline_force: baseline_force.to_owned(),
+            proof_reason: proof_reason.to_owned(),
+        };
+        let input = vec![
+            row("Fixture::field0@d0", "unsat", "allocation-source-count-0"),
+            row("Fixture::field1@d0", "sat", "force-sat-exception"),
+        ];
+
+        let census = select_isolated_input(&input, "fixture", "Fixture::field0@d0").unwrap();
+        assert_eq!(census.0.len(), 1);
+        assert!(census.1.is_empty());
+
+        let exception = select_isolated_input(&input, "fixture", "Fixture::field1@d0").unwrap();
+        assert!(exception.0.is_empty());
+        assert_eq!(exception.1.len(), 1);
+
+        assert!(select_isolated_input(&input, "fixture", "missing").is_err());
+    }
+
+    #[test]
+    fn capped_candidate_classification_is_fail_closed() {
+        assert_eq!(classify_capped_candidate(true, 0, true), Ok("ok"));
+        assert_eq!(
+            classify_capped_candidate(true, 1, false),
+            Ok("resource-exhausted")
+        );
+        assert!(
+            classify_capped_candidate(false, 0, false)
+                .expect_err("an unverified cgroup cap must fail setup")
+                .contains("cap was not verified")
+        );
+
+        let row = render_resource_exhausted(
+            "fixture",
+            "Fixture::field0@d0",
+            CANDIDATE_MEMORY_MAX_BYTES,
+            104_857_600,
+            "source-traversal",
+        );
+        assert!(row.starts_with(RESOURCE_EXHAUSTED_HEADER));
+        assert!(row.contains("\tresource-exhausted\t107374182400\t104857600\t"));
+        assert!(row.ends_with("\tfalse\n"));
+    }
+
+    #[test]
+    fn checkpoint_reuse_requires_candidate_and_ordered_root_rows() {
+        let candidate = concat!(
+            "program\tfield_key\tfield_slot\tordinary_kind\tprimary_class\tcause_flags\troot_count\n",
+            "fixture\tFixture::field0@d0\t0\traw\tabsent\tnull-literal-root\t1\n",
+        );
+        let roots = concat!(
+            "population\tprogram\tfield_key\tstore_site\troot_id\troot_label\tcause_flags\tordered_path\n",
+            "census\tfixture\tFixture::field0@d0\tstore\troot\tnull\tnull-literal-root\troot>store\n",
+        );
+        assert!(validate_reusable_candidate_artifact(
+            "fixture",
+            "Fixture::field0@d0",
+            candidate,
+            roots,
+        )
+        .is_ok());
+        assert!(
+            validate_reusable_candidate_artifact(
+                "fixture",
+                "Fixture::field0@d0",
+                candidate,
+                ROOT_HEADER.to_owned().as_str(),
+            )
+            .expect_err("candidate summary without ordered roots must not be reusable")
+            .contains("root inventory")
+        );
     }
 
     #[test]
@@ -6263,6 +7182,542 @@ mod tests {
             .unwrap();
             assert_eq!(reading.closed_world_class, PrimaryClass::Invisible);
             assert_eq!(reading.open_class, PrimaryClass::Mixed);
+        })
+        .unwrap_or_else(|error| error.raise());
+    }
+
+    #[test]
+    fn field_stored_hook_resolution_reuses_visible_external_arm() {
+        let source = r#"
+            use core::ffi::c_void;
+
+            extern "C" {
+                fn malloc(size: usize) -> *mut c_void;
+            }
+
+            type Alloc = unsafe extern "C" fn(usize) -> *mut c_void;
+
+            struct DualHook {
+                alloc: Option<Alloc>,
+            }
+
+            struct VisibleHook {
+                alloc: Option<Alloc>,
+            }
+
+            struct EmptyHook {
+                alloc: Option<Alloc>,
+            }
+
+            unsafe extern "C" fn local_alloc(size: usize) -> *mut c_void {
+                malloc(size)
+            }
+
+            unsafe fn install_dual_default(hook: *mut DualHook) {
+                (*hook).alloc = Some(local_alloc);
+            }
+
+            pub unsafe extern "C" fn install_dual_external(
+                hook: *mut DualHook,
+                alloc: Option<Alloc>,
+            ) {
+                (*hook).alloc = alloc;
+            }
+
+            unsafe fn install_visible(hook: *mut VisibleHook) {
+                (*hook).alloc = Some(local_alloc);
+            }
+
+            unsafe fn call_dual(hook: *mut DualHook) -> *mut c_void {
+                install_dual_default(hook);
+                (*hook).alloc.expect("dual")(8)
+            }
+
+            unsafe fn call_visible(hook: *mut VisibleHook) -> *mut c_void {
+                install_visible(hook);
+                (*hook).alloc.expect("visible")(8)
+            }
+
+            unsafe fn call_empty(hook: *mut EmptyHook) -> *mut c_void {
+                (*hook).alloc.expect("empty")(8)
+            }
+        "#;
+        ::utils::compilation::run_compiler_on_str(source, |tcx| {
+            let program = super::super::collect_program(tcx);
+            let resolutions = collect_indirect_call_resolutions(tcx, &program.functions);
+            let resolution_for = |suffix: &str| {
+                let mut matching = resolutions
+                    .iter()
+                    .filter(|((function, _), _)| tcx.def_path_str(*function).ends_with(suffix))
+                    .map(|(_, resolution)| resolution)
+                    .collect::<Vec<_>>();
+                assert_eq!(matching.len(), 1, "one indirect call in {suffix}");
+                matching.pop().unwrap()
+            };
+            let target_paths = |resolution: &IndirectCallResolution| {
+                resolution
+                    .visible_targets
+                    .iter()
+                    .map(|target| tcx.def_path_str(*target))
+                    .collect::<BTreeSet<_>>()
+            };
+
+            let dual = resolution_for("call_dual");
+            assert_eq!(target_paths(dual), BTreeSet::from(["local_alloc".to_owned()]));
+            assert!(dual.has_external_parameter);
+            assert!(
+                dual.public_setter_reachable,
+                "a public parameter reaching the same field is the existing external remainder: {:#?}",
+                dual.diagnostic
+            );
+            assert!(!dual.has_unexplained_predecessor);
+            assert_eq!(
+                indirect_call_arm(
+                    true,
+                    dual.visible_targets.len(),
+                    dual.has_external_parameter,
+                    dual.exclusively_external_parameter,
+                    dual.public_setter_reachable,
+                    dual.has_unexplained_predecessor,
+                    "field-dual",
+                ),
+                Ok(IndirectCallArm::VisibleTargetsAndExternalRemainder)
+            );
+
+            let visible = resolution_for("call_visible");
+            assert_eq!(
+                target_paths(visible),
+                BTreeSet::from(["local_alloc".to_owned()])
+            );
+            assert!(!visible.has_external_parameter);
+            assert!(!visible.public_setter_reachable);
+            assert!(!visible.has_unexplained_predecessor);
+            assert_eq!(
+                indirect_call_arm(true, 1, false, false, false, false, "field-visible"),
+                Ok(IndirectCallArm::VisibleTargets)
+            );
+
+            let empty = resolution_for("call_empty");
+            assert!(empty.visible_targets.is_empty());
+            assert!(!empty.has_external_parameter);
+            assert!(empty.has_unexplained_predecessor);
+            assert!(
+                indirect_call_arm(true, 0, false, false, false, true, "field-empty")
+                    .expect_err("the field with neither source must STOP")
+                    .contains("unexplained predecessor")
+            );
+        })
+        .unwrap_or_else(|error| error.raise());
+    }
+
+    #[test]
+    fn indirect_targets_are_filtered_by_call_site_signature_without_choosing() {
+        let source = r#"
+            type Erased = Option<unsafe extern "C" fn()>;
+            type PointerHook = Option<unsafe extern "C" fn(usize) -> *mut u8>;
+            type UnitHook = Option<unsafe extern "C" fn(usize)>;
+
+            struct Hooks {
+                callback: Erased,
+            }
+
+            unsafe extern "C" fn unit_target(_size: usize) {}
+
+            unsafe extern "C" fn pointer_target_a(_size: usize) -> *mut u8 {
+                core::ptr::null_mut()
+            }
+
+            unsafe extern "C" fn pointer_target_b(_size: usize) -> *mut u8 {
+                core::ptr::null_mut()
+            }
+
+            unsafe fn install_all(hooks: *mut Hooks) {
+                (*hooks).callback = core::mem::transmute::<UnitHook, Erased>(Some(unit_target));
+                (*hooks).callback =
+                    core::mem::transmute::<PointerHook, Erased>(Some(pointer_target_a));
+                (*hooks).callback =
+                    core::mem::transmute::<PointerHook, Erased>(Some(pointer_target_b));
+            }
+
+            unsafe fn call_pointer(hooks: *mut Hooks) -> *mut u8 {
+                install_all(hooks);
+                let callback = core::mem::transmute::<Erased, PointerHook>((*hooks).callback);
+                callback.expect("pointer callback")(1)
+            }
+        "#;
+        ::utils::compilation::run_compiler_on_str(source, |tcx| {
+            let program = super::super::collect_program(tcx);
+            let resolutions = collect_indirect_call_resolutions(tcx, &program.functions);
+            let mut matching = resolutions
+                .iter()
+                .filter(|((function, _), _)| {
+                    tcx.def_path_str(*function).ends_with("call_pointer")
+                })
+                .map(|(_, resolution)| resolution)
+                .collect::<Vec<_>>();
+            assert_eq!(matching.len(), 1, "one indirect pointer call");
+            let targets = matching
+                .pop()
+                .unwrap()
+                .visible_targets
+                .iter()
+                .map(|target| tcx.def_path_str(*target))
+                .collect::<BTreeSet<_>>();
+
+            assert!(
+                !targets.contains("unit_target"),
+                "RED-exclude: a unit-returning target is incompatible with a pointer result: {targets:?}"
+            );
+            assert!(
+                targets.contains("pointer_target_a"),
+                "RED-include: a signature-compatible target must remain: {targets:?}"
+            );
+            assert_eq!(
+                targets,
+                BTreeSet::from([
+                    "pointer_target_a".to_owned(),
+                    "pointer_target_b".to_owned(),
+                ]),
+                "ambiguity control: all compatible targets must remain"
+            );
+        })
+        .unwrap_or_else(|error| error.raise());
+    }
+
+    #[test]
+    fn reference_mediated_callback_store_is_external_only() {
+        let source = r#"
+            use core::ffi::c_void;
+
+            type Callback = Option<unsafe extern "C" fn() -> *mut c_void>;
+
+            struct Registered {
+                callbacks: [Callback; 2],
+            }
+
+            struct Empty {
+                callbacks: [Callback; 2],
+            }
+
+            pub unsafe extern "C" fn register(
+                hooks: *mut Registered,
+                index: usize,
+                callback: Callback,
+            ) {
+                let ref mut slot = (*hooks).callbacks[index];
+                *slot = callback;
+            }
+
+            unsafe fn call_registered(hooks: *mut Registered) -> *mut c_void {
+                (*hooks).callbacks[0].expect("registered")()
+            }
+
+            unsafe fn call_empty(hooks: *mut Empty) -> *mut c_void {
+                (*hooks).callbacks[0].expect("empty")()
+            }
+        "#;
+        ::utils::compilation::run_compiler_on_str(source, |tcx| {
+            let program = super::super::collect_program(tcx);
+            let resolutions = collect_indirect_call_resolutions(tcx, &program.functions);
+            let resolution_for = |suffix: &str| {
+                let mut matching = resolutions
+                    .iter()
+                    .filter(|((function, _), _)| tcx.def_path_str(*function).ends_with(suffix))
+                    .map(|(_, resolution)| resolution)
+                    .collect::<Vec<_>>();
+                assert_eq!(matching.len(), 1, "one indirect call in {suffix}");
+                matching.pop().unwrap()
+            };
+
+            let registered = resolution_for("call_registered");
+            assert!(registered.visible_targets.is_empty());
+            assert!(
+                registered.has_external_parameter,
+                "the reference-mediated public setter must reach the callback field: {:#?}",
+                registered.diagnostic
+            );
+            assert!(registered.exclusively_external_parameter);
+            assert!(!registered.public_setter_reachable);
+            assert!(!registered.has_unexplained_predecessor);
+            assert_eq!(
+                indirect_call_arm(true, 0, true, true, false, false, "reference-store"),
+                Ok(IndirectCallArm::ExternalParameterCallback)
+            );
+
+            let empty = resolution_for("call_empty");
+            assert!(empty.visible_targets.is_empty());
+            assert!(!empty.has_external_parameter);
+            assert!(empty.has_unexplained_predecessor);
+            assert!(
+                indirect_call_arm(true, 0, false, false, false, true, "empty-reference")
+                    .expect_err("a callback field with no realized store must STOP")
+                    .contains("unexplained predecessor")
+            );
+        })
+        .unwrap_or_else(|error| error.raise());
+    }
+
+    #[test]
+    fn callback_reference_alias_conflicts_and_projected_stores_stop() {
+        let mut aliases = FxHashMap::default();
+        let local = Local::from_usize(1);
+        insert_target_reference_alias(&mut aliases, local, "field-a".to_owned()).unwrap();
+        assert!(
+            insert_target_reference_alias(&mut aliases, local, "field-b".to_owned())
+                .expect_err("one reference local cannot select two callback fields")
+                .contains("conflicting referents")
+        );
+
+        let source = r#"
+            use core::ffi::c_void;
+
+            type Callback = Option<unsafe extern "C" fn() -> *mut c_void>;
+
+            struct Hooks {
+                callbacks: [Callback; 2],
+            }
+
+            unsafe fn projected_store(hooks: *mut Hooks, callback: Callback) {
+                let slot = &mut (*hooks).callbacks;
+                (*slot)[0] = callback;
+            }
+        "#;
+        ::utils::compilation::run_compiler_on_str(source, |tcx| {
+            let program = super::super::collect_program(tcx);
+            let function = program
+                .functions
+                .iter()
+                .copied()
+                .find(|function| tcx.def_path_str(*function).ends_with("projected_store"))
+                .expect("projected-store fixture function");
+            let body_ref = tcx
+                .mir_drops_elaborated_and_const_checked(function)
+                .borrow();
+            let static_pointers = static_pointer_locals(tcx, &body_ref).unwrap();
+            let aliases =
+                target_reference_aliases(tcx, function, &body_ref, &static_pointers).unwrap();
+            let lhs = body_ref
+                .basic_blocks
+                .iter()
+                .flat_map(|data| &data.statements)
+                .find_map(|statement| {
+                    let StatementKind::Assign(box (lhs, _)) = &statement.kind else {
+                        return None;
+                    };
+                    (lhs.projection.len() > 1
+                        && matches!(lhs.projection.first(), Some(ProjectionElem::Deref)))
+                    .then_some(*lhs)
+                })
+                .expect("projected dereference store");
+            assert!(
+                target_assignment_node(tcx, function, &body_ref, &static_pointers, &aliases, lhs,)
+                    .expect_err("an additional projection on a callback alias must STOP")
+                    .contains("unsupported projected callback-reference store")
+            );
+        })
+        .unwrap_or_else(|error| error.raise());
+    }
+
+    #[test]
+    fn realized_same_type_alias_store_reaches_later_base_load() {
+        let source = r#"
+            use core::ffi::c_void;
+
+            extern "C" {
+                fn calloc(count: usize, size: usize) -> *mut c_void;
+                fn realloc(pointer: *mut c_void, size: usize) -> *mut c_void;
+            }
+
+            struct Item {
+                value: i32,
+            }
+
+            struct LiveContainer {
+                entries: *mut *mut Item,
+            }
+
+            struct EmptyContainer {
+                entries: *mut *mut Item,
+            }
+
+            struct LiveHolder {
+                current: *mut Item,
+            }
+
+            struct EmptyHolder {
+                current: *mut Item,
+            }
+
+            unsafe fn install_live(container: *mut LiveContainer) {
+                let item = calloc(1, core::mem::size_of::<Item>()) as *mut Item;
+                let entries = realloc(
+                    (*container).entries as *mut c_void,
+                    core::mem::size_of::<*mut Item>(),
+                ) as *mut *mut Item;
+                (*container).entries = entries;
+                *entries.offset(0) = item;
+            }
+
+            unsafe fn find_live(container: *mut LiveContainer) -> *mut Item {
+                *(*container).entries.offset(0)
+            }
+
+            unsafe fn find_empty(container: *mut EmptyContainer) -> *mut Item {
+                *(*container).entries.offset(0)
+            }
+
+            unsafe fn restore_live(holder: *mut LiveHolder, container: *mut LiveContainer) {
+                (*holder).current = find_live(container);
+            }
+
+            unsafe fn restore_empty(holder: *mut EmptyHolder, container: *mut EmptyContainer) {
+                (*holder).current = find_empty(container);
+            }
+        "#;
+        ::utils::compilation::run_compiler_on_str(source, |tcx| {
+            let program = super::super::collect_program(tcx);
+            let slots = CrateSlots::build(&program);
+            let crate_ctxt = CrateCtxt::new(&program);
+            let solver = KindSolver::new(&slots);
+            let (_, captured_export) = with_bo_export(|| {
+                emit_crate_ownership_constraints(
+                    &crate_ctxt,
+                    &slots,
+                    &compute_origins(&program),
+                    &solver,
+                )
+                .expect("fixture ownership emission")
+            });
+            let graph = build_source_graph(tcx, &slots, &captured_export);
+            let fields = candidate_fields(tcx, &slots);
+            let field = |suffix: &str| {
+                fields
+                    .keys()
+                    .find(|key| key.ends_with(suffix))
+                    .unwrap_or_else(|| panic!("fixture field missing: {suffix}"))
+                    .clone()
+            };
+
+            let live = trace_candidate(&graph, &field("LiveHolder::field0@d0"));
+            assert!(
+                !live.is_empty() && live.iter().all(|root| !root.evidence.flags.is_empty()),
+                "the realized offset-alias store must reach only existing terminals: {live:#?}"
+            );
+            assert_ne!(
+                classify_roots(
+                    &live
+                        .iter()
+                        .map(|root| root.evidence.clone())
+                        .collect::<Vec<_>>()
+                ),
+                PrimaryClass::Unresolved
+            );
+
+            let empty = trace_candidate(&graph, &field("EmptyHolder::field0@d0"));
+            assert!(
+                empty.iter().any(|root| root.evidence.flags.is_empty()),
+                "the base with no realized element store must stay unresolved"
+            );
+            assert_eq!(
+                classify_roots(
+                    &empty
+                        .iter()
+                        .map(|root| root.evidence.clone())
+                        .collect::<Vec<_>>()
+                ),
+                PrimaryClass::Unresolved
+            );
+        })
+        .unwrap_or_else(|error| error.raise());
+    }
+
+    #[test]
+    fn non_pointer_alias_payload_store_is_out_of_pointer_graph() {
+        let source = r#"
+            use core::ffi::c_void;
+
+            extern "C" {
+                fn realloc(pointer: *mut c_void, size: usize) -> *mut c_void;
+            }
+
+            unsafe fn write_byte(buffer: *mut u8, byte: u8) -> *mut u8 {
+                let resized = realloc(buffer.cast(), 2).cast::<u8>();
+                let alias = resized.offset(1);
+                *alias = byte;
+                resized
+            }
+        "#;
+        ::utils::compilation::run_compiler_on_str(source, |tcx| {
+            let program = super::super::collect_program(tcx);
+            let slots = CrateSlots::build(&program);
+            build_source_graph(tcx, &slots, &BoExport::default());
+        })
+        .unwrap_or_else(|error| error.raise());
+    }
+
+    #[test]
+    fn projected_pointer_alias_store_uses_only_existing_graph_places() {
+        let represented = r#"
+            struct Holder {
+                pointer: *mut u8,
+            }
+
+            pub unsafe fn store(holder: *mut Holder, source: *mut u8) {
+                let alias = holder;
+                (*alias).pointer = source;
+            }
+        "#;
+        ::utils::compilation::run_compiler_on_str(represented, |tcx| {
+            let program = super::super::collect_program(tcx);
+            let slots = CrateSlots::build(&program);
+            let graph = build_source_graph(tcx, &slots, &BoExport::default());
+            let field = candidate_fields(tcx, &slots)
+                .keys()
+                .find(|key| key.ends_with("Holder::field0@d0"))
+                .expect("fixture pointer field")
+                .clone();
+            let roots = trace_candidate(&graph, &field);
+            assert!(roots.iter().any(|root| {
+                root.evidence
+                    .flags
+                    .contains(&CauseFlag::ExternallySuppliedParameter)
+            }));
+        })
+        .unwrap_or_else(|error| error.raise());
+
+        let unsupported = r#"
+            struct ScalarHolder {
+                value: u8,
+            }
+
+            pub unsafe fn store(holder: *mut ScalarHolder, value: u8) {
+                let alias = holder;
+                (*alias).value = value;
+            }
+        "#;
+        ::utils::compilation::run_compiler_on_str(unsupported, |tcx| {
+            let program = super::super::collect_program(tcx);
+            let slots = CrateSlots::build(&program);
+            let function = program
+                .functions
+                .iter()
+                .copied()
+                .find(|function| tcx.def_path_str(*function).ends_with("store"))
+                .expect("fixture store function");
+            let body_ref = tcx
+                .mir_drops_elaborated_and_const_checked(function)
+                .borrow();
+            assert!(
+                add_realized_pointer_alias_store_edges(
+                    &mut SourceGraph::default(),
+                    tcx,
+                    &slots,
+                    function,
+                    &body_ref,
+                )
+                .expect_err("a projected alias store without a pointer node must STOP")
+                .contains("unsupported projected realized pointer-alias store")
+            );
         })
         .unwrap_or_else(|error| error.raise());
     }
