@@ -72,9 +72,34 @@ pub(crate) struct IdemStats {
 
 #[cfg(test)]
 fn idempotence_over(krate: &rustc_ast::Crate, tcx: TyCtxt<'_>) -> IdemStats {
-    use rustc_ast_pretty::pprust;
     let mut s = IdemStats::default();
-    for item in &krate.items {
+    walk_items(&krate.items, tcx, &mut s);
+    s
+}
+
+/// **RECURSES INTO MODULES**, and that is not a detail.
+///
+/// The first version of this walk iterated `krate.items` alone and measured
+/// **zero functions on all 20 programs**: every corpus function lives inside
+/// nested modules — `src::avl::height` is `mod src { mod avl { fn height } }`,
+/// which is what c2rust emits for a single-file crate. The gate reported
+/// `0 functions / 0 stable`: **vacuous, not passing.**
+///
+/// It was caught only because the census reports the **denominator** beside the
+/// rate. A rate alone would have read as a total failure or been waved off as a
+/// glitch, and a uniformly-zero predicate would have shipped as a green gate.
+/// Same shape as the corpus-empty `addr-taken` arm and the RED-weakening trap:
+/// **a measurement whose population is zero has not passed anything.**
+#[cfg(test)]
+fn walk_items(items: &[rustc_ast::ptr::P<rustc_ast::Item>], tcx: TyCtxt<'_>, s: &mut IdemStats) {
+    use rustc_ast_pretty::pprust;
+    for item in items {
+        if let rustc_ast::ItemKind::Mod(_, _, rustc_ast::ModKind::Loaded(inner, _, _, _)) =
+            &item.kind
+        {
+            walk_items(inner, tcx, s);
+            continue;
+        }
         if !matches!(item.kind, rustc_ast::ItemKind::Fn(_)) {
             continue;
         }
@@ -110,7 +135,6 @@ fn idempotence_over(krate: &rustc_ast::Crate, tcx: TyCtxt<'_>) -> IdemStats {
             }
         }
     }
-    s
 }
 
 /// One subject's bridge status.
