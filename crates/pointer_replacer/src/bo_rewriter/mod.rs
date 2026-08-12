@@ -82,6 +82,10 @@ pub(crate) mod verify;
 /// production when phase 3 ports the edit vocabulary onto it.
 #[cfg(test)]
 pub(crate) mod ast_bridge;
+/// **Phase 3** — the edit vocabulary as node transforms, with the fail-closed
+/// composition guard built beside its first arm.
+#[cfg(test)]
+pub(crate) mod ast_transform;
 #[cfg(test)]
 mod emit_tests;
 #[cfg(test)]
