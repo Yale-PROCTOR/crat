@@ -15930,3 +15930,56 @@ sample,measured,all legacy pre-transform decision subjects; final decision kind,
         .unwrap_or_else(|error| error.raise());
     }
 }
+
+/// **PHASE 1's SECOND HALF — do the substituted sources COMPILE?**
+///
+/// Reads the `{name}.substituted.rs` files the recon sweep writes and runs each
+/// through the project's own gate — [`verify::diagnose_crate`] — rather than an
+/// ad-hoc `rustc` invocation, so a pass here means the same thing a pass in the
+/// emit loop means. Two sources of truth about one compile is exactly the shape
+/// `type_checks_crate`'s own doc refuses.
+///
+/// Separate from the sweep because compiling inside a compiler callback nests
+/// two drivers; the sweep writes, this reads.
+#[test]
+#[ignore = "phase-1 gate: compiles 20 substituted crates"]
+fn m1_pprint_substitution_compiles() {
+    let art = orchestrate::out_dir().join("m1-recon-artifacts");
+    let mut rows: Vec<(String, usize, usize)> = Vec::new();
+    let mut files: Vec<_> = std::fs::read_dir(&art)
+        .unwrap_or_else(|e| panic!("read {}: {e}", art.display()))
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.to_string_lossy().ends_with(".substituted.rs"))
+        .collect();
+    files.sort();
+    assert!(
+        !files.is_empty(),
+        "no substituted sources — run m1_recon_corpus first. An empty \
+         population is not a passing gate."
+    );
+    for path in &files {
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().replace(".substituted.rs", ""))
+            .unwrap_or_default();
+        let d = crate::bo_rewriter::verify::diagnose_crate(path);
+        println!(
+            "M1PPRINT program={name} errors={} unrenderable={}",
+            d.errors, d.unrenderable
+        );
+        rows.push((name, d.errors, d.unrenderable));
+    }
+    let failed: Vec<_> = rows.iter().filter(|(_, e, _)| *e > 0).collect();
+    println!(
+        "M1PPRINT TOTAL programs={} clean={} failing={}",
+        rows.len(),
+        rows.len() - failed.len(),
+        failed.len()
+    );
+    assert!(
+        failed.is_empty(),
+        "function-granular substitution does not compile for {} program(s): {:?}",
+        failed.len(),
+        failed
+    );
+}
