@@ -1740,12 +1740,17 @@ fn an_unannotated_pointer_local_degrades_with_the_gate_that_stops_it() {
 /// is the existing key that carries exactly this claim — its own doc says *"or
 /// a parameter that is already a reference"* — so nothing was coined for them.
 ///
-/// *Mutation-tested:* deleting the collector's resolved-type shape fallback
-/// (restoring `DeclShape::Other`) routes this to a residual key, which is the
-/// pre-dissolution behaviour wearing a new name.
+/// **The SHAPE is asserted, not just the key**, and that is load-bearing:
+/// `DeclShape::Other` fails the `!= RawPtr` test too, so a mutation restoring
+/// `Other` reports the same key and a key-only assertion passes it. Measured,
+/// not reasoned — the first version of this witness was written key-only and
+/// its mutation came back GREEN.
+///
+/// *Mutation-tested:* restoring `DeclShape::Other` in the collector's
+/// resolved-type fallback fails on the shape column.
 #[test]
 fn an_unannotated_local_that_is_already_a_reference_reports_its_shape() {
-    let got = locals_of(
+    let rows = artifact_rows_of(
         "#![allow(dead_code, unused_unsafe, unused_variables)]\n\
          pub struct S { pub a: [u32; 4] }\n\
          pub unsafe fn f(s: *mut S) {\n\
@@ -1753,12 +1758,23 @@ fn an_unannotated_local_that_is_already_a_reference_reports_its_shape() {
          \x20   *fresh0 |= 1;\n\
          }\n",
     );
-    let fresh: Vec<_> = got
+    let fresh: Vec<_> = rows
         .iter()
-        .filter(|(_, n, _)| n.as_deref() == Some("fresh0"))
+        .filter(|r| r.param_name.as_deref() == Some("fresh0"))
         .collect();
-    assert_eq!(fresh.len(), 1, "{got:?}");
-    assert_eq!(fresh[0].2, "unsupported-decl-shape", "{got:?}");
+    assert_eq!(fresh.len(), 1, "{rows:?}");
+    assert_eq!(
+        fresh[0].degrade_reason.as_deref(),
+        Some("unsupported-decl-shape"),
+        "{rows:?}"
+    );
+    assert_eq!(
+        fresh[0].decl_shape,
+        Some(crate::coverage_recon::schema::DeclShape::Reference),
+        "the shape must come from the RESOLVED type — this subject is already \
+         `&mut T` and reporting `other` for it is the pre-dissolution claim \
+         wearing a new name: {rows:?}"
+    );
 }
 
 /// **THE TERMINAL VETO: a subject with no splice target cannot emit**, whatever
