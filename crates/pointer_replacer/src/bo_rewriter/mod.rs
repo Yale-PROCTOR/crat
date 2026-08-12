@@ -2960,7 +2960,7 @@ pub(crate) fn artifact_rows_span_swapped(
 pub(crate) fn seam_tsv(tcx: TyCtxt<'_>) -> Result<String, String> {
     let (table, _ctx) = decide_table_with_ctx(tcx)?;
     let sm = tcx.sess.source_map();
-    let mut out = String::from("kind\towner_fn\tfamily_or_reason\tsite\tlen_arm\n");
+    let mut out = String::from("kind\towner_fn\tfamily_or_reason\tsite\tlen_arm\tglue_shape\n");
     for edit in &table.seams.edits {
         let family = match edit.family {
             decision::seam::SeamFamily::Safe => "safe",
@@ -2971,8 +2971,34 @@ pub(crate) fn seam_tsv(tcx: TyCtxt<'_>) -> Result<String, String> {
         // and it can only be surgical if a `following` selection is
         // distinguishable from a `preceding` one without re-deriving it.
         let arm = edit.len_arm.map_or("-", |a| a.key());
+        // The glue SHAPE, so the placed population is countable by FORM and not
+        // only by family. Without it "does the unwrap arm ever fire?" is
+        // unanswerable from the census, and a golden could ratify a form with
+        // zero market -- the -4/-5 precedent.
+        let r = &edit.replacement;
+        let shape = if r.starts_with("core::slice::from_raw_parts") {
+            "from_raw_parts"
+        } else if r.starts_with("Some(core::slice::from_raw_parts") {
+            "some_from_raw_parts"
+        } else if r.contains(".as_mut().unwrap()") {
+            "as_mut_unwrap"
+        } else if r.contains(".unwrap()") {
+            "unwrap"
+        } else if r.starts_with("Some(&mut *") || r.starts_with("Some(&*") {
+            "some_reborrow"
+        } else if r.starts_with("Some(core::slice::from_") {
+            "some_from_ref_mut"
+        } else if r.starts_with("Some(") {
+            "some_wrap"
+        } else if r.starts_with("&mut *") || r.starts_with("&*") {
+            "reborrow"
+        } else if r.starts_with("core::slice::from_") {
+            "from_ref_mut"
+        } else {
+            "index"
+        };
         out.push_str(&format!(
-            "placed\t{}\t{}\t{}\t{arm}\n",
+            "placed\t{}\t{}\t{}\t{arm}\t{shape}\n",
             edit.owner_fn,
             family,
             sm.span_to_diagnostic_string(edit.span)
