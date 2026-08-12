@@ -7000,24 +7000,13 @@ mod run {
             }
         }
 
-        // **ARM 1's POPULATION DIFFERENTIAL** — also AST-first, and it runs
-        // before the bridge census for the same reason the substitution does.
-        match crate::bo_rewriter::ast_transform::arm1_population(tcx) {
-            Ok(st) => {
+        // ARM 1's TEXT DIFFERENTIAL — §3b's per-edit unit. Runs in the same
+        // AST-first window; it re-uses the capture rather than taking a second.
+        match crate::bo_rewriter::ast_transform::arm1_full(tcx) {
+            Ok((st, d)) => {
                 row.set("arm1_rewritten", st.rewritten.to_string());
                 row.set("arm1_not_ptr_decl", st.not_a_pointer_decl.to_string());
                 row.set("arm1_refused", st.refused.to_string());
-            }
-            Err(why) => {
-                row.set("arm1_rewritten", "declined");
-                row.set("arm1_detail", super::report::sanitize(&why));
-            }
-        }
-
-        // ARM 1's TEXT DIFFERENTIAL — §3b's per-edit unit. Runs in the same
-        // AST-first window; it re-uses the capture rather than taking a second.
-        match crate::bo_rewriter::ast_transform::arm1_text_differential(tcx) {
-            Ok(d) => {
                 row.set("arm1_compared", d.compared.to_string());
                 row.set("arm1_equal", d.equal.to_string());
                 row.set("arm1_differing", d.differing.to_string());

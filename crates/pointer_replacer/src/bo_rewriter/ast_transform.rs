@@ -308,10 +308,22 @@ pub(crate) struct TextDiff {
     pub unmatched_span: usize,
 }
 
+/// **ONE ENTRY, because the AST may be captured ONCE.**
+///
+/// `expanded_ast` panics after the HIR is built, and `make_ast_to_hir` builds
+/// it — so two functions that each capture the AST cannot both run in one
+/// session. They did, and the second declined on all 20 programs with
+/// `AST capture panicked` while the first quietly succeeded.
+///
+/// The module doc has warned about this ordering since phase 1; the defect was
+/// adding a SECOND consumer, not forgetting the rule. So the fix is structural
+/// rather than a comment: the population census and the text differential share
+/// one capture and one entry point, and there is no second function to call out
+/// of order.
 #[cfg(test)]
-pub(crate) fn arm1_text_differential(
+pub(crate) fn arm1_full(
     tcx: rustc_middle::ty::TyCtxt<'_>,
-) -> Result<TextDiff, String> {
+) -> Result<(RefDeclStats, TextDiff), String> {
     let stats = arm1_population_inner(tcx)?;
     let (table, _ctx) = super::decide_table_with_ctx(tcx)?;
     let emission = super::emit_files(tcx, &table, &rustc_hash::FxHashSet::default())?;
@@ -361,5 +373,5 @@ pub(crate) fn arm1_text_differential(
         .keys()
         .filter(|o| !ast_offsets.contains(o))
         .count();
-    Ok(d)
+    Ok((stats, d))
 }
