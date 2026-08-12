@@ -19,7 +19,7 @@ use rustc_middle::{
         AggregateKind, Body, Const, ConstValue, Local, Location, Operand, Place, PlaceRef,
         ProjectionElem, RETURN_PLACE, Rvalue, StatementKind, Terminator, TerminatorKind,
     },
-    ty::{TyCtxt, TyKind, UintTy},
+    ty::{Ty, TyCtxt, TyKind, UintTy},
 };
 use rustc_span::{
     def_id::{DefId, LocalDefId},
@@ -962,6 +962,60 @@ fn roles_for_name(name: &str) -> Vec<crate::analyses::borrow_ownership::boundary
         .collect()
 }
 
+fn boundary_matcher_applies(
+    tcx: TyCtxt<'_>,
+    callee: DefId,
+    matcher: crate::analyses::borrow_ownership::boundary_table::Matcher,
+    name: &str,
+) -> bool {
+    use rustc_hir::{def::DefKind, definitions::DefPathData};
+
+    use crate::analyses::borrow_ownership::boundary_table::Matcher;
+
+    match matcher {
+        Matcher::ForeignC => false,
+        Matcher::RustLibAssoc => !callee.is_local() && tcx.def_kind(callee) == DefKind::AssocFn,
+        Matcher::RustLibNonLocal => !callee.is_local(),
+        Matcher::AnyName => true,
+        Matcher::RustPtrPath => {
+            if callee.is_local() {
+                return false;
+            }
+            let def_path = tcx.def_path(callee);
+            matches!(
+                def_path.data.first().map(|element| &element.data),
+                Some(DefPathData::TypeNs(namespace)) if namespace.as_str() == "ptr"
+            ) && matches!(
+                def_path.data.get(3).map(|element| &element.data),
+                Some(DefPathData::ValueNs(value)) if value.as_str() == name
+            )
+        }
+    }
+}
+
+fn is_static_data_pointer_flow_call<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    callee: DefId,
+    source_ty: Ty<'tcx>,
+    destination_ty: Ty<'tcx>,
+) -> bool {
+    use crate::analyses::borrow_ownership::boundary_table::{Role, TABLE};
+
+    if source_ty != destination_ty || !source_ty.is_raw_ptr() {
+        return false;
+    }
+    let item_name = tcx.item_name(callee);
+    let name = item_name.as_str();
+    TABLE.iter().any(|entry| {
+        entry.name == name
+            && boundary_matcher_applies(tcx, callee, entry.matcher, name)
+            && entry
+                .roles
+                .iter()
+                .any(|role| matches!(role, Role::ProvenanceFlow | Role::LoanCreating))
+    })
+}
+
 #[derive(Clone, Debug)]
 enum HarnessCallKind {
     Local(LocalDefId),
@@ -1190,6 +1244,243 @@ fn static_pointer_locals(
         }
     }
     Ok(statics)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct StaticDataDerivation {
+    static_did: DefId,
+    depth_offset: i16,
+}
+
+fn static_data_derivation_for_place(
+    derivations: &FxHashMap<Local, StaticDataDerivation>,
+    place: Place<'_>,
+) -> Result<Option<StaticDataDerivation>, String> {
+    let Some(mut derivation) = derivations.get(&place.local).copied() else {
+        return Ok(None);
+    };
+    for projection in place.projection.iter() {
+        match projection {
+            ProjectionElem::Deref => derivation.depth_offset += 1,
+            ProjectionElem::Index(_) | ProjectionElem::ConstantIndex { .. } => {}
+            _ => {
+                return Err(format!(
+                    "unsupported static-data projection {projection:?} in {place:?}"
+                ));
+            }
+        }
+    }
+    Ok(Some(derivation))
+}
+
+fn insert_static_data_derivation(
+    derivations: &mut FxHashMap<Local, StaticDataDerivation>,
+    local: Local,
+    derivation: StaticDataDerivation,
+) -> Result<bool, String> {
+    match derivations.get(&local) {
+        Some(previous) if *previous == derivation => Ok(false),
+        Some(previous) => Err(format!(
+            "one MIR local has conflicting static-data derivations: {local:?} {previous:?} {derivation:?}"
+        )),
+        None => {
+            derivations.insert(local, derivation);
+            Ok(true)
+        }
+    }
+}
+
+fn derive_static_data_locals<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    fn_did: LocalDefId,
+    body: &Body<'tcx>,
+) -> Result<FxHashMap<Local, StaticDataDerivation>, String> {
+    let mut derivations = static_pointer_locals(tcx, body)?
+        .into_iter()
+        .map(|(local, static_did)| {
+            (
+                local,
+                StaticDataDerivation {
+                    static_did,
+                    depth_offset: -1,
+                },
+            )
+        })
+        .collect::<FxHashMap<_, _>>();
+    loop {
+        let mut changed = false;
+        for data in body.basic_blocks.iter() {
+            for statement in &data.statements {
+                let StatementKind::Assign(box (lhs, rvalue)) = &statement.kind else {
+                    continue;
+                };
+                let Some(target_local) = lhs.as_local() else {
+                    continue;
+                };
+                let source = match rvalue {
+                    Rvalue::Use(Operand::Copy(place) | Operand::Move(place))
+                    | Rvalue::CopyForDeref(place) => Some((*place, false)),
+                    Rvalue::Cast(_, operand, _)
+                        if operand.ty(&body.local_decls, tcx) == lhs.ty(body, tcx).ty =>
+                    {
+                        operand.place().map(|place| (place, false))
+                    }
+                    Rvalue::RawPtr(_, place) => Some((*place, true)),
+                    _ => None,
+                };
+                let Some((source_place, creates_pointer_to_place)) = source else {
+                    continue;
+                };
+                let Some(mut derivation) =
+                    static_data_derivation_for_place(&derivations, source_place)?
+                else {
+                    continue;
+                };
+                if creates_pointer_to_place {
+                    derivation.depth_offset -= 1;
+                } else if source_place.ty(body, tcx).ty != lhs.ty(body, tcx).ty {
+                    continue;
+                }
+                changed |=
+                    insert_static_data_derivation(&mut derivations, target_local, derivation)?;
+            }
+
+            let Some(call) = harness_call(tcx, data.terminator()) else {
+                continue;
+            };
+            let HarnessCallKind::RustLib(callee) = call.kind else {
+                continue;
+            };
+            let Some(target_local) = call.destination.as_local() else {
+                continue;
+            };
+            let Some(source_operand) = call.args.first().map(|argument| &argument.node) else {
+                continue;
+            };
+            let Some(source_place) = source_operand.place() else {
+                continue;
+            };
+            if !is_static_data_pointer_flow_call(
+                tcx,
+                callee,
+                source_operand.ty(body, tcx),
+                call.destination.ty(body, tcx).ty,
+            ) {
+                continue;
+            }
+            let Some(derivation) = static_data_derivation_for_place(&derivations, source_place)?
+            else {
+                continue;
+            };
+            changed |= insert_static_data_derivation(&mut derivations, target_local, derivation)?;
+        }
+        if !changed {
+            break;
+        }
+    }
+    if derivations
+        .values()
+        .any(|derivation| derivation.depth_offset < -1)
+    {
+        return Err(format!(
+            "invalid static-data depth offset in {}",
+            tcx.def_path_str(fn_did)
+        ));
+    }
+    Ok(derivations)
+}
+
+fn static_data_node(
+    tcx: TyCtxt<'_>,
+    derivation: StaticDataDerivation,
+    depth: u8,
+) -> Option<String> {
+    let static_depth = i16::from(depth) + derivation.depth_offset;
+    (static_depth >= 0).then(|| {
+        format!(
+            "data-static:{}@d{static_depth}",
+            tcx.def_path_str(derivation.static_did)
+        )
+    })
+}
+
+fn add_static_data_alias_edges<'tcx>(
+    graph: &mut SourceGraph,
+    tcx: TyCtxt<'tcx>,
+    slots: &CrateSlots,
+    fn_did: LocalDefId,
+    body: &Body<'tcx>,
+    derivations: &FxHashMap<Local, StaticDataDerivation>,
+) {
+    for (&local, &derivation) in derivations {
+        for depth in 0..=u8::MAX {
+            let Some(local_node) =
+                node_for_place_depth(tcx, slots, fn_did, body, Place::from(local), depth)
+            else {
+                break;
+            };
+            let Some(static_node) = static_data_node(tcx, derivation, depth) else {
+                continue;
+            };
+            let label = format!(
+                "static-data-alias:{}:{local:?}:depth{depth}",
+                tcx.def_path_str(fn_did)
+            );
+            graph.add_edge(FlowEdge {
+                source: static_node,
+                target: local_node,
+                kind: FlowEdgeKind::Local,
+                label,
+                provenance_tags: BTreeSet::new(),
+            });
+        }
+    }
+}
+
+fn add_static_data_store_edges<'tcx>(
+    graph: &mut SourceGraph,
+    tcx: TyCtxt<'tcx>,
+    slots: &CrateSlots,
+    fn_did: LocalDefId,
+    body: &Body<'tcx>,
+    derivations: &FxHashMap<Local, StaticDataDerivation>,
+) -> Result<(), String> {
+    for (bb, data) in body.basic_blocks.iter_enumerated() {
+        for (statement_index, statement) in data.statements.iter().enumerate() {
+            let StatementKind::Assign(box (lhs, _)) = &statement.kind else {
+                continue;
+            };
+            if !lhs
+                .projection
+                .iter()
+                .any(|projection| matches!(projection, ProjectionElem::Deref))
+            {
+                continue;
+            }
+            let Some(derivation) = static_data_derivation_for_place(derivations, *lhs)? else {
+                continue;
+            };
+            let Some(local_node) = node_for_place(tcx, slots, fn_did, body, *lhs) else {
+                continue;
+            };
+            let Some(static_node) = static_data_node(tcx, derivation, 0) else {
+                continue;
+            };
+            graph.add_edge(FlowEdge {
+                source: local_node,
+                target: static_node,
+                kind: FlowEdgeKind::Local,
+                label: format!(
+                    "static-data-store:{}:bb{}[{}]",
+                    tcx.def_path_str(fn_did),
+                    bb.index(),
+                    statement_index
+                ),
+                provenance_tags: BTreeSet::new(),
+            });
+        }
+    }
+    Ok(())
 }
 
 fn target_flow_node<'tcx>(
@@ -1531,6 +1822,25 @@ fn build_source_graph(tcx: TyCtxt<'_>, slots: &CrateSlots, export: &BoExport) ->
     let program = collect_program(tcx);
     let program_functions = program.functions.iter().copied().collect::<FxHashSet<_>>();
     let indirect_call_resolutions = collect_indirect_call_resolutions(tcx, &program.functions);
+    let static_data_derivations = program
+        .functions
+        .iter()
+        .copied()
+        .map(|function| {
+            let body_ref = tcx
+                .mir_drops_elaborated_and_const_checked(function)
+                .borrow();
+            let derivations = derive_static_data_locals(tcx, function, &body_ref).unwrap_or_else(
+                |error| {
+                    panic!(
+                        "A4C STOP phase=graph-construction candidate=none: static data aliases in {}: {error}",
+                        tcx.def_path_str(function)
+                    )
+                },
+            );
+            (function, derivations)
+        })
+        .collect::<FxHashMap<_, _>>();
     let mut graph = SourceGraph::default();
     let mut parameter_nodes = Vec::<(LocalDefId, Local, String)>::new();
     let mut nested_parameter_nodes = Vec::<(LocalDefId, Local, u8, String)>::new();
@@ -1539,6 +1849,28 @@ fn build_source_graph(tcx: TyCtxt<'_>, slots: &CrateSlots, export: &BoExport) ->
     for &fn_did in &program.functions {
         let body_ref = tcx.mir_drops_elaborated_and_const_checked(fn_did).borrow();
         let body = &*body_ref;
+        add_static_data_alias_edges(
+            &mut graph,
+            tcx,
+            slots,
+            fn_did,
+            body,
+            &static_data_derivations[&fn_did],
+        );
+        add_static_data_store_edges(
+            &mut graph,
+            tcx,
+            slots,
+            fn_did,
+            body,
+            &static_data_derivations[&fn_did],
+        )
+        .unwrap_or_else(|error| {
+            panic!(
+                "A4C STOP phase=graph-construction candidate=none: static data stores in {}: {error}",
+                tcx.def_path_str(fn_did)
+            )
+        });
         for local in body.args_iter() {
             if let Some(node) = node_for_place(tcx, slots, fn_did, body, Place::from(local)) {
                 parameter_nodes.push((fn_did, local, node));
@@ -3073,7 +3405,7 @@ const RAW_CORPUS_DIGEST: &str = "9fc912af10fd3b235fe4d444d2fbac0bc521509b1c9447f
 const DERIVED_SUBSTRATE_DIGEST: &str =
     "db96829b5c2b0db28fb4bb9ddd3d32901b5d4e6e4134da07ada0d513d94eb4c6";
 const SNAPSHOT_PATH: &str = "/home/p51lee/dev/agent-worktrees/m1-artifact-snapshots/3b26a0ff";
-const RETRY3_PREDECESSOR_SHARDS: [(&str, &str, &str); 11] = [
+const RETRY3_PREDECESSOR_SHARDS: [(&str, &str, &str); 12] = [
     (
         "bst",
         "ce11b3459c6fa46965e4cbe23ce11dffbdc7bf01",
@@ -3128,6 +3460,11 @@ const RETRY3_PREDECESSOR_SHARDS: [(&str, &str, &str); 11] = [
         "json.h",
         "bb8cead3695b42f5ef20a574000c51ba5dc5ebc6",
         "fcb2a562d385483ebf7f1b65841e38a3cf3609339cc216a6da6989954d4de693",
+    ),
+    (
+        "binn",
+        "93f0bdf4f2e361743e651abf3c1884e70a4d4b19",
+        "b516c79fd1b65f6805a3767713e9331cc86024d80c9c4467546c831fbf8ac1bd",
     ),
 ];
 
@@ -5926,6 +6263,270 @@ mod tests {
             .unwrap();
             assert_eq!(reading.closed_world_class, PrimaryClass::Invisible);
             assert_eq!(reading.open_class, PrimaryClass::Mixed);
+        })
+        .unwrap_or_else(|error| error.raise());
+    }
+
+    #[test]
+    fn static_cached_data_pointer_alias_has_source_and_empty_controls() {
+        let source = r#"
+            struct Live {
+                pointer: *mut u32,
+            }
+
+            struct Empty {
+                pointer: *mut u32,
+            }
+
+            struct LocalPointer(*mut u32);
+
+            impl LocalPointer {
+                unsafe fn offset(self, _amount: isize) -> *mut u32 {
+                    self.0
+                }
+            }
+
+            static mut LIVE_POOL: [*mut *mut u32; 1] = [core::ptr::null_mut(); 1];
+            static mut EMPTY_POOL: [*mut *mut u32; 1] = [core::ptr::null_mut(); 1];
+            static mut SCALAR: u32 = 0;
+
+            pub unsafe fn seed_live(value: *mut Live, source: *mut u32) {
+                (*value).pointer = source;
+            }
+
+            pub unsafe fn install_live_pool(pool: *mut *mut u32) {
+                LIVE_POOL[0] = pool;
+            }
+
+            pub unsafe fn cache_live(value: *mut Live) {
+                let pool = LIVE_POOL[0];
+                *pool.offset(0) = (*value).pointer;
+            }
+
+            pub unsafe fn restore_live(value: *mut Live) {
+                let pool = LIVE_POOL[0];
+                (*value).pointer = *pool.offset(0);
+            }
+
+            pub unsafe fn restore_empty(value: *mut Empty) {
+                let pool = EMPTY_POOL[0];
+                (*value).pointer = *pool.offset(0);
+            }
+
+            pub unsafe fn call_local_offset(source: *mut u32) -> *mut u32 {
+                LocalPointer(source).offset(0)
+            }
+
+            pub unsafe fn raw_address_roundtrip() -> *mut u32 {
+                let pointer = &raw mut SCALAR;
+                &raw mut *pointer
+            }
+
+            pub unsafe fn depth_changing_cast() -> *mut u8 {
+                let pointer = &raw mut SCALAR;
+                pointer as *mut u8
+            }
+        "#;
+        ::utils::compilation::run_compiler_on_str(source, |tcx| {
+            let program = super::super::collect_program(tcx);
+            let slots = CrateSlots::build(&program);
+            let graph = build_source_graph(tcx, &slots, &BoExport::default());
+            let function = |suffix: &str| {
+                program
+                    .functions
+                    .iter()
+                    .copied()
+                    .find(|function| tcx.def_path_str(*function).ends_with(suffix))
+                    .unwrap_or_else(|| panic!("fixture function missing: {suffix}"))
+            };
+            let core_offset = function("cache_live");
+            let core_body_ref = tcx
+                .mir_drops_elaborated_and_const_checked(core_offset)
+                .borrow();
+            let core_call = core_body_ref
+                .basic_blocks
+                .iter()
+                .filter_map(|data| harness_call(tcx, data.terminator()))
+                .find_map(|call| match call.kind {
+                    HarnessCallKind::RustLib(callee)
+                        if tcx.item_name(callee).as_str() == "offset" =>
+                    {
+                        Some((callee, call))
+                    }
+                    _ => None,
+                })
+                .expect("core pointer offset call missing");
+            assert!(is_static_data_pointer_flow_call(
+                tcx,
+                core_call.0,
+                core_call.1.args[0].node.ty(&*core_body_ref, tcx),
+                core_call.1.destination.ty(&*core_body_ref, tcx).ty,
+            ));
+
+            let local_offset = function("call_local_offset");
+            let local_body_ref = tcx
+                .mir_drops_elaborated_and_const_checked(local_offset)
+                .borrow();
+            let local_callee = local_body_ref
+                .basic_blocks
+                .iter()
+                .filter_map(|data| harness_call(tcx, data.terminator()))
+                .find_map(|call| match call.kind {
+                    HarnessCallKind::Local(callee)
+                        if tcx.item_name(callee.to_def_id()).as_str() == "offset" =>
+                    {
+                        Some(callee.to_def_id())
+                    }
+                    _ => None,
+                })
+                .expect("same-named local offset call missing");
+            let pointer_ty = local_body_ref.return_ty();
+            assert!(
+                !is_static_data_pointer_flow_call(tcx, local_callee, pointer_ty, pointer_ty),
+                "a same-named local method must not match the Rust library boundary"
+            );
+
+            let derive = |suffix: &str| {
+                let function = function(suffix);
+                let body_ref = tcx
+                    .mir_drops_elaborated_and_const_checked(function)
+                    .borrow();
+                let seeds = static_pointer_locals(tcx, &body_ref).unwrap();
+                let derivations = derive_static_data_locals(tcx, function, &body_ref).unwrap();
+                (seeds, derivations)
+            };
+            let (roundtrip_seeds, roundtrip_derivations) = derive("raw_address_roundtrip");
+            assert_eq!(roundtrip_seeds.len(), 1);
+            let (&seed_local, &static_did) = roundtrip_seeds.iter().next().unwrap();
+            assert_eq!(
+                roundtrip_derivations.get(&seed_local),
+                Some(&StaticDataDerivation {
+                    static_did,
+                    depth_offset: -1,
+                })
+            );
+            assert_eq!(
+                roundtrip_derivations.get(&RETURN_PLACE),
+                roundtrip_derivations.get(&seed_local),
+                "one deref plus one raw-address step must preserve static identity and depth"
+            );
+
+            let (cast_seeds, cast_derivations) = derive("depth_changing_cast");
+            assert_eq!(cast_seeds.len(), 1);
+            assert!(
+                !cast_derivations.contains_key(&RETURN_PLACE),
+                "a depth-changing cast must not enter the static-data derivation"
+            );
+            let fields = candidate_fields(tcx, &slots);
+            let field = |suffix: &str| {
+                fields
+                    .keys()
+                    .find(|key| key.ends_with(suffix))
+                    .unwrap_or_else(|| panic!("fixture field missing: {suffix}"))
+                    .clone()
+            };
+
+            let live = trace_candidate(&graph, &field("Live::field0@d0"));
+            assert!(
+                !live.is_empty() && live.iter().all(|root| !root.evidence.flags.is_empty()),
+                "the static cache path must reach only existing terminals: {live:#?}"
+            );
+            assert_ne!(
+                classify_roots(
+                    &live
+                        .iter()
+                        .map(|root| root.evidence.clone())
+                        .collect::<Vec<_>>()
+                ),
+                PrimaryClass::Unresolved
+            );
+
+            let empty = trace_candidate(&graph, &field("Empty::field0@d0"));
+            assert!(
+                empty.iter().any(|root| root.evidence.flags.is_empty()),
+                "a static-loaded pointer with no visible store must remain unresolved"
+            );
+            assert_eq!(
+                classify_roots(
+                    &empty
+                        .iter()
+                        .map(|root| root.evidence.clone())
+                        .collect::<Vec<_>>()
+                ),
+                PrimaryClass::Unresolved
+            );
+        })
+        .unwrap_or_else(|error| error.raise());
+    }
+
+    #[test]
+    fn unsupported_static_data_projection_stops() {
+        let source = r#"
+            struct Holder {
+                pointer: *mut u32,
+            }
+
+            static mut HOLDER: Holder = Holder {
+                pointer: core::ptr::null_mut(),
+            };
+
+            pub unsafe fn unsupported_projection() -> *mut u32 {
+                let holder = &raw mut HOLDER;
+                (*holder).pointer
+            }
+
+            pub unsafe fn unrelated_projection(holder: *mut Holder) -> *mut u32 {
+                (*holder).pointer
+            }
+        "#;
+        ::utils::compilation::run_compiler_on_str(source, |tcx| {
+            let program = super::super::collect_program(tcx);
+            let derive = |suffix: &str| {
+                let function = program
+                    .functions
+                    .iter()
+                    .copied()
+                    .find(|function| tcx.def_path_str(*function).ends_with(suffix))
+                    .unwrap_or_else(|| panic!("fixture function missing: {suffix}"));
+                let body_ref = tcx
+                    .mir_drops_elaborated_and_const_checked(function)
+                    .borrow();
+                let seeds = static_pointer_locals(tcx, &body_ref).unwrap();
+                let mut assignments = Vec::new();
+                for (bb, data) in body_ref.basic_blocks.iter_enumerated() {
+                    for (statement_index, statement) in data.statements.iter().enumerate() {
+                        let StatementKind::Assign(box (lhs, rvalue)) = &statement.kind else {
+                            continue;
+                        };
+                        assignments.push(format!(
+                            "bb{}[{statement_index}] lhs={lhs:?} rvalue={rvalue:?} seed={:?}",
+                            bb.index(),
+                            seeds.get(&lhs.local)
+                        ));
+                    }
+                }
+                (
+                    derive_static_data_locals(tcx, function, &body_ref),
+                    assignments,
+                )
+            };
+
+            let (result, assignments) = derive("unsupported_projection");
+            let error = match result {
+                Err(error) => error,
+                Ok(derived) => panic!(
+                    "a field projection on a known static-derived base must STOP; derived={derived:?}; MIR assignments:\n{}",
+                    assignments.join("\n")
+                ),
+            };
+            assert!(
+                error.contains("unsupported static-data projection"),
+                "unexpected STOP: {error}"
+            );
+            assert!(
+                derive("unrelated_projection").0.is_ok(),
+                "a field projection on a non-derived base is outside the static-data bridge"
+            );
         })
         .unwrap_or_else(|error| error.raise());
     }
