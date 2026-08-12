@@ -172,6 +172,31 @@ fn walk_items(items: &[rustc_ast::ptr::P<rustc_ast::Item>], tcx: TyCtxt<'_>, s: 
     }
 }
 
+/// **The substituted range must COVER the outer attributes.**
+///
+/// `Item::span` starts at `pub`/`unsafe`/`fn`, NOT at the first attribute —
+/// measured, not assumed: `subst_span_at_attr` came back **0 on all 20
+/// programs**. `pprust::item_to_string` prints the attributes, so replacing
+/// `item.span` alone leaves the substrate's `#[no_mangle]` in place and adds a
+/// second one from the printed text. `bst.substituted.rs` had them on
+/// consecutive lines 47 and 48.
+///
+/// This is the counter earning its place: the defect is invisible in the
+/// idempotence gate — printing and reparsing a function is a fixed point
+/// whether or not the SPAN used to splice it is right — and it would have
+/// surfaced in phase 3 as an unexplained parity diff over every attributed
+/// function in the corpus.
+#[cfg(test)]
+fn item_span_with_attrs(item: &rustc_ast::Item) -> rustc_span::Span {
+    let lo = item
+        .attrs
+        .iter()
+        .map(|a| a.span.lo())
+        .min()
+        .map_or(item.span.lo(), |a| a.min(item.span.lo()));
+    item.span.with_lo(lo)
+}
+
 /// One subject's bridge status.
 pub(crate) struct BridgeRow {
     pub fn_path: String,
@@ -343,7 +368,7 @@ fn collect_fn_spans(items: &[rustc_ast::ptr::P<rustc_ast::Item>], out: &mut Vec<
             continue;
         }
         if matches!(item.kind, rustc_ast::ItemKind::Fn(_)) {
-            out.push(item.span);
+            out.push(item_span_with_attrs(item));
         }
     }
 }
@@ -430,7 +455,7 @@ fn collect_fn_prints(
             continue;
         }
         if matches!(item.kind, rustc_ast::ItemKind::Fn(_)) {
-            out.push((item.span, pprust::item_to_string(item)));
+            out.push((item_span_with_attrs(item), pprust::item_to_string(item)));
         }
     }
 }
