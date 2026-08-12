@@ -15950,6 +15950,7 @@ fn m1_pprint_substitution_compiles() {
         .unwrap_or_else(|e| panic!("read {}: {e}", art.display()))
         .filter_map(|e| e.ok().map(|e| e.path()))
         .filter(|p| p.to_string_lossy().ends_with(".substituted.rs"))
+        .filter(|p| !p.to_string_lossy().contains("__gate_"))
         .collect();
     files.sort();
     assert!(
@@ -15962,7 +15963,17 @@ fn m1_pprint_substitution_compiles() {
             .file_name()
             .map(|n| n.to_string_lossy().replace(".substituted.rs", ""))
             .unwrap_or_default();
-        let d = crate::bo_rewriter::verify::diagnose_crate(path);
+        // **The crate name comes from the FILE NAME**, and `{name}.substituted.rs`
+        // makes `bst.substituted` — `invalid character '.' in crate name`. That
+        // is what produced a uniform `errors=2` on all 20 programs and a 0.81 s
+        // run that could not possibly have compiled brotli's 26 MB. The gate
+        // owns the compile, so it owns making its input nameable.
+        let stem = name.replace(['.', '-'], "_");
+        let tmp = art.join(format!("__gate_{stem}.rs"));
+        std::fs::copy(path, &tmp)
+            .unwrap_or_else(|e| panic!("stage {} -> {}: {e}", path.display(), tmp.display()));
+        let d = crate::bo_rewriter::verify::diagnose_crate(&tmp);
+        let _ = std::fs::remove_file(&tmp);
         println!(
             "M1PPRINT program={name} errors={} unrenderable={}",
             d.errors, d.unrenderable
