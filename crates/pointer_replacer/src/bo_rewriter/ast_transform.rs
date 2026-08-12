@@ -79,6 +79,11 @@ pub(crate) struct RefDeclStats {
     pub not_a_pointer_decl: usize,
     /// Refused by the composition guard.
     pub refused: usize,
+    /// `(byte offset of the declaration's type, rendered type)` per rewrite —
+    /// the text differential's left-hand side. Keyed by offset because that is
+    /// what the span layer's `Edit` is keyed by, so the join needs no name
+    /// matching and cannot silently pair the wrong two things.
+    pub rendered: Vec<(u32, String)>,
 }
 
 /// Arm 1's visitor: rewrite the declared type of every `Decision::Ref` subject.
@@ -136,6 +141,9 @@ impl RefDeclVisitor<'_> {
             },
         );
         self.stats.rewritten += 1;
+        self.stats
+            .rendered
+            .push((ty.span.lo().0, rustc_ast_pretty::pprust::ty_to_string(ty)));
     }
 }
 
@@ -234,6 +242,11 @@ mod tests {
 /// is built.
 #[cfg(test)]
 pub(crate) fn arm1_population(tcx: rustc_middle::ty::TyCtxt<'_>) -> Result<RefDeclStats, String> {
+    arm1_population_inner(tcx)
+}
+
+#[cfg(test)]
+fn arm1_population_inner(tcx: rustc_middle::ty::TyCtxt<'_>) -> Result<RefDeclStats, String> {
     let captured = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let mut krate = ::utils::ast::expanded_ast(tcx);
         let map = ::utils::ast::make_ast_to_hir(&mut krate, tcx);
@@ -269,4 +282,84 @@ pub(crate) fn arm1_population(tcx: rustc_middle::ty::TyCtxt<'_>) -> Result<RefDe
     let mut stats = v.stats;
     stats.refused = guard.refused.len();
     Ok(stats)
+}
+
+/// **ARM 1's TEXT DIFFERENTIAL** — the rendered declaration vs the span layer's
+/// own edit, at the same byte offset.
+///
+/// Per §3b: the unit is one EDIT, and this arm is comparable with no other arm
+/// built, because each declaration replacement is independent of every other
+/// edit in the file.
+///
+/// The right-hand side is the **real** plan — `emit_files` extracts it once
+/// inside the session — never a re-derivation of what the replacement ought to
+/// be. Comparing against a re-derivation would test this function against
+/// itself.
+#[derive(Default)]
+pub(crate) struct TextDiff {
+    pub compared: usize,
+    pub equal: usize,
+    /// Offsets where the AST layer rendered something the span layer did not
+    /// write. Capped for the artifact; `differing` is the uncapped count.
+    pub examples: Vec<String>,
+    pub differing: usize,
+    /// AST rewrites with no span-layer edit at that offset, and vice versa.
+    pub unmatched_ast: usize,
+    pub unmatched_span: usize,
+}
+
+#[cfg(test)]
+pub(crate) fn arm1_text_differential(
+    tcx: rustc_middle::ty::TyCtxt<'_>,
+) -> Result<TextDiff, String> {
+    let stats = arm1_population_inner(tcx)?;
+    let (table, _ctx) = super::decide_table_with_ctx(tcx)?;
+    let emission = super::emit_files(tcx, &table, &rustc_hash::FxHashSet::default())?;
+
+    // The span layer's declaration edits, keyed by absolute offset. `Edit::lo`
+    // is FILE-relative, so the file's own base is added back before joining —
+    // the AST side carries absolute `Span` offsets.
+    let sm = tcx.sess.source_map();
+    let mut by_offset: FxHashMap<u32, String> = FxHashMap::default();
+    for (key, edits) in &emission.plan.by_file {
+        let base = sm
+            .files()
+            .iter()
+            .find(|sf| super::file_key(&sf.name).as_ref() == Some(key))
+            .map(|sf| sf.start_pos.0)
+            .unwrap_or(0);
+        for e in edits {
+            if matches!(
+                e.justification,
+                super::plan::Justification::KindDecision { .. }
+            ) {
+                by_offset.insert(base + e.lo as u32, e.replacement.clone());
+            }
+        }
+    }
+
+    let mut d = TextDiff::default();
+    for (off, rendered) in &stats.rendered {
+        match by_offset.get(off) {
+            Some(span_text) => {
+                d.compared += 1;
+                if span_text == rendered {
+                    d.equal += 1;
+                } else {
+                    d.differing += 1;
+                    if d.examples.len() < 10 {
+                        d.examples
+                            .push(format!("@{off} ast={rendered:?} span={span_text:?}"));
+                    }
+                }
+            }
+            None => d.unmatched_ast += 1,
+        }
+    }
+    let ast_offsets: FxHashSet<u32> = stats.rendered.iter().map(|(o, _)| *o).collect();
+    d.unmatched_span = by_offset
+        .keys()
+        .filter(|o| !ast_offsets.contains(o))
+        .count();
+    Ok(d)
 }

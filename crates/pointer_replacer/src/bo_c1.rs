@@ -7014,6 +7014,28 @@ mod run {
             }
         }
 
+        // ARM 1's TEXT DIFFERENTIAL — §3b's per-edit unit. Runs in the same
+        // AST-first window; it re-uses the capture rather than taking a second.
+        match crate::bo_rewriter::ast_transform::arm1_text_differential(tcx) {
+            Ok(d) => {
+                row.set("arm1_compared", d.compared.to_string());
+                row.set("arm1_equal", d.equal.to_string());
+                row.set("arm1_differing", d.differing.to_string());
+                row.set("arm1_unmatched_ast", d.unmatched_ast.to_string());
+                row.set("arm1_unmatched_span", d.unmatched_span.to_string());
+                if !d.examples.is_empty() {
+                    row.set(
+                        "arm1_examples",
+                        super::report::sanitize(&d.examples.join(" | ")),
+                    );
+                }
+            }
+            Err(why) => {
+                row.set("arm1_compared", "declined");
+                row.set("arm1_diff_detail", super::report::sanitize(&why));
+            }
+        }
+
         let bridge = crate::bo_rewriter::ast_bridge::census_tsv(tcx);
         let bridge_path = dir.join(format!("{name}.astbridge.tsv"));
         std::fs::write(&bridge_path, &bridge)
