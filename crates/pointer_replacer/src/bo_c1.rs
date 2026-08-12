@@ -6979,6 +6979,27 @@ mod run {
         // so the resolution rate is a corpus number rather than something read
         // off a file by hand — the same discipline the seam column landed
         // under.
+        // PHASE 1's second half, and it runs BEFORE the bridge census: it needs
+        // only the AST and the source map, while the bridge builds the HIR via
+        // `make_ast_to_hir`. Two `expanded_ast` captures are fine while nothing
+        // has lowered; one after lowering is a panic.
+        match crate::bo_rewriter::ast_bridge::substituted_source(tcx) {
+            Ok((text, st)) => {
+                let sp = dir.join(format!("{name}.substituted.rs"));
+                std::fs::write(&sp, &text)
+                    .unwrap_or_else(|e| panic!("write substituted source {}: {e}", sp.display()));
+                row.set("subst_functions", st.functions.to_string());
+                row.set("subst_nested", st.nested.to_string());
+                row.set("subst_unrenderable", st.unrenderable.to_string());
+                row.set("subst_span_at_attr", st.span_starts_at_attr.to_string());
+                row.set("subst_bytes", text.len().to_string());
+            }
+            Err(why) => {
+                row.set("subst_functions", "declined");
+                row.set("subst_detail", super::report::sanitize(&why));
+            }
+        }
+
         let bridge = crate::bo_rewriter::ast_bridge::census_tsv(tcx);
         let bridge_path = dir.join(format!("{name}.astbridge.tsv"));
         std::fs::write(&bridge_path, &bridge)

@@ -306,3 +306,131 @@ pub(crate) fn census_tsv(tcx: TyCtxt<'_>) -> String {
     }
     out
 }
+
+/// **PHASE 1's SECOND HALF — does function-granular substitution COMPILE?**
+///
+/// Not "does a whole-crate reprint compile". The frozen-substrate correction
+/// made that question obsolete: the emitted crate is the substrate with each
+/// transformed function's byte range replaced by that function's printed text,
+/// and every other byte untouched. So the property to measure is the one the
+/// emission model actually relies on.
+///
+/// **It also discharges the carried caveat** (reviewer note, 2026-08-12):
+/// *"non-overlapping by construction" rests on decided functions being disjoint
+/// top-level items — a nested item inside a decided function's range is a
+/// FINDING, not a silent assumption.* This walk reports containment rather than
+/// assuming its absence.
+pub(crate) struct SubstStats {
+    pub functions: usize,
+    /// Function spans that CONTAIN another function's span. Must be 0, or
+    /// function-granular substitution is not non-overlapping after all.
+    pub nested: usize,
+    /// Spans whose original text could not be recovered — substitution would be
+    /// guessing, so it is refused and counted.
+    pub unrenderable: usize,
+    /// Does `item.span` include the outer attributes? Measured, not assumed:
+    /// substituting a span that excludes them duplicates every `#[no_mangle]`.
+    pub span_starts_at_attr: usize,
+}
+
+#[cfg(test)]
+fn collect_fn_spans(items: &[rustc_ast::ptr::P<rustc_ast::Item>], out: &mut Vec<rustc_span::Span>) {
+    for item in items {
+        if let rustc_ast::ItemKind::Mod(_, _, rustc_ast::ModKind::Loaded(inner, _, _, _)) =
+            &item.kind
+        {
+            collect_fn_spans(inner, out);
+            continue;
+        }
+        if matches!(item.kind, rustc_ast::ItemKind::Fn(_)) {
+            out.push(item.span);
+        }
+    }
+}
+
+/// Build the substituted source for the crate's single root file, plus the
+/// findings above. Returns `Err` when the AST capture itself is refused.
+#[cfg(test)]
+pub(crate) fn substituted_source(tcx: TyCtxt<'_>) -> Result<(String, SubstStats), String> {
+    let mapped = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let krate = ::utils::ast::expanded_ast(tcx);
+        let mut spans = Vec::new();
+        collect_fn_spans(&krate.items, &mut spans);
+        let mut printed: Vec<(rustc_span::Span, String)> = Vec::new();
+        collect_fn_prints(&krate.items, &mut printed);
+        (spans, printed)
+    }));
+    let (spans, printed) = mapped.map_err(|_| "AST capture panicked".to_owned())?;
+
+    let sm = tcx.sess.source_map();
+    let mut s = SubstStats {
+        functions: printed.len(),
+        nested: 0,
+        unrenderable: 0,
+        span_starts_at_attr: 0,
+    };
+    // Containment: a function span that strictly contains another's.
+    for a in &spans {
+        if spans
+            .iter()
+            .any(|b| b != a && a.contains(*b) && (a.lo() != b.lo() || a.hi() != b.hi()))
+        {
+            s.nested += 1;
+        }
+    }
+    // The root file's original text — the frozen substrate for this crate.
+    let Some(file) = spans
+        .first()
+        .map(|sp| sm.lookup_source_file(sp.lo()))
+        .filter(|f| f.src.is_some())
+    else {
+        return Ok((String::new(), s));
+    };
+    let src = file.src.as_ref().expect("filtered").to_string();
+    let base = file.start_pos;
+
+    let mut edits: Vec<(usize, usize, String)> = Vec::new();
+    for (sp, text) in &printed {
+        match sm.span_to_snippet(*sp) {
+            Ok(orig) => {
+                if orig.trim_start().starts_with('#') {
+                    s.span_starts_at_attr += 1;
+                }
+                let lo = (sp.lo() - base).0 as usize;
+                let hi = (sp.hi() - base).0 as usize;
+                edits.push((lo, hi, text.clone()));
+            }
+            Err(_) => s.unrenderable += 1,
+        }
+    }
+    // Back-to-front, exactly as `apply` does: offsets address the ORIGINAL.
+    edits.sort_by_key(|(lo, _, _)| std::cmp::Reverse(*lo));
+    let mut out = src;
+    for (lo, hi, text) in edits {
+        if lo <= hi && hi <= out.len() {
+            out.replace_range(lo..hi, &text);
+        } else {
+            s.unrenderable += 1;
+        }
+    }
+    Ok((out, s))
+}
+
+#[cfg(test)]
+fn collect_fn_prints(
+    items: &[rustc_ast::ptr::P<rustc_ast::Item>],
+    out: &mut Vec<(rustc_span::Span, String)>,
+) {
+    use rustc_ast_pretty::pprust;
+    for item in items {
+        if let rustc_ast::ItemKind::Mod(_, _, rustc_ast::ModKind::Loaded(inner, _, _, _)) =
+            &item.kind
+        {
+            collect_fn_prints(inner, out);
+            continue;
+        }
+        if matches!(item.kind, rustc_ast::ItemKind::Fn(_)) {
+            out.push((item.span, pprust::item_to_string(item)));
+        }
+    }
+}
