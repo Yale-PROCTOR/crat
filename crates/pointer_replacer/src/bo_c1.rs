@@ -15951,6 +15951,7 @@ fn m1_pprint_substitution_compiles() {
         .filter_map(|e| e.ok().map(|e| e.path()))
         .filter(|p| p.to_string_lossy().ends_with(".substituted.rs"))
         .filter(|p| !p.to_string_lossy().contains("__gate_"))
+        .filter(|p| !p.to_string_lossy().contains("__base_"))
         .collect();
     files.sort();
     assert!(
@@ -15974,11 +15975,34 @@ fn m1_pprint_substitution_compiles() {
             .unwrap_or_else(|e| panic!("stage {} -> {}: {e}", path.display(), tmp.display()));
         let d = crate::bo_rewriter::verify::diagnose_crate(&tmp);
         let _ = std::fs::remove_file(&tmp);
+        // **BASELINE CONTROL — the substrate through the SAME gate.**
+        //
+        // S2b's instrument-integrity rule: the baseline compiles only where it
+        // is consumed. A corpus program need not compile standalone under this
+        // harness — brotli needs `c2rust_bitfields`, which a bare crate root
+        // does not supply — so "substituted has errors" is not a finding on its
+        // own. The property is that substitution introduces NO NEW errors,
+        // which needs the substrate's own count beside it.
+        let orig = orchestrate::workspace_root()
+            .join("benchmarks/rs-crown-derived")
+            .join(&name)
+            .join("lib.rs");
+        let base_errors = if orig.exists() {
+            let bt = art.join(format!("__base_{stem}.rs"));
+            std::fs::copy(&orig, &bt).unwrap_or_else(|e| panic!("stage baseline: {e}"));
+            let b = crate::bo_rewriter::verify::diagnose_crate(&bt);
+            let _ = std::fs::remove_file(&bt);
+            b.errors
+        } else {
+            0
+        };
         println!(
-            "M1PPRINT program={name} errors={} unrenderable={}",
-            d.errors, d.unrenderable
+            "M1PPRINT program={name} errors={} baseline={base_errors} new={} unrenderable={}",
+            d.errors,
+            d.errors.saturating_sub(base_errors),
+            d.unrenderable
         );
-        rows.push((name, d.errors, d.unrenderable));
+        rows.push((name, d.errors.saturating_sub(base_errors), d.unrenderable));
     }
     let failed: Vec<_> = rows.iter().filter(|(_, e, _)| *e > 0).collect();
     println!(
@@ -15989,7 +16013,7 @@ fn m1_pprint_substitution_compiles() {
     );
     assert!(
         failed.is_empty(),
-        "function-granular substitution does not compile for {} program(s): {:?}",
+        "function-granular substitution introduces NEW errors in {} program(s): {:?}",
         failed.len(),
         failed
     );
