@@ -43,6 +43,76 @@ use rustc_data_structures::unord::UnordSet;
 use rustc_hir::HirId;
 use rustc_middle::ty::TyCtxt;
 
+/// **PHASE 1's GATE — idempotence on the print path**, per FUNCTION.
+///
+/// The frozen-substrate correction (user, 2026-08-12) narrowed this from a
+/// whole-crate reprint to exactly what the emission model does: an emitted
+/// function carries printer output, and every other byte in the file is the
+/// substrate's. So the property that has to hold is
+/// `print(parse(print(f))) == print(f)` for a function item — not for a crate.
+///
+/// **Why it gates.** If printing is not a fixed point, then two rounds of the
+/// verify loop over the same unchanged function produce different bytes, and
+/// every downstream comparison — parity differentials, golden anchors, the
+/// revert/no-revert distinction — is measuring the printer instead of the
+/// rewrite.
+///
+/// A function that fails to REPARSE counts as non-idempotent and is named. That
+/// is the stronger reading and the right one: text this pipeline emits but
+/// cannot itself read back is not a fixed point in any useful sense.
+#[derive(Default)]
+pub(crate) struct IdemStats {
+    pub functions: usize,
+    pub stable: usize,
+    /// Function names whose print is not a fixed point, capped for the artifact.
+    pub unstable: Vec<String>,
+    /// Functions whose printed text did not reparse at all.
+    pub unparseable: Vec<String>,
+}
+
+#[cfg(test)]
+fn idempotence_over(krate: &rustc_ast::Crate, tcx: TyCtxt<'_>) -> IdemStats {
+    use rustc_ast_pretty::pprust;
+    let mut s = IdemStats::default();
+    for item in &krate.items {
+        if !matches!(item.kind, rustc_ast::ItemKind::Fn(_)) {
+            continue;
+        }
+        s.functions += 1;
+        let name = item
+            .kind
+            .ident()
+            .map_or_else(|| "<anon>".to_owned(), |i| i.to_string());
+        let t1 = pprust::item_to_string(item);
+        let mut parser = ::utils::ast::new_parser_from_str(&tcx.sess.psess, t1.clone());
+        match parser.parse_crate_mod() {
+            Ok(k2) => {
+                let t2 = k2
+                    .items
+                    .iter()
+                    .map(|i| pprust::item_to_string(i))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                if t2.trim() == t1.trim() {
+                    s.stable += 1;
+                } else if s.unstable.len() < 20 {
+                    s.unstable.push(name);
+                }
+            }
+            Err(diag) => {
+                // Cancelled, not emitted: this is a MEASUREMENT, and a probe
+                // that reports through the diagnostic stream would contaminate
+                // the verify loop's own attribution.
+                diag.cancel();
+                if s.unparseable.len() < 20 {
+                    s.unparseable.push(name);
+                }
+            }
+        }
+    }
+    s
+}
+
 /// One subject's bridge status.
 pub(crate) struct BridgeRow {
     pub fn_path: String,
@@ -72,12 +142,17 @@ pub(crate) struct BridgeRow {
 /// program whose correspondence the mapper rejects is reported rather than
 /// crashing the sweep.
 #[cfg(test)]
-pub(crate) fn census(tcx: TyCtxt<'_>) -> Result<Vec<BridgeRow>, String> {
+pub(crate) fn census(tcx: TyCtxt<'_>) -> Result<(Vec<BridgeRow>, IdemStats), String> {
     // FIRST, before anything touches HIR. `catch_unwind` covers the mapping,
     // not the decision phase: a decision-phase panic is a real defect and must
     // not be swallowed here.
+    // ONE `expanded_ast` call, shared. A second would panic: `make_ast_to_hir`
+    // below builds the HIR, and `expanded_ast` clones a resolver that lowering
+    // consumes. Phase 1's gate and phase 2's bar therefore ride the same
+    // capture rather than each taking their own.
     let mapped = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let mut krate = ::utils::ast::expanded_ast(tcx);
+        let idem = idempotence_over(&krate, tcx);
         let map = ::utils::ast::make_ast_to_hir(&mut krate, tcx);
         // `NodeMap` is rustc's `UnordMap`, which hides `values()`/`iter()` on
         // purpose so nondeterministic iteration cannot leak into compiler
@@ -86,9 +161,9 @@ pub(crate) fn census(tcx: TyCtxt<'_>) -> Result<Vec<BridgeRow>, String> {
         let hir_image: UnordSet<HirId> = map.local_map.items().map(|(_, v)| *v).into();
         let fn_image: UnordSet<rustc_span::def_id::LocalDefId> =
             map.global_map.items().map(|(_, v)| *v).into();
-        (hir_image, fn_image)
+        (hir_image, fn_image, idem)
     }));
-    let (hir_image, fn_image) = match mapped {
+    let (hir_image, fn_image, idem) = match mapped {
         Ok(pair) => pair,
         Err(payload) => {
             let msg = payload
@@ -101,7 +176,7 @@ pub(crate) fn census(tcx: TyCtxt<'_>) -> Result<Vec<BridgeRow>, String> {
     };
 
     let (table, _ctx) = super::decide_table_with_ctx(tcx)?;
-    Ok(table
+    let rows = table
         .entries
         .iter()
         .map(|(subject, decision)| BridgeRow {
@@ -122,7 +197,8 @@ pub(crate) fn census(tcx: TyCtxt<'_>) -> Result<Vec<BridgeRow>, String> {
             hir_resolved: hir_image.contains(&subject.hir_id),
             fn_resolved: fn_image.contains(&subject.fn_did),
         })
-        .collect())
+        .collect();
+    Ok((rows, idem))
 }
 
 /// The census as a TSV artifact, for the corpus sweep.
@@ -131,7 +207,24 @@ pub(crate) fn census_tsv(tcx: TyCtxt<'_>) -> String {
     let mut out =
         String::from("fn_path\tmir_local\tis_param\tdecided\thir_resolved\tfn_resolved\n");
     match census(tcx) {
-        Ok(rows) => {
+        Ok((rows, idem)) => {
+            // Phase 1's gate rides the same artifact as phase 2's bar, on one
+            // header line, because they share one AST capture and separating
+            // them into two files would let a consumer read one at a vintage
+            // the other was not measured at.
+            out.push_str(&format!(
+                "<idempotence>\t{}\t{}\t{}\t{}\t{}\n",
+                idem.functions,
+                idem.stable,
+                idem.unstable.len(),
+                idem.unparseable.len(),
+                idem.unstable
+                    .iter()
+                    .chain(idem.unparseable.iter())
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(","),
+            ));
             for r in rows {
                 out.push_str(&format!(
                     "{}\t{}\t{}\t{}\t{}\t{}\n",
