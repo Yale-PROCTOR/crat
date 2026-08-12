@@ -199,6 +199,10 @@ pub(super) const GOLDENS: &[Golden] = goldens![
     // effect is on the LEDGER — `+N decided_ref` / `−N no-declared-type`, zero
     // text delta — is invisible to a text-comparing golden by construction. The
     // witness moved to the decision level, in `emit_tests`, where it can fail.
+    //
+    // The key named above was RETIRED by the dissolution (2026-08-12). The
+    // reasoning is kept verbatim rather than restated in today's vocabulary,
+    // because it is what retired g19 and the record cites it as written.
 ];
 
 /// Run `rustfmt` over a source string with pinned settings.

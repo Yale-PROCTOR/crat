@@ -187,6 +187,7 @@ mod tests {
             len_recovered: false,
             null_init: false,
             mut_binding: false,
+            ctor: None,
         }
     }
 

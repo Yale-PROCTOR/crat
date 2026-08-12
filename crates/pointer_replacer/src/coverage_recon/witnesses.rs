@@ -715,7 +715,11 @@ fn an_unannotated_local_counts_under_the_locals_class() {
     // A: a local (arg_index None) with NO decl_span — the unannotated shape.
     let mut a_local = bare_row("m::f", 2, Some("p"), None, 1);
     a_local.outcome = Some(Outcome::Degraded);
-    a_local.degrade_reason = Some("no-declared-type".to_owned());
+    // Any degrade reason serves — this axis splits the POPULATION, not the
+    // vocabulary — but it is kept a live key: the dissolution retired
+    // `no-declared-type`, and synthetic data naming a key production can no
+    // longer produce reads as a claim about the pipeline.
+    a_local.degrade_reason = Some("copy-source-coupled".to_owned());
     // A parameter alongside it, fully evaluable, so the span axis has a
     // parameter to walk and the parameter class is exercised rather than empty.
     let a_param = full_row();

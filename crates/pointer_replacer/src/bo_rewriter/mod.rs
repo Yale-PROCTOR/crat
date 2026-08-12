@@ -1022,6 +1022,7 @@ fn collect_subjects(
                 len_recovered: false,
                 null_init: false,
                 mut_binding: false,
+                ctor: None,
             });
         }
     }
@@ -1055,8 +1056,10 @@ fn collect_subjects(
 ///
 /// A local not found in that map has no declared type of its own: it is either
 /// unannotated, or a component of a destructuring pattern whose annotation
-/// belongs to the pattern. Both carry `ty_span: None` and degrade with
-/// [`decision::DegradeReason::NoDeclaredType`].
+/// belongs to the pattern. Both carry `ty_span: None`, which means the plan
+/// phase has no splice target — but **not** that nothing is known about the
+/// declaration: the SHAPE still comes from the resolved type, and the
+/// dissolution pass reads it there.
 fn collect_local_subjects(
     tcx: TyCtxt<'_>,
     program: &RustProgram<'_>,
@@ -1189,9 +1192,37 @@ fn collect_local_subjects(
                 }
                 Some((t, _)) => (decision::DeclShape::Other, None, Some(t.span)),
                 // No declared type of its own — unannotated, or a destructuring
-                // component. `decide_one` degrades on `ty_span.is_none()` before
-                // it ever consults the shape.
-                None => (decision::DeclShape::Other, None, None),
+                // component. **The shape is still knowable**, from the resolved
+                // type: the universe filter above admits this local only when
+                // `ptr_chain_depth(ty) > 0`, which is `RawPtr` or `Ref` and
+                // nothing else.
+                //
+                // Reporting `Other` here — as every vintage before the
+                // dissolution did — asserted a syntax the subject does not
+                // have, and it HID a population: 51 of these locals are
+                // C2Rust's `let ref mut fresh…` temporaries, whose resolved
+                // type is already `&mut T`. They are not unconvertible, they
+                // are already converted, and `unsupported-decl-shape` with
+                // shape `reference` is the existing key that says so. Keyed on
+                // the resolved type rather than on the construction class,
+                // because 51-of-52 is a correlation and the type is the fact.
+                //
+                // `Alias` is deliberately unreachable here: an alias is a
+                // syntactic spelling, the resolved type has none, and there is
+                // no alias in the source for a rewrite to preserve.
+                None => (
+                    match ty.kind() {
+                        TyKind::RawPtr(..) => decision::DeclShape::RawPtr,
+                        TyKind::Ref(..) => decision::DeclShape::Reference,
+                        // Not reachable through the universe filter; attributed
+                        // rather than folded into either arm, so a widened
+                        // filter shows up as a reason and not as a silent
+                        // reclassification.
+                        _ => decision::DeclShape::Other,
+                    },
+                    None,
+                    None,
+                ),
             };
             // Attribution, not a placeholder. Absence is a contradiction, not a
             // fallback: this local HAS a `var_debug_info` span, and a
@@ -1227,6 +1258,7 @@ fn collect_local_subjects(
                 len_recovered: false,
                 null_init: false,
                 mut_binding: false,
+                ctor: None,
             });
         }
     }
@@ -1926,6 +1958,14 @@ fn finish_decide<'tcx>(
             .by_binding
             .get(&(subject.fn_did, subject.hir_id))
             .is_some_and(|c| matches!(c, decision::construction::Construction::NullLit));
+        // **The dissolution** — the class itself, from the same lookup the two
+        // booleans above already make. A parameter has no construction site in
+        // this crate, and the map has no entry for one, so this reads `None`
+        // for the whole parameter universe without a `kind` test.
+        subject.ctor = ctors
+            .by_binding
+            .get(&(subject.fn_did, subject.hir_id))
+            .cloned();
         subject.mut_binding = matches!(
             tcx.hir_node(subject.hir_id),
             rustc_hir::Node::Pat(pat) if matches!(
@@ -2938,6 +2978,31 @@ pub(crate) fn artifact_rows_span_swapped(
             let (lo, hi) = (subjects[0].ty_span, subjects[1].ty_span);
             subjects[0].ty_span = hi;
             subjects[1].ty_span = lo;
+        }
+    })
+    .map(|(table, _ctx)| artifact::rows(tcx, &table))
+}
+
+/// Every subject's decision with `ty_span` ERASED on the collector's real
+/// output — the dissolution's terminal veto, driven through the real pipeline.
+///
+/// The veto is **corpus-unreachable by construction**: a parameter always has a
+/// declared type, and an unannotated local cannot reach an emitting `Slice` or
+/// `Opt` because the two local-construction gates fire first. That is exactly
+/// why it needs a hook. A guard whose only evidence is that nothing has ever
+/// hit it is not a guard, and the veto exists precisely so that "zero decision
+/// flips" does not rest on those two gates staying where they are.
+///
+/// Injected at the phase boundary on `Subject`, like the span swap above,
+/// rather than through a production seam — same reasoning, same zero
+/// production-code cost.
+#[cfg(test)]
+pub(crate) fn decisions_with_ty_span_erased(
+    tcx: TyCtxt<'_>,
+) -> Result<Vec<crate::coverage_recon::schema::Row>, String> {
+    decide_table_perturbed(tcx, |subjects| {
+        for s in subjects {
+            s.ty_span = None;
         }
     })
     .map(|(table, _ctx)| artifact::rows(tcx, &table))

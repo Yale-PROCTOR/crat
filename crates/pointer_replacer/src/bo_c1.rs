@@ -8977,7 +8977,10 @@ fn expected_zero_aggregate(row: &report::Row, class: &str) -> Result<(), String>
 /// c2rust `let ref mut fresh_N` temporaries that supplied them are eliminated
 /// by `preprocess`. The universe shrank 7,448 → 6,015 (−1,433) against a
 /// `no-declared-type` fall of −1,432 — off by one — which is the same
-/// population seen from the decision side.
+/// population seen from the decision side. (That key was RETIRED by the
+/// dissolution, 2026-08-12; the migration measurement is left as it was
+/// measured. The population did not move — its 1,196 survivors now carry the
+/// reason of the gate that actually stops each one.)
 ///
 /// The RAW-era values, measured by the E′ probe at code `75a2d8fe`
 /// (2026-08-05, digest `9fc912af…0e621`) and cross-checked against an

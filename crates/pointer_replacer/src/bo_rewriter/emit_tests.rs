@@ -1700,24 +1700,126 @@ fn two_shadowing_locals_are_two_subjects() {
     assert_ne!(got[0].0, got[1].0, "distinct mir_locals: {got:?}");
 }
 
-/// **An unannotated pointer local degrades with its OWN reason**, and carries no
-/// `arg_index`.
+/// **An unannotated pointer local degrades with the reason of the gate that
+/// actually stops it**, and carries no `arg_index`.
 ///
 /// The dominant corpus shape: **1,196 of 1,710** locals on the substrate of
 /// record are C2Rust bindings with no declared type (raw-form era: 2,628 of
 /// 3,142 — `preprocess` removed the `fresh_N` temporaries, not the class).
-/// Routing them through the decl-shape arm would attribute them to a syntax
-/// they do not have, which is why `NoDeclaredType` is tested first.
 ///
-/// *Mutation-tested:* removing the `ty_span.is_none()` arm in `decide_one`
-/// re-routes this to `unsupported-decl-shape`.
+/// **Amended by the dissolution (2026-08-12).** Every vintage before it
+/// asserted `no-declared-type` here: one reason over the whole 1,196, naming
+/// the rewriter's splice mechanism rather than anything about the subject. The
+/// ladder now speaks, and on this fixture — a leaked `malloc` result — it says
+/// `kind-raw`, a fact about the program. Corpus-wide the same move accounts for
+/// 475 of the 1,196.
+///
+/// *Mutation-tested:* restoring the `ty_span.is_none()` early return in
+/// `decide_one_ladder` puts a residual key back here.
 #[test]
-fn an_unannotated_pointer_local_degrades_with_its_own_reason() {
+fn an_unannotated_pointer_local_degrades_with_the_gate_that_stops_it() {
     let got = locals_of(&format!(
         "{MALLOC}pub unsafe fn f() -> i32 {{ let p = malloc(4) as *mut i32; *p = 1; *p }}\n"
     ));
     assert_eq!(got.len(), 1, "{got:?}");
-    assert_eq!(got[0].2, "no-declared-type", "{got:?}");
+    assert_eq!(got[0].2, "kind-raw", "{got:?}");
+}
+
+/// **An unannotated local that is ALREADY a reference says so** — the
+/// dissolution's largest single discovery, and the one that kept the ruling's
+/// STOP from firing.
+///
+/// `let ref mut x = place;` is C2Rust's temporary idiom and it binds `&mut T`.
+/// **51 of the 52 `index-addr` subjects on the corpus are this shape**, and
+/// every vintage before the dissolution reported them `no-declared-type` — a
+/// claim about the rewriter's splice mechanism, applied to subjects that need
+/// no rewrite at all because they are already the target form.
+///
+/// The shape is read from the RESOLVED type, not from the construction class:
+/// 51-of-52 is a correlation, and `ty.kind()` is the fact. `unsupported-decl-shape`
+/// is the existing key that carries exactly this claim — its own doc says *"or
+/// a parameter that is already a reference"* — so nothing was coined for them.
+///
+/// *Mutation-tested:* deleting the collector's resolved-type shape fallback
+/// (restoring `DeclShape::Other`) routes this to a residual key, which is the
+/// pre-dissolution behaviour wearing a new name.
+#[test]
+fn an_unannotated_local_that_is_already_a_reference_reports_its_shape() {
+    let got = locals_of(
+        "#![allow(dead_code, unused_unsafe, unused_variables)]\n\
+         pub struct S { pub a: [u32; 4] }\n\
+         pub unsafe fn f(s: *mut S) {\n\
+         \x20   let ref mut fresh0 = (*s).a[1];\n\
+         \x20   *fresh0 |= 1;\n\
+         }\n",
+    );
+    let fresh: Vec<_> = got
+        .iter()
+        .filter(|(_, n, _)| n.as_deref() == Some("fresh0"))
+        .collect();
+    assert_eq!(fresh.len(), 1, "{got:?}");
+    assert_eq!(fresh[0].2, "unsupported-decl-shape", "{got:?}");
+}
+
+/// **THE TERMINAL VETO: a subject with no splice target cannot emit**, whatever
+/// form the ladder selected for it.
+///
+/// This is what makes the dissolution's ledger invariance STRUCTURAL rather
+/// than measured. Today no real subject reaches an emitting `Slice` or `Opt`
+/// without a `ty_span` — a parameter always has one, and a local is stopped by
+/// `slice-local-construction` / `opt-local-construction` first — so the veto is
+/// corpus-unreachable and this is the ONLY thing that can ever fail for it.
+///
+/// The fixture is a slice-emitting PARAMETER, chosen because a parameter walks
+/// past both local-construction gates and reaches `Decision::Slice`; erasing
+/// its `ty_span` at the phase boundary is then the exact state the veto exists
+/// for. `ctor` is `None` for a parameter, so the residual fold is
+/// `copy-source-coupled` — the no-recognized-initializer arm.
+///
+/// *Mutation-tested:* deleting the veto in `decide_one` emits this subject
+/// (`<emitted>`), which is the ledger movement it exists to make impossible.
+#[test]
+fn a_subject_with_no_splice_target_cannot_emit_whatever_form_was_selected() {
+    let src = "#![allow(dead_code, unused_unsafe, unused_mut, unused_assignments)]\n\
+               pub unsafe fn fill(p: *mut i32, len: usize) {\n\
+               \x20   let mut i: usize = 0;\n\
+               \x20   while i < len { *p.offset(i as isize) = i as i32; i += 1; }\n\
+               }\n";
+    let fixture = Fixture::new(&[("lib.rs", src)]);
+    let (baseline, erased) =
+        ::utils::compilation::run_compiler_on_path(&fixture.0.join("lib.rs"), |tcx| {
+            let base = super::artifact::rows(tcx, &super::decide_table(tcx).expect("table"));
+            let erased = super::decisions_with_ty_span_erased(tcx).expect("perturbed table");
+            (base, erased)
+        })
+        .expect("fixture compiles");
+
+    let reason = |rows: &[crate::coverage_recon::schema::Row]| {
+        rows.iter()
+            .find(|r| r.param_name.as_deref() == Some("p"))
+            .map(|r| {
+                r.degrade_reason
+                    .clone()
+                    .unwrap_or_else(|| "<emitted>".to_owned())
+            })
+            .expect("subject p present")
+    };
+    // The baseline is the load-bearing half: without it, a veto that vetoed
+    // nothing would pass this test exactly as well, because the subject would
+    // read `slice-*` in both columns.
+    assert_eq!(
+        reason(&baseline),
+        "<emitted>",
+        "the fixture must EMIT unperturbed, or the veto below is vetoing a \
+         subject that was already degraded"
+    );
+    assert_eq!(
+        reason(&erased),
+        "copy-source-coupled",
+        "a subject whose declared type was erased reached an emitting form and \
+         the terminal veto did not stop it — the plan phase would splice at a \
+         span that does not exist"
+    );
 }
 
 /// **A locals row carries `arg_index: None`** — *not a parameter*, never
@@ -1904,10 +2006,19 @@ fn one_comparison_degrades_its_parameter_and_its_local_operand_alike() {
 /// **The facts join reports a fact the DECISION never reached.**
 ///
 /// This is the instrument's whole purpose, so it is what the witness tests. The
-/// fixture's local is **unannotated**, so `decide_one` degrades it at
-/// `no-declared-type` — the first predicate — and never consults A1 at all. A
+/// fixture's local is **unannotated**, so it degrades at
+/// `slice-local-construction` — a slice value would have to be built at its
+/// initializer — and the A1 op fact never reaches the reason field. A
 /// reason-field tally therefore records nothing about its `.offset()` use, and
 /// would report the op population as smaller than it is.
+///
+/// **The dissolution amended the expected key, not the witness.** Before it,
+/// the fixture stopped at `no-declared-type`, the first predicate, and never
+/// consulted A1 at all; now it reaches A1, selects the slice form, and is
+/// stopped by the construction-site gate. Either way the degradation is
+/// upstream of the reported fact, which is the property under test — and the
+/// amended key makes the fixture a STRICTLY harder case, because the decision
+/// now does consult the op it must not be the source of.
 ///
 /// The join must still report `annotated=0` **and** `raw_op=offset` on that
 /// same subject. If it cannot, it has inherited the ordering it exists to
@@ -1937,8 +2048,9 @@ fn the_facts_join_reports_facts_the_decision_never_reached() {
         .expect("fixture compiles");
 
     assert_eq!(
-        reason, "no-declared-type",
-        "the fixture must degrade UPSTREAM of A1, or it witnesses nothing"
+        reason, "slice-local-construction",
+        "the fixture must degrade UPSTREAM of the reported fact, or it \
+         witnesses nothing"
     );
     let hdr: Vec<&str> = facts.lines().next().expect("header").split('\t').collect();
     let col = |n: &str| hdr.iter().position(|h| *h == n).expect("column present");
@@ -2904,23 +3016,25 @@ fn a_may_be_negative_offset_refuses_the_fat_optional_form_too() {
     );
 }
 
-/// **STATUS-QUO PIN — the g16 work-unit RETIRED (user ruling C, 2026-08-09).**
+/// **THE DISSOLUTION'S RESIDUE WITNESS — one case per construction class**
+/// (user ruling RECLASSIFY-ONLY, 2026-08-12).
 ///
-/// This began as the g16 capability's decision-level witness, RED, after g19
-/// was retired for being invisible to a text golden. The work-unit then retired
-/// too, on **F1**: the capability emits nothing, so no gate could validate the
-/// counter it moved — byte identity would have been satisfied by a broken
-/// implementation exactly as well as by a correct one.
+/// Every unannotated local still degrades — the pin below is not weakened by
+/// one subject — but it degrades **naming the owed capability it is waiting
+/// on** rather than naming the rewriter's splice mechanism.
 ///
-/// **It is inverted rather than deleted, and it is a PIN, not a witness.** It
-/// asserts today's behaviour: all four classes of unannotated local degrade
-/// `no-declared-type`. That is precisely the independent check F1's banked rule
-/// asks for — *no counter moves on trust* — because it fails the moment
-/// anything starts claiming this population without a ruling. It witnesses no
-/// capability, and is labelled so it can never be mistaken for one.
+/// # Where this test came from, kept adjacent
 ///
-/// The per-class measurement it was built on is preserved because it is what
-/// retired the step, and it is what S3.6/M3 inherit:
+/// It began as the g16 capability's decision-level witness, RED, after g19 was
+/// retired for being invisible to a text golden. The work-unit then retired too
+/// on **F1** — the capability emits nothing, so byte identity would have been
+/// satisfied by a broken implementation exactly as well as a correct one — and
+/// the witness was **inverted into a status-quo pin** asserting that all four
+/// classes still degrade `no-declared-type`. The dissolution supersedes the
+/// key, not the pin: all four still degrade, and each now says why.
+///
+/// The per-class measurement that retired the g16 step is preserved, because it
+/// is exactly what decided the folds below:
 ///
 /// | class | n | inference gives a reference? | insertion `: &T` compiles? |
 /// |---|---:|---|---|
@@ -2931,13 +3045,24 @@ fn a_may_be_negative_offset_refuses_the_fat_optional_form_too() {
 ///
 /// `call-result` and `place-read` fail structurally: their initializer type
 /// comes from a callee **return type** or a **pointee/struct field**, and
-/// neither is in M1's parameters-and-locals subject universe. They are S3.6/M3
-/// work. `copy` and `other` are inference-carried, and whether an unannotated
-/// local realized as a reference by inference counts toward a *declaration*
-/// metric is registered for evaluation — **neither layer moves until that is
-/// ruled**.
+/// neither is in M1's parameters-and-locals subject universe. That is what
+/// `return-not-adapted` and `place-read-pointee` now say, and it is why they
+/// are owed to S3.6-5 and M3 rather than to the locals-conversion follow-up —
+/// which owns only `copy-source-coupled`.
+///
+/// **Four classes here, all nine plus `None` in
+/// `decision::tests::every_construction_class_names_an_owed_capability`.** The
+/// split is deliberate: this test proves the residue gate is REACHED and wired
+/// to the fold table, which needs a real program; the fold table's own
+/// exhaustiveness is a pure function and is tested as one. `Alloc` in
+/// particular cannot be witnessed here — BO settles a `malloc` local `Owning`
+/// or `Raw`, so `kind-*` fires first and the ladder never reaches the residue,
+/// which is exactly why the corpus has only one such subject.
+///
+/// *Mutation-tested:* deleting the residue gate ahead of the co-conversion gate
+/// reports `call-site-not-adapted` for all four.
 #[test]
-fn every_unannotated_local_class_still_degrades_no_declared_type() {
+fn every_unannotated_local_class_degrades_naming_its_owed_capability() {
     fn reason_for_q(body: &str) -> String {
         let src = format!(
             "#![allow(dead_code, unused_unsafe, unused_mut, unused_variables)]\n\
@@ -2947,22 +3072,36 @@ fn every_unannotated_local_class_still_degrades_no_declared_type() {
         reason_of(&decisions_of(&src), "q", false)
     }
 
-    for (label, body) in [
-        ("copy", "    let q = p;\n    *q = 7;\n    *q"),
+    for (label, body, want) in [
+        (
+            "copy",
+            "    let q = p;\n    *q = 7;\n    *q",
+            "copy-source-coupled",
+        ),
         (
             "other",
             "    let q = if n > 0 { p } else { p };\n    *q = 7;\n    *q",
+            "copy-source-coupled",
         ),
-        ("call-result", "    let q = src_of();\n    *q = 7;\n    *q"),
-        ("place-read", "    let q = *pp;\n    *q = 7;\n    *q"),
+        (
+            "call-result",
+            "    let q = src_of();\n    *q = 7;\n    *q",
+            "return-not-adapted",
+        ),
+        (
+            "place-read",
+            "    let q = *pp;\n    *q = 7;\n    *q",
+            "place-read-pointee",
+        ),
     ] {
         assert_eq!(
             reason_for_q(body),
-            "no-declared-type",
-            "{label}: the g16 work-unit is RETIRED, so every class of \
-             unannotated local must still degrade. If this moved, something is \
-             claiming this population without a ruling — which is exactly the \
-             unwitnessable ledger movement F1 refused."
+            want,
+            "{label}: every class of unannotated local must still degrade, and \
+             must name the owed capability it waits on. If this moved, either \
+             something is claiming this population without a ruling — the \
+             unwitnessable ledger movement F1 refused — or a residual fold has \
+             been silently rerouted."
         );
     }
 }

@@ -178,8 +178,14 @@ pub(crate) struct Subject {
     /// `let p = malloc(4) as *mut i32;` has no annotation, and a
     /// tuple-destructuring `let (a, b): (…)` annotates the *pattern*, not its
     /// components (measured 2026-08-05: MIR reports per-binding spans while the
-    /// HIR `let` carries one whole-pattern type). Such subjects degrade with
-    /// [`DegradeReason::NoDeclaredType`]; nothing splices them.
+    /// HIR `let` carries one whole-pattern type).
+    ///
+    /// **Such subjects cannot emit — nothing splices them — but this is no
+    /// longer a REASON.** The dissolution (2026-08-12) put the ladder ahead of
+    /// it: 1,084 of the 1,196 name a gate that was already there, and the 112
+    /// for which the missing declaration IS the binding constraint get a
+    /// residual key from [`residual_reason`] naming the owed capability. What
+    /// enforces the no-emission half is the veto in [`decide_one`].
     ///
     /// Kept distinct from [`Self::binding_span`] because they mean different
     /// things: this one is *where an edit would go*, that one is *where the
@@ -247,6 +253,24 @@ pub(crate) struct Subject {
     /// that is `error[E0596]`, so the fact has to be available where the form is
     /// chosen rather than discovered by the verify loop.
     pub mut_binding: bool,
+    /// **The dissolution pass** — where this binding's VALUE comes from.
+    ///
+    /// Stamped from the same construction pass as [`Self::null_init`] and
+    /// [`Self::len_recovered`], so the three cannot disagree about what the
+    /// initializer is. The class itself rather than a boolean projection of it,
+    /// because [`residual_reason`] has to name *which* owed capability an
+    /// unspliceable subject is waiting on, and a boolean cannot.
+    ///
+    /// **Read only by [`residual_reason`]**, which runs after every other gate
+    /// has declined to speak. That containment is the point: before the
+    /// dissolution this module read nothing from the construction recognizer
+    /// except two booleans, and that is still true of every gate that can BLOCK
+    /// a subject. The class decides an attribution, never a decision.
+    ///
+    /// `None` for a parameter — no construction site in this crate — and for a
+    /// `let` the recognizer does not classify. The `param-no-site` rule again:
+    /// a statement about reach, never a claim about the program.
+    pub ctor: Option<construction::Construction>,
 }
 
 /// Bindings passed to a deallocator, keyed exactly as A1's emitability gates are
@@ -376,18 +400,29 @@ pub(crate) enum DegradeReason {
     /// conflating it with the collection fix would repeat this milestone's
     /// pattern of bundling.
     UnsupportedDeclShape { shape: &'static str },
-    /// The subject has **no declared type**, so there is no splice target.
+    /// **The dissolution's residue** — the subject has no declared type, every
+    /// other gate has declined to speak, and the type would have to come from
+    /// the **callee's return type**.
     ///
-    /// Locals only, and reachable two ways (both measured 2026-08-05):
-    /// an unannotated `let p = malloc(4) as *mut i32;`, and a destructuring
-    /// `let (a, b): (*mut i32, *mut i32)` whose annotation belongs to the
-    /// PATTERN — MIR reports per-binding spans while the HIR `let` carries one
-    /// whole-pattern type, so a component has no type of its own.
+    /// Its own key rather than `escapes-via-return`, which is a different
+    /// claim: that one says a converted reference would escape THROUGH a
+    /// return, this one says the declaration's type LIVES in one. Reusing it
+    /// would attribute to these subjects a hazard they do not carry.
     ///
-    /// A parameter always has a declared type, so this reason never appears on
-    /// the parameter universe. A count of 0 means the locals universe is empty,
-    /// not that the reason is inert.
-    NoDeclaredType,
+    /// Return position is not in M1's subject universe at all, so this reason
+    /// is owed forward to S3.6-5 rather than to the locals-conversion slice.
+    ReturnNotAdapted,
+    /// **The dissolution's residue** — as [`Self::ReturnNotAdapted`], but the
+    /// type lives in a **pointee or struct field**: `(*s).f`, `&arr[i]`, `&x`,
+    /// `((*h).arr).as_mut_ptr()`. Owed to M3, not to this milestone.
+    PlaceReadPointee,
+    /// **The dissolution's residue** — as [`Self::ReturnNotAdapted`], but the
+    /// type is **coupled to another binding's**: a copy, pointer arithmetic off
+    /// another local, or a conditional over two statics. This is the one
+    /// residual class the registered locals-conversion follow-up owns, because
+    /// initializer edges in the co-conversion graph are exactly what would
+    /// resolve it.
+    CopySourceCoupled,
     /// **The freed-slot gate.** The subject's binding is passed to a
     /// deallocator, so emitting a reference form for it would hand codegen a
     /// reference to freed memory.
@@ -572,7 +607,9 @@ impl DegradeReason {
             DegradeReason::PtrComparison => "ptr-comparison",
             DegradeReason::NoSlot => "no-slot",
             DegradeReason::UnsupportedDeclShape { .. } => "unsupported-decl-shape",
-            DegradeReason::NoDeclaredType => "no-declared-type",
+            DegradeReason::ReturnNotAdapted => "return-not-adapted",
+            DegradeReason::PlaceReadPointee => "place-read-pointee",
+            DegradeReason::CopySourceCoupled => "copy-source-coupled",
             DegradeReason::FreedSlot => "freed-slot",
             DegradeReason::SliceUseUnsupported => "slice-use-unsupported",
             DegradeReason::NestedUseEdits => "nested-use-edits",
@@ -853,7 +890,73 @@ fn degrade(subject: &Subject, site: String, reason: DegradeReason) -> Decision {
     })
 }
 
+/// **The dissolution's residual attribution.** Which owed capability an
+/// unspliceable subject is waiting on, from where its value comes from.
+///
+/// Reached only when every gate in [`decide_one_ladder`] has declined — that
+/// is, when the missing declaration is the *binding* constraint rather than one
+/// blocker among several. On the corpus that is 112 of 1,196 (measured
+/// 2026-08-12); the other 1,084 name a real gate and never arrive here.
+///
+/// The folds onto the three keys are by **type source**, not by construction
+/// spelling, and each was measured before it was written (micro-plan §1):
+/// `Alloc` is `strdup(url)`, whose type is the callee's return type;
+/// `ArrayDecay` is `((*h).next_symbol).as_mut_ptr()`, whose type is the
+/// field's element type; `Other` is, over all 19 on the corpus, either
+/// `q.offset(…)` off another local or a conditional over two statics.
+///
+/// `None` — no recognized initializer — folds to source-coupled: such a local
+/// takes its type from a later assignment, which is that claim. **Corpus-empty
+/// (0 of 1,196) and pinned as empty**, not asserted away.
+fn residual_reason(ctor: Option<&construction::Construction>) -> DegradeReason {
+    use construction::Construction as C;
+    match ctor {
+        Some(C::CallResult | C::Alloc { .. }) => DegradeReason::ReturnNotAdapted,
+        Some(C::PlaceRead | C::ArrayDecay | C::IndexAddr | C::AddrOf) => {
+            DegradeReason::PlaceReadPointee
+        }
+        Some(C::CopyOf | C::Other) | None => DegradeReason::CopySourceCoupled,
+        // The null-init gate above owns this class and fires before the
+        // residue can. Kept explicit rather than folded into an arm it does not
+        // belong to, so the ordering is legible where it matters.
+        Some(C::NullLit) => DegradeReason::NullInit,
+    }
+}
+
+/// **The dissolution's structural guarantee: a subject with no splice target
+/// cannot emit.**
+///
+/// Separate from the residue gate inside [`decide_one_ladder`], and both earn
+/// their place. That one is about ATTRIBUTION — it keeps the co-conversion gate
+/// from claiming 158 subjects it has nothing to say about. This one is about
+/// the LEDGER: today the `Slice` and `Opt` arms cannot reach an emission for a
+/// local because `slice-local-construction` and `opt-local-construction` fire
+/// first, but "zero decision flips" must not rest on those two gates staying
+/// where they are.
+///
+/// Corpus-unreachable by construction, which is precisely why it is witnessed
+/// through the `perturb` hook rather than by a sweep: a guard no test can break
+/// is not a guard.
 fn decide_one(ctx: &Ctx<'_, '_>, subject: &Subject) -> Decision {
+    let decision = decide_one_ladder(ctx, subject);
+    if subject.ty_span.is_some() {
+        return decision;
+    }
+    // EXHAUSTIVE, not `matches!(.., Degraded(_))` — the import denylist rejects
+    // the bypass shape and is right to: a new emitting disposition must be a
+    // compile error here, because a form this veto does not name is a form that
+    // escapes it.
+    match decision {
+        Decision::Ref { .. } | Decision::Slice { .. } | Decision::Opt { .. } => degrade(
+            subject,
+            EmitabilityFacts::site(ctx.tcx, subject.attribution_span()),
+            residual_reason(subject.ctor.as_ref()),
+        ),
+        Decision::Degraded(_) => decision,
+    }
+}
+
+fn decide_one_ladder(ctx: &Ctx<'_, '_>, subject: &Subject) -> Decision {
     let &Ctx {
         tcx,
         model,
@@ -882,12 +985,20 @@ fn decide_one(ctx: &Ctx<'_, '_>, subject: &Subject) -> Decision {
     // The cost, stated: an alias-typed parameter's BO kind does not reach the
     // counters. That is S2b's question to reopen with a reason if it wants the
     // "how many alias params would have been Ref" breakdown.
-    // BEFORE the shape test, because "no declared type" is not a shape. A local
-    // with no annotation has no `decl_shape` worth reporting, and routing it
-    // through the shape arm would attribute it to a syntax it does not have.
-    if subject.ty_span.is_none() {
-        return degrade(subject, decl_site, DegradeReason::NoDeclaredType);
-    }
+    //
+    // **The dissolution removed an earlier gate from ahead of this one.** Every
+    // vintage before it returned `no-declared-type` here for a missing
+    // `ty_span`, ahead of the shape test and ahead of every analysis — one
+    // reason over 1,196 subjects, naming the splice mechanism rather than
+    // anything about the subject. The ladder now speaks for them, and the
+    // measured result is that 1,084 of the 1,196 hit a gate that was already
+    // there. Only 112 reach the residue.
+    //
+    // The shape test comes first for them too, and it is correct for them
+    // because the collector derives the shape from the RESOLVED type when there
+    // is no annotation: 51 of these locals are `let ref mut fresh…`
+    // temporaries whose type is already `&mut T`, and this is the arm that says
+    // so.
     if subject.decl_shape != DeclShape::RawPtr {
         return degrade(
             subject,
@@ -1043,6 +1154,25 @@ fn decide_one(ctx: &Ctx<'_, '_>, subject: &Subject) -> Decision {
         // consulted: while the referenced gate still blocks, a blocked
         // classmate is not converting either, so nothing is jointly decided
         // yet. Collateral becomes load-bearing at the lift, not before.
+        // **THE RESIDUE, and it must precede the class gate.**
+        //
+        // Not a preference — an attribution requirement. The co-conversion node
+        // set is built from the HYPOTHETICAL decision, in which a subject with
+        // no splice target still degrades, so an unannotated local is **never a
+        // node**: 0 of 1,196, against 2,609 of the annotated 4,819 (measured
+        // 2026-08-12). `admits` therefore returns false for every one of them
+        // and the gate below falls into its not-a-node arm, which reports
+        // `call-site-not-adapted`.
+        //
+        // That arm's own comment predicts this case — *"an unreachable arm that
+        // falls through is how a subject escapes its own gate once the premise
+        // stops holding"* — and the dissolution is where the premise stops
+        // holding. Without this placement 158 subjects would be attributed to a
+        // gate that is not blocking them, 121 of them in functions that are not
+        // even pinned.
+        if subject.ty_span.is_none() {
+            return degrade(subject, decl_site, residual_reason(subject.ctor.as_ref()));
+        }
         // **S3.6-1 step 3 — THE CLASS GATE, and it consults `admits`.**
         //
         // That is what UNIFORM means: the class verdict governs every node, not
@@ -1170,6 +1300,60 @@ fn decide_one(ctx: &Ctx<'_, '_>, subject: &Subject) -> Decision {
     }
 }
 
+#[cfg(test)]
+mod residual_tests {
+    use super::{construction::Construction as C, *};
+
+    /// **The residual fold table, exhaustively.** Every `Construction` variant
+    /// plus the no-recognized-initializer case names an owed capability.
+    ///
+    /// A pure function tested as one. The end-to-end witness in `emit_tests`
+    /// covers only the four classes that can actually REACH the residue in a
+    /// small fixture — `Alloc` cannot, because BO settles a `malloc` local
+    /// `Owning` or `Raw` and `kind-*` fires first — so a fold witnessed only
+    /// there would be a fold no mutation can break for the other five.
+    ///
+    /// The list is written out rather than iterated over a variant list,
+    /// because there is no such list: the *compiler* enforces exhaustiveness
+    /// inside `residual_reason`, and this enforces that each arm sends its
+    /// class where the measured witness says it goes (micro-plan §1).
+    ///
+    /// *Mutation-tested:* collapsing any two arms of `residual_reason` fails
+    /// the class whose key was swallowed; making the `None` arm return
+    /// `ReturnNotAdapted` fails the last row.
+    #[test]
+    fn every_construction_class_names_an_owed_capability() {
+        let alloc = C::Alloc {
+            callee: "malloc".to_owned(),
+            size: "4".to_owned(),
+            count: None,
+        };
+        for (ctor, want) in [
+            (Some(&C::CallResult), "return-not-adapted"),
+            (Some(&alloc), "return-not-adapted"),
+            (Some(&C::PlaceRead), "place-read-pointee"),
+            (Some(&C::ArrayDecay), "place-read-pointee"),
+            (Some(&C::IndexAddr), "place-read-pointee"),
+            (Some(&C::AddrOf), "place-read-pointee"),
+            (Some(&C::CopyOf), "copy-source-coupled"),
+            (Some(&C::Other), "copy-source-coupled"),
+            (Some(&C::NullLit), "null-init"),
+            // No recognized initializer: the type would come from a later
+            // assignment, which IS the source-coupled claim. Corpus-empty
+            // (0 of 1,196) and pinned as empty rather than asserted away.
+            (None, "copy-source-coupled"),
+        ] {
+            assert_eq!(
+                residual_reason(ctor).key(),
+                want,
+                "{ctor:?} must name the capability that would unblock it — a \
+                 residual key routes an owed item to a slice, and two owed \
+                 items must not read as one"
+            );
+        }
+    }
+}
+
 /// Which form `decide_one` selected, before the gates that can still refuse it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Form {
@@ -1215,6 +1399,7 @@ mod self_consistency_tests {
             len_recovered: false,
             null_init: false,
             mut_binding: false,
+            ctor: None,
         }
     }
 
