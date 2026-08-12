@@ -7178,6 +7178,30 @@ mod run {
                         _ => {}
                     }
                 }
+                // **STATUS-QUO PINS (ruling 2026-08-11).** Two glue arms are
+                // SPECIFIED-BUT-UNREACHED: `unwrap` (found `Opt`) and pure
+                // `reborrow` (expected `Ref`). Both need a Ref-DECIDING callee
+                // parameter, and those are exactly the class-eligible ones, so
+                // `arg-stays-raw` fires before a seam is ever needed — the empty
+                // arms are the gating working, not a coverage gap.
+                //
+                // Pinned at zero so either form silently appearing in a future
+                // run is caught as the EVENT it would be (the class builder's
+                // scope changed) rather than absorbed into a placed total.
+                let mut shape_unwrap = 0usize;
+                let mut shape_pure_reborrow = 0usize;
+                for line in tsv.lines().skip(1) {
+                    let f: Vec<&str> = line.split('\t').collect();
+                    if f.first() == Some(&"placed") {
+                        match f.get(5) {
+                            Some(&"unwrap") | Some(&"as_mut_unwrap") => shape_unwrap += 1,
+                            Some(&"reborrow") => shape_pure_reborrow += 1,
+                            _ => {}
+                        }
+                    }
+                }
+                row.set("seam_shape_unwrap", shape_unwrap);
+                row.set("seam_shape_pure_reborrow", shape_pure_reborrow);
                 row.set("seam_safe", placed_safe);
                 row.set("seam_reborrow", placed_reborrow);
                 row.set("seam_uncensused", uncensused);
@@ -9648,6 +9672,27 @@ fn m1_recon_corpus() {
         }
         if let Err(detail) = expected_not_evaluable_local(&row, program.name) {
             failures.push(format!("{}: {detail}", program.name));
+        }
+
+        // **STATUS-QUO PINS on the unreached glue arms (ruling 2026-08-11).**
+        //
+        // NOT invariants — a status-quo pin. `unwrap` and pure `reborrow` are
+        // specified arms of the glue table whose market measured ZERO, because
+        // both need a Ref-DECIDING callee parameter and those are exactly the
+        // class-eligible ones: `arg-stays-raw` fires before a seam is needed.
+        //
+        // If either ever fires, the class builder's scope has changed and that
+        // is an EVENT to rule on — a ratified golden for the form would then be
+        // owed. Pinned so it surfaces as a failure rather than as a quietly
+        // larger placed total.
+        for key in ["seam_shape_unwrap", "seam_shape_pure_reborrow"] {
+            if let Err(detail) = expected_zero_field(&row, key) {
+                failures.push(format!(
+                    "{}: {detail} — a specified-but-unreached glue arm fired; \
+                     this is a scope change to rule on, not a yield increase",
+                    program.name
+                ));
+            }
         }
 
         // Provenance: digests of the exact bytes the verdict was computed from.
