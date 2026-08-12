@@ -130,6 +130,39 @@ pub(super) const GOLDENS: &[Golden] = goldens![
     // — that is g19's rule, honoured rather than restated.
     "g20_callsite_adapt_propagate",
     "g21_callsite_blocked_class",
+    // **g22-g25 — THE SEAM BATCH, ratified 2026-08-11.** All four land GREEN:
+    // the seam mechanism is live, so these are regression pins with
+    // mutation-proven falsifiability, not RED-first spec.
+    //
+    // **g22 `callsite_reborrow_bridge` — PARKED 2026-08-09, SUPERSEDED
+    // 2026-08-11.** One number, two dispositions, in sequence. The parking
+    // declined the reborrow bridge pending an independent UB-safety oracle; the
+    // 2026-08-11 user ruling authorises it on DIFFERENT terms — benchmark
+    // mode-tag, recorded exposure, site gates as mitigation, and the narrower
+    // context of call-boundary GLUE rather than subject settlement. The oracle
+    // condition was never met and is not claimed to be.
+    //
+    // **Epistemic status of all four: GENERATE-THEN-REVIEW**, not hand-authored.
+    // Each expected half was produced by the pipeline, then every rewrite in it
+    // was verified against the ratified arm specs (`is_null`->`is_none` and
+    // deref->`unwrap` per -3; the slice arm's `*p.offset(e)`->`p[e]`), and both
+    // halves compiled on the pinned toolchain. The callee-body rewrites are the
+    // reason: they belong to arms ratified elsewhere and cannot be hand-written
+    // reliably without restating them.
+    //
+    // **g24 carries the measured amendment** `&mut T -> &[T]` via
+    // `slice::from_ref`, which takes a `&mut T` by coercion. The census found
+    // it; the originally ratified adapter table did not have it.
+    //
+    // **g25 states its evidence arm: `len-following`.** The ratification pins
+    // the MECHANISM's output shape. It does NOT certify that the selected
+    // companion is the right length -- that is the registered
+    // bound-verification follow-up's concern, and the exposure is recorded in
+    // the micro-plan.
+    "g22_callsite_reborrow_bridge",
+    "g23_callsite_optional_wrap",
+    "g24_callsite_slice_from_ref",
+    "g25_callsite_slice_seam_len",
     // **g22 `callsite_reborrow_bridge` — PARKED 2026-08-09, deliberately NOT
     // authored. The NUMBER IS CONSUMED and must never be reallocated.**
     //
@@ -249,6 +282,10 @@ golden_test!(g17_reslice_advance, "g17_reslice_advance");
 golden_test!(g18_reslice_rebind, "g18_reslice_rebind");
 golden_test!(g20_callsite_adapt_propagate, "g20_callsite_adapt_propagate");
 golden_test!(g21_callsite_blocked_class, "g21_callsite_blocked_class");
+golden_test!(g22_callsite_reborrow_bridge, "g22_callsite_reborrow_bridge");
+golden_test!(g23_callsite_optional_wrap, "g23_callsite_optional_wrap");
+golden_test!(g24_callsite_slice_from_ref, "g24_callsite_slice_from_ref");
+golden_test!(g25_callsite_slice_seam_len, "g25_callsite_slice_seam_len");
 
 /// The canonicalizer must be a real normalizer, not a pass-through.
 ///
@@ -276,13 +313,25 @@ fn canonicalization_normalizes_whitespace() {
 fn every_golden_pair_is_present() {
     assert_eq!(
         GOLDENS.len(),
-        17,
+        21,
         "the M0.5 package specifies ten pairs; U-5 slice 1 transcribes g11/g12 \
          from the ratified §8 table, slice 3 transcribes g13, and 2b adds \
          g17/g18. g19 was added and RETIRED in the g16 slice — back to 15, with \
-         the number consumed. S3.6-1 ratifies g20/g21 → 17. **g22 was proposed \
-         and PARKED**, so its number is consumed and 17 is NOT 15+3: a count \
-         that quietly became 18 would mean the parked bridge had been authored"
+         the number consumed. S3.6-1 ratifies g20/g21 → 17.\n\
+         \n\
+         **17 → 21 (2026-08-11): the seam batch g22–g25.** This pin FIRED on \
+         that change and it was right to: its previous text said a count \
+         quietly becoming 18 would mean the parked bridge had been authored. \
+         **g22 HAS now been authored** — deliberately, by user ruling, as a \
+         SUPERSESSION of the 2026-08-09 parking on different terms (benchmark \
+         mode-tag, recorded exposure, site gates as mitigation, call-boundary \
+         glue rather than subject settlement). The oracle condition the parking \
+         set was never met and is not claimed to be. One number, two \
+         dispositions, in sequence.\n\
+         \n\
+         So 21 is 17 + 4, and g22 is one of the four rather than a number held \
+         empty. A future count that moves without a ruling is still the event \
+         this assertion exists to catch."
     );
     for g in GOLDENS {
         assert!(!g.input.trim().is_empty(), "{}: empty .input.rs", g.name);
