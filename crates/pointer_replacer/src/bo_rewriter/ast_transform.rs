@@ -84,9 +84,15 @@ pub(crate) struct RefDeclStats {
 /// Arm 1's visitor: rewrite the declared type of every `Decision::Ref` subject.
 pub(crate) struct RefDeclVisitor<'a> {
     /// AST `NodeId` → HIR `HirId`, the forward direction a tree walk wants.
-    pub local_map: &'a FxHashMap<NodeId, HirId>,
+    ///
+    /// The `UnordMap` is used DIRECTLY rather than copied into an `FxHashMap`:
+    /// a lookup is order-free, `get` is all a tree walk needs, and converting
+    /// would mean iterating a container that hides iteration on purpose.
+    pub local_map: &'a rustc_ast::node_id::NodeMap<HirId>,
     /// `(fn_did, hir_id)` → is this subject `Ref`, and is it mutable?
     pub decisions: &'a FxHashMap<(LocalDefId, HirId), bool>,
+    /// AST `NodeId` → `LocalDefId`, used to set `current_fn` at each item.
+    pub global_map: &'a rustc_ast::node_id::NodeMap<LocalDefId>,
     /// The function currently being walked, from the global map.
     pub current_fn: Option<LocalDefId>,
     pub guard: &'a mut Composition,
@@ -134,6 +140,19 @@ impl RefDeclVisitor<'_> {
 }
 
 impl MutVisitor for RefDeclVisitor<'_> {
+    fn visit_item(&mut self, item: &mut rustc_ast::Item) {
+        // The enclosing function's `LocalDefId` is half the decision key.
+        // SAVED AND RESTORED rather than overwritten: a nested item would
+        // otherwise leave the outer function's params keyed to the inner one,
+        // which is the same wrong-owner class the seam `owner_fn` defect was.
+        let saved = self.current_fn;
+        if matches!(item.kind, rustc_ast::ItemKind::Fn(_)) {
+            self.current_fn = self.global_map.get(&item.id).copied();
+        }
+        rustc_ast::mut_visit::walk_item(self, item);
+        self.current_fn = saved;
+    }
+
     fn visit_param(&mut self, param: &mut rustc_ast::Param) {
         let binding = param.pat.id;
         self.rewrite_decl(binding, &mut param.ty);
@@ -196,4 +215,58 @@ mod tests {
         assert!(g.claim(NodeId::from_u32(2)));
         assert!(g.refused.is_empty(), "distinct nodes must not be refused");
     }
+}
+
+/// **ARM 1's POPULATION DIFFERENTIAL.** Does the tree walk reach exactly the
+/// subjects the decision layer settled `Ref`, and does the composition guard
+/// stay silent?
+///
+/// Pre-stated (2026-08-13): `rewritten == 780` corpus-wide, `refused == 0`,
+/// `not_a_pointer_decl == 0`.
+///
+/// **A non-zero `refused` is STOP-class, not a conservative win** (ruling
+/// pre-classification, 2026-08-13). The span layer's nesting pass refused the
+/// INNER edit and applied the outer; this guard refuses BOTH on a same-node
+/// claim. Those semantics differ in principle, and this run is where we learn
+/// whether they differ on this corpus. It may not be absorbed silently.
+///
+/// **Must run before any HIR/MIR query** — `expanded_ast` panics once the HIR
+/// is built.
+#[cfg(test)]
+pub(crate) fn arm1_population(tcx: rustc_middle::ty::TyCtxt<'_>) -> Result<RefDeclStats, String> {
+    let captured = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let mut krate = ::utils::ast::expanded_ast(tcx);
+        let map = ::utils::ast::make_ast_to_hir(&mut krate, tcx);
+        (krate, map)
+    }));
+    let (mut krate, map) = captured.map_err(|_| "AST capture panicked".to_owned())?;
+
+    let (table, _ctx) = super::decide_table_with_ctx(tcx)?;
+    let mut decisions: FxHashMap<(LocalDefId, HirId), bool> = FxHashMap::default();
+    for (subject, decision) in &table.entries {
+        // EXHAUSTIVE — the denylist rejects the bypass shape, and arm 1's
+        // population is defined by which disposition was reached.
+        match decision {
+            super::decision::Decision::Ref { mutable } => {
+                decisions.insert((subject.fn_did, subject.hir_id), *mutable);
+            }
+            super::decision::Decision::Slice { .. }
+            | super::decision::Decision::Opt { .. }
+            | super::decision::Decision::Degraded(_) => {}
+        }
+    }
+
+    let mut guard = Composition::default();
+    let mut v = RefDeclVisitor {
+        local_map: &map.local_map,
+        decisions: &decisions,
+        global_map: &map.global_map,
+        current_fn: None,
+        guard: &mut guard,
+        stats: RefDeclStats::default(),
+    };
+    v.visit_crate(&mut krate);
+    let mut stats = v.stats;
+    stats.refused = guard.refused.len();
+    Ok(stats)
 }

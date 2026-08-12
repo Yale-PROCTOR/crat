@@ -7000,6 +7000,20 @@ mod run {
             }
         }
 
+        // **ARM 1's POPULATION DIFFERENTIAL** — also AST-first, and it runs
+        // before the bridge census for the same reason the substitution does.
+        match crate::bo_rewriter::ast_transform::arm1_population(tcx) {
+            Ok(st) => {
+                row.set("arm1_rewritten", st.rewritten.to_string());
+                row.set("arm1_not_ptr_decl", st.not_a_pointer_decl.to_string());
+                row.set("arm1_refused", st.refused.to_string());
+            }
+            Err(why) => {
+                row.set("arm1_rewritten", "declined");
+                row.set("arm1_detail", super::report::sanitize(&why));
+            }
+        }
+
         let bridge = crate::bo_rewriter::ast_bridge::census_tsv(tcx);
         let bridge_path = dir.join(format!("{name}.astbridge.tsv"));
         std::fs::write(&bridge_path, &bridge)
