@@ -7000,10 +7000,11 @@ mod run {
             }
         }
 
-        // ARM 1's TEXT DIFFERENTIAL — §3b's per-edit unit. Runs in the same
-        // AST-first window; it re-uses the capture rather than taking a second.
-        match crate::bo_rewriter::ast_transform::arm1_full(tcx) {
-            Ok((st, d)) => {
+        // ARMS 1 AND 2's TEXT DIFFERENTIAL — §3b's per-edit unit. Runs in the
+        // same AST-first window; both arms re-use the one capture rather than
+        // each taking their own, which `expanded_ast` would refuse.
+        match crate::bo_rewriter::ast_transform::arms_full(tcx) {
+            Ok((st, gr, d)) => {
                 row.set("arm1_rewritten", st.rewritten.to_string());
                 row.set("arm1_not_ptr_decl", st.not_a_pointer_decl.to_string());
                 row.set("arm1_refused", st.refused.to_string());
@@ -7012,6 +7013,30 @@ mod run {
                 row.set("arm1_differing", d.differing.to_string());
                 row.set("arm1_unmatched_ast", d.unmatched_ast.to_string());
                 row.set("arm1_unmatched_span", d.unmatched_span.to_string());
+
+                row.set("arm2_slice_decl", st.slice_rewritten.to_string());
+                row.set("arm2_opt_decl", st.opt_rewritten.to_string());
+                row.set("arm2_use_grafted", gr.grafted.to_string());
+                row.set("arm2_use_parse_failed", gr.parse_failed.to_string());
+                row.set("arm2_use_unmatched", gr.unmatched.to_string());
+                row.set("arm2_refused", gr.refused.to_string());
+                row.set("arm2_compared", d.arm2_compared.to_string());
+                row.set("arm2_equal", d.arm2_equal.to_string());
+                row.set("arm2_differing", d.arm2_differing.to_string());
+                row.set("arm2_unmatched_ast", d.arm2_unmatched_ast.to_string());
+
+                // The conservation bound and the instrument's own integrity.
+                row.set("kd_unmatched_span", d.kd_unmatched_span.to_string());
+                row.set("kd_edits", d.kd_edits.to_string());
+                row.set("kd_offsets", d.kd_offsets.to_string());
+                row.set("kd_base_unresolved", d.base_unresolved.to_string());
+
+                if !gr.parse_failures.is_empty() {
+                    row.set(
+                        "arm2_parse_failures",
+                        super::report::sanitize(&gr.parse_failures.join(" | ")),
+                    );
+                }
                 if !d.examples.is_empty() {
                     row.set(
                         "arm1_examples",
