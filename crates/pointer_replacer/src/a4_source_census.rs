@@ -3720,8 +3720,10 @@ const MACHINE_ID: &str = "lambda7";
 const PLATFORM: &str = "linux-x86_64";
 const LIVENESS_BOUND_S: u64 = 14_400;
 const CANDIDATE_MEMORY_MAX_BYTES: u64 = 100 * 1024 * 1024 * 1024;
+const LIL_ORACLE_PARTIAL_SHA256: &str =
+    "86c9e73d0e419a08e04c6ff3ac91531d948cbc31a8acb80d9c5f7cd238587feb";
 const RESOURCE_EXHAUSTED_HEADER: &str =
-    "program\tfield_key\tstatus\tmemory_max_bytes\tpeak_rss_kb\tphase\tdata";
+    "program\tfield_key\tstatus\tmemory_max_bytes\tpeak_rss_kb\tcgroup_peak_memory_kb\tphase\tdata";
 const A4_AGGREGATE_MANIFEST_SHA256: &str =
     "66f85f5a30b77ba7e26c66fda0cccb0becdff13b4a8a03da74bb8d08e34e7c71";
 const A4_COMBINED_SHA256: &str = "d89d69fd3c6d1e10e565d13a680e7e3af42bf3465851e31c0ceafa7dbbf6dcae";
@@ -4019,6 +4021,56 @@ const FULL_IDENTITY_HEADER: &str =
     "program\tfield_key\tfield_slot\tordinary_kind\tbaseline_force\tproof_reason";
 const PUBLIC_SETTER_REACHABLE_TAG: &str = "public-setter-reachable";
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct CandidateMemoryPeaks {
+    process_peak_rss_kb: u64,
+    cgroup_peak_memory_kb: u64,
+}
+
+fn parse_gnu_time_peak_rss_kb(receipt: &str) -> Result<u64, String> {
+    const PREFIX: &str = "Maximum resident set size (kbytes):";
+    let mut values = receipt
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix(PREFIX));
+    let value = values
+        .next()
+        .ok_or_else(|| "GNU-time receipt is missing peak RSS".to_owned())?;
+    if values.next().is_some() {
+        return Err("GNU-time receipt has duplicate peak RSS entries".to_owned());
+    }
+    let value = value
+        .trim()
+        .parse::<u64>()
+        .map_err(|error| format!("GNU-time peak RSS is not an integer: {error}"))?;
+    if value == 0 {
+        return Err("GNU-time peak RSS is zero".to_owned());
+    }
+    Ok(value)
+}
+
+fn require_candidate_memory_peaks(
+    gnu_time_receipt: Option<&str>,
+    cgroup_peak_memory_bytes: Option<u64>,
+) -> Result<CandidateMemoryPeaks, String> {
+    let process_peak_rss_kb = parse_gnu_time_peak_rss_kb(
+        gnu_time_receipt.ok_or_else(|| "GNU-time receipt is unavailable".to_owned())?,
+    )?;
+    let cgroup_peak_memory_bytes = cgroup_peak_memory_bytes
+        .filter(|peak| *peak > 0)
+        .ok_or_else(|| "cgroup peak charged memory is unavailable".to_owned())?;
+    Ok(CandidateMemoryPeaks {
+        process_peak_rss_kb,
+        cgroup_peak_memory_kb: cgroup_peak_memory_bytes.div_ceil(1024),
+    })
+}
+
+fn render_candidate_memory_receipt(peaks: CandidateMemoryPeaks) -> String {
+    format!(
+        "peak_rss_kb={}\ncgroup_peak_memory_kb={}\n",
+        peaks.process_peak_rss_kb, peaks.cgroup_peak_memory_kb
+    )
+}
+
 fn classify_capped_candidate(
     cap_verified: bool,
     oom_kills: u64,
@@ -4038,10 +4090,11 @@ fn render_resource_exhausted(
     field_key: &str,
     memory_max_bytes: u64,
     peak_rss_kb: u64,
+    cgroup_peak_memory_kb: u64,
     phase: &str,
 ) -> String {
     format!(
-        "{RESOURCE_EXHAUSTED_HEADER}\n{}\t{}\tresource-exhausted\t{memory_max_bytes}\t{peak_rss_kb}\t{}\tfalse\n",
+        "{RESOURCE_EXHAUSTED_HEADER}\n{}\t{}\tresource-exhausted\t{memory_max_bytes}\t{peak_rss_kb}\t{cgroup_peak_memory_kb}\t{}\tfalse\n",
         clean_cell(program),
         clean_cell(field_key),
         clean_cell(phase),
@@ -4074,6 +4127,59 @@ fn validate_reusable_candidate_artifact(
         ));
     }
     Ok(())
+}
+
+fn validate_oracle_candidate_byte_match(
+    oracle_partial: &str,
+    actual_candidates: &str,
+    program: &str,
+    field_key: &str,
+) -> Result<bool, String> {
+    let marker = format!("{CANDIDATE_HEADER}\n");
+    if oracle_partial.match_indices(&marker).count() != 1 {
+        return Err("oracle partial must contain exactly one candidate header".to_owned());
+    }
+    let oracle_table = oracle_partial
+        .split_once(&marker)
+        .expect("exactly one oracle header")
+        .1;
+    let mut oracle_rows = oracle_table
+        .lines()
+        .take_while(|line| !line.is_empty())
+        .filter(|line| {
+            let mut columns = line.split('\t');
+            columns.next() == Some(program) && columns.next() == Some(field_key)
+        });
+    let Some(oracle_row) = oracle_rows.next() else {
+        return Ok(false);
+    };
+    if oracle_rows.next().is_some() {
+        return Err(format!(
+            "oracle duplicates candidate: program={program} candidate={field_key}"
+        ));
+    }
+
+    let actual = parse_table_text(
+        actual_candidates,
+        CANDIDATE_HEADER,
+        7,
+        "isolated oracle candidate",
+    )?;
+    if actual.len() != 1 || actual[0][0] != program || actual[0][1] != field_key {
+        return Err(format!(
+            "isolated oracle identity mismatch: program={program} candidate={field_key} rows={actual:?}"
+        ));
+    }
+    let actual_row = actual_candidates
+        .lines()
+        .nth(1)
+        .ok_or_else(|| "isolated oracle candidate row is missing".to_owned())?;
+    if actual_row != oracle_row {
+        return Err(format!(
+            "candidate summary byte mismatch: program={program} candidate={field_key}"
+        ));
+    }
+    Ok(true)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -4275,6 +4381,30 @@ fn validate_completed_receipt(
     {
         return Err("current-head receipt lacks candidate-isolation/cgroup contract".to_owned());
     }
+    if receipt_head == &contract.head {
+        for key in ["peak_rss_kb", "cgroup_peak_memory_kb"] {
+            let value = receipt
+                .get(key)
+                .ok_or_else(|| format!("current-head receipt lacks {key}"))?
+                .parse::<u64>()
+                .map_err(|error| format!("current-head receipt {key} is invalid: {error}"))?;
+            if value == 0 {
+                return Err(format!("current-head receipt {key} is zero"));
+            }
+        }
+        let expected_oracle_matches = (usize::from(program == "lil") * 19).to_string();
+        if receipt.get("oracle_partial_sha256").map(String::as_str)
+            != Some(LIL_ORACLE_PARTIAL_SHA256)
+            || receipt.get("oracle_byte_matches").map(String::as_str)
+                != Some(expected_oracle_matches.as_str())
+            || receipt.get("oracle_expected_matches").map(String::as_str)
+                != Some(expected_oracle_matches.as_str())
+        {
+            return Err(format!(
+                "current-head receipt oracle contract drift: program={program}"
+            ));
+        }
+    }
     for (key, expected) in [
         ("program", program),
         ("a4_aggregate_manifest_sha256", A4_AGGREGATE_MANIFEST_SHA256),
@@ -4345,7 +4475,8 @@ fn last_phase(stderr: &str) -> (String, String) {
 struct CappedCandidateOutcome {
     status: String,
     wall_s: f64,
-    peak_rss_kb: u64,
+    memory_peaks: Option<CandidateMemoryPeaks>,
+    memory_receipt_error: Option<String>,
     stderr: String,
     cap_verified: bool,
     oom_kills: u64,
@@ -4395,6 +4526,7 @@ fn run_capped_candidate_child(
     let unit = format!("crat-a4-{}-{sequence}.service", std::process::id());
     let out_path = unit_dir.join("worker.out");
     let err_path = unit_dir.join("worker.err");
+    let time_path = unit_dir.join("time.txt");
     let out_file = fs::File::create(&out_path).expect("create candidate worker stdout");
     let err_file = fs::File::create(&err_path).expect("create candidate worker stderr");
     let exe = std::env::current_exe().expect("current test executable");
@@ -4437,6 +4569,9 @@ fn run_capped_candidate_child(
         command.arg("--setenv").arg(assignment);
     }
     command
+        .arg("/usr/bin/time")
+        .args(["--verbose", "--output"])
+        .arg(&time_path)
         .arg(exe)
         .args(["bo_c1::boc1_run_one", "--exact", "--ignored", "--nocapture"])
         .stdin(Stdio::null())
@@ -4486,6 +4621,13 @@ fn run_capped_candidate_child(
     let wall_s = started.elapsed().as_secs_f64();
     let stdout = fs::read_to_string(&out_path).unwrap_or_default();
     let stderr = fs::read_to_string(&err_path).unwrap_or_default();
+    let gnu_time_receipt = fs::read_to_string(&time_path).ok();
+    let memory_receipt = require_candidate_memory_peaks(
+        gnu_time_receipt.as_deref(),
+        (peak_bytes > 0).then_some(peak_bytes),
+    );
+    let memory_receipt_error = memory_receipt.as_ref().err().cloned();
+    let memory_peaks = memory_receipt.ok();
     let row = stdout.lines().rev().find_map(super::report::parse_kv_line);
     let worker_ok = status.success()
         && row
@@ -4494,6 +4636,8 @@ fn run_capped_candidate_child(
             .is_some_and(|status| status == "ok");
     let classification = if timed_out {
         "timeout".to_owned()
+    } else if memory_receipt_error.is_some() {
+        "metric-receipt-failure".to_owned()
     } else {
         match classify_capped_candidate(cap_verified, oom_kills, worker_ok) {
             Ok("failed") => row
@@ -4512,7 +4656,8 @@ fn run_capped_candidate_child(
     CappedCandidateOutcome {
         status: classification,
         wall_s,
-        peak_rss_kb: peak_bytes.div_ceil(1024),
+        memory_peaks,
+        memory_receipt_error,
         stderr,
         cap_verified,
         oom_kills,
@@ -4526,6 +4671,7 @@ struct MeasurementContract {
     input: Vec<A4InputRow>,
     programs: Vec<super::CorpusProgram>,
     head: String,
+    lil_oracle_partial: String,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -4867,6 +5013,43 @@ fn measurement_contract() -> MeasurementContract {
             .join("deps_crate/target/debug/deps")
             .is_dir()
     );
+    let oracle_path = PathBuf::from(
+        std::env::var_os("CRAT_A4_SOURCE_ORACLE_PARTIAL").expect("CRAT_A4_SOURCE_ORACLE_PARTIAL"),
+    );
+    assert!(oracle_path.is_absolute());
+    assert_eq!(sha256(&oracle_path), LIL_ORACLE_PARTIAL_SHA256);
+    let lil_oracle_partial = fs::read_to_string(&oracle_path).expect("read lil summary oracle");
+    let marker = format!("{CANDIDATE_HEADER}\n");
+    let oracle_rows = lil_oracle_partial
+        .split_once(&marker)
+        .expect("lil oracle candidate header")
+        .1
+        .lines()
+        .take_while(|line| !line.is_empty())
+        .map(|line| line.split('\t').collect::<Vec<_>>())
+        .collect::<Vec<_>>();
+    assert_eq!(oracle_rows.len(), 19);
+    let expected_lil = expected_identities_from_input(&input, "lil", true)
+        .into_iter()
+        .map(|identity| identity.field_key)
+        .collect::<BTreeSet<_>>();
+    let oracle_lil = oracle_rows
+        .iter()
+        .map(|row| {
+            assert_eq!(row.len(), 7);
+            assert_eq!(row[0], "lil");
+            row[1].to_owned()
+        })
+        .collect::<BTreeSet<_>>();
+    assert_eq!(oracle_lil.len(), 19);
+    assert!(oracle_lil.is_subset(&expected_lil));
+    assert_eq!(
+        expected_lil
+            .difference(&oracle_lil)
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+        vec!["src::lil::_lil_var_t::field2@d0"]
+    );
     MeasurementContract {
         run_root,
         input_root,
@@ -4874,16 +5057,16 @@ fn measurement_contract() -> MeasurementContract {
         input,
         programs,
         head,
+        lil_oracle_partial,
     }
 }
 
-fn expected_identities(
-    contract: &MeasurementContract,
+fn expected_identities_from_input(
+    input: &[A4InputRow],
     program: &str,
     census: bool,
 ) -> Vec<Identity> {
-    contract
-        .input
+    input
         .iter()
         .filter(|row| row.program == program)
         .filter(|row| {
@@ -4898,6 +5081,14 @@ fn expected_identities(
             field_key: row.field_key.clone(),
         })
         .collect()
+}
+
+fn expected_identities(
+    contract: &MeasurementContract,
+    program: &str,
+    census: bool,
+) -> Vec<Identity> {
+    expected_identities_from_input(&contract.input, program, census)
 }
 
 fn validate_unique_root_rows(roots: &[Vec<String>]) -> Result<(), String> {
@@ -5219,23 +5410,57 @@ fn validate_isolated_unit(
             ));
         }
     }
+    for key in ["peak_rss_kb", "cgroup_peak_memory_kb"] {
+        let value = receipt
+            .get(key)
+            .ok_or_else(|| format!("isolated receipt lacks {key}"))?
+            .parse::<u64>()
+            .map_err(|error| format!("isolated receipt {key} is invalid: {error}"))?;
+        if value == 0 {
+            return Err(format!("isolated receipt {key} is zero"));
+        }
+    }
+    let candidates_text = fs::read_to_string(dir.join("candidates.tsv"))
+        .map_err(|error| format!("read isolated oracle candidate: {error}"))?;
+    let oracle_byte_match = validate_oracle_candidate_byte_match(
+        &contract.lil_oracle_partial,
+        &candidates_text,
+        &expected.identity.program,
+        &expected.identity.field_key,
+    )?;
+    let expected_oracle_label = if oracle_byte_match {
+        "true"
+    } else {
+        "not-applicable"
+    };
+    if receipt.get("oracle_byte_match").map(String::as_str) != Some(expected_oracle_label)
+        || receipt.get("oracle_partial_sha256").map(String::as_str)
+            != Some(LIL_ORACLE_PARTIAL_SHA256)
+    {
+        return Err(format!(
+            "isolated oracle receipt mismatch for {}",
+            expected.identity.field_key
+        ));
+    }
     Ok(())
 }
 
 fn render_isolated_checkpoint(
     program: &str,
-    units: &[(usize, IsolatedIdentity, String, f64, u64)],
+    units: &[(usize, IsolatedIdentity, String, f64, CandidateMemoryPeaks)],
 ) -> String {
     let mut out = format!(
-        "data=false\nprogram={}\nunits_completed={}\n\nindex\tpopulation\tfield_key\tmanifest_sha256\twall_s\tpeak_rss_kb\n",
+        "data=false\nprogram={}\nunits_completed={}\n\nindex\tpopulation\tfield_key\tmanifest_sha256\twall_s\tpeak_rss_kb\tcgroup_peak_memory_kb\n",
         clean_cell(program),
         units.len()
     );
-    for (index, identity, manifest, wall_s, peak_rss_kb) in units {
+    for (index, identity, manifest, wall_s, memory_peaks) in units {
         out.push_str(&format!(
-            "{index}\t{}\t{}\t{manifest}\t{wall_s:.3}\t{peak_rss_kb}\n",
+            "{index}\t{}\t{}\t{manifest}\t{wall_s:.3}\t{}\t{}\n",
             identity.population,
             clean_cell(&identity.identity.field_key),
+            memory_peaks.process_peak_rss_kb,
+            memory_peaks.cgroup_peak_memory_kb,
         ));
     }
     out
@@ -5290,7 +5515,7 @@ fn run_shard(contract: &MeasurementContract, program: super::CorpusProgram) {
         .join(program.name)
         .join(program.lib_root);
     let identities = isolated_identities(contract, program.name);
-    let mut completed = Vec::<(usize, IsolatedIdentity, String, f64, u64)>::new();
+    let mut completed = Vec::<(usize, IsolatedIdentity, String, f64, CandidateMemoryPeaks)>::new();
     for (index, identity) in identities.iter().cloned().enumerate() {
         let unit_dir = units_dir.join(format!("{index:03}"));
         if unit_dir.is_dir() {
@@ -5313,7 +5538,12 @@ fn run_shard(contract: &MeasurementContract, program: super::CorpusProgram) {
                 identity,
                 manifest,
                 receipt["wall_s"].parse().expect("candidate wall"),
-                receipt["peak_rss_kb"].parse().expect("candidate RSS"),
+                CandidateMemoryPeaks {
+                    process_peak_rss_kb: receipt["peak_rss_kb"].parse().expect("candidate RSS"),
+                    cgroup_peak_memory_kb: receipt["cgroup_peak_memory_kb"]
+                        .parse()
+                        .expect("candidate cgroup peak"),
+                },
             ));
             continue;
         }
@@ -5351,12 +5581,16 @@ fn run_shard(contract: &MeasurementContract, program: super::CorpusProgram) {
         );
         let (phase, marker_candidate) = last_phase(&outcome.stderr);
         if outcome.status != "ok" {
+            let memory_peaks = outcome.memory_peaks;
             if outcome.status == "resource-exhausted" {
+                let memory_peaks = memory_peaks
+                    .expect("resource-exhausted classification requires both memory metrics");
                 let resource = render_resource_exhausted(
                     program.name,
                     &identity.identity.field_key,
                     CANDIDATE_MEMORY_MAX_BYTES,
-                    outcome.peak_rss_kb,
+                    memory_peaks.process_peak_rss_kb,
+                    memory_peaks.cgroup_peak_memory_kb,
                     &phase,
                 );
                 fs::write(unit_dir.join("resource-exhausted.tsv"), &resource)
@@ -5364,8 +5598,14 @@ fn run_shard(contract: &MeasurementContract, program: super::CorpusProgram) {
                 write_atomic_checkpoint(&dir.join("resource-exhausted.tsv"), &resource)
                     .expect("write program resource exception");
             }
+            let memory_receipt = memory_peaks.map_or_else(
+                || "peak_rss_kb=unavailable\ncgroup_peak_memory_kb=unavailable\n".to_owned(),
+                render_candidate_memory_receipt,
+            );
+            let memory_receipt_error =
+                clean_cell(outcome.memory_receipt_error.as_deref().unwrap_or("none"));
             let receipt = format!(
-                "machine_id={MACHINE_ID}\nplatform={PLATFORM}\nmemory_limit=cgroup-100GiB\nmemory_max_bytes={CANDIDATE_MEMORY_MAX_BYTES}\ncap_verified={}\noom_kills={}\nwall_bound_kind=liveness\nwall_cap_s={LIVENESS_BOUND_S}\nprogram={}\ncandidate={}\npopulation={}\nstatus={}\ndata=false\ncheckpoint_data=false\nanalysis_head={}\nlast_phase={phase}\nlast_candidate={marker_candidate}\nwall_s={:.3}\npeak_rss_kb={}\n",
+                "machine_id={MACHINE_ID}\nplatform={PLATFORM}\nmemory_limit=cgroup-100GiB\nmemory_max_bytes={CANDIDATE_MEMORY_MAX_BYTES}\ncap_verified={}\noom_kills={}\nwall_bound_kind=liveness\nwall_cap_s={LIVENESS_BOUND_S}\nprogram={}\ncandidate={}\npopulation={}\nstatus={}\ndata=false\ncheckpoint_data=false\nanalysis_head={}\nlast_phase={phase}\nlast_candidate={marker_candidate}\nwall_s={:.3}\n{memory_receipt}memory_receipt_error={memory_receipt_error}\n",
                 outcome.cap_verified,
                 outcome.oom_kills,
                 program.name,
@@ -5374,7 +5614,6 @@ fn run_shard(contract: &MeasurementContract, program: super::CorpusProgram) {
                 outcome.status,
                 contract.head,
                 outcome.wall_s,
-                outcome.peak_rss_kb,
             );
             fs::write(unit_dir.join("receipt.txt"), receipt).expect("write failed unit receipt");
             let mut files = vec!["receipt.txt", "worker.out", "worker.err"];
@@ -5384,6 +5623,7 @@ fn run_shard(contract: &MeasurementContract, program: super::CorpusProgram) {
                 "exceptions.tsv",
                 "partial.tsv",
                 "resource-exhausted.tsv",
+                "time.txt",
             ] {
                 if unit_dir.join(file).is_file() {
                     files.push(file);
@@ -5396,23 +5636,87 @@ fn run_shard(contract: &MeasurementContract, program: super::CorpusProgram) {
             )
             .expect("write program checkpoint after failed unit");
             panic!(
-                "A4C STOP phase={phase} candidate={} program={} status={} cap_bytes={} wall_s={:.3} peak_rss_kb={} manifest={manifest}",
+                "A4C STOP phase={phase} candidate={} program={} status={} cap_bytes={} wall_s={:.3} peak_rss_kb={} cgroup_peak_memory_kb={} memory_receipt_error={} manifest={manifest}",
                 identity.identity.field_key,
                 program.name,
                 outcome.status,
                 CANDIDATE_MEMORY_MAX_BYTES,
                 outcome.wall_s,
-                outcome.peak_rss_kb,
+                memory_peaks
+                    .map(|peaks| peaks.process_peak_rss_kb)
+                    .unwrap_or(0),
+                memory_peaks
+                    .map(|peaks| peaks.cgroup_peak_memory_kb)
+                    .unwrap_or(0),
+                memory_receipt_error,
             );
         }
+        let memory_peaks = outcome
+            .memory_peaks
+            .expect("ok candidate requires both memory metrics");
         let candidates = parse_table(&unit_dir.join("candidates.tsv"), CANDIDATE_HEADER, 7)
             .expect("parse isolated candidates");
         let roots =
             parse_table(&unit_dir.join("roots.tsv"), ROOT_HEADER, 8).expect("parse isolated roots");
         let exceptions = parse_table(&unit_dir.join("exceptions.tsv"), EXCEPTION_HEADER, 28)
             .expect("parse isolated exceptions");
+        let candidates_text = fs::read_to_string(unit_dir.join("candidates.tsv"))
+            .expect("read isolated oracle candidate");
+        let oracle_byte_match = match validate_oracle_candidate_byte_match(
+            &contract.lil_oracle_partial,
+            &candidates_text,
+            program.name,
+            &identity.identity.field_key,
+        ) {
+            Ok(matched) => matched,
+            Err(error) => {
+                let memory_receipt = render_candidate_memory_receipt(memory_peaks);
+                let receipt = format!(
+                    "machine_id={MACHINE_ID}\nplatform={PLATFORM}\nmemory_limit=cgroup-100GiB\nmemory_max_bytes={CANDIDATE_MEMORY_MAX_BYTES}\ncap_verified={}\noom_kills={}\nwall_bound_kind=liveness\nwall_cap_s={LIVENESS_BOUND_S}\nprogram={}\ncandidate={}\npopulation={}\nstatus=oracle-byte-mismatch\ndata=false\ncheckpoint_data=false\nanalysis_head={}\nlast_phase=oracle-byte-compare\nlast_candidate={}\nwall_s={:.3}\n{memory_receipt}memory_receipt_error=none\noracle_byte_match=false\noracle_partial_sha256={LIL_ORACLE_PARTIAL_SHA256}\n",
+                    outcome.cap_verified,
+                    outcome.oom_kills,
+                    program.name,
+                    clean_cell(&identity.identity.field_key),
+                    identity.population,
+                    contract.head,
+                    clean_cell(&identity.identity.field_key),
+                    outcome.wall_s,
+                );
+                fs::write(unit_dir.join("receipt.txt"), receipt)
+                    .expect("write oracle mismatch receipt");
+                let manifest = write_manifest(
+                    &unit_dir,
+                    &[
+                        "candidates.tsv",
+                        "roots.tsv",
+                        "exceptions.tsv",
+                        "partial.tsv",
+                        "receipt.txt",
+                        "worker.out",
+                        "worker.err",
+                        "time.txt",
+                    ],
+                )
+                .expect("manifest oracle mismatch");
+                write_atomic_checkpoint(
+                    &dir.join("partial.tsv"),
+                    &render_isolated_checkpoint(program.name, &completed),
+                )
+                .expect("write program checkpoint after oracle mismatch");
+                panic!(
+                    "A4C STOP phase=oracle-byte-compare candidate={} program={} status=oracle-byte-mismatch manifest={manifest}: {error}",
+                    identity.identity.field_key, program.name
+                );
+            }
+        };
+        let oracle_label = if oracle_byte_match {
+            "true"
+        } else {
+            "not-applicable"
+        };
+        let memory_receipt = render_candidate_memory_receipt(memory_peaks);
         let receipt = format!(
-            "machine_id={MACHINE_ID}\nplatform={PLATFORM}\nmemory_limit=cgroup-100GiB\nmemory_max_bytes={CANDIDATE_MEMORY_MAX_BYTES}\ncap_verified={}\noom_kills={}\nwall_bound_kind=liveness\nwall_cap_s={LIVENESS_BOUND_S}\nprogram={}\ncandidate={}\npopulation={}\nstatus=ok\ndata=true\ncheckpoint_data=false\nanalysis_head={}\ncandidates={}\nroots={}\nexceptions={}\nlast_phase={phase}\nlast_candidate={marker_candidate}\nwall_s={:.3}\npeak_rss_kb={}\n",
+            "machine_id={MACHINE_ID}\nplatform={PLATFORM}\nmemory_limit=cgroup-100GiB\nmemory_max_bytes={CANDIDATE_MEMORY_MAX_BYTES}\ncap_verified={}\noom_kills={}\nwall_bound_kind=liveness\nwall_cap_s={LIVENESS_BOUND_S}\nprogram={}\ncandidate={}\npopulation={}\nstatus=ok\ndata=true\ncheckpoint_data=false\nanalysis_head={}\ncandidates={}\nroots={}\nexceptions={}\nlast_phase={phase}\nlast_candidate={marker_candidate}\nwall_s={:.3}\n{memory_receipt}memory_receipt_error=none\noracle_byte_match={oracle_label}\noracle_partial_sha256={LIL_ORACLE_PARTIAL_SHA256}\n",
             outcome.cap_verified,
             outcome.oom_kills,
             program.name,
@@ -5423,7 +5727,6 @@ fn run_shard(contract: &MeasurementContract, program: super::CorpusProgram) {
             roots.len(),
             exceptions.len(),
             outcome.wall_s,
-            outcome.peak_rss_kb,
         );
         fs::write(unit_dir.join("receipt.txt"), receipt).expect("write completed unit receipt");
         let manifest = write_manifest(
@@ -5436,6 +5739,7 @@ fn run_shard(contract: &MeasurementContract, program: super::CorpusProgram) {
                 "receipt.txt",
                 "worker.out",
                 "worker.err",
+                "time.txt",
             ],
         )
         .expect("manifest completed unit");
@@ -5445,13 +5749,7 @@ fn run_shard(contract: &MeasurementContract, program: super::CorpusProgram) {
         );
         validate_isolated_unit(contract, &identity, &unit_dir)
             .expect("validate newly completed isolated unit");
-        completed.push((
-            index,
-            identity,
-            manifest,
-            outcome.wall_s,
-            outcome.peak_rss_kb,
-        ));
+        completed.push((index, identity, manifest, outcome.wall_s, memory_peaks));
         write_atomic_checkpoint(
             &dir.join("partial.tsv"),
             &render_isolated_checkpoint(program.name, &completed),
@@ -5505,9 +5803,32 @@ fn run_shard(contract: &MeasurementContract, program: super::CorpusProgram) {
     let exceptions = parse_table(&dir.join("exceptions.tsv"), EXCEPTION_HEADER, 28)
         .expect("parse completed exceptions");
     let wall_s = completed.iter().map(|unit| unit.3).sum::<f64>();
-    let peak_rss_kb = completed.iter().map(|unit| unit.4).max().unwrap_or(0);
+    let peak_rss_kb = completed
+        .iter()
+        .map(|unit| unit.4.process_peak_rss_kb)
+        .max()
+        .unwrap_or(0);
+    let cgroup_peak_memory_kb = completed
+        .iter()
+        .map(|unit| unit.4.cgroup_peak_memory_kb)
+        .max()
+        .unwrap_or(0);
+    let oracle_byte_matches = completed
+        .iter()
+        .filter(|(index, _, _, _, _)| {
+            parse_receipt(&units_dir.join(format!("{index:03}")).join("receipt.txt"))
+                .expect("read finalized candidate oracle receipt")["oracle_byte_match"]
+                == "true"
+        })
+        .count();
+    let expected_oracle_matches = usize::from(program.name == "lil") * 19;
+    assert_eq!(
+        oracle_byte_matches, expected_oracle_matches,
+        "A4C STOP phase=oracle-byte-compare candidate={}: oracle match count drift",
+        program.name
+    );
     let receipt = format!(
-        "machine_id={MACHINE_ID}\nplatform={PLATFORM}\nmemory_limit=cgroup-100GiB\nmemory_max_bytes={CANDIDATE_MEMORY_MAX_BYTES}\ncandidate_isolation=true\nwall_bound_kind=liveness\nwall_cap_s={LIVENESS_BOUND_S}\nprogram={}\nstatus=ok\ndata=true\ncheckpoint_data=false\nanalysis_head={}\na4_aggregate_manifest_sha256={A4_AGGREGATE_MANIFEST_SHA256}\na4_combined_sha256={A4_COMBINED_SHA256}\ncensus_identity_sha256={CENSUS_IDENTITY_SHA256}\nexception_identity_sha256={EXCEPTION_IDENTITY_SHA256}\nraw_corpus_digest={RAW_CORPUS_DIGEST}\nderived_substrate_digest={DERIVED_SUBSTRATE_DIGEST}\nsnapshot={SNAPSHOT_PATH}\ncandidates={}\nroots={}\nexceptions={}\nlast_phase=complete\nlast_candidate=none\nwall_s={wall_s:.3}\npeak_rss_kb={peak_rss_kb}\n",
+        "machine_id={MACHINE_ID}\nplatform={PLATFORM}\nmemory_limit=cgroup-100GiB\nmemory_max_bytes={CANDIDATE_MEMORY_MAX_BYTES}\ncandidate_isolation=true\nwall_bound_kind=liveness\nwall_cap_s={LIVENESS_BOUND_S}\nprogram={}\nstatus=ok\ndata=true\ncheckpoint_data=false\nanalysis_head={}\na4_aggregate_manifest_sha256={A4_AGGREGATE_MANIFEST_SHA256}\na4_combined_sha256={A4_COMBINED_SHA256}\ncensus_identity_sha256={CENSUS_IDENTITY_SHA256}\nexception_identity_sha256={EXCEPTION_IDENTITY_SHA256}\nraw_corpus_digest={RAW_CORPUS_DIGEST}\nderived_substrate_digest={DERIVED_SUBSTRATE_DIGEST}\nsnapshot={SNAPSHOT_PATH}\ncandidates={}\nroots={}\nexceptions={}\noracle_partial_sha256={LIL_ORACLE_PARTIAL_SHA256}\noracle_byte_matches={oracle_byte_matches}\noracle_expected_matches={expected_oracle_matches}\nlast_phase=complete\nlast_candidate=none\nwall_s={wall_s:.3}\npeak_rss_kb={peak_rss_kb}\ncgroup_peak_memory_kb={cgroup_peak_memory_kb}\n",
         program.name,
         contract.head,
         candidates.len(),
@@ -5534,13 +5855,14 @@ fn run_shard(contract: &MeasurementContract, program: super::CorpusProgram) {
         .expect("validate newly completed receipt");
     validate_receipt_counts(&receipt, &dir).expect("validate newly completed receipt counts");
     eprintln!(
-        "A4C completed program={} candidates={} roots={} exceptions={} wall_s={:.3} peak_rss_kb={} manifest={manifest}",
+        "A4C completed program={} candidates={} roots={} exceptions={} wall_s={:.3} peak_rss_kb={} cgroup_peak_memory_kb={} manifest={manifest}",
         program.name,
         candidates.len(),
         roots.len(),
         exceptions.len(),
         wall_s,
-        peak_rss_kb
+        peak_rss_kb,
+        cgroup_peak_memory_kb,
     );
 }
 
@@ -5715,6 +6037,12 @@ fn aggregate(contract: &MeasurementContract) {
         .map(|receipt| receipt["peak_rss_kb"].parse::<u64>().expect("RSS integer"))
         .max()
         .unwrap_or(0);
+    let cgroup_peak_memory = receipts
+        .iter()
+        .filter_map(|receipt| receipt.get("cgroup_peak_memory_kb"))
+        .map(|peak| peak.parse::<u64>().expect("cgroup peak integer"))
+        .max()
+        .unwrap_or(0);
     let shard_analysis_heads = contract
         .programs
         .iter()
@@ -5723,7 +6051,7 @@ fn aggregate(contract: &MeasurementContract) {
         .collect::<Vec<_>>()
         .join(",");
     let mut per_program = String::from(
-        "program\tcandidates\troots\texceptions\tclosed_invisible\tclosed_absent\tclosed_mixed\topen_invisible\topen_absent\topen_mixed\tstance_divergences\twall_s\tpeak_rss_kb\n",
+        "program\tcandidates\troots\texceptions\tclosed_invisible\tclosed_absent\tclosed_mixed\topen_invisible\topen_absent\topen_mixed\tstance_divergences\twall_s\tpeak_rss_kb\tcgroup_peak_memory_kb\n",
     );
     for (program, receipt) in contract.programs.iter().zip(&receipts) {
         let program_rows = candidate_readings
@@ -5732,8 +6060,12 @@ fn aggregate(contract: &MeasurementContract) {
             .collect::<Vec<_>>();
         let count_closed = |class: &str| program_rows.iter().filter(|row| row[4] == class).count();
         let count_open = |class: &str| program_rows.iter().filter(|row| row[5] == class).count();
+        let cgroup_peak = receipt
+            .get("cgroup_peak_memory_kb")
+            .map(String::as_str)
+            .unwrap_or("not-recorded-pre-isolation");
         per_program.push_str(&format!(
-            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
             program.name,
             program_rows.len(),
             roots.iter().filter(|row| row[1] == program.name).count(),
@@ -5750,6 +6082,7 @@ fn aggregate(contract: &MeasurementContract) {
             program_rows.iter().filter(|row| row[4] != row[5]).count(),
             receipt["wall_s"],
             receipt["peak_rss_kb"],
+            cgroup_peak,
         ));
     }
     let closed_class_summary = closed_class_counts
@@ -5802,10 +6135,10 @@ fn aggregate(contract: &MeasurementContract) {
         .filter(|row| row[4] != row[5])
         .count();
     let report = format!(
-        "# A4 force-SAT exceptions and no-allocation-source census\n\nMachine `{MACHINE_ID}`, platform `{PLATFORM}`; RAM/CPU uncapped with a {LIVENESS_BOUND_S}-second per-program liveness bound. Wall/RSS values are machine-local and never compared across machines.\n\nExact identity: **261/261** A4/P2 candidates plus **4/4** separately re-checked force-SAT exception rows (**261+4**), with **237/237** no-allocation-source candidates characterized. Unknown/unexplained: **0**.\n\n## Closed-world partition\n\nThe closed-world reading excludes only `public-setter-reachable` external-remainder rows.\n\n{closed_class_summary}\n\n## Open partition\n\nThe open reading includes every manifested path row and treats the public-setter remainder as opaque/absent.\n\n{open_class_summary}\n\nClosed/open class divergences: **{stance_divergences}**.\n\n## Overlapping cause flags (open reading)\n\n{flag_summary}\n\n## Indirect-target provenance tags\n\n{provenance_tag_summary}\n\nTags remain outside the invisible/absent predicates. `public-setter-reachable` controls only which manifested row enters the closed versus open reading.\n\n## Force-SAT exceptions\n\n{exception_summary}\n\nSequential shard wall sum: **{total_wall:.3}s**. Maximum observed worker RSS: **{peak_rss} KiB**. Only SHA-manifested, completed `data=true` shards feed this report; atomic `data=false` checkpoints are excluded. Production analysis and rewriter behavior remained untouched.\n"
+        "# A4 force-SAT exceptions and no-allocation-source census\n\nMachine `{MACHINE_ID}`, platform `{PLATFORM}`. Pre-isolation predecessor shards were uncapped; current-head candidates ran sequentially in fresh processes under a 100 GiB cgroup host-protection cap and a {LIVENESS_BOUND_S}-second liveness bound. Wall/RSS values are machine-local and never compared across machines.\n\nExact identity: **261/261** A4/P2 candidates plus **4/4** separately re-checked force-SAT exception rows (**261+4**), with **237/237** no-allocation-source candidates characterized. Unknown/unexplained: **0**.\n\n## Closed-world partition\n\nThe closed-world reading excludes only `public-setter-reachable` external-remainder rows.\n\n{closed_class_summary}\n\n## Open partition\n\nThe open reading includes every manifested path row and treats the public-setter remainder as opaque/absent.\n\n{open_class_summary}\n\nClosed/open class divergences: **{stance_divergences}**.\n\n## Overlapping cause flags (open reading)\n\n{flag_summary}\n\n## Indirect-target provenance tags\n\n{provenance_tag_summary}\n\nTags remain outside the invisible/absent predicates. `public-setter-reachable` controls only which manifested row enters the closed versus open reading.\n\n## Force-SAT exceptions\n\n{exception_summary}\n\nSequential shard wall sum: **{total_wall:.3}s**. Maximum process peak RSS: **{peak_rss} KiB**. Maximum current-head candidate cgroup peak charged memory: **{cgroup_peak_memory} KiB**. Only SHA-manifested, completed `data=true` shards feed this report; atomic `data=false` checkpoints are excluded. Production analysis and rewriter behavior remained untouched.\n"
     );
     let provenance = format!(
-        "machine_id={MACHINE_ID}\nplatform={PLATFORM}\nanalysis_head={}\nanalysis_branch=codex/a4-source-census\nbaseline_branch=analysis-lane\nbaseline_head=67bcd3cb67c1ae6f74463050033370b108854411\na4_input_root={}\na4_aggregate_manifest_sha256={A4_AGGREGATE_MANIFEST_SHA256}\na4_combined_sha256={A4_COMBINED_SHA256}\ncensus_identity_sha256={CENSUS_IDENTITY_SHA256}\nexception_identity_sha256={EXCEPTION_IDENTITY_SHA256}\nraw_corpus_digest={RAW_CORPUS_DIGEST}\nderived_substrate_digest={DERIVED_SUBSTRATE_DIGEST}\nsnapshot={SNAPSHOT_PATH}\nmemory_limit=uncapped\nwall_bound_kind=liveness\nwall_cap_s={LIVENESS_BOUND_S}\nprograms={}\nfull_identity_rows=261\ncensus_candidates=237\nexception_rechecks=4\nidentity_accounting=261+4\nunknown=0\nunexplained=0\nclosed_open_divergences={stance_divergences}\nroots={}\nwall_sum_s={total_wall:.3}\npeak_rss_kb={peak_rss}\nshard_analysis_heads={shard_analysis_heads}\nshard_manifests={}\naggregation_input_policy=manifested-published-completed-data-true-only\ntiming_comparison=forbidden-across-machines\n",
+        "machine_id={MACHINE_ID}\nplatform={PLATFORM}\nanalysis_head={}\nanalysis_branch=codex/a4-source-census\nbaseline_branch=analysis-lane\nbaseline_head=67bcd3cb67c1ae6f74463050033370b108854411\na4_input_root={}\na4_aggregate_manifest_sha256={A4_AGGREGATE_MANIFEST_SHA256}\na4_combined_sha256={A4_COMBINED_SHA256}\ncensus_identity_sha256={CENSUS_IDENTITY_SHA256}\nexception_identity_sha256={EXCEPTION_IDENTITY_SHA256}\nraw_corpus_digest={RAW_CORPUS_DIGEST}\nderived_substrate_digest={DERIVED_SUBSTRATE_DIGEST}\nsnapshot={SNAPSHOT_PATH}\nmemory_policy=predecessor-shards-uncapped,current-head-candidates-cgroup-100GiB\nwall_bound_kind=liveness\nwall_cap_s={LIVENESS_BOUND_S}\nprograms={}\nfull_identity_rows=261\ncensus_candidates=237\nexception_rechecks=4\nidentity_accounting=261+4\nunknown=0\nunexplained=0\nclosed_open_divergences={stance_divergences}\nroots={}\nwall_sum_s={total_wall:.3}\npeak_rss_kb={peak_rss}\ncgroup_peak_memory_kb={cgroup_peak_memory}\ncgroup_peak_scope=current-head-candidate-isolated-shards-only\nshard_analysis_heads={shard_analysis_heads}\nshard_manifests={}\naggregation_input_policy=manifested-published-completed-data-true-only\ntiming_comparison=forbidden-across-machines\n",
         contract.head,
         contract.input_root.display(),
         contract.programs.len(),
@@ -6007,11 +6340,58 @@ mod tests {
             "Fixture::field0@d0",
             CANDIDATE_MEMORY_MAX_BYTES,
             104_857_600,
+            104_900_000,
             "source-traversal",
         );
         assert!(row.starts_with(RESOURCE_EXHAUSTED_HEADER));
-        assert!(row.contains("\tresource-exhausted\t107374182400\t104857600\t"));
+        assert!(row.contains("\tresource-exhausted\t107374182400\t104857600\t104900000\t"));
         assert!(row.ends_with("\tfalse\n"));
+    }
+
+    #[test]
+    fn gnu_time_peak_rss_parser_is_strict() {
+        let receipt = concat!(
+            "Command being timed: fixture\n",
+            "\tMaximum resident set size (kbytes): 333660\n",
+            "\tExit status: 0\n",
+        );
+        assert_eq!(parse_gnu_time_peak_rss_kb(receipt), Ok(333_660));
+        assert!(
+            parse_gnu_time_peak_rss_kb("Exit status: 0\n")
+                .expect_err("missing GNU-time RSS must fail closed")
+                .contains("missing")
+        );
+        assert!(
+            parse_gnu_time_peak_rss_kb(concat!(
+                "Maximum resident set size (kbytes): 1\n",
+                "Maximum resident set size (kbytes): 2\n",
+            ))
+            .expect_err("duplicate GNU-time RSS must fail closed")
+            .contains("duplicate")
+        );
+    }
+
+    #[test]
+    fn candidate_memory_receipt_separates_and_requires_both_metrics() {
+        let peaks = require_candidate_memory_peaks(
+            Some("Maximum resident set size (kbytes): 333660\n"),
+            Some(205_209_600),
+        )
+        .unwrap();
+        assert_eq!(peaks.process_peak_rss_kb, 333_660);
+        assert_eq!(peaks.cgroup_peak_memory_kb, 200_400);
+        assert_eq!(
+            render_candidate_memory_receipt(peaks),
+            "peak_rss_kb=333660\ncgroup_peak_memory_kb=200400\n"
+        );
+        assert!(require_candidate_memory_peaks(None, Some(205_209_600)).is_err());
+        assert!(
+            require_candidate_memory_peaks(
+                Some("Maximum resident set size (kbytes): 333660\n"),
+                None,
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -6040,6 +6420,35 @@ mod tests {
             )
             .expect_err("candidate summary without ordered roots must not be reusable")
             .contains("root inventory")
+        );
+    }
+
+    #[test]
+    fn preserved_summary_is_a_byte_oracle_not_a_skip_artifact() {
+        let oracle = concat!(
+            "data=false\n",
+            "candidates_completed=1\n\n",
+            "program\tfield_key\tfield_slot\tordinary_kind\tprimary_class\tcause_flags\troot_count\n",
+            "fixture\tFixture::field0@d0\t0\traw\tabsent\tnull-literal-root\t1\n",
+        );
+        let matching = concat!(
+            "program\tfield_key\tfield_slot\tordinary_kind\tprimary_class\tcause_flags\troot_count\n",
+            "fixture\tFixture::field0@d0\t0\traw\tabsent\tnull-literal-root\t1\n",
+        );
+        let drifted = matching.replace("\tabsent\t", "\tmixed\t");
+
+        assert_eq!(
+            validate_oracle_candidate_byte_match(oracle, matching, "fixture", "Fixture::field0@d0"),
+            Ok(true)
+        );
+        assert!(
+            validate_oracle_candidate_byte_match(oracle, &drifted, "fixture", "Fixture::field0@d0")
+                .expect_err("semantic drift must STOP")
+                .contains("byte mismatch")
+        );
+        assert_eq!(
+            validate_oracle_candidate_byte_match(oracle, matching, "fixture", "Fixture::field1@d0"),
+            Ok(false)
         );
     }
 
