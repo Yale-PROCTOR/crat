@@ -7101,6 +7101,7 @@ mod run {
                 row.set("just_kind_decision", jc.kind_decision.to_string());
                 row.set("just_seam_adapter", jc.seam_adapter.to_string());
                 row.set("just_total", jc.total().to_string());
+                row.set("just_edits", d.plan_edits.to_string());
                 // **AND AS AN ARTIFACT.** The row goes to stdout, which this
                 // machine's CLI proxy filters — a limitation already banked at
                 // the S3.2'-5 close, where the TOTAL line could not be captured
@@ -7109,18 +7110,20 @@ mod run {
                 // that cannot be cited. Written per program, so the market is
                 // read from artifacts like every other market in this
                 // milestone, and survives into the snapshot.
+                //
+                // **NO `TOTAL` ROW.** It sat in the same `edits` column as the
+                // five buckets, so a consumer summing that column
+                // double-counted — and the analysis lane reads these files. The
+                // total is recoverable from the five and already rides the row
+                // as `just_total`/`just_edits`; a derived value does not belong
+                // in a column of primary ones.
                 let jp = dir.join(format!("{name}.just.tsv"));
                 std::fs::write(
                     &jp,
                     format!(
                         "justification\tedits\nkind_decision\t{}\nseam_adapter\t{}\n\
-                         reroute\t{}\ndrop_form\t{}\nstore_form\t{}\nTOTAL\t{}\n",
-                        jc.kind_decision,
-                        jc.seam_adapter,
-                        jc.reroute,
-                        jc.drop_form,
-                        jc.store_form,
-                        jc.total()
+                         reroute\t{}\ndrop_form\t{}\nstore_form\t{}\n",
+                        jc.kind_decision, jc.seam_adapter, jc.reroute, jc.drop_form, jc.store_form,
                     ),
                 )
                 .unwrap_or_else(|e| panic!("write justification census {}: {e}", jp.display()));
@@ -9893,18 +9896,24 @@ const ARM_ZERO_INVARIANTS: &[&str] = &[
     "arm3_unmatched_ast",
     "arm3_ws_real",
     "sa_unmatched_span",
-    // ---- ARM 4 — GATED ONLY AFTER BEING MEASURED ----
+    // ---- ARM 4 — REGRESSION PINS, and the distinction matters ----
     //
-    // The census (task 0, sweep at `081d3a17`) measured all three at **0**
-    // across 20 programs against a live denominator that ranges from brotli's
-    // 1,305 plan edits to libcsv's 107 — no program has an empty plan, so these
-    // are not three uniform smalls over empty populations.
+    // ⚠ **These zeros are STRUCTURAL, not corpus facts.** `ReRoute`, `DropForm`
+    // and `StoreForm` have **no construction site anywhere in the crate**, so
+    // they read zero for every possible input, not merely for this corpus. That
+    // puts them in `arm1_refused`/`arm2_refused`'s category — pins that prove
+    // nothing today — and NOT in `arm3_refused`'s, whose zero is contingent
+    // because a seam genuinely can collide.
     //
-    // They enter this list NOW and not before: the pre-statement gated nothing
-    // until the number was known, because a census whose result decides whether
-    // an arm has a market may not be pre-judged by the gate that reads it. What
-    // they pin from here is the DAY ONE IS FIRST CONSTRUCTED — which is the
-    // event that reopens arm 4.
+    // This comment first argued non-vacuity from the denominator (no program
+    // has an empty plan; brotli 1,305 edits to libcsv's 107). **That argument
+    // was wrong and is corrected here.** The denominator establishes only that
+    // the instrument ran over a non-empty population; it cannot make a
+    // structurally-impossible counter contingent. Caught at the arm-4 review.
+    //
+    // What they DO pin is the day one of the three is first constructed — the
+    // event that reopens arm 4 — which is the correct reason to gate them, and
+    // the reason they were added only after the census measured them.
     "arm4_reroute",
     "arm4_dropform",
     "arm4_storeform",
@@ -10050,9 +10059,20 @@ fn arm_parity_failures(program: &str, row: &report::Row) -> Vec<String> {
             (Err(why), _) | (Ok(_), Err(why)) => out.push(why),
         }
     }
-    // The census's own conservation: an edit may not land in NO bucket.
+    // **The census's conservation, against an INDEPENDENT denominator.**
+    //
+    // This gated `just_total` — which is serialized as the sum of these same
+    // five parts, so it could fail only on row corruption and never on a census
+    // defect. A tautological gate is worse than none, because it reads as
+    // coverage. `just_edits` counts the plan's edits WITHOUT consulting any
+    // justification, so this now fails on a walk that skips a file, a dropped
+    // increment, or a bucket counted but not exported.
+    //
+    // What it still cannot see is a MIS-CLASSIFIED edit: an arm-4 edit counted
+    // as a `KindDecision` keeps every total right. That is the injection
+    // witness's job, and it is stated rather than left implied.
     match (
-        num("just_total"),
+        num("just_edits"),
         num("just_kind_decision"),
         num("just_seam_adapter"),
         num("arm4_reroute"),
@@ -10061,8 +10081,8 @@ fn arm_parity_failures(program: &str, row: &report::Row) -> Vec<String> {
     ) {
         (Ok(t), Ok(k), Ok(s), Ok(r), Ok(df), Ok(sf)) if t == k + s + r + df + sf => {}
         (Ok(t), Ok(k), Ok(s), Ok(r), Ok(df), Ok(sf)) => out.push(format!(
-            "{program}: just_total={t} != {k}+{s}+{r}+{df}+{sf} — a plan edit \
-             landed in no justification bucket"
+            "{program}: just_edits={t} != {k}+{s}+{r}+{df}+{sf} — the plan holds \
+             edits the census did not bucket, so a walk skipped them"
         )),
         (Err(why), ..)
         | (Ok(_), Err(why), ..)
@@ -10123,6 +10143,7 @@ fn conforming_arm_row() -> report::Row {
     row.set("just_kind_decision", "2819");
     row.set("just_seam_adapter", "421");
     row.set("just_total", "3240");
+    row.set("just_edits", "3240");
     row
 }
 
@@ -10285,7 +10306,7 @@ fn every_arm_gate_failure_class_actually_fails() {
     // exists for. Injected on each arm-4 counter too, since those are the ones
     // whose zero is the finding.
     for (key, value) in [
-        ("just_total", "3241"),
+        ("just_edits", "3241"),
         ("arm4_reroute", "1"),
         ("arm4_dropform", "1"),
         ("arm4_storeform", "1"),
@@ -10294,7 +10315,7 @@ fn every_arm_gate_failure_class_actually_fails() {
         row.set(key, value);
         let failures = arm_parity_failures("avl", &row);
         assert!(
-            failures.iter().any(|f| f.contains("just_total")),
+            failures.iter().any(|f| f.contains("just_edits")),
             "{key}={value} must break the census's conservation: {failures:?}"
         );
     }

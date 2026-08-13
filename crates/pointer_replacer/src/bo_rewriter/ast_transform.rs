@@ -1405,6 +1405,9 @@ pub(crate) struct TextDiff {
     /// **ARM 4's TASK 0.** Every plan edit by justification, counted in its own
     /// pass — see [`JustificationCensus`].
     pub justifications: JustificationCensus,
+    /// The plan's edit count derived without reading any justification — the
+    /// independent denominator the conservation gate uses.
+    pub plan_edits: usize,
 
     /// **THE CONSERVATION BOUND.** `KindDecision` offsets that NEITHER arm
     /// reached.
@@ -1544,10 +1547,30 @@ pub(crate) struct JustificationCensus {
 }
 
 impl JustificationCensus {
-    /// The denominator. A method rather than a sixth field, so it cannot drift
-    /// from the parts it sums.
+    /// The sum of the buckets. A method rather than a sixth field, so it cannot
+    /// drift from the parts.
+    ///
+    /// **This is NOT an independent denominator**, and gating it against those
+    /// same parts is a tautology — see [`Self::edits_in`], which is one.
     pub(crate) fn total(&self) -> usize {
         self.kind_decision + self.seam_adapter + self.reroute + self.drop_form + self.store_form
+    }
+
+    /// The plan's edit count, derived **without consulting any justification**.
+    ///
+    /// The real denominator, and the one a conservation gate has to use.
+    /// `just_total == Σ buckets` cannot fail in production: `total()` *is* that
+    /// sum, over parts serialized from the same struct, so it detects row
+    /// corruption and nothing else. Gating `edits_in == Σ buckets` instead does
+    /// fail on a walk that skips a file (the M52c shape), on a dropped
+    /// increment, and on a future bucket counted but never exported.
+    ///
+    /// **Stated so it is not over-read:** no conservation identity can see a
+    /// *mis-classified* edit. An arm-4 edit counted as a `KindDecision` leaves
+    /// every total correct and reports the market as zero — which is what the
+    /// injection witness is for, not this.
+    pub(crate) fn edits_in(plan: &super::plan::Plan) -> usize {
+        plan.by_file.values().map(Vec::len).sum()
     }
 
     /// Census one whole plan.
@@ -1701,6 +1724,7 @@ pub(crate) fn arms_full(
     // `just_kind_decision == kd_edits` one number printed twice instead of two
     // derivations agreeing.
     d.justifications = JustificationCensus::of_plan(&emission.plan);
+    d.plan_edits = JustificationCensus::edits_in(&emission.plan);
 
     let (c, eq, diff, un) = compare_renders(&decls.rendered, &by_offset, "decl", &mut d);
     d.compared = c;
@@ -2970,6 +2994,61 @@ mod arm2_witnesses {
         assert_eq!(
             JustificationCensus::of_plan(&Plan::default()),
             JustificationCensus::default()
+        );
+
+        // **THE INDEPENDENT DENOMINATOR agrees — and is derived without
+        // reading a single justification.** This is what makes the corpus
+        // conservation gate capable of failing: `total()` restates the buckets,
+        // `edits_in` counts the plan.
+        assert_eq!(JustificationCensus::edits_in(&plan), 4);
+        assert_eq!(JustificationCensus::edits_in(&plan), c.total());
+        assert_eq!(JustificationCensus::edits_in(&Plan::default()), 0);
+    }
+
+    /// **THE CONSERVATION GATE CAN FAIL — the property its tautological
+    /// predecessor did not have.**
+    ///
+    /// `just_total == Σ buckets` was serialized from one struct on both sides,
+    /// so it could only ever detect row corruption. `edits_in` is derived
+    /// without consulting any justification, so a walk that misses edits breaks
+    /// the identity. Simulated here by censusing a SUBSET of the plan while
+    /// measuring the denominator over the whole of it — which is exactly what a
+    /// skipped file looks like.
+    #[test]
+    fn the_independent_denominator_catches_a_walk_that_misses_edits() {
+        use super::super::plan::{Edit, FileKey, Justification as J, Plan};
+        let edit = || Edit {
+            lo: 0,
+            hi: 1,
+            replacement: String::new(),
+            justification: J::KindDecision { kind: "Ref" },
+            owner_fn: String::new(),
+        };
+        let mut whole = Plan::default();
+        whole
+            .by_file
+            .insert(FileKey::Virtual("a.rs".to_owned()), vec![edit(), edit()]);
+        whole
+            .by_file
+            .insert(FileKey::Virtual("b.rs".to_owned()), vec![edit()]);
+
+        let mut partial = Plan::default();
+        partial
+            .by_file
+            .insert(FileKey::Virtual("a.rs".to_owned()), vec![edit(), edit()]);
+
+        let short = JustificationCensus::of_plan(&partial);
+        assert_eq!(
+            JustificationCensus::edits_in(&whole),
+            3,
+            "the denominator sees all three edits"
+        );
+        assert_ne!(
+            JustificationCensus::edits_in(&whole),
+            short.total(),
+            "and a census that missed a file DISAGREES with it — the failure \
+             the tautological form could not represent, because there both \
+             sides came from the same struct"
         );
     }
 
