@@ -9893,6 +9893,21 @@ const ARM_ZERO_INVARIANTS: &[&str] = &[
     "arm3_unmatched_ast",
     "arm3_ws_real",
     "sa_unmatched_span",
+    // ---- ARM 4 — GATED ONLY AFTER BEING MEASURED ----
+    //
+    // The census (task 0, sweep at `081d3a17`) measured all three at **0**
+    // across 20 programs against a live denominator that ranges from brotli's
+    // 1,305 plan edits to libcsv's 107 — no program has an empty plan, so these
+    // are not three uniform smalls over empty populations.
+    //
+    // They enter this list NOW and not before: the pre-statement gated nothing
+    // until the number was known, because a census whose result decides whether
+    // an arm has a market may not be pre-judged by the gate that reads it. What
+    // they pin from here is the DAY ONE IS FIRST CONSTRUCTED — which is the
+    // event that reopens arm 4.
+    "arm4_reroute",
+    "arm4_dropform",
+    "arm4_storeform",
 ];
 
 /// **THE ARM-2 PARITY GATE — fail-closed over one program's row.**
