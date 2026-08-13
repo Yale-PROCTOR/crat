@@ -1682,11 +1682,52 @@ fn compare_renders(
 /// skip. Silently dropping one would under-revert — the AST side would then
 /// transform a function the span side took back, and every such function would
 /// present as a parity difference with no way to tell it from a real one.
+/// **THE REVERT SET — a SHARED, HELD-FIXED INPUT to both sides.**
+///
+/// Ruled 2026-08-14: the revert set is a **population specification**, so
+/// sharing it between the two sides is correct and required; what must stay
+/// independent is each side's *text derivation*. The first run got this wrong in
+/// one direction only — the span side read `emission.plan` unfiltered — and the
+/// two sides then agreed about a population that was not the emitted one.
+///
+/// It carries **both** vocabularies because the pipeline reverts in both:
+/// `emit_files` filters SUBJECTS by `LocalDefId` at plan-build time, while
+/// `render` filters EDITS by `owner_fn` afterwards. A seam edit is only ever
+/// caught by the second — `plan`'s own comment says so: *"Reverting the callee
+/// reverts its seams with it, because `owner_fn` is the revert key."*
+#[cfg(test)]
+pub(crate) struct RevertSet {
+    pub fns: FxHashSet<LocalDefId>,
+    pub names: FxHashSet<String>,
+    pub subjects: usize,
+}
+
+#[cfg(test)]
+impl RevertSet {
+    /// Does an edit owned by `owner_fn` survive? **The single place either side
+    /// asks**, so they cannot diverge on population again.
+    ///
+    /// Applying this to EVERY plan edit reproduces `render`'s semantics exactly.
+    /// It is idempotent on `KindDecision` edits — `emit_files` has already
+    /// dropped those subjects, and `owner_of(subject)` is the same
+    /// `def_path_str` these names are — so one uniform filter is both correct
+    /// and sufficient.
+    pub(crate) fn keeps(&self, owner_fn: &str) -> bool {
+        !self.names.contains(owner_fn)
+    }
+
+    /// Does a subject survive? `emit_files`'s own rule, restated for the AST
+    /// side so both layers hold back the same functions.
+    pub(crate) fn keeps_subject(&self, fn_did: LocalDefId) -> bool {
+        !self.fns.contains(&fn_did)
+    }
+}
+
 #[cfg(test)]
 pub(crate) fn oracle_reverts(
     tcx: rustc_middle::ty::TyCtxt<'_>,
     path: &std::path::Path,
-) -> Result<(FxHashSet<LocalDefId>, usize), String> {
+) -> Result<RevertSet, String> {
     let body = std::fs::read_to_string(path).map_err(|e| format!("read {path:?}: {e}"))?;
     let wanted: FxHashSet<&str> = body
         .lines()
@@ -1719,7 +1760,11 @@ pub(crate) fn oracle_reverts(
             wanted.len()
         ));
     }
-    Ok((out, subjects))
+    Ok(RevertSet {
+        fns: out,
+        names: seen,
+        subjects,
+    })
 }
 
 /// **THE PHASE-3 EXIT GATE.** Whole-function parity over the emitted
@@ -1770,14 +1815,14 @@ pub(crate) fn phase3_fn_parity(
         (krate, map)
     }));
     let (mut krate, map) = captured.map_err(|_| "AST capture panicked".to_owned())?;
-    let (reverted, reverted_subjects) = oracle_reverts(tcx, reverts_path)?;
-    let reverted = &reverted;
+    let reverts = oracle_reverts(tcx, reverts_path)?;
 
     let (table, _ctx) = super::decide_table_with_ctx(tcx)?;
-    let emission = super::emit_files(tcx, &table, reverted)?;
+    let emission = super::emit_files(tcx, &table, &reverts.fns)?;
 
     let mut p = FnParity::default();
-    p.reverted_subjects = reverted_subjects;
+    p.reverted_subjects = reverts.subjects;
+    p.reverted_fns = reverts.fns.len();
 
     // ---- the AST side: the same three passes, with the SAME subjects held back ----
     let mut decisions: FxHashMap<(LocalDefId, HirId), (DeclForm, bool)> = FxHashMap::default();
@@ -1787,7 +1832,7 @@ pub(crate) fn phase3_fn_parity(
         // `emit_files` applies it by** — the owning function's `LocalDefId`.
         // Without this the AST side would transform functions the span side
         // took back, and every one would present as a difference.
-        if reverted.contains(&subject.fn_did) {
+        if !reverts.keeps_subject(subject.fn_did) {
             continue;
         }
         let (form, mutable, use_edits) = match decision {
@@ -1822,8 +1867,15 @@ pub(crate) fn phase3_fn_parity(
     g.visit_crate(&mut krate);
     let _ = g.finish();
 
+    // **F2 — seams obey the revert set too.** These were unfiltered on the
+    // first run, on BOTH sides, so the two agreed about seams a revert should
+    // have taken: lodepng reported 21 compared functions with every one of its
+    // 179 subjects reverted and nothing emitted.
     let mut seam_targets: FxHashMap<(u32, u32), SeamTarget> = FxHashMap::default();
     for edit in &table.seams.edits {
+        if !reverts.keeps(&edit.owner_fn) {
+            continue;
+        }
         seam_targets.insert((edit.span.lo().0, edit.span.hi().0), SeamTarget::of(edit));
     }
     let mut s = SeamGraftVisitor::new(&seam_targets, &mut guard);
@@ -1868,10 +1920,26 @@ pub(crate) fn phase3_fn_parity(
                 continue;
             };
             for e in edits {
+                // **F2 — the same shared filter the AST side used.**
+                if !reverts.keeps(&e.owner_fn) {
+                    continue;
+                }
                 let (lo, hi) = (base + e.lo as u32, base + e.hi as u32);
                 if lo >= flo && hi <= fhi {
+                    // **F1 — arms 1 and 2 are DISTINCT.** `KindDecision` covers
+                    // both, and the variant already separates them: a use edit
+                    // carries `kind` ending in `(use)` (`"Opt(use)"` /
+                    // `"Slice(use)"`), a declaration edit carries the declared
+                    // kind. Collapsing them into one label made every
+                    // declaration-plus-its-uses function read as single-armed,
+                    // so `multi_arm` was 0 and composition went unmeasured.
                     let arm = match e.justification {
-                        super::plan::Justification::KindDecision { .. } => "decl-or-use",
+                        super::plan::Justification::KindDecision { kind }
+                            if kind.ends_with("(use)") =>
+                        {
+                            "use"
+                        }
+                        super::plan::Justification::KindDecision { .. } => "decl",
                         super::plan::Justification::SeamAdapter { .. } => "seam",
                         _ => "other",
                     };
@@ -1960,6 +2028,9 @@ pub(crate) struct FnParity {
     /// Subjects the revert set took back, so the ledger identity is checkable
     /// from this instrument's own output.
     pub reverted_subjects: usize,
+    /// Functions the revert set took back. Reported again after being dropped
+    /// from the row during the capture-ordering fix.
+    pub reverted_fns: usize,
     pub examples: Vec<String>,
 }
 

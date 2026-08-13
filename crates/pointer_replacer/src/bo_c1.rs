@@ -7964,6 +7964,7 @@ mod run {
             Ok(p) => {
                 row.set("p3", "ok");
                 row.set("p3_reverted_subjects", p.reverted_subjects.to_string());
+                row.set("p3_reverted_fns", p.reverted_fns.to_string());
                 row.set("p3_compared", p.compared.to_string());
                 row.set("p3_equal", p.equal.to_string());
                 row.set("p3_differing", p.differing.to_string());
