@@ -1752,19 +1752,32 @@ pub(crate) fn oracle_reverts(
 #[cfg(test)]
 pub(crate) fn phase3_fn_parity(
     tcx: rustc_middle::ty::TyCtxt<'_>,
-    reverted: &FxHashSet<LocalDefId>,
+    reverts_path: &std::path::Path,
 ) -> Result<FnParity, String> {
+    // **THE AST IS CAPTURED FIRST, BEFORE ANY HIR QUERY.** This function used
+    // to receive an already-resolved revert set, and resolving it called
+    // `tcx.hir_body_owners()` — which BUILDS THE HIR and steals the resolver,
+    // so the `expanded_ast` below then panicked with "attempted to read from
+    // stolen value" on all 20 programs. That is the module's own ONE ENTRY rule
+    // (see [`arms_full`]), and the mistake was putting a HIR query ahead of the
+    // capture rather than adding a second capture.
+    //
+    // `make_ast_to_hir` builds the HIR itself, so every HIR query below — the
+    // revert resolution included — is safe once it has run.
     let captured = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let mut krate = ::utils::ast::expanded_ast(tcx);
         let map = ::utils::ast::make_ast_to_hir(&mut krate, tcx);
         (krate, map)
     }));
     let (mut krate, map) = captured.map_err(|_| "AST capture panicked".to_owned())?;
+    let (reverted, reverted_subjects) = oracle_reverts(tcx, reverts_path)?;
+    let reverted = &reverted;
 
     let (table, _ctx) = super::decide_table_with_ctx(tcx)?;
     let emission = super::emit_files(tcx, &table, reverted)?;
 
     let mut p = FnParity::default();
+    p.reverted_subjects = reverted_subjects;
 
     // ---- the AST side: the same three passes, with the SAME subjects held back ----
     let mut decisions: FxHashMap<(LocalDefId, HirId), (DeclForm, bool)> = FxHashMap::default();
@@ -1775,7 +1788,6 @@ pub(crate) fn phase3_fn_parity(
         // Without this the AST side would transform functions the span side
         // took back, and every one would present as a difference.
         if reverted.contains(&subject.fn_did) {
-            p.reverted_subjects += 1;
             continue;
         }
         let (form, mutable, use_edits) = match decision {

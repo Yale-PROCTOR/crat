@@ -7960,21 +7960,10 @@ mod run {
         };
         let path = dir.join(format!("{name}.reverts.txt"));
         row.set("p3_oracle", path.display().to_string());
-        let (reverted, subjects) =
-            match crate::bo_rewriter::ast_transform::oracle_reverts(tcx, &path) {
-                Ok(v) => v,
-                Err(why) => {
-                    row.set("p3", "declined");
-                    row.set("p3_detail", super::report::sanitize(&why));
-                    row.set("t_total_s", secs(t0.elapsed()));
-                    return row;
-                }
-            };
-        row.set("p3_reverted_subjects", subjects.to_string());
-        row.set("p3_reverted_fns", reverted.len().to_string());
-        match crate::bo_rewriter::ast_transform::phase3_fn_parity(tcx, &reverted) {
+        match crate::bo_rewriter::ast_transform::phase3_fn_parity(tcx, &path) {
             Ok(p) => {
                 row.set("p3", "ok");
+                row.set("p3_reverted_subjects", p.reverted_subjects.to_string());
                 row.set("p3_compared", p.compared.to_string());
                 row.set("p3_equal", p.equal.to_string());
                 row.set("p3_differing", p.differing.to_string());
@@ -10904,6 +10893,16 @@ fn m1_p3_corpus() {
     );
     // R7: the population is asserted NON-EMPTY. A green gate over zero
     // functions is the failure this assertion exists to make impossible.
+    // **FAILURES FIRST.** These asserted after `compared > 0` on the first
+    // run, so twenty declined workers reported "compared NO functions" and hid
+    // their own cause. An instrument that misattributes its own failure costs a
+    // diagnosis cycle; this one did.
+    assert!(
+        failures.is_empty(),
+        "phase-3 exit gate FAILED ({} finding(s)):\n  {}",
+        failures.len(),
+        failures.join("\n  ")
+    );
     assert!(
         compared > 0,
         "the phase-3 gate compared NO functions — a parity claim over an empty \
