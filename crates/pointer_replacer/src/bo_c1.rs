@@ -11060,11 +11060,18 @@ fn every_p3_failure_class_actually_fails() {
 
 /// **THE PHASE-3 EXIT GATE — the corpus run.**
 ///
-/// The arms proved their edits SEVERALLY. This proves their COMPOSITION into
-/// whole function bodies, which is the first end-to-end assembly evidence the
-/// milestone has — and the reason `p3_multi_arm` is asserted non-zero rather
-/// than merely reported: a gate over functions that each carry one edit would
-/// re-prove the per-arm differentials and nothing else.
+/// The arms proved their edits SEVERALLY. This measures **whole-function token
+/// parity over the complete surviving population** — including same-arm
+/// multi-edit assembly.
+///
+/// **It does NOT measure cross-arm composition, and this doc used to claim it
+/// did.** rs-crown never co-locates two arms in one function (31 arm1-only /
+/// 30 arm2-only / 0 both), so `p3_multi_arm` is a **corpus-shape pin at 0**,
+/// asserted in that direction. The stale sentence — *"the reason
+/// `p3_multi_arm` is asserted non-zero"* — survived the retirement by one
+/// commit and is corrected here: prose asserting a check the code does not
+/// have is this track's founding failure class, and it recurred inside the
+/// repair for it.
 ///
 /// The oracle is cited by PATH and verified by DIGEST at the call site; the
 /// revert set is held, never re-derived, because phase 3 tests the transform
