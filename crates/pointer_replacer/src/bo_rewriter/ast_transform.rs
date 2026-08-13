@@ -1550,6 +1550,25 @@ impl JustificationCensus {
         self.kind_decision + self.seam_adapter + self.reroute + self.drop_form + self.store_form
     }
 
+    /// Census one whole plan.
+    ///
+    /// **A named function over the plan, per R8** (ratified at the arm-3
+    /// close). The loop sat inline in [`arms_full`], which needs a `TyCtxt`, so
+    /// only a corpus sweep could reach it — and mutation M52, making the walk
+    /// count nothing, left the entire suite green. The corpus gate would have
+    /// caught it (`just_kind_decision` 0 against `kd_edits` 2,819); the suite
+    /// could not. R8's remedy is to lift the logic out rather than write a
+    /// bigger test, and this is its first application.
+    pub(crate) fn of_plan(plan: &super::plan::Plan) -> Self {
+        let mut c = Self::default();
+        for edits in plan.by_file.values() {
+            for e in edits {
+                c.count(&e.justification);
+            }
+        }
+        c
+    }
+
     /// Count one edit's justification.
     pub(crate) fn count(&mut self, j: &super::plan::Justification) {
         use super::plan::Justification as J;
@@ -1681,11 +1700,7 @@ pub(crate) fn arms_full(
     // Deliberately not folded into the loop above: sharing that loop would make
     // `just_kind_decision == kd_edits` one number printed twice instead of two
     // derivations agreeing.
-    for edits in emission.plan.by_file.values() {
-        for e in edits {
-            d.justifications.count(&e.justification);
-        }
-    }
+    d.justifications = JustificationCensus::of_plan(&emission.plan);
 
     let (c, eq, diff, un) = compare_renders(&decls.rendered, &by_offset, "decl", &mut d);
     d.compared = c;
@@ -2896,6 +2911,66 @@ mod arm2_witnesses {
         let empty = JustificationCensus::default();
         assert_eq!(empty.total(), 0);
         assert_eq!(empty.reroute + empty.drop_form + empty.store_form, 0);
+    }
+
+    /// **THE WALK OVER A PLAN, witnessed — R8's first application.**
+    ///
+    /// Mutation M52 made the walk count nothing and the whole suite stayed
+    /// green, because the loop lived inside [`arms_full`] behind a `TyCtxt` and
+    /// only a corpus sweep could reach it. The corpus gate would have caught it;
+    /// the suite could not, and R8 says the remedy is to lift the logic out.
+    ///
+    /// The plan is built by hand with edits in **two files**, so a walk that
+    /// visited only the first entry of `by_file` fails here.
+    #[test]
+    fn the_census_walks_every_file_of_a_plan() {
+        use super::super::plan::{Edit, FileKey, Justification as J, Plan};
+        let edit = |j: J| Edit {
+            lo: 0,
+            hi: 1,
+            replacement: String::new(),
+            justification: j,
+            owner_fn: String::new(),
+        };
+        let mut plan = Plan::default();
+        plan.by_file.insert(
+            FileKey::Virtual("a.rs".to_owned()),
+            vec![
+                edit(J::KindDecision { kind: "Ref" }),
+                edit(J::SeamAdapter { family: "safe" }),
+            ],
+        );
+        plan.by_file.insert(
+            FileKey::Virtual("b.rs".to_owned()),
+            vec![
+                edit(J::KindDecision { kind: "Ref(mut)" }),
+                edit(J::DropForm {
+                    selector_site: "s".to_owned(),
+                }),
+            ],
+        );
+
+        let c = JustificationCensus::of_plan(&plan);
+        assert_eq!(
+            c,
+            JustificationCensus {
+                kind_decision: 2,
+                seam_adapter: 1,
+                reroute: 0,
+                drop_form: 1,
+                store_form: 0,
+            },
+            "the walk must reach EVERY file — the second file's edits are the \
+             half a first-entry-only walk would miss"
+        );
+        assert_eq!(c.total(), 4, "and the denominator counts them all");
+
+        // Non-vacuity: an empty plan really does census to nothing, so the
+        // assertion above is about the walk rather than about the default.
+        assert_eq!(
+            JustificationCensus::of_plan(&Plan::default()),
+            JustificationCensus::default()
+        );
     }
 
     /// **EVERY SPAN THIS LAYER MANUFACTURES IS `DUMMY_SP` — types included.**
