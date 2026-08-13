@@ -969,6 +969,77 @@ mod arm2_witnesses {
         });
     }
 
+    /// **The whitespace discriminator must be able to SAY NO.**
+    ///
+    /// `ws_real` is what carries arm 2's parity claim: the corpus reports 176
+    /// differing use-position pairs and `ws_real = 0`, and that zero is only
+    /// worth anything if the split can land on the other side. Both classes are
+    /// exercised here in one call, so a discriminator that answered
+    /// "whitespace" unconditionally — the shape that would quietly convert a
+    /// real parity diff into a formatting note — fails on `ws_real`.
+    ///
+    /// **Why whitespace-stripping is the right test and not a lazy one:** the
+    /// hazard at a use position is the printer adding or dropping parentheses
+    /// and changing precedence. Parentheses are not whitespace, so that hazard
+    /// lands in `ws_real` by construction — which is exactly what the second
+    /// pair below stands for.
+    ///
+    /// *Mutation-tested:* making the strip comparison unconditional
+    /// (`d.ws_equal += 1` with no branch) fails on `ws_real`; removing the
+    /// position split fails on `differing_use`.
+    #[test]
+    fn the_whitespace_split_separates_formatting_from_a_real_difference() {
+        let by_offset: FxHashMap<u32, String> = [
+            // Formatting only — the span layer's verbatim source copy wrapped
+            // across a line, which is the corpus's actual 176.
+            (
+                1u32,
+                "data[(pos.wrapping_add(0 as\n     libc::c_int)) as usize]".to_owned(),
+            ),
+            // A REAL difference: one parenthesis fewer, so the precedence
+            // differs. Not whitespace, and it must not be absorbed as such.
+            (
+                2u32,
+                "data[pos.wrapping_add(0 as libc::c_int) as usize]".to_owned(),
+            ),
+        ]
+        .into_iter()
+        .collect();
+        let renders = vec![
+            (
+                1u32,
+                "data[(pos.wrapping_add(0 as libc::c_int)) as usize]".to_owned(),
+            ),
+            (
+                2u32,
+                "data[(pos.wrapping_add(0 as libc::c_int)) as usize]".to_owned(),
+            ),
+        ];
+
+        let mut d = TextDiff::default();
+        let (compared, equal, differing, unmatched) =
+            compare_renders(&renders, &by_offset, "use", &mut d);
+
+        assert_eq!((compared, equal, differing, unmatched), (2, 0, 2, 0));
+        assert_eq!(d.ws_equal, 1, "the line-wrapped pair is formatting");
+        assert_eq!(
+            d.ws_real, 1,
+            "the pair differing by a PARENTHESIS is a real difference and must \
+             not be absorbed as whitespace — this is the assertion that makes \
+             the corpus's `ws_real = 0` mean anything"
+        );
+        assert_eq!(d.differing_use, 2);
+        assert_eq!(
+            d.differing_decl, 0,
+            "position must be recorded, not assumed"
+        );
+        assert_eq!(
+            d.pairs.len(),
+            2,
+            "every differing pair goes to the artifact"
+        );
+    }
+
     /// **The `(lo, hi)` key is load-bearing, and this is what it prevents.**
     ///
     /// `p.offset(1)` and `p.offset(1) as usize` share a START offset and differ
