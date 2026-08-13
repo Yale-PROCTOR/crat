@@ -1297,6 +1297,70 @@ mod arm2_witnesses {
         });
     }
 
+    /// **A declaration the pass cannot transform does NOT take the node.**
+    ///
+    /// The ordering repair's witness, added because the repair SURVIVED
+    /// mutation without one: deleting the shape check left the whole suite
+    /// green, since `not_a_pointer_decl` is corpus-zero and no test reached the
+    /// branch. An unwitnessed guarded branch is not a fix, it is a claim.
+    ///
+    /// The injection is data-level, exactly as `plan`'s missing-pointee arm
+    /// does it: the shipping decision layer degrades every non-pointer
+    /// declaration shape, so no input program can reach this. Handing the
+    /// visitor a decision table it could not have produced is the whole seam.
+    ///
+    /// *Mutation-tested:* removing the `matches!(ty.kind, TyKind::Ptr(_))`
+    /// check makes this panic on the `unreachable!` below it; moving the check
+    /// back after `guard.claim` fails the ownership assertion.
+    #[test]
+    fn a_declaration_the_pass_cannot_transform_does_not_claim_its_node() {
+        rustc_span::create_default_session_globals_then(|| {
+            // A decided subject whose declaration is NOT a syntactic pointer.
+            let mut krate = ::utils::ast::parse_crate("fn f(p: u32) {}".to_owned());
+            let (item_id, pat_id, ty_id) = {
+                let item = &krate.items[0];
+                let rustc_ast::ItemKind::Fn(f) = &item.kind else { panic!("fixture is a fn") };
+                let param = &f.sig.decl.inputs[0];
+                (item.id, param.pat.id, param.ty.id)
+            };
+
+            let mut local_map = rustc_ast::node_id::NodeMap::default();
+            local_map.insert(pat_id, rustc_hir::CRATE_HIR_ID);
+            let mut global_map = rustc_ast::node_id::NodeMap::default();
+            global_map.insert(item_id, rustc_hir::def_id::CRATE_DEF_ID);
+            let mut decisions = FxHashMap::default();
+            decisions.insert(
+                (rustc_hir::def_id::CRATE_DEF_ID, rustc_hir::CRATE_HIR_ID),
+                (DeclForm::Ref, true),
+            );
+
+            let mut guard = Composition::default();
+            let mut v = RefDeclVisitor {
+                local_map: &local_map,
+                decisions: &decisions,
+                global_map: &global_map,
+                current_fn: None,
+                guard: &mut guard,
+                stats: RefDeclStats::default(),
+            };
+            v.visit_crate(&mut krate);
+            let stats = v.stats;
+
+            assert_eq!(
+                stats.not_a_pointer_decl, 1,
+                "the subject must be reached and counted"
+            );
+            assert_eq!(stats.rewritten, 0, "and must not be transformed");
+            assert!(
+                guard.claim(ty_id, "someone-else"),
+                "THE POINT: the node must still be UNCLAIMED. Claiming before \
+                 the shape check meant a declaration this pass cannot transform \
+                 still owned its node, so a later transform that legitimately \
+                 wanted it would be refused on behalf of work that never happened"
+            );
+        });
+    }
+
     /// **The DECL position of the whitespace split — the positive-control
     /// mirror.**
     ///
