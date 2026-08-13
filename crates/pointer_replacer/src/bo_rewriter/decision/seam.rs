@@ -1059,6 +1059,79 @@ mod tests {
         assert_eq!(g(Ref { mutable: false }, Ref { mutable: true }), Ok(None));
     }
 
+    /// **THE CAST PEEL, at the side that decides it.**
+    ///
+    /// [`text_span_of`] is the whole of the decision layer's answer to *which
+    /// subtree survives inside the adapter*, and getting it wrong is silent: the
+    /// span layer replaces the whole argument either way, so a `&mut *(q as *mut
+    /// u8)` would differ from the span layer's `&mut *q` only in the corpus
+    /// differential, and only if this corpus places a seam on a cast at all.
+    ///
+    /// Mutation M28 collapsed the two cast arms onto the argument span and the
+    /// entire suite stayed green — because the mapping lived inside a loop that
+    /// needs a `TyCtxt`, a call site and a decision map to run. Lifting it out
+    /// is what makes it witnessable.
+    ///
+    /// The `None` arms matter as much as the `Some` ones: a default of
+    /// `arg.span` for an unnameable operand would hand the AST layer a subtree
+    /// the replacement was never built from.
+    #[test]
+    fn the_replacement_text_comes_from_the_cast_operand_and_nowhere_else() {
+        rustc_span::create_default_session_globals_then(|| {
+            let whole = Span::with_root_ctxt(rustc_span::BytePos(100), rustc_span::BytePos(120));
+            let operand = Span::with_root_ctxt(rustc_span::BytePos(100), rustc_span::BytePos(101));
+            let hir = HirId::INVALID;
+
+            // The shapes that read their OWN span.
+            assert_eq!(text_span_of(ArgShape::BareLocal(hir), whole), Some(whole));
+            assert_eq!(
+                text_span_of(
+                    ArgShape::AddrOf {
+                        mutable: true,
+                        base: None,
+                        through_deref: false
+                    },
+                    whole
+                ),
+                Some(whole)
+            );
+
+            // The two that read the cast's OPERAND, which is strictly inside.
+            assert_eq!(
+                text_span_of(
+                    ArgShape::AddrOfCast {
+                        mutable: true,
+                        inner: operand
+                    },
+                    whole
+                ),
+                Some(operand),
+                "the replacement is built from the operand's snippet, so the \
+                 operand is the subtree that must survive"
+            );
+            assert_eq!(
+                text_span_of(
+                    ArgShape::CastOfLocal {
+                        binding: hir,
+                        inner: operand
+                    },
+                    whole
+                ),
+                Some(operand)
+            );
+            assert_ne!(
+                operand, whole,
+                "the assertions above only mean anything if the two spans differ"
+            );
+
+            // And the shapes with no nameable operand answer NOTHING rather
+            // than defaulting.
+            assert_eq!(text_span_of(ArgShape::NullLit, whole), None);
+            assert_eq!(text_span_of(ArgShape::Cast { inner: operand }, whole), None);
+            assert_eq!(text_span_of(ArgShape::Other, whole), None);
+        });
+    }
+
     /// **THE RETIRED CLASSIFIER, kept as this test's oracle.**
     ///
     /// A verbatim transcription of the ten prefix tests `seam_tsv` ran over
@@ -1348,13 +1421,12 @@ pub(crate) fn synthesize(
                 // out of this match rather than reconstructed below, because
                 // the two cast shapes read the OPERAND's snippet while every
                 // other shape reads the argument's own.
-                let (found, text, text_span, blind) = match arg.shape {
+                let (found, text, blind) = match arg.shape {
                     ArgShape::BareLocal(hir) => (
                         decision_of
                             .get(&(site.caller, hir))
                             .map_or(Form::Raw, |d| form_of(d)),
                         sm.span_to_snippet(arg.span).ok(),
-                        arg.span,
                         false,
                     ),
                     ArgShape::AddrOf {
@@ -1375,22 +1447,17 @@ pub(crate) fn synthesize(
                         (
                             Form::Ref { mutable },
                             sm.span_to_snippet(arg.span).ok(),
-                            arg.span,
                             blind,
                         )
                     }
-                    ArgShape::AddrOfCast { mutable, inner } => (
-                        Form::Ref { mutable },
-                        sm.span_to_snippet(inner).ok(),
-                        inner,
-                        true,
-                    ),
+                    ArgShape::AddrOfCast { mutable, inner } => {
+                        (Form::Ref { mutable }, sm.span_to_snippet(inner).ok(), true)
+                    }
                     ArgShape::CastOfLocal { binding, inner } => (
                         decision_of
                             .get(&(site.caller, binding))
                             .map_or(Form::Raw, |d| form_of(d)),
                         sm.span_to_snippet(inner).ok(),
-                        inner,
                         false,
                     ),
                     // Not an expression this slice can name.
@@ -1403,6 +1470,22 @@ pub(crate) fn synthesize(
                         ));
                         continue;
                     }
+                };
+                // The two reads are kept in step by CONSTRUCTION: `text` is
+                // the snippet of exactly this span, so a shape whose operand
+                // moves moves both or neither.
+                let Some(text_span) = text_span_of(arg.shape, arg.span) else {
+                    // Unreachable — the shapes with no nameable operand are
+                    // blocked above. Fail-closed rather than defaulting to
+                    // `arg.span`, which would hand the AST layer a subtree the
+                    // replacement was not built from.
+                    plan.blocked.push((
+                        site.caller,
+                        *callee,
+                        arg.span,
+                        SeamBlock::UnnameableOperand,
+                    ));
+                    continue;
                 };
                 positions.push(Pos {
                     span: arg.span,
@@ -1538,6 +1621,29 @@ pub(crate) fn synthesize(
         }
     }
     plan
+}
+
+/// **Where an argument's REPLACEMENT TEXT is read from**, which is not always
+/// the argument's own span.
+///
+/// The two cast shapes build from the cast's OPERAND while the replaced range
+/// stays the whole argument, so the surviving subtree is nested one level inside
+/// the node the span layer overwrites. Everything else reads its own span.
+///
+/// A free function rather than three lines inside the position loop, because
+/// that loop needs a `TyCtxt`, a call site and a decision map to run at all —
+/// and a mapping that only a corpus sweep can exercise is a mapping with no
+/// witness. Mutation M28 collapsed it onto `arg.span` and the entire suite
+/// stayed green.
+///
+/// `None` for the shapes that carry no nameable operand; those positions are
+/// already blocked as `UnnameableOperand` before any text is read.
+fn text_span_of(shape: ArgShape, arg_span: Span) -> Option<Span> {
+    match shape {
+        ArgShape::BareLocal(_) | ArgShape::AddrOf { .. } => Some(arg_span),
+        ArgShape::AddrOfCast { inner, .. } | ArgShape::CastOfLocal { inner, .. } => Some(inner),
+        ArgShape::NullLit | ArgShape::Cast { .. } | ArgShape::Other => None,
+    }
 }
 
 /// **Ruling item 4a — is there a companion length in the callee's signature?**

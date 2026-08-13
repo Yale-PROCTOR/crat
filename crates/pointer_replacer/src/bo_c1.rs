@@ -10064,6 +10064,54 @@ fn every_arm_gate_failure_class_actually_fails() {
             .any(|f| f.contains("kd_edits") && f.contains("kd_offsets")),
         "kd_edits != kd_offsets must fail and name BOTH sides: {failures:?}"
     );
+
+    // 5. The SAME lossy join on arm 3's own population. A separate case
+    //    because `kd_*` and `sa_*` are different justifications: folded into
+    //    one pair, a surplus on either side would mask a shortfall on the
+    //    other. Mutation M36 disabled this check and the whole suite stayed
+    //    green — a gate with no negative control is the arm-2 review's finding,
+    //    and it recurred inside the boundary that repaired it.
+    let mut row = conforming_arm_row();
+    row.set("sa_offsets", "420");
+    let failures = arm_parity_failures("avl", &row);
+    assert!(
+        failures
+            .iter()
+            .any(|f| f.contains("sa_edits") && f.contains("sa_offsets")),
+        "sa_edits != sa_offsets must fail and name BOTH sides: {failures:?}"
+    );
+
+    // 6. The family split must ADD UP. Without this the two family counters
+    //    are telemetry: a lost or double-counted placement moves one of them
+    //    and no gate reads either. Both directions are injected, because a
+    //    check written as `>=` or `<=` would pass one of them.
+    for (safe, reborrow) in [("106", "314"), ("108", "314")] {
+        let mut row = conforming_arm_row();
+        row.set("arm3_safe", safe);
+        row.set("arm3_reborrow", reborrow);
+        let failures = arm_parity_failures("avl", &row);
+        assert!(
+            failures
+                .iter()
+                .any(|f| f.contains("arm3_safe") && f.contains("arm3_seam_rendered")),
+            "safe={safe} + reborrow={reborrow} != rendered must fail: {failures:?}"
+        );
+    }
+
+    // 7. And each of the three keys in that identity is fail-closed on
+    //    absence, exactly as the zero-invariants are — a family split that
+    //    goes missing must not read as a satisfied identity.
+    for key in ["arm3_seam_rendered", "arm3_safe", "arm3_reborrow"] {
+        let mut row = conforming_arm_row();
+        row.0.retain(|(k, _)| k != key);
+        let failures = arm_parity_failures("avl", &row);
+        assert!(
+            failures
+                .iter()
+                .any(|f| f.contains(key) && f.contains("MISSING")),
+            "an ABSENT {key} must fail the family identity: {failures:?}"
+        );
+    }
 }
 
 #[test]

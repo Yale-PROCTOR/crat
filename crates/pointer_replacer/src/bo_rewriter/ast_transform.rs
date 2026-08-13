@@ -959,6 +959,67 @@ mod tests {
         assert!(g.claim(NodeId::from_u32(2), "use"));
         assert!(g.refused.is_empty(), "distinct nodes must not be refused");
     }
+
+    /// **A difference is booked to the arm that produced it.**
+    ///
+    /// [`compare_renders`] is shared by three arms and buckets on a position
+    /// label. Until arm 3 that `match` ended in `_ => differing_use`, so every
+    /// seam difference would have been reported as an arm-2 *use* difference —
+    /// a published line — and attributed to a pass that never ran at that
+    /// offset. Mutation M34 restored the fold and the whole suite stayed green,
+    /// because nothing exercised the buckets directly.
+    ///
+    /// The whitespace split is asserted at the same time: `ws_real` carries the
+    /// parity claim for all three arms jointly (the arm-2 review's finding 9,
+    /// recorded as deliberate), and `ws_real_seam` is arm 3's share of it. A
+    /// difference that is only reformatting must land in `ws_equal` and leave
+    /// both real counters alone.
+    #[test]
+    fn a_differing_render_is_booked_to_the_arm_that_produced_it() {
+        let by_offset: FxHashMap<u32, String> = [
+            (10, "&mut *p".to_owned()),
+            (20, "&mut *p".to_owned()),
+            (30, "&mut * p".to_owned()),
+        ]
+        .into_iter()
+        .collect();
+        let mut d = TextDiff::default();
+
+        compare_renders(&[(10, "&x[0]".to_owned())], &by_offset, "seam", &mut d);
+        assert_eq!(d.differing_seam, 1, "a seam difference is arm 3's");
+        assert_eq!(
+            d.differing_use, 0,
+            "and must NOT be attributed to the use pass, which never ran here"
+        );
+        assert_eq!(d.differing_decl, 0);
+        assert_eq!(d.ws_real, 1, "the joint parity line sees it");
+        assert_eq!(d.ws_real_seam, 1, "and so does arm 3's own share");
+
+        // A use difference at another offset lands in the other bucket.
+        compare_renders(&[(20, "p[1]".to_owned())], &by_offset, "use", &mut d);
+        assert_eq!(d.differing_use, 1);
+        assert_eq!(d.differing_seam, 1, "unchanged by the use pass");
+        assert_eq!(d.ws_real_seam, 1, "and arm 3's share does not move either");
+
+        // Reformatting only: `ws_equal`, and neither real counter moves.
+        compare_renders(&[(30, "&mut *p".to_owned())], &by_offset, "seam", &mut d);
+        assert_eq!(d.ws_equal, 1);
+        assert_eq!(d.ws_real, 2, "still only the two genuine differences");
+        assert_eq!(d.ws_real_seam, 1);
+    }
+
+    /// A label no arm owns is a PANIC, not a silent bucket.
+    ///
+    /// The positive control for the test above: it shows the exhaustive `match`
+    /// rejects rather than absorbs, so a fourth arm cannot inherit a third's
+    /// counter the way arm 3 would have inherited arm 2's.
+    #[test]
+    #[should_panic(expected = "unknown differential position")]
+    fn an_unnamed_position_cannot_borrow_another_arms_bucket() {
+        let by_offset: FxHashMap<u32, String> = [(10, "a".to_owned())].into_iter().collect();
+        let mut d = TextDiff::default();
+        compare_renders(&[(10, "b".to_owned())], &by_offset, "arm4", &mut d);
+    }
 }
 
 /// **ARM 1's POPULATION DIFFERENTIAL.** Does the tree walk reach exactly the
