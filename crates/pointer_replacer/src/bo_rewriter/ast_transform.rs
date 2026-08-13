@@ -760,6 +760,34 @@ pub(crate) struct SeamTarget {
     pub reborrow: bool,
 }
 
+impl SeamTarget {
+    /// Project one [`SeamEdit`] onto what the walk needs.
+    ///
+    /// A named function rather than three lines inside the map-building loop,
+    /// for the reason `text_span_of` is one: that loop needs a `TyCtxt` and a
+    /// decision table to run, so the projection could only be exercised by a
+    /// corpus sweep — and mutation M40 (making `reborrow` uniformly `false`)
+    /// left the whole suite green while the sweep's 107/314 split would have
+    /// collapsed to 421/0. **A mapping only a corpus sweep can exercise is a
+    /// mapping with no witness**, which this boundary has now learned twice.
+    ///
+    /// The family match is EXHAUSTIVE, not `matches!`: a third family would
+    /// silently become `safe`, and `safe` is the column meaning
+    /// "compiler-checked end to end" — so the default a `matches!` picks is the
+    /// flattering one.
+    fn of(edit: &super::decision::seam::SeamEdit) -> Self {
+        use super::decision::seam::SeamFamily;
+        Self {
+            spec: edit.spec.clone(),
+            arg_span: edit.arg_span,
+            reborrow: match edit.family {
+                SeamFamily::Reborrow => true,
+                SeamFamily::Safe => false,
+            },
+        }
+    }
+}
+
 impl<'a> SeamGraftVisitor<'a> {
     pub(crate) fn new(
         seams: &'a FxHashMap<(u32, u32), SeamTarget>,
@@ -1176,22 +1204,7 @@ fn transform_inner(
         // Same reasoning as `use_key_collisions`: a map is a join, and a join
         // without a collision counter agrees with itself while being short.
         if seam_targets
-            .insert(
-                (edit.span.lo().0, edit.span.hi().0),
-                SeamTarget {
-                    spec: edit.spec.clone(),
-                    arg_span: edit.arg_span,
-                    // EXHAUSTIVE rather than `matches!`. A third family would
-                    // silently become `safe` here — and `safe` is the column
-                    // meaning "compiler-checked end to end", so the default a
-                    // `matches!` picks is the FLATTERING one. Every other shape
-                    // mapping in this change is exhaustive; this one was not.
-                    reborrow: match edit.family {
-                        super::decision::seam::SeamFamily::Reborrow => true,
-                        super::decision::seam::SeamFamily::Safe => false,
-                    },
-                },
-            )
+            .insert((edit.span.lo().0, edit.span.hi().0), SeamTarget::of(edit))
             .is_some()
         {
             seam_key_collisions += 1;
@@ -2568,6 +2581,37 @@ mod arm2_witnesses {
         });
     }
 
+    /// **The family survives the projection into the walk, BOTH ways.**
+    ///
+    /// The corpus split (safe 107 / reborrow 314) is the only thing that was
+    /// checking this, and only a sweep produces it: mutation M40 made
+    /// `reborrow` uniformly `false` and the whole suite stayed green. Both
+    /// directions are asserted, because a projection stuck on either constant
+    /// passes a one-sided test.
+    #[test]
+    fn the_seam_family_survives_the_projection_in_both_directions() {
+        rustc_span::create_default_session_globals_then(|| {
+            let edit = |family| super::super::decision::seam::SeamEdit {
+                span: DUMMY_SP,
+                replacement: String::new(),
+                owner_fn: String::new(),
+                family,
+                len_arm: None,
+                spec: GlueSpec::core(GlueCore::Reborrow, true),
+                arg_span: DUMMY_SP,
+            };
+            assert!(
+                SeamTarget::of(&edit(super::super::decision::seam::SeamFamily::Reborrow)).reborrow,
+                "a reborrow adapter must stay countable as one — it is the \
+                 population carrying the aliasing exposure"
+            );
+            assert!(
+                !SeamTarget::of(&edit(super::super::decision::seam::SeamFamily::Safe)).reborrow,
+                "and a safe one must not be inflated into it"
+            );
+        });
+    }
+
     /// **An `arg_span` the matched node does not contain declines, and is
     /// counted as NOT-FOUND rather than as a peel.**
     ///
@@ -2710,6 +2754,18 @@ mod arm2_witnesses {
             );
             assert_eq!(stats.unsupported, 0, "not confused with an unbuilt shape");
             assert!(text.contains("g(p)"), "{text}");
+            // **The identity's denominator.** `len_shapes` is what turns
+            // `len_grafted` from telemetry into a gated ledger; mutation M39
+            // stopped it incrementing and only the corpus would have noticed.
+            assert_eq!(
+                stats.len_shapes, 1,
+                "a length-bearing shape reached the step"
+            );
+            assert_eq!(
+                stats.len_grafted + stats.len_parse_failed + stats.len_absent,
+                stats.len_shapes,
+                "and exactly one outcome followed it"
+            );
 
             // And a `{len}` that does not round-trip is a typed row too, per
             // R7.4 — never an abort, which is what a bare `parse_expr` would do.
@@ -2722,6 +2778,19 @@ mod arm2_witnesses {
                 1,
                 "the offending template must be ATTACHED, not just tallied"
             );
+            assert_eq!(
+                stats.len_grafted + stats.len_parse_failed + stats.len_absent,
+                stats.len_shapes,
+                "the identity holds on the parse-failure branch too"
+            );
+
+            // ...and on the SUCCESS branch, which is the one the corpus's 277
+            // actually travels.
+            let ok = GlueSpec::core(GlueCore::FromRawParts, false).with_len("n");
+            let (_, stats) = seam_over(src, &[(arg, arg, ok, true)]);
+            assert_eq!(stats.len_grafted, 1);
+            assert_eq!(stats.len_shapes, 1);
+            assert_eq!(stats.len_absent + stats.len_parse_failed, 0);
         });
     }
 
