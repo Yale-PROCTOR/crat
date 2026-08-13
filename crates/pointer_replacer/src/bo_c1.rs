@@ -7022,6 +7022,7 @@ mod run {
                 row.set("arm2_refused", gr.refused.to_string());
                 row.set("arm2_multi_matched", gr.multi_matched.to_string());
                 row.set("decl_inside_use", d.decl_render_inside_use_edit.to_string());
+                row.set("use_key_collisions", d.use_key_collisions.to_string());
                 row.set("arm2_compared", d.arm2_compared.to_string());
                 row.set("arm2_equal", d.arm2_equal.to_string());
                 row.set("arm2_differing", d.arm2_differing.to_string());
@@ -9742,6 +9743,16 @@ fn m1_use_census_corpus() {
 /// with whitespace removed. Gating `arm2_differing` would fail a conforming
 /// corpus; gating nothing would let a real difference through.
 ///
+/// ⚠ **`arm1_refused` and `arm2_refused` are REGRESSION PINS, not
+/// measurements** (adversarial review, arm-2 boundary). Through arms 1-2 no
+/// walk can violate them: the declaration pass claims `Ty` nodes and the use
+/// pass claims `Expr` nodes, and `refuse_nested_use_edits` has already made the
+/// surviving use spans pairwise disjoint. Their zero is STRUCTURAL, so gating
+/// them proves nothing today — it pins the structure so arm 3 cannot quietly
+/// change it. Arm 3 is where they become live: a seam edit targets a
+/// call-argument EXPRESSION, the same syntactic category the use pass claims,
+/// so `seam` vs `use` is the first pair that can collide on one node.
+///
 /// `arm1_unmatched_span` is absent for a different reason: it reads 2,039 by
 /// construction (arm 1's renders alone, kept computable so its pin survives).
 /// `kd_unmatched_span` is the conservation bound and IS gated.
@@ -9755,6 +9766,7 @@ const ARM_ZERO_INVARIANTS: &[&str] = &[
     "arm2_refused",
     "arm2_multi_matched",
     "decl_inside_use",
+    "use_key_collisions",
     "arm2_unmatched_ast",
     "arm2_ws_real",
     "kd_unmatched_span",

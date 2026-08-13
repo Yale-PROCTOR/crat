@@ -284,6 +284,15 @@ impl RefDeclVisitor<'_> {
         let Some(&(form, mutable)) = self.decisions.get(&(fn_did, *hir_id)) else {
             return;
         };
+        // **The shape check runs BEFORE the claim** (arm-2 review). Claiming
+        // first meant a declaration this pass cannot transform still took
+        // OWNERSHIP of the node, so a later transform that legitimately wanted
+        // it would be refused on behalf of work that never happened. Ownership
+        // now follows the transform rather than the attempt.
+        if !matches!(ty.kind, TyKind::Ptr(_)) {
+            self.stats.not_a_pointer_decl += 1;
+            return;
+        }
         let claimant = match form {
             DeclForm::Ref => "decl:ref",
             DeclForm::Slice => "decl:slice",
@@ -297,8 +306,7 @@ impl RefDeclVisitor<'_> {
         // `mut_ty.ty` is the same subtree, reattached under a reference — and
         // under a `[…]` and an `Option<…>` too, for the forms that need them.
         let TyKind::Ptr(mut_ty) = &mut ty.kind else {
-            self.stats.not_a_pointer_decl += 1;
-            return;
+            unreachable!("shape checked immediately above")
         };
         let pointee = mut_ty.ty.clone();
         ty.kind = decl_ty_kind(form, mutable, pointee);
@@ -556,7 +564,7 @@ mod tests {
 /// is built.
 #[cfg(test)]
 pub(crate) fn arm1_population(tcx: rustc_middle::ty::TyCtxt<'_>) -> Result<RefDeclStats, String> {
-    transform_inner(tcx).map(|(decls, _, _)| decls)
+    transform_inner(tcx).map(|(decls, ..)| decls)
 }
 
 /// Both passes over ONE capture, sharing ONE composition guard.
@@ -587,7 +595,7 @@ pub(crate) fn arm1_population(tcx: rustc_middle::ty::TyCtxt<'_>) -> Result<RefDe
 #[cfg(test)]
 fn transform_inner(
     tcx: rustc_middle::ty::TyCtxt<'_>,
-) -> Result<(RefDeclStats, UseGraftStats, usize), String> {
+) -> Result<(RefDeclStats, UseGraftStats, usize, usize), String> {
     let captured = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let mut krate = ::utils::ast::expanded_ast(tcx);
         let map = ::utils::ast::make_ast_to_hir(&mut krate, tcx);
@@ -598,6 +606,7 @@ fn transform_inner(
     let (table, _ctx) = super::decide_table_with_ctx(tcx)?;
     let mut decisions: FxHashMap<(LocalDefId, HirId), (DeclForm, bool)> = FxHashMap::default();
     let mut uses: FxHashMap<(u32, u32), String> = FxHashMap::default();
+    let mut use_key_collisions = 0usize;
     for (subject, decision) in &table.entries {
         // EXHAUSTIVE — the denylist rejects the bypass shape, and the arm's
         // population is defined by which disposition was reached.
@@ -615,7 +624,18 @@ fn transform_inner(
         };
         decisions.insert((subject.fn_did, subject.hir_id), (form, mutable));
         for u in use_edits.into_iter().flatten() {
-            uses.insert((u.span.lo().0, u.span.hi().0), u.replacement.clone());
+            // A returned `Some` means two use edits carried the SAME span and
+            // one was overwritten — the map would then hold fewer edits than
+            // the table does, and every downstream count would agree with
+            // itself while being short. `refuse_nested_use_edits` should make
+            // this impossible (identical spans contain each other), but that is
+            // an argument about another module, and this is a counter.
+            if uses
+                .insert((u.span.lo().0, u.span.hi().0), u.replacement.clone())
+                .is_some()
+            {
+                use_key_collisions += 1;
+            }
         }
     }
 
@@ -657,9 +677,13 @@ fn transform_inner(
         .rendered
         .iter()
         .chain(decls.rendered_arm2.iter())
-        .filter(|(off, _)| uses.keys().any(|(lo, hi)| *off > *lo && *off < *hi))
+        // HALF-OPEN, matching the range it models. This read `*off > *lo`,
+        // which missed a declaration render starting exactly at a use edit's
+        // first byte — the containment case most likely to occur, since a use
+        // edit and a declaration inside it can share a start.
+        .filter(|(off, _)| uses.keys().any(|(lo, hi)| *off >= *lo && *off < *hi))
         .count();
-    Ok((decls, grafts, decl_inside_use))
+    Ok((decls, grafts, decl_inside_use, use_key_collisions))
 }
 
 /// **ARM 1's TEXT DIFFERENTIAL** — the rendered declaration vs the span layer's
@@ -708,6 +732,10 @@ pub(crate) struct TextDiff {
     /// silently, and in the direction that flatters the bound.
     pub kd_edits: usize,
     pub kd_offsets: usize,
+    /// **Two use edits carrying one span**, one of which was overwritten when
+    /// the map was built. Corpus expectation 0, GATED — the collision counter
+    /// this join was missing while every other join in the file had one.
+    pub use_key_collisions: usize,
     /// **A declaration render whose offset lies strictly inside a use edit's
     /// range** — the containment case the two-pass split does not remove.
     /// Corpus expectation 0, GATED. See `transform_inner`'s doc.
@@ -822,7 +850,7 @@ fn compare_renders(
 pub(crate) fn arms_full(
     tcx: rustc_middle::ty::TyCtxt<'_>,
 ) -> Result<(RefDeclStats, UseGraftStats, TextDiff), String> {
-    let (decls, grafts, decl_inside_use) = transform_inner(tcx)?;
+    let (decls, grafts, decl_inside_use, use_key_collisions) = transform_inner(tcx)?;
     let (table, _ctx) = super::decide_table_with_ctx(tcx)?;
     let emission = super::emit_files(tcx, &table, &rustc_hash::FxHashSet::default())?;
 
@@ -891,6 +919,7 @@ pub(crate) fn arms_full(
         .collect();
     d.kd_unmatched_span = by_offset.keys().filter(|o| !both.contains(o)).count();
     d.decl_render_inside_use_edit = decl_inside_use;
+    d.use_key_collisions = use_key_collisions;
     Ok((decls, grafts, d))
 }
 
@@ -917,10 +946,30 @@ pub(crate) fn arms_full(
 /// is one shared session, which is exactly the `SourceMap` dedupe that made
 /// every parse after the first return fragment #1's source (I2).
 pub(crate) fn graft_expr(text: &str) -> Result<rustc_ast::Expr, String> {
-    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+    let parsed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         ::utils::ast::parse_expr(text.to_owned())
     }))
-    .map_err(|_| text.to_owned())
+    .map_err(|_| text.to_owned())?;
+    // **FULL CONSUMPTION, and it is not belt-and-braces** (adversarial review,
+    // arm-2 boundary). `utils::ast::parse_expr` calls `parser.parse_expr()` and
+    // never requires EOF, so a replacement whose PREFIX is a valid expression
+    // parses happily and the remainder is discarded: `"p[0] trailing"` becomes
+    // `p[0]`. That is not a parse failure and was not counted as one — it is a
+    // WRONG GRAFT reported as a success, which is the failure mode this
+    // milestone treats as the expensive one.
+    //
+    // The check is a whitespace-insensitive round trip, for the same reason the
+    // corpus differential uses one: the printer reformats, and only reformatting
+    // is licensed. A dropped tail changes non-whitespace, so it fails here.
+    // Corpus-safe by MEASUREMENT rather than argument — all 1,699 use
+    // replacements already round-trip within whitespace, which is precisely
+    // what `ws_real = 0` says.
+    let printed = rustc_ast_pretty::pprust::expr_to_string(&parsed);
+    let strip = |s: &str| -> String { s.chars().filter(|c| !c.is_whitespace()).collect() };
+    if strip(&printed) != strip(text) {
+        return Err(text.to_owned());
+    }
+    Ok(parsed)
 }
 
 #[cfg(test)]
@@ -1595,6 +1644,39 @@ mod template_witnesses {
                  aborts the run rather than producing a row"
                 );
             }
+        });
+    }
+
+    /// **A replacement whose PREFIX parses is refused, not silently truncated.**
+    ///
+    /// Named by the adversarial review at the arm-2 boundary.
+    /// `utils::ast::parse_expr` never requires EOF, so before the
+    /// full-consumption check `graft_expr("p[0] trailing")` returned
+    /// `Ok(p[0])` — a wrong graft counted as a success, and invisible to
+    /// `parse_failed`.
+    ///
+    /// The second case is the control that keeps the check honest: a
+    /// replacement differing from its printed form only in WHITESPACE must
+    /// still be accepted, because that is the corpus's ordinary shape (1,699
+    /// of them) and a stricter test would refuse the whole arm.
+    ///
+    /// *Mutation-tested:* deleting the `strip(&printed) != strip(text)` guard
+    /// makes the first assertion fail.
+    #[test]
+    fn a_replacement_with_a_trailing_tail_is_refused() {
+        rustc_span::create_default_session_globals_then(|| {
+            assert_eq!(
+                graft_expr("p[0] trailing").unwrap_err(),
+                "p[0] trailing",
+                "a prefix-parse must be REFUSED and must carry its text — \
+                 `parse_expr` stops at the first complete expression and drops \
+                 the rest, which is a wrong graft, not a parse failure"
+            );
+            assert!(
+                graft_expr("data[(pos.wrapping_add(0 as libc::c_int)) as usize]").is_ok(),
+                "a replacement that round-trips within whitespace must still be \
+                 accepted — this is the corpus's ordinary shape"
+            );
         });
     }
 
