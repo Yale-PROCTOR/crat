@@ -10792,6 +10792,128 @@ fn the_transfer_refuses_a_capture_with_no_frame() {
 /// of corpus pointer params before S3 exists, so the emitted/degraded split here
 /// is "pre-S3 — measures S3's absence". Only the M1-final report after S3 feeds
 /// the emission-guided-refinement decision.
+/// **THE PHASE-3 EXIT GATE, fail-closed over one program's row.**
+///
+/// Extracted from the corpus loop so it has NEGATIVE CONTROLS. Inline it had
+/// none — the arm-2 review's finding (a check no test can fail) and R8's
+/// lesson in a second dress: logic only a corpus sweep can exercise is logic
+/// with no witness.
+///
+/// A MISSING key and an unparseable value are FAILURES, not skips: a declined
+/// worker presents as absence, and absence must never read as parity.
+fn p3_row_failures(program: &str, row: &report::Row) -> Vec<String> {
+    let mut out = Vec::new();
+    let num = |key: &str| -> Result<i64, String> {
+        match row.get(key) {
+            None => Err(format!(
+                "{program}: {key} MISSING — the phase-3 gate is fail-closed, and \
+                 an absent counter is not a passing one"
+            )),
+            Some(v) => v
+                .parse::<i64>()
+                .map_err(|_| format!("{program}: {key}={v:?} does not parse as a number")),
+        }
+    };
+    for key in [
+        "p3_differing",
+        "p3_ast_only",
+        "p3_span_only",
+        "p3_parse_failed",
+    ] {
+        match num(key) {
+            Ok(0) => {}
+            Ok(n) => out.push(format!(
+                "{program}: {key}={n}, expected 0 — STOP-class on this gate"
+            )),
+            Err(why) => out.push(why),
+        }
+    }
+    // Every compared function must have been EQUAL. Its own identity rather
+    // than an inference from `differing == 0`, so a function compared and
+    // counted in neither bucket cannot pass.
+    match (num("p3_compared"), num("p3_equal")) {
+        (Ok(c), Ok(e)) if c == e => {}
+        (Ok(c), Ok(e)) => out.push(format!(
+            "{program}: p3_compared={c} != p3_equal={e} — a compared function \
+             landed in no bucket"
+        )),
+        (Err(why), _) | (Ok(_), Err(why)) => out.push(why),
+    }
+    out
+}
+
+/// A row carrying values the phase-3 sweep ACTUALLY produced (R7 addendum:
+/// measured, never invented).
+///
+/// **libcsv deliberately** — 18 functions compared and **17 of them
+/// multi-arm** — so the control carries a genuinely composition-bearing
+/// program rather than a constructed one. Cited to the run at `969d3d81`.
+#[cfg(test)]
+fn conforming_p3_row() -> report::Row {
+    let mut row = report::Row::default();
+    row.set("p3", "ok");
+    row.set("p3_compared", "18");
+    row.set("p3_equal", "18");
+    row.set("p3_differing", "0");
+    row.set("p3_ast_only", "0");
+    row.set("p3_span_only", "0");
+    row.set("p3_parse_failed", "0");
+    row.set("p3_multi_arm", "17");
+    row
+}
+
+#[test]
+fn the_p3_gate_passes_the_shape_the_corpus_produces() {
+    let f = p3_row_failures("libcsv", &conforming_p3_row());
+    assert!(f.is_empty(), "must not fail libcsv's measured shape: {f:?}");
+}
+
+#[test]
+fn every_p3_failure_class_actually_fails() {
+    for key in [
+        "p3_differing",
+        "p3_ast_only",
+        "p3_span_only",
+        "p3_parse_failed",
+    ] {
+        let mut row = conforming_p3_row();
+        row.set(key, "1");
+        let f = p3_row_failures("libcsv", &row);
+        assert!(
+            f.iter().any(|m| m.contains(key)),
+            "{key}=1 must fail and NAME the key: {f:?}"
+        );
+    }
+    // Absence is a failure, not a skip — how a declined worker presents.
+    for key in [
+        "p3_differing",
+        "p3_ast_only",
+        "p3_span_only",
+        "p3_parse_failed",
+        "p3_compared",
+        "p3_equal",
+    ] {
+        let mut row = conforming_p3_row();
+        row.0.retain(|(k, _)| k != key);
+        let f = p3_row_failures("libcsv", &row);
+        assert!(
+            f.iter().any(|m| m.contains(key) && m.contains("MISSING")),
+            "an ABSENT {key} must fail: {f:?}"
+        );
+    }
+    // compared != equal, BOTH directions — a `>=` spelling passes one of them.
+    for equal in ["17", "19"] {
+        let mut row = conforming_p3_row();
+        row.set("p3_equal", equal);
+        let f = p3_row_failures("libcsv", &row);
+        assert!(
+            f.iter()
+                .any(|m| m.contains("p3_compared") && m.contains("p3_equal")),
+            "p3_equal={equal} must fail and name BOTH sides: {f:?}"
+        );
+    }
+}
+
 /// **THE PHASE-3 EXIT GATE — the corpus run.**
 ///
 /// The arms proved their edits SEVERALLY. This proves their COMPOSITION into
@@ -10862,27 +10984,10 @@ fn m1_p3_corpus() {
                 continue;
             }
         }
+        failures.extend(p3_row_failures(program.name, &row));
         let num = |k: &str| -> i64 { row.get(k).and_then(|v| v.parse().ok()).unwrap_or(-1) };
-        for key in [
-            "p3_differing",
-            "p3_ast_only",
-            "p3_span_only",
-            "p3_parse_failed",
-        ] {
-            match num(key) {
-                0 => {}
-                n => failures.push(format!(
-                    "{}: {key}={n}, expected 0 — STOP-class on this gate",
-                    program.name
-                )),
-            }
-        }
-        let (c, e) = (num("p3_compared"), num("p3_equal"));
-        if c != e {
-            failures.push(format!("{}: p3_compared={c} != p3_equal={e}", program.name));
-        }
-        compared += c.max(0) as u64;
-        equal += e.max(0) as u64;
+        compared += num("p3_compared").max(0) as u64;
+        equal += num("p3_equal").max(0) as u64;
         multi += num("p3_multi_arm").max(0) as u64;
         rev_subj += num("p3_reverted_subjects").max(0) as u64;
         println!("{}", report::to_kv_line(&row));
