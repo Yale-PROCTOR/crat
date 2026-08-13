@@ -1821,8 +1821,22 @@ pub(crate) fn phase3_fn_parity(
     let emission = super::emit_files(tcx, &table, &reverts.fns)?;
 
     let mut p = FnParity::default();
+    let mut span_touched: FxHashSet<u32> = FxHashSet::default();
+    let mut ast_touched: FxHashSet<u32> = FxHashSet::default();
     p.reverted_subjects = reverts.subjects;
     p.reverted_fns = reverts.fns.len();
+    // **F — the reconciliation denominator.** `compared == 0` is legal only
+    // where the ledger emitted nothing; anywhere else it is a gate failure.
+    // I1 at program granularity: a walk that measured nothing must not read as
+    // a walk that measured agreement.
+    p.emitted_subjects = table
+        .entries
+        .iter()
+        .filter(|(subj, d)| {
+            !matches!(d, super::decision::Decision::Degraded(_))
+                && reverts.keeps_subject(subj.fn_did)
+        })
+        .count();
 
     // ---- the AST side: the same three passes, with the SAME subjects held back ----
     let mut decisions: FxHashMap<(LocalDefId, HirId), (DeclForm, bool)> = FxHashMap::default();
@@ -1956,14 +1970,18 @@ pub(crate) fn phase3_fn_parity(
             continue;
         }
         p.compared += 1;
-        if mine
-            .iter()
-            .map(|(_, _, _, a)| *a)
-            .collect::<FxHashSet<_>>()
-            .len()
-            > 1
-        {
+        let arms: FxHashSet<&'static str> = mine.iter().map(|(_, _, _, a)| *a).collect();
+        if arms.len() > 1 {
             p.multi_arm += 1;
+        }
+        // **ALL THREE ARMS IN ONE BODY.** Pre-stated STRUCTURALLY ZERO on this
+        // corpus and reported anyway: no emitted-subject function owns both a
+        // surviving `Ref` subject and a surviving `Slice`/`Opt` one (31
+        // arm1-only + 30 arm2-only + 0 both, derived independently from the
+        // oracle), so `{arm1, arm2, arm3}` is unreachable here. Counted so that
+        // stops being an assumption.
+        if arms.len() >= 3 {
+            p.arm_set_3 += 1;
         }
         // Back-to-front, exactly as `apply` does: offsets address the ORIGINAL.
         mine.sort_by_key(|(lo, ..)| std::cmp::Reverse(*lo));
@@ -1978,6 +1996,7 @@ pub(crate) fn phase3_fn_parity(
             p.span_only += 1;
             continue;
         };
+        span_touched.insert(flo);
         match (canonical_item(&span_text), canonical_item(ast_text)) {
             (Some(a), Some(b)) if a == b => p.equal += 1,
             (Some(a), Some(b)) => {
@@ -1993,12 +2012,38 @@ pub(crate) fn phase3_fn_parity(
             _ => p.parse_failed += 1,
         }
     }
-    // A transformed function the span side never reached.
-    let span_los: FxHashSet<u32> = spans.iter().map(|s| s.lo().0).collect();
-    p.ast_only = printed
-        .iter()
-        .filter(|(sp, _)| !span_los.contains(&sp.lo().0))
-        .count();
+    // **CROSS-LAYER RESIDENCE, not one population against itself.**
+    //
+    // This read `printed` against `spans` — BOTH collected from the same
+    // transformed crate — so their span sets were equal by construction and
+    // `ast_only` could never fire. It was one of four STOP-class counters and
+    // it was structurally dead.
+    //
+    // The layers are now genuinely different populations:
+    //   - SPAN-touched: a function holding at least one surviving plan edit;
+    //   - AST-touched:  a function whose canonical form DIFFERS from its own
+    //     original's, i.e. one the node transforms actually changed.
+    //
+    // Canonical on both sides is what makes the second sound: `pprust` reprints
+    // every function, so raw text always differs, while an untouched function
+    // canonicalises to exactly its original's form.
+    for fsp in &spans {
+        let flo = fsp.lo().0;
+        let (Ok(orig), Some(ast_text)) = (sm.span_to_snippet(*fsp), ast_by_lo.get(&flo)) else {
+            continue;
+        };
+        match (canonical_item(&orig), canonical_item(ast_text)) {
+            (Some(a), Some(b)) if a != b => {
+                ast_touched.insert(flo);
+            }
+            (Some(_), Some(_)) => {}
+            // A side that will not canonicalise is already counted at the
+            // comparison; not double-counted here.
+            _ => {}
+        }
+    }
+    p.ast_only = ast_touched.difference(&span_touched).count();
+    p.span_only += span_touched.difference(&ast_touched).count();
     Ok(p)
 }
 
@@ -2025,6 +2070,11 @@ pub(crate) struct FnParity {
     /// nothing the per-arm differentials had not already proved, so this is the
     /// number that says whether the gate tested the thing it claims to.
     pub multi_arm: usize,
+    /// Functions in which ALL THREE arms meet.
+    pub arm_set_3: usize,
+    /// Subjects that survived the revert set — the per-program reconciliation
+    /// denominator.
+    pub emitted_subjects: usize,
     /// Subjects the revert set took back, so the ledger identity is checkable
     /// from this instrument's own output.
     pub reverted_subjects: usize,

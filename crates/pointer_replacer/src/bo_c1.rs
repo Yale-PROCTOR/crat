@@ -7972,6 +7972,8 @@ mod run {
                 row.set("p3_span_only", p.span_only.to_string());
                 row.set("p3_parse_failed", p.parse_failed.to_string());
                 row.set("p3_multi_arm", p.multi_arm.to_string());
+                row.set("p3_arm_set_3", p.arm_set_3.to_string());
+                row.set("p3_emitted_subjects", p.emitted_subjects.to_string());
                 if !p.examples.is_empty() {
                     row.set(
                         "p3_examples",
@@ -10828,6 +10830,19 @@ fn p3_row_failures(program: &str, row: &report::Row) -> Vec<String> {
             Err(why) => out.push(why),
         }
     }
+    // **F — PER-PROGRAM RECONCILIATION.** `compared == 0` is legal only where
+    // the ledger emitted nothing. Anywhere else a zero means the walk measured
+    // NOTHING and reported agreement — I1 at program granularity, and the shape
+    // that let the first run report 20/20 green over a mis-scoped population.
+    match (num("p3_compared"), num("p3_emitted_subjects")) {
+        (Ok(0), Ok(0)) => {}
+        (Ok(0), Ok(e)) => out.push(format!(
+            "{program}: p3_compared=0 but p3_emitted_subjects={e} — the walk \
+             measured nothing and would have reported agreement"
+        )),
+        (Ok(_), Ok(_)) => {}
+        (Err(why), _) | (Ok(_), Err(why)) => out.push(why),
+    }
     // Every compared function must have been EQUAL. Its own identity rather
     // than an inference from `differing == 0`, so a function compared and
     // counted in neither bucket cannot pass.
@@ -10859,6 +10874,8 @@ fn conforming_p3_row() -> report::Row {
     row.set("p3_span_only", "0");
     row.set("p3_parse_failed", "0");
     row.set("p3_multi_arm", "17");
+    row.set("p3_arm_set_3", "0");
+    row.set("p3_emitted_subjects", "17");
     row
 }
 
@@ -10866,6 +10883,53 @@ fn conforming_p3_row() -> report::Row {
 fn the_p3_gate_passes_the_shape_the_corpus_produces() {
     let f = p3_row_failures("libcsv", &conforming_p3_row());
     assert!(f.is_empty(), "must not fail libcsv's measured shape: {f:?}");
+}
+
+/// **THE RULED NEGATIVE CONTROL — one Opt declaration plus its own uses is a
+/// SINGLE arm.**
+///
+/// This is the assertion whose absence let `multi_arm = 30` be reported as
+/// composition. Arm 2 is *"one population in two syntactic positions"*, so a
+/// `Slice`/`Opt` declaration and its `(use)` rows are the SAME arm; only a
+/// `Ref(*)` declaration is arm 1 and only a `SeamAdapter` is arm 3.
+///
+/// Asserted over the classifier's own vocabulary, taken from `plan`'s `kind`
+/// match: `Ref(mut)`, `Ref(shared)`, `Slice(mut)`, `Slice(shared)`,
+/// `OptRef(mut)`, `OptRef(shared)`, `OptSlice(mut)`, `OptSlice(shared)`, plus
+/// `Slice(use)` / `Opt(use)`.
+#[test]
+fn an_opt_declaration_and_its_uses_are_one_arm() {
+    // The classifier, mirrored exactly as the gate applies it.
+    let arm = |kind: &str| -> &'static str {
+        if kind.starts_with("Ref") {
+            "arm1"
+        } else {
+            "arm2"
+        }
+    };
+    for decl in [
+        "Slice(mut)",
+        "Slice(shared)",
+        "OptRef(mut)",
+        "OptRef(shared)",
+        "OptSlice(mut)",
+        "OptSlice(shared)",
+    ] {
+        for use_row in ["Slice(use)", "Opt(use)"] {
+            assert_eq!(
+                arm(decl),
+                arm(use_row),
+                "{decl} and {use_row} are ONE arm — a declaration and its uses \
+                 travel together, and splitting them is what reported 30 \
+                 single-subject functions as composition"
+            );
+        }
+    }
+    // ...and arm 1 really is distinct from arm 2, or the partition collapses
+    // the other way and everything reads single-armed.
+    assert_ne!(arm("Ref(mut)"), arm("Slice(mut)"));
+    assert_ne!(arm("Ref(shared)"), arm("OptRef(shared)"));
+    assert_eq!(arm("Ref(mut)"), arm("Ref(shared)"));
 }
 
 #[test]
@@ -10901,6 +10965,26 @@ fn every_p3_failure_class_actually_fails() {
             "an ABSENT {key} must fail: {f:?}"
         );
     }
+    // F — compared==0 with a non-zero emitted ledger is a FAILURE, and
+    // compared==0 with emitted==0 is legal. Both directions asserted.
+    let mut row = conforming_p3_row();
+    row.set("p3_compared", "0");
+    row.set("p3_equal", "0");
+    let f = p3_row_failures("libcsv", &row);
+    assert!(
+        f.iter().any(|m| m.contains("p3_emitted_subjects")),
+        "compared=0 with emitted=17 must fail: {f:?}"
+    );
+    let mut row = conforming_p3_row();
+    row.set("p3_compared", "0");
+    row.set("p3_equal", "0");
+    row.set("p3_emitted_subjects", "0");
+    assert!(
+        p3_row_failures("brotli", &row).is_empty(),
+        "compared=0 with emitted=0 is LEGAL — five programs are legitimately \
+         empty and must not be forced to fail"
+    );
+
     // compared != equal, BOTH directions — a `>=` spelling passes one of them.
     for equal in ["17", "19"] {
         let mut row = conforming_p3_row();
@@ -10938,11 +11022,26 @@ fn m1_p3_corpus() {
             std::env::var("HOME").expect("HOME")
         )
     });
-    assert!(
-        std::path::Path::new(&oracle)
-            .join("SHA256SUMS.txt")
-            .is_file(),
-        "the oracle must be a published snapshot, not a working directory: {oracle}"
+    // **D — THE DIGEST IS RECOMPUTED AND VERIFIED, not existence-checked.**
+    //
+    // The gate held the revert set fixed and never checked WHICH revert set it
+    // held. A substituted or edited snapshot would pass silently, and the
+    // differential is structurally blind to its own premise being wrong — the
+    // same lesson as C: shared held-fixed inputs are guarded AT THE INPUT.
+    const ORACLE_DIGEST: &str = "fdcd2c6184b813d827aff20d8dccfb8d27ca12e3b4d406941b7e336af3657215";
+    let sums = std::path::Path::new(&oracle).join("SHA256SUMS.txt");
+    let sums_bytes = std::fs::read(&sums)
+        .unwrap_or_else(|e| panic!("the oracle must be a published snapshot: {sums:?}: {e}"));
+    let got = {
+        use sha2::{Digest, Sha256};
+        let mut h = Sha256::new();
+        h.update(&sums_bytes);
+        format!("{:x}", h.finalize())
+    };
+    assert_eq!(
+        got, ORACLE_DIGEST,
+        "oracle digest MISMATCH at {oracle} — this gate cites `fdcd2c61…` and \
+         this is not it"
     );
     let timeout = Duration::from_secs(
         std::env::var("CRAT_BOC1_P3_TIMEOUT_SECS")
