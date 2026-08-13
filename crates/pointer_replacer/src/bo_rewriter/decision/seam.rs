@@ -759,6 +759,119 @@ mod tests {
         );
     }
 
+    /// **THE UNWRAP SPELLING FOLLOWS THE *FOUND* SIDE — witnessed OFF THE
+    /// DIAGONAL.**
+    ///
+    /// [`unwrap_expr`]'s whole reason for existing is that `Option<&mut T>` is
+    /// not `Copy` and `.unwrap()` MOVES it, so the seam must spell that case
+    /// `.as_mut().unwrap()`. Which spelling applies is therefore a fact about
+    /// the value the caller HAS, never about the position it is going into.
+    ///
+    /// [`optional_wraps_one_way_and_unwraps_the_other`] pins both spellings but
+    /// only where the two sides agree, so it is blind to a `glue` that read the
+    /// EXPECTED side's mutability — the two are equal on the diagonal, which is
+    /// the shape this module's own reborrow test warns about ("a witness on one
+    /// direction witnesses half a table"). Found by mutation (M26): passing `w`
+    /// where `h` belongs left the entire suite green.
+    ///
+    /// A shared position fed from a mutable optional is the discriminating
+    /// case, and it is not exotic: `&T` is exactly what a read-only callee
+    /// parameter converts to.
+    #[test]
+    fn the_unwrap_spelling_is_the_found_sides_and_not_the_expected_sides() {
+        assert_eq!(
+            text(
+                Ref { mutable: false },
+                Opt {
+                    mutable: true,
+                    slice: false
+                }
+            ),
+            "p.as_mut().unwrap()",
+            "a MUTABLE optional stays borrowed even into a SHARED position — \
+             reading the expected side here would move it, and `E0382` would \
+             appear only at a second use"
+        );
+        // The other off-diagonal pairing cannot occur: `shared_to_mut` blocks a
+        // `&mut` position fed from a shared optional before any spec is built.
+        // Asserted so the pair above is not mistaken for half a table in turn.
+        assert_eq!(
+            g(
+                Ref { mutable: true },
+                Opt {
+                    mutable: false,
+                    slice: false
+                }
+            ),
+            Err(SeamBlock::SharedToMut)
+        );
+    }
+
+    /// **The `Slice`-expected-from-`Opt`-found arm, BOTH fat/thin twins.**
+    ///
+    /// The arm picks its core on the FOUND optional's fatness: a fat optional
+    /// already carries the slice and needs only the unwrap, while a thin one
+    /// yields a reference that must be widened by `from_ref`/`from_mut`.
+    /// Swapping the two produces glue that is well-formed and wrong in both
+    /// directions — `core::slice::from_ref` applied to a slice, and a slice
+    /// position handed a bare reference.
+    ///
+    /// Unwitnessed until mutation M25 swapped them and the suite stayed green.
+    #[test]
+    fn a_slice_position_widens_a_thin_optional_and_only_unwraps_a_fat_one() {
+        assert_eq!(
+            text(
+                Slice { mutable: false },
+                Opt {
+                    mutable: false,
+                    slice: true
+                }
+            ),
+            "p.unwrap()",
+            "a FAT optional is already the slice"
+        );
+        assert_eq!(
+            text(
+                Slice { mutable: true },
+                Opt {
+                    mutable: true,
+                    slice: false
+                }
+            ),
+            "core::slice::from_mut(p.as_mut().unwrap())",
+            "a THIN optional yields a reference, which must be widened"
+        );
+        // The same split under the optional-expected arm, whose core selection
+        // reads the EXPECTED side's fatness instead — the mirror choice, and
+        // the reason the two arms cannot share one rule.
+        assert_eq!(
+            text(
+                Opt {
+                    mutable: false,
+                    slice: true
+                },
+                Opt {
+                    mutable: false,
+                    slice: false
+                }
+            ),
+            "Some(core::slice::from_ref(p.unwrap()))"
+        );
+        assert_eq!(
+            text(
+                Opt {
+                    mutable: false,
+                    slice: false
+                },
+                Opt {
+                    mutable: false,
+                    slice: true
+                }
+            ),
+            "Some(&p.unwrap()[0])"
+        );
+    }
+
     /// **Optional over a raw base composes both families**, and the composition
     /// is `Some(&mut *p)` — not `&mut *Some(p)`, which does not parse as a
     /// pointer operation at all.
