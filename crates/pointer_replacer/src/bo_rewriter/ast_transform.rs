@@ -160,6 +160,31 @@ pub(crate) enum GlueShape {
     Some_,
 }
 
+/// The type `usize`, synthesized rather than parsed.
+///
+/// See the call site: a parsed fragment carries spans from a fresh `ParseSess`
+/// that alias real offsets in this crate, and the synthetic-span invariant says
+/// nodes this layer manufactures carry `DUMMY_SP`.
+fn usize_ty() -> Ty {
+    Ty {
+        id: DUMMY_NODE_ID,
+        kind: TyKind::Path(
+            None,
+            Path {
+                span: DUMMY_SP,
+                segments: ThinVec::from_iter([PathSegment {
+                    ident: Ident::new(Symbol::intern("usize"), DUMMY_SP),
+                    id: DUMMY_NODE_ID,
+                    args: None,
+                }]),
+                tokens: None,
+            },
+        ),
+        span: DUMMY_SP,
+        tokens: None,
+    }
+}
+
 /// A path expression `core::slice::<name>`.
 fn slice_path(name: &str) -> rustc_ast::Expr {
     let seg = |n: &str| PathSegment {
@@ -244,10 +269,16 @@ pub(crate) fn glue_expr(
             };
             // `(LEN) as usize` — parenthesised exactly as the span layer writes
             // it, because the companion may be an arbitrary expression.
-            let cast = expr(ExprKind::Cast(
-                expr(ExprKind::Paren(len)),
-                P(::utils::ast::parse_ty("usize".to_owned())),
-            ));
+            //
+            // The `usize` is HAND-BUILT with `DUMMY_SP`, not parsed. `parse_ty`
+            // opens a fresh `ParseSess` whose `BytePos` values start at zero and
+            // therefore **alias real offsets in this crate's first source
+            // file** — exactly the hazard `SpanEraser` was landed for at task
+            // 0, reintroduced by one line, and invisible to that witness
+            // because it collects `Expr` spans only. `slice_path` just below
+            // already hand-builds for the same reason; this line was the odd
+            // one out. Found by the adversarial review.
+            let cast = expr(ExprKind::Cast(expr(ExprKind::Paren(len)), P(usize_ty())));
             ExprKind::Call(P(slice_path(ctor)), ThinVec::from_iter([arg, cast]))
         }
         GlueShape::FromRefMut => {
@@ -927,11 +958,30 @@ impl MutVisitor for SeamGraftVisitor<'_> {
             // call-argument expression, the same syntactic category the use
             // pass claims, so `refused` stops being a structural zero here and
             // becomes a corpus fact.
+            //
+            // **BUILD FIRST, CLAIM SECOND.** The claim used to come first, so a
+            // spec this pass cannot build still took ownership of the node and
+            // left it unclaimable by anyone else — which is arm 2's review
+            // finding 5 ("`guard.claim` ran BEFORE the shape check"), already
+            // repaired once in the declaration pass and reintroduced here.
+            // Found by the adversarial review.
+            //
+            // The cost is stated rather than hidden: a node built and then
+            // refused has already counted its peel and its length, so those two
+            // rows can exceed the placements. That is unreachable while
+            // `refused` is zero, and a nonzero `refused` is STOP-class, so the
+            // over-count can only appear on a path a human is already reading.
+            let Some(kind) = self.build(e, target) else {
+                // Declined with a typed row; the node is left intact AND
+                // claimable, which is the invariant that matters.
+                rustc_ast::mut_visit::walk_expr(self, e);
+                return;
+            };
             if !self.guard.claim(e.id, "seam") {
                 self.stats.refused += 1;
                 return;
             }
-            if let Some(kind) = self.build(e, target) {
+            {
                 e.kind = kind;
                 self.stats.grafted += 1;
                 if target.reborrow {
@@ -946,7 +996,6 @@ impl MutVisitor for SeamGraftVisitor<'_> {
                 // argument moved across as a subtree rather than being revisited.
                 return;
             }
-            // Declined with a typed row; the node is left intact.
         }
         rustc_ast::mut_visit::walk_expr(self, e);
     }
@@ -2506,7 +2555,7 @@ mod arm2_witnesses {
                 );
                 // **The two derivations, compared here rather than assumed.**
                 assert_eq!(
-                    spec.render("(*s).ptr"),
+                    spec.render("(*s).ptr").expect("an emitting spec renders"),
                     expected,
                     "and the RENDERER must agree with the same text — if these \
                      two ever part, the corpus differential's 421 equalities \
@@ -2728,6 +2777,64 @@ mod arm2_witnesses {
             let (_, stats) = seam_over(src, &[(arg, arg, identity, false)]);
             assert_eq!(stats.grafted, 0);
             assert_eq!(stats.unsupported, 1);
+        });
+    }
+
+    /// **A DECLINED SEAM LEAVES THE NODE CLAIMABLE BY SOMEONE ELSE.**
+    ///
+    /// Arm 2's review found exactly this shape in the declaration pass —
+    /// finding 5, *"`guard.claim` ran BEFORE the shape check, so a declaration
+    /// the pass cannot transform still took ownership of its node"* — and
+    /// repaired it. The seam pass reintroduced it, and the suite stayed green
+    /// because the only thing anyone asserted about a decline was the node's
+    /// TEXT, never the guard's state.
+    ///
+    /// So the load-bearing assertion here is the guard's, exactly as M17b's
+    /// was. Found by the adversarial review.
+    #[test]
+    fn a_declined_seam_does_not_take_ownership_of_the_node() {
+        rustc_span::create_default_session_globals_then(|| {
+            let src = "fn f(o: Option<&mut u8>) { g(o) }";
+            let mut krate = ::utils::ast::parse_crate(src.to_owned());
+            let arg = call_arg_span(&krate);
+            let node_id = {
+                let rustc_ast::ItemKind::Fn(f) = &krate.items[0].kind else {
+                    panic!("fixture is a fn")
+                };
+                let body = f.body.as_ref().expect("body");
+                let rustc_ast::StmtKind::Expr(e) = &body.stmts.last().expect("tail").kind else {
+                    panic!("tail is an expression")
+                };
+                let rustc_ast::ExprKind::Call(_, args) = &e.kind else { panic!("tail is a call") };
+                args[0].id
+            };
+
+            // A spec the builder deliberately does not build.
+            let seams: FxHashMap<(u32, u32), SeamTarget> = [(
+                (arg.lo().0, arg.hi().0),
+                SeamTarget {
+                    spec: GlueSpec::core(GlueCore::Bare, true).with_unwrap(true),
+                    arg_span: arg,
+                    reborrow: false,
+                },
+            )]
+            .into_iter()
+            .collect();
+            let mut guard = Composition::default();
+            let mut v = SeamGraftVisitor::new(&seams, &mut guard);
+            v.visit_crate(&mut krate);
+            let stats = v.finish();
+            assert_eq!(stats.grafted, 0);
+            assert_eq!(stats.unsupported, 1, "it declined, as designed");
+            assert_eq!(stats.refused, 0, "and was not refused — nothing collided");
+
+            assert!(
+                guard.claim(node_id, "arm4"),
+                "THE LOAD-BEARING ASSERTION: a node this pass could not \
+                 transform must stay claimable. Claiming before building leaves \
+                 a phantom owner that fail-closes a later arm's transform on a \
+                 node nobody actually rewrote"
+            );
         });
     }
 

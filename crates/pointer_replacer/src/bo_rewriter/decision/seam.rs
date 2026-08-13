@@ -331,7 +331,22 @@ impl GlueSpec {
 
     /// Render the spec as the span layer's text. **Byte-identical to the
     /// pre-reification `format!` set, and gated as such.**
-    pub(crate) fn render(&self, text: &str) -> String {
+    ///
+    /// `None` when a length-bearing core carries no length. **This used to
+    /// substitute an empty string**, printing
+    /// `core::slice::from_raw_parts(p, () as usize)` — not merely invalid Rust
+    /// but a *silent length substitution*, in the one place this milestone's
+    /// hardest invariant says none may ever happen, while [`Self::len`]'s own
+    /// doc promised `None`-means-refused. Prose asserting a check the code did
+    /// not have, on the exact socket the HELD fabricated-length slice is
+    /// designed to plug into. The AST builder already refused this input and
+    /// counted it (`len_absent`); the renderer did not. Found by the
+    /// adversarial review.
+    ///
+    /// Unreachable through [`glue`], which returns [`SeamBlock::LengthUnknown`]
+    /// first — so this is fail-closed structure rather than a live path, and it
+    /// moves no corpus line.
+    pub(crate) fn render(&self, text: &str) -> Option<String> {
         let base = match self.unwrap {
             None => text.to_owned(),
             Some(found_mutable) => unwrap_expr(text, found_mutable),
@@ -346,7 +361,7 @@ impl GlueSpec {
                 } else {
                     "from_raw_parts"
                 };
-                let len = self.len.as_deref().unwrap_or_default();
+                let len = self.len.as_deref()?;
                 format!("core::slice::{ctor}({base}, ({len}) as usize)")
             }
             GlueCore::FromRefMut => {
@@ -354,11 +369,11 @@ impl GlueSpec {
                 format!("core::slice::{ctor}({base})")
             }
         };
-        if self.optional {
+        Some(if self.optional {
             format!("Some({inner})")
         } else {
             inner
-        }
+        })
     }
 }
 
@@ -690,7 +705,7 @@ mod tests {
         ];
         for (spec, expected) in cases {
             assert_eq!(
-                spec.render(T),
+                spec.render(T).expect("every emitting spec renders"),
                 expected,
                 "renderer must be byte-identical to the arm it replaces: {spec:?}"
             );
@@ -714,6 +729,7 @@ mod tests {
             .unwrap_or_else(|| panic!("no edit"))
             .0
             .render(arg)
+            .expect("an emitting spec always renders")
     }
 
     /// **Reborrow, BOTH SIDES.** `*mut T → &mut T` needs glue; the reverse needs
@@ -897,7 +913,7 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        assert_eq!(spec.render(T), "Some(&mut *p)");
+        assert_eq!(spec.render(T).unwrap(), "Some(&mut *p)");
         assert_eq!(fam, SeamFamily::Reborrow, "the raw base carries the family");
     }
 
@@ -1185,10 +1201,61 @@ mod tests {
         for spec in every_emitting_spec() {
             assert_eq!(
                 spec.shape_key(),
-                inferred_shape(&spec.render("p")),
+                inferred_shape(&spec.render("p").expect("emitting spec renders")),
                 "carried and inferred shapes must agree on a bare argument: {spec:?}"
             );
         }
+    }
+
+    /// **THE RENDERER REFUSES A LENGTH-LESS SLICE ADAPTER.**
+    ///
+    /// It used to substitute an empty string and print
+    /// `core::slice::from_raw_parts(p, () as usize)`. That is not merely
+    /// "invalid Rust the compiler catches" — it is a **silent length
+    /// substitution**, produced by the layer whose own field doc promises
+    /// `None`-means-refused, at the socket the HELD fabricated-length slice
+    /// plugs into. The AST builder refused the same input and counted it
+    /// (`len_absent`), so the two halves of one contract disagreed and only the
+    /// half with a witness was right.
+    ///
+    /// Unreachable through [`glue`] — asserted below — so this is fail-closed
+    /// structure rather than a behaviour change, and it moves no corpus line.
+    #[test]
+    fn the_renderer_refuses_a_slice_adapter_with_no_length() {
+        let lengthless = GlueSpec::core(GlueCore::FromRawParts, false);
+        assert_eq!(
+            lengthless.render("p"),
+            None,
+            "a length-bearing core with no length must REFUSE, never render \
+             `() as usize` around an empty string"
+        );
+        assert_eq!(
+            lengthless.wrapped().render("p"),
+            None,
+            "and the `Some` wrapper must not launder it either"
+        );
+        // With a length it renders normally, so the refusal is the missing
+        // length rather than the shape.
+        assert_eq!(
+            GlueSpec::core(GlueCore::FromRawParts, false)
+                .with_len("n")
+                .render("p")
+                .as_deref(),
+            Some("core::slice::from_raw_parts(p, (n) as usize)")
+        );
+        // The gate is UPSTREAM: `glue` never names the refusing shape, which is
+        // what makes this structure rather than a live path.
+        assert_eq!(
+            glue(Slice { mutable: false }, Raw, None),
+            Err(SeamBlock::LengthUnknown)
+        );
+        assert!(
+            every_emitting_spec()
+                .iter()
+                .all(|s| s.render("p").is_some()),
+            "and every spec `glue` CAN name must still render, or the corpus \
+             would move"
+        );
     }
 
     /// **`index` IS REACHABLE, and `Bare`-without-a-wrapper is not** — the two
@@ -1214,7 +1281,7 @@ mod tests {
             "index",
             "reached through `glue`, not by hand"
         );
-        assert_eq!(spec.render("p"), "&mut p[0]");
+        assert_eq!(spec.render("p").unwrap(), "&mut p[0]");
         assert_eq!(family, SeamFamily::Safe);
         assert!(
             !spec.optional && spec.unwrap.is_none(),
@@ -1255,9 +1322,9 @@ mod tests {
         // An `Index0` wrap over an argument spelled `*q` renders `Some(&*q[0])`,
         // whose prefix is `Some(&*` — the classifier called that `some_reborrow`.
         let index0_wrapped = GlueSpec::core(GlueCore::Index0, false).wrapped();
-        assert_eq!(index0_wrapped.render("*q"), "Some(&*q[0])");
+        assert_eq!(index0_wrapped.render("*q").unwrap(), "Some(&*q[0])");
         assert_eq!(
-            inferred_shape(&index0_wrapped.render("*q")),
+            inferred_shape(&index0_wrapped.render("*q").unwrap()),
             "some_reborrow"
         );
         assert_eq!(index0_wrapped.shape_key(), "some_wrap");
@@ -1265,7 +1332,10 @@ mod tests {
         // An argument that is itself an `.unwrap()` call captured rule 4, which
         // sits ABOVE every `Some(` test.
         let some_wrap = GlueSpec::core(GlueCore::Bare, false).wrapped();
-        assert_eq!(inferred_shape(&some_wrap.render("o.unwrap()")), "unwrap");
+        assert_eq!(
+            inferred_shape(&some_wrap.render("o.unwrap()").unwrap()),
+            "unwrap"
+        );
         assert_eq!(some_wrap.shape_key(), "some_wrap");
 
         // And the carried answer does not move with the argument at all — the
@@ -1663,9 +1733,25 @@ pub(crate) fn synthesize(
                         // string so the AST layer can find the same subtree
                         // rather than re-deriving which part of the argument the
                         // span layer kept.
+                        //
+                        // A refusing render blocks under the EXISTING
+                        // `LengthUnknown` key — the same outcome `glue` would
+                        // have produced, so this is not new refusal vocabulary
+                        // (STOP 4). Unreachable today; it exists so that no
+                        // future producer of a spec can route a length-less
+                        // slice adapter into a file.
+                        let Some(replacement) = spec.render(text) else {
+                            plan.blocked.push((
+                                site.caller,
+                                *callee,
+                                pos.span,
+                                SeamBlock::LengthUnknown,
+                            ));
+                            continue;
+                        };
                         plan.edits.push(SeamEdit {
                             span: pos.span,
-                            replacement: spec.render(text),
+                            replacement,
                             owner_fn: tcx.def_path_str(callee.to_def_id()),
                             family,
                             len_arm,
