@@ -375,3 +375,122 @@ pub(crate) fn arm1_full(
         .count();
     Ok((stats, d))
 }
+
+/// **ARM 2's PARSE-AND-GRAFT plumbing** (user ruling (c), 2026-08-13).
+///
+/// The decision layer computes use rewrites as TEXT (`format!("{name}[{index}]")`
+/// and friends). Under the registration the application layer emits only printer
+/// output, so that text reaches a file exclusively through **parse → graft →
+/// print**. A decision-layer string is a *specification*; parsing it into the
+/// application representation is realization, not span editing.
+///
+/// # The wrap rule, bound
+///
+/// `utils::ast::parse_expr` ends `.unwrap()` over a `ParseSess::with_fatal_emitter`,
+/// so a template the enumeration missed would **abort the run** rather than
+/// produce a row. Every adoption in this milestone therefore goes through
+/// [`graft_expr`], which converts failure into a typed row carrying the
+/// offending text. The bare `.unwrap()` is never called.
+///
+/// # Why the fresh-session cost is accepted
+///
+/// Each `parse_*` opens its own `ParseSess`, so ≈1,699 fragments means ≈1,699
+/// sessions. That is real work and it is the right trade: the cheap alternative
+/// is one shared session, which is exactly the `SourceMap` dedupe that made
+/// every parse after the first return fragment #1's source (I2).
+#[cfg(test)]
+pub(crate) fn graft_expr(text: &str) -> Result<rustc_ast::Expr, String> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        ::utils::ast::parse_expr(text.to_owned())
+    }))
+    .map_err(|_| text.to_owned())
+}
+
+#[cfg(test)]
+mod template_witnesses {
+    use super::*;
+
+    /// **R7.4 — one parse witness per template shape**, enumerated READ-ONLY
+    /// from `decision/emitability.rs` before arm 2's first corpus run.
+    ///
+    /// The grammar of use replacements is a finite set of `format!` templates:
+    ///
+    /// | # | template | site |
+    /// |---|---|---|
+    /// | A | `{name}[0]` | `emitability.rs:981` |
+    /// | B | `{amp}{name}[{index}..]` | `:1031` |
+    /// | C | `{name}[{index}]` | `:1062` |
+    /// | D | `{name}.is_some()` | `:816` |
+    /// | E | `{name}.is_none()` | `:824` |
+    /// | F | `{name}.unwrap()` | `:832` via `Accessor::deref` |
+    /// | G | `*{name}.as_mut().unwrap()` | `:832` via `Accessor::deref`, `as_mut` arm |
+    /// | H | `{name}.unwrap()[{index}]` | `:869` via `Accessor::index` |
+    /// | I | `{name}.as_mut().unwrap()[{index}]` | `:869`, `as_mut` arm |
+    ///
+    /// `{index}` is an arbitrary offset expression carried from source, so a
+    /// non-trivial one is included rather than only bare identifiers — a
+    /// witness over `p[0]` alone would prove nothing about `p[i.wrapping_mul(2)
+    /// as usize]`.
+    ///
+    /// **This makes `parse_failed = 0` a CHECKED corpus expectation.** A corpus
+    /// parse failure then means a template this enumeration missed — a finding
+    /// with the offending text attached, never a silent skip.
+    /// **Session globals are REQUIRED**, and that is a property of the
+    /// plumbing, not of the test. `parse_expr` interns symbols and allocates
+    /// spans, so it panics in `scoped-tls` outside a session. Production grafts
+    /// run inside the compiler callback and have them; a unit witness must
+    /// establish them explicitly, which is why this wrapper is here and not an
+    /// oversight being papered over.
+    #[test]
+    fn every_use_replacement_template_parses() {
+        rustc_span::create_default_session_globals_then(|| {
+            for (label, text) in [
+                ("A name[0]", "p[0]"),
+                ("B &name[i..]", "&p[1..]"),
+                (
+                    "B' &mut name[expr..]",
+                    "&mut p[(i.wrapping_mul(2) as usize)..]",
+                ),
+                ("C name[i]", "p[i]"),
+                ("C' name[expr]", "p[i.wrapping_mul(2) as usize]"),
+                ("D is_some", "p.is_some()"),
+                ("E is_none", "p.is_none()"),
+                ("F unwrap", "p.unwrap()"),
+                ("G deref as_mut", "*p.as_mut().unwrap()"),
+                ("H unwrap index", "p.unwrap()[i]"),
+                ("I as_mut index", "p.as_mut().unwrap()[i]"),
+            ] {
+                assert!(
+                    graft_expr(text).is_ok(),
+                    "{label}: the template {text:?} must parse — it is a shape the \
+                 decision layer actually emits, and a shape that does not parse \
+                 aborts the run rather than producing a row"
+                );
+            }
+        });
+    }
+
+    /// **The wrap rule is load-bearing, and this proves it fires.**
+    ///
+    /// Not a positive control: `parse_expr`'s bare form PANICS on malformed
+    /// input over a fatal emitter, so without the wrapper this input would take
+    /// down the whole sweep. The assertion is that it becomes a VALUE.
+    ///
+    /// *Mutation-tested:* removing the `catch_unwind` makes this test abort
+    /// rather than fail — which is itself the demonstration.
+    #[test]
+    fn a_malformed_template_becomes_a_row_not_an_abort() {
+        rustc_span::create_default_session_globals_then(|| {
+            let bad = "p[";
+            let got = graft_expr(bad);
+            assert!(got.is_err(), "a malformed fragment must not parse");
+            assert_eq!(
+                got.unwrap_err(),
+                bad,
+                "the row must carry the OFFENDING TEXT — a refusal that does not \
+             name what it refused cannot be traced back to the template that \
+             produced it"
+            );
+        });
+    }
+}
