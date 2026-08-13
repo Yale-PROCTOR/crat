@@ -7101,6 +7101,29 @@ mod run {
                 row.set("just_kind_decision", jc.kind_decision.to_string());
                 row.set("just_seam_adapter", jc.seam_adapter.to_string());
                 row.set("just_total", jc.total().to_string());
+                // **AND AS AN ARTIFACT.** The row goes to stdout, which this
+                // machine's CLI proxy filters — a limitation already banked at
+                // the S3.2'-5 close, where the TOTAL line could not be captured
+                // either. The census's entire purpose is three ungated numbers,
+                // so a number that exists only on a filtered stream is a number
+                // that cannot be cited. Written per program, so the market is
+                // read from artifacts like every other market in this
+                // milestone, and survives into the snapshot.
+                let jp = dir.join(format!("{name}.just.tsv"));
+                std::fs::write(
+                    &jp,
+                    format!(
+                        "justification\tedits\nkind_decision\t{}\nseam_adapter\t{}\n\
+                         reroute\t{}\ndrop_form\t{}\nstore_form\t{}\nTOTAL\t{}\n",
+                        jc.kind_decision,
+                        jc.seam_adapter,
+                        jc.reroute,
+                        jc.drop_form,
+                        jc.store_form,
+                        jc.total()
+                    ),
+                )
+                .unwrap_or_else(|e| panic!("write justification census {}: {e}", jp.display()));
                 if !sg.len_parse_failures.is_empty() {
                     row.set(
                         "arm3_len_parse_failures",
