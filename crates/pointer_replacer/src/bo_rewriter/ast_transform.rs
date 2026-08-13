@@ -116,6 +116,22 @@ pub(crate) fn decl_ty_kind(form: DeclForm, mutable: bool, pointee: P<Ty>) -> TyK
     }
 }
 
+/// One refused claim, naming **both** parties.
+///
+/// Requirement added at the arm-2 review (2026-08-13). A refusal row that named
+/// only the node would hand a STOP diagnosis half the story: `refused = 1 @
+/// node 4713` says a collision happened and not who collided, and the two
+/// transforms live in different passes over a 900-line module. Both sides are
+/// recorded so the diagnosis holds both parties.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Refusal {
+    pub node: NodeId,
+    /// The transform that already owns the node — its claim STANDS.
+    pub holder: &'static str,
+    /// The transform refused. See [`Composition`]: this one, not both.
+    pub challenger: &'static str,
+}
+
 /// **THE FAIL-CLOSED COMPOSITION GUARD.**
 ///
 /// Built beside the FIRST arm by ruling (2026-08-12, item 5), not deferred to
@@ -154,24 +170,53 @@ pub(crate) fn decl_ty_kind(form: DeclForm, mutable: bool, pointee: P<Ty>) -> TyK
 /// pass) is work that belongs to whichever unlock first makes composition
 /// legal. What must not happen is prose promising a rollback the code does not
 /// perform.
+///
+/// **The preserved invariant is NO SILENT PRECEDENCE** (ruling 2026-08-13). The
+/// first claim standing is not a precedence *rule* — it is the order the walk
+/// happened to run in, and the guard's job is to ensure that order is never
+/// quietly load-bearing. Every refusal is a typed [`Refusal`] row naming both
+/// parties and is STOP-class at parity, so a collision cannot be resolved by
+/// walk order without a human seeing it.
 #[derive(Default)]
 pub(crate) struct Composition {
-    claimed: FxHashSet<NodeId>,
-    /// Refusals, with the node that was claimed twice.
-    pub refused: Vec<NodeId>,
+    claimed: FxHashMap<NodeId, &'static str>,
+    /// Refusals, each naming the node and both claimants.
+    pub refused: Vec<Refusal>,
 }
 
 impl Composition {
     /// `true` when this transform may proceed. `false` means another transform
     /// already owns the node, and THIS one is refused — see the struct doc for
     /// why that is not the same as refusing both.
-    pub(crate) fn claim(&mut self, node: NodeId) -> bool {
-        if self.claimed.insert(node) {
-            true
-        } else {
-            self.refused.push(node);
-            false
+    ///
+    /// `claimant` is a stable label for the transform, not for the subject: it
+    /// is what a STOP diagnosis reads to learn which two passes collided.
+    pub(crate) fn claim(&mut self, node: NodeId, claimant: &'static str) -> bool {
+        match self.claimed.get(&node) {
+            None => {
+                self.claimed.insert(node, claimant);
+                true
+            }
+            Some(&holder) => {
+                self.refused.push(Refusal {
+                    node,
+                    holder,
+                    challenger: claimant,
+                });
+                false
+            }
         }
+    }
+
+    /// Refusals whose CHALLENGER carries this label — the pass that was turned
+    /// away. Derived from the labels rather than by subtracting one pass's
+    /// tally from the guard's total, which would mis-attribute the moment a
+    /// third transform lands.
+    pub(crate) fn refused_by(&self, claimant: &str) -> usize {
+        self.refused
+            .iter()
+            .filter(|r| r.challenger == claimant)
+            .count()
     }
 }
 
@@ -239,7 +284,12 @@ impl RefDeclVisitor<'_> {
         let Some(&(form, mutable)) = self.decisions.get(&(fn_did, *hir_id)) else {
             return;
         };
-        if !self.guard.claim(ty.id) {
+        let claimant = match form {
+            DeclForm::Ref => "decl:ref",
+            DeclForm::Slice => "decl:slice",
+            DeclForm::Opt { .. } => "decl:opt",
+        };
+        if !self.guard.claim(ty.id, claimant) {
             self.stats.refused += 1;
             return;
         }
@@ -371,7 +421,7 @@ impl MutVisitor for UseGraftVisitor<'_> {
         let key = (e.span.lo().0, e.span.hi().0);
         if let Some(text) = self.uses.get(&key) {
             self.consumed.insert(key);
-            if !self.guard.claim(e.id) {
+            if !self.guard.claim(e.id, "use") {
                 self.stats.refused += 1;
                 return;
             }
@@ -424,19 +474,34 @@ mod tests {
     fn two_transforms_may_not_claim_one_node() {
         let mut g = Composition::default();
         let node = NodeId::from_u32(7);
-        assert!(g.claim(node), "the first claim must be admitted");
         assert!(
-            !g.claim(node),
+            g.claim(node, "decl:slice"),
+            "the first claim must be admitted"
+        );
+        assert!(
+            !g.claim(node, "use"),
             "the SECOND claim on one node must be refused — this is the \
              structural half of the barrier the site-overlap gate provides, \
              and it does not lapse in parity mode"
         );
         assert_eq!(
             g.refused,
-            vec![node],
-            "the refusal must be COUNTED, not \
-             merely returned: an unreviewed composition that is refused and \
-             not recorded is indistinguishable from one that never arose"
+            vec![Refusal {
+                node,
+                holder: "decl:slice",
+                challenger: "use",
+            }],
+            "the refusal must be COUNTED and must name BOTH parties (ruling \
+             2026-08-13). A row carrying only the node hands a STOP diagnosis \
+             half the story — that a collision happened, but not who collided, \
+             across passes that live in different halves of the module"
+        );
+        assert_eq!(g.refused_by("use"), 1, "attributed to the CHALLENGER");
+        assert_eq!(
+            g.refused_by("decl:slice"),
+            0,
+            "the holder was not refused — its claim stands, which is exactly \
+             the asymmetry the guard's doc was corrected to state"
         );
     }
 
@@ -449,8 +514,8 @@ mod tests {
     #[test]
     fn distinct_nodes_do_not_conflict() {
         let mut g = Composition::default();
-        assert!(g.claim(NodeId::from_u32(1)));
-        assert!(g.claim(NodeId::from_u32(2)));
+        assert!(g.claim(NodeId::from_u32(1), "decl:ref"));
+        assert!(g.claim(NodeId::from_u32(2), "use"));
         assert!(g.refused.is_empty(), "distinct nodes must not be refused");
     }
 }
@@ -538,10 +603,12 @@ fn transform_inner(
     g.visit_crate(&mut krate);
     let grafts = g.finish();
 
-    // The guard's total is split between the passes by their own tallies, so a
-    // refusal is attributable to the position it arose at rather than to a
-    // corpus-level sum.
-    decls.refused = guard.refused.len() - grafts.refused;
+    // Attributed by CLAIMANT LABEL, not by subtracting the use pass's tally
+    // from the guard's total: subtraction is correct only while there are
+    // exactly two transforms, and arm 3 adds a third.
+    decls.refused = guard.refused_by("decl:ref")
+        + guard.refused_by("decl:slice")
+        + guard.refused_by("decl:opt");
     Ok((decls, grafts))
 }
 
