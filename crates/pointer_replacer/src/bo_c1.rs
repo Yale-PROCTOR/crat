@@ -11194,8 +11194,23 @@ fn m1_p3_corpus() {
     // `-2`/`-3` re-measures, seam-market expansion — **REARMS the cross-arm
     // parity obligation on those functions before that change banks.** Parked
     // with a tripwire, not answered by fiat.
-    println!(
-        "BOC1-P3-REARM multi_arm={multi} (retired as an assertion; nonzero REARMS cross-arm parity)"
+    println!("BOC1-P3-REARM multi_arm={multi} (corpus-shape pin; nonzero REARMS cross-arm parity)");
+    // **AND IT IS ENFORCED, not printed.** A `println!` is prose: nothing
+    // downstream depended on `multi`, so a capability change could bank the
+    // corpus's first cross-arm function with no one stopping — the founding
+    // failure class, inside the very mechanism written to prevent it. Found by
+    // the adversarial review.
+    //
+    // The assertion is INVERTED from the retired one: `multi_arm` is pinned at
+    // the corpus shape (0), and going nonzero is what must stop the run. It is
+    // deliberately REPLACED — never deleted — when the cross-arm parity gate is
+    // installed for those functions.
+    assert_eq!(
+        multi, 0,
+        "REARM: multi_arm is nonzero, so a capability change has produced the \
+         corpus's first cross-arm function(s). The cross-arm parity obligation \
+         REARMS on them BEFORE this change banks — replace this pin with that \
+         gate, do not delete it"
     );
     assert_eq!(
         rev_subj, 1058,
