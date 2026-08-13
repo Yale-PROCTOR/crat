@@ -7020,6 +7020,8 @@ mod run {
                 row.set("arm2_use_parse_failed", gr.parse_failed.to_string());
                 row.set("arm2_use_unmatched", gr.unmatched.to_string());
                 row.set("arm2_refused", gr.refused.to_string());
+                row.set("arm2_multi_matched", gr.multi_matched.to_string());
+                row.set("decl_inside_use", d.decl_render_inside_use_edit.to_string());
                 row.set("arm2_compared", d.arm2_compared.to_string());
                 row.set("arm2_equal", d.arm2_equal.to_string());
                 row.set("arm2_differing", d.arm2_differing.to_string());
@@ -9751,6 +9753,8 @@ const ARM_ZERO_INVARIANTS: &[&str] = &[
     "arm2_use_parse_failed",
     "arm2_use_unmatched",
     "arm2_refused",
+    "arm2_multi_matched",
+    "decl_inside_use",
     "arm2_unmatched_ast",
     "arm2_ws_real",
     "kd_unmatched_span",

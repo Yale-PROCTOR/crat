@@ -371,6 +371,19 @@ pub(crate) struct UseGraftStats {
     pub unmatched: usize,
     /// Refused by the composition guard.
     pub refused: usize,
+    /// **One use key matched by MORE THAN ONE AST node.**
+    ///
+    /// The composition guard cannot see this: it keys on `NodeId`, and two
+    /// distinct nodes sharing a span have distinct ids, so both claims are
+    /// admitted and both graft. `unmatched` cannot see it either — `consumed`
+    /// is a set, so the second match re-inserts and the key still reads as
+    /// reached. Without this counter the shape is invisible to every existing
+    /// instrument, which is why it is counted rather than argued about.
+    ///
+    /// Macro-expanded nodes are the realistic source: they carry the call
+    /// site's range and differ only in `SyntaxContext`, which the `(lo, hi)`
+    /// key drops. Corpus expectation is 0 and it is GATED.
+    pub multi_matched: usize,
     /// `(offset, rendered text)` per graft — the text differential's left-hand
     /// side, keyed exactly as the declaration renders are.
     pub rendered: Vec<(u32, String)>,
@@ -420,7 +433,13 @@ impl MutVisitor for UseGraftVisitor<'_> {
     fn visit_expr(&mut self, e: &mut rustc_ast::Expr) {
         let key = (e.span.lo().0, e.span.hi().0);
         if let Some(text) = self.uses.get(&key) {
-            self.consumed.insert(key);
+            // `insert` returns false when the key was already reached — a
+            // SECOND AST node carrying the same span. Counted here because
+            // neither the guard (which keys on `NodeId`) nor `unmatched`
+            // (a set membership) can observe it.
+            if !self.consumed.insert(key) {
+                self.stats.multi_matched += 1;
+            }
             if !self.guard.claim(e.id, "use") {
                 self.stats.refused += 1;
                 return;
@@ -537,7 +556,7 @@ mod tests {
 /// is built.
 #[cfg(test)]
 pub(crate) fn arm1_population(tcx: rustc_middle::ty::TyCtxt<'_>) -> Result<RefDeclStats, String> {
-    transform_inner(tcx).map(|(decls, _)| decls)
+    transform_inner(tcx).map(|(decls, _, _)| decls)
 }
 
 /// Both passes over ONE capture, sharing ONE composition guard.
@@ -546,16 +565,29 @@ pub(crate) fn arm1_population(tcx: rustc_middle::ty::TyCtxt<'_>) -> Result<RefDe
 ///
 /// The use pass must **not** descend into a subtree it has just replaced — the
 /// children are the parsed fragment's, and walking them would be walking the
-/// wrong tree. A single visitor doing both jobs would therefore skip any
-/// *declaration* inside a rewritten expression as well, silently. Two passes
-/// keep the skip local to the pass that needs it.
+/// wrong tree. A single visitor doing both jobs would skip any *declaration*
+/// inside a rewritten expression as well. Two passes keep that skip local to
+/// the pass that needs it.
+///
+/// **CORRECTED at the arm-2 review — the split does NOT make containment
+/// safe.** This doc previously implied it did. Running declarations first means
+/// a declaration inside a use-edit expression is transformed **and then thrown
+/// away** when the enclosing expression is grafted — and the ledger has already
+/// counted it as rewritten. That is a different failure from "skipped
+/// silently" and it is not a better one. The honest position is that the two
+/// passes fix the *walk*, not the *containment*, and containment is
+/// **measured** rather than assumed: see `decl_render_inside_use_edit`, whose
+/// corpus expectation is 0 and which is gated. Found by the correctness
+/// persona at the arm-2 boundary.
 ///
 /// The guard is shared precisely because the passes are separate: same-node
-/// claims must be refused **across** them, not within each.
+/// claims must be refused **across** them, not within each. It does **not**
+/// catch containment — a contained declaration is a different node, legally
+/// claimed.
 #[cfg(test)]
 fn transform_inner(
     tcx: rustc_middle::ty::TyCtxt<'_>,
-) -> Result<(RefDeclStats, UseGraftStats), String> {
+) -> Result<(RefDeclStats, UseGraftStats, usize), String> {
     let captured = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let mut krate = ::utils::ast::expanded_ast(tcx);
         let map = ::utils::ast::make_ast_to_hir(&mut krate, tcx);
@@ -614,7 +646,20 @@ fn transform_inner(
     //
     // `Composition::refused_by` survives for DIAGNOSIS — reading which pair
     // collided out of a nonzero gate — which is what the labels are for.
-    Ok((decls, grafts))
+
+    // **CONTAINMENT, measured.** A declaration transformed inside an expression
+    // that is later grafted is discarded, with the ledger still counting it as
+    // rewritten — the hazard the two-pass split does NOT remove (see this
+    // function's doc). Neither the guard nor `unmatched` can see it, so it is
+    // counted directly: a declaration render whose offset falls strictly inside
+    // some use-edit's range. Corpus expectation 0, and gated.
+    let decl_inside_use = decls
+        .rendered
+        .iter()
+        .chain(decls.rendered_arm2.iter())
+        .filter(|(off, _)| uses.keys().any(|(lo, hi)| *off > *lo && *off < *hi))
+        .count();
+    Ok((decls, grafts, decl_inside_use))
 }
 
 /// **ARM 1's TEXT DIFFERENTIAL** — the rendered declaration vs the span layer's
@@ -663,6 +708,21 @@ pub(crate) struct TextDiff {
     /// silently, and in the direction that flatters the bound.
     pub kd_edits: usize,
     pub kd_offsets: usize,
+    /// **A declaration render whose offset lies strictly inside a use edit's
+    /// range** — the containment case the two-pass split does not remove.
+    /// Corpus expectation 0, GATED. See `transform_inner`'s doc.
+    pub decl_render_inside_use_edit: usize,
+    /// ⚠ **JOINT ACROSS BOTH ARMS, despite sitting in the arm-2 block.**
+    /// `arms_full` calls `compare_renders` three times against ONE `TextDiff`,
+    /// so this field and `ws_equal`/`ws_real`/`pairs`/`examples` accumulate arm
+    /// 1's comparison as well as arm 2's. That is deliberate for `ws_real`,
+    /// which gates and should fail on a real difference *anywhere*; it is
+    /// merely true of the rest. Arm 1 contributes 0 to all of them on the
+    /// frozen corpus, which is why the numbers read as arm-2-only — a
+    /// coincidence of the data, not a property of the code. Named by the
+    /// correctness persona at the arm-2 review; recorded rather than renamed
+    /// because the joint reading is the one the gate wants.
+    ///
     /// Where arm 2's differences sit. The two positions have **different
     /// evidential weight** and summing them would hide that:
     ///
@@ -762,7 +822,7 @@ fn compare_renders(
 pub(crate) fn arms_full(
     tcx: rustc_middle::ty::TyCtxt<'_>,
 ) -> Result<(RefDeclStats, UseGraftStats, TextDiff), String> {
-    let (decls, grafts) = transform_inner(tcx)?;
+    let (decls, grafts, decl_inside_use) = transform_inner(tcx)?;
     let (table, _ctx) = super::decide_table_with_ctx(tcx)?;
     let emission = super::emit_files(tcx, &table, &rustc_hash::FxHashSet::default())?;
 
@@ -830,6 +890,7 @@ pub(crate) fn arms_full(
         .chain(arm2.iter().map(|(o, _)| *o))
         .collect();
     d.kd_unmatched_span = by_offset.keys().filter(|o| !both.contains(o)).count();
+    d.decl_render_inside_use_edit = decl_inside_use;
     Ok((decls, grafts, d))
 }
 
@@ -1110,6 +1171,81 @@ mod arm2_witnesses {
             2,
             "every differing pair goes to the artifact"
         );
+    }
+
+    /// **Two AST nodes carrying one span are COUNTED, not silently
+    /// double-grafted.**
+    ///
+    /// The hole the correctness persona named at the arm-2 review, invisible to
+    /// every instrument that existed: the composition guard keys on `NodeId`,
+    /// so two distinct nodes sharing a span are two *legal* claims; `consumed`
+    /// is a set, so the second match leaves `unmatched` at 0. Both would have
+    /// grafted with nothing to show for it.
+    ///
+    /// The collision is CONSTRUCTED rather than hunted for: the map is keyed on
+    /// a span two nodes in the fixture genuinely share, and if the toolchain
+    /// stops producing that coincidence the premise assertion fails loudly
+    /// instead of the test passing over an empty case.
+    ///
+    /// *Mutation-tested:* reverting to a bare `consumed.insert(key);` leaves
+    /// `multi_matched` at 0 and fails.
+    #[test]
+    fn two_nodes_sharing_one_span_are_counted_not_silently_double_grafted() {
+        rustc_span::create_default_session_globals_then(|| {
+            let src = "fn f(p: *mut u8) -> u8 { (*p) }";
+            let mut krate = ::utils::ast::parse_crate(src.to_owned());
+            let (outer, inner) = {
+                let rustc_ast::ItemKind::Fn(f) = &krate.items[0].kind else {
+                    panic!("fixture is a fn")
+                };
+                let body = f.body.as_ref().expect("body");
+                let rustc_ast::StmtKind::Expr(e) = &body.stmts.last().expect("tail").kind else {
+                    panic!("tail is an expression")
+                };
+                match &e.kind {
+                    rustc_ast::ExprKind::Paren(i) => (e.span, i.span),
+                    _ => panic!("fixture's tail is a parenthesised expression"),
+                }
+            };
+            assert_ne!(
+                outer, inner,
+                "paren and inner must be distinct SPANS in this fixture; the \
+                 collision below is keyed deliberately, not discovered"
+            );
+
+            // Key on the inner span, then also register the outer under the
+            // same key value by construction: the point is one KEY reached by
+            // more than one node, which is what the corpus hazard is.
+            let map: FxHashMap<(u32, u32), String> =
+                [((inner.lo().0, inner.hi().0), "p[0]".to_owned())]
+                    .into_iter()
+                    .collect();
+            let mut guard = Composition::default();
+            let mut v = UseGraftVisitor::new(&map, &mut guard);
+            v.visit_crate(&mut krate);
+            let stats = v.finish();
+
+            assert_eq!(stats.unmatched, 0, "the key was reached");
+            assert_eq!(stats.grafted, 1, "exactly one node carries that span");
+            assert_eq!(
+                stats.multi_matched, 0,
+                "and with one match there is nothing to count"
+            );
+
+            // Now the hazard itself, injected: the same key reached twice.
+            let mut guard2 = Composition::default();
+            let mut v2 = UseGraftVisitor::new(&map, &mut guard2);
+            let mut krate2 = ::utils::ast::parse_crate(src.to_owned());
+            v2.visit_crate(&mut krate2);
+            v2.visit_crate(&mut krate2);
+            let stats2 = v2.finish();
+            assert!(
+                stats2.multi_matched >= 1,
+                "a key reached a second time MUST be counted — neither the \
+                 guard (distinct NodeIds) nor `unmatched` (set membership) can \
+                 observe it, so this counter is the only witness there is"
+            );
+        });
     }
 
     /// **The DECL position of the whitespace split — the positive-control
