@@ -7974,6 +7974,12 @@ mod run {
                 row.set("p3_multi_arm", p.multi_arm.to_string());
                 row.set("p3_arm_set_3", p.arm_set_3.to_string());
                 row.set("p3_emitted_subjects", p.emitted_subjects.to_string());
+                // ---- PHASE 4: the revert layer on the new layer ----
+                row.set("p4_decided", p.decided_subjects.to_string());
+                row.set("p4_placed", p.ast_decl_placed.to_string());
+                row.set("p4_unplaced", p.ast_decl_unplaced.to_string());
+                row.set("p4_use_unmatched", p.ast_use_unmatched.to_string());
+                row.set("p4_refused", p.ast_refused.to_string());
                 if !p.examples.is_empty() {
                     row.set(
                         "p3_examples",
@@ -10843,6 +10849,46 @@ fn p3_row_failures(program: &str, row: &report::Row) -> Vec<String> {
         (Ok(_), Ok(_)) => {}
         (Err(why), _) | (Ok(_), Err(why)) => out.push(why),
     }
+    // **PHASE 4 — THE REVERT LAYER, RE-DERIVED ON THE NEW LAYER.**
+    //
+    // Phase 3 held the revert set fixed and tested the transform layer; this is
+    // the complementary half. Revert means *do not transform that subtree*, so
+    // the AST layer must place an edit for EVERY surviving subject and for no
+    // reverted one, and the ledger must close with GAP 0.
+    //
+    // `unplaced` and `use_unmatched` are the new layer's `unplaceable`: a
+    // decided subject the walk cannot reach, or a use edit that evaporates
+    // leaving a converted declaration with a raw use under it. Both are ledger
+    // movements, which is the entire content of the GAP-0 claim.
+    match (
+        num("p4_decided"),
+        num("p3_emitted_subjects"),
+        num("p3_reverted_subjects"),
+    ) {
+        (Ok(d), Ok(e), Ok(r)) if d == e + r => {}
+        (Ok(d), Ok(e), Ok(r)) => out.push(format!(
+            "{program}: p4_decided={d} != emitted={e} + reverted={r} — GAP \
+             {} on the new layer",
+            d - e - r
+        )),
+        (Err(why), ..) | (Ok(_), Err(why), _) | (Ok(_), Ok(_), Err(why)) => out.push(why),
+    }
+    // Every surviving subject must have been PLACED by the AST layer.
+    match (num("p4_placed"), num("p3_emitted_subjects")) {
+        (Ok(p), Ok(e)) if p == e => {}
+        (Ok(p), Ok(e)) => out.push(format!(
+            "{program}: p4_placed={p} != emitted={e} — the AST layer did not \
+             place an edit for every surviving subject"
+        )),
+        (Err(why), _) | (Ok(_), Err(why)) => out.push(why),
+    }
+    for key in ["p4_unplaced", "p4_use_unmatched", "p4_refused"] {
+        match num(key) {
+            Ok(0) => {}
+            Ok(n) => out.push(format!("{program}: {key}={n}, expected 0")),
+            Err(why) => out.push(why),
+        }
+    }
     // Every compared function must have been EQUAL. Its own identity rather
     // than an inference from `differing == 0`, so a function compared and
     // counted in neither bucket cannot pass.
@@ -10876,6 +10922,12 @@ fn conforming_p3_row() -> report::Row {
     row.set("p3_multi_arm", "17");
     row.set("p3_arm_set_3", "0");
     row.set("p3_emitted_subjects", "17");
+    row.set("p3_reverted_subjects", "0");
+    row.set("p4_decided", "17");
+    row.set("p4_placed", "17");
+    row.set("p4_unplaced", "0");
+    row.set("p4_use_unmatched", "0");
+    row.set("p4_refused", "0");
     row
 }
 
@@ -10975,14 +11027,22 @@ fn every_p3_failure_class_actually_fails() {
         f.iter().any(|m| m.contains("p3_emitted_subjects")),
         "compared=0 with emitted=17 must fail: {f:?}"
     );
+    // The empty-program case carries BROTLI's measured row, not libcsv's with
+    // zeroes patched in: decided 495, all 495 reverted, nothing emitted, and
+    // therefore nothing placed. A control has to be a row the corpus really
+    // produces, or it tests an arrangement that cannot occur.
     let mut row = conforming_p3_row();
     row.set("p3_compared", "0");
     row.set("p3_equal", "0");
     row.set("p3_emitted_subjects", "0");
+    row.set("p3_reverted_subjects", "495");
+    row.set("p4_decided", "495");
+    row.set("p4_placed", "0");
     assert!(
         p3_row_failures("brotli", &row).is_empty(),
         "compared=0 with emitted=0 is LEGAL — five programs are legitimately \
-         empty and must not be forced to fail"
+         empty and must not be forced to fail: {:?}",
+        p3_row_failures("brotli", &row)
     );
 
     // compared != equal, BOTH directions — a `>=` spelling passes one of them.
@@ -11113,12 +11173,29 @@ fn m1_p3_corpus() {
         "the phase-3 gate compared NO functions — a parity claim over an empty \
          population is not a parity claim"
     );
-    // And it must have tested COMPOSITION, which is the thing this gate
-    // uniquely adds over the per-arm differentials.
-    assert!(
-        multi > 0,
-        "no function carried edits from more than one arm, so this gate \
-         re-proved the per-arm differentials and measured no composition"
+    // **`multi_arm > 0` IS RETIRED AS AN ASSERTION** (ruling 2026-08-14), and
+    // the reason is recorded rather than the check merely deleted.
+    //
+    // rs-crown never co-locates two arms in one function. Derived from the
+    // oracle BEFORE any code changed — 61 emitted-subject functions split
+    // **31 arm-1-only / 30 arm-2-only / 0 both** — reproduced by the run, and
+    // proven disjoint by `61 + 7 = 68 = compared`, since any overlap would have
+    // made `compared` smaller. The zero is a CORPUS-SHAPE PIN, not evidence.
+    //
+    // What this gate does establish: whole-function TOKEN parity over the
+    // complete surviving population, including same-arm multi-edit assembly,
+    // with every check live and fault-injected. Crate-granularity composition
+    // is recorded beside it — 2,819 `KindDecision` + 421 `SeamAdapter` edits
+    // applied in one pass, corpus-wide parity — as the assembly evidence this
+    // corpus can supply.
+    //
+    // ⚠ **REARM TRIPWIRE.** `multi_arm` stays REPORTED every run. The first
+    // capability change that makes it nonzero — fabricated-length placements,
+    // `-2`/`-3` re-measures, seam-market expansion — **REARMS the cross-arm
+    // parity obligation on those functions before that change banks.** Parked
+    // with a tripwire, not answered by fiat.
+    println!(
+        "BOC1-P3-REARM multi_arm={multi} (retired as an assertion; nonzero REARMS cross-arm parity)"
     );
     assert_eq!(
         rev_subj, 1058,

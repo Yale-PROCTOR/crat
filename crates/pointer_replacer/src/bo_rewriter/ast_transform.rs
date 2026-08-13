@@ -1891,9 +1891,10 @@ pub(crate) fn phase3_fn_parity(
         stats: RefDeclStats::default(),
     };
     v.visit_crate(&mut krate);
+    let decls_stats = v.stats;
     let mut g = UseGraftVisitor::new(&uses, &mut guard);
     g.visit_crate(&mut krate);
-    let _ = g.finish();
+    let grafts_stats = g.finish();
 
     // **F2 — seams obey the revert set too.** These were unfiltered on the
     // first run, on BOTH sides, so the two agreed about seams a revert should
@@ -1910,6 +1911,17 @@ pub(crate) fn phase3_fn_parity(
     s.visit_crate(&mut krate);
     let _ = s.finish();
 
+    // ---- PHASE 4's ledger, on the new layer ----
+    p.decided_subjects = table
+        .entries
+        .iter()
+        .filter(|(_, d)| !matches!(d, super::decision::Decision::Degraded(_)))
+        .count();
+    p.ast_decl_placed =
+        decls_stats.rewritten + decls_stats.slice_rewritten + decls_stats.opt_rewritten;
+    p.ast_decl_unplaced = decls_stats.not_a_pointer_decl;
+    p.ast_use_unmatched = grafts_stats.unmatched;
+
     // **A composition-guard refusal is STOP-class here.** Carried into the
     // result rather than swallowed: this gate is the first place three
     // transforms meet inside one function body.
@@ -1921,6 +1933,7 @@ pub(crate) fn phase3_fn_parity(
         ));
         p.differing += guard.refused.len();
     }
+    p.ast_refused = guard.refused.len();
 
     let mut printed: Vec<(rustc_span::Span, String)> = Vec::new();
     super::ast_bridge::collect_fn_prints(&krate.items, &mut printed);
@@ -2089,6 +2102,29 @@ pub(crate) struct FnParity {
     /// Subjects that survived the revert set — the per-program reconciliation
     /// denominator.
     pub emitted_subjects: usize,
+
+    // ---- PHASE 4: the revert layer, re-derived ON THE NEW LAYER ----
+    //
+    // Phase 3 held the revert set fixed and tested the transform layer. Phase 4
+    // asks the complementary question: does the AST layer PLACE an edit for
+    // every surviving subject and for no reverted one? A transform layer known
+    // good plus a revert layer checked here is what makes any later difference
+    // attributable to one of the two.
+    /// Every subject the decision table settled to an emitting form.
+    pub decided_subjects: usize,
+    /// Declarations the AST layer actually rewrote — arm 1 + arm 2's
+    /// declaration half. Must equal [`Self::emitted_subjects`].
+    pub ast_decl_placed: usize,
+    /// A surviving subject whose declaration the walk could not reach. **Not a
+    /// skip**: a decided subject the transform cannot place is a ledger
+    /// movement, which is the whole content of the GAP-0 claim.
+    pub ast_decl_unplaced: usize,
+    /// Use edits whose span matched no AST node — a converted declaration left
+    /// with a raw use under it, i.e. an ill-typed crate rather than a partial
+    /// rewrite.
+    pub ast_use_unmatched: usize,
+    /// Composition-guard refusals across all three passes.
+    pub ast_refused: usize,
     /// Subjects the revert set took back, so the ledger identity is checkable
     /// from this instrument's own output.
     pub reverted_subjects: usize,
