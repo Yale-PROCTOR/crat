@@ -11,7 +11,7 @@ use std::{
     path::{Path, PathBuf},
     process::{Command, Stdio},
     sync::atomic::{AtomicU64, Ordering},
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use rustc_const_eval::interpret::{GlobalAlloc, Scalar};
@@ -3720,8 +3720,88 @@ const MACHINE_ID: &str = "lambda7";
 const PLATFORM: &str = "linux-x86_64";
 const LIVENESS_BOUND_S: u64 = 14_400;
 const CANDIDATE_MEMORY_MAX_BYTES: u64 = 100 * 1024 * 1024 * 1024;
+const HOST_MEMORY_MARGIN_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 const LIL_ORACLE_PARTIAL_SHA256: &str =
     "86c9e73d0e419a08e04c6ff3ac91531d948cbc31a8acb80d9c5f7cd238587feb";
+const LIL_RESUME9_HEAD: &str = "e87be067d4717d3ea74dd5192f210b6de4170bac";
+const LIL_RESUME9_UNITS: [(&str, &str); 19] = [
+    (
+        "src::lil::_expreval_t::field0@d0",
+        "938b30fa2b20fcd987f4bef32163c6354545a6f451c44d4942445dd3dd0fbaa7",
+    ),
+    (
+        "src::lil::_lil_env_t::field0@d0",
+        "356b95b1049dce7b4dc436c2a42ad57e904df1b1bad9f1c027416367608474fc",
+    ),
+    (
+        "src::lil::_lil_env_t::field1@d0",
+        "c5255d927f6e2d55cc8a4938bd6c4b616871182c75bfa26efc2b0381314f5ff9",
+    ),
+    (
+        "src::lil::_lil_env_t::field2@d0",
+        "0bd5509d95a365c8f3a355b26ae292695158e3806a76b592857421ab5b5e0519",
+    ),
+    (
+        "src::lil::_lil_env_t::field5@d0",
+        "c55369f57d9f70388801e0bc0c146a1c4f6c990b6d2317331d85d3b8526969d7",
+    ),
+    (
+        "src::lil::_lil_func_t::field0@d0",
+        "ba0ece0a776e6d83d344ce0b31d382b182c8138036c7cb846c0a754e4593a921",
+    ),
+    (
+        "src::lil::_lil_func_t::field1@d0",
+        "8de2876076591d7a7c1f7de900020b30460566fdbf5f61d47271f374bdefea84",
+    ),
+    (
+        "src::lil::_lil_func_t::field2@d0",
+        "d2e24c6d2b5d7c2d607872a1f1e1c68afe367c7bab91600955a684e402f05c73",
+    ),
+    (
+        "src::lil::_lil_t::field0@d0",
+        "86dfad5c0349ba38251adbaf11afef156c14bd928c1e52ead464b06842f3f1ec",
+    ),
+    (
+        "src::lil::_lil_t::field10@d0",
+        "28dcc516054ef777481306efaf02db9498b43bb05892ad4e12c19d96a3698a10",
+    ),
+    (
+        "src::lil::_lil_t::field11@d0",
+        "213c5ba9f2e479b96f8ee1961f44a5e082673c775ce2241454923c401bfd4236",
+    ),
+    (
+        "src::lil::_lil_t::field12@d0",
+        "aeeae156107501ba3448c9b41f4d1a0e0e73e01ab89e8d7d49c7d74110103aa4",
+    ),
+    (
+        "src::lil::_lil_t::field13@d0",
+        "014f532cfe2452a5915038f06cca0b0498a4c3f09d8e2542e5bd7662d0946d6d",
+    ),
+    (
+        "src::lil::_lil_t::field14@d0",
+        "91908441e42079a1b285beeba3643f449a9ef7a797375c7127f7dfbd34693291",
+    ),
+    (
+        "src::lil::_lil_t::field17@d0",
+        "ffef0bd35f41d68ab1a5b5c631567d65a98cc4408cb777a9d865a4a9b41eb488",
+    ),
+    (
+        "src::lil::_lil_t::field1@d0",
+        "3171e05055e4bb4eff535426f07d8a9c6c62fc10a413bd0dcf514456af7d7a03",
+    ),
+    (
+        "src::lil::_lil_t::field8@d0",
+        "47228de7d4f258abd954b026a406c6e5dad43a822565ea255fa0f05ca180de8d",
+    ),
+    (
+        "src::lil::_lil_var_t::field0@d0",
+        "3ba326983ebe9d0d7a5f5680f2ed60a47ba429b01f533bd8257392478637d1ff",
+    ),
+    (
+        "src::lil::_lil_var_t::field1@d0",
+        "79c12c0bee945ea2ac565d5b7ebfafa6794cc16ff1ba250289e8c9766684804c",
+    ),
+];
 const RESOURCE_EXHAUSTED_HEADER: &str =
     "program\tfield_key\tstatus\tmemory_max_bytes\tpeak_rss_kb\tcgroup_peak_memory_kb\tphase\tdata";
 const A4_AGGREGATE_MANIFEST_SHA256: &str =
@@ -4027,6 +4107,50 @@ struct CandidateMemoryPeaks {
     cgroup_peak_memory_kb: u64,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CandidateMemoryReceipt {
+    process_peak_rss_kb: Option<u64>,
+    cgroup_peak_memory_kb: Option<u64>,
+    errors: Vec<String>,
+}
+
+impl CandidateMemoryReceipt {
+    fn require_complete(&self) -> Result<CandidateMemoryPeaks, String> {
+        if !self.errors.is_empty() {
+            return Err(self.errors.join("; "));
+        }
+        Ok(CandidateMemoryPeaks {
+            process_peak_rss_kb: self
+                .process_peak_rss_kb
+                .ok_or_else(|| "GNU-time peak RSS is unavailable".to_owned())?,
+            cgroup_peak_memory_kb: self
+                .cgroup_peak_memory_kb
+                .ok_or_else(|| "cgroup peak charged memory is unavailable".to_owned())?,
+        })
+    }
+
+    fn render(&self) -> String {
+        fn value(value: Option<u64>) -> String {
+            value.map_or_else(|| "unavailable".to_owned(), |value| value.to_string())
+        }
+        format!(
+            "peak_rss_kb={}\ncgroup_peak_memory_kb={}\n",
+            value(self.process_peak_rss_kb),
+            value(self.cgroup_peak_memory_kb),
+        )
+    }
+}
+
+impl From<CandidateMemoryPeaks> for CandidateMemoryReceipt {
+    fn from(peaks: CandidateMemoryPeaks) -> Self {
+        Self {
+            process_peak_rss_kb: Some(peaks.process_peak_rss_kb),
+            cgroup_peak_memory_kb: Some(peaks.cgroup_peak_memory_kb),
+            errors: Vec::new(),
+        }
+    }
+}
+
 fn parse_gnu_time_peak_rss_kb(receipt: &str) -> Result<u64, String> {
     const PREFIX: &str = "Maximum resident set size (kbytes):";
     let mut values = receipt
@@ -4048,39 +4172,49 @@ fn parse_gnu_time_peak_rss_kb(receipt: &str) -> Result<u64, String> {
     Ok(value)
 }
 
-fn require_candidate_memory_peaks(
+fn collect_candidate_memory_receipt(
     gnu_time_receipt: Option<&str>,
     cgroup_peak_memory_bytes: Option<u64>,
-) -> Result<CandidateMemoryPeaks, String> {
-    let process_peak_rss_kb = parse_gnu_time_peak_rss_kb(
-        gnu_time_receipt.ok_or_else(|| "GNU-time receipt is unavailable".to_owned())?,
-    )?;
-    let cgroup_peak_memory_bytes = cgroup_peak_memory_bytes
+) -> CandidateMemoryReceipt {
+    let process_peak_rss = gnu_time_receipt
+        .ok_or_else(|| "GNU-time receipt is unavailable".to_owned())
+        .and_then(parse_gnu_time_peak_rss_kb);
+    let cgroup_peak_memory = cgroup_peak_memory_bytes
         .filter(|peak| *peak > 0)
-        .ok_or_else(|| "cgroup peak charged memory is unavailable".to_owned())?;
-    Ok(CandidateMemoryPeaks {
-        process_peak_rss_kb,
-        cgroup_peak_memory_kb: cgroup_peak_memory_bytes.div_ceil(1024),
-    })
+        .ok_or_else(|| "cgroup peak charged memory is unavailable".to_owned())
+        .map(|bytes| bytes.div_ceil(1024));
+    let errors = process_peak_rss
+        .as_ref()
+        .err()
+        .into_iter()
+        .chain(cgroup_peak_memory.as_ref().err())
+        .cloned()
+        .collect();
+    CandidateMemoryReceipt {
+        process_peak_rss_kb: process_peak_rss.ok(),
+        cgroup_peak_memory_kb: cgroup_peak_memory.ok(),
+        errors,
+    }
 }
 
 fn render_candidate_memory_receipt(peaks: CandidateMemoryPeaks) -> String {
-    format!(
-        "peak_rss_kb={}\ncgroup_peak_memory_kb={}\n",
-        peaks.process_peak_rss_kb, peaks.cgroup_peak_memory_kb
-    )
+    CandidateMemoryReceipt::from(peaks).render()
 }
 
 fn classify_capped_candidate(
     cap_verified: bool,
     oom_kills: u64,
+    memory_max_events: u64,
     worker_ok: bool,
 ) -> Result<&'static str, String> {
     if !cap_verified {
         return Err("candidate cgroup MemoryMax cap was not verified".to_owned());
     }
-    if oom_kills > 0 {
+    if oom_kills > 0 && memory_max_events > 0 {
         return Ok("resource-exhausted");
+    }
+    if oom_kills > 0 {
+        return Ok("environment-oom-kill");
     }
     Ok(if worker_ok { "ok" } else { "failed" })
 }
@@ -4475,11 +4609,108 @@ fn last_phase(stderr: &str) -> (String, String) {
 struct CappedCandidateOutcome {
     status: String,
     wall_s: f64,
-    memory_peaks: Option<CandidateMemoryPeaks>,
+    memory_receipt: CandidateMemoryReceipt,
     memory_receipt_error: Option<String>,
     stderr: String,
     cap_verified: bool,
     oom_kills: u64,
+    memory_max_events: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct HostMemoryPreflight {
+    mem_available_bytes: Option<u64>,
+    required_bytes: u64,
+    status: &'static str,
+    error: Option<String>,
+}
+
+impl HostMemoryPreflight {
+    fn launch_allowed(&self) -> bool {
+        self.status == "ready"
+    }
+
+    fn render(&self, program: &str, candidate: &str, timestamp_unix_s: u64) -> String {
+        let available = self.mem_available_bytes.map_or_else(
+            || "unavailable".to_owned(),
+            |available| available.to_string(),
+        );
+        format!(
+            "machine_id={MACHINE_ID}\nplatform={PLATFORM}\ntimestamp_unix_s={timestamp_unix_s}\nprogram={}\ncandidate={}\nstatus={}\nmeasurement_started=false\nmemory_max_bytes={CANDIDATE_MEMORY_MAX_BYTES}\nmargin_bytes={HOST_MEMORY_MARGIN_BYTES}\nrequired_bytes={}\nmem_available_bytes={available}\nerror={}\n",
+            clean_cell(program),
+            clean_cell(candidate),
+            self.status,
+            self.required_bytes,
+            clean_cell(self.error.as_deref().unwrap_or("none")),
+        )
+    }
+}
+
+fn evaluate_host_memory_preflight(meminfo: &str) -> HostMemoryPreflight {
+    let required_bytes = CANDIDATE_MEMORY_MAX_BYTES + HOST_MEMORY_MARGIN_BYTES;
+    let mut values = meminfo.lines().filter_map(|line| {
+        line.strip_prefix("MemAvailable:")
+            .map(|value| value.trim().to_owned())
+    });
+    let parsed = match (values.next(), values.next()) {
+        (None, _) => Err("/proc/meminfo lacks MemAvailable".to_owned()),
+        (Some(_), Some(_)) => Err("/proc/meminfo duplicates MemAvailable".to_owned()),
+        (Some(value), None) => {
+            let mut fields = value.split_whitespace();
+            let kib = fields
+                .next()
+                .ok_or_else(|| "MemAvailable has no value".to_owned())
+                .and_then(|value| {
+                    value
+                        .parse::<u64>()
+                        .map_err(|error| format!("MemAvailable is not an integer: {error}"))
+                });
+            match (kib, fields.next(), fields.next()) {
+                (Ok(kib), Some("kB"), None) => kib
+                    .checked_mul(1024)
+                    .ok_or_else(|| "MemAvailable overflows bytes".to_owned()),
+                (Err(error), _, _) => Err(error),
+                _ => Err("MemAvailable must have exactly a kB value".to_owned()),
+            }
+        }
+    };
+    match parsed {
+        Ok(available) if available > required_bytes => HostMemoryPreflight {
+            mem_available_bytes: Some(available),
+            required_bytes,
+            status: "ready",
+            error: None,
+        },
+        Ok(available) => HostMemoryPreflight {
+            mem_available_bytes: Some(available),
+            required_bytes,
+            status: "host-memory-insufficient",
+            error: Some("MemAvailable is not strictly greater than cap plus margin".to_owned()),
+        },
+        Err(error) => HostMemoryPreflight {
+            mem_available_bytes: None,
+            required_bytes,
+            status: "host-memory-unavailable",
+            error: Some(error),
+        },
+    }
+}
+
+fn candidate_systemd_properties(memory_max_bytes: u64) -> Vec<String> {
+    vec![
+        "Type=exec".to_owned(),
+        "MemoryAccounting=yes".to_owned(),
+        format!("MemoryMax={memory_max_bytes}"),
+        "OOMPolicy=continue".to_owned(),
+    ]
+}
+
+fn resume9_lil_unit_is_authorized(index: usize, field_key: &str, manifest: &str) -> bool {
+    LIL_RESUME9_UNITS
+        .get(index)
+        .is_some_and(|(expected_field, expected_manifest)| {
+            field_key == *expected_field && manifest == *expected_manifest
+        })
 }
 
 static CANDIDATE_UNIT_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -4499,11 +4730,12 @@ fn read_u64_file(path: &Path) -> Option<u64> {
     fs::read_to_string(path).ok()?.trim().parse().ok()
 }
 
-fn read_oom_kills(path: &Path) -> Option<u64> {
+fn read_memory_event(path: &Path, key: &str) -> Option<u64> {
     fs::read_to_string(path)
         .ok()?
         .lines()
-        .find_map(|line| line.strip_prefix("oom_kill "))?
+        .find_map(|line| line.split_once(' ').filter(|(name, _)| *name == key))?
+        .1
         .parse()
         .ok()
 }
@@ -4553,15 +4785,10 @@ fn run_capped_candidate_child(
         "--same-dir",
         "--unit",
         &unit,
-        "--property",
-        "Type=exec",
-        "--property",
-        "MemoryAccounting=yes",
-        "--property",
-        &format!("MemoryMax={CANDIDATE_MEMORY_MAX_BYTES}"),
-        "--property",
-        "OOMPolicy=stop",
     ]);
+    for property in candidate_systemd_properties(CANDIDATE_MEMORY_MAX_BYTES) {
+        command.arg("--property").arg(property);
+    }
     for (key, value) in environment {
         let mut assignment = key;
         assignment.push("=");
@@ -4584,6 +4811,7 @@ fn run_capped_candidate_child(
     let mut cap_verified = false;
     let mut peak_bytes = 0;
     let mut oom_kills = 0;
+    let mut memory_max_events = 0;
     let mut timed_out = false;
     let status = loop {
         if cgroup_path.is_none()
@@ -4603,7 +4831,10 @@ fn run_capped_candidate_child(
                 cap_verified = true;
             }
             peak_bytes = peak_bytes.max(read_u64_file(&cgroup.join("memory.peak")).unwrap_or(0));
-            oom_kills = oom_kills.max(read_oom_kills(&cgroup.join("memory.events")).unwrap_or(0));
+            let events = cgroup.join("memory.events");
+            oom_kills = oom_kills.max(read_memory_event(&events, "oom_kill").unwrap_or(0));
+            memory_max_events =
+                memory_max_events.max(read_memory_event(&events, "max").unwrap_or(0));
         }
         match child.try_wait().expect("poll capped candidate worker") {
             Some(status) => break status,
@@ -4618,16 +4849,20 @@ fn run_capped_candidate_child(
     if systemd_user_property(&unit, "Result").as_deref() == Some("oom-kill") {
         oom_kills = oom_kills.max(1);
     }
+    peak_bytes = peak_bytes.max(
+        systemd_user_property(&unit, "MemoryPeak")
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(0),
+    );
     let wall_s = started.elapsed().as_secs_f64();
     let stdout = fs::read_to_string(&out_path).unwrap_or_default();
     let stderr = fs::read_to_string(&err_path).unwrap_or_default();
     let gnu_time_receipt = fs::read_to_string(&time_path).ok();
-    let memory_receipt = require_candidate_memory_peaks(
+    let memory_receipt = collect_candidate_memory_receipt(
         gnu_time_receipt.as_deref(),
         (peak_bytes > 0).then_some(peak_bytes),
     );
-    let memory_receipt_error = memory_receipt.as_ref().err().cloned();
-    let memory_peaks = memory_receipt.ok();
+    let memory_receipt_error = memory_receipt.require_complete().err();
     let row = stdout.lines().rev().find_map(super::report::parse_kv_line);
     let worker_ok = status.success()
         && row
@@ -4636,10 +4871,8 @@ fn run_capped_candidate_child(
             .is_some_and(|status| status == "ok");
     let classification = if timed_out {
         "timeout".to_owned()
-    } else if memory_receipt_error.is_some() {
-        "metric-receipt-failure".to_owned()
     } else {
-        match classify_capped_candidate(cap_verified, oom_kills, worker_ok) {
+        match classify_capped_candidate(cap_verified, oom_kills, memory_max_events, worker_ok) {
             Ok("failed") => row
                 .as_ref()
                 .and_then(|row| row.get("status"))
@@ -4649,6 +4882,7 @@ fn run_capped_candidate_child(
                     "crash"
                 })
                 .to_owned(),
+            Ok("ok") if memory_receipt_error.is_some() => "metric-receipt-failure".to_owned(),
             Ok(status) => status.to_owned(),
             Err(_) => "cap-setup-failure".to_owned(),
         }
@@ -4656,11 +4890,12 @@ fn run_capped_candidate_child(
     CappedCandidateOutcome {
         status: classification,
         wall_s,
-        memory_peaks,
+        memory_receipt,
         memory_receipt_error,
         stderr,
         cap_verified,
         oom_kills,
+        memory_max_events,
     }
 }
 
@@ -5329,8 +5564,10 @@ fn isolated_identities(contract: &MeasurementContract, program: &str) -> Vec<Iso
 
 fn validate_isolated_unit(
     contract: &MeasurementContract,
+    index: usize,
     expected: &IsolatedIdentity,
     dir: &Path,
+    manifest: &str,
 ) -> Result<(), String> {
     let candidates = parse_table(&dir.join("candidates.tsv"), CANDIDATE_HEADER, 7)?;
     let roots = parse_table(&dir.join("roots.tsv"), ROOT_HEADER, 8)?;
@@ -5391,11 +5628,23 @@ fn validate_isolated_unit(
         ));
     }
     let receipt = parse_receipt(&dir.join("receipt.txt"))?;
+    let receipt_head = receipt
+        .get("analysis_head")
+        .ok_or_else(|| "isolated receipt lacks analysis_head".to_owned())?;
+    let current_head = receipt_head == &contract.head;
+    let resume9_unit = receipt_head == LIL_RESUME9_HEAD
+        && expected.identity.program == "lil"
+        && resume9_lil_unit_is_authorized(index, &expected.identity.field_key, manifest);
+    if !current_head && !resume9_unit {
+        return Err(format!(
+            "isolated receipt head is not authorized for index={index} candidate={} manifest={manifest}",
+            expected.identity.field_key
+        ));
+    }
     for (key, value) in [
         ("status", "ok"),
         ("data", "true"),
         ("checkpoint_data", "false"),
-        ("analysis_head", contract.head.as_str()),
         ("program", expected.identity.program.as_str()),
         ("candidate", expected.identity.field_key.as_str()),
         ("population", expected.population),
@@ -5418,6 +5667,27 @@ fn validate_isolated_unit(
             .map_err(|error| format!("isolated receipt {key} is invalid: {error}"))?;
         if value == 0 {
             return Err(format!("isolated receipt {key} is zero"));
+        }
+    }
+    if current_head {
+        let preflight = parse_receipt(&dir.join("memory-preflight.txt"))?;
+        for (key, expected_value) in [
+            ("status", "ready"),
+            ("measurement_started", "false"),
+            ("machine_id", MACHINE_ID),
+            ("platform", PLATFORM),
+            ("program", expected.identity.program.as_str()),
+            ("candidate", expected.identity.field_key.as_str()),
+            ("memory_max_bytes", "107374182400"),
+            ("margin_bytes", "8589934592"),
+            ("required_bytes", "115964116992"),
+        ] {
+            if preflight.get(key).map(String::as_str) != Some(expected_value) {
+                return Err(format!(
+                    "isolated memory preflight {key} mismatch for {}",
+                    expected.identity.field_key
+                ));
+            }
         }
     }
     let candidates_text = fs::read_to_string(dir.join("candidates.tsv"))
@@ -5525,12 +5795,13 @@ fn run_shard(contract: &MeasurementContract, program: super::CorpusProgram) {
                     identity.identity.field_key
                 )
             });
-            validate_isolated_unit(contract, &identity, &unit_dir).unwrap_or_else(|error| {
-                panic!(
-                    "A4C STOP phase=candidate-verified-skip candidate={}: {error}",
-                    identity.identity.field_key
-                )
-            });
+            validate_isolated_unit(contract, index, &identity, &unit_dir, &manifest)
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "A4C STOP phase=candidate-verified-skip candidate={}: {error}",
+                        identity.identity.field_key
+                    )
+                });
             let receipt =
                 parse_receipt(&unit_dir.join("receipt.txt")).expect("parse candidate receipt");
             completed.push((
@@ -5548,6 +5819,35 @@ fn run_shard(contract: &MeasurementContract, program: super::CorpusProgram) {
             continue;
         }
         fs::create_dir(&unit_dir).expect("create fresh candidate unit");
+        let preflight = fs::read_to_string("/proc/meminfo")
+            .map(|meminfo| evaluate_host_memory_preflight(&meminfo))
+            .unwrap_or_else(|error| HostMemoryPreflight {
+                mem_available_bytes: None,
+                required_bytes: CANDIDATE_MEMORY_MAX_BYTES + HOST_MEMORY_MARGIN_BYTES,
+                status: "host-memory-unavailable",
+                error: Some(format!("read /proc/meminfo: {error}")),
+            });
+        let timestamp_unix_s = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock before Unix epoch")
+            .as_secs();
+        fs::write(
+            unit_dir.join("memory-preflight.txt"),
+            preflight.render(program.name, &identity.identity.field_key, timestamp_unix_s),
+        )
+        .expect("write candidate memory preflight");
+        if !preflight.launch_allowed() {
+            let manifest = write_manifest(&unit_dir, &["memory-preflight.txt"])
+                .expect("manifest failed memory preflight");
+            panic!(
+                "A4C STOP phase=candidate-memory-preflight candidate={} program={} status={} mem_available_bytes={} required_bytes={} measurement_started=false manifest={manifest}",
+                identity.identity.field_key,
+                program.name,
+                preflight.status,
+                preflight.mem_available_bytes.unwrap_or(0),
+                preflight.required_bytes,
+            );
+        }
         let outcome = run_capped_candidate_child(
             program.name,
             &input,
@@ -5581,7 +5881,7 @@ fn run_shard(contract: &MeasurementContract, program: super::CorpusProgram) {
         );
         let (phase, marker_candidate) = last_phase(&outcome.stderr);
         if outcome.status != "ok" {
-            let memory_peaks = outcome.memory_peaks;
+            let memory_peaks = outcome.memory_receipt.require_complete().ok();
             if outcome.status == "resource-exhausted" {
                 let memory_peaks = memory_peaks
                     .expect("resource-exhausted classification requires both memory metrics");
@@ -5598,16 +5898,19 @@ fn run_shard(contract: &MeasurementContract, program: super::CorpusProgram) {
                 write_atomic_checkpoint(&dir.join("resource-exhausted.tsv"), &resource)
                     .expect("write program resource exception");
             }
-            let memory_receipt = memory_peaks.map_or_else(
-                || "peak_rss_kb=unavailable\ncgroup_peak_memory_kb=unavailable\n".to_owned(),
-                render_candidate_memory_receipt,
-            );
+            let memory_receipt = outcome.memory_receipt.render();
             let memory_receipt_error =
                 clean_cell(outcome.memory_receipt_error.as_deref().unwrap_or("none"));
+            let oom_killer = if outcome.oom_kills > 0 {
+                "kernel-oom-killer"
+            } else {
+                "none"
+            };
             let receipt = format!(
-                "machine_id={MACHINE_ID}\nplatform={PLATFORM}\nmemory_limit=cgroup-100GiB\nmemory_max_bytes={CANDIDATE_MEMORY_MAX_BYTES}\ncap_verified={}\noom_kills={}\nwall_bound_kind=liveness\nwall_cap_s={LIVENESS_BOUND_S}\nprogram={}\ncandidate={}\npopulation={}\nstatus={}\ndata=false\ncheckpoint_data=false\nanalysis_head={}\nlast_phase={phase}\nlast_candidate={marker_candidate}\nwall_s={:.3}\n{memory_receipt}memory_receipt_error={memory_receipt_error}\n",
+                "machine_id={MACHINE_ID}\nplatform={PLATFORM}\nmemory_limit=cgroup-100GiB\nmemory_max_bytes={CANDIDATE_MEMORY_MAX_BYTES}\ncap_verified={}\noom_kills={}\nmemory_max_events={}\noom_killer={oom_killer}\nwall_bound_kind=liveness\nwall_cap_s={LIVENESS_BOUND_S}\nprogram={}\ncandidate={}\npopulation={}\nstatus={}\ndata=false\ncheckpoint_data=false\nanalysis_head={}\nlast_phase={phase}\nlast_candidate={marker_candidate}\nwall_s={:.3}\n{memory_receipt}memory_receipt_error={memory_receipt_error}\n",
                 outcome.cap_verified,
                 outcome.oom_kills,
+                outcome.memory_max_events,
                 program.name,
                 clean_cell(&identity.identity.field_key),
                 identity.population,
@@ -5616,7 +5919,12 @@ fn run_shard(contract: &MeasurementContract, program: super::CorpusProgram) {
                 outcome.wall_s,
             );
             fs::write(unit_dir.join("receipt.txt"), receipt).expect("write failed unit receipt");
-            let mut files = vec!["receipt.txt", "worker.out", "worker.err"];
+            let mut files = vec![
+                "memory-preflight.txt",
+                "receipt.txt",
+                "worker.out",
+                "worker.err",
+            ];
             for file in [
                 "candidates.tsv",
                 "roots.tsv",
@@ -5636,23 +5944,21 @@ fn run_shard(contract: &MeasurementContract, program: super::CorpusProgram) {
             )
             .expect("write program checkpoint after failed unit");
             panic!(
-                "A4C STOP phase={phase} candidate={} program={} status={} cap_bytes={} wall_s={:.3} peak_rss_kb={} cgroup_peak_memory_kb={} memory_receipt_error={} manifest={manifest}",
+                "A4C STOP phase={phase} candidate={} program={} status={} killer={oom_killer} cap_bytes={} max_events={} wall_s={:.3} peak_rss_kb={} cgroup_peak_memory_kb={} memory_receipt_error={} manifest={manifest}",
                 identity.identity.field_key,
                 program.name,
                 outcome.status,
                 CANDIDATE_MEMORY_MAX_BYTES,
+                outcome.memory_max_events,
                 outcome.wall_s,
-                memory_peaks
-                    .map(|peaks| peaks.process_peak_rss_kb)
-                    .unwrap_or(0),
-                memory_peaks
-                    .map(|peaks| peaks.cgroup_peak_memory_kb)
-                    .unwrap_or(0),
+                outcome.memory_receipt.process_peak_rss_kb.unwrap_or(0),
+                outcome.memory_receipt.cgroup_peak_memory_kb.unwrap_or(0),
                 memory_receipt_error,
             );
         }
         let memory_peaks = outcome
-            .memory_peaks
+            .memory_receipt
+            .require_complete()
             .expect("ok candidate requires both memory metrics");
         let candidates = parse_table(&unit_dir.join("candidates.tsv"), CANDIDATE_HEADER, 7)
             .expect("parse isolated candidates");
@@ -5672,9 +5978,10 @@ fn run_shard(contract: &MeasurementContract, program: super::CorpusProgram) {
             Err(error) => {
                 let memory_receipt = render_candidate_memory_receipt(memory_peaks);
                 let receipt = format!(
-                    "machine_id={MACHINE_ID}\nplatform={PLATFORM}\nmemory_limit=cgroup-100GiB\nmemory_max_bytes={CANDIDATE_MEMORY_MAX_BYTES}\ncap_verified={}\noom_kills={}\nwall_bound_kind=liveness\nwall_cap_s={LIVENESS_BOUND_S}\nprogram={}\ncandidate={}\npopulation={}\nstatus=oracle-byte-mismatch\ndata=false\ncheckpoint_data=false\nanalysis_head={}\nlast_phase=oracle-byte-compare\nlast_candidate={}\nwall_s={:.3}\n{memory_receipt}memory_receipt_error=none\noracle_byte_match=false\noracle_partial_sha256={LIL_ORACLE_PARTIAL_SHA256}\n",
+                    "machine_id={MACHINE_ID}\nplatform={PLATFORM}\nmemory_limit=cgroup-100GiB\nmemory_max_bytes={CANDIDATE_MEMORY_MAX_BYTES}\ncap_verified={}\noom_kills={}\nmemory_max_events={}\noom_killer=none\nwall_bound_kind=liveness\nwall_cap_s={LIVENESS_BOUND_S}\nprogram={}\ncandidate={}\npopulation={}\nstatus=oracle-byte-mismatch\ndata=false\ncheckpoint_data=false\nanalysis_head={}\nlast_phase=oracle-byte-compare\nlast_candidate={}\nwall_s={:.3}\n{memory_receipt}memory_receipt_error=none\noracle_byte_match=false\noracle_partial_sha256={LIL_ORACLE_PARTIAL_SHA256}\n",
                     outcome.cap_verified,
                     outcome.oom_kills,
+                    outcome.memory_max_events,
                     program.name,
                     clean_cell(&identity.identity.field_key),
                     identity.population,
@@ -5687,6 +5994,7 @@ fn run_shard(contract: &MeasurementContract, program: super::CorpusProgram) {
                 let manifest = write_manifest(
                     &unit_dir,
                     &[
+                        "memory-preflight.txt",
                         "candidates.tsv",
                         "roots.tsv",
                         "exceptions.tsv",
@@ -5716,9 +6024,10 @@ fn run_shard(contract: &MeasurementContract, program: super::CorpusProgram) {
         };
         let memory_receipt = render_candidate_memory_receipt(memory_peaks);
         let receipt = format!(
-            "machine_id={MACHINE_ID}\nplatform={PLATFORM}\nmemory_limit=cgroup-100GiB\nmemory_max_bytes={CANDIDATE_MEMORY_MAX_BYTES}\ncap_verified={}\noom_kills={}\nwall_bound_kind=liveness\nwall_cap_s={LIVENESS_BOUND_S}\nprogram={}\ncandidate={}\npopulation={}\nstatus=ok\ndata=true\ncheckpoint_data=false\nanalysis_head={}\ncandidates={}\nroots={}\nexceptions={}\nlast_phase={phase}\nlast_candidate={marker_candidate}\nwall_s={:.3}\n{memory_receipt}memory_receipt_error=none\noracle_byte_match={oracle_label}\noracle_partial_sha256={LIL_ORACLE_PARTIAL_SHA256}\n",
+            "machine_id={MACHINE_ID}\nplatform={PLATFORM}\nmemory_limit=cgroup-100GiB\nmemory_max_bytes={CANDIDATE_MEMORY_MAX_BYTES}\ncap_verified={}\noom_kills={}\nmemory_max_events={}\noom_killer=none\nwall_bound_kind=liveness\nwall_cap_s={LIVENESS_BOUND_S}\nprogram={}\ncandidate={}\npopulation={}\nstatus=ok\ndata=true\ncheckpoint_data=false\nanalysis_head={}\ncandidates={}\nroots={}\nexceptions={}\nlast_phase={phase}\nlast_candidate={marker_candidate}\nwall_s={:.3}\n{memory_receipt}memory_receipt_error=none\noracle_byte_match={oracle_label}\noracle_partial_sha256={LIL_ORACLE_PARTIAL_SHA256}\n",
             outcome.cap_verified,
             outcome.oom_kills,
+            outcome.memory_max_events,
             program.name,
             clean_cell(&identity.identity.field_key),
             identity.population,
@@ -5732,6 +6041,7 @@ fn run_shard(contract: &MeasurementContract, program: super::CorpusProgram) {
         let manifest = write_manifest(
             &unit_dir,
             &[
+                "memory-preflight.txt",
                 "candidates.tsv",
                 "roots.tsv",
                 "exceptions.tsv",
@@ -5747,7 +6057,7 @@ fn run_shard(contract: &MeasurementContract, program: super::CorpusProgram) {
             verify_manifest(&unit_dir).expect("verify completed unit manifest"),
             manifest
         );
-        validate_isolated_unit(contract, &identity, &unit_dir)
+        validate_isolated_unit(contract, index, &identity, &unit_dir, &manifest)
             .expect("validate newly completed isolated unit");
         completed.push((index, identity, manifest, outcome.wall_s, memory_peaks));
         write_atomic_checkpoint(
@@ -5760,9 +6070,9 @@ fn run_shard(contract: &MeasurementContract, program: super::CorpusProgram) {
     let mut combined_candidates = String::new();
     let mut combined_roots = String::new();
     let mut combined_exceptions = String::new();
-    for (index, identity, _, _, _) in &completed {
+    for (index, identity, manifest, _, _) in &completed {
         let unit_dir = units_dir.join(format!("{index:03}"));
-        validate_isolated_unit(contract, identity, &unit_dir)
+        validate_isolated_unit(contract, *index, identity, &unit_dir, manifest)
             .expect("revalidate isolated unit before program finalization");
         append_table(
             &mut combined_candidates,
@@ -6324,13 +6634,17 @@ mod tests {
 
     #[test]
     fn capped_candidate_classification_is_fail_closed() {
-        assert_eq!(classify_capped_candidate(true, 0, true), Ok("ok"));
+        assert_eq!(classify_capped_candidate(true, 0, 0, true), Ok("ok"));
         assert_eq!(
-            classify_capped_candidate(true, 1, false),
+            classify_capped_candidate(true, 1, 1, false),
             Ok("resource-exhausted")
         );
+        assert_eq!(
+            classify_capped_candidate(true, 1, 0, false),
+            Ok("environment-oom-kill")
+        );
         assert!(
-            classify_capped_candidate(false, 0, false)
+            classify_capped_candidate(false, 0, 0, false)
                 .expect_err("an unverified cgroup cap must fail setup")
                 .contains("cap was not verified")
         );
@@ -6372,26 +6686,94 @@ mod tests {
     }
 
     #[test]
-    fn candidate_memory_receipt_separates_and_requires_both_metrics() {
-        let peaks = require_candidate_memory_peaks(
+    fn candidate_memory_receipt_preserves_each_available_metric() {
+        let receipt = collect_candidate_memory_receipt(
             Some("Maximum resident set size (kbytes): 333660\n"),
             Some(205_209_600),
-        )
-        .unwrap();
+        );
+        let peaks = receipt.require_complete().unwrap();
         assert_eq!(peaks.process_peak_rss_kb, 333_660);
         assert_eq!(peaks.cgroup_peak_memory_kb, 200_400);
         assert_eq!(
-            render_candidate_memory_receipt(peaks),
+            receipt.render(),
             "peak_rss_kb=333660\ncgroup_peak_memory_kb=200400\n"
         );
-        assert!(require_candidate_memory_peaks(None, Some(205_209_600)).is_err());
-        assert!(
-            require_candidate_memory_peaks(
-                Some("Maximum resident set size (kbytes): 333660\n"),
-                None,
-            )
-            .is_err()
+        let cgroup_only = collect_candidate_memory_receipt(None, Some(205_209_600));
+        assert_eq!(
+            cgroup_only.render(),
+            "peak_rss_kb=unavailable\ncgroup_peak_memory_kb=200400\n"
         );
+        assert!(cgroup_only.require_complete().is_err());
+        let rss_only = collect_candidate_memory_receipt(
+            Some("Maximum resident set size (kbytes): 333660\n"),
+            None,
+        );
+        assert_eq!(
+            rss_only.render(),
+            "peak_rss_kb=333660\ncgroup_peak_memory_kb=unavailable\n"
+        );
+        assert!(rss_only.require_complete().is_err());
+    }
+
+    #[test]
+    fn candidate_systemd_policy_keeps_the_wrapper_alive_after_child_oom() {
+        let properties = candidate_systemd_properties(CANDIDATE_MEMORY_MAX_BYTES);
+        assert!(
+            properties
+                .iter()
+                .any(|property| property == "OOMPolicy=continue")
+        );
+        assert!(
+            !properties
+                .iter()
+                .any(|property| property == "OOMPolicy=stop")
+        );
+    }
+
+    #[test]
+    fn host_memory_preflight_is_typed_and_strictly_above_cap_plus_margin() {
+        let threshold = CANDIDATE_MEMORY_MAX_BYTES + HOST_MEMORY_MARGIN_BYTES;
+        let ready = evaluate_host_memory_preflight(&format!(
+            "MemTotal: 200000000 kB\nMemAvailable: {} kB\n",
+            threshold / 1024 + 1
+        ));
+        assert_eq!(ready.status, "ready");
+        assert!(ready.launch_allowed());
+        assert_eq!(ready.required_bytes, threshold);
+        assert!(
+            ready
+                .render("fixture", "Fixture::field0@d0", 123)
+                .contains("status=ready\nmeasurement_started=false\n")
+        );
+
+        let equal =
+            evaluate_host_memory_preflight(&format!("MemAvailable: {} kB\n", threshold / 1024));
+        assert_eq!(equal.status, "host-memory-insufficient");
+        assert!(!equal.launch_allowed());
+        assert!(
+            evaluate_host_memory_preflight("MemTotal: 1 kB\n")
+                .render("fixture", "Fixture::field0@d0", 123)
+                .contains("mem_available_bytes=unavailable")
+        );
+    }
+
+    #[test]
+    fn resume9_unit_reuse_is_exactly_manifest_and_identity_scoped() {
+        assert!(resume9_lil_unit_is_authorized(
+            0,
+            "src::lil::_expreval_t::field0@d0",
+            "938b30fa2b20fcd987f4bef32163c6354545a6f451c44d4942445dd3dd0fbaa7",
+        ));
+        assert!(!resume9_lil_unit_is_authorized(
+            0,
+            "src::lil::_expreval_t::field0@d0",
+            "0000000000000000000000000000000000000000000000000000000000000000",
+        ));
+        assert!(!resume9_lil_unit_is_authorized(
+            19,
+            "src::lil::_lil_var_t::field2@d0",
+            "938b30fa2b20fcd987f4bef32163c6354545a6f451c44d4942445dd3dd0fbaa7",
+        ));
     }
 
     #[test]
