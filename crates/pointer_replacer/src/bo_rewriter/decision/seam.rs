@@ -250,7 +250,7 @@ pub(crate) struct GlueSpec {
 }
 
 impl GlueSpec {
-    fn core(core: GlueCore, mutable: bool) -> Self {
+    pub(crate) fn core(core: GlueCore, mutable: bool) -> Self {
         Self {
             core,
             mutable,
@@ -260,17 +260,17 @@ impl GlueSpec {
         }
     }
 
-    fn with_unwrap(mut self, found_mutable: bool) -> Self {
+    pub(crate) fn with_unwrap(mut self, found_mutable: bool) -> Self {
         self.unwrap = Some(found_mutable);
         self
     }
 
-    fn with_len(mut self, len: &str) -> Self {
+    pub(crate) fn with_len(mut self, len: &str) -> Self {
         self.len = Some(len.to_owned());
         self
     }
 
-    fn wrapped(mut self) -> Self {
+    pub(crate) fn wrapped(mut self) -> Self {
         self.optional = true;
         self
     }

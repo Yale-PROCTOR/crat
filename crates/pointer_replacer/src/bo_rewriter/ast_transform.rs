@@ -630,6 +630,273 @@ impl MutVisitor for UseGraftVisitor<'_> {
     }
 }
 
+/// What the seam pass placed, declined, and rendered.
+///
+/// Every decline is a **typed counter** rather than a skip, on the same rule
+/// arm 2 landed under: an adapter that evaporates leaves the callee converted
+/// and the call site raw, which is precisely the `E0308` the whole slice exists
+/// to remove.
+#[derive(Default)]
+pub(crate) struct SeamGraftStats {
+    pub grafted: usize,
+    pub safe: usize,
+    pub reborrow: usize,
+    /// Slice seams whose `{len}` was parsed and grafted. **The one genuinely
+    /// new expression in arm 3** — it has no subtree behind it, which is why
+    /// the split rule sends it through [`graft_expr`] rather than a builder.
+    pub len_grafted: usize,
+    /// `{len}` texts [`graft_expr`] refused. A checked corpus expectation of
+    /// zero, per R7.4 — never an abort, never a silent skip.
+    pub len_parse_failed: usize,
+    pub len_parse_failures: Vec<String>,
+    /// A `FromRawParts` spec that reached the builder with no length at all.
+    /// Unreachable through `glue`, which returns `SeamBlock::LengthUnknown`
+    /// first — counted because **no layer below the gate may invent a length**,
+    /// and a builder that silently dropped the shape would be doing exactly
+    /// that in the other direction.
+    pub len_absent: usize,
+    /// Seam edits whose span matched no AST expression.
+    pub unmatched: usize,
+    pub refused: usize,
+    /// One seam key matched by MORE THAN ONE AST node — invisible to both the
+    /// guard (which keys on `NodeId`) and to `unmatched` (a set membership),
+    /// exactly as at the use pass.
+    pub multi_matched: usize,
+    /// Two seam edits carrying the SAME span, one overwriting the other in the
+    /// lookup map. The join in this file that would otherwise have no collision
+    /// counter — arm 2's finding 7, applied before it can bite.
+    pub key_collisions: usize,
+    /// A spec the builder deliberately does not build.
+    ///
+    /// The unwrap family (`unwrap` / `as_mut_unwrap`) is standalone with **zero
+    /// market** on the frozen corpus, so it stays unbuilt on the `-4`/`-5`
+    /// precedent — and an unknown shape becomes a row here rather than a silent
+    /// skip. `Bare` with neither an unwrap nor a wrapper is the second case: it
+    /// renders the argument unchanged, `glue` cannot produce it, and building it
+    /// would be a no-op indistinguishable from success.
+    pub unsupported: usize,
+    /// `arg_span` named a subtree the matched node does not contain.
+    pub arg_not_found: usize,
+    /// Seams whose surviving subtree is NESTED inside the replaced node — the
+    /// two cast shapes. **Measured, not gated**: whether the frozen corpus
+    /// places a seam on a cast is a fact about the corpus.
+    pub arg_peeled: usize,
+    /// `(offset, rendered text)` per placement, keyed exactly as arms 1 and 2's
+    /// renders are.
+    pub rendered: Vec<(u32, String)>,
+}
+
+/// The first node at or under `e` whose span is exactly `want`.
+///
+/// Used only on the cast shapes, where the decision layer built its replacement
+/// from the cast's OPERAND while the replaced range is the whole argument. A
+/// pattern match on `ExprKind::Cast` would look equivalent and is not: a
+/// `Paren` between the cast and its operand shifts the node without shifting
+/// the span, so the search is by the coordinate the decision layer actually
+/// recorded.
+fn find_by_span<'a>(e: &'a rustc_ast::Expr, want: rustc_span::Span) -> Option<&'a rustc_ast::Expr> {
+    struct Find<'a> {
+        want: rustc_span::Span,
+        hit: Option<&'a rustc_ast::Expr>,
+    }
+    impl<'a> rustc_ast::visit::Visitor<'a> for Find<'a> {
+        fn visit_expr(&mut self, e: &'a rustc_ast::Expr) {
+            if self.hit.is_some() {
+                return;
+            }
+            if e.span == self.want {
+                self.hit = Some(e);
+                return;
+            }
+            rustc_ast::visit::walk_expr(self, e);
+        }
+    }
+    let mut f = Find { want, hit: None };
+    rustc_ast::visit::Visitor::visit_expr(&mut f, e);
+    f.hit
+}
+
+/// **ARM 3 — the seam pass.** The THIRD span-keyed walk over one crate, and the
+/// first whose targets share a syntactic category with another pass's.
+///
+/// # The split rule, in code
+///
+/// *Structural where a subtree already exists; parse-and-graft where the text is
+/// genuinely new.* The wrapper is built by [`glue_expr`] around the argument's
+/// own node — arm 1's §3c precedent, which declined a text round-trip for the
+/// pointee — and only the `{len}` expression, which has no subtree behind it,
+/// goes through [`graft_expr`].
+///
+/// # Why this runs LAST
+///
+/// A seam's argument may contain a use rewrite, so the use pass must have
+/// finished grafting before the seam pass moves the subtree. Task 0 measured
+/// `use_contains_seam = 0` over 181,844 pairs, so no seam is currently hidden
+/// under a grafted node — but the ordering is what makes that a corpus fact
+/// rather than a dependency.
+pub(crate) struct SeamGraftVisitor<'a> {
+    seams: &'a FxHashMap<(u32, u32), SeamTarget>,
+    guard: &'a mut Composition,
+    stats: SeamGraftStats,
+    consumed: FxHashSet<(u32, u32)>,
+}
+
+/// What the AST layer needs from one [`SeamEdit`] — the spec, the argument's
+/// coordinate, and the family. Copied out of the decision layer's edit so the
+/// walk borrows nothing from the table it is keyed by.
+pub(crate) struct SeamTarget {
+    pub spec: super::decision::seam::GlueSpec,
+    pub arg_span: rustc_span::Span,
+    pub reborrow: bool,
+}
+
+impl<'a> SeamGraftVisitor<'a> {
+    pub(crate) fn new(
+        seams: &'a FxHashMap<(u32, u32), SeamTarget>,
+        guard: &'a mut Composition,
+    ) -> Self {
+        Self {
+            seams,
+            guard,
+            stats: SeamGraftStats::default(),
+            consumed: FxHashSet::default(),
+        }
+    }
+
+    pub(crate) fn finish(mut self) -> SeamGraftStats {
+        self.stats.unmatched = self
+            .seams
+            .keys()
+            .filter(|k| !self.consumed.contains(k))
+            .count();
+        self.stats
+    }
+
+    /// Build the adapter around `e`'s own subtree, or decline with a typed row.
+    fn build(&mut self, e: &rustc_ast::Expr, target: &SeamTarget) -> Option<rustc_ast::ExprKind> {
+        use super::decision::seam::GlueCore;
+        let spec = &target.spec;
+        // The unwrap family is deliberately unbuilt — see [`SeamGraftStats`].
+        if spec.unwrap.is_some() {
+            self.stats.unsupported += 1;
+            return None;
+        }
+        let shape = match spec.core {
+            GlueCore::Bare => None,
+            GlueCore::Reborrow => Some(GlueShape::Reborrow),
+            GlueCore::Index0 => Some(GlueShape::Index0),
+            GlueCore::FromRawParts => Some(GlueShape::FromRawParts),
+            GlueCore::FromRefMut => Some(GlueShape::FromRefMut),
+        };
+        // A bare core with no wrapper renders the argument unchanged, so
+        // "building" it would be a no-op that reads as a placement.
+        if shape.is_none() && !spec.optional {
+            self.stats.unsupported += 1;
+            return None;
+        }
+
+        // ---- the argument: a SUBTREE, never re-parsed ----
+        let arg: P<rustc_ast::Expr> = if target.arg_span == e.span {
+            P(rustc_ast::Expr {
+                id: DUMMY_NODE_ID,
+                kind: e.kind.clone(),
+                span: e.span,
+                attrs: e.attrs.clone(),
+                tokens: None,
+            })
+        } else {
+            // A cast shape: the replacement's text came from the cast's
+            // operand, so the operand is what must survive inside the adapter.
+            self.stats.arg_peeled += 1;
+            let Some(inner) = find_by_span(e, target.arg_span) else {
+                self.stats.arg_not_found += 1;
+                return None;
+            };
+            P(inner.clone())
+        };
+
+        // ---- the length: the ONE genuinely new expression ----
+        let len = match spec.len.as_deref() {
+            None => None,
+            Some(text) => match graft_expr(text) {
+                Ok(parsed) => {
+                    self.stats.len_grafted += 1;
+                    Some(P(parsed))
+                }
+                Err(offending) => {
+                    self.stats.len_parse_failed += 1;
+                    if self.stats.len_parse_failures.len() < 10 {
+                        self.stats.len_parse_failures.push(offending);
+                    }
+                    return None;
+                }
+            },
+        };
+
+        let core = match shape {
+            None => arg,
+            Some(shape) => {
+                let Some(kind) = glue_expr(shape, spec.mutable, arg, len) else {
+                    // `glue_expr` declines exactly one way: a length-bearing
+                    // shape with no length.
+                    self.stats.len_absent += 1;
+                    return None;
+                };
+                expr(kind)
+            }
+        };
+        Some(if spec.optional {
+            glue_expr(GlueShape::Some_, spec.mutable, core, None)
+                .expect("the `Some` wrapper is length-free and cannot decline")
+        } else {
+            (*core).kind
+        })
+    }
+}
+
+impl MutVisitor for SeamGraftVisitor<'_> {
+    fn visit_expr(&mut self, e: &mut rustc_ast::Expr) {
+        // A grafted node's spans are the fragment's own and alias real offsets
+        // in this crate's first source file — the hazard task 0 landed the
+        // erasure for, and arm 3 is the pass that could have been bitten by it.
+        if e.span.is_dummy() {
+            rustc_ast::mut_visit::walk_expr(self, e);
+            return;
+        }
+        let key = (e.span.lo().0, e.span.hi().0);
+        if let Some(target) = self.seams.get(&key) {
+            if !self.consumed.insert(key) {
+                self.stats.multi_matched += 1;
+            }
+            // **THE FIRST CLAIM THAT CAN GENUINELY COLLIDE.** A seam targets a
+            // call-argument expression, the same syntactic category the use
+            // pass claims, so `refused` stops being a structural zero here and
+            // becomes a corpus fact.
+            if !self.guard.claim(e.id, "seam") {
+                self.stats.refused += 1;
+                return;
+            }
+            if let Some(kind) = self.build(e, target) {
+                e.kind = kind;
+                self.stats.grafted += 1;
+                if target.reborrow {
+                    self.stats.reborrow += 1;
+                } else {
+                    self.stats.safe += 1;
+                }
+                self.stats
+                    .rendered
+                    .push((key.0, rustc_ast_pretty::pprust::expr_to_string(e)));
+                // NOT walked: the children are the adapter's now, and the
+                // argument moved across as a subtree rather than being revisited.
+                return;
+            }
+            // Declined with a typed row; the node is left intact.
+        }
+        rustc_ast::mut_visit::walk_expr(self, e);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -742,7 +1009,17 @@ pub(crate) fn arm1_population(tcx: rustc_middle::ty::TyCtxt<'_>) -> Result<RefDe
 #[cfg(test)]
 fn transform_inner(
     tcx: rustc_middle::ty::TyCtxt<'_>,
-) -> Result<(RefDeclStats, UseGraftStats, usize, usize, SeamUseSurface), String> {
+) -> Result<
+    (
+        RefDeclStats,
+        UseGraftStats,
+        SeamGraftStats,
+        usize,
+        usize,
+        SeamUseSurface,
+    ),
+    String,
+> {
     let captured = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let mut krate = ::utils::ast::expanded_ast(tcx);
         let map = ::utils::ast::make_ast_to_hir(&mut krate, tcx);
@@ -801,6 +1078,33 @@ fn transform_inner(
     let mut g = UseGraftVisitor::new(&uses, &mut guard);
     g.visit_crate(&mut krate);
     let grafts = g.finish();
+
+    // **ARM 3 — the seam pass, and it runs THIRD by requirement, not by
+    // convenience.** A seam's argument may contain a use rewrite, so the use
+    // pass must have finished before the subtree is moved.
+    let mut seam_targets: FxHashMap<(u32, u32), SeamTarget> = FxHashMap::default();
+    let mut seam_key_collisions = 0usize;
+    for edit in &table.seams.edits {
+        // Same reasoning as `use_key_collisions`: a map is a join, and a join
+        // without a collision counter agrees with itself while being short.
+        if seam_targets
+            .insert(
+                (edit.span.lo().0, edit.span.hi().0),
+                SeamTarget {
+                    spec: edit.spec.clone(),
+                    arg_span: edit.arg_span,
+                    reborrow: matches!(edit.family, super::decision::seam::SeamFamily::Reborrow),
+                },
+            )
+            .is_some()
+        {
+            seam_key_collisions += 1;
+        }
+    }
+    let mut s = SeamGraftVisitor::new(&seam_targets, &mut guard);
+    s.visit_crate(&mut krate);
+    let mut seams = s.finish();
+    seams.key_collisions = seam_key_collisions;
 
     // **Each pass counts its OWN refusals**, at the site where it was turned
     // away. This used to recompute `decls.refused` here by summing
@@ -869,6 +1173,7 @@ fn transform_inner(
     Ok((
         decls,
         grafts,
+        seams,
         decl_inside_use,
         use_key_collisions,
         SeamUseSurface {
@@ -913,6 +1218,31 @@ pub(crate) struct TextDiff {
     pub arm2_equal: usize,
     pub arm2_differing: usize,
     pub arm2_unmatched_ast: usize,
+
+    /// **ARM 3's differential, against the `SeamAdapter` edits.**
+    ///
+    /// A separate offset map from `KindDecision`'s, because the two
+    /// justifications are separate populations: folding them would make arm 1's
+    /// pinned `unmatched_span` move for a reason that has nothing to do with
+    /// arm 1.
+    ///
+    /// **This is the milestone's first genuinely two-derivation comparison.**
+    /// At arms 1–2 both sides were built from the same decision-layer string;
+    /// here the AST side composes nodes structurally while the span side writes
+    /// a `format!`, so equality at 421 edits is evidence rather than a
+    /// tautology.
+    pub arm3_compared: usize,
+    pub arm3_equal: usize,
+    pub arm3_differing: usize,
+    pub arm3_unmatched_ast: usize,
+    /// `SeamAdapter` offsets arm 3 never reached — the seam conservation bound.
+    pub sa_unmatched_span: usize,
+    pub sa_edits: usize,
+    pub sa_offsets: usize,
+    /// Arm 3's own share of the joint whitespace split, so the pre-stated line
+    /// is readable without unpicking the joint accumulator.
+    pub ws_real_seam: usize,
+    pub differing_seam: usize,
 
     /// **THE CONSERVATION BOUND.** `KindDecision` offsets that NEITHER arm
     /// reached.
@@ -1038,14 +1368,28 @@ fn compare_renders(
                     equal += 1;
                 } else {
                     differing += 1;
+                    // **EXHAUSTIVE over the labels, with no fallback.** This
+                    // read `_ => d.differing_use += 1`, which would have folded
+                    // arm 3's seam differences into `arm2_differing_use` — a
+                    // reported line — and attributed them to a pass that never
+                    // ran on that offset. A third position is exactly the event
+                    // a catch-all is invisible to.
                     match position {
                         "decl" => d.differing_decl += 1,
-                        _ => d.differing_use += 1,
+                        "use" => d.differing_use += 1,
+                        "seam" => d.differing_seam += 1,
+                        other => panic!(
+                            "unknown differential position {other:?}: a new arm must \
+                             name its own bucket, never inherit another arm's"
+                        ),
                     }
                     if strip(span_text) == strip(rendered) {
                         d.ws_equal += 1;
                     } else {
                         d.ws_real += 1;
+                        if position == "seam" {
+                            d.ws_real_seam += 1;
+                        }
                     }
                     d.pairs
                         .push((*off, position, rendered.clone(), span_text.clone()));
@@ -1077,8 +1421,9 @@ fn compare_renders(
 #[cfg(test)]
 pub(crate) fn arms_full(
     tcx: rustc_middle::ty::TyCtxt<'_>,
-) -> Result<(RefDeclStats, UseGraftStats, TextDiff), String> {
-    let (decls, grafts, decl_inside_use, use_key_collisions, surface) = transform_inner(tcx)?;
+) -> Result<(RefDeclStats, UseGraftStats, SeamGraftStats, TextDiff), String> {
+    let (decls, grafts, seams, decl_inside_use, use_key_collisions, surface) =
+        transform_inner(tcx)?;
     let (table, _ctx) = super::decide_table_with_ctx(tcx)?;
     let emission = super::emit_files(tcx, &table, &rustc_hash::FxHashSet::default())?;
 
@@ -1087,6 +1432,9 @@ pub(crate) fn arms_full(
     // joining — the AST side carries absolute `Span` offsets.
     let sm = tcx.sess.source_map();
     let mut by_offset: FxHashMap<u32, String> = FxHashMap::default();
+    // Arm 3's edits are a SEPARATE population, keyed apart so that arm 1's
+    // pinned `unmatched_span` cannot move for a seam-shaped reason.
+    let mut seam_by_offset: FxHashMap<u32, String> = FxHashMap::default();
     let mut d = TextDiff::default();
     for (key, edits) in &emission.plan.by_file {
         let base = sm
@@ -1099,16 +1447,21 @@ pub(crate) fn arms_full(
                 0
             });
         for e in edits {
-            if matches!(
-                e.justification,
-                super::plan::Justification::KindDecision { .. }
-            ) {
-                d.kd_edits += 1;
-                by_offset.insert(base + e.lo as u32, e.replacement.clone());
+            match e.justification {
+                super::plan::Justification::KindDecision { .. } => {
+                    d.kd_edits += 1;
+                    by_offset.insert(base + e.lo as u32, e.replacement.clone());
+                }
+                super::plan::Justification::SeamAdapter { .. } => {
+                    d.sa_edits += 1;
+                    seam_by_offset.insert(base + e.lo as u32, e.replacement.clone());
+                }
+                _ => {}
             }
         }
     }
     d.kd_offsets = by_offset.len();
+    d.sa_offsets = seam_by_offset.len();
 
     let (c, eq, diff, un) = compare_renders(&decls.rendered, &by_offset, "decl", &mut d);
     d.compared = c;
@@ -1146,10 +1499,23 @@ pub(crate) fn arms_full(
         .chain(arm2.iter().map(|(o, _)| *o))
         .collect();
     d.kd_unmatched_span = by_offset.keys().filter(|o| !both.contains(o)).count();
+
+    // ---- ARM 3's differential, against its own justification's edits ----
+    let (c3, eq3, diff3, un3) = compare_renders(&seams.rendered, &seam_by_offset, "seam", &mut d);
+    d.arm3_compared = c3;
+    d.arm3_equal = eq3;
+    d.arm3_differing = diff3;
+    d.arm3_unmatched_ast = un3;
+    let seam_offsets: FxHashSet<u32> = seams.rendered.iter().map(|(o, _)| *o).collect();
+    d.sa_unmatched_span = seam_by_offset
+        .keys()
+        .filter(|o| !seam_offsets.contains(o))
+        .count();
+
     d.decl_render_inside_use_edit = decl_inside_use;
     d.use_key_collisions = use_key_collisions;
     d.seam_use_surface = surface;
-    Ok((decls, grafts, d))
+    Ok((decls, grafts, seams, d))
 }
 
 /// **ARM 2's PARSE-AND-GRAFT plumbing** (user ruling (c), 2026-08-13).
@@ -1904,6 +2270,352 @@ mod arm2_witnesses {
             assert!(
                 !text.contains("q[0]"),
                 "the inner edit did not land: {text}"
+            );
+        });
+    }
+
+    // ---- ARM 3 — the seam pass, driven end to end ----
+
+    use super::super::decision::seam::{GlueCore, GlueSpec};
+
+    /// Run the real [`SeamGraftVisitor`] over a fixture, exactly as
+    /// [`graft_over`] runs the use pass.
+    ///
+    /// `arg` is the span the adapter must KEEP; passing it separately from the
+    /// target span is what makes the cast-peel path reachable from a test.
+    fn seam_over(
+        src: &str,
+        seams: &[(rustc_span::Span, rustc_span::Span, GlueSpec, bool)],
+    ) -> (String, SeamGraftStats) {
+        let mut krate = ::utils::ast::parse_crate(src.to_owned());
+        let map: FxHashMap<(u32, u32), SeamTarget> = seams
+            .iter()
+            .map(|(span, arg_span, spec, reborrow)| {
+                (
+                    (span.lo().0, span.hi().0),
+                    SeamTarget {
+                        spec: spec.clone(),
+                        arg_span: *arg_span,
+                        reborrow: *reborrow,
+                    },
+                )
+            })
+            .collect();
+        let mut guard = Composition::default();
+        let mut v = SeamGraftVisitor::new(&map, &mut guard);
+        v.visit_crate(&mut krate);
+        (pprust::item_to_string(&krate.items[0]), v.finish())
+    }
+
+    /// **RED WITNESS — each realized shape wraps the argument's own SUBTREE.**
+    ///
+    /// The argument is `(*s).ptr` throughout — a field access through a deref,
+    /// not a bare identifier — for the reason arm 1's pointee witness uses a
+    /// multi-segment path: a builder that re-rendered the argument from text
+    /// would pass just as happily over `p`, and re-rendering is exactly what the
+    /// split rule forbids.
+    ///
+    /// The five shapes here are the five the frozen corpus realizes
+    /// (`from_raw_parts` 273, `some_wrap` 78, `some_reborrow` 37, `from_ref_mut`
+    /// 29, `some_from_raw_parts` 4 = 421), each asserted against the text the
+    /// span layer writes for the same spec — so the two derivations are compared
+    /// at unit level before the corpus differential compares them at 421.
+    #[test]
+    fn every_realized_shape_wraps_the_argument_subtree() {
+        rustc_span::create_default_session_globals_then(|| {
+            let src = "fn f(s: *mut S) { g((*s).ptr) }";
+            let krate = ::utils::ast::parse_crate(src.to_owned());
+            // The seam targets the CALL ARGUMENT, not the tail expression.
+            let arg = {
+                let rustc_ast::ItemKind::Fn(f) = &krate.items[0].kind else {
+                    panic!("fixture is a fn")
+                };
+                let body = f.body.as_ref().expect("body");
+                let rustc_ast::StmtKind::Expr(e) = &body.stmts.last().expect("tail").kind else {
+                    panic!("tail is an expression")
+                };
+                let rustc_ast::ExprKind::Call(_, args) = &e.kind else {
+                    panic!("the fixture's tail is a call")
+                };
+                args[0].span
+            };
+            let cases: Vec<(GlueSpec, &str)> = vec![
+                (
+                    GlueSpec::core(GlueCore::FromRawParts, true).with_len("n"),
+                    "core::slice::from_raw_parts_mut((*s).ptr, (n) as usize)",
+                ),
+                (
+                    GlueSpec::core(GlueCore::FromRawParts, false)
+                        .with_len("n")
+                        .wrapped(),
+                    "Some(core::slice::from_raw_parts((*s).ptr, (n) as usize))",
+                ),
+                (
+                    GlueSpec::core(GlueCore::Reborrow, true).wrapped(),
+                    "Some(&mut *(*s).ptr)",
+                ),
+                (
+                    GlueSpec::core(GlueCore::Bare, false).wrapped(),
+                    "Some((*s).ptr)",
+                ),
+                (
+                    GlueSpec::core(GlueCore::FromRefMut, false),
+                    "core::slice::from_ref((*s).ptr)",
+                ),
+            ];
+            for (spec, expected) in cases {
+                let (text, stats) = seam_over(src, &[(arg, arg, spec.clone(), false)]);
+                assert_eq!(stats.grafted, 1, "{spec:?} must place: {text}");
+                assert_eq!(stats.unmatched, 0);
+                assert!(
+                    text.contains(expected),
+                    "the built node must print what the span layer writes for the \
+                     same spec.\n  spec:     {spec:?}\n  expected: {expected}\n  got:      {text}"
+                );
+                // **The two derivations, compared here rather than assumed.**
+                assert_eq!(
+                    spec.render("(*s).ptr"),
+                    expected,
+                    "and the RENDERER must agree with the same text — if these \
+                     two ever part, the corpus differential's 421 equalities \
+                     stop meaning the builder is right"
+                );
+            }
+        });
+    }
+
+    /// **THE CAST PEEL — the surviving subtree is the OPERAND, not the cast.**
+    ///
+    /// `ArgShape::CastOfLocal` makes the decision layer build its replacement
+    /// from the cast's operand while the replaced range is the whole argument,
+    /// so `arg_span != span` and the adapter must wrap `q`, never `q as *mut u8`.
+    ///
+    /// Found by reading `Pos`'s construction rather than by a failing
+    /// differential, and witnessed here because mutation M28 — collapsing
+    /// `arg_span` onto the argument span — left the entire suite green while
+    /// the field had no consumer.
+    ///
+    /// Both halves are asserted: the operand is kept **and** the cast is gone.
+    /// Only the first would also pass for a builder that wrapped the whole cast.
+    #[test]
+    fn a_cast_shaped_seam_keeps_the_operand_and_drops_the_cast() {
+        rustc_span::create_default_session_globals_then(|| {
+            let src = "fn f(q: *mut u8) { g(q as *mut u8) }";
+            let krate = ::utils::ast::parse_crate(src.to_owned());
+            let (whole, operand) = {
+                let rustc_ast::ItemKind::Fn(f) = &krate.items[0].kind else {
+                    panic!("fixture is a fn")
+                };
+                let body = f.body.as_ref().expect("body");
+                let rustc_ast::StmtKind::Expr(e) = &body.stmts.last().expect("tail").kind else {
+                    panic!("tail is an expression")
+                };
+                let rustc_ast::ExprKind::Call(_, args) = &e.kind else {
+                    panic!("the fixture's tail is a call")
+                };
+                let rustc_ast::ExprKind::Cast(inner, _) = &args[0].kind else {
+                    panic!("the fixture's argument is a cast")
+                };
+                (args[0].span, inner.span)
+            };
+            assert_ne!(
+                whole, operand,
+                "the fixture only tests anything if the two spans differ"
+            );
+
+            let spec = GlueSpec::core(GlueCore::Reborrow, true);
+            let (text, stats) = seam_over(src, &[(whole, operand, spec, true)]);
+            assert_eq!(stats.grafted, 1, "{text}");
+            assert_eq!(
+                stats.arg_peeled, 1,
+                "the peel must be COUNTED — whether the corpus places seams on \
+                 cast shapes is a measurement, and an uncounted peel makes it \
+                 unanswerable"
+            );
+            assert_eq!(stats.arg_not_found, 0);
+            assert!(
+                text.contains("&mut *q"),
+                "the OPERAND must survive inside the adapter: {text}"
+            );
+            assert!(
+                !text.contains("as *mut u8"),
+                "and the cast must not: the span layer replaces the whole \
+                 argument, so a builder that kept the cast emits `&mut *(q as \
+                 *mut u8)` where the span layer wrote `&mut *q` — a silent \
+                 parity divergence at exactly the positions casts appear: {text}"
+            );
+            assert_eq!(stats.reborrow, 1, "the family rides the placement");
+            assert_eq!(stats.safe, 0);
+        });
+    }
+
+    /// **A spec the builder does not build becomes a ROW, never a silent skip.**
+    ///
+    /// The unwrap family is standalone with zero market on the frozen corpus and
+    /// stays unbuilt on the `-4`/`-5` precedent. What must not happen is that it
+    /// disappears: an adapter that evaporates leaves the callee converted and
+    /// the call site raw, which is the `E0308` the slice exists to remove.
+    ///
+    /// The node is asserted INTACT as well as counted — a decline that mangled
+    /// the tree and reported itself would pass a count-only test.
+    #[test]
+    fn an_unbuilt_shape_declines_with_a_typed_row_and_leaves_the_node_intact() {
+        rustc_span::create_default_session_globals_then(|| {
+            let src = "fn f(o: Option<&mut u8>) { g(o) }";
+            let krate = ::utils::ast::parse_crate(src.to_owned());
+            let arg = {
+                let rustc_ast::ItemKind::Fn(f) = &krate.items[0].kind else {
+                    panic!("fixture is a fn")
+                };
+                let body = f.body.as_ref().expect("body");
+                let rustc_ast::StmtKind::Expr(e) = &body.stmts.last().expect("tail").kind else {
+                    panic!("tail is an expression")
+                };
+                let rustc_ast::ExprKind::Call(_, args) = &e.kind else {
+                    panic!("the fixture's tail is a call")
+                };
+                args[0].span
+            };
+
+            let unwrapping = GlueSpec::core(GlueCore::Bare, true).with_unwrap(true);
+            let (text, stats) = seam_over(src, &[(arg, arg, unwrapping, false)]);
+            assert_eq!(stats.grafted, 0, "the shape is deliberately unbuilt");
+            assert_eq!(stats.unsupported, 1, "and it is COUNTED");
+            assert_eq!(
+                stats.unmatched, 0,
+                "the key WAS reached — declined is a different fact from never \
+                 found, exactly as at the use pass"
+            );
+            assert!(
+                text.contains("g(o)"),
+                "a declined seam must leave the node untouched: {text}"
+            );
+
+            // The second unbuilt case: a bare core with no wrapper renders the
+            // argument unchanged, so building it would be a no-op that reads as
+            // a placement. `glue` cannot produce it; the guard is fail-closed.
+            let identity = GlueSpec::core(GlueCore::Bare, false);
+            let (_, stats) = seam_over(src, &[(arg, arg, identity, false)]);
+            assert_eq!(stats.grafted, 0);
+            assert_eq!(stats.unsupported, 1);
+        });
+    }
+
+    /// **A length-bearing shape with NO length places nothing** — the gate the
+    /// decision layer holds (`seam-len-unknown`, 93 blocked) is not quietly
+    /// re-opened one layer down.
+    ///
+    /// Unreachable through `glue`, which returns `SeamBlock::LengthUnknown`
+    /// first. Injected the way `plan`'s missing-pointee arm is, because "no
+    /// layer below the gate may invent a length" is a claim about this code and
+    /// not about its caller.
+    #[test]
+    fn a_slice_seam_with_no_length_places_nothing_and_is_counted() {
+        rustc_span::create_default_session_globals_then(|| {
+            let src = "fn f(p: *mut u8) { g(p) }";
+            let krate = ::utils::ast::parse_crate(src.to_owned());
+            let arg = {
+                let rustc_ast::ItemKind::Fn(f) = &krate.items[0].kind else {
+                    panic!("fixture is a fn")
+                };
+                let body = f.body.as_ref().expect("body");
+                let rustc_ast::StmtKind::Expr(e) = &body.stmts.last().expect("tail").kind else {
+                    panic!("tail is an expression")
+                };
+                let rustc_ast::ExprKind::Call(_, args) = &e.kind else {
+                    panic!("the fixture's tail is a call")
+                };
+                args[0].span
+            };
+            let lengthless = GlueSpec::core(GlueCore::FromRawParts, false);
+            let (text, stats) = seam_over(src, &[(arg, arg, lengthless, true)]);
+            assert_eq!(stats.grafted, 0);
+            assert_eq!(
+                stats.len_absent, 1,
+                "declined, and attributed to the LENGTH"
+            );
+            assert_eq!(stats.unsupported, 0, "not confused with an unbuilt shape");
+            assert!(text.contains("g(p)"), "{text}");
+
+            // And a `{len}` that does not round-trip is a typed row too, per
+            // R7.4 — never an abort, which is what a bare `parse_expr` would do.
+            let unparseable = GlueSpec::core(GlueCore::FromRawParts, false).with_len("n +");
+            let (_, stats) = seam_over(src, &[(arg, arg, unparseable, true)]);
+            assert_eq!(stats.grafted, 0);
+            assert_eq!(stats.len_parse_failed, 1);
+            assert_eq!(
+                stats.len_parse_failures.len(),
+                1,
+                "the offending template must be ATTACHED, not just tallied"
+            );
+        });
+    }
+
+    /// **The seam pass and the use pass share one guard, and the second claim on
+    /// a node is refused.**
+    ///
+    /// This is the first pair in the milestone that can genuinely collide: both
+    /// claim `Expr` nodes. Task 0 measured the collision surface empty over
+    /// 181,844 pairs on the frozen corpus, so `arm3_refused = 0` there is a
+    /// **corpus fact** — which is precisely why the mechanism needs a witness
+    /// the corpus cannot provide.
+    #[test]
+    fn a_seam_may_not_claim_a_node_the_use_pass_already_owns() {
+        rustc_span::create_default_session_globals_then(|| {
+            let src = "fn f(p: *mut u8) { g(*p.offset(1)) }";
+            let mut krate = ::utils::ast::parse_crate(src.to_owned());
+            let arg = {
+                let rustc_ast::ItemKind::Fn(f) = &krate.items[0].kind else {
+                    panic!("fixture is a fn")
+                };
+                let body = f.body.as_ref().expect("body");
+                let rustc_ast::StmtKind::Expr(e) = &body.stmts.last().expect("tail").kind else {
+                    panic!("tail is an expression")
+                };
+                let rustc_ast::ExprKind::Call(_, args) = &e.kind else {
+                    panic!("the fixture's tail is a call")
+                };
+                args[0].span
+            };
+            let mut guard = Composition::default();
+
+            // The use pass claims the node first — the order the walk runs in.
+            let uses: FxHashMap<(u32, u32), String> =
+                [((arg.lo().0, arg.hi().0), "p[1]".to_owned())]
+                    .into_iter()
+                    .collect();
+            let mut u = UseGraftVisitor::new(&uses, &mut guard);
+            u.visit_crate(&mut krate);
+            assert_eq!(u.finish().grafted, 1, "the use edit lands first");
+
+            let seams: FxHashMap<(u32, u32), SeamTarget> = [(
+                (arg.lo().0, arg.hi().0),
+                SeamTarget {
+                    spec: GlueSpec::core(GlueCore::Reborrow, true),
+                    arg_span: arg,
+                    reborrow: true,
+                },
+            )]
+            .into_iter()
+            .collect();
+            let mut s = SeamGraftVisitor::new(&seams, &mut guard);
+            s.visit_crate(&mut krate);
+            let stats = s.finish();
+
+            assert_eq!(stats.refused, 1, "the second claimant is refused");
+            assert_eq!(stats.grafted, 0);
+            assert_eq!(
+                stats.unmatched, 0,
+                "the key was REACHED and refused — a different fact from never \
+                 being found"
+            );
+            assert_eq!(guard.refused_by("seam"), 1, "attributed to the CHALLENGER");
+            assert_eq!(guard.refused[0].holder, "use");
+            let text = pprust::item_to_string(&krate.items[0]);
+            assert!(
+                text.contains("p[1]") && !text.contains("&mut *"),
+                "the holder's transform stands and the refused one did not \
+                 land: {text}"
             );
         });
     }

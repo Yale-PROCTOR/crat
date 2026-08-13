@@ -7000,11 +7000,11 @@ mod run {
             }
         }
 
-        // ARMS 1 AND 2's TEXT DIFFERENTIAL — §3b's per-edit unit. Runs in the
-        // same AST-first window; both arms re-use the one capture rather than
-        // each taking their own, which `expanded_ast` would refuse.
+        // ARMS 1, 2 AND 3's TEXT DIFFERENTIAL — §3b's per-edit unit. Runs in
+        // the same AST-first window; every arm re-uses the one capture rather
+        // than each taking their own, which `expanded_ast` would refuse.
         match crate::bo_rewriter::ast_transform::arms_full(tcx) {
-            Ok((st, gr, d)) => {
+            Ok((st, gr, sg, d)) => {
                 row.set("arm1_rewritten", st.rewritten.to_string());
                 row.set("arm1_not_ptr_decl", st.not_a_pointer_decl.to_string());
                 row.set("arm1_refused", st.refused.to_string());
@@ -7051,6 +7051,45 @@ mod run {
                 row.set("arm2_differing_use", d.differing_use.to_string());
                 row.set("arm2_ws_equal", d.ws_equal.to_string());
                 row.set("arm2_ws_real", d.ws_real.to_string());
+
+                // ---- ARM 3 — the seam pass ----
+                //
+                // `arm3_differing` is NOT gated, on the same token-vs-byte
+                // ruling as arm 2; `arm3_ws_real` carries the parity claim.
+                // The difference is that arm 3's is a real two-derivation
+                // comparison: the AST side composes nodes, the span side writes
+                // a `format!`.
+                row.set("arm3_seam_rendered", sg.grafted.to_string());
+                row.set("arm3_safe", sg.safe.to_string());
+                row.set("arm3_reborrow", sg.reborrow.to_string());
+                row.set("arm3_len_grafted", sg.len_grafted.to_string());
+                row.set("arm3_len_parse_failed", sg.len_parse_failed.to_string());
+                row.set("arm3_len_absent", sg.len_absent.to_string());
+                row.set("arm3_seam_unmatched", sg.unmatched.to_string());
+                row.set("arm3_refused", sg.refused.to_string());
+                row.set("arm3_multi_matched", sg.multi_matched.to_string());
+                row.set("arm3_key_collisions", sg.key_collisions.to_string());
+                row.set("arm3_unsupported", sg.unsupported.to_string());
+                row.set("arm3_arg_not_found", sg.arg_not_found.to_string());
+                // MEASURED, not gated: whether the frozen corpus places a seam
+                // on a cast shape is a fact about the corpus, and pre-judging
+                // it is the mistake task 0 exists to have avoided.
+                row.set("arm3_arg_peeled", sg.arg_peeled.to_string());
+                row.set("arm3_compared", d.arm3_compared.to_string());
+                row.set("arm3_equal", d.arm3_equal.to_string());
+                row.set("arm3_differing", d.arm3_differing.to_string());
+                row.set("arm3_unmatched_ast", d.arm3_unmatched_ast.to_string());
+                row.set("arm3_ws_real", d.ws_real_seam.to_string());
+                row.set("arm3_differing_seam", d.differing_seam.to_string());
+                row.set("sa_unmatched_span", d.sa_unmatched_span.to_string());
+                row.set("sa_edits", d.sa_edits.to_string());
+                row.set("sa_offsets", d.sa_offsets.to_string());
+                if !sg.len_parse_failures.is_empty() {
+                    row.set(
+                        "arm3_len_parse_failures",
+                        super::report::sanitize(&sg.len_parse_failures.join(" | ")),
+                    );
+                }
 
                 // The differing pairs UNTRUNCATED. `report::sanitize` cuts a row
                 // value at 120 chars, which is exactly long enough to make two
@@ -9790,6 +9829,30 @@ const ARM_ZERO_INVARIANTS: &[&str] = &[
     "arm2_ws_real",
     "kd_unmatched_span",
     "kd_base_unresolved",
+    // ---- ARM 3 ----
+    //
+    // ⚠ `arm3_refused` is DELIBERATELY ABSENT, and its absence is the
+    // pre-statement's §3 in code. A seam edit targets a call-argument
+    // EXPRESSION — the same syntactic category the use pass claims — so unlike
+    // `arm1_refused`/`arm2_refused` its zero is **a corpus fact, not a
+    // structure**: task 0 measured the seam-vs-use collision surface empty
+    // across all four relations over 181,844 pairs, and an empty surface is
+    // something this corpus happens to have. Gating it would convert a
+    // falsifiable expectation into an assertion, which is exactly the move §3
+    // declined to make. It is reported and read; a nonzero is a STOP.
+    //
+    // `arm3_differing` is absent for arm 2's reason: token-vs-byte. The parity
+    // claim rides `arm3_ws_real`.
+    "arm3_len_parse_failed",
+    "arm3_len_absent",
+    "arm3_seam_unmatched",
+    "arm3_multi_matched",
+    "arm3_key_collisions",
+    "arm3_unsupported",
+    "arm3_arg_not_found",
+    "arm3_unmatched_ast",
+    "arm3_ws_real",
+    "sa_unmatched_span",
 ];
 
 /// **THE ARM-2 PARITY GATE — fail-closed over one program's row.**
@@ -9859,6 +9922,36 @@ fn arm_parity_failures(program: &str, row: &report::Row) -> Vec<String> {
         )),
         (Err(why), _) | (Ok(_), Err(why)) => out.push(why),
     }
+    // The same guard on arm 3's own population. Written as a second case rather
+    // than folded in: `kd_*` and `sa_*` are different justifications, and a
+    // single combined pair would let a surplus on one side mask a shortfall on
+    // the other.
+    match (num("sa_edits"), num("sa_offsets")) {
+        (Ok(e), Ok(o)) if e == o => {}
+        (Ok(e), Ok(o)) => out.push(format!(
+            "{program}: sa_edits={e} != sa_offsets={o} — two seam edits share \
+             one absolute offset, so the seam conservation bound closed for the \
+             wrong reason"
+        )),
+        (Err(why), _) | (Ok(_), Err(why)) => out.push(why),
+    }
+    // **Every placed adapter is one of exactly two families.** Without this the
+    // family split is telemetry: `safe + reborrow` could drift from `grafted`
+    // and the corpus gate would not notice, which is the class of defect the
+    // arm-2 review found across twenty keys at once.
+    match (
+        num("arm3_seam_rendered"),
+        num("arm3_safe"),
+        num("arm3_reborrow"),
+    ) {
+        (Ok(g), Ok(s), Ok(r)) if g == s + r => {}
+        (Ok(g), Ok(s), Ok(r)) => out.push(format!(
+            "{program}: arm3_safe={s} + arm3_reborrow={r} != \
+             arm3_seam_rendered={g} — a placed adapter belongs to exactly one \
+             family, so this is a lost or double-counted placement"
+        )),
+        (Err(why), _, _) | (Ok(_), Err(why), _) | (Ok(_), Ok(_), Err(why)) => out.push(why),
+    }
     out
 }
 
@@ -9877,6 +9970,23 @@ fn conforming_arm_row() -> report::Row {
     row.set("arm1_unmatched_span", "2039");
     row.set("kd_edits", "2819");
     row.set("kd_offsets", "2819");
+    // Arm 3's corpus shape: the 421 placed adapters, 314 reborrow + 107 safe.
+    // Carried as the CORPUS TOTAL rather than one program's share for the same
+    // reason `arm1_compared = 780` is — what this row tests is that each gated
+    // key is present and passing in the shape the sweep produces, and the
+    // identity `safe + reborrow == rendered` must hold at every scale.
+    row.set("arm3_seam_rendered", "421");
+    row.set("arm3_safe", "107");
+    row.set("arm3_reborrow", "314");
+    row.set("arm3_len_grafted", "277");
+    // NOT gated, and load-bearing here exactly as `arm2_differing` is: if arm
+    // 3's differential is ever tightened to byte equality, this row fails
+    // rather than the corpus.
+    row.set("arm3_differing", "3");
+    row.set("arm3_refused", "0");
+    row.set("arm3_arg_peeled", "0");
+    row.set("sa_edits", "421");
+    row.set("sa_offsets", "421");
     row
 }
 
