@@ -132,6 +132,146 @@ pub(crate) struct Refusal {
     pub challenger: &'static str,
 }
 
+/// **ARM 3 — the glue shapes**, as the span layer's `format!` set classifies
+/// them.
+///
+/// Five of the ten shapes `seam_tsv`'s classifier knows are realized on the
+/// frozen corpus (`from_raw_parts` 273, `some_wrap` 78, `some_reborrow` 37,
+/// `from_ref_mut` 29, `some_from_raw_parts` 4 = 421). The other five —
+/// `reborrow` alone, `unwrap`, `as_mut_unwrap`, `index` alone,
+/// `some_from_ref_mut` — have market **0**.
+///
+/// `Reborrow` and `Index0` are built anyway, because they are the INNER forms
+/// the realized `some_*` shapes wrap; they are not unbuilt zero-market arms in
+/// the `-4`/`-5` sense. `Unwrap`/`AsMutUnwrap` are deliberately NOT built: they
+/// are standalone shapes with zero market, and a shape the transform does not
+/// know must become a typed row rather than a silent skip.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum GlueShape {
+    /// `&mut *X` / `&*X`
+    Reborrow,
+    /// `&mut X[0]` / `&X[0]`
+    Index0,
+    /// `core::slice::from_raw_parts{_mut}(X, (LEN) as usize)`
+    FromRawParts,
+    /// `core::slice::from_mut(X)` / `core::slice::from_ref(X)`
+    FromRefMut,
+    /// `Some(X)` — the wrapper; the `some_*` shapes are this over an inner form.
+    Some_,
+}
+
+/// A path expression `core::slice::<name>`.
+fn slice_path(name: &str) -> rustc_ast::Expr {
+    let seg = |n: &str| PathSegment {
+        ident: Ident::new(Symbol::intern(n), DUMMY_SP),
+        id: DUMMY_NODE_ID,
+        args: None,
+    };
+    rustc_ast::Expr {
+        id: DUMMY_NODE_ID,
+        kind: rustc_ast::ExprKind::Path(
+            None,
+            Path {
+                span: DUMMY_SP,
+                segments: ThinVec::from_iter([seg("core"), seg("slice"), seg(name)]),
+                tokens: None,
+            },
+        ),
+        span: DUMMY_SP,
+        attrs: Default::default(),
+        tokens: None,
+    }
+}
+
+fn expr(kind: rustc_ast::ExprKind) -> P<rustc_ast::Expr> {
+    P(rustc_ast::Expr {
+        id: DUMMY_NODE_ID,
+        kind,
+        span: DUMMY_SP,
+        attrs: Default::default(),
+        tokens: None,
+    })
+}
+
+/// **Build one glue expression, KEEPING `arg` as a subtree.**
+///
+/// This is the ruled (c)-extension in code: *structural where a subtree already
+/// exists; parse-and-graft where the text is genuinely new.* The argument is
+/// the existing call-argument node and moves across untouched — arm 1's §3c
+/// precedent, which declined a text round-trip for the pointee. The **length**
+/// is the one genuinely new part, has no subtree behind it, and is therefore
+/// handed in already parsed via [`graft_expr`].
+///
+/// Returns `None` when a length-bearing shape has no length: the decision layer
+/// gates that as `seam-len-unknown` (93 blocked) precisely so no layer below
+/// invents one, and neither does this.
+pub(crate) fn glue_expr(
+    shape: GlueShape,
+    mutable: bool,
+    arg: P<rustc_ast::Expr>,
+    len: Option<P<rustc_ast::Expr>>,
+) -> Option<rustc_ast::ExprKind> {
+    use rustc_ast::{BorrowKind, ExprKind};
+    let mutbl = if mutable {
+        Mutability::Mut
+    } else {
+        Mutability::Not
+    };
+    Some(match shape {
+        GlueShape::Reborrow => ExprKind::AddrOf(
+            BorrowKind::Ref,
+            mutbl,
+            expr(ExprKind::Unary(rustc_ast::UnOp::Deref, arg)),
+        ),
+        GlueShape::Index0 => {
+            let zero = expr(ExprKind::Lit(rustc_ast::token::Lit {
+                kind: rustc_ast::token::LitKind::Integer,
+                symbol: Symbol::intern("0"),
+                suffix: None,
+            }));
+            ExprKind::AddrOf(
+                BorrowKind::Ref,
+                mutbl,
+                expr(ExprKind::Index(arg, zero, DUMMY_SP)),
+            )
+        }
+        GlueShape::FromRawParts => {
+            let len = len?;
+            let ctor = if mutable {
+                "from_raw_parts_mut"
+            } else {
+                "from_raw_parts"
+            };
+            // `(LEN) as usize` — parenthesised exactly as the span layer writes
+            // it, because the companion may be an arbitrary expression.
+            let cast = expr(ExprKind::Cast(
+                expr(ExprKind::Paren(len)),
+                P(::utils::ast::parse_ty("usize".to_owned())),
+            ));
+            ExprKind::Call(P(slice_path(ctor)), ThinVec::from_iter([arg, cast]))
+        }
+        GlueShape::FromRefMut => {
+            let ctor = if mutable { "from_mut" } else { "from_ref" };
+            ExprKind::Call(P(slice_path(ctor)), ThinVec::from_iter([arg]))
+        }
+        GlueShape::Some_ => ExprKind::Call(
+            expr(ExprKind::Path(
+                None,
+                Path {
+                    span: DUMMY_SP,
+                    segments: ThinVec::from_iter([PathSegment {
+                        ident: Ident::new(Symbol::intern("Some"), DUMMY_SP),
+                        id: DUMMY_NODE_ID,
+                        args: None,
+                    }]),
+                    tokens: None,
+                },
+            )),
+            ThinVec::from_iter([arg]),
+        ),
+    })
+}
+
 /// **THE FAIL-CLOSED COMPOSITION GUARD.**
 ///
 /// Built beside the FIRST arm by ruling (2026-08-12, item 5), not deferred to
@@ -1764,6 +1904,107 @@ mod arm2_witnesses {
             assert!(
                 !text.contains("q[0]"),
                 "the inner edit did not land: {text}"
+            );
+        });
+    }
+}
+
+#[cfg(test)]
+mod arm3_witnesses {
+    use rustc_ast_pretty::pprust;
+
+    use super::*;
+
+    /// Render one glue shape over a NON-TRIVIAL argument.
+    ///
+    /// The argument is `(*s).ptr` — a field access through a deref, not a bare
+    /// identifier — deliberately. The split rule's whole claim is that the
+    /// argument moves across as a SUBTREE; a witness over `p` alone would pass
+    /// for an implementation that re-rendered it from scratch.
+    fn rendered(shape: GlueShape, mutable: bool, len: Option<&str>) -> String {
+        let arg = ::utils::ast::parse_expr("(*s).ptr".to_owned());
+        let len = len.map(|l| ::utils::ast::parse_expr(l.to_owned()));
+        let kind = glue_expr(
+            shape,
+            mutable,
+            rustc_ast::ptr::P(arg),
+            len.map(rustc_ast::ptr::P),
+        )
+        .expect("the five realized shapes all build");
+        pprust::expr_to_string(&rustc_ast::Expr {
+            id: DUMMY_NODE_ID,
+            kind,
+            span: DUMMY_SP,
+            attrs: Default::default(),
+            tokens: None,
+        })
+    }
+
+    /// **RED WITNESS — the glue shapes render exactly the span layer's text.**
+    ///
+    /// The oracle is `decision/seam.rs`'s `format!` set. These are the FIVE
+    /// shapes realized on the frozen corpus, measured from `seams.tsv`:
+    /// `from_raw_parts` 273, `some_wrap` 78, `some_reborrow` 37,
+    /// `from_ref_mut` 29, `some_from_raw_parts` 4 = 421.
+    ///
+    /// Pinning them here is what makes a corpus parity diff attributable: a
+    /// differing seam cannot be the renderer's fault without this failing
+    /// first. Same role as arm 2's declared-forms witness.
+    #[test]
+    fn glue_shapes_render_the_span_layers_text() {
+        rustc_span::create_default_session_globals_then(|| {
+            // reborrow family
+            assert_eq!(rendered(GlueShape::Reborrow, true, None), "&mut *(*s).ptr");
+            assert_eq!(rendered(GlueShape::Reborrow, false, None), "&*(*s).ptr");
+            assert_eq!(
+                rendered(GlueShape::FromRawParts, true, Some("n")),
+                "core::slice::from_raw_parts_mut((*s).ptr, (n) as usize)"
+            );
+            assert_eq!(
+                rendered(GlueShape::FromRawParts, false, Some("n")),
+                "core::slice::from_raw_parts((*s).ptr, (n) as usize)"
+            );
+            // safe family
+            assert_eq!(
+                rendered(GlueShape::FromRefMut, true, None),
+                "core::slice::from_mut((*s).ptr)"
+            );
+            assert_eq!(
+                rendered(GlueShape::FromRefMut, false, None),
+                "core::slice::from_ref((*s).ptr)"
+            );
+            assert_eq!(rendered(GlueShape::Index0, true, None), "&mut (*s).ptr[0]");
+            assert_eq!(rendered(GlueShape::Index0, false, None), "&(*s).ptr[0]");
+            // the optional wrapper, over a bare argument and over a nested form
+            assert_eq!(rendered(GlueShape::Some_, false, None), "Some((*s).ptr)");
+        });
+    }
+
+    /// **The `{len}` expression is the ONE part that is genuinely new text.**
+    ///
+    /// The split rule in one assertion: the argument arrives as a subtree and
+    /// is never re-rendered, while the length has no subtree behind it (it is
+    /// recovered or fabricated) and therefore travels the parse-and-graft path
+    /// arm 2 hardened. A `from_raw_parts` shape with no length is a REFUSAL,
+    /// not a guess — the seam never invents a length, and neither does this.
+    ///
+    /// *Mutation-tested:* returning `None` instead of erroring on a missing
+    /// length fails the first assertion; accepting it and emitting `0` would
+    /// fail it too.
+    #[test]
+    fn a_length_bearing_shape_without_a_length_is_refused_not_guessed() {
+        rustc_span::create_default_session_globals_then(|| {
+            let arg = ::utils::ast::parse_expr("(*s).ptr".to_owned());
+            assert!(
+                glue_expr(GlueShape::FromRawParts, true, rustc_ast::ptr::P(arg), None).is_none(),
+                "a slice seam with no length must be REFUSED — the decision \
+                 layer gates it as `seam-len-unknown` (93 blocked) precisely so \
+                 that no layer below invents one"
+            );
+            let arg2 = ::utils::ast::parse_expr("(*s).ptr".to_owned());
+            assert!(
+                glue_expr(GlueShape::Reborrow, true, rustc_ast::ptr::P(arg2), None).is_some(),
+                "and a shape that needs no length must not be caught by that gate"
             );
         });
     }

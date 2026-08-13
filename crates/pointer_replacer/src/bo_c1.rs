@@ -9965,6 +9965,32 @@ fn m1_recon_corpus() {
     let art = orchestrate::out_dir().join("m1-recon-artifacts");
     let _ = fs::remove_dir_all(&art);
     fs::create_dir_all(&art).expect("artifact dir");
+    // **R7.5 — THE RUN STAMP, written before any program runs.**
+    //
+    // Both stale-artifact reads this milestone has recorded happened during the
+    // RELEASE BUILD, before this test body executed and therefore before
+    // `remove_dir_all` above: the previous run's files were still on disk and
+    // read as this run's. A reader cannot tell them apart by content, and
+    // "check the mtime" is a discipline, not a property.
+    //
+    // The stamp makes it decidable: a reader that does not find this file, or
+    // finds one whose pid is not the launch it is attributing results to, is
+    // provably looking at another run. It is written FIRST so the window in
+    // which the directory exists without it is empty.
+    //
+    // Deliberately NOT run-keyed directories: two other call sites read this
+    // path, so keying it would oblige them to locate "the newest run" — which
+    // is the same staleness hazard moved to the reader and made implicit.
+    //
+    // The pid is the TEST BINARY's, not the `cargo` process an observer
+    // watches. That is stated rather than glossed: the stamp is a run IDENTITY,
+    // not a handle. What it supports is "this differs from the value I saw
+    // before I launched", which is exactly the discrimination that was missing.
+    fs::write(
+        art.join("RUN.txt"),
+        format!("test_pid={}\n", std::process::id()),
+    )
+    .expect("run stamp");
 
     let timeout = Duration::from_secs(
         std::env::var("CRAT_BOC1_RECON_TIMEOUT_SECS")
