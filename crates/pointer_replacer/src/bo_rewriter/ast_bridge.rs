@@ -187,7 +187,7 @@ fn walk_items(items: &[rustc_ast::ptr::P<rustc_ast::Item>], tcx: TyCtxt<'_>, s: 
 /// surfaced in phase 3 as an unexplained parity diff over every attributed
 /// function in the corpus.
 #[cfg(test)]
-fn item_span_with_attrs(item: &rustc_ast::Item) -> rustc_span::Span {
+pub(crate) fn item_span_with_attrs(item: &rustc_ast::Item) -> rustc_span::Span {
     let lo = item
         .attrs
         .iter()
@@ -359,7 +359,10 @@ pub(crate) struct SubstStats {
 }
 
 #[cfg(test)]
-fn collect_fn_spans(items: &[rustc_ast::ptr::P<rustc_ast::Item>], out: &mut Vec<rustc_span::Span>) {
+pub(crate) fn collect_fn_spans(
+    items: &[rustc_ast::ptr::P<rustc_ast::Item>],
+    out: &mut Vec<rustc_span::Span>,
+) {
     for item in items {
         if let rustc_ast::ItemKind::Mod(_, _, rustc_ast::ModKind::Loaded(inner, _, _, _)) =
             &item.kind
@@ -442,7 +445,7 @@ pub(crate) fn substituted_source(tcx: TyCtxt<'_>) -> Result<(String, SubstStats)
 }
 
 #[cfg(test)]
-fn collect_fn_prints(
+pub(crate) fn collect_fn_prints(
     items: &[rustc_ast::ptr::P<rustc_ast::Item>],
     out: &mut Vec<(rustc_span::Span, String)>,
 ) {

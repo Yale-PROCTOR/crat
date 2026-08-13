@@ -7938,6 +7938,66 @@ mod run {
     /// a file join on `(fn_path, mir_local)` and needs no re-derivation. No BO
     /// solve; the row carries the subject and use totals so a silently empty
     /// census cannot pass for a measured zero.
+    /// **THE PHASE-3 EXIT GATE, per program.**
+    ///
+    /// Cites the oracle by **path handed in**, never by re-derivation: the
+    /// snapshot directory arrives as `CRAT_M1_ORACLE_DIR` and the revert set is
+    /// read from `{program}.reverts.txt` inside it. The digest is the caller's
+    /// to verify — this worker's contract is that it read THAT directory and no
+    /// other, which is why the path is echoed back into the row.
+    pub fn run_m1_p3(tcx: TyCtxt<'_>, t_tcx: Duration) -> Row {
+        let t0 = Instant::now();
+        let mut row = Row::default();
+        row.set("t_tcx_s", secs(t_tcx));
+        let name = std::env::var("CRAT_BOC1_NAME").unwrap_or_else(|_| "unnamed".into());
+        let Some(dir) = std::env::var_os("CRAT_M1_ORACLE_DIR").map(std::path::PathBuf::from) else {
+            // ABSENCE IS A TYPED ROW, never a silent pass: a gate that ran
+            // against no oracle would report parity over an empty population.
+            row.set("p3", "declined");
+            row.set("p3_detail", "CRAT_M1_ORACLE_DIR unset");
+            row.set("t_total_s", secs(t0.elapsed()));
+            return row;
+        };
+        let path = dir.join(format!("{name}.reverts.txt"));
+        row.set("p3_oracle", path.display().to_string());
+        let (reverted, subjects) =
+            match crate::bo_rewriter::ast_transform::oracle_reverts(tcx, &path) {
+                Ok(v) => v,
+                Err(why) => {
+                    row.set("p3", "declined");
+                    row.set("p3_detail", super::report::sanitize(&why));
+                    row.set("t_total_s", secs(t0.elapsed()));
+                    return row;
+                }
+            };
+        row.set("p3_reverted_subjects", subjects.to_string());
+        row.set("p3_reverted_fns", reverted.len().to_string());
+        match crate::bo_rewriter::ast_transform::phase3_fn_parity(tcx, &reverted) {
+            Ok(p) => {
+                row.set("p3", "ok");
+                row.set("p3_compared", p.compared.to_string());
+                row.set("p3_equal", p.equal.to_string());
+                row.set("p3_differing", p.differing.to_string());
+                row.set("p3_ast_only", p.ast_only.to_string());
+                row.set("p3_span_only", p.span_only.to_string());
+                row.set("p3_parse_failed", p.parse_failed.to_string());
+                row.set("p3_multi_arm", p.multi_arm.to_string());
+                if !p.examples.is_empty() {
+                    row.set(
+                        "p3_examples",
+                        super::report::sanitize(&p.examples.join(" | ")),
+                    );
+                }
+            }
+            Err(why) => {
+                row.set("p3", "declined");
+                row.set("p3_detail", super::report::sanitize(&why));
+            }
+        }
+        row.set("t_total_s", secs(t0.elapsed()));
+        row
+    }
+
     pub fn run_use_census(tcx: TyCtxt<'_>, t_tcx: Duration) -> Row {
         let t0 = Instant::now();
         let mut row = Row::default();
@@ -10742,6 +10802,132 @@ fn the_transfer_refuses_a_capture_with_no_frame() {
 /// of corpus pointer params before S3 exists, so the emitted/degraded split here
 /// is "pre-S3 — measures S3's absence". Only the M1-final report after S3 feeds
 /// the emission-guided-refinement decision.
+/// **THE PHASE-3 EXIT GATE — the corpus run.**
+///
+/// The arms proved their edits SEVERALLY. This proves their COMPOSITION into
+/// whole function bodies, which is the first end-to-end assembly evidence the
+/// milestone has — and the reason `p3_multi_arm` is asserted non-zero rather
+/// than merely reported: a gate over functions that each carry one edit would
+/// re-prove the per-arm differentials and nothing else.
+///
+/// The oracle is cited by PATH and verified by DIGEST at the call site; the
+/// revert set is held, never re-derived, because phase 3 tests the transform
+/// layer and phase 4 tests the revert layer. A run that re-derived reverts
+/// would make any difference ambiguous between the two.
+#[test]
+#[ignore = "phase-3 exit gate: spawns one worker per program"]
+fn m1_p3_corpus() {
+    use std::time::Duration;
+
+    let root = orchestrate::workspace_root();
+    let oracle = std::env::var("CRAT_M1_ORACLE_DIR").unwrap_or_else(|_| {
+        format!(
+            "{}/dev/agent-worktrees/m1-artifact-snapshots/d797ccaf",
+            std::env::var("HOME").expect("HOME")
+        )
+    });
+    assert!(
+        std::path::Path::new(&oracle)
+            .join("SHA256SUMS.txt")
+            .is_file(),
+        "the oracle must be a published snapshot, not a working directory: {oracle}"
+    );
+    let timeout = Duration::from_secs(
+        std::env::var("CRAT_BOC1_P3_TIMEOUT_SECS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(3000),
+    );
+
+    let mut failures: Vec<String> = Vec::new();
+    let (mut compared, mut equal, mut multi, mut rev_subj) = (0u64, 0u64, 0u64, 0u64);
+
+    for program in CORPUS {
+        let input = program.input_path(&root);
+        assert!(input.is_file(), "missing rs-crown input: {input:?}");
+        let outcome = orchestrate::run_child_env(
+            program.name,
+            &input,
+            "m1-p3",
+            timeout,
+            &[("CRAT_M1_ORACLE_DIR", oracle.clone())],
+        );
+        let Some(row) = outcome.row.clone() else {
+            failures.push(format!(
+                "{}: no sentinel row (orchestrator status={})",
+                program.name, outcome.status
+            ));
+            continue;
+        };
+        // FAIL-CLOSED: a declined worker reports NO parity, which must never
+        // read as parity. This is the arm-2 review's finding applied at birth.
+        match row.get("p3") {
+            Some("ok") => {}
+            other => {
+                failures.push(format!(
+                    "{}: p3={other:?} detail={:?}",
+                    program.name,
+                    row.get("p3_detail")
+                ));
+                continue;
+            }
+        }
+        let num = |k: &str| -> i64 { row.get(k).and_then(|v| v.parse().ok()).unwrap_or(-1) };
+        for key in [
+            "p3_differing",
+            "p3_ast_only",
+            "p3_span_only",
+            "p3_parse_failed",
+        ] {
+            match num(key) {
+                0 => {}
+                n => failures.push(format!(
+                    "{}: {key}={n}, expected 0 — STOP-class on this gate",
+                    program.name
+                )),
+            }
+        }
+        let (c, e) = (num("p3_compared"), num("p3_equal"));
+        if c != e {
+            failures.push(format!("{}: p3_compared={c} != p3_equal={e}", program.name));
+        }
+        compared += c.max(0) as u64;
+        equal += e.max(0) as u64;
+        multi += num("p3_multi_arm").max(0) as u64;
+        rev_subj += num("p3_reverted_subjects").max(0) as u64;
+        println!("{}", report::to_kv_line(&row));
+    }
+
+    println!(
+        "BOC1-P3 oracle={oracle} compared={compared} equal={equal} multi_arm={multi} \
+         reverted_subjects={rev_subj}"
+    );
+    // R7: the population is asserted NON-EMPTY. A green gate over zero
+    // functions is the failure this assertion exists to make impossible.
+    assert!(
+        compared > 0,
+        "the phase-3 gate compared NO functions — a parity claim over an empty \
+         population is not a parity claim"
+    );
+    // And it must have tested COMPOSITION, which is the thing this gate
+    // uniquely adds over the per-arm differentials.
+    assert!(
+        multi > 0,
+        "no function carried edits from more than one arm, so this gate \
+         re-proved the per-arm differentials and measured no composition"
+    );
+    assert_eq!(
+        rev_subj, 1058,
+        "the oracle's revert set must be the one the ledger was closed on"
+    );
+    assert!(
+        failures.is_empty(),
+        "phase-3 exit gate FAILED ({} finding(s)):\n  {}",
+        failures.len(),
+        failures.join("\n  ")
+    );
+}
+
 #[test]
 #[ignore = "S2b.0 measurement: spawns one worker per program"]
 fn m1_emit_corpus() {
@@ -10991,6 +11177,7 @@ fn boc1_run_one() {
             "free-overlap" => run::run_free_overlap(tcx, t_tcx),
             "use-census" => run::run_use_census(tcx, t_tcx),
             "m1-recon" => run::run_m1_recon(tcx, t_tcx),
+            "m1-p3" => run::run_m1_p3(tcx, t_tcx),
             "selector-core" => run::run_selector_core(tcx, t_tcx),
             "selector-necessity" => run::run_selector_necessity(tcx, t_tcx),
             detail if detail.starts_with("selector-detail-") => {

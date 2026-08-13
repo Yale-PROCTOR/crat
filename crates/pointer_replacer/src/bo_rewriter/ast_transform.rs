@@ -1662,6 +1662,318 @@ fn compare_renders(
     (compared, equal, differing, unmatched)
 }
 
+/// **THE ORACLE'S REVERT SET, resolved — held, never re-derived.**
+///
+/// Reads the digest-pinned snapshot's `{program}.reverts.txt` and resolves each
+/// line to the owning function's `LocalDefId`, which is the granularity
+/// `emit_files` reverts at and the granularity S3.6-1 measured revert to have.
+///
+/// # The id format, established by joining rather than by reading a format string
+///
+/// A line is `{fn_path}::{param_name}#{mir_local}`, where `fn_path` is
+/// `tcx.def_path_str` of the owning function — verified by joining binn's 26
+/// revert-owners against its `a.jsonl` `fn_path` column, **26/26 matched**,
+/// with the tail joining to a real row's `param_name`. Taking the prefix before
+/// the LAST `::` is therefore exact, not a heuristic.
+///
+/// # Fail-closed on an unresolved name
+///
+/// A line naming a function this session cannot resolve is an **error**, not a
+/// skip. Silently dropping one would under-revert — the AST side would then
+/// transform a function the span side took back, and every such function would
+/// present as a parity difference with no way to tell it from a real one.
+#[cfg(test)]
+pub(crate) fn oracle_reverts(
+    tcx: rustc_middle::ty::TyCtxt<'_>,
+    path: &std::path::Path,
+) -> Result<(FxHashSet<LocalDefId>, usize), String> {
+    let body = std::fs::read_to_string(path).map_err(|e| format!("read {path:?}: {e}"))?;
+    let wanted: FxHashSet<&str> = body
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .filter_map(|l| l.rsplit_once("::").map(|(owner, _)| owner))
+        .collect();
+    let subjects = body.lines().filter(|l| !l.trim().is_empty()).count();
+
+    let mut out = FxHashSet::default();
+    let mut seen: FxHashSet<String> = FxHashSet::default();
+    for did in tcx.hir_body_owners() {
+        let p = tcx.def_path_str(did.to_def_id());
+        if wanted.contains(p.as_str()) {
+            out.insert(did);
+            seen.insert(p);
+        }
+    }
+    if seen.len() != wanted.len() {
+        let missing: Vec<&&str> = wanted
+            .iter()
+            .filter(|w| !seen.contains(**w))
+            .take(5)
+            .collect();
+        return Err(format!(
+            "{} of {} reverted owner(s) did not resolve to a local function — \
+             under-reverting would make the AST side transform what the span \
+             side took back: {missing:?}",
+            wanted.len() - seen.len(),
+            wanted.len()
+        ));
+    }
+    Ok((out, subjects))
+}
+
+/// **THE PHASE-3 EXIT GATE.** Whole-function parity over the emitted
+/// population, with the oracle's decision table AND revert set held fixed.
+///
+/// # The two sides, and the one thing that differs between them
+///
+/// Both start from one `emit_files(tcx, &table, &reverted)` — so the decision
+/// table and the revert set are literally the same objects on both sides, and
+/// the ONLY difference is how the edits become text. That is the same-path
+/// control R7 asks for, in its strongest available form.
+///
+/// - **span side** — the plan's edits spliced into the function's own original
+///   snippet, offset-rebased.
+/// - **AST side** — arms 1–3's node transforms, printed by `pprust`.
+///
+/// # Partition by RESIDENCE, not by ownership (ruled 2026-08-14)
+///
+/// Edits are grouped by the function span that CONTAINS them, never by
+/// `owner_fn`: a seam edit sits in the **caller's** body while owned by the
+/// **callee**. Reverting follows ownership (`emit_files` filters by the owner's
+/// `LocalDefId`); the function-text unit follows residence. Conflating the two
+/// would attribute a caller's text to a callee.
+///
+/// # Why the revert set must be held rather than re-derived
+///
+/// Phase 3 tests the transform layer; phase 4 tests the revert layer. A run
+/// that re-derived reverts would make any difference ambiguous between the two,
+/// which is the attribution problem this milestone has paid for repeatedly.
+#[cfg(test)]
+pub(crate) fn phase3_fn_parity(
+    tcx: rustc_middle::ty::TyCtxt<'_>,
+    reverted: &FxHashSet<LocalDefId>,
+) -> Result<FnParity, String> {
+    let captured = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let mut krate = ::utils::ast::expanded_ast(tcx);
+        let map = ::utils::ast::make_ast_to_hir(&mut krate, tcx);
+        (krate, map)
+    }));
+    let (mut krate, map) = captured.map_err(|_| "AST capture panicked".to_owned())?;
+
+    let (table, _ctx) = super::decide_table_with_ctx(tcx)?;
+    let emission = super::emit_files(tcx, &table, reverted)?;
+
+    let mut p = FnParity::default();
+
+    // ---- the AST side: the same three passes, with the SAME subjects held back ----
+    let mut decisions: FxHashMap<(LocalDefId, HirId), (DeclForm, bool)> = FxHashMap::default();
+    let mut uses: FxHashMap<(u32, u32), String> = FxHashMap::default();
+    for (subject, decision) in &table.entries {
+        // **The revert set, applied to the AST layer by the same rule
+        // `emit_files` applies it by** — the owning function's `LocalDefId`.
+        // Without this the AST side would transform functions the span side
+        // took back, and every one would present as a difference.
+        if reverted.contains(&subject.fn_did) {
+            p.reverted_subjects += 1;
+            continue;
+        }
+        let (form, mutable, use_edits) = match decision {
+            super::decision::Decision::Ref { mutable } => (DeclForm::Ref, *mutable, None),
+            super::decision::Decision::Slice { mutable, uses } => {
+                (DeclForm::Slice, *mutable, Some(uses))
+            }
+            super::decision::Decision::Opt {
+                mutable,
+                slice,
+                uses,
+            } => (DeclForm::Opt { slice: *slice }, *mutable, Some(uses)),
+            super::decision::Decision::Degraded(_) => continue,
+        };
+        decisions.insert((subject.fn_did, subject.hir_id), (form, mutable));
+        for u in use_edits.into_iter().flatten() {
+            uses.insert((u.span.lo().0, u.span.hi().0), u.replacement.clone());
+        }
+    }
+
+    let mut guard = Composition::default();
+    let mut v = RefDeclVisitor {
+        local_map: &map.local_map,
+        decisions: &decisions,
+        global_map: &map.global_map,
+        current_fn: None,
+        guard: &mut guard,
+        stats: RefDeclStats::default(),
+    };
+    v.visit_crate(&mut krate);
+    let mut g = UseGraftVisitor::new(&uses, &mut guard);
+    g.visit_crate(&mut krate);
+    let _ = g.finish();
+
+    let mut seam_targets: FxHashMap<(u32, u32), SeamTarget> = FxHashMap::default();
+    for edit in &table.seams.edits {
+        seam_targets.insert((edit.span.lo().0, edit.span.hi().0), SeamTarget::of(edit));
+    }
+    let mut s = SeamGraftVisitor::new(&seam_targets, &mut guard);
+    s.visit_crate(&mut krate);
+    let _ = s.finish();
+
+    // **A composition-guard refusal is STOP-class here.** Carried into the
+    // result rather than swallowed: this gate is the first place three
+    // transforms meet inside one function body.
+    if !guard.refused.is_empty() {
+        p.examples.push(format!(
+            "COMPOSITION REFUSAL x{}: {:?}",
+            guard.refused.len(),
+            &guard.refused[..guard.refused.len().min(3)]
+        ));
+        p.differing += guard.refused.len();
+    }
+
+    let mut printed: Vec<(rustc_span::Span, String)> = Vec::new();
+    super::ast_bridge::collect_fn_prints(&krate.items, &mut printed);
+    let ast_by_lo: FxHashMap<u32, &String> = printed.iter().map(|(sp, t)| (sp.lo().0, t)).collect();
+
+    // ---- the span side: the plan's edits, partitioned by RESIDENCE ----
+    let sm = tcx.sess.source_map();
+    let mut spans: Vec<rustc_span::Span> = Vec::new();
+    super::ast_bridge::collect_fn_spans(&krate.items, &mut spans);
+
+    for fsp in &spans {
+        let Ok(orig) = sm.span_to_snippet(*fsp) else {
+            continue;
+        };
+        let (flo, fhi) = (fsp.lo().0, fsp.hi().0);
+        // Every surviving edit whose range sits inside this function.
+        let mut mine: Vec<(usize, usize, &str, &'static str)> = Vec::new();
+        for (key, edits) in &emission.plan.by_file {
+            let Some(base) = sm
+                .files()
+                .iter()
+                .find(|sf| super::file_key(&sf.name).as_ref() == Some(key))
+                .map(|sf| sf.start_pos.0)
+            else {
+                continue;
+            };
+            for e in edits {
+                let (lo, hi) = (base + e.lo as u32, base + e.hi as u32);
+                if lo >= flo && hi <= fhi {
+                    let arm = match e.justification {
+                        super::plan::Justification::KindDecision { .. } => "decl-or-use",
+                        super::plan::Justification::SeamAdapter { .. } => "seam",
+                        _ => "other",
+                    };
+                    mine.push((
+                        (lo - flo) as usize,
+                        (hi - flo) as usize,
+                        &e.replacement,
+                        arm,
+                    ));
+                }
+            }
+        }
+        if mine.is_empty() {
+            continue;
+        }
+        p.compared += 1;
+        if mine
+            .iter()
+            .map(|(_, _, _, a)| *a)
+            .collect::<FxHashSet<_>>()
+            .len()
+            > 1
+        {
+            p.multi_arm += 1;
+        }
+        // Back-to-front, exactly as `apply` does: offsets address the ORIGINAL.
+        mine.sort_by_key(|(lo, ..)| std::cmp::Reverse(*lo));
+        let mut span_text = orig.clone();
+        for (lo, hi, rep, _) in &mine {
+            if *lo <= *hi && *hi <= span_text.len() {
+                span_text.replace_range(*lo..*hi, rep);
+            }
+        }
+
+        let Some(ast_text) = ast_by_lo.get(&flo) else {
+            p.span_only += 1;
+            continue;
+        };
+        match (canonical_item(&span_text), canonical_item(ast_text)) {
+            (Some(a), Some(b)) if a == b => p.equal += 1,
+            (Some(a), Some(b)) => {
+                p.differing += 1;
+                if p.examples.len() < 6 {
+                    p.examples.push(format!(
+                        "@{flo} span={:?} ast={:?}",
+                        a.chars().take(160).collect::<String>(),
+                        b.chars().take(160).collect::<String>()
+                    ));
+                }
+            }
+            _ => p.parse_failed += 1,
+        }
+    }
+    // A transformed function the span side never reached.
+    let span_los: FxHashSet<u32> = spans.iter().map(|s| s.lo().0).collect();
+    p.ast_only = printed
+        .iter()
+        .filter(|(sp, _)| !span_los.contains(&sp.lo().0))
+        .count();
+    Ok(p)
+}
+
+/// **THE PHASE-3 EXIT GATE's result.**
+///
+/// The arms proved their edits *severally* — one declaration, one use, one glue
+/// expression at a time. This measures their **COMPOSITION** into whole
+/// function bodies: the first end-to-end assembly evidence the milestone has.
+#[derive(Default, Debug)]
+pub(crate) struct FnParity {
+    /// Functions carrying at least one surviving edit — the population.
+    pub compared: usize,
+    pub equal: usize,
+    pub differing: usize,
+    /// A function reached on one side only. **Typed rows, never skips**: on
+    /// this gate an absence IS the failure mode, not a nothing.
+    pub ast_only: usize,
+    pub span_only: usize,
+    /// A side whose text would not re-parse. R7.4's wrap rule — a canonical
+    /// form that cannot be taken is a reported row, never an abort.
+    pub parse_failed: usize,
+    /// **THE COMPOSITION POPULATION.** Functions carrying edits from MORE THAN
+    /// ONE arm. A gate over functions that each hold a single edit would prove
+    /// nothing the per-arm differentials had not already proved, so this is the
+    /// number that says whether the gate tested the thing it claims to.
+    pub multi_arm: usize,
+    /// Subjects the revert set took back, so the ledger identity is checkable
+    /// from this instrument's own output.
+    pub reverted_subjects: usize,
+    pub examples: Vec<String>,
+}
+
+/// Canonical form for comparison: **parse, then print**.
+///
+/// The token-stream unit, in the shape available in-process. Both sides go
+/// through the same parser and the same printer, so indentation, line wrapping
+/// and **comments** normalise *symmetrically* — which matters because `pprust`
+/// drops comments on the AST side while the span side splices into original
+/// source that keeps them. Comparing raw text would report every commented
+/// function as a difference; comparing tokens does not, and tokens are the unit
+/// the charter names.
+///
+/// This is also what makes the two registered non-findings — column-0 splice
+/// indentation and `pprust` wrapping — *structurally* unable to appear as
+/// differences, rather than merely expected not to.
+///
+/// `None` when the text will not re-parse: a typed row, never a panic.
+fn canonical_item(text: &str) -> Option<String> {
+    let parsed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        ::utils::ast::parse_item(text.to_owned())
+    }))
+    .ok()?;
+    Some(rustc_ast_pretty::pprust::item_to_string(&parsed))
+}
+
 /// **ONE ENTRY, because the AST may be captured ONCE.**
 ///
 /// `expanded_ast` panics after the HIR is built, and `make_ast_to_hir` builds
