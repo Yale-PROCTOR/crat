@@ -146,6 +146,27 @@ pub(crate) struct SeamEdit {
     /// surgical if it can tell a `following` selection from a `preceding` one
     /// without re-deriving the choice.
     pub len_arm: Option<LenEvidence>,
+    /// **The adapter, DESCRIBED** — option A's carried interface (2026-08-13).
+    ///
+    /// [`Self::replacement`] is `spec.render(<the argument's source text>)`, so
+    /// the two are redundant *by construction* and the span layer keeps reading
+    /// the string. The AST layer reads this instead, because it cannot rebuild a
+    /// wrapper from a rendered string without re-parsing the argument it was
+    /// told to keep as a subtree.
+    pub spec: GlueSpec,
+    /// **The span whose TEXT the replacement was built from** — which is NOT
+    /// always [`Self::span`].
+    ///
+    /// `span` is the whole argument and is what the span layer overwrites. For
+    /// the two cast shapes (`AddrOfCast`, `CastOfLocal`) the decision layer
+    /// builds the replacement from the cast's OPERAND (`ArgShape`'s `inner`),
+    /// so the surviving subtree is nested one level inside the replaced node.
+    ///
+    /// Carried rather than re-derived: an AST layer that peeled casts by
+    /// pattern would be guessing at exactly the point where the span layer
+    /// already knows, and a `Paren` between the cast and its operand would make
+    /// the guess silently wrong.
+    pub arg_span: Span,
 }
 
 /// `&mut ` or `&`.
@@ -254,6 +275,49 @@ impl GlueSpec {
         self
     }
 
+    /// **The census's `glue_shape`, CARRIED rather than inferred** — condition 5
+    /// of the option-A ruling.
+    ///
+    /// `seam_tsv` used to recover the shape by testing PREFIXES of the rendered
+    /// replacement. Same column, same ten-word vocabulary, strictly better
+    /// provenance — but it IS a schema semantics change, because the prefix test
+    /// reads a string the argument's own text contributes to and this reads the
+    /// decision.
+    ///
+    /// **Two inherited quirks are reproduced deliberately, not repaired here.**
+    /// The classifier tested `.contains(".unwrap()")` BEFORE the `Some(` tests,
+    /// so an unwrap under a wrapper reported `unwrap`/`as_mut_unwrap` rather
+    /// than the wrapper's shape; and `Some(&X[0])` fell through the
+    /// `Some(&mut *`/`Some(&*` test to `some_wrap`. Both are kept so this
+    /// function is provably zero-delta wherever the classifier was right, and
+    /// the places it was NOT right are the measured movement rather than a
+    /// change of vocabulary mixed in with it.
+    pub(crate) fn shape_key(&self) -> &'static str {
+        if let Some(found_mutable) = self.unwrap {
+            return if found_mutable {
+                "as_mut_unwrap"
+            } else {
+                "unwrap"
+            };
+        }
+        match (self.optional, &self.core) {
+            (true, GlueCore::FromRawParts) => "some_from_raw_parts",
+            (true, GlueCore::Reborrow) => "some_reborrow",
+            (true, GlueCore::FromRefMut) => "some_from_ref_mut",
+            // `Some(&X[0])` matches neither `Some(&mut *` nor `Some(&*`.
+            (true, GlueCore::Bare | GlueCore::Index0) => "some_wrap",
+            (false, GlueCore::FromRawParts) => "from_raw_parts",
+            (false, GlueCore::Reborrow) => "reborrow",
+            (false, GlueCore::FromRefMut) => "from_ref_mut",
+            // `index` is the classifier's FALLBACK arm. A bare core with
+            // neither an unwrap nor a wrapper renders the argument unchanged
+            // and is unreachable — `glue`'s identity arms return `Ok(None)`
+            // before any spec is built — so this pairing is the fallback's
+            // shape, matched here only to keep the function total.
+            (false, GlueCore::Bare | GlueCore::Index0) => "index",
+        }
+    }
+
     /// Render the spec as the span layer's text. **Byte-identical to the
     /// pre-reification `format!` set, and gated as such.**
     pub(crate) fn render(&self, text: &str) -> String {
@@ -290,18 +354,27 @@ impl GlueSpec {
 /// The glue that turns a value of `found` into one of `expected`.
 ///
 /// - `Ok(None)` — the forms already agree, or coerce. **No edit.**
-/// - `Ok(Some(text))` — the adapter expression.
+/// - `Ok(Some(spec))` — the adapter, DESCRIBED.
 /// - `Err(block)` — this position cannot be adapted, with its reason.
 ///
-/// `text` is the argument's own source, already peeled of any cast the caller
-/// resolved, and is substituted verbatim: the seam never re-renders an
-/// expression it did not author.
+/// # Half 2 of the option-A reification (2026-08-13)
+///
+/// Every arm used to `format!` its answer over the argument's source text.
+/// It now names a [`GlueSpec`], and the caller renders that spec over the same
+/// text — so `spec.render(text)` is the string this function used to return,
+/// **byte for byte**, and the argument no longer reaches this function at all.
+///
+/// That the text is not a parameter here is the substance of the change rather
+/// than a tidy-up: an adapter is a shape, the argument is a subtree, and the
+/// AST layer needs the first without being handed a rendering of the second.
+///
+/// **Reification only** — no arm's `(expected, found)` pattern, guard, family
+/// or `Err` moved. Each `format!` became the spec that renders to it.
 pub(crate) fn glue(
     expected: Form,
     found: Form,
-    text: &str,
     len: Option<&str>,
-) -> Result<Option<(String, SeamFamily)>, SeamBlock> {
+) -> Result<Option<(GlueSpec, SeamFamily)>, SeamBlock> {
     use Form::*;
     // A shared borrow can never satisfy a `&mut` position, whatever the shapes
     // either side. Checked first so every arm below may assume mutability is
@@ -339,7 +412,10 @@ pub(crate) fn glue(
         }
 
         // ---- reborrow family: a raw base becomes a reference ----
-        (Ref { mutable }, Raw) => Some((format!("{}*{text}", amp(mutable)), SeamFamily::Reborrow)),
+        (Ref { mutable }, Raw) => Some((
+            GlueSpec::core(GlueCore::Reborrow, mutable),
+            SeamFamily::Reborrow,
+        )),
         (
             Opt {
                 mutable,
@@ -347,7 +423,7 @@ pub(crate) fn glue(
             },
             Raw,
         ) => Some((
-            format!("Some({}*{text})", amp(mutable)),
+            GlueSpec::core(GlueCore::Reborrow, mutable).wrapped(),
             SeamFamily::Reborrow,
         )),
 
@@ -365,13 +441,8 @@ pub(crate) fn glue(
             let Some(len) = len else {
                 return Err(SeamBlock::LengthUnknown);
             };
-            let ctor = if mutable {
-                "from_raw_parts_mut"
-            } else {
-                "from_raw_parts"
-            };
             Some((
-                format!("core::slice::{ctor}({text}, ({len}) as usize)"),
+                GlueSpec::core(GlueCore::FromRawParts, mutable).with_len(len),
                 SeamFamily::Reborrow,
             ))
         }
@@ -385,13 +456,10 @@ pub(crate) fn glue(
             let Some(len) = len else {
                 return Err(SeamBlock::LengthUnknown);
             };
-            let ctor = if mutable {
-                "from_raw_parts_mut"
-            } else {
-                "from_raw_parts"
-            };
             Some((
-                format!("Some(core::slice::{ctor}({text}, ({len}) as usize))"),
+                GlueSpec::core(GlueCore::FromRawParts, mutable)
+                    .with_len(len)
+                    .wrapped(),
                 SeamFamily::Reborrow,
             ))
         }
@@ -404,14 +472,13 @@ pub(crate) fn glue(
             // `from_ref` accepts a `&mut T` by coercion, which is what makes the
             // measured `&mut T → &[T]` row (30 positions) a safe one rather than
             // a gap.
-            let ctor = if w { "from_mut" } else { "from_ref" };
-            Some((format!("core::slice::{ctor}({text})"), SeamFamily::Safe))
+            Some((GlueSpec::core(GlueCore::FromRefMut, w), SeamFamily::Safe))
         }
         (Ref { mutable: w }, Slice { mutable: h }) => {
             if shared_to_mut(w, h) {
                 return Err(SeamBlock::SharedToMut);
             }
-            Some((format!("{}{text}[0]", amp(w)), SeamFamily::Safe))
+            Some((GlueSpec::core(GlueCore::Index0, w), SeamFamily::Safe))
         }
         (
             Opt {
@@ -423,7 +490,10 @@ pub(crate) fn glue(
             if shared_to_mut(w, h) {
                 return Err(SeamBlock::SharedToMut);
             }
-            Some((format!("Some({text})"), SeamFamily::Safe))
+            Some((
+                GlueSpec::core(GlueCore::Bare, w).wrapped(),
+                SeamFamily::Safe,
+            ))
         }
         (
             Opt {
@@ -435,9 +505,8 @@ pub(crate) fn glue(
             if shared_to_mut(w, h) {
                 return Err(SeamBlock::SharedToMut);
             }
-            let ctor = if w { "from_mut" } else { "from_ref" };
             Some((
-                format!("Some(core::slice::{ctor}({text}))"),
+                GlueSpec::core(GlueCore::FromRefMut, w).wrapped(),
                 SeamFamily::Safe,
             ))
         }
@@ -451,7 +520,10 @@ pub(crate) fn glue(
             if shared_to_mut(w, h) {
                 return Err(SeamBlock::SharedToMut);
             }
-            Some((format!("Some({}{text}[0])", amp(w)), SeamFamily::Safe))
+            Some((
+                GlueSpec::core(GlueCore::Index0, w).wrapped(),
+                SeamFamily::Safe,
+            ))
         }
         // The FAT twin of the arm above: the slice is already the payload, so
         // this is a bare wrap. Found by the exhaustiveness guard rather than by
@@ -468,7 +540,10 @@ pub(crate) fn glue(
             if shared_to_mut(w, h) {
                 return Err(SeamBlock::SharedToMut);
             }
-            Some((format!("Some({text})"), SeamFamily::Safe))
+            Some((
+                GlueSpec::core(GlueCore::Bare, w).wrapped(),
+                SeamFamily::Safe,
+            ))
         }
 
         // ---- the null-panic convention (-3), inherited rather than reinvented ----
@@ -481,24 +556,23 @@ pub(crate) fn glue(
             if shared_to_mut(w, h) {
                 return Err(SeamBlock::SharedToMut);
             }
-            let inner = unwrap_expr(text, h);
-            Some(if slice {
-                (format!("{}{inner}[0]", amp(w)), SeamFamily::Safe)
+            let core = if slice {
+                GlueCore::Index0
             } else {
-                (inner, SeamFamily::Safe)
-            })
+                GlueCore::Bare
+            };
+            Some((GlueSpec::core(core, w).with_unwrap(h), SeamFamily::Safe))
         }
         (Slice { mutable: w }, Opt { mutable: h, slice }) => {
             if shared_to_mut(w, h) {
                 return Err(SeamBlock::SharedToMut);
             }
-            let inner = unwrap_expr(text, h);
-            Some(if slice {
-                (inner, SeamFamily::Safe)
+            let core = if slice {
+                GlueCore::Bare
             } else {
-                let ctor = if w { "from_mut" } else { "from_ref" };
-                (format!("core::slice::{ctor}({inner})"), SeamFamily::Safe)
-            })
+                GlueCore::FromRefMut
+            };
+            Some((GlueSpec::core(core, w).with_unwrap(h), SeamFamily::Safe))
         }
         (
             Opt {
@@ -511,16 +585,15 @@ pub(crate) fn glue(
             if shared_to_mut(w, h) {
                 return Err(SeamBlock::SharedToMut);
             }
-            let inner = unwrap_expr(text, h);
-            Some(if ws {
-                let ctor = if w { "from_mut" } else { "from_ref" };
-                (
-                    format!("Some(core::slice::{ctor}({inner}))"),
-                    SeamFamily::Safe,
-                )
+            let core = if ws {
+                GlueCore::FromRefMut
             } else {
-                (format!("Some({}{inner}[0])", amp(w)), SeamFamily::Safe)
-            })
+                GlueCore::Index0
+            };
+            Some((
+                GlueSpec::core(core, w).with_unwrap(h).wrapped(),
+                SeamFamily::Safe,
+            ))
         }
 
         // A raw position needs no adapter: `&mut T` coerces to `*mut T` at a
@@ -613,15 +686,23 @@ mod tests {
         }
     }
 
-    fn g(expected: Form, found: Form) -> Result<Option<(String, SeamFamily)>, SeamBlock> {
-        glue(expected, found, T, None)
+    fn g(expected: Form, found: Form) -> Result<Option<(GlueSpec, SeamFamily)>, SeamBlock> {
+        glue(expected, found, None)
     }
 
+    /// The glue's TEXT — `glue` names a spec and the caller renders it, which is
+    /// exactly what `seams` does in production. These assertions therefore still
+    /// read the string the span layer writes, over the same argument, and they
+    /// are the reason half 2 could not quietly change one.
     fn text(expected: Form, found: Form) -> String {
-        g(expected, found)
-            .unwrap_or_else(|b| panic!("blocked: {b:?}"))
+        rendered(g(expected, found), T)
+    }
+
+    fn rendered(got: Result<Option<(GlueSpec, SeamFamily)>, SeamBlock>, arg: &str) -> String {
+        got.unwrap_or_else(|b| panic!("blocked: {b:?}"))
             .unwrap_or_else(|| panic!("no edit"))
             .0
+            .render(arg)
     }
 
     /// **Reborrow, BOTH SIDES.** `*mut T → &mut T` needs glue; the reverse needs
@@ -683,7 +764,7 @@ mod tests {
     /// pointer operation at all.
     #[test]
     fn optional_over_raw_composes_reborrow_inside_some() {
-        let (t, fam) = g(
+        let (spec, fam) = g(
             Opt {
                 mutable: true,
                 slice: false,
@@ -692,7 +773,7 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        assert_eq!(t, "Some(&mut *p)");
+        assert_eq!(spec.render(T), "Some(&mut *p)");
         assert_eq!(fam, SeamFamily::Reborrow, "the raw base carries the family");
     }
 
@@ -764,40 +845,33 @@ mod tests {
     #[test]
     fn a_companion_length_converts_the_gate_into_a_slice_seam() {
         assert_eq!(
-            glue(Slice { mutable: true }, Raw, "p", Some("n"))
-                .unwrap()
-                .unwrap()
-                .0,
+            rendered(glue(Slice { mutable: true }, Raw, Some("n")), "p"),
             "core::slice::from_raw_parts_mut(p, (n) as usize)"
         );
         assert_eq!(
-            glue(Slice { mutable: false }, Raw, "p", Some("len"))
-                .unwrap()
-                .unwrap()
-                .0,
+            rendered(glue(Slice { mutable: false }, Raw, Some("len")), "p"),
             "core::slice::from_raw_parts(p, (len) as usize)"
         );
         // The fat optional composes the wrap around it.
         assert_eq!(
-            glue(
-                Opt {
-                    mutable: true,
-                    slice: true
-                },
-                Raw,
-                "p",
-                Some("n")
-            )
-            .unwrap()
-            .unwrap()
-            .0,
+            rendered(
+                glue(
+                    Opt {
+                        mutable: true,
+                        slice: true
+                    },
+                    Raw,
+                    Some("n")
+                ),
+                "p"
+            ),
             "Some(core::slice::from_raw_parts_mut(p, (n) as usize))"
         );
         // **The gate still holds without one** — ruling item 4 stands, and B
         // widened which positions HAVE a length, never whether one may be
         // invented.
         assert_eq!(
-            glue(Slice { mutable: true }, Raw, "p", None),
+            glue(Slice { mutable: true }, Raw, None),
             Err(SeamBlock::LengthUnknown)
         );
     }
@@ -811,7 +885,7 @@ mod tests {
     #[test]
     fn a_slice_seam_over_a_raw_base_is_reborrow_family() {
         assert_eq!(
-            glue(Slice { mutable: true }, Raw, "p", Some("n"))
+            glue(Slice { mutable: true }, Raw, Some("n"))
                 .unwrap()
                 .unwrap()
                 .1,
@@ -870,6 +944,136 @@ mod tests {
         }
         // `&mut T` supplied where `&T` is wanted: coercion, still no edit.
         assert_eq!(g(Ref { mutable: false }, Ref { mutable: true }), Ok(None));
+    }
+
+    /// **THE RETIRED CLASSIFIER, kept as this test's oracle.**
+    ///
+    /// A verbatim transcription of the ten prefix tests `seam_tsv` ran over
+    /// `edit.replacement` before condition 5 replaced them with
+    /// [`GlueSpec::shape_key`]. Kept here and nowhere else: the census must
+    /// carry the shape, and the only remaining question is *where the carried
+    /// answer differs from the inferred one*, which needs both.
+    fn inferred_shape(r: &str) -> &'static str {
+        if r.starts_with("core::slice::from_raw_parts") {
+            "from_raw_parts"
+        } else if r.starts_with("Some(core::slice::from_raw_parts") {
+            "some_from_raw_parts"
+        } else if r.contains(".as_mut().unwrap()") {
+            "as_mut_unwrap"
+        } else if r.contains(".unwrap()") {
+            "unwrap"
+        } else if r.starts_with("Some(&mut *") || r.starts_with("Some(&*") {
+            "some_reborrow"
+        } else if r.starts_with("Some(core::slice::from_") {
+            "some_from_ref_mut"
+        } else if r.starts_with("Some(") {
+            "some_wrap"
+        } else if r.starts_with("&mut *") || r.starts_with("&*") {
+            "reborrow"
+        } else if r.starts_with("core::slice::from_") {
+            "from_ref_mut"
+        } else {
+            "index"
+        }
+    }
+
+    /// **Every spec `glue` can name agrees with the retired classifier — over a
+    /// WELL-BEHAVED argument.** Condition 5's "same column" as a measurement.
+    ///
+    /// The argument is a bare identifier here deliberately, because that is the
+    /// case in which the prefix classifier was *right*. The cases in which it
+    /// was not are the next test, and they are the schema movement.
+    #[test]
+    fn the_carried_shape_agrees_with_the_retired_classifier() {
+        for spec in every_emitting_spec() {
+            assert_eq!(
+                spec.shape_key(),
+                inferred_shape(&spec.render("p")),
+                "carried and inferred shapes must agree on a bare argument: {spec:?}"
+            );
+        }
+    }
+
+    /// **Where the two DISAGREE, and why that is the point of carrying it.**
+    ///
+    /// The classifier reads a string the argument's own text contributes to, so
+    /// an argument that happens to start with `*` or contain `.unwrap()` moves
+    /// the inferred label while the decision is unchanged. These rows are the
+    /// schema semantics change condition 5 requires to be recorded — *strictly
+    /// better provenance*, stated as a witness rather than as a claim.
+    #[test]
+    fn the_classifier_was_argument_text_sensitive_and_the_carried_shape_is_not() {
+        // An `Index0` wrap over an argument spelled `*q` renders `Some(&*q[0])`,
+        // whose prefix is `Some(&*` — the classifier called that `some_reborrow`.
+        let index0_wrapped = GlueSpec::core(GlueCore::Index0, false).wrapped();
+        assert_eq!(index0_wrapped.render("*q"), "Some(&*q[0])");
+        assert_eq!(
+            inferred_shape(&index0_wrapped.render("*q")),
+            "some_reborrow"
+        );
+        assert_eq!(index0_wrapped.shape_key(), "some_wrap");
+
+        // An argument that is itself an `.unwrap()` call captured rule 4, which
+        // sits ABOVE every `Some(` test.
+        let some_wrap = GlueSpec::core(GlueCore::Bare, false).wrapped();
+        assert_eq!(inferred_shape(&some_wrap.render("o.unwrap()")), "unwrap");
+        assert_eq!(some_wrap.shape_key(), "some_wrap");
+
+        // And the carried answer does not move with the argument at all — the
+        // property that makes the column mean the decision.
+        for arg in ["p", "*q", "o.unwrap()", "(*s).ptr", "&mut *raw"] {
+            assert_eq!(
+                some_wrap.shape_key(),
+                "some_wrap",
+                "the carried shape must not depend on the argument text ({arg})"
+            );
+        }
+    }
+
+    /// Every `(spec, family)` `glue` can return, enumerated by driving `glue`
+    /// over the whole `(expected, found)` product rather than by transcribing
+    /// the arms a second time.
+    ///
+    /// Transcription is what the renderer oracle does, and doing it twice would
+    /// make both copies agree with each other instead of with the function.
+    fn every_emitting_spec() -> Vec<GlueSpec> {
+        let forms = [
+            Raw,
+            Ref { mutable: true },
+            Ref { mutable: false },
+            Slice { mutable: true },
+            Slice { mutable: false },
+            Opt {
+                mutable: true,
+                slice: false,
+            },
+            Opt {
+                mutable: false,
+                slice: false,
+            },
+            Opt {
+                mutable: true,
+                slice: true,
+            },
+            Opt {
+                mutable: false,
+                slice: true,
+            },
+        ];
+        let mut out = Vec::new();
+        for expected in forms {
+            for found in forms {
+                if let Ok(Some((spec, _))) = glue(expected, found, Some("n")) {
+                    out.push(spec);
+                }
+            }
+        }
+        assert!(
+            out.len() >= 14,
+            "the product must reach every emitting arm; got {}",
+            out.len()
+        );
+        out
     }
 }
 
@@ -1006,6 +1210,13 @@ pub(crate) fn synthesize(
                 expected: Form,
                 found: Form,
                 text: Option<String>,
+                /// **Where `text` was read from.** Equal to `span` for every
+                /// shape except the two cast shapes, whose snippet comes from
+                /// the cast's OPERAND while the replaced range is the whole
+                /// argument. Carried because the AST layer must keep that
+                /// operand as its subtree, and only this side knows which it
+                /// was.
+                text_span: Span,
                 root: Option<HirId>,
                 blind: bool,
             }
@@ -1020,12 +1231,17 @@ pub(crate) fn synthesize(
                 if matches!(expected, Form::Raw) {
                     continue;
                 }
-                let (found, text, blind) = match arg.shape {
+                // The third element is the span `text` is read from — carried
+                // out of this match rather than reconstructed below, because
+                // the two cast shapes read the OPERAND's snippet while every
+                // other shape reads the argument's own.
+                let (found, text, text_span, blind) = match arg.shape {
                     ArgShape::BareLocal(hir) => (
                         decision_of
                             .get(&(site.caller, hir))
                             .map_or(Form::Raw, |d| form_of(d)),
                         sm.span_to_snippet(arg.span).ok(),
+                        arg.span,
                         false,
                     ),
                     ArgShape::AddrOf {
@@ -1046,17 +1262,22 @@ pub(crate) fn synthesize(
                         (
                             Form::Ref { mutable },
                             sm.span_to_snippet(arg.span).ok(),
+                            arg.span,
                             blind,
                         )
                     }
-                    ArgShape::AddrOfCast { mutable, inner } => {
-                        (Form::Ref { mutable }, sm.span_to_snippet(inner).ok(), true)
-                    }
+                    ArgShape::AddrOfCast { mutable, inner } => (
+                        Form::Ref { mutable },
+                        sm.span_to_snippet(inner).ok(),
+                        inner,
+                        true,
+                    ),
                     ArgShape::CastOfLocal { binding, inner } => (
                         decision_of
                             .get(&(site.caller, binding))
                             .map_or(Form::Raw, |d| form_of(d)),
                         sm.span_to_snippet(inner).ok(),
+                        inner,
                         false,
                     ),
                     // Not an expression this slice can name.
@@ -1076,6 +1297,7 @@ pub(crate) fn synthesize(
                     expected,
                     found,
                     text,
+                    text_span,
                     root: arg.shape.place_root(),
                     blind,
                 });
@@ -1160,21 +1382,29 @@ pub(crate) fn synthesize(
                 } else {
                     (None, None)
                 };
-                match glue(pos.expected, pos.found, text, len_text.as_deref()) {
+                match glue(pos.expected, pos.found, len_text.as_deref()) {
                     Ok(None) => {}
-                    Ok(Some((replacement, family))) => {
+                    Ok(Some((spec, family))) => {
                         // Rule 1 (2026-08-11): the census is a prioritization
                         // overlay, so a pair with no row is REPORTED, not
                         // refused.
                         if !in_census(pos.found, pos.expected) {
                             plan.uncensused.push((pos.found, pos.expected));
                         }
+                        // **The rendering happens HERE**, over exactly the text
+                        // the arms used to receive. `pos.text_span` is the span
+                        // that text was read from, and it is carried beside the
+                        // string so the AST layer can find the same subtree
+                        // rather than re-deriving which part of the argument the
+                        // span layer kept.
                         plan.edits.push(SeamEdit {
                             span: pos.span,
-                            replacement,
+                            replacement: spec.render(text),
                             owner_fn: tcx.def_path_str(callee.to_def_id()),
                             family,
                             len_arm,
+                            spec,
+                            arg_span: pos.text_span,
                         });
                     }
                     Err(block) => {

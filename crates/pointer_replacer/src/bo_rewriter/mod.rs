@@ -3050,28 +3050,18 @@ pub(crate) fn seam_tsv(tcx: TyCtxt<'_>) -> Result<String, String> {
         // only by family. Without it "does the unwrap arm ever fire?" is
         // unanswerable from the census, and a golden could ratify a form with
         // zero market -- the -4/-5 precedent.
-        let r = &edit.replacement;
-        let shape = if r.starts_with("core::slice::from_raw_parts") {
-            "from_raw_parts"
-        } else if r.starts_with("Some(core::slice::from_raw_parts") {
-            "some_from_raw_parts"
-        } else if r.contains(".as_mut().unwrap()") {
-            "as_mut_unwrap"
-        } else if r.contains(".unwrap()") {
-            "unwrap"
-        } else if r.starts_with("Some(&mut *") || r.starts_with("Some(&*") {
-            "some_reborrow"
-        } else if r.starts_with("Some(core::slice::from_") {
-            "some_from_ref_mut"
-        } else if r.starts_with("Some(") {
-            "some_wrap"
-        } else if r.starts_with("&mut *") || r.starts_with("&*") {
-            "reborrow"
-        } else if r.starts_with("core::slice::from_") {
-            "from_ref_mut"
-        } else {
-            "index"
-        };
+        //
+        // **CARRIED, not inferred** — condition 5 of the option-A ruling
+        // (2026-08-13). This was ten `starts_with`/`contains` tests over
+        // `edit.replacement`, which is a string the ARGUMENT's own text
+        // contributes to: an `Index0` adapter over an argument spelled `*q`
+        // renders `Some(&*q[0])`, and the prefix test called that
+        // `some_reborrow`. Same column, same ten-word vocabulary, and the shape
+        // is now read from the decision rather than recovered from a rendering
+        // of it. **Schema semantics changed; the column did not** — see
+        // `GlueSpec::shape_key`, which reproduces the classifier's two ordering
+        // quirks deliberately so the movement is only where it was wrong.
+        let shape = edit.spec.shape_key();
         out.push_str(&format!(
             "placed\t{}\t{}\t{}\t{arm}\t{shape}\t-\n",
             edit.owner_fn,
