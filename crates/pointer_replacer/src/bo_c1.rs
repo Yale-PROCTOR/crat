@@ -9729,6 +9729,198 @@ fn m1_use_census_corpus() {
 ///
 /// It **continues past failures** and enumerates them all before asserting, so
 /// one run yields full incidence rather than halting at the first program.
+/// The arm-1/arm-2 row keys that must read **exactly zero** on every program.
+///
+/// `arm2_differing` is deliberately ABSENT from this list, and that absence is
+/// the token-vs-byte ruling in code: it reads **176** on the frozen corpus, all
+/// of it the AST layer canonicalizing the span layer's verbatim multi-line
+/// source copy at use positions. §2's parity unit is token-stream equality
+/// after canonical formatting, not byte equality per edit, so the line that
+/// carries the parity claim is [`arm2_ws_real`] — differing AND still differing
+/// with whitespace removed. Gating `arm2_differing` would fail a conforming
+/// corpus; gating nothing would let a real difference through.
+///
+/// `arm1_unmatched_span` is absent for a different reason: it reads 2,039 by
+/// construction (arm 1's renders alone, kept computable so its pin survives).
+/// `kd_unmatched_span` is the conservation bound and IS gated.
+const ARM_ZERO_INVARIANTS: &[&str] = &[
+    "arm1_not_ptr_decl",
+    "arm1_refused",
+    "arm1_differing",
+    "arm1_unmatched_ast",
+    "arm2_use_parse_failed",
+    "arm2_use_unmatched",
+    "arm2_refused",
+    "arm2_unmatched_ast",
+    "arm2_ws_real",
+    "kd_unmatched_span",
+    "kd_base_unresolved",
+];
+
+/// **THE ARM-2 PARITY GATE — fail-closed over one program's row.**
+///
+/// # What this repairs, and how it was found
+///
+/// Arm 2 landed its parity counters as **telemetry**: `run_m1_recon` sets ~20
+/// `arm*`/`kd_*` keys and `m1_recon_corpus` read exactly three — `derivations`,
+/// `recon`, `status`. Every invariant the arm claims could therefore be
+/// violated while the corpus gate stayed green: a parse failure, an unmatched
+/// or refused graft, a lossy offset collision, an unresolved source-map base, a
+/// nonzero conservation residue — or `arms_full` **declining outright**, which
+/// makes every arm number *absent* rather than wrong, the quietest failure of
+/// the set.
+///
+/// The composition guard's doc called a nonzero `refused` "pre-classified
+/// STOP". That was **prose asserting a check the code did not have** — this
+/// track's own founding failure class, named in `plan/mod.rs`'s doc — and the
+/// claim outlived the slice that made it by exactly one boundary. Surfaced by
+/// the Codex adversarial review at the arm-2 boundary (2026-08-13).
+///
+/// # Fail-closed means absence fails
+///
+/// A missing key and an unparseable value are FAILURES, not skips. That is the
+/// whole point: `arms_full` returning `Err` writes `arm1_compared: "declined"`
+/// and omits everything else, so a gate that treated absence as "nothing to
+/// check" would be green precisely when the instrument measured nothing.
+fn arm_parity_failures(program: &str, row: &report::Row) -> Vec<String> {
+    let mut out = Vec::new();
+    let num = |key: &str| -> Result<i64, String> {
+        match row.get(key) {
+            None => Err(format!(
+                "{program}: {key} MISSING — the arm gate is fail-closed, and an \
+                 absent counter is not a passing one"
+            )),
+            Some(v) => v.parse::<i64>().map_err(|_| {
+                format!(
+                    "{program}: {key}={v:?} does not parse as a number — \
+                     `arms_full` most likely declined, in which case every arm \
+                     figure below is absent rather than wrong"
+                )
+            }),
+        }
+    };
+    // Named first so a decline reports its CAUSE once, not as eleven
+    // indistinguishable MISSING lines.
+    if let Err(why) = num("arm1_compared") {
+        out.push(why);
+    }
+    for key in ARM_ZERO_INVARIANTS {
+        match num(key) {
+            Ok(0) => {}
+            Ok(n) => out.push(format!(
+                "{program}: {key}={n}, expected 0 — this is a STOP-class parity \
+                 movement, not a conservative win"
+            )),
+            Err(why) => out.push(why),
+        }
+    }
+    // The flattering-direction guard: two edits colliding on one absolute
+    // offset would close the conservation bound WHILE an edit went unmatched.
+    match (num("kd_edits"), num("kd_offsets")) {
+        (Ok(e), Ok(o)) if e == o => {}
+        (Ok(e), Ok(o)) => out.push(format!(
+            "{program}: kd_edits={e} != kd_offsets={o} — the offset-keyed join \
+             is lossy, so the conservation bound closed for the wrong reason"
+        )),
+        (Err(why), _) | (Ok(_), Err(why)) => out.push(why),
+    }
+    out
+}
+
+/// A row carrying the frozen corpus's actual conforming values.
+#[cfg(test)]
+fn conforming_arm_row() -> report::Row {
+    let mut row = report::Row::default();
+    // Real values from the 20-program sweep at `8aef96f5`, per program totals
+    // aside — what matters here is that each gated key is present and passing.
+    row.set("arm1_compared", "780");
+    for key in ARM_ZERO_INVARIANTS {
+        row.set(key, "0");
+    }
+    // `arm2_differing` is 176 on the real corpus and is deliberately NOT gated.
+    row.set("arm2_differing", "176");
+    row.set("arm1_unmatched_span", "2039");
+    row.set("kd_edits", "2819");
+    row.set("kd_offsets", "2819");
+    row
+}
+
+/// **The gate must PASS the shape the corpus actually produces.**
+///
+/// The positive control, and it is load-bearing rather than decorative: it
+/// carries `arm2_differing = 176`, the real measured value. A gate that
+/// tightened `arm2_differing` to zero — the intuitive but wrong reading of
+/// "parity" — fails here, which is the token-vs-byte ruling defended by a test
+/// instead of by a comment.
+#[test]
+fn the_arm_gate_passes_a_conforming_row() {
+    assert!(
+        arm_parity_failures("avl", &conforming_arm_row()).is_empty(),
+        "the gate must not fail the corpus's own conforming shape: {:?}",
+        arm_parity_failures("avl", &conforming_arm_row())
+    );
+}
+
+/// **Every failure class fails the gate — fault-injected, one at a time.**
+///
+/// This is the test the Codex adversarial review asked for by name. Without it
+/// the gate is a block of code that has never said no, and "fail-closed" is
+/// another claim with no witness — the exact defect it was written to repair.
+///
+/// Each case perturbs ONE key of an otherwise-conforming row, so a passing
+/// assertion attributes to that key rather than to the row being broken
+/// generally.
+#[test]
+fn every_arm_gate_failure_class_actually_fails() {
+    // 1. Each zero-invariant, violated on its own.
+    for key in ARM_ZERO_INVARIANTS {
+        let mut row = conforming_arm_row();
+        row.set(key, "1");
+        let failures = arm_parity_failures("avl", &row);
+        assert!(
+            failures.iter().any(|f| f.contains(key)),
+            "{key}=1 must fail the gate and NAME the key: {failures:?}"
+        );
+    }
+
+    // 2. A missing key is a failure, not a skip. This is the class that makes
+    //    the gate fail-closed rather than fail-open.
+    for key in ARM_ZERO_INVARIANTS {
+        let mut row = conforming_arm_row();
+        row.0.retain(|(k, _)| k != key);
+        let failures = arm_parity_failures("avl", &row);
+        assert!(
+            failures
+                .iter()
+                .any(|f| f.contains(key) && f.contains("MISSING")),
+            "an ABSENT {key} must fail — absence is how a declined instrument \
+             presents, and it must not read as zero: {failures:?}"
+        );
+    }
+
+    // 3. `arms_full` declining. The quietest failure: every arm figure goes
+    //    absent and `arm1_compared` carries the word "declined".
+    let mut row = conforming_arm_row();
+    row.set("arm1_compared", "declined");
+    let failures = arm_parity_failures("avl", &row);
+    assert!(
+        failures.iter().any(|f| f.contains("arm1_compared")),
+        "a declined `arms_full` must fail the gate by name: {failures:?}"
+    );
+
+    // 4. The lossy offset join — the flattering-direction failure, where the
+    //    conservation bound closes while an edit goes unmatched.
+    let mut row = conforming_arm_row();
+    row.set("kd_offsets", "2818");
+    let failures = arm_parity_failures("avl", &row);
+    assert!(
+        failures
+            .iter()
+            .any(|f| f.contains("kd_edits") && f.contains("kd_offsets")),
+        "kd_edits != kd_offsets must fail and name BOTH sides: {failures:?}"
+    );
+}
+
 #[test]
 #[ignore = "S2a-H corpus gate: spawns one worker per program"]
 fn m1_recon_corpus() {
@@ -9780,6 +9972,10 @@ fn m1_recon_corpus() {
                 program.name
             )),
         }
+        // The AST layer's parity invariants, fail-closed. Until this landed the
+        // arm counters were telemetry no gate read — see `arm_parity_failures`.
+        failures.extend(arm_parity_failures(program.name, &row));
+
         let recon = row.get("recon").unwrap_or("missing").to_owned();
         let status = row.get("status").unwrap_or("missing").to_owned();
 

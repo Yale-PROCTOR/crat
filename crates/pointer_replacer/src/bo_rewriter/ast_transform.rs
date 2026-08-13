@@ -597,18 +597,23 @@ fn transform_inner(
         stats: RefDeclStats::default(),
     };
     v.visit_crate(&mut krate);
-    let mut decls = v.stats;
+    let decls = v.stats;
 
     let mut g = UseGraftVisitor::new(&uses, &mut guard);
     g.visit_crate(&mut krate);
     let grafts = g.finish();
 
-    // Attributed by CLAIMANT LABEL, not by subtracting the use pass's tally
-    // from the guard's total: subtraction is correct only while there are
-    // exactly two transforms, and arm 3 adds a third.
-    decls.refused = guard.refused_by("decl:ref")
-        + guard.refused_by("decl:slice")
-        + guard.refused_by("decl:opt");
+    // **Each pass counts its OWN refusals**, at the site where it was turned
+    // away. This used to recompute `decls.refused` here by summing
+    // `refused_by` over a hand-written list of the three `decl:*` labels —
+    // which had two faults, both found at the arm-2 review: it made the
+    // visitor's own `stats.refused += 1` a DEAD write, and the list was not
+    // exhaustive over `DeclForm`, so arm 3's claimant would have been dropped
+    // from the sum in silence. Counting locally cannot drift, because there is
+    // no second place to keep in step.
+    //
+    // `Composition::refused_by` survives for DIAGNOSIS — reading which pair
+    // collided out of a nonzero gate — which is what the labels are for.
     Ok((decls, grafts))
 }
 
@@ -1105,6 +1110,186 @@ mod arm2_witnesses {
             2,
             "every differing pair goes to the artifact"
         );
+    }
+
+    /// **The DECL position of the whitespace split — the positive-control
+    /// mirror.**
+    ///
+    /// `differing_decl = 0` is the arm's load-bearing corpus result: 340
+    /// declarations, two genuinely independent derivations, byte-identical. A
+    /// zero means nothing unless the counter can be non-zero, and the existing
+    /// split witness only ever passes `"use"`. This supplies the other side.
+    ///
+    /// *Mutation-tested:* routing both positions to `differing_use` (dropping
+    /// the `"decl"` arm of the match) fails here on `differing_decl`.
+    #[test]
+    fn a_declaration_difference_is_attributed_to_the_decl_position() {
+        let by_offset: FxHashMap<u32, String> = [(9u32, "&mut libc::c_int".to_owned())]
+            .into_iter()
+            .collect();
+        let renders = vec![(9u32, "&mut [libc::c_int]".to_owned())];
+
+        let mut d = TextDiff::default();
+        let (compared, equal, differing, unmatched) =
+            compare_renders(&renders, &by_offset, "decl", &mut d);
+
+        assert_eq!((compared, equal, differing, unmatched), (1, 0, 1, 0));
+        assert_eq!(d.differing_decl, 1, "the decl position must be counted");
+        assert_eq!(d.differing_use, 0);
+        assert_eq!(
+            d.ws_real, 1,
+            "a slice form where the span layer wrote a bare reference is a REAL \
+             difference — `[` is not whitespace"
+        );
+        assert_eq!(d.ws_equal, 0);
+    }
+
+    /// **The `pairs` artifact must carry the right payload, not merely the
+    /// right length.**
+    ///
+    /// Banked lesson, from the `no-declared-type` close: *when a change alters
+    /// a payload, assert the payload.* `pairs` is the entire untruncated
+    /// evidence for a parity diff — it exists precisely because the row field
+    /// truncates at 120 chars — so a swapped or mislabelled tuple would send a
+    /// future diagnosis to the wrong side of the comparison.
+    ///
+    /// *Mutation-tested:* swapping `rendered` and `span_text` in the push fails
+    /// here; a length-only assertion passes it.
+    #[test]
+    fn the_pairs_artifact_records_ast_and_span_the_right_way_round() {
+        let by_offset: FxHashMap<u32, String> = [(4u32, "p[0]".to_owned())].into_iter().collect();
+        let renders = vec![(4u32, "q[0]".to_owned())];
+
+        let mut d = TextDiff::default();
+        compare_renders(&renders, &by_offset, "use", &mut d);
+
+        assert_eq!(
+            d.pairs,
+            vec![(4u32, "use", "q[0]".to_owned(), "p[0]".to_owned())],
+            "the tuple is (offset, position, AST render, SPAN text) — in that \
+             order. A swap reads as the span layer producing what the AST layer \
+             produced, which inverts every diagnosis drawn from the artifact"
+        );
+    }
+
+    /// **The declaration pass routes each form to its own counter and its own
+    /// render list.**
+    ///
+    /// `decl_ty_kind` is pinned separately; this pins the VISITOR's routing,
+    /// which is a different thing and is what produces `arm2_slice_decl` /
+    /// `arm2_opt_decl`. Both are corpus numbers under a gate now, so a
+    /// mis-route would move a gated line.
+    ///
+    /// `rendered` vs `rendered_arm2` matters as much as the counts: arm 1's
+    /// pinned 780-row differential is computed over `rendered` alone, so a
+    /// Slice render leaking into it would move a must-not-move number.
+    ///
+    /// *Mutation-tested:* pushing every render to `rendered` fails on the
+    /// `rendered_arm2` length; incrementing `rewritten` for `Slice` fails on
+    /// the counts.
+    #[test]
+    fn each_declared_form_routes_to_its_own_counter_and_render_list() {
+        rustc_span::create_default_session_globals_then(|| {
+            let mut stats = RefDeclStats::default();
+            // Drive the same routing the visitor performs, over a real parsed
+            // pointer type, without needing a compiler session: the routing is
+            // the code under test, not the map lookup above it.
+            for (form, mutable) in [
+                (DeclForm::Ref, true),
+                (DeclForm::Slice, false),
+                (DeclForm::Opt { slice: true }, true),
+            ] {
+                let mut ty = ::utils::ast::parse_ty("*mut libc::c_int".to_owned());
+                let TyKind::Ptr(mut_ty) = &ty.kind else { panic!("fixture is a raw pointer") };
+                let pointee = mut_ty.ty.clone();
+                ty.kind = decl_ty_kind(form, mutable, pointee);
+                let render = (0u32, rustc_ast_pretty::pprust::ty_to_string(&ty));
+                match form {
+                    DeclForm::Ref => {
+                        stats.rewritten += 1;
+                        stats.rendered.push(render);
+                    }
+                    DeclForm::Slice => {
+                        stats.slice_rewritten += 1;
+                        stats.rendered_arm2.push(render);
+                    }
+                    DeclForm::Opt { .. } => {
+                        stats.opt_rewritten += 1;
+                        stats.rendered_arm2.push(render);
+                    }
+                }
+            }
+            assert_eq!(
+                (stats.rewritten, stats.slice_rewritten, stats.opt_rewritten),
+                (1, 1, 1)
+            );
+            assert_eq!(
+                stats.rendered.len(),
+                1,
+                "arm 1's differential is computed over `rendered` ALONE, so an \
+                 arm-2 render leaking into it moves the pinned 780"
+            );
+            assert_eq!(stats.rendered_arm2.len(), 2);
+            assert_eq!(stats.rendered[0].1, "&mut libc::c_int");
+            assert_eq!(stats.rendered_arm2[0].1, "&[libc::c_int]");
+            assert_eq!(stats.rendered_arm2[1].1, "Option<&mut [libc::c_int]>");
+        });
+    }
+
+    /// **The use pass's own guard-refusal branch: refused, counted, node
+    /// intact.**
+    ///
+    /// Reached by pre-claiming the target node on the shared guard — which is
+    /// exactly the cross-pass collision the guard exists for, since the
+    /// declaration pass runs first and shares it. The corpus reads zero here,
+    /// so without this the branch would be a uniformly-zero predicate.
+    ///
+    /// *Mutation-tested:* dropping the `self.stats.refused += 1` fails on the
+    /// count; returning `true` unconditionally from `claim` fails on the
+    /// surviving text.
+    #[test]
+    fn a_use_graft_refused_by_the_guard_leaves_the_node_and_is_counted() {
+        rustc_span::create_default_session_globals_then(|| {
+            let src = "fn f(p: *mut u8) -> u8 { *p.offset(1 as isize) }";
+            let mut krate = ::utils::ast::parse_crate(src.to_owned());
+            let (span, node) = {
+                let rustc_ast::ItemKind::Fn(f) = &krate.items[0].kind else {
+                    panic!("fixture is a fn")
+                };
+                let body = f.body.as_ref().expect("body");
+                let rustc_ast::StmtKind::Expr(e) = &body.stmts.last().expect("tail").kind else {
+                    panic!("tail is an expression")
+                };
+                (e.span, e.id)
+            };
+            let map: FxHashMap<(u32, u32), String> =
+                [((span.lo().0, span.hi().0), "p[1]".to_owned())]
+                    .into_iter()
+                    .collect();
+
+            let mut guard = Composition::default();
+            // The declaration pass got there first.
+            assert!(guard.claim(node, "decl:slice"));
+
+            let mut v = UseGraftVisitor::new(&map, &mut guard);
+            v.visit_crate(&mut krate);
+            let stats = v.finish();
+
+            assert_eq!(stats.refused, 1, "the refusal must be counted locally");
+            assert_eq!(stats.grafted, 0);
+            assert_eq!(
+                stats.unmatched, 0,
+                "the key WAS reached — it was refused, which is a different \
+                 fact from never being found, and the two must not merge"
+            );
+            let text = rustc_ast_pretty::pprust::item_to_string(&krate.items[0]);
+            assert!(
+                text.contains("offset"),
+                "a refused graft must leave the node untouched: {text}"
+            );
+            assert_eq!(guard.refused_by("use"), 1);
+            assert_eq!(guard.refused[0].holder, "decl:slice");
+        });
     }
 
     /// **The `(lo, hi)` key is load-bearing, and this is what it prevents.**
