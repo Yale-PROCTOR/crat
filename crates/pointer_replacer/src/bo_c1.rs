@@ -7025,6 +7025,29 @@ mod run {
                 row.set("arm2_differing", d.arm2_differing.to_string());
                 row.set("arm2_unmatched_ast", d.arm2_unmatched_ast.to_string());
 
+                row.set("arm2_differing_decl", d.differing_decl.to_string());
+                row.set("arm2_differing_use", d.differing_use.to_string());
+                row.set("arm2_ws_equal", d.ws_equal.to_string());
+                row.set("arm2_ws_real", d.ws_real.to_string());
+
+                // The differing pairs UNTRUNCATED. `report::sanitize` cuts a row
+                // value at 120 chars, which is exactly long enough to make two
+                // multi-line index expressions look identical — so the evidence
+                // for a parity diff may not live in the row.
+                if !d.pairs.is_empty() {
+                    let mut tsv = String::from("offset\tposition\tast\tspan\n");
+                    for (off, pos, ast, span) in &d.pairs {
+                        tsv.push_str(&format!(
+                            "{off}\t{pos}\t{}\t{}\n",
+                            ast.replace(['\t', '\n', '\r'], " "),
+                            span.replace(['\t', '\n', '\r'], " ")
+                        ));
+                    }
+                    let p = dir.join(format!("{name}.arm2diff.tsv"));
+                    std::fs::write(&p, &tsv)
+                        .unwrap_or_else(|e| panic!("write arm2 diff {}: {e}", p.display()));
+                }
+
                 // The conservation bound and the instrument's own integrity.
                 row.set("kd_unmatched_span", d.kd_unmatched_span.to_string());
                 row.set("kd_edits", d.kd_edits.to_string());

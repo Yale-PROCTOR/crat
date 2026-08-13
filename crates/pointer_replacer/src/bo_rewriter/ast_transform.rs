@@ -591,6 +591,35 @@ pub(crate) struct TextDiff {
     /// silently, and in the direction that flatters the bound.
     pub kd_edits: usize,
     pub kd_offsets: usize,
+    /// Where arm 2's differences sit. The two positions have **different
+    /// evidential weight** and summing them would hide that:
+    ///
+    /// - A **declaration** difference is two independent derivations
+    ///   disagreeing — the AST side builds `&mut [T]` structurally from a
+    ///   subtree, the span side writes `format!("&mut [{pointee}]")` over
+    ///   verbatim source. Disagreement there is a real finding.
+    /// - A **use** difference is not a second derivation at all. The AST render
+    ///   is `print(parse(replacement))` and the span text *is* `replacement` —
+    ///   the same string from the same `UseEdit`. So the only thing that can
+    ///   differ is whether that string was already printer-canonical, and
+    ///   "canonicalize both sides then compare" would be **tautologically
+    ///   equal**. It is recorded here as a formatting delta, not offered as a
+    ///   parity check.
+    pub differing_decl: usize,
+    pub differing_use: usize,
+    /// Of the differing pairs, those equal once **all** whitespace is removed
+    /// from both sides. Both sides are valid Rust produced from one parse, so
+    /// whitespace-stripped equality is strong evidence of a pure formatting
+    /// delta — and it is a check that can fail, unlike canonicalizing both
+    /// sides through the same printer.
+    pub ws_equal: usize,
+    /// The residue: differing, and **still** differing with whitespace gone.
+    /// This is the number that carries the parity claim. Pre-stated **0**.
+    pub ws_real: usize,
+    /// Every differing pair, uncapped, for the side artifact. The row's
+    /// `examples` field is truncated at 120 chars by `report::sanitize`, which
+    /// is why the evidence does not live there.
+    pub pairs: Vec<(u32, &'static str, String, String)>,
     /// Files whose base offset could not be resolved from the source map.
     ///
     /// The join adds a file's own base back to each `Edit::lo`, which is
@@ -608,8 +637,10 @@ pub(crate) struct TextDiff {
 fn compare_renders(
     renders: &[(u32, String)],
     by_offset: &FxHashMap<u32, String>,
-    examples: &mut Vec<String>,
+    position: &'static str,
+    d: &mut TextDiff,
 ) -> (usize, usize, usize, usize) {
+    let strip = |s: &str| -> String { s.chars().filter(|c| !c.is_whitespace()).collect() };
     let (mut compared, mut equal, mut differing, mut unmatched) = (0, 0, 0, 0);
     for (off, rendered) in renders {
         match by_offset.get(off) {
@@ -619,8 +650,21 @@ fn compare_renders(
                     equal += 1;
                 } else {
                     differing += 1;
-                    if examples.len() < 10 {
-                        examples.push(format!("@{off} ast={rendered:?} span={span_text:?}"));
+                    match position {
+                        "decl" => d.differing_decl += 1,
+                        _ => d.differing_use += 1,
+                    }
+                    if strip(span_text) == strip(rendered) {
+                        d.ws_equal += 1;
+                    } else {
+                        d.ws_real += 1;
+                    }
+                    d.pairs
+                        .push((*off, position, rendered.clone(), span_text.clone()));
+                    if d.examples.len() < 10 {
+                        d.examples.push(format!(
+                            "@{off} {position} ast={rendered:?} span={span_text:?}"
+                        ));
                     }
                 }
             }
@@ -678,7 +722,7 @@ pub(crate) fn arms_full(
     }
     d.kd_offsets = by_offset.len();
 
-    let (c, eq, diff, un) = compare_renders(&decls.rendered, &by_offset, &mut d.examples);
+    let (c, eq, diff, un) = compare_renders(&decls.rendered, &by_offset, "decl", &mut d);
     d.compared = c;
     d.equal = eq;
     d.differing = diff;
@@ -686,19 +730,22 @@ pub(crate) fn arms_full(
 
     // Arm 2 is one population in two syntactic positions — a declaration and
     // its uses travel together or not at all (`plan`'s `use_failure` enforces
-    // exactly that on the span side), so splitting them here would report two
-    // half-populations neither of which is the thing that has to agree.
+    // exactly that on the span side), so the totals stay joint. The positions
+    // are counted apart only in `differing_decl`/`differing_use`, because a
+    // disagreement means different things at the two (see [`TextDiff`]).
+    let (cd, eqd, diffd, und) = compare_renders(&decls.rendered_arm2, &by_offset, "decl", &mut d);
+    let (cu, equ, diffu, unu) = compare_renders(&grafts.rendered, &by_offset, "use", &mut d);
+    d.arm2_compared = cd + cu;
+    d.arm2_equal = eqd + equ;
+    d.arm2_differing = diffd + diffu;
+    d.arm2_unmatched_ast = und + unu;
+
     let arm2: Vec<(u32, String)> = decls
         .rendered_arm2
         .iter()
         .chain(grafts.rendered.iter())
         .cloned()
         .collect();
-    let (c2, eq2, diff2, un2) = compare_renders(&arm2, &by_offset, &mut d.examples);
-    d.arm2_compared = c2;
-    d.arm2_equal = eq2;
-    d.arm2_differing = diff2;
-    d.arm2_unmatched_ast = un2;
 
     let arm1_offsets: FxHashSet<u32> = decls.rendered.iter().map(|(o, _)| *o).collect();
     d.unmatched_span = by_offset
