@@ -1729,13 +1729,27 @@ pub(crate) fn oracle_reverts(
     path: &std::path::Path,
 ) -> Result<RevertSet, String> {
     let body = std::fs::read_to_string(path).map_err(|e| format!("read {path:?}: {e}"))?;
-    let wanted: FxHashSet<&str> = body
-        .lines()
-        .map(str::trim)
-        .filter(|l| !l.is_empty())
-        .filter_map(|l| l.rsplit_once("::").map(|(owner, _)| owner))
-        .collect();
-    let subjects = body.lines().filter(|l| !l.trim().is_empty()).count();
+    // **EVERY NON-EMPTY LINE MUST PARSE.** This was a `filter_map`, which
+    // dropped a malformed line while `subjects` still counted it — so a
+    // corrupted oracle could under-revert BOTH sides identically, keep the
+    // 1,058 pin green, and leave the differential structurally blind to it.
+    // Shared held-fixed inputs are guarded AT THE INPUT, because a differential
+    // cannot see its own premise being wrong.
+    let mut wanted: FxHashSet<&str> = FxHashSet::default();
+    let mut subjects = 0usize;
+    for line in body.lines().map(str::trim).filter(|l| !l.is_empty()) {
+        subjects += 1;
+        let Some((owner, tail)) = line.rsplit_once("::") else {
+            return Err(format!(
+                "malformed revert line {line:?} in {path:?}: expected \
+                 `{{fn_path}}::{{param}}#{{mir_local}}`"
+            ));
+        };
+        if owner.is_empty() || !tail.contains('#') {
+            return Err(format!("malformed revert line {line:?} in {path:?}"));
+        }
+        wanted.insert(owner);
+    }
 
     let mut out = FxHashSet::default();
     let mut seen: FxHashSet<String> = FxHashSet::default();
@@ -1949,12 +1963,12 @@ pub(crate) fn phase3_fn_parity(
                     // so `multi_arm` was 0 and composition went unmeasured.
                     let arm = match e.justification {
                         super::plan::Justification::KindDecision { kind }
-                            if kind.ends_with("(use)") =>
+                            if kind.starts_with("Ref") =>
                         {
-                            "use"
+                            "arm1"
                         }
-                        super::plan::Justification::KindDecision { .. } => "decl",
-                        super::plan::Justification::SeamAdapter { .. } => "seam",
+                        super::plan::Justification::KindDecision { .. } => "arm2",
+                        super::plan::Justification::SeamAdapter { .. } => "arm3",
                         _ => "other",
                     };
                     mine.push((
@@ -2104,7 +2118,20 @@ fn canonical_item(text: &str) -> Option<String> {
         ::utils::ast::parse_item(text.to_owned())
     }))
     .ok()?;
-    Some(rustc_ast_pretty::pprust::item_to_string(&parsed))
+    let printed = rustc_ast_pretty::pprust::item_to_string(&parsed);
+    // **FULL CONSUMPTION.** `parse_item` answers "the FIRST item in this text"
+    // and never requires EOF, so `fn f() {} trailing` canonicalises to the
+    // prefix and silently discards real output — the same prefix-acceptance
+    // defect `graft_expr` was hardened against at the arm-2 boundary, applied
+    // here at its new site.
+    //
+    // Whitespace-insensitive for the reason the corpus differential is:
+    // reformatting is licensed, dropping tokens is not.
+    let strip = |s: &str| -> String { s.chars().filter(|c| !c.is_whitespace()).collect() };
+    if strip(&printed) != strip(text) {
+        return None;
+    }
+    Some(printed)
 }
 
 /// **ONE ENTRY, because the AST may be captured ONCE.**
