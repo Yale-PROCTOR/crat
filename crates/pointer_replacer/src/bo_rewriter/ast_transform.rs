@@ -688,6 +688,7 @@ fn transform_inner(
     // guaranteed same-node claim, while containment either way is the shape
     // that makes one transform discard the other's work (arm 2's containment
     // finding, now on the seam axis).
+    let mut seam_pairs = 0usize;
     let mut seam_same = 0usize;
     let mut seam_contains_use = 0usize;
     let mut use_contains_seam = 0usize;
@@ -696,6 +697,7 @@ fn transform_inner(
         let (slo, shi) = (seam.span.lo().0, seam.span.hi().0);
         for (ulo, uhi) in uses.keys() {
             let (ulo, uhi) = (*ulo, *uhi);
+            seam_pairs += 1;
             if slo == ulo && shi == uhi {
                 seam_same += 1;
             } else if slo <= ulo && uhi <= shi {
@@ -730,6 +732,8 @@ fn transform_inner(
         decl_inside_use,
         use_key_collisions,
         SeamUseSurface {
+            pairs: seam_pairs,
+            programs_compared: usize::from(seam_pairs > 0),
             same: seam_same,
             seam_contains_use,
             use_contains_seam,
@@ -858,6 +862,17 @@ pub(crate) struct TextDiff {
 /// four.
 #[derive(Default, Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct SeamUseSurface {
+    /// **THE DENOMINATOR** — `|placed seams| × |use edits|`, the pairs actually
+    /// compared. R5, and it was missing on this instrument's first run: four
+    /// zeros across 20 programs of wildly different size is this milestone's
+    /// instrument signature, and without this the reader cannot tell an empty
+    /// relation from an empty *population*. It had to be recovered by
+    /// hand-joining two artifacts, which is exactly what reporting it prevents.
+    pub pairs: usize,
+    /// Programs where BOTH populations are non-empty — the spread behind the
+    /// denominator, since one large program can carry it alone (brotli is
+    /// 139,689 of the corpus's 181,844).
+    pub programs_compared: usize,
     pub same: usize,
     pub seam_contains_use: usize,
     pub use_contains_seam: usize,

@@ -7027,6 +7027,11 @@ mod run {
                 // NOT gated: this is the measurement that decides whether arm
                 // 3's `refused` can be nonzero, and gating a number before
                 // knowing it is exactly the mistake the slice exists to avoid.
+                row.set("seamuse_pairs", d.seam_use_surface.pairs.to_string());
+                row.set(
+                    "seamuse_programs_compared",
+                    d.seam_use_surface.programs_compared.to_string(),
+                );
                 row.set("seamuse_same", d.seam_use_surface.same.to_string());
                 row.set(
                     "seamuse_seam_contains_use",
