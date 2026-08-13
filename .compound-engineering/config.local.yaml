@@ -1,0 +1,44 @@
+# Compound Engineering — local config for `crat`.
+#
+# Written by hand on 2026-08-13, NOT by `/ce-setup`: that skill carries
+# `disable-model-invocation: true` and is interactive by design ("Never silently
+# skip or auto-configure"). It has not been run. See the boundary report.
+#
+# Filename note: the plugin's template is `config.local.yaml`, not
+# `config.yaml`. The directive named the latter; this is the name the plugin
+# actually reads.
+#
+# ---------------------------------------------------------------------------
+# docs_root: DOES NOT EXIST in compound-engineering 3.12.0.
+#
+# There is no path setting of any kind in the template. `ce-compound` hardcodes
+# `docs/solutions/`, repo-relative. In THIS project that is already correct:
+# `docs/` IS the nested docs git repository, so CE artifacts land inside the
+# record's own home with no configuration — the directive's intent is satisfied
+# by the default rather than by a key.
+#
+# ⚠ COLLISION, flagged not absorbed: CE skills do not know `docs/` is a separate
+# git repo. `ce-compound` writes to `docs/solutions/` and any commit it prompts
+# for must be made from INSIDE `docs/` (CLAUDE.md, persistence protocol §3).
+# Committing it from the parent repo would stage an embedded repo/gitlink, which
+# the project forbids. Treat CE writes under `docs/` as producing changes in the
+# docs repo, and commit them there.
+# ---------------------------------------------------------------------------
+
+# --- Work delegation (Codex) ---
+# Pinned OFF explicitly rather than left to the default.
+#
+# This is the governance line in config form: invocability != authorization. A
+# CE skill that silently delegated an implementation to Codex would produce
+# writes outside the approved plan step, bypassing R1/R4 and the
+# micro-plan/STOP chain. The default is already `false`; it is written here so
+# that turning it on is a visible, reviewable edit rather than an absent line.
+work_delegate: false
+work_delegate_consent: false
+
+# --- Output format ---
+# Markdown only. The record is plain-text, diffable, and lives in git; an HTML
+# artifact would be a second representation of the same thing.
+plan_output: md
+brainstorm_output: md
+ideate_output: md
