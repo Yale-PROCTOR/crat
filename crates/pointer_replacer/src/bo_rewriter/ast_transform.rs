@@ -2780,6 +2780,102 @@ mod arm2_witnesses {
         });
     }
 
+    /// **EVERY SPAN THIS LAYER MANUFACTURES IS `DUMMY_SP` — types included.**
+    ///
+    /// The synthetic-span invariant exists because a fresh `ParseSess` numbers
+    /// its `SourceMap` from zero, so a parsed fragment's spans are not invalid
+    /// but **valid coordinates pointing somewhere else** in this crate. Task 0
+    /// landed `SpanEraser` for exactly that, and one line still parsed: the
+    /// `usize` in `(LEN) as usize`.
+    ///
+    /// It survived because the erasure witness collects **`Expr` spans only**
+    /// and this leak is on a `Ty`. So the witness is widened here rather than
+    /// the claim restated — a checker that cannot see the node kind the defect
+    /// lives on is not checking it. Found by the adversarial review.
+    ///
+    /// The argument keeps its REAL span deliberately: it is the original
+    /// subtree, not something this layer manufactured, so it is excluded by
+    /// identity rather than by the walk declining to look.
+    #[test]
+    fn every_span_the_glue_builder_manufactures_is_dummy() {
+        rustc_span::create_default_session_globals_then(|| {
+            struct Spans {
+                exprs: Vec<rustc_span::Span>,
+                tys: Vec<rustc_span::Span>,
+            }
+            impl<'a> rustc_ast::visit::Visitor<'a> for Spans {
+                fn visit_expr(&mut self, e: &'a rustc_ast::Expr) {
+                    self.exprs.push(e.span);
+                    rustc_ast::visit::walk_expr(self, e);
+                }
+
+                fn visit_ty(&mut self, t: &'a Ty) {
+                    self.tys.push(t.span);
+                    rustc_ast::visit::walk_ty(self, t);
+                }
+            }
+            fn spans_of(e: &rustc_ast::Expr) -> Spans {
+                let mut v = Spans {
+                    exprs: Vec::new(),
+                    tys: Vec::new(),
+                };
+                rustc_ast::visit::Visitor::visit_expr(&mut v, e);
+                v
+            }
+
+            let arg = ::utils::ast::parse_expr("(*s).ptr".to_owned());
+            // **The WHOLE argument subtree is exempt, not just its root.**
+            // `(*s).ptr` also carries real spans on `(*s)`, `*s` and `s`: they
+            // are the KEPT subtree, and keeping them is the point of the split
+            // rule. Exempting only the root made this assertion fire on exactly
+            // what arm 3 exists to preserve — caught by running it.
+            let kept: FxHashSet<rustc_span::Span> = spans_of(&arg).exprs.into_iter().collect();
+            let len = graft_expr("n").expect("the length parses");
+            let built = expr(
+                glue_expr(GlueShape::FromRawParts, true, P(arg), Some(P(len)))
+                    .expect("a length-bearing shape with a length builds"),
+            );
+            let got = spans_of(&built);
+
+            let leaked: Vec<_> = got
+                .exprs
+                .iter()
+                .filter(|s| !s.is_dummy() && !kept.contains(s))
+                .collect();
+            assert!(
+                leaked.is_empty(),
+                "a manufactured expression carrying a real span aliases a real \
+                 offset in this crate's first source file, which is the \
+                 wrong-target hazard the erasure exists to remove: {leaked:?}"
+            );
+            // The argument contains no types, so EVERY type here was built by
+            // this layer and none may carry a span.
+            assert!(
+                got.tys.iter().all(|s| s.is_dummy()),
+                "the `usize` in `(LEN) as usize` is manufactured, so its span \
+                 must be DUMMY_SP: {:?}",
+                got.tys
+            );
+
+            // NON-VACUITY, both halves: the walk must actually REACH a type,
+            // and it must be able to SEE a real span when there is one — which
+            // is precisely how the `Expr`-only witness missed this.
+            assert_eq!(
+                got.tys.len(),
+                1,
+                "the built expression has exactly one type"
+            );
+            assert!(
+                spans_of(&::utils::ast::parse_expr("(x) as usize".to_owned()))
+                    .tys
+                    .iter()
+                    .any(|s| !s.is_dummy()),
+                "the probe must SEE a parsed type's span, or the assertion \
+                 above is vacuous"
+            );
+        });
+    }
+
     /// **A DECLINED SEAM LEAVES THE NODE CLAIMABLE BY SOMEONE ELSE.**
     ///
     /// Arm 2's review found exactly this shape in the declaration pass —
