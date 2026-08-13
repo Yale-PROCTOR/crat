@@ -7023,6 +7023,20 @@ mod run {
                 row.set("arm2_multi_matched", gr.multi_matched.to_string());
                 row.set("decl_inside_use", d.decl_render_inside_use_edit.to_string());
                 row.set("use_key_collisions", d.use_key_collisions.to_string());
+                // ARM 3 TASK 0 — the seam-vs-use collision surface. Reported,
+                // NOT gated: this is the measurement that decides whether arm
+                // 3's `refused` can be nonzero, and gating a number before
+                // knowing it is exactly the mistake the slice exists to avoid.
+                row.set("seamuse_same", d.seam_use_surface.same.to_string());
+                row.set(
+                    "seamuse_seam_contains_use",
+                    d.seam_use_surface.seam_contains_use.to_string(),
+                );
+                row.set(
+                    "seamuse_use_contains_seam",
+                    d.seam_use_surface.use_contains_seam.to_string(),
+                );
+                row.set("seamuse_partial", d.seam_use_surface.partial.to_string());
                 row.set("arm2_compared", d.arm2_compared.to_string());
                 row.set("arm2_equal", d.arm2_equal.to_string());
                 row.set("arm2_differing", d.arm2_differing.to_string());

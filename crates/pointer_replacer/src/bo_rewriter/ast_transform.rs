@@ -440,6 +440,13 @@ impl<'a> UseGraftVisitor<'a> {
 impl MutVisitor for UseGraftVisitor<'_> {
     fn visit_expr(&mut self, e: &mut rustc_ast::Expr) {
         let key = (e.span.lo().0, e.span.hi().0);
+        // A normalized (grafted) node can never be a target: `DUMMY_SP` is not
+        // a position in this crate, and skipping it explicitly means the
+        // erasure cannot manufacture a match of its own.
+        if e.span.is_dummy() {
+            rustc_ast::mut_visit::walk_expr(self, e);
+            return;
+        }
         if let Some(text) = self.uses.get(&key) {
             // `insert` returns false when the key was already reached — a
             // SECOND AST node carrying the same span. Counted here because
@@ -595,7 +602,7 @@ pub(crate) fn arm1_population(tcx: rustc_middle::ty::TyCtxt<'_>) -> Result<RefDe
 #[cfg(test)]
 fn transform_inner(
     tcx: rustc_middle::ty::TyCtxt<'_>,
-) -> Result<(RefDeclStats, UseGraftStats, usize, usize), String> {
+) -> Result<(RefDeclStats, UseGraftStats, usize, usize, SeamUseSurface), String> {
     let captured = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let mut krate = ::utils::ast::expanded_ast(tcx);
         let map = ::utils::ast::make_ast_to_hir(&mut krate, tcx);
@@ -667,6 +674,40 @@ fn transform_inner(
     // `Composition::refused_by` survives for DIAGNOSIS — reading which pair
     // collided out of a nonzero gate — which is what the labels are for.
 
+    // **ARM 3 TASK 0 — THE COLLISION SURFACE, measured before any transform.**
+    //
+    // A seam edit targets a CALL-ARGUMENT expression; a use graft targets a
+    // use-site expression. Same syntactic category, so `seam` vs `use` is the
+    // first pair that can claim one node — unlike `decl:*` vs `use`, which are
+    // `Ty` vs `Expr` and structurally disjoint. The decision layer's
+    // `seam-site-overlap` gate refuses seam-vs-seam BYTE overlap at one call;
+    // it says nothing about seam-vs-use NODE IDENTITY, which is a different
+    // relation. So this is measured rather than argued, before arm 3 exists.
+    //
+    // All four relations are reported separately: an exact coincidence is a
+    // guaranteed same-node claim, while containment either way is the shape
+    // that makes one transform discard the other's work (arm 2's containment
+    // finding, now on the seam axis).
+    let mut seam_same = 0usize;
+    let mut seam_contains_use = 0usize;
+    let mut use_contains_seam = 0usize;
+    let mut seam_use_partial = 0usize;
+    for seam in &table.seams.edits {
+        let (slo, shi) = (seam.span.lo().0, seam.span.hi().0);
+        for (ulo, uhi) in uses.keys() {
+            let (ulo, uhi) = (*ulo, *uhi);
+            if slo == ulo && shi == uhi {
+                seam_same += 1;
+            } else if slo <= ulo && uhi <= shi {
+                seam_contains_use += 1;
+            } else if ulo <= slo && shi <= uhi {
+                use_contains_seam += 1;
+            } else if slo < uhi && ulo < shi {
+                seam_use_partial += 1;
+            }
+        }
+    }
+
     // **CONTAINMENT, measured.** A declaration transformed inside an expression
     // that is later grafted is discarded, with the ledger still counting it as
     // rewritten — the hazard the two-pass split does NOT remove (see this
@@ -683,7 +724,18 @@ fn transform_inner(
         // edit and a declaration inside it can share a start.
         .filter(|(off, _)| uses.keys().any(|(lo, hi)| *off >= *lo && *off < *hi))
         .count();
-    Ok((decls, grafts, decl_inside_use, use_key_collisions))
+    Ok((
+        decls,
+        grafts,
+        decl_inside_use,
+        use_key_collisions,
+        SeamUseSurface {
+            same: seam_same,
+            seam_contains_use,
+            use_contains_seam,
+            partial: seam_use_partial,
+        },
+    ))
 }
 
 /// **ARM 1's TEXT DIFFERENTIAL** — the rendered declaration vs the span layer's
@@ -732,6 +784,11 @@ pub(crate) struct TextDiff {
     /// silently, and in the direction that flatters the bound.
     pub kd_edits: usize,
     pub kd_offsets: usize,
+    /// **ARM 3 TASK 0** — how the placed seam spans relate to the use-edit
+    /// spans. NOT gated: this is the measurement that decides whether arm 3's
+    /// `refused` can be nonzero, and gating a number before knowing it is the
+    /// mistake this slice exists to avoid.
+    pub seam_use_surface: SeamUseSurface,
     /// **Two use edits carrying one span**, one of which was overwritten when
     /// the map was built. Corpus expectation 0, GATED — the collision counter
     /// this join was missing while every other join in the file had one.
@@ -789,6 +846,22 @@ pub(crate) struct TextDiff {
     /// fallback is kept, so no pinned number moves; what is added is that it is
     /// now counted.
     pub base_unresolved: usize,
+}
+
+/// **The seam-vs-use collision surface** (arm 3, task 0).
+///
+/// Four relations, kept apart because they mean different things: `same` is a
+/// guaranteed same-node claim and therefore a guaranteed `refused`; either
+/// containment is the shape where one transform discards the other's work; a
+/// `partial` overlap is representable in bytes but NOT in a tree, so it would
+/// mean the two edits disagree about the syntax and is the most alarming of the
+/// four.
+#[derive(Default, Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct SeamUseSurface {
+    pub same: usize,
+    pub seam_contains_use: usize,
+    pub use_contains_seam: usize,
+    pub partial: usize,
 }
 
 /// Join one arm's renders against the plan. Returns
@@ -850,7 +923,7 @@ fn compare_renders(
 pub(crate) fn arms_full(
     tcx: rustc_middle::ty::TyCtxt<'_>,
 ) -> Result<(RefDeclStats, UseGraftStats, TextDiff), String> {
-    let (decls, grafts, decl_inside_use, use_key_collisions) = transform_inner(tcx)?;
+    let (decls, grafts, decl_inside_use, use_key_collisions, surface) = transform_inner(tcx)?;
     let (table, _ctx) = super::decide_table_with_ctx(tcx)?;
     let emission = super::emit_files(tcx, &table, &rustc_hash::FxHashSet::default())?;
 
@@ -920,6 +993,7 @@ pub(crate) fn arms_full(
     d.kd_unmatched_span = by_offset.keys().filter(|o| !both.contains(o)).count();
     d.decl_render_inside_use_edit = decl_inside_use;
     d.use_key_collisions = use_key_collisions;
+    d.seam_use_surface = surface;
     Ok((decls, grafts, d))
 }
 
@@ -945,6 +1019,35 @@ pub(crate) fn arms_full(
 /// sessions. That is real work and it is the right trade: the cheap alternative
 /// is one shared session, which is exactly the `SourceMap` dedupe that made
 /// every parse after the first return fragment #1's source (I2).
+/// **Erase every span in a grafted fragment.**
+///
+/// Landed with arm 3's task 0 rather than deferred (ruling 2026-08-13), because
+/// arm 3 is the first pass that can make the hazard bite rather than merely
+/// exist.
+///
+/// A fragment parsed by `graft_expr` comes from a FRESH `ParseSess` with its own
+/// `SourceMap`, whose `BytePos` values start from zero and therefore **alias
+/// real offsets in the crate's first source file**. They are not invalid — they
+/// are valid coordinates pointing somewhere else entirely, which is the worst
+/// of the three possibilities. Arm 2 could tolerate it: its use pass never
+/// revisits a grafted subtree and is the last walk over the tree.
+///
+/// **Arm 3 breaks that.** The seam pass is a THIRD span-keyed walk over the same
+/// crate, and it runs over a tree arm 2 has already grafted into. A grafted
+/// node whose aliased span numerically equals a seam's target span would be
+/// grafted into — silently, and in the wrong place. Normalizing turns a
+/// wrong-target hazard into an impossibility.
+///
+/// `DUMMY_SP` is additionally excluded from key lookup at both walks, so the
+/// erasure cannot itself manufacture a match.
+struct SpanEraser;
+
+impl MutVisitor for SpanEraser {
+    fn visit_span(&mut self, span: &mut rustc_span::Span) {
+        *span = DUMMY_SP;
+    }
+}
+
 pub(crate) fn graft_expr(text: &str) -> Result<rustc_ast::Expr, String> {
     let parsed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         ::utils::ast::parse_expr(text.to_owned())
@@ -969,6 +1072,10 @@ pub(crate) fn graft_expr(text: &str) -> Result<rustc_ast::Expr, String> {
     if strip(&printed) != strip(text) {
         return Err(text.to_owned());
     }
+    // Erase AFTER the round-trip check, so the check reads the fragment as
+    // parsed rather than as normalized.
+    let mut parsed = parsed;
+    SpanEraser.visit_expr(&mut parsed);
     Ok(parsed)
 }
 
@@ -1740,6 +1847,53 @@ mod template_witnesses {
                 graft_expr("data[(pos.wrapping_add(0 as libc::c_int)) as usize]").is_ok(),
                 "a replacement that round-trips within whitespace must still be \
                  accepted — this is the corpus's ordinary shape"
+            );
+        });
+    }
+
+    /// **A grafted fragment carries NO real spans** — the arm-3 precondition.
+    ///
+    /// The hazard is not that grafted spans are invalid; it is that they are
+    /// VALID coordinates pointing somewhere else. A fresh `ParseSess` numbers
+    /// its `SourceMap` from zero, so a fragment's spans alias real offsets in
+    /// the crate's first source file. Arm 3 is a third span-keyed walk over a
+    /// tree arm 2 has already grafted into, so an aliased span could be grafted
+    /// into as though it were a target.
+    ///
+    /// The assertion is over EVERY node, not just the root: the root's span is
+    /// overwritten by the visitor anyway (it keeps the original node's), so a
+    /// root-only check would pass for an unnormalized fragment.
+    ///
+    /// *Mutation-tested:* removing the `SpanEraser.visit_expr(&mut parsed)`
+    /// call leaves the inner spans real and this fails.
+    #[test]
+    fn a_grafted_fragment_carries_no_real_spans() {
+        rustc_span::create_default_session_globals_then(|| {
+            let parsed = graft_expr("p[i.wrapping_mul(2) as usize]").expect("parses");
+
+            struct Collect(Vec<rustc_span::Span>);
+            impl rustc_ast::visit::Visitor<'_> for Collect {
+                fn visit_expr(&mut self, e: &rustc_ast::Expr) {
+                    self.0.push(e.span);
+                    rustc_ast::visit::walk_expr(self, e);
+                }
+            }
+            let mut c = Collect(Vec::new());
+            rustc_ast::visit::Visitor::visit_expr(&mut c, &parsed);
+
+            assert!(
+                c.0.len() > 1,
+                "the fixture must be a NESTED expression or this witnesses \
+                 nothing about inner spans: {} node(s)",
+                c.0.len()
+            );
+            assert!(
+                c.0.iter().all(|s| s.is_dummy()),
+                "every span in a grafted fragment must be DUMMY_SP — a fresh \
+                 ParseSess numbers from zero, so a surviving span is a VALID \
+                 coordinate into another file, which is worse than an invalid \
+                 one: {:?}",
+                c.0.iter().filter(|s| !s.is_dummy()).collect::<Vec<_>>()
             );
         });
     }
