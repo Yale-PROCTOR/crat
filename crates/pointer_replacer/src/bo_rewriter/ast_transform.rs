@@ -655,6 +655,16 @@ pub(crate) struct SeamGraftStats {
     /// and a builder that silently dropped the shape would be doing exactly
     /// that in the other direction.
     pub len_absent: usize,
+    /// Length-bearing SHAPES that reached the length step — the denominator
+    /// [`Self::len_grafted`] did not have.
+    ///
+    /// Exactly one of `len_grafted` / `len_parse_failed` / `len_absent` follows
+    /// each one, so this closes an exhaustive identity the corpus gate reads.
+    /// Without it `len_grafted` was telemetry: it could drop to zero, or drift
+    /// from the `from_raw_parts` placements it tracks, with every gated counter
+    /// still clean — this track's own founding failure class, raised against
+    /// this change by the past-learnings pass.
+    pub len_shapes: usize,
     /// Seam edits whose span matched no AST expression.
     pub unmatched: usize,
     pub refused: usize,
@@ -801,21 +811,38 @@ impl<'a> SeamGraftVisitor<'a> {
                 id: DUMMY_NODE_ID,
                 kind: e.kind.clone(),
                 span: e.span,
-                attrs: e.attrs.clone(),
+                // **NOT cloned onto both nodes.** `e` keeps its own attributes
+                // and stays the node the walk and the differential know; giving
+                // the wrapped subtree a copy would print the attribute twice.
+                // The outer node is the one that survives with an identity, so
+                // it is the one that keeps them — the same choice arm 2's graft
+                // makes by replacing only `kind`.
+                attrs: Default::default(),
                 tokens: None,
             })
         } else {
             // A cast shape: the replacement's text came from the cast's
             // operand, so the operand is what must survive inside the adapter.
-            self.stats.arg_peeled += 1;
             let Some(inner) = find_by_span(e, target.arg_span) else {
                 self.stats.arg_not_found += 1;
                 return None;
             };
+            // Counted AFTER the lookup succeeds. Incrementing first made a
+            // failed peel land in both counters, so `arg_peeled` meant
+            // "attempted" while its doc said "realized" — and the corpus could
+            // not show the difference, because `arg_not_found` is zero there.
+            self.stats.arg_peeled += 1;
             P(inner.clone())
         };
 
         // ---- the length: the ONE genuinely new expression ----
+        //
+        // Counted HERE, after the argument resolved and before the outcome is
+        // known, so that exactly one of the three length outcomes follows every
+        // increment and the identity is exhaustive rather than approximate.
+        if matches!(spec.core, GlueCore::FromRawParts) {
+            self.stats.len_shapes += 1;
+        }
         let len = match spec.len.as_deref() {
             None => None,
             Some(text) => match graft_expr(text) {
@@ -1154,7 +1181,15 @@ fn transform_inner(
                 SeamTarget {
                     spec: edit.spec.clone(),
                     arg_span: edit.arg_span,
-                    reborrow: matches!(edit.family, super::decision::seam::SeamFamily::Reborrow),
+                    // EXHAUSTIVE rather than `matches!`. A third family would
+                    // silently become `safe` here — and `safe` is the column
+                    // meaning "compiler-checked end to end", so the default a
+                    // `matches!` picks is the FLATTERING one. Every other shape
+                    // mapping in this change is exhaustive; this one was not.
+                    reborrow: match edit.family {
+                        super::decision::seam::SeamFamily::Reborrow => true,
+                        super::decision::seam::SeamFamily::Safe => false,
+                    },
                 },
             )
             .is_some()
@@ -2339,6 +2374,28 @@ mod arm2_witnesses {
 
     use super::super::decision::seam::{GlueCore, GlueSpec};
 
+    /// The span of the fixture's single call ARGUMENT — the node a seam edit
+    /// names. Not the tail expression: a seam targets the argument inside the
+    /// call, which is the whole reason it collides with the use pass.
+    fn call_arg_span(krate: &rustc_ast::Crate) -> rustc_span::Span {
+        let rustc_ast::ItemKind::Fn(f) = &krate.items[0].kind else {
+            panic!("the fixture's only item is a function")
+        };
+        let body = f.body.as_ref().expect("the fixture has a body");
+        let rustc_ast::StmtKind::Expr(e) = &body
+            .stmts
+            .last()
+            .expect("the fixture has a tail expression")
+            .kind
+        else {
+            panic!("the fixture's tail is an expression")
+        };
+        let rustc_ast::ExprKind::Call(_, args) = &e.kind else {
+            panic!("the fixture's tail is a call")
+        };
+        args[0].span
+    }
+
     /// Run the real [`SeamGraftVisitor`] over a fixture, exactly as
     /// [`graft_over`] runs the use pass.
     ///
@@ -2387,19 +2444,7 @@ mod arm2_witnesses {
             let src = "fn f(s: *mut S) { g((*s).ptr) }";
             let krate = ::utils::ast::parse_crate(src.to_owned());
             // The seam targets the CALL ARGUMENT, not the tail expression.
-            let arg = {
-                let rustc_ast::ItemKind::Fn(f) = &krate.items[0].kind else {
-                    panic!("fixture is a fn")
-                };
-                let body = f.body.as_ref().expect("body");
-                let rustc_ast::StmtKind::Expr(e) = &body.stmts.last().expect("tail").kind else {
-                    panic!("tail is an expression")
-                };
-                let rustc_ast::ExprKind::Call(_, args) = &e.kind else {
-                    panic!("the fixture's tail is a call")
-                };
-                args[0].span
-            };
+            let arg = call_arg_span(&krate);
             let cases: Vec<(GlueSpec, &str)> = vec![
                 (
                     GlueSpec::core(GlueCore::FromRawParts, true).with_len("n"),
@@ -2422,6 +2467,19 @@ mod arm2_witnesses {
                 (
                     GlueSpec::core(GlueCore::FromRefMut, false),
                     "core::slice::from_ref((*s).ptr)",
+                ),
+                // **`Index0`, which the five corpus-realized shapes do NOT
+                // reach through this builder.** `glue`'s `(Ref, Slice)` arm
+                // produces exactly this spec, so the `GlueCore::Index0 =>
+                // GlueShape::Index0` mapping in `build` is live code with zero
+                // market on the frozen corpus — and a market of zero is not a
+                // reason to leave a mapping unexercised. Added at the arm-3
+                // review; both the bare and wrapped forms, since only the
+                // wrapped one shares a census bucket with anything tested.
+                (GlueSpec::core(GlueCore::Index0, true), "&mut (*s).ptr[0]"),
+                (
+                    GlueSpec::core(GlueCore::Index0, false).wrapped(),
+                    "Some(&(*s).ptr[0])",
                 ),
             ];
             for (spec, expected) in cases {
@@ -2510,6 +2568,85 @@ mod arm2_witnesses {
         });
     }
 
+    /// **An `arg_span` the matched node does not contain declines, and is
+    /// counted as NOT-FOUND rather than as a peel.**
+    ///
+    /// Corpus-zero (`arg_not_found = 0` on all 20 programs), so the only
+    /// evidence it works can come from an injected case. Injected the way arm
+    /// 2's containment backstop is: the visitor is a pure function of its map,
+    /// so it is handed a map the decision layer could not have produced.
+    ///
+    /// The `arg_peeled == 0` assertion is the load-bearing half. The counter
+    /// used to increment BEFORE the lookup, so a failed peel landed in both
+    /// rows and `arg_peeled` meant "attempted" while its doc said "realized" —
+    /// invisible on a corpus where `arg_not_found` is zero. Found by the
+    /// correctness reviewer at the arm-3 boundary.
+    #[test]
+    fn an_arg_span_the_node_does_not_contain_declines_and_is_not_a_peel() {
+        rustc_span::create_default_session_globals_then(|| {
+            let src = "fn f(q: *mut u8) { g(q) }";
+            let krate = ::utils::ast::parse_crate(src.to_owned());
+            let arg = call_arg_span(&krate);
+            // A span inside the fixture but belonging to no node under `arg`.
+            let bogus = arg.with_lo(arg.lo() - rustc_span::BytePos(3));
+            assert_ne!(bogus, arg);
+
+            let (text, stats) = seam_over(
+                src,
+                &[(arg, bogus, GlueSpec::core(GlueCore::Reborrow, true), true)],
+            );
+            assert_eq!(
+                stats.grafted, 0,
+                "nothing is built from a subtree that is not there"
+            );
+            assert_eq!(stats.arg_not_found, 1, "and the decline is attributed");
+            assert_eq!(
+                stats.arg_peeled, 0,
+                "a FAILED peel is not a peel — `arg_peeled` counts realized \
+                 ones, which is what makes the corpus's 9 mean what it says"
+            );
+            assert_eq!(stats.unmatched, 0, "the key was reached, then declined");
+            assert!(text.contains("g(q)"), "the node is left intact: {text}");
+        });
+    }
+
+    /// **One seam key matched by MORE THAN ONE node is counted.**
+    ///
+    /// Neither the guard (distinct `NodeId`s) nor `unmatched` (set membership)
+    /// can observe this, exactly as at the use pass — so this counter is the
+    /// only witness there is, and it was gated at zero with nothing driving it
+    /// positive. Injected by walking the same crate twice, mirroring
+    /// [`two_nodes_sharing_one_span_are_counted_not_silently_double_grafted`].
+    #[test]
+    fn one_seam_key_reached_twice_is_counted() {
+        rustc_span::create_default_session_globals_then(|| {
+            let src = "fn f(q: *mut u8) { g(q) }";
+            let mut krate = ::utils::ast::parse_crate(src.to_owned());
+            let arg = call_arg_span(&krate);
+            let seams: FxHashMap<(u32, u32), SeamTarget> = [(
+                (arg.lo().0, arg.hi().0),
+                SeamTarget {
+                    spec: GlueSpec::core(GlueCore::Reborrow, true),
+                    arg_span: arg,
+                    reborrow: true,
+                },
+            )]
+            .into_iter()
+            .collect();
+            let mut guard = Composition::default();
+            let mut v = SeamGraftVisitor::new(&seams, &mut guard);
+            v.visit_crate(&mut krate);
+            let mut krate2 = ::utils::ast::parse_crate(src.to_owned());
+            v.visit_crate(&mut krate2);
+            let stats = v.finish();
+            assert!(
+                stats.multi_matched >= 1,
+                "a key reached a second time MUST be counted — it is invisible \
+                 to every other instrument this pass has"
+            );
+        });
+    }
+
     /// **A spec the builder does not build becomes a ROW, never a silent skip.**
     ///
     /// The unwrap family is standalone with zero market on the frozen corpus and
@@ -2524,19 +2661,7 @@ mod arm2_witnesses {
         rustc_span::create_default_session_globals_then(|| {
             let src = "fn f(o: Option<&mut u8>) { g(o) }";
             let krate = ::utils::ast::parse_crate(src.to_owned());
-            let arg = {
-                let rustc_ast::ItemKind::Fn(f) = &krate.items[0].kind else {
-                    panic!("fixture is a fn")
-                };
-                let body = f.body.as_ref().expect("body");
-                let rustc_ast::StmtKind::Expr(e) = &body.stmts.last().expect("tail").kind else {
-                    panic!("tail is an expression")
-                };
-                let rustc_ast::ExprKind::Call(_, args) = &e.kind else {
-                    panic!("the fixture's tail is a call")
-                };
-                args[0].span
-            };
+            let arg = call_arg_span(&krate);
 
             let unwrapping = GlueSpec::core(GlueCore::Bare, true).with_unwrap(true);
             let (text, stats) = seam_over(src, &[(arg, arg, unwrapping, false)]);
@@ -2575,19 +2700,7 @@ mod arm2_witnesses {
         rustc_span::create_default_session_globals_then(|| {
             let src = "fn f(p: *mut u8) { g(p) }";
             let krate = ::utils::ast::parse_crate(src.to_owned());
-            let arg = {
-                let rustc_ast::ItemKind::Fn(f) = &krate.items[0].kind else {
-                    panic!("fixture is a fn")
-                };
-                let body = f.body.as_ref().expect("body");
-                let rustc_ast::StmtKind::Expr(e) = &body.stmts.last().expect("tail").kind else {
-                    panic!("tail is an expression")
-                };
-                let rustc_ast::ExprKind::Call(_, args) = &e.kind else {
-                    panic!("the fixture's tail is a call")
-                };
-                args[0].span
-            };
+            let arg = call_arg_span(&krate);
             let lengthless = GlueSpec::core(GlueCore::FromRawParts, false);
             let (text, stats) = seam_over(src, &[(arg, arg, lengthless, true)]);
             assert_eq!(stats.grafted, 0);
@@ -2625,19 +2738,7 @@ mod arm2_witnesses {
         rustc_span::create_default_session_globals_then(|| {
             let src = "fn f(p: *mut u8) { g(*p.offset(1)) }";
             let mut krate = ::utils::ast::parse_crate(src.to_owned());
-            let arg = {
-                let rustc_ast::ItemKind::Fn(f) = &krate.items[0].kind else {
-                    panic!("fixture is a fn")
-                };
-                let body = f.body.as_ref().expect("body");
-                let rustc_ast::StmtKind::Expr(e) = &body.stmts.last().expect("tail").kind else {
-                    panic!("tail is an expression")
-                };
-                let rustc_ast::ExprKind::Call(_, args) = &e.kind else {
-                    panic!("the fixture's tail is a call")
-                };
-                args[0].span
-            };
+            let arg = call_arg_span(&krate);
             let mut guard = Composition::default();
 
             // The use pass claims the node first — the order the walk runs in.

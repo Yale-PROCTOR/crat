@@ -309,11 +309,22 @@ impl GlueSpec {
             (false, GlueCore::FromRawParts) => "from_raw_parts",
             (false, GlueCore::Reborrow) => "reborrow",
             (false, GlueCore::FromRefMut) => "from_ref_mut",
-            // `index` is the classifier's FALLBACK arm. A bare core with
-            // neither an unwrap nor a wrapper renders the argument unchanged
-            // and is unreachable — `glue`'s identity arms return `Ok(None)`
-            // before any spec is built — so this pairing is the fallback's
-            // shape, matched here only to keep the function total.
+            // `index` is the classifier's FALLBACK arm, and the two cores that
+            // land in it are **not** in the same position — a distinction this
+            // comment previously got wrong, in the direction this track calls
+            // its founding failure class.
+            //
+            // - `Index0` here is REACHABLE and REAL: `glue`'s `(Ref, Slice)`
+            //   arm builds exactly `core(Index0, w)` with no unwrap and no
+            //   wrapper, rendering `&w X[0]`, which the retired classifier fell
+            //   through to `index`. It is corpus-ZERO on the frozen corpus, and
+            //   corpus-zero is not unreachable.
+            // - `Bare` here is genuinely unreachable: with neither an unwrap
+            //   nor a wrapper it renders the argument unchanged, and `glue`
+            //   returns `Ok(None)` for every pairing that would need it.
+            //
+            // Both are matched together because the classifier gave both the
+            // same answer; only the reachability claim differed.
             (false, GlueCore::Bare | GlueCore::Index0) => "index",
         }
     }
@@ -1180,6 +1191,58 @@ mod tests {
         }
     }
 
+    /// **`index` IS REACHABLE, and `Bare`-without-a-wrapper is not** — the two
+    /// halves of `shape_key`'s fallback arm, separated by measurement.
+    ///
+    /// The doc on that arm originally called the whole pairing unreachable
+    /// "matched only to keep the function total". That is true of `Bare` and
+    /// **false of `Index0`**: `glue`'s `(Ref, Slice)` arm builds exactly
+    /// `core(Index0, w)`, which renders `&w X[0]` and classifies `index`. It is
+    /// corpus-zero on the frozen corpus — and corpus-zero is not unreachable,
+    /// which is the distinction this project has had to re-learn by name.
+    ///
+    /// Found by the maintainability reviewer at the arm-3 boundary. The code
+    /// was right; the prose was not, so this is the witness the corrected prose
+    /// needed rather than a second correction of it.
+    #[test]
+    fn the_index_shape_is_reachable_and_the_bare_one_is_not() {
+        let (spec, family) = glue(Ref { mutable: true }, Slice { mutable: true }, None)
+            .expect("a mutable reference from a mutable slice is adaptable")
+            .expect("and it needs an edit");
+        assert_eq!(
+            spec.shape_key(),
+            "index",
+            "reached through `glue`, not by hand"
+        );
+        assert_eq!(spec.render("p"), "&mut p[0]");
+        assert_eq!(family, SeamFamily::Safe);
+        assert!(
+            !spec.optional && spec.unwrap.is_none(),
+            "and with neither wrapper nor unwrap, so it lands in the fallback \
+             arm rather than in a `some_*` one: {spec:?}"
+        );
+
+        // The other half: no pairing `glue` accepts produces a bare core with
+        // neither an unwrap nor a wrapper. Asserted over the SAME enumeration
+        // the agreement test uses, so the claim is checked rather than argued.
+        assert!(
+            every_emitting_spec()
+                .iter()
+                .all(|s| !(matches!(s.core, GlueCore::Bare) && !s.optional && s.unwrap.is_none())),
+            "a bare core with no wrapper renders the argument unchanged; `glue` \
+             returns `Ok(None)` for every pairing that would need it"
+        );
+        // ...and `index` really is corpus-zero, which is why the distinction
+        // was invisible until now.
+        assert!(
+            every_emitting_spec()
+                .iter()
+                .any(|s| s.shape_key() == "index"),
+            "the enumeration must actually reach `index`, or the assertion \
+             above is vacuous"
+        );
+    }
+
     /// **Where the two DISAGREE, and why that is the point of carrying it.**
     ///
     /// The classifier reads a string the argument's own text contributes to, so
@@ -1254,9 +1317,16 @@ mod tests {
                 }
             }
         }
-        assert!(
-            out.len() >= 14,
-            "the product must reach every emitting arm; got {}",
+        // **THE EXACT CARDINALITY, not a floor.** This read `>= 14`, which is
+        // the RED-weakening shape: an entire arm can stop emitting — the
+        // `Opt`/`Opt` arm alone is 6 of these pairs — while a floor of 14 stays
+        // green. 44 is derived from the 9×9 product minus the identity/coercion
+        // arms and the `SharedToMut` blocks, and it is pinned so a lost arm
+        // fails HERE rather than showing up as a quiet corpus movement.
+        assert_eq!(
+            out.len(),
+            44,
+            "the product must reach every emitting arm exactly; got {}",
             out.len()
         );
         out

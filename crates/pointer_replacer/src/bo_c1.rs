@@ -7063,6 +7063,7 @@ mod run {
                 row.set("arm3_safe", sg.safe.to_string());
                 row.set("arm3_reborrow", sg.reborrow.to_string());
                 row.set("arm3_len_grafted", sg.len_grafted.to_string());
+                row.set("arm3_len_shapes", sg.len_shapes.to_string());
                 row.set("arm3_len_parse_failed", sg.len_parse_failed.to_string());
                 row.set("arm3_len_absent", sg.len_absent.to_string());
                 row.set("arm3_seam_unmatched", sg.unmatched.to_string());
@@ -9952,6 +9953,29 @@ fn arm_parity_failures(program: &str, row: &report::Row) -> Vec<String> {
         )),
         (Err(why), _, _) | (Ok(_), Err(why), _) | (Ok(_), Ok(_), Err(why)) => out.push(why),
     }
+    // **Every length-bearing shape resolves exactly one way.** `arm3_len_grafted`
+    // was pre-stated at 277 and measured 277 — by a human reading the row, not
+    // by this gate. That is precisely the shape of this track's founding failure
+    // class, so it now has a denominator and an exhaustive identity: a dropped
+    // increment, a length silently skipped, or a decline booked to the wrong
+    // row all break it.
+    match (
+        num("arm3_len_shapes"),
+        num("arm3_len_grafted"),
+        num("arm3_len_parse_failed"),
+        num("arm3_len_absent"),
+    ) {
+        (Ok(shapes), Ok(g), Ok(f), Ok(a)) if shapes == g + f + a => {}
+        (Ok(shapes), Ok(g), Ok(f), Ok(a)) => out.push(format!(
+            "{program}: arm3_len_grafted={g} + arm3_len_parse_failed={f} + \
+             arm3_len_absent={a} != arm3_len_shapes={shapes} — a length-bearing \
+             adapter resolved in no counted way, so the length ledger is short"
+        )),
+        (Err(why), ..)
+        | (Ok(_), Err(why), ..)
+        | (Ok(_), Ok(_), Err(why), _)
+        | (Ok(_), Ok(_), Ok(_), Err(why)) => out.push(why),
+    }
     out
 }
 
@@ -9979,12 +10003,20 @@ fn conforming_arm_row() -> report::Row {
     row.set("arm3_safe", "107");
     row.set("arm3_reborrow", "314");
     row.set("arm3_len_grafted", "277");
+    row.set("arm3_len_shapes", "277");
     // NOT gated, and load-bearing here exactly as `arm2_differing` is: if arm
     // 3's differential is ever tightened to byte equality, this row fails
     // rather than the corpus.
-    row.set("arm3_differing", "3");
+    //
+    // **These are the values the 20-program sweep at `d9160ee5` actually
+    // produced.** They were written before that sweep ran and carried
+    // `differing = 3` / `arg_peeled = 0` — invented numbers, in the one row
+    // whose entire job is to be the corpus's real shape. A positive control
+    // holding fiction cannot fail when the gate drifts toward the fiction,
+    // which is exactly the guard `arm2_differing = 176` was put here to be.
+    row.set("arm3_differing", "47");
     row.set("arm3_refused", "0");
-    row.set("arm3_arg_peeled", "0");
+    row.set("arm3_arg_peeled", "9");
     row.set("sa_edits", "421");
     row.set("sa_offsets", "421");
     row
@@ -10071,15 +10103,22 @@ fn every_arm_gate_failure_class_actually_fails() {
     //    other. Mutation M36 disabled this check and the whole suite stayed
     //    green — a gate with no negative control is the arm-2 review's finding,
     //    and it recurred inside the boundary that repaired it.
-    let mut row = conforming_arm_row();
-    row.set("sa_offsets", "420");
-    let failures = arm_parity_failures("avl", &row);
-    assert!(
-        failures
-            .iter()
-            .any(|f| f.contains("sa_edits") && f.contains("sa_offsets")),
-        "sa_edits != sa_offsets must fail and name BOTH sides: {failures:?}"
-    );
+    // Injected in BOTH directions, for the reason stated one case below: an
+    // `e >= o` or `e <= o` spelling passes one of them. This case originally
+    // had only the shortfall, while its sibling immediately below carried the
+    // both-directions comment — the inconsistency was mine, and the testing
+    // reviewer caught it.
+    for offsets in ["420", "422"] {
+        let mut row = conforming_arm_row();
+        row.set("sa_offsets", offsets);
+        let failures = arm_parity_failures("avl", &row);
+        assert!(
+            failures
+                .iter()
+                .any(|f| f.contains("sa_edits") && f.contains("sa_offsets")),
+            "sa_edits != sa_offsets={offsets} must fail and name BOTH sides: {failures:?}"
+        );
+    }
 
     // 6. The family split must ADD UP. Without this the two family counters
     //    are telemetry: a lost or double-counted placement moves one of them
@@ -10095,6 +10134,29 @@ fn every_arm_gate_failure_class_actually_fails() {
                 .iter()
                 .any(|f| f.contains("arm3_safe") && f.contains("arm3_seam_rendered")),
             "safe={safe} + reborrow={reborrow} != rendered must fail: {failures:?}"
+        );
+    }
+
+    // 6b. The length ledger's exhaustive identity, injected in both directions
+    //     and on each of its three outcome rows, so a decline booked to the
+    //     wrong row fails as loudly as a dropped one.
+    for (key, value) in [
+        ("arm3_len_grafted", "276"),
+        ("arm3_len_grafted", "278"),
+        ("arm3_len_parse_failed", "1"),
+        ("arm3_len_absent", "1"),
+        ("arm3_len_shapes", "278"),
+    ] {
+        let mut row = conforming_arm_row();
+        // The zero-invariant loop already fails a nonzero `len_parse_failed` /
+        // `len_absent`; what this checks is that the IDENTITY names the ledger
+        // too, so the failure is attributable to the length step rather than
+        // only to a zero-invariant.
+        row.set(key, value);
+        let failures = arm_parity_failures("avl", &row);
+        assert!(
+            failures.iter().any(|f| f.contains("arm3_len_shapes")),
+            "{key}={value} must break the length identity and name it: {failures:?}"
         );
     }
 
