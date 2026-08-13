@@ -91,9 +91,12 @@ pub(crate) struct Unplaceable {
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[allow(
     dead_code,
-    reason = "S1 builds only KindDecision; the other arms are shaped against \
-              the remaining goldens on purpose, so S3 adds construction sites \
-              rather than reshaping the type"
+    reason = "KindDecision and SeamAdapter are BOTH live; ReRoute/DropForm/\
+              StoreForm are shaped against goldens g04-g08 on purpose, so the \
+              slice that builds drops and moves adds construction sites rather \
+              than reshaping the type. Their emptiness is MEASURED, not \
+              assumed: arm 4's census counts every variant per program and the \
+              corpus gate holds those three at zero."
 )]
 pub(crate) enum Justification {
     /// G01–G03: BO decided this slot is a reference. **Live at S1.**

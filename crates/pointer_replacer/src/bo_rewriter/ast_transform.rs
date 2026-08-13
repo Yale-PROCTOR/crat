@@ -1402,6 +1402,10 @@ pub(crate) struct TextDiff {
     pub ws_real_seam: usize,
     pub differing_seam: usize,
 
+    /// **ARM 4's TASK 0.** Every plan edit by justification, counted in its own
+    /// pass — see [`JustificationCensus`].
+    pub justifications: JustificationCensus,
+
     /// **THE CONSERVATION BOUND.** `KindDecision` offsets that NEITHER arm
     /// reached.
     ///
@@ -1505,6 +1509,58 @@ pub(crate) struct SeamUseSurface {
     pub seam_contains_use: usize,
     pub use_contains_seam: usize,
     pub partial: usize,
+}
+
+/// **ARM 4's TASK 0 — the justification census.**
+///
+/// Arm 4 is `ReRoute` / `DropForm` / `StoreForm`, and the migration's job for
+/// any arm is to reproduce the span layer's edits as node transforms. So arm
+/// 4's market is exactly *how many such edits the span layer emits* — which is
+/// what this counts, before any transform is designed.
+///
+/// # Why an exhaustive `match` and not one with a fallback
+///
+/// A sixth `Justification` variant must break **compilation** here, never land
+/// silently in an "other" bucket. Arm 3 paid for the fallback version of this
+/// in [`compare_renders`], where `_ => differing_use` would have booked every
+/// seam difference to a pass that never ran at that offset.
+///
+/// # Why this walks the plan again instead of reading `kd_edits`/`sa_edits`
+///
+/// Those two are counted inside [`arms_full`]'s own loop. Counting here in a
+/// separate pass makes `just_kind_decision == kd_edits` and
+/// `just_seam_adapter == sa_edits` a cross-check between **two independent
+/// walks** rather than one number printed twice — and the totals give the three
+/// expected zeros a denominator (R5), without which three zeros across programs
+/// of wildly different size are an instrument signature rather than a finding.
+#[derive(Default, Debug, PartialEq, Eq)]
+pub(crate) struct JustificationCensus {
+    pub kind_decision: usize,
+    pub seam_adapter: usize,
+    // ---- arm 4's three: expected zero, and MEASURED rather than assumed ----
+    pub reroute: usize,
+    pub drop_form: usize,
+    pub store_form: usize,
+}
+
+impl JustificationCensus {
+    /// The denominator. A method rather than a sixth field, so it cannot drift
+    /// from the parts it sums.
+    pub(crate) fn total(&self) -> usize {
+        self.kind_decision + self.seam_adapter + self.reroute + self.drop_form + self.store_form
+    }
+
+    /// Count one edit's justification.
+    pub(crate) fn count(&mut self, j: &super::plan::Justification) {
+        use super::plan::Justification as J;
+        match j {
+            J::KindDecision { .. } => self.kind_decision += 1,
+            J::SeamAdapter { .. } => self.seam_adapter += 1,
+            J::ReRoute { .. } => self.reroute += 1,
+            J::DropForm { .. } => self.drop_form += 1,
+            J::StoreForm { .. } => self.store_form += 1,
+        }
+    }
 }
 
 /// Join one arm's renders against the plan. Returns
@@ -1620,6 +1676,16 @@ pub(crate) fn arms_full(
     }
     d.kd_offsets = by_offset.len();
     d.sa_offsets = seam_by_offset.len();
+
+    // **ARM 4's TASK 0 — a SECOND, independent walk over the same plan.**
+    // Deliberately not folded into the loop above: sharing that loop would make
+    // `just_kind_decision == kd_edits` one number printed twice instead of two
+    // derivations agreeing.
+    for edits in emission.plan.by_file.values() {
+        for e in edits {
+            d.justifications.count(&e.justification);
+        }
+    }
 
     let (c, eq, diff, un) = compare_renders(&decls.rendered, &by_offset, "decl", &mut d);
     d.compared = c;
@@ -2778,6 +2844,58 @@ mod arm2_witnesses {
             assert_eq!(stats.grafted, 0);
             assert_eq!(stats.unsupported, 1);
         });
+    }
+
+    /// **ARM 4's CENSUS COUNTS WHAT IT CLAIMS TO — injected, not hoped for.**
+    ///
+    /// The census's whole job is to decide whether arm 4 has a market, and its
+    /// expected answer is three zeros. **A counter that never increments
+    /// produces exactly the same three zeros**, so without this the measurement
+    /// cannot distinguish *no market* from *no instrument* — the D1 lesson in
+    /// its original form, and the reason the pre-statement made injection a
+    /// requirement rather than a nicety.
+    ///
+    /// So each of the five variants is fed in and asserted to land in its own
+    /// bucket, and the denominator is asserted to be the sum.
+    #[test]
+    fn the_justification_census_counts_every_variant_including_arm_fours() {
+        use super::super::plan::Justification as J;
+        let mut c = JustificationCensus::default();
+        for j in [
+            J::KindDecision { kind: "Ref(mut)" },
+            J::KindDecision { kind: "Ref" },
+            J::SeamAdapter { family: "safe" },
+            J::ReRoute {
+                licensing_loan: "L0".to_owned(),
+            },
+            J::DropForm {
+                selector_site: "s".to_owned(),
+            },
+            J::StoreForm { form: "N-raw" },
+        ] {
+            c.count(&j);
+        }
+        assert_eq!(
+            c,
+            JustificationCensus {
+                kind_decision: 2,
+                seam_adapter: 1,
+                reroute: 1,
+                drop_form: 1,
+                store_form: 1,
+            },
+            "each variant must land in its OWN bucket — an arm-4 edit counted \
+             as a `KindDecision` would report the market as zero while the \
+             population was not"
+        );
+        assert_eq!(c.total(), 6, "the denominator is the sum of the parts");
+
+        // And an empty plan is genuinely empty, so the zeros the corpus reports
+        // are the counter's answer rather than its default being mistaken for
+        // one.
+        let empty = JustificationCensus::default();
+        assert_eq!(empty.total(), 0);
+        assert_eq!(empty.reroute + empty.drop_form + empty.store_form, 0);
     }
 
     /// **EVERY SPAN THIS LAYER MANUFACTURES IS `DUMMY_SP` — types included.**

@@ -7085,6 +7085,22 @@ mod run {
                 row.set("sa_unmatched_span", d.sa_unmatched_span.to_string());
                 row.set("sa_edits", d.sa_edits.to_string());
                 row.set("sa_offsets", d.sa_offsets.to_string());
+
+                // ---- ARM 4 TASK 0 — the justification census ----
+                //
+                // REPORTED, not gated. A census whose result decides whether an
+                // arm has a market at all may not be pre-judged by a gate —
+                // that is the ordering arm 3's task 0 established, and it is not
+                // inverted one arm later. The three join `ARM_ZERO_INVARIANTS`
+                // once measured. The identities beside them are what make three
+                // zeros a finding rather than three uniform smalls.
+                let jc = &d.justifications;
+                row.set("arm4_reroute", jc.reroute.to_string());
+                row.set("arm4_dropform", jc.drop_form.to_string());
+                row.set("arm4_storeform", jc.store_form.to_string());
+                row.set("just_kind_decision", jc.kind_decision.to_string());
+                row.set("just_seam_adapter", jc.seam_adapter.to_string());
+                row.set("just_total", jc.total().to_string());
                 if !sg.len_parse_failures.is_empty() {
                     row.set(
                         "arm3_len_parse_failures",
@@ -9976,6 +9992,47 @@ fn arm_parity_failures(program: &str, row: &report::Row) -> Vec<String> {
         | (Ok(_), Ok(_), Err(why), _)
         | (Ok(_), Ok(_), Ok(_), Err(why)) => out.push(why),
     }
+    // **ARM 4's TASK 0 — the census agrees with the differential's own counts.**
+    //
+    // `just_kind_decision` and `kd_edits` count one population in two
+    // independent walks over the plan, as do `just_seam_adapter` and `sa_edits`.
+    // Gated as a pair, because this is the only thing that makes arm 4's three
+    // zeros mean "no market" rather than "no counter".
+    for (census, arm) in [
+        ("just_kind_decision", "kd_edits"),
+        ("just_seam_adapter", "sa_edits"),
+    ] {
+        match (num(census), num(arm)) {
+            (Ok(c), Ok(a)) if c == a => {}
+            (Ok(c), Ok(a)) => out.push(format!(
+                "{program}: {census}={c} != {arm}={a} — two independent walks \
+                 over one plan disagree, so the census is not measuring the \
+                 population it reports a denominator for"
+            )),
+            (Err(why), _) | (Ok(_), Err(why)) => out.push(why),
+        }
+    }
+    // The census's own conservation: an edit may not land in NO bucket.
+    match (
+        num("just_total"),
+        num("just_kind_decision"),
+        num("just_seam_adapter"),
+        num("arm4_reroute"),
+        num("arm4_dropform"),
+        num("arm4_storeform"),
+    ) {
+        (Ok(t), Ok(k), Ok(s), Ok(r), Ok(df), Ok(sf)) if t == k + s + r + df + sf => {}
+        (Ok(t), Ok(k), Ok(s), Ok(r), Ok(df), Ok(sf)) => out.push(format!(
+            "{program}: just_total={t} != {k}+{s}+{r}+{df}+{sf} — a plan edit \
+             landed in no justification bucket"
+        )),
+        (Err(why), ..)
+        | (Ok(_), Err(why), ..)
+        | (Ok(_), Ok(_), Err(why), ..)
+        | (Ok(_), Ok(_), Ok(_), Err(why), ..)
+        | (Ok(_), Ok(_), Ok(_), Ok(_), Err(why), _)
+        | (Ok(_), Ok(_), Ok(_), Ok(_), Ok(_), Err(why)) => out.push(why),
+    }
     out
 }
 
@@ -10019,6 +10076,15 @@ fn conforming_arm_row() -> report::Row {
     row.set("arm3_arg_peeled", "9");
     row.set("sa_edits", "421");
     row.set("sa_offsets", "421");
+    // Arm 4's census. R7 ADDENDUM: these are the values the sweep produced,
+    // cited to it — 2,819 + 421 = 3,240, with arm 4's three at zero because the
+    // span layer constructs none of those justifications.
+    row.set("arm4_reroute", "0");
+    row.set("arm4_dropform", "0");
+    row.set("arm4_storeform", "0");
+    row.set("just_kind_decision", "2819");
+    row.set("just_seam_adapter", "421");
+    row.set("just_total", "3240");
     row
 }
 
@@ -10157,6 +10223,41 @@ fn every_arm_gate_failure_class_actually_fails() {
         assert!(
             failures.iter().any(|f| f.contains("arm3_len_shapes")),
             "{key}={value} must break the length identity and name it: {failures:?}"
+        );
+    }
+
+    // 6c. Arm 4's census must AGREE with the differential's own counts, and
+    //     conserve. Both directions on each pair, because a `>=`/`<=` spelling
+    //     passes one of them.
+    for (key, value) in [
+        ("just_kind_decision", "2818"),
+        ("just_kind_decision", "2820"),
+        ("just_seam_adapter", "420"),
+        ("just_seam_adapter", "422"),
+    ] {
+        let mut row = conforming_arm_row();
+        row.set(key, value);
+        let failures = arm_parity_failures("avl", &row);
+        assert!(
+            failures.iter().any(|f| f.contains(key)),
+            "{key}={value} must fail the two-walk cross-check: {failures:?}"
+        );
+    }
+    // A plan edit landing in NO bucket — the conservation the denominator
+    // exists for. Injected on each arm-4 counter too, since those are the ones
+    // whose zero is the finding.
+    for (key, value) in [
+        ("just_total", "3241"),
+        ("arm4_reroute", "1"),
+        ("arm4_dropform", "1"),
+        ("arm4_storeform", "1"),
+    ] {
+        let mut row = conforming_arm_row();
+        row.set(key, value);
+        let failures = arm_parity_failures("avl", &row);
+        assert!(
+            failures.iter().any(|f| f.contains("just_total")),
+            "{key}={value} must break the census's conservation: {failures:?}"
         );
     }
 
