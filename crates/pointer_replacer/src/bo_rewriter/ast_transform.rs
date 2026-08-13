@@ -138,6 +138,22 @@ pub(crate) fn decl_ty_kind(form: DeclForm, mutable: bool, pointee: P<Ty>) -> TyK
 /// **Fail-closed:** a second claim on a node is REFUSED and counted. It is
 /// never resolved by precedence, because a precedence rule is a decision, and
 /// deciding here is what the phase separation forbids.
+///
+/// # What "refused" means exactly — CORRECTED at arm 2
+///
+/// This doc previously said a second claim refuses **both** transforms. It does
+/// not, and cannot as built: the first claimant has already mutated its node by
+/// the time the second arrives, so what the guard delivers is *the second is
+/// refused and counted*, with the first standing. Through arm 1 the difference
+/// was unobservable — one transform cannot conflict, so `refused` was a
+/// uniformly-zero predicate and the claim was never exercised.
+///
+/// The distinction is recorded rather than repaired because a nonzero `refused`
+/// is **pre-classified STOP** in parity mode: the corpus expectation is zero, and
+/// a genuine both-refusal (rollback, or a claim pass separated from a transform
+/// pass) is work that belongs to whichever unlock first makes composition
+/// legal. What must not happen is prose promising a rollback the code does not
+/// perform.
 #[derive(Default)]
 pub(crate) struct Composition {
     claimed: FxHashSet<NodeId>,
@@ -147,7 +163,8 @@ pub(crate) struct Composition {
 
 impl Composition {
     /// `true` when this transform may proceed. `false` means another transform
-    /// already owns the node and **both** are refused — see the struct doc.
+    /// already owns the node, and THIS one is refused — see the struct doc for
+    /// why that is not the same as refusing both.
     pub(crate) fn claim(&mut self, node: NodeId) -> bool {
         if self.claimed.insert(node) {
             true
@@ -901,6 +918,55 @@ mod arm2_witnesses {
                 "a declined graft must LEAVE the node — a fail-closed refusal \
                  that blanks what it refused is worse than the abort it \
                  replaced: {text}"
+            );
+        });
+    }
+
+    /// **The `(lo, hi)` key is load-bearing, and this is what it prevents.**
+    ///
+    /// `p.offset(1)` and `p.offset(1) as usize` share a START offset and differ
+    /// only at the end. The walk meets the **cast first**, so a map keyed on
+    /// `lo` alone would graft the replacement over the whole cast — silently,
+    /// correctly-looking, and only on shapes where an outer node happens to
+    /// begin at the same byte. C2Rust's `p.offset(i as isize)` idiom puts casts
+    /// everywhere, so this is the corpus's most ordinary shape, not a corner.
+    ///
+    /// *Mutation-tested:* keying the map on `key.0` alone makes this fail on the
+    /// surviving-cast assertion, while every other witness here stays green.
+    #[test]
+    fn a_use_edit_names_one_node_not_every_node_sharing_its_start() {
+        rustc_span::create_default_session_globals_then(|| {
+            let src = "fn f(p: *mut u8) -> usize { p.offset(1) as usize }";
+            let krate = ::utils::ast::parse_crate(src.to_owned());
+            let tail = tail_expr_span(&krate);
+            let inner = {
+                let rustc_ast::ItemKind::Fn(f) = &krate.items[0].kind else {
+                    panic!("fixture is a fn")
+                };
+                let body = f.body.as_ref().expect("fixture has a body");
+                let rustc_ast::StmtKind::Expr(e) = &body.stmts.last().expect("tail").kind else {
+                    panic!("tail is an expression")
+                };
+                let rustc_ast::ExprKind::Cast(operand, _) = &e.kind else {
+                    panic!("the fixture's tail is a cast")
+                };
+                operand.span
+            };
+            assert_eq!(
+                inner.lo(),
+                tail.lo(),
+                "the fixture only tests anything if the two spans really do \
+                 share a start offset"
+            );
+            assert_ne!(inner.hi(), tail.hi(), "and really do differ at the end");
+
+            let (text, stats) = graft_over(src, &[(inner, "p[1]")]);
+            assert_eq!(stats.grafted, 1);
+            assert!(
+                text.contains("p[1] as usize"),
+                "the edit named the OPERAND, so the cast must survive it — a \
+                 map keyed on the start offset alone grafts over the whole cast \
+                 and silently drops the conversion: {text}"
             );
         });
     }
