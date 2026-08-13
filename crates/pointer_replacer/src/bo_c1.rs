@@ -10767,6 +10767,21 @@ fn m1_emit_corpus() {
     let revert_dir = orchestrate::out_dir().join("m1-emit-reverts");
     let _ = fs::remove_dir_all(&revert_dir);
     fs::create_dir_all(&revert_dir).expect("revert dir");
+    // **R7.5 — THE RUN STAMP.** `m1_recon_corpus` got one; this sweep did not,
+    // and the omission surfaced when the phase-3 exit gate needed to CITE this
+    // directory's contents. The remnant found there had the right line count
+    // and the right date and **no recoverable producing run** — exactly the
+    // discrimination the stamp exists to provide.
+    //
+    // It matters more here than at recon: these files are about to become a
+    // digest-pinned ORACLE, so "which run produced them" is not a debugging
+    // convenience, it is the citation. Written before any program runs, so the
+    // window in which the directory exists unstamped is empty.
+    fs::write(
+        revert_dir.join("RUN.txt"),
+        format!("test_pid={}\n", std::process::id()),
+    )
+    .expect("emit run stamp");
 
     for program in CORPUS {
         let input = program.input_path(&root);
