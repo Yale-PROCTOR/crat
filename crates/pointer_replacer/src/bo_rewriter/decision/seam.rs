@@ -174,6 +174,119 @@ fn unwrap_expr(text: &str, mutable: bool) -> String {
     }
 }
 
+/// **THE GLUE SPEC — the reification ruled at the arm-3 boundary (2026-08-13).**
+///
+/// Glue used to be manufactured as TEXT here and consumed as text downstream.
+/// The AST application layer cannot build a node from a rendered string without
+/// re-parsing the argument it was told to keep as a subtree — the round-trip
+/// arm 1 declined — so the shape the decision layer already knew is now
+/// CARRIED rather than re-derived.
+///
+/// **Reification only.** No decision, gate, family or position-walk change: the
+/// spec is computed at exactly the sites that already computed the string, and
+/// [`GlueSpec::render`] reproduces that string byte-for-byte. That equality is
+/// GATED, not asserted — see `render_is_byte_identical_to_the_frozen_glue_text`.
+///
+/// The dependency arrow runs application→decision: this type lives here, and
+/// the AST layer consumes it. The import denylist is untouched.
+///
+/// Every arm of [`glue`] is one point in a small algebra —
+/// `[Some(] core([unwrap(] text [)]) [)]` — which is why five cores suffice for
+/// all fourteen emitting arms.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum GlueCore {
+    /// `X` — the argument unchanged (the payload already fits).
+    Bare,
+    /// `&mut *X` / `&*X`
+    Reborrow,
+    /// `&mut X[0]` / `&X[0]`
+    Index0,
+    /// `core::slice::from_raw_parts{_mut}(X, (LEN) as usize)`
+    FromRawParts,
+    /// `core::slice::from_mut(X)` / `core::slice::from_ref(X)`
+    FromRefMut,
+}
+
+/// One adapter, described rather than rendered.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct GlueSpec {
+    pub core: GlueCore,
+    /// The EXPECTED side's mutability — selects `&`/`&mut` and
+    /// `from_ref`/`from_mut`.
+    pub mutable: bool,
+    /// The unwrap that precedes the core when the FOUND side is optional.
+    /// `Some(true)` is `.as_mut().unwrap()`, `Some(false)` is `.unwrap()` —
+    /// the distinction `unwrap_expr` exists for, carried rather than inferred.
+    pub unwrap: Option<bool>,
+    /// The length's source text, `FromRawParts` only.
+    ///
+    /// **Still `None`-means-refused**: the seam never invents a length, and the
+    /// held fabricated-length slice inserts HERE rather than at a string
+    /// substitution.
+    pub len: Option<String>,
+    /// Wrap the result in `Some(...)`.
+    pub optional: bool,
+}
+
+impl GlueSpec {
+    fn core(core: GlueCore, mutable: bool) -> Self {
+        Self {
+            core,
+            mutable,
+            unwrap: None,
+            len: None,
+            optional: false,
+        }
+    }
+
+    fn with_unwrap(mut self, found_mutable: bool) -> Self {
+        self.unwrap = Some(found_mutable);
+        self
+    }
+
+    fn with_len(mut self, len: &str) -> Self {
+        self.len = Some(len.to_owned());
+        self
+    }
+
+    fn wrapped(mut self) -> Self {
+        self.optional = true;
+        self
+    }
+
+    /// Render the spec as the span layer's text. **Byte-identical to the
+    /// pre-reification `format!` set, and gated as such.**
+    pub(crate) fn render(&self, text: &str) -> String {
+        let base = match self.unwrap {
+            None => text.to_owned(),
+            Some(found_mutable) => unwrap_expr(text, found_mutable),
+        };
+        let inner = match self.core {
+            GlueCore::Bare => base,
+            GlueCore::Reborrow => format!("{}*{base}", amp(self.mutable)),
+            GlueCore::Index0 => format!("{}{base}[0]", amp(self.mutable)),
+            GlueCore::FromRawParts => {
+                let ctor = if self.mutable {
+                    "from_raw_parts_mut"
+                } else {
+                    "from_raw_parts"
+                };
+                let len = self.len.as_deref().unwrap_or_default();
+                format!("core::slice::{ctor}({base}, ({len}) as usize)")
+            }
+            GlueCore::FromRefMut => {
+                let ctor = if self.mutable { "from_mut" } else { "from_ref" };
+                format!("core::slice::{ctor}({base})")
+            }
+        };
+        if self.optional {
+            format!("Some({inner})")
+        } else {
+            inner
+        }
+    }
+}
+
 /// The glue that turns a value of `found` into one of `expected`.
 ///
 /// - `Ok(None)` — the forms already agree, or coerce. **No edit.**
@@ -423,6 +536,82 @@ mod tests {
     use super::*;
 
     const T: &str = "p";
+
+    /// **THE RENDERER PARITY ORACLE — every emitting arm of [`glue`], by hand.**
+    ///
+    /// Condition 2 of the option-A ruling: spec + renderer must reproduce
+    /// today's text byte-identically. This pins the RENDERER half of that gate
+    /// now, before any arm is converted, so the conversion lands against a
+    /// fixed target rather than co-evolving with it.
+    ///
+    /// Each row is `(spec, expected text)` transcribed from the corresponding
+    /// `format!` in `glue`. The algebra is `[Some(] core([unwrap(] X [)]) [)]`,
+    /// and these fourteen rows are every composition `glue` can emit.
+    ///
+    /// *Mutation-tested:* dropping the parens in the `FromRawParts` cast, or
+    /// swapping `from_ref`/`from_mut`, fails here.
+    #[test]
+    fn render_reproduces_every_emitting_glue_arm_byte_for_byte() {
+        let cases: Vec<(GlueSpec, &str)> = vec![
+            // (Ref, Raw) and its optional twin
+            (GlueSpec::core(GlueCore::Reborrow, true), "&mut *p"),
+            (GlueSpec::core(GlueCore::Reborrow, false), "&*p"),
+            (
+                GlueSpec::core(GlueCore::Reborrow, true).wrapped(),
+                "Some(&mut *p)",
+            ),
+            // (Slice, Raw) and its optional twin
+            (
+                GlueSpec::core(GlueCore::FromRawParts, true).with_len("n"),
+                "core::slice::from_raw_parts_mut(p, (n) as usize)",
+            ),
+            (
+                GlueSpec::core(GlueCore::FromRawParts, false).with_len("n"),
+                "core::slice::from_raw_parts(p, (n) as usize)",
+            ),
+            (
+                GlueSpec::core(GlueCore::FromRawParts, true)
+                    .with_len("n")
+                    .wrapped(),
+                "Some(core::slice::from_raw_parts_mut(p, (n) as usize))",
+            ),
+            // safe family
+            (
+                GlueSpec::core(GlueCore::FromRefMut, true),
+                "core::slice::from_mut(p)",
+            ),
+            (
+                GlueSpec::core(GlueCore::FromRefMut, false),
+                "core::slice::from_ref(p)",
+            ),
+            (GlueSpec::core(GlueCore::Index0, true), "&mut p[0]"),
+            (GlueSpec::core(GlueCore::Bare, false).wrapped(), "Some(p)"),
+            (
+                GlueSpec::core(GlueCore::FromRefMut, false).wrapped(),
+                "Some(core::slice::from_ref(p))",
+            ),
+            (
+                GlueSpec::core(GlueCore::Index0, false).wrapped(),
+                "Some(&p[0])",
+            ),
+            // the null-panic convention: unwrap under each core
+            (
+                GlueSpec::core(GlueCore::Bare, false).with_unwrap(false),
+                "p.unwrap()",
+            ),
+            (
+                GlueSpec::core(GlueCore::Index0, true).with_unwrap(true),
+                "&mut p.as_mut().unwrap()[0]",
+            ),
+        ];
+        for (spec, expected) in cases {
+            assert_eq!(
+                spec.render(T),
+                expected,
+                "renderer must be byte-identical to the arm it replaces: {spec:?}"
+            );
+        }
+    }
 
     fn g(expected: Form, found: Form) -> Result<Option<(String, SeamFamily)>, SeamBlock> {
         glue(expected, found, T, None)
