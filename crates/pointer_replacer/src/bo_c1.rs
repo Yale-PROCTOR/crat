@@ -7024,6 +7024,11 @@ mod run {
                     refused: _,
                     orphan_subject: _,
                     reverted_withheld: _,
+                    // `arms_full` runs with an EMPTY revert set, so both of
+                    // these are structurally empty here — the phase-4 gate is
+                    // the only site that applies a real one. Named rather than
+                    // globbed, which is the whole point of the destructure.
+                    withheld_ids: _,
                     placed_ids: _,
                     rendered: _,
                     rendered_arm2: _,
@@ -8080,6 +8085,22 @@ mod run {
                 // zero is only a measurement if the check actually ran, and
                 // this is what says it did.
                 row.set("p4_reverted_withheld", p.reverted_withheld.to_string());
+                // **THE WITHHELD SIDE AT IDENTITY LEVEL.** The scalar above is
+                // checked against the oracle's LINE COUNT; these are checked
+                // against the table-derived `reverted_ids`, and they are what
+                // the coverage claim actually rests on.
+                row.set("p4_withheld_ids", p.withheld_ids.to_string());
+                row.set("p4_withheld_dup", p.withheld_dup.to_string());
+                row.set("p4_withheld_missing", p.withheld_missing.to_string());
+                row.set("p4_withheld_surplus", p.withheld_surplus.to_string());
+                if !p.withheld_examples.is_empty() {
+                    row.set(
+                        "p4_withheld_ex",
+                        super::report::sanitize(
+                            &p.withheld_examples[..p.withheld_examples.len().min(2)].join(" | "),
+                        ),
+                    );
+                }
                 // **BUDGETED BY LENGTH, NOT BY COUNT — and per CLASS.**
                 //
                 // The first fix capped at three rows, which fails twice, both
@@ -8116,13 +8137,29 @@ mod run {
                 );
                 row.set("p4_seam_key_collisions", p.seam_key_collisions.to_string());
                 row.set("p4_seam_refused", p.seam_refused.to_string());
-                // **RENDER-GAP CALIBRATION — reported, not gated.** The charter
-                // asked for one comparison, not permanent wiring: a nonzero
-                // here is a STOP a human reads, and whether it becomes a gate
-                // is a decision for after the number exists.
+                // **RENDER-GAP CALIBRATION — de-tautologized at round 4, and
+                // now GATED.** Round 3's version compared two consumers of one
+                // revert predicate, so its zero was forced; the two sides now
+                // derive the revert decision by different routes, which is what
+                // makes `differing`/`absent`/`surplus` worth failing on.
+                // `rollbacks` and the two owner classes stay REPORTED — first
+                // measurements whose zero rests on a structural argument rather
+                // than a prior run, and all three are fail-open into
+                // `differing`, which is gated.
                 row.set("p4_render_compared", p.render_compared.to_string());
                 row.set("p4_render_differing", p.render_differing.to_string());
                 row.set("p4_render_absent", p.render_absent.to_string());
+                row.set("p4_render_surplus", p.render_surplus.to_string());
+                row.set(
+                    "p4_render_expected_empty",
+                    p.render_expected_empty.to_string(),
+                );
+                row.set("p4_render_plan_files", p.render_plan_files.to_string());
+                row.set(
+                    "p4_render_owner_unresolved",
+                    p.render_owner_unresolved.to_string(),
+                );
+                row.set("p4_render_owner_split", p.render_owner_split.to_string());
                 row.set("p4_render_rollbacks", p.render_rollbacks.to_string());
                 if !p.render_examples.is_empty() {
                     row.set(
@@ -11236,12 +11273,60 @@ fn p3_row_failures(program: &str, row: &report::Row) -> Vec<String> {
     // it also counts declarations those would have stopped anyway. The
     // observability of `reverted_placed` rests on the unit witness (M9); this
     // is coverage, not opportunity.
+    // ⚠⚠ **AND ROUND 4 NARROWS THE PARAGRAPH ABOVE.** Codex's round-3 [high]:
+    // this is a COUNT. Two declarations resolving to reverted subject `A` while
+    // `B` is never reached satisfies it exactly, so *"every reverted subject's
+    // declaration was reached"* is NOT established here — it is established by
+    // `p4_withheld_missing`/`_surplus`/`_dup` below.
+    //
+    // The line is KEPT because its right-hand side is the oracle's LINE COUNT,
+    // a different source from the table-derived `reverted_ids` the identity
+    // check uses. Two sources, two lines; the claim lives on the other one.
     match (num("p4_reverted_withheld"), num("p3_reverted_subjects")) {
         (Ok(w), Ok(r)) if w == r => {}
         (Ok(w), Ok(r)) => out.push(format!(
-            "{program}: p4_reverted_withheld={w} != p3_reverted_subjects={r} —              the site revert check did not reach every reverted subject's              declaration, so `p4_reverted_placed`'s zero covers less than the              population it claims"
+            "{program}: p4_reverted_withheld={w} != p3_reverted_subjects={r} —              the site revert check did not decline once per reverted oracle              line"
         )),
         (Err(why), _) | (Ok(_), Err(why)) => out.push(why),
+    }
+    // **THE WITHHELD IDENTITY LIST vs ITS OWN COUNTER**, the mirror of
+    // `placed_ids + placed_dup == placed`. Without it the identity set could
+    // drift from the counter the oracle line above is checked against, and each
+    // line would still pass on its own.
+    match (
+        num("p4_withheld_ids"),
+        num("p4_withheld_dup"),
+        num("p4_reverted_withheld"),
+    ) {
+        (Ok(ids), Ok(dup), Ok(w)) if ids + dup == w => {}
+        (Ok(ids), Ok(dup), Ok(w)) => out.push(format!(
+            "{program}: p4_withheld_ids={ids} + p4_withheld_dup={dup} != \
+             p4_reverted_withheld={w} — the withheld identity list drifted from \
+             the counter it is supposed to be derived from"
+        )),
+        (Err(why), ..) | (Ok(_), Err(why), _) | (Ok(_), Ok(_), Err(why)) => out.push(why),
+    }
+    // **THE CALIBRATION'S CONSERVATION IDENTITY.** Every planned file must
+    // account for itself as compared, absent, or expected-empty. Without it a
+    // file could vanish from all three populations — which is precisely how
+    // round 3's comparison excluded the fully-reverted programs while reporting
+    // a clean 0/15.
+    match (
+        num("p4_render_compared"),
+        num("p4_render_absent"),
+        num("p4_render_expected_empty"),
+        num("p4_render_plan_files"),
+    ) {
+        (Ok(c), Ok(a), Ok(e), Ok(f)) if c + a + e == f => {}
+        (Ok(c), Ok(a), Ok(e), Ok(f)) => out.push(format!(
+            "{program}: p4_render_compared={c} + absent={a} + expected_empty={e} \
+             != p4_render_plan_files={f} — a planned file reached NO population, \
+             so the calibration's denominator is not the plan's"
+        )),
+        (Err(why), ..)
+        | (Ok(_), Err(why), ..)
+        | (Ok(_), Ok(_), Err(why), _)
+        | (Ok(_), Ok(_), Ok(_), Err(why)) => out.push(why),
     }
     // Every compared function must have been EQUAL. Its own identity rather
     // than an inference from `differing == 0`, so a function compared and
@@ -11311,7 +11396,124 @@ fn conforming_p3_row() -> report::Row {
     // withholds nothing — measured, and the brotli control below carries the
     // non-zero half so the identity is exercised in both directions.
     row.set("p4_reverted_withheld", "0");
+    // The identity form of the same fact. `_missing`/`_surplus`/`_dup` come from
+    // the zero-key loop above; these two are the population, and `0 + 0 == 0`
+    // is what the list-vs-counter identity reads on a program that reverts
+    // nothing.
+    row.set("p4_withheld_ids", "0");
+    row.set("p4_withheld_dup", "0");
+    // **libcsv's MEASURED calibration shape** (this round's sweep): one planned
+    // file, compared against `render`, equal, with nothing expected-empty.
+    // `differing`/`absent`/`surplus` come from the zero-key loop.
+    row.set("p4_render_compared", "1");
+    row.set("p4_render_expected_empty", "0");
+    row.set("p4_render_plan_files", "1");
     row
+}
+
+/// **A row from a program whose whole population is REVERTED** — the half
+/// `conforming_p3_row` structurally cannot carry.
+///
+/// libcsv reverts nothing, so on it the withheld identity check and the
+/// calibration's `expected_empty` arm are both vacuous: every assertion about
+/// them passes over an empty population. **avl's measured row** (this round's
+/// sweep) is the other direction — 3 reverted subjects, all three withheld by
+/// identity, and one planned file whose every edit the reconstruction drops
+/// while `render` correctly emits nothing.
+///
+/// That last line is the population round 3's comparison excluded by
+/// construction, and it is the reason `p4_render_surplus` exists.
+#[cfg(test)]
+fn fully_reverted_p3_row() -> report::Row {
+    let mut row = conforming_p3_row();
+    // avl: 3 subjects, all reverted, so nothing is emitted or compared.
+    row.set("p3_compared", "0");
+    row.set("p3_equal", "0");
+    row.set("p3_multi_arm", "0");
+    row.set("p3_emitted_subjects", "0");
+    row.set("p3_reverted_subjects", "3");
+    row.set("p4_decided", "3");
+    row.set("p4_placed", "0");
+    row.set("p4_survivor_ids", "0");
+    row.set("p4_placed_ids", "0");
+    row.set("p4_reverted_withheld", "3");
+    row.set("p4_withheld_ids", "3");
+    row.set("p4_withheld_dup", "0");
+    // avl's seam population is empty once the revert set applies.
+    row.set("p4_seam_targets", "0");
+    row.set("p4_seam_grafted", "0");
+    // **THE FULLY-REVERTED FILE**: planned, kept by nothing, emitted by nobody.
+    row.set("p4_render_compared", "0");
+    row.set("p4_render_expected_empty", "1");
+    row.set("p4_render_plan_files", "1");
+    row
+}
+
+/// The fully-reverted shape must PASS, and its two load-bearing lines must FAIL
+/// when broken — otherwise `p4_render_surplus` and the withheld identity are
+/// gated over a population no control ever exercises.
+#[test]
+fn the_gate_passes_a_fully_reverted_program_and_still_checks_it() {
+    let f = p3_row_failures("avl", &fully_reverted_p3_row());
+    assert!(f.is_empty(), "avl's measured shape must pass: {f:?}");
+
+    // **THE SURPLUS ARM.** `render` emitting a file the reconstruction calls
+    // fully reverted is a revert defect in the production applier — the exact
+    // scenario round 3's comparison could not see, because it iterated the
+    // reconstruction's keys and skipped the empty ones.
+    let mut surplus = fully_reverted_p3_row();
+    surplus.set("p4_render_surplus", "1");
+    assert!(
+        p3_row_failures("avl", &surplus)
+            .iter()
+            .any(|m| m.contains("p4_render_surplus")),
+        "a surplus render on a fully-reverted program must FAIL"
+    );
+
+    // **AND THE CONSERVATION IDENTITY** — a planned file reaching no population
+    // at all, which is how a file gets silently excluded from the denominator.
+    let mut lost = fully_reverted_p3_row();
+    lost.set("p4_render_expected_empty", "0");
+    let f = p3_row_failures("avl", &lost);
+    assert!(
+        f.iter().any(|m| m.contains("p4_render_plan_files")),
+        "a planned file in NO population must fail the conservation identity: {f:?}"
+    );
+
+    // The withheld identity, exercised where its population is non-empty.
+    for (missing, surplus) in [("1", "0"), ("0", "1")] {
+        let mut row = fully_reverted_p3_row();
+        row.set("p4_withheld_missing", missing);
+        row.set("p4_withheld_surplus", surplus);
+        let f = p3_row_failures("avl", &row);
+        assert!(
+            f.iter()
+                .any(|m| m.contains("p4_withheld_missing") || m.contains("p4_withheld_surplus")),
+            "a withheld identity mismatch must fail over a NON-EMPTY reverted \
+             population: {f:?}"
+        );
+    }
+
+    // **THE COMPENSATING PAIR the retained scalar cannot see**, stated as a
+    // test: one identity declined twice and one never reached keeps
+    // `p4_reverted_withheld == p3_reverted_subjects` exactly true.
+    let mut pair = fully_reverted_p3_row();
+    pair.set("p4_withheld_ids", "2");
+    pair.set("p4_withheld_dup", "1");
+    pair.set("p4_withheld_missing", "1");
+    assert!(
+        p3_row_failures("avl", &pair)
+            .iter()
+            .all(|m| !m.contains("p4_reverted_withheld=")),
+        "the SCALAR line is satisfied by the compensating pair — which is why \
+         the claim moved to the identity check"
+    );
+    assert!(
+        p3_row_failures("avl", &pair)
+            .iter()
+            .any(|m| m.contains("p4_withheld_missing") || m.contains("p4_withheld_dup")),
+        "...and the identity check is what catches it"
+    );
 }
 
 /// **THE CHECK-TO-USE VERIFICATION — hash the buffer you are about to parse.**
@@ -11554,6 +11756,24 @@ fn recon_example_rows_keep_one_whole_label_per_class() {
 /// **`p4_reverted_placed` became a genuine measurement at round 2** — 1,058
 /// declines on the frozen corpus — and was a construction before it.
 #[cfg(test)]
+/// **Round 4 added six**, and their bases are NOT uniform — stated, because the
+/// last time this list grew, a claim covering it was narrower than written.
+///
+/// - **`p4_withheld_missing` and `p4_withheld_dup` are LIVE.** The walk can
+///   reach fewer declarations than the revert set owes (a `local_map` miss, an
+///   orphan), and it can reach one identity twice. Both are exactly the
+///   compensating pair that keeps the retained scalar equal while the SET is
+///   wrong.
+/// - **`p4_withheld_surplus` is a PIN, not a live check**, and the label is
+///   recorded rather than implied: the walk pushes only keys it found in
+///   `decisions` under a `fn_did` in `reverted_fns`, and every such key is in
+///   `reverted_ids` by construction. It is gated so that a future change to the
+///   decline site cannot make it live without a row moving.
+/// - **`p4_render_*` became gateable only when the two sides of the calibration
+///   stopped consuming one revert predicate.** A gate over a tautology is worse
+///   than no gate: it reads as coverage. `differing` is live in both directions;
+///   `absent` and `surplus` are the two asymmetries round 3's loop could not
+///   see, `surplus` being the fully-reverted population's only witness.
 const P4_IDENTITY_ZERO_KEYS: &[&str] = &[
     "p4_unplaced",
     "p4_use_unmatched",
@@ -11563,6 +11783,12 @@ const P4_IDENTITY_ZERO_KEYS: &[&str] = &[
     "p4_reverted_placed",
     "p4_placed_dup",
     "p4_orphan_subject",
+    "p4_withheld_missing",
+    "p4_withheld_surplus",
+    "p4_withheld_dup",
+    "p4_render_differing",
+    "p4_render_absent",
+    "p4_render_surplus",
 ];
 
 /// The phase-4 failure classes whose corpus value is **zero and gated**.
@@ -11733,6 +11959,17 @@ fn every_p3_failure_class_actually_fails() {
     // the walk reached every one. This is the non-zero half of the identity —
     // without it the gate would be satisfied by a corpus that never withheld.
     row.set("p4_reverted_withheld", "495");
+    // **AND ITS IDENTITY FORM** (round 4, measured this sweep): 495 distinct,
+    // none declined twice. Without these the row fails the list-vs-counter
+    // identity — which is how this control found out it was incomplete.
+    row.set("p4_withheld_ids", "495");
+    row.set("p4_withheld_dup", "0");
+    // brotli's MEASURED calibration shape: ONE planned file, every edit on it
+    // reverted, and `render` correctly emitting nothing. The fully-reverted
+    // population, which round 3's comparison excluded by construction.
+    row.set("p4_render_compared", "0");
+    row.set("p4_render_expected_empty", "1");
+    row.set("p4_render_plan_files", "1");
     assert!(
         p3_row_failures("brotli", &row).is_empty(),
         "compared=0 with emitted=0 is LEGAL — five programs are legitimately \
@@ -12003,6 +12240,13 @@ fn every_p4_failure_class_actually_fails() {
         "p4_survivor_ids",
         "p4_placed_ids",
         "p4_missing_unattributed",
+        // ---- round 4: every new key the gate READS, absence included ----
+        "p4_withheld_ids",
+        "p4_withheld_dup",
+        "p4_render_compared",
+        "p4_render_absent",
+        "p4_render_expected_empty",
+        "p4_render_plan_files",
     ]
     .iter()
     .copied()

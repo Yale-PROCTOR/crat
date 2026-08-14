@@ -423,7 +423,22 @@ pub(crate) struct RefDeclStats {
     /// denominator that makes `reverted_placed`'s zero mean something: a zero
     /// here would mean the check never ran, and the observability the F2 repair
     /// bought would be back to a construction.
+    ///
+    /// ⚠ **A COUNT, and the claim no longer rests on it** (round 4). Codex's
+    /// round-3 [high]: if two AST declarations resolve to reverted subject `A`
+    /// while subject `B` is never reached, this scalar still equals the two
+    /// oracle lines — so *"every reverted subject's declaration was reached"* was
+    /// never established by it. The identities are in
+    /// [`Self::withheld_ids`]; this stays as the term the oracle's LINE COUNT is
+    /// checked against, which is a different source from `reverted_ids`.
     pub reverted_withheld: usize,
+    /// **THE IDENTITIES the site revert check declined**, one per decline.
+    ///
+    /// A `Vec` for [`Self::placed_ids`]' reason and it is the same reason: the
+    /// duplicate is itself the failure class — the exact compensating pair that
+    /// keeps the scalar equal while the *set* is wrong — and a set would absorb
+    /// it at the point of collection.
+    pub withheld_ids: Vec<(LocalDefId, HirId)>,
     /// **THE ORPHAN CLASS — a subject whose declaration the walk reached with
     /// no owning function.**
     ///
@@ -541,6 +556,10 @@ impl RefDeclVisitor<'_> {
         // than a set membership no bug could disturb.
         if self.reverted_fns.contains(&fn_did) {
             self.stats.reverted_withheld += 1;
+            // **THE IDENTITY, beside the count.** The count alone cannot say
+            // WHICH subjects were reached; round 4's item 2, and the mirror of
+            // what `placed_ids` does three returns below.
+            self.stats.withheld_ids.push((fn_did, hir_id));
             return;
         }
         // **The shape check runs BEFORE the claim** (arm-2 review). Claiming
@@ -2259,13 +2278,31 @@ pub(crate) fn phase3_fn_parity(
     // and its output is compared against a reconstruction built the way this
     // gate builds one.
     //
-    // **Compared at FILE level, which SUBSUMES the placed 62** — a deviation
-    // from the charter's per-function wording, taken deliberately. Matching
-    // per-function extents inside a rewritten file needs the net length change
-    // of every prior surviving edit; that offset arithmetic is my code, it can
-    // be wrong, and a calibration whose own instrument is the delicate part
-    // measures itself. File equality gives the per-function claim for free: if
-    // the whole texts agree, every function's slice of them agrees.
+    // **ROUND 4 — THE TWO SIDES NOW DIFFER IN THE REVERT DECISION.** They did
+    // not before: this side asked `reverts.keeps(&e.owner_fn)` and `render`
+    // asked `!reverted.contains(&edit.owner_fn)` — one set, one key, one string
+    // vocabulary — so 0-differing was FORCED before the sweep ran, and what
+    // round 3 measured was two back-to-front appliers agreeing about an
+    // already-agreed edit set. The revert half was a tautology.
+    //
+    // `render` keeps `reverts.names`, the oracle file's parsed strings. This
+    // side asks the **declaration walk's realized verdict**: `withheld_fns` is
+    // what the walk actually DECLINED at its site, and the name→`LocalDefId`
+    // bridge is an index built here from `tcx.hir_body_owners()`. Neither
+    // `reverts.keeps` nor `reverts.names` is on this path.
+    //
+    // **Compared at FILE level** — a deviation from the charter's per-function
+    // wording, and §27 offered "calibrate the per-function splice OR say plainly
+    // it is a different derivation". The second branch is taken, for a reason
+    // §27 could not have: handing the per-function splice this predicate would
+    // DAMAGE phase 3. Its span side filters by NAME while its AST side consults
+    // `reverts.fns` by `DefId` at the site, and that cross-vocabulary
+    // independence is real; routing the span side through the walk's verdict
+    // would make both sides consume the walk, and a walk-side revert defect
+    // would go invisible in the instrument pinned at 68/68. The per-function
+    // splice therefore keeps its predicate and shares only [`splice_kept`].
+    // **What stays uncalibrated is its OFFSET REBASING** (`base + e.lo`, then
+    // `lo - flo`) — named rather than covered by an inference.
     //
     // ⚠ `emit_files` calls `render` with an EMPTY revert set — it has already
     // dropped reverted SUBJECTS at plan-build time — so `emission.files` still
@@ -2286,41 +2323,39 @@ pub(crate) fn phase3_fn_parity(
     for rb in rollbacks.iter().take(4) {
         p.render_examples.push(format!("ROLLBACK {rb:?}"));
     }
-    for (key, edits) in &emission.plan.by_file {
-        let Some(source) = emission.texts.get(key) else {
-            continue;
-        };
-        let mut kept: Vec<(usize, usize, &str)> = edits
-            .iter()
-            .filter(|e| reverts.keeps(&e.owner_fn))
-            .map(|e| (e.lo, e.hi, e.replacement.as_str()))
-            .collect();
-        if kept.is_empty() {
-            continue;
-        }
-        let mine = splice_kept(source, &mut kept);
-        p.render_compared += 1;
-        match rendered_files.get(key) {
-            Some(theirs) if *theirs == mine => {}
-            Some(_) => {
-                p.render_differing += 1;
-                if p.render_examples.len() < 4 {
-                    p.render_examples
-                        .push(format!("RENDER-GAP {key:?}: reconstruction != render"));
-                }
-            }
-            // `render` skips a file whose surviving edits are empty; this loop
-            // already `continue`d on that, so an absence here is a real
-            // divergence about WHICH files were touched, not a nothing.
-            None => {
-                p.render_absent += 1;
-                if p.render_examples.len() < 4 {
-                    p.render_examples
-                        .push(format!("RENDER-GAP {key:?}: render emitted no file"));
-                }
-            }
-        }
+    // **THE WALK'S OWN VERDICT, projected to the owner half of its key.** A
+    // function lands here only by having been reached and declined at
+    // `rewrite_decl`'s site check — behaviour, not a set membership copied from
+    // the input.
+    let withheld_fns: FxHashSet<LocalDefId> =
+        decls_stats.withheld_ids.iter().map(|(d, _)| *d).collect();
+    // The name→`DefId` bridge, built from the COMPILER rather than from the
+    // oracle parse. A `Vec` per name because `def_path_str` is not injective on
+    // this corpus (295 duplicate `fn` names in brotli alone) and collapsing that
+    // silently is the registered hazard itself.
+    let mut owners_by_name: FxHashMap<String, Vec<LocalDefId>> = FxHashMap::default();
+    for did in tcx.hir_body_owners() {
+        owners_by_name
+            .entry(tcx.def_path_str(did.to_def_id()))
+            .or_default()
+            .push(did);
     }
+    let recon = reconstruct_kept_files(
+        &emission.plan,
+        &emission.texts,
+        &owners_by_name,
+        &withheld_fns,
+    );
+    p.render_plan_files = emission.plan.by_file.len();
+    p.render_expected_empty = recon.expected_empty;
+    p.render_owner_unresolved = recon.owner_unresolved;
+    p.render_owner_split = recon.owner_split;
+    let calib = compare_rendered(&recon.files, &rendered_files);
+    p.render_compared = calib.compared;
+    p.render_differing = calib.differing;
+    p.render_absent = calib.absent;
+    p.render_surplus = calib.surplus;
+    p.render_examples.extend(calib.examples);
 
     // ---- PHASE 4's ledger, on the new layer ----
     p.decided_subjects = table
@@ -2363,6 +2398,33 @@ pub(crate) fn phase3_fn_parity(
     // asks for mismatches as typed rows NAMING the function; a truncated join
     // does not satisfy it.
     p.recon_examples = recon.examples;
+
+    // **THE WITHHELD SIDE, AT IDENTITY LEVEL — round 4's item 2.**
+    //
+    // Codex's round-3 [high], and it is F2's own defect class one round after
+    // repairing F2: `reverted_withheld` is a SCALAR. If two AST declarations
+    // resolve to reverted subject `A` while subject `B` is never reached, the
+    // count still equals the two oracle lines, survivor reconciliation stays
+    // empty and `reverted_placed` stays zero — so *"every reverted subject's
+    // declaration was reached"* was asserted by a check that cannot see it.
+    //
+    // Compared against `reverted_ids` — the TABLE-derived half — while the
+    // retained scalar is compared against the oracle's LINE COUNT. Two sources,
+    // so both lines are kept.
+    let withheld: FxHashSet<(LocalDefId, HirId)> =
+        decls_stats.withheld_ids.iter().copied().collect();
+    p.withheld_ids = withheld.len();
+    p.withheld_dup = decls_stats.withheld_ids.len() - withheld.len();
+    // The third argument is deliberately EMPTY and its output deliberately
+    // unread: `reverted_placed` asks "did the walk place something reverted",
+    // which is the survivor reconciliation's question, not this one. Passing the
+    // reverted set here would make it fire on every row and mean nothing.
+    let wrecon = reconcile_identities(&reverted_ids, &withheld, &FxHashSet::default(), |k| {
+        labels.get(k).cloned().unwrap_or_else(|| format!("{k:?}"))
+    });
+    p.withheld_missing = wrecon.missing;
+    p.withheld_surplus = wrecon.surplus;
+    p.withheld_examples = wrecon.examples;
 
     // **A composition-guard refusal is STOP-class here.** Carried into the
     // result rather than swallowed: this gate is the first place three
@@ -2458,14 +2520,22 @@ pub(crate) fn phase3_fn_parity(
         if arms.len() >= 3 {
             p.arm_set_3 += 1;
         }
-        // Back-to-front, exactly as `apply` does: offsets address the ORIGINAL.
-        mine.sort_by_key(|(lo, ..)| std::cmp::Reverse(*lo));
-        let mut span_text = orig.clone();
-        for (lo, hi, rep, _) in &mine {
-            if *lo <= *hi && *hi <= span_text.len() {
-                span_text.replace_range(*lo..*hi, rep);
-            }
-        }
+        // **THE SAME SPLICE HELPER THE CALIBRATION USES** (round-4 item 1b's
+        // shared-mechanics half). This loop was a second hand-written copy of
+        // `splice_kept`'s body — back-to-front, same bounds guard — so the
+        // calibration was measuring a splice discipline this path only
+        // resembled. One function now, and what remains genuinely uncalibrated
+        // is this path's OFFSET REBASING above (`base + e.lo`, then `lo - flo`),
+        // which is named in the calibration's own comment rather than covered by
+        // an inference from file equality.
+        //
+        // The predicate is deliberately NOT shared — see that comment for why
+        // sharing it would damage phase 3.
+        let mut ranges: Vec<(usize, usize, &str)> = mine
+            .iter()
+            .map(|(lo, hi, rep, _)| (*lo, *hi, *rep))
+            .collect();
+        let span_text = splice_kept(&orig, &mut ranges);
 
         let Some(ast_text) = ast_by_lo.get(&flo) else {
             p.span_only += 1;
@@ -2542,6 +2612,186 @@ pub(crate) fn splice_kept(source: &str, kept: &mut [(usize, usize, &str)]) -> St
         }
     }
     out
+}
+
+/// **THE RECONSTRUCTION'S VERDICT ON ONE EDIT — derived the WALK's way.**
+///
+/// Round 4's item 1. The round-3 calibration asked `reverts.keeps(&e.owner_fn)`
+/// while `render` asked `!reverted.contains(&edit.owner_fn)` — the same set, the
+/// same key, the same strings — so **0-differing was forced before the sweep
+/// ran** and the comparison measured splice mechanics, not the revert decision.
+///
+/// This side asks a different question of a different object: *did the
+/// declaration walk DECLINE this owner at its site?* `withheld` is the walk's
+/// realized behaviour projected onto `LocalDefId`, and `candidates` comes from an
+/// index built off `tcx.hir_body_owners()`. Neither reads `reverts`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg(test)]
+pub(crate) enum OwnerVerdict {
+    Kept,
+    Withheld,
+    /// The name resolved to no local body owner.
+    Unresolved,
+    /// Several body owners share the name and **disagree** about withheld-ness
+    /// — the homonym hazard at the one place it can change a verdict.
+    Split,
+}
+
+#[cfg(test)]
+impl OwnerVerdict {
+    /// **FAIL-OPEN, ON PURPOSE.** An undecidable owner keeps its edit, so the
+    /// disagreement surfaces as a text difference in a GATED counter rather than
+    /// as a quiet exclusion from the denominator. Dropping the edit instead
+    /// would shrink the comparison exactly where it is least trustworthy, which
+    /// is the shape this milestone keeps repairing.
+    pub(crate) fn keeps_edit(self) -> bool {
+        !matches!(self, OwnerVerdict::Withheld)
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn owner_verdict<D: Eq + std::hash::Hash>(
+    candidates: Option<&[D]>,
+    withheld: &FxHashSet<D>,
+) -> OwnerVerdict {
+    let Some(cands) = candidates.filter(|c| !c.is_empty()) else {
+        return OwnerVerdict::Unresolved;
+    };
+    match cands.iter().filter(|d| withheld.contains(*d)).count() {
+        0 => OwnerVerdict::Kept,
+        n if n == cands.len() => OwnerVerdict::Withheld,
+        _ => OwnerVerdict::Split,
+    }
+}
+
+/// The reconstruction's output, and the classes it could not decide.
+#[derive(Default, Debug)]
+#[cfg(test)]
+pub(crate) struct Reconstruction {
+    pub files: std::collections::BTreeMap<super::plan::FileKey, String>,
+    pub expected_empty: usize,
+    pub owner_unresolved: usize,
+    pub owner_split: usize,
+}
+
+/// **THE RECONSTRUCTION — and its SIGNATURE is the guard.**
+///
+/// Round 4 de-tautologized the calibration, and the natural way to undo that is
+/// a one-token edit: swap the verdict for `reverts.keeps(&e.owner_fn)` and the
+/// two sides consume one predicate again. **No corpus number can catch that** —
+/// a tautology's whole property is that it still reads 0 — and a unit test that
+/// reassembles the loop from its pieces would not catch it either.
+///
+/// So the loop lives here, where **there is no `RevertSet` to reach for**. It
+/// takes the plan, the texts, a name→owner index and the walk's withheld set,
+/// and nothing else. Re-introducing the tautology now requires threading a new
+/// parameter through this signature, which is a visible structural act rather
+/// than a silent one — and the negative control below drives THIS function
+/// rather than a copy of it.
+#[cfg(test)]
+pub(crate) fn reconstruct_kept_files<D: Eq + std::hash::Hash>(
+    planned: &super::plan::Plan,
+    texts: &std::collections::BTreeMap<super::plan::FileKey, String>,
+    owners_by_name: &FxHashMap<String, Vec<D>>,
+    withheld: &FxHashSet<D>,
+) -> Reconstruction {
+    let mut r = Reconstruction::default();
+    for (key, edits) in &planned.by_file {
+        let mut kept: Vec<(usize, usize, &str)> = Vec::new();
+        for e in edits {
+            let verdict = owner_verdict(owners_by_name.get(&e.owner_fn).map(|v| &v[..]), withheld);
+            match verdict {
+                OwnerVerdict::Unresolved => r.owner_unresolved += 1,
+                OwnerVerdict::Split => r.owner_split += 1,
+                OwnerVerdict::Kept | OwnerVerdict::Withheld => {}
+            }
+            if verdict.keeps_edit() {
+                kept.push((e.lo, e.hi, e.replacement.as_str()));
+            }
+        }
+        if kept.is_empty() {
+            // **REPORTED, not `continue`d in silence.** `render` skips such a
+            // file too, so the two agree by both emitting nothing — and the
+            // agreement is only meaningful because `surplus` checks that
+            // `render` really did skip it.
+            r.expected_empty += 1;
+            continue;
+        }
+        // `emit_files` errors out if any planned file lacks text, so a miss here
+        // is unrepresentable rather than merely unlikely — and if it ever became
+        // representable, the file would land in NO population and the gated
+        // conservation identity would fail rather than absorb it. That is
+        // deliberate: a silent `continue` into no bucket is the exact shape
+        // round 3's comparison used to exclude the fully-reverted programs.
+        let Some(source) = texts.get(key) else {
+            continue;
+        };
+        r.files.insert(key.clone(), splice_kept(source, &mut kept));
+    }
+    r
+}
+
+/// The symmetric file comparison — **over the UNION of keys**.
+///
+/// Round-3's loop iterated the reconstruction's keys and `continue`d on an empty
+/// surviving set, so a `render` that emitted a file it should not have
+/// incremented nothing, and the fully-reverted programs — the population where a
+/// revert defect actually shows — were excluded from the denominator by
+/// construction. Codex's [high], and it is the half that makes the number mean
+/// something.
+#[derive(Default, Debug)]
+#[cfg(test)]
+pub(crate) struct RenderCalibration {
+    pub compared: usize,
+    pub differing: usize,
+    /// Reconstructed, not emitted by `render`.
+    pub absent: usize,
+    /// Emitted by `render`, and the reconstruction says fully reverted.
+    pub surplus: usize,
+    pub examples: Vec<String>,
+}
+
+#[cfg(test)]
+pub(crate) fn compare_rendered<K: Ord + std::fmt::Debug>(
+    recon: &std::collections::BTreeMap<K, String>,
+    rendered: &std::collections::BTreeMap<K, String>,
+) -> RenderCalibration {
+    let mut c = RenderCalibration::default();
+    let mut push = |c: &mut RenderCalibration, row: String| {
+        if c.examples.len() < 4 {
+            c.examples.push(row);
+        }
+    };
+    for (key, mine) in recon {
+        match rendered.get(key) {
+            Some(theirs) if theirs == mine => c.compared += 1,
+            Some(_) => {
+                c.compared += 1;
+                c.differing += 1;
+                push(
+                    &mut c,
+                    format!("RENDER-GAP {key:?}: reconstruction != render"),
+                );
+            }
+            None => {
+                c.absent += 1;
+                push(
+                    &mut c,
+                    format!("RENDER-GAP {key:?}: render emitted no file"),
+                );
+            }
+        }
+    }
+    for key in rendered.keys() {
+        if !recon.contains_key(key) {
+            c.surplus += 1;
+            push(
+                &mut c,
+                format!("RENDER-GAP {key:?}: render emitted a FULLY REVERTED file"),
+            );
+        }
+    }
+    c
 }
 
 /// **A MAP INSERT THAT COUNTS ITS OWN COLLISIONS — one mechanism, one witness.**
@@ -2732,7 +2982,24 @@ pub(crate) struct FnParity {
     /// reached and DECLINED because their owner is reverted. Non-zero is the
     /// evidence that `recon_reverted_placed`'s zero is a measurement rather
     /// than a construction — a zero here would mean the check never ran.
+    ///
+    /// Retained against `p3_reverted_subjects`, the oracle's **line count** —
+    /// a different source from the table-derived `reverted_ids` the identity
+    /// reconciliation below uses. The COVERAGE CLAIM lives there, not here.
     pub reverted_withheld: usize,
+    /// Distinct identities the site check declined.
+    pub withheld_ids: usize,
+    /// One identity declined more than once. Half of the compensating pair a
+    /// scalar cannot see; [`Self::withheld_missing`] is the other half.
+    pub withheld_dup: usize,
+    /// A reverted subject the walk NEVER REACHED. This is the number
+    /// *"every reverted subject's declaration was reached"* actually needs.
+    pub withheld_missing: usize,
+    /// Something declined that the revert set did not take back.
+    pub withheld_surplus: usize,
+    /// The withheld reconciliation's rows, on their **own** channel — the
+    /// two-instruments-one-channel defect this file has now repaired twice.
+    pub withheld_examples: Vec<String>,
     /// The reconciliation's class-tagged rows, on their OWN channel — see the
     /// note at the assignment site for the two faults that kept them out of
     /// [`Self::examples`].
@@ -2778,6 +3045,29 @@ pub(crate) struct FnParity {
     pub render_differing: usize,
     /// Files this gate reconstructed that `render` did not emit at all.
     pub render_absent: usize,
+    /// **Files `render` emitted that the reconstruction says are FULLY
+    /// REVERTED.** Round 4, and the direction the round-3 comparison could not
+    /// see: it iterated the reconstruction's keys and skipped empty ones, so a
+    /// `render` that emitted a fully-reverted file incremented nothing — and
+    /// the 5 programs excluded from the round-3 denominator were exactly the
+    /// fully-reverted ones, i.e. precisely where a revert defect would show.
+    pub render_surplus: usize,
+    /// Planned files whose surviving-edit set is empty on the reconstruction's
+    /// derivation. The fully-reverted population, as a reported number rather
+    /// than a silent `continue`.
+    pub render_expected_empty: usize,
+    /// `|plan.by_file|` — the conservation denominator, so every planned file
+    /// accounts for itself as compared, absent or expected-empty.
+    pub render_plan_files: usize,
+    /// An edit whose `owner_fn` resolved to NO local body owner. Structurally
+    /// zero; **fail-open** (the edit is kept), so it surfaces as a text
+    /// difference rather than a quiet exclusion.
+    pub render_owner_unresolved: usize,
+    /// An edit whose `owner_fn` resolved to several body owners that DISAGREE
+    /// about withheld-ness — the registered homonym hazard, at the one place it
+    /// could change a verdict. Entailed zero while the injectivity gate holds;
+    /// fail-open for the same reason as above.
+    pub render_owner_split: usize,
     /// **`render`'s own rollbacks** — an edit it could not place coherently.
     /// The one production-coherence signal this gate has, and it was being
     /// dropped on the floor.
@@ -3701,6 +3991,306 @@ mod arm2_witnesses {
                 "`placed_dup` is exactly this difference, and a set absorbs the \
                  second placement in silence — which is why the walk hands over \
                  a Vec and not a set"
+            );
+        });
+    }
+
+    /// **THE CALIBRATION'S NEGATIVE CONTROL — an injected ONE-SIDED revert
+    /// divergence must FAIL. Round 4's acceptance.**
+    ///
+    /// This test is unconstructible against the round-3 calibration, and that is
+    /// the whole distance the item travels: there was only ONE side to inject
+    /// into. The reconstruction asked `reverts.keeps(&e.owner_fn)` while
+    /// `render` asked `!reverted.contains(&edit.owner_fn)` — one set, one key,
+    /// one vocabulary — so 0-differing was forced before the sweep ran.
+    ///
+    /// The two sides here derive the revert decision by different routes:
+    /// `render` from a set of NAMES, the reconstruction from the set of
+    /// `LocalDefId`s the declaration walk DECLINED. Point them at different
+    /// functions and the texts must disagree.
+    ///
+    /// Pure: `render` needs no `TyCtxt`, only a plan, its texts, and a name set.
+    ///
+    /// *Mutation-tested:* M18 (reconstruction filters by the name set instead —
+    /// the round-3 tautology restored) makes the NEGATIVE half report 0
+    /// differing, i.e. green when it must be red.
+    #[test]
+    fn a_one_sided_revert_divergence_fails_the_calibration() {
+        use super::super::plan;
+        // Two edits in one file, owned by two different functions. The
+        // replacement texts differ so a wrongly-kept edit cannot coincide with
+        // a rightly-kept one.
+        let key = plan::FileKey::Virtual("main.rs".to_owned());
+        let source = "AA BB".to_owned();
+        let edit = |lo: usize, hi: usize, rep: &str, owner: &str| plan::Edit {
+            lo,
+            hi,
+            replacement: rep.to_owned(),
+            justification: plan::Justification::KindDecision { kind: "Ref" },
+            owner_fn: owner.to_owned(),
+        };
+        let mut planned = plan::Plan::default();
+        planned.by_file.insert(
+            key.clone(),
+            vec![edit(0, 2, "aa", "a"), edit(3, 5, "bb", "b")],
+        );
+        let mut texts = std::collections::BTreeMap::new();
+        texts.insert(key.clone(), source.clone());
+
+        // The reconstruction's vocabulary: two distinct owner ids behind the
+        // two names. `u32` stands in for `LocalDefId` — `owner_verdict` is
+        // generic precisely so its failure modes need no compiler session.
+        let by_name: FxHashMap<String, Vec<u32>> =
+            [("a".to_owned(), vec![1u32]), ("b".to_owned(), vec![2u32])]
+                .into_iter()
+                .collect();
+        // **THE PRODUCTION FUNCTION, not a copy of it.** A control that
+        // reassembles the loop from its pieces witnesses the pieces and leaves
+        // the assembly — which is where round 3's defect actually lived —
+        // untested.
+        let reconstruct = |withheld: &FxHashSet<u32>| {
+            reconstruct_kept_files(&planned, &texts, &by_name, withheld).files
+        };
+
+        // ---- POSITIVE: the two sides name the SAME function ----
+        let reverted: std::collections::BTreeSet<String> = ["b".to_owned()].into_iter().collect();
+        let (rendered, rollbacks) = super::super::render(&planned, &texts, &reverted);
+        assert!(rollbacks.is_empty(), "the fixture places cleanly");
+        let agree = compare_rendered(&reconstruct(&[2u32].into_iter().collect()), &rendered);
+        assert_eq!(
+            (agree.compared, agree.differing, agree.absent, agree.surplus),
+            (1, 0, 0, 0),
+            "agreement about the revert decision must compare EQUAL — without \
+             this half a calibration that always differed would pass"
+        );
+
+        // ---- NEGATIVE: one side withholds `a`, the other reverts `b` ----
+        let split = compare_rendered(&reconstruct(&[1u32].into_iter().collect()), &rendered);
+        assert_eq!(
+            (split.compared, split.differing),
+            (1, 1),
+            "a ONE-SIDED revert divergence must FAIL the calibration — this is \
+             the assertion the round-3 derivation could not host"
+        );
+
+        // ---- SURPLUS: `render` emits a file the reconstruction calls fully
+        // reverted. Round 3 counted this as nothing, and the 5 programs it
+        // excluded from the denominator were exactly the fully-reverted ones.
+        let none_reverted: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        let (all_rendered, _) = super::super::render(&planned, &texts, &none_reverted);
+        let both_withheld = reconstruct_kept_files(
+            &planned,
+            &texts,
+            &by_name,
+            &[1u32, 2u32].into_iter().collect(),
+        );
+        assert_eq!(
+            (
+                both_withheld.expected_empty,
+                both_withheld.owner_unresolved,
+                both_withheld.owner_split
+            ),
+            (1, 0, 0),
+            "a file whose every edit is withheld must be COUNTED expected-empty, \
+             not dropped out of every population — the conservation identity's \
+             left-hand term"
+        );
+        let surplus = compare_rendered(&both_withheld.files, &all_rendered);
+        assert_eq!(
+            (surplus.compared, surplus.absent, surplus.surplus),
+            (0, 0, 1),
+            "a fully-reverted file that `render` emitted anyway must be COUNTED"
+        );
+        assert!(
+            surplus
+                .examples
+                .iter()
+                .any(|e| e.contains("FULLY REVERTED")),
+            "and named: {:?}",
+            surplus.examples
+        );
+
+        // ---- ABSENT: the reconstruction keeps edits, `render` emits nothing ----
+        let absent = compare_rendered(
+            &reconstruct(&FxHashSet::default()),
+            &std::collections::BTreeMap::new(),
+        );
+        assert_eq!(
+            (absent.compared, absent.absent, absent.surplus),
+            (0, 1, 0),
+            "the other direction is its own class, not folded into `differing`"
+        );
+    }
+
+    /// **THE FAIL-OPEN ARM, WITNESSED.** An undecidable owner keeps its edit, so
+    /// the disagreement lands in a GATED counter instead of quietly shrinking
+    /// the denominator — which is the shape round 3's comparison had.
+    ///
+    /// *Mutation-tested:* M20 (fold `Split` into the dropped arm) flips the
+    /// third assertion.
+    #[test]
+    fn an_undecidable_owner_keeps_its_edit_and_names_itself() {
+        let withheld: FxHashSet<u32> = [1u32].into_iter().collect();
+        assert_eq!(
+            owner_verdict(None, &withheld),
+            OwnerVerdict::Unresolved,
+            "a name resolving to nothing is its own class, not `Kept`"
+        );
+        assert_eq!(
+            owner_verdict(Some(&[][..]), &withheld),
+            OwnerVerdict::Unresolved,
+            "an EMPTY candidate list is the same absence — a `Some(&[])` that \
+             read as `Kept` would be an unresolved owner wearing a verdict"
+        );
+        assert_eq!(
+            owner_verdict(Some(&[1u32][..]), &withheld),
+            OwnerVerdict::Withheld
+        );
+        assert_eq!(
+            owner_verdict(Some(&[2u32][..]), &withheld),
+            OwnerVerdict::Kept
+        );
+        assert_eq!(
+            owner_verdict(Some(&[1u32, 2u32][..]), &withheld),
+            OwnerVerdict::Split,
+            "homonyms that DISAGREE are the hazard; homonyms that agree are not"
+        );
+        assert_eq!(
+            owner_verdict(Some(&[1u32, 1u32][..]), &withheld),
+            OwnerVerdict::Withheld,
+            "...and agreeing homonyms must NOT read as a split"
+        );
+        for v in [
+            OwnerVerdict::Kept,
+            OwnerVerdict::Unresolved,
+            OwnerVerdict::Split,
+        ] {
+            assert!(
+                v.keeps_edit(),
+                "{v:?} must FAIL OPEN into the gated counter"
+            );
+        }
+        assert!(!OwnerVerdict::Withheld.keeps_edit());
+    }
+
+    /// **WITHHELD AT IDENTITY LEVEL — round 4's item 2, and its ruled negative
+    /// control: `A` withheld twice, `B` absent.**
+    ///
+    /// Codex's round-3 [high], which is F2's own defect class one round after
+    /// F2 was repaired: `reverted_withheld` is a SCALAR, so two declarations
+    /// resolving to reverted subject `A` while `B` is never reached leaves the
+    /// count equal to the two oracle lines and every downstream line green. The
+    /// coverage claim needs the SET.
+    ///
+    /// Both halves are exercised on ONE fixture, because they are one scenario:
+    /// the walk produces the duplicate, and the reconciliation produces the
+    /// absence.
+    ///
+    /// *Mutation-tested:* M16 (drop the `withheld_ids` push) collapses the
+    /// walk half to `(0, 0)`; M17 (reconcile against `survivors` rather than
+    /// `reverted_ids`) inverts missing and surplus.
+    #[test]
+    fn withheld_identities_are_reconciled_not_counted() {
+        rustc_span::create_default_session_globals_then(|| {
+            let mut krate =
+                ::utils::ast::parse_crate("fn f(p: *mut u32, q: *mut u32) {}".to_owned());
+            // The file's fixture rule: a witness needing two DISTINCT nodes
+            // supplies its own ids, because `parse_crate` leaves every node at
+            // `DUMMY_NODE_ID`.
+            let (item_id, pat_a, pat_b) = {
+                let item = &mut krate.items[0];
+                item.id = rustc_ast::node_id::NodeId::from_u32(910);
+                let rustc_ast::ItemKind::Fn(f) = &mut item.kind else { panic!("fixture is a fn") };
+                f.sig.decl.inputs[0].pat.id = rustc_ast::node_id::NodeId::from_u32(911);
+                f.sig.decl.inputs[0].ty.id = rustc_ast::node_id::NodeId::from_u32(912);
+                f.sig.decl.inputs[1].pat.id = rustc_ast::node_id::NodeId::from_u32(913);
+                f.sig.decl.inputs[1].ty.id = rustc_ast::node_id::NodeId::from_u32(914);
+                (
+                    item.id,
+                    f.sig.decl.inputs[0].pat.id,
+                    f.sig.decl.inputs[1].pat.id,
+                )
+            };
+            assert_ne!(pat_a, pat_b, "the fixture must supply DISTINCT ids");
+            let mut local_map = rustc_ast::node_id::NodeMap::default();
+            // BOTH bindings resolve to ONE `HirId` — subject `A`, declined
+            // twice. This is the compensating half the scalar cannot see.
+            local_map.insert(pat_a, rustc_hir::CRATE_HIR_ID);
+            local_map.insert(pat_b, rustc_hir::CRATE_HIR_ID);
+            let mut global_map = rustc_ast::node_id::NodeMap::default();
+            global_map.insert(item_id, rustc_hir::def_id::CRATE_DEF_ID);
+            let a = (rustc_hir::def_id::CRATE_DEF_ID, rustc_hir::CRATE_HIR_ID);
+            let mut decisions = FxHashMap::default();
+            decisions.insert(a, (DeclForm::Ref, true));
+            let subject_hirs: FxHashSet<HirId> = FxHashSet::default();
+            let reverted: FxHashSet<LocalDefId> =
+                [rustc_hir::def_id::CRATE_DEF_ID].into_iter().collect();
+            let mut guard = Composition::default();
+            let mut v = RefDeclVisitor {
+                local_map: &local_map,
+                decisions: &decisions,
+                global_map: &global_map,
+                reverted_fns: &reverted,
+                subject_hirs: &subject_hirs,
+                current_fn: None,
+                guard: &mut guard,
+                stats: RefDeclStats::default(),
+            };
+            v.visit_crate(&mut krate);
+            let stats = v.stats;
+
+            let distinct: FxHashSet<(LocalDefId, HirId)> =
+                stats.withheld_ids.iter().copied().collect();
+            assert_eq!(
+                (
+                    stats.reverted_withheld,
+                    stats.withheld_ids.len(),
+                    distinct.len()
+                ),
+                (2, 2, 1),
+                "TWO declines under ONE identity: the scalar reads 2 and the SET \
+                 reads 1, which is the whole gap this item closes"
+            );
+
+            // ---- the reconciliation half: `B` was owed and never reached ----
+            //
+            // `B` is a second reverted subject in the same function. The scalar
+            // 2 matches the two oracle lines exactly, so nothing count-based
+            // can tell this apart from full coverage.
+            let b = (
+                rustc_hir::def_id::CRATE_DEF_ID,
+                rustc_hir::HirId {
+                    owner: rustc_hir::CRATE_HIR_ID.owner,
+                    local_id: rustc_hir::hir_id::ItemLocalId::from_u32(7),
+                },
+            );
+            assert_ne!(a, b, "the two owed subjects must be distinct identities");
+            let reverted_ids: FxHashSet<(LocalDefId, HirId)> = [a, b].into_iter().collect();
+            let r = reconcile_identities(&reverted_ids, &distinct, &FxHashSet::default(), |k| {
+                format!("{k:?}")
+            });
+            assert_eq!(
+                (r.missing, r.surplus),
+                (1, 0),
+                "`B` is MISSING — reached by nothing, owed by the revert set — \
+                 while the scalar 2 == 2 says the coverage is complete"
+            );
+            assert!(
+                r.examples.iter().any(|e| e.starts_with("MISSING:")),
+                "and the row must NAME it: {:?}",
+                r.examples
+            );
+
+            // The positive half, so a reconciliation that reported MISSING for
+            // everything would fail here rather than pass as vigilance.
+            let only_a: FxHashSet<(LocalDefId, HirId)> = [a].into_iter().collect();
+            let ok = reconcile_identities(&only_a, &distinct, &FxHashSet::default(), |k| {
+                format!("{k:?}")
+            });
+            assert_eq!(
+                (ok.missing, ok.surplus),
+                (0, 0),
+                "full coverage must reconcile CLEAN"
             );
         });
     }
