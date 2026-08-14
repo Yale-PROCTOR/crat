@@ -1845,6 +1845,54 @@ impl RevertSet {
     }
 }
 
+/// **IS THE REVERT RESOLUTION A FUNCTION? (round-3 item 7.)**
+///
+/// `def_path_str` is **not injective on this corpus** — the project's own record
+/// measures **295 duplicate `fn` names in brotli alone** — so a revert line
+/// naming a homonym matched EVERY function of that name and over-reverted them
+/// all, **silently**: the old `seen.len() == wanted.len()` check passed because
+/// `seen` is keyed by NAME while the resolved set collects `LocalDefId`s.
+///
+/// Over-reverting is invisible to the differential for the usual reason — both
+/// sides consume this one set — and was caught only downstream by
+/// `decided == emitted + reverted`, which compares a `DefId`-keyed set against
+/// the oracle's LINE COUNT. That is a coincidence of two representations, not a
+/// check, and it stops holding the moment that ledger line is relaxed.
+///
+/// **Minimal form, per the charter**: assert the relation is a function and a
+/// total one, and name the offenders. A `DefId`-carrying revert format is the
+/// real fix and is **registered, not built** in this round.
+///
+/// Pure over the counts so it has a witness — `oracle_reverts` itself needs a
+/// `TyCtxt` and is corpus-only.
+#[cfg(test)]
+pub(crate) fn revert_resolution_failure(
+    by_name: &[(String, usize)],
+    wanted: usize,
+    resolved: usize,
+    origin: &str,
+) -> Option<String> {
+    let mut homonyms: Vec<&(String, usize)> = by_name.iter().filter(|(_, n)| *n > 1).collect();
+    if !homonyms.is_empty() {
+        homonyms.sort();
+        return Some(format!(
+            "{} reverted owner name(s) in {origin:?} resolve to MORE THAN ONE \
+             local function — `def_path_str` is not injective on this corpus \
+             (295 duplicate fn names in brotli alone), so each over-reverts \
+             every homonym silently: {:?}",
+            homonyms.len(),
+            homonyms.iter().take(5).collect::<Vec<_>>()
+        ));
+    }
+    if resolved != wanted {
+        return Some(format!(
+            "resolved {resolved} LocalDefId(s) for {wanted} reverted owner \
+             name(s) in {origin:?} — the revert resolution must be one-to-one"
+        ));
+    }
+    None
+}
+
 /// **TAKES THE VERIFIED BYTES, NOT A PATH — the check-to-use closure.**
 ///
 /// This read the file itself, from a path the parent had hashed *earlier*. The
@@ -1914,26 +1962,9 @@ pub(crate) fn oracle_reverts(
             seen.insert(p);
         }
     }
-    let mut homonyms: Vec<(&String, &usize)> = by_name.iter().filter(|(_, n)| **n > 1).collect();
-    if !homonyms.is_empty() {
-        homonyms.sort();
-        return Err(format!(
-            "{} reverted owner name(s) in {path:?} resolve to MORE THAN ONE \
-             local function — `def_path_str` is not injective on this corpus \
-             (295 duplicate fn names in brotli alone), so each of these \
-             over-reverts every homonym silently: {:?}",
-            homonyms.len(),
-            homonyms.iter().take(5).collect::<Vec<_>>()
-        ));
-    }
-    // ...and the resolution is TOTAL: one `LocalDefId` per named owner.
-    if out.len() != wanted.len() {
-        return Err(format!(
-            "resolved {} LocalDefId(s) for {} reverted owner name(s) in \
-             {path:?} — the revert resolution must be one-to-one",
-            out.len(),
-            wanted.len()
-        ));
+    let counts: Vec<(String, usize)> = by_name.into_iter().collect();
+    if let Some(why) = revert_resolution_failure(&counts, wanted.len(), out.len(), path) {
+        return Err(why);
     }
     if seen.len() != wanted.len() {
         let missing: Vec<&&str> = wanted
@@ -3378,6 +3409,44 @@ mod arm2_witnesses {
             assert_eq!(stats.rewritten, 0, "and must not be transformed");
             assert!(stats.placed_ids.is_empty(), "and places no identity");
         });
+    }
+
+    /// **THE HOMONYM GATE — the registered hazard, fail-closed and witnessed.**
+    ///
+    /// `def_path_str` is not injective on this corpus (295 duplicate `fn` names
+    /// in brotli alone), and the old check compared a NAME-keyed set against the
+    /// wanted names, so one line naming a homonym over-reverted every match
+    /// while every count still agreed.
+    ///
+    /// *Mutation-tested (M15):* widening the `n > 1` filter leaves the homonym
+    /// undetected and fails the first assertion.
+    #[test]
+    fn revert_resolution_must_be_one_to_one() {
+        // The conforming shape: every name resolves to exactly one function.
+        let ok = [("a::f".to_owned(), 1usize), ("a::g".to_owned(), 1)];
+        assert!(
+            revert_resolution_failure(&ok, 2, 2, "x.reverts.txt").is_none(),
+            "an injective resolution passes"
+        );
+
+        // **THE HOMONYM.** One name, two functions — and note the counts the
+        // OLD check looked at still agree: 2 names wanted, 2 names seen. Only
+        // the resolved-id count betrays it, which is why this takes both.
+        let dup = [("a::f".to_owned(), 2usize), ("a::g".to_owned(), 1)];
+        let why =
+            revert_resolution_failure(&dup, 2, 3, "x.reverts.txt").expect("a homonym must fail");
+        assert!(
+            why.contains("MORE THAN ONE") && why.contains("a::f"),
+            "and must NAME the offender: {why}"
+        );
+
+        // Under-resolution is the other direction and must not be silent.
+        let short = [("a::f".to_owned(), 1usize)];
+        assert!(
+            revert_resolution_failure(&short, 2, 1, "x.reverts.txt")
+                .expect("under-resolution must fail")
+                .contains("one-to-one"),
+        );
     }
 
     /// **THE COLLISION-COUNTING INSERT, witnessed at the PRODUCER.**
