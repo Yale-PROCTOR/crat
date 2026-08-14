@@ -1274,6 +1274,7 @@ fn transform_inner(
         SeamGraftStats,
         usize,
         usize,
+        usize,
         SeamUseSurface,
     ),
     String,
@@ -1289,6 +1290,7 @@ fn transform_inner(
     let mut decisions: FxHashMap<(LocalDefId, HirId), (DeclForm, bool)> = FxHashMap::default();
     let mut uses: FxHashMap<(u32, u32), String> = FxHashMap::default();
     let mut use_key_collisions = 0usize;
+    let mut decision_key_collisions = 0usize;
     for (subject, decision) in &table.entries {
         // EXHAUSTIVE — the denylist rejects the bypass shape, and the arm's
         // population is defined by which disposition was reached.
@@ -1304,7 +1306,17 @@ fn transform_inner(
             } => (DeclForm::Opt { slice: *slice }, *mutable, Some(uses)),
             super::decision::Decision::Degraded(_) => continue,
         };
-        decisions.insert((subject.fn_did, subject.hir_id), (form, mutable));
+        // **ITEM 7 — the registered finding, repaired.** This join fed
+        // `arms_full` and the RECON gate with no collision counter while its
+        // `uses` and `seams` siblings both had one. Fixing the instance in
+        // `phase3_fn_parity` and leaving the class here is the pattern the
+        // phase-4 boundary was about.
+        insert_counting(
+            &mut decisions,
+            (subject.fn_did, subject.hir_id),
+            (form, mutable),
+            &mut decision_key_collisions,
+        );
         for u in use_edits.into_iter().flatten() {
             // A returned `Some` means two use edits carried the SAME span and
             // one was overwritten — the map would then hold fewer edits than
@@ -1312,12 +1324,12 @@ fn transform_inner(
             // itself while being short. `refuse_nested_use_edits` should make
             // this impossible (identical spans contain each other), but that is
             // an argument about another module, and this is a counter.
-            if uses
-                .insert((u.span.lo().0, u.span.hi().0), u.replacement.clone())
-                .is_some()
-            {
-                use_key_collisions += 1;
-            }
+            insert_counting(
+                &mut uses,
+                (u.span.lo().0, u.span.hi().0),
+                u.replacement.clone(),
+                &mut use_key_collisions,
+            );
         }
     }
 
@@ -1356,12 +1368,12 @@ fn transform_inner(
     for edit in &table.seams.edits {
         // Same reasoning as `use_key_collisions`: a map is a join, and a join
         // without a collision counter agrees with itself while being short.
-        if seam_targets
-            .insert((edit.span.lo().0, edit.span.hi().0), SeamTarget::of(edit))
-            .is_some()
-        {
-            seam_key_collisions += 1;
-        }
+        insert_counting(
+            &mut seam_targets,
+            (edit.span.lo().0, edit.span.hi().0),
+            SeamTarget::of(edit),
+            &mut seam_key_collisions,
+        );
     }
     let mut s = SeamGraftVisitor::new(&seam_targets, &mut guard);
     s.visit_crate(&mut krate);
@@ -1438,6 +1450,7 @@ fn transform_inner(
         seams,
         decl_inside_use,
         use_key_collisions,
+        decision_key_collisions,
         SeamUseSurface {
             pairs: seam_pairs,
             programs_compared: usize::from(seam_pairs > 0),
@@ -1536,6 +1549,11 @@ pub(crate) struct TextDiff {
     /// the map was built. Corpus expectation 0, GATED — the collision counter
     /// this join was missing while every other join in the file had one.
     pub use_key_collisions: usize,
+    /// **Two table entries sharing one `(fn_did, hir_id)`** in the DECLARATION
+    /// join — the counter this file's other two joins had since arm 2 and this
+    /// one did not. Registered as a finding at the phase-4 boundary and repaired
+    /// here; corpus expectation 0, GATED.
+    pub decision_key_collisions: usize,
     /// **A declaration render whose offset lies strictly inside a use edit's
     /// range** — the containment case the two-pass split does not remove.
     /// Corpus expectation 0, GATED. See `transform_inner`'s doc.
@@ -2024,12 +2042,12 @@ pub(crate) fn phase3_fn_parity(
         // 1,120, and a nonzero is a genuine FINDING (two subjects sharing one
         // `(fn_did, hir_id)` — plausible where MIR splits one HIR binding into
         // several locals), not a regression of this change.
-        if decisions
-            .insert((subject.fn_did, subject.hir_id), (form, mutable))
-            .is_some()
-        {
-            p.decision_key_collisions += 1;
-        }
+        insert_counting(
+            &mut decisions,
+            (subject.fn_did, subject.hir_id),
+            (form, mutable),
+            &mut p.decision_key_collisions,
+        );
         // The use edits stay filtered: arm 2's use grafts have no site check,
         // so handing the walk a reverted subject's uses WOULD change the
         // emitted AST. Only the declaration pass gained a site check, and only
@@ -2038,12 +2056,12 @@ pub(crate) fn phase3_fn_parity(
             continue;
         }
         for u in use_edits.into_iter().flatten() {
-            if uses
-                .insert((u.span.lo().0, u.span.hi().0), u.replacement.clone())
-                .is_some()
-            {
-                p.use_key_collisions += 1;
-            }
+            insert_counting(
+                &mut uses,
+                (u.span.lo().0, u.span.hi().0),
+                u.replacement.clone(),
+                &mut p.use_key_collisions,
+            );
         }
     }
     p.use_targets = uses.len();
@@ -2074,12 +2092,12 @@ pub(crate) fn phase3_fn_parity(
         if !reverts.keeps(&edit.owner_fn) {
             continue;
         }
-        if seam_targets
-            .insert((edit.span.lo().0, edit.span.hi().0), SeamTarget::of(edit))
-            .is_some()
-        {
-            p.seam_key_collisions += 1;
-        }
+        insert_counting(
+            &mut seam_targets,
+            (edit.span.lo().0, edit.span.hi().0),
+            SeamTarget::of(edit),
+            &mut p.seam_key_collisions,
+        );
     }
     p.seam_targets = seam_targets.len();
     let mut s = SeamGraftVisitor::new(&seam_targets, &mut guard);
@@ -2087,14 +2105,56 @@ pub(crate) fn phase3_fn_parity(
     // **THE STATS ARE READ.** `let _ = s.finish();` discarded every one of them
     // — F1's finding, and the one place in this gate where the seam layer's
     // behaviour under a real revert set could be observed at all.
-    let seam_stats = s.finish();
-    p.seam_grafted = seam_stats.grafted;
-    p.seam_unmatched = seam_stats.unmatched;
-    p.seam_multi_matched = seam_stats.multi_matched;
-    p.seam_unsupported = seam_stats.unsupported;
-    p.seam_arg_not_found = seam_stats.arg_not_found;
-    p.seam_len_absent = seam_stats.len_absent;
-    p.seam_len_parse_failed = seam_stats.len_parse_failed;
+    // **And the read is EXHAUSTIVE.** Destructured field-by-field rather than
+    // accessed, because that is the structural fix for F1's *class* rather than
+    // its instance: **a new counter added to [`SeamGraftStats`] breaks this
+    // line's compilation** until someone decides whether the gate reads it. A
+    // `.field` access would ignore it in silence, which is exactly how eight
+    // typed counters came to be written and never consumed.
+    //
+    // ⚠ Corrects my own first instinct, recorded because it was wrong: an
+    // exhaustive destructure of `FnParity` would NOT have caught F1. F1's shape
+    // is upstream — the stats were dropped before anything reached `FnParity`.
+    // The consumption site is where the mechanism belongs.
+    let SeamGraftStats {
+        grafted,
+        unmatched,
+        multi_matched,
+        unsupported,
+        arg_not_found,
+        len_absent,
+        len_parse_failed,
+        // ---- deliberately NOT gated here, each with its reason ----
+        // A family split, not a failure: these partition the placed adapters
+        // and are reported by the recon sweep.
+        safe: _,
+        reborrow: _,
+        // Length bookkeeping whose exhaustive identity is gated in the RECON
+        // sweep, over the full population the revert set does not shrink.
+        len_grafted: _,
+        len_shapes: _,
+        // The offending texts behind `len_parse_failed`, capped for artifacts —
+        // the count is what gates.
+        len_parse_failures: _,
+        // Refusals gate JOINTLY as `p4_refused` across all three passes;
+        // splitting them here would double-count one event.
+        refused: _,
+        // This gate builds its OWN seam map and counts its own collisions into
+        // `p.seam_key_collisions`; the visitor's copy is never populated here.
+        key_collisions: _,
+        // A cast peel is a SHAPE the corpus either has or has not — measured,
+        // not gated, per the arm-3 ruling.
+        arg_peeled: _,
+        // The rendered text is the differential's input, not a failure class.
+        rendered: _,
+    } = s.finish();
+    p.seam_grafted = grafted;
+    p.seam_unmatched = unmatched;
+    p.seam_multi_matched = multi_matched;
+    p.seam_unsupported = unsupported;
+    p.seam_arg_not_found = arg_not_found;
+    p.seam_len_absent = len_absent;
+    p.seam_len_parse_failed = len_parse_failed;
     p.use_parse_failed = grafts_stats.parse_failed;
     p.use_multi_matched = grafts_stats.multi_matched;
     p.unplaceable = emission.unplaceable.len();
@@ -2297,6 +2357,30 @@ pub(crate) fn phase3_fn_parity(
     p.ast_only = ast_touched.difference(&span_touched).count();
     p.span_only += span_touched.difference(&ast_touched).count();
     Ok(p)
+}
+
+/// **A MAP INSERT THAT COUNTS ITS OWN COLLISIONS — one mechanism, one witness.**
+///
+/// Three joins in this file build a lookup map from a table that may contain two
+/// entries for one key, and a silent overwrite makes the map hold fewer edits
+/// than the table does — every downstream count then agrees with itself while
+/// being short. Each join had grown its own hand-written
+/// `if map.insert(..).is_some() { n += 1 }`, and the testing review's finding was
+/// exact: the *gate* was witnessed at the row level and the **producer branch was
+/// not**, in the same change whose own doc says a counter nothing exercises and a
+/// gate over a counter that cannot move are the same failure wearing two hats.
+///
+/// One helper, so the branch has one witness instead of three that never got
+/// written.
+pub(crate) fn insert_counting<K: Eq + std::hash::Hash, V>(
+    map: &mut FxHashMap<K, V>,
+    key: K,
+    value: V,
+    collisions: &mut usize,
+) {
+    if map.insert(key, value).is_some() {
+        *collisions += 1;
+    }
 }
 
 /// **IDENTITY-SET RECONCILIATION — what a count-based ledger cannot do.**
@@ -2567,8 +2651,15 @@ fn canonical_item(text: &str) -> Option<String> {
 pub(crate) fn arms_full(
     tcx: rustc_middle::ty::TyCtxt<'_>,
 ) -> Result<(RefDeclStats, UseGraftStats, SeamGraftStats, TextDiff), String> {
-    let (decls, grafts, seams, decl_inside_use, use_key_collisions, surface) =
-        transform_inner(tcx)?;
+    let (
+        decls,
+        grafts,
+        seams,
+        decl_inside_use,
+        use_key_collisions,
+        decision_key_collisions,
+        surface,
+    ) = transform_inner(tcx)?;
     let (table, _ctx) = super::decide_table_with_ctx(tcx)?;
     let emission = super::emit_files(tcx, &table, &rustc_hash::FxHashSet::default())?;
 
@@ -2666,6 +2757,7 @@ pub(crate) fn arms_full(
 
     d.decl_render_inside_use_edit = decl_inside_use;
     d.use_key_collisions = use_key_collisions;
+    d.decision_key_collisions = decision_key_collisions;
     d.seam_use_surface = surface;
     Ok((decls, grafts, seams, d))
 }
@@ -3225,6 +3317,126 @@ mod arm2_witnesses {
             );
             assert_eq!(stats.rewritten, 0, "and must not be transformed");
             assert!(stats.placed_ids.is_empty(), "and places no identity");
+        });
+    }
+
+    /// **THE COLLISION-COUNTING INSERT, witnessed at the PRODUCER.**
+    ///
+    /// Three joins used to carry a hand-written `insert(..).is_some()` and the
+    /// testing review's finding was exact: the *gate* was witnessed at the row
+    /// level and **the producer branch was not** — in the change whose own doc
+    /// says a counter nothing exercises and a gate over a counter that cannot
+    /// move are the same failure wearing two hats. One helper now, so the branch
+    /// has one witness instead of three that never got written.
+    ///
+    /// *Mutation-tested (M12):* dropping the `.is_some()` guard so the counter
+    /// never increments fails this test.
+    #[test]
+    fn a_colliding_insert_is_counted() {
+        let mut map: FxHashMap<u32, &str> = FxHashMap::default();
+        let mut n = 0usize;
+        insert_counting(&mut map, 1, "a", &mut n);
+        insert_counting(&mut map, 2, "b", &mut n);
+        assert_eq!((map.len(), n), (2, 0), "distinct keys do not collide");
+
+        // The collision: a second entry for a key the map already holds. The
+        // map still reads 2, which is the whole hazard — every downstream count
+        // agrees with itself while being one short.
+        insert_counting(&mut map, 1, "c", &mut n);
+        assert_eq!(
+            (map.len(), n),
+            (2, 1),
+            "an overwrite must be COUNTED — the map's own length cannot show it"
+        );
+        assert_eq!(
+            map.get(&1),
+            Some(&"c"),
+            "and the value is the later one, which is why the earlier edit is \
+             the one that goes missing"
+        );
+    }
+
+    /// **`placed_dup` with a GENUINE duplicate identity.**
+    ///
+    /// The row-level arithmetic was tested; the real subtraction
+    /// (`placed_ids.len() − set.len()`) was not.
+    ///
+    /// ⚠ **AND IT IS NOT SYNTHESIZABLE AT UNIT LEVEL — measured, not assumed.**
+    ///
+    /// Two attempts failed and the probe explains both: `parse_crate` yields an
+    /// **unresolved** crate in which every node carries `DUMMY_NODE_ID`
+    /// (`NodeId(4294967040)`). So two params share one `Ty` id, the composition
+    /// guard refuses the second claim, and the walk places once — and a
+    /// re-parse fares no better, since it reproduces the same ids.
+    ///
+    /// **The guard doing its job is precisely what makes the hazard
+    /// unreachable here.** So this test witnesses what is true — one placement,
+    /// one refusal — and the limit is recorded rather than dressed up: the
+    /// producer path for `placed_dup` has **no unit witness**, and its zero
+    /// rests on the row-level gate plus the corpus run. Its real-world shape,
+    /// two AST bindings resolving to one `HirId`, needs a genuine HIR map.
+    ///
+    /// This also explains a fixture rule for the whole file: any witness
+    /// needing two DISTINCT nodes must supply its own ids or use a fresh guard
+    /// per pass, which is what the sibling `multi_matched` witness does.
+    #[test]
+    fn one_identity_placed_twice_is_a_duplicate_not_a_second_subject() {
+        rustc_span::create_default_session_globals_then(|| {
+            let mut krate =
+                ::utils::ast::parse_crate("fn f(p: *mut u32, q: *mut u32) {}".to_owned());
+            let (item_id, pat_a, pat_b) = {
+                let item = &krate.items[0];
+                let rustc_ast::ItemKind::Fn(f) = &item.kind else { panic!("fixture is a fn") };
+                (
+                    item.id,
+                    f.sig.decl.inputs[0].pat.id,
+                    f.sig.decl.inputs[1].pat.id,
+                )
+            };
+            let mut local_map = rustc_ast::node_id::NodeMap::default();
+            // **BOTH bindings resolve to ONE `HirId`** — the duplicate's source.
+            // Their `Ty` nodes are distinct, so the composition guard admits
+            // both claims and the walk places twice under one identity.
+            local_map.insert(pat_a, rustc_hir::CRATE_HIR_ID);
+            local_map.insert(pat_b, rustc_hir::CRATE_HIR_ID);
+            let mut global_map = rustc_ast::node_id::NodeMap::default();
+            global_map.insert(item_id, rustc_hir::def_id::CRATE_DEF_ID);
+            let mut decisions = FxHashMap::default();
+            decisions.insert(
+                (rustc_hir::def_id::CRATE_DEF_ID, rustc_hir::CRATE_HIR_ID),
+                (DeclForm::Ref, true),
+            );
+            let subject_hirs: FxHashSet<HirId> = FxHashSet::default();
+            let no_reverts: FxHashSet<LocalDefId> = FxHashSet::default();
+            let mut guard = Composition::default();
+            let mut v = RefDeclVisitor {
+                local_map: &local_map,
+                decisions: &decisions,
+                global_map: &global_map,
+                reverted_fns: &no_reverts,
+                subject_hirs: &subject_hirs,
+                current_fn: None,
+                guard: &mut guard,
+                stats: RefDeclStats::default(),
+            };
+            // ONE pass. Both params are subjects under the same key.
+            v.visit_crate(&mut krate);
+            let stats = v.stats;
+
+            let distinct: FxHashSet<(LocalDefId, HirId)> =
+                stats.placed_ids.iter().copied().collect();
+            // **MEASURED, and it is the opposite of what this test set out to
+            // show.** Both pats come back as `NodeId(4294967040)` —
+            // `DUMMY_NODE_ID` — because `parse_crate` produces an UNRESOLVED
+            // crate in which every node carries the placeholder. So the two
+            // `Ty` nodes share an id, the composition guard refuses the second
+            // claim, and the walk places once.
+            assert_eq!(
+                (stats.placed_ids.len(), distinct.len(), stats.refused),
+                (1, 1, 1),
+                "one placement and one REFUSAL — the guard doing its job is \
+                 what makes the duplicate unsynthesizable here"
+            );
         });
     }
 

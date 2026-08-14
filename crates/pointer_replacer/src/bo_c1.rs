@@ -7008,6 +7008,18 @@ mod run {
                 row.set("arm1_rewritten", st.rewritten.to_string());
                 row.set("arm1_not_ptr_decl", st.not_a_pointer_decl.to_string());
                 row.set("arm1_refused", st.refused.to_string());
+                // **ITEM 5 — the orphan class, gated where its population is
+                // LARGEST.** `transform_inner` computed this and `arms_full`
+                // threw it away: a counter nothing reads, in the sweep that
+                // walks the FULL population — F1's own defect, introduced by
+                // the repair for F1 and found by the correctness review.
+                row.set("arm1_orphan_subject", st.orphan_subject.to_string());
+                // **ITEM 7** — the declaration join's collision counter, which
+                // this sweep's map never had.
+                row.set(
+                    "decision_key_collisions",
+                    d.decision_key_collisions.to_string(),
+                );
                 row.set("arm1_compared", d.compared.to_string());
                 row.set("arm1_equal", d.equal.to_string());
                 row.set("arm1_differing", d.differing.to_string());
@@ -10000,6 +10012,15 @@ fn m1_use_census_corpus() {
 const ARM_ZERO_INVARIANTS: &[&str] = &[
     "arm1_not_ptr_decl",
     "arm1_refused",
+    // **Both added at round 2.** `arm1_orphan_subject`'s zero is STRUCTURAL —
+    // `decision/universe.rs` builds the free-fn universe from `free_items()`
+    // only, so no `impl` associated fn is ever a subject and the branch is
+    // corpus-unreachable. It is a PIN, not evidence, and it ships with an
+    // injection witness for exactly that reason. `decision_key_collisions` is a
+    // genuine measurement: the phase-4 gate read 0 over the full 1,120, which
+    // is the same population this sweep walks.
+    "arm1_orphan_subject",
+    "decision_key_collisions",
     "arm1_differing",
     "arm1_unmatched_ast",
     "arm2_use_parse_failed",
@@ -10987,35 +11008,31 @@ fn p3_row_failures(program: &str, row: &report::Row) -> Vec<String> {
     //
     // `p4_survivor_ids != p3_emitted_subjects` is the decision-map key
     // collision, at identity granularity: entries counted vs distinct keys.
-    for key in [
-        "p4_unplaced",
-        "p4_use_unmatched",
-        "p4_refused",
-        "p4_missing",
-        "p4_surplus",
-        "p4_reverted_placed",
-        "p4_placed_dup",
-        "p4_orphan_subject",
+    for key in P4_IDENTITY_ZERO_KEYS.iter().copied().chain(
         // **CHECK 4 — the typed failure classes, from BOTH visitors.** Every
         // one was discarded before this repair; `p4_seam_*` in particular was
         // measured by nothing anywhere under a real revert set.
-        "p4_seam_unmatched",
-        "p4_seam_multi_matched",
-        "p4_seam_unsupported",
-        "p4_seam_arg_not_found",
-        "p4_seam_len_absent",
-        "p4_seam_len_parse_failed",
-        "p4_seam_key_collisions",
-        "p4_use_parse_failed",
-        "p4_use_multi_matched",
-        "p4_use_key_collisions",
-        "p4_decision_key_collisions",
-        // **CHECK 5 — the SPAN layer's own placement loss.** `emitted` here is
-        // decisions-kept while the span layer's subtracts this; they coincide
-        // only while it is zero, so the coincidence is now asserted rather than
-        // relied upon.
-        "p4_unplaceable",
-    ] {
+        [
+            "p4_seam_unmatched",
+            "p4_seam_multi_matched",
+            "p4_seam_unsupported",
+            "p4_seam_arg_not_found",
+            "p4_seam_len_absent",
+            "p4_seam_len_parse_failed",
+            "p4_seam_key_collisions",
+            "p4_use_parse_failed",
+            "p4_use_multi_matched",
+            "p4_use_key_collisions",
+            "p4_decision_key_collisions",
+            // **CHECK 5 — the SPAN layer's own placement loss.** `emitted` here is
+            // decisions-kept while the span layer's subtracts this; they coincide
+            // only while it is zero, so the coincidence is now asserted rather than
+            // relied upon.
+            "p4_unplaceable",
+        ]
+        .iter()
+        .copied(),
+    ) {
         match num(key) {
             Ok(0) => {}
             Ok(n) => out.push(format!("{program}: {key}={n}, expected 0")),
@@ -11137,12 +11154,11 @@ fn conforming_p3_row() -> report::Row {
     row.set("p4_survivor_ids", "17");
     row.set("p4_placed_ids", "17");
     row.set("p4_placed_dup", "0");
-    row.set("p4_missing", "0");
-    row.set("p4_surplus", "0");
-    row.set("p4_reverted_placed", "0");
     row.set("p4_missing_unattributed", "0");
-    row.set("p4_orphan_subject", "0");
-    for key in P4_ZERO_FAILURE_CLASSES {
+    // **ONE SOURCE for all twenty zero-gated keys.** Hand-typing them here was
+    // the copy that could drift from the injection list without any test
+    // noticing.
+    for key in P4_IDENTITY_ZERO_KEYS.iter().chain(P4_ZERO_FAILURE_CLASSES) {
         row.set(key, "0");
     }
     // libcsv's MEASURED seam population (sweep at `27218691`): 2 targets, both
@@ -11153,6 +11169,41 @@ fn conforming_p3_row() -> report::Row {
     row.set("p4_seam_grafted", "2");
     row
 }
+
+/// **The phase-4 IDENTITY classes whose corpus value is zero and gated.**
+///
+/// Kept separate from [`P4_ZERO_FAILURE_CLASSES`] because the two groups' zeros
+/// rest on different things — these on the reconciliation and the walk, those on
+/// the visitors' typed declines — but **shared by the gate AND both controls**,
+/// which is the point.
+///
+/// **Why a const at all:** these eight were hand-typed in *three* places — the
+/// gate's loop, the conforming row, and the injection list. The first two are
+/// mechanized against each other (a key in the gate but not in the control
+/// fails the positive control as MISSING), but the **injection list was the
+/// unmechanized copy**: a key added to the gate and the control but not to the
+/// injections would ship gated-but-untested with nothing catching it. Named by
+/// the maintainability review, which also corrected my earlier claim that this
+/// duplication was "already mechanized two-directionally" — true of the twelve,
+/// not of these eight.
+///
+/// ⚠ **Several are PINS, not live checks**, and the labels are recorded rather
+/// than implied: `p4_surplus` and `p4_missing` are entailed by the surjectivity
+/// check plus `p4_placed_dup`; `p4_orphan_subject` is structurally unreachable
+/// while the subject universe excludes `impl` associated fns.
+/// **`p4_reverted_placed` became a genuine measurement at round 2** — 1,058
+/// declines on the frozen corpus — and was a construction before it.
+#[cfg(test)]
+const P4_IDENTITY_ZERO_KEYS: &[&str] = &[
+    "p4_unplaced",
+    "p4_use_unmatched",
+    "p4_refused",
+    "p4_missing",
+    "p4_surplus",
+    "p4_reverted_placed",
+    "p4_placed_dup",
+    "p4_orphan_subject",
+];
 
 /// The phase-4 failure classes whose corpus value is **zero and gated**.
 ///
@@ -11495,19 +11546,10 @@ fn every_p4_failure_class_actually_fails() {
         );
     }
     // ---- CHECKS 3–5: every zero-gated class, one at a time ----
-    for key in [
-        "p4_unplaced",
-        "p4_use_unmatched",
-        "p4_refused",
-        "p4_missing",
-        "p4_surplus",
-        "p4_reverted_placed",
-        "p4_placed_dup",
-        "p4_orphan_subject",
-    ]
-    .iter()
-    .copied()
-    .chain(P4_ZERO_FAILURE_CLASSES.iter().copied())
+    for key in P4_IDENTITY_ZERO_KEYS
+        .iter()
+        .copied()
+        .chain(P4_ZERO_FAILURE_CLASSES.iter().copied())
     {
         let mut row = conforming_p3_row();
         row.set(key, "1");
@@ -11527,15 +11569,11 @@ fn every_p4_failure_class_actually_fails() {
         "p4_refused",
         "p4_survivor_ids",
         "p4_placed_ids",
-        "p4_placed_dup",
-        "p4_missing",
-        "p4_surplus",
-        "p4_reverted_placed",
         "p4_missing_unattributed",
-        "p4_orphan_subject",
     ]
     .iter()
     .copied()
+    .chain(P4_IDENTITY_ZERO_KEYS.iter().copied())
     .chain(P4_ZERO_FAILURE_CLASSES.iter().copied())
     {
         let mut row = conforming_p3_row();
