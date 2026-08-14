@@ -7980,6 +7980,46 @@ mod run {
                 row.set("p4_unplaced", p.ast_decl_unplaced.to_string());
                 row.set("p4_use_unmatched", p.ast_use_unmatched.to_string());
                 row.set("p4_refused", p.ast_refused.to_string());
+                // ---- IDENTITY-SET RECONCILIATION (F2) ----
+                row.set("p4_survivor_ids", p.survivor_ids.to_string());
+                row.set("p4_placed_ids", p.placed_ids.to_string());
+                row.set("p4_placed_dup", p.placed_dup.to_string());
+                row.set("p4_missing", p.recon_missing.to_string());
+                row.set("p4_surplus", p.recon_surplus.to_string());
+                row.set("p4_reverted_placed", p.recon_reverted_placed.to_string());
+                row.set(
+                    "p4_missing_unattributed",
+                    p.recon_missing_unattributed.to_string(),
+                );
+                row.set("p4_orphan_subject", p.orphan_subject.to_string());
+                row.set("p4_decl_refused", p.decl_refused.to_string());
+                // ---- THE TYPED FAILURE CLASSES, READ (F1) ----
+                //
+                // The denominators travel WITH the counters: a zero failure
+                // count over a zero population is not evidence, and seam
+                // placement under a real revert set was previously measured by
+                // nothing anywhere.
+                row.set("p4_seam_targets", p.seam_targets.to_string());
+                row.set("p4_seam_grafted", p.seam_grafted.to_string());
+                row.set("p4_seam_unmatched", p.seam_unmatched.to_string());
+                row.set("p4_seam_multi_matched", p.seam_multi_matched.to_string());
+                row.set("p4_seam_unsupported", p.seam_unsupported.to_string());
+                row.set("p4_seam_arg_not_found", p.seam_arg_not_found.to_string());
+                row.set("p4_seam_len_absent", p.seam_len_absent.to_string());
+                row.set(
+                    "p4_seam_len_parse_failed",
+                    p.seam_len_parse_failed.to_string(),
+                );
+                row.set("p4_seam_key_collisions", p.seam_key_collisions.to_string());
+                row.set("p4_use_targets", p.use_targets.to_string());
+                row.set("p4_use_parse_failed", p.use_parse_failed.to_string());
+                row.set("p4_use_multi_matched", p.use_multi_matched.to_string());
+                row.set("p4_use_key_collisions", p.use_key_collisions.to_string());
+                row.set(
+                    "p4_decision_key_collisions",
+                    p.decision_key_collisions.to_string(),
+                );
+                row.set("p4_unplaceable", p.unplaceable.to_string());
                 if !p.examples.is_empty() {
                     row.set(
                         "p3_examples",
@@ -10873,7 +10913,14 @@ fn p3_row_failures(program: &str, row: &report::Row) -> Vec<String> {
         )),
         (Err(why), ..) | (Ok(_), Err(why), _) | (Ok(_), Ok(_), Err(why)) => out.push(why),
     }
-    // Every surviving subject must have been PLACED by the AST layer.
+    // **CHECK 2 — SURJECTIVITY OF THE WALK, and that is its honest label.**
+    //
+    // `placed <= |decisions| <= emitted`, equality iff no map-key collision, no
+    // missed node, no non-`Ptr` shape and no guard refusal. It shows the walk
+    // reached every surviving subject; it does NOT show the *set* was right,
+    // which is what the identity reconciliation below is for. Kept because it
+    // is genuinely falsifiable along four loss paths — not because it is a
+    // second derivation, a claim withdrawn at the boundary review.
     match (num("p4_placed"), num("p3_emitted_subjects")) {
         (Ok(p), Ok(e)) if p == e => {}
         (Ok(p), Ok(e)) => out.push(format!(
@@ -10882,12 +10929,87 @@ fn p3_row_failures(program: &str, row: &report::Row) -> Vec<String> {
         )),
         (Err(why), _) | (Ok(_), Err(why)) => out.push(why),
     }
-    for key in ["p4_unplaced", "p4_use_unmatched", "p4_refused"] {
+    // **CHECK 3 — IDENTITY-SET RECONCILIATION.** The count-based ledger could
+    // not prove WHICH: a same-cardinality identity error selects the wrong
+    // subjects on both sides together and every line still closes. These three
+    // read the identities the walk actually rewrote.
+    //
+    // `p4_reverted_placed` is a strict sub-class of `p4_surplus` — survivors
+    // and reverted are disjoint by construction — and is gated apart because it
+    // is the semantic violation phase 4 exists to exclude, stated by name.
+    //
+    // **This is also what makes the counterweight false.** Deleting the three
+    // AST visitors left the GAP check passing unchanged, because only
+    // `p4_placed` observed the AST layer at all; with an empty `placed` set,
+    // `p4_missing` becomes the whole survivor population and this fails.
+    //
+    // `p4_survivor_ids != p3_emitted_subjects` is the decision-map key
+    // collision, at identity granularity: entries counted vs distinct keys.
+    for key in [
+        "p4_unplaced",
+        "p4_use_unmatched",
+        "p4_refused",
+        "p4_missing",
+        "p4_surplus",
+        "p4_reverted_placed",
+        "p4_placed_dup",
+        "p4_orphan_subject",
+        // **CHECK 4 — the typed failure classes, from BOTH visitors.** Every
+        // one was discarded before this repair; `p4_seam_*` in particular was
+        // measured by nothing anywhere under a real revert set.
+        "p4_seam_unmatched",
+        "p4_seam_multi_matched",
+        "p4_seam_unsupported",
+        "p4_seam_arg_not_found",
+        "p4_seam_len_absent",
+        "p4_seam_len_parse_failed",
+        "p4_seam_key_collisions",
+        "p4_use_parse_failed",
+        "p4_use_multi_matched",
+        "p4_use_key_collisions",
+        "p4_decision_key_collisions",
+        // **CHECK 5 — the SPAN layer's own placement loss.** `emitted` here is
+        // decisions-kept while the span layer's subtracts this; they coincide
+        // only while it is zero, so the coincidence is now asserted rather than
+        // relied upon.
+        "p4_unplaceable",
+    ] {
         match num(key) {
             Ok(0) => {}
             Ok(n) => out.push(format!("{program}: {key}={n}, expected 0")),
             Err(why) => out.push(why),
         }
+    }
+    match (num("p4_survivor_ids"), num("p3_emitted_subjects")) {
+        (Ok(s), Ok(e)) if s == e => {}
+        (Ok(s), Ok(e)) => out.push(format!(
+            "{program}: p4_survivor_ids={s} != p3_emitted_subjects={e} — two \
+             table entries share one (fn_did, hir_id) and the walk's lookup map \
+             dropped one in silence"
+        )),
+        (Err(why), _) | (Ok(_), Err(why)) => out.push(why),
+    }
+    // The identity list and the three form counters move together or the
+    // instrument is broken: `p4_placed` is the sum of the counters,
+    // `p4_placed_ids` the distinct identities behind them.
+    match (num("p4_placed_ids"), num("p4_placed_dup"), num("p4_placed")) {
+        (Ok(ids), Ok(dup), Ok(placed)) if ids + dup == placed => {}
+        (Ok(ids), Ok(dup), Ok(placed)) => out.push(format!(
+            "{program}: p4_placed_ids={ids} + p4_placed_dup={dup} != \
+             p4_placed={placed} — the identity list drifted from the counters \
+             that are supposed to be derived from the same rewrites"
+        )),
+        (Err(why), ..) | (Ok(_), Err(why), _) | (Ok(_), Ok(_), Err(why)) => out.push(why),
+    }
+    // The missing-class attribution must not go NEGATIVE, which would mean one
+    // subject counted in two classes.
+    match num("p4_missing_unattributed") {
+        Ok(n) if n >= 0 => {}
+        Ok(n) => out.push(format!(
+            "{program}: p4_missing_unattributed={n} is negative — a missing \
+             subject was counted in two classes at once"
+        )),
+        Err(why) => out.push(why),
     }
     // Every compared function must have been EQUAL. Its own identity rather
     // than an inference from `differing == 0`, so a function compared and
@@ -10928,8 +11050,51 @@ fn conforming_p3_row() -> report::Row {
     row.set("p4_unplaced", "0");
     row.set("p4_use_unmatched", "0");
     row.set("p4_refused", "0");
+    // The identity lines follow from libcsv's MEASURED 17, they are not a
+    // second guess at it: `survivor_ids == emitted` and
+    // `placed_ids + placed_dup == placed` are the two equalities the gate
+    // asserts, so a conforming row is the one where they hold at 17.
+    row.set("p4_survivor_ids", "17");
+    row.set("p4_placed_ids", "17");
+    row.set("p4_placed_dup", "0");
+    row.set("p4_missing", "0");
+    row.set("p4_surplus", "0");
+    row.set("p4_reverted_placed", "0");
+    row.set("p4_missing_unattributed", "0");
+    row.set("p4_orphan_subject", "0");
+    for key in P4_ZERO_FAILURE_CLASSES {
+        row.set(key, "0");
+    }
     row
 }
+
+/// The phase-4 failure classes whose corpus value is **zero and gated**.
+///
+/// Their zeros are not assumed: every one of these is already gated at zero by
+/// [`ARM_ZERO_INVARIANTS`] in the reconciliation sweep, which runs the same two
+/// visitors over the **full** population with an empty revert set. Applying the
+/// real revert set can only shrink the target maps, and each of these counts a
+/// per-target event, so a zero over the superset is a zero over the subset.
+///
+/// That is exactly why gating them HERE is the repair rather than a duplicate:
+/// the sibling gate reads them with `FxHashSet::default()` for reverts, so seam
+/// placement under a real revert set was measured nowhere — with 7 of the 68
+/// compared functions seam-only.
+#[cfg(test)]
+const P4_ZERO_FAILURE_CLASSES: &[&str] = &[
+    "p4_seam_unmatched",
+    "p4_seam_multi_matched",
+    "p4_seam_unsupported",
+    "p4_seam_arg_not_found",
+    "p4_seam_len_absent",
+    "p4_seam_len_parse_failed",
+    "p4_seam_key_collisions",
+    "p4_use_parse_failed",
+    "p4_use_multi_matched",
+    "p4_use_key_collisions",
+    "p4_decision_key_collisions",
+    "p4_unplaceable",
+];
 
 #[test]
 fn the_p3_gate_passes_the_shape_the_corpus_produces() {
@@ -11038,6 +11203,12 @@ fn every_p3_failure_class_actually_fails() {
     row.set("p3_reverted_subjects", "495");
     row.set("p4_decided", "495");
     row.set("p4_placed", "0");
+    // Nothing survives, so nothing is owed and nothing is placed — and the
+    // reconciliation must read empty rather than fail. A program whose whole
+    // population is reverted is the sharpest test that `p4_missing` is a
+    // difference against the SURVIVORS and not against the decided.
+    row.set("p4_survivor_ids", "0");
+    row.set("p4_placed_ids", "0");
     assert!(
         p3_row_failures("brotli", &row).is_empty(),
         "compared=0 with emitted=0 is LEGAL — five programs are legitimately \
@@ -11056,6 +11227,203 @@ fn every_p3_failure_class_actually_fails() {
             "p3_equal={equal} must fail and name BOTH sides: {f:?}"
         );
     }
+}
+
+/// **FAULT INJECTION FOR EVERY PHASE-4 BRANCH — the control that shipped
+/// missing.**
+///
+/// Phase 4 landed five branches with **zero** controls, against this track's own
+/// standing rule that a witness which cannot fail is not a witness. Recorded as
+/// a lapse at the boundary review and corrected here: every branch is broken in
+/// both directions and with the key ABSENT, because a declined worker presents
+/// as absence and absence must never read as agreement.
+#[test]
+fn every_p4_failure_class_actually_fails() {
+    // ---- CHECK 1: the GAP identity, `decided == emitted + reverted` ----
+    //
+    // BOTH directions on each of the three terms: a `>=` or a one-sided
+    // spelling passes half of these.
+    for (key, value) in [
+        ("p4_decided", "16"),
+        ("p4_decided", "18"),
+        ("p3_emitted_subjects", "16"),
+        ("p3_reverted_subjects", "1"),
+    ] {
+        let mut row = conforming_p3_row();
+        row.set(key, value);
+        let f = p3_row_failures("libcsv", &row);
+        assert!(
+            f.iter().any(|m| m.contains("GAP")),
+            "{key}={value} must break the GAP identity: {f:?}"
+        );
+    }
+    // ---- CHECK 2: walk surjectivity, `p4_placed == emitted` ----
+    for placed in ["16", "18"] {
+        let mut row = conforming_p3_row();
+        row.set("p4_placed", placed);
+        // The identity list moves with it, so this tests the surjectivity
+        // branch and not the drift branch.
+        row.set("p4_placed_ids", placed);
+        let f = p3_row_failures("libcsv", &row);
+        assert!(
+            f.iter()
+                .any(|m| m.contains("p4_placed") && m.contains("emitted")),
+            "p4_placed={placed} must fail surjectivity: {f:?}"
+        );
+    }
+    // ---- CHECK 3: the identity-set reconciliation ----
+    //
+    // **THE COUNTERWEIGHT, INVERTED.** The review recorded that deleting all
+    // three AST visitors would leave the GAP check passing unchanged, because
+    // only `p4_placed` observed the AST layer at all. This is that mutation as
+    // a row: nothing placed, so every survivor is missing — and the run stops.
+    let mut deleted_visitors = conforming_p3_row();
+    deleted_visitors.set("p4_placed", "0");
+    deleted_visitors.set("p4_placed_ids", "0");
+    deleted_visitors.set("p4_missing", "17");
+    let f = p3_row_failures("libcsv", &deleted_visitors);
+    assert!(
+        f.iter().any(|m| m.contains("p4_missing")),
+        "deleting the visitors must now FAIL the reconciliation — this is the \
+         counterweight the boundary review recorded, and it must be false: {f:?}"
+    );
+    // The GAP check is deliberately shown STILL GREEN under that mutation, so
+    // the test states which check does the work rather than implying the whole
+    // gate does.
+    let mut gap_only = conforming_p3_row();
+    gap_only.set("p4_placed", "0");
+    gap_only.set("p4_placed_ids", "0");
+    assert!(
+        !p3_row_failures("libcsv", &gap_only)
+            .iter()
+            .any(|m| m.contains("GAP")),
+        "the GAP identity is table-and-oracle only and must be UNMOVED by an \
+         empty walk — that is precisely why the reconciliation is needed"
+    );
+    // ---- CHECK 3b: the two identity equalities, both directions ----
+    for survivors in ["16", "18"] {
+        let mut row = conforming_p3_row();
+        row.set("p4_survivor_ids", survivors);
+        let f = p3_row_failures("libcsv", &row);
+        assert!(
+            f.iter().any(|m| m.contains("p4_survivor_ids")),
+            "p4_survivor_ids={survivors} is a decision-map key collision and \
+             must fail: {f:?}"
+        );
+    }
+    for ids in ["16", "18"] {
+        let mut row = conforming_p3_row();
+        row.set("p4_placed_ids", ids);
+        let f = p3_row_failures("libcsv", &row);
+        assert!(
+            f.iter().any(|m| m.contains("p4_placed_ids")),
+            "p4_placed_ids={ids} must fail the drift check: {f:?}"
+        );
+    }
+    // A duplicate placement is absorbed by the drift identity, so it must fail
+    // through its OWN key rather than only through the sum.
+    let mut dup = conforming_p3_row();
+    dup.set("p4_placed_ids", "16");
+    dup.set("p4_placed_dup", "1");
+    let f = p3_row_failures("libcsv", &dup);
+    assert!(
+        f.iter().any(|m| m.contains("p4_placed_dup")),
+        "one identity placed twice must fail by name, not be absorbed into the \
+         sum that still reaches 17: {f:?}"
+    );
+    // A negative attribution residue means one subject in two classes.
+    let mut neg = conforming_p3_row();
+    neg.set("p4_missing_unattributed", "-1");
+    let f = p3_row_failures("libcsv", &neg);
+    assert!(
+        f.iter().any(|m| m.contains("negative")),
+        "a negative attribution residue must fail: {f:?}"
+    );
+    // ---- CHECKS 3–5: every zero-gated class, one at a time ----
+    for key in [
+        "p4_unplaced",
+        "p4_use_unmatched",
+        "p4_refused",
+        "p4_missing",
+        "p4_surplus",
+        "p4_reverted_placed",
+        "p4_placed_dup",
+        "p4_orphan_subject",
+    ]
+    .iter()
+    .copied()
+    .chain(P4_ZERO_FAILURE_CLASSES.iter().copied())
+    {
+        let mut row = conforming_p3_row();
+        row.set(key, "1");
+        let f = p3_row_failures("libcsv", &row);
+        assert!(
+            f.iter().any(|m| m.contains(key)),
+            "{key}=1 must fail and NAME the key: {f:?}"
+        );
+    }
+    // ---- ABSENCE, on every phase-4 key the gate reads ----
+    for key in [
+        "p4_decided",
+        "p3_reverted_subjects",
+        "p4_placed",
+        "p4_unplaced",
+        "p4_use_unmatched",
+        "p4_refused",
+        "p4_survivor_ids",
+        "p4_placed_ids",
+        "p4_placed_dup",
+        "p4_missing",
+        "p4_surplus",
+        "p4_reverted_placed",
+        "p4_missing_unattributed",
+        "p4_orphan_subject",
+    ]
+    .iter()
+    .copied()
+    .chain(P4_ZERO_FAILURE_CLASSES.iter().copied())
+    {
+        let mut row = conforming_p3_row();
+        row.0.retain(|(k, _)| k != key);
+        let f = p3_row_failures("libcsv", &row);
+        assert!(
+            f.iter().any(|m| m.contains(key) && m.contains("MISSING")),
+            "an ABSENT {key} must fail: {f:?}"
+        );
+    }
+}
+
+/// **THE NAMED INJECTION WITNESS for the dropped-by-both seam.**
+///
+/// F1's false-pass path, stated exactly: a seam rejected by *both* the span
+/// locator and the AST walker touches no caller function, so it appears in
+/// neither compared population — parity stays green and the ledger still closes
+/// while a converted callee keeps an unadapted call site, which is the `E0308`
+/// the seam machinery exists to remove.
+///
+/// The row here is that scenario's shape: every population line conforming,
+/// every parity line green, and the seam absent from both sides showing up as
+/// **one** unmatched seam target. Before this repair the row passed.
+#[test]
+fn a_seam_dropped_by_both_layers_cannot_vanish() {
+    let mut row = conforming_p3_row();
+    // Untouched: compared/equal 18/18, differing 0, the ledger closes, the walk
+    // placed every surviving subject. Nothing in the parity half can see this.
+    row.set("p4_seam_unmatched", "1");
+    let f = p3_row_failures("libcsv", &row);
+    assert!(
+        f.iter().any(|m| m.contains("p4_seam_unmatched")),
+        "a seam in NEITHER population must fail the gate by name — the whole \
+         point is that it cannot vanish between two green halves: {f:?}"
+    );
+    // ...and the row is otherwise conforming, so the failure is attributable to
+    // the seam alone rather than to some other line having been disturbed.
+    assert_eq!(
+        f.len(),
+        1,
+        "the injection must produce exactly ONE finding, or it is not \
+         attributable to the seam: {f:?}"
+    );
 }
 
 /// **THE PHASE-3 EXIT GATE — the corpus run.**
@@ -11119,6 +11487,10 @@ fn m1_p3_corpus() {
 
     let mut failures: Vec<String> = Vec::new();
     let (mut compared, mut equal, mut multi, mut rev_subj) = (0u64, 0u64, 0u64, 0u64);
+    // **THE DENOMINATORS for the newly-gated failure classes.** Their zeros are
+    // only evidence over a non-empty population, and seam placement under a
+    // real revert set is precisely what nothing measured before this repair.
+    let (mut seam_targets, mut use_targets, mut survivor_ids) = (0u64, 0u64, 0u64);
 
     for program in CORPUS {
         let input = program.input_path(&root);
@@ -11156,12 +11528,19 @@ fn m1_p3_corpus() {
         equal += num("p3_equal").max(0) as u64;
         multi += num("p3_multi_arm").max(0) as u64;
         rev_subj += num("p3_reverted_subjects").max(0) as u64;
+        seam_targets += num("p4_seam_targets").max(0) as u64;
+        use_targets += num("p4_use_targets").max(0) as u64;
+        survivor_ids += num("p4_survivor_ids").max(0) as u64;
         println!("{}", report::to_kv_line(&row));
     }
 
     println!(
         "BOC1-P3 oracle={oracle} compared={compared} equal={equal} multi_arm={multi} \
          reverted_subjects={rev_subj}"
+    );
+    println!(
+        "BOC1-P4 survivor_ids={survivor_ids} seam_targets={seam_targets} \
+         use_targets={use_targets}"
     );
     // R7: the population is asserted NON-EMPTY. A green gate over zero
     // functions is the failure this assertion exists to make impossible.
@@ -11179,6 +11558,23 @@ fn m1_p3_corpus() {
         compared > 0,
         "the phase-3 gate compared NO functions — a parity claim over an empty \
          population is not a parity claim"
+    );
+    // **R7, applied to the classes this repair newly gated.** Eleven of them
+    // read zero, and a zero over an empty population is not evidence — it is
+    // the shape the whole boundary review was about. The seam denominator is
+    // the load-bearing one: the sibling gate that read these counters ran with
+    // an EMPTY revert set, so this is the first assertion anywhere that the
+    // seam layer was exercised under the real one.
+    assert!(
+        seam_targets > 0,
+        "the phase-4 gate saw NO surviving seam targets — every seam failure \
+         class then reads zero for want of a population, which is exactly the \
+         false pass F1 named"
+    );
+    assert!(
+        survivor_ids > 0,
+        "the reconciliation owed NOTHING on any program — an identity check \
+         over an empty survivor set cannot fail and is not a check"
     );
     // **`multi_arm > 0` IS RETIRED AS AN ASSERTION** (ruling 2026-08-14), and
     // the reason is recorded rather than the check merely deleted.

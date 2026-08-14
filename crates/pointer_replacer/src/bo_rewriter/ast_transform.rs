@@ -411,6 +411,28 @@ pub(crate) struct RefDeclStats {
     pub not_a_pointer_decl: usize,
     /// Refused by the composition guard.
     pub refused: usize,
+    /// **THE IDENTITIES the walk actually rewrote**, one per realized rewrite.
+    ///
+    /// A `Vec` and not a set on purpose: the *duplicate* is itself a failure
+    /// class (one key rewritten twice), and a set would absorb it silently at
+    /// the point of collection — which is the shape the count-based ledger was
+    /// faulted for. The de-duplication happens at the reconciliation, where the
+    /// difference between the two lengths is a reported row.
+    pub placed_ids: Vec<(LocalDefId, HirId)>,
+    /// **THE ORPHAN CLASS — a subject whose declaration the walk reached with
+    /// no owning function.**
+    ///
+    /// [`MutVisitor::visit_item`] sets `current_fn` only on a top-level
+    /// `ItemKind::Fn`, and `visit_assoc_item` is **not** overridden — so an
+    /// `impl` method's params arrive here with `current_fn` unset and used to
+    /// return with no trace. Exact rather than approximate: it counts only
+    /// bindings whose `HirId` is a KNOWN SURVIVOR, which the hir-only index
+    /// makes decidable without the `fn_did` half of the key.
+    ///
+    /// Corpus-zero would be **structural, not evidential**, so it ships with an
+    /// injection witness (`an_impl_method_subject_is_counted_not_skipped`)
+    /// rather than an argument.
+    pub orphan_subject: usize,
     /// `(byte offset of the declaration's type, rendered type)` per rewrite —
     /// the text differential's left-hand side. Keyed by offset because that is
     /// what the span layer's `Edit` is keyed by, so the join needs no name
@@ -435,6 +457,15 @@ pub(crate) struct RefDeclVisitor<'a> {
     pub decisions: &'a FxHashMap<(LocalDefId, HirId), (DeclForm, bool)>,
     /// AST `NodeId` → `LocalDefId`, used to set `current_fn` at each item.
     pub global_map: &'a rustc_ast::node_id::NodeMap<LocalDefId>,
+    /// **The survivors' `HirId`s alone** — the half of the decision key that is
+    /// available when `current_fn` is not.
+    ///
+    /// Sound as an identity because a binding's `HirId.owner` **is** its body
+    /// owner: for a param or local of `F`, the owner is `F`, so a `HirId` in
+    /// this index determines the `fn_did` half it came with. That is what makes
+    /// [`RefDeclStats::orphan_subject`] an exact count rather than a heuristic
+    /// over "raw-pointer declarations we did not transform".
+    pub subject_hirs: &'a FxHashSet<HirId>,
     /// The function currently being walked, from the global map.
     pub current_fn: Option<LocalDefId>,
     pub guard: &'a mut Composition,
@@ -448,11 +479,27 @@ impl RefDeclVisitor<'_> {
     /// `map_pat_to_pat` sends an AST `PatKind::Ident` to `hir::PatKind::Binding`
     /// and a subject's `hir_id` is its binding pattern's.
     fn rewrite_decl(&mut self, binding: NodeId, ty: &mut Ty) {
-        let Some(fn_did) = self.current_fn else { return };
-        let Some(hir_id) = self.local_map.get(&binding) else {
+        // **THE HIR LOOKUP MOVED AHEAD OF THE OWNER LOOKUP**, and the reorder is
+        // the whole point: with `current_fn` checked first, an `impl` method's
+        // subject returned before anything could tell it apart from the many
+        // declarations that are simply not subjects. Both paths still return —
+        // this is instrument-only — but the orphan class is now decidable.
+        let Some(&hir_id) = self.local_map.get(&binding) else {
+            // A `local_map` miss cannot be attributed here: without a `HirId`
+            // there is no key to test membership with. It is not left
+            // unmeasured — the identity reconciliation reports the exact
+            // subject that went missing, by name, and
+            // `missing_unattributed` is the residue after the classes that CAN
+            // be named at the site are subtracted.
             return;
         };
-        let Some(&(form, mutable)) = self.decisions.get(&(fn_did, *hir_id)) else {
+        let Some(fn_did) = self.current_fn else {
+            if self.subject_hirs.contains(&hir_id) {
+                self.stats.orphan_subject += 1;
+            }
+            return;
+        };
+        let Some(&(form, mutable)) = self.decisions.get(&(fn_did, hir_id)) else {
             return;
         };
         // **The shape check runs BEFORE the claim** (arm-2 review). Claiming
@@ -482,6 +529,11 @@ impl RefDeclVisitor<'_> {
         let pointee = mut_ty.ty.clone();
         ty.kind = decl_ty_kind(form, mutable, pointee);
         let render = (ty.span.lo().0, rustc_ast_pretty::pprust::ty_to_string(ty));
+        // **RECORDED AT THE REALIZED REWRITE, not at the attempt.** Every early
+        // return above is a non-placement, so this list and the three form
+        // counters move together or the instrument is broken — an equality the
+        // gate asserts rather than assumes.
+        self.stats.placed_ids.push((fn_did, hir_id));
         match form {
             DeclForm::Ref => {
                 self.stats.rewritten += 1;
@@ -1228,11 +1280,17 @@ fn transform_inner(
         }
     }
 
+    // The hir-only index of the population, so an `impl`-method subject that
+    // reaches the walk with no owning function is COUNTED rather than dropped.
+    // `arms_full` applies no revert set, so here the population is every
+    // decided subject.
+    let subject_hirs: FxHashSet<HirId> = decisions.keys().map(|(_, h)| *h).collect();
     let mut guard = Composition::default();
     let mut v = RefDeclVisitor {
         local_map: &map.local_map,
         decisions: &decisions,
         global_map: &map.global_map,
+        subject_hirs: &subject_hirs,
         current_fn: None,
         guard: &mut guard,
         stats: RefDeclStats::default(),
@@ -1852,6 +1910,35 @@ pub(crate) fn phase3_fn_parity(
         })
         .count();
 
+    // **THE IDENTITY SETS — F2's remedy, built here and not from the walk's own
+    // lookup map.** `survivors` and `reverted_ids` partition the non-degraded
+    // table by the held-fixed revert set; `labels` renders one for a human and
+    // is never used for matching, so two subjects sharing a label cannot merge.
+    //
+    // What this DOES establish: the walk placed exactly the survivor set,
+    // subject by subject. What it does NOT, and the distinction is the whole
+    // content of the boundary review: the revert set is a HELD-FIXED population
+    // specification (ruled 2026-08-14), shared by both sides on purpose, so no
+    // check here re-derives it. `decided == emitted + reverted` remains the one
+    // line with a genuinely external second source.
+    let mut survivors: FxHashSet<(LocalDefId, HirId)> = FxHashSet::default();
+    let mut reverted_ids: FxHashSet<(LocalDefId, HirId)> = FxHashSet::default();
+    let mut labels: FxHashMap<(LocalDefId, HirId), String> = FxHashMap::default();
+    for (subject, decision) in &table.entries {
+        if matches!(decision, super::decision::Decision::Degraded(_)) {
+            continue;
+        }
+        let key = (subject.fn_did, subject.hir_id);
+        labels.insert(key, subject.label.clone());
+        if reverts.keeps_subject(subject.fn_did) {
+            survivors.insert(key);
+        } else {
+            reverted_ids.insert(key);
+        }
+    }
+    p.survivor_ids = survivors.len();
+    let subject_hirs: FxHashSet<HirId> = survivors.iter().map(|(_, h)| *h).collect();
+
     // ---- the AST side: the same three passes, with the SAME subjects held back ----
     let mut decisions: FxHashMap<(LocalDefId, HirId), (DeclForm, bool)> = FxHashMap::default();
     let mut uses: FxHashMap<(u32, u32), String> = FxHashMap::default();
@@ -1875,17 +1962,33 @@ pub(crate) fn phase3_fn_parity(
             } => (DeclForm::Opt { slice: *slice }, *mutable, Some(uses)),
             super::decision::Decision::Degraded(_) => continue,
         };
-        decisions.insert((subject.fn_did, subject.hir_id), (form, mutable));
+        // **THE JOINS GET THEIR COLLISION COUNTERS**, which `transform_inner`
+        // has had since arm 2 and this gate did not: a map that silently
+        // overwrites holds fewer edits than the table does, and every
+        // downstream count then agrees with itself while being short.
+        if decisions
+            .insert((subject.fn_did, subject.hir_id), (form, mutable))
+            .is_some()
+        {
+            p.decision_key_collisions += 1;
+        }
         for u in use_edits.into_iter().flatten() {
-            uses.insert((u.span.lo().0, u.span.hi().0), u.replacement.clone());
+            if uses
+                .insert((u.span.lo().0, u.span.hi().0), u.replacement.clone())
+                .is_some()
+            {
+                p.use_key_collisions += 1;
+            }
         }
     }
+    p.use_targets = uses.len();
 
     let mut guard = Composition::default();
     let mut v = RefDeclVisitor {
         local_map: &map.local_map,
         decisions: &decisions,
         global_map: &map.global_map,
+        subject_hirs: &subject_hirs,
         current_fn: None,
         guard: &mut guard,
         stats: RefDeclStats::default(),
@@ -1905,11 +2008,30 @@ pub(crate) fn phase3_fn_parity(
         if !reverts.keeps(&edit.owner_fn) {
             continue;
         }
-        seam_targets.insert((edit.span.lo().0, edit.span.hi().0), SeamTarget::of(edit));
+        if seam_targets
+            .insert((edit.span.lo().0, edit.span.hi().0), SeamTarget::of(edit))
+            .is_some()
+        {
+            p.seam_key_collisions += 1;
+        }
     }
+    p.seam_targets = seam_targets.len();
     let mut s = SeamGraftVisitor::new(&seam_targets, &mut guard);
     s.visit_crate(&mut krate);
-    let _ = s.finish();
+    // **THE STATS ARE READ.** `let _ = s.finish();` discarded every one of them
+    // — F1's finding, and the one place in this gate where the seam layer's
+    // behaviour under a real revert set could be observed at all.
+    let seam_stats = s.finish();
+    p.seam_grafted = seam_stats.grafted;
+    p.seam_unmatched = seam_stats.unmatched;
+    p.seam_multi_matched = seam_stats.multi_matched;
+    p.seam_unsupported = seam_stats.unsupported;
+    p.seam_arg_not_found = seam_stats.arg_not_found;
+    p.seam_len_absent = seam_stats.len_absent;
+    p.seam_len_parse_failed = seam_stats.len_parse_failed;
+    p.use_parse_failed = grafts_stats.parse_failed;
+    p.use_multi_matched = grafts_stats.multi_matched;
+    p.unplaceable = emission.unplaceable.len();
 
     // ---- PHASE 4's ledger, on the new layer ----
     p.decided_subjects = table
@@ -1921,17 +2043,44 @@ pub(crate) fn phase3_fn_parity(
         decls_stats.rewritten + decls_stats.slice_rewritten + decls_stats.opt_rewritten;
     p.ast_decl_unplaced = decls_stats.not_a_pointer_decl;
     p.ast_use_unmatched = grafts_stats.unmatched;
+    p.orphan_subject = decls_stats.orphan_subject;
+    p.decl_refused = decls_stats.refused;
+
+    // **THE RECONCILIATION — identities, not cardinalities.**
+    let placed: FxHashSet<(LocalDefId, HirId)> = decls_stats.placed_ids.iter().copied().collect();
+    p.placed_ids = placed.len();
+    p.placed_dup = decls_stats.placed_ids.len() - placed.len();
+    let recon = reconcile_identities(&survivors, &placed, &reverted_ids, |k| {
+        labels.get(k).cloned().unwrap_or_else(|| format!("{k:?}"))
+    });
+    p.recon_missing = recon.missing;
+    p.recon_surplus = recon.surplus;
+    p.recon_reverted_placed = recon.reverted_placed;
+    // The classes a site-level counter CAN name, subtracted. What is left is
+    // the `local_map` miss and the never-visited node, which have no possible
+    // site counter — so the residue is reported rather than argued away.
+    p.recon_missing_unattributed = recon.missing as i64
+        - decls_stats.orphan_subject as i64
+        - decls_stats.not_a_pointer_decl as i64
+        - decls_stats.refused as i64;
+    p.examples.extend(recon.examples);
 
     // **A composition-guard refusal is STOP-class here.** Carried into the
     // result rather than swallowed: this gate is the first place three
     // transforms meet inside one function body.
+    //
+    // **NO LONGER ADDED TO `differing`** (boundary review): the double-count
+    // meant `p4_refused` could never be a *sole* failure, so phase 4 had four
+    // independent checks while claiming five. A refusal is still fail-closed —
+    // `p4_refused` gates it directly — and a refused declaration still makes
+    // its function's text differ, so nothing is lost by removing the second
+    // path to the same stop.
     if !guard.refused.is_empty() {
         p.examples.push(format!(
             "COMPOSITION REFUSAL x{}: {:?}",
             guard.refused.len(),
             &guard.refused[..guard.refused.len().min(3)]
         ));
-        p.differing += guard.refused.len();
     }
     p.ast_refused = guard.refused.len();
 
@@ -2074,6 +2223,86 @@ pub(crate) fn phase3_fn_parity(
     Ok(p)
 }
 
+/// **IDENTITY-SET RECONCILIATION — what a count-based ledger cannot do.**
+///
+/// The phase-4 boundary review's F2, in one sentence: `p4_placed == emitted`
+/// compares two *cardinalities* over one filtered population, so a
+/// same-cardinality identity error selects the wrong subjects on both sides
+/// together and every line still closes. The honest label for the equality was
+/// a **surjectivity check on the walk** — it showed the walk reached every
+/// decided declaration once, never that the *set* was right.
+///
+/// This is the remedy, and it is deliberately **pure and generic**: no
+/// `TyCtxt`, no rustc identifier types in the signature, so its own failure
+/// modes are exercisable by unit tests. Logic only a corpus sweep can run is
+/// logic with no witness — R8, and the reason `p3_row_failures` was extracted
+/// from the corpus loop before it.
+#[derive(Default, Debug)]
+pub(crate) struct IdentityRecon {
+    /// A survivor the walk never placed. Every `local_map` miss, unvisited
+    /// node, orphaned `impl`-method subject and guard refusal lands here **by
+    /// identity**, whether or not a site-level counter could name it.
+    pub missing: usize,
+    /// Something the walk placed that is not a survivor.
+    pub surplus: usize,
+    /// **PHASE 4's OWN PROPERTY, named**: a subject the revert set took back
+    /// and the walk transformed anyway. A strict sub-class of
+    /// [`Self::surplus`] — survivors and reverted are disjoint by construction
+    /// — reported apart because it is the semantic violation the phase exists
+    /// to exclude, and a sub-class that says what it means beats a total that
+    /// does not.
+    pub reverted_placed: usize,
+    /// Class-tagged, **sorted**, capped rows. Sorted because a set's iteration
+    /// order is not an artifact's business.
+    pub examples: Vec<String>,
+}
+
+/// Reconcile the identities a walk placed against the identities it owed.
+///
+/// `label` renders one identity for a human; it is never used for matching, so
+/// two subjects sharing a label cannot merge.
+pub(crate) fn reconcile_identities<T, F>(
+    survivors: &FxHashSet<T>,
+    placed: &FxHashSet<T>,
+    reverted: &FxHashSet<T>,
+    label: F,
+) -> IdentityRecon
+where
+    T: Eq + std::hash::Hash,
+    F: Fn(&T) -> String,
+{
+    let collect = |class: &'static str, rows: Vec<&T>| -> (usize, Vec<String>) {
+        let mut named: Vec<String> = rows
+            .into_iter()
+            .map(|t| format!("{class}:{}", label(t)))
+            .collect();
+        named.sort();
+        (named.len(), named)
+    };
+    let (missing, m_rows) = collect(
+        "MISSING",
+        survivors.iter().filter(|s| !placed.contains(s)).collect(),
+    );
+    let (surplus, s_rows) = collect(
+        "SURPLUS",
+        placed.iter().filter(|p| !survivors.contains(p)).collect(),
+    );
+    let (reverted_placed, r_rows) = collect(
+        "REVERTED-PLACED",
+        placed.iter().filter(|p| reverted.contains(p)).collect(),
+    );
+    let mut examples: Vec<String> = Vec::new();
+    for rows in [m_rows, s_rows, r_rows] {
+        examples.extend(rows.into_iter().take(4));
+    }
+    IdentityRecon {
+        missing,
+        surplus,
+        reverted_placed,
+        examples,
+    }
+}
+
 /// **THE PHASE-3 EXIT GATE's result.**
 ///
 /// The arms proved their edits *severally* — one declaration, one use, one glue
@@ -2124,7 +2353,74 @@ pub(crate) struct FnParity {
     /// rewrite.
     pub ast_use_unmatched: usize,
     /// Composition-guard refusals across all three passes.
+    ///
+    /// **No longer folded into [`Self::differing`]** (boundary review): it was
+    /// double-counted there, so it could never be a *sole* failure and phase 4
+    /// had four checks wearing the label of five.
     pub ast_refused: usize,
+
+    // ---- IDENTITY-SET RECONCILIATION — F2's remedy ----
+    /// Distinct survivor identities. **Not a second spelling of
+    /// [`Self::emitted_subjects`]**: that one counts table ENTRIES, this counts
+    /// distinct `(fn_did, hir_id)` keys, so their difference is exactly the
+    /// decision-map key collision that would otherwise drop a subject in
+    /// silence.
+    pub survivor_ids: usize,
+    /// Distinct identities the declaration walk placed.
+    pub placed_ids: usize,
+    /// One identity placed more than once — invisible to a set, which is why
+    /// the walk hands over a `Vec`.
+    pub placed_dup: usize,
+    pub recon_missing: usize,
+    pub recon_surplus: usize,
+    pub recon_reverted_placed: usize,
+    /// [`Self::recon_missing`] minus the classes a site-level counter could
+    /// name (`orphan_subject`, `ast_decl_unplaced`, `decl_refused`). The
+    /// residue is the `local_map` miss and the never-visited node — the two
+    /// paths with no possible site counter. **Signed**: a negative value means
+    /// a subject was counted in two classes, which is an instrument fault of
+    /// its own.
+    pub recon_missing_unattributed: i64,
+    /// An `impl`-method subject the walk reached with no owning function.
+    pub orphan_subject: usize,
+    /// Declaration-pass refusals alone, for the attribution above.
+    pub decl_refused: usize,
+
+    // ---- THE TYPED FAILURE CLASSES, READ (F1) ----
+    //
+    // `let _ = s.finish();` threw the seam visitor's entire stats away, and
+    // none of these was read anywhere in this gate. The false pass was
+    // concrete: a seam rejected by BOTH the span locator and the AST walker
+    // touches no caller function, appears in neither population, and leaves
+    // parity green while a converted callee keeps an unadapted call site.
+    //
+    // The sibling gate that DOES read them (`arms_full`) runs with an empty
+    // revert set, so seam placement under a REAL revert set was measured by
+    // nothing anywhere — with 7 of the 68 compared functions seam-only.
+    /// Seam targets surviving the revert filter — **the denominator**. A zero
+    /// failure count over a zero population is not evidence, so the population
+    /// travels with the counters.
+    pub seam_targets: usize,
+    pub seam_grafted: usize,
+    pub seam_unmatched: usize,
+    pub seam_multi_matched: usize,
+    pub seam_unsupported: usize,
+    pub seam_arg_not_found: usize,
+    pub seam_len_absent: usize,
+    pub seam_len_parse_failed: usize,
+    pub seam_key_collisions: usize,
+    /// Use targets surviving the revert filter — the other denominator.
+    pub use_targets: usize,
+    pub use_parse_failed: usize,
+    pub use_multi_matched: usize,
+    pub use_key_collisions: usize,
+    /// Two table entries sharing one `(fn_did, hir_id)`, one overwriting the
+    /// other in the walk's lookup map.
+    pub decision_key_collisions: usize,
+    /// The SPAN layer's own placement loss, pinned at 0 since S2b.3 and never
+    /// read by this gate. `emitted` here is decisions-kept; the span layer's
+    /// `emitted` subtracts this, and the two coincide only while it is zero.
+    pub unplaceable: usize,
     /// Subjects the revert set took back, so the ledger identity is checkable
     /// from this instrument's own output.
     pub reverted_subjects: usize,
@@ -2733,11 +3029,13 @@ mod arm2_witnesses {
                 (DeclForm::Ref, true),
             );
 
+            let subject_hirs: FxHashSet<HirId> = decisions.keys().map(|(_, h)| *h).collect();
             let mut guard = Composition::default();
             let mut v = RefDeclVisitor {
                 local_map: &local_map,
                 decisions: &decisions,
                 global_map: &global_map,
+                subject_hirs: &subject_hirs,
                 current_fn: None,
                 guard: &mut guard,
                 stats: RefDeclStats::default(),
@@ -2749,6 +3047,11 @@ mod arm2_witnesses {
                 stats.not_a_pointer_decl, 1,
                 "the subject must be reached and counted"
             );
+            assert!(
+                stats.placed_ids.is_empty(),
+                "and must contribute NO identity — the list is recorded at the \
+                 realized rewrite, so every early return is a non-placement"
+            );
             assert_eq!(stats.rewritten, 0, "and must not be transformed");
             assert!(
                 guard.claim(ty_id, "someone-else"),
@@ -2758,6 +3061,196 @@ mod arm2_witnesses {
                  wanted it would be refused on behalf of work that never happened"
             );
         });
+    }
+
+    /// **THE ORPHAN CLASS, INJECTED — an `impl`-method subject is COUNTED, not
+    /// skipped.**
+    ///
+    /// [`RefDeclVisitor::visit_item`] sets `current_fn` only on a top-level
+    /// `ItemKind::Fn`, and `visit_assoc_item` is not overridden, so an `impl`
+    /// method's params arrive with `current_fn` unset. Before this repair they
+    /// returned with **no trace at all** — one of three loss classes the review
+    /// found with no counter, and the one the AST layer can produce today.
+    ///
+    /// Corpus-zero for this class would be **structural, not evidential**, which
+    /// is exactly why it ships with an injection rather than an argument: the
+    /// two-zeros discipline says a counter whose zero no input can move is a
+    /// counter with no witness.
+    ///
+    /// *Mutation-tested:* deleting the `subject_hirs.contains` branch drops
+    /// `orphan_subject` to 0 and this fails; reverting the lookup order so
+    /// `current_fn` is checked first makes the branch unreachable and it fails
+    /// the same way.
+    #[test]
+    fn an_impl_method_subject_is_counted_not_skipped() {
+        rustc_span::create_default_session_globals_then(|| {
+            // The param is a genuine `*mut u32`, so nothing but the missing
+            // owner can stop it — the shape check would otherwise take the
+            // credit and the test would pass for the wrong reason.
+            let mut krate =
+                ::utils::ast::parse_crate("struct S; impl S { fn m(p: *mut u32) {} }".to_owned());
+            let pat_id = {
+                let rustc_ast::ItemKind::Impl(im) = &krate.items[1].kind else {
+                    panic!("fixture's second item is an impl")
+                };
+                let rustc_ast::AssocItemKind::Fn(f) = &im.items[0].kind else {
+                    panic!("fixture's impl holds one fn")
+                };
+                f.sig.decl.inputs[0].pat.id
+            };
+
+            let mut local_map = rustc_ast::node_id::NodeMap::default();
+            local_map.insert(pat_id, rustc_hir::CRATE_HIR_ID);
+            // DELIBERATELY EMPTY: no `impl` item maps to a `LocalDefId`, which
+            // is the condition being modelled. The decision map is keyed on a
+            // `fn_did` the walk will never learn.
+            let global_map = rustc_ast::node_id::NodeMap::default();
+            let mut decisions = FxHashMap::default();
+            decisions.insert(
+                (rustc_hir::def_id::CRATE_DEF_ID, rustc_hir::CRATE_HIR_ID),
+                (DeclForm::Ref, true),
+            );
+            let subject_hirs: FxHashSet<HirId> = decisions.keys().map(|(_, h)| *h).collect();
+
+            let mut guard = Composition::default();
+            let mut v = RefDeclVisitor {
+                local_map: &local_map,
+                decisions: &decisions,
+                global_map: &global_map,
+                subject_hirs: &subject_hirs,
+                current_fn: None,
+                guard: &mut guard,
+                stats: RefDeclStats::default(),
+            };
+            v.visit_crate(&mut krate);
+            let stats = v.stats;
+
+            assert_eq!(
+                stats.orphan_subject, 1,
+                "a SURVIVOR reached with no owning function must be counted — \
+                 this is the class that returned silently"
+            );
+            assert_eq!(stats.rewritten, 0, "and must not be transformed");
+            assert!(stats.placed_ids.is_empty(), "and places no identity");
+        });
+    }
+
+    /// **The orphan counter counts SUBJECTS, not every declaration it cannot
+    /// key.**
+    ///
+    /// The negative half, and the reason the hir-only index exists at all: an
+    /// ordinary pointer param of an `impl` method that is NOT a subject must
+    /// leave the counter alone. Without this the counter would read the whole
+    /// `impl` population and its zero would mean nothing.
+    #[test]
+    fn a_non_subject_in_an_impl_does_not_read_as_an_orphan() {
+        rustc_span::create_default_session_globals_then(|| {
+            let mut krate =
+                ::utils::ast::parse_crate("struct S; impl S { fn m(p: *mut u32) {} }".to_owned());
+            let pat_id = {
+                let rustc_ast::ItemKind::Impl(im) = &krate.items[1].kind else {
+                    panic!("fixture's second item is an impl")
+                };
+                let rustc_ast::AssocItemKind::Fn(f) = &im.items[0].kind else {
+                    panic!("fixture's impl holds one fn")
+                };
+                f.sig.decl.inputs[0].pat.id
+            };
+            let mut local_map = rustc_ast::node_id::NodeMap::default();
+            local_map.insert(pat_id, rustc_hir::CRATE_HIR_ID);
+            let global_map = rustc_ast::node_id::NodeMap::default();
+            // No decisions at all — the same walk over a population of zero.
+            let decisions = FxHashMap::default();
+            let subject_hirs: FxHashSet<HirId> = FxHashSet::default();
+
+            let mut guard = Composition::default();
+            let mut v = RefDeclVisitor {
+                local_map: &local_map,
+                decisions: &decisions,
+                global_map: &global_map,
+                subject_hirs: &subject_hirs,
+                current_fn: None,
+                guard: &mut guard,
+                stats: RefDeclStats::default(),
+            };
+            v.visit_crate(&mut krate);
+            assert_eq!(
+                v.stats.orphan_subject, 0,
+                "a non-subject declaration must NOT read as a lost subject"
+            );
+        });
+    }
+
+    /// **IDENTITY-SET RECONCILIATION — every class, and the counterweight.**
+    ///
+    /// Pure and generic on purpose, so its failure modes are exercisable
+    /// without a corpus sweep. `(u32, u32)` stands in for `(fn_did, hir_id)`:
+    /// the function never inspects the identity, only its equality.
+    #[test]
+    fn reconciliation_names_every_class() {
+        let set = |xs: &[(u32, u32)]| -> FxHashSet<(u32, u32)> { xs.iter().copied().collect() };
+        let label = |k: &(u32, u32)| format!("f{}::p{}", k.0, k.1);
+
+        // The conforming shape: placed exactly the survivors.
+        let r = reconcile_identities(
+            &set(&[(1, 1), (1, 2)]),
+            &set(&[(1, 1), (1, 2)]),
+            &set(&[(2, 1)]),
+            label,
+        );
+        assert_eq!((r.missing, r.surplus, r.reverted_placed), (0, 0, 0));
+        assert!(r.examples.is_empty(), "a clean reconciliation has no rows");
+
+        // **THE SAME-CARDINALITY IDENTITY ERROR** — the exact shape the
+        // count-based ledger could not see: two placed, two owed, wrong two.
+        let r = reconcile_identities(
+            &set(&[(1, 1), (1, 2)]),
+            &set(&[(1, 1), (1, 3)]),
+            &set(&[]),
+            label,
+        );
+        assert_eq!(
+            (r.missing, r.surplus),
+            (1, 1),
+            "counts agree at 2 == 2 and the SETS do not — this is what \
+             `p4_placed == emitted` was blind to"
+        );
+        assert!(
+            r.examples.iter().any(|e| e == "MISSING:f1::p2")
+                && r.examples.iter().any(|e| e == "SURPLUS:f1::p3"),
+            "and each side must be NAMED: {:?}",
+            r.examples
+        );
+
+        // A reverted subtree transformed anyway — phase 4's own property.
+        let r = reconcile_identities(
+            &set(&[(1, 1)]),
+            &set(&[(1, 1), (2, 1)]),
+            &set(&[(2, 1)]),
+            label,
+        );
+        assert_eq!(
+            (r.reverted_placed, r.surplus),
+            (1, 1),
+            "a reverted subject that was placed is BOTH surplus and the named \
+             violation — a sub-class, and it says so"
+        );
+
+        // **THE COUNTERWEIGHT.** "Deleting all three AST visitors would leave
+        // the GAP check passing unchanged." An empty `placed` is that mutation.
+        let r = reconcile_identities(&set(&[(1, 1), (1, 2), (1, 3)]), &set(&[]), &set(&[]), label);
+        assert_eq!(
+            r.missing, 3,
+            "with no walk at all EVERY survivor is missing — the check that \
+             makes the counterweight false"
+        );
+
+        // Rows are sorted, because a set's iteration order is not an artifact's
+        // business and a flapping example column is not evidence.
+        let r = reconcile_identities(&set(&[(1, 3), (1, 1), (1, 2)]), &set(&[]), &set(&[]), label);
+        let mut sorted = r.examples.clone();
+        sorted.sort();
+        assert_eq!(r.examples, sorted, "example rows must be deterministic");
     }
 
     /// **The DECL position of the whitespace split — the positive-control
