@@ -419,6 +419,11 @@ pub(crate) struct RefDeclStats {
     /// faulted for. The de-duplication happens at the reconciliation, where the
     /// difference between the two lengths is a reported row.
     pub placed_ids: Vec<(LocalDefId, HirId)>,
+    /// Decided subjects the **site** revert check declined. Diagnostic, and the
+    /// denominator that makes `reverted_placed`'s zero mean something: a zero
+    /// here would mean the check never ran, and the observability the F2 repair
+    /// bought would be back to a construction.
+    pub reverted_withheld: usize,
     /// **THE ORPHAN CLASS — a subject whose declaration the walk reached with
     /// no owning function.**
     ///
@@ -457,8 +462,35 @@ pub(crate) struct RefDeclVisitor<'a> {
     pub decisions: &'a FxHashMap<(LocalDefId, HirId), (DeclForm, bool)>,
     /// AST `NodeId` → `LocalDefId`, used to set `current_fn` at each item.
     pub global_map: &'a rustc_ast::node_id::NodeMap<LocalDefId>,
+    /// **THE REVERT SET, CONSULTED AT THE SITE** — the F2 repair.
+    ///
+    /// Phase 4's whole property is *"a reverted subtree is not transformed"*,
+    /// and the first repair could not observe it: `decisions` was built WITH the
+    /// revert filter, so `placed ⊆ survivors` held **by construction** and
+    /// `reverted_placed` was empty for a reason no bug could disturb. The
+    /// reconciliation was comparing a lookup key against itself.
+    ///
+    /// Moving the filter here makes the withholding a **checked behaviour**
+    /// instead of a pre-filtered population: the walk now sees every decided
+    /// subject and declines the reverted ones at this line. Delete that check
+    /// and `reverted_placed` fires — which is what "observable" means.
+    ///
+    /// **Behaviour is unchanged**: previously a reverted subject missed the
+    /// `decisions` lookup and returned; now it is found and declined. Neither
+    /// path rewrites, claims a node, or renders — so the emitted AST is
+    /// identical and every phase-3 line is untouched.
+    ///
+    /// Empty for [`transform_inner`], which applies no revert set.
+    pub reverted_fns: &'a FxHashSet<LocalDefId>,
     /// **The survivors' `HirId`s alone** — the half of the decision key that is
     /// available when `current_fn` is not.
+    ///
+    /// **No longer derivable from [`Self::decisions`]** now that the revert
+    /// filter moved to the site: `decisions` carries every decided subject
+    /// while this carries only the ones a placement is OWED for. The
+    /// maintainability review flagged the old shape as a projection recomputed
+    /// at each construction site; the two sets are genuinely different now, so
+    /// passing both is information rather than duplication.
     ///
     /// Sound as an identity because a binding's `HirId.owner` **is** its body
     /// owner: for a param or local of `F`, the owner is `F`, so a `HirId` in
@@ -502,6 +534,15 @@ impl RefDeclVisitor<'_> {
         let Some(&(form, mutable)) = self.decisions.get(&(fn_did, hir_id)) else {
             return;
         };
+        // **THE REVERT CHECK, AT THE SITE.** Before the shape check and before
+        // the claim, so a withheld declaration behaves exactly as it did when
+        // the population was pre-filtered: untouched, unclaimed, unrendered.
+        // The difference is that it is now a CHECK a mutation can break, rather
+        // than a set membership no bug could disturb.
+        if self.reverted_fns.contains(&fn_did) {
+            self.stats.reverted_withheld += 1;
+            return;
+        }
         // **The shape check runs BEFORE the claim** (arm-2 review). Claiming
         // first meant a declaration this pass cannot transform still took
         // OWNERSHIP of the node, so a later transform that legitimately wanted
@@ -1285,11 +1326,16 @@ fn transform_inner(
     // `arms_full` applies no revert set, so here the population is every
     // decided subject.
     let subject_hirs: FxHashSet<HirId> = decisions.keys().map(|(_, h)| *h).collect();
+    // `arms_full` applies NO revert set, so the site check is a no-op here and
+    // every decided subject is owed a placement. Named rather than defaulted,
+    // so the empty set is a statement instead of an omission.
+    let no_reverts: FxHashSet<LocalDefId> = FxHashSet::default();
     let mut guard = Composition::default();
     let mut v = RefDeclVisitor {
         local_map: &map.local_map,
         decisions: &decisions,
         global_map: &map.global_map,
+        reverted_fns: &no_reverts,
         subject_hirs: &subject_hirs,
         current_fn: None,
         guard: &mut guard,
@@ -1943,13 +1989,18 @@ pub(crate) fn phase3_fn_parity(
     let mut decisions: FxHashMap<(LocalDefId, HirId), (DeclForm, bool)> = FxHashMap::default();
     let mut uses: FxHashMap<(u32, u32), String> = FxHashMap::default();
     for (subject, decision) in &table.entries {
-        // **The revert set, applied to the AST layer by the same rule
-        // `emit_files` applies it by** — the owning function's `LocalDefId`.
-        // Without this the AST side would transform functions the span side
-        // took back, and every one would present as a difference.
-        if !reverts.keeps_subject(subject.fn_did) {
-            continue;
-        }
+        // **THE PRE-FILTER IS GONE — this is the F2 repair.**
+        //
+        // The revert set used to be applied HERE, which made `placed ⊆
+        // survivors` true by construction and `reverted_placed` empty for a
+        // reason no bug could disturb. It now applies at the transform site
+        // (see [`RefDeclVisitor::reverted_fns`]), so the declaration walk sees
+        // every decided subject and DECLINES the reverted ones — a checked
+        // behaviour a mutation can break.
+        //
+        // The emitted AST is unchanged: a reverted subject previously missed
+        // the lookup and returned, and now is found and declined. Neither path
+        // rewrites, claims, or renders.
         let (form, mutable, use_edits) = match decision {
             super::decision::Decision::Ref { mutable } => (DeclForm::Ref, *mutable, None),
             super::decision::Decision::Slice { mutable, uses } => {
@@ -1966,11 +2017,25 @@ pub(crate) fn phase3_fn_parity(
         // has had since arm 2 and this gate did not: a map that silently
         // overwrites holds fewer edits than the table does, and every
         // downstream count then agrees with itself while being short.
+        //
+        // ⚠ This now runs over the FULL decided population rather than the
+        // surviving 62, because the revert filter moved to the transform site.
+        // The previous 0 was measured over 62; this is a first measurement over
+        // 1,120, and a nonzero is a genuine FINDING (two subjects sharing one
+        // `(fn_did, hir_id)` — plausible where MIR splits one HIR binding into
+        // several locals), not a regression of this change.
         if decisions
             .insert((subject.fn_did, subject.hir_id), (form, mutable))
             .is_some()
         {
             p.decision_key_collisions += 1;
+        }
+        // The use edits stay filtered: arm 2's use grafts have no site check,
+        // so handing the walk a reverted subject's uses WOULD change the
+        // emitted AST. Only the declaration pass gained a site check, and only
+        // its population is widened.
+        if !reverts.keeps_subject(subject.fn_did) {
+            continue;
         }
         for u in use_edits.into_iter().flatten() {
             if uses
@@ -1988,6 +2053,7 @@ pub(crate) fn phase3_fn_parity(
         local_map: &map.local_map,
         decisions: &decisions,
         global_map: &map.global_map,
+        reverted_fns: &reverts.fns,
         subject_hirs: &subject_hirs,
         current_fn: None,
         guard: &mut guard,
@@ -2045,6 +2111,7 @@ pub(crate) fn phase3_fn_parity(
     p.ast_use_unmatched = grafts_stats.unmatched;
     p.orphan_subject = decls_stats.orphan_subject;
     p.decl_refused = decls_stats.refused;
+    p.reverted_withheld = decls_stats.reverted_withheld;
 
     // **THE RECONCILIATION — identities, not cardinalities.**
     let placed: FxHashSet<(LocalDefId, HirId)> = decls_stats.placed_ids.iter().copied().collect();
@@ -2392,6 +2459,11 @@ pub(crate) struct FnParity {
     pub recon_missing_unattributed: i64,
     /// An `impl`-method subject the walk reached with no owning function.
     pub orphan_subject: usize,
+    /// **The site revert check's own denominator.** Decided subjects the walk
+    /// reached and DECLINED because their owner is reverted. Non-zero is the
+    /// evidence that `recon_reverted_placed`'s zero is a measurement rather
+    /// than a construction — a zero here would mean the check never ran.
+    pub reverted_withheld: usize,
     /// The reconciliation's class-tagged rows, on their OWN channel — see the
     /// note at the assignment site for the two faults that kept them out of
     /// [`Self::examples`].
@@ -3043,11 +3115,15 @@ mod arm2_witnesses {
             );
 
             let subject_hirs: FxHashSet<HirId> = decisions.keys().map(|(_, h)| *h).collect();
+            // No revert set in these fixtures: the site check is a no-op, so
+            // each test isolates the behaviour it names.
+            let no_reverts: FxHashSet<LocalDefId> = FxHashSet::default();
             let mut guard = Composition::default();
             let mut v = RefDeclVisitor {
                 local_map: &local_map,
                 decisions: &decisions,
                 global_map: &global_map,
+                reverted_fns: &no_reverts,
                 subject_hirs: &subject_hirs,
                 current_fn: None,
                 guard: &mut guard,
@@ -3125,11 +3201,15 @@ mod arm2_witnesses {
             );
             let subject_hirs: FxHashSet<HirId> = decisions.keys().map(|(_, h)| *h).collect();
 
+            // No revert set in these fixtures: the site check is a no-op, so
+            // each test isolates the behaviour it names.
+            let no_reverts: FxHashSet<LocalDefId> = FxHashSet::default();
             let mut guard = Composition::default();
             let mut v = RefDeclVisitor {
                 local_map: &local_map,
                 decisions: &decisions,
                 global_map: &global_map,
+                reverted_fns: &no_reverts,
                 subject_hirs: &subject_hirs,
                 current_fn: None,
                 guard: &mut guard,
@@ -3145,6 +3225,99 @@ mod arm2_witnesses {
             );
             assert_eq!(stats.rewritten, 0, "and must not be transformed");
             assert!(stats.placed_ids.is_empty(), "and places no identity");
+        });
+    }
+
+    /// **THE F2 REPAIR, WITNESSED — a reverted subject is DECLINED, and the
+    /// decline is a check that can fail.**
+    ///
+    /// The first repair's `reverted_placed` was empty *by construction*:
+    /// `decisions` was pre-filtered, so no input could put a reverted subject
+    /// in front of the walk and the counter's zero meant nothing. The filter
+    /// now lives at the transform site, so this fixture can do what no input
+    /// could do before — hand the walk a decided subject whose owner is
+    /// reverted — and observe that it is withheld.
+    ///
+    /// **This is the test the acceptance criterion asks for**: delete the
+    /// `reverted_fns.contains` branch and `placed_ids` gains the reverted
+    /// subject, which is `reverted_placed` firing at the gate.
+    ///
+    /// *Mutation-tested (M9):* removing that branch makes `rewritten` 1 and
+    /// `reverted_withheld` 0, failing both assertions.
+    #[test]
+    fn a_reverted_subject_is_declined_at_the_site() {
+        rustc_span::create_default_session_globals_then(|| {
+            let mut krate = ::utils::ast::parse_crate("fn f(p: *mut u32) {}".to_owned());
+            let (item_id, pat_id) = {
+                let item = &krate.items[0];
+                let rustc_ast::ItemKind::Fn(f) = &item.kind else { panic!("fixture is a fn") };
+                (item.id, f.sig.decl.inputs[0].pat.id)
+            };
+            let mut local_map = rustc_ast::node_id::NodeMap::default();
+            local_map.insert(pat_id, rustc_hir::CRATE_HIR_ID);
+            let mut global_map = rustc_ast::node_id::NodeMap::default();
+            global_map.insert(item_id, rustc_hir::def_id::CRATE_DEF_ID);
+            // A genuine `*mut u32` with a real decision, so nothing but the
+            // revert check can stop it — the shape check would otherwise take
+            // the credit and the test would pass for the wrong reason.
+            let mut decisions = FxHashMap::default();
+            decisions.insert(
+                (rustc_hir::def_id::CRATE_DEF_ID, rustc_hir::CRATE_HIR_ID),
+                (DeclForm::Ref, true),
+            );
+            let subject_hirs: FxHashSet<HirId> = FxHashSet::default();
+
+            // ---- the control: NOT reverted, so it must be placed ----
+            let no_reverts: FxHashSet<LocalDefId> = FxHashSet::default();
+            let mut guard = Composition::default();
+            let mut v = RefDeclVisitor {
+                local_map: &local_map,
+                decisions: &decisions,
+                global_map: &global_map,
+                reverted_fns: &no_reverts,
+                subject_hirs: &subject_hirs,
+                current_fn: None,
+                guard: &mut guard,
+                stats: RefDeclStats::default(),
+            };
+            v.visit_crate(&mut krate);
+            assert_eq!(
+                (v.stats.rewritten, v.stats.reverted_withheld),
+                (1, 0),
+                "the same subject with an empty revert set MUST be placed — \
+                 without this half, a check that declined EVERYTHING would pass"
+            );
+
+            // ---- the injection: owner reverted, everything else identical ----
+            let mut krate2 = ::utils::ast::parse_crate("fn f(p: *mut u32) {}".to_owned());
+            let reverted: FxHashSet<LocalDefId> =
+                [rustc_hir::def_id::CRATE_DEF_ID].into_iter().collect();
+            let mut guard2 = Composition::default();
+            let mut v2 = RefDeclVisitor {
+                local_map: &local_map,
+                decisions: &decisions,
+                global_map: &global_map,
+                reverted_fns: &reverted,
+                subject_hirs: &subject_hirs,
+                current_fn: None,
+                guard: &mut guard2,
+                stats: RefDeclStats::default(),
+            };
+            v2.visit_crate(&mut krate2);
+            assert_eq!(
+                v2.stats.reverted_withheld, 1,
+                "a decided subject whose owner is REVERTED must be declined at \
+                 the site and counted"
+            );
+            assert_eq!(
+                v2.stats.rewritten, 0,
+                "and must not be transformed — this is phase 4's whole property"
+            );
+            assert!(
+                v2.stats.placed_ids.is_empty(),
+                "and must place NO identity: a non-empty `placed_ids` here is \
+                 exactly what `reverted_placed` reports at the gate"
+            );
         });
     }
 
@@ -3176,11 +3349,15 @@ mod arm2_witnesses {
             let decisions = FxHashMap::default();
             let subject_hirs: FxHashSet<HirId> = FxHashSet::default();
 
+            // No revert set in these fixtures: the site check is a no-op, so
+            // each test isolates the behaviour it names.
+            let no_reverts: FxHashSet<LocalDefId> = FxHashSet::default();
             let mut guard = Composition::default();
             let mut v = RefDeclVisitor {
                 local_map: &local_map,
                 decisions: &decisions,
                 global_map: &global_map,
+                reverted_fns: &no_reverts,
                 subject_hirs: &subject_hirs,
                 current_fn: None,
                 guard: &mut guard,

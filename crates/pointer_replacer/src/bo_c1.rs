@@ -7993,17 +7993,47 @@ mod run {
                 );
                 row.set("p4_orphan_subject", p.orphan_subject.to_string());
                 row.set("p4_decl_refused", p.decl_refused.to_string());
-                // **CAPPED AT THREE so the NAMES survive.** `sanitize`
-                // truncates a value at 120 chars, and a reconciliation whose
-                // rows are cut off has produced counts — not the typed rows
-                // naming the function that the whole repair is for.
-                if !p.recon_examples.is_empty() {
-                    row.set(
-                        "p4_recon_examples",
-                        super::report::sanitize(
-                            &p.recon_examples[..p.recon_examples.len().min(3)].join(" | "),
-                        ),
-                    );
+                // **The site revert check's denominator.** `reverted_placed`'s
+                // zero is only a measurement if the check actually ran, and
+                // this is what says it did.
+                row.set("p4_reverted_withheld", p.reverted_withheld.to_string());
+                // **BUDGETED BY LENGTH, NOT BY COUNT — and per CLASS.**
+                //
+                // The first fix capped at three rows, which fails twice, both
+                // found at the boundary review. `sanitize` truncates at 120
+                // chars, so three moderate labels can still be cut mid-name;
+                // and `reconcile_identities` emits every MISSING row before any
+                // SURPLUS or REVERTED-PLACED, so three missing subjects
+                // suppressed **every later class entirely**. A cap that starves
+                // the class the reconciliation exists to name is not a cap, it
+                // is the original bug in a smaller font.
+                //
+                // Each class now gets its own key and its own byte budget, so
+                // no class can starve another and at least one WHOLE label
+                // survives per nonzero class.
+                for (class, key) in [
+                    ("MISSING", "p4_recon_missing_ex"),
+                    ("SURPLUS", "p4_recon_surplus_ex"),
+                    ("REVERTED-PLACED", "p4_recon_reverted_ex"),
+                ] {
+                    let mut budget = String::new();
+                    for row_text in p.recon_examples.iter().filter(|e| e.starts_with(class)) {
+                        // Always admit the FIRST row of a class whole, even if
+                        // it alone exceeds the budget — sanitize will cut it,
+                        // but a cut name beats no name, and a class that
+                        // reported nothing would read as a class with no
+                        // members.
+                        if !budget.is_empty() && budget.len() + row_text.len() + 3 > 110 {
+                            break;
+                        }
+                        if !budget.is_empty() {
+                            budget.push_str(" | ");
+                        }
+                        budget.push_str(row_text);
+                    }
+                    if !budget.is_empty() {
+                        row.set(key, super::report::sanitize(&budget));
+                    }
                 }
                 // ---- THE TYPED FAILURE CLASSES, READ (F1) ----
                 //
@@ -11015,6 +11045,12 @@ fn p3_row_failures(program: &str, row: &report::Row) -> Vec<String> {
     }
     // The missing-class attribution must not go NEGATIVE, which would mean one
     // subject counted in two classes.
+    //
+    // ⚠ **Labelled honestly (boundary review): this can never be a SOLE
+    // failure.** It is derived from `recon_missing` minus three counters each
+    // gated at zero above, so going negative requires one of them to be nonzero
+    // — which already fails on its own row. A derived diagnostic, not an
+    // independent check, and it is counted as such.
     match num("p4_missing_unattributed") {
         Ok(n) if n >= 0 => {}
         Ok(n) => out.push(format!(
@@ -11022,6 +11058,38 @@ fn p3_row_failures(program: &str, row: &report::Row) -> Vec<String> {
              subject was counted in two classes at once"
         )),
         Err(why) => out.push(why),
+    }
+    // **THE SEAM CONSERVATION IDENTITY.** Every surviving seam target has
+    // exactly one outcome: grafted, never reached, or declined by one of the
+    // typed classes. Without this, a future silent `return None` inside
+    // `SeamGraftVisitor::build` drops `grafted` while `unmatched` and every
+    // decline counter stay at zero — the target evaporates and no counter
+    // moves, because a seam is marked CONSUMED before `build` runs. Named by
+    // the Codex adversarial review with that mechanism attached.
+    let seam_parts = [
+        "p4_seam_grafted",
+        "p4_seam_unmatched",
+        "p4_seam_unsupported",
+        "p4_seam_arg_not_found",
+        "p4_seam_len_absent",
+        "p4_seam_len_parse_failed",
+    ];
+    let mut sum = 0i64;
+    let mut seam_err = None;
+    for k in seam_parts {
+        match num(k) {
+            Ok(n) => sum += n,
+            Err(why) => seam_err = Some(why),
+        }
+    }
+    match (num("p4_seam_targets"), seam_err) {
+        (Ok(t), None) if t == sum => {}
+        (Ok(t), None) => out.push(format!(
+            "{program}: p4_seam_targets={t} != {sum} = the sum of its outcomes \
+             — a seam target reached no outcome, which is how a silent decline \
+             evaporates without moving any counter"
+        )),
+        (Err(why), _) | (Ok(_), Some(why)) => out.push(why),
     }
     // Every compared function must have been EQUAL. Its own identity rather
     // than an inference from `differing == 0`, so a function compared and
@@ -11077,21 +11145,44 @@ fn conforming_p3_row() -> report::Row {
     for key in P4_ZERO_FAILURE_CLASSES {
         row.set(key, "0");
     }
+    // libcsv's MEASURED seam population (sweep at `27218691`): 2 targets, both
+    // grafted. Carried so the conservation identity is exercised over a
+    // NON-EMPTY population — over zero targets it holds vacuously and the
+    // control would prove nothing.
+    row.set("p4_seam_targets", "2");
+    row.set("p4_seam_grafted", "2");
     row
 }
 
 /// The phase-4 failure classes whose corpus value is **zero and gated**.
 ///
-/// Their zeros are not assumed: every one of these is already gated at zero by
-/// [`ARM_ZERO_INVARIANTS`] in the reconciliation sweep, which runs the same two
-/// visitors over the **full** population with an empty revert set. Applying the
-/// real revert set can only shrink the target maps, and each of these counts a
-/// per-target event, so a zero over the superset is a zero over the subset.
+/// ⚠ **Their zeros rest on THREE different bases, not one.** The first version
+/// of this doc claimed [`ARM_ZERO_INVARIANTS`] covered all twelve; three
+/// reviewers found it does not, and the correction was made in the plan
+/// document and **not propagated here** — prose asserting a property the code
+/// does not have, which is this track's founding failure class. Split
+/// explicitly:
 ///
-/// That is exactly why gating them HERE is the repair rather than a duplicate:
-/// the sibling gate reads them with `FxHashSet::default()` for reverts, so seam
-/// placement under a real revert set was measured nowhere — with 7 of the 68
-/// compared functions seam-only.
+/// - **Ten** — the visitor-produced classes — are gated at zero by
+///   [`ARM_ZERO_INVARIANTS`] over the **full** population with an empty revert
+///   set. Applying the real revert set only shrinks the target maps and each
+///   counts a per-target event, so a zero over the superset is a zero over the
+///   subset.
+/// - **`p4_unplaceable`** is not in that list at all. Its zero is S2b.3's
+///   **emit-sweep** pin, which is a *stronger* basis: that sweep applies the
+///   real revert set.
+/// - **`p4_decision_key_collisions`** had **no prior measurement anywhere** —
+///   `transform_inner`'s decision-map join is unguarded — so its zero was a
+///   pre-statement confirmed by the run at `27218691`, over 62 subjects. It now
+///   runs over the full 1,120, which is a **first measurement again**.
+///
+/// And the reason gating them here is not a duplicate is **not** the
+/// monotonicity argument, which if anything implies duplication: it is that the
+/// two gates build their seam maps in **different functions**
+/// (`transform_inner` vs `phase3_fn_parity`), so this one guards a second,
+/// independent construction site. What the sibling genuinely cannot do is
+/// *report* the seam layer under a real revert set — it runs with
+/// `FxHashSet::default()`, with 7 of the 68 compared functions seam-only.
 #[cfg(test)]
 const P4_ZERO_FAILURE_CLASSES: &[&str] = &[
     "p4_seam_unmatched",
@@ -11221,6 +11312,11 @@ fn every_p3_failure_class_actually_fails() {
     // difference against the SURVIVORS and not against the decided.
     row.set("p4_survivor_ids", "0");
     row.set("p4_placed_ids", "0");
+    // brotli's whole population is reverted, so it owns no surviving seam and
+    // the conservation identity holds at 0 == 0. Set explicitly rather than
+    // inherited from libcsv's 2/2, which would make this row unrepresentable.
+    row.set("p4_seam_targets", "0");
+    row.set("p4_seam_grafted", "0");
     assert!(
         p3_row_failures("brotli", &row).is_empty(),
         "compared=0 with emitted=0 is LEGAL — five programs are legitimately \
@@ -11351,6 +11447,53 @@ fn every_p4_failure_class_actually_fails() {
         f.iter().any(|m| m.contains("negative")),
         "a negative attribution residue must fail: {f:?}"
     );
+    // ---- THE SEAM CONSERVATION IDENTITY, both directions ----
+    //
+    // The failure this exists for is a target that reaches NO outcome: a silent
+    // `return None` inside `build` after the seam was marked consumed. That
+    // presents as `grafted` falling with every decline counter still at zero,
+    // which is the first case here.
+    for grafted in ["1", "3"] {
+        let mut row = conforming_p3_row();
+        row.set("p4_seam_grafted", grafted);
+        let f = p3_row_failures("libcsv", &row);
+        assert!(
+            f.iter().any(|m| m.contains("p4_seam_targets")),
+            "p4_seam_grafted={grafted} against 2 targets must break \
+             conservation: {f:?}"
+        );
+    }
+    // A decline class absorbing the difference must RESTORE the identity —
+    // otherwise the check would be a disguised `grafted == targets` and every
+    // legitimate decline would fail it.
+    let mut declined = conforming_p3_row();
+    declined.set("p4_seam_grafted", "1");
+    declined.set("p4_seam_unsupported", "1");
+    assert!(
+        p3_row_failures("libcsv", &declined)
+            .iter()
+            .all(|m| !m.contains("p4_seam_targets")),
+        "1 grafted + 1 unsupported == 2 targets is CONSERVED and must not fail \
+         the identity: {:?}",
+        p3_row_failures("libcsv", &declined)
+    );
+    // ...but it must still fail on the decline class's own zero-gate, so the
+    // conservation check cannot be used to launder a nonzero failure class.
+    assert!(
+        p3_row_failures("libcsv", &declined)
+            .iter()
+            .any(|m| m.contains("p4_seam_unsupported")),
+        "a conserved decline is still a STOP on its own row"
+    );
+    for key in ["p4_seam_targets", "p4_seam_grafted"] {
+        let mut row = conforming_p3_row();
+        row.0.retain(|(k, _)| k != key);
+        let f = p3_row_failures("libcsv", &row);
+        assert!(
+            f.iter().any(|m| m.contains(key) && m.contains("MISSING")),
+            "an ABSENT {key} must fail: {f:?}"
+        );
+    }
     // ---- CHECKS 3–5: every zero-gated class, one at a time ----
     for key in [
         "p4_unplaced",
@@ -11421,6 +11564,16 @@ fn a_seam_dropped_by_both_layers_cannot_vanish() {
     let mut row = conforming_p3_row();
     // Untouched: compared/equal 18/18, differing 0, the ledger closes, the walk
     // placed every surviving subject. Nothing in the parity half can see this.
+    //
+    // **The row is kept CONSISTENT**: a seam the walk never reached is a seam
+    // that was not grafted, so of libcsv's 2 targets one is grafted and one is
+    // unmatched. The first version moved `unmatched` alone and left `grafted`
+    // at 2, which is a row the instrument cannot emit — and the seam
+    // conservation identity, added later in this same batch, caught it. That is
+    // the reviewers' "injections produce impossible rows" point arriving as a
+    // test failure rather than as an argument, and the fix makes this witness
+    // strictly stronger.
+    row.set("p4_seam_grafted", "1");
     row.set("p4_seam_unmatched", "1");
     let f = p3_row_failures("libcsv", &row);
     assert!(
@@ -11457,6 +11610,170 @@ fn a_seam_dropped_by_both_layers_cannot_vanish() {
 /// revert set is held, never re-derived, because phase 3 tests the transform
 /// layer and phase 4 tests the revert layer. A run that re-derived reverts
 /// would make any difference ambiguous between the two.
+/// **THE ORACLE'S CONTENT, VERIFIED — not merely its manifest.**
+///
+/// The digest check hashes `SHA256SUMS.txt`'s own BYTES. It therefore proves
+/// which manifest is present and **nothing whatever about the files the
+/// manifest lists**. Edit one `{program}.reverts.txt` in place — swap an owner
+/// for another with the same line count — and the manifest is untouched, the
+/// digest still matches, and the ledger `1120 = 62 + 1058` is unchanged.
+///
+/// **Every derivation downstream then certifies the same wrong population.**
+/// Survivor classification, the AST layer's filter and the span layer's
+/// emission all consume that one revert set, so a differential cannot see it:
+/// the corruption moves both sides identically. That is not a gap a second
+/// derivation can close — it is why the premise must be guarded AT THE INPUT,
+/// which is the principle the digest check's own comment states and did not
+/// implement. Found by the Codex adversarial review at the phase-4 boundary,
+/// after five persona reviews missed it.
+///
+/// # Two checks, because one of them is about ABSENCE
+///
+/// 1. every manifest-listed file hashes to its recorded value;
+/// 2. every `.reverts.txt` the workers will actually READ is listed at all —
+///    an unlisted file is an unverified file, and check 1 is silent about it.
+///
+/// # Pure over a reader, so the negative controls need no filesystem
+///
+/// `read` returns the bytes for one manifest name, or `None` when the file is
+/// absent. The corpus call site reads the oracle directory; the tests hand over
+/// a map, which is what lets the **owner-swap** control be exact rather than
+/// approximated by touching a real snapshot.
+#[cfg(test)]
+fn oracle_content_failures(
+    sums_text: &str,
+    needed: &[String],
+    read: impl Fn(&str) -> Option<Vec<u8>>,
+) -> Vec<String> {
+    use sha2::{Digest, Sha256};
+    let mut out = Vec::new();
+    let mut listed: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for line in sums_text.lines().map(str::trim).filter(|l| !l.is_empty()) {
+        // `shasum`'s format is `<hex>  <name>`; the name may contain spaces, so
+        // the split is on the FIRST gap only and the remainder is the name.
+        let Some((want, name)) = line.split_once("  ") else {
+            out.push(format!(
+                "malformed manifest line {line:?} — expected `<hex>  <name>`"
+            ));
+            continue;
+        };
+        let name = name.trim();
+        listed.insert(name.to_owned());
+        let Some(bytes) = read(name) else {
+            out.push(format!(
+                "{name}: listed in the manifest and MISSING from the oracle"
+            ));
+            continue;
+        };
+        let got = {
+            let mut h = Sha256::new();
+            h.update(&bytes);
+            format!("{:x}", h.finalize())
+        };
+        if got != want {
+            out.push(format!(
+                "{name}: CONTENT MISMATCH — manifest says {want}, file hashes \
+                 {got}. The oracle's content is not the oracle that was published"
+            ));
+        }
+    }
+    // **CHECK 2 — an unlisted file is an unverified file.** Check 1 iterates the
+    // manifest, so a revert file the workers read but the manifest never named
+    // would sail past it in total silence.
+    for want in needed {
+        if !listed.contains(want) {
+            out.push(format!(
+                "{want}: the workers will READ this file and the manifest does \
+                 not list it — it would be consumed unverified"
+            ));
+        }
+    }
+    out
+}
+
+#[test]
+fn oracle_content_verification_catches_an_owner_swap() {
+    // A two-file manifest whose hashes are real, so the conforming case is not
+    // a tautology over invented digests.
+    let hash = |b: &[u8]| {
+        use sha2::{Digest, Sha256};
+        let mut h = Sha256::new();
+        h.update(b);
+        format!("{:x}", h.finalize())
+    };
+    let good = b"binn::a#1\nbinn::b#2\n".to_vec();
+    // **THE OWNER SWAP — the exact attack the digest cannot see.** Same line
+    // count, same byte length, one owner changed.
+    let swapped = b"binn::a#1\nbinn::c#2\n".to_vec();
+    assert_eq!(
+        good.len(),
+        swapped.len(),
+        "the swap must be length-preserving"
+    );
+    let other = b"x\n".to_vec();
+    let sums = format!(
+        "{}  binn.reverts.txt\n{}  other.txt\n",
+        hash(&good),
+        hash(&other)
+    );
+    let needed = vec!["binn.reverts.txt".to_owned()];
+
+    // Conforming: content matches the manifest.
+    let f = oracle_content_failures(&sums, &needed, |n| match n {
+        "binn.reverts.txt" => Some(good.clone()),
+        "other.txt" => Some(other.clone()),
+        _ => None,
+    });
+    assert!(f.is_empty(), "an intact oracle must pass: {f:?}");
+
+    // **THE CONTROL.** The swapped file has the same length and line count, so
+    // every ledger line downstream is unchanged — this check is the only thing
+    // between it and a green run.
+    let f = oracle_content_failures(&sums, &needed, |n| match n {
+        "binn.reverts.txt" => Some(swapped.clone()),
+        "other.txt" => Some(other.clone()),
+        _ => None,
+    });
+    assert!(
+        f.iter()
+            .any(|m| m.contains("binn.reverts.txt") && m.contains("CONTENT MISMATCH")),
+        "an equal-cardinality owner swap MUST fail and name the file: {f:?}"
+    );
+
+    // A listed file that is gone is a failure, not a skip.
+    let f = oracle_content_failures(&sums, &needed, |n| match n {
+        "other.txt" => Some(other.clone()),
+        _ => None,
+    });
+    assert!(
+        f.iter().any(|m| m.contains("MISSING")),
+        "a listed-but-absent file must fail: {f:?}"
+    );
+
+    // **CHECK 2** — a revert file the workers read that the manifest omits.
+    let f = oracle_content_failures(
+        &format!("{}  other.txt\n", hash(&other)),
+        &needed,
+        |n| match n {
+            "other.txt" => Some(other.clone()),
+            _ => None,
+        },
+    );
+    assert!(
+        f.iter()
+            .any(|m| m.contains("binn.reverts.txt") && m.contains("consumed unverified")),
+        "an unlisted revert file must fail — check 1 iterates the manifest and \
+         is silent about it: {f:?}"
+    );
+
+    // A malformed manifest line is a typed row, never a skip.
+    let f = oracle_content_failures("not-a-manifest-line\n", &[], |_| None);
+    assert!(
+        f.iter().any(|m| m.contains("malformed")),
+        "a malformed manifest line must fail: {f:?}"
+    );
+}
+
 #[test]
 #[ignore = "phase-3 exit gate: spawns one worker per program"]
 fn m1_p3_corpus() {
@@ -11490,6 +11807,25 @@ fn m1_p3_corpus() {
         "oracle digest MISMATCH at {oracle} — this gate cites `fdcd2c61…` and \
          this is not it"
     );
+    // **AND THE CONTENT, not only the manifest.** The digest above proves which
+    // manifest is present and nothing about the files it lists; see
+    // [`oracle_content_failures`] for the equal-cardinality owner swap that
+    // walks straight through it. This runs BEFORE any worker starts, because it
+    // certifies the premise every other check in both gates consumes.
+    let sums_text = String::from_utf8_lossy(&sums_bytes).into_owned();
+    let needed: Vec<String> = CORPUS
+        .iter()
+        .map(|p| format!("{}.reverts.txt", p.name))
+        .collect();
+    let content = oracle_content_failures(&sums_text, &needed, |name| {
+        std::fs::read(std::path::Path::new(&oracle).join(name)).ok()
+    });
+    assert!(
+        content.is_empty(),
+        "oracle CONTENT verification failed ({} finding(s)) at {oracle}:\n  {}",
+        content.len(),
+        content.join("\n  ")
+    );
     let timeout = Duration::from_secs(
         std::env::var("CRAT_BOC1_P3_TIMEOUT_SECS")
             .ok()
@@ -11503,6 +11839,7 @@ fn m1_p3_corpus() {
     // only evidence over a non-empty population, and seam placement under a
     // real revert set is precisely what nothing measured before this repair.
     let (mut seam_targets, mut use_targets, mut survivor_ids) = (0u64, 0u64, 0u64);
+    let mut withheld = 0u64;
 
     for program in CORPUS {
         let input = program.input_path(&root);
@@ -11543,6 +11880,7 @@ fn m1_p3_corpus() {
         seam_targets += num("p4_seam_targets").max(0) as u64;
         use_targets += num("p4_use_targets").max(0) as u64;
         survivor_ids += num("p4_survivor_ids").max(0) as u64;
+        withheld += num("p4_reverted_withheld").max(0) as u64;
         println!("{}", report::to_kv_line(&row));
     }
 
@@ -11587,6 +11925,22 @@ fn m1_p3_corpus() {
         survivor_ids > 0,
         "the reconciliation owed NOTHING on any program — an identity check \
          over an empty survivor set cannot fail and is not a check"
+    );
+    // **The third denominator, which shipped unasserted** — four use-class
+    // zeros rode an unchecked population until the boundary review said so.
+    assert!(
+        use_targets > 0,
+        "the phase-4 gate saw NO surviving use targets, so every use failure \
+         class reads zero for want of a population"
+    );
+    // **The site revert check's own denominator.** `reverted_placed == 0` is a
+    // measurement only if the check ran; a zero here would mean the walk never
+    // met a reverted subject and the F2 repair was inert on this corpus.
+    assert!(
+        withheld > 0,
+        "the site revert check DECLINED NOTHING across 1,058 reverted \
+         subjects — `p4_reverted_placed`'s zero would then be a construction \
+         again, which is the defect this repair exists to remove"
     );
     // **`multi_arm > 0` IS RETIRED AS AN ASSERTION** (ruling 2026-08-14), and
     // the reason is recorded rather than the check merely deleted.
