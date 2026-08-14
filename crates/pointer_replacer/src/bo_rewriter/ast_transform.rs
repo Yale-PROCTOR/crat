@@ -3361,38 +3361,55 @@ mod arm2_witnesses {
     /// The row-level arithmetic was tested; the real subtraction
     /// (`placed_ids.len() − set.len()`) was not.
     ///
-    /// ⚠ **AND IT IS NOT SYNTHESIZABLE AT UNIT LEVEL — measured, not assumed.**
+    /// ⚠ **I RECORDED THIS AS UNWITNESSABLE, AND THAT WAS WRONG.**
     ///
-    /// Two attempts failed and the probe explains both: `parse_crate` yields an
-    /// **unresolved** crate in which every node carries `DUMMY_NODE_ID`
-    /// (`NodeId(4294967040)`). So two params share one `Ty` id, the composition
-    /// guard refuses the second claim, and the walk places once — and a
-    /// re-parse fares no better, since it reproduces the same ids.
+    /// Two attempts failed because `parse_crate` yields an **unresolved** crate
+    /// in which every node carries `DUMMY_NODE_ID` (`NodeId(4294967040)`): the
+    /// two params shared one `Ty` id, the composition guard refused the second
+    /// claim, and the walk placed once. I measured that much correctly — and
+    /// then drew the wrong conclusion from it, banking "not synthesizable at
+    /// unit level" into the record.
     ///
-    /// **The guard doing its job is precisely what makes the hazard
-    /// unreachable here.** So this test witnesses what is true — one placement,
-    /// one refusal — and the limit is recorded rather than dressed up: the
-    /// producer path for `placed_dup` has **no unit witness**, and its zero
-    /// rests on the row-level gate plus the corpus run. Its real-world shape,
-    /// two AST bindings resolving to one `HirId`, needs a genuine HIR map.
+    /// **The round-2 testing review declined to accept the limit**, pointing
+    /// out that `NodeId::from_u32` is public and `Pat::id` / `Ty::id` are public
+    /// fields. They are: the fixture below assigns its own ids and the walk
+    /// places **twice under one identity with no refusal**, which is exactly the
+    /// shape `placed_dup` exists to count. A measured premise (`DUMMY_NODE_ID`
+    /// everywhere) does not license an unmeasured conclusion (*therefore
+    /// nothing can be done*), and the distance between those two is where this
+    /// went wrong.
     ///
-    /// This also explains a fixture rule for the whole file: any witness
-    /// needing two DISTINCT nodes must supply its own ids or use a fresh guard
-    /// per pass, which is what the sibling `multi_matched` witness does.
+    /// What survives from that episode is a real fixture rule for the file:
+    /// **a witness needing two DISTINCT nodes must supply its own ids**, since
+    /// the parser supplies none.
     #[test]
     fn one_identity_placed_twice_is_a_duplicate_not_a_second_subject() {
         rustc_span::create_default_session_globals_then(|| {
             let mut krate =
                 ::utils::ast::parse_crate("fn f(p: *mut u32, q: *mut u32) {}".to_owned());
+            // **THE FIXTURE ASSIGNS THE IDS.** `parse_crate` leaves every node
+            // at `DUMMY_NODE_ID`, which is what made a first attempt collapse
+            // into one placement plus one guard refusal — and what I then
+            // recorded, wrongly, as "not synthesizable at unit level".
+            // `NodeId::from_u32` and the `Pat`/`Ty` `id` fields are public, so
+            // the fixture supplies the distinctness the parser does not. Found
+            // by the round-2 testing review, which declined to accept the limit
+            // as stated.
             let (item_id, pat_a, pat_b) = {
-                let item = &krate.items[0];
-                let rustc_ast::ItemKind::Fn(f) = &item.kind else { panic!("fixture is a fn") };
+                let item = &mut krate.items[0];
+                item.id = rustc_ast::node_id::NodeId::from_u32(900);
+                let rustc_ast::ItemKind::Fn(f) = &mut item.kind else { panic!("fixture is a fn") };
+                f.sig.decl.inputs[0].pat.id = rustc_ast::node_id::NodeId::from_u32(901);
+                f.sig.decl.inputs[0].ty.id = rustc_ast::node_id::NodeId::from_u32(902);
+                f.sig.decl.inputs[1].pat.id = rustc_ast::node_id::NodeId::from_u32(903);
+                f.sig.decl.inputs[1].ty.id = rustc_ast::node_id::NodeId::from_u32(904);
                 (
                     item.id,
                     f.sig.decl.inputs[0].pat.id,
                     f.sig.decl.inputs[1].pat.id,
                 )
             };
+            assert_ne!(pat_a, pat_b, "the fixture must supply DISTINCT ids");
             let mut local_map = rustc_ast::node_id::NodeMap::default();
             // **BOTH bindings resolve to ONE `HirId`** — the duplicate's source.
             // Their `Ty` nodes are distinct, so the composition guard admits
@@ -3425,17 +3442,18 @@ mod arm2_witnesses {
 
             let distinct: FxHashSet<(LocalDefId, HirId)> =
                 stats.placed_ids.iter().copied().collect();
-            // **MEASURED, and it is the opposite of what this test set out to
-            // show.** Both pats come back as `NodeId(4294967040)` —
-            // `DUMMY_NODE_ID` — because `parse_crate` produces an UNRESOLVED
-            // crate in which every node carries the placeholder. So the two
-            // `Ty` nodes share an id, the composition guard refuses the second
-            // claim, and the walk places once.
             assert_eq!(
                 (stats.placed_ids.len(), distinct.len(), stats.refused),
-                (1, 1, 1),
-                "one placement and one REFUSAL — the guard doing its job is \
-                 what makes the duplicate unsynthesizable here"
+                (2, 1, 0),
+                "TWO placements under ONE identity and NO refusal — the real \
+                 duplicate, produced by the mechanism `placed_dup` exists for"
+            );
+            assert_eq!(
+                stats.placed_ids.len() - distinct.len(),
+                1,
+                "`placed_dup` is exactly this difference, and a set absorbs the \
+                 second placement in silence — which is why the walk hands over \
+                 a Vec and not a set"
             );
         });
     }
