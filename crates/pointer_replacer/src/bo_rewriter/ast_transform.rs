@@ -3671,6 +3671,65 @@ mod arm2_witnesses {
         });
     }
 
+    /// **THE SEAM THE WALK NEVER REACHED — F1's counter, witnessed.**
+    ///
+    /// The gate discarded these stats entirely (`let _ = s.finish();`), and the
+    /// concrete false pass was a seam rejected by *both* the span locator and
+    /// the AST walker: it touches no caller function, appears in neither
+    /// compared population, and leaves parity green while a converted callee
+    /// keeps an unadapted call site — the `E0308` the seam machinery exists to
+    /// remove.
+    ///
+    /// This is the producer half of that repair; the gate half is
+    /// `a_seam_dropped_by_both_layers_cannot_vanish`. Both are needed: a counter
+    /// nothing reads, and a gate over a counter that cannot move, are the same
+    /// failure wearing two hats.
+    ///
+    /// The span is a real coordinate that no node in this crate occupies —
+    /// deliberately not `DUMMY_SP`, which the walk skips by design, so the
+    /// witness tests *not reached* rather than *not eligible*.
+    ///
+    /// *Mutation-tested (M8):* replacing `finish`'s subtraction-over-identities
+    /// with `unmatched = 0` fails this test.
+    #[test]
+    fn a_seam_no_node_matches_is_counted_unmatched() {
+        rustc_span::create_default_session_globals_then(|| {
+            let src = "fn f(s: *mut S) { g((*s).ptr) }";
+            let krate = ::utils::ast::parse_crate(src.to_owned());
+            let arg = call_arg_span(&krate);
+            // One byte narrower than any real node's range.
+            let phantom = arg.with_hi(rustc_span::BytePos(arg.hi().0 - 1));
+            assert!(!phantom.is_dummy(), "the miss must be a real coordinate");
+
+            let (_, stats) = seam_over(
+                src,
+                &[(
+                    phantom,
+                    phantom,
+                    GlueSpec::core(GlueCore::Reborrow, true),
+                    false,
+                )],
+            );
+            assert_eq!(
+                stats.grafted, 0,
+                "nothing may be placed for a target no node carries"
+            );
+            assert_eq!(
+                stats.unmatched, 1,
+                "a seam the walk never reached MUST be counted — this is the \
+                 only place a seam dropped by both layers is visible at all"
+            );
+
+            // ...and the same visitor over a REAL target reads zero, or the
+            // counter would be firing on something other than the miss.
+            let (_, ok) = seam_over(
+                src,
+                &[(arg, arg, GlueSpec::core(GlueCore::Reborrow, true), false)],
+            );
+            assert_eq!(ok.unmatched, 0, "a reached target is not unmatched");
+        });
+    }
+
     /// **THE CAST PEEL — the surviving subtree is the OPERAND, not the cast.**
     ///
     /// `ArgShape::CastOfLocal` makes the decision layer build its replacement
