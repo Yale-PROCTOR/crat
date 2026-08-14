@@ -7993,6 +7993,18 @@ mod run {
                 );
                 row.set("p4_orphan_subject", p.orphan_subject.to_string());
                 row.set("p4_decl_refused", p.decl_refused.to_string());
+                // **CAPPED AT THREE so the NAMES survive.** `sanitize`
+                // truncates a value at 120 chars, and a reconciliation whose
+                // rows are cut off has produced counts — not the typed rows
+                // naming the function that the whole repair is for.
+                if !p.recon_examples.is_empty() {
+                    row.set(
+                        "p4_recon_examples",
+                        super::report::sanitize(
+                            &p.recon_examples[..p.recon_examples.len().min(3)].join(" | "),
+                        ),
+                    );
+                }
                 // ---- THE TYPED FAILURE CLASSES, READ (F1) ----
                 //
                 // The denominators travel WITH the counters: a zero failure

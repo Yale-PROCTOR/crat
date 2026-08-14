@@ -2063,7 +2063,16 @@ pub(crate) fn phase3_fn_parity(
         - decls_stats.orphan_subject as i64
         - decls_stats.not_a_pointer_decl as i64
         - decls_stats.refused as i64;
-    p.examples.extend(recon.examples);
+    // **ITS OWN CHANNEL, not `examples`.** Two faults found reviewing this
+    // before the sweep landed. The span loop below appends its token-difference
+    // examples under an `examples.len() < 6` cap, so a reconciliation failure
+    // would have SUPPRESSED every phase-3 diagnostic — two instruments sharing
+    // one channel, newest wins. And `report::sanitize` truncates a row value at
+    // 120 chars, so a `" | "`-joined list of up to twelve rows would have cut
+    // away the very names the reconciliation exists to produce. The charter
+    // asks for mismatches as typed rows NAMING the function; a truncated join
+    // does not satisfy it.
+    p.recon_examples = recon.examples;
 
     // **A composition-guard refusal is STOP-class here.** Carried into the
     // result rather than swallowed: this gate is the first place three
@@ -2383,6 +2392,10 @@ pub(crate) struct FnParity {
     pub recon_missing_unattributed: i64,
     /// An `impl`-method subject the walk reached with no owning function.
     pub orphan_subject: usize,
+    /// The reconciliation's class-tagged rows, on their OWN channel — see the
+    /// note at the assignment site for the two faults that kept them out of
+    /// [`Self::examples`].
+    pub recon_examples: Vec<String>,
     /// Declaration-pass refusals alone, for the attribution above.
     pub decl_refused: usize,
 
