@@ -8133,6 +8133,13 @@ mod run {
                 );
                 row.set("p4_seam_key_collisions", p.seam_key_collisions.to_string());
                 row.set("p4_seam_refused", p.seam_refused.to_string());
+                // **RENDER-GAP CALIBRATION — reported, not gated.** The charter
+                // asked for one comparison, not permanent wiring: a nonzero
+                // here is a STOP a human reads, and whether it becomes a gate
+                // is a decision for after the number exists.
+                row.set("p4_render_compared", p.render_compared.to_string());
+                row.set("p4_render_differing", p.render_differing.to_string());
+                row.set("p4_render_absent", p.render_absent.to_string());
                 row.set("p4_use_targets", p.use_targets.to_string());
                 row.set("p4_use_parse_failed", p.use_parse_failed.to_string());
                 row.set("p4_use_multi_matched", p.use_multi_matched.to_string());

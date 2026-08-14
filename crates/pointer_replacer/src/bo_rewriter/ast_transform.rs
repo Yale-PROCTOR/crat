@@ -2247,6 +2247,78 @@ pub(crate) fn phase3_fn_parity(
     p.use_multi_matched = grafts_stats.multi_matched;
     p.unplaceable = emission.unplaceable.len();
 
+    // ---- RENDER-GAP CALIBRATION (round-3 item 8): bounded, one comparison ----
+    //
+    // **The registered hazard:** this gate verifies the revert property on the
+    // AST replica, while the span half **re-implements the revert filter beside
+    // `render`** — the production applier, and the only code that actually
+    // reverts a seam adapter into a file. `render` is therefore on no path the
+    // gate measures, so a production revert defect ships green.
+    //
+    // Calibrated, not wired: `render` is invoked ONCE with the real revert set,
+    // and its output is compared against a reconstruction built the way this
+    // gate builds one.
+    //
+    // **Compared at FILE level, which SUBSUMES the placed 62** — a deviation
+    // from the charter's per-function wording, taken deliberately. Matching
+    // per-function extents inside a rewritten file needs the net length change
+    // of every prior surviving edit; that offset arithmetic is my code, it can
+    // be wrong, and a calibration whose own instrument is the delicate part
+    // measures itself. File equality gives the per-function claim for free: if
+    // the whole texts agree, every function's slice of them agrees.
+    //
+    // ⚠ `emit_files` calls `render` with an EMPTY revert set — it has already
+    // dropped reverted SUBJECTS at plan-build time — so `emission.files` still
+    // carries seam edits owned by reverted callees. Comparing against that
+    // would measure an expected difference and prove nothing, so this
+    // re-renders with `reverts.names`, which is what production passes.
+    let reverted_names: std::collections::BTreeSet<String> =
+        reverts.names.iter().cloned().collect();
+    let (rendered_files, _) = super::render(&emission.plan, &emission.texts, &reverted_names);
+    for (key, edits) in &emission.plan.by_file {
+        let Some(source) = emission.texts.get(key) else {
+            continue;
+        };
+        let mut kept: Vec<(usize, usize, &str)> = edits
+            .iter()
+            .filter(|e| reverts.keeps(&e.owner_fn))
+            .map(|e| (e.lo, e.hi, e.replacement.as_str()))
+            .collect();
+        if kept.is_empty() {
+            continue;
+        }
+        // Back-to-front, exactly as this gate's per-function splice does it:
+        // offsets address the ORIGINAL.
+        kept.sort_by_key(|(lo, ..)| std::cmp::Reverse(*lo));
+        let mut mine = source.clone();
+        for (lo, hi, rep) in &kept {
+            if *lo <= *hi && *hi <= mine.len() {
+                mine.replace_range(*lo..*hi, rep);
+            }
+        }
+        p.render_compared += 1;
+        match rendered_files.get(key) {
+            Some(theirs) if *theirs == mine => {}
+            Some(_) => {
+                p.render_differing += 1;
+                if p.examples.len() < 8 {
+                    p.examples
+                        .push(format!("RENDER-GAP {key:?}: reconstruction != render"));
+                }
+            }
+            // `render` skips a file whose surviving edits are empty; this loop
+            // already `continue`d on that, so an absence here is a real
+            // divergence about WHICH files were touched, not a nothing.
+            None => {
+                p.render_absent += 1;
+                if p.examples.len() < 8 {
+                    p.examples
+                        .push(format!("RENDER-GAP {key:?}: render emitted no file"));
+                }
+            }
+        }
+    }
+
     // ---- PHASE 4's ledger, on the new layer ----
     p.decided_subjects = table
         .entries
@@ -2669,6 +2741,18 @@ pub(crate) struct FnParity {
     /// The seam pass's own refusals — a term in the conservation identity, not
     /// a second gate (`p4_refused` gates the joint count across all passes).
     pub seam_refused: usize,
+
+    // ---- RENDER-GAP CALIBRATION (round-3 item 8) ----
+    /// Files compared between this gate's own reconstruction and
+    /// `bo_rewriter::render`'s output under the REAL revert set — the
+    /// production applier, which no other check in this gate exercises.
+    pub render_compared: usize,
+    /// Files where the two disagree. **The whole point of the calibration**:
+    /// nonzero is a finding about the gate's span-side reconstruction, not
+    /// about the code under test.
+    pub render_differing: usize,
+    /// Files this gate reconstructed that `render` did not emit at all.
+    pub render_absent: usize,
     /// Use targets surviving the revert filter — the other denominator.
     pub use_targets: usize,
     pub use_parse_failed: usize,
