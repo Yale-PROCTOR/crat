@@ -2274,7 +2274,18 @@ pub(crate) fn phase3_fn_parity(
     // re-renders with `reverts.names`, which is what production passes.
     let reverted_names: std::collections::BTreeSet<String> =
         reverts.names.iter().cloned().collect();
-    let (rendered_files, _) = super::render(&emission.plan, &emission.texts, &reverted_names);
+    // **THE ROLLBACKS ARE NOT DISCARDED.** `let (files, _) = render(..)` is
+    // `let _ = s.finish()` wearing different clothes — the third appearance of
+    // that shape in this milestone, and I wrote it inside the item repairing a
+    // hazard. A rollback is the ONE production-coherence signal this gate
+    // uniquely has: `apply` emits one when an edit could not be placed
+    // coherently, and nothing else in either gate reads them.
+    let (rendered_files, rollbacks) =
+        super::render(&emission.plan, &emission.texts, &reverted_names);
+    p.render_rollbacks = rollbacks.len();
+    for rb in rollbacks.iter().take(4) {
+        p.render_examples.push(format!("ROLLBACK {rb:?}"));
+    }
     for (key, edits) in &emission.plan.by_file {
         let Some(source) = emission.texts.get(key) else {
             continue;
@@ -2287,22 +2298,14 @@ pub(crate) fn phase3_fn_parity(
         if kept.is_empty() {
             continue;
         }
-        // Back-to-front, exactly as this gate's per-function splice does it:
-        // offsets address the ORIGINAL.
-        kept.sort_by_key(|(lo, ..)| std::cmp::Reverse(*lo));
-        let mut mine = source.clone();
-        for (lo, hi, rep) in &kept {
-            if *lo <= *hi && *hi <= mine.len() {
-                mine.replace_range(*lo..*hi, rep);
-            }
-        }
+        let mine = splice_kept(source, &mut kept);
         p.render_compared += 1;
         match rendered_files.get(key) {
             Some(theirs) if *theirs == mine => {}
             Some(_) => {
                 p.render_differing += 1;
-                if p.examples.len() < 8 {
-                    p.examples
+                if p.render_examples.len() < 4 {
+                    p.render_examples
                         .push(format!("RENDER-GAP {key:?}: reconstruction != render"));
                 }
             }
@@ -2311,8 +2314,8 @@ pub(crate) fn phase3_fn_parity(
             // divergence about WHICH files were touched, not a nothing.
             None => {
                 p.render_absent += 1;
-                if p.examples.len() < 8 {
-                    p.examples
+                if p.render_examples.len() < 4 {
+                    p.render_examples
                         .push(format!("RENDER-GAP {key:?}: render emitted no file"));
                 }
             }
@@ -2517,6 +2520,28 @@ pub(crate) fn phase3_fn_parity(
     p.ast_only = ast_touched.difference(&span_touched).count();
     p.span_only += span_touched.difference(&ast_touched).count();
     Ok(p)
+}
+
+/// **APPLY SURVIVING EDITS THE WAY THIS GATE APPLIES THEM — back to front.**
+///
+/// Extracted from the render calibration so the reconstruction has a witness
+/// that needs no `TyCtxt`: the round-3 testing review's point was that a broken
+/// reconstruction could not fail anything, since the calibration is REPORTED
+/// rather than gated (deliberately — the charter asked for one comparison, not
+/// permanent wiring). A number nothing can falsify is the shape this whole
+/// milestone keeps repairing.
+///
+/// Back-to-front because the offsets address the ORIGINAL text, which is the
+/// same discipline `apply` uses and the same one the per-function splice uses.
+pub(crate) fn splice_kept(source: &str, kept: &mut [(usize, usize, &str)]) -> String {
+    kept.sort_by_key(|(lo, ..)| std::cmp::Reverse(*lo));
+    let mut out = source.to_owned();
+    for (lo, hi, rep) in kept.iter() {
+        if *lo <= *hi && *hi <= out.len() {
+            out.replace_range(*lo..*hi, rep);
+        }
+    }
+    out
 }
 
 /// **A MAP INSERT THAT COUNTS ITS OWN COLLISIONS — one mechanism, one witness.**
@@ -2753,6 +2778,15 @@ pub(crate) struct FnParity {
     pub render_differing: usize,
     /// Files this gate reconstructed that `render` did not emit at all.
     pub render_absent: usize,
+    /// **`render`'s own rollbacks** — an edit it could not place coherently.
+    /// The one production-coherence signal this gate has, and it was being
+    /// dropped on the floor.
+    pub render_rollbacks: usize,
+    /// The calibration's rows, on their OWN channel. Sharing `examples` with
+    /// the phase-3 differential is the two-instruments-one-channel defect this
+    /// file already repaired once, for `recon_examples`, in round 2 — and I
+    /// reintroduced it here in round 3.
+    pub render_examples: Vec<String>,
     /// Use targets surviving the revert filter — the other denominator.
     pub use_targets: usize,
     pub use_parse_failed: usize,

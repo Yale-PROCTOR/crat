@@ -8033,28 +8033,11 @@ mod run {
             row.set("t_total_s", secs(t0.elapsed()));
             return row;
         };
-        let got = {
-            use sha2::{Digest, Sha256};
-            let mut h = Sha256::new();
-            h.update(&bytes);
-            format!("{:x}", h.finalize())
-        };
-        if got != want {
-            row.set("p3", "declined");
-            row.set(
-                "p3_detail",
-                super::report::sanitize(&format!(
-                    "oracle CONTENT changed between preflight and read: want {want} got {got}"
-                )),
-            );
-            row.set("t_total_s", secs(t0.elapsed()));
-            return row;
-        }
-        let text = match String::from_utf8(bytes) {
+        let text = match super::verify_oracle_bytes(&bytes, &want) {
             Ok(t) => t,
-            Err(e) => {
+            Err(why) => {
                 row.set("p3", "declined");
-                row.set("p3_detail", super::report::sanitize(&format!("utf8: {e}")));
+                row.set("p3_detail", super::report::sanitize(&why));
                 row.set("t_total_s", secs(t0.elapsed()));
                 return row;
             }
@@ -8140,6 +8123,15 @@ mod run {
                 row.set("p4_render_compared", p.render_compared.to_string());
                 row.set("p4_render_differing", p.render_differing.to_string());
                 row.set("p4_render_absent", p.render_absent.to_string());
+                row.set("p4_render_rollbacks", p.render_rollbacks.to_string());
+                if !p.render_examples.is_empty() {
+                    row.set(
+                        "p4_render_ex",
+                        super::report::sanitize(
+                            &p.render_examples[..p.render_examples.len().min(2)].join(" | "),
+                        ),
+                    );
+                }
                 row.set("p4_use_targets", p.use_targets.to_string());
                 row.set("p4_use_parse_failed", p.use_parse_failed.to_string());
                 row.set("p4_use_multi_matched", p.use_multi_matched.to_string());
@@ -11198,13 +11190,23 @@ fn p3_row_failures(program: &str, row: &report::Row) -> Vec<String> {
             Err(why) => part_errs.push(why),
         }
     }
-    let lhs = match (num("p4_seam_targets"), num("p4_seam_multi_matched")) {
-        (Ok(t), Ok(m)) => Some(t + m),
-        (Err(why), _) | (Ok(_), Err(why)) => {
-            part_errs.push(why);
-            None
+    // **THE SAME REPAIR ON THIS SIDE.** Item 2 removed a last-write-wins
+    // or-pattern from the loop above and left one here, six lines away — so two
+    // simultaneously-missing left-hand keys still reported one row. Found by
+    // the round-3 correctness review; fixing a pattern in one place and leaving
+    // it in the adjacent lines is its own recurring shape.
+    let mut lhs = 0i64;
+    let mut lhs_ok = true;
+    for k in ["p4_seam_targets", "p4_seam_multi_matched"] {
+        match num(k) {
+            Ok(n) => lhs += n,
+            Err(why) => {
+                part_errs.push(why);
+                lhs_ok = false;
+            }
         }
-    };
+    }
+    let lhs = lhs_ok.then_some(lhs);
     let had_errs = !part_errs.is_empty();
     out.extend(part_errs);
     if let (Some(lhs), false) = (lhs, had_errs)
@@ -11312,6 +11314,74 @@ fn conforming_p3_row() -> report::Row {
     row
 }
 
+/// **THE CHECK-TO-USE VERIFICATION — hash the buffer you are about to parse.**
+///
+/// The parent's preflight hashes every oracle file and then hands each worker a
+/// mutable PATH; a replacement or symlink retarget in between is consumed
+/// unverified, and because BOTH derivations use that one revert set, parity and
+/// the ledger stay green over a substituted oracle. Codex's round-2 [high]
+/// finding, and the gap item 0's manifest verification left open.
+///
+/// Pure over the bytes so it has a witness — the round-3 testing review caught
+/// this shipping with **none of its four branches exercised**, in the round
+/// whose whole business is enforcing that rule. Extracted rather than argued
+/// about.
+#[cfg(test)]
+fn verify_oracle_bytes(bytes: &[u8], want_sha: &str) -> Result<String, String> {
+    use sha2::{Digest, Sha256};
+    let got = {
+        let mut h = Sha256::new();
+        h.update(bytes);
+        format!("{:x}", h.finalize())
+    };
+    if got != want_sha {
+        return Err(format!(
+            "oracle CONTENT changed between preflight and read: want {want_sha} got {got}"
+        ));
+    }
+    String::from_utf8(bytes.to_vec()).map_err(|e| format!("oracle is not UTF-8: {e}"))
+}
+
+#[test]
+fn oracle_bytes_are_verified_before_they_are_parsed() {
+    use sha2::{Digest, Sha256};
+    let good = b"binn::a#1\nbinn::b#2\n".to_vec();
+    let sha = {
+        let mut h = Sha256::new();
+        h.update(&good);
+        format!("{:x}", h.finalize())
+    };
+    assert_eq!(
+        verify_oracle_bytes(&good, &sha).expect("matching bytes parse"),
+        String::from_utf8(good.clone()).unwrap(),
+        "the VERIFIED buffer is what comes back — not a re-read"
+    );
+
+    // **THE POST-PREFLIGHT SWAP.** Same length, same line count, one owner
+    // changed: every ledger line downstream is unchanged and this is the only
+    // thing between it and a green run.
+    let swapped = b"binn::a#1\nbinn::c#2\n".to_vec();
+    assert_eq!(good.len(), swapped.len(), "the swap is length-preserving");
+    let why = verify_oracle_bytes(&swapped, &sha).expect_err("a swapped oracle must decline");
+    assert!(
+        why.contains("changed between preflight and read") && why.contains(&sha),
+        "and must name BOTH digests: {why}"
+    );
+
+    // Non-UTF-8 is a typed decline, not a panic — the worker must not abort a
+    // 20-program sweep on one corrupt file.
+    let sha_bad = {
+        let mut h = Sha256::new();
+        h.update([0xffu8, 0xfe]);
+        format!("{:x}", h.finalize())
+    };
+    assert!(
+        verify_oracle_bytes(&[0xff, 0xfe], &sha_bad)
+            .expect_err("non-UTF-8 must decline")
+            .contains("not UTF-8")
+    );
+}
+
 /// **THE RECONCILIATION'S DIAGNOSTIC ROWS — one key per class, budgeted by
 /// LENGTH.**
 ///
@@ -11345,10 +11415,17 @@ fn recon_example_rows(examples: &[String]) -> Vec<(&'static str, String)> {
                 // it is truncated here, on a char boundary, so the cut is this
                 // function's and is visible.
                 if row_text.len() > BUDGET {
-                    budget = row_text
-                        .chars()
-                        .take(BUDGET - MARK.len())
-                        .collect::<String>();
+                    // **CUT BY BYTES, on a boundary.** The budget is a BYTE
+                    // budget (`sanitize` truncates bytes), so cutting by CHARS
+                    // made the "sanitize never re-cuts" invariant hold for
+                    // ASCII only — a multibyte label could still exceed 120
+                    // bytes after a 106-char cut. Found by the round-3
+                    // correctness review.
+                    let mut n = BUDGET - MARK.len();
+                    while n > 0 && !row_text.is_char_boundary(n) {
+                        n -= 1;
+                    }
+                    budget = row_text[..n].to_owned();
                     budget.push_str(MARK);
                 } else {
                     budget.push_str(row_text);
@@ -11398,6 +11475,12 @@ fn recon_example_rows_keep_one_whole_label_per_class() {
         get("p4_recon_reverted_ex").contains("f3::d"),
         "and neither must REVERTED-PLACED: {rows:?}"
     );
+    // The SECOND same-class row joins in, rather than only the first being
+    // kept — the join branch was exercised but never asserted.
+    assert!(
+        get("p4_recon_missing_ex").contains("f1::b"),
+        "a second row of the same class joins in: {rows:?}"
+    );
     // A class with no members emits no key at all, so absence means "none"
     // rather than "the renderer stopped".
     let only_missing = vec!["MISSING:f1::a".to_owned()];
@@ -11425,6 +11508,25 @@ fn recon_example_rows_keep_one_whole_label_per_class() {
         report::sanitize(v),
         *v,
         "sanitize must be a no-op on it — that is what 'the cut is ours' means"
+    );
+
+    // **THE MULTIBYTE CONTROL.** The budget counts BYTES because `sanitize`
+    // truncates bytes; cutting by CHARS made the invariant hold for ASCII only.
+    // 'é' is two bytes, so 300 of them is 600 bytes — a char-count cut would
+    // leave ~212 bytes and `sanitize` would cut it a second time, silently.
+    let multi = format!("MISSING:{}", "é".repeat(300));
+    let rows = recon_example_rows(&[multi]);
+    let v = &rows[0].1;
+    assert!(v.ends_with("~CUT"), "cut visibly: {v:?}");
+    assert!(
+        v.len() <= 110,
+        "the budget is in BYTES: len {} must fit inside sanitize's 120",
+        v.len()
+    );
+    assert_eq!(
+        report::sanitize(v),
+        *v,
+        "and sanitize must be a no-op on a MULTIBYTE label too"
     );
 }
 
