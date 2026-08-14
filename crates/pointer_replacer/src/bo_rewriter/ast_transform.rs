@@ -1845,12 +1845,25 @@ impl RevertSet {
     }
 }
 
+/// **TAKES THE VERIFIED BYTES, NOT A PATH — the check-to-use closure.**
+///
+/// This read the file itself, from a path the parent had hashed *earlier*. The
+/// parent's preflight therefore certified one set of bytes and the worker
+/// consumed whatever was at that path when it got there: a replacement or a
+/// symlink retarget in between is consumed unverified, and because BOTH
+/// derivations use that same set, parity and the ledger stay green over a
+/// substituted revert set. Codex's round-2 [high] finding.
+///
+/// Taking the content as a parameter makes the window unrepresentable rather
+/// than merely small: the caller hashes the buffer it read and hands over that
+/// exact buffer.
 #[cfg(test)]
 pub(crate) fn oracle_reverts(
     tcx: rustc_middle::ty::TyCtxt<'_>,
-    path: &std::path::Path,
+    body: &str,
+    origin: &str,
 ) -> Result<RevertSet, String> {
-    let body = std::fs::read_to_string(path).map_err(|e| format!("read {path:?}: {e}"))?;
+    let path = origin;
     // **EVERY NON-EMPTY LINE MUST PARSE.** This was a `filter_map`, which
     // dropped a malformed line while `subjects` still counted it — so a
     // corrupted oracle could under-revert BOTH sides identically, keep the
@@ -1873,14 +1886,54 @@ pub(crate) fn oracle_reverts(
         wanted.insert(owner);
     }
 
+    // **INJECTIVITY, ASSERTED (item 7).** `def_path_str` is NOT unique in this
+    // corpus — this project's own record measures **295 duplicate `fn` names in
+    // brotli alone** — so a revert line naming a homonym matched EVERY function
+    // of that name and over-reverted them all, silently: `seen.len() ==
+    // wanted.len()` still passed, because `seen` is keyed by NAME while `out`
+    // collected several `LocalDefId`s.
+    //
+    // Over-reverting is invisible to the differential for the usual reason —
+    // both sides consume this one set — and was caught only downstream, by
+    // `decided == emitted + reverted` comparing a `DefId`-keyed set against the
+    // oracle's LINE COUNT. That is a coincidence of two representations, not a
+    // check, and it stops holding the moment that ledger line is relaxed.
+    //
+    // Minimal form, per the round-3 charter: assert the relation is a function,
+    // and report the offenders. **No id-format redesign here** — a
+    // `DefId`-carrying revert format is the real fix and is registered, not
+    // built.
     let mut out = FxHashSet::default();
     let mut seen: FxHashSet<String> = FxHashSet::default();
+    let mut by_name: FxHashMap<String, usize> = FxHashMap::default();
     for did in tcx.hir_body_owners() {
         let p = tcx.def_path_str(did.to_def_id());
         if wanted.contains(p.as_str()) {
             out.insert(did);
+            *by_name.entry(p.clone()).or_default() += 1;
             seen.insert(p);
         }
+    }
+    let mut homonyms: Vec<(&String, &usize)> = by_name.iter().filter(|(_, n)| **n > 1).collect();
+    if !homonyms.is_empty() {
+        homonyms.sort();
+        return Err(format!(
+            "{} reverted owner name(s) in {path:?} resolve to MORE THAN ONE \
+             local function — `def_path_str` is not injective on this corpus \
+             (295 duplicate fn names in brotli alone), so each of these \
+             over-reverts every homonym silently: {:?}",
+            homonyms.len(),
+            homonyms.iter().take(5).collect::<Vec<_>>()
+        ));
+    }
+    // ...and the resolution is TOTAL: one `LocalDefId` per named owner.
+    if out.len() != wanted.len() {
+        return Err(format!(
+            "resolved {} LocalDefId(s) for {} reverted owner name(s) in \
+             {path:?} — the revert resolution must be one-to-one",
+            out.len(),
+            wanted.len()
+        ));
     }
     if seen.len() != wanted.len() {
         let missing: Vec<&&str> = wanted
@@ -1933,7 +1986,8 @@ pub(crate) fn oracle_reverts(
 #[cfg(test)]
 pub(crate) fn phase3_fn_parity(
     tcx: rustc_middle::ty::TyCtxt<'_>,
-    reverts_path: &std::path::Path,
+    reverts_text: &str,
+    reverts_origin: &str,
 ) -> Result<FnParity, String> {
     // **THE AST IS CAPTURED FIRST, BEFORE ANY HIR QUERY.** This function used
     // to receive an already-resolved revert set, and resolving it called
@@ -1951,7 +2005,7 @@ pub(crate) fn phase3_fn_parity(
         (krate, map)
     }));
     let (mut krate, map) = captured.map_err(|_| "AST capture panicked".to_owned())?;
-    let reverts = oracle_reverts(tcx, reverts_path)?;
+    let reverts = oracle_reverts(tcx, reverts_text, reverts_origin)?;
 
     let (table, _ctx) = super::decide_table_with_ctx(tcx)?;
     let emission = super::emit_files(tcx, &table, &reverts.fns)?;
@@ -2136,9 +2190,11 @@ pub(crate) fn phase3_fn_parity(
         // The offending texts behind `len_parse_failed`, capped for artifacts —
         // the count is what gates.
         len_parse_failures: _,
-        // Refusals gate JOINTLY as `p4_refused` across all three passes;
-        // splitting them here would double-count one event.
-        refused: _,
+        // **NOW CARRIED.** Still gated jointly as `p4_refused`, but the seam
+        // pass's own share is a TERM IN THE CONSERVATION IDENTITY: a refusal is
+        // a terminal outcome for a matched target, so an identity without it
+        // misattributes the first real refusal as an evaporation.
+        refused: seam_refused,
         // This gate builds its OWN seam map and counts its own collisions into
         // `p.seam_key_collisions`; the visitor's copy is never populated here.
         key_collisions: _,
@@ -2155,6 +2211,7 @@ pub(crate) fn phase3_fn_parity(
     p.seam_arg_not_found = arg_not_found;
     p.seam_len_absent = len_absent;
     p.seam_len_parse_failed = len_parse_failed;
+    p.seam_refused = seam_refused;
     p.use_parse_failed = grafts_stats.parse_failed;
     p.use_multi_matched = grafts_stats.multi_matched;
     p.unplaceable = emission.unplaceable.len();
@@ -2578,6 +2635,9 @@ pub(crate) struct FnParity {
     pub seam_len_absent: usize,
     pub seam_len_parse_failed: usize,
     pub seam_key_collisions: usize,
+    /// The seam pass's own refusals — a term in the conservation identity, not
+    /// a second gate (`p4_refused` gates the joint count across all passes).
+    pub seam_refused: usize,
     /// Use targets surviving the revert filter — the other denominator.
     pub use_targets: usize,
     pub use_parse_failed: usize,

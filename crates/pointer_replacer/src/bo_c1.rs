@@ -7005,6 +7005,38 @@ mod run {
         // than each taking their own, which `expanded_ast` would refuse.
         match crate::bo_rewriter::ast_transform::arms_full(tcx) {
             Ok((st, gr, sg, d)) => {
+                // **THE SECOND CONSUMPTION SITE, made exhaustive (round-3 item
+                // 4).** The phase-4 site destructures `SeamGraftStats` so a new
+                // counter breaks compilation; I then claimed that guarantee
+                // generally, and it held at ONE of TWO sites. This is the other
+                // one — and it is precisely where item 5's discarded
+                // `orphan_subject` was found, i.e. the site that has already
+                // demonstrated the failure mode once.
+                //
+                // Bound by reference (`ref`) because the fields are read below
+                // rather than moved, and `rendered`/`parse_failures` are the
+                // differential's inputs, not this row's.
+                let crate::bo_rewriter::ast_transform::RefDeclStats {
+                    rewritten: _,
+                    slice_rewritten: _,
+                    opt_rewritten: _,
+                    not_a_pointer_decl: _,
+                    refused: _,
+                    orphan_subject: _,
+                    reverted_withheld: _,
+                    placed_ids: _,
+                    rendered: _,
+                    rendered_arm2: _,
+                } = &st;
+                let crate::bo_rewriter::ast_transform::UseGraftStats {
+                    grafted: _,
+                    parse_failed: _,
+                    parse_failures: _,
+                    unmatched: _,
+                    refused: _,
+                    multi_matched: _,
+                    rendered: _,
+                } = &gr;
                 row.set("arm1_rewritten", st.rewritten.to_string());
                 row.set("arm1_not_ptr_decl", st.not_a_pointer_decl.to_string());
                 row.set("arm1_refused", st.refused.to_string());
@@ -7972,7 +8004,63 @@ mod run {
         };
         let path = dir.join(format!("{name}.reverts.txt"));
         row.set("p3_oracle", path.display().to_string());
-        match crate::bo_rewriter::ast_transform::phase3_fn_parity(tcx, &path) {
+        // **READ ONCE, HASH THAT BUFFER, PARSE THOSE EXACT BYTES.**
+        //
+        // The parent's preflight hashed this file and then handed over a
+        // mutable PATH; a replacement or symlink retarget in between was
+        // consumed unverified, and since both derivations use this one set,
+        // parity and the ledger stayed green over a substituted revert set.
+        // Codex's round-2 [high] finding — the check-to-use gap that item 0's
+        // manifest verification left open.
+        let bytes = match std::fs::read(&path) {
+            Ok(b) => b,
+            Err(e) => {
+                row.set("p3", "declined");
+                row.set("p3_detail", super::report::sanitize(&format!("read: {e}")));
+                row.set("t_total_s", secs(t0.elapsed()));
+                return row;
+            }
+        };
+        // The digest is the PARENT's, pinned from the manifest it verified.
+        // Absent means the worker was driven directly rather than by the gate;
+        // that is a typed decline, never a silent unverified read.
+        let Some(want) = std::env::var("CRAT_M1_ORACLE_SHA").ok() else {
+            row.set("p3", "declined");
+            row.set(
+                "p3_detail",
+                "CRAT_M1_ORACLE_SHA unset — refusing to consume an unverified oracle",
+            );
+            row.set("t_total_s", secs(t0.elapsed()));
+            return row;
+        };
+        let got = {
+            use sha2::{Digest, Sha256};
+            let mut h = Sha256::new();
+            h.update(&bytes);
+            format!("{:x}", h.finalize())
+        };
+        if got != want {
+            row.set("p3", "declined");
+            row.set(
+                "p3_detail",
+                super::report::sanitize(&format!(
+                    "oracle CONTENT changed between preflight and read: want {want} got {got}"
+                )),
+            );
+            row.set("t_total_s", secs(t0.elapsed()));
+            return row;
+        }
+        let text = match String::from_utf8(bytes) {
+            Ok(t) => t,
+            Err(e) => {
+                row.set("p3", "declined");
+                row.set("p3_detail", super::report::sanitize(&format!("utf8: {e}")));
+                row.set("t_total_s", secs(t0.elapsed()));
+                return row;
+            }
+        };
+        let origin = path.display().to_string();
+        match crate::bo_rewriter::ast_transform::phase3_fn_parity(tcx, &text, &origin) {
             Ok(p) => {
                 row.set("p3", "ok");
                 row.set("p3_reverted_subjects", p.reverted_subjects.to_string());
@@ -8023,29 +8111,8 @@ mod run {
                 // Each class now gets its own key and its own byte budget, so
                 // no class can starve another and at least one WHOLE label
                 // survives per nonzero class.
-                for (class, key) in [
-                    ("MISSING", "p4_recon_missing_ex"),
-                    ("SURPLUS", "p4_recon_surplus_ex"),
-                    ("REVERTED-PLACED", "p4_recon_reverted_ex"),
-                ] {
-                    let mut budget = String::new();
-                    for row_text in p.recon_examples.iter().filter(|e| e.starts_with(class)) {
-                        // Always admit the FIRST row of a class whole, even if
-                        // it alone exceeds the budget — sanitize will cut it,
-                        // but a cut name beats no name, and a class that
-                        // reported nothing would read as a class with no
-                        // members.
-                        if !budget.is_empty() && budget.len() + row_text.len() + 3 > 110 {
-                            break;
-                        }
-                        if !budget.is_empty() {
-                            budget.push_str(" | ");
-                        }
-                        budget.push_str(row_text);
-                    }
-                    if !budget.is_empty() {
-                        row.set(key, super::report::sanitize(&budget));
-                    }
+                for (key, value) in super::recon_example_rows(&p.recon_examples) {
+                    row.set(key, super::report::sanitize(&value));
                 }
                 // ---- THE TYPED FAILURE CLASSES, READ (F1) ----
                 //
@@ -8065,6 +8132,7 @@ mod run {
                     p.seam_len_parse_failed.to_string(),
                 );
                 row.set("p4_seam_key_collisions", p.seam_key_collisions.to_string());
+                row.set("p4_seam_refused", p.seam_refused.to_string());
                 row.set("p4_use_targets", p.use_targets.to_string());
                 row.set("p4_use_parse_failed", p.use_parse_failed.to_string());
                 row.set("p4_use_multi_matched", p.use_multi_matched.to_string());
@@ -11083,8 +11151,25 @@ fn p3_row_failures(program: &str, row: &report::Row) -> Vec<String> {
     // decline counter stay at zero — the target evaporates and no counter
     // moves, because a seam is marked CONSUMED before `build` runs. Named by
     // the Codex adversarial review with that mechanism attached.
+    // **THE EXACT FORM (round 3).** The first version summed only
+    // `grafted + unmatched + the four declines` against `targets`, which is NOT
+    // a partition — derived from `SeamGraftVisitor::visit_expr`:
+    //
+    //   * per MATCH exactly one terminal outcome fires: `grafted`, `refused`,
+    //     or one of the four declines (`build` returns `None` down exactly one
+    //     counter's path);
+    //   * `multi_matched` counts matches BEYOND THE FIRST for one key, so total
+    //     matches = distinct-keys-matched + `multi_matched`;
+    //   * `unmatched` = `targets` − distinct-keys-matched.
+    //
+    // Hence `targets + multi_matched == grafted + refused + declines +
+    // unmatched`. The old form silently assumed `refused == multi_matched`; it
+    // was fail-closed only because both are separately gated at zero, and its
+    // first real firing would have misdiagnosed a REFUSAL as an evaporation —
+    // then "fixed" it by widening the sum. Found by two reviewers independently.
     let seam_parts = [
         "p4_seam_grafted",
+        "p4_seam_refused",
         "p4_seam_unmatched",
         "p4_seam_unsupported",
         "p4_seam_arg_not_found",
@@ -11092,21 +11177,62 @@ fn p3_row_failures(program: &str, row: &report::Row) -> Vec<String> {
         "p4_seam_len_parse_failed",
     ];
     let mut sum = 0i64;
-    let mut seam_err = None;
+    // **FIRST ERROR KEPT, and EVERY error reported.** This was
+    // `seam_err = Some(why)` — last-write-wins — pushed through an or-pattern
+    // that emitted exactly one row. A missing `p4_seam_grafted` was therefore
+    // DROPPED whenever any later part key was also missing, and since
+    // `p4_seam_grafted` is in neither zero-key const, that was its only absence
+    // detector. No false pass was possible, but the operator learned of it a
+    // full corpus sweep late.
+    let mut part_errs: Vec<String> = Vec::new();
     for k in seam_parts {
         match num(k) {
             Ok(n) => sum += n,
-            Err(why) => seam_err = Some(why),
+            Err(why) => part_errs.push(why),
         }
     }
-    match (num("p4_seam_targets"), seam_err) {
-        (Ok(t), None) if t == sum => {}
-        (Ok(t), None) => out.push(format!(
-            "{program}: p4_seam_targets={t} != {sum} = the sum of its outcomes \
-             — a seam target reached no outcome, which is how a silent decline \
+    let lhs = match (num("p4_seam_targets"), num("p4_seam_multi_matched")) {
+        (Ok(t), Ok(m)) => Some(t + m),
+        (Err(why), _) | (Ok(_), Err(why)) => {
+            part_errs.push(why);
+            None
+        }
+    };
+    let had_errs = !part_errs.is_empty();
+    out.extend(part_errs);
+    if let (Some(lhs), false) = (lhs, had_errs)
+        && lhs != sum
+    {
+        out.push(format!(
+            "{program}: p4_seam_targets + p4_seam_multi_matched = {lhs} != {sum} \
+             = grafted + refused + unmatched + declines — a matched seam target \
+             reached NO terminal outcome, which is how a silent decline \
              evaporates without moving any counter"
+        ));
+    }
+    // **ITEM 3 — THE SITE CHECK'S DENOMINATOR, GATED PER PROGRAM.**
+    //
+    // `p4_reverted_withheld > 0` was asserted only as a CORPUS AGGREGATE, which
+    // one program satisfies for all twenty: a fully-reverted program could pass
+    // phase 4 with the declaration walk never having run at all.
+    //
+    // The identity gated here — `withheld == reverted_subjects` — was MEASURED
+    // to hold per program on all 20 before it was gated, which is the order
+    // this track now follows. It says every reverted subject's declaration was
+    // REACHED by the walk: a `local_map` miss or an orphan would part the two.
+    //
+    // ⚠ Labelled honestly: this proves the branch EXECUTED over the whole
+    // reverted population. It does NOT prove those subjects would otherwise
+    // have been placed — the site check precedes the shape and claim checks, so
+    // it also counts declarations those would have stopped anyway. The
+    // observability of `reverted_placed` rests on the unit witness (M9); this
+    // is coverage, not opportunity.
+    match (num("p4_reverted_withheld"), num("p3_reverted_subjects")) {
+        (Ok(w), Ok(r)) if w == r => {}
+        (Ok(w), Ok(r)) => out.push(format!(
+            "{program}: p4_reverted_withheld={w} != p3_reverted_subjects={r} —              the site revert check did not reach every reverted subject's              declaration, so `p4_reverted_placed`'s zero covers less than the              population it claims"
         )),
-        (Err(why), _) | (Ok(_), Some(why)) => out.push(why),
+        (Err(why), _) | (Ok(_), Err(why)) => out.push(why),
     }
     // Every compared function must have been EQUAL. Its own identity rather
     // than an inference from `differing == 0`, so a function compared and
@@ -11167,7 +11293,132 @@ fn conforming_p3_row() -> report::Row {
     // control would prove nothing.
     row.set("p4_seam_targets", "2");
     row.set("p4_seam_grafted", "2");
+    // A TERM in the conservation identity, not a zero-gated class of its own:
+    // the arm-3 ruling declined to gate `arm3_refused` because its zero is a
+    // corpus fact rather than a structure, and `p4_refused` gates the joint
+    // count across all three passes. Measured 0 on libcsv.
+    row.set("p4_seam_refused", "0");
+    // libcsv reverts NOTHING (`p3_reverted_subjects` 0), so the site check
+    // withholds nothing — measured, and the brotli control below carries the
+    // non-zero half so the identity is exercised in both directions.
+    row.set("p4_reverted_withheld", "0");
     row
+}
+
+/// **THE RECONCILIATION'S DIAGNOSTIC ROWS — one key per class, budgeted by
+/// LENGTH.**
+///
+/// Extracted from `run_m1_p3` so it has a witness. Three reviewers across two
+/// rounds flagged this logic as untested while its two predecessors both
+/// carried real defects — the first capped by COUNT (three moderate labels
+/// still cut mid-name by `sanitize`'s 120), and both emitted every `MISSING`
+/// row before any `SURPLUS`, so a few missing subjects starved every later
+/// class entirely.
+///
+/// **`BUDGET` is below `sanitize`'s 120 on purpose**, and an over-long first
+/// row is truncated HERE with a visible marker rather than left for the
+/// sanitizer to cut silently mid-identity — the round-2 Codex finding. A cut
+/// name that says it was cut is a diagnostic; one that does not is a wrong
+/// name.
+#[cfg(test)]
+fn recon_example_rows(examples: &[String]) -> Vec<(&'static str, String)> {
+    const BUDGET: usize = 110;
+    const MARK: &str = "~CUT";
+    let mut out = Vec::new();
+    for (class, key) in [
+        ("MISSING", "p4_recon_missing_ex"),
+        ("SURPLUS", "p4_recon_surplus_ex"),
+        ("REVERTED-PLACED", "p4_recon_reverted_ex"),
+    ] {
+        let mut budget = String::new();
+        for row_text in examples.iter().filter(|e| e.starts_with(class)) {
+            if budget.is_empty() {
+                // The first row of a class is ALWAYS admitted — a class that
+                // reported nothing would read as a class with no members — but
+                // it is truncated here, on a char boundary, so the cut is this
+                // function's and is visible.
+                if row_text.len() > BUDGET {
+                    budget = row_text
+                        .chars()
+                        .take(BUDGET - MARK.len())
+                        .collect::<String>();
+                    budget.push_str(MARK);
+                } else {
+                    budget.push_str(row_text);
+                }
+                continue;
+            }
+            if budget.len() + row_text.len() + 3 > BUDGET {
+                break;
+            }
+            budget.push_str(" | ");
+            budget.push_str(row_text);
+        }
+        if !budget.is_empty() {
+            out.push((key, budget));
+        }
+    }
+    out
+}
+
+#[test]
+fn recon_example_rows_keep_one_whole_label_per_class() {
+    // Every class populated, so the ordering hazard is live: `MISSING` rows
+    // come first and must not starve the two after them.
+    let ex: Vec<String> = vec![
+        "MISSING:f1::a".into(),
+        "MISSING:f1::b".into(),
+        "SURPLUS:f2::c".into(),
+        "REVERTED-PLACED:f3::d".into(),
+    ];
+    let rows = recon_example_rows(&ex);
+    let get = |k: &str| -> String {
+        rows.iter()
+            .find(|(key, _)| *key == k)
+            .map(|(_, v)| v.clone())
+            .unwrap_or_default()
+    };
+    assert!(
+        get("p4_recon_missing_ex").contains("f1::a"),
+        "the missing class names its subject: {rows:?}"
+    );
+    assert!(
+        get("p4_recon_surplus_ex").contains("f2::c"),
+        "SURPLUS must NOT be starved by the MISSING rows that precede it — the \
+         exact defect the per-class split repairs: {rows:?}"
+    );
+    assert!(
+        get("p4_recon_reverted_ex").contains("f3::d"),
+        "and neither must REVERTED-PLACED: {rows:?}"
+    );
+    // A class with no members emits no key at all, so absence means "none"
+    // rather than "the renderer stopped".
+    let only_missing = vec!["MISSING:f1::a".to_owned()];
+    let rows = recon_example_rows(&only_missing);
+    assert_eq!(rows.len(), 1, "an empty class emits no key: {rows:?}");
+
+    // **THE OVERSIZED-LABEL CONTROL.** A single label longer than the budget
+    // must come back marked, and short enough that `sanitize`'s 120-char
+    // truncation never touches it — otherwise the identity is cut with no sign
+    // that it was.
+    let long = format!("MISSING:{}", "x".repeat(300));
+    let rows = recon_example_rows(&[long]);
+    let v = &rows[0].1;
+    assert!(
+        v.ends_with("~CUT"),
+        "an over-long label must be cut VISIBLY: {v:?}"
+    );
+    assert!(
+        v.len() <= 110,
+        "...and must fit inside sanitize's 120 so the sanitizer never cuts it \
+         a second time, silently: len {}",
+        v.len()
+    );
+    assert_eq!(
+        report::sanitize(v),
+        *v,
+        "sanitize must be a no-op on it — that is what 'the cut is ours' means"
+    );
 }
 
 /// **The phase-4 IDENTITY classes whose corpus value is zero and gated.**
@@ -11368,6 +11619,11 @@ fn every_p3_failure_class_actually_fails() {
     // inherited from libcsv's 2/2, which would make this row unrepresentable.
     row.set("p4_seam_targets", "0");
     row.set("p4_seam_grafted", "0");
+    row.set("p4_seam_refused", "0");
+    // **brotli's MEASURED withheld**: all 495 of its subjects are reverted and
+    // the walk reached every one. This is the non-zero half of the identity —
+    // without it the gate would be satisfied by a corpus that never withheld.
+    row.set("p4_reverted_withheld", "495");
     assert!(
         p3_row_failures("brotli", &row).is_empty(),
         "compared=0 with emitted=0 is LEGAL — five programs are legitimately \
@@ -11536,13 +11792,81 @@ fn every_p4_failure_class_actually_fails() {
             .any(|m| m.contains("p4_seam_unsupported")),
         "a conserved decline is still a STOP on its own row"
     );
-    for key in ["p4_seam_targets", "p4_seam_grafted"] {
+    for key in [
+        "p4_seam_targets",
+        "p4_seam_grafted",
+        "p4_seam_refused",
+        "p4_seam_multi_matched",
+        "p4_reverted_withheld",
+    ] {
         let mut row = conforming_p3_row();
         row.0.retain(|(k, _)| k != key);
         let f = p3_row_failures("libcsv", &row);
         assert!(
             f.iter().any(|m| m.contains(key) && m.contains("MISSING")),
             "an ABSENT {key} must fail: {f:?}"
+        );
+    }
+    // **THE last-write-wins REPAIR, witnessed.** Two part keys absent at once:
+    // the OLD code kept only the last error and emitted a single row, so a
+    // missing `p4_seam_grafted` — whose ONLY absence detector this is — was
+    // dropped whenever a later key was also missing.
+    let mut two_gone = conforming_p3_row();
+    two_gone.0.retain(|(k, _)| k != "p4_seam_grafted");
+    two_gone.0.retain(|(k, _)| k != "p4_seam_len_absent");
+    let f = p3_row_failures("libcsv", &two_gone);
+    assert!(
+        f.iter().any(|m| m.contains("p4_seam_grafted")),
+        "the FIRST missing part key must survive a later one: {f:?}"
+    );
+    assert!(
+        f.iter().any(|m| m.contains("p4_seam_len_absent")),
+        "...and the later one is reported too — EVERY error, not just one: {f:?}"
+    );
+    // **THE EXACT IDENTITY: `refused` is a terminal outcome, not an
+    // evaporation.** One of libcsv's 2 targets refused instead of grafted
+    // CONSERVES the identity, so the sum must not fire. Under the old form this
+    // row read as "a target reached no outcome" — the misdiagnosis the exact
+    // form removes.
+    let mut refused_one = conforming_p3_row();
+    refused_one.set("p4_seam_grafted", "1");
+    refused_one.set("p4_seam_refused", "1");
+    let f = p3_row_failures("libcsv", &refused_one);
+    assert!(
+        !f.iter().any(|m| m.contains("NO terminal outcome")),
+        "a REFUSAL conserves the identity and must not read as an evaporation: {f:?}"
+    );
+    // **`multi_matched` belongs on the TARGET side.** A second match on one key
+    // yields a second outcome, so it adds to `targets` — the old form had it on
+    // neither side.
+    let mut multi = conforming_p3_row();
+    multi.set("p4_seam_multi_matched", "1");
+    multi.set("p4_seam_grafted", "3");
+    assert!(
+        !p3_row_failures("libcsv", &multi)
+            .iter()
+            .any(|m| m.contains("NO terminal outcome")),
+        "2 targets + 1 multi-match == 3 outcomes is CONSERVED"
+    );
+    let mut multi_bad = conforming_p3_row();
+    multi_bad.set("p4_seam_multi_matched", "1");
+    assert!(
+        p3_row_failures("libcsv", &multi_bad)
+            .iter()
+            .any(|m| m.contains("NO terminal outcome")),
+        "a multi-match with no second outcome must FAIL"
+    );
+    // ---- ITEM 3: the site-check denominator, BOTH directions ----
+    for withheld in ["494", "496"] {
+        let mut row = conforming_p3_row();
+        row.set("p3_reverted_subjects", "495");
+        row.set("p4_decided", "512");
+        row.set("p4_reverted_withheld", withheld);
+        let f = p3_row_failures("libcsv", &row);
+        assert!(
+            f.iter()
+                .any(|m| m.contains("p4_reverted_withheld") && m.contains("p3_reverted_subjects")),
+            "withheld={withheld} against 495 reverted must fail and name BOTH: {f:?}"
         );
     }
     // ---- CHECKS 3–5: every zero-gated class, one at a time ----
@@ -11864,6 +12188,19 @@ fn m1_p3_corpus() {
         content.len(),
         content.join("\n  ")
     );
+    // **THE PINNED PER-PROGRAM DIGESTS, carried TO the workers.** Verifying
+    // here and then handing over a mutable PATH left a check-to-use window:
+    // each worker re-reads over a span bounded by the whole sweep, so a file
+    // replaced in between was consumed unverified — by BOTH derivations at
+    // once, which is why no differential could see it. The worker now hashes
+    // the buffer it parses and compares against the value pinned here.
+    let manifest: std::collections::BTreeMap<String, String> = sums_text
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .filter_map(|l| l.split_once("  "))
+        .map(|(h, n)| (n.trim().to_owned(), h.to_owned()))
+        .collect();
     let timeout = Duration::from_secs(
         std::env::var("CRAT_BOC1_P3_TIMEOUT_SECS")
             .ok()
@@ -11882,12 +12219,28 @@ fn m1_p3_corpus() {
     for program in CORPUS {
         let input = program.input_path(&root);
         assert!(input.is_file(), "missing rs-crown input: {input:?}");
+        // Fail-closed: a program whose revert file the manifest does not name
+        // cannot be run at all, rather than run unverified. `oracle_content_
+        // failures`' check 2 has already made this unreachable; it is asserted
+        // here too because the ENV is what the worker actually trusts.
+        let sha = manifest
+            .get(&format!("{}.reverts.txt", program.name))
+            .unwrap_or_else(|| {
+                panic!(
+                    "{}: no manifest digest for its revert file — the worker                      would consume it unverified",
+                    program.name
+                )
+            })
+            .clone();
         let outcome = orchestrate::run_child_env(
             program.name,
             &input,
             "m1-p3",
             timeout,
-            &[("CRAT_M1_ORACLE_DIR", oracle.clone())],
+            &[
+                ("CRAT_M1_ORACLE_DIR", oracle.clone()),
+                ("CRAT_M1_ORACLE_SHA", sha),
+            ],
         );
         let Some(row) = outcome.row.clone() else {
             failures.push(format!(
