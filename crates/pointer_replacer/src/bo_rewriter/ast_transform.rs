@@ -30,6 +30,11 @@ use rustc_hir::HirId;
 use rustc_span::{DUMMY_SP, Ident, Symbol, def_id::LocalDefId};
 use thin_vec::ThinVec;
 
+// The length's provenance is a DECISION-layer type: `finish_len` is the only
+// place in this file that branches on it, and it branches on the carried value
+// rather than on a re-derivation of it.
+use super::decision::seam::SeamLen;
+
 /// **ARM 2 — which declared form a decision asks for.**
 ///
 /// The three emitting dispositions, carried as a shape rather than as the
@@ -227,9 +232,41 @@ fn expr(kind: rustc_ast::ExprKind) -> P<rustc_ast::Expr> {
 /// is the one genuinely new part, has no subtree behind it, and is therefore
 /// handed in already parsed via [`graft_expr`].
 ///
-/// Returns `None` when a length-bearing shape has no length: the decision layer
-/// gates that as `seam-len-unknown` (93 blocked) precisely so no layer below
-/// invents one, and neither does this.
+/// Returns `None` when a length-bearing shape has no length. After the
+/// fabrication ruling the decision layer no longer *gates* on a missing length —
+/// it fabricates a tagged one — but the principle this arm encodes is unchanged
+/// and is now the whole of it: **no layer below the gate invents a length**, and
+/// neither does this.
+/// **Finish a `from_raw_parts` length expression — the ONE place the two arms
+/// diverge in the AST layer** (R8: a decidable mapping, lifted out).
+///
+/// A licensed companion becomes `(LEN) as usize`, because the C spelling may be
+/// `size_t`/`c_int`/`c_ulong` and `from_raw_parts` takes `usize`. A **fabricated**
+/// extent is left bare: the named const is already `usize`, and casting it would
+/// make a fabricated site textually indistinguishable from a licensed one whose
+/// companion happened to be a path.
+///
+/// Extracted rather than written inline in the visitor because the arm-3
+/// differential renders through this too. Building the cast in the test harness
+/// instead would have made the harness a **second implementation** of the
+/// production rule — the class this milestone's parity work exists to prevent,
+/// and the shape M28/M40 were banked for.
+///
+/// The `usize` is HAND-BUILT with `DUMMY_SP`, never parsed: `parse_ty` opens a
+/// fresh `ParseSess` whose `BytePos` values start at zero and therefore alias
+/// real offsets in this crate's first source file — the hazard `SpanEraser` was
+/// landed for at task 0, invisible to that witness because it collects `Expr`
+/// spans only.
+pub(crate) fn finish_len(seam_len: &SeamLen, parsed: rustc_ast::Expr) -> P<rustc_ast::Expr> {
+    match seam_len {
+        SeamLen::Licensed(_) => expr(rustc_ast::ExprKind::Cast(
+            expr(rustc_ast::ExprKind::Paren(P(parsed))),
+            P(usize_ty()),
+        )),
+        SeamLen::Fabricated => P(parsed),
+    }
+}
+
 pub(crate) fn glue_expr(
     shape: GlueShape,
     mutable: bool,
@@ -267,19 +304,21 @@ pub(crate) fn glue_expr(
             } else {
                 "from_raw_parts"
             };
-            // `(LEN) as usize` — parenthesised exactly as the span layer writes
-            // it, because the companion may be an arbitrary expression.
+            // **`len` arrives FINISHED** (2026-08-12): the caller applied
+            // `(LEN) as usize` for a licensed companion and left a fabricated
+            // extent bare, because only the caller holds the provenance that
+            // decides between them. Building the cast here would have cast the
+            // named const too, making a fabricated site textually
+            // indistinguishable from a licensed one.
             //
-            // The `usize` is HAND-BUILT with `DUMMY_SP`, not parsed. `parse_ty`
-            // opens a fresh `ParseSess` whose `BytePos` values start at zero and
-            // therefore **alias real offsets in this crate's first source
-            // file** — exactly the hazard `SpanEraser` was landed for at task
-            // 0, reintroduced by one line, and invisible to that witness
-            // because it collects `Expr` spans only. `slice_path` just below
-            // already hand-builds for the same reason; this line was the odd
-            // one out. Found by the adversarial review.
-            let cast = expr(ExprKind::Cast(expr(ExprKind::Paren(len)), P(usize_ty())));
-            ExprKind::Call(P(slice_path(ctor)), ThinVec::from_iter([arg, cast]))
+            // The hand-built `usize` (now at the caller) stays hand-built with
+            // `DUMMY_SP`: `parse_ty` opens a fresh `ParseSess` whose `BytePos`
+            // values start at zero and therefore **alias real offsets in this
+            // crate's first source file** — the hazard `SpanEraser` was landed
+            // for at task 0, invisible to that witness because it collects
+            // `Expr` spans only. Found by the adversarial review; preserved
+            // across the move.
+            ExprKind::Call(P(slice_path(ctor)), ThinVec::from_iter([arg, len]))
         }
         GlueShape::FromRefMut => {
             let ctor = if mutable { "from_mut" } else { "from_ref" };
@@ -788,6 +827,16 @@ pub(crate) struct SeamGraftStats {
     /// new expression in arm 3** — it has no subtree behind it, which is why
     /// the split rule sends it through [`graft_expr`] rather than a builder.
     pub len_grafted: usize,
+    /// The **FABRICATED subset** of [`Self::len_grafted`] (ruling 2026-08-12).
+    ///
+    /// A subset, not a sibling: the exhaustive
+    /// `len_grafted + len_parse_failed + len_absent == len_shapes` identity is
+    /// deliberately untouched, so this counter cannot drift the ledger. It
+    /// exists because "how many of the placed lengths were invented" must be
+    /// answerable from **this** layer's own stats and not only from the seam
+    /// census — the ruling's separate-count requirement, applied where the
+    /// expression is actually built.
+    pub len_fabricated: usize,
     /// `{len}` texts [`graft_expr`] refused. A checked corpus expectation of
     /// zero, per R7.4 — never an abort, never a silent skip.
     pub len_parse_failed: usize,
@@ -955,7 +1004,7 @@ impl<'a> SeamGraftVisitor<'a> {
 
     /// Build the adapter around `e`'s own subtree, or decline with a typed row.
     fn build(&mut self, e: &rustc_ast::Expr, target: &SeamTarget) -> Option<rustc_ast::ExprKind> {
-        use super::decision::seam::GlueCore;
+        use super::decision::seam::{GlueCore, SeamLen};
         let spec = &target.spec;
         // The unwrap family is deliberately unbuilt — see [`SeamGraftStats`].
         if spec.unwrap.is_some() {
@@ -1014,12 +1063,22 @@ impl<'a> SeamGraftVisitor<'a> {
         if matches!(spec.core, GlueCore::FromRawParts) {
             self.stats.len_shapes += 1;
         }
-        let len = match spec.len.as_deref() {
+        // **The length expression is finished HERE, not in `glue_expr`**
+        // (2026-08-12). A licensed companion is `(TEXT) as usize` because the C
+        // spelling may be `size_t`/`c_int`/`c_ulong`; a FABRICATED extent is the
+        // named const, already `usize`, and casting it would make a fabricated
+        // site textually indistinguishable from a licensed one whose companion
+        // happened to be a path. Two renderings, so the builder that knows WHICH
+        // is the one that must decide — `glue_expr` receives a finished node.
+        let len = match spec.len.as_ref() {
             None => None,
-            Some(text) => match graft_expr(text) {
+            Some(seam_len) => match graft_expr(seam_len.text()) {
                 Ok(parsed) => {
                     self.stats.len_grafted += 1;
-                    Some(P(parsed))
+                    if seam_len.is_fabricated() {
+                        self.stats.len_fabricated += 1;
+                    }
+                    Some(finish_len(seam_len, parsed))
                 }
                 Err(offending) => {
                     self.stats.len_parse_failed += 1;
@@ -1497,8 +1556,25 @@ fn transform_inner(
 pub(crate) fn ast_emitted_source(
     tcx: rustc_middle::ty::TyCtxt<'_>,
 ) -> Result<(String, super::ast_bridge::SubstStats), String> {
-    let (.., krate) = transform_inner(tcx)?;
-    Ok(super::ast_bridge::splice_fn_prints(tcx, &krate))
+    let (_, _, seams, _, _, _, _, krate) = transform_inner(tcx)?;
+    let (mut source, stats) = super::ast_bridge::splice_fn_prints(tcx, &krate);
+    // **The fabricated-extent const, on the SAME condition the span layer uses**
+    // (marker ruling, 2026-08-15): at least one fabricated adapter SURVIVED.
+    //
+    // The condition is read off `len_fabricated`, which counts grafts — and the
+    // seam pass only grafts adapters whose owner the revert set kept — so this
+    // is the same "derived from the survivors" rule `render` applies, asked of
+    // this layer's own ledger rather than re-derived from the span layer's.
+    //
+    // Appended, matching `render`'s end-of-file insertion: the spliced output
+    // replaces function spans in place, so appending here and inserting at
+    // `source.len()` of the original put the item in the same position.
+    if seams.len_fabricated > 0 && !source.is_empty() {
+        source.push('\n');
+        source.push_str(&super::decision::seam::fabricated_len_item());
+        source.push('\n');
+    }
+    Ok((source, stats))
 }
 
 /// **ARM 1's TEXT DIFFERENTIAL** — the rendered declaration vs the span layer's
@@ -1701,6 +1777,13 @@ pub(crate) struct SeamUseSurface {
 pub(crate) struct JustificationCensus {
     pub kind_decision: usize,
     pub seam_adapter: usize,
+    /// The FABRICATED subset of [`Self::seam_adapter`] — a subset, so the
+    /// [`Self::total`] identity is untouched and this cannot drift the ledger.
+    pub seam_adapter_fabricated: usize,
+    /// The crate-level const declaration: **0 or 1 per crate**, and 1 only when
+    /// a fabricated adapter survived. Counted so "the const is present" is a
+    /// measured line rather than something read off the emitted text.
+    pub fabricated_len_const: usize,
     // ---- arm 4's three: expected zero, and MEASURED rather than assumed ----
     pub reroute: usize,
     pub drop_form: usize,
@@ -1714,7 +1797,16 @@ impl JustificationCensus {
     /// **This is NOT an independent denominator**, and gating it against those
     /// same parts is a tautology — see [`Self::edits_in`], which is one.
     pub(crate) fn total(&self) -> usize {
-        self.kind_decision + self.seam_adapter + self.reroute + self.drop_form + self.store_form
+        // `seam_adapter_fabricated` is deliberately absent: it is a SUBSET of
+        // `seam_adapter`, and adding it would double-count every fabricated
+        // placement against `edits_in`. `fabricated_len_const` IS a bucket — it
+        // is a real edit in `by_file` with its own justification.
+        self.kind_decision
+            + self.seam_adapter
+            + self.fabricated_len_const
+            + self.reroute
+            + self.drop_form
+            + self.store_form
     }
 
     /// The plan's edit count, derived **without consulting any justification**.
@@ -1758,7 +1850,13 @@ impl JustificationCensus {
         use super::plan::Justification as J;
         match j {
             J::KindDecision { .. } => self.kind_decision += 1,
-            J::SeamAdapter { .. } => self.seam_adapter += 1,
+            J::SeamAdapter { fabricated, .. } => {
+                self.seam_adapter += 1;
+                if *fabricated {
+                    self.seam_adapter_fabricated += 1;
+                }
+            }
+            J::FabricatedLenConst => self.fabricated_len_const += 1,
             J::ReRoute { .. } => self.reroute += 1,
             J::DropForm { .. } => self.drop_form += 1,
             J::StoreForm { .. } => self.store_form += 1,
@@ -2279,6 +2377,11 @@ pub(crate) fn phase3_fn_parity(
         // sweep, over the full population the revert set does not shrink.
         len_grafted: _,
         len_shapes: _,
+        // The fabricated SUBSET of `len_grafted`. Reported by the seam census
+        // and by the recon sweep, which is where the fabricated population's
+        // separate count is gated; this phase-4 gate reads the placed/refused
+        // partition, and fabrication does not change what that partition means.
+        len_fabricated: _,
         // The offending texts behind `len_parse_failed`, capped for artifacts —
         // the count is what gates.
         len_parse_failures: _,
@@ -5623,7 +5726,19 @@ mod arm2_witnesses {
         for j in [
             J::KindDecision { kind: "Ref(mut)" },
             J::KindDecision { kind: "Ref" },
-            J::SeamAdapter { family: "safe" },
+            J::SeamAdapter {
+                family: "safe",
+                fabricated: false,
+            },
+            // The fabricated adapter is a SUBSET of `seam_adapter`, so it must
+            // increment BOTH — a fabricated placement that stopped counting as
+            // a seam would shrink the placed population while the crate still
+            // carried the adapter.
+            J::SeamAdapter {
+                family: "reborrow",
+                fabricated: true,
+            },
+            J::FabricatedLenConst,
             J::ReRoute {
                 licensing_loan: "L0".to_owned(),
             },
@@ -5638,7 +5753,9 @@ mod arm2_witnesses {
             c,
             JustificationCensus {
                 kind_decision: 2,
-                seam_adapter: 1,
+                seam_adapter: 2,
+                seam_adapter_fabricated: 1,
+                fabricated_len_const: 1,
                 reroute: 1,
                 drop_form: 1,
                 store_form: 1,
@@ -5647,7 +5764,12 @@ mod arm2_witnesses {
              as a `KindDecision` would report the market as zero while the \
              population was not"
         );
-        assert_eq!(c.total(), 6, "the denominator is the sum of the parts");
+        assert_eq!(
+            c.total(),
+            8,
+            "the denominator is the sum of the parts — and `fabricated` is a \
+             SUBSET flag, not a bucket, so it must not appear in it"
+        );
 
         // And an empty plan is genuinely empty, so the zeros the corpus reports
         // are the counter's answer rather than its default being mistaken for
@@ -5681,7 +5803,10 @@ mod arm2_witnesses {
             FileKey::Virtual("a.rs".to_owned()),
             vec![
                 edit(J::KindDecision { kind: "Ref" }),
-                edit(J::SeamAdapter { family: "safe" }),
+                edit(J::SeamAdapter {
+                    family: "safe",
+                    fabricated: false,
+                }),
             ],
         );
         plan.by_file.insert(
@@ -5700,6 +5825,8 @@ mod arm2_witnesses {
             JustificationCensus {
                 kind_decision: 2,
                 seam_adapter: 1,
+                seam_adapter_fabricated: 0,
+                fabricated_len_const: 0,
                 reroute: 0,
                 drop_form: 1,
                 store_form: 0,
@@ -5822,9 +5949,13 @@ mod arm2_witnesses {
             // rule. Exempting only the root made this assertion fire on exactly
             // what arm 3 exists to preserve — caught by running it.
             let kept: FxHashSet<rustc_span::Span> = spans_of(&arg).exprs.into_iter().collect();
-            let len = graft_expr("n").expect("the length parses");
+            let licensed = SeamLen::Licensed("n".to_owned());
+            let len = finish_len(
+                &licensed,
+                graft_expr(licensed.text()).expect("the length parses"),
+            );
             let built = expr(
-                glue_expr(GlueShape::FromRawParts, true, P(arg), Some(P(len)))
+                glue_expr(GlueShape::FromRawParts, true, P(arg), Some(len))
                     .expect("a length-bearing shape with a length builds"),
             );
             let got = spans_of(&built);
@@ -5864,6 +5995,44 @@ mod arm2_witnesses {
                     .any(|s| !s.is_dummy()),
                 "the probe must SEE a parsed type's span, or the assertion \
                  above is vacuous"
+            );
+
+            // ---- THE FABRICATED ARM (ruling 2026-08-12) ----
+            //
+            // A fabricated extent is text that **never existed in the input**,
+            // so it is the purest case of the aliasing hazard this witness
+            // exists for: its spans come from a fresh `ParseSess` whose
+            // `BytePos` values start at zero. Witnessed here rather than
+            // assumed to inherit the licensed arm's protection — the licensed
+            // companion at least corresponds to real source, and it was exactly
+            // that kind of "surely it's the same" reasoning that let the parsed
+            // `usize` through until the adversarial review.
+            let arg2 = ::utils::ast::parse_expr("(*s).ptr".to_owned());
+            let kept2: FxHashSet<rustc_span::Span> = spans_of(&arg2).exprs.into_iter().collect();
+            let fab = finish_len(
+                &SeamLen::Fabricated,
+                graft_expr(SeamLen::Fabricated.text()).expect("the const path parses"),
+            );
+            let built2 = expr(
+                glue_expr(GlueShape::FromRawParts, false, P(arg2), Some(fab))
+                    .expect("the fabricated shape builds"),
+            );
+            let got2 = spans_of(&built2);
+            let leaked2: Vec<_> = got2
+                .exprs
+                .iter()
+                .filter(|s| !s.is_dummy() && !kept2.contains(s))
+                .collect();
+            assert!(
+                leaked2.is_empty(),
+                "the fabricated extent's own nodes must carry DUMMY_SP: {leaked2:?}"
+            );
+            // And it manufactures NO type — the structural difference from the
+            // licensed arm, asserted rather than left to the rendered string.
+            assert!(
+                got2.tys.is_empty(),
+                "a fabricated extent is already `usize` and builds no cast: {:?}",
+                got2.tys
             );
         });
     }
@@ -6059,16 +6228,15 @@ mod arm3_witnesses {
     /// identifier — deliberately. The split rule's whole claim is that the
     /// argument moves across as a SUBTREE; a witness over `p` alone would pass
     /// for an implementation that re-rendered it from scratch.
-    fn rendered(shape: GlueShape, mutable: bool, len: Option<&str>) -> String {
+    fn rendered(shape: GlueShape, mutable: bool, len: Option<SeamLen>) -> String {
         let arg = ::utils::ast::parse_expr("(*s).ptr".to_owned());
-        let len = len.map(|l| ::utils::ast::parse_expr(l.to_owned()));
-        let kind = glue_expr(
-            shape,
-            mutable,
-            rustc_ast::ptr::P(arg),
-            len.map(rustc_ast::ptr::P),
-        )
-        .expect("the five realized shapes all build");
+        // **Through the production helper, not around it.** `finish_len` is what
+        // the visitor calls; a harness that applied the cast itself would be a
+        // second implementation of the rule under test, and would have gone on
+        // passing after the fabricated arm made the rule conditional.
+        let len = len.map(|sl| finish_len(&sl, ::utils::ast::parse_expr(sl.text().to_owned())));
+        let kind =
+            glue_expr(shape, mutable, rustc_ast::ptr::P(arg), len).expect("the shapes all build");
         pprust::expr_to_string(&rustc_ast::Expr {
             id: DUMMY_NODE_ID,
             kind,
@@ -6094,13 +6262,30 @@ mod arm3_witnesses {
             // reborrow family
             assert_eq!(rendered(GlueShape::Reborrow, true, None), "&mut *(*s).ptr");
             assert_eq!(rendered(GlueShape::Reborrow, false, None), "&*(*s).ptr");
+            let licensed = || Some(SeamLen::Licensed("n".to_owned()));
             assert_eq!(
-                rendered(GlueShape::FromRawParts, true, Some("n")),
+                rendered(GlueShape::FromRawParts, true, licensed()),
                 "core::slice::from_raw_parts_mut((*s).ptr, (n) as usize)"
             );
             assert_eq!(
-                rendered(GlueShape::FromRawParts, false, Some("n")),
+                rendered(GlueShape::FromRawParts, false, licensed()),
                 "core::slice::from_raw_parts((*s).ptr, (n) as usize)"
+            );
+            // **The SIXTH realized shape** (ruling 2026-08-12): the fabricated
+            // extent, whose text differs from the licensed arm in exactly the
+            // two ways the audit depends on — a NAMED const, and no cast.
+            //
+            // The differential's whole job is that a corpus parity diff is
+            // attributable to the decision layer rather than the renderer; the
+            // fabricated arm without a row here would be the one placement
+            // shape the AST layer renders unwitnessed.
+            assert_eq!(
+                rendered(GlueShape::FromRawParts, true, Some(SeamLen::Fabricated)),
+                "core::slice::from_raw_parts_mut((*s).ptr, crate::SEAM_LEN_PLACEHOLDER)"
+            );
+            assert_eq!(
+                rendered(GlueShape::FromRawParts, false, Some(SeamLen::Fabricated)),
+                "core::slice::from_raw_parts((*s).ptr, crate::SEAM_LEN_PLACEHOLDER)"
             );
             // safe family
             assert_eq!(

@@ -118,6 +118,109 @@ impl LenEvidence {
     }
 }
 
+/// **Which arm produced a placed slice seam's length** — the ruled audit tag
+/// (user ruling 2026-08-12, marker ruled 2026-08-15).
+///
+/// A two-arm type rather than a `bool` beside the evidence, so a fabricated site
+/// can never be counted inside the licensed 277 by accident. `Fabricated`
+/// carries the signature evidence that WAS available, because
+/// bound-verification's derivability question is exactly `Elsewhere` (a
+/// non-adjacent integer exists) vs `None` (none does).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum LenArm {
+    /// Ruling B adjacency evidence — the length is the caller's own companion.
+    Licensed(LenEvidence),
+    /// FABRICATED. The placeholder was placed where no companion exists.
+    Fabricated(LenEvidence),
+}
+
+impl LenArm {
+    pub(crate) fn key(self) -> &'static str {
+        match self {
+            // **Byte-identical to the pre-ruling column for all 277 licensed
+            // placements** — the licensed population's artifact bytes do not
+            // move, which is what makes the fabricated count a clean addition
+            // rather than a re-keying.
+            LenArm::Licensed(e) => e.key(),
+            LenArm::Fabricated(_) => "len-fabricated",
+        }
+    }
+
+    /// The signature evidence, whichever arm placed the length. The
+    /// `lengated` rows read this so the `len-elsewhere` / `len-absent` split
+    /// survives fabrication as bound-verification's derivability input.
+    pub(crate) fn evidence(self) -> LenEvidence {
+        match self {
+            LenArm::Licensed(e) | LenArm::Fabricated(e) => e,
+        }
+    }
+}
+
+/// **A slice seam's length, WITH ITS PROVENANCE** (marker ruling, 2026-08-15).
+///
+/// The provenance rides *in* the value rather than beside it, so "fabricate
+/// without tagging it" is **not expressible**: [`GlueSpec::render`] and the
+/// artifact's [`LenArm`] read the same field, one derivation. The prefix-testing
+/// `glue_shape` classifier was retired for exactly this reason — a second
+/// derivation of a fact the decision already holds is a defect waiting for a
+/// mutation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum SeamLen {
+    /// The caller's own companion argument text (ruling B adjacency).
+    Licensed(String),
+    /// The fabricated placeholder, rendered as the named const the emitter
+    /// inserts. Carries no text because there is none to carry — which is the
+    /// point.
+    Fabricated,
+}
+
+impl SeamLen {
+    /// The length's source text. **The single place both emitters read it
+    /// from**, so the span layer's string and the AST layer's parsed node come
+    /// from one derivation rather than two spellings of the same const.
+    pub(crate) fn text(&self) -> &str {
+        match self {
+            SeamLen::Licensed(t) => t,
+            SeamLen::Fabricated => FABRICATED_LEN_PATH,
+        }
+    }
+
+    pub(crate) fn is_fabricated(&self) -> bool {
+        matches!(self, SeamLen::Fabricated)
+    }
+}
+
+/// The fabricated slice-seam extent (user ruling, 2026-08-12).
+pub(crate) const FABRICATED_SEAM_LEN: usize = 1024;
+
+/// The const's name in the emitted crate (marker ruling, 2026-08-15).
+pub(crate) const SEAM_LEN_CONST: &str = "SEAM_LEN_PLACEHOLDER";
+
+/// The path a fabricated extent is spelled as at the call site.
+///
+/// Crate-qualified so a fabricated site in a non-root file resolves — the
+/// spelling the frozen legacy rewriter already used for `crate::slice_cursor::`.
+pub(crate) const FABRICATED_LEN_PATH: &str = "crate::SEAM_LEN_PLACEHOLDER";
+
+/// **The const item, as emitted text — produced from a real AST item.**
+///
+/// The marker ruling says *named const via `item!`*, and this is that: the text
+/// is `pprust`'s rendering of a node the parser accepted, not a hand-written
+/// string that merely looks like Rust. A typo in a string blob would reach the
+/// emitted crate and fail at the callers' `verify`, attributed to them; a typo
+/// here fails at `parse_item`, attributed to itself.
+///
+/// The parsed node is **printed and discarded**, never inserted into a krate, so
+/// the fresh-`ParseSess` span-aliasing hazard cannot follow it — the node's spans
+/// never leave this function.
+///
+/// One producer, two consumers: the span layer splices this string and the AST
+/// layer appends it, so the two emitters cannot disagree about the const's text.
+pub(crate) fn fabricated_len_item() -> String {
+    let item = ::utils::item!("const {SEAM_LEN_CONST}: usize = {FABRICATED_SEAM_LEN};");
+    rustc_ast_pretty::pprust::item_to_string(&item)
+}
+
 /// Which family a placed adapter came from. Reported in the artifacts' seam
 /// column so the reborrow population — the one carrying the aliasing exposure —
 /// stays countable on its own.
@@ -145,7 +248,10 @@ pub(crate) struct SeamEdit {
     /// that check certifies or corrects each selection, and it can only be
     /// surgical if it can tell a `following` selection from a `preceding` one
     /// without re-deriving the choice.
-    pub len_arm: Option<LenEvidence>,
+    /// **Fabricated placements ride the same field, tagged** (2026-08-15), so
+    /// the licensed 277 and the fabricated 93 are one vocabulary in two arms —
+    /// never one blended count.
+    pub len_arm: Option<LenArm>,
     /// **The adapter, DESCRIBED** — option A's carried interface (2026-08-13).
     ///
     /// [`Self::replacement`] is `spec.render(<the argument's source text>)`, so
@@ -167,6 +273,24 @@ pub(crate) struct SeamEdit {
     /// already knows, and a `Paren` between the cast and its operand would make
     /// the guess silently wrong.
     pub arg_span: Span,
+}
+
+/// **The authorization rule for fabrication, as a pure function** (R8).
+///
+/// One place decides *licensed vs fabricated*, and it decides it from the only
+/// input that may decide it: whether the call site supplied a companion length.
+/// Lifted out of `glue`'s two arms rather than written twice, because two copies
+/// of an authorization rule is one copy too many — and because a rule inside a
+/// match arm is a rule only a corpus sweep can exercise.
+///
+/// **This is the whole of "fabricate exactly when authorized":** a `Some` input
+/// can only produce `Licensed`, a `None` input can only produce `Fabricated`,
+/// and neither can produce the other.
+fn with_length(spec: GlueSpec, len: Option<&str>) -> GlueSpec {
+    match len {
+        Some(text) => spec.with_len(text),
+        None => spec.with_fabricated_len(),
+    }
 }
 
 /// `&mut ` or `&`.
@@ -239,12 +363,15 @@ pub(crate) struct GlueSpec {
     /// `Some(true)` is `.as_mut().unwrap()`, `Some(false)` is `.unwrap()` —
     /// the distinction `unwrap_expr` exists for, carried rather than inferred.
     pub unwrap: Option<bool>,
-    /// The length's source text, `FromRawParts` only.
+    /// The length, `FromRawParts` only, **with its provenance**.
     ///
-    /// **Still `None`-means-refused**: the seam never invents a length, and the
-    /// held fabricated-length slice inserts HERE rather than at a string
-    /// substitution.
-    pub len: Option<String>,
+    /// The held fabricated-length slice landed HERE, exactly as this doc
+    /// predicted, rather than at a string substitution. `None` still means
+    /// refused — but after the 2026-08-12 ruling `glue` no longer produces it
+    /// for the two length-needing arms, which fabricate instead. What `None`
+    /// now guards is the layer BELOW the gate: a builder handed a length-less
+    /// `FromRawParts` still places nothing.
+    pub len: Option<SeamLen>,
     /// Wrap the result in `Some(...)`.
     pub optional: bool,
 }
@@ -266,7 +393,17 @@ impl GlueSpec {
     }
 
     pub(crate) fn with_len(mut self, len: &str) -> Self {
-        self.len = Some(len.to_owned());
+        self.len = Some(SeamLen::Licensed(len.to_owned()));
+        self
+    }
+
+    /// **The fabricated extent** (user ruling 2026-08-12; marker 2026-08-15).
+    ///
+    /// Deliberately a *separate* constructor from [`Self::with_len`] rather than
+    /// a flag on it: the two produce different emitted text and different
+    /// artifact rows, and a caller must name which one it means.
+    pub(crate) fn with_fabricated_len(mut self) -> Self {
+        self.len = Some(SeamLen::Fabricated);
         self
     }
 
@@ -361,8 +498,22 @@ impl GlueSpec {
                 } else {
                     "from_raw_parts"
                 };
-                let len = self.len.as_deref()?;
-                format!("core::slice::{ctor}({base}, ({len}) as usize)")
+                match self.len.as_ref()? {
+                    // The C spelling is `size_t`/`c_int`/`c_ulong` depending on
+                    // the header and `from_raw_parts` takes `usize`, so the
+                    // companion is cast; parenthesised because it may be an
+                    // arbitrary expression.
+                    SeamLen::Licensed(len) => {
+                        format!("core::slice::{ctor}({base}, ({len}) as usize)")
+                    }
+                    // **No cast and no parentheses**: the const is declared
+                    // `usize`, and casting it would make a fabricated site
+                    // textually indistinguishable from a licensed one whose
+                    // companion happened to be a path.
+                    SeamLen::Fabricated => {
+                        format!("core::slice::{ctor}({base}, {FABRICATED_LEN_PATH})")
+                    }
+                }
             }
             GlueCore::FromRefMut => {
                 let ctor = if self.mutable { "from_mut" } else { "from_ref" };
@@ -453,42 +604,36 @@ pub(crate) fn glue(
             SeamFamily::Reborrow,
         )),
 
-        // ---- slice seams: a length from the CALL SITE, or gated ----
+        // ---- slice seams: a length from the CALL SITE, or FABRICATED ----
         //
         // Ruling B (2026-08-11): both adjacency arms license the companion
-        // argument as the length. `len` is that argument's own source text,
-        // substituted verbatim and cast — the seam never invents a length, and
-        // `None` here still gates rather than guessing (ruling item 4 stands).
+        // argument as the length — `len` is that argument's own source text.
         //
-        // `as usize` unconditionally: the C spelling is `size_t`, `c_int` or
-        // `c_ulong` depending on the header, and `from_raw_parts` takes `usize`.
-        // Parenthesised because the companion may be an arbitrary expression.
-        (Slice { mutable }, Raw) => {
-            let Some(len) = len else {
-                return Err(SeamBlock::LengthUnknown);
-            };
-            Some((
-                GlueSpec::core(GlueCore::FromRawParts, mutable).with_len(len),
-                SeamFamily::Reborrow,
-            ))
-        }
+        // **Ruling B's `None` arm is SUPERSEDED (2026-08-12).** Where no
+        // companion exists — `len-elsewhere` and `len-absent`, the full
+        // `seam-len-unknown` population — the position no longer refuses; it
+        // places the seam with the fabricated placeholder extent, uniformly.
+        // The premise is contribution scope: the guarantee is aliasing UB, not
+        // spatial bounds. The carve-out is per SITE and the site is TAGGED, so
+        // it stays countable apart from the licensed placements.
+        //
+        // `LengthUnknown` **stays in the enum** — it is still the honest name
+        // for the condition and the census reports the underlying evidence
+        // under it. What changed is that `glue` no longer returns it.
+        (Slice { mutable }, Raw) => Some((
+            with_length(GlueSpec::core(GlueCore::FromRawParts, mutable), len),
+            SeamFamily::Reborrow,
+        )),
         (
             Opt {
                 mutable,
                 slice: true,
             },
             Raw,
-        ) => {
-            let Some(len) = len else {
-                return Err(SeamBlock::LengthUnknown);
-            };
-            Some((
-                GlueSpec::core(GlueCore::FromRawParts, mutable)
-                    .with_len(len)
-                    .wrapped(),
-                SeamFamily::Reborrow,
-            ))
-        }
+        ) => Some((
+            with_length(GlueSpec::core(GlueCore::FromRawParts, mutable), len).wrapped(),
+            SeamFamily::Reborrow,
+        )),
 
         // ---- safe family ----
         (Slice { mutable: w }, Ref { mutable: h }) => {
@@ -947,13 +1092,38 @@ mod tests {
         );
     }
 
-    /// **The length gate — 65.7 % of the measured market.**
+    /// **The length rule — evolved from a gate to an authorization**
+    /// (user ruling 2026-08-12).
     ///
-    /// Every raw→slice direction blocks, thin and fat alike. No constant is ever
-    /// produced: `from_raw_parts` with an oversized `len` is UB at construction,
-    /// so a fabricated length is unsound the moment it is built.
+    /// # What this witness USED to pin, and why it changed
+    ///
+    /// It read *"raw → {expected} must gate, never fabricate a length"*, over
+    /// 65.7 % of the measured market. The reasoning was sound and is
+    /// **unretracted**: `from_raw_parts` with an oversized extent is UB at
+    /// construction, so a fabricated length is unsound the moment it is built.
+    ///
+    /// The **policy** over that fact changed, on a premise the technical
+    /// objection does not own — contribution scope. The paper's guarantee is
+    /// aliasing UB, not spatial bounds; fabricated sites are a knowing,
+    /// **tagged, per-site** carve-out. The objection stays on record as the
+    /// flagged technical fact; it was not withdrawn and it is not wrong.
+    ///
+    /// # What it pins NOW
+    ///
+    /// The old guard's protection is being spent, so it is replaced by three
+    /// obligations rather than deleted — a guard that quietly changes meaning is
+    /// worse than one that is retired in the open:
+    ///
+    /// - **W1** a fabricated length is ALWAYS TAGGED,
+    /// - **W2** fabrication happens ONLY where no companion exists,
+    /// - **W3** the non-length-bearing cores never carry a length.
+    ///
+    /// **The builder-layer guard is deliberately NOT touched.**
+    /// `a_slice_seam_with_no_length_places_nothing_and_is_counted` pins *no
+    /// layer below the gate may invent a length*; fabrication happens **at** the
+    /// gate, so that guard stands and `len_absent` stays 0 on the corpus.
     #[test]
-    fn every_raw_to_slice_direction_is_length_gated() {
+    fn every_raw_to_slice_direction_gets_a_length_or_a_fabricated_one() {
         for expected in [
             Slice { mutable: true },
             Slice { mutable: false },
@@ -966,11 +1136,134 @@ mod tests {
                 slice: true,
             },
         ] {
+            // ---- W1: a fabricated length is ALWAYS TAGGED ----
+            //
+            // The whole point of `SeamLen` being a two-arm type. A mutation
+            // that fabricates by building `Licensed("1024")` fails HERE, and it
+            // fails at the artifact too, because both read this one field.
+            let Ok(Some((spec, _))) = g(expected, Raw) else {
+                panic!("raw → {expected:?} must fabricate, not refuse")
+            };
             assert_eq!(
-                g(expected, Raw),
-                Err(SeamBlock::LengthUnknown),
-                "raw → {expected:?} must gate, never fabricate a length"
+                spec.len,
+                Some(SeamLen::Fabricated),
+                "raw → {expected:?} with no companion must fabricate, TAGGED"
             );
+
+            // ---- W2: fabrication ONLY where no companion exists ----
+            //
+            // The other direction of the same authorization rule: an arm that
+            // ignored its input and fabricated unconditionally would satisfy W1
+            // and destroy all 277 licensed placements.
+            let Ok(Some((spec, _))) = glue(expected, Raw, Some("n")) else {
+                panic!("a companion length must still place a licensed seam")
+            };
+            assert_eq!(
+                spec.len,
+                Some(SeamLen::Licensed("n".to_owned())),
+                "a companion was supplied — fabricating over it is forbidden"
+            );
+        }
+
+        // ---- W3: the NON-length-bearing cores never carry a length ----
+        //
+        // `with_length` is only reachable from the two `FromRawParts` arms; a
+        // mutation that routed a reborrow or a `from_ref` through it would
+        // render a length into a constructor that takes none.
+        for (expected, found) in [
+            (Ref { mutable: true }, Raw),
+            (Ref { mutable: false }, Raw),
+            (Slice { mutable: false }, Ref { mutable: false }),
+            (Slice { mutable: true }, Ref { mutable: true }),
+        ] {
+            if let Ok(Some((spec, _))) = glue(expected, found, None) {
+                assert_eq!(
+                    spec.len, None,
+                    "{expected:?} ← {found:?} needs no length and must carry none"
+                );
+            }
+        }
+    }
+
+    /// **The authorization rule, witnessed on the pure function itself** (R8).
+    ///
+    /// `with_length` is the single place that decides licensed-vs-fabricated.
+    /// Witnessing it here as well as through `glue` is not redundancy: `glue`'s
+    /// witness proves the two slice arms are wired to it, and this one proves
+    /// the rule those arms are wired to is the right rule — the split M28 and
+    /// M40 were banked for.
+    #[test]
+    fn the_authorization_rule_is_decided_by_the_companion_alone() {
+        let base = || GlueSpec::core(GlueCore::FromRawParts, false);
+        assert_eq!(
+            with_length(base(), Some("n")).len,
+            Some(SeamLen::Licensed("n".to_owned()))
+        );
+        assert_eq!(with_length(base(), None).len, Some(SeamLen::Fabricated));
+        // An EMPTY companion is still a companion: the call site supplied text,
+        // and inventing an extent over supplied text is the failure this rule
+        // exists to prevent. (`glue` never sees one — `span_to_snippet` of a
+        // real argument is non-empty — so this pins the rule, not the corpus.)
+        assert_eq!(
+            with_length(base(), Some("")).len,
+            Some(SeamLen::Licensed(String::new()))
+        );
+    }
+
+    /// **The two arms render DIFFERENT text, and the difference is auditable.**
+    ///
+    /// A fabricated site must be recognizable in the emitted crate by someone
+    /// holding the code and not the TSV — the ruling's own reason for rejecting
+    /// artifact-tag-only. `1024` spelled as a literal would be
+    /// indistinguishable from a real length that happens to be 1024; the named
+    /// const is not.
+    #[test]
+    fn a_fabricated_extent_is_named_in_the_emitted_text() {
+        let fabricated = GlueSpec::core(GlueCore::FromRawParts, false)
+            .with_fabricated_len()
+            .render("p")
+            .expect("fabricated specs render");
+        assert_eq!(
+            fabricated,
+            "core::slice::from_raw_parts(p, crate::SEAM_LEN_PLACEHOLDER)"
+        );
+        assert!(
+            !fabricated.contains("1024"),
+            "the extent is NAMED, never spelled as a bare literal: {fabricated}"
+        );
+        assert!(
+            !fabricated.contains("as usize"),
+            "the const is already `usize`; casting it would make a fabricated \
+             site textually indistinguishable from a licensed path companion"
+        );
+        // And the licensed arm is byte-identical to its pre-ruling text.
+        assert_eq!(
+            GlueSpec::core(GlueCore::FromRawParts, true)
+                .with_len("n")
+                .render("p")
+                .as_deref(),
+            Some("core::slice::from_raw_parts_mut(p, (n) as usize)")
+        );
+    }
+
+    /// The audit tag's two arms key differently, and the LICENSED bytes do not
+    /// move — which is what makes the fabricated count an addition to the
+    /// census rather than a re-keying of it.
+    #[test]
+    fn the_audit_tag_separates_fabricated_from_licensed() {
+        for e in [
+            LenEvidence::Following,
+            LenEvidence::Preceding,
+            LenEvidence::Elsewhere,
+            LenEvidence::None,
+        ] {
+            assert_eq!(LenArm::Licensed(e).key(), e.key(), "licensed bytes move");
+            assert_eq!(LenArm::Fabricated(e).key(), "len-fabricated");
+            // The signature evidence survives BOTH arms — bound-verification's
+            // derivability input (`Elsewhere` vs `None`) must not be erased by
+            // the fabrication that made the position placeable.
+            assert_eq!(LenArm::Fabricated(e).evidence(), e);
+            assert_eq!(LenArm::Licensed(e).evidence(), e);
         }
     }
 
@@ -1007,12 +1300,17 @@ mod tests {
             ),
             "Some(core::slice::from_raw_parts_mut(p, (n) as usize))"
         );
-        // **The gate still holds without one** — ruling item 4 stands, and B
-        // widened which positions HAVE a length, never whether one may be
-        // invented.
+        // **Without one, the position now FABRICATES** (ruling 2026-08-12,
+        // superseding ruling item 4's `None` arm). What ruling B settled is
+        // untouched: adjacency licenses the companion, and a licensed companion
+        // is never overridden by an invented extent.
+        let Ok(Some((spec, _))) = glue(Slice { mutable: true }, Raw, None) else {
+            panic!("the no-companion position must place a fabricated seam")
+        };
+        assert_eq!(spec.len, Some(SeamLen::Fabricated));
         assert_eq!(
-            glue(Slice { mutable: true }, Raw, None),
-            Err(SeamBlock::LengthUnknown)
+            spec.render("p").as_deref(),
+            Some("core::slice::from_raw_parts_mut(p, crate::SEAM_LEN_PLACEHOLDER)")
         );
     }
 
@@ -1243,11 +1541,27 @@ mod tests {
                 .as_deref(),
             Some("core::slice::from_raw_parts(p, (n) as usize)")
         );
-        // The gate is UPSTREAM: `glue` never names the refusing shape, which is
-        // what makes this structure rather than a live path.
-        assert_eq!(
-            glue(Slice { mutable: false }, Raw, None),
-            Err(SeamBlock::LengthUnknown)
+        // The gate is UPSTREAM and STAYS upstream after the fabrication ruling
+        // — what changed is which answer it gives. `glue` still never names the
+        // refusing shape: a `None` companion now yields a FABRICATED length, so
+        // this renderer arm remains fail-closed structure with no live path.
+        //
+        // **This is the distinction the ruling's guard-evolution turns on.**
+        // Fabrication happens AT the gate; no layer *below* it may invent a
+        // length, so the refusal above is untouched.
+        assert!(
+            matches!(
+                glue(Slice { mutable: false }, Raw, None),
+                Ok(Some((
+                    GlueSpec {
+                        len: Some(SeamLen::Fabricated),
+                        ..
+                    },
+                    _
+                )))
+            ),
+            "glue must fabricate, not refuse — and the renderer's own refusal \
+             must therefore stay unreachable through it"
         );
         assert!(
             every_emitting_spec()
@@ -1711,10 +2025,34 @@ pub(crate) fn synthesize(
                     let text = companion
                         .and_then(|i| site.args.iter().find(|a| a.index == i))
                         .and_then(|a| sm.span_to_snippet(a.span).ok());
-                    // The arm is recorded only when a length was actually
-                    // FOUND: an arm with no text placed no seam, and tagging it
-                    // would make the follow-up's population wrong.
-                    (text.clone(), text.map(|_| arm))
+                    // **Both outcomes are now placements, and both are tagged**
+                    // (2026-08-12). Before the ruling an arm was recorded only
+                    // when a length was FOUND, because a missing one placed no
+                    // seam; now a missing one places a FABRICATED seam, and an
+                    // untagged placement is exactly what the ruling forbids.
+                    //
+                    // `LenArm` carries the signature evidence on BOTH arms, so
+                    // the derivability question bound-verification asks —
+                    // `Elsewhere` (a non-adjacent integer exists) vs `None`
+                    // (none does) — survives fabrication rather than being
+                    // erased by it.
+                    let recorded = Some(match &text {
+                        Some(_) => LenArm::Licensed(arm),
+                        None => LenArm::Fabricated(arm),
+                    });
+                    // The `lengated` census row moves HERE from the `Err` arm
+                    // it used to live in: that arm no longer fires for these
+                    // positions, and losing the row would take the 42/51 split
+                    // with it. Same vocabulary, same one-row-per-gated-position
+                    // rule, now keyed on *fabrication* rather than on refusal.
+                    if text.is_none() {
+                        plan.length_evidence.push((
+                            tcx.def_path_str(callee.to_def_id()),
+                            pos.index,
+                            arm,
+                        ));
+                    }
+                    (text, recorded)
                 } else {
                     (None, None)
                 };
@@ -1760,16 +2098,23 @@ pub(crate) fn synthesize(
                         });
                     }
                     Err(block) => {
-                        // Item 4a: price the length question where it is asked,
-                        // so the coverage number is per BLOCKED POSITION rather
-                        // than per signature — one signature serves many calls.
-                        if block == SeamBlock::LengthUnknown {
-                            plan.length_evidence.push((
-                                tcx.def_path_str(callee.to_def_id()),
-                                pos.index,
-                                length_evidence(tcx, *callee, pos.index),
-                            ));
-                        }
+                        // **The item-4a push MOVED to the fabrication site**
+                        // (2026-08-12) and does not run here any more: `glue`
+                        // no longer returns `LengthUnknown`, so this arm cannot
+                        // reach it, and a copy left behind would have been a
+                        // second producer of the same census row waiting for
+                        // the day the first one moved.
+                        //
+                        // The only surviving `LengthUnknown` producer is the
+                        // render refusal above, which pushes a `blocked` row and
+                        // no evidence row — correctly, since a refused render
+                        // means the spec had no length at all, which is a
+                        // different fact from "the signature offers none".
+                        debug_assert_ne!(
+                            block,
+                            SeamBlock::LengthUnknown,
+                            "glue must not gate on length after the fabrication ruling"
+                        );
                         plan.blocked.push((site.caller, *callee, pos.span, block));
                     }
                 }

@@ -111,7 +111,29 @@ pub(crate) enum Justification {
     /// **S3.6-1**: one expression of glue at a mismatched argument position.
     /// `family` is `"safe"` or `"reborrow"` — the latter carries the aliasing
     /// exposure §5a measured, so the two must stay countable apart.
-    SeamAdapter { family: &'static str },
+    SeamAdapter {
+        family: &'static str,
+        /// **Whether this adapter's length was FABRICATED** (ruling
+        /// 2026-08-12). Carried from `spec.len`, never re-derived by testing
+        /// the replacement text for the const's name — the classifier
+        /// anti-pattern this milestone retired once already.
+        ///
+        /// It is here rather than only in the seam census because the const
+        /// item's insertion is conditioned on a fabricated adapter **surviving
+        /// the revert set**, and the surviving set is a `plan` fact.
+        fabricated: bool,
+    },
+    /// **The fabricated-extent const's declaration** (marker ruling,
+    /// 2026-08-15). One per crate, in the crate root file, emitted only when at
+    /// least one fabricated adapter survives.
+    ///
+    /// It has no owning subject, and that is deliberate: keying it to one
+    /// adapter's `owner_fn` would delete the const when that function reverts
+    /// while other sites still name it (`E0433`, cascading), and keying it to a
+    /// never-reverted sentinel would leave a dead const behind when every
+    /// fabricated site reverts. It is DERIVED from the surviving edits instead,
+    /// which is why it is created after the revert filter rather than before.
+    FabricatedLenConst,
     /// G07/G09: a store form that must NOT drop — (N-raw)/(N-safe)/(R) — or a
     /// P-drop suppression, carrying which rule applied.
     StoreForm { form: &'static str },
@@ -159,6 +181,15 @@ pub(crate) struct Plan {
     pub by_file: BTreeMap<FileKey, Vec<Edit>>,
     /// Decisions that produced no placed edit, with attribution.
     pub unplaceable: Vec<Unplaceable>,
+    /// **The crate ROOT file** — where a crate-level item must go, and the only
+    /// place `crate::SEAM_LEN_PLACEHOLDER` resolves from.
+    ///
+    /// Filled by the caller, which is the only party holding a `TyCtxt`; `plan`
+    /// itself takes no compiler type. `None` leaves the fabricated-const
+    /// insertion **fail-closed** — no root, no insertion, and the fabricated
+    /// adapters that need it fail `verify` loudly rather than emitting a crate
+    /// with a dangling path.
+    pub root_file: Option<FileKey>,
 }
 
 /// Turn decisions into edits.
@@ -257,6 +288,7 @@ pub(crate) fn plan(
                         super::decision::seam::SeamFamily::Safe => "safe",
                         super::decision::seam::SeamFamily::Reborrow => "reborrow",
                     },
+                    fabricated: seam.spec.len.as_ref().is_some_and(|l| l.is_fabricated()),
                 },
                 owner_fn: seam.owner_fn.clone(),
             }),
@@ -472,6 +504,9 @@ pub(crate) fn plan(
     Plan {
         by_file,
         unplaceable,
+        // Filled by the caller; `plan` has no `TyCtxt` and so cannot ask which
+        // file is the crate root.
+        root_file: None,
     }
 }
 

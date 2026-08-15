@@ -4278,3 +4278,101 @@ fn a_reverted_callee_takes_its_seams_with_it() {
         "the callee's own declaration must revert with it:\n{text}"
     );
 }
+
+/// **THE FABRICATED-EXTENT CONST IS DERIVED FROM THE SURVIVORS** — all three
+/// arms of the marker ruling's placement rule, on the production `render`.
+///
+/// §9c priced the two obvious owners and refused both: keying the const to one
+/// adapter's `owner_fn` deletes it when that function reverts while siblings
+/// still name it (`E0433`, cascading), and a never-reverted sentinel leaves a
+/// dead const when every fabricated site reverts. The rule shipped instead is
+/// *emit iff at least one fabricated adapter survives the revert set* — which is
+/// only meaningful if all three arms are witnessed, because arms 1 and 3 are
+/// exactly what the two refused designs would have got wrong.
+///
+/// *Mutation-tested:* replace the survivor test with `true` and arm 1 fails;
+/// replace it with a per-file `push` and arm 3 fails on the count.
+#[test]
+fn the_fabricated_const_follows_the_surviving_adapters() {
+    let src = "#![allow(dead_code, unused_unsafe, unused_mut, unused_variables)]\n\
+               pub unsafe fn fab_total(buf: *mut i32) -> i32 {\n\
+               \x20   let mut s: i32 = 0;\n\
+               \x20   let mut i: usize = 0;\n\
+               \x20   while i < 4 { s += *buf.offset(i as isize); i += 1; }\n\
+               \x20   s\n\
+               }\n\
+               pub unsafe fn fab_one(d: *mut i32) -> i32 { fab_total(d) }\n\
+               pub unsafe fn fab_two(d: *mut i32) -> i32 { fab_total(d) }\n";
+    let fixture = Fixture::new(&[("lib.rs", src)]);
+    ::utils::compilation::run_compiler_on_path(&fixture.0.join("lib.rs"), |tcx| {
+        let table = decide_table(tcx).expect("decides");
+        let emission = emit_files(tcx, &table, &rustc_hash::FxHashSet::default()).expect("emits");
+        let (plan, texts) = (&emission.plan, &emission.texts);
+
+        // NON-VACUITY FIRST. Everything below is about a population; if the
+        // fixture produced no fabricated adapter the three arms would agree
+        // trivially and witness nothing.
+        let fabricated: Vec<&str> = plan
+            .by_file
+            .values()
+            .flatten()
+            .filter(|e| {
+                matches!(
+                    e.justification,
+                    super::plan::Justification::SeamAdapter {
+                        fabricated: true,
+                        ..
+                    }
+                )
+            })
+            .map(|e| e.owner_fn.as_str())
+            .collect();
+        assert_eq!(
+            fabricated.len(),
+            2,
+            "the fixture must place TWO fabricated adapters, both owned by the \
+             callee — one is not enough to tell 'one const per crate' from \
+             'one const per adapter'"
+        );
+        let owner = fabricated[0].to_owned();
+        assert!(
+            plan.root_file.is_some(),
+            "the root file must be identified, or the insertion fail-closes"
+        );
+
+        let consts = |reverted: &std::collections::BTreeSet<String>| -> usize {
+            let (files, rollbacks) = super::render(plan, texts, reverted);
+            assert!(rollbacks.is_empty(), "the insertion must not collide");
+            files
+                .values()
+                .map(|t| {
+                    t.matches("const SEAM_LEN_PLACEHOLDER: usize = 1024;")
+                        .count()
+                })
+                .sum()
+        };
+
+        // ---- arm 2: adapters survive ⇒ EXACTLY ONE const ----
+        // ---- arm 3: TWO surviving adapters ⇒ still exactly one ----
+        // Both are this call: the fixture's two adapters share one callee, so
+        // an implementation that pushed per adapter would report 2 here.
+        assert_eq!(
+            consts(&std::collections::BTreeSet::new()),
+            1,
+            "one crate, one const — never one per fabricated site"
+        );
+
+        // ---- arm 1: every fabricated adapter reverts ⇒ NO const ----
+        // The dead-const case the sentinel owner would have produced.
+        let all_gone: std::collections::BTreeSet<String> = std::iter::once(owner).collect();
+        assert_eq!(
+            consts(&all_gone),
+            0,
+            "no surviving fabricated adapter means no const — a dead item in \
+             the emitted crate is exactly what deriving it avoids"
+        );
+        Ok::<(), String>(())
+    })
+    .expect("fixture compiles")
+    .expect("no emission error");
+}

@@ -1757,21 +1757,65 @@ pub(crate) fn render(
 ) {
     let mut files = std::collections::BTreeMap::new();
     let mut rollbacks = Vec::new();
-    for (key, edits) in &planned.by_file {
-        // Revert by JUSTIFICATION, not geography: an edit survives only if the
-        // subject that justifies it has not been taken back.
-        let kept: Vec<plan::Edit> = edits
-            .iter()
-            .filter(|edit| !reverted.contains(&edit.owner_fn))
-            .cloned()
-            .collect();
+    // Revert by JUSTIFICATION, not geography: an edit survives only if the
+    // subject that justifies it has not been taken back.
+    let mut kept_by_file: std::collections::BTreeMap<plan::FileKey, Vec<plan::Edit>> = planned
+        .by_file
+        .iter()
+        .map(|(key, edits)| {
+            let kept = edits
+                .iter()
+                .filter(|edit| !reverted.contains(&edit.owner_fn))
+                .cloned()
+                .collect::<Vec<_>>();
+            (key.clone(), kept)
+        })
+        .collect();
+    // **The fabricated-extent const is DERIVED FROM THE SURVIVORS** (marker
+    // ruling, 2026-08-15), which is why it is computed here and not in `plan`:
+    // this is the one place that knows which adapters a given revert set
+    // leaves standing, and `render` is called once per revert round.
+    //
+    // No surviving fabricated adapter ⇒ no const, so no dead item; one or many
+    // ⇒ exactly one, in the crate root, so no `E0433` when a single fabricated
+    // site's function reverts and its siblings do not.
+    if kept_by_file.values().flatten().any(|e| {
+        matches!(
+            e.justification,
+            plan::Justification::SeamAdapter {
+                fabricated: true,
+                ..
+            }
+        )
+    }) && let Some(root) = planned.root_file.clone()
+        && let Some(source) = texts.get(&root)
+    {
+        // Appended at END OF FILE — the one offset both emitters compute
+        // identically without parsing. A crate-level `const` is legal there
+        // whatever the file's inner attributes, outer attributes or trailing
+        // comments look like, and every alternative anchor (after the last
+        // inner attribute; before the first item) needs a parse that the span
+        // layer, running after HIR is built, cannot redo.
+        let at = source.len();
+        kept_by_file.entry(root).or_default().push(plan::Edit {
+            lo: at,
+            hi: at,
+            replacement: format!("\n{}\n", decision::seam::fabricated_len_item()),
+            justification: plan::Justification::FabricatedLenConst,
+            // Added AFTER the revert filter, so this name is never matched
+            // against the revert set — it is not a sentinel that must be kept
+            // out of it, it is simply not subject to it.
+            owner_fn: "<crate>".to_owned(),
+        });
+    }
+    for (key, kept) in &kept_by_file {
         if kept.is_empty() {
             continue;
         }
         let Some(source) = texts.get(key) else {
             continue;
         };
-        let applied = apply::apply(source, &kept);
+        let applied = apply::apply(source, kept);
         rollbacks.extend(applied.rollbacks);
         files.insert(key.clone(), applied.source);
     }
@@ -1833,20 +1877,37 @@ pub(crate) fn emit_files<'tcx>(
             Ok((lo_key, lo, hi))
         };
 
-    let planned = plan::plan(
+    let mut planned = plan::plan(
         table,
         text_of,
         span_to_loc,
         |subject| tcx.def_path_str(subject.fn_did.to_def_id()),
         &|subject: &decision::Subject| reverted.contains(&subject.fn_did),
     );
+    // **The crate root, asked of the compiler rather than guessed** — not
+    // `files()[0]`, which is source-map insertion order, and not the first
+    // planned file, which is whichever file happened to hold an edit.
+    // `crate::SEAM_LEN_PLACEHOLDER` resolves from exactly one module.
+    planned.root_file = {
+        let root = tcx.def_span(rustc_hir::def_id::CRATE_DEF_ID);
+        file_key(&source_map.lookup_byte_offset(root.lo()).sf.name)
+    };
 
     let mut texts = std::collections::BTreeMap::new();
-    for key in planned.by_file.keys() {
-        let Some(source) = text_of(key) else {
+    for key in planned
+        .by_file
+        .keys()
+        .cloned()
+        .chain(planned.root_file.clone())
+    {
+        // The root is included even when it holds no edit: a crate whose only
+        // fabricated adapters land in other files still declares the const at
+        // its root, and `render` cannot splice a file whose text it was not
+        // given.
+        let Some(source) = text_of(&key) else {
             return Err(format!("no source text for planned file {key:?}"));
         };
-        texts.insert(key.clone(), source);
+        texts.insert(key, source);
     }
     let (files, rollbacks) = render(&planned, &texts, &std::collections::BTreeSet::new());
     Ok(Emission {
