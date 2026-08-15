@@ -7,7 +7,7 @@ use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
     ffi::OsString,
     fs,
-    io::Write,
+    io::{BufRead, BufReader, BufWriter, Write},
     path::{Path, PathBuf},
     process::{Command, Stdio},
     sync::atomic::{AtomicU64, Ordering},
@@ -4408,6 +4408,299 @@ fn render_candidate_readings(
     Ok(rendered)
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct StreamingEvidenceSummary {
+    evidence: RootEvidence,
+    has_unclassified: bool,
+    count: usize,
+}
+
+impl Default for StreamingEvidenceSummary {
+    fn default() -> Self {
+        Self {
+            evidence: RootEvidence {
+                flags: BTreeSet::new(),
+                provenance_tags: BTreeSet::new(),
+            },
+            has_unclassified: false,
+            count: 0,
+        }
+    }
+}
+
+impl StreamingEvidenceSummary {
+    fn add(&mut self, evidence: &RootEvidence) {
+        self.has_unclassified |= evidence.flags.is_empty();
+        self.evidence.flags.extend(evidence.flags.iter().copied());
+        self.evidence
+            .provenance_tags
+            .extend(evidence.provenance_tags.iter().cloned());
+        self.count += 1;
+    }
+
+    fn class(&self) -> PrimaryClass {
+        if self.count == 0 || self.has_unclassified {
+            PrimaryClass::Unresolved
+        } else {
+            classify_roots(std::slice::from_ref(&self.evidence))
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct StreamingIdentitySummary {
+    population: String,
+    open: StreamingEvidenceSummary,
+    closed: StreamingEvidenceSummary,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct StreamingRootSummary {
+    row_count: usize,
+    identities: BTreeMap<(String, String), StreamingIdentitySummary>,
+    program_counts: BTreeMap<String, usize>,
+    flag_witnesses: BTreeMap<String, String>,
+    provenance_tag_witnesses: BTreeMap<String, String>,
+}
+
+fn strip_table_line_ending(line: &mut String) {
+    if line.ends_with('\n') {
+        line.pop();
+    }
+    if line.ends_with('\r') {
+        line.pop();
+    }
+}
+
+fn scan_root_table<R: BufRead>(mut reader: R, label: &str) -> Result<StreamingRootSummary, String> {
+    let mut line = String::new();
+    reader
+        .read_line(&mut line)
+        .map_err(|error| format!("read {label} header: {error}"))?;
+    strip_table_line_ending(&mut line);
+    if line != ROOT_HEADER {
+        return Err(format!("header drift: {label}"));
+    }
+
+    let mut summary = StreamingRootSummary::default();
+    let mut previous_row = None::<String>;
+    loop {
+        line.clear();
+        if reader
+            .read_line(&mut line)
+            .map_err(|error| format!("read {label} row: {error}"))?
+            == 0
+        {
+            break;
+        }
+        strip_table_line_ending(&mut line);
+        // trace_candidate emits canonical BTreeMap order, so exact duplicates are adjacent.
+        if previous_row.as_deref() == Some(line.as_str()) {
+            return Err(format!("duplicate adjacent root row in {label}"));
+        }
+        let columns = line.split('\t').collect::<Vec<_>>();
+        if columns.len() != 8 {
+            return Err(format!(
+                "{label} line {} has {} columns, expected 8",
+                summary.row_count + 2,
+                columns.len()
+            ));
+        }
+        if !matches!(columns[0], "census" | "exception") {
+            return Err(format!("unknown root population {:?}", columns[0]));
+        }
+        if columns[1].is_empty() || columns[2].is_empty() {
+            return Err(format!("root lacks program/candidate in {label}"));
+        }
+        if columns[3].is_empty() || columns[7].is_empty() {
+            return Err(format!(
+                "root lacks store/path at {}: {}",
+                columns[2], columns[4]
+            ));
+        }
+        if columns[6].is_empty() {
+            return Err(format!(
+                "root lacks cause flag at {}: {}",
+                columns[2], columns[4]
+            ));
+        }
+        let evidence = parse_root_evidence(columns[6])?;
+        let identity = (columns[1].to_owned(), columns[2].to_owned());
+        let entry = summary
+            .identities
+            .entry(identity.clone())
+            .or_insert_with(|| StreamingIdentitySummary {
+                population: columns[0].to_owned(),
+                open: StreamingEvidenceSummary::default(),
+                closed: StreamingEvidenceSummary::default(),
+            });
+        if entry.population != columns[0] {
+            return Err(format!(
+                "root identity crosses populations: {} {}",
+                columns[1], columns[2]
+            ));
+        }
+        entry.open.add(&evidence);
+        if !evidence
+            .provenance_tags
+            .contains(PUBLIC_SETTER_REACHABLE_TAG)
+        {
+            entry.closed.add(&evidence);
+        }
+        *summary
+            .program_counts
+            .entry(columns[1].to_owned())
+            .or_default() += 1;
+        let witness = || {
+            format!(
+                "{}::{} store={} root={} path={}",
+                columns[1], columns[2], columns[3], columns[4], columns[7]
+            )
+        };
+        for flag in &evidence.flags {
+            summary
+                .flag_witnesses
+                .entry(flag_label(*flag).to_owned())
+                .or_insert_with(&witness);
+        }
+        for tag in &evidence.provenance_tags {
+            summary
+                .provenance_tag_witnesses
+                .entry(tag.clone())
+                .or_insert_with(&witness);
+        }
+        summary.row_count += 1;
+        previous_row = Some(line.clone());
+    }
+    Ok(summary)
+}
+
+fn scan_root_path(path: &Path) -> Result<StreamingRootSummary, String> {
+    let file = fs::File::open(path)
+        .map_err(|error| format!("open root table {}: {error}", path.display()))?;
+    scan_root_table(BufReader::new(file), &path.display().to_string())
+}
+
+fn validate_isolated_root_summary(
+    summary: &StreamingRootSummary,
+    population: &str,
+    program: &str,
+    field_key: &str,
+    reported: usize,
+) -> Result<(), String> {
+    let expected_identity = (program.to_owned(), field_key.to_owned());
+    let Some(identity) = summary.identities.get(&expected_identity) else {
+        return Err(format!(
+            "isolated root identity mismatch: {program} {field_key}"
+        ));
+    };
+    if summary.identities.len() != 1 || identity.population != population {
+        return Err(format!(
+            "isolated root identity mismatch: {program} {field_key} population={population}"
+        ));
+    }
+    if summary.row_count != reported || reported == 0 {
+        return Err(format!(
+            "isolated root count mismatch: {program} {field_key} expected={reported} actual={}",
+            summary.row_count
+        ));
+    }
+    Ok(())
+}
+
+fn dual_reading_from_summary(summary: &StreamingIdentitySummary) -> Result<DualReading, String> {
+    let closed_world_class = summary.closed.class();
+    let open_class = summary.open.class();
+    if closed_world_class == PrimaryClass::Unresolved {
+        return Err("closed-world reading has no classified visible root".to_owned());
+    }
+    if open_class == PrimaryClass::Unresolved {
+        return Err("open reading contains an unclassified root".to_owned());
+    }
+    Ok(DualReading {
+        closed_world_class,
+        open_class,
+        closed_world_evidence: summary.closed.evidence.clone(),
+        open_evidence: summary.open.evidence.clone(),
+        closed_world_root_count: summary.closed.count,
+        open_root_count: summary.open.count,
+    })
+}
+
+fn render_candidate_readings_from_summary(
+    candidates: &[Vec<String>],
+    roots: &StreamingRootSummary,
+) -> Result<String, String> {
+    let mut rendered = format!("{CANDIDATE_READINGS_HEADER}\n");
+    for row in candidates {
+        let identity = (row[0].clone(), row[1].clone());
+        let roots = roots
+            .identities
+            .get(&identity)
+            .filter(|summary| summary.population == "census")
+            .ok_or_else(|| format!("candidate reading lacks roots: {} {}", row[0], row[1]))?;
+        let reading = dual_reading_from_summary(roots)?;
+        let open_evidence = evidence_tokens(&reading.open_evidence).join("|");
+        if class_label(reading.open_class) != row[4]
+            || open_evidence != row[5]
+            || reading.open_root_count.to_string() != row[6]
+        {
+            return Err(format!(
+                "open reading does not reproduce manifested candidate row: {} {}",
+                row[0], row[1]
+            ));
+        }
+        rendered.push_str(&format!(
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+            row[0],
+            row[1],
+            row[2],
+            row[3],
+            class_label(reading.closed_world_class),
+            class_label(reading.open_class),
+            evidence_tokens(&reading.closed_world_evidence).join("|"),
+            open_evidence,
+            reading.closed_world_root_count,
+            reading.open_root_count,
+        ));
+    }
+    Ok(rendered)
+}
+
+fn append_table_streaming<R: BufRead, W: Write>(
+    mut reader: R,
+    writer: &mut W,
+    expected_header: &str,
+    write_header: bool,
+) -> Result<(), String> {
+    let mut line = String::new();
+    reader
+        .read_line(&mut line)
+        .map_err(|error| format!("read streaming table header: {error}"))?;
+    strip_table_line_ending(&mut line);
+    if line != expected_header {
+        return Err("streaming table header drift".to_owned());
+    }
+    if write_header {
+        writeln!(writer, "{expected_header}")
+            .map_err(|error| format!("write streaming table header: {error}"))?;
+    }
+    loop {
+        line.clear();
+        if reader
+            .read_line(&mut line)
+            .map_err(|error| format!("read streaming table row: {error}"))?
+            == 0
+        {
+            break;
+        }
+        strip_table_line_ending(&mut line);
+        writeln!(writer, "{line}")
+            .map_err(|error| format!("write streaming table row: {error}"))?;
+    }
+    Ok(())
+}
+
 fn render_full_identity(input: &[A4InputRow]) -> Result<String, String> {
     let expected_counts = BTreeMap::from([
         ("allocation-source-count-0", 237usize),
@@ -5349,7 +5642,7 @@ fn validate_unique_root_rows(roots: &[Vec<String>]) -> Result<(), String> {
 
 fn validate_shard(contract: &MeasurementContract, program: &str, dir: &Path) -> Result<(), String> {
     let candidates = parse_table(&dir.join("candidates.tsv"), CANDIDATE_HEADER, 7)?;
-    let roots = parse_table(&dir.join("roots.tsv"), ROOT_HEADER, 8)?;
+    let roots = scan_root_path(&dir.join("roots.tsv"))?;
     let exceptions = parse_table(&dir.join("exceptions.tsv"), EXCEPTION_HEADER, 28)?;
     let candidate_ids = candidates
         .iter()
@@ -5375,15 +5668,12 @@ fn validate_shard(contract: &MeasurementContract, program: &str, dir: &Path) -> 
     )?;
     let candidate_id_set = candidate_ids.iter().cloned().collect::<BTreeSet<_>>();
     let exception_id_set = exception_ids.iter().cloned().collect::<BTreeSet<_>>();
-    validate_unique_root_rows(&roots)?;
-    let mut root_counts = BTreeMap::<(String, String), usize>::new();
-    let mut root_evidence = BTreeMap::<(String, String), Vec<RootEvidence>>::new();
-    for row in &roots {
+    for ((root_program, field_key), root) in &roots.identities {
         let identity = Identity {
-            program: row[1].clone(),
-            field_key: row[2].clone(),
+            program: root_program.clone(),
+            field_key: field_key.clone(),
         };
-        let expected = match row[0].as_str() {
+        let expected = match root.population.as_str() {
             "census" => &candidate_id_set,
             "exception" => &exception_id_set,
             other => return Err(format!("unknown root population {other:?}")),
@@ -5391,23 +5681,9 @@ fn validate_shard(contract: &MeasurementContract, program: &str, dir: &Path) -> 
         if !expected.contains(&identity) {
             return Err(format!(
                 "root outside {0} identity: {1} {2}",
-                row[0], identity.program, identity.field_key
+                root.population, identity.program, identity.field_key
             ));
         }
-        if row[3].is_empty() || row[7].is_empty() {
-            return Err(format!("root lacks store/path at {}: {}", row[2], row[4]));
-        }
-        if row[6].is_empty() {
-            return Err(format!("root lacks cause flag at {}: {}", row[2], row[4]));
-        }
-        let evidence = parse_root_evidence(&row[6])?;
-        *root_counts
-            .entry((identity.program.clone(), identity.field_key.clone()))
-            .or_default() += 1;
-        root_evidence
-            .entry((identity.program, identity.field_key))
-            .or_default()
-            .push(evidence);
     }
     for row in &candidates {
         if !matches!(row[4].as_str(), "invisible" | "absent" | "mixed") {
@@ -5419,24 +5695,18 @@ fn validate_shard(contract: &MeasurementContract, program: &str, dir: &Path) -> 
         let reported = row[6]
             .parse::<usize>()
             .map_err(|error| format!("candidate root count {}: {error}", row[1]))?;
-        if root_counts.get(&(row[0].clone(), row[1].clone())) != Some(&reported) {
+        let evidence = roots
+            .identities
+            .get(&(row[0].clone(), row[1].clone()))
+            .filter(|summary| summary.population == "census")
+            .ok_or_else(|| format!("candidate root inventory missing: {}", row[1]))?;
+        if evidence.open.count != reported {
             return Err(format!("candidate root inventory drift: {}", row[1]));
         }
-        let evidence = &root_evidence[&(row[0].clone(), row[1].clone())];
-        if class_label(classify_roots(evidence)) != row[4] {
+        if class_label(evidence.open.class()) != row[4] {
             return Err(format!("candidate primary class drift: {}", row[1]));
         }
-        let flags = evidence_tokens(&RootEvidence {
-            flags: evidence
-                .iter()
-                .flat_map(|root| root.flags.iter().copied())
-                .collect(),
-            provenance_tags: evidence
-                .iter()
-                .flat_map(|root| root.provenance_tags.iter().cloned())
-                .collect(),
-        })
-        .join("|");
+        let flags = evidence_tokens(&evidence.open.evidence).join("|");
         if flags != row[5] {
             return Err(format!("candidate cause-flag drift: {}", row[1]));
         }
@@ -5469,7 +5739,12 @@ fn validate_shard(contract: &MeasurementContract, program: &str, dir: &Path) -> 
         let reported = row[21]
             .parse::<usize>()
             .map_err(|error| format!("exception root count {}: {error}", row[1]))?;
-        if reported == 0 || root_counts.get(&(row[0].clone(), row[1].clone())) != Some(&reported) {
+        let evidence = roots
+            .identities
+            .get(&(row[0].clone(), row[1].clone()))
+            .filter(|summary| summary.population == "exception")
+            .ok_or_else(|| format!("exception root inventory missing: {}", row[1]))?;
+        if reported == 0 || evidence.open.count != reported {
             return Err(format!("exception root inventory drift: {}", row[1]));
         }
         let input = contract
@@ -5480,19 +5755,8 @@ fn validate_shard(contract: &MeasurementContract, program: &str, dir: &Path) -> 
         if kind_label(input.baseline_kind) != row[3] {
             return Err(format!("exception ordinary-kind drift: {}", row[1]));
         }
-        let evidence = &root_evidence[&(row[0].clone(), row[1].clone())];
-        let flags = evidence
-            .iter()
-            .flat_map(|root| root.flags.iter().copied())
-            .collect::<BTreeSet<_>>();
-        let rendered_flags = evidence_tokens(&RootEvidence {
-            flags: flags.clone(),
-            provenance_tags: evidence
-                .iter()
-                .flat_map(|root| root.provenance_tags.iter().cloned())
-                .collect(),
-        })
-        .join("|");
+        let flags = &evidence.open.evidence.flags;
+        let rendered_flags = evidence_tokens(&evidence.open.evidence).join("|");
         if rendered_flags != row[22] {
             return Err(format!("exception graph-flag drift: {}", row[1]));
         }
@@ -5520,10 +5784,7 @@ fn validate_receipt_counts(receipt: &BTreeMap<String, String>, dir: &Path) -> Re
             "candidates",
             parse_table(&dir.join("candidates.tsv"), CANDIDATE_HEADER, 7)?.len(),
         ),
-        (
-            "roots",
-            parse_table(&dir.join("roots.tsv"), ROOT_HEADER, 8)?.len(),
-        ),
+        ("roots", scan_root_path(&dir.join("roots.tsv"))?.row_count),
         (
             "exceptions",
             parse_table(&dir.join("exceptions.tsv"), EXCEPTION_HEADER, 28)?.len(),
@@ -5570,7 +5831,7 @@ fn validate_isolated_unit(
     manifest: &str,
 ) -> Result<(), String> {
     let candidates = parse_table(&dir.join("candidates.tsv"), CANDIDATE_HEADER, 7)?;
-    let roots = parse_table(&dir.join("roots.tsv"), ROOT_HEADER, 8)?;
+    let roots = scan_root_path(&dir.join("roots.tsv"))?;
     let exceptions = parse_table(&dir.join("exceptions.tsv"), EXCEPTION_HEADER, 28)?;
     let expected_candidate_count = usize::from(expected.population == "census");
     let expected_exception_count = usize::from(expected.population == "exception");
@@ -5601,32 +5862,19 @@ fn validate_isolated_unit(
             expected.identity
         ));
     }
-    if roots.is_empty()
-        || roots.iter().any(|row| {
-            row[0] != expected.population
-                || row[1] != expected.identity.program
-                || row[2] != expected.identity.field_key
-        })
-    {
-        return Err(format!(
-            "isolated ordered-root identity mismatch: {}",
-            expected.identity.field_key
-        ));
-    }
-    validate_unique_root_rows(&roots)?;
     let reported = if expected.population == "census" {
         identity_row[6].parse::<usize>()
     } else {
         identity_row[21].parse::<usize>()
     }
     .map_err(|error| format!("isolated root count: {error}"))?;
-    if roots.len() != reported {
-        return Err(format!(
-            "isolated root inventory mismatch: candidate={} reported={reported} actual={}",
-            expected.identity.field_key,
-            roots.len()
-        ));
-    }
+    validate_isolated_root_summary(
+        &roots,
+        expected.population,
+        &expected.identity.program,
+        &expected.identity.field_key,
+        reported,
+    )?;
     let receipt = parse_receipt(&dir.join("receipt.txt"))?;
     let receipt_head = receipt
         .get("analysis_head")
@@ -5962,8 +6210,7 @@ fn run_shard(contract: &MeasurementContract, program: super::CorpusProgram) {
             .expect("ok candidate requires both memory metrics");
         let candidates = parse_table(&unit_dir.join("candidates.tsv"), CANDIDATE_HEADER, 7)
             .expect("parse isolated candidates");
-        let roots =
-            parse_table(&unit_dir.join("roots.tsv"), ROOT_HEADER, 8).expect("parse isolated roots");
+        let roots = scan_root_path(&unit_dir.join("roots.tsv")).expect("scan isolated roots");
         let exceptions = parse_table(&unit_dir.join("exceptions.tsv"), EXCEPTION_HEADER, 28)
             .expect("parse isolated exceptions");
         let candidates_text = fs::read_to_string(unit_dir.join("candidates.tsv"))
@@ -6033,7 +6280,7 @@ fn run_shard(contract: &MeasurementContract, program: super::CorpusProgram) {
             identity.population,
             contract.head,
             candidates.len(),
-            roots.len(),
+            roots.row_count,
             exceptions.len(),
             outcome.wall_s,
         );
@@ -6067,9 +6314,9 @@ fn run_shard(contract: &MeasurementContract, program: super::CorpusProgram) {
         .expect("write program isolated checkpoint");
     }
 
-    let mut combined_candidates = String::new();
-    let mut combined_roots = String::new();
-    let mut combined_exceptions = String::new();
+    let mut combined_candidates = format!("{CANDIDATE_HEADER}\n");
+    let mut combined_exceptions = format!("{EXCEPTION_HEADER}\n");
+    let mut root_inputs = Vec::new();
     for (index, identity, manifest, _, _) in &completed {
         let unit_dir = units_dir.join(format!("{index:03}"));
         validate_isolated_unit(contract, *index, identity, &unit_dir, manifest)
@@ -6079,11 +6326,7 @@ fn run_shard(contract: &MeasurementContract, program: super::CorpusProgram) {
             &fs::read_to_string(unit_dir.join("candidates.tsv")).expect("read unit candidates"),
             CANDIDATE_HEADER,
         );
-        append_table(
-            &mut combined_roots,
-            &fs::read_to_string(unit_dir.join("roots.tsv")).expect("read unit roots"),
-            ROOT_HEADER,
-        );
+        root_inputs.push(unit_dir.join("roots.tsv"));
         append_table(
             &mut combined_exceptions,
             &fs::read_to_string(unit_dir.join("exceptions.tsv")).expect("read unit exceptions"),
@@ -6092,7 +6335,8 @@ fn run_shard(contract: &MeasurementContract, program: super::CorpusProgram) {
     }
     write_atomic_checkpoint(&dir.join("candidates.tsv"), &combined_candidates)
         .expect("write program candidates");
-    write_atomic_checkpoint(&dir.join("roots.tsv"), &combined_roots).expect("write program roots");
+    write_combined_table_streaming(&root_inputs, &dir.join("roots.tsv"), ROOT_HEADER)
+        .expect("write program roots");
     write_atomic_checkpoint(&dir.join("exceptions.tsv"), &combined_exceptions)
         .expect("write program exceptions");
     let units_index = render_isolated_checkpoint(program.name, &completed).replacen(
@@ -6109,7 +6353,7 @@ fn run_shard(contract: &MeasurementContract, program: super::CorpusProgram) {
     });
     let candidates = parse_table(&dir.join("candidates.tsv"), CANDIDATE_HEADER, 7)
         .expect("parse completed candidates");
-    let roots = parse_table(&dir.join("roots.tsv"), ROOT_HEADER, 8).expect("parse completed roots");
+    let roots = scan_root_path(&dir.join("roots.tsv")).expect("scan completed roots");
     let exceptions = parse_table(&dir.join("exceptions.tsv"), EXCEPTION_HEADER, 28)
         .expect("parse completed exceptions");
     let wall_s = completed.iter().map(|unit| unit.3).sum::<f64>();
@@ -6142,7 +6386,7 @@ fn run_shard(contract: &MeasurementContract, program: super::CorpusProgram) {
         program.name,
         contract.head,
         candidates.len(),
-        roots.len(),
+        roots.row_count,
         exceptions.len(),
     );
     fs::write(dir.join("receipt.txt"), receipt).expect("write completed receipt");
@@ -6168,7 +6412,7 @@ fn run_shard(contract: &MeasurementContract, program: super::CorpusProgram) {
         "A4C completed program={} candidates={} roots={} exceptions={} wall_s={:.3} peak_rss_kb={} cgroup_peak_memory_kb={} manifest={manifest}",
         program.name,
         candidates.len(),
-        roots.len(),
+        roots.row_count,
         exceptions.len(),
         wall_s,
         peak_rss_kb,
@@ -6189,13 +6433,50 @@ fn append_table(combined: &mut String, input: &str, expected_header: &str) {
     }
 }
 
+fn write_combined_table_streaming(
+    inputs: &[PathBuf],
+    output: &Path,
+    expected_header: &str,
+) -> Result<(), String> {
+    let temporary = output.with_extension("tsv.tmp");
+    let file = fs::File::create(&temporary)
+        .map_err(|error| format!("create {}: {error}", temporary.display()))?;
+    let mut writer = BufWriter::new(file);
+    if inputs.is_empty() {
+        writeln!(writer, "{expected_header}")
+            .map_err(|error| format!("write empty table {}: {error}", temporary.display()))?;
+    } else {
+        for (index, input) in inputs.iter().enumerate() {
+            let file = fs::File::open(input)
+                .map_err(|error| format!("open table {}: {error}", input.display()))?;
+            append_table_streaming(
+                BufReader::new(file),
+                &mut writer,
+                expected_header,
+                index == 0,
+            )?;
+        }
+    }
+    writer
+        .flush()
+        .map_err(|error| format!("flush {}: {error}", temporary.display()))?;
+    drop(writer);
+    fs::rename(&temporary, output).map_err(|error| {
+        format!(
+            "publish streaming table {} from {}: {error}",
+            output.display(),
+            temporary.display()
+        )
+    })
+}
+
 fn aggregate(contract: &MeasurementContract) {
     let aggregate_dir = contract.run_root.join("aggregate");
     assert!(!aggregate_dir.exists(), "completed aggregate is immutable");
     fs::create_dir(&aggregate_dir).expect("create aggregate directory");
-    let mut combined_candidates = String::new();
-    let mut combined_roots = String::new();
-    let mut combined_exceptions = String::new();
+    let mut combined_candidates = format!("{CANDIDATE_HEADER}\n");
+    let mut combined_exceptions = format!("{EXCEPTION_HEADER}\n");
+    let mut root_inputs = Vec::new();
     let mut receipts = Vec::new();
     let mut shard_manifests = Vec::new();
     for program in &contract.programs {
@@ -6212,11 +6493,7 @@ fn aggregate(contract: &MeasurementContract) {
             &fs::read_to_string(dir.join("candidates.tsv")).expect("read candidate shard"),
             CANDIDATE_HEADER,
         );
-        append_table(
-            &mut combined_roots,
-            &fs::read_to_string(dir.join("roots.tsv")).expect("read root shard"),
-            ROOT_HEADER,
-        );
+        root_inputs.push(dir.join("roots.tsv"));
         append_table(
             &mut combined_exceptions,
             &fs::read_to_string(dir.join("exceptions.tsv")).expect("read exception shard"),
@@ -6229,16 +6506,17 @@ fn aggregate(contract: &MeasurementContract) {
     let candidate_readings_path = aggregate_dir.join("candidate-readings.tsv");
     let identity_path = aggregate_dir.join("identity.tsv");
     fs::write(&candidates_path, combined_candidates).expect("write aggregate candidates");
-    fs::write(&roots_path, combined_roots).expect("write aggregate roots");
+    write_combined_table_streaming(&root_inputs, &roots_path, ROOT_HEADER)
+        .expect("write aggregate roots");
     fs::write(&exceptions_path, combined_exceptions).expect("write aggregate exceptions");
     let candidates =
         parse_table(&candidates_path, CANDIDATE_HEADER, 7).expect("parse aggregate candidates");
-    let roots = parse_table(&roots_path, ROOT_HEADER, 8).expect("parse aggregate roots");
+    let roots = scan_root_path(&roots_path).expect("scan aggregate roots");
     let exceptions =
         parse_table(&exceptions_path, EXCEPTION_HEADER, 28).expect("parse aggregate exceptions");
     fs::write(
         &candidate_readings_path,
-        render_candidate_readings(&candidates, &roots)
+        render_candidate_readings_from_summary(&candidates, &roots)
             .expect("derive closed/open candidate readings"),
     )
     .expect("write aggregate candidate readings");
@@ -6290,8 +6568,8 @@ fn aggregate(contract: &MeasurementContract) {
     let mut provenance_tag_counts = BTreeMap::<String, usize>::new();
     let mut closed_class_witness = BTreeMap::<String, String>::new();
     let mut open_class_witness = BTreeMap::<String, String>::new();
-    let mut flag_witness = BTreeMap::<String, String>::new();
-    let mut provenance_tag_witness = BTreeMap::<String, String>::new();
+    let flag_witness = &roots.flag_witnesses;
+    let provenance_tag_witness = &roots.provenance_tag_witnesses;
     for row in &candidate_readings {
         *closed_class_counts.entry(row[4].clone()).or_default() += 1;
         *open_class_counts.entry(row[5].clone()).or_default() += 1;
@@ -6307,27 +6585,6 @@ fn aggregate(contract: &MeasurementContract) {
         }
         for tag in evidence.provenance_tags {
             *provenance_tag_counts.entry(tag).or_default() += 1;
-        }
-    }
-    for row in &roots {
-        let evidence = parse_root_evidence(&row[6]).expect("validated root evidence");
-        for flag in evidence.flags {
-            flag_witness
-                .entry(flag_label(flag).to_owned())
-                .or_insert_with(|| {
-                    format!(
-                        "{}::{} store={} root={} path={}",
-                        row[1], row[2], row[3], row[4], row[7]
-                    )
-                });
-        }
-        for tag in evidence.provenance_tags {
-            provenance_tag_witness.entry(tag).or_insert_with(|| {
-                format!(
-                    "{}::{} store={} root={} path={}",
-                    row[1], row[2], row[3], row[4], row[7]
-                )
-            });
         }
     }
     assert_eq!(closed_class_counts.values().sum::<usize>(), 237);
@@ -6378,7 +6635,7 @@ fn aggregate(contract: &MeasurementContract) {
             "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
             program.name,
             program_rows.len(),
-            roots.iter().filter(|row| row[1] == program.name).count(),
+            roots.program_counts.get(program.name).copied().unwrap_or(0),
             exceptions
                 .iter()
                 .filter(|row| row[0] == program.name)
@@ -6452,7 +6709,7 @@ fn aggregate(contract: &MeasurementContract) {
         contract.head,
         contract.input_root.display(),
         contract.programs.len(),
-        roots.len(),
+        roots.row_count,
         shard_manifests
             .iter()
             .map(|(program, digest)| format!("{program}:{digest}"))
@@ -6478,7 +6735,7 @@ fn aggregate(contract: &MeasurementContract) {
     .expect("manifest aggregate");
     eprintln!(
         "A4C aggregate complete manifest={manifest} identity=261+4 candidates=237 exceptions=4 roots={} closed_classes={closed_class_counts:?} open_classes={open_class_counts:?} divergences={stance_divergences} flags={flag_counts:?}",
-        roots.len()
+        roots.row_count
     );
 }
 
@@ -6495,7 +6752,7 @@ fn a4_source_census() {
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, process};
+    use std::{fs, io::Cursor, process};
 
     use super::*;
 
@@ -7241,6 +7498,97 @@ mod tests {
         distinct_path[7] = "malloc -> insert-return -> recursive-arg -> field-store".to_owned();
         assert!(validate_unique_root_rows(&[root.clone(), distinct_path]).is_ok());
         assert!(validate_unique_root_rows(&[root.clone(), root]).is_err());
+    }
+
+    #[test]
+    fn streaming_root_validation_preserves_schema_identity_count_and_duplicates() {
+        let row = "census\tfixture\tFixture::field0@d0\tstore\troot\tlabel\tstatic-or-interior-root\troot -> store\n";
+        let distinct_path = row.replace("root -> store", "root -> copy -> store");
+        let valid = format!("{ROOT_HEADER}\n{row}{distinct_path}");
+        let summary = scan_root_table(Cursor::new(valid), "streaming fixture").unwrap();
+        assert_eq!(summary.row_count, 2);
+        assert!(
+            validate_isolated_root_summary(&summary, "census", "fixture", "Fixture::field0@d0", 2,)
+                .is_ok()
+        );
+        assert!(
+            validate_isolated_root_summary(&summary, "census", "fixture", "Fixture::field0@d0", 1,)
+                .expect_err("count drift must fail")
+                .contains("count")
+        );
+        assert!(
+            validate_isolated_root_summary(&summary, "census", "fixture", "Fixture::field1@d0", 2,)
+                .expect_err("identity drift must fail")
+                .contains("identity")
+        );
+
+        let duplicate = format!("{ROOT_HEADER}\n{row}{row}");
+        assert!(
+            scan_root_table(Cursor::new(duplicate), "duplicate fixture")
+                .expect_err("an adjacent exact duplicate must fail")
+                .contains("duplicate")
+        );
+        let malformed = format!("{ROOT_HEADER}\ncensus\tfixture\ttoo-few\n");
+        assert!(
+            scan_root_table(Cursor::new(malformed), "malformed fixture")
+                .expect_err("column drift must fail")
+                .contains("columns")
+        );
+    }
+
+    #[test]
+    fn streaming_readings_and_concatenation_are_byte_identical() {
+        let candidates_text = concat!(
+            "program\tfield_key\tfield_slot\tordinary_kind\tprimary_class\tcause_flags\troot_count\n",
+            "fixture\tFixture::field0@d0\t0\traw\tmixed\tfield-mediated-allocation|static-or-interior-root|public-setter-reachable\t2\n",
+        );
+        let roots_text = concat!(
+            "population\tprogram\tfield_key\tstore_site\troot_id\troot_label\tcause_flags\tordered_path\n",
+            "census\tfixture\tFixture::field0@d0\tstore0\troot0\talloc\tfield-mediated-allocation\talloc -> store0\n",
+            "census\tfixture\tFixture::field0@d0\tstore1\troot1\tstatic\tstatic-or-interior-root|public-setter-reachable\tstatic -> store1\n",
+        );
+        let candidates =
+            parse_table_text(candidates_text, CANDIDATE_HEADER, 7, "candidate fixture").unwrap();
+        let roots = parse_table_text(roots_text, ROOT_HEADER, 8, "root fixture").unwrap();
+        let in_memory = render_candidate_readings(&candidates, &roots).unwrap();
+        let summary = scan_root_table(Cursor::new(roots_text), "root fixture").unwrap();
+        let streaming = render_candidate_readings_from_summary(&candidates, &summary).unwrap();
+        assert_eq!(streaming.as_bytes(), in_memory.as_bytes());
+
+        let mut expected = String::new();
+        append_table(&mut expected, roots_text, ROOT_HEADER);
+        append_table(&mut expected, roots_text, ROOT_HEADER);
+        let mut actual = Vec::new();
+        append_table_streaming(Cursor::new(roots_text), &mut actual, ROOT_HEADER, true).unwrap();
+        append_table_streaming(Cursor::new(roots_text), &mut actual, ROOT_HEADER, false).unwrap();
+        assert_eq!(actual, expected.as_bytes());
+    }
+
+    #[test]
+    #[ignore = "lambda7 byte/digest witness against manifested resume9 BST shard"]
+    fn streaming_matches_manifested_bst_artifact_byte_for_byte() {
+        let dir = Path::new(
+            "/home/p51lee/dev/agent-worktrees/crat-a4-source-census-run-20260813-retry3-resume9/shards/bst",
+        );
+        assert_eq!(
+            verify_manifest(dir).unwrap(),
+            "f9c23eddb3b9da283a2ebf82a4839f9f0e28c4d535f69923d38531ad397b90dd"
+        );
+        let candidates = parse_table(&dir.join("candidates.tsv"), CANDIDATE_HEADER, 7).unwrap();
+        let roots_text = fs::read_to_string(dir.join("roots.tsv")).unwrap();
+        let roots = parse_table_text(&roots_text, ROOT_HEADER, 8, "manifested BST roots").unwrap();
+        let in_memory = render_candidate_readings(&candidates, &roots).unwrap();
+        let summary = scan_root_path(&dir.join("roots.tsv")).unwrap();
+        let streaming = render_candidate_readings_from_summary(&candidates, &summary).unwrap();
+        assert_eq!(streaming.as_bytes(), in_memory.as_bytes());
+
+        let mut copied = Vec::new();
+        append_table_streaming(Cursor::new(&roots_text), &mut copied, ROOT_HEADER, true).unwrap();
+        assert_eq!(copied, roots_text.as_bytes());
+        assert_eq!(
+            sha256_text(std::str::from_utf8(&copied).unwrap()),
+            sha256(&dir.join("roots.tsv"))
+        );
     }
 
     #[test]
