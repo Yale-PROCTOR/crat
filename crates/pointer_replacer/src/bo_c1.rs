@@ -7965,32 +7965,6 @@ mod run {
                 let op_path = std::path::Path::new(&dir).join(format!("{name}.ops.tsv"));
                 std::fs::write(&op_path, ops)
                     .unwrap_or_else(|e| panic!("write op split {}: {e}", op_path.display()));
-
-                // **THE PER-SUBJECT REASON SIDE-FILE** (option A, authorized as
-                // a batch 2026-08-16).
-                //
-                // Until this, the fine degradation reason existed ONLY as a
-                // corpus-wide aggregate printed to the sweep log: producer A's
-                // row carries an 8-value coarse `outcome` in which every one of
-                // the 4,895 degraded subjects reports the same string. So a
-                // market could be quoted as a total and never as a
-                // distribution, and R5 says a rate without its spread is not
-                // reportable.
-                //
-                // Written as a SIDE-FILE rather than a new column, on the
-                // `*.ops.tsv` precedent directly above: producer A's row is a
-                // reconciliation wire contract with row-equality controls
-                // (S2a-H), and widening it would perturb every future sweep
-                // comparison for a measurement that has no business in it.
-                // **Additive** — no existing artifact class changes by a byte.
-                let reasons: String = degradations
-                    .iter()
-                    .map(|d| format!("{}\t{}\t{}\n", d.subject, d.reason.key(), d.site))
-                    .collect();
-                let reason_path = std::path::Path::new(&dir).join(format!("{name}.reasons.tsv"));
-                std::fs::write(&reason_path, reasons).unwrap_or_else(|e| {
-                    panic!("write reason side-file {}: {e}", reason_path.display())
-                });
             }
         }
         // **THE FABRICATED-EXTENT CONST, MEASURED ON THE EMITTED TEXT.**
@@ -10988,80 +10962,6 @@ fn m1_recon_corpus() {
     for (reason, n) in &totals.by_reason {
         println!("M1COUNT-REASON {reason}={n} label={PRE_S3_LABEL:?}");
     }
-    // ⚠ **THE REASON SIDE-FILE PARTITIONS THE DEGRADED POPULATION** (option A,
-    // 2026-08-16). This is the instrument's non-vacuity witness, and it is a
-    // PARTITION identity rather than a total: rows must sum to `degraded` AND
-    // every key's sum must equal the aggregate the census already prints.
-    //
-    // A total alone would pass on a side-file that mislabelled every row; a
-    // per-key identity alone would pass on one that dropped a whole program.
-    // Both together are what makes the per-program spread trustworthy, which is
-    // the only reason the side-file exists.
-    {
-        let mut file_rows = 0usize;
-        let mut file_by_key: std::collections::BTreeMap<String, usize> = Default::default();
-        for program in CORPUS {
-            let path = art.join(format!("{}.reasons.tsv", program.name));
-            let Ok(text) = fs::read_to_string(&path) else {
-                failures.push(format!(
-                    "{}: no reason side-file at {} — an ABSENT file is not an \
-                     empty population, and this instrument exists to stop \
-                     exactly that read",
-                    program.name,
-                    path.display()
-                ));
-                continue;
-            };
-            let n = text.lines().filter(|l| !l.trim().is_empty()).count();
-            // A program with zero rows is a TYPED FINDING, not silence: every
-            // corpus program degrades something, so a zero here is the writer
-            // having failed rather than the program having nothing to say.
-            if n == 0 {
-                failures.push(format!(
-                    "{}: reason side-file is EMPTY — no corpus program has zero \
-                     degradations, so this is the writer, not the program",
-                    program.name
-                ));
-            }
-            file_rows += n;
-            for line in text.lines() {
-                if let Some(key) = line.split('\t').nth(1) {
-                    *file_by_key.entry(key.to_owned()).or_default() += 1;
-                }
-            }
-        }
-        if file_rows != totals.degraded {
-            failures.push(format!(
-                "reason side-files hold {file_rows} rows but the census counted \
-                 {} degraded subjects — the side-file is not a partition of the \
-                 population it claims to describe",
-                totals.degraded
-            ));
-        }
-        for (key, n) in &totals.by_reason {
-            match file_by_key.get(key.as_str()) {
-                Some(m) if m == n => {}
-                other => failures.push(format!(
-                    "reason `{key}`: census {n}, side-files {other:?} — the two \
-                     derivations of the same key disagree"
-                )),
-            }
-        }
-        for key in file_by_key.keys() {
-            if !totals.by_reason.contains_key(key.as_str()) {
-                failures.push(format!(
-                    "reason `{key}` appears in the side-files and in NO census \
-                     row — a key the aggregate cannot see"
-                ));
-            }
-        }
-        println!(
-            "M1REASONS rows={file_rows} keys={} degraded={}",
-            file_by_key.len(),
-            totals.degraded
-        );
-    }
-
     // ⚠ **THE FABRICATED POPULATION IS NON-EMPTY** (R7; adversarial finding
     // ADV-FAB-06, relocated here 2026-08-15 after being written into the wrong
     // frame first).
