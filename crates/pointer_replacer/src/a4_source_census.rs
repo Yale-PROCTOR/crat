@@ -689,6 +689,8 @@ fn constant_root(tcx: TyCtxt<'_>, operand: &Operand<'_>) -> (TerminalKind, BTree
             TerminalKind::StaticOrInterior,
             BTreeSet::from(["string-literal-root".to_owned()]),
         )
+    } else if constant_static_target(tcx, operand).is_some() {
+        (TerminalKind::StaticOrInterior, BTreeSet::new())
     } else {
         (TerminalKind::Unsupported, BTreeSet::new())
     }
@@ -1374,6 +1376,19 @@ fn static_data_derivation_for_place(
         match projection {
             ProjectionElem::Deref => derivation.depth_offset += 1,
             ProjectionElem::Index(_) | ProjectionElem::ConstantIndex { .. } => {}
+            ProjectionElem::Field(_, field_ty)
+                if matches!(
+                    field_ty.kind(),
+                    TyKind::Array(element, _)
+                        if matches!(
+                            element.kind(),
+                            TyKind::Bool
+                                | TyKind::Char
+                                | TyKind::Int(_)
+                                | TyKind::Uint(_)
+                                | TyKind::Float(_)
+                        )
+                ) => {}
             _ => {
                 return Err(format!(
                     "unsupported static-data projection {projection:?} in {place:?}"
@@ -2234,20 +2249,20 @@ fn build_source_graph(tcx: TyCtxt<'_>, slots: &CrateSlots, export: &BoExport) ->
                     Rvalue::Use(operand @ Operand::Constant(_))
                     | Rvalue::Cast(_, operand @ Operand::Constant(_), _) => {
                         let (terminal, provenance_tags) = constant_root(tcx, operand);
+                        let constant_label = if terminal == TerminalKind::NullLiteral {
+                            "null-literal"
+                        } else if provenance_tags.contains("string-literal-root") {
+                            "string-literal"
+                        } else if terminal == TerminalKind::StaticOrInterior {
+                            "static-address"
+                        } else {
+                            "constant-pointer"
+                        };
                         add_terminal_with_tags(
                             &mut graph,
                             target,
                             terminal,
-                            format!(
-                                "{}:{location}",
-                                if terminal == TerminalKind::NullLiteral {
-                                    "null-literal"
-                                } else if terminal == TerminalKind::StaticOrInterior {
-                                    "string-literal"
-                                } else {
-                                    "constant-pointer"
-                                }
-                            ),
+                            format!("{constant_label}:{location}"),
                             false,
                             provenance_tags,
                         );
@@ -3747,6 +3762,9 @@ const COMPLETED_LIL_MANIFEST: &str =
     "b7fccec973fcf08062c44bd2302a5f0e315034094e86cc984b9f5be6cdcbfbfe";
 const COMPLETED_LIL_RECEIPT_SHA256: &str =
     "7c7c61e8138e2d41822cf01f114697ef3d793d76df89ba7d9938385c01c54827";
+const COMPLETED_HEMAN_HEAD: &str = "951a327deb5904aac07c8c700ca3c8c85b182d2c";
+const COMPLETED_HEMAN_MANIFEST: &str =
+    "33863923d1e86d0138b7cdf51f1f1193cd0c341ad422d24ee04258b2b819a71b";
 const LIL_RESUME9_HEAD: &str = "e87be067d4717d3ea74dd5192f210b6de4170bac";
 const LIL_RESUME9_UNITS: [(&str, &str); 19] = [
     (
@@ -3840,7 +3858,7 @@ const RAW_CORPUS_DIGEST: &str = "9fc912af10fd3b235fe4d444d2fbac0bc521509b1c9447f
 const DERIVED_SUBSTRATE_DIGEST: &str =
     "db96829b5c2b0db28fb4bb9ddd3d32901b5d4e6e4134da07ada0d513d94eb4c6";
 const SNAPSHOT_PATH: &str = "/home/p51lee/dev/agent-worktrees/m1-artifact-snapshots/3b26a0ff";
-const RETRY3_PREDECESSOR_SHARDS: [(&str, &str, &str); 14] = [
+const RETRY3_PREDECESSOR_SHARDS: [(&str, &str, &str); 15] = [
     (
         "bst",
         "ce11b3459c6fa46965e4cbe23ce11dffbdc7bf01",
@@ -3907,6 +3925,7 @@ const RETRY3_PREDECESSOR_SHARDS: [(&str, &str, &str); 14] = [
         "241ea04355b5a9f469d3d8f75d8ac70f98ff797bfb8e50e694fce13b90e8bd2a",
     ),
     ("lil", COMPLETED_LIL_HEAD, COMPLETED_LIL_MANIFEST),
+    ("heman", COMPLETED_HEMAN_HEAD, COMPLETED_HEMAN_MANIFEST),
 ];
 
 fn command_stdout(mut command: Command, description: &str) -> String {
@@ -4948,11 +4967,12 @@ fn completed_shard_memory_policy(
     current_head: &str,
 ) -> Result<CompletedShardMemoryPolicy, String> {
     validate_receipt_head(program, receipt_head, manifest, current_head)?;
-    if receipt_head == current_head
-        || (program == "lil"
-            && receipt_head == COMPLETED_LIL_HEAD
-            && manifest == COMPLETED_LIL_MANIFEST)
-    {
+    let capped_predecessor = matches!(
+        (program, receipt_head, manifest),
+        ("lil", COMPLETED_LIL_HEAD, COMPLETED_LIL_MANIFEST)
+            | ("heman", COMPLETED_HEMAN_HEAD, COMPLETED_HEMAN_MANIFEST)
+    );
+    if receipt_head == current_head || capped_predecessor {
         Ok(CompletedShardMemoryPolicy::Cgroup100GiB)
     } else {
         Ok(CompletedShardMemoryPolicy::LegacyUncapped)
@@ -7899,8 +7919,8 @@ mod tests {
         assert_eq!(
             completed_shard_memory_policy(
                 "heman",
-                "new-current-head",
-                "future-current-manifest",
+                COMPLETED_HEMAN_HEAD,
+                COMPLETED_HEMAN_MANIFEST,
                 "new-current-head",
             ),
             Ok(CompletedShardMemoryPolicy::Cgroup100GiB),
@@ -7917,10 +7937,10 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "lambda7 exact fourteen-shard typed-policy validation witness"]
-    fn all_fourteen_manifested_shards_validate_under_typed_policies() {
+    #[ignore = "lambda7 exact manifested-predecessor typed-policy validation witness"]
+    fn all_manifested_predecessor_shards_validate_under_typed_policies() {
         let run_root = PathBuf::from(
-            "/home/p51lee/dev/agent-worktrees/crat-a4-source-census-run-20260815-retry3-resume13-AYUuOKKP",
+            "/home/p51lee/dev/agent-worktrees/crat-a4-source-census-run-20260816-retry3-resume14-GL6M9JOG",
         );
         let input_root = PathBuf::from(
             "/home/p51lee/dev/agent-worktrees/crat-a4-predicted-run-20260810/aggregate",
@@ -7945,7 +7965,7 @@ mod tests {
             let receipt = parse_receipt(&dir.join("receipt.txt")).unwrap();
             validate_completed_receipt(&receipt, &contract, program, &manifest)
                 .unwrap_or_else(|error| panic!("{program} completed receipt: {error}"));
-            if program == "lil" {
+            if matches!(program, "lil" | "heman") {
                 let mut mutated = receipt.clone();
                 mutated.insert("memory_limit".to_owned(), "uncapped".to_owned());
                 assert!(
@@ -10126,6 +10146,84 @@ mod tests {
                 ),
                 PrimaryClass::Unresolved
             );
+        })
+        .unwrap_or_else(|error| error.raise());
+    }
+
+    #[test]
+    fn primitive_static_array_field_is_interior_but_pointer_array_stops() {
+        let scalar_array = r#"
+            struct Table {
+                padding: u32,
+                values: [u32; 256],
+            }
+
+            struct Output {
+                pointer: *mut u32,
+            }
+
+            static mut TABLE: Table = Table {
+                padding: 0,
+                values: [0; 256],
+            };
+
+            pub unsafe fn store_static_interior(output: *mut Output, index: usize) {
+                let table = &raw mut TABLE;
+                (*output).pointer = &raw mut (*table).values[index];
+            }
+        "#;
+        ::utils::compilation::run_compiler_on_str(scalar_array, |tcx| {
+            let program = super::super::collect_program(tcx);
+            let slots = CrateSlots::build(&program);
+            let graph = build_source_graph(tcx, &slots, &BoExport::default());
+            let field = candidate_fields(tcx, &slots)
+                .keys()
+                .find(|key| key.ends_with("Output::field0@d0"))
+                .expect("fixture output field")
+                .clone();
+            let roots = trace_candidate(&graph, &field);
+            assert!(
+                roots.iter().any(|root| {
+                    root.evidence
+                        .flags
+                        .contains(&CauseFlag::StaticOrInteriorRoot)
+                }),
+                "primitive scalar array interior must reach the existing static terminal: {roots:#?}"
+            );
+        })
+        .unwrap_or_else(|error| error.raise());
+
+        let pointer_array = r#"
+            struct Table {
+                pointers: [*mut u32; 1],
+            }
+
+            static mut TABLE: Table = Table {
+                pointers: [core::ptr::null_mut(); 1],
+            };
+
+            pub unsafe fn unsupported_pointer_array(index: usize) -> *mut *mut u32 {
+                let table = &raw mut TABLE;
+                &raw mut (*table).pointers[index]
+            }
+        "#;
+        ::utils::compilation::run_compiler_on_str(pointer_array, |tcx| {
+            let program = super::super::collect_program(tcx);
+            let function = program
+                .functions
+                .iter()
+                .copied()
+                .find(|function| {
+                    tcx.def_path_str(*function)
+                        .ends_with("unsupported_pointer_array")
+                })
+                .expect("fixture pointer-array function");
+            let body_ref = tcx
+                .mir_drops_elaborated_and_const_checked(function)
+                .borrow();
+            let error = derive_static_data_locals(tcx, function, &body_ref)
+                .expect_err("a static array containing pointers must remain unsupported");
+            assert!(error.contains("unsupported static-data projection"));
         })
         .unwrap_or_else(|error| error.raise());
     }
