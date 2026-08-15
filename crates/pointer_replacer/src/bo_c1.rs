@@ -10962,6 +10962,41 @@ fn m1_recon_corpus() {
     for (reason, n) in &totals.by_reason {
         println!("M1COUNT-REASON {reason}={n} label={PRE_S3_LABEL:?}");
     }
+    // ⚠ **THE FABRICATED POPULATION IS NON-EMPTY** (R7; adversarial finding
+    // ADV-FAB-06, relocated here 2026-08-15 after being written into the wrong
+    // frame first).
+    //
+    // Every counter this capability added is `row.set` only, so a build in
+    // which `glue`'s two slice arms never fired would produce an identical green
+    // sweep — nothing anywhere depended on the 93. Worse, every way the const's
+    // delivery can fail collapses onto the same passing state downstream: no
+    // root file → the const arm fail-opens → dangling path → `E0433` → verify
+    // reverts the fabricated owners → the emitted crate carries neither const
+    // nor reference → `decl 0, ref 0` → green, indistinguishable from an empty
+    // market.
+    //
+    // **This is the frame that can answer it**: `seam_len_fabricated` is set by
+    // the seam-census block above. How many of them SURVIVE is a different
+    // question, in a different frame, and `m1_emit_corpus` reports it there
+    // without pretending to know this one.
+    let placed_fab: i64 = rows
+        .iter()
+        .filter_map(|r| r.get("seam_len_fabricated"))
+        .filter_map(|v| v.parse::<i64>().ok())
+        .sum();
+    println!(
+        "M1FAB-RECON placed={placed_fab} programs={}",
+        rows.iter()
+            .filter(|r| r.get("seam_len_fabricated").is_some_and(|v| v != "0"))
+            .count()
+    );
+    assert!(
+        placed_fab > 0,
+        "no fabricated placement was made anywhere in the corpus — the \
+         capability is unexercised and every gate below it passes vacuously. \
+         This is a DIFFERENT event from 'placements were made and all were \
+         reverted', which the emit frame reports as surviving=0"
+    );
     assert_eq!(
         rows.len()
             + failures
@@ -13275,41 +13310,32 @@ fn m1_emit_corpus() {
         "every corpus program must be attempted"
     );
     assert_eq!(attempted, CORPUS.len(), "the corpus is 20 programs");
-    // ⚠ **THE FABRICATED POPULATION IS NON-EMPTY** (R7, added 2026-08-15 on
-    // adversarial finding ADV-FAB-06).
+    // ⚠ **WHAT THIS FRAME KNOWS, AND WHAT IT DOES NOT** (repaired 2026-08-15).
     //
-    // Every new counter in this slice was `row.set` only, so a build in which
-    // `glue`'s two slice arms never fired would have produced an identical green
-    // sweep. Worse, every way the const's delivery can fail collapses onto the
-    // same passing state: no root file → the const arm fail-opens → dangling
-    // path → `E0433` → verify reverts the fabricated owners → final files carry
-    // neither const nor reference → `decl 0, ref 0` → green. Indistinguishable
-    // from an empty market.
+    // The first version of this block summed `seam_len_fabricated` here and
+    // asserted it nonzero. That key is set by the RECON worker's seam-census
+    // block and is **absent from every emit row**, so the sum was 0 across all
+    // 20 programs and the assertion fired on a corpus that had placed 93.
     //
-    // The two are now separated: the placements must EXIST, and how many of them
-    // survive is reported beside the total rather than conflated with it.
-    let placed_fab: i64 = rows
-        .iter()
-        .filter_map(|r| r.get("seam_len_fabricated"))
-        .filter_map(|v| v.parse::<i64>().ok())
-        .sum();
+    // The failure was cheap and the printed line was not: `M1FAB placed=0` is a
+    // confident zero for a quantity this frame cannot see — absence read as
+    // observation, produced by the very fix written for ADV-FAB-06, which was
+    // itself about a counter that could not tell "none placed" from "all
+    // reverted". The non-emptiness assertion belongs in `m1_recon_corpus`, where
+    // the census lives, and it is there now.
+    //
+    // This frame reports SURVIVAL, and says so.
     let surviving_fab: i64 = rows
         .iter()
         .filter_map(|r| r.get("fab_const_ref"))
         .filter_map(|v| v.parse::<i64>().ok())
         .sum();
     println!(
-        "M1FAB placed={placed_fab} surviving={surviving_fab} programs_with_const={}",
+        "M1FAB-EMIT surviving={surviving_fab} programs_with_const={} \
+         (placed is a RECON-frame quantity and is not measured here)",
         rows.iter()
             .filter(|r| r.get("fab_const_decl") == Some("1"))
             .count()
-    );
-    assert!(
-        placed_fab > 0,
-        "no fabricated placement was made anywhere in the corpus — the \
-         fabrication capability is unexercised, and every gate below it passes \
-         vacuously. This is a different event from 'placements were made and all \
-         were reverted', which reports surviving=0 with placed>0"
     );
     assert!(
         failures.is_empty(),
