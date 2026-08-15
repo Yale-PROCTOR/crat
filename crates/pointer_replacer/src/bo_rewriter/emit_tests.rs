@@ -4362,6 +4362,25 @@ fn the_fabricated_const_follows_the_surviving_adapters() {
             "one crate, one const — never one per fabricated site"
         );
 
+        // **PLACEMENT IS LOAD-BEARING, so it is COMPILED.** Counting the const
+        // proves it is present; only the compiler proves it is somewhere legal
+        // and that `crate::SEAM_LEN_PLACEHOLDER` resolves from the call sites.
+        // Without this the whole placement rule — end of the crate ROOT file —
+        // would be witnessed by a `.matches()` on a string, which an insertion
+        // ahead of the inner attributes would satisfy just as well.
+        let (files, _) = super::render(plan, texts, &std::collections::BTreeSet::new());
+        let emitted = files.values().next().expect("one emitted file").clone();
+        assert!(
+            emitted.contains("crate::SEAM_LEN_PLACEHOLDER"),
+            "the call sites must NAME the const, or this compiles vacuously:\n{emitted}"
+        );
+        let staged =
+            super::verify::materialize_single_file(&emitted).expect("the emitted crate stages");
+        assert!(
+            super::verify::type_checks_crate(staged.root()),
+            "the emitted crate must type-check with the const where we put it:\n{emitted}"
+        );
+
         // ---- arm 1: every fabricated adapter reverts ⇒ NO const ----
         // The dead-const case the sentinel owner would have produced.
         let all_gone: std::collections::BTreeSet<String> = std::iter::once(owner).collect();
