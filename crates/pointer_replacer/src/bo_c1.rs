@@ -8167,10 +8167,16 @@ mod run {
                 // revert predicate, so its zero was forced; the two sides now
                 // derive the revert decision by different routes, which is what
                 // makes `differing`/`absent`/`surplus` worth failing on.
-                // `rollbacks` and the two owner classes stay REPORTED — first
-                // measurements whose zero rests on a structural argument rather
-                // than a prior run, and all three are fail-open into
-                // `differing`, which is gated.
+                // ⚠ **STALE AS OF ROUND 5, CORRECTED HERE.** This said the two
+                // owner classes "stay REPORTED ... and all three are fail-open
+                // into `differing`". Round 5 GATED both
+                // (`P4_IDENTITY_ZERO_KEYS`) and made `Unresolved` fail CLOSED —
+                // in the same commit, ~130 lines from this comment. Now: both
+                // owner classes are **gated PINs** (`Unresolved` unreachable
+                // because every `owner_fn` resolves; `Split` unreachable while
+                // `revert_resolution_failure` errors on a reverted homonym),
+                // `Unresolved` fails closed and `Split` fails open, and only
+                // `render_rollbacks` remains reported-not-gated.
                 row.set("p4_render_compared", p.render_compared.to_string());
                 row.set("p4_render_differing", p.render_differing.to_string());
                 row.set("p4_render_absent", p.render_absent.to_string());
@@ -11368,11 +11374,22 @@ fn p3_row_failures(program: &str, row: &report::Row) -> Vec<String> {
     }
     // **THE SEAM-OWNER CORROBORATION'S CONSERVATION IDENTITY (round 5).**
     //
-    // Every seam edit must reach exactly one verdict of the second derivation.
-    // Without this the three zero-gates sit over a population nothing pins: a
-    // corroboration that silently examined no edits would read as agreement,
-    // which is the shape `p4_render_*` shipped in round 4 without a denominator
-    // and the round-4 review named.
+    // ⚠ **A PIN, and the first version of this comment claimed otherwise** —
+    // caught by the round-5 review, and it is the *isomorphic* defect to the
+    // withheld identity relabelled 40 lines above IN THIS SAME COMMIT.
+    // `reconcile_seam_owners` is fed `table.seams.edits.iter()` while
+    // `p.seam_edits` is `table.seams.edits.len()` three statements later — the
+    // same `Vec`, unmutated — and the reconciler increments exactly one of four
+    // counters per item. So `a + m + u + b == len()` holds on every run the
+    // instrument can emit, and the stated protection ("a corroboration that
+    // silently examined no edits would read as agreement") is NOT what it
+    // provides: over an empty collection the denominator is 0 too and
+    // `0+0+0+0 == 0` passes.
+    //
+    // What it does pin: the four-way outcome set stays exhaustive and mutually
+    // exclusive, and the row-level controls (2/2, 1/1, 249/249) exercise the
+    // gate. Kept for that, labelled honestly rather than sold as a denominator
+    // guard.
     match (
         num("p4_seam_owner_agree"),
         num("p4_seam_owner_mismatch"),

@@ -2313,7 +2313,12 @@ pub(crate) fn phase3_fn_parity(
     // built here from `tcx.hir_body_owners()`.
     //
     // ⚠ **WHAT THAT DOES AND DOES NOT BUY (round-4 review, adopted).**
-    // `recon-drop = render-drop ∧ reached`, and the gated
+    // `recon-drop = (render-drop ∧ reached) ∨ unresolved` — the `unresolved`
+    // term is round 5's fail-closed arm, and the round-5 review caught this
+    // formula still missing it. It is a PIN (unreachable, and zero-gated), so
+    // the equality below is unaffected in practice; the term is stated because
+    // a formula that omits a live disjunct is how the last three overclaims
+    // started. With it, and the gated
     // `withheld_missing`/`_surplus == 0` plus the ledger GAP line force
     // `withheld_fns == reverts.fns` — so **on a green gate the two predicates
     // are EQUAL and the corpus zeros below are ENTAILED, not independent
@@ -2728,18 +2733,49 @@ pub(crate) fn owner_verdict<D: Eq + std::hash::Hash>(
 /// reconstruction, the AST seam map and the span splice all consume it without
 /// any of them able to disagree with it.
 ///
-/// This derives it again from the other direction: a HIR walk keyed by the
-/// **argument span**, so a seam edit's owner is looked up by *where the edit
-/// lands* rather than by the map key it was filed under. The two derivations
-/// share rustc's own `Res::Def` path resolution — **stated, not papered over**:
-/// what this corroborates is OUR attribution (which owner string reaches which
-/// edit), not rustc's resolution of a path.
+/// This derives it again as a **SECOND COPY** of the same computation, keyed by
+/// the argument span instead of by the callee.
 ///
-/// Body enumeration is `hir_body_owners` + `hir_body_owned_by`, matching
-/// [`super::decision::emitability::collect`] exactly, so a body one walk sees and
-/// the other does not cannot present as a mismatch. Deliberately NOT filtered by
-/// the functions-under-consideration list that `emitability` applies: a superset
-/// index can only make lookups succeed, never invent a disagreement.
+/// ⚠ **WHAT THAT IS AND IS NOT — corrected after the round-5 adversarial review,
+/// which falsified the first version of this paragraph.** That version said the
+/// owner is "looked up by *where the edit lands* rather than by the map key it
+/// was filed under". **That is false.** `emitability` files the map key
+/// `local_did` and the `Arg { span: arg.span }` inside the *same*
+/// `if let ExprKind::Call(callee, args)`, in the *same* `args` loop — so the two
+/// are one derivation indexed two ways, not two derivations.
+///
+/// This function is [`super::decision::emitability::collect`]'s arm 5 with one
+/// predicate removed (`locals.contains`). The consequences are exact and are
+/// labelled rather than argued:
+///
+/// - **`unlocated` is a PIN, not a measurement.** A strictly weaker predicate
+///   chain inserts an entry wherever `emitability` produced one, so a seam key
+///   is always present. It fires only if the two copies diverge structurally.
+/// - **`agree == seam_edits` is ENTAILED given `ambiguous == 0`** whenever both
+///   copies are correct — which is the normal state of any differential between
+///   two correct implementations, and is why the number is corroboration rather
+///   than independent evidence.
+/// - **`ambiguous` is the only unconditionally measured content**: a census of
+///   argument spans resolving to several distinct callees.
+///
+/// **What it is nonetheless LIVE against** — the reason it is not vacuous: a
+/// defect in either copy. Principally `seam::synthesize`'s ~25-line transport
+/// (`owner_fn: def_path_str(site.caller)` fires `mismatch`; a wrong `span` fires
+/// `unlocated`), and also `emitability`'s own keying, since this walk re-resolves
+/// the callee rather than reading that map. Nothing in the gate forces
+/// `mismatch == 0`; only the code under test being correct does.
+///
+/// **Shared steps, stated in full** (the first version conceded only
+/// `Res::Def`): the body enumeration, the `ExprKind::Call` match, the
+/// `QPath::Resolved`/`Res::Def`/`as_local` chain, `def_path_str` — which this
+/// file measures as NON-INJECTIVE — and the `for arg in args` pairing. A
+/// cross-homonym mis-attribution is invisible here by construction; that bound
+/// rests on `revert_resolution_failure`, not on this corroboration.
+///
+/// Body enumeration matches `collect` exactly so a body one walk sees and the
+/// other does not cannot present as a mismatch. The index is deliberately NOT
+/// filtered by the functions-under-consideration list: a superset can only make
+/// lookups succeed, never invent a disagreement.
 #[cfg(test)]
 pub(crate) fn call_arg_owners(
     tcx: rustc_middle::ty::TyCtxt<'_>,
@@ -2791,10 +2827,13 @@ pub(crate) struct SeamOwnerRecon {
     /// of the call its argument sits in — so the revert filter is asking about
     /// the wrong function, and every downstream counter agrees with it.
     pub mismatch: usize,
-    /// A seam edit whose argument span matches no direct-call argument. Its zero
-    /// is not decorative: seams are produced only from `call_args`, whose entries
-    /// are exactly these spans, so a nonzero means the two walks disagree about
-    /// what the crate contains.
+    /// A seam edit whose argument span matches no direct-call argument.
+    ///
+    /// ⚠ **A PIN.** `call_arg_owners`' predicate chain is strictly weaker than
+    /// the one that produced these spans, so its index is a SUPERSET of the seam
+    /// keys and this cannot fire while both copies walk the same construct. It
+    /// is gated so that a structural divergence between them cannot land
+    /// silently.
     pub unlocated: usize,
     /// One argument span naming several DISTINCT callees — a span collision, and
     /// undecidable rather than wrong. Counted apart so it can never be read as
@@ -3267,14 +3306,24 @@ pub(crate) struct FnParity {
     /// REVERTED** — the direction round 3's comparison could not see at all,
     /// since it iterated the reconstruction's keys and skipped the empty ones.
     ///
-    /// ⚠ **A PIN, NOT A MEASUREMENT** (round-4 review; round 4's own doc called
-    /// it "the first measurement of the fully-reverted population" and that was
-    /// wrong). Unreachable from the reconstruction side by construction:
-    /// recon-Withheld(e) ⟹ owner ∈ `withheld_fns` ⊆ `reverts.fns` ⟹
-    /// `owner_fn` ∈ `reverts.names` ⟹ `render` drops it too; contrapositively
-    /// render-keeps ⟹ recon-keeps ⟹ the key is in `recon.files`. It fires only
-    /// on a mutation of `render`'s own filter, and is gated so that mutation
-    /// cannot land silently.
+    /// ⚠ **A PIN ONLY WHILE `render_owner_unresolved == 0` — and the round-5
+    /// commit that wrote the unconditional proof below is the same one that
+    /// broke it.** Round 4 called this "the first measurement of the
+    /// fully-reverted population"; round 5 corrected that to a PIN with the
+    /// proof *recon-Withheld(e) ⟹ owner ∈ `withheld_fns` ⊆ `reverts.fns` ⟹
+    /// `owner_fn` ∈ `reverts.names` ⟹ `render` drops too*, contrapositively
+    /// render-keeps ⟹ recon-keeps.
+    ///
+    /// **That proof covers only `Withheld`.** Since round 5 the reconstruction
+    /// also drops on `Unresolved`, and an unresolvable name is by construction
+    /// absent from `reverts.names`, so `render` KEEPS it: a file whose every
+    /// otherwise-kept edit is unresolved is omitted by the reconstruction and
+    /// emitted by `render`, firing this counter **from the reconstruction
+    /// side**. "Fires only on a mutation of `render`'s own filter" is false.
+    ///
+    /// Both directions fail RED, so no green is laundered — `render_owner_
+    /// unresolved` is itself zero-gated and fires first. The consequence is
+    /// misdiagnosis, not a false pass.
     pub render_surplus: usize,
     /// Planned files whose surviving-edit set is empty on the reconstruction's
     /// derivation. The fully-reverted population, as a reported number rather
@@ -3283,14 +3332,22 @@ pub(crate) struct FnParity {
     /// `|plan.by_file|` — the conservation denominator, so every planned file
     /// accounts for itself as compared, absent or expected-empty.
     pub render_plan_files: usize,
-    /// An edit whose `owner_fn` resolved to NO local body owner. Structurally
-    /// zero; **fail-open** (the edit is kept), so it surfaces as a text
-    /// difference rather than a quiet exclusion.
+    /// An edit whose `owner_fn` resolved to NO local body owner.
+    ///
+    /// ⚠ **A PIN, and FAIL-CLOSED as of round 5** — this doc said "fail-open
+    /// (the edit is kept)" and the same commit made it drop. Unreachable:
+    /// `collect_program` gathers only `ItemKind::Fn` body owners and
+    /// `owners_by_name` is keyed over all of them, so every `owner_fn` resolves.
+    /// **GATED** as of round 5, so its zero cannot be read as a measurement.
     pub render_owner_unresolved: usize,
     /// An edit whose `owner_fn` resolved to several body owners that DISAGREE
     /// about withheld-ness — the registered homonym hazard, at the one place it
-    /// could change a verdict. Entailed zero while the injectivity gate holds;
-    /// fail-open for the same reason as above.
+    /// could change a verdict.
+    ///
+    /// ⚠ **A PIN**, unreachable while `revert_resolution_failure` errors on any
+    /// reverted homonym. **FAIL-OPEN** (kept) — the opposite arm from
+    /// `Unresolved` above, and the asymmetry is deliberate: see
+    /// [`OwnerVerdict::keeps_edit`]. **GATED** as of round 5.
     pub render_owner_split: usize,
     /// **`render`'s own rollbacks** — an edit it could not place coherently.
     /// The one production-coherence signal this gate has, and it was being
@@ -4439,7 +4496,7 @@ mod arm2_witnesses {
     /// *Mutation-tested:* M20 (fold `Split` into the dropped arm) and M24
     /// (restore `Unresolved` to fail-open) each flip their own assertion.
     #[test]
-    fn an_undecidable_owner_keeps_its_edit_and_names_itself() {
+    fn the_two_undecidable_owner_arms_fail_in_opposite_directions() {
         let withheld: FxHashSet<u32> = [1u32].into_iter().collect();
         assert_eq!(
             owner_verdict(None, &withheld),
