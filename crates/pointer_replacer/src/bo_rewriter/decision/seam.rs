@@ -159,11 +159,17 @@ impl LenArm {
 /// **A slice seam's length, WITH ITS PROVENANCE** (marker ruling, 2026-08-15).
 ///
 /// The provenance rides *in* the value rather than beside it, so "fabricate
-/// without tagging it" is **not expressible**: [`GlueSpec::render`] and the
-/// artifact's [`LenArm`] read the same field, one derivation. The prefix-testing
-/// `glue_shape` classifier was retired for exactly this reason — a second
-/// derivation of a fact the decision already holds is a defect waiting for a
-/// mutation.
+/// without tagging it" is not expressible **in the emitted text**.
+///
+/// ⚠ **That was originally claimed for the ARTIFACT too, and it was false.**
+/// `synthesize` decided the audit arm by its own `match` on the companion text,
+/// so the tag and the length were two expressions reading one variable — they
+/// agreed by coincidence, and forcing the tag one way left the emitted text
+/// untouched with the whole suite green (ADV-FAB-01). Repaired 2026-08-15: the
+/// arm is derived from this field after `glue` answers, so the claim now holds
+/// because of the code rather than in spite of it. The prefix-testing
+/// `glue_shape` classifier was retired for the same reason — a second derivation
+/// of a fact the decision already holds is a defect waiting for a mutation.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum SeamLen {
     /// The caller's own companion argument text (ruling B adjacency).
@@ -2012,7 +2018,7 @@ pub(crate) fn synthesize(
                     (pos.expected, pos.found),
                     (Form::Slice { .. }, Form::Raw) | (Form::Opt { slice: true, .. }, Form::Raw)
                 );
-                let (len_text, len_arm) = if wants_len {
+                let (len_text, len_evidence) = if wants_len {
                     let arm = length_evidence(tcx, *callee, pos.index);
                     let companion = match arm {
                         LenEvidence::Following => Some(pos.index + 1),
@@ -2025,34 +2031,24 @@ pub(crate) fn synthesize(
                     let text = companion
                         .and_then(|i| site.args.iter().find(|a| a.index == i))
                         .and_then(|a| sm.span_to_snippet(a.span).ok());
-                    // **Both outcomes are now placements, and both are tagged**
-                    // (2026-08-12). Before the ruling an arm was recorded only
-                    // when a length was FOUND, because a missing one placed no
-                    // seam; now a missing one places a FABRICATED seam, and an
-                    // untagged placement is exactly what the ruling forbids.
+                    // ⚠ **ONLY THE EVIDENCE TRAVELS FROM HERE** (repaired
+                    // 2026-08-15, adversarial finding ADV-FAB-01). This block
+                    // used to also decide the audit ARM, by a second `match` on
+                    // `text` — and the doc on `SeamLen` claimed the arm and the
+                    // emitted length were "one derivation". They were two
+                    // expressions reading one variable, which agree by
+                    // coincidence and not by construction: forcing this one to
+                    // `Licensed` left every emitted `crate::SEAM_LEN_PLACEHOLDER`
+                    // in place while the artifact reported all 370 placements as
+                    // licensed, with the whole suite green.
                     //
-                    // `LenArm` carries the signature evidence on BOTH arms, so
-                    // the derivability question bound-verification asks —
-                    // `Elsewhere` (a non-adjacent integer exists) vs `None`
-                    // (none does) — survives fabrication rather than being
-                    // erased by it.
-                    let recorded = Some(match &text {
-                        Some(_) => LenArm::Licensed(arm),
-                        None => LenArm::Fabricated(arm),
-                    });
-                    // The `lengated` census row moves HERE from the `Err` arm
-                    // it used to live in: that arm no longer fires for these
-                    // positions, and losing the row would take the 42/51 split
-                    // with it. Same vocabulary, same one-row-per-gated-position
-                    // rule, now keyed on *fabrication* rather than on refusal.
-                    if text.is_none() {
-                        plan.length_evidence.push((
-                            tcx.def_path_str(callee.to_def_id()),
-                            pos.index,
-                            arm,
-                        ));
-                    }
-                    (text, recorded)
+                    // The arm is now derived from `spec.len` AFTER `glue`
+                    // answers, so the tag and the text have one producer for
+                    // real. What survives here is the SIGNATURE evidence, which
+                    // `glue` genuinely cannot know — `Elsewhere` (a non-adjacent
+                    // integer exists) vs `None` (none does), the derivability
+                    // input bound-verification needs.
+                    (text, Some(arm))
                 } else {
                     (None, None)
                 };
@@ -2087,6 +2083,28 @@ pub(crate) fn synthesize(
                             ));
                             continue;
                         };
+                        // **THE AUDIT TAG, DERIVED FROM THE SPEC** — the one
+                        // value that also decides the emitted text. A licensed
+                        // placement cannot be reported fabricated, or the
+                        // reverse, without changing what the crate says.
+                        let len_arm = spec.len.as_ref().zip(len_evidence).map(|(l, e)| {
+                            if l.is_fabricated() {
+                                LenArm::Fabricated(e)
+                            } else {
+                                LenArm::Licensed(e)
+                            }
+                        });
+                        // The `lengated` census row is keyed on the SPEC too,
+                        // for the same reason: it exists to preserve the 42/51
+                        // derivability split across fabrication, so it must fire
+                        // exactly where fabrication happened.
+                        if let Some(LenArm::Fabricated(e)) = len_arm {
+                            plan.length_evidence.push((
+                                tcx.def_path_str(callee.to_def_id()),
+                                pos.index,
+                                e,
+                            ));
+                        }
                         plan.edits.push(SeamEdit {
                             span: pos.span,
                             replacement,

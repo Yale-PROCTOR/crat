@@ -827,7 +827,17 @@ pub(crate) struct SeamGraftStats {
     /// new expression in arm 3** — it has no subtree behind it, which is why
     /// the split rule sends it through [`graft_expr`] rather than a builder.
     pub len_grafted: usize,
-    /// The **FABRICATED subset** of [`Self::len_grafted`] (ruling 2026-08-12).
+    /// **Fabricated lengths actually PLACED** — not built (repaired 2026-08-15,
+    /// adversarial finding ADV-FAB-04).
+    ///
+    /// It was incremented in `build`, beside `len_grafted`, where a node can
+    /// still be refused by the claim guard afterwards. That over-count was
+    /// benign while it was telemetry; it stopped being benign when it became the
+    /// condition for emitting a **crate-level item**, because a built-then-
+    /// refused fabricated seam would have produced a const with no reference —
+    /// the dead item the whole derivation exists to prevent. `arm3_refused` is
+    /// deliberately NOT zero-gated (its zero is a corpus fact, not a structure),
+    /// so this could not rest on it.
     ///
     /// A subset, not a sibling: the exhaustive
     /// `len_grafted + len_parse_failed + len_absent == len_shapes` identity is
@@ -1075,9 +1085,6 @@ impl<'a> SeamGraftVisitor<'a> {
             Some(seam_len) => match graft_expr(seam_len.text()) {
                 Ok(parsed) => {
                     self.stats.len_grafted += 1;
-                    if seam_len.is_fabricated() {
-                        self.stats.len_fabricated += 1;
-                    }
                     Some(finish_len(seam_len, parsed))
                 }
                 Err(offending) => {
@@ -1155,6 +1162,17 @@ impl MutVisitor for SeamGraftVisitor<'_> {
             {
                 e.kind = kind;
                 self.stats.grafted += 1;
+                // **COUNTED AT THE PLACEMENT, past the claim guard** — the
+                // condition for emitting the crate-level const, so it may not
+                // count a node that was built and then refused (ADV-FAB-04).
+                if target
+                    .spec
+                    .len
+                    .as_ref()
+                    .is_some_and(super::decision::seam::SeamLen::is_fabricated)
+                {
+                    self.stats.len_fabricated += 1;
+                }
                 if target.reborrow {
                     self.stats.reborrow += 1;
                 } else {
@@ -1558,13 +1576,22 @@ pub(crate) fn ast_emitted_source(
 ) -> Result<(String, super::ast_bridge::SubstStats), String> {
     let (_, _, seams, _, _, _, _, krate) = transform_inner(tcx)?;
     let (mut source, stats) = super::ast_bridge::splice_fn_prints(tcx, &krate);
-    // **The fabricated-extent const, on the SAME condition the span layer uses**
-    // (marker ruling, 2026-08-15): at least one fabricated adapter SURVIVED.
+    // **The fabricated-extent const** (marker ruling, 2026-08-15): emitted when
+    // this layer PLACED at least one fabricated adapter.
     //
-    // The condition is read off `len_fabricated`, which counts grafts — and the
-    // seam pass only grafts adapters whose owner the revert set kept — so this
-    // is the same "derived from the survivors" rule `render` applies, asked of
-    // this layer's own ledger rather than re-derived from the span layer's.
+    // ⚠ **This is NOT the span layer's condition, and the comment here used to
+    // claim it was** — "the seam pass only grafts adapters whose owner the
+    // revert set kept". False, and flagged independently by both boundary
+    // reviews. `transform_inner` builds its visitors with an explicitly EMPTY
+    // revert set, and `ast_emitted_source_of` is documented as running no verify
+    // loop and no revert rounds. So this layer's condition is *placed*, and the
+    // span layer's is *survived*.
+    //
+    // They coincide on every current fixture only because none reverts a
+    // fabricated callee. That is the **already-accepted scope limit** — the AST
+    // layer emits a pre-revert program — not a new divergence, and the two
+    // cross-layer witnesses would fail loudly rather than silently if it were.
+    // Recorded here so the next reader does not inherit the equivalence claim.
     //
     // Appended, matching `render`'s end-of-file insertion: the spliced output
     // replaces function spans in place, so appending here and inserting at
@@ -1780,9 +1807,14 @@ pub(crate) struct JustificationCensus {
     /// The FABRICATED subset of [`Self::seam_adapter`] — a subset, so the
     /// [`Self::total`] identity is untouched and this cannot drift the ledger.
     pub seam_adapter_fabricated: usize,
-    /// The crate-level const declaration: **0 or 1 per crate**, and 1 only when
-    /// a fabricated adapter survived. Counted so "the const is present" is a
-    /// measured line rather than something read off the emitted text.
+    /// The crate-level const declaration.
+    ///
+    /// ⚠ **A PIN, not a measurement.** Production never fills it: the const edit
+    /// is created inside `render` from the surviving edits and never enters
+    /// `plan.by_file`, which is what this census walks. Unit-witnessed,
+    /// production-unreachable — retained so a `FabricatedLenConst` that DID
+    /// reach `count()` could not be silently dropped from the total, and
+    /// labelled so nobody reads its zero as evidence about the const.
     pub fabricated_len_const: usize,
     // ---- arm 4's three: expected zero, and MEASURED rather than assumed ----
     pub reroute: usize,
@@ -1799,8 +1831,21 @@ impl JustificationCensus {
     pub(crate) fn total(&self) -> usize {
         // `seam_adapter_fabricated` is deliberately absent: it is a SUBSET of
         // `seam_adapter`, and adding it would double-count every fabricated
-        // placement against `edits_in`. `fabricated_len_const` IS a bucket — it
-        // is a real edit in `by_file` with its own justification.
+        // placement against `edits_in`.
+        //
+        // ⚠ **`fabricated_len_const` is a bucket that PRODUCTION NEVER FILLS**,
+        // and the comment here previously claimed the opposite ("a real edit in
+        // `by_file`"). It is not: the const edit is created inside `render`
+        // from the surviving edits and never enters `by_file`, which is the only
+        // thing this census walks. Corrected 2026-08-15 (ADV-FAB-08) — the claim
+        // was contradicted by another comment in the same slice.
+        //
+        // The term stays in the sum because a `FabricatedLenConst` reaching
+        // `count()` *would* be a real edit and must not be dropped; but its zero
+        // is a **PIN**, unit-witnessed and production-unreachable, in the same
+        // class as `arm4_reroute`/`drop_form`/`store_form` and NOT in
+        // `seam_adapter`'s. The real claim about the const's delivery is gated
+        // on the EMITTED TEXT (`fab_const_decl` / `fab_const_ref`).
         self.kind_decision
             + self.seam_adapter
             + self.fabricated_len_const
@@ -3056,6 +3101,38 @@ pub(crate) fn reconstruct_kept_files<D: Eq + std::hash::Hash>(
     withheld: &FxHashSet<D>,
 ) -> Reconstruction {
     let mut r = Reconstruction::default();
+    // **THE FABRICATED-EXTENT CONST, RE-DERIVED** (repaired 2026-08-15,
+    // adversarial finding ADV-FAB-05).
+    //
+    // `render` adds a crate-level const when a fabricated adapter survives. This
+    // reconstruction walked `by_file` and nothing else, so it had **no
+    // representation of the const at all** — and the calibration compares the
+    // two at file-text level. It is green today only because the frozen oracle's
+    // revert set reverted every function fabrication unblocks, so no fabricated
+    // adapter survives in this frame: an ENTAILED zero, exactly the shape the
+    // REARM pin was labelled for, one gate over. At the first oracle refresh in
+    // which one survives, the gate would have fired **on correct behaviour** and
+    // read as a render defect.
+    //
+    // Re-derived rather than shared: this stays a second implementation of the
+    // same rule, which is what the calibration is for.
+    let const_survives = planned.by_file.values().flatten().any(|e| {
+        matches!(
+            e.justification,
+            super::plan::Justification::SeamAdapter {
+                fabricated: true,
+                ..
+            }
+        ) && owner_verdict(owners_by_name.get(&e.owner_fn).map(|v| &v[..]), withheld).keeps_edit()
+    });
+    let const_target = const_survives
+        .then(|| {
+            planned
+                .root_file
+                .clone()
+                .zip(planned.len_const_item.clone())
+        })
+        .flatten();
     for (key, edits) in &planned.by_file {
         let mut kept: Vec<(usize, usize, &str)> = Vec::new();
         for e in edits {
@@ -3068,6 +3145,14 @@ pub(crate) fn reconstruct_kept_files<D: Eq + std::hash::Hash>(
             if verdict.keeps_edit() {
                 kept.push((e.lo, e.hi, e.replacement.as_str()));
             }
+        }
+        let const_here = const_target.as_ref().filter(|(root, _)| root == key);
+        let const_text;
+        if let Some((_, item)) = const_here
+            && let Some(source) = texts.get(key)
+        {
+            const_text = format!("\n{item}\n");
+            kept.push((source.len(), source.len(), const_text.as_str()));
         }
         if kept.is_empty() {
             // **REPORTED, not `continue`d in silence.** `render` skips such a

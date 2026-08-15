@@ -7979,12 +7979,32 @@ mod run {
         // says what should be there and this says what is, and the sweep gates
         // the two against each other (`declared iff referenced, exactly once`).
         if let RewriteOutcome::Emitted { files, .. } = &outcome {
-            let decl = format!("const {}: usize = 1024;", "SEAM_LEN_PLACEHOLDER");
+            // **COMPOSED FROM THE PRODUCER'S CONSTANTS, not spelled a fourth
+            // time** (ADV-FAB-07). A hand-written literal here was a separate
+            // copy of text owned by `decision::seam`, so changing the
+            // placeholder value would make this probe miss and report a DELIVERY
+            // failure for a rename.
+            //
+            // ⚠ **NOT `fabricated_len_item()`**, which is what I reached for
+            // first: it parses and pretty-prints, and this worker runs OUTSIDE a
+            // compiler session — the exact defect this slice spent a sweep
+            // finding, repeated inside the fix for a different finding, one hour
+            // later. It was caught by the witness that repair installed rather
+            // than by another 625 s sweep, which is the whole point of it.
+            let decl = format!(
+                "const {}: usize = {};",
+                crate::bo_rewriter::decision::seam::SEAM_LEN_CONST,
+                crate::bo_rewriter::decision::seam::FABRICATED_SEAM_LEN
+            );
             let (mut decls, mut refs) = (0usize, 0usize);
             for text in files.values() {
                 decls += text.matches(&decl).count();
-                // Minus the declaration's own occurrence of the name.
-                refs += text.matches("crate::SEAM_LEN_PLACEHOLDER").count();
+                // Call sites only: the declaration spells the bare name, so it
+                // does not contribute here. (The previous comment claimed a
+                // subtraction this code does not perform and does not need.)
+                refs += text
+                    .matches(crate::bo_rewriter::decision::seam::FABRICATED_LEN_PATH)
+                    .count();
             }
             row.set("fab_const_decl", decls);
             row.set("fab_const_ref", refs);
@@ -13255,6 +13275,42 @@ fn m1_emit_corpus() {
         "every corpus program must be attempted"
     );
     assert_eq!(attempted, CORPUS.len(), "the corpus is 20 programs");
+    // ⚠ **THE FABRICATED POPULATION IS NON-EMPTY** (R7, added 2026-08-15 on
+    // adversarial finding ADV-FAB-06).
+    //
+    // Every new counter in this slice was `row.set` only, so a build in which
+    // `glue`'s two slice arms never fired would have produced an identical green
+    // sweep. Worse, every way the const's delivery can fail collapses onto the
+    // same passing state: no root file → the const arm fail-opens → dangling
+    // path → `E0433` → verify reverts the fabricated owners → final files carry
+    // neither const nor reference → `decl 0, ref 0` → green. Indistinguishable
+    // from an empty market.
+    //
+    // The two are now separated: the placements must EXIST, and how many of them
+    // survive is reported beside the total rather than conflated with it.
+    let placed_fab: i64 = rows
+        .iter()
+        .filter_map(|r| r.get("seam_len_fabricated"))
+        .filter_map(|v| v.parse::<i64>().ok())
+        .sum();
+    let surviving_fab: i64 = rows
+        .iter()
+        .filter_map(|r| r.get("fab_const_ref"))
+        .filter_map(|v| v.parse::<i64>().ok())
+        .sum();
+    println!(
+        "M1FAB placed={placed_fab} surviving={surviving_fab} programs_with_const={}",
+        rows.iter()
+            .filter(|r| r.get("fab_const_decl") == Some("1"))
+            .count()
+    );
+    assert!(
+        placed_fab > 0,
+        "no fabricated placement was made anywhere in the corpus — the \
+         fabrication capability is unexercised, and every gate below it passes \
+         vacuously. This is a different event from 'placements were made and all \
+         were reverted', which reports surviving=0 with placed>0"
+    );
     assert!(
         failures.is_empty(),
         "unplaceable is expected-zero corpus-wide ({} finding(s)) — a nonzero \

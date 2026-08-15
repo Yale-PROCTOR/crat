@@ -1902,20 +1902,28 @@ pub(crate) fn emit_files<'tcx>(
     planned.len_const_item = Some(decision::seam::fabricated_len_item());
 
     let mut texts = std::collections::BTreeMap::new();
-    for key in planned
-        .by_file
-        .keys()
-        .cloned()
-        .chain(planned.root_file.clone())
-    {
-        // The root is included even when it holds no edit: a crate whose only
-        // fabricated adapters land in other files still declares the const at
-        // its root, and `render` cannot splice a file whose text it was not
-        // given.
-        let Some(source) = text_of(&key) else {
+    for key in planned.by_file.keys() {
+        let Some(source) = text_of(key) else {
             return Err(format!("no source text for planned file {key:?}"));
         };
-        texts.insert(key, source);
+        texts.insert(key.clone(), source);
+    }
+    // The root is included even when it holds no edit: a crate whose only
+    // fabricated adapters land in other files still declares the const at its
+    // root, and `render` cannot splice a file whose text it was not given.
+    //
+    // ⚠ **Its absence is NOT fatal** (ADV-FAB-09). Folding the root into the
+    // loop above made an unreadable root text fail the WHOLE emission — for
+    // every crate, including the fourteen that fabricate nothing. A feature that
+    // may never fire in a program must not be able to stop that program from
+    // emitting. Missing root text fail-closes the const alone: `render`'s
+    // `texts.get(&root)` misses, no insertion happens, and the fabricated
+    // adapters that name it fail `verify` and revert.
+    if let Some(root) = planned.root_file.clone()
+        && !texts.contains_key(&root)
+        && let Some(source) = text_of(&root)
+    {
+        texts.insert(root, source);
     }
     let (files, rollbacks) = render(&planned, &texts, &std::collections::BTreeSet::new());
     Ok(Emission {
