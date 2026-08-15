@@ -4395,3 +4395,54 @@ fn the_fabricated_const_follows_the_surviving_adapters() {
     .expect("fixture compiles")
     .expect("no emission error");
 }
+
+/// **BOTH LAYERS EMIT THE CONST, AND AGREE ON IT.**
+///
+/// Found by mutation **M-F7**: disabling the AST layer's const arm entirely left
+/// the suite at 1247/6/28 — byte-identical to baseline. The arm was live
+/// production code in the **layer of record** with no witness at all, because
+/// the only thing exercising the AST emitter is the golden set and **no golden
+/// carries a fabricated position** (measured: 0 across all 21).
+///
+/// The obvious answer — "g26 will witness it" — is the answer this milestone has
+/// learned to refuse. g26 is a ratification event that has not happened yet, and
+/// an arm whose only witness is a fixture someone still has to approve is an arm
+/// shipping unwitnessed in the meantime.
+///
+/// *Mutation-tested:* the M-F7 mutation that survived the whole suite fails
+/// here.
+#[test]
+fn both_layers_emit_the_fabricated_const() {
+    const SRC: &str = "#![allow(dead_code, unused_unsafe, unused_mut, unused_variables)]\n\
+                       pub unsafe fn fab_total(buf: *mut i32) -> i32 {\n\
+                       \x20   let mut s: i32 = 0;\n\
+                       \x20   let mut i: usize = 0;\n\
+                       \x20   while i < 4 { s += *buf.offset(i as isize); i += 1; }\n\
+                       \x20   s\n\
+                       }\n\
+                       pub unsafe fn fab_one(d: *mut i32) -> i32 { fab_total(d) }\n";
+    let decl = "const SEAM_LEN_PLACEHOLDER: usize = 1024;";
+
+    let ast = super::ast_emitted_source_of(SRC).expect("the AST layer emits");
+    assert_eq!(
+        ast.matches(decl).count(),
+        1,
+        "the AST layer — the LAYER OF RECORD — must declare the const it names:\n{ast}"
+    );
+    assert!(
+        ast.contains("crate::SEAM_LEN_PLACEHOLDER"),
+        "and a fabricated site must name it, or the count above is vacuous:\n{ast}"
+    );
+
+    // The span layer, on the SAME input, through the production entry point.
+    let span = match super::rewrite_m1(SRC) {
+        super::RewriteOutcome::Emitted { source, .. } => source,
+        other => panic!("the span layer must emit: {other:?}"),
+    };
+    assert_eq!(
+        span.matches(decl).count(),
+        1,
+        "and so must the span layer, or the two frames disagree about the \
+         program:\n{span}"
+    );
+}
