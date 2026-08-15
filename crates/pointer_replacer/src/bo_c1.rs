@@ -7149,6 +7149,28 @@ mod run {
                 row.set("arm4_storeform", jc.store_form.to_string());
                 row.set("just_kind_decision", jc.kind_decision.to_string());
                 row.set("just_seam_adapter", jc.seam_adapter.to_string());
+                // **The ruling's separate count, and the const's DELIVERY, as
+                // measured rows.** Without these the claim "the const is
+                // emitted in exactly the crates with a surviving fabricated
+                // adapter" is read off emitted text by hand — and the count of
+                // fabricated placements lives only in the seam census, in a
+                // different frame from the plan that placed them.
+                row.set(
+                    "just_seam_adapter_fabricated",
+                    jc.seam_adapter_fabricated.to_string(),
+                );
+                // ⚠ **STRUCTURALLY ZERO IN THIS FRAME, and reported anyway.**
+                // The const edit is created inside `render`, from the SURVIVING
+                // edits, so it never enters `plan.by_file` — which is what this
+                // census walks. A row that is zero for every possible input is
+                // the uniformly-zero-predicate shape: it is RETAINED and
+                // labelled rather than asserted away, and the real claim
+                // ("declared iff referenced, exactly once") is gated on the
+                // EMITTED TEXT instead, where the const actually appears.
+                row.set(
+                    "just_fabricated_len_const",
+                    jc.fabricated_len_const.to_string(),
+                );
                 row.set("just_total", jc.total().to_string());
                 row.set("just_edits", d.plan_edits.to_string());
                 // **AND AS AN ARTIFACT.** The row goes to stdout, which this
@@ -7166,13 +7188,38 @@ mod run {
                 // total is recoverable from the five and already rides the row
                 // as `just_total`/`just_edits`; a derived value does not belong
                 // in a column of primary ones.
+                // ⚠ **EXHAUSTIVE DESTRUCTURE, 2026-08-15.** This was a
+                // hand-written five-bucket `format!`, and the fabrication slice
+                // showed exactly what that costs: `fabricated_len_const` was
+                // added to `JustificationCensus` and reached `just_total` and
+                // `just_edits` — which still agreed, so nothing failed — while
+                // the ARTIFACT silently kept five rows. A consumer summing this
+                // column would have got a number that no longer matched
+                // `just_edits`, and the analysis lane reads these files.
+                //
+                // Destructured so a sixth bucket breaks COMPILATION here rather
+                // than the artifact's arithmetic. `seam_adapter_fabricated` is
+                // a SUBSET row, marked as such in its key, so a consumer that
+                // sums buckets does not double-count it.
+                let crate::bo_rewriter::ast_transform::JustificationCensus {
+                    kind_decision,
+                    seam_adapter,
+                    seam_adapter_fabricated,
+                    fabricated_len_const,
+                    reroute,
+                    drop_form,
+                    store_form,
+                } = jc;
                 let jp = dir.join(format!("{name}.just.tsv"));
                 std::fs::write(
                     &jp,
                     format!(
-                        "justification\tedits\nkind_decision\t{}\nseam_adapter\t{}\n\
-                         reroute\t{}\ndrop_form\t{}\nstore_form\t{}\n",
-                        jc.kind_decision, jc.seam_adapter, jc.reroute, jc.drop_form, jc.store_form,
+                        "justification\tedits\nkind_decision\t{kind_decision}\n\
+                         seam_adapter\t{seam_adapter}\n\
+                         reroute\t{reroute}\ndrop_form\t{drop_form}\n\
+                         store_form\t{store_form}\n\
+                         fabricated_len_const\t{fabricated_len_const}\n\
+                         subset:seam_adapter_fabricated\t{seam_adapter_fabricated}\n",
                     ),
                 )
                 .unwrap_or_else(|e| panic!("write justification census {}: {e}", jp.display()));
@@ -7919,6 +7966,28 @@ mod run {
                 std::fs::write(&op_path, ops)
                     .unwrap_or_else(|e| panic!("write op split {}: {e}", op_path.display()));
             }
+        }
+        // **THE FABRICATED-EXTENT CONST, MEASURED ON THE EMITTED TEXT.**
+        //
+        // The ruling's placement claim is *one const per affected crate*, and
+        // the affected set is *the crates with a surviving fabricated adapter*.
+        // Neither half is visible in the plan census — the const is created
+        // inside `render` from the surviving edits — so it is counted here,
+        // where the emitted program actually is.
+        //
+        // Reading the emitted text is a SECOND derivation on purpose: the plan
+        // says what should be there and this says what is, and the sweep gates
+        // the two against each other (`declared iff referenced, exactly once`).
+        if let RewriteOutcome::Emitted { files, .. } = &outcome {
+            let decl = format!("const {}: usize = 1024;", "SEAM_LEN_PLACEHOLDER");
+            let (mut decls, mut refs) = (0usize, 0usize);
+            for text in files.values() {
+                decls += text.matches(&decl).count();
+                // Minus the declaration's own occurrence of the name.
+                refs += text.matches("crate::SEAM_LEN_PLACEHOLDER").count();
+            }
+            row.set("fab_const_decl", decls);
+            row.set("fab_const_ref", refs);
         }
         row.set("emitted", emitted);
         row.set("degraded", degraded);
@@ -10438,11 +10507,11 @@ fn conforming_arm_row() -> report::Row {
     // reason `arm1_compared = 780` is — what this row tests is that each gated
     // key is present and passing in the shape the sweep produces, and the
     // identity `safe + reborrow == rendered` must hold at every scale.
-    row.set("arm3_seam_rendered", "421");
+    row.set("arm3_seam_rendered", "514");
     row.set("arm3_safe", "107");
-    row.set("arm3_reborrow", "314");
-    row.set("arm3_len_grafted", "277");
-    row.set("arm3_len_shapes", "277");
+    row.set("arm3_reborrow", "407");
+    row.set("arm3_len_grafted", "370");
+    row.set("arm3_len_shapes", "370");
     // NOT gated, and load-bearing here exactly as `arm2_differing` is: if arm
     // 3's differential is ever tightened to byte equality, this row fails
     // rather than the corpus.
@@ -10453,11 +10522,11 @@ fn conforming_arm_row() -> report::Row {
     // whose entire job is to be the corpus's real shape. A positive control
     // holding fiction cannot fail when the gate drifts toward the fiction,
     // which is exactly the guard `arm2_differing = 176` was put here to be.
-    row.set("arm3_differing", "47");
+    row.set("arm3_differing", "58");
     row.set("arm3_refused", "0");
-    row.set("arm3_arg_peeled", "9");
-    row.set("sa_edits", "421");
-    row.set("sa_offsets", "421");
+    row.set("arm3_arg_peeled", "17");
+    row.set("sa_edits", "514");
+    row.set("sa_offsets", "514");
     // Arm 4's census. R7 ADDENDUM: these are the values the sweep produced,
     // cited to it — 2,819 + 421 = 3,240, with arm 4's three at zero because the
     // span layer constructs none of those justifications.
@@ -10465,9 +10534,9 @@ fn conforming_arm_row() -> report::Row {
     row.set("arm4_dropform", "0");
     row.set("arm4_storeform", "0");
     row.set("just_kind_decision", "2819");
-    row.set("just_seam_adapter", "421");
-    row.set("just_total", "3240");
-    row.set("just_edits", "3240");
+    row.set("just_seam_adapter", "514");
+    row.set("just_total", "3333");
+    row.set("just_edits", "3333");
     row
 }
 
@@ -12992,6 +13061,27 @@ fn m1_emit_corpus() {
         );
         let Some(mut row) = outcome.row.clone() else {
             // DEFERRAL IS RECORDED, NEVER ZEROED.
+            //
+            // ⚠ **AND A PANIC IS NOT A DEFERRAL** (2026-08-15). Until this
+            // line, every missing row was recorded and none was gated: the
+            // sweep asserted `rows + missing == attempted` and expected-zero
+            // over **the rows that exist**, so four programs could panic and
+            // the sweep still report `ok`. That is exactly what happened on the
+            // fabrication slice's first emit run — 89 of 93 fabricated
+            // placements never reached a verdict, under a green sweep.
+            //
+            // A resource deferral (timeout, memory cap) is a decision this
+            // machine makes and stays a recorded absence. A **panic** is the
+            // program under test failing, and reading it as an absence is the
+            // absence-as-observation class at sweep level.
+            if outcome.status.contains("panic") {
+                failures.push(format!(
+                    "{}: the worker PANICKED — a panic is a failure, not a \
+                     deferral, and a sweep that reports it as a missing row is \
+                     green over a population that never ran",
+                    program.name
+                ));
+            }
             missing.push(format!(
                 "{}: no sentinel row (orchestrator status={})",
                 program.name, outcome.status
@@ -13096,6 +13186,29 @@ fn m1_emit_corpus() {
         // run yields full incidence rather than halting at the first program.
         if let Err(detail) = expected_zero_field(&row, "unplaceable") {
             failures.push(format!("{}: {detail}", program.name));
+        }
+        // **DECLARED IFF REFERENCED, EXACTLY ONCE** (marker ruling, 2026-08-15).
+        //
+        // Both directions are failures and they are different failures: a
+        // reference with no declaration is `E0433` in the emitted crate, and a
+        // declaration with no reference is a dead item the derivation exists to
+        // prevent. Two declarations would mean the insertion ran per file
+        // rather than per crate.
+        match (
+            row.get("fab_const_decl")
+                .and_then(|v| v.parse::<i64>().ok()),
+            row.get("fab_const_ref").and_then(|v| v.parse::<i64>().ok()),
+        ) {
+            (Some(d), Some(r)) if d == i64::from(r > 0) => {}
+            (Some(d), Some(r)) => failures.push(format!(
+                "{}: fab_const_decl={d} fab_const_ref={r} — the const must be \
+                 declared exactly when a fabricated site names it, once per \
+                 crate",
+                program.name
+            )),
+            // Absent on a non-emitting program, which is legal; absent on an
+            // emitting one is the counter having gone missing.
+            _ => {}
         }
         rows.push(row);
     }

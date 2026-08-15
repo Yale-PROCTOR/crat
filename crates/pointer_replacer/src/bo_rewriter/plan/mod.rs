@@ -190,6 +190,20 @@ pub(crate) struct Plan {
     /// adapters that need it fail `verify` loudly rather than emitting a crate
     /// with a dangling path.
     pub root_file: Option<FileKey>,
+    /// **The fabricated-extent const's TEXT, produced once by the caller.**
+    ///
+    /// It is carried rather than built where it is spliced because building it
+    /// **parses and pretty-prints**, and both need `rustc_span` session globals
+    /// — which the verify/revert loop does not have: `rewrite_core`'s `TyCtxt`
+    /// closure ends before the loop's `render` calls. Producing it inside
+    /// `render` panicked four corpus programs, and only the four in which a
+    /// fabricated adapter survived into a loop round.
+    ///
+    /// So the rule is: **anything needing a compiler session is produced while
+    /// one provably exists, and travels as data.** `None` fail-closes — no
+    /// text, no insertion, and the adapters that name it fail `verify` loudly
+    /// rather than emitting a crate with a dangling path.
+    pub len_const_item: Option<String>,
 }
 
 /// Turn decisions into edits.
@@ -504,9 +518,10 @@ pub(crate) fn plan(
     Plan {
         by_file,
         unplaceable,
-        // Filled by the caller; `plan` has no `TyCtxt` and so cannot ask which
-        // file is the crate root.
+        // Both filled by the caller; `plan` has no `TyCtxt`, so it can ask
+        // neither which file is the crate root nor the parser for an item.
         root_file: None,
+        len_const_item: None,
     }
 }
 

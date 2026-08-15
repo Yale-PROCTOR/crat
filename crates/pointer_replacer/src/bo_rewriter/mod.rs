@@ -1788,6 +1788,7 @@ pub(crate) fn render(
             }
         )
     }) && let Some(root) = planned.root_file.clone()
+        && let Some(item) = planned.len_const_item.as_deref()
         && let Some(source) = texts.get(&root)
     {
         // Appended at END OF FILE — the one offset both emitters compute
@@ -1800,7 +1801,7 @@ pub(crate) fn render(
         kept_by_file.entry(root).or_default().push(plan::Edit {
             lo: at,
             hi: at,
-            replacement: format!("\n{}\n", decision::seam::fabricated_len_item()),
+            replacement: format!("\n{item}\n"),
             justification: plan::Justification::FabricatedLenConst,
             // Added AFTER the revert filter, so this name is never matched
             // against the revert set — it is not a sentinel that must be kept
@@ -1892,6 +1893,13 @@ pub(crate) fn emit_files<'tcx>(
         let root = tcx.def_span(rustc_hir::def_id::CRATE_DEF_ID);
         file_key(&source_map.lookup_byte_offset(root.lo()).sf.name)
     };
+    // **Produced HERE, where a `TyCtxt` provably exists.** `render` runs three
+    // more times inside the verify/revert loop, which is OUTSIDE the compiler
+    // session — parsing or printing there panics `scoped-tls`. Built
+    // unconditionally: it is one small string, and making it conditional would
+    // put a second copy of the survivor rule in a place that cannot see the
+    // survivors.
+    planned.len_const_item = Some(decision::seam::fabricated_len_item());
 
     let mut texts = std::collections::BTreeMap::new();
     for key in planned

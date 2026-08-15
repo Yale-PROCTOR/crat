@@ -4396,6 +4396,69 @@ fn the_fabricated_const_follows_the_surviving_adapters() {
     .expect("no emission error");
 }
 
+/// **`render` RUNS OUTSIDE THE COMPILER SESSION, AND THE CONST STILL LANDS.**
+///
+/// The reproduction of the defect the first fabrication emit sweep found: four
+/// of twenty programs panicked at
+/// `scoped-tls: cannot access a scoped thread local variable without calling
+/// set first`, and they were exactly the four in which a fabricated adapter
+/// SURVIVED into a verify/revert round.
+///
+/// `rewrite_core`'s `TyCtxt` closure ends before the verify loop, so the loop's
+/// three `render` calls have **no session globals**. Building the const there
+/// parsed and pretty-printed — both of which need them.
+///
+/// **Why the existing witness could not catch it:**
+/// `the_fabricated_const_follows_the_surviving_adapters` calls `render` INSIDE
+/// `run_compiler_on_path`. It exercised the function in a context production
+/// does not have, so it was green while production panicked. *A witness has to
+/// run where the code runs* — M-F7's lesson one layer down, and this one cost a
+/// 625 s sweep.
+///
+/// *Mutation-tested:* move the `fabricated_len_item()` call back into `render`
+/// and this test panics rather than failing an assertion — which is the defect,
+/// reproduced.
+#[test]
+fn render_outside_a_compiler_session_still_delivers_the_const() {
+    const SRC: &str = "#![allow(dead_code, unused_unsafe, unused_mut, unused_variables)]\n\
+                       pub unsafe fn fab_total(buf: *mut i32) -> i32 {\n\
+                       \x20   let mut s: i32 = 0;\n\
+                       \x20   let mut i: usize = 0;\n\
+                       \x20   while i < 4 { s += *buf.offset(i as isize); i += 1; }\n\
+                       \x20   s\n\
+                       }\n\
+                       pub unsafe fn fab_one(d: *mut i32) -> i32 { fab_total(d) }\n";
+    let fixture = Fixture::new(&[("lib.rs", SRC)]);
+    // Everything that needs a session happens INSIDE it, and only data escapes.
+    let (plan, texts) =
+        ::utils::compilation::run_compiler_on_path(&fixture.0.join("lib.rs"), |tcx| {
+            let table = decide_table(tcx).expect("decides");
+            let e = emit_files(tcx, &table, &rustc_hash::FxHashSet::default()).expect("emits");
+            (e.plan, e.texts)
+        })
+        .expect("fixture compiles");
+
+    assert!(
+        plan.len_const_item.is_some(),
+        "the const's text must be produced while a session exists, or the          insertion fail-closes outside one"
+    );
+
+    // ---- and NOW, with no session anywhere on this thread ----
+    let (files, rollbacks) = super::render(&plan, &texts, &std::collections::BTreeSet::new());
+    assert!(rollbacks.is_empty());
+    let n: usize = files
+        .values()
+        .map(|t| {
+            t.matches("const SEAM_LEN_PLACEHOLDER: usize = 1024;")
+                .count()
+        })
+        .sum();
+    assert_eq!(
+        n, 1,
+        "exactly one const, rendered outside a compiler session — this is the          call the verify loop makes"
+    );
+}
+
 /// **BOTH LAYERS EMIT THE CONST, AND AGREE ON IT.**
 ///
 /// Found by mutation **M-F7**: disabling the AST layer's const arm entirely left
