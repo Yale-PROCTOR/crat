@@ -3742,6 +3742,11 @@ const RATIFIED_TYPED_EXCLUSION_INDEX: usize = 19;
 const RATIFIED_TYPED_EXCLUSION_HEAD: &str = "6b6ae475c169ef581e209b9fa0f738697d4b3096";
 const RATIFIED_TYPED_EXCLUSION_MANIFEST: &str =
     "e3bb4d0d10cadd191b420d5b566c44478de80327804ed876cf193a2733dfd9dd";
+const COMPLETED_LIL_HEAD: &str = "2118cc9dd4797a561412a806e171160c1a08f0c0";
+const COMPLETED_LIL_MANIFEST: &str =
+    "b7fccec973fcf08062c44bd2302a5f0e315034094e86cc984b9f5be6cdcbfbfe";
+const COMPLETED_LIL_RECEIPT_SHA256: &str =
+    "7c7c61e8138e2d41822cf01f114697ef3d793d76df89ba7d9938385c01c54827";
 const LIL_RESUME9_HEAD: &str = "e87be067d4717d3ea74dd5192f210b6de4170bac";
 const LIL_RESUME9_UNITS: [(&str, &str); 19] = [
     (
@@ -3835,7 +3840,7 @@ const RAW_CORPUS_DIGEST: &str = "9fc912af10fd3b235fe4d444d2fbac0bc521509b1c9447f
 const DERIVED_SUBSTRATE_DIGEST: &str =
     "db96829b5c2b0db28fb4bb9ddd3d32901b5d4e6e4134da07ada0d513d94eb4c6";
 const SNAPSHOT_PATH: &str = "/home/p51lee/dev/agent-worktrees/m1-artifact-snapshots/3b26a0ff";
-const RETRY3_PREDECESSOR_SHARDS: [(&str, &str, &str); 13] = [
+const RETRY3_PREDECESSOR_SHARDS: [(&str, &str, &str); 14] = [
     (
         "bst",
         "ce11b3459c6fa46965e4cbe23ce11dffbdc7bf01",
@@ -3901,6 +3906,7 @@ const RETRY3_PREDECESSOR_SHARDS: [(&str, &str, &str); 13] = [
         "d07bf0ad177b46d60d0aba975d7b830b3bb3007f",
         "241ea04355b5a9f469d3d8f75d8ac70f98ff797bfb8e50e694fce13b90e8bd2a",
     ),
+    ("lil", COMPLETED_LIL_HEAD, COMPLETED_LIL_MANIFEST),
 ];
 
 fn command_stdout(mut command: Command, description: &str) -> String {
@@ -4133,6 +4139,23 @@ struct CandidateMemoryReceipt {
     errors: Vec<String>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct CompletedShardReceiptInput<'a> {
+    program: &'a str,
+    analysis_head: &'a str,
+    unit_identities_expected: usize,
+    census_expected: usize,
+    census_measured: usize,
+    typed_exclusions: usize,
+    candidates: usize,
+    roots: usize,
+    exceptions: usize,
+    oracle_byte_matches: usize,
+    oracle_expected_matches: usize,
+    wall_s: f64,
+    memory_peaks: Option<CandidateMemoryPeaks>,
+}
+
 impl CandidateMemoryReceipt {
     fn require_complete(&self) -> Result<CandidateMemoryPeaks, String> {
         if !self.errors.is_empty() {
@@ -4218,6 +4241,59 @@ fn collect_candidate_memory_receipt(
 
 fn render_candidate_memory_receipt(peaks: CandidateMemoryPeaks) -> String {
     CandidateMemoryReceipt::from(peaks).render()
+}
+
+fn render_completed_shard_receipt(
+    input: &CompletedShardReceiptInput<'_>,
+) -> Result<String, String> {
+    if input.census_measured != input.candidates
+        || input.census_expected != input.census_measured + input.typed_exclusions
+        || input.unit_identities_expected
+            != input.candidates + input.typed_exclusions + input.exceptions
+    {
+        return Err(format!(
+            "completed shard identity accounting drift: {input:?}"
+        ));
+    }
+    let zero_work = input.unit_identities_expected == 0;
+    if zero_work {
+        if input.census_expected != 0
+            || input.census_measured != 0
+            || input.typed_exclusions != 0
+            || input.candidates != 0
+            || input.roots != 0
+            || input.exceptions != 0
+            || input.oracle_byte_matches != 0
+            || input.oracle_expected_matches != 0
+            || input.wall_s != 0.0
+            || input.memory_peaks.is_some()
+        {
+            return Err(format!("zero-work receipt is not exact 0/0/0: {input:?}"));
+        }
+        return Ok(format!(
+            "machine_id={MACHINE_ID}\nplatform={PLATFORM}\nmemory_limit=cgroup-100GiB\nmemory_max_bytes={CANDIDATE_MEMORY_MAX_BYTES}\ncandidate_isolation=true\nwall_bound_kind=liveness\nwall_cap_s={LIVENESS_BOUND_S}\nprogram={}\nstatus=ok\ndata=true\ncheckpoint_data=false\nanalysis_head={}\na4_aggregate_manifest_sha256={A4_AGGREGATE_MANIFEST_SHA256}\na4_combined_sha256={A4_COMBINED_SHA256}\ncensus_identity_sha256={CENSUS_IDENTITY_SHA256}\nexception_identity_sha256={EXCEPTION_IDENTITY_SHA256}\nraw_corpus_digest={RAW_CORPUS_DIGEST}\nderived_substrate_digest={DERIVED_SUBSTRATE_DIGEST}\nsnapshot={SNAPSHOT_PATH}\ncensus_expected=0\ncensus_measured=0\ntyped_exclusions=0\ncandidates=0\nroots=0\nexceptions=0\nzero_work=true\ncandidate_processes_launched=0\noracle_partial_sha256={LIL_ORACLE_PARTIAL_SHA256}\noracle_byte_matches=0\noracle_expected_matches=0\nlast_phase=complete\nlast_candidate=none\nwall_s=0.000\npeak_rss_kb=not-applicable-no-candidates\ncgroup_peak_memory_kb=not-applicable-no-candidates\n",
+            input.program, input.analysis_head,
+        ));
+    }
+    let peaks = input
+        .memory_peaks
+        .ok_or_else(|| "nonzero shard lacks measured candidate peaks".to_owned())?;
+    Ok(format!(
+        "machine_id={MACHINE_ID}\nplatform={PLATFORM}\nmemory_limit=cgroup-100GiB\nmemory_max_bytes={CANDIDATE_MEMORY_MAX_BYTES}\ncandidate_isolation=true\nwall_bound_kind=liveness\nwall_cap_s={LIVENESS_BOUND_S}\nprogram={}\nstatus=ok\ndata=true\ncheckpoint_data=false\nanalysis_head={}\na4_aggregate_manifest_sha256={A4_AGGREGATE_MANIFEST_SHA256}\na4_combined_sha256={A4_COMBINED_SHA256}\ncensus_identity_sha256={CENSUS_IDENTITY_SHA256}\nexception_identity_sha256={EXCEPTION_IDENTITY_SHA256}\nraw_corpus_digest={RAW_CORPUS_DIGEST}\nderived_substrate_digest={DERIVED_SUBSTRATE_DIGEST}\nsnapshot={SNAPSHOT_PATH}\ncensus_expected={}\ncensus_measured={}\ntyped_exclusions={}\ncandidates={}\nroots={}\nexceptions={}\noracle_partial_sha256={LIL_ORACLE_PARTIAL_SHA256}\noracle_byte_matches={}\noracle_expected_matches={}\nlast_phase=complete\nlast_candidate=none\nwall_s={:.3}\npeak_rss_kb={}\ncgroup_peak_memory_kb={}\n",
+        input.program,
+        input.analysis_head,
+        input.census_expected,
+        input.census_measured,
+        input.typed_exclusions,
+        input.candidates,
+        input.roots,
+        input.exceptions,
+        input.oracle_byte_matches,
+        input.oracle_expected_matches,
+        input.wall_s,
+        peaks.process_peak_rss_kb,
+        peaks.cgroup_peak_memory_kb,
+    ))
 }
 
 fn classify_capped_candidate(
@@ -4815,6 +4891,50 @@ fn parse_receipt(path: &Path) -> Result<BTreeMap<String, String>, String> {
     Ok(receipt)
 }
 
+fn validate_completed_shard_metrics(
+    receipt: &BTreeMap<String, String>,
+    unit_identities_expected: usize,
+) -> Result<(), String> {
+    if unit_identities_expected == 0 {
+        for (key, expected) in [
+            ("census_expected", "0"),
+            ("census_measured", "0"),
+            ("typed_exclusions", "0"),
+            ("candidates", "0"),
+            ("roots", "0"),
+            ("exceptions", "0"),
+            ("zero_work", "true"),
+            ("candidate_processes_launched", "0"),
+            ("wall_s", "0.000"),
+            ("peak_rss_kb", "not-applicable-no-candidates"),
+            ("cgroup_peak_memory_kb", "not-applicable-no-candidates"),
+        ] {
+            if receipt.get(key).map(String::as_str) != Some(expected) {
+                return Err(format!(
+                    "zero-work receipt {key}: expected {expected:?}, got {:?}",
+                    receipt.get(key)
+                ));
+            }
+        }
+        return Ok(());
+    }
+
+    if receipt.contains_key("zero_work") || receipt.contains_key("candidate_processes_launched") {
+        return Err("nonzero receipt carries zero-work-only fields".to_owned());
+    }
+    for key in ["peak_rss_kb", "cgroup_peak_memory_kb"] {
+        let value = receipt
+            .get(key)
+            .ok_or_else(|| format!("current-head receipt lacks {key}"))?
+            .parse::<u64>()
+            .map_err(|error| format!("current-head receipt {key} is invalid: {error}"))?;
+        if value == 0 {
+            return Err(format!("current-head receipt {key} is zero"));
+        }
+    }
+    Ok(())
+}
+
 fn validate_completed_receipt(
     receipt: &BTreeMap<String, String>,
     contract: &MeasurementContract,
@@ -4858,16 +4978,6 @@ fn validate_completed_receipt(
         return Err("current-head receipt lacks candidate-isolation/cgroup contract".to_owned());
     }
     if receipt_head == &contract.head {
-        for key in ["peak_rss_kb", "cgroup_peak_memory_kb"] {
-            let value = receipt
-                .get(key)
-                .ok_or_else(|| format!("current-head receipt lacks {key}"))?
-                .parse::<u64>()
-                .map_err(|error| format!("current-head receipt {key} is invalid: {error}"))?;
-            if value == 0 {
-                return Err(format!("current-head receipt {key} is zero"));
-            }
-        }
         let expected_oracle_matches = (usize::from(program == "lil") * 19).to_string();
         if receipt.get("oracle_partial_sha256").map(String::as_str)
             != Some(LIL_ORACLE_PARTIAL_SHA256)
@@ -4881,6 +4991,7 @@ fn validate_completed_receipt(
             ));
         }
         let census_expected = expected_identities(contract, program, true).len();
+        let exception_expected = expected_identities(contract, program, false).len();
         let typed_exclusions = expected_typed_exclusion_identities(program).len();
         let census_measured = census_expected - typed_exclusions;
         for (key, expected) in [
@@ -4895,6 +5006,7 @@ fn validate_completed_receipt(
                 ));
             }
         }
+        validate_completed_shard_metrics(receipt, census_expected + exception_expected)?;
     }
     for (key, expected) in [
         ("program", program),
@@ -6309,6 +6421,20 @@ fn render_isolated_checkpoint(
     out
 }
 
+fn render_zero_work_checkpoint(
+    program: &str,
+    identities_expected: usize,
+    identities_measured: usize,
+    typed_excluded: usize,
+) -> Result<String, String> {
+    if (identities_expected, identities_measured, typed_excluded) != (0, 0, 0) {
+        return Err(format!(
+            "empty checkpoint requires exact 0/0/0 identity accounting: program={program} expected={identities_expected} measured={identities_measured} typed_excluded={typed_excluded}"
+        ));
+    }
+    Ok(render_isolated_checkpoint(program, &[]))
+}
+
 fn render_isolated_final_index(
     program: &str,
     expected: usize,
@@ -6695,6 +6821,18 @@ fn run_shard(contract: &MeasurementContract, program: super::CorpusProgram) {
         .expect("write program isolated checkpoint");
     }
 
+    if identities.is_empty() {
+        let checkpoint = render_zero_work_checkpoint(
+            program.name,
+            identities.len(),
+            completed.len(),
+            typed_exclusions.len(),
+        )
+        .expect("render exact zero-work checkpoint");
+        write_atomic_checkpoint(&dir.join("partial.tsv"), &checkpoint)
+            .expect("write zero-work checkpoint");
+    }
+
     let mut combined_candidates = format!("{CANDIDATE_HEADER}\n");
     let mut combined_exceptions = format!("{EXCEPTION_HEADER}\n");
     let mut root_inputs = Vec::new();
@@ -6746,31 +6884,42 @@ fn run_shard(contract: &MeasurementContract, program: super::CorpusProgram) {
         .expect("parse completed exceptions");
     let typed_exclusions =
         parse_typed_exclusions(&dir.join("typed-exclusions.tsv")).expect("parse typed exclusions");
-    let wall_s = completed.iter().map(|unit| unit.3).sum::<f64>()
-        + typed_exclusions
-            .iter()
-            .map(|exclusion| exclusion.wall_s)
-            .sum::<f64>();
-    let peak_rss_kb = completed
-        .iter()
-        .map(|unit| unit.4.process_peak_rss_kb)
-        .chain(
-            typed_exclusions
+    let zero_work = identities.is_empty();
+    let wall_s = if zero_work {
+        0.0
+    } else {
+        completed.iter().map(|unit| unit.3).sum::<f64>()
+            + typed_exclusions
                 .iter()
-                .map(|exclusion| exclusion.peak_rss_kb),
-        )
-        .max()
-        .unwrap_or(0);
-    let cgroup_peak_memory_kb = completed
-        .iter()
-        .map(|unit| unit.4.cgroup_peak_memory_kb)
-        .chain(
-            typed_exclusions
+                .map(|exclusion| exclusion.wall_s)
+                .sum::<f64>()
+    };
+    let memory_peaks = if zero_work {
+        None
+    } else {
+        Some(CandidateMemoryPeaks {
+            process_peak_rss_kb: completed
                 .iter()
-                .map(|exclusion| exclusion.cgroup_peak_memory_kb),
-        )
-        .max()
-        .unwrap_or(0);
+                .map(|unit| unit.4.process_peak_rss_kb)
+                .chain(
+                    typed_exclusions
+                        .iter()
+                        .map(|exclusion| exclusion.peak_rss_kb),
+                )
+                .max()
+                .expect("nonzero shard has a process peak"),
+            cgroup_peak_memory_kb: completed
+                .iter()
+                .map(|unit| unit.4.cgroup_peak_memory_kb)
+                .chain(
+                    typed_exclusions
+                        .iter()
+                        .map(|exclusion| exclusion.cgroup_peak_memory_kb),
+                )
+                .max()
+                .expect("nonzero shard has a cgroup peak"),
+        })
+    };
     let oracle_byte_matches = completed
         .iter()
         .filter(|(index, _, _, _, _)| {
@@ -6785,17 +6934,22 @@ fn run_shard(contract: &MeasurementContract, program: super::CorpusProgram) {
         "A4C STOP phase=oracle-byte-compare candidate={}: oracle match count drift",
         program.name
     );
-    let receipt = format!(
-        "machine_id={MACHINE_ID}\nplatform={PLATFORM}\nmemory_limit=cgroup-100GiB\nmemory_max_bytes={CANDIDATE_MEMORY_MAX_BYTES}\ncandidate_isolation=true\nwall_bound_kind=liveness\nwall_cap_s={LIVENESS_BOUND_S}\nprogram={}\nstatus=ok\ndata=true\ncheckpoint_data=false\nanalysis_head={}\na4_aggregate_manifest_sha256={A4_AGGREGATE_MANIFEST_SHA256}\na4_combined_sha256={A4_COMBINED_SHA256}\ncensus_identity_sha256={CENSUS_IDENTITY_SHA256}\nexception_identity_sha256={EXCEPTION_IDENTITY_SHA256}\nraw_corpus_digest={RAW_CORPUS_DIGEST}\nderived_substrate_digest={DERIVED_SUBSTRATE_DIGEST}\nsnapshot={SNAPSHOT_PATH}\ncensus_expected={}\ncensus_measured={}\ntyped_exclusions={}\ncandidates={}\nroots={}\nexceptions={}\noracle_partial_sha256={LIL_ORACLE_PARTIAL_SHA256}\noracle_byte_matches={oracle_byte_matches}\noracle_expected_matches={expected_oracle_matches}\nlast_phase=complete\nlast_candidate=none\nwall_s={wall_s:.3}\npeak_rss_kb={peak_rss_kb}\ncgroup_peak_memory_kb={cgroup_peak_memory_kb}\n",
-        program.name,
-        contract.head,
-        expected_identities(contract, program.name, true).len(),
-        candidates.len(),
-        typed_exclusions.len(),
-        candidates.len(),
-        roots.row_count,
-        exceptions.len(),
-    );
+    let receipt = render_completed_shard_receipt(&CompletedShardReceiptInput {
+        program: program.name,
+        analysis_head: &contract.head,
+        unit_identities_expected: identities.len(),
+        census_expected: expected_identities(contract, program.name, true).len(),
+        census_measured: candidates.len(),
+        typed_exclusions: typed_exclusions.len(),
+        candidates: candidates.len(),
+        roots: roots.row_count,
+        exceptions: exceptions.len(),
+        oracle_byte_matches,
+        oracle_expected_matches: expected_oracle_matches,
+        wall_s,
+        memory_peaks,
+    })
+    .expect("render completed shard receipt");
     fs::write(dir.join("receipt.txt"), receipt).expect("write completed receipt");
     let manifest = write_manifest(
         &dir,
@@ -6816,6 +6970,12 @@ fn run_shard(contract: &MeasurementContract, program: super::CorpusProgram) {
     validate_completed_receipt(&receipt, contract, program.name, &manifest)
         .expect("validate newly completed receipt");
     validate_receipt_counts(&receipt, &dir).expect("validate newly completed receipt counts");
+    let peak_rss = memory_peaks
+        .map(|peaks| peaks.process_peak_rss_kb.to_string())
+        .unwrap_or_else(|| "not-applicable-no-candidates".to_owned());
+    let cgroup_peak = memory_peaks
+        .map(|peaks| peaks.cgroup_peak_memory_kb.to_string())
+        .unwrap_or_else(|| "not-applicable-no-candidates".to_owned());
     eprintln!(
         "A4C completed program={} measured_candidates={} typed_exclusions={} roots={} exceptions={} wall_s={:.3} peak_rss_kb={} cgroup_peak_memory_kb={} manifest={manifest}",
         program.name,
@@ -6824,8 +6984,8 @@ fn run_shard(contract: &MeasurementContract, program: super::CorpusProgram) {
         roots.row_count,
         exceptions.len(),
         wall_s,
-        peak_rss_kb,
-        cgroup_peak_memory_kb,
+        peak_rss,
+        cgroup_peak,
     );
 }
 
@@ -7071,13 +7231,19 @@ fn aggregate(contract: &MeasurementContract) {
         .sum::<f64>();
     let peak_rss = receipts
         .iter()
-        .map(|receipt| receipt["peak_rss_kb"].parse::<u64>().expect("RSS integer"))
+        .filter_map(|receipt| match receipt["peak_rss_kb"].as_str() {
+            "not-applicable-no-candidates" => None,
+            value => Some(value.parse::<u64>().expect("RSS integer")),
+        })
         .max()
         .unwrap_or(0);
     let cgroup_peak_memory = receipts
         .iter()
         .filter_map(|receipt| receipt.get("cgroup_peak_memory_kb"))
-        .map(|peak| peak.parse::<u64>().expect("cgroup peak integer"))
+        .filter_map(|peak| match peak.as_str() {
+            "not-applicable-no-candidates" => None,
+            value => Some(value.parse::<u64>().expect("cgroup peak integer")),
+        })
         .max()
         .unwrap_or(0);
     let shard_analysis_heads = contract
@@ -7555,6 +7721,131 @@ mod tests {
         let exclusion =
             validate_typed_exclusion_artifact(19, &ratified_exclusion_expected(), dir).unwrap();
         assert_eq!(exclusion.manifest, RATIFIED_TYPED_EXCLUSION_MANIFEST);
+    }
+
+    #[test]
+    fn zero_work_schema_is_reachable_only_for_exact_zero_identity() {
+        let checkpoint = render_zero_work_checkpoint("heman", 0, 0, 0).unwrap();
+        assert_eq!(checkpoint, render_isolated_checkpoint("heman", &[]));
+        for accounting in [(1, 0, 0), (0, 1, 0), (0, 0, 1)] {
+            assert!(
+                render_zero_work_checkpoint("fixture", accounting.0, accounting.1, accounting.2,)
+                    .is_err()
+            );
+        }
+
+        let zero = render_completed_shard_receipt(&CompletedShardReceiptInput {
+            program: "heman",
+            analysis_head: "current",
+            unit_identities_expected: 0,
+            census_expected: 0,
+            census_measured: 0,
+            typed_exclusions: 0,
+            candidates: 0,
+            roots: 0,
+            exceptions: 0,
+            oracle_byte_matches: 0,
+            oracle_expected_matches: 0,
+            wall_s: 0.0,
+            memory_peaks: None,
+        })
+        .unwrap();
+        assert!(zero.contains("zero_work=true\ncandidate_processes_launched=0\n"));
+        assert!(zero.contains("wall_s=0.000\n"));
+        assert!(!zero.contains("wall_s=-0.000"));
+        assert!(zero.contains("peak_rss_kb=not-applicable-no-candidates\n"));
+        assert!(zero.contains("cgroup_peak_memory_kb=not-applicable-no-candidates\n"));
+        let zero_fields = zero
+            .lines()
+            .map(|line| {
+                let (key, value) = line.split_once('=').unwrap();
+                (key.to_owned(), value.to_owned())
+            })
+            .collect::<BTreeMap<_, _>>();
+        assert!(validate_completed_shard_metrics(&zero_fields, 0).is_ok());
+        assert!(validate_completed_shard_metrics(&zero_fields, 1).is_err());
+
+        let mut failed_measurement = CompletedShardReceiptInput {
+            program: "fixture",
+            analysis_head: "current",
+            unit_identities_expected: 1,
+            census_expected: 0,
+            census_measured: 0,
+            typed_exclusions: 0,
+            candidates: 0,
+            roots: 0,
+            exceptions: 0,
+            oracle_byte_matches: 0,
+            oracle_expected_matches: 0,
+            wall_s: 0.0,
+            memory_peaks: None,
+        };
+        assert!(render_completed_shard_receipt(&failed_measurement).is_err());
+        failed_measurement.unit_identities_expected = 0;
+        failed_measurement.candidates = 1;
+        assert!(render_completed_shard_receipt(&failed_measurement).is_err());
+    }
+
+    #[test]
+    fn completed_lil_verified_skip_tuple_is_additive_and_exact() {
+        assert!(
+            validate_receipt_head(
+                "lil",
+                COMPLETED_LIL_HEAD,
+                COMPLETED_LIL_MANIFEST,
+                "new-current-head",
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_receipt_head(
+                "lil",
+                COMPLETED_LIL_HEAD,
+                "wrong-manifest",
+                "new-current-head",
+            )
+            .is_err()
+        );
+        assert!(
+            validate_receipt_head(
+                "other",
+                COMPLETED_LIL_HEAD,
+                COMPLETED_LIL_MANIFEST,
+                "new-current-head",
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    #[ignore = "lambda7 manifested lil receipt byte-invariance witness"]
+    fn nonzero_lil_receipt_refinalizes_byte_identically() {
+        let path = Path::new(
+            "/home/p51lee/dev/agent-worktrees/crat-a4-source-census-run-20260815-retry3-resume12-YsSmmh9u/shards/lil/receipt.txt",
+        );
+        let expected = fs::read_to_string(path).unwrap();
+        assert_eq!(sha256(path), COMPLETED_LIL_RECEIPT_SHA256);
+        let rendered = render_completed_shard_receipt(&CompletedShardReceiptInput {
+            program: "lil",
+            analysis_head: COMPLETED_LIL_HEAD,
+            unit_identities_expected: 21,
+            census_expected: 20,
+            census_measured: 19,
+            typed_exclusions: 1,
+            candidates: 19,
+            roots: 4_522_217,
+            exceptions: 1,
+            oracle_byte_matches: 19,
+            oracle_expected_matches: 19,
+            wall_s: 1013.290,
+            memory_peaks: Some(CandidateMemoryPeaks {
+                process_peak_rss_kb: 104_581_640,
+                cgroup_peak_memory_kb: 104_857_600,
+            }),
+        })
+        .unwrap();
+        assert_eq!(rendered.as_bytes(), expected.as_bytes());
+        assert_eq!(sha256_text(&rendered), COMPLETED_LIL_RECEIPT_SHA256);
     }
 
     #[test]
