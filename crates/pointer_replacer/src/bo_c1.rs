@@ -8137,6 +8137,31 @@ mod run {
                 );
                 row.set("p4_seam_key_collisions", p.seam_key_collisions.to_string());
                 row.set("p4_seam_refused", p.seam_refused.to_string());
+                // **SEAM OWNER ATTRIBUTION, SECOND DERIVATION (round 5, item
+                // 1).** For a seam edit the owner string IS the revert decision
+                // — `plan` filters subjects but pushes every seam — so round 4
+                // duplicating only the predicate left the half that matters
+                // single-sourced. The denominator travels with the counters.
+                row.set("p4_seam_edits", p.seam_edits.to_string());
+                row.set("p4_seam_owner_agree", p.seam_owner_agree.to_string());
+                row.set("p4_seam_owner_mismatch", p.seam_owner_mismatch.to_string());
+                row.set(
+                    "p4_seam_owner_unlocated",
+                    p.seam_owner_unlocated.to_string(),
+                );
+                row.set(
+                    "p4_seam_owner_ambiguous",
+                    p.seam_owner_ambiguous.to_string(),
+                );
+                if !p.seam_owner_examples.is_empty() {
+                    row.set(
+                        "p4_seam_owner_ex",
+                        super::report::sanitize(
+                            &p.seam_owner_examples[..p.seam_owner_examples.len().min(2)]
+                                .join(" | "),
+                        ),
+                    );
+                }
                 // **RENDER-GAP CALIBRATION — de-tautologized at round 4, and
                 // now GATED.** Round 3's version compared two consumers of one
                 // revert predicate, so its zero was forced; the two sides now
@@ -11289,10 +11314,23 @@ fn p3_row_failures(program: &str, row: &report::Row) -> Vec<String> {
         )),
         (Err(why), _) | (Ok(_), Err(why)) => out.push(why),
     }
-    // **THE WITHHELD IDENTITY LIST vs ITS OWN COUNTER**, the mirror of
-    // `placed_ids + placed_dup == placed`. Without it the identity set could
-    // drift from the counter the oracle line above is checked against, and each
-    // line would still pass on its own.
+    // **THE WITHHELD IDENTITY LIST vs ITS OWN COUNTER.**
+    //
+    // ⚠ **STRUCTURALLY UNFALSIFIABLE — a PIN, and round 4's doc called it a
+    // drift detector.** `reverted_withheld += 1` and `withheld_ids.push(..)` are
+    // consecutive unconditional statements in ONE branch of `rewrite_decl`, so
+    // `withheld_ids.len() == reverted_withheld` always holds, and this row's
+    // three values are |S|, |V|−|S| and |V| off that single `Vec`: the check
+    // reduces to |S| + (|V|−|S|) == |V|. It cannot fail on any row the
+    // instrument can emit.
+    //
+    // **Item 2's actual protection is the zero-gating of
+    // `p4_withheld_missing`** (live: the walk can fail to reach a declaration
+    // the revert set owes). `p4_withheld_surplus` is a PIN and
+    // `p4_withheld_dup` is ENTAILED by this line plus the oracle line plus the
+    // GAP identity. Kept because it pins the derivation shape against a future
+    // refactor that separates the two statements — not because it detects
+    // drift today.
     match (
         num("p4_withheld_ids"),
         num("p4_withheld_dup"),
@@ -11327,6 +11365,33 @@ fn p3_row_failures(program: &str, row: &report::Row) -> Vec<String> {
         | (Ok(_), Err(why), ..)
         | (Ok(_), Ok(_), Err(why), _)
         | (Ok(_), Ok(_), Ok(_), Err(why)) => out.push(why),
+    }
+    // **THE SEAM-OWNER CORROBORATION'S CONSERVATION IDENTITY (round 5).**
+    //
+    // Every seam edit must reach exactly one verdict of the second derivation.
+    // Without this the three zero-gates sit over a population nothing pins: a
+    // corroboration that silently examined no edits would read as agreement,
+    // which is the shape `p4_render_*` shipped in round 4 without a denominator
+    // and the round-4 review named.
+    match (
+        num("p4_seam_owner_agree"),
+        num("p4_seam_owner_mismatch"),
+        num("p4_seam_owner_unlocated"),
+        num("p4_seam_owner_ambiguous"),
+        num("p4_seam_edits"),
+    ) {
+        (Ok(a), Ok(m), Ok(u), Ok(b), Ok(t)) if a + m + u + b == t => {}
+        (Ok(a), Ok(m), Ok(u), Ok(b), Ok(t)) => out.push(format!(
+            "{program}: p4_seam_owner agree={a} + mismatch={m} + unlocated={u} \
+             + ambiguous={b} != p4_seam_edits={t} — a seam edit reached NO \
+             verdict of the second derivation, so the attribution corroboration \
+             covers less than the seam population"
+        )),
+        (Err(why), ..)
+        | (Ok(_), Err(why), ..)
+        | (Ok(_), Ok(_), Err(why), ..)
+        | (Ok(_), Ok(_), Ok(_), Err(why), _)
+        | (Ok(_), Ok(_), Ok(_), Ok(_), Err(why)) => out.push(why),
     }
     // Every compared function must have been EQUAL. Its own identity rather
     // than an inference from `differing == 0`, so a function compared and
@@ -11408,6 +11473,13 @@ fn conforming_p3_row() -> report::Row {
     row.set("p4_render_compared", "1");
     row.set("p4_render_expected_empty", "0");
     row.set("p4_render_plan_files", "1");
+    // **libcsv's MEASURED seam population** (round-5 sweep): 2 seam edits, both
+    // corroborated by the second derivation. Carried so the conservation
+    // identity is exercised over a NON-EMPTY population — over zero edits it
+    // holds vacuously and the control would prove nothing, which is precisely
+    // the defect the round-4 review found in `p4_render_*`.
+    row.set("p4_seam_edits", "2");
+    row.set("p4_seam_owner_agree", "2");
     row
 }
 
@@ -11442,10 +11514,35 @@ fn fully_reverted_p3_row() -> report::Row {
     // avl's seam population is empty once the revert set applies.
     row.set("p4_seam_targets", "0");
     row.set("p4_seam_grafted", "0");
+    // **BUT ITS SEAM EDITS ARE NOT** — avl carries ONE seam edit, owned by a
+    // reverted callee, which is why it has a planned file whose surviving set is
+    // empty (`p4_render_expected_empty` 1). Measured in the round-5 sweep; this
+    // row previously INHERITED libcsv's 2/2, which was invented for avl. The
+    // corroboration and the revert filter therefore run over disjoint
+    // populations here, which is exactly the case item 1 exists for: the filter
+    // reads `owner_fn` on an edit no survivor set contains.
+    row.set("p4_seam_edits", "1");
+    row.set("p4_seam_owner_agree", "1");
     // **THE FULLY-REVERTED FILE**: planned, kept by nothing, emitted by nobody.
     row.set("p4_render_compared", "0");
     row.set("p4_render_expected_empty", "1");
     row.set("p4_render_plan_files", "1");
+    row
+}
+
+/// **brotli's measured fully-reverted shape** — 495 subjects reverted, 249 seam
+/// edits, nothing emitted. Extracted from the injection test so the seam-owner
+/// corroboration can be exercised at its LARGEST population rather than only at
+/// avl's single edit.
+#[cfg(test)]
+fn brotli_fully_reverted_row() -> report::Row {
+    let mut row = fully_reverted_p3_row();
+    row.set("p3_reverted_subjects", "495");
+    row.set("p4_decided", "495");
+    row.set("p4_reverted_withheld", "495");
+    row.set("p4_withheld_ids", "495");
+    row.set("p4_seam_edits", "249");
+    row.set("p4_seam_owner_agree", "249");
     row
 }
 
@@ -11491,6 +11588,42 @@ fn the_gate_passes_a_fully_reverted_program_and_still_checks_it() {
                 .any(|m| m.contains("p4_withheld_missing") || m.contains("p4_withheld_surplus")),
             "a withheld identity mismatch must fail over a NON-EMPTY reverted \
              population: {f:?}"
+        );
+    }
+
+    // **THE SEAM-OWNER CORROBORATION, EXERCISED WHERE ITS POPULATION IS
+    // LARGEST** (round 5). avl carries one seam edit; brotli carries 249, every
+    // one reverted. A mis-attribution on either must fail, and the conservation
+    // identity must catch an edit that reached no verdict.
+    for (label, row_fn) in [
+        ("avl", fully_reverted_p3_row as fn() -> report::Row),
+        ("brotli", brotli_fully_reverted_row as fn() -> report::Row),
+    ] {
+        let base = row_fn();
+        let total: i64 = base.get("p4_seam_edits").unwrap().parse().unwrap();
+        // A mis-attributed owner: one edit moves from `agree` to `mismatch`.
+        // Conserved, so ONLY the zero-gate can catch it — which is the point.
+        let mut bad = row_fn();
+        bad.set("p4_seam_owner_agree", &(total - 1).to_string());
+        bad.set("p4_seam_owner_mismatch", "1");
+        let f = p3_row_failures(label, &bad);
+        assert!(
+            f.iter().any(|m| m.contains("p4_seam_owner_mismatch")),
+            "{label}: a CONSERVED mis-attribution must still fail its own zero \
+             gate: {f:?}"
+        );
+        assert!(
+            !f.iter().any(|m| m.contains("reached NO verdict")),
+            "{label}: ...and must NOT read as an evaporation — it conserves"
+        );
+        // An edit that reached no verdict at all: the denominator check.
+        let mut lost = row_fn();
+        lost.set("p4_seam_owner_agree", &(total - 1).to_string());
+        let f = p3_row_failures(label, &lost);
+        assert!(
+            f.iter().any(|m| m.contains("reached NO verdict")),
+            "{label}: a seam edit reaching NO verdict must fail the \
+             conservation identity: {f:?}"
         );
     }
 
@@ -11789,6 +11922,19 @@ const P4_IDENTITY_ZERO_KEYS: &[&str] = &[
     "p4_render_differing",
     "p4_render_absent",
     "p4_render_surplus",
+    // ---- ROUND 5 ----
+    // **C2**: these two were REPORTED-not-gated, and round 4's claim that they
+    // fail open into `render_differing` was false for `Unresolved` — `render`
+    // keeps an unresolvable owner too, so both sides agreed BECAUSE both
+    // failed. Gated now, and `Unresolved` also drops (see `keeps_edit`), so
+    // each arm carries two signals instead of none.
+    "p4_render_owner_unresolved",
+    "p4_render_owner_split",
+    // **C1**: a seam edit whose carried owner is not the callee of the call it
+    // sits in. For seams this IS the revert decision.
+    "p4_seam_owner_mismatch",
+    "p4_seam_owner_unlocated",
+    "p4_seam_owner_ambiguous",
 ];
 
 /// The phase-4 failure classes whose corpus value is **zero and gated**.
@@ -11955,6 +12101,13 @@ fn every_p3_failure_class_actually_fails() {
     row.set("p4_seam_targets", "0");
     row.set("p4_seam_grafted", "0");
     row.set("p4_seam_refused", "0");
+    // **brotli's MEASURED seam population: 249 edits, every one reverted** —
+    // `seam_targets` 0 and `seam_edits` 249 are the same fact from the two sides
+    // of the revert filter, and they are the sharpest available exercise of the
+    // corroboration's denominator: 249 attributions checked on a program where
+    // the filter keeps nothing. This row previously inherited libcsv's 2/2.
+    row.set("p4_seam_edits", "249");
+    row.set("p4_seam_owner_agree", "249");
     // **brotli's MEASURED withheld**: all 495 of its subjects are reverted and
     // the walk reached every one. This is the non-zero half of the identity —
     // without it the gate would be satisfied by a corpus that never withheld.
@@ -12247,6 +12400,9 @@ fn every_p4_failure_class_actually_fails() {
         "p4_render_absent",
         "p4_render_expected_empty",
         "p4_render_plan_files",
+        // ---- round 5: the seam-owner corroboration's read keys ----
+        "p4_seam_owner_agree",
+        "p4_seam_edits",
     ]
     .iter()
     .copied()

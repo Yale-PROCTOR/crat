@@ -2204,6 +2204,28 @@ pub(crate) fn phase3_fn_parity(
         );
     }
     p.seam_targets = seam_targets.len();
+
+    // **ITEM 1 — THE SECOND DERIVATION OF SEAM OWNERSHIP.**
+    //
+    // Over the FULL seam population, deliberately: the revert filter three lines
+    // above READS `owner_fn`, so corroborating only the edits that survive it
+    // would exclude exactly the ones a mis-attribution wrongly saved.
+    let owner_index = call_arg_owners(tcx);
+    let sowner = reconcile_seam_owners(
+        table
+            .seams
+            .edits
+            .iter()
+            .map(|e| ((e.span.lo().0, e.span.hi().0), e.owner_fn.as_str())),
+        &owner_index,
+    );
+    p.seam_edits = table.seams.edits.len();
+    p.seam_owner_agree = sowner.agree;
+    p.seam_owner_mismatch = sowner.mismatch;
+    p.seam_owner_unlocated = sowner.unlocated;
+    p.seam_owner_ambiguous = sowner.ambiguous;
+    p.seam_owner_examples = sowner.examples;
+
     let mut s = SeamGraftVisitor::new(&seam_targets, &mut guard);
     s.visit_crate(&mut krate);
     // **THE STATS ARE READ.** `let _ = s.finish();` discarded every one of them
@@ -2278,31 +2300,42 @@ pub(crate) fn phase3_fn_parity(
     // and its output is compared against a reconstruction built the way this
     // gate builds one.
     //
-    // **ROUND 4 — THE TWO SIDES NOW DIFFER IN THE REVERT DECISION.** They did
-    // not before: this side asked `reverts.keeps(&e.owner_fn)` and `render`
-    // asked `!reverted.contains(&edit.owner_fn)` — one set, one key, one string
-    // vocabulary — so 0-differing was FORCED before the sweep ran, and what
-    // round 3 measured was two back-to-front appliers agreeing about an
-    // already-agreed edit set. The revert half was a tautology.
+    // **THE TWO SIDES DERIVE THE REVERT DECISION BY DIFFERENT ROUTES — and the
+    // honest label for the relation is STRICT REFINEMENT, not independence.**
     //
-    // `render` keeps `reverts.names`, the oracle file's parsed strings. This
-    // side asks the **declaration walk's realized verdict**: `withheld_fns` is
-    // what the walk actually DECLINED at its site, and the name→`LocalDefId`
-    // bridge is an index built here from `tcx.hir_body_owners()`. Neither
-    // `reverts.keeps` nor `reverts.names` is on this path.
+    // Round 3's version was a tautology: this side asked
+    // `reverts.keeps(&e.owner_fn)` and `render` asked
+    // `!reverted.contains(&edit.owner_fn)` — one set, one key, one string
+    // vocabulary — so 0-differing was FORCED before the sweep ran. `render` now
+    // keeps `reverts.names`, the oracle file's parsed strings, while this side
+    // asks the **declaration walk's realized verdict** (`withheld_fns`, what the
+    // walk actually DECLINED at its site) through a name→`LocalDefId` index
+    // built here from `tcx.hir_body_owners()`.
     //
-    // **Compared at FILE level** — a deviation from the charter's per-function
-    // wording, and §27 offered "calibrate the per-function splice OR say plainly
-    // it is a different derivation". The second branch is taken, for a reason
-    // §27 could not have: handing the per-function splice this predicate would
-    // DAMAGE phase 3. Its span side filters by NAME while its AST side consults
-    // `reverts.fns` by `DefId` at the site, and that cross-vocabulary
-    // independence is real; routing the span side through the walk's verdict
-    // would make both sides consume the walk, and a walk-side revert defect
-    // would go invisible in the instrument pinned at 68/68. The per-function
-    // splice therefore keeps its predicate and shares only [`splice_kept`].
-    // **What stays uncalibrated is its OFFSET REBASING** (`base + e.lo`, then
-    // `lo - flo`) — named rather than covered by an inference.
+    // ⚠ **WHAT THAT DOES AND DOES NOT BUY (round-4 review, adopted).**
+    // `recon-drop = render-drop ∧ reached`, and the gated
+    // `withheld_missing`/`_surplus == 0` plus the ledger GAP line force
+    // `withheld_fns == reverts.fns` — so **on a green gate the two predicates
+    // are EQUAL and the corpus zeros below are ENTAILED, not independent
+    // evidence.** What is genuinely measured here is (a) a mutation of
+    // `render`'s own filter line, and (b) splice-mechanics divergence between
+    // [`splice_kept`] and `apply::apply`. The falsifiability that matters is the
+    // unit negative control, which injects a one-sided divergence directly.
+    //
+    // **Compared at FILE level** — §27 offered "calibrate the per-function
+    // splice OR say plainly it is a different derivation", and the second branch
+    // is taken. ⚠ The round-4 justification for it was WRONG and is corrected
+    // here: it claimed phase 3 keeps a cross-vocabulary split because "its span
+    // side filters by NAME while its AST side consults `reverts.fns` by
+    // `DefId`". **That holds for DECLARATIONS ONLY.** For seams both of phase
+    // 3's sides call `reverts.keeps(name)` — the AST seam-target filter above
+    // and the span-side per-function filter below — so no such split exists
+    // there. The seam path's corroboration is now ATTRIBUTION-side (item 1),
+    // which is where a seam's revert decision actually lives.
+    //
+    // **What stays uncalibrated is the per-function path's OFFSET REBASING**
+    // (`base + e.lo`, then `lo - flo`) — named rather than covered by an
+    // inference; the predicate and [`splice_kept`] are shared with it.
     //
     // ⚠ `emit_files` calls `render` with an EMPTY revert set — it has already
     // dropped reverted SUBJECTS at plan-build time — so `emission.files` still
@@ -2639,13 +2672,30 @@ pub(crate) enum OwnerVerdict {
 
 #[cfg(test)]
 impl OwnerVerdict {
-    /// **FAIL-OPEN, ON PURPOSE.** An undecidable owner keeps its edit, so the
-    /// disagreement surfaces as a text difference in a GATED counter rather than
-    /// as a quiet exclusion from the denominator. Dropping the edit instead
-    /// would shrink the comparison exactly where it is least trustworthy, which
-    /// is the shape this milestone keeps repairing.
+    /// **THE TWO UNDECIDABLE ARMS FAIL IN OPPOSITE DIRECTIONS, AND EACH
+    /// DIRECTION IS THE LOUD ONE FOR ITS ARM.** Round 4 claimed both were
+    /// "fail-open and loud"; that was true of `Split` and **false of
+    /// `Unresolved`**, which is the correction round 5 lands (C2).
+    ///
+    /// - `Unresolved` **DROPS** (fail-closed). It cannot be kept: `reverts.names`
+    ///   is a *subset* of the same `def_path_str`-over-`hir_body_owners` strings
+    ///   `owners_by_name` is keyed by, so a name absent from the index is
+    ///   necessarily absent from the revert set — `render` keeps it, and a
+    ///   reconstruction that also kept it would agree **because both failed
+    ///   identically**, with no text difference to surface. Dropping makes
+    ///   `render_differing` fire.
+    /// - `Split` **KEEPS**. A split needs at least one reverted candidate, whose
+    ///   name is therefore in `reverts.names`, so `render` drops it — keeping
+    ///   makes `render_differing` fire here too.
+    ///
+    /// Neither arm relies on that reasoning alone: both counters are zero-gated
+    /// in [`P4_IDENTITY_ZERO_KEYS`] as of round 5, so the text divergence is
+    /// defense in depth rather than the only signal.
     pub(crate) fn keeps_edit(self) -> bool {
-        !matches!(self, OwnerVerdict::Withheld)
+        match self {
+            OwnerVerdict::Kept | OwnerVerdict::Split => true,
+            OwnerVerdict::Withheld | OwnerVerdict::Unresolved => false,
+        }
     }
 }
 
@@ -2664,6 +2714,147 @@ pub(crate) fn owner_verdict<D: Eq + std::hash::Hash>(
     }
 }
 
+/// **SEAM OWNER ATTRIBUTION, DERIVED A SECOND TIME — round 5's item 1.**
+///
+/// Round 4's finding, and the one that kept phase 4 shut: the revert decision has
+/// two halves — *which owner an edit belongs to*, and *whether that owner is
+/// reverted* — and round 4 duplicated only the second. For a SEAM edit the first
+/// half **is** the revert decision, because `plan` filters subjects but pushes
+/// every seam unconditionally, so `owner_fn` is the only thing standing between a
+/// reverted callee and a transformed call site.
+///
+/// That string is produced once, at `decision::seam`'s `plan.edits.push`, from
+/// the callee that keys `facts.call_args` — and `render`, this gate's
+/// reconstruction, the AST seam map and the span splice all consume it without
+/// any of them able to disagree with it.
+///
+/// This derives it again from the other direction: a HIR walk keyed by the
+/// **argument span**, so a seam edit's owner is looked up by *where the edit
+/// lands* rather than by the map key it was filed under. The two derivations
+/// share rustc's own `Res::Def` path resolution — **stated, not papered over**:
+/// what this corroborates is OUR attribution (which owner string reaches which
+/// edit), not rustc's resolution of a path.
+///
+/// Body enumeration is `hir_body_owners` + `hir_body_owned_by`, matching
+/// [`super::decision::emitability::collect`] exactly, so a body one walk sees and
+/// the other does not cannot present as a mismatch. Deliberately NOT filtered by
+/// the functions-under-consideration list that `emitability` applies: a superset
+/// index can only make lookups succeed, never invent a disagreement.
+#[cfg(test)]
+pub(crate) fn call_arg_owners(
+    tcx: rustc_middle::ty::TyCtxt<'_>,
+) -> FxHashMap<(u32, u32), Vec<String>> {
+    use rustc_hir::intravisit::{self, Visitor};
+
+    struct ArgOwners<'a, 'tcx> {
+        tcx: rustc_middle::ty::TyCtxt<'tcx>,
+        out: &'a mut FxHashMap<(u32, u32), Vec<String>>,
+    }
+    impl<'tcx> Visitor<'tcx> for ArgOwners<'_, 'tcx> {
+        fn visit_expr(&mut self, expr: &'tcx rustc_hir::Expr<'tcx>) {
+            // **DIRECT CALLS ONLY**, which is exactly the shape `call_args`
+            // records — a method call produces no seam, so widening here would
+            // add index entries no seam edit can ever key into.
+            if let rustc_hir::ExprKind::Call(callee, args) = &expr.kind
+                && let rustc_hir::ExprKind::Path(rustc_hir::QPath::Resolved(_, path)) = &callee.kind
+                && let rustc_hir::def::Res::Def(rustc_hir::def::DefKind::Fn, def_id) = path.res
+                && let Some(local_did) = def_id.as_local()
+            {
+                let owner = self.tcx.def_path_str(local_did.to_def_id());
+                for arg in args.iter() {
+                    self.out
+                        .entry((arg.span.lo().0, arg.span.hi().0))
+                        .or_default()
+                        .push(owner.clone());
+                }
+            }
+            intravisit::walk_expr(self, expr);
+        }
+    }
+
+    let mut out: FxHashMap<(u32, u32), Vec<String>> = FxHashMap::default();
+    for owner in tcx.hir_body_owners() {
+        let body = tcx.hir_body_owned_by(owner);
+        let mut v = ArgOwners { tcx, out: &mut out };
+        v.visit_body(body);
+    }
+    out
+}
+
+/// The per-seam verdict of the second derivation.
+#[derive(Default, Debug)]
+#[cfg(test)]
+pub(crate) struct SeamOwnerRecon {
+    /// The independent derivation names the same owner the edit carries.
+    pub agree: usize,
+    /// **THE CLASS ROUND 5 EXISTS FOR.** The edit's `owner_fn` is not the callee
+    /// of the call its argument sits in — so the revert filter is asking about
+    /// the wrong function, and every downstream counter agrees with it.
+    pub mismatch: usize,
+    /// A seam edit whose argument span matches no direct-call argument. Its zero
+    /// is not decorative: seams are produced only from `call_args`, whose entries
+    /// are exactly these spans, so a nonzero means the two walks disagree about
+    /// what the crate contains.
+    pub unlocated: usize,
+    /// One argument span naming several DISTINCT callees — a span collision, and
+    /// undecidable rather than wrong. Counted apart so it can never be read as
+    /// agreement.
+    pub ambiguous: usize,
+    pub examples: Vec<String>,
+}
+
+/// Reconcile carried seam owners against the independent span-keyed derivation.
+///
+/// Pure and rustc-free in its signature so the injection witness the charter asks
+/// for — *a mis-attributed `owner_fn` MUST fire it* — needs no compiler session.
+#[cfg(test)]
+pub(crate) fn reconcile_seam_owners<'a>(
+    edits: impl Iterator<Item = ((u32, u32), &'a str)>,
+    index: &FxHashMap<(u32, u32), Vec<String>>,
+) -> SeamOwnerRecon {
+    let mut r = SeamOwnerRecon::default();
+    for (key, carried) in edits {
+        let mut push = |r: &mut SeamOwnerRecon, row: String| {
+            if r.examples.len() < 4 {
+                r.examples.push(row);
+            }
+        };
+        match index.get(&key) {
+            None => {
+                r.unlocated += 1;
+                push(
+                    &mut r,
+                    format!("SEAM-OWNER UNLOCATED @{key:?} carried={carried}"),
+                );
+            }
+            Some(found) => {
+                let distinct: std::collections::BTreeSet<&str> =
+                    found.iter().map(String::as_str).collect();
+                if distinct.len() > 1 {
+                    r.ambiguous += 1;
+                    push(
+                        &mut r,
+                        format!(
+                            "SEAM-OWNER AMBIGUOUS @{key:?} carried={carried} found={distinct:?}"
+                        ),
+                    );
+                } else if distinct.contains(carried) {
+                    r.agree += 1;
+                } else {
+                    r.mismatch += 1;
+                    push(
+                        &mut r,
+                        format!(
+                            "SEAM-OWNER MISMATCH @{key:?} carried={carried} derived={distinct:?}"
+                        ),
+                    );
+                }
+            }
+        }
+    }
+    r
+}
+
 /// The reconstruction's output, and the classes it could not decide.
 #[derive(Default, Debug)]
 #[cfg(test)]
@@ -2674,7 +2865,7 @@ pub(crate) struct Reconstruction {
     pub owner_split: usize,
 }
 
-/// **THE RECONSTRUCTION — and its SIGNATURE is the guard.**
+/// **THE RECONSTRUCTION — its signature guards ONE of the two ways back.**
 ///
 /// Round 4 de-tautologized the calibration, and the natural way to undo that is
 /// a one-token edit: swap the verdict for `reverts.keeps(&e.owner_fn)` and the
@@ -2682,12 +2873,19 @@ pub(crate) struct Reconstruction {
 /// a tautology's whole property is that it still reads 0 — and a unit test that
 /// reassembles the loop from its pieces would not catch it either.
 ///
-/// So the loop lives here, where **there is no `RevertSet` to reach for**. It
+/// So the loop lives here, where **there is no `RevertSet` to reach for**: it
 /// takes the plan, the texts, a name→owner index and the walk's withheld set,
-/// and nothing else. Re-introducing the tautology now requires threading a new
-/// parameter through this signature, which is a visible structural act rather
-/// than a silent one — and the negative control below drives THIS function
-/// rather than a copy of it.
+/// and nothing else. Restoring the tautology *inside this function* therefore
+/// requires threading a new parameter through the signature.
+///
+/// ⚠ **AND THAT IS THE LIMIT OF IT** (round-4 review; round 4's own doc claimed
+/// the signature was "the guard", full stop). The CALL SITE is the other way
+/// back: `phase3_fn_parity` builds `withheld_fns` from
+/// `decls_stats.withheld_ids`, and rewriting that one line to derive it from
+/// `reverts.fns` restores the tautology with **no signature change** — and the
+/// negative control would not notice, because it drives this function directly
+/// with a `withheld` set of its own. The call site is guarded by review, not by
+/// construction.
 #[cfg(test)]
 pub(crate) fn reconstruct_kept_files<D: Eq + std::hash::Hash>(
     planned: &super::plan::Plan,
@@ -3034,6 +3232,26 @@ pub(crate) struct FnParity {
     /// a second gate (`p4_refused` gates the joint count across all passes).
     pub seam_refused: usize,
 
+    // ---- SEAM OWNER ATTRIBUTION, SECOND DERIVATION (round 5, item 1) ----
+    /// `table.seams.edits.len()` — the corroboration's DENOMINATOR, carried
+    /// beside its counters because a zero-mismatch over a zero population is the
+    /// shape this milestone keeps having to repair.
+    pub seam_edits: usize,
+    /// Seam edits whose carried `owner_fn` matches the span-keyed HIR
+    /// derivation.
+    pub seam_owner_agree: usize,
+    /// **The class round 5 exists for**: the carried owner is not the callee of
+    /// the call whose argument this edit replaces.
+    pub seam_owner_mismatch: usize,
+    /// A seam edit whose argument span is no direct-call argument.
+    pub seam_owner_unlocated: usize,
+    /// One argument span naming several distinct callees — undecidable, never
+    /// counted as agreement.
+    pub seam_owner_ambiguous: usize,
+    /// Its OWN channel. The two-instruments-one-channel defect has been written
+    /// into this file four times; this counter arrives with its own key.
+    pub seam_owner_examples: Vec<String>,
+
     // ---- RENDER-GAP CALIBRATION (round-3 item 8) ----
     /// Files compared between this gate's own reconstruction and
     /// `bo_rewriter::render`'s output under the REAL revert set — the
@@ -3046,11 +3264,17 @@ pub(crate) struct FnParity {
     /// Files this gate reconstructed that `render` did not emit at all.
     pub render_absent: usize,
     /// **Files `render` emitted that the reconstruction says are FULLY
-    /// REVERTED.** Round 4, and the direction the round-3 comparison could not
-    /// see: it iterated the reconstruction's keys and skipped empty ones, so a
-    /// `render` that emitted a fully-reverted file incremented nothing — and
-    /// the 5 programs excluded from the round-3 denominator were exactly the
-    /// fully-reverted ones, i.e. precisely where a revert defect would show.
+    /// REVERTED** — the direction round 3's comparison could not see at all,
+    /// since it iterated the reconstruction's keys and skipped the empty ones.
+    ///
+    /// ⚠ **A PIN, NOT A MEASUREMENT** (round-4 review; round 4's own doc called
+    /// it "the first measurement of the fully-reverted population" and that was
+    /// wrong). Unreachable from the reconstruction side by construction:
+    /// recon-Withheld(e) ⟹ owner ∈ `withheld_fns` ⊆ `reverts.fns` ⟹
+    /// `owner_fn` ∈ `reverts.names` ⟹ `render` drops it too; contrapositively
+    /// render-keeps ⟹ recon-keeps ⟹ the key is in `recon.files`. It fires only
+    /// on a mutation of `render`'s own filter, and is gated so that mutation
+    /// cannot land silently.
     pub render_surplus: usize,
     /// Planned files whose surviving-edit set is empty on the reconstruction's
     /// derivation. The fully-reverted population, as a reported number rather
@@ -4122,12 +4346,98 @@ mod arm2_witnesses {
         );
     }
 
-    /// **THE FAIL-OPEN ARM, WITNESSED.** An undecidable owner keeps its edit, so
-    /// the disagreement lands in a GATED counter instead of quietly shrinking
-    /// the denominator — which is the shape round 3's comparison had.
+    /// **SEAM OWNER ATTRIBUTION — THE INJECTION WITNESS THE CHARTER ASKS FOR:
+    /// a mis-attributed `owner_fn` MUST fire it.** Round 5's item 1.
     ///
-    /// *Mutation-tested:* M20 (fold `Split` into the dropped arm) flips the
-    /// third assertion.
+    /// Round 4's blocking finding was that the seam owner string is produced
+    /// once and consumed identically everywhere, so for seams — where the owner
+    /// IS the revert decision — nothing could disagree with it. This drives the
+    /// production [`reconcile_seam_owners`] against a hand-built span index.
+    ///
+    /// *Mutation-tested:* M22 (treat a mismatch as agreement) and M23 (count a
+    /// missing index entry as agreement) each fail their own assertion.
+    #[test]
+    fn a_misattributed_seam_owner_fires_the_corroboration() {
+        let mut index: FxHashMap<(u32, u32), Vec<String>> = FxHashMap::default();
+        index.insert((10, 20), vec!["crate::callee_a".to_owned()]);
+        index.insert((30, 40), vec!["crate::callee_b".to_owned()]);
+        // A span whose call was resolved to two different callees — undecidable,
+        // and it must not be laundered into either agreement or mismatch.
+        index.insert(
+            (50, 60),
+            vec!["crate::callee_a".to_owned(), "crate::callee_b".to_owned()],
+        );
+        // The same callee recorded twice for one span is NOT ambiguity — a
+        // repeated identical resolution is still one answer.
+        index.insert(
+            (70, 80),
+            vec!["crate::callee_a".to_owned(), "crate::callee_a".to_owned()],
+        );
+
+        // ---- the control: every carried owner is the derived one ----
+        let ok = reconcile_seam_owners(
+            [((10, 20), "crate::callee_a"), ((30, 40), "crate::callee_b")].into_iter(),
+            &index,
+        );
+        assert_eq!(
+            (ok.agree, ok.mismatch, ok.unlocated, ok.ambiguous),
+            (2, 0, 0, 0),
+            "correct attribution must corroborate CLEAN — without this half a \
+             check that flagged everything would pass as vigilance"
+        );
+
+        // ---- THE INJECTION: the edit at (10,20) claims callee_b ----
+        //
+        // This is exactly C1's scenario: a seam adapting a call to one function
+        // carries another function's name, so the revert filter asks about the
+        // wrong function and every downstream counter agrees with it.
+        let bad = reconcile_seam_owners([((10, 20), "crate::callee_b")].into_iter(), &index);
+        assert_eq!(
+            (bad.agree, bad.mismatch),
+            (0, 1),
+            "a MIS-ATTRIBUTED owner_fn must fire the corroboration — this is the \
+             assertion round 4 had no way to host"
+        );
+        assert!(
+            bad.examples.iter().any(|e| e.contains("MISMATCH")
+                && e.contains("callee_b")
+                && e.contains("callee_a")),
+            "and the row must name BOTH the carried and the derived owner: {:?}",
+            bad.examples
+        );
+
+        // ---- the two undecidable classes, each its own ----
+        let amb = reconcile_seam_owners([((50, 60), "crate::callee_a")].into_iter(), &index);
+        assert_eq!(
+            (amb.agree, amb.mismatch, amb.ambiguous),
+            (0, 0, 1),
+            "one span naming two callees is UNDECIDABLE — counting it as \
+             agreement would let a span collision read as corroboration"
+        );
+        let dup = reconcile_seam_owners([((70, 80), "crate::callee_a")].into_iter(), &index);
+        assert_eq!(
+            (dup.agree, dup.ambiguous),
+            (1, 0),
+            "...but a repeated IDENTICAL resolution is one answer, not a split"
+        );
+        let miss = reconcile_seam_owners([((90, 99), "crate::callee_a")].into_iter(), &index);
+        assert_eq!(
+            (miss.agree, miss.unlocated),
+            (0, 1),
+            "a seam whose argument span is no call argument is its own class — \
+             seams come only from call arguments, so this cannot be a nothing"
+        );
+    }
+
+    /// **THE TWO UNDECIDABLE ARMS FAIL IN OPPOSITE DIRECTIONS — round 5's C2.**
+    ///
+    /// Round 4 shipped both as fail-open and claimed both were loud. `Split` was;
+    /// `Unresolved` was not, because `reverts.names` is a subset of the index's
+    /// own keys, so an unresolvable owner is one `render` keeps too — both sides
+    /// agreed BECAUSE both failed, and no text difference existed to surface.
+    ///
+    /// *Mutation-tested:* M20 (fold `Split` into the dropped arm) and M24
+    /// (restore `Unresolved` to fail-open) each flip their own assertion.
     #[test]
     fn an_undecidable_owner_keeps_its_edit_and_names_itself() {
         let withheld: FxHashSet<u32> = [1u32].into_iter().collect();
@@ -4160,17 +4470,30 @@ mod arm2_witnesses {
             OwnerVerdict::Withheld,
             "...and agreeing homonyms must NOT read as a split"
         );
-        for v in [
-            OwnerVerdict::Kept,
-            OwnerVerdict::Unresolved,
-            OwnerVerdict::Split,
-        ] {
-            assert!(
-                v.keeps_edit(),
-                "{v:?} must FAIL OPEN into the gated counter"
-            );
-        }
-        assert!(!OwnerVerdict::Withheld.keeps_edit());
+        // **THE TWO DIRECTIONS, EACH ASSERTED SEPARATELY** — round 5's C2. A
+        // single loop over "all undecidable arms keep" is what shipped in round
+        // 4, and it encoded the very claim the review refuted.
+        assert!(
+            OwnerVerdict::Kept.keeps_edit(),
+            "a resolved, unreverted owner keeps its edit"
+        );
+        assert!(
+            !OwnerVerdict::Withheld.keeps_edit(),
+            "a withheld owner drops its edit — the whole point of the filter"
+        );
+        assert!(
+            !OwnerVerdict::Unresolved.keeps_edit(),
+            "UNRESOLVED FAILS CLOSED. `reverts.names` is a subset of the index's \
+             own keys, so `render` keeps an unresolvable owner too — keeping it \
+             here would make both sides agree BECAUSE both failed, with no text \
+             difference to surface. Dropping is what makes it loud."
+        );
+        assert!(
+            OwnerVerdict::Split.keeps_edit(),
+            "SPLIT FAILS OPEN, and the asymmetry is deliberate: a split needs a \
+             reverted candidate, whose name IS in `reverts.names`, so `render` \
+             drops it — keeping here is what produces the divergence"
+        );
     }
 
     /// **WITHHELD AT IDENTITY LEVEL — round 4's item 2, and its ruled negative
