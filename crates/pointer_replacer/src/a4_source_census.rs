@@ -4925,11 +4925,85 @@ fn validate_completed_shard_metrics(
     for key in ["peak_rss_kb", "cgroup_peak_memory_kb"] {
         let value = receipt
             .get(key)
-            .ok_or_else(|| format!("current-head receipt lacks {key}"))?
+            .ok_or_else(|| format!("capped receipt lacks {key}"))?
             .parse::<u64>()
-            .map_err(|error| format!("current-head receipt {key} is invalid: {error}"))?;
+            .map_err(|error| format!("capped receipt {key} is invalid: {error}"))?;
         if value == 0 {
-            return Err(format!("current-head receipt {key} is zero"));
+            return Err(format!("capped receipt {key} is zero"));
+        }
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CompletedShardMemoryPolicy {
+    LegacyUncapped,
+    Cgroup100GiB,
+}
+
+fn completed_shard_memory_policy(
+    program: &str,
+    receipt_head: &str,
+    manifest: &str,
+    current_head: &str,
+) -> Result<CompletedShardMemoryPolicy, String> {
+    validate_receipt_head(program, receipt_head, manifest, current_head)?;
+    if receipt_head == current_head
+        || (program == "lil"
+            && receipt_head == COMPLETED_LIL_HEAD
+            && manifest == COMPLETED_LIL_MANIFEST)
+    {
+        Ok(CompletedShardMemoryPolicy::Cgroup100GiB)
+    } else {
+        Ok(CompletedShardMemoryPolicy::LegacyUncapped)
+    }
+}
+
+fn validate_completed_shard_memory_policy(
+    receipt: &BTreeMap<String, String>,
+    policy: CompletedShardMemoryPolicy,
+) -> Result<(), String> {
+    match policy {
+        CompletedShardMemoryPolicy::LegacyUncapped => {
+            if receipt.get("memory_limit").map(String::as_str) != Some("uncapped") {
+                return Err(format!(
+                    "legacy-uncapped receipt memory_limit drift: {:?}",
+                    receipt.get("memory_limit")
+                ));
+            }
+            for key in [
+                "memory_max_bytes",
+                "candidate_isolation",
+                "cgroup_peak_memory_kb",
+            ] {
+                if receipt.contains_key(key) {
+                    return Err(format!(
+                        "legacy-uncapped receipt carries capped-only field {key}"
+                    ));
+                }
+            }
+            let peak = receipt
+                .get("peak_rss_kb")
+                .ok_or_else(|| "legacy-uncapped receipt lacks peak_rss_kb".to_owned())?
+                .parse::<u64>()
+                .map_err(|error| format!("legacy-uncapped receipt RSS is invalid: {error}"))?;
+            if peak == 0 {
+                return Err("legacy-uncapped receipt RSS is zero".to_owned());
+            }
+        }
+        CompletedShardMemoryPolicy::Cgroup100GiB => {
+            for (key, expected) in [
+                ("memory_limit", "cgroup-100GiB"),
+                ("memory_max_bytes", "107374182400"),
+                ("candidate_isolation", "true"),
+            ] {
+                if receipt.get(key).map(String::as_str) != Some(expected) {
+                    return Err(format!(
+                        "capped receipt {key}: expected {expected:?}, got {:?}",
+                        receipt.get(key)
+                    ));
+                }
+            }
         }
     }
     Ok(())
@@ -4959,25 +5033,10 @@ fn validate_completed_receipt(
     let receipt_head = receipt
         .get("analysis_head")
         .ok_or_else(|| "receipt lacks analysis_head".to_owned())?;
-    validate_receipt_head(program, receipt_head, manifest, &contract.head)?;
-    let expected_memory_limit = if receipt_head == &contract.head {
-        "cgroup-100GiB"
-    } else {
-        "uncapped"
-    };
-    if receipt.get("memory_limit").map(String::as_str) != Some(expected_memory_limit) {
-        return Err(format!(
-            "receipt memory_limit: expected {expected_memory_limit:?}, got {:?}",
-            receipt.get("memory_limit")
-        ));
-    }
-    if receipt_head == &contract.head
-        && (receipt.get("memory_max_bytes").map(String::as_str) != Some("107374182400")
-            || receipt.get("candidate_isolation").map(String::as_str) != Some("true"))
-    {
-        return Err("current-head receipt lacks candidate-isolation/cgroup contract".to_owned());
-    }
-    if receipt_head == &contract.head {
+    let memory_policy =
+        completed_shard_memory_policy(program, receipt_head, manifest, &contract.head)?;
+    validate_completed_shard_memory_policy(receipt, memory_policy)?;
+    if memory_policy == CompletedShardMemoryPolicy::Cgroup100GiB {
         let expected_oracle_matches = (usize::from(program == "lil") * 19).to_string();
         if receipt.get("oracle_partial_sha256").map(String::as_str)
             != Some(LIL_ORACLE_PARTIAL_SHA256)
@@ -4987,7 +5046,7 @@ fn validate_completed_receipt(
                 != Some(expected_oracle_matches.as_str())
         {
             return Err(format!(
-                "current-head receipt oracle contract drift: program={program}"
+                "capped receipt oracle contract drift: program={program}"
             ));
         }
         let census_expected = expected_identities(contract, program, true).len();
@@ -5001,7 +5060,7 @@ fn validate_completed_receipt(
         ] {
             if receipt.get(key).map(String::as_str) != Some(expected.as_str()) {
                 return Err(format!(
-                    "current-head receipt {key} drift: program={program} expected={expected} actual={:?}",
+                    "capped receipt {key} drift: program={program} expected={expected} actual={:?}",
                     receipt.get(key)
                 ));
             }
@@ -7815,6 +7874,95 @@ mod tests {
             )
             .is_err()
         );
+        assert_eq!(
+            completed_shard_memory_policy(
+                "lil",
+                COMPLETED_LIL_HEAD,
+                COMPLETED_LIL_MANIFEST,
+                "new-current-head",
+            ),
+            Ok(CompletedShardMemoryPolicy::Cgroup100GiB),
+        );
+        let &(legacy_program, legacy_head, legacy_manifest) = RETRY3_PREDECESSOR_SHARDS
+            .iter()
+            .find(|(program, _, _)| *program != "lil")
+            .unwrap();
+        assert_eq!(
+            completed_shard_memory_policy(
+                legacy_program,
+                legacy_head,
+                legacy_manifest,
+                "new-current-head",
+            ),
+            Ok(CompletedShardMemoryPolicy::LegacyUncapped),
+        );
+        assert_eq!(
+            completed_shard_memory_policy(
+                "heman",
+                "new-current-head",
+                "future-current-manifest",
+                "new-current-head",
+            ),
+            Ok(CompletedShardMemoryPolicy::Cgroup100GiB),
+        );
+        assert!(
+            completed_shard_memory_policy(
+                "lil",
+                COMPLETED_LIL_HEAD,
+                "wrong-manifest",
+                "new-current-head",
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    #[ignore = "lambda7 exact fourteen-shard typed-policy validation witness"]
+    fn all_fourteen_manifested_shards_validate_under_typed_policies() {
+        let run_root = PathBuf::from(
+            "/home/p51lee/dev/agent-worktrees/crat-a4-source-census-run-20260815-retry3-resume13-AYUuOKKP",
+        );
+        let input_root = PathBuf::from(
+            "/home/p51lee/dev/agent-worktrees/crat-a4-predicted-run-20260810/aggregate",
+        );
+        let input_path = input_root.join("combined.tsv");
+        let oracle_path = Path::new(
+            "/home/p51lee/dev/agent-worktrees/crat-a4-source-census-preserved-lil-20260812/partial.tsv",
+        );
+        let contract = MeasurementContract {
+            run_root: run_root.clone(),
+            input_root,
+            input: parse_a4_input(&input_path).unwrap(),
+            input_path,
+            programs: Vec::new(),
+            head: "post-empty-schema-head".to_owned(),
+            lil_oracle_partial: fs::read_to_string(oracle_path).unwrap(),
+        };
+        for &(program, _, expected_manifest) in &RETRY3_PREDECESSOR_SHARDS {
+            let dir = run_root.join("shards").join(program);
+            let manifest = verify_manifest(&dir).unwrap();
+            assert_eq!(manifest, expected_manifest, "{program} manifest drift");
+            let receipt = parse_receipt(&dir.join("receipt.txt")).unwrap();
+            validate_completed_receipt(&receipt, &contract, program, &manifest)
+                .unwrap_or_else(|error| panic!("{program} completed receipt: {error}"));
+            if program == "lil" {
+                let mut mutated = receipt.clone();
+                mutated.insert("memory_limit".to_owned(), "uncapped".to_owned());
+                assert!(
+                    validate_completed_receipt(&mutated, &contract, program, &manifest).is_err()
+                );
+            } else if program == "bst" {
+                let mut mutated = receipt.clone();
+                mutated.insert("memory_limit".to_owned(), "cgroup-100GiB".to_owned());
+                assert!(
+                    validate_completed_receipt(&mutated, &contract, program, &manifest).is_err()
+                );
+            }
+            validate_shard(&contract, program, &dir)
+                .unwrap_or_else(|error| panic!("{program} shard: {error}"));
+            validate_receipt_counts(&receipt, &dir)
+                .unwrap_or_else(|error| panic!("{program} receipt counts: {error}"));
+        }
     }
 
     #[test]
