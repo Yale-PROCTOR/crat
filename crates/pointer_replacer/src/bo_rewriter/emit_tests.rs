@@ -4509,3 +4509,61 @@ fn both_layers_emit_the_fabricated_const() {
          program:\n{span}"
     );
 }
+
+/// **CROSS-ARM PARITY — one function carrying BOTH a declaration edit and a
+/// fabricated seam.** The REARM obligation, discharged at fixture level.
+///
+/// The fabrication sweep made `multi_arm` nonzero for the first time:
+/// `rgba_from_hex_string` holds two subjects decided `ref` **and** both of
+/// rgba's fabricated seams, with zero reverts in that program — one function,
+/// two arms. The parked cross-arm parity obligation therefore REARMED.
+///
+/// **The p3 gate cannot see this.** It runs against a frozen oracle whose revert
+/// set predates fabrication and reverted exactly the functions fabrication
+/// unblocks, so its `multi_arm` is 0 by construction, not by measurement. A pin
+/// that cannot move is not a discharge.
+///
+/// Measured on rgba itself: the two layers are **byte-identical after canonical
+/// formatting** (86,458 bytes each, one const each). This fixture is the
+/// corpus-independent half of the same claim, so the obligation stays discharged
+/// when the corpus moves.
+#[test]
+fn a_function_carrying_both_arms_renders_identically_in_both_layers() {
+    const SRC: &str = "#![allow(dead_code, unused_unsafe, unused_mut, unused_variables)]\n\
+                       pub unsafe fn cx_sum(buf: *mut i32) -> i32 {\n\
+                       \x20   let mut s: i32 = 0;\n\
+                       \x20   let mut i: usize = 0;\n\
+                       \x20   while i < 4 { s += *buf.offset(i as isize); i += 1; }\n\
+                       \x20   s\n\
+                       }\n\
+                       pub unsafe fn cx_caller(p: *mut i32, out: *mut i32) -> i32 {\n\
+                       \x20   let t = cx_sum(p);\n\
+                       \x20   *out = t;\n\
+                       \x20   t\n\
+                       }\n";
+    let span = match super::rewrite_m1(SRC) {
+        super::RewriteOutcome::Emitted { source, .. } => source,
+        other => panic!("the span layer must emit: {other:?}"),
+    };
+    // ---- NON-VACUITY: the fixture must actually carry BOTH arms ----
+    //
+    // Without this the test would pass on a fixture where fabrication never
+    // fired, or where the caller kept every raw parameter — which is exactly
+    // the shape it exists to cover.
+    assert!(
+        span.contains("crate::SEAM_LEN_PLACEHOLDER"),
+        "arm 3 (a fabricated seam) must be present:\n{span}"
+    );
+    assert!(
+        span.contains("out: &mut i32"),
+        "arm 2 (a declaration edit) must be present IN THE CALLER, or this is \
+         not a cross-arm function:\n{span}"
+    );
+
+    let ast = super::ast_emitted_source_of(SRC).expect("the AST layer emits");
+    assert_eq!(
+        crate::bo_rewriter::goldens::canonicalize("span", &span),
+        crate::bo_rewriter::goldens::canonicalize("ast", &ast),
+        "the two layers must agree on a function that carries both arms"
+    );
+}

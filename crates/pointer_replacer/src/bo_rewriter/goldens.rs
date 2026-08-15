@@ -226,7 +226,7 @@ pub(super) const GOLDENS: &[Golden] = goldens![
 /// discovery that could differ between them. A formatter failure is surfaced,
 /// never swallowed: silently returning the input on error would let a
 /// malformed emission compare equal to a well-formed expectation.
-fn canonicalize(label: &str, src: &str) -> String {
+pub(super) fn canonicalize(label: &str, src: &str) -> String {
     let mut child = Command::new("rustfmt")
         .args(["--edition", "2021", "--emit", "stdout", "--quiet"])
         .stdin(Stdio::piped())

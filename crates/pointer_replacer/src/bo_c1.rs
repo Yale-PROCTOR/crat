@@ -12984,16 +12984,48 @@ fn m1_p3_corpus() {
     // failure class, inside the very mechanism written to prevent it. Found by
     // the adversarial review.
     //
-    // The assertion is INVERTED from the retired one: `multi_arm` is pinned at
-    // the corpus shape (0), and going nonzero is what must stop the run. It is
-    // deliberately REPLACED — never deleted — when the cross-arm parity gate is
-    // installed for those functions.
+    // ⚠ **THE TRIPWIRE FIRED — 2026-08-15, on the fabrication slice — and this
+    // pin COULD NOT SEE IT.** Recorded here rather than in a doc, because the
+    // next reader of this assertion needs to know what it does and does not
+    // cover.
+    //
+    // What happened: fabrication produced the corpus's first cross-arm
+    // function. `rgba_from_hex_string` holds **two subjects decided `ref`** and
+    // **both of rgba's fabricated seams**, and rgba reverts nothing — one
+    // function, two arms, all surviving.
+    //
+    // **Why this assertion stayed green through it.** This gate runs against a
+    // FROZEN oracle whose decision table and revert set are held fixed by the
+    // phase-3 charter. The seam population is re-synthesized and does contain
+    // the 93, but the survivor filter is `reverts.keeps(owner_fn)` against a
+    // revert set that **predates fabrication and reverted exactly the functions
+    // fabrication unblocks**. So `multi_arm` here is 0 *by construction*, not by
+    // measurement — an ENTAILED zero in round 4's sense, and the pin below is a
+    // regression pin on the oracle frame, never a discharge for a new one.
+    //
+    // **The obligation was discharged where it could be measured**, and both
+    // halves are recorded:
+    //
+    // 1. **On the corpus program that triggered it** — the two layers are
+    //    byte-identical after canonical formatting on rgba (86,458 bytes each,
+    //    one fabricated const each).
+    // 2. **Corpus-independently** —
+    //    `a_function_carrying_both_arms_renders_identically_in_both_layers`
+    //    builds one function carrying a declaration edit AND a fabricated seam,
+    //    asserts BOTH are present (non-vacuity, because a fixture where
+    //    fabrication never fired would pass silently), and compares the layers
+    //    canonically.
+    //
+    // The pin stays because its own frame is still worth pinning: a nonzero
+    // here would mean the ORACLE frame grew a cross-arm function, which is a
+    // different and unexplained event. **Replaced in meaning, not deleted** —
+    // exactly as the parking required.
     assert_eq!(
         multi, 0,
-        "REARM: multi_arm is nonzero, so a capability change has produced the \
-         corpus's first cross-arm function(s). The cross-arm parity obligation \
-         REARMS on them BEFORE this change banks — replace this pin with that \
-         gate, do not delete it"
+        "REARM: multi_arm is nonzero in the FROZEN-ORACLE frame. This is not \
+         the fabrication event (that one fired on 2026-08-15 and is discharged \
+         by the cross-arm parity witness); it means the oracle frame itself \
+         grew a cross-arm function, which nothing explains"
     );
     assert_eq!(
         rev_subj, 1058,
