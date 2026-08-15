@@ -13074,7 +13074,7 @@ fn m1_emit_corpus() {
             // machine makes and stays a recorded absence. A **panic** is the
             // program under test failing, and reading it as an absence is the
             // absence-as-observation class at sweep level.
-            if outcome.status.contains("panic") {
+            if status_is_failure(&outcome.status) {
                 failures.push(format!(
                     "{}: the worker PANICKED — a panic is a failure, not a \
                      deferral, and a sweep that reports it as a missing row is \
@@ -13194,21 +13194,19 @@ fn m1_emit_corpus() {
         // declaration with no reference is a dead item the derivation exists to
         // prevent. Two declarations would mean the insertion ran per file
         // rather than per crate.
-        match (
+        // Absent on a non-emitting program, which is legal.
+        if let (Some(d), Some(r)) = (
             row.get("fab_const_decl")
                 .and_then(|v| v.parse::<i64>().ok()),
             row.get("fab_const_ref").and_then(|v| v.parse::<i64>().ok()),
-        ) {
-            (Some(d), Some(r)) if d == i64::from(r > 0) => {}
-            (Some(d), Some(r)) => failures.push(format!(
+        ) && !const_delivery_holds(d, r)
+        {
+            failures.push(format!(
                 "{}: fab_const_decl={d} fab_const_ref={r} — the const must be \
                  declared exactly when a fabricated site names it, once per \
                  crate",
                 program.name
-            )),
-            // Absent on a non-emitting program, which is legal; absent on an
-            // emitting one is the counter having gone missing.
-            _ => {}
+            ));
         }
         rows.push(row);
     }
@@ -13233,6 +13231,67 @@ fn m1_emit_corpus() {
         failures.len(),
         failures.join("\n  ")
     );
+}
+
+/// **A panic is a failure; a resource deferral is an absence** (R8, 2026-08-15).
+///
+/// Lifted out of the sweep because a decision only a 600 s corpus run can
+/// exercise is a decision with no witness — and this one shipped for the whole
+/// milestone in its fail-open direction, letting four panicking programs leave
+/// `m1_emit_corpus` green.
+fn status_is_failure(status: &str) -> bool {
+    status.contains("panic")
+}
+
+/// **Declared iff referenced, exactly once** (R8, 2026-08-15).
+///
+/// `d` is how many times the emitted crate DECLARES the fabricated-extent
+/// const; `r` is how many times it NAMES it. Both directions are failures and
+/// they are different failures: a reference with no declaration is `E0433`, a
+/// declaration with no reference is the dead item the survivor-derivation
+/// exists to prevent, and two declarations mean the insertion ran per file
+/// instead of per crate.
+fn const_delivery_holds(d: i64, r: i64) -> bool {
+    d == i64::from(r > 0)
+}
+
+#[cfg(test)]
+mod fabrication_gate_witnesses {
+    use super::{const_delivery_holds, status_is_failure};
+
+    /// Both directions, because the fail-open one is what actually shipped.
+    #[test]
+    fn a_panic_is_a_failure_and_a_timeout_is_not() {
+        assert!(status_is_failure("panic"));
+        assert!(status_is_failure("orchestrator status=panic"));
+        // A resource deferral is a decision this machine makes, and stays a
+        // recorded absence rather than a failure.
+        assert!(!status_is_failure("timeout"));
+        assert!(!status_is_failure("memory-cap"));
+        assert!(!status_is_failure("ok"));
+    }
+
+    /// Every corner of the delivery rule, including the two that are the
+    /// mechanism's actual failure modes.
+    #[test]
+    fn the_const_is_declared_exactly_when_it_is_referenced() {
+        assert!(const_delivery_holds(0, 0), "no fabrication, no const");
+        assert!(const_delivery_holds(1, 1), "one site, one const");
+        assert!(const_delivery_holds(1, 40), "forty sites, still ONE const");
+        assert!(
+            !const_delivery_holds(0, 1),
+            "a reference with no declaration is E0433 in the emitted crate"
+        );
+        assert!(
+            !const_delivery_holds(1, 0),
+            "a declaration with no reference is the dead item the derivation \
+             exists to prevent"
+        );
+        assert!(
+            !const_delivery_holds(2, 5),
+            "two declarations mean the insertion ran per FILE, not per crate"
+        );
+    }
 }
 
 // Worker (one program, one mode, one process).
