@@ -1116,3 +1116,54 @@ fn reference_typed_params_are_collected_with_their_own_shape() {
         "degradation names the wrong subject: {hit:?}"
     );
 }
+
+/// **PHASE 5 — THE SWITCHOVER GATE.** The AST layer, measured at golden level.
+///
+/// The phase-3/4 gates compared the two layers per FUNCTION. This compares
+/// whole emitted PROGRAMS against the ratified expecteds, through the same
+/// rustfmt canonicalization the span-layer goldens use (2026-07-28 ruling).
+///
+/// **The claim it makes falsifiable:** on every golden the span layer emits
+/// correctly today, the AST layer emits the SAME program canonically. The
+/// standing red six are excluded by name — they fail on the span layer too, for
+/// capabilities that are ratified spec and deliberately unbuilt, so requiring
+/// them here would assert a capability rather than fidelity.
+#[test]
+fn the_ast_layer_reproduces_every_green_golden() {
+    // Pre-existing RED on the SPAN layer: g04/g05/g08 Box+drop, g06 move
+    // reroute, g07 non-dropping store, g18 reslice rebind (arm unbuilt).
+    const RED: &[&str] = &[
+        "g04_box_drop",
+        "g05_opt_box",
+        "g06_move_reroute",
+        "g07_nonDropping_store",
+        "g08_drop_all_paths",
+        "g18_reslice_rebind",
+    ];
+    let mut compared = 0usize;
+    let mut differing: Vec<&str> = Vec::new();
+    for g in GOLDENS {
+        if RED.contains(&g.name) {
+            continue;
+        }
+        let src = crate::bo_rewriter::ast_emitted_source_of(g.input)
+            .unwrap_or_else(|why| panic!("{}: AST layer declined to emit — {why}", g.name));
+        compared += 1;
+        if canonicalize("new", &src) != canonicalize("expected", g.expected) {
+            differing.push(g.name);
+        }
+    }
+    // **THE DENOMINATOR TRAVELS WITH THE COUNTER.** A zero-differing over a
+    // zero population is the shape phase 4 spent five rounds removing.
+    assert_eq!(
+        compared,
+        GOLDENS.len() - RED.len(),
+        "every non-red golden must be compared"
+    );
+    assert!(compared > 0, "the comparison population must be non-empty");
+    assert!(
+        differing.is_empty(),
+        "the AST layer diverges from the ratified expected on {} golden(s): {differing:?}",
+        differing.len()
+    );
+}

@@ -247,6 +247,28 @@ pub(crate) fn rewrite_m1(input: &str) -> RewriteOutcome {
     )
 }
 
+/// **THE SWITCHOVER ARTIFACT's string entry** — the AST layer, emitting a
+/// program.
+///
+/// The counterpart of [`rewrite_m1`] on the new layer. It runs no verify loop
+/// and no revert rounds: those live in `rewrite_core` around the SPAN layer, and
+/// phase 5's question is what the AST layer emits, not how the loop converges
+/// over it. Wiring the loop to this layer is the M1-close merge list's business.
+///
+/// ⚠ **ORDERING**: `ast_emitted_source` captures the AST as its first action,
+/// before `decide_table_with_ctx` touches HIR — the constraint `ast_bridge`'s
+/// module doc states. Nothing here may run a query ahead of it.
+#[cfg(test)]
+pub(crate) fn ast_emitted_source_of(input: &str) -> Result<String, String> {
+    match ::utils::compilation::run_compiler_on_input(
+        ::utils::compilation::str_to_input(input),
+        |tcx| ast_transform::ast_emitted_source(tcx).map(|(source, _stats)| source),
+    ) {
+        Ok(inner) => inner,
+        Err(why) => Err(format!("{why:?}")),
+    }
+}
+
 /// M1's **general** entry point: a crate rooted at `root`, rewritten into a temp
 /// copy and gated there.
 #[allow(

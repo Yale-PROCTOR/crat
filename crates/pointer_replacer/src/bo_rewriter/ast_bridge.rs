@@ -186,7 +186,6 @@ fn walk_items(items: &[rustc_ast::ptr::P<rustc_ast::Item>], tcx: TyCtxt<'_>, s: 
 /// whether or not the SPAN used to splice it is right — and it would have
 /// surfaced in phase 3 as an unexplained parity diff over every attributed
 /// function in the corpus.
-#[cfg(test)]
 pub(crate) fn item_span_with_attrs(item: &rustc_ast::Item) -> rustc_span::Span {
     let lo = item
         .attrs
@@ -358,7 +357,6 @@ pub(crate) struct SubstStats {
     pub span_starts_at_attr: usize,
 }
 
-#[cfg(test)]
 pub(crate) fn collect_fn_spans(
     items: &[rustc_ast::ptr::P<rustc_ast::Item>],
     out: &mut Vec<rustc_span::Span>,
@@ -382,13 +380,30 @@ pub(crate) fn collect_fn_spans(
 pub(crate) fn substituted_source(tcx: TyCtxt<'_>) -> Result<(String, SubstStats), String> {
     let mapped = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let krate = ::utils::ast::expanded_ast(tcx);
-        let mut spans = Vec::new();
-        collect_fn_spans(&krate.items, &mut spans);
-        let mut printed: Vec<(rustc_span::Span, String)> = Vec::new();
-        collect_fn_prints(&krate.items, &mut printed);
-        (spans, printed)
+        splice_fn_prints(tcx, &krate)
     }));
-    let (spans, printed) = mapped.map_err(|_| "AST capture panicked".to_owned())?;
+    mapped.map_err(|_| "AST capture panicked".to_owned())
+}
+
+/// **THE SWITCHOVER ARTIFACT'S PRINTER — one implementation, two krates.**
+///
+/// Extracted from [`substituted_source`] so the *transformed* krate can reach
+/// the same splice. The alternative was a second copy of this loop, which is the
+/// duplicate-implementation hazard phase 4 spent two rounds measuring.
+///
+/// Reprints every function through `pprust` and splices those reprints into the
+/// ORIGINAL file text. Two consequences follow from that and are load-bearing
+/// for the golden batch:
+///
+/// - text **outside** a function span survives **verbatim** (file-level
+///   comments, `extern` blocks, inner attributes);
+/// - text **inside** a function span is normalized, so comments in bodies are
+///   dropped by `pprust`.
+pub(crate) fn splice_fn_prints(tcx: TyCtxt<'_>, krate: &rustc_ast::Crate) -> (String, SubstStats) {
+    let mut spans = Vec::new();
+    collect_fn_spans(&krate.items, &mut spans);
+    let mut printed: Vec<(rustc_span::Span, String)> = Vec::new();
+    collect_fn_prints(&krate.items, &mut printed);
 
     let sm = tcx.sess.source_map();
     let mut s = SubstStats {
@@ -412,7 +427,7 @@ pub(crate) fn substituted_source(tcx: TyCtxt<'_>) -> Result<(String, SubstStats)
         .map(|sp| sm.lookup_source_file(sp.lo()))
         .filter(|f| f.src.is_some())
     else {
-        return Ok((String::new(), s));
+        return (String::new(), s);
     };
     let src = file.src.as_ref().expect("filtered").to_string();
     let base = file.start_pos;
@@ -441,10 +456,9 @@ pub(crate) fn substituted_source(tcx: TyCtxt<'_>) -> Result<(String, SubstStats)
             s.unrenderable += 1;
         }
     }
-    Ok((out, s))
+    (out, s)
 }
 
-#[cfg(test)]
 pub(crate) fn collect_fn_prints(
     items: &[rustc_ast::ptr::P<rustc_ast::Item>],
     out: &mut Vec<(rustc_span::Span, String)>,

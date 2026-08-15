@@ -1283,7 +1283,6 @@ pub(crate) fn arm1_population(tcx: rustc_middle::ty::TyCtxt<'_>) -> Result<RefDe
 /// claims must be refused **across** them, not within each. It does **not**
 /// catch containment — a contained declaration is a different node, legally
 /// claimed.
-#[cfg(test)]
 fn transform_inner(
     tcx: rustc_middle::ty::TyCtxt<'_>,
 ) -> Result<
@@ -1295,6 +1294,7 @@ fn transform_inner(
         usize,
         usize,
         SeamUseSurface,
+        rustc_ast::Crate,
     ),
     String,
 > {
@@ -1478,7 +1478,27 @@ fn transform_inner(
             use_contains_seam,
             partial: seam_use_partial,
         },
+        krate,
     ))
+}
+
+/// **THE SWITCHOVER ARTIFACT** — the AST layer, emitting.
+///
+/// Until now the AST layer computed statistics and threw its transformed krate
+/// away: `transform_inner` had three call sites and all three discarded it, so
+/// nothing anywhere produced a rewritten crate through this layer. The phase-3
+/// and phase-4 gates could compare it to the span layer per function; no caller
+/// could ASK IT FOR A PROGRAM.
+///
+/// This is that caller. It runs the same three passes the parity gates measured
+/// — `transform_inner`, unchanged — and hands the transformed krate to the same
+/// printer `substituted_source` uses, so the emitted text differs from the
+/// substrate in exactly the functions the transforms touched.
+pub(crate) fn ast_emitted_source(
+    tcx: rustc_middle::ty::TyCtxt<'_>,
+) -> Result<(String, super::ast_bridge::SubstStats), String> {
+    let (.., krate) = transform_inner(tcx)?;
+    Ok(super::ast_bridge::splice_fn_prints(tcx, &krate))
 }
 
 /// **ARM 1's TEXT DIFFERENTIAL** — the rendered declaration vs the span layer's
@@ -3439,6 +3459,9 @@ pub(crate) fn arms_full(
         use_key_collisions,
         decision_key_collisions,
         surface,
+        // The transformed krate — `arms_full` measures, it does not emit.
+        // `ast_emitted_source` is the caller that wants it.
+        _krate,
     ) = transform_inner(tcx)?;
     let (table, _ctx) = super::decide_table_with_ctx(tcx)?;
     let emission = super::emit_files(tcx, &table, &rustc_hash::FxHashSet::default())?;
