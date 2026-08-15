@@ -163,6 +163,21 @@ pub(super) const GOLDENS: &[Golden] = goldens![
     "g23_callsite_optional_wrap",
     "g24_callsite_slice_from_ref",
     "g25_callsite_slice_seam_len",
+    // **FABRICATED-LENGTH SLICE, ratification pending (2026-08-15).** `g26` is
+    // the next free number, record-checked rather than assumed: `g14`, `g15` and
+    // `g16` are ratified-and-allocated, `g19` is consumed-and-retired, and the
+    // registry holds 21 goldens over `g01`–`g13`, `g17`, `g18`, `g20`–`g25`.
+    //
+    // Its callee takes `*mut i32` and carries **no integer parameter at all**
+    // (`LenEvidence::None`), so no adjacency arm can license a companion and the
+    // FABRICATED arm is the only one that can fire — the shape the ruling's
+    // carve-out is about, chosen so the fixture cannot pass by accident through
+    // ruling B's licensed path.
+    //
+    // It pins three things no other golden can: that a fabricated site NAMES the
+    // extent rather than spelling `1024` inline, that the crate-level const is
+    // DECLARED (one per crate, at the root), and that the two together compile.
+    "g26_callsite_slice_seam_fabricated",
     // **g22 `callsite_reborrow_bridge` — PARKED 2026-08-09, deliberately NOT
     // authored. The NUMBER IS CONSUMED and must never be reallocated.**
     //
@@ -290,6 +305,10 @@ golden_test!(g22_callsite_reborrow_bridge, "g22_callsite_reborrow_bridge");
 golden_test!(g23_callsite_optional_wrap, "g23_callsite_optional_wrap");
 golden_test!(g24_callsite_slice_from_ref, "g24_callsite_slice_from_ref");
 golden_test!(g25_callsite_slice_seam_len, "g25_callsite_slice_seam_len");
+golden_test!(
+    g26_callsite_slice_seam_fabricated,
+    "g26_callsite_slice_seam_fabricated"
+);
 
 /// The canonicalizer must be a real normalizer, not a pass-through.
 ///
@@ -317,7 +336,7 @@ fn canonicalization_normalizes_whitespace() {
 fn every_golden_pair_is_present() {
     assert_eq!(
         GOLDENS.len(),
-        21,
+        22,
         "the M0.5 package specifies ten pairs; U-5 slice 1 transcribes g11/g12 \
          from the ratified §8 table, slice 3 transcribes g13, and 2b adds \
          g17/g18. g19 was added and RETIRED in the g16 slice — back to 15, with \
@@ -335,7 +354,16 @@ fn every_golden_pair_is_present() {
          \n\
          So 21 is 17 + 4, and g22 is one of the four rather than a number held \
          empty. A future count that moves without a ruling is still the event \
-         this assertion exists to catch."
+         this assertion exists to catch.\n\
+         \n\
+         **21 → 22 (2026-08-15): the fabricated-length slice's g26.** The pin \
+         fired on this change too, and correctly. `g26` is the NEXT FREE \
+         number, record-checked rather than assumed: `g14`/`g15`/`g16` are \
+         ratified-and-allocated with no fixtures, `g19` is \
+         consumed-and-retired, and `g22` is authored — reusing any of those \
+         gaps would collide with a ratified spec, which is exactly why the \
+         ruling said to record-check. It lands GREEN; the red set does not \
+         move and stays at six."
     );
     for g in GOLDENS {
         assert!(!g.input.trim().is_empty(), "{}: empty .input.rs", g.name);

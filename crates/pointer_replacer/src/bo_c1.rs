@@ -7444,7 +7444,25 @@ mod run {
                 let mut blocked: std::collections::BTreeMap<&str, usize> =
                     std::collections::BTreeMap::new();
                 let mut uncensused = 0usize;
+                // **The length arm, counted SEPARATELY** (ruling 2026-08-12,
+                // mandatory clause). A fabricated extent may never be blended
+                // into the licensed population, so it gets its own column
+                // beside the two adjacency arms rather than a share of theirs.
+                let mut len_arm: std::collections::BTreeMap<&str, usize> =
+                    std::collections::BTreeMap::new();
                 for line in tsv.lines().skip(1) {
+                    let cols: Vec<&str> = line.split('\t').collect();
+                    if cols.first() == Some(&"placed")
+                        && let Some(arm) = cols.get(4)
+                        && let Some(key) = match *arm {
+                            "len-following" => Some("seam_len_following"),
+                            "len-preceding" => Some("seam_len_preceding"),
+                            "len-fabricated" => Some("seam_len_fabricated"),
+                            _ => None,
+                        }
+                    {
+                        *len_arm.entry(key).or_default() += 1;
+                    }
                     let mut f = line.split('\t');
                     match (f.next(), f.next(), f.next()) {
                         (Some("placed"), _, Some("safe")) => placed_safe += 1,
@@ -7501,6 +7519,16 @@ mod run {
                     "seam_unnameable_operand",
                 ] {
                     row.set(key, blocked.get(key).copied().unwrap_or(0));
+                }
+                // Exhaustive for the same reason: a fabricated population that
+                // stopped being produced would otherwise report as an ABSENT
+                // key, which joins identically to a measured zero.
+                for key in [
+                    "seam_len_following",
+                    "seam_len_preceding",
+                    "seam_len_fabricated",
+                ] {
+                    row.set(key, len_arm.get(key).copied().unwrap_or(0));
                 }
             }
             Ok(Err(why)) => row.set("seam_status", super::report::sanitize(&why)),
