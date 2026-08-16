@@ -1365,6 +1365,13 @@ struct StaticDataDerivation {
     depth_offset: i16,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StaticDataSourceResolution {
+    Untracked,
+    NonProvenanceStaticScalarLoad,
+    Provenance(StaticDataDerivation),
+}
+
 fn static_data_derivation_for_place(
     derivations: &FxHashMap<Local, StaticDataDerivation>,
     place: Place<'_>,
@@ -1397,6 +1404,31 @@ fn static_data_derivation_for_place(
         }
     }
     Ok(Some(derivation))
+}
+
+fn resolve_static_data_source<'tcx>(
+    derivations: &FxHashMap<Local, StaticDataDerivation>,
+    source_place: Place<'_>,
+    source_ty: Ty<'tcx>,
+    target_ty: Ty<'tcx>,
+    creates_pointer_to_place: bool,
+) -> Result<StaticDataSourceResolution, String> {
+    if !creates_pointer_to_place
+        && source_ty == target_ty
+        && matches!(
+            source_ty.kind(),
+            TyKind::Bool | TyKind::Char | TyKind::Int(_) | TyKind::Uint(_) | TyKind::Float(_)
+        )
+        && derivations.contains_key(&source_place.local)
+    {
+        return Ok(StaticDataSourceResolution::NonProvenanceStaticScalarLoad);
+    }
+    Ok(
+        match static_data_derivation_for_place(derivations, source_place)? {
+            Some(derivation) => StaticDataSourceResolution::Provenance(derivation),
+            None => StaticDataSourceResolution::Untracked,
+        },
+    )
 }
 
 fn insert_static_data_derivation(
@@ -1457,10 +1489,16 @@ fn derive_static_data_locals<'tcx>(
                 let Some((source_place, creates_pointer_to_place)) = source else {
                     continue;
                 };
-                let Some(mut derivation) =
-                    static_data_derivation_for_place(&derivations, source_place)?
-                else {
-                    continue;
+                let mut derivation = match resolve_static_data_source(
+                    &derivations,
+                    source_place,
+                    source_place.ty(body, tcx).ty,
+                    lhs.ty(body, tcx).ty,
+                    creates_pointer_to_place,
+                )? {
+                    StaticDataSourceResolution::Untracked
+                    | StaticDataSourceResolution::NonProvenanceStaticScalarLoad => continue,
+                    StaticDataSourceResolution::Provenance(derivation) => derivation,
                 };
                 if creates_pointer_to_place {
                     derivation.depth_offset -= 1;
@@ -10145,6 +10183,69 @@ mod tests {
                         .collect::<Vec<_>>()
                 ),
                 PrimaryClass::Unresolved
+            );
+        })
+        .unwrap_or_else(|error| error.raise());
+    }
+
+    #[test]
+    fn static_primitive_scalar_loads_do_not_propagate_pointer_provenance() {
+        let source = r#"
+            struct Table {
+                values: [u32; 4],
+            }
+
+            struct Timespec {
+                tv_sec: i64,
+                tv_nsec: i64,
+            }
+
+            struct Metadata {
+                atime: Timespec,
+            }
+
+            static mut TABLE: Table = Table { values: [0; 4] };
+            static mut METADATA: Metadata = Metadata {
+                atime: Timespec {
+                    tv_sec: 0,
+                    tv_nsec: 0,
+                },
+            };
+
+            pub unsafe fn primitive_array_scalar(index: usize) -> u32 {
+                let table = &raw mut TABLE;
+                (*table).values[index]
+            }
+
+            pub unsafe fn nested_static_scalar() -> i64 {
+                let metadata = &raw mut METADATA;
+                (*metadata).atime.tv_sec
+            }
+        "#;
+        ::utils::compilation::run_compiler_on_str(source, |tcx| {
+            let program = super::super::collect_program(tcx);
+            let derive = |suffix: &str| {
+                let function = program
+                    .functions
+                    .iter()
+                    .copied()
+                    .find(|function| tcx.def_path_str(*function).ends_with(suffix))
+                    .unwrap_or_else(|| panic!("fixture function missing: {suffix}"));
+                let body_ref = tcx
+                    .mir_drops_elaborated_and_const_checked(function)
+                    .borrow();
+                derive_static_data_locals(tcx, function, &body_ref)
+            };
+
+            let array = derive("primitive_array_scalar");
+            let nested = derive("nested_static_scalar");
+            let array_is_terminal =
+                matches!(&array, Ok(derivations) if !derivations.contains_key(&RETURN_PLACE));
+            let nested_is_terminal =
+                matches!(&nested, Ok(derivations) if !derivations.contains_key(&RETURN_PLACE));
+            assert!(
+                array_is_terminal && nested_is_terminal,
+                "static primitive scalar loads must terminate outside pointer provenance: array={array:?}; nested={nested:?}"
             );
         })
         .unwrap_or_else(|error| error.raise());
