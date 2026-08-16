@@ -4,10 +4,12 @@
 //! analysis and rewriter behavior do not depend on it.
 
 use std::{
+    cell::RefCell,
     collections::{BTreeMap, BTreeSet, VecDeque},
     ffi::OsString,
     fs,
     io::{BufRead, BufReader, BufWriter, Write},
+    panic::{self, AssertUnwindSafe},
     path::{Path, PathBuf},
     process::{Command, Stdio},
     sync::atomic::{AtomicU64, Ordering},
@@ -1329,31 +1331,44 @@ fn constant_static_target(tcx: TyCtxt<'_>, operand: &Operand<'_>) -> Option<DefI
 
 fn static_pointer_locals(
     tcx: TyCtxt<'_>,
+    fn_did: LocalDefId,
     body: &Body<'_>,
 ) -> Result<FxHashMap<Local, DefId>, String> {
     let mut statics = FxHashMap::default();
-    for statement in body.basic_blocks.iter().flat_map(|data| &data.statements) {
-        let Some((local, static_did)) = (|| {
-            let StatementKind::Assign(box (lhs, rvalue)) = &statement.kind else {
-                return None;
+    for (bb, data) in body.basic_blocks.iter_enumerated() {
+        for (statement_index, statement) in data.statements.iter().enumerate() {
+            let Some((local, static_did)) = (|| {
+                let StatementKind::Assign(box (lhs, rvalue)) = &statement.kind else {
+                    return None;
+                };
+                let local = lhs.as_local()?;
+                let operand = match rvalue {
+                    Rvalue::Use(operand) | Rvalue::Cast(_, operand, _) => operand,
+                    _ => return None,
+                };
+                constant_static_target(tcx, operand).map(|static_did| (local, static_did))
+            })() else {
+                continue;
             };
-            let local = lhs.as_local()?;
-            let operand = match rvalue {
-                Rvalue::Use(operand) | Rvalue::Cast(_, operand, _) => operand,
-                _ => return None,
-            };
-            constant_static_target(tcx, operand).map(|static_did| (local, static_did))
-        })() else {
-            continue;
-        };
-        if let Some(previous) = statics.insert(local, static_did)
-            && previous != static_did
-        {
-            return Err(format!(
-                "one MIR local carries multiple static identities: {local:?} {} {}",
-                tcx.def_path_str(previous),
-                tcx.def_path_str(static_did)
-            ));
+            if let Some(&previous) = statics.get(&local)
+                && previous != static_did
+            {
+                let error = format!(
+                    "one MIR local carries multiple static identities: {local:?} {} {}",
+                    tcx.def_path_str(previous),
+                    tcx.def_path_str(static_did)
+                );
+                if record_graph_shape_gap(GraphShapeGap {
+                    kind: "multiple-static-seed-identities",
+                    function: tcx.def_path_str(fn_did.to_def_id()),
+                    site: format!("bb{}[{statement_index}] {local:?}", bb.index()),
+                    detail: error.clone(),
+                }) {
+                    continue;
+                }
+                return Err(error);
+            }
+            statics.insert(local, static_did);
         }
     }
     Ok(statics)
@@ -1363,6 +1378,66 @@ fn static_pointer_locals(
 struct StaticDataDerivation {
     static_did: DefId,
     depth_offset: i16,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct GraphShapeGap {
+    kind: &'static str,
+    function: String,
+    site: String,
+    detail: String,
+}
+
+thread_local! {
+    static GRAPH_SHAPE_GAPS: RefCell<Option<BTreeSet<GraphShapeGap>>> = const {
+        RefCell::new(None)
+    };
+}
+
+fn record_graph_shape_gap(gap: GraphShapeGap) -> bool {
+    GRAPH_SHAPE_GAPS.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        let Some(gaps) = slot.as_mut() else {
+            return false;
+        };
+        gaps.insert(gap);
+        true
+    })
+}
+
+fn collect_source_graph_shape_gaps(tcx: TyCtxt<'_>) -> Vec<GraphShapeGap> {
+    GRAPH_SHAPE_GAPS.with(|slot| {
+        assert!(slot.borrow_mut().replace(BTreeSet::new()).is_none());
+    });
+    let result = panic::catch_unwind(AssertUnwindSafe(|| {
+        let program = collect_program(tcx);
+        let slots = CrateSlots::build(&program);
+        let _graph = build_source_graph(tcx, &slots, &BoExport::default());
+    }));
+    if let Err(payload) = result {
+        let detail = payload
+            .downcast_ref::<String>()
+            .cloned()
+            .or_else(|| {
+                payload
+                    .downcast_ref::<&str>()
+                    .map(|value| (*value).to_owned())
+            })
+            .unwrap_or_else(|| "non-string graph-construction panic".to_owned());
+        assert!(record_graph_shape_gap(GraphShapeGap {
+            kind: "other-graph-construction-stop",
+            function: "crate".to_owned(),
+            site: "graph-construction".to_owned(),
+            detail,
+        }));
+    }
+    GRAPH_SHAPE_GAPS.with(|slot| {
+        slot.borrow_mut()
+            .take()
+            .expect("shape-gap collection must remain active")
+            .into_iter()
+            .collect()
+    })
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1448,12 +1523,73 @@ fn insert_static_data_derivation(
     }
 }
 
+fn insert_static_data_derivation_or_record_gap(
+    tcx: TyCtxt<'_>,
+    fn_did: LocalDefId,
+    site: String,
+    derivations: &mut FxHashMap<Local, StaticDataDerivation>,
+    local: Local,
+    derivation: StaticDataDerivation,
+) -> Result<bool, String> {
+    match insert_static_data_derivation(derivations, local, derivation) {
+        Ok(changed) => Ok(changed),
+        Err(error) => {
+            let previous = derivations[&local];
+            let kind = if previous.static_did == derivation.static_did {
+                "conflicting-static-depth-merge"
+            } else {
+                "multi-static-identity-merge"
+            };
+            let detail = format!(
+                "local={local:?} previous={}@{} incoming={}@{}",
+                tcx.def_path_str(previous.static_did),
+                previous.depth_offset,
+                tcx.def_path_str(derivation.static_did),
+                derivation.depth_offset,
+            );
+            if record_graph_shape_gap(GraphShapeGap {
+                kind,
+                function: tcx.def_path_str(fn_did.to_def_id()),
+                site,
+                detail,
+            }) {
+                Ok(false)
+            } else {
+                Err(error)
+            }
+        }
+    }
+}
+
+fn record_static_data_resolution_gap(
+    tcx: TyCtxt<'_>,
+    fn_did: LocalDefId,
+    site: String,
+    error: String,
+) -> Result<(), String> {
+    let kind = if error.starts_with("unsupported static-data projection") {
+        "unsupported-static-data-projection"
+    } else {
+        "other-graph-construction-stop"
+    };
+    if record_graph_shape_gap(GraphShapeGap {
+        kind,
+        function: tcx.def_path_str(fn_did.to_def_id()),
+        site,
+        detail: error.clone(),
+    }) {
+        Ok(())
+    } else {
+        Err(error)
+    }
+}
+
 fn derive_static_data_locals<'tcx>(
     tcx: TyCtxt<'tcx>,
     fn_did: LocalDefId,
     body: &Body<'tcx>,
 ) -> Result<FxHashMap<Local, StaticDataDerivation>, String> {
-    let mut derivations = static_pointer_locals(tcx, body)?
+    let mut derivations = static_pointer_locals(tcx, fn_did, body)?
         .into_iter()
         .map(|(local, static_did)| {
             (
@@ -1467,8 +1603,8 @@ fn derive_static_data_locals<'tcx>(
         .collect::<FxHashMap<_, _>>();
     loop {
         let mut changed = false;
-        for data in body.basic_blocks.iter() {
-            for statement in &data.statements {
+        for (bb, data) in body.basic_blocks.iter_enumerated() {
+            for (statement_index, statement) in data.statements.iter().enumerate() {
                 let StatementKind::Assign(box (lhs, rvalue)) = &statement.kind else {
                     continue;
                 };
@@ -1489,13 +1625,25 @@ fn derive_static_data_locals<'tcx>(
                 let Some((source_place, creates_pointer_to_place)) = source else {
                     continue;
                 };
-                let mut derivation = match resolve_static_data_source(
+                let resolution = match resolve_static_data_source(
                     &derivations,
                     source_place,
                     source_place.ty(body, tcx).ty,
                     lhs.ty(body, tcx).ty,
                     creates_pointer_to_place,
-                )? {
+                ) {
+                    Ok(resolution) => resolution,
+                    Err(error) => {
+                        record_static_data_resolution_gap(
+                            tcx,
+                            fn_did,
+                            format!("bb{}[{statement_index}] {target_local:?}", bb.index()),
+                            error,
+                        )?;
+                        continue;
+                    }
+                };
+                let mut derivation = match resolution {
                     StaticDataSourceResolution::Untracked
                     | StaticDataSourceResolution::NonProvenanceStaticScalarLoad => continue,
                     StaticDataSourceResolution::Provenance(derivation) => derivation,
@@ -1505,8 +1653,14 @@ fn derive_static_data_locals<'tcx>(
                 } else if source_place.ty(body, tcx).ty != lhs.ty(body, tcx).ty {
                     continue;
                 }
-                changed |=
-                    insert_static_data_derivation(&mut derivations, target_local, derivation)?;
+                changed |= insert_static_data_derivation_or_record_gap(
+                    tcx,
+                    fn_did,
+                    format!("bb{}[{statement_index}] {target_local:?}", bb.index()),
+                    &mut derivations,
+                    target_local,
+                    derivation,
+                )?;
             }
 
             let Some(call) = harness_call(tcx, data.terminator()) else {
@@ -1532,24 +1686,54 @@ fn derive_static_data_locals<'tcx>(
             ) {
                 continue;
             }
-            let Some(derivation) = static_data_derivation_for_place(&derivations, source_place)?
-            else {
-                continue;
+            let derivation = match static_data_derivation_for_place(&derivations, source_place) {
+                Ok(Some(derivation)) => derivation,
+                Ok(None) => continue,
+                Err(error) => {
+                    record_static_data_resolution_gap(
+                        tcx,
+                        fn_did,
+                        format!("bb{}[term] {target_local:?}", bb.index()),
+                        error,
+                    )?;
+                    continue;
+                }
             };
-            changed |= insert_static_data_derivation(&mut derivations, target_local, derivation)?;
+            changed |= insert_static_data_derivation_or_record_gap(
+                tcx,
+                fn_did,
+                format!("bb{}[term] {target_local:?}", bb.index()),
+                &mut derivations,
+                target_local,
+                derivation,
+            )?;
         }
         if !changed {
             break;
         }
     }
-    if derivations
-        .values()
-        .any(|derivation| derivation.depth_offset < -1)
-    {
-        return Err(format!(
-            "invalid static-data depth offset in {}",
-            tcx.def_path_str(fn_did)
-        ));
+    let invalid = derivations
+        .iter()
+        .filter(|(_, derivation)| derivation.depth_offset < -1)
+        .map(|(&local, &derivation)| (local, derivation))
+        .collect::<Vec<_>>();
+    if !invalid.is_empty() {
+        let collected = invalid.iter().all(|(local, derivation)| {
+            record_graph_shape_gap(GraphShapeGap {
+                kind: "invalid-static-depth",
+                function: tcx.def_path_str(fn_did.to_def_id()),
+                site: format!("{local:?}"),
+                detail: format!("depth_offset={}", derivation.depth_offset),
+            })
+        });
+        if collected {
+            derivations.retain(|_, derivation| derivation.depth_offset >= -1);
+        } else {
+            return Err(format!(
+                "invalid static-data depth offset in {}",
+                tcx.def_path_str(fn_did)
+            ));
+        }
     }
     Ok(derivations)
 }
@@ -1853,7 +2037,7 @@ fn collect_indirect_call_resolutions<'tcx>(
             let body_ref = tcx
                 .mir_drops_elaborated_and_const_checked(function)
                 .borrow();
-            let statics = static_pointer_locals(tcx, &body_ref).unwrap_or_else(|error| {
+            let statics = static_pointer_locals(tcx, function, &body_ref).unwrap_or_else(|error| {
                 panic!(
                     "A4C STOP phase=graph-construction candidate=none: static target identity in {}: {error}",
                     tcx.def_path_str(function)
@@ -3372,7 +3556,58 @@ fn replay_none_disposition(reason_unknown: Option<String>) -> Result<&'static st
     }
 }
 
+const GRAPH_SHAPE_HEADER: &str = "program\tkind\tfunction\tsite\tdetail";
+
+fn render_graph_shape_gaps(program: &str, gaps: &[GraphShapeGap]) -> String {
+    let mut out = format!("{GRAPH_SHAPE_HEADER}\n");
+    for gap in gaps {
+        out.push_str(&format!(
+            "{}\t{}\t{}\t{}\t{}\n",
+            clean_cell(program),
+            gap.kind,
+            clean_cell(&gap.function),
+            clean_cell(&gap.site),
+            clean_cell(&gap.detail),
+        ));
+    }
+    out
+}
+
+fn run_shape_census_worker(tcx: TyCtxt<'_>, t_tcx: Duration) -> Row {
+    let started = Instant::now();
+    let program = std::env::var("CRAT_BOC1_NAME").expect("shape-census worker program name");
+    let output =
+        PathBuf::from(std::env::var_os("CRAT_A4_SHAPE_ROWS").expect("shape-census rows output"));
+    let checkpoint = PathBuf::from(
+        std::env::var_os("CRAT_A4_SHAPE_CHECKPOINT").expect("shape-census checkpoint output"),
+    );
+    emit_phase(started, "shape-graph-construction", None, 0);
+    let gaps = collect_source_graph_shape_gaps(tcx);
+    let rendered = render_graph_shape_gaps(&program, &gaps);
+    write_atomic_checkpoint(&checkpoint, &rendered)
+        .unwrap_or_else(|error| panic!("A4C STOP phase=shape-checkpoint candidate=none: {error}"));
+    emit_phase(started, "shape-checkpoint-written", None, gaps.len());
+    write_atomic_checkpoint(&output, &rendered)
+        .unwrap_or_else(|error| panic!("A4C STOP phase=shape-finalize candidate=none: {error}"));
+    emit_phase(started, "shape-complete", None, gaps.len());
+
+    let mut row = Row::default();
+    row.set("program", program);
+    row.set("shape_count", gaps.len());
+    row.set("candidate_processing", "false");
+    row.set("t_tcx_s", format!("{:.3}", t_tcx.as_secs_f64()));
+    row.set("status", "ok");
+    row.set(
+        "t_total_s",
+        format!("{:.3}", started.elapsed().as_secs_f64()),
+    );
+    row
+}
+
 pub(super) fn run_worker(tcx: TyCtxt<'_>, t_tcx: Duration) -> Row {
+    if std::env::var("CRAT_A4_SOURCE_SHAPE_CENSUS").as_deref() == Ok("1") {
+        return run_shape_census_worker(tcx, t_tcx);
+    }
     let started = Instant::now();
     let program_name = std::env::var("CRAT_BOC1_NAME").expect("source-census worker program name");
     let input_path =
@@ -3787,6 +4022,8 @@ const PLATFORM: &str = "linux-x86_64";
 const LIVENESS_BOUND_S: u64 = 14_400;
 const CANDIDATE_MEMORY_MAX_BYTES: u64 = 100 * 1024 * 1024 * 1024;
 const HOST_MEMORY_MARGIN_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+const GRAPH_SHAPE_CENSUS_SCOPE: [(&str, usize); 3] =
+    [("bzip2", 23), ("brotli", 112), ("lodepng", 31)];
 const LIL_ORACLE_PARTIAL_SHA256: &str =
     "86c9e73d0e419a08e04c6ff3ac91531d948cbc31a8acb80d9c5f7cd238587feb";
 const RATIFIED_TYPED_EXCLUSION_PROGRAM: &str = "lil";
@@ -7512,6 +7749,326 @@ fn aggregate(contract: &MeasurementContract) {
     );
 }
 
+#[derive(Clone, Debug)]
+struct GraphShapeProgramRecord {
+    program: String,
+    units_covered: usize,
+    shape_count: usize,
+    manifest: String,
+    wall_s: f64,
+    memory_peaks: CandidateMemoryPeaks,
+}
+
+fn parse_graph_shape_rows(
+    path: &Path,
+    expected_program: &str,
+) -> Result<Vec<GraphShapeGap>, String> {
+    let registered = BTreeSet::from([
+        "multiple-static-seed-identities",
+        "multi-static-identity-merge",
+        "conflicting-static-depth-merge",
+        "unsupported-static-data-projection",
+        "invalid-static-depth",
+        "other-graph-construction-stop",
+    ]);
+    let rows = parse_table(path, GRAPH_SHAPE_HEADER, 5)?;
+    let mut seen = BTreeSet::new();
+    let mut gaps = Vec::with_capacity(rows.len());
+    for row in rows {
+        if row[0] != expected_program {
+            return Err(format!(
+                "shape program drift: expected={expected_program} actual={}",
+                row[0]
+            ));
+        }
+        if !registered.contains(row[1].as_str()) {
+            return Err(format!("unregistered shape kind: {}", row[1]));
+        }
+        let gap = GraphShapeGap {
+            kind: registered
+                .get(row[1].as_str())
+                .copied()
+                .expect("registered shape kind"),
+            function: row[2].clone(),
+            site: row[3].clone(),
+            detail: row[4].clone(),
+        };
+        if !seen.insert(gap.clone()) {
+            return Err(format!("duplicate exact shape row: {gap:?}"));
+        }
+        gaps.push(gap);
+    }
+    Ok(gaps)
+}
+
+fn render_graph_shape_program_checkpoint(records: &[GraphShapeProgramRecord]) -> String {
+    let mut out = "measurement_class=shape-only\nsemantic_data=false\ncandidate_processing=false\n\nprogram\tunits_covered\tshape_count\tmanifest_sha256\twall_s\tpeak_rss_kb\tcgroup_peak_memory_kb\n".to_owned();
+    for record in records {
+        out.push_str(&format!(
+            "{}\t{}\t{}\t{}\t{:.3}\t{}\t{}\n",
+            record.program,
+            record.units_covered,
+            record.shape_count,
+            record.manifest,
+            record.wall_s,
+            record.memory_peaks.process_peak_rss_kb,
+            record.memory_peaks.cgroup_peak_memory_kb,
+        ));
+    }
+    out
+}
+
+fn run_graph_shape_census(contract: &MeasurementContract) {
+    use super::orchestrate::workspace_root;
+
+    let root = contract.run_root.join("shape-census");
+    assert!(
+        !root.exists(),
+        "A4C STOP phase=shape-setup candidate=none: shape-census directory must be fresh"
+    );
+    fs::create_dir(&root).expect("create shape-census directory");
+    let mut records = Vec::new();
+    let mut all_gaps = Vec::<(String, GraphShapeGap)>::new();
+
+    for &(program_name, units_covered) in &GRAPH_SHAPE_CENSUS_SCOPE {
+        let actual_units = isolated_identities(contract, program_name).len();
+        assert_eq!(
+            actual_units, units_covered,
+            "A4C STOP phase=shape-scope candidate={program_name}: unit denominator drift"
+        );
+        let program = contract
+            .programs
+            .iter()
+            .copied()
+            .find(|program| program.name == program_name)
+            .expect("shape-census program in measurement contract");
+        let dir = root.join(program_name);
+        fs::create_dir(&dir).expect("create shape program directory");
+        let preflight = fs::read_to_string("/proc/meminfo")
+            .map(|meminfo| evaluate_host_memory_preflight(&meminfo))
+            .unwrap_or_else(|error| HostMemoryPreflight {
+                mem_available_bytes: None,
+                required_bytes: CANDIDATE_MEMORY_MAX_BYTES + HOST_MEMORY_MARGIN_BYTES,
+                status: "host-memory-unavailable",
+                error: Some(format!("read /proc/meminfo: {error}")),
+            });
+        let timestamp_unix_s = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock before Unix epoch")
+            .as_secs();
+        fs::write(
+            dir.join("memory-preflight.txt"),
+            preflight.render(program_name, "shape-census", timestamp_unix_s),
+        )
+        .expect("write shape memory preflight");
+        if !preflight.launch_allowed() {
+            let manifest = write_manifest(&dir, &["memory-preflight.txt"])
+                .expect("manifest failed shape preflight");
+            panic!(
+                "A4C STOP phase=shape-memory-preflight candidate={program_name} status={} mem_available_bytes={} required_bytes={} measurement_started=false manifest={manifest}",
+                preflight.status,
+                preflight.mem_available_bytes.unwrap_or(0),
+                preflight.required_bytes,
+            );
+        }
+
+        let input = workspace_root()
+            .join("benchmarks/rs-crown-derived")
+            .join(program.name)
+            .join(program.lib_root);
+        let outcome = run_capped_candidate_child(
+            program_name,
+            &input,
+            &dir,
+            &[
+                ("CRAT_A4_SOURCE_SHAPE_CENSUS", "1".to_owned()),
+                (
+                    "CRAT_A4_SHAPE_ROWS",
+                    dir.join("shapes.tsv").display().to_string(),
+                ),
+                (
+                    "CRAT_A4_SHAPE_CHECKPOINT",
+                    dir.join("checkpoint.tsv").display().to_string(),
+                ),
+            ],
+        );
+        if outcome.status != "ok" {
+            let (phase, marker_candidate) = last_phase(&outcome.stderr);
+            let oom_killer = if outcome.oom_kills > 0 {
+                "kernel-oom-killer"
+            } else {
+                "none"
+            };
+            let receipt = format!(
+                "machine_id={MACHINE_ID}\nplatform={PLATFORM}\nmeasurement_class=shape-only\nsemantic_data=false\ncompleted=false\ncandidate_processing=false\nmemory_limit=cgroup-100GiB\nmemory_max_bytes={CANDIDATE_MEMORY_MAX_BYTES}\ncap_verified={}\noom_kills={}\nmemory_max_events={}\noom_killer={oom_killer}\nwall_bound_kind=liveness\nwall_cap_s={LIVENESS_BOUND_S}\nprogram={program_name}\nunits_covered={units_covered}\nstatus={}\nanalysis_head={}\nlast_phase={phase}\nlast_candidate={marker_candidate}\nwall_s={:.3}\n{}memory_receipt_error={}\n",
+                outcome.cap_verified,
+                outcome.oom_kills,
+                outcome.memory_max_events,
+                outcome.status,
+                contract.head,
+                outcome.wall_s,
+                outcome.memory_receipt.render(),
+                clean_cell(outcome.memory_receipt_error.as_deref().unwrap_or("none")),
+            );
+            fs::write(dir.join("receipt.txt"), receipt).expect("write failed shape receipt");
+            let mut files = vec![
+                "memory-preflight.txt",
+                "receipt.txt",
+                "worker.out",
+                "worker.err",
+                "time.txt",
+            ];
+            for file in ["shapes.tsv", "checkpoint.tsv"] {
+                if dir.join(file).is_file() {
+                    files.push(file);
+                }
+            }
+            let manifest = write_manifest(&dir, &files).expect("manifest failed shape worker");
+            panic!(
+                "A4C STOP phase={phase} candidate={program_name} measurement=shape-only status={} wall_s={:.3} manifest={manifest}",
+                outcome.status, outcome.wall_s,
+            );
+        }
+        let memory_peaks = outcome
+            .memory_receipt
+            .require_complete()
+            .expect("completed shape worker requires both memory metrics");
+        assert_eq!(
+            fs::read(dir.join("shapes.tsv")).expect("read shape rows"),
+            fs::read(dir.join("checkpoint.tsv")).expect("read shape checkpoint"),
+            "A4C STOP phase=shape-finalize candidate={program_name}: checkpoint byte drift"
+        );
+        let gaps =
+            parse_graph_shape_rows(&dir.join("shapes.tsv"), program_name).unwrap_or_else(|error| {
+                panic!("A4C STOP phase=shape-schema candidate={program_name}: {error}")
+            });
+        let receipt = format!(
+            "machine_id={MACHINE_ID}\nplatform={PLATFORM}\nmeasurement_class=shape-only\nsemantic_data=false\ncompleted=true\ncandidate_processing=false\nmemory_limit=cgroup-100GiB\nmemory_max_bytes={CANDIDATE_MEMORY_MAX_BYTES}\ncap_verified={}\noom_kills={}\nmemory_max_events={}\noom_killer=none\nwall_bound_kind=liveness\nwall_cap_s={LIVENESS_BOUND_S}\nprogram={program_name}\nunits_covered={units_covered}\nshape_count={}\nstatus=ok\nanalysis_head={}\nwall_s={:.3}\n{}memory_receipt_error=none\n",
+            outcome.cap_verified,
+            outcome.oom_kills,
+            outcome.memory_max_events,
+            gaps.len(),
+            contract.head,
+            outcome.wall_s,
+            render_candidate_memory_receipt(memory_peaks),
+        );
+        fs::write(dir.join("receipt.txt"), receipt).expect("write completed shape receipt");
+        let manifest = write_manifest(
+            &dir,
+            &[
+                "checkpoint.tsv",
+                "memory-preflight.txt",
+                "receipt.txt",
+                "shapes.tsv",
+                "time.txt",
+                "worker.err",
+                "worker.out",
+            ],
+        )
+        .expect("manifest completed shape worker");
+        all_gaps.extend(gaps.into_iter().map(|gap| (program_name.to_owned(), gap)));
+        records.push(GraphShapeProgramRecord {
+            program: program_name.to_owned(),
+            units_covered,
+            shape_count: all_gaps
+                .iter()
+                .filter(|(program, _)| program == program_name)
+                .count(),
+            manifest,
+            wall_s: outcome.wall_s,
+            memory_peaks,
+        });
+        write_atomic_checkpoint(
+            &root.join("partial.tsv"),
+            &render_graph_shape_program_checkpoint(&records),
+        )
+        .expect("write shape controller checkpoint");
+    }
+
+    assert_eq!(
+        records
+            .iter()
+            .map(|record| record.units_covered)
+            .sum::<usize>(),
+        166,
+        "A4C STOP phase=shape-scope candidate=none: total unit denominator drift"
+    );
+    let mut shapes = format!("{GRAPH_SHAPE_HEADER}\n");
+    for (program, gap) in &all_gaps {
+        shapes.push_str(&format!(
+            "{}\t{}\t{}\t{}\t{}\n",
+            program,
+            gap.kind,
+            clean_cell(&gap.function),
+            clean_cell(&gap.site),
+            clean_cell(&gap.detail),
+        ));
+    }
+    write_atomic_checkpoint(&root.join("shapes.tsv"), &shapes).expect("write combined shape rows");
+    let scope = render_graph_shape_program_checkpoint(&records);
+    write_atomic_checkpoint(&root.join("scope.tsv"), &scope).expect("write shape scope");
+    let peak_rss = records
+        .iter()
+        .map(|record| record.memory_peaks.process_peak_rss_kb)
+        .max()
+        .unwrap_or(0);
+    let cgroup_peak = records
+        .iter()
+        .map(|record| record.memory_peaks.cgroup_peak_memory_kb)
+        .max()
+        .unwrap_or(0);
+    let wall_sum = records.iter().map(|record| record.wall_s).sum::<f64>();
+    let report = format!(
+        "# Remaining-unit graph-shape census\n\n- scope: 166 units (bzip2 23, brotli 112, lodepng 31)\n- dry program graph builds: 3\n- candidate processing: false\n- semantic data: false\n- exact shape rows: {}\n- wall sum on {MACHINE_ID}: {wall_sum:.3} s\n- peak GNU-time RSS: {peak_rss} KiB\n- peak cgroup memory: {cgroup_peak} KiB\n",
+        all_gaps.len(),
+    );
+    fs::write(root.join("report.md"), report).expect("write shape report");
+    let provenance = format!(
+        "machine_id={MACHINE_ID}\nplatform={PLATFORM}\nanalysis_head={}\nanalysis_branch=codex/a4-source-census\nmeasurement_class=shape-only\nsemantic_data=false\ncandidate_processing=false\nderived_substrate_digest={DERIVED_SUBSTRATE_DIGEST}\nwall_bound_kind=liveness\nwall_cap_s={LIVENESS_BOUND_S}\nmemory_limit=cgroup-100GiB\nprograms=bzip2,brotli,lodepng\nunits_covered=166\nshape_rows={}\nprogram_manifests={}\nwall_sum_s={wall_sum:.3}\npeak_rss_kb={peak_rss}\ncgroup_peak_memory_kb={cgroup_peak}\ntiming_comparison=forbidden-across-machines\n",
+        contract.head,
+        all_gaps.len(),
+        records
+            .iter()
+            .map(|record| format!("{}:{}", record.program, record.manifest))
+            .collect::<Vec<_>>()
+            .join(","),
+    );
+    fs::write(root.join("provenance.txt"), provenance).expect("write shape provenance");
+    let manifest = write_manifest(
+        &root,
+        &[
+            "partial.tsv",
+            "provenance.txt",
+            "report.md",
+            "scope.tsv",
+            "shapes.tsv",
+        ],
+    )
+    .expect("manifest shape aggregate");
+
+    let singleton = all_gaps.len() == 1
+        && all_gaps[0].0 == "bzip2"
+        && all_gaps[0].1.kind == "multi-static-identity-merge"
+        && all_gaps[0].1.function.ends_with("bzlib::bzopen_or_bzdopen")
+        && all_gaps[0].1.detail.contains("__stdinp")
+        && all_gaps[0].1.detail.contains("__stdoutp");
+    assert!(
+        singleton,
+        "A4C STOP phase=shape-decision candidate=none status=non-singleton manifest={manifest}\n{shapes}"
+    );
+    eprintln!(
+        "A4C shape census complete manifest={manifest} units=166 shapes=1 singleton=bzip2:bzlib::bzopen_or_bzdopen"
+    );
+}
+
+#[test]
+#[ignore = "A4 remaining-unit shape census; run once sequentially on the dedicated Linux lane"]
+fn a4_source_shape_census() {
+    let contract = measurement_contract();
+    enforce_substrate_preflight(&contract);
+    run_graph_shape_census(&contract);
+}
+
 #[test]
 #[ignore = "A4 source census; run sequentially on the dedicated Linux lane"]
 fn a4_source_census() {
@@ -9767,7 +10324,7 @@ mod tests {
             let body_ref = tcx
                 .mir_drops_elaborated_and_const_checked(function)
                 .borrow();
-            let static_pointers = static_pointer_locals(tcx, &body_ref).unwrap();
+            let static_pointers = static_pointer_locals(tcx, function, &body_ref).unwrap();
             let aliases =
                 target_reference_aliases(tcx, function, &body_ref, &static_pointers).unwrap();
             let lhs = body_ref
@@ -10120,7 +10677,7 @@ mod tests {
                 let body_ref = tcx
                     .mir_drops_elaborated_and_const_checked(function)
                     .borrow();
-                let seeds = static_pointer_locals(tcx, &body_ref).unwrap();
+                let seeds = static_pointer_locals(tcx, function, &body_ref).unwrap();
                 let derivations = derive_static_data_locals(tcx, function, &body_ref).unwrap();
                 (seeds, derivations)
             };
@@ -10252,6 +10809,65 @@ mod tests {
     }
 
     #[test]
+    fn graph_shape_census_counts_multi_static_merge_without_classifying() {
+        let conflict = r#"
+            extern "C" {
+                static mut INPUT: *mut u32;
+                static mut OUTPUT: *mut u32;
+            }
+
+            pub unsafe fn choose(writing: bool) -> *mut u32 {
+                if writing { OUTPUT } else { INPUT }
+            }
+        "#;
+        ::utils::compilation::run_compiler_on_str(conflict, |tcx| {
+            let program = super::super::collect_program(tcx);
+            let function = program
+                .functions
+                .iter()
+                .copied()
+                .find(|function| tcx.def_path_str(*function).ends_with("choose"))
+                .expect("conditional-static fixture function");
+            let body_ref = tcx
+                .mir_drops_elaborated_and_const_checked(function)
+                .borrow();
+            assert!(
+                derive_static_data_locals(tcx, function, &body_ref)
+                    .expect_err("production census must retain the multi-static STOP")
+                    .contains("conflicting static-data derivations"),
+                "shape collection must not widen the production derivation domain"
+            );
+            let gaps = collect_source_graph_shape_gaps(tcx);
+            assert_eq!(gaps.len(), 1, "exact conditional-static gap: {gaps:#?}");
+            assert_eq!(gaps[0].kind, "multi-static-identity-merge");
+            assert!(gaps[0].function.ends_with("choose"));
+            assert!(gaps[0].detail.contains("INPUT"));
+            assert!(gaps[0].detail.contains("OUTPUT"));
+        })
+        .unwrap_or_else(|error| error.raise());
+
+        let supported = r#"
+            extern "C" {
+                static mut INPUT: *mut u32;
+            }
+
+            pub unsafe fn copy() -> *mut u32 {
+                let first = INPUT;
+                let second = first;
+                second
+            }
+        "#;
+        ::utils::compilation::run_compiler_on_str(supported, |tcx| {
+            let gaps = collect_source_graph_shape_gaps(tcx);
+            assert!(
+                gaps.is_empty(),
+                "supported graph must be gap-free: {gaps:#?}"
+            );
+        })
+        .unwrap_or_else(|error| error.raise());
+    }
+
+    #[test]
     fn primitive_static_array_field_is_interior_but_pointer_array_stops() {
         let scalar_array = r#"
             struct Table {
@@ -10361,7 +10977,7 @@ mod tests {
                 let body_ref = tcx
                     .mir_drops_elaborated_and_const_checked(function)
                     .borrow();
-                let seeds = static_pointer_locals(tcx, &body_ref).unwrap();
+                let seeds = static_pointer_locals(tcx, function, &body_ref).unwrap();
                 let mut assignments = Vec::new();
                 for (bb, data) in body_ref.basic_blocks.iter_enumerated() {
                     for (statement_index, statement) in data.statements.iter().enumerate() {
