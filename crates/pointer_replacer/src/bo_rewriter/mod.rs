@@ -262,7 +262,12 @@ pub(crate) fn rewrite_m1(input: &str) -> RewriteOutcome {
 pub(crate) fn ast_emitted_source_of(input: &str) -> Result<String, String> {
     match ::utils::compilation::run_compiler_on_input(
         ::utils::compilation::str_to_input(input),
-        |tcx| ast_transform::ast_emitted_source(tcx).map(|(source, _stats)| source),
+        |tcx| {
+            // The string entry emits the UN-reverted program: it runs no verify
+            // loop, so there is no revert set to honour. Named, not defaulted.
+            ast_transform::ast_emitted_source(tcx, &ast_transform::RevertSet::default())
+                .map(|(source, _stats)| source)
+        },
     ) {
         Ok(inner) => inner,
         Err(why) => Err(format!("{why:?}")),

@@ -1332,7 +1332,7 @@ mod tests {
 /// is built.
 #[cfg(test)]
 pub(crate) fn arm1_population(tcx: rustc_middle::ty::TyCtxt<'_>) -> Result<RefDeclStats, String> {
-    transform_inner(tcx).map(|(decls, ..)| decls)
+    transform_inner(tcx, &RevertSet::default()).map(|(decls, ..)| decls)
 }
 
 /// Both passes over ONE capture, sharing ONE composition guard.
@@ -1362,6 +1362,7 @@ pub(crate) fn arm1_population(tcx: rustc_middle::ty::TyCtxt<'_>) -> Result<RefDe
 /// claimed.
 fn transform_inner(
     tcx: rustc_middle::ty::TyCtxt<'_>,
+    reverts: &RevertSet,
 ) -> Result<
     (
         RefDeclStats,
@@ -1434,16 +1435,15 @@ fn transform_inner(
     // `arms_full` applies no revert set, so here the population is every
     // decided subject.
     let subject_hirs: FxHashSet<HirId> = decisions.keys().map(|(_, h)| *h).collect();
-    // `arms_full` applies NO revert set, so the site check is a no-op here and
-    // every decided subject is owed a placement. Named rather than defaulted,
-    // so the empty set is a statement instead of an omission.
-    let no_reverts: FxHashSet<LocalDefId> = FxHashSet::default();
+    // **ARM 1 takes the revert set through its own site check** (M-2). Callers
+    // that want the un-reverted population — `arms_full` and the parity gates —
+    // pass an EMPTY `RevertSet`, which is a statement rather than an omission.
     let mut guard = Composition::default();
     let mut v = RefDeclVisitor {
         local_map: &map.local_map,
         decisions: &decisions,
         global_map: &map.global_map,
-        reverted_fns: &no_reverts,
+        reverted_fns: &reverts.fns,
         subject_hirs: &subject_hirs,
         current_fn: None,
         guard: &mut guard,
@@ -1452,6 +1452,12 @@ fn transform_inner(
     v.visit_crate(&mut krate);
     let decls = v.stats;
 
+    // **ARMS 2 AND 3 CONSUME THE SHARED BUILDER** (M-2). Their visitors carry no
+    // site check, so their revert semantics live entirely in how these maps are
+    // built — and production builds them in exactly ONE place.
+    let filtered = filtered_inputs(&table, reverts);
+    let uses = filtered.uses;
+    let use_key_collisions = use_key_collisions + filtered.use_key_collisions;
     let mut g = UseGraftVisitor::new(&uses, &mut guard);
     g.visit_crate(&mut krate);
     let grafts = g.finish();
@@ -1459,18 +1465,8 @@ fn transform_inner(
     // **ARM 3 — the seam pass, and it runs THIRD by requirement, not by
     // convenience.** A seam's argument may contain a use rewrite, so the use
     // pass must have finished before the subtree is moved.
-    let mut seam_targets: FxHashMap<(u32, u32), SeamTarget> = FxHashMap::default();
-    let mut seam_key_collisions = 0usize;
-    for edit in &table.seams.edits {
-        // Same reasoning as `use_key_collisions`: a map is a join, and a join
-        // without a collision counter agrees with itself while being short.
-        insert_counting(
-            &mut seam_targets,
-            (edit.span.lo().0, edit.span.hi().0),
-            SeamTarget::of(edit),
-            &mut seam_key_collisions,
-        );
-    }
+    let seam_targets = filtered.seams;
+    let seam_key_collisions = filtered.seam_key_collisions;
     let mut s = SeamGraftVisitor::new(&seam_targets, &mut guard);
     s.visit_crate(&mut krate);
     let mut seams = s.finish();
@@ -1573,8 +1569,9 @@ fn transform_inner(
 /// substrate in exactly the functions the transforms touched.
 pub(crate) fn ast_emitted_source(
     tcx: rustc_middle::ty::TyCtxt<'_>,
+    reverts: &RevertSet,
 ) -> Result<(String, super::ast_bridge::SubstStats), String> {
-    let (_, _, seams, _, _, _, _, krate) = transform_inner(tcx)?;
+    let (_, _, seams, _, _, _, _, krate) = transform_inner(tcx, reverts)?;
     let (mut source, stats) = super::ast_bridge::splice_fn_prints(tcx, &krate);
     // **The fabricated-extent const** (marker ruling, 2026-08-15): emitted when
     // this layer PLACED at least one fabricated adapter.
@@ -1999,17 +1996,22 @@ fn compare_renders(
 /// `render` filters EDITS by `owner_fn` afterwards. A seam edit is only ever
 /// caught by the second — `plan`'s own comment says so: *"Reverting the callee
 /// reverts its seams with it, because `owner_fn` is the revert key."*
-#[cfg(test)]
+#[derive(Default)]
 pub(crate) struct RevertSet {
     pub fns: FxHashSet<LocalDefId>,
     pub names: FxHashSet<String>,
     pub subjects: usize,
 }
 
-#[cfg(test)]
 impl RevertSet {
     /// Does an edit owned by `owner_fn` survive? **The single place either side
     /// asks**, so they cannot diverge on population again.
+    ///
+    /// **PRODUCTION LAW from 2026-08-16 (M-2).** The type graduated out of
+    /// `#[cfg(test)]` when the verify/revert loop was wired to the AST layer:
+    /// production needs a revert vocabulary spanning BOTH keys, because
+    /// `emit_files` filters SUBJECTS by `LocalDefId` while `render` filters
+    /// EDITS by `owner_fn`, and a seam edit is only ever caught by the second.
     ///
     /// Applying this to EVERY plan edit reproduces `render`'s semantics exactly.
     /// It is idempotent on `KindDecision` edits — `emit_files` has already
@@ -2025,6 +2027,89 @@ impl RevertSet {
     pub(crate) fn keeps_subject(&self, fn_did: LocalDefId) -> bool {
         !self.fns.contains(&fn_did)
     }
+}
+
+/// **THE FILTERED-INPUT BUILDER — production's ONE answer to "which edits
+/// survive"** (M-2, ruled 2026-08-16).
+///
+/// # Why this exists, and why the GATE must not call it
+///
+/// Arms 2 and 3 revert by **input filtering**, by design: their visitors carry
+/// no site check, so *"handing the walk a reverted subject's uses WOULD change
+/// the emitted AST"*. Only arm 1 has a per-site check. So the revert semantics
+/// for two of three arms live in **how their maps are built**, and building
+/// them twice in production would be a second derivation of the survivor set —
+/// the class this milestone has repaired four times.
+///
+/// **`phase3_fn_parity` deliberately keeps its own verbatim filters and never
+/// calls this.** That is not duplication, it is the point: a gate is *supposed*
+/// to be an independent derivation, and a gate that consumes what it checks is
+/// the render-gap tautology. The two sides cannot diverge on **population** —
+/// both read one [`RevertSet`] — and if they diverge on **semantics**, the
+/// acceptance gate's byte reproduction is the detector. Such a divergence is a
+/// finding, never reconciled silently in either direction.
+pub(crate) struct FilteredInputs {
+    /// Use-graft targets, keyed by `(lo, hi)`, with reverted subjects' uses
+    /// already removed.
+    pub uses: FxHashMap<(u32, u32), String>,
+    /// Seam targets, keyed by `(lo, hi)`, with reverted owners' seams removed.
+    pub seams: FxHashMap<(u32, u32), SeamTarget>,
+    /// Collisions observed while building each map — a join without a collision
+    /// counter agrees with itself while being short.
+    pub use_key_collisions: usize,
+    pub seam_key_collisions: usize,
+}
+
+/// Build both filtered maps from one decision table and one revert set.
+///
+/// `subject_of` yields each use edit's owning subject so the arm-2 filter can
+/// ask `keeps_subject`; the arm-3 filter asks `keeps` on the seam's own
+/// `owner_fn`, which is the CALLEE — the revert key a seam is caught by.
+pub(crate) fn filtered_inputs(
+    table: &super::decision::DecisionTable,
+    reverts: &RevertSet,
+) -> FilteredInputs {
+    let mut out = FilteredInputs {
+        uses: FxHashMap::default(),
+        seams: FxHashMap::default(),
+        use_key_collisions: 0,
+        seam_key_collisions: 0,
+    };
+    for (subject, decision) in &table.entries {
+        let use_edits = match decision {
+            super::decision::Decision::Ref { .. } => None,
+            super::decision::Decision::Slice { uses, .. } => Some(uses),
+            super::decision::Decision::Opt { uses, .. } => Some(uses),
+            super::decision::Decision::Degraded(_) => continue,
+        };
+        // ARM 2's filter: no site check downstream, so a reverted subject's
+        // uses must never enter the map.
+        if !reverts.keeps_subject(subject.fn_did) {
+            continue;
+        }
+        for u in use_edits.into_iter().flatten() {
+            insert_counting(
+                &mut out.uses,
+                (u.span.lo().0, u.span.hi().0),
+                u.replacement.clone(),
+                &mut out.use_key_collisions,
+            );
+        }
+    }
+    for edit in &table.seams.edits {
+        // ARM 3's filter, on the CALLEE's path: reverting a callee reverts its
+        // seams with it, because `owner_fn` is the revert key.
+        if !reverts.keeps(&edit.owner_fn) {
+            continue;
+        }
+        insert_counting(
+            &mut out.seams,
+            (edit.span.lo().0, edit.span.hi().0),
+            SeamTarget::of(edit),
+            &mut out.seam_key_collisions,
+        );
+    }
+    out
 }
 
 /// **IS THE REVERT RESOLUTION A FUNCTION? (round-3 item 7.)**
@@ -3650,7 +3735,7 @@ pub(crate) fn arms_full(
         // The transformed krate — `arms_full` measures, it does not emit.
         // `ast_emitted_source` is the caller that wants it.
         _krate,
-    ) = transform_inner(tcx)?;
+    ) = transform_inner(tcx, &RevertSet::default())?;
     let (table, _ctx) = super::decide_table_with_ctx(tcx)?;
     let emission = super::emit_files(tcx, &table, &rustc_hash::FxHashSet::default())?;
 
