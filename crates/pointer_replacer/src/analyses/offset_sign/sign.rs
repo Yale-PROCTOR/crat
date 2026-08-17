@@ -34,7 +34,21 @@ pub struct OffsetSignResult {
     /// (`Neg`, `NonPos`, or a negative constant), i.e. pointers that go below
     /// their entry position on some path, not merely "may be negative"
     pub definite_signs: FxHashMap<LocalDefId, DenseBitSet<Local>>,
+    /// for each tainted local, the offset-call seeds whose taint reaches it
+    /// (diagnostics only; not group-widened like `access_signs`)
+    pub reaching_seeds: FxHashMap<(LocalDefId, Local), Vec<SeedInfo>>,
     pub field_access_signs: FxHashSet<StructFieldSlot>,
+}
+
+/// a may-negative offset call that seeds the taint propagation
+#[derive(Debug, Clone)]
+pub struct SeedInfo {
+    /// function containing the offset call
+    pub def_id: LocalDefId,
+    /// abstract value of the offset argument at the call
+    pub abs: AbsValue,
+    /// source span of the offset call
+    pub span: rustc_span::Span,
 }
 
 /// abstract-value lattice combining concrete constants with sign
@@ -1116,6 +1130,7 @@ struct Collector<'mir, 'tcx, 'a> {
     graph: &'a mut FxHashMap<Node, FxHashSet<Node>>,
     tainted: &'a mut FxHashSet<Node>,
     definite_tainted: &'a mut FxHashSet<Node>,
+    seed_infos: &'a mut Vec<(Node, SeedInfo)>,
     field_graph: &'a mut FieldSignGraph,
     field_tainted: &'a mut FxHashSet<FieldNode>,
     addr_takens: &'a FxHashSet<Local>,
@@ -1256,6 +1271,14 @@ impl<'mir, 'tcx, 'a> MVisitor<'tcx> for Collector<'mir, 'tcx, 'a> {
                             if offset_val.is_definitely_negative() {
                                 self.definite_tainted.insert((self.def_id, place.local));
                             }
+                            self.seed_infos.push((
+                                (self.def_id, place.local),
+                                SeedInfo {
+                                    def_id: self.def_id,
+                                    abs: offset_val,
+                                    span: terminator.source_info.span,
+                                },
+                            ));
                             let field_node = raw_pointer_field_slot(self.body, *place)
                                 .map(FieldNode::Field)
                                 .unwrap_or(FieldNode::Local(self.def_id, place.local));
@@ -1399,6 +1422,7 @@ pub fn offset_sign_analysis(rust_program: &RustProgram<'_>) -> OffsetSignResult 
     let mut graph: SignGraph = FxHashMap::default();
     let mut tainted: FxHashSet<Node> = FxHashSet::default();
     let mut definite_tainted: FxHashSet<Node> = FxHashSet::default();
+    let mut seed_infos: Vec<(Node, SeedInfo)> = Vec::new();
     let mut field_graph: FieldSignGraph = FxHashMap::default();
     let mut field_tainted: FxHashSet<FieldNode> = FxHashSet::default();
     let mut access_signs: FxHashMap<LocalDefId, DenseBitSet<Local>> = FxHashMap::default();
@@ -1439,6 +1463,7 @@ pub fn offset_sign_analysis(rust_program: &RustProgram<'_>) -> OffsetSignResult 
             graph: &mut graph,
             tainted: &mut tainted,
             definite_tainted: &mut definite_tainted,
+            seed_infos: &mut seed_infos,
             field_graph: &mut field_graph,
             field_tainted: &mut field_tainted,
             addr_takens: &addr_takens,
@@ -1487,6 +1512,23 @@ pub fn offset_sign_analysis(rust_program: &RustProgram<'_>) -> OffsetSignResult 
         .flat_map(|&scc_id| &sccs.scc_elems[scc_id])
         .collect::<FxHashSet<_>>();
 
+    // per-seed forward reachability (diagnostics): which locals each seed taints
+    let mut reaching_seeds: FxHashMap<Node, Vec<SeedInfo>> = FxHashMap::default();
+    for (node, info) in &seed_infos {
+        let Some(&seed_scc) = sccs.indices.get(node) else { continue };
+        let mut visited: FxHashSet<graph::SccId> = FxHashSet::default();
+        let mut worklist: VecDeque<graph::SccId> = VecDeque::from([seed_scc]);
+        while let Some(scc_id) = worklist.pop_front() {
+            if !visited.insert(scc_id) {
+                continue;
+            }
+            for &member in &sccs.scc_elems[scc_id] {
+                reaching_seeds.entry(member).or_default().push(info.clone());
+            }
+            worklist.extend(sccs.successors(scc_id));
+        }
+    }
+
     // post-process results to map v
     let mut definite_signs: FxHashMap<LocalDefId, DenseBitSet<Local>> = FxHashMap::default();
     for &def_id in &rust_program.functions {
@@ -1531,6 +1573,7 @@ pub fn offset_sign_analysis(rust_program: &RustProgram<'_>) -> OffsetSignResult 
     OffsetSignResult {
         access_signs,
         definite_signs,
+        reaching_seeds,
         field_access_signs,
     }
 }

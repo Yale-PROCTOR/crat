@@ -70,10 +70,11 @@ pub(super) fn assess(
                 };
                 class_counts[class - 1] += 1;
                 eprintln!(
-                    "CURSOR-ASSESS param fn={} local={:?} class={}",
+                    "CURSOR-ASSESS param fn={} local={:?} class={} seeds=[{}]",
                     tcx.def_path_str(did),
                     local,
                     class,
+                    seed_summary(analysis, tcx, did, local),
                 );
                 if class == 2 {
                     class2_params.entry(did).or_default().push(local);
@@ -140,6 +141,39 @@ pub(super) fn assess(
         callsite_bases,
         class2_local_bases,
     );
+}
+
+/// deduplicated `sign@fn@file:line` list of the offset-call seeds whose taint
+/// reaches this local; empty means the taint arrived via alias-group widening
+fn seed_summary(
+    analysis: &Analysis,
+    tcx: TyCtxt<'_>,
+    did: LocalDefId,
+    local: Local,
+) -> String {
+    let Some(seeds) = analysis.offset_sign_result.reaching_seeds.get(&(did, local)) else {
+        return "via-alias-group".to_string();
+    };
+    let mut entries: Vec<String> = seeds
+        .iter()
+        .map(|seed| {
+            let span = tcx.sess.source_map().span_to_embeddable_string(seed.span);
+            let file_line = span
+                .rsplit_once('/')
+                .map(|(_, tail)| tail)
+                .unwrap_or(&span)
+                .to_string();
+            format!(
+                "{:?}@{}@{}",
+                seed.abs,
+                tcx.def_path_str(seed.def_id),
+                file_line,
+            )
+        })
+        .collect();
+    entries.sort();
+    entries.dedup();
+    entries.join(", ")
 }
 
 fn base_status<'tcx>(
