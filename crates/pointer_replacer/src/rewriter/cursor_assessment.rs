@@ -21,7 +21,6 @@ use rustc_middle::{
 use super::decision::{DecisionMaker, PtrKind};
 use crate::{
     analyses::{
-        cursor_demotion::CursorDemotion,
         fn_ptr_groups::FnPtrGroups,
         pointer_flow::{
             self, PointerFlowResult,
@@ -40,8 +39,7 @@ pub(super) fn assess(
 ) {
     let tcx = input.tcx;
     let flows = pointer_flow::pointer_flow_analysis(input, alloc_fns);
-    let demotion =
-        CursorDemotion::compute(input, &analysis.offset_sign_result, fn_ptr_groups);
+    let demotion = &analysis.cursor_demotion;
 
     let mut class_counts = [0usize; 3];
     let mut class2_params: FxHashMap<LocalDefId, Vec<Local>> = FxHashMap::default();

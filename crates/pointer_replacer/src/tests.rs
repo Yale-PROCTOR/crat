@@ -3793,7 +3793,7 @@ pub unsafe fn show(fields: *mut Record, i: isize) -> i32 {
             "pub struct Record<'a>",
             "pub name: &'a [i8]",
             "pub unsafe fn consume_c_string(s: &[i8])",
-            "consume_c_string(((fields)[(i) as isize]).name)",
+            "consume_c_string(((&((fields)[(i) as usize..]))[0]).name)",
         ],
         &["pub name: Option<&'a i8>", "pub name: *const i8"],
     );
@@ -8392,7 +8392,7 @@ pub unsafe extern "C" fn foo() {
 }
 
 #[test]
-fn test_param_byte_cast_offset_rewrites_to_slice_cursor() {
+fn test_param_byte_cast_offset_rewrites_to_slice() {
     run_test(
         r#"
 #[repr(C)]
@@ -8410,21 +8410,20 @@ pub unsafe extern "C" fn caller(info: *mut Info, offset: i32, value: u32) {
 }
 "#,
         &[
-            "crate::slice_cursor::SliceCursorMut<'_, u32>",
-            "SliceCursorMut::from_raw_parts_mut((addr).as_ptr()",
-            "as *mut u8, 1_000_000",
-            "set_type((leaf_addr).as_deref_mut(), offset, value);",
+            "fn set_type(mut addr: &mut [u32]",
+            "bytemuck::cast_slice_mut",
+            "set_type((leaf_addr).as_slice_mut(), offset, value);",
         ],
         &[
             "pub unsafe extern \"C\" fn set_type(mut addr: *mut u32",
             "*(addr as *mut u8).offset",
-            "bytemuck::cast_slice_mut",
+            "SliceCursorMut::from_raw_parts_mut",
         ],
     );
 }
 
 #[test]
-fn test_raw_local_noop_cast_call_does_not_demote_cursor_callee() {
+fn test_raw_local_noop_cast_call_keeps_callee_slice() {
     run_test(
         r#"
 #[repr(C)]
@@ -8448,17 +8447,31 @@ pub unsafe extern "C" fn caller(v_info: *mut core::ffi::c_void, offset: i32, val
 }
 "#,
         &[
-            "crate::slice_cursor::SliceCursorMut<'_, u32>",
-            "SliceCursorMut::from_raw_parts_mut((addr).as_ptr()",
-            "as *mut u8, 1_000_000",
+            "fn set_type(mut addr: &mut [u32]",
+            "bytemuck::cast_slice_mut",
             "set_type(if (leaf_addr).is_null()",
-            "SliceCursorMut::from_raw_parts_mut((leaf_addr),",
+            "std::slice::from_raw_parts_mut((leaf_addr), 1_000_000)",
         ],
         &[
             "pub unsafe extern \"C\" fn set_type(mut addr: *mut u32",
             "*(addr as *mut u8).offset",
-            "bytemuck::cast_slice_mut",
+            "SliceCursorMut::from_raw_parts_mut",
         ],
+    );
+}
+
+/// a variable-offset param with no definitely-negative movement is demoted
+/// from `SliceCursor` to a plain slice; the offset becomes range indexing
+#[test]
+fn test_param_variable_offset_demotes_to_slice() {
+    run_test(
+        r#"
+pub unsafe fn write_at(p: *mut i32, i: isize) {
+    *p.offset(i) = 1;
+}
+"#,
+        &["fn write_at(mut p: &mut [i32]", "(&mut ((p)[(i) as usize..]))[0] = 1"],
+        &["SliceCursor"],
     );
 }
 
@@ -8764,6 +8777,7 @@ fn test_mut_cursor_multi_offset_deref_uses_combined_index() {
         r#"
 pub unsafe fn write_offset(p: *mut i32, a: isize, b: isize) {
     *p.offset(a).offset(b) = 1;
+    *p.offset(-1) = 0;
 }
 "#,
         &["(p)[((a) as isize).wrapping_add((b) as isize)] = 1"],
@@ -8781,6 +8795,7 @@ pub unsafe fn recurse(items: *mut i32, a: isize, b: isize) {
     }
     recurse(items.offset(a).offset(b), a, b - 1);
     *items = b as i32;
+    *items.offset(-1) = 0;
 }
 "#,
         &["as_deref_mut", ")).offset_by((b) as isize)"],

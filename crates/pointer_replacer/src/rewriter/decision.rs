@@ -176,6 +176,15 @@ impl<'tcx> DecisionMaker<'tcx> {
         if let Some(signs) = fn_offset_signs {
             needs_cursor.union(signs);
         }
+        // demotable params take plain slices: no definitely-negative movement
+        // reaches them, so call sites' rebase-to-pos-0 constructions preserve
+        // behavior; locals keep cursors
+        let arg_count = tcx.mir_drops_elaborated_and_const_checked(did).borrow().arg_count;
+        for param in (1..=arg_count).map(Local::from_usize) {
+            if analysis.cursor_demotion.is_demotable(did, param) {
+                needs_cursor.remove(param);
+            }
+        }
         let non_null_locals = analysis
             .nullity_result
             .non_null_locals

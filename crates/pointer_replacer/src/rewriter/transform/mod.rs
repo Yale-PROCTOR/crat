@@ -16915,6 +16915,11 @@ mod tests {
         let mut nullity_result = analyses::nullity::analyze(&input, &points_to);
         nullity_result.non_null_locals =
             source_var_groups.postprocess_non_null_locals(nullity_result.non_null_locals);
+        let cursor_demotion = analyses::cursor_demotion::CursorDemotion::compute(
+            &input,
+            &offset_sign_result,
+            &super::super::collector::collect_fn_ptrs(&input),
+        );
         let analysis = super::super::Analysis {
             borrow_promotion_result,
             borrow_lifetime_flows,
@@ -16928,6 +16933,7 @@ mod tests {
             offset_sign_result,
             nullity_result,
             struct_copy_result,
+            cursor_demotion,
         };
 
         (input, analysis)
