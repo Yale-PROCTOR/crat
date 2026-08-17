@@ -18,7 +18,8 @@ You should first build the `deps_crate` crate, which provides dependencies to
 compile the Rust program to be transformed. You only need to do this once.
 
 ```bash
-cargo build --manifest-path deps_crate/Cargo.toml
+cargo build --manifest-path deps_crate/Cargo.toml \
+  --target "$(rustc --print host-tuple)"
 ```
 
 ## Usage

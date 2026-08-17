@@ -29,7 +29,7 @@ jobs:
         run: sudo -u ubuntu bash -lc "cargo clippy -- -D warnings"
 
       - name: Build dependency crate
-        run: sudo -u ubuntu bash -lc "cd deps_crate && cargo build"
+        run: sudo -u ubuntu bash -lc 'cargo build --manifest-path deps_crate/Cargo.toml --target "$(rustc --print host-tuple)"'
 
       - name: Build (Dev)
         run: sudo -u ubuntu bash -lc "cargo build"
