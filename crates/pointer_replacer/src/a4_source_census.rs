@@ -3946,6 +3946,86 @@ const GAP_ATTRIBUTION_HEADER: &str = "program\tkind\tfunction\tsite\tdetail\tfie
 const GAP_IMPACT_HEADER: &str =
     "program\tkind\tfunction\tsite\tdetail\tanchor_status\tanchor_count\taffected_candidate_count";
 const GAP_ANCHOR_HEADER: &str = "program\tkind\tfunction\tsite\tdetail\tanchor_status\tanchor";
+const GAP_INVENTORY_STOPPING_RULE: &str = "exhaustive-per-program-no-first-panic-truncation";
+const GAP_INVENTORY_METADATA: &str =
+    "# stopping_rule=exhaustive-per-program-no-first-panic-truncation";
+const GAP_INVENTORY_HEADER: &str =
+    "program\tkind\tfunction\tsite\tdetail\tanchor_status\tanchor_count\tanchors";
+
+fn render_exhaustive_gap_inventory(
+    program: &str,
+    gaps: &BTreeMap<GraphShapeGap, ResolvedGraphGap>,
+) -> String {
+    let mut out = format!("{GAP_INVENTORY_METADATA}\n{GAP_INVENTORY_HEADER}\n");
+    for (gap, resolved) in gaps {
+        let anchors = if resolved.nodes.is_empty() {
+            "not-applicable".to_owned()
+        } else {
+            resolved.nodes.iter().cloned().collect::<Vec<_>>().join("|")
+        };
+        out.push_str(&format!(
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+            clean_cell(program),
+            gap.kind,
+            clean_cell(&gap.function),
+            clean_cell(&gap.site),
+            clean_cell(&gap.detail),
+            gap_anchor_status_label(resolved.status),
+            resolved.nodes.len(),
+            clean_cell(&anchors),
+        ));
+    }
+    out
+}
+
+fn parse_exhaustive_gap_inventory(
+    path: &Path,
+    expected_program: &str,
+) -> Result<Vec<Vec<String>>, String> {
+    let input = fs::read_to_string(path)
+        .map_err(|error| format!("read inventory {}: {error}", path.display()))?;
+    let (metadata, table) = input
+        .split_once('\n')
+        .ok_or_else(|| format!("inventory metadata missing: {}", path.display()))?;
+    if metadata != GAP_INVENTORY_METADATA {
+        return Err(format!("inventory stopping-rule drift: {metadata:?}"));
+    }
+    let rows = parse_table_text(table, GAP_INVENTORY_HEADER, 8, &path.display().to_string())?;
+    let mut identities = BTreeSet::new();
+    for row in &rows {
+        if row[0] != expected_program {
+            return Err(format!(
+                "inventory program drift: expected={expected_program} actual={}",
+                row[0]
+            ));
+        }
+        if !identities.insert(row[..5].to_vec()) {
+            return Err(format!("duplicate inventory identity: {:?}", &row[..5]));
+        }
+        let count = row[6]
+            .parse::<usize>()
+            .map_err(|_| format!("nonnumeric inventory anchor count: {:?}", &row[..5]))?;
+        match row[5].as_str() {
+            "out-of-pointer-universe" => {
+                if count != 0 || row[7] != "not-applicable" {
+                    return Err(format!("invalid typed-zero inventory row: {row:?}"));
+                }
+            }
+            "graph-nodes" => {
+                let anchors = row[7].split('|').collect::<BTreeSet<_>>();
+                if count == 0
+                    || row[7] == "not-applicable"
+                    || anchors.len() != count
+                    || anchors.contains("")
+                {
+                    return Err(format!("invalid graph-node inventory row: {row:?}"));
+                }
+            }
+            other => return Err(format!("unknown inventory anchor status {other:?}")),
+        }
+    }
+    Ok(rows)
+}
 
 fn validate_gap_output_rows(
     mapping: &[Vec<String>],
@@ -4022,6 +4102,49 @@ fn render_graph_shape_gaps(program: &str, gaps: &[GraphShapeGap]) -> String {
         ));
     }
     out
+}
+
+fn run_gap_inventory_worker(tcx: TyCtxt<'_>, t_tcx: Duration) -> Row {
+    let started = Instant::now();
+    let program = std::env::var("CRAT_BOC1_NAME").expect("gap-inventory worker program name");
+    let output = PathBuf::from(
+        std::env::var_os("CRAT_A4_GAP_INVENTORY_ROWS").expect("gap-inventory rows output"),
+    );
+    let checkpoint = PathBuf::from(
+        std::env::var_os("CRAT_A4_GAP_INVENTORY_CHECKPOINT")
+            .expect("gap-inventory checkpoint output"),
+    );
+    emit_phase(started, "gap-inventory-graph", None, 0);
+    let (_, _, gaps) = collect_source_graph_gap_attribution(tcx)
+        .unwrap_or_else(|error| panic!("A4C STOP phase=gap-inventory candidate=none: {error}"));
+    let rendered = render_exhaustive_gap_inventory(&program, &gaps);
+    write_atomic_checkpoint(&checkpoint, &rendered).unwrap_or_else(|error| {
+        panic!("A4C STOP phase=gap-inventory-checkpoint candidate=none: {error}")
+    });
+    emit_phase(
+        started,
+        "gap-inventory-checkpoint-written",
+        None,
+        gaps.len(),
+    );
+    write_atomic_checkpoint(&output, &rendered).unwrap_or_else(|error| {
+        panic!("A4C STOP phase=gap-inventory-finalize candidate=none: {error}")
+    });
+    emit_phase(started, "gap-inventory-complete", None, gaps.len());
+
+    let mut row = Row::default();
+    row.set("program", program);
+    row.set("gap_count", gaps.len());
+    row.set("candidate_processing", "false");
+    row.set("semantic_data", "false");
+    row.set("stopping_rule", GAP_INVENTORY_STOPPING_RULE);
+    row.set("t_tcx_s", format!("{:.3}", t_tcx.as_secs_f64()));
+    row.set("status", "ok");
+    row.set(
+        "t_total_s",
+        format!("{:.3}", started.elapsed().as_secs_f64()),
+    );
+    row
 }
 
 fn run_shape_census_worker(tcx: TyCtxt<'_>, t_tcx: Duration) -> Row {
@@ -4194,6 +4317,9 @@ fn run_gap_attribution_worker(tcx: TyCtxt<'_>, t_tcx: Duration) -> Row {
 }
 
 pub(super) fn run_worker(tcx: TyCtxt<'_>, t_tcx: Duration) -> Row {
+    if std::env::var("CRAT_A4_SOURCE_GAP_INVENTORY").as_deref() == Ok("1") {
+        return run_gap_inventory_worker(tcx, t_tcx);
+    }
     if std::env::var("CRAT_A4_SOURCE_GAP_ATTRIBUTION").as_deref() == Ok("1") {
         return run_gap_attribution_worker(tcx, t_tcx);
     }
@@ -4616,6 +4742,7 @@ const CANDIDATE_MEMORY_MAX_BYTES: u64 = 100 * 1024 * 1024 * 1024;
 const HOST_MEMORY_MARGIN_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 const GRAPH_SHAPE_CENSUS_SCOPE: [(&str, usize); 3] =
     [("bzip2", 23), ("brotli", 112), ("lodepng", 31)];
+const GAP_INVENTORY_SCOPE: [(&str, usize); 2] = [("brotli", 112), ("lodepng", 31)];
 const GAP_SITE_SOURCE_ROOT: &str =
     "/home/p51lee/dev/agent-worktrees/crat-a4-shape-census-run-20260816-v4FADj7h/shape-census";
 const GAP_SITE_AGGREGATE_MANIFEST: &str =
@@ -8722,6 +8849,322 @@ fn run_graph_shape_census(contract: &MeasurementContract) {
     );
 }
 
+#[derive(Clone, Debug)]
+struct GapInventoryProgramRecord {
+    program: String,
+    units_covered: usize,
+    gap_count: usize,
+    typed_zero_count: usize,
+    anchored_count: usize,
+    manifest: String,
+    wall_s: f64,
+    memory_peaks: CandidateMemoryPeaks,
+}
+
+fn render_gap_inventory_checkpoint(records: &[GapInventoryProgramRecord]) -> String {
+    let mut out = format!(
+        "measurement_class=exhaustive-gap-inventory\nsemantic_data=false\ncandidate_processing=false\nstopping_rule={GAP_INVENTORY_STOPPING_RULE}\n\nprogram\tunits_covered\tgap_count\ttyped_zero_count\tanchored_count\tmanifest_sha256\twall_s\tpeak_rss_kb\tcgroup_peak_memory_kb\n"
+    );
+    for record in records {
+        out.push_str(&format!(
+            "{}\t{}\t{}\t{}\t{}\t{}\t{:.3}\t{}\t{}\n",
+            record.program,
+            record.units_covered,
+            record.gap_count,
+            record.typed_zero_count,
+            record.anchored_count,
+            record.manifest,
+            record.wall_s,
+            record.memory_peaks.process_peak_rss_kb,
+            record.memory_peaks.cgroup_peak_memory_kb,
+        ));
+    }
+    out
+}
+
+fn gap_inventory_source_group(row: &[String]) -> Result<String, String> {
+    let function = if row[2] == "crate" {
+        row[4]
+            .split_once("realized pointer-alias stores in ")
+            .and_then(|(_, rest)| rest.split_once(": unsupported").map(|(value, _)| value))
+            .ok_or_else(|| format!("crate-level inventory row lacks a source function: {row:?}"))?
+    } else {
+        &row[2]
+    };
+    Ok(function
+        .rsplit_once("::")
+        .map(|(group, _)| group)
+        .unwrap_or(function)
+        .to_owned())
+}
+
+fn run_exhaustive_gap_inventory(contract: &MeasurementContract) {
+    use super::orchestrate::workspace_root;
+
+    let root = contract.run_root.join("gap-inventory");
+    assert!(
+        !root.exists(),
+        "A4C STOP phase=gap-inventory-setup candidate=none: inventory directory must be fresh"
+    );
+    fs::create_dir(&root).expect("create exhaustive gap-inventory directory");
+    let mut records = Vec::new();
+    let mut all_rows = Vec::<Vec<String>>::new();
+
+    for &(program_name, units_covered) in &GAP_INVENTORY_SCOPE {
+        assert_eq!(
+            isolated_identities(contract, program_name).len(),
+            units_covered,
+            "A4C STOP phase=gap-inventory-scope candidate={program_name}: unit denominator drift"
+        );
+        let program = contract
+            .programs
+            .iter()
+            .copied()
+            .find(|program| program.name == program_name)
+            .expect("gap-inventory program in measurement contract");
+        let dir = root.join(program_name);
+        fs::create_dir(&dir).expect("create gap-inventory program directory");
+        let preflight = fs::read_to_string("/proc/meminfo")
+            .map(|meminfo| evaluate_host_memory_preflight(&meminfo))
+            .unwrap_or_else(|error| HostMemoryPreflight {
+                mem_available_bytes: None,
+                required_bytes: CANDIDATE_MEMORY_MAX_BYTES + HOST_MEMORY_MARGIN_BYTES,
+                status: "host-memory-unavailable",
+                error: Some(format!("read /proc/meminfo: {error}")),
+            });
+        let timestamp_unix_s = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock before Unix epoch")
+            .as_secs();
+        fs::write(
+            dir.join("memory-preflight.txt"),
+            preflight.render(program_name, "gap-inventory", timestamp_unix_s),
+        )
+        .expect("write gap-inventory memory preflight");
+        if !preflight.launch_allowed() {
+            let manifest = write_manifest(&dir, &["memory-preflight.txt"])
+                .expect("manifest failed gap-inventory preflight");
+            panic!(
+                "A4C STOP phase=gap-inventory-memory-preflight candidate={program_name} status={} mem_available_bytes={} required_bytes={} measurement_started=false manifest={manifest}",
+                preflight.status,
+                preflight.mem_available_bytes.unwrap_or(0),
+                preflight.required_bytes,
+            );
+        }
+
+        let input = workspace_root()
+            .join("benchmarks/rs-crown-derived")
+            .join(program.name)
+            .join(program.lib_root);
+        let outcome = run_capped_candidate_child(
+            program_name,
+            &input,
+            &dir,
+            &[
+                ("CRAT_A4_SOURCE_GAP_INVENTORY", "1".to_owned()),
+                (
+                    "CRAT_A4_GAP_INVENTORY_ROWS",
+                    dir.join("gap-sites.tsv").display().to_string(),
+                ),
+                (
+                    "CRAT_A4_GAP_INVENTORY_CHECKPOINT",
+                    dir.join("checkpoint.tsv").display().to_string(),
+                ),
+            ],
+        );
+        if outcome.status != "ok" {
+            let (phase, marker_candidate) = last_phase(&outcome.stderr);
+            let oom_killer = if outcome.oom_kills > 0 {
+                "kernel-oom-killer"
+            } else {
+                "none"
+            };
+            let receipt = format!(
+                "machine_id={MACHINE_ID}\nplatform={PLATFORM}\nmeasurement_class=exhaustive-gap-inventory\nsemantic_data=false\ncompleted=false\ncandidate_processing=false\nstopping_rule={GAP_INVENTORY_STOPPING_RULE}\nmemory_limit=cgroup-100GiB\nmemory_max_bytes={CANDIDATE_MEMORY_MAX_BYTES}\ncap_verified={}\noom_kills={}\nmemory_max_events={}\noom_killer={oom_killer}\nwall_bound_kind=liveness\nwall_cap_s={LIVENESS_BOUND_S}\nprogram={program_name}\nunits_covered={units_covered}\nstatus={}\nanalysis_head={}\nlast_phase={phase}\nlast_candidate={marker_candidate}\nwall_s={:.3}\n{}memory_receipt_error={}\n",
+                outcome.cap_verified,
+                outcome.oom_kills,
+                outcome.memory_max_events,
+                outcome.status,
+                contract.head,
+                outcome.wall_s,
+                outcome.memory_receipt.render(),
+                clean_cell(outcome.memory_receipt_error.as_deref().unwrap_or("none")),
+            );
+            fs::write(dir.join("receipt.txt"), receipt)
+                .expect("write failed gap-inventory receipt");
+            let mut files = vec![
+                "memory-preflight.txt",
+                "receipt.txt",
+                "worker.out",
+                "worker.err",
+                "time.txt",
+            ];
+            for file in ["gap-sites.tsv", "checkpoint.tsv"] {
+                if dir.join(file).is_file() {
+                    files.push(file);
+                }
+            }
+            let manifest =
+                write_manifest(&dir, &files).expect("manifest failed gap-inventory worker");
+            panic!(
+                "A4C STOP phase={phase} candidate={program_name} measurement=exhaustive-gap-inventory status={} wall_s={:.3} manifest={manifest}",
+                outcome.status, outcome.wall_s,
+            );
+        }
+
+        let memory_peaks = outcome
+            .memory_receipt
+            .require_complete()
+            .expect("completed gap-inventory worker requires both memory metrics");
+        assert_eq!(
+            fs::read(dir.join("gap-sites.tsv")).expect("read gap-inventory rows"),
+            fs::read(dir.join("checkpoint.tsv")).expect("read gap-inventory checkpoint"),
+            "A4C STOP phase=gap-inventory-finalize candidate={program_name}: checkpoint byte drift"
+        );
+        let rows = parse_exhaustive_gap_inventory(&dir.join("gap-sites.tsv"), program_name)
+            .unwrap_or_else(|error| {
+                panic!("A4C STOP phase=gap-inventory-schema candidate={program_name}: {error}")
+            });
+        let typed_zero_count = rows
+            .iter()
+            .filter(|row| row[5] == "out-of-pointer-universe")
+            .count();
+        let anchored_count = rows.len() - typed_zero_count;
+        let receipt = format!(
+            "machine_id={MACHINE_ID}\nplatform={PLATFORM}\nmeasurement_class=exhaustive-gap-inventory\nsemantic_data=false\ncompleted=true\ncandidate_processing=false\nstopping_rule={GAP_INVENTORY_STOPPING_RULE}\nmemory_limit=cgroup-100GiB\nmemory_max_bytes={CANDIDATE_MEMORY_MAX_BYTES}\ncap_verified={}\noom_kills={}\nmemory_max_events={}\noom_killer=none\nwall_bound_kind=liveness\nwall_cap_s={LIVENESS_BOUND_S}\nprogram={program_name}\nunits_covered={units_covered}\ngap_sites={}\ntyped_zero_sites={typed_zero_count}\nanchored_sites={anchored_count}\nstatus=ok\nanalysis_head={}\nwall_s={:.3}\n{}memory_receipt_error=none\n",
+            outcome.cap_verified,
+            outcome.oom_kills,
+            outcome.memory_max_events,
+            rows.len(),
+            contract.head,
+            outcome.wall_s,
+            render_candidate_memory_receipt(memory_peaks),
+        );
+        fs::write(dir.join("receipt.txt"), receipt).expect("write completed gap-inventory receipt");
+        let manifest = write_manifest(
+            &dir,
+            &[
+                "checkpoint.tsv",
+                "gap-sites.tsv",
+                "memory-preflight.txt",
+                "receipt.txt",
+                "time.txt",
+                "worker.err",
+                "worker.out",
+            ],
+        )
+        .expect("manifest completed gap-inventory worker");
+        all_rows.extend(rows);
+        records.push(GapInventoryProgramRecord {
+            program: program_name.to_owned(),
+            units_covered,
+            gap_count: all_rows.iter().filter(|row| row[0] == program_name).count(),
+            typed_zero_count,
+            anchored_count,
+            manifest,
+            wall_s: outcome.wall_s,
+            memory_peaks,
+        });
+        write_atomic_checkpoint(
+            &root.join("partial.tsv"),
+            &render_gap_inventory_checkpoint(&records),
+        )
+        .expect("write gap-inventory controller checkpoint");
+    }
+
+    assert_eq!(records.len(), GAP_INVENTORY_SCOPE.len());
+    assert_eq!(
+        records
+            .iter()
+            .map(|record| record.units_covered)
+            .sum::<usize>(),
+        143,
+        "A4C STOP phase=gap-inventory-scope candidate=none: total unit denominator drift"
+    );
+    all_rows.sort();
+    assert_eq!(
+        all_rows.iter().cloned().collect::<BTreeSet<_>>().len(),
+        all_rows.len(),
+        "A4C STOP phase=gap-inventory-schema candidate=none: duplicate aggregate row"
+    );
+    let mut combined = format!("{GAP_INVENTORY_METADATA}\n{GAP_INVENTORY_HEADER}\n");
+    for row in &all_rows {
+        combined.push_str(&row.join("\t"));
+        combined.push('\n');
+    }
+    write_atomic_checkpoint(&root.join("gap-sites.tsv"), &combined)
+        .expect("write aggregate exhaustive gap inventory");
+
+    let mut grouped = BTreeMap::<(String, String, String, String), usize>::new();
+    for row in &all_rows {
+        let source_group = gap_inventory_source_group(row).unwrap_or_else(|error| {
+            panic!("A4C STOP phase=gap-inventory-group candidate=none: {error}")
+        });
+        *grouped
+            .entry((row[0].clone(), source_group, row[1].clone(), row[5].clone()))
+            .or_default() += 1;
+    }
+    let mut grouped_rows = "program\tsource_group\tkind\tanchor_status\tgap_count\n".to_owned();
+    for ((program, source_group, kind, status), count) in &grouped {
+        grouped_rows.push_str(&format!(
+            "{program}\t{source_group}\t{kind}\t{status}\t{count}\n"
+        ));
+    }
+    fs::write(root.join("grouped.tsv"), grouped_rows).expect("write grouped gap inventory");
+
+    let typed_zero_count = records
+        .iter()
+        .map(|record| record.typed_zero_count)
+        .sum::<usize>();
+    let anchored_count = records
+        .iter()
+        .map(|record| record.anchored_count)
+        .sum::<usize>();
+    let wall_sum = records.iter().map(|record| record.wall_s).sum::<f64>();
+    let peak_rss = records
+        .iter()
+        .map(|record| record.memory_peaks.process_peak_rss_kb)
+        .max()
+        .unwrap_or(0);
+    let cgroup_peak = records
+        .iter()
+        .map(|record| record.memory_peaks.cgroup_peak_memory_kb)
+        .max()
+        .unwrap_or(0);
+    let report = format!(
+        "# Exhaustive gap-site inventory\n\n- stopping rule: `{GAP_INVENTORY_STOPPING_RULE}`\n- scope: brotli 112 units; lodepng 31 units\n- candidate processing: false\n- semantic data: false\n- gap sites: {}\n- typed out-of-pointer-universe: {typed_zero_count}\n- graph-anchored: {anchored_count}\n- pointer-free-table hypothesis: measured, not assumed\n- wall sum on {MACHINE_ID}: {wall_sum:.3} s\n- peak GNU-time RSS: {peak_rss} KiB\n- peak cgroup memory: {cgroup_peak} KiB\n",
+        all_rows.len(),
+    );
+    fs::write(root.join("report.md"), report).expect("write exhaustive gap-inventory report");
+    let provenance = format!(
+        "machine_id={MACHINE_ID}\nplatform={PLATFORM}\nanalysis_head={}\nanalysis_branch=codex/a4-source-census\nmeasurement_class=exhaustive-gap-inventory\nsemantic_data=false\ncandidate_processing=false\nstopping_rule={GAP_INVENTORY_STOPPING_RULE}\nderived_substrate_digest={DERIVED_SUBSTRATE_DIGEST}\nwall_bound_kind=liveness\nwall_cap_s={LIVENESS_BOUND_S}\nmemory_limit=cgroup-100GiB\nprograms=brotli,lodepng\nunits_covered=143\ngap_sites={}\ntyped_zero_sites={typed_zero_count}\nanchored_sites={anchored_count}\nprogram_manifests={}\nwall_sum_s={wall_sum:.3}\npeak_rss_kb={peak_rss}\ncgroup_peak_memory_kb={cgroup_peak}\ntiming_comparison=forbidden-across-machines\n",
+        contract.head,
+        all_rows.len(),
+        records
+            .iter()
+            .map(|record| format!("{}:{}", record.program, record.manifest))
+            .collect::<Vec<_>>()
+            .join(","),
+    );
+    fs::write(root.join("provenance.txt"), provenance)
+        .expect("write exhaustive gap-inventory provenance");
+    let manifest = write_manifest(
+        &root,
+        &[
+            "gap-sites.tsv",
+            "grouped.tsv",
+            "partial.tsv",
+            "provenance.txt",
+            "report.md",
+        ],
+    )
+    .expect("manifest exhaustive gap-inventory aggregate");
+    eprintln!(
+        "A4C exhaustive gap inventory complete manifest={manifest} stopping_rule={GAP_INVENTORY_STOPPING_RULE} gap_sites={} typed_zero={typed_zero_count} anchored={anchored_count}",
+        all_rows.len()
+    );
+}
+
 fn render_string_rows(header: &str, rows: &[Vec<String>]) -> String {
     let mut out = format!("{header}\n");
     for row in rows {
@@ -9063,6 +9506,14 @@ fn run_gap_attribution_probe(contract: &MeasurementContract) {
         "A4C gap attribution complete manifest={manifest} unique_affected_candidates={}",
         affected.len()
     );
+}
+
+#[test]
+#[ignore = "A4 exhaustive gap-site inventory; run once sequentially on the dedicated Linux lane"]
+fn a4_source_gap_inventory() {
+    let contract = measurement_contract();
+    enforce_substrate_preflight(&contract);
+    run_exhaustive_gap_inventory(&contract);
 }
 
 #[test]
@@ -10556,6 +11007,71 @@ mod tests {
             projected_gap_disposition(true, &[]).is_err(),
             "an empty base set remains unresolved"
         );
+    }
+
+    #[test]
+    fn exhaustive_gap_inventory_keeps_multiple_sites_from_one_program() {
+        let source = r#"
+            struct ScalarTable {
+                left: u16,
+                right: u16,
+            }
+
+            pub unsafe fn store_left(table: *mut ScalarTable, value: u16) {
+                let alias = table;
+                (*alias).left = value;
+            }
+
+            pub unsafe fn store_right(table: *mut ScalarTable, value: u16) {
+                let alias = table;
+                (*alias).right = value;
+            }
+        "#;
+        ::utils::compilation::run_compiler_on_str(source, |tcx| {
+            let (_, _, gaps) = collect_source_graph_gap_attribution(tcx)
+                .expect("both same-program gaps must complete classification");
+            let rendered = render_exhaustive_gap_inventory("fixture", &gaps);
+            let mut lines = rendered.lines();
+            assert_eq!(
+                lines.next(),
+                Some("# stopping_rule=exhaustive-per-program-no-first-panic-truncation")
+            );
+            assert_eq!(lines.next(), Some(GAP_INVENTORY_HEADER));
+            let rows = lines.collect::<Vec<_>>();
+            assert_eq!(rows.len(), 2, "no first-gap truncation: {rows:#?}");
+            assert!(
+                rows.iter()
+                    .all(|row| row.contains("\tout-of-pointer-universe\t0\tnot-applicable")),
+                "both scalar table stores must be mechanically typed zero: {rows:#?}"
+            );
+
+            let path = std::env::temp_dir().join(format!(
+                "a4-exhaustive-gap-inventory-schema-{}.tsv",
+                process::id()
+            ));
+            fs::write(&path, &rendered).expect("write exhaustive inventory fixture");
+            assert_eq!(
+                parse_exhaustive_gap_inventory(&path, "fixture")
+                    .expect("exact stopping rule must parse")
+                    .len(),
+                2
+            );
+            fs::write(
+                &path,
+                rendered.replacen(
+                    GAP_INVENTORY_METADATA,
+                    "# stopping_rule=first-panic-truncation",
+                    1,
+                ),
+            )
+            .expect("write truncated-rule fixture");
+            assert!(
+                parse_exhaustive_gap_inventory(&path, "fixture").is_err(),
+                "a completed artifact cannot misstate the stopping rule"
+            );
+            fs::remove_file(path).expect("remove exhaustive inventory fixture");
+        })
+        .unwrap_or_else(|error| error.raise());
     }
 
     #[test]
