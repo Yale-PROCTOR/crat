@@ -36,6 +36,7 @@ use crate::{
 pub(crate) mod array_local_index_rewriter;
 pub(crate) mod array_local_trace;
 pub(crate) mod collector;
+mod cursor_assessment;
 pub(crate) mod decision;
 pub(crate) mod diagnostics;
 mod epoch_split;
@@ -140,6 +141,8 @@ pub fn replace_local_borrows(config: &Config, tcx: TyCtxt<'_>) -> (String, Bytem
     let mut offset_sign_result = analyses::offset_sign::sign::offset_sign_analysis(&input);
     offset_sign_result.access_signs =
         source_var_groups.postprocess_offset_signs(offset_sign_result.access_signs);
+    offset_sign_result.definite_signs =
+        source_var_groups.postprocess_offset_signs(offset_sign_result.definite_signs);
     let mut nullity_result = analyses::nullity::analyze(&input, &points_to);
     nullity_result.non_null_locals =
         source_var_groups.postprocess_non_null_locals(nullity_result.non_null_locals);
@@ -172,6 +175,15 @@ pub fn replace_local_borrows(config: &Config, tcx: TyCtxt<'_>) -> (String, Bytem
         &tss,
         &fn_ptr_groups,
     );
+
+    if std::env::var("CRAT_CURSOR_ASSESS").is_ok() {
+        cursor_assessment::assess(
+            &input,
+            &analysis_results,
+            &fn_ptr_groups,
+            &pre_points_to.alloc_fns,
+        );
+    }
 
     let diagnostics = diagnostics::DecisionDiagnostics::from_env();
     let mut visitor = TransformVisitor::new(
