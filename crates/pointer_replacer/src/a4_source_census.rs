@@ -581,6 +581,50 @@ fn trace_candidate(graph: &SourceGraph, target: &str) -> Vec<RootTrace> {
     roots.into_values().collect()
 }
 
+fn reachable_source_nodes(graph: &SourceGraph, target: &str) -> BTreeSet<String> {
+    let mut reachable = BTreeSet::new();
+    let mut work = VecDeque::from([target.to_owned()]);
+    while let Some(node) = work.pop_front() {
+        if !reachable.insert(node.clone()) {
+            continue;
+        }
+        work.extend(
+            graph
+                .incoming
+                .get(&node)
+                .into_iter()
+                .flatten()
+                .map(|edge| edge.source.clone()),
+        );
+    }
+    reachable
+}
+
+fn attribute_gap_candidates(
+    graph: &SourceGraph,
+    candidates: &[String],
+    gap_anchors: &BTreeMap<GraphShapeGap, BTreeSet<String>>,
+) -> Result<BTreeMap<GraphShapeGap, Vec<String>>, String> {
+    let reachable = candidates
+        .iter()
+        .map(|candidate| (candidate, reachable_source_nodes(graph, candidate)))
+        .collect::<Vec<_>>();
+    gap_anchors
+        .iter()
+        .map(|(gap, anchors)| {
+            if anchors.is_empty() {
+                return Err(format!("gap has no graph anchor: {gap:?}"));
+            }
+            let candidates = reachable
+                .iter()
+                .filter(|(_, nodes)| !nodes.is_disjoint(anchors))
+                .map(|(candidate, _)| (*candidate).clone())
+                .collect();
+            Ok((gap.clone(), candidates))
+        })
+        .collect()
+}
+
 fn field_key(tcx: TyCtxt<'_>, slots: &CrateSlots, field: SlotId) -> String {
     let slot = slots.field_slots.slot(field);
     let SlotOwner::Field(owner) = slot.owner else {
@@ -1358,12 +1402,14 @@ fn static_pointer_locals(
                     tcx.def_path_str(previous),
                     tcx.def_path_str(static_did)
                 );
-                if record_graph_shape_gap(GraphShapeGap {
+                let gap = GraphShapeGap {
                     kind: "multiple-static-seed-identities",
                     function: tcx.def_path_str(fn_did.to_def_id()),
                     site: format!("bb{}[{statement_index}] {local:?}", bb.index()),
                     detail: error.clone(),
-                }) {
+                };
+                if record_graph_shape_gap(gap.clone()) {
+                    record_graph_gap_anchor(gap, GraphGapAnchor::MirLocal { fn_did, local });
                     continue;
                 }
                 return Err(error);
@@ -1388,10 +1434,64 @@ struct GraphShapeGap {
     detail: String,
 }
 
+#[derive(Clone, Debug)]
+enum GraphGapAnchor {
+    MirLocal { fn_did: LocalDefId, local: Local },
+    Node(String),
+}
+
 thread_local! {
     static GRAPH_SHAPE_GAPS: RefCell<Option<BTreeSet<GraphShapeGap>>> = const {
         RefCell::new(None)
     };
+    static GRAPH_GAP_ANCHORS: RefCell<Option<BTreeMap<GraphShapeGap, Vec<GraphGapAnchor>>>> = const {
+        RefCell::new(None)
+    };
+}
+
+fn begin_graph_shape_gap_collection() {
+    GRAPH_SHAPE_GAPS.with(|slot| {
+        assert!(slot.borrow_mut().replace(BTreeSet::new()).is_none());
+    });
+}
+
+fn take_graph_shape_gaps() -> Vec<GraphShapeGap> {
+    GRAPH_SHAPE_GAPS.with(|slot| {
+        slot.borrow_mut()
+            .take()
+            .expect("shape-gap collection must remain active")
+            .into_iter()
+            .collect()
+    })
+}
+
+fn begin_graph_gap_attribution() {
+    GRAPH_GAP_ANCHORS.with(|slot| {
+        assert!(slot.borrow_mut().replace(BTreeMap::new()).is_none());
+    });
+}
+
+fn graph_gap_attribution_active() -> bool {
+    GRAPH_GAP_ANCHORS.with(|slot| slot.borrow().is_some())
+}
+
+fn record_graph_gap_anchor(gap: GraphShapeGap, anchor: GraphGapAnchor) -> bool {
+    GRAPH_GAP_ANCHORS.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        let Some(gaps) = slot.as_mut() else {
+            return false;
+        };
+        gaps.entry(gap).or_default().push(anchor);
+        true
+    })
+}
+
+fn take_graph_gap_anchors() -> BTreeMap<GraphShapeGap, Vec<GraphGapAnchor>> {
+    GRAPH_GAP_ANCHORS.with(|slot| {
+        slot.borrow_mut()
+            .take()
+            .expect("gap-attribution collection must remain active")
+    })
 }
 
 fn record_graph_shape_gap(gap: GraphShapeGap) -> bool {
@@ -1406,9 +1506,7 @@ fn record_graph_shape_gap(gap: GraphShapeGap) -> bool {
 }
 
 fn collect_source_graph_shape_gaps(tcx: TyCtxt<'_>) -> Vec<GraphShapeGap> {
-    GRAPH_SHAPE_GAPS.with(|slot| {
-        assert!(slot.borrow_mut().replace(BTreeSet::new()).is_none());
-    });
+    begin_graph_shape_gap_collection();
     let result = panic::catch_unwind(AssertUnwindSafe(|| {
         let program = collect_program(tcx);
         let slots = CrateSlots::build(&program);
@@ -1431,13 +1529,7 @@ fn collect_source_graph_shape_gaps(tcx: TyCtxt<'_>) -> Vec<GraphShapeGap> {
             detail,
         }));
     }
-    GRAPH_SHAPE_GAPS.with(|slot| {
-        slot.borrow_mut()
-            .take()
-            .expect("shape-gap collection must remain active")
-            .into_iter()
-            .collect()
-    })
+    take_graph_shape_gaps()
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1547,12 +1639,14 @@ fn insert_static_data_derivation_or_record_gap(
                 tcx.def_path_str(derivation.static_did),
                 derivation.depth_offset,
             );
-            if record_graph_shape_gap(GraphShapeGap {
+            let gap = GraphShapeGap {
                 kind,
                 function: tcx.def_path_str(fn_did.to_def_id()),
                 site,
                 detail,
-            }) {
+            };
+            if record_graph_shape_gap(gap.clone()) {
+                record_graph_gap_anchor(gap, GraphGapAnchor::MirLocal { fn_did, local });
                 Ok(false)
             } else {
                 Err(error)
@@ -1719,12 +1813,23 @@ fn derive_static_data_locals<'tcx>(
         .collect::<Vec<_>>();
     if !invalid.is_empty() {
         let collected = invalid.iter().all(|(local, derivation)| {
-            record_graph_shape_gap(GraphShapeGap {
+            let gap = GraphShapeGap {
                 kind: "invalid-static-depth",
                 function: tcx.def_path_str(fn_did.to_def_id()),
                 site: format!("{local:?}"),
                 detail: format!("depth_offset={}", derivation.depth_offset),
-            })
+            };
+            let recorded = record_graph_shape_gap(gap.clone());
+            if recorded {
+                record_graph_gap_anchor(
+                    gap,
+                    GraphGapAnchor::MirLocal {
+                        fn_did,
+                        local: *local,
+                    },
+                );
+            }
+            recorded
         });
         if collected {
             derivations.retain(|_, derivation| derivation.depth_offset >= -1);
@@ -1904,9 +2009,69 @@ fn add_realized_pointer_alias_store_edges<'tcx>(
                 if aliases.contains_key(&lhs.local)
                     && node_for_place(tcx, slots, fn_did, body, *lhs).is_none()
                 {
-                    return Err(format!(
-                        "unsupported projected realized pointer-alias store {lhs:?}"
-                    ));
+                    let error =
+                        format!("unsupported projected realized pointer-alias store {lhs:?}");
+                    let detail = format!(
+                        "A4C STOP phase=graph-construction candidate=none: realized pointer-alias stores in {}: {error}",
+                        tcx.def_path_str(fn_did)
+                    );
+                    let gap = GraphShapeGap {
+                        kind: "other-graph-construction-stop",
+                        function: "crate".to_owned(),
+                        site: "graph-construction".to_owned(),
+                        detail,
+                    };
+                    if !graph_gap_attribution_active() {
+                        return Err(error);
+                    }
+                    let mut work = VecDeque::from([lhs.local]);
+                    let mut seen = BTreeSet::new();
+                    while let Some(local) = work.pop_front() {
+                        if !seen.insert(local) {
+                            continue;
+                        }
+                        work.extend(aliases.get(&local).into_iter().flatten().copied());
+                    }
+                    seen.remove(&lhs.local);
+                    let anchors = seen
+                        .into_iter()
+                        .map(|base| {
+                            node_for_place_depth(
+                                tcx,
+                                slots,
+                                fn_did,
+                                body,
+                                Place::from(base),
+                                1,
+                            )
+                            .ok_or_else(|| {
+                                format!(
+                                    "projected pointer-alias attribution base has no depth-one graph node: {base:?}"
+                                )
+                            })
+                        })
+                        .collect::<Result<BTreeSet<_>, _>>()?;
+                    if !anchors.is_empty()
+                        && record_graph_gap_anchor(
+                            gap.clone(),
+                            anchors
+                                .iter()
+                                .cloned()
+                                .map(GraphGapAnchor::Node)
+                                .next()
+                                .expect("nonempty attribution anchors"),
+                        )
+                    {
+                        for anchor in anchors.into_iter().skip(1) {
+                            assert!(record_graph_gap_anchor(
+                                gap.clone(),
+                                GraphGapAnchor::Node(anchor),
+                            ));
+                        }
+                        assert!(record_graph_shape_gap(gap));
+                        continue;
+                    }
+                    return Err(error);
                 }
                 continue;
             }
@@ -3141,6 +3306,72 @@ fn build_source_graph(tcx: TyCtxt<'_>, slots: &CrateSlots, export: &BoExport) ->
     graph
 }
 
+fn resolve_graph_gap_anchors(
+    tcx: TyCtxt<'_>,
+    slots: &CrateSlots,
+    raw: BTreeMap<GraphShapeGap, Vec<GraphGapAnchor>>,
+) -> Result<BTreeMap<GraphShapeGap, BTreeSet<String>>, String> {
+    raw.into_iter()
+        .map(|(gap, anchors)| {
+            let mut resolved = BTreeSet::new();
+            for anchor in anchors {
+                match anchor {
+                    GraphGapAnchor::MirLocal { fn_did, local } => {
+                        let body_ref = tcx.mir_drops_elaborated_and_const_checked(fn_did).borrow();
+                        let body = &*body_ref;
+                        for depth in 0..=u8::MAX {
+                            let Some(node) = node_for_place_depth(
+                                tcx,
+                                slots,
+                                fn_did,
+                                body,
+                                Place::from(local),
+                                depth,
+                            ) else {
+                                break;
+                            };
+                            resolved.insert(node);
+                        }
+                    }
+                    GraphGapAnchor::Node(node) => {
+                        resolved.insert(node);
+                    }
+                }
+            }
+            if resolved.is_empty() {
+                return Err(format!("gap has no resolved graph anchor: {gap:?}"));
+            }
+            Ok((gap, resolved))
+        })
+        .collect()
+}
+
+fn collect_source_graph_gap_attribution(
+    tcx: TyCtxt<'_>,
+) -> Result<
+    (
+        CrateSlots,
+        SourceGraph,
+        BTreeMap<GraphShapeGap, BTreeSet<String>>,
+    ),
+    String,
+> {
+    begin_graph_shape_gap_collection();
+    begin_graph_gap_attribution();
+    let program = collect_program(tcx);
+    let slots = CrateSlots::build(&program);
+    let graph = build_source_graph(tcx, &slots, &BoExport::default());
+    let gaps = take_graph_shape_gaps().into_iter().collect::<BTreeSet<_>>();
+    let anchors = resolve_graph_gap_anchors(tcx, &slots, take_graph_gap_anchors())?;
+    let anchored_gaps = anchors.keys().cloned().collect::<BTreeSet<_>>();
+    if gaps != anchored_gaps {
+        return Err(format!(
+            "gap/anchor identity mismatch: gaps={gaps:?} anchors={anchored_gaps:?}"
+        ));
+    }
+    Ok((slots, graph, anchors))
+}
+
 const A4_INPUT_HEADER: &str = "program\tfield_key\tfield_slot\tbaseline_kind\tbaseline_force\tbaseline_core_families\tproof_eligible\tproof_reason\tselected_own_assumes\tsource_selector_indices\tnecessary_labels\trelaxed_force\trelaxed_kind\trelaxed_core_families\trelaxed_core_labels";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -3557,6 +3788,10 @@ fn replay_none_disposition(reason_unknown: Option<String>) -> Result<&'static st
 }
 
 const GRAPH_SHAPE_HEADER: &str = "program\tkind\tfunction\tsite\tdetail";
+const GAP_ATTRIBUTION_HEADER: &str = "program\tkind\tfunction\tsite\tdetail\tfield_key";
+const GAP_IMPACT_HEADER: &str =
+    "program\tkind\tfunction\tsite\tdetail\tanchor_count\taffected_candidate_count";
+const GAP_ANCHOR_HEADER: &str = "program\tkind\tfunction\tsite\tdetail\tanchor";
 
 fn render_graph_shape_gaps(program: &str, gaps: &[GraphShapeGap]) -> String {
     let mut out = format!("{GRAPH_SHAPE_HEADER}\n");
@@ -3604,7 +3839,140 @@ fn run_shape_census_worker(tcx: TyCtxt<'_>, t_tcx: Duration) -> Row {
     row
 }
 
+fn run_gap_attribution_worker(tcx: TyCtxt<'_>, t_tcx: Duration) -> Row {
+    let started = Instant::now();
+    let program = std::env::var("CRAT_BOC1_NAME").expect("gap-attribution worker program name");
+    let input_path =
+        PathBuf::from(std::env::var_os("CRAT_A4_SOURCE_INPUT").expect("gap-attribution A4 input"));
+    let expected_gap_path = PathBuf::from(
+        std::env::var_os("CRAT_A4_GAP_SITES").expect("gap-attribution expected gap sites"),
+    );
+    let mapping_path = PathBuf::from(
+        std::env::var_os("CRAT_A4_GAP_MAPPING").expect("gap-attribution mapping output"),
+    );
+    let impact_path = PathBuf::from(
+        std::env::var_os("CRAT_A4_GAP_IMPACT").expect("gap-attribution impact output"),
+    );
+    let anchors_path = PathBuf::from(
+        std::env::var_os("CRAT_A4_GAP_ANCHORS").expect("gap-attribution anchors output"),
+    );
+    let checkpoint_path = PathBuf::from(
+        std::env::var_os("CRAT_A4_GAP_CHECKPOINT").expect("gap-attribution checkpoint output"),
+    );
+    let expected_units = std::env::var("CRAT_A4_GAP_EXPECTED_UNITS")
+        .expect("gap-attribution expected units")
+        .parse::<usize>()
+        .expect("numeric gap-attribution expected units");
+
+    emit_phase(started, "gap-attribution-graph", None, 0);
+    let expected_gaps = parse_graph_shape_rows(&expected_gap_path, &program)
+        .unwrap_or_else(|error| panic!("A4C STOP phase=gap-input candidate=none: {error}"));
+    let input = parse_a4_input(&input_path)
+        .unwrap_or_else(|error| panic!("A4C STOP phase=gap-input candidate=none: {error}"));
+    let mut candidates = input
+        .into_iter()
+        .filter(|row| {
+            row.program == program
+                && (row.proof_reason == "allocation-source-count-0" || row.baseline_force == "sat")
+        })
+        .map(|row| row.field_key)
+        .collect::<Vec<_>>();
+    candidates.sort();
+    assert_eq!(
+        candidates.len(),
+        expected_units,
+        "A4C STOP phase=gap-identity candidate=none: unit denominator drift"
+    );
+
+    let (slots, graph, anchors) = collect_source_graph_gap_attribution(tcx)
+        .unwrap_or_else(|error| panic!("A4C STOP phase=gap-graph candidate=none: {error}"));
+    let expected = expected_gaps.into_iter().collect::<BTreeSet<_>>();
+    let actual = anchors.keys().cloned().collect::<BTreeSet<_>>();
+    assert_eq!(
+        actual, expected,
+        "A4C STOP phase=gap-identity candidate=none: gap-site drift"
+    );
+    let fields = candidate_fields(tcx, &slots);
+    for candidate in &candidates {
+        assert!(
+            fields.contains_key(candidate),
+            "A4C STOP phase=gap-identity candidate={candidate}: candidate has no field graph node"
+        );
+    }
+    let attributed = attribute_gap_candidates(&graph, &candidates, &anchors)
+        .unwrap_or_else(|error| panic!("A4C STOP phase=gap-attribution candidate=none: {error}"));
+
+    let mut mapping = format!("{GAP_ATTRIBUTION_HEADER}\n");
+    let mut impact = format!("{GAP_IMPACT_HEADER}\n");
+    let mut rendered_anchors = format!("{GAP_ANCHOR_HEADER}\n");
+    for (gap, gap_anchors) in &anchors {
+        for anchor in gap_anchors {
+            rendered_anchors.push_str(&format!(
+                "{}\t{}\t{}\t{}\t{}\t{}\n",
+                clean_cell(&program),
+                gap.kind,
+                clean_cell(&gap.function),
+                clean_cell(&gap.site),
+                clean_cell(&gap.detail),
+                clean_cell(anchor),
+            ));
+        }
+        let affected = &attributed[gap];
+        impact.push_str(&format!(
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+            clean_cell(&program),
+            gap.kind,
+            clean_cell(&gap.function),
+            clean_cell(&gap.site),
+            clean_cell(&gap.detail),
+            gap_anchors.len(),
+            affected.len(),
+        ));
+        for candidate in affected {
+            mapping.push_str(&format!(
+                "{}\t{}\t{}\t{}\t{}\t{}\n",
+                clean_cell(&program),
+                gap.kind,
+                clean_cell(&gap.function),
+                clean_cell(&gap.site),
+                clean_cell(&gap.detail),
+                clean_cell(candidate),
+            ));
+        }
+    }
+    write_atomic_checkpoint(&checkpoint_path, &mapping)
+        .unwrap_or_else(|error| panic!("A4C STOP phase=gap-checkpoint candidate=none: {error}"));
+    emit_phase(started, "gap-checkpoint-written", None, candidates.len());
+    write_atomic_checkpoint(&mapping_path, &mapping)
+        .unwrap_or_else(|error| panic!("A4C STOP phase=gap-finalize candidate=mapping: {error}"));
+    write_atomic_checkpoint(&impact_path, &impact)
+        .unwrap_or_else(|error| panic!("A4C STOP phase=gap-finalize candidate=impact: {error}"));
+    write_atomic_checkpoint(&anchors_path, &rendered_anchors)
+        .unwrap_or_else(|error| panic!("A4C STOP phase=gap-finalize candidate=anchors: {error}"));
+    emit_phase(started, "gap-attribution-complete", None, candidates.len());
+
+    let mut row = Row::default();
+    row.set("program", program);
+    row.set("gap_count", anchors.len());
+    row.set(
+        "mapping_rows",
+        attributed.values().map(Vec::len).sum::<usize>(),
+    );
+    row.set("candidate_processing", "attribution-only");
+    row.set("semantic_data", "false");
+    row.set("t_tcx_s", format!("{:.3}", t_tcx.as_secs_f64()));
+    row.set("status", "ok");
+    row.set(
+        "t_total_s",
+        format!("{:.3}", started.elapsed().as_secs_f64()),
+    );
+    row
+}
+
 pub(super) fn run_worker(tcx: TyCtxt<'_>, t_tcx: Duration) -> Row {
+    if std::env::var("CRAT_A4_SOURCE_GAP_ATTRIBUTION").as_deref() == Ok("1") {
+        return run_gap_attribution_worker(tcx, t_tcx);
+    }
     if std::env::var("CRAT_A4_SOURCE_SHAPE_CENSUS").as_deref() == Ok("1") {
         return run_shape_census_worker(tcx, t_tcx);
     }
@@ -4024,6 +4392,24 @@ const CANDIDATE_MEMORY_MAX_BYTES: u64 = 100 * 1024 * 1024 * 1024;
 const HOST_MEMORY_MARGIN_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 const GRAPH_SHAPE_CENSUS_SCOPE: [(&str, usize); 3] =
     [("bzip2", 23), ("brotli", 112), ("lodepng", 31)];
+const GAP_SITE_SOURCE_ROOT: &str =
+    "/home/p51lee/dev/agent-worktrees/crat-a4-shape-census-run-20260816-v4FADj7h/shape-census";
+const GAP_SITE_AGGREGATE_MANIFEST: &str =
+    "0b4fbd4387e567a4312e544ff1034857ca8ad5495f05878a6229235d331a970f";
+const GAP_SITE_PROGRAM_MANIFESTS: [(&str, &str); 3] = [
+    (
+        "bzip2",
+        "64a8b62038d941d6bd3926293e78b1293696ade6def58fc79e9f2d3b5681b391",
+    ),
+    (
+        "brotli",
+        "e0020c6ed6fec6e91469e9d7579c3b53e1a65e55cbc40ce628abbf229135288a",
+    ),
+    (
+        "lodepng",
+        "a64312c9ce24992213c5933f5b70e96817d6852f01dc25d08860929a0ed66206",
+    ),
+];
 const LIL_ORACLE_PARTIAL_SHA256: &str =
     "86c9e73d0e419a08e04c6ff3ac91531d948cbc31a8acb80d9c5f7cd238587feb";
 const RATIFIED_TYPED_EXCLUSION_PROGRAM: &str = "lil";
@@ -7801,6 +8187,55 @@ fn parse_graph_shape_rows(
     Ok(gaps)
 }
 
+fn verify_gap_site_source() -> Result<BTreeMap<String, Vec<GraphShapeGap>>, String> {
+    let root = Path::new(GAP_SITE_SOURCE_ROOT);
+    let aggregate_manifest = verify_manifest(root)?;
+    if aggregate_manifest != GAP_SITE_AGGREGATE_MANIFEST {
+        return Err(format!(
+            "gap-site aggregate manifest drift: expected={GAP_SITE_AGGREGATE_MANIFEST} actual={aggregate_manifest}"
+        ));
+    }
+    let combined = parse_table(&root.join("shapes.tsv"), GRAPH_SHAPE_HEADER, 5)?;
+    if combined.len() != 4 {
+        return Err(format!(
+            "gap-site aggregate expected four rows, got {}",
+            combined.len()
+        ));
+    }
+    let mut by_program = BTreeMap::new();
+    for (program, expected_manifest) in GAP_SITE_PROGRAM_MANIFESTS {
+        let dir = root.join(program);
+        let manifest = verify_manifest(&dir)?;
+        if manifest != expected_manifest {
+            return Err(format!(
+                "gap-site program manifest drift: program={program} expected={expected_manifest} actual={manifest}"
+            ));
+        }
+        by_program.insert(
+            program.to_owned(),
+            parse_graph_shape_rows(&dir.join("shapes.tsv"), program)?,
+        );
+    }
+    let rendered = by_program
+        .iter()
+        .flat_map(|(program, gaps)| {
+            gaps.iter().map(move |gap| {
+                vec![
+                    program.clone(),
+                    gap.kind.to_owned(),
+                    gap.function.clone(),
+                    gap.site.clone(),
+                    gap.detail.clone(),
+                ]
+            })
+        })
+        .collect::<BTreeSet<_>>();
+    if rendered != combined.into_iter().collect() {
+        return Err("gap-site aggregate/program row mismatch".to_owned());
+    }
+    Ok(by_program)
+}
+
 fn render_graph_shape_program_checkpoint(records: &[GraphShapeProgramRecord]) -> String {
     let mut out = "measurement_class=shape-only\nsemantic_data=false\ncandidate_processing=false\n\nprogram\tunits_covered\tshape_count\tmanifest_sha256\twall_s\tpeak_rss_kb\tcgroup_peak_memory_kb\n".to_owned();
     for record in records {
@@ -8061,12 +8496,343 @@ fn run_graph_shape_census(contract: &MeasurementContract) {
     );
 }
 
+fn render_string_rows(header: &str, rows: &[Vec<String>]) -> String {
+    let mut out = format!("{header}\n");
+    for row in rows {
+        out.push_str(&row.join("\t"));
+        out.push('\n');
+    }
+    out
+}
+
+fn run_gap_attribution_probe(contract: &MeasurementContract) {
+    use super::orchestrate::workspace_root;
+
+    let registered = verify_gap_site_source().unwrap_or_else(|error| {
+        panic!("A4C STOP phase=gap-source-verification candidate=none: {error}")
+    });
+    let root = contract.run_root.join("gap-attribution");
+    assert!(
+        !root.exists(),
+        "A4C STOP phase=gap-setup candidate=none: attribution directory must be fresh"
+    );
+    fs::create_dir(&root).expect("create gap-attribution directory");
+
+    let mut all_mapping = Vec::<Vec<String>>::new();
+    let mut all_impact = Vec::<Vec<String>>::new();
+    let mut all_anchors = Vec::<Vec<String>>::new();
+    let mut program_records = Vec::<(
+        String,
+        usize,
+        usize,
+        usize,
+        String,
+        f64,
+        CandidateMemoryPeaks,
+    )>::new();
+
+    for &(program_name, units_covered) in &GRAPH_SHAPE_CENSUS_SCOPE {
+        let actual_units = isolated_identities(contract, program_name).len();
+        assert_eq!(
+            actual_units, units_covered,
+            "A4C STOP phase=gap-scope candidate={program_name}: unit denominator drift"
+        );
+        let expected_gaps = &registered[program_name];
+        let program = contract
+            .programs
+            .iter()
+            .copied()
+            .find(|program| program.name == program_name)
+            .expect("gap-attribution program in measurement contract");
+        let dir = root.join(program_name);
+        fs::create_dir(&dir).expect("create gap-attribution program directory");
+        let preflight = fs::read_to_string("/proc/meminfo")
+            .map(|meminfo| evaluate_host_memory_preflight(&meminfo))
+            .unwrap_or_else(|error| HostMemoryPreflight {
+                mem_available_bytes: None,
+                required_bytes: CANDIDATE_MEMORY_MAX_BYTES + HOST_MEMORY_MARGIN_BYTES,
+                status: "host-memory-unavailable",
+                error: Some(format!("read /proc/meminfo: {error}")),
+            });
+        let timestamp_unix_s = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock before Unix epoch")
+            .as_secs();
+        fs::write(
+            dir.join("memory-preflight.txt"),
+            preflight.render(program_name, "gap-attribution", timestamp_unix_s),
+        )
+        .expect("write gap-attribution memory preflight");
+        if !preflight.launch_allowed() {
+            let manifest = write_manifest(&dir, &["memory-preflight.txt"])
+                .expect("manifest failed gap-attribution preflight");
+            panic!(
+                "A4C STOP phase=gap-memory-preflight candidate={program_name} status={} mem_available_bytes={} required_bytes={} measurement_started=false manifest={manifest}",
+                preflight.status,
+                preflight.mem_available_bytes.unwrap_or(0),
+                preflight.required_bytes,
+            );
+        }
+
+        let input = workspace_root()
+            .join("benchmarks/rs-crown-derived")
+            .join(program.name)
+            .join(program.lib_root);
+        let outcome = run_capped_candidate_child(
+            program_name,
+            &input,
+            &dir,
+            &[
+                ("CRAT_A4_SOURCE_GAP_ATTRIBUTION", "1".to_owned()),
+                (
+                    "CRAT_A4_SOURCE_INPUT",
+                    contract.input_path.display().to_string(),
+                ),
+                (
+                    "CRAT_A4_GAP_SITES",
+                    Path::new(GAP_SITE_SOURCE_ROOT)
+                        .join(program_name)
+                        .join("shapes.tsv")
+                        .display()
+                        .to_string(),
+                ),
+                (
+                    "CRAT_A4_GAP_MAPPING",
+                    dir.join("mapping.tsv").display().to_string(),
+                ),
+                (
+                    "CRAT_A4_GAP_IMPACT",
+                    dir.join("impact.tsv").display().to_string(),
+                ),
+                (
+                    "CRAT_A4_GAP_ANCHORS",
+                    dir.join("anchors.tsv").display().to_string(),
+                ),
+                (
+                    "CRAT_A4_GAP_CHECKPOINT",
+                    dir.join("checkpoint.tsv").display().to_string(),
+                ),
+                ("CRAT_A4_GAP_EXPECTED_UNITS", units_covered.to_string()),
+            ],
+        );
+        if outcome.status != "ok" {
+            let (phase, marker_candidate) = last_phase(&outcome.stderr);
+            let oom_killer = if outcome.oom_kills > 0 {
+                "kernel-oom-killer"
+            } else {
+                "none"
+            };
+            let receipt = format!(
+                "machine_id={MACHINE_ID}\nplatform={PLATFORM}\nmeasurement_class=gap-attribution\nsemantic_data=false\ncompleted=false\ncandidate_processing=attribution-only\nmemory_limit=cgroup-100GiB\nmemory_max_bytes={CANDIDATE_MEMORY_MAX_BYTES}\ncap_verified={}\noom_kills={}\nmemory_max_events={}\noom_killer={oom_killer}\nwall_bound_kind=liveness\nwall_cap_s={LIVENESS_BOUND_S}\nprogram={program_name}\nunits_covered={units_covered}\nstatus={}\nanalysis_head={}\nlast_phase={phase}\nlast_candidate={marker_candidate}\nwall_s={:.3}\n{}memory_receipt_error={}\n",
+                outcome.cap_verified,
+                outcome.oom_kills,
+                outcome.memory_max_events,
+                outcome.status,
+                contract.head,
+                outcome.wall_s,
+                outcome.memory_receipt.render(),
+                clean_cell(outcome.memory_receipt_error.as_deref().unwrap_or("none")),
+            );
+            fs::write(dir.join("receipt.txt"), receipt)
+                .expect("write failed gap-attribution receipt");
+            let mut files = vec![
+                "memory-preflight.txt",
+                "receipt.txt",
+                "worker.out",
+                "worker.err",
+                "time.txt",
+            ];
+            for file in ["anchors.tsv", "checkpoint.tsv", "impact.tsv", "mapping.tsv"] {
+                if dir.join(file).is_file() {
+                    files.push(file);
+                }
+            }
+            let manifest =
+                write_manifest(&dir, &files).expect("manifest failed gap-attribution worker");
+            panic!(
+                "A4C STOP phase={phase} candidate={program_name} measurement=gap-attribution status={} wall_s={:.3} manifest={manifest}",
+                outcome.status, outcome.wall_s,
+            );
+        }
+        let memory_peaks = outcome
+            .memory_receipt
+            .require_complete()
+            .expect("completed gap-attribution worker requires both memory metrics");
+        assert_eq!(
+            fs::read(dir.join("mapping.tsv")).expect("read gap mapping"),
+            fs::read(dir.join("checkpoint.tsv")).expect("read gap checkpoint"),
+            "A4C STOP phase=gap-finalize candidate={program_name}: checkpoint byte drift"
+        );
+        let mapping = parse_table(&dir.join("mapping.tsv"), GAP_ATTRIBUTION_HEADER, 6)
+            .unwrap_or_else(|error| {
+                panic!("A4C STOP phase=gap-schema candidate={program_name}: {error}")
+            });
+        let impact =
+            parse_table(&dir.join("impact.tsv"), GAP_IMPACT_HEADER, 7).unwrap_or_else(|error| {
+                panic!("A4C STOP phase=gap-schema candidate={program_name}: {error}")
+            });
+        let anchors =
+            parse_table(&dir.join("anchors.tsv"), GAP_ANCHOR_HEADER, 6).unwrap_or_else(|error| {
+                panic!("A4C STOP phase=gap-schema candidate={program_name}: {error}")
+            });
+        assert_eq!(
+            impact.len(),
+            expected_gaps.len(),
+            "A4C STOP phase=gap-schema candidate={program_name}: impact row count drift"
+        );
+        assert!(
+            mapping.iter().all(|row| row[0] == program_name)
+                && impact.iter().all(|row| row[0] == program_name)
+                && anchors.iter().all(|row| row[0] == program_name),
+            "A4C STOP phase=gap-schema candidate={program_name}: output program drift"
+        );
+        assert_eq!(
+            mapping.iter().cloned().collect::<BTreeSet<_>>().len(),
+            mapping.len(),
+            "A4C STOP phase=gap-schema candidate={program_name}: duplicate mapping row"
+        );
+        let receipt = format!(
+            "machine_id={MACHINE_ID}\nplatform={PLATFORM}\nmeasurement_class=gap-attribution\nsemantic_data=false\ncompleted=true\ncandidate_processing=attribution-only\nmemory_limit=cgroup-100GiB\nmemory_max_bytes={CANDIDATE_MEMORY_MAX_BYTES}\ncap_verified={}\noom_kills={}\nmemory_max_events={}\noom_killer=none\nwall_bound_kind=liveness\nwall_cap_s={LIVENESS_BOUND_S}\nprogram={program_name}\nunits_covered={units_covered}\ngap_sites={}\nmapping_rows={}\nstatus=ok\nanalysis_head={}\nwall_s={:.3}\n{}memory_receipt_error=none\n",
+            outcome.cap_verified,
+            outcome.oom_kills,
+            outcome.memory_max_events,
+            impact.len(),
+            mapping.len(),
+            contract.head,
+            outcome.wall_s,
+            render_candidate_memory_receipt(memory_peaks),
+        );
+        fs::write(dir.join("receipt.txt"), receipt)
+            .expect("write completed gap-attribution receipt");
+        let manifest = write_manifest(
+            &dir,
+            &[
+                "anchors.tsv",
+                "checkpoint.tsv",
+                "impact.tsv",
+                "mapping.tsv",
+                "memory-preflight.txt",
+                "receipt.txt",
+                "time.txt",
+                "worker.err",
+                "worker.out",
+            ],
+        )
+        .expect("manifest completed gap-attribution worker");
+        all_mapping.extend(mapping);
+        all_impact.extend(impact);
+        all_anchors.extend(anchors);
+        program_records.push((
+            program_name.to_owned(),
+            units_covered,
+            expected_gaps.len(),
+            all_mapping
+                .iter()
+                .filter(|row| row[0] == program_name)
+                .count(),
+            manifest,
+            outcome.wall_s,
+            memory_peaks,
+        ));
+    }
+
+    all_mapping.sort();
+    all_impact.sort();
+    all_anchors.sort();
+    assert_eq!(
+        all_impact.len(),
+        4,
+        "A4C STOP phase=gap-aggregate candidate=none: expected four gap sites"
+    );
+    assert_eq!(
+        program_records.iter().map(|record| record.1).sum::<usize>(),
+        166,
+        "A4C STOP phase=gap-aggregate candidate=none: unit scope drift"
+    );
+    let affected = all_mapping
+        .iter()
+        .map(|row| (row[0].clone(), row[5].clone()))
+        .collect::<BTreeSet<_>>();
+    let mapping = render_string_rows(GAP_ATTRIBUTION_HEADER, &all_mapping);
+    let impact = render_string_rows(GAP_IMPACT_HEADER, &all_impact);
+    let anchors = render_string_rows(GAP_ANCHOR_HEADER, &all_anchors);
+    write_atomic_checkpoint(&root.join("mapping.tsv"), &mapping)
+        .expect("write aggregate gap mapping");
+    write_atomic_checkpoint(&root.join("impact.tsv"), &impact).expect("write aggregate gap impact");
+    write_atomic_checkpoint(&root.join("anchors.tsv"), &anchors)
+        .expect("write aggregate gap anchors");
+    let operational = "program\tgap_sites\tcandidate_workers_hard_blocked\treason\nbzip2\t1\t23\twhole-program-graph-construction-before-candidate\nbrotli\t2\t112\twhole-program-graph-construction-before-candidate\nlodepng\t1\t31\twhole-program-graph-construction-before-candidate\n";
+    fs::write(root.join("operational-scope.tsv"), operational)
+        .expect("write gap operational scope");
+    let peak_rss = program_records
+        .iter()
+        .map(|record| record.6.process_peak_rss_kb)
+        .max()
+        .unwrap_or(0);
+    let cgroup_peak = program_records
+        .iter()
+        .map(|record| record.6.cgroup_peak_memory_kb)
+        .max()
+        .unwrap_or(0);
+    let wall_sum = program_records.iter().map(|record| record.5).sum::<f64>();
+    let per_program = program_records
+        .iter()
+        .map(|record| format!("{}:{}/{}", record.0, record.3, record.1))
+        .collect::<Vec<_>>()
+        .join(",");
+    let report = format!(
+        "# Gap-site to candidate attribution\n\n- gap sites: 4\n- candidate identity scope: 166\n- unique reachable candidates: {}\n- mapping rows: {}\n- per-program mapping/scope: {per_program}\n- semantic data: false\n- ordinary-path operational block: bzip2 23, brotli 112, lodepng 31 candidate workers\n- wall sum on {MACHINE_ID}: {wall_sum:.3} s\n- peak GNU-time RSS: {peak_rss} KiB\n- peak cgroup memory: {cgroup_peak} KiB\n",
+        affected.len(),
+        all_mapping.len(),
+    );
+    fs::write(root.join("report.md"), report).expect("write gap-attribution report");
+    let provenance = format!(
+        "machine_id={MACHINE_ID}\nplatform={PLATFORM}\nanalysis_head={}\nanalysis_branch=codex/a4-source-census\nmeasurement_class=gap-attribution\nsemantic_data=false\ncandidate_processing=attribution-only\nderived_substrate_digest={DERIVED_SUBSTRATE_DIGEST}\ngap_site_source_manifest={GAP_SITE_AGGREGATE_MANIFEST}\nwall_bound_kind=liveness\nwall_cap_s={LIVENESS_BOUND_S}\nmemory_limit=cgroup-100GiB\nprograms=bzip2,brotli,lodepng\nunits_covered=166\ngap_sites=4\nmapping_rows={}\nunique_affected_candidates={}\nprogram_manifests={}\nwall_sum_s={wall_sum:.3}\npeak_rss_kb={peak_rss}\ncgroup_peak_memory_kb={cgroup_peak}\ntiming_comparison=forbidden-across-machines\n",
+        contract.head,
+        all_mapping.len(),
+        affected.len(),
+        program_records
+            .iter()
+            .map(|record| format!("{}:{}", record.0, record.4))
+            .collect::<Vec<_>>()
+            .join(","),
+    );
+    fs::write(root.join("provenance.txt"), provenance).expect("write gap-attribution provenance");
+    let manifest = write_manifest(
+        &root,
+        &[
+            "anchors.tsv",
+            "impact.tsv",
+            "mapping.tsv",
+            "operational-scope.tsv",
+            "provenance.txt",
+            "report.md",
+        ],
+    )
+    .expect("manifest gap-attribution aggregate");
+    assert_eq!(
+        affected.len(),
+        4,
+        "A4C STOP phase=gap-decision candidate=none status=affected-cardinality-{} manifest={manifest}\n{impact}{mapping}",
+        affected.len(),
+    );
+    eprintln!("A4C gap attribution complete manifest={manifest} unique_affected_candidates=4");
+}
+
 #[test]
 #[ignore = "A4 remaining-unit shape census; run once sequentially on the dedicated Linux lane"]
 fn a4_source_shape_census() {
     let contract = measurement_contract();
     enforce_substrate_preflight(&contract);
     run_graph_shape_census(&contract);
+}
+
+#[test]
+#[ignore = "A4 gap-site attribution; run once sequentially on the dedicated Linux lane"]
+fn a4_source_gap_attribution() {
+    let contract = measurement_contract();
+    enforce_substrate_preflight(&contract);
+    run_gap_attribution_probe(&contract);
 }
 
 #[test]
@@ -9479,6 +10245,54 @@ mod tests {
     }
 
     #[test]
+    fn gap_attribution_separates_reachable_and_unrelated_candidates() {
+        let gap = GraphShapeGap {
+            kind: "multi-static-identity-merge",
+            function: "fixture::conditional_static".to_owned(),
+            site: "bb0[1] _2".to_owned(),
+            detail: "local=_2 previous=fixture::LEFT@0 incoming=fixture::RIGHT@0".to_owned(),
+        };
+        let mut graph = SourceGraph::default();
+        graph.add_edge(FlowEdge {
+            source: "gap-anchor".to_owned(),
+            target: "Fixture::field0@d0".to_owned(),
+            kind: FlowEdgeKind::Local,
+            label: "reachable-store".to_owned(),
+            provenance_tags: BTreeSet::new(),
+        });
+        graph.add_edge(FlowEdge {
+            source: "unrelated-source".to_owned(),
+            target: "Fixture::field1@d0".to_owned(),
+            kind: FlowEdgeKind::Local,
+            label: "unrelated-store".to_owned(),
+            provenance_tags: BTreeSet::new(),
+        });
+        graph.canonicalize();
+
+        let actual = attribute_gap_candidates(
+            &graph,
+            &[
+                "Fixture::field0@d0".to_owned(),
+                "Fixture::field1@d0".to_owned(),
+            ],
+            &BTreeMap::from([(gap.clone(), BTreeSet::from(["gap-anchor".to_owned()]))]),
+        )
+        .unwrap();
+
+        assert_eq!(actual[&gap], vec!["Fixture::field0@d0"]);
+        assert!(!actual[&gap].contains(&"Fixture::field1@d0".to_owned()));
+    }
+
+    #[test]
+    #[ignore = "lambda7 exact published gap-site manifest/input witness"]
+    fn published_gap_site_input_verifies_exactly() {
+        let gaps = verify_gap_site_source().expect("published gap-site input must verify");
+        assert_eq!(gaps["bzip2"].len(), 1);
+        assert_eq!(gaps["brotli"].len(), 2);
+        assert_eq!(gaps["lodepng"].len(), 1);
+    }
+
+    #[test]
     fn indirect_hook_visible_default_expands_and_empty_target_stops() {
         let targets = [IndirectTargetSpec {
             canonical_path: "src::fixture::realloc".to_owned(),
@@ -10843,6 +11657,14 @@ mod tests {
             assert!(gaps[0].function.ends_with("choose"));
             assert!(gaps[0].detail.contains("INPUT"));
             assert!(gaps[0].detail.contains("OUTPUT"));
+            let (_, _, anchors) = collect_source_graph_gap_attribution(tcx)
+                .expect("the attribution-only build must resolve the conditional gap anchor");
+            assert_eq!(anchors.len(), 1);
+            assert_eq!(anchors.keys().next(), gaps.first());
+            assert!(
+                anchors.values().all(|nodes| !nodes.is_empty()),
+                "every collected gap must carry a graph anchor: {anchors:#?}"
+            );
         })
         .unwrap_or_else(|error| error.raise());
 
