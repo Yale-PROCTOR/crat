@@ -35,7 +35,7 @@ use crate::{
     FieldIdentity, Literal, LoadedRuleSet, Pattern, PointerVariableMetadata, PointerVariableOrigin,
     RangeLimits, RawMutability, RefMutability, RuleDocument, RuleMatchInput, SkeletonView,
     Statement, StatementPairMetadata, TypeTree, UnaryOperator, ValueIdentity, VariantIdentity,
-    observation::{select_rule_regions, semantic_type_tree},
+    observation::{local_c_foreign_function_symbol, select_rule_regions, semantic_type_tree},
     preservation::{make_disposition_forest, validate_cross_view_topology},
     validator::validate_rule_application_shape,
 };
@@ -1377,6 +1377,7 @@ struct TypeSpeller<'a, 'tcx> {
     implicit_prelude_enabled: bool,
     implicit_prelude_disabled_by: Option<LocalDefId>,
     prelude_module: Option<DefId>,
+    foreign_functions: HashMap<String, Vec<DefId>>,
 }
 
 impl<'a, 'tcx> TypeSpeller<'a, 'tcx> {
@@ -1487,6 +1488,34 @@ impl<'a, 'tcx> TypeSpeller<'a, 'tcx> {
         external_roots.sort_by(|left, right| left.0.cmp(&right.0));
         external_roots.dedup();
 
+        struct ForeignDeclarations<'tcx> {
+            tcx: TyCtxt<'tcx>,
+            functions: HashMap<String, Vec<DefId>>,
+        }
+        impl<'tcx> Visitor<'tcx> for ForeignDeclarations<'tcx> {
+            type NestedFilter = nested_filter::OnlyBodies;
+
+            fn maybe_tcx(&mut self) -> Self::MaybeTyCtxt {
+                self.tcx
+            }
+
+            fn visit_foreign_item(&mut self, item: &'tcx hir::ForeignItem<'tcx>) {
+                let definition = item.owner_id.def_id.to_def_id();
+                if let Some(symbol) = local_c_foreign_function_symbol(definition, self.tcx) {
+                    self.functions
+                        .entry(symbol.to_string())
+                        .or_default()
+                        .push(definition);
+                }
+                intravisit::walk_foreign_item(self, item);
+            }
+        }
+        let mut foreign = ForeignDeclarations {
+            tcx,
+            functions: HashMap::new(),
+        };
+        tcx.hir_visit_all_item_likes_in_crate(&mut foreign);
+
         Self {
             tcx,
             ast_to_hir,
@@ -1496,6 +1525,7 @@ impl<'a, 'tcx> TypeSpeller<'a, 'tcx> {
             implicit_prelude_enabled,
             implicit_prelude_disabled_by,
             prelude_module,
+            foreign_functions: foreign.functions,
         }
     }
 
@@ -1571,6 +1601,20 @@ impl<'a, 'tcx> TypeSpeller<'a, 'tcx> {
                 self.tcx.def_path_str(def_id)
             )
         })
+    }
+
+    fn foreign_function_path(&self, symbol: &str) -> Option<String> {
+        let accessible = self
+            .foreign_functions
+            .get(symbol)?
+            .iter()
+            .filter_map(|definition| {
+                self.value_path(*definition)
+                    .ok()
+                    .map(|path| (*definition, path))
+            })
+            .collect::<Vec<_>>();
+        (accessible.len() == 1).then(|| accessible[0].1.clone())
     }
 
     fn resolve_external_identity(
@@ -2242,9 +2286,10 @@ fn value_spelling(value: &ValueIdentity, renderer: &RuleRenderer<'_, '_, '_>) ->
             .type_speller
             .resolve_external_identity(crate_name, path, Namespace::ValueNS)
             .and_then(|definition| renderer.type_speller.value_path(definition).ok()),
-        ValueIdentity::ForeignFunction { symbol } | ValueIdentity::ForeignStatic { symbol } => {
-            Some(symbol.clone())
+        ValueIdentity::ForeignFunction { symbol } => {
+            renderer.type_speller.foreign_function_path(symbol)
         }
+        ValueIdentity::ForeignStatic { symbol } => Some(symbol.clone()),
         ValueIdentity::Constructor { adt, variant } => {
             let adt = match adt {
                 AdtIdentity::External { crate_name, path } => renderer
@@ -4497,7 +4542,14 @@ impl ForeignFunctionVisitor<'_> {
             return;
         };
         if self.tcx.is_foreign_item(def_id) {
-            self.names.insert(self.tcx.item_name(def_id).to_string());
+            let rust_name = self.tcx.item_name(def_id);
+            self.names.insert(rust_name.to_string());
+            if let Some(symbol) = local_c_foreign_function_symbol(def_id, self.tcx)
+                && symbol != rust_name
+                && self.tcx.codegen_fn_attrs(def_id).link_name.is_some()
+            {
+                self.names.insert(symbol.to_string());
+            }
         }
     }
 }

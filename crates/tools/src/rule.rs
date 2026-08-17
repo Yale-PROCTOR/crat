@@ -494,11 +494,6 @@ fn validate_observation(observation: &Observation, where_: &str) -> Result<(), D
         &observation.target_expression,
         &format!("{where_}.target_expression"),
     )?;
-    if observation.pointer_anchors.is_empty() {
-        return Err(invalid(format!(
-            "{where_}.pointer_anchors must be nonempty"
-        )));
-    }
     let mut anchors = HashSet::new();
     for (index, anchor) in observation.pointer_anchors.iter().enumerate() {
         let anchor_where = format!("{where_}.pointer_anchors[{index}]");
@@ -931,11 +926,6 @@ fn expect_sort(
 }
 
 fn validate_rule(rule: &Rule, where_: &str) -> Result<(), DocumentError> {
-    if rule.pointer_anchors.is_empty() {
-        return Err(invalid(format!(
-            "{where_}.pointer_anchors must be nonempty"
-        )));
-    }
     let mut anchors = HashSet::new();
     for anchor in &rule.pointer_anchors {
         expect_sort(&anchor.id, &[VariableSort::Anchor], where_)?;
@@ -1569,6 +1559,162 @@ enum Walk {
     Reject,
 }
 
+const RIGID_SCAN_FORMAT: &str = "__proctor_rigid_scan_format";
+
+#[derive(Clone, Copy)]
+enum ScanSide {
+    Source,
+    Target,
+}
+
+fn scan_format_argument(expression: &Value, side: ScanSide) -> Option<usize> {
+    let object = expression.as_object()?;
+    if object.get("kind").and_then(Value::as_str) != Some("call") {
+        return None;
+    }
+    let value = object
+        .get("callee")?
+        .as_object()?
+        .get("value")?
+        .as_object()?;
+    match side {
+        ScanSide::Source
+            if value.get("kind").and_then(Value::as_str) == Some("foreign_function") =>
+        {
+            match value.get("symbol").and_then(Value::as_str)? {
+                "scanf" => Some(0),
+                "fscanf" | "sscanf" => Some(1),
+                _ => None,
+            }
+        }
+        ScanSide::Target if value.get("kind").and_then(Value::as_str) == Some("external") => {
+            if value.get("crate").and_then(Value::as_str) != Some("xj_scanf") {
+                return None;
+            }
+            let path = value
+                .get("path")?
+                .as_array()?
+                .iter()
+                .map(Value::as_str)
+                .collect::<Option<Vec<_>>>()?;
+            match path.as_slice() {
+                ["legacy", "scanf"] => Some(0),
+                ["legacy", "brscanf" | "bscanf"] => Some(1),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+fn scan_path(path: &[String]) -> String {
+    path.join("/")
+}
+
+fn mark_scan_format_literals(
+    value: &mut Value,
+    path: &mut Vec<String>,
+    protected: &mut HashMap<String, Value>,
+) -> bool {
+    match value {
+        Value::Object(object)
+            if object.get("kind").and_then(Value::as_str) == Some("literal")
+                && object
+                    .get("value")
+                    .and_then(Value::as_object)
+                    .and_then(|literal| literal.get("kind"))
+                    .and_then(Value::as_str)
+                    .is_some_and(|kind| matches!(kind, "string" | "byte_string" | "c_string")) =>
+        {
+            object.insert(RIGID_SCAN_FORMAT.into(), Value::Bool(true));
+            protected.insert(scan_path(path), object["value"].clone());
+            true
+        }
+        Value::Object(object) => {
+            let mut contains_protected = object
+                .get(RIGID_SCAN_FORMAT)
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            for (key, child) in object.iter_mut() {
+                if key == RIGID_SCAN_FORMAT {
+                    continue;
+                }
+                path.push(key.clone());
+                contains_protected |= mark_scan_format_literals(child, path, protected);
+                path.pop();
+            }
+            if contains_protected {
+                object.insert(RIGID_SCAN_FORMAT.into(), Value::Bool(true));
+            }
+            contains_protected
+        }
+        Value::Array(values) => {
+            let mut contains_protected = false;
+            for (index, child) in values.iter_mut().enumerate() {
+                path.push(index.to_string());
+                contains_protected |= mark_scan_format_literals(child, path, protected);
+                path.pop();
+            }
+            contains_protected
+        }
+        _ => false,
+    }
+}
+
+fn annotate_scan_formats(value: &mut Value, side: ScanSide) -> HashMap<String, Value> {
+    fn visit(
+        value: &mut Value,
+        side: ScanSide,
+        path: &mut Vec<String>,
+        protected: &mut HashMap<String, Value>,
+    ) -> bool {
+        let mut contains_protected = value
+            .get(RIGID_SCAN_FORMAT)
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        if let Some(index) = scan_format_argument(value, side)
+            && let Some(argument) = value
+                .get_mut("arguments")
+                .and_then(Value::as_array_mut)
+                .and_then(|arguments| arguments.get_mut(index))
+        {
+            path.push("arguments".into());
+            path.push(index.to_string());
+            contains_protected |= mark_scan_format_literals(argument, path, protected);
+            path.pop();
+            path.pop();
+        }
+        match value {
+            Value::Object(object) => {
+                for (key, child) in object.iter_mut() {
+                    if key == RIGID_SCAN_FORMAT {
+                        continue;
+                    }
+                    path.push(key.clone());
+                    contains_protected |= visit(child, side, path, protected);
+                    path.pop();
+                }
+                if contains_protected {
+                    object.insert(RIGID_SCAN_FORMAT.into(), Value::Bool(true));
+                }
+            }
+            Value::Array(values) => {
+                for (index, child) in values.iter_mut().enumerate() {
+                    path.push(index.to_string());
+                    contains_protected |= visit(child, side, path, protected);
+                    path.pop();
+                }
+            }
+            _ => {}
+        }
+        contains_protected
+    }
+
+    let mut protected = HashMap::new();
+    visit(value, side, &mut vec![], &mut protected);
+    protected
+}
+
 fn local_sort(value: &str) -> Option<VariableSort> {
     Some(match parse_local_id(value)?.0 {
         "id" => VariableSort::Binding,
@@ -1873,6 +2019,17 @@ fn expression_variable(
     state: &mut SynthesisState,
     mode: Mode,
 ) -> Walk {
+    if left
+        .get(RIGID_SCAN_FORMAT)
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+        || right
+            .get(RIGID_SCAN_FORMAT)
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+    {
+        return Walk::Reject;
+    }
     match state.disagreement(VariableSort::Expression, left, right, mode) {
         Some(value) => Walk::Ok(value),
         None => Walk::Reject,
@@ -2022,13 +2179,17 @@ fn block(left: &Value, right: &Value, state: &mut SynthesisState, mode: Mode) ->
             if left_object["semicolon"] != right_object["semicolon"] {
                 return Walk::Generalize;
             }
-            let Walk::Ok(value) = expression(
+            let value = expression(
                 &left_object["expression"],
                 &right_object["expression"],
                 state,
                 mode,
-            ) else {
-                return Walk::Generalize;
+            );
+            let Walk::Ok(value) = value else {
+                return match value {
+                    Walk::Reject => Walk::Reject,
+                    _ => Walk::Generalize,
+                };
             };
             statements.push(value_object([
                 ("kind", Value::String("expression".into())),
@@ -2461,7 +2622,23 @@ fn struct_expression(left: &Value, right: &Value, state: &mut SynthesisState, mo
 }
 
 fn literal_expression(left: &Value, right: &Value, state: &mut SynthesisState, mode: Mode) -> Walk {
+    let left_rigid = left
+        .get(RIGID_SCAN_FORMAT)
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let right_rigid = right
+        .get(RIGID_SCAN_FORMAT)
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
     let (left_literal, right_literal) = (&left["value"], &right["value"]);
+    if left_rigid || right_rigid {
+        if !left_rigid || !right_rigid || left_literal != right_literal {
+            return Walk::Reject;
+        }
+        let mut value = left.clone();
+        value.as_object_mut().unwrap().remove(RIGID_SCAN_FORMAT);
+        return Walk::Ok(value);
+    }
     if left_literal.get("kind").and_then(Value::as_str) == Some("integer")
         && right_literal.get("kind").and_then(Value::as_str) == Some("integer")
     {
@@ -2763,12 +2940,18 @@ pub fn synthesize_observation_pair(left: &Observation, right: &Observation) -> P
             substitutions: BTreeMap::new(),
         };
     };
-    let source = expression(
-        &left_value["source_expression"],
-        &right_value["source_expression"],
-        &mut state,
-        Mode::Source,
-    );
+    let mut left_source = left_value["source_expression"].clone();
+    let mut right_source = right_value["source_expression"].clone();
+    if annotate_scan_formats(&mut left_source, ScanSide::Source)
+        != annotate_scan_formats(&mut right_source, ScanSide::Source)
+    {
+        return PairSynthesis {
+            rule: None,
+            rejection: Some(PairRejection::Source),
+            substitutions: state.substitutions,
+        };
+    }
+    let source = expression(&left_source, &right_source, &mut state, Mode::Source);
     let Walk::Ok(source) = source else {
         return PairSynthesis {
             rule: None,
@@ -2785,12 +2968,18 @@ pub fn synthesize_observation_pair(left: &Observation, right: &Observation) -> P
             substitutions: state.substitutions,
         };
     }
-    let target = expression(
-        &left_value["target_expression"],
-        &right_value["target_expression"],
-        &mut state,
-        Mode::Target,
-    );
+    let mut left_target = left_value["target_expression"].clone();
+    let mut right_target = right_value["target_expression"].clone();
+    if annotate_scan_formats(&mut left_target, ScanSide::Target)
+        != annotate_scan_formats(&mut right_target, ScanSide::Target)
+    {
+        return PairSynthesis {
+            rule: None,
+            rejection: Some(PairRejection::TargetLookup),
+            substitutions: state.substitutions,
+        };
+    }
+    let target = expression(&left_target, &right_target, &mut state, Mode::Target);
     let Walk::Ok(target) = target else {
         return PairSynthesis {
             rule: None,
@@ -3366,6 +3555,95 @@ fn collect_target_syntax_overrides(
     }
 }
 
+fn contains_foreign_function(value: &Value) -> bool {
+    match value {
+        Value::Object(object) => {
+            object.get("kind").and_then(Value::as_str) == Some("foreign_function")
+                || object.values().any(contains_foreign_function)
+        }
+        Value::Array(values) => values.iter().any(contains_foreign_function),
+        _ => false,
+    }
+}
+
+fn collect_foreign_source_syntax(
+    value: &Value,
+    position: SubstitutionPosition,
+    syntax: &[String],
+    cursor: &mut usize,
+    by_expression: &mut HashMap<String, Option<String>>,
+) {
+    if position == SubstitutionPosition::Expression && matches!(value, Value::Object(_)) {
+        let ordinal = *cursor;
+        *cursor += 1;
+        if contains_foreign_function(value)
+            && let Some(source) = syntax.get(ordinal)
+        {
+            let key = compact(value);
+            by_expression
+                .entry(key)
+                .and_modify(|spelling| *spelling = None)
+                .or_insert_with(|| Some(source.clone()));
+        }
+    }
+    match value {
+        Value::Object(object) => {
+            for key in canonical_object_keys(object) {
+                collect_foreign_source_syntax(
+                    &object[key],
+                    child_substitution_position(object, key),
+                    syntax,
+                    cursor,
+                    by_expression,
+                );
+            }
+        }
+        Value::Array(values) => {
+            for value in values {
+                collect_foreign_source_syntax(value, position, syntax, cursor, by_expression);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn collect_foreign_target_overrides(
+    value: &Value,
+    position: SubstitutionPosition,
+    by_expression: &HashMap<String, Option<String>>,
+    cursor: &mut usize,
+    overrides: &mut BTreeMap<usize, String>,
+) {
+    if position == SubstitutionPosition::Expression && matches!(value, Value::Object(_)) {
+        let ordinal = *cursor;
+        *cursor += 1;
+        if contains_foreign_function(value)
+            && let Some(Some(source)) = by_expression.get(&compact(value))
+        {
+            overrides.entry(ordinal).or_insert_with(|| source.clone());
+        }
+    }
+    match value {
+        Value::Object(object) => {
+            for key in canonical_object_keys(object) {
+                collect_foreign_target_overrides(
+                    &object[key],
+                    child_substitution_position(object, key),
+                    by_expression,
+                    cursor,
+                    overrides,
+                );
+            }
+        }
+        Value::Array(values) => {
+            for value in values {
+                collect_foreign_target_overrides(value, position, by_expression, cursor, overrides);
+            }
+        }
+        _ => {}
+    }
+}
+
 fn substituted_variable(
     sort: VariableSort,
     value: &Value,
@@ -3663,6 +3941,23 @@ impl LoadedRuleSet {
             &mut cursor,
             &mut syntax_overrides,
         );
+        let mut foreign_source_syntax = HashMap::new();
+        cursor = 0;
+        collect_foreign_source_syntax(
+            &serde_json::to_value(&input.source_expression).ok()?,
+            SubstitutionPosition::Expression,
+            source_syntax,
+            &mut cursor,
+            &mut foreign_source_syntax,
+        );
+        cursor = 0;
+        collect_foreign_target_overrides(
+            &serde_json::to_value(&target_expression).ok()?,
+            SubstitutionPosition::Expression,
+            &foreign_source_syntax,
+            &mut cursor,
+            &mut syntax_overrides,
+        );
         let identity_syntax = syntax_bindings
             .iter()
             .filter_map(|(key, syntax)| {
@@ -3689,6 +3984,9 @@ impl LoadedRuleSet {
 
 #[cfg(test)]
 mod synthesis_parity_tests;
+
+#[cfg(test)]
+mod scan_rigidity_tests;
 
 #[cfg(test)]
 mod tests {
@@ -3778,6 +4076,75 @@ mod tests {
             source_adjusted_type: rule_primitive(),
             target_type: rule_primitive(),
             target_adjusted_type: rule_primitive(),
+        }
+    }
+
+    fn anchorless_observation(
+        source_expression: Expression,
+        target_expression: Expression,
+    ) -> Observation {
+        Observation {
+            source_expression,
+            target_expression,
+            pointer_anchors: vec![],
+            lhs: false,
+            source_type: primitive(),
+            source_adjusted_type: primitive(),
+            target_type: primitive(),
+            target_adjusted_type: primitive(),
+        }
+    }
+
+    fn call(callee: crate::ValueIdentity, arguments: Vec<Expression>) -> Expression {
+        Expression::Call {
+            callee: Box::new(Expression::Path { value: callee }),
+            arguments,
+        }
+    }
+
+    fn string(value: &str) -> Expression {
+        Expression::Literal {
+            value: crate::Literal::String {
+                value: value.into(),
+            },
+        }
+    }
+
+    fn source_scan(format: &str) -> Expression {
+        source_scan_expression("scanf", string(format))
+    }
+
+    fn source_scan_symbol(symbol: &str, format: &str) -> Expression {
+        source_scan_expression(symbol, string(format))
+    }
+
+    fn source_scan_expression(symbol: &str, format: Expression) -> Expression {
+        call(
+            crate::ValueIdentity::ForeignFunction {
+                symbol: symbol.into(),
+            },
+            vec![format],
+        )
+    }
+
+    fn target_scan(format: &str) -> Expression {
+        target_scan_expression(string(format))
+    }
+
+    fn target_scan_expression(format: Expression) -> Expression {
+        call(
+            crate::ValueIdentity::External {
+                crate_name: "xj_scanf".into(),
+                path: vec!["legacy".into(), "scanf".into()],
+            },
+            vec![format],
+        )
+    }
+
+    fn scan_cast(expression: Expression, name: &str) -> Expression {
+        Expression::Cast {
+            expression: Box::new(expression),
+            ty: crate::TypeTree::Primitive { name: name.into() },
         }
     }
 
@@ -4021,6 +4388,204 @@ mod tests {
         let result = synthesize_observation_pair(&left.observations[0], &right.observations[0]);
         assert_eq!(result.rejection, Some(PairRejection::Context));
         assert!(result.substitutions.is_empty());
+    }
+
+    #[test]
+    fn empty_anchor_documents_round_trip_and_match() {
+        let observation = anchorless_observation(
+            call(
+                crate::ValueIdentity::ForeignFunction {
+                    symbol: "ping".into(),
+                },
+                vec![],
+            ),
+            string("done"),
+        );
+        let document = ObservationDocument {
+            schema_version: 1,
+            observations: vec![observation.clone()],
+        };
+        let encoded = observation_document_to_json(&document).unwrap();
+        assert_eq!(observation_document_from_json(&encoded).unwrap(), document);
+        assert!(encoded.contains("\"pointer_anchors\": []"));
+
+        let rule = synthesize_observation_pair(&observation, &observation)
+            .rule
+            .unwrap();
+        assert!(rule.pointer_anchors.is_empty());
+        let rules = RuleDocument {
+            schema_version: 1,
+            rules: vec![rule.clone()],
+        };
+        let encoded = rule_document_to_json(&rules).unwrap();
+        assert_eq!(rule_document_from_json(&encoded).unwrap(), rules);
+        let markdown = rule_document_to_markdown(&rules).unwrap();
+        assert!(markdown.starts_with("* "));
+        assert!(!markdown.contains("A0:"));
+        assert!(
+            LoadedRuleSet::new(&rules)
+                .unwrap()
+                .select(&RuleMatchInput {
+                    source_expression: observation.source_expression,
+                    pointer_anchors: vec![],
+                    lhs: false,
+                    source_type: primitive(),
+                    source_adjusted_type: primitive(),
+                    target_type: Some(primitive()),
+                    target_adjusted_type: Some(primitive()),
+                })
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn scan_formats_are_rigid_only_at_resolved_format_positions() {
+        let base = anchorless_observation(source_scan("%d"), target_scan("%d"));
+        assert!(synthesize_observation_pair(&base, &base).rule.is_some());
+
+        let source_mismatch = anchorless_observation(source_scan("%u"), target_scan("%d"));
+        let result = synthesize_observation_pair(&base, &source_mismatch);
+        assert_eq!(result.rejection, Some(PairRejection::Source));
+        assert!(result.rule.is_none());
+
+        let target_mismatch = anchorless_observation(source_scan("%d"), target_scan("%u"));
+        let result = synthesize_observation_pair(&base, &target_mismatch);
+        assert_eq!(result.rejection, Some(PairRejection::TargetLookup));
+        assert!(result.rule.is_none());
+
+        let block = |expression| Expression::Block {
+            block: crate::Block {
+                statements: vec![crate::Statement::Expression {
+                    expression,
+                    semicolon: true,
+                }],
+            },
+        };
+        let block_left = anchorless_observation(block(source_scan("%d")), block(target_scan("%d")));
+        let block_right =
+            anchorless_observation(block(source_scan("%u")), block(target_scan("%d")));
+        assert_eq!(
+            synthesize_observation_pair(&block_left, &block_right).rejection,
+            Some(PairRejection::Source)
+        );
+
+        let one_sided =
+            anchorless_observation(source_scan_symbol("vscanf", "%d"), target_scan("%d"));
+        assert_eq!(
+            synthesize_observation_pair(&base, &one_sided).rejection,
+            Some(PairRejection::Source)
+        );
+
+        let fscanf = |stream: &str, format: &str| {
+            call(
+                crate::ValueIdentity::ForeignFunction {
+                    symbol: "fscanf".into(),
+                },
+                vec![string(stream), string(format)],
+            )
+        };
+        let brscanf = |stream: &str, format: &str| {
+            call(
+                crate::ValueIdentity::External {
+                    crate_name: "xj_scanf".into(),
+                    path: vec!["legacy".into(), "brscanf".into()],
+                },
+                vec![string(stream), string(format)],
+            )
+        };
+        let fscanf_left = anchorless_observation(fscanf("left", "%d"), brscanf("left", "%d"));
+        let stream_change = anchorless_observation(fscanf("right", "%d"), brscanf("right", "%d"));
+        assert!(
+            synthesize_observation_pair(&fscanf_left, &stream_change)
+                .rule
+                .is_some()
+        );
+        let format_change = anchorless_observation(fscanf("left", "%u"), brscanf("left", "%d"));
+        assert_eq!(
+            synthesize_observation_pair(&fscanf_left, &format_change).rejection,
+            Some(PairRejection::Source)
+        );
+
+        let ordinary_left = anchorless_observation(
+            call(
+                crate::ValueIdentity::External {
+                    crate_name: "fixture".into(),
+                    path: vec!["log".into()],
+                },
+                vec![string("left")],
+            ),
+            string("left"),
+        );
+        let ordinary_right = anchorless_observation(
+            call(
+                crate::ValueIdentity::External {
+                    crate_name: "fixture".into(),
+                    path: vec!["log".into()],
+                },
+                vec![string("right")],
+            ),
+            string("right"),
+        );
+        assert!(
+            synthesize_observation_pair(&ordinary_left, &ordinary_right)
+                .rule
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn equal_scan_formats_cannot_hide_enclosing_structure_disagreements() {
+        let target = target_scan("%d");
+        let source_left = anchorless_observation(
+            source_scan_expression("scanf", scan_cast(string("%d"), "i8")),
+            target.clone(),
+        );
+        let source_type_change = anchorless_observation(
+            source_scan_expression("scanf", scan_cast(string("%d"), "u8")),
+            target.clone(),
+        );
+        let result = synthesize_observation_pair(&source_left, &source_type_change);
+        assert_eq!(result.rejection, Some(PairRejection::Source));
+        assert!(result.rule.is_none());
+        assert!(
+            result
+                .substitutions
+                .keys()
+                .all(|(sort, _)| *sort != VariableSort::Expression)
+        );
+
+        let source_wrapper_change = anchorless_observation(
+            source_scan_expression("scanf", string("%d")),
+            target.clone(),
+        );
+        let result = synthesize_observation_pair(&source_left, &source_wrapper_change);
+        assert_eq!(result.rejection, Some(PairRejection::Source));
+        assert!(result.rule.is_none());
+
+        let source = source_scan("%d");
+        let target_left = anchorless_observation(
+            source.clone(),
+            target_scan_expression(scan_cast(string("%d"), "i8")),
+        );
+        let target_type_change = anchorless_observation(
+            source.clone(),
+            target_scan_expression(scan_cast(string("%d"), "u8")),
+        );
+        let result = synthesize_observation_pair(&target_left, &target_type_change);
+        assert_eq!(result.rejection, Some(PairRejection::TargetLookup));
+        assert!(result.rule.is_none());
+        assert!(
+            result
+                .substitutions
+                .keys()
+                .all(|(sort, _)| *sort != VariableSort::Expression)
+        );
+
+        let target_wrapper_change =
+            anchorless_observation(source, target_scan_expression(string("%d")));
+        let result = synthesize_observation_pair(&target_left, &target_wrapper_change);
+        assert_eq!(result.rejection, Some(PairRejection::TargetLookup));
+        assert!(result.rule.is_none());
     }
 
     #[test]
@@ -5377,5 +5942,1874 @@ mod tests {
             .select(&lhs_input)
             .is_none()
         );
+    }
+
+    fn anchorless_rule(source_pattern: RuleExpression, target_pattern: RuleExpression) -> Rule {
+        Rule {
+            source_pattern,
+            target_pattern,
+            pointer_anchors: vec![],
+            lhs: false,
+            source_type: rule_primitive(),
+            source_adjusted_type: rule_primitive(),
+            target_type: rule_primitive(),
+            target_adjusted_type: rule_primitive(),
+        }
+    }
+
+    fn binding_rule_path(index: u64) -> RuleExpression {
+        RuleExpression::Path {
+            value: RuleValueIdentity::Variable {
+                sort: VariableSort::Binding,
+                index,
+            },
+        }
+    }
+
+    fn anchorless_input(expression: Expression) -> RuleMatchInput {
+        RuleMatchInput {
+            source_expression: expression,
+            pointer_anchors: vec![],
+            lhs: false,
+            source_type: primitive(),
+            source_adjusted_type: primitive(),
+            target_type: Some(primitive()),
+            target_adjusted_type: Some(primitive()),
+        }
+    }
+
+    fn literal(value: crate::Literal) -> Expression {
+        Expression::Literal { value }
+    }
+
+    fn rule_literal(value: RuleLiteral) -> RuleExpression {
+        RuleExpression::Literal { value }
+    }
+
+    fn foreign_rule_call(symbol: &str, arguments: Vec<RuleExpression>) -> RuleExpression {
+        RuleExpression::Call {
+            callee: Box::new(RuleExpression::Path {
+                value: RuleValueIdentity::ForeignFunction {
+                    symbol: symbol.into(),
+                },
+            }),
+            arguments,
+        }
+    }
+
+    fn external_rule_call(path: &[&str], arguments: Vec<RuleExpression>) -> RuleExpression {
+        RuleExpression::Call {
+            callee: Box::new(RuleExpression::Path {
+                value: external_value("xj_scanf", path),
+            }),
+            arguments,
+        }
+    }
+
+    fn address(expression: Expression) -> Expression {
+        Expression::AddressOf {
+            borrow: BorrowKind::Reference,
+            mutability: RawMutability::Mut,
+            expression: Box::new(expression),
+        }
+    }
+
+    fn rule_address(expression: RuleExpression) -> RuleExpression {
+        RuleExpression::AddressOf {
+            borrow: BorrowKind::Reference,
+            mutability: RawMutability::Mut,
+            expression: Box::new(expression),
+        }
+    }
+
+    fn exact_scan_observation(format: u8) -> Observation {
+        let const_pointer = |name: &str| TypeTree::RawPointer {
+            mutability: RawMutability::Const,
+            pointee: Box::new(TypeTree::Primitive { name: name.into() }),
+        };
+        let mutable_i32 = TypeTree::RawPointer {
+            mutability: RawMutability::Mut,
+            pointee: Box::new(primitive()),
+        };
+        let binding = concrete_binding("<id0>");
+        let source_format = Expression::Cast {
+            expression: Box::new(Expression::Cast {
+                expression: Box::new(literal(crate::Literal::ByteString {
+                    value: vec![b'%', format, 0],
+                })),
+                ty: const_pointer("u8"),
+            }),
+            ty: const_pointer("i8"),
+        };
+        let source_binding = Expression::Cast {
+            expression: Box::new(address(binding.clone())),
+            ty: mutable_i32,
+        };
+        let target_binding = address(Expression::Array {
+            elements: vec![address(binding)],
+        });
+        anchorless_observation(
+            call(
+                crate::ValueIdentity::ForeignFunction {
+                    symbol: "scanf".into(),
+                },
+                vec![source_format, source_binding],
+            ),
+            call(
+                concrete_external("xj_scanf", &["legacy", "scanf"]),
+                vec![string(&format!("%{}", char::from(format))), target_binding],
+            ),
+        )
+    }
+
+    fn exact_scan_rule(format: u8) -> Rule {
+        let const_pointer = |name: &str| RuleTypeTree::RawPointer {
+            mutability: RawMutability::Const,
+            pointee: Box::new(RuleTypeTree::Primitive { name: name.into() }),
+        };
+        let mutable_i32 = RuleTypeTree::RawPointer {
+            mutability: RawMutability::Mut,
+            pointee: Box::new(rule_primitive()),
+        };
+        let binding = binding_variable(0);
+        let source_format = RuleExpression::Cast {
+            expression: Box::new(RuleExpression::Cast {
+                expression: Box::new(rule_literal(RuleLiteral::ByteString {
+                    value: vec![b'%', format, 0],
+                })),
+                ty: const_pointer("u8"),
+            }),
+            ty: const_pointer("i8"),
+        };
+        let source_binding = RuleExpression::Cast {
+            expression: Box::new(rule_address(binding.clone())),
+            ty: mutable_i32,
+        };
+        let target_binding = rule_address(RuleExpression::Array {
+            elements: vec![rule_address(binding)],
+        });
+        anchorless_rule(
+            foreign_rule_call("scanf", vec![source_format, source_binding]),
+            external_rule_call(
+                &["legacy", "scanf"],
+                vec![
+                    rule_literal(RuleLiteral::String {
+                        value: format!("%{}", char::from(format)),
+                    }),
+                    target_binding,
+                ],
+            ),
+        )
+    }
+
+    #[test]
+    fn anchorless_wire_validation_is_closed_and_canonical() {
+        let observation = anchorless_observation(
+            call(
+                crate::ValueIdentity::ForeignFunction {
+                    symbol: "ping".into(),
+                },
+                vec![concrete_binding("<id0>")],
+            ),
+            concrete_binding("<id0>"),
+        );
+        let observations = ObservationDocument {
+            schema_version: 1,
+            observations: vec![observation.clone()],
+        };
+        let bytes = observation_document_to_json(&observations).unwrap();
+        assert_eq!(
+            observation_document_to_json(&observation_document_from_json(&bytes).unwrap()).unwrap(),
+            bytes
+        );
+        assert!(bytes.contains("      \"pointer_anchors\": [],\n      \"lhs\": false,"));
+
+        let expression = RuleExpression::Variable {
+            sort: VariableSort::Expression,
+            index: 0,
+        };
+        let rule = anchorless_rule(
+            RuleExpression::Call {
+                callee: Box::new(RuleExpression::Path {
+                    value: RuleValueIdentity::ForeignFunction {
+                        symbol: "ping".into(),
+                    },
+                }),
+                arguments: vec![expression.clone()],
+            },
+            expression,
+        );
+        let rules = RuleDocument {
+            schema_version: 1,
+            rules: vec![rule.clone()],
+        };
+        let bytes = rule_document_to_json(&rules).unwrap();
+        assert_eq!(
+            rule_document_to_json(&rule_document_from_json(&bytes).unwrap()).unwrap(),
+            bytes
+        );
+        assert!(bytes.contains("      \"pointer_anchors\": [],\n      \"lhs\": false,"));
+
+        let markdown = rule_document_to_markdown(&rules).unwrap();
+        assert_eq!(
+            markdown,
+            "* `ping(<E0>)` -> `<E0>`\n  * lhs: false\n  * `i32` (`i32`) -> `i32` (`i32`).\n"
+        );
+
+        let binding_rule = anchorless_rule(binding_rule_path(0), binding_rule_path(0));
+        assert!(
+            rule_document_to_json(&RuleDocument {
+                schema_version: 1,
+                rules: vec![binding_rule],
+            })
+            .is_ok()
+        );
+
+        let undeclared_anchor = anchorless_rule(anchor_path(), anchor_path());
+        assert!(
+            rule_document_to_json(&RuleDocument {
+                schema_version: 1,
+                rules: vec![undeclared_anchor],
+            })
+            .is_err()
+        );
+
+        let merged = merge_observation_documents(&[
+            observations.clone(),
+            ObservationDocument::default(),
+            observations.clone(),
+        ])
+        .unwrap();
+        assert_eq!(merged.observations, [observation.clone(), observation]);
+        assert_eq!(
+            observation_document_to_json(&merged).unwrap(),
+            observation_document_to_json(
+                &merge_observation_documents(&[
+                    observations.clone(),
+                    ObservationDocument::default(),
+                    observations,
+                ])
+                .unwrap()
+            )
+            .unwrap()
+        );
+    }
+
+    #[test]
+    fn exact_anchorless_ping_documents_keep_canonical_bytes() {
+        let observation_input = r#"{
+  "schema_version": 1,
+  "observations": [
+    {
+      "source_expression": {
+        "kind": "call",
+        "callee": {"kind":"path","value":{"kind":"foreign_function","symbol":"ping"}},
+        "arguments": []
+      },
+      "target_expression": {
+        "kind": "literal",
+        "value": {"kind": "integer", "value": "0", "type": "i32"}
+      },
+      "pointer_anchors": [],
+      "lhs": false,
+      "source_type": {"kind":"primitive","name":"i32"},
+      "source_adjusted_type": {"kind":"primitive","name":"i32"},
+      "target_type": {"kind":"primitive","name":"i32"},
+      "target_adjusted_type": {"kind":"primitive","name":"i32"}
+    }
+  ]
+}"#;
+        let observation_expected = r#"{
+  "schema_version": 1,
+  "observations": [
+    {
+      "source_expression": {
+        "kind": "call",
+        "callee": {
+          "kind": "path",
+          "value": {
+            "kind": "foreign_function",
+            "symbol": "ping"
+          }
+        },
+        "arguments": []
+      },
+      "target_expression": {
+        "kind": "literal",
+        "value": {
+          "kind": "integer",
+          "value": "0",
+          "type": "i32"
+        }
+      },
+      "pointer_anchors": [],
+      "lhs": false,
+      "source_type": {
+        "kind": "primitive",
+        "name": "i32"
+      },
+      "source_adjusted_type": {
+        "kind": "primitive",
+        "name": "i32"
+      },
+      "target_type": {
+        "kind": "primitive",
+        "name": "i32"
+      },
+      "target_adjusted_type": {
+        "kind": "primitive",
+        "name": "i32"
+      }
+    }
+  ]
+}
+"#;
+        let observation = observation_document_from_json(observation_input).unwrap();
+        assert_eq!(
+            observation_document_to_json(&observation).unwrap(),
+            observation_expected
+        );
+        assert_eq!(
+            observation_document_from_json(observation_expected).unwrap(),
+            observation
+        );
+
+        let rule_input = r#"{
+  "schema_version": 1,
+  "rules": [
+    {
+      "source_pattern": {
+        "kind":"call",
+        "callee":{"kind":"path","value":{"kind":"foreign_function","symbol":"ping"}},
+        "arguments":[{"kind":"variable","sort":"expression","index":0}]
+      },
+      "target_pattern": {"kind":"variable","sort":"expression","index":0},
+      "pointer_anchors": [],
+      "lhs": false,
+      "source_type": {"kind":"primitive","name":"i32"},
+      "source_adjusted_type": {"kind":"primitive","name":"i32"},
+      "target_type": {"kind":"primitive","name":"i32"},
+      "target_adjusted_type": {"kind":"primitive","name":"i32"}
+    }
+  ]
+}"#;
+        let rule_expected = r#"{
+  "schema_version": 1,
+  "rules": [
+    {
+      "source_pattern": {
+        "kind": "call",
+        "callee": {
+          "kind": "path",
+          "value": {
+            "kind": "foreign_function",
+            "symbol": "ping"
+          }
+        },
+        "arguments": [
+          {
+            "kind": "variable",
+            "sort": "expression",
+            "index": 0
+          }
+        ]
+      },
+      "target_pattern": {
+        "kind": "variable",
+        "sort": "expression",
+        "index": 0
+      },
+      "pointer_anchors": [],
+      "lhs": false,
+      "source_type": {
+        "kind": "primitive",
+        "name": "i32"
+      },
+      "source_adjusted_type": {
+        "kind": "primitive",
+        "name": "i32"
+      },
+      "target_type": {
+        "kind": "primitive",
+        "name": "i32"
+      },
+      "target_adjusted_type": {
+        "kind": "primitive",
+        "name": "i32"
+      }
+    }
+  ]
+}
+"#;
+        let rule = rule_document_from_json(rule_input).unwrap();
+        assert_eq!(rule_document_to_json(&rule).unwrap(), rule_expected);
+        assert_eq!(rule_document_from_json(rule_expected).unwrap(), rule);
+    }
+
+    #[test]
+    fn nonempty_documents_retain_their_canonical_wire_bytes() {
+        let one_observation_expected = r#"{
+  "schema_version": 1,
+  "observations": [
+    {
+      "source_expression": {
+        "kind": "path",
+        "value": {
+          "kind": "binding",
+          "id": "<id0>"
+        }
+      },
+      "target_expression": {
+        "kind": "path",
+        "value": {
+          "kind": "binding",
+          "id": "<id0>"
+        }
+      },
+      "pointer_anchors": [
+        {
+          "id": "<id0>",
+          "source_type": {
+            "kind": "raw_pointer",
+            "mutability": "const",
+            "pointee": {
+              "kind": "primitive",
+              "name": "i32"
+            }
+          },
+          "target_type": {
+            "kind": "reference",
+            "mutability": "shared",
+            "pointee": {
+              "kind": "primitive",
+              "name": "i32"
+            }
+          }
+        }
+      ],
+      "lhs": false,
+      "source_type": {
+        "kind": "primitive",
+        "name": "i32"
+      },
+      "source_adjusted_type": {
+        "kind": "primitive",
+        "name": "i32"
+      },
+      "target_type": {
+        "kind": "primitive",
+        "name": "i32"
+      },
+      "target_adjusted_type": {
+        "kind": "primitive",
+        "name": "i32"
+      }
+    }
+  ]
+}
+"#;
+        let one_observation = observation(false);
+        assert_eq!(
+            observation_document_to_json(&one_observation).unwrap(),
+            one_observation_expected
+        );
+
+        let raw = |name: &str| TypeTree::RawPointer {
+            mutability: RawMutability::Const,
+            pointee: Box::new(TypeTree::Primitive { name: name.into() }),
+        };
+        let reference = |name: &str| TypeTree::Reference {
+            mutability: RefMutability::Shared,
+            pointee: Box::new(TypeTree::Primitive { name: name.into() }),
+        };
+        let two_observation = ObservationDocument {
+            schema_version: 1,
+            observations: vec![Observation {
+                source_expression: Expression::Tuple {
+                    elements: vec![concrete_binding("<id0>"), concrete_binding("<id1>")],
+                },
+                target_expression: Expression::Tuple {
+                    elements: vec![concrete_binding("<id0>"), concrete_binding("<id1>")],
+                },
+                pointer_anchors: vec![
+                    crate::PointerAnchor {
+                        id: "<id0>".into(),
+                        source_type: raw("i32"),
+                        target_type: reference("i32"),
+                    },
+                    crate::PointerAnchor {
+                        id: "<id1>".into(),
+                        source_type: raw("i32"),
+                        target_type: reference("i32"),
+                    },
+                ],
+                lhs: false,
+                source_type: TypeTree::Tuple {
+                    elements: vec![raw("i32"), raw("i32")],
+                },
+                source_adjusted_type: TypeTree::Tuple {
+                    elements: vec![raw("i32"), raw("i32")],
+                },
+                target_type: TypeTree::Tuple {
+                    elements: vec![reference("i32"), reference("i32")],
+                },
+                target_adjusted_type: TypeTree::Tuple {
+                    elements: vec![reference("i32"), reference("i32")],
+                },
+            }],
+        };
+        let anchor = |index| RuleExpression::Path {
+            value: RuleValueIdentity::Variable {
+                sort: VariableSort::Anchor,
+                index,
+            },
+        };
+        let two_rule = synthesize_observation_pair(
+            &two_observation.observations[0],
+            &two_observation.observations[0],
+        )
+        .rule
+        .unwrap();
+        assert_eq!(
+            two_rule.source_pattern,
+            RuleExpression::Tuple {
+                elements: vec![anchor(0), anchor(1)]
+            }
+        );
+
+        let observation_bytes = [
+            observation_document_to_json(&one_observation).unwrap(),
+            observation_document_to_json(&two_observation).unwrap(),
+        ];
+        let rule_bytes = [
+            rule_document_to_json(&RuleDocument {
+                schema_version: 1,
+                rules: vec![base_rule(anchor_path(), anchor_path())],
+            })
+            .unwrap(),
+            rule_document_to_json(&RuleDocument {
+                schema_version: 1,
+                rules: vec![two_rule],
+            })
+            .unwrap(),
+        ];
+        let one_rule_expected = r#"{
+  "schema_version": 1,
+  "rules": [
+    {
+      "source_pattern": {
+        "kind": "path",
+        "value": {
+          "kind": "variable",
+          "sort": "anchor",
+          "index": 0
+        }
+      },
+      "target_pattern": {
+        "kind": "path",
+        "value": {
+          "kind": "variable",
+          "sort": "anchor",
+          "index": 0
+        }
+      },
+      "pointer_anchors": [
+        {
+          "id": {
+            "kind": "variable",
+            "sort": "anchor",
+            "index": 0
+          },
+          "source_type": {
+            "kind": "raw_pointer",
+            "mutability": "const",
+            "pointee": {
+              "kind": "primitive",
+              "name": "i32"
+            }
+          },
+          "target_type": {
+            "kind": "reference",
+            "mutability": "shared",
+            "pointee": {
+              "kind": "primitive",
+              "name": "i32"
+            }
+          }
+        }
+      ],
+      "lhs": false,
+      "source_type": {
+        "kind": "primitive",
+        "name": "i32"
+      },
+      "source_adjusted_type": {
+        "kind": "primitive",
+        "name": "i32"
+      },
+      "target_type": {
+        "kind": "primitive",
+        "name": "i32"
+      },
+      "target_adjusted_type": {
+        "kind": "primitive",
+        "name": "i32"
+      }
+    }
+  ]
+}
+"#;
+        let two_observation_expected = r#"{
+  "schema_version": 1,
+  "observations": [
+    {
+      "source_expression": {
+        "kind": "tuple",
+        "elements": [
+          {
+            "kind": "path",
+            "value": {
+              "kind": "binding",
+              "id": "<id0>"
+            }
+          },
+          {
+            "kind": "path",
+            "value": {
+              "kind": "binding",
+              "id": "<id1>"
+            }
+          }
+        ]
+      },
+      "target_expression": {
+        "kind": "tuple",
+        "elements": [
+          {
+            "kind": "path",
+            "value": {
+              "kind": "binding",
+              "id": "<id0>"
+            }
+          },
+          {
+            "kind": "path",
+            "value": {
+              "kind": "binding",
+              "id": "<id1>"
+            }
+          }
+        ]
+      },
+      "pointer_anchors": [
+        {
+          "id": "<id0>",
+          "source_type": {
+            "kind": "raw_pointer",
+            "mutability": "const",
+            "pointee": {
+              "kind": "primitive",
+              "name": "i32"
+            }
+          },
+          "target_type": {
+            "kind": "reference",
+            "mutability": "shared",
+            "pointee": {
+              "kind": "primitive",
+              "name": "i32"
+            }
+          }
+        },
+        {
+          "id": "<id1>",
+          "source_type": {
+            "kind": "raw_pointer",
+            "mutability": "const",
+            "pointee": {
+              "kind": "primitive",
+              "name": "i32"
+            }
+          },
+          "target_type": {
+            "kind": "reference",
+            "mutability": "shared",
+            "pointee": {
+              "kind": "primitive",
+              "name": "i32"
+            }
+          }
+        }
+      ],
+      "lhs": false,
+      "source_type": {
+        "kind": "tuple",
+        "elements": [
+          {
+            "kind": "raw_pointer",
+            "mutability": "const",
+            "pointee": {
+              "kind": "primitive",
+              "name": "i32"
+            }
+          },
+          {
+            "kind": "raw_pointer",
+            "mutability": "const",
+            "pointee": {
+              "kind": "primitive",
+              "name": "i32"
+            }
+          }
+        ]
+      },
+      "source_adjusted_type": {
+        "kind": "tuple",
+        "elements": [
+          {
+            "kind": "raw_pointer",
+            "mutability": "const",
+            "pointee": {
+              "kind": "primitive",
+              "name": "i32"
+            }
+          },
+          {
+            "kind": "raw_pointer",
+            "mutability": "const",
+            "pointee": {
+              "kind": "primitive",
+              "name": "i32"
+            }
+          }
+        ]
+      },
+      "target_type": {
+        "kind": "tuple",
+        "elements": [
+          {
+            "kind": "reference",
+            "mutability": "shared",
+            "pointee": {
+              "kind": "primitive",
+              "name": "i32"
+            }
+          },
+          {
+            "kind": "reference",
+            "mutability": "shared",
+            "pointee": {
+              "kind": "primitive",
+              "name": "i32"
+            }
+          }
+        ]
+      },
+      "target_adjusted_type": {
+        "kind": "tuple",
+        "elements": [
+          {
+            "kind": "reference",
+            "mutability": "shared",
+            "pointee": {
+              "kind": "primitive",
+              "name": "i32"
+            }
+          },
+          {
+            "kind": "reference",
+            "mutability": "shared",
+            "pointee": {
+              "kind": "primitive",
+              "name": "i32"
+            }
+          }
+        ]
+      }
+    }
+  ]
+}
+"#;
+        let two_rule_expected = r#"{
+  "schema_version": 1,
+  "rules": [
+    {
+      "source_pattern": {
+        "kind": "tuple",
+        "elements": [
+          {
+            "kind": "path",
+            "value": {
+              "kind": "variable",
+              "sort": "anchor",
+              "index": 0
+            }
+          },
+          {
+            "kind": "path",
+            "value": {
+              "kind": "variable",
+              "sort": "anchor",
+              "index": 1
+            }
+          }
+        ]
+      },
+      "target_pattern": {
+        "kind": "tuple",
+        "elements": [
+          {
+            "kind": "path",
+            "value": {
+              "kind": "variable",
+              "sort": "anchor",
+              "index": 0
+            }
+          },
+          {
+            "kind": "path",
+            "value": {
+              "kind": "variable",
+              "sort": "anchor",
+              "index": 1
+            }
+          }
+        ]
+      },
+      "pointer_anchors": [
+        {
+          "id": {
+            "kind": "variable",
+            "sort": "anchor",
+            "index": 0
+          },
+          "source_type": {
+            "kind": "raw_pointer",
+            "mutability": "const",
+            "pointee": {
+              "kind": "primitive",
+              "name": "i32"
+            }
+          },
+          "target_type": {
+            "kind": "reference",
+            "mutability": "shared",
+            "pointee": {
+              "kind": "primitive",
+              "name": "i32"
+            }
+          }
+        },
+        {
+          "id": {
+            "kind": "variable",
+            "sort": "anchor",
+            "index": 1
+          },
+          "source_type": {
+            "kind": "raw_pointer",
+            "mutability": "const",
+            "pointee": {
+              "kind": "primitive",
+              "name": "i32"
+            }
+          },
+          "target_type": {
+            "kind": "reference",
+            "mutability": "shared",
+            "pointee": {
+              "kind": "primitive",
+              "name": "i32"
+            }
+          }
+        }
+      ],
+      "lhs": false,
+      "source_type": {
+        "kind": "tuple",
+        "elements": [
+          {
+            "kind": "raw_pointer",
+            "mutability": "const",
+            "pointee": {
+              "kind": "primitive",
+              "name": "i32"
+            }
+          },
+          {
+            "kind": "raw_pointer",
+            "mutability": "const",
+            "pointee": {
+              "kind": "primitive",
+              "name": "i32"
+            }
+          }
+        ]
+      },
+      "source_adjusted_type": {
+        "kind": "tuple",
+        "elements": [
+          {
+            "kind": "raw_pointer",
+            "mutability": "const",
+            "pointee": {
+              "kind": "primitive",
+              "name": "i32"
+            }
+          },
+          {
+            "kind": "raw_pointer",
+            "mutability": "const",
+            "pointee": {
+              "kind": "primitive",
+              "name": "i32"
+            }
+          }
+        ]
+      },
+      "target_type": {
+        "kind": "tuple",
+        "elements": [
+          {
+            "kind": "reference",
+            "mutability": "shared",
+            "pointee": {
+              "kind": "primitive",
+              "name": "i32"
+            }
+          },
+          {
+            "kind": "reference",
+            "mutability": "shared",
+            "pointee": {
+              "kind": "primitive",
+              "name": "i32"
+            }
+          }
+        ]
+      },
+      "target_adjusted_type": {
+        "kind": "tuple",
+        "elements": [
+          {
+            "kind": "reference",
+            "mutability": "shared",
+            "pointee": {
+              "kind": "primitive",
+              "name": "i32"
+            }
+          },
+          {
+            "kind": "reference",
+            "mutability": "shared",
+            "pointee": {
+              "kind": "primitive",
+              "name": "i32"
+            }
+          }
+        ]
+      }
+    }
+  ]
+}
+"#;
+        assert_eq!(
+            observation_bytes,
+            [one_observation_expected, two_observation_expected]
+        );
+        assert_eq!(rule_bytes, [one_rule_expected, two_rule_expected]);
+        for before in observation_bytes {
+            assert_eq!(
+                observation_document_to_json(&observation_document_from_json(&before).unwrap())
+                    .unwrap(),
+                before
+            );
+        }
+        for before in rule_bytes {
+            assert_eq!(
+                rule_document_to_json(&rule_document_from_json(&before).unwrap()).unwrap(),
+                before
+            );
+        }
+    }
+
+    #[test]
+    fn nonempty_anchor_validation_invariants_remain_exact() {
+        let valid_rule = base_rule(anchor_path(), anchor_path());
+        let rejects = |rule| {
+            rule_document_to_json(&RuleDocument {
+                schema_version: 1,
+                rules: vec![rule],
+            })
+            .is_err()
+        };
+
+        let mut duplicate = valid_rule.clone();
+        duplicate
+            .pointer_anchors
+            .push(duplicate.pointer_anchors[0].clone());
+        assert!(rejects(duplicate));
+
+        let mut noncanonical = valid_rule.clone();
+        noncanonical.pointer_anchors[0].id = RuleVariable::new(VariableSort::Anchor, 1);
+        assert!(rejects(noncanonical));
+
+        let mut wrong_sort = valid_rule.clone();
+        wrong_sort.pointer_anchors[0].id = RuleVariable::new(VariableSort::Binding, 0);
+        assert!(rejects(wrong_sort));
+
+        let mut wrong_source_type = valid_rule.clone();
+        wrong_source_type.pointer_anchors[0].source_type = rule_primitive();
+        assert!(rejects(wrong_source_type));
+
+        let valid_observation = observation(false).observations.remove(0);
+        let rejects = |observation| {
+            observation_document_to_json(&ObservationDocument {
+                schema_version: 1,
+                observations: vec![observation],
+            })
+            .is_err()
+        };
+        let mut duplicate = valid_observation.clone();
+        duplicate
+            .pointer_anchors
+            .push(duplicate.pointer_anchors[0].clone());
+        assert!(rejects(duplicate));
+        let mut noncanonical = valid_observation.clone();
+        noncanonical.pointer_anchors[0].id = "<id1>".into();
+        assert!(rejects(noncanonical));
+        let mut unused = valid_observation.clone();
+        unused.source_expression = integer("1");
+        unused.target_expression = integer("1");
+        assert!(rejects(unused));
+        let mut wrong_source_type = valid_observation.clone();
+        wrong_source_type.pointer_anchors[0].source_type = primitive();
+        assert!(rejects(wrong_source_type));
+
+        let raw = |name: &str| TypeTree::RawPointer {
+            mutability: RawMutability::Const,
+            pointee: Box::new(TypeTree::Primitive { name: name.into() }),
+        };
+        let reference = |name: &str| TypeTree::Reference {
+            mutability: RefMutability::Shared,
+            pointee: Box::new(TypeTree::Primitive { name: name.into() }),
+        };
+        let two_anchor = Observation {
+            source_expression: Expression::Tuple {
+                elements: vec![concrete_binding("<id0>"), concrete_binding("<id1>")],
+            },
+            target_expression: Expression::Tuple {
+                elements: vec![concrete_binding("<id0>"), concrete_binding("<id1>")],
+            },
+            pointer_anchors: vec![
+                crate::PointerAnchor {
+                    id: "<id0>".into(),
+                    source_type: raw("i32"),
+                    target_type: reference("i32"),
+                },
+                crate::PointerAnchor {
+                    id: "<id1>".into(),
+                    source_type: raw("i32"),
+                    target_type: reference("i32"),
+                },
+            ],
+            lhs: false,
+            source_type: TypeTree::Tuple {
+                elements: vec![raw("i32"), raw("i32")],
+            },
+            source_adjusted_type: TypeTree::Tuple {
+                elements: vec![raw("i32"), raw("i32")],
+            },
+            target_type: TypeTree::Tuple {
+                elements: vec![reference("i32"), reference("i32")],
+            },
+            target_adjusted_type: TypeTree::Tuple {
+                elements: vec![reference("i32"), reference("i32")],
+            },
+        };
+        assert!(!rejects(two_anchor.clone()));
+        let mut reversed = two_anchor;
+        reversed.pointer_anchors.reverse();
+        assert!(rejects(reversed));
+    }
+
+    #[test]
+    fn anchorless_binding_carriers_matching_and_contexts_remain_sound() {
+        let binding_observation = anchorless_observation(
+            Expression::Tuple {
+                elements: vec![concrete_binding("<id0>"), concrete_binding("<id0>")],
+            },
+            Expression::Tuple {
+                elements: vec![concrete_binding("<id0>"), concrete_binding("<id0>")],
+            },
+        );
+        let binding_path = binding_rule_path(0);
+        let expected_rule = anchorless_rule(
+            RuleExpression::Tuple {
+                elements: vec![binding_path.clone(), binding_path.clone()],
+            },
+            RuleExpression::Tuple {
+                elements: vec![binding_path.clone(), binding_path],
+            },
+        );
+        assert_eq!(
+            synthesize_observation_pair(&binding_observation, &binding_observation),
+            PairSynthesis {
+                rule: Some(expected_rule),
+                rejection: None,
+                substitutions: BTreeMap::from([(
+                    (VariableSort::Binding, 0),
+                    (Value::String("<id0>".into()), Value::String("<id0>".into())),
+                )]),
+            }
+        );
+
+        let split_left = anchorless_observation(
+            Expression::Tuple {
+                elements: vec![concrete_binding("<id0>"), concrete_binding("<id0>")],
+            },
+            Expression::Tuple {
+                elements: vec![concrete_binding("<id0>"), concrete_binding("<id0>")],
+            },
+        );
+        let split_right = anchorless_observation(
+            Expression::Tuple {
+                elements: vec![
+                    concrete_binding("<id0>"),
+                    Expression::AddressOf {
+                        borrow: crate::BorrowKind::Reference,
+                        mutability: RawMutability::Const,
+                        expression: Box::new(concrete_binding("<id0>")),
+                    },
+                ],
+            },
+            Expression::Tuple {
+                elements: vec![
+                    concrete_binding("<id0>"),
+                    Expression::AddressOf {
+                        borrow: crate::BorrowKind::Reference,
+                        mutability: RawMutability::Const,
+                        expression: Box::new(concrete_binding("<id0>")),
+                    },
+                ],
+            },
+        );
+        let split_substitution = (
+            VariableSort::Expression,
+            0,
+            serde_json::to_value(concrete_binding("<id0>")).unwrap(),
+            serde_json::to_value(Expression::AddressOf {
+                borrow: crate::BorrowKind::Reference,
+                mutability: RawMutability::Const,
+                expression: Box::new(concrete_binding("<id0>")),
+            })
+            .unwrap(),
+        );
+        assert_eq!(
+            synthesize_observation_pair(&split_left, &split_right),
+            PairSynthesis {
+                rule: None,
+                rejection: Some(PairRejection::Carrier),
+                substitutions: BTreeMap::from([
+                    (
+                        (VariableSort::Binding, 0),
+                        (Value::String("<id0>".into()), Value::String("<id0>".into())),
+                    ),
+                    (
+                        (split_substitution.0, split_substitution.1),
+                        (split_substitution.2, split_substitution.3),
+                    ),
+                ]),
+            }
+        );
+
+        let loaded = LoadedRuleSet::new(&RuleDocument {
+            schema_version: 1,
+            rules: vec![anchorless_rule(binding_rule_path(0), binding_rule_path(0))],
+        })
+        .unwrap();
+        let input = anchorless_input(concrete_binding("<id0>"));
+        assert!(loaded.select(&input).is_some());
+        let mut anchored = input.clone();
+        anchored.pointer_anchors.push(crate::PointerAnchor {
+            id: "<id0>".into(),
+            source_type: TypeTree::RawPointer {
+                mutability: RawMutability::Const,
+                pointee: Box::new(primitive()),
+            },
+            target_type: TypeTree::Reference {
+                mutability: RefMutability::Shared,
+                pointee: Box::new(primitive()),
+            },
+        });
+        assert!(loaded.select(&anchored).is_none());
+
+        let mut anchored_observation = binding_observation.clone();
+        anchored_observation.pointer_anchors = anchored.pointer_anchors;
+        assert_eq!(
+            synthesize_observation_pair(&binding_observation, &anchored_observation).rejection,
+            Some(PairRejection::Context)
+        );
+    }
+
+    #[test]
+    fn non_scan_character_disagreement_is_reused_in_the_target() {
+        let pair = |character: &str| Observation {
+            source_expression: call(
+                concrete_external("fixture", &["pair"]),
+                vec![
+                    literal(crate::Literal::Char {
+                        value: character.into(),
+                    }),
+                    dereference(concrete_binding("<id0>")),
+                ],
+            ),
+            target_expression: call(
+                concrete_external("fixture", &["pair"]),
+                vec![
+                    literal(crate::Literal::Char {
+                        value: character.into(),
+                    }),
+                    concrete_binding("<id0>"),
+                ],
+            ),
+            ..observation(false).observations.remove(0)
+        };
+        let result = synthesize_observation_pair(&pair("x"), &pair("y"));
+        assert_eq!(result.rejection, None);
+        assert_eq!(
+            result.rule.unwrap(),
+            base_rule(
+                RuleExpression::Call {
+                    callee: Box::new(RuleExpression::Path {
+                        value: external_value("fixture", &["pair"]),
+                    }),
+                    arguments: vec![expression_variable(0), dereference_rule(anchor_path())],
+                },
+                RuleExpression::Call {
+                    callee: Box::new(RuleExpression::Path {
+                        value: external_value("fixture", &["pair"]),
+                    }),
+                    arguments: vec![expression_variable(0), anchor_path()],
+                },
+            )
+        );
+        assert_eq!(
+            result
+                .substitutions
+                .keys()
+                .copied()
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([(VariableSort::Anchor, 0), (VariableSort::Expression, 0),])
+        );
+    }
+
+    #[test]
+    fn exact_scan_pair_retains_formats_and_one_binding_carrier() {
+        let observation = exact_scan_observation(b'd');
+        let result = synthesize_observation_pair(&observation, &observation);
+        assert_eq!(result.rejection, None);
+        assert_eq!(result.rule, Some(exact_scan_rule(b'd')));
+        assert_eq!(
+            result
+                .substitutions
+                .keys()
+                .copied()
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([(VariableSort::Binding, 0)])
+        );
+    }
+
+    #[test]
+    fn unprotected_scan_arguments_generalize_with_complete_patterns() {
+        let cases = [
+            (
+                literal(crate::Literal::ByteString {
+                    value: b"12".to_vec(),
+                }),
+                literal(crate::Literal::ByteString {
+                    value: b"34".to_vec(),
+                }),
+                literal(crate::Literal::ByteString {
+                    value: b"%d\0".to_vec(),
+                }),
+                "sscanf",
+                "bscanf",
+            ),
+            (
+                string("left"),
+                string("right"),
+                string("%d"),
+                "fscanf",
+                "brscanf",
+            ),
+            (
+                string("left"),
+                string("right"),
+                string("%d"),
+                "sscanf",
+                "bscanf",
+            ),
+            (
+                literal(crate::Literal::ByteString {
+                    value: b"left".to_vec(),
+                }),
+                literal(crate::Literal::ByteString {
+                    value: b"right".to_vec(),
+                }),
+                string("%d"),
+                "sscanf",
+                "bscanf",
+            ),
+            (
+                literal(crate::Literal::CString {
+                    value: b"left".to_vec(),
+                }),
+                literal(crate::Literal::CString {
+                    value: b"right".to_vec(),
+                }),
+                string("%d"),
+                "sscanf",
+                "bscanf",
+            ),
+        ];
+        for (left_input, right_input, source_format, source_symbol, target_name) in cases {
+            let make = |input: Expression| {
+                anchorless_observation(
+                    call(
+                        crate::ValueIdentity::ForeignFunction {
+                            symbol: source_symbol.into(),
+                        },
+                        vec![
+                            input.clone(),
+                            source_format.clone(),
+                            concrete_binding("<id0>"),
+                        ],
+                    ),
+                    call(
+                        concrete_external("xj_scanf", &["legacy", target_name]),
+                        vec![input, string("%d"), concrete_binding("<id0>")],
+                    ),
+                )
+            };
+            let result = synthesize_observation_pair(&make(left_input), &make(right_input));
+            assert_eq!(result.rejection, None);
+            assert_eq!(
+                result.rule,
+                Some(anchorless_rule(
+                    foreign_rule_call(
+                        source_symbol,
+                        vec![
+                            expression_variable(0),
+                            serde_json::from_value(serde_json::to_value(&source_format).unwrap())
+                                .unwrap(),
+                            binding_variable(0),
+                        ],
+                    ),
+                    external_rule_call(
+                        &["legacy", target_name],
+                        vec![
+                            expression_variable(0),
+                            rule_literal(RuleLiteral::String { value: "%d".into() }),
+                            binding_variable(0),
+                        ],
+                    ),
+                ))
+            );
+            assert_eq!(
+                result
+                    .substitutions
+                    .keys()
+                    .copied()
+                    .collect::<BTreeSet<_>>(),
+                BTreeSet::from([(VariableSort::Binding, 0), (VariableSort::Expression, 0),])
+            );
+        }
+    }
+
+    #[test]
+    fn non_scan_string_like_literals_generalize_and_reuse() {
+        let pairs = [
+            (
+                literal(crate::Literal::String {
+                    value: "left".into(),
+                }),
+                literal(crate::Literal::String {
+                    value: "right".into(),
+                }),
+            ),
+            (
+                literal(crate::Literal::ByteString {
+                    value: b"left".to_vec(),
+                }),
+                literal(crate::Literal::ByteString {
+                    value: b"right".to_vec(),
+                }),
+            ),
+            (
+                literal(crate::Literal::CString {
+                    value: b"left".to_vec(),
+                }),
+                literal(crate::Literal::CString {
+                    value: b"right".to_vec(),
+                }),
+            ),
+        ];
+        for (left_literal, right_literal) in pairs {
+            let make = |value: Expression| {
+                anchorless_observation(
+                    call(
+                        concrete_external("fixture", &["log"]),
+                        vec![value.clone(), concrete_binding("<id0>")],
+                    ),
+                    call(
+                        concrete_external("fixture", &["consume"]),
+                        vec![value, concrete_binding("<id0>")],
+                    ),
+                )
+            };
+            let result = synthesize_observation_pair(&make(left_literal), &make(right_literal));
+            assert_eq!(result.rejection, None);
+            assert_eq!(
+                result.rule,
+                Some(anchorless_rule(
+                    RuleExpression::Call {
+                        callee: Box::new(RuleExpression::Path {
+                            value: external_value("fixture", &["log"]),
+                        }),
+                        arguments: vec![expression_variable(0), binding_variable(0)],
+                    },
+                    RuleExpression::Call {
+                        callee: Box::new(RuleExpression::Path {
+                            value: external_value("fixture", &["consume"]),
+                        }),
+                        arguments: vec![expression_variable(0), binding_variable(0)],
+                    },
+                ))
+            );
+        }
+    }
+
+    #[test]
+    fn ordinary_bindings_match_and_substitute_in_anchorless_calls() {
+        let format = rule_literal(RuleLiteral::String { value: "%d".into() });
+        let rule = anchorless_rule(
+            foreign_rule_call(
+                "scanf",
+                vec![format.clone(), rule_address(binding_variable(0))],
+            ),
+            external_rule_call(&["safe"], vec![format, rule_address(binding_variable(0))]),
+        );
+        let input = anchorless_input(call(
+            crate::ValueIdentity::ForeignFunction {
+                symbol: "scanf".into(),
+            },
+            vec![string("%d"), address(concrete_binding("<id0>"))],
+        ));
+        let selected = LoadedRuleSet::new(&RuleDocument {
+            schema_version: 1,
+            rules: vec![rule],
+        })
+        .unwrap()
+        .select(&input)
+        .unwrap();
+        assert_eq!(
+            selected.target_expression,
+            call(
+                concrete_external("xj_scanf", &["safe"]),
+                vec![string("%d"), address(concrete_binding("<id0>"))],
+            )
+        );
+
+        let two_bindings = anchorless_rule(
+            foreign_rule_call("scanf", vec![binding_variable(0), binding_variable(1)]),
+            binding_variable(0),
+        );
+        let duplicate = anchorless_input(call(
+            crate::ValueIdentity::ForeignFunction {
+                symbol: "scanf".into(),
+            },
+            vec![concrete_binding("<id0>"), concrete_binding("<id0>")],
+        ));
+        assert!(rule_matches(&two_bindings, &duplicate).is_none());
+    }
+
+    #[test]
+    fn anchorless_ping_expression_match_rejects_extra_anchor_context() {
+        let expression = expression_variable(0);
+        let rule = anchorless_rule(
+            foreign_rule_call("ping", vec![expression.clone()]),
+            expression,
+        );
+        let input = anchorless_input(call(
+            crate::ValueIdentity::ForeignFunction {
+                symbol: "ping".into(),
+            },
+            vec![integer("7")],
+        ));
+        let selected = LoadedRuleSet::new(&RuleDocument {
+            schema_version: 1,
+            rules: vec![rule.clone()],
+        })
+        .unwrap()
+        .select(&input)
+        .unwrap();
+        assert_eq!(selected.target_expression, integer("7"));
+        assert_eq!(selected.substitution_cost, 4);
+
+        let mut anchored = input;
+        anchored.pointer_anchors.push(crate::PointerAnchor {
+            id: "<id0>".into(),
+            source_type: TypeTree::RawPointer {
+                mutability: RawMutability::Const,
+                pointee: Box::new(primitive()),
+            },
+            target_type: TypeTree::Reference {
+                mutability: RefMutability::Shared,
+                pointee: Box::new(primitive()),
+            },
+        });
+        assert!(rule_matches(&rule, &anchored).is_none());
+    }
+
+    #[test]
+    fn differing_scan_formats_enumerate_only_equal_repeated_pairs() {
+        let decimal = exact_scan_observation(b'd');
+        let unsigned = exact_scan_observation(b'u');
+        assert_eq!(
+            synthesize_observation_pair(&decimal, &unsigned).rejection,
+            Some(PairRejection::Source)
+        );
+        let documents = [
+            ObservationDocument {
+                schema_version: 1,
+                observations: vec![decimal.clone(), unsigned.clone()],
+            },
+            ObservationDocument {
+                schema_version: 1,
+                observations: vec![unsigned.clone(), decimal.clone()],
+            },
+        ];
+        let forward = synthesize_rules(&documents).unwrap();
+        let reverse = synthesize_rules(&[documents[1].clone(), documents[0].clone()]).unwrap();
+        assert_eq!(
+            rule_document_to_json(&forward).unwrap(),
+            rule_document_to_json(&reverse).unwrap()
+        );
+        assert_eq!(forward.rules.len(), 2);
+        assert_eq!(
+            forward
+                .rules
+                .iter()
+                .cloned()
+                .map(|rule| semantic_sort_key(&rule))
+                .collect::<BTreeSet<_>>(),
+            [exact_scan_rule(b'd'), exact_scan_rule(b'u')]
+                .into_iter()
+                .map(|rule| semantic_sort_key(&rule))
+                .collect()
+        );
+    }
+
+    #[test]
+    fn unavailable_foreign_selection_has_exact_fallback_metadata() {
+        let exact_source = foreign_rule_call(
+            "source_ping",
+            vec![integer_rule(RuleIntegerMagnitude::Fixed("1".into()))],
+        );
+        let unavailable = anchorless_rule(
+            exact_source,
+            foreign_rule_call(
+                "c_ping",
+                vec![integer_rule(RuleIntegerMagnitude::Fixed("1".into()))],
+            ),
+        );
+        let fallback = anchorless_rule(
+            foreign_rule_call("source_ping", vec![expression_variable(0)]),
+            integer_rule(RuleIntegerMagnitude::Fixed("7".into())),
+        );
+        assert!(source_pattern_at_least_as_specific(
+            &unavailable.source_pattern,
+            &fallback.source_pattern
+        ));
+        assert!(!source_pattern_at_least_as_specific(
+            &fallback.source_pattern,
+            &unavailable.source_pattern
+        ));
+        let input = anchorless_input(call(
+            crate::ValueIdentity::ForeignFunction {
+                symbol: "source_ping".into(),
+            },
+            vec![integer("1")],
+        ));
+        for rules in [
+            vec![unavailable.clone(), fallback.clone()],
+            vec![fallback.clone(), unavailable.clone()],
+        ] {
+            let unavailable_index = rules.iter().position(|rule| rule == &unavailable).unwrap();
+            let fallback_index = rules.iter().position(|rule| rule == &fallback).unwrap();
+            let loaded = LoadedRuleSet::new(&RuleDocument {
+                schema_version: 1,
+                rules,
+            })
+            .unwrap();
+            let first = loaded
+                .select_with_exclusions(&input, &BTreeSet::new())
+                .unwrap();
+            assert_eq!(first.rule_index, unavailable_index);
+            assert_eq!(
+                first.alpha_group,
+                loaded.alpha_group(unavailable_index).unwrap()
+            );
+            assert_eq!(first.substitution_cost, 0);
+            assert_eq!(first.target_size, 7);
+            assert_eq!(
+                first.target_expression,
+                call(
+                    crate::ValueIdentity::ForeignFunction {
+                        symbol: "c_ping".into(),
+                    },
+                    vec![integer("1")],
+                )
+            );
+
+            let second = loaded
+                .select_with_exclusions(&input, &BTreeSet::from([unavailable_index]))
+                .unwrap();
+            assert_eq!(second.rule_index, fallback_index);
+            assert_eq!(
+                second.alpha_group,
+                loaded.alpha_group(fallback_index).unwrap()
+            );
+            assert_eq!(second.substitution_cost, 4);
+            assert_eq!(second.target_size, 4);
+            assert_eq!(second.target_expression, integer("7"));
+        }
+    }
+
+    #[test]
+    fn anchorless_rules_use_existing_specificity_ranking_and_exclusions() {
+        let specific_source = RuleExpression::Call {
+            callee: Box::new(RuleExpression::Path {
+                value: RuleValueIdentity::ForeignFunction {
+                    symbol: "ping".into(),
+                },
+            }),
+            arguments: vec![integer_rule(RuleIntegerMagnitude::Fixed("1".into()))],
+        };
+        let broad_source = RuleExpression::Variable {
+            sort: VariableSort::Expression,
+            index: 0,
+        };
+        let specific = anchorless_rule(
+            specific_source.clone(),
+            integer_rule(RuleIntegerMagnitude::Fixed("7".into())),
+        );
+        let broad = anchorless_rule(
+            broad_source,
+            integer_rule(RuleIntegerMagnitude::Fixed("8".into())),
+        );
+        let concrete = anchorless_input(call(
+            crate::ValueIdentity::ForeignFunction {
+                symbol: "ping".into(),
+            },
+            vec![integer("1")],
+        ));
+        for rules in [
+            vec![specific.clone(), broad.clone()],
+            vec![broad.clone(), specific.clone()],
+        ] {
+            let loaded = LoadedRuleSet::new(&RuleDocument {
+                schema_version: 1,
+                rules,
+            })
+            .unwrap();
+            let selected = loaded
+                .select_with_exclusions(&concrete, &BTreeSet::new())
+                .unwrap();
+            assert_eq!(selected.target_expression, integer("7"));
+            let fallback = loaded
+                .select_with_exclusions(&concrete, &BTreeSet::from([selected.rule_index]))
+                .unwrap();
+            assert_eq!(fallback.target_expression, integer("8"));
+            assert!(source_pattern_at_least_as_specific(
+                &specific.source_pattern,
+                &broad.source_pattern
+            ));
+            assert!(!source_pattern_at_least_as_specific(
+                &broad.source_pattern,
+                &specific.source_pattern
+            ));
+        }
+
+        let repeated_source = RuleExpression::Tuple {
+            elements: vec![
+                expression_variable(0),
+                expression_variable(0),
+                integer_rule(RuleIntegerMagnitude::Fixed("0".into())),
+            ],
+        };
+        let decomposed_source = RuleExpression::Tuple {
+            elements: vec![
+                add_rule(expression_variable(0), expression_variable(1)),
+                add_rule(expression_variable(0), expression_variable(1)),
+                expression_variable(2),
+            ],
+        };
+        let repeated = anchorless_rule(
+            repeated_source,
+            integer_rule(RuleIntegerMagnitude::Fixed("7".into())),
+        );
+        let decomposed = anchorless_rule(
+            decomposed_source,
+            integer_rule(RuleIntegerMagnitude::Fixed("9".into())),
+        );
+        let repeated_concrete = anchorless_input(Expression::Tuple {
+            elements: vec![
+                add_expression(concrete_binding("<id0>"), integer("1")),
+                add_expression(concrete_binding("<id0>"), integer("1")),
+                integer("0"),
+            ],
+        });
+        let repeated_state = rule_matches(&repeated, &repeated_concrete).unwrap();
+        let decomposed_state = rule_matches(&decomposed, &repeated_concrete).unwrap();
+        assert_eq!(substitution_cost(&repeated, &repeated_state), 8);
+        assert_eq!(substitution_cost(&decomposed, &decomposed_state), 10);
+        assert!(!source_pattern_at_least_as_specific(
+            &repeated.source_pattern,
+            &decomposed.source_pattern
+        ));
+        assert!(!source_pattern_at_least_as_specific(
+            &decomposed.source_pattern,
+            &repeated.source_pattern
+        ));
+        for rules in [
+            vec![repeated.clone(), decomposed.clone()],
+            vec![decomposed.clone(), repeated.clone()],
+        ] {
+            assert_eq!(
+                LoadedRuleSet::new(&RuleDocument {
+                    schema_version: 1,
+                    rules,
+                })
+                .unwrap()
+                .select(&repeated_concrete)
+                .unwrap()
+                .target_expression,
+                integer("7")
+            );
+        }
+
+        let exact_call = RuleExpression::Call {
+            callee: Box::new(RuleExpression::Path {
+                value: RuleValueIdentity::ForeignFunction {
+                    symbol: "ping".into(),
+                },
+            }),
+            arguments: vec![integer_rule(RuleIntegerMagnitude::Fixed("1".into()))],
+        };
+        let small = anchorless_rule(
+            exact_call.clone(),
+            integer_rule(RuleIntegerMagnitude::Fixed("1".into())),
+        );
+        let large_target = add_rule(
+            integer_rule(RuleIntegerMagnitude::Fixed("1".into())),
+            integer_rule(RuleIntegerMagnitude::Fixed("2".into())),
+        );
+        let large = anchorless_rule(exact_call.clone(), large_target.clone());
+        for rules in [
+            vec![small.clone(), large.clone()],
+            vec![large.clone(), small],
+        ] {
+            let selected = LoadedRuleSet::new(&RuleDocument {
+                schema_version: 1,
+                rules,
+            })
+            .unwrap()
+            .select(&concrete)
+            .unwrap();
+            assert_eq!(
+                selected.target_expression,
+                add_expression(integer("1"), integer("2"))
+            );
+            assert_eq!(
+                selected.target_size,
+                normalized_term_size(&serde_json::to_value(&large_target).unwrap())
+            );
+        }
+
+        let canonical_one = anchorless_rule(
+            exact_call.clone(),
+            integer_rule(RuleIntegerMagnitude::Fixed("1".into())),
+        );
+        let canonical_two = anchorless_rule(
+            exact_call,
+            integer_rule(RuleIntegerMagnitude::Fixed("2".into())),
+        );
+        for rules in [
+            vec![canonical_one.clone(), canonical_two.clone()],
+            vec![canonical_two.clone(), canonical_one.clone()],
+        ] {
+            assert_eq!(
+                LoadedRuleSet::new(&RuleDocument {
+                    schema_version: 1,
+                    rules,
+                })
+                .unwrap()
+                .select(&concrete)
+                .unwrap()
+                .target_expression,
+                integer("1")
+            );
+        }
+
+        let allocate = RuleExpression::Call {
+            callee: Box::new(RuleExpression::Path {
+                value: RuleValueIdentity::ForeignFunction {
+                    symbol: "allocate".into(),
+                },
+            }),
+            arguments: vec![],
+        };
+        let raw = RuleTypeTree::RawPointer {
+            mutability: RawMutability::Mut,
+            pointee: Box::new(rule_primitive()),
+        };
+        let mut i32_rule = anchorless_rule(allocate.clone(), allocate.clone());
+        i32_rule.source_type = raw.clone();
+        i32_rule.source_adjusted_type = raw.clone();
+        i32_rule.target_type = rule_primitive();
+        i32_rule.target_adjusted_type = raw.clone();
+        let mut usize_rule = i32_rule.clone();
+        usize_rule.target_type = RuleTypeTree::Primitive {
+            name: "usize".into(),
+        };
+        let mut allocate_input = anchorless_input(call(
+            crate::ValueIdentity::ForeignFunction {
+                symbol: "allocate".into(),
+            },
+            vec![],
+        ));
+        allocate_input.source_type = TypeTree::RawPointer {
+            mutability: RawMutability::Mut,
+            pointee: Box::new(primitive()),
+        };
+        allocate_input.source_adjusted_type = allocate_input.source_type.clone();
+        allocate_input.target_adjusted_type = Some(allocate_input.source_type.clone());
+        for rules in [
+            vec![i32_rule.clone(), usize_rule.clone()],
+            vec![usize_rule.clone(), i32_rule.clone()],
+        ] {
+            let loaded = LoadedRuleSet::new(&RuleDocument {
+                schema_version: 1,
+                rules,
+            })
+            .unwrap();
+            let selected = loaded.select(&allocate_input).unwrap();
+            assert_eq!(
+                loaded.rules()[selected.rule_index].target_type,
+                rule_primitive()
+            );
+        }
     }
 }

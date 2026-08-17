@@ -1291,13 +1291,20 @@ struct ParentEdge {
 struct AnchorOccurrence {
     expression: NodeId,
     binding: hir::HirId,
+    ordinal: usize,
+}
+
+enum SeedOccurrence {
+    Pointer(AnchorOccurrence),
+    ForeignCall { expression: NodeId, ordinal: usize },
 }
 
 #[derive(Default)]
 pub(crate) struct ExpressionTree<'a> {
     expressions: HashMap<NodeId, &'a Expr>,
     parents: HashMap<NodeId, ParentEdge>,
-    anchors: Vec<AnchorOccurrence>,
+    order: HashMap<NodeId, usize>,
+    seeds: Vec<SeedOccurrence>,
     opaque: HashSet<NodeId>,
 }
 
@@ -1317,6 +1324,8 @@ impl<'a> ExpressionTree<'a> {
             return;
         }
         self.expressions.insert(expression.id, expression);
+        let ordinal = self.order.len();
+        self.order.insert(expression.id, ordinal);
         if let Some(parent) = parent {
             self.parents
                 .insert(expression.id, ParentEdge { parent, role });
@@ -1334,9 +1343,20 @@ impl<'a> ExpressionTree<'a> {
                 .expr_ty(hir_expression)
                 .is_raw_ptr()
         {
-            self.anchors.push(AnchorOccurrence {
+            self.seeds.push(SeedOccurrence::Pointer(AnchorOccurrence {
                 expression: expression.id,
                 binding,
+                ordinal,
+            }));
+        }
+        if let ExprKind::Call(callee, _) = &expression.kind
+            && resolved_definition(callee, ast_to_hir, tcx)
+                .and_then(|definition| local_c_foreign_function_symbol(definition, tcx))
+                .is_some()
+        {
+            self.seeds.push(SeedOccurrence::ForeignCall {
+                expression: expression.id,
+                ordinal,
             });
         }
         let id = expression.id;
@@ -1525,6 +1545,7 @@ impl<'a> ExpressionTree<'a> {
 pub(crate) struct AnchorPair {
     pub(crate) source_binding: hir::HirId,
     pub(crate) target_binding: hir::HirId,
+    occurrence: usize,
 }
 
 pub(crate) struct SelectedRegion {
@@ -1547,25 +1568,39 @@ pub(crate) fn select_expression_regions<'a>(
     };
     tree.add(expression, None, ParentRole::Boundary, ast_to_hir, tcx);
     let mut selected = vec![];
-    for anchor in &tree.anchors {
-        let Some(target_binding) = target_binding(anchor.binding) else {
-            continue;
+    for seed in &tree.seeds {
+        let (start, ordinal, anchors) = match seed {
+            SeedOccurrence::Pointer(anchor) => {
+                let Some(target_binding) = target_binding(anchor.binding) else {
+                    continue;
+                };
+                (
+                    anchor.expression,
+                    anchor.ordinal,
+                    vec![AnchorPair {
+                        source_binding: anchor.binding,
+                        target_binding,
+                        occurrence: anchor.ordinal,
+                    }],
+                )
+            }
+            SeedOccurrence::ForeignCall {
+                expression,
+                ordinal,
+            } => (*expression, *ordinal, vec![]),
         };
-        let Some((root, promoted_field)) = select_region(anchor.expression, &tree, ast_to_hir, tcx)
-        else {
+        let Some((root, promoted_field)) = select_region(start, &tree, ast_to_hir, tcx) else {
             continue;
         };
         selected.push(SelectedRegion {
             root,
             promoted_field,
             lhs: false,
-            anchors: vec![AnchorPair {
-                source_binding: anchor.binding,
-                target_binding,
-            }],
+            anchors,
         });
+        debug_assert!(tree.order[&root] <= ordinal);
     }
-    merge_regions(&mut selected);
+    coalesce_regions(&mut selected, &tree);
     for region in &mut selected {
         region.lhs = tree.parents.get(&region.root).is_some_and(|edge| {
             edge.role == ParentRole::AssignLeft
@@ -1575,11 +1610,14 @@ pub(crate) fn select_expression_regions<'a>(
                     .is_some_and(|parent| matches!(parent.kind, ExprKind::Assign(..)))
         });
     }
-    (!regions_overlap(&selected, &tree)).then_some((tree, selected))
+    debug_assert!(!regions_overlap(&selected, &tree));
+    Some((tree, selected))
 }
 
 pub(crate) struct RuleRegion {
     pub root: NodeId,
+    #[cfg(test)]
+    pub promoted_field: bool,
     pub observation: Observation,
     pub spellings: HashMap<String, String>,
     pub source_syntax: Vec<String>,
@@ -1703,6 +1741,8 @@ pub(crate) fn select_rule_regions(
             syntax.visit_expr(root);
             Some(RuleRegion {
                 root: region.root,
+                #[cfg(test)]
+                promoted_field: region.promoted_field,
                 observation: Observation {
                     source_expression: source_expression.clone(),
                     target_expression: source_expression,
@@ -1976,7 +2016,27 @@ fn resolved_definition(
     }
 }
 
-fn merge_regions(regions: &mut Vec<SelectedRegion>) {
+pub(crate) fn local_c_foreign_function_symbol(
+    definition: DefId,
+    tcx: TyCtxt<'_>,
+) -> Option<Symbol> {
+    if tcx.def_kind(definition) != hir::def::DefKind::Fn || !tcx.is_foreign_item(definition) {
+        return None;
+    }
+    let parent = tcx.parent(definition).as_local()?;
+    let hir::Node::Item(item) = tcx.hir_node_by_def_id(parent) else { return None };
+    let hir::ItemKind::ForeignMod { abi, .. } = item.kind else { return None };
+    if !matches!(abi, rustc_abi::ExternAbi::C { unwind: false }) {
+        return None;
+    }
+    Some(
+        tcx.codegen_fn_attrs(definition)
+            .link_name
+            .unwrap_or_else(|| tcx.item_name(definition)),
+    )
+}
+
+fn coalesce_regions(regions: &mut Vec<SelectedRegion>, tree: &ExpressionTree<'_>) {
     let mut merged: Vec<SelectedRegion> = vec![];
     for region in regions.drain(..) {
         if let Some(existing) = merged
@@ -1984,20 +2044,65 @@ fn merge_regions(regions: &mut Vec<SelectedRegion>) {
             .find(|existing| existing.root == region.root)
         {
             existing.promoted_field |= region.promoted_field;
-            for anchor in region.anchors {
-                if !existing
-                    .anchors
-                    .iter()
-                    .any(|value| value.source_binding == anchor.source_binding)
-                {
-                    existing.anchors.push(anchor);
-                }
-            }
+            existing.anchors.extend(region.anchors);
         } else {
             merged.push(region);
         }
     }
-    *regions = merged;
+
+    let roots = merged
+        .iter()
+        .map(|region| region.root)
+        .collect::<HashSet<_>>();
+    let mut retained = vec![];
+    for region in &merged {
+        let mut current = region.root;
+        let mut maximal_ancestor = None;
+        while let Some(edge) = tree.parents.get(&current) {
+            current = edge.parent;
+            if roots.contains(&current) {
+                maximal_ancestor = Some(current);
+            }
+        }
+        if maximal_ancestor.is_none() {
+            retained.push(SelectedRegion {
+                root: region.root,
+                promoted_field: region.promoted_field,
+                lhs: false,
+                anchors: vec![],
+            });
+        }
+    }
+    for region in merged {
+        let mut destination = region.root;
+        let mut current = region.root;
+        while let Some(edge) = tree.parents.get(&current) {
+            current = edge.parent;
+            if roots.contains(&current) {
+                destination = current;
+            }
+        }
+        let target = retained
+            .iter_mut()
+            .find(|candidate| candidate.root == destination)
+            .expect("every selected region has one maximal selected ancestor");
+        target.anchors.extend(region.anchors);
+    }
+    retained.sort_by_key(|region| tree.order[&region.root]);
+    for region in &mut retained {
+        region.anchors.sort_by_key(|anchor| anchor.occurrence);
+        let mut seen = HashMap::new();
+        region.anchors.retain(|anchor| {
+            if let Some(previous_target) = seen.get(&anchor.source_binding) {
+                debug_assert_eq!(*previous_target, anchor.target_binding);
+                false
+            } else {
+                seen.insert(anchor.source_binding, anchor.target_binding);
+                true
+            }
+        });
+    }
+    *regions = retained;
 }
 
 fn regions_overlap(regions: &[SelectedRegion], tree: &ExpressionTree<'_>) -> bool {
@@ -3238,18 +3343,20 @@ impl<'a, 'tcx> DumpContext<'a, 'tcx> {
             return Some(ValueIdentity::Function { id: value });
         }
         if self.tcx.is_foreign_item(id) {
-            if !self.foreign_item_has_c_abi(id) {
-                return None;
-            }
-            let symbol = self
-                .tcx
-                .codegen_fn_attrs(id)
-                .link_name
-                .unwrap_or_else(|| self.tcx.item_name(id))
-                .to_string();
             return match kind {
-                hir::def::DefKind::Fn => Some(ValueIdentity::ForeignFunction { symbol }),
-                hir::def::DefKind::Static { .. } => Some(ValueIdentity::ForeignStatic { symbol }),
+                hir::def::DefKind::Fn => Some(ValueIdentity::ForeignFunction {
+                    symbol: local_c_foreign_function_symbol(id, self.tcx)?.to_string(),
+                }),
+                hir::def::DefKind::Static { .. } if self.foreign_item_has_c_abi(id) => {
+                    Some(ValueIdentity::ForeignStatic {
+                        symbol: self
+                            .tcx
+                            .codegen_fn_attrs(id)
+                            .link_name
+                            .unwrap_or_else(|| self.tcx.item_name(id))
+                            .to_string(),
+                    })
+                }
                 _ => None,
             };
         }
@@ -3930,6 +4037,193 @@ mod tests {
         extract_metadata(source, metadata)
     }
 
+    fn primitive(name: &str) -> TypeTree {
+        TypeTree::Primitive { name: name.into() }
+    }
+
+    fn raw_pointer(name: &str, mutability: RawMutability) -> TypeTree {
+        TypeTree::RawPointer {
+            mutability,
+            pointee: Box::new(primitive(name)),
+        }
+    }
+
+    fn shared_reference(ty: TypeTree) -> TypeTree {
+        TypeTree::Reference {
+            mutability: RefMutability::Shared,
+            pointee: Box::new(ty),
+        }
+    }
+
+    fn binding(id: &str) -> Expression {
+        Expression::Path {
+            value: ValueIdentity::Binding { id: id.into() },
+        }
+    }
+
+    fn foreign_call(symbol: &str, arguments: Vec<Expression>) -> Expression {
+        Expression::Call {
+            callee: Box::new(Expression::Path {
+                value: ValueIdentity::ForeignFunction {
+                    symbol: symbol.into(),
+                },
+            }),
+            arguments,
+        }
+    }
+
+    fn integer(value: &str, ty: &str) -> Expression {
+        Expression::Literal {
+            value: Literal::Integer {
+                value: value.into(),
+                ty: ty.into(),
+            },
+        }
+    }
+
+    fn pointer_anchor(id: &str, source_type: TypeTree, target_type: TypeTree) -> PointerAnchor {
+        PointerAnchor {
+            id: id.into(),
+            source_type,
+            target_type,
+        }
+    }
+
+    fn scalar_observation(
+        source_expression: Expression,
+        target_expression: Expression,
+        pointer_anchors: Vec<PointerAnchor>,
+        lhs: bool,
+        scalar: &str,
+    ) -> Observation {
+        Observation {
+            source_expression,
+            target_expression,
+            pointer_anchors,
+            lhs,
+            source_type: primitive(scalar),
+            source_adjusted_type: primitive(scalar),
+            target_type: primitive(scalar),
+            target_adjusted_type: primitive(scalar),
+        }
+    }
+
+    fn recorded_scan_pair(format: char, binding: &str) -> String {
+        format!(
+            r#"
+extern crate xj_scanf;
+unsafe extern "C" {{ fn scanf(format: *const i8, ...) -> i32; }}
+unsafe fn source_copy() -> i32 {{
+    #[proctor(0)] let mut {binding}: i32 = 0;
+    #[proctor(1)] scanf(b"%{format}\0" as *const u8 as *const i8, &mut {binding} as *mut i32)
+}}
+unsafe fn target() -> i32 {{
+    #[proctor(0)] let mut {binding}: i32 = 0;
+    #[proctor(1)] xj_scanf::legacy::scanf("%{format}", &mut [&mut {binding}])
+}}
+"#
+        )
+    }
+
+    fn exact_recorded_scan_rule(format: u8) -> crate::Rule {
+        let primitive = || crate::RuleTypeTree::Primitive { name: "i32".into() };
+        let const_pointer = |name: &str| crate::RuleTypeTree::RawPointer {
+            mutability: RawMutability::Const,
+            pointee: Box::new(crate::RuleTypeTree::Primitive { name: name.into() }),
+        };
+        let binding = crate::RuleExpression::Path {
+            value: crate::RuleValueIdentity::Variable {
+                sort: crate::VariableSort::Binding,
+                index: 0,
+            },
+        };
+        let address = |expression| crate::RuleExpression::AddressOf {
+            borrow: BorrowKind::Reference,
+            mutability: RawMutability::Mut,
+            expression: Box::new(expression),
+        };
+        let source_format = crate::RuleExpression::Cast {
+            expression: Box::new(crate::RuleExpression::Cast {
+                expression: Box::new(crate::RuleExpression::Literal {
+                    value: crate::RuleLiteral::ByteString {
+                        value: vec![b'%', format, 0],
+                    },
+                }),
+                ty: const_pointer("u8"),
+            }),
+            ty: const_pointer("i8"),
+        };
+        let source_binding = crate::RuleExpression::Cast {
+            expression: Box::new(address(binding.clone())),
+            ty: crate::RuleTypeTree::RawPointer {
+                mutability: RawMutability::Mut,
+                pointee: Box::new(primitive()),
+            },
+        };
+        let call = |callee, arguments| crate::RuleExpression::Call {
+            callee: Box::new(crate::RuleExpression::Path { value: callee }),
+            arguments,
+        };
+        crate::Rule {
+            source_pattern: call(
+                crate::RuleValueIdentity::ForeignFunction {
+                    symbol: "scanf".into(),
+                },
+                vec![source_format, source_binding],
+            ),
+            target_pattern: call(
+                crate::RuleValueIdentity::External {
+                    crate_name: "xj_scanf".into(),
+                    path: vec!["legacy".into(), "scanf".into()],
+                },
+                vec![
+                    crate::RuleExpression::Literal {
+                        value: crate::RuleLiteral::String {
+                            value: format!("%{}", char::from(format)),
+                        },
+                    },
+                    address(crate::RuleExpression::Array {
+                        elements: vec![address(binding)],
+                    }),
+                ],
+            ),
+            pointer_anchors: vec![],
+            lhs: false,
+            source_type: primitive(),
+            source_adjusted_type: primitive(),
+            target_type: primitive(),
+            target_adjusted_type: primitive(),
+        }
+    }
+
+    fn extract_twice_canonically(
+        source: &str,
+        source_copy_path: &str,
+        implementation_path: &str,
+        transform_labels: Vec<u32>,
+    ) -> ObservationDocument {
+        let first = extract_case(
+            source,
+            source_copy_path,
+            implementation_path,
+            transform_labels.clone(),
+        )
+        .unwrap();
+        let second = extract_case(
+            source,
+            source_copy_path,
+            implementation_path,
+            transform_labels,
+        )
+        .unwrap();
+        assert_eq!(first, second);
+        assert_eq!(
+            serde_json::to_string(&first).unwrap(),
+            serde_json::to_string(&second).unwrap()
+        );
+        first
+    }
+
     fn extract_metadata(
         source: &str,
         mut metadata: ReplacementObservationMetadata,
@@ -3958,6 +4252,31 @@ mod tests {
                 .collect()
         })
         .unwrap()
+    }
+
+    fn inspect_source_selection<F>(source: &str, function: &str, inspect: F)
+    where F: for<'tcx> FnOnce(TyCtxt<'tcx>, &ExpressionTree<'_>, &[SelectedRegion]) + Send {
+        let source = source.to_owned();
+        let function = function.to_owned();
+        utils::compilation::run_compiler_on_str(&source.clone(), move |tcx| {
+            let mut surface = utils::ast::parse_crate(source);
+            let mut mapper = utils::ir::AstToHirMapper::new(tcx);
+            mapper.map_crate_to_mod(&mut surface, tcx.hir_root_module(), false);
+            let ast_to_hir = mapper.ast_to_hir;
+            let mut functions = HashMap::new();
+            collect_functions(&surface.items, &mut vec![], &mut functions);
+            let statement = plain_statements(functions[function.as_str()])
+                .into_iter()
+                .next()
+                .expect("fixture has one statement");
+            let expression =
+                statement_expression(statement).expect("fixture statement is expression");
+            let (tree, regions) =
+                select_expression_regions(expression, HashSet::new(), Some, &ast_to_hir, tcx)
+                    .expect("selection succeeds");
+            inspect(tcx, &tree, &regions);
+        })
+        .unwrap();
     }
 
     fn dump_parameter_types(source: &str, function: &str) -> Vec<TypeTree> {
@@ -4530,19 +4849,36 @@ unsafe fn __proctor_source_read(pointer: *mut i32) -> i32 {
     #[test]
     fn preserved_labels_never_emit() {
         let source = r#"
+unsafe extern "C" { fn ping() -> i32; }
 unsafe fn read(pointer: &i32) -> i32 {
-    #[proctor(0)] let value: i32 = 1;
+    #[proctor(0)] let value: i32 = ping();
     #[proctor(1)] value + *pointer
 }
 unsafe fn __proctor_source_read(pointer: *const i32) -> i32 {
-    #[proctor(0)] let value = 1;
+    #[proctor(0)] let value = ping();
     #[proctor(1)] value + *pointer
 }
 "#;
+        let document = extract_twice_canonically(source, "__proctor_source_read", "read", vec![1]);
+        let dereference = Expression::Unary {
+            operator: UnaryOperator::Deref,
+            operand: Box::new(binding("<id0>")),
+        };
         assert_eq!(
-            extract_labels(source, vec![1]).unwrap().observations.len(),
-            1
+            document.observations,
+            [scalar_observation(
+                dereference.clone(),
+                dereference,
+                vec![pointer_anchor(
+                    "<id0>",
+                    raw_pointer("i32", RawMutability::Const),
+                    shared_reference(primitive("i32")),
+                )],
+                false,
+                "i32",
+            )]
         );
+        assert!(!serde_json::to_string(&document).unwrap().contains("ping"));
     }
 
     #[test]
@@ -4558,6 +4894,23 @@ unsafe fn target(mut pointer: &i32) -> i32 {
 "#;
         assert!(
             extract_case(source, "source_copy", "target", vec![0])
+                .unwrap()
+                .observations
+                .is_empty()
+        );
+
+        let foreign = r#"
+unsafe extern "C" { fn ping() -> i32; }
+unsafe fn source_copy() -> i32 {
+    #[proctor(0)] ping()
+}
+unsafe fn target() -> i32 {
+    #[proctor(0)] let proctor_temp_var_0 = ping();
+    #[proctor(0)] proctor_temp_var_0
+}
+"#;
+        assert!(
+            extract_case(foreign, "source_copy", "target", vec![0])
                 .unwrap()
                 .observations
                 .is_empty()
@@ -4588,6 +4941,67 @@ unsafe fn target(mut pointer: Option<&i32>) -> i32 {
         assert_eq!(
             serde_json::to_value(&document.observations).unwrap(),
             exact_optional_pointer_observations()
+        );
+    }
+
+    #[test]
+    fn nested_foreign_label_is_opaque_to_outer_selection() {
+        let source = r#"
+unsafe extern "C" { fn ping(pointer: *const i32) -> i32; }
+unsafe fn source_copy(mut flag: *const bool, mut pointer: *const i32) -> i32 {
+    #[proctor(0)]
+    if *flag {
+        #[proctor(1)] ping(pointer)
+    } else {
+        0
+    }
+}
+unsafe fn target(mut flag: &bool, mut pointer: &i32) -> i32 {
+    #[proctor(0)]
+    if *flag {
+        #[proctor(1)] ping(pointer as *const i32)
+    } else {
+        0
+    }
+}
+"#;
+        let document = extract_twice_canonically(source, "source_copy", "target", vec![0, 1]);
+        let dereference = |id| Expression::Unary {
+            operator: UnaryOperator::Deref,
+            operand: Box::new(binding(id)),
+        };
+        assert_eq!(
+            document.observations,
+            [
+                scalar_observation(
+                    dereference("<id0>"),
+                    dereference("<id0>"),
+                    vec![pointer_anchor(
+                        "<id0>",
+                        raw_pointer("bool", RawMutability::Const),
+                        shared_reference(primitive("bool")),
+                    )],
+                    false,
+                    "bool",
+                ),
+                scalar_observation(
+                    foreign_call("ping", vec![binding("<id0>")]),
+                    foreign_call(
+                        "ping",
+                        vec![Expression::Cast {
+                            expression: Box::new(binding("<id0>")),
+                            ty: raw_pointer("i32", RawMutability::Const),
+                        }],
+                    ),
+                    vec![pointer_anchor(
+                        "<id0>",
+                        raw_pointer("i32", RawMutability::Const),
+                        shared_reference(primitive("i32")),
+                    )],
+                    false,
+                    "i32",
+                ),
+            ]
         );
     }
 
@@ -4903,6 +5317,31 @@ unsafe fn values(pointer: *const i32) -> i32 {
                 {"kind":"unary","operator":"negate","operand":{"kind":"literal","value":{"kind":"integer","value":"12","type":"i32"}}}
             ]})
         );
+
+        let formats = dump_statement_expressions(
+            r##"fn formats() { let _ = ("%d", r"%d", "\x25d", b"%d\0", b"\x25\x64\x00", c"%d", c"\x25\x64"); }"##,
+            "formats",
+        );
+        let Expression::Tuple { elements } = &formats[0] else { panic!() };
+        assert_eq!(elements[0], elements[1]);
+        assert_eq!(elements[1], elements[2]);
+        assert_eq!(elements[3], elements[4]);
+        assert_eq!(elements[5], elements[6]);
+        assert_eq!(
+            serde_json::to_value(&elements[0]).unwrap(),
+            json!({"kind":"literal","value":{"kind":"string","value":"%d"}})
+        );
+        assert_eq!(
+            serde_json::to_value(&elements[3]).unwrap(),
+            json!({"kind":"literal","value":{"kind":"byte_string","value":[37,100,0]}})
+        );
+        assert_eq!(
+            serde_json::to_value(&elements[5]).unwrap(),
+            json!({"kind":"literal","value":{"kind":"c_string","value":[37,100]}})
+        );
+        assert_ne!(elements[0], elements[3]);
+        assert_ne!(elements[0], elements[5]);
+        assert_ne!(elements[3], elements[5]);
     }
 
     #[test]
@@ -5341,7 +5780,7 @@ unsafe fn target(mut pointer: &i32) -> i32 {
 "#;
         let document = extract_case(source, "source_copy", "target", vec![0]).unwrap();
         assert_eq!(document.observations.len(), 3);
-        for observation in document.observations {
+        for observation in &document.observations[..2] {
             assert!(matches!(
                 observation.source_type,
                 TypeTree::RawPointer { .. }
@@ -5351,6 +5790,11 @@ unsafe fn target(mut pointer: &i32) -> i32 {
                 TypeTree::RawPointer { .. }
             ));
         }
+        assert!(matches!(
+            document.observations[2].source_expression,
+            Expression::Call { .. }
+        ));
+        assert_eq!(document.observations[2].pointer_anchors.len(), 1);
     }
 
     #[test]
@@ -5596,7 +6040,7 @@ unsafe fn target(mut pointer: &Pair) -> i32 {
     }
 
     #[test]
-    fn promoted_regions_participate_in_overlap_check() {
+    fn promoted_overlap_keeps_the_outer_field() {
         let source = r#"
 struct Pair { value: i32 }
 unsafe fn source_copy(mut pointer: *const Pair, mut index: *const isize) -> i32 {
@@ -5606,8 +6050,87 @@ unsafe fn target(mut pointer: &[Pair], mut index: &isize) -> i32 {
     #[proctor(0)] pointer[*index as usize].value
 }
 "#;
-        let document = extract_case(source, "source_copy", "target", vec![0]).unwrap();
-        assert!(document.observations.is_empty());
+        let document = extract_twice_canonically(source, "source_copy", "target", vec![0]);
+        let pair = TypeTree::Adt {
+            adt_kind: AdtKind::Struct,
+            identity: AdtIdentity::Local {
+                id: "<struct0>".into(),
+            },
+            arguments: vec![],
+        };
+        let field = FieldIdentity::Local {
+            owner: AdtIdentity::Local {
+                id: "<struct0>".into(),
+            },
+            id: "<field0>".into(),
+        };
+        let source_expression = Expression::Field {
+            base: Box::new(Expression::Unary {
+                operator: UnaryOperator::Deref,
+                operand: Box::new(Expression::MethodCall {
+                    receiver: Box::new(binding("<id0>")),
+                    method: ValueIdentity::External {
+                        crate_name: "core".into(),
+                        path: vec!["ptr".into(), "const_ptr".into(), "offset".into()],
+                    },
+                    arguments: vec![Expression::Unary {
+                        operator: UnaryOperator::Deref,
+                        operand: Box::new(binding("<id1>")),
+                    }],
+                }),
+            }),
+            field: field.clone(),
+        };
+        let target_expression = Expression::Field {
+            base: Box::new(Expression::Index {
+                base: Box::new(binding("<id0>")),
+                index: Box::new(Expression::Cast {
+                    expression: Box::new(Expression::Unary {
+                        operator: UnaryOperator::Deref,
+                        operand: Box::new(binding("<id1>")),
+                    }),
+                    ty: primitive("usize"),
+                }),
+            }),
+            field,
+        };
+        assert_eq!(
+            document.observations,
+            [scalar_observation(
+                source_expression,
+                target_expression,
+                vec![
+                    PointerAnchor {
+                        id: "<id0>".into(),
+                        source_type: TypeTree::RawPointer {
+                            mutability: RawMutability::Const,
+                            pointee: Box::new(pair.clone()),
+                        },
+                        target_type: shared_reference(TypeTree::Slice {
+                            element: Box::new(pair),
+                        }),
+                    },
+                    PointerAnchor {
+                        id: "<id1>".into(),
+                        source_type: raw_pointer("isize", RawMutability::Const),
+                        target_type: shared_reference(primitive("isize")),
+                    },
+                ],
+                false,
+                "i32",
+            )]
+        );
+
+        let selection_source = source.replace("#[proctor(0)]", "");
+        inspect_source_selection(&selection_source, "source_copy", |_, tree, regions| {
+            assert_eq!(regions.len(), 1);
+            assert!(matches!(
+                tree.expressions[&regions[0].root].kind,
+                ExprKind::Field(..)
+            ));
+            assert!(regions[0].promoted_field);
+            assert!(!regions[0].lhs);
+        });
     }
 
     #[test]
@@ -5894,7 +6417,7 @@ unsafe fn target(mut pointer: &mut bool) {
     }
 
     #[test]
-    fn strict_ancestry_overlap_skips_complete_statement() {
+    fn strict_ancestry_keeps_the_maximal_region() {
         let source = r#"
 unsafe fn source_copy(mut base: *const i32, mut other: *const i32) -> i32 {
     #[proctor(0)] *base.offset(other.offset_from(base))
@@ -5903,11 +6426,593 @@ unsafe fn target(mut base: &[i32], mut other: &[i32]) -> i32 {
     #[proctor(0)] base[other.as_ptr().offset_from(base.as_ptr()) as usize]
 }
 "#;
+        let document = extract_twice_canonically(source, "source_copy", "target", vec![0]);
+        let method = |receiver, path: &[&str], arguments| Expression::MethodCall {
+            receiver: Box::new(receiver),
+            method: ValueIdentity::External {
+                crate_name: "core".into(),
+                path: path.iter().map(|part| (*part).into()).collect(),
+            },
+            arguments,
+        };
+        let source_expression = Expression::Unary {
+            operator: UnaryOperator::Deref,
+            operand: Box::new(method(
+                binding("<id0>"),
+                &["ptr", "const_ptr", "offset"],
+                vec![method(
+                    binding("<id1>"),
+                    &["ptr", "const_ptr", "offset_from"],
+                    vec![binding("<id0>")],
+                )],
+            )),
+        };
+        let target_expression = Expression::Index {
+            base: Box::new(binding("<id0>")),
+            index: Box::new(Expression::Cast {
+                expression: Box::new(method(
+                    method(binding("<id1>"), &["slice", "as_ptr"], vec![]),
+                    &["ptr", "const_ptr", "offset_from"],
+                    vec![method(binding("<id0>"), &["slice", "as_ptr"], vec![])],
+                )),
+                ty: primitive("usize"),
+            }),
+        };
+        let source_anchor_type = raw_pointer("i32", RawMutability::Const);
+        let target_anchor_type = shared_reference(TypeTree::Slice {
+            element: Box::new(primitive("i32")),
+        });
+        assert_eq!(
+            document.observations,
+            [scalar_observation(
+                source_expression,
+                target_expression,
+                ["<id0>", "<id1>"]
+                    .into_iter()
+                    .map(|id| PointerAnchor {
+                        id: id.into(),
+                        source_type: source_anchor_type.clone(),
+                        target_type: target_anchor_type.clone(),
+                    })
+                    .collect(),
+                false,
+                "i32",
+            )]
+        );
+    }
+
+    #[test]
+    fn disjoint_maximal_roots_survive_in_source_order() {
+        let source = r#"
+unsafe fn source_copy(mut left: *const i32, mut right: *const i32) -> i32 {
+    #[proctor(0)] *left + *right
+}
+unsafe fn target(mut left: &i32, mut right: &i32) -> i32 {
+    #[proctor(0)] *left + *right
+}
+"#;
+        let document = extract_twice_canonically(source, "source_copy", "target", vec![0]);
+        let dereference = |id| Expression::Unary {
+            operator: UnaryOperator::Deref,
+            operand: Box::new(binding(id)),
+        };
+        let anchor = pointer_anchor(
+            "<id0>",
+            raw_pointer("i32", RawMutability::Const),
+            shared_reference(primitive("i32")),
+        );
+        assert_eq!(
+            document.observations,
+            [
+                scalar_observation(
+                    dereference("<id0>"),
+                    dereference("<id0>"),
+                    vec![anchor.clone()],
+                    false,
+                    "i32",
+                ),
+                scalar_observation(
+                    dereference("<id0>"),
+                    dereference("<id0>"),
+                    vec![anchor],
+                    false,
+                    "i32",
+                ),
+            ]
+        );
+        let selection_source = source.replace("#[proctor(0)]", "");
+        inspect_source_selection(&selection_source, "source_copy", |tcx, tree, regions| {
+            assert_eq!(regions.len(), 2);
+            assert!(tree.order[&regions[0].root] < tree.order[&regions[1].root]);
+            assert_eq!(
+                tcx.hir_name(regions[0].anchors[0].source_binding).as_str(),
+                "left"
+            );
+            assert_eq!(
+                tcx.hir_name(regions[1].anchors[0].source_binding).as_str(),
+                "right"
+            );
+        });
+    }
+
+    #[test]
+    fn ancestor_absorbs_descendants_in_expression_occurrence_order() {
+        let source = r#"
+unsafe fn source_copy(
+    mut base: *const i32,
+    mut first: *const isize,
+    mut second: *const isize,
+) -> i32 {
+    #[proctor(0)]
+    *base.offset((*first + *second) as isize)
+}
+unsafe fn target(mut base: &[i32], mut first: &isize, mut second: &isize) -> i32 {
+    #[proctor(0)]
+    base[(*first + *second) as usize]
+}
+"#;
+        let document = extract_twice_canonically(source, "source_copy", "target", vec![0]);
+        let addition = || Expression::Binary {
+            operator: BinaryOperator::Add,
+            left: Box::new(Expression::Unary {
+                operator: UnaryOperator::Deref,
+                operand: Box::new(binding("<id1>")),
+            }),
+            right: Box::new(Expression::Unary {
+                operator: UnaryOperator::Deref,
+                operand: Box::new(binding("<id2>")),
+            }),
+        };
+        assert_eq!(
+            document.observations,
+            [scalar_observation(
+                Expression::Unary {
+                    operator: UnaryOperator::Deref,
+                    operand: Box::new(Expression::MethodCall {
+                        receiver: Box::new(binding("<id0>")),
+                        method: ValueIdentity::External {
+                            crate_name: "core".into(),
+                            path: vec!["ptr".into(), "const_ptr".into(), "offset".into()],
+                        },
+                        arguments: vec![Expression::Cast {
+                            expression: Box::new(addition()),
+                            ty: primitive("isize"),
+                        }],
+                    }),
+                },
+                Expression::Index {
+                    base: Box::new(binding("<id0>")),
+                    index: Box::new(Expression::Cast {
+                        expression: Box::new(addition()),
+                        ty: primitive("usize"),
+                    }),
+                },
+                vec![
+                    pointer_anchor(
+                        "<id0>",
+                        raw_pointer("i32", RawMutability::Const),
+                        shared_reference(TypeTree::Slice {
+                            element: Box::new(primitive("i32")),
+                        }),
+                    ),
+                    pointer_anchor(
+                        "<id1>",
+                        raw_pointer("isize", RawMutability::Const),
+                        shared_reference(primitive("isize")),
+                    ),
+                    pointer_anchor(
+                        "<id2>",
+                        raw_pointer("isize", RawMutability::Const),
+                        shared_reference(primitive("isize")),
+                    ),
+                ],
+                false,
+                "i32",
+            )]
+        );
+        let selection_source = source.replace("#[proctor(0)]", "");
+        inspect_source_selection(&selection_source, "source_copy", |tcx, _, regions| {
+            assert_eq!(regions.len(), 1);
+            assert_eq!(
+                regions[0]
+                    .anchors
+                    .iter()
+                    .map(|anchor| tcx.hir_name(anchor.source_binding).to_string())
+                    .collect::<Vec<_>>(),
+                ["base", "first", "second"]
+            );
+        });
+    }
+
+    #[test]
+    fn direct_local_c_foreign_calls_seed_anchorless_regions() {
+        let source = r#"
+unsafe extern "C" { fn ping(value: i32) -> i32; }
+unsafe fn source_copy() -> i32 { #[proctor(0)] ping(1) }
+unsafe fn target() -> i32 { #[proctor(0)] ping(2) }
+"#;
+        let document = extract_twice_canonically(source, "source_copy", "target", vec![0]);
+        assert_eq!(
+            document.observations,
+            [scalar_observation(
+                foreign_call("ping", vec![integer("1", "i32")]),
+                foreign_call("ping", vec![integer("2", "i32")]),
+                vec![],
+                false,
+                "i32",
+            )]
+        );
+    }
+
+    #[test]
+    fn scanf_run_emits_the_exact_anchorless_observation() {
+        let source = r#"
+extern crate xj_scanf;
+unsafe extern "C" {
+    fn scanf(format: *const i8, ...) -> i32;
+}
+unsafe fn source_copy() -> i32 {
+    #[proctor(0)]
+    let mut x: i32 = 0;
+    #[proctor(1)]
+    scanf(b"%d\0" as *const u8 as *const i8, &mut x as *mut i32)
+}
+unsafe fn target() -> i32 {
+    #[proctor(0)]
+    let mut x: i32 = 0;
+    #[proctor(1)]
+    xj_scanf::legacy::scanf("%d", &mut [&mut x])
+}
+"#;
+        let observations = extract_case(source, "source_copy", "target", vec![1])
+            .unwrap()
+            .observations;
+        let primitive = || TypeTree::Primitive { name: "i32".into() };
+        let raw = |name: &str, mutability| TypeTree::RawPointer {
+            mutability,
+            pointee: Box::new(TypeTree::Primitive { name: name.into() }),
+        };
+        let binding = || Expression::Path {
+            value: ValueIdentity::Binding { id: "<id0>".into() },
+        };
+        let expected = Observation {
+            source_expression: Expression::Call {
+                callee: Box::new(Expression::Path {
+                    value: ValueIdentity::ForeignFunction {
+                        symbol: "scanf".into(),
+                    },
+                }),
+                arguments: vec![
+                    Expression::Cast {
+                        expression: Box::new(Expression::Cast {
+                            expression: Box::new(Expression::Literal {
+                                value: Literal::ByteString {
+                                    value: vec![b'%', b'd', 0],
+                                },
+                            }),
+                            ty: raw("u8", RawMutability::Const),
+                        }),
+                        ty: raw("i8", RawMutability::Const),
+                    },
+                    Expression::Cast {
+                        expression: Box::new(Expression::AddressOf {
+                            borrow: BorrowKind::Reference,
+                            mutability: RawMutability::Mut,
+                            expression: Box::new(binding()),
+                        }),
+                        ty: raw("i32", RawMutability::Mut),
+                    },
+                ],
+            },
+            target_expression: Expression::Call {
+                callee: Box::new(Expression::Path {
+                    value: ValueIdentity::External {
+                        crate_name: "xj_scanf".into(),
+                        path: vec!["legacy".into(), "scanf".into()],
+                    },
+                }),
+                arguments: vec![
+                    Expression::Literal {
+                        value: Literal::String { value: "%d".into() },
+                    },
+                    Expression::AddressOf {
+                        borrow: BorrowKind::Reference,
+                        mutability: RawMutability::Mut,
+                        expression: Box::new(Expression::Array {
+                            elements: vec![Expression::AddressOf {
+                                borrow: BorrowKind::Reference,
+                                mutability: RawMutability::Mut,
+                                expression: Box::new(binding()),
+                            }],
+                        }),
+                    },
+                ],
+            },
+            pointer_anchors: vec![],
+            lhs: false,
+            source_type: primitive(),
+            source_adjusted_type: primitive(),
+            target_type: primitive(),
+            target_adjusted_type: primitive(),
+        };
+        assert_eq!(observations, [expected]);
+    }
+
+    #[test]
+    fn repeated_recorded_scanf_observations_synthesize_and_apply_end_to_end() {
+        let first = extract_case(
+            &recorded_scan_pair('d', "first"),
+            "source_copy",
+            "target",
+            vec![1],
+        )
+        .unwrap();
+        let second = extract_case(
+            &recorded_scan_pair('d', "second"),
+            "source_copy",
+            "target",
+            vec![1],
+        )
+        .unwrap();
+        assert_eq!(first.observations.len(), 1);
+        assert_eq!(second.observations, first.observations);
+        let rules = crate::synthesize_rules(&[first, second]).unwrap();
+        assert_eq!(
+            rules,
+            crate::RuleDocument {
+                schema_version: 1,
+                rules: vec![exact_recorded_scan_rule(b'd')],
+            }
+        );
+        let markdown = crate::rule_document_to_markdown(&rules).unwrap();
+        assert_eq!(
+            markdown,
+            "* `scanf((b\"%d\\x00\" as *const u8) as *const i8, &mut <B0> as *mut i32)` -> `xj_scanf::legacy::scanf(\"%d\", &mut [&mut <B0>])`\n  * lhs: false\n  * `i32` (`i32`) -> `i32` (`i32`).\n"
+        );
+
+        let third = r#"
+extern crate xj_scanf;
+unsafe extern "C" { fn scanf(format: *const i8, ...) -> i32; }
+pub unsafe fn third() -> i32 {
+    let mut value: i32 = 0;
+    scanf(b"%d\0" as *const u8 as *const i8, &mut value as *mut i32)
+}
+"#;
+        utils::compilation::run_compiler_on_str(third, |tcx| {
+            let records = crate::make_skeletons_with_rules(third, Some(&rules), tcx).unwrap();
+            let record = records
+                .iter()
+                .find_map(|record| match record {
+                    crate::ItemRecord::Function(record) if record.path == "third" => Some(record),
+                    _ => None,
+                })
+                .unwrap();
+            assert_eq!(
+                record.applied,
+                crate::SkeletonView {
+                    skeleton: "pub unsafe fn third() -> i32 {\n    #[proctor(0)]\n    let mut value: i32 = 0;\n    #[proctor(1)]\n    ::xj_scanf::legacy::scanf(\"%d\", &mut [&mut value])\n}".into(),
+                    needs_transformation: false,
+                    statement_dispositions: vec![
+                        crate::StatementDisposition {
+                            label: 0,
+                            disposition: crate::StatementDispositionKind::Preserve,
+                            children: vec![],
+                        },
+                        crate::StatementDisposition {
+                            label: 1,
+                            disposition: crate::StatementDispositionKind::RuleApplied,
+                            children: vec![],
+                        },
+                    ],
+                    statement_pair_metadata: vec![],
+                }
+            );
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn different_recorded_scan_formats_do_not_share_a_rule_end_to_end() {
+        let extract_scan = |format, binding| {
+            extract_case(
+                &recorded_scan_pair(format, binding),
+                "source_copy",
+                "target",
+                vec![1],
+            )
+            .unwrap()
+        };
+        let decimal_first = extract_scan('d', "decimal_first");
+        let decimal_second = extract_scan('d', "decimal_second");
+        let unsigned_first = extract_scan('u', "unsigned_first");
+        let unsigned_second = extract_scan('u', "unsigned_second");
+        for document in [
+            &decimal_first,
+            &decimal_second,
+            &unsigned_first,
+            &unsigned_second,
+        ] {
+            assert_eq!(document.observations.len(), 1);
+            assert!(document.observations[0].pointer_anchors.is_empty());
+        }
+        assert_eq!(decimal_first.observations, decimal_second.observations);
+        assert_eq!(unsigned_first.observations, unsigned_second.observations);
+        assert_eq!(
+            crate::synthesize_observation_pair(
+                &decimal_first.observations[0],
+                &unsigned_first.observations[0],
+            ),
+            crate::PairSynthesis {
+                rule: None,
+                rejection: Some(crate::PairRejection::Source),
+                substitutions: std::collections::BTreeMap::new(),
+            }
+        );
+
+        let rules = crate::synthesize_rules(&[
+            decimal_first,
+            decimal_second,
+            unsigned_first,
+            unsigned_second,
+        ])
+        .unwrap();
+        assert_eq!(
+            rules,
+            crate::RuleDocument {
+                schema_version: 1,
+                rules: vec![
+                    exact_recorded_scan_rule(b'd'),
+                    exact_recorded_scan_rule(b'u'),
+                ],
+            }
+        );
+
+        let source = r#"
+extern crate xj_scanf;
+unsafe extern "C" { fn scanf(format: *const i8, ...) -> i32; }
+pub unsafe fn decimal() -> i32 {
+    let mut value: i32 = 0;
+    scanf(b"%d\0" as *const u8 as *const i8, &mut value as *mut i32)
+}
+pub unsafe fn unsigned() -> i32 {
+    let mut value: i32 = 0;
+    scanf(b"%u\0" as *const u8 as *const i8, &mut value as *mut i32)
+}
+"#;
+        utils::compilation::run_compiler_on_str(source, |tcx| {
+            let records = crate::make_skeletons_with_rules(source, Some(&rules), tcx).unwrap();
+            for (name, format) in [("decimal", 'd'), ("unsigned", 'u')] {
+                let applied = &records
+                    .iter()
+                    .find_map(|record| match record {
+                        crate::ItemRecord::Function(record) if record.path == name => {
+                            Some(record)
+                        }
+                        _ => None,
+                    })
+                    .unwrap()
+                    .applied;
+                let expected = crate::SkeletonView {
+                        skeleton: format!(
+                            "pub unsafe fn {name}() -> i32 {{\n    #[proctor(0)]\n    let mut value: i32 = 0;\n    #[proctor(1)]\n    ::xj_scanf::legacy::scanf(\"%{format}\", &mut [&mut value])\n}}"
+                        ),
+                        needs_transformation: false,
+                        statement_dispositions: vec![
+                            crate::StatementDisposition {
+                                label: 0,
+                                disposition: crate::StatementDispositionKind::Preserve,
+                                children: vec![],
+                            },
+                            crate::StatementDisposition {
+                                label: 1,
+                                disposition: crate::StatementDispositionKind::RuleApplied,
+                                children: vec![],
+                            },
+                        ],
+                        statement_pair_metadata: vec![],
+                    };
+                assert_eq!(applied, &expected);
+            }
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn foreign_call_maximal_region_absorbs_pointer_anchors() {
+        let source = r#"
+unsafe extern "C" { fn read_one(pointer: *const i32) -> i32; }
+unsafe fn source_copy(mut pointer: *const i32) -> i32 {
+    #[proctor(0)] read_one(pointer)
+}
+unsafe fn target(mut pointer: &i32) -> i32 {
+    #[proctor(0)] read_one(pointer as *const i32)
+}
+"#;
+        let document = extract_twice_canonically(source, "source_copy", "target", vec![0]);
+        assert_eq!(
+            document.observations,
+            [scalar_observation(
+                foreign_call("read_one", vec![binding("<id0>")]),
+                foreign_call(
+                    "read_one",
+                    vec![Expression::Cast {
+                        expression: Box::new(binding("<id0>")),
+                        ty: raw_pointer("i32", RawMutability::Const),
+                    }],
+                ),
+                vec![pointer_anchor(
+                    "<id0>",
+                    raw_pointer("i32", RawMutability::Const),
+                    shared_reference(primitive("i32")),
+                )],
+                false,
+                "i32",
+            )]
+        );
+    }
+
+    #[test]
+    fn foreign_seed_requires_a_local_exact_c_declaration() {
+        let defined = r#"
+unsafe extern "C" fn defined(value: i32) -> i32 { value }
+unsafe fn source_copy() -> i32 { #[proctor(0)] defined(1) }
+unsafe fn target() -> i32 { #[proctor(0)] defined(2) }
+"#;
         assert!(
-            extract_case(source, "source_copy", "target", vec![0])
+            extract_case(defined, "source_copy", "target", vec![0])
                 .unwrap()
                 .observations
                 .is_empty()
+        );
+
+        let unwind = r#"
+unsafe extern "C-unwind" { fn ping(value: i32) -> i32; }
+unsafe fn source_copy() -> i32 { #[proctor(0)] ping(1) }
+unsafe fn target() -> i32 { #[proctor(0)] ping(2) }
+"#;
+        assert!(
+            extract_case(unwind, "source_copy", "target", vec![0])
+                .unwrap()
+                .observations
+                .is_empty()
+        );
+
+        let indirect = r#"
+unsafe fn source_copy(mut call: unsafe extern "C" fn(i32) -> i32) -> i32 {
+    #[proctor(0)] call(1)
+}
+unsafe fn target(mut call: unsafe extern "C" fn(i32) -> i32) -> i32 {
+    #[proctor(0)] call(2)
+}
+"#;
+        assert!(
+            extract_case(indirect, "source_copy", "target", vec![0])
+                .unwrap()
+                .observations
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn foreign_link_name_is_the_normalized_identity() {
+        let source = r#"
+unsafe extern "C" {
+    #[link_name = "scanf"]
+    fn rust_scan(value: i32) -> i32;
+}
+unsafe fn source_copy() -> i32 { #[proctor(0)] rust_scan(1) }
+unsafe fn target() -> i32 { #[proctor(0)] rust_scan(2) }
+"#;
+        let document = extract_twice_canonically(source, "source_copy", "target", vec![0]);
+        assert_eq!(
+            document.observations,
+            [scalar_observation(
+                foreign_call("scanf", vec![integer("1", "i32")]),
+                foreign_call("scanf", vec![integer("2", "i32")]),
+                vec![],
+                false,
+                "i32",
+            )]
         );
     }
 
@@ -6086,5 +7191,640 @@ unsafe fn values(value: i32) {
             }
         ));
         assert!(matches!(values[3], Expression::Repeat { .. }));
+    }
+
+    #[test]
+    fn foreign_call_anchor_order_follows_argument_occurrence() {
+        for (source_parameters, target_parameters) in [
+            (
+                "mut left: *const i32, mut right: *const i32",
+                "mut left: &i32, mut right: &i32",
+            ),
+            (
+                "mut right: *const i32, mut left: *const i32",
+                "mut right: &i32, mut left: &i32",
+            ),
+        ] {
+            let source = format!(
+                r#"
+unsafe extern "C" {{ fn compare(left: *const i32, right: *const i32) -> i32; }}
+unsafe fn source_copy({source_parameters}) -> i32 {{
+    #[proctor(0)] compare(left, right)
+}}
+unsafe fn target({target_parameters}) -> i32 {{
+    #[proctor(0)] compare(left as *const i32, right as *const i32)
+}}
+"#
+            );
+            let document = extract_twice_canonically(&source, "source_copy", "target", vec![0]);
+            let cast = |id| Expression::Cast {
+                expression: Box::new(binding(id)),
+                ty: raw_pointer("i32", RawMutability::Const),
+            };
+            assert_eq!(
+                document.observations,
+                [scalar_observation(
+                    foreign_call("compare", vec![binding("<id0>"), binding("<id1>")]),
+                    foreign_call("compare", vec![cast("<id0>"), cast("<id1>")]),
+                    vec![
+                        pointer_anchor(
+                            "<id0>",
+                            raw_pointer("i32", RawMutability::Const),
+                            shared_reference(primitive("i32")),
+                        ),
+                        pointer_anchor(
+                            "<id1>",
+                            raw_pointer("i32", RawMutability::Const),
+                            shared_reference(primitive("i32")),
+                        ),
+                    ],
+                    false,
+                    "i32",
+                )]
+            );
+        }
+    }
+
+    #[test]
+    fn foreign_pointer_returns_grow_to_the_supported_parent() {
+        let with_anchor = r#"
+unsafe extern "C" { fn strchr(s: *const i8, c: i32) -> *mut i8; }
+unsafe fn source_copy(mut s: *const i8) -> i8 {
+    #[proctor(0)] *strchr(s, 97)
+}
+unsafe fn target(mut s: &[i8]) -> i8 {
+    #[proctor(0)] s[0]
+}
+"#;
+        let document = extract_twice_canonically(with_anchor, "source_copy", "target", vec![0]);
+        assert_eq!(
+            document.observations,
+            [scalar_observation(
+                Expression::Unary {
+                    operator: UnaryOperator::Deref,
+                    operand: Box::new(foreign_call(
+                        "strchr",
+                        vec![binding("<id0>"), integer("97", "i32")],
+                    )),
+                },
+                Expression::Index {
+                    base: Box::new(binding("<id0>")),
+                    index: Box::new(integer("0", "usize")),
+                },
+                vec![pointer_anchor(
+                    "<id0>",
+                    raw_pointer("i8", RawMutability::Const),
+                    shared_reference(TypeTree::Slice {
+                        element: Box::new(primitive("i8")),
+                    }),
+                )],
+                false,
+                "i8",
+            )]
+        );
+
+        let anchorless = r#"
+unsafe extern "C" { fn allocate() -> *mut i32; }
+unsafe fn source_copy() -> i32 { #[proctor(0)] *allocate() }
+unsafe fn target() -> i32 { #[proctor(0)] 0 }
+"#;
+        let document = extract_twice_canonically(anchorless, "source_copy", "target", vec![0]);
+        assert_eq!(
+            document.observations,
+            [scalar_observation(
+                Expression::Unary {
+                    operator: UnaryOperator::Deref,
+                    operand: Box::new(foreign_call("allocate", vec![])),
+                },
+                integer("0", "i32"),
+                vec![],
+                false,
+                "i32",
+            )]
+        );
+    }
+
+    #[test]
+    fn nested_and_disjoint_foreign_seeds_maximalize_deterministically() {
+        let nested = r#"
+unsafe extern "C" { fn inner() -> i32; fn outer(value: i32) -> i32; }
+unsafe fn source_copy() -> i32 { #[proctor(0)] outer(inner()) }
+unsafe fn target() -> i32 { #[proctor(0)] outer(inner() + 1) }
+"#;
+        let document = extract_twice_canonically(nested, "source_copy", "target", vec![0]);
+        assert_eq!(
+            document.observations,
+            [scalar_observation(
+                foreign_call("outer", vec![foreign_call("inner", vec![])]),
+                foreign_call(
+                    "outer",
+                    vec![Expression::Binary {
+                        operator: BinaryOperator::Add,
+                        left: Box::new(foreign_call("inner", vec![])),
+                        right: Box::new(integer("1", "i32")),
+                    }],
+                ),
+                vec![],
+                false,
+                "i32",
+            )]
+        );
+
+        let disjoint = r#"
+unsafe extern "C" { fn left() -> i32; fn right() -> i32; }
+unsafe fn source_copy() -> i32 { #[proctor(0)] left() + right() }
+unsafe fn target() -> i32 { #[proctor(0)] 1 + 2 }
+"#;
+        let document = extract_twice_canonically(disjoint, "source_copy", "target", vec![0]);
+        assert_eq!(
+            document.observations,
+            [
+                scalar_observation(
+                    foreign_call("left", vec![]),
+                    integer("1", "i32"),
+                    vec![],
+                    false,
+                    "i32",
+                ),
+                scalar_observation(
+                    foreign_call("right", vec![]),
+                    integer("2", "i32"),
+                    vec![],
+                    false,
+                    "i32",
+                ),
+            ]
+        );
+
+        let changed_parent = disjoint.replace("#[proctor(0)] 1 + 2", "#[proctor(0)] 1 - 2");
+        assert!(
+            extract_case(&changed_parent, "source_copy", "target", vec![0])
+                .unwrap()
+                .observations
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn mixed_seed_kinds_keep_source_order_and_rejected_seeds_are_local() {
+        let ordered = r#"
+unsafe extern "C" { fn ping(value: i32) -> i32; }
+unsafe fn source_copy(mut p: *const i32, mut q: *const i32) -> i32 {
+    #[proctor(0)] *p + ping(7) + *q
+}
+unsafe fn target(mut p: &i32, mut q: &i32) -> i32 {
+    #[proctor(0)] *p + ping(8) + *q
+}
+"#;
+        let document = extract_twice_canonically(ordered, "source_copy", "target", vec![0]);
+        let dereference = || Expression::Unary {
+            operator: UnaryOperator::Deref,
+            operand: Box::new(binding("<id0>")),
+        };
+        let anchor = || {
+            vec![pointer_anchor(
+                "<id0>",
+                raw_pointer("i32", RawMutability::Const),
+                shared_reference(primitive("i32")),
+            )]
+        };
+        assert_eq!(
+            document.observations,
+            [
+                scalar_observation(dereference(), dereference(), anchor(), false, "i32",),
+                scalar_observation(
+                    foreign_call("ping", vec![integer("7", "i32")]),
+                    foreign_call("ping", vec![integer("8", "i32")]),
+                    vec![],
+                    false,
+                    "i32",
+                ),
+                scalar_observation(dereference(), dereference(), anchor(), false, "i32",),
+            ]
+        );
+
+        let rejected = r#"
+unsafe extern "C" { fn ping(value: i32) -> i32; }
+unsafe fn source_copy(
+    mut indirect: unsafe extern "C" fn(*const i32) -> i32,
+    mut rejected: *const i32,
+    mut kept: *const i32,
+) -> i32 {
+    #[proctor(0)] indirect(rejected) + ping(7) + *kept
+}
+unsafe fn target(
+    mut indirect: unsafe extern "C" fn(*const i32) -> i32,
+    mut rejected: *const i32,
+    mut kept: &i32,
+) -> i32 {
+    #[proctor(0)] indirect(rejected) + ping(8) + *kept
+}
+"#;
+        let document = extract_twice_canonically(rejected, "source_copy", "target", vec![0]);
+        assert_eq!(
+            document.observations,
+            [
+                scalar_observation(
+                    foreign_call("ping", vec![integer("7", "i32")]),
+                    foreign_call("ping", vec![integer("8", "i32")]),
+                    vec![],
+                    false,
+                    "i32",
+                ),
+                scalar_observation(dereference(), dereference(), anchor(), false, "i32",),
+            ]
+        );
+    }
+
+    #[test]
+    fn exact_foreign_seed_exclusions_and_alignment_boundaries_hold() {
+        let system = r#"
+unsafe extern "system" { fn ping(value: i32) -> i32; }
+unsafe fn source_copy() -> i32 { #[proctor(0)] ping(1) }
+unsafe fn target() -> i32 { #[proctor(0)] ping(2) }
+"#;
+        assert!(
+            extract_case(system, "source_copy", "target", vec![0])
+                .unwrap()
+                .observations
+                .is_empty()
+        );
+
+        let dependency = r#"
+extern crate libc;
+unsafe fn source_copy() { #[proctor(0)] libc::free(core::ptr::null_mut()) }
+unsafe fn target() { #[proctor(0)] libc::free(core::ptr::null_mut()) }
+"#;
+        assert!(
+            extract_case(dependency, "source_copy", "target", vec![0])
+                .unwrap()
+                .observations
+                .is_empty()
+        );
+
+        let external_rust = r#"
+unsafe fn source_copy() -> i32 { #[proctor(0)] std::cmp::max(1, 2) }
+unsafe fn target() -> i32 { #[proctor(0)] std::cmp::max(2, 3) }
+"#;
+        assert!(
+            extract_case(external_rust, "source_copy", "target", vec![0])
+                .unwrap()
+                .observations
+                .is_empty()
+        );
+
+        let macro_source = r#"
+macro_rules! one { () => { 1 }; }
+unsafe extern "C" { fn ping(left: i32, right: i32) -> i32; }
+unsafe fn source_copy() -> i32 { #[proctor(0)] ping(1, one!()) }
+unsafe fn target() -> i32 { #[proctor(0)] ping(2, 1) }
+"#;
+        assert!(
+            extract_case(macro_source, "source_copy", "target", vec![0])
+                .unwrap()
+                .observations
+                .is_empty()
+        );
+        let macro_free = macro_source.replace("one!()", "1");
+        assert_eq!(
+            extract_case(&macro_free, "source_copy", "target", vec![0])
+                .unwrap()
+                .observations
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn coalescing_deduplicates_by_resolved_binding_in_occurrence_order() {
+        let source = r#"
+unsafe extern "C" { fn combine(left: *const i32, middle: *const i32, right: *const i32) -> i32; }
+unsafe fn selected(mut p: *const i32, mut q: *const i32) -> i32 {
+    combine(p, p, q)
+}
+"#;
+        inspect_source_selection(source, "selected", |tcx, tree, regions| {
+            assert_eq!(regions.len(), 1);
+            let region = &regions[0];
+            assert!(matches!(
+                tree.expressions[&region.root].kind,
+                ExprKind::Call(..)
+            ));
+            assert!(!region.promoted_field);
+            assert!(!region.lhs);
+            assert_eq!(region.anchors.len(), 2);
+            assert_eq!(
+                region
+                    .anchors
+                    .iter()
+                    .map(|anchor| tcx.hir_name(anchor.source_binding).to_string())
+                    .collect::<Vec<_>>(),
+                ["p".to_owned(), "q".to_owned()]
+            );
+        });
+
+        let shadowed = r#"
+unsafe fn first(mut p: *const i32) -> *const i32 { p }
+unsafe fn second(mut p: *const i32) -> *const i32 { p }
+"#;
+        utils::compilation::run_compiler_on_str(shadowed, |tcx| {
+            struct BindingFinder {
+                hir_id: Option<hir::HirId>,
+            }
+            impl<'tcx> hir::intravisit::Visitor<'tcx> for BindingFinder {
+                fn visit_pat(&mut self, pattern: &'tcx hir::Pat<'tcx>) {
+                    if let hir::PatKind::Binding(_, hir_id, ident, _) = pattern.kind
+                        && ident.name.as_str() == "p"
+                    {
+                        self.hir_id = Some(hir_id);
+                    }
+                    hir::intravisit::walk_pat(self, pattern);
+                }
+            }
+            let binding = |name: &str| {
+                let definition = tcx
+                    .hir_free_items()
+                    .find_map(|item_id| {
+                        (tcx.def_path_str(item_id.owner_id.def_id)
+                            .rsplit("::")
+                            .next()
+                            == Some(name))
+                        .then_some(item_id.owner_id.def_id)
+                    })
+                    .unwrap();
+                let mut finder = BindingFinder { hir_id: None };
+                hir::intravisit::Visitor::visit_body(
+                    &mut finder,
+                    tcx.hir_body_owned_by(definition),
+                );
+                finder.hir_id.unwrap()
+            };
+            let first = binding("first");
+            let second = binding("second");
+            assert_ne!(first, second);
+            assert_eq!(tcx.hir_name(first), tcx.hir_name(second));
+
+            let root = NodeId::from_u32(1);
+            let mut tree = ExpressionTree::default();
+            tree.order.insert(root, 0);
+            let mut regions = vec![
+                SelectedRegion {
+                    root,
+                    promoted_field: false,
+                    lhs: true,
+                    anchors: vec![AnchorPair {
+                        source_binding: first,
+                        target_binding: first,
+                        occurrence: 3,
+                    }],
+                },
+                SelectedRegion {
+                    root,
+                    promoted_field: true,
+                    lhs: false,
+                    anchors: vec![
+                        AnchorPair {
+                            source_binding: first,
+                            target_binding: first,
+                            occurrence: 6,
+                        },
+                        AnchorPair {
+                            source_binding: second,
+                            target_binding: second,
+                            occurrence: 8,
+                        },
+                    ],
+                },
+            ];
+            coalesce_regions(&mut regions, &tree);
+            assert_eq!(regions.len(), 1);
+            assert!(regions[0].promoted_field);
+            assert!(
+                !regions[0].lhs,
+                "coalescing does not retain stale lhs flags"
+            );
+            assert_eq!(
+                regions[0]
+                    .anchors
+                    .iter()
+                    .map(|anchor| (anchor.source_binding, anchor.occurrence))
+                    .collect::<Vec<_>>(),
+                [(first, 3), (second, 8)]
+            );
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn identical_roots_merge_anchor_occurrences_once() {
+        let source = r#"
+unsafe fn selected(
+    mut p: *const i32,
+    mut q: *const i32,
+    mut r: *const i32,
+) -> *const i32 { p }
+"#;
+        utils::compilation::run_compiler_on_str(source, |tcx| {
+            struct Bindings(HashMap<String, hir::HirId>);
+            impl<'tcx> hir::intravisit::Visitor<'tcx> for Bindings {
+                fn visit_pat(&mut self, pattern: &'tcx hir::Pat<'tcx>) {
+                    if let hir::PatKind::Binding(_, hir_id, ident, _) = pattern.kind {
+                        self.0.insert(ident.name.to_string(), hir_id);
+                    }
+                    hir::intravisit::walk_pat(self, pattern);
+                }
+            }
+            let definition = tcx
+                .hir_free_items()
+                .find_map(|item_id| {
+                    (tcx.def_path_str(item_id.owner_id.def_id)
+                        .rsplit("::")
+                        .next()
+                        == Some("selected"))
+                    .then_some(item_id.owner_id.def_id)
+                })
+                .unwrap();
+            let mut bindings = Bindings(HashMap::new());
+            hir::intravisit::Visitor::visit_body(&mut bindings, tcx.hir_body_owned_by(definition));
+            let p = bindings.0["p"];
+            let q = bindings.0["q"];
+            let r = bindings.0["r"];
+            let root = NodeId::from_u32(1);
+            let mut tree = ExpressionTree::default();
+            tree.order.insert(root, 0);
+            let mut regions = vec![
+                SelectedRegion {
+                    root,
+                    promoted_field: false,
+                    lhs: false,
+                    anchors: vec![
+                        AnchorPair {
+                            source_binding: p,
+                            target_binding: p,
+                            occurrence: 2,
+                        },
+                        AnchorPair {
+                            source_binding: q,
+                            target_binding: q,
+                            occurrence: 5,
+                        },
+                    ],
+                },
+                SelectedRegion {
+                    root,
+                    promoted_field: true,
+                    lhs: false,
+                    anchors: vec![
+                        AnchorPair {
+                            source_binding: p,
+                            target_binding: p,
+                            occurrence: 7,
+                        },
+                        AnchorPair {
+                            source_binding: r,
+                            target_binding: r,
+                            occurrence: 9,
+                        },
+                    ],
+                },
+            ];
+            coalesce_regions(&mut regions, &tree);
+            assert_eq!(regions.len(), 1);
+            assert!(regions[0].promoted_field);
+            assert_eq!(
+                regions[0]
+                    .anchors
+                    .iter()
+                    .map(|anchor| (
+                        tcx.hir_name(anchor.source_binding).to_string(),
+                        anchor.occurrence
+                    ))
+                    .collect::<Vec<_>>(),
+                [("p".into(), 2), ("q".into(), 5), ("r".into(), 9)]
+            );
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn coalescing_recomputes_lhs_and_keeps_promotion_root_local() {
+        let lhs = r#"
+unsafe extern "C" { fn get_out(p: *mut *mut i32) -> *mut *mut i32; }
+unsafe fn selected(mut p: *mut *mut i32) {
+    *get_out(p) = core::ptr::null_mut()
+}
+"#;
+        inspect_source_selection(lhs, "selected", |_, tree, regions| {
+            assert_eq!(regions.len(), 1);
+            let region = &regions[0];
+            assert!(matches!(
+                tree.expressions[&region.root].kind,
+                ExprKind::Unary(..)
+            ));
+            assert!(region.lhs);
+            assert_eq!(region.anchors.len(), 1);
+        });
+
+        let promoted = r#"
+struct Pair { value: i32 }
+unsafe fn selected(mut p: *const Pair) -> i32 { (*p).value }
+"#;
+        inspect_source_selection(promoted, "selected", |_, tree, regions| {
+            assert_eq!(regions.len(), 1);
+            assert!(matches!(
+                tree.expressions[&regions[0].root].kind,
+                ExprKind::Field(..)
+            ));
+            assert!(regions[0].promoted_field);
+            assert!(!regions[0].lhs);
+        });
+
+        let absorbed = r#"
+struct Pair { value: i32 }
+unsafe extern "C" { fn consume(value: i32) -> i32; }
+unsafe fn selected(mut p: *const Pair) -> i32 { consume((*p).value) }
+"#;
+        inspect_source_selection(absorbed, "selected", |_, tree, regions| {
+            assert_eq!(regions.len(), 1);
+            assert!(matches!(
+                tree.expressions[&regions[0].root].kind,
+                ExprKind::Call(..)
+            ));
+            assert!(!regions[0].promoted_field);
+            assert!(!regions[0].lhs);
+            assert_eq!(regions[0].anchors.len(), 1);
+        });
+
+        let absorbed_lhs = r#"
+unsafe extern "C" { fn consume(pointer: *mut i32) -> *mut i32; }
+unsafe fn selected(mut p: *mut i32, q: *mut i32) -> *mut i32 {
+    consume({ p = q; p })
+}
+"#;
+        inspect_source_selection(absorbed_lhs, "selected", |_, tree, regions| {
+            assert_eq!(regions.len(), 1);
+            assert!(matches!(
+                tree.expressions[&regions[0].root].kind,
+                ExprKind::Call(..)
+            ));
+            assert!(
+                !regions[0].lhs,
+                "the retained foreign parent is not an assignment LHS"
+            );
+            assert_eq!(regions[0].anchors.len(), 2);
+        });
+    }
+
+    #[test]
+    fn retained_foreign_pointer_root_recomputes_assignment_lhs() {
+        let source = r#"
+unsafe extern "C" { fn get_out(p: *mut *mut i32) -> *mut *mut i32; }
+unsafe fn source_copy(mut p: *mut *mut i32) {
+    #[proctor(0)] *get_out(p) = core::ptr::null_mut();
+}
+unsafe fn target(mut p: &mut *mut i32) {
+    #[proctor(0)] *get_out(p as *mut *mut i32) = core::ptr::null_mut();
+}
+"#;
+        let document = extract_twice_canonically(source, "source_copy", "target", vec![0]);
+        let pointer = raw_pointer("i32", RawMutability::Mut);
+        let pointer_to_pointer = TypeTree::RawPointer {
+            mutability: RawMutability::Mut,
+            pointee: Box::new(pointer.clone()),
+        };
+        let source_expression = Expression::Unary {
+            operator: UnaryOperator::Deref,
+            operand: Box::new(foreign_call("get_out", vec![binding("<id0>")])),
+        };
+        let target_expression = Expression::Unary {
+            operator: UnaryOperator::Deref,
+            operand: Box::new(foreign_call(
+                "get_out",
+                vec![Expression::Cast {
+                    expression: Box::new(binding("<id0>")),
+                    ty: pointer_to_pointer.clone(),
+                }],
+            )),
+        };
+        assert_eq!(
+            document.observations,
+            [Observation {
+                source_expression,
+                target_expression,
+                pointer_anchors: vec![pointer_anchor(
+                    "<id0>",
+                    pointer_to_pointer,
+                    TypeTree::Reference {
+                        mutability: RefMutability::Mutable,
+                        pointee: Box::new(pointer.clone()),
+                    },
+                )],
+                lhs: true,
+                source_type: pointer.clone(),
+                source_adjusted_type: pointer.clone(),
+                target_type: pointer.clone(),
+                target_adjusted_type: pointer,
+            }]
+        );
     }
 }
