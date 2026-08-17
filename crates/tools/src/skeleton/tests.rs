@@ -4454,11 +4454,11 @@ pub unsafe fn hold_callable() {
     );
     assert_eq!(
         function(&records, "length").foreign_function_names,
-        ["c_strlen"]
+        ["c_strlen", "strlen"]
     );
     assert_eq!(
         function(&records, "hold_callable").foreign_function_names,
-        ["c_strlen"]
+        ["c_strlen", "strlen"]
     );
 
     let dependency_records = generate(
@@ -4472,6 +4472,59 @@ pub unsafe fn dependency_free(pointer: *mut libc::c_void) {
         function(&dependency_records, "dependency_free").foreign_function_names,
         ["free"]
     );
+
+    let scan_records = generate(
+        r#"unsafe extern "C" {
+    #[link_name = "scanf"]
+    fn rust_scanf(value: i32) -> i32;
+}
+unsafe extern "C-unwind" {
+    #[link_name = "scanf"]
+    fn unwind_scanf(value: i32) -> i32;
+}
+pub unsafe fn scan(value: i32) -> i32 { rust_scanf(value) }
+pub unsafe fn unwind(value: i32) -> i32 { unwind_scanf(value) }
+"#,
+    );
+    assert_eq!(
+        function(&scan_records, "scan").foreign_function_names,
+        ["rust_scanf", "scanf"]
+    );
+    assert_eq!(
+        function(&scan_records, "unwind").foreign_function_names,
+        ["unwind_scanf"]
+    );
+
+    let direct_scan = generate(
+        r#"unsafe extern "C" { fn scanf(value: i32) -> i32; }
+pub unsafe fn direct(value: i32) -> i32 { scanf(value) }
+"#,
+    );
+    assert_eq!(
+        function(&direct_scan, "direct").foreign_function_names,
+        ["scanf"]
+    );
+
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    {
+        let basename = generate(
+            r#"extern crate libc;
+pub unsafe fn dependency_basename(value: *mut libc::c_char) -> *mut libc::c_char {
+    libc::posix_basename(value)
+}
+"#,
+        );
+        assert_eq!(
+            function(&basename, "dependency_basename").foreign_function_names,
+            ["posix_basename"]
+        );
+        assert!(
+            !function(&basename, "dependency_basename")
+                .foreign_function_names
+                .iter()
+                .any(|name| name == "__xpg_basename")
+        );
+    }
 }
 
 #[test]
@@ -6373,6 +6426,847 @@ fn rule_selection_materialization_and_statement_installation_are_integrated() {
 }
 
 #[test]
+fn foreign_rules_reuse_matched_rust_spelling_instead_of_link_symbols() {
+    let source = r#"
+unsafe extern "C" {
+    #[link_name = "c_ping"]
+    fn rust_ping(value: i32) -> i32;
+}
+pub unsafe fn f() -> i32 { rust_ping(1) }
+"#;
+    let foreign = || crate::RuleExpression::Path {
+        value: crate::RuleValueIdentity::ForeignFunction {
+            symbol: "c_ping".into(),
+        },
+    };
+    let integer = |value: &str| crate::RuleExpression::Literal {
+        value: crate::RuleLiteral::Integer {
+            value: crate::RuleIntegerMagnitude::Fixed(value.into()),
+            ty: "i32".into(),
+        },
+    };
+    let call = |value: &str| crate::RuleExpression::Call {
+        callee: Box::new(foreign()),
+        arguments: vec![integer(value)],
+    };
+    let primitive = crate::RuleTypeTree::Primitive { name: "i32".into() };
+    let rules = crate::RuleDocument {
+        schema_version: 1,
+        rules: vec![crate::Rule {
+            source_pattern: call("1"),
+            target_pattern: call("2"),
+            pointer_anchors: vec![],
+            lhs: false,
+            source_type: primitive.clone(),
+            source_adjusted_type: primitive.clone(),
+            target_type: primitive.clone(),
+            target_adjusted_type: primitive,
+        }],
+    };
+    run_compiler_on_str(source, |tcx| {
+        let records = make_skeletons_with_rules(source, Some(&rules), tcx).unwrap();
+        let record = function(&records, "f");
+        assert_eq!(
+            record.applied.skeleton,
+            "pub unsafe fn f() -> i32 {\n    #[proctor(0)]\n    rust_ping(2i32)\n}"
+        );
+        assert_eq!(
+            record.applied.statement_dispositions[0].disposition,
+            crate::StatementDispositionKind::RuleApplied
+        );
+        assert!(!record.applied.needs_transformation);
+    })
+    .unwrap();
+}
+
+#[test]
+fn target_only_foreign_identity_uses_one_accessible_local_declaration() {
+    let source = r#"
+mod ffi {
+    unsafe extern "C" {
+        #[link_name = "source_ping"]
+        pub fn source_rust(value: i32) -> i32;
+        #[link_name = "c_ping"]
+        pub fn target_rust(value: i32) -> i32;
+    }
+}
+pub unsafe fn f() -> i32 { ffi::source_rust(1) }
+"#;
+    let call = |symbol: &str| crate::RuleExpression::Call {
+        callee: Box::new(crate::RuleExpression::Path {
+            value: crate::RuleValueIdentity::ForeignFunction {
+                symbol: symbol.into(),
+            },
+        }),
+        arguments: vec![crate::RuleExpression::Literal {
+            value: crate::RuleLiteral::Integer {
+                value: crate::RuleIntegerMagnitude::Fixed("1".into()),
+                ty: "i32".into(),
+            },
+        }],
+    };
+    let primitive = crate::RuleTypeTree::Primitive { name: "i32".into() };
+    let rules = crate::RuleDocument {
+        schema_version: 1,
+        rules: vec![crate::Rule {
+            source_pattern: call("source_ping"),
+            target_pattern: call("c_ping"),
+            pointer_anchors: vec![],
+            lhs: false,
+            source_type: primitive.clone(),
+            source_adjusted_type: primitive.clone(),
+            target_type: primitive.clone(),
+            target_adjusted_type: primitive,
+        }],
+    };
+    run_compiler_on_str(source, |tcx| {
+        let records = make_skeletons_with_rules(source, Some(&rules), tcx).unwrap();
+        let record = function(&records, "f");
+        assert_eq!(
+            record.applied.skeleton,
+            "pub unsafe fn f() -> i32 {\n    #[proctor(0)]\n    crate::ffi::target_rust(1i32)\n}"
+        );
+        assert_eq!(
+            record.applied.statement_dispositions[0].disposition,
+            crate::StatementDispositionKind::RuleApplied
+        );
+    })
+    .unwrap();
+}
+
+#[test]
+fn equal_foreign_symbols_keep_occurrence_specific_source_spelling() {
+    let source = r#"
+mod left {
+    unsafe extern "C" {
+        #[link_name = "c_ping"]
+        pub fn left_rust(value: i32) -> i32;
+    }
+}
+mod right {
+    unsafe extern "C" {
+        #[link_name = "c_ping"]
+        pub fn right_rust(value: i32) -> i32;
+    }
+}
+unsafe extern "C" { fn combine(left: i32, right: i32) -> i32; }
+use left::left_rust as first;
+use right::right_rust as second;
+pub unsafe fn f() -> i32 { combine(first(1), second(2)) }
+"#;
+    let integer = |value: &str| crate::RuleExpression::Literal {
+        value: crate::RuleLiteral::Integer {
+            value: crate::RuleIntegerMagnitude::Fixed(value.into()),
+            ty: "i32".into(),
+        },
+    };
+    let foreign_call = |symbol: &str, argument| crate::RuleExpression::Call {
+        callee: Box::new(crate::RuleExpression::Path {
+            value: crate::RuleValueIdentity::ForeignFunction {
+                symbol: symbol.into(),
+            },
+        }),
+        arguments: vec![argument],
+    };
+    let first = foreign_call("c_ping", integer("1"));
+    let second = foreign_call("c_ping", integer("2"));
+    let source_pattern = crate::RuleExpression::Call {
+        callee: Box::new(crate::RuleExpression::Path {
+            value: crate::RuleValueIdentity::ForeignFunction {
+                symbol: "combine".into(),
+            },
+        }),
+        arguments: vec![first, second.clone()],
+    };
+    let primitive = crate::RuleTypeTree::Primitive { name: "i32".into() };
+    let occurrence_rule = crate::Rule {
+        source_pattern,
+        target_pattern: second,
+        pointer_anchors: vec![],
+        lhs: false,
+        source_type: primitive.clone(),
+        source_adjusted_type: primitive.clone(),
+        target_type: primitive.clone(),
+        target_adjusted_type: primitive,
+    };
+    let irrelevant = anchorless_foreign_rule("combine", fixed_integer_rule("99"));
+    for rules in [
+        vec![occurrence_rule.clone(), irrelevant.clone()],
+        vec![irrelevant.clone(), occurrence_rule.clone()],
+    ] {
+        let document = crate::RuleDocument {
+            schema_version: 1,
+            rules,
+        };
+        run_compiler_on_str(source, |tcx| {
+            let records = make_skeletons_with_rules(source, Some(&document), tcx).unwrap();
+            let applied = &function(&records, "f").applied;
+            assert_eq!(
+                applied.skeleton,
+                "pub unsafe fn f() -> i32 {\n    #[proctor(0)]\n    second(2)\n}"
+            );
+            assert_eq!(
+                applied.statement_dispositions[0].disposition,
+                crate::StatementDispositionKind::RuleApplied
+            );
+        })
+        .unwrap();
+    }
+}
+
+fn fixed_integer_rule(value: &str) -> crate::RuleExpression {
+    crate::RuleExpression::Literal {
+        value: crate::RuleLiteral::Integer {
+            value: crate::RuleIntegerMagnitude::Fixed(value.into()),
+            ty: "i32".into(),
+        },
+    }
+}
+
+fn foreign_call_rule(symbol: &str, argument: &str) -> crate::RuleExpression {
+    crate::RuleExpression::Call {
+        callee: Box::new(crate::RuleExpression::Path {
+            value: crate::RuleValueIdentity::ForeignFunction {
+                symbol: symbol.into(),
+            },
+        }),
+        arguments: vec![fixed_integer_rule(argument)],
+    }
+}
+
+fn anchorless_foreign_rule(
+    source_symbol: &str,
+    target_pattern: crate::RuleExpression,
+) -> crate::Rule {
+    let primitive = crate::RuleTypeTree::Primitive { name: "i32".into() };
+    crate::Rule {
+        source_pattern: foreign_call_rule(source_symbol, "1"),
+        target_pattern,
+        pointer_anchors: vec![],
+        lhs: false,
+        source_type: primitive.clone(),
+        source_adjusted_type: primitive.clone(),
+        target_type: primitive.clone(),
+        target_adjusted_type: primitive,
+    }
+}
+
+#[test]
+fn foreign_static_targets_keep_their_bare_symbol_spelling() {
+    let source = r#"
+unsafe extern "C" {
+    #[link_name = "c_value"]
+    static RUST_VALUE: i32;
+    fn consume(value: i32) -> i32;
+}
+pub unsafe fn f() -> i32 { consume(RUST_VALUE) }
+"#;
+    let primitive = crate::RuleTypeTree::Primitive { name: "i32".into() };
+    let foreign_static = crate::RuleExpression::Path {
+        value: crate::RuleValueIdentity::ForeignStatic {
+            symbol: "c_value".into(),
+        },
+    };
+    let document = crate::RuleDocument {
+        schema_version: 1,
+        rules: vec![crate::Rule {
+            source_pattern: crate::RuleExpression::Call {
+                callee: Box::new(crate::RuleExpression::Path {
+                    value: crate::RuleValueIdentity::ForeignFunction {
+                        symbol: "consume".into(),
+                    },
+                }),
+                arguments: vec![foreign_static.clone()],
+            },
+            target_pattern: foreign_static,
+            pointer_anchors: vec![],
+            lhs: false,
+            source_type: primitive.clone(),
+            source_adjusted_type: primitive.clone(),
+            target_type: primitive.clone(),
+            target_adjusted_type: primitive,
+        }],
+    };
+    run_compiler_on_str(source, |tcx| {
+        let records = make_skeletons_with_rules(source, Some(&document), tcx).unwrap();
+        let record = function(&records, "f");
+        assert_eq!(
+            record.applied.skeleton,
+            "pub unsafe fn f() -> i32 {\n    #[proctor(0)]\n    c_value\n}"
+        );
+        assert_eq!(
+            record.applied.statement_dispositions[0].disposition,
+            crate::StatementDispositionKind::RuleApplied
+        );
+    })
+    .unwrap();
+}
+
+#[test]
+fn pointer_valued_foreign_root_requires_supported_target_context() {
+    let source = r#"
+unsafe extern "C" { fn allocate() -> *mut i32; }
+unsafe fn consume(_: *mut i32) {}
+pub unsafe fn discarded() { allocate(); }
+pub unsafe fn returned() -> *mut i32 { allocate() }
+pub unsafe fn argument() { consume(allocate()); }
+"#;
+    run_compiler_on_str(source, |tcx| {
+        let mut surface = utils::ast::parse_crate(source.to_owned());
+        let mut mapper = utils::ir::AstToHirMapper::new(tcx);
+        mapper.map_crate_to_mod(&mut surface, tcx.hir_root_module(), false);
+        let ast_to_hir = mapper.ast_to_hir;
+        let mut decisions = tools_pointer_decisions(tcx);
+        decisions
+            .signatures
+            .data
+            .get_mut(&local_def("returned", tcx))
+            .unwrap()
+            .output_dec = Some(PtrKind::OptRef(true));
+        decisions
+            .signatures
+            .data
+            .get_mut(&local_def("consume", tcx))
+            .unwrap()
+            .input_decs[0] = Some(PtrKind::OptRef(true));
+
+        let primitive = crate::RuleTypeTree::Primitive { name: "i32".into() };
+        let raw = crate::RuleTypeTree::RawPointer {
+            mutability: crate::RawMutability::Mut,
+            pointee: Box::new(primitive.clone()),
+        };
+        let optional_reference = crate::RuleTypeTree::Adt {
+            adt_kind: crate::AdtKind::Enum,
+            identity: crate::RuleAdtIdentity::External {
+                crate_name: "core".into(),
+                path: vec!["option".into(), "Option".into()],
+            },
+            arguments: vec![crate::RuleTypeTree::Reference {
+                mutability: crate::RefMutability::Mutable,
+                pointee: Box::new(primitive),
+            }],
+        };
+        let allocate = crate::RuleExpression::Call {
+            callee: Box::new(crate::RuleExpression::Path {
+                value: crate::RuleValueIdentity::ForeignFunction {
+                    symbol: "allocate".into(),
+                },
+            }),
+            arguments: vec![],
+        };
+        let document = crate::RuleDocument {
+            schema_version: 1,
+            rules: vec![crate::Rule {
+                source_pattern: allocate.clone(),
+                target_pattern: allocate,
+                pointer_anchors: vec![],
+                lhs: false,
+                source_type: raw.clone(),
+                source_adjusted_type: raw.clone(),
+                target_type: raw,
+                target_adjusted_type: optional_reference,
+            }],
+        };
+
+        let expected = [
+            (
+                "discarded",
+                BTreeSet::new(),
+                "pub unsafe fn discarded() {\n\n    #[proctor(0)]\n    allocate();\n}",
+                crate::SkeletonView {
+                    skeleton: "pub unsafe fn discarded() {\n    #[proctor(0)]\n    todo!();\n}"
+                        .into(),
+                    needs_transformation: true,
+                    statement_dispositions: vec![crate::StatementDisposition {
+                        label: 0,
+                        disposition: crate::StatementDispositionKind::Transform,
+                        children: vec![],
+                    }],
+                    statement_pair_metadata: vec![crate::StatementPairMetadata {
+                        label: 0,
+                        before_statement: "#[proctor(0)]\nallocate();".into(),
+                        pointer_variables_complete: true,
+                        pointer_variables: vec![],
+                    }],
+                },
+            ),
+            (
+                "returned",
+                BTreeSet::from([0]),
+                "pub unsafe fn returned() -> *mut i32 {\n\n    #[proctor(0)]\n    allocate()\n}",
+                crate::SkeletonView {
+                    skeleton: "pub unsafe fn returned() -> Option<&mut i32> {\n    #[proctor(0)]\n    allocate()\n}".into(),
+                    needs_transformation: false,
+                    statement_dispositions: vec![crate::StatementDisposition {
+                        label: 0,
+                        disposition: crate::StatementDispositionKind::RuleApplied,
+                        children: vec![],
+                    }],
+                    statement_pair_metadata: vec![],
+                },
+            ),
+            (
+                "argument",
+                BTreeSet::from([0]),
+                "pub unsafe fn argument() {\n\n    #[proctor(0)]\n    consume(allocate());\n}",
+                crate::SkeletonView {
+                    skeleton: "pub unsafe fn argument() {\n    #[proctor(0)]\n    consume(allocate());\n}".into(),
+                    needs_transformation: false,
+                    statement_dispositions: vec![crate::StatementDisposition {
+                        label: 0,
+                        disposition: crate::StatementDispositionKind::RuleApplied,
+                        children: vec![],
+                    }],
+                    statement_pair_metadata: vec![],
+                },
+            ),
+        ];
+        for (name, expected_disposition, expected_statement, expected_view) in expected {
+            let function = local_def(name, tcx);
+            let mut item = surface
+                .items
+                .iter()
+                .find(|item| {
+                    item.kind
+                        .ident()
+                        .is_some_and(|ident| ident.name.as_str() == name)
+                })
+                .unwrap()
+                .clone();
+            let record_item = item.clone();
+            annotate_function(&mut item, &FxHashSet::default());
+            let mut target = item.clone();
+            let speller = TypeSpeller::new(function, &ast_to_hir, tcx);
+            let applied = apply_rule_set(
+                &item,
+                &mut target,
+                &BTreeSet::from([0]),
+                &document,
+                function,
+                &decisions,
+                &ast_to_hir,
+                &speller,
+                tcx,
+            )
+            .unwrap();
+            assert_eq!(applied, expected_disposition, "{name}");
+            assert_eq!(
+                pprust::item_to_string(&target),
+                expected_statement,
+                "{name}"
+            );
+            let record = make_function_record(
+                SurfaceItem {
+                    id: 0,
+                    path: name.into(),
+                    item: record_item,
+                    def_id: function,
+                    kind: ItemKindName::Fn,
+                },
+                &ast_to_hir,
+                &FxHashMap::default(),
+                &decisions,
+                &PreservationDecisionOverrides::default(),
+                Some(&document),
+                tcx,
+            )
+            .unwrap();
+            let ItemRecord::Function(record) = record else { unreachable!() };
+            assert_eq!(record.applied, expected_view, "{name}");
+        }
+    })
+    .unwrap();
+}
+
+#[test]
+fn matched_foreign_paths_retain_module_alias_and_plain_spellings() {
+    let fixtures = [
+        (
+            r#"
+mod ffi {
+    unsafe extern "C" {
+        #[link_name = "c_ping"]
+        pub fn rust_ping(value: i32) -> i32;
+    }
+}
+pub unsafe fn f() -> i32 { ffi::rust_ping(1) }
+"#,
+            "ffi::rust_ping(2i32)",
+        ),
+        (
+            r#"
+mod ffi {
+    unsafe extern "C" {
+        #[link_name = "c_ping"]
+        pub fn rust_ping(value: i32) -> i32;
+    }
+}
+use ffi::rust_ping as alias;
+pub unsafe fn f() -> i32 { alias(1) }
+"#,
+            "alias(2i32)",
+        ),
+        (
+            r#"
+unsafe extern "C" { fn ping(value: i32) -> i32; }
+pub unsafe fn f() -> i32 { ping(1) }
+"#,
+            "ping(2i32)",
+        ),
+    ];
+    for (source, expected) in fixtures {
+        let symbol = if expected.starts_with("ping") {
+            "ping"
+        } else {
+            "c_ping"
+        };
+        let rules = crate::RuleDocument {
+            schema_version: 1,
+            rules: vec![anchorless_foreign_rule(
+                symbol,
+                foreign_call_rule(symbol, "2"),
+            )],
+        };
+        run_compiler_on_str(source, |tcx| {
+            let records = make_skeletons_with_rules(source, Some(&rules), tcx).unwrap();
+            let record = function(&records, "f");
+            assert_eq!(
+                record.applied.skeleton,
+                format!("pub unsafe fn f() -> i32 {{\n    #[proctor(0)]\n    {expected}\n}}")
+            );
+            assert_eq!(
+                record.applied.statement_dispositions,
+                vec![crate::StatementDisposition {
+                    label: 0,
+                    disposition: crate::StatementDispositionKind::RuleApplied,
+                    children: vec![],
+                }]
+            );
+            assert!(!record.applied.needs_transformation);
+            assert!(record.applied.statement_pair_metadata.is_empty());
+        })
+        .unwrap();
+    }
+}
+
+#[test]
+fn unavailable_foreign_declarations_fall_back_without_emitting_link_symbols() {
+    let fixtures = [
+        r#"
+mod ffi {
+    unsafe extern "C" {
+        #[link_name = "source_ping"]
+        pub fn source_rust(value: i32) -> i32;
+    }
+}
+pub unsafe fn f() -> i32 { ffi::source_rust(1) }
+"#,
+        r#"
+mod ffi {
+    unsafe extern "C" {
+        #[link_name = "source_ping"]
+        pub fn source_rust(value: i32) -> i32;
+    }
+}
+mod left { unsafe extern "C" { #[link_name = "c_ping"] pub fn left_rust(value: i32) -> i32; } }
+mod right { unsafe extern "C" { #[link_name = "c_ping"] pub fn right_rust(value: i32) -> i32; } }
+pub unsafe fn f() -> i32 { ffi::source_rust(1) }
+"#,
+        r#"
+mod ffi {
+    unsafe extern "C" {
+        #[link_name = "source_ping"]
+        pub fn source_rust(value: i32) -> i32;
+    }
+}
+mod hidden { unsafe extern "C" { #[link_name = "c_ping"] fn hidden_rust(value: i32) -> i32; } }
+pub unsafe fn f() -> i32 { ffi::source_rust(1) }
+"#,
+    ];
+    let preferred = anchorless_foreign_rule("source_ping", foreign_call_rule("c_ping", "1"));
+    let fallback = anchorless_foreign_rule("source_ping", fixed_integer_rule("7"));
+    for source in fixtures {
+        for rules in [
+            vec![preferred.clone(), fallback.clone()],
+            vec![fallback.clone(), preferred.clone()],
+        ] {
+            let document = crate::RuleDocument {
+                schema_version: 1,
+                rules,
+            };
+            run_compiler_on_str(source, |tcx| {
+                let records = make_skeletons_with_rules(source, Some(&document), tcx).unwrap();
+                let record = function(&records, "f");
+                assert_eq!(
+                    record.applied.skeleton,
+                    "pub unsafe fn f() -> i32 {\n    #[proctor(0)]\n    7i32\n}"
+                );
+                assert_eq!(
+                    record.applied.statement_dispositions,
+                    vec![crate::StatementDisposition {
+                        label: 0,
+                        disposition: crate::StatementDispositionKind::RuleApplied,
+                        children: vec![],
+                    }]
+                );
+            })
+            .unwrap();
+        }
+
+        let document = crate::RuleDocument {
+            schema_version: 1,
+            rules: vec![preferred.clone()],
+        };
+        run_compiler_on_str(source, |tcx| {
+            let records = make_skeletons_with_rules(source, Some(&document), tcx).unwrap();
+            let record = function(&records, "f");
+            assert_eq!(record.applied, record.baseline);
+            assert_eq!(record.applied.transform_labels(), [0]);
+            assert_eq!(
+                record.applied.statement_dispositions[0].disposition,
+                crate::StatementDispositionKind::Transform
+            );
+        })
+        .unwrap();
+    }
+}
+
+#[test]
+fn structurally_invalid_foreign_winner_falls_back_without_touching_preserved_sibling() {
+    let source = r#"
+unsafe extern "C" { fn ping() -> i32; }
+pub unsafe fn f() {
+    let value: i32 = ping();
+    let keep: i32 = 1;
+}
+"#;
+    let primitive = crate::RuleTypeTree::Primitive { name: "i32".into() };
+    let ping = crate::RuleExpression::Call {
+        callee: Box::new(crate::RuleExpression::Path {
+            value: crate::RuleValueIdentity::ForeignFunction {
+                symbol: "ping".into(),
+            },
+        }),
+        arguments: vec![],
+    };
+    let rule = |target_pattern| crate::Rule {
+        source_pattern: ping.clone(),
+        target_pattern,
+        pointer_anchors: vec![],
+        lhs: false,
+        source_type: primitive.clone(),
+        source_adjusted_type: primitive.clone(),
+        target_type: primitive.clone(),
+        target_adjusted_type: primitive.clone(),
+    };
+    let invalid = rule(crate::RuleExpression::Array {
+        elements: vec![crate::RuleExpression::While {
+            condition: Box::new(crate::RuleExpression::Literal {
+                value: crate::RuleLiteral::Bool { value: true },
+            }),
+            body: crate::RuleBlock { statements: vec![] },
+        }],
+    });
+    let fallback = rule(fixed_integer_rule("7"));
+    for rules in [
+        vec![invalid.clone(), fallback.clone()],
+        vec![fallback.clone(), invalid.clone()],
+    ] {
+        let document = crate::RuleDocument {
+            schema_version: 1,
+            rules,
+        };
+        run_compiler_on_str(source, |tcx| {
+            let records = make_skeletons_with_rules(source, Some(&document), tcx).unwrap();
+            let record = function(&records, "f");
+            assert_eq!(
+                record.applied.skeleton,
+                "pub unsafe fn f() {\n    #[proctor(0)]\n    let mut value: i32 = 7i32;\n    #[proctor(1)]\n    let mut keep: i32 = 1;\n}"
+            );
+            assert_eq!(
+                record.applied.statement_dispositions,
+                vec![
+                    crate::StatementDisposition {
+                        label: 0,
+                        disposition: crate::StatementDispositionKind::RuleApplied,
+                        children: vec![],
+                    },
+                    crate::StatementDisposition {
+                        label: 1,
+                        disposition: crate::StatementDispositionKind::Preserve,
+                        children: vec![],
+                    },
+                ]
+            );
+            assert!(!record.applied.needs_transformation);
+            assert!(record.applied.statement_pair_metadata.is_empty());
+        })
+        .unwrap();
+    }
+
+    let document = crate::RuleDocument {
+        schema_version: 1,
+        rules: vec![invalid],
+    };
+    run_compiler_on_str(source, |tcx| {
+        let records = make_skeletons_with_rules(source, Some(&document), tcx).unwrap();
+        let record = function(&records, "f");
+        assert_eq!(
+            record.annotated_source,
+            "pub unsafe fn f() {\n    #[proctor(0)]\n    let mut value: i32 = ping();\n    #[proctor(1)]\n    let mut keep: i32 = 1;\n}"
+        );
+        assert_eq!(
+            record.baseline.skeleton,
+            "pub unsafe fn f() {\n    #[proctor(0)]\n    let mut value: i32 = todo!();\n    #[proctor(1)]\n    let mut keep: i32 = 1;\n}"
+        );
+        assert_eq!(record.applied, record.baseline);
+        assert_eq!(
+            record.applied.statement_dispositions,
+            vec![
+                crate::StatementDisposition {
+                    label: 0,
+                    disposition: crate::StatementDispositionKind::Transform,
+                    children: vec![],
+                },
+                crate::StatementDisposition {
+                    label: 1,
+                    disposition: crate::StatementDispositionKind::Preserve,
+                    children: vec![],
+                },
+            ]
+        );
+        assert_eq!(record.applied.statement_pair_metadata.len(), 1);
+    })
+    .unwrap();
+}
+
+#[test]
+fn maximal_foreign_parent_owns_transferred_anchor_context_without_child_fallback() {
+    let source = r#"
+unsafe extern "C" { fn read_one(pointer: *const i32) -> i32; }
+pub unsafe fn f(pointer: *const i32) -> i32 { read_one(pointer) }
+"#;
+    let primitive = crate::RuleTypeTree::Primitive { name: "i32".into() };
+    let raw = crate::RuleTypeTree::RawPointer {
+        mutability: crate::RawMutability::Const,
+        pointee: Box::new(primitive.clone()),
+    };
+    let reference = crate::RuleTypeTree::Reference {
+        mutability: crate::RefMutability::Shared,
+        pointee: Box::new(primitive.clone()),
+    };
+    let optional_reference = crate::RuleTypeTree::Adt {
+        adt_kind: crate::AdtKind::Enum,
+        identity: crate::RuleAdtIdentity::External {
+            crate_name: "core".into(),
+            path: vec!["option".into(), "Option".into()],
+        },
+        arguments: vec![reference],
+    };
+    let anchor_identity = crate::RuleValueIdentity::Variable {
+        sort: crate::VariableSort::Anchor,
+        index: 0,
+    };
+    let anchor_path = crate::RuleExpression::Path {
+        value: anchor_identity,
+    };
+    let anchors = vec![crate::RulePointerAnchor {
+        id: crate::RuleVariable::new(crate::VariableSort::Anchor, 0),
+        source_type: raw.clone(),
+        target_type: optional_reference.clone(),
+    }];
+    let parent = crate::Rule {
+        source_pattern: crate::RuleExpression::Call {
+            callee: Box::new(crate::RuleExpression::Path {
+                value: crate::RuleValueIdentity::ForeignFunction {
+                    symbol: "read_one".into(),
+                },
+            }),
+            arguments: vec![anchor_path.clone()],
+        },
+        target_pattern: fixed_integer_rule("7"),
+        pointer_anchors: anchors.clone(),
+        lhs: false,
+        source_type: primitive.clone(),
+        source_adjusted_type: primitive.clone(),
+        target_type: primitive.clone(),
+        target_adjusted_type: primitive.clone(),
+    };
+    let child = crate::Rule {
+        source_pattern: anchor_path.clone(),
+        target_pattern: anchor_path,
+        pointer_anchors: anchors,
+        lhs: false,
+        source_type: raw.clone(),
+        source_adjusted_type: raw,
+        target_type: optional_reference.clone(),
+        target_adjusted_type: optional_reference,
+    };
+    for rules in [
+        vec![parent.clone(), child.clone()],
+        vec![child.clone(), parent.clone()],
+    ] {
+        let document = crate::RuleDocument {
+            schema_version: 1,
+            rules,
+        };
+        run_compiler_on_str(source, |tcx| {
+            let records = make_skeletons_with_rules(source, Some(&document), tcx).unwrap();
+            let record = function(&records, "f");
+            assert_eq!(
+                record.applied,
+                crate::SkeletonView {
+                    skeleton: "pub unsafe fn f(mut pointer: Option<&i32>) -> i32 {\n    #[proctor(0)]\n    7i32\n}".into(),
+                    needs_transformation: false,
+                    statement_dispositions: vec![crate::StatementDisposition {
+                        label: 0,
+                        disposition: crate::StatementDispositionKind::RuleApplied,
+                        children: vec![],
+                    }],
+                    statement_pair_metadata: vec![],
+                }
+            );
+        })
+        .unwrap();
+    }
+
+    let child_only = crate::RuleDocument {
+        schema_version: 1,
+        rules: vec![child],
+    };
+    run_compiler_on_str(source, |tcx| {
+        let records = make_skeletons_with_rules(source, Some(&child_only), tcx).unwrap();
+        let record = function(&records, "f");
+        assert_eq!(
+            record.applied,
+            crate::SkeletonView {
+                skeleton: "pub unsafe fn f(mut pointer: Option<&i32>) -> i32 {\n    #[proctor(0)]\n    todo!()\n}".into(),
+                needs_transformation: true,
+                statement_dispositions: vec![crate::StatementDisposition {
+                    label: 0,
+                    disposition: crate::StatementDispositionKind::Transform,
+                    children: vec![],
+                }],
+                statement_pair_metadata: vec![crate::StatementPairMetadata {
+                    label: 0,
+                    before_statement: "#[proctor(0)]\nread_one(pointer)".into(),
+                    pointer_variables_complete: true,
+                    pointer_variables: vec![crate::PointerVariableMetadata {
+                        name: "pointer".into(),
+                        origin: crate::PointerVariableOrigin::Parameter { index: 0 },
+                        before_type: "*const i32".into(),
+                        selected_target_type: "Option<&i32>".into(),
+                        before_type_is_inferred: false,
+                    }],
+                }],
+            }
+        );
+        assert_eq!(record.applied, record.baseline);
+    })
+    .unwrap();
+}
+
+#[test]
 fn unrelated_transformed_restricted_conditional_does_not_block_rule_application() {
     let source = r#"
 extern "C" { fn opaque_value() -> bool; }
@@ -6644,8 +7538,12 @@ pub unsafe fn atomic(p: *mut i32, q: *mut i32) {
 
 #[test]
 fn two_disjoint_rule_regions_install_together_independently_of_rule_order() {
-    let source =
-        "pub unsafe fn dual(p: *mut i32, q: *mut i32) -> (i32, bool) { (*p, !q.is_null()) }";
+    let source = r#"
+unsafe extern "C" { fn ping(value: i32) -> i32; }
+pub unsafe fn dual(p: *mut i32, q: *mut i32) -> (i32, i32, bool) {
+    (*p, ping(1), !q.is_null())
+}
+"#;
     run_compiler_on_str(source, |tcx| {
         let mut surface = utils::ast::parse_crate(source.to_owned());
         let mut mapper = utils::ir::AstToHirMapper::new(tcx);
@@ -6654,9 +7552,17 @@ fn two_disjoint_rule_regions_install_together_independently_of_rule_order() {
         let function = local_def("dual", tcx);
         let mut decisions = tools_pointer_decisions(tcx);
         let signature = decisions.signatures.data.get_mut(&function).unwrap();
-        signature.input_decs[0] = Some(PtrKind::OptRef(false));
         signature.input_decs[1] = Some(PtrKind::OptRef(false));
-        let mut item = surface.items[0].clone();
+        let mut item = surface
+            .items
+            .iter()
+            .find(|item| {
+                item.kind
+                    .ident()
+                    .is_some_and(|ident| ident.name.as_str() == "dual")
+            })
+            .unwrap()
+            .clone();
         annotate_function(&mut item, &FxHashSet::default());
         let catalog = rule_binding_catalog(&item, function, &decisions, &ast_to_hir, tcx);
         let ItemKind::Fn(box body) = &item.kind else { unreachable!() };
@@ -6667,7 +7573,7 @@ fn two_disjoint_rule_regions_install_together_independently_of_rule_order() {
             tcx,
         )
         .unwrap();
-        assert_eq!(regions.len(), 2);
+        assert_eq!(regions.len(), 3);
         let external = |name: &str| crate::ValueIdentity::External {
             crate_name: "core".into(),
             path: vec!["option".into(), name.into()],
@@ -6679,21 +7585,38 @@ fn two_disjoint_rule_regions_install_together_independently_of_rule_order() {
         };
         let mut observations = vec![];
         for region in regions {
-            let anchor = crate::Expression::Path {
-                value: crate::ValueIdentity::Binding {
-                    id: region.observation.pointer_anchors[0].id.clone(),
-                },
-            };
             let mut observation = region.observation;
             observation.target_expression = match observation.source_expression {
                 crate::Expression::Unary {
                     operator: UnaryOperator::Deref,
                     ..
-                } => crate::Expression::Unary {
-                    operator: UnaryOperator::Deref,
-                    operand: Box::new(method(method(anchor, "as_deref"), "unwrap")),
+                } => crate::Expression::Literal {
+                    value: crate::Literal::Integer {
+                        value: "3".into(),
+                        ty: "i32".into(),
+                    },
                 },
-                crate::Expression::MethodCall { .. } => method(anchor, "is_none"),
+                crate::Expression::MethodCall { .. } => {
+                    let anchor = crate::Expression::Path {
+                        value: crate::ValueIdentity::Binding {
+                            id: observation.pointer_anchors[0].id.clone(),
+                        },
+                    };
+                    method(anchor, "is_none")
+                }
+                crate::Expression::Call { .. } => crate::Expression::Call {
+                    callee: Box::new(crate::Expression::Path {
+                        value: crate::ValueIdentity::ForeignFunction {
+                            symbol: "ping".into(),
+                        },
+                    }),
+                    arguments: vec![crate::Expression::Literal {
+                        value: crate::Literal::Integer {
+                            value: "2".into(),
+                            ty: "i32".into(),
+                        },
+                    }],
+                },
                 ref other => panic!("unexpected selected region {other:?}"),
             };
             observations.extend([observation.clone(), observation]);
@@ -6703,7 +7626,7 @@ fn two_disjoint_rule_regions_install_together_independently_of_rule_order() {
             observations,
         }])
         .unwrap();
-        assert_eq!(rules.rules.len(), 2);
+        assert_eq!(rules.rules.len(), 3);
         let type_speller = TypeSpeller::new(function, &ast_to_hir, tcx);
         let apply = |document: &crate::RuleDocument| {
             let mut target = item.clone();
@@ -6723,8 +7646,10 @@ fn two_disjoint_rule_regions_install_together_independently_of_rule_order() {
         };
         let (forward_applied, forward) = apply(&rules);
         assert_eq!(forward_applied, BTreeSet::from([0]));
-        assert!(forward.contains("as_deref"), "{forward}");
-        assert!(forward.contains("is_none"), "{forward}");
+        assert_eq!(
+            forward,
+            "pub unsafe fn dual(p: *mut i32, q: *mut i32) -> (i32, i32, bool) {\n\n    #[proctor(0)]\n    (3i32, ping(2i32), !(q).is_none())\n}"
+        );
         let mut reversed = rules.clone();
         reversed.rules.reverse();
         assert_eq!(apply(&reversed), (forward_applied, forward.clone()));
@@ -6736,6 +7661,58 @@ fn two_disjoint_rule_regions_install_together_independently_of_rule_order() {
         let (applied, unchanged) = apply(&incomplete);
         assert!(applied.is_empty());
         assert_eq!(unchanged, pprust::item_to_string(&item));
+
+        let complete_view = crate::SkeletonView {
+            skeleton: "pub unsafe fn dual(mut p: &i32, mut q: Option<&i32>) -> (i32, i32, bool) {\n    #[proctor(0)]\n    (3i32, ping(2i32), !(q).is_none())\n}".into(),
+            needs_transformation: false,
+            statement_dispositions: vec![crate::StatementDisposition {
+                label: 0,
+                disposition: crate::StatementDispositionKind::RuleApplied,
+                children: vec![],
+            }],
+            statement_pair_metadata: vec![],
+        };
+        for document in [&rules, &reversed] {
+            let records = make_skeletons_with_rules(source, Some(document), tcx).unwrap();
+            assert_eq!(
+                crate::skeleton::tests::function(&records, "dual").applied,
+                complete_view
+            );
+        }
+        let records = make_skeletons_with_rules(source, Some(&incomplete), tcx).unwrap();
+        assert_eq!(
+            crate::skeleton::tests::function(&records, "dual").applied,
+            crate::SkeletonView {
+                skeleton: "pub unsafe fn dual(mut p: &i32, mut q: Option<&i32>) -> (i32, i32, bool) {\n    #[proctor(0)]\n    todo!()\n}".into(),
+                needs_transformation: true,
+                statement_dispositions: vec![crate::StatementDisposition {
+                    label: 0,
+                    disposition: crate::StatementDispositionKind::Transform,
+                    children: vec![],
+                }],
+                statement_pair_metadata: vec![crate::StatementPairMetadata {
+                    label: 0,
+                    before_statement: "#[proctor(0)]\n(*p, ping(1), !q.is_null())".into(),
+                    pointer_variables_complete: true,
+                    pointer_variables: vec![
+                        crate::PointerVariableMetadata {
+                            name: "p".into(),
+                            origin: crate::PointerVariableOrigin::Parameter { index: 0 },
+                            before_type: "*mut i32".into(),
+                            selected_target_type: "&i32".into(),
+                            before_type_is_inferred: false,
+                        },
+                        crate::PointerVariableMetadata {
+                            name: "q".into(),
+                            origin: crate::PointerVariableOrigin::Parameter { index: 1 },
+                            before_type: "*mut i32".into(),
+                            selected_target_type: "Option<&i32>".into(),
+                            before_type_is_inferred: false,
+                        },
+                    ],
+                }],
+            }
+        );
     })
     .unwrap();
 }
@@ -6744,7 +7721,10 @@ fn two_disjoint_rule_regions_install_together_independently_of_rule_order() {
 fn observation_and_application_share_identical_region_selection() {
     let source = r#"
 struct Holder { ptr: *mut i32 }
-unsafe fn consume(_: *mut i32) {}
+unsafe extern "C" {
+    fn consume(_: *mut i32);
+    fn ping(value: i32) -> i32;
+}
 unsafe fn selectors(
     holder: *mut Holder,
     p: *mut i32,
@@ -6754,6 +7734,8 @@ unsafe fn selectors(
     let _ = (*holder).ptr;
     let _ = p.is_null();
     consume(p);
+    consume((*holder).ptr);
+    let _ = (p.is_null(), ping(1));
     let _ = *p + *q;
     let _ = p.offset(q as isize);
     let _closure = || p;
@@ -6775,16 +7757,25 @@ unsafe fn selectors(
             })
             .unwrap();
         let ItemKind::Fn(box function) = &item.kind else { unreachable!() };
+        let function_id = local_def("selectors", tcx);
+        let decisions = tools_pointer_decisions(tcx);
+        let catalog = rule_binding_catalog(
+            item,
+            function_id,
+            &decisions,
+            &mapper.ast_to_hir,
+            tcx,
+        );
         let mut saw_promotion = false;
-        let mut saw_overlap = false;
+        let mut saw_absorbed_anchors = false;
         let mut saw_lhs = false;
         let mut saw_two_regions = false;
         let mut saw_empty = false;
-        for statement in &function.body.as_ref().unwrap().stmts {
+        for (statement_index, statement) in function.body.as_ref().unwrap().stmts.iter().enumerate() {
             let Some(expression) = crate::observation::statement_expression(statement) else {
                 continue;
             };
-            let select = || {
+            let extraction =
                 crate::observation::select_expression_regions(
                     expression,
                     HashSet::new(),
@@ -6803,33 +7794,177 @@ unsafe fn selectors(
                                 region
                                     .anchors
                                     .into_iter()
-                                    .map(|anchor| (anchor.source_binding, anchor.target_binding))
+                                    .map(|anchor| tcx.hir_name(anchor.source_binding).to_string())
                                     .collect::<Vec<_>>(),
                             )
                         })
                         .collect::<Vec<_>>()
-                })
-            };
-            let observation = select();
-            let application = select();
-            assert_eq!(observation, application);
-            match observation {
-                None => saw_overlap = true,
+                });
+            let application = crate::observation::select_rule_regions(
+                statement,
+                &catalog,
+                &mapper.ast_to_hir,
+                tcx,
+            )
+            .map(|regions| {
+                regions
+                    .into_iter()
+                    .map(|region| {
+                        (
+                            region.root,
+                            region.promoted_field,
+                            region.observation.lhs,
+                            region
+                                .observation
+                                .pointer_anchors
+                                .iter()
+                                .map(|anchor| region.spellings[&anchor.id].clone())
+                                .collect::<Vec<_>>(),
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            });
+            assert_eq!(
+                extraction.as_ref().map(|regions| {
+                    regions.to_vec()
+                }),
+                application,
+                "observation extraction and rule application must consume identical maxima"
+            );
+            match extraction {
+                None => unreachable!("selection always returns pairwise-disjoint maxima"),
                 Some(regions) => {
+                    match statement_index {
+                        2 | 3 => assert_eq!(
+                            regions
+                                .iter()
+                                .map(|region| (region.1, region.2, region.3.len()))
+                                .collect::<Vec<_>>(),
+                            vec![(false, false, 1)],
+                            "foreign parents absorb their pointer descendant without inheriting promotion"
+                        ),
+                        4 => assert_eq!(
+                            regions
+                                .iter()
+                                .map(|region| region.3.len())
+                                .collect::<Vec<_>>(),
+                            vec![1, 0],
+                            "pointer and foreign roots remain disjoint and source-ordered"
+                        ),
+                        _ => {}
+                    }
                     saw_promotion |= regions.iter().any(|region| region.1);
                     saw_lhs |= regions.iter().any(|region| region.2);
                     saw_two_regions |= regions.len() == 2;
+                    saw_absorbed_anchors |= regions
+                        .iter()
+                        .any(|region| region.3.len() == 2 && regions.len() == 1);
                     saw_empty |= regions.is_empty();
                 }
             }
         }
         assert!(saw_promotion);
-        assert!(saw_overlap);
+        assert!(saw_absorbed_anchors);
         assert!(saw_lhs);
         assert!(saw_two_regions);
         assert!(saw_empty);
     })
     .unwrap();
+}
+
+#[test]
+fn post_maximalization_lhs_matches_only_the_rule_with_the_same_role() {
+    let fixtures = [
+        (
+            r#"pub unsafe fn selected(mut pointer: *mut i32) {
+                pointer = core::ptr::null_mut();
+            }"#,
+            true,
+        ),
+        (
+            r#"unsafe extern "C" { fn consume(pointer: *mut i32) -> i32; }
+            pub unsafe fn selected(mut pointer: *mut i32, other: *mut i32) {
+                let _ = consume({ pointer = other; pointer });
+            }"#,
+            false,
+        ),
+    ];
+    for (source, expected_lhs) in fixtures {
+        run_compiler_on_str(source, |tcx| {
+            let mut surface = utils::ast::parse_crate(source.to_owned());
+            let mut mapper = utils::ir::AstToHirMapper::new(tcx);
+            mapper.map_crate_to_mod(&mut surface, tcx.hir_root_module(), false);
+            let item = surface
+                .items
+                .iter()
+                .find(|item| {
+                    item.kind
+                        .ident()
+                        .is_some_and(|ident| ident.name.as_str() == "selected")
+                })
+                .unwrap();
+            let function = local_def("selected", tcx);
+            let decisions = tools_pointer_decisions(tcx);
+            let catalog = rule_binding_catalog(item, function, &decisions, &mapper.ast_to_hir, tcx);
+            let ItemKind::Fn(box body) = &item.kind else { unreachable!() };
+            let regions = crate::observation::select_rule_regions(
+                &body.body.as_ref().unwrap().stmts[0],
+                &catalog,
+                &mapper.ast_to_hir,
+                tcx,
+            )
+            .unwrap();
+            let [region] = &regions[..] else { panic!("fixture must retain one maximal region") };
+            assert_eq!(region.observation.lhs, expected_lhs);
+
+            let mut observation = region.observation.clone();
+            observation.target_expression = observation.source_expression.clone();
+            observation.target_type = if expected_lhs {
+                observation.pointer_anchors[0].target_type.clone()
+            } else {
+                observation.source_type.clone()
+            };
+            observation.target_adjusted_type = observation.target_type.clone();
+            let rule = crate::synthesize_rules(&[crate::ObservationDocument {
+                schema_version: 1,
+                observations: vec![observation.clone(), observation.clone()],
+            }])
+            .unwrap()
+            .rules
+            .remove(0);
+            assert_eq!(rule.lhs, expected_lhs);
+            let mut wrong_role = rule.clone();
+            wrong_role.lhs = !expected_lhs;
+            let input = crate::RuleMatchInput {
+                source_expression: region.observation.source_expression.clone(),
+                pointer_anchors: region.observation.pointer_anchors.clone(),
+                lhs: region.observation.lhs,
+                source_type: region.observation.source_type.clone(),
+                source_adjusted_type: region.observation.source_adjusted_type.clone(),
+                target_type: None,
+                target_adjusted_type: expected_lhs
+                    .then(|| observation.target_adjusted_type.clone()),
+            };
+            for rules in [
+                vec![rule.clone(), wrong_role.clone()],
+                vec![wrong_role.clone(), rule.clone()],
+            ] {
+                let loaded = crate::LoadedRuleSet::new(&crate::RuleDocument {
+                    schema_version: 1,
+                    rules,
+                })
+                .unwrap();
+                let selected = loaded.select(&input).unwrap();
+                assert_eq!(loaded.rules()[selected.rule_index].lhs, expected_lhs);
+                assert!(
+                    loaded
+                        .select_with_exclusions(&input, &BTreeSet::from([selected.rule_index]),)
+                        .is_none()
+                );
+            }
+        })
+        .unwrap();
+    }
 }
 
 #[test]
