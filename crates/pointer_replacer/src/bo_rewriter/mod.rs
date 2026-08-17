@@ -80,11 +80,12 @@ pub(crate) mod verify;
 /// **The AST application layer's bridge** — phases 1–2 of the migration back to
 /// standing decision 3. Test-only while the bar is measured; it becomes
 /// production when phase 3 ports the edit vocabulary onto it.
-#[cfg(test)]
+///
+/// **GRADUATED (M-2/A task 3, 2026-08-18)** — the verify loop now emits through
+/// this layer, so the condition this doc named is met.
 pub(crate) mod ast_bridge;
 /// **Phase 3** — the edit vocabulary as node transforms, with the fail-closed
 /// composition guard built beside its first arm.
-#[cfg(test)]
 pub(crate) mod ast_transform;
 #[cfg(test)]
 mod emit_tests;
@@ -451,6 +452,23 @@ fn rewrite_core_injected(
     };
     let root_hint = tree_base;
     let result = ::utils::compilation::run_compiler_on_input(input, |tcx| {
+        // **THE ONE AST CAPTURE PER SESSION — hoisted here, and this position is
+        // the whole point** (M-2/A task 3, 2026-08-18).
+        //
+        // `capture_ast` succeeds at most once per session: `expanded_ast` panics
+        // once the HIR is built, and the capture builds it. `decide_table` on
+        // the very next line is HIR work, so a capture taken any later — at
+        // `emit_files`, or per round inside the verify loop — is already too
+        // late and returns `Err("AST capture panicked")`.
+        //
+        // The verify loop therefore re-emits from THIS pristine capture on every
+        // round rather than re-capturing; `transform_with` transforms a clone,
+        // so the capture stays reusable. Witnessed at
+        // `a_second_capture_in_one_session_fails` — the constraint is measured,
+        // not asserted.
+        //
+        // ⚠ Nothing may run a query ahead of this line.
+        let capture = ast_transform::capture_ast(tcx)?;
         let mut table = decide_table(tcx)?;
         inject(&mut table);
         let table = table;

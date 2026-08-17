@@ -2202,7 +2202,6 @@ pub(crate) fn filtered_inputs(
 ///
 /// Pure over the counts so it has a witness — `oracle_reverts` itself needs a
 /// `TyCtxt` and is corpus-only.
-#[cfg(test)]
 pub(crate) fn revert_resolution_failure(
     by_name: &[(String, usize)],
     wanted: usize,
@@ -2288,6 +2287,24 @@ pub(crate) fn oracle_reverts(
     // and report the offenders. **No id-format redesign here** — a
     // `DefId`-carrying revert format is the real fix and is registered, not
     // built.
+    resolve_reverts(tcx, &wanted, subjects, path)
+}
+
+/// **THE ONE NAME→`LocalDefId` RESOLUTION.** Both revert producers go through
+/// here: the oracle's text format ([`oracle_reverts`]) and the verify loop's own
+/// `BTreeSet<String>` of reverted owners ([`revert_set_from_names`]).
+///
+/// It is extracted rather than copied for the reason this module keeps
+/// re-learning: *which functions are reverted* is exactly the kind of fact that
+/// grows a second derivation and then diverges from the first. The stale-edit
+/// attribution defect (S3.6-1 task 2, P3(a)) was that shape, and it was in code
+/// one commit old at the time.
+fn resolve_reverts(
+    tcx: rustc_middle::ty::TyCtxt<'_>,
+    wanted: &FxHashSet<&str>,
+    subjects: usize,
+    path: &str,
+) -> Result<RevertSet, String> {
     let mut out = FxHashSet::default();
     let mut seen: FxHashSet<String> = FxHashSet::default();
     let mut by_name: FxHashMap<String, usize> = FxHashMap::default();
@@ -2322,6 +2339,21 @@ pub(crate) fn oracle_reverts(
         names: seen,
         subjects,
     })
+}
+
+/// **THE LOOP'S REVERT ADAPTER.** The verify loop reverts by owner NAME — the
+/// vocabulary `render` filters edits with. The AST layer needs both
+/// vocabularies, because `emit_files` filters SUBJECTS by `LocalDefId` while the
+/// use and seam arms filter EDITS by `owner_fn`.
+///
+/// ⚠ **An empty name set is not an error and must not resolve to "revert
+/// everything" or fail the injectivity check** — round 0 always has one.
+pub(crate) fn revert_set_from_names(
+    tcx: rustc_middle::ty::TyCtxt<'_>,
+    names: &std::collections::BTreeSet<String>,
+) -> Result<RevertSet, String> {
+    let wanted: FxHashSet<&str> = names.iter().map(String::as_str).collect();
+    resolve_reverts(tcx, &wanted, names.len(), "verify-loop")
 }
 
 /// **THE PHASE-3 EXIT GATE.** Whole-function parity over the emitted

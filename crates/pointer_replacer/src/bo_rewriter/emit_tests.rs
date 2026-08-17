@@ -4537,7 +4537,10 @@ fn a_reverted_fn_keeps_its_raw_declaration() {
 fn a_second_capture_in_one_session_fails() {
     const SRC: &str = "#![allow(dead_code)]\npub unsafe fn f(p: *mut i32) -> i32 { *p }\n";
     let (first, second) = super::two_captures_in_one_session(SRC).expect("session runs");
-    assert!(first, "the FIRST capture must succeed, or the second proves nothing");
+    assert!(
+        first,
+        "the FIRST capture must succeed, or the second proves nothing"
+    );
     assert!(
         !second,
         "a SECOND capture in one session must fail — the loop's one-capture \
