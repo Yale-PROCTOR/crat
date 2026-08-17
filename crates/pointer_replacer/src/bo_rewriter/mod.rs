@@ -694,18 +694,13 @@ fn round_files(
         return Ok((files, rollbacks));
     }
     let reverts = ast_transform::revert_set_from_names(tcx, reverted)?;
-    let (source, _stats) = ast_transform::ast_emitted_source_from(tcx, capture, &reverts)?;
-    // **THE ONE-ENTRY MAP** — licensed by C-20's measurement, not by convenience:
-    // all 20 corpus programs are single crate-source file and emit-time
-    // `files_touched` never exceeds 1. If a program with two source files ever
-    // enters the corpus, this is the line that is wrong, and C-20 carries the
-    // revival tripwire that says so.
-    let files = match root_key {
-        Some(key) => std::iter::once((key.clone(), source)).collect(),
-        // Round 0 emitted nothing, so there is no file to re-emit into. Not an
-        // error: six corpus programs are in exactly this state.
-        None => std::collections::BTreeMap::new(),
-    };
+    // **PER-FILE (A1, revived 2026-08-18).** The one-entry map that stood here
+    // was licensed by C-20's corpus measurement — 20/20 single crate-source
+    // file — and that measurement still holds. What it did not cover is the
+    // verify loop's own end-to-end witnesses, which ARE multi-file, and which
+    // it silently collapsed. The corpus emission is unchanged by this: a
+    // single-file crate yields a single-entry map either way.
+    let (files, _stats) = ast_transform::ast_emitted_files_from(tcx, capture, &reverts, root_key)?;
     Ok((files, Vec::new()))
 }
 

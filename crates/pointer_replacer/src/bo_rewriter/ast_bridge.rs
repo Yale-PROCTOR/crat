@@ -399,7 +399,27 @@ pub(crate) fn substituted_source(tcx: TyCtxt<'_>) -> Result<(String, SubstStats)
 ///   comments, `extern` blocks, inner attributes);
 /// - text **inside** a function span is normalized, so comments in bodies are
 ///   dropped by `pprust`.
-pub(crate) fn splice_fn_prints(tcx: TyCtxt<'_>, krate: &rustc_ast::Crate) -> (String, SubstStats) {
+/// **Per-file emission (A1, revived by ruling 2026-08-18).**
+///
+/// Groups every reprint by the source file its span lives in and splices each
+/// file's edits into that file's own text, with that file's own `start_pos` as
+/// the offset base. The previous shape picked `spans.first()`'s file and
+/// spliced EVERY reprint into it — correct on a single-file crate and a wrong
+/// program on any other.
+///
+/// ⚠ **Why this exists when the corpus does not need it.** All 20 corpus
+/// programs are single crate-source file (C-20), so this changes no corpus
+/// byte. It exists because the verify loop's own end-to-end witnesses are
+/// multi-file, and they are the only witnesses that the loop reverts a bad
+/// rewrite while keeping a good one. C-20's retirement check scoped the corpus
+/// and not the witness population — the correction is recorded there.
+pub(crate) fn splice_fn_prints_per_file(
+    tcx: TyCtxt<'_>,
+    krate: &rustc_ast::Crate,
+) -> (
+    std::collections::BTreeMap<super::plan::FileKey, String>,
+    SubstStats,
+) {
     let mut spans = Vec::new();
     collect_fn_spans(&krate.items, &mut spans);
     let mut printed: Vec<(rustc_span::Span, String)> = Vec::new();
@@ -421,42 +441,70 @@ pub(crate) fn splice_fn_prints(tcx: TyCtxt<'_>, krate: &rustc_ast::Crate) -> (St
             s.nested += 1;
         }
     }
-    // The root file's original text — the frozen substrate for this crate.
-    let Some(file) = spans
-        .first()
-        .map(|sp| sm.lookup_source_file(sp.lo()))
-        .filter(|f| f.src.is_some())
-    else {
-        return (String::new(), s);
-    };
-    let src = file.src.as_ref().expect("filtered").to_string();
-    let base = file.start_pos;
 
-    let mut edits: Vec<(usize, usize, String)> = Vec::new();
+    // Edits bucketed BY FILE. A span whose file has no source text, or whose
+    // name does not map to a `FileKey`, is unrenderable — counted, never
+    // silently spliced into a neighbouring file, which is precisely the defect
+    // the single-file shape had.
+    let mut per_file: std::collections::BTreeMap<
+        super::plan::FileKey,
+        (String, rustc_span::BytePos, Vec<(usize, usize, String)>),
+    > = std::collections::BTreeMap::new();
     for (sp, text) in &printed {
+        let file = sm.lookup_source_file(sp.lo());
+        let (Some(src), Some(key)) = (file.src.as_ref(), super::file_key(&file.name)) else {
+            s.unrenderable += 1;
+            continue;
+        };
+        let slot = per_file
+            .entry(key)
+            .or_insert_with(|| (src.to_string(), file.start_pos, Vec::new()));
         match sm.span_to_snippet(*sp) {
             Ok(orig) => {
                 if orig.trim_start().starts_with('#') {
                     s.span_starts_at_attr += 1;
                 }
-                let lo = (sp.lo() - base).0 as usize;
-                let hi = (sp.hi() - base).0 as usize;
-                edits.push((lo, hi, text.clone()));
+                let lo = (sp.lo() - slot.1).0 as usize;
+                let hi = (sp.hi() - slot.1).0 as usize;
+                slot.2.push((lo, hi, text.clone()));
             }
             Err(_) => s.unrenderable += 1,
         }
     }
-    // Back-to-front, exactly as `apply` does: offsets address the ORIGINAL.
-    edits.sort_by_key(|(lo, _, _)| std::cmp::Reverse(*lo));
-    let mut out = src;
-    for (lo, hi, text) in edits {
-        if lo <= hi && hi <= out.len() {
-            out.replace_range(lo..hi, &text);
-        } else {
-            s.unrenderable += 1;
+
+    let mut out = std::collections::BTreeMap::new();
+    for (key, (src, _base, mut edits)) in per_file {
+        // Back-to-front, exactly as `apply` does: offsets address the ORIGINAL.
+        edits.sort_by_key(|(lo, _, _)| std::cmp::Reverse(*lo));
+        let mut text = src;
+        for (lo, hi, replacement) in edits {
+            if lo <= hi && hi <= text.len() {
+                text.replace_range(lo..hi, &replacement);
+            } else {
+                s.unrenderable += 1;
+            }
         }
+        out.insert(key, text);
     }
     (out, s)
+}
+
+/// **The root file alone**, for callers that emit one text: the string entry,
+/// the goldens, and the parity gates. Selects by `spans.first()`'s file — the
+/// same rule the pre-A1 shape used — so single-file callers are byte-identical
+/// to before.
+pub(crate) fn splice_fn_prints(tcx: TyCtxt<'_>, krate: &rustc_ast::Crate) -> (String, SubstStats) {
+    let mut spans = Vec::new();
+    collect_fn_spans(&krate.items, &mut spans);
+    let root = spans
+        .first()
+        .map(|sp| tcx.sess.source_map().lookup_source_file(sp.lo()))
+        .and_then(|f| super::file_key(&f.name));
+    let (files, s) = splice_fn_prints_per_file(tcx, krate);
+    let text = root
+        .and_then(|key| files.get(&key).cloned())
+        .unwrap_or_default();
+    (text, s)
 }
 
 pub(crate) fn collect_fn_prints(

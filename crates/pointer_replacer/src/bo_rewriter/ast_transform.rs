@@ -1634,6 +1634,44 @@ pub(crate) fn ast_emitted_source(
 /// This split is not a convenience: calling [`ast_emitted_source`] twice in one
 /// session returns `Err("AST capture panicked")` on the second call, witnessed
 /// at `a_second_capture_in_one_session_fails`.
+/// **The loop's per-file entry (A1).** Same transform, same const rule, but the
+/// emission is keyed by source file rather than collapsed into the root.
+///
+/// The const is appended to the ROOT file only — it is declared once per crate
+/// and named as `crate::SEAM_LEN_PLACEHOLDER`, so a copy per file would be a
+/// duplicate-definition error, not redundancy.
+pub(crate) fn ast_emitted_files_from(
+    tcx: rustc_middle::ty::TyCtxt<'_>,
+    capture: &AstCapture,
+    reverts: &RevertSet,
+    root_key: Option<&super::plan::FileKey>,
+) -> Result<
+    (
+        std::collections::BTreeMap<super::plan::FileKey, String>,
+        super::ast_bridge::SubstStats,
+    ),
+    String,
+> {
+    let (table, _ctx) = super::decide_table_with_ctx(tcx)?;
+    let (_, _, seams, _, _, _, _, krate) = transform_with(capture, &table, reverts)?;
+    let (mut files, stats) = super::ast_bridge::splice_fn_prints_per_file(tcx, &krate);
+    if seams.len_fabricated > 0 {
+        // Root selection: the caller's key when it has one (the loop's round-0
+        // file), else the map's first — deterministic because the map is
+        // ordered by `FileKey`.
+        let key = root_key.cloned().or_else(|| files.keys().next().cloned());
+        if let Some(key) = key
+            && let Some(text) = files.get_mut(&key)
+            && !text.is_empty()
+        {
+            text.push('\n');
+            text.push_str(&super::decision::seam::fabricated_len_item());
+            text.push('\n');
+        }
+    }
+    Ok((files, stats))
+}
+
 pub(crate) fn ast_emitted_source_from(
     tcx: rustc_middle::ty::TyCtxt<'_>,
     capture: &AstCapture,
