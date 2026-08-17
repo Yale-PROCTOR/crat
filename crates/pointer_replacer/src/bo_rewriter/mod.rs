@@ -525,18 +525,23 @@ fn rewrite_core_injected(
                     .or_else(|| sf.src.as_ref().map(|src| src.to_string()))
             })
             .unwrap_or_default();
-        Ok((
+        // **THE LOOP RUNS HERE NOW** (M-2/A) — inside the session, so `tcx` is
+        // live for every revert round. `emitted_subjects.len()` is NOT a count
+        // of `Ref` decisions (which is what the deleted `emitted_count()`
+        // computed): it is the placed set, already filtered above, so `emitted`
+        // names what the rewrite actually did to the source.
+        Ok(verify_and_revert(
+            tcx,
+            tree_base,
+            virtual_original,
+            max_rounds,
+            probe_only,
             emission.files,
             emission_plan,
             emission_texts,
             emission.unplaceable,
             degradations,
-            // NOT a count of `Ref` DECISIONS (which is what the deleted
-            // `emitted_count()` computed). This
-            // is the placed set, already filtered above, so `emitted` names
-            // what the rewrite actually did to the source.
             emitted_subjects.len(),
-            decision::universe::classify(tcx).excluded,
             root_text,
             emitted_sites,
             emitted_subjects,
@@ -544,391 +549,413 @@ fn rewrite_core_injected(
     });
 
     match result {
-        Ok(Ok((
-            files,
-            emission_plan,
-            emission_texts,
-            unplaceable,
-            degradations,
-            emitted_count,
-            excluded,
-            root_text,
-            emitted_sites,
-            emitted_subjects,
-        ))) => {
-            // Built ONCE. Every return below goes through `facts.emitted(..)`
-            // or `facts.degraded(..)`; no site hand-fills a field.
-            let site_owners: std::collections::BTreeSet<&str> =
-                emitted_sites.iter().map(|s| s.fn_path.as_str()).collect();
-            let attribution_blind = emission_plan
-                .by_file
-                .values()
-                .flatten()
-                .map(|edit| edit.owner_fn.as_str())
-                .collect::<std::collections::BTreeSet<_>>()
-                .difference(&site_owners)
-                .count();
-            // BASELINE-DIFFERENTIAL GATE. The gate judges what the REWRITE
-            // introduced, not what the input already reported: brotli's frozen
-            // source trips a deny-by-default lint unedited, which made
-            // revert-all — the bisect base case — impossible to satisfy under an
-            // absolute gate. Excluding lints wholesale would instead blind the
-            // gate to rewrite-INTRODUCED violations of exactly our risk class
-            // (reference casting), so the baseline is subtracted, not the class.
-            // NOT COMPUTED HERE — see the loop, below the `probe_only` return.
-            // `baseline_of` COMPILES the unmodified crate, and its diagnostics
-            // are forwarded to the same stderr an instrument's consumer reads.
-            // Computed on the instrument path it would be dead work (probe mode
-            // returns before `novel` is ever consulted) whose only effect is to
-            // contaminate that stderr with a second crate's diagnostics — which
-            // is exactly what it did to brotli: 4 frozen-tree entries appeared
-            // on the rendered side of a transfer that measures the temp copy.
-            //
-            // The placement is the enforcement. A predicate here would work
-            // today and be one careless edit from unconditional again; below
-            // the return, "gate machinery does not run on instrument paths"
-            // holds by position.
-            let compute_baseline = || match (tree_base, &virtual_original) {
-                (Some(root), _) => verify::baseline_of(root),
-                (None, Some(text)) => match verify::materialize_single_file(text) {
-                    Ok(staged) => verify::baseline_of(staged.root()),
-                    Err(_) => verify::Baseline::default(),
-                },
-                (None, None) => verify::Baseline::default(),
-            };
-            // **S3.6-1 task 2.** Built ONCE, from the same plan and texts every
-            // revert round re-renders from, so attribution and rendering cannot
-            // drift apart across rounds — the divergence class that cost a
-            // brotli sweep when `candidates` and `emitted_sites` were derived
-            // two different ways.
-            let planned_edit_sites = edit_sites(&emission_plan, &emission_texts);
-            let mut baseline: Option<verify::Baseline> = None;
-            let mut facts = OutcomeFacts {
-                degradations,
-                excluded,
-                emitted_count,
-                files_touched: files.len(),
-                reverted_count: 0,
-                emitted_sites,
-                unplaceable,
-                bisect_probes: 0,
-                escalated: None,
-                attribution_blind,
-                first_diags: Vec::new(),
-                observed_root: None,
-                // Filled below, on the gate path, when the baseline is
-                // actually computed. Probe mode HAS no baseline — its payload
-                // is the raw capture — so zero here is "not applicable in this
-                // mode", not a measured value that was zeroed.
-                baseline_keys: 0,
-                baseline_errors: 0,
-                baseline_msg_env: 0,
-            };
-            let crate_dir = tree_base
-                .and_then(|root| root.parent())
-                .map(|d| d.to_path_buf());
-            let mut reverted: std::collections::BTreeSet<String> =
-                std::collections::BTreeSet::new();
-            let mut files = files;
-            let mut rounds = 0usize;
-            let mut previous_errors: Option<usize> = None;
-            let mut probe_secs = 0.0f64;
-            let escalation: Option<String>;
-
-            loop {
-                let materialized = match tree_base {
-                    Some(root) => verify::materialize(root, &files),
-                    None => verify::materialize_single_file(&root_text),
-                };
-                let staged = match materialized {
-                    Ok(staged) => staged,
-                    Err(err) => {
-                        facts.files_touched = files.len();
-                        facts.reverted_count = reverted.len();
-                        return facts
-                            .degraded(format!("could not materialize the emitted crate: {err}"));
-                    }
-                };
-                let probe_started = std::time::Instant::now();
-                let diagnosis = verify::diagnose_crate(staged.root());
-                probe_secs = probe_secs.max(probe_started.elapsed().as_secs_f64());
-                if probe_only {
-                    // INSTRUMENTS MEASURE THE CAPTURE; GATES CONSUME THE
-                    // FILTERED VIEW. The probe payload is the RAW diagnosis and
-                    // gets its own assignment statement here, above the early
-                    // return; the gate's baseline-subtracted `novel` is assigned
-                    // separately below. The two never share an assignment site
-                    // again.
-                    //
-                    // This is not a style preference. The payloads were shared
-                    // once: the differential gate rewrote the single assignment
-                    // to `novel`, which needs a root and a baseline, so it had
-                    // to move BELOW this return — and the return did not move
-                    // with it. `diagnose_once` then returned empty and
-                    // `run_m1_diag` reported `struct_diags=0 status=ok` for
-                    // every program, a zeroed payload wearing an ok status.
-                    //
-                    // Raw is also the SEMANTICALLY required payload, not merely
-                    // the restored one: the transfer harness compares these
-                    // against the child's unfiltered stderr, so subtracting a
-                    // baseline from one side of that comparison would bias it.
-                    // Baseline diagnostics appear on both sides, which is what
-                    // makes the equality mean anything.
-                    facts.first_diags = diagnosis.diags.clone();
-                    facts.observed_root = Some(
-                        staged
-                            .root()
-                            .parent()
-                            .unwrap_or(staged.root())
-                            .to_path_buf(),
-                    );
-                    facts.files_touched = files.len();
-                    return facts.degraded("probe-only: first diagnose recorded".to_owned());
-                }
-                // GATE MACHINERY STARTS HERE. Everything below the probe
-                // return belongs to the differential; the baseline compile is
-                // the first of it, computed once and reused across rounds.
-                let baseline = baseline.get_or_insert_with(|| compute_baseline());
-                facts.baseline_keys = baseline.keys.values().sum();
-                facts.baseline_errors = baseline.errors;
-                facts.baseline_msg_env = baseline.messages_embedding_root;
-                let observed_root = staged
-                    .root()
-                    .parent()
-                    .unwrap_or(staged.root())
-                    .to_path_buf();
-                let novel: Vec<verify::Diag> = baseline
-                    .novel(&diagnosis.diags, &observed_root)
-                    .into_iter()
-                    .cloned()
-                    .collect();
-                let novel_errors = diagnosis.errors.saturating_sub(baseline.errors);
-                if facts.first_diags.is_empty() {
-                    facts.first_diags = novel.clone();
-                    facts.observed_root = Some(observed_root.clone());
-                }
-                if novel.is_empty() && novel_errors == 0 {
-                    let source = std::fs::read_to_string(staged.root()).unwrap_or_default();
-                    let (kept, taken): (Vec<_>, Vec<_>) = emitted_subjects
-                        .iter()
-                        .partition(|(owner, _, _)| !reverted.contains(owner));
-                    // ACCOUNTING: a reverted subject moves from emitted to
-                    // degraded under its OWN reason key, so
-                    // `emitted_final + degraded == row count` survives the loop.
-                    for (_, subject, site) in &taken {
-                        facts.degradations.push(decision::Degradation {
-                            subject: subject.clone(),
-                            site: site.clone(),
-                            reason: decision::DegradeReason::RevertedAfterVerifyFailure,
-                        });
-                    }
-                    facts.emitted_count = kept.len();
-                    facts.reverted_count = taken.len();
-                    facts.files_touched = files.len();
-                    return facts.emitted(source, files);
-                }
-
-                // DUAL TERMINATION, both arms. Neither alone: a no-progress
-                // detector can be starved by a loop that keeps finding new
-                // attributions, and a cap alone burns every round on a case
-                // that stopped improving after the first.
-                let outstanding = novel.len().max(novel_errors);
-                if previous_errors.is_some_and(|prev| outstanding >= prev) {
-                    escalation = Some(format!(
-                        "escalation-required: no progress ({} error(s) after \
-                         reverting {} function(s)) — attribution is wrong here \
-                         and (C) bisect must take over",
-                        outstanding,
-                        reverted.len()
-                    ));
-                    break;
-                }
-                previous_errors = Some(outstanding);
-                rounds += 1;
-                if rounds > max_rounds {
-                    escalation = Some(format!(
-                        "escalation-required: round cap {max_rounds} reached with \
-                         {} error(s) outstanding",
-                        outstanding
-                    ));
-                    break;
-                }
-
-                let newly = attribute(
-                    &novel,
-                    &observed_root,
-                    &facts.emitted_sites,
-                    &planned_edit_sites,
-                    &reverted,
-                    crate_dir.as_deref().unwrap_or(std::path::Path::new("")),
-                )
-                .difference(&reverted)
-                .cloned()
-                .collect::<std::collections::BTreeSet<_>>();
-                if newly.is_empty() {
-                    escalation = Some(format!(
-                        "escalation-required: {} error(s) attributed to no rewritten \
-                         function",
-                        outstanding
-                    ));
-                    break;
-                }
-                // BATCH revert: the union of this round's attributions, not one
-                // at a time — one compile per round rather than one per function.
-                reverted.extend(newly);
-                let (next_files, rollbacks) = render(&emission_plan, &emission_texts, &reverted);
-                if !rollbacks.is_empty() {
-                    escalation = Some(format!(
-                        "escalation-required: re-render rolled back {} edit(s)",
-                        rollbacks.len()
-                    ));
-                    break;
-                }
-                files = next_files;
-            }
-
-            // ---- (C) BISECT: the escalation path ----
-            // Reaching here means the loop BROKE, and only the gate path can
-            // break: probe mode returns from inside it. So the baseline exists
-            // by construction — and it is asserted rather than defaulted,
-            // because a `Baseline::default()` fallback here would silently turn
-            // the differential into an absolute gate, which is the exact defect
-            // brotli's frozen source exposed in the first place.
-            let baseline = baseline.expect(
-                "the gate path computes a baseline on its first round; reaching \
-                 the post-loop stages without one means the loop was exited by a \
-                 path that skipped it",
-            );
-
-            let escalation = escalation.unwrap_or_else(|| "escalation-required".to_owned());
-            // Candidates come from the PLAN's `owner_fn` domain — the exact key
-            // `render` filters on — so `base ∪ candidates` drops EVERY edit and
-            // the base case (revert-all compiles) holds BY CONSTRUCTION.
-            //
-            // They were previously derived from `emitted_sites`, a DIFFERENT
-            // derivation: it skips a subject whose enclosing function's span has
-            // no editable file identity, while the edit is keyed on the
-            // subject's own `ty_span`. brotli found the divergence (2026-07-31):
-            // reverting every candidate left edits standing, the crate still
-            // failed, and bisect returned a non-compiling set. Two derivations
-            // assumed identical — the founding class.
-            let candidates: Vec<String> = emission_plan
-                .by_file
-                .values()
-                .flatten()
-                .map(|edit| edit.owner_fn.clone())
-                .filter(|owner| !reverted.contains(owner))
-                .collect::<std::collections::BTreeSet<_>>()
-                .into_iter()
-                .collect();
-
-            // ESCALATION BUDGET. A bisect that cannot finish inside the worker
-            // budget is DEFERRED LOUDLY with its attribution state, never
-            // silently truncated — a truncated bisect returns a wrong answer
-            // that looks like a right one.
-            let projected = (candidates.len() + 1).next_power_of_two().trailing_zeros() as f64;
-            let budget_secs = std::env::var("CRAT_BOC1_EMIT_TIMEOUT_SECS")
-                .ok()
-                .and_then(|v| v.parse::<f64>().ok())
-                .unwrap_or(900.0);
-            if projected * probe_secs > budget_secs {
-                facts.files_touched = files.len();
-                facts.reverted_count = reverted.len();
-                facts.escalated = Some(escalation.clone());
-                return facts.degraded(format!(
-                    "escalation-deferred: {escalation}; bisect needs ~{projected} probe(s)                          at ~{probe_secs:.1}s each against a {budget_secs:.0}s budget, with                          {} function(s) already reverted",
-                    reverted.len()
-                ));
-            }
-
-            let (final_reverted, probes) = bisect(&candidates, &reverted, |trial| {
-                let (trial_files, rollbacks) = render(&emission_plan, &emission_texts, trial);
-                if !rollbacks.is_empty() {
-                    return false;
-                }
-                let materialized = match tree_base {
-                    Some(root) => verify::materialize(root, &trial_files),
-                    None => verify::materialize_single_file(&root_text),
-                };
-                let Ok(staged) = materialized else {
-                    return false;
-                };
-                let probe = verify::diagnose_crate(staged.root());
-                let probe_root = staged.root().parent().unwrap_or(staged.root());
-                baseline.novel(&probe.diags, probe_root).is_empty()
-                    && probe.errors.saturating_sub(baseline.errors) == 0
-            });
-
-            let (final_files, rollbacks) = render(&emission_plan, &emission_texts, &final_reverted);
-            let materialized = match tree_base {
-                Some(root) => verify::materialize(root, &final_files),
-                None => verify::materialize_single_file(&root_text),
-            };
-            // INCIDENT-PROVEN DEFENSE — not a control over an unreachable case.
-            //
-            // `type_checks_crate` here can never be the thing that fails:
-            // `bisect` only ever assigns `hi` a `mid` it just tested true, so
-            // the returned `k` either compiled under test or equals
-            // `candidates.len()` — reverting every owner, which drops every
-            // edit and reduces the crate to the original input. The input
-            // compiled, or `decide_table` would not have produced a table.
-            // Non-monotonicity costs MINIMALITY, never correctness.
-            //
-            // `rollbacks` likewise cannot fire here: `render` applies a SUBSET
-            // of the edits that produced no rollbacks initially, and dropping
-            // edits cannot create an overlap, an out-of-bounds range, or a
-            // char-boundary violation.
-            //
-            // **This guard FIRED on brotli, 2026-07-31**, when `candidates` was
-            // derived from `emitted_sites` rather than from the plan's
-            // `owner_fn` domain: the two sets diverged, revert-all left edits
-            // standing, and bisect returned a set that did not compile. The
-            // derivation is fixed above; the guard stays because it is what
-            // turned a silently wrong emission into a loud `Degraded`.
-            //
-            // The `rollbacks` arm remains unreachable (a SUBSET of edits that
-            // produced no rollbacks cannot produce new ones); the reachable
-            // rollback path is the pre-loop structural gate, witnessed there.
-            match materialized {
-                Ok(staged)
-                    if rollbacks.is_empty() && {
-                        let final_diag = verify::diagnose_crate(staged.root());
-                        let final_root = staged.root().parent().unwrap_or(staged.root());
-                        baseline.novel(&final_diag.diags, final_root).is_empty()
-                            && final_diag.errors.saturating_sub(baseline.errors) == 0
-                    } =>
-                {
-                    let source = std::fs::read_to_string(staged.root()).unwrap_or_default();
-                    let (kept, taken): (Vec<_>, Vec<_>) = emitted_subjects
-                        .iter()
-                        .partition(|(owner, _, _)| !final_reverted.contains(owner));
-                    for (_, subject, site) in &taken {
-                        facts.degradations.push(decision::Degradation {
-                            subject: subject.clone(),
-                            site: site.clone(),
-                            reason: decision::DegradeReason::RevertedAfterVerifyFailure,
-                        });
-                    }
-                    facts.emitted_count = kept.len();
-                    facts.reverted_count = taken.len();
-                    facts.files_touched = final_files.len();
-                    facts.bisect_probes = probes;
-                    facts.escalated = Some(escalation);
-                    facts.emitted(source, final_files)
-                }
-                _ => {
-                    facts.files_touched = files.len();
-                    facts.reverted_count = final_reverted.len();
-                    facts.bisect_probes = probes;
-                    facts.escalated = Some(escalation.clone());
-                    facts.degraded(format!("{escalation}; bisect did not recover the crate"))
-                }
-            }
-        }
+        Ok(Ok(outcome)) => outcome,
         // Nothing was decided, so the facts are genuinely empty here — the one
         // place a zero is the measurement rather than an omission.
         Ok(Err(reason)) => OutcomeFacts::default().degraded(reason),
         Err(_) => OutcomeFacts::default().degraded("input crate did not compile".to_owned()),
+    }
+}
+
+/// **THE VERIFY/REVERT LOOP — RELOCATED INSIDE THE COMPILER SESSION** (M-2/A).
+///
+/// It used to run AFTER `run_compiler_on_input` returned, consuming ten values
+/// across the closure boundary. That worked only because `render` consumes
+/// PRE-COMPUTED data — a plan and file texts. The AST emitter cannot: it
+/// RE-DERIVES from `tcx`, and calling it outside the session is the `scoped-tls`
+/// panic four corpus programs already paid for.
+///
+/// So the loop moved to the data rather than the data to the loop.
+///
+/// ⚠ **NOT behaviour-preserving by construction.** Relocated control flow
+/// cannot be proven unchanged by its shape. The suite is the interim shield;
+/// the PROOF is the acceptance gate's byte/digest reproduction of the pinned
+/// oracle verdicts.
+#[allow(clippy::too_many_arguments)]
+fn verify_and_revert(
+    tcx: TyCtxt<'_>,
+    tree_base: Option<&std::path::Path>,
+    virtual_original: Option<String>,
+    max_rounds: usize,
+    probe_only: bool,
+    files: std::collections::BTreeMap<plan::FileKey, String>,
+    emission_plan: plan::Plan,
+    emission_texts: std::collections::BTreeMap<plan::FileKey, String>,
+    unplaceable: Vec<plan::Unplaceable>,
+    degradations: Vec<decision::Degradation>,
+    emitted_count: usize,
+    root_text: String,
+    emitted_sites: Vec<EmittedSite>,
+    emitted_subjects: Vec<(String, String, String)>,
+) -> RewriteOutcome {
+    // `excluded` is a LOCAL again: the loop holds `tcx`, so a value that used
+    // to cross the boundary is simply computed here. One of the ten, retired.
+    let excluded = decision::universe::classify(tcx).excluded;
+    // Built ONCE. Every return below goes through `facts.emitted(..)`
+    // or `facts.degraded(..)`; no site hand-fills a field.
+    let site_owners: std::collections::BTreeSet<&str> =
+        emitted_sites.iter().map(|s| s.fn_path.as_str()).collect();
+    let attribution_blind = emission_plan
+        .by_file
+        .values()
+        .flatten()
+        .map(|edit| edit.owner_fn.as_str())
+        .collect::<std::collections::BTreeSet<_>>()
+        .difference(&site_owners)
+        .count();
+    // BASELINE-DIFFERENTIAL GATE. The gate judges what the REWRITE
+    // introduced, not what the input already reported: brotli's frozen
+    // source trips a deny-by-default lint unedited, which made
+    // revert-all — the bisect base case — impossible to satisfy under an
+    // absolute gate. Excluding lints wholesale would instead blind the
+    // gate to rewrite-INTRODUCED violations of exactly our risk class
+    // (reference casting), so the baseline is subtracted, not the class.
+    // NOT COMPUTED HERE — see the loop, below the `probe_only` return.
+    // `baseline_of` COMPILES the unmodified crate, and its diagnostics
+    // are forwarded to the same stderr an instrument's consumer reads.
+    // Computed on the instrument path it would be dead work (probe mode
+    // returns before `novel` is ever consulted) whose only effect is to
+    // contaminate that stderr with a second crate's diagnostics — which
+    // is exactly what it did to brotli: 4 frozen-tree entries appeared
+    // on the rendered side of a transfer that measures the temp copy.
+    //
+    // The placement is the enforcement. A predicate here would work
+    // today and be one careless edit from unconditional again; below
+    // the return, "gate machinery does not run on instrument paths"
+    // holds by position.
+    let compute_baseline = || match (tree_base, &virtual_original) {
+        (Some(root), _) => verify::baseline_of(root),
+        (None, Some(text)) => match verify::materialize_single_file(text) {
+            Ok(staged) => verify::baseline_of(staged.root()),
+            Err(_) => verify::Baseline::default(),
+        },
+        (None, None) => verify::Baseline::default(),
+    };
+    // **S3.6-1 task 2.** Built ONCE, from the same plan and texts every
+    // revert round re-renders from, so attribution and rendering cannot
+    // drift apart across rounds — the divergence class that cost a
+    // brotli sweep when `candidates` and `emitted_sites` were derived
+    // two different ways.
+    let planned_edit_sites = edit_sites(&emission_plan, &emission_texts);
+    let mut baseline: Option<verify::Baseline> = None;
+    let mut facts = OutcomeFacts {
+        degradations,
+        excluded,
+        emitted_count,
+        files_touched: files.len(),
+        reverted_count: 0,
+        emitted_sites,
+        unplaceable,
+        bisect_probes: 0,
+        escalated: None,
+        attribution_blind,
+        first_diags: Vec::new(),
+        observed_root: None,
+        // Filled below, on the gate path, when the baseline is
+        // actually computed. Probe mode HAS no baseline — its payload
+        // is the raw capture — so zero here is "not applicable in this
+        // mode", not a measured value that was zeroed.
+        baseline_keys: 0,
+        baseline_errors: 0,
+        baseline_msg_env: 0,
+    };
+    let crate_dir = tree_base
+        .and_then(|root| root.parent())
+        .map(|d| d.to_path_buf());
+    let mut reverted: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let mut files = files;
+    let mut rounds = 0usize;
+    let mut previous_errors: Option<usize> = None;
+    let mut probe_secs = 0.0f64;
+    let escalation: Option<String>;
+
+    loop {
+        let materialized = match tree_base {
+            Some(root) => verify::materialize(root, &files),
+            None => verify::materialize_single_file(&root_text),
+        };
+        let staged = match materialized {
+            Ok(staged) => staged,
+            Err(err) => {
+                facts.files_touched = files.len();
+                facts.reverted_count = reverted.len();
+                return facts.degraded(format!("could not materialize the emitted crate: {err}"));
+            }
+        };
+        let probe_started = std::time::Instant::now();
+        let diagnosis = verify::diagnose_crate(staged.root());
+        probe_secs = probe_secs.max(probe_started.elapsed().as_secs_f64());
+        if probe_only {
+            // INSTRUMENTS MEASURE THE CAPTURE; GATES CONSUME THE
+            // FILTERED VIEW. The probe payload is the RAW diagnosis and
+            // gets its own assignment statement here, above the early
+            // return; the gate's baseline-subtracted `novel` is assigned
+            // separately below. The two never share an assignment site
+            // again.
+            //
+            // This is not a style preference. The payloads were shared
+            // once: the differential gate rewrote the single assignment
+            // to `novel`, which needs a root and a baseline, so it had
+            // to move BELOW this return — and the return did not move
+            // with it. `diagnose_once` then returned empty and
+            // `run_m1_diag` reported `struct_diags=0 status=ok` for
+            // every program, a zeroed payload wearing an ok status.
+            //
+            // Raw is also the SEMANTICALLY required payload, not merely
+            // the restored one: the transfer harness compares these
+            // against the child's unfiltered stderr, so subtracting a
+            // baseline from one side of that comparison would bias it.
+            // Baseline diagnostics appear on both sides, which is what
+            // makes the equality mean anything.
+            facts.first_diags = diagnosis.diags.clone();
+            facts.observed_root = Some(
+                staged
+                    .root()
+                    .parent()
+                    .unwrap_or(staged.root())
+                    .to_path_buf(),
+            );
+            facts.files_touched = files.len();
+            return facts.degraded("probe-only: first diagnose recorded".to_owned());
+        }
+        // GATE MACHINERY STARTS HERE. Everything below the probe
+        // return belongs to the differential; the baseline compile is
+        // the first of it, computed once and reused across rounds.
+        let baseline = baseline.get_or_insert_with(|| compute_baseline());
+        facts.baseline_keys = baseline.keys.values().sum();
+        facts.baseline_errors = baseline.errors;
+        facts.baseline_msg_env = baseline.messages_embedding_root;
+        let observed_root = staged
+            .root()
+            .parent()
+            .unwrap_or(staged.root())
+            .to_path_buf();
+        let novel: Vec<verify::Diag> = baseline
+            .novel(&diagnosis.diags, &observed_root)
+            .into_iter()
+            .cloned()
+            .collect();
+        let novel_errors = diagnosis.errors.saturating_sub(baseline.errors);
+        if facts.first_diags.is_empty() {
+            facts.first_diags = novel.clone();
+            facts.observed_root = Some(observed_root.clone());
+        }
+        if novel.is_empty() && novel_errors == 0 {
+            let source = std::fs::read_to_string(staged.root()).unwrap_or_default();
+            let (kept, taken): (Vec<_>, Vec<_>) = emitted_subjects
+                .iter()
+                .partition(|(owner, _, _)| !reverted.contains(owner));
+            // ACCOUNTING: a reverted subject moves from emitted to
+            // degraded under its OWN reason key, so
+            // `emitted_final + degraded == row count` survives the loop.
+            for (_, subject, site) in &taken {
+                facts.degradations.push(decision::Degradation {
+                    subject: subject.clone(),
+                    site: site.clone(),
+                    reason: decision::DegradeReason::RevertedAfterVerifyFailure,
+                });
+            }
+            facts.emitted_count = kept.len();
+            facts.reverted_count = taken.len();
+            facts.files_touched = files.len();
+            return facts.emitted(source, files);
+        }
+
+        // DUAL TERMINATION, both arms. Neither alone: a no-progress
+        // detector can be starved by a loop that keeps finding new
+        // attributions, and a cap alone burns every round on a case
+        // that stopped improving after the first.
+        let outstanding = novel.len().max(novel_errors);
+        if previous_errors.is_some_and(|prev| outstanding >= prev) {
+            escalation = Some(format!(
+                "escalation-required: no progress ({} error(s) after \
+                 reverting {} function(s)) — attribution is wrong here \
+                 and (C) bisect must take over",
+                outstanding,
+                reverted.len()
+            ));
+            break;
+        }
+        previous_errors = Some(outstanding);
+        rounds += 1;
+        if rounds > max_rounds {
+            escalation = Some(format!(
+                "escalation-required: round cap {max_rounds} reached with \
+                 {} error(s) outstanding",
+                outstanding
+            ));
+            break;
+        }
+
+        let newly = attribute(
+            &novel,
+            &observed_root,
+            &facts.emitted_sites,
+            &planned_edit_sites,
+            &reverted,
+            crate_dir.as_deref().unwrap_or(std::path::Path::new("")),
+        )
+        .difference(&reverted)
+        .cloned()
+        .collect::<std::collections::BTreeSet<_>>();
+        if newly.is_empty() {
+            escalation = Some(format!(
+                "escalation-required: {} error(s) attributed to no rewritten \
+                 function",
+                outstanding
+            ));
+            break;
+        }
+        // BATCH revert: the union of this round's attributions, not one
+        // at a time — one compile per round rather than one per function.
+        reverted.extend(newly);
+        let (next_files, rollbacks) = render(&emission_plan, &emission_texts, &reverted);
+        if !rollbacks.is_empty() {
+            escalation = Some(format!(
+                "escalation-required: re-render rolled back {} edit(s)",
+                rollbacks.len()
+            ));
+            break;
+        }
+        files = next_files;
+    }
+
+    // ---- (C) BISECT: the escalation path ----
+    // Reaching here means the loop BROKE, and only the gate path can
+    // break: probe mode returns from inside it. So the baseline exists
+    // by construction — and it is asserted rather than defaulted,
+    // because a `Baseline::default()` fallback here would silently turn
+    // the differential into an absolute gate, which is the exact defect
+    // brotli's frozen source exposed in the first place.
+    let baseline = baseline.expect(
+        "the gate path computes a baseline on its first round; reaching \
+         the post-loop stages without one means the loop was exited by a \
+         path that skipped it",
+    );
+
+    let escalation = escalation.unwrap_or_else(|| "escalation-required".to_owned());
+    // Candidates come from the PLAN's `owner_fn` domain — the exact key
+    // `render` filters on — so `base ∪ candidates` drops EVERY edit and
+    // the base case (revert-all compiles) holds BY CONSTRUCTION.
+    //
+    // They were previously derived from `emitted_sites`, a DIFFERENT
+    // derivation: it skips a subject whose enclosing function's span has
+    // no editable file identity, while the edit is keyed on the
+    // subject's own `ty_span`. brotli found the divergence (2026-07-31):
+    // reverting every candidate left edits standing, the crate still
+    // failed, and bisect returned a non-compiling set. Two derivations
+    // assumed identical — the founding class.
+    let candidates: Vec<String> = emission_plan
+        .by_file
+        .values()
+        .flatten()
+        .map(|edit| edit.owner_fn.clone())
+        .filter(|owner| !reverted.contains(owner))
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect();
+
+    // ESCALATION BUDGET. A bisect that cannot finish inside the worker
+    // budget is DEFERRED LOUDLY with its attribution state, never
+    // silently truncated — a truncated bisect returns a wrong answer
+    // that looks like a right one.
+    let projected = (candidates.len() + 1).next_power_of_two().trailing_zeros() as f64;
+    let budget_secs = std::env::var("CRAT_BOC1_EMIT_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .unwrap_or(900.0);
+    if projected * probe_secs > budget_secs {
+        facts.files_touched = files.len();
+        facts.reverted_count = reverted.len();
+        facts.escalated = Some(escalation.clone());
+        return facts.degraded(format!(
+            "escalation-deferred: {escalation}; bisect needs ~{projected} probe(s)                          at ~{probe_secs:.1}s each against a {budget_secs:.0}s budget, with                          {} function(s) already reverted",
+            reverted.len()
+        ));
+    }
+
+    let (final_reverted, probes) = bisect(&candidates, &reverted, |trial| {
+        let (trial_files, rollbacks) = render(&emission_plan, &emission_texts, trial);
+        if !rollbacks.is_empty() {
+            return false;
+        }
+        let materialized = match tree_base {
+            Some(root) => verify::materialize(root, &trial_files),
+            None => verify::materialize_single_file(&root_text),
+        };
+        let Ok(staged) = materialized else {
+            return false;
+        };
+        let probe = verify::diagnose_crate(staged.root());
+        let probe_root = staged.root().parent().unwrap_or(staged.root());
+        baseline.novel(&probe.diags, probe_root).is_empty()
+            && probe.errors.saturating_sub(baseline.errors) == 0
+    });
+
+    let (final_files, rollbacks) = render(&emission_plan, &emission_texts, &final_reverted);
+    let materialized = match tree_base {
+        Some(root) => verify::materialize(root, &final_files),
+        None => verify::materialize_single_file(&root_text),
+    };
+    // INCIDENT-PROVEN DEFENSE — not a control over an unreachable case.
+    //
+    // `type_checks_crate` here can never be the thing that fails:
+    // `bisect` only ever assigns `hi` a `mid` it just tested true, so
+    // the returned `k` either compiled under test or equals
+    // `candidates.len()` — reverting every owner, which drops every
+    // edit and reduces the crate to the original input. The input
+    // compiled, or `decide_table` would not have produced a table.
+    // Non-monotonicity costs MINIMALITY, never correctness.
+    //
+    // `rollbacks` likewise cannot fire here: `render` applies a SUBSET
+    // of the edits that produced no rollbacks initially, and dropping
+    // edits cannot create an overlap, an out-of-bounds range, or a
+    // char-boundary violation.
+    //
+    // **This guard FIRED on brotli, 2026-07-31**, when `candidates` was
+    // derived from `emitted_sites` rather than from the plan's
+    // `owner_fn` domain: the two sets diverged, revert-all left edits
+    // standing, and bisect returned a set that did not compile. The
+    // derivation is fixed above; the guard stays because it is what
+    // turned a silently wrong emission into a loud `Degraded`.
+    //
+    // The `rollbacks` arm remains unreachable (a SUBSET of edits that
+    // produced no rollbacks cannot produce new ones); the reachable
+    // rollback path is the pre-loop structural gate, witnessed there.
+    match materialized {
+        Ok(staged)
+            if rollbacks.is_empty() && {
+                let final_diag = verify::diagnose_crate(staged.root());
+                let final_root = staged.root().parent().unwrap_or(staged.root());
+                baseline.novel(&final_diag.diags, final_root).is_empty()
+                    && final_diag.errors.saturating_sub(baseline.errors) == 0
+            } =>
+        {
+            let source = std::fs::read_to_string(staged.root()).unwrap_or_default();
+            let (kept, taken): (Vec<_>, Vec<_>) = emitted_subjects
+                .iter()
+                .partition(|(owner, _, _)| !final_reverted.contains(owner));
+            for (_, subject, site) in &taken {
+                facts.degradations.push(decision::Degradation {
+                    subject: subject.clone(),
+                    site: site.clone(),
+                    reason: decision::DegradeReason::RevertedAfterVerifyFailure,
+                });
+            }
+            facts.emitted_count = kept.len();
+            facts.reverted_count = taken.len();
+            facts.files_touched = final_files.len();
+            facts.bisect_probes = probes;
+            facts.escalated = Some(escalation);
+            facts.emitted(source, final_files)
+        }
+        _ => {
+            facts.files_touched = files.len();
+            facts.reverted_count = final_reverted.len();
+            facts.bisect_probes = probes;
+            facts.escalated = Some(escalation.clone());
+            facts.degraded(format!("{escalation}; bisect did not recover the crate"))
+        }
     }
 }
 
