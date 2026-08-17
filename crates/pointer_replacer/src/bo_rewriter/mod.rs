@@ -605,6 +605,7 @@ fn rewrite_core_injected(
         // names what the rewrite actually did to the source.
         Ok(verify_and_revert(
             tcx,
+            &capture,
             tree_base,
             virtual_original,
             max_rounds,
@@ -645,8 +646,72 @@ fn rewrite_core_injected(
 /// the PROOF is the acceptance gate's byte/digest reproduction of the pinned
 /// oracle verdicts.
 #[allow(clippy::too_many_arguments)]
+/// **Is the verify loop emitting through the AST layer?**
+///
+/// TRANSITIONAL, and it exists for one reason: the acceptance gate has to run
+/// BOTH layers over the frozen corpus and compare verdicts and counters against
+/// the pinned oracle. A swap with no switch could only be measured by breaking
+/// the corpus and reading the wreckage.
+///
+/// Default is the span layer, so every existing sweep, golden and pin keeps its
+/// meaning until the gate says otherwise. **M-3 deletes the span layer and this
+/// switch together** — it is not a permanent configuration surface.
+fn ast_emit_enabled() -> bool {
+    std::env::var_os("CRAT_M1_AST_EMIT").is_some()
+}
+
+/// **THE ROUND'S FILE SET — ONE derivation, BOTH call sites.**
+///
+/// The per-round re-render and the bisect probes must agree on which layer
+/// produced the program, because the bisect ATTRIBUTES diagnostics to functions:
+/// probing a span-layer program to explain a diagnostic observed on an AST-layer
+/// program compares against a program that was never verified. That is not a
+/// variant, it is a defect — so both sites call this and neither renders.
+///
+/// The AST path returns **no rollbacks**, and that is structural rather than
+/// optimistic: rollbacks are byte-offset collisions between edits applied to one
+/// text, and a structural transform has no byte offsets to collide. The callers'
+/// rollback branches are therefore unreachable on this path — recorded here
+/// because "the check never fires" and "the check cannot fire" read identically
+/// at the call site.
+#[allow(clippy::too_many_arguments)]
+fn round_files(
+    tcx: TyCtxt<'_>,
+    capture: &ast_transform::AstCapture,
+    emission_plan: &plan::Plan,
+    emission_texts: &std::collections::BTreeMap<plan::FileKey, String>,
+    reverted: &std::collections::BTreeSet<String>,
+    root_key: Option<&plan::FileKey>,
+) -> Result<
+    (
+        std::collections::BTreeMap<plan::FileKey, String>,
+        Vec<apply::Rollback>,
+    ),
+    String,
+> {
+    if !ast_emit_enabled() {
+        let (files, rollbacks) = render(emission_plan, emission_texts, reverted);
+        return Ok((files, rollbacks));
+    }
+    let reverts = ast_transform::revert_set_from_names(tcx, reverted)?;
+    let (source, _stats) = ast_transform::ast_emitted_source_from(tcx, capture, &reverts)?;
+    // **THE ONE-ENTRY MAP** — licensed by C-20's measurement, not by convenience:
+    // all 20 corpus programs are single crate-source file and emit-time
+    // `files_touched` never exceeds 1. If a program with two source files ever
+    // enters the corpus, this is the line that is wrong, and C-20 carries the
+    // revival tripwire that says so.
+    let files = match root_key {
+        Some(key) => std::iter::once((key.clone(), source)).collect(),
+        // Round 0 emitted nothing, so there is no file to re-emit into. Not an
+        // error: six corpus programs are in exactly this state.
+        None => std::collections::BTreeMap::new(),
+    };
+    Ok((files, Vec::new()))
+}
+
 fn verify_and_revert(
     tcx: TyCtxt<'_>,
+    capture: &ast_transform::AstCapture,
     tree_base: Option<&std::path::Path>,
     virtual_original: Option<String>,
     max_rounds: usize,
@@ -709,6 +774,9 @@ fn verify_and_revert(
     // drift apart across rounds — the divergence class that cost a
     // brotli sweep when `candidates` and `emitted_sites` were derived
     // two different ways.
+    // The round-0 emitted file — the key every later round re-emits into on the
+    // AST path. Taken from the map production already built, never re-derived.
+    let root_key: Option<plan::FileKey> = files.keys().next().cloned();
     let planned_edit_sites = edit_sites(&emission_plan, &emission_texts);
     let mut baseline: Option<verify::Baseline> = None;
     let mut facts = OutcomeFacts {
@@ -882,7 +950,20 @@ fn verify_and_revert(
         // BATCH revert: the union of this round's attributions, not one
         // at a time — one compile per round rather than one per function.
         reverted.extend(newly);
-        let (next_files, rollbacks) = render(&emission_plan, &emission_texts, &reverted);
+        let (next_files, rollbacks) = match round_files(
+            tcx,
+            capture,
+            &emission_plan,
+            &emission_texts,
+            &reverted,
+            root_key.as_ref(),
+        ) {
+            Ok(pair) => pair,
+            Err(why) => {
+                escalation = Some(format!("escalation-required: re-emit failed: {why}"));
+                break;
+            }
+        };
         if !rollbacks.is_empty() {
             escalation = Some(format!(
                 "escalation-required: re-render rolled back {} edit(s)",
@@ -948,7 +1029,16 @@ fn verify_and_revert(
     }
 
     let (final_reverted, probes) = bisect(&candidates, &reverted, |trial| {
-        let (trial_files, rollbacks) = render(&emission_plan, &emission_texts, trial);
+        let Ok((trial_files, rollbacks)) = round_files(
+            tcx,
+            capture,
+            &emission_plan,
+            &emission_texts,
+            trial,
+            root_key.as_ref(),
+        ) else {
+            return false;
+        };
         if !rollbacks.is_empty() {
             return false;
         }
