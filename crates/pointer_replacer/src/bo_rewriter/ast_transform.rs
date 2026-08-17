@@ -1376,14 +1376,58 @@ fn transform_inner(
     ),
     String,
 > {
+    let capture = capture_ast(tcx)?;
+    let (table, _ctx) = super::decide_table_with_ctx(tcx)?;
+    transform_with(&capture, &table, reverts)
+}
+
+/// **THE ONE AST CAPTURE PER SESSION** (M-2/A).
+///
+/// `expanded_ast` **panics once the HIR is built** — it clones a resolver that
+/// lowering has already consumed — and `make_ast_to_hir` builds the HIR. So this
+/// may be called **exactly once per compiler session, before any HIR/MIR
+/// query**, and the pristine krate it yields is the only one there will be.
+///
+/// That is why the verify/revert loop clones rather than re-captures: a second
+/// call is not expensive, it is a panic.
+pub(crate) struct AstCapture {
+    /// The pristine, untransformed crate. **Cloned per revert round**, never
+    /// mutated in place — the loop needs a fresh copy for each revert set, and
+    /// `rustc_ast::Crate: Clone` is what makes A possible at all.
+    pub krate: rustc_ast::Crate,
+    pub map: ::utils::ir::AstToHir,
+}
+
+pub(crate) fn capture_ast(tcx: rustc_middle::ty::TyCtxt<'_>) -> Result<AstCapture, String> {
     let captured = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let mut krate = ::utils::ast::expanded_ast(tcx);
         let map = ::utils::ast::make_ast_to_hir(&mut krate, tcx);
-        (krate, map)
+        AstCapture { krate, map }
     }));
-    let (mut krate, map) = captured.map_err(|_| "AST capture panicked".to_owned())?;
+    captured.map_err(|_| "AST capture panicked".to_owned())
+}
 
-    let (table, _ctx) = super::decide_table_with_ctx(tcx)?;
+/// One transform pass over a CLONE of the pristine capture, under one revert
+/// set. Called once per verify/revert round.
+fn transform_with(
+    capture: &AstCapture,
+    table: &super::decision::DecisionTable,
+    reverts: &RevertSet,
+) -> Result<
+    (
+        RefDeclStats,
+        UseGraftStats,
+        SeamGraftStats,
+        usize,
+        usize,
+        usize,
+        SeamUseSurface,
+        rustc_ast::Crate,
+    ),
+    String,
+> {
+    let mut krate = capture.krate.clone();
+    let map = &capture.map;
     let mut decisions: FxHashMap<(LocalDefId, HirId), (DeclForm, bool)> = FxHashMap::default();
     let mut uses: FxHashMap<(u32, u32), String> = FxHashMap::default();
     let mut use_key_collisions = 0usize;
