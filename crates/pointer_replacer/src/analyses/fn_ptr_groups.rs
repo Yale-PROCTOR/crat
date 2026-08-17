@@ -231,11 +231,19 @@ mod tests {
             let mut nullity_result = crate::analyses::nullity::analyze(&input, &points_to_result);
             nullity_result.non_null_locals =
                 source_var_groups.postprocess_non_null_locals(nullity_result.non_null_locals);
+            let fn_ptr_participants = crate::rewriter::collector::collect_fn_ptrs(&input);
             let cursor_demotion = crate::analyses::cursor_demotion::CursorDemotion::compute(
                 &input,
                 &offset_sign_result,
-                &crate::rewriter::collector::collect_fn_ptrs(&input),
+                &fn_ptr_participants,
             );
+            let cursor_construction =
+                crate::analyses::cursor_construction::CursorConstruction::compute(
+                    &input,
+                    &offset_sign_result,
+                    &fn_ptr_participants,
+                    &pre.alloc_fns,
+                );
             let analysis = crate::rewriter::Analysis {
                 borrow_promotion_result,
                 borrow_lifetime_flows,
@@ -250,6 +258,7 @@ mod tests {
                 nullity_result,
                 struct_copy_result,
                 cursor_demotion,
+                cursor_construction,
             };
             let groups = FnPtrGroups::build(&pre, &solutions, &input, &analysis);
             let named = named_fns(tcx);

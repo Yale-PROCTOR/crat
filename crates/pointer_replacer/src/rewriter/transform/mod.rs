@@ -16879,6 +16879,7 @@ mod tests {
         let points_to_solutions =
             points_to::andersen::analyze(&andersen_config, &pre_points_to, &tss, tcx);
         let aliases = super::super::find_param_aliases(&pre_points_to, &points_to_solutions, tcx);
+        let alloc_fns = pre_points_to.alloc_fns.clone();
         let points_to = points_to::andersen::post_analyze(
             &andersen_config,
             pre_points_to,
@@ -16915,10 +16916,17 @@ mod tests {
         let mut nullity_result = analyses::nullity::analyze(&input, &points_to);
         nullity_result.non_null_locals =
             source_var_groups.postprocess_non_null_locals(nullity_result.non_null_locals);
+        let fn_ptr_participants = super::super::collector::collect_fn_ptrs(&input);
         let cursor_demotion = analyses::cursor_demotion::CursorDemotion::compute(
             &input,
             &offset_sign_result,
-            &super::super::collector::collect_fn_ptrs(&input),
+            &fn_ptr_participants,
+        );
+        let cursor_construction = analyses::cursor_construction::CursorConstruction::compute(
+            &input,
+            &offset_sign_result,
+            &fn_ptr_participants,
+            &alloc_fns,
         );
         let analysis = super::super::Analysis {
             borrow_promotion_result,
@@ -16934,6 +16942,7 @@ mod tests {
             nullity_result,
             struct_copy_result,
             cursor_demotion,
+            cursor_construction,
         };
 
         (input, analysis)

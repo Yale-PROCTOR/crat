@@ -63,6 +63,7 @@ pub struct Analysis {
     pub(crate) nullity_result: analyses::nullity::NullityResult,
     pub(crate) struct_copy_result: StructCopyAnalysisResult,
     pub(crate) cursor_demotion: analyses::cursor_demotion::CursorDemotion,
+    pub(crate) cursor_construction: analyses::cursor_construction::CursorConstruction,
 }
 
 #[derive(Debug, Default, Clone, Deserialize)]
@@ -147,10 +148,17 @@ pub fn replace_local_borrows(config: &Config, tcx: TyCtxt<'_>) -> (String, Bytem
     let mut nullity_result = analyses::nullity::analyze(&input, &points_to);
     nullity_result.non_null_locals =
         source_var_groups.postprocess_non_null_locals(nullity_result.non_null_locals);
+    let fn_ptr_participants = collector::collect_fn_ptrs(&input);
     let cursor_demotion = analyses::cursor_demotion::CursorDemotion::compute(
         &input,
         &offset_sign_result,
-        &collector::collect_fn_ptrs(&input),
+        &fn_ptr_participants,
+    );
+    let cursor_construction = analyses::cursor_construction::CursorConstruction::compute(
+        &input,
+        &offset_sign_result,
+        &fn_ptr_participants,
+        &pre_points_to.alloc_fns,
     );
     let analysis_results = Analysis {
         borrow_promotion_result,
@@ -166,6 +174,7 @@ pub fn replace_local_borrows(config: &Config, tcx: TyCtxt<'_>) -> (String, Bytem
         nullity_result,
         struct_copy_result,
         cursor_demotion,
+        cursor_construction,
     };
 
     let fn_ptr_groups = FnPtrGroups::build(
