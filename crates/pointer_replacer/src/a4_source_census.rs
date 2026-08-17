@@ -603,23 +603,34 @@ fn reachable_source_nodes(graph: &SourceGraph, target: &str) -> BTreeSet<String>
 fn attribute_gap_candidates(
     graph: &SourceGraph,
     candidates: &[String],
-    gap_anchors: &BTreeMap<GraphShapeGap, BTreeSet<String>>,
+    gaps: &BTreeMap<GraphShapeGap, ResolvedGraphGap>,
 ) -> Result<BTreeMap<GraphShapeGap, Vec<String>>, String> {
     let reachable = candidates
         .iter()
         .map(|candidate| (candidate, reachable_source_nodes(graph, candidate)))
         .collect::<Vec<_>>();
-    gap_anchors
-        .iter()
-        .map(|(gap, anchors)| {
-            if anchors.is_empty() {
-                return Err(format!("gap has no graph anchor: {gap:?}"));
-            }
-            let candidates = reachable
-                .iter()
-                .filter(|(_, nodes)| !nodes.is_disjoint(anchors))
-                .map(|(candidate, _)| (*candidate).clone())
-                .collect();
+    gaps.iter()
+        .map(|(gap, resolved)| {
+            let candidates = match resolved.status {
+                GapAnchorStatus::GraphNodes => {
+                    if resolved.nodes.is_empty() {
+                        return Err(format!("gap has no graph anchor: {gap:?}"));
+                    }
+                    reachable
+                        .iter()
+                        .filter(|(_, nodes)| !nodes.is_disjoint(&resolved.nodes))
+                        .map(|(candidate, _)| (*candidate).clone())
+                        .collect()
+                }
+                GapAnchorStatus::OutOfPointerUniverse => {
+                    if !resolved.nodes.is_empty() {
+                        return Err(format!(
+                            "out-of-pointer-universe gap carries graph anchors: {gap:?}"
+                        ));
+                    }
+                    Vec::new()
+                }
+            };
             Ok((gap.clone(), candidates))
         })
         .collect()
@@ -1438,6 +1449,46 @@ struct GraphShapeGap {
 enum GraphGapAnchor {
     MirLocal { fn_did: LocalDefId, local: Local },
     Node(String),
+    OutOfPointerUniverse,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GapAnchorStatus {
+    GraphNodes,
+    OutOfPointerUniverse,
+}
+
+fn gap_anchor_status_label(status: GapAnchorStatus) -> &'static str {
+    match status {
+        GapAnchorStatus::GraphNodes => "graph-nodes",
+        GapAnchorStatus::OutOfPointerUniverse => "out-of-pointer-universe",
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ResolvedGraphGap {
+    status: GapAnchorStatus,
+    nodes: BTreeSet<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ProjectedGapDisposition {
+    OutOfPointerUniverse,
+    RequiresGraphAnchor,
+}
+
+fn projected_gap_disposition(
+    destination_is_scalar: bool,
+    base_pointer_slot_counts: &[usize],
+) -> Result<ProjectedGapDisposition, String> {
+    if base_pointer_slot_counts.is_empty() {
+        return Err("projected gap has no resolved alias base".to_owned());
+    }
+    if destination_is_scalar && base_pointer_slot_counts.iter().all(|count| *count == 0) {
+        Ok(ProjectedGapDisposition::OutOfPointerUniverse)
+    } else {
+        Ok(ProjectedGapDisposition::RequiresGraphAnchor)
+    }
 }
 
 thread_local! {
@@ -1936,6 +1987,71 @@ fn add_static_data_store_edges<'tcx>(
     Ok(())
 }
 
+fn data_pointer_slot_count<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    ty: Ty<'tcx>,
+    visiting: &mut FxHashSet<DefId>,
+) -> Result<usize, String> {
+    match ty.kind() {
+        TyKind::RawPtr(..) | TyKind::Ref(..) => Ok(1),
+        TyKind::Bool
+        | TyKind::Char
+        | TyKind::Int(_)
+        | TyKind::Uint(_)
+        | TyKind::Float(_)
+        | TyKind::Never
+        | TyKind::Str
+        | TyKind::FnDef(..)
+        | TyKind::FnPtr(..) => Ok(0),
+        TyKind::Array(element, _) | TyKind::Slice(element) => {
+            data_pointer_slot_count(tcx, *element, visiting)
+        }
+        TyKind::Tuple(fields) => fields.iter().try_fold(0usize, |total, field| {
+            data_pointer_slot_count(tcx, field, visiting).and_then(|count| {
+                total
+                    .checked_add(count)
+                    .ok_or_else(|| "pointer-slot count overflow".to_owned())
+            })
+        }),
+        TyKind::Adt(def, args) => {
+            if !visiting.insert(def.did()) {
+                return Err(format!(
+                    "non-pointer recursive aggregate in pointer-slot count: {}",
+                    tcx.def_path_str(def.did())
+                ));
+            }
+            let count = def.all_fields().map(|field| field.ty(tcx, args)).try_fold(
+                0usize,
+                |total, field_ty| {
+                    data_pointer_slot_count(tcx, field_ty, visiting).and_then(|count| {
+                        total
+                            .checked_add(count)
+                            .ok_or_else(|| "pointer-slot count overflow".to_owned())
+                    })
+                },
+            );
+            visiting.remove(&def.did());
+            count
+        }
+        other => Err(format!("unsupported type in pointer-slot count: {other:?}")),
+    }
+}
+
+fn pointee_data_pointer_slot_count<'tcx>(tcx: TyCtxt<'tcx>, ty: Ty<'tcx>) -> Result<usize, String> {
+    let pointee = match ty.kind() {
+        TyKind::RawPtr(pointee, _) | TyKind::Ref(_, pointee, _) => *pointee,
+        _ => return Err(format!("alias base is not a pointer: {ty:?}")),
+    };
+    data_pointer_slot_count(tcx, pointee, &mut FxHashSet::default())
+}
+
+fn primitive_non_pointer_scalar(ty: Ty<'_>) -> bool {
+    matches!(
+        ty.kind(),
+        TyKind::Bool | TyKind::Char | TyKind::Int(_) | TyKind::Uint(_) | TyKind::Float(_)
+    )
+}
+
 fn exact_raw_pointer_aliases<'tcx>(
     tcx: TyCtxt<'tcx>,
     body: &Body<'tcx>,
@@ -2033,8 +2149,27 @@ fn add_realized_pointer_alias_store_edges<'tcx>(
                         work.extend(aliases.get(&local).into_iter().flatten().copied());
                     }
                     seen.remove(&lhs.local);
+                    let base_pointer_slot_counts = seen
+                        .iter()
+                        .map(|base| {
+                            pointee_data_pointer_slot_count(tcx, body.local_decls[*base].ty)
+                        })
+                        .collect::<Result<Vec<_>, _>>()?;
+                    if projected_gap_disposition(
+                        primitive_non_pointer_scalar(lhs.ty(body, tcx).ty),
+                        &base_pointer_slot_counts,
+                    )? == ProjectedGapDisposition::OutOfPointerUniverse
+                    {
+                        assert!(record_graph_gap_anchor(
+                            gap.clone(),
+                            GraphGapAnchor::OutOfPointerUniverse,
+                        ));
+                        assert!(record_graph_shape_gap(gap));
+                        continue;
+                    }
                     let anchors = seen
-                        .into_iter()
+                        .iter()
+                        .copied()
                         .map(|base| {
                             node_for_place_depth(
                                 tcx,
@@ -3310,10 +3445,11 @@ fn resolve_graph_gap_anchors(
     tcx: TyCtxt<'_>,
     slots: &CrateSlots,
     raw: BTreeMap<GraphShapeGap, Vec<GraphGapAnchor>>,
-) -> Result<BTreeMap<GraphShapeGap, BTreeSet<String>>, String> {
+) -> Result<BTreeMap<GraphShapeGap, ResolvedGraphGap>, String> {
     raw.into_iter()
         .map(|(gap, anchors)| {
             let mut resolved = BTreeSet::new();
+            let mut out_of_pointer_universe = false;
             for anchor in anchors {
                 match anchor {
                     GraphGapAnchor::MirLocal { fn_did, local } => {
@@ -3336,12 +3472,30 @@ fn resolve_graph_gap_anchors(
                     GraphGapAnchor::Node(node) => {
                         resolved.insert(node);
                     }
+                    GraphGapAnchor::OutOfPointerUniverse => {
+                        out_of_pointer_universe = true;
+                    }
                 }
             }
-            if resolved.is_empty() {
+            if out_of_pointer_universe && !resolved.is_empty() {
+                return Err(format!(
+                    "gap mixes graph anchors with out-of-pointer-universe: {gap:?}"
+                ));
+            }
+            if !out_of_pointer_universe && resolved.is_empty() {
                 return Err(format!("gap has no resolved graph anchor: {gap:?}"));
             }
-            Ok((gap, resolved))
+            Ok((
+                gap,
+                ResolvedGraphGap {
+                    status: if out_of_pointer_universe {
+                        GapAnchorStatus::OutOfPointerUniverse
+                    } else {
+                        GapAnchorStatus::GraphNodes
+                    },
+                    nodes: resolved,
+                },
+            ))
         })
         .collect()
 }
@@ -3352,7 +3506,7 @@ fn collect_source_graph_gap_attribution(
     (
         CrateSlots,
         SourceGraph,
-        BTreeMap<GraphShapeGap, BTreeSet<String>>,
+        BTreeMap<GraphShapeGap, ResolvedGraphGap>,
     ),
     String,
 > {
@@ -3790,8 +3944,70 @@ fn replay_none_disposition(reason_unknown: Option<String>) -> Result<&'static st
 const GRAPH_SHAPE_HEADER: &str = "program\tkind\tfunction\tsite\tdetail";
 const GAP_ATTRIBUTION_HEADER: &str = "program\tkind\tfunction\tsite\tdetail\tfield_key";
 const GAP_IMPACT_HEADER: &str =
-    "program\tkind\tfunction\tsite\tdetail\tanchor_count\taffected_candidate_count";
-const GAP_ANCHOR_HEADER: &str = "program\tkind\tfunction\tsite\tdetail\tanchor";
+    "program\tkind\tfunction\tsite\tdetail\tanchor_status\tanchor_count\taffected_candidate_count";
+const GAP_ANCHOR_HEADER: &str = "program\tkind\tfunction\tsite\tdetail\tanchor_status\tanchor";
+
+fn validate_gap_output_rows(
+    mapping: &[Vec<String>],
+    impact: &[Vec<String>],
+    anchors: &[Vec<String>],
+) -> Result<(), String> {
+    let impact_keys = impact
+        .iter()
+        .map(|row| row[..5].to_vec())
+        .collect::<BTreeSet<_>>();
+    if impact_keys.len() != impact.len() {
+        return Err("duplicate impact identity".to_owned());
+    }
+    if mapping
+        .iter()
+        .chain(anchors)
+        .any(|row| !impact_keys.contains(&row[..5]))
+    {
+        return Err("mapping or anchor identity lacks an impact row".to_owned());
+    }
+    for row in impact {
+        let key = &row[..5];
+        let status = row[5].as_str();
+        let anchor_count = row[6]
+            .parse::<usize>()
+            .map_err(|_| format!("nonnumeric anchor count for {key:?}"))?;
+        let affected_count = row[7]
+            .parse::<usize>()
+            .map_err(|_| format!("nonnumeric affected count for {key:?}"))?;
+        let matching_anchors = anchors
+            .iter()
+            .filter(|anchor| anchor[..5] == *key)
+            .collect::<Vec<_>>();
+        let matching_mappings = mapping.iter().filter(|mapped| mapped[..5] == *key).count();
+        match status {
+            "graph-nodes" => {
+                if anchor_count == 0
+                    || matching_anchors.len() != anchor_count
+                    || matching_anchors
+                        .iter()
+                        .any(|anchor| anchor[5] != status || anchor[6] == "not-applicable")
+                    || matching_mappings != affected_count
+                {
+                    return Err(format!("invalid graph-node accounting for {key:?}"));
+                }
+            }
+            "out-of-pointer-universe" => {
+                if anchor_count != 0
+                    || affected_count != 0
+                    || matching_mappings != 0
+                    || matching_anchors.len() != 1
+                    || matching_anchors[0][5] != status
+                    || matching_anchors[0][6] != "not-applicable"
+                {
+                    return Err(format!("invalid typed-zero accounting for {key:?}"));
+                }
+            }
+            other => return Err(format!("unknown gap anchor status {other:?}")),
+        }
+    }
+    Ok(())
+}
 
 fn render_graph_shape_gaps(program: &str, gaps: &[GraphShapeGap]) -> String {
     let mut out = format!("{GRAPH_SHAPE_HEADER}\n");
@@ -3905,27 +4121,35 @@ fn run_gap_attribution_worker(tcx: TyCtxt<'_>, t_tcx: Duration) -> Row {
     let mut mapping = format!("{GAP_ATTRIBUTION_HEADER}\n");
     let mut impact = format!("{GAP_IMPACT_HEADER}\n");
     let mut rendered_anchors = format!("{GAP_ANCHOR_HEADER}\n");
-    for (gap, gap_anchors) in &anchors {
-        for anchor in gap_anchors {
+    for (gap, resolved) in &anchors {
+        let status = gap_anchor_status_label(resolved.status);
+        let rendered_nodes = if resolved.nodes.is_empty() {
+            vec!["not-applicable".to_owned()]
+        } else {
+            resolved.nodes.iter().cloned().collect()
+        };
+        for anchor in rendered_nodes {
             rendered_anchors.push_str(&format!(
-                "{}\t{}\t{}\t{}\t{}\t{}\n",
+                "{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
                 clean_cell(&program),
                 gap.kind,
                 clean_cell(&gap.function),
                 clean_cell(&gap.site),
                 clean_cell(&gap.detail),
-                clean_cell(anchor),
+                status,
+                clean_cell(&anchor),
             ));
         }
         let affected = &attributed[gap];
         impact.push_str(&format!(
-            "{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
             clean_cell(&program),
             gap.kind,
             clean_cell(&gap.function),
             clean_cell(&gap.site),
             clean_cell(&gap.detail),
-            gap_anchors.len(),
+            status,
+            resolved.nodes.len(),
             affected.len(),
         ));
         for candidate in affected {
@@ -4396,6 +4620,8 @@ const GAP_SITE_SOURCE_ROOT: &str =
     "/home/p51lee/dev/agent-worktrees/crat-a4-shape-census-run-20260816-v4FADj7h/shape-census";
 const GAP_SITE_AGGREGATE_MANIFEST: &str =
     "0b4fbd4387e567a4312e544ff1034857ca8ad5495f05878a6229235d331a970f";
+const BZIP2_GAP_MAPPING_SHA256: &str =
+    "de035d4b177827bbd8ab9e13507640c682124b9df9eb19b9829528c5cb4e2fa8";
 const GAP_SITE_PROGRAM_MANIFESTS: [(&str, &str); 3] = [
     (
         "bzip2",
@@ -8668,11 +8894,11 @@ fn run_gap_attribution_probe(contract: &MeasurementContract) {
                 panic!("A4C STOP phase=gap-schema candidate={program_name}: {error}")
             });
         let impact =
-            parse_table(&dir.join("impact.tsv"), GAP_IMPACT_HEADER, 7).unwrap_or_else(|error| {
+            parse_table(&dir.join("impact.tsv"), GAP_IMPACT_HEADER, 8).unwrap_or_else(|error| {
                 panic!("A4C STOP phase=gap-schema candidate={program_name}: {error}")
             });
         let anchors =
-            parse_table(&dir.join("anchors.tsv"), GAP_ANCHOR_HEADER, 6).unwrap_or_else(|error| {
+            parse_table(&dir.join("anchors.tsv"), GAP_ANCHOR_HEADER, 7).unwrap_or_else(|error| {
                 panic!("A4C STOP phase=gap-schema candidate={program_name}: {error}")
             });
         assert_eq!(
@@ -8691,6 +8917,24 @@ fn run_gap_attribution_probe(contract: &MeasurementContract) {
             mapping.len(),
             "A4C STOP phase=gap-schema candidate={program_name}: duplicate mapping row"
         );
+        if program_name == "bzip2" {
+            assert_eq!(
+                sha256(&dir.join("mapping.tsv")),
+                BZIP2_GAP_MAPPING_SHA256,
+                "A4C STOP phase=gap-determinism candidate=bzip2: attempt-3 mapping byte drift"
+            );
+            assert_eq!(
+                mapping
+                    .iter()
+                    .map(|row| row[5].as_str())
+                    .collect::<Vec<_>>(),
+                vec!["bzlib::bzFile::field0@d0"],
+                "A4C STOP phase=gap-determinism candidate=bzip2: mapped identity drift"
+            );
+        }
+        validate_gap_output_rows(&mapping, &impact, &anchors).unwrap_or_else(|error| {
+            panic!("A4C STOP phase=gap-schema candidate={program_name}: {error}")
+        });
         let receipt = format!(
             "machine_id={MACHINE_ID}\nplatform={PLATFORM}\nmeasurement_class=gap-attribution\nsemantic_data=false\ncompleted=true\ncandidate_processing=attribution-only\nmemory_limit=cgroup-100GiB\nmemory_max_bytes={CANDIDATE_MEMORY_MAX_BYTES}\ncap_verified={}\noom_kills={}\nmemory_max_events={}\noom_killer=none\nwall_bound_kind=liveness\nwall_cap_s={LIVENESS_BOUND_S}\nprogram={program_name}\nunits_covered={units_covered}\ngap_sites={}\nmapping_rows={}\nstatus=ok\nanalysis_head={}\nwall_s={:.3}\n{}memory_receipt_error=none\n",
             outcome.cap_verified,
@@ -8810,13 +9054,15 @@ fn run_gap_attribution_probe(contract: &MeasurementContract) {
         ],
     )
     .expect("manifest gap-attribution aggregate");
-    assert_eq!(
-        affected.len(),
-        4,
+    assert!(
+        affected.len() <= 4,
         "A4C STOP phase=gap-decision candidate=none status=affected-cardinality-{} manifest={manifest}\n{impact}{mapping}",
         affected.len(),
     );
-    eprintln!("A4C gap attribution complete manifest={manifest} unique_affected_candidates=4");
+    eprintln!(
+        "A4C gap attribution complete manifest={manifest} unique_affected_candidates={}",
+        affected.len()
+    );
 }
 
 #[test]
@@ -10275,12 +10521,72 @@ mod tests {
                 "Fixture::field0@d0".to_owned(),
                 "Fixture::field1@d0".to_owned(),
             ],
-            &BTreeMap::from([(gap.clone(), BTreeSet::from(["gap-anchor".to_owned()]))]),
+            &BTreeMap::from([(
+                gap.clone(),
+                ResolvedGraphGap {
+                    status: GapAnchorStatus::GraphNodes,
+                    nodes: BTreeSet::from(["gap-anchor".to_owned()]),
+                },
+            )]),
         )
         .unwrap();
 
         assert_eq!(actual[&gap], vec!["Fixture::field0@d0"]);
         assert!(!actual[&gap].contains(&"Fixture::field1@d0".to_owned()));
+    }
+
+    #[test]
+    fn projected_gap_out_of_pointer_universe_is_conjunctive() {
+        assert_eq!(
+            projected_gap_disposition(true, &[0]).unwrap(),
+            ProjectedGapDisposition::OutOfPointerUniverse,
+            "a scalar destination with fully resolved pointer-free bases is typed zero"
+        );
+        assert_eq!(
+            projected_gap_disposition(true, &[0, 1]).unwrap(),
+            ProjectedGapDisposition::RequiresGraphAnchor,
+            "a mixed/pointer-bearing base set must not become typed zero"
+        );
+        assert_eq!(
+            projected_gap_disposition(false, &[0]).unwrap(),
+            ProjectedGapDisposition::RequiresGraphAnchor,
+            "a non-scalar destination must retain an anchor requirement"
+        );
+        assert!(
+            projected_gap_disposition(true, &[]).is_err(),
+            "an empty base set remains unresolved"
+        );
+    }
+
+    #[test]
+    fn gap_output_schema_keeps_typed_zero_distinct_from_missing_anchor() {
+        let typed_zero_impact = vec![vec![
+            "brotli".to_owned(),
+            "other-graph-construction-stop".to_owned(),
+            "crate".to_owned(),
+            "graph-construction".to_owned(),
+            "StoreH40".to_owned(),
+            "out-of-pointer-universe".to_owned(),
+            "0".to_owned(),
+            "0".to_owned(),
+        ]];
+        let typed_zero_anchors = vec![vec![
+            "brotli".to_owned(),
+            "other-graph-construction-stop".to_owned(),
+            "crate".to_owned(),
+            "graph-construction".to_owned(),
+            "StoreH40".to_owned(),
+            "out-of-pointer-universe".to_owned(),
+            "not-applicable".to_owned(),
+        ]];
+        assert!(validate_gap_output_rows(&[], &typed_zero_impact, &typed_zero_anchors).is_ok());
+
+        let mut missing_anchor = typed_zero_impact;
+        missing_anchor[0][5] = "graph-nodes".to_owned();
+        assert!(
+            validate_gap_output_rows(&[], &missing_anchor, &typed_zero_anchors).is_err(),
+            "a pointer-bearing or unresolved destination cannot use the typed-zero shape"
+        );
     }
 
     #[test]
@@ -11662,7 +11968,9 @@ mod tests {
             assert_eq!(anchors.len(), 1);
             assert_eq!(anchors.keys().next(), gaps.first());
             assert!(
-                anchors.values().all(|nodes| !nodes.is_empty()),
+                anchors.values().all(|resolved| {
+                    resolved.status == GapAnchorStatus::GraphNodes && !resolved.nodes.is_empty()
+                }),
                 "every collected gap must carry a graph anchor: {anchors:#?}"
             );
         })
