@@ -10,3 +10,5 @@ f128 = "0.2"
 num-traits = "0.2"
 tempfile = "3.19"
 bytemuck = { version = "1.24.0", features = ["derive", "min_const_generics", "must_cast"] }
+xj_scanf = "0.2.6"
+proctor-libc = "0.1.0"
