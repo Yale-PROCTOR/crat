@@ -1,5 +1,6 @@
 pub mod array_local_provenance;
 pub mod borrow;
+pub mod cursor_demotion;
 mod encoding;
 pub mod fn_ptr_groups;
 pub mod fn_ptr_rewrite_decision;
