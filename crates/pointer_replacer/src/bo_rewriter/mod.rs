@@ -274,6 +274,61 @@ pub(crate) fn ast_emitted_source_of(input: &str) -> Result<String, String> {
     }
 }
 
+/// **W1's entry — the AST layer emitting under a NON-EMPTY revert set.**
+///
+/// Every cross-layer witness before this one ran with `RevertSet::default()`, a
+/// gap registered at the fabrication close. The loop this layer is being wired
+/// into reverts on every round but the first, so *"does the AST layer honour a
+/// revert set"* is the swap's precondition — and it could not be settled by
+/// reading, because the comment that answered it was stale.
+///
+/// ⚠ **ORDER IS LOAD-BEARING, and it is the loop's order too.** `capture_ast`
+/// must run before anything touches HIR; `oracle_reverts` queries
+/// `hir_body_owners`. Capture first, resolve second, emit third.
+///
+/// `reverts_text` is the oracle's own format (`{fn_path}::{param}#{mir_local}`,
+/// one per line) parsed by the production resolver — not a test-only shortcut,
+/// so this exercises revert RESOLUTION as well as revert honouring.
+#[cfg(test)]
+pub(crate) fn ast_emitted_source_of_reverting(
+    input: &str,
+    reverts_text: &str,
+) -> Result<String, String> {
+    match ::utils::compilation::run_compiler_on_input(
+        ::utils::compilation::str_to_input(input),
+        |tcx| {
+            let capture = ast_transform::capture_ast(tcx)?;
+            let reverts = ast_transform::oracle_reverts(tcx, reverts_text, "w1-fixture")?;
+            ast_transform::ast_emitted_source_from(tcx, &capture, &reverts)
+                .map(|(source, _stats)| source)
+        },
+    ) {
+        Ok(inner) => inner,
+        Err(why) => Err(format!("{why:?}")),
+    }
+}
+
+/// **The one-capture-per-session fact, as an entry a test can call twice.**
+///
+/// Returns `(first, second)` outcomes of `capture_ast` in ONE session. The
+/// loop's design rests on this: it captures once and re-emits per round, and
+/// the reason is that the second capture cannot work, not that re-capturing
+/// would be slow.
+#[cfg(test)]
+pub(crate) fn two_captures_in_one_session(input: &str) -> Result<(bool, bool), String> {
+    match ::utils::compilation::run_compiler_on_input(
+        ::utils::compilation::str_to_input(input),
+        |tcx| {
+            let first = ast_transform::capture_ast(tcx).is_ok();
+            let second = ast_transform::capture_ast(tcx).is_ok();
+            Ok((first, second))
+        },
+    ) {
+        Ok(inner) => inner,
+        Err(why) => Err(format!("{why:?}")),
+    }
+}
+
 /// M1's **general** entry point: a crate rooted at `root`, rewritten into a temp
 /// copy and gated there.
 #[allow(

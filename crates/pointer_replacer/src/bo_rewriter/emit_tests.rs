@@ -4474,6 +4474,78 @@ fn render_outside_a_compiler_session_still_delivers_the_const() {
 ///
 /// *Mutation-tested:* the M-F7 mutation that survived the whole suite fails
 /// here.
+/// **W1 — the AST layer HONOURS a non-empty revert set.**
+///
+/// The standing gap, registered at the fabrication close: *"every existing
+/// cross-layer witness runs with an empty revert set."* The verify/revert loop
+/// reverts on every round but the first, so an emitter that ignored its revert
+/// set would re-convert exactly the functions the previous round took back —
+/// silently, and the loop would never converge.
+///
+/// **Reading could not settle this.** The comment in `ast_emitted_source` said
+/// `transform_inner` "builds its visitors with an explicitly EMPTY revert set";
+/// it had been false since M-2/A task 1 threaded `reverts` through. This test is
+/// the empirical answer.
+///
+/// *Mutation-tested* (M-W1-a): drop `reverted_fns` from the decl visitor's
+/// construction, or pass `&RevertSet::default()` to `transform_with`, and the
+/// `revert_me` half fails — the reverted function converts.
+#[test]
+fn a_reverted_fn_keeps_its_raw_declaration() {
+    const SRC: &str = "#![allow(dead_code, unused_unsafe, unused_mut, unused_variables)]\n\
+                       pub unsafe fn keep_me(p: *mut i32) -> i32 { *p }\n\
+                       pub unsafe fn revert_me(q: *mut i32) -> i32 { *q }\n";
+
+    // Both convert with an EMPTY revert set — the control that makes the
+    // reverted half non-vacuous. Without it, "revert_me stayed raw" would be
+    // satisfied by a fixture that never converted at all.
+    let none = super::ast_emitted_source_of(SRC).expect("the AST layer emits");
+    assert!(
+        !none.contains("p: *mut i32") && !none.contains("q: *mut i32"),
+        "CONTROL: both params must convert under an empty revert set, or the \
+         reverted half below proves nothing:\n{none}"
+    );
+
+    // Now revert exactly one of them.
+    let one = super::ast_emitted_source_of_reverting(SRC, "revert_me::q#1")
+        .expect("the AST layer emits under a revert set");
+    assert!(
+        one.contains("q: *mut i32"),
+        "REVERTED: `revert_me` must keep its raw declaration — an emitter that \
+         ignores its revert set re-converts what the previous round took \
+         back:\n{one}"
+    );
+    assert!(
+        !one.contains("p: *mut i32"),
+        "KEPT: `keep_me` must still convert — reverting one function may not \
+         revert the crate:\n{one}"
+    );
+}
+
+/// **The one-capture-per-session fact, measured rather than cited.**
+///
+/// `ast_emitted_source` captures on every call, so a loop calling it per round
+/// would fail on round 2. That is why the loop uses
+/// `ast_emitted_source_from` against a single round-0 capture — a design
+/// constraint, not a performance choice.
+///
+/// *Mutation-tested* (M-W1-b): make `capture_ast` memoize and return the same
+/// capture twice and this fails, which is the point — a memoizing capture would
+/// make the split look unnecessary while quietly handing out a krate whose
+/// resolver is already consumed.
+#[test]
+fn a_second_capture_in_one_session_fails() {
+    const SRC: &str = "#![allow(dead_code)]\npub unsafe fn f(p: *mut i32) -> i32 { *p }\n";
+    let (first, second) = super::two_captures_in_one_session(SRC).expect("session runs");
+    assert!(first, "the FIRST capture must succeed, or the second proves nothing");
+    assert!(
+        !second,
+        "a SECOND capture in one session must fail — the loop's one-capture \
+         design rests on this, and if it ever starts succeeding the split in \
+         `ast_emitted_source_from` needs re-justifying, not deleting"
+    );
+}
+
 #[test]
 fn both_layers_emit_the_fabricated_const() {
     const SRC: &str = "#![allow(dead_code, unused_unsafe, unused_mut, unused_variables)]\n\

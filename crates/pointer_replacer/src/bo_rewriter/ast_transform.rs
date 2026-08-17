@@ -1611,28 +1611,54 @@ fn transform_with(
 /// — `transform_inner`, unchanged — and hands the transformed krate to the same
 /// printer `substituted_source` uses, so the emitted text differs from the
 /// substrate in exactly the functions the transforms touched.
+/// **ONE-SHOT.** Captures, then emits. Correct for a caller that emits once
+/// (the string entry, the parity gates). **A verify/revert loop must NOT use
+/// it** — see [`ast_emitted_source_from`] for why a second call cannot work.
 pub(crate) fn ast_emitted_source(
     tcx: rustc_middle::ty::TyCtxt<'_>,
     reverts: &RevertSet,
 ) -> Result<(String, super::ast_bridge::SubstStats), String> {
-    let (_, _, seams, _, _, _, _, krate) = transform_inner(tcx, reverts)?;
+    let capture = capture_ast(tcx)?;
+    ast_emitted_source_from(tcx, &capture, reverts)
+}
+
+/// **THE LOOP'S ENTRY — emit round N from the round-0 capture.**
+///
+/// `capture_ast` may succeed **at most once per session**: `expanded_ast`
+/// panics once the HIR is built, and the capture itself builds it
+/// (`make_ast_to_hir`). So a verify/revert loop cannot re-capture per round —
+/// it captures once, before any HIR query, and re-emits from that pristine
+/// capture under each round's revert set. `transform_with` already transforms a
+/// CLONE, so the capture stays reusable.
+///
+/// This split is not a convenience: calling [`ast_emitted_source`] twice in one
+/// session returns `Err("AST capture panicked")` on the second call, witnessed
+/// at `a_second_capture_in_one_session_fails`.
+pub(crate) fn ast_emitted_source_from(
+    tcx: rustc_middle::ty::TyCtxt<'_>,
+    capture: &AstCapture,
+    reverts: &RevertSet,
+) -> Result<(String, super::ast_bridge::SubstStats), String> {
+    let (table, _ctx) = super::decide_table_with_ctx(tcx)?;
+    let (_, _, seams, _, _, _, _, krate) = transform_with(capture, &table, reverts)?;
     let (mut source, stats) = super::ast_bridge::splice_fn_prints(tcx, &krate);
     // **The fabricated-extent const** (marker ruling, 2026-08-15): emitted when
     // this layer PLACED at least one fabricated adapter.
     //
-    // ⚠ **This is NOT the span layer's condition, and the comment here used to
-    // claim it was** — "the seam pass only grafts adapters whose owner the
-    // revert set kept". False, and flagged independently by both boundary
-    // reviews. `transform_inner` builds its visitors with an explicitly EMPTY
-    // revert set, and `ast_emitted_source_of` is documented as running no verify
-    // loop and no revert rounds. So this layer's condition is *placed*, and the
-    // span layer's is *survived*.
+    // ⚠ **This is NOT the span layer's condition.** The span layer's is
+    // *survived*; this one is *placed*.
     //
-    // They coincide on every current fixture only because none reverts a
-    // fabricated callee. That is the **already-accepted scope limit** — the AST
-    // layer emits a pre-revert program — not a new divergence, and the two
-    // cross-layer witnesses would fail loudly rather than silently if it were.
-    // Recorded here so the next reader does not inherit the equivalence claim.
+    // ⚠⚠ **The previous text here was STALE and is corrected (M-2/A task 3,
+    // 2026-08-18).** It read: *"`transform_inner` builds its visitors with an
+    // explicitly EMPTY revert set."* That was true before M-2/A task 1 threaded
+    // `reverts` through; it has been false since. The revert set IS honoured —
+    // at `reverted_fns` in the decl arm and at `filtered_inputs` for the use and
+    // seam arms — and `a_reverted_fn_keeps_its_raw_declaration` witnesses it.
+    //
+    // What survives of the old note is only the narrow part: the two conditions
+    // still coincide on every current fixture because none reverts a fabricated
+    // callee, so `len_fabricated > 0` has not yet been observed to disagree with
+    // survival. That is an unexercised case, NOT an established equivalence.
     //
     // Appended, matching `render`'s end-of-file insertion: the spliced output
     // replaces function spans in place, so appending here and inserting at
