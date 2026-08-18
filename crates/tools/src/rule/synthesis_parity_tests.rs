@@ -161,6 +161,7 @@ fn with_context(
 fn document(observations: Vec<Observation>) -> ObservationDocument {
     ObservationDocument {
         schema_version: OBSERVATION_SCHEMA_VERSION,
+        printf_observations: vec![],
         observations,
     }
 }
@@ -805,6 +806,7 @@ fn target_context_may_introduce_a_dormant_intrinsic_identity() {
     ));
     let document = RuleDocument {
         schema_version: RULE_SCHEMA_VERSION,
+        printf_rules: vec![],
         rules: vec![rule],
     };
     assert_eq!(
@@ -1742,7 +1744,11 @@ fn recursive_input_json_member_order_does_not_change_canonical_output() {
         None,
         None,
     );
-    let ordinary = json!({"schema_version": 1, "observations": [left, right]});
+    let ordinary = json!({
+        "schema_version": 1,
+        "observations": [left, right],
+        "printf_observations": []
+    });
     let reversed = reverse_json_object_members(&ordinary);
     let ordinary = observation_document_from_json(&ordinary.to_string()).unwrap();
     let reversed = observation_document_from_json(&reversed.to_string()).unwrap();

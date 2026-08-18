@@ -1,5 +1,13 @@
 use serde::{Deserialize, Serialize};
 
+fn deserialize_required_option<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(deserializer)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SkeletonView {
@@ -14,6 +22,23 @@ impl SkeletonView {
         fn visit(nodes: &[StatementDisposition], labels: &mut Vec<u32>) {
             for node in nodes {
                 if node.disposition == StatementDispositionKind::Transform {
+                    labels.push(node.label);
+                }
+                visit(&node.children, labels);
+            }
+        }
+        let mut labels = vec![];
+        visit(&self.statement_dispositions, &mut labels);
+        labels
+    }
+
+    pub fn report_labels(&self) -> Vec<u32> {
+        fn visit(nodes: &[StatementDisposition], labels: &mut Vec<u32>) {
+            for node in nodes {
+                if matches!(
+                    node.disposition,
+                    StatementDispositionKind::Transform | StatementDispositionKind::Mechanical
+                ) {
                     labels.push(node.label);
                 }
                 visit(&node.children, labels);
@@ -49,6 +74,7 @@ pub enum StatementDispositionKind {
     PreserveShell,
     Transform,
     RuleApplied,
+    Mechanical,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -56,8 +82,17 @@ pub enum StatementDispositionKind {
 pub struct StatementPairMetadata {
     pub label: u32,
     pub before_statement: String,
+    #[serde(deserialize_with = "deserialize_required_option")]
+    pub printf_template: Option<PrintfTemplateMetadata>,
     pub pointer_variables_complete: bool,
     pub pointer_variables: Vec<PointerVariableMetadata>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PrintfTemplateMetadata {
+    pub rust_format: String,
+    pub argument_count: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]

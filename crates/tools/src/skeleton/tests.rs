@@ -66,6 +66,749 @@ fn generate(source: &str) -> Vec<ItemRecord> {
     run_compiler_on_str(source, |tcx| make_skeletons(source, tcx).unwrap()).unwrap()
 }
 
+fn synthesized_printf_rules(
+    format_specifier: &str,
+    source_expression: crate::Expression,
+    target_expression: crate::Expression,
+    pointer_anchors: Vec<crate::PointerAnchor>,
+    source_type: crate::TypeTree,
+) -> crate::RuleDocument {
+    let observation = crate::PrintfObservation {
+        format_specifier: format_specifier.to_owned(),
+        source_expression,
+        target_expression,
+        pointer_anchors,
+        source_adjusted_type: source_type.clone(),
+        source_type,
+    };
+    let document = crate::ObservationDocument {
+        schema_version: crate::OBSERVATION_SCHEMA_VERSION,
+        observations: vec![],
+        printf_observations: vec![observation],
+    };
+    crate::synthesize_rules(&[document.clone(), document]).unwrap()
+}
+
+fn apply_printf_rules_to_third(
+    source: &str,
+    target: &str,
+    rules: &crate::RuleDocument,
+    target_binding_type: Option<(&str, crate::TypeTree)>,
+) -> String {
+    crate::LoadedRuleSet::new(rules).expect("synthesized printf rules must validate");
+    run_compiler_on_str(source, |tcx| {
+        let mut surface = utils::ast::parse_crate(source.to_owned());
+        let mut mapper = utils::ir::AstToHirMapper::new(tcx);
+        mapper.map_crate_to_mod(&mut surface, tcx.hir_root_module(), false);
+        let function = local_def("third", tcx);
+        let decisions = tools_pointer_decisions(tcx);
+        let mut source_item = surface
+            .items
+            .iter()
+            .find(|item| {
+                item.kind
+                    .ident()
+                    .is_some_and(|ident| ident.name.as_str() == "third")
+            })
+            .unwrap()
+            .clone();
+        annotate_function(&mut source_item, &FxHashSet::default());
+
+        let mut target_item = utils::ast::parse_crate(target.to_owned())
+            .items
+            .into_iter()
+            .next()
+            .unwrap();
+        let type_speller = TypeSpeller::new(function, &mapper.ast_to_hir, tcx);
+        let applied = if let Some((name, target_type)) = target_binding_type {
+            apply_rule_set_with_test_binding_catalog(
+                &source_item,
+                &mut target_item,
+                &BTreeSet::from([0]),
+                rules,
+                function,
+                &decisions,
+                &mapper.ast_to_hir,
+                &type_speller,
+                HashMap::from([(local_binding_hir_id(function, name, tcx), target_type)]),
+                tcx,
+            )
+        } else {
+            apply_rule_set(
+                &source_item,
+                &mut target_item,
+                &BTreeSet::from([0]),
+                rules,
+                function,
+                &decisions,
+                &mapper.ast_to_hir,
+                &type_speller,
+                tcx,
+            )
+        }
+        .unwrap();
+        assert_eq!(applied, BTreeSet::from([0]));
+        pprust::item_to_string(&target_item)
+    })
+    .unwrap()
+}
+
+fn installed_candidate_type_checks(candidate: &str) -> bool {
+    let candidate = candidate.replace("#[proctor(0)]\n", "");
+    run_compiler_on_str(&candidate, utils::type_check).is_ok()
+}
+
+#[test]
+fn supported_printf_builds_mechanical_and_rule_complete_views() {
+    let no_arguments = r#"
+unsafe extern "C" { fn printf(format: *const i8, ...) -> i32; }
+pub unsafe fn message() { printf(b"hello %%\n\0" as *const u8 as *const i8); }
+"#;
+    let records = generate(no_arguments);
+    let record = function(&records, "message");
+    assert_eq!(record.baseline.skeleton, record.applied.skeleton);
+    assert!(
+        record
+            .baseline
+            .skeleton
+            .contains("::std::print!(\"hello %\\n\");")
+    );
+    assert!(!record.baseline.needs_transformation);
+    assert_eq!(
+        record.baseline.statement_dispositions[0].disposition,
+        crate::StatementDispositionKind::Mechanical
+    );
+    assert_eq!(record.baseline.statement_pair_metadata[0].label, 0);
+    assert_eq!(
+        record.baseline.statement_pair_metadata[0].printf_template,
+        Some(crate::PrintfTemplateMetadata {
+            rust_format: "hello %\n".into(),
+            argument_count: 0,
+        })
+    );
+    assert_eq!(
+        record.applied.statement_pair_metadata[0].printf_template,
+        record.baseline.statement_pair_metadata[0].printf_template
+    );
+
+    let one_argument = r#"
+unsafe extern "C" { fn printf(format: *const i8, ...) -> i32; }
+pub unsafe fn value(x: i32) { printf(b"%d\0" as *const u8 as *const i8, x); }
+"#;
+    let binding = crate::RuleExpression::Path {
+        value: crate::RuleValueIdentity::Variable {
+            sort: crate::VariableSort::Binding,
+            index: 0,
+        },
+    };
+    let i32_type = crate::TypeTree::Primitive { name: "i32".into() };
+    let rules = crate::RuleDocument {
+        schema_version: crate::RULE_SCHEMA_VERSION,
+        rules: vec![],
+        printf_rules: vec![crate::PrintfRule {
+            format_specifier: "%d".into(),
+            source_pattern: binding.clone(),
+            target_pattern: binding,
+            pointer_anchors: vec![],
+            source_type: i32_type.clone(),
+            source_adjusted_type: i32_type,
+        }],
+    };
+    run_compiler_on_str(one_argument, |tcx| {
+        let records = make_skeletons_with_rules(one_argument, Some(&rules), tcx).unwrap();
+        let record = function(&records, "value");
+        assert!(
+            record
+                .baseline
+                .skeleton
+                .contains("::std::print!(\"{}\", todo!());")
+        );
+        assert!(
+            record
+                .applied
+                .skeleton
+                .contains("::std::print!(\"{}\", x);")
+        );
+        assert_eq!(
+            record.baseline.statement_dispositions[0].disposition,
+            crate::StatementDispositionKind::Transform
+        );
+        assert_eq!(
+            record.baseline.statement_pair_metadata[0].printf_template,
+            Some(crate::PrintfTemplateMetadata {
+                rust_format: "{}".into(),
+                argument_count: 1,
+            })
+        );
+        assert_eq!(
+            record.applied.statement_dispositions[0].disposition,
+            crate::StatementDispositionKind::RuleApplied
+        );
+        assert_eq!(
+            record.baseline.statement_pair_metadata[0].printf_template,
+            Some(crate::PrintfTemplateMetadata {
+                rust_format: "{}".into(),
+                argument_count: 1,
+            })
+        );
+    })
+    .unwrap();
+}
+
+#[test]
+fn printf_identity_literal_and_statement_eligibility_is_conservative() {
+    let source = r#"
+unsafe extern "C" {
+    #[link_name = "printf"] fn c_print(format: *const i8, ...) -> i32;
+    #[link_name = "different"] fn printf(format: *const i8, ...) -> i32;
+}
+
+static FORMAT: &[u8] = b"%d\0";
+pub unsafe fn canonical(x: i32) { c_print(b"%d\0" as *const u8 as *const i8, x); }
+pub unsafe fn parenthesized(x: i32) { ((c_print((b"%d\0" as *const u8 as *const i8), x))); }
+pub unsafe fn wrong_symbol(x: i32) { printf(b"%d\0" as *const u8 as *const i8, x); }
+pub unsafe fn missing_nul(x: i32) { c_print(b"%d" as *const u8 as *const i8, x); }
+pub unsafe fn interior_nul(x: i32) { c_print(b"%d\0\0" as *const u8 as *const i8, x); }
+pub unsafe fn mutable_cast(x: i32) { c_print(b"%d\0" as *const u8 as *mut u8 as *const i8, x); }
+pub unsafe fn wrong_cast(x: i32) { c_print(b"%d\0" as *const u8 as *const u16 as *const i8, x); }
+pub unsafe fn nonliteral(x: i32) { c_print(FORMAT.as_ptr() as *const i8, x); }
+pub unsafe fn count_mismatch(x: i32) { c_print(b"%d %i\0" as *const u8 as *const i8, x); }
+pub unsafe fn unsupported(x: i32) { c_print(b"%*d\0" as *const u8 as *const i8, 4, x); }
+pub unsafe fn return_used(x: i32) -> i32 { return c_print(b"%d\0" as *const u8 as *const i8, x); }
+"#;
+    let records = generate(source);
+    for name in ["canonical", "parenthesized"] {
+        let record = function(&records, name);
+        assert!(record.baseline.skeleton.contains("::std::print!"), "{name}");
+        assert_eq!(
+            record.baseline.statement_dispositions[0].disposition,
+            crate::StatementDispositionKind::Transform
+        );
+    }
+    for name in [
+        "wrong_symbol",
+        "missing_nul",
+        "interior_nul",
+        "mutable_cast",
+        "wrong_cast",
+        "nonliteral",
+        "count_mismatch",
+        "unsupported",
+        "return_used",
+    ] {
+        let record = function(&records, name);
+        assert!(
+            !record.baseline.skeleton.contains("::std::print!"),
+            "{name}"
+        );
+        assert!(record.baseline.skeleton.contains("todo!()"), "{name}");
+        assert_eq!(
+            record.baseline.statement_pair_metadata[0].printf_template,
+            None
+        );
+    }
+}
+
+#[test]
+fn printf_statement_literal_cast_count_and_family_boundaries_are_exhaustive() {
+    let source = r#"
+unsafe extern "C" {
+    fn printf(format: *const i8, ...) -> i32;
+    fn fprintf(stream: *mut u8, format: *const i8, ...) -> i32;
+    fn sprintf(dst: *mut i8, format: *const i8, ...) -> i32;
+    fn snprintf(dst: *mut i8, size: usize, format: *const i8, ...) -> i32;
+    fn vprintf(format: *const i8, args: *mut u8) -> i32;
+    fn wprintf(format: *const u16, ...) -> i32;
+}
+static FORMAT: &[u8] = b"%d\0";
+unsafe fn format_result() -> *const i8 { b"%d\0".as_ptr() as *const i8 }
+unsafe fn sink(_: i32) {}
+pub unsafe fn qualified(x: i32) { self::printf(b"%d\0" as *const u8 as *const i8, x); }
+pub unsafe fn typical(x: ::core::ffi::c_int) {
+    printf(
+        b"%d!\n\0" as *const u8 as *const ::core::ffi::c_char,
+        x as ::core::ffi::c_int,
+    );
+}
+pub unsafe fn redundant(x: i32) { printf(((b"%d!\n\0" as *const u8) as *const i8) as *const i8, x as i32); }
+pub unsafe fn empty() { printf(b"\0" as *const u8 as *const i8); }
+pub unsafe fn percent() { printf(b"%%\0" as *const u8 as *const i8); }
+pub unsafe fn exact_count(x: i32, p: *const i8) { printf(b"%d %% %s\0" as *const u8 as *const i8, x, p); }
+pub unsafe fn let_use(x: i32) { let _n: i32 = printf(b"%d\0" as *const u8 as *const i8, x); }
+pub unsafe fn return_use(x: i32) -> i32 { printf(b"%d\0" as *const u8 as *const i8, x) }
+pub unsafe fn nested_use(x: i32) { sink(printf(b"%d\0" as *const u8 as *const i8, x)); }
+pub unsafe fn arithmetic_use(x: i32) { let _n: i32 = printf(b"%d\0" as *const u8 as *const i8, x) + 1; }
+pub unsafe fn interior_before(x: i32) { printf(b"a\0%d\0" as *const u8 as *const i8, x); }
+pub unsafe fn integer_cast(x: i32) { printf(b"%d\0".as_ptr() as usize as *const i8, x); }
+pub unsafe fn address_deref(x: i32) { printf(&*b"%d\0".as_ptr() as *const u8 as *const i8, x); }
+pub unsafe fn method(x: i32) { printf(b"%d\0".as_ptr() as *const i8, x); }
+pub unsafe fn transmute(x: i32) { printf(core::mem::transmute::<_, *const i8>(b"%d\0".as_ptr()), x); }
+pub unsafe fn identifier(x: i32) { printf(FORMAT.as_ptr() as *const i8, x); }
+pub unsafe fn concatenated(x: i32) { printf(concat!("%d", "\0").as_ptr() as *const i8, x); }
+pub unsafe fn included(x: i32) { printf(include_bytes!("/dev/null").as_ptr() as *const i8, x); }
+pub unsafe fn block(x: i32) { printf(({ b"%d\0" }) as *const u8 as *const i8, x); }
+pub unsafe fn conditional(x: i32) { printf((if true { b"%d\0" } else { b"%i\0" }) as *const u8 as *const i8, x); }
+pub unsafe fn arithmetic(x: i32) { printf(((b"%d\0".as_ptr() as usize) + 0) as *const i8, x); }
+pub unsafe fn result(x: i32) { printf(format_result(), x); }
+pub unsafe fn count_zero() { printf(b"%d %% %s\0" as *const u8 as *const i8); }
+pub unsafe fn count_one(x: i32) { printf(b"%d %% %s\0" as *const u8 as *const i8, x); }
+pub unsafe fn count_three(x: i32, p: *const i8) { printf(b"%d %% %s\0" as *const u8 as *const i8, x, p, x); }
+pub unsafe fn percent_extra(x: i32) { printf(b"%%\0" as *const u8 as *const i8, x); }
+pub unsafe fn other_prints(p: *mut i8, w: *const u16, x: i32) {
+    fprintf(p as *mut u8, b"%d\0".as_ptr() as *const i8, x);
+    sprintf(p, b"%d\0".as_ptr() as *const i8, x);
+    snprintf(p, 1, b"%d\0".as_ptr() as *const i8, x);
+    vprintf(b"%d\0".as_ptr() as *const i8, p as *mut u8);
+    wprintf(w, x);
+}
+mod ordinary { pub unsafe fn printf(_: *const i8, _: i32) {} }
+pub unsafe fn rust_function(x: i32) { ordinary::printf(b"%d\0".as_ptr() as *const i8, x); }
+"#;
+    let records = generate(source);
+    for name in [
+        "qualified",
+        "typical",
+        "redundant",
+        "empty",
+        "percent",
+        "exact_count",
+    ] {
+        let record = function(&records, name);
+        assert!(record.baseline.skeleton.contains("::std::print!"), "{name}");
+        assert!(
+            record.baseline.statement_pair_metadata[0]
+                .printf_template
+                .is_some()
+        );
+    }
+    for name in [
+        "let_use",
+        "return_use",
+        "nested_use",
+        "arithmetic_use",
+        "interior_before",
+        "integer_cast",
+        "address_deref",
+        "method",
+        "transmute",
+        "identifier",
+        "concatenated",
+        "included",
+        "block",
+        "conditional",
+        "arithmetic",
+        "result",
+        "count_zero",
+        "count_one",
+        "count_three",
+        "percent_extra",
+        "rust_function",
+    ] {
+        let record = function(&records, name);
+        assert!(
+            !record.baseline.skeleton.contains("::std::print!"),
+            "{name}"
+        );
+        assert!(
+            record
+                .baseline
+                .statement_pair_metadata
+                .iter()
+                .all(|metadata| metadata.printf_template.is_none()),
+            "{name}"
+        );
+    }
+    let other = function(&records, "other_prints");
+    assert!(!other.baseline.skeleton.contains("::std::print!"));
+    assert!(
+        other
+            .baseline
+            .statement_pair_metadata
+            .iter()
+            .all(|metadata| metadata.printf_template.is_none())
+    );
+}
+
+#[test]
+fn printf_prototype_and_abi_must_be_exact() {
+    let cases = [
+        r#"unsafe extern "C" { fn printf(format: *const i8) -> i32; }
+pub unsafe fn f() { printf(b"fixed\0" as *const u8 as *const i8); }"#,
+        r#"unsafe extern "C" { fn printf(format: *const i8, tag: i32, ...) -> i32; }
+pub unsafe fn f() { printf(b"fixed\0" as *const u8 as *const i8, 0); }"#,
+        r#"unsafe extern "C" { fn printf(format: *mut i8, ...) -> i32; }
+pub unsafe fn f() { printf(b"fixed\0" as *const u8 as *mut i8); }"#,
+        r#"unsafe extern "C" { fn printf(format: *const u16, ...) -> i32; }
+pub unsafe fn f() { printf(b"fixed\0" as *const u8 as *const u16); }"#,
+        r#"unsafe extern "C" { fn printf(format: *const i8, ...) -> i64; }
+pub unsafe fn f() { printf(b"fixed\0" as *const u8 as *const i8); }"#,
+        r#"unsafe extern "C-unwind" { fn printf(format: *const i8, ...) -> i32; }
+pub unsafe fn f() { printf(b"fixed\0" as *const u8 as *const i8); }"#,
+        r#"unsafe extern "system" { fn printf(format: *const i8, ...) -> i32; }
+pub unsafe fn f() { printf(b"fixed\0" as *const u8 as *const i8); }"#,
+        r#"pub unsafe extern "C" fn printf(_format: *const i8) -> i32 { 0 }
+pub unsafe fn f() { printf(b"fixed\0" as *const u8 as *const i8); }"#,
+    ];
+    for source in cases {
+        let records = generate(source);
+        let record = function(&records, "f");
+        assert!(
+            !record.baseline.skeleton.contains("::std::print!"),
+            "{source}"
+        );
+        assert!(record.baseline.skeleton.contains("todo!()"), "{source}");
+    }
+
+    let dependency_owned = r#"
+extern crate libc;
+pub unsafe fn f(x: i32) {
+    libc::printf(b"%d\0" as *const u8 as *const libc::c_char, x);
+}
+"#;
+    let records = generate(dependency_owned);
+    let record = function(&records, "f");
+    assert!(!record.baseline.skeleton.contains("::std::print!"));
+    assert!(record.baseline.skeleton.contains("todo!()"));
+    assert!(
+        record
+            .baseline
+            .statement_pair_metadata
+            .iter()
+            .all(|metadata| metadata.printf_template.is_none())
+    );
+}
+
+#[test]
+fn multiple_printf_arguments_apply_only_as_one_complete_statement() {
+    let source = r#"
+unsafe extern "C" { fn printf(format: *const i8, ...) -> i32; }
+pub unsafe fn values(a: i32, b: i32, c: i32) {
+    printf(b"%d/%i/%d\0" as *const u8 as *const i8, a, b, c);
+}
+"#;
+    let binding = crate::RuleExpression::Path {
+        value: crate::RuleValueIdentity::Variable {
+            sort: crate::VariableSort::Binding,
+            index: 0,
+        },
+    };
+    let i32_type = crate::TypeTree::Primitive { name: "i32".into() };
+    let make_rule = |specifier: &str| {
+        let target_pattern = if specifier == "%d" {
+            crate::RuleExpression::Cast {
+                expression: Box::new(binding.clone()),
+                ty: crate::RuleTypeTree::Primitive { name: "i64".into() },
+            }
+        } else {
+            crate::RuleExpression::Unary {
+                operator: crate::UnaryOperator::Negate,
+                operand: Box::new(binding.clone()),
+            }
+        };
+        crate::PrintfRule {
+            format_specifier: specifier.to_owned(),
+            source_pattern: binding.clone(),
+            target_pattern,
+            pointer_anchors: vec![],
+            source_type: i32_type.clone(),
+            source_adjusted_type: i32_type.clone(),
+        }
+    };
+    let complete = crate::RuleDocument {
+        schema_version: crate::RULE_SCHEMA_VERSION,
+        rules: vec![],
+        printf_rules: vec![make_rule("%d"), make_rule("%i")],
+    };
+    run_compiler_on_str(source, |tcx| {
+        let records = make_skeletons_with_rules(source, Some(&complete), tcx).unwrap();
+        let record = function(&records, "values");
+        assert!(
+            record
+                .applied
+                .skeleton
+                .contains("::std::print!(\"{}/{}/{}\", (a as i64), (-b), (c as i64));"),
+            "{}",
+            record.applied.skeleton
+        );
+        assert_eq!(
+            record.applied.statement_dispositions[0].disposition,
+            crate::StatementDispositionKind::RuleApplied
+        );
+    })
+    .unwrap();
+
+    let partial = crate::RuleDocument {
+        schema_version: crate::RULE_SCHEMA_VERSION,
+        rules: vec![],
+        printf_rules: vec![make_rule("%d")],
+    };
+    run_compiler_on_str(source, |tcx| {
+        let records = make_skeletons_with_rules(source, Some(&partial), tcx).unwrap();
+        let record = function(&records, "values");
+        assert_eq!(record.applied.skeleton, record.baseline.skeleton);
+        assert_eq!(
+            record.applied.statement_dispositions[0].disposition,
+            crate::StatementDispositionKind::Transform
+        );
+        assert_eq!(record.applied.skeleton.matches("todo!()").count(), 3);
+    })
+    .unwrap();
+}
+
+#[test]
+fn printf_unmaterializable_winner_uses_ranked_fallback_or_rolls_back_atomically() {
+    let source = r#"
+unsafe extern "C" { fn printf(format: *const i8, ...) -> i32; }
+pub unsafe fn value(x: i32) { printf(b"%d\0" as *const u8 as *const i8, x); }
+"#;
+    let binding = crate::RuleExpression::Path {
+        value: crate::RuleValueIdentity::Variable {
+            sort: crate::VariableSort::Binding,
+            index: 0,
+        },
+    };
+    let i32_type = crate::TypeTree::Primitive { name: "i32".into() };
+    let rule = |target_pattern| crate::PrintfRule {
+        format_specifier: "%d".into(),
+        source_pattern: binding.clone(),
+        target_pattern,
+        pointer_anchors: vec![],
+        source_type: i32_type.clone(),
+        source_adjusted_type: i32_type.clone(),
+    };
+    let unavailable = rule(crate::RuleExpression::Call {
+        callee: Box::new(crate::RuleExpression::Path {
+            value: crate::RuleValueIdentity::ForeignFunction {
+                symbol: "missing_printf_helper".into(),
+            },
+        }),
+        arguments: vec![binding.clone()],
+    });
+    let fallback = rule(crate::RuleExpression::Cast {
+        expression: Box::new(binding.clone()),
+        ty: crate::RuleTypeTree::Primitive { name: "i64".into() },
+    });
+    for printf_rules in [
+        vec![unavailable.clone(), fallback.clone()],
+        vec![fallback.clone(), unavailable.clone()],
+    ] {
+        let rules = crate::RuleDocument {
+            schema_version: crate::RULE_SCHEMA_VERSION,
+            rules: vec![],
+            printf_rules,
+        };
+        run_compiler_on_str(source, |tcx| {
+            let records = make_skeletons_with_rules(source, Some(&rules), tcx).unwrap();
+            let record = function(&records, "value");
+            assert!(
+                record
+                    .applied
+                    .skeleton
+                    .contains("::std::print!(\"{}\", (x as i64));"),
+                "{}",
+                record.applied.skeleton
+            );
+        })
+        .unwrap();
+    }
+
+    let only_unavailable = crate::RuleDocument {
+        schema_version: crate::RULE_SCHEMA_VERSION,
+        rules: vec![],
+        printf_rules: vec![unavailable],
+    };
+    run_compiler_on_str(source, |tcx| {
+        let records = make_skeletons_with_rules(source, Some(&only_unavailable), tcx).unwrap();
+        let record = function(&records, "value");
+        assert_eq!(record.applied, record.baseline);
+        assert_eq!(record.applied.skeleton.matches("todo!()").count(), 1);
+    })
+    .unwrap();
+}
+
+#[test]
+fn promoted_narrow_printf_rule_installs_without_target_root_context() {
+    let source = r#"
+unsafe extern "C" { fn printf(format: *const i8, ...) -> i32; }
+pub unsafe fn narrow(small: i8) {
+    printf(b"%hhd\0" as *const u8 as *const i8, small as i32);
+}
+"#;
+    let binding = crate::RuleExpression::Path {
+        value: crate::RuleValueIdentity::Variable {
+            sort: crate::VariableSort::Binding,
+            index: 0,
+        },
+    };
+    let rules = crate::RuleDocument {
+        schema_version: crate::RULE_SCHEMA_VERSION,
+        rules: vec![],
+        printf_rules: vec![crate::PrintfRule {
+            format_specifier: "%hhd".into(),
+            source_pattern: crate::RuleExpression::Cast {
+                expression: Box::new(binding.clone()),
+                ty: crate::RuleTypeTree::Primitive { name: "i32".into() },
+            },
+            target_pattern: crate::RuleExpression::Cast {
+                expression: Box::new(binding),
+                ty: crate::RuleTypeTree::Primitive { name: "i8".into() },
+            },
+            pointer_anchors: vec![],
+            source_type: crate::TypeTree::Primitive { name: "i32".into() },
+            source_adjusted_type: crate::TypeTree::Primitive { name: "i32".into() },
+        }],
+    };
+    run_compiler_on_str(source, |tcx| {
+        let records = make_skeletons_with_rules(source, Some(&rules), tcx).unwrap();
+        let record = function(&records, "narrow");
+        assert!(
+            record
+                .applied
+                .skeleton
+                .contains("::std::print!(\"{}\", (small as i8));"),
+            "{}",
+            record.applied.skeleton
+        );
+        assert_eq!(
+            record.applied.statement_dispositions[0].disposition,
+            crate::StatementDispositionKind::RuleApplied
+        );
+    })
+    .unwrap();
+}
+
+#[test]
+fn synthesized_string_pointer_rule_installs_into_third_and_type_checks() {
+    let source_pointer = crate::TypeTree::RawPointer {
+        mutability: crate::RawMutability::Const,
+        pointee: Box::new(crate::TypeTree::Primitive { name: "i8".into() }),
+    };
+    let target_string = crate::TypeTree::Reference {
+        mutability: crate::RefMutability::Shared,
+        pointee: Box::new(crate::TypeTree::Primitive { name: "str".into() }),
+    };
+    let binding = crate::Expression::Path {
+        value: crate::ValueIdentity::Binding { id: "<id0>".into() },
+    };
+    let rules = synthesized_printf_rules(
+        "%s",
+        binding.clone(),
+        binding,
+        vec![crate::PointerAnchor {
+            id: "<id0>".into(),
+            source_type: source_pointer.clone(),
+            target_type: target_string,
+        }],
+        source_pointer,
+    );
+    assert_eq!(rules.printf_rules.len(), 1);
+
+    let candidate = apply_printf_rules_to_third(
+        r#"
+unsafe extern "C" { fn printf(format: *const i8, ...) -> i32; }
+pub unsafe fn third(q: *const i8) {
+    printf(b"%s\0" as *const u8 as *const i8, q);
+}
+"#,
+        r#"pub unsafe fn third(q: &str) { #[proctor(0)] todo!(); }"#,
+        &rules,
+        Some((
+            "q",
+            crate::TypeTree::Reference {
+                mutability: crate::RefMutability::Shared,
+                pointee: Box::new(crate::TypeTree::Primitive { name: "str".into() }),
+            },
+        )),
+    );
+    assert!(
+        candidate.contains("::std::print!(\"{}\", q);"),
+        "{candidate}"
+    );
+    assert!(installed_candidate_type_checks(&candidate));
+}
+
+#[test]
+fn synthesized_promoted_narrow_rule_installs_into_third_and_type_checks() {
+    let binding = crate::Expression::Path {
+        value: crate::ValueIdentity::Binding { id: "<id0>".into() },
+    };
+    let i32_type = crate::TypeTree::Primitive { name: "i32".into() };
+    let i8_type = crate::TypeTree::Primitive { name: "i8".into() };
+    let rules = synthesized_printf_rules(
+        "%hhd",
+        crate::Expression::Cast {
+            expression: Box::new(binding.clone()),
+            ty: i32_type.clone(),
+        },
+        crate::Expression::Cast {
+            expression: Box::new(binding),
+            ty: i8_type,
+        },
+        vec![],
+        i32_type,
+    );
+    assert_eq!(rules.printf_rules.len(), 1);
+
+    let candidate = apply_printf_rules_to_third(
+        r#"
+unsafe extern "C" { fn printf(format: *const i8, ...) -> i32; }
+pub unsafe fn third(small: i8) {
+    printf(b"%hhd\0" as *const u8 as *const i8, small as i32);
+}
+"#,
+        r#"pub unsafe fn third(small: i8) { #[proctor(0)] todo!(); }"#,
+        &rules,
+        None,
+    );
+    assert!(
+        candidate.contains("::std::print!(\"{}\", (small as i8));"),
+        "{candidate}"
+    );
+    assert!(installed_candidate_type_checks(&candidate));
+}
+
+#[test]
+fn materialized_array_printf_argument_is_rejected_by_rust_type_checking() {
+    let binding = crate::Expression::Path {
+        value: crate::ValueIdentity::Binding { id: "<id0>".into() },
+    };
+    let i32_type = crate::TypeTree::Primitive { name: "i32".into() };
+    let rules = synthesized_printf_rules(
+        "%d",
+        binding.clone(),
+        crate::Expression::Array {
+            elements: vec![binding],
+        },
+        vec![],
+        i32_type,
+    );
+    assert_eq!(rules.printf_rules.len(), 1);
+
+    let candidate = apply_printf_rules_to_third(
+        r#"
+unsafe extern "C" { fn printf(format: *const i8, ...) -> i32; }
+pub unsafe fn third(x: i32) {
+    printf(b"%d\0" as *const u8 as *const i8, x);
+}
+"#,
+        r#"pub unsafe fn third(x: i32) { #[proctor(0)] todo!(); }"#,
+        &rules,
+        None,
+    );
+    assert!(
+        candidate.contains("::std::print!(\"{}\", [x]);"),
+        "{candidate}"
+    );
+    assert!(
+        installed_candidate_type_checks(&candidate.replace("[x]", "x")),
+        "the otherwise identical scalar control must satisfy Display"
+    );
+    assert!(
+        !installed_candidate_type_checks(&candidate),
+        "the generated array argument must fail Display type checking"
+    );
+}
+
 #[test]
 fn source_type_and_const_generics_reject_before_rule_application() {
     for (source, function, kind) in [
@@ -6364,6 +7107,7 @@ fn rule_selection_materialization_and_statement_installation_are_integrated() {
         .unwrap();
         let document = crate::ObservationDocument {
             schema_version: crate::OBSERVATION_SCHEMA_VERSION,
+            printf_observations: vec![],
             observations: vec![observation.clone(), observation],
         };
         let mut rule = crate::synthesize_rules(&[document]).unwrap();
@@ -6452,6 +7196,7 @@ pub unsafe fn f() -> i32 { rust_ping(1) }
     let primitive = crate::RuleTypeTree::Primitive { name: "i32".into() };
     let rules = crate::RuleDocument {
         schema_version: 1,
+        printf_rules: vec![],
         rules: vec![crate::Rule {
             source_pattern: call("1"),
             target_pattern: call("2"),
@@ -6508,6 +7253,7 @@ pub unsafe fn f() -> i32 { ffi::source_rust(1) }
     let primitive = crate::RuleTypeTree::Primitive { name: "i32".into() };
     let rules = crate::RuleDocument {
         schema_version: 1,
+        printf_rules: vec![],
         rules: vec![crate::Rule {
             source_pattern: call("source_ping"),
             target_pattern: call("c_ping"),
@@ -6596,6 +7342,7 @@ pub unsafe fn f() -> i32 { combine(first(1), second(2)) }
     ] {
         let document = crate::RuleDocument {
             schema_version: 1,
+            printf_rules: vec![],
             rules,
         };
         run_compiler_on_str(source, |tcx| {
@@ -6669,6 +7416,7 @@ pub unsafe fn f() -> i32 { consume(RUST_VALUE) }
     };
     let document = crate::RuleDocument {
         schema_version: 1,
+        printf_rules: vec![],
         rules: vec![crate::Rule {
             source_pattern: crate::RuleExpression::Call {
                 callee: Box::new(crate::RuleExpression::Path {
@@ -6756,6 +7504,7 @@ pub unsafe fn argument() { consume(allocate()); }
         };
         let document = crate::RuleDocument {
             schema_version: 1,
+            printf_rules: vec![],
             rules: vec![crate::Rule {
                 source_pattern: allocate.clone(),
                 target_pattern: allocate,
@@ -6785,6 +7534,7 @@ pub unsafe fn argument() { consume(allocate()); }
                     statement_pair_metadata: vec![crate::StatementPairMetadata {
                         label: 0,
                         before_statement: "#[proctor(0)]\nallocate();".into(),
+                        printf_template: None,
                         pointer_variables_complete: true,
                         pointer_variables: vec![],
                     }],
@@ -6922,6 +7672,7 @@ pub unsafe fn f() -> i32 { ping(1) }
         };
         let rules = crate::RuleDocument {
             schema_version: 1,
+            printf_rules: vec![],
             rules: vec![anchorless_foreign_rule(
                 symbol,
                 foreign_call_rule(symbol, "2"),
@@ -6992,6 +7743,7 @@ pub unsafe fn f() -> i32 { ffi::source_rust(1) }
         ] {
             let document = crate::RuleDocument {
                 schema_version: 1,
+                printf_rules: vec![],
                 rules,
             };
             run_compiler_on_str(source, |tcx| {
@@ -7015,6 +7767,7 @@ pub unsafe fn f() -> i32 { ffi::source_rust(1) }
 
         let document = crate::RuleDocument {
             schema_version: 1,
+            printf_rules: vec![],
             rules: vec![preferred.clone()],
         };
         run_compiler_on_str(source, |tcx| {
@@ -7074,6 +7827,7 @@ pub unsafe fn f() {
     ] {
         let document = crate::RuleDocument {
             schema_version: 1,
+            printf_rules: vec![],
             rules,
         };
         run_compiler_on_str(source, |tcx| {
@@ -7106,6 +7860,7 @@ pub unsafe fn f() {
 
     let document = crate::RuleDocument {
         schema_version: 1,
+        printf_rules: vec![],
         rules: vec![invalid],
     };
     run_compiler_on_str(source, |tcx| {
@@ -7208,6 +7963,7 @@ pub unsafe fn f(pointer: *const i32) -> i32 { read_one(pointer) }
     ] {
         let document = crate::RuleDocument {
             schema_version: 1,
+            printf_rules: vec![],
             rules,
         };
         run_compiler_on_str(source, |tcx| {
@@ -7232,6 +7988,7 @@ pub unsafe fn f(pointer: *const i32) -> i32 { read_one(pointer) }
 
     let child_only = crate::RuleDocument {
         schema_version: 1,
+        printf_rules: vec![],
         rules: vec![child],
     };
     run_compiler_on_str(source, |tcx| {
@@ -7250,6 +8007,7 @@ pub unsafe fn f(pointer: *const i32) -> i32 { read_one(pointer) }
                 statement_pair_metadata: vec![crate::StatementPairMetadata {
                     label: 0,
                     before_statement: "#[proctor(0)]\nread_one(pointer)".into(),
+                    printf_template: None,
                     pointer_variables_complete: true,
                     pointer_variables: vec![crate::PointerVariableMetadata {
                         name: "pointer".into(),
@@ -7328,6 +8086,7 @@ pub unsafe fn mixed(p: *mut i32, flag: bool) -> bool {
         .unwrap();
         let rules = crate::synthesize_rules(&[crate::ObservationDocument {
             schema_version: crate::OBSERVATION_SCHEMA_VERSION,
+            printf_observations: vec![],
             observations: vec![observation.clone(), observation],
         }])
         .unwrap();
@@ -7404,6 +8163,7 @@ pub unsafe fn no_match(flag: bool) -> Option<bool> {
         .unwrap();
         let rules = crate::synthesize_rules(&[crate::ObservationDocument {
             schema_version: crate::OBSERVATION_SCHEMA_VERSION,
+            printf_observations: vec![],
             observations: vec![observation.clone(), observation],
         }])
         .unwrap();
@@ -7474,6 +8234,7 @@ pub unsafe fn atomic(p: *mut i32, q: *mut i32) {
         };
         let rules = crate::synthesize_rules(&[crate::ObservationDocument {
             schema_version: crate::OBSERVATION_SCHEMA_VERSION,
+            printf_observations: vec![],
             observations: vec![observation.clone(), observation],
         }])
         .unwrap();
@@ -7623,6 +8384,7 @@ pub unsafe fn dual(p: *mut i32, q: *mut i32) -> (i32, i32, bool) {
         }
         let rules = crate::synthesize_rules(&[crate::ObservationDocument {
             schema_version: crate::OBSERVATION_SCHEMA_VERSION,
+            printf_observations: vec![],
             observations,
         }])
         .unwrap();
@@ -7656,6 +8418,7 @@ pub unsafe fn dual(p: *mut i32, q: *mut i32) -> (i32, i32, bool) {
 
         let incomplete = crate::RuleDocument {
             schema_version: 1,
+            printf_rules: vec![],
             rules: vec![rules.rules[0].clone()],
         };
         let (applied, unchanged) = apply(&incomplete);
@@ -7693,6 +8456,7 @@ pub unsafe fn dual(p: *mut i32, q: *mut i32) -> (i32, i32, bool) {
                 statement_pair_metadata: vec![crate::StatementPairMetadata {
                     label: 0,
                     before_statement: "#[proctor(0)]\n(*p, ping(1), !q.is_null())".into(),
+                    printf_template: None,
                     pointer_variables_complete: true,
                     pointer_variables: vec![
                         crate::PointerVariableMetadata {
@@ -7927,6 +8691,7 @@ fn post_maximalization_lhs_matches_only_the_rule_with_the_same_role() {
             observation.target_adjusted_type = observation.target_type.clone();
             let rule = crate::synthesize_rules(&[crate::ObservationDocument {
                 schema_version: 1,
+                printf_observations: vec![],
                 observations: vec![observation.clone(), observation.clone()],
             }])
             .unwrap()
@@ -7951,6 +8716,7 @@ fn post_maximalization_lhs_matches_only_the_rule_with_the_same_role() {
             ] {
                 let loaded = crate::LoadedRuleSet::new(&crate::RuleDocument {
                     schema_version: 1,
+                    printf_rules: vec![],
                     rules,
                 })
                 .unwrap();
@@ -8042,6 +8808,7 @@ fn materialization_and_shape_misses_are_local_but_corrupt_invariants_are_fatal()
         let mut target = item.clone();
         let invalid = crate::RuleDocument {
             schema_version: crate::RULE_SCHEMA_VERSION + 1,
+            printf_rules: vec![],
             rules: vec![],
         };
         let error = apply_rule_set(
@@ -8616,6 +9383,7 @@ fn rule_application_materializes_the_complete_expression_matrix_structurally() {
         for (name, source_pattern, target_pattern, concrete, expected) in cases {
             let selected = LoadedRuleSet::new(&crate::RuleDocument {
                 schema_version: 1,
+                printf_rules: vec![],
                 rules: vec![make_rule(source_pattern, target_pattern)],
             })
             .unwrap()
@@ -8755,6 +9523,7 @@ unsafe fn f() { let _ = (((1))) + (2); let _ = alias(1); }
         );
         let loaded = LoadedRuleSet::new(&crate::RuleDocument {
             schema_version: 1,
+            printf_rules: vec![],
             rules: vec![expression_rule],
         })
         .unwrap();
@@ -8794,6 +9563,7 @@ unsafe fn f() { let _ = (((1))) + (2); let _ = alias(1); }
         );
         let loaded = LoadedRuleSet::new(&crate::RuleDocument {
             schema_version: 1,
+            printf_rules: vec![],
             rules: vec![call_rule],
         })
         .unwrap();

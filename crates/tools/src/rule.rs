@@ -9,8 +9,8 @@ pub use markdown::rule_document_to_markdown;
 
 use crate::{
     AdtKind, BinaryOperator, BindingMutability, BorrowKind, ByRefKind, Expression,
-    OBSERVATION_SCHEMA_VERSION, Observation, ObservationDocument, RangeLimits, RawMutability,
-    RefMutability, TypeTree, UnaryOperator,
+    OBSERVATION_SCHEMA_VERSION, Observation, ObservationDocument, PrintfObservation, RangeLimits,
+    RawMutability, RefMutability, TypeTree, UnaryOperator,
 };
 
 pub const RULE_SCHEMA_VERSION: u64 = 1;
@@ -39,6 +39,7 @@ fn invalid(message: impl Into<String>) -> DocumentError {
 pub struct RuleDocument {
     pub schema_version: u64,
     pub rules: Vec<Rule>,
+    pub printf_rules: Vec<PrintfRule>,
 }
 
 impl Default for RuleDocument {
@@ -46,8 +47,20 @@ impl Default for RuleDocument {
         Self {
             schema_version: RULE_SCHEMA_VERSION,
             rules: vec![],
+            printf_rules: vec![],
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PrintfRule {
+    pub format_specifier: String,
+    pub source_pattern: RuleExpression,
+    pub target_pattern: RuleExpression,
+    pub pointer_anchors: Vec<RulePointerAnchor>,
+    pub source_type: TypeTree,
+    pub source_adjusted_type: TypeTree,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -416,13 +429,16 @@ pub fn merge_observation_documents(
     documents: &[ObservationDocument],
 ) -> Result<ObservationDocument, DocumentError> {
     let mut observations = vec![];
+    let mut printf_observations = vec![];
     for document in documents {
         validate_observation_document(document)?;
         observations.extend(document.observations.iter().cloned());
+        printf_observations.extend(document.printf_observations.iter().cloned());
     }
     Ok(ObservationDocument {
         schema_version: OBSERVATION_SCHEMA_VERSION,
         observations,
+        printf_observations,
     })
 }
 
@@ -481,6 +497,43 @@ fn validate_observation_document(document: &ObservationDocument) -> Result<(), D
     }
     for (index, observation) in document.observations.iter().enumerate() {
         validate_observation(observation, &format!("observations[{index}]"))?;
+    }
+    for (index, observation) in document.printf_observations.iter().enumerate() {
+        validate_printf_observation(observation, &format!("printf_observations[{index}]"))?;
+    }
+    Ok(())
+}
+
+fn validate_printf_observation(
+    observation: &PrintfObservation,
+    where_: &str,
+) -> Result<(), DocumentError> {
+    validate_printf_specifier(&observation.format_specifier, where_)?;
+    validate_observation(
+        &Observation {
+            source_expression: observation.source_expression.clone(),
+            target_expression: observation.target_expression.clone(),
+            pointer_anchors: observation.pointer_anchors.clone(),
+            lhs: false,
+            source_type: observation.source_type.clone(),
+            source_adjusted_type: observation.source_adjusted_type.clone(),
+            target_type: observation.source_type.clone(),
+            target_adjusted_type: observation.source_adjusted_type.clone(),
+        },
+        where_,
+    )
+}
+
+fn validate_printf_specifier(specifier: &str, where_: &str) -> Result<(), DocumentError> {
+    let converted = crate::printf::convert_printf_format(specifier.as_bytes())
+        .ok_or_else(|| invalid(format!("{where_}.format_specifier is unsupported")))?;
+    if converted.conversions.len() != 1
+        || converted.conversions[0].source_specifier != specifier
+        || !converted.rust_format.starts_with('{')
+    {
+        return Err(invalid(format!(
+            "{where_}.format_specifier must be exactly one consuming conversion"
+        )));
     }
     Ok(())
 }
@@ -910,7 +963,132 @@ fn validate_rule_document(document: &RuleDocument) -> Result<(), DocumentError> 
     for (index, rule) in document.rules.iter().enumerate() {
         validate_rule(rule, &format!("rules[{index}]"))?;
     }
+    for (index, rule) in document.printf_rules.iter().enumerate() {
+        validate_printf_rule(rule, &format!("printf_rules[{index}]"))?;
+    }
     Ok(())
+}
+
+fn validate_printf_rule(rule: &PrintfRule, where_: &str) -> Result<(), DocumentError> {
+    validate_printf_specifier(&rule.format_specifier, where_)?;
+    validate_rule_expression(&rule.source_pattern, where_)?;
+    validate_rule_expression(&rule.target_pattern, where_)?;
+    validate_type(&rule.source_type, &format!("{where_}.source_type"))?;
+    validate_type(
+        &rule.source_adjusted_type,
+        &format!("{where_}.source_adjusted_type"),
+    )?;
+    let synthetic = printf_rule_as_ordinary(rule)?;
+    validate_rule(&synthetic, where_)?;
+
+    let mut source_bound = HashSet::new();
+    let mut collect = |value: Value| -> Result<(), DocumentError> {
+        visit_variables(&value, &mut |sort, index| {
+            source_bound.insert((sort, index));
+            Ok(())
+        })
+    };
+    for anchor in &rule.pointer_anchors {
+        collect(serde_json::to_value(&anchor.id).map_err(|error| invalid(error.to_string()))?)?;
+        collect(
+            serde_json::to_value(&anchor.source_type)
+                .map_err(|error| invalid(error.to_string()))?,
+        )?;
+    }
+    collect(
+        serde_json::to_value(&rule.source_pattern).map_err(|error| invalid(error.to_string()))?,
+    )?;
+    let require_source_bound = |value: Value, field: &str| -> Result<(), DocumentError> {
+        visit_variables(&value, &mut |sort, index| {
+            if source_bound.contains(&(sort, index)) {
+                Ok(())
+            } else {
+                Err(invalid(format!(
+                    "{where_}.{field} contains a variable unavailable from the source"
+                )))
+            }
+        })
+    };
+    for (index, anchor) in rule.pointer_anchors.iter().enumerate() {
+        require_source_bound(
+            serde_json::to_value(&anchor.target_type)
+                .map_err(|error| invalid(error.to_string()))?,
+            &format!("pointer_anchors[{index}].target_type"),
+        )?;
+    }
+    require_source_bound(
+        serde_json::to_value(&rule.target_pattern).map_err(|error| invalid(error.to_string()))?,
+        "target_pattern",
+    )
+}
+
+fn printf_rule_as_ordinary(rule: &PrintfRule) -> Result<Rule, DocumentError> {
+    Ok(Rule {
+        source_pattern: rule.source_pattern.clone(),
+        target_pattern: rule.target_pattern.clone(),
+        pointer_anchors: rule.pointer_anchors.clone(),
+        lhs: false,
+        source_type: concrete_rule_type(&rule.source_type)?,
+        source_adjusted_type: concrete_rule_type(&rule.source_adjusted_type)?,
+        target_type: concrete_rule_type(&rule.source_type)?,
+        target_adjusted_type: concrete_rule_type(&rule.source_adjusted_type)?,
+    })
+}
+
+fn concrete_rule_type(ty: &TypeTree) -> Result<RuleTypeTree, DocumentError> {
+    Ok(match ty {
+        TypeTree::Primitive { name } => RuleTypeTree::Primitive { name: name.clone() },
+        TypeTree::Slice { element } => RuleTypeTree::Slice {
+            element: Box::new(concrete_rule_type(element)?),
+        },
+        TypeTree::Array { element, length } => RuleTypeTree::Array {
+            element: Box::new(concrete_rule_type(element)?),
+            length: *length,
+        },
+        TypeTree::RawPointer {
+            mutability,
+            pointee,
+        } => RuleTypeTree::RawPointer {
+            mutability: *mutability,
+            pointee: Box::new(concrete_rule_type(pointee)?),
+        },
+        TypeTree::Reference {
+            mutability,
+            pointee,
+        } => RuleTypeTree::Reference {
+            mutability: *mutability,
+            pointee: Box::new(concrete_rule_type(pointee)?),
+        },
+        TypeTree::Tuple { elements } => RuleTypeTree::Tuple {
+            elements: elements
+                .iter()
+                .map(concrete_rule_type)
+                .collect::<Result<_, _>>()?,
+        },
+        TypeTree::Adt {
+            adt_kind,
+            identity: crate::AdtIdentity::External { crate_name, path },
+            arguments,
+        } => RuleTypeTree::Adt {
+            adt_kind: *adt_kind,
+            identity: RuleAdtIdentity::External {
+                crate_name: crate_name.clone(),
+                path: path.clone(),
+            },
+            arguments: arguments
+                .iter()
+                .map(concrete_rule_type)
+                .collect::<Result<_, _>>()?,
+        },
+        TypeTree::Adt {
+            identity: crate::AdtIdentity::Local { .. },
+            ..
+        } => {
+            return Err(invalid(
+                "printf source type context cannot contain a local nominal identity",
+            ));
+        }
+    })
 }
 
 fn expect_sort(
@@ -3007,13 +3185,55 @@ pub fn synthesize_observation_pair(left: &Observation, right: &Observation) -> P
     }
 }
 
+fn synthesize_printf_observation_pair(
+    left: &PrintfObservation,
+    right: &PrintfObservation,
+) -> Option<PrintfRule> {
+    if left.format_specifier != right.format_specifier
+        || left.source_type != right.source_type
+        || left.source_adjusted_type != right.source_adjusted_type
+    {
+        return None;
+    }
+    let ordinary = |observation: &PrintfObservation| Observation {
+        source_expression: observation.source_expression.clone(),
+        target_expression: observation.target_expression.clone(),
+        pointer_anchors: observation.pointer_anchors.clone(),
+        lhs: false,
+        source_type: observation.source_type.clone(),
+        source_adjusted_type: observation.source_adjusted_type.clone(),
+        target_type: observation.source_type.clone(),
+        target_adjusted_type: observation.source_adjusted_type.clone(),
+    };
+    let synthesized = synthesize_observation_pair(&ordinary(left), &ordinary(right)).rule?;
+    let canonical = canonicalize_rule(&synthesized).ok()?;
+    let rule = PrintfRule {
+        format_specifier: left.format_specifier.clone(),
+        source_pattern: canonical.source_pattern,
+        target_pattern: canonical.target_pattern,
+        pointer_anchors: canonical.pointer_anchors,
+        source_type: left.source_type.clone(),
+        source_adjusted_type: left.source_adjusted_type.clone(),
+    };
+    validate_printf_rule(&rule, "printf rule").ok()?;
+    Some(rule)
+}
+
 pub fn synthesize_rules(documents: &[ObservationDocument]) -> Result<RuleDocument, DocumentError> {
     let mut unique = BTreeMap::<String, (Observation, bool)>::new();
+    let mut unique_printf = BTreeMap::<String, (PrintfObservation, bool)>::new();
     for document in documents {
         validate_observation_document(document)?;
         for observation in &document.observations {
             let key = serde_json::to_string(&serde_json::to_value(observation).unwrap()).unwrap();
             unique
+                .entry(key)
+                .and_modify(|entry| entry.1 = true)
+                .or_insert((observation.clone(), false));
+        }
+        for observation in &document.printf_observations {
+            let key = semantic_sort_key(observation);
+            unique_printf
                 .entry(key)
                 .and_modify(|entry| entry.1 = true)
                 .or_insert((observation.clone(), false));
@@ -3031,9 +3251,22 @@ pub fn synthesize_rules(documents: &[ObservationDocument]) -> Result<RuleDocumen
             rules.insert(semantic_sort_key(&rule), rule);
         }
     }
+    let printf_values = unique_printf.into_values().collect::<Vec<_>>();
+    let mut printf_rules = BTreeMap::<String, PrintfRule>::new();
+    for (index, (left, repeated)) in printf_values.iter().enumerate() {
+        for (right, _) in &printf_values[index + 1..] {
+            if let Some(rule) = synthesize_printf_observation_pair(left, right) {
+                printf_rules.insert(semantic_sort_key(&rule), rule);
+            }
+        }
+        if *repeated && let Some(rule) = synthesize_printf_observation_pair(left, left) {
+            printf_rules.insert(semantic_sort_key(&rule), rule);
+        }
+    }
     let document = RuleDocument {
         schema_version: RULE_SCHEMA_VERSION,
         rules: rules.into_values().collect(),
+        printf_rules: printf_rules.into_values().collect(),
     };
     validate_rule_document(&document)?;
     Ok(document)
@@ -3053,9 +3286,19 @@ pub struct RuleMatchInput {
     pub target_adjusted_type: Option<TypeTree>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrintfRuleMatchInput {
+    pub format_specifier: String,
+    pub source_expression: Expression,
+    pub pointer_anchors: Vec<crate::PointerAnchor>,
+    pub source_type: TypeTree,
+    pub source_adjusted_type: TypeTree,
+}
+
 #[derive(Debug, Clone)]
 pub struct LoadedRuleSet {
     rules: Vec<Rule>,
+    printf_rules: Vec<PrintfRule>,
     alpha_groups: Vec<usize>,
     strictly_more_specific_groups: Vec<BTreeSet<usize>>,
 }
@@ -3831,6 +4074,7 @@ impl LoadedRuleSet {
         }
         Ok(Self {
             rules,
+            printf_rules: document.printf_rules.clone(),
             alpha_groups,
             strictly_more_specific_groups,
         })
@@ -3838,6 +4082,53 @@ impl LoadedRuleSet {
 
     pub fn rules(&self) -> &[Rule] {
         &self.rules
+    }
+
+    pub fn printf_rules(&self) -> &[PrintfRule] {
+        &self.printf_rules
+    }
+
+    pub(crate) fn select_printf_with_exclusions_and_syntax(
+        &self,
+        input: &PrintfRuleMatchInput,
+        excluded: &BTreeSet<usize>,
+        source_syntax: &[String],
+    ) -> Option<RuleSelection> {
+        let mut indices = vec![];
+        let mut rules = vec![];
+        for (index, rule) in self.printf_rules.iter().enumerate() {
+            if excluded.contains(&index)
+                || rule.format_specifier != input.format_specifier
+                || rule.source_type != input.source_type
+                || rule.source_adjusted_type != input.source_adjusted_type
+            {
+                continue;
+            }
+            indices.push(index);
+            rules.push(printf_rule_as_ordinary(rule).ok()?);
+        }
+        let loaded = LoadedRuleSet::new(&RuleDocument {
+            schema_version: RULE_SCHEMA_VERSION,
+            rules,
+            printf_rules: vec![],
+        })
+        .ok()?;
+        let ordinary_input = RuleMatchInput {
+            source_expression: input.source_expression.clone(),
+            pointer_anchors: input.pointer_anchors.clone(),
+            lhs: false,
+            source_type: input.source_type.clone(),
+            source_adjusted_type: input.source_adjusted_type.clone(),
+            target_type: Some(input.source_type.clone()),
+            target_adjusted_type: Some(input.source_adjusted_type.clone()),
+        };
+        let mut selection = loaded.select_with_exclusions_and_syntax(
+            &ordinary_input,
+            &BTreeSet::new(),
+            source_syntax,
+        )?;
+        selection.rule_index = *indices.get(selection.rule_index)?;
+        Some(selection)
     }
 
     pub fn alpha_group(&self, rule_index: usize) -> Option<usize> {
@@ -4013,7 +4304,8 @@ mod tests {
       "target_type": {{"kind":"primitive","name":"i32"}},
       "target_adjusted_type": {{"kind":"primitive","name":"i32"}}
     }}
-  ]
+  ],
+  "printf_observations": []
 }}"#
         )
     }
@@ -4076,6 +4368,123 @@ mod tests {
             source_adjusted_type: rule_primitive(),
             target_type: rule_primitive(),
             target_adjusted_type: rule_primitive(),
+        }
+    }
+
+    #[test]
+    fn printf_target_anchor_type_variables_must_be_source_bound() {
+        let rule = PrintfRule {
+            format_specifier: "%d".to_owned(),
+            source_pattern: anchor_path(),
+            target_pattern: anchor_path(),
+            pointer_anchors: vec![RulePointerAnchor {
+                id: RuleVariable::new(VariableSort::Anchor, 0),
+                source_type: RuleTypeTree::RawPointer {
+                    mutability: RawMutability::Const,
+                    pointee: Box::new(rule_primitive()),
+                },
+                target_type: RuleTypeTree::Adt {
+                    adt_kind: AdtKind::Struct,
+                    identity: RuleAdtIdentity::Variable {
+                        sort: VariableSort::Struct,
+                        index: 0,
+                    },
+                    arguments: vec![],
+                },
+            }],
+            source_type: primitive(),
+            source_adjusted_type: primitive(),
+        };
+        let error = rule_document_to_json(&RuleDocument {
+            schema_version: 1,
+            rules: vec![],
+            printf_rules: vec![rule],
+        })
+        .unwrap_err();
+        assert!(error.message.contains("unavailable from the source"));
+    }
+
+    #[test]
+    fn every_printf_target_variable_sort_and_carrier_is_closed_over_the_source() {
+        let valid = printf_rule(binding_variable(0), binding_variable(0), vec![]);
+        rule_document_to_json(&RuleDocument {
+            schema_version: 1,
+            rules: vec![],
+            printf_rules: vec![valid.clone()],
+        })
+        .unwrap();
+
+        let mut fixed = valid.clone();
+        fixed.target_pattern = integer_rule(RuleIntegerMagnitude::Fixed("7".into()));
+        rule_document_to_json(&RuleDocument {
+            schema_version: 1,
+            rules: vec![],
+            printf_rules: vec![fixed],
+        })
+        .unwrap();
+
+        let all_sorts = [
+            VariableSort::Anchor,
+            VariableSort::Binding,
+            VariableSort::Function,
+            VariableSort::Struct,
+            VariableSort::Enum,
+            VariableSort::Union,
+            VariableSort::Field,
+            VariableSort::Variant,
+            VariableSort::Constant,
+            VariableSort::Static,
+            VariableSort::Method,
+            VariableSort::Expression,
+            VariableSort::IntegerMagnitude,
+        ];
+        for sort in all_sorts {
+            let mut invalid = valid.clone();
+            invalid.target_pattern = RuleExpression::Variable { sort, index: 1 };
+            assert!(
+                rule_document_to_json(&RuleDocument {
+                    schema_version: 1,
+                    rules: vec![],
+                    printf_rules: vec![invalid],
+                })
+                .is_err(),
+                "target-only {sort:?} variable"
+            );
+        }
+
+        for (adt_kind, sort) in [
+            (AdtKind::Struct, VariableSort::Struct),
+            (AdtKind::Enum, VariableSort::Enum),
+            (AdtKind::Union, VariableSort::Union),
+        ] {
+            let mut invalid = printf_rule(
+                rule_anchor_path(0),
+                rule_anchor_path(0),
+                vec![RulePointerAnchor {
+                    id: RuleVariable::new(VariableSort::Anchor, 0),
+                    source_type: RuleTypeTree::RawPointer {
+                        mutability: RawMutability::Const,
+                        pointee: Box::new(rule_primitive()),
+                    },
+                    target_type: RuleTypeTree::Reference {
+                        mutability: RefMutability::Shared,
+                        pointee: Box::new(rule_primitive()),
+                    },
+                }],
+            );
+            invalid.pointer_anchors[0].target_type = RuleTypeTree::Adt {
+                adt_kind,
+                identity: RuleAdtIdentity::Variable { sort, index: 1 },
+                arguments: vec![],
+            };
+            assert!(
+                rule_document_to_json(&RuleDocument {
+                    schema_version: 1,
+                    rules: vec![],
+                    printf_rules: vec![invalid],
+                })
+                .is_err()
+            );
         }
     }
 
@@ -4213,6 +4622,61 @@ mod tests {
         }
     }
 
+    fn rule_anchor_path(index: u64) -> RuleExpression {
+        RuleExpression::Path {
+            value: RuleValueIdentity::Variable {
+                sort: VariableSort::Anchor,
+                index,
+            },
+        }
+    }
+
+    fn printf_observation(
+        specifier: &str,
+        source_expression: Expression,
+        target_expression: Expression,
+        pointer_anchors: Vec<crate::PointerAnchor>,
+        source_type: TypeTree,
+        source_adjusted_type: TypeTree,
+    ) -> PrintfObservation {
+        PrintfObservation {
+            format_specifier: specifier.into(),
+            source_expression,
+            target_expression,
+            pointer_anchors,
+            source_type,
+            source_adjusted_type,
+        }
+    }
+
+    fn printf_rule(
+        source_pattern: RuleExpression,
+        target_pattern: RuleExpression,
+        pointer_anchors: Vec<RulePointerAnchor>,
+    ) -> PrintfRule {
+        PrintfRule {
+            format_specifier: "%d".into(),
+            source_pattern,
+            target_pattern,
+            pointer_anchors,
+            source_type: primitive(),
+            source_adjusted_type: primitive(),
+        }
+    }
+
+    fn printf_input(
+        source_expression: Expression,
+        pointer_anchors: Vec<crate::PointerAnchor>,
+    ) -> PrintfRuleMatchInput {
+        PrintfRuleMatchInput {
+            format_specifier: "%d".into(),
+            source_expression,
+            pointer_anchors,
+            source_type: primitive(),
+            source_adjusted_type: primitive(),
+        }
+    }
+
     fn function_variable(index: u64) -> RuleExpression {
         RuleExpression::Path {
             value: RuleValueIdentity::Variable {
@@ -4340,12 +4804,792 @@ mod tests {
     fn empty_documents_have_exact_bytes() {
         assert_eq!(
             observation_document_to_json(&ObservationDocument::default()).unwrap(),
-            "{\n  \"schema_version\": 1,\n  \"observations\": []\n}\n"
+            "{\n  \"schema_version\": 1,\n  \"observations\": [],\n  \"printf_observations\": []\n}\n"
         );
         assert_eq!(
             rule_document_to_json(&RuleDocument::default()).unwrap(),
-            "{\n  \"schema_version\": 1,\n  \"rules\": []\n}\n"
+            "{\n  \"schema_version\": 1,\n  \"rules\": [],\n  \"printf_rules\": []\n}\n"
         );
+    }
+
+    #[test]
+    fn printf_wire_family_is_closed_and_round_trips() {
+        let member = PrintfObservation {
+            format_specifier: "%d".to_owned(),
+            source_expression: concrete_binding("<id0>"),
+            target_expression: concrete_binding("<id0>"),
+            pointer_anchors: vec![],
+            source_type: primitive(),
+            source_adjusted_type: primitive(),
+        };
+        let document = ObservationDocument {
+            schema_version: 1,
+            observations: vec![],
+            printf_observations: vec![member.clone()],
+        };
+        let encoded = observation_document_to_json(&document).unwrap();
+        assert_eq!(observation_document_from_json(&encoded).unwrap(), document);
+        assert_eq!(
+            observation_document_to_json(&observation_document_from_json(&encoded).unwrap())
+                .unwrap(),
+            encoded
+        );
+        assert!(
+            observation_document_from_json(&encoded.replace(
+                "  \"printf_observations\": [",
+                "  \"extra\": 0,\n  \"printf_observations\": ["
+            ))
+            .is_err()
+        );
+        assert!(
+            observation_document_from_json(
+                "{\n  \"schema_version\": 1,\n  \"observations\": []\n}"
+            )
+            .is_err()
+        );
+        for specifier in ["text%d", "%d%d", "%%", "%*d", "%q"] {
+            let mut invalid = document.clone();
+            invalid.printf_observations[0].format_specifier = specifier.to_owned();
+            assert!(
+                observation_document_to_json(&invalid).is_err(),
+                "{specifier}"
+            );
+        }
+
+        let rules = synthesize_rules(&[document.clone(), document]).unwrap();
+        assert!(rules.rules.is_empty());
+        assert_eq!(rules.printf_rules.len(), 1);
+        let loaded = LoadedRuleSet::new(&rules).unwrap();
+        let input = PrintfRuleMatchInput {
+            format_specifier: "%d".to_owned(),
+            source_expression: concrete_binding("<id9>"),
+            pointer_anchors: vec![],
+            source_type: primitive(),
+            source_adjusted_type: primitive(),
+        };
+        assert_eq!(
+            loaded
+                .select_printf_with_exclusions_and_syntax(&input, &BTreeSet::new(), &[])
+                .unwrap()
+                .target_expression,
+            concrete_binding("<id9>")
+        );
+        let mut wrong_specifier = input.clone();
+        wrong_specifier.format_specifier = "%i".to_owned();
+        let mut wrong_intrinsic = input.clone();
+        wrong_intrinsic.source_type = TypeTree::Primitive { name: "u32".into() };
+        let mut wrong_adjusted = input.clone();
+        wrong_adjusted.source_adjusted_type = TypeTree::Primitive { name: "u32".into() };
+        for mismatch in [wrong_specifier, wrong_intrinsic, wrong_adjusted] {
+            assert!(
+                loaded
+                    .select_printf_with_exclusions_and_syntax(&mismatch, &BTreeSet::new(), &[])
+                    .is_none()
+            );
+        }
+        let encoded = rule_document_to_json(&rules).unwrap();
+        assert_eq!(rule_document_from_json(&encoded).unwrap(), rules);
+        assert_eq!(
+            rule_document_to_json(&rule_document_from_json(&encoded).unwrap()).unwrap(),
+            encoded
+        );
+        assert!(
+            rule_document_from_json("{\n  \"schema_version\": 1,\n  \"rules\": []\n}").is_err()
+        );
+    }
+
+    #[test]
+    fn anchored_printf_wire_round_trips_and_rejects_every_closed_shape_violation() {
+        let anchor = crate::PointerAnchor {
+            id: "<id0>".into(),
+            source_type: TypeTree::RawPointer {
+                mutability: RawMutability::Const,
+                pointee: Box::new(primitive()),
+            },
+            target_type: TypeTree::Reference {
+                mutability: RefMutability::Shared,
+                pointee: Box::new(TypeTree::Slice {
+                    element: Box::new(primitive()),
+                }),
+            },
+        };
+        let member = printf_observation(
+            "%d",
+            dereference(concrete_binding("<id0>")),
+            Expression::Index {
+                base: Box::new(concrete_binding("<id0>")),
+                index: Box::new(integer("0")),
+            },
+            vec![anchor],
+            primitive(),
+            primitive(),
+        );
+        let document = ObservationDocument {
+            schema_version: 1,
+            observations: vec![],
+            printf_observations: vec![member],
+        };
+        let encoded = observation_document_to_json(&document).unwrap();
+        assert_eq!(
+            observation_document_to_json(&observation_document_from_json(&encoded).unwrap())
+                .unwrap(),
+            encoded
+        );
+        for keys in [
+            ["\"format_specifier\"", "\"source_expression\""],
+            ["\"source_expression\"", "\"target_expression\""],
+            ["\"target_expression\"", "\"pointer_anchors\""],
+            ["\"pointer_anchors\"", "\"source_type\""],
+            ["\"source_type\"", "\"source_adjusted_type\""],
+        ] {
+            assert!(encoded.find(keys[0]).unwrap() < encoded.find(keys[1]).unwrap());
+        }
+
+        let value = serde_json::to_value(&document).unwrap();
+        let member_value = &value["printf_observations"][0];
+        for field in [
+            "format_specifier",
+            "source_expression",
+            "target_expression",
+            "pointer_anchors",
+            "source_type",
+            "source_adjusted_type",
+        ] {
+            let mut invalid = value.clone();
+            invalid["printf_observations"][0]
+                .as_object_mut()
+                .unwrap()
+                .remove(field);
+            assert!(
+                observation_document_from_json(&serde_json::to_string(&invalid).unwrap()).is_err(),
+                "missing {field}"
+            );
+        }
+        for (name, mutate) in [
+            (
+                "unknown root field",
+                ("target_type", serde_json::to_value(primitive()).unwrap()),
+            ),
+            (
+                "unknown arbitrary field",
+                ("extra", serde_json::Value::Bool(true)),
+            ),
+        ] {
+            let mut invalid = value.clone();
+            invalid["printf_observations"][0]
+                .as_object_mut()
+                .unwrap()
+                .insert(mutate.0.into(), mutate.1);
+            assert!(
+                observation_document_from_json(&serde_json::to_string(&invalid).unwrap()).is_err(),
+                "{name}"
+            );
+        }
+        for (name, replacement) in [
+            (
+                "bad expression",
+                serde_json::json!({"kind":"variable","sort":"binding","index":0}),
+            ),
+            (
+                "bad type",
+                serde_json::json!({"kind":"primitive","name":"bogus"}),
+            ),
+            (
+                "bad anchor",
+                serde_json::json!([{"id":"<id9>","source_type":{"kind":"primitive","name":"i32"},"target_type":{"kind":"primitive","name":"i32"}}]),
+            ),
+        ] {
+            let mut invalid = value.clone();
+            let member = invalid["printf_observations"][0].as_object_mut().unwrap();
+            match name {
+                "bad expression" => member.insert("source_expression".into(), replacement),
+                "bad type" => member.insert("source_type".into(), replacement),
+                _ => member.insert("pointer_anchors".into(), replacement),
+            };
+            assert!(
+                observation_document_from_json(&serde_json::to_string(&invalid).unwrap()).is_err(),
+                "{name}: {member_value:?}"
+            );
+        }
+        let duplicate = encoded.replacen(
+            "      \"format_specifier\": \"%d\",",
+            "      \"format_specifier\": \"%d\",\n      \"format_specifier\": \"%d\",",
+            1,
+        );
+        assert!(observation_document_from_json(&duplicate).is_err());
+    }
+
+    #[test]
+    fn printf_synthesis_separates_exact_context_and_generalizes_anchors_relationally() {
+        let make = |id: &str| {
+            printf_observation(
+                "%d",
+                dereference(concrete_binding(id)),
+                Expression::Index {
+                    base: Box::new(concrete_binding(id)),
+                    index: Box::new(integer("0")),
+                },
+                vec![crate::PointerAnchor {
+                    id: id.into(),
+                    source_type: TypeTree::RawPointer {
+                        mutability: RawMutability::Const,
+                        pointee: Box::new(primitive()),
+                    },
+                    target_type: TypeTree::Reference {
+                        mutability: RefMutability::Shared,
+                        pointee: Box::new(TypeTree::Slice {
+                            element: Box::new(primitive()),
+                        }),
+                    },
+                }],
+                primitive(),
+                primitive(),
+            )
+        };
+        let left = make("<id0>");
+        let right = make("<id0>");
+        let rules = synthesize_rules(&[ObservationDocument {
+            schema_version: 1,
+            observations: vec![],
+            printf_observations: vec![left.clone(), right.clone()],
+        }])
+        .unwrap();
+        let [rule] = rules.printf_rules.as_slice() else {
+            panic!("two corresponding anchored observations must synthesize one rule")
+        };
+        assert_eq!(rule.format_specifier, "%d");
+        assert_eq!(rule.pointer_anchors.len(), 1);
+        assert_eq!(
+            rule.pointer_anchors[0].id,
+            RuleVariable::new(VariableSort::Anchor, 0)
+        );
+        let encoded = rule_document_to_json(&rules).unwrap();
+        assert_eq!(
+            rule_document_to_json(&rule_document_from_json(&encoded).unwrap()).unwrap(),
+            encoded
+        );
+
+        for (left_specifier, right_specifier) in [("%d", "%i"), ("%x", "%08x")] {
+            let mut left_context = left.clone();
+            left_context.format_specifier = left_specifier.into();
+            let mut right_context = right.clone();
+            right_context.format_specifier = right_specifier.into();
+            assert!(
+                synthesize_rules(&[ObservationDocument {
+                    schema_version: 1,
+                    observations: vec![],
+                    printf_observations: vec![left_context, right_context],
+                }])
+                .unwrap()
+                .printf_rules
+                .is_empty()
+            );
+        }
+
+        for (name, mutate) in [
+            ("specifier", 0),
+            ("intrinsic type", 1),
+            ("adjusted type", 2),
+            ("anchor cardinality", 3),
+            ("anchor carrier", 4),
+            ("anchor target type", 5),
+        ] {
+            let mut changed = right.clone();
+            match mutate {
+                0 => changed.format_specifier = "%i".into(),
+                1 => changed.source_type = TypeTree::Primitive { name: "u32".into() },
+                2 => changed.source_adjusted_type = TypeTree::Primitive { name: "u32".into() },
+                3 => changed.pointer_anchors.clear(),
+                4 => changed.pointer_anchors[0].id = "<id2>".into(),
+                5 => changed.pointer_anchors[0].target_type = primitive(),
+                _ => unreachable!(),
+            }
+            let result = synthesize_rules(&[ObservationDocument {
+                schema_version: 1,
+                observations: vec![],
+                printf_observations: vec![left.clone(), changed],
+            }]);
+            if name == "anchor carrier" {
+                assert!(
+                    result.is_err() || result.as_ref().unwrap().printf_rules.is_empty(),
+                    "{name}"
+                );
+            } else {
+                assert!(result.unwrap().printf_rules.is_empty(), "{name}");
+            }
+        }
+
+        let external_type = |crate_name: &str, path: &[&str]| TypeTree::Adt {
+            adt_kind: crate::AdtKind::Struct,
+            identity: crate::AdtIdentity::External {
+                crate_name: crate_name.into(),
+                path: path.iter().map(|segment| (*segment).into()).collect(),
+            },
+            arguments: vec![],
+        };
+        let mut external_left = left.clone();
+        external_left.source_type = external_type("fixture", &["model", "Value"]);
+        external_left.source_adjusted_type = external_left.source_type.clone();
+        let external_right = external_left.clone();
+        assert_eq!(
+            synthesize_rules(&[ObservationDocument {
+                schema_version: 1,
+                observations: vec![],
+                printf_observations: vec![external_left.clone(), external_right],
+            }])
+            .unwrap()
+            .printf_rules
+            .len(),
+            1
+        );
+        for (crate_name, path) in [
+            ("other_fixture", vec!["model", "Value"]),
+            ("fixture", vec!["model", "OtherValue"]),
+        ] {
+            let mut changed = external_left.clone();
+            changed.source_type = external_type(crate_name, &path);
+            changed.source_adjusted_type = changed.source_type.clone();
+            assert!(
+                synthesize_rules(&[ObservationDocument {
+                    schema_version: 1,
+                    observations: vec![],
+                    printf_observations: vec![external_left.clone(), changed],
+                }])
+                .unwrap()
+                .printf_rules
+                .is_empty()
+            );
+        }
+
+        let target_external = |name: &str| {
+            printf_observation(
+                "%d",
+                concrete_binding("<id0>"),
+                Expression::Path {
+                    value: crate::ValueIdentity::External {
+                        crate_name: "fixture".into(),
+                        path: vec![name.into()],
+                    },
+                },
+                vec![],
+                primitive(),
+                primitive(),
+            )
+        };
+        let rejected = synthesize_rules(&[ObservationDocument {
+            schema_version: 1,
+            observations: vec![],
+            printf_observations: vec![target_external("left"), target_external("right")],
+        }])
+        .unwrap();
+        assert!(rejected.printf_rules.is_empty());
+
+        let target_literal = |value: &str| {
+            printf_observation(
+                "%d",
+                concrete_binding("<id0>"),
+                integer(value),
+                vec![],
+                primitive(),
+                primitive(),
+            )
+        };
+        let rejected = synthesize_rules(&[ObservationDocument {
+            schema_version: 1,
+            observations: vec![],
+            printf_observations: vec![target_literal("1"), target_literal("2")],
+        }])
+        .unwrap();
+        assert!(rejected.printf_rules.is_empty());
+
+        let target_binding = |id: &str| {
+            printf_observation(
+                "%d",
+                Expression::Tuple {
+                    elements: vec![concrete_binding("<id0>"), concrete_binding("<id1>")],
+                },
+                concrete_binding(id),
+                vec![],
+                primitive(),
+                primitive(),
+            )
+        };
+        let rejected = synthesize_rules(&[ObservationDocument {
+            schema_version: 1,
+            observations: vec![],
+            printf_observations: vec![target_binding("<id0>"), target_binding("<id1>")],
+        }])
+        .unwrap();
+        assert!(rejected.printf_rules.is_empty());
+    }
+
+    #[test]
+    fn printf_synthesis_deduplicates_sorts_and_never_crosses_rule_families() {
+        let printf = printf_observation(
+            "%d",
+            concrete_binding("<id0>"),
+            concrete_binding("<id0>"),
+            vec![],
+            primitive(),
+            primitive(),
+        );
+        let ordinary = anchorless_observation(concrete_binding("<id0>"), concrete_binding("<id0>"));
+        let left = ObservationDocument {
+            schema_version: 1,
+            observations: vec![ordinary.clone()],
+            printf_observations: vec![printf.clone()],
+        };
+        let right = ObservationDocument {
+            schema_version: 1,
+            observations: vec![ordinary],
+            printf_observations: vec![printf],
+        };
+        let forward = synthesize_rules(&[left.clone(), right.clone()]).unwrap();
+        let reverse = synthesize_rules(&[right, left]).unwrap();
+        assert_eq!(forward.rules.len(), 1);
+        assert_eq!(forward.printf_rules.len(), 1);
+        assert_eq!(
+            rule_document_to_json(&forward).unwrap(),
+            rule_document_to_json(&reverse).unwrap()
+        );
+    }
+
+    #[test]
+    fn printf_anchor_matching_preserves_injectivity_and_carrier_relations() {
+        let rule_anchor = |index| RulePointerAnchor {
+            id: RuleVariable::new(VariableSort::Anchor, index),
+            source_type: RuleTypeTree::RawPointer {
+                mutability: RawMutability::Const,
+                pointee: Box::new(rule_primitive()),
+            },
+            target_type: RuleTypeTree::Reference {
+                mutability: RefMutability::Shared,
+                pointee: Box::new(rule_primitive()),
+            },
+        };
+        let concrete_anchor = |id: &str| crate::PointerAnchor {
+            id: id.into(),
+            source_type: TypeTree::RawPointer {
+                mutability: RawMutability::Const,
+                pointee: Box::new(primitive()),
+            },
+            target_type: TypeTree::Reference {
+                mutability: RefMutability::Shared,
+                pointee: Box::new(primitive()),
+            },
+        };
+        let one = printf_rule(
+            dereference_rule(rule_anchor_path(0)),
+            rule_anchor_path(0),
+            vec![rule_anchor(0)],
+        );
+        let loaded = LoadedRuleSet::new(&RuleDocument {
+            schema_version: 1,
+            rules: vec![],
+            printf_rules: vec![one],
+        })
+        .unwrap();
+        let selected = loaded
+            .select_printf_with_exclusions_and_syntax(
+                &printf_input(
+                    dereference(concrete_binding("<id0>")),
+                    vec![concrete_anchor("<id0>")],
+                ),
+                &BTreeSet::new(),
+                &[],
+            )
+            .unwrap();
+        assert_eq!(selected.target_expression, concrete_binding("<id0>"));
+
+        let two = printf_rule(
+            RuleExpression::Tuple {
+                elements: vec![rule_anchor_path(0), rule_anchor_path(1)],
+            },
+            rule_anchor_path(0),
+            vec![rule_anchor(0), rule_anchor(1)],
+        );
+        let loaded = LoadedRuleSet::new(&RuleDocument {
+            schema_version: 1,
+            rules: vec![],
+            printf_rules: vec![two],
+        })
+        .unwrap();
+        let matching = printf_input(
+            Expression::Tuple {
+                elements: vec![concrete_binding("<id0>"), concrete_binding("<id1>")],
+            },
+            vec![concrete_anchor("<id0>"), concrete_anchor("<id1>")],
+        );
+        assert!(
+            loaded
+                .select_printf_with_exclusions_and_syntax(&matching, &BTreeSet::new(), &[])
+                .is_some()
+        );
+        let swapped = printf_input(
+            Expression::Tuple {
+                elements: vec![concrete_binding("<id1>"), concrete_binding("<id0>")],
+            },
+            vec![concrete_anchor("<id0>"), concrete_anchor("<id1>")],
+        );
+        assert!(
+            loaded
+                .select_printf_with_exclusions_and_syntax(&swapped, &BTreeSet::new(), &[])
+                .is_none()
+        );
+        let repeated = printf_input(
+            Expression::Tuple {
+                elements: vec![concrete_binding("<id0>"), concrete_binding("<id0>")],
+            },
+            vec![concrete_anchor("<id0>"), concrete_anchor("<id1>")],
+        );
+        assert!(
+            loaded
+                .select_printf_with_exclusions_and_syntax(&repeated, &BTreeSet::new(), &[])
+                .is_none()
+        );
+        let mut split = matching;
+        split.pointer_anchors[1].source_type = TypeTree::RawPointer {
+            mutability: RawMutability::Const,
+            pointee: Box::new(TypeTree::Primitive { name: "u32".into() }),
+        };
+        assert!(
+            loaded
+                .select_printf_with_exclusions_and_syntax(&split, &BTreeSet::new(), &[])
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn string_pointer_printf_rule_synthesizes_and_applies_without_target_root_type() {
+        let source_pointer = TypeTree::RawPointer {
+            mutability: RawMutability::Const,
+            pointee: Box::new(TypeTree::Primitive { name: "i8".into() }),
+        };
+        let target_string = TypeTree::Reference {
+            mutability: RefMutability::Shared,
+            pointee: Box::new(TypeTree::Primitive { name: "str".into() }),
+        };
+        let observation = printf_observation(
+            "%s",
+            concrete_binding("<id0>"),
+            concrete_binding("<id0>"),
+            vec![crate::PointerAnchor {
+                id: "<id0>".into(),
+                source_type: source_pointer.clone(),
+                target_type: target_string.clone(),
+            }],
+            source_pointer.clone(),
+            source_pointer.clone(),
+        );
+        let document = ObservationDocument {
+            schema_version: 1,
+            observations: vec![],
+            printf_observations: vec![observation],
+        };
+        let rules = synthesize_rules(&[document.clone(), document]).unwrap();
+        let [rule] = rules.printf_rules.as_slice() else {
+            panic!("expected one pointer-to-string printf rule")
+        };
+        assert_eq!(rule.format_specifier, "%s");
+        assert_eq!(rule.pointer_anchors.len(), 1);
+        assert_eq!(
+            rule.pointer_anchors[0].target_type,
+            RuleTypeTree::Reference {
+                mutability: RefMutability::Shared,
+                pointee: Box::new(RuleTypeTree::Primitive { name: "str".into() }),
+            }
+        );
+        let input = PrintfRuleMatchInput {
+            format_specifier: "%s".into(),
+            source_expression: concrete_binding("<id9>"),
+            pointer_anchors: vec![crate::PointerAnchor {
+                id: "<id9>".into(),
+                source_type: source_pointer.clone(),
+                target_type: target_string,
+            }],
+            source_type: source_pointer.clone(),
+            source_adjusted_type: source_pointer,
+        };
+        let selected = LoadedRuleSet::new(&rules)
+            .unwrap()
+            .select_printf_with_exclusions_and_syntax(&input, &BTreeSet::new(), &[])
+            .unwrap();
+        assert_eq!(selected.target_expression, concrete_binding("<id9>"));
+    }
+
+    #[test]
+    fn printf_ranking_is_deterministic_through_every_existing_tie_break_and_exclusion() {
+        let specific_source = RuleExpression::Call {
+            callee: Box::new(RuleExpression::Path {
+                value: RuleValueIdentity::ForeignFunction {
+                    symbol: "ping".into(),
+                },
+            }),
+            arguments: vec![integer_rule(RuleIntegerMagnitude::Fixed("1".into()))],
+        };
+        let broad_source = expression_variable(0);
+        let specific = printf_rule(
+            specific_source,
+            integer_rule(RuleIntegerMagnitude::Fixed("7".into())),
+            vec![],
+        );
+        let broad = printf_rule(
+            broad_source,
+            integer_rule(RuleIntegerMagnitude::Fixed("8".into())),
+            vec![],
+        );
+        let input = printf_input(
+            call(
+                crate::ValueIdentity::ForeignFunction {
+                    symbol: "ping".into(),
+                },
+                vec![integer("1")],
+            ),
+            vec![],
+        );
+        for rules in [
+            vec![specific.clone(), broad.clone()],
+            vec![broad.clone(), specific.clone()],
+        ] {
+            let loaded = LoadedRuleSet::new(&RuleDocument {
+                schema_version: 1,
+                rules: vec![],
+                printf_rules: rules,
+            })
+            .unwrap();
+            let first = loaded
+                .select_printf_with_exclusions_and_syntax(&input, &BTreeSet::new(), &[])
+                .unwrap();
+            assert_eq!(first.target_expression, integer("7"));
+            let second = loaded
+                .select_printf_with_exclusions_and_syntax(
+                    &input,
+                    &BTreeSet::from([first.rule_index]),
+                    &[],
+                )
+                .unwrap();
+            assert_eq!(second.target_expression, integer("8"));
+        }
+
+        let repeated = printf_rule(
+            RuleExpression::Tuple {
+                elements: vec![
+                    expression_variable(0),
+                    expression_variable(0),
+                    integer_rule(RuleIntegerMagnitude::Fixed("0".into())),
+                ],
+            },
+            integer_rule(RuleIntegerMagnitude::Fixed("7".into())),
+            vec![],
+        );
+        let decomposed = printf_rule(
+            RuleExpression::Tuple {
+                elements: vec![
+                    add_rule(expression_variable(0), expression_variable(1)),
+                    add_rule(expression_variable(0), expression_variable(1)),
+                    expression_variable(2),
+                ],
+            },
+            integer_rule(RuleIntegerMagnitude::Fixed("9".into())),
+            vec![],
+        );
+        let substitution_input = printf_input(
+            Expression::Tuple {
+                elements: vec![
+                    add_expression(concrete_binding("<id0>"), integer("1")),
+                    add_expression(concrete_binding("<id0>"), integer("1")),
+                    integer("0"),
+                ],
+            },
+            vec![],
+        );
+        for rules in [
+            vec![repeated.clone(), decomposed.clone()],
+            vec![decomposed.clone(), repeated.clone()],
+        ] {
+            assert_eq!(
+                LoadedRuleSet::new(&RuleDocument {
+                    schema_version: 1,
+                    rules: vec![],
+                    printf_rules: rules,
+                })
+                .unwrap()
+                .select_printf_with_exclusions_and_syntax(
+                    &substitution_input,
+                    &BTreeSet::new(),
+                    &[],
+                )
+                .unwrap()
+                .target_expression,
+                integer("7")
+            );
+        }
+
+        let source = add_rule(
+            expression_variable(0),
+            integer_rule(RuleIntegerMagnitude::Fixed("1".into())),
+        );
+        let small = printf_rule(
+            source.clone(),
+            integer_rule(RuleIntegerMagnitude::Fixed("2".into())),
+            vec![],
+        );
+        let large = printf_rule(
+            source.clone(),
+            add_rule(
+                integer_rule(RuleIntegerMagnitude::Fixed("2".into())),
+                integer_rule(RuleIntegerMagnitude::Fixed("3".into())),
+            ),
+            vec![],
+        );
+        let canonical_first = printf_rule(
+            source.clone(),
+            integer_rule(RuleIntegerMagnitude::Fixed("0".into())),
+            vec![],
+        );
+        let canonical_second = printf_rule(
+            source,
+            integer_rule(RuleIntegerMagnitude::Fixed("1".into())),
+            vec![],
+        );
+        let input = printf_input(
+            add_expression(concrete_binding("<id0>"), integer("1")),
+            vec![],
+        );
+        for rules in [
+            vec![small.clone(), large.clone()],
+            vec![large.clone(), small],
+        ] {
+            let selected = LoadedRuleSet::new(&RuleDocument {
+                schema_version: 1,
+                rules: vec![],
+                printf_rules: rules,
+            })
+            .unwrap()
+            .select_printf_with_exclusions_and_syntax(&input, &BTreeSet::new(), &[])
+            .unwrap();
+            assert_eq!(
+                selected.target_expression,
+                add_expression(integer("2"), integer("3"))
+            );
+        }
+        for rules in [
+            vec![canonical_second.clone(), canonical_first.clone()],
+            vec![canonical_first, canonical_second],
+        ] {
+            assert_eq!(
+                LoadedRuleSet::new(&RuleDocument {
+                    schema_version: 1,
+                    rules: vec![],
+                    printf_rules: rules,
+                })
+                .unwrap()
+                .select_printf_with_exclusions_and_syntax(&input, &BTreeSet::new(), &[])
+                .unwrap()
+                .target_expression,
+                integer("0")
+            );
+        }
     }
 
     #[test]
@@ -4355,6 +5599,7 @@ mod tests {
         let merged = merge_observation_documents(&[
             ObservationDocument {
                 schema_version: 1,
+                printf_observations: vec![],
                 observations: vec![
                     false_document.observations[0].clone(),
                     false_document.observations[0].clone(),
@@ -4403,6 +5648,7 @@ mod tests {
         );
         let document = ObservationDocument {
             schema_version: 1,
+            printf_observations: vec![],
             observations: vec![observation.clone()],
         };
         let encoded = observation_document_to_json(&document).unwrap();
@@ -4415,6 +5661,7 @@ mod tests {
         assert!(rule.pointer_anchors.is_empty());
         let rules = RuleDocument {
             schema_version: 1,
+            printf_rules: vec![],
             rules: vec![rule.clone()],
         };
         let encoded = rule_document_to_json(&rules).unwrap();
@@ -4921,6 +6168,7 @@ mod tests {
             assert!(
                 LoadedRuleSet::new(&RuleDocument {
                     schema_version: 1,
+                    printf_rules: vec![],
                     rules: vec![rule],
                 })
                 .is_err(),
@@ -4935,6 +6183,7 @@ mod tests {
             assert!(
                 LoadedRuleSet::new(&RuleDocument {
                     schema_version: 1,
+                    printf_rules: vec![],
                     rules: vec![rule],
                 })
                 .is_ok(),
@@ -5351,6 +6600,7 @@ mod tests {
         };
         let loaded = LoadedRuleSet::new(&RuleDocument {
             schema_version: 1,
+            printf_rules: vec![],
             rules: vec![left, right],
         })
         .unwrap();
@@ -5382,6 +6632,7 @@ mod tests {
         let specific = base_rule(fixed_source.clone(), specific_target.clone());
         let loaded = LoadedRuleSet::new(&RuleDocument {
             schema_version: 1,
+            printf_rules: vec![],
             rules: vec![broad, general, specific],
         })
         .unwrap();
@@ -5410,6 +6661,7 @@ mod tests {
         for rules in [vec![two.clone(), one.clone()], vec![one, two]] {
             let selected = LoadedRuleSet::new(&RuleDocument {
                 schema_version: 1,
+                printf_rules: vec![],
                 rules,
             })
             .unwrap()
@@ -5466,6 +6718,7 @@ mod tests {
         assert_eq!(
             LoadedRuleSet::new(&RuleDocument {
                 schema_version: 1,
+                printf_rules: vec![],
                 rules: vec![decomposed, repeated],
             })
             .unwrap()
@@ -5521,6 +6774,7 @@ mod tests {
         ] {
             let selected = LoadedRuleSet::new(&RuleDocument {
                 schema_version: 1,
+                printf_rules: vec![],
                 rules,
             })
             .unwrap()
@@ -5548,6 +6802,7 @@ mod tests {
             assert_eq!(
                 LoadedRuleSet::new(&RuleDocument {
                     schema_version: 1,
+                    printf_rules: vec![],
                     rules,
                 })
                 .unwrap()
@@ -5580,6 +6835,7 @@ mod tests {
         );
         let loaded = LoadedRuleSet::new(&RuleDocument {
             schema_version: 1,
+            printf_rules: vec![],
             rules: vec![general, specific],
         })
         .unwrap();
@@ -5602,6 +6858,7 @@ mod tests {
         );
         let loaded = LoadedRuleSet::new(&RuleDocument {
             schema_version: 1,
+            printf_rules: vec![],
             rules: vec![rule],
         })
         .unwrap();
@@ -5649,6 +6906,7 @@ mod tests {
         fallback.source_adjusted_type = raw_source;
         let loaded = LoadedRuleSet::new(&RuleDocument {
             schema_version: 1,
+            printf_rules: vec![],
             rules: vec![dormant.clone(), fallback],
         })
         .unwrap();
@@ -5662,6 +6920,7 @@ mod tests {
         assert!(
             LoadedRuleSet::new(&RuleDocument {
                 schema_version: 1,
+                printf_rules: vec![],
                 rules: vec![dormant],
             })
             .unwrap()
@@ -5686,6 +6945,7 @@ mod tests {
         let pair = synthesize_observation_pair(&first.observations[0], &second.observations[0]);
         let synthesized = RuleDocument {
             schema_version: 1,
+            printf_rules: vec![],
             rules: vec![pair.rule.unwrap_or_else(|| panic!("{:?}", pair.rejection))],
         };
         let json = rule_document_to_json(&synthesized).unwrap();
@@ -5819,6 +7079,7 @@ mod tests {
         assert!(
             LoadedRuleSet::new(&RuleDocument {
                 schema_version: 1,
+                printf_rules: vec![],
                 rules: vec![place],
             })
             .unwrap()
@@ -5828,6 +7089,7 @@ mod tests {
         assert!(
             LoadedRuleSet::new(&RuleDocument {
                 schema_version: 1,
+                printf_rules: vec![],
                 rules: vec![call],
             })
             .unwrap()
@@ -5936,6 +7198,7 @@ mod tests {
         assert!(
             LoadedRuleSet::new(&RuleDocument {
                 schema_version: 1,
+                printf_rules: vec![],
                 rules: vec![place_miss],
             })
             .unwrap()
@@ -6115,6 +7378,7 @@ mod tests {
         );
         let observations = ObservationDocument {
             schema_version: 1,
+            printf_observations: vec![],
             observations: vec![observation.clone()],
         };
         let bytes = observation_document_to_json(&observations).unwrap();
@@ -6141,6 +7405,7 @@ mod tests {
         );
         let rules = RuleDocument {
             schema_version: 1,
+            printf_rules: vec![],
             rules: vec![rule.clone()],
         };
         let bytes = rule_document_to_json(&rules).unwrap();
@@ -6160,6 +7425,7 @@ mod tests {
         assert!(
             rule_document_to_json(&RuleDocument {
                 schema_version: 1,
+                printf_rules: vec![],
                 rules: vec![binding_rule],
             })
             .is_ok()
@@ -6169,6 +7435,7 @@ mod tests {
         assert!(
             rule_document_to_json(&RuleDocument {
                 schema_version: 1,
+                printf_rules: vec![],
                 rules: vec![undeclared_anchor],
             })
             .is_err()
@@ -6217,7 +7484,8 @@ mod tests {
       "target_type": {"kind":"primitive","name":"i32"},
       "target_adjusted_type": {"kind":"primitive","name":"i32"}
     }
-  ]
+  ],
+  "printf_observations": []
 }"#;
         let observation_expected = r#"{
   "schema_version": 1,
@@ -6261,7 +7529,8 @@ mod tests {
         "name": "i32"
       }
     }
-  ]
+  ],
+  "printf_observations": []
 }
 "#;
         let observation = observation_document_from_json(observation_input).unwrap();
@@ -6291,7 +7560,8 @@ mod tests {
       "target_type": {"kind":"primitive","name":"i32"},
       "target_adjusted_type": {"kind":"primitive","name":"i32"}
     }
-  ]
+  ],
+  "printf_rules": []
 }"#;
         let rule_expected = r#"{
   "schema_version": 1,
@@ -6338,7 +7608,8 @@ mod tests {
         "name": "i32"
       }
     }
-  ]
+  ],
+  "printf_rules": []
 }
 "#;
         let rule = rule_document_from_json(rule_input).unwrap();
@@ -6405,7 +7676,8 @@ mod tests {
         "name": "i32"
       }
     }
-  ]
+  ],
+  "printf_observations": []
 }
 "#;
         let one_observation = observation(false);
@@ -6424,6 +7696,7 @@ mod tests {
         };
         let two_observation = ObservationDocument {
             schema_version: 1,
+            printf_observations: vec![],
             observations: vec![Observation {
                 source_expression: Expression::Tuple {
                     elements: vec![concrete_binding("<id0>"), concrete_binding("<id1>")],
@@ -6484,11 +7757,13 @@ mod tests {
         let rule_bytes = [
             rule_document_to_json(&RuleDocument {
                 schema_version: 1,
+                printf_rules: vec![],
                 rules: vec![base_rule(anchor_path(), anchor_path())],
             })
             .unwrap(),
             rule_document_to_json(&RuleDocument {
                 schema_version: 1,
+                printf_rules: vec![],
                 rules: vec![two_rule],
             })
             .unwrap(),
@@ -6556,7 +7831,8 @@ mod tests {
         "name": "i32"
       }
     }
-  ]
+  ],
+  "printf_rules": []
 }
 "#;
         let two_observation_expected = r#"{
@@ -6727,7 +8003,8 @@ mod tests {
         ]
       }
     }
-  ]
+  ],
+  "printf_observations": []
 }
 "#;
         let two_rule_expected = r#"{
@@ -6910,7 +8187,8 @@ mod tests {
         ]
       }
     }
-  ]
+  ],
+  "printf_rules": []
 }
 "#;
         assert_eq!(
@@ -6939,6 +8217,7 @@ mod tests {
         let rejects = |rule| {
             rule_document_to_json(&RuleDocument {
                 schema_version: 1,
+                printf_rules: vec![],
                 rules: vec![rule],
             })
             .is_err()
@@ -6966,6 +8245,7 @@ mod tests {
         let rejects = |observation| {
             observation_document_to_json(&ObservationDocument {
                 schema_version: 1,
+                printf_observations: vec![],
                 observations: vec![observation],
             })
             .is_err()
@@ -7125,6 +8405,7 @@ mod tests {
 
         let loaded = LoadedRuleSet::new(&RuleDocument {
             schema_version: 1,
+            printf_rules: vec![],
             rules: vec![anchorless_rule(binding_rule_path(0), binding_rule_path(0))],
         })
         .unwrap();
@@ -7408,6 +8689,7 @@ mod tests {
         ));
         let selected = LoadedRuleSet::new(&RuleDocument {
             schema_version: 1,
+            printf_rules: vec![],
             rules: vec![rule],
         })
         .unwrap()
@@ -7449,6 +8731,7 @@ mod tests {
         ));
         let selected = LoadedRuleSet::new(&RuleDocument {
             schema_version: 1,
+            printf_rules: vec![],
             rules: vec![rule.clone()],
         })
         .unwrap()
@@ -7483,10 +8766,12 @@ mod tests {
         let documents = [
             ObservationDocument {
                 schema_version: 1,
+                printf_observations: vec![],
                 observations: vec![decimal.clone(), unsigned.clone()],
             },
             ObservationDocument {
                 schema_version: 1,
+                printf_observations: vec![],
                 observations: vec![unsigned.clone(), decimal.clone()],
             },
         ];
@@ -7550,6 +8835,7 @@ mod tests {
             let fallback_index = rules.iter().position(|rule| rule == &fallback).unwrap();
             let loaded = LoadedRuleSet::new(&RuleDocument {
                 schema_version: 1,
+                printf_rules: vec![],
                 rules,
             })
             .unwrap();
@@ -7621,6 +8907,7 @@ mod tests {
         ] {
             let loaded = LoadedRuleSet::new(&RuleDocument {
                 schema_version: 1,
+                printf_rules: vec![],
                 rules,
             })
             .unwrap();
@@ -7690,6 +8977,7 @@ mod tests {
             assert_eq!(
                 LoadedRuleSet::new(&RuleDocument {
                     schema_version: 1,
+                    printf_rules: vec![],
                     rules,
                 })
                 .unwrap()
@@ -7723,6 +9011,7 @@ mod tests {
         ] {
             let selected = LoadedRuleSet::new(&RuleDocument {
                 schema_version: 1,
+                printf_rules: vec![],
                 rules,
             })
             .unwrap()
@@ -7753,6 +9042,7 @@ mod tests {
             assert_eq!(
                 LoadedRuleSet::new(&RuleDocument {
                     schema_version: 1,
+                    printf_rules: vec![],
                     rules,
                 })
                 .unwrap()
@@ -7802,6 +9092,7 @@ mod tests {
         ] {
             let loaded = LoadedRuleSet::new(&RuleDocument {
                 schema_version: 1,
+                printf_rules: vec![],
                 rules,
             })
             .unwrap();

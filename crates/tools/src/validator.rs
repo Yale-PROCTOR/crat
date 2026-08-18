@@ -15,7 +15,10 @@ use serde::{Deserialize, Serialize, ser::SerializeStruct};
 
 use crate::{
     SkeletonView,
-    preservation::{canonicalize_function_with_view, validate_skeleton_view},
+    preservation::{
+        canonical_statement_group, canonicalize_function_with_view, validate_skeleton_view,
+    },
+    printf::{parse_print_macro_statement, validate_print_macro_statement},
 };
 
 const SCHEMA_VERSION: u64 = 1;
@@ -399,6 +402,60 @@ fn validate_expected_skeleton(item: &Item, entry: &ExpectedFunction) -> Result<(
             entry.name, entry.id
         )
     })?;
+    for label in entry.view.transform_labels() {
+        let template = entry
+            .view
+            .statement_pair_metadata
+            .iter()
+            .find(|metadata| metadata.label == label)
+            .and_then(|metadata| metadata.printf_template.as_ref());
+        let Some(group) = canonical_statement_group(item, label) else {
+            if template.is_some() {
+                return Err(format!(
+                    "Expected skeleton for `{}` (item {}) has no print template group at label {label}",
+                    entry.name, entry.id
+                ));
+            }
+            continue;
+        };
+        if group.len() != 1 || !matches!(group[0].kind, StmtKind::MacCall(..)) {
+            if template.is_some() {
+                return Err(format!(
+                    "Expected skeleton for `{}` (item {}) has an invalid print template group at label {label}",
+                    entry.name, entry.id
+                ));
+            }
+            continue;
+        }
+        match parse_print_macro_statement(&group[0]) {
+            Ok(_) => {}
+            Err(problem) if template.is_some() => {
+                return Err(format!(
+                    "Expected skeleton for `{}` (item {}) has invalid print template at label {label}: {}",
+                    entry.name, entry.id, problem.message
+                ));
+            }
+            Err(_) => continue,
+        }
+        let Some(template) = template else {
+            return Err(format!(
+                "Expected skeleton for `{}` (item {}) has a print template without trusted metadata at label {label}",
+                entry.name, entry.id
+            ));
+        };
+        validate_print_macro_statement(
+            &group[0],
+            &template.rust_format,
+            template.argument_count as usize,
+        ).map_err(
+            |problem| {
+                format!(
+                    "Expected skeleton for `{}` (item {}) has invalid print template at label {label}: {}",
+                    entry.name, entry.id, problem.message
+                )
+            },
+        )?;
+    }
     Ok(())
 }
 
@@ -728,6 +785,84 @@ fn validate_function(expected: &ParsedExpected, result: &Item) -> Vec<Validation
     let mut result_scan = BodyScanner::new(false);
     result_scan.visit_block(result_body);
 
+    let printf_labels = expected
+        .metadata
+        .view
+        .statement_pair_metadata
+        .iter()
+        .filter_map(|metadata| metadata.printf_template.as_ref().map(|_| metadata.label))
+        .collect::<HashSet<_>>();
+    result_scan.macro_temporaries.retain(|occurrence| {
+        occurrence
+            .label
+            .is_none_or(|label| !printf_labels.contains(&label))
+    });
+    returned_scan.macro_temporaries.retain(|occurrence| {
+        occurrence
+            .label
+            .is_none_or(|label| !printf_labels.contains(&label))
+    });
+
+    let mut printf_errors = vec![];
+    for label in expected.metadata.view.transform_labels() {
+        let Some(template_metadata) = expected
+            .metadata
+            .view
+            .statement_pair_metadata
+            .iter()
+            .find(|metadata| metadata.label == label)
+            .and_then(|metadata| metadata.printf_template.as_ref())
+        else {
+            continue;
+        };
+        let Some(expected_group) = canonical_statement_group(&expected.item, label) else {
+            continue;
+        };
+        if expected_group.len() != 1 {
+            continue;
+        }
+        let Some(result_group) = canonical_statement_group(&canonical, label) else {
+            continue;
+        };
+        if result_group.len() != 1 {
+            printf_errors.push(error(
+                "printf_statement_group",
+                function_message(
+                    expected,
+                    format!(
+                        "print template label {label} must remain exactly one statement, but the returned expansion group contains {} statements",
+                        result_group.len()
+                    ),
+                ),
+            ));
+            continue;
+        }
+        match validate_print_macro_statement(
+            &result_group[0],
+            &template_metadata.rust_format,
+            template_metadata.argument_count as usize,
+        ) {
+            Ok(()) => {
+                if let Ok(parsed) = parse_print_macro_statement(&result_group[0]) {
+                    result_scan.visit_print_arguments(label, &parsed.arguments);
+                    validate_print_argument_temporaries(
+                        expected,
+                        &expected_scan,
+                        label,
+                        &parsed.arguments,
+                        &mut printf_errors,
+                    );
+                }
+            }
+            Err(problem) => {
+                printf_errors.push(error(
+                    problem.code,
+                    function_message(expected, problem.message),
+                ));
+            }
+        }
+    }
+
     let mut declaration_errors = vec![];
     let mut temporary_errors = vec![];
     validate_declarations(
@@ -807,6 +942,7 @@ fn validate_function(expected: &ParsedExpected, result: &Item) -> Vec<Validation
     errors.extend(declaration_errors);
     errors.extend(label_errors);
     errors.extend(control_errors);
+    errors.extend(printf_errors);
     errors.extend(temporary_errors);
     errors.extend(safety_errors);
     suppress_dependent_cascades(&mut errors, &expected_scan, &role_suppressions);
@@ -1296,6 +1432,16 @@ impl BodyScanner {
         } else {
             self.visit_payload(expression);
         }
+    }
+
+    fn visit_print_arguments(&mut self, label: u32, arguments: &[P<Expr>]) {
+        let previous_label = self.current_label.replace(label);
+        for (index, argument) in arguments.iter().enumerate() {
+            self.with_path(format!("print argument {index}"), |this| {
+                this.visit_payload(argument)
+            });
+        }
+        self.current_label = previous_label;
     }
 }
 
@@ -2927,6 +3073,82 @@ struct LexicalTempScanner<'a> {
     outside_group: Vec<ScopedTempProblem>,
 }
 
+fn expected_binding_names(expected: &ParsedExpected, scan: &BodyScanner) -> HashSet<String> {
+    let ItemKind::Fn(box function) = &expected.item.kind else { unreachable!() };
+    let mut names = scan
+        .bindings
+        .iter()
+        .map(|binding| binding.name.clone())
+        .collect::<HashSet<_>>();
+    names.extend(
+        function
+            .sig
+            .decl
+            .inputs
+            .iter()
+            .filter_map(|parameter| simple_pattern_name(&parameter.pat).map(str::to_owned)),
+    );
+    names
+}
+
+fn validate_print_argument_temporaries(
+    expected: &ParsedExpected,
+    expected_scan: &BodyScanner,
+    label: u32,
+    arguments: &[P<Expr>],
+    errors: &mut Vec<ValidationError>,
+) {
+    let existing_names = expected_binding_names(expected, expected_scan);
+    for argument in arguments {
+        let mut scan = BodyScanner::new(false);
+        scan.visit_print_arguments(label, std::slice::from_ref(argument));
+        let generated = scan
+            .bindings
+            .iter()
+            .filter(|binding| {
+                is_temp_name(&binding.name) && !existing_names.contains(binding.name.as_str())
+            })
+            .collect::<Vec<_>>();
+        let mut counts = HashMap::<&str, usize>::new();
+        for binding in &generated {
+            *counts.entry(binding.name.as_str()).or_default() += 1;
+        }
+        let unreliable_names = counts
+            .iter()
+            .filter_map(|(name, count)| (*count != 1).then_some(*name))
+            .collect::<HashSet<_>>();
+        let reliable_declarations = generated
+            .iter()
+            .filter(|binding| !unreliable_names.contains(binding.name.as_str()))
+            .map(|binding| (binding.name.as_str(), binding.label))
+            .collect::<HashMap<_, _>>();
+        let discarded_declarations = HashSet::new();
+        let mut scanner = LexicalTempScanner {
+            existing_names: &existing_names,
+            reliable_declarations: &reliable_declarations,
+            discarded_declarations: &discarded_declarations,
+            unreliable_names: &unreliable_names,
+            scopes: vec![existing_names.clone()],
+            current_label: Some(label),
+            unresolved: vec![],
+            outside_group: vec![],
+        };
+        scanner.visit_expr(argument);
+        for problem in scanner.unresolved {
+            let ScopedTempProblem::Unresolved { name, .. } = problem else { unreachable!() };
+            errors.push(error(
+                "unresolved_generated_temporary",
+                function_message(
+                    expected,
+                    format!(
+                        "generated-looking identifier `{name}` at print template label {label} has no declaration earlier in the same print argument lexical scope"
+                    ),
+                ),
+            ));
+        }
+    }
+}
+
 impl LexicalTempScanner<'_> {
     fn activate_pattern(&mut self, pat: &Pat) {
         let mut bindings = vec![];
@@ -3089,20 +3311,7 @@ fn validate_temporaries(
     returned_scan: &BodyScanner,
     errors: &mut Vec<ValidationError>,
 ) {
-    let ItemKind::Fn(box expected_function) = &expected.item.kind else { unreachable!() };
-    let mut expected_names = expected_scan
-        .bindings
-        .iter()
-        .map(|binding| binding.name.clone())
-        .collect::<HashSet<_>>();
-    expected_names.extend(
-        expected_function
-            .sig
-            .decl
-            .inputs
-            .iter()
-            .filter_map(|parameter| simple_pattern_name(&parameter.pat).map(str::to_owned)),
-    );
+    let expected_names = expected_binding_names(expected, expected_scan);
     let generated = result_scan
         .bindings
         .iter()

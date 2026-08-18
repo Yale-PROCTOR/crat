@@ -8,7 +8,10 @@ use rustc_ast::{
 use rustc_ast_pretty::pprust;
 use thin_vec::ThinVec;
 
-use crate::{SkeletonView, StatementDisposition, StatementDispositionKind};
+use crate::{
+    SkeletonView, StatementDisposition, StatementDispositionKind,
+    printf::{parse_print_macro_statement, validate_print_template_statement},
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PreservationError {
@@ -21,6 +24,7 @@ pub(crate) fn make_disposition_forest(
     transformed: &HashSet<u32>,
     preserved_shells: &HashSet<u32>,
     rule_applied: &HashSet<u32>,
+    mechanical: &HashSet<u32>,
 ) -> Result<Vec<StatementDisposition>, PreservationError> {
     let topology = collect_label_topology(item)?;
     let parents = topology.iter().copied().collect::<HashMap<_, _>>();
@@ -28,6 +32,7 @@ pub(crate) fn make_disposition_forest(
         .union(preserved_shells)
         .copied()
         .chain(rule_applied.iter().copied())
+        .chain(mechanical.iter().copied())
         .find(|label| !parents.contains_key(label))
     {
         return Err(metadata_error(
@@ -44,6 +49,17 @@ pub(crate) fn make_disposition_forest(
     if let Some(label) = preserved_shells
         .intersection(transformed)
         .chain(preserved_shells.intersection(rule_applied))
+        .chain(preserved_shells.intersection(mechanical))
+        .next()
+    {
+        return Err(metadata_error(
+            "conflicting_disposition",
+            format!("label {label} has conflicting statement dispositions"),
+        ));
+    }
+    if let Some(label) = transformed
+        .intersection(mechanical)
+        .chain(rule_applied.intersection(mechanical))
         .next()
     {
         return Err(metadata_error(
@@ -57,6 +73,7 @@ pub(crate) fn make_disposition_forest(
         transformed: &HashSet<u32>,
         preserved_shells: &HashSet<u32>,
         rule_applied: &HashSet<u32>,
+        mechanical: &HashSet<u32>,
     ) -> Vec<StatementDisposition> {
         let labels = topology
             .iter()
@@ -72,6 +89,8 @@ pub(crate) fn make_disposition_forest(
                     StatementDispositionKind::PreserveShell
                 } else if rule_applied.contains(&label) {
                     StatementDispositionKind::RuleApplied
+                } else if mechanical.contains(&label) {
+                    StatementDispositionKind::Mechanical
                 } else {
                     StatementDispositionKind::Preserve
                 },
@@ -81,6 +100,7 @@ pub(crate) fn make_disposition_forest(
                     transformed,
                     preserved_shells,
                     rule_applied,
+                    mechanical,
                 ),
             })
             .collect()
@@ -91,6 +111,7 @@ pub(crate) fn make_disposition_forest(
         transformed,
         preserved_shells,
         rule_applied,
+        mechanical,
     ))
 }
 
@@ -107,11 +128,13 @@ pub(crate) fn validate_skeleton_view(
     ) -> Result<(), PreservationError> {
         for node in nodes {
             flattened.push((node.label, parent, node.disposition));
-            if node.disposition == StatementDispositionKind::Preserve
-                && node
-                    .children
-                    .iter()
-                    .any(|child| child.disposition != StatementDispositionKind::Preserve)
+            if matches!(
+                node.disposition,
+                StatementDispositionKind::Preserve | StatementDispositionKind::Mechanical
+            ) && node
+                .children
+                .iter()
+                .any(|child| child.disposition != StatementDispositionKind::Preserve)
             {
                 return Err(metadata_error(
                     "open_preserved_parent",
@@ -153,16 +176,99 @@ pub(crate) fn validate_skeleton_view(
             "`needs_transformation` must equal whether a recursive disposition is `transform`",
         ));
     }
+    let report_labels = flattened
+        .iter()
+        .filter_map(|(label, _, disposition)| {
+            matches!(
+                disposition,
+                StatementDispositionKind::Transform | StatementDispositionKind::Mechanical
+            )
+            .then_some(*label)
+        })
+        .collect::<Vec<_>>();
     let metadata_labels = view
         .statement_pair_metadata
         .iter()
         .map(|metadata| metadata.label)
         .collect::<Vec<_>>();
-    if metadata_labels != transform_labels {
+    if metadata_labels != report_labels {
         return Err(metadata_error(
             "invalid_statement_pair_metadata",
-            "statement-pair metadata labels must equal transform labels in depth-first order",
+            "statement-pair metadata labels must equal reportable labels in depth-first order",
         ));
+    }
+    for (label, _, disposition) in &flattened {
+        if !matches!(
+            disposition,
+            StatementDispositionKind::Transform | StatementDispositionKind::Mechanical
+        ) {
+            continue;
+        }
+        let metadata = view
+            .statement_pair_metadata
+            .iter()
+            .find(|metadata| metadata.label == *label)
+            .expect("metadata labels were validated above");
+        let Some(group) = canonical_statement_group(item, *label) else {
+            if metadata.printf_template.is_none() {
+                continue;
+            }
+            return Err(metadata_error(
+                "invalid_printf_template",
+                format!("printf template label {label} has no statement group"),
+            ));
+        };
+        if metadata.printf_template.is_none() {
+            if group.len() == 1 && parse_print_macro_statement(&group[0]).is_ok() {
+                return Err(metadata_error(
+                    "invalid_printf_template",
+                    format!("print template label {label} has no trusted printf metadata"),
+                ));
+            }
+            continue;
+        }
+        let template = metadata
+            .printf_template
+            .as_ref()
+            .expect("presence was checked above");
+        let expected_arguments = usize::try_from(template.argument_count).map_err(|_| {
+            metadata_error(
+                "invalid_printf_template",
+                format!("printf template label {label} has an invalid argument count"),
+            )
+        })?;
+        if (*disposition == StatementDispositionKind::Mechanical) != (expected_arguments == 0) {
+            return Err(metadata_error(
+                "invalid_printf_template",
+                format!(
+                    "printf template label {label} has an argument count inconsistent with its disposition"
+                ),
+            ));
+        }
+        if group.len() != 1 {
+            return Err(metadata_error(
+                "invalid_printf_template",
+                format!("printf template label {label} must contain exactly one statement"),
+            ));
+        }
+        let result = if *disposition == StatementDispositionKind::Mechanical {
+            crate::printf::validate_print_macro_statement(
+                &group[0],
+                &template.rust_format,
+                expected_arguments,
+            )
+        } else {
+            validate_print_template_statement(&group[0], &template.rust_format, expected_arguments)
+        };
+        if let Err(problem) = result {
+            return Err(metadata_error(
+                "invalid_printf_template",
+                format!(
+                    "printf template label {label} is invalid: {}",
+                    problem.message
+                ),
+            ));
+        }
     }
     Ok(())
 }
@@ -171,13 +277,40 @@ pub(crate) fn validate_cross_view_topology(
     baseline: &Item,
     applied: &Item,
 ) -> Result<(), PreservationError> {
-    let baseline = collect_label_data(baseline)?;
-    let applied = collect_label_data(applied)?;
-    if baseline.topology != applied.topology || baseline.shells != applied.shells {
+    let baseline_data = collect_label_data(baseline)?;
+    let applied_data = collect_label_data(applied)?;
+    if baseline_data.topology != applied_data.topology
+        || baseline_data.shells != applied_data.shells
+    {
         return Err(metadata_error(
             "cross_view_topology_mismatch",
             "baseline and applied skeletons have different depth-first label/control topology",
         ));
+    }
+    for (label, _) in &baseline_data.topology {
+        let Some(baseline_group) = canonical_statement_group(baseline, *label) else {
+            continue;
+        };
+        let Some(applied_group) = canonical_statement_group(applied, *label) else {
+            continue;
+        };
+        if baseline_group.len() == 1
+            && parse_print_macro_statement(&baseline_group[0])
+                .is_ok_and(|parsed| parsed.arguments.is_empty())
+            && baseline_group
+                .iter()
+                .map(pprust::stmt_to_string)
+                .collect::<Vec<_>>()
+                != applied_group
+                    .iter()
+                    .map(pprust::stmt_to_string)
+                    .collect::<Vec<_>>()
+        {
+            return Err(metadata_error(
+                "cross_view_mechanical_mismatch",
+                format!("fixed print payload at label {label} differs between skeleton views"),
+            ));
+        }
     }
     Ok(())
 }
@@ -204,6 +337,9 @@ pub(crate) fn canonicalize_function_with_view(
                     transformed.insert(node.label);
                 }
                 StatementDispositionKind::RuleApplied => {
+                    rule_applied.insert(node.label);
+                }
+                StatementDispositionKind::Mechanical => {
                     rule_applied.insert(node.label);
                 }
                 StatementDispositionKind::PreserveShell => {
@@ -1490,4 +1626,110 @@ fn parse_label_attribute(attribute: &Attribute) -> Result<Option<u32>, ()> {
         return Err(());
     }
     argument.parse::<u32>().map(Some).map_err(|_| ())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{SkeletonView, StatementPairMetadata};
+
+    fn parse_item(source: &str) -> P<Item> {
+        P(utils::ast::parse_item(source.to_owned()))
+    }
+
+    #[test]
+    fn mechanical_payload_is_canonical_and_cross_view_immutable() {
+        rustc_span::create_session_if_not_set_then(
+            rustc_span::edition::Edition::Edition2021,
+            |_| {
+                let item = parse_item(r#"unsafe fn f() { #[proctor(0)] ::std::print!("fixed"); }"#);
+                let view = SkeletonView {
+                    skeleton: pprust::item_to_string(&item),
+                    needs_transformation: false,
+                    statement_dispositions: vec![StatementDisposition {
+                        label: 0,
+                        disposition: StatementDispositionKind::Mechanical,
+                        children: vec![],
+                    }],
+                    statement_pair_metadata: vec![StatementPairMetadata {
+                        label: 0,
+                        before_statement: r#"c_print(b"fixed\0" as *const u8 as *const i8);"#
+                            .to_owned(),
+                        printf_template: Some(crate::PrintfTemplateMetadata {
+                            rust_format: "fixed".to_owned(),
+                            argument_count: 0,
+                        }),
+                        pointer_variables_complete: true,
+                        pointer_variables: vec![],
+                    }],
+                };
+                validate_skeleton_view(&item, &view).unwrap();
+
+                let changed =
+                    parse_item(r#"unsafe fn f() { #[proctor(0)] ::std::print!("changed"); }"#);
+                assert_eq!(
+                    validate_cross_view_topology(&item, &changed)
+                        .unwrap_err()
+                        .code,
+                    "cross_view_mechanical_mismatch"
+                );
+
+                let mut invalid = view.clone();
+                invalid.statement_pair_metadata[0]
+                    .printf_template
+                    .as_mut()
+                    .unwrap()
+                    .rust_format = "other".to_owned();
+                assert_eq!(
+                    validate_skeleton_view(&item, &invalid).unwrap_err().code,
+                    "invalid_printf_template"
+                );
+
+                let mut missing = view.clone();
+                missing.statement_pair_metadata[0].printf_template = None;
+                assert_eq!(
+                    validate_skeleton_view(&item, &missing).unwrap_err().code,
+                    "invalid_printf_template"
+                );
+
+                let consuming =
+                    parse_item(r#"unsafe fn f() { #[proctor(0)] ::std::print!("{}", todo!()); }"#);
+                let mut consuming_view = view;
+                consuming_view.skeleton = pprust::item_to_string(&consuming);
+                consuming_view.needs_transformation = true;
+                consuming_view.statement_dispositions[0].disposition =
+                    StatementDispositionKind::Transform;
+                consuming_view.statement_pair_metadata[0].printf_template =
+                    Some(crate::PrintfTemplateMetadata {
+                        rust_format: "{}".to_owned(),
+                        argument_count: 1,
+                    });
+                validate_skeleton_view(&consuming, &consuming_view).unwrap();
+
+                let attributed = parse_item(
+                    r#"unsafe fn f() { #[proctor(0)] ::std::print!("{}", #[allow(unused)] todo!()); }"#,
+                );
+                consuming_view.skeleton = pprust::item_to_string(&attributed);
+                assert_eq!(
+                    validate_skeleton_view(&attributed, &consuming_view)
+                        .unwrap_err()
+                        .code,
+                    "invalid_printf_template"
+                );
+
+                consuming_view.skeleton = pprust::item_to_string(&consuming);
+                consuming_view.statement_pair_metadata[0]
+                    .printf_template
+                    .as_mut()
+                    .unwrap()
+                    .argument_count = 0;
+                assert_eq!(
+                    validate_skeleton_view(&consuming, &consuming_view)
+                        .unwrap_err()
+                        .code,
+                    "invalid_printf_template"
+                );
+            },
+        );
+    }
 }

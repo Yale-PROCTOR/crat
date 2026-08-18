@@ -33,10 +33,15 @@ use smallvec::{SmallVec, smallvec};
 use crate::{
     AdtIdentity, AdtKind, BinaryOperator, BindingMutability, BorrowKind, ByRefKind, Expression,
     FieldIdentity, Literal, LoadedRuleSet, Pattern, PointerVariableMetadata, PointerVariableOrigin,
-    RangeLimits, RawMutability, RefMutability, RuleDocument, RuleMatchInput, SkeletonView,
-    Statement, StatementPairMetadata, TypeTree, UnaryOperator, ValueIdentity, VariantIdentity,
-    observation::{local_c_foreign_function_symbol, select_rule_regions, semantic_type_tree},
+    PrintfRuleMatchInput, PrintfTemplateMetadata, RangeLimits, RawMutability, RefMutability,
+    RuleDocument, RuleMatchInput, SkeletonView, Statement, StatementPairMetadata, TypeTree,
+    UnaryOperator, ValueIdentity, VariantIdentity,
+    observation::{
+        local_c_foreign_function_symbol, printf_rule_argument, select_rule_regions,
+        semantic_type_tree,
+    },
     preservation::{make_disposition_forest, validate_cross_view_topology},
+    printf::{eligible_printf_statement, supported_printf_call},
     validator::validate_rule_application_shape,
 };
 
@@ -428,7 +433,9 @@ fn make_function_record<'tcx>(
     let mut source = surface.item.clone();
     sanitize_item(&mut source);
     validate_function_body(&source, &surface.path)?;
-    let opaque_nested_ifs = collect_opaque_nested_ifs(&source, &surface.path)?;
+    let opaque_printf_payloads = supported_printf_expression_ids(&source, ast_to_hir, tcx);
+    let opaque_nested_ifs =
+        collect_opaque_nested_ifs_with_skips(&source, &surface.path, &opaque_printf_payloads)?;
     annotate_function(&mut source, &opaque_nested_ifs);
     PresentationBindingNormalizer.visit_item(&mut source);
     let statement_classification = classify_function_statements(
@@ -439,7 +446,7 @@ fn make_function_record<'tcx>(
         preservation_overrides,
         tcx,
     );
-    let statements_requiring_transformation = statement_classification.transformed;
+    let mut statements_requiring_transformation = statement_classification.transformed;
     let preserved_shell_statements = statement_classification.preserved_shells;
     let mut target = source.clone();
     let type_speller = TypeSpeller::new(surface.def_id, ast_to_hir, tcx);
@@ -451,6 +458,16 @@ fn make_function_record<'tcx>(
         &surface.path,
         tcx,
     )?;
+    let printf_templates = collect_printf_templates(&source, ast_to_hir, tcx);
+    let mechanical_statements = printf_templates
+        .iter()
+        .filter_map(|(label, template)| template.argument_count.eq(&0).then_some(*label))
+        .collect::<BTreeSet<_>>();
+    for label in &mechanical_statements {
+        statements_requiring_transformation.remove(label);
+    }
+    install_printf_templates(&mut target, &printf_templates);
+    let printf_template_statements = printf_templates.keys().copied().collect::<BTreeSet<_>>();
     let mut applied_target = target.clone();
     let rule_applied_statements = match rules {
         Some(rules) => apply_rule_set(
@@ -478,6 +495,7 @@ fn make_function_record<'tcx>(
         statements_requiring_transformation: &statements_requiring_transformation,
         preserved_shell_statements: &preserved_shell_statements,
         rule_applied_statements: &no_rule_applications,
+        printf_template_statements: &printf_template_statements,
         type_speller: &type_speller,
         function_path: &surface.path,
         error: None,
@@ -494,6 +512,7 @@ fn make_function_record<'tcx>(
         statements_requiring_transformation: &applied_transformations,
         preserved_shell_statements: &preserved_shell_statements,
         rule_applied_statements: &rule_applied_statements,
+        printf_template_statements: &printf_template_statements,
         type_speller: &type_speller,
         function_path: &surface.path,
         error: None,
@@ -523,24 +542,51 @@ fn make_function_record<'tcx>(
     })?;
     let source_signature = render_signature(&source);
     let target_signature = render_signature(&baseline_skeleton);
+    let baseline_reportable = statements_requiring_transformation
+        .union(&mechanical_statements)
+        .copied()
+        .collect();
     let baseline_statement_pair_metadata = collect_statement_pair_metadata(
         &source,
         &baseline_skeleton,
-        &statements_requiring_transformation,
+        &baseline_reportable,
+        &printf_templates,
         ast_to_hir,
         &type_speller,
         &surface.path,
         tcx,
     )?;
+    let applied_reportable = applied_transformations
+        .union(&mechanical_statements)
+        .copied()
+        .collect();
     let applied_statement_pair_metadata = collect_statement_pair_metadata(
         &source,
         &applied_skeleton,
-        &applied_transformations,
+        &applied_reportable,
+        &printf_templates,
         ast_to_hir,
         &type_speller,
         &surface.path,
         tcx,
     )?;
+    for label in &mechanical_statements {
+        let baseline_metadata = baseline_statement_pair_metadata
+            .iter()
+            .find(|metadata| metadata.label == *label);
+        let applied_metadata = applied_statement_pair_metadata
+            .iter()
+            .find(|metadata| metadata.label == *label);
+        if baseline_metadata != applied_metadata {
+            return Err(GenerationError {
+                kind: GenerationErrorKind::AstHirMismatch,
+                function_path: surface.path.clone(),
+                message: format!(
+                    "fixed print label {label} has different report metadata between skeleton views"
+                ),
+            });
+        }
+    }
     let transformed = statements_requiring_transformation
         .iter()
         .copied()
@@ -554,6 +600,7 @@ fn make_function_record<'tcx>(
         &transformed,
         &preserved_shells,
         &HashSet::new(),
+        &mechanical_statements.iter().copied().collect(),
     )
     .map_err(|error| GenerationError {
         kind: GenerationErrorKind::AstHirMismatch,
@@ -579,6 +626,7 @@ fn make_function_record<'tcx>(
         &applied_transformed,
         &preserved_shells,
         &applied_rules,
+        &mechanical_statements.iter().copied().collect(),
     )
     .map_err(|error| GenerationError {
         kind: GenerationErrorKind::AstHirMismatch,
@@ -608,10 +656,83 @@ fn make_function_record<'tcx>(
     })))
 }
 
+#[derive(Debug, Clone)]
+struct PrintfTemplate {
+    rust_format: String,
+    argument_count: usize,
+}
+
+fn collect_printf_templates(
+    source: &Item,
+    ast_to_hir: &utils::ir::AstToHir,
+    tcx: TyCtxt<'_>,
+) -> BTreeMap<u32, PrintfTemplate> {
+    struct Collector<'a, 'tcx> {
+        ast_to_hir: &'a utils::ir::AstToHir,
+        result: BTreeMap<u32, PrintfTemplate>,
+        tcx: TyCtxt<'tcx>,
+    }
+    impl<'ast> visit::Visitor<'ast> for Collector<'_, '_> {
+        fn visit_stmt(&mut self, statement: &'ast Stmt) {
+            if let Some(label) = statement_numeric_label(statement)
+                && let Some(call) = eligible_printf_statement(statement, self.ast_to_hir, self.tcx)
+            {
+                self.result.insert(
+                    label,
+                    PrintfTemplate {
+                        rust_format: call.format.rust_format,
+                        argument_count: call.arguments.len(),
+                    },
+                );
+            }
+            visit::walk_stmt(self, statement);
+        }
+    }
+    let ItemKind::Fn(box function) = &source.kind else { unreachable!() };
+    let mut collector = Collector {
+        ast_to_hir,
+        result: BTreeMap::new(),
+        tcx,
+    };
+    collector.visit_block(function.body.as_ref().unwrap());
+    collector.result
+}
+
+fn install_printf_templates(target: &mut Item, templates: &BTreeMap<u32, PrintfTemplate>) {
+    struct Installer<'a>(&'a BTreeMap<u32, PrintfTemplate>);
+    impl MutVisitor for Installer<'_> {
+        fn flat_map_stmt(&mut self, mut statement: Stmt) -> SmallVec<[Stmt; 1]> {
+            let Some(template) =
+                statement_numeric_label(&statement).and_then(|label| self.0.get(&label))
+            else {
+                return mut_visit::walk_flat_map_stmt(self, statement);
+            };
+            let arguments =
+                std::iter::repeat_n("todo!()", template.argument_count).collect::<Vec<_>>();
+            let suffix = if arguments.is_empty() {
+                String::new()
+            } else {
+                format!(", {}", arguments.join(", "))
+            };
+            let mut replacement = utils::ast::parse_stmt(format!(
+                "::std::print!({:?}{suffix});",
+                template.rust_format
+            ));
+            *stmt_attrs_mut(&mut replacement) = std::mem::take(stmt_attrs_mut(&mut statement));
+            replacement.id = statement.id;
+            replacement.span = statement.span;
+            smallvec![replacement]
+        }
+    }
+    Installer(templates).visit_item(target);
+}
+
+#[allow(clippy::too_many_arguments)]
 fn collect_statement_pair_metadata<'tcx>(
     source: &Item,
     skeleton: &Item,
     transformed: &BTreeSet<u32>,
+    printf_templates: &BTreeMap<u32, PrintfTemplate>,
     ast_to_hir: &utils::ir::AstToHir,
     type_speller: &TypeSpeller<'_, 'tcx>,
     function_path: &str,
@@ -651,6 +772,13 @@ fn collect_statement_pair_metadata<'tcx>(
             StatementPairMetadata {
                 label: *label,
                 before_statement: render_statement_group(std::slice::from_ref(*statement)),
+                printf_template: printf_templates.get(label).map(|template| {
+                    PrintfTemplateMetadata {
+                        rust_format: template.rust_format.clone(),
+                        argument_count: u32::try_from(template.argument_count)
+                            .expect("a Rust statement cannot contain more than u32::MAX arguments"),
+                    }
+                }),
                 pointer_variables_complete: collector.complete,
                 pointer_variables: collector.variables,
             }
@@ -3230,6 +3358,35 @@ impl MutVisitor for RuleExpressionInstaller<'_> {
     }
 }
 
+fn install_statement_at_label(item: &mut Item, label: u32, replacement: &Stmt) -> bool {
+    struct Installer<'a> {
+        label: u32,
+        replacement: &'a Stmt,
+        installed: bool,
+    }
+    impl MutVisitor for Installer<'_> {
+        fn flat_map_stmt(&mut self, mut statement: Stmt) -> SmallVec<[Stmt; 1]> {
+            if !self.installed && statement_numeric_label(&statement) == Some(self.label) {
+                let mut replacement = self.replacement.clone();
+                *stmt_attrs_mut(&mut replacement) = std::mem::take(stmt_attrs_mut(&mut statement));
+                replacement.id = statement.id;
+                replacement.span = statement.span;
+                self.installed = true;
+                smallvec![replacement]
+            } else {
+                mut_visit::walk_flat_map_stmt(self, statement)
+            }
+        }
+    }
+    let mut installer = Installer {
+        label,
+        replacement,
+        installed: false,
+    };
+    installer.visit_item(item);
+    installer.installed
+}
+
 #[allow(clippy::too_many_arguments)]
 fn apply_rule_set(
     source: &Item,
@@ -3242,15 +3399,71 @@ fn apply_rule_set(
     type_speller: &TypeSpeller<'_, '_>,
     tcx: TyCtxt<'_>,
 ) -> Result<BTreeSet<u32>, GenerationError> {
+    apply_rule_set_with_binding_catalog(
+        source,
+        target,
+        transformed,
+        document,
+        function,
+        decisions,
+        ast_to_hir,
+        type_speller,
+        None,
+        tcx,
+    )
+}
+
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+fn apply_rule_set_with_test_binding_catalog(
+    source: &Item,
+    target: &mut Item,
+    transformed: &BTreeSet<u32>,
+    document: &RuleDocument,
+    function: LocalDefId,
+    decisions: &InitialPointerDecisions,
+    ast_to_hir: &utils::ir::AstToHir,
+    type_speller: &TypeSpeller<'_, '_>,
+    binding_catalog: HashMap<hir::HirId, TypeTree>,
+    tcx: TyCtxt<'_>,
+) -> Result<BTreeSet<u32>, GenerationError> {
+    apply_rule_set_with_binding_catalog(
+        source,
+        target,
+        transformed,
+        document,
+        function,
+        decisions,
+        ast_to_hir,
+        type_speller,
+        Some(binding_catalog),
+        tcx,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn apply_rule_set_with_binding_catalog(
+    source: &Item,
+    target: &mut Item,
+    transformed: &BTreeSet<u32>,
+    document: &RuleDocument,
+    function: LocalDefId,
+    decisions: &InitialPointerDecisions,
+    ast_to_hir: &utils::ir::AstToHir,
+    type_speller: &TypeSpeller<'_, '_>,
+    binding_catalog: Option<HashMap<hir::HirId, TypeTree>>,
+    tcx: TyCtxt<'_>,
+) -> Result<BTreeSet<u32>, GenerationError> {
     let loaded = LoadedRuleSet::new(document).map_err(|error| GenerationError {
         kind: GenerationErrorKind::AstHirMismatch,
         function_path: tcx.def_path_str(function.to_def_id()),
         message: format!("invalid rule document: {error}"),
     })?;
-    if loaded.rules().is_empty() {
+    if loaded.rules().is_empty() && loaded.printf_rules().is_empty() {
         return Ok(BTreeSet::new());
     }
-    let catalog = rule_binding_catalog(source, function, decisions, ast_to_hir, tcx);
+    let catalog = binding_catalog
+        .unwrap_or_else(|| rule_binding_catalog(source, function, decisions, ast_to_hir, tcx));
     let target_catalog = rule_target_binding_catalog(source, function, decisions, ast_to_hir, tcx);
     let type_syntax = rule_type_syntax(source, ast_to_hir, tcx);
     let ItemKind::Fn(box source_function) = &source.kind else {
@@ -3266,6 +3479,76 @@ fn apply_rule_set(
         let Some(statement) = statements.get(label).copied() else {
             continue;
         };
+        if let Some(call) = eligible_printf_statement(statement, ast_to_hir, tcx) {
+            let mut target_arguments = vec![];
+            let mut complete = true;
+            for (conversion, argument) in call.format.conversions.iter().zip(call.arguments) {
+                let Some(region) = printf_rule_argument(argument, &catalog, ast_to_hir, tcx) else {
+                    complete = false;
+                    break;
+                };
+                let input = PrintfRuleMatchInput {
+                    format_specifier: conversion.source_specifier.clone(),
+                    source_expression: region.source_expression,
+                    pointer_anchors: region.pointer_anchors,
+                    source_type: region.source_type,
+                    source_adjusted_type: region.source_adjusted_type,
+                };
+                let mut excluded = BTreeSet::new();
+                let expression = loop {
+                    let Some(selection) = loaded.select_printf_with_exclusions_and_syntax(
+                        &input,
+                        &excluded,
+                        &region.source_syntax,
+                    ) else {
+                        break None;
+                    };
+                    let renderer = RuleRenderer {
+                        names: &region.spellings,
+                        syntax_overrides: &selection.syntax_overrides,
+                        identity_syntax: &selection.identity_syntax,
+                        syntax_cursor: Cell::new(0),
+                        type_syntax: &type_syntax,
+                        type_speller,
+                    };
+                    if let Some(expression) =
+                        expression_spelling(&selection.target_expression, &renderer)
+                            .and_then(|rendered| parse_rule_expression(rendered, false))
+                    {
+                        break Some(expression);
+                    }
+                    excluded.insert(selection.rule_index);
+                };
+                let Some(expression) = expression else {
+                    complete = false;
+                    break;
+                };
+                target_arguments.push(expression);
+            }
+            if complete && target_arguments.len() == call.arguments.len() {
+                let rendered_arguments = target_arguments
+                    .iter()
+                    .map(pprust::expr_to_string)
+                    .collect::<Vec<_>>();
+                let suffix = if rendered_arguments.is_empty() {
+                    String::new()
+                } else {
+                    format!(", {}", rendered_arguments.join(", "))
+                };
+                let replacement = utils::ast::parse_stmt(format!(
+                    "::std::print!({:?}{suffix});",
+                    call.format.rust_format
+                ));
+                let mut tentative = target.clone();
+                if install_statement_at_label(&mut tentative, *label, &replacement)
+                    && validate_rule_application_shape(&tentative).is_ok()
+                {
+                    *target = tentative;
+                    applied.insert(*label);
+                }
+            }
+            continue;
+        }
         let Some(regions) = select_rule_regions(statement, &catalog, ast_to_hir, tcx) else {
             continue;
         };
@@ -3937,6 +4220,7 @@ struct Skeletonizer<'a, 'tcx> {
     statements_requiring_transformation: &'a BTreeSet<u32>,
     preserved_shell_statements: &'a BTreeSet<u32>,
     rule_applied_statements: &'a BTreeSet<u32>,
+    printf_template_statements: &'a BTreeSet<u32>,
     type_speller: &'a TypeSpeller<'a, 'tcx>,
     function_path: &'a str,
     error: Option<GenerationError>,
@@ -3954,6 +4238,8 @@ impl MutVisitor for Skeletonizer<'_, '_> {
             .is_some_and(|label| self.rule_applied_statements.contains(&label));
         let preserved_shell = statement_numeric_label(&stmt)
             .is_some_and(|label| self.preserved_shell_statements.contains(&label));
+        let printf_template = statement_numeric_label(&stmt)
+            .is_some_and(|label| self.printf_template_statements.contains(&label));
         if let StmtKind::Let(local) = &mut stmt.kind
             && let PatKind::Ident(_, _, None) = local.pat.kind
             && let Some(hir_id) = self.ast_to_hir.local_map.get(&local.pat.id).copied()
@@ -4017,6 +4303,9 @@ impl MutVisitor for Skeletonizer<'_, '_> {
             if rule_applied || preserved_shell {
                 self.visit_labeled_descendants(&mut stmt);
             }
+            return smallvec![stmt];
+        }
+        if printf_template {
             return smallvec![stmt];
         }
         match &mut stmt.kind {
@@ -4267,6 +4556,7 @@ fn inspect_nested_control(expr: &Expr, mut on_restricted: impl FnMut(NodeId)) ->
 
 struct OpaqueNestedIfCollector<'a> {
     function_path: &'a str,
+    opaque_payloads: &'a FxHashSet<NodeId>,
     opaque_nested_ifs: FxHashSet<NodeId>,
     error: Option<GenerationError>,
 }
@@ -4321,6 +4611,9 @@ impl OpaqueNestedIfCollector<'_> {
     }
 
     fn inspect_non_control(&mut self, expr: &Expr) {
+        if self.opaque_payloads.contains(&expr.id) {
+            return;
+        }
         if inspect_nested_control(expr, |id| {
             self.opaque_nested_ifs.insert(id);
         }) {
@@ -4368,8 +4661,17 @@ pub(crate) fn collect_opaque_nested_ifs(
     item: &Item,
     path: &str,
 ) -> Result<FxHashSet<NodeId>, GenerationError> {
+    collect_opaque_nested_ifs_with_skips(item, path, &FxHashSet::default())
+}
+
+fn collect_opaque_nested_ifs_with_skips(
+    item: &Item,
+    path: &str,
+    opaque_payloads: &FxHashSet<NodeId>,
+) -> Result<FxHashSet<NodeId>, GenerationError> {
     let mut collector = OpaqueNestedIfCollector {
         function_path: path,
+        opaque_payloads,
         opaque_nested_ifs: FxHashSet::default(),
         error: None,
     };
@@ -4379,6 +4681,34 @@ pub(crate) fn collect_opaque_nested_ifs(
         Some(error) => Err(error),
         None => Ok(collector.opaque_nested_ifs),
     }
+}
+
+fn supported_printf_expression_ids(
+    item: &Item,
+    ast_to_hir: &utils::ir::AstToHir,
+    tcx: TyCtxt<'_>,
+) -> FxHashSet<NodeId> {
+    struct Collector<'a, 'tcx> {
+        ast_to_hir: &'a utils::ir::AstToHir,
+        ids: FxHashSet<NodeId>,
+        tcx: TyCtxt<'tcx>,
+    }
+    impl<'ast> visit::Visitor<'ast> for Collector<'_, '_> {
+        fn visit_expr(&mut self, expression: &'ast Expr) {
+            if supported_printf_call(expression, self.ast_to_hir, self.tcx) {
+                self.ids.insert(expression.id);
+                return;
+            }
+            visit::walk_expr(self, expression);
+        }
+    }
+    let mut collector = Collector {
+        ast_to_hir,
+        ids: FxHashSet::default(),
+        tcx,
+    };
+    collector.visit_item(item);
+    collector.ids
 }
 
 fn skeletonize_payload(expr: &mut Expr, visitor: &mut Skeletonizer<'_, '_>) {
