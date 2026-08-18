@@ -355,6 +355,20 @@ pub(crate) struct SubstStats {
     /// Does `item.span` include the outer attributes? Measured, not assumed:
     /// substituting a span that excludes them duplicates every `#[no_mangle]`.
     pub span_starts_at_attr: usize,
+    /// **THE `files_touched` NUMERATOR — files with at least one SURVIVING
+    /// EDIT** (ruling 2026-08-18).
+    ///
+    /// NOT the size of the emission map. The map is SEEDED with every file
+    /// holding a function, because a crate with no surviving edits must still
+    /// emit its original text rather than an empty file (the g09 fix). Counting
+    /// map entries therefore reports a file as touched when nothing touched it —
+    /// measured on `bst`, which converges with every subject reverted and so
+    /// reported 1 against the span layer's 0.
+    ///
+    /// This counts distinct files among the reprints that SURVIVED the
+    /// changed-set filter — the same single derivation that decides what gets
+    /// spliced, so the counter cannot drift from the emission.
+    pub files_with_edits: usize,
 }
 
 pub(crate) fn collect_fn_spans(
@@ -456,6 +470,7 @@ pub(crate) fn splice_fn_prints_per_file(
         nested: 0,
         unrenderable: 0,
         span_starts_at_attr: 0,
+        files_with_edits: 0,
     };
     // Containment: a function span that strictly contains another's.
     for a in &spans {
@@ -505,6 +520,8 @@ pub(crate) fn splice_fn_prints_per_file(
             Err(_) => s.unrenderable += 1,
         }
     }
+
+    s.files_with_edits = per_file.values().filter(|(_, _, e)| !e.is_empty()).count();
 
     let mut out = std::collections::BTreeMap::new();
     for (key, (src, _base, mut edits)) in per_file {

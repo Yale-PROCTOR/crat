@@ -688,12 +688,18 @@ fn round_files(
     (
         std::collections::BTreeMap<plan::FileKey, String>,
         Vec<apply::Rollback>,
+        // **`files_touched`'s value — files with >=1 SURVIVING EDIT** (ruling
+        // 2026-08-18), NOT the emission map's size. On the span layer the two
+        // coincide because `render` returns only edited files; on the AST layer
+        // they do not, because the map is seeded (see `SubstStats`).
+        usize,
     ),
     String,
 > {
     if !ast_emit_enabled() {
         let (files, rollbacks) = render(emission_plan, emission_texts, reverted);
-        return Ok((files, rollbacks));
+        let edited = files.len();
+        return Ok((files, rollbacks, edited));
     }
     let reverts = ast_transform::revert_set_from_names(tcx, reverted)?;
     // **PER-FILE (A1, revived 2026-08-18).** The one-entry map that stood here
@@ -702,9 +708,9 @@ fn round_files(
     // verify loop's own end-to-end witnesses, which ARE multi-file, and which
     // it silently collapsed. The corpus emission is unchanged by this: a
     // single-file crate yields a single-entry map either way.
-    let (files, _stats) =
+    let (files, stats) =
         ast_transform::ast_emitted_files_from(tcx, capture, &reverts, root_key, table)?;
-    Ok((files, Vec::new()))
+    Ok((files, Vec::new(), stats.files_with_edits))
 }
 
 fn verify_and_revert(
@@ -776,13 +782,16 @@ fn verify_and_revert(
     // The round-0 emitted file — the key every later round re-emits into on the
     // AST path. Taken from the map production already built, never re-derived.
     let root_key: Option<plan::FileKey> = files.keys().next().cloned();
+    // Round 0 comes from `emit_files`, which returns only files it edited, so
+    // the seed is already the ruled definition.
+    let mut files_edited = files.len();
     let planned_edit_sites = edit_sites(&emission_plan, &emission_texts);
     let mut baseline: Option<verify::Baseline> = None;
     let mut facts = OutcomeFacts {
         degradations,
         excluded,
         emitted_count,
-        files_touched: files.len(),
+        files_touched: files_edited,
         reverted_count: 0,
         emitted_sites,
         unplaceable,
@@ -817,7 +826,7 @@ fn verify_and_revert(
         let staged = match materialized {
             Ok(staged) => staged,
             Err(err) => {
-                facts.files_touched = files.len();
+                facts.files_touched = files_edited;
                 facts.reverted_count = reverted.len();
                 return facts.degraded(format!("could not materialize the emitted crate: {err}"));
             }
@@ -855,7 +864,7 @@ fn verify_and_revert(
                     .unwrap_or(staged.root())
                     .to_path_buf(),
             );
-            facts.files_touched = files.len();
+            facts.files_touched = files_edited;
             return facts.degraded("probe-only: first diagnose recorded".to_owned());
         }
         // GATE MACHINERY STARTS HERE. Everything below the probe
@@ -897,7 +906,7 @@ fn verify_and_revert(
             }
             facts.emitted_count = kept.len();
             facts.reverted_count = taken.len();
-            facts.files_touched = files.len();
+            facts.files_touched = files_edited;
             return facts.emitted(source, files);
         }
 
@@ -949,7 +958,7 @@ fn verify_and_revert(
         // BATCH revert: the union of this round's attributions, not one
         // at a time — one compile per round rather than one per function.
         reverted.extend(newly);
-        let (next_files, rollbacks) = match round_files(
+        let (next_files, rollbacks, next_edited) = match round_files(
             tcx,
             capture,
             &emission_plan,
@@ -958,7 +967,7 @@ fn verify_and_revert(
             root_key.as_ref(),
             table,
         ) {
-            Ok(pair) => pair,
+            Ok(triple) => triple,
             Err(why) => {
                 escalation = Some(format!("escalation-required: re-emit failed: {why}"));
                 break;
@@ -972,6 +981,7 @@ fn verify_and_revert(
             break;
         }
         files = next_files;
+        files_edited = next_edited;
     }
 
     // ---- (C) BISECT: the escalation path ----
@@ -1019,7 +1029,7 @@ fn verify_and_revert(
         .and_then(|v| v.parse::<f64>().ok())
         .unwrap_or(900.0);
     if projected * probe_secs > budget_secs {
-        facts.files_touched = files.len();
+        facts.files_touched = files_edited;
         facts.reverted_count = reverted.len();
         facts.escalated = Some(escalation.clone());
         return facts.degraded(format!(
@@ -1029,7 +1039,7 @@ fn verify_and_revert(
     }
 
     let (final_reverted, probes) = bisect(&candidates, &reverted, |trial| {
-        let Ok((trial_files, rollbacks)) = round_files(
+        let Ok((trial_files, rollbacks, _)) = round_files(
             tcx,
             capture,
             &emission_plan,
@@ -1114,7 +1124,7 @@ fn verify_and_revert(
             facts.emitted(source, final_files)
         }
         _ => {
-            facts.files_touched = files.len();
+            facts.files_touched = files_edited;
             facts.reverted_count = final_reverted.len();
             facts.bisect_probes = probes;
             facts.escalated = Some(escalation.clone());
