@@ -2660,6 +2660,41 @@ pub(crate) fn edit_dump(
             let _ = writeln!(o, "   text   = {:?}", e.replacement);
         }
     }
+
+    // **THE TEXT COMPARISON.** The reason this dump exists: `emitted` and
+    // `reverted` count DECISIONS, and nothing at corpus scale compares TEXT, so
+    // an emission difference under a converged revert set is invisible to the
+    // very ledger that reports the divergence. Here the emitted bytes are
+    // compared against the substrate directly, on BOTH layers.
+    //
+    // A file the layer did not emit at all is reported as `<not emitted>`,
+    // which is a different fact from emitting identical bytes — the seeded map
+    // makes the AST layer emit where the span layer emits nothing.
+    let substrate_of = |key: &super::plan::FileKey| -> Option<String> {
+        let super::plan::FileKey::Real(path) = key else {
+            return None;
+        };
+        std::fs::read_to_string(path).ok()
+    };
+    let mut keys: std::collections::BTreeSet<&super::plan::FileKey> = files.keys().collect();
+    keys.extend(span_files.keys());
+    let _ = writeln!(o, "\n== EMITTED TEXT vs SUBSTRATE ==");
+    for key in keys {
+        let base = substrate_of(key);
+        let verdict = |emitted: Option<&String>| match (emitted, base.as_ref()) {
+            (None, _) => "<not emitted>".to_owned(),
+            (Some(_), None) => "<substrate unreadable>".to_owned(),
+            (Some(t), Some(b)) if t == b => format!("IDENTICAL ({} bytes)", t.len()),
+            (Some(t), Some(b)) => format!(
+                "DIFFERS (emitted {} vs substrate {} bytes)",
+                t.len(),
+                b.len()
+            ),
+        };
+        let _ = writeln!(o, "-- {key:?}");
+        let _ = writeln!(o, "   ast  = {}", verdict(files.get(key)));
+        let _ = writeln!(o, "   span = {}", verdict(span_files.get(key)));
+    }
     Ok(o)
 }
 
