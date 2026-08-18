@@ -600,6 +600,24 @@ fn reachable_source_nodes(graph: &SourceGraph, target: &str) -> BTreeSet<String>
     reachable
 }
 
+fn nested_reference_edges_reaching(graph: &SourceGraph, target: &str) -> BTreeSet<String> {
+    let mut witnesses = BTreeSet::new();
+    let mut seen = BTreeSet::new();
+    let mut work = VecDeque::from([target.to_owned()]);
+    while let Some(node) = work.pop_front() {
+        if !seen.insert(node.clone()) {
+            continue;
+        }
+        for edge in graph.incoming.get(&node).into_iter().flatten() {
+            if edge.label.starts_with(NESTED_REFERENCE_EDGE_PREFIX) {
+                witnesses.insert(format!("{}=>{}:{}", edge.source, edge.target, edge.label));
+            }
+            work.push_back(edge.source.clone());
+        }
+    }
+    witnesses
+}
+
 fn attribute_gap_candidates(
     graph: &SourceGraph,
     candidates: &[String],
@@ -771,6 +789,67 @@ fn add_value_edge(graph: &mut SourceGraph, source: Option<String>, target: Strin
             provenance_tags: BTreeSet::new(),
         });
     }
+}
+
+const SOURCE_WALKER_VERSION: &str = "a4-source-walker-v2-nested-reference";
+const NESTED_REFERENCE_EDGE_PREFIX: &str = "nested-reference-value:";
+
+#[allow(clippy::too_many_arguments)]
+fn add_nested_reference_place_edges<'tcx>(
+    graph: &mut SourceGraph,
+    tcx: TyCtxt<'tcx>,
+    slots: &CrateSlots,
+    fn_did: LocalDefId,
+    body: &Body<'tcx>,
+    source_place: Place<'tcx>,
+    target_place: Place<'tcx>,
+    location: &str,
+) -> Result<usize, String> {
+    if !source_place.projection.is_empty() {
+        return Err(format!(
+            "unsupported nested-reference place projection at {location}: {source_place:?}"
+        ));
+    }
+    let source_ty = source_place.ty(body, tcx).ty;
+    let target_ty = target_place.ty(body, tcx).ty;
+    let TyKind::Ref(_, referent_ty, _) = target_ty.kind() else {
+        return Err(format!(
+            "nested-reference target is not a reference at {location}: {target_ty:?}"
+        ));
+    };
+    if source_ty != *referent_ty {
+        return Err(format!(
+            "nested-reference referent type drift at {location}: source={source_ty:?} target={target_ty:?}"
+        ));
+    }
+
+    let mut added = 0;
+    for source_depth in 0..u8::MAX {
+        let target_depth = source_depth + 1;
+        let source = node_for_place_depth(tcx, slots, fn_did, body, source_place, source_depth);
+        let target = node_for_place_depth(tcx, slots, fn_did, body, target_place, target_depth);
+        match (source, target) {
+            (Some(source), Some(target)) => {
+                graph.add_edge(FlowEdge {
+                    kind: edge_kind(&source, &target),
+                    source,
+                    target,
+                    label: format!(
+                        "{NESTED_REFERENCE_EDGE_PREFIX}{location}:source-depth{source_depth}:target-depth{target_depth}"
+                    ),
+                    provenance_tags: BTreeSet::new(),
+                });
+                added += 1;
+            }
+            (None, None) => break,
+            (source, target) => {
+                return Err(format!(
+                    "nested-reference slot-shape drift at {location}: source-depth{source_depth}={source:?} target-depth{target_depth}={target:?}"
+                ));
+            }
+        }
+    }
+    Ok(added)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2898,7 +2977,35 @@ fn build_source_graph(tcx: TyCtxt<'_>, slots: &CrateSlots, export: &BoExport) ->
                         target,
                         format!("copy-for-deref:{location}"),
                     ),
-                    Rvalue::Ref(_, _, place) | Rvalue::RawPtr(_, place) => {
+                    Rvalue::Ref(_, _, place) => {
+                        if place
+                            .projection
+                            .iter()
+                            .any(|projection| matches!(projection, ProjectionElem::Deref))
+                        {
+                            add_value_edge(
+                                &mut graph,
+                                node_for_place(tcx, slots, fn_did, body, Place::from(place.local)),
+                                target,
+                                format!("address-through-pointer:{location}:{place:?}"),
+                            );
+                        } else {
+                            add_terminal(
+                                &mut graph,
+                                target,
+                                TerminalKind::StackOrLocalAddress,
+                                format!("address-of-local:{location}:{place:?}"),
+                                false,
+                            );
+                            add_nested_reference_place_edges(
+                                &mut graph, tcx, slots, fn_did, body, *place, *lhs, &location,
+                            )
+                            .unwrap_or_else(|error| {
+                                panic!("A4C STOP phase=graph-construction candidate=none: {error}")
+                            });
+                        }
+                    }
+                    Rvalue::RawPtr(_, place) => {
                         if place
                             .projection
                             .iter()
@@ -4407,7 +4514,108 @@ fn run_gap_attribution_worker(tcx: TyCtxt<'_>, t_tcx: Duration) -> Row {
     row
 }
 
+const WALKER_IMPACT_HEADER: &str = "program\tfield_key\tstatus\tnested_reference_edges\twitnesses";
+
+fn run_source_walker_impact_worker(tcx: TyCtxt<'_>, t_tcx: Duration) -> Row {
+    let started = Instant::now();
+    let program = std::env::var("CRAT_BOC1_NAME").expect("walker-impact program name");
+    let input_path =
+        PathBuf::from(std::env::var_os("CRAT_A4_SOURCE_INPUT").expect("walker-impact A4 input"));
+    let rows_path = PathBuf::from(
+        std::env::var_os("CRAT_A4_WALKER_IMPACT_ROWS").expect("walker-impact rows output"),
+    );
+    let checkpoint_path = PathBuf::from(
+        std::env::var_os("CRAT_A4_WALKER_IMPACT_CHECKPOINT")
+            .expect("walker-impact checkpoint output"),
+    );
+
+    emit_phase(started, "walker-impact-input", None, 0);
+    let input = parse_a4_input(&input_path).unwrap_or_else(|error| {
+        panic!("A4C STOP phase=walker-impact-input candidate=none: {error}")
+    });
+    let mut candidates = input
+        .into_iter()
+        .filter(|row| row.program == program)
+        .filter(|row| {
+            row.proof_reason == "allocation-source-count-0" || row.baseline_force == "sat"
+        })
+        .map(|row| row.field_key)
+        .collect::<Vec<_>>();
+    candidates.sort();
+    candidates.dedup();
+
+    emit_phase(started, "walker-impact-graph", None, 0);
+    let rust_program = collect_program(tcx);
+    let slots = CrateSlots::build(&rust_program);
+    let graph = build_source_graph(tcx, &slots, &BoExport::default());
+    verify_active_gap_waivers_exercised().unwrap_or_else(|error| {
+        panic!("A4C STOP phase=walker-impact-gap-waiver candidate=none: {error}")
+    });
+    let fields = candidate_fields(tcx, &slots);
+    let mut rendered = format!(
+        "source_walker_version={SOURCE_WALKER_VERSION}\nmeasurement_class=graph-only-reachability-impact\nsemantic_data=false\n\n{WALKER_IMPACT_HEADER}\n"
+    );
+    let mut affected = 0;
+    for (index, candidate) in candidates.iter().enumerate() {
+        emit_phase(
+            started,
+            "walker-impact-reachability",
+            Some(candidate),
+            index,
+        );
+        assert!(
+            fields.contains_key(candidate),
+            "A4C STOP phase=walker-impact-identity candidate={candidate}: field graph node absent"
+        );
+        let witnesses = nested_reference_edges_reaching(&graph, candidate);
+        let status = if witnesses.is_empty() {
+            "unaffected"
+        } else {
+            affected += 1;
+            "affected"
+        };
+        rendered.push_str(&format!(
+            "{}\t{}\t{status}\t{}\t{}\n",
+            clean_cell(&program),
+            clean_cell(candidate),
+            witnesses.len(),
+            clean_cell(&witnesses.into_iter().collect::<Vec<_>>().join("|")),
+        ));
+    }
+    write_atomic_checkpoint(&checkpoint_path, &rendered).unwrap_or_else(|error| {
+        panic!("A4C STOP phase=walker-impact-checkpoint candidate=none: {error}")
+    });
+    emit_phase(
+        started,
+        "walker-impact-checkpoint-written",
+        None,
+        candidates.len(),
+    );
+    write_atomic_checkpoint(&rows_path, &rendered).unwrap_or_else(|error| {
+        panic!("A4C STOP phase=walker-impact-finalize candidate=none: {error}")
+    });
+    emit_phase(started, "walker-impact-complete", None, candidates.len());
+
+    let mut row = Row::default();
+    row.set("program", program);
+    row.set("candidates", candidates.len());
+    row.set("affected", affected);
+    row.set("measurement_class", "graph-only-reachability-impact");
+    row.set("semantic_data", "false");
+    row.set("source_walker_version", SOURCE_WALKER_VERSION);
+    row.set("t_tcx_s", format!("{:.3}", t_tcx.as_secs_f64()));
+    row.set("status", "ok");
+    row.set(
+        "t_total_s",
+        format!("{:.3}", started.elapsed().as_secs_f64()),
+    );
+    row
+}
+
 pub(super) fn run_worker(tcx: TyCtxt<'_>, t_tcx: Duration) -> Row {
+    if std::env::var("CRAT_A4_SOURCE_WALKER_IMPACT").as_deref() == Ok("1") {
+        return run_source_walker_impact_worker(tcx, t_tcx);
+    }
     if std::env::var("CRAT_A4_SOURCE_GAP_INVENTORY").as_deref() == Ok("1") {
         return run_gap_inventory_worker(tcx, t_tcx);
     }
@@ -5455,6 +5663,56 @@ fn parse_table(path: &Path, header: &str, columns: usize) -> Result<Vec<Vec<Stri
     let input = fs::read_to_string(path)
         .map_err(|error| format!("read table {}: {error}", path.display()))?;
     parse_table_text(&input, header, columns, &path.display().to_string())
+}
+
+fn parse_walker_impact_rows(path: &Path, program: &str) -> Result<Vec<Vec<String>>, String> {
+    let input = fs::read_to_string(path)
+        .map_err(|error| format!("read walker-impact rows {}: {error}", path.display()))?;
+    let mut lines = input.lines();
+    for expected in [
+        format!("source_walker_version={SOURCE_WALKER_VERSION}"),
+        "measurement_class=graph-only-reachability-impact".to_owned(),
+        "semantic_data=false".to_owned(),
+        String::new(),
+        WALKER_IMPACT_HEADER.to_owned(),
+    ] {
+        let actual = lines.next().unwrap_or_default();
+        if actual != expected {
+            return Err(format!(
+                "walker-impact schema drift: expected={expected:?} actual={actual:?}"
+            ));
+        }
+    }
+    let mut identities = BTreeSet::new();
+    let mut rows = Vec::new();
+    for (offset, line) in lines.enumerate() {
+        let row = line.split('\t').map(str::to_owned).collect::<Vec<_>>();
+        if row.len() != 5
+            || row[0] != program
+            || !matches!(row[2].as_str(), "affected" | "unaffected")
+        {
+            return Err(format!(
+                "walker-impact row {} is malformed: {row:?}",
+                offset + 6
+            ));
+        }
+        if !identities.insert(row[1].clone()) {
+            return Err(format!("walker-impact duplicate identity: {}", row[1]));
+        }
+        let count = row[3]
+            .parse::<usize>()
+            .map_err(|error| format!("walker-impact edge count: {error}"))?;
+        let witness_count = if row[4].is_empty() {
+            0
+        } else {
+            row[4].split('|').count()
+        };
+        if count != witness_count || (row[2] == "affected") != (count > 0) {
+            return Err(format!("walker-impact status/witness drift: {row:?}"));
+        }
+        rows.push(row);
+    }
+    Ok(rows)
 }
 
 fn parse_table_text(
@@ -10301,6 +10559,317 @@ fn run_gap_attribution_probe(contract: &MeasurementContract) {
     );
 }
 
+#[derive(Clone, Debug)]
+struct WalkerImpactProgramRecord {
+    program: String,
+    candidates: usize,
+    affected: usize,
+    manifest: String,
+    wall_s: f64,
+    memory_peaks: CandidateMemoryPeaks,
+}
+
+fn run_source_walker_impact_audit(contract: &MeasurementContract) {
+    use super::orchestrate::workspace_root;
+
+    let root = contract.run_root.join("walker-impact-audit");
+    assert!(
+        !root.exists(),
+        "A4C STOP phase=walker-impact-setup candidate=none: audit directory must be fresh"
+    );
+    fs::create_dir(&root).expect("create walker-impact audit directory");
+    let mut scope = vec!["bzip2"];
+    scope.extend(
+        RETRY3_PREDECESSOR_SHARDS
+            .iter()
+            .map(|(program, _, _)| *program),
+    );
+    assert_eq!(scope.len(), 16);
+    assert_eq!(scope.iter().copied().collect::<BTreeSet<_>>().len(), 16);
+
+    let mut records = Vec::new();
+    let mut all_rows = Vec::new();
+    for program_name in scope {
+        let program = contract
+            .programs
+            .iter()
+            .copied()
+            .find(|program| program.name == program_name)
+            .expect("walker-impact program in measurement contract");
+        let dir = root.join(program_name);
+        fs::create_dir(&dir).expect("create walker-impact program directory");
+        let preflight = fs::read_to_string("/proc/meminfo")
+            .map(|meminfo| evaluate_host_memory_preflight(&meminfo))
+            .unwrap_or_else(|error| HostMemoryPreflight {
+                mem_available_bytes: None,
+                required_bytes: CANDIDATE_MEMORY_MAX_BYTES + HOST_MEMORY_MARGIN_BYTES,
+                status: "host-memory-unavailable",
+                error: Some(format!("read /proc/meminfo: {error}")),
+            });
+        let timestamp_unix_s = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock before Unix epoch")
+            .as_secs();
+        fs::write(
+            dir.join("memory-preflight.txt"),
+            preflight.render(program_name, "walker-impact-audit", timestamp_unix_s),
+        )
+        .expect("write walker-impact memory preflight");
+        if !preflight.launch_allowed() {
+            let manifest = write_manifest(&dir, &["memory-preflight.txt"])
+                .expect("manifest failed walker-impact preflight");
+            panic!(
+                "A4C STOP phase=walker-impact-memory-preflight candidate={program_name} status={} mem_available_bytes={} required_bytes={} measurement_started=false manifest={manifest}",
+                preflight.status,
+                preflight.mem_available_bytes.unwrap_or(0),
+                preflight.required_bytes,
+            );
+        }
+
+        let waiver_path = dir.join("gap-waivers.tsv");
+        if program_name == "bzip2" {
+            write_atomic_checkpoint(
+                &waiver_path,
+                &render_gap_waivers(&[registered_bzip2_gap_waiver()]),
+            )
+            .expect("write walker-impact bzip2 waiver");
+        }
+        let input = workspace_root()
+            .join("benchmarks/rs-crown-derived")
+            .join(program.name)
+            .join(program.lib_root);
+        let rows_path = dir.join("impact.tsv");
+        let checkpoint_path = dir.join("checkpoint.tsv");
+        let mut extra = vec![
+            ("CRAT_A4_SOURCE_WALKER_IMPACT", "1".to_owned()),
+            (
+                "CRAT_A4_SOURCE_INPUT",
+                contract.input_path.display().to_string(),
+            ),
+            (
+                "CRAT_A4_WALKER_IMPACT_ROWS",
+                rows_path.display().to_string(),
+            ),
+            (
+                "CRAT_A4_WALKER_IMPACT_CHECKPOINT",
+                checkpoint_path.display().to_string(),
+            ),
+        ];
+        if program_name == "bzip2" {
+            extra.push((
+                "CRAT_A4_SOURCE_GAP_WAIVERS",
+                waiver_path.display().to_string(),
+            ));
+        }
+        let outcome = run_capped_candidate_child(program_name, &input, &dir, &extra);
+        if outcome.status != "ok" {
+            let (phase, candidate) = last_phase(&outcome.stderr);
+            let receipt = format!(
+                "machine_id={MACHINE_ID}\nplatform={PLATFORM}\nmeasurement_class=graph-only-reachability-impact\nsemantic_data=false\ncompleted=false\ncandidate_processing=graph-only\nsource_walker_version={SOURCE_WALKER_VERSION}\nmemory_limit=cgroup-100GiB\nmemory_max_bytes={CANDIDATE_MEMORY_MAX_BYTES}\ncap_verified={}\noom_kills={}\nmemory_max_events={}\nwall_bound_kind=liveness\nwall_cap_s={LIVENESS_BOUND_S}\nprogram={program_name}\nstatus={}\nanalysis_head={}\nlast_phase={phase}\nlast_candidate={candidate}\nwall_s={:.3}\n{}memory_receipt_error={}\n",
+                outcome.cap_verified,
+                outcome.oom_kills,
+                outcome.memory_max_events,
+                outcome.status,
+                contract.head,
+                outcome.wall_s,
+                outcome.memory_receipt.render(),
+                clean_cell(outcome.memory_receipt_error.as_deref().unwrap_or("none")),
+            );
+            fs::write(dir.join("receipt.txt"), receipt).expect("write failed impact receipt");
+            let mut files = vec![
+                "memory-preflight.txt",
+                "receipt.txt",
+                "worker.out",
+                "worker.err",
+                "time.txt",
+            ];
+            for file in ["checkpoint.tsv", "impact.tsv", "gap-waivers.tsv"] {
+                if dir.join(file).is_file() {
+                    files.push(file);
+                }
+            }
+            let manifest =
+                write_manifest(&dir, &files).expect("manifest failed walker-impact worker");
+            panic!(
+                "A4C STOP phase={phase} candidate={candidate} program={program_name} measurement=walker-impact status={} wall_s={:.3} manifest={manifest}",
+                outcome.status, outcome.wall_s,
+            );
+        }
+
+        let memory_peaks = outcome
+            .memory_receipt
+            .require_complete()
+            .expect("completed walker-impact worker requires both memory metrics");
+        assert_eq!(
+            fs::read(&rows_path).expect("read walker-impact rows"),
+            fs::read(&checkpoint_path).expect("read walker-impact checkpoint"),
+            "A4C STOP phase=walker-impact-finalize candidate={program_name}: checkpoint byte drift"
+        );
+        let rows = parse_walker_impact_rows(&rows_path, program_name).unwrap_or_else(|error| {
+            panic!("A4C STOP phase=walker-impact-schema candidate={program_name}: {error}")
+        });
+        let expected = isolated_identities(contract, program_name)
+            .into_iter()
+            .map(|identity| identity.identity.field_key)
+            .collect::<BTreeSet<_>>();
+        let actual = rows
+            .iter()
+            .map(|row| row[1].clone())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            actual, expected,
+            "A4C STOP phase=walker-impact-identity candidate={program_name}: candidate set drift"
+        );
+        let affected = rows.iter().filter(|row| row[2] == "affected").count();
+        if program_name == "bzip2" {
+            assert!(
+                rows.iter()
+                    .any(|row| { row[1] == "bzip2::zzzz::field1@d0" && row[2] == "affected" }),
+                "A4C STOP phase=walker-impact-positive-control candidate=bzip2::zzzz::field1@d0: bzip2 must be affected"
+            );
+        }
+        let receipt = format!(
+            "machine_id={MACHINE_ID}\nplatform={PLATFORM}\nmeasurement_class=graph-only-reachability-impact\nsemantic_data=false\ncompleted=true\ncandidate_processing=graph-only\nsource_walker_version={SOURCE_WALKER_VERSION}\nmemory_limit=cgroup-100GiB\nmemory_max_bytes={CANDIDATE_MEMORY_MAX_BYTES}\ncap_verified={}\noom_kills={}\nmemory_max_events={}\nwall_bound_kind=liveness\nwall_cap_s={LIVENESS_BOUND_S}\nprogram={program_name}\ncandidates={}\naffected={affected}\nstatus=ok\nanalysis_head={}\nlast_phase=complete\nlast_candidate=none\nwall_s={:.3}\n{}memory_receipt_error=none\n",
+            outcome.cap_verified,
+            outcome.oom_kills,
+            outcome.memory_max_events,
+            rows.len(),
+            contract.head,
+            outcome.wall_s,
+            render_candidate_memory_receipt(memory_peaks),
+        );
+        fs::write(dir.join("receipt.txt"), receipt).expect("write completed impact receipt");
+        let mut files = vec![
+            "checkpoint.tsv",
+            "impact.tsv",
+            "memory-preflight.txt",
+            "receipt.txt",
+            "time.txt",
+            "worker.err",
+            "worker.out",
+        ];
+        if program_name == "bzip2" {
+            files.push("gap-waivers.tsv");
+        }
+        let manifest =
+            write_manifest(&dir, &files).expect("manifest completed walker-impact worker");
+        assert_eq!(
+            verify_manifest(&dir).expect("verify walker-impact manifest"),
+            manifest
+        );
+        all_rows.extend(rows);
+        records.push(WalkerImpactProgramRecord {
+            program: program_name.to_owned(),
+            candidates: expected.len(),
+            affected,
+            manifest,
+            wall_s: outcome.wall_s,
+            memory_peaks,
+        });
+        let mut partial = "program\tcandidates\taffected\tmanifest_sha256\twall_s\tpeak_rss_kb\tcgroup_peak_memory_kb\n".to_owned();
+        for record in &records {
+            partial.push_str(&format!(
+                "{}\t{}\t{}\t{}\t{:.3}\t{}\t{}\n",
+                record.program,
+                record.candidates,
+                record.affected,
+                record.manifest,
+                record.wall_s,
+                record.memory_peaks.process_peak_rss_kb,
+                record.memory_peaks.cgroup_peak_memory_kb,
+            ));
+        }
+        write_atomic_checkpoint(&root.join("partial.tsv"), &partial)
+            .expect("write walker-impact partial");
+    }
+
+    let mut impact = format!(
+        "source_walker_version={SOURCE_WALKER_VERSION}\nmeasurement_class=graph-only-reachability-impact\nsemantic_data=false\n\n{WALKER_IMPACT_HEADER}\n"
+    );
+    for row in &all_rows {
+        impact.push_str(&format!("{}\n", row.join("\t")));
+    }
+    write_atomic_checkpoint(&root.join("impact.tsv"), &impact)
+        .expect("write aggregate walker-impact rows");
+    let predecessor_reruns = records
+        .iter()
+        .filter(|record| record.program != "bzip2" && record.affected > 0)
+        .map(|record| (record.program.as_str(), record.affected))
+        .collect::<Vec<_>>();
+    let mut reruns = "program\taffected_candidates\n".to_owned();
+    for (program, affected) in &predecessor_reruns {
+        reruns.push_str(&format!("{program}\t{affected}\n"));
+    }
+    write_atomic_checkpoint(&root.join("predecessor-reruns.tsv"), &reruns)
+        .expect("write predecessor rerun list");
+    let wall_sum = records.iter().map(|record| record.wall_s).sum::<f64>();
+    let peak_rss = records
+        .iter()
+        .map(|record| record.memory_peaks.process_peak_rss_kb)
+        .max()
+        .unwrap_or(0);
+    let cgroup_peak = records
+        .iter()
+        .map(|record| record.memory_peaks.cgroup_peak_memory_kb)
+        .max()
+        .unwrap_or(0);
+    let affected_total = all_rows.iter().filter(|row| row[2] == "affected").count();
+    let report = format!(
+        "# Nested-reference walker impact audit\n\n- walker: `{SOURCE_WALKER_VERSION}`\n- scope: bzip2 positive control plus 15 manifested predecessors\n- candidates audited: {}\n- affected candidates: {affected_total}\n- affected predecessor programs: {}\n- semantic data: false\n- wall sum on {MACHINE_ID}: {wall_sum:.3} s\n- peak GNU-time RSS: {peak_rss} KiB\n- peak cgroup memory: {cgroup_peak} KiB\n",
+        all_rows.len(),
+        if predecessor_reruns.is_empty() {
+            "none".to_owned()
+        } else {
+            predecessor_reruns
+                .iter()
+                .map(|(program, count)| format!("{program}:{count}"))
+                .collect::<Vec<_>>()
+                .join(",")
+        },
+    );
+    fs::write(root.join("report.md"), report).expect("write walker-impact report");
+    let provenance = format!(
+        "machine_id={MACHINE_ID}\nplatform={PLATFORM}\nanalysis_head={}\nanalysis_branch=codex/a4-source-census\nmeasurement_class=graph-only-reachability-impact\nsemantic_data=false\nsource_walker_version={SOURCE_WALKER_VERSION}\nderived_substrate_digest={DERIVED_SUBSTRATE_DIGEST}\nwall_bound_kind=liveness\nwall_cap_s={LIVENESS_BOUND_S}\nmemory_limit=cgroup-100GiB\nprograms={}\ncandidates={}\naffected_candidates={affected_total}\naffected_predecessor_programs={}\nprogram_manifests={}\nwall_sum_s={wall_sum:.3}\npeak_rss_kb={peak_rss}\ncgroup_peak_memory_kb={cgroup_peak}\ntiming_comparison=forbidden-across-machines\n",
+        contract.head,
+        records
+            .iter()
+            .map(|record| record.program.as_str())
+            .collect::<Vec<_>>()
+            .join(","),
+        all_rows.len(),
+        predecessor_reruns
+            .iter()
+            .map(|(program, _)| *program)
+            .collect::<Vec<_>>()
+            .join(","),
+        records
+            .iter()
+            .map(|record| format!("{}:{}", record.program, record.manifest))
+            .collect::<Vec<_>>()
+            .join(","),
+    );
+    fs::write(root.join("provenance.txt"), provenance).expect("write walker-impact provenance");
+    let manifest = write_manifest(
+        &root,
+        &[
+            "impact.tsv",
+            "partial.tsv",
+            "predecessor-reruns.tsv",
+            "provenance.txt",
+            "report.md",
+        ],
+    )
+    .expect("manifest walker-impact aggregate");
+    eprintln!(
+        "A4C walker-impact complete manifest={manifest} walker={SOURCE_WALKER_VERSION} affected_candidates={affected_total} predecessor_reruns={}",
+        predecessor_reruns
+            .iter()
+            .map(|(program, count)| format!("{program}:{count}"))
+            .collect::<Vec<_>>()
+            .join(",")
+    );
+}
+
 #[test]
 #[ignore = "A4 exhaustive gap-site inventory; run once sequentially on the dedicated Linux lane"]
 fn a4_source_gap_inventory() {
@@ -10323,6 +10892,14 @@ fn a4_source_gap_attribution() {
     let contract = measurement_contract();
     enforce_substrate_preflight(&contract);
     run_gap_attribution_probe(&contract);
+}
+
+#[test]
+#[ignore = "A4 nested-reference walker impact audit; run once sequentially on the dedicated Linux lane"]
+fn a4_source_walker_impact() {
+    let contract = measurement_contract();
+    enforce_substrate_preflight(&contract);
+    run_source_walker_impact_audit(&contract);
 }
 
 #[test]
@@ -11929,6 +12506,109 @@ mod tests {
 
         assert_eq!(actual[&gap], vec!["Fixture::field0@d0"]);
         assert!(!actual[&gap].contains(&"Fixture::field1@d0".to_owned()));
+    }
+
+    #[test]
+    fn nested_reference_rule_is_depth_shifted_scalar_narrow_and_fail_closed() {
+        let supported = r#"
+            unsafe fn consume_pointer(_: &mut *mut u8) {}
+            unsafe fn consume_scalar(_: &mut u64) {}
+
+            pub unsafe fn pointer_reference(mut pointer: *mut u8) {
+                consume_pointer(&mut pointer);
+            }
+
+            pub unsafe fn scalar_reference(mut scalar: u64) {
+                consume_scalar(&mut scalar);
+            }
+        "#;
+        ::utils::compilation::run_compiler_on_str(supported, |tcx| {
+            let program = super::super::collect_program(tcx);
+            let slots = CrateSlots::build(&program);
+            let graph = build_source_graph(tcx, &slots, &BoExport::default());
+            let nested_edges = graph
+                .incoming
+                .values()
+                .flatten()
+                .filter(|edge| edge.label.starts_with("nested-reference-value:"))
+                .collect::<Vec<_>>();
+            assert_eq!(
+                nested_edges.len(),
+                1,
+                "only the pointer reference contributes a nested value edge: {nested_edges:#?}"
+            );
+            assert!(nested_edges[0].label.contains("pointer_reference"));
+            assert!(
+                nested_edges[0]
+                    .label
+                    .ends_with(":source-depth0:target-depth1")
+            );
+            assert!(
+                nested_edges
+                    .iter()
+                    .all(|edge| !edge.label.contains("scalar_reference")),
+                "a scalar reference must not expand pointer provenance"
+            );
+        })
+        .unwrap_or_else(|error| error.raise());
+
+        let unsupported = r#"
+            unsafe fn consume(_: &mut *mut u8) {}
+
+            pub unsafe fn projected_reference(mut pair: (*mut u8, u8)) {
+                consume(&mut pair.0);
+            }
+        "#;
+        ::utils::compilation::run_compiler_on_str(unsupported, |tcx| {
+            let program = super::super::collect_program(tcx);
+            let slots = CrateSlots::build(&program);
+            let stopped = panic::catch_unwind(AssertUnwindSafe(|| {
+                build_source_graph(tcx, &slots, &BoExport::default())
+            }));
+            assert!(
+                stopped.is_err(),
+                "an unregistered projected reference shape must fail closed"
+            );
+        })
+        .unwrap_or_else(|error| error.raise());
+    }
+
+    #[test]
+    fn walker_impact_is_candidate_reachability_not_program_presence() {
+        let mut graph = SourceGraph::default();
+        graph.add_edge(FlowEdge {
+            source: "pointer-source".to_owned(),
+            target: "reference-depth1".to_owned(),
+            kind: FlowEdgeKind::Local,
+            label: format!(
+                "{NESTED_REFERENCE_EDGE_PREFIX}fixture:bb0[0]:source-depth0:target-depth1"
+            ),
+            provenance_tags: BTreeSet::new(),
+        });
+        graph.add_edge(FlowEdge {
+            source: "reference-depth1".to_owned(),
+            target: "Affected::field0@d0".to_owned(),
+            kind: FlowEdgeKind::Field,
+            label: "candidate-store".to_owned(),
+            provenance_tags: BTreeSet::new(),
+        });
+        graph.add_edge(FlowEdge {
+            source: "other-source".to_owned(),
+            target: "Unaffected::field0@d0".to_owned(),
+            kind: FlowEdgeKind::Field,
+            label: "unrelated-store".to_owned(),
+            provenance_tags: BTreeSet::new(),
+        });
+        graph.canonicalize();
+
+        assert_eq!(
+            nested_reference_edges_reaching(&graph, "Affected::field0@d0").len(),
+            1
+        );
+        assert!(
+            nested_reference_edges_reaching(&graph, "Unaffected::field0@d0").is_empty(),
+            "program-level presence must not mark an unrelated candidate affected"
+        );
     }
 
     #[test]
