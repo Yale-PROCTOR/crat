@@ -1669,6 +1669,14 @@ pub(crate) fn ast_emitted_files_from(
     capture: &AstCapture,
     reverts: &RevertSet,
     root_key: Option<&super::plan::FileKey>,
+    // **THE CALLER'S TABLE, NOT A RE-DERIVATION.** This entry used to call
+    // `decide_table_with_ctx` itself — a SECOND derivation of the decision
+    // table, and the module's founding defect class in its purest form. It was
+    // invisible on every fixture whose table is deterministic, and visible the
+    // moment one is INJECTED: `rewrite_core_injected` injects into its own
+    // table, the re-derived one never saw the injection, and the AST layer
+    // emitted a program without the very edit the test exists to break on.
+    table: &super::decision::DecisionTable,
 ) -> Result<
     (
         std::collections::BTreeMap<super::plan::FileKey, String>,
@@ -1676,8 +1684,7 @@ pub(crate) fn ast_emitted_files_from(
     ),
     String,
 > {
-    let (table, _ctx) = super::decide_table_with_ctx(tcx)?;
-    let (_, _, seams, _, _, _, _, krate, edited) = transform_with(capture, &table, reverts)?;
+    let (_, _, seams, _, _, _, _, krate, edited) = transform_with(capture, table, reverts)?;
     let (mut files, stats) =
         super::ast_bridge::splice_fn_prints_per_file(tcx, &krate, Some(&edited));
     if seams.len_fabricated > 0 {

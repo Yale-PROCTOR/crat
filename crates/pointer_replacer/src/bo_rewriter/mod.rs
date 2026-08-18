@@ -606,6 +606,7 @@ fn rewrite_core_injected(
         Ok(verify_and_revert(
             tcx,
             &capture,
+            &table,
             tree_base,
             virtual_original,
             max_rounds,
@@ -682,6 +683,7 @@ fn round_files(
     emission_texts: &std::collections::BTreeMap<plan::FileKey, String>,
     reverted: &std::collections::BTreeSet<String>,
     root_key: Option<&plan::FileKey>,
+    table: &decision::DecisionTable,
 ) -> Result<
     (
         std::collections::BTreeMap<plan::FileKey, String>,
@@ -700,13 +702,15 @@ fn round_files(
     // verify loop's own end-to-end witnesses, which ARE multi-file, and which
     // it silently collapsed. The corpus emission is unchanged by this: a
     // single-file crate yields a single-entry map either way.
-    let (files, _stats) = ast_transform::ast_emitted_files_from(tcx, capture, &reverts, root_key)?;
+    let (files, _stats) =
+        ast_transform::ast_emitted_files_from(tcx, capture, &reverts, root_key, table)?;
     Ok((files, Vec::new()))
 }
 
 fn verify_and_revert(
     tcx: TyCtxt<'_>,
     capture: &ast_transform::AstCapture,
+    table: &decision::DecisionTable,
     tree_base: Option<&std::path::Path>,
     virtual_original: Option<String>,
     max_rounds: usize,
@@ -952,6 +956,7 @@ fn verify_and_revert(
             &emission_texts,
             &reverted,
             root_key.as_ref(),
+            table,
         ) {
             Ok(pair) => pair,
             Err(why) => {
@@ -1031,6 +1036,7 @@ fn verify_and_revert(
             &emission_texts,
             trial,
             root_key.as_ref(),
+            table,
         ) else {
             return false;
         };
