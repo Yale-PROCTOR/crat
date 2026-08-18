@@ -58,13 +58,6 @@ use emitability::EmitabilityFacts;
 /// This enum is where that rule is paid for at the decision layer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum RefGate {
-    /// **Every** in-crate reference blocks — M1's behaviour through S3.6-0, and
-    /// task 2's production setting.
-    ///
-    /// Task 2 computes classes and decides nothing, so the production call site
-    /// passes this and the corpus cannot move. Zero delta is a property of the
-    /// code, not an outcome of a run — the S3.6-0 pattern.
-    BlockAll,
     /// Adaptable functions pass the gate; **pinned ones still block**.
     ///
     /// The hypothetical the class builder asks about. Task 3 is where a
@@ -1100,16 +1093,16 @@ fn decide_one_ladder(ctx: &Ctx<'_, '_>, subject: &Subject) -> Decision {
     }
     // **S3.6-0 recorded the reference KIND; S3.6-1 makes the gate a MODE.**
     //
-    // Under [`RefGate::BlockAll`] — task 2's production setting and every
-    // setting before it — any reference degrades, adaptable or pinned alike,
-    // exactly as it did at S3.6-0. Under [`RefGate::LiftAdaptable`] the
+    // Under the former `RefGate::BlockAll` — task 2's setting and every setting
+    // before it, **deleted at M-3 as measured-dead** — any reference degraded,
+    // adaptable or pinned alike, exactly as at S3.6-0. Under the surviving
+    // [`RefGate::LiftAdaptable`] the
     // adaptable population passes and the pinned population still blocks, which
     // is the hypothetical `co_conversion` builds its node set from.
     if let Some(refs) = facts.referenced.get(&subject.fn_did)
         && let Some((_kind, span)) = refs.first()
     {
         let blocks = match gate {
-            RefGate::BlockAll => true,
             RefGate::LiftAdaptable => !emitability::RefKind::is_adaptable(refs),
         };
         if blocks {

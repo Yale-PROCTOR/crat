@@ -428,19 +428,6 @@ pub(crate) fn rewrite_m1_path_injected(
         max_rounds,
         inject,
         false,
-        ast_emit_enabled(),
-    )
-}
-
-#[cfg(test)]
-pub(crate) fn rewrite_m1_path_with_cap(
-    root: &std::path::Path,
-    max_rounds: usize,
-) -> RewriteOutcome {
-    rewrite_core(
-        ::utils::compilation::path_to_input(root),
-        Some(root),
-        max_rounds,
     )
 }
 
@@ -449,14 +436,7 @@ fn rewrite_core(
     tree_base: Option<&std::path::Path>,
     max_rounds: usize,
 ) -> RewriteOutcome {
-    rewrite_core_injected(
-        input,
-        tree_base,
-        max_rounds,
-        &|_| {},
-        false,
-        ast_emit_enabled(),
-    )
+    rewrite_core_injected(input, tree_base, max_rounds, &|_| {}, false)
 }
 
 /// [`rewrite_core`] with a hook applied to the finished decision table at the
@@ -472,7 +452,6 @@ fn rewrite_core_injected(
     max_rounds: usize,
     inject: &(dyn Fn(&mut decision::DecisionTable) + Sync),
     probe_only: bool,
-    ast: bool,
 ) -> RewriteOutcome {
     // The string entry's original text, so a baseline exists for it too.
     let virtual_original = match &input {
@@ -633,7 +612,6 @@ fn rewrite_core_injected(
         // computed): it is the placed set, already filtered above, so `emitted`
         // names what the rewrite actually did to the source.
         Ok(verify_and_revert(
-            ast,
             tcx,
             &capture,
             &table,
@@ -677,53 +655,6 @@ fn rewrite_core_injected(
 /// the PROOF is the acceptance gate's byte/digest reproduction of the pinned
 /// oracle verdicts.
 #[allow(clippy::too_many_arguments)]
-/// **Is the verify loop emitting through the AST layer?**
-///
-/// TRANSITIONAL, and it exists for one reason: the acceptance gate has to run
-/// BOTH layers over the frozen corpus and compare verdicts and counters against
-/// the pinned oracle. A swap with no switch could only be measured by breaking
-/// the corpus and reading the wreckage.
-///
-/// Default is the span layer, so every existing sweep, golden and pin keeps its
-/// meaning until the gate says otherwise. **M-3 deletes the span layer and this
-/// switch together** — it is not a permanent configuration surface.
-fn ast_emit_enabled() -> bool {
-    std::env::var_os("CRAT_M1_AST_EMIT").is_some()
-}
-
-/// **READ ONCE, AT THE ENTRY, THEN PASSED AS A VALUE** (2026-08-18).
-///
-/// The switch used to be read deep in [`round_files`], which made the layer a
-/// property of the PROCESS at the moment of the read. The suite runs its tests
-/// as threads of one process, so a test selecting a layer was selecting it for
-/// every concurrently running test — and a second such test made that concrete:
-/// one test's `remove_var` cleared the other's selection mid-rewrite, and the
-/// AST arm silently measured the span layer. It passed in isolation and failed
-/// in the suite.
-///
-/// Threading it as a parameter makes the layer a property of the CALL. Tests
-/// pass it explicitly and mutate no environment; production reads the variable
-/// once, here. M-3 deletes the parameter with the span layer.
-///
-/// This is the same lesson the z3 seed pin records: a process-global knob set
-/// by a test leaks into the parallel runner.
-#[cfg(test)]
-pub(crate) fn rewrite_m1_path_on_layer(
-    root: &std::path::Path,
-    max_rounds: usize,
-    inject: &(dyn Fn(&mut decision::DecisionTable) + Sync),
-    ast: bool,
-) -> RewriteOutcome {
-    rewrite_core_injected(
-        ::utils::compilation::path_to_input(root),
-        Some(root),
-        max_rounds,
-        inject,
-        false,
-        ast,
-    )
-}
-
 /// **THE ROUND'S FILE SET — ONE derivation, BOTH call sites.**
 ///
 /// The per-round re-render, the bisect probes, and **the bisect's final
@@ -754,7 +685,6 @@ fn round_files(
     reverted: &std::collections::BTreeSet<String>,
     root_key: Option<&plan::FileKey>,
     table: &decision::DecisionTable,
-    ast: bool,
 ) -> Result<
     (
         std::collections::BTreeMap<plan::FileKey, String>,
@@ -771,11 +701,6 @@ fn round_files(
     ),
     String,
 > {
-    if !ast {
-        let (files, rollbacks, maps) = render(emission_plan, emission_texts, reverted);
-        let edited = files.len();
-        return Ok((files, rollbacks, edited, maps));
-    }
     let reverts = ast_transform::revert_set_from_names(tcx, reverted)?;
     // **PER-FILE (A1, revived 2026-08-18).** The one-entry map that stood here
     // was licensed by C-20's corpus measurement — 20/20 single crate-source
@@ -789,7 +714,6 @@ fn round_files(
 }
 
 fn verify_and_revert(
-    ast: bool,
     tcx: TyCtxt<'_>,
     capture: &ast_transform::AstCapture,
     table: &decision::DecisionTable,
@@ -912,7 +836,6 @@ fn verify_and_revert(
         &std::collections::BTreeSet::new(),
         root_key.as_ref(),
         table,
-        ast,
     ) {
         Ok((round0, rollbacks, edited, maps)) => {
             if !rollbacks.is_empty() {
@@ -1088,7 +1011,6 @@ fn verify_and_revert(
             &reverted,
             root_key.as_ref(),
             table,
-            ast,
         ) {
             Ok(quad) => quad,
             Err(why) => {
@@ -1171,7 +1093,6 @@ fn verify_and_revert(
             trial,
             root_key.as_ref(),
             table,
-            ast,
         ) else {
             return false;
         };
@@ -1207,7 +1128,6 @@ fn verify_and_revert(
         &final_reverted,
         root_key.as_ref(),
         table,
-        ast,
     ) {
         Ok(quad) => quad,
         Err(why) => {
@@ -1766,7 +1686,6 @@ pub(crate) fn diagnose_once(
         MAX_REVERT_ROUNDS,
         &|_| {},
         true,
-        ast_emit_enabled(),
     );
     let (observed_root, diags) = outcome.into_capture();
     // FAIL-CLOSED. A capture without its frame cannot be canonicalized, and the
@@ -2145,33 +2064,31 @@ pub(crate) struct Emission {
 /// Apply a plan's edits, minus the reverted owners, to the original texts.
 ///
 /// Pure: no compiler session, no analysis. This is what a revert round runs.
-/// # EXHAUSTIVE CALL-SITE TABLE (2026-08-18) — a fourth emission site must be
-/// impossible outside this table
+/// # THE EMISSION SITES ARE GONE — this is PLAN VALIDATION (M-3, 2026-08-18)
 ///
-/// Three unswitched emission sites were found one at a time, each after the
-/// previous was called the last: the bisect final emission (`:1069`), then
-/// round 0 (`emit_files`'s product). Each was invisible to the three counters,
-/// which compare DECISIONS while the difference was TEXT. So the sites are
-/// enumerated rather than trusted.
+/// This was `render`, the span layer's emitter. Four emission sites routed
+/// through it and each was found one at a time, after the previous was called
+/// the last: the bisect final emission (`:1069`), then round 0 — the largest,
+/// carrying 35 of the corpus's 64 emissions. M-3 deleted the span layer, so
+/// **there is no longer an emission path here at all**, and the class of defect
+/// that table existed to prevent is now unrepresentable rather than merely
+/// absent: the only emitter is the AST layer, reached through `round_files`.
 ///
-/// **Production — exactly two:**
+/// What survives is the part that was never layer-specific. `emit_files` calls
+/// this once, with **no revert set**, to answer one question: does the PLAN
+/// apply — are its byte ranges in bounds, on char boundaries, and mutually
+/// non-overlapping? Those rollbacks feed the pre-loop structural gate. That
+/// gate judges the plan, not a layer, which is why it was kept when its
+/// emitter was deleted.
 ///
-/// | site | caller | disposition |
-/// |---|---|---|
-/// | `round_files`, span branch | the layer switch | **THE emission site.** All four emission paths — round 0, the per-round re-emit, the bisect probes, the bisect final emission — now route here. M-3 deletes this branch with the span layer |
-/// | `emit_files` | plan validation | **NOT an emission path since 2026-08-18.** Its `rollbacks` feed the pre-loop structural gate, which judges the PLAN (byte-offset collisions) and is therefore layer-independent; its `files` supply `root_key`. ⚠ **M-3 must keep or replace that gate — deleting `render` outright removes it** |
+/// ⚠ **Its `files` are NOT an emission.** They exist so the caller can pick a
+/// `root_key`, and nothing verifies or ships them.
 ///
-/// **Test-only — nine, none an emission path:** `edit_dump` and
-/// `phase3_fn_parity` (both `#[cfg(test)]`, each rendering the SPAN side of a
-/// deliberate two-layer comparison), and seven fixtures in `emit_tests` /
-/// `ast_transform::tests`.
-///
-/// Not in this table and not this function: the `.render(…)` METHODS on
-/// `fat_facts`, `sign_facts` and `decision::seam`, which share only the name.
-pub(crate) fn render(
+/// Not this function and never were: the `.render(…)` METHODS on `fat_facts`,
+/// `sign_facts` and `decision::seam`, which share only the name.
+pub(crate) fn validate_plan(
     planned: &plan::Plan,
     texts: &std::collections::BTreeMap<plan::FileKey, String>,
-    reverted: &std::collections::BTreeSet<String>,
 ) -> (
     std::collections::BTreeMap<plan::FileKey, String>,
     Vec<apply::Rollback>,
@@ -2183,18 +2100,8 @@ pub(crate) fn render(
     let mut maps = std::collections::BTreeMap::new();
     // Revert by JUSTIFICATION, not geography: an edit survives only if the
     // subject that justifies it has not been taken back.
-    let mut kept_by_file: std::collections::BTreeMap<plan::FileKey, Vec<plan::Edit>> = planned
-        .by_file
-        .iter()
-        .map(|(key, edits)| {
-            let kept = edits
-                .iter()
-                .filter(|edit| !reverted.contains(&edit.owner_fn))
-                .cloned()
-                .collect::<Vec<_>>();
-            (key.clone(), kept)
-        })
-        .collect();
+    let mut kept_by_file: std::collections::BTreeMap<plan::FileKey, Vec<plan::Edit>> =
+        planned.by_file.clone();
     // **The fabricated-extent const is DERIVED FROM THE SURVIVORS** (marker
     // ruling, 2026-08-15), which is why it is computed here and not in `plan`:
     // this is the one place that knows which adapters a given revert set
@@ -2350,7 +2257,7 @@ pub(crate) fn emit_files<'tcx>(
     {
         texts.insert(root, source);
     }
-    let (files, rollbacks, _) = render(&planned, &texts, &std::collections::BTreeSet::new());
+    let (files, rollbacks, _) = validate_plan(&planned, &texts);
     Ok(Emission {
         files,
         rollbacks,
@@ -2609,9 +2516,11 @@ fn finish_decide<'tcx>(
     // never a replay of it: micro-plan §1b measured a `facts.tsv`-only replay
     // reporting 2,133 against a true 2,075, and retracted it.
     //
-    // **The production table above is built first and from `BlockAll`**, so
-    // nothing here can move a decision — the S3.6-0 pattern that makes zero
-    // corpus delta structural rather than lucky. Task 3 is where the verdict
+    // **The production table above is built first**, so nothing here can move a
+    // decision — the S3.6-0 pattern that makes zero corpus delta structural
+    // rather than lucky. ⚠ **This said "and from `BlockAll`"; that was true of
+    // task 2 only.** Production has passed `LiftAdaptable` since S3.6-1 and the
+    // `BlockAll` variant was deleted at M-3 (X-3). Task 3 is where the verdict
     // reaches a gate.
     let hypothetical = decision::decide(&ctx_of(decision::RefGate::LiftAdaptable, None), &subjects);
     // Escapes are computed BEFORE the classes now: P1 makes them a gate, not a

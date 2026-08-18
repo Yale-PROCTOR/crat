@@ -24,11 +24,15 @@
 //! # What this module does at task 2, and what it deliberately does not
 //!
 //! It **computes**. Nothing here is consulted by [`super::decide_one`]: the
-//! production call site passes [`RefGate::BlockAll`], so the corpus cannot
+//! production call site passed `RefGate::BlockAll`, so the corpus cannot
 //! move. Zero delta is a property of the code — the S3.6-0 pattern — and task 3
 //! is where the verdict becomes load-bearing.
 //!
-//! [`RefGate::BlockAll`]: super::RefGate::BlockAll
+//! ⚠ **STALE SINCE S3.6-1, AND THE VARIANT IS GONE (X-3, closed 2026-08-18).**
+//! Production has passed `RefGate::LiftAdaptable` since S3.6-1; the claim above
+//! describes task 2 only, and it cost one wrong calibration run before it was
+//! caught. `BlockAll` was deleted at M-3 as measured-dead, and this note is its
+//! other direction — one fact, both places, closed together.
 
 use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_hir::{
@@ -156,18 +160,13 @@ impl BlockReason {
 
 /// **P2 — how the within-site overlap gate treats two node positions.**
 ///
-/// A measurement parameter, not a policy: production passes
-/// [`Self::RootDisjoint`], so nothing moves while the two candidate rules are
-/// priced at CLASS level. The per-node lesson applies to this estimate too —
+/// A measurement parameter, not a policy. ⚠ **The `RootDisjoint` baseline this
+/// doc used to name was deleted at M-3 as measured-dead**; production is
+/// [`Self::BlindOnly`], ruled 2026-08-10 on the split census. The per-node lesson applies to this estimate too —
 /// blocking a node blocks its class, so neither option can be costed by
 /// counting positions.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum OverlapRule {
-    /// The pre-P2 rule: two positions are disjoint when both roots are KNOWN
-    /// and DIFFERENT. **Unsound as a disjointness proof** — a `HirId` names a
-    /// binding, not an allocation (P2). Retained as the measurement baseline
-    /// the split census is read against; **not** the production rule.
-    RootDisjoint,
     /// **PRODUCTION, ruled 2026-08-10 on the split census.** Block a pair only
     /// where the compiler cannot see it: at least one side is a place reached
     /// through a base that stays RAW after conversion, or has an unknown root.
@@ -446,7 +445,6 @@ pub(crate) fn build(
                     }
                     let same_root = !matches!((root_a, root_b), (Some(x), Some(y)) if x != y);
                     let conflicts = match overlap {
-                        OverlapRule::RootDisjoint => same_root,
                         OverlapRule::BlindOnly => same_root || blind_a || blind_b,
                         OverlapRule::AllPairs => true,
                     };

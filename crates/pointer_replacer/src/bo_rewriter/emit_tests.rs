@@ -1360,7 +1360,6 @@ fn a_probe_does_not_compile_the_baseline_it_never_consults() {
         super::MAX_REVERT_ROUNDS,
         &|_| {},
         true,
-        false,
     );
     match probe {
         super::RewriteOutcome::Degraded {
@@ -1490,7 +1489,6 @@ fn a_degraded_outcome_still_reports_its_unplaceable_decisions() {
         super::MAX_REVERT_ROUNDS,
         &|_| {},
         true,
-        false,
     );
     match probe {
         super::RewriteOutcome::Degraded { unplaceable, .. } => {
@@ -1565,13 +1563,32 @@ fn emitted_counts_placements_not_ref_decisions() {
         super::RewriteOutcome::Emitted {
             emitted_count,
             files,
+            files_touched,
             unplaceable,
             ..
         } => {
-            assert!(
-                files.is_empty(),
-                "nothing should have been written: {:?}",
-                files.keys().collect::<Vec<_>>()
+            // ⚠ **THIS ASSERTION WAS `files.is_empty()`, AND M-3 CHANGED WHAT IT
+            // MEANS** (I-32, 2026-08-18). It held while the default layer was
+            // `render`, which cannot place an edit inside a macro expansion and
+            // reports the subject `unplaceable`. The AST layer works on the
+            // EXPANDED ast and rewrites the macro's DEFINITION body —
+            // `p: *mut i32` → `p: &mut i32` — so this fixture's text now DOES
+            // change.
+            //
+            // Two consequences, recorded rather than blessed: it is a
+            // capability the span layer never had, and the PLAN still calls the
+            // subject unplaceable, so the text changes while `emitted_count`
+            // counts nothing — an emission the ledger does not account for.
+            //
+            // **Corpus-unreachable**: `unplaceable == 0` on all 20 programs in
+            // BOTH eras, so no reported number depends on it. Asserted here as
+            // the MEASURED truth so any future movement is loud.
+            assert_eq!(
+                files_touched, 1,
+                "the AST layer rewrites through the macro definition; 0 would \
+                 mean the capability was lost, and a plan that learned to place \
+                 the subject closes I-32's accounting gap and obliges this test \
+                 to be re-stated"
             );
             assert_eq!(unplaceable.len(), 1, "{unplaceable:?}");
             assert_eq!(
@@ -1615,7 +1632,6 @@ fn a_degraded_outcome_reports_placements_too() {
         super::MAX_REVERT_ROUNDS,
         &|_| {},
         true,
-        false,
     );
     match probe {
         super::RewriteOutcome::Degraded { emitted_count, .. } => assert_eq!(
@@ -3902,8 +3918,12 @@ mod coconv_witnesses {
     /// positively, under **its own name**, so nothing pretends to be the old
     /// pin still holding.
     ///
-    /// *Mutation-tested (deletion first):* reverting production to
-    /// `RefGate::BlockAll` makes the chain degrade again and fails this.
+    /// *Mutation-tested (deletion first):* the recorded mutation reverted
+    /// production to `RefGate::BlockAll`, which made the chain degrade again and
+    /// failed this. ⚠ **That variant was deleted at M-3 as measured-dead, so the
+    /// mutation is no longer performable as written**; the equivalent today is to
+    /// make `RefKind::is_adaptable` return `false`, which blocks every reference
+    /// and reproduces the same failure.
     #[test]
     fn an_admissible_class_converts_after_the_lift() {
         let rows = census(&format!(
@@ -4280,200 +4300,6 @@ fn a_blocked_seam_row_names_the_callee_as_its_revert_key() {
     );
 }
 
-/// **REVERT COHERENCE, BOTH SIDES.** A callee's seams live and die with it.
-///
-/// # The failure mode this prevents
-///
-/// A callee reverts to a raw parameter while its caller keeps the `Some(..)`
-/// wrapping the seam inserted. That is a **reverse-direction `E0308`
-/// manufactured by our own glue** — the crate compiled before the rewrite and
-/// fails after, in a file the reverted function does not even live in. It is
-/// strictly worse than the mismatch the seam exists to fix, because the seam
-/// was supposed to be the repair.
-///
-/// # Why this is checkable at all
-///
-/// `render` filters edits by `!reverted.contains(&edit.owner_fn)`, and every
-/// seam carries the **callee's** path — not the caller's, though the edit lands
-/// in the caller's file. Reverting by justification rather than geography is
-/// what makes a caller-file edit revert with the callee that justifies it.
-///
-/// *Mutation-tested (Rider 0, deletion first):* key the seam on the CALLER
-/// (`site.caller`) instead of the callee and the reverted half fails — the glue
-/// survives its own callee's revert, which is the exact defect.
-#[test]
-fn a_reverted_callee_takes_its_seams_with_it() {
-    let src = "#![allow(dead_code, unused_unsafe, unused_mut, unused_variables)]\n\
-               pub unsafe fn callee(p: *mut i32) -> i32 {\n\
-               \x20   if p.is_null() { 0 } else { *p }\n\
-               }\n\
-               pub fn caller() {\n\
-               \x20   let mut x: i32 = 1;\n\
-               \x20   unsafe { callee(&mut x); }\n\
-               }\n";
-    let fixture = Fixture::new(&[("lib.rs", src)]);
-    let emission = emit(&fixture);
-
-    // The seam exists, and it is OWNED BY THE CALLEE — the half of the property
-    // that makes the other half possible.
-    let seam_owner = emission
-        .plan
-        .by_file
-        .values()
-        .flatten()
-        .find(|e| e.replacement.contains("Some("))
-        .map(|e| e.owner_fn.clone())
-        .expect("the fixture must produce a seam");
-    assert_eq!(
-        seam_owner, "callee",
-        "a seam must be justified by the CALLEE, though it lands in the \
-         caller's file: reverting by geography would strand it"
-    );
-
-    // ---- side 1: callee survives ⇒ the glue is present ----
-    let (kept, _, _) = super::render(
-        &emission.plan,
-        &emission.texts,
-        &std::collections::BTreeSet::new(),
-    );
-    assert!(
-        text_for_any(&kept).is_some_and(|t| t.contains("callee(Some(&mut x))")),
-        "with nothing reverted the seam must be in the emitted text"
-    );
-
-    // ---- side 2: callee reverts ⇒ the glue vanishes ----
-    let reverted: std::collections::BTreeSet<String> = [seam_owner].into_iter().collect();
-    let (after, _, _) = super::render(&emission.plan, &emission.texts, &reverted);
-    let text = text_for_any(&after).unwrap_or_default();
-    assert!(
-        !text.contains("Some("),
-        "the callee was reverted and its seam SURVIVED — the caller now wraps \
-         an argument for a parameter that went back to raw, which is a \
-         reverse-direction E0308 our own glue manufactured:\n{text}"
-    );
-    assert!(
-        !text.contains("Option<"),
-        "the callee's own declaration must revert with it:\n{text}"
-    );
-}
-
-/// **THE FABRICATED-EXTENT CONST IS DERIVED FROM THE SURVIVORS** — all three
-/// arms of the marker ruling's placement rule, on the production `render`.
-///
-/// §9c priced the two obvious owners and refused both: keying the const to one
-/// adapter's `owner_fn` deletes it when that function reverts while siblings
-/// still name it (`E0433`, cascading), and a never-reverted sentinel leaves a
-/// dead const when every fabricated site reverts. The rule shipped instead is
-/// *emit iff at least one fabricated adapter survives the revert set* — which is
-/// only meaningful if all three arms are witnessed, because arms 1 and 3 are
-/// exactly what the two refused designs would have got wrong.
-///
-/// *Mutation-tested:* replace the survivor test with `true` and arm 1 fails;
-/// replace it with a per-file `push` and arm 3 fails on the count.
-#[test]
-fn the_fabricated_const_follows_the_surviving_adapters() {
-    let src = "#![allow(dead_code, unused_unsafe, unused_mut, unused_variables)]\n\
-               pub unsafe fn fab_total(buf: *mut i32) -> i32 {\n\
-               \x20   let mut s: i32 = 0;\n\
-               \x20   let mut i: usize = 0;\n\
-               \x20   while i < 4 { s += *buf.offset(i as isize); i += 1; }\n\
-               \x20   s\n\
-               }\n\
-               pub unsafe fn fab_one(d: *mut i32) -> i32 { fab_total(d) }\n\
-               pub unsafe fn fab_two(d: *mut i32) -> i32 { fab_total(d) }\n";
-    let fixture = Fixture::new(&[("lib.rs", src)]);
-    ::utils::compilation::run_compiler_on_path(&fixture.0.join("lib.rs"), |tcx| {
-        let table = decide_table(tcx).expect("decides");
-        let emission = emit_files(tcx, &table, &rustc_hash::FxHashSet::default()).expect("emits");
-        let (plan, texts) = (&emission.plan, &emission.texts);
-
-        // NON-VACUITY FIRST. Everything below is about a population; if the
-        // fixture produced no fabricated adapter the three arms would agree
-        // trivially and witness nothing.
-        let fabricated: Vec<&str> = plan
-            .by_file
-            .values()
-            .flatten()
-            .filter(|e| {
-                matches!(
-                    e.justification,
-                    super::plan::Justification::SeamAdapter {
-                        fabricated: true,
-                        ..
-                    }
-                )
-            })
-            .map(|e| e.owner_fn.as_str())
-            .collect();
-        assert_eq!(
-            fabricated.len(),
-            2,
-            "the fixture must place TWO fabricated adapters, both owned by the \
-             callee — one is not enough to tell 'one const per crate' from \
-             'one const per adapter'"
-        );
-        let owner = fabricated[0].to_owned();
-        assert!(
-            plan.root_file.is_some(),
-            "the root file must be identified, or the insertion fail-closes"
-        );
-
-        let consts = |reverted: &std::collections::BTreeSet<String>| -> usize {
-            let (files, rollbacks, _) = super::render(plan, texts, reverted);
-            assert!(rollbacks.is_empty(), "the insertion must not collide");
-            files
-                .values()
-                .map(|t| {
-                    t.matches("const SEAM_LEN_PLACEHOLDER: usize = 1024;")
-                        .count()
-                })
-                .sum()
-        };
-
-        // ---- arm 2: adapters survive ⇒ EXACTLY ONE const ----
-        // ---- arm 3: TWO surviving adapters ⇒ still exactly one ----
-        // Both are this call: the fixture's two adapters share one callee, so
-        // an implementation that pushed per adapter would report 2 here.
-        assert_eq!(
-            consts(&std::collections::BTreeSet::new()),
-            1,
-            "one crate, one const — never one per fabricated site"
-        );
-
-        // **PLACEMENT IS LOAD-BEARING, so it is COMPILED.** Counting the const
-        // proves it is present; only the compiler proves it is somewhere legal
-        // and that `crate::SEAM_LEN_PLACEHOLDER` resolves from the call sites.
-        // Without this the whole placement rule — end of the crate ROOT file —
-        // would be witnessed by a `.matches()` on a string, which an insertion
-        // ahead of the inner attributes would satisfy just as well.
-        let (files, _, _) = super::render(plan, texts, &std::collections::BTreeSet::new());
-        let emitted = files.values().next().expect("one emitted file").clone();
-        assert!(
-            emitted.contains("crate::SEAM_LEN_PLACEHOLDER"),
-            "the call sites must NAME the const, or this compiles vacuously:\n{emitted}"
-        );
-        let staged =
-            super::verify::materialize_single_file(&emitted).expect("the emitted crate stages");
-        assert!(
-            super::verify::type_checks_crate(staged.root()),
-            "the emitted crate must type-check with the const where we put it:\n{emitted}"
-        );
-
-        // ---- arm 1: every fabricated adapter reverts ⇒ NO const ----
-        // The dead-const case the sentinel owner would have produced.
-        let all_gone: std::collections::BTreeSet<String> = std::iter::once(owner).collect();
-        assert_eq!(
-            consts(&all_gone),
-            0,
-            "no surviving fabricated adapter means no const — a dead item in \
-             the emitted crate is exactly what deriving it avoids"
-        );
-        Ok::<(), String>(())
-    })
-    .expect("fixture compiles")
-    .expect("no emission error");
-}
-
 /// **`render` RUNS OUTSIDE THE COMPILER SESSION, AND THE CONST STILL LANDS.**
 ///
 /// The reproduction of the defect the first fabrication emit sweep found: four
@@ -4522,7 +4348,7 @@ fn render_outside_a_compiler_session_still_delivers_the_const() {
     );
 
     // ---- and NOW, with no session anywhere on this thread ----
-    let (files, rollbacks, _) = super::render(&plan, &texts, &std::collections::BTreeSet::new());
+    let (files, rollbacks, _) = super::validate_plan(&plan, &texts);
     assert!(rollbacks.is_empty());
     let n: usize = files
         .values()
@@ -4533,7 +4359,11 @@ fn render_outside_a_compiler_session_still_delivers_the_const() {
         .sum();
     assert_eq!(
         n, 1,
-        "exactly one const, rendered outside a compiler session — this is the          call the verify loop makes"
+        "exactly one const, produced outside a compiler session. ⚠ Since M-3 \
+         this exercises `validate_plan`, NOT an emission path: the emitted \
+         const is the AST layer's, inserted inside a session. What survives \
+         here is that `plan.len_const_item` is session-produced data and can \
+         be spliced without one"
     );
 }
 
@@ -4761,316 +4591,5 @@ fn reverting_every_function_reproduces_the_substrate() {
         out, SRC,
         "reverting every function must reproduce the substrate byte for byte.\n\
          --- emitted ---\n{out}\n--- substrate ---\n{SRC}"
-    );
-}
-
-/// **W2 — the two layers agree on a program the loop actually REVERTED.**
-///
-/// W1 established that the AST layer honours a revert set. W2 is the question
-/// the acceptance gate rests on: that both layers, driven end to end through
-/// the real verify/revert loop on a fixture where a revert genuinely fires,
-/// reach the SAME verdict and the SAME converged state.
-///
-/// # ADMISSIBILITY — traced, not assumed
-///
-/// A compared quantity is admissible **iff its dataflow passes through
-/// `round_files`' output**, i.e. through the candidate programs the switched
-/// emitter produced. The first draft of this test compared `emitted_count` and
-/// the `degradations` vector — **both PARAMETERS of `verify_and_revert`,
-/// computed by `emit_files` before the loop**, hence identical on both sides by
-/// construction. It passed with the defect it named restored. A comparison
-/// witnesses nothing unless its two sides can differ.
-///
-/// The trace for each quantity compared here:
-///
-/// | quantity | origin | admissible |
-/// |---|---|---|
-/// | verdict (`Emitted`/`Degraded`) | the loop's own exit path | yes |
-/// | `escalated` | `facts.escalated`, assigned in the loop | yes |
-/// | `reverted_count` | `facts.reverted_count`, from `reverted.len()`/`taken.len()` | yes |
-/// | `bisect_probes` | `facts.bisect_probes`, from `bisect`'s return | yes |
-/// | ~~`emitted_count`~~ | parameter, pre-loop | **NO** |
-/// | ~~`degradations.len()`~~ | parameter, pre-loop | **NO** |
-///
-/// Emitted TEXT is deliberately not compared: the gate's bar is verdicts and
-/// counters, the pinned oracle carries no texts, and text-level fidelity is
-/// already owned by the parity instruments and
-/// `reverting_every_function_reproduces_the_substrate`.
-///
-/// *Mutation-witnessed* (M-W2): restoring the re-derivation inside
-/// `ast_emitted_files_from` flips the AST side's verdict. Build-verified —
-/// a mutation is only a mutation if it provably compiled into that run.
-#[test]
-fn both_layers_agree_on_a_reverted_program() {
-    /// Verdict plus the loop-derived counters. Everything here is assigned
-    /// below the layer switch; see the admissibility table above.
-    #[derive(Debug, PartialEq, Eq)]
-    struct Converged {
-        emitted: bool,
-        escalated: Option<String>,
-        reverted_count: usize,
-        bisect_probes: usize,
-    }
-
-    fn run(ast: bool) -> Converged {
-        // **THE LAYER IS A PARAMETER, NOT THE ENVIRONMENT** (2026-08-18).
-        //
-        // This set `CRAT_M1_AST_EMIT` and removed it again, under a SAFETY note
-        // arguing that was sound because the switch is read once per call. It
-        // was not: the variable is process-global and the suite runs its tests
-        // as threads, so the note only held while this was the ONLY such test.
-        // The moment a second one existed, this test's `remove_var` cleared the
-        // other's selection mid-rewrite and the other silently measured the
-        // span layer — green alone, red in the suite.
-        let fixture = Fixture::new(&[
-            (
-                "lib.rs",
-                "#![allow(dead_code, unused_unsafe)]\npub mod good;\npub mod bad;\n",
-            ),
-            (
-                "good.rs",
-                "pub unsafe fn bump(p: *mut i32) -> i32 {\n    *p += 1;\n    *p\n}\n",
-            ),
-            ("bad.rs", BREAKS_ON_REWRITE),
-        ]);
-        // **CAP 0 IS LOAD-BEARING.** At cap 8 the loop reverts once and
-        // converges on BOTH layers, so every compared quantity agrees even
-        // with the defect restored — measured, not assumed. Round 0's files
-        // come from `emit_files` (span-derived) either way, so a single revert
-        // repairs the crate before the switched emitter can matter.
-        //
-        // Cap 0 forces the bisect path, where every candidate program comes
-        // from `round_files` and the switch therefore governs. That is exactly
-        // why `the_round_cap_stops_the_loop` caught this defect and the cap-8
-        // shape did not.
-        let out =
-            super::rewrite_m1_path_on_layer(&fixture.root(), 0, &force_stash_value_shared, ast);
-        match out {
-            super::RewriteOutcome::Emitted {
-                escalated,
-                reverted_count,
-                bisect_probes,
-                ..
-            } => Converged {
-                emitted: true,
-                escalated,
-                reverted_count,
-                bisect_probes,
-            },
-            super::RewriteOutcome::Degraded { reason, .. } => Converged {
-                emitted: false,
-                escalated: Some(reason),
-                reverted_count: 0,
-                bisect_probes: 0,
-            },
-        }
-    }
-
-    let span = run(false);
-    let ast = run(true);
-
-    // NON-VACUITY, first: the fixture must actually exercise a revert, or every
-    // assertion below is satisfied by a loop that did nothing.
-    assert!(
-        span.emitted,
-        "the SPAN layer must reach Emitted, or the comparison is vacuous: {span:?}"
-    );
-    assert!(
-        span.reverted_count > 0,
-        "the fixture must actually revert something, or W2 tests nothing it \
-         claims to: {span:?}"
-    );
-
-    assert_eq!(
-        span, ast,
-        "the layers diverge on loop-derived state.\n  span: {span:?}\n  ast:  {ast:?}"
-    );
-}
-
-/// **ROUND 0 EMITS THROUGH THE SELECTED LAYER — the zero-revert shape.**
-///
-/// The largest of the four sites, and the last found. `emit_files` produces the
-/// loop's initial `files` through `render`, unconditionally; the loop's first
-/// act is to materialize it. So until a revert occurred, nothing switched — and
-/// **a program that converges with ZERO reverts returns that map unchanged**.
-///
-/// On the corpus that was **7 programs and 35 of the 64 emissions** emitting
-/// span text while the AST arm reported agreement on all three counters, which
-/// cannot see text. The measured witness was libcsv: 50,440 bytes on the AST
-/// layer against 55,764 on the span layer, same converged (empty) revert set,
-/// identical counters. This fixture is that shape in miniature.
-///
-/// **Non-vacuity is asserted, not assumed:** `reverted_count == 0` is the whole
-/// point — a fixture that reverted would reach `round_files` through the loop
-/// and pass even with the defect restored.
-///
-/// *Mutation-tested.* Restore `let mut files = files;` in place of the round-0
-/// re-emit and the AST arm returns the span map (91 → 99) — this fails.
-#[test]
-fn round_zero_emits_through_the_selected_layer() {
-    fn run(ast: bool) -> (usize, usize, Vec<(String, usize)>) {
-        let fixture = Fixture::new(&[(
-            "lib.rs",
-            "#![allow(dead_code, unused_unsafe)]\npub unsafe fn bump(p: *mut i32) -> i32 {\n    *p += 1;\n    *p\n}\n",
-        )]);
-        match super::rewrite_m1_path_on_layer(&fixture.root(), 8, &|_| {}, ast) {
-            super::RewriteOutcome::Emitted {
-                emitted_count,
-                reverted_count,
-                files,
-                ..
-            } => {
-                let mut v: Vec<(String, usize)> = files
-                    .iter()
-                    .map(|(k, t)| {
-                        let super::plan::FileKey::Real(p) = k else {
-                            return ("virtual".to_owned(), t.len());
-                        };
-                        (
-                            p.file_name()
-                                .expect("emitted file has a name")
-                                .to_string_lossy()
-                                .into_owned(),
-                            t.len(),
-                        )
-                    })
-                    .collect();
-                v.sort();
-                (emitted_count, reverted_count, v)
-            }
-            super::RewriteOutcome::Degraded { reason, .. } => {
-                (0, 0, vec![(format!("DEGRADED {reason}"), 0)])
-            }
-        }
-    }
-
-    let (span_emitted, span_reverted, span_files) = run(false);
-    let (ast_emitted, ast_reverted, ast_files) = run(true);
-
-    assert_eq!(
-        (span_emitted, span_reverted),
-        (1, 0),
-        "the fixture must EMIT and revert NOTHING — the zero-revert shape is \
-         the one that never reaches the loop's re-emit, and a fixture that \
-         reverted would witness nothing here"
-    );
-    assert_eq!(
-        (ast_emitted, ast_reverted),
-        (1, 0),
-        "both layers must agree on the counters; only the TEXT is at issue"
-    );
-    assert_eq!(
-        span_files,
-        vec![("lib.rs".to_owned(), 99)],
-        "the span layer splices its edit into the original text"
-    );
-    assert_eq!(
-        ast_files,
-        vec![("lib.rs".to_owned(), 91)],
-        "round 0 did not come from the AST layer: 99 bytes is the SPAN splice, \
-         91 is the `pprust` reprint. A zero-revert program returns the loop's \
-         initial map untouched, so if that map is `render`'s the program emits \
-         span text no matter which layer was selected"
-    );
-}
-
-/// **THE BISECT PATH EMITS THROUGH THE SELECTED LAYER.**
-///
-/// Its sibling above compares loop-derived COUNTERS and passes either way; this
-/// compares the EMISSION, which is the only thing that can see the difference.
-/// That gap is exactly how the defect survived: the bisect path's final
-/// emission called `render` directly, so under `CRAT_M1_AST_EMIT` an escalating
-/// program ran its probes on the AST layer and then emitted SPAN text — a
-/// program returned that is not the program the probes verified. On the corpus
-/// **12 of 20 programs escalate**, so this was most of arm B.
-///
-/// **Cap 0 is load-bearing**, for the reason the sibling records: it forces the
-/// bisect path. At cap 8 the loop converges before bisect and this witnesses
-/// nothing.
-///
-/// # Two independent discriminators, both from the layer's own character
-///
-/// - **The key set.** The AST emission map is SEEDED with every file holding a
-///   function, so it carries `bad.rs`; `render` returns edited files only, so
-///   the span map does not. A map without `bad.rs` came from `render`.
-/// - **The byte length.** `pprust` reprints `good.rs`'s function, normalizing
-///   it to 55 bytes against the span splice's 63.
-///
-/// Either alone would catch the defect; both are asserted because they fail for
-/// different reasons, and a future change that legitimately moves one should
-/// have to confront the other rather than silently inherit it.
-///
-/// *Mutation-tested.* Restore `render(&emission_plan, &emission_texts,
-/// &final_reverted)` at the third site and the AST arm returns the span map —
-/// both assertions fail.
-#[test]
-fn the_bisect_path_emits_through_the_selected_layer() {
-    fn run(ast: bool) -> Vec<(String, usize)> {
-        let fixture = Fixture::new(&[
-            (
-                "lib.rs",
-                "#![allow(dead_code, unused_unsafe)]\npub mod good;\npub mod bad;\n",
-            ),
-            (
-                "good.rs",
-                "pub unsafe fn bump(p: *mut i32) -> i32 {\n    *p += 1;\n    *p\n}\n",
-            ),
-            ("bad.rs", BREAKS_ON_REWRITE),
-        ]);
-        let out =
-            super::rewrite_m1_path_on_layer(&fixture.root(), 0, &force_stash_value_shared, ast);
-        match out {
-            super::RewriteOutcome::Emitted { files, .. } => {
-                let mut v: Vec<(String, usize)> = files
-                    .iter()
-                    .map(|(k, t)| {
-                        let super::plan::FileKey::Real(path) = k else {
-                            return ("virtual".to_owned(), t.len());
-                        };
-                        (
-                            path.file_name()
-                                .expect("emitted file has a name")
-                                .to_string_lossy()
-                                .into_owned(),
-                            t.len(),
-                        )
-                    })
-                    .collect();
-                v.sort();
-                v
-            }
-            super::RewriteOutcome::Degraded { .. } => vec![("DEGRADED".to_owned(), 0)],
-        }
-    }
-
-    let span = run(false);
-    let ast = run(true);
-
-    // NON-VACUITY: the span arm must have emitted through bisect at all.
-    assert_eq!(
-        span,
-        vec![("good.rs".to_owned(), 63)],
-        "the span arm must emit its one edited file through the bisect path, \
-         or this witnesses nothing"
-    );
-
-    let ast_keys: Vec<&str> = ast.iter().map(|(k, _)| k.as_str()).collect();
-    assert!(
-        ast_keys.contains(&"bad.rs"),
-        "the bisect path's final emission did not come from the AST layer: its \
-         map is SEEDED with every file holding a function, so `bad.rs` must be \
-         present. A map of edited files only is `render`'s, which means the \
-         probes ran on one layer and the emission came from the other.\n  \
-         span: {span:?}\n  ast:  {ast:?}"
-    );
-    let ast_good = ast
-        .iter()
-        .find(|(k, _)| k == "good.rs")
-        .expect("the AST arm must still emit the edited file");
-    assert_eq!(
-        ast_good.1, 55,
-        "the AST arm's edited file must be the `pprust` reprint (55 bytes), not \
-         the span splice (63) — a second, independent signal that the emission \
-         came from the selected layer.\n  span: {span:?}\n  ast:  {ast:?}"
     );
 }
