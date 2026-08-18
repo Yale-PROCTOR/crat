@@ -600,7 +600,7 @@ fn reachable_source_nodes(graph: &SourceGraph, target: &str) -> BTreeSet<String>
     reachable
 }
 
-fn nested_reference_edges_reaching(graph: &SourceGraph, target: &str) -> BTreeSet<String> {
+fn walker_rule_edges_reaching(graph: &SourceGraph, target: &str) -> BTreeSet<String> {
     let mut witnesses = BTreeSet::new();
     let mut seen = BTreeSet::new();
     let mut work = VecDeque::from([target.to_owned()]);
@@ -609,7 +609,9 @@ fn nested_reference_edges_reaching(graph: &SourceGraph, target: &str) -> BTreeSe
             continue;
         }
         for edge in graph.incoming.get(&node).into_iter().flatten() {
-            if edge.label.starts_with(NESTED_REFERENCE_EDGE_PREFIX) {
+            if edge.label.starts_with(NESTED_REFERENCE_EDGE_PREFIX)
+                || edge.label.starts_with(ONE_DEREF_RAWPTR_EDGE_PREFIX)
+            {
                 witnesses.insert(format!("{}=>{}:{}", edge.source, edge.target, edge.label));
             }
             work.push_back(edge.source.clone());
@@ -791,8 +793,9 @@ fn add_value_edge(graph: &mut SourceGraph, source: Option<String>, target: Strin
     }
 }
 
-const SOURCE_WALKER_VERSION: &str = "a4-source-walker-v2-nested-reference";
+const SOURCE_WALKER_VERSION: &str = "a4-source-walker-v3-one-deref-rawptr";
 const NESTED_REFERENCE_EDGE_PREFIX: &str = "nested-reference-value:";
+const ONE_DEREF_RAWPTR_EDGE_PREFIX: &str = "nested-one-deref-rawptr-value:";
 const NESTED_ADDRESS_SHAPE_HEADER: &str = "program\trvalue_kind\tlocation\tsource_depth\ttarget_depth\tsource_node\ttarget_node\tmodeled_by_walker";
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -821,7 +824,15 @@ fn collect_nested_address_shapes(tcx: TyCtxt<'_>, slots: &CrateSlots) -> Vec<Nes
                     Rvalue::RawPtr(_, place) => ("RawPtr", *place),
                     _ => continue,
                 };
-                if !source_place.projection.is_empty() {
+                let in_registered_grammar = match rvalue_kind {
+                    "Ref" => source_place.projection.is_empty(),
+                    "RawPtr" => {
+                        source_place.projection.len() == 1
+                            && matches!(source_place.projection[0], ProjectionElem::Deref)
+                    }
+                    _ => false,
+                };
+                if !in_registered_grammar {
                     continue;
                 }
                 let location = format!(
@@ -865,14 +876,18 @@ fn render_nested_address_shapes(
         "source_walker_version={SOURCE_WALKER_VERSION}\nmeasurement_class=walker-shape-diagnostic\nsemantic_data=false\n\n{NESTED_ADDRESS_SHAPE_HEADER}\n"
     );
     for shape in shapes {
+        let expected_prefix = if shape.rvalue_kind == "Ref" {
+            NESTED_REFERENCE_EDGE_PREFIX
+        } else {
+            ONE_DEREF_RAWPTR_EDGE_PREFIX
+        };
         let modeled = graph
             .incoming
             .get(&shape.target_node)
             .into_iter()
             .flatten()
             .any(|edge| {
-                edge.source == shape.source_node
-                    && edge.label.starts_with(NESTED_REFERENCE_EDGE_PREFIX)
+                edge.source == shape.source_node && edge.label.starts_with(expected_prefix)
             });
         out.push_str(&format!(
             "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
@@ -945,6 +960,98 @@ fn add_nested_reference_place_edges<'tcx>(
         }
     }
     Ok(added)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn add_one_deref_rawptr_nested_edges<'tcx>(
+    graph: &mut SourceGraph,
+    tcx: TyCtxt<'tcx>,
+    slots: &CrateSlots,
+    fn_did: LocalDefId,
+    body: &Body<'tcx>,
+    source_place: Place<'tcx>,
+    target_place: Place<'tcx>,
+    location: &str,
+) -> Result<usize, String> {
+    if node_for_place_depth(tcx, slots, fn_did, body, target_place, 1).is_none() {
+        return Ok(0);
+    }
+    if source_place.projection.len() != 1
+        || !matches!(source_place.projection[0], ProjectionElem::Deref)
+    {
+        return Err(format!(
+            "unsupported nested RawPtr projection at {location}: {source_place:?}"
+        ));
+    }
+    let base_ty = body.local_decls[source_place.local].ty;
+    if !matches!(base_ty.kind(), TyKind::Ref(..)) {
+        return Err(format!(
+            "one-deref nested RawPtr base is not a reference at {location}: place={source_place:?} base={base_ty:?}"
+        ));
+    }
+    let target_ty = target_place.ty(body, tcx).ty;
+    if !matches!(target_ty.kind(), TyKind::RawPtr(..)) {
+        return Err(format!(
+            "one-deref nested RawPtr target is not raw at {location}: {target_ty:?}"
+        ));
+    }
+
+    let mut added = 0;
+    for source_depth in 0..u8::MAX {
+        let target_depth = source_depth + 1;
+        let source = node_for_place_depth(tcx, slots, fn_did, body, source_place, source_depth);
+        let target = node_for_place_depth(tcx, slots, fn_did, body, target_place, target_depth);
+        match (source, target) {
+            (Some(source), Some(target)) => {
+                graph.add_edge(FlowEdge {
+                    kind: edge_kind(&source, &target),
+                    source,
+                    target,
+                    label: format!(
+                        "{ONE_DEREF_RAWPTR_EDGE_PREFIX}{location}:source-depth{source_depth}:target-depth{target_depth}"
+                    ),
+                    provenance_tags: BTreeSet::new(),
+                });
+                added += 1;
+            }
+            (None, None) => break,
+            (source, target) => {
+                return Err(format!(
+                    "one-deref nested RawPtr slot-shape drift at {location}: source-depth{source_depth}={source:?} target-depth{target_depth}={target:?}"
+                ));
+            }
+        }
+    }
+    Ok(added)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn reject_unmodeled_nested_cast<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    slots: &CrateSlots,
+    fn_did: LocalDefId,
+    body: &Body<'tcx>,
+    operand: &Operand<'tcx>,
+    target_place: Place<'tcx>,
+    location: &str,
+) -> Result<(), String> {
+    let (Operand::Copy(source_place) | Operand::Move(source_place)) = operand else {
+        return Ok(());
+    };
+    for depth in 1..=u8::MAX {
+        let source = node_for_place_depth(tcx, slots, fn_did, body, *source_place, depth);
+        let target = node_for_place_depth(tcx, slots, fn_did, body, target_place, depth);
+        match (source, target) {
+            (Some(source), Some(target)) => {
+                return Err(format!(
+                    "unsupported nested-pointer cast at {location}: depth={depth} source={source} target={target}"
+                ));
+            }
+            (None, None) => break,
+            _ => {}
+        }
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3060,12 +3167,20 @@ fn build_source_graph(tcx: TyCtxt<'_>, slots: &CrateSlots, export: &BoExport) ->
                             &BTreeSet::new(),
                         );
                     }
-                    Rvalue::Cast(_, operand, _) => add_value_edge(
-                        &mut graph,
-                        node_for_operand(tcx, slots, fn_did, body, operand),
-                        target,
-                        format!("transfer:{location}"),
-                    ),
+                    Rvalue::Cast(_, operand, _) => {
+                        reject_unmodeled_nested_cast(
+                            tcx, slots, fn_did, body, operand, *lhs, &location,
+                        )
+                        .unwrap_or_else(|error| {
+                            panic!("A4C STOP phase=graph-construction candidate=none: {error}")
+                        });
+                        add_value_edge(
+                            &mut graph,
+                            node_for_operand(tcx, slots, fn_did, body, operand),
+                            target,
+                            format!("transfer:{location}"),
+                        );
+                    }
                     Rvalue::CopyForDeref(place) => add_value_edge(
                         &mut graph,
                         node_for_place(tcx, slots, fn_did, body, *place),
@@ -3112,6 +3227,12 @@ fn build_source_graph(tcx: TyCtxt<'_>, slots: &CrateSlots, export: &BoExport) ->
                                 target,
                                 format!("address-through-pointer:{location}:{place:?}"),
                             );
+                            add_one_deref_rawptr_nested_edges(
+                                &mut graph, tcx, slots, fn_did, body, *place, *lhs, &location,
+                            )
+                            .unwrap_or_else(|error| {
+                                panic!("A4C STOP phase=graph-construction candidate=none: {error}")
+                            });
                         } else {
                             add_terminal(
                                 &mut graph,
@@ -4674,7 +4795,7 @@ fn run_source_walker_impact_worker(tcx: TyCtxt<'_>, t_tcx: Duration) -> Row {
             fields.contains_key(candidate),
             "A4C STOP phase=walker-impact-identity candidate={candidate}: field graph node absent"
         );
-        let witnesses = nested_reference_edges_reaching(&graph, candidate);
+        let witnesses = walker_rule_edges_reaching(&graph, candidate);
         let status = if witnesses.is_empty() {
             "unaffected"
         } else {
@@ -12648,6 +12769,7 @@ mod tests {
             unsafe fn consume_pointer(_: &mut *mut u8) {}
             unsafe fn consume_scalar(_: &mut u64) {}
             unsafe fn consume_raw(_: *mut *mut u8) {}
+            unsafe fn consume_raw_scalar(_: *mut u64) {}
 
             pub unsafe fn pointer_reference(mut pointer: *mut u8) {
                 consume_pointer(&mut pointer);
@@ -12659,6 +12781,14 @@ mod tests {
 
             pub unsafe fn raw_pointer_reference(mut pointer: *mut u8) {
                 consume_raw(&raw mut pointer);
+            }
+
+            pub unsafe fn coerced_reference(mut pointer: *mut u8) {
+                consume_raw(&mut pointer);
+            }
+
+            pub unsafe fn coerced_scalar(mut scalar: u64) {
+                consume_raw_scalar(&mut scalar);
             }
         "#;
         ::utils::compilation::run_compiler_on_str(supported, |tcx| {
@@ -12673,14 +12803,23 @@ mod tests {
                 .collect::<Vec<_>>();
             assert_eq!(
                 nested_edges.len(),
-                1,
-                "only the pointer reference contributes a nested value edge: {nested_edges:#?}"
+                2,
+                "both pointer references contribute their Ref edge: {nested_edges:#?}"
             );
-            assert!(nested_edges[0].label.contains("pointer_reference"));
             assert!(
-                nested_edges[0]
-                    .label
-                    .ends_with(":source-depth0:target-depth1")
+                nested_edges
+                    .iter()
+                    .any(|edge| edge.label.contains("pointer_reference"))
+            );
+            assert!(
+                nested_edges
+                    .iter()
+                    .any(|edge| edge.label.contains("coerced_reference"))
+            );
+            assert!(
+                nested_edges
+                    .iter()
+                    .all(|edge| edge.label.ends_with(":source-depth0:target-depth1"))
             );
             assert!(
                 nested_edges
@@ -12696,20 +12835,38 @@ mod tests {
                 .iter()
                 .find(|shape| {
                     shape.rvalue_kind == "RawPtr"
-                        && shape.location.contains("raw_pointer_reference")
+                        && shape.location.contains("coerced_reference")
                 })
-                .expect("raw address-to-pointer nesting must remain visible diagnostically");
+                .expect("one-deref RawPtr nesting must remain visible diagnostically");
             assert!(
-                !graph
+                graph
                     .incoming
                     .get(&raw.target_node)
                     .into_iter()
                     .flatten()
                     .any(|edge| {
                         edge.source == raw.source_node
-                            && edge.label.starts_with(NESTED_REFERENCE_EDGE_PREFIX)
+                            && edge.label.starts_with(ONE_DEREF_RAWPTR_EDGE_PREFIX)
                     }),
-                "the approved Ref-only walker rule must not silently absorb RawPtr"
+                "the exact one-deref RawPtr edge must be modeled"
+            );
+            let rawptr_edges = graph
+                .incoming
+                .values()
+                .flatten()
+                .filter(|edge| edge.label.starts_with("nested-one-deref-rawptr-value:"))
+                .collect::<Vec<_>>();
+            assert_eq!(
+                rawptr_edges.len(),
+                1,
+                "only the exact coerced pointer reference contributes the one-deref RawPtr edge: {rawptr_edges:#?}"
+            );
+            assert!(rawptr_edges[0].label.contains("coerced_reference"));
+            assert!(
+                rawptr_edges
+                    .iter()
+                    .all(|edge| !edge.label.contains("coerced_scalar")),
+                "a scalar pointee must not expand nested RawPtr provenance"
             );
         })
         .unwrap_or_else(|error| error.raise());
@@ -12733,11 +12890,60 @@ mod tests {
             );
         })
         .unwrap_or_else(|error| error.raise());
+
+        let multi_deref = r#"
+            pub unsafe fn unsupported_multi_deref(
+                pointer: *mut *mut *mut u8,
+            ) -> *mut *mut u8 {
+                &raw mut **pointer
+            }
+        "#;
+        ::utils::compilation::run_compiler_on_str(multi_deref, |tcx| {
+            let program = super::super::collect_program(tcx);
+            let slots = CrateSlots::build(&program);
+            let stopped = panic::catch_unwind(AssertUnwindSafe(|| {
+                build_source_graph(tcx, &slots, &BoExport::default())
+            }));
+            assert!(
+                stopped.is_err(),
+                "a nested-pointer RawPtr with multiple dereferences must fail closed"
+            );
+        })
+        .unwrap_or_else(|error| error.raise());
+
+        let nested_cast = r#"
+            pub unsafe fn unsupported_nested_cast(
+                pointer: *mut *mut u8,
+            ) -> *mut *const u8 {
+                pointer as *mut *const u8
+            }
+        "#;
+        ::utils::compilation::run_compiler_on_str(nested_cast, |tcx| {
+            let program = super::super::collect_program(tcx);
+            let slots = CrateSlots::build(&program);
+            let stopped = panic::catch_unwind(AssertUnwindSafe(|| {
+                build_source_graph(tcx, &slots, &BoExport::default())
+            }));
+            assert!(
+                stopped.is_err(),
+                "a nested-pointer cast outside the exact RawPtr grammar must fail closed"
+            );
+        })
+        .unwrap_or_else(|error| error.raise());
     }
 
     #[test]
     fn walker_impact_is_candidate_reachability_not_program_presence() {
         let mut graph = SourceGraph::default();
+        graph.add_edge(FlowEdge {
+            source: "rawptr-source".to_owned(),
+            target: "pointer-source".to_owned(),
+            kind: FlowEdgeKind::Local,
+            label: format!(
+                "{ONE_DEREF_RAWPTR_EDGE_PREFIX}fixture:bb0[1]:source-depth0:target-depth1"
+            ),
+            provenance_tags: BTreeSet::new(),
+        });
         graph.add_edge(FlowEdge {
             source: "pointer-source".to_owned(),
             target: "reference-depth1".to_owned(),
@@ -12764,11 +12970,11 @@ mod tests {
         graph.canonicalize();
 
         assert_eq!(
-            nested_reference_edges_reaching(&graph, "Affected::field0@d0").len(),
-            1
+            walker_rule_edges_reaching(&graph, "Affected::field0@d0").len(),
+            2
         );
         assert!(
-            nested_reference_edges_reaching(&graph, "Unaffected::field0@d0").is_empty(),
+            walker_rule_edges_reaching(&graph, "Unaffected::field0@d0").is_empty(),
             "program-level presence must not mark an unrelated candidate affected"
         );
     }
