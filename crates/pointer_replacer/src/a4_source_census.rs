@@ -620,6 +620,29 @@ fn walker_rule_edges_reaching(graph: &SourceGraph, target: &str) -> BTreeSet<Str
     witnesses
 }
 
+fn walker_barriers_reaching(
+    graph: &SourceGraph,
+    target: &str,
+    barriers: &BTreeMap<GraphShapeGap, ResolvedGraphGap>,
+) -> Result<BTreeSet<String>, String> {
+    let reachable = reachable_source_nodes(graph, target);
+    let mut witnesses = BTreeSet::new();
+    for (gap, resolved) in barriers {
+        if resolved.status != GapAnchorStatus::GraphNodes || resolved.nodes.is_empty() {
+            return Err(format!(
+                "walker-impact barrier has unsupported anchor status: gap={gap:?} resolved={resolved:?}"
+            ));
+        }
+        for node in reachable.intersection(&resolved.nodes) {
+            witnesses.insert(format!(
+                "{}:{}:{}:{}:anchor={}",
+                gap.kind, gap.function, gap.site, gap.detail, node
+            ));
+        }
+    }
+    Ok(witnesses)
+}
+
 fn attribute_gap_candidates(
     graph: &SourceGraph,
     candidates: &[String],
@@ -2011,6 +2034,7 @@ fn record_static_data_resolution_gap(
     tcx: TyCtxt<'_>,
     fn_did: LocalDefId,
     site: String,
+    target_local: Local,
     error: String,
 ) -> Result<(), String> {
     let kind = if error.starts_with("unsupported static-data projection") {
@@ -2018,12 +2042,20 @@ fn record_static_data_resolution_gap(
     } else {
         "other-graph-construction-stop"
     };
-    if record_graph_shape_gap(GraphShapeGap {
+    let gap = GraphShapeGap {
         kind,
         function: tcx.def_path_str(fn_did.to_def_id()),
         site,
         detail: error.clone(),
-    }) {
+    };
+    if record_graph_shape_gap(gap.clone()) {
+        assert!(record_graph_gap_anchor(
+            gap,
+            GraphGapAnchor::MirLocal {
+                fn_did,
+                local: target_local,
+            },
+        ));
         Ok(())
     } else {
         Err(error)
@@ -2084,6 +2116,7 @@ fn derive_static_data_locals<'tcx>(
                             tcx,
                             fn_did,
                             format!("bb{}[{statement_index}] {target_local:?}", bb.index()),
+                            target_local,
                             error,
                         )?;
                         continue;
@@ -2140,6 +2173,7 @@ fn derive_static_data_locals<'tcx>(
                         tcx,
                         fn_did,
                         format!("bb{}[term] {target_local:?}", bb.index()),
+                        target_local,
                         error,
                     )?;
                     continue;
@@ -4734,6 +4768,77 @@ fn run_gap_attribution_worker(tcx: TyCtxt<'_>, t_tcx: Duration) -> Row {
 }
 
 const WALKER_IMPACT_HEADER: &str = "program\tfield_key\tstatus\tnested_reference_edges\twitnesses";
+const WALKER_BARRIER_HEADER: &str = "program\tfield_key\tbarrier_status\tbarrier_count\twitnesses";
+
+fn render_walker_barrier_rows(
+    program: &str,
+    candidates: &[String],
+    graph: &SourceGraph,
+    barriers: &BTreeMap<GraphShapeGap, ResolvedGraphGap>,
+) -> Result<String, String> {
+    let mut rendered = format!(
+        "source_walker_version={SOURCE_WALKER_VERSION}\nmeasurement_class=walker-barrier-disjointness\nsemantic_data=false\n\n{WALKER_BARRIER_HEADER}\n"
+    );
+    for candidate in candidates {
+        let witnesses = walker_barriers_reaching(graph, candidate, barriers)?;
+        let status = if witnesses.is_empty() {
+            "disjoint"
+        } else {
+            "audit-blocked"
+        };
+        rendered.push_str(&format!(
+            "{}\t{}\t{status}\t{}\t{}\n",
+            clean_cell(program),
+            clean_cell(candidate),
+            witnesses.len(),
+            if witnesses.is_empty() {
+                "none".to_owned()
+            } else {
+                clean_cell(&witnesses.into_iter().collect::<Vec<_>>().join("|"))
+            },
+        ));
+    }
+    Ok(rendered)
+}
+
+fn parse_walker_barrier_rows(path: &Path, program: &str) -> Result<Vec<Vec<String>>, String> {
+    let input = fs::read_to_string(path)
+        .map_err(|error| format!("read walker barrier rows {}: {error}", path.display()))?;
+    let (_, table) = input
+        .split_once("\n\n")
+        .ok_or_else(|| "walker barrier metadata separator missing".to_owned())?;
+    let rows = parse_table_text(table, WALKER_BARRIER_HEADER, 5, "walker barrier rows")?;
+    let mut identities = BTreeSet::new();
+    for row in &rows {
+        if row[0] != program {
+            return Err(format!(
+                "walker barrier program drift: expected={program} actual={}",
+                row[0]
+            ));
+        }
+        if !identities.insert(row[1].clone()) {
+            return Err(format!("duplicate walker barrier candidate: {}", row[1]));
+        }
+        let count = row[3]
+            .parse::<usize>()
+            .map_err(|_| format!("nonnumeric walker barrier count: {row:?}"))?;
+        match row[2].as_str() {
+            "disjoint" if count == 0 && row[4] == "none" => {}
+            "audit-blocked" => {
+                let witnesses = row[4].split('|').collect::<BTreeSet<_>>();
+                if count == 0
+                    || row[4] == "none"
+                    || witnesses.len() != count
+                    || witnesses.contains("")
+                {
+                    return Err(format!("invalid audit-blocked barrier row: {row:?}"));
+                }
+            }
+            _ => return Err(format!("invalid walker barrier status/count: {row:?}")),
+        }
+    }
+    Ok(rows)
+}
 
 fn run_source_walker_impact_worker(tcx: TyCtxt<'_>, t_tcx: Duration) -> Row {
     let started = Instant::now();
@@ -4746,6 +4851,13 @@ fn run_source_walker_impact_worker(tcx: TyCtxt<'_>, t_tcx: Duration) -> Row {
     let checkpoint_path = PathBuf::from(
         std::env::var_os("CRAT_A4_WALKER_IMPACT_CHECKPOINT")
             .expect("walker-impact checkpoint output"),
+    );
+    let barrier_rows_path = PathBuf::from(
+        std::env::var_os("CRAT_A4_WALKER_BARRIER_ROWS").expect("walker-impact barrier rows output"),
+    );
+    let barrier_checkpoint_path = PathBuf::from(
+        std::env::var_os("CRAT_A4_WALKER_BARRIER_CHECKPOINT")
+            .expect("walker-impact barrier checkpoint output"),
     );
     let shapes_path = PathBuf::from(
         std::env::var_os("CRAT_A4_WALKER_ADDRESS_SHAPES")
@@ -4768,9 +4880,10 @@ fn run_source_walker_impact_worker(tcx: TyCtxt<'_>, t_tcx: Duration) -> Row {
     candidates.dedup();
 
     emit_phase(started, "walker-impact-graph", None, 0);
-    let rust_program = collect_program(tcx);
-    let slots = CrateSlots::build(&rust_program);
-    let graph = build_source_graph(tcx, &slots, &BoExport::default());
+    let (slots, graph, barriers) =
+        collect_source_graph_gap_attribution(tcx).unwrap_or_else(|error| {
+            panic!("A4C STOP phase=walker-impact-barrier candidate=none: {error}")
+        });
     verify_active_gap_waivers_exercised().unwrap_or_else(|error| {
         panic!("A4C STOP phase=walker-impact-gap-waiver candidate=none: {error}")
     });
@@ -4783,6 +4896,24 @@ fn run_source_walker_impact_worker(tcx: TyCtxt<'_>, t_tcx: Duration) -> Row {
         panic!("A4C STOP phase=walker-impact-shape-diagnostic candidate=none: {error}")
     });
     let fields = candidate_fields(tcx, &slots);
+    let rendered_barriers = render_walker_barrier_rows(&program, &candidates, &graph, &barriers)
+        .unwrap_or_else(|error| {
+            panic!("A4C STOP phase=walker-impact-barrier candidate=none: {error}")
+        });
+    let barrier_rows = parse_table_text(
+        rendered_barriers
+            .split_once("\n\n")
+            .expect("rendered walker barrier metadata separator")
+            .1,
+        WALKER_BARRIER_HEADER,
+        5,
+        "rendered walker barrier rows",
+    )
+    .expect("rendered walker barrier schema");
+    let blocked = barrier_rows
+        .iter()
+        .filter(|row| row[2] == "audit-blocked")
+        .count();
     let mut rendered = format!(
         "source_walker_version={SOURCE_WALKER_VERSION}\nmeasurement_class=graph-only-reachability-impact\nsemantic_data=false\n\n{WALKER_IMPACT_HEADER}\n"
     );
@@ -4816,6 +4947,9 @@ fn run_source_walker_impact_worker(tcx: TyCtxt<'_>, t_tcx: Duration) -> Row {
     write_atomic_checkpoint(&checkpoint_path, &rendered).unwrap_or_else(|error| {
         panic!("A4C STOP phase=walker-impact-checkpoint candidate=none: {error}")
     });
+    write_atomic_checkpoint(&barrier_checkpoint_path, &rendered_barriers).unwrap_or_else(|error| {
+        panic!("A4C STOP phase=walker-impact-barrier-checkpoint candidate=none: {error}")
+    });
     emit_phase(
         started,
         "walker-impact-checkpoint-written",
@@ -4825,12 +4959,17 @@ fn run_source_walker_impact_worker(tcx: TyCtxt<'_>, t_tcx: Duration) -> Row {
     write_atomic_checkpoint(&rows_path, &rendered).unwrap_or_else(|error| {
         panic!("A4C STOP phase=walker-impact-finalize candidate=none: {error}")
     });
+    write_atomic_checkpoint(&barrier_rows_path, &rendered_barriers).unwrap_or_else(|error| {
+        panic!("A4C STOP phase=walker-impact-barrier-finalize candidate=none: {error}")
+    });
     emit_phase(started, "walker-impact-complete", None, candidates.len());
 
     let mut row = Row::default();
     row.set("program", program);
     row.set("candidates", candidates.len());
     row.set("affected", affected);
+    row.set("barriers", barriers.len());
+    row.set("audit_blocked", blocked);
     row.set("measurement_class", "graph-only-reachability-impact");
     row.set("semantic_data", "false");
     row.set("source_walker_version", SOURCE_WALKER_VERSION);
@@ -10853,6 +10992,7 @@ struct WalkerImpactProgramRecord {
     program: String,
     candidates: usize,
     affected: usize,
+    audit_blocked: usize,
     manifest: String,
     wall_s: f64,
     memory_peaks: CandidateMemoryPeaks,
@@ -10878,6 +11018,7 @@ fn run_source_walker_impact_audit(contract: &MeasurementContract) {
 
     let mut records = Vec::new();
     let mut all_rows = Vec::new();
+    let mut all_barrier_rows = Vec::new();
     for program_name in scope {
         let program = contract
             .programs
@@ -10929,6 +11070,8 @@ fn run_source_walker_impact_audit(contract: &MeasurementContract) {
             .join(program.lib_root);
         let rows_path = dir.join("impact.tsv");
         let checkpoint_path = dir.join("checkpoint.tsv");
+        let barrier_rows_path = dir.join("barrier-impact.tsv");
+        let barrier_checkpoint_path = dir.join("barrier-checkpoint.tsv");
         let mut extra = vec![
             ("CRAT_A4_SOURCE_WALKER_IMPACT", "1".to_owned()),
             (
@@ -10942,6 +11085,14 @@ fn run_source_walker_impact_audit(contract: &MeasurementContract) {
             (
                 "CRAT_A4_WALKER_IMPACT_CHECKPOINT",
                 checkpoint_path.display().to_string(),
+            ),
+            (
+                "CRAT_A4_WALKER_BARRIER_ROWS",
+                barrier_rows_path.display().to_string(),
+            ),
+            (
+                "CRAT_A4_WALKER_BARRIER_CHECKPOINT",
+                barrier_checkpoint_path.display().to_string(),
             ),
             (
                 "CRAT_A4_WALKER_ADDRESS_SHAPES",
@@ -10978,6 +11129,8 @@ fn run_source_walker_impact_audit(contract: &MeasurementContract) {
             ];
             for file in [
                 "address-shapes.tsv",
+                "barrier-checkpoint.tsv",
+                "barrier-impact.tsv",
                 "checkpoint.tsv",
                 "impact.tsv",
                 "gap-waivers.tsv",
@@ -11003,9 +11156,20 @@ fn run_source_walker_impact_audit(contract: &MeasurementContract) {
             fs::read(&checkpoint_path).expect("read walker-impact checkpoint"),
             "A4C STOP phase=walker-impact-finalize candidate={program_name}: checkpoint byte drift"
         );
+        assert_eq!(
+            fs::read(&barrier_rows_path).expect("read walker barrier rows"),
+            fs::read(&barrier_checkpoint_path).expect("read walker barrier checkpoint"),
+            "A4C STOP phase=walker-impact-barrier-finalize candidate={program_name}: checkpoint byte drift"
+        );
         let rows = parse_walker_impact_rows(&rows_path, program_name).unwrap_or_else(|error| {
             panic!("A4C STOP phase=walker-impact-schema candidate={program_name}: {error}")
         });
+        let barrier_rows = parse_walker_barrier_rows(&barrier_rows_path, program_name)
+            .unwrap_or_else(|error| {
+                panic!(
+                    "A4C STOP phase=walker-impact-barrier-schema candidate={program_name}: {error}"
+                )
+            });
         let expected = isolated_identities(contract, program_name)
             .into_iter()
             .map(|identity| identity.identity.field_key)
@@ -11018,7 +11182,21 @@ fn run_source_walker_impact_audit(contract: &MeasurementContract) {
             actual, expected,
             "A4C STOP phase=walker-impact-identity candidate={program_name}: candidate set drift"
         );
+        let barrier_actual = barrier_rows
+            .iter()
+            .map(|row| row[1].clone())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            barrier_actual, expected,
+            "A4C STOP phase=walker-impact-barrier-identity candidate={program_name}: candidate set drift"
+        );
         let affected = rows.iter().filter(|row| row[2] == "affected").count();
+        let blocked_candidates = barrier_rows
+            .iter()
+            .filter(|row| row[2] == "audit-blocked")
+            .map(|row| row[1].clone())
+            .collect::<Vec<_>>();
+        let audit_blocked = blocked_candidates.len();
         let positive_site_passed = program_name != "bzip2"
             || rows
                 .iter()
@@ -11045,15 +11223,21 @@ fn run_source_walker_impact_audit(contract: &MeasurementContract) {
             "walker-impact-positive-control"
         } else if !oracle_byte_match {
             "walker-impact-oracle-byte-compare"
+        } else if audit_blocked > 0 {
+            "walker-impact-barrier-certification"
         } else {
             "complete"
         };
-        let status = if positive_control_passed {
-            "ok"
-        } else if !positive_site_passed {
+        let audit_certified = audit_blocked == 0;
+        let measurement_completed = positive_control_passed;
+        let status = if !positive_site_passed {
             "positive-control-failure"
-        } else {
+        } else if !oracle_byte_match {
             "oracle-byte-mismatch"
+        } else if audit_blocked > 0 {
+            "audit-blocked"
+        } else {
+            "ok"
         };
         let oracle_label = if program_name == "bzip2" {
             oracle_byte_match.to_string()
@@ -11062,15 +11246,28 @@ fn run_source_walker_impact_audit(contract: &MeasurementContract) {
         };
         let oracle_error = clean_cell(oracle_result.as_ref().err().map_or("none", String::as_str));
         let receipt = format!(
-            "machine_id={MACHINE_ID}\nplatform={PLATFORM}\nmeasurement_class=graph-only-reachability-impact\nsemantic_data=false\ncompleted={}\ncandidate_processing=graph-only\nsource_walker_version={SOURCE_WALKER_VERSION}\nmemory_limit=cgroup-100GiB\nmemory_max_bytes={CANDIDATE_MEMORY_MAX_BYTES}\ncap_verified={}\noom_kills={}\nmemory_max_events={}\nwall_bound_kind=liveness\nwall_cap_s={LIVENESS_BOUND_S}\nprogram={program_name}\ncandidates={}\naffected={affected}\nstatus={status}\nanalysis_head={}\nlast_phase={failure_phase}\nlast_candidate={}\nbzip2_oracle_path={}\nbzip2_oracle_sha256={}\nbzip2_oracle_byte_match={oracle_label}\nbzip2_oracle_error={oracle_error}\nwall_s={:.3}\n{}memory_receipt_error=none\n",
-            positive_control_passed,
+            "machine_id={MACHINE_ID}\nplatform={PLATFORM}\nmeasurement_class=graph-only-reachability-impact\nsemantic_data=false\ncompleted={}\naudit_certified={audit_certified}\ndisposition={}\ncandidate_processing=graph-only\nsource_walker_version={SOURCE_WALKER_VERSION}\nmemory_limit=cgroup-100GiB\nmemory_max_bytes={CANDIDATE_MEMORY_MAX_BYTES}\ncap_verified={}\noom_kills={}\nmemory_max_events={}\nwall_bound_kind=liveness\nwall_cap_s={LIVENESS_BOUND_S}\nprogram={program_name}\ncandidates={}\naffected={affected}\nbarrier_rows={}\naudit_blocked={audit_blocked}\nblocked_candidates={}\nstatus={status}\nanalysis_head={}\nlast_phase={failure_phase}\nlast_candidate={}\nbzip2_oracle_path={}\nbzip2_oracle_sha256={}\nbzip2_oracle_byte_match={oracle_label}\nbzip2_oracle_error={oracle_error}\nwall_s={:.3}\n{}memory_receipt_error=none\n",
+            measurement_completed,
+            if audit_certified {
+                "certified"
+            } else {
+                "typed-domain-gap-deferral"
+            },
             outcome.cap_verified,
             outcome.oom_kills,
             outcome.memory_max_events,
             rows.len(),
+            barrier_rows.len(),
+            if blocked_candidates.is_empty() {
+                "none".to_owned()
+            } else {
+                blocked_candidates.join(",")
+            },
             contract.head,
-            if positive_control_passed {
+            if audit_certified {
                 "none"
+            } else if audit_blocked > 0 {
+                &blocked_candidates[0]
             } else {
                 "bzip2::zzzz::field1@d0"
             },
@@ -11090,6 +11287,8 @@ fn run_source_walker_impact_audit(contract: &MeasurementContract) {
         fs::write(dir.join("receipt.txt"), receipt).expect("write completed impact receipt");
         let mut files = vec![
             "address-shapes.tsv",
+            "barrier-checkpoint.tsv",
+            "barrier-impact.tsv",
             "checkpoint.tsv",
             "impact.tsv",
             "memory-preflight.txt",
@@ -11109,24 +11308,37 @@ fn run_source_walker_impact_audit(contract: &MeasurementContract) {
         );
         assert!(
             positive_control_passed,
-            "A4C STOP phase={failure_phase} candidate=bzip2::zzzz::field1@d0 status={status} manifest={manifest}: {oracle_error}"
+            "A4C STOP phase={failure_phase} candidate={} program={program_name} status={status} audit_blocked={audit_blocked} blocked_candidates={} manifest={manifest}: {oracle_error}",
+            if audit_blocked > 0 {
+                blocked_candidates[0].as_str()
+            } else {
+                "bzip2::zzzz::field1@d0"
+            },
+            if blocked_candidates.is_empty() {
+                "none".to_owned()
+            } else {
+                blocked_candidates.join(",")
+            },
         );
         all_rows.extend(rows);
+        all_barrier_rows.extend(barrier_rows);
         records.push(WalkerImpactProgramRecord {
             program: program_name.to_owned(),
             candidates: expected.len(),
             affected,
+            audit_blocked,
             manifest,
             wall_s: outcome.wall_s,
             memory_peaks,
         });
-        let mut partial = "program\tcandidates\taffected\tmanifest_sha256\twall_s\tpeak_rss_kb\tcgroup_peak_memory_kb\n".to_owned();
+        let mut partial = "program\tcandidates\taffected\taudit_blocked\tmanifest_sha256\twall_s\tpeak_rss_kb\tcgroup_peak_memory_kb\n".to_owned();
         for record in &records {
             partial.push_str(&format!(
-                "{}\t{}\t{}\t{}\t{:.3}\t{}\t{}\n",
+                "{}\t{}\t{}\t{}\t{}\t{:.3}\t{}\t{}\n",
                 record.program,
                 record.candidates,
                 record.affected,
+                record.audit_blocked,
                 record.manifest,
                 record.wall_s,
                 record.memory_peaks.process_peak_rss_kb,
@@ -11145,6 +11357,14 @@ fn run_source_walker_impact_audit(contract: &MeasurementContract) {
     }
     write_atomic_checkpoint(&root.join("impact.tsv"), &impact)
         .expect("write aggregate walker-impact rows");
+    let mut barrier_impact = format!(
+        "source_walker_version={SOURCE_WALKER_VERSION}\nmeasurement_class=walker-barrier-disjointness\nsemantic_data=false\n\n{WALKER_BARRIER_HEADER}\n"
+    );
+    for row in &all_barrier_rows {
+        barrier_impact.push_str(&format!("{}\n", row.join("\t")));
+    }
+    write_atomic_checkpoint(&root.join("barrier-impact.tsv"), &barrier_impact)
+        .expect("write aggregate walker barrier rows");
     let predecessor_reruns = records
         .iter()
         .filter(|record| record.program != "bzip2" && record.affected > 0)
@@ -11156,6 +11376,18 @@ fn run_source_walker_impact_audit(contract: &MeasurementContract) {
     }
     write_atomic_checkpoint(&root.join("predecessor-reruns.tsv"), &reruns)
         .expect("write predecessor rerun list");
+    let mut deferrals = "program\tfield_key\tdisposition\tbarrier_count\twitnesses\n".to_owned();
+    for row in all_barrier_rows
+        .iter()
+        .filter(|row| row[2] == "audit-blocked")
+    {
+        deferrals.push_str(&format!(
+            "{}\t{}\ttyped-domain-gap-deferral\t{}\t{}\n",
+            row[0], row[1], row[3], row[4]
+        ));
+    }
+    write_atomic_checkpoint(&root.join("barrier-deferrals.tsv"), &deferrals)
+        .expect("write walker barrier deferral ledger");
     let wall_sum = records.iter().map(|record| record.wall_s).sum::<f64>();
     let peak_rss = records
         .iter()
@@ -11168,8 +11400,12 @@ fn run_source_walker_impact_audit(contract: &MeasurementContract) {
         .max()
         .unwrap_or(0);
     let affected_total = all_rows.iter().filter(|row| row[2] == "affected").count();
+    let audit_blocked_total = all_barrier_rows
+        .iter()
+        .filter(|row| row[2] == "audit-blocked")
+        .count();
     let report = format!(
-        "# Nested-reference walker impact audit\n\n- walker: `{SOURCE_WALKER_VERSION}`\n- scope: bzip2 positive control plus 15 manifested predecessors\n- candidates audited: {}\n- affected candidates: {affected_total}\n- affected predecessor programs: {}\n- semantic data: false\n- wall sum on {MACHINE_ID}: {wall_sum:.3} s\n- peak GNU-time RSS: {peak_rss} KiB\n- peak cgroup memory: {cgroup_peak} KiB\n",
+        "# Nested-reference walker impact audit\n\n- walker: `{SOURCE_WALKER_VERSION}`\n- scope: bzip2 positive control plus 15 manifested predecessors\n- candidates audited: {}\n- affected candidates: {affected_total}\n- audit-blocked candidates deferred: {audit_blocked_total}\n- barrier disposition: disjoint candidates certified; reachable barriers entered in `barrier-deferrals.tsv` as typed domain-gap deferrals\n- affected predecessor programs: {}\n- semantic data: false\n- wall sum on {MACHINE_ID}: {wall_sum:.3} s\n- peak GNU-time RSS: {peak_rss} KiB\n- peak cgroup memory: {cgroup_peak} KiB\n",
         all_rows.len(),
         if predecessor_reruns.is_empty() {
             "none".to_owned()
@@ -11183,7 +11419,7 @@ fn run_source_walker_impact_audit(contract: &MeasurementContract) {
     );
     fs::write(root.join("report.md"), report).expect("write walker-impact report");
     let provenance = format!(
-        "machine_id={MACHINE_ID}\nplatform={PLATFORM}\nanalysis_head={}\nanalysis_branch=codex/a4-source-census\nmeasurement_class=graph-only-reachability-impact\nsemantic_data=false\nsource_walker_version={SOURCE_WALKER_VERSION}\nderived_substrate_digest={DERIVED_SUBSTRATE_DIGEST}\nwall_bound_kind=liveness\nwall_cap_s={LIVENESS_BOUND_S}\nmemory_limit=cgroup-100GiB\nprograms={}\ncandidates={}\naffected_candidates={affected_total}\naffected_predecessor_programs={}\nprogram_manifests={}\nwall_sum_s={wall_sum:.3}\npeak_rss_kb={peak_rss}\ncgroup_peak_memory_kb={cgroup_peak}\ntiming_comparison=forbidden-across-machines\n",
+        "machine_id={MACHINE_ID}\nplatform={PLATFORM}\nanalysis_head={}\nanalysis_branch=codex/a4-source-census\nmeasurement_class=graph-only-reachability-impact\nsemantic_data=false\nsource_walker_version={SOURCE_WALKER_VERSION}\nderived_substrate_digest={DERIVED_SUBSTRATE_DIGEST}\nwall_bound_kind=liveness\nwall_cap_s={LIVENESS_BOUND_S}\nmemory_limit=cgroup-100GiB\nprograms={}\ncandidates={}\naffected_candidates={affected_total}\naudit_blocked_candidates={audit_blocked_total}\nbarrier_disposition=disjoint-certified;reachable-typed-domain-gap-deferred\naffected_predecessor_programs={}\nprogram_manifests={}\nwall_sum_s={wall_sum:.3}\npeak_rss_kb={peak_rss}\ncgroup_peak_memory_kb={cgroup_peak}\ntiming_comparison=forbidden-across-machines\n",
         contract.head,
         records
             .iter()
@@ -11206,6 +11442,8 @@ fn run_source_walker_impact_audit(contract: &MeasurementContract) {
     let manifest = write_manifest(
         &root,
         &[
+            "barrier-deferrals.tsv",
+            "barrier-impact.tsv",
             "impact.tsv",
             "partial.tsv",
             "predecessor-reruns.tsv",
@@ -11215,7 +11453,7 @@ fn run_source_walker_impact_audit(contract: &MeasurementContract) {
     )
     .expect("manifest walker-impact aggregate");
     eprintln!(
-        "A4C walker-impact complete manifest={manifest} walker={SOURCE_WALKER_VERSION} affected_candidates={affected_total} predecessor_reruns={}",
+        "A4C walker-impact complete manifest={manifest} walker={SOURCE_WALKER_VERSION} affected_candidates={affected_total} audit_blocked_candidates={audit_blocked_total} predecessor_reruns={}",
         predecessor_reruns
             .iter()
             .map(|(program, count)| format!("{program}:{count}"))
@@ -13142,6 +13380,50 @@ mod tests {
     }
 
     #[test]
+    fn walker_barrier_reachability_is_two_sided() {
+        let gap = GraphShapeGap {
+            kind: "unsupported-static-data-projection",
+            function: "fixture::rgba_shape".to_owned(),
+            site: "bb1[3] _0".to_owned(),
+            detail: "Field(0, *const i8)".to_owned(),
+        };
+        let barriers = BTreeMap::from([(
+            gap,
+            ResolvedGraphGap {
+                status: GapAnchorStatus::GraphNodes,
+                nodes: BTreeSet::from(["gap-anchor".to_owned()]),
+            },
+        )]);
+        let mut graph = SourceGraph::default();
+        graph.add_edge(FlowEdge {
+            source: "gap-anchor".to_owned(),
+            target: "Blocked::field0@d0".to_owned(),
+            kind: FlowEdgeKind::Field,
+            label: "candidate-store".to_owned(),
+            provenance_tags: BTreeSet::new(),
+        });
+        graph.add_edge(FlowEdge {
+            source: "unrelated".to_owned(),
+            target: "Disjoint::field0@d0".to_owned(),
+            kind: FlowEdgeKind::Field,
+            label: "candidate-store".to_owned(),
+            provenance_tags: BTreeSet::new(),
+        });
+        graph.canonicalize();
+
+        let blocked = walker_barriers_reaching(&graph, "Blocked::field0@d0", &barriers)
+            .expect("reachable barrier accounting");
+        assert_eq!(blocked.len(), 1, "reachable barrier must audit-block");
+        assert!(blocked.iter().next().unwrap().contains("gap-anchor"));
+        assert!(
+            walker_barriers_reaching(&graph, "Disjoint::field0@d0", &barriers)
+                .expect("disjoint barrier accounting")
+                .is_empty(),
+            "a disconnected barrier must certify disjoint"
+        );
+    }
+
+    #[test]
     fn projected_gap_out_of_pointer_universe_is_conjunctive() {
         assert_eq!(
             projected_gap_disposition(true, 0).unwrap(),
@@ -14929,6 +15211,43 @@ mod tests {
                 derive("unrelated_projection").0.is_ok(),
                 "a field projection on a non-derived base is outside the static-data bridge"
             );
+        })
+        .unwrap_or_else(|error| error.raise());
+    }
+
+    #[test]
+    fn static_aggregate_pointer_field_gap_has_a_graph_barrier() {
+        let source = r#"
+            #[derive(Clone, Copy)]
+            struct NamedColor {
+                name: *const i8,
+                value: u32,
+            }
+
+            static mut NAMED_COLORS: [NamedColor; 2] = [
+                NamedColor { name: b"red\0".as_ptr() as *const i8, value: 1 },
+                NamedColor { name: b"blue\0".as_ptr() as *const i8, value: 2 },
+            ];
+
+            pub unsafe fn rgba_shape(index: usize) -> *const i8 {
+                let color = NAMED_COLORS[index];
+                color.name
+            }
+        "#;
+        ::utils::compilation::run_compiler_on_str(source, |tcx| {
+            let (_, _, barriers) = collect_source_graph_gap_attribution(tcx)
+                .expect("audit collection must anchor the static aggregate field barrier");
+            assert_eq!(
+                barriers.len(),
+                1,
+                "exact rgba-shaped barrier: {barriers:#?}"
+            );
+            let (gap, resolved) = barriers.iter().next().unwrap();
+            assert_eq!(gap.kind, "unsupported-static-data-projection");
+            assert!(gap.function.ends_with("rgba_shape"));
+            assert!(gap.detail.contains("Field(0"));
+            assert_eq!(resolved.status, GapAnchorStatus::GraphNodes);
+            assert!(!resolved.nodes.is_empty());
         })
         .unwrap_or_else(|error| error.raise());
     }
