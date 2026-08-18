@@ -4036,10 +4036,7 @@ fn render_exhaustive_gap_inventory(
     out
 }
 
-fn parse_exhaustive_gap_inventory(
-    path: &Path,
-    expected_program: &str,
-) -> Result<Vec<Vec<String>>, String> {
+fn parse_gap_inventory_rows(path: &Path) -> Result<Vec<Vec<String>>, String> {
     let input = fs::read_to_string(path)
         .map_err(|error| format!("read inventory {}: {error}", path.display()))?;
     let (metadata, table) = input
@@ -4051,12 +4048,6 @@ fn parse_exhaustive_gap_inventory(
     let rows = parse_table_text(table, GAP_INVENTORY_HEADER, 8, &path.display().to_string())?;
     let mut identities = BTreeSet::new();
     for row in &rows {
-        if row[0] != expected_program {
-            return Err(format!(
-                "inventory program drift: expected={expected_program} actual={}",
-                row[0]
-            ));
-        }
         if !identities.insert(row[..5].to_vec()) {
             return Err(format!("duplicate inventory identity: {:?}", &row[..5]));
         }
@@ -4081,6 +4072,20 @@ fn parse_exhaustive_gap_inventory(
             }
             other => return Err(format!("unknown inventory anchor status {other:?}")),
         }
+    }
+    Ok(rows)
+}
+
+fn parse_exhaustive_gap_inventory(
+    path: &Path,
+    expected_program: &str,
+) -> Result<Vec<Vec<String>>, String> {
+    let rows = parse_gap_inventory_rows(path)?;
+    if let Some(row) = rows.iter().find(|row| row[0] != expected_program) {
+        return Err(format!(
+            "inventory program drift: expected={expected_program} actual={}",
+            row[0]
+        ));
     }
     Ok(rows)
 }
@@ -4244,6 +4249,8 @@ fn run_gap_attribution_worker(tcx: TyCtxt<'_>, t_tcx: Duration) -> Row {
     let expected_gap_path = PathBuf::from(
         std::env::var_os("CRAT_A4_GAP_SITES").expect("gap-attribution expected gap sites"),
     );
+    let expected_gap_format =
+        std::env::var("CRAT_A4_GAP_SITE_FORMAT").expect("gap-attribution gap-site format");
     let mapping_path = PathBuf::from(
         std::env::var_os("CRAT_A4_GAP_MAPPING").expect("gap-attribution mapping output"),
     );
@@ -4262,8 +4269,9 @@ fn run_gap_attribution_worker(tcx: TyCtxt<'_>, t_tcx: Duration) -> Row {
         .expect("numeric gap-attribution expected units");
 
     emit_phase(started, "gap-attribution-graph", None, 0);
-    let expected_gaps = parse_graph_shape_rows(&expected_gap_path, &program)
-        .unwrap_or_else(|error| panic!("A4C STOP phase=gap-input candidate=none: {error}"));
+    let expected_gaps =
+        parse_registered_gap_program(&expected_gap_path, &program, &expected_gap_format)
+            .unwrap_or_else(|error| panic!("A4C STOP phase=gap-input candidate=none: {error}"));
     let input = parse_a4_input(&input_path)
         .unwrap_or_else(|error| panic!("A4C STOP phase=gap-input candidate=none: {error}"));
     let mut candidates = input
@@ -4283,12 +4291,20 @@ fn run_gap_attribution_worker(tcx: TyCtxt<'_>, t_tcx: Duration) -> Row {
 
     let (slots, graph, anchors) = collect_source_graph_gap_attribution(tcx)
         .unwrap_or_else(|error| panic!("A4C STOP phase=gap-graph candidate=none: {error}"));
-    let expected = expected_gaps.into_iter().collect::<BTreeSet<_>>();
+    let expected = expected_gaps.keys().cloned().collect::<BTreeSet<_>>();
     let actual = anchors.keys().cloned().collect::<BTreeSet<_>>();
     assert_eq!(
         actual, expected,
         "A4C STOP phase=gap-identity candidate=none: gap-site drift"
     );
+    for (gap, expected_resolution) in &expected_gaps {
+        if let Some(expected_resolution) = expected_resolution {
+            assert_eq!(
+                &anchors[gap], expected_resolution,
+                "A4C STOP phase=gap-status candidate=none: registered gap status/anchor drift for {gap:?}"
+            );
+        }
+    }
     let fields = candidate_fields(tcx, &slots);
     for candidate in &candidates {
         assert!(
@@ -4801,26 +4817,34 @@ const HOST_MEMORY_MARGIN_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 const GRAPH_SHAPE_CENSUS_SCOPE: [(&str, usize); 3] =
     [("bzip2", 23), ("brotli", 112), ("lodepng", 31)];
 const GAP_INVENTORY_SCOPE: [(&str, usize); 2] = [("brotli", 112), ("lodepng", 31)];
-const GAP_SITE_SOURCE_ROOT: &str =
+const BZIP2_GAP_SITE_SOURCE_ROOT: &str =
     "/home/p51lee/dev/agent-worktrees/crat-a4-shape-census-run-20260816-v4FADj7h/shape-census";
-const GAP_SITE_AGGREGATE_MANIFEST: &str =
+const BZIP2_GAP_SITE_AGGREGATE_MANIFEST: &str =
     "0b4fbd4387e567a4312e544ff1034857ca8ad5495f05878a6229235d331a970f";
+const BZIP2_GAP_SITE_PROGRAM_MANIFEST: &str =
+    "64a8b62038d941d6bd3926293e78b1293696ade6def58fc79e9f2d3b5681b391";
 const BZIP2_GAP_MAPPING_SHA256: &str =
     "de035d4b177827bbd8ab9e13507640c682124b9df9eb19b9829528c5cb4e2fa8";
 const BROTLI_GAP_INVENTORY_SHA256: &str =
     "4378fa1f704ccd2486fbdd08825038404a7af21db6bd0338430f7fdf91ef42f4";
-const GAP_SITE_PROGRAM_MANIFESTS: [(&str, &str); 3] = [
-    (
-        "bzip2",
-        "64a8b62038d941d6bd3926293e78b1293696ade6def58fc79e9f2d3b5681b391",
-    ),
+const GAP_INVENTORY_SOURCE_ROOT: &str =
+    "/home/p51lee/dev/agent-worktrees/crat-a4-gap-inventory-run-20260818-pDPvDl0f/gap-inventory";
+const GAP_INVENTORY_AGGREGATE_MANIFEST: &str =
+    "984d72f3f2affb72d9328c608b58b1011638a42c74746f56c371ab163d7e0918";
+const GAP_INVENTORY_AGGREGATE_SHA256: &str =
+    "3513ce078f941aa4d518b2b83bca663311a248cd8310d10c4bac0bd4ae68b0e0";
+const GAP_INVENTORY_PROGRAM_SOURCES: [(&str, &str, &str, usize); 2] = [
     (
         "brotli",
-        "e0020c6ed6fec6e91469e9d7579c3b53e1a65e55cbc40ce628abbf229135288a",
+        "7475eb976ea530c96d2f82fcbf6f9a12857f5076a319d9bdfee99c5b2bbe1e28",
+        BROTLI_GAP_INVENTORY_SHA256,
+        35,
     ),
     (
         "lodepng",
-        "a64312c9ce24992213c5933f5b70e96817d6852f01dc25d08860929a0ed66206",
+        "7cd70ad01533a785f65093447fcfafe2fdb432174a782caf9511d5f47cf5e612",
+        "6f3b176e8631fd36b6e4d53cd7bba816097da5c5214a07c1b0254fb877e7decc",
+        7,
     ),
 ];
 const LIL_ORACLE_PARTIAL_SHA256: &str =
@@ -8562,14 +8586,6 @@ fn parse_graph_shape_rows(
     path: &Path,
     expected_program: &str,
 ) -> Result<Vec<GraphShapeGap>, String> {
-    let registered = BTreeSet::from([
-        "multiple-static-seed-identities",
-        "multi-static-identity-merge",
-        "conflicting-static-depth-merge",
-        "unsupported-static-data-projection",
-        "invalid-static-depth",
-        "other-graph-construction-stop",
-    ]);
     let rows = parse_table(path, GRAPH_SHAPE_HEADER, 5)?;
     let mut seen = BTreeSet::new();
     let mut gaps = Vec::with_capacity(rows.len());
@@ -8580,18 +8596,7 @@ fn parse_graph_shape_rows(
                 row[0]
             ));
         }
-        if !registered.contains(row[1].as_str()) {
-            return Err(format!("unregistered shape kind: {}", row[1]));
-        }
-        let gap = GraphShapeGap {
-            kind: registered
-                .get(row[1].as_str())
-                .copied()
-                .expect("registered shape kind"),
-            function: row[2].clone(),
-            site: row[3].clone(),
-            detail: row[4].clone(),
-        };
+        let gap = graph_shape_gap_from_row(&row)?;
         if !seen.insert(gap.clone()) {
             return Err(format!("duplicate exact shape row: {gap:?}"));
         }
@@ -8600,15 +8605,91 @@ fn parse_graph_shape_rows(
     Ok(gaps)
 }
 
-fn verify_gap_site_source() -> Result<BTreeMap<String, Vec<GraphShapeGap>>, String> {
-    let root = Path::new(GAP_SITE_SOURCE_ROOT);
-    let aggregate_manifest = verify_manifest(root)?;
-    if aggregate_manifest != GAP_SITE_AGGREGATE_MANIFEST {
+fn registered_graph_shape_kind(value: &str) -> Result<&'static str, String> {
+    match value {
+        "multiple-static-seed-identities" => Ok("multiple-static-seed-identities"),
+        "multi-static-identity-merge" => Ok("multi-static-identity-merge"),
+        "conflicting-static-depth-merge" => Ok("conflicting-static-depth-merge"),
+        "unsupported-static-data-projection" => Ok("unsupported-static-data-projection"),
+        "invalid-static-depth" => Ok("invalid-static-depth"),
+        "other-graph-construction-stop" => Ok("other-graph-construction-stop"),
+        other => Err(format!("unregistered shape kind: {other}")),
+    }
+}
+
+fn graph_shape_gap_from_row(row: &[String]) -> Result<GraphShapeGap, String> {
+    if row.len() < 5 {
+        return Err(format!("gap row has too few columns: {row:?}"));
+    }
+    Ok(GraphShapeGap {
+        kind: registered_graph_shape_kind(&row[1])?,
+        function: row[2].clone(),
+        site: row[3].clone(),
+        detail: row[4].clone(),
+    })
+}
+
+const GAP_SOURCE_FORMAT_SHAPE_IDENTITY: &str = "shape-identity";
+const GAP_SOURCE_FORMAT_EXHAUSTIVE_INVENTORY: &str = "exhaustive-inventory";
+
+#[derive(Clone, Debug)]
+struct RegisteredGapProgram {
+    input_path: PathBuf,
+    format: &'static str,
+    sites: BTreeMap<GraphShapeGap, Option<ResolvedGraphGap>>,
+}
+
+impl RegisteredGapProgram {
+    fn len(&self) -> usize {
+        self.sites.len()
+    }
+}
+
+fn parse_registered_gap_program(
+    path: &Path,
+    program: &str,
+    format: &str,
+) -> Result<BTreeMap<GraphShapeGap, Option<ResolvedGraphGap>>, String> {
+    match format {
+        GAP_SOURCE_FORMAT_SHAPE_IDENTITY => Ok(parse_graph_shape_rows(path, program)?
+            .into_iter()
+            .map(|gap| (gap, None))
+            .collect()),
+        GAP_SOURCE_FORMAT_EXHAUSTIVE_INVENTORY => {
+            let rows = parse_exhaustive_gap_inventory(path, program)?;
+            rows.into_iter()
+                .map(|row| {
+                    let gap = graph_shape_gap_from_row(&row)?;
+                    let resolved = match row[5].as_str() {
+                        "out-of-pointer-universe" => ResolvedGraphGap {
+                            status: GapAnchorStatus::OutOfPointerUniverse,
+                            nodes: BTreeSet::new(),
+                        },
+                        "graph-nodes" => ResolvedGraphGap {
+                            status: GapAnchorStatus::GraphNodes,
+                            nodes: row[7].split('|').map(str::to_owned).collect(),
+                        },
+                        other => {
+                            return Err(format!("unknown inventory anchor status {other:?}"));
+                        }
+                    };
+                    Ok((gap, Some(resolved)))
+                })
+                .collect()
+        }
+        other => Err(format!("unknown registered gap-source format: {other}")),
+    }
+}
+
+fn verify_gap_site_source() -> Result<BTreeMap<String, RegisteredGapProgram>, String> {
+    let bzip2_root = Path::new(BZIP2_GAP_SITE_SOURCE_ROOT);
+    let aggregate_manifest = verify_manifest(bzip2_root)?;
+    if aggregate_manifest != BZIP2_GAP_SITE_AGGREGATE_MANIFEST {
         return Err(format!(
-            "gap-site aggregate manifest drift: expected={GAP_SITE_AGGREGATE_MANIFEST} actual={aggregate_manifest}"
+            "bzip2 gap-site aggregate manifest drift: expected={BZIP2_GAP_SITE_AGGREGATE_MANIFEST} actual={aggregate_manifest}"
         ));
     }
-    let combined = parse_table(&root.join("shapes.tsv"), GRAPH_SHAPE_HEADER, 5)?;
+    let combined = parse_table(&bzip2_root.join("shapes.tsv"), GRAPH_SHAPE_HEADER, 5)?;
     if combined.len() != 4 {
         return Err(format!(
             "gap-site aggregate expected four rows, got {}",
@@ -8616,35 +8697,109 @@ fn verify_gap_site_source() -> Result<BTreeMap<String, Vec<GraphShapeGap>>, Stri
         ));
     }
     let mut by_program = BTreeMap::new();
-    for (program, expected_manifest) in GAP_SITE_PROGRAM_MANIFESTS {
-        let dir = root.join(program);
+    let bzip2_dir = bzip2_root.join("bzip2");
+    let bzip2_manifest = verify_manifest(&bzip2_dir)?;
+    if bzip2_manifest != BZIP2_GAP_SITE_PROGRAM_MANIFEST {
+        return Err(format!(
+            "bzip2 gap-site program manifest drift: expected={BZIP2_GAP_SITE_PROGRAM_MANIFEST} actual={bzip2_manifest}"
+        ));
+    }
+    let bzip2_input = bzip2_dir.join("shapes.tsv");
+    let bzip2_sites =
+        parse_registered_gap_program(&bzip2_input, "bzip2", GAP_SOURCE_FORMAT_SHAPE_IDENTITY)?;
+    if bzip2_sites.len() != 1 {
+        return Err(format!(
+            "bzip2 gap-site source expected one row, got {}",
+            bzip2_sites.len()
+        ));
+    }
+    let bzip2_rendered = bzip2_sites
+        .keys()
+        .map(|gap| {
+            vec![
+                "bzip2".to_owned(),
+                gap.kind.to_owned(),
+                gap.function.clone(),
+                gap.site.clone(),
+                gap.detail.clone(),
+            ]
+        })
+        .collect::<BTreeSet<_>>();
+    if !bzip2_rendered.is_subset(&combined.iter().cloned().collect()) {
+        return Err("bzip2 program row missing from manifested aggregate".to_owned());
+    }
+    by_program.insert(
+        "bzip2".to_owned(),
+        RegisteredGapProgram {
+            input_path: bzip2_input,
+            format: GAP_SOURCE_FORMAT_SHAPE_IDENTITY,
+            sites: bzip2_sites,
+        },
+    );
+
+    let inventory_root = Path::new(GAP_INVENTORY_SOURCE_ROOT);
+    let inventory_manifest = verify_manifest(inventory_root)?;
+    if inventory_manifest != GAP_INVENTORY_AGGREGATE_MANIFEST {
+        return Err(format!(
+            "gap-inventory aggregate manifest drift: expected={GAP_INVENTORY_AGGREGATE_MANIFEST} actual={inventory_manifest}"
+        ));
+    }
+    let inventory_path = inventory_root.join("gap-sites.tsv");
+    let inventory_sha = sha256(&inventory_path);
+    if inventory_sha != GAP_INVENTORY_AGGREGATE_SHA256 {
+        return Err(format!(
+            "gap-inventory aggregate row digest drift: expected={GAP_INVENTORY_AGGREGATE_SHA256} actual={inventory_sha}"
+        ));
+    }
+    let combined_inventory = parse_gap_inventory_rows(&inventory_path)?;
+    if combined_inventory.len() != 42 {
+        return Err(format!(
+            "gap-inventory aggregate expected 42 rows, got {}",
+            combined_inventory.len()
+        ));
+    }
+    let mut program_inventory_rows = BTreeSet::new();
+    for (program, expected_manifest, expected_rows_sha, expected_count) in
+        GAP_INVENTORY_PROGRAM_SOURCES
+    {
+        let dir = inventory_root.join(program);
         let manifest = verify_manifest(&dir)?;
         if manifest != expected_manifest {
             return Err(format!(
-                "gap-site program manifest drift: program={program} expected={expected_manifest} actual={manifest}"
+                "gap-inventory program manifest drift: program={program} expected={expected_manifest} actual={manifest}"
             ));
         }
+        let input_path = dir.join("gap-sites.tsv");
+        let actual_rows_sha = sha256(&input_path);
+        if actual_rows_sha != expected_rows_sha {
+            return Err(format!(
+                "gap-inventory program row digest drift: program={program} expected={expected_rows_sha} actual={actual_rows_sha}"
+            ));
+        }
+        let rows = parse_exhaustive_gap_inventory(&input_path, program)?;
+        if rows.len() != expected_count {
+            return Err(format!(
+                "gap-inventory program row count drift: program={program} expected={expected_count} actual={}",
+                rows.len()
+            ));
+        }
+        program_inventory_rows.extend(rows);
+        let sites = parse_registered_gap_program(
+            &input_path,
+            program,
+            GAP_SOURCE_FORMAT_EXHAUSTIVE_INVENTORY,
+        )?;
         by_program.insert(
             program.to_owned(),
-            parse_graph_shape_rows(&dir.join("shapes.tsv"), program)?,
+            RegisteredGapProgram {
+                input_path,
+                format: GAP_SOURCE_FORMAT_EXHAUSTIVE_INVENTORY,
+                sites,
+            },
         );
     }
-    let rendered = by_program
-        .iter()
-        .flat_map(|(program, gaps)| {
-            gaps.iter().map(move |gap| {
-                vec![
-                    program.clone(),
-                    gap.kind.to_owned(),
-                    gap.function.clone(),
-                    gap.site.clone(),
-                    gap.detail.clone(),
-                ]
-            })
-        })
-        .collect::<BTreeSet<_>>();
-    if rendered != combined.into_iter().collect() {
-        return Err("gap-site aggregate/program row mismatch".to_owned());
+    if program_inventory_rows != combined_inventory.into_iter().collect() {
+        return Err("gap-inventory aggregate/program row mismatch".to_owned());
     }
     Ok(by_program)
 }
@@ -9331,12 +9486,9 @@ fn run_gap_attribution_probe(contract: &MeasurementContract) {
                 ),
                 (
                     "CRAT_A4_GAP_SITES",
-                    Path::new(GAP_SITE_SOURCE_ROOT)
-                        .join(program_name)
-                        .join("shapes.tsv")
-                        .display()
-                        .to_string(),
+                    expected_gaps.input_path.display().to_string(),
                 ),
+                ("CRAT_A4_GAP_SITE_FORMAT", expected_gaps.format.to_owned()),
                 (
                     "CRAT_A4_GAP_MAPPING",
                     dir.join("mapping.tsv").display().to_string(),
@@ -9500,8 +9652,8 @@ fn run_gap_attribution_probe(contract: &MeasurementContract) {
     all_anchors.sort();
     assert_eq!(
         all_impact.len(),
-        4,
-        "A4C STOP phase=gap-aggregate candidate=none: expected four gap sites"
+        43,
+        "A4C STOP phase=gap-aggregate candidate=none: expected 43 gap sites"
     );
     assert_eq!(
         program_records.iter().map(|record| record.1).sum::<usize>(),
@@ -9520,7 +9672,7 @@ fn run_gap_attribution_probe(contract: &MeasurementContract) {
     write_atomic_checkpoint(&root.join("impact.tsv"), &impact).expect("write aggregate gap impact");
     write_atomic_checkpoint(&root.join("anchors.tsv"), &anchors)
         .expect("write aggregate gap anchors");
-    let operational = "program\tgap_sites\tcandidate_workers_hard_blocked\treason\nbzip2\t1\t23\twhole-program-graph-construction-before-candidate\nbrotli\t2\t112\twhole-program-graph-construction-before-candidate\nlodepng\t1\t31\twhole-program-graph-construction-before-candidate\n";
+    let operational = "program\tgap_sites\tcandidate_workers_hard_blocked\treason\nbzip2\t1\t23\twhole-program-graph-construction-before-candidate\nbrotli\t35\t112\twhole-program-graph-construction-before-candidate\nlodepng\t7\t31\twhole-program-graph-construction-before-candidate\n";
     fs::write(root.join("operational-scope.tsv"), operational)
         .expect("write gap operational scope");
     let peak_rss = program_records
@@ -9536,18 +9688,20 @@ fn run_gap_attribution_probe(contract: &MeasurementContract) {
     let wall_sum = program_records.iter().map(|record| record.5).sum::<f64>();
     let per_program = program_records
         .iter()
-        .map(|record| format!("{}:{}/{}", record.0, record.3, record.1))
+        .map(|record| format!("{}:{}/{}", record.0, record.3, record.2))
         .collect::<Vec<_>>()
         .join(",");
     let report = format!(
-        "# Gap-site to candidate attribution\n\n- gap sites: 4\n- candidate identity scope: 166\n- unique reachable candidates: {}\n- mapping rows: {}\n- per-program mapping/scope: {per_program}\n- semantic data: false\n- ordinary-path operational block: bzip2 23, brotli 112, lodepng 31 candidate workers\n- wall sum on {MACHINE_ID}: {wall_sum:.3} s\n- peak GNU-time RSS: {peak_rss} KiB\n- peak cgroup memory: {cgroup_peak} KiB\n",
+        "# Gap-site to candidate attribution\n\n- gap sites: {}\n- candidate identity scope: 166\n- unique reachable candidates: {}\n- mapping rows: {}\n- per-program mapping/gap-sites: {per_program}\n- semantic data: false\n- ordinary-path operational block: bzip2 23, brotli 112, lodepng 31 candidate workers\n- wall sum on {MACHINE_ID}: {wall_sum:.3} s\n- peak GNU-time RSS: {peak_rss} KiB\n- peak cgroup memory: {cgroup_peak} KiB\n",
+        all_impact.len(),
         affected.len(),
         all_mapping.len(),
     );
     fs::write(root.join("report.md"), report).expect("write gap-attribution report");
     let provenance = format!(
-        "machine_id={MACHINE_ID}\nplatform={PLATFORM}\nanalysis_head={}\nanalysis_branch=codex/a4-source-census\nmeasurement_class=gap-attribution\nsemantic_data=false\ncandidate_processing=attribution-only\nderived_substrate_digest={DERIVED_SUBSTRATE_DIGEST}\ngap_site_source_manifest={GAP_SITE_AGGREGATE_MANIFEST}\nwall_bound_kind=liveness\nwall_cap_s={LIVENESS_BOUND_S}\nmemory_limit=cgroup-100GiB\nprograms=bzip2,brotli,lodepng\nunits_covered=166\ngap_sites=4\nmapping_rows={}\nunique_affected_candidates={}\nprogram_manifests={}\nwall_sum_s={wall_sum:.3}\npeak_rss_kb={peak_rss}\ncgroup_peak_memory_kb={cgroup_peak}\ntiming_comparison=forbidden-across-machines\n",
+        "machine_id={MACHINE_ID}\nplatform={PLATFORM}\nanalysis_head={}\nanalysis_branch=codex/a4-source-census\nmeasurement_class=gap-attribution\nsemantic_data=false\ncandidate_processing=attribution-only\nderived_substrate_digest={DERIVED_SUBSTRATE_DIGEST}\nbzip2_gap_site_source_manifest={BZIP2_GAP_SITE_AGGREGATE_MANIFEST}\ngap_inventory_source_manifest={GAP_INVENTORY_AGGREGATE_MANIFEST}\ngap_inventory_rows_sha256={GAP_INVENTORY_AGGREGATE_SHA256}\nwall_bound_kind=liveness\nwall_cap_s={LIVENESS_BOUND_S}\nmemory_limit=cgroup-100GiB\nprograms=bzip2,brotli,lodepng\nunits_covered=166\ngap_sites={}\nmapping_rows={}\nunique_affected_candidates={}\nprogram_manifests={}\nwall_sum_s={wall_sum:.3}\npeak_rss_kb={peak_rss}\ncgroup_peak_memory_kb={cgroup_peak}\ntiming_comparison=forbidden-across-machines\n",
         contract.head,
+        all_impact.len(),
         all_mapping.len(),
         affected.len(),
         program_records
@@ -11267,8 +11421,38 @@ mod tests {
     fn published_gap_site_input_verifies_exactly() {
         let gaps = verify_gap_site_source().expect("published gap-site input must verify");
         assert_eq!(gaps["bzip2"].len(), 1);
-        assert_eq!(gaps["brotli"].len(), 2);
-        assert_eq!(gaps["lodepng"].len(), 1);
+        assert_eq!(gaps["brotli"].len(), 35);
+        assert_eq!(gaps["lodepng"].len(), 7);
+        assert!(gaps["bzip2"].sites.values().all(Option::is_none));
+        assert_eq!(
+            gaps["brotli"]
+                .sites
+                .values()
+                .filter(|resolved| {
+                    resolved.as_ref().is_some_and(|resolved| {
+                        resolved.status == GapAnchorStatus::OutOfPointerUniverse
+                    })
+                })
+                .count(),
+            34
+        );
+        assert_eq!(
+            gaps["brotli"]
+                .sites
+                .values()
+                .filter(|resolved| {
+                    resolved
+                        .as_ref()
+                        .is_some_and(|resolved| resolved.status == GapAnchorStatus::GraphNodes)
+                })
+                .count(),
+            1
+        );
+        assert!(gaps["lodepng"].sites.values().all(|resolved| {
+            resolved
+                .as_ref()
+                .is_some_and(|resolved| resolved.status == GapAnchorStatus::OutOfPointerUniverse)
+        }));
     }
 
     #[test]
