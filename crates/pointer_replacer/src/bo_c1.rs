@@ -41,8 +41,14 @@ use self::ownership_diagnostic_package::{
 };
 use crate::{analyses::borrow_ownership::solver::CORE_LABEL_FAMILIES, utils::rustc::RustProgram};
 
+#[path = "a4_measurement.rs"]
+mod a4_measurement;
+#[path = "a4_source_census.rs"]
+mod a4_source_census;
 #[path = "a5_measurement.rs"]
 mod a5_measurement;
+#[path = "p_b_measurement.rs"]
+mod p_b_measurement;
 #[path = "s23_measurement.rs"]
 mod s23_measurement;
 
@@ -2157,11 +2163,12 @@ pub(crate) mod ownership_diagnostic_package {
         Other,
     }
 
-    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    #[derive(Clone, Debug, PartialEq, Eq)]
     pub enum RemovalFilter {
         Family(&'static str),
         FamilyPair([&'static str; 2]),
         OwnAssumeSite(AssumeSite),
+        ExactOwnAssumeLabels(BTreeSet<String>),
     }
 
     pub const PAIRWISE_REMOVAL_FAMILIES: [&str; 5] = [
@@ -2364,7 +2371,7 @@ pub(crate) mod ownership_diagnostic_package {
     }
 
     pub fn suppresses_label(label: impl FnOnce() -> String) -> bool {
-        let filter = REMOVAL_FILTER.with(|slot| *slot.borrow());
+        let filter = REMOVAL_FILTER.with(|slot| slot.borrow().clone());
         let Some(filter) = filter else {
             return false;
         };
@@ -2377,6 +2384,9 @@ pub(crate) mod ownership_diagnostic_package {
             RemovalFilter::OwnAssumeSite(site) => {
                 family == "own-assume"
                     && crate::analyses::borrow_ownership::solver::current_own_assume_site() == site
+            }
+            RemovalFilter::ExactOwnAssumeLabels(labels) => {
+                family == "own-assume" && label.ends_with("=false)") && labels.contains(&label)
             }
         }
     }
@@ -2801,6 +2811,24 @@ pub(crate) mod ownership_diagnostic_package {
                 assert!(suppresses_label(|| "own-equal(x=y)".to_string()));
                 assert!(suppresses_label(|| "link-own(x=y)".to_string()));
                 assert!(!suppresses_label(|| "own-linear(x+y=z)".to_string()));
+            });
+            assert!(!removal_filter_active());
+        }
+
+        #[test]
+        fn a4_exact_filter_suppresses_only_the_named_negative_assumption() {
+            let selected = BTreeSet::from(["own-assume[ssa-transfer](17=false)".to_owned()]);
+            with_removal_filter(RemovalFilter::ExactOwnAssumeLabels(selected), || {
+                assert!(suppresses_label(|| {
+                    "own-assume[ssa-transfer](17=false)".to_owned()
+                }));
+                assert!(!suppresses_label(|| {
+                    "own-assume[ssa-transfer](18=false)".to_owned()
+                }));
+                assert!(!suppresses_label(|| {
+                    "own-assume[temporary-finalization](17=false)".to_owned()
+                }));
+                assert!(!suppresses_label(|| "own-equal(17,18)".to_owned()));
             });
             assert!(!removal_filter_active());
         }
@@ -13029,6 +13057,8 @@ fn boc1_run_one() {
             | "prod-box"
             | "selector-core"
             | "selector-necessity"
+            | "a4-probe"
+            | "a4-source-census"
             | "a5-p1"
             | "s23-discover"
             | "s23-probe"
@@ -13067,7 +13097,10 @@ fn boc1_run_one() {
             "use-census" => run::run_use_census(tcx, t_tcx),
             "m1-recon" => run::run_m1_recon(tcx, t_tcx),
             "m1-editdump" => run::run_m1_editdump(tcx, t_tcx),
+            "a4-probe" => a4_measurement::run_probe_worker(tcx, t_tcx),
+            "a4-source-census" => a4_source_census::run_worker(tcx, t_tcx),
             "a5-p1" => a5_measurement::run_worker(tcx, t_tcx),
+            "p-b" => p_b_measurement::run_worker(tcx, t_tcx),
             "s23-discover" => s23_measurement::run_discovery_worker(tcx, t_tcx),
             "s23-probe" => s23_measurement::run_probe_worker(tcx, t_tcx),
             "selector-core" => run::run_selector_core(tcx, t_tcx),
@@ -13590,11 +13623,20 @@ mod orchestrate {
         pub stderr: String,
     }
 
-    fn env_u64(key: &str, default: u64) -> u64 {
-        std::env::var(key)
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(default)
+    pub(super) fn memory_limit_kb(raw: Option<&str>) -> Result<Option<u64>, String> {
+        let mib = match raw {
+            Some("uncapped") => return Ok(None),
+            Some(value) => value
+                .parse::<u64>()
+                .map_err(|error| format!("invalid CRAT_BOC1_MEM_MB {value:?}: {error}"))?,
+            None => 8192,
+        };
+        if mib == 0 {
+            return Err("CRAT_BOC1_MEM_MB=0 is ambiguous; use `uncapped`".to_owned());
+        }
+        mib.checked_mul(1024)
+            .map(Some)
+            .ok_or_else(|| format!("CRAT_BOC1_MEM_MB={mib} overflows KiB"))
     }
 
     pub fn workspace_root() -> PathBuf {
@@ -13731,7 +13773,9 @@ mod orchestrate {
         timeout: Duration,
         extra: &[(&str, String)],
     ) -> ChildOutcome {
-        let mem_cap_kb = env_u64("CRAT_BOC1_MEM_MB", 8192) * 1024;
+        let memory_limit_raw = std::env::var("CRAT_BOC1_MEM_MB").ok();
+        let mem_cap_kb = memory_limit_kb(memory_limit_raw.as_deref())
+            .unwrap_or_else(|error| panic!("memory-limit configuration: {error}"));
         let logs = out_dir().join("logs");
         fs::create_dir_all(&logs).expect("create log dir");
         let out_path = logs.join(format!("{program}.{log_label}.out"));
@@ -13887,7 +13931,7 @@ mod orchestrate {
                         let _ = child.kill();
                     } else if killed_for.is_none()
                         && t0.elapsed().as_millis() % 1000 < 200
-                        && current_rss_kb.is_some_and(|kb| kb > mem_cap_kb)
+                        && mem_cap_kb.is_some_and(|cap| current_rss_kb.is_some_and(|kb| kb > cap))
                     {
                         killed_for = Some("oom-kill");
                         let _ = child.kill();

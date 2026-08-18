@@ -2,6 +2,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use syn::visit::{self, Visit};
 
+pub mod differential_join;
+
 const STATISTIC_KEYS: [&str; 9] = [
     "num_unsafe_ptrs",
     "num_non_arr_unsafe_ptrs",
