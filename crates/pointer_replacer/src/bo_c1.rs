@@ -7843,7 +7843,7 @@ mod run {
             RewriteOutcome::Emitted {
                 emitted_count,
                 degradations,
-                files,
+                files_touched,
                 reverted_count,
                 attribution_blind,
                 bisect_probes,
@@ -7854,7 +7854,12 @@ mod run {
             } => (
                 *emitted_count,
                 degradations.len(),
-                files.len(),
+                // **THE RULED VALUE, READ — never `files.len()`** (2026-08-18).
+                // The AST emission map is seeded, so its size counts files the
+                // rewrite did not touch; measuring it here reported `bst` as
+                // 1 against the span layer's 0 while both emitted byte-
+                // identical text.
+                *files_touched,
                 *reverted_count,
                 *attribution_blind,
                 *bisect_probes,

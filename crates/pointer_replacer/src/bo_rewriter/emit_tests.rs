@@ -919,6 +919,63 @@ fn a_failing_outcome_carries_its_reverted_count() {
     }
 }
 
+/// **An EMITTED outcome carries the ruled `files_touched`, not its map size.**
+///
+/// The twin of `a_failing_outcome_carries_its_reverted_count`, for the arm that
+/// did not have one. `Degraded` carried the ruled value all along; `emitted()`
+/// DROPPED it, so the only consumer recovered a number by measuring `files`
+/// instead. On the span layer the two agree — `render` returns edited files
+/// only — so the defect was invisible for the whole span era and surfaced the
+/// moment the AST layer's SEEDED map made them differ.
+///
+/// The fixture encodes exactly that disagreement: `files_touched: 0` against a
+/// ONE-entry map. That is not a contrived pair, it is `bst` — converged with
+/// every subject reverted, emitting its substrate unchanged, and reported as
+/// touching one file against the span layer's zero.
+///
+/// *Mutation-tested.* **Deletion first:** drop `files_touched: self.files_touched`
+/// from `OutcomeFacts::emitted` and this fails to compile, which is the
+/// strongest available failure. **Faithful second:** write
+/// `files_touched: files.len()` there — the exact defect, spelled as a plausible
+/// fix — and this fails 1 vs 0.
+#[test]
+fn an_emitted_outcome_carries_the_ruled_files_touched() {
+    let facts = super::OutcomeFacts {
+        emitted_count: 0,
+        reverted_count: 1,
+        files_touched: 0,
+        ..Default::default()
+    };
+    let mut files = std::collections::BTreeMap::new();
+    files.insert(
+        super::plan::FileKey::Real(std::path::PathBuf::from("/x/lib.rs")),
+        "fn f() {}\n".to_owned(),
+    );
+    match facts.emitted("fn f() {}\n".to_owned(), files) {
+        super::RewriteOutcome::Emitted {
+            files_touched,
+            files,
+            ..
+        } => {
+            assert_eq!(
+                files_touched, 0,
+                "an emitted outcome reported its emission MAP SIZE as \
+                 files_touched; the map is seeded on the AST layer, so this \
+                 counts a file the rewrite never touched"
+            );
+            assert_eq!(
+                files.len(),
+                1,
+                "the map itself must still carry the file — the emission is \
+                 what it is; only the COUNTER was wrong, and a fix that \
+                 dropped the file would trade a counter defect for an \
+                 emission one"
+            );
+        }
+        super::RewriteOutcome::Degraded { .. } => panic!("emitted() built a Degraded"),
+    }
+}
+
 /// **brotli investigation (a) — PRISTINE-COPY CONTROL.**
 ///
 /// Materialize brotli with ZERO edits and type-check the copy. This is the

@@ -118,8 +118,28 @@ pub(crate) enum RewriteOutcome {
         /// Read back from the materialized copy rather than reconstructed, so it
         /// is correct whether or not the root itself was edited.
         source: String,
-        /// Every file the rewrite changed, keyed by file.
+        /// The files this outcome emits, keyed by file.
+        ///
+        /// ⚠ **NOT "every file the rewrite changed" — that is what this said,
+        /// and it was false on the AST layer** (2026-08-18). The AST emission
+        /// map is SEEDED with every file holding a function, because a crate
+        /// with no surviving edits must still emit its original text rather
+        /// than an empty file (the g09 fix). So on that layer `files` can
+        /// contain a file whose bytes are IDENTICAL to the substrate.
+        ///
+        /// Consequently **`files.len()` is not `files_touched`**, and the stale
+        /// wording here is what licensed a consumer to re-derive it that way.
+        /// Use [`Self::Emitted::files_touched`].
         files: std::collections::BTreeMap<plan::FileKey, String>,
+        /// **Files with at least one SURVIVING EDIT** (ruling 2026-08-18),
+        /// carried from the loop rather than re-derived from `files`.
+        ///
+        /// It exists because it was already computed and then DROPPED here:
+        /// `OutcomeFacts` held the ruled value, `emitted()` did not pass it on,
+        /// and the reporting site recovered a number by measuring `files`
+        /// instead — a second derivation that agreed with the first only on the
+        /// span layer, where `render` returns edited files only.
+        files_touched: usize,
         degradations: Vec<decision::Degradation>,
         emitted_count: usize,
         /// Pointer parameters on item kinds M1 does not rewrite. Carried out
@@ -1724,6 +1744,7 @@ impl OutcomeFacts {
         RewriteOutcome::Emitted {
             source,
             files,
+            files_touched: self.files_touched,
             degradations: self.degradations,
             emitted_count: self.emitted_count,
             excluded: self.excluded,
