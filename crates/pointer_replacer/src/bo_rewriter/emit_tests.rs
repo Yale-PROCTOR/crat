@@ -4685,3 +4685,128 @@ fn reverting_every_function_reproduces_the_substrate() {
          --- emitted ---\n{out}\n--- substrate ---\n{SRC}"
     );
 }
+
+/// **W2 — the two layers agree on a program the loop actually REVERTED.**
+///
+/// W1 established that the AST layer honours a revert set. W2 is the question
+/// the acceptance gate rests on: that both layers, driven end to end through
+/// the real verify/revert loop on a fixture where a revert genuinely fires,
+/// reach the SAME verdict and the SAME converged state.
+///
+/// # ADMISSIBILITY — traced, not assumed
+///
+/// A compared quantity is admissible **iff its dataflow passes through
+/// `round_files`' output**, i.e. through the candidate programs the switched
+/// emitter produced. The first draft of this test compared `emitted_count` and
+/// the `degradations` vector — **both PARAMETERS of `verify_and_revert`,
+/// computed by `emit_files` before the loop**, hence identical on both sides by
+/// construction. It passed with the defect it named restored. A comparison
+/// witnesses nothing unless its two sides can differ.
+///
+/// The trace for each quantity compared here:
+///
+/// | quantity | origin | admissible |
+/// |---|---|---|
+/// | verdict (`Emitted`/`Degraded`) | the loop's own exit path | yes |
+/// | `escalated` | `facts.escalated`, assigned in the loop | yes |
+/// | `reverted_count` | `facts.reverted_count`, from `reverted.len()`/`taken.len()` | yes |
+/// | `bisect_probes` | `facts.bisect_probes`, from `bisect`'s return | yes |
+/// | ~~`emitted_count`~~ | parameter, pre-loop | **NO** |
+/// | ~~`degradations.len()`~~ | parameter, pre-loop | **NO** |
+///
+/// Emitted TEXT is deliberately not compared: the gate's bar is verdicts and
+/// counters, the pinned oracle carries no texts, and text-level fidelity is
+/// already owned by the parity instruments and
+/// `reverting_every_function_reproduces_the_substrate`.
+///
+/// *Mutation-witnessed* (M-W2): restoring the re-derivation inside
+/// `ast_emitted_files_from` flips the AST side's verdict. Build-verified —
+/// a mutation is only a mutation if it provably compiled into that run.
+#[test]
+fn both_layers_agree_on_a_reverted_program() {
+    /// Verdict plus the loop-derived counters. Everything here is assigned
+    /// below the layer switch; see the admissibility table above.
+    #[derive(Debug, PartialEq, Eq)]
+    struct Converged {
+        emitted: bool,
+        escalated: Option<String>,
+        reverted_count: usize,
+        bisect_probes: usize,
+    }
+
+    fn run(ast: bool) -> Converged {
+        // SAFETY: this test is run single-threaded (`--test-threads=1` is not
+        // required because the switch is read once per `rewrite_*` call and
+        // restored before returning), and the switch is process-global by
+        // design: it is a transitional build selector, not a runtime parameter.
+        unsafe {
+            if ast {
+                std::env::set_var("CRAT_M1_AST_EMIT", "1");
+            } else {
+                std::env::remove_var("CRAT_M1_AST_EMIT");
+            }
+        }
+        let fixture = Fixture::new(&[
+            (
+                "lib.rs",
+                "#![allow(dead_code, unused_unsafe)]\npub mod good;\npub mod bad;\n",
+            ),
+            (
+                "good.rs",
+                "pub unsafe fn bump(p: *mut i32) -> i32 {\n    *p += 1;\n    *p\n}\n",
+            ),
+            ("bad.rs", BREAKS_ON_REWRITE),
+        ]);
+        // **CAP 0 IS LOAD-BEARING.** At cap 8 the loop reverts once and
+        // converges on BOTH layers, so every compared quantity agrees even
+        // with the defect restored — measured, not assumed. Round 0's files
+        // come from `emit_files` (span-derived) either way, so a single revert
+        // repairs the crate before the switched emitter can matter.
+        //
+        // Cap 0 forces the bisect path, where every candidate program comes
+        // from `round_files` and the switch therefore governs. That is exactly
+        // why `the_round_cap_stops_the_loop` caught this defect and the cap-8
+        // shape did not.
+        let out = super::rewrite_m1_path_injected(&fixture.root(), 0, &force_stash_value_shared);
+        unsafe { std::env::remove_var("CRAT_M1_AST_EMIT") };
+        match out {
+            super::RewriteOutcome::Emitted {
+                escalated,
+                reverted_count,
+                bisect_probes,
+                ..
+            } => Converged {
+                emitted: true,
+                escalated,
+                reverted_count,
+                bisect_probes,
+            },
+            super::RewriteOutcome::Degraded { reason, .. } => Converged {
+                emitted: false,
+                escalated: Some(reason),
+                reverted_count: 0,
+                bisect_probes: 0,
+            },
+        }
+    }
+
+    let span = run(false);
+    let ast = run(true);
+
+    // NON-VACUITY, first: the fixture must actually exercise a revert, or every
+    // assertion below is satisfied by a loop that did nothing.
+    assert!(
+        span.emitted,
+        "the SPAN layer must reach Emitted, or the comparison is vacuous: {span:?}"
+    );
+    assert!(
+        span.reverted_count > 0,
+        "the fixture must actually revert something, or W2 tests nothing it \
+         claims to: {span:?}"
+    );
+
+    assert_eq!(
+        span, ast,
+        "the layers diverge on loop-derived state.\n  span: {span:?}\n  ast:  {ast:?}"
+    );
+}
