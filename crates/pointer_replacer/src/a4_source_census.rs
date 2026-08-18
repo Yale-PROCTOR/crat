@@ -11613,6 +11613,20 @@ fn a4_source_census() {
     aggregate(&contract);
 }
 
+#[test]
+#[ignore = "A4 reference-grade bzip2 shard; run sequentially on the dedicated Linux lane"]
+fn a4_source_census_bzip2_reference() {
+    let contract = measurement_contract();
+    enforce_substrate_preflight(&contract);
+    let program = contract
+        .programs
+        .iter()
+        .copied()
+        .find(|program| program.name == "bzip2")
+        .expect("bzip2 in measurement contract");
+    run_shard(&contract, program);
+}
+
 #[cfg(test)]
 mod tests {
     use std::{fs, io::Cursor, process};
