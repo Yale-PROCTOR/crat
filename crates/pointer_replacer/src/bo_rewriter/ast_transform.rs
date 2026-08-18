@@ -390,6 +390,14 @@ pub(crate) fn glue_expr(
 #[derive(Default)]
 pub(crate) struct Composition {
     claimed: FxHashMap<NodeId, &'static str>,
+    /// **THE CHANGED-SET, recorded where the change is claimed.**
+    ///
+    /// A function is reprinted iff one of these spans falls inside it. Recorded
+    /// at `claim` rather than derived later, because "which functions changed"
+    /// is exactly the kind of fact that grows a second derivation and drifts —
+    /// and the alternative here (compare reprint text against the original) is
+    /// the derivation the fix ruling explicitly forbade.
+    edited: Vec<rustc_span::Span>,
     /// Refusals, each naming the node and both claimants.
     pub refused: Vec<Refusal>,
 }
@@ -401,10 +409,16 @@ impl Composition {
     ///
     /// `claimant` is a stable label for the transform, not for the subject: it
     /// is what a STOP diagnosis reads to learn which two passes collided.
-    pub(crate) fn claim(&mut self, node: NodeId, claimant: &'static str) -> bool {
+    pub(crate) fn claim(
+        &mut self,
+        node: NodeId,
+        span: rustc_span::Span,
+        claimant: &'static str,
+    ) -> bool {
         match self.claimed.get(&node) {
             None => {
                 self.claimed.insert(node, claimant);
+                self.edited.push(span);
                 true
             }
             Some(&holder) => {
@@ -416,6 +430,13 @@ impl Composition {
                 false
             }
         }
+    }
+
+    /// The spans this transform actually edited. Empty means the transform
+    /// changed nothing — and then nothing is reprinted, which is the correct
+    /// answer, not a degenerate one.
+    pub(crate) fn edited_spans(&self) -> &[rustc_span::Span] {
+        &self.edited
     }
 
     /// Refusals whose CHALLENGER carries this label — the pass that was turned
@@ -615,7 +636,7 @@ impl RefDeclVisitor<'_> {
             DeclForm::Slice => "decl:slice",
             DeclForm::Opt { .. } => "decl:opt",
         };
-        if !self.guard.claim(ty.id, claimant) {
+        if !self.guard.claim(ty.id, ty.span, claimant) {
             self.stats.refused += 1;
             return;
         }
@@ -777,7 +798,7 @@ impl MutVisitor for UseGraftVisitor<'_> {
             if !self.consumed.insert(key) {
                 self.stats.multi_matched += 1;
             }
-            if !self.guard.claim(e.id, "use") {
+            if !self.guard.claim(e.id, e.span, "use") {
                 self.stats.refused += 1;
                 return;
             }
@@ -1155,7 +1176,7 @@ impl MutVisitor for SeamGraftVisitor<'_> {
                 rustc_ast::mut_visit::walk_expr(self, e);
                 return;
             };
-            if !self.guard.claim(e.id, "seam") {
+            if !self.guard.claim(e.id, e.span, "seam") {
                 self.stats.refused += 1;
                 return;
             }
@@ -1209,11 +1230,11 @@ mod tests {
         let mut g = Composition::default();
         let node = NodeId::from_u32(7);
         assert!(
-            g.claim(node, "decl:slice"),
+            g.claim(node, rustc_span::DUMMY_SP, "decl:slice"),
             "the first claim must be admitted"
         );
         assert!(
-            !g.claim(node, "use"),
+            !g.claim(node, rustc_span::DUMMY_SP, "use"),
             "the SECOND claim on one node must be refused — this is the \
              structural half of the barrier the site-overlap gate provides, \
              and it does not lapse in parity mode"
@@ -1248,8 +1269,8 @@ mod tests {
     #[test]
     fn distinct_nodes_do_not_conflict() {
         let mut g = Composition::default();
-        assert!(g.claim(NodeId::from_u32(1), "decl:ref"));
-        assert!(g.claim(NodeId::from_u32(2), "use"));
+        assert!(g.claim(NodeId::from_u32(1), rustc_span::DUMMY_SP, "decl:ref"));
+        assert!(g.claim(NodeId::from_u32(2), rustc_span::DUMMY_SP, "use"));
         assert!(g.refused.is_empty(), "distinct nodes must not be refused");
     }
 
@@ -1373,6 +1394,7 @@ fn transform_inner(
         usize,
         SeamUseSurface,
         rustc_ast::Crate,
+        Vec<rustc_span::Span>,
     ),
     String,
 > {
@@ -1423,6 +1445,7 @@ fn transform_with(
         usize,
         SeamUseSurface,
         rustc_ast::Crate,
+        Vec<rustc_span::Span>,
     ),
     String,
 > {
@@ -1596,6 +1619,7 @@ fn transform_with(
             partial: seam_use_partial,
         },
         krate,
+        guard.edited_spans().to_vec(),
     ))
 }
 
@@ -1653,8 +1677,9 @@ pub(crate) fn ast_emitted_files_from(
     String,
 > {
     let (table, _ctx) = super::decide_table_with_ctx(tcx)?;
-    let (_, _, seams, _, _, _, _, krate) = transform_with(capture, &table, reverts)?;
-    let (mut files, stats) = super::ast_bridge::splice_fn_prints_per_file(tcx, &krate);
+    let (_, _, seams, _, _, _, _, krate, edited) = transform_with(capture, &table, reverts)?;
+    let (mut files, stats) =
+        super::ast_bridge::splice_fn_prints_per_file(tcx, &krate, Some(&edited));
     if seams.len_fabricated > 0 {
         // Root selection: the caller's key when it has one (the loop's round-0
         // file), else the map's first — deterministic because the map is
@@ -1678,8 +1703,8 @@ pub(crate) fn ast_emitted_source_from(
     reverts: &RevertSet,
 ) -> Result<(String, super::ast_bridge::SubstStats), String> {
     let (table, _ctx) = super::decide_table_with_ctx(tcx)?;
-    let (_, _, seams, _, _, _, _, krate) = transform_with(capture, &table, reverts)?;
-    let (mut source, stats) = super::ast_bridge::splice_fn_prints(tcx, &krate);
+    let (_, _, seams, _, _, _, _, krate, edited) = transform_with(capture, &table, reverts)?;
+    let (mut source, stats) = super::ast_bridge::splice_fn_prints(tcx, &krate, Some(&edited));
     // **The fabricated-extent const** (marker ruling, 2026-08-15): emitted when
     // this layer PLACED at least one fabricated adapter.
     //
@@ -3875,6 +3900,7 @@ pub(crate) fn arms_full(
         // The transformed krate — `arms_full` measures, it does not emit.
         // `ast_emitted_source` is the caller that wants it.
         _krate,
+        _edited,
     ) = transform_inner(tcx, &RevertSet::default())?;
     let (table, _ctx) = super::decide_table_with_ctx(tcx)?;
     let emission = super::emit_files(tcx, &table, &rustc_hash::FxHashSet::default())?;
@@ -4451,7 +4477,7 @@ mod arm2_witnesses {
             );
             assert_eq!(stats.rewritten, 0, "and must not be transformed");
             assert!(
-                guard.claim(ty_id, "someone-else"),
+                guard.claim(ty_id, rustc_span::DUMMY_SP, "someone-else"),
                 "THE POINT: the node must still be UNCLAIMED. Claiming before \
                  the shape check meant a declaration this pass cannot transform \
                  still owned its node, so a later transform that legitimately \
@@ -5483,7 +5509,7 @@ mod arm2_witnesses {
 
             let mut guard = Composition::default();
             // The declaration pass got there first.
-            assert!(guard.claim(node, "decl:slice"));
+            assert!(guard.claim(node, rustc_span::DUMMY_SP, "decl:slice"));
 
             let mut v = UseGraftVisitor::new(&map, &mut guard);
             v.visit_crate(&mut krate);
@@ -6396,7 +6422,7 @@ mod arm2_witnesses {
             assert_eq!(stats.refused, 0, "and was not refused — nothing collided");
 
             assert!(
-                guard.claim(node_id, "arm4"),
+                guard.claim(node_id, rustc_span::DUMMY_SP, "arm4"),
                 "THE LOAD-BEARING ASSERTION: a node this pass could not \
                  transform must stay claimable. Claiming before building leaves \
                  a phantom owner that fail-closes a later arm's transform on a \

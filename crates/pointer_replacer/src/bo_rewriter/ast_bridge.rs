@@ -380,7 +380,7 @@ pub(crate) fn collect_fn_spans(
 pub(crate) fn substituted_source(tcx: TyCtxt<'_>) -> Result<(String, SubstStats), String> {
     let mapped = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let krate = ::utils::ast::expanded_ast(tcx);
-        splice_fn_prints(tcx, &krate)
+        splice_fn_prints(tcx, &krate, None)
     }));
     mapped.map_err(|_| "AST capture panicked".to_owned())
 }
@@ -416,6 +416,7 @@ pub(crate) fn substituted_source(tcx: TyCtxt<'_>) -> Result<(String, SubstStats)
 pub(crate) fn splice_fn_prints_per_file(
     tcx: TyCtxt<'_>,
     krate: &rustc_ast::Crate,
+    edited: Option<&[rustc_span::Span]>,
 ) -> (
     std::collections::BTreeMap<super::plan::FileKey, String>,
     SubstStats,
@@ -424,6 +425,30 @@ pub(crate) fn splice_fn_prints_per_file(
     collect_fn_spans(&krate.items, &mut spans);
     let mut printed: Vec<(rustc_span::Span, String)> = Vec::new();
     collect_fn_prints(&krate.items, &mut printed);
+    // **SPLICE ONLY WHAT CHANGED** (fix ruling, 2026-08-18). Reprinting an
+    // untouched function normalizes its spacing and DROPS its interior
+    // comments — a defect against byte preservation for untransformed code,
+    // measured at `reverting_every_function_reproduces_the_substrate`.
+    //
+    // The predicate is containment against the transform's OWN claim records.
+    // Deriving "changed" by comparing reprint text to the original was
+    // explicitly forbidden: it would call a function unchanged exactly when the
+    // reprint happens to be canonical, which is the vacuity that nearly hid
+    // this defect in the first place.
+    // `None` means REPRINT ALL, and it has exactly one caller: the parity
+    // instrument, whose whole purpose is canonicalizing every function before
+    // a token comparison. Emission always passes `Some`.
+    //
+    // ⚠ **SEED BEFORE FILTERING.** The file map must carry every source file
+    // that holds a function, whether or not that file has an edit — otherwise a
+    // crate with no changes emits an EMPTY root file instead of the original.
+    // That is not hypothetical: it broke `g09_pdrop_suppression`, whose input
+    // and expected are byte-identical (I-12) and whose correct emission is
+    // therefore the substrate unchanged.
+    let seed: Vec<rustc_span::Span> = printed.iter().map(|(sp, _)| *sp).collect();
+    if let Some(edited) = edited {
+        printed.retain(|(sp, _)| edited.iter().any(|e| sp.contains(*e)));
+    }
 
     let sm = tcx.sess.source_map();
     let mut s = SubstStats {
@@ -450,15 +475,24 @@ pub(crate) fn splice_fn_prints_per_file(
         super::plan::FileKey,
         (String, rustc_span::BytePos, Vec<(usize, usize, String)>),
     > = std::collections::BTreeMap::new();
+    for sp in &seed {
+        let file = sm.lookup_source_file(sp.lo());
+        if let (Some(src), Some(key)) = (file.src.as_ref(), super::file_key(&file.name)) {
+            per_file
+                .entry(key)
+                .or_insert_with(|| (src.to_string(), file.start_pos, Vec::new()));
+        }
+    }
     for (sp, text) in &printed {
         let file = sm.lookup_source_file(sp.lo());
-        let (Some(src), Some(key)) = (file.src.as_ref(), super::file_key(&file.name)) else {
+        let (Some(_src), Some(key)) = (file.src.as_ref(), super::file_key(&file.name)) else {
             s.unrenderable += 1;
             continue;
         };
-        let slot = per_file
-            .entry(key)
-            .or_insert_with(|| (src.to_string(), file.start_pos, Vec::new()));
+        let Some(slot) = per_file.get_mut(&key) else {
+            s.unrenderable += 1;
+            continue;
+        };
         match sm.span_to_snippet(*sp) {
             Ok(orig) => {
                 if orig.trim_start().starts_with('#') {
@@ -493,14 +527,18 @@ pub(crate) fn splice_fn_prints_per_file(
 /// the goldens, and the parity gates. Selects by `spans.first()`'s file — the
 /// same rule the pre-A1 shape used — so single-file callers are byte-identical
 /// to before.
-pub(crate) fn splice_fn_prints(tcx: TyCtxt<'_>, krate: &rustc_ast::Crate) -> (String, SubstStats) {
+pub(crate) fn splice_fn_prints(
+    tcx: TyCtxt<'_>,
+    krate: &rustc_ast::Crate,
+    edited: Option<&[rustc_span::Span]>,
+) -> (String, SubstStats) {
     let mut spans = Vec::new();
     collect_fn_spans(&krate.items, &mut spans);
     let root = spans
         .first()
         .map(|sp| tcx.sess.source_map().lookup_source_file(sp.lo()))
         .and_then(|f| super::file_key(&f.name));
-    let (files, s) = splice_fn_prints_per_file(tcx, krate);
+    let (files, s) = splice_fn_prints_per_file(tcx, krate, edited);
     let text = root
         .and_then(|key| files.get(&key).cloned())
         .unwrap_or_default();

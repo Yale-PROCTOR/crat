@@ -4669,23 +4669,19 @@ fn reverting_every_function_reproduces_the_substrate() {
     let all = "one::p#1\ntwo::q#1";
     let out = super::ast_emitted_source_of_reverting(SRC, all).expect("emits");
 
-    // **STATUS-QUO PIN OF A CONFIRMED DEFECT.** The correct assertion is
-    // `out == SRC`; it FAILS today. `collect_fn_prints` reprints every function
-    // unconditionally, so a fully reverted function returns as a `pprust`
-    // reprint: spacing normalized, a multi-line body collapsed, and the
-    // interior comment DROPPED. Pinned rather than left red so the defect is
-    // measured, not merely asserted — and so the fix breaks this test loudly.
-    assert_ne!(
+    // **FIXED (2026-08-18).** This was a status-quo pin of a confirmed defect:
+    // `collect_fn_prints` reprinted every function unconditionally, so a fully
+    // reverted function came back as a `pprust` reprint with its spacing
+    // normalized and its interior comment dropped. The splicer now reprints
+    // only functions the transform actually CLAIMED, so an untouched function
+    // keeps its original bytes.
+    //
+    // ⚠ The fixture is DELIBERATELY non-canonical — see above. Written in
+    // `pprust` style it would pass either way, which is how the defect stayed
+    // invisible to 21 goldens.
+    assert_eq!(
         out, SRC,
-        "if this now passes, the reprint defect is FIXED — \
-                          replace this pin with `assert_eq!(out, SRC)`"
-    );
-    assert!(
-        !out.contains("a comment a reprint would drop"),
-        "the dropped interior comment is the defect's sharpest symptom"
-    );
-    assert!(
-        out.contains("one(p: *mut i32)"),
-        "and the normalized spacing is the second: `p:   *mut` came back as `p: *mut`"
+        "reverting every function must reproduce the substrate byte for byte.\n\
+         --- emitted ---\n{out}\n--- substrate ---\n{SRC}"
     );
 }
