@@ -103,10 +103,10 @@ struct Identity {
 struct TypedExclusion {
     identity: Identity,
     status: String,
-    memory_max_bytes: u64,
-    wall_s: f64,
-    peak_rss_kb: u64,
-    cgroup_peak_memory_kb: u64,
+    memory_max_bytes: Option<u64>,
+    wall_s: Option<f64>,
+    peak_rss_kb: Option<u64>,
+    cgroup_peak_memory_kb: Option<u64>,
     phase: String,
     data: bool,
     manifest: String,
@@ -4855,6 +4855,17 @@ const RATIFIED_TYPED_EXCLUSION_INDEX: usize = 19;
 const RATIFIED_TYPED_EXCLUSION_HEAD: &str = "6b6ae475c169ef581e209b9fa0f738697d4b3096";
 const RATIFIED_TYPED_EXCLUSION_MANIFEST: &str =
     "e3bb4d0d10cadd191b420d5b566c44478de80327804ed876cf193a2733dfd9dd";
+const GAP_ATTRIBUTION_SOURCE_ROOT: &str = "/home/p51lee/dev/agent-worktrees/crat-a4-gap-attribution-run-20260818-w8mFXs1u/gap-attribution";
+const GAP_ATTRIBUTION_AGGREGATE_MANIFEST: &str =
+    "8688d0c4416d7ab88d7fdab1b47d9b9de06aacf7101208f5fe49af0134dd1f59";
+const BZIP2_GAP_ATTRIBUTION_MANIFEST: &str =
+    "c081c1fdc8066503f9eb0a22db34921728da08f1eb415b855214b2f15f798a81";
+const TAXONOMY_TYPED_EXCLUSION_PROGRAM: &str = "bzip2";
+const TAXONOMY_TYPED_EXCLUSION_FIELD_KEY: &str = "bzlib::bzFile::field0@d0";
+const TAXONOMY_TYPED_EXCLUSION_INDEX: usize = 22;
+const TAXONOMY_TYPED_EXCLUSION_STATUS: &str = "taxonomy-set-valued-multi-static-provenance";
+const TAXONOMY_TYPED_EXCLUSION_PHASE: &str = "graph-construction-domain-gap";
+const NO_CANDIDATE_PROCESS_METRIC: &str = "not-applicable-no-candidate-process";
 const COMPLETED_LIL_HEAD: &str = "2118cc9dd4797a561412a806e171160c1a08f0c0";
 const COMPLETED_LIL_MANIFEST: &str =
     "b7fccec973fcf08062c44bd2302a5f0e315034094e86cc984b9f5be6cdcbfbfe";
@@ -5946,7 +5957,20 @@ fn render_full_identity(
                     row.program, row.field_key
                 ));
             }
-            "typed-excluded-resource-exhausted"
+            if row.program == RATIFIED_TYPED_EXCLUSION_PROGRAM
+                && row.field_key == RATIFIED_TYPED_EXCLUSION_FIELD_KEY
+            {
+                "typed-excluded-resource-exhausted"
+            } else if row.program == TAXONOMY_TYPED_EXCLUSION_PROGRAM
+                && row.field_key == TAXONOMY_TYPED_EXCLUSION_FIELD_KEY
+            {
+                "typed-excluded-taxonomy-set-valued-multi-static-provenance"
+            } else {
+                return Err(format!(
+                    "unregistered typed exclusion: {} {}",
+                    row.program, row.field_key
+                ));
+            }
         } else if row.proof_reason == "allocation-source-count-0" {
             "measured"
         } else {
@@ -5969,11 +5993,17 @@ fn render_full_identity(
             input.len()
         ));
     }
-    let ratified = Identity {
-        program: RATIFIED_TYPED_EXCLUSION_PROGRAM.to_owned(),
-        field_key: RATIFIED_TYPED_EXCLUSION_FIELD_KEY.to_owned(),
-    };
-    if typed_excluded != &BTreeSet::from([ratified]) {
+    let ratified = BTreeSet::from([
+        Identity {
+            program: RATIFIED_TYPED_EXCLUSION_PROGRAM.to_owned(),
+            field_key: RATIFIED_TYPED_EXCLUSION_FIELD_KEY.to_owned(),
+        },
+        Identity {
+            program: TAXONOMY_TYPED_EXCLUSION_PROGRAM.to_owned(),
+            field_key: TAXONOMY_TYPED_EXCLUSION_FIELD_KEY.to_owned(),
+        },
+    ]);
+    if typed_excluded != &ratified {
         return Err(format!(
             "full identity typed-exclusion drift: {typed_excluded:?}"
         ));
@@ -7249,10 +7279,10 @@ fn validate_typed_exclusion_parts(
     Ok(TypedExclusion {
         identity: expected.identity.clone(),
         status: "resource-exhausted".to_owned(),
-        memory_max_bytes: CANDIDATE_MEMORY_MAX_BYTES,
-        wall_s: 201.846,
-        peak_rss_kb: 104_581_640,
-        cgroup_peak_memory_kb: 104_857_600,
+        memory_max_bytes: Some(CANDIDATE_MEMORY_MAX_BYTES),
+        wall_s: Some(201.846),
+        peak_rss_kb: Some(104_581_640),
+        cgroup_peak_memory_kb: Some(104_857_600),
         phase: "source-traversal".to_owned(),
         data: false,
         manifest: manifest.to_owned(),
@@ -7294,18 +7324,115 @@ fn validate_typed_exclusion_artifact(
     validate_typed_exclusion_parts(index, expected, &manifest, &receipt, &resource_rows)
 }
 
+fn is_taxonomy_typed_exclusion(index: usize, expected: &IsolatedIdentity) -> bool {
+    index == TAXONOMY_TYPED_EXCLUSION_INDEX
+        && expected.population == "census"
+        && expected.identity.program == TAXONOMY_TYPED_EXCLUSION_PROGRAM
+        && expected.identity.field_key == TAXONOMY_TYPED_EXCLUSION_FIELD_KEY
+}
+
+fn validate_taxonomy_typed_exclusion_parts(
+    index: usize,
+    expected: &IsolatedIdentity,
+    aggregate_manifest: &str,
+    program_manifest: &str,
+    mapping_sha: &str,
+    mapping: &[Vec<String>],
+) -> Result<TypedExclusion, String> {
+    if !is_taxonomy_typed_exclusion(index, expected) {
+        return Err(format!(
+            "identity is not the ratified taxonomy exclusion: index={index} identity={:?}",
+            expected.identity
+        ));
+    }
+    if aggregate_manifest != GAP_ATTRIBUTION_AGGREGATE_MANIFEST {
+        return Err(format!(
+            "taxonomy-exclusion aggregate manifest drift: expected={GAP_ATTRIBUTION_AGGREGATE_MANIFEST} actual={aggregate_manifest}"
+        ));
+    }
+    if program_manifest != BZIP2_GAP_ATTRIBUTION_MANIFEST {
+        return Err(format!(
+            "taxonomy-exclusion program manifest drift: expected={BZIP2_GAP_ATTRIBUTION_MANIFEST} actual={program_manifest}"
+        ));
+    }
+    if mapping_sha != BZIP2_GAP_MAPPING_SHA256 {
+        return Err(format!(
+            "taxonomy-exclusion mapping digest drift: expected={BZIP2_GAP_MAPPING_SHA256} actual={mapping_sha}"
+        ));
+    }
+    if mapping.len() != 1
+        || mapping[0].len() != 6
+        || mapping[0][0] != TAXONOMY_TYPED_EXCLUSION_PROGRAM
+        || mapping[0][5] != TAXONOMY_TYPED_EXCLUSION_FIELD_KEY
+    {
+        return Err(format!(
+            "taxonomy-exclusion mapping identity drift: {mapping:?}"
+        ));
+    }
+    Ok(TypedExclusion {
+        identity: expected.identity.clone(),
+        status: TAXONOMY_TYPED_EXCLUSION_STATUS.to_owned(),
+        memory_max_bytes: None,
+        wall_s: None,
+        peak_rss_kb: None,
+        cgroup_peak_memory_kb: None,
+        phase: TAXONOMY_TYPED_EXCLUSION_PHASE.to_owned(),
+        data: false,
+        manifest: program_manifest.to_owned(),
+    })
+}
+
+fn validate_taxonomy_typed_exclusion_artifact(
+    index: usize,
+    expected: &IsolatedIdentity,
+) -> Result<TypedExclusion, String> {
+    let root = Path::new(GAP_ATTRIBUTION_SOURCE_ROOT);
+    let aggregate_manifest = verify_manifest(root)?;
+    let program_dir = root.join(TAXONOMY_TYPED_EXCLUSION_PROGRAM);
+    let program_manifest = verify_manifest(&program_dir)?;
+    let mapping_path = program_dir.join("mapping.tsv");
+    let mapping_sha = sha256(&mapping_path);
+    let mapping = parse_table(&mapping_path, GAP_ATTRIBUTION_HEADER, 6)?;
+    let aggregate_mapping = parse_table(&root.join("mapping.tsv"), GAP_ATTRIBUTION_HEADER, 6)?;
+    if mapping != aggregate_mapping {
+        return Err("taxonomy-exclusion program/aggregate mapping drift".to_owned());
+    }
+    validate_taxonomy_typed_exclusion_parts(
+        index,
+        expected,
+        &aggregate_manifest,
+        &program_manifest,
+        &mapping_sha,
+        &mapping,
+    )
+}
+
 fn render_typed_exclusions(exclusions: &[TypedExclusion]) -> String {
+    fn render_u64(value: Option<u64>) -> String {
+        value.map_or_else(
+            || NO_CANDIDATE_PROCESS_METRIC.to_owned(),
+            |value| value.to_string(),
+        )
+    }
+
+    fn render_wall(value: Option<f64>) -> String {
+        value.map_or_else(
+            || NO_CANDIDATE_PROCESS_METRIC.to_owned(),
+            |value| format!("{value:.3}"),
+        )
+    }
+
     let mut rendered = format!("{TYPED_EXCLUSION_HEADER}\n");
     for exclusion in exclusions {
         rendered.push_str(&format!(
-            "{}\t{}\t{}\t{}\t{:.3}\t{}\t{}\t{}\t{}\t{}\n",
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
             exclusion.identity.program,
             exclusion.identity.field_key,
             exclusion.status,
-            exclusion.memory_max_bytes,
-            exclusion.wall_s,
-            exclusion.peak_rss_kb,
-            exclusion.cgroup_peak_memory_kb,
+            render_u64(exclusion.memory_max_bytes),
+            render_wall(exclusion.wall_s),
+            render_u64(exclusion.peak_rss_kb),
+            render_u64(exclusion.cgroup_peak_memory_kb),
             exclusion.phase,
             exclusion.data,
             exclusion.manifest,
@@ -7321,39 +7448,63 @@ fn parse_typed_exclusions(path: &Path) -> Result<Vec<TypedExclusion>, String> {
     let rows = parse_table(path, TYPED_EXCLUSION_HEADER, 10)?;
     rows.into_iter()
         .map(|row| {
-            let expected = [
-                RATIFIED_TYPED_EXCLUSION_PROGRAM,
-                RATIFIED_TYPED_EXCLUSION_FIELD_KEY,
-                "resource-exhausted",
-                "107374182400",
-                "201.846",
-                "104581640",
-                "104857600",
-                "source-traversal",
-                "false",
-                RATIFIED_TYPED_EXCLUSION_MANIFEST,
-            ];
-            if row.iter().map(String::as_str).ne(expected) {
-                return Err(format!("typed-exclusion aggregate row drift: {row:?}"));
-            }
+            let (memory_max_bytes, wall_s, peak_rss_kb, cgroup_peak_memory_kb) = if row[0]
+                == RATIFIED_TYPED_EXCLUSION_PROGRAM
+                && row[1] == RATIFIED_TYPED_EXCLUSION_FIELD_KEY
+            {
+                let expected = [
+                    RATIFIED_TYPED_EXCLUSION_PROGRAM,
+                    RATIFIED_TYPED_EXCLUSION_FIELD_KEY,
+                    "resource-exhausted",
+                    "107374182400",
+                    "201.846",
+                    "104581640",
+                    "104857600",
+                    "source-traversal",
+                    "false",
+                    RATIFIED_TYPED_EXCLUSION_MANIFEST,
+                ];
+                if row.iter().map(String::as_str).ne(expected) {
+                    return Err(format!("typed-exclusion aggregate row drift: {row:?}"));
+                }
+                (
+                    Some(CANDIDATE_MEMORY_MAX_BYTES),
+                    Some(201.846),
+                    Some(104_581_640),
+                    Some(104_857_600),
+                )
+            } else if row[0] == TAXONOMY_TYPED_EXCLUSION_PROGRAM
+                && row[1] == TAXONOMY_TYPED_EXCLUSION_FIELD_KEY
+            {
+                let expected = [
+                    TAXONOMY_TYPED_EXCLUSION_PROGRAM,
+                    TAXONOMY_TYPED_EXCLUSION_FIELD_KEY,
+                    TAXONOMY_TYPED_EXCLUSION_STATUS,
+                    NO_CANDIDATE_PROCESS_METRIC,
+                    NO_CANDIDATE_PROCESS_METRIC,
+                    NO_CANDIDATE_PROCESS_METRIC,
+                    NO_CANDIDATE_PROCESS_METRIC,
+                    TAXONOMY_TYPED_EXCLUSION_PHASE,
+                    "false",
+                    BZIP2_GAP_ATTRIBUTION_MANIFEST,
+                ];
+                if row.iter().map(String::as_str).ne(expected) {
+                    return Err(format!("typed-exclusion aggregate row drift: {row:?}"));
+                }
+                (None, None, None, None)
+            } else {
+                return Err(format!("unknown typed-exclusion identity: {row:?}"));
+            };
             Ok(TypedExclusion {
                 identity: Identity {
                     program: row[0].clone(),
                     field_key: row[1].clone(),
                 },
                 status: row[2].clone(),
-                memory_max_bytes: row[3]
-                    .parse()
-                    .map_err(|error| format!("typed-exclusion memory max: {error}"))?,
-                wall_s: row[4]
-                    .parse()
-                    .map_err(|error| format!("typed-exclusion wall: {error}"))?,
-                peak_rss_kb: row[5]
-                    .parse()
-                    .map_err(|error| format!("typed-exclusion RSS: {error}"))?,
-                cgroup_peak_memory_kb: row[6]
-                    .parse()
-                    .map_err(|error| format!("typed-exclusion cgroup peak: {error}"))?,
+                memory_max_bytes,
+                wall_s,
+                peak_rss_kb,
+                cgroup_peak_memory_kb,
                 phase: row[7].clone(),
                 data: row[8]
                     .parse()
@@ -7409,13 +7560,16 @@ fn render_census_denominator(
 }
 
 fn expected_typed_exclusion_identities(program: &str) -> Vec<Identity> {
-    if program == RATIFIED_TYPED_EXCLUSION_PROGRAM {
-        vec![Identity {
+    match program {
+        RATIFIED_TYPED_EXCLUSION_PROGRAM => vec![Identity {
             program: RATIFIED_TYPED_EXCLUSION_PROGRAM.to_owned(),
             field_key: RATIFIED_TYPED_EXCLUSION_FIELD_KEY.to_owned(),
-        }]
-    } else {
-        Vec::new()
+        }],
+        TAXONOMY_TYPED_EXCLUSION_PROGRAM => vec![Identity {
+            program: TAXONOMY_TYPED_EXCLUSION_PROGRAM.to_owned(),
+            field_key: TAXONOMY_TYPED_EXCLUSION_FIELD_KEY.to_owned(),
+        }],
+        _ => Vec::new(),
     }
 }
 
@@ -7696,6 +7850,30 @@ fn run_shard(contract: &MeasurementContract, program: super::CorpusProgram) {
     let mut typed_exclusions = Vec::<TypedExclusion>::new();
     for (index, identity) in identities.iter().cloned().enumerate() {
         let unit_dir = units_dir.join(format!("{index:03}"));
+        if is_taxonomy_typed_exclusion(index, &identity) {
+            if unit_dir.exists() {
+                panic!(
+                    "A4C STOP phase=typed-exclusion-validation candidate={} status=taxonomy-exclusion-unit-collision",
+                    identity.identity.field_key
+                );
+            }
+            let exclusion = validate_taxonomy_typed_exclusion_artifact(index, &identity)
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "A4C STOP phase=typed-exclusion-validation candidate={}: {error}",
+                        identity.identity.field_key
+                    )
+                });
+            eprintln!(
+                "A4C typed-exclusion program={} candidate={} status={} manifest={}",
+                exclusion.identity.program,
+                exclusion.identity.field_key,
+                exclusion.status,
+                exclusion.manifest,
+            );
+            typed_exclusions.push(exclusion);
+            continue;
+        }
         if unit_dir.is_dir() {
             if is_ratified_typed_exclusion(index, &identity) {
                 let exclusion = validate_typed_exclusion_artifact(index, &identity, &unit_dir)
@@ -8068,7 +8246,7 @@ fn run_shard(contract: &MeasurementContract, program: super::CorpusProgram) {
         completed.iter().map(|unit| unit.3).sum::<f64>()
             + typed_exclusions
                 .iter()
-                .map(|exclusion| exclusion.wall_s)
+                .filter_map(|exclusion| exclusion.wall_s)
                 .sum::<f64>()
     };
     let memory_peaks = if zero_work {
@@ -8081,7 +8259,7 @@ fn run_shard(contract: &MeasurementContract, program: super::CorpusProgram) {
                 .chain(
                     typed_exclusions
                         .iter()
-                        .map(|exclusion| exclusion.peak_rss_kb),
+                        .filter_map(|exclusion| exclusion.peak_rss_kb),
                 )
                 .max()
                 .expect("nonzero shard has a process peak"),
@@ -8091,7 +8269,7 @@ fn run_shard(contract: &MeasurementContract, program: super::CorpusProgram) {
                 .chain(
                     typed_exclusions
                         .iter()
-                        .map(|exclusion| exclusion.cgroup_peak_memory_kb),
+                        .filter_map(|exclusion| exclusion.cgroup_peak_memory_kb),
                 )
                 .max()
                 .expect("nonzero shard has a cgroup peak"),
@@ -8294,11 +8472,11 @@ fn aggregate(contract: &MeasurementContract) {
         .expect("parse aggregate candidate readings");
     let full_identity = parse_table(&identity_path, FULL_IDENTITY_HEADER, 7)
         .expect("parse aggregate full identity");
-    assert_eq!(candidates.len(), 236);
-    assert_eq!(candidate_readings.len(), 236);
+    assert_eq!(candidates.len(), 235);
+    assert_eq!(candidate_readings.len(), 235);
     assert_eq!(full_identity.len(), 261);
     assert_eq!(exceptions.len(), 4);
-    assert_eq!(typed_exclusions.len(), 1);
+    assert_eq!(typed_exclusions.len(), 2);
     let identity_status_counts =
         full_identity
             .iter()
@@ -8309,23 +8487,40 @@ fn aggregate(contract: &MeasurementContract) {
     assert_eq!(
         identity_status_counts,
         BTreeMap::from([
-            ("measured".to_owned(), 236usize),
+            ("measured".to_owned(), 235usize),
             ("not-in-source-census".to_owned(), 24usize),
             ("typed-excluded-resource-exhausted".to_owned(), 1usize),
+            (
+                "typed-excluded-taxonomy-set-valued-multi-static-provenance".to_owned(),
+                1usize,
+            ),
         ])
     );
-    let excluded_identity_rows = full_identity
+    let resource_excluded_identity_rows = full_identity
         .iter()
         .filter(|row| row[6] == "typed-excluded-resource-exhausted")
         .collect::<Vec<_>>();
-    assert_eq!(excluded_identity_rows.len(), 1);
+    assert_eq!(resource_excluded_identity_rows.len(), 1);
     assert_eq!(
-        excluded_identity_rows[0][0],
+        resource_excluded_identity_rows[0][0],
         RATIFIED_TYPED_EXCLUSION_PROGRAM
     );
     assert_eq!(
-        excluded_identity_rows[0][1],
+        resource_excluded_identity_rows[0][1],
         RATIFIED_TYPED_EXCLUSION_FIELD_KEY
+    );
+    let taxonomy_excluded_identity_rows = full_identity
+        .iter()
+        .filter(|row| row[6] == "typed-excluded-taxonomy-set-valued-multi-static-provenance")
+        .collect::<Vec<_>>();
+    assert_eq!(taxonomy_excluded_identity_rows.len(), 1);
+    assert_eq!(
+        taxonomy_excluded_identity_rows[0][0],
+        TAXONOMY_TYPED_EXCLUSION_PROGRAM
+    );
+    assert_eq!(
+        taxonomy_excluded_identity_rows[0][1],
+        TAXONOMY_TYPED_EXCLUSION_FIELD_KEY
     );
     let candidate_ids = candidates
         .iter()
@@ -8343,17 +8538,19 @@ fn aggregate(contract: &MeasurementContract) {
         .iter()
         .map(|exclusion| exclusion.identity.clone())
         .collect::<Vec<_>>();
-    validate_exact_identities(
-        &expected_typed_exclusion_identities(RATIFIED_TYPED_EXCLUSION_PROGRAM),
-        &typed_exclusion_ids,
-    )
-    .expect("aggregate exact typed-exclusion identity");
+    let expected_typed_exclusions = contract
+        .programs
+        .iter()
+        .flat_map(|program| expected_typed_exclusion_identities(program.name))
+        .collect::<Vec<_>>();
+    validate_exact_identities(&expected_typed_exclusions, &typed_exclusion_ids)
+        .expect("aggregate exact typed-exclusion identity");
     validate_measured_excluded_identities(
         &expected_candidates,
         &candidate_ids,
         &typed_exclusion_ids,
     )
-    .expect("aggregate measured 236 plus one typed exclusion identity");
+    .expect("aggregate measured 235 plus two typed-exclusion identities");
     let exception_ids = exceptions
         .iter()
         .map(|row| Identity {
@@ -8394,8 +8591,8 @@ fn aggregate(contract: &MeasurementContract) {
             *provenance_tag_counts.entry(tag).or_default() += 1;
         }
     }
-    assert_eq!(closed_class_counts.values().sum::<usize>(), 236);
-    assert_eq!(open_class_counts.values().sum::<usize>(), 236);
+    assert_eq!(closed_class_counts.values().sum::<usize>(), 235);
+    assert_eq!(open_class_counts.values().sum::<usize>(), 235);
     for flag in flag_counts.keys() {
         assert!(flag_witness.contains_key(flag));
     }
@@ -8533,11 +8730,22 @@ fn aggregate(contract: &MeasurementContract) {
         typed_exclusions.len(),
     )
     .expect("aggregate census denominator");
+    let measured_count = candidates.len();
+    let typed_exclusion_manifests = typed_exclusions
+        .iter()
+        .map(|exclusion| {
+            format!(
+                "{}:{}:{}",
+                exclusion.identity.program, exclusion.identity.field_key, exclusion.manifest
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
     let report = format!(
-        "# A4 force-SAT exceptions and no-allocation-source census\n\nMachine `{MACHINE_ID}`, platform `{PLATFORM}`. Pre-isolation predecessor shards were uncapped; current-head candidates ran sequentially in fresh processes under a 100 GiB cgroup host-protection cap and a {LIVENESS_BOUND_S}-second liveness bound. Wall/RSS values are machine-local and never compared across machines.\n\nExact input identity: **261/261** A4/P2 candidates plus **4/4** separately re-checked force-SAT exception rows (**261+4**). No-allocation-source characterization: **{census_denominator}**. Unknown/unexplained among the 236 measured candidates: **0**. The typed exclusion is neither a semantic class nor an Unknown.\n\n## Typed exclusion\n\n`lil::src::_lil_var_t::field2@d0` is `resource-exhausted` at the exact 100 GiB cap during `source-traversal`, evidenced by unit manifest `{RATIFIED_TYPED_EXCLUSION_MANIFEST}`. It has no fabricated candidate or root row.\n\n## Closed-world partition (measured 236 only)\n\nThe closed-world reading excludes only `public-setter-reachable` external-remainder rows.\n\n{closed_class_summary}\n\n## Open partition (measured 236 only)\n\nThe open reading includes every manifested path row and treats the public-setter remainder as opaque/absent.\n\n{open_class_summary}\n\nClosed/open class divergences: **{stance_divergences}**.\n\n## Overlapping cause flags (measured 236, open reading)\n\n{flag_summary}\n\n## Indirect-target provenance tags (measured 236)\n\n{provenance_tag_summary}\n\nTags remain outside the invisible/absent predicates. `public-setter-reachable` controls only which manifested row enters the closed versus open reading.\n\n## Force-SAT exceptions\n\n{exception_summary}\n\nSequential shard wall sum, including the typed exclusion's bounded attempt: **{total_wall:.3}s**. Maximum process peak RSS: **{peak_rss} KiB**. Maximum current-head candidate cgroup peak charged memory: **{cgroup_peak_memory} KiB**. Semantic aggregates consume only SHA-manifested, completed `data=true` rows; atomic partials remain excluded. The one exact `data=false` typed-exclusion row is carried only for identity/provenance accounting. Production analysis and rewriter behavior remained untouched.\n"
+        "# A4 force-SAT exceptions and no-allocation-source census\n\nMachine `{MACHINE_ID}`, platform `{PLATFORM}`. Legacy predecessor shards were uncapped; post-isolation candidates ran sequentially in fresh processes under a 100 GiB cgroup host-protection cap and a {LIVENESS_BOUND_S}-second liveness bound. Wall/RSS values are machine-local and never compared across machines.\n\nExact input identity: **261/261** A4/P2 candidates plus **4/4** separately re-checked force-SAT exception rows (**261+4**). No-allocation-source characterization: **{census_denominator}**. Unknown/unexplained among the {measured_count} measured candidates: **0**. Neither typed exclusion is a semantic class or an Unknown.\n\n## Typed exclusions\n\n- `lil::src::_lil_var_t::field2@d0` is `resource-exhausted` at the exact 100 GiB cap during `source-traversal`, evidenced by unit manifest `{RATIFIED_TYPED_EXCLUSION_MANIFEST}`.\n- `bzip2::bzlib::bzFile::field0@d0` is `taxonomy-set-valued-multi-static-provenance`, evidenced by attribution manifest `{BZIP2_GAP_ATTRIBUTION_MANIFEST}`. No candidate process was launched for this exclusion, so its wall and memory metrics are not applicable.\n\nNeither exclusion fabricates a candidate or root row.\n\n## Closed-world partition (measured {measured_count} only)\n\nThe closed-world reading excludes only `public-setter-reachable` external-remainder rows.\n\n{closed_class_summary}\n\n## Open partition (measured {measured_count} only)\n\nThe open reading includes every manifested path row and treats the public-setter remainder as opaque/absent.\n\n{open_class_summary}\n\nClosed/open class divergences: **{stance_divergences}**.\n\n## Overlapping cause flags (measured {measured_count}, open reading)\n\n{flag_summary}\n\n## Indirect-target provenance tags (measured {measured_count})\n\n{provenance_tag_summary}\n\nTags remain outside the invisible/absent predicates. `public-setter-reachable` controls only which manifested row enters the closed versus open reading.\n\n## Force-SAT exceptions\n\n{exception_summary}\n\nSequential shard wall sum, including the lil exclusion's bounded attempt and no fabricated time for the taxonomy exclusion: **{total_wall:.3}s**. Maximum process peak RSS: **{peak_rss} KiB**. Maximum post-isolation candidate cgroup peak charged memory: **{cgroup_peak_memory} KiB**. Semantic aggregates consume only SHA-manifested, completed `data=true` rows; atomic partials remain excluded. The two exact `data=false` typed-exclusion rows are carried only for identity/provenance accounting. Production analysis and rewriter behavior remained untouched.\n"
     );
     let provenance = format!(
-        "machine_id={MACHINE_ID}\nplatform={PLATFORM}\nanalysis_head={}\nanalysis_branch=codex/a4-source-census\nbaseline_branch=analysis-lane\nbaseline_head=67bcd3cb67c1ae6f74463050033370b108854411\na4_input_root={}\na4_aggregate_manifest_sha256={A4_AGGREGATE_MANIFEST_SHA256}\na4_combined_sha256={A4_COMBINED_SHA256}\ncensus_identity_sha256={CENSUS_IDENTITY_SHA256}\nexception_identity_sha256={EXCEPTION_IDENTITY_SHA256}\nraw_corpus_digest={RAW_CORPUS_DIGEST}\nderived_substrate_digest={DERIVED_SUBSTRATE_DIGEST}\nsnapshot={SNAPSHOT_PATH}\nmemory_policy=predecessor-shards-uncapped,current-head-candidates-cgroup-100GiB,no-cap-raise\nwall_bound_kind=liveness\nwall_cap_s={LIVENESS_BOUND_S}\nprograms={}\nfull_identity_rows=261\ncensus_expected=237\ncensus_measured=236\ncensus_typed_excluded=1\ntyped_exclusion_manifest={RATIFIED_TYPED_EXCLUSION_MANIFEST}\nexception_rechecks=4\nidentity_accounting=260-measured+1-typed-excluded+4-rechecks\nunknown=0\nunexplained=0\nclosed_open_divergences={stance_divergences}\nroots={}\nwall_sum_s={total_wall:.3}\npeak_rss_kb={peak_rss}\ncgroup_peak_memory_kb={cgroup_peak_memory}\ncgroup_peak_scope=current-head-candidate-isolated-shards-including-typed-exclusion\nshard_analysis_heads={shard_analysis_heads}\nshard_manifests={}\naggregation_input_policy=semantic-data-true-only;one-exact-data-false-typed-exclusion-for-identity-provenance\ntiming_comparison=forbidden-across-machines\n",
+        "machine_id={MACHINE_ID}\nplatform={PLATFORM}\nanalysis_head={}\nanalysis_branch=codex/a4-source-census\nbaseline_branch=analysis-lane\nbaseline_head=67bcd3cb67c1ae6f74463050033370b108854411\na4_input_root={}\na4_aggregate_manifest_sha256={A4_AGGREGATE_MANIFEST_SHA256}\na4_combined_sha256={A4_COMBINED_SHA256}\ncensus_identity_sha256={CENSUS_IDENTITY_SHA256}\nexception_identity_sha256={EXCEPTION_IDENTITY_SHA256}\nraw_corpus_digest={RAW_CORPUS_DIGEST}\nderived_substrate_digest={DERIVED_SUBSTRATE_DIGEST}\nsnapshot={SNAPSHOT_PATH}\nmemory_policy=legacy-predecessors-uncapped;post-isolation-candidates-cgroup-100GiB;no-cap-raise\nwall_bound_kind=liveness\nwall_cap_s={LIVENESS_BOUND_S}\nprograms={}\nfull_identity_rows=261\ncensus_expected=237\ncensus_measured=235\ncensus_typed_excluded=2\ntyped_exclusion_manifests={typed_exclusion_manifests}\nexception_rechecks=4\nidentity_accounting=259-measured+2-typed-excluded+4-rechecks\nunknown=0\nunexplained=0\nclosed_open_divergences={stance_divergences}\nroots={}\nwall_sum_s={total_wall:.3}\npeak_rss_kb={peak_rss}\ncgroup_peak_memory_kb={cgroup_peak_memory}\ncgroup_peak_scope=post-isolation-candidate-processes-including-resource-exhausted-exclusion;taxonomy-exclusion-not-applicable\nshard_analysis_heads={shard_analysis_heads}\nshard_manifests={}\naggregation_input_policy=semantic-data-true-only;two-exact-data-false-typed-exclusions-for-identity-provenance\ntiming_comparison=forbidden-across-machines\n",
         contract.head,
         contract.input_root.display(),
         contract.programs.len(),
@@ -8567,7 +8775,7 @@ fn aggregate(contract: &MeasurementContract) {
     )
     .expect("manifest aggregate");
     eprintln!(
-        "A4C aggregate complete manifest={manifest} identity=261+4 measured_candidates=236 typed_exclusions=1 exceptions=4 roots={} closed_classes={closed_class_counts:?} open_classes={open_class_counts:?} divergences={stance_divergences} flags={flag_counts:?}",
+        "A4C aggregate complete manifest={manifest} identity=261+4 measured_candidates=235 typed_exclusions=2 exceptions=4 roots={} closed_classes={closed_class_counts:?} open_classes={open_class_counts:?} divergences={stance_divergences} flags={flag_counts:?}",
         roots.row_count
     );
 }
@@ -10009,7 +10217,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(exclusion.identity, expected.identity);
-        assert_eq!(exclusion.wall_s, 201.846);
+        assert_eq!(exclusion.wall_s, Some(201.846));
 
         assert!(validate_typed_exclusion_parts(19, &expected, "wrong", &receipt, &rows).is_err());
         let mut wrong_status = receipt.clone();
@@ -10033,6 +10241,78 @@ mod tests {
                 RATIFIED_TYPED_EXCLUSION_MANIFEST,
                 &receipt,
                 &rows,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn taxonomy_typed_exclusion_is_exact_and_has_no_candidate_metrics() {
+        let expected = IsolatedIdentity {
+            identity: Identity {
+                program: TAXONOMY_TYPED_EXCLUSION_PROGRAM.to_owned(),
+                field_key: TAXONOMY_TYPED_EXCLUSION_FIELD_KEY.to_owned(),
+            },
+            population: "census",
+        };
+        let mapping = vec![vec![
+            "bzip2".to_owned(),
+            "multi-static-identity-merge".to_owned(),
+            "bzlib::bzopen_or_bzdopen".to_owned(),
+            "bb32[3] _79".to_owned(),
+            "local=_79 previous=bzlib::__stdoutp@0 incoming=bzlib::__stdinp@0".to_owned(),
+            "bzlib::bzFile::field0@d0".to_owned(),
+        ]];
+        let exclusion = validate_taxonomy_typed_exclusion_parts(
+            TAXONOMY_TYPED_EXCLUSION_INDEX,
+            &expected,
+            GAP_ATTRIBUTION_AGGREGATE_MANIFEST,
+            BZIP2_GAP_ATTRIBUTION_MANIFEST,
+            BZIP2_GAP_MAPPING_SHA256,
+            &mapping,
+        )
+        .unwrap();
+        assert_eq!(exclusion.identity, expected.identity);
+        assert_eq!(exclusion.wall_s, None);
+        assert_eq!(exclusion.peak_rss_kb, None);
+        assert_eq!(exclusion.cgroup_peak_memory_kb, None);
+        let rendered = render_typed_exclusions(std::slice::from_ref(&exclusion));
+        assert_eq!(rendered.matches(NO_CANDIDATE_PROCESS_METRIC).count(), 4);
+        let path = std::env::temp_dir().join(format!(
+            "crat-a4-taxonomy-typed-exclusion-{}.tsv",
+            process::id()
+        ));
+        fs::write(&path, rendered).unwrap();
+        assert_eq!(parse_typed_exclusions(&path).unwrap(), vec![exclusion]);
+        fs::remove_file(path).unwrap();
+
+        let mut wrong_identity = expected;
+        wrong_identity.identity.field_key.push_str("-other");
+        assert!(
+            validate_taxonomy_typed_exclusion_parts(
+                TAXONOMY_TYPED_EXCLUSION_INDEX,
+                &wrong_identity,
+                GAP_ATTRIBUTION_AGGREGATE_MANIFEST,
+                BZIP2_GAP_ATTRIBUTION_MANIFEST,
+                BZIP2_GAP_MAPPING_SHA256,
+                &mapping,
+            )
+            .is_err()
+        );
+        assert!(
+            validate_taxonomy_typed_exclusion_parts(
+                TAXONOMY_TYPED_EXCLUSION_INDEX,
+                &IsolatedIdentity {
+                    identity: Identity {
+                        program: TAXONOMY_TYPED_EXCLUSION_PROGRAM.to_owned(),
+                        field_key: TAXONOMY_TYPED_EXCLUSION_FIELD_KEY.to_owned(),
+                    },
+                    population: "census",
+                },
+                GAP_ATTRIBUTION_AGGREGATE_MANIFEST,
+                BZIP2_GAP_ATTRIBUTION_MANIFEST,
+                BZIP2_GAP_MAPPING_SHA256,
+                &[vec!["short".to_owned()]],
             )
             .is_err()
         );
@@ -10072,6 +10352,10 @@ mod tests {
             render_census_denominator(236, 237, 1).unwrap(),
             "measured 236/237, typed excluded 1"
         );
+        assert_eq!(
+            render_census_denominator(235, 237, 2).unwrap(),
+            "measured 235/237, typed excluded 2"
+        );
         assert!(render_census_denominator(235, 237, 1).is_err());
     }
 
@@ -10084,6 +10368,22 @@ mod tests {
         let exclusion =
             validate_typed_exclusion_artifact(19, &ratified_exclusion_expected(), dir).unwrap();
         assert_eq!(exclusion.manifest, RATIFIED_TYPED_EXCLUSION_MANIFEST);
+    }
+
+    #[test]
+    #[ignore = "lambda7 exact taxonomy-exclusion attribution witness"]
+    fn taxonomy_typed_exclusion_artifact_verifies_exactly() {
+        let expected = IsolatedIdentity {
+            identity: Identity {
+                program: TAXONOMY_TYPED_EXCLUSION_PROGRAM.to_owned(),
+                field_key: TAXONOMY_TYPED_EXCLUSION_FIELD_KEY.to_owned(),
+            },
+            population: "census",
+        };
+        let exclusion =
+            validate_taxonomy_typed_exclusion_artifact(TAXONOMY_TYPED_EXCLUSION_INDEX, &expected)
+                .unwrap();
+        assert_eq!(exclusion.manifest, BZIP2_GAP_ATTRIBUTION_MANIFEST);
     }
 
     #[test]
