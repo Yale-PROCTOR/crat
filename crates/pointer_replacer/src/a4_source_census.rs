@@ -822,6 +822,14 @@ const ONE_DEREF_RAWPTR_EDGE_PREFIX: &str = "nested-one-deref-rawptr-value:";
 const BZIP2_WALKER_IMPACT_ORACLE_PATH: &str = "/home/p51lee/dev/agent-worktrees/crat-a4-source-walker-impact-v3-20260818-80xGVFBo/walker-impact-audit/bzip2/impact.tsv";
 const BZIP2_WALKER_IMPACT_ORACLE_SHA256: &str =
     "29fe9952a9e512aad6f44ec6a4a1421ee10c11c2aca41d127c3e89fab757c8da";
+const REFERENCE_WALKER_AUDIT_ROOT: &str = "/home/p51lee/dev/agent-worktrees/crat-a4-source-walker-impact-reference-20260818-caMrsP/walker-impact-audit";
+const REFERENCE_WALKER_AUDIT_MANIFEST: &str =
+    "6fd58fe7a5e9619b926631b5bf89163066286792087e721154405f1bb3996198";
+const REFERENCE_PREDECESSOR_ROOT: &str = "/home/p51lee/dev/agent-worktrees/crat-a4-source-census-run-20260816-retry3-resume14-GL6M9JOG/shards";
+const REFERENCE_BZIP2_ROOT: &str =
+    "/home/p51lee/dev/agent-worktrees/crat-a4-source-bzip2-reference-20260818-liuLmj/shards/bzip2";
+const REFERENCE_BZIP2_MANIFEST: &str =
+    "7161bbb4c63d447667e985f35a6e7a2eb75ddf54bd761a77a55d440d114302e4";
 const NESTED_ADDRESS_SHAPE_HEADER: &str = "program\trvalue_kind\tlocation\tsource_depth\ttarget_depth\tsource_node\ttarget_node\tmodeled_by_walker";
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -9842,6 +9850,242 @@ fn aggregate(contract: &MeasurementContract) {
     );
 }
 
+fn write_reference_roots(
+    inputs: &[PathBuf],
+    output: &Path,
+    measured: &BTreeSet<Identity>,
+) -> Result<(), String> {
+    let temporary = output.with_extension("tsv.tmp");
+    let mut writer = BufWriter::new(
+        fs::File::create(&temporary)
+            .map_err(|error| format!("create {}: {error}", temporary.display()))?,
+    );
+    writeln!(writer, "{ROOT_HEADER}").map_err(|error| error.to_string())?;
+    for input in inputs {
+        let mut lines = BufReader::new(
+            fs::File::open(input).map_err(|error| format!("open {}: {error}", input.display()))?,
+        )
+        .lines();
+        if lines
+            .next()
+            .transpose()
+            .map_err(|error| error.to_string())?
+            .as_deref()
+            != Some(ROOT_HEADER)
+        {
+            return Err(format!("root header drift: {}", input.display()));
+        }
+        for line in lines {
+            let line = line.map_err(|error| error.to_string())?;
+            let columns = line.split('\t').collect::<Vec<_>>();
+            if columns.len() != 8 {
+                return Err(format!("root schema drift: {}", input.display()));
+            }
+            let identity = Identity {
+                program: columns[1].to_owned(),
+                field_key: columns[2].to_owned(),
+            };
+            if columns[0] == "census" && measured.contains(&identity) {
+                writeln!(writer, "{line}").map_err(|error| error.to_string())?;
+            }
+        }
+    }
+    writer.flush().map_err(|error| error.to_string())?;
+    drop(writer);
+    fs::rename(&temporary, output).map_err(|error| error.to_string())
+}
+
+fn build_reference_source_aggregate(contract: &MeasurementContract) {
+    let output = contract.run_root.join("reference-aggregate");
+    assert!(!output.exists(), "reference aggregate must be fresh");
+    fs::create_dir(&output).expect("create reference aggregate");
+
+    assert_eq!(
+        verify_manifest(Path::new(REFERENCE_WALKER_AUDIT_ROOT)).unwrap(),
+        REFERENCE_WALKER_AUDIT_MANIFEST
+    );
+    assert_eq!(
+        verify_manifest(Path::new(GAP_ATTRIBUTION_SOURCE_ROOT)).unwrap(),
+        GAP_ATTRIBUTION_AGGREGATE_MANIFEST
+    );
+    assert_eq!(
+        verify_manifest(Path::new(REFERENCE_BZIP2_ROOT)).unwrap(),
+        REFERENCE_BZIP2_MANIFEST
+    );
+
+    let expected = contract
+        .programs
+        .iter()
+        .flat_map(|program| expected_identities(contract, program.name, true))
+        .collect::<BTreeSet<_>>();
+    assert_eq!(expected.len(), 237);
+    let audit_rows = parse_table(
+        &Path::new(REFERENCE_WALKER_AUDIT_ROOT).join("audit-deferrals.tsv"),
+        "program\tfield_key\tdisposition\tevidence_kind\tevidence_count\twitnesses",
+        6,
+    )
+    .expect("parse reference audit deferrals");
+    let audit_identities = audit_rows
+        .iter()
+        .map(|row| Identity {
+            program: row[0].clone(),
+            field_key: row[1].clone(),
+        })
+        .collect::<BTreeSet<_>>();
+    assert_eq!(audit_identities.len(), 35);
+    let audit_source = audit_identities
+        .intersection(&expected)
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    assert_eq!(audit_source.len(), 34);
+
+    let deferred_programs = ["brotli", "lodepng"];
+    let program_deferred = expected
+        .iter()
+        .filter(|identity| deferred_programs.contains(&identity.program.as_str()))
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    assert_eq!(program_deferred.len(), 140);
+    let taxonomy = Identity {
+        program: TAXONOMY_TYPED_EXCLUSION_PROGRAM.to_owned(),
+        field_key: TAXONOMY_TYPED_EXCLUSION_FIELD_KEY.to_owned(),
+    };
+    let mut excluded = audit_source.clone();
+    excluded.extend(program_deferred.clone());
+    excluded.insert(taxonomy.clone());
+    assert_eq!(excluded.len(), 175);
+    let measured = expected
+        .difference(&excluded)
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    assert_eq!(measured.len(), 62);
+
+    let predecessor = Path::new(REFERENCE_PREDECESSOR_ROOT);
+    let mut candidate_rows = BTreeMap::<Identity, Vec<String>>::new();
+    let mut root_inputs = Vec::new();
+    for &(program, _, expected_manifest) in &RETRY3_PREDECESSOR_SHARDS {
+        let dir = predecessor.join(program);
+        assert_eq!(verify_manifest(&dir).unwrap(), expected_manifest);
+        for row in parse_table(&dir.join("candidates.tsv"), CANDIDATE_HEADER, 7).unwrap() {
+            let identity = Identity {
+                program: row[0].clone(),
+                field_key: row[1].clone(),
+            };
+            if measured.contains(&identity) {
+                assert!(candidate_rows.insert(identity, row).is_none());
+            }
+        }
+        root_inputs.push(dir.join("roots.tsv"));
+    }
+    for row in parse_table(
+        &Path::new(REFERENCE_BZIP2_ROOT).join("candidates.tsv"),
+        CANDIDATE_HEADER,
+        7,
+    )
+    .unwrap()
+    {
+        let identity = Identity {
+            program: row[0].clone(),
+            field_key: row[1].clone(),
+        };
+        if measured.contains(&identity) {
+            assert!(candidate_rows.insert(identity, row).is_none());
+        }
+    }
+    root_inputs.push(Path::new(REFERENCE_BZIP2_ROOT).join("roots.tsv"));
+    assert_eq!(
+        candidate_rows.keys().cloned().collect::<BTreeSet<_>>(),
+        measured
+    );
+
+    let candidates_path = output.join("candidates.tsv");
+    let mut candidates = format!("{CANDIDATE_HEADER}\n");
+    for row in candidate_rows.values() {
+        candidates.push_str(&format!("{}\n", row.join("\t")));
+    }
+    fs::write(&candidates_path, candidates).unwrap();
+    let roots_path = output.join("roots.tsv");
+    write_reference_roots(&root_inputs, &roots_path, &measured).unwrap();
+    let candidate_rows = parse_table(&candidates_path, CANDIDATE_HEADER, 7).unwrap();
+    let roots = scan_root_path(&roots_path).unwrap();
+    fs::write(
+        output.join("candidate-readings.tsv"),
+        render_candidate_readings_from_summary(&candidate_rows, &roots).unwrap(),
+    )
+    .unwrap();
+
+    let mut exclusions = "program\tfield_key\tstatus\tevidence_manifest\n".to_owned();
+    for identity in &excluded {
+        let resource_exhausted = Identity {
+            program: RATIFIED_TYPED_EXCLUSION_PROGRAM.to_owned(),
+            field_key: RATIFIED_TYPED_EXCLUSION_FIELD_KEY.to_owned(),
+        };
+        let (status, manifest) = if *identity == resource_exhausted {
+            (
+                "resource-exhausted-at-100-gib-cap",
+                RATIFIED_TYPED_EXCLUSION_MANIFEST,
+            )
+        } else if *identity == taxonomy {
+            (
+                "taxonomy-set-valued-multi-static-provenance",
+                BZIP2_GAP_ATTRIBUTION_MANIFEST,
+            )
+        } else if audit_source.contains(identity) {
+            ("walker-audit-deferred", REFERENCE_WALKER_AUDIT_MANIFEST)
+        } else {
+            (
+                "program-graph-domain-deferred",
+                GAP_ATTRIBUTION_AGGREGATE_MANIFEST,
+            )
+        };
+        exclusions.push_str(&format!(
+            "{}\t{}\t{status}\t{manifest}\n",
+            identity.program, identity.field_key
+        ));
+    }
+    fs::write(output.join("exclusions.tsv"), exclusions).unwrap();
+    let non_source = audit_identities.difference(&expected).collect::<Vec<_>>();
+    assert_eq!(non_source.len(), 1);
+    fs::write(
+        output.join("non-source-deferrals.tsv"),
+        format!(
+            "program\tfield_key\tstatus\tevidence_manifest\n{}\t{}\tforce-sat-walker-audit-deferred\t{}\n",
+            non_source[0].program,
+            non_source[0].field_key,
+            REFERENCE_WALKER_AUDIT_MANIFEST,
+        ),
+    )
+    .unwrap();
+    let report = format!(
+        "# Provisional/reference allocation-source aggregate\n\n- expected source-census identities: 237\n- measured and walker-certified: 62\n- typed deferred/excluded: 175 (1 resource-exhausted, 33 walker-audit domain deferrals, 140 whole-program graph-domain deferrals, 1 taxonomy exclusion)\n- unknown/unexplained among measured: 0\n- predecessor reruns: none\n- reference-only: true\n- CROWN join use: design input, not publication numbers\n"
+    );
+    fs::write(output.join("report.md"), report).unwrap();
+    fs::write(
+        output.join("provenance.txt"),
+        format!(
+            "machine_id={MACHINE_ID}\nplatform={PLATFORM}\nanalysis_head={}\nanalysis_branch=codex/a4-source-census\nreference_only=true\nderived_substrate_digest={DERIVED_SUBSTRATE_DIGEST}\nsource_expected=237\nsource_measured=62\nsource_typed_deferred=175\nwalker_audit_manifest={REFERENCE_WALKER_AUDIT_MANIFEST}\ngap_attribution_manifest={GAP_ATTRIBUTION_AGGREGATE_MANIFEST}\nbzip2_shard_manifest={REFERENCE_BZIP2_MANIFEST}\nunknown=0\nunexplained=0\ntiming_comparison=forbidden-across-machines\n",
+            contract.head
+        ),
+    )
+    .unwrap();
+    let manifest = write_manifest(
+        &output,
+        &[
+            "candidate-readings.tsv",
+            "candidates.tsv",
+            "exclusions.tsv",
+            "non-source-deferrals.tsv",
+            "provenance.txt",
+            "report.md",
+            "roots.tsv",
+        ],
+    )
+    .unwrap();
+    eprintln!(
+        "A4C reference aggregate complete manifest={manifest} measured=62 typed_deferred=175"
+    );
+}
+
 #[derive(Clone, Debug)]
 struct GraphShapeProgramRecord {
     program: String,
@@ -11625,6 +11869,14 @@ fn a4_source_census_bzip2_reference() {
         .find(|program| program.name == "bzip2")
         .expect("bzip2 in measurement contract");
     run_shard(&contract, program);
+}
+
+#[test]
+#[ignore = "A4 provisional/reference source aggregate; run on the dedicated Linux lane"]
+fn a4_source_reference_aggregate() {
+    let contract = measurement_contract();
+    enforce_substrate_preflight(&contract);
+    build_reference_source_aggregate(&contract);
 }
 
 #[cfg(test)]
@@ -15500,6 +15752,41 @@ mod tests {
             .is_err(),
             "the data=false predecessor shard is never skippable"
         );
+    }
+
+    #[test]
+    fn reference_root_filter_keeps_only_measured_census_rows() {
+        let root =
+            std::env::temp_dir().join(format!("crat-a4-reference-root-filter-{}", process::id()));
+        if root.exists() {
+            fs::remove_dir_all(&root).unwrap();
+        }
+        fs::create_dir(&root).unwrap();
+        let input = root.join("input.tsv");
+        let output = root.join("output.tsv");
+        fs::write(
+            &input,
+            format!(
+                "{ROOT_HEADER}\ncensus\tbst\tkeep::field0@d0\tstore-a\troot-a\tlabel-a\tflag-a\tpath-a\ncensus\tbst\tdefer::field0@d0\tstore-b\troot-b\tlabel-b\tflag-b\tpath-b\nexception\tbst\tkeep::field0@d0\tstore-c\troot-c\tlabel-c\tflag-c\tpath-c\n"
+            ),
+        )
+        .unwrap();
+        let measured = BTreeSet::from([Identity {
+            program: "bst".to_owned(),
+            field_key: "keep::field0@d0".to_owned(),
+        }]);
+
+        write_reference_roots(std::slice::from_ref(&input), &output, &measured).unwrap();
+        assert_eq!(
+            fs::read_to_string(&output).unwrap(),
+            format!(
+                "{ROOT_HEADER}\ncensus\tbst\tkeep::field0@d0\tstore-a\troot-a\tlabel-a\tflag-a\tpath-a\n"
+            )
+        );
+
+        fs::write(&input, format!("{ROOT_HEADER}\nshort\trow\n")).unwrap();
+        assert!(write_reference_roots(&[input], &output, &measured).is_err());
+        fs::remove_dir_all(root).unwrap();
     }
 
     fn preflight_fixture(label: &str) -> (PathBuf, PathBuf) {
