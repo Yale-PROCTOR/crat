@@ -1474,7 +1474,11 @@ fn transform_inner(
         usize,
         SeamUseSurface,
         rustc_ast::Crate,
-        Vec<rustc_span::Span>,
+        // **THE CHANGED-SET, EACH EDIT WITH ITS CLAIMANT.** Carried as pairs
+        // rather than two parallel vectors so the pairing cannot come apart at
+        // this boundary; the emission sites project the spans back out, which
+        // is order-preserving and classifies nothing.
+        Vec<(rustc_span::Span, &'static str)>,
     ),
     String,
 > {
@@ -1525,7 +1529,11 @@ fn transform_with(
         usize,
         SeamUseSurface,
         rustc_ast::Crate,
-        Vec<rustc_span::Span>,
+        // **THE CHANGED-SET, EACH EDIT WITH ITS CLAIMANT.** Carried as pairs
+        // rather than two parallel vectors so the pairing cannot come apart at
+        // this boundary; the emission sites project the spans back out, which
+        // is order-preserving and classifies nothing.
+        Vec<(rustc_span::Span, &'static str)>,
     ),
     String,
 > {
@@ -1699,7 +1707,7 @@ fn transform_with(
             partial: seam_use_partial,
         },
         krate,
-        guard.edited_spans().to_vec(),
+        guard.edited_with_claimants().collect(),
     ))
 }
 
@@ -1773,6 +1781,7 @@ pub(crate) fn ast_emitted_files_from(
     String,
 > {
     let (_, _, seams, _, _, _, _, krate, edited) = transform_with(capture, table, reverts)?;
+    let edited: Vec<rustc_span::Span> = edited.into_iter().map(|(sp, _)| sp).collect();
     let (mut files, stats) =
         super::ast_bridge::splice_fn_prints_per_file(tcx, &krate, Some(&edited));
     if seams.len_fabricated > 0 {
@@ -1799,6 +1808,7 @@ pub(crate) fn ast_emitted_source_from(
 ) -> Result<(String, super::ast_bridge::SubstStats), String> {
     let (table, _ctx) = super::decide_table_with_ctx(tcx)?;
     let (_, _, seams, _, _, _, _, krate, edited) = transform_with(capture, &table, reverts)?;
+    let edited: Vec<rustc_span::Span> = edited.into_iter().map(|(sp, _)| sp).collect();
     let (mut source, stats) = super::ast_bridge::splice_fn_prints(tcx, &krate, Some(&edited));
     // **The fabricated-extent const** (marker ruling, 2026-08-15): emitted when
     // this layer PLACED at least one fabricated adapter.
@@ -2512,6 +2522,145 @@ pub(crate) fn revert_set_from_names(
 ) -> Result<RevertSet, String> {
     let wanted: FxHashSet<&str> = names.iter().map(String::as_str).collect();
     resolve_reverts(tcx, &wanted, names.len(), "verify-loop")
+}
+
+/// **THE EDIT DUMP** — both layers' SURVIVING edits under ONE held revert set.
+///
+/// Diagnostic only. Nothing gates on it and nothing in the emission path reads
+/// it; it exists to answer a question no corpus counter can, because `emitted`
+/// and `reverted` count **DECISIONS** and nothing at corpus scale compares
+/// **TEXT** (M-2 handoff §2).
+///
+/// # The revert set is HELD, never re-derived
+///
+/// Both sides consume the one `RevertSet` parsed from the caller's oracle text,
+/// for the reason `phase3_fn_parity` records: a run that re-derived reverts
+/// would make any difference ambiguous between the transform layer and the
+/// revert layer. The set is also reported back in the dump, so a reader can see
+/// which population the two sides were actually asked about.
+///
+/// # Ordering is load-bearing
+///
+/// `capture_ast` **first**, before any HIR query — `expanded_ast` panics once
+/// the HIR is built, and revert resolution is a HIR query. This is the module's
+/// ONE ENTRY rule; getting it wrong panicked all 20 programs once already.
+///
+/// # Both keys are reported on purpose
+///
+/// [`RevertSet`] carries `fns` (`LocalDefId`) and `names` (`owner_fn` paths)
+/// because `emit_files` filters SUBJECTS by the first while `render` filters
+/// EDITS by the second. A dump that showed only one key could not distinguish
+/// "not reverted" from "reverted under the other key".
+pub(crate) fn edit_dump(
+    tcx: rustc_middle::ty::TyCtxt<'_>,
+    reverts_text: &str,
+    reverts_origin: &str,
+) -> Result<String, String> {
+    use std::fmt::Write as _;
+
+    let capture = capture_ast(tcx)?;
+    let reverts = oracle_reverts(tcx, reverts_text, reverts_origin)?;
+    let (table, _ctx) = super::decide_table_with_ctx(tcx)?;
+    let sm = tcx.sess.source_map();
+    let mut o = String::new();
+
+    let mut names: Vec<&str> = reverts.names.iter().map(String::as_str).collect();
+    names.sort_unstable();
+    let _ = writeln!(o, "== HELD REVERT SET (one set, both layers) ==");
+    let _ = writeln!(
+        o,
+        "origin={reverts_origin}\nsubjects={} fns={} names={names:?}",
+        reverts.subjects,
+        reverts.fns.len()
+    );
+
+    // Function extents, from the SAME walk the splice uses, so "containing
+    // function" here means what it means there.
+    let mut fn_spans = Vec::new();
+    super::ast_bridge::collect_fn_spans(&capture.krate.items, &mut fn_spans);
+    // Body owners, for the resolved `LocalDefId` of whatever contains an edit.
+    let owners: Vec<(rustc_span::Span, rustc_hir::def_id::LocalDefId)> = tcx
+        .hir_body_owners()
+        .map(|did| (tcx.def_span(did), did))
+        .collect();
+    let locate = |sp: rustc_span::Span| -> String {
+        let Some(extent) = fn_spans.iter().find(|f| f.contains(sp)) else {
+            return "fn=<none: edit is outside every function extent>".to_owned();
+        };
+        match owners.iter().find(|(dsp, _)| extent.contains(*dsp)) {
+            Some((_, did)) => format!(
+                "fn={} local_def_id={did:?} reverted_by_defid={} reverted_by_name={}",
+                tcx.def_path_str(*did),
+                reverts.fns.contains(did),
+                reverts.names.contains(&tcx.def_path_str(*did)),
+            ),
+            None => format!(
+                "fn=<unresolved> extent={}",
+                sm.span_to_string(*extent, rustc_span::FileNameDisplayPreference::Local)
+            ),
+        }
+    };
+
+    // ---- AST layer -------------------------------------------------------
+    let (_, _, _, _, _, _, _, krate, edited) = transform_with(&capture, &table, &reverts)?;
+    let spans: Vec<rustc_span::Span> = edited.iter().map(|(sp, _)| *sp).collect();
+    let (files, stats) = super::ast_bridge::splice_fn_prints_per_file(tcx, &krate, Some(&spans));
+    let _ = writeln!(
+        o,
+        "\n== AST LAYER ==\nclaimed_edits={} files_with_edits={} files_emitted={}",
+        edited.len(),
+        stats.files_with_edits,
+        files.len()
+    );
+    for (i, (sp, claimant)) in edited.iter().enumerate() {
+        let _ = writeln!(o, "-- ast edit #{i} kind={claimant}");
+        let _ = writeln!(
+            o,
+            "   at     = {} bytes=[{}, {})",
+            sm.span_to_string(*sp, rustc_span::FileNameDisplayPreference::Local),
+            sp.lo().0,
+            sp.hi().0
+        );
+        let _ = writeln!(o, "   {}", locate(*sp));
+        let _ = writeln!(
+            o,
+            "   text   = {:?}",
+            sm.span_to_snippet(*sp)
+                .unwrap_or_else(|_| "<unrenderable>".to_owned())
+        );
+    }
+
+    // ---- span layer ------------------------------------------------------
+    // ⚠ PLANNED vs SURVIVING are reported separately: "0 surviving" and "0
+    // planned" are different facts, and collapsing them is absence-as-
+    // observation (standard §1a).
+    let emission = super::emit_files(tcx, &table, &reverts.fns)?;
+    let reverted_names: std::collections::BTreeSet<String> =
+        reverts.names.iter().cloned().collect();
+    let (span_files, rollbacks) = super::render(&emission.plan, &emission.texts, &reverted_names);
+    let planned: usize = emission.plan.by_file.values().map(Vec::len).sum();
+    let _ = writeln!(
+        o,
+        "\n== SPAN LAYER ==\nplanned_edits={planned} files_emitted={} rollbacks={} unplaceable={}",
+        span_files.len(),
+        rollbacks.len(),
+        emission.plan.unplaceable.len()
+    );
+    for (key, edits) in &emission.plan.by_file {
+        for (i, e) in edits.iter().enumerate() {
+            let _ = writeln!(
+                o,
+                "-- span edit #{i} file={key:?} bytes=[{}, {}) owner_fn={} survives={} just={:?}",
+                e.lo,
+                e.hi,
+                e.owner_fn,
+                !reverted_names.contains(&e.owner_fn),
+                e.justification
+            );
+            let _ = writeln!(o, "   text   = {:?}", e.replacement);
+        }
+    }
+    Ok(o)
 }
 
 /// **THE PHASE-3 EXIT GATE.** Whole-function parity over the emitted

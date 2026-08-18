@@ -8111,6 +8111,71 @@ mod run {
     /// read from `{program}.reverts.txt` inside it. The digest is the caller's
     /// to verify — this worker's contract is that it read THAT directory and no
     /// other, which is why the path is echoed back into the row.
+    /// **THE bst EDIT DUMP** (M-2, 2026-08-18). Diagnostic; nothing gates on it.
+    ///
+    /// Reports BOTH layers' surviving edits under ONE held revert set, read
+    /// from `CRAT_M1_DUMP_REVERTS`. The revert set is the CONVERGED one the
+    /// emit run produced, supplied as a file, because re-deriving it here would
+    /// make any difference ambiguous between the transform and revert layers.
+    ///
+    /// ⚠ **Written to a FILE, not stdout.** The sweep discards worker stdout,
+    /// and the CLI proxy filters it besides, so a dump that only printed would
+    /// be an instrument reporting a confident nothing (standard §1e). The
+    /// row carries the path so the reader is never guessing which run wrote it.
+    pub fn run_m1_editdump(tcx: TyCtxt<'_>, t_tcx: Duration) -> Row {
+        let t0 = Instant::now();
+        let mut row = Row::default();
+        row.set("t_tcx_s", secs(t_tcx));
+        let name = std::env::var("CRAT_BOC1_NAME").unwrap_or_else(|_| "unnamed".into());
+        let Some(src) = std::env::var_os("CRAT_M1_DUMP_REVERTS") else {
+            row.set("dump", "declined");
+            row.set("dump_detail", "CRAT_M1_DUMP_REVERTS unset");
+            row.set("t_total_s", secs(t0.elapsed()));
+            return row;
+        };
+        let src = std::path::PathBuf::from(src);
+        let text = match std::fs::read_to_string(&src) {
+            Ok(t) => t,
+            Err(e) => {
+                row.set("dump", "declined");
+                row.set(
+                    "dump_detail",
+                    super::report::sanitize(&format!("read: {e}")),
+                );
+                row.set("t_total_s", secs(t0.elapsed()));
+                return row;
+            }
+        };
+        let origin = src.display().to_string();
+        match crate::bo_rewriter::ast_transform::edit_dump(tcx, &text, &origin) {
+            Ok(body) => {
+                let dir = super::orchestrate::out_dir().join("m1-editdump");
+                let _ = std::fs::create_dir_all(&dir);
+                let path = dir.join(format!("{name}.txt"));
+                match std::fs::write(&path, &body) {
+                    Ok(()) => {
+                        row.set("dump", "ok");
+                        row.set("dump_path", path.display().to_string());
+                        row.set("dump_bytes", body.len().to_string());
+                    }
+                    Err(e) => {
+                        row.set("dump", "failed");
+                        row.set(
+                            "dump_detail",
+                            super::report::sanitize(&format!("write: {e}")),
+                        );
+                    }
+                }
+            }
+            Err(why) => {
+                row.set("dump", "failed");
+                row.set("dump_detail", super::report::sanitize(&why));
+            }
+        }
+        row.set("t_total_s", secs(t0.elapsed()));
+        row
+    }
+
     pub fn run_m1_p3(tcx: TyCtxt<'_>, t_tcx: Duration) -> Row {
         let t0 = Instant::now();
         let mut row = Row::default();
@@ -13474,6 +13539,7 @@ fn boc1_run_one() {
             "use-census" => run::run_use_census(tcx, t_tcx),
             "m1-recon" => run::run_m1_recon(tcx, t_tcx),
             "m1-p3" => run::run_m1_p3(tcx, t_tcx),
+            "m1-editdump" => run::run_m1_editdump(tcx, t_tcx),
             "selector-core" => run::run_selector_core(tcx, t_tcx),
             "selector-necessity" => run::run_selector_necessity(tcx, t_tcx),
             detail if detail.starts_with("selector-detail-") => {
