@@ -428,6 +428,7 @@ pub(crate) fn rewrite_m1_path_injected(
         max_rounds,
         inject,
         false,
+        ast_emit_enabled(),
     )
 }
 
@@ -448,7 +449,14 @@ fn rewrite_core(
     tree_base: Option<&std::path::Path>,
     max_rounds: usize,
 ) -> RewriteOutcome {
-    rewrite_core_injected(input, tree_base, max_rounds, &|_| {}, false)
+    rewrite_core_injected(
+        input,
+        tree_base,
+        max_rounds,
+        &|_| {},
+        false,
+        ast_emit_enabled(),
+    )
 }
 
 /// [`rewrite_core`] with a hook applied to the finished decision table at the
@@ -464,6 +472,7 @@ fn rewrite_core_injected(
     max_rounds: usize,
     inject: &(dyn Fn(&mut decision::DecisionTable) + Sync),
     probe_only: bool,
+    ast: bool,
 ) -> RewriteOutcome {
     // The string entry's original text, so a baseline exists for it too.
     let virtual_original = match &input {
@@ -624,6 +633,7 @@ fn rewrite_core_injected(
         // computed): it is the placed set, already filtered above, so `emitted`
         // names what the rewrite actually did to the source.
         Ok(verify_and_revert(
+            ast,
             tcx,
             &capture,
             &table,
@@ -681,6 +691,39 @@ fn ast_emit_enabled() -> bool {
     std::env::var_os("CRAT_M1_AST_EMIT").is_some()
 }
 
+/// **READ ONCE, AT THE ENTRY, THEN PASSED AS A VALUE** (2026-08-18).
+///
+/// The switch used to be read deep in [`round_files`], which made the layer a
+/// property of the PROCESS at the moment of the read. The suite runs its tests
+/// as threads of one process, so a test selecting a layer was selecting it for
+/// every concurrently running test — and a second such test made that concrete:
+/// one test's `remove_var` cleared the other's selection mid-rewrite, and the
+/// AST arm silently measured the span layer. It passed in isolation and failed
+/// in the suite.
+///
+/// Threading it as a parameter makes the layer a property of the CALL. Tests
+/// pass it explicitly and mutate no environment; production reads the variable
+/// once, here. M-3 deletes the parameter with the span layer.
+///
+/// This is the same lesson the z3 seed pin records: a process-global knob set
+/// by a test leaks into the parallel runner.
+#[cfg(test)]
+pub(crate) fn rewrite_m1_path_on_layer(
+    root: &std::path::Path,
+    max_rounds: usize,
+    inject: &(dyn Fn(&mut decision::DecisionTable) + Sync),
+    ast: bool,
+) -> RewriteOutcome {
+    rewrite_core_injected(
+        ::utils::compilation::path_to_input(root),
+        Some(root),
+        max_rounds,
+        inject,
+        false,
+        ast,
+    )
+}
+
 /// **THE ROUND'S FILE SET — ONE derivation, BOTH call sites.**
 ///
 /// The per-round re-render, the bisect probes, and **the bisect's final
@@ -711,6 +754,7 @@ fn round_files(
     reverted: &std::collections::BTreeSet<String>,
     root_key: Option<&plan::FileKey>,
     table: &decision::DecisionTable,
+    ast: bool,
 ) -> Result<
     (
         std::collections::BTreeMap<plan::FileKey, String>,
@@ -723,7 +767,7 @@ fn round_files(
     ),
     String,
 > {
-    if !ast_emit_enabled() {
+    if !ast {
         let (files, rollbacks) = render(emission_plan, emission_texts, reverted);
         let edited = files.len();
         return Ok((files, rollbacks, edited));
@@ -741,6 +785,7 @@ fn round_files(
 }
 
 fn verify_and_revert(
+    ast: bool,
     tcx: TyCtxt<'_>,
     capture: &ast_transform::AstCapture,
     table: &decision::DecisionTable,
@@ -993,6 +1038,7 @@ fn verify_and_revert(
             &reverted,
             root_key.as_ref(),
             table,
+            ast,
         ) {
             Ok(triple) => triple,
             Err(why) => {
@@ -1074,6 +1120,7 @@ fn verify_and_revert(
             trial,
             root_key.as_ref(),
             table,
+            ast,
         ) else {
             return false;
         };
@@ -1109,6 +1156,7 @@ fn verify_and_revert(
         &final_reverted,
         root_key.as_ref(),
         table,
+        ast,
     ) {
         Ok(triple) => triple,
         Err(why) => {
@@ -1667,6 +1715,7 @@ pub(crate) fn diagnose_once(
         MAX_REVERT_ROUNDS,
         &|_| {},
         true,
+        ast_emit_enabled(),
     );
     let (observed_root, diags) = outcome.into_capture();
     // FAIL-CLOSED. A capture without its frame cannot be canonicalized, and the

@@ -1360,6 +1360,7 @@ fn a_probe_does_not_compile_the_baseline_it_never_consults() {
         super::MAX_REVERT_ROUNDS,
         &|_| {},
         true,
+        false,
     );
     match probe {
         super::RewriteOutcome::Degraded {
@@ -1489,6 +1490,7 @@ fn a_degraded_outcome_still_reports_its_unplaceable_decisions() {
         super::MAX_REVERT_ROUNDS,
         &|_| {},
         true,
+        false,
     );
     match probe {
         super::RewriteOutcome::Degraded { unplaceable, .. } => {
@@ -1613,6 +1615,7 @@ fn a_degraded_outcome_reports_placements_too() {
         super::MAX_REVERT_ROUNDS,
         &|_| {},
         true,
+        false,
     );
     match probe {
         super::RewriteOutcome::Degraded { emitted_count, .. } => assert_eq!(
@@ -4792,17 +4795,15 @@ fn both_layers_agree_on_a_reverted_program() {
     }
 
     fn run(ast: bool) -> Converged {
-        // SAFETY: this test is run single-threaded (`--test-threads=1` is not
-        // required because the switch is read once per `rewrite_*` call and
-        // restored before returning), and the switch is process-global by
-        // design: it is a transitional build selector, not a runtime parameter.
-        unsafe {
-            if ast {
-                std::env::set_var("CRAT_M1_AST_EMIT", "1");
-            } else {
-                std::env::remove_var("CRAT_M1_AST_EMIT");
-            }
-        }
+        // **THE LAYER IS A PARAMETER, NOT THE ENVIRONMENT** (2026-08-18).
+        //
+        // This set `CRAT_M1_AST_EMIT` and removed it again, under a SAFETY note
+        // arguing that was sound because the switch is read once per call. It
+        // was not: the variable is process-global and the suite runs its tests
+        // as threads, so the note only held while this was the ONLY such test.
+        // The moment a second one existed, this test's `remove_var` cleared the
+        // other's selection mid-rewrite and the other silently measured the
+        // span layer — green alone, red in the suite.
         let fixture = Fixture::new(&[
             (
                 "lib.rs",
@@ -4824,8 +4825,8 @@ fn both_layers_agree_on_a_reverted_program() {
         // from `round_files` and the switch therefore governs. That is exactly
         // why `the_round_cap_stops_the_loop` caught this defect and the cap-8
         // shape did not.
-        let out = super::rewrite_m1_path_injected(&fixture.root(), 0, &force_stash_value_shared);
-        unsafe { std::env::remove_var("CRAT_M1_AST_EMIT") };
+        let out =
+            super::rewrite_m1_path_on_layer(&fixture.root(), 0, &force_stash_value_shared, ast);
         match out {
             super::RewriteOutcome::Emitted {
                 escalated,
@@ -4900,16 +4901,6 @@ fn both_layers_agree_on_a_reverted_program() {
 #[test]
 fn the_bisect_path_emits_through_the_selected_layer() {
     fn run(ast: bool) -> Vec<(String, usize)> {
-        // SAFETY: same contract as `both_layers_agree_on_a_reverted_program` —
-        // the switch is read once per `rewrite_*` call and removed before
-        // returning.
-        unsafe {
-            if ast {
-                std::env::set_var("CRAT_M1_AST_EMIT", "1");
-            } else {
-                std::env::remove_var("CRAT_M1_AST_EMIT");
-            }
-        }
         let fixture = Fixture::new(&[
             (
                 "lib.rs",
@@ -4921,8 +4912,8 @@ fn the_bisect_path_emits_through_the_selected_layer() {
             ),
             ("bad.rs", BREAKS_ON_REWRITE),
         ]);
-        let out = super::rewrite_m1_path_injected(&fixture.root(), 0, &force_stash_value_shared);
-        unsafe { std::env::remove_var("CRAT_M1_AST_EMIT") };
+        let out =
+            super::rewrite_m1_path_on_layer(&fixture.root(), 0, &force_stash_value_shared, ast);
         match out {
             super::RewriteOutcome::Emitted { files, .. } => {
                 let mut v: Vec<(String, usize)> = files
