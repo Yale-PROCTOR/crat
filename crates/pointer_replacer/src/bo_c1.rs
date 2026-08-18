@@ -7817,30 +7817,38 @@ mod run {
     /// Takes a PATH rather than a `TyCtxt`: `rewrite_m1_path` opens its own
     /// compiler session, and nesting one inside the worker's would run two
     /// rustc invocations in one process for no reason.
-    pub fn run_m1_emit(input: &std::path::Path) -> Row {
-        use crate::bo_rewriter::{RewriteOutcome, rewrite_m1_path};
-
-        let t0 = Instant::now();
-        let mut row = Row::default();
-        let outcome = rewrite_m1_path(input);
-        row.set("t_total_s", secs(t0.elapsed()));
-
-        // ONE filling site, reading the outcome uniformly. The previous shape
-        // matched on the variant and hand-filled each arm, which zeroed a real
-        // value twice — `emitted` at S2b.0 and then `reverted` while repairing
-        // it. Fields that exist on both arms are read once, before the branch.
-        let (
-            emitted,
-            degraded,
-            files_touched,
-            reverted,
-            blind,
-            probes,
-            base_keys,
-            base_errors,
-            base_msg_env,
-        ) = match &outcome {
-            RewriteOutcome::Emitted {
+    /// **THE COUNTER SELECTION, extracted so it can be WITNESSED.**
+    ///
+    /// It was inline in [`run_m1_emit`], and inline it was untestable: the only
+    /// fixture reaching it runs on the span layer, where `files.len()` and the
+    /// ruled `files_touched` always agree — so the reporting-site defect this
+    /// extraction exists to prevent could be reintroduced with the whole suite
+    /// green. Measured, not assumed: restoring `files.len()` here left
+    /// `run_m1_emit_reports_its_counters_at_fixture_scale` PASSING.
+    ///
+    /// Extracting it lets a test build an outcome whose map size and ruled
+    /// counter DISAGREE, which is the only shape that can witness the
+    /// difference — and that shape is `bst`, not a contrivance.
+    ///
+    /// ONE filling site, reading the outcome uniformly. The previous shape
+    /// matched on the variant and hand-filled each arm, which zeroed a real
+    /// value twice — `emitted` at S2b.0 and then `reverted` while repairing it.
+    #[allow(clippy::type_complexity)]
+    pub(super) fn emit_counters(
+        outcome: &crate::bo_rewriter::RewriteOutcome,
+    ) -> (
+        usize,
+        usize,
+        usize,
+        usize,
+        usize,
+        usize,
+        usize,
+        usize,
+        usize,
+    ) {
+        match outcome {
+            crate::bo_rewriter::RewriteOutcome::Emitted {
                 emitted_count,
                 degradations,
                 files_touched,
@@ -7867,7 +7875,7 @@ mod run {
                 *baseline_errors,
                 *baseline_msg_env,
             ),
-            RewriteOutcome::Degraded {
+            crate::bo_rewriter::RewriteOutcome::Degraded {
                 emitted_count,
                 degradations,
                 files_touched,
@@ -7889,7 +7897,32 @@ mod run {
                 *baseline_errors,
                 *baseline_msg_env,
             ),
-        };
+        }
+    }
+
+    pub fn run_m1_emit(input: &std::path::Path) -> Row {
+        use crate::bo_rewriter::{RewriteOutcome, rewrite_m1_path};
+
+        let t0 = Instant::now();
+        let mut row = Row::default();
+        let outcome = rewrite_m1_path(input);
+        row.set("t_total_s", secs(t0.elapsed()));
+
+        // ONE filling site, reading the outcome uniformly. The previous shape
+        // matched on the variant and hand-filled each arm, which zeroed a real
+        // value twice — `emitted` at S2b.0 and then `reverted` while repairing
+        // it. Fields that exist on both arms are read once, before the branch.
+        let (
+            emitted,
+            degraded,
+            files_touched,
+            reverted,
+            blind,
+            probes,
+            base_keys,
+            base_errors,
+            base_msg_env,
+        ) = emit_counters(&outcome);
         // S3.1′ E3c — the reverted subjects BY IDENTITY, not just a count.
         //
         // `reverted` is an aggregate, and the question it is being asked (how
@@ -9858,6 +9891,59 @@ fn an_unparseable_aggregate_fails_closed() {
 /// That site reaches a consumer only on a `Degraded` return, which is why it has
 /// its own witness in `a_degraded_outcome_reports_placements_too` rather than
 /// being claimed here.
+/// **THE REPORTING SITE READS THE RULED COUNTER, NOT THE MAP SIZE.**
+///
+/// The witness `run_m1_emit_reports_its_counters_at_fixture_scale` could not
+/// provide. That fixture runs on the span layer, where `render` returns edited
+/// files only, so `files.len()` and `files_touched` agree and the two are
+/// indistinguishable — restoring the defect left it PASSING. This builds the
+/// one shape where they disagree.
+///
+/// That shape is not contrived: it is `bst`. Converged with every subject
+/// reverted, it emits its substrate byte-identical, so the ruled counter is 0
+/// while the SEEDED AST map still holds one entry.
+///
+/// *Mutation-tested.* Bind `files` in the `Emitted` arm and return
+/// `files.len()` — the exact pre-fix code — and this fails 1 vs 0.
+#[test]
+fn the_reporting_site_reads_files_touched_not_the_map_size() {
+    let outcome = crate::bo_rewriter::RewriteOutcome::Emitted {
+        source: "fn f() {}\n".to_owned(),
+        files: [(
+            crate::bo_rewriter::plan::FileKey::Real(std::path::PathBuf::from("/x/lib.rs")),
+            "fn f() {}\n".to_owned(),
+        )]
+        .into_iter()
+        .collect(),
+        files_touched: 0,
+        degradations: Vec::new(),
+        emitted_count: 0,
+        excluded: Default::default(),
+        emitted_sites: Vec::new(),
+        bisect_probes: 0,
+        escalated: None,
+        unplaceable: Vec::new(),
+        reverted_count: 1,
+        attribution_blind: 0,
+        first_diags: Vec::new(),
+        observed_root: None,
+        baseline_keys: 0,
+        baseline_errors: 0,
+        baseline_msg_env: 0,
+    };
+    let (_emitted, _degraded, files_touched, reverted, ..) = run::emit_counters(&outcome);
+    assert_eq!(
+        files_touched, 0,
+        "the reporting site measured the emission MAP instead of reading the \
+         ruled counter; on the AST layer that map is seeded, so this reports a \
+         file as touched while the emitted bytes are identical to the substrate"
+    );
+    assert_eq!(
+        reverted, 1,
+        "the revert count must still be read, not zeroed"
+    );
+}
+
 #[test]
 fn run_m1_emit_reports_its_counters_at_fixture_scale() {
     let dir = std::env::temp_dir().join(format!("crat-m1emit-smoke-{}", std::process::id()));
