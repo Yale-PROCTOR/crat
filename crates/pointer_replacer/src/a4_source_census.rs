@@ -1478,13 +1478,13 @@ enum ProjectedGapDisposition {
 }
 
 fn projected_gap_disposition(
-    destination_is_scalar: bool,
-    base_pointer_slot_counts: &[usize],
+    plain_projection: bool,
+    written_pointer_slot_count: usize,
 ) -> Result<ProjectedGapDisposition, String> {
-    if base_pointer_slot_counts.is_empty() {
-        return Err("projected gap has no resolved alias base".to_owned());
+    if !plain_projection {
+        return Err("projected gap is outside the closed written-place grammar".to_owned());
     }
-    if destination_is_scalar && base_pointer_slot_counts.iter().all(|count| *count == 0) {
+    if written_pointer_slot_count == 0 {
         Ok(ProjectedGapDisposition::OutOfPointerUniverse)
     } else {
         Ok(ProjectedGapDisposition::RequiresGraphAnchor)
@@ -2037,19 +2037,78 @@ fn data_pointer_slot_count<'tcx>(
     }
 }
 
-fn pointee_data_pointer_slot_count<'tcx>(tcx: TyCtxt<'tcx>, ty: Ty<'tcx>) -> Result<usize, String> {
-    let pointee = match ty.kind() {
-        TyKind::RawPtr(pointee, _) | TyKind::Ref(_, pointee, _) => *pointee,
-        _ => return Err(format!("alias base is not a pointer: {ty:?}")),
-    };
-    data_pointer_slot_count(tcx, pointee, &mut FxHashSet::default())
-}
+fn written_place_pointer_slot_count<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    body: &Body<'tcx>,
+    place: Place<'tcx>,
+) -> Result<usize, String> {
+    let projections = place.projection.as_ref();
+    if projections.len() < 2
+        || !matches!(projections.first(), Some(ProjectionElem::Deref))
+        || !matches!(projections.last(), Some(ProjectionElem::Field(..)))
+    {
+        return Err(format!(
+            "projected store is outside the closed written-place grammar: {place:?}"
+        ));
+    }
 
-fn primitive_non_pointer_scalar(ty: Ty<'_>) -> bool {
-    matches!(
-        ty.kind(),
-        TyKind::Bool | TyKind::Char | TyKind::Int(_) | TyKind::Uint(_) | TyKind::Float(_)
-    )
+    let mut ty = body.local_decls[place.local].ty;
+    for (index, projection) in projections.iter().enumerate() {
+        match projection {
+            ProjectionElem::Deref if index == 0 => {
+                ty = ty.builtin_deref(true).ok_or_else(|| {
+                    format!("written-place leading dereference has no pointee: {place:?}")
+                })?;
+            }
+            ProjectionElem::Deref => {
+                return Err(format!(
+                    "additional dereference outside written-place grammar: {place:?}"
+                ));
+            }
+            ProjectionElem::Field(_, field_ty) => {
+                match ty.kind() {
+                    TyKind::Adt(def, args) if def.is_union() => {
+                        for member in def.all_fields() {
+                            let member_ty = member.ty(tcx, args);
+                            let member_pointer_slots =
+                                data_pointer_slot_count(tcx, member_ty, &mut FxHashSet::default())?;
+                            if member_pointer_slots != 0 {
+                                return Err(format!(
+                                    "pointer-bearing union outside written-place closure: {} member {} has {member_pointer_slots} data-pointer slot(s)",
+                                    tcx.def_path_str(def.did()),
+                                    member.name,
+                                ));
+                            }
+                        }
+                    }
+                    TyKind::Adt(def, _) if def.is_struct() => {}
+                    TyKind::Tuple(_) => {}
+                    other => {
+                        return Err(format!(
+                            "unsupported field owner in written-place grammar: {other:?} in {place:?}"
+                        ));
+                    }
+                }
+                ty = *field_ty;
+            }
+            ProjectionElem::Index(_) | ProjectionElem::ConstantIndex { .. } => {
+                ty = ty
+                    .builtin_index()
+                    .ok_or_else(|| format!("written-place index has no element type: {place:?}"))?;
+            }
+            ProjectionElem::Subslice { .. }
+            | ProjectionElem::Downcast(..)
+            | ProjectionElem::OpaqueCast(_)
+            | ProjectionElem::Subtype(_)
+            | ProjectionElem::UnwrapUnsafeBinder(_) => {
+                return Err(format!(
+                    "unsupported projection outside written-place grammar: {projection:?} in {place:?}"
+                ));
+            }
+        }
+    }
+
+    data_pointer_slot_count(tcx, ty, &mut FxHashSet::default())
 }
 
 fn exact_raw_pointer_aliases<'tcx>(
@@ -2137,6 +2196,8 @@ fn add_realized_pointer_alias_store_edges<'tcx>(
                         site: "graph-construction".to_owned(),
                         detail,
                     };
+                    let written_pointer_slot_count =
+                        written_place_pointer_slot_count(tcx, body, *lhs)?;
                     if !graph_gap_attribution_active() {
                         return Err(error);
                     }
@@ -2149,16 +2210,8 @@ fn add_realized_pointer_alias_store_edges<'tcx>(
                         work.extend(aliases.get(&local).into_iter().flatten().copied());
                     }
                     seen.remove(&lhs.local);
-                    let base_pointer_slot_counts = seen
-                        .iter()
-                        .map(|base| {
-                            pointee_data_pointer_slot_count(tcx, body.local_decls[*base].ty)
-                        })
-                        .collect::<Result<Vec<_>, _>>()?;
-                    if projected_gap_disposition(
-                        primitive_non_pointer_scalar(lhs.ty(body, tcx).ty),
-                        &base_pointer_slot_counts,
-                    )? == ProjectedGapDisposition::OutOfPointerUniverse
+                    if projected_gap_disposition(true, written_pointer_slot_count)?
+                        == ProjectedGapDisposition::OutOfPointerUniverse
                     {
                         assert!(record_graph_gap_anchor(
                             gap.clone(),
@@ -2166,6 +2219,11 @@ fn add_realized_pointer_alias_store_edges<'tcx>(
                         ));
                         assert!(record_graph_shape_gap(gap));
                         continue;
+                    }
+                    if seen.is_empty() {
+                        return Err(format!(
+                            "projected pointer-alias attribution has no resolved alias base: {lhs:?}"
+                        ));
                     }
                     let anchors = seen
                         .iter()
@@ -4749,6 +4807,8 @@ const GAP_SITE_AGGREGATE_MANIFEST: &str =
     "0b4fbd4387e567a4312e544ff1034857ca8ad5495f05878a6229235d331a970f";
 const BZIP2_GAP_MAPPING_SHA256: &str =
     "de035d4b177827bbd8ab9e13507640c682124b9df9eb19b9829528c5cb4e2fa8";
+const BROTLI_GAP_INVENTORY_SHA256: &str =
+    "4378fa1f704ccd2486fbdd08825038404a7af21db6bd0338430f7fdf91ef42f4";
 const GAP_SITE_PROGRAM_MANIFESTS: [(&str, &str); 3] = [
     (
         "bzip2",
@@ -9030,6 +9090,18 @@ fn run_exhaustive_gap_inventory(contract: &MeasurementContract) {
             .filter(|row| row[5] == "out-of-pointer-universe")
             .count();
         let anchored_count = rows.len() - typed_zero_count;
+        if program_name == "brotli" {
+            assert_eq!(
+                sha256(&dir.join("gap-sites.tsv")),
+                BROTLI_GAP_INVENTORY_SHA256,
+                "A4C STOP phase=gap-inventory-determinism candidate=brotli: gap inventory byte drift"
+            );
+            assert_eq!(
+                (rows.len(), typed_zero_count, anchored_count),
+                (35, 34, 1),
+                "A4C STOP phase=gap-inventory-determinism candidate=brotli: inventory class-count drift"
+            );
+        }
         let receipt = format!(
             "machine_id={MACHINE_ID}\nplatform={PLATFORM}\nmeasurement_class=exhaustive-gap-inventory\nsemantic_data=false\ncompleted=true\ncandidate_processing=false\nstopping_rule={GAP_INVENTORY_STOPPING_RULE}\nmemory_limit=cgroup-100GiB\nmemory_max_bytes={CANDIDATE_MEMORY_MAX_BYTES}\ncap_verified={}\noom_kills={}\nmemory_max_events={}\noom_killer=none\nwall_bound_kind=liveness\nwall_cap_s={LIVENESS_BOUND_S}\nprogram={program_name}\nunits_covered={units_covered}\ngap_sites={}\ntyped_zero_sites={typed_zero_count}\nanchored_sites={anchored_count}\nstatus=ok\nanalysis_head={}\nwall_s={:.3}\n{}memory_receipt_error=none\n",
             outcome.cap_verified,
@@ -10989,24 +11061,109 @@ mod tests {
     #[test]
     fn projected_gap_out_of_pointer_universe_is_conjunctive() {
         assert_eq!(
-            projected_gap_disposition(true, &[0]).unwrap(),
+            projected_gap_disposition(true, 0).unwrap(),
             ProjectedGapDisposition::OutOfPointerUniverse,
-            "a scalar destination with fully resolved pointer-free bases is typed zero"
+            "a plain pointer-free written field is typed zero"
         );
         assert_eq!(
-            projected_gap_disposition(true, &[0, 1]).unwrap(),
+            projected_gap_disposition(true, 1).unwrap(),
             ProjectedGapDisposition::RequiresGraphAnchor,
-            "a mixed/pointer-bearing base set must not become typed zero"
-        );
-        assert_eq!(
-            projected_gap_disposition(false, &[0]).unwrap(),
-            ProjectedGapDisposition::RequiresGraphAnchor,
-            "a non-scalar destination must retain an anchor requirement"
+            "a pointer-bearing written field must not become typed zero"
         );
         assert!(
-            projected_gap_disposition(true, &[]).is_err(),
-            "an empty base set remains unresolved"
+            projected_gap_disposition(false, 0).is_err(),
+            "a non-plain projection remains a STOP even when its value type is pointer-free"
         );
+    }
+
+    #[test]
+    fn field_level_gap_refinement_enforces_pointer_free_union_closure() {
+        let mixed = r#"
+            struct Mixed {
+                scalar: u16,
+                pointer: *mut u8,
+            }
+
+            pub unsafe fn store_scalar(value: *mut Mixed, scalar: u16) {
+                let alias = value;
+                (*alias).scalar = scalar;
+            }
+
+            pub unsafe fn store_pointer(value: *mut Mixed, pointer: *mut u8) {
+                let alias = value;
+                (*alias).pointer = pointer;
+            }
+        "#;
+        ::utils::compilation::run_compiler_on_str(mixed, |tcx| {
+            let (slots, graph, gaps) = collect_source_graph_gap_attribution(tcx)
+                .expect("plain mixed-struct fields must classify mechanically");
+            assert_eq!(gaps.len(), 1, "only the scalar store is outside the graph");
+            let (gap, resolved) = gaps.iter().next().unwrap();
+            assert!(gap.detail.contains("store_scalar"), "{gap:#?}");
+            assert_eq!(resolved.status, GapAnchorStatus::OutOfPointerUniverse);
+            assert!(resolved.nodes.is_empty());
+
+            let pointer = candidate_fields(tcx, &slots)
+                .keys()
+                .find(|field| field.ends_with("Mixed::field1@d0"))
+                .expect("mixed-struct pointer field")
+                .clone();
+            assert!(
+                trace_candidate(&graph, &pointer).iter().any(|root| root
+                    .evidence
+                    .flags
+                    .contains(&CauseFlag::ExternallySuppliedParameter)),
+                "the same struct's pointer-field store must remain graph-anchored"
+            );
+        })
+        .unwrap_or_else(|error| error.raise());
+
+        let pointer_free_union = r#"
+            union PointerFree {
+                scalar: u64,
+                words: [u16; 4],
+            }
+
+            pub unsafe fn store_closed_union(value: *mut PointerFree, scalar: u64) {
+                let alias = value;
+                (*alias).scalar = scalar;
+            }
+        "#;
+        ::utils::compilation::run_compiler_on_str(pointer_free_union, |tcx| {
+            let (_, _, gaps) = collect_source_graph_gap_attribution(tcx)
+                .expect("an all-members-pointer-free union satisfies the closure grammar");
+            assert_eq!(gaps.len(), 1);
+            let (gap, resolved) = gaps.iter().next().unwrap();
+            assert!(gap.detail.contains("store_closed_union"), "{gap:#?}");
+            assert_eq!(resolved.status, GapAnchorStatus::OutOfPointerUniverse);
+            assert!(resolved.nodes.is_empty());
+        })
+        .unwrap_or_else(|error| error.raise());
+
+        let pointer_bearing_union = r#"
+            union PointerBearing {
+                scalar: u64,
+                pointer: *mut u8,
+            }
+
+            pub unsafe fn store_open_union(value: *mut PointerBearing, scalar: u64) {
+                let alias = value;
+                (*alias).scalar = scalar;
+            }
+        "#;
+        ::utils::compilation::run_compiler_on_str(pointer_bearing_union, |tcx| {
+            let gaps = collect_source_graph_shape_gaps(tcx);
+            assert_eq!(
+                gaps.len(),
+                1,
+                "the closure violation must be one named STOP"
+            );
+            assert!(
+                gaps[0].detail.contains("pointer-bearing union"),
+                "the union-closure boundary must produce a named STOP: {gaps:#?}"
+            );
+        })
+        .unwrap_or_else(|error| error.raise());
     }
 
     #[test]
