@@ -434,6 +434,10 @@ pub(crate) fn splice_fn_prints_per_file(
 ) -> (
     std::collections::BTreeMap<super::plan::FileKey, String>,
     SubstStats,
+    // **I-31**: per-file emitted→original line translation. `pprust` reprints
+    // whole functions, so this layer's line numbers drift from the original's —
+    // measured at −36 on libtree. Built from the SAME edit vector spliced below.
+    std::collections::BTreeMap<super::plan::FileKey, super::apply::LineMap>,
 ) {
     let mut spans = Vec::new();
     collect_fn_spans(&krate.items, &mut spans);
@@ -524,9 +528,21 @@ pub(crate) fn splice_fn_prints_per_file(
     s.files_with_edits = per_file.values().filter(|(_, _, e)| !e.is_empty()).count();
 
     let mut out = std::collections::BTreeMap::new();
+    let mut maps = std::collections::BTreeMap::new();
     for (key, (src, _base, mut edits)) in per_file {
         // Back-to-front, exactly as `apply` does: offsets address the ORIGINAL.
         edits.sort_by_key(|(lo, _, _)| std::cmp::Reverse(*lo));
+        // **The map is built from the edits that will be APPLIED**, before the
+        // loop consumes them, and from the ORIGINAL text they address.
+        let applied: Vec<(usize, usize, String)> = edits
+            .iter()
+            .filter(|(lo, hi, _)| lo <= hi && *hi <= src.len())
+            .cloned()
+            .collect();
+        maps.insert(
+            key.clone(),
+            super::apply::LineMap::from_splices(&src, &applied),
+        );
         let mut text = src;
         for (lo, hi, replacement) in edits {
             if lo <= hi && hi <= text.len() {
@@ -537,7 +553,7 @@ pub(crate) fn splice_fn_prints_per_file(
         }
         out.insert(key, text);
     }
-    (out, s)
+    (out, s, maps)
 }
 
 /// **The root file alone**, for callers that emit one text: the string entry,
@@ -555,7 +571,7 @@ pub(crate) fn splice_fn_prints(
         .first()
         .map(|sp| tcx.sess.source_map().lookup_source_file(sp.lo()))
         .and_then(|f| super::file_key(&f.name));
-    let (files, s) = splice_fn_prints_per_file(tcx, krate, edited);
+    let (files, s, _) = splice_fn_prints_per_file(tcx, krate, edited);
     let text = root
         .and_then(|key| files.get(&key).cloned())
         .unwrap_or_default();

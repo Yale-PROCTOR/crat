@@ -1777,12 +1777,14 @@ pub(crate) fn ast_emitted_files_from(
     (
         std::collections::BTreeMap<super::plan::FileKey, String>,
         super::ast_bridge::SubstStats,
+        // **I-31**: the emitted document's line map, from the splicer.
+        std::collections::BTreeMap<super::plan::FileKey, super::apply::LineMap>,
     ),
     String,
 > {
     let (_, _, seams, _, _, _, _, krate, edited) = transform_with(capture, table, reverts)?;
     let edited: Vec<rustc_span::Span> = edited.into_iter().map(|(sp, _)| sp).collect();
-    let (mut files, stats) =
+    let (mut files, stats, maps) =
         super::ast_bridge::splice_fn_prints_per_file(tcx, &krate, Some(&edited));
     if seams.len_fabricated > 0 {
         // Root selection: the caller's key when it has one (the loop's round-0
@@ -1798,7 +1800,7 @@ pub(crate) fn ast_emitted_files_from(
             text.push('\n');
         }
     }
-    Ok((files, stats))
+    Ok((files, stats, maps))
 }
 
 pub(crate) fn ast_emitted_source_from(
@@ -2613,7 +2615,7 @@ pub(crate) fn edit_dump(
     // ---- AST layer -------------------------------------------------------
     let (_, _, _, _, _, _, _, krate, edited) = transform_with(&capture, &table, &reverts)?;
     let spans: Vec<rustc_span::Span> = edited.iter().map(|(sp, _)| *sp).collect();
-    let (files, stats) = super::ast_bridge::splice_fn_prints_per_file(tcx, &krate, Some(&spans));
+    let (files, stats, _) = super::ast_bridge::splice_fn_prints_per_file(tcx, &krate, Some(&spans));
     let _ = writeln!(
         o,
         "\n== AST LAYER ==\nclaimed_edits={} files_with_edits={} files_emitted={}",
@@ -2646,7 +2648,8 @@ pub(crate) fn edit_dump(
     let emission = super::emit_files(tcx, &table, &reverts.fns)?;
     let reverted_names: std::collections::BTreeSet<String> =
         reverts.names.iter().cloned().collect();
-    let (span_files, rollbacks) = super::render(&emission.plan, &emission.texts, &reverted_names);
+    let (span_files, rollbacks, _) =
+        super::render(&emission.plan, &emission.texts, &reverted_names);
     let planned: usize = emission.plan.by_file.values().map(Vec::len).sum();
     let _ = writeln!(
         o,
@@ -3074,13 +3077,13 @@ pub(crate) fn phase3_fn_parity(
     // re-renders with `reverts.names`, which is what production passes.
     let reverted_names: std::collections::BTreeSet<String> =
         reverts.names.iter().cloned().collect();
-    // **THE ROLLBACKS ARE NOT DISCARDED.** `let (files, _) = render(..)` is
+    // **THE ROLLBACKS ARE NOT DISCARDED.** `let (files, _, _) = render(..)` is
     // `let _ = s.finish()` wearing different clothes — the third appearance of
     // that shape in this milestone, and I wrote it inside the item repairing a
     // hazard. A rollback is the ONE production-coherence signal this gate
     // uniquely has: `apply` emits one when an edit could not be placed
     // coherently, and nothing else in either gate reads them.
-    let (rendered_files, rollbacks) =
+    let (rendered_files, rollbacks, _) =
         super::render(&emission.plan, &emission.texts, &reverted_names);
     p.render_rollbacks = rollbacks.len();
     for rb in rollbacks.iter().take(4) {
@@ -5104,7 +5107,7 @@ mod arm2_witnesses {
 
         // ---- POSITIVE: the two sides name the SAME function ----
         let reverted: std::collections::BTreeSet<String> = ["b".to_owned()].into_iter().collect();
-        let (rendered, rollbacks) = super::super::render(&planned, &texts, &reverted);
+        let (rendered, rollbacks, _) = super::super::render(&planned, &texts, &reverted);
         assert!(rollbacks.is_empty(), "the fixture places cleanly");
         let agree = compare_rendered(&reconstruct(&[2u32].into_iter().collect()), &rendered);
         assert_eq!(
@@ -5127,7 +5130,7 @@ mod arm2_witnesses {
         // reverted. Round 3 counted this as nothing, and the 5 programs it
         // excluded from the denominator were exactly the fully-reverted ones.
         let none_reverted: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-        let (all_rendered, _) = super::super::render(&planned, &texts, &none_reverted);
+        let (all_rendered, _, _) = super::super::render(&planned, &texts, &none_reverted);
         let both_withheld = reconstruct_kept_files(
             &planned,
             &texts,

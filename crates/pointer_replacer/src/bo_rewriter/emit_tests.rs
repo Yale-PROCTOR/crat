@@ -3996,7 +3996,15 @@ mod attribution_and_escapes {
         }];
         let diags = [diag("/crate/caller.rs", 10)];
 
-        let owners = attribute(&diags, root, &sites, &edits, &BTreeSet::new(), root);
+        let owners = attribute(
+            &diags,
+            &Default::default(),
+            root,
+            &sites,
+            &edits,
+            &BTreeSet::new(),
+            root,
+        );
         assert_eq!(
             owners.into_iter().collect::<Vec<_>>(),
             vec!["k::callee".to_owned()],
@@ -4004,7 +4012,15 @@ mod attribution_and_escapes {
              justifies the edit"
         );
 
-        let blind = attribute(&diags, root, &sites, &[], &BTreeSet::new(), root);
+        let blind = attribute(
+            &diags,
+            &Default::default(),
+            root,
+            &sites,
+            &[],
+            &BTreeSet::new(),
+            root,
+        );
         assert!(
             blind.is_empty(),
             "the pre-repair derivation must attribute this to NOBODY, or the \
@@ -4035,6 +4051,7 @@ mod attribution_and_escapes {
         }];
         let owners = attribute(
             &[diag("/crate/callee.rs", 20)],
+            &Default::default(),
             root,
             &sites,
             &edits,
@@ -4082,6 +4099,7 @@ mod attribution_and_escapes {
 
         let owners = attribute(
             &[diag("/crate/m.rs", 10)],
+            &Default::default(),
             root,
             &sites,
             &edits,
@@ -4313,7 +4331,7 @@ fn a_reverted_callee_takes_its_seams_with_it() {
     );
 
     // ---- side 1: callee survives ⇒ the glue is present ----
-    let (kept, _) = super::render(
+    let (kept, _, _) = super::render(
         &emission.plan,
         &emission.texts,
         &std::collections::BTreeSet::new(),
@@ -4325,7 +4343,7 @@ fn a_reverted_callee_takes_its_seams_with_it() {
 
     // ---- side 2: callee reverts ⇒ the glue vanishes ----
     let reverted: std::collections::BTreeSet<String> = [seam_owner].into_iter().collect();
-    let (after, _) = super::render(&emission.plan, &emission.texts, &reverted);
+    let (after, _, _) = super::render(&emission.plan, &emission.texts, &reverted);
     let text = text_for_any(&after).unwrap_or_default();
     assert!(
         !text.contains("Some("),
@@ -4401,7 +4419,7 @@ fn the_fabricated_const_follows_the_surviving_adapters() {
         );
 
         let consts = |reverted: &std::collections::BTreeSet<String>| -> usize {
-            let (files, rollbacks) = super::render(plan, texts, reverted);
+            let (files, rollbacks, _) = super::render(plan, texts, reverted);
             assert!(rollbacks.is_empty(), "the insertion must not collide");
             files
                 .values()
@@ -4428,7 +4446,7 @@ fn the_fabricated_const_follows_the_surviving_adapters() {
         // Without this the whole placement rule — end of the crate ROOT file —
         // would be witnessed by a `.matches()` on a string, which an insertion
         // ahead of the inner attributes would satisfy just as well.
-        let (files, _) = super::render(plan, texts, &std::collections::BTreeSet::new());
+        let (files, _, _) = super::render(plan, texts, &std::collections::BTreeSet::new());
         let emitted = files.values().next().expect("one emitted file").clone();
         assert!(
             emitted.contains("crate::SEAM_LEN_PLACEHOLDER"),
@@ -4504,7 +4522,7 @@ fn render_outside_a_compiler_session_still_delivers_the_const() {
     );
 
     // ---- and NOW, with no session anywhere on this thread ----
-    let (files, rollbacks) = super::render(&plan, &texts, &std::collections::BTreeSet::new());
+    let (files, rollbacks, _) = super::render(&plan, &texts, &std::collections::BTreeSet::new());
     assert!(rollbacks.is_empty());
     let n: usize = files
         .values()

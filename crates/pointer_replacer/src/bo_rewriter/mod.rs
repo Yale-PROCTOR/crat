@@ -764,13 +764,17 @@ fn round_files(
         // coincide because `render` returns only edited files; on the AST layer
         // they do not, because the map is seeded (see `SubstStats`).
         usize,
+        // **I-31**: emitted→original line translation, per file, from whichever
+        // splicer produced this round. `attribute` cannot key a diagnostic to a
+        // function without it once the emitter reflows.
+        std::collections::BTreeMap<plan::FileKey, apply::LineMap>,
     ),
     String,
 > {
     if !ast {
-        let (files, rollbacks) = render(emission_plan, emission_texts, reverted);
+        let (files, rollbacks, maps) = render(emission_plan, emission_texts, reverted);
         let edited = files.len();
-        return Ok((files, rollbacks, edited));
+        return Ok((files, rollbacks, edited, maps));
     }
     let reverts = ast_transform::revert_set_from_names(tcx, reverted)?;
     // **PER-FILE (A1, revived 2026-08-18).** The one-entry map that stood here
@@ -779,9 +783,9 @@ fn round_files(
     // verify loop's own end-to-end witnesses, which ARE multi-file, and which
     // it silently collapsed. The corpus emission is unchanged by this: a
     // single-file crate yields a single-entry map either way.
-    let (files, stats) =
+    let (files, stats, maps) =
         ast_transform::ast_emitted_files_from(tcx, capture, &reverts, root_key, table)?;
-    Ok((files, Vec::new(), stats.files_with_edits))
+    Ok((files, Vec::new(), stats.files_with_edits, maps))
 }
 
 fn verify_and_revert(
@@ -900,7 +904,7 @@ fn verify_and_revert(
     // The incoming `files` is still what `root_key` is taken from and what the
     // pre-loop rollback gate judged — that gate validates the PLAN (byte-offset
     // collisions), which is layer-independent, so it keeps its meaning.
-    let (mut files, mut files_edited) = match round_files(
+    let (mut files, mut files_edited, mut line_maps) = match round_files(
         tcx,
         capture,
         &emission_plan,
@@ -910,7 +914,7 @@ fn verify_and_revert(
         table,
         ast,
     ) {
-        Ok((round0, rollbacks, edited)) => {
+        Ok((round0, rollbacks, edited, maps)) => {
             if !rollbacks.is_empty() {
                 // The pre-loop structural gate already rejected a non-empty
                 // rollback set for this plan, so this is a DISAGREEMENT between
@@ -921,7 +925,7 @@ fn verify_and_revert(
                     rollbacks.len()
                 ));
             }
-            (round0, edited)
+            (round0, edited, maps)
         }
         Err(why) => {
             facts.files_touched = files_edited;
@@ -1054,6 +1058,8 @@ fn verify_and_revert(
 
         let newly = attribute(
             &novel,
+            // The map of the round whose program produced these diagnostics.
+            &line_maps,
             &observed_root,
             &facts.emitted_sites,
             &planned_edit_sites,
@@ -1074,7 +1080,7 @@ fn verify_and_revert(
         // BATCH revert: the union of this round's attributions, not one
         // at a time — one compile per round rather than one per function.
         reverted.extend(newly);
-        let (next_files, rollbacks, next_edited) = match round_files(
+        let (next_files, rollbacks, next_edited, next_maps) = match round_files(
             tcx,
             capture,
             &emission_plan,
@@ -1084,7 +1090,7 @@ fn verify_and_revert(
             table,
             ast,
         ) {
-            Ok(triple) => triple,
+            Ok(quad) => quad,
             Err(why) => {
                 escalation = Some(format!("escalation-required: re-emit failed: {why}"));
                 break;
@@ -1099,6 +1105,7 @@ fn verify_and_revert(
         }
         files = next_files;
         files_edited = next_edited;
+        line_maps = next_maps;
     }
 
     // ---- (C) BISECT: the escalation path ----
@@ -1156,7 +1163,7 @@ fn verify_and_revert(
     }
 
     let (final_reverted, probes) = bisect(&candidates, &reverted, |trial| {
-        let Ok((trial_files, rollbacks, _)) = round_files(
+        let Ok((trial_files, rollbacks, _, _)) = round_files(
             tcx,
             capture,
             &emission_plan,
@@ -1192,7 +1199,7 @@ fn verify_and_revert(
     // `round_files`' own doc names — a program returned that is not the
     // program the probes verified — and it also left M-3 with an escalation
     // path that has no implementation once `render` is deleted.
-    let (final_files, rollbacks, final_edited) = match round_files(
+    let (final_files, rollbacks, final_edited, _final_maps) = match round_files(
         tcx,
         capture,
         &emission_plan,
@@ -1202,7 +1209,7 @@ fn verify_and_revert(
         table,
         ast,
     ) {
-        Ok(triple) => triple,
+        Ok(quad) => quad,
         Err(why) => {
             // The bisect already found a compiling set; failing to re-emit it
             // is a loud degrade, never a silent fall back to the other layer.
@@ -1998,6 +2005,10 @@ fn edit_sites(
 /// `attribution_blind` is what counts it.
 fn attribute(
     diags: &[verify::Diag],
+    // **I-31**: emitted→original line translation, per file, produced by the
+    // splicer that emitted this round. Without it the comparison below matches
+    // a line in the EMITTED program against ranges measured in the ORIGINAL.
+    line_maps: &std::collections::BTreeMap<plan::FileKey, apply::LineMap>,
     observed_root: &std::path::Path,
     sites: &[EmittedSite],
     edits: &[EditSite],
@@ -2042,13 +2053,44 @@ fn attribute(
         files.len() <= 1
     };
     let mut owners = std::collections::BTreeSet::new();
+    // Crate-relative keys, so a diagnostic's file can find its map: the maps
+    // are keyed by the ORIGINAL path, the diagnostic names a path in the
+    // materialized copy.
+    let maps_by_rel: std::collections::BTreeMap<String, &apply::LineMap> = line_maps
+        .iter()
+        .filter_map(|(key, map)| match key {
+            plan::FileKey::Real(path) => Some((
+                verify::crate_relative(&path.display().to_string(), original_root),
+                map,
+            )),
+            plan::FileKey::Virtual(name) => Some((name.clone(), map)),
+        })
+        .collect();
     for diag in diags {
         let diag_rel = verify::crate_relative(&diag.file, observed_root);
+        // **THE TRANSLATION** (I-31). `diag.line` indexes the EMITTED document;
+        // every range below was measured in the ORIGINAL. `render` kept the two
+        // within a line, so this was invisible for the whole span era;
+        // `pprust` reprints whole functions and the drift reaches −36 on
+        // libtree, which silently reverts functions that did nothing wrong.
+        //
+        // Single-file crates (all 20, C-20) have exactly one map, so the
+        // lookup falls back to it rather than failing on a path mismatch —
+        // and a MISSING map means "no splice happened", where the identity is
+        // correct, not a reason to skip attribution.
+        let diag_line = maps_by_rel
+            .get(&diag_rel)
+            .or(if maps_by_rel.len() == 1 {
+                maps_by_rel.values().next()
+            } else {
+                None
+            })
+            .map_or(diag.line, |map| map.to_original(diag.line));
         let mut by_edit = std::collections::BTreeSet::new();
         for edit in &edits {
             let same_file =
                 single_file || verify::crate_relative(&edit.file, original_root) == diag_rel;
-            if same_file && edit.lo_line <= diag.line && diag.line <= edit.hi_line {
+            if same_file && edit.lo_line <= diag_line && diag_line <= edit.hi_line {
                 by_edit.insert(edit.fn_path.clone());
             }
         }
@@ -2059,7 +2101,7 @@ fn attribute(
         for site in sites {
             let same_file =
                 single_file || verify::crate_relative(&site.file, original_root) == diag_rel;
-            if same_file && site.lo_line <= diag.line && diag.line <= site.hi_line {
+            if same_file && site.lo_line <= diag_line && diag_line <= site.hi_line {
                 owners.insert(site.fn_path.clone());
             }
         }
@@ -2133,9 +2175,12 @@ pub(crate) fn render(
 ) -> (
     std::collections::BTreeMap<plan::FileKey, String>,
     Vec<apply::Rollback>,
+    // **I-31**: per-file emitted→original line translation, from the splicer.
+    std::collections::BTreeMap<plan::FileKey, apply::LineMap>,
 ) {
     let mut files = std::collections::BTreeMap::new();
     let mut rollbacks = Vec::new();
+    let mut maps = std::collections::BTreeMap::new();
     // Revert by JUSTIFICATION, not geography: an edit survives only if the
     // subject that justifies it has not been taken back.
     let mut kept_by_file: std::collections::BTreeMap<plan::FileKey, Vec<plan::Edit>> = planned
@@ -2197,9 +2242,10 @@ pub(crate) fn render(
         };
         let applied = apply::apply(source, kept);
         rollbacks.extend(applied.rollbacks);
+        maps.insert(key.clone(), applied.line_map);
         files.insert(key.clone(), applied.source);
     }
-    (files, rollbacks)
+    (files, rollbacks, maps)
 }
 
 /// A source file's identity for editing. `None` for anything not written back
@@ -2304,7 +2350,7 @@ pub(crate) fn emit_files<'tcx>(
     {
         texts.insert(root, source);
     }
-    let (files, rollbacks) = render(&planned, &texts, &std::collections::BTreeSet::new());
+    let (files, rollbacks, _) = render(&planned, &texts, &std::collections::BTreeSet::new());
     Ok(Emission {
         files,
         rollbacks,
