@@ -4840,6 +4840,23 @@ fn parse_walker_barrier_rows(path: &Path, program: &str) -> Result<Vec<Vec<Strin
     Ok(rows)
 }
 
+fn walker_audit_certified_count(
+    expected: usize,
+    emitted_rows: usize,
+    barrier_blocked: usize,
+    deferred: usize,
+) -> Result<usize, String> {
+    let certified = emitted_rows.checked_sub(barrier_blocked).ok_or_else(|| {
+        "walker audit has more barrier-blocked candidates than emitted rows".to_owned()
+    })?;
+    if certified + deferred != expected {
+        return Err(format!(
+            "walker audit denominator drift: expected={expected} emitted_rows={emitted_rows} barrier_blocked={barrier_blocked} deferred={deferred} certified={certified}"
+        ));
+    }
+    Ok(certified)
+}
+
 fn run_source_walker_impact_worker(tcx: TyCtxt<'_>, t_tcx: Duration) -> Row {
     let started = Instant::now();
     let program = std::env::var("CRAT_BOC1_NAME").expect("walker-impact program name");
@@ -10993,9 +11010,39 @@ struct WalkerImpactProgramRecord {
     candidates: usize,
     affected: usize,
     audit_blocked: usize,
+    audit_deferred: usize,
     manifest: String,
-    wall_s: f64,
-    memory_peaks: CandidateMemoryPeaks,
+    wall_s: Option<f64>,
+    memory_peaks: Option<CandidateMemoryPeaks>,
+}
+
+fn write_walker_impact_partial(root: &Path, records: &[WalkerImpactProgramRecord]) {
+    let mut partial = "program\tcandidates\taffected\taudit_blocked\taudit_deferred\tmanifest_sha256\twall_s\tpeak_rss_kb\tcgroup_peak_memory_kb\n".to_owned();
+    for record in records {
+        partial.push_str(&format!(
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+            record.program,
+            record.candidates,
+            record.affected,
+            record.audit_blocked,
+            record.audit_deferred,
+            record.manifest,
+            record.wall_s.map_or_else(
+                || NO_CANDIDATE_PROCESS_METRIC.to_owned(),
+                |wall_s| format!("{wall_s:.3}"),
+            ),
+            record.memory_peaks.map_or_else(
+                || NO_CANDIDATE_PROCESS_METRIC.to_owned(),
+                |peaks| peaks.process_peak_rss_kb.to_string(),
+            ),
+            record.memory_peaks.map_or_else(
+                || NO_CANDIDATE_PROCESS_METRIC.to_owned(),
+                |peaks| peaks.cgroup_peak_memory_kb.to_string(),
+            ),
+        ));
+    }
+    write_atomic_checkpoint(&root.join("partial.tsv"), &partial)
+        .expect("write walker-impact partial");
 }
 
 fn run_source_walker_impact_audit(contract: &MeasurementContract) {
@@ -11019,6 +11066,7 @@ fn run_source_walker_impact_audit(contract: &MeasurementContract) {
     let mut records = Vec::new();
     let mut all_rows = Vec::new();
     let mut all_barrier_rows = Vec::new();
+    let mut audit_deferrals = Vec::<Vec<String>>::new();
     for program_name in scope {
         let program = contract
             .programs
@@ -11026,6 +11074,10 @@ fn run_source_walker_impact_audit(contract: &MeasurementContract) {
             .copied()
             .find(|program| program.name == program_name)
             .expect("walker-impact program in measurement contract");
+        let expected = isolated_identities(contract, program_name)
+            .into_iter()
+            .map(|identity| identity.identity.field_key)
+            .collect::<BTreeSet<_>>();
         let dir = root.join(program_name);
         fs::create_dir(&dir).expect("create walker-impact program directory");
         let preflight = fs::read_to_string("/proc/meminfo")
@@ -11048,12 +11100,33 @@ fn run_source_walker_impact_audit(contract: &MeasurementContract) {
         if !preflight.launch_allowed() {
             let manifest = write_manifest(&dir, &["memory-preflight.txt"])
                 .expect("manifest failed walker-impact preflight");
-            panic!(
-                "A4C STOP phase=walker-impact-memory-preflight candidate={program_name} status={} mem_available_bytes={} required_bytes={} measurement_started=false manifest={manifest}",
-                preflight.status,
-                preflight.mem_available_bytes.unwrap_or(0),
-                preflight.required_bytes,
-            );
+            for field_key in &expected {
+                audit_deferrals.push(vec![
+                    program_name.to_owned(),
+                    field_key.clone(),
+                    "typed-setup-deferral".to_owned(),
+                    "memory-preflight".to_owned(),
+                    "1".to_owned(),
+                    format!(
+                        "status={};mem_available_bytes={};required_bytes={};manifest={manifest}",
+                        preflight.status,
+                        preflight.mem_available_bytes.unwrap_or(0),
+                        preflight.required_bytes,
+                    ),
+                ]);
+            }
+            records.push(WalkerImpactProgramRecord {
+                program: program_name.to_owned(),
+                candidates: expected.len(),
+                affected: 0,
+                audit_blocked: 0,
+                audit_deferred: expected.len(),
+                manifest,
+                wall_s: None,
+                memory_peaks: None,
+            });
+            write_walker_impact_partial(&root, &records);
+            continue;
         }
 
         let waiver_path = dir.join("gap-waivers.tsv");
@@ -11109,7 +11182,8 @@ fn run_source_walker_impact_audit(contract: &MeasurementContract) {
         if outcome.status != "ok" {
             let (phase, candidate) = last_phase(&outcome.stderr);
             let receipt = format!(
-                "machine_id={MACHINE_ID}\nplatform={PLATFORM}\nmeasurement_class=graph-only-reachability-impact\nsemantic_data=false\ncompleted=false\ncandidate_processing=graph-only\nsource_walker_version={SOURCE_WALKER_VERSION}\nmemory_limit=cgroup-100GiB\nmemory_max_bytes={CANDIDATE_MEMORY_MAX_BYTES}\ncap_verified={}\noom_kills={}\nmemory_max_events={}\nwall_bound_kind=liveness\nwall_cap_s={LIVENESS_BOUND_S}\nprogram={program_name}\nstatus={}\nanalysis_head={}\nlast_phase={phase}\nlast_candidate={candidate}\nwall_s={:.3}\n{}memory_receipt_error={}\n",
+                "machine_id={MACHINE_ID}\nplatform={PLATFORM}\nmeasurement_class=graph-only-reachability-impact\nsemantic_data=false\ncompleted=false\naudit_certified=false\ndisposition=typed-graph-construction-deferral\ndeferred_candidates={}\ncandidate_processing=graph-only\nsource_walker_version={SOURCE_WALKER_VERSION}\nmemory_limit=cgroup-100GiB\nmemory_max_bytes={CANDIDATE_MEMORY_MAX_BYTES}\ncap_verified={}\noom_kills={}\nmemory_max_events={}\nwall_bound_kind=liveness\nwall_cap_s={LIVENESS_BOUND_S}\nprogram={program_name}\nstatus={}\nanalysis_head={}\nlast_phase={phase}\nlast_candidate={candidate}\nwall_s={:.3}\n{}memory_receipt_error={}\n",
+                expected.len(),
                 outcome.cap_verified,
                 outcome.oom_kills,
                 outcome.memory_max_events,
@@ -11141,10 +11215,31 @@ fn run_source_walker_impact_audit(contract: &MeasurementContract) {
             }
             let manifest =
                 write_manifest(&dir, &files).expect("manifest failed walker-impact worker");
-            panic!(
-                "A4C STOP phase={phase} candidate={candidate} program={program_name} measurement=walker-impact status={} wall_s={:.3} manifest={manifest}",
-                outcome.status, outcome.wall_s,
-            );
+            for field_key in &expected {
+                audit_deferrals.push(vec![
+                    program_name.to_owned(),
+                    field_key.clone(),
+                    "typed-graph-construction-deferral".to_owned(),
+                    "program-worker-stop".to_owned(),
+                    "1".to_owned(),
+                    format!(
+                        "phase={phase};status={};manifest={manifest}",
+                        outcome.status
+                    ),
+                ]);
+            }
+            records.push(WalkerImpactProgramRecord {
+                program: program_name.to_owned(),
+                candidates: expected.len(),
+                affected: 0,
+                audit_blocked: 0,
+                audit_deferred: expected.len(),
+                manifest,
+                wall_s: Some(outcome.wall_s),
+                memory_peaks: outcome.memory_receipt.require_complete().ok(),
+            });
+            write_walker_impact_partial(&root, &records);
+            continue;
         }
 
         let memory_peaks = outcome
@@ -11170,10 +11265,6 @@ fn run_source_walker_impact_audit(contract: &MeasurementContract) {
                     "A4C STOP phase=walker-impact-barrier-schema candidate={program_name}: {error}"
                 )
             });
-        let expected = isolated_identities(contract, program_name)
-            .into_iter()
-            .map(|identity| identity.identity.field_key)
-            .collect::<BTreeSet<_>>();
         let actual = rows
             .iter()
             .map(|row| row[1].clone())
@@ -11320,6 +11411,16 @@ fn run_source_walker_impact_audit(contract: &MeasurementContract) {
                 blocked_candidates.join(",")
             },
         );
+        for row in barrier_rows.iter().filter(|row| row[2] == "audit-blocked") {
+            audit_deferrals.push(vec![
+                row[0].clone(),
+                row[1].clone(),
+                "typed-domain-gap-deferral".to_owned(),
+                "reachable-barrier".to_owned(),
+                row[3].clone(),
+                row[4].clone(),
+            ]);
+        }
         all_rows.extend(rows);
         all_barrier_rows.extend(barrier_rows);
         records.push(WalkerImpactProgramRecord {
@@ -11327,26 +11428,12 @@ fn run_source_walker_impact_audit(contract: &MeasurementContract) {
             candidates: expected.len(),
             affected,
             audit_blocked,
+            audit_deferred: audit_blocked,
             manifest,
-            wall_s: outcome.wall_s,
-            memory_peaks,
+            wall_s: Some(outcome.wall_s),
+            memory_peaks: Some(memory_peaks),
         });
-        let mut partial = "program\tcandidates\taffected\taudit_blocked\tmanifest_sha256\twall_s\tpeak_rss_kb\tcgroup_peak_memory_kb\n".to_owned();
-        for record in &records {
-            partial.push_str(&format!(
-                "{}\t{}\t{}\t{}\t{}\t{:.3}\t{}\t{}\n",
-                record.program,
-                record.candidates,
-                record.affected,
-                record.audit_blocked,
-                record.manifest,
-                record.wall_s,
-                record.memory_peaks.process_peak_rss_kb,
-                record.memory_peaks.cgroup_peak_memory_kb,
-            ));
-        }
-        write_atomic_checkpoint(&root.join("partial.tsv"), &partial)
-            .expect("write walker-impact partial");
+        write_walker_impact_partial(&root, &records);
     }
 
     let mut impact = format!(
@@ -11367,7 +11454,9 @@ fn run_source_walker_impact_audit(contract: &MeasurementContract) {
         .expect("write aggregate walker barrier rows");
     let predecessor_reruns = records
         .iter()
-        .filter(|record| record.program != "bzip2" && record.affected > 0)
+        .filter(|record| {
+            record.program != "bzip2" && record.affected > 0 && record.audit_deferred == 0
+        })
         .map(|record| (record.program.as_str(), record.affected))
         .collect::<Vec<_>>();
     let mut reruns = "program\taffected_candidates\n".to_owned();
@@ -11376,36 +11465,55 @@ fn run_source_walker_impact_audit(contract: &MeasurementContract) {
     }
     write_atomic_checkpoint(&root.join("predecessor-reruns.tsv"), &reruns)
         .expect("write predecessor rerun list");
-    let mut deferrals = "program\tfield_key\tdisposition\tbarrier_count\twitnesses\n".to_owned();
-    for row in all_barrier_rows
-        .iter()
-        .filter(|row| row[2] == "audit-blocked")
-    {
-        deferrals.push_str(&format!(
-            "{}\t{}\ttyped-domain-gap-deferral\t{}\t{}\n",
-            row[0], row[1], row[3], row[4]
-        ));
+    let mut deferrals =
+        "program\tfield_key\tdisposition\tevidence_kind\tevidence_count\twitnesses\n".to_owned();
+    let mut deferred_identities = BTreeSet::new();
+    for row in &audit_deferrals {
+        assert_eq!(row.len(), 6);
+        assert!(
+            deferred_identities.insert((row[0].clone(), row[1].clone())),
+            "A4C STOP phase=walker-impact-deferral-schema candidate={}: duplicate deferred identity",
+            row[1]
+        );
+        deferrals.push_str(&format!("{}\n", row.join("\t")));
     }
-    write_atomic_checkpoint(&root.join("barrier-deferrals.tsv"), &deferrals)
-        .expect("write walker barrier deferral ledger");
-    let wall_sum = records.iter().map(|record| record.wall_s).sum::<f64>();
+    write_atomic_checkpoint(&root.join("audit-deferrals.tsv"), &deferrals)
+        .expect("write walker audit deferral ledger");
+    let wall_sum = records
+        .iter()
+        .filter_map(|record| record.wall_s)
+        .sum::<f64>();
     let peak_rss = records
         .iter()
-        .map(|record| record.memory_peaks.process_peak_rss_kb)
+        .filter_map(|record| record.memory_peaks.map(|peaks| peaks.process_peak_rss_kb))
         .max()
         .unwrap_or(0);
     let cgroup_peak = records
         .iter()
-        .map(|record| record.memory_peaks.cgroup_peak_memory_kb)
+        .filter_map(|record| record.memory_peaks.map(|peaks| peaks.cgroup_peak_memory_kb))
         .max()
         .unwrap_or(0);
+    let expected_total = records
+        .iter()
+        .map(|record| record.candidates)
+        .sum::<usize>();
     let affected_total = all_rows.iter().filter(|row| row[2] == "affected").count();
     let audit_blocked_total = all_barrier_rows
         .iter()
         .filter(|row| row[2] == "audit-blocked")
         .count();
+    let audit_deferred_total = audit_deferrals.len();
+    let certified_total = walker_audit_certified_count(
+        expected_total,
+        all_rows.len(),
+        audit_blocked_total,
+        audit_deferred_total,
+    )
+    .unwrap_or_else(|error| {
+        panic!("A4C STOP phase=walker-impact-denominator candidate=none: {error}")
+    });
     let report = format!(
-        "# Nested-reference walker impact audit\n\n- walker: `{SOURCE_WALKER_VERSION}`\n- scope: bzip2 positive control plus 15 manifested predecessors\n- candidates audited: {}\n- affected candidates: {affected_total}\n- audit-blocked candidates deferred: {audit_blocked_total}\n- barrier disposition: disjoint candidates certified; reachable barriers entered in `barrier-deferrals.tsv` as typed domain-gap deferrals\n- affected predecessor programs: {}\n- semantic data: false\n- wall sum on {MACHINE_ID}: {wall_sum:.3} s\n- peak GNU-time RSS: {peak_rss} KiB\n- peak cgroup memory: {cgroup_peak} KiB\n",
+        "# Nested-reference walker impact audit\n\n- walker: `{SOURCE_WALKER_VERSION}`\n- scope: bzip2 positive control plus 15 manifested predecessors\n- candidates expected: {expected_total}\n- candidate rows emitted: {}\n- candidates certified: {certified_total}\n- candidates typed-deferred: {audit_deferred_total}\n- affected candidates: {affected_total}\n- reachable-barrier candidates deferred: {audit_blocked_total}\n- deferral disposition: exact receipts and witnesses are carried in `audit-deferrals.tsv`; no impact or barrier row is fabricated\n- affected predecessor programs: {}\n- semantic data: false\n- wall sum on {MACHINE_ID}: {wall_sum:.3} s\n- peak GNU-time RSS: {peak_rss} KiB\n- peak cgroup memory: {cgroup_peak} KiB\n",
         all_rows.len(),
         if predecessor_reruns.is_empty() {
             "none".to_owned()
@@ -11419,7 +11527,7 @@ fn run_source_walker_impact_audit(contract: &MeasurementContract) {
     );
     fs::write(root.join("report.md"), report).expect("write walker-impact report");
     let provenance = format!(
-        "machine_id={MACHINE_ID}\nplatform={PLATFORM}\nanalysis_head={}\nanalysis_branch=codex/a4-source-census\nmeasurement_class=graph-only-reachability-impact\nsemantic_data=false\nsource_walker_version={SOURCE_WALKER_VERSION}\nderived_substrate_digest={DERIVED_SUBSTRATE_DIGEST}\nwall_bound_kind=liveness\nwall_cap_s={LIVENESS_BOUND_S}\nmemory_limit=cgroup-100GiB\nprograms={}\ncandidates={}\naffected_candidates={affected_total}\naudit_blocked_candidates={audit_blocked_total}\nbarrier_disposition=disjoint-certified;reachable-typed-domain-gap-deferred\naffected_predecessor_programs={}\nprogram_manifests={}\nwall_sum_s={wall_sum:.3}\npeak_rss_kb={peak_rss}\ncgroup_peak_memory_kb={cgroup_peak}\ntiming_comparison=forbidden-across-machines\n",
+        "machine_id={MACHINE_ID}\nplatform={PLATFORM}\nanalysis_head={}\nanalysis_branch=codex/a4-source-census\nmeasurement_class=graph-only-reachability-impact\nsemantic_data=false\nsource_walker_version={SOURCE_WALKER_VERSION}\nderived_substrate_digest={DERIVED_SUBSTRATE_DIGEST}\nwall_bound_kind=liveness\nwall_cap_s={LIVENESS_BOUND_S}\nmemory_limit=cgroup-100GiB\nprograms={}\ncandidates_expected={expected_total}\ncandidate_rows_emitted={}\ncandidates_certified={certified_total}\ncandidates_typed_deferred={audit_deferred_total}\naffected_candidates={affected_total}\naudit_blocked_candidates={audit_blocked_total}\ndeferral_policy=receipt-first;no-fabricated-impact-or-barrier-rows\naffected_predecessor_programs={}\nprogram_manifests={}\nwall_sum_s={wall_sum:.3}\npeak_rss_kb={peak_rss}\ncgroup_peak_memory_kb={cgroup_peak}\ntiming_comparison=forbidden-across-machines\n",
         contract.head,
         records
             .iter()
@@ -11442,7 +11550,7 @@ fn run_source_walker_impact_audit(contract: &MeasurementContract) {
     let manifest = write_manifest(
         &root,
         &[
-            "barrier-deferrals.tsv",
+            "audit-deferrals.tsv",
             "barrier-impact.tsv",
             "impact.tsv",
             "partial.tsv",
@@ -11453,7 +11561,7 @@ fn run_source_walker_impact_audit(contract: &MeasurementContract) {
     )
     .expect("manifest walker-impact aggregate");
     eprintln!(
-        "A4C walker-impact complete manifest={manifest} walker={SOURCE_WALKER_VERSION} affected_candidates={affected_total} audit_blocked_candidates={audit_blocked_total} predecessor_reruns={}",
+        "A4C walker-impact complete manifest={manifest} walker={SOURCE_WALKER_VERSION} expected_candidates={expected_total} certified_candidates={certified_total} typed_deferred_candidates={audit_deferred_total} affected_candidates={affected_total} predecessor_reruns={}",
         predecessor_reruns
             .iter()
             .map(|(program, count)| format!("{program}:{count}"))
@@ -13421,6 +13529,22 @@ mod tests {
                 .is_empty(),
             "a disconnected barrier must certify disjoint"
         );
+    }
+
+    #[test]
+    fn walker_audit_deferrals_conserve_the_expected_denominator() {
+        assert_eq!(
+            walker_audit_certified_count(3, 3, 1, 1).unwrap(),
+            2,
+            "one emitted barrier-blocked row is deferred rather than certified"
+        );
+        assert_eq!(
+            walker_audit_certified_count(3, 0, 0, 3).unwrap(),
+            0,
+            "a program-level worker stop defers every missing candidate row"
+        );
+        assert!(walker_audit_certified_count(3, 2, 0, 0).is_err());
+        assert!(walker_audit_certified_count(3, 0, 1, 3).is_err());
     }
 
     #[test]
