@@ -8185,10 +8185,10 @@ mod run {
             }
         };
         let origin = src.display().to_string();
-        match crate::bo_rewriter::ast_transform::edit_dump(tcx, &text, &origin) {
+        let dir = super::orchestrate::out_dir().join("m1-editdump");
+        let _ = std::fs::create_dir_all(&dir);
+        match crate::bo_rewriter::ast_transform::edit_dump(tcx, &text, &origin, Some(&dir)) {
             Ok(body) => {
-                let dir = super::orchestrate::out_dir().join("m1-editdump");
-                let _ = std::fs::create_dir_all(&dir);
                 let path = dir.join(format!("{name}.txt"));
                 match std::fs::write(&path, &body) {
                     Ok(()) => {

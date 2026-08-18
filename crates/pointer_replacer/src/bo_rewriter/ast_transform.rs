@@ -2560,6 +2560,10 @@ pub(crate) fn edit_dump(
     tcx: rustc_middle::ty::TyCtxt<'_>,
     reverts_text: &str,
     reverts_origin: &str,
+    // **WHERE TO WRITE THE TWO EMITTED PROGRAMS.** `None` reports byte counts
+    // only. Byte counts say THAT the layers differ; a promote-failure specimen
+    // needs to show WHERE, and the emitted text is the only thing that can.
+    texts_out: Option<&std::path::Path>,
 ) -> Result<String, String> {
     use std::fmt::Write as _;
 
@@ -2699,6 +2703,25 @@ pub(crate) fn edit_dump(
         let _ = writeln!(o, "-- {key:?}");
         let _ = writeln!(o, "   ast  = {}", verdict(files.get(key)));
         let _ = writeln!(o, "   span = {}", verdict(span_files.get(key)));
+        if let Some(dir) = texts_out {
+            let stem = match key {
+                super::plan::FileKey::Real(path) => path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "unnamed".to_owned()),
+                _ => "virtual".to_owned(),
+            };
+            for (label, text) in [("ast", files.get(key)), ("span", span_files.get(key))] {
+                // A layer that emitted nothing writes NO file, rather than an
+                // empty one: "did not emit" and "emitted nothing" are different
+                // facts, and a zero-byte file conflates them.
+                if let Some(text) = text {
+                    let at = dir.join(format!("{stem}.{label}"));
+                    let _ = std::fs::write(&at, text);
+                    let _ = writeln!(o, "   {label} text -> {}", at.display());
+                }
+            }
+        }
     }
     Ok(o)
 }
