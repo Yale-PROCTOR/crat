@@ -45,6 +45,9 @@ pub(super) fn assess(
     let mut class2_params: FxHashMap<LocalDefId, Vec<Local>> = FxHashMap::default();
     let mut class2_local_bases: FxHashMap<String, usize> = FxHashMap::default();
     let mut callsite_bases: FxHashMap<String, usize> = FxHashMap::default();
+    // stage-0 gap set: params tainted may-negative but not definitely negative
+    let mut gap_shapes: FxHashMap<String, usize> = FxHashMap::default();
+    let mut gap_params = 0usize;
 
     // pass 1: classify cursor params and definitely-negative non-param locals
     for &did in &input.functions {
@@ -96,6 +99,35 @@ pub(super) fn assess(
         }
     }
 
+    // pass 1b: the gap set, measured from the sign analysis alone so it is
+    // independent of demotion having already turned these params into slices.
+    // a param is in the gap when taint reaches it (`access_signs`: it would
+    // need a cursor under a sound criterion) but it is not definitely negative
+    // (`definite_signs`) -- i.e. where cursor selection rests on imprecision
+    // rather than on proof. bucketed by which fact family would refute it.
+    for &did in &input.functions {
+        let body = tcx.mir_drops_elaborated_and_const_checked(did).borrow();
+        let Some(access) = analysis.offset_sign_result.access_signs.get(&did) else {
+            continue;
+        };
+        let definite = analysis.offset_sign_result.definite_signs.get(&did);
+        for local in body.args_iter() {
+            if !access.contains(local) || definite.is_some_and(|d| d.contains(local)) {
+                continue;
+            }
+            gap_params += 1;
+            let shapes = shape_summary(analysis, did, local);
+            eprintln!(
+                "CURSOR-GAP param fn={} local={:?} shapes=[{}] seeds=[{}]",
+                tcx.def_path_str(did),
+                local,
+                shapes,
+                seed_summary(analysis, tcx, did, local),
+            );
+            *gap_shapes.entry(shapes).or_default() += 1;
+        }
+    }
+
     // pass 2: provenance of every call-site argument feeding a class-2 param
     for &did in &input.functions {
         let body = tcx.mir_drops_elaborated_and_const_checked(did).borrow();
@@ -142,6 +174,21 @@ pub(super) fn assess(
         callsite_bases,
         class2_local_bases,
     );
+    let mut gap_shapes: Vec<_> = gap_shapes.into_iter().collect();
+    gap_shapes.sort();
+    eprintln!("CURSOR-GAP summary gap_params={gap_params} shapes={gap_shapes:?}");
+}
+
+/// deduplicated, sorted shape names of the seeds reaching this local; these
+/// bucket the gap set by which non-negativity fact would refute the taint
+fn shape_summary(analysis: &Analysis, did: LocalDefId, local: Local) -> String {
+    let Some(seeds) = analysis.offset_sign_result.reaching_seeds.get(&(did, local)) else {
+        return "via-alias-group".to_string();
+    };
+    let mut shapes: Vec<&'static str> = seeds.iter().map(|seed| seed.shape.as_str()).collect();
+    shapes.sort();
+    shapes.dedup();
+    shapes.join("+")
 }
 
 /// deduplicated `sign@fn@file:line` list of the offset-call seeds whose taint

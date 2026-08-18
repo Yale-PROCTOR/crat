@@ -49,6 +49,43 @@ pub struct SeedInfo {
     pub abs: AbsValue,
     /// source span of the offset call
     pub span: rustc_span::Span,
+    /// syntactic shape of the rvalue defining the offset argument, used to
+    /// bucket the gap set by which non-negativity fact would refute it
+    pub shape: SeedShape,
+}
+
+/// shape of the expression producing a may-negative offset argument
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum SeedShape {
+    /// `x & C` -- refutable by a width-safe mask fact
+    Mask,
+    /// `x % C` -- refutable by a width-safe remainder fact
+    Rem,
+    /// `x - y` -- refutable by a lower bound on `x`
+    Sub,
+    /// a cast/copy of another shape, carrying that shape's name
+    Cast(&'static str),
+    /// the offset argument is a function parameter (fact must come from the
+    /// caller, not this function)
+    Param,
+    /// loaded through a deref (field or pointee); no local definition
+    Deref,
+    /// defined by some other rvalue
+    Other,
+}
+
+impl SeedShape {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            SeedShape::Mask => "mask",
+            SeedShape::Rem => "rem",
+            SeedShape::Sub => "sub",
+            SeedShape::Cast(inner) => inner,
+            SeedShape::Param => "param",
+            SeedShape::Deref => "deref",
+            SeedShape::Other => "other",
+        }
+    }
 }
 
 /// abstract-value lattice combining concrete constants with sign
@@ -1136,6 +1173,64 @@ struct Collector<'mir, 'tcx, 'a> {
     addr_takens: &'a FxHashSet<Local>,
 }
 
+/// classify the shape of the expression defining `operand` by scanning the
+/// body for the assignment that defines it. diagnostics only: stage-0
+/// bucketing of the gap set.
+fn classify_seed_shape<'tcx>(body: &Body<'tcx>, operand: &Operand<'tcx>) -> SeedShape {
+    let (Operand::Copy(place) | Operand::Move(place)) = operand else {
+        return SeedShape::Other;
+    };
+    if contains_deref(place) {
+        return SeedShape::Deref;
+    }
+    if place.local.index() <= body.arg_count && place.local.index() > 0 {
+        return SeedShape::Param;
+    }
+    let mut current = place.local;
+    // follow copy/cast chains to the underlying computation
+    for _ in 0..8 {
+        let Some(rvalue) = sole_definition(body, current) else {
+            return SeedShape::Other;
+        };
+        match rvalue {
+            Rvalue::BinaryOp(mir::BinOp::BitAnd, _) => return SeedShape::Mask,
+            Rvalue::BinaryOp(mir::BinOp::Rem, _) => return SeedShape::Rem,
+            Rvalue::BinaryOp(mir::BinOp::Sub, _) => return SeedShape::Sub,
+            Rvalue::Use(Operand::Copy(p) | Operand::Move(p))
+            | Rvalue::Cast(_, Operand::Copy(p) | Operand::Move(p), _) => {
+                if contains_deref(p) {
+                    return SeedShape::Cast("deref");
+                }
+                if p.local.index() <= body.arg_count && p.local.index() > 0 {
+                    return SeedShape::Cast("param");
+                }
+                current = p.local;
+            }
+            _ => return SeedShape::Other,
+        }
+    }
+    SeedShape::Other
+}
+
+/// the unique rvalue assigned to `local`, if it is assigned exactly once
+fn sole_definition<'a, 'tcx>(body: &'a Body<'tcx>, local: Local) -> Option<&'a Rvalue<'tcx>> {
+    let mut found = None;
+    for bb_data in body.basic_blocks.iter() {
+        for stmt in &bb_data.statements {
+            if let mir::StatementKind::Assign(box (place, rvalue)) = &stmt.kind
+                && place.local == local
+                && place.projection.is_empty()
+            {
+                if found.is_some() {
+                    return None;
+                }
+                found = Some(rvalue);
+            }
+        }
+    }
+    found
+}
+
 fn contains_deref(place: &Place<'_>) -> bool {
     place
         .projection
@@ -1277,6 +1372,10 @@ impl<'mir, 'tcx, 'a> MVisitor<'tcx> for Collector<'mir, 'tcx, 'a> {
                                     def_id: self.def_id,
                                     abs: offset_val,
                                     span: terminator.source_info.span,
+                                    shape: classify_seed_shape(
+                                        self.body,
+                                        &offset_arg.node,
+                                    ),
                                 },
                             ));
                             let field_node = raw_pointer_field_slot(self.body, *place)
