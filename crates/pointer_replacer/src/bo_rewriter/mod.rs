@@ -683,11 +683,18 @@ fn ast_emit_enabled() -> bool {
 
 /// **THE ROUND'S FILE SET — ONE derivation, BOTH call sites.**
 ///
-/// The per-round re-render and the bisect probes must agree on which layer
-/// produced the program, because the bisect ATTRIBUTES diagnostics to functions:
-/// probing a span-layer program to explain a diagnostic observed on an AST-layer
-/// program compares against a program that was never verified. That is not a
-/// variant, it is a defect — so both sites call this and neither renders.
+/// The per-round re-render, the bisect probes, and **the bisect's final
+/// emission** must agree on which layer produced the program, because the
+/// bisect ATTRIBUTES diagnostics to functions: probing a span-layer program to
+/// explain a diagnostic observed on an AST-layer program compares against a
+/// program that was never verified. That is not a variant, it is a defect — so
+/// all three sites call this and none renders.
+///
+/// ⚠ **This doc said "both sites" and there were three** (corrected
+/// 2026-08-18). The third — the final emission after bisect — called `render`
+/// directly, so under `CRAT_M1_AST_EMIT` every escalating program emitted span
+/// text while its probes ran on the AST layer. The count is not small: on the
+/// corpus, 12 of 20 programs escalate.
 ///
 /// The AST path returns **no rollbacks**, and that is structural rather than
 /// optimistic: rollbacks are byte-offset collisions between edits applied to one
@@ -1086,7 +1093,34 @@ fn verify_and_revert(
             && probe.errors.saturating_sub(baseline.errors) == 0
     });
 
-    let (final_files, rollbacks) = render(&emission_plan, &emission_texts, &final_reverted);
+    // **THE THIRD SITE — routed through `round_files` like the other two**
+    // (ruling 2026-08-18). This called `render` directly, with no layer
+    // switch, so under `CRAT_M1_AST_EMIT` every program that escalated
+    // emitted SPAN text: the bisect PROBES above ran on the selected layer
+    // and the emission that followed did not. That is precisely the defect
+    // `round_files`' own doc names — a program returned that is not the
+    // program the probes verified — and it also left M-3 with an escalation
+    // path that has no implementation once `render` is deleted.
+    let (final_files, rollbacks, final_edited) = match round_files(
+        tcx,
+        capture,
+        &emission_plan,
+        &emission_texts,
+        &final_reverted,
+        root_key.as_ref(),
+        table,
+    ) {
+        Ok(triple) => triple,
+        Err(why) => {
+            // The bisect already found a compiling set; failing to re-emit it
+            // is a loud degrade, never a silent fall back to the other layer.
+            facts.files_touched = files_edited;
+            facts.reverted_count = final_reverted.len();
+            facts.bisect_probes = probes;
+            facts.escalated = Some(escalation.clone());
+            return facts.degraded(format!("{escalation}; final re-emit failed: {why}"));
+        }
+    };
     let materialized = match tree_base {
         Some(root) => verify::materialize(root, &final_files),
         None => verify::materialize_single_file(&root_text),
@@ -1138,7 +1172,9 @@ fn verify_and_revert(
             }
             facts.emitted_count = kept.len();
             facts.reverted_count = taken.len();
-            facts.files_touched = final_files.len();
+            // The RULED value from the same derivation the other exits use —
+            // not the map size, which is seeded on the AST layer.
+            facts.files_touched = final_edited;
             facts.bisect_probes = probes;
             facts.escalated = Some(escalation);
             facts.emitted(source, final_files)

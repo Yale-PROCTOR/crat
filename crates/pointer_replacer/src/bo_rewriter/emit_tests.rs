@@ -4867,3 +4867,114 @@ fn both_layers_agree_on_a_reverted_program() {
         "the layers diverge on loop-derived state.\n  span: {span:?}\n  ast:  {ast:?}"
     );
 }
+
+/// **THE BISECT PATH EMITS THROUGH THE SELECTED LAYER.**
+///
+/// Its sibling above compares loop-derived COUNTERS and passes either way; this
+/// compares the EMISSION, which is the only thing that can see the difference.
+/// That gap is exactly how the defect survived: the bisect path's final
+/// emission called `render` directly, so under `CRAT_M1_AST_EMIT` an escalating
+/// program ran its probes on the AST layer and then emitted SPAN text — a
+/// program returned that is not the program the probes verified. On the corpus
+/// **12 of 20 programs escalate**, so this was most of arm B.
+///
+/// **Cap 0 is load-bearing**, for the reason the sibling records: it forces the
+/// bisect path. At cap 8 the loop converges before bisect and this witnesses
+/// nothing.
+///
+/// # Two independent discriminators, both from the layer's own character
+///
+/// - **The key set.** The AST emission map is SEEDED with every file holding a
+///   function, so it carries `bad.rs`; `render` returns edited files only, so
+///   the span map does not. A map without `bad.rs` came from `render`.
+/// - **The byte length.** `pprust` reprints `good.rs`'s function, normalizing
+///   it to 55 bytes against the span splice's 63.
+///
+/// Either alone would catch the defect; both are asserted because they fail for
+/// different reasons, and a future change that legitimately moves one should
+/// have to confront the other rather than silently inherit it.
+///
+/// *Mutation-tested.* Restore `render(&emission_plan, &emission_texts,
+/// &final_reverted)` at the third site and the AST arm returns the span map —
+/// both assertions fail.
+#[test]
+fn the_bisect_path_emits_through_the_selected_layer() {
+    fn run(ast: bool) -> Vec<(String, usize)> {
+        // SAFETY: same contract as `both_layers_agree_on_a_reverted_program` —
+        // the switch is read once per `rewrite_*` call and removed before
+        // returning.
+        unsafe {
+            if ast {
+                std::env::set_var("CRAT_M1_AST_EMIT", "1");
+            } else {
+                std::env::remove_var("CRAT_M1_AST_EMIT");
+            }
+        }
+        let fixture = Fixture::new(&[
+            (
+                "lib.rs",
+                "#![allow(dead_code, unused_unsafe)]\npub mod good;\npub mod bad;\n",
+            ),
+            (
+                "good.rs",
+                "pub unsafe fn bump(p: *mut i32) -> i32 {\n    *p += 1;\n    *p\n}\n",
+            ),
+            ("bad.rs", BREAKS_ON_REWRITE),
+        ]);
+        let out = super::rewrite_m1_path_injected(&fixture.root(), 0, &force_stash_value_shared);
+        unsafe { std::env::remove_var("CRAT_M1_AST_EMIT") };
+        match out {
+            super::RewriteOutcome::Emitted { files, .. } => {
+                let mut v: Vec<(String, usize)> = files
+                    .iter()
+                    .map(|(k, t)| {
+                        let super::plan::FileKey::Real(path) = k else {
+                            return ("virtual".to_owned(), t.len());
+                        };
+                        (
+                            path.file_name()
+                                .expect("emitted file has a name")
+                                .to_string_lossy()
+                                .into_owned(),
+                            t.len(),
+                        )
+                    })
+                    .collect();
+                v.sort();
+                v
+            }
+            super::RewriteOutcome::Degraded { .. } => vec![("DEGRADED".to_owned(), 0)],
+        }
+    }
+
+    let span = run(false);
+    let ast = run(true);
+
+    // NON-VACUITY: the span arm must have emitted through bisect at all.
+    assert_eq!(
+        span,
+        vec![("good.rs".to_owned(), 63)],
+        "the span arm must emit its one edited file through the bisect path, \
+         or this witnesses nothing"
+    );
+
+    let ast_keys: Vec<&str> = ast.iter().map(|(k, _)| k.as_str()).collect();
+    assert!(
+        ast_keys.contains(&"bad.rs"),
+        "the bisect path's final emission did not come from the AST layer: its \
+         map is SEEDED with every file holding a function, so `bad.rs` must be \
+         present. A map of edited files only is `render`'s, which means the \
+         probes ran on one layer and the emission came from the other.\n  \
+         span: {span:?}\n  ast:  {ast:?}"
+    );
+    let ast_good = ast
+        .iter()
+        .find(|(k, _)| k == "good.rs")
+        .expect("the AST arm must still emit the edited file");
+    assert_eq!(
+        ast_good.1, 55,
+        "the AST arm's edited file must be the `pprust` reprint (55 bytes), not \
+         the span splice (63) — a second, independent signal that the emission \
+         came from the selected layer.\n  span: {span:?}\n  ast:  {ast:?}"
+    );
+}
