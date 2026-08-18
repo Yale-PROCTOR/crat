@@ -41,6 +41,11 @@ use self::ownership_diagnostic_package::{
 };
 use crate::{analyses::borrow_ownership::solver::CORE_LABEL_FAMILIES, utils::rustc::RustProgram};
 
+#[path = "a5_measurement.rs"]
+mod a5_measurement;
+#[path = "s23_measurement.rs"]
+mod s23_measurement;
+
 /// Copy of tests.rs `borrow_ownership_coherence::collect_program` (kept local so
 /// tests.rs stays untouched): every top-level fn/struct item, in HIR owner order.
 fn collect_program(tcx: TyCtxt<'_>) -> RustProgram<'_> {
@@ -13019,7 +13024,14 @@ fn boc1_run_one() {
     // `z3_full_version` stamp.
     if matches!(
         mode.as_str(),
-        "bo" | "prod-own" | "prod-precision" | "prod-box" | "selector-core" | "selector-necessity"
+        "bo" | "prod-own"
+            | "prod-precision"
+            | "prod-box"
+            | "selector-core"
+            | "selector-necessity"
+            | "a5-p1"
+            | "s23-discover"
+            | "s23-probe"
     ) || mode.starts_with("selector-detail-")
     {
         z3::set_global_param("smt.random_seed", "0");
@@ -13055,6 +13067,9 @@ fn boc1_run_one() {
             "use-census" => run::run_use_census(tcx, t_tcx),
             "m1-recon" => run::run_m1_recon(tcx, t_tcx),
             "m1-editdump" => run::run_m1_editdump(tcx, t_tcx),
+            "a5-p1" => a5_measurement::run_worker(tcx, t_tcx),
+            "s23-discover" => s23_measurement::run_discovery_worker(tcx, t_tcx),
+            "s23-probe" => s23_measurement::run_probe_worker(tcx, t_tcx),
             "selector-core" => run::run_selector_core(tcx, t_tcx),
             "selector-necessity" => run::run_selector_necessity(tcx, t_tcx),
             detail if detail.starts_with("selector-detail-") => {
@@ -13566,7 +13581,12 @@ mod orchestrate {
         pub status: String,
         pub row: Option<Row>,
         pub wall_s: f64,
+        /// Maximum worker RSS observed by the 200 ms supervision loop.
+        pub peak_rss_kb: u64,
         pub note: String,
+        /// Exact child stdout. A5 consumes its registered raw sentinel here,
+        /// without projecting through the generic BOC1 row.
+        pub stdout: String,
         pub stderr: String,
     }
 
@@ -13853,16 +13873,21 @@ mod orchestrate {
         let mut child = command.spawn().expect("spawn worker");
 
         let mut killed_for: Option<&str> = None;
+        let mut peak_rss_kb = 0;
         let status = loop {
             match child.try_wait().expect("try_wait") {
                 Some(status) => break status,
                 None => {
+                    let current_rss_kb = rss_kb(child.id());
+                    if let Some(rss_kb) = current_rss_kb {
+                        peak_rss_kb = peak_rss_kb.max(rss_kb);
+                    }
                     if t0.elapsed() >= timeout && killed_for.is_none() {
                         killed_for = Some("timeout");
                         let _ = child.kill();
                     } else if killed_for.is_none()
                         && t0.elapsed().as_millis() % 1000 < 200
-                        && rss_kb(child.id()).is_some_and(|kb| kb > mem_cap_kb)
+                        && current_rss_kb.is_some_and(|kb| kb > mem_cap_kb)
                     {
                         killed_for = Some("oom-kill");
                         let _ = child.kill();
@@ -13924,7 +13949,9 @@ mod orchestrate {
             status: classification,
             row,
             wall_s,
+            peak_rss_kb,
             note,
+            stdout,
             stderr,
         }
     }
