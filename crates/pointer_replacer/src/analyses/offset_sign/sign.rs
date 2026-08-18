@@ -380,6 +380,26 @@ impl AbsValue {
         }
     }
 
+    /// `x & C` for a non-negative constant `C` is bounded by `[0, C]`: the
+    /// result cannot have the sign bit set, so it is non-negative regardless
+    /// of the other operand's sign. a negative mask preserves the sign bit
+    /// and yields no information.
+    pub fn bit_and(&self, other: &AbsValue) -> AbsValue {
+        use AbsValue::*;
+        match (*self, *other) {
+            (Bottom, _) | (_, Bottom) => Bottom,
+            (ConstI(c1), ConstI(c2)) => abs_from_i128(c1 & c2),
+            (ConstU(c1), ConstU(c2)) => abs_from_u128(c1 & c2),
+            // a non-negative constant on either side bounds the result
+            (Zero, _) | (_, Zero) => Zero,
+            (ConstU(_), _) | (_, ConstU(_)) => NonNeg,
+            (ConstI(c), _) | (_, ConstI(c)) if c > 0 => NonNeg,
+            // both operands non-negative: the result is too
+            (Pos | NonNeg, Pos | NonNeg) => NonNeg,
+            _ => Top,
+        }
+    }
+
     /// sign is preserved
     pub fn shr(&self, other: &AbsValue) -> AbsValue {
         use AbsValue::*;
@@ -1057,6 +1077,7 @@ fn eval_rvalue<'tcx>(
                 mir::BinOp::Mul => l.mul(&r),
                 mir::BinOp::Div => l.div(&r),
                 mir::BinOp::Rem => l.rem(&r),
+                mir::BinOp::BitAnd => l.bit_and(&r),
                 mir::BinOp::Shr => l.shr(&r),
                 mir::BinOp::Shl => l.shl(&r),
                 // comparisons produce bool (0 or 1), so always NonNeg

@@ -1067,3 +1067,83 @@ fn return_taint_two_hops() {
         "caller::a flows into f::a which needs cursor — propagated back via arg edge"
     );
 }
+
+#[test]
+fn masked_offset_is_safe() {
+    let map = run_analysis(
+        "
+        pub unsafe fn f(p: *const i32, idx: i32) {
+            let _ = *p.offset(((idx - 1) & 7) as isize);
+        }
+        ",
+    );
+    assert_eq!(
+        needs_cursor(&map, "f", "p"),
+        None,
+        "(idx - 1) & 7 is in [0, 7], so p never moves below entry"
+    );
+}
+
+#[test]
+fn masked_offset_by_sign_bit_needs_cursor() {
+    let map = run_analysis(
+        "
+        pub unsafe fn f(p: *const i32, idx: i8) {
+            let _ = *p.offset((idx & -128i8) as isize);
+        }
+        ",
+    );
+    assert_eq!(
+        needs_cursor(&map, "f", "p"),
+        Some(true),
+        "masking with the sign bit can still yield a negative value"
+    );
+}
+
+#[test]
+fn masked_offset_by_negative_mask_needs_cursor() {
+    let map = run_analysis(
+        "
+        pub unsafe fn f(p: *const i32, idx: i32) {
+            let _ = *p.offset((idx & -2) as isize);
+        }
+        ",
+    );
+    assert_eq!(
+        needs_cursor(&map, "f", "p"),
+        Some(true),
+        "a negative mask preserves negative values"
+    );
+}
+
+#[test]
+fn unsigned_rem_offset_is_safe() {
+    let map = run_analysis(
+        "
+        pub unsafe fn f(p: *const i32, n: usize) {
+            let _ = *p.offset((n % 8) as isize);
+        }
+        ",
+    );
+    assert_eq!(
+        needs_cursor(&map, "f", "p"),
+        None,
+        "n % 8 on an unsigned dividend is in [0, 7]"
+    );
+}
+
+#[test]
+fn signed_rem_offset_needs_cursor() {
+    let map = run_analysis(
+        "
+        pub unsafe fn f(p: *const i32, n: i32) {
+            let _ = *p.offset((n % 8) as isize);
+        }
+        ",
+    );
+    assert_eq!(
+        needs_cursor(&map, "f", "p"),
+        Some(true),
+        "signed remainder keeps the dividend's sign, so it may be negative"
+    );
+}
