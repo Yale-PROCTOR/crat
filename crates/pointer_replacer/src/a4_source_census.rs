@@ -796,6 +796,9 @@ fn add_value_edge(graph: &mut SourceGraph, source: Option<String>, target: Strin
 const SOURCE_WALKER_VERSION: &str = "a4-source-walker-v3-one-deref-rawptr";
 const NESTED_REFERENCE_EDGE_PREFIX: &str = "nested-reference-value:";
 const ONE_DEREF_RAWPTR_EDGE_PREFIX: &str = "nested-one-deref-rawptr-value:";
+const BZIP2_WALKER_IMPACT_ORACLE_PATH: &str = "/home/p51lee/dev/agent-worktrees/crat-a4-source-walker-impact-v3-20260818-80xGVFBo/walker-impact-audit/bzip2/impact.tsv";
+const BZIP2_WALKER_IMPACT_ORACLE_SHA256: &str =
+    "29fe9952a9e512aad6f44ec6a4a1421ee10c11c2aca41d127c3e89fab757c8da";
 const NESTED_ADDRESS_SHAPE_HEADER: &str = "program\trvalue_kind\tlocation\tsource_depth\ttarget_depth\tsource_node\ttarget_node\tmodeled_by_walker";
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -5943,6 +5946,23 @@ fn parse_walker_impact_rows(path: &Path, program: &str) -> Result<Vec<Vec<String
     Ok(rows)
 }
 
+fn validate_walker_impact_oracle(
+    actual: &str,
+    oracle: &str,
+    expected_oracle_sha256: &str,
+) -> Result<(), String> {
+    let actual_oracle_sha256 = sha256_text(oracle);
+    if actual_oracle_sha256 != expected_oracle_sha256 {
+        return Err(format!(
+            "walker-impact oracle digest drift: expected={expected_oracle_sha256} actual={actual_oracle_sha256}"
+        ));
+    }
+    if actual.as_bytes() != oracle.as_bytes() {
+        return Err("walker-impact byte mismatch against the preserved v3 bzip2 oracle".to_owned());
+    }
+    Ok(())
+}
+
 fn parse_table_text(
     input: &str,
     header: &str,
@@ -10999,32 +11019,70 @@ fn run_source_walker_impact_audit(contract: &MeasurementContract) {
             "A4C STOP phase=walker-impact-identity candidate={program_name}: candidate set drift"
         );
         let affected = rows.iter().filter(|row| row[2] == "affected").count();
-        let positive_control_passed = program_name != "bzip2"
+        let positive_site_passed = program_name != "bzip2"
             || rows
                 .iter()
                 .any(|row| row[1] == "bzip2::zzzz::field1@d0" && row[2] == "affected");
+        let oracle_result = if program_name == "bzip2" {
+            fs::read_to_string(BZIP2_WALKER_IMPACT_ORACLE_PATH)
+                .map_err(|error| format!("read preserved bzip2 walker-impact oracle: {error}"))
+                .and_then(|oracle| {
+                    let actual = fs::read_to_string(&rows_path).map_err(|error| {
+                        format!("read current bzip2 walker-impact rows: {error}")
+                    })?;
+                    validate_walker_impact_oracle(
+                        &actual,
+                        &oracle,
+                        BZIP2_WALKER_IMPACT_ORACLE_SHA256,
+                    )
+                })
+        } else {
+            Ok(())
+        };
+        let oracle_byte_match = oracle_result.is_ok();
+        let positive_control_passed = positive_site_passed && oracle_byte_match;
+        let failure_phase = if !positive_site_passed {
+            "walker-impact-positive-control"
+        } else if !oracle_byte_match {
+            "walker-impact-oracle-byte-compare"
+        } else {
+            "complete"
+        };
+        let status = if positive_control_passed {
+            "ok"
+        } else if !positive_site_passed {
+            "positive-control-failure"
+        } else {
+            "oracle-byte-mismatch"
+        };
+        let oracle_label = if program_name == "bzip2" {
+            oracle_byte_match.to_string()
+        } else {
+            "not-applicable".to_owned()
+        };
+        let oracle_error = clean_cell(oracle_result.as_ref().err().map_or("none", String::as_str));
         let receipt = format!(
-            "machine_id={MACHINE_ID}\nplatform={PLATFORM}\nmeasurement_class=graph-only-reachability-impact\nsemantic_data=false\ncompleted={}\ncandidate_processing=graph-only\nsource_walker_version={SOURCE_WALKER_VERSION}\nmemory_limit=cgroup-100GiB\nmemory_max_bytes={CANDIDATE_MEMORY_MAX_BYTES}\ncap_verified={}\noom_kills={}\nmemory_max_events={}\nwall_bound_kind=liveness\nwall_cap_s={LIVENESS_BOUND_S}\nprogram={program_name}\ncandidates={}\naffected={affected}\nstatus={}\nanalysis_head={}\nlast_phase={}\nlast_candidate={}\nwall_s={:.3}\n{}memory_receipt_error=none\n",
+            "machine_id={MACHINE_ID}\nplatform={PLATFORM}\nmeasurement_class=graph-only-reachability-impact\nsemantic_data=false\ncompleted={}\ncandidate_processing=graph-only\nsource_walker_version={SOURCE_WALKER_VERSION}\nmemory_limit=cgroup-100GiB\nmemory_max_bytes={CANDIDATE_MEMORY_MAX_BYTES}\ncap_verified={}\noom_kills={}\nmemory_max_events={}\nwall_bound_kind=liveness\nwall_cap_s={LIVENESS_BOUND_S}\nprogram={program_name}\ncandidates={}\naffected={affected}\nstatus={status}\nanalysis_head={}\nlast_phase={failure_phase}\nlast_candidate={}\nbzip2_oracle_path={}\nbzip2_oracle_sha256={}\nbzip2_oracle_byte_match={oracle_label}\nbzip2_oracle_error={oracle_error}\nwall_s={:.3}\n{}memory_receipt_error=none\n",
             positive_control_passed,
             outcome.cap_verified,
             outcome.oom_kills,
             outcome.memory_max_events,
             rows.len(),
-            if positive_control_passed {
-                "ok"
-            } else {
-                "positive-control-failure"
-            },
             contract.head,
-            if positive_control_passed {
-                "complete"
-            } else {
-                "walker-impact-positive-control"
-            },
             if positive_control_passed {
                 "none"
             } else {
                 "bzip2::zzzz::field1@d0"
+            },
+            if program_name == "bzip2" {
+                BZIP2_WALKER_IMPACT_ORACLE_PATH
+            } else {
+                "not-applicable"
+            },
+            if program_name == "bzip2" {
+                BZIP2_WALKER_IMPACT_ORACLE_SHA256
+            } else {
+                "not-applicable"
             },
             outcome.wall_s,
             outcome.render_memory_receipt(),
@@ -11051,7 +11109,7 @@ fn run_source_walker_impact_audit(contract: &MeasurementContract) {
         );
         assert!(
             positive_control_passed,
-            "A4C STOP phase=walker-impact-positive-control candidate=bzip2::zzzz::field1@d0 status=unaffected manifest={manifest}: bzip2 must be affected"
+            "A4C STOP phase={failure_phase} candidate=bzip2::zzzz::field1@d0 status={status} manifest={manifest}: {oracle_error}"
         );
         all_rows.extend(rows);
         records.push(WalkerImpactProgramRecord {
@@ -13059,6 +13117,27 @@ mod tests {
         assert!(
             walker_rule_edges_reaching(&graph, "Unaffected::field0@d0").is_empty(),
             "program-level presence must not mark an unrelated candidate affected"
+        );
+    }
+
+    #[test]
+    fn walker_impact_oracle_pin_is_byte_and_digest_exact() {
+        let oracle = "source_walker_version=v3\nfield\taffected\n";
+        let digest = sha256_text(oracle);
+        assert!(validate_walker_impact_oracle(oracle, oracle, &digest).is_ok());
+        assert!(
+            validate_walker_impact_oracle(
+                "source_walker_version=v3\nfield\tunaffected\n",
+                oracle,
+                &digest,
+            )
+            .expect_err("changed impact bytes must fail")
+            .contains("byte mismatch")
+        );
+        assert!(
+            validate_walker_impact_oracle(oracle, oracle, &"0".repeat(64))
+                .expect_err("changed oracle digest must fail")
+                .contains("oracle digest")
         );
     }
 
