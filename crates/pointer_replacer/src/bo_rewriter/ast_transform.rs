@@ -1664,6 +1664,14 @@ pub(crate) fn ast_emitted_source(
 /// The const is appended to the ROOT file only — it is declared once per crate
 /// and named as `crate::SEAM_LEN_PLACEHOLDER`, so a copy per file would be a
 /// duplicate-definition error, not redundancy.
+///
+/// ⚠ **`tcx` IS STILL REQUIRED, and only for one thing: the source map.**
+/// `splice_fn_prints_per_file` needs it to resolve spans to files, offsets and
+/// original text. It is NOT used to derive anything — `transform_with` takes
+/// the capture, the table and the reverts, all as parameters. Narrowing the
+/// signature to make re-derivation unrepresentable was considered and is not
+/// available here; do not widen `tcx`'s use back beyond the source map without
+/// re-reading why this note exists.
 pub(crate) fn ast_emitted_files_from(
     tcx: rustc_middle::ty::TyCtxt<'_>,
     capture: &AstCapture,
