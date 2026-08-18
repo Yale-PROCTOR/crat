@@ -4,9 +4,10 @@ use std::{
 };
 
 use rustc_ast::{
-    AngleBracketedArg, AttrKind, Attribute, BindingMode, ByRef, Crate, Expr, ExprKind, Extern,
-    FnRetTy, GenericArg, GenericArgs, GenericParamKind, Item, ItemKind, Mutability, NodeId,
-    PatKind, Safety, Stmt, StmtKind, Ty, TyKind, VisibilityKind,
+    AngleBracketedArg, AttrKind, Attribute, BindingMode, BlockCheckMode, ByRef, Crate, Expr,
+    ExprKind, Extern, FnRetTy, GenericArg, GenericArgs, GenericParamKind, Item, ItemKind,
+    LocalKind, Mutability, NodeId, Pat, PatKind, Safety, Stmt, StmtKind, Ty, TyKind,
+    VisibilityKind,
     mut_visit::{self, MutVisitor},
     ptr::P,
     visit::{self, Visitor},
@@ -29,6 +30,7 @@ use crate::{
     preservation::{
         canonical_statement_group, canonicalize_function_with_view, validate_skeleton_view,
     },
+    printf::{parse_print_macro_statement, validate_print_macro_statement},
     skeleton::{annotate_function, collect_opaque_nested_ifs, render_statement_group},
 };
 
@@ -162,7 +164,97 @@ pub fn replace_items_with_observations(
                     format!("{}: {}", problem.code, problem.message),
                 )
             })?;
+        let existing_temporaries = existing_temporary_bindings(&expected);
         for label in requested.view.transform_labels() {
+            let template_metadata = requested
+                .view
+                .statement_pair_metadata
+                .iter()
+                .find(|metadata| metadata.label == label)
+                .and_then(|metadata| metadata.printf_template.as_ref());
+            let expected_group = canonical_statement_group(&expected, label).ok_or_else(|| {
+                item_error(
+                    ReplacementErrorKind::InvalidTransformation,
+                    requested,
+                    format!("expected skeleton contains no expansion group for label {label}"),
+                )
+            })?;
+            if expected_group.len() != 1 || !matches!(expected_group[0].kind, StmtKind::MacCall(..))
+            {
+                if template_metadata.is_some() {
+                    return Err(item_error(
+                        ReplacementErrorKind::InvalidRequest,
+                        requested,
+                        format!("invalid print template group at label {label}"),
+                    ));
+                }
+                continue;
+            }
+            {
+                match parse_print_macro_statement(&expected_group[0]) {
+                    Ok(template) => template,
+                    Err(problem) if template_metadata.is_some() => {
+                        return Err(item_error(
+                            ReplacementErrorKind::InvalidRequest,
+                            requested,
+                            format!("{}: {}", problem.code, problem.message),
+                        ));
+                    }
+                    Err(_) => continue,
+                };
+                let Some(template_metadata) = template_metadata else {
+                    return Err(item_error(
+                        ReplacementErrorKind::InvalidRequest,
+                        requested,
+                        format!("print template label {label} has no trusted metadata"),
+                    ));
+                };
+                let group = canonical_statement_group(&canonical, label).ok_or_else(|| {
+                    item_error(
+                        ReplacementErrorKind::InvalidTransformation,
+                        requested,
+                        format!(
+                            "canonical replacement contains no expansion group for label {label}"
+                        ),
+                    )
+                })?;
+                if group.len() != 1 {
+                    return Err(item_error(
+                        ReplacementErrorKind::InvalidTransformation,
+                        requested,
+                        format!("print template label {label} must contain exactly one statement"),
+                    ));
+                }
+                validate_print_macro_statement(
+                    &group[0],
+                    &template_metadata.rust_format,
+                    template_metadata.argument_count as usize,
+                )
+                .map_err(|problem| {
+                    item_error(
+                        ReplacementErrorKind::InvalidTransformation,
+                        requested,
+                        format!("{}: {}", problem.code, problem.message),
+                    )
+                })?;
+                let parsed = parse_print_macro_statement(&group[0]).map_err(|problem| {
+                    item_error(
+                        ReplacementErrorKind::InvalidTransformation,
+                        requested,
+                        format!("{}: {}", problem.code, problem.message),
+                    )
+                })?;
+                validate_print_arguments_independently(&parsed.arguments, &existing_temporaries)
+                    .map_err(|message| {
+                        item_error(
+                            ReplacementErrorKind::InvalidTransformation,
+                            requested,
+                            message,
+                        )
+                    })?;
+            }
+        }
+        for label in requested.view.report_labels() {
             let group = canonical_statement_group(&canonical, label).ok_or_else(|| {
                 item_error(
                     ReplacementErrorKind::InvalidTransformation,
@@ -532,6 +624,304 @@ fn validate_correspondence(records: &[CallableCorrespondence]) -> Result<(), Rep
                 ),
             ));
         }
+    }
+    Ok(())
+}
+
+fn existing_temporary_bindings(item: &Item) -> HashSet<String> {
+    #[derive(Default)]
+    struct Collector(HashSet<String>);
+    impl<'ast> Visitor<'ast> for Collector {
+        fn visit_pat(&mut self, pattern: &'ast Pat) {
+            if let PatKind::Ident(_, ident, _) = &pattern.kind {
+                let name = ident.name.to_string();
+                if name.starts_with("proctor_temp_var_") {
+                    self.0.insert(name);
+                }
+            }
+            visit::walk_pat(self, pattern);
+        }
+    }
+    let mut collector = Collector::default();
+    collector.visit_item(item);
+    collector.0
+}
+
+fn validate_print_arguments_independently(
+    arguments: &[P<Expr>],
+    existing_temporaries: &HashSet<String>,
+) -> Result<(), String> {
+    const TEMP_PREFIX: &str = "proctor_temp_var_";
+
+    #[derive(Default)]
+    struct Defense {
+        error: Option<String>,
+        declared: HashMap<String, usize>,
+        existing: HashSet<String>,
+    }
+
+    fn is_temp_name(name: &str) -> bool {
+        name.strip_prefix(TEMP_PREFIX).is_some_and(|suffix| {
+            !suffix.is_empty() && suffix.bytes().all(|byte| byte.is_ascii_digit())
+        })
+    }
+
+    fn macro_contains_temp(tokens: &rustc_ast::tokenstream::TokenStream) -> bool {
+        use rustc_ast::{
+            token::TokenKind,
+            tokenstream::{TokenStream, TokenTree},
+        };
+        fn walk(tokens: &TokenStream) -> bool {
+            tokens.iter().any(|tree| match tree {
+                TokenTree::Token(token, _) => matches!(
+                    token.kind,
+                    TokenKind::Ident(symbol, _) if symbol.as_str().starts_with(TEMP_PREFIX)
+                ),
+                TokenTree::Delimited(_, _, _, inner) => walk(inner),
+            })
+        }
+        walk(tokens)
+    }
+
+    impl<'ast> Visitor<'ast> for Defense {
+        fn visit_item(&mut self, _item: &'ast Item) {
+            self.error
+                .get_or_insert_with(|| "print argument contains a function-local item".to_owned());
+        }
+
+        fn visit_stmt(&mut self, statement: &'ast Stmt) {
+            let has_attrs = match &statement.kind {
+                StmtKind::Let(local) => !local.attrs.is_empty(),
+                StmtKind::Item(item) => !item.attrs.is_empty(),
+                StmtKind::Expr(expression) | StmtKind::Semi(expression) => {
+                    !expression.attrs.is_empty()
+                }
+                StmtKind::MacCall(mac) => !mac.attrs.is_empty(),
+                StmtKind::Empty => false,
+            };
+            if has_attrs {
+                self.error.get_or_insert_with(|| {
+                    "print argument contains an unsupported statement attribute".to_owned()
+                });
+            }
+            visit::walk_stmt(self, statement);
+        }
+
+        fn visit_pat(&mut self, pattern: &'ast Pat) {
+            if let PatKind::Ident(_, ident, _) = &pattern.kind {
+                let name = ident.name.to_string();
+                if !is_temp_name(&name) || self.existing.contains(&name) {
+                    self.error.get_or_insert_with(|| {
+                        format!("print argument declares unsupported local binding `{name}`")
+                    });
+                } else {
+                    *self.declared.entry(name).or_default() += 1;
+                }
+            }
+            visit::walk_pat(self, pattern);
+        }
+
+        fn visit_expr(&mut self, expression: &'ast Expr) {
+            if !expression.attrs.is_empty() {
+                self.error.get_or_insert_with(|| {
+                    "print argument contains an unsupported expression attribute".to_owned()
+                });
+            }
+            if matches!(
+                expression.kind,
+                ExprKind::Block(ref block, _) if matches!(block.rules, BlockCheckMode::Unsafe(..))
+            ) {
+                self.error.get_or_insert_with(|| {
+                    "print argument contains an explicit unsafe block".to_owned()
+                });
+            }
+            if let ExprKind::Path(_, path) = &expression.kind
+                && let Some(segment) = path.segments.last()
+            {
+                let name = segment.ident.name.to_string();
+                if name.starts_with(TEMP_PREFIX) && !is_temp_name(&name) {
+                    self.error.get_or_insert_with(|| {
+                        format!("print argument uses invalid generated temporary `{name}`")
+                    });
+                }
+            }
+            visit::walk_expr(self, expression);
+        }
+
+        fn visit_mac_call(&mut self, mac: &'ast rustc_ast::MacCall) {
+            if macro_contains_temp(&mac.args.tokens) {
+                self.error.get_or_insert_with(|| {
+                    "print argument uses a generated temporary inside macro tokens".to_owned()
+                });
+            }
+        }
+    }
+
+    struct LexicalDefense<'a> {
+        declared: &'a HashMap<String, usize>,
+        existing: &'a HashSet<String>,
+        scopes: Vec<HashSet<String>>,
+        error: Option<String>,
+    }
+
+    impl LexicalDefense<'_> {
+        fn activate_pattern(&mut self, pattern: &Pat) {
+            #[derive(Default)]
+            struct Bindings(Vec<String>);
+            impl<'ast> Visitor<'ast> for Bindings {
+                fn visit_pat(&mut self, pattern: &'ast Pat) {
+                    if let PatKind::Ident(_, ident, _) = &pattern.kind {
+                        self.0.push(ident.name.to_string());
+                    }
+                    visit::walk_pat(self, pattern);
+                }
+            }
+            let mut bindings = Bindings::default();
+            bindings.visit_pat(pattern);
+            for name in bindings.0 {
+                if self.declared.contains_key(&name) || self.existing.contains(&name) {
+                    self.scopes.last_mut().unwrap().insert(name);
+                }
+            }
+        }
+
+        fn visit_scoped_block(&mut self, block: &rustc_ast::Block, pattern: Option<&Pat>) {
+            self.scopes.push(HashSet::new());
+            if let Some(pattern) = pattern {
+                self.activate_pattern(pattern);
+            }
+            for statement in &block.stmts {
+                self.visit_stmt(statement);
+            }
+            self.scopes.pop();
+        }
+
+        fn active(&self, name: &str) -> bool {
+            self.scopes.iter().rev().any(|scope| scope.contains(name))
+        }
+    }
+
+    impl<'ast> Visitor<'ast> for LexicalDefense<'_> {
+        fn visit_block(&mut self, block: &'ast rustc_ast::Block) {
+            self.visit_scoped_block(block, None);
+        }
+
+        fn visit_stmt(&mut self, statement: &'ast Stmt) {
+            match &statement.kind {
+                StmtKind::Let(local) => {
+                    match &local.kind {
+                        LocalKind::Decl => {}
+                        LocalKind::Init(initializer) => self.visit_expr(initializer),
+                        LocalKind::InitElse(initializer, else_block) => {
+                            self.visit_expr(initializer);
+                            self.visit_block(else_block);
+                        }
+                    }
+                    self.activate_pattern(&local.pat);
+                }
+                StmtKind::Item(_) => {}
+                StmtKind::Expr(expression) | StmtKind::Semi(expression) => {
+                    self.visit_expr(expression)
+                }
+                StmtKind::MacCall(_) | StmtKind::Empty => {}
+            }
+        }
+
+        fn visit_expr(&mut self, expression: &'ast Expr) {
+            match &expression.kind {
+                ExprKind::If(condition, then_block, else_expression) => {
+                    if let ExprKind::Let(pattern, value, ..) = &condition.kind {
+                        self.visit_expr(value);
+                        self.visit_scoped_block(then_block, Some(pattern));
+                    } else {
+                        self.visit_expr(condition);
+                        self.visit_block(then_block);
+                    }
+                    if let Some(else_expression) = else_expression {
+                        self.visit_expr(else_expression);
+                    }
+                }
+                ExprKind::While(condition, body, _) => {
+                    if let ExprKind::Let(pattern, value, ..) = &condition.kind {
+                        self.visit_expr(value);
+                        self.visit_scoped_block(body, Some(pattern));
+                    } else {
+                        self.visit_expr(condition);
+                        self.visit_block(body);
+                    }
+                }
+                ExprKind::ForLoop {
+                    pat, iter, body, ..
+                } => {
+                    self.visit_expr(iter);
+                    self.visit_scoped_block(body, Some(pat));
+                }
+                ExprKind::Match(scrutinee, arms, _) => {
+                    self.visit_expr(scrutinee);
+                    for arm in arms {
+                        self.scopes.push(HashSet::new());
+                        self.activate_pattern(&arm.pat);
+                        if let Some(guard) = &arm.guard {
+                            self.visit_expr(guard);
+                        }
+                        if let Some(body) = &arm.body {
+                            self.visit_expr(body);
+                        }
+                        self.scopes.pop();
+                    }
+                }
+                ExprKind::Closure(closure) => {
+                    self.scopes.push(HashSet::new());
+                    for parameter in &closure.fn_decl.inputs {
+                        self.activate_pattern(&parameter.pat);
+                    }
+                    self.visit_expr(&closure.body);
+                    self.scopes.pop();
+                }
+                ExprKind::Path(None, path) if path.segments.len() == 1 => {
+                    let name = path.segments[0].ident.to_string();
+                    if is_temp_name(&name) && !self.active(&name) {
+                        self.error.get_or_insert_with(|| {
+                            format!(
+                                "print argument references generated temporary `{name}` outside its lexical expansion scope"
+                            )
+                        });
+                    }
+                }
+                ExprKind::MacCall(_) => {}
+                _ => visit::walk_expr(self, expression),
+            }
+        }
+    }
+
+    let mut all_declarations = HashMap::<String, usize>::new();
+    for argument in arguments {
+        let mut defense = Defense {
+            existing: existing_temporaries.clone(),
+            ..Defense::default()
+        };
+        defense.visit_expr(argument);
+        if let Some(error) = defense.error {
+            return Err(error);
+        }
+        for (name, count) in &defense.declared {
+            *all_declarations.entry(name.clone()).or_default() += count;
+        }
+        let mut lexical = LexicalDefense {
+            declared: &defense.declared,
+            existing: existing_temporaries,
+            scopes: vec![existing_temporaries.clone()],
+            error: None,
+        };
+        lexical.visit_expr(argument);
+        if let Some(error) = lexical.error {
+            return Err(error);
+        }
+    }
+    if let Some((name, _)) = all_declarations.iter().find(|(_, count)| **count != 1) {
+        return Err(format!(
+            "print argument declares generated temporary `{name}` more than once"
+        ));
     }
     Ok(())
 }

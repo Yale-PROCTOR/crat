@@ -6,6 +6,7 @@ use std::{
 
 use rustc_ast::{
     AttrKind, Attribute, Expr, ExprKind, Item, ItemKind, NodeId, PatKind, Stmt, StmtKind,
+    format::FormatArgumentKind,
     mut_visit::{self, MutVisitor},
     ptr::P,
     visit::{self, Visitor},
@@ -15,13 +16,16 @@ use rustc_hir::{self as hir, def::Res};
 use rustc_middle::ty::{self, TyCtxt};
 use rustc_session::config::Input;
 use rustc_span::{
-    Symbol,
+    Span, Symbol,
     def_id::{DefId, LocalDefId},
 };
 use serde::{Deserialize, Serialize};
 use smallvec::SmallVec;
 
-use crate::{CallableCorrespondence, CurrentObservationItem, ExtendedReplacementOutput};
+use crate::{
+    CallableCorrespondence, CurrentObservationItem, ExtendedReplacementOutput,
+    printf::{eligible_printf_statement, parse_print_macro_statement, supported_printf_call},
+};
 
 pub const OBSERVATION_SCHEMA_VERSION: u64 = 1;
 
@@ -61,6 +65,7 @@ impl ReplacementObservationMetadata {
 pub struct ObservationDocument {
     pub schema_version: u64,
     pub observations: Vec<Observation>,
+    pub printf_observations: Vec<PrintfObservation>,
 }
 
 impl Default for ObservationDocument {
@@ -68,8 +73,20 @@ impl Default for ObservationDocument {
         Self {
             schema_version: OBSERVATION_SCHEMA_VERSION,
             observations: vec![],
+            printf_observations: vec![],
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PrintfObservation {
+    pub format_specifier: String,
+    pub source_expression: Expression,
+    pub target_expression: Expression,
+    pub pointer_anchors: Vec<PointerAnchor>,
+    pub source_type: TypeTree,
+    pub source_adjusted_type: TypeTree,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -471,6 +488,14 @@ fn extract_observations(
     input: Input,
     metadata: &ReplacementObservationMetadata,
 ) -> Result<ObservationDocument, ObservationError> {
+    extract_observations_with_printf_recovery(input, metadata, PrintfRecoveryFailure::None)
+}
+
+fn extract_observations_with_printf_recovery(
+    input: Input,
+    metadata: &ReplacementObservationMetadata,
+    printf_recovery_failure: PrintfRecoveryFailure,
+) -> Result<ObservationDocument, ObservationError> {
     if metadata.schema_version != OBSERVATION_SCHEMA_VERSION {
         return Err(ObservationError {
             code: "unsupported_schema_version",
@@ -492,7 +517,7 @@ fn extract_observations(
     let compiler_source = prepared.compiler_source.clone();
     utils::compilation::run_compiler_on_input(
         utils::compilation::str_to_input(&compiler_source),
-        move |tcx| extract_with_tcx(&prepared, metadata, tcx),
+        move |tcx| extract_with_tcx(&prepared, metadata, printf_recovery_failure, tcx),
     )
     .map_err(|_| ObservationError {
         code: "compiler_failure",
@@ -526,6 +551,7 @@ struct PreparedLabel {
     source_ordinal: usize,
     target_ordinals: Vec<usize>,
     macro_skip: bool,
+    printf_candidate: bool,
     source_opaque_ordinals: Vec<usize>,
     opaque_labels_match: bool,
 }
@@ -606,6 +632,15 @@ fn prepare_observation_source(
                     message: format!("target transform label {label} is nonconsecutive"),
                 });
             }
+            let printf_candidate = target_matches.len() == 1
+                && parse_print_macro_statement(target_matches[0].statement).is_ok();
+            let target_has_nested_macro = printf_candidate
+                && parse_print_macro_statement(target_matches[0].statement).is_ok_and(|parsed| {
+                    parsed
+                        .arguments
+                        .iter()
+                        .any(|argument| expression_contains_macro(argument))
+                });
             labels.push(PreparedLabel {
                 label: *label,
                 source_ordinal: source_matches[0].ordinal,
@@ -614,9 +649,14 @@ fn prepare_observation_source(
                     .map(|statement| statement.ordinal)
                     .collect(),
                 macro_skip: statement_contains_macro(source_matches[0].statement)
-                    || target_matches
-                        .iter()
-                        .any(|statement| statement_contains_macro(statement.statement)),
+                    || if printf_candidate {
+                        target_has_nested_macro
+                    } else {
+                        target_matches
+                            .iter()
+                            .any(|statement| statement_contains_macro(statement.statement))
+                    },
+                printf_candidate,
                 source_opaque_ordinals: source_statements
                     .iter()
                     .filter(|statement| {
@@ -648,11 +688,81 @@ fn prepare_observation_source(
             local_pairs,
         });
     }
+    wrap_print_arguments(&mut krate.items, &mut vec![], &functions);
     ProctorAttributeRemover.visit_crate(&mut krate);
     Ok(PreparedObservation {
         compiler_source: pprust::crate_to_string_for_macros(&krate),
         functions,
     })
+}
+
+fn wrap_print_arguments(
+    items: &mut [P<Item>],
+    module_path: &mut Vec<String>,
+    functions: &[PreparedFunction],
+) {
+    for item in items {
+        match &mut item.kind {
+            ItemKind::Mod(_, ident, rustc_ast::ModKind::Loaded(children, ..)) => {
+                module_path.push(ident.to_string());
+                wrap_print_arguments(children, module_path, functions);
+                module_path.pop();
+            }
+            ItemKind::Fn(box function) if function.body.is_some() => {
+                let path = module_path
+                    .iter()
+                    .cloned()
+                    .chain(std::iter::once(function.ident.to_string()))
+                    .collect::<Vec<_>>()
+                    .join("::");
+                let labels = functions
+                    .iter()
+                    .filter(|prepared| prepared.target_path == path)
+                    .flat_map(|prepared| &prepared.labels)
+                    .filter(|label| label.printf_candidate)
+                    .map(|label| label.label)
+                    .collect::<HashSet<_>>();
+                if !labels.is_empty() {
+                    PrintArgumentWrapper { labels }.visit_block(function.body.as_mut().unwrap());
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+struct PrintArgumentWrapper {
+    labels: HashSet<u32>,
+}
+
+impl MutVisitor for PrintArgumentWrapper {
+    fn flat_map_stmt(&mut self, statement: Stmt) -> SmallVec<[Stmt; 1]> {
+        let label = statement_attributes(&statement)
+            .iter()
+            .find_map(numeric_proctor_label);
+        if label.is_some_and(|label| self.labels.contains(&label))
+            && let Ok(parsed) = parse_print_macro_statement(&statement)
+        {
+            let attributes = statement_attributes(&statement).to_vec();
+            let arguments = parsed
+                .arguments
+                .iter()
+                .map(|argument| format!("{{ {} }}", pprust::expr_to_string(argument)))
+                .collect::<Vec<_>>();
+            let suffix = if arguments.is_empty() {
+                String::new()
+            } else {
+                format!(", {}", arguments.join(", "))
+            };
+            let mut replacement =
+                utils::ast::parse_stmt(format!("::std::print!({:?}{});", parsed.format, suffix));
+            if let StmtKind::MacCall(mac) = &mut replacement.kind {
+                mac.attrs = attributes.into();
+            }
+            return smallvec::smallvec![replacement];
+        }
+        mut_visit::walk_flat_map_stmt(self, statement)
+    }
 }
 
 fn nested_labels<'a>(
@@ -821,8 +931,13 @@ struct SurfaceFunction<'a> {
 fn extract_with_tcx(
     prepared: &PreparedObservation,
     metadata: &ReplacementObservationMetadata,
+    printf_recovery_failure: PrintfRecoveryFailure,
     tcx: TyCtxt<'_>,
 ) -> Result<ObservationDocument, ObservationError> {
+    let mut expanded = utils::ast::expanded_ast(tcx);
+    let expanded_ast_to_hir = utils::ast::make_ast_to_hir(&mut expanded, tcx);
+    let mut expanded_functions = HashMap::new();
+    collect_functions(&expanded.items, &mut vec![], &mut expanded_functions);
     let mut surface = catch_unwind(AssertUnwindSafe(|| {
         utils::ast::parse_crate(prepared.compiler_source.clone())
     }))
@@ -853,6 +968,7 @@ fn extract_with_tcx(
     }
     let callable_correspondence = callable_correspondence(metadata, &functions)?;
     let mut output = vec![];
+    let mut printf_output = vec![];
     let mut ordered = prepared.functions.iter().collect::<Vec<_>>();
     ordered.sort_by_key(|function| function.item_id);
     for prepared_function in ordered {
@@ -886,21 +1002,51 @@ fn extract_with_tcx(
             tcx,
         )?;
         for label in &prepared_function.labels {
-            if label.macro_skip || label.target_ordinals.len() != 1 || !label.opaque_labels_match {
-                continue;
-            }
             let Some(source_statement) = source_statements.get(label.source_ordinal) else {
                 return Err(ObservationError {
                     code: "ast_hir_mapping",
                     message: format!("source label {} ordinal disappeared", label.label),
                 });
             };
-            let Some(target_statement) = target_statements.get(label.target_ordinals[0]) else {
+            let Some(target_ordinal) = label.target_ordinals.first() else {
+                continue;
+            };
+            let Some(target_statement) = target_statements.get(*target_ordinal) else {
                 return Err(ObservationError {
                     code: "ast_hir_mapping",
                     message: format!("target label {} ordinal disappeared", label.label),
                 });
             };
+            if let Some(printf) = eligible_printf_statement(source_statement, &ast_to_hir, tcx) {
+                if !label.macro_skip
+                    && label.printf_candidate
+                    && label.target_ordinals.len() == 1
+                    && label.opaque_labels_match
+                {
+                    let Some(expanded_target) =
+                        expanded_functions.get(&prepared_function.target_path)
+                    else {
+                        continue;
+                    };
+                    if let Some(observations) = dump_printf_observations(
+                        target_statement,
+                        expanded_target,
+                        &printf,
+                        &bindings,
+                        &callable_correspondence,
+                        &ast_to_hir,
+                        &expanded_ast_to_hir,
+                        printf_recovery_failure,
+                        tcx,
+                    ) {
+                        printf_output.extend(observations);
+                    }
+                }
+                continue;
+            }
+            if label.macro_skip || label.target_ordinals.len() != 1 || !label.opaque_labels_match {
+                continue;
+            }
             let (Some(source_expression), Some(target_expression)) = (
                 statement_expression(source_statement),
                 statement_expression(target_statement),
@@ -1010,7 +1156,397 @@ fn extract_with_tcx(
     Ok(ObservationDocument {
         schema_version: OBSERVATION_SCHEMA_VERSION,
         observations: output,
+        printf_observations: printf_output,
     })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn dump_printf_observations(
+    target_statement: &Stmt,
+    expanded_target: &Item,
+    printf: &crate::printf::EligiblePrintfCall<'_>,
+    bindings: &HashMap<hir::HirId, hir::HirId>,
+    callables: &HashMap<DefId, u64>,
+    source_ast_to_hir: &utils::ir::AstToHir,
+    target_ast_to_hir: &utils::ir::AstToHir,
+    recovery_failure: PrintfRecoveryFailure,
+    tcx: TyCtxt<'_>,
+) -> Option<Vec<PrintfObservation>> {
+    let target = parse_print_macro_statement(target_statement).ok()?;
+    if target.format != printf.format.rust_format
+        || target.arguments.len() != printf.arguments.len()
+        || printf.format.conversions.len() != printf.arguments.len()
+        || target
+            .arguments
+            .iter()
+            .any(|argument| expression_contains_macro(argument))
+    {
+        return None;
+    }
+    let target_arguments = expanded_print_arguments(
+        expanded_target,
+        target_statement,
+        target.format_span,
+        &target.arguments,
+        recovery_failure,
+    )?;
+    if target_arguments.len() != printf.arguments.len() {
+        return None;
+    }
+    collect_atomically(
+        printf
+            .format
+            .conversions
+            .iter()
+            .zip(printf.arguments)
+            .zip(target_arguments)
+            .enumerate(),
+        |(argument, ((conversion, source), target))| {
+            dump_printf_observation(
+                conversion.source_specifier.clone(),
+                argument,
+                source,
+                target,
+                bindings,
+                callables,
+                source_ast_to_hir,
+                target_ast_to_hir,
+                recovery_failure,
+                tcx,
+            )
+        },
+    )
+}
+
+fn collect_atomically<T, U>(
+    values: impl IntoIterator<Item = T>,
+    collect: impl FnMut(T) -> Option<U>,
+) -> Option<Vec<U>> {
+    values.into_iter().map(collect).collect()
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PrintfRecoveryFailure {
+    None,
+    #[cfg(test)]
+    SourceHirMapping {
+        argument: usize,
+    },
+    #[cfg(test)]
+    TargetHirMapping {
+        argument: usize,
+    },
+    #[cfg(test)]
+    SourceNormalization {
+        argument: usize,
+    },
+    #[cfg(test)]
+    TargetNormalization {
+        argument: usize,
+    },
+    #[cfg(test)]
+    AnchorCorrespondence {
+        argument: usize,
+    },
+    #[cfg(test)]
+    NamedExpandedArgument {
+        argument: usize,
+    },
+    #[cfg(test)]
+    CapturedExpandedArgument {
+        argument: usize,
+    },
+    #[cfg(test)]
+    NonUserExpandedArgument {
+        argument: usize,
+    },
+}
+
+impl PrintfRecoveryFailure {
+    fn source_hir_mapping_is_absent(self, argument: usize) -> bool {
+        #[cfg(test)]
+        return self == Self::SourceHirMapping { argument };
+        #[cfg(not(test))]
+        {
+            let _ = (self, argument);
+            false
+        }
+    }
+
+    fn target_hir_mapping_is_absent(self, argument: usize) -> bool {
+        #[cfg(test)]
+        return self == Self::TargetHirMapping { argument };
+        #[cfg(not(test))]
+        {
+            let _ = (self, argument);
+            false
+        }
+    }
+
+    fn source_normalization_is_unsupported(self, argument: usize) -> bool {
+        #[cfg(test)]
+        return self == Self::SourceNormalization { argument };
+        #[cfg(not(test))]
+        {
+            let _ = (self, argument);
+            false
+        }
+    }
+
+    fn target_normalization_is_unsupported(self, argument: usize) -> bool {
+        #[cfg(test)]
+        return self == Self::TargetNormalization { argument };
+        #[cfg(not(test))]
+        {
+            let _ = (self, argument);
+            false
+        }
+    }
+
+    fn anchor_correspondence_is_absent(self, argument: usize) -> bool {
+        #[cfg(test)]
+        return self == Self::AnchorCorrespondence { argument };
+        #[cfg(not(test))]
+        {
+            let _ = (self, argument);
+            false
+        }
+    }
+
+    fn expanded_argument_is_normal(self, argument: usize, kind: &FormatArgumentKind) -> bool {
+        #[cfg(test)]
+        if matches!(
+            self,
+            Self::NamedExpandedArgument {
+                argument: injected
+            } | Self::CapturedExpandedArgument {
+                argument: injected
+            } if injected == argument
+        ) {
+            return false;
+        }
+        #[cfg(not(test))]
+        let _ = (self, argument);
+        matches!(kind, FormatArgumentKind::Normal)
+    }
+
+    fn expanded_argument_has_user_origin(self, argument: usize) -> bool {
+        #[cfg(test)]
+        return !matches!(
+            self,
+            Self::NonUserExpandedArgument {
+                argument: injected
+            } if injected == argument
+        );
+        #[cfg(not(test))]
+        {
+            let _ = (self, argument);
+            true
+        }
+    }
+}
+
+fn expanded_print_arguments<'a>(
+    item: &'a Item,
+    statement: &Stmt,
+    format_span: Span,
+    surface_arguments: &[P<Expr>],
+    recovery_failure: PrintfRecoveryFailure,
+) -> Option<Vec<&'a Expr>> {
+    let StmtKind::MacCall(macro_statement) = &statement.kind else { return None };
+    let outer_callsite = macro_statement.mac.span().source_callsite();
+    struct Collector<'a> {
+        outer_callsite: Span,
+        outer_depth: usize,
+        candidates: Vec<(bool, Span, &'a rustc_ast::FormatArgs)>,
+    }
+    impl<'ast> Visitor<'ast> for Collector<'ast> {
+        fn visit_expr(&mut self, expression: &'ast Expr) {
+            let enters_outer = expression.span.source_callsite() == self.outer_callsite;
+            if enters_outer {
+                self.outer_depth += 1;
+            }
+            if let ExprKind::FormatArgs(format_args) = &expression.kind {
+                self.candidates.push((
+                    self.outer_depth > 0,
+                    format_args.span.source_callsite(),
+                    format_args,
+                ));
+            }
+            visit::walk_expr(self, expression);
+            if enters_outer {
+                self.outer_depth -= 1;
+            }
+        }
+    }
+    let mut collector = Collector {
+        outer_callsite,
+        outer_depth: 0,
+        candidates: vec![],
+    };
+    collector.visit_item(item);
+    let format_args = unique_print_expansion(format_span.source_callsite(), collector.candidates)?;
+    let expanded_arguments = format_args.arguments.all_args().iter().collect::<Vec<_>>();
+    if expanded_arguments.len() != surface_arguments.len() {
+        return None;
+    }
+    let expanded = expanded_arguments
+        .into_iter()
+        .enumerate()
+        .map(|(index, argument)| {
+            if !recovery_failure.expanded_argument_is_normal(index, &argument.kind) {
+                return None;
+            }
+            let inner = anti_fold_inner_expression(&argument.expr)?;
+            Some((
+                argument.expr.span.source_callsite(),
+                inner.span.source_callsite(),
+                inner,
+            ))
+        })
+        .collect::<Option<Vec<_>>>()?;
+    let surface = surface_arguments
+        .iter()
+        .map(|argument| {
+            let inner = anti_fold_inner_expression(argument)?;
+            Some((
+                argument.span.source_callsite(),
+                inner.span.source_callsite(),
+            ))
+        })
+        .collect::<Option<Vec<_>>>()?;
+    exact_print_argument_spans(&surface, &expanded, recovery_failure)
+        .then(|| expanded.into_iter().map(|(_, _, inner)| inner).collect())
+}
+
+fn unique_print_expansion<T>(
+    expected_format_callsite: Span,
+    candidates: impl IntoIterator<Item = (bool, Span, T)>,
+) -> Option<T> {
+    let mut matches =
+        candidates
+            .into_iter()
+            .filter_map(|(inside_outer, format_callsite, value)| {
+                (inside_outer && format_callsite == expected_format_callsite).then_some(value)
+            });
+    let result = matches.next()?;
+    matches.next().is_none().then_some(result)
+}
+
+fn exact_print_argument_spans<T>(
+    surface: &[(Span, Span)],
+    expanded: &[(Span, Span, T)],
+    recovery_failure: PrintfRecoveryFailure,
+) -> bool {
+    surface.len() == expanded.len()
+        && surface.iter().zip(expanded).enumerate().all(
+            |(
+                argument,
+                ((surface_wrapper, surface_inner), (expanded_wrapper, expanded_inner, _)),
+            )| {
+                if !recovery_failure.expanded_argument_has_user_origin(argument) {
+                    return false;
+                }
+                surface_wrapper == expanded_wrapper && surface_inner == expanded_inner
+            },
+        )
+}
+
+fn anti_fold_inner_expression(expression: &Expr) -> Option<&Expr> {
+    let ExprKind::Block(block, None) = &expression.kind else { return None };
+    let [statement] = block.stmts.as_slice() else { return None };
+    let StmtKind::Expr(inner) = &statement.kind else { return None };
+    statement_attributes(statement).is_empty().then_some(inner)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn dump_printf_observation(
+    format_specifier: String,
+    argument: usize,
+    source: &Expr,
+    target: &Expr,
+    bindings: &HashMap<hir::HirId, hir::HirId>,
+    callables: &HashMap<DefId, u64>,
+    source_ast_to_hir: &utils::ir::AstToHir,
+    target_ast_to_hir: &utils::ir::AstToHir,
+    recovery_failure: PrintfRecoveryFailure,
+    tcx: TyCtxt<'_>,
+) -> Option<PrintfObservation> {
+    let mut tree = ExpressionTree::default();
+    tree.add(source, None, ParentRole::Boundary, source_ast_to_hir, tcx);
+    let mut context = DumpContext::new(bindings, callables, source_ast_to_hir, tcx);
+    context.source_side = true;
+    let source_hir = (!recovery_failure.source_hir_mapping_is_absent(argument))
+        .then(|| source_ast_to_hir.get_expr(source.id, tcx))
+        .flatten()?;
+    let source_expression = (!recovery_failure.source_normalization_is_unsupported(argument))
+        .then(|| context.expression(source))
+        .flatten()?;
+    let source_typeck = tcx.typeck(source_hir.hir_id.owner);
+    let source_type = context.type_tree(source_typeck.expr_ty(source_hir))?;
+    let source_adjusted_type = context.type_tree(source_typeck.expr_ty_adjusted(source_hir))?;
+    if type_tree_contains_local_identity(&source_type)
+        || type_tree_contains_local_identity(&source_adjusted_type)
+    {
+        return None;
+    }
+    let mut pointer_anchors = vec![];
+    let mut seen = HashSet::new();
+    for seed in &tree.seeds {
+        let SeedOccurrence::Pointer(anchor) = seed else { continue };
+        if !seen.insert(anchor.binding) {
+            continue;
+        }
+        let target_binding = (!recovery_failure.anchor_correspondence_is_absent(argument))
+            .then(|| bindings.get(&anchor.binding).copied())
+            .flatten()?;
+        let source_type = context.type_tree(binding_type(anchor.binding, tcx)?)?;
+        if type_tree_contains_local_identity(&source_type) {
+            return None;
+        }
+        pointer_anchors.push(PointerAnchor {
+            id: context.binding_id(anchor.binding, true)?,
+            source_type,
+            target_type: context.type_tree(binding_type(target_binding, tcx)?)?,
+        });
+    }
+    context.ast_to_hir = target_ast_to_hir;
+    context.source_side = false;
+    let _target_hir = (!recovery_failure.target_hir_mapping_is_absent(argument))
+        .then(|| target_ast_to_hir.get_expr(target.id, tcx))
+        .flatten()?;
+    let target_expression = (!recovery_failure.target_normalization_is_unsupported(argument))
+        .then(|| context.expression(target))
+        .flatten()?;
+    Some(PrintfObservation {
+        format_specifier,
+        source_expression,
+        target_expression,
+        pointer_anchors,
+        source_type,
+        source_adjusted_type,
+    })
+}
+
+fn type_tree_contains_local_identity(value: &TypeTree) -> bool {
+    match value {
+        TypeTree::Primitive { .. } => false,
+        TypeTree::Slice { element } | TypeTree::Array { element, .. } => {
+            type_tree_contains_local_identity(element)
+        }
+        TypeTree::RawPointer { pointee, .. } | TypeTree::Reference { pointee, .. } => {
+            type_tree_contains_local_identity(pointee)
+        }
+        TypeTree::Tuple { elements } => elements.iter().any(type_tree_contains_local_identity),
+        TypeTree::Adt {
+            identity,
+            arguments,
+            ..
+        } => {
+            matches!(identity, AdtIdentity::Local { .. })
+                || arguments.iter().any(type_tree_contains_local_identity)
+        }
+    }
 }
 
 fn callable_correspondence(
@@ -1306,6 +1842,7 @@ pub(crate) struct ExpressionTree<'a> {
     order: HashMap<NodeId, usize>,
     seeds: Vec<SeedOccurrence>,
     opaque: HashSet<NodeId>,
+    blocked_ancestors: HashSet<NodeId>,
 }
 
 impl<'a> ExpressionTree<'a> {
@@ -1331,6 +1868,16 @@ impl<'a> ExpressionTree<'a> {
                 .insert(expression.id, ParentEdge { parent, role });
         }
         if self.opaque.contains(&expression.id) {
+            return;
+        }
+        if supported_printf_call(expression, ast_to_hir, tcx) {
+            self.opaque.insert(expression.id);
+            let mut blocked = expression.id;
+            loop {
+                self.blocked_ancestors.insert(blocked);
+                let Some(parent) = self.parents.get(&blocked) else { break };
+                blocked = parent.parent;
+            }
             return;
         }
         if let Some(hir_expression) = ast_to_hir.get_expr(expression.id, tcx)
@@ -1623,6 +2170,101 @@ pub(crate) struct RuleRegion {
     pub source_syntax: Vec<String>,
 }
 
+pub(crate) struct PrintfRuleArgument {
+    pub source_expression: Expression,
+    pub pointer_anchors: Vec<PointerAnchor>,
+    pub source_type: TypeTree,
+    pub source_adjusted_type: TypeTree,
+    pub spellings: HashMap<String, String>,
+    pub source_syntax: Vec<String>,
+}
+
+pub(crate) fn printf_rule_argument(
+    expression: &Expr,
+    eligible: &HashMap<hir::HirId, TypeTree>,
+    ast_to_hir: &utils::ir::AstToHir,
+    tcx: TyCtxt<'_>,
+) -> Option<PrintfRuleArgument> {
+    let mut tree = ExpressionTree::default();
+    tree.add(expression, None, ParentRole::Boundary, ast_to_hir, tcx);
+    let bindings = HashMap::new();
+    let callables = HashMap::new();
+    let mut context = DumpContext::new(&bindings, &callables, ast_to_hir, tcx);
+    let source_expression = context.expression(expression)?;
+    let hir_expression = ast_to_hir.get_expr(expression.id, tcx)?;
+    let typeck = tcx.typeck(hir_expression.hir_id.owner);
+    let source_type = context.type_tree(typeck.expr_ty(hir_expression))?;
+    let source_adjusted_type = context.type_tree(typeck.expr_ty_adjusted(hir_expression))?;
+    let mut pointer_anchors = vec![];
+    let mut seen = HashSet::new();
+    for seed in &tree.seeds {
+        let SeedOccurrence::Pointer(anchor) = seed else { continue };
+        if !seen.insert(anchor.binding) {
+            continue;
+        }
+        pointer_anchors.push(PointerAnchor {
+            id: context.binding_id(anchor.binding, true)?,
+            source_type: context.type_tree(binding_type(anchor.binding, tcx)?)?,
+            target_type: eligible.get(&anchor.binding)?.clone(),
+        });
+    }
+    let mut spellings = HashMap::new();
+    for (binding, id) in &context.binding_ids {
+        spellings.insert(id.clone(), tcx.hir_name(*binding).to_string());
+    }
+    for (definition, id) in &context.local_function_ids {
+        spellings.insert(id.clone(), tcx.item_name(*definition).to_string());
+    }
+    for (definition, id) in &context.adt_ids {
+        spellings.insert(id.clone(), tcx.item_name(*definition).to_string());
+    }
+    for (definition, id) in &context.field_ids {
+        spellings.insert(id.clone(), tcx.item_name(*definition).to_string());
+    }
+    for (definition, id) in &context.variant_ids {
+        spellings.insert(id.clone(), tcx.item_name(*definition).to_string());
+    }
+    for (definition, id) in &context.constant_ids {
+        spellings.insert(id.clone(), tcx.item_name(*definition).to_string());
+    }
+    for (definition, id) in &context.static_ids {
+        spellings.insert(id.clone(), tcx.item_name(*definition).to_string());
+    }
+    for (definition, id) in &context.method_ids {
+        spellings.insert(id.clone(), tcx.item_name(*definition).to_string());
+    }
+    let mut source_syntax = vec![];
+    struct SyntaxCollector<'a, 'context, 'tcx> {
+        context: &'a mut DumpContext<'context, 'tcx>,
+        output: &'a mut Vec<String>,
+    }
+    impl<'ast> Visitor<'ast> for SyntaxCollector<'_, '_, '_> {
+        fn visit_expr(&mut self, expression: &'ast Expr) {
+            if self.context.expression(expression).is_some() {
+                let mut rendered = expression.clone();
+                rendered
+                    .attrs
+                    .retain(|attribute| numeric_proctor_label(attribute).is_none());
+                self.output.push(pprust::expr_to_string(&rendered));
+            }
+            visit::walk_expr(self, expression);
+        }
+    }
+    SyntaxCollector {
+        context: &mut context,
+        output: &mut source_syntax,
+    }
+    .visit_expr(expression);
+    Some(PrintfRuleArgument {
+        source_expression,
+        pointer_anchors,
+        source_type,
+        source_adjusted_type,
+        spellings,
+        source_syntax,
+    })
+}
+
 pub(crate) fn select_rule_regions(
     statement: &Stmt,
     eligible: &HashMap<hir::HirId, TypeTree>,
@@ -1774,6 +2416,9 @@ fn select_region(
     let mut current = start;
     let mut promoted_field = false;
     while let Some(edge) = tree.parents.get(&current).copied() {
+        if tree.blocked_ancestors.contains(&edge.parent) {
+            break;
+        }
         let expression = tree.expressions[&current];
         let parent = tree.expressions.get(&edge.parent).copied();
         let current_pointer_like =
@@ -2000,7 +2645,7 @@ fn builtin_operator_operand(ty: ty::Ty<'_>) -> bool {
     scalar_type(ty) || matches!(ty.kind(), ty::TyKind::RawPtr(..) | ty::TyKind::Ref(..))
 }
 
-fn resolved_definition(
+pub(crate) fn resolved_definition(
     expression: &Expr,
     ast_to_hir: &utils::ir::AstToHir,
     tcx: TyCtxt<'_>,
@@ -3638,6 +4283,22 @@ fn statement_contains_macro(statement: &Stmt) -> bool {
     finder.0
 }
 
+fn expression_contains_macro(expression: &Expr) -> bool {
+    struct Finder(bool);
+    impl<'ast> Visitor<'ast> for Finder {
+        fn visit_expr(&mut self, expression: &'ast Expr) {
+            if matches!(expression.kind, ExprKind::MacCall(..)) {
+                self.0 = true;
+                return;
+            }
+            visit::walk_expr(self, expression);
+        }
+    }
+    let mut finder = Finder(false);
+    finder.visit_expr(expression);
+    finder.0
+}
+
 pub fn replacement_metadata_from_json(
     input: &str,
 ) -> Result<ReplacementObservationMetadata, ObservationError> {
@@ -4013,7 +4674,24 @@ mod tests {
         implementation_path: &str,
         transform_labels: Vec<u32>,
     ) -> Result<ObservationDocument, ObservationError> {
-        let metadata = ReplacementObservationMetadata {
+        extract_metadata(
+            source,
+            case_metadata(
+                source,
+                source_copy_path,
+                implementation_path,
+                transform_labels,
+            ),
+        )
+    }
+
+    fn case_metadata(
+        source: &str,
+        source_copy_path: &str,
+        implementation_path: &str,
+        transform_labels: Vec<u32>,
+    ) -> ReplacementObservationMetadata {
+        ReplacementObservationMetadata {
             schema_version: 1,
             candidate_sha256: sha256_hex(b""),
             statement_pairs_sha256: sha256_hex(b""),
@@ -4033,8 +4711,7 @@ mod tests {
                 wrapper_path: None,
                 transform_labels,
             }],
-        };
-        extract_metadata(source, metadata)
+        }
     }
 
     fn primitive(name: &str) -> TypeTree {
@@ -4224,6 +4901,412 @@ unsafe fn target() -> i32 {{
         first
     }
 
+    #[test]
+    fn print_argument_is_recovered_from_the_expanded_format_arguments() {
+        let source = r#"
+unsafe extern "C" { fn printf(format: *const i8, ...) -> i32; }
+unsafe fn __proctor_source_read(x: i32) {
+    #[proctor(0)] printf(b"%d\0" as *const u8 as *const i8, x);
+}
+unsafe fn read(x: i32) {
+    #[proctor(0)] ::std::print!("{}", x);
+}
+"#;
+        let document = extract(source).unwrap();
+        assert!(document.observations.is_empty());
+        assert_eq!(document.printf_observations.len(), 1);
+        let observation = &document.printf_observations[0];
+        assert_eq!(observation.format_specifier, "%d");
+        assert_eq!(observation.source_expression, binding("<id0>"));
+        assert_eq!(observation.target_expression, binding("<id0>"));
+        assert!(observation.pointer_anchors.is_empty());
+        assert_eq!(observation.source_type, primitive("i32"));
+        assert_eq!(observation.source_adjusted_type, primitive("i32"));
+    }
+
+    #[test]
+    fn multiple_print_arguments_recover_in_conversion_order_atomically() {
+        let source = r#"
+unsafe extern "C" { fn printf(format: *const i8, ...) -> i32; }
+unsafe fn __proctor_source_read(a: i32, b: u32, c: f64) {
+    #[proctor(0)] printf(b"%ld/%08x/%.2f\0" as *const u8 as *const i8, a, b, c);
+}
+unsafe fn read(a: i32, b: u32, c: f64) {
+    #[proctor(0)] ::std::print!("{}/{:08x}/{:.2}", a, b, c);
+}
+"#;
+        let document = extract(source).unwrap();
+        assert!(document.observations.is_empty());
+        assert_eq!(document.printf_observations.len(), 3);
+        assert_eq!(
+            document
+                .printf_observations
+                .iter()
+                .map(|observation| observation.format_specifier.as_str())
+                .collect::<Vec<_>>(),
+            ["%ld", "%08x", "%.2f"]
+        );
+        assert_eq!(
+            document
+                .printf_observations
+                .iter()
+                .map(|observation| observation.source_expression.clone())
+                .collect::<Vec<_>>(),
+            [binding("<id0>"), binding("<id0>"), binding("<id0>")]
+        );
+
+        let nested = source.replace(
+            "unsafe fn read(a: i32, b: u32, c: f64) {",
+            "macro_rules! helper { ($value:expr) => { $value }; }\nunsafe fn read(a: i32, b: u32, c: f64) {",
+        ).replace(
+            "::std::print!(\"{}/{:08x}/{:.2}\", a, b, c);",
+            "::std::print!(\"{}/{:08x}/{:.2}\", a, helper!(b), c);",
+        );
+        let document = extract(&nested).unwrap();
+        assert!(document.observations.is_empty());
+        assert!(document.printf_observations.is_empty());
+
+        let nested_with_other_label = nested
+            .replace(
+                "#[proctor(0)] printf(b\"%ld/%08x/%.2f\\0\" as *const u8 as *const i8, a, b, c);",
+                "#[proctor(0)] printf(b\"%ld/%08x/%.2f\\0\" as *const u8 as *const i8, a, b, c);\n    #[proctor(1)] printf(b\"%d\\0\" as *const u8 as *const i8, a);",
+            )
+            .replace(
+                "#[proctor(0)] ::std::print!(\"{}/{:08x}/{:.2}\", a, helper!(b), c);",
+                "#[proctor(0)] ::std::print!(\"{}/{:08x}/{:.2}\", a, helper!(b), c);\n    #[proctor(1)] ::std::print!(\"{}\", a);",
+            );
+        let document = extract_case(
+            &nested_with_other_label,
+            "__proctor_source_read",
+            "read",
+            vec![0, 1],
+        )
+        .unwrap();
+        assert!(document.observations.is_empty());
+        assert_eq!(document.printf_observations.len(), 1);
+        assert_eq!(document.printf_observations[0].format_specifier, "%d");
+
+        let wrong_count = source.replace(
+            "::std::print!(\"{}/{:08x}/{:.2}\", a, b, c);",
+            "::std::print!(\"{}/{:08x}\", a, b);",
+        );
+        let document = extract(&wrong_count).unwrap();
+        assert!(document.printf_observations.is_empty());
+    }
+
+    #[test]
+    fn print_observations_preserve_pointer_anchor_completeness_and_occurrence_order() {
+        let one_anchor = r#"
+unsafe extern "C" { fn printf(format: *const i8, ...) -> i32; }
+unsafe fn __proctor_source_read(p: *const i32) {
+    #[proctor(0)] printf(b"%d\0" as *const u8 as *const i8, *p.add(0));
+}
+unsafe fn read(p: &[i32]) {
+    #[proctor(0)] ::std::print!("{}", p[0]);
+}
+"#;
+        let document = extract(one_anchor).unwrap();
+        let [observation] = document.printf_observations.as_slice() else {
+            panic!("expected one complete pointer observation")
+        };
+        assert_eq!(observation.source_type, primitive("i32"));
+        assert_eq!(observation.source_adjusted_type, primitive("i32"));
+        assert_eq!(
+            observation.pointer_anchors,
+            [pointer_anchor(
+                "<id0>",
+                raw_pointer("i32", RawMutability::Const),
+                shared_reference(TypeTree::Slice {
+                    element: Box::new(primitive("i32")),
+                }),
+            )]
+        );
+
+        let two_anchors = r#"
+unsafe extern "C" { fn printf(format: *const i8, ...) -> i32; }
+unsafe fn __proctor_source_read(left: *const i32, right: *const i32) {
+    #[proctor(0)] printf(b"%d\0" as *const u8 as *const i8, *right + *left + *right);
+}
+unsafe fn read(left: &[i32], right: &[i32]) {
+    #[proctor(0)] ::std::print!("{}", right[0] + left[0] + right[0]);
+}
+"#;
+        let document = extract(two_anchors).unwrap();
+        let anchors = &document.printf_observations[0].pointer_anchors;
+        assert_eq!(anchors.len(), 2);
+        assert_eq!(anchors[0].id, "<id0>");
+        assert_eq!(anchors[1].id, "<id1>");
+        assert_eq!(anchors[0].source_type, anchors[1].source_type);
+        assert_eq!(anchors[0].target_type, anchors[1].target_type);
+    }
+
+    #[test]
+    fn print_observations_keep_explicit_source_types_and_allow_target_root_changes() {
+        let promoted = r#"
+unsafe extern "C" { fn printf(format: *const i8, ...) -> i32; }
+unsafe fn __proctor_source_read(value: i8) {
+    #[proctor(0)] printf(b"%hhd\0" as *const u8 as *const i8, value as i32);
+}
+unsafe fn read(value: i8) {
+    #[proctor(0)] ::std::print!("{}", value as i8);
+}
+"#;
+        let document = extract(promoted).unwrap();
+        let [observation] = document.printf_observations.as_slice() else {
+            panic!("expected promoted integer observation")
+        };
+        assert_eq!(observation.format_specifier, "%hhd");
+        assert_eq!(observation.source_type, primitive("i32"));
+        assert_eq!(observation.source_adjusted_type, primitive("i32"));
+        assert!(
+            serde_json::to_value(observation)
+                .unwrap()
+                .get("target_type")
+                .is_none()
+        );
+
+        let string_pointer = r#"
+unsafe extern "C" { fn printf(format: *const i8, ...) -> i32; }
+unsafe fn __proctor_source_read(p: *const i8) {
+    #[proctor(0)] printf(b"%s\0" as *const u8 as *const i8, p);
+}
+unsafe fn read(p: &str) {
+    #[proctor(0)] ::std::print!("{}", p);
+}
+"#;
+        let document = extract(string_pointer).unwrap();
+        let [observation] = document.printf_observations.as_slice() else {
+            panic!("expected pointer-to-string observation")
+        };
+        assert_eq!(observation.format_specifier, "%s");
+        assert_eq!(
+            observation.source_type,
+            raw_pointer("i8", RawMutability::Const)
+        );
+        assert_eq!(observation.pointer_anchors.len(), 1);
+        assert_eq!(
+            observation.pointer_anchors[0].target_type,
+            shared_reference(TypeTree::Primitive { name: "str".into() })
+        );
+        assert!(
+            serde_json::to_value(observation)
+                .unwrap()
+                .get("target_type")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn nominal_print_context_is_ineligible_and_special_ownership_is_exclusive() {
+        let nominal = r#"
+struct LocalChar(i8);
+unsafe extern "C" { fn printf(format: *const i8, ...) -> i32; }
+unsafe fn __proctor_source_read(p: *const LocalChar) {
+    #[proctor(0)] printf(b"%s\0" as *const u8 as *const i8, p);
+}
+unsafe fn read(p: *const LocalChar) {
+    #[proctor(0)] ::std::print!("{}", p as usize);
+}
+"#;
+        let document = extract(nominal).unwrap();
+        assert!(document.observations.is_empty());
+        assert!(document.printf_observations.is_empty());
+
+        let unsupported_and_return_used = r#"
+unsafe extern "C" { fn printf(format: *const i8, ...) -> i32; }
+unsafe fn __proctor_source_read(p: *const i32) {
+    #[proctor(0)] printf(b"%*d\0" as *const u8 as *const i8, 4, *p);
+    #[proctor(1)] let _n = printf(b"%d\0" as *const u8 as *const i8, *p);
+}
+unsafe fn read(p: *const i32) {
+    #[proctor(0)] ::std::print!("{}", *p);
+    #[proctor(1)] let _n: i32 = 1;
+}
+"#;
+        let document = extract_case(
+            unsupported_and_return_used,
+            "__proctor_source_read",
+            "read",
+            vec![0, 1],
+        )
+        .unwrap();
+        assert!(document.observations.is_empty());
+        assert!(document.printf_observations.is_empty());
+
+        let eligible = promoted_fixture();
+        let document = extract_case(&eligible, "__proctor_source_read", "read", vec![]).unwrap();
+        assert!(document.observations.is_empty());
+        assert!(document.printf_observations.is_empty());
+    }
+
+    fn promoted_fixture() -> String {
+        r#"
+unsafe extern "C" { fn printf(format: *const i8, ...) -> i32; }
+unsafe fn __proctor_source_read(value: i8) {
+    #[proctor(0)] printf(b"%hhd\0" as *const u8 as *const i8, value as i32);
+}
+unsafe fn read(value: i8) {
+    #[proctor(0)] ::std::print!("{}", value as i8);
+}
+"#
+        .to_owned()
+    }
+
+    #[test]
+    fn expanded_print_argument_correspondence_is_exact_and_ordered() {
+        let ident = rustc_span::Ident::dummy();
+        assert!(
+            PrintfRecoveryFailure::None.expanded_argument_is_normal(0, &FormatArgumentKind::Normal)
+        );
+        assert!(
+            !PrintfRecoveryFailure::None
+                .expanded_argument_is_normal(0, &FormatArgumentKind::Named(ident))
+        );
+        assert!(
+            !PrintfRecoveryFailure::None
+                .expanded_argument_is_normal(0, &FormatArgumentKind::Captured(ident))
+        );
+
+        fn span(value: u32) -> Span {
+            Span::new(
+                rustc_span::BytePos(value),
+                rustc_span::BytePos(value + 1),
+                rustc_span::SyntaxContext::root(),
+                None,
+            )
+        }
+        let surface = [(span(1), span(2)), (span(3), span(4)), (span(5), span(6))];
+        let expanded = [
+            (span(1), span(2), ()),
+            (span(3), span(4), ()),
+            (span(5), span(6), ()),
+        ];
+        assert!(exact_print_argument_spans(
+            &surface,
+            &expanded,
+            PrintfRecoveryFailure::None
+        ));
+        assert!(!exact_print_argument_spans(
+            &surface[..2],
+            &expanded,
+            PrintfRecoveryFailure::None
+        ));
+        assert!(!exact_print_argument_spans(
+            &surface,
+            &expanded[..2],
+            PrintfRecoveryFailure::None
+        ));
+        assert!(!exact_print_argument_spans(
+            &surface,
+            &[expanded[1], expanded[0], expanded[2]],
+            PrintfRecoveryFailure::None,
+        ));
+        assert!(!exact_print_argument_spans(
+            &surface,
+            &[(span(9), span(2), ()), expanded[1], expanded[2]],
+            PrintfRecoveryFailure::None,
+        ));
+        assert!(!exact_print_argument_spans(
+            &surface,
+            &[(span(1), span(9), ()), expanded[1], expanded[2]],
+            PrintfRecoveryFailure::None,
+        ));
+    }
+
+    #[test]
+    fn expanded_print_selection_rejects_every_ambiguous_or_wrong_candidate() {
+        fn span(value: u32) -> Span {
+            Span::new(
+                rustc_span::BytePos(value),
+                rustc_span::BytePos(value + 1),
+                rustc_span::SyntaxContext::root(),
+                None,
+            )
+        }
+        let expected = span(1);
+        assert_eq!(
+            unique_print_expansion(expected, [(true, expected, "exact")]),
+            Some("exact")
+        );
+        for (name, candidates) in [
+            ("missing", vec![]),
+            (
+                "duplicate",
+                vec![(true, expected, "first"), (true, expected, "second")],
+            ),
+            ("wrong outer callsite", vec![(false, expected, "wrong")]),
+            ("wrong format callsite", vec![(true, span(2), "wrong")]),
+        ] {
+            assert_eq!(unique_print_expansion(expected, candidates), None, "{name}");
+        }
+    }
+
+    #[test]
+    fn print_mapping_failures_are_statement_atomic() {
+        let source = r#"
+unsafe extern "C" { fn printf(format: *const i8, ...) -> i32; }
+unsafe fn __proctor_source_read(a: i64, p: *const u32, c: u32, survivor: i32) {
+    #[proctor(0)] printf(b"%ld/%u/%x\0" as *const u8 as *const i8, a, *p, c);
+    #[proctor(1)] printf(b"%d\0" as *const u8 as *const i8, survivor);
+}
+unsafe fn read(a: i64, p: &[u32], c: u32, survivor: i32) {
+    #[proctor(0)] ::std::print!("{}/{}/{:x}", a, p[0], c);
+    #[proctor(1)] ::std::print!("{}", survivor);
+}
+"#;
+        for failure in [
+            PrintfRecoveryFailure::SourceHirMapping { argument: 1 },
+            PrintfRecoveryFailure::TargetHirMapping { argument: 1 },
+            PrintfRecoveryFailure::SourceNormalization { argument: 1 },
+            PrintfRecoveryFailure::TargetNormalization { argument: 1 },
+            PrintfRecoveryFailure::AnchorCorrespondence { argument: 1 },
+            PrintfRecoveryFailure::NamedExpandedArgument { argument: 1 },
+            PrintfRecoveryFailure::CapturedExpandedArgument { argument: 1 },
+            PrintfRecoveryFailure::NonUserExpandedArgument { argument: 1 },
+        ] {
+            let document = extract_with_printf_recovery_failure(
+                source,
+                case_metadata(source, "__proctor_source_read", "read", vec![0, 1]),
+                failure,
+            )
+            .unwrap();
+            assert!(document.observations.is_empty(), "{failure:?}");
+            assert_eq!(
+                document
+                    .printf_observations
+                    .iter()
+                    .map(|observation| observation.format_specifier.as_str())
+                    .collect::<Vec<_>>(),
+                ["%d"],
+                "{failure:?}"
+            );
+        }
+
+        let mut contradictory = case_metadata(source, "__proctor_source_read", "read", vec![0, 1]);
+        contradictory.new_correspondence[0].item_id = 8;
+        let error = extract_with_printf_recovery_failure(
+            source,
+            contradictory,
+            PrintfRecoveryFailure::SourceHirMapping { argument: 1 },
+        )
+        .unwrap_err();
+        assert_eq!(error.code, "malformed_metadata");
+        assert!(error.message.contains("disagrees"));
+    }
+
+    fn extract_with_printf_recovery_failure(
+        source: &str,
+        mut metadata: ReplacementObservationMetadata,
+        failure: PrintfRecoveryFailure,
+    ) -> Result<ObservationDocument, ObservationError> {
+        metadata.observation_source_sha256 = sha256_hex(source.as_bytes());
+        extract_observations_with_printf_recovery(
+            utils::compilation::str_to_input(source),
+            &metadata,
+            failure,
+        )
+    }
+
     fn extract_metadata(
         source: &str,
         mut metadata: ReplacementObservationMetadata,
@@ -4277,6 +5360,73 @@ unsafe fn target() -> i32 {{
             inspect(tcx, &tree, &regions);
         })
         .unwrap();
+    }
+
+    #[test]
+    fn resolved_printf_subtrees_are_opaque_without_hiding_disjoint_siblings() {
+        let return_used = r#"
+unsafe extern "C" { fn printf(format: *const i8, ...) -> i32; }
+unsafe fn f(p: *const i32) -> i32 {
+    return printf(b"%d\0" as *const u8 as *const i8, *p);
+}
+"#;
+        inspect_source_selection(return_used, "f", |_, _, regions| {
+            assert!(regions.is_empty());
+        });
+
+        let unsupported = r#"
+unsafe extern "C" { fn printf(format: *const i8, ...) -> i32; }
+unsafe fn f(p: *const i32) {
+    printf(b"%*d\0" as *const u8 as *const i8, 4, *p);
+}
+"#;
+        inspect_source_selection(unsupported, "f", |_, _, regions| {
+            assert!(regions.is_empty());
+        });
+
+        let sibling = r#"
+unsafe extern "C" { fn printf(format: *const i8, ...) -> i32; }
+unsafe fn consume(_: i32, _: i32) {}
+unsafe fn f(left: *const i32, hidden: *const i32, right: *const i32) {
+    consume(*left + printf(b"%d\0" as *const u8 as *const i8, *hidden), *right);
+}
+"#;
+        inspect_source_selection(sibling, "f", |_, tree, regions| {
+            assert_eq!(regions.len(), 2);
+            assert_eq!(
+                regions
+                    .iter()
+                    .map(|region| pprust::expr_to_string(tree.expressions[&region.root]))
+                    .collect::<Vec<_>>(),
+                ["*left", "*right"]
+            );
+        });
+
+        let wrong_identity = r#"
+unsafe extern "C" { #[link_name = "different"] fn printf(format: *const i8, ...) -> i32; }
+unsafe fn f(p: *const i32) {
+    printf(b"%d\0" as *const u8 as *const i8, *p);
+}
+"#;
+        inspect_source_selection(wrong_identity, "f", |_, _, regions| {
+            assert!(!regions.is_empty());
+        });
+
+        let wrong_prototype = r#"
+unsafe extern "C" { fn printf(format: *const i8, value: i32) -> i32; }
+unsafe fn f(p: *const i32) { printf(b"%d\0" as *const u8 as *const i8, *p); }
+"#;
+        inspect_source_selection(wrong_prototype, "f", |_, _, regions| {
+            assert!(!regions.is_empty());
+        });
+
+        let rust_function = r#"
+unsafe fn printf(_: *const i8, _: i32) -> i32 { 0 }
+unsafe fn f(p: *const i32) { printf(b"%d\0" as *const u8 as *const i8, *p); }
+"#;
+        inspect_source_selection(rust_function, "f", |_, _, regions| {
+            assert!(!regions.is_empty());
+        });
     }
 
     fn dump_parameter_types(source: &str, function: &str) -> Vec<TypeTree> {
@@ -5841,6 +6991,7 @@ unsafe fn target(mut pointer: &u32, mut sink: Sink) -> u32 {
         assert_eq!(second.observations.len(), 1, "label 1: {second:?}");
         let document = ObservationDocument {
             schema_version: OBSERVATION_SCHEMA_VERSION,
+            printf_observations: vec![],
             observations: first
                 .observations
                 .into_iter()
@@ -6761,6 +7912,7 @@ unsafe fn target() -> i32 {
             rules,
             crate::RuleDocument {
                 schema_version: 1,
+                printf_rules: vec![],
                 rules: vec![exact_recorded_scan_rule(b'd')],
             }
         );
@@ -6860,6 +8012,7 @@ pub unsafe fn third() -> i32 {
             rules,
             crate::RuleDocument {
                 schema_version: 1,
+                printf_rules: vec![],
                 rules: vec![
                     exact_recorded_scan_rule(b'd'),
                     exact_recorded_scan_rule(b'u'),

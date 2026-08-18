@@ -1,5 +1,7 @@
 use super::*;
-use crate::{StatementDisposition, StatementDispositionKind, StatementPairMetadata};
+use crate::{
+    PrintfTemplateMetadata, StatementDisposition, StatementDispositionKind, StatementPairMetadata,
+};
 
 fn skeleton_view(skeleton: &str, transformed: Vec<u32>, needs: bool) -> SkeletonView {
     rustc_span::create_session_if_not_set_then(rustc_span::edition::Edition::Edition2021, |_| {
@@ -12,6 +14,7 @@ fn skeleton_view(skeleton: &str, transformed: Vec<u32>, needs: bool) -> Skeleton
                     crate::preservation::make_disposition_forest(
                         item,
                         &transformed_set,
+                        &HashSet::new(),
                         &HashSet::new(),
                         &HashSet::new(),
                     )
@@ -38,6 +41,18 @@ fn skeleton_view(skeleton: &str, transformed: Vec<u32>, needs: bool) -> Skeleton
                 .map(|label| StatementPairMetadata {
                     label,
                     before_statement: "test".to_owned(),
+                    printf_template: std::panic::catch_unwind(|| parse_crate(skeleton))
+                        .ok()
+                        .and_then(Result::ok)
+                        .and_then(|krate| {
+                            canonical_statement_group(&krate.items[0], label)
+                                .and_then(|group| (group.len() == 1).then_some(group))
+                                .and_then(|group| parse_print_macro_statement(&group[0]).ok())
+                        })
+                        .map(|parsed| PrintfTemplateMetadata {
+                            rust_format: parsed.format,
+                            argument_count: parsed.arguments.len() as u32,
+                        }),
                     pointer_variables_complete: true,
                     pointer_variables: vec![],
                 })
@@ -96,6 +111,7 @@ fn mixed_preservation_request(
                     &transformed.iter().copied().collect(),
                     &HashSet::new(),
                     &rule_applied.iter().copied().collect(),
+                    &HashSet::new(),
                 )
                 .unwrap(),
                 statement_pair_metadata: transformed
@@ -104,6 +120,7 @@ fn mixed_preservation_request(
                     .map(|label| StatementPairMetadata {
                         label,
                         before_statement: "test".to_owned(),
+                        printf_template: None,
                         pointer_variables_complete: true,
                         pointer_variables: vec![],
                     })
@@ -161,6 +178,170 @@ fn assert_codes(skeleton: &str, transformation: &str, expected: &[&str]) {
 }
 
 const UNIT_SKELETON: &str = "unsafe fn f() { #[proctor(0)] todo!(); }";
+
+#[test]
+fn print_arguments_receive_normal_structural_validation() {
+    let skeleton = r#"unsafe fn f() { #[proctor(0)] ::std::print!("{}", todo!()); }"#;
+    assert_valid(
+        skeleton,
+        r#"unsafe fn f() { #[proctor(0)] ::std::print!("{}", helper!(x)); }"#,
+    );
+    assert_valid(
+        skeleton,
+        r#"unsafe fn f() { #[proctor(0)] ::std::print!("{}", { let proctor_temp_var_0 = 1; proctor_temp_var_0 }); }"#,
+    );
+    for (argument, code) in [
+        ("{ fn hidden() {} 1 }", "unexpected_nested_item"),
+        ("unsafe { 1 }", "explicit_unsafe_block"),
+        (
+            "{ #[allow(unused_variables)] let proctor_temp_var_0 = 1; proctor_temp_var_0 }",
+            "unexpected_body_attribute",
+        ),
+        (
+            "{ let invented = 1; invented }",
+            "invalid_generated_binding_name",
+        ),
+        (
+            "{ let proctor_temp_var_0 = 1; helper!(proctor_temp_var_0); proctor_temp_var_0 }",
+            "temporary_in_macro",
+        ),
+    ] {
+        assert_code(
+            skeleton,
+            &format!(r#"unsafe fn f() {{ #[proctor(0)] ::std::print!("{{}}", {argument}); }}"#),
+            code,
+        );
+    }
+
+    for argument in [
+        "{ proctor_temp_var_0 + { let proctor_temp_var_0 = 1; proctor_temp_var_0 } }",
+        "{ { let proctor_temp_var_0 = 1; } proctor_temp_var_0 }",
+        "{ if true { let proctor_temp_var_0 = 1; } proctor_temp_var_0 }",
+    ] {
+        assert_code(
+            skeleton,
+            &format!(r#"unsafe fn f() {{ #[proctor(0)] ::std::print!("{{}}", {argument}); }}"#),
+            "unresolved_generated_temporary",
+        );
+    }
+
+    let two = r#"unsafe fn f() { #[proctor(0)] ::std::print!("{} {}", todo!(), todo!()); }"#;
+    assert_code(
+        two,
+        r#"unsafe fn f() { #[proctor(0)] ::std::print!("{} {}", { let proctor_temp_var_0 = 1; proctor_temp_var_0 }, proctor_temp_var_0); }"#,
+        "unresolved_generated_temporary",
+    );
+}
+
+#[test]
+fn aliased_printf_metadata_makes_corrupt_template_a_setup_error() {
+    let skeleton = r#"unsafe fn f() { #[proctor(0)] ::std::println!("{}"); }"#;
+    let mut expected = expected_function(7, "f", skeleton);
+    expected.view.statement_pair_metadata[0].printf_template = Some(PrintfTemplateMetadata {
+        rust_format: "{}".to_owned(),
+        argument_count: 1,
+    });
+    let response = validate(&ValidationRequest {
+        schema_version: 1,
+        expected_functions: vec![expected],
+        transformation: skeleton.to_owned(),
+    });
+    assert!(matches!(response, ValidationResponse::SetupError { .. }));
+}
+
+#[test]
+fn ordinary_call_shaped_metadata_never_confers_printf_provenance() {
+    let skeleton = "unsafe fn f() { #[proctor(0)] todo!(); }";
+    let mut expected = expected_function(7, "f", skeleton);
+    expected.view.statement_pair_metadata[0].before_statement =
+        r#"foo(b"%d\0" as *const u8 as *const i8, value);"#.to_owned();
+    let response = validate(&ValidationRequest {
+        schema_version: 1,
+        expected_functions: vec![expected],
+        transformation:
+            r#"unsafe fn f() { #[proctor(0)] foo(b"%d\0" as *const u8 as *const i8, value); }"#
+                .to_owned(),
+    });
+    assert_eq!(response, ValidationResponse::Valid);
+}
+
+#[test]
+fn print_template_attack_matrix_is_rejected_precisely() {
+    let skeleton = r#"unsafe fn f() { #[proctor(0)] ::std::print!("{}/{:08x}/{}", todo!(), todo!(), todo!()); }"#;
+    assert_valid(
+        skeleton,
+        r#"unsafe fn f() { #[proctor(0)] ::std::print!("\x7b}/{:08x}/{}", a, b, c,); }"#,
+    );
+    assert_valid(
+        skeleton,
+        r#"unsafe fn f() { #[proctor(0)] ::std::print!("{}/{:08x}/{}", (a, b), { helper(a, b) }, value::<A, B>((a, b))); }"#,
+    );
+    for (statement, code) in [
+        (r#"print!("{}/{:08x}/{}", a, b, c);"#, "printf_macro_path"),
+        (
+            r#"std::print!("{}/{:08x}/{}", a, b, c);"#,
+            "printf_macro_path",
+        ),
+        (
+            r#"::std::println!("{}/{:08x}/{}", a, b, c);"#,
+            "printf_macro_path",
+        ),
+        (
+            r#"::core::print!("{}/{:08x}/{}", a, b, c);"#,
+            "printf_macro_path",
+        ),
+        (r#"print("{}/{:08x}/{}", a, b, c);"#, "printf_macro_kind"),
+        (
+            r#"::std::print!["{}/{:08x}/{}", a, b, c];"#,
+            "printf_macro_delimiter",
+        ),
+        (
+            r#"::std::print!{"{}/{:08x}/{}", a, b, c};"#,
+            "printf_macro_delimiter",
+        ),
+        (
+            r#"::std::print!("changed", a, b, c);"#,
+            "printf_format_literal",
+        ),
+        (
+            r#"::std::print!("{1}/{0}/{}", a, b, c);"#,
+            "printf_format_references",
+        ),
+        (
+            r#"::std::print!("{}/{:08x}/{}", a, b);"#,
+            "printf_argument_count",
+        ),
+        (
+            r#"::std::print!("{}/{:08x}/{}", a, b, c, d);"#,
+            "printf_argument_count",
+        ),
+        (
+            r#"::std::print!("{}/{:08x}/{}", name = a, b, c);"#,
+            "printf_named_argument",
+        ),
+    ] {
+        assert_code(
+            skeleton,
+            &format!("unsafe fn f() {{ #[proctor(0)] {statement} }}"),
+            code,
+        );
+    }
+    assert_code(
+        skeleton,
+        r#"unsafe fn f() { #[proctor(0)] { ::std::print!("{}/{:08x}/{}", a, b, c); } }"#,
+        "printf_macro_kind",
+    );
+    for transformation in [
+        r#"unsafe fn f() { #[proctor(0)] ::std::print!("{}/{:08x}/{}", a, b, c); #[proctor(0)] ::std::print!("{}/{:08x}/{}", a, b, c); }"#,
+        r#"unsafe fn f() { #[proctor(0)] ::std::print!("{}/{:08x}/{}", a, b, c); consume(); }"#,
+    ] {
+        let response = validate(&request(skeleton, transformation));
+        assert!(
+            matches!(response, ValidationResponse::Invalid { .. }),
+            "{transformation}: {response:?}"
+        );
+    }
+}
 
 #[test]
 fn preservation_forest_must_follow_depth_first_lexical_order() {
@@ -519,11 +700,22 @@ fn preserved_outer_alignment_keeps_stable_label_errors() {
 #[test]
 fn valid_response_has_explicit_status() {
     let response = validate_json(
-        r#"{"schema_version":1,"expected_functions":[{"id":7,"name":"f","view":{"skeleton":"unsafe fn f() { #[proctor(0)] todo!(); }","needs_transformation":true,"statement_dispositions":[{"label":0,"disposition":"transform","children":[]}],"statement_pair_metadata":[{"label":0,"before_statement":"test","pointer_variables_complete":true,"pointer_variables":[]}]}}],"transformation":"unsafe fn f() { #[proctor(0)] return; }"}"#,
+        r#"{"schema_version":1,"expected_functions":[{"id":7,"name":"f","view":{"skeleton":"unsafe fn f() { #[proctor(0)] todo!(); }","needs_transformation":true,"statement_dispositions":[{"label":0,"disposition":"transform","children":[]}],"statement_pair_metadata":[{"label":0,"before_statement":"test","printf_template":null,"pointer_variables_complete":true,"pointer_variables":[]}]}}],"transformation":"unsafe fn f() { #[proctor(0)] return; }"}"#,
     );
     assert_eq!(
         response,
         "{\n  \"schema_version\": 1,\n  \"status\": \"valid\"\n}"
+    );
+}
+
+#[test]
+fn statement_metadata_requires_explicit_null_printf_provenance() {
+    let response = validate_json(
+        r#"{"schema_version":1,"expected_functions":[{"id":7,"name":"f","view":{"skeleton":"unsafe fn f() { #[proctor(0)] todo!(); }","needs_transformation":true,"statement_dispositions":[{"label":0,"disposition":"transform","children":[]}],"statement_pair_metadata":[{"label":0,"before_statement":"test","pointer_variables_complete":true,"pointer_variables":[]}]}}],"transformation":"unsafe fn f() { #[proctor(0)] return; }"}"#,
+    );
+    assert!(
+        response.contains("missing field `printf_template`"),
+        "{response}"
     );
 }
 
@@ -555,7 +747,7 @@ fn setup_error_matches_schema_and_key_order() {
 fn json_round_trip_preserves_embedded_rust() {
     let input = r#"{
   "schema_version": 1,
-  "expected_functions": [{"id":7,"name":"f","view":{"skeleton":"unsafe fn f() -> &'static str {\n #[proctor(0)]\n todo!()\n}","needs_transformation":true,"statement_dispositions":[{"label":0,"disposition":"transform","children":[]}],"statement_pair_metadata":[{"label":0,"before_statement":"test","pointer_variables_complete":true,"pointer_variables":[]}]}}],
+  "expected_functions": [{"id":7,"name":"f","view":{"skeleton":"unsafe fn f() -> &'static str {\n #[proctor(0)]\n todo!()\n}","needs_transformation":true,"statement_dispositions":[{"label":0,"disposition":"transform","children":[]}],"statement_pair_metadata":[{"label":0,"before_statement":"test","printf_template":null,"pointer_variables_complete":true,"pointer_variables":[]}]}}],
   "transformation":"unsafe fn f() -> &'static str {\n #[proctor(0)]\n \"quote:\\\" slash:\\\\ line:\\n\"\n}"
 }"#;
     assert!(validate_json(input).contains("\"status\": \"valid\""));

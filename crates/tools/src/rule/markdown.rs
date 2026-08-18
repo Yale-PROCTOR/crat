@@ -40,6 +40,31 @@ pub fn rule_document_to_markdown(document: &RuleDocument) -> Result<String, Docu
         output.push_str(&code_span(&type_spelling(&rule.target_adjusted_type)));
         output.push_str(").\n");
     }
+    for rule in &document.printf_rules {
+        output.push_str("* printf argument ");
+        output.push_str(&code_span(&rule.format_specifier));
+        output.push_str(": ");
+        output.push_str(&code_span(&expression_spelling(&rule.source_pattern)));
+        output.push_str(" -> ");
+        output.push_str(&code_span(&expression_spelling(&rule.target_pattern)));
+        output.push('\n');
+        for anchor in &rule.pointer_anchors {
+            output.push_str("  * ");
+            output.push_str(&escape_markdown_text(&variable_spelling(&anchor.id)));
+            output.push_str(": ");
+            output.push_str(&code_span(&type_spelling(&anchor.source_type)));
+            output.push_str(" -> ");
+            output.push_str(&code_span(&type_spelling(&anchor.target_type)));
+            output.push('\n');
+        }
+        let source_type = super::concrete_rule_type(&rule.source_type)?;
+        let source_adjusted_type = super::concrete_rule_type(&rule.source_adjusted_type)?;
+        output.push_str("  * source type: ");
+        output.push_str(&code_span(&type_spelling(&source_type)));
+        output.push_str(" (");
+        output.push_str(&code_span(&type_spelling(&source_adjusted_type)));
+        output.push_str(").\n");
+    }
     Ok(output)
 }
 

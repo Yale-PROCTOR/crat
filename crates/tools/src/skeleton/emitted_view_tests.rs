@@ -93,6 +93,7 @@ fn rule_for_region(
     };
     crate::synthesize_rules(&[ObservationDocument {
         schema_version: OBSERVATION_SCHEMA_VERSION,
+        printf_observations: vec![],
         observations: vec![observation.clone(), observation],
     }])
     .unwrap()
