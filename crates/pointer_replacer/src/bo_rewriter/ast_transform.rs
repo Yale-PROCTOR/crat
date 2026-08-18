@@ -398,6 +398,19 @@ pub(crate) struct Composition {
     /// and the alternative here (compare reprint text against the original) is
     /// the derivation the fix ruling explicitly forbade.
     edited: Vec<rustc_span::Span>,
+    /// **THE CLAIMANT OF EACH `edited` SPAN, index-parallel to it.**
+    ///
+    /// Exists so a diagnostic can report an edit's KIND (`decl:*` / `use` /
+    /// `seam`) without re-deriving that classification from the AST. Production
+    /// already decides it at [`Composition::claim`]; a second derivation in an
+    /// instrument is this module's founding defect class, and putting it inside
+    /// the thing you debug WITH is the worst place for it (ruled 2026-08-18).
+    ///
+    /// Parallel rather than a `Vec<(Span, &str)>` so `edited_spans` stays a
+    /// borrow of a contiguous slice and the retain filter is untouched. The
+    /// pairing is therefore an INVARIANT, not a type guarantee — hence the
+    /// `debug_assert` at the single push site.
+    claimants: Vec<&'static str>,
     /// Refusals, each naming the node and both claimants.
     pub refused: Vec<Refusal>,
 }
@@ -419,6 +432,14 @@ impl Composition {
             None => {
                 self.claimed.insert(node, claimant);
                 self.edited.push(span);
+                self.claimants.push(claimant);
+                // The two vectors are index-parallel by construction; this is
+                // the ONLY site that grows either, so the invariant is local.
+                debug_assert_eq!(
+                    self.edited.len(),
+                    self.claimants.len(),
+                    "edited spans and their claimants must stay index-parallel"
+                );
                 true
             }
             Some(&holder) => {
@@ -437,6 +458,20 @@ impl Composition {
     /// answer, not a degenerate one.
     pub(crate) fn edited_spans(&self) -> &[rustc_span::Span] {
         &self.edited
+    }
+
+    /// The same edits, each carrying the claimant that made it.
+    ///
+    /// Diagnostic-only: nothing in the emission path reads this, so it cannot
+    /// change what is spliced. It reports the classification production
+    /// already made rather than recomputing one.
+    pub(crate) fn edited_with_claimants(
+        &self,
+    ) -> impl Iterator<Item = (rustc_span::Span, &'static str)> + '_ {
+        self.edited
+            .iter()
+            .copied()
+            .zip(self.claimants.iter().copied())
     }
 
     /// Refusals whose CHALLENGER carries this label — the pass that was turned
@@ -1272,6 +1307,51 @@ mod tests {
         assert!(g.claim(NodeId::from_u32(1), rustc_span::DUMMY_SP, "decl:ref"));
         assert!(g.claim(NodeId::from_u32(2), rustc_span::DUMMY_SP, "use"));
         assert!(g.refused.is_empty(), "distinct nodes must not be refused");
+    }
+
+    /// **The claimant travels with its span, in order, and REFUSALS DO NOT
+    /// ENTER.**
+    ///
+    /// Both halves matter and they fail to different mutations. The spans are
+    /// DISTINCT on purpose: with `DUMMY_SP` everywhere, any mispairing still
+    /// compares equal, so the test would pass under its own defect.
+    ///
+    /// *Mutation-tested*, each reverted by `git checkout`:
+    /// - **M-A (pairing)** — `.zip(self.claimants.iter().rev().copied())`:
+    ///   claimants pair with the wrong spans. FAILS.
+    /// - **M-B (exclusion)** — hoist `claimants.push` out of the admitted arm:
+    ///   a REFUSED claim, which edited nothing, records a claimant, and the
+    ///   parallel invariant reports a changed-set longer than its edits. FAILS.
+    /// - **M-C (constant)** — push a fixed `"decl:ref"` instead of the
+    ///   parameter: every edit reports the same kind, which is what a
+    ///   diagnostic reading this would silently believe. FAILS.
+    ///
+    /// Note what is NOT a discriminating mutation: swapping the two `push`
+    /// calls. Both append, so the pairing is unchanged — recorded because it
+    /// was the first mutation reached for, and it witnesses nothing.
+    #[test]
+    fn each_edited_span_carries_the_claimant_that_made_it() {
+        use rustc_span::{BytePos, Span, SyntaxContext};
+        let sp =
+            |lo: u32, hi: u32| Span::new(BytePos(lo), BytePos(hi), SyntaxContext::root(), None);
+        let mut g = Composition::default();
+        let (a, b, c) = (sp(10, 20), sp(30, 40), sp(50, 60));
+        assert!(g.claim(NodeId::from_u32(1), a, "decl:ref"));
+        assert!(g.claim(NodeId::from_u32(2), b, "use"));
+        assert!(g.claim(NodeId::from_u32(3), c, "seam"));
+        // Refused: node 1 is already held, so this must add NOTHING.
+        assert!(!g.claim(NodeId::from_u32(1), sp(70, 80), "seam"));
+
+        assert_eq!(
+            g.edited_with_claimants().collect::<Vec<_>>(),
+            vec![(a, "decl:ref"), (b, "use"), (c, "seam")],
+            "each edited span must carry the claimant that made it, in the              order the claims were admitted, and a REFUSED claim must not              appear — it edited nothing"
+        );
+        assert_eq!(
+            g.edited_spans().len(),
+            g.edited_with_claimants().count(),
+            "the parallel vectors must agree in length — the invariant the              debug_assert in `claim` states"
+        );
     }
 
     /// **A difference is booked to the arm that produced it.**
