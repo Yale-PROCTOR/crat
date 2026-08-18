@@ -675,13 +675,10 @@ fn parse_p2(path: &Path) -> Result<BTreeMap<Identity, P2Row>, String> {
                 if row[0] != PLATFORM || row[1] != MACHINE_ID {
                     return Err("P2 platform/machine provenance drift".to_owned());
                 }
-                if !matches!(row[11].as_str(), "hard-UNSAT" | "force-SAT") {
-                    return Err(format!("unknown P2 verdict: {}", row[11]));
-                }
                 let identity = (row[2].clone(), row[3].clone());
                 let p2_row = P2Row {
                     identity: identity.clone(),
-                    verdict: row[11].clone(),
+                    verdict: normalize_p2_verdict(&row[11])?.to_owned(),
                 };
                 if eligible.insert(identity, p2_row).is_some() {
                     return Err("duplicate eligible P2 identity".to_owned());
@@ -706,6 +703,14 @@ fn parse_p2(path: &Path) -> Result<BTreeMap<Identity, P2Row>, String> {
         ));
     }
     Ok(eligible)
+}
+
+fn normalize_p2_verdict(verdict: &str) -> Result<&'static str, String> {
+    match verdict {
+        "hard-UNSAT" => Ok("hard-UNSAT"),
+        "force-own-SAT-not-selected" => Ok("force-SAT"),
+        other => Err(format!("unknown P2 verdict: {other}")),
+    }
 }
 
 fn parse_a4(path: &Path) -> Result<BTreeMap<Identity, A4Row>, String> {
@@ -1365,5 +1370,15 @@ mod tests {
         fs::write(&path, format!("{digest}  ../classification.tsv\n")).unwrap();
         assert!(parse_sha_manifest(&path).is_err());
         fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn p2_terminal_labels_map_to_the_join_vocabulary_exactly() {
+        assert_eq!(normalize_p2_verdict("hard-UNSAT"), Ok("hard-UNSAT"));
+        assert_eq!(
+            normalize_p2_verdict("force-own-SAT-not-selected"),
+            Ok("force-SAT")
+        );
+        assert!(normalize_p2_verdict("force-SAT").is_err());
     }
 }
