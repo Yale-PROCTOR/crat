@@ -2551,6 +2551,11 @@ pub(crate) fn revert_set_from_names(
 /// because `emit_files` filters SUBJECTS by the first while `render` filters
 /// EDITS by the second. A dump that showed only one key could not distinguish
 /// "not reverted" from "reverted under the other key".
+///
+/// `#[cfg(test)]` like its sibling [`phase3_fn_parity`], and for the same
+/// reason: it consumes `oracle_reverts`, and its only caller is the
+/// `#[cfg(test)]` corpus worker. Production emits without it.
+#[cfg(test)]
 pub(crate) fn edit_dump(
     tcx: rustc_middle::ty::TyCtxt<'_>,
     reverts_text: &str,
