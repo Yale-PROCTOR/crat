@@ -6035,16 +6035,6 @@ impl CandidateMemoryReceipt {
     }
 }
 
-impl From<CandidateMemoryPeaks> for CandidateMemoryReceipt {
-    fn from(peaks: CandidateMemoryPeaks) -> Self {
-        Self {
-            process_peak_rss_kb: Some(peaks.process_peak_rss_kb),
-            cgroup_peak_memory_kb: Some(peaks.cgroup_peak_memory_kb),
-            errors: Vec::new(),
-        }
-    }
-}
-
 fn parse_gnu_time_peak_rss_kb(receipt: &str) -> Result<u64, String> {
     const PREFIX: &str = "Maximum resident set size (kbytes):";
     let mut values = receipt
@@ -6089,10 +6079,6 @@ fn collect_candidate_memory_receipt(
         cgroup_peak_memory_kb: cgroup_peak_memory.ok(),
         errors,
     }
-}
-
-fn render_candidate_memory_receipt(peaks: CandidateMemoryPeaks) -> String {
-    CandidateMemoryReceipt::from(peaks).render()
 }
 
 fn render_completed_shard_receipt(
@@ -7035,6 +7021,34 @@ struct CappedCandidateOutcome {
     cap_verified: bool,
     oom_kills: u64,
     memory_max_events: u64,
+    cgroup_peak_read_source: CgroupPeakReadSource,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CgroupPeakReadSource {
+    ExitPrimary,
+    PollBackup,
+    Unavailable,
+}
+
+impl CgroupPeakReadSource {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::ExitPrimary => "exit-primary",
+            Self::PollBackup => "poll-backup",
+            Self::Unavailable => "unavailable",
+        }
+    }
+}
+
+impl CappedCandidateOutcome {
+    fn render_memory_receipt(&self) -> String {
+        format!(
+            "{}cgroup_peak_read_source={}\n",
+            self.memory_receipt.render(),
+            self.cgroup_peak_read_source.as_str(),
+        )
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -7122,6 +7136,7 @@ fn candidate_systemd_properties(memory_max_bytes: u64) -> Vec<String> {
         "MemoryAccounting=yes".to_owned(),
         format!("MemoryMax={memory_max_bytes}"),
         "OOMPolicy=continue".to_owned(),
+        "ExecStopPost=/usr/bin/sleep 1".to_owned(),
     ]
 }
 
@@ -7229,8 +7244,10 @@ fn run_capped_candidate_child(
     let started = Instant::now();
     let mut child = command.spawn().expect("spawn capped candidate worker");
     let mut cgroup_path = None;
+    let mut main_pid = None;
     let mut cap_verified = false;
-    let mut peak_bytes = 0;
+    let mut polled_peak_bytes = 0;
+    let mut exit_peak_bytes = None::<u64>;
     let mut oom_kills = 0;
     let mut memory_max_events = 0;
     let mut timed_out = false;
@@ -7251,7 +7268,26 @@ fn run_capped_candidate_child(
             if read_u64_file(&cgroup.join("memory.max")) == Some(CANDIDATE_MEMORY_MAX_BYTES) {
                 cap_verified = true;
             }
-            peak_bytes = peak_bytes.max(read_u64_file(&cgroup.join("memory.peak")).unwrap_or(0));
+            let current_peak = read_u64_file(&cgroup.join("memory.peak")).unwrap_or(0);
+            polled_peak_bytes = polled_peak_bytes.max(current_peak);
+            if exit_peak_bytes.is_none() && main_pid.is_none() {
+                let substate = systemd_user_property(&unit, "SubState");
+                let observed_main_pid = systemd_user_property(&unit, "MainPID")
+                    .and_then(|value| value.parse::<u32>().ok());
+                if substate.as_deref() == Some("stop-post") {
+                    exit_peak_bytes = Some(current_peak);
+                } else {
+                    main_pid = observed_main_pid.filter(|pid| *pid > 0);
+                }
+            }
+            if let Some(pid) = main_pid
+                && !PathBuf::from("/proc").join(pid.to_string()).exists()
+            {
+                exit_peak_bytes = Some(exit_peak_bytes.unwrap_or(0).max(current_peak));
+            }
+            if let Some(exit_peak) = &mut exit_peak_bytes {
+                *exit_peak = (*exit_peak).max(current_peak);
+            }
             let events = cgroup.join("memory.events");
             oom_kills = oom_kills.max(read_memory_event(&events, "oom_kill").unwrap_or(0));
             memory_max_events =
@@ -7270,19 +7306,23 @@ fn run_capped_candidate_child(
     if systemd_user_property(&unit, "Result").as_deref() == Some("oom-kill") {
         oom_kills = oom_kills.max(1);
     }
-    peak_bytes = peak_bytes.max(
+    polled_peak_bytes = polled_peak_bytes.max(
         systemd_user_property(&unit, "MemoryPeak")
             .and_then(|value| value.parse().ok())
             .unwrap_or(0),
     );
+    let (peak_bytes, cgroup_peak_read_source) = match exit_peak_bytes.filter(|peak| *peak > 0) {
+        Some(peak) => (Some(peak), CgroupPeakReadSource::ExitPrimary),
+        None if polled_peak_bytes > 0 => {
+            (Some(polled_peak_bytes), CgroupPeakReadSource::PollBackup)
+        }
+        None => (None, CgroupPeakReadSource::Unavailable),
+    };
     let wall_s = started.elapsed().as_secs_f64();
     let stdout = fs::read_to_string(&out_path).unwrap_or_default();
     let stderr = fs::read_to_string(&err_path).unwrap_or_default();
     let gnu_time_receipt = fs::read_to_string(&time_path).ok();
-    let memory_receipt = collect_candidate_memory_receipt(
-        gnu_time_receipt.as_deref(),
-        (peak_bytes > 0).then_some(peak_bytes),
-    );
+    let memory_receipt = collect_candidate_memory_receipt(gnu_time_receipt.as_deref(), peak_bytes);
     let memory_receipt_error = memory_receipt.require_complete().err();
     let row = stdout.lines().rev().find_map(super::report::parse_kv_line);
     let worker_ok = status.success()
@@ -7317,6 +7357,7 @@ fn run_capped_candidate_child(
         cap_verified,
         oom_kills,
         memory_max_events,
+        cgroup_peak_read_source,
     }
 }
 
@@ -8833,7 +8874,7 @@ fn run_shard(contract: &MeasurementContract, program: super::CorpusProgram) {
                 write_atomic_checkpoint(&dir.join("resource-exhausted.tsv"), &resource)
                     .expect("write program resource exception");
             }
-            let memory_receipt = outcome.memory_receipt.render();
+            let memory_receipt = outcome.render_memory_receipt();
             let memory_receipt_error =
                 clean_cell(outcome.memory_receipt_error.as_deref().unwrap_or("none"));
             let oom_killer = if outcome.oom_kills > 0 {
@@ -8910,7 +8951,7 @@ fn run_shard(contract: &MeasurementContract, program: super::CorpusProgram) {
         ) {
             Ok(matched) => matched,
             Err(error) => {
-                let memory_receipt = render_candidate_memory_receipt(memory_peaks);
+                let memory_receipt = outcome.render_memory_receipt();
                 let receipt = format!(
                     "machine_id={MACHINE_ID}\nplatform={PLATFORM}\nmemory_limit=cgroup-100GiB\nmemory_max_bytes={CANDIDATE_MEMORY_MAX_BYTES}\ncap_verified={}\noom_kills={}\nmemory_max_events={}\noom_killer=none\nwall_bound_kind=liveness\nwall_cap_s={LIVENESS_BOUND_S}\nprogram={}\ncandidate={}\npopulation={}\nstatus=oracle-byte-mismatch\ndata=false\ncheckpoint_data=false\nanalysis_head={}\nlast_phase=oracle-byte-compare\nlast_candidate={}\nwall_s={:.3}\n{memory_receipt}memory_receipt_error=none\noracle_byte_match=false\noracle_partial_sha256={LIL_ORACLE_PARTIAL_SHA256}\n{gap_waiver_receipt}",
                     outcome.cap_verified,
@@ -8956,7 +8997,7 @@ fn run_shard(contract: &MeasurementContract, program: super::CorpusProgram) {
         } else {
             "not-applicable"
         };
-        let memory_receipt = render_candidate_memory_receipt(memory_peaks);
+        let memory_receipt = outcome.render_memory_receipt();
         let receipt = format!(
             "machine_id={MACHINE_ID}\nplatform={PLATFORM}\nmemory_limit=cgroup-100GiB\nmemory_max_bytes={CANDIDATE_MEMORY_MAX_BYTES}\ncap_verified={}\noom_kills={}\nmemory_max_events={}\noom_killer=none\nwall_bound_kind=liveness\nwall_cap_s={LIVENESS_BOUND_S}\nprogram={}\ncandidate={}\npopulation={}\nstatus=ok\ndata=true\ncheckpoint_data=false\nanalysis_head={}\ncandidates={}\nroots={}\nexceptions={}\nlast_phase={phase}\nlast_candidate={marker_candidate}\nwall_s={:.3}\n{memory_receipt}memory_receipt_error=none\noracle_byte_match={oracle_label}\noracle_partial_sha256={LIL_ORACLE_PARTIAL_SHA256}\n{gap_waiver_receipt}",
             outcome.cap_verified,
@@ -9963,7 +10004,7 @@ fn run_graph_shape_census(contract: &MeasurementContract) {
                 outcome.status,
                 contract.head,
                 outcome.wall_s,
-                outcome.memory_receipt.render(),
+                outcome.render_memory_receipt(),
                 clean_cell(outcome.memory_receipt_error.as_deref().unwrap_or("none")),
             );
             fs::write(dir.join("receipt.txt"), receipt).expect("write failed shape receipt");
@@ -10006,7 +10047,7 @@ fn run_graph_shape_census(contract: &MeasurementContract) {
             gaps.len(),
             contract.head,
             outcome.wall_s,
-            render_candidate_memory_receipt(memory_peaks),
+            outcome.render_memory_receipt(),
         );
         fs::write(dir.join("receipt.txt"), receipt).expect("write completed shape receipt");
         let manifest = write_manifest(
@@ -10255,7 +10296,7 @@ fn run_exhaustive_gap_inventory(contract: &MeasurementContract) {
                 outcome.status,
                 contract.head,
                 outcome.wall_s,
-                outcome.memory_receipt.render(),
+                outcome.render_memory_receipt(),
                 clean_cell(outcome.memory_receipt_error.as_deref().unwrap_or("none")),
             );
             fs::write(dir.join("receipt.txt"), receipt)
@@ -10318,7 +10359,7 @@ fn run_exhaustive_gap_inventory(contract: &MeasurementContract) {
             rows.len(),
             contract.head,
             outcome.wall_s,
-            render_candidate_memory_receipt(memory_peaks),
+            outcome.render_memory_receipt(),
         );
         fs::write(dir.join("receipt.txt"), receipt).expect("write completed gap-inventory receipt");
         let manifest = write_manifest(
@@ -10576,7 +10617,7 @@ fn run_gap_attribution_probe(contract: &MeasurementContract) {
                 outcome.status,
                 contract.head,
                 outcome.wall_s,
-                outcome.memory_receipt.render(),
+                outcome.render_memory_receipt(),
                 clean_cell(outcome.memory_receipt_error.as_deref().unwrap_or("none")),
             );
             fs::write(dir.join("receipt.txt"), receipt)
@@ -10664,7 +10705,7 @@ fn run_gap_attribution_probe(contract: &MeasurementContract) {
             mapping.len(),
             contract.head,
             outcome.wall_s,
-            render_candidate_memory_receipt(memory_peaks),
+            outcome.render_memory_receipt(),
         );
         fs::write(dir.join("receipt.txt"), receipt)
             .expect("write completed gap-attribution receipt");
@@ -10904,7 +10945,7 @@ fn run_source_walker_impact_audit(contract: &MeasurementContract) {
                 outcome.status,
                 contract.head,
                 outcome.wall_s,
-                outcome.memory_receipt.render(),
+                outcome.render_memory_receipt(),
                 clean_cell(outcome.memory_receipt_error.as_deref().unwrap_or("none")),
             );
             fs::write(dir.join("receipt.txt"), receipt).expect("write failed impact receipt");
@@ -10986,7 +11027,7 @@ fn run_source_walker_impact_audit(contract: &MeasurementContract) {
                 "bzip2::zzzz::field1@d0"
             },
             outcome.wall_s,
-            render_candidate_memory_receipt(memory_peaks),
+            outcome.render_memory_receipt(),
         );
         fs::write(dir.join("receipt.txt"), receipt).expect("write completed impact receipt");
         let mut files = vec![
@@ -11917,6 +11958,48 @@ mod tests {
                 .iter()
                 .any(|property| property == "OOMPolicy=stop")
         );
+        assert!(
+            properties
+                .iter()
+                .any(|property| property == "ExecStopPost=/usr/bin/sleep 1"),
+            "a completed worker cgroup must remain observable for the exit-primary memory.peak read"
+        );
+    }
+
+    #[test]
+    #[ignore = "live systemd control for a near-zero-work capped child"]
+    fn near_zero_worker_retains_an_exact_cgroup_peak() {
+        let dir = std::env::temp_dir().join(format!(
+            "crat-a4-near-zero-cgroup-control-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system clock before Unix epoch")
+                .as_nanos()
+        ));
+        fs::create_dir(&dir).expect("create near-zero cgroup control directory");
+        let missing_input = dir.join("intentionally-missing.rs");
+        let outcome =
+            run_capped_candidate_child("near-zero-cgroup-control", &missing_input, &dir, &[]);
+
+        assert!(
+            outcome.cap_verified,
+            "near-zero worker cap was not observed"
+        );
+        assert_eq!(
+            outcome.cgroup_peak_read_source,
+            CgroupPeakReadSource::ExitPrimary,
+            "the retained post-exit cgroup read must be primary"
+        );
+        let peaks = outcome
+            .memory_receipt
+            .require_complete()
+            .expect("near-zero worker must retain exact GNU-time and cgroup peaks");
+        assert!(peaks.process_peak_rss_kb > 0);
+        assert!(peaks.cgroup_peak_memory_kb > 0);
+        let receipt = outcome.render_memory_receipt();
+        assert!(receipt.contains("cgroup_peak_memory_kb="));
+        assert!(receipt.contains("cgroup_peak_read_source=exit-primary\n"));
     }
 
     #[test]
