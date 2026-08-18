@@ -1147,3 +1147,68 @@ fn signed_rem_offset_needs_cursor() {
         "signed remainder keeps the dividend's sign, so it may be negative"
     );
 }
+
+#[test]
+fn positive_guarded_sub_one_is_safe() {
+    let map = run_analysis(
+        "
+        pub unsafe fn f(p: *const i32, count: i32) {
+            if count > 0 { let _ = *p.offset((count - 1) as isize); }
+        }
+        ",
+    );
+    assert_eq!(
+        needs_cursor(&map, "f", "p"),
+        None,
+        "a strictly positive value minus one is non-negative"
+    );
+}
+
+#[test]
+fn early_return_guarded_sub_one_is_safe() {
+    let map = run_analysis(
+        "
+        pub unsafe fn f(p: *const i32, count: i32) {
+            if count <= 1 { return; }
+            let _ = *p.offset((count - 1) as isize);
+        }
+        ",
+    );
+    assert_eq!(
+        needs_cursor(&map, "f", "p"),
+        None,
+        "the guard leaves count >= 2 on the reaching path, so count - 1 >= 1"
+    );
+}
+
+#[test]
+fn unguarded_sub_one_needs_cursor() {
+    let map = run_analysis(
+        "
+        pub unsafe fn f(p: *const i32, count: i32) {
+            let _ = *p.offset((count - 1) as isize);
+        }
+        ",
+    );
+    assert_eq!(
+        needs_cursor(&map, "f", "p"),
+        Some(true),
+        "without a lower bound on count, count - 1 may be negative"
+    );
+}
+
+#[test]
+fn positive_guarded_sub_two_needs_cursor() {
+    let map = run_analysis(
+        "
+        pub unsafe fn f(p: *const i32, count: i32) {
+            if count > 0 { let _ = *p.offset((count - 2) as isize); }
+        }
+        ",
+    );
+    assert_eq!(
+        needs_cursor(&map, "f", "p"),
+        Some(true),
+        "count >= 1 only bounds count - 1; count - 2 may still be negative"
+    );
+}

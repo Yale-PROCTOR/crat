@@ -251,6 +251,8 @@ impl AbsValue {
             // --- sign-based rules ---
             (ConstI(c), Pos) | (Pos, ConstI(c)) if c > 0 => Pos,
             (ConstI(c), NonNeg) | (NonNeg, ConstI(c)) if c > 0 => Pos,
+            // `Pos` is >= 1, so subtracting 1 cannot go below zero
+            (ConstI(c), Pos) | (Pos, ConstI(c)) if c == -1 => NonNeg,
             (ConstI(c), Neg) | (Neg, ConstI(c)) if c < 0 => Neg,
             (ConstI(c), NonPos) | (NonPos, ConstI(c)) if c < 0 => Neg,
             (ConstU(_), Pos) | (Pos, ConstU(_)) => Pos,
