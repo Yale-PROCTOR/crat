@@ -4869,6 +4869,93 @@ fn both_layers_agree_on_a_reverted_program() {
     );
 }
 
+/// **ROUND 0 EMITS THROUGH THE SELECTED LAYER — the zero-revert shape.**
+///
+/// The largest of the four sites, and the last found. `emit_files` produces the
+/// loop's initial `files` through `render`, unconditionally; the loop's first
+/// act is to materialize it. So until a revert occurred, nothing switched — and
+/// **a program that converges with ZERO reverts returns that map unchanged**.
+///
+/// On the corpus that was **7 programs and 35 of the 64 emissions** emitting
+/// span text while the AST arm reported agreement on all three counters, which
+/// cannot see text. The measured witness was libcsv: 50,440 bytes on the AST
+/// layer against 55,764 on the span layer, same converged (empty) revert set,
+/// identical counters. This fixture is that shape in miniature.
+///
+/// **Non-vacuity is asserted, not assumed:** `reverted_count == 0` is the whole
+/// point — a fixture that reverted would reach `round_files` through the loop
+/// and pass even with the defect restored.
+///
+/// *Mutation-tested.* Restore `let mut files = files;` in place of the round-0
+/// re-emit and the AST arm returns the span map (91 → 99) — this fails.
+#[test]
+fn round_zero_emits_through_the_selected_layer() {
+    fn run(ast: bool) -> (usize, usize, Vec<(String, usize)>) {
+        let fixture = Fixture::new(&[(
+            "lib.rs",
+            "#![allow(dead_code, unused_unsafe)]\npub unsafe fn bump(p: *mut i32) -> i32 {\n    *p += 1;\n    *p\n}\n",
+        )]);
+        match super::rewrite_m1_path_on_layer(&fixture.root(), 8, &|_| {}, ast) {
+            super::RewriteOutcome::Emitted {
+                emitted_count,
+                reverted_count,
+                files,
+                ..
+            } => {
+                let mut v: Vec<(String, usize)> = files
+                    .iter()
+                    .map(|(k, t)| {
+                        let super::plan::FileKey::Real(p) = k else {
+                            return ("virtual".to_owned(), t.len());
+                        };
+                        (
+                            p.file_name()
+                                .expect("emitted file has a name")
+                                .to_string_lossy()
+                                .into_owned(),
+                            t.len(),
+                        )
+                    })
+                    .collect();
+                v.sort();
+                (emitted_count, reverted_count, v)
+            }
+            super::RewriteOutcome::Degraded { reason, .. } => {
+                (0, 0, vec![(format!("DEGRADED {reason}"), 0)])
+            }
+        }
+    }
+
+    let (span_emitted, span_reverted, span_files) = run(false);
+    let (ast_emitted, ast_reverted, ast_files) = run(true);
+
+    assert_eq!(
+        (span_emitted, span_reverted),
+        (1, 0),
+        "the fixture must EMIT and revert NOTHING — the zero-revert shape is \
+         the one that never reaches the loop's re-emit, and a fixture that \
+         reverted would witness nothing here"
+    );
+    assert_eq!(
+        (ast_emitted, ast_reverted),
+        (1, 0),
+        "both layers must agree on the counters; only the TEXT is at issue"
+    );
+    assert_eq!(
+        span_files,
+        vec![("lib.rs".to_owned(), 99)],
+        "the span layer splices its edit into the original text"
+    );
+    assert_eq!(
+        ast_files,
+        vec![("lib.rs".to_owned(), 91)],
+        "round 0 did not come from the AST layer: 99 bytes is the SPAN splice, \
+         91 is the `pprust` reprint. A zero-revert program returns the loop's \
+         initial map untouched, so if that map is `render`'s the program emits \
+         span text no matter which layer was selected"
+    );
+}
+
 /// **THE BISECT PATH EMITS THROUGH THE SELECTED LAYER.**
 ///
 /// Its sibling above compares loop-derived COUNTERS and passes either way; this

@@ -884,7 +884,51 @@ fn verify_and_revert(
         .and_then(|root| root.parent())
         .map(|d| d.to_path_buf());
     let mut reverted: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-    let mut files = files;
+    // **ROUND 0 THROUGH THE SWITCH — the FOURTH site** (ruling 2026-08-18).
+    //
+    // `files` arrives from `emit_files`, whose product is `render`'s: the SPAN
+    // layer, unconditionally. The loop's first act is to materialize it, so
+    // until a revert occurred nothing switched — and a program that converges
+    // with ZERO reverts returns this map unchanged. On the corpus that is **7
+    // programs and 35 of the 64 emissions**, every one of them emitting span
+    // text while the AST arm reported agreement, because the three counters
+    // cannot see text. libcsv is the measured witness: 50,440 bytes on the AST
+    // layer against 55,764 on the span layer, same converged (empty) revert
+    // set, identical counters.
+    //
+    // Re-emitting round 0 here puts every exit shape behind the one derivation.
+    // The incoming `files` is still what `root_key` is taken from and what the
+    // pre-loop rollback gate judged — that gate validates the PLAN (byte-offset
+    // collisions), which is layer-independent, so it keeps its meaning.
+    let (mut files, mut files_edited) = match round_files(
+        tcx,
+        capture,
+        &emission_plan,
+        &emission_texts,
+        &std::collections::BTreeSet::new(),
+        root_key.as_ref(),
+        table,
+        ast,
+    ) {
+        Ok((round0, rollbacks, edited)) => {
+            if !rollbacks.is_empty() {
+                // The pre-loop structural gate already rejected a non-empty
+                // rollback set for this plan, so this is a DISAGREEMENT between
+                // the two, not a plan defect — loud, never silent.
+                facts.files_touched = files_edited;
+                return facts.degraded(format!(
+                    "round-0 re-emit produced {} rollback(s) after the                      structural gate accepted the plan",
+                    rollbacks.len()
+                ));
+            }
+            (round0, edited)
+        }
+        Err(why) => {
+            facts.files_touched = files_edited;
+            return facts.degraded(format!("round-0 emit failed: {why}"));
+        }
+    };
+    facts.files_touched = files_edited;
     let mut rounds = 0usize;
     let mut previous_errors: Option<usize> = None;
     let mut probe_secs = 0.0f64;
@@ -2059,6 +2103,29 @@ pub(crate) struct Emission {
 /// Apply a plan's edits, minus the reverted owners, to the original texts.
 ///
 /// Pure: no compiler session, no analysis. This is what a revert round runs.
+/// # EXHAUSTIVE CALL-SITE TABLE (2026-08-18) — a fourth emission site must be
+/// impossible outside this table
+///
+/// Three unswitched emission sites were found one at a time, each after the
+/// previous was called the last: the bisect final emission (`:1069`), then
+/// round 0 (`emit_files`'s product). Each was invisible to the three counters,
+/// which compare DECISIONS while the difference was TEXT. So the sites are
+/// enumerated rather than trusted.
+///
+/// **Production — exactly two:**
+///
+/// | site | caller | disposition |
+/// |---|---|---|
+/// | `round_files`, span branch | the layer switch | **THE emission site.** All four emission paths — round 0, the per-round re-emit, the bisect probes, the bisect final emission — now route here. M-3 deletes this branch with the span layer |
+/// | `emit_files` | plan validation | **NOT an emission path since 2026-08-18.** Its `rollbacks` feed the pre-loop structural gate, which judges the PLAN (byte-offset collisions) and is therefore layer-independent; its `files` supply `root_key`. ⚠ **M-3 must keep or replace that gate — deleting `render` outright removes it** |
+///
+/// **Test-only — nine, none an emission path:** `edit_dump` and
+/// `phase3_fn_parity` (both `#[cfg(test)]`, each rendering the SPAN side of a
+/// deliberate two-layer comparison), and seven fixtures in `emit_tests` /
+/// `ast_transform::tests`.
+///
+/// Not in this table and not this function: the `.render(…)` METHODS on
+/// `fat_facts`, `sign_facts` and `decision::seam`, which share only the name.
 pub(crate) fn render(
     planned: &plan::Plan,
     texts: &std::collections::BTreeMap<plan::FileKey, String>,
