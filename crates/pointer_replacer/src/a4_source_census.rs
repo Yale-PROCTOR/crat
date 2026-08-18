@@ -7732,6 +7732,28 @@ fn inspect_substrate(
     }
 }
 
+/// Reuse the A4 preflight as the standing fresh-worktree substrate gate for
+/// later measurement harnesses. This exports one verdict, not the digest
+/// algorithm: there must remain one implementation of the frozen-substrate
+/// identity.
+pub(super) fn registered_substrate_digest(workspace: &Path) -> Result<String, String> {
+    let inputs = super::CORPUS
+        .iter()
+        .map(|program| (program.name, program.lib_root))
+        .collect::<Vec<_>>();
+    let result = inspect_substrate(workspace, &inputs, DERIVED_SUBSTRATE_DIGEST);
+    if result.status != SubstratePreflightStatus::Ok {
+        return Err(format!(
+            "status={} detail={}",
+            result.status.as_str(),
+            result.detail
+        ));
+    }
+    result
+        .actual_digest
+        .ok_or_else(|| "successful substrate preflight omitted its digest".to_owned())
+}
+
 fn receipt_value(value: &str) -> String {
     value.replace(['\n', '\r', '\t'], " ")
 }

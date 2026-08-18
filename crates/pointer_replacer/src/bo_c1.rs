@@ -49,6 +49,8 @@ mod a4_source_census;
 mod a5_measurement;
 #[path = "p_b_measurement.rs"]
 mod p_b_measurement;
+#[path = "promote_failure_measurement.rs"]
+mod promote_failure_measurement;
 #[path = "s23_measurement.rs"]
 mod s23_measurement;
 
