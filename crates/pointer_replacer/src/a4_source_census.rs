@@ -9895,7 +9895,34 @@ fn write_reference_roots(
     fs::rename(&temporary, output).map_err(|error| error.to_string())
 }
 
+fn parse_linux_vm_hwm_kb(status: &str) -> Result<u64, String> {
+    let rows = status
+        .lines()
+        .filter_map(|line| line.strip_prefix("VmHWM:"))
+        .collect::<Vec<_>>();
+    if rows.len() != 1 {
+        return Err(format!(
+            "expected exactly one Linux VmHWM row, found {}",
+            rows.len()
+        ));
+    }
+    let columns = rows[0].split_whitespace().collect::<Vec<_>>();
+    let [value, "kB"] = columns.as_slice() else {
+        return Err(format!("malformed Linux VmHWM row: {:?}", rows[0]));
+    };
+    value
+        .parse()
+        .map_err(|error| format!("invalid Linux VmHWM value {value:?}: {error}"))
+}
+
+fn current_process_peak_rss_kb() -> Result<u64, String> {
+    let status = fs::read_to_string("/proc/self/status")
+        .map_err(|error| format!("read /proc/self/status: {error}"))?;
+    parse_linux_vm_hwm_kb(&status)
+}
+
 fn build_reference_source_aggregate(contract: &MeasurementContract) {
+    let started = Instant::now();
     let output = contract.run_root.join("reference-aggregate");
     assert!(!output.exists(), "reference aggregate must be fresh");
     fs::create_dir(&output).expect("create reference aggregate");
@@ -10056,14 +10083,17 @@ fn build_reference_source_aggregate(contract: &MeasurementContract) {
         ),
     )
     .unwrap();
+    let aggregate_wall_s = started.elapsed().as_secs_f64();
+    let aggregate_peak_rss_kb = current_process_peak_rss_kb()
+        .expect("reference aggregate requires an exact Linux process peak RSS");
     let report = format!(
-        "# Provisional/reference allocation-source aggregate\n\n- expected source-census identities: 237\n- measured and walker-certified: 62\n- typed deferred/excluded: 175 (1 resource-exhausted, 33 walker-audit domain deferrals, 140 whole-program graph-domain deferrals, 1 taxonomy exclusion)\n- unknown/unexplained among measured: 0\n- predecessor reruns: none\n- reference-only: true\n- CROWN join use: design input, not publication numbers\n"
+        "# Provisional/reference allocation-source aggregate\n\n- expected source-census identities: 237\n- measured and walker-certified: 62\n- typed deferred/excluded: 175 (1 resource-exhausted, 33 walker-audit domain deferrals, 140 whole-program graph-domain deferrals, 1 taxonomy exclusion)\n- unknown/unexplained among measured: 0\n- predecessor reruns: none\n- aggregate wall on {MACHINE_ID}: {aggregate_wall_s:.3} s\n- aggregate peak RSS: {aggregate_peak_rss_kb} KiB\n- reference-only: true\n- CROWN join use: design input, not publication numbers\n"
     );
     fs::write(output.join("report.md"), report).unwrap();
     fs::write(
         output.join("provenance.txt"),
         format!(
-            "machine_id={MACHINE_ID}\nplatform={PLATFORM}\nanalysis_head={}\nanalysis_branch=codex/a4-source-census\nreference_only=true\nderived_substrate_digest={DERIVED_SUBSTRATE_DIGEST}\nsource_expected=237\nsource_measured=62\nsource_typed_deferred=175\nwalker_audit_manifest={REFERENCE_WALKER_AUDIT_MANIFEST}\ngap_attribution_manifest={GAP_ATTRIBUTION_AGGREGATE_MANIFEST}\nbzip2_shard_manifest={REFERENCE_BZIP2_MANIFEST}\nunknown=0\nunexplained=0\ntiming_comparison=forbidden-across-machines\n",
+            "machine_id={MACHINE_ID}\nplatform={PLATFORM}\nanalysis_head={}\nanalysis_branch=codex/a4-source-census\nreference_only=true\nderived_substrate_digest={DERIVED_SUBSTRATE_DIGEST}\nsource_expected=237\nsource_measured=62\nsource_typed_deferred=175\nwalker_audit_manifest={REFERENCE_WALKER_AUDIT_MANIFEST}\ngap_attribution_manifest={GAP_ATTRIBUTION_AGGREGATE_MANIFEST}\nbzip2_shard_manifest={REFERENCE_BZIP2_MANIFEST}\naggregate_wall_s={aggregate_wall_s:.3}\naggregate_peak_rss_kb={aggregate_peak_rss_kb}\nunknown=0\nunexplained=0\ntiming_comparison=forbidden-across-machines\n",
             contract.head
         ),
     )
@@ -15787,6 +15817,17 @@ mod tests {
         fs::write(&input, format!("{ROOT_HEADER}\nshort\trow\n")).unwrap();
         assert!(write_reference_roots(&[input], &output, &measured).is_err());
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn reference_aggregate_peak_rss_parser_is_linux_typed() {
+        assert_eq!(
+            parse_linux_vm_hwm_kb("Name:\tfixture\nVmHWM:\t  4242 kB\nVmRSS:\t  12 kB\n"),
+            Ok(4242)
+        );
+        assert!(parse_linux_vm_hwm_kb("Name:\tfixture\nVmRSS:\t12 kB\n").is_err());
+        assert!(parse_linux_vm_hwm_kb("VmHWM:\t4242 bytes\n").is_err());
+        assert!(parse_linux_vm_hwm_kb("VmHWM:\t1 kB\nVmHWM:\t2 kB\n").is_err());
     }
 
     fn preflight_fixture(label: &str) -> (PathBuf, PathBuf) {
