@@ -96,6 +96,10 @@ pub struct DecisionMaker<'tcx> {
     promoted_shared_refs: DenseBitSet<Local>,
     /// Locals that need a SliceCursor because they are offset with potentially-negative values.
     needs_cursor: DenseBitSet<Local>,
+    /// Cursor params with a call site whose argument has no derivable
+    /// allocation base; cursor constructions there would rebase to position
+    /// 0 and below-entry accesses would panic, so these stay raw pointers.
+    raw_fallback: DenseBitSet<Local>,
     non_null_locals: DenseBitSet<Local>,
 }
 
@@ -180,9 +184,13 @@ impl<'tcx> DecisionMaker<'tcx> {
         // reaches them, so call sites' rebase-to-pos-0 constructions preserve
         // behavior; locals keep cursors
         let arg_count = tcx.mir_drops_elaborated_and_const_checked(did).borrow().arg_count;
+        let mut raw_fallback = DenseBitSet::new_empty(mutable_pointers.len());
         for param in (1..=arg_count).map(Local::from_usize) {
             if analysis.cursor_demotion.is_demotable(did, param) {
                 needs_cursor.remove(param);
+            }
+            if analysis.cursor_construction.needs_raw_fallback(did, param) {
+                raw_fallback.insert(param);
             }
         }
         let non_null_locals = analysis
@@ -200,6 +208,7 @@ impl<'tcx> DecisionMaker<'tcx> {
             promoted_mut_refs,
             promoted_shared_refs,
             needs_cursor,
+            raw_fallback,
             non_null_locals,
         }
     }
@@ -245,10 +254,17 @@ impl<'tcx> DecisionMaker<'tcx> {
             } else if self._owning_pointers[local] && self.array_pointers[local] {
                 if self._output_params.contains(local) {
                     if self.needs_cursor.contains(local) {
-                        (
-                            Some(PtrKind::SliceCursor(true)),
-                            DecisionReason::OwningArrayOutputParam,
-                        )
+                        if self.raw_fallback.contains(local) {
+                            (
+                                Some(PtrKind::Raw(self.mutable_pointers[local])),
+                                DecisionReason::CursorUnderivableCallsite,
+                            )
+                        } else {
+                            (
+                                Some(PtrKind::SliceCursor(true)),
+                                DecisionReason::OwningArrayOutputParam,
+                            )
+                        }
                     } else {
                         (
                             Some(PtrKind::Slice(true)),
@@ -283,10 +299,17 @@ impl<'tcx> DecisionMaker<'tcx> {
             } else if self.array_pointers[local] {
                 if self.promoted_shared_refs.contains(local) {
                     if self.needs_cursor.contains(local) {
-                        (
-                            Some(PtrKind::SliceCursor(false)),
-                            DecisionReason::ArrayBorrowPromotedShared,
-                        )
+                        if self.raw_fallback.contains(local) {
+                            (
+                                Some(PtrKind::Raw(self.mutable_pointers[local])),
+                                DecisionReason::CursorUnderivableCallsite,
+                            )
+                        } else {
+                            (
+                                Some(PtrKind::SliceCursor(false)),
+                                DecisionReason::ArrayBorrowPromotedShared,
+                            )
+                        }
                     } else {
                         (
                             Some(PtrKind::Slice(false)),
@@ -295,10 +318,17 @@ impl<'tcx> DecisionMaker<'tcx> {
                     }
                 } else if self.promoted_mut_refs.contains(local) {
                     if self.needs_cursor.contains(local) {
-                        (
-                            Some(PtrKind::SliceCursor(true)),
-                            DecisionReason::ArrayBorrowPromotedMut,
-                        )
+                        if self.raw_fallback.contains(local) {
+                            (
+                                Some(PtrKind::Raw(self.mutable_pointers[local])),
+                                DecisionReason::CursorUnderivableCallsite,
+                            )
+                        } else {
+                            (
+                                Some(PtrKind::SliceCursor(true)),
+                                DecisionReason::ArrayBorrowPromotedMut,
+                            )
+                        }
                     } else {
                         (
                             Some(PtrKind::Slice(true)),
@@ -1129,6 +1159,7 @@ mod tests {
             promoted_mut_refs,
             promoted_shared_refs,
             needs_cursor: needs_cursor_set,
+            raw_fallback: DenseBitSet::new_empty(len),
             non_null_locals,
         }
     }

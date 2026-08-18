@@ -8771,6 +8771,64 @@ pub unsafe fn drive() -> u8 {
     );
 }
 
+/// a call site passing a borrowed struct field has no derivable allocation
+/// base, so the definitely-negative param falls back to a raw pointer
+/// instead of a cursor that would rebase to position 0
+#[test]
+fn test_field_borrow_caller_makes_negative_cursor_input_raw() {
+    run_test(
+        r#"
+pub struct Pair {
+    pub a: i32,
+    pub b: i32,
+}
+
+pub unsafe fn read_prev(p: *const i32) -> i32 {
+    *p.offset(-1)
+}
+
+pub unsafe fn drive() -> i32 {
+    let pair = Pair { a: 1, b: 2 };
+    read_prev(&pair.b as *const i32)
+}
+"#,
+        &["p: *const i32"],
+        &["p: crate::slice_cursor::SliceCursor"],
+    );
+}
+
+/// the raw fallback cascades through forwarded params: `outer`'s param has
+/// an underivable call site, so `inner`'s param fed from it goes raw too
+#[test]
+fn test_raw_fallback_cascades_through_forwarded_param() {
+    run_test(
+        r#"
+pub struct Pair {
+    pub a: i32,
+    pub b: i32,
+}
+
+pub unsafe fn inner(p: *const i32) -> i32 {
+    *p.offset(-1)
+}
+
+pub unsafe fn outer(q: *const i32) -> i32 {
+    *q.offset(-1) + inner(q)
+}
+
+pub unsafe fn drive() -> i32 {
+    let pair = Pair { a: 1, b: 2 };
+    outer(&pair.b as *const i32)
+}
+"#,
+        &["p: *const i32", "q: *const i32"],
+        &[
+            "p: crate::slice_cursor::SliceCursor",
+            "q: crate::slice_cursor::SliceCursor",
+        ],
+    );
+}
+
 #[test]
 fn test_mut_cursor_multi_offset_deref_uses_combined_index() {
     run_test(
