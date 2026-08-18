@@ -6,6 +6,7 @@ version = 4
 name = "crown_artifact_inventory"
 version = "0.1.0"
 dependencies = [
+ "quote",
  "serde_json",
  "syn 2.0.119",
 ]
