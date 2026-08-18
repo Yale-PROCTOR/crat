@@ -6,7 +6,7 @@
 use std::{
     cell::RefCell,
     collections::{BTreeMap, BTreeSet, VecDeque},
-    ffi::OsString,
+    ffi::{OsStr, OsString},
     fs,
     io::{BufRead, BufReader, BufWriter, Write},
     panic::{self, AssertUnwindSafe},
@@ -1445,6 +1445,17 @@ struct GraphShapeGap {
     detail: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct GapSiteWaiver {
+    program: String,
+    gap: GraphShapeGap,
+    accepted_details: BTreeSet<String>,
+    excluded_identities: BTreeSet<Identity>,
+    attribution_aggregate_manifest: String,
+    attribution_program_manifest: String,
+    mapping_sha256: String,
+}
+
 #[derive(Clone, Debug)]
 enum GraphGapAnchor {
     MirLocal { fn_did: LocalDefId, local: Local },
@@ -1497,6 +1508,9 @@ thread_local! {
     };
     static GRAPH_GAP_ANCHORS: RefCell<Option<BTreeMap<GraphShapeGap, Vec<GraphGapAnchor>>>> = const {
         RefCell::new(None)
+    };
+    static ACTIVE_GAP_WAIVER_HITS: RefCell<BTreeSet<String>> = const {
+        RefCell::new(BTreeSet::new())
     };
 }
 
@@ -1696,6 +1710,9 @@ fn insert_static_data_derivation_or_record_gap(
                 site,
                 detail,
             };
+            if active_gap_waiver_allows(&gap)? {
+                return Ok(false);
+            }
             if record_graph_shape_gap(gap.clone()) {
                 record_graph_gap_anchor(gap, GraphGapAnchor::MirLocal { fn_did, local });
                 Ok(false)
@@ -4498,6 +4515,8 @@ pub(super) fn run_worker(tcx: TyCtxt<'_>, t_tcx: Duration) -> Row {
         selector_state(&ordinary, &ordinary_selectors);
     emit_phase(started, "graph-construction", None, 0);
     let graph = build_source_graph(tcx, &slots, &_ordinary_export);
+    verify_active_gap_waivers_exercised()
+        .unwrap_or_else(|error| panic!("A4C STOP phase=graph-gap-waiver candidate=none: {error}"));
     let fields = candidate_fields(tcx, &slots);
 
     let mut candidate_records = Vec::with_capacity(census_input.len());
@@ -4860,6 +4879,13 @@ const GAP_ATTRIBUTION_AGGREGATE_MANIFEST: &str =
     "8688d0c4416d7ab88d7fdab1b47d9b9de06aacf7101208f5fe49af0134dd1f59";
 const BZIP2_GAP_ATTRIBUTION_MANIFEST: &str =
     "c081c1fdc8066503f9eb0a22db34921728da08f1eb415b855214b2f15f798a81";
+const GAP_WAIVER_HEADER: &str = "program\tkind\tfunction\tsite\tdetail\texcluded_field_keys\tattribution_aggregate_manifest\tattribution_program_manifest\tmapping_sha256";
+const BZIP2_GAP_WAIVER_FUNCTION: &str = "bzlib::bzopen_or_bzdopen";
+const BZIP2_GAP_WAIVER_SITE: &str = "bb32[3] _79";
+const BZIP2_GAP_WAIVER_DETAIL: &str =
+    "local=_79 previous=bzlib::__stdoutp@0 incoming=bzlib::__stdinp@0";
+const BZIP2_GAP_WAIVER_REVERSED_DETAIL: &str =
+    "local=_79 previous=bzlib::__stdinp@0 incoming=bzlib::__stdoutp@0";
 const TAXONOMY_TYPED_EXCLUSION_PROGRAM: &str = "bzip2";
 const TAXONOMY_TYPED_EXCLUSION_FIELD_KEY: &str = "bzlib::bzFile::field0@d0";
 const TAXONOMY_TYPED_EXCLUSION_INDEX: usize = 22;
@@ -5036,6 +5062,218 @@ const RETRY3_PREDECESSOR_SHARDS: [(&str, &str, &str); 15] = [
     ("lil", COMPLETED_LIL_HEAD, COMPLETED_LIL_MANIFEST),
     ("heman", COMPLETED_HEMAN_HEAD, COMPLETED_HEMAN_MANIFEST),
 ];
+
+fn registered_bzip2_gap_waiver() -> GapSiteWaiver {
+    GapSiteWaiver {
+        program: "bzip2".to_owned(),
+        gap: GraphShapeGap {
+            kind: "multi-static-identity-merge",
+            function: BZIP2_GAP_WAIVER_FUNCTION.to_owned(),
+            site: BZIP2_GAP_WAIVER_SITE.to_owned(),
+            detail: BZIP2_GAP_WAIVER_DETAIL.to_owned(),
+        },
+        accepted_details: BTreeSet::from([
+            BZIP2_GAP_WAIVER_DETAIL.to_owned(),
+            BZIP2_GAP_WAIVER_REVERSED_DETAIL.to_owned(),
+        ]),
+        excluded_identities: BTreeSet::from([Identity {
+            program: TAXONOMY_TYPED_EXCLUSION_PROGRAM.to_owned(),
+            field_key: TAXONOMY_TYPED_EXCLUSION_FIELD_KEY.to_owned(),
+        }]),
+        attribution_aggregate_manifest: GAP_ATTRIBUTION_AGGREGATE_MANIFEST.to_owned(),
+        attribution_program_manifest: BZIP2_GAP_ATTRIBUTION_MANIFEST.to_owned(),
+        mapping_sha256: BZIP2_GAP_MAPPING_SHA256.to_owned(),
+    }
+}
+
+fn gap_matches_waiver(waiver: &GapSiteWaiver, gap: &GraphShapeGap) -> bool {
+    waiver.gap.kind == gap.kind
+        && waiver.gap.function == gap.function
+        && waiver.gap.site == gap.site
+        && waiver.accepted_details.contains(&gap.detail)
+}
+
+fn authorize_gap_waiver(
+    waiver: &GapSiteWaiver,
+    gap: &GraphShapeGap,
+    mapped: &BTreeSet<Identity>,
+    typed_excluded: &BTreeSet<Identity>,
+) -> Result<(), String> {
+    if !gap_matches_waiver(waiver, gap) {
+        return Err(format!("gap waiver tuple drift: {gap:?}"));
+    }
+    if mapped.is_empty() {
+        return Err("gap waiver mapping is empty".to_owned());
+    }
+    if mapped != &waiver.excluded_identities {
+        return Err(format!(
+            "gap waiver mapping differs from preregistration: expected={:?} actual={mapped:?}",
+            waiver.excluded_identities
+        ));
+    }
+    if !mapped.is_subset(typed_excluded) {
+        return Err(format!(
+            "gap waiver reaches a measured candidate: mapped={mapped:?} typed_excluded={typed_excluded:?}"
+        ));
+    }
+    Ok(())
+}
+
+fn render_gap_waivers(waivers: &[GapSiteWaiver]) -> String {
+    let mut waivers = waivers.to_vec();
+    waivers.sort_by(|left, right| {
+        (&left.program, &left.gap.function, &left.gap.site).cmp(&(
+            &right.program,
+            &right.gap.function,
+            &right.gap.site,
+        ))
+    });
+    let mut rendered = format!("{GAP_WAIVER_HEADER}\n");
+    for waiver in waivers {
+        let excluded = waiver
+            .excluded_identities
+            .iter()
+            .map(|identity| identity.field_key.as_str())
+            .collect::<Vec<_>>()
+            .join("|");
+        rendered.push_str(&format!(
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+            waiver.program,
+            waiver.gap.kind,
+            waiver.gap.function,
+            waiver.gap.site,
+            waiver.gap.detail,
+            excluded,
+            waiver.attribution_aggregate_manifest,
+            waiver.attribution_program_manifest,
+            waiver.mapping_sha256,
+        ));
+    }
+    rendered
+}
+
+fn read_active_gap_waivers(path: &Path) -> Result<Vec<GapSiteWaiver>, String> {
+    let input = fs::read_to_string(path)
+        .map_err(|error| format!("read gap-waiver table {}: {error}", path.display()))?;
+    let registered = registered_bzip2_gap_waiver();
+    let expected = render_gap_waivers(std::slice::from_ref(&registered));
+    if input != expected {
+        return Err(format!(
+            "active gap-waiver table is not the exact registered table: {}",
+            path.display()
+        ));
+    }
+    Ok(vec![registered])
+}
+
+fn gap_waiver_key(waiver: &GapSiteWaiver) -> String {
+    format!(
+        "{}\t{}\t{}\t{}",
+        waiver.program, waiver.gap.kind, waiver.gap.function, waiver.gap.site
+    )
+}
+
+fn active_gap_waiver_allows(gap: &GraphShapeGap) -> Result<bool, String> {
+    let Some(path) = std::env::var_os("CRAT_A4_SOURCE_GAP_WAIVERS") else {
+        return Ok(false);
+    };
+    let waivers = read_active_gap_waivers(Path::new(&path))?;
+    let Some(waiver) = waivers
+        .iter()
+        .find(|waiver| gap_matches_waiver(waiver, gap))
+    else {
+        return Ok(false);
+    };
+    ACTIVE_GAP_WAIVER_HITS.with(|hits| {
+        hits.borrow_mut().insert(gap_waiver_key(waiver));
+    });
+    eprintln!(
+        "A4C gap-waiver applied program={} function={} site={} attribution_manifest={}",
+        waiver.program, waiver.gap.function, waiver.gap.site, waiver.attribution_program_manifest,
+    );
+    Ok(true)
+}
+
+fn verify_active_gap_waivers_exercised() -> Result<(), String> {
+    let Some(path) = std::env::var_os("CRAT_A4_SOURCE_GAP_WAIVERS") else {
+        return Ok(());
+    };
+    let waivers = read_active_gap_waivers(Path::new(&path))?;
+    let expected = waivers.iter().map(gap_waiver_key).collect::<BTreeSet<_>>();
+    let actual = ACTIVE_GAP_WAIVER_HITS.with(|hits| std::mem::take(&mut *hits.borrow_mut()));
+    if actual != expected {
+        return Err(format!(
+            "active gap-waiver hit set drift: expected={expected:?} actual={actual:?}"
+        ));
+    }
+    Ok(())
+}
+
+fn render_gap_waiver_receipt(count: usize, table_sha256: &str) -> Result<String, String> {
+    if count == 0 {
+        if table_sha256 != "none" {
+            return Err("zero gap waivers carry a table digest".to_owned());
+        }
+        return Ok(String::new());
+    }
+    if table_sha256.len() != 64 || !table_sha256.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err("active gap-waiver table digest is not SHA-256".to_owned());
+    }
+    Ok(format!(
+        "graph_gap_waivers={count}\ngraph_gap_waiver_table_sha256={table_sha256}\n"
+    ))
+}
+
+fn validate_registered_gap_waivers_for_program(
+    program: &str,
+    typed_excluded: &BTreeSet<Identity>,
+) -> Result<Vec<GapSiteWaiver>, String> {
+    if program != "bzip2" {
+        return Ok(Vec::new());
+    }
+    let root = Path::new(GAP_ATTRIBUTION_SOURCE_ROOT);
+    let aggregate_manifest = verify_manifest(root)?;
+    let program_dir = root.join(program);
+    let program_manifest = verify_manifest(&program_dir)?;
+    let mapping_path = program_dir.join("mapping.tsv");
+    let mapping_sha = sha256(&mapping_path);
+    let mapping = parse_table(&mapping_path, GAP_ATTRIBUTION_HEADER, 6)?;
+    let aggregate_mapping = parse_table(&root.join("mapping.tsv"), GAP_ATTRIBUTION_HEADER, 6)?;
+    if mapping != aggregate_mapping {
+        return Err("gap-waiver program/aggregate mapping drift".to_owned());
+    }
+    let waiver = registered_bzip2_gap_waiver();
+    if aggregate_manifest != waiver.attribution_aggregate_manifest
+        || program_manifest != waiver.attribution_program_manifest
+        || mapping_sha != waiver.mapping_sha256
+    {
+        return Err(format!(
+            "gap-waiver attribution artifact drift: aggregate={aggregate_manifest} program={program_manifest} mapping={mapping_sha}"
+        ));
+    }
+    if mapping.len() != 1 {
+        return Err(format!(
+            "gap-waiver mapping cardinality drift: expected=1 actual={}",
+            mapping.len()
+        ));
+    }
+    let row = &mapping[0];
+    let gap = GraphShapeGap {
+        kind: match row[1].as_str() {
+            "multi-static-identity-merge" => "multi-static-identity-merge",
+            other => return Err(format!("gap-waiver kind drift: {other}")),
+        },
+        function: row[2].clone(),
+        site: row[3].clone(),
+        detail: row[4].clone(),
+    };
+    let mapped = BTreeSet::from([Identity {
+        program: row[0].clone(),
+        field_key: row[5].clone(),
+    }]);
+    authorize_gap_waiver(&waiver, &gap, &mapped, typed_excluded)?;
+    Ok(vec![waiver])
+}
 
 fn command_stdout(mut command: Command, description: &str) -> String {
     let output = command
@@ -6215,6 +6453,26 @@ fn validate_completed_receipt(
         }
         validate_completed_shard_metrics(receipt, census_expected + exception_expected)?;
     }
+    if receipt_head == &contract.head && program == "bzip2" {
+        let expected_digest =
+            try_sha256_text(&render_gap_waivers(&[registered_bzip2_gap_waiver()]))?;
+        for (key, expected) in [
+            ("graph_gap_waivers", "1"),
+            ("graph_gap_waiver_table_sha256", expected_digest.as_str()),
+        ] {
+            if receipt.get(key).map(String::as_str) != Some(expected) {
+                return Err(format!(
+                    "completed gap-waiver receipt {key} drift: program={program}"
+                ));
+            }
+        }
+    } else if receipt.contains_key("graph_gap_waivers")
+        || receipt.contains_key("graph_gap_waiver_table_sha256")
+    {
+        return Err(format!(
+            "receipt carries an unregistered gap waiver: program={program} head={receipt_head}"
+        ));
+    }
     for (key, expected) in [
         ("program", program),
         ("a4_aggregate_manifest_sha256", A4_AGGREGATE_MANIFEST_SHA256),
@@ -6440,6 +6698,7 @@ fn run_capped_candidate_child(
     let exe = std::env::current_exe().expect("current test executable");
 
     let mut environment = std::env::vars_os().collect::<BTreeMap<OsString, OsString>>();
+    environment.remove(OsStr::new("CRAT_A4_SOURCE_GAP_WAIVERS"));
     for (key, value) in [
         ("CRAT_BOC1_INPUT", input.display().to_string()),
         ("CRAT_BOC1_MODE", "a4-source-census".to_owned()),
@@ -7028,6 +7287,29 @@ fn validate_shard(contract: &MeasurementContract, program: &str, dir: &Path) -> 
     let roots = scan_root_path(&dir.join("roots.tsv"))?;
     let exceptions = parse_table(&dir.join("exceptions.tsv"), EXCEPTION_HEADER, 28)?;
     let typed_exclusions = parse_typed_exclusions(&dir.join("typed-exclusions.tsv"))?;
+    let typed_exclusion_identity_set = typed_exclusions
+        .iter()
+        .map(|exclusion| exclusion.identity.clone())
+        .collect::<BTreeSet<_>>();
+    let expected_gap_waivers =
+        validate_registered_gap_waivers_for_program(program, &typed_exclusion_identity_set)?;
+    let gap_waiver_path = dir.join("gap-waivers.tsv");
+    if expected_gap_waivers.is_empty() {
+        if gap_waiver_path.exists() {
+            return Err(format!(
+                "unregistered gap-waiver table exists for program {program}"
+            ));
+        }
+    } else {
+        let actual = fs::read_to_string(&gap_waiver_path)
+            .map_err(|error| format!("read active gap-waiver table: {error}"))?;
+        let expected = render_gap_waivers(&expected_gap_waivers);
+        if actual != expected {
+            return Err(format!(
+                "active gap-waiver table drift for program {program}"
+            ));
+        }
+    }
     let candidate_ids = candidates
         .iter()
         .map(|row| Identity {
@@ -7686,6 +7968,28 @@ fn validate_isolated_unit(
         }
     }
     if current_head {
+        if expected.identity.program == "bzip2" {
+            let expected_digest =
+                try_sha256_text(&render_gap_waivers(&[registered_bzip2_gap_waiver()]))?;
+            for (key, expected_value) in [
+                ("graph_gap_waivers", "1"),
+                ("graph_gap_waiver_table_sha256", expected_digest.as_str()),
+            ] {
+                if receipt.get(key).map(String::as_str) != Some(expected_value) {
+                    return Err(format!(
+                        "isolated gap-waiver receipt {key} mismatch for {}",
+                        expected.identity.field_key
+                    ));
+                }
+            }
+        } else if receipt.contains_key("graph_gap_waivers")
+            || receipt.contains_key("graph_gap_waiver_table_sha256")
+        {
+            return Err(format!(
+                "isolated receipt carries an unregistered gap waiver for {}",
+                expected.identity.field_key
+            ));
+        }
         let preflight = parse_receipt(&dir.join("memory-preflight.txt"))?;
         for (key, expected_value) in [
             ("status", "ready"),
@@ -7846,6 +8150,38 @@ fn run_shard(contract: &MeasurementContract, program: super::CorpusProgram) {
         .join(program.name)
         .join(program.lib_root);
     let identities = isolated_identities(contract, program.name);
+    let expected_typed_exclusions = expected_typed_exclusion_identities(program.name)
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    let gap_waivers =
+        validate_registered_gap_waivers_for_program(program.name, &expected_typed_exclusions)
+            .unwrap_or_else(|error| {
+                panic!(
+                    "A4C STOP phase=graph-gap-waiver-validation candidate={}: {error}",
+                    program.name
+                )
+            });
+    let gap_waiver_path = dir.join("gap-waivers.tsv");
+    let gap_waiver_table_sha256 = if gap_waivers.is_empty() {
+        "none".to_owned()
+    } else {
+        let rendered = render_gap_waivers(&gap_waivers);
+        if gap_waiver_path.is_file() {
+            let existing = fs::read_to_string(&gap_waiver_path)
+                .expect("read existing active gap-waiver table");
+            assert_eq!(
+                existing, rendered,
+                "A4C STOP phase=graph-gap-waiver-validation candidate={}: active table drift",
+                program.name
+            );
+        } else {
+            write_atomic_checkpoint(&gap_waiver_path, &rendered)
+                .expect("write active gap-waiver table");
+        }
+        sha256(&gap_waiver_path)
+    };
+    let gap_waiver_receipt = render_gap_waiver_receipt(gap_waivers.len(), &gap_waiver_table_sha256)
+        .expect("render active gap-waiver receipt");
     let mut completed = Vec::<(usize, IsolatedIdentity, String, f64, CandidateMemoryPeaks)>::new();
     let mut typed_exclusions = Vec::<TypedExclusion>::new();
     for (index, identity) in identities.iter().cloned().enumerate() {
@@ -7958,37 +8294,40 @@ fn run_shard(contract: &MeasurementContract, program: super::CorpusProgram) {
                 preflight.required_bytes,
             );
         }
-        let outcome = run_capped_candidate_child(
-            program.name,
-            &input,
-            &unit_dir,
-            &[
-                (
-                    "CRAT_A4_SOURCE_INPUT",
-                    contract.input_path.display().to_string(),
-                ),
-                (
-                    "CRAT_A4_SOURCE_CANDIDATE",
-                    identity.identity.field_key.clone(),
-                ),
-                (
-                    "CRAT_A4_SOURCE_CANDIDATES",
-                    unit_dir.join("candidates.tsv").display().to_string(),
-                ),
-                (
-                    "CRAT_A4_SOURCE_ROOTS",
-                    unit_dir.join("roots.tsv").display().to_string(),
-                ),
-                (
-                    "CRAT_A4_SOURCE_EXCEPTIONS",
-                    unit_dir.join("exceptions.tsv").display().to_string(),
-                ),
-                (
-                    "CRAT_A4_SOURCE_CHECKPOINT",
-                    unit_dir.join("partial.tsv").display().to_string(),
-                ),
-            ],
-        );
+        let mut candidate_environment = vec![
+            (
+                "CRAT_A4_SOURCE_INPUT",
+                contract.input_path.display().to_string(),
+            ),
+            (
+                "CRAT_A4_SOURCE_CANDIDATE",
+                identity.identity.field_key.clone(),
+            ),
+            (
+                "CRAT_A4_SOURCE_CANDIDATES",
+                unit_dir.join("candidates.tsv").display().to_string(),
+            ),
+            (
+                "CRAT_A4_SOURCE_ROOTS",
+                unit_dir.join("roots.tsv").display().to_string(),
+            ),
+            (
+                "CRAT_A4_SOURCE_EXCEPTIONS",
+                unit_dir.join("exceptions.tsv").display().to_string(),
+            ),
+            (
+                "CRAT_A4_SOURCE_CHECKPOINT",
+                unit_dir.join("partial.tsv").display().to_string(),
+            ),
+        ];
+        if !gap_waivers.is_empty() {
+            candidate_environment.push((
+                "CRAT_A4_SOURCE_GAP_WAIVERS",
+                gap_waiver_path.display().to_string(),
+            ));
+        }
+        let outcome =
+            run_capped_candidate_child(program.name, &input, &unit_dir, &candidate_environment);
         let (phase, marker_candidate) = last_phase(&outcome.stderr);
         if outcome.status != "ok" {
             let memory_peaks = outcome.memory_receipt.require_complete().ok();
@@ -8017,7 +8356,7 @@ fn run_shard(contract: &MeasurementContract, program: super::CorpusProgram) {
                 "none"
             };
             let receipt = format!(
-                "machine_id={MACHINE_ID}\nplatform={PLATFORM}\nmemory_limit=cgroup-100GiB\nmemory_max_bytes={CANDIDATE_MEMORY_MAX_BYTES}\ncap_verified={}\noom_kills={}\nmemory_max_events={}\noom_killer={oom_killer}\nwall_bound_kind=liveness\nwall_cap_s={LIVENESS_BOUND_S}\nprogram={}\ncandidate={}\npopulation={}\nstatus={}\ndata=false\ncheckpoint_data=false\nanalysis_head={}\nlast_phase={phase}\nlast_candidate={marker_candidate}\nwall_s={:.3}\n{memory_receipt}memory_receipt_error={memory_receipt_error}\n",
+                "machine_id={MACHINE_ID}\nplatform={PLATFORM}\nmemory_limit=cgroup-100GiB\nmemory_max_bytes={CANDIDATE_MEMORY_MAX_BYTES}\ncap_verified={}\noom_kills={}\nmemory_max_events={}\noom_killer={oom_killer}\nwall_bound_kind=liveness\nwall_cap_s={LIVENESS_BOUND_S}\nprogram={}\ncandidate={}\npopulation={}\nstatus={}\ndata=false\ncheckpoint_data=false\nanalysis_head={}\nlast_phase={phase}\nlast_candidate={marker_candidate}\nwall_s={:.3}\n{memory_receipt}memory_receipt_error={memory_receipt_error}\n{gap_waiver_receipt}",
                 outcome.cap_verified,
                 outcome.oom_kills,
                 outcome.memory_max_events,
@@ -8087,7 +8426,7 @@ fn run_shard(contract: &MeasurementContract, program: super::CorpusProgram) {
             Err(error) => {
                 let memory_receipt = render_candidate_memory_receipt(memory_peaks);
                 let receipt = format!(
-                    "machine_id={MACHINE_ID}\nplatform={PLATFORM}\nmemory_limit=cgroup-100GiB\nmemory_max_bytes={CANDIDATE_MEMORY_MAX_BYTES}\ncap_verified={}\noom_kills={}\nmemory_max_events={}\noom_killer=none\nwall_bound_kind=liveness\nwall_cap_s={LIVENESS_BOUND_S}\nprogram={}\ncandidate={}\npopulation={}\nstatus=oracle-byte-mismatch\ndata=false\ncheckpoint_data=false\nanalysis_head={}\nlast_phase=oracle-byte-compare\nlast_candidate={}\nwall_s={:.3}\n{memory_receipt}memory_receipt_error=none\noracle_byte_match=false\noracle_partial_sha256={LIL_ORACLE_PARTIAL_SHA256}\n",
+                    "machine_id={MACHINE_ID}\nplatform={PLATFORM}\nmemory_limit=cgroup-100GiB\nmemory_max_bytes={CANDIDATE_MEMORY_MAX_BYTES}\ncap_verified={}\noom_kills={}\nmemory_max_events={}\noom_killer=none\nwall_bound_kind=liveness\nwall_cap_s={LIVENESS_BOUND_S}\nprogram={}\ncandidate={}\npopulation={}\nstatus=oracle-byte-mismatch\ndata=false\ncheckpoint_data=false\nanalysis_head={}\nlast_phase=oracle-byte-compare\nlast_candidate={}\nwall_s={:.3}\n{memory_receipt}memory_receipt_error=none\noracle_byte_match=false\noracle_partial_sha256={LIL_ORACLE_PARTIAL_SHA256}\n{gap_waiver_receipt}",
                     outcome.cap_verified,
                     outcome.oom_kills,
                     outcome.memory_max_events,
@@ -8133,7 +8472,7 @@ fn run_shard(contract: &MeasurementContract, program: super::CorpusProgram) {
         };
         let memory_receipt = render_candidate_memory_receipt(memory_peaks);
         let receipt = format!(
-            "machine_id={MACHINE_ID}\nplatform={PLATFORM}\nmemory_limit=cgroup-100GiB\nmemory_max_bytes={CANDIDATE_MEMORY_MAX_BYTES}\ncap_verified={}\noom_kills={}\nmemory_max_events={}\noom_killer=none\nwall_bound_kind=liveness\nwall_cap_s={LIVENESS_BOUND_S}\nprogram={}\ncandidate={}\npopulation={}\nstatus=ok\ndata=true\ncheckpoint_data=false\nanalysis_head={}\ncandidates={}\nroots={}\nexceptions={}\nlast_phase={phase}\nlast_candidate={marker_candidate}\nwall_s={:.3}\n{memory_receipt}memory_receipt_error=none\noracle_byte_match={oracle_label}\noracle_partial_sha256={LIL_ORACLE_PARTIAL_SHA256}\n",
+            "machine_id={MACHINE_ID}\nplatform={PLATFORM}\nmemory_limit=cgroup-100GiB\nmemory_max_bytes={CANDIDATE_MEMORY_MAX_BYTES}\ncap_verified={}\noom_kills={}\nmemory_max_events={}\noom_killer=none\nwall_bound_kind=liveness\nwall_cap_s={LIVENESS_BOUND_S}\nprogram={}\ncandidate={}\npopulation={}\nstatus=ok\ndata=true\ncheckpoint_data=false\nanalysis_head={}\ncandidates={}\nroots={}\nexceptions={}\nlast_phase={phase}\nlast_candidate={marker_candidate}\nwall_s={:.3}\n{memory_receipt}memory_receipt_error=none\noracle_byte_match={oracle_label}\noracle_partial_sha256={LIL_ORACLE_PARTIAL_SHA256}\n{gap_waiver_receipt}",
             outcome.cap_verified,
             outcome.oom_kills,
             outcome.memory_max_events,
@@ -8289,7 +8628,7 @@ fn run_shard(contract: &MeasurementContract, program: super::CorpusProgram) {
         "A4C STOP phase=oracle-byte-compare candidate={}: oracle match count drift",
         program.name
     );
-    let receipt = render_completed_shard_receipt(&CompletedShardReceiptInput {
+    let mut receipt = render_completed_shard_receipt(&CompletedShardReceiptInput {
         program: program.name,
         analysis_head: &contract.head,
         unit_identities_expected: identities.len(),
@@ -8305,20 +8644,21 @@ fn run_shard(contract: &MeasurementContract, program: super::CorpusProgram) {
         memory_peaks,
     })
     .expect("render completed shard receipt");
+    receipt.push_str(&gap_waiver_receipt);
     fs::write(dir.join("receipt.txt"), receipt).expect("write completed receipt");
-    let manifest = write_manifest(
-        &dir,
-        &[
-            "candidates.tsv",
-            "roots.tsv",
-            "exceptions.tsv",
-            "typed-exclusions.tsv",
-            "partial.tsv",
-            "units.tsv",
-            "receipt.txt",
-        ],
-    )
-    .expect("manifest completed shard");
+    let mut manifest_files = vec![
+        "candidates.tsv",
+        "roots.tsv",
+        "exceptions.tsv",
+        "typed-exclusions.tsv",
+        "partial.tsv",
+        "units.tsv",
+        "receipt.txt",
+    ];
+    if !gap_waivers.is_empty() {
+        manifest_files.push("gap-waivers.tsv");
+    }
+    let manifest = write_manifest(&dir, &manifest_files).expect("manifest completed shard");
     let verified = verify_manifest(&dir).expect("verify newly completed shard manifest");
     assert_eq!(verified, manifest, "completed shard manifest digest drift");
     let receipt = parse_receipt(&dir.join("receipt.txt")).expect("reparse completed receipt");
@@ -8401,6 +8741,7 @@ fn aggregate(contract: &MeasurementContract) {
     let mut combined_candidates = format!("{CANDIDATE_HEADER}\n");
     let mut combined_exceptions = format!("{EXCEPTION_HEADER}\n");
     let mut combined_typed_exclusions = format!("{TYPED_EXCLUSION_HEADER}\n");
+    let mut combined_gap_waivers = format!("{GAP_WAIVER_HEADER}\n");
     let mut root_inputs = Vec::new();
     let mut receipts = Vec::new();
     let mut shard_manifests = Vec::new();
@@ -8432,11 +8773,20 @@ fn aggregate(contract: &MeasurementContract) {
                 TYPED_EXCLUSION_HEADER,
             );
         }
+        let waiver_path = dir.join("gap-waivers.tsv");
+        if waiver_path.is_file() {
+            append_table(
+                &mut combined_gap_waivers,
+                &fs::read_to_string(&waiver_path).expect("read gap-waiver shard"),
+                GAP_WAIVER_HEADER,
+            );
+        }
     }
     let candidates_path = aggregate_dir.join("candidates.tsv");
     let roots_path = aggregate_dir.join("roots.tsv");
     let exceptions_path = aggregate_dir.join("exceptions.tsv");
     let typed_exclusions_path = aggregate_dir.join("typed-exclusions.tsv");
+    let gap_waivers_path = aggregate_dir.join("gap-waivers.tsv");
     let candidate_readings_path = aggregate_dir.join("candidate-readings.tsv");
     let identity_path = aggregate_dir.join("identity.tsv");
     fs::write(&candidates_path, combined_candidates).expect("write aggregate candidates");
@@ -8445,6 +8795,7 @@ fn aggregate(contract: &MeasurementContract) {
     fs::write(&exceptions_path, combined_exceptions).expect("write aggregate exceptions");
     fs::write(&typed_exclusions_path, combined_typed_exclusions)
         .expect("write aggregate typed exclusions");
+    fs::write(&gap_waivers_path, combined_gap_waivers).expect("write aggregate gap waivers");
     let candidates =
         parse_table(&candidates_path, CANDIDATE_HEADER, 7).expect("parse aggregate candidates");
     let roots = scan_root_path(&roots_path).expect("scan aggregate roots");
@@ -8452,6 +8803,12 @@ fn aggregate(contract: &MeasurementContract) {
         parse_table(&exceptions_path, EXCEPTION_HEADER, 28).expect("parse aggregate exceptions");
     let typed_exclusions =
         parse_typed_exclusions(&typed_exclusions_path).expect("parse aggregate typed exclusions");
+    let expected_gap_waivers = render_gap_waivers(&[registered_bzip2_gap_waiver()]);
+    assert_eq!(
+        fs::read_to_string(&gap_waivers_path).expect("read aggregate gap waivers"),
+        expected_gap_waivers,
+        "aggregate exact gap-waiver identity drift"
+    );
     let typed_exclusion_ids = typed_exclusions
         .iter()
         .map(|exclusion| exclusion.identity.clone())
@@ -8627,6 +8984,7 @@ fn aggregate(contract: &MeasurementContract) {
         .map(|(program, receipt)| format!("{}:{}", program.name, receipt["analysis_head"]))
         .collect::<Vec<_>>()
         .join(",");
+    let gap_waiver_table_sha256 = sha256(&gap_waivers_path);
     let mut per_program = String::from(
         "program\tcensus_expected\tcensus_measured\ttyped_excluded\troots\texceptions\tclosed_invisible\tclosed_absent\tclosed_mixed\topen_invisible\topen_absent\topen_mixed\tstance_divergences\twall_s\tpeak_rss_kb\tcgroup_peak_memory_kb\n",
     );
@@ -8742,10 +9100,10 @@ fn aggregate(contract: &MeasurementContract) {
         .collect::<Vec<_>>()
         .join(",");
     let report = format!(
-        "# A4 force-SAT exceptions and no-allocation-source census\n\nMachine `{MACHINE_ID}`, platform `{PLATFORM}`. Legacy predecessor shards were uncapped; post-isolation candidates ran sequentially in fresh processes under a 100 GiB cgroup host-protection cap and a {LIVENESS_BOUND_S}-second liveness bound. Wall/RSS values are machine-local and never compared across machines.\n\nExact input identity: **261/261** A4/P2 candidates plus **4/4** separately re-checked force-SAT exception rows (**261+4**). No-allocation-source characterization: **{census_denominator}**. Unknown/unexplained among the {measured_count} measured candidates: **0**. Neither typed exclusion is a semantic class or an Unknown.\n\n## Typed exclusions\n\n- `lil::src::_lil_var_t::field2@d0` is `resource-exhausted` at the exact 100 GiB cap during `source-traversal`, evidenced by unit manifest `{RATIFIED_TYPED_EXCLUSION_MANIFEST}`.\n- `bzip2::bzlib::bzFile::field0@d0` is `taxonomy-set-valued-multi-static-provenance`, evidenced by attribution manifest `{BZIP2_GAP_ATTRIBUTION_MANIFEST}`. No candidate process was launched for this exclusion, so its wall and memory metrics are not applicable.\n\nNeither exclusion fabricates a candidate or root row.\n\n## Closed-world partition (measured {measured_count} only)\n\nThe closed-world reading excludes only `public-setter-reachable` external-remainder rows.\n\n{closed_class_summary}\n\n## Open partition (measured {measured_count} only)\n\nThe open reading includes every manifested path row and treats the public-setter remainder as opaque/absent.\n\n{open_class_summary}\n\nClosed/open class divergences: **{stance_divergences}**.\n\n## Overlapping cause flags (measured {measured_count}, open reading)\n\n{flag_summary}\n\n## Indirect-target provenance tags (measured {measured_count})\n\n{provenance_tag_summary}\n\nTags remain outside the invisible/absent predicates. `public-setter-reachable` controls only which manifested row enters the closed versus open reading.\n\n## Force-SAT exceptions\n\n{exception_summary}\n\nSequential shard wall sum, including the lil exclusion's bounded attempt and no fabricated time for the taxonomy exclusion: **{total_wall:.3}s**. Maximum process peak RSS: **{peak_rss} KiB**. Maximum post-isolation candidate cgroup peak charged memory: **{cgroup_peak_memory} KiB**. Semantic aggregates consume only SHA-manifested, completed `data=true` rows; atomic partials remain excluded. The two exact `data=false` typed-exclusion rows are carried only for identity/provenance accounting. Production analysis and rewriter behavior remained untouched.\n"
+        "# A4 force-SAT exceptions and no-allocation-source census\n\nMachine `{MACHINE_ID}`, platform `{PLATFORM}`. Legacy predecessor shards were uncapped; post-isolation candidates ran sequentially in fresh processes under a 100 GiB cgroup host-protection cap and a {LIVENESS_BOUND_S}-second liveness bound. Wall/RSS values are machine-local and never compared across machines.\n\nExact input identity: **261/261** A4/P2 candidates plus **4/4** separately re-checked force-SAT exception rows (**261+4**). No-allocation-source characterization: **{census_denominator}**. Unknown/unexplained among the {measured_count} measured candidates: **0**. Neither typed exclusion is a semantic class or an Unknown.\n\n## Typed exclusions\n\n- `lil::src::_lil_var_t::field2@d0` is `resource-exhausted` at the exact 100 GiB cap during `source-traversal`, evidenced by unit manifest `{RATIFIED_TYPED_EXCLUSION_MANIFEST}`.\n- `bzip2::bzlib::bzFile::field0@d0` is `taxonomy-set-valued-multi-static-provenance`, evidenced by attribution manifest `{BZIP2_GAP_ATTRIBUTION_MANIFEST}`. No candidate process was launched for this exclusion, so its wall and memory metrics are not applicable.\n\nNeither exclusion fabricates a candidate or root row.\n\n## Active graph-gap waiver\n\nThe 22 measured bzip2 candidates were evaluated with one exact graph-construction waiver active: `bzlib::bzopen_or_bzdopen`, site `bb32[3] _79`, static pair `__stdoutp@0`/`__stdinp@0`, justified by attribution manifest `{BZIP2_GAP_ATTRIBUTION_MANIFEST}`. Its complete nonempty mapping is solely the typed-excluded `bzlib::bzFile::field0@d0`. The waiver omits that exact gap edge only; it creates no candidate or root row. Every affected candidate receipt and the bzip2 shard manifest carry the waiver-table digest.\n\n## Closed-world partition (measured {measured_count} only)\n\nThe closed-world reading excludes only `public-setter-reachable` external-remainder rows.\n\n{closed_class_summary}\n\n## Open partition (measured {measured_count} only)\n\nThe open reading includes every manifested path row and treats the public-setter remainder as opaque/absent.\n\n{open_class_summary}\n\nClosed/open class divergences: **{stance_divergences}**.\n\n## Overlapping cause flags (measured {measured_count}, open reading)\n\n{flag_summary}\n\n## Indirect-target provenance tags (measured {measured_count})\n\n{provenance_tag_summary}\n\nTags remain outside the invisible/absent predicates. `public-setter-reachable` controls only which manifested row enters the closed versus open reading.\n\n## Force-SAT exceptions\n\n{exception_summary}\n\nSequential shard wall sum, including the lil exclusion's bounded attempt and no fabricated time for the taxonomy exclusion: **{total_wall:.3}s**. Maximum process peak RSS: **{peak_rss} KiB**. Maximum post-isolation candidate cgroup peak charged memory: **{cgroup_peak_memory} KiB**. Semantic aggregates consume only SHA-manifested, completed `data=true` rows; atomic partials remain excluded. The two exact `data=false` typed-exclusion rows are carried only for identity/provenance accounting. Production analysis and rewriter behavior remained untouched.\n"
     );
     let provenance = format!(
-        "machine_id={MACHINE_ID}\nplatform={PLATFORM}\nanalysis_head={}\nanalysis_branch=codex/a4-source-census\nbaseline_branch=analysis-lane\nbaseline_head=67bcd3cb67c1ae6f74463050033370b108854411\na4_input_root={}\na4_aggregate_manifest_sha256={A4_AGGREGATE_MANIFEST_SHA256}\na4_combined_sha256={A4_COMBINED_SHA256}\ncensus_identity_sha256={CENSUS_IDENTITY_SHA256}\nexception_identity_sha256={EXCEPTION_IDENTITY_SHA256}\nraw_corpus_digest={RAW_CORPUS_DIGEST}\nderived_substrate_digest={DERIVED_SUBSTRATE_DIGEST}\nsnapshot={SNAPSHOT_PATH}\nmemory_policy=legacy-predecessors-uncapped;post-isolation-candidates-cgroup-100GiB;no-cap-raise\nwall_bound_kind=liveness\nwall_cap_s={LIVENESS_BOUND_S}\nprograms={}\nfull_identity_rows=261\ncensus_expected=237\ncensus_measured=235\ncensus_typed_excluded=2\ntyped_exclusion_manifests={typed_exclusion_manifests}\nexception_rechecks=4\nidentity_accounting=259-measured+2-typed-excluded+4-rechecks\nunknown=0\nunexplained=0\nclosed_open_divergences={stance_divergences}\nroots={}\nwall_sum_s={total_wall:.3}\npeak_rss_kb={peak_rss}\ncgroup_peak_memory_kb={cgroup_peak_memory}\ncgroup_peak_scope=post-isolation-candidate-processes-including-resource-exhausted-exclusion;taxonomy-exclusion-not-applicable\nshard_analysis_heads={shard_analysis_heads}\nshard_manifests={}\naggregation_input_policy=semantic-data-true-only;two-exact-data-false-typed-exclusions-for-identity-provenance\ntiming_comparison=forbidden-across-machines\n",
+        "machine_id={MACHINE_ID}\nplatform={PLATFORM}\nanalysis_head={}\nanalysis_branch=codex/a4-source-census\nbaseline_branch=analysis-lane\nbaseline_head=67bcd3cb67c1ae6f74463050033370b108854411\na4_input_root={}\na4_aggregate_manifest_sha256={A4_AGGREGATE_MANIFEST_SHA256}\na4_combined_sha256={A4_COMBINED_SHA256}\ncensus_identity_sha256={CENSUS_IDENTITY_SHA256}\nexception_identity_sha256={EXCEPTION_IDENTITY_SHA256}\nraw_corpus_digest={RAW_CORPUS_DIGEST}\nderived_substrate_digest={DERIVED_SUBSTRATE_DIGEST}\nsnapshot={SNAPSHOT_PATH}\nmemory_policy=legacy-predecessors-uncapped;post-isolation-candidates-cgroup-100GiB;no-cap-raise\nwall_bound_kind=liveness\nwall_cap_s={LIVENESS_BOUND_S}\nprograms={}\nfull_identity_rows=261\ncensus_expected=237\ncensus_measured=235\ncensus_typed_excluded=2\ntyped_exclusion_manifests={typed_exclusion_manifests}\ngraph_gap_waivers=1\ngraph_gap_waiver_table_sha256={gap_waiver_table_sha256}\ngraph_gap_waiver_attribution_manifest={BZIP2_GAP_ATTRIBUTION_MANIFEST}\ngraph_gap_waiver_denominator=bzip2:22-measured+1-typed-excluded\nexception_rechecks=4\nidentity_accounting=259-measured+2-typed-excluded+4-rechecks\nunknown=0\nunexplained=0\nclosed_open_divergences={stance_divergences}\nroots={}\nwall_sum_s={total_wall:.3}\npeak_rss_kb={peak_rss}\ncgroup_peak_memory_kb={cgroup_peak_memory}\ncgroup_peak_scope=post-isolation-candidate-processes-including-resource-exhausted-exclusion;taxonomy-exclusion-not-applicable\nshard_analysis_heads={shard_analysis_heads}\nshard_manifests={}\naggregation_input_policy=semantic-data-true-only;two-exact-data-false-typed-exclusions-for-identity-provenance\ntiming_comparison=forbidden-across-machines\n",
         contract.head,
         contract.input_root.display(),
         contract.programs.len(),
@@ -8767,6 +9125,7 @@ fn aggregate(contract: &MeasurementContract) {
             "roots.tsv",
             "exceptions.tsv",
             "typed-exclusions.tsv",
+            "gap-waivers.tsv",
             "identity.tsv",
             "per-program.tsv",
             "report.md",
@@ -10319,6 +10678,49 @@ mod tests {
     }
 
     #[test]
+    fn gap_waiver_requires_exact_excluded_only_attribution() {
+        let waiver = registered_bzip2_gap_waiver();
+        let excluded = BTreeSet::from([Identity {
+            program: TAXONOMY_TYPED_EXCLUSION_PROGRAM.to_owned(),
+            field_key: TAXONOMY_TYPED_EXCLUSION_FIELD_KEY.to_owned(),
+        }]);
+        assert!(authorize_gap_waiver(&waiver, &waiver.gap, &excluded, &excluded).is_ok());
+        let mut reversed = waiver.gap.clone();
+        reversed.detail = BZIP2_GAP_WAIVER_REVERSED_DETAIL.to_owned();
+        assert!(authorize_gap_waiver(&waiver, &reversed, &excluded, &excluded).is_ok());
+
+        let measured = Identity {
+            program: "bzip2".to_owned(),
+            field_key: "blocksort::EState::field0@d0".to_owned(),
+        };
+        assert!(
+            authorize_gap_waiver(
+                &waiver,
+                &waiver.gap,
+                &BTreeSet::from([excluded.iter().next().unwrap().clone(), measured]),
+                &excluded,
+            )
+            .is_err()
+        );
+        assert!(authorize_gap_waiver(&waiver, &waiver.gap, &BTreeSet::new(), &excluded).is_err());
+
+        let mut wrong_gap = waiver.gap.clone();
+        wrong_gap.site.push_str("-other");
+        assert!(authorize_gap_waiver(&waiver, &wrong_gap, &excluded, &excluded).is_err());
+
+        let rendered = render_gap_waivers(std::slice::from_ref(&waiver));
+        assert!(rendered.contains(BZIP2_GAP_ATTRIBUTION_MANIFEST));
+        assert!(rendered.contains("bzlib::bzopen_or_bzdopen"));
+        assert!(rendered.contains("bb32[3] _79"));
+        let digest = try_sha256_text(&rendered).unwrap();
+        let receipt = render_gap_waiver_receipt(1, &digest).unwrap();
+        assert!(receipt.contains("graph_gap_waivers=1\n"));
+        assert!(receipt.contains(&format!("graph_gap_waiver_table_sha256={digest}\n")));
+        assert!(render_gap_waiver_receipt(0, "none").unwrap().is_empty());
+        assert!(render_gap_waiver_receipt(1, "none").is_err());
+    }
+
+    #[test]
     fn measured_and_typed_excluded_identities_conserve_exactly() {
         let measured = Identity {
             program: "fixture".to_owned(),
@@ -10384,6 +10786,23 @@ mod tests {
             validate_taxonomy_typed_exclusion_artifact(TAXONOMY_TYPED_EXCLUSION_INDEX, &expected)
                 .unwrap();
         assert_eq!(exclusion.manifest, BZIP2_GAP_ATTRIBUTION_MANIFEST);
+    }
+
+    #[test]
+    #[ignore = "lambda7 exact published excluded-only gap-waiver witness"]
+    fn registered_gap_waiver_artifact_verifies_exactly() {
+        let excluded = BTreeSet::from([Identity {
+            program: TAXONOMY_TYPED_EXCLUSION_PROGRAM.to_owned(),
+            field_key: TAXONOMY_TYPED_EXCLUSION_FIELD_KEY.to_owned(),
+        }]);
+        let waivers = validate_registered_gap_waivers_for_program("bzip2", &excluded).unwrap();
+        assert_eq!(waivers, vec![registered_bzip2_gap_waiver()]);
+        assert_eq!(
+            try_sha256_text(&render_gap_waivers(&waivers))
+                .unwrap()
+                .len(),
+            64
+        );
     }
 
     #[test]
