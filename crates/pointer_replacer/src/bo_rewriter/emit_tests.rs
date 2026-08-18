@@ -4642,3 +4642,50 @@ fn a_function_carrying_both_arms_renders_identically_in_both_layers() {
         "the two layers must agree on a function that carries both arms"
     );
 }
+
+/// **DIAGNOSIS (M-2/A, 2026-08-18) — does a revert restore BYTES or a reprint?**
+///
+/// The bar the acceptance gate sets is verdicts and counters, not text. But
+/// byte preservation for untransformed code is the migration's founding
+/// principle, so a reverted function coming back as a `pprust` reprint is a
+/// defect against that principle regardless of whether it moves a verdict.
+///
+/// Reverting EVERY function is the sharpest form of the question: the emitted
+/// text should then be the substrate, byte for byte.
+#[test]
+fn reverting_every_function_reproduces_the_substrate() {
+    // ⚠ **DELIBERATELY NON-CANONICAL.** The first draft of this fixture was
+    // written in `pprust`'s own style, so it would have passed whether reverts
+    // restore bytes or reprint them — a witness passing for the wrong reason.
+    // The odd spacing, the multi-line body and the interior comment are the
+    // discriminator: a reprint normalizes all three.
+    const SRC: &str = "#![allow(dead_code, unused_unsafe, unused_mut, unused_variables)]\n\
+                       pub unsafe fn one(p:   *mut i32) -> i32 {\n\
+                       \x20   // a comment a reprint would drop\n\
+                       \x20   *p\n\
+                       }\n\
+                       pub unsafe fn two(q: *mut i32)   ->   i32 { *q }\n";
+
+    let all = "one::p#1\ntwo::q#1";
+    let out = super::ast_emitted_source_of_reverting(SRC, all).expect("emits");
+
+    // **STATUS-QUO PIN OF A CONFIRMED DEFECT.** The correct assertion is
+    // `out == SRC`; it FAILS today. `collect_fn_prints` reprints every function
+    // unconditionally, so a fully reverted function returns as a `pprust`
+    // reprint: spacing normalized, a multi-line body collapsed, and the
+    // interior comment DROPPED. Pinned rather than left red so the defect is
+    // measured, not merely asserted — and so the fix breaks this test loudly.
+    assert_ne!(
+        out, SRC,
+        "if this now passes, the reprint defect is FIXED — \
+                          replace this pin with `assert_eq!(out, SRC)`"
+    );
+    assert!(
+        !out.contains("a comment a reprint would drop"),
+        "the dropped interior comment is the defect's sharpest symptom"
+    );
+    assert!(
+        out.contains("one(p: *mut i32)"),
+        "and the normalized spacing is the second: `p:   *mut` came back as `p: *mut`"
+    );
+}
