@@ -1171,11 +1171,16 @@ fn parse_sha_manifest(path: &Path) -> Result<Vec<(String, String)>, String> {
             .split_once("  ")
             .ok_or_else(|| format!("{}:{} malformed SHA row", path.display(), index + 1))?;
         let relative_path = Path::new(relative);
-        if relative_path.is_absolute()
-            || relative_path
-                .components()
-                .any(|component| !matches!(component, Component::Normal(_)))
-        {
+        let mut saw_normal = false;
+        let safe_relative = relative_path.components().all(|component| match component {
+            Component::CurDir if !saw_normal => true,
+            Component::Normal(_) => {
+                saw_normal = true;
+                true
+            }
+            _ => false,
+        });
+        if relative_path.is_absolute() || !safe_relative || !saw_normal {
             return Err(format!("unsafe manifest path: {relative}"));
         }
         if digest.len() != 64 || !digest.bytes().all(|byte| byte.is_ascii_hexdigit()) {
@@ -1271,7 +1276,10 @@ fn write_manifest(root: &Path, files: &[&str]) -> Result<String, String> {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::{BTreeMap, BTreeSet};
+    use std::{
+        collections::{BTreeMap, BTreeSet},
+        fs, process,
+    };
 
     use super::*;
 
@@ -1340,5 +1348,22 @@ mod tests {
 
         let incomplete = BTreeMap::new();
         assert!(validate_source_partition(&source, &measured, &incomplete, 2, 1, 1).is_err());
+    }
+
+    #[test]
+    fn artifact_manifest_accepts_leading_curdir_but_rejects_parent() {
+        let path = std::env::temp_dir().join(format!(
+            "crown-reference-manifest-path-{}.sha256",
+            process::id()
+        ));
+        let digest = "0".repeat(64);
+        fs::write(&path, format!("{digest}  ./classification.tsv\n")).unwrap();
+        assert_eq!(
+            parse_sha_manifest(&path).unwrap(),
+            vec![(digest.clone(), "./classification.tsv".to_owned())]
+        );
+        fs::write(&path, format!("{digest}  ../classification.tsv\n")).unwrap();
+        assert!(parse_sha_manifest(&path).is_err());
+        fs::remove_file(path).unwrap();
     }
 }
