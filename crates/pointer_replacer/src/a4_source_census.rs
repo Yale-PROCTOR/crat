@@ -793,6 +793,101 @@ fn add_value_edge(graph: &mut SourceGraph, source: Option<String>, target: Strin
 
 const SOURCE_WALKER_VERSION: &str = "a4-source-walker-v2-nested-reference";
 const NESTED_REFERENCE_EDGE_PREFIX: &str = "nested-reference-value:";
+const NESTED_ADDRESS_SHAPE_HEADER: &str = "program\trvalue_kind\tlocation\tsource_depth\ttarget_depth\tsource_node\ttarget_node\tmodeled_by_walker";
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct NestedAddressShape {
+    rvalue_kind: &'static str,
+    location: String,
+    source_depth: u8,
+    target_depth: u8,
+    source_node: String,
+    target_node: String,
+}
+
+fn collect_nested_address_shapes(tcx: TyCtxt<'_>, slots: &CrateSlots) -> Vec<NestedAddressShape> {
+    let program = collect_program(tcx);
+    let mut rows = BTreeSet::new();
+    for &fn_did in &program.functions {
+        let body_ref = tcx.mir_drops_elaborated_and_const_checked(fn_did).borrow();
+        let body = &*body_ref;
+        for (bb, data) in body.basic_blocks.iter_enumerated() {
+            for (statement_index, statement) in data.statements.iter().enumerate() {
+                let StatementKind::Assign(box (lhs, rvalue)) = &statement.kind else {
+                    continue;
+                };
+                let (rvalue_kind, source_place) = match rvalue {
+                    Rvalue::Ref(_, _, place) => ("Ref", *place),
+                    Rvalue::RawPtr(_, place) => ("RawPtr", *place),
+                    _ => continue,
+                };
+                if !source_place.projection.is_empty() {
+                    continue;
+                }
+                let location = format!(
+                    "{}:bb{}[{}]",
+                    tcx.def_path_str(fn_did),
+                    bb.index(),
+                    statement_index
+                );
+                for source_depth in 0..u8::MAX {
+                    let target_depth = source_depth + 1;
+                    let source =
+                        node_for_place_depth(tcx, slots, fn_did, body, source_place, source_depth);
+                    let target = node_for_place_depth(tcx, slots, fn_did, body, *lhs, target_depth);
+                    match (source, target) {
+                        (Some(source_node), Some(target_node)) => {
+                            rows.insert(NestedAddressShape {
+                                rvalue_kind,
+                                location: location.clone(),
+                                source_depth,
+                                target_depth,
+                                source_node,
+                                target_node,
+                            });
+                        }
+                        (None, None) => break,
+                        _ => break,
+                    }
+                }
+            }
+        }
+    }
+    rows.into_iter().collect()
+}
+
+fn render_nested_address_shapes(
+    program: &str,
+    shapes: &[NestedAddressShape],
+    graph: &SourceGraph,
+) -> String {
+    let mut out = format!(
+        "source_walker_version={SOURCE_WALKER_VERSION}\nmeasurement_class=walker-shape-diagnostic\nsemantic_data=false\n\n{NESTED_ADDRESS_SHAPE_HEADER}\n"
+    );
+    for shape in shapes {
+        let modeled = graph
+            .incoming
+            .get(&shape.target_node)
+            .into_iter()
+            .flatten()
+            .any(|edge| {
+                edge.source == shape.source_node
+                    && edge.label.starts_with(NESTED_REFERENCE_EDGE_PREFIX)
+            });
+        out.push_str(&format!(
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+            clean_cell(program),
+            shape.rvalue_kind,
+            clean_cell(&shape.location),
+            shape.source_depth,
+            shape.target_depth,
+            clean_cell(&shape.source_node),
+            clean_cell(&shape.target_node),
+            modeled,
+        ));
+    }
+    out
+}
 
 #[allow(clippy::too_many_arguments)]
 fn add_nested_reference_place_edges<'tcx>(
@@ -4528,6 +4623,10 @@ fn run_source_walker_impact_worker(tcx: TyCtxt<'_>, t_tcx: Duration) -> Row {
         std::env::var_os("CRAT_A4_WALKER_IMPACT_CHECKPOINT")
             .expect("walker-impact checkpoint output"),
     );
+    let shapes_path = PathBuf::from(
+        std::env::var_os("CRAT_A4_WALKER_ADDRESS_SHAPES")
+            .expect("walker-impact address-shape output"),
+    );
 
     emit_phase(started, "walker-impact-input", None, 0);
     let input = parse_a4_input(&input_path).unwrap_or_else(|error| {
@@ -4550,6 +4649,14 @@ fn run_source_walker_impact_worker(tcx: TyCtxt<'_>, t_tcx: Duration) -> Row {
     let graph = build_source_graph(tcx, &slots, &BoExport::default());
     verify_active_gap_waivers_exercised().unwrap_or_else(|error| {
         panic!("A4C STOP phase=walker-impact-gap-waiver candidate=none: {error}")
+    });
+    let shapes = collect_nested_address_shapes(tcx, &slots);
+    write_atomic_checkpoint(
+        &shapes_path,
+        &render_nested_address_shapes(&program, &shapes, &graph),
+    )
+    .unwrap_or_else(|error| {
+        panic!("A4C STOP phase=walker-impact-shape-diagnostic candidate=none: {error}")
     });
     let fields = candidate_fields(tcx, &slots);
     let mut rendered = format!(
@@ -10654,6 +10761,10 @@ fn run_source_walker_impact_audit(contract: &MeasurementContract) {
                 "CRAT_A4_WALKER_IMPACT_CHECKPOINT",
                 checkpoint_path.display().to_string(),
             ),
+            (
+                "CRAT_A4_WALKER_ADDRESS_SHAPES",
+                dir.join("address-shapes.tsv").display().to_string(),
+            ),
         ];
         if program_name == "bzip2" {
             extra.push((
@@ -10683,7 +10794,12 @@ fn run_source_walker_impact_audit(contract: &MeasurementContract) {
                 "worker.err",
                 "time.txt",
             ];
-            for file in ["checkpoint.tsv", "impact.tsv", "gap-waivers.tsv"] {
+            for file in [
+                "address-shapes.tsv",
+                "checkpoint.tsv",
+                "impact.tsv",
+                "gap-waivers.tsv",
+            ] {
                 if dir.join(file).is_file() {
                     files.push(file);
                 }
@@ -10721,25 +10837,39 @@ fn run_source_walker_impact_audit(contract: &MeasurementContract) {
             "A4C STOP phase=walker-impact-identity candidate={program_name}: candidate set drift"
         );
         let affected = rows.iter().filter(|row| row[2] == "affected").count();
-        if program_name == "bzip2" {
-            assert!(
-                rows.iter()
-                    .any(|row| { row[1] == "bzip2::zzzz::field1@d0" && row[2] == "affected" }),
-                "A4C STOP phase=walker-impact-positive-control candidate=bzip2::zzzz::field1@d0: bzip2 must be affected"
-            );
-        }
+        let positive_control_passed = program_name != "bzip2"
+            || rows
+                .iter()
+                .any(|row| row[1] == "bzip2::zzzz::field1@d0" && row[2] == "affected");
         let receipt = format!(
-            "machine_id={MACHINE_ID}\nplatform={PLATFORM}\nmeasurement_class=graph-only-reachability-impact\nsemantic_data=false\ncompleted=true\ncandidate_processing=graph-only\nsource_walker_version={SOURCE_WALKER_VERSION}\nmemory_limit=cgroup-100GiB\nmemory_max_bytes={CANDIDATE_MEMORY_MAX_BYTES}\ncap_verified={}\noom_kills={}\nmemory_max_events={}\nwall_bound_kind=liveness\nwall_cap_s={LIVENESS_BOUND_S}\nprogram={program_name}\ncandidates={}\naffected={affected}\nstatus=ok\nanalysis_head={}\nlast_phase=complete\nlast_candidate=none\nwall_s={:.3}\n{}memory_receipt_error=none\n",
+            "machine_id={MACHINE_ID}\nplatform={PLATFORM}\nmeasurement_class=graph-only-reachability-impact\nsemantic_data=false\ncompleted={}\ncandidate_processing=graph-only\nsource_walker_version={SOURCE_WALKER_VERSION}\nmemory_limit=cgroup-100GiB\nmemory_max_bytes={CANDIDATE_MEMORY_MAX_BYTES}\ncap_verified={}\noom_kills={}\nmemory_max_events={}\nwall_bound_kind=liveness\nwall_cap_s={LIVENESS_BOUND_S}\nprogram={program_name}\ncandidates={}\naffected={affected}\nstatus={}\nanalysis_head={}\nlast_phase={}\nlast_candidate={}\nwall_s={:.3}\n{}memory_receipt_error=none\n",
+            positive_control_passed,
             outcome.cap_verified,
             outcome.oom_kills,
             outcome.memory_max_events,
             rows.len(),
+            if positive_control_passed {
+                "ok"
+            } else {
+                "positive-control-failure"
+            },
             contract.head,
+            if positive_control_passed {
+                "complete"
+            } else {
+                "walker-impact-positive-control"
+            },
+            if positive_control_passed {
+                "none"
+            } else {
+                "bzip2::zzzz::field1@d0"
+            },
             outcome.wall_s,
             render_candidate_memory_receipt(memory_peaks),
         );
         fs::write(dir.join("receipt.txt"), receipt).expect("write completed impact receipt");
         let mut files = vec![
+            "address-shapes.tsv",
             "checkpoint.tsv",
             "impact.tsv",
             "memory-preflight.txt",
@@ -10756,6 +10886,10 @@ fn run_source_walker_impact_audit(contract: &MeasurementContract) {
         assert_eq!(
             verify_manifest(&dir).expect("verify walker-impact manifest"),
             manifest
+        );
+        assert!(
+            positive_control_passed,
+            "A4C STOP phase=walker-impact-positive-control candidate=bzip2::zzzz::field1@d0 status=unaffected manifest={manifest}: bzip2 must be affected"
         );
         all_rows.extend(rows);
         records.push(WalkerImpactProgramRecord {
@@ -12513,6 +12647,7 @@ mod tests {
         let supported = r#"
             unsafe fn consume_pointer(_: &mut *mut u8) {}
             unsafe fn consume_scalar(_: &mut u64) {}
+            unsafe fn consume_raw(_: *mut *mut u8) {}
 
             pub unsafe fn pointer_reference(mut pointer: *mut u8) {
                 consume_pointer(&mut pointer);
@@ -12520,6 +12655,10 @@ mod tests {
 
             pub unsafe fn scalar_reference(mut scalar: u64) {
                 consume_scalar(&mut scalar);
+            }
+
+            pub unsafe fn raw_pointer_reference(mut pointer: *mut u8) {
+                consume_raw(&raw mut pointer);
             }
         "#;
         ::utils::compilation::run_compiler_on_str(supported, |tcx| {
@@ -12548,6 +12687,29 @@ mod tests {
                     .iter()
                     .all(|edge| !edge.label.contains("scalar_reference")),
                 "a scalar reference must not expand pointer provenance"
+            );
+            let shapes = collect_nested_address_shapes(tcx, &slots);
+            assert!(shapes.iter().any(|shape| {
+                shape.rvalue_kind == "Ref" && shape.location.contains("pointer_reference")
+            }));
+            let raw = shapes
+                .iter()
+                .find(|shape| {
+                    shape.rvalue_kind == "RawPtr"
+                        && shape.location.contains("raw_pointer_reference")
+                })
+                .expect("raw address-to-pointer nesting must remain visible diagnostically");
+            assert!(
+                !graph
+                    .incoming
+                    .get(&raw.target_node)
+                    .into_iter()
+                    .flatten()
+                    .any(|edge| {
+                        edge.source == raw.source_node
+                            && edge.label.starts_with(NESTED_REFERENCE_EDGE_PREFIX)
+                    }),
+                "the approved Ref-only walker rule must not silently absorb RawPtr"
             );
         })
         .unwrap_or_else(|error| error.raise());
