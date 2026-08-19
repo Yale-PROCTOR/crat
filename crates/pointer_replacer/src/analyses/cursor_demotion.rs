@@ -10,10 +10,7 @@ use rustc_hash::FxHashSet;
 use rustc_hir::def_id::LocalDefId;
 use rustc_middle::mir::Local;
 
-use crate::{
-    analyses::offset_sign::sign::OffsetSignResult,
-    utils::rustc::RustProgram,
-};
+use crate::{analyses::offset_sign::sign::OffsetSignResult, utils::rustc::RustProgram};
 
 pub struct CursorDemotion {
     /// params safe to take as plain slices
@@ -31,7 +28,10 @@ impl CursorDemotion {
             if fn_ptr_participants.contains(&did) {
                 continue;
             }
-            let body = input.tcx.mir_drops_elaborated_and_const_checked(did).borrow();
+            let body = input
+                .tcx
+                .mir_drops_elaborated_and_const_checked(did)
+                .borrow();
             let definite = offset_signs.definite_signs.get(&did);
             for local in body.args_iter() {
                 if !definite.is_some_and(|d| d.contains(local)) {

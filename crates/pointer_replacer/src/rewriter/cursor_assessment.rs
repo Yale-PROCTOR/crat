@@ -182,7 +182,11 @@ pub(super) fn assess(
 /// deduplicated, sorted shape names of the seeds reaching this local; these
 /// bucket the gap set by which non-negativity fact would refute the taint
 fn shape_summary(analysis: &Analysis, did: LocalDefId, local: Local) -> String {
-    let Some(seeds) = analysis.offset_sign_result.reaching_seeds.get(&(did, local)) else {
+    let Some(seeds) = analysis
+        .offset_sign_result
+        .reaching_seeds
+        .get(&(did, local))
+    else {
         return "via-alias-group".to_string();
     };
     let mut shapes: Vec<&'static str> = seeds.iter().map(|seed| seed.shape.as_str()).collect();
@@ -193,13 +197,12 @@ fn shape_summary(analysis: &Analysis, did: LocalDefId, local: Local) -> String {
 
 /// deduplicated `sign@fn@file:line` list of the offset-call seeds whose taint
 /// reaches this local; empty means the taint arrived via alias-group widening
-fn seed_summary(
-    analysis: &Analysis,
-    tcx: TyCtxt<'_>,
-    did: LocalDefId,
-    local: Local,
-) -> String {
-    let Some(seeds) = analysis.offset_sign_result.reaching_seeds.get(&(did, local)) else {
+fn seed_summary(analysis: &Analysis, tcx: TyCtxt<'_>, did: LocalDefId, local: Local) -> String {
+    let Some(seeds) = analysis
+        .offset_sign_result
+        .reaching_seeds
+        .get(&(did, local))
+    else {
         return "via-alias-group".to_string();
     };
     let mut entries: Vec<String> = seeds

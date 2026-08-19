@@ -8470,7 +8470,10 @@ pub unsafe fn write_at(p: *mut i32, i: isize) {
     *p.offset(i) = 1;
 }
 "#,
-        &["fn write_at(mut p: &mut [i32]", "(&mut ((p)[(i) as usize..]))[0] = 1"],
+        &[
+            "fn write_at(mut p: &mut [i32]",
+            "(&mut ((p)[(i) as usize..]))[0] = 1",
+        ],
         &["SliceCursor"],
     );
 }

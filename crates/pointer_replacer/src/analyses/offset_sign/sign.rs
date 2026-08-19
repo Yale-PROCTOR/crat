@@ -1197,8 +1197,7 @@ struct Collector<'mir, 'tcx, 'a> {
 }
 
 /// classify the shape of the expression defining `operand` by scanning the
-/// body for the assignment that defines it. diagnostics only: stage-0
-/// bucketing of the gap set.
+/// body for the assignment that defines it.
 fn classify_seed_shape<'tcx>(body: &Body<'tcx>, operand: &Operand<'tcx>) -> SeedShape {
     let (Operand::Copy(place) | Operand::Move(place)) = operand else {
         return SeedShape::Other;
@@ -1395,10 +1394,7 @@ impl<'mir, 'tcx, 'a> MVisitor<'tcx> for Collector<'mir, 'tcx, 'a> {
                                     def_id: self.def_id,
                                     abs: offset_val,
                                     span: terminator.source_info.span,
-                                    shape: classify_seed_shape(
-                                        self.body,
-                                        &offset_arg.node,
-                                    ),
+                                    shape: classify_seed_shape(self.body, &offset_arg.node),
                                 },
                             ));
                             let field_node = raw_pointer_field_slot(self.body, *place)

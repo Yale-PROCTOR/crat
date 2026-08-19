@@ -183,7 +183,10 @@ impl<'tcx> DecisionMaker<'tcx> {
         // demotable params take plain slices: no definitely-negative movement
         // reaches them, so call sites' rebase-to-pos-0 constructions preserve
         // behavior; locals keep cursors
-        let arg_count = tcx.mir_drops_elaborated_and_const_checked(did).borrow().arg_count;
+        let arg_count = tcx
+            .mir_drops_elaborated_and_const_checked(did)
+            .borrow()
+            .arg_count;
         let mut raw_fallback = DenseBitSet::new_empty(mutable_pointers.len());
         for param in (1..=arg_count).map(Local::from_usize) {
             if analysis.cursor_demotion.is_demotable(did, param) {
