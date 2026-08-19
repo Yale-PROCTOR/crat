@@ -17,11 +17,25 @@ fn to_slot_ref(r: ResolvedSlot, fn_did: LocalDefId) -> SlotRef {
     }
 }
 
-pub fn add_coherence<'tcx>(
+fn with_use_track_context<T>(_solver: &KindSolver, tag_uses: bool, f: impl FnOnce() -> T) -> T {
+    #[cfg(test)]
+    if tag_uses {
+        return _solver
+            .tracker()
+            .expect("Use-track tagging requires a tracked solver")
+            .with_context("coherence-use", f);
+    }
+
+    debug_assert!(!tag_uses);
+    f()
+}
+
+fn add_coherence_impl<'tcx>(
     solver: &KindSolver,
     slots: &CrateSlots,
     fn_did: LocalDefId,
     body: &Body<'tcx>,
+    tag_uses: bool,
 ) {
     for bbdata in body.basic_blocks.iter() {
         for stmt in &bbdata.statements {
@@ -32,22 +46,24 @@ pub fn add_coherence<'tcx>(
             match rvalue {
                 Rvalue::Use(Operand::Copy(rhs) | Operand::Move(rhs))
                 | Rvalue::CopyForDeref(rhs) => {
-                    for d in 0..MAX_SLOT_DEPTH {
-                        if let (Some(la), Some(ra)) = (
-                            resolve_place(slots, fn_did, body, *lhs, d, None),
-                            resolve_place(slots, fn_did, body, *rhs, d, None),
-                        ) {
-                            // §9.10.2: a field STORE's depth-0 ownership is set crate-wide by
-                            // `constrain_field_ownership` (`field.own <=> AND stored owns`), so
-                            // skip the per-store equate here — equating multiple stores to one
-                            // global field slot is what transitively dragged a borrowed value
-                            // to `Owning`. (Field LOADS have a Local lhs and still equate.)
-                            if d == 0 && matches!(la, ResolvedSlot::Field(_)) {
-                                continue;
+                    with_use_track_context(solver, tag_uses, || {
+                        for d in 0..MAX_SLOT_DEPTH {
+                            if let (Some(la), Some(ra)) = (
+                                resolve_place(slots, fn_did, body, *lhs, d, None),
+                                resolve_place(slots, fn_did, body, *rhs, d, None),
+                            ) {
+                                // §9.10.2: a field STORE's depth-0 ownership is set crate-wide by
+                                // `constrain_field_ownership` (`field.own <=> AND stored owns`), so
+                                // skip the per-store equate here — equating multiple stores to one
+                                // global field slot is what transitively dragged a borrowed value
+                                // to `Owning`. (Field LOADS have a Local lhs and still equate.)
+                                if d == 0 && matches!(la, ResolvedSlot::Field(_)) {
+                                    continue;
+                                }
+                                solver.equate(to_slot_ref(la, fn_did), to_slot_ref(ra, fn_did));
                             }
-                            solver.equate(to_slot_ref(la, fn_did), to_slot_ref(ra, fn_did));
                         }
-                    }
+                    });
                 }
                 Rvalue::Ref(_, _, rhs) | Rvalue::RawPtr(_, rhs) => {
                     for d in 0..MAX_SLOT_DEPTH {
@@ -107,6 +123,25 @@ pub fn add_coherence<'tcx>(
     if super::SafeMonoMode::current() == super::SafeMonoMode::PerSite {
         super::safety_mono::add_safety_mono(solver, slots, fn_did, body);
     }
+}
+
+pub fn add_coherence<'tcx>(
+    solver: &KindSolver,
+    slots: &CrateSlots,
+    fn_did: LocalDefId,
+    body: &Body<'tcx>,
+) {
+    add_coherence_impl(solver, slots, fn_did, body, false);
+}
+
+#[cfg(test)]
+pub(crate) fn add_coherence_tagging_uses<'tcx>(
+    solver: &KindSolver,
+    slots: &CrateSlots,
+    fn_did: LocalDefId,
+    body: &Body<'tcx>,
+) {
+    add_coherence_impl(solver, slots, fn_did, body, true);
 }
 
 /// §9.10.2 crate-wide field-ownership constraint. A struct field slot is ONE crate-wide slot

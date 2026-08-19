@@ -47,6 +47,8 @@ mod a4_measurement;
 mod a4_source_census;
 #[path = "a5_measurement.rs"]
 mod a5_measurement;
+#[path = "kind_equate_core_census.rs"]
+mod kind_equate_core_census;
 #[path = "p_b_measurement.rs"]
 mod p_b_measurement;
 #[path = "promote_failure_measurement.rs"]
@@ -13062,6 +13064,7 @@ fn boc1_run_one() {
             | "a4-probe"
             | "a4-source-census"
             | "a5-p1"
+            | "kind-equate-core"
             | "s23-discover"
             | "s23-probe"
     ) || mode.starts_with("selector-detail-")
@@ -13103,6 +13106,7 @@ fn boc1_run_one() {
             "a4-source-census" => a4_source_census::run_worker(tcx, t_tcx),
             "a5-p1" => a5_measurement::run_worker(tcx, t_tcx),
             "p-b" => p_b_measurement::run_worker(tcx, t_tcx),
+            "kind-equate-core" => kind_equate_core_census::run_worker(tcx, t_tcx),
             "s23-discover" => s23_measurement::run_discovery_worker(tcx, t_tcx),
             "s23-probe" => s23_measurement::run_probe_worker(tcx, t_tcx),
             "selector-core" => run::run_selector_core(tcx, t_tcx),

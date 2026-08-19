@@ -81,6 +81,27 @@ impl CoreTracker {
         *self.context.borrow_mut() = context.to_string();
     }
 
+    #[cfg(test)]
+    pub(crate) fn with_context<T>(&self, context: &str, f: impl FnOnce() -> T) -> T {
+        struct Restore<'a> {
+            context: &'a RefCell<String>,
+            previous: Option<String>,
+        }
+
+        impl Drop for Restore<'_> {
+            fn drop(&mut self) {
+                *self.context.borrow_mut() = self.previous.take().expect("saved core context");
+            }
+        }
+
+        let previous = self.context.replace(context.to_owned());
+        let _restore = Restore {
+            context: &self.context,
+            previous: Some(previous),
+        };
+        f()
+    }
+
     /// Mint a fresh track literal for one hard constraint and record its label.
     fn record(&self, label: String) -> Bool {
         if self.granularity == CoreTrackingGranularity::Family {
@@ -115,6 +136,11 @@ impl CoreTracker {
             .iter()
             .map(|(track, _)| track.clone())
             .collect()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn labeled_tracks(&self) -> Vec<(Bool, String)> {
+        self.entries.borrow().clone()
     }
 
     /// Label of a core literal (z3 node identity, valid on the shared
@@ -702,6 +728,22 @@ impl KindSolver {
 
     pub(crate) fn optimize(&self) -> &Optimize {
         &self.solver
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_random_seed(&self, seed: u32) {
+        let mut params = z3::Params::new();
+        params.set_u32("random_seed", seed);
+        self.solver.set_params(&params);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn owning_literal(&self, slot: SlotRef) -> Bool {
+        self.vars
+            .get(&slot)
+            .unwrap_or_else(|| panic!("unknown slot: {slot:?}"))
+            .own
+            .clone()
     }
 
     pub fn model_kinds(&self) -> Option<FxHashMap<SlotRef, SlotKind>> {
