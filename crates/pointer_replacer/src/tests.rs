@@ -9960,7 +9960,7 @@ mod borrow_ownership_coherence {
                 export::{LoanClass, location_key, with_bo_export},
                 mutability_facts::MutFacts,
                 origins::{collect_no_borrow_origin_slots, compute_origins},
-                slots::{SlotId, StructFieldSlot},
+                slots::{SlotId, SlotOwner, StructFieldSlot},
                 solver::{BoOwnDatabase, KindSolver, SlotRef},
                 sources::collect_malloc_source_slots,
                 ssa::constraint::{Database, Gen, Var},
@@ -16063,6 +16063,74 @@ pub unsafe fn copy_local() -> i32 {
                     conflicts.values().all(Vec::is_empty),
                     "dead-before-free CopyLend must be accepted: {conflicts:?}"
                 );
+            },
+        );
+    }
+
+    /// Phase-1b gate fact retained after ruling §7a: Foster's written-through semantics leave a
+    /// freed destination read-only. Eligibility must reject this shape through the unconditional
+    /// S2-2-mirror rule rather than changing Foster.
+    #[test]
+    fn copy_lend_phase1b_fact_free_destination_remains_foster_readonly() {
+        run_compiler(
+            r#"
+unsafe extern "C" {
+    fn free(p: *mut i32);
+}
+
+pub unsafe fn free_destination(p: *mut i32) {
+    let q = p;
+    unsafe { free(q) };
+}
+"#,
+            |tcx| {
+                let program = collect_program(tcx);
+                let function = function_by_name(&program, "free_destination");
+                let q = local_by_var_name(tcx, function, "q");
+                let facts = MutFacts::from_program(&program);
+                assert!(
+                    !facts.is_mutable(function, q),
+                    "ruling §7a fact drift: Foster unexpectedly classified free(q) mutable"
+                );
+            },
+        );
+    }
+
+    /// Phase-1b gate fact retained after ruling §7b. Fresh allocation has no modeled borrow origin,
+    /// so incoming `unknown_targets` contains the allocator-backed pair's genealogy. Eligibility
+    /// consumes outward-live boundary events instead of this incoming membership.
+    #[test]
+    fn copy_lend_phase1b_fact_allocator_pair_has_incoming_unknown_genealogy() {
+        run_compiler(
+            r#"
+unsafe extern "C" {
+    fn malloc(size: usize) -> *mut core::ffi::c_void;
+    fn free(p: *mut core::ffi::c_void);
+}
+
+pub unsafe fn copy_local() -> i32 {
+    let p = unsafe { malloc(core::mem::size_of::<i32>()) } as *mut i32;
+    let q = p;
+    let value = unsafe { *q };
+    unsafe { free(p as *mut core::ffi::c_void) };
+    value
+}
+"#,
+            |tcx| {
+                let program = collect_program(tcx);
+                let function = function_by_name(&program, "copy_local");
+                let p = local_by_var_name(tcx, function, "p");
+                let q = local_by_var_name(tcx, function, "q");
+                let origins = compute_origins(&program);
+                let unknown = origins.native_flows()[&function]
+                    .body
+                    .unknown_owner_depths();
+                for local in [p, q] {
+                    assert!(
+                        unknown.contains(&(SlotOwner::Local(local), 0)),
+                        "ruling §7b genealogy fact drift: {local:?}@d0 absent; facts={unknown:?}"
+                    );
+                }
             },
         );
     }
