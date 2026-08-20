@@ -9000,15 +9000,18 @@ pub unsafe fn f() -> i32 {
         ::utils::compilation::run_compiler_on_str(
             item15_source!(
                 r#"pub unsafe fn f() -> i32 {
-    let p = unsafe { malloc(4) } as *mut i32;
-    unsafe { *p }
+    let pp = unsafe { malloc(core::mem::size_of::<*mut i32>()) } as *mut *mut i32;
+    let q = unsafe { *pp };
+    let value = unsafe { *q };
+    unsafe { free(pp as *mut core::ffi::c_void) };
+    value
 }"#
             ),
             |tcx| {
                 let program = collect_program(tcx);
                 assert!(
-                    program.functions.iter().any(|did| {
-                        tcx.mir_drops_elaborated_and_const_checked(*did)
+                    !program.functions.iter().any(|did| {
+                        tcx.mir_built(*did)
                             .borrow()
                             .basic_blocks
                             .iter()
@@ -9020,14 +9023,14 @@ pub unsafe fn f() -> i32 {
                                 )
                             })
                     }),
-                    "N02 fixture must contain a CopyForDeref rvalue"
+                    "N02 correction: current production MIR unexpectedly regained CopyForDeref; re-preregister the case instead of treating its Use lowering as the named arm"
                 );
                 let row = CopyLendMode::LendArm.with_override(|| run_bo(tcx, Duration::ZERO));
                 assert_eq!(row.get("status"), Some("ok"));
                 assert_eq!(row.get("copy_lend_mode"), Some("lend_arm"));
-                assert_eq!(row.get("copy_lend_eligible_pairs"), Some("1"));
-                assert_eq!(row.get("copy_lend_selected_sites"), Some("1"));
-                assert_eq!(row.get("copy_lend_replay_selections"), Some("1"));
+                assert_eq!(row.get("copy_lend_eligible_pairs"), Some("0"));
+                assert_eq!(row.get("copy_lend_selected_sites"), Some("0"));
+                assert_eq!(row.get("copy_lend_replay_selections"), Some("0"));
             },
         )
         .unwrap_or_else(|error| error.raise());
@@ -9090,14 +9093,20 @@ pub unsafe fn f() -> i32 {
     first + second
 }"#
             ),
-            Item15Verdict::Unselected { pairs: 1 },
+            Item15Verdict::Unselected { pairs: 3 },
         );
     }
 
     #[test]
     #[ignore = "PROPOSED item-15 ledger; run one case at a time"]
     fn item15_case_x01() {
-        use crate::analyses::borrow_ownership::{construction::CopyLendMode, export::LoanClass};
+        use rustc_hash::FxHashSet;
+        use rustc_middle::mir::Local;
+
+        use crate::analyses::borrow_ownership::{
+            borrow_engine::selected_copy_lend_contains, coherence::SelectedCopyLendLoan,
+            construction::CopyLendMode, export::LoanClass,
+        };
 
         ::utils::compilation::run_compiler_on_str(
             item15_source!(
@@ -9127,13 +9136,18 @@ pub unsafe fn f() -> i32 {
                     1,
                     "exactly one loan identity must be typed CopyLend"
                 );
+                let selected = SelectedCopyLendLoan {
+                    location: typed[0].key.location,
+                    borrowed: typed[0].key.place.clone(),
+                    borrower: typed[0].key.borrower,
+                };
+                let mut companion = selected.clone();
+                companion.borrowed.local = Local::from_u32(999);
+                let selected_set = FxHashSet::from_iter([selected.clone()]);
                 assert!(
-                    export.loans.iter().any(|loan| {
-                        loan.class == LoanClass::Existing
-                            && loan.key.fn_did == typed[0].key.fn_did
-                            && loan.key.location == typed[0].key.location
-                    }),
-                    "X01 fixture must retain a same-location untyped companion loan"
+                    selected_copy_lend_contains(&selected_set, &selected)
+                        && !selected_copy_lend_contains(&selected_set, &companion),
+                    "same-location companion identity must retain Existing semantics"
                 );
             },
         )

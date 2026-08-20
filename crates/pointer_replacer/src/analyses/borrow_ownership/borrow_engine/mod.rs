@@ -51,6 +51,8 @@ pub(crate) use conflicts::{
 // (grouping-independent — see `nb4r_route_compose_fallback_on_type_mismatch`).
 #[cfg(test)]
 pub(crate) use invalidates::{RoutedCompose, route_compose};
+#[cfg(test)]
+pub(crate) use origin_replay::selected_copy_lend_contains;
 
 /// §NB3-3a — routes the `borrow_verify` seam (and the `bo_c1` mirror) to the forked BO engine vs
 /// the production `borrow` engine. **Default = `Fork` (flipped at 3a merge, A1).** During 3a dev the

@@ -40,7 +40,7 @@ pub(super) struct NativeInference<'tcx> {
     pub(super) copy_lends: DenseBitSet<Loan>,
 }
 
-fn selected_copy_lend_contains(
+pub(crate) fn selected_copy_lend_contains(
     selected: &FxHashSet<SelectedCopyLendLoan>,
     identity: &SelectedCopyLendLoan,
 ) -> bool {
