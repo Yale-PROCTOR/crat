@@ -5,7 +5,7 @@
 // READS only, not writes. NO sync tripwire (divergence is the deliverable). NB6's validator uses the
 // UNFORKED production engine (D5).
 use rustc_hash::{FxHashMap, FxHashSet};
-use rustc_index::bit_set::SparseBitMatrix;
+use rustc_index::bit_set::{DenseBitSet, SparseBitMatrix};
 use rustc_middle::{
     mir::{
         Body, CopyNonOverlapping, InlineAsmOperand, Local, Location, NonDivergingIntrinsic,
@@ -20,7 +20,10 @@ use super::{
     BorrowSet, Loan,
     places_conflict::{AccessDepth, PlaceConflictBias, places_conflict},
 };
-use crate::analyses::borrow::{Borrower, ProvenanceOwner, ProvenanceSet};
+use crate::analyses::{
+    borrow::{Borrower, ProvenanceOwner, ProvenanceSet},
+    borrow_ownership::boundary_table::{self, Matcher, Role},
+};
 
 pub(crate) type Invalidates = SparseBitMatrix<PointIndex, Loan>;
 
@@ -44,7 +47,35 @@ pub fn compute_invalidates<'tcx>(
     provenance_set: &ProvenanceSet,
     location_map: &DenseLocationMap,
 ) -> Invalidates {
-    compute_invalidates_inner(tcx, body, borrow_set, provenance_set, location_map, None)
+    let copy_lends = DenseBitSet::new_empty(borrow_set.loans.len());
+    compute_invalidates_inner(
+        tcx,
+        body,
+        borrow_set,
+        provenance_set,
+        location_map,
+        &copy_lends,
+        None,
+    )
+}
+
+pub(crate) fn compute_invalidates_with_copy_lends<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    body: &Body<'tcx>,
+    borrow_set: &BorrowSet<'tcx>,
+    provenance_set: &ProvenanceSet,
+    location_map: &DenseLocationMap,
+    copy_lends: &DenseBitSet<Loan>,
+) -> Invalidates {
+    compute_invalidates_inner(
+        tcx,
+        body,
+        borrow_set,
+        provenance_set,
+        location_map,
+        copy_lends,
+        None,
+    )
 }
 
 /// Compute the unchanged invalidation facts while also retaining the access
@@ -60,6 +91,25 @@ pub(crate) fn compute_invalidates_capturing<'tcx>(
     provenance_set: &ProvenanceSet,
     location_map: &DenseLocationMap,
 ) -> (Invalidates, Vec<InvalidationAccess>) {
+    let copy_lends = DenseBitSet::new_empty(borrow_set.loans.len());
+    compute_invalidates_capturing_with_copy_lends(
+        tcx,
+        body,
+        borrow_set,
+        provenance_set,
+        location_map,
+        &copy_lends,
+    )
+}
+
+pub(crate) fn compute_invalidates_capturing_with_copy_lends<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    body: &Body<'tcx>,
+    borrow_set: &BorrowSet<'tcx>,
+    provenance_set: &ProvenanceSet,
+    location_map: &DenseLocationMap,
+    copy_lends: &DenseBitSet<Loan>,
+) -> (Invalidates, Vec<InvalidationAccess>) {
     let mut accesses = Vec::new();
     let invalidates = compute_invalidates_inner(
         tcx,
@@ -67,6 +117,7 @@ pub(crate) fn compute_invalidates_capturing<'tcx>(
         borrow_set,
         provenance_set,
         location_map,
+        copy_lends,
         Some(&mut accesses),
     );
     (invalidates, accesses)
@@ -78,6 +129,7 @@ fn compute_invalidates_inner<'tcx>(
     borrow_set: &BorrowSet<'tcx>,
     provenance_set: &ProvenanceSet,
     location_map: &DenseLocationMap,
+    copy_lends: &DenseBitSet<Loan>,
     accesses: Option<&mut Vec<InvalidationAccess>>,
 ) -> Invalidates {
     let mut invalidates = SparseBitMatrix::new(borrow_set.loans.len());
@@ -97,6 +149,7 @@ fn compute_invalidates_inner<'tcx>(
         borrow_set,
         provenance_set,
         location_map,
+        copy_lends,
         issued_loans: if routing_enabled {
             build_issued_loans(tcx, body, borrow_set)
         } else {
@@ -229,6 +282,7 @@ struct LoanInvalidatesGenerator<'g, 'tcx> {
     borrow_set: &'g BorrowSet<'tcx>,
     provenance_set: &'g ProvenanceSet,
     location_map: &'g DenseLocationMap,
+    copy_lends: &'g DenseBitSet<Loan>,
     /// §NB4-R routing chain (see `build_issued_loans`). Empty when routing is disabled.
     issued_loans: FxHashMap<Local, Vec<Loan>>,
     /// §NB4-R toggle (`CRAT_NB4R_ROUTING`); gates the cross-alias-write walk for sweep attribution.
@@ -269,6 +323,26 @@ impl<'g, 'tcx> LoanInvalidatesGenerator<'g, 'tcx> {
         self.check_access_for_conflict(location, place, AccessDepth::Deep, kind);
     }
 
+    /// A12's targeted temporal rule. Only typed CopyLend loans are considered; the ordinary call
+    /// operand remains a Read below, so existing loans retain pre-A12 deallocator behavior (A1).
+    fn invalidate_copy_lends_at_deallocation(&mut self, location: Location, pointer: Place<'tcx>) {
+        let pointee = pointer.project_deeper(&[PlaceElem::Deref], self.tcx);
+        let point = self.location_map.point_from_location(location);
+        for loan in self.copy_lends.iter() {
+            let borrow_data = &self.borrow_set.loans[loan];
+            if places_conflict(
+                self.tcx,
+                self.body,
+                borrow_data.borrowed,
+                pointee,
+                AccessDepth::Deep,
+                PlaceConflictBias::Overlap,
+            ) {
+                self.insert_invalidation(point, loan, pointer.local);
+            }
+        }
+    }
+
     fn shallowly_access_place(&mut self, location: Location, place: Place<'tcx>, kind: AccessKind) {
         self.check_access_for_conflict(location, place, AccessDepth::Shallow, kind);
     }
@@ -288,7 +362,9 @@ impl<'g, 'tcx> LoanInvalidatesGenerator<'g, 'tcx> {
         if let Some(borrows_for_place_base) = self.borrow_set.local_map.row(place.local) {
             for loan in borrows_for_place_base.iter() {
                 let borrow_data = &self.borrow_set.loans[loan];
-                if let Some(p) = self.provenance_set.local_data[borrow_data.borrowed.local]
+                let copy_lend_write = kind == AccessKind::Write && self.copy_lends.contains(loan);
+                if !copy_lend_write
+                    && let Some(p) = self.provenance_set.local_data[borrow_data.borrowed.local]
                     && !self.provenance_set.provenance_data[p].is_mutable()
                 {
                     continue; // loan of immutable provenance does not invalidate
@@ -382,7 +458,10 @@ impl<'g, 'tcx> LoanInvalidatesGenerator<'g, 'tcx> {
                     ) {
                         continue;
                     }
-                    if let Some(p) = self.provenance_set.local_data[borrow_data.borrowed.local]
+                    let copy_lend_write =
+                        kind == AccessKind::Write && self.copy_lends.contains(loan);
+                    if !copy_lend_write
+                        && let Some(p) = self.provenance_set.local_data[borrow_data.borrowed.local]
                         && !self.provenance_set.provenance_data[p].is_mutable()
                     {
                         continue; // loan of immutable provenance does not invalidate (read-only cell)
@@ -560,11 +639,18 @@ impl<'g, 'tcx> Visitor<'tcx> for LoanInvalidatesGenerator<'g, 'tcx> {
                 fn_span: _,
             } => {
                 self.consume_operand(location, func, AccessKind::Read);
+                let copy_lend_deallocator = exact_foreign_sink(func, self.body, self.tcx);
                 for arg in args {
                     // §NB4-4a-ii: labeled `Read` here; 4a-ii's GATING commit refines the arg
                     // access by the callee's effect class (a `no-access` callee gets a SHALLOW
                     // access instead of this blanket `Deep` one).
                     self.consume_operand(location, &arg.node, AccessKind::Read);
+                }
+                if copy_lend_deallocator
+                    && let Some(arg0) = args.first()
+                    && let Operand::Copy(place) | Operand::Move(place) = &arg0.node
+                {
+                    self.invalidate_copy_lends_at_deallocation(location, *place);
                 }
                 // The call's return value is WRITTEN into the destination.
                 self.deeply_access_place(location, *destination, AccessKind::Write);
@@ -663,4 +749,22 @@ impl<'g, 'tcx> Visitor<'tcx> for LoanInvalidatesGenerator<'g, 'tcx> {
 
         self.super_terminator(terminator, location);
     }
+}
+
+fn exact_foreign_sink<'tcx>(func: &Operand<'tcx>, body: &Body<'tcx>, tcx: TyCtxt<'tcx>) -> bool {
+    let TyKind::FnDef(def_id, _) = func.ty(body, tcx).kind() else {
+        return false;
+    };
+    let Some(local_did) = def_id.as_local() else {
+        return false;
+    };
+    if !matches!(
+        tcx.hir_node_by_def_id(local_did),
+        rustc_hir::Node::ForeignItem(_)
+    ) {
+        return false;
+    }
+    let name = tcx.item_name(*def_id);
+    boundary_table::lookup(name.as_str(), Matcher::ForeignC)
+        .is_some_and(|entry| entry.roles == [Role::Sink])
 }

@@ -40,7 +40,7 @@ mod vec_vec;
 
 #[allow(unused_imports)]
 pub use domain::SlotKind;
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_hir::def_id::{DefId, LocalDefId};
 use rustc_middle::mir::{Body, Local, Location};
 use z3::ast::Bool;
@@ -236,6 +236,26 @@ pub(crate) fn emit_crate_ownership_constraints<'tcx>(
     origins: &origin_summary::OriginSummaries,
     kind_solver: &KindSolver,
 ) -> anyhow::Result<(BoOwnEmissionStats, Selectors)> {
+    emit_crate_ownership_constraints_impl(crate_ctxt, slots, origins, kind_solver, None)
+}
+
+pub(crate) fn emit_crate_ownership_constraints_with_copy_lends<'tcx>(
+    crate_ctxt: &CrateCtxt<'tcx>,
+    slots: &CrateSlots,
+    origins: &origin_summary::OriginSummaries,
+    kind_solver: &KindSolver,
+    copy_lends: &FxHashSet<coherence::CopyLendPair>,
+) -> anyhow::Result<(BoOwnEmissionStats, Selectors)> {
+    emit_crate_ownership_constraints_impl(crate_ctxt, slots, origins, kind_solver, Some(copy_lends))
+}
+
+fn emit_crate_ownership_constraints_impl<'tcx>(
+    crate_ctxt: &CrateCtxt<'tcx>,
+    slots: &CrateSlots,
+    origins: &origin_summary::OriginSummaries,
+    kind_solver: &KindSolver,
+    copy_lends: Option<&FxHashSet<coherence::CopyLendPair>>,
+) -> anyhow::Result<(BoOwnEmissionStats, Selectors)> {
     let mut var_gen = Gen::new();
     // §NB-R: hand the KindSolver's tracker (if any) to the database so the
     // ownership-version constraints are track-gated in tracked mode too.
@@ -265,6 +285,7 @@ pub(crate) fn emit_crate_ownership_constraints<'tcx>(
             &global_assumptions,
             &inter_ctxt,
             did.expect_local(),
+            copy_lends,
         );
     }
     if let Some(tracker) = kind_solver.tracker() {
@@ -332,6 +353,7 @@ fn emit_fn_body_into<'tcx>(
     global_assumptions: &GlobalAssumptions,
     inter_ctxt: &InterCtxt,
     fn_did: LocalDefId,
+    copy_lends: Option<&FxHashSet<coherence::CopyLendPair>>,
 ) {
     const B1_PRECISION: Precision = BO_PRECISION;
 
@@ -341,6 +363,9 @@ fn emit_fn_body_into<'tcx>(
         .borrow();
     let body = &*body_ref;
     let ssa_state = initial_ssa_state(crate_ctxt, body);
+    let copy_lend_guards = copy_lends
+        .map(|pairs| coherence::copy_lend_guards_for_body(kind_solver, slots, fn_did, body, pairs))
+        .unwrap_or_default();
 
     let summary = {
         let mut rn = ssa::constraint::infer::Renamer::new(body, ssa_state, crate_ctxt.tcx);
@@ -352,6 +377,7 @@ fn emit_fn_body_into<'tcx>(
             var_gen,
             inter_ctxt,
             global_assumptions,
+            &copy_lend_guards,
         );
 
         rn.go::<BoOwnershipProbe>(&mut infer_cx);

@@ -1,5 +1,6 @@
 use std::ops::Range;
 
+use rustc_hash::FxHashMap;
 use rustc_index::IndexVec;
 use rustc_middle::{
     mir::{
@@ -11,6 +12,7 @@ use rustc_middle::{
 use rustc_span::source_map::Spanned;
 use rustc_type_ir::TyKind::FnDef;
 use smallvec::SmallVec;
+use z3::ast::Bool;
 
 use self::boundary::Boundary;
 use super::{AnalysisKind, Precision};
@@ -139,6 +141,7 @@ where
     deref_copy: Option<Consume<<Analysis as InferMode<'infercx, 'db, 'tcx>>::LocalSig>>,
     call_args: Vec<CallArg<<Analysis as InferMode<'infercx, 'db, 'tcx>>::LocalSig>>,
     global_assumptions: &'infercx GlobalAssumptions,
+    copy_lend_guards: &'infercx FxHashMap<Location, Bool>,
 }
 
 type CallArg<LocalSig> = (Local, (Consume<LocalSig>, bool));
@@ -156,6 +159,7 @@ where
         var_gen: &'infercx mut Gen,
         inter_ctxt: Analysis::InterCtxt,
         global_assumptions: &'infercx GlobalAssumptions,
+        copy_lend_guards: &'infercx FxHashMap<Location, Bool>,
     ) -> Self {
         let struct_ctxt = crate_ctxt.struct_ctxt.with_max_precision(max_precision);
         let mut fn_body_sig = IndexVec::with_capacity(body.local_decls.len());
@@ -191,7 +195,12 @@ where
             deref_copy: None,
             call_args: Vec::new(),
             global_assumptions,
+            copy_lend_guards,
         }
+    }
+
+    fn copy_lend_guard(&self, location: Location) -> Option<Bool> {
+        self.copy_lend_guards.get(&location).cloned()
     }
 
     /// Dominance property
@@ -561,7 +570,20 @@ where
         InferCtxt::project_deeper(base, base_ty, place.projection, infer_cx)
     }
 
-    fn copy_for_deref(infer_cx: &mut Self::Ctxt, consume: Option<Consume<Self::LocalSig>>) {
+    fn copy_for_deref(
+        infer_cx: &mut Self::Ctxt,
+        consume: Option<Consume<Self::LocalSig>>,
+        location: Location,
+    ) {
+        if let Some(lend) = infer_cx.copy_lend_guard(location)
+            && let Some(consume) = consume.as_ref()
+        {
+            for (source_use, source_def) in consume.r#use.clone().zip(consume.def.clone()) {
+                infer_cx
+                    .database
+                    .push_guarded_lend_source(&lend, source_def, source_use);
+            }
+        }
         if infer_cx.deref_copy.is_some() {
             tracing::debug!("overwriting stale deref_copy consume");
         }
@@ -573,10 +595,13 @@ where
         ty: Ty<'tcx>,
         lhs_result: Consume<Self::LocalSig>,
         rhs_result: Consume<Self::LocalSig>,
+        location: Option<Location>,
     ) {
         tracing::debug!("transfer relation: {:?} ~ {:?}", lhs_result, rhs_result);
 
+        let copy_lend_guard = location.and_then(|location| infer_cx.copy_lend_guard(location));
         with_own_assume_site(OwnAssumeSite::SsaTransfer, || {
+            let mut matched_depth = 0usize;
             matcher(
                 ty,
                 lhs_result.transpose(),
@@ -590,7 +615,11 @@ where
                             lhs.r#use,
                             false,
                         );
-                    if ENSURE_MOVE {
+                    if matched_depth == 0
+                        && let Some(lend) = copy_lend_guard.as_ref()
+                    {
+                        database.push_guarded_copy(lend, lhs.def, rhs.def, rhs.r#use, ENSURE_MOVE);
+                    } else if ENSURE_MOVE {
                         database.push_equal::<
                             crate::analyses::borrow_ownership::ssa::constraint::Debug,
                         >((), lhs.def, rhs.r#use);
@@ -602,6 +631,7 @@ where
                             crate::analyses::borrow_ownership::ssa::constraint::Debug,
                         >((), lhs.def, rhs.def, rhs.r#use)
                     }
+                    matched_depth += 1;
                 },
             )
         })
@@ -612,11 +642,12 @@ where
         ty: Ty<'tcx>,
         lhs: Consume<Self::LocalSig>,
         rhs: Consume<Self::LocalSig>,
+        location: Option<Location>,
     ) {
         if ty.is_raw_ptr() || ty.is_box() || ty.is_ref() {
             let lhs = lhs.repack(|sigs| sigs.start..sigs.start + 1u32);
             let rhs = rhs.repack(|sigs| sigs.start..sigs.start + 1u32);
-            Self::transfer::<ENSURE_MOVE>(infer_cx, ty, lhs, rhs)
+            Self::transfer::<ENSURE_MOVE>(infer_cx, ty, lhs, rhs, location)
         } else {
             todo!("handling casts between structs are not supported")
         }

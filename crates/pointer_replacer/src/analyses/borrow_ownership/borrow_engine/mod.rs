@@ -43,7 +43,8 @@ mod places_conflict;
 #[cfg(test)]
 pub(crate) use conflicts::{borrow_conflicts, borrow_conflicts_replaying};
 pub(crate) use conflicts::{
-    borrow_conflicts_replaying_with_flows, borrow_conflicts_replaying_witnessed,
+    borrow_conflicts_replaying_with_flows, borrow_conflicts_replaying_with_flows_and_copy_lends,
+    borrow_conflicts_replaying_witnessed, borrow_conflicts_replaying_witnessed_with_copy_lends,
     borrow_conflicts_with_flows,
 };
 // §NB4-R: the compose/type-check decision, re-exported so its fallback is unit-testable in isolation

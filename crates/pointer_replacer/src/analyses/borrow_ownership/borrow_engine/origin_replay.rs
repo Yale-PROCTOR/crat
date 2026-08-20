@@ -1,3 +1,5 @@
+use std::ops::{Deref, DerefMut};
+
 use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_index::{
     IndexVec,
@@ -19,6 +21,8 @@ use crate::{
             ProvenanceSet, StructFieldSlot, borrow_inference,
         },
         borrow_ownership::{
+            export,
+            l2::MirLocationKey,
             origin_flow::{self, OriginFlowResults},
             slots::SlotOwner,
         },
@@ -29,6 +33,25 @@ use crate::{
 pub(super) struct NativeBorrowContext<'a> {
     pub(super) borrow: GBorrowInferCtxt,
     flows: &'a OriginFlowResults,
+}
+
+pub(super) struct NativeInference<'tcx> {
+    pub(super) facts: BorrowInferenceResults<'tcx>,
+    pub(super) copy_lends: DenseBitSet<Loan>,
+}
+
+impl<'tcx> Deref for NativeInference<'tcx> {
+    type Target = BorrowInferenceResults<'tcx>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.facts
+    }
+}
+
+impl DerefMut for NativeInference<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.facts
+    }
 }
 
 impl<'a> NativeBorrowContext<'a> {
@@ -77,8 +100,15 @@ impl<'a> NativeBorrowContext<'a> {
         tcx: TyCtxt<'tcx>,
         f: LocalDefId,
         disabled_fields: &[StructFieldSlot],
-    ) -> BorrowInferenceResults<'tcx> {
+        selected_copy_lends: &FxHashSet<MirLocationKey>,
+    ) -> NativeInference<'tcx> {
         let mut inference = borrow_inference(tcx, f, &self.borrow);
+        let mut copy_lends = DenseBitSet::new_empty(inference.borrow_set.loans.len());
+        for (loan, data) in inference.borrow_set.loans.iter_enumerated() {
+            if selected_copy_lends.contains(&export::location_key(data.location())) {
+                copy_lends.insert(loan);
+            }
+        }
         let provenance_set = self.borrow.provenances.get(&f).unwrap();
         let graph = NativeConstraintGraph::new(
             &inference,
@@ -99,7 +129,10 @@ impl<'a> NativeBorrowContext<'a> {
             &inference.requires,
             &inference.killed,
         );
-        inference
+        NativeInference {
+            facts: inference,
+            copy_lends,
+        }
     }
 }
 
