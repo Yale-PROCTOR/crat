@@ -8898,7 +8898,9 @@ pub unsafe fn f() -> i32 {
             r#"pub unsafe fn f() -> i32 {
     let p = unsafe { malloc(4) } as *const i32;
     let q = p;
-    unsafe { *q }
+    let value = unsafe { *q };
+    unsafe { free(p as *mut core::ffi::c_void) };
+    value
 }"#
         );
         item15_row(
