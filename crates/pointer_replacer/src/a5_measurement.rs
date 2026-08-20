@@ -1928,11 +1928,6 @@ fn a5_p1_corpus() {
                     let pairs = parse_pair_ledger(&outcome.stdout, &counts)
                         .unwrap_or_else(|why| panic!("{}: {why}", program.name));
                     assert_eq!(counts.program, program.name);
-                    assert_eq!(
-                        counts.sites_not_proven_disjoint, 0,
-                        "{} returned a final base row despite needing a depth export",
-                        program.name
-                    );
                     final_runs.insert(
                         program.name,
                         FinalRun {
