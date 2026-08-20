@@ -6373,6 +6373,10 @@ mod run {
         row.set("repair", rstats.repair.label());
         row.set("rounds", rstats.rounds);
         row.set("commits_conflict", rstats.commits_conflict);
+        row.set(
+            "copy_lend_replay_selections",
+            rstats.copy_lend_replay_selections,
+        );
         row.set("check_sat_count", solver.check_sat_count());
         row.set(
             "commits_per_round",
@@ -8467,6 +8471,7 @@ pub unsafe fn f() -> i32 {
                 assert_eq!(row.get("copy_lend_mode"), Some("lend_arm"));
                 assert_eq!(row.get("copy_lend_eligible_pairs"), Some("1"));
                 assert_eq!(row.get("copy_lend_selected_sites"), Some("1"));
+                assert_eq!(row.get("copy_lend_replay_selections"), Some("1"));
                 assert!(row.get("n_own").unwrap().parse::<usize>().unwrap() >= 1);
                 assert!(row.get("n_ref").unwrap().parse::<usize>().unwrap() >= 1);
             },
@@ -8506,6 +8511,7 @@ pub unsafe fn f() -> i32 {
                     if mode != CopyLendMode::LendArm {
                         assert_eq!(row.get("copy_lend_eligible_pairs"), Some("0"));
                         assert_eq!(row.get("copy_lend_selected_sites"), Some("0"));
+                        assert_eq!(row.get("copy_lend_replay_selections"), Some("0"));
                     }
                 }
             },

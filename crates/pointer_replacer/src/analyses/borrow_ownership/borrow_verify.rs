@@ -605,6 +605,9 @@ pub(crate) struct RoundStats {
     /// §NB0: every commit is a conflict commit (the `¬ref(source)` invariant is emitted eagerly).
     pub commits_conflict: usize,
     pub commits_per_round: Vec<usize>,
+    /// Exact CopyLend loan identities handed to the final replay round. This is a wiring receipt,
+    /// not a model-derived recount: suppressing replay registration must drive it to zero.
+    pub copy_lend_replay_selections: usize,
     /// §NB-F: sink selectors the FINAL solve dropped (leaked frees).
     pub dropped_sinks: usize,
     /// §NB-F: source selectors the FINAL solve dropped (leaked allocs).
@@ -755,6 +758,10 @@ fn verify_to_fixpoint_counting_with_flows_impl(
         super::export::begin_round();
         let selected_copy_lends =
             copy_lends.map(|pairs| selected_copy_lend_sites(program, slots, pairs, &model));
+        stats.copy_lend_replay_selections = selected_copy_lends
+            .as_ref()
+            .map(|selected| selected.values().map(FxHashSet::len).sum())
+            .unwrap_or(0);
         let conflicts = revalidate_replaying_with_flows(
             program,
             slots,
@@ -1113,6 +1120,10 @@ pub(crate) fn verify_l2_to_fixpoint_counting(
         super::export::begin_round();
         let selected_copy_lends =
             copy_lends.map(|pairs| selected_copy_lend_sites(program, slots, pairs, &model));
+        stats.copy_lend_replay_selections = selected_copy_lends
+            .as_ref()
+            .map(|selected| selected.values().map(FxHashSet::len).sum())
+            .unwrap_or(0);
         let conflicts = revalidate_replaying_witnessed(
             program,
             slots,

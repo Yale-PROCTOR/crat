@@ -16242,22 +16242,22 @@ pub unsafe fn f(p: *mut i32) {
 unsafe extern "C" {
     fn malloc(size: usize) -> *mut core::ffi::c_void;
     fn free(p: *mut core::ffi::c_void);
-    fn opaque(p: *mut i32);
+    fn opaque(p: *const i32);
 }
-unsafe fn local_sink(p: *mut i32) { core::hint::black_box(p); }
+unsafe fn local_sink(p: *const i32) { let _ = unsafe { *p }; }
 pub unsafe fn plain() -> i32 {
-    let p = unsafe { malloc(4) } as *mut i32;
+    let p = unsafe { malloc(4) } as *const i32;
     let q = p;
     unsafe { *q }
 }
 pub unsafe fn outward() -> i32 {
-    let p = unsafe { malloc(4) } as *mut i32;
+    let p = unsafe { malloc(4) } as *const i32;
     let q = p;
     unsafe { opaque(q) };
     unsafe { *q }
 }
 pub unsafe fn ordinary_call() -> i32 {
-    let p = unsafe { malloc(4) } as *mut i32;
+    let p = unsafe { malloc(4) } as *const i32;
     let q = p;
     unsafe { local_sink(q) };
     unsafe { *q }
@@ -16274,7 +16274,7 @@ pub unsafe fn mutable_destination() -> i32 {
     unsafe { *q }
 }
 pub unsafe fn free_source() -> i32 {
-    let p = unsafe { malloc(4) } as *mut i32;
+    let p = unsafe { malloc(4) } as *const i32;
     let q = p;
     let value = unsafe { *q };
     unsafe { free(p as *mut core::ffi::c_void) };
@@ -16310,7 +16310,14 @@ pub unsafe fn free_source() -> i32 {
                 ] {
                     let function = function_by_name(&program, name);
                     let p = local_slot(&slots, function, local_by_var_name(tcx, function, "p"), 0);
-                    let q = local_slot(&slots, function, local_by_var_name(tcx, function, "q"), 0);
+                    let q_local = local_by_var_name(tcx, function, "q");
+                    let q = local_slot(&slots, function, q_local, 0);
+                    if name == "ordinary_call" {
+                        assert!(
+                            !facts.is_mutable(function, q_local),
+                            "ordinary-call control must isolate C3 from the C2 gate"
+                        );
+                    }
                     assert_eq!(
                         fixture.pairs.contains(&CopyLendPair::new(q, p)),
                         expected,
@@ -16352,7 +16359,7 @@ pub unsafe fn f() -> i32 {
                     CopyLendMode::LendArm,
                 )
                 .expect("lend construction");
-                let (model, _stats) = verify_l2_to_fixpoint_counting(
+                let (model, stats) = verify_l2_to_fixpoint_counting(
                     &program,
                     &slots,
                     origins.native_flows(),
@@ -16361,6 +16368,7 @@ pub unsafe fn f() -> i32 {
                     &facts,
                     Some(&construction.eligibility.pairs),
                 );
+                assert_eq!(stats.copy_lend_replay_selections, 1);
                 let model = model.expect("L2 must accept the dead-before-free CopyLend");
                 let function = function_by_name(&program, "f");
                 let p = local_slot(&slots, function, local_by_var_name(tcx, function, "p"), 0);
