@@ -2667,9 +2667,10 @@ fn s23_p2_brotli_checkpoint() {
     fs::write(
         &receipt,
         format!(
-            "machine_id={}\nplatform={}\nmachine_protocol=dedicated-host\nmemory_limit=uncapped\nwall_bound_kind=liveness\nbatch={batch_index}\nprogram=brotli\nstatus={}\ndata={}\ncheckpoint_data=false\nanalysis_head={}\nbase_harness_head={}\nbase_manifest_sha256={}\nmac_base_manifest_sha256={}\nsnapshot={}\nbatch_size={}\nbatch_plan={}\nwall_cap_s={}\nrange_start={}\nrange_end={}\nplanned_targets={}\nqueried={}\nfirst_key={}\nlast_key={}\nlast_phase={}\nlast_candidate={}\nlast_phase_t_s={}\ncheckpoint_rows={}\ncheckpoint_last_key={}\nwall_s={:.3}\nwall_s_per_candidate={:.6}\npeak_rss_kb={}\nworker_t_total_s={}\nhard_unsat={}\nforce_sat={}\nsolver_unknown={}\naccepted_owning={}\n",
+            "machine_id={}\nplatform={}\ncopy_lend_mode={}\nmachine_protocol=dedicated-host\nmemory_limit=uncapped\nwall_bound_kind=liveness\nbatch={batch_index}\nprogram=brotli\nstatus={}\ndata={}\ncheckpoint_data=false\nanalysis_head={}\nbase_harness_head={}\nbase_manifest_sha256={}\nmac_base_manifest_sha256={}\nsnapshot={}\nbatch_size={}\nbatch_plan={}\nwall_cap_s={}\nrange_start={}\nrange_end={}\nplanned_targets={}\nqueried={}\nfirst_key={}\nlast_key={}\nlast_phase={}\nlast_candidate={}\nlast_phase_t_s={}\ncheckpoint_rows={}\ncheckpoint_last_key={}\nwall_s={:.3}\nwall_s_per_candidate={:.6}\npeak_rss_kb={}\nworker_t_total_s={}\nhard_unsat={}\nforce_sat={}\nsolver_unknown={}\naccepted_owning={}\n",
             contract.identity.machine_id,
             contract.identity.platform,
+            CopyLendMode::current().label(),
             outcome.status,
             data,
             super::orchestrate::git_sha(),
@@ -2996,9 +2997,10 @@ fn s23_p2_non_brotli_recovery_shard() {
     fs::write(
         &receipt_path,
         format!(
-            "machine_id={}\nplatform={}\nmachine_protocol=dedicated-host\nmemory_limit=uncapped\nwall_bound_kind=liveness\nprogram={}\nstatus={}\nworker_status={}\ndata={}\ncheckpoint_data=false\nanalysis_head={}\nbase_harness_head={}\nbase_manifest_sha256={}\nmac_base_manifest_sha256={}\nmac_record_commit=bbaaaf0ac4914398e7024dd137accbdc3932ecf5\ncandidate_universe_sha256={}\nnon_brotli_identity_list_sha256={}\nmac_comparison_kind=universal-record-per-exact-key\nmac_expected_verdict=unsat\nmac_expected_core_families=own-assume|link-own\nmac_comparison={}\nsnapshot={}\nwall_cap_s={}\nplanned_targets={}\nqueried={}\nfirst_key={}\nlast_key={}\nlast_phase={}\nlast_candidate={}\nlast_phase_t_s={}\ncheckpoint_rows={}\ncheckpoint_last_key={}\nwall_s={:.3}\nwall_s_per_candidate={:.6}\npeak_rss_kb={}\nhard_unsat={}\nforce_sat={}\nsolver_unknown={}\naccepted_owning={}\nvalidation_error={}\n",
+            "machine_id={}\nplatform={}\ncopy_lend_mode={}\nmachine_protocol=dedicated-host\nmemory_limit=uncapped\nwall_bound_kind=liveness\nprogram={}\nstatus={}\nworker_status={}\ndata={}\ncheckpoint_data=false\nanalysis_head={}\nbase_harness_head={}\nbase_manifest_sha256={}\nmac_base_manifest_sha256={}\nmac_record_commit=bbaaaf0ac4914398e7024dd137accbdc3932ecf5\ncandidate_universe_sha256={}\nnon_brotli_identity_list_sha256={}\nmac_comparison_kind=universal-record-per-exact-key\nmac_expected_verdict=unsat\nmac_expected_core_families=own-assume|link-own\nmac_comparison={}\nsnapshot={}\nwall_cap_s={}\nplanned_targets={}\nqueried={}\nfirst_key={}\nlast_key={}\nlast_phase={}\nlast_candidate={}\nlast_phase_t_s={}\ncheckpoint_rows={}\ncheckpoint_last_key={}\nwall_s={:.3}\nwall_s_per_candidate={:.6}\npeak_rss_kb={}\nhard_unsat={}\nforce_sat={}\nsolver_unknown={}\naccepted_owning={}\nvalidation_error={}\n",
             contract.identity.machine_id,
             contract.identity.platform,
+            CopyLendMode::current().label(),
             program,
             effective_status,
             outcome.status,

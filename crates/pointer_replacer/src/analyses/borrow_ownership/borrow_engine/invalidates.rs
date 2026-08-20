@@ -136,10 +136,8 @@ fn compute_invalidates_inner<'tcx>(
 
     // §NB4-R routing toggle (default ON). `CRAT_NB4R_ROUTING=off|0` disables the cross-alias-write
     // walk, restoring pre-NB4-R invalidation — the sweep's gross-demotion attribution runs both.
-    let routing_enabled = !matches!(
-        std::env::var("CRAT_NB4R_ROUTING").as_deref(),
-        Ok("off") | Ok("0")
-    );
+    let routing_setting = std::env::var("CRAT_NB4R_ROUTING").ok();
+    let routing_enabled = routing_enabled_for(routing_setting.as_deref(), !copy_lends.is_empty());
 
     LoanInvalidatesGenerator {
         facts: &mut invalidates,
@@ -160,6 +158,24 @@ fn compute_invalidates_inner<'tcx>(
     .visit_body(body);
 
     invalidates
+}
+
+fn routing_enabled_for(setting: Option<&str>, has_copy_lends: bool) -> bool {
+    // CopyLend's mandatory free(source)-through-cast rule depends on the issued-loan alias route.
+    // The historical NB4-R ablation may disable that route only when no selected CopyLend exists.
+    has_copy_lends || !matches!(setting, Some("off" | "0"))
+}
+
+#[cfg(test)]
+mod copy_lend_routing_tests {
+    use super::routing_enabled_for;
+
+    #[test]
+    fn copy_lend_keeps_mandatory_alias_routing_under_nb4r_off() {
+        assert!(routing_enabled_for(Some("off"), true));
+        assert!(routing_enabled_for(Some("0"), true));
+        assert!(!routing_enabled_for(Some("off"), false));
+    }
 }
 
 /// §NB4-R — an `offset`-call destination signature `(dest_local, borrowed=(*arg0))`. The fork

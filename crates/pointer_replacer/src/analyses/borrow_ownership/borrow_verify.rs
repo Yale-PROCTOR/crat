@@ -1347,6 +1347,36 @@ pub(crate) fn model_accepts_with_flows(
     model: &FxHashMap<SlotRef, SlotKind>,
     is_mutable: impl MutProvider + Copy,
 ) -> bool {
+    model_accepts_with_flows_impl(program, slots, origin_flows, model, is_mutable, None)
+}
+
+pub(crate) fn model_accepts_with_flows_and_copy_lends(
+    program: &RustProgram,
+    slots: &CrateSlots,
+    origin_flows: &OriginFlowResults,
+    model: &FxHashMap<SlotRef, SlotKind>,
+    is_mutable: impl MutProvider + Copy,
+    copy_lends: &FxHashSet<CopyLendPair>,
+) -> bool {
+    let selected = selected_copy_lend_sites(program, slots, copy_lends, model);
+    model_accepts_with_flows_impl(
+        program,
+        slots,
+        origin_flows,
+        model,
+        is_mutable,
+        Some(&selected),
+    )
+}
+
+fn model_accepts_with_flows_impl(
+    program: &RustProgram,
+    slots: &CrateSlots,
+    origin_flows: &OriginFlowResults,
+    model: &FxHashMap<SlotRef, SlotKind>,
+    is_mutable: impl MutProvider + Copy,
+    selected_copy_lends: Option<&SelectedCopyLendLoans>,
+) -> bool {
     // ALLOW-LIST TRIPWIRE (ruling on ADV-1). This is a PROBE — an oracle run
     // outside either CEGAR loop, on a model the loop may never have accepted.
     // Under the allow-list it is outside the armed region and records nothing
@@ -1374,7 +1404,7 @@ pub(crate) fn model_accepts_with_flows(
             SlotRef::Local(..) => model.get(&s) != Some(&SlotKind::Ref),
         },
         is_mutable,
-        None,
+        selected_copy_lends,
     );
     // The loop's accept is `committed == 0` reached WITHOUT tripping either of its two guards: the
     // `residual_nonref_field` decline (non-`Ref` FIELD residual) and the `guard_slots_are_ref`

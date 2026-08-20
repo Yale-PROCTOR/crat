@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_index::bit_set::DenseBitSet;
 use rustc_middle::mir::{
-    Body, Local, Location, Operand, Place, RETURN_PLACE, Rvalue, StatementKind,
+    Body, Local, Location, Operand, Place, ProjectionElem, RETURN_PLACE, Rvalue, StatementKind,
     visit::{PlaceContext, Visitor},
 };
 use rustc_mir_dataflow::Analysis;
@@ -342,7 +342,10 @@ pub(crate) fn analyze_copy_lend_eligibility(
             );
             let destination_flow =
                 owner_closure([SlotOwner::Local(sites[0].lhs_local)], &value_flows);
-            if destination_flows_to_deallocator(program.tcx, &body, &destination_flow)
+            if closure
+                .iter()
+                .any(|owner| matches!(owner, SlotOwner::Field(_)))
+                || destination_flows_to_deallocator(program.tcx, &body, &destination_flow)
                 || has_live_outward_event(program, slots, fn_did, &body, &closure, &live_before)
             {
                 continue;
@@ -472,12 +475,20 @@ fn rvalue_mentions_closure(
     visitor.found
 }
 
-fn exact_deallocator(call: &crate::analyses::mir::terminator::MirFunctionCall<'_, '_>) -> bool {
+fn known_deallocator(call: &crate::analyses::mir::terminator::MirFunctionCall<'_, '_>) -> bool {
     let CallKind::LibC(name) = &call.func else {
         return false;
     };
     boundary_table::lookup(name.as_str(), Matcher::ForeignC)
         .is_some_and(|entry| entry.roles.contains(&Role::Sink))
+}
+
+fn exact_free(call: &crate::analyses::mir::terminator::MirFunctionCall<'_, '_>) -> bool {
+    let CallKind::LibC(name) = &call.func else {
+        return false;
+    };
+    boundary_table::lookup(name.as_str(), Matcher::ForeignC)
+        .is_some_and(|entry| entry.roles == [Role::Sink])
 }
 
 fn destination_flows_to_deallocator<'tcx>(
@@ -492,7 +503,7 @@ fn destination_flows_to_deallocator<'tcx>(
         let Some(call) = terminator.as_call(tcx) else {
             return false;
         };
-        exact_deallocator(&call)
+        known_deallocator(&call)
             && call.args.first().is_some_and(|arg| {
                 arg.node
                     .place()
@@ -504,7 +515,7 @@ fn destination_flows_to_deallocator<'tcx>(
 fn boundary_call(call: &crate::analyses::mir::terminator::MirFunctionCall<'_, '_>) -> bool {
     match call.func {
         CallKind::FreeStanding(_) | CallKind::Impl(_) => true,
-        CallKind::LibC(_) => !exact_deallocator(call),
+        CallKind::LibC(_) => !exact_free(call),
         CallKind::RustLib(_) | CallKind::Closure | CallKind::Dynamic => true,
     }
 }
@@ -529,11 +540,23 @@ fn has_live_outward_event<'tcx>(
             let StatementKind::Assign(box (lhs, rvalue)) = &statement.kind else {
                 continue;
             };
-            if !rvalue.ty(body, program.tcx).is_any_ptr() {
+            if !rvalue.ty(body, program.tcx).is_any_ptr()
+                && !matches!(rvalue, Rvalue::Aggregate(..))
+            {
                 continue;
             }
             if !rvalue_mentions_closure(rvalue, location, closure) {
                 continue;
+            }
+            if matches!(rvalue, Rvalue::Aggregate(..)) {
+                return true;
+            }
+            if lhs
+                .projection
+                .iter()
+                .any(|projection| matches!(projection, ProjectionElem::Field(..)))
+            {
+                return true;
             }
             if lhs.local == RETURN_PLACE {
                 return true;

@@ -16242,9 +16242,11 @@ pub unsafe fn f(p: *mut i32) {
 unsafe extern "C" {
     fn malloc(size: usize) -> *mut core::ffi::c_void;
     fn free(p: *mut core::ffi::c_void);
+    fn realloc(p: *mut core::ffi::c_void, size: usize) -> *mut core::ffi::c_void;
     fn opaque(p: *const i32);
 }
 unsafe fn local_sink(p: *const i32) { let _ = unsafe { *p }; }
+struct Holder { ptr: *const i32 }
 pub unsafe fn plain() -> i32 {
     let p = unsafe { malloc(4) } as *const i32;
     let q = p;
@@ -16260,6 +16262,24 @@ pub unsafe fn ordinary_call() -> i32 {
     let p = unsafe { malloc(4) } as *const i32;
     let q = p;
     unsafe { local_sink(q) };
+    unsafe { *q }
+}
+pub unsafe fn field_escape() -> i32 {
+    let p = unsafe { malloc(4) } as *const i32;
+    let q = p;
+    let mut holder = Holder { ptr: core::ptr::null() };
+    holder.ptr = q;
+    unsafe { *holder.ptr }
+}
+pub unsafe fn return_escape() -> *const i32 {
+    let p = unsafe { malloc(4) } as *const i32;
+    let q = p;
+    q
+}
+pub unsafe fn realloc_source() -> i32 {
+    let p = unsafe { malloc(4) } as *const i32;
+    let q = p;
+    let _new = unsafe { realloc(p as *mut core::ffi::c_void, 8) };
     unsafe { *q }
 }
 pub unsafe fn free_destination() {
@@ -16304,6 +16324,9 @@ pub unsafe fn free_source() -> i32 {
                     ("plain", true),
                     ("outward", false),
                     ("ordinary_call", false),
+                    ("field_escape", false),
+                    ("return_escape", false),
+                    ("realloc_source", false),
                     ("free_destination", false),
                     ("mutable_destination", false),
                     ("free_source", true),

@@ -4331,14 +4331,14 @@ mod run {
         borrow_ownership::{
             SafeMonoMode, SlotKind,
             borrow_verify::{
-                RepairMode, model_accepts_with_flows, slotref_key, with_capture,
-                with_mode_a_commit_trace,
+                RepairMode, model_accepts_with_flows, model_accepts_with_flows_and_copy_lends,
+                slotref_key, with_capture, with_mode_a_commit_trace,
             },
             coherence::{
                 constrain_field_ownership, field_ownership_candidates, selected_copy_lend_sites,
             },
             construction::{
-                CopyLendMode, construct_bo_into, verify_bo_construction_counting,
+                BoConstruction, CopyLendMode, construct_bo_into, verify_bo_construction_counting,
                 verify_bo_construction_with_flows,
             },
             crate_slots::CrateSlots,
@@ -4667,14 +4667,14 @@ mod run {
         origins: &crate::analyses::borrow_ownership::origin_summary::OriginSummaries,
         mut_facts: &MutFacts,
         mode: CopyLendMode,
-    ) -> Option<(KindSolver, Selectors)> {
+    ) -> Option<(KindSolver, BoConstruction)> {
         // Allow-list: this is outside the armed region, so it records nothing.
         {
             let solver = KindSolver::new(slots);
             let construction =
                 construct_bo_into(program, slots, origins, mut_facts, &solver, mode).ok()?;
             constrain_field_ownership(&solver, slots, program);
-            Some((solver, construction.selectors))
+            Some((solver, construction))
         }
     }
 
@@ -4694,7 +4694,7 @@ mod run {
         slots: &CrateSlots,
         origin_flows: &crate::analyses::borrow_ownership::origin_flow::OriginFlowResults,
         base: &KindSolver,
-        selectors: &Selectors,
+        construction: &BoConstruction,
         is_mutable: impl MutProvider + Copy,
         demote: &[SlotRef],
         target: SlotRef,
@@ -4704,16 +4704,46 @@ mod run {
             base.add_borrow_exclusion(Some(d), &[]);
         }
         // Allow-list: outside the armed region ⇒ records nothing.
-        let verdict = match base.model_kinds_relaxing(selectors) {
+        let verdict = match base.model_kinds_relaxing(&construction.selectors) {
             Some(model) => {
-                model.get(&target) == Some(&SlotKind::Ref)
-                    && model_accepts_with_flows(program, slots, origin_flows, &model, is_mutable)
+                let accepted = construction_model_accepts(
+                    program,
+                    slots,
+                    origin_flows,
+                    construction,
+                    &model,
+                    is_mutable,
+                );
+                model.get(&target) == Some(&SlotKind::Ref) && accepted
             }
             // UNSAT even without `target` ⇒ `target` is not the reason it declines; NOT removable.
             None => false,
         };
         base.pop_scope();
         verdict
+    }
+
+    fn construction_model_accepts(
+        program: &crate::utils::rustc::RustProgram,
+        slots: &CrateSlots,
+        origin_flows: &crate::analyses::borrow_ownership::origin_flow::OriginFlowResults,
+        construction: &BoConstruction,
+        model: &FxHashMap<SlotRef, SlotKind>,
+        is_mutable: impl MutProvider + Copy,
+    ) -> bool {
+        match construction.mode {
+            CopyLendMode::LendArm => model_accepts_with_flows_and_copy_lends(
+                program,
+                slots,
+                origin_flows,
+                model,
+                is_mutable,
+                &construction.eligibility.pairs,
+            ),
+            CopyLendMode::Baseline | CopyLendMode::RemovalOnly => {
+                model_accepts_with_flows(program, slots, origin_flows, model, is_mutable)
+            }
+        }
     }
 
     /// §NB5-L2 — single-shot leave-one-out (build base + one probe). The audit driver builds the base
@@ -4729,7 +4759,7 @@ mod run {
         i: usize,
     ) -> ProbeOutcome {
         let construction_mut_facts = MutFacts::all_mut();
-        let Some((base, selectors)) = build_probe_base(
+        let Some((base, construction)) = build_probe_base(
             program,
             slots,
             origins,
@@ -4748,7 +4778,7 @@ mod run {
             slots,
             origins.native_flows(),
             &base,
-            &selectors,
+            &construction,
             is_mutable,
             &demote,
             commit_set[i],
@@ -4936,7 +4966,7 @@ mod run {
             return;
         }
         // Emit the probe base ONCE; every probe reuses it via push/pop (rider 4 / cost).
-        let Some((base, selectors)) =
+        let Some((base, construction)) =
             build_probe_base(program, slots, origins, mut_facts, CopyLendMode::current())
         else {
             row.set("na_status", "base-error");
@@ -4963,7 +4993,7 @@ mod run {
                     slots,
                     origins.native_flows(),
                     &base,
-                    &selectors,
+                    &construction,
                     mut_facts,
                     &demote,
                     slots_only[i],
@@ -4990,7 +5020,7 @@ mod run {
                 slots,
                 origins.native_flows(),
                 &base,
-                &selectors,
+                &construction,
                 mut_facts,
                 &demote,
                 slots_only[i],
@@ -5018,12 +5048,17 @@ mod run {
             base.add_borrow_exclusion(Some(d), &[]);
         }
         // Allow-list: outside the armed region ⇒ records nothing.
-        let witnessed = match base.model_kinds_relaxing(&selectors) {
+        let witnessed = match base.model_kinds_relaxing(&construction.selectors) {
             // Removed slots are hard-pinned `Ref`, so a SAT model has them all `Ref` by construction;
             // only acceptance remains to check.
-            Some(m) => {
-                model_accepts_with_flows(program, slots, origins.native_flows(), &m, mut_facts)
-            }
+            Some(m) => construction_model_accepts(
+                program,
+                slots,
+                origins.native_flows(),
+                &construction,
+                &m,
+                mut_facts,
+            ),
             // UNSAT under the pins ⇒ the removed set is NOT jointly `Ref`-recoverable (unless empty).
             None => removed.is_empty(),
         };
@@ -5124,7 +5159,7 @@ mod run {
             "certified-context targets do not match the captured Mode-A commit set"
         );
 
-        let (base, selectors) =
+        let (base, construction) =
             build_probe_base(program, slots, origins, mut_facts, CopyLendMode::current())
                 .expect("certified-context probe base");
         base.push_scope();
@@ -5135,7 +5170,7 @@ mod run {
             base.add_borrow_exclusion(Some(slot), &[]);
         }
         let before_checks = base.check_sat_count();
-        let witness = base.model_kinds_relaxing(&selectors);
+        let witness = base.model_kinds_relaxing(&construction.selectors);
         let witness_checks = base.check_sat_count() - before_checks;
         base.pop_scope();
 
@@ -5147,7 +5182,14 @@ mod run {
             "certified-context witness violated a hard Ref pin"
         );
         assert!(
-            model_accepts_with_flows(program, slots, origins.native_flows(), &witness, mut_facts,),
+            construction_model_accepts(
+                program,
+                slots,
+                origins.native_flows(),
+                &construction,
+                &witness,
+                mut_facts,
+            ),
             "certified-context hard-pinned witness must pass audit acceptance"
         );
 
@@ -8564,6 +8606,37 @@ pub unsafe fn f() {
                 assert_eq!(row.get("status"), Some("ok"));
                 assert_eq!(row.get("copy_lend_eligible_pairs"), Some("0"));
                 assert_eq!(row.get("copy_lend_selected_sites"), Some("0"));
+            },
+        )
+        .unwrap_or_else(|error| error.raise());
+    }
+
+    #[test]
+    fn copy_lend_phase1b_bo_c1_c2_c3_exclusions_reach_driver() {
+        use crate::analyses::borrow_ownership::construction::CopyLendMode;
+        ::utils::compilation::run_compiler_on_str(
+            r#"
+unsafe extern "C" { fn malloc(size: usize) -> *mut core::ffi::c_void; }
+unsafe fn read_only(p: *const i32) { let _ = unsafe { *p }; }
+pub unsafe fn mutable_destination() -> i32 {
+    let p = unsafe { malloc(4) } as *mut i32;
+    let q = p;
+    unsafe { *q = 1 };
+    unsafe { *q }
+}
+pub unsafe fn ordinary_boundary() -> i32 {
+    let p = unsafe { malloc(4) } as *const i32;
+    let q = p;
+    unsafe { read_only(q) };
+    unsafe { *q }
+}
+"#,
+            |tcx| {
+                let row = CopyLendMode::LendArm.with_override(|| run_bo(tcx, Duration::ZERO));
+                assert_eq!(row.get("status"), Some("ok"));
+                assert_eq!(row.get("copy_lend_eligible_pairs"), Some("0"));
+                assert_eq!(row.get("copy_lend_selected_sites"), Some("0"));
+                assert_eq!(row.get("copy_lend_replay_selections"), Some("0"));
             },
         )
         .unwrap_or_else(|error| error.raise());
