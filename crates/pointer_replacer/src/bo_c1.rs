@@ -8785,7 +8785,7 @@ pub unsafe fn ordinary_boundary() -> i32 {
 }"#
             ),
             Item15Verdict::Lend {
-                pairs: 1,
+                pairs: 2,
                 selections: 1,
             },
         );
