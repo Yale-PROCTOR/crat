@@ -15974,6 +15974,99 @@ pub unsafe fn copy_local(p: *mut i32) -> i32 {
         );
     }
 
+    /// Required witness 4: a non-conflicting copy recovers the allocation owner. The alias's last
+    /// use precedes `free(p)`, so the typed loan is dead at deallocation and the oracle accepts
+    /// `p=Owning, q=Ref`.
+    #[test]
+    fn copy_lend_recovers_owner_and_accepts() {
+        run_compiler(
+            r#"
+unsafe extern "C" {
+    fn malloc(size: usize) -> *mut core::ffi::c_void;
+    fn free(p: *mut core::ffi::c_void);
+}
+
+pub unsafe fn copy_local() -> i32 {
+    let p = unsafe { malloc(core::mem::size_of::<i32>()) } as *mut i32;
+    let q = p;
+    let value = unsafe { *q };
+    unsafe { free(p as *mut core::ffi::c_void) };
+    value
+}
+"#,
+            |tcx| {
+                let program = collect_program(tcx);
+                let slots = CrateSlots::build(&program);
+                let crate_ctxt = CrateCtxt::new(&program);
+                let origins = compute_origins(&program);
+                let copy_local = function_by_name(&program, "copy_local");
+                let body = tcx
+                    .mir_drops_elaborated_and_const_checked(copy_local)
+                    .borrow();
+                let p_local = local_by_var_name(tcx, copy_local, "p");
+                let q_local = local_by_var_name(tcx, copy_local, "q");
+                let p = local_slot(&slots, copy_local, p_local, 0);
+                let q = local_slot(&slots, copy_local, q_local, 0);
+                let copy_lends = FxHashSet::from_iter([CopyLendPair::new(q, p)]);
+                let solver = KindSolver::new(&slots);
+
+                let (_stats, selectors) = emit_crate_ownership_constraints_with_copy_lends(
+                    &crate_ctxt,
+                    &slots,
+                    &origins,
+                    &solver,
+                    &copy_lends,
+                )
+                .expect("ownership emission");
+                add_coherence_with_copy_lends(&solver, &slots, copy_local, &body, &copy_lends);
+                let model = solver
+                    .model_kinds_relaxing(&selectors)
+                    .expect("owner-recovery model must be satisfiable");
+                assert_eq!(model.get(&p), Some(&SlotKind::Owning));
+                assert_eq!(model.get(&q), Some(&SlotKind::Ref));
+
+                let selected = selected_copy_lend_sites(&program, &slots, &copy_lends, &model);
+                let is_ref = |did| {
+                    let model = &model;
+                    let slots = &slots;
+                    move |local| {
+                        slots
+                            .fn_local_slots
+                            .get(&did)
+                            .and_then(|universe| universe.slot_for_local_depth(local, 0))
+                            .map(|slot| SlotRef::Local(did, slot))
+                            .is_some_and(|slot| model.get(&slot) == Some(&SlotKind::Ref))
+                    }
+                };
+                let is_raw = |did| {
+                    let model = &model;
+                    let slots = &slots;
+                    move |local| {
+                        slots
+                            .fn_local_slots
+                            .get(&did)
+                            .and_then(|universe| universe.slot_for_local_depth(local, 0))
+                            .map(|slot| SlotRef::Local(did, slot))
+                            .is_some_and(|slot| model.get(&slot) != Some(&SlotKind::Ref))
+                    }
+                };
+                let conflicts = borrow_conflicts_replaying_with_flows_and_copy_lends(
+                    &program,
+                    origins.native_flows(),
+                    is_ref,
+                    is_raw,
+                    |_| |_| false,
+                    &[],
+                    &selected,
+                );
+                assert!(
+                    conflicts.values().all(Vec::is_empty),
+                    "dead-before-free CopyLend must be accepted: {conflicts:?}"
+                );
+            },
+        );
+    }
+
     #[test]
     fn copy_propagates_kind() {
         run_compiler(
