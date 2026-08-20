@@ -301,7 +301,16 @@ fn emit_crate_ownership_constraints_impl<'tcx>(
     // the selector set are untouched. Replaces `verify_to_fixpoint`'s lazy
     // per-round BB3-a commit.
     let fns: Vec<_> = crate_ctxt.fns().iter().map(|d| d.expect_local()).collect();
-    for slot in sources::collect_malloc_source_slots(crate_ctxt.tcx, &fns, slots) {
+    let malloc_sources = match copy_lends {
+        Some(copy_lends) => sources::collect_malloc_source_slots_with_copy_lends(
+            crate_ctxt.tcx,
+            &fns,
+            slots,
+            copy_lends,
+        ),
+        None => sources::collect_malloc_source_slots(crate_ctxt.tcx, &fns, slots),
+    };
+    for slot in malloc_sources {
         kind_solver.add_borrow_exclusion(Some(slot), &[]);
     }
 
