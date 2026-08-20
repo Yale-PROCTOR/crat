@@ -745,7 +745,7 @@ fn formal_for_argument(
     targets: &[LocalDefId],
     parameter: usize,
     formals: &BTreeMap<(String, u32), ArtifactFormal>,
-    deep_refs: &BTreeMap<(String, u32), BTreeSet<FormalKey>>,
+    current_refs: &BTreeMap<(String, u32), BTreeSet<FormalKey>>,
     mutability: &MutFacts,
 ) -> Result<FormalDecision, String> {
     let mut settles_ref = true;
@@ -778,17 +778,21 @@ fn formal_for_argument(
             settles_ref = false;
             continue;
         };
-        settles_ref &= formal.settles_ref;
-        if formal.currently_predicted_ref {
-            currently_predicted_refs.insert(FormalKey {
-                function: path.clone(),
-                parameter: parameter as u32 + 1,
-                depth: 0,
-            });
-        }
-        if let Some(deeper) = deep_refs.get(&key) {
-            currently_predicted_refs.extend(deeper.iter().cloned());
-        }
+        let refs = current_refs.get(&key).ok_or_else(|| {
+            format!(
+                "current-head baseline model has no formal identity for {}#arg{} (snapshot depth {})",
+                path,
+                parameter + 1,
+                formal.ptr_depth,
+            )
+        })?;
+        let depth_zero = FormalKey {
+            function: path,
+            parameter: parameter as u32 + 1,
+            depth: 0,
+        };
+        settles_ref &= refs.contains(&depth_zero);
+        currently_predicted_refs.extend(refs.iter().cloned());
     }
     if !settles_ref {
         currently_predicted_refs.clear();
@@ -802,7 +806,7 @@ fn formal_for_argument(
     })
 }
 
-fn accepted_deep_refs(
+fn accepted_current_refs(
     tcx: TyCtxt<'_>,
     program: &RustProgram<'_>,
     formals: &BTreeMap<(String, u32), ArtifactFormal>,
@@ -842,20 +846,20 @@ fn accepted_deep_refs(
                 continue;
             };
             let local = Local::from_usize(parameter + 1);
-            let mut deeper = BTreeSet::new();
-            for depth in 1..formal.ptr_depth {
+            let mut accepted_refs = BTreeSet::new();
+            for depth in 0..formal.ptr_depth {
                 let slot = universe.slot_for_local_depth(local, depth).ok_or_else(|| {
                     format!("accepted model lacks {path}#arg{}@{depth}", parameter + 1)
                 })?;
                 if model.get(&SlotRef::Local(function, slot)) == Some(&SlotKind::Ref) {
-                    deeper.insert(FormalKey {
+                    accepted_refs.insert(FormalKey {
                         function: path.clone(),
                         parameter: parameter as u32 + 1,
                         depth,
                     });
                 }
             }
-            refs.insert(key, deeper);
+            refs.insert(key, accepted_refs);
         }
     }
     Ok(refs)
@@ -865,7 +869,7 @@ fn measure_tcx(
     program_name: &str,
     tcx: TyCtxt<'_>,
     formals: &BTreeMap<(String, u32), ArtifactFormal>,
-    deep_refs: &BTreeMap<(String, u32), BTreeSet<FormalKey>>,
+    current_refs: &BTreeMap<(String, u32), BTreeSet<FormalKey>>,
     accepted_model_time: Duration,
 ) -> Result<Measurement, String> {
     let program = super::collect_program(tcx);
@@ -988,7 +992,7 @@ fn measure_tcx(
 
             let arguments = (0..call_args.len())
                 .map(|parameter| {
-                    formal_for_argument(tcx, targets, parameter, formals, deep_refs, &mutability)
+                    formal_for_argument(tcx, targets, parameter, formals, current_refs, &mutability)
                 })
                 .collect::<Result<Vec<_>, _>>()?;
             let mut pair_facts = BTreeMap::new();
@@ -1054,17 +1058,12 @@ pub(super) fn run_worker(tcx: TyCtxt<'_>, t_tcx: Duration) -> super::report::Row
         row.set("status", "missing-snapshot");
         return row;
     };
-    let deep = std::env::var("CRAT_A5_DEEP").as_deref() == Ok("1");
     let measured = snapshot_formals(&snapshot, &program).and_then(|formals| {
         let t_model = Instant::now();
-        let deep_refs = if deep {
-            let rust_program = super::collect_program(tcx);
-            accepted_deep_refs(tcx, &rust_program, &formals)?
-        } else {
-            BTreeMap::new()
-        };
-        let model_time = deep.then(|| t_model.elapsed()).unwrap_or_default();
-        measure_tcx(&program, tcx, &formals, &deep_refs, model_time)
+        let rust_program = super::collect_program(tcx);
+        let current_refs = accepted_current_refs(tcx, &rust_program, &formals)?;
+        let model_time = t_model.elapsed();
+        measure_tcx(&program, tcx, &formals, &current_refs, model_time)
     });
     match measured {
         Ok(measured) => {
@@ -1072,14 +1071,8 @@ pub(super) fn run_worker(tcx: TyCtxt<'_>, t_tcx: Duration) -> super::report::Row
             for pair in &measured.pairs {
                 println!("{}", render_pair_line(pair));
             }
-            let needs_depth = !deep && counts.sites_not_proven_disjoint > 0;
-            if needs_depth {
-                println!("{}", render_base_line(counts));
-                row.set("status", "needs-depth");
-            } else {
-                println!("{}", render_count_line(counts));
-                row.set("status", "ok");
-            }
+            println!("{}", render_count_line(counts));
+            row.set("status", "ok");
             row.set("c1", counts.sites_with_two_ref_args);
             row.set("c2", counts.sites_not_proven_disjoint);
             row.set("c3", counts.attributed_predicted_refs);
@@ -1545,7 +1538,8 @@ fn load_preserved_bases(directory: &Path) -> Result<BTreeMap<String, CompletedBa
 fn a5_p1_corpus() {
     use std::{fs, path::PathBuf};
 
-    const DATE: &str = "2026-08-07";
+    const DATE: &str = "2026-08-20";
+    const ANALYSIS_SEMANTICS_HEAD: &str = "809dd9de";
     const SNAPSHOT_PRODUCER_HEAD: &str = "3b26a0ff85517a33acf916e8dbe2624ffc924a85";
     const SNAPSHOT_PRODUCER_BRANCH_HEAD: &str = "52da86648db9d76d8945063792f37da61bf8c8b9";
     const MANIFEST_COMMIT: &str = "a654d5ecde8a0ea9fccc8a3e7b9caaa8fac5812d";
@@ -1638,13 +1632,15 @@ fn a5_p1_corpus() {
     );
 
     let deps_link = root.join("deps_crate/target");
-    assert!(
-        fs::symlink_metadata(&deps_link)
-            .expect("deps target metadata")
-            .file_type()
-            .is_symlink(),
-        "P1 records the approved read-only symlink provisioning shape"
-    );
+    let deps_shape = if fs::symlink_metadata(&deps_link)
+        .expect("deps target metadata")
+        .file_type()
+        .is_symlink()
+    {
+        "read-only-symlink-to-main-checkout-build"
+    } else {
+        "worktree-local-locked-build"
+    };
     let deps_target = deps_link.canonicalize().expect("canonical deps target");
     let deps_dir = deps_target.join("debug/deps");
     let deps_entries = fs::read_dir(&deps_dir).expect("read linked deps directory");
@@ -1795,7 +1791,6 @@ fn a5_p1_corpus() {
     let mut brotli_depth_peak_rss_kb = None;
     let mut brotli_depth_wall_s = None;
     let preserved_final_directory = std::env::var_os("CRAT_A5_PRESERVED_FINAL_DIR");
-    let resumed_final_rows = preserved_final_directory.is_some();
     if let Some(directory) = preserved_final_directory {
         assert_eq!(
             std::env::var("CRAT_BOC1_MEM_MB").as_deref(),
@@ -1967,14 +1962,7 @@ fn a5_p1_corpus() {
         needs_depth.len() < super::CORPUS.len(),
         "all 20 programs require a targeted accepted-model export; P1 refuses a suite-wide re-solve"
     );
-    let targeted_count = if resumed_final_rows {
-        final_runs
-            .values()
-            .filter(|run| run.counts.sites_not_proven_disjoint > 0)
-            .count()
-    } else {
-        needs_depth.len()
-    };
+    let current_head_baseline_model_count = super::CORPUS.len();
     for (program, base, base_wall) in needs_depth {
         let input = corpus_link.join(program.name).join(program.lib_root);
         let outcome = super::orchestrate::run_child_env(
@@ -2063,7 +2051,7 @@ fn a5_p1_corpus() {
         "program\tc1\tc2\tc3\tc3_depth0\tcg_num\tcg_den\tpair_den\tmut_mut\tmut_read_only\tshared_shared\tsite_mut_mut\tsite_mut_read_only\tsite_shared_shared\tmut_default_fires\tcalls_total\tdirect_local\tindirect_local\tdirect_external\tindirect_unresolved\tnon_fn_def_constant\tt_origins_s\tt_andersen_s\tt_model_s\twall_s\n",
     );
     let mut markdown = format!(
-        "# A5/P1 raw measurement with count-(5)\n\nHEAD `{analysis_head}`, date {DATE}; manifest docs `{MANIFEST_COMMIT}`; CopyLend mode `baseline`.\n\n| program | C1 | C2/site denominator | C3-all | C3-d0 | pair denominator | mut+mut | mut+read-only | shared+shared | site mut+mut | site mut+read-only | site shared+shared | unknown-reachable / local functions |\n|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n"
+        "# A5 current-head refresh with count-(5)\n\nHEAD `{analysis_head}`, date {DATE}; manifest docs `{MANIFEST_COMMIT}` supplies identity/depth cross-checks only; all C1-C3 decisions come from the current-head `baseline` BO model.\n\n| program | C1 | C2/site denominator | C3-all | C3-d0 | pair denominator | mut+mut | mut+read-only | shared+shared | site mut+mut | site mut+read-only | site shared+shared | unknown-reachable / local functions |\n|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n"
     );
     let percent = |numerator: usize, denominator: usize| {
         if denominator == 0 {
@@ -2225,11 +2213,12 @@ fn a5_p1_corpus() {
         .map(|value| format!("{value:.3}"))
         .unwrap_or_else(|| "not-applicable".to_owned());
     let provenance = format!(
-        "date={DATE}\nanalysis_worktree_head={analysis_head}\ncopy_lend_mode=baseline\nfoster_fact_producer=MutFacts::from_program(mutability_analysis+SourceVarGroups::postprocess_mut_res)\nsnapshot_producer_head={SNAPSHOT_PRODUCER_HEAD}\nsnapshot_producer_branch_head={SNAPSHOT_PRODUCER_BRANCH_HEAD}\nsnapshot_producer_branch_delta=one-test-only-commit-after-capture\nmanifest_commit={MANIFEST_COMMIT}\nraw_frozen_corpus_sha256={RAW_FROZEN_DIGEST}\nderived_substrate_sha256={DERIVED_SUBSTRATE_DIGEST}\nsubstrate=derived\nsubstrate_selector={}\nrepair=mode_a\nl2=0\nsafe_mono=per_site\nfork_engine=fork\nmutability_facts=on-direct-from-program\nz3_smt_seed=0\nz3_sat_seed=0\ncorpus_shape=read-only-symlink-to-main-checkout-derived-corpus\ncorpus_link={}\ncorpus_target={}\nsnapshot={}\ndeps_shape=read-only-symlink-to-main-checkout-build\ndeps_link={}\ndeps_target={}\ndeps_rlibs={}\ndeps_bytemuck_derive=present\nresolver_DIR={}\nresolver_CWD={}\nbase_timeout_s={}\ndeep_timeout_s={}\ntargeted_programs={}\npreserved_base_dir={}\npreserved_base_rows={}\npreserved_base_hash_manifest_sha256={}\npreserved_base_wall_source=child-t_total_s\npreserved_final_dir={}\npreserved_final_rows={}\npreserved_final_hash_manifest_sha256={}\npreserved_final_wall_source=child-t_total_s\nbrotli_recovery_mem_cap_mib={}\nbrotli_recovery_peak_rss_kb={}\nbrotli_depth_recovery_mem_cap_mib={}\nbrotli_depth_recovery_peak_rss_kb={}\nbrotli_depth_recovery_wall_s={}\nbrotli_single_file_side_effect=derived-expand-collapsed-to-about-500k-sloc\n",
+        "date={DATE}\nanalysis_worktree_head={analysis_head}\nanalysis_semantics_head={ANALYSIS_SEMANTICS_HEAD}\ncopy_lend_mode=baseline\nfoster_fact_producer=MutFacts::from_program(mutability_analysis+SourceVarGroups::postprocess_mut_res)\nsnapshot_role=identity-and-pointer-depth-cross-check-only\nsnapshot_producer_head={SNAPSHOT_PRODUCER_HEAD}\nsnapshot_producer_branch_head={SNAPSHOT_PRODUCER_BRANCH_HEAD}\nsnapshot_producer_branch_delta=one-test-only-commit-after-capture\nmanifest_commit={MANIFEST_COMMIT}\nraw_frozen_corpus_sha256={RAW_FROZEN_DIGEST}\nderived_substrate_sha256={DERIVED_SUBSTRATE_DIGEST}\nsubstrate=derived\nsubstrate_selector={}\nrepair=mode_a\nl2=0\nsafe_mono=per_site\nfork_engine=fork\nmutability_facts=on-direct-from-program\nz3_smt_seed=0\nz3_sat_seed=0\ncorpus_shape=read-only-symlink-to-main-checkout-derived-corpus\ncorpus_link={}\ncorpus_target={}\nsnapshot={}\ndeps_shape={}\ndeps_link={}\ndeps_target={}\ndeps_rlibs={}\ndeps_bytemuck_derive=present\nresolver_DIR={}\nresolver_CWD={}\nbase_timeout_s={}\ndeep_timeout_s={}\ncurrent_head_baseline_model_programs={}\npreserved_base_dir={}\npreserved_base_rows={}\npreserved_base_hash_manifest_sha256={}\npreserved_base_wall_source=child-t_total_s\npreserved_final_dir={}\npreserved_final_rows={}\npreserved_final_hash_manifest_sha256={}\npreserved_final_wall_source=child-t_total_s\nbrotli_recovery_mem_cap_mib={}\nbrotli_recovery_peak_rss_kb={}\nbrotli_depth_recovery_mem_cap_mib={}\nbrotli_depth_recovery_peak_rss_kb={}\nbrotli_depth_recovery_wall_s={}\nbrotli_single_file_side_effect=derived-expand-collapsed-to-about-500k-sloc\n",
         substrate_selector.as_deref().unwrap_or("default-derived"),
         corpus_link.display(),
         corpus_target.display(),
         snapshot.display(),
+        deps_shape,
         deps_link.display(),
         deps_target.display(),
         rlibs,
@@ -2237,7 +2226,7 @@ fn a5_p1_corpus() {
         resolver_cwd.display(),
         base_timeout.as_secs(),
         deep_timeout.as_secs(),
-        targeted_count,
+        current_head_baseline_model_count,
         preserved_base_dir,
         if preserved_base_dir == "none" { 0 } else { 19 },
         preserved_base_hash_manifest_sha256,
@@ -2733,24 +2722,25 @@ pub unsafe fn entry(p: *mut i32, q: *mut i32) { two(p, q); }
                     (
                         (path.clone(), 1),
                         ArtifactFormal {
-                            settles_ref: true,
-                            currently_predicted_ref: true,
+                            settles_ref: false,
+                            currently_predicted_ref: false,
                             ptr_depth: 1,
                         },
                     ),
                     (
                         (path, 2),
                         ArtifactFormal {
-                            settles_ref: true,
-                            currently_predicted_ref: true,
+                            settles_ref: false,
+                            currently_predicted_ref: false,
                             ptr_depth: 1,
                         },
                     ),
                 ]);
 
-                let measured =
-                    measure_tcx("fixture", tcx, &formals, &BTreeMap::new(), Duration::ZERO)
-                        .expect("measured fixture");
+                let current_refs = accepted_current_refs(tcx, &program, &formals)
+                    .expect("current-head baseline model");
+                let measured = measure_tcx("fixture", tcx, &formals, &current_refs, Duration::ZERO)
+                    .expect("measured fixture");
 
                 assert_eq!(measured.counts.sites_with_two_ref_args, 1);
                 assert_eq!(measured.counts.sites_not_proven_disjoint, 1);
