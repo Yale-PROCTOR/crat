@@ -21,8 +21,8 @@ use crate::{
             ProvenanceSet, StructFieldSlot, borrow_inference,
         },
         borrow_ownership::{
+            coherence::SelectedCopyLendLoan,
             export,
-            l2::MirLocationKey,
             origin_flow::{self, OriginFlowResults},
             slots::SlotOwner,
         },
@@ -100,12 +100,25 @@ impl<'a> NativeBorrowContext<'a> {
         tcx: TyCtxt<'tcx>,
         f: LocalDefId,
         disabled_fields: &[StructFieldSlot],
-        selected_copy_lends: &FxHashSet<MirLocationKey>,
+        selected_copy_lends: &FxHashSet<SelectedCopyLendLoan>,
     ) -> NativeInference<'tcx> {
         let mut inference = borrow_inference(tcx, f, &self.borrow);
         let mut copy_lends = DenseBitSet::new_empty(inference.borrow_set.loans.len());
         for (loan, data) in inference.borrow_set.loans.iter_enumerated() {
-            if selected_copy_lends.contains(&export::location_key(data.location())) {
+            let borrower = match data.assigned {
+                Borrower::Assign(owner) => export::BorrowerKind::Assign {
+                    owner: export::OwnerKey::from_owner(owner),
+                },
+                Borrower::CallArg(callee, arg_index) => export::BorrowerKind::CallArg {
+                    callee: callee.local_def_index.as_u32(),
+                    arg_index,
+                },
+            };
+            if selected_copy_lends.contains(&SelectedCopyLendLoan {
+                location: export::location_key(data.location()),
+                borrowed: export::PlaceKey::from_place(data.borrowed),
+                borrower,
+            }) {
                 copy_lends.insert(loan);
             }
         }

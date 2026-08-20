@@ -9949,12 +9949,13 @@ mod borrow_ownership_coherence {
                 },
                 borrow_verify::{
                     SlotConflict, materialize_guards, model_accepts, revalidate,
-                    revalidate_replaying, verify_to_fixpoint,
+                    revalidate_replaying, verify_l2_to_fixpoint_counting, verify_to_fixpoint,
                 },
                 coherence::{
                     CopyLendPair, add_coherence, add_coherence_with_copy_lends,
                     constrain_field_ownership, selected_copy_lend_sites,
                 },
+                construction::{CopyLendMode, analyze_copy_lend_eligibility, construct_bo_into},
                 crate_slots::CrateSlots,
                 emit_crate_ownership_constraints, emit_crate_ownership_constraints_with_copy_lends,
                 export::{LoanClass, location_key, with_bo_export},
@@ -15733,20 +15734,27 @@ pub unsafe fn copy_local(p: *const i32) -> i32 {
                 });
                 assert_eq!(model.get(&p), Some(&SlotKind::Owning));
                 assert_eq!(model.get(&q), Some(&SlotKind::Ref));
-                assert!(
-                    export.loans.iter().any(|loan| {
-                        loan.class == LoanClass::CopyLend
-                            && loan.key.fn_did == copy_local
-                            && loan.key.borrower
-                                == crate::analyses::borrow_ownership::export::BorrowerKind::Assign {
-                                    owner:
-                                        crate::analyses::borrow_ownership::export::OwnerKey::Local(
-                                            q_local.as_u32(),
-                                        ),
-                                }
-                    }),
-                    "selected lend emitted no typed replay loan: {:?}",
+                let typed = export
+                    .loans
+                    .iter()
+                    .filter(|loan| loan.class == LoanClass::CopyLend)
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    typed.len(),
+                    1,
+                    "CopyLend registration must identify one exact loan, not every companion at its location: {:?}",
                     export.loans
+                );
+                let typed = typed[0];
+                assert_eq!(typed.key.fn_did, copy_local);
+                assert_eq!(typed.key.place.local, p_local);
+                assert_eq!(
+                    typed.key.borrower,
+                    crate::analyses::borrow_ownership::export::BorrowerKind::Assign {
+                        owner: crate::analyses::borrow_ownership::export::OwnerKey::Local(
+                            q_local.as_u32(),
+                        ),
+                    }
                 );
             },
         );
@@ -16131,6 +16139,234 @@ pub unsafe fn copy_local() -> i32 {
                         "ruling §7b genealogy fact drift: {local:?}@d0 absent; facts={unknown:?}"
                     );
                 }
+            },
+        );
+    }
+
+    #[test]
+    fn copy_lend_phase1b_eligibility_malloc_without_outward_event_is_eligible() {
+        run_compiler(
+            r#"
+unsafe extern "C" {
+    fn malloc(size: usize) -> *mut core::ffi::c_void;
+    fn free(p: *mut core::ffi::c_void);
+}
+pub unsafe fn f() -> i32 {
+    let p = unsafe { malloc(4) } as *mut i32;
+    let q = p;
+    let value = unsafe { *q };
+    unsafe { free(p as *mut core::ffi::c_void) };
+    value
+}
+"#,
+            |tcx| {
+                let program = collect_program(tcx);
+                let slots = CrateSlots::build(&program);
+                let origins = compute_origins(&program);
+                let facts = MutFacts::from_program(&program);
+                let function = function_by_name(&program, "f");
+                let p = local_slot(&slots, function, local_by_var_name(tcx, function, "p"), 0);
+                let q = local_slot(&slots, function, local_by_var_name(tcx, function, "q"), 0);
+                let eligibility =
+                    analyze_copy_lend_eligibility(&program, &slots, &facts, origins.native_flows());
+                assert!(eligibility.pairs.contains(&CopyLendPair::new(q, p)));
+            },
+        );
+    }
+
+    #[test]
+    fn copy_lend_phase1b_eligibility_live_outward_foreign_call_is_ineligible() {
+        run_compiler(
+            r#"
+unsafe extern "C" {
+    fn malloc(size: usize) -> *mut core::ffi::c_void;
+    fn free(p: *mut core::ffi::c_void);
+    fn opaque(p: *mut i32);
+}
+pub unsafe fn f() -> i32 {
+    let p = unsafe { malloc(4) } as *mut i32;
+    let q = p;
+    unsafe { opaque(q) };
+    let value = unsafe { *q };
+    unsafe { free(p as *mut core::ffi::c_void) };
+    value
+}
+"#,
+            |tcx| {
+                let program = collect_program(tcx);
+                let slots = CrateSlots::build(&program);
+                let origins = compute_origins(&program);
+                let facts = MutFacts::from_program(&program);
+                let function = function_by_name(&program, "f");
+                let p = local_slot(&slots, function, local_by_var_name(tcx, function, "p"), 0);
+                let q = local_slot(&slots, function, local_by_var_name(tcx, function, "q"), 0);
+                let eligibility =
+                    analyze_copy_lend_eligibility(&program, &slots, &facts, origins.native_flows());
+                assert!(!eligibility.pairs.contains(&CopyLendPair::new(q, p)));
+            },
+        );
+    }
+
+    #[test]
+    fn copy_lend_phase1b_eligibility_free_destination_is_unconditionally_ineligible() {
+        run_compiler(
+            r#"
+unsafe extern "C" { fn free(p: *mut i32); }
+pub unsafe fn f(p: *mut i32) {
+    let q = p;
+    unsafe { free(q) };
+}
+"#,
+            |tcx| {
+                let program = collect_program(tcx);
+                let slots = CrateSlots::build(&program);
+                let origins = compute_origins(&program);
+                let facts = MutFacts::from_program(&program);
+                let function = function_by_name(&program, "f");
+                let p = local_slot(&slots, function, local_by_var_name(tcx, function, "p"), 0);
+                let q = local_slot(&slots, function, local_by_var_name(tcx, function, "q"), 0);
+                let eligibility =
+                    analyze_copy_lend_eligibility(&program, &slots, &facts, origins.native_flows());
+                assert!(!eligibility.pairs.contains(&CopyLendPair::new(q, p)));
+            },
+        );
+    }
+
+    /// The production helper must consume exactly the same C2/C3 verdicts as the fixture-scale
+    /// producer. This is a differential, not a duplicated predicate: the expected matrix pins the
+    /// plain/free(source), outward-call, free(destination), and mutable-destination controls.
+    #[test]
+    fn copy_lend_phase1b_production_eligibility_matches_fixture_matrix() {
+        run_compiler(
+            r#"
+unsafe extern "C" {
+    fn malloc(size: usize) -> *mut core::ffi::c_void;
+    fn free(p: *mut core::ffi::c_void);
+    fn opaque(p: *mut i32);
+}
+unsafe fn local_sink(p: *mut i32) { core::hint::black_box(p); }
+pub unsafe fn plain() -> i32 {
+    let p = unsafe { malloc(4) } as *mut i32;
+    let q = p;
+    unsafe { *q }
+}
+pub unsafe fn outward() -> i32 {
+    let p = unsafe { malloc(4) } as *mut i32;
+    let q = p;
+    unsafe { opaque(q) };
+    unsafe { *q }
+}
+pub unsafe fn ordinary_call() -> i32 {
+    let p = unsafe { malloc(4) } as *mut i32;
+    let q = p;
+    unsafe { local_sink(q) };
+    unsafe { *q }
+}
+pub unsafe fn free_destination() {
+    let p = unsafe { malloc(4) } as *mut i32;
+    let q = p;
+    unsafe { free(q as *mut core::ffi::c_void) };
+}
+pub unsafe fn mutable_destination() -> i32 {
+    let p = unsafe { malloc(4) } as *mut i32;
+    let q = p;
+    unsafe { *q = 1 };
+    unsafe { *q }
+}
+pub unsafe fn free_source() -> i32 {
+    let p = unsafe { malloc(4) } as *mut i32;
+    let q = p;
+    let value = unsafe { *q };
+    unsafe { free(p as *mut core::ffi::c_void) };
+    value
+}
+"#,
+            |tcx| {
+                let program = collect_program(tcx);
+                let slots = CrateSlots::build(&program);
+                let origins = compute_origins(&program);
+                let facts = MutFacts::from_program(&program);
+                let fixture =
+                    analyze_copy_lend_eligibility(&program, &slots, &facts, origins.native_flows());
+                let solver = KindSolver::new(&slots);
+                let production = construct_bo_into(
+                    &program,
+                    &slots,
+                    &origins,
+                    &facts,
+                    &solver,
+                    CopyLendMode::LendArm,
+                )
+                .expect("production construction");
+                assert_eq!(production.eligibility, fixture);
+
+                for (name, expected) in [
+                    ("plain", true),
+                    ("outward", false),
+                    ("ordinary_call", false),
+                    ("free_destination", false),
+                    ("mutable_destination", false),
+                    ("free_source", true),
+                ] {
+                    let function = function_by_name(&program, name);
+                    let p = local_slot(&slots, function, local_by_var_name(tcx, function, "p"), 0);
+                    let q = local_slot(&slots, function, local_by_var_name(tcx, function, "q"), 0);
+                    assert_eq!(
+                        fixture.pairs.contains(&CopyLendPair::new(q, p)),
+                        expected,
+                        "eligibility matrix drift for {name}"
+                    );
+                }
+            },
+        );
+    }
+
+    #[test]
+    fn copy_lend_phase1b_l2_replay_receives_selected_loans() {
+        run_compiler(
+            r#"
+unsafe extern "C" {
+    fn malloc(size: usize) -> *mut core::ffi::c_void;
+    fn free(p: *mut core::ffi::c_void);
+}
+pub unsafe fn f() -> i32 {
+    let p = unsafe { malloc(4) } as *mut i32;
+    let q = p;
+    let value = unsafe { *q };
+    unsafe { free(p as *mut core::ffi::c_void) };
+    value
+}
+"#,
+            |tcx| {
+                let program = collect_program(tcx);
+                let slots = CrateSlots::build(&program);
+                let origins = compute_origins(&program);
+                let facts = MutFacts::from_program(&program);
+                let solver = KindSolver::new(&slots);
+                let construction = construct_bo_into(
+                    &program,
+                    &slots,
+                    &origins,
+                    &facts,
+                    &solver,
+                    CopyLendMode::LendArm,
+                )
+                .expect("lend construction");
+                let (model, _stats) = verify_l2_to_fixpoint_counting(
+                    &program,
+                    &slots,
+                    origins.native_flows(),
+                    &solver,
+                    &construction.selectors,
+                    &facts,
+                    Some(&construction.eligibility.pairs),
+                );
+                let model = model.expect("L2 must accept the dead-before-free CopyLend");
+                let function = function_by_name(&program, "f");
+                let p = local_slot(&slots, function, local_by_var_name(tcx, function, "p"), 0);
+                let q = local_slot(&slots, function, local_by_var_name(tcx, function, "q"), 0);
+                assert_eq!(model.get(&p), Some(&SlotKind::Owning));
+                assert_eq!(model.get(&q), Some(&SlotKind::Ref));
             },
         );
     }

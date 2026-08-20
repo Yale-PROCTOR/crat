@@ -33,11 +33,11 @@ use z3::SatResult;
 
 use super::{collect_program, report::Row};
 use crate::analyses::borrow_ownership::{
-    CrateCtxt, SlotKind,
-    borrow_verify::{verify_to_fixpoint_counting_with_flows, with_mode_a_commit_trace},
-    coherence::{add_coherence, constrain_field_ownership},
+    SlotKind,
+    borrow_verify::with_mode_a_commit_trace,
+    coherence::constrain_field_ownership,
+    construction::{CopyLendMode, construct_bo_into, verify_bo_construction_counting},
     crate_slots::CrateSlots,
-    emit_crate_ownership_constraints,
     export::{BoExport, SelectorSite, location_key, with_bo_export},
     mutability_facts::{MutFacts, MutFactsMode},
     origins::compute_origins,
@@ -5082,40 +5082,42 @@ pub(super) fn run_worker(tcx: TyCtxt<'_>, t_tcx: Duration) -> Row {
     let program = collect_program(tcx);
     let origins = compute_origins(&program);
     let slots = CrateSlots::build(&program);
-    let crate_ctxt = CrateCtxt::new(&program);
     let mutability = match MutFactsMode::current() {
         MutFactsMode::Off => MutFacts::all_mut(),
         MutFactsMode::On => MutFacts::from_program(&program),
     };
     let ordinary = KindSolver::new(&slots);
+    let copy_lend_mode = CopyLendMode::current();
     let (
-        (((ordinary_model, _ordinary_stats), ordinary_commits), ordinary_selectors),
+        (((ordinary_model, _ordinary_stats), ordinary_commits), ordinary_construction),
         _ordinary_export,
     ) = with_bo_export(|| {
-        let (_stats, selectors) =
-            emit_crate_ownership_constraints(&crate_ctxt, &slots, &origins, &ordinary)
-                .expect("A4C ordinary ownership emission");
-        for &fn_did in &program.functions {
-            let body = tcx.mir_drops_elaborated_and_const_checked(fn_did).borrow();
-            add_coherence(&ordinary, &slots, fn_did, &body);
-        }
+        let construction = construct_bo_into(
+            &program,
+            &slots,
+            &origins,
+            &mutability,
+            &ordinary,
+            copy_lend_mode,
+        )
+        .expect("A4C ordinary ownership emission");
         let ((model, stats), commits) = with_mode_a_commit_trace(|| {
-            verify_to_fixpoint_counting_with_flows(
+            verify_bo_construction_counting(
                 &program,
                 &slots,
-                origins.native_flows(),
+                &origins,
                 &ordinary,
-                &selectors,
+                &construction,
                 &mutability,
             )
         });
-        (((model, stats), commits), selectors)
+        (((model, stats), commits), construction)
     });
     let ordinary_model = ordinary_model.unwrap_or_else(|| {
         panic!("A4C STOP phase=ordinary candidate=none: selector-off baseline declined")
     });
     let (ordinary_dropped_sources, ordinary_dropped_sinks) =
-        selector_state(&ordinary, &ordinary_selectors);
+        selector_state(&ordinary, &ordinary_construction.selectors);
     emit_phase(started, "graph-construction", None, 0);
     let graph = build_source_graph(tcx, &slots, &_ordinary_export);
     verify_active_gap_waivers_exercised()
@@ -5230,13 +5232,15 @@ pub(super) fn run_worker(tcx: TyCtxt<'_>, t_tcx: Duration) -> Row {
         );
 
         let forced = KindSolver::new(&slots);
-        let (_stats, forced_selectors) =
-            emit_crate_ownership_constraints(&crate_ctxt, &slots, &origins, &forced)
-                .expect("A4C forced ownership emission");
-        for &fn_did in &program.functions {
-            let body = tcx.mir_drops_elaborated_and_const_checked(fn_did).borrow();
-            add_coherence(&forced, &slots, fn_did, &body);
-        }
+        let forced_construction = construct_bo_into(
+            &program,
+            &slots,
+            &origins,
+            &mutability,
+            &forced,
+            copy_lend_mode,
+        )
+        .expect("A4C forced ownership emission");
         constrain_field_ownership(&forced, &slots, &program);
         for commit in &ordinary_commits {
             forced.add_borrow_exclusion(Some(commit.target), &[]);
@@ -5256,7 +5260,7 @@ pub(super) fn run_worker(tcx: TyCtxt<'_>, t_tcx: Duration) -> Row {
         });
         assert_eq!(forced_model.get(&field_ref), Some(&SlotKind::Owning));
         let (forced_dropped_sources, forced_dropped_sinks) =
-            selector_state(&forced, &forced_selectors);
+            selector_state(&forced, &forced_construction.selectors);
 
         emit_phase(
             started,
@@ -5265,21 +5269,23 @@ pub(super) fn run_worker(tcx: TyCtxt<'_>, t_tcx: Duration) -> Row {
             exception_records.len(),
         );
         let replay = KindSolver::new(&slots);
-        let (_stats, replay_selectors) =
-            emit_crate_ownership_constraints(&crate_ctxt, &slots, &origins, &replay)
-                .expect("A4C replay ownership emission");
-        for &fn_did in &program.functions {
-            let body = tcx.mir_drops_elaborated_and_const_checked(fn_did).borrow();
-            add_coherence(&replay, &slots, fn_did, &body);
-        }
+        let replay_construction = construct_bo_into(
+            &program,
+            &slots,
+            &origins,
+            &mutability,
+            &replay,
+            copy_lend_mode,
+        )
+        .expect("A4C replay ownership emission");
         replay.assert_owning(field_ref);
         let ((replay_model, _replay_stats), replay_commits) = with_mode_a_commit_trace(|| {
-            verify_to_fixpoint_counting_with_flows(
+            verify_bo_construction_counting(
                 &program,
                 &slots,
-                origins.native_flows(),
+                &origins,
                 &replay,
-                &replay_selectors,
+                &replay_construction,
                 &mutability,
             )
         });
@@ -5293,7 +5299,7 @@ pub(super) fn run_worker(tcx: TyCtxt<'_>, t_tcx: Duration) -> Row {
                     SlotKind::Owning,
                     "A4C STOP phase=exception-replay candidate={key}: force lost"
                 );
-                let (sources, sinks) = selector_state(&replay, &replay_selectors);
+                let (sources, sinks) = selector_state(&replay, &replay_construction.selectors);
                 ("accepted".to_owned(), Some(kind), sources, sinks)
             } else {
                 let disposition = replay_none_disposition(replay.optimize().get_reason_unknown())
@@ -5362,8 +5368,8 @@ pub(super) fn run_worker(tcx: TyCtxt<'_>, t_tcx: Duration) -> Row {
             model_changes,
             ordinary_commits: commit_lines(&ordinary_commits),
             forced_commits: commit_lines(&replay_commits),
-            source_count: forced_selectors.sources().len(),
-            sink_count: forced_selectors.sinks().len(),
+            source_count: forced_construction.selectors.sources().len(),
+            sink_count: forced_construction.selectors.sinks().len(),
             source_inventory: selector_inventory(
                 tcx,
                 &_ordinary_export.source_sites,
@@ -5413,6 +5419,7 @@ pub(super) fn run_worker(tcx: TyCtxt<'_>, t_tcx: Duration) -> Row {
     emit_phase(started, "complete", None, candidate_records.len());
 
     let mut row = Row::default();
+    row.set("copy_lend_mode", copy_lend_mode.label());
     row.set("t_tcx_s", format!("{:.3}", t_tcx.as_secs_f64()));
     row.set("candidates", candidate_records.len());
     row.set("exceptions", exception_records.len());
@@ -15038,14 +15045,15 @@ mod tests {
         ::utils::compilation::run_compiler_on_str(source, |tcx| {
             let program = super::super::collect_program(tcx);
             let slots = CrateSlots::build(&program);
-            let crate_ctxt = CrateCtxt::new(&program);
             let solver = KindSolver::new(&slots);
             let (_, captured_export) = with_bo_export(|| {
-                emit_crate_ownership_constraints(
-                    &crate_ctxt,
+                construct_bo_into(
+                    &program,
                     &slots,
                     &compute_origins(&program),
+                    &MutFacts::all_mut(),
                     &solver,
+                    CopyLendMode::Baseline,
                 )
                 .expect("fixture ownership emission")
             });

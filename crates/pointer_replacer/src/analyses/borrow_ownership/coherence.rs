@@ -1,11 +1,12 @@
 use rustc_hash::{FxHashMap, FxHashSet};
-use rustc_middle::mir::{AggregateKind, Body, Location, Operand, Rvalue, StatementKind};
+use rustc_middle::mir::{AggregateKind, Body, Location, Operand, PlaceElem, Rvalue, StatementKind};
 use rustc_span::def_id::LocalDefId;
 use z3::ast::Bool;
 
 use super::{
     SlotKind,
     crate_slots::{CrateSlots, MAX_SLOT_DEPTH},
+    export::{BorrowerKind, OwnerKey, PlaceKey},
     l2::MirLocationKey,
     resolve::{ResolvedSlot, resolve_place},
     slots::StructFieldSlot,
@@ -76,7 +77,17 @@ pub(crate) fn copy_lend_guards_for_body(
     guards
 }
 
-pub(crate) type SelectedCopyLendSites = FxHashMap<LocalDefId, FxHashSet<MirLocationKey>>;
+/// Stable identity of the one loan synthesized by a selected copy-lend arm. Location alone is not
+/// sufficient: grouped provenance can synthesize companion loans at the same statement, and those
+/// retain the existing-loan invalidation semantics.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct SelectedCopyLendLoan {
+    pub(crate) location: MirLocationKey,
+    pub(crate) borrowed: PlaceKey,
+    pub(crate) borrower: BorrowerKind,
+}
+
+pub(crate) type SelectedCopyLendLoans = FxHashMap<LocalDefId, FxHashSet<SelectedCopyLendLoan>>;
 
 /// Read the selected CopyLend sites from the same accepted kind model replay will validate.
 pub(crate) fn selected_copy_lend_sites(
@@ -84,7 +95,7 @@ pub(crate) fn selected_copy_lend_sites(
     slots: &CrateSlots,
     copy_lends: &FxHashSet<CopyLendPair>,
     model: &FxHashMap<SlotRef, SlotKind>,
-) -> SelectedCopyLendSites {
+) -> SelectedCopyLendLoans {
     let mut selected = FxHashMap::default();
     for &fn_did in &program.functions {
         let body = program
@@ -112,10 +123,17 @@ pub(crate) fn selected_copy_lend_sites(
                     && model.get(&pair.lhs) == Some(&SlotKind::Ref)
                     && model.get(&pair.rhs) == Some(&SlotKind::Owning)
                 {
+                    let borrowed = rhs_place.project_deeper(&[PlaceElem::Deref], program.tcx);
                     selected
                         .entry(fn_did)
                         .or_insert_with(FxHashSet::default)
-                        .insert(MirLocationKey::new(block.as_u32(), statement_index));
+                        .insert(SelectedCopyLendLoan {
+                            location: MirLocationKey::new(block.as_u32(), statement_index),
+                            borrowed: PlaceKey::from_place(borrowed),
+                            borrower: BorrowerKind::Assign {
+                                owner: OwnerKey::Local(lhs_place.local.as_u32()),
+                            },
+                        });
                 }
             }
         }
@@ -143,6 +161,7 @@ fn add_coherence_impl<'tcx>(
     body: &Body<'tcx>,
     tag_uses: bool,
     copy_lends: Option<&FxHashSet<CopyLendPair>>,
+    remove_copy_equates: bool,
 ) {
     for bbdata in body.basic_blocks.iter() {
         for stmt in &bbdata.statements {
@@ -154,6 +173,9 @@ fn add_coherence_impl<'tcx>(
                 Rvalue::Use(Operand::Copy(rhs) | Operand::Move(rhs))
                 | Rvalue::CopyForDeref(rhs) => {
                     with_use_track_context(solver, tag_uses, || {
+                        if remove_copy_equates {
+                            return;
+                        }
                         for d in 0..MAX_SLOT_DEPTH {
                             if let (Some(la), Some(ra)) = (
                                 resolve_place(slots, fn_did, body, *lhs, d, None),
@@ -248,7 +270,7 @@ pub fn add_coherence<'tcx>(
     fn_did: LocalDefId,
     body: &Body<'tcx>,
 ) {
-    add_coherence_impl(solver, slots, fn_did, body, false, None);
+    add_coherence_impl(solver, slots, fn_did, body, false, None, false);
 }
 
 pub(crate) fn add_coherence_with_copy_lends<'tcx>(
@@ -258,7 +280,16 @@ pub(crate) fn add_coherence_with_copy_lends<'tcx>(
     body: &Body<'tcx>,
     copy_lends: &FxHashSet<CopyLendPair>,
 ) {
-    add_coherence_impl(solver, slots, fn_did, body, false, Some(copy_lends));
+    add_coherence_impl(solver, slots, fn_did, body, false, Some(copy_lends), false);
+}
+
+pub(crate) fn add_coherence_removal_only<'tcx>(
+    solver: &KindSolver,
+    slots: &CrateSlots,
+    fn_did: LocalDefId,
+    body: &Body<'tcx>,
+) {
+    add_coherence_impl(solver, slots, fn_did, body, false, None, true);
 }
 
 #[cfg(test)]
@@ -268,7 +299,7 @@ pub(crate) fn add_coherence_tagging_uses<'tcx>(
     fn_did: LocalDefId,
     body: &Body<'tcx>,
 ) {
-    add_coherence_impl(solver, slots, fn_did, body, true, None);
+    add_coherence_impl(solver, slots, fn_did, body, true, None, false);
 }
 
 /// §9.10.2 crate-wide field-ownership constraint. A struct field slot is ONE crate-wide slot

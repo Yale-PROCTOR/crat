@@ -23,11 +23,11 @@ use z3::SatResult;
 
 use super::report::Row;
 use crate::analyses::borrow_ownership::{
-    CrateCtxt, SlotKind,
-    borrow_verify::{verify_to_fixpoint_counting_with_flows, with_mode_a_commit_trace},
-    coherence::{add_coherence, constrain_field_ownership},
+    SlotKind,
+    borrow_verify::with_mode_a_commit_trace,
+    coherence::constrain_field_ownership,
+    construction::{CopyLendMode, construct_bo_into, verify_bo_construction_counting},
     crate_slots::CrateSlots,
-    emit_crate_ownership_constraints,
     mutability_facts::{MutFacts, MutFactsMode},
     origins::compute_origins,
     resolve::{ResolvedSlot, resolve_place},
@@ -440,9 +440,14 @@ fn kind_label(kind: SlotKind) -> &'static str {
     }
 }
 
-fn write_probe(path: &Path, program: &str, records: &[ProbeRecord]) -> Result<(), String> {
+fn write_probe(
+    path: &Path,
+    program: &str,
+    mode: CopyLendMode,
+    records: &[ProbeRecord],
+) -> Result<(), String> {
     let mut out = String::from(
-        "program\tfield_key\tfield_slot\taccepted_kind\tforce_result\tcore_families\tcore_labels\n",
+        "copy_lend_mode\tprogram\tfield_key\tfield_slot\taccepted_kind\tforce_result\tcore_families\tcore_labels\n",
     );
     for record in records {
         let force = match record.force_result {
@@ -452,7 +457,8 @@ fn write_probe(path: &Path, program: &str, records: &[ProbeRecord]) -> Result<()
             ForceResult::NotQueried => "not-queried",
         };
         out.push_str(&format!(
-            "{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+            mode.label(),
             tsv_cell(program),
             tsv_cell(&record.field_key),
             record.field_slot,
@@ -472,10 +478,11 @@ fn probe_checkpoint_temp_path(path: &Path) -> PathBuf {
 fn write_probe_checkpoint(
     path: &Path,
     program: &str,
+    mode: CopyLendMode,
     records: &[ProbeRecord],
 ) -> Result<(), String> {
     let temp = probe_checkpoint_temp_path(path);
-    write_probe(&temp, program, records)?;
+    write_probe(&temp, program, mode, records)?;
     fs::rename(&temp, path).map_err(|error| {
         format!(
             "publish checkpoint {} from {}: {error}",
@@ -579,27 +586,29 @@ pub(super) fn run_probe_worker(tcx: TyCtxt<'_>, t_tcx: Duration) -> Row {
     emit_checkpoint_phase(started, "ordinary-start", None, 0);
     let origins = compute_origins(&program);
     let slots = CrateSlots::build(&program);
-    let crate_ctxt = CrateCtxt::new(&program);
-
-    let ordinary = KindSolver::new(&slots);
-    let (_stats, selectors) =
-        emit_crate_ownership_constraints(&crate_ctxt, &slots, &origins, &ordinary)
-            .unwrap_or_else(|error| panic!("ordinary emission: {error:#}"));
-    for &fn_did in &program.functions {
-        let body = tcx.mir_drops_elaborated_and_const_checked(fn_did).borrow();
-        add_coherence(&ordinary, &slots, fn_did, &body);
-    }
     let mutability = match MutFactsMode::current() {
         MutFactsMode::Off => MutFacts::all_mut(),
         MutFactsMode::On => MutFacts::from_program(&program),
     };
+    let copy_lend_mode = CopyLendMode::current();
+
+    let ordinary = KindSolver::new(&slots);
+    let ordinary_construction = construct_bo_into(
+        &program,
+        &slots,
+        &origins,
+        &mutability,
+        &ordinary,
+        copy_lend_mode,
+    )
+    .unwrap_or_else(|error| panic!("ordinary emission: {error:#}"));
     let ((model, repair_stats), commit_trace) = with_mode_a_commit_trace(|| {
-        verify_to_fixpoint_counting_with_flows(
+        verify_bo_construction_counting(
             &program,
             &slots,
-            origins.native_flows(),
+            &origins,
             &ordinary,
-            &selectors,
+            &ordinary_construction,
             &mutability,
         )
     });
@@ -613,15 +622,16 @@ pub(super) fn run_probe_worker(tcx: TyCtxt<'_>, t_tcx: Duration) -> Row {
 
     emit_checkpoint_phase(started, "tracked-start", None, 0);
     let tracked = KindSolver::new_tracked(&slots);
-    let (_stats, _selectors) =
-        emit_crate_ownership_constraints(&crate_ctxt, &slots, &origins, &tracked)
-            .unwrap_or_else(|error| panic!("tracked emission: {error:#}"));
+    let _tracked_construction = construct_bo_into(
+        &program,
+        &slots,
+        &origins,
+        &mutability,
+        &tracked,
+        copy_lend_mode,
+    )
+    .unwrap_or_else(|error| panic!("tracked emission: {error:#}"));
     let tracker = tracked.tracker().expect("new_tracked has tracker");
-    tracker.set_context("coherence");
-    for &fn_did in &program.functions {
-        let body = tcx.mir_drops_elaborated_and_const_checked(fn_did).borrow();
-        add_coherence(&tracked, &slots, fn_did, &body);
-    }
     tracker.set_context("field-law");
     constrain_field_ownership(&tracked, &slots, &program);
     for commit in &commit_trace {
@@ -680,7 +690,7 @@ pub(super) fn run_probe_worker(tcx: TyCtxt<'_>, t_tcx: Duration) -> Row {
             core_labels: labels,
         });
         if let Some(checkpoint_path) = &checkpoint_path {
-            write_probe_checkpoint(checkpoint_path, &program_name, &records)
+            write_probe_checkpoint(checkpoint_path, &program_name, copy_lend_mode, &records)
                 .unwrap_or_else(|error| panic!("{error}"));
             emit_checkpoint_phase(started, "checkpoint-written", Some(&key), records.len());
         } else {
@@ -688,11 +698,17 @@ pub(super) fn run_probe_worker(tcx: TyCtxt<'_>, t_tcx: Duration) -> Row {
         }
     }
     emit_checkpoint_phase(started, "finalize-start", None, records.len());
-    write_probe(Path::new(&probe_path), &program_name, &records)
-        .unwrap_or_else(|error| panic!("{error}"));
+    write_probe(
+        Path::new(&probe_path),
+        &program_name,
+        copy_lend_mode,
+        &records,
+    )
+    .unwrap_or_else(|error| panic!("{error}"));
     emit_checkpoint_phase(started, "complete", None, records.len());
 
     let mut row = Row::default();
+    row.set("copy_lend_mode", copy_lend_mode.label());
     row.set("t_tcx_s", format!("{:.3}", t_tcx.as_secs_f64()));
     row.set("queried", records.len());
     row.set(
@@ -888,8 +904,7 @@ fn parse_probe_for_program(
     path: &Path,
     expected_program: Option<&str>,
 ) -> Result<Vec<ProbeRecord>, String> {
-    const HEADER: &str =
-        "program\tfield_key\tfield_slot\taccepted_kind\tforce_result\tcore_families\tcore_labels";
+    const HEADER: &str = "copy_lend_mode\tprogram\tfield_key\tfield_slot\taccepted_kind\tforce_result\tcore_families\tcore_labels";
     let input = fs::read_to_string(path)
         .map_err(|error| format!("read probe {}: {error}", path.display()))?;
     let mut lines = input.lines();
@@ -899,7 +914,7 @@ fn parse_probe_for_program(
     let mut rows = Vec::new();
     for (offset, line) in lines.enumerate() {
         let columns = line.split('\t').collect::<Vec<_>>();
-        if columns.len() != 7 {
+        if columns.len() != 8 {
             return Err(format!(
                 "probe {} line {} has {} columns",
                 path.display(),
@@ -907,23 +922,30 @@ fn parse_probe_for_program(
                 columns.len()
             ));
         }
+        if !matches!(columns[0], "baseline" | "removal_only" | "lend_arm") {
+            return Err(format!(
+                "probe {} line {} copy-lend mode drift",
+                path.display(),
+                offset + 2
+            ));
+        }
         if let Some(expected_program) = expected_program
-            && columns[0] != expected_program
+            && columns[1] != expected_program
         {
             return Err(format!(
                 "probe {} line {} program identity mismatch: expected {expected_program:?}, got {:?}",
                 path.display(),
                 offset + 2,
-                columns[0]
+                columns[1]
             ));
         }
-        let accepted_kind = match columns[3] {
+        let accepted_kind = match columns[4] {
             "raw" => SlotKind::Raw,
             "ref" => SlotKind::Ref,
             "owning" => SlotKind::Owning,
             other => return Err(format!("unknown accepted kind {other:?}")),
         };
-        let force_result = match columns[4] {
+        let force_result = match columns[5] {
             "sat" => ForceResult::Sat,
             "unsat" => ForceResult::Unsat,
             "unknown" => ForceResult::Unknown,
@@ -931,8 +953,8 @@ fn parse_probe_for_program(
             other => return Err(format!("unknown force result {other:?}")),
         };
         rows.push(ProbeRecord {
-            field_key: columns[1].to_owned(),
-            field_slot: columns[2].parse().map_err(|error| {
+            field_key: columns[2].to_owned(),
+            field_slot: columns[3].parse().map_err(|error| {
                 format!(
                     "probe {} line {} field_slot: {error}",
                     path.display(),
@@ -941,15 +963,15 @@ fn parse_probe_for_program(
             })?,
             accepted_kind,
             force_result,
-            core_families: if columns[5].is_empty() {
-                Vec::new()
-            } else {
-                columns[5].split('|').map(str::to_owned).collect()
-            },
-            core_labels: if columns[6].is_empty() {
+            core_families: if columns[6].is_empty() {
                 Vec::new()
             } else {
                 columns[6].split('|').map(str::to_owned).collect()
+            },
+            core_labels: if columns[7].is_empty() {
+                Vec::new()
+            } else {
+                columns[7].split('|').map(str::to_owned).collect()
             },
         });
     }
@@ -4779,8 +4801,13 @@ mod tests {
             core_families: vec!["own-assume".to_owned(), "link-own".to_owned()],
             core_labels: Vec::new(),
         }];
-        write_probe_checkpoint(&witness_path, "fixture", &witness_records)
-            .expect("write positive-control checkpoint");
+        write_probe_checkpoint(
+            &witness_path,
+            "fixture",
+            CopyLendMode::Baseline,
+            &witness_records,
+        )
+        .expect("write positive-control checkpoint");
         assert!(
             !probe_checkpoint_temp_path(&witness_path).exists(),
             "atomic checkpoint publish must not leave its temporary file"

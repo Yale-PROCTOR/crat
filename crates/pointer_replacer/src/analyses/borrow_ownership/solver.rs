@@ -160,6 +160,7 @@ impl CoreTracker {
 /// emission site cannot invent an unlisted family silently.
 pub(crate) const CORE_LABEL_FAMILIES: &[&str] = &[
     "kind-pin",
+    "kind-copy-arm",
     "kind-equate",
     // NOTE: matching is first-containment (`family_of`), so the longer
     // "field-and-rev" MUST precede its prefix "field-and".
@@ -177,6 +178,9 @@ pub(crate) const CORE_LABEL_FAMILIES: &[&str] = &[
     // §NB1 per-site safety monotonicity (no substring overlap with the others).
     "safe-mono",
     "i1-adjacency",
+    "own-copy-for-deref-lend",
+    "own-copy-current",
+    "own-copy-lend",
     "own-linear",
     "own-assume",
     "own-equal",

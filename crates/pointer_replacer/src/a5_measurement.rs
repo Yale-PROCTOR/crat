@@ -18,11 +18,9 @@ use crate::{
     analyses::{
         borrow::lifetime_flow::{self, BodyLifetimeFlow},
         borrow_ownership::{
-            CrateCtxt, SlotKind,
-            borrow_verify::verify_to_fixpoint,
-            coherence::add_coherence,
+            SlotKind,
+            construction::{CopyLendMode, construct_bo_into, verify_bo_construction},
             crate_slots::CrateSlots,
-            emit_crate_ownership_constraints,
             export::with_bo_export,
             mutability_facts::MutFacts,
             origins::compute_origins,
@@ -646,23 +644,19 @@ fn accepted_deep_refs(
     let slots = CrateSlots::build(program);
     let mutable = MutFacts::from_program(program);
     let (model, _export) = with_bo_export(|| {
-        let crate_ctxt = CrateCtxt::new(program);
         let solver = KindSolver::new(&slots);
-        let Ok((_stats, selectors)) = emit_crate_ownership_constraints(
-            &crate_ctxt,
+        let origins = compute_origins(program);
+        let Ok(construction) = construct_bo_into(
+            program,
             &slots,
-            &compute_origins(program),
+            &origins,
+            &mutable,
             &solver,
+            CopyLendMode::current(),
         ) else {
             return None;
         };
-        for &function in &program.functions {
-            let body = tcx
-                .mir_drops_elaborated_and_const_checked(function)
-                .borrow();
-            add_coherence(&solver, &slots, function, &body);
-        }
-        verify_to_fixpoint(program, &slots, &solver, &selectors, &mutable)
+        verify_bo_construction(program, &slots, &origins, &solver, &construction, &mutable)
     });
     let model = model.ok_or_else(|| "targeted accepted-model export declined".to_owned())?;
 
@@ -884,6 +878,7 @@ fn measure_tcx(
 pub(super) fn run_worker(tcx: TyCtxt<'_>, t_tcx: Duration) -> super::report::Row {
     let t0 = Instant::now();
     let mut row = super::report::Row::default();
+    row.set("copy_lend_mode", CopyLendMode::current().label());
     let program = std::env::var("CRAT_BOC1_NAME").unwrap_or_else(|_| "unnamed".to_owned());
     let Some(snapshot) = std::env::var_os("CRAT_A5_SNAPSHOT").map(std::path::PathBuf::from) else {
         row.set("status", "missing-snapshot");

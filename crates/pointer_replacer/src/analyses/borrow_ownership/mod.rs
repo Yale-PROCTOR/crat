@@ -12,6 +12,7 @@ pub(crate) mod borrow_verify;
 pub(crate) mod boundary_table;
 mod call_graph;
 pub mod coherence;
+pub(crate) mod construction;
 pub mod crate_slots;
 #[cfg(test)]
 mod dependency_ratchet;

@@ -65,8 +65,107 @@ mod tests {
     /// The ratchet does not scan itself (its allowlist entries are string literals anyway).
     const SELF_FILE: &str = "dependency_ratchet.rs";
 
+    /// Phase-1b construction ratchet. These are the only whole files allowed to invoke the legacy
+    /// BO construction primitives directly. `construction.rs` is the planned single production
+    /// owner; the other two are dedicated lower-level semantic fixture files. This is deliberately
+    /// an enumerated list: adding another exempt file requires a visible reviewed diff.
+    const LEGACY_DIRECT_FILE_ALLOW: &[&str] = &[
+        "src/analyses/borrow_ownership/construction.rs",
+        "src/analyses/borrow_ownership/export/tests.rs",
+        "src/tests.rs",
+    ];
+
+    /// Exact callers in mixed-purpose or primitive-implementation files that may invoke a legacy
+    /// construction primitive directly. The `bo_c1.rs` entries are lower-level semantic fixtures;
+    /// production and measurement callers in that file are intentionally absent and therefore RED
+    /// until they migrate to `construction.rs`.
+    const LEGACY_DIRECT_CALLER_ALLOW: &[(&str, &str)] = &[
+        (
+            "src/analyses/borrow_ownership/borrow_verify.rs",
+            "verify_to_fixpoint",
+        ),
+        (
+            "src/analyses/borrow_ownership/borrow_verify.rs",
+            "verify_to_fixpoint_with_flows",
+        ),
+        (
+            "src/analyses/borrow_ownership/borrow_verify.rs",
+            "verify_to_fixpoint_counting",
+        ),
+        (
+            "src/analyses/borrow_ownership/borrow_verify.rs",
+            "verify_to_fixpoint_counting_with_flows",
+        ),
+        (
+            "src/analyses/borrow_ownership/borrow_verify.rs",
+            "verify_to_fixpoint_counting_with_flows_and_copy_lends",
+        ),
+        (
+            "src/analyses/borrow_ownership/coherence.rs",
+            "add_coherence",
+        ),
+        (
+            "src/analyses/borrow_ownership/coherence.rs",
+            "add_coherence_tagging_uses",
+        ),
+        (
+            "src/analyses/borrow_ownership/coherence.rs",
+            "add_coherence_removal_only",
+        ),
+        (
+            "src/analyses/borrow_ownership/coherence.rs",
+            "add_coherence_with_copy_lends",
+        ),
+        (
+            "src/analyses/borrow_ownership/mod.rs",
+            "emit_crate_ownership_constraints",
+        ),
+        (
+            "src/analyses/borrow_ownership/mod.rs",
+            "emit_crate_ownership_constraints_with_copy_lends",
+        ),
+        ("src/bo_c1.rs", "verify_to_fixpoint_is_thin_wrapper"),
+        ("src/bo_c1.rs", "nb5m_native_round_stats_contract::stats_of"),
+        ("src/bo_c1.rs", "nb5f2_field_conflict_restores::run"),
+        ("src/bo_c1.rs", "s23_owning_blocker_probe"),
+        ("src/bo_c1.rs", "nbf_sink_retractable_delete_node"),
+        (
+            "src/bo_c1.rs",
+            "nb5l_lemma_ref_subset_mode_a_on_fixtures::run",
+        ),
+        ("src/bo_c1.rs", "nb5l_high_arity_lemmas_converges_no_panic"),
+        ("src/bo_c1.rs", "nb5l_cap_exhaustion_declines_not_panics"),
+        ("src/bo_c1.rs", "nb5l2_anchor"),
+        ("src/bo_c1.rs", "nb5l2_capture_is_mode_a_only"),
+        ("src/bo_c1.rs", "l2_feature_off_capture_program"),
+    ];
+
+    const LEGACY_PRIMITIVE_PREFIXES: &[&str] = &[
+        "emit_crate_ownership_constraints",
+        "add_coherence",
+        "verify_to_fixpoint",
+    ];
+
+    #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+    struct FunctionSpan {
+        start: usize,
+        end: usize,
+        name: String,
+    }
+
+    #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+    struct LegacyCallSite {
+        file: String,
+        caller: String,
+        primitive: String,
+    }
+
     fn bo_dir() -> PathBuf {
         Path::new(env!("CARGO_MANIFEST_DIR")).join("src/analyses/borrow_ownership")
+    }
+
+    fn crate_src_dir() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("src")
     }
 
     fn collect_rs(dir: &Path, out: &mut Vec<PathBuf>) {
@@ -375,6 +474,173 @@ mod tests {
         found.insert(seg.to_string());
     }
 
+    fn whole_word_at(text: &str, start: usize, word: &str) -> bool {
+        let bytes = text.as_bytes();
+        text[start..].starts_with(word)
+            && (start == 0 || !is_ident(bytes[start - 1]))
+            && (start + word.len() == bytes.len() || !is_ident(bytes[start + word.len()]))
+    }
+
+    fn skip_space(bytes: &[u8], mut at: usize) -> usize {
+        while at < bytes.len() && (bytes[at] as char).is_whitespace() {
+            at += 1;
+        }
+        at
+    }
+
+    fn previous_ident(text: &str, start: usize) -> Option<&str> {
+        let bytes = text.as_bytes();
+        let end = (0..start)
+            .rev()
+            .find(|&at| !(bytes[at] as char).is_whitespace())?
+            + 1;
+        let begin = (0..end)
+            .rev()
+            .find(|&at| !is_ident(bytes[at]))
+            .map_or(0, |at| at + 1);
+        (begin < end).then_some(&text[begin..end])
+    }
+
+    /// Locate named function bodies in already-cleaned Rust source. Nested fixture helpers are kept
+    /// as nested spans, letting diagnostics name `outer_test::helper` rather than granting every
+    /// same-named `run` helper in a mixed-purpose file.
+    fn function_spans(text: &str) -> Vec<FunctionSpan> {
+        let bytes = text.as_bytes();
+        let mut spans = Vec::new();
+        let mut at = 0;
+        while at + 2 <= bytes.len() {
+            if !whole_word_at(text, at, "fn") {
+                at += 1;
+                continue;
+            }
+            let name_start = skip_space(bytes, at + 2);
+            if name_start >= bytes.len() || !is_ident(bytes[name_start]) {
+                at += 2;
+                continue;
+            }
+            let mut name_end = name_start + 1;
+            while name_end < bytes.len() && is_ident(bytes[name_end]) {
+                name_end += 1;
+            }
+
+            let mut sig_at = name_end;
+            let mut paren_depth = 0i32;
+            let mut bracket_depth = 0i32;
+            let body_start = loop {
+                if sig_at >= bytes.len() {
+                    break None;
+                }
+                match bytes[sig_at] {
+                    b'(' => paren_depth += 1,
+                    b')' => paren_depth -= 1,
+                    b'[' => bracket_depth += 1,
+                    b']' => bracket_depth -= 1,
+                    b';' if paren_depth == 0 && bracket_depth == 0 => break None,
+                    b'{' if paren_depth == 0 && bracket_depth == 0 => break Some(sig_at),
+                    _ => {}
+                }
+                sig_at += 1;
+            };
+            let Some(body_start) = body_start else {
+                at = name_end;
+                continue;
+            };
+
+            let mut depth = 1usize;
+            let mut end = body_start + 1;
+            while end < bytes.len() && depth != 0 {
+                match bytes[end] {
+                    b'{' => depth += 1,
+                    b'}' => depth -= 1,
+                    _ => {}
+                }
+                end += 1;
+            }
+            if depth == 0 {
+                spans.push(FunctionSpan {
+                    start: at,
+                    end,
+                    name: text[name_start..name_end].to_owned(),
+                });
+            }
+            at = name_end;
+        }
+        spans
+    }
+
+    fn caller_at(spans: &[FunctionSpan], call_at: usize) -> String {
+        let mut containing = spans
+            .iter()
+            .filter(|span| span.start < call_at && call_at < span.end)
+            .collect::<Vec<_>>();
+        containing.sort_by_key(|span| (span.start, std::cmp::Reverse(span.end)));
+        if containing.is_empty() {
+            "<module>".to_owned()
+        } else {
+            containing
+                .into_iter()
+                .map(|span| span.name.as_str())
+                .collect::<Vec<_>>()
+                .join("::")
+        }
+    }
+
+    fn legacy_calls_in(file: &str, clean: &str) -> Vec<LegacyCallSite> {
+        let bytes = clean.as_bytes();
+        let spans = function_spans(clean);
+        let mut sites = Vec::new();
+        let mut at = 0;
+        while at < bytes.len() {
+            if !is_ident(bytes[at]) || (at > 0 && is_ident(bytes[at - 1])) {
+                at += 1;
+                continue;
+            }
+            let mut end = at + 1;
+            while end < bytes.len() && is_ident(bytes[end]) {
+                end += 1;
+            }
+            let name = &clean[at..end];
+            let is_legacy = LEGACY_PRIMITIVE_PREFIXES
+                .iter()
+                .any(|prefix| name.starts_with(prefix));
+            if is_legacy
+                && bytes.get(skip_space(bytes, end)) == Some(&b'(')
+                && previous_ident(clean, at) != Some("fn")
+            {
+                sites.push(LegacyCallSite {
+                    file: file.to_owned(),
+                    caller: caller_at(&spans, at),
+                    primitive: name.to_owned(),
+                });
+            }
+            at = end;
+        }
+        sites
+    }
+
+    fn scan_legacy_call_sites() -> BTreeSet<LegacyCallSite> {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut files = Vec::new();
+        collect_rs(&crate_src_dir(), &mut files);
+        let mut sites = BTreeSet::new();
+        for path in files {
+            let relative = path
+                .strip_prefix(root)
+                .expect("pointer_replacer source below crate root")
+                .to_string_lossy()
+                .replace('\\', "/");
+            let src = std::fs::read_to_string(&path).expect("read pointer_replacer source file");
+            let clean = strip_comments_and_strings(&src);
+            sites.extend(legacy_calls_in(&relative, &clean));
+        }
+        sites
+    }
+
+    fn legacy_call_is_allowed(site: &LegacyCallSite) -> bool {
+        LEGACY_DIRECT_FILE_ALLOW.contains(&site.file.as_str())
+            || LEGACY_DIRECT_CALLER_ALLOW.contains(&(site.file.as_str(), site.caller.as_str()))
+    }
+
     fn scan() -> (BTreeSet<String>, BTreeSet<String>) {
         let mut files = vec![];
         collect_rs(&bo_dir(), &mut files);
@@ -425,6 +691,39 @@ mod tests {
              (allowlist length is the self-containment metric: {} borrow / {} ownership)",
             BORROW_ALLOW.len(),
             OWNERSHIP_ALLOW.len(),
+        );
+    }
+
+    /// Phase-1b RED-first construction ratchet. Before production wiring this deliberately names
+    /// every production/measurement consumer that still assembles the legacy three-stage pipeline
+    /// directly. Migrating those callers through `construction.rs` makes this test GREEN; adding a
+    /// fresh direct consumer makes it RED again without silently broadening the allowlist.
+    #[test]
+    fn legacy_construction_calls_are_owned_by_the_shared_helper() {
+        let sites = scan_legacy_call_sites();
+        let unexpected = sites
+            .iter()
+            .filter(|site| !legacy_call_is_allowed(site))
+            .map(|site| format!("{}::{} -> {}", site.file, site.caller, site.primitive))
+            .collect::<Vec<_>>();
+
+        let actual_callers = sites
+            .iter()
+            .map(|site| (site.file.as_str(), site.caller.as_str()))
+            .collect::<BTreeSet<_>>();
+        let stale = LEGACY_DIRECT_CALLER_ALLOW
+            .iter()
+            .filter(|allowed| !actual_callers.contains(*allowed))
+            .map(|(file, caller)| format!("{file}::{caller}"))
+            .collect::<Vec<_>>();
+
+        assert!(
+            unexpected.is_empty() && stale.is_empty(),
+            "phase-1b construction-site ratchet tripped.\n  \
+             unexpected direct legacy construction callers (migrate through construction.rs):\n    {}\n  \
+             stale exact caller exemptions (delete from LEGACY_DIRECT_CALLER_ALLOW):\n    {}",
+            unexpected.join("\n    "),
+            stale.join("\n    "),
         );
     }
 

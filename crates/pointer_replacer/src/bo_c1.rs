@@ -4329,15 +4329,20 @@ mod run {
     use crate::analyses::{
         borrow::{GBorrowInferCtxt, demote_pointers_iterative_with_fields},
         borrow_ownership::{
-            CrateCtxt, SafeMonoMode, SlotKind,
+            SafeMonoMode, SlotKind,
             borrow_verify::{
-                RepairMode, model_accepts_with_flows, slotref_key,
-                verify_to_fixpoint_counting_with_flows, verify_to_fixpoint_with_flows,
-                with_capture, with_mode_a_commit_trace,
+                RepairMode, model_accepts_with_flows, slotref_key, with_capture,
+                with_mode_a_commit_trace,
             },
-            coherence::{add_coherence, constrain_field_ownership, field_ownership_candidates},
+            coherence::{
+                constrain_field_ownership, field_ownership_candidates, selected_copy_lend_sites,
+            },
+            construction::{
+                CopyLendMode, construct_bo_into, verify_bo_construction_counting,
+                verify_bo_construction_with_flows,
+            },
             crate_slots::CrateSlots,
-            emit_crate_ownership_constraints, l2,
+            l2,
             mutability_facts::{MutFacts, MutFactsMode, MutProvider},
             origins::compute_origins,
             slots::{SlotId, SlotOwner},
@@ -4504,21 +4509,27 @@ mod run {
         mut_facts: &MutFacts,
     ) -> Option<FxHashMap<SlotRef, SlotKind>> {
         let empty = crate::analyses::borrow_ownership::origin_summary::OriginSummaries::default();
-        let crate_ctxt = CrateCtxt::new(program);
         let solver = KindSolver::new(slots);
-        let (_stats, selectors) =
-            emit_crate_ownership_constraints(&crate_ctxt, slots, &empty, &solver).ok()?;
+        let construction = construct_bo_into(
+            program,
+            slots,
+            &empty,
+            mut_facts,
+            &solver,
+            CopyLendMode::Baseline,
+        )
+        .ok()?;
         for slot in demote {
             solver.add_borrow_exclusion(Some(*slot), &[]);
         }
-        for &g in &program.functions {
-            let body = program
-                .tcx
-                .mir_drops_elaborated_and_const_checked(g)
-                .borrow();
-            add_coherence(&solver, slots, g, &body);
-        }
-        verify_to_fixpoint_with_flows(program, slots, origin_flows, &solver, &selectors, mut_facts)
+        verify_bo_construction_with_flows(
+            program,
+            slots,
+            origin_flows,
+            &solver,
+            &construction,
+            mut_facts,
+        )
     }
 
     /// Measure the collateral. Returns a status-tagged struct (never panics on decline — Codex F2a).
@@ -4654,22 +4665,16 @@ mod run {
         program: &crate::utils::rustc::RustProgram,
         slots: &CrateSlots,
         origins: &crate::analyses::borrow_ownership::origin_summary::OriginSummaries,
+        mut_facts: &MutFacts,
+        mode: CopyLendMode,
     ) -> Option<(KindSolver, Selectors)> {
         // Allow-list: this is outside the armed region, so it records nothing.
         {
-            let crate_ctxt = CrateCtxt::new(program);
             let solver = KindSolver::new(slots);
-            let (_stats, selectors) =
-                emit_crate_ownership_constraints(&crate_ctxt, slots, origins, &solver).ok()?;
-            for &g in &program.functions {
-                let body = program
-                    .tcx
-                    .mir_drops_elaborated_and_const_checked(g)
-                    .borrow();
-                add_coherence(&solver, slots, g, &body);
-            }
+            let construction =
+                construct_bo_into(program, slots, origins, mut_facts, &solver, mode).ok()?;
             constrain_field_ownership(&solver, slots, program);
-            Some((solver, selectors))
+            Some((solver, construction.selectors))
         }
     }
 
@@ -4723,7 +4728,14 @@ mod run {
         commit_set: &[SlotRef],
         i: usize,
     ) -> ProbeOutcome {
-        let Some((base, selectors)) = build_probe_base(program, slots, origins) else {
+        let construction_mut_facts = MutFacts::all_mut();
+        let Some((base, selectors)) = build_probe_base(
+            program,
+            slots,
+            origins,
+            &construction_mut_facts,
+            CopyLendMode::Baseline,
+        ) else {
             return ProbeOutcome::Necessary;
         };
         let demote: Vec<SlotRef> = commit_set
@@ -4888,7 +4900,7 @@ mod run {
         program: &crate::utils::rustc::RustProgram,
         slots: &CrateSlots,
         origins: &crate::analyses::borrow_ownership::origin_summary::OriginSummaries,
-        is_mutable: impl MutProvider + Copy,
+        mut_facts: &MutFacts,
         model: &Option<FxHashMap<SlotRef, SlotKind>>,
         events: &[(SlotRef, usize)],
         row: &mut Row,
@@ -4899,7 +4911,7 @@ mod run {
             return;
         };
         assert!(
-            model_accepts_with_flows(program, slots, origins.native_flows(), model, is_mutable,),
+            model_accepts_with_flows(program, slots, origins.native_flows(), model, mut_facts,),
             "necessity audit: the anchor's accepted model must satisfy model_accepts (drift STOP)"
         );
         let (anchor_nref, anchor_nref_d0) = count_refs(model, slots);
@@ -4924,7 +4936,9 @@ mod run {
             return;
         }
         // Emit the probe base ONCE; every probe reuses it via push/pop (rider 4 / cost).
-        let Some((base, selectors)) = build_probe_base(program, slots, origins) else {
+        let Some((base, selectors)) =
+            build_probe_base(program, slots, origins, mut_facts, CopyLendMode::current())
+        else {
             row.set("na_status", "base-error");
             return;
         };
@@ -4950,7 +4964,7 @@ mod run {
                     origins.native_flows(),
                     &base,
                     &selectors,
-                    is_mutable,
+                    mut_facts,
                     &demote,
                     slots_only[i],
                 ) {
@@ -4977,7 +4991,7 @@ mod run {
                 origins.native_flows(),
                 &base,
                 &selectors,
-                is_mutable,
+                mut_facts,
                 &demote,
                 slots_only[i],
             ) {
@@ -5008,7 +5022,7 @@ mod run {
             // Removed slots are hard-pinned `Ref`, so a SAT model has them all `Ref` by construction;
             // only acceptance remains to check.
             Some(m) => {
-                model_accepts_with_flows(program, slots, origins.native_flows(), &m, is_mutable)
+                model_accepts_with_flows(program, slots, origins.native_flows(), &m, mut_facts)
             }
             // UNSAT under the pins ⇒ the removed set is NOT jointly `Ref`-recoverable (unless empty).
             None => removed.is_empty(),
@@ -5059,7 +5073,7 @@ mod run {
         program: &crate::utils::rustc::RustProgram,
         slots: &CrateSlots,
         origins: &crate::analyses::borrow_ownership::origin_summary::OriginSummaries,
-        is_mutable: impl MutProvider + Copy,
+        mut_facts: &MutFacts,
         events: &[(SlotRef, usize)],
         row: &mut Row,
     ) {
@@ -5111,7 +5125,8 @@ mod run {
         );
 
         let (base, selectors) =
-            build_probe_base(program, slots, origins).expect("certified-context probe base");
+            build_probe_base(program, slots, origins, mut_facts, CopyLendMode::current())
+                .expect("certified-context probe base");
         base.push_scope();
         for &slot in &removed {
             base.assume(slot, SlotKind::Ref);
@@ -5132,7 +5147,7 @@ mod run {
             "certified-context witness violated a hard Ref pin"
         );
         assert!(
-            model_accepts_with_flows(program, slots, origins.native_flows(), &witness, is_mutable,),
+            model_accepts_with_flows(program, slots, origins.native_flows(), &witness, mut_facts,),
             "certified-context hard-pinned witness must pass audit acceptance"
         );
 
@@ -5303,19 +5318,24 @@ mod run {
         let program = collect_program(tcx);
         let origins = compute_origins(&program);
         let slots = CrateSlots::build(&program);
-        let crate_ctxt = CrateCtxt::new(&program);
+        let mut_facts = match MutFactsMode::current() {
+            MutFactsMode::Off => MutFacts::all_mut(),
+            MutFactsMode::On => MutFacts::from_program(&program),
+        };
+        let copy_lend_mode = CopyLendMode::current();
+        row.set("copy_lend_mode", copy_lend_mode.label());
         let solver = KindSolver::new_family_tracked(&slots);
-        let (_stats, selectors) =
-            emit_crate_ownership_constraints(&crate_ctxt, &slots, &origins, &solver)
-                .expect("tracked selector-core emission");
+        let construction = construct_bo_into(
+            &program,
+            &slots,
+            &origins,
+            &mut_facts,
+            &solver,
+            copy_lend_mode,
+        )
+        .expect("tracked selector-core emission");
+        let selectors = &construction.selectors;
         let tracker = solver.tracker().expect("tracked solver");
-        tracker.set_context("coherence");
-        for &function in &program.functions {
-            let body = tcx
-                .mir_drops_elaborated_and_const_checked(function)
-                .borrow();
-            add_coherence(&solver, &slots, function, &body);
-        }
         tracker.set_context("field-law");
         constrain_field_ownership(&solver, &slots, &program);
 
@@ -5493,19 +5513,24 @@ mod run {
         let program = collect_program(tcx);
         let origins = compute_origins(&program);
         let slots = CrateSlots::build(&program);
-        let crate_ctxt = CrateCtxt::new(&program);
+        let mut_facts = match MutFactsMode::current() {
+            MutFactsMode::Off => MutFacts::all_mut(),
+            MutFactsMode::On => MutFacts::from_program(&program),
+        };
+        let copy_lend_mode = CopyLendMode::current();
+        row.set("copy_lend_mode", copy_lend_mode.label());
         let solver = KindSolver::new_tracked(&slots);
-        let (_stats, selectors) =
-            emit_crate_ownership_constraints(&crate_ctxt, &slots, &origins, &solver)
-                .expect("per-assertion selector detail emission");
+        let construction = construct_bo_into(
+            &program,
+            &slots,
+            &origins,
+            &mut_facts,
+            &solver,
+            copy_lend_mode,
+        )
+        .expect("per-assertion selector detail emission");
+        let selectors = &construction.selectors;
         let tracker = solver.tracker().expect("tracked solver");
-        tracker.set_context("coherence");
-        for &function in &program.functions {
-            let body = tcx
-                .mir_drops_elaborated_and_const_checked(function)
-                .borrow();
-            add_coherence(&solver, &slots, function, &body);
-        }
         tracker.set_context("field-law");
         constrain_field_ownership(&solver, &slots, &program);
 
@@ -5697,6 +5722,12 @@ mod run {
         let program = collect_program(tcx);
         let origins = compute_origins(&program);
         let slots = CrateSlots::build(&program);
+        let mut_facts = match MutFactsMode::current() {
+            MutFactsMode::Off => MutFacts::all_mut(),
+            MutFactsMode::On => MutFacts::from_program(&program),
+        };
+        let copy_lend_mode = CopyLendMode::current();
+        row.set("copy_lend_mode", copy_lend_mode.label());
         let candidate_families = program_matrix
             .values()
             .flat_map(|families| families.iter().cloned())
@@ -5710,17 +5741,17 @@ mod run {
 
         let probe = |filter: RemovalFilter, keys: &BTreeSet<String>| -> (BTreeSet<String>, usize) {
             ownership_diagnostic_package::with_removal_filter(filter, || {
-                let crate_ctxt = CrateCtxt::new(&program);
                 let solver = KindSolver::new(&slots);
-                let (_stats, selectors) =
-                    emit_crate_ownership_constraints(&crate_ctxt, &slots, &origins, &solver)
-                        .expect("untracked necessity emission");
-                for &function in &program.functions {
-                    let body = tcx
-                        .mir_drops_elaborated_and_const_checked(function)
-                        .borrow();
-                    add_coherence(&solver, &slots, function, &body);
-                }
+                let construction = construct_bo_into(
+                    &program,
+                    &slots,
+                    &origins,
+                    &mut_facts,
+                    &solver,
+                    copy_lend_mode,
+                )
+                .expect("untracked necessity emission");
+                let selectors = &construction.selectors;
                 constrain_field_ownership(&solver, &slots, &program);
                 assert_eq!(selectors.sources().len(), official.n_sources);
                 assert_eq!(selectors.all().len(), official.total_selectors);
@@ -6197,23 +6228,52 @@ mod run {
         // RAII rather than a closure: the emit-error path below does an early
         // `return row`, and `Drop` ends the scope correctly on that path
         // without restructuring the region.
-        let capture_arm = crate::analyses::borrow_ownership::export::arm_capture();
-        let crate_ctxt = CrateCtxt::new(&program);
-        let solver = KindSolver::new(&slots);
+        // §NB2 + A12 phase-1b: construction consumes the exact mutability facts used by replay,
+        // so derive them before the single construction point.
         let t = Instant::now();
-        let (stats, selectors) =
-            match emit_crate_ownership_constraints(&crate_ctxt, &slots, &origins, &solver) {
-                Ok(x) => x,
-                Err(e) => {
-                    row.set("status", "emit-error");
-                    row.set("err", format!("{e:#}"));
-                    return row;
-                }
-            };
-        row.set("t_emit_s", secs(t.elapsed()));
-        row.set("z3_ast_len", stats.z3_ast_len);
-        row.set("source_sink_emissions", stats.source_sink_emissions);
+        let mut_facts = match MutFactsMode::current() {
+            MutFactsMode::Off => MutFacts::all_mut(),
+            MutFactsMode::On => MutFacts::from_program(&program),
+        };
+        row.set("t_mut_facts_s", secs(t.elapsed()));
+        let copy_lend_mode = CopyLendMode::current();
+        row.set("copy_lend_mode", copy_lend_mode.label());
+
+        let capture_arm = crate::analyses::borrow_ownership::export::arm_capture();
+        let solver = KindSolver::new(&slots);
+        let construction = match construct_bo_into(
+            &program,
+            &slots,
+            &origins,
+            &mut_facts,
+            &solver,
+            copy_lend_mode,
+        ) {
+            Ok(construction) => construction,
+            Err(e) => {
+                row.set("status", "emit-error");
+                row.set("err", format!("{e:#}"));
+                return row;
+            }
+        };
+        let selectors = &construction.selectors;
+        row.set("t_eligibility_s", secs(construction.eligibility_elapsed));
+        row.set("t_emit_s", secs(construction.emit_elapsed));
+        row.set("t_coherence_s", secs(construction.coherence_elapsed));
+        row.set("z3_ast_len", construction.stats.z3_ast_len);
+        row.set(
+            "source_sink_emissions",
+            construction.stats.source_sink_emissions,
+        );
         row.set("selectors", selectors.all().len());
+        row.set(
+            "copy_lend_eligible_pairs",
+            construction.eligibility.pairs.len(),
+        );
+        row.set(
+            "copy_lend_eligible_sites",
+            construction.eligibility.sites.len(),
+        );
         // §NB1: record the active safety-monotonicity mode so the ablation
         // sweeps (per_site vs chain) are self-labeling in the results.
         row.set("safe_mono", SafeMonoMode::current().label());
@@ -6222,22 +6282,7 @@ mod run {
         row.set("mut_facts", MutFactsMode::current().label());
         phase("emit_done", t0);
 
-        let t = Instant::now();
-        for &g in &program.functions {
-            let body = tcx.mir_drops_elaborated_and_const_checked(g).borrow();
-            add_coherence(&solver, &slots, g, &body);
-        }
-        row.set("t_coherence_s", secs(t.elapsed()));
         phase("coherence_done", t0);
-
-        // §NB2: build the per-local mutability oracle once (production-parity map). Mode Off
-        // reproduces pre-NB2 forced-mut; the borrow replay reads it per pointer local.
-        let t = Instant::now();
-        let mut_facts = match MutFactsMode::current() {
-            MutFactsMode::Off => MutFacts::all_mut(),
-            MutFactsMode::On => MutFacts::from_program(&program),
-        };
-        row.set("t_mut_facts_s", secs(t.elapsed()));
 
         let t = Instant::now();
         // §NB5-M: native fork counters (the bo_c1 mirror is RETIRED — parity was proven at the NB5-M
@@ -6267,12 +6312,12 @@ mod run {
         let ((model, rstats), captured) = if selector_core_capture {
             let ((model_and_stats, commit_trace), selector_trace) = with_selector_trace(|| {
                 with_mode_a_commit_trace(|| {
-                    verify_to_fixpoint_counting_with_flows(
+                    verify_bo_construction_counting(
                         &program,
                         &slots,
-                        origins.native_flows(),
+                        &origins,
                         &solver,
-                        &selectors,
+                        &construction,
                         &mut_facts,
                     )
                 })
@@ -6293,24 +6338,24 @@ mod run {
             (model_and_stats, None)
         } else if audit || certified_context {
             let (mr, events) = with_capture(|| {
-                verify_to_fixpoint_counting_with_flows(
+                verify_bo_construction_counting(
                     &program,
                     &slots,
-                    origins.native_flows(),
+                    &origins,
                     &solver,
-                    &selectors,
+                    &construction,
                     &mut_facts,
                 )
             });
             (mr, Some(events))
         } else {
             (
-                verify_to_fixpoint_counting_with_flows(
+                verify_bo_construction_counting(
                     &program,
                     &slots,
-                    origins.native_flows(),
+                    &origins,
                     &solver,
-                    &selectors,
+                    &construction,
                     &mut_facts,
                 ),
                 None,
@@ -6429,6 +6474,15 @@ mod run {
                 }
             }
             Some(m) => {
+                let selected_copy_lends = if construction.mode == CopyLendMode::LendArm {
+                    selected_copy_lend_sites(&program, &slots, &construction.eligibility.pairs, m)
+                        .values()
+                        .map(FxHashSet::len)
+                        .sum::<usize>()
+                } else {
+                    0
+                };
+                row.set("copy_lend_selected_sites", selected_copy_lends);
                 let (mut n_ref, mut n_raw, mut n_own) = (0usize, 0usize, 0usize);
                 let (mut n_ref_d0, mut n_raw_d0, mut n_own_d0) = (0usize, 0usize, 0usize);
                 // §NB2: split depth-0 Ref into shared (&T) vs mut (&mut T) via the fact map,
@@ -6599,26 +6653,30 @@ mod run {
             let t = Instant::now();
             // Allow-list: outside the armed region ⇒ records nothing.
             let real = {
-                let crate_ctxt = CrateCtxt::new(&program);
                 let solver = KindSolver::new(&slots);
                 // §NB4-4c F3: CHECK_REAL reuses run_bo's `origins` — the SAME demotion seed as run_bo's
                 // native solve, so the fidelity cross-check compares identical clause sets.
-                match emit_crate_ownership_constraints(&crate_ctxt, &slots, &origins, &solver) {
-                    Ok((_s, selectors)) => {
-                        for &g in &program.functions {
-                            let body = tcx.mir_drops_elaborated_and_const_checked(g).borrow();
-                            add_coherence(&solver, &slots, g, &body);
-                        }
+                match construct_bo_into(
+                    &program,
+                    &slots,
+                    &origins,
+                    &mut_facts,
+                    &solver,
+                    copy_lend_mode,
+                ) {
+                    Ok(real_construction) => {
                         // §NB2: same oracle as run_bo's native solve above, so the fidelity check
                         // compares like with like (shipped facts vs a fresh real solve).
-                        Some(verify_to_fixpoint_with_flows(
-                            &program,
-                            &slots,
-                            origins.native_flows(),
-                            &solver,
-                            &selectors,
-                            &mut_facts,
-                        ))
+                        Some(
+                            crate::analyses::borrow_ownership::construction::verify_bo_construction(
+                                &program,
+                                &slots,
+                                &origins,
+                                &solver,
+                                &real_construction,
+                                &mut_facts,
+                            ),
+                        )
                     }
                     Err(_) => None,
                 }
@@ -8383,6 +8441,127 @@ mod run {
         )
         .unwrap_or_else(|e| e.raise());
     }
+
+    /// Phase-1b production-entry witness. This calls the real BO row driver, not the explicit
+    /// fixture construction API: the mode must reach eligibility, solve, replay, and reporting.
+    #[test]
+    fn copy_lend_phase1b_bo_c1_end_to_end_recovers_owner() {
+        use crate::analyses::borrow_ownership::construction::CopyLendMode;
+        ::utils::compilation::run_compiler_on_str(
+            r#"
+unsafe extern "C" {
+    fn malloc(size: usize) -> *mut core::ffi::c_void;
+    fn free(p: *mut core::ffi::c_void);
+}
+pub unsafe fn f() -> i32 {
+    let p = unsafe { malloc(4) } as *mut i32;
+    let q = p;
+    let value = unsafe { *q };
+    unsafe { free(p as *mut core::ffi::c_void) };
+    value
+}
+"#,
+            |tcx| {
+                let row = CopyLendMode::LendArm.with_override(|| run_bo(tcx, Duration::ZERO));
+                assert_eq!(row.get("status"), Some("ok"));
+                assert_eq!(row.get("copy_lend_mode"), Some("lend_arm"));
+                assert_eq!(row.get("copy_lend_eligible_pairs"), Some("1"));
+                assert_eq!(row.get("copy_lend_selected_sites"), Some("1"));
+                assert!(row.get("n_own").unwrap().parse::<usize>().unwrap() >= 1);
+                assert!(row.get("n_ref").unwrap().parse::<usize>().unwrap() >= 1);
+            },
+        )
+        .unwrap_or_else(|error| error.raise());
+    }
+
+    #[test]
+    fn copy_lend_phase1b_three_modes_are_reachable_and_stamped() {
+        use crate::analyses::borrow_ownership::construction::CopyLendMode;
+        ::utils::compilation::run_compiler_on_str(
+            "pub unsafe fn f(p: *const i32) -> i32 { let q = p; unsafe { *q } }",
+            |tcx| {
+                let modes = [
+                    CopyLendMode::Baseline,
+                    CopyLendMode::RemovalOnly,
+                    CopyLendMode::LendArm,
+                ];
+                let program = collect_program(tcx);
+                let fingerprints = modes
+                    .iter()
+                    .map(|mode| {
+                        mode.with_override(|| {
+                            crate::analyses::borrow_ownership::model_cache::fingerprint(&program)
+                        })
+                    })
+                    .collect::<std::collections::BTreeSet<_>>();
+                assert_eq!(
+                    fingerprints.len(),
+                    modes.len(),
+                    "copy-lend mode must participate in model-artifact identity"
+                );
+                for mode in modes {
+                    let row = mode.with_override(|| run_bo(tcx, Duration::ZERO));
+                    assert_eq!(row.get("status"), Some("ok"));
+                    assert_eq!(row.get("copy_lend_mode"), Some(mode.label()));
+                    if mode != CopyLendMode::LendArm {
+                        assert_eq!(row.get("copy_lend_eligible_pairs"), Some("0"));
+                        assert_eq!(row.get("copy_lend_selected_sites"), Some("0"));
+                    }
+                }
+            },
+        )
+        .unwrap_or_else(|error| error.raise());
+    }
+
+    /// Production-entry A1 control: an unselected same-shape loan at `free(p)` keeps the existing
+    /// semantics. The lend configuration is active and the pair is eligible, but a non-owning
+    /// source selects no CopyLend arm; the row must still accept with the shared locals intact.
+    #[test]
+    fn copy_lend_phase1b_bo_c1_free_does_not_globalize_existing_loans() {
+        use crate::analyses::borrow_ownership::construction::CopyLendMode;
+        ::utils::compilation::run_compiler_on_str(
+            r#"
+unsafe extern "C" { fn free(p: *mut core::ffi::c_void); }
+pub unsafe fn f(p: *mut i32) -> i32 {
+    let q = p;
+    unsafe { free(p as *mut core::ffi::c_void) };
+    unsafe { *q }
+}
+"#,
+            |tcx| {
+                let row = CopyLendMode::LendArm.with_override(|| run_bo(tcx, Duration::ZERO));
+                assert_eq!(row.get("status"), Some("ok"));
+                assert_eq!(row.get("copy_lend_eligible_pairs"), Some("1"));
+                assert_eq!(row.get("copy_lend_selected_sites"), Some("0"));
+            },
+        )
+        .unwrap_or_else(|error| error.raise());
+    }
+
+    #[test]
+    fn copy_lend_phase1b_bo_c1_free_destination_is_ineligible() {
+        use crate::analyses::borrow_ownership::construction::CopyLendMode;
+        ::utils::compilation::run_compiler_on_str(
+            r#"
+unsafe extern "C" {
+    fn malloc(size: usize) -> *mut core::ffi::c_void;
+    fn free(p: *mut core::ffi::c_void);
+}
+pub unsafe fn f() {
+    let p = unsafe { malloc(4) } as *mut i32;
+    let q = p;
+    unsafe { free(q as *mut core::ffi::c_void) };
+}
+"#,
+            |tcx| {
+                let row = CopyLendMode::LendArm.with_override(|| run_bo(tcx, Duration::ZERO));
+                assert_eq!(row.get("status"), Some("ok"));
+                assert_eq!(row.get("copy_lend_eligible_pairs"), Some("0"));
+                assert_eq!(row.get("copy_lend_selected_sites"), Some("0"));
+            },
+        )
+        .unwrap_or_else(|error| error.raise());
+    }
 }
 
 /// Shared C2Rust delete-node fixture (was defined among the retired mirror tests; several surviving
@@ -8865,10 +9044,10 @@ mod explain {
 
     use super::collect_program;
     use crate::analyses::borrow_ownership::{
-        CrateCtxt,
-        coherence::{add_coherence, constrain_field_ownership},
+        coherence::constrain_field_ownership,
+        construction::{CopyLendMode, construct_bo_into},
         crate_slots::CrateSlots,
-        emit_crate_ownership_constraints,
+        mutability_facts::{MutFacts, MutFactsMode},
         solver::{CORE_LABEL_FAMILIES, KindSolver},
     };
 
@@ -8930,21 +9109,23 @@ mod explain {
     pub fn explain_unsat(tcx: TyCtxt<'_>) -> Explained {
         let program = collect_program(tcx);
         let slots = CrateSlots::build(&program);
-        let crate_ctxt = CrateCtxt::new(&program);
+        let origins = crate::analyses::borrow_ownership::origins::compute_origins(&program);
+        let mut_facts = match MutFactsMode::current() {
+            MutFactsMode::Off => MutFacts::all_mut(),
+            MutFactsMode::On => MutFacts::from_program(&program),
+        };
         let solver = KindSolver::new_tracked(&slots);
-        let (_stats, selectors) = emit_crate_ownership_constraints(
-            &crate_ctxt,
+        let construction = construct_bo_into(
+            &program,
             &slots,
-            &crate::analyses::borrow_ownership::origins::compute_origins(&program),
+            &origins,
+            &mut_facts,
             &solver,
+            CopyLendMode::current(),
         )
         .expect("NB-R: tracked emission");
+        let selectors = &construction.selectors;
         let tracker = solver.tracker().expect("new_tracked");
-        tracker.set_context("coherence");
-        for &g in &program.functions {
-            let body = tcx.mir_drops_elaborated_and_const_checked(g).borrow();
-            add_coherence(&solver, &slots, g, &body);
-        }
         tracker.set_context("field-law");
         constrain_field_ownership(&solver, &slots, &program);
 
@@ -18030,11 +18211,13 @@ fn nb5l2_greedy_witnessed_joint_certified() {
         ::utils::compilation::run_compiler_on_str(code, |tcx| {
             let (program, slots, origins, model, events) = nb5l2_anchor(tcx);
             let mut row = report::Row::default();
+            let mut_facts =
+                crate::analyses::borrow_ownership::mutability_facts::MutFacts::all_mut();
             run::run_necessity_audit(
                 &program,
                 &slots,
                 &origins,
-                true,
+                &mut_facts,
                 &Some(model),
                 &events,
                 &mut row,

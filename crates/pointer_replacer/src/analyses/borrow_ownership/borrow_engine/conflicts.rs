@@ -22,7 +22,7 @@ use crate::{
             ProvenanceOwner, ProvenanceSet, StructFieldSlot, collect_invalid_loan_demotions,
         },
         borrow_ownership::{
-            coherence::SelectedCopyLendSites, export::LoanClass, origin_flow::OriginFlowResults,
+            coherence::SelectedCopyLendLoans, export::LoanClass, origin_flow::OriginFlowResults,
         },
     },
     utils::rustc::RustProgram,
@@ -381,7 +381,7 @@ where
     K: Fn(LocalDefId) -> L,
     L: Fn(Local) -> bool,
 {
-    let selected = SelectedCopyLendSites::default();
+    let selected = SelectedCopyLendLoans::default();
     borrow_conflicts_replaying_with_flows_and_copy_lends(
         program, flows, is_ref, is_raw, is_mutable, raw_fields, &selected,
     )
@@ -394,7 +394,7 @@ pub(crate) fn borrow_conflicts_replaying_with_flows_and_copy_lends<I, J, M, N, K
     is_raw: M,
     is_mutable: K,
     raw_fields: &[StructFieldSlot],
-    selected_copy_lends: &SelectedCopyLendSites,
+    selected_copy_lends: &SelectedCopyLendLoans,
 ) -> FxHashMap<LocalDefId, Vec<ConflictEdge>>
 where
     I: Fn(LocalDefId) -> J,
@@ -544,7 +544,7 @@ where
     K: Fn(LocalDefId) -> L,
     L: Fn(Local) -> bool,
 {
-    let selected = SelectedCopyLendSites::default();
+    let selected = SelectedCopyLendLoans::default();
     borrow_conflicts_replaying_witnessed_with_copy_lends(
         program, flows, is_ref, is_raw, is_mutable, raw_fields, &selected,
     )
@@ -557,7 +557,7 @@ pub(crate) fn borrow_conflicts_replaying_witnessed_with_copy_lends<I, J, M, N, K
     is_raw: M,
     is_mutable: K,
     raw_fields: &[StructFieldSlot],
-    selected_copy_lends: &SelectedCopyLendSites,
+    selected_copy_lends: &SelectedCopyLendLoans,
 ) -> FxHashMap<LocalDefId, Vec<WitnessedConflictEdge>>
 where
     I: Fn(LocalDefId) -> J,
