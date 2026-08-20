@@ -15935,6 +15935,45 @@ pub unsafe fn copy_local(p: *mut i32) -> i32 {
         );
     }
 
+    /// Targeted temporal-rule control: `free` must not acquire queue A1's global behaviour.
+    /// With no selected CopyLend sites, the syntactic shared copy loan remains an existing loan
+    /// class and the same foreign-C free call does not invalidate it.
+    #[test]
+    fn copy_lend_free_does_not_invalidate_unrelated_existing_loans() {
+        run_compiler(
+            r#"
+unsafe extern "C" {
+    fn free(p: *mut i32);
+}
+
+pub unsafe fn copy_local(p: *mut i32) -> i32 {
+    let q = p;
+    unsafe { free(p) };
+    let value = unsafe { *q };
+    value
+}
+"#,
+            |tcx| {
+                let program = collect_program(tcx);
+                let origins = compute_origins(&program);
+                let selected = Default::default();
+                let witnessed = borrow_conflicts_replaying_witnessed_with_copy_lends(
+                    &program,
+                    origins.native_flows(),
+                    |_| |_| true,
+                    |_| |_| false,
+                    |_| |_| false,
+                    &[],
+                    &selected,
+                );
+                assert!(
+                    witnessed.values().all(Vec::is_empty),
+                    "an untyped existing loan changed at free: {witnessed:?}"
+                );
+            },
+        );
+    }
+
     #[test]
     fn copy_propagates_kind() {
         run_compiler(

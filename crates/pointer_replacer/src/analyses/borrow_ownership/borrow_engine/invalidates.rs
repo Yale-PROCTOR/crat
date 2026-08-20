@@ -320,31 +320,24 @@ impl<'g, 'tcx> LoanInvalidatesGenerator<'g, 'tcx> {
     }
 
     fn deeply_access_place(&mut self, location: Location, place: Place<'tcx>, kind: AccessKind) {
-        self.check_access_for_conflict(location, place, AccessDepth::Deep, kind);
+        self.check_access_for_conflict(location, place, AccessDepth::Deep, kind, false);
     }
 
     /// A12's targeted temporal rule. Only typed CopyLend loans are considered; the ordinary call
     /// operand remains a Read below, so existing loans retain pre-A12 deallocator behavior (A1).
     fn invalidate_copy_lends_at_deallocation(&mut self, location: Location, pointer: Place<'tcx>) {
         let pointee = pointer.project_deeper(&[PlaceElem::Deref], self.tcx);
-        let point = self.location_map.point_from_location(location);
-        for loan in self.copy_lends.iter() {
-            let borrow_data = &self.borrow_set.loans[loan];
-            if places_conflict(
-                self.tcx,
-                self.body,
-                borrow_data.borrowed,
-                pointee,
-                AccessDepth::Deep,
-                PlaceConflictBias::Overlap,
-            ) {
-                self.insert_invalidation(point, loan, pointer.local);
-            }
-        }
+        self.check_access_for_conflict(
+            location,
+            pointee,
+            AccessDepth::Deep,
+            AccessKind::Write,
+            true,
+        );
     }
 
     fn shallowly_access_place(&mut self, location: Location, place: Place<'tcx>, kind: AccessKind) {
-        self.check_access_for_conflict(location, place, AccessDepth::Shallow, kind);
+        self.check_access_for_conflict(location, place, AccessDepth::Shallow, kind, false);
     }
 
     fn check_access_for_conflict(
@@ -355,12 +348,16 @@ impl<'g, 'tcx> LoanInvalidatesGenerator<'g, 'tcx> {
         // §NB4-4a-ii labeled the kind but left it unconsumed. §NB4-R consumes it: only a WRITE
         // access ROUTES (below). The DIRECT check still fires for both kinds (production parity).
         kind: AccessKind,
+        copy_lends_only: bool,
     ) {
         let point_index = self.location_map.point_from_location(location);
 
         // DIRECT check: loans keyed under the accessed local.
         if let Some(borrows_for_place_base) = self.borrow_set.local_map.row(place.local) {
             for loan in borrows_for_place_base.iter() {
+                if copy_lends_only && !self.copy_lends.contains(loan) {
+                    continue;
+                }
                 let borrow_data = &self.borrow_set.loans[loan];
                 let copy_lend_write = kind == AccessKind::Write && self.copy_lends.contains(loan);
                 if !copy_lend_write
@@ -448,6 +445,9 @@ impl<'g, 'tcx> LoanInvalidatesGenerator<'g, 'tcx> {
                 };
             if let Some(borrows_for_base) = self.borrow_set.local_map.row(base) {
                 for loan in borrows_for_base.iter() {
+                    if copy_lends_only && !self.copy_lends.contains(loan) {
+                        continue;
+                    }
                     let borrow_data = &self.borrow_set.loans[loan];
                     // self-loan skip: the access IS through `place.local`; its OWN loan (keyed under
                     // `base`) is not a conflict with itself, or every `let b=&mut *p; *b=…` reborrow
@@ -474,7 +474,8 @@ impl<'g, 'tcx> LoanInvalidatesGenerator<'g, 'tcx> {
                         routed_depth,
                         PlaceConflictBias::Overlap,
                     ) {
-                        self.insert_invalidation(point_index, loan, place.local);
+                        let accessor = if copy_lends_only { base } else { place.local };
+                        self.insert_invalidation(point_index, loan, accessor);
                     }
                 }
             }
