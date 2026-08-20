@@ -1650,7 +1650,8 @@ fn a5_p1_corpus() {
         let name = entry.file_name();
         let name = name.to_string_lossy();
         rlibs += usize::from(name.ends_with(".rlib"));
-        bytemuck_derive |= name.starts_with("libbytemuck_derive") && name.ends_with(".dylib");
+        bytemuck_derive |= name.starts_with("libbytemuck_derive")
+            && (name.ends_with(".dylib") || name.ends_with(".so"));
     }
     assert!(rlibs > 0, "linked deps target contains no rlibs");
     assert!(
