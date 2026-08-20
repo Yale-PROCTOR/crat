@@ -1676,8 +1676,8 @@ fn a5_p1_corpus() {
     if std::env::var("CRAT_A5_RECOVER_BROTLI").as_deref() == Ok("1") {
         assert_eq!(
             std::env::var("CRAT_BOC1_MEM_MB").as_deref(),
-            Ok("24576"),
-            "the one-shot brotli recovery is authorized only at the 24,576-MiB cap"
+            Ok("49152"),
+            "the amended one-shot brotli recovery is authorized only at the 49,152-MiB cap"
         );
         assert!(
             std::env::var_os("CRAT_A5_PRESERVED_BASE_DIR").is_none(),
@@ -1699,7 +1699,7 @@ fn a5_p1_corpus() {
         let recovery_output = out.join("a5-p1-recovery");
         fs::create_dir_all(&recovery_output).expect("create P1 recovery output directory");
         let receipt = format!(
-            "program=brotli\nstatus={}\nmem_cap_mib=24576\npeak_rss_kb={}\npeak_rss_mib={:.3}\nwall_s={:.3}\nanalysis_worktree_head={analysis_head}\nsnapshot_producer_head={SNAPSHOT_PRODUCER_HEAD}\nmanifest_commit={MANIFEST_COMMIT}\nderived_substrate_sha256={DERIVED_SUBSTRATE_DIGEST}\nmachine_quiet_precondition=externally-verified\n",
+            "program=brotli\nstatus={}\nmem_cap_mib=49152\npeak_rss_kb={}\npeak_rss_mib={:.3}\nwall_s={:.3}\nanalysis_worktree_head={analysis_head}\nanalysis_semantics_head={ANALYSIS_SEMANTICS_HEAD}\ncopy_lend_mode=baseline\nsnapshot_producer_head={SNAPSHOT_PRODUCER_HEAD}\nmanifest_commit={MANIFEST_COMMIT}\nderived_substrate_sha256={DERIVED_SUBSTRATE_DIGEST}\nmachine_quiet_precondition=lambda7-high-memory\n",
             outcome.status,
             outcome.peak_rss_kb,
             outcome.peak_rss_kb as f64 / 1024.0,
@@ -1708,7 +1708,7 @@ fn a5_p1_corpus() {
         fs::write(recovery_output.join("receipt.txt"), &receipt)
             .expect("write P1 recovery receipt");
         println!(
-            "A5P1RECOVERY program=brotli status={} mem_cap_mib=24576 peak_rss_kb={} peak_rss_mib={:.3} wall_s={:.3}",
+            "A5P1RECOVERY program=brotli status={} mem_cap_mib=49152 peak_rss_kb={} peak_rss_mib={:.3} wall_s={:.3}",
             outcome.status,
             outcome.peak_rss_kb,
             outcome.peak_rss_kb as f64 / 1024.0,
@@ -2166,7 +2166,7 @@ fn a5_p1_corpus() {
     ));
     if let Some(peak_rss_kb) = brotli_peak_rss_kb {
         markdown.push_str(&format!(
-            "\nResource note: derived expansion collapsed brotli into one ~500k-SLOC file; its one-shot 24,576-MiB base-classification recovery peaked at {:.3} MiB RSS (200 ms sampling).\n",
+            "\nResource note: derived expansion collapsed brotli into one ~500k-SLOC file; its amended one-shot 49,152-MiB base-classification recovery peaked at {:.3} MiB RSS (200 ms sampling).\n",
             peak_rss_kb as f64 / 1024.0,
         ));
     }
@@ -2232,7 +2232,7 @@ fn a5_p1_corpus() {
         if brotli_peak_rss_kb == "not-applicable" {
             "not-applicable"
         } else {
-            "24576"
+            "49152"
         },
         brotli_peak_rss_kb,
         if brotli_depth_peak_rss_kb == "not-applicable" {
