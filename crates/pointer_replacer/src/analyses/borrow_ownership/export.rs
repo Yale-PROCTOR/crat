@@ -220,6 +220,14 @@ pub(crate) enum LoanKind {
     NoProvenance,
 }
 
+/// How the loan entered BO replay. Orthogonal to mutability [`LoanKind`]: A12 uses this typed
+/// class to apply shared CopyLend invalidation without changing older syntactic loan semantics.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum LoanClass {
+    Existing,
+    CopyLend,
+}
+
 impl LoanKind {
     /// Reproduces the engine's branch at `borrow_engine/invalidates.rs`.
     ///
@@ -340,6 +348,7 @@ pub(crate) struct LoanIdentity {
     pub run_local_handle: usize,
     /// Attribute, not key — see [`LoanKey`].
     pub kind: LoanKind,
+    pub class: LoanClass,
     /// Whether this loan was in the final round's invalid set. **Surviving
     /// loans are `false`** — those are the ones a re-route must match against.
     pub invalid: bool,
@@ -348,7 +357,10 @@ pub(crate) struct LoanIdentity {
 impl PartialEq for LoanIdentity {
     fn eq(&self, other: &Self) -> bool {
         // `run_local_handle` deliberately excluded — see the type doc.
-        self.key == other.key && self.kind == other.kind && self.invalid == other.invalid
+        self.key == other.key
+            && self.kind == other.kind
+            && self.class == other.class
+            && self.invalid == other.invalid
     }
 }
 

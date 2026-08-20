@@ -21,6 +21,7 @@ use z3::ast::Bool;
 
 use super::{
     SlotKind,
+    coherence::{CopyLendPair, SelectedCopyLendLoans, selected_copy_lend_sites},
     crate_slots::CrateSlots,
     l2::{
         self, CommitAction, ConflictObservation, DeclineReason as L2DeclineReason, Planner,
@@ -259,7 +260,15 @@ pub(crate) fn revalidate_replaying(
     is_mutable: impl MutProvider + Copy,
 ) -> FxHashMap<LocalDefId, Vec<SlotConflict>> {
     let origin_flows = super::origin_flow::analyze_program_origin_flow(program);
-    revalidate_replaying_with_flows(program, slots, &origin_flows, is_ref, is_raw, is_mutable)
+    revalidate_replaying_with_flows(
+        program,
+        slots,
+        &origin_flows,
+        is_ref,
+        is_raw,
+        is_mutable,
+        None,
+    )
 }
 
 fn revalidate_replaying_with_flows(
@@ -269,6 +278,7 @@ fn revalidate_replaying_with_flows(
     is_ref: impl Fn(SlotRef) -> bool,
     is_raw: impl Fn(SlotRef) -> bool,
     is_mutable: impl MutProvider + Copy,
+    selected_copy_lends: Option<&SelectedCopyLendLoans>,
 ) -> FxHashMap<LocalDefId, Vec<SlotConflict>> {
     let is_ref = &is_ref;
     let is_raw = &is_raw;
@@ -309,18 +319,33 @@ fn revalidate_replaying_with_flows(
     // flips to Fork at 3a merge — A1). All closures are `Copy`, so both arms may reference them.
     let edges = match super::borrow_engine::ForkEngineMode::current() {
         super::borrow_engine::ForkEngineMode::Production => {
+            assert!(
+                selected_copy_lends.is_none_or(|selected| selected.is_empty()),
+                "CopyLend replay requires the BO fork engine"
+            );
             borrow::borrow_conflicts_replaying(program, cand, raw, mutab)
         }
-        super::borrow_engine::ForkEngineMode::Fork => {
-            super::borrow_engine::borrow_conflicts_replaying_with_flows(
+        super::borrow_engine::ForkEngineMode::Fork => match selected_copy_lends {
+            Some(selected) => {
+                super::borrow_engine::borrow_conflicts_replaying_with_flows_and_copy_lends(
+                    program,
+                    origin_flows,
+                    cand,
+                    raw,
+                    mutab,
+                    &raw_fields,
+                    selected,
+                )
+            }
+            None => super::borrow_engine::borrow_conflicts_replaying_with_flows(
                 program,
                 origin_flows,
                 cand,
                 raw,
                 mutab,
                 &raw_fields,
-            )
-        }
+            ),
+        },
     };
 
     map_edges_to_slots(slots, edges)
@@ -336,6 +361,7 @@ fn revalidate_replaying_witnessed(
     is_ref: impl Fn(SlotRef) -> bool,
     is_raw: impl Fn(SlotRef) -> bool,
     is_mutable: impl MutProvider + Copy,
+    selected_copy_lends: Option<&SelectedCopyLendLoans>,
 ) -> FxHashMap<LocalDefId, Vec<WitnessedSlotConflict>> {
     let is_ref = &is_ref;
     let is_raw = &is_raw;
@@ -372,14 +398,27 @@ fn revalidate_replaying_witnessed(
         super::borrow_engine::ForkEngineMode::Fork,
         "L2 witnessed invalidator capture requires CRAT_BO_FORK_ENGINE=fork (or the unset fork default)"
     );
-    let edges = super::borrow_engine::borrow_conflicts_replaying_witnessed(
-        program,
-        origin_flows,
-        cand,
-        raw,
-        mutab,
-        &raw_fields,
-    );
+    let edges = match selected_copy_lends {
+        Some(selected) => {
+            super::borrow_engine::borrow_conflicts_replaying_witnessed_with_copy_lends(
+                program,
+                origin_flows,
+                cand,
+                raw,
+                mutab,
+                &raw_fields,
+                selected,
+            )
+        }
+        None => super::borrow_engine::borrow_conflicts_replaying_witnessed(
+            program,
+            origin_flows,
+            cand,
+            raw,
+            mutab,
+            &raw_fields,
+        ),
+    };
 
     edges
         .into_iter()
@@ -566,6 +605,9 @@ pub(crate) struct RoundStats {
     /// §NB0: every commit is a conflict commit (the `¬ref(source)` invariant is emitted eagerly).
     pub commits_conflict: usize,
     pub commits_per_round: Vec<usize>,
+    /// Exact CopyLend loan identities handed to the final replay round. This is a wiring receipt,
+    /// not a model-derived recount: suppressing replay registration must drive it to zero.
+    pub copy_lend_replay_selections: usize,
     /// §NB-F: sink selectors the FINAL solve dropped (leaked frees).
     pub dropped_sinks: usize,
     /// §NB-F: source selectors the FINAL solve dropped (leaked allocs).
@@ -630,6 +672,46 @@ pub(crate) fn verify_to_fixpoint_counting_with_flows(
     selectors: &Selectors,
     is_mutable: impl MutProvider + Copy,
 ) -> (Option<FxHashMap<SlotRef, SlotKind>>, RoundStats) {
+    verify_to_fixpoint_counting_with_flows_impl(
+        program,
+        slots,
+        origin_flows,
+        solver,
+        selectors,
+        is_mutable,
+        None,
+    )
+}
+
+pub(crate) fn verify_to_fixpoint_counting_with_flows_and_copy_lends(
+    program: &RustProgram,
+    slots: &CrateSlots,
+    origin_flows: &OriginFlowResults,
+    solver: &KindSolver,
+    selectors: &Selectors,
+    is_mutable: impl MutProvider + Copy,
+    copy_lends: &FxHashSet<CopyLendPair>,
+) -> (Option<FxHashMap<SlotRef, SlotKind>>, RoundStats) {
+    verify_to_fixpoint_counting_with_flows_impl(
+        program,
+        slots,
+        origin_flows,
+        solver,
+        selectors,
+        is_mutable,
+        Some(copy_lends),
+    )
+}
+
+fn verify_to_fixpoint_counting_with_flows_impl(
+    program: &RustProgram,
+    slots: &CrateSlots,
+    origin_flows: &OriginFlowResults,
+    solver: &KindSolver,
+    selectors: &Selectors,
+    is_mutable: impl MutProvider + Copy,
+    copy_lends: Option<&FxHashSet<CopyLendPair>>,
+) -> (Option<FxHashMap<SlotRef, SlotKind>>, RoundStats) {
     // §NB-R guard (release-active): a tracked solver's hard constraints are
     // track-gated; every solve in this loop would be vacuously SAT and the
     // accepted model meaningless. Tracked instances belong to the explain path.
@@ -652,6 +734,7 @@ pub(crate) fn verify_to_fixpoint_counting_with_flows(
             solver,
             selectors,
             is_mutable,
+            copy_lends,
         );
     }
     let cap = round_cap(slots);
@@ -673,6 +756,12 @@ pub(crate) fn verify_to_fixpoint_counting_with_flows(
         // predicate. Reset so the export holds the FINAL round's BorrowSet,
         // not the union over rejected intermediate models.
         super::export::begin_round();
+        let selected_copy_lends =
+            copy_lends.map(|pairs| selected_copy_lend_sites(program, slots, pairs, &model));
+        stats.copy_lend_replay_selections = selected_copy_lends
+            .as_ref()
+            .map(|selected| selected.values().map(FxHashSet::len).sum())
+            .unwrap_or(0);
         let conflicts = revalidate_replaying_with_flows(
             program,
             slots,
@@ -714,6 +803,7 @@ pub(crate) fn verify_to_fixpoint_counting_with_flows(
                 SlotRef::Local(..) => model.get(&s) != Some(&SlotKind::Ref),
             },
             is_mutable,
+            selected_copy_lends.as_ref(),
         );
         // §NB5-F — partition the residual-conflict guard by owner class. A non-`Ref` FIELD in a
         // residual is the A′ principle extended to field requirers: the field is a live requirer the
@@ -970,6 +1060,7 @@ pub(crate) fn verify_l2_to_fixpoint_counting(
     solver: &KindSolver,
     selectors: &Selectors,
     is_mutable: impl MutProvider + Copy,
+    copy_lends: Option<&FxHashSet<CopyLendPair>>,
 ) -> (Option<FxHashMap<SlotRef, SlotKind>>, RoundStats) {
     // D17: re-assert the load-bearing precondition at the door, not only at the
     // env entry. `debug_assert!` rather than `assert!` so the release-path cost
@@ -1027,6 +1118,12 @@ pub(crate) fn verify_l2_to_fixpoint_counting(
         }
         // D1: same per-round reset on the L2 path.
         super::export::begin_round();
+        let selected_copy_lends =
+            copy_lends.map(|pairs| selected_copy_lend_sites(program, slots, pairs, &model));
+        stats.copy_lend_replay_selections = selected_copy_lends
+            .as_ref()
+            .map(|selected| selected.values().map(FxHashSet::len).sum())
+            .unwrap_or(0);
         let conflicts = revalidate_replaying_witnessed(
             program,
             slots,
@@ -1037,6 +1134,7 @@ pub(crate) fn verify_l2_to_fixpoint_counting(
                 SlotRef::Local(..) => model.get(&slot) != Some(&SlotKind::Ref),
             },
             is_mutable,
+            selected_copy_lends.as_ref(),
         );
         let mut observations = Vec::new();
         for (did, conflicts) in &conflicts {
@@ -1249,6 +1347,36 @@ pub(crate) fn model_accepts_with_flows(
     model: &FxHashMap<SlotRef, SlotKind>,
     is_mutable: impl MutProvider + Copy,
 ) -> bool {
+    model_accepts_with_flows_impl(program, slots, origin_flows, model, is_mutable, None)
+}
+
+pub(crate) fn model_accepts_with_flows_and_copy_lends(
+    program: &RustProgram,
+    slots: &CrateSlots,
+    origin_flows: &OriginFlowResults,
+    model: &FxHashMap<SlotRef, SlotKind>,
+    is_mutable: impl MutProvider + Copy,
+    copy_lends: &FxHashSet<CopyLendPair>,
+) -> bool {
+    let selected = selected_copy_lend_sites(program, slots, copy_lends, model);
+    model_accepts_with_flows_impl(
+        program,
+        slots,
+        origin_flows,
+        model,
+        is_mutable,
+        Some(&selected),
+    )
+}
+
+fn model_accepts_with_flows_impl(
+    program: &RustProgram,
+    slots: &CrateSlots,
+    origin_flows: &OriginFlowResults,
+    model: &FxHashMap<SlotRef, SlotKind>,
+    is_mutable: impl MutProvider + Copy,
+    selected_copy_lends: Option<&SelectedCopyLendLoans>,
+) -> bool {
     // ALLOW-LIST TRIPWIRE (ruling on ADV-1). This is a PROBE — an oracle run
     // outside either CEGAR loop, on a model the loop may never have accepted.
     // Under the allow-list it is outside the armed region and records nothing
@@ -1276,6 +1404,7 @@ pub(crate) fn model_accepts_with_flows(
             SlotRef::Local(..) => model.get(&s) != Some(&SlotKind::Ref),
         },
         is_mutable,
+        selected_copy_lends,
     );
     // The loop's accept is `committed == 0` reached WITHOUT tripping either of its two guards: the
     // `residual_nonref_field` decline (non-`Ref` FIELD residual) and the `guard_slots_are_ref`

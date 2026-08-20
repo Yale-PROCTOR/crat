@@ -1,9 +1,13 @@
 use rustc_hash::{FxHashMap, FxHashSet};
-use rustc_middle::mir::{AggregateKind, Body, Operand, Rvalue, StatementKind};
+use rustc_middle::mir::{AggregateKind, Body, Location, Operand, PlaceElem, Rvalue, StatementKind};
 use rustc_span::def_id::LocalDefId;
+use z3::ast::Bool;
 
 use super::{
+    SlotKind,
     crate_slots::{CrateSlots, MAX_SLOT_DEPTH},
+    export::{BorrowerKind, OwnerKey, PlaceKey},
+    l2::MirLocationKey,
     resolve::{ResolvedSlot, resolve_place},
     slots::StructFieldSlot,
     solver::{KindSolver, SlotRef},
@@ -15,6 +19,126 @@ fn to_slot_ref(r: ResolvedSlot, fn_did: LocalDefId) -> SlotRef {
         ResolvedSlot::Local(id) => SlotRef::Local(fn_did, id),
         ResolvedSlot::Field(id) => SlotRef::Field(id),
     }
+}
+
+/// A12's pair-global depth-zero eligibility result. Construction is deliberately separate from
+/// coherence: the final producer combines Foster mutability, closed origin flow, and MIR liveness;
+/// this type is only the narrow solver/coherence handoff.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct CopyLendPair {
+    pub(crate) lhs: SlotRef,
+    pub(crate) rhs: SlotRef,
+}
+
+impl CopyLendPair {
+    pub(crate) fn new(lhs: SlotRef, rhs: SlotRef) -> Self {
+        Self { lhs, rhs }
+    }
+}
+
+/// Build the ownership emitter's per-site view of the same pair-global plan coherence consumes.
+/// The value is the exact kind-layer guard, so the two halves cannot choose different arms.
+pub(crate) fn copy_lend_guards_for_body(
+    solver: &KindSolver,
+    slots: &CrateSlots,
+    fn_did: LocalDefId,
+    body: &Body<'_>,
+    copy_lends: &FxHashSet<CopyLendPair>,
+) -> FxHashMap<Location, Bool> {
+    let mut guards = FxHashMap::default();
+    for (block, bbdata) in body.basic_blocks.iter_enumerated() {
+        for (statement_index, stmt) in bbdata.statements.iter().enumerate() {
+            let StatementKind::Assign(box (lhs_place, rvalue)) = &stmt.kind else {
+                continue;
+            };
+            let rhs_place = match rvalue {
+                Rvalue::Use(Operand::Copy(rhs) | Operand::Move(rhs))
+                | Rvalue::CopyForDeref(rhs) => rhs,
+                _ => continue,
+            };
+            let (Some(lhs), Some(rhs)) = (
+                resolve_place(slots, fn_did, body, *lhs_place, 0, None),
+                resolve_place(slots, fn_did, body, *rhs_place, 0, None),
+            ) else {
+                continue;
+            };
+            let pair = CopyLendPair::new(to_slot_ref(lhs, fn_did), to_slot_ref(rhs, fn_did));
+            if copy_lends.contains(&pair) {
+                guards.insert(
+                    Location {
+                        block,
+                        statement_index,
+                    },
+                    solver.lend_guard(pair.lhs, pair.rhs),
+                );
+            }
+        }
+    }
+    guards
+}
+
+/// Stable identity of the one loan synthesized by a selected copy-lend arm. Location alone is not
+/// sufficient: grouped provenance can synthesize companion loans at the same statement, and those
+/// retain the existing-loan invalidation semantics.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct SelectedCopyLendLoan {
+    pub(crate) location: MirLocationKey,
+    pub(crate) borrowed: PlaceKey,
+    pub(crate) borrower: BorrowerKind,
+}
+
+pub(crate) type SelectedCopyLendLoans = FxHashMap<LocalDefId, FxHashSet<SelectedCopyLendLoan>>;
+
+/// Read the selected CopyLend sites from the same accepted kind model replay will validate.
+pub(crate) fn selected_copy_lend_sites(
+    program: &RustProgram<'_>,
+    slots: &CrateSlots,
+    copy_lends: &FxHashSet<CopyLendPair>,
+    model: &FxHashMap<SlotRef, SlotKind>,
+) -> SelectedCopyLendLoans {
+    let mut selected = FxHashMap::default();
+    for &fn_did in &program.functions {
+        let body = program
+            .tcx
+            .mir_drops_elaborated_and_const_checked(fn_did)
+            .borrow();
+        for (block, bbdata) in body.basic_blocks.iter_enumerated() {
+            for (statement_index, stmt) in bbdata.statements.iter().enumerate() {
+                let StatementKind::Assign(box (lhs_place, rvalue)) = &stmt.kind else {
+                    continue;
+                };
+                let rhs_place = match rvalue {
+                    Rvalue::Use(Operand::Copy(rhs) | Operand::Move(rhs))
+                    | Rvalue::CopyForDeref(rhs) => rhs,
+                    _ => continue,
+                };
+                let (Some(lhs), Some(rhs)) = (
+                    resolve_place(slots, fn_did, &body, *lhs_place, 0, None),
+                    resolve_place(slots, fn_did, &body, *rhs_place, 0, None),
+                ) else {
+                    continue;
+                };
+                let pair = CopyLendPair::new(to_slot_ref(lhs, fn_did), to_slot_ref(rhs, fn_did));
+                if copy_lends.contains(&pair)
+                    && model.get(&pair.lhs) == Some(&SlotKind::Ref)
+                    && model.get(&pair.rhs) == Some(&SlotKind::Owning)
+                {
+                    let borrowed = rhs_place.project_deeper(&[PlaceElem::Deref], program.tcx);
+                    selected
+                        .entry(fn_did)
+                        .or_insert_with(FxHashSet::default)
+                        .insert(SelectedCopyLendLoan {
+                            location: MirLocationKey::new(block.as_u32(), statement_index),
+                            borrowed: PlaceKey::from_place(borrowed),
+                            borrower: BorrowerKind::Assign {
+                                owner: OwnerKey::Local(lhs_place.local.as_u32()),
+                            },
+                        });
+                }
+            }
+        }
+    }
+    selected
 }
 
 fn with_use_track_context<T>(_solver: &KindSolver, tag_uses: bool, f: impl FnOnce() -> T) -> T {
@@ -36,6 +160,8 @@ fn add_coherence_impl<'tcx>(
     fn_did: LocalDefId,
     body: &Body<'tcx>,
     tag_uses: bool,
+    copy_lends: Option<&FxHashSet<CopyLendPair>>,
+    remove_copy_equates: bool,
 ) {
     for bbdata in body.basic_blocks.iter() {
         for stmt in &bbdata.statements {
@@ -47,6 +173,9 @@ fn add_coherence_impl<'tcx>(
                 Rvalue::Use(Operand::Copy(rhs) | Operand::Move(rhs))
                 | Rvalue::CopyForDeref(rhs) => {
                     with_use_track_context(solver, tag_uses, || {
+                        if remove_copy_equates {
+                            return;
+                        }
                         for d in 0..MAX_SLOT_DEPTH {
                             if let (Some(la), Some(ra)) = (
                                 resolve_place(slots, fn_did, body, *lhs, d, None),
@@ -60,7 +189,17 @@ fn add_coherence_impl<'tcx>(
                                 if d == 0 && matches!(la, ResolvedSlot::Field(_)) {
                                     continue;
                                 }
-                                solver.equate(to_slot_ref(la, fn_did), to_slot_ref(ra, fn_did));
+                                let lhs = to_slot_ref(la, fn_did);
+                                let rhs = to_slot_ref(ra, fn_did);
+                                if d == 0
+                                    && copy_lends.is_some_and(|pairs| {
+                                        pairs.contains(&CopyLendPair::new(lhs, rhs))
+                                    })
+                                {
+                                    solver.lend_or_equate(lhs, rhs);
+                                } else {
+                                    solver.equate(lhs, rhs);
+                                }
                             }
                         }
                     });
@@ -131,7 +270,26 @@ pub fn add_coherence<'tcx>(
     fn_did: LocalDefId,
     body: &Body<'tcx>,
 ) {
-    add_coherence_impl(solver, slots, fn_did, body, false);
+    add_coherence_impl(solver, slots, fn_did, body, false, None, false);
+}
+
+pub(crate) fn add_coherence_with_copy_lends<'tcx>(
+    solver: &KindSolver,
+    slots: &CrateSlots,
+    fn_did: LocalDefId,
+    body: &Body<'tcx>,
+    copy_lends: &FxHashSet<CopyLendPair>,
+) {
+    add_coherence_impl(solver, slots, fn_did, body, false, Some(copy_lends), false);
+}
+
+pub(crate) fn add_coherence_removal_only<'tcx>(
+    solver: &KindSolver,
+    slots: &CrateSlots,
+    fn_did: LocalDefId,
+    body: &Body<'tcx>,
+) {
+    add_coherence_impl(solver, slots, fn_did, body, false, None, true);
 }
 
 #[cfg(test)]
@@ -141,7 +299,7 @@ pub(crate) fn add_coherence_tagging_uses<'tcx>(
     fn_did: LocalDefId,
     body: &Body<'tcx>,
 ) {
-    add_coherence_impl(solver, slots, fn_did, body, true);
+    add_coherence_impl(solver, slots, fn_did, body, true, None, false);
 }
 
 /// §9.10.2 crate-wide field-ownership constraint. A struct field slot is ONE crate-wide slot

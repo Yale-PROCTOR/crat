@@ -12,10 +12,9 @@ use z3::{SatResult, ast::Bool};
 
 use super::{collect_program, report};
 use crate::analyses::borrow_ownership::{
-    CrateCtxt,
-    coherence::{add_coherence_tagging_uses, constrain_field_ownership},
+    coherence::constrain_field_ownership,
+    construction::construct_tracked_census_baseline,
     crate_slots::CrateSlots,
-    emit_crate_ownership_constraints,
     origins::compute_origins,
     solver::{KindSolver, SlotRef, core_label_family},
 };
@@ -281,17 +280,11 @@ fn build_tracked_solver<'tcx>(
     program: &crate::utils::rustc::RustProgram<'tcx>,
 ) -> (CrateSlots, KindSolver) {
     let slots = CrateSlots::build(program);
-    let crate_ctxt = CrateCtxt::new(program);
     let solver = KindSolver::new_tracked(&slots);
     solver.set_random_seed(0);
-    emit_crate_ownership_constraints(&crate_ctxt, &slots, &compute_origins(program), &solver)
+    construct_tracked_census_baseline(program, &slots, &compute_origins(program), &solver)
         .expect("tracked constraint emission");
     let tracker = solver.tracker().expect("tracked solver");
-    tracker.set_context("coherence");
-    for &did in &program.functions {
-        let body = tcx.mir_drops_elaborated_and_const_checked(did).borrow();
-        add_coherence_tagging_uses(&solver, &slots, did, &body);
-    }
     tracker.set_context("field-law");
     constrain_field_ownership(&solver, &slots, program);
     (slots, solver)

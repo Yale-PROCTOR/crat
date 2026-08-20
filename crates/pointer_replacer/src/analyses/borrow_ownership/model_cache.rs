@@ -66,6 +66,14 @@ pub(crate) fn dir() -> Option<PathBuf> {
 pub(crate) fn fingerprint(program: &RustProgram<'_>) -> String {
     let mut h = Sha256::new();
 
+    // D3: the comparison mode is part of launch identity. A cache entry from one arm must never
+    // answer another arm's solve even when source and analysis code are byte-identical.
+    h.update(
+        super::construction::CopyLendMode::current()
+            .label()
+            .as_bytes(),
+    );
+
     // 1. The program's own source. Per-program, not the whole-corpus digest, so
     //    one program changing does not void the other nineteen.
     let tcx = program.tcx;
@@ -173,7 +181,11 @@ pub(crate) fn store(
     // Sorted: a cache entry that permutes between runs is not comparable, and
     // D19's lesson is that report order is part of the artifact.
     lines.sort();
-    let body = format!("# fingerprint {fp}\n{}\n", lines.join("\n"));
+    let mode = super::construction::CopyLendMode::current().label();
+    let body = format!(
+        "# fingerprint {fp}\n# copy_lend_mode {mode}\n{}\n",
+        lines.join("\n")
+    );
     let _ = std::fs::write(entry_path(&d, &fp), body);
 }
 
@@ -215,6 +227,10 @@ pub(crate) fn load(
     if first != format!("# fingerprint {fp}") {
         return None;
     }
+    let mode = super::construction::CopyLendMode::current().label();
+    if text.lines().nth(1)? != format!("# copy_lend_mode {mode}") {
+        return None;
+    }
 
     // Rebuild the session-local keys by rendering every slot THIS session has
     // and matching on the canonical name. A key in the file that no longer
@@ -236,7 +252,7 @@ pub(crate) fn load(
     }
 
     let mut out = FxHashMap::default();
-    for line in text.lines().skip(1) {
+    for line in text.lines().skip(2) {
         if line.trim().is_empty() {
             continue;
         }

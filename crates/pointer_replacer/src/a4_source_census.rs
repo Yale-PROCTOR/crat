@@ -33,11 +33,11 @@ use z3::SatResult;
 
 use super::{collect_program, report::Row};
 use crate::analyses::borrow_ownership::{
-    CrateCtxt, SlotKind,
-    borrow_verify::{verify_to_fixpoint_counting_with_flows, with_mode_a_commit_trace},
-    coherence::{add_coherence, constrain_field_ownership},
+    SlotKind,
+    borrow_verify::with_mode_a_commit_trace,
+    coherence::constrain_field_ownership,
+    construction::{CopyLendMode, construct_bo_into, verify_bo_construction_counting},
     crate_slots::CrateSlots,
-    emit_crate_ownership_constraints,
     export::{BoExport, SelectorSite, location_key, with_bo_export},
     mutability_facts::{MutFacts, MutFactsMode},
     origins::compute_origins,
@@ -4137,11 +4137,11 @@ struct CandidateRecord {
 
 fn render_candidates(records: &[CandidateRecord]) -> String {
     let mut out = String::from(
-        "program\tfield_key\tfield_slot\tordinary_kind\tprimary_class\tcause_flags\troot_count\n",
+        "program\tfield_key\tfield_slot\tordinary_kind\tprimary_class\tcause_flags\troot_count\tcopy_lend_mode\n",
     );
     for record in records {
         out.push_str(&format!(
-            "{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
             clean_cell(&record.input.program),
             clean_cell(&record.input.field_key),
             record.input.field_slot,
@@ -4153,6 +4153,7 @@ fn render_candidates(records: &[CandidateRecord]) -> String {
             })
             .join("|"),
             record.roots.len(),
+            CopyLendMode::current().label(),
         ));
     }
     out
@@ -4160,12 +4161,12 @@ fn render_candidates(records: &[CandidateRecord]) -> String {
 
 fn render_roots(records: &[CandidateRecord], exceptions: &[ExceptionRecord]) -> String {
     let mut out = String::from(
-        "population\tprogram\tfield_key\tstore_site\troot_id\troot_label\tcause_flags\tordered_path\n",
+        "population\tprogram\tfield_key\tstore_site\troot_id\troot_label\tcause_flags\tordered_path\tcopy_lend_mode\n",
     );
     for record in records {
         for root in &record.roots {
             out.push_str(&format!(
-                "census\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+                "census\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
                 clean_cell(&record.input.program),
                 clean_cell(&record.input.field_key),
                 clean_cell(&root.store_site),
@@ -4173,13 +4174,14 @@ fn render_roots(records: &[CandidateRecord], exceptions: &[ExceptionRecord]) -> 
                 clean_cell(&root.root_label),
                 evidence_tokens(&root.evidence).join("|"),
                 clean_cell(&root.path.join(" -> ")),
+                CopyLendMode::current().label(),
             ));
         }
     }
     for record in exceptions {
         for root in &record.roots {
             out.push_str(&format!(
-                "exception\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+                "exception\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
                 clean_cell(&record.input.program),
                 clean_cell(&record.input.field_key),
                 clean_cell(&root.store_site),
@@ -4187,6 +4189,7 @@ fn render_roots(records: &[CandidateRecord], exceptions: &[ExceptionRecord]) -> 
                 clean_cell(&root.root_label),
                 evidence_tokens(&root.evidence).join("|"),
                 clean_cell(&root.path.join(" -> ")),
+                CopyLendMode::current().label(),
             ));
         }
     }
@@ -4251,7 +4254,7 @@ struct ExceptionRecord {
 
 fn render_exceptions(records: &[ExceptionRecord]) -> String {
     let mut out = String::from(
-        "program\tfield_key\tfield_slot\tordinary_kind\tforce_result\treplay_result\treplay_kind\tcausal_outcome\tsource_selectors\tsink_selectors\tsource_inventory\tsink_inventory\tordinary_dropped_sources\tordinary_dropped_sinks\tforced_dropped_sources\tforced_dropped_sinks\treplay_dropped_sources\treplay_dropped_sinks\tmodel_changes\tordinary_commits\tforced_commits\tgraph_root_count\tgraph_flags\tallocation_token_path\tunsupported_realloc\tcopy_clone_gate\tabi_gate\tfn_pointer_gate\n",
+        "program\tfield_key\tfield_slot\tordinary_kind\tforce_result\treplay_result\treplay_kind\tcausal_outcome\tsource_selectors\tsink_selectors\tsource_inventory\tsink_inventory\tordinary_dropped_sources\tordinary_dropped_sinks\tforced_dropped_sources\tforced_dropped_sinks\treplay_dropped_sources\treplay_dropped_sinks\tmodel_changes\tordinary_commits\tforced_commits\tgraph_root_count\tgraph_flags\tallocation_token_path\tunsupported_realloc\tcopy_clone_gate\tabi_gate\tfn_pointer_gate\tcopy_lend_mode\n",
     );
     for record in records {
         let indices = |values: &[usize]| {
@@ -4262,7 +4265,7 @@ fn render_exceptions(records: &[ExceptionRecord]) -> String {
                 .join("|")
         };
         out.push_str(&format!(
-            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
             clean_cell(&record.input.program),
             clean_cell(&record.input.field_key),
             record.input.field_slot,
@@ -4295,6 +4298,7 @@ fn render_exceptions(records: &[ExceptionRecord]) -> String {
             "not-reached:ordinary-kind-not-owning",
             "not-reached:ordinary-kind-not-owning",
             "not-reached:ordinary-kind-not-owning",
+            CopyLendMode::current().label(),
         ));
     }
     out
@@ -4308,7 +4312,8 @@ fn render_checkpoint(
     exceptions: &[ExceptionRecord],
 ) -> String {
     format!(
-        "data=false\nphase={}\ncandidate={}\nelapsed_s={elapsed_s:.3}\ncandidates_completed={}\nexceptions_completed={}\n\n{}\n{}",
+        "data=false\ncopy_lend_mode={}\nphase={}\ncandidate={}\nelapsed_s={elapsed_s:.3}\ncandidates_completed={}\nexceptions_completed={}\n\n{}\n{}",
+        CopyLendMode::current().label(),
         clean_cell(phase),
         clean_cell(candidate),
         candidates.len(),
@@ -5082,40 +5087,42 @@ pub(super) fn run_worker(tcx: TyCtxt<'_>, t_tcx: Duration) -> Row {
     let program = collect_program(tcx);
     let origins = compute_origins(&program);
     let slots = CrateSlots::build(&program);
-    let crate_ctxt = CrateCtxt::new(&program);
     let mutability = match MutFactsMode::current() {
         MutFactsMode::Off => MutFacts::all_mut(),
         MutFactsMode::On => MutFacts::from_program(&program),
     };
     let ordinary = KindSolver::new(&slots);
+    let copy_lend_mode = CopyLendMode::current();
     let (
-        (((ordinary_model, _ordinary_stats), ordinary_commits), ordinary_selectors),
+        (((ordinary_model, _ordinary_stats), ordinary_commits), ordinary_construction),
         _ordinary_export,
     ) = with_bo_export(|| {
-        let (_stats, selectors) =
-            emit_crate_ownership_constraints(&crate_ctxt, &slots, &origins, &ordinary)
-                .expect("A4C ordinary ownership emission");
-        for &fn_did in &program.functions {
-            let body = tcx.mir_drops_elaborated_and_const_checked(fn_did).borrow();
-            add_coherence(&ordinary, &slots, fn_did, &body);
-        }
+        let construction = construct_bo_into(
+            &program,
+            &slots,
+            &origins,
+            &mutability,
+            &ordinary,
+            copy_lend_mode,
+        )
+        .expect("A4C ordinary ownership emission");
         let ((model, stats), commits) = with_mode_a_commit_trace(|| {
-            verify_to_fixpoint_counting_with_flows(
+            verify_bo_construction_counting(
                 &program,
                 &slots,
-                origins.native_flows(),
+                &origins,
                 &ordinary,
-                &selectors,
+                &construction,
                 &mutability,
             )
         });
-        (((model, stats), commits), selectors)
+        (((model, stats), commits), construction)
     });
     let ordinary_model = ordinary_model.unwrap_or_else(|| {
         panic!("A4C STOP phase=ordinary candidate=none: selector-off baseline declined")
     });
     let (ordinary_dropped_sources, ordinary_dropped_sinks) =
-        selector_state(&ordinary, &ordinary_selectors);
+        selector_state(&ordinary, &ordinary_construction.selectors);
     emit_phase(started, "graph-construction", None, 0);
     let graph = build_source_graph(tcx, &slots, &_ordinary_export);
     verify_active_gap_waivers_exercised()
@@ -5230,13 +5237,15 @@ pub(super) fn run_worker(tcx: TyCtxt<'_>, t_tcx: Duration) -> Row {
         );
 
         let forced = KindSolver::new(&slots);
-        let (_stats, forced_selectors) =
-            emit_crate_ownership_constraints(&crate_ctxt, &slots, &origins, &forced)
-                .expect("A4C forced ownership emission");
-        for &fn_did in &program.functions {
-            let body = tcx.mir_drops_elaborated_and_const_checked(fn_did).borrow();
-            add_coherence(&forced, &slots, fn_did, &body);
-        }
+        let forced_construction = construct_bo_into(
+            &program,
+            &slots,
+            &origins,
+            &mutability,
+            &forced,
+            copy_lend_mode,
+        )
+        .expect("A4C forced ownership emission");
         constrain_field_ownership(&forced, &slots, &program);
         for commit in &ordinary_commits {
             forced.add_borrow_exclusion(Some(commit.target), &[]);
@@ -5256,7 +5265,7 @@ pub(super) fn run_worker(tcx: TyCtxt<'_>, t_tcx: Duration) -> Row {
         });
         assert_eq!(forced_model.get(&field_ref), Some(&SlotKind::Owning));
         let (forced_dropped_sources, forced_dropped_sinks) =
-            selector_state(&forced, &forced_selectors);
+            selector_state(&forced, &forced_construction.selectors);
 
         emit_phase(
             started,
@@ -5265,21 +5274,23 @@ pub(super) fn run_worker(tcx: TyCtxt<'_>, t_tcx: Duration) -> Row {
             exception_records.len(),
         );
         let replay = KindSolver::new(&slots);
-        let (_stats, replay_selectors) =
-            emit_crate_ownership_constraints(&crate_ctxt, &slots, &origins, &replay)
-                .expect("A4C replay ownership emission");
-        for &fn_did in &program.functions {
-            let body = tcx.mir_drops_elaborated_and_const_checked(fn_did).borrow();
-            add_coherence(&replay, &slots, fn_did, &body);
-        }
+        let replay_construction = construct_bo_into(
+            &program,
+            &slots,
+            &origins,
+            &mutability,
+            &replay,
+            copy_lend_mode,
+        )
+        .expect("A4C replay ownership emission");
         replay.assert_owning(field_ref);
         let ((replay_model, _replay_stats), replay_commits) = with_mode_a_commit_trace(|| {
-            verify_to_fixpoint_counting_with_flows(
+            verify_bo_construction_counting(
                 &program,
                 &slots,
-                origins.native_flows(),
+                &origins,
                 &replay,
-                &replay_selectors,
+                &replay_construction,
                 &mutability,
             )
         });
@@ -5293,7 +5304,7 @@ pub(super) fn run_worker(tcx: TyCtxt<'_>, t_tcx: Duration) -> Row {
                     SlotKind::Owning,
                     "A4C STOP phase=exception-replay candidate={key}: force lost"
                 );
-                let (sources, sinks) = selector_state(&replay, &replay_selectors);
+                let (sources, sinks) = selector_state(&replay, &replay_construction.selectors);
                 ("accepted".to_owned(), Some(kind), sources, sinks)
             } else {
                 let disposition = replay_none_disposition(replay.optimize().get_reason_unknown())
@@ -5362,8 +5373,8 @@ pub(super) fn run_worker(tcx: TyCtxt<'_>, t_tcx: Duration) -> Row {
             model_changes,
             ordinary_commits: commit_lines(&ordinary_commits),
             forced_commits: commit_lines(&replay_commits),
-            source_count: forced_selectors.sources().len(),
-            sink_count: forced_selectors.sinks().len(),
+            source_count: forced_construction.selectors.sources().len(),
+            sink_count: forced_construction.selectors.sinks().len(),
             source_inventory: selector_inventory(
                 tcx,
                 &_ordinary_export.source_sites,
@@ -5413,6 +5424,7 @@ pub(super) fn run_worker(tcx: TyCtxt<'_>, t_tcx: Duration) -> Row {
     emit_phase(started, "complete", None, candidate_records.len());
 
     let mut row = Row::default();
+    row.set("copy_lend_mode", copy_lend_mode.label());
     row.set("t_tcx_s", format!("{:.3}", t_tcx.as_secs_f64()));
     row.set("candidates", candidate_records.len());
     row.set("exceptions", exception_records.len());
@@ -6153,11 +6165,9 @@ fn parse_table_text(
         .collect()
 }
 
-const CANDIDATE_HEADER: &str =
-    "program\tfield_key\tfield_slot\tordinary_kind\tprimary_class\tcause_flags\troot_count";
-const ROOT_HEADER: &str =
-    "population\tprogram\tfield_key\tstore_site\troot_id\troot_label\tcause_flags\tordered_path";
-const EXCEPTION_HEADER: &str = "program\tfield_key\tfield_slot\tordinary_kind\tforce_result\treplay_result\treplay_kind\tcausal_outcome\tsource_selectors\tsink_selectors\tsource_inventory\tsink_inventory\tordinary_dropped_sources\tordinary_dropped_sinks\tforced_dropped_sources\tforced_dropped_sinks\treplay_dropped_sources\treplay_dropped_sinks\tmodel_changes\tordinary_commits\tforced_commits\tgraph_root_count\tgraph_flags\tallocation_token_path\tunsupported_realloc\tcopy_clone_gate\tabi_gate\tfn_pointer_gate";
+const CANDIDATE_HEADER: &str = "program\tfield_key\tfield_slot\tordinary_kind\tprimary_class\tcause_flags\troot_count\tcopy_lend_mode";
+const ROOT_HEADER: &str = "population\tprogram\tfield_key\tstore_site\troot_id\troot_label\tcause_flags\tordered_path\tcopy_lend_mode";
+const EXCEPTION_HEADER: &str = "program\tfield_key\tfield_slot\tordinary_kind\tforce_result\treplay_result\treplay_kind\tcausal_outcome\tsource_selectors\tsink_selectors\tsource_inventory\tsink_inventory\tordinary_dropped_sources\tordinary_dropped_sinks\tforced_dropped_sources\tforced_dropped_sinks\treplay_dropped_sources\treplay_dropped_sinks\tmodel_changes\tordinary_commits\tforced_commits\tgraph_root_count\tgraph_flags\tallocation_token_path\tunsupported_realloc\tcopy_clone_gate\tabi_gate\tfn_pointer_gate\tcopy_lend_mode";
 const CANDIDATE_READINGS_HEADER: &str = "program\tfield_key\tfield_slot\tordinary_kind\tclosed_world_class\topen_class\tclosed_world_evidence\topen_evidence\tclosed_world_root_count\topen_root_count";
 const FULL_IDENTITY_HEADER: &str = "program\tfield_key\tfield_slot\tordinary_kind\tbaseline_force\tproof_reason\tsource_census_status";
 const PUBLIC_SETTER_REACHABLE_TAG: &str = "public-setter-reachable";
@@ -6358,13 +6368,13 @@ fn validate_reusable_candidate_artifact(
     candidates: &str,
     roots: &str,
 ) -> Result<(), String> {
-    let candidates = parse_table_text(candidates, CANDIDATE_HEADER, 7, "checkpoint candidates")?;
+    let candidates = parse_table_text(candidates, CANDIDATE_HEADER, 8, "checkpoint candidates")?;
     if candidates.len() != 1 || candidates[0][0] != program || candidates[0][1] != field_key {
         return Err(format!(
             "checkpoint candidate identity mismatch: program={program} candidate={field_key} rows={candidates:?}"
         ));
     }
-    let roots = parse_table_text(roots, ROOT_HEADER, 8, "checkpoint roots")?;
+    let roots = parse_table_text(roots, ROOT_HEADER, 9, "checkpoint roots")?;
     let matching = roots
         .iter()
         .filter(|row| row[1] == program && row[2] == field_key)
@@ -6413,7 +6423,7 @@ fn validate_oracle_candidate_byte_match(
     let actual = parse_table_text(
         actual_candidates,
         CANDIDATE_HEADER,
-        7,
+        8,
         "isolated oracle candidate",
     )?;
     if actual.len() != 1 || actual[0][0] != program || actual[0][1] != field_key {
@@ -6616,9 +6626,9 @@ fn scan_root_table<R: BufRead>(mut reader: R, label: &str) -> Result<StreamingRo
             return Err(format!("duplicate adjacent root row in {label}"));
         }
         let columns = line.split('\t').collect::<Vec<_>>();
-        if columns.len() != 8 {
+        if columns.len() != 9 {
             return Err(format!(
-                "{label} line {} has {} columns, expected 8",
+                "{label} line {} has {} columns, expected 9",
                 summary.row_count + 2,
                 columns.len()
             ));
@@ -8016,9 +8026,9 @@ fn validate_unique_root_rows(roots: &[Vec<String>]) -> Result<(), String> {
 }
 
 fn validate_shard(contract: &MeasurementContract, program: &str, dir: &Path) -> Result<(), String> {
-    let candidates = parse_table(&dir.join("candidates.tsv"), CANDIDATE_HEADER, 7)?;
+    let candidates = parse_table(&dir.join("candidates.tsv"), CANDIDATE_HEADER, 8)?;
     let roots = scan_root_path(&dir.join("roots.tsv"))?;
-    let exceptions = parse_table(&dir.join("exceptions.tsv"), EXCEPTION_HEADER, 28)?;
+    let exceptions = parse_table(&dir.join("exceptions.tsv"), EXCEPTION_HEADER, 29)?;
     let typed_exclusions = parse_typed_exclusions(&dir.join("typed-exclusions.tsv"))?;
     let typed_exclusion_identity_set = typed_exclusions
         .iter()
@@ -8190,12 +8200,12 @@ fn validate_receipt_counts(receipt: &BTreeMap<String, String>, dir: &Path) -> Re
     let mut actual = vec![
         (
             "candidates",
-            parse_table(&dir.join("candidates.tsv"), CANDIDATE_HEADER, 7)?.len(),
+            parse_table(&dir.join("candidates.tsv"), CANDIDATE_HEADER, 8)?.len(),
         ),
         ("roots", scan_root_path(&dir.join("roots.tsv"))?.row_count),
         (
             "exceptions",
-            parse_table(&dir.join("exceptions.tsv"), EXCEPTION_HEADER, 28)?.len(),
+            parse_table(&dir.join("exceptions.tsv"), EXCEPTION_HEADER, 29)?.len(),
         ),
     ];
     if receipt.contains_key("typed_exclusions") || dir.join("typed-exclusions.tsv").is_file() {
@@ -8613,9 +8623,9 @@ fn validate_isolated_unit(
     dir: &Path,
     manifest: &str,
 ) -> Result<(), String> {
-    let candidates = parse_table(&dir.join("candidates.tsv"), CANDIDATE_HEADER, 7)?;
+    let candidates = parse_table(&dir.join("candidates.tsv"), CANDIDATE_HEADER, 8)?;
     let roots = scan_root_path(&dir.join("roots.tsv"))?;
-    let exceptions = parse_table(&dir.join("exceptions.tsv"), EXCEPTION_HEADER, 28)?;
+    let exceptions = parse_table(&dir.join("exceptions.tsv"), EXCEPTION_HEADER, 29)?;
     let expected_candidate_count = usize::from(expected.population == "census");
     let expected_exception_count = usize::from(expected.population == "exception");
     if candidates.len() != expected_candidate_count || exceptions.len() != expected_exception_count
@@ -9142,10 +9152,10 @@ fn run_shard(contract: &MeasurementContract, program: super::CorpusProgram) {
             .memory_receipt
             .require_complete()
             .expect("ok candidate requires both memory metrics");
-        let candidates = parse_table(&unit_dir.join("candidates.tsv"), CANDIDATE_HEADER, 7)
+        let candidates = parse_table(&unit_dir.join("candidates.tsv"), CANDIDATE_HEADER, 8)
             .expect("parse isolated candidates");
         let roots = scan_root_path(&unit_dir.join("roots.tsv")).expect("scan isolated roots");
-        let exceptions = parse_table(&unit_dir.join("exceptions.tsv"), EXCEPTION_HEADER, 28)
+        let exceptions = parse_table(&unit_dir.join("exceptions.tsv"), EXCEPTION_HEADER, 29)
             .expect("parse isolated exceptions");
         let candidates_text = fs::read_to_string(unit_dir.join("candidates.tsv"))
             .expect("read isolated oracle candidate");
@@ -9304,10 +9314,10 @@ fn run_shard(contract: &MeasurementContract, program: super::CorpusProgram) {
             program.name
         )
     });
-    let candidates = parse_table(&dir.join("candidates.tsv"), CANDIDATE_HEADER, 7)
+    let candidates = parse_table(&dir.join("candidates.tsv"), CANDIDATE_HEADER, 8)
         .expect("parse completed candidates");
     let roots = scan_root_path(&dir.join("roots.tsv")).expect("scan completed roots");
-    let exceptions = parse_table(&dir.join("exceptions.tsv"), EXCEPTION_HEADER, 28)
+    let exceptions = parse_table(&dir.join("exceptions.tsv"), EXCEPTION_HEADER, 29)
         .expect("parse completed exceptions");
     let typed_exclusions =
         parse_typed_exclusions(&dir.join("typed-exclusions.tsv")).expect("parse typed exclusions");
@@ -9530,10 +9540,10 @@ fn aggregate(contract: &MeasurementContract) {
         .expect("write aggregate typed exclusions");
     fs::write(&gap_waivers_path, combined_gap_waivers).expect("write aggregate gap waivers");
     let candidates =
-        parse_table(&candidates_path, CANDIDATE_HEADER, 7).expect("parse aggregate candidates");
+        parse_table(&candidates_path, CANDIDATE_HEADER, 8).expect("parse aggregate candidates");
     let roots = scan_root_path(&roots_path).expect("scan aggregate roots");
     let exceptions =
-        parse_table(&exceptions_path, EXCEPTION_HEADER, 28).expect("parse aggregate exceptions");
+        parse_table(&exceptions_path, EXCEPTION_HEADER, 29).expect("parse aggregate exceptions");
     let typed_exclusions =
         parse_typed_exclusions(&typed_exclusions_path).expect("parse aggregate typed exclusions");
     let expected_gap_waivers = render_gap_waivers(&[registered_bzip2_gap_waiver()]);
@@ -9900,7 +9910,7 @@ fn write_reference_roots(
         for line in lines {
             let line = line.map_err(|error| error.to_string())?;
             let columns = line.split('\t').collect::<Vec<_>>();
-            if columns.len() != 8 {
+            if columns.len() != 9 {
                 return Err(format!("root schema drift: {}", input.display()));
             }
             let identity = Identity {
@@ -10015,7 +10025,7 @@ fn build_reference_source_aggregate(contract: &MeasurementContract) {
     for &(program, _, expected_manifest) in &RETRY3_PREDECESSOR_SHARDS {
         let dir = predecessor.join(program);
         assert_eq!(verify_manifest(&dir).unwrap(), expected_manifest);
-        for row in parse_table(&dir.join("candidates.tsv"), CANDIDATE_HEADER, 7).unwrap() {
+        for row in parse_table(&dir.join("candidates.tsv"), CANDIDATE_HEADER, 8).unwrap() {
             let identity = Identity {
                 program: row[0].clone(),
                 field_key: row[1].clone(),
@@ -10055,7 +10065,7 @@ fn build_reference_source_aggregate(contract: &MeasurementContract) {
     fs::write(&candidates_path, candidates).unwrap();
     let roots_path = output.join("roots.tsv");
     write_reference_roots(&root_inputs, &roots_path, &measured).unwrap();
-    let candidate_rows = parse_table(&candidates_path, CANDIDATE_HEADER, 7).unwrap();
+    let candidate_rows = parse_table(&candidates_path, CANDIDATE_HEADER, 8).unwrap();
     let roots = scan_root_path(&roots_path).unwrap();
     fs::write(
         output.join("candidate-readings.tsv"),
@@ -12773,12 +12783,12 @@ mod tests {
     #[test]
     fn checkpoint_reuse_requires_candidate_and_ordered_root_rows() {
         let candidate = concat!(
-            "program\tfield_key\tfield_slot\tordinary_kind\tprimary_class\tcause_flags\troot_count\n",
-            "fixture\tFixture::field0@d0\t0\traw\tabsent\tnull-literal-root\t1\n",
+            "program\tfield_key\tfield_slot\tordinary_kind\tprimary_class\tcause_flags\troot_count\tcopy_lend_mode\n",
+            "fixture\tFixture::field0@d0\t0\traw\tabsent\tnull-literal-root\t1\tbaseline\n",
         );
         let roots = concat!(
-            "population\tprogram\tfield_key\tstore_site\troot_id\troot_label\tcause_flags\tordered_path\n",
-            "census\tfixture\tFixture::field0@d0\tstore\troot\tnull\tnull-literal-root\troot>store\n",
+            "population\tprogram\tfield_key\tstore_site\troot_id\troot_label\tcause_flags\tordered_path\tcopy_lend_mode\n",
+            "census\tfixture\tFixture::field0@d0\tstore\troot\tnull\tnull-literal-root\troot>store\tbaseline\n",
         );
         assert!(validate_reusable_candidate_artifact(
             "fixture",
@@ -12804,12 +12814,12 @@ mod tests {
         let oracle = concat!(
             "data=false\n",
             "candidates_completed=1\n\n",
-            "program\tfield_key\tfield_slot\tordinary_kind\tprimary_class\tcause_flags\troot_count\n",
-            "fixture\tFixture::field0@d0\t0\traw\tabsent\tnull-literal-root\t1\n",
+            "program\tfield_key\tfield_slot\tordinary_kind\tprimary_class\tcause_flags\troot_count\tcopy_lend_mode\n",
+            "fixture\tFixture::field0@d0\t0\traw\tabsent\tnull-literal-root\t1\tbaseline\n",
         );
         let matching = concat!(
-            "program\tfield_key\tfield_slot\tordinary_kind\tprimary_class\tcause_flags\troot_count\n",
-            "fixture\tFixture::field0@d0\t0\traw\tabsent\tnull-literal-root\t1\n",
+            "program\tfield_key\tfield_slot\tordinary_kind\tprimary_class\tcause_flags\troot_count\tcopy_lend_mode\n",
+            "fixture\tFixture::field0@d0\t0\traw\tabsent\tnull-literal-root\t1\tbaseline\n",
         );
         let drifted = matching.replace("\tabsent\t", "\tmixed\t");
 
@@ -13215,7 +13225,7 @@ mod tests {
             process::id()
         ));
         fs::write(&path, "wrong\theader\n").unwrap();
-        assert!(parse_table(&path, CANDIDATE_HEADER, 7).is_err());
+        assert!(parse_table(&path, CANDIDATE_HEADER, 8).is_err());
         fs::remove_file(path).unwrap();
     }
 
@@ -13239,7 +13249,7 @@ mod tests {
 
     #[test]
     fn streaming_root_validation_preserves_schema_identity_count_and_duplicates() {
-        let row = "census\tfixture\tFixture::field0@d0\tstore\troot\tlabel\tstatic-or-interior-root\troot -> store\n";
+        let row = "census\tfixture\tFixture::field0@d0\tstore\troot\tlabel\tstatic-or-interior-root\troot -> store\tbaseline\n";
         let distinct_path = row.replace("root -> store", "root -> copy -> store");
         let valid = format!("{ROOT_HEADER}\n{row}{distinct_path}");
         let summary = scan_root_table(Cursor::new(valid), "streaming fixture").unwrap();
@@ -13276,17 +13286,17 @@ mod tests {
     #[test]
     fn streaming_readings_and_concatenation_are_byte_identical() {
         let candidates_text = concat!(
-            "program\tfield_key\tfield_slot\tordinary_kind\tprimary_class\tcause_flags\troot_count\n",
-            "fixture\tFixture::field0@d0\t0\traw\tmixed\tfield-mediated-allocation|static-or-interior-root|public-setter-reachable\t2\n",
+            "program\tfield_key\tfield_slot\tordinary_kind\tprimary_class\tcause_flags\troot_count\tcopy_lend_mode\n",
+            "fixture\tFixture::field0@d0\t0\traw\tmixed\tfield-mediated-allocation|static-or-interior-root|public-setter-reachable\t2\tbaseline\n",
         );
         let roots_text = concat!(
-            "population\tprogram\tfield_key\tstore_site\troot_id\troot_label\tcause_flags\tordered_path\n",
-            "census\tfixture\tFixture::field0@d0\tstore0\troot0\talloc\tfield-mediated-allocation\talloc -> store0\n",
-            "census\tfixture\tFixture::field0@d0\tstore1\troot1\tstatic\tstatic-or-interior-root|public-setter-reachable\tstatic -> store1\n",
+            "population\tprogram\tfield_key\tstore_site\troot_id\troot_label\tcause_flags\tordered_path\tcopy_lend_mode\n",
+            "census\tfixture\tFixture::field0@d0\tstore0\troot0\talloc\tfield-mediated-allocation\talloc -> store0\tbaseline\n",
+            "census\tfixture\tFixture::field0@d0\tstore1\troot1\tstatic\tstatic-or-interior-root|public-setter-reachable\tstatic -> store1\tbaseline\n",
         );
         let candidates =
-            parse_table_text(candidates_text, CANDIDATE_HEADER, 7, "candidate fixture").unwrap();
-        let roots = parse_table_text(roots_text, ROOT_HEADER, 8, "root fixture").unwrap();
+            parse_table_text(candidates_text, CANDIDATE_HEADER, 8, "candidate fixture").unwrap();
+        let roots = parse_table_text(roots_text, ROOT_HEADER, 9, "root fixture").unwrap();
         let in_memory = render_candidate_readings(&candidates, &roots).unwrap();
         let summary = scan_root_table(Cursor::new(roots_text), "root fixture").unwrap();
         let streaming = render_candidate_readings_from_summary(&candidates, &summary).unwrap();
@@ -13311,9 +13321,9 @@ mod tests {
             verify_manifest(dir).unwrap(),
             "f9c23eddb3b9da283a2ebf82a4839f9f0e28c4d535f69923d38531ad397b90dd"
         );
-        let candidates = parse_table(&dir.join("candidates.tsv"), CANDIDATE_HEADER, 7).unwrap();
+        let candidates = parse_table(&dir.join("candidates.tsv"), CANDIDATE_HEADER, 8).unwrap();
         let roots_text = fs::read_to_string(dir.join("roots.tsv")).unwrap();
-        let roots = parse_table_text(&roots_text, ROOT_HEADER, 8, "manifested BST roots").unwrap();
+        let roots = parse_table_text(&roots_text, ROOT_HEADER, 9, "manifested BST roots").unwrap();
         let in_memory = render_candidate_readings(&candidates, &roots).unwrap();
         let summary = scan_root_path(&dir.join("roots.tsv")).unwrap();
         let streaming = render_candidate_readings_from_summary(&candidates, &summary).unwrap();
@@ -15038,14 +15048,15 @@ mod tests {
         ::utils::compilation::run_compiler_on_str(source, |tcx| {
             let program = super::super::collect_program(tcx);
             let slots = CrateSlots::build(&program);
-            let crate_ctxt = CrateCtxt::new(&program);
             let solver = KindSolver::new(&slots);
             let (_, captured_export) = with_bo_export(|| {
-                emit_crate_ownership_constraints(
-                    &crate_ctxt,
+                construct_bo_into(
+                    &program,
                     &slots,
                     &compute_origins(&program),
+                    &MutFacts::all_mut(),
                     &solver,
+                    CopyLendMode::Baseline,
                 )
                 .expect("fixture ownership emission")
             });
@@ -15819,7 +15830,7 @@ mod tests {
         fs::write(
             &input,
             format!(
-                "{ROOT_HEADER}\ncensus\tbst\tkeep::field0@d0\tstore-a\troot-a\tlabel-a\tflag-a\tpath-a\ncensus\tbst\tdefer::field0@d0\tstore-b\troot-b\tlabel-b\tflag-b\tpath-b\nexception\tbst\tkeep::field0@d0\tstore-c\troot-c\tlabel-c\tflag-c\tpath-c\n"
+                "{ROOT_HEADER}\ncensus\tbst\tkeep::field0@d0\tstore-a\troot-a\tlabel-a\tflag-a\tpath-a\tbaseline\ncensus\tbst\tdefer::field0@d0\tstore-b\troot-b\tlabel-b\tflag-b\tpath-b\tbaseline\nexception\tbst\tkeep::field0@d0\tstore-c\troot-c\tlabel-c\tflag-c\tpath-c\tbaseline\n"
             ),
         )
         .unwrap();
@@ -15832,7 +15843,7 @@ mod tests {
         assert_eq!(
             fs::read_to_string(&output).unwrap(),
             format!(
-                "{ROOT_HEADER}\ncensus\tbst\tkeep::field0@d0\tstore-a\troot-a\tlabel-a\tflag-a\tpath-a\n"
+                "{ROOT_HEADER}\ncensus\tbst\tkeep::field0@d0\tstore-a\troot-a\tlabel-a\tflag-a\tpath-a\tbaseline\n"
             )
         );
 

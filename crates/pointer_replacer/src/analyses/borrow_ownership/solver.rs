@@ -160,6 +160,7 @@ impl CoreTracker {
 /// emission site cannot invent an unlisted family silently.
 pub(crate) const CORE_LABEL_FAMILIES: &[&str] = &[
     "kind-pin",
+    "kind-copy-arm",
     "kind-equate",
     // NOTE: matching is first-containment (`family_of`), so the longer
     // "field-and-rev" MUST precede its prefix "field-and".
@@ -177,6 +178,9 @@ pub(crate) const CORE_LABEL_FAMILIES: &[&str] = &[
     // §NB1 per-site safety monotonicity (no substring overlap with the others).
     "safe-mono",
     "i1-adjacency",
+    "own-copy-for-deref-lend",
+    "own-copy-current",
+    "own-copy-lend",
     "own-linear",
     "own-assume",
     "own-equal",
@@ -430,6 +434,49 @@ impl KindSolver {
             || format!("kind-equate({a:?},{b:?},own)"),
             &!va.own.xor(&vb.own),
         );
+    }
+
+    /// A12 phase-1 depth-zero copy disjunction. The destination (`lhs`) and source (`rhs`)
+    /// either keep the current equal-kind reading, or take the owner-to-shared-reference lend
+    /// reading `lhs.ref && rhs.own`. The lend guard is derived from the one-hot kind bits rather
+    /// than allocated as a free selector, so it adds no independent model choice.
+    pub(crate) fn lend_or_equate(&self, lhs: SlotRef, rhs: SlotRef) {
+        let lend = self.lend_guard(lhs, rhs);
+        let lhs_vars = self
+            .vars
+            .get(&lhs)
+            .unwrap_or_else(|| panic!("unknown slot: {lhs:?}"));
+        let rhs_vars = self
+            .vars
+            .get(&rhs)
+            .unwrap_or_else(|| panic!("unknown slot: {rhs:?}"));
+        let tracker = self.tracker.as_ref();
+
+        for (bit, equal) in [
+            ("raw", !lhs_vars.raw.xor(&rhs_vars.raw)),
+            ("ref", !lhs_vars.ref_.xor(&rhs_vars.ref_)),
+            ("own", !lhs_vars.own.xor(&rhs_vars.own)),
+        ] {
+            assert_hard(
+                &self.solver,
+                tracker,
+                || format!("kind-copy-arm({lhs:?},{rhs:?},{bit})"),
+                &Bool::or(&[&lend, &equal]),
+            );
+        }
+    }
+
+    /// The derived A12 branch guard, shared by kind coherence and ownership transfer.
+    pub(crate) fn lend_guard(&self, lhs: SlotRef, rhs: SlotRef) -> Bool {
+        let lhs_vars = self
+            .vars
+            .get(&lhs)
+            .unwrap_or_else(|| panic!("unknown slot: {lhs:?}"));
+        let rhs_vars = self
+            .vars
+            .get(&rhs)
+            .unwrap_or_else(|| panic!("unknown slot: {rhs:?}"));
+        Bool::and(&[&lhs_vars.ref_, &rhs_vars.own])
     }
 
     /// §9.10.2 field-ownership constraint: a struct field slot is one crate-wide slot that
@@ -1228,6 +1275,89 @@ impl<'opt> BoOwnDatabase<'opt> {
         &self.z3_ast[var]
     }
 
+    /// A12's R1 ownership disjunction for one depth-zero transfer. `lend` is the exact kind-layer
+    /// expression returned by [`KindSolver::lend_guard`]. When false, these are the existing Copy
+    /// linearity or Move constraints. When true, the destination cannot own and the source owns
+    /// both before and after the site.
+    pub(crate) fn push_guarded_copy_constraints(
+        &mut self,
+        lend: &Bool,
+        destination_def: Var,
+        source_def: Var,
+        source_use: Var,
+        ensure_move: bool,
+    ) {
+        let destination_def = &self.z3_ast[destination_def];
+        let source_def = &self.z3_ast[source_def];
+        let source_use = &self.z3_ast[source_use];
+
+        if ensure_move {
+            assert_hard(
+                self.optimize,
+                self.tracker,
+                || "own-copy-current-move-equal".to_owned(),
+                &Bool::or(&[lend, &!destination_def.xor(source_use)]),
+            );
+            assert_hard(
+                self.optimize,
+                self.tracker,
+                || "own-copy-current-move-source-cleared".to_owned(),
+                &Bool::or(&[lend, &!source_def]),
+            );
+        } else {
+            for (clause, suffix) in [
+                (Bool::or(&[&!destination_def, &!source_def]), "exclusive"),
+                (Bool::or(&[&!destination_def, source_use]), "destination"),
+                (
+                    Bool::or(&[destination_def, source_def, &!source_use]),
+                    "conservation",
+                ),
+                (Bool::or(&[&!source_def, source_use]), "source"),
+            ] {
+                assert_hard(
+                    self.optimize,
+                    self.tracker,
+                    || format!("own-copy-current-linear-{suffix}"),
+                    &Bool::or(&[lend, &clause]),
+                );
+            }
+        }
+
+        let not_lend = !lend;
+        for (clause, suffix) in [
+            (!destination_def, "destination-not-owning"),
+            (source_use.clone(), "source-use-owning"),
+            (source_def.clone(), "source-def-owning"),
+        ] {
+            assert_hard(
+                self.optimize,
+                self.tracker,
+                || format!("own-copy-lend-{suffix}"),
+                &Bool::or(&[&not_lend, &clause]),
+            );
+        }
+    }
+
+    pub(crate) fn push_guarded_lend_source_constraints(
+        &mut self,
+        lend: &Bool,
+        source_def: Var,
+        source_use: Var,
+    ) {
+        let not_lend = !lend;
+        for (clause, suffix) in [
+            (self.z3_ast[source_use].clone(), "source-use-owning"),
+            (self.z3_ast[source_def].clone(), "source-def-owning"),
+        ] {
+            assert_hard(
+                self.optimize,
+                self.tracker,
+                || format!("own-copy-for-deref-lend-{suffix}"),
+                &Bool::or(&[&not_lend, &clause]),
+            );
+        }
+    }
+
     /// Selector literals for the emitted `source` ownerships. Assume all of them
     /// to reproduce the hard source; the relax loop drops some on UNSAT.
     pub(crate) fn source_selectors(&self) -> &[Bool] {
@@ -1303,6 +1433,27 @@ impl Database for BoOwnDatabase<'_> {
         assert_hard(self.optimize, self.tracker, label, &Bool::or(&[&!x, z]));
         assert_hard(self.optimize, self.tracker, label, &Bool::or(&[x, y, &!z]));
         assert_hard(self.optimize, self.tracker, label, &Bool::or(&[&!y, z]));
+    }
+
+    fn push_guarded_copy(
+        &mut self,
+        lend: &Bool,
+        destination_def: Var,
+        source_def: Var,
+        source_use: Var,
+        ensure_move: bool,
+    ) {
+        self.push_guarded_copy_constraints(
+            lend,
+            destination_def,
+            source_def,
+            source_use,
+            ensure_move,
+        );
+    }
+
+    fn push_guarded_lend_source(&mut self, lend: &Bool, source_def: Var, source_use: Var) {
+        self.push_guarded_lend_source_constraints(lend, source_def, source_use);
     }
 
     fn push_assume_impl(&mut self, x: Var, sign: bool) {

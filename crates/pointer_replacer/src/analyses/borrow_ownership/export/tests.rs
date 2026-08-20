@@ -164,6 +164,7 @@ fn export_off_records_nothing() {
         },
         run_local_handle: 0,
         kind: LoanKind::NoProvenance,
+        class: LoanClass::Existing,
         invalid: false,
     });
     assert!(!capturing(), "capture must still be inactive");
@@ -843,6 +844,7 @@ fn capture_solve_l2(
                 &solver,
                 &selectors,
                 true,
+                None,
             )
         });
         (model, stats, export)
@@ -967,6 +969,7 @@ fn l2_door_rejects_a_tracked_solver() {
             &solver,
             &selectors,
             true,
+            None,
         );
         None::<()>
     })
@@ -1076,6 +1079,7 @@ fn injected_push_order_permutation_preserves_keys() {
             },
             run_local_handle: handle,
             kind: LoanKind::Mut,
+            class: LoanClass::Existing,
             invalid: false,
         }
     }

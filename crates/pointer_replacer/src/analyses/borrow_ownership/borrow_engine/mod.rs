@@ -43,13 +43,16 @@ mod places_conflict;
 #[cfg(test)]
 pub(crate) use conflicts::{borrow_conflicts, borrow_conflicts_replaying};
 pub(crate) use conflicts::{
-    borrow_conflicts_replaying_with_flows, borrow_conflicts_replaying_witnessed,
+    borrow_conflicts_replaying_with_flows, borrow_conflicts_replaying_with_flows_and_copy_lends,
+    borrow_conflicts_replaying_witnessed, borrow_conflicts_replaying_witnessed_with_copy_lends,
     borrow_conflicts_with_flows,
 };
 // §NB4-R: the compose/type-check decision, re-exported so its fallback is unit-testable in isolation
 // (grouping-independent — see `nb4r_route_compose_fallback_on_type_mismatch`).
 #[cfg(test)]
 pub(crate) use invalidates::{RoutedCompose, route_compose};
+#[cfg(test)]
+pub(crate) use origin_replay::selected_copy_lend_contains;
 
 /// §NB3-3a — routes the `borrow_verify` seam (and the `bo_c1` mirror) to the forked BO engine vs
 /// the production `borrow` engine. **Default = `Fork` (flipped at 3a merge, A1).** During 3a dev the
