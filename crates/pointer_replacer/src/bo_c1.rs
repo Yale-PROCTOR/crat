@@ -8641,6 +8641,541 @@ pub unsafe fn ordinary_boundary() -> i32 {
         )
         .unwrap_or_else(|error| error.raise());
     }
+
+    // Item 15's user/seat-approved case ledger. These fixtures remain PROPOSED, so they are
+    // ignored by the ordinary suite and are run one at a time by exact name. Every row enters
+    // through `run_bo`: this is intentionally a production-wiring ledger, not another direct
+    // construction-harness matrix.
+    #[derive(Clone, Copy)]
+    enum Item15Verdict {
+        Lend { pairs: usize, selections: usize },
+        Repair { pairs: usize },
+        Unselected { pairs: usize },
+        Baseline,
+    }
+
+    fn item15_row(source: &str, expected: Item15Verdict) {
+        use crate::analyses::borrow_ownership::construction::CopyLendMode;
+
+        ::utils::compilation::run_compiler_on_str(source, |tcx| {
+            let row = CopyLendMode::LendArm.with_override(|| run_bo(tcx, Duration::ZERO));
+            assert_eq!(row.get("copy_lend_mode"), Some("lend_arm"));
+            assert_eq!(row.get("status"), Some("ok"));
+            let metric = |name: &str| {
+                row.get(name)
+                    .unwrap_or_else(|| panic!("missing item-15 receipt field {name}"))
+                    .parse::<usize>()
+                    .unwrap_or_else(|error| panic!("invalid item-15 receipt field {name}: {error}"))
+            };
+            match expected {
+                Item15Verdict::Lend { pairs, selections } => {
+                    assert_eq!(metric("copy_lend_eligible_pairs"), pairs);
+                    assert_eq!(metric("copy_lend_selected_sites"), selections);
+                    assert_eq!(metric("copy_lend_replay_selections"), selections);
+                    assert!(metric("n_own") >= 1, "selected lend must retain an owner");
+                    assert!(
+                        metric("n_ref") >= selections,
+                        "selected lends must produce shared destinations"
+                    );
+                }
+                Item15Verdict::Repair { pairs } => {
+                    assert_eq!(metric("copy_lend_eligible_pairs"), pairs);
+                    assert_eq!(metric("copy_lend_selected_sites"), 0);
+                    assert_eq!(metric("copy_lend_replay_selections"), 0);
+                    assert!(
+                        metric("commits_conflict") > 0,
+                        "repair verdict must be witnessed by a conflict commit"
+                    );
+                }
+                Item15Verdict::Unselected { pairs } => {
+                    assert_eq!(metric("copy_lend_eligible_pairs"), pairs);
+                    assert_eq!(metric("copy_lend_selected_sites"), 0);
+                    assert_eq!(metric("copy_lend_replay_selections"), 0);
+                }
+                Item15Verdict::Baseline => {
+                    assert_eq!(metric("copy_lend_eligible_pairs"), 0);
+                    assert_eq!(metric("copy_lend_selected_sites"), 0);
+                    assert_eq!(metric("copy_lend_replay_selections"), 0);
+                }
+            }
+        })
+        .unwrap_or_else(|error| error.raise());
+    }
+
+    macro_rules! item15_source {
+        ($body:literal) => {
+            concat!(
+                "unsafe extern \"C\" {\n",
+                "    fn malloc(size: usize) -> *mut core::ffi::c_void;\n",
+                "    fn free(p: *mut core::ffi::c_void);\n",
+                "    fn realloc(p: *mut core::ffi::c_void, size: usize) -> *mut core::ffi::c_void;\n",
+                "}\n",
+                $body
+            )
+        };
+    }
+
+    #[test]
+    #[ignore = "PROPOSED item-15 ledger; run one case at a time"]
+    fn item15_case_l01() {
+        item15_row(
+            item15_source!(
+                r#"pub unsafe fn f() -> i32 {
+    let p = unsafe { malloc(4) } as *mut i32;
+    let q = p;
+    let value = unsafe { *q };
+    unsafe { free(p as *mut core::ffi::c_void) };
+    value
+}"#
+            ),
+            Item15Verdict::Lend {
+                pairs: 1,
+                selections: 1,
+            },
+        );
+    }
+
+    #[test]
+    #[ignore = "PROPOSED item-15 ledger; run one case at a time"]
+    fn item15_case_l02() {
+        item15_row(
+            item15_source!(
+                r#"pub unsafe fn f() -> i32 {
+    let p = unsafe { malloc(4) } as *mut i32;
+    let q = p;
+    unsafe { *p = 1 };
+    let value = unsafe { *q };
+    unsafe { free(p as *mut core::ffi::c_void) };
+    value
+}"#
+            ),
+            Item15Verdict::Repair { pairs: 1 },
+        );
+    }
+
+    #[test]
+    #[ignore = "PROPOSED item-15 ledger; run one case at a time"]
+    fn item15_case_l03() {
+        item15_row(
+            item15_source!(
+                r#"pub unsafe fn f() -> i32 {
+    let p = unsafe { malloc(4) } as *mut i32;
+    let q = p;
+    unsafe { free(p as *mut core::ffi::c_void) };
+    unsafe { *q }
+}"#
+            ),
+            Item15Verdict::Repair { pairs: 1 },
+        );
+    }
+
+    #[test]
+    #[ignore = "PROPOSED item-15 ledger; run one case at a time"]
+    fn item15_case_l04() {
+        item15_row(
+            item15_source!(
+                r#"pub unsafe fn f() -> i32 {
+    let p = unsafe { malloc(4) } as *mut i32;
+    let mut q = p;
+    let value = unsafe { *q };
+    q = core::ptr::null_mut();
+    let _ = q;
+    unsafe { free(p as *mut core::ffi::c_void) };
+    value
+}"#
+            ),
+            Item15Verdict::Lend {
+                pairs: 1,
+                selections: 1,
+            },
+        );
+    }
+
+    #[test]
+    #[ignore = "PROPOSED item-15 ledger; run one case at a time"]
+    fn item15_case_l05() {
+        item15_row(
+            item15_source!(
+                r#"pub unsafe fn f() {
+    let p = unsafe { malloc(4) } as *mut i32;
+    let q = p;
+    unsafe { free(q as *mut core::ffi::c_void) };
+}"#
+            ),
+            Item15Verdict::Baseline,
+        );
+    }
+
+    #[test]
+    #[ignore = "PROPOSED item-15 ledger; run one case at a time"]
+    fn item15_case_l06() {
+        item15_row(
+            item15_source!(
+                r#"pub unsafe fn f() -> i32 {
+    let p = unsafe { malloc(4) } as *mut i32;
+    let q = p;
+    unsafe { *q = 1 };
+    unsafe { *q }
+}"#
+            ),
+            Item15Verdict::Baseline,
+        );
+    }
+
+    #[test]
+    #[ignore = "PROPOSED item-15 ledger; run one case at a time"]
+    fn item15_case_l07() {
+        item15_row(
+            item15_source!(
+                r#"unsafe fn observe(p: *const i32) { let _ = unsafe { *p }; }
+pub unsafe fn f() -> i32 {
+    let p = unsafe { malloc(4) } as *const i32;
+    let q = p;
+    unsafe { observe(q) };
+    unsafe { *q }
+}"#
+            ),
+            Item15Verdict::Baseline,
+        );
+    }
+
+    #[test]
+    #[ignore = "PROPOSED item-15 ledger; run one case at a time"]
+    fn item15_case_l08() {
+        item15_row(
+            item15_source!(
+                r#"unsafe extern "C" { fn opaque(p: *const i32); }
+pub unsafe fn f() -> i32 {
+    let p = unsafe { malloc(4) } as *const i32;
+    let q = p;
+    unsafe { opaque(q) };
+    unsafe { *q }
+}"#
+            ),
+            Item15Verdict::Baseline,
+        );
+    }
+
+    #[test]
+    #[ignore = "PROPOSED item-15 ledger; run one case at a time"]
+    fn item15_case_l09() {
+        item15_row(
+            item15_source!(
+                r#"pub unsafe fn f() -> *const i32 {
+    let p = unsafe { malloc(4) } as *const i32;
+    let q = p;
+    q
+}"#
+            ),
+            Item15Verdict::Baseline,
+        );
+    }
+
+    #[test]
+    #[ignore = "PROPOSED item-15 ledger; run one case at a time"]
+    fn item15_case_l10() {
+        item15_row(
+            item15_source!(
+                r#"pub struct Holder { pub ptr: *const i32 }
+pub unsafe fn f() -> i32 {
+    let p = unsafe { malloc(4) } as *const i32;
+    let q = p;
+    let mut holder = Holder { ptr: core::ptr::null() };
+    holder.ptr = q;
+    unsafe { *holder.ptr }
+}"#
+            ),
+            Item15Verdict::Baseline,
+        );
+    }
+
+    #[test]
+    #[ignore = "PROPOSED item-15 ledger; run one case at a time"]
+    fn item15_case_l11() {
+        use crate::analyses::borrow_ownership::construction::CopyLendMode;
+
+        const SOURCE: &str = item15_source!(
+            r#"pub unsafe fn f() -> i32 {
+    let p = unsafe { malloc(4) } as *const i32;
+    let q = p;
+    unsafe { *q }
+}"#
+        );
+        item15_row(
+            SOURCE,
+            Item15Verdict::Lend {
+                pairs: 1,
+                selections: 1,
+            },
+        );
+        ::utils::compilation::run_compiler_on_str(SOURCE, |tcx| {
+            let baseline = CopyLendMode::Baseline.with_override(|| run_bo(tcx, Duration::ZERO));
+            assert_eq!(baseline.get("status"), Some("ok"));
+            assert_eq!(baseline.get("copy_lend_mode"), Some("baseline"));
+            assert_eq!(baseline.get("copy_lend_eligible_pairs"), Some("0"));
+            assert_eq!(baseline.get("copy_lend_selected_sites"), Some("0"));
+            assert_eq!(baseline.get("copy_lend_replay_selections"), Some("0"));
+        })
+        .unwrap_or_else(|error| error.raise());
+    }
+
+    #[test]
+    #[ignore = "PROPOSED item-15 ledger; run one case at a time"]
+    fn item15_case_l12() {
+        item15_row(
+            item15_source!(
+                r#"pub unsafe fn f() -> i32 {
+    let p = unsafe { malloc(4) } as *mut i32;
+    let q = p;
+    let _new = unsafe { realloc(p as *mut core::ffi::c_void, 8) };
+    unsafe { *q }
+}"#
+            ),
+            Item15Verdict::Baseline,
+        );
+    }
+
+    #[test]
+    #[ignore = "PROPOSED item-15 ledger; run one case at a time"]
+    fn item15_case_l13() {
+        item15_row(
+            item15_source!(
+                r#"pub unsafe fn f() -> i32 {
+    let p = unsafe { malloc(4) } as *mut i32;
+    let r = p;
+    let q = p;
+    let value = unsafe { *r + *q };
+    unsafe { free(p as *mut core::ffi::c_void) };
+    value
+}"#
+            ),
+            Item15Verdict::Lend {
+                pairs: 2,
+                selections: 2,
+            },
+        );
+    }
+
+    #[test]
+    #[ignore = "PROPOSED item-15 ledger; run one case at a time"]
+    fn item15_case_l14() {
+        item15_row(
+            item15_source!(
+                r#"pub unsafe fn f() -> i32 {
+    let p = unsafe { malloc(4) } as *mut i32;
+    let r = p;
+    let q = p;
+    unsafe { *r = 1 };
+    let value = unsafe { *q };
+    unsafe { free(p as *mut core::ffi::c_void) };
+    value
+}"#
+            ),
+            Item15Verdict::Repair { pairs: 1 },
+        );
+    }
+
+    #[test]
+    #[ignore = "PROPOSED item-15 ledger; run one case at a time"]
+    fn item15_case_n01() {
+        item15_row(
+            r#"pub unsafe fn f(src: *mut *mut i32, dst: *mut *mut i32) {
+    unsafe { *dst = *src };
+}"#,
+            Item15Verdict::Baseline,
+        );
+    }
+
+    #[test]
+    #[ignore = "PROPOSED item-15 ledger; run one case at a time"]
+    fn item15_case_n02() {
+        // The MIR assertion prevents this row from passing after source lowering ceases to exercise
+        // the ledger's named `CopyForDeref` arm.
+        use rustc_middle::mir::{Rvalue, StatementKind};
+
+        use crate::analyses::borrow_ownership::construction::CopyLendMode;
+
+        ::utils::compilation::run_compiler_on_str(
+            item15_source!(
+                r#"pub unsafe fn f() -> i32 {
+    let p = unsafe { malloc(4) } as *mut i32;
+    unsafe { *p }
+}"#
+            ),
+            |tcx| {
+                let program = collect_program(tcx);
+                assert!(
+                    program.functions.iter().any(|did| {
+                        tcx.mir_drops_elaborated_and_const_checked(*did)
+                            .borrow()
+                            .basic_blocks
+                            .iter()
+                            .flat_map(|data| &data.statements)
+                            .any(|statement| {
+                                matches!(
+                                    statement.kind,
+                                    StatementKind::Assign(box (_, Rvalue::CopyForDeref(_)))
+                                )
+                            })
+                    }),
+                    "N02 fixture must contain a CopyForDeref rvalue"
+                );
+                let row = CopyLendMode::LendArm.with_override(|| run_bo(tcx, Duration::ZERO));
+                assert_eq!(row.get("status"), Some("ok"));
+                assert_eq!(row.get("copy_lend_mode"), Some("lend_arm"));
+                assert_eq!(row.get("copy_lend_eligible_pairs"), Some("1"));
+                assert_eq!(row.get("copy_lend_selected_sites"), Some("1"));
+                assert_eq!(row.get("copy_lend_replay_selections"), Some("1"));
+            },
+        )
+        .unwrap_or_else(|error| error.raise());
+    }
+
+    #[test]
+    #[ignore = "PROPOSED item-15 ledger; run one case at a time"]
+    fn item15_case_f01() {
+        item15_row(
+            item15_source!(
+                r#"unsafe fn first(p: *const i32) { let _ = unsafe { *p }; }
+unsafe fn second(p: *const i32) { let _ = unsafe { *p }; }
+pub unsafe fn f() -> i32 {
+    let p = unsafe { malloc(4) } as *const i32;
+    let q = p;
+    unsafe { first(q) };
+    unsafe { second(q) };
+    unsafe { *q }
+}"#
+            ),
+            Item15Verdict::Baseline,
+        );
+    }
+
+    #[test]
+    #[ignore = "PROPOSED item-15 ledger; run one case at a time"]
+    fn item15_case_s01() {
+        item15_row(
+            item15_source!(
+                r#"pub struct Holder { pub ptr: *const i32 }
+pub unsafe fn f() -> *const i32 {
+    let p = unsafe { malloc(4) } as *const i32;
+    let q = p;
+    let mut holder = Holder { ptr: core::ptr::null() };
+    holder.ptr = q;
+    holder.ptr
+}"#
+            ),
+            Item15Verdict::Baseline,
+        );
+    }
+
+    #[test]
+    #[ignore = "PROPOSED item-15 ledger; run one case at a time"]
+    fn item15_case_s02() {
+        item15_row(
+            item15_source!(
+                r#"pub struct Holder { pub ptr: *mut i32 }
+pub unsafe fn f() -> i32 {
+    let mut stack = 1;
+    let mut holder = Holder { ptr: &mut stack };
+    let mut p = unsafe { malloc(4) } as *mut i32;
+    let owner = p;
+    let mut q = p;
+    let first = unsafe { *q };
+    p = holder.ptr;
+    q = p;
+    let second = unsafe { *q };
+    unsafe { free(owner as *mut core::ffi::c_void) };
+    first + second
+}"#
+            ),
+            Item15Verdict::Unselected { pairs: 1 },
+        );
+    }
+
+    #[test]
+    #[ignore = "PROPOSED item-15 ledger; run one case at a time"]
+    fn item15_case_x01() {
+        use crate::analyses::borrow_ownership::{construction::CopyLendMode, export::LoanClass};
+
+        ::utils::compilation::run_compiler_on_str(
+            item15_source!(
+                r#"pub unsafe fn f() -> i32 {
+    let p = unsafe { malloc(4) } as *mut i32;
+    let q = p;
+    let value = unsafe { *q };
+    unsafe { free(p as *mut core::ffi::c_void) };
+    value
+}"#
+            ),
+            |tcx| {
+                let (row, export) =
+                    crate::analyses::borrow_ownership::export::with_bo_export(|| {
+                        CopyLendMode::LendArm.with_override(|| run_bo(tcx, Duration::ZERO))
+                    });
+                assert_eq!(row.get("status"), Some("ok"));
+                assert_eq!(row.get("copy_lend_mode"), Some("lend_arm"));
+                assert_eq!(row.get("copy_lend_selected_sites"), Some("1"));
+                let typed = export
+                    .loans
+                    .iter()
+                    .filter(|loan| loan.class == LoanClass::CopyLend)
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    typed.len(),
+                    1,
+                    "exactly one loan identity must be typed CopyLend"
+                );
+                assert!(
+                    export.loans.iter().any(|loan| {
+                        loan.class == LoanClass::Existing
+                            && loan.key.fn_did == typed[0].key.fn_did
+                            && loan.key.location == typed[0].key.location
+                    }),
+                    "X01 fixture must retain a same-location untyped companion loan"
+                );
+            },
+        )
+        .unwrap_or_else(|error| error.raise());
+    }
+
+    struct Item15EnvRestore {
+        key: &'static str,
+        old: Option<std::ffi::OsString>,
+    }
+
+    impl Drop for Item15EnvRestore {
+        fn drop(&mut self) {
+            unsafe {
+                match &self.old {
+                    Some(value) => std::env::set_var(self.key, value),
+                    None => std::env::remove_var(self.key),
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "PROPOSED item-15 ledger; run one case at a time"]
+    fn item15_case_x02() {
+        let key = "CRAT_NB4R_ROUTING";
+        let _restore = Item15EnvRestore {
+            key,
+            old: std::env::var_os(key),
+        };
+        unsafe { std::env::set_var(key, "off") };
+        assert_eq!(std::env::var(key).as_deref(), Ok("off"));
+        item15_row(
+            item15_source!(
+                r#"pub unsafe fn f() -> i32 {
+    let p = unsafe { malloc(4) } as *mut i32;
+    let q = p;
+    unsafe { free(p as *mut core::ffi::c_void) };
+    unsafe { *q }
+}"#
+            ),
+            Item15Verdict::Repair { pairs: 1 },
+        );
+    }
 }
 
 /// Shared C2Rust delete-node fixture (was defined among the retired mirror tests; several surviving
