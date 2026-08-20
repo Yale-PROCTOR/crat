@@ -40,6 +40,13 @@ pub(super) struct NativeInference<'tcx> {
     pub(super) copy_lends: DenseBitSet<Loan>,
 }
 
+fn selected_copy_lend_contains(
+    selected: &FxHashSet<SelectedCopyLendLoan>,
+    identity: &SelectedCopyLendLoan,
+) -> bool {
+    selected.contains(identity)
+}
+
 impl<'tcx> Deref for NativeInference<'tcx> {
     type Target = BorrowInferenceResults<'tcx>;
 
@@ -114,11 +121,14 @@ impl<'a> NativeBorrowContext<'a> {
                     arg_index,
                 },
             };
-            if selected_copy_lends.contains(&SelectedCopyLendLoan {
-                location: export::location_key(data.location()),
-                borrowed: export::PlaceKey::from_place(data.borrowed),
-                borrower,
-            }) {
+            if selected_copy_lend_contains(
+                selected_copy_lends,
+                &SelectedCopyLendLoan {
+                    location: export::location_key(data.location()),
+                    borrowed: export::PlaceKey::from_place(data.borrowed),
+                    borrower,
+                },
+            ) {
                 copy_lends.insert(loan);
             }
         }
@@ -146,6 +156,47 @@ impl<'a> NativeBorrowContext<'a> {
             facts: inference,
             copy_lends,
         }
+    }
+}
+
+#[cfg(test)]
+mod copy_lend_identity_tests {
+    use rustc_hash::FxHashSet;
+    use rustc_middle::mir::Local;
+
+    use super::selected_copy_lend_contains;
+    use crate::analyses::borrow_ownership::{
+        coherence::SelectedCopyLendLoan,
+        export::{BorrowerKind, OwnerKey, PlaceKey},
+        l2::MirLocationKey,
+    };
+
+    #[test]
+    fn same_location_companion_is_not_copy_lend() {
+        let selected = SelectedCopyLendLoan {
+            location: MirLocationKey::new(3, 7),
+            borrowed: PlaceKey {
+                local: Local::from_u32(1),
+                proj: Vec::new(),
+            },
+            borrower: BorrowerKind::Assign {
+                owner: OwnerKey::Local(2),
+            },
+        };
+        let companion = SelectedCopyLendLoan {
+            location: selected.location,
+            borrowed: PlaceKey {
+                local: Local::from_u32(9),
+                proj: Vec::new(),
+            },
+            borrower: selected.borrower,
+        };
+        let selected_set = FxHashSet::from_iter([selected.clone()]);
+        assert!(selected_copy_lend_contains(&selected_set, &selected));
+        assert!(
+            !selected_copy_lend_contains(&selected_set, &companion),
+            "same-location companion must retain Existing loan semantics"
+        );
     }
 }
 
