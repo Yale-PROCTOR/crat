@@ -947,10 +947,21 @@ mod nb5o_tests {
     fn a5_w12_parameter_overlap_changes_no_loan_identity_or_class() {
         use crate::analyses::borrow_ownership::export::{BorrowerKind, LoanClass, with_bo_export};
 
-        let code = "unsafe fn f(x: *mut i32, y: *mut i32) { *x = *y + 1; }";
+        let code = r#"
+unsafe fn g(p: *mut i32) { *p = 9; }
+unsafe fn f(p: *mut i32) -> i32 {
+    g(p);
+    *p
+}
+"#;
         ::utils::compilation::run_compiler_on_str(code, |tcx| {
             let program = program(tcx);
-            let function = program.functions[0];
+            let function = program
+                .functions
+                .iter()
+                .copied()
+                .find(|&did| tcx.item_name(did.to_def_id()).as_str() == "f")
+                .expect("CALL_ARG function f");
             let flows = crate::analyses::borrow_ownership::origin_flow::analyze_program_origin_flow(
                 &program,
             );
@@ -960,7 +971,10 @@ mod nb5o_tests {
                 ParameterOverlap::from_pairs([(Local::from_usize(1), Local::from_usize(2))]),
             )]);
 
-            let (baseline_edges, baseline_export) = with_bo_export(|| {
+            // Conflict equality is deliberately excluded. W1 owns that
+            // territory and requires A5 to add parameter-overlap conflicts;
+            // H3 compares the complete old-loan observation only.
+            let (_, baseline_export) = with_bo_export(|| {
                 borrow_conflicts_replaying_with_flows_and_copy_lends(
                     &program,
                     &flows,
@@ -971,7 +985,7 @@ mod nb5o_tests {
                     &selected,
                 )
             });
-            let (precise_edges, precise_export) = with_bo_export(|| {
+            let (_, precise_export) = with_bo_export(|| {
                 borrow_conflicts_replaying_with_flows_and_parameter_overlap(
                     &program,
                     &flows,
@@ -984,10 +998,9 @@ mod nb5o_tests {
                 )
             });
 
-            assert_eq!(canonical(precise_edges), canonical(baseline_edges));
             assert!(
                 !baseline_export.loans.is_empty(),
-                "fixture exported no loans"
+                "CALL_ARG structural precondition: existing old-loan population"
             );
             assert!(
                 baseline_export
@@ -996,13 +1009,13 @@ mod nb5o_tests {
                     .any(|loan| matches!(loan.key.borrower, BorrowerKind::CallArg { .. })),
                 "fixture must carry an existing CallArg population"
             );
-            assert_eq!(precise_export.loans, baseline_export.loans);
             assert!(
-                precise_export
+                baseline_export
                     .loans
                     .iter()
                     .all(|loan| loan.class == LoanClass::Existing)
             );
+            assert_eq!(precise_export.loans, baseline_export.loans);
         })
         .unwrap();
     }
