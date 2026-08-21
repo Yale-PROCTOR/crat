@@ -767,6 +767,7 @@ fn sampled_attribution_tables(ledgers: &[(String, String)]) -> (String, String) 
     let mut aggregate_population = BTreeMap::<String, usize>::new();
     let mut aggregate_sampled = BTreeMap::<String, usize>::new();
     let mut aggregate_unknown = BTreeMap::<String, usize>::new();
+    let mut aggregate_exhaustive = BTreeMap::<String, bool>::new();
     let mut aggregate_families = BTreeMap::<(String, String), usize>::new();
 
     for (program, ledger) in ledgers {
@@ -843,6 +844,10 @@ fn sampled_attribution_tables(ledgers: &[(String, String)]) -> (String, String) 
                 .or_default() += losses.len();
             *aggregate_sampled.entry(transition.to_owned()).or_default() += sampled.len();
             *aggregate_unknown.entry(transition.to_owned()).or_default() += unknown;
+            aggregate_exhaustive
+                .entry(transition.to_owned())
+                .and_modify(|all| *all &= scope == "EXHAUSTIVE")
+                .or_insert(scope == "EXHAUSTIVE");
             for (family, incidence) in &families {
                 if family != "none" {
                     *aggregate_families
@@ -872,6 +877,15 @@ fn sampled_attribution_tables(ledgers: &[(String, String)]) -> (String, String) 
         let population = aggregate_population.get(transition).copied().unwrap_or(0);
         let sampled = aggregate_sampled.get(transition).copied().unwrap_or(0);
         let unknown = aggregate_unknown.get(transition).copied().unwrap_or(0);
+        let scope = if aggregate_exhaustive
+            .get(transition)
+            .copied()
+            .unwrap_or(true)
+        {
+            "EXHAUSTIVE"
+        } else {
+            "SAMPLED"
+        };
         let families = aggregate_families
             .iter()
             .filter(|((candidate, _), _)| candidate == transition)
@@ -889,10 +903,10 @@ fn sampled_attribution_tables(ledgers: &[(String, String)]) -> (String, String) 
                 incidence as f64 * 100.0 / sampled as f64
             };
             tsv.push_str(&format!(
-                "ALL_FIVE\t{transition}\tSAMPLED\t{population}\t{sampled}\t{unknown}\t{family}\t{incidence}\t{percent:.2}\tlend_arm\t{SAMPLE_K}\n"
+                "ALL_FIVE\t{transition}\t{scope}\t{population}\t{sampled}\t{unknown}\t{family}\t{incidence}\t{percent:.2}\tlend_arm\t{SAMPLE_K}\n"
             ));
             markdown.push_str(&format!(
-                "| **ALL FIVE** | {transition} | **SAMPLED** | {population} | {sampled} | {unknown} | {family} | {incidence} | {percent:.2} |\n"
+                "| **ALL FIVE** | {transition} | **{scope}** | {population} | {sampled} | {unknown} | {family} | {incidence} | {percent:.2} |\n"
             ));
         }
     }
