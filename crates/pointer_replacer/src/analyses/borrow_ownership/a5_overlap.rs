@@ -2,6 +2,8 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use petgraph::{algo::kosaraju_scc, graphmap::DiGraphMap};
+
 use super::l2::{FnKey, MirLocationKey, SlotKey};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -90,6 +92,10 @@ impl CallSiteWitnessKey {
     pub(crate) fn actuals(self) -> (SlotKey, SlotKey) {
         self.actuals
     }
+
+    pub(crate) fn caller(self) -> FnKey {
+        self.caller
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -121,6 +127,10 @@ impl MayOverlapSummary {
             .expect("may-overlap pair must have at least one witness")
     }
 
+    pub(crate) fn contains(&self, pair: FunctionPairKey) -> bool {
+        self.witnesses.contains_key(&pair)
+    }
+
     pub(crate) fn ordered_rows(&self) -> Vec<(FunctionPairKey, CallSiteWitnessKey)> {
         self.witnesses
             .iter()
@@ -131,6 +141,164 @@ impl MayOverlapSummary {
                     .map(move |witness| (pair, witness))
             })
             .collect()
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum TransferCause {
+    DirectEvidence,
+    CallerPair(FunctionPairKey),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct CallTransfer {
+    witness: CallSiteWitnessKey,
+    cause: TransferCause,
+}
+
+impl CallTransfer {
+    pub(crate) fn direct(witness: CallSiteWitnessKey) -> Self {
+        Self {
+            witness,
+            cause: TransferCause::DirectEvidence,
+        }
+    }
+
+    pub(crate) fn forwarded(
+        witness: CallSiteWitnessKey,
+        caller_pair: FunctionPairKey,
+    ) -> Result<Self, String> {
+        if caller_pair.function() != witness.caller() {
+            return Err(format!(
+                "A5 transfer dependency belongs to function {}, but call witness belongs to {}",
+                caller_pair.function(),
+                witness.caller()
+            ));
+        }
+        Ok(Self {
+            witness,
+            cause: TransferCause::CallerPair(caller_pair),
+        })
+    }
+
+    fn caller(self) -> FnKey {
+        self.witness.caller()
+    }
+
+    fn callee(self) -> FnKey {
+        self.witness.pair().function()
+    }
+
+    fn is_active(self, summary: &MayOverlapSummary) -> bool {
+        match self.cause {
+            TransferCause::DirectEvidence => true,
+            TransferCause::CallerPair(pair) => summary.contains(pair),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct MayOverlapFixpoint {
+    summary: MayOverlapSummary,
+    sccs: Vec<Vec<FnKey>>,
+    scc_iterations: usize,
+}
+
+impl MayOverlapFixpoint {
+    pub(crate) fn summary(&self) -> &MayOverlapSummary {
+        &self.summary
+    }
+
+    pub(crate) fn sccs(&self) -> &[Vec<FnKey>] {
+        &self.sccs
+    }
+
+    pub(crate) fn scc_iterations(&self) -> usize {
+        self.scc_iterations
+    }
+}
+
+pub(crate) fn solve_may_overlap(
+    transfers: impl IntoIterator<Item = CallTransfer>,
+) -> MayOverlapFixpoint {
+    let transfers = transfers.into_iter().collect::<BTreeSet<_>>();
+    let mut functions = BTreeSet::new();
+    for transfer in &transfers {
+        functions.insert(transfer.caller());
+        functions.insert(transfer.callee());
+    }
+
+    let mut graph = DiGraphMap::<FnKey, ()>::new();
+    for &function in &functions {
+        graph.add_node(function);
+    }
+    for transfer in &transfers {
+        graph.add_edge(transfer.caller(), transfer.callee(), ());
+    }
+
+    let mut components = kosaraju_scc(&graph);
+    for component in &mut components {
+        component.sort_unstable();
+    }
+    let mut component_of = BTreeMap::new();
+    for (index, component) in components.iter().enumerate() {
+        for &function in component {
+            component_of.insert(function, index);
+        }
+    }
+    let mut outgoing = vec![BTreeSet::new(); components.len()];
+    let mut indegree = vec![0usize; components.len()];
+    for transfer in &transfers {
+        let caller = component_of[&transfer.caller()];
+        let callee = component_of[&transfer.callee()];
+        if caller != callee && outgoing[caller].insert(callee) {
+            indegree[callee] += 1;
+        }
+    }
+    let mut ready = components
+        .iter()
+        .enumerate()
+        .filter_map(|(index, component)| (indegree[index] == 0).then_some((component[0], index)))
+        .collect::<BTreeSet<_>>();
+    let mut schedule = Vec::with_capacity(components.len());
+    while let Some(&(minimum, component)) = ready.iter().next() {
+        ready.remove(&(minimum, component));
+        schedule.push(component);
+        for &successor in &outgoing[component] {
+            indegree[successor] -= 1;
+            if indegree[successor] == 0 {
+                ready.insert((components[successor][0], successor));
+            }
+        }
+    }
+    assert_eq!(schedule.len(), components.len(), "SCC DAG must be acyclic");
+
+    let mut summary = MayOverlapSummary::default();
+    let mut scc_iterations = 0;
+    let mut ordered_sccs = Vec::with_capacity(schedule.len());
+    for component in schedule {
+        let functions = &components[component];
+        loop {
+            scc_iterations += 1;
+            let mut changed = false;
+            for &transfer in &transfers {
+                if functions.binary_search(&transfer.callee()).is_ok()
+                    && transfer.is_active(&summary)
+                {
+                    changed |= summary.insert(transfer.witness);
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+        ordered_sccs.push(functions.clone());
+    }
+
+    MayOverlapFixpoint {
+        summary,
+        sccs: ordered_sccs,
+        scc_iterations,
     }
 }
 
@@ -552,5 +720,69 @@ mod tests {
             a5_abi_guard(&AbiBoundaryFacts::default(), None),
             AbiGuardDisposition::Permitted { attested: false }
         );
+    }
+
+    #[test]
+    fn scc_fixpoint_kills_the_one_pass_mutation() {
+        let pair1 = FunctionPairKey::new(1, 1, 2).unwrap();
+        let pair2 = FunctionPairKey::new(2, 1, 2).unwrap();
+        let pair3 = FunctionPairKey::new(3, 1, 2).unwrap();
+        let seed = CallTransfer::direct(witness(1, 0, 0, 1, slot(0, 1), 2, slot(0, 2)));
+        let one_to_two =
+            CallTransfer::forwarded(witness(2, 1, 1, 1, slot(1, 1), 2, slot(1, 2)), pair1).unwrap();
+        let two_to_one =
+            CallTransfer::forwarded(witness(1, 2, 2, 1, slot(2, 1), 2, slot(2, 2)), pair2).unwrap();
+        let two_to_three =
+            CallTransfer::forwarded(witness(3, 2, 3, 1, slot(2, 3), 2, slot(2, 4)), pair2).unwrap();
+
+        let solved = solve_may_overlap([two_to_three, two_to_one, one_to_two, seed]);
+
+        assert!(solved.summary().contains(pair1));
+        assert!(solved.summary().contains(pair2));
+        assert!(solved.summary().contains(pair3));
+        assert!(solved.scc_iterations() > solved.sccs().len());
+    }
+
+    #[test]
+    fn transfer_direction_is_caller_to_callee_only() {
+        let caller_pair = FunctionPairKey::new(1, 1, 2).unwrap();
+        let callee_pair = FunctionPairKey::new(2, 1, 2).unwrap();
+        let callee_seed = CallTransfer::direct(witness(2, 0, 0, 1, slot(0, 1), 2, slot(0, 2)));
+        let caller_to_callee =
+            CallTransfer::forwarded(witness(2, 1, 1, 1, slot(1, 1), 2, slot(1, 2)), caller_pair)
+                .unwrap();
+
+        let solved = solve_may_overlap([caller_to_callee, callee_seed]);
+
+        assert!(!solved.summary().contains(caller_pair));
+        assert!(solved.summary().contains(callee_pair));
+    }
+
+    #[test]
+    fn fixpoint_is_byte_stable_under_unsorted_registration() {
+        let pair1 = FunctionPairKey::new(1, 1, 2).unwrap();
+        let pair2 = FunctionPairKey::new(2, 1, 2).unwrap();
+        let transfers = [
+            CallTransfer::direct(witness(1, 0, 4, 1, slot(0, 1), 2, slot(0, 2))),
+            CallTransfer::forwarded(witness(2, 1, 3, 1, slot(1, 1), 2, slot(1, 2)), pair1).unwrap(),
+            CallTransfer::direct(witness(2, 0, 2, 1, slot(0, 3), 2, slot(0, 4))),
+        ];
+        let forward = solve_may_overlap(transfers);
+        let reverse = solve_may_overlap(transfers.into_iter().rev());
+
+        assert!(forward.summary().contains(pair2));
+        assert_eq!(forward, reverse);
+        assert_eq!(
+            forward.summary().ordered_rows(),
+            reverse.summary().ordered_rows()
+        );
+    }
+
+    #[test]
+    fn forwarded_transfer_rejects_a_reverse_edge_dependency() {
+        let wrong_caller = FunctionPairKey::new(9, 1, 2).unwrap();
+        let edge = witness(2, 1, 1, 1, slot(1, 1), 2, slot(1, 2));
+
+        assert!(CallTransfer::forwarded(edge, wrong_caller).is_err());
     }
 }
