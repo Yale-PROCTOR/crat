@@ -381,6 +381,67 @@ pub(crate) fn classify_pair<T: Ord>(facts: &PairFacts<T>) -> PairClass {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PairSide {
+    Left,
+    Right,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum WitnessMutability {
+    MutMut,
+    MutReadOnly { read_only: PairSide },
+    SharedShared,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct WitnessMutabilityJoin {
+    pub(crate) class: WitnessMutability,
+    pub(crate) missing_defaults: usize,
+}
+
+pub(crate) fn join_witness_mutability(
+    left: impl IntoIterator<Item = Option<bool>>,
+    right: impl IntoIterator<Item = Option<bool>>,
+) -> WitnessMutabilityJoin {
+    let join_side = |values: &mut dyn Iterator<Item = Option<bool>>| {
+        let mut seen = false;
+        let mut mutable = false;
+        let mut missing = 0;
+        for value in values {
+            seen = true;
+            match value {
+                Some(value) => mutable |= value,
+                None => {
+                    mutable = true;
+                    missing += 1;
+                }
+            }
+        }
+        if !seen {
+            mutable = true;
+            missing = 1;
+        }
+        (mutable, missing)
+    };
+    let (left_mutable, left_missing) = join_side(&mut left.into_iter());
+    let (right_mutable, right_missing) = join_side(&mut right.into_iter());
+    let class = match (left_mutable, right_mutable) {
+        (true, true) => WitnessMutability::MutMut,
+        (true, false) => WitnessMutability::MutReadOnly {
+            read_only: PairSide::Right,
+        },
+        (false, true) => WitnessMutability::MutReadOnly {
+            read_only: PairSide::Left,
+        },
+        (false, false) => WitnessMutability::SharedShared,
+    };
+    WitnessMutabilityJoin {
+        class,
+        missing_defaults: left_missing + right_missing,
+    }
+}
+
 /// The only A5 call-world policy authorized for loop 2. Keeping the complete
 /// option set here makes the absence of an O1 build/config arm testable.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -996,5 +1057,54 @@ mod tests {
                 .contains("abi_guard=refused:externally-visible,address-taken\n")
         );
         assert!(artifact.receipt.contains("pairs=1\nwitnesses=1\n"));
+    }
+
+    #[test]
+    fn foster_join_classifies_mut_mut() {
+        let joined = join_witness_mutability([Some(true)], [Some(true)]);
+        assert_eq!(joined.class, WitnessMutability::MutMut);
+        assert_eq!(joined.missing_defaults, 0);
+    }
+
+    #[test]
+    fn foster_join_classifies_mut_read_only_with_side() {
+        assert_eq!(
+            join_witness_mutability([Some(true)], [Some(false)]).class,
+            WitnessMutability::MutReadOnly {
+                read_only: PairSide::Right,
+            }
+        );
+    }
+
+    #[test]
+    fn foster_join_classifies_shared_shared() {
+        assert_eq!(
+            join_witness_mutability([Some(false)], [Some(false)]).class,
+            WitnessMutability::SharedShared
+        );
+    }
+
+    #[test]
+    fn foster_join_defaults_missing_facts_to_mutable() {
+        let joined = join_witness_mutability([None], [Some(false)]);
+        assert_eq!(
+            joined.class,
+            WitnessMutability::MutReadOnly {
+                read_only: PairSide::Right,
+            }
+        );
+        assert_eq!(joined.missing_defaults, 1);
+    }
+
+    #[test]
+    fn foster_join_ors_mutability_across_resolved_targets() {
+        let joined = join_witness_mutability([Some(false), Some(true)], [Some(false), Some(false)]);
+        assert_eq!(
+            joined.class,
+            WitnessMutability::MutReadOnly {
+                read_only: PairSide::Right,
+            }
+        );
+        assert_eq!(joined.missing_defaults, 0);
     }
 }
