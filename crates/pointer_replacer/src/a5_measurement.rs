@@ -19,7 +19,7 @@ use crate::{
         borrow::lifetime_flow::{self, BodyLifetimeFlow},
         borrow_ownership::{
             SlotKind,
-            a5_overlap::{PairClass, PairFacts, SetPairEvidence, classify_pair},
+            a5_overlap::{A5World, PairClass, PairFacts, SetPairEvidence, classify_pair},
             construction::{CopyLendMode, construct_bo_into, verify_bo_construction},
             crate_slots::CrateSlots,
             export::with_bo_export,
@@ -41,6 +41,8 @@ use projection_conflict::{AccessDepth, PlaceConflictBias, places_conflict};
 const COUNT_SENTINEL: &str = "A5P1 ";
 const BASE_SENTINEL: &str = "A5P1BASE ";
 const PAIR_SENTINEL: &str = "A5P1PAIR\t";
+const CLOSED_WORLD_FRAME_UNKNOWN_REACHABLE: usize = 2_318;
+const CLOSED_WORLD_FRAME_LOCAL_FUNCTIONS: usize = 2_456;
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 struct FormalKey {
@@ -1065,7 +1067,7 @@ pub(super) fn run_worker(tcx: TyCtxt<'_>, t_tcx: Duration) -> super::report::Row
     let t0 = Instant::now();
     let mut row = super::report::Row::default();
     row.set("copy_lend_mode", CopyLendMode::Baseline.label());
-    row.set("a5_world", "closed_world_frozen_graph");
+    row.set("a5_world", A5World::ClosedWorldFrozenGraph.label());
     row.set("a5_mode", "classifier_differential");
     row.set("a5_abi_guard", "not-yet-consumed-item4");
     let program = std::env::var("CRAT_BOC1_NAME").unwrap_or_else(|_| "unnamed".to_owned());
@@ -2068,6 +2070,14 @@ fn a5_p1_corpus() {
         })
         .collect::<Vec<_>>();
     let total = aggregate(&rows).expect("valid P1 aggregate");
+    assert_eq!(
+        total.unknown_caller_reachable, CLOSED_WORLD_FRAME_UNKNOWN_REACHABLE,
+        "count-(5) closedness numerator moved"
+    );
+    assert_eq!(
+        total.local_functions, CLOSED_WORLD_FRAME_LOCAL_FUNCTIONS,
+        "count-(5) closedness denominator moved"
+    );
     let classifier_sum = |key: &str| {
         final_runs
             .values()

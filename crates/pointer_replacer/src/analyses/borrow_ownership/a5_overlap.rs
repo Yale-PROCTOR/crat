@@ -210,6 +210,101 @@ pub(crate) fn classify_pair<T: Ord>(facts: &PairFacts<T>) -> PairClass {
     }
 }
 
+/// The only A5 call-world policy authorized for loop 2. Keeping the complete
+/// option set here makes the absence of an O1 build/config arm testable.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum A5World {
+    ClosedWorldFrozenGraph,
+}
+
+impl A5World {
+    pub(crate) const ALL: [Self; 1] = [Self::ClosedWorldFrozenGraph];
+
+    pub(crate) fn parse(value: &str) -> Result<Self, String> {
+        match value {
+            "closed_world_frozen_graph" => Ok(Self::ClosedWorldFrozenGraph),
+            other => Err(format!("unsupported A5 world {other:?}")),
+        }
+    }
+
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::ClosedWorldFrozenGraph => "closed_world_frozen_graph",
+        }
+    }
+
+    pub(crate) fn seeds_unknown_callers(self) -> bool {
+        match self {
+            Self::ClosedWorldFrozenGraph => false,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum WholeProgramAttestation {
+    FrozenBenchmarkGraph,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct AbiBoundaryFacts {
+    pub(crate) externally_visible: bool,
+    pub(crate) address_taken: bool,
+    pub(crate) function_target: bool,
+    pub(crate) unresolved_target: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum AbiGuardReason {
+    ExternallyVisible,
+    AddressTaken,
+    FunctionTarget,
+    UnresolvedTarget,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum AbiGuardDisposition {
+    Permitted { attested: bool },
+    Refused { reasons: BTreeSet<AbiGuardReason> },
+}
+
+impl AbiGuardDisposition {
+    pub(crate) fn refused(reasons: impl IntoIterator<Item = AbiGuardReason>) -> Self {
+        Self::Refused {
+            reasons: reasons.into_iter().collect(),
+        }
+    }
+}
+
+pub(crate) fn a5_abi_guard(
+    facts: &AbiBoundaryFacts,
+    attestation: Option<WholeProgramAttestation>,
+) -> AbiGuardDisposition {
+    if attestation == Some(WholeProgramAttestation::FrozenBenchmarkGraph) {
+        return if facts.unresolved_target {
+            AbiGuardDisposition::refused([AbiGuardReason::UnresolvedTarget])
+        } else {
+            AbiGuardDisposition::Permitted { attested: true }
+        };
+    }
+
+    let mut reasons = BTreeSet::new();
+    reasons.extend(
+        [
+            (facts.externally_visible, AbiGuardReason::ExternallyVisible),
+            (facts.address_taken, AbiGuardReason::AddressTaken),
+            (facts.function_target, AbiGuardReason::FunctionTarget),
+            (facts.unresolved_target, AbiGuardReason::UnresolvedTarget),
+        ]
+        .into_iter()
+        .filter_map(|(present, reason)| present.then_some(reason)),
+    );
+    if reasons.is_empty() {
+        AbiGuardDisposition::Permitted { attested: false }
+    } else {
+        AbiGuardDisposition::Refused { reasons }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -337,6 +432,125 @@ mod tests {
         assert_eq!(
             classify_pair(&storage_alias_dominates),
             PairClass::NotProvenDisjoint
+        );
+    }
+
+    #[test]
+    fn o2_is_the_only_world_and_never_seeds_unknown_callers() {
+        assert_eq!(A5World::ALL, [A5World::ClosedWorldFrozenGraph]);
+        assert_eq!(
+            A5World::parse("closed_world_frozen_graph"),
+            Ok(A5World::ClosedWorldFrozenGraph)
+        );
+        assert!(A5World::parse("open_world").is_err());
+        assert!(!A5World::ClosedWorldFrozenGraph.seeds_unknown_callers());
+    }
+
+    #[test]
+    fn abi_guard_refuses_externally_visible_without_attestation() {
+        let facts = AbiBoundaryFacts {
+            externally_visible: true,
+            ..AbiBoundaryFacts::default()
+        };
+
+        assert_eq!(
+            a5_abi_guard(&facts, None),
+            AbiGuardDisposition::refused([AbiGuardReason::ExternallyVisible])
+        );
+    }
+
+    #[test]
+    fn abi_guard_refuses_address_taken_without_attestation() {
+        let facts = AbiBoundaryFacts {
+            address_taken: true,
+            ..AbiBoundaryFacts::default()
+        };
+
+        assert_eq!(
+            a5_abi_guard(&facts, None),
+            AbiGuardDisposition::refused([AbiGuardReason::AddressTaken])
+        );
+    }
+
+    #[test]
+    fn abi_guard_refuses_function_target_groups_without_attestation() {
+        let facts = AbiBoundaryFacts {
+            function_target: true,
+            ..AbiBoundaryFacts::default()
+        };
+
+        assert_eq!(
+            a5_abi_guard(&facts, None),
+            AbiGuardDisposition::refused([AbiGuardReason::FunctionTarget])
+        );
+    }
+
+    #[test]
+    fn abi_guard_refuses_unresolved_targets_without_attestation() {
+        let facts = AbiBoundaryFacts {
+            unresolved_target: true,
+            ..AbiBoundaryFacts::default()
+        };
+
+        assert_eq!(
+            a5_abi_guard(&facts, None),
+            AbiGuardDisposition::refused([AbiGuardReason::UnresolvedTarget])
+        );
+    }
+
+    #[test]
+    fn abi_guard_collects_every_refusal_reason() {
+        let facts = AbiBoundaryFacts {
+            externally_visible: true,
+            address_taken: true,
+            function_target: true,
+            unresolved_target: true,
+        };
+
+        assert_eq!(
+            a5_abi_guard(&facts, None),
+            AbiGuardDisposition::refused([
+                AbiGuardReason::ExternallyVisible,
+                AbiGuardReason::AddressTaken,
+                AbiGuardReason::FunctionTarget,
+                AbiGuardReason::UnresolvedTarget,
+            ])
+        );
+    }
+
+    #[test]
+    fn frozen_graph_attestation_permits_a_resolved_abi_boundary() {
+        let facts = AbiBoundaryFacts {
+            externally_visible: true,
+            address_taken: true,
+            function_target: true,
+            unresolved_target: false,
+        };
+
+        assert_eq!(
+            a5_abi_guard(&facts, Some(WholeProgramAttestation::FrozenBenchmarkGraph)),
+            AbiGuardDisposition::Permitted { attested: true }
+        );
+    }
+
+    #[test]
+    fn unresolved_target_fails_closed_even_with_attestation() {
+        let facts = AbiBoundaryFacts {
+            unresolved_target: true,
+            ..AbiBoundaryFacts::default()
+        };
+
+        assert_eq!(
+            a5_abi_guard(&facts, Some(WholeProgramAttestation::FrozenBenchmarkGraph)),
+            AbiGuardDisposition::refused([AbiGuardReason::UnresolvedTarget])
+        );
+    }
+
+    #[test]
+    fn private_resolved_boundary_needs_no_global_attestation() {
+        assert_eq!(
+            a5_abi_guard(&AbiBoundaryFacts::default(), None),
+            AbiGuardDisposition::Permitted { attested: false }
         );
     }
 }
