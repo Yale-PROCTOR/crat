@@ -19,7 +19,11 @@ use crate::{
         borrow::lifetime_flow::{self, BodyLifetimeFlow},
         borrow_ownership::{
             SlotKind,
-            a5_overlap::{A5World, PairClass, PairFacts, SetPairEvidence, classify_pair},
+            a5_overlap::{
+                A5World, PairClass, PairFacts, PairSide, SetPairEvidence, SnapshotVerdict,
+                classify_pair,
+            },
+            a5_snapshot_effects::snapshot_verdict_for_target,
             construction::{CopyLendMode, construct_bo_into, verify_bo_construction},
             crate_slots::CrateSlots,
             export::with_bo_export,
@@ -120,6 +124,7 @@ struct Measurement {
     counts: ProgramCounts,
     pairs: Vec<PairLedgerRow>,
     classifier: ClassifierDifferential,
+    snapshot: SnapshotCoverage,
     coverage: CoverageCounts,
     timings: Timings,
 }
@@ -129,6 +134,17 @@ struct ClassifierDifferential {
     candidates: usize,
     not_proven_disjoint: usize,
     byte_mismatches: usize,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct SnapshotCoverage {
+    mut_read_only: usize,
+    markable: usize,
+    read_after_write: usize,
+    opaque_escape: usize,
+    recursive: usize,
+    volatile_or_atomic: usize,
+    unresolved: usize,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -225,11 +241,34 @@ fn classify_pair_differential(facts: &PairFacts<String>) -> Result<PairClass, St
     Ok(shared)
 }
 
+fn combine_snapshot_verdicts(
+    verdicts: impl IntoIterator<Item = SnapshotVerdict>,
+) -> Option<SnapshotVerdict> {
+    let mut seen = false;
+    let mut combined = SnapshotVerdict::Markable;
+    for verdict in verdicts {
+        seen = true;
+        combined = match (combined, verdict) {
+            (_, SnapshotVerdict::VolatileOrAtomic) => SnapshotVerdict::VolatileOrAtomic,
+            (SnapshotVerdict::VolatileOrAtomic, _) => SnapshotVerdict::VolatileOrAtomic,
+            (_, SnapshotVerdict::Recursive) => SnapshotVerdict::Recursive,
+            (SnapshotVerdict::Recursive, _) => SnapshotVerdict::Recursive,
+            (_, SnapshotVerdict::OpaqueEscape) => SnapshotVerdict::OpaqueEscape,
+            (SnapshotVerdict::OpaqueEscape, _) => SnapshotVerdict::OpaqueEscape,
+            (_, SnapshotVerdict::ReadAfterWrite) => SnapshotVerdict::ReadAfterWrite,
+            (SnapshotVerdict::ReadAfterWrite, _) => SnapshotVerdict::ReadAfterWrite,
+            _ => SnapshotVerdict::Markable,
+        };
+    }
+    seen.then_some(combined)
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct CallSite {
     id: String,
     arguments: Vec<FormalDecision>,
     pair_facts: BTreeMap<(usize, usize), PairFacts<String>>,
+    snapshot_verdicts: BTreeMap<(usize, usize), SnapshotVerdict>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -305,6 +344,7 @@ struct MeasuredProgram {
     counts: ProgramCounts,
     pairs: Vec<PairLedgerRow>,
     classifier: ClassifierDifferential,
+    snapshot: SnapshotCoverage,
 }
 
 fn measure_program(input: &ProgramInput) -> Result<MeasuredProgram, String> {
@@ -321,6 +361,7 @@ fn measure_program(input: &ProgramInput) -> Result<MeasuredProgram, String> {
     let mut sites_with_shared_shared = 0;
     let mut mutability_default_fires = 0;
     let mut classifier = ClassifierDifferential::default();
+    let mut snapshot = SnapshotCoverage::default();
 
     for site in &input.call_sites {
         if !site_ids.insert(site.id.as_str()) {
@@ -365,7 +406,22 @@ fn measure_program(input: &ProgramInput) -> Result<MeasuredProgram, String> {
                         PairMutability::from_sides(left_formal.mutable, right_formal.mutable);
                     match class {
                         PairMutability::MutMut => mut_mut += 1,
-                        PairMutability::MutReadOnly => mut_read_only += 1,
+                        PairMutability::MutReadOnly => {
+                            mut_read_only += 1;
+                            snapshot.mut_read_only += 1;
+                            match site.snapshot_verdicts.get(&(left, right)) {
+                                Some(SnapshotVerdict::Markable) => snapshot.markable += 1,
+                                Some(SnapshotVerdict::ReadAfterWrite) => {
+                                    snapshot.read_after_write += 1
+                                }
+                                Some(SnapshotVerdict::OpaqueEscape) => snapshot.opaque_escape += 1,
+                                Some(SnapshotVerdict::Recursive) => snapshot.recursive += 1,
+                                Some(SnapshotVerdict::VolatileOrAtomic) => {
+                                    snapshot.volatile_or_atomic += 1
+                                }
+                                None => snapshot.unresolved += 1,
+                            }
+                        }
                         PairMutability::SharedShared => shared_shared += 1,
                     }
                     site_classes.insert(class);
@@ -425,6 +481,7 @@ fn measure_program(input: &ProgramInput) -> Result<MeasuredProgram, String> {
         counts,
         pairs,
         classifier,
+        snapshot,
     })
 }
 
@@ -1009,6 +1066,7 @@ fn measure_tcx(
                 })
                 .collect::<Result<Vec<_>, _>>()?;
             let mut pair_facts = BTreeMap::new();
+            let mut snapshot_verdicts = BTreeMap::new();
             for left in 0..call_args.len() {
                 for right in left + 1..call_args.len() {
                     pair_facts.insert(
@@ -1026,6 +1084,19 @@ fn measure_tcx(
                             &call_args[right].node,
                         ),
                     );
+                    let read_only = match (arguments[left].mutable, arguments[right].mutable) {
+                        (false, true) => Some(PairSide::Left),
+                        (true, false) => Some(PairSide::Right),
+                        _ => None,
+                    };
+                    if let Some(read_only) = read_only
+                        && let Some(verdict) =
+                            combine_snapshot_verdicts(targets.iter().map(|target| {
+                                snapshot_verdict_for_target(tcx, *target, left, right, read_only)
+                            }))
+                    {
+                        snapshot_verdicts.insert((left, right), verdict);
+                    }
                 }
             }
             call_sites.push(CallSite {
@@ -1040,6 +1111,7 @@ fn measure_tcx(
                 ),
                 arguments,
                 pair_facts,
+                snapshot_verdicts,
             });
         }
     }
@@ -1054,6 +1126,7 @@ fn measure_tcx(
         counts: measured.counts,
         pairs: measured.pairs,
         classifier: measured.classifier,
+        snapshot: measured.snapshot,
         coverage,
         timings: Timings {
             origins: origins_time,
@@ -1114,6 +1187,19 @@ pub(super) fn run_worker(tcx: TyCtxt<'_>, t_tcx: Duration) -> super::report::Row
                 "a5_classifier_byte_mismatches",
                 measured.classifier.byte_mismatches,
             );
+            row.set("a5_snapshot_total", measured.snapshot.mut_read_only);
+            row.set("a5_snapshot_markable", measured.snapshot.markable);
+            row.set(
+                "a5_snapshot_read_after_write",
+                measured.snapshot.read_after_write,
+            );
+            row.set("a5_snapshot_opaque_escape", measured.snapshot.opaque_escape);
+            row.set("a5_snapshot_recursive", measured.snapshot.recursive);
+            row.set(
+                "a5_snapshot_volatile_or_atomic",
+                measured.snapshot.volatile_or_atomic,
+            );
+            row.set("a5_snapshot_unresolved", measured.snapshot.unresolved);
             row.set("calls_total", measured.coverage.calls_total);
             row.set("direct_local", measured.coverage.direct_local);
             row.set("indirect_local", measured.coverage.indirect_local);
@@ -1581,6 +1667,7 @@ fn a5_p1_corpus() {
         Ok(other) => panic!("CRAT_A5_CLASSIFIER_DIFFERENTIAL must be 0 or 1, got {other:?}"),
         Err(error) => panic!("CRAT_A5_CLASSIFIER_DIFFERENTIAL is not valid Unicode: {error}"),
     };
+    let snapshot_coverage = std::env::var("CRAT_A5_SNAPSHOT_COVERAGE").as_deref() == Ok("1");
 
     assert_eq!(
         super::CORPUS.len(),
@@ -2109,6 +2196,34 @@ fn a5_p1_corpus() {
         assert_eq!(total.mut_read_only, 2_480);
         assert_eq!(total.shared_shared, 684);
     }
+    let snapshot_sum = |key: &str| classifier_sum(key);
+    let snapshot_totals = snapshot_coverage.then(|| {
+        [
+            snapshot_sum("a5_snapshot_total"),
+            snapshot_sum("a5_snapshot_markable"),
+            snapshot_sum("a5_snapshot_read_after_write"),
+            snapshot_sum("a5_snapshot_opaque_escape"),
+            snapshot_sum("a5_snapshot_recursive"),
+            snapshot_sum("a5_snapshot_volatile_or_atomic"),
+            snapshot_sum("a5_snapshot_unresolved"),
+        ]
+    });
+    if let Some(
+        [
+            den,
+            markable,
+            read_after,
+            opaque,
+            recursive,
+            volatile,
+            unresolved,
+        ],
+    ) = snapshot_totals
+    {
+        assert_eq!(den, 2_480);
+        assert_eq!(unresolved, 0);
+        assert_eq!(markable + read_after + opaque + recursive + volatile, den);
+    }
 
     let output = out.join("a5-p1");
     fs::create_dir_all(&output).expect("create P1 output directory");
@@ -2338,6 +2453,29 @@ fn a5_p1_corpus() {
         )
         .expect("write classifier differential receipt");
     }
+    if let Some(
+        [
+            den,
+            markable,
+            read_after,
+            opaque,
+            recursive,
+            volatile,
+            unresolved,
+        ],
+    ) = snapshot_totals
+    {
+        fs::write(
+            output.join("snapshot-coverage.txt"),
+            format!(
+                "status=ok\ndata=true\nanalysis_head={analysis_head}\na5_world=closed_world_frozen_graph\n\
+                 a5_mode=precise_replay\nunknown_caller_seeding=false\ndenominator={den}\n\
+                 markable={markable}\nread_after_write={read_after}\nopaque_escape={opaque}\n\
+                 recursive={recursive}\nvolatile_or_atomic={volatile}\nunresolved={unresolved}\n"
+            ),
+        )
+        .expect("write snapshot coverage receipt");
+    }
     println!("{}", render_count_line(&total));
 }
 
@@ -2406,6 +2544,7 @@ mod tests {
                         formal_with_mutability("callee", 3, false, 1),
                     ],
                     pair_facts: all_risky(3),
+                    snapshot_verdicts: BTreeMap::new(),
                 },
                 CallSite {
                     id: "caller:bb1:callee".to_owned(),
@@ -2414,6 +2553,7 @@ mod tests {
                         formal_with_mutability("callee", 2, false, 0),
                     ],
                     pair_facts: all_risky(2),
+                    snapshot_verdicts: BTreeMap::new(),
                 },
             ],
             functions: BTreeMap::new(),
@@ -2536,11 +2676,13 @@ mod tests {
             id: "caller:bb0".to_owned(),
             arguments: vec![outer.clone(), deeper.clone()],
             pair_facts,
+            snapshot_verdicts: BTreeMap::new(),
         };
         let one_ref_site = CallSite {
             id: "caller:bb2".to_owned(),
             arguments: vec![formal("callee", 3, 0)],
             pair_facts: BTreeMap::new(),
+            snapshot_verdicts: BTreeMap::new(),
         };
         let program = ProgramInput {
             name: "fixture".to_owned(),
