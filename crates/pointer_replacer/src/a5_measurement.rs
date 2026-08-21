@@ -257,7 +257,9 @@ struct ExtendedPairLedgerRow {
     raw_overlap: bool,
     effective_overlap: bool,
     markability: String,
+    planned_mark: bool,
     selected_mark: bool,
+    model_attribution: String,
 }
 
 impl PairLedgerRow {
@@ -698,7 +700,9 @@ fn measure_program(input: &ProgramInput) -> Result<MeasuredProgram, String> {
                         raw_overlap: true,
                         effective_overlap: !selected_mark,
                         markability: markability.to_owned(),
+                        planned_mark: selected_mark,
                         selected_mark,
+                        model_attribution: "not-evaluated".to_owned(),
                     });
                     pairs.push(pair);
                     for index in [left, right] {
@@ -797,12 +801,13 @@ fn build_parameter_overlaps(
 
 fn build_exposure_ledger(
     program: &str,
-    measured: &MeasuredProgram,
+    rows: &[ExtendedPairLedgerRow],
+    expected_depth_zero: usize,
     baseline: &AcceptedFormalModel,
     precise: &AcceptedFormalModel,
 ) -> Result<Vec<ExposureLedgerRow>, String> {
     let mut participation = BTreeMap::<FormalKey, Vec<&ExtendedPairLedgerRow>>::new();
-    for row in &measured.extended_pairs {
+    for row in rows {
         for formal in row
             .left_formals
             .iter()
@@ -812,11 +817,11 @@ fn build_exposure_ledger(
             participation.entry(formal.clone()).or_default().push(row);
         }
     }
-    if participation.len() != measured.counts.attributed_predicted_refs_depth0 {
+    if participation.len() != expected_depth_zero {
         return Err(format!(
             "W14 exposure identity count {} disagrees with C3-d0 {}",
             participation.len(),
-            measured.counts.attributed_predicted_refs_depth0
+            expected_depth_zero
         ));
     }
 
@@ -862,6 +867,72 @@ fn build_exposure_ledger(
     Ok(answer)
 }
 
+fn filter_planned_marks_postsolve(
+    rows: &[ExtendedPairLedgerRow],
+    precise: &AcceptedFormalModel,
+) -> Vec<ExtendedPairLedgerRow> {
+    let mut filtered = rows.to_vec();
+    for row in filtered.iter_mut().filter(|row| row.planned_mark) {
+        let left_fallen = row
+            .left_formals
+            .iter()
+            .filter(|formal| precise.kinds.get(*formal) != Some(&SlotKind::Ref))
+            .cloned()
+            .collect::<Vec<_>>();
+        let right_fallen = row
+            .right_formals
+            .iter()
+            .filter(|formal| precise.kinds.get(*formal) != Some(&SlotKind::Ref))
+            .cloned()
+            .collect::<Vec<_>>();
+        row.selected_mark = left_fallen.is_empty() && right_fallen.is_empty();
+        if row.selected_mark {
+            row.model_attribution = "retained:both-ref".to_owned();
+            continue;
+        }
+        row.markability = "demoted-by-model".to_owned();
+        let fallen = left_fallen
+            .iter()
+            .chain(&right_fallen)
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        let cooccurring = rows
+            .iter()
+            .filter(|other| {
+                other.effective_overlap
+                    && other
+                        .left_formals
+                        .iter()
+                        .chain(&other.right_formals)
+                        .any(|formal| fallen.contains(formal))
+            })
+            .map(|other| other.pair.class.label())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>()
+            .join(",");
+        row.model_attribution = format!(
+            "left_fell={};right_fell={};cooccurring={}",
+            left_fallen
+                .iter()
+                .map(formal_label)
+                .collect::<Vec<_>>()
+                .join("|"),
+            right_fallen
+                .iter()
+                .map(formal_label)
+                .collect::<Vec<_>>()
+                .join("|"),
+            if cooccurring.is_empty() {
+                "none"
+            } else {
+                &cooccurring
+            },
+        );
+    }
+    filtered
+}
+
 fn run_focused_w14(
     program_name: &str,
     program: &RustProgram<'_>,
@@ -900,26 +971,16 @@ fn run_focused_w14(
     let model = model.ok_or_else(|| "W14 precise replay declined".to_owned())?;
     let precise = project_formal_kinds(program.tcx, program, slots, formals, &model)?;
 
-    for row in measured
-        .extended_pairs
-        .iter()
-        .filter(|row| row.selected_mark)
-    {
-        if row
-            .left_formals
-            .iter()
-            .chain(&row.right_formals)
-            .any(|formal| precise.kinds.get(formal) != Some(&SlotKind::Ref))
-        {
-            return Err(format!(
-                "selected mark at {} does not retain both formal sides as Ref",
-                row.pair.site
-            ));
-        }
-    }
-    let exposures = build_exposure_ledger(program_name, measured, baseline, &precise)?;
+    let filtered_pairs = filter_planned_marks_postsolve(&measured.extended_pairs, &precise);
+    let exposures = build_exposure_ledger(
+        program_name,
+        &filtered_pairs,
+        measured.counts.attributed_predicted_refs_depth0,
+        baseline,
+        &precise,
+    )?;
     Ok(W14Measurement {
-        pairs: measured.extended_pairs.clone(),
+        pairs: filtered_pairs,
         exposures,
         precise_rounds: stats.rounds,
     })
@@ -1759,6 +1820,17 @@ pub(super) fn run_worker(tcx: TyCtxt<'_>, t_tcx: Duration) -> super::report::Row
                     "a5_w14_selected_marks",
                     w14.pairs.iter().filter(|pair| pair.selected_mark).count(),
                 );
+                row.set(
+                    "a5_w14_planned_marks",
+                    w14.pairs.iter().filter(|pair| pair.planned_mark).count(),
+                );
+                row.set(
+                    "a5_w14_demoted_by_model",
+                    w14.pairs
+                        .iter()
+                        .filter(|pair| pair.planned_mark && !pair.selected_mark)
+                        .count(),
+                );
                 row.set("a5_w14_exposures", w14.exposures.len());
                 row.set("a5_w14_demoted", exposure_count(ExposureClass::Demoted));
                 row.set("a5_w14_marked", exposure_count(ExposureClass::Marked));
@@ -1953,7 +2025,7 @@ fn render_extended_pair_line(row: &ExtendedPairLedgerRow) -> String {
         .collect::<Vec<_>>()
         .join("|");
     format!(
-        "{W14_PAIR_SENTINEL}{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\tbaseline\tprecise_replay\tclosed_world_frozen_graph\tpermitted:measurement-frozen-graph-attested",
+        "{W14_PAIR_SENTINEL}{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\tbaseline\tprecise_replay\tclosed_world_frozen_graph\tpermitted:measurement-frozen-graph-attested\t{}\t{}",
         row.pair.program,
         row.pair.site,
         row.pair.left_argument,
@@ -1966,6 +2038,8 @@ fn render_extended_pair_line(row: &ExtendedPairLedgerRow) -> String {
         usize::from(row.effective_overlap),
         row.markability,
         usize::from(row.selected_mark),
+        usize::from(row.planned_mark),
+        row.model_attribution,
     )
 }
 
@@ -2259,10 +2333,10 @@ fn parse_w14_ledgers(
             .expect("filtered W14 pair")
             .split('\t')
             .collect::<Vec<_>>();
-        if columns.len() != 16
+        if !matches!(columns.len(), 16 | 18)
             || columns[0] != counts.program
             || columns[8] != "1"
-            || columns[12..]
+            || columns[12..16]
                 != [
                     "baseline",
                     "precise_replay",
@@ -2613,6 +2687,56 @@ fn a5_p1_corpus() {
     );
     let snapshot_env = snapshot.display().to_string();
 
+    if std::env::var("CRAT_A5_W14_RECOVER_BROTLI").as_deref() == Ok("1") {
+        assert!(focused_w14, "W14 brotli recovery requires focused mode");
+        assert_eq!(
+            std::env::var("CRAT_BOC1_MEM_MB").as_deref(),
+            Ok("49152"),
+            "W14 brotli recovery retains the 49,152-MiB cap"
+        );
+        assert!(
+            std::env::var_os("CRAT_A5_W14_HELD_DIR").is_none(),
+            "W14 recovery and aggregation are separate serialized phases"
+        );
+        let program = super::CORPUS
+            .iter()
+            .find(|program| program.name == "brotli")
+            .expect("brotli catalog row");
+        let input = corpus_link.join(program.name).join(program.lib_root);
+        let outcome = super::orchestrate::run_child_labeled(
+            program.name,
+            &input,
+            "a5-p1",
+            "a5-w14-recovery",
+            base_timeout,
+            &[("CRAT_A5_SNAPSHOT", snapshot_env.clone())],
+        );
+        assert_eq!(
+            outcome.status, "ok",
+            "brotli W14 recovery status={} note={}",
+            outcome.status, outcome.note
+        );
+        let metadata = outcome.row.as_ref().expect("brotli W14 metadata");
+        let (_, counts) =
+            parse_single_raw_line(&outcome.stdout, COUNT_SENTINEL).expect("brotli W14 count row");
+        parse_pair_ledger(&outcome.stdout, &counts).expect("brotli exact pair ledger");
+        parse_w14_ledgers(&outcome.stdout, metadata, &counts)
+            .expect("brotli W14 ledgers reconcile");
+        let recovery = out.join("a5-w14-recovery");
+        fs::create_dir_all(&recovery).expect("create W14 recovery receipt directory");
+        fs::write(
+            recovery.join("receipt.txt"),
+            format!(
+                "status=ok\ndata=true\nprogram=brotli\nanalysis_head={analysis_head}\n\
+                 copy_lend_mode=baseline\na5_mode=precise_replay\na5_world=closed_world_frozen_graph\n\
+                 mem_cap_mib=49152\npeak_rss_kb={}\nwall_s={:.3}\n",
+                outcome.peak_rss_kb, outcome.wall_s,
+            ),
+        )
+        .expect("write W14 recovery receipt");
+        return;
+    }
+
     if std::env::var("CRAT_A5_RECOVER_BROTLI").as_deref() == Ok("1") {
         assert_eq!(
             std::env::var("CRAT_BOC1_MEM_MB").as_deref(),
@@ -2731,8 +2855,50 @@ fn a5_p1_corpus() {
     let mut brotli_peak_rss_kb = None;
     let mut brotli_depth_peak_rss_kb = None;
     let mut brotli_depth_wall_s = None;
+    let held_w14_directory = std::env::var_os("CRAT_A5_W14_HELD_DIR");
     let preserved_final_directory = std::env::var_os("CRAT_A5_PRESERVED_FINAL_DIR");
-    if let Some(directory) = preserved_final_directory {
+    if let Some(directory) = held_w14_directory {
+        assert!(focused_w14, "held W14 rows require focused mode");
+        assert!(
+            preserved_final_directory.is_none()
+                && std::env::var_os("CRAT_A5_PRESERVED_BASE_DIR").is_none(),
+            "W14 held-row aggregation does not mix older resume protocols"
+        );
+        let directory = PathBuf::from(directory);
+        for program in super::CORPUS
+            .iter()
+            .filter(|program| program.name != "brotli")
+        {
+            let stdout = fs::read_to_string(directory.join(format!("{}.a5-p1.out", program.name)))
+                .unwrap_or_else(|why| panic!("{}: read held stdout: {why}", program.name));
+            let stderr = fs::read_to_string(directory.join(format!("{}.a5-p1.err", program.name)))
+                .unwrap_or_else(|why| panic!("{}: read held stderr: {why}", program.name));
+            match parse_completed_base(program.name, &stdout, &stderr)
+                .unwrap_or_else(|why| panic!("{}: held W14 row: {why}", program.name))
+            {
+                CompletedBase::Final(run) => {
+                    final_runs.insert(program.name, run);
+                }
+                CompletedBase::NeedsDepth { .. } => {
+                    panic!("{}: held W14 row still needs depth", program.name)
+                }
+            }
+        }
+        let recovery_logs = out.join("logs");
+        let stdout = fs::read_to_string(recovery_logs.join("brotli.a5-w14-recovery.out"))
+            .expect("read brotli W14 recovery stdout");
+        let stderr = fs::read_to_string(recovery_logs.join("brotli.a5-w14-recovery.err"))
+            .expect("read brotli W14 recovery stderr");
+        match parse_completed_base("brotli", &stdout, &stderr)
+            .expect("complete brotli W14 recovery row")
+        {
+            CompletedBase::Final(run) => {
+                final_runs.insert("brotli", run);
+            }
+            CompletedBase::NeedsDepth { .. } => panic!("brotli W14 recovery needs depth"),
+        }
+        assert_eq!(final_runs.len(), 20);
+    } else if let Some(directory) = preserved_final_directory {
         assert_eq!(
             std::env::var("CRAT_BOC1_MEM_MB").as_deref(),
             Ok("8192"),
@@ -3071,10 +3237,25 @@ fn a5_p1_corpus() {
     }
 
     let w14_totals = focused_w14.then(|| {
+        let optional_sum = |key: &str, fallback: Option<&str>| {
+            final_runs
+                .values()
+                .map(|run| {
+                    run.metadata
+                        .get(key)
+                        .or_else(|| fallback.and_then(|fallback| run.metadata.get(fallback)))
+                        .unwrap_or("0")
+                        .parse::<usize>()
+                        .unwrap_or_else(|why| panic!("{} invalid {key}: {why}", run.counts.program))
+                })
+                .sum::<usize>()
+        };
         let values = [
             classifier_sum("a5_w14_pairs"),
             classifier_sum("a5_w14_effective_pairs"),
+            optional_sum("a5_w14_planned_marks", Some("a5_w14_selected_marks")),
             classifier_sum("a5_w14_selected_marks"),
+            optional_sum("a5_w14_demoted_by_model", None),
             classifier_sum("a5_w14_exposures"),
             classifier_sum("a5_w14_demoted"),
             classifier_sum("a5_w14_marked"),
@@ -3083,9 +3264,10 @@ fn a5_p1_corpus() {
             classifier_sum("a5_w14_precise_rounds"),
         ];
         assert_eq!(values[0], 5_555, "W14 pair denominator moved");
-        assert_eq!(values[2], 4, "W14 selected-mark count moved");
-        assert_eq!(values[3], 2_014, "W14 exposure denominator moved");
-        assert_eq!(values[4] + values[5] + values[6] + values[7], values[3]);
+        assert_eq!(values[2], 4, "W14 planned-mark count moved");
+        assert_eq!(values[2], values[3] + values[4]);
+        assert_eq!(values[5], 2_014, "W14 exposure denominator moved");
+        assert_eq!(values[6] + values[7] + values[8] + values[9], values[5]);
         values
     });
 
@@ -3096,13 +3278,13 @@ fn a5_p1_corpus() {
         "program\tsite\tleft_argument\tright_argument\tclass\tleft_mutable\tright_mutable\tleft_default_fires\tright_default_fires\n",
     );
     let mut w14_pair_ledger = String::from(
-        "program\tsite\tleft_argument\tright_argument\tclass\ttarget_formals\tleft_formals\tright_formals\traw_overlap\teffective_overlap\tmarkability\tselected_mark\tcopy_lend_mode\ta5_mode\ta5_world\ta5_abi_guard\n",
+        "program\tsite\tleft_argument\tright_argument\tclass\ttarget_formals\tleft_formals\tright_formals\traw_overlap\teffective_overlap\tmarkability\tretained_mark\tcopy_lend_mode\ta5_mode\ta5_world\ta5_abi_guard\tplanned_mark\tmodel_attribution\n",
     );
     let mut w14_exposure_ledger = String::from(
         "program\tfunction\tparameter\tdepth\tbaseline_kind\tprecise_kind\tmovement\tclass\tcopy_lend_mode\ta5_mode\ta5_world\ta5_abi_guard\n",
     );
     let mut w14_programs = String::from(
-        "program\tpairs\teffective_pairs\tselected_marks\texposures\tdemoted\tmarked\tshared_safe\tunresolved\tprecise_rounds\n",
+        "program\tpairs\teffective_pairs\tplanned_marks\tretained_marks\tdemoted_by_model\texposures\tdemoted\tmarked\tshared_safe\tunresolved\tprecise_rounds\n",
     );
     let mut tsv = String::from(
         "program\tc1\tc2\tc3\tc3_depth0\tcg_num\tcg_den\tpair_den\tmut_mut\tmut_read_only\tshared_shared\tsite_mut_mut\tsite_mut_read_only\tsite_shared_shared\tmut_default_fires\tcalls_total\tdirect_local\tindirect_local\tdirect_external\tindirect_unresolved\tnon_fn_def_constant\tt_origins_s\tt_andersen_s\tt_model_s\twall_s\n",
@@ -3155,11 +3337,15 @@ fn a5_p1_corpus() {
                     .unwrap_or_else(|| panic!("{} missing {key}", program.name))
             };
             w14_programs.push_str(&format!(
-                "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+                "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
                 program.name,
                 get_w14("a5_w14_pairs"),
                 get_w14("a5_w14_effective_pairs"),
+                run.metadata
+                    .get("a5_w14_planned_marks")
+                    .unwrap_or_else(|| get_w14("a5_w14_selected_marks")),
                 get_w14("a5_w14_selected_marks"),
+                run.metadata.get("a5_w14_demoted_by_model").unwrap_or("0"),
                 get_w14("a5_w14_exposures"),
                 get_w14("a5_w14_demoted"),
                 get_w14("a5_w14_marked"),
@@ -3356,11 +3542,12 @@ fn a5_p1_corpus() {
                 "status={}\ndata={}\nanalysis_head={analysis_head}\ncopy_lend_mode=baseline\n\
                  a5_mode=precise_replay\na5_world=closed_world_frozen_graph\n\
                  unknown_caller_seeding=false\na5_abi_guard=permitted:measurement-frozen-graph-attested\n\
-                 pairs={}\neffective_pairs={}\nselected_marks={}\nexposures={}\n\
+                 pairs={}\neffective_pairs={}\nplanned_marks={}\nretained_marks={}\n\
+                 demoted_by_model={}\nexposures={}\n\
                  demoted={}\nmarked={}\nshared_safe={}\nunresolved={}\nprecise_rounds={}\n\
                  pair_partition=5555=2391+2480+684\n",
-                if values[7] == 0 { "ok" } else { "unresolved" },
-                values[7] == 0,
+                if values[9] == 0 { "ok" } else { "unresolved" },
+                values[9] == 0,
                 values[0],
                 values[1],
                 values[2],
@@ -3370,6 +3557,8 @@ fn a5_p1_corpus() {
                 values[6],
                 values[7],
                 values[8],
+                values[9],
+                values[10],
             ),
         )
         .expect("write W14 receipt");
@@ -3427,7 +3616,7 @@ fn a5_p1_corpus() {
     println!("{}", render_count_line(&total));
     if let Some(values) = w14_totals {
         assert_eq!(
-            values[7], 0,
+            values[9], 0,
             "W14 unresolved exposure residual; artifacts preserved for STOP"
         );
     }
@@ -3651,14 +3840,31 @@ mod tests {
                 .map(|key| (key, SlotKind::Ref))
                 .collect(),
         };
-        let exposure = build_exposure_ledger("fixture", &measured, &baseline, &baseline)
-            .expect("reconciled exposure");
+        let exposure = build_exposure_ledger(
+            "fixture",
+            &measured.extended_pairs,
+            measured.counts.attributed_predicted_refs_depth0,
+            &baseline,
+            &baseline,
+        )
+        .expect("reconciled exposure");
         assert_eq!(exposure.len(), 2);
         assert!(
             exposure
                 .iter()
                 .all(|row| row.class == ExposureClass::Marked)
         );
+
+        let mut precise = AcceptedFormalModel {
+            refs: BTreeMap::new(),
+            kinds: baseline.kinds.clone(),
+        };
+        precise.kinds.insert(keys[0].clone(), SlotKind::Raw);
+        let filtered = filter_planned_marks_postsolve(&measured.extended_pairs, &precise);
+        assert!(filtered[0].planned_mark);
+        assert!(!filtered[0].selected_mark);
+        assert_eq!(filtered[0].markability, "demoted-by-model");
+        assert!(filtered[0].model_attribution.contains("fell="));
     }
 
     #[test]
