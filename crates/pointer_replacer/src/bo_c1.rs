@@ -13878,6 +13878,7 @@ fn boc1_run_one() {
             | "a4-source-census"
             | "a5-p1"
             | "copy-lend-funnel"
+            | "copy-lend-funnel-subjects"
             | "kind-equate-core"
             | "s23-discover"
             | "s23-probe"
@@ -13920,6 +13921,7 @@ fn boc1_run_one() {
             "a4-source-census" => a4_source_census::run_worker(tcx, t_tcx),
             "a5-p1" => a5_measurement::run_worker(tcx, t_tcx),
             "copy-lend-funnel" => copy_lend_funnel::run_worker(tcx, t_tcx),
+            "copy-lend-funnel-subjects" => copy_lend_funnel::run_subject_worker(tcx, t_tcx),
             "p-b" => p_b_measurement::run_worker(tcx, t_tcx),
             "kind-equate-core" => kind_equate_core_census::run_worker(tcx, t_tcx),
             "s23-discover" => s23_measurement::run_discovery_worker(tcx, t_tcx),

@@ -27,6 +27,37 @@ use crate::analyses::borrow_ownership::{
 };
 
 const CORPUS_DIGEST: &str = "db96829b5c2b0db28fb4bb9ddd3d32901b5d4e6e4134da07ada0d513d94eb4c6";
+const SAMPLE_K: usize = 8;
+const QUERY_TIMEOUT: Duration = Duration::from_secs(600);
+
+fn program_bound_seconds(pairs: usize) -> u64 {
+    14_400u64.max(
+        u64::try_from(pairs)
+            .expect("funnel pair count fits u64")
+            .saturating_mul(300),
+    )
+}
+
+fn sample_loss_indices(losses: &[usize]) -> Vec<usize> {
+    losses.iter().copied().take(SAMPLE_K).collect()
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum QueryVerdict {
+    Sat,
+    Unsat,
+    Unknown,
+}
+
+impl QueryVerdict {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Sat => "sat",
+            Self::Unsat => "unsat",
+            Self::Unknown => "unknown",
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct StageBits {
@@ -113,12 +144,12 @@ fn hard_query(
     tracker: &CoreTracker,
     tracks: &[Bool],
     force: Bool,
-) -> (bool, Vec<String>) {
+) -> (QueryVerdict, Vec<String>) {
     let mut assumptions = tracks.to_vec();
     assumptions.push(force.clone());
     match solver.check_with_assumptions(&assumptions) {
-        SatResult::Sat => (true, Vec::new()),
-        SatResult::Unknown => panic!("A12 funnel hard assumption query returned Unknown"),
+        SatResult::Sat => (QueryVerdict::Sat, Vec::new()),
+        SatResult::Unknown => (QueryVerdict::Unknown, Vec::new()),
         SatResult::Unsat => {
             let mut families = Vec::new();
             for literal in solver.optimize().get_unsat_core() {
@@ -138,8 +169,16 @@ fn hard_query(
                 !families.is_empty(),
                 "UNSAT funnel query must name at least one hard family"
             );
-            (false, families)
+            (QueryVerdict::Unsat, families)
         }
+    }
+}
+
+fn untracked_query(solver: &KindSolver, force: Bool) -> QueryVerdict {
+    match solver.check_with_assumptions(&[force]) {
+        SatResult::Sat => QueryVerdict::Sat,
+        SatResult::Unsat => QueryVerdict::Unsat,
+        SatResult::Unknown => QueryVerdict::Unknown,
     }
 }
 
@@ -169,8 +208,25 @@ struct Measurement {
     ledger: String,
     s0_sites: usize,
     s1_sites: usize,
+    s2_unknown: usize,
+    s3_unknown: usize,
+    s2_sampled_losses: usize,
+    s3_sampled_losses: usize,
+    sampled_core_unknown: usize,
     tracked_checks: usize,
     final_selected_sites: usize,
+}
+
+struct PairStage {
+    candidate: CopyLendPairCandidate,
+    s2: QueryVerdict,
+    s3: Option<QueryVerdict>,
+    s2_core: Vec<String>,
+    s3_core: Vec<String>,
+    s2_core_scope: &'static str,
+    s3_core_scope: &'static str,
+    s2_core_status: &'static str,
+    s3_core_status: &'static str,
 }
 
 fn measure_program(tcx: TyCtxt<'_>, program_name: &str) -> Measurement {
@@ -194,21 +250,19 @@ fn measure_program(tcx: TyCtxt<'_>, program_name: &str) -> Measurement {
         .map(|candidate| candidate.sites.len())
         .sum::<usize>();
 
-    let tracked = KindSolver::new_family_tracked(&slots);
-    tracked.set_random_seed(0);
-    let tracked_construction = construct_bo_into(
+    let stage_solver = KindSolver::new_hard_only(&slots);
+    stage_solver.set_random_seed(0);
+    stage_solver.set_query_timeout(QUERY_TIMEOUT);
+    let stage_construction = construct_bo_into(
         &program,
         &slots,
         &origins,
         &mut_facts,
-        &tracked,
+        &stage_solver,
         CopyLendMode::LendArm,
     )
-    .expect("A12 funnel tracked construction");
-    let tracker = tracked.tracker().expect("A12 funnel family tracker");
-    tracker.set_context("field-law");
-    constrain_field_ownership(&tracked, &slots, &program);
-    let tracks = tracker.tracks();
+    .expect("A12 funnel hard-only construction");
+    constrain_field_ownership(&stage_solver, &slots, &program);
 
     let candidate_eligible = candidates
         .iter()
@@ -216,12 +270,138 @@ fn measure_program(tcx: TyCtxt<'_>, program_name: &str) -> Measurement {
         .map(|candidate| candidate.pair)
         .collect::<FxHashSet<_>>();
     assert_eq!(
-        candidate_eligible, tracked_construction.eligibility.pairs,
+        candidate_eligible, stage_construction.eligibility.pairs,
         "funnel classifier and production eligibility diverged"
     );
 
+    let mut stages = candidates
+        .into_iter()
+        .map(|candidate| {
+            let s2 = if candidate.drop.is_none() {
+                untracked_query(
+                    &stage_solver,
+                    stage_solver.owning_literal(candidate.pair.rhs),
+                )
+            } else {
+                QueryVerdict::Unsat
+            };
+            let s3 = if s2 == QueryVerdict::Sat {
+                Some(untracked_query(
+                    &stage_solver,
+                    stage_solver.lend_guard(candidate.pair.lhs, candidate.pair.rhs),
+                ))
+            } else {
+                None
+            };
+            PairStage {
+                candidate,
+                s2,
+                s3,
+                s2_core: Vec::new(),
+                s3_core: Vec::new(),
+                s2_core_scope: "na",
+                s3_core_scope: "na",
+                s2_core_status: "na",
+                s3_core_status: "na",
+            }
+        })
+        .collect::<Vec<_>>();
+
+    let s2_losses = stages
+        .iter()
+        .enumerate()
+        .filter_map(|(index, stage)| {
+            (stage.candidate.drop.is_none() && stage.s2 == QueryVerdict::Unsat).then_some(index)
+        })
+        .collect::<Vec<_>>();
+    let s3_losses = stages
+        .iter()
+        .enumerate()
+        .filter_map(|(index, stage)| {
+            (stage.s2 == QueryVerdict::Sat && stage.s3 == Some(QueryVerdict::Unsat))
+                .then_some(index)
+        })
+        .collect::<Vec<_>>();
+    let s2_sample = sample_loss_indices(&s2_losses);
+    let s3_sample = sample_loss_indices(&s3_losses);
+    let mut sampled_core_unknown = 0usize;
+    let tracked_checks = if s2_sample.is_empty() && s3_sample.is_empty() {
+        0
+    } else {
+        let tracked = KindSolver::new_family_tracked_hard_only(&slots);
+        tracked.set_random_seed(0);
+        tracked.set_query_timeout(QUERY_TIMEOUT);
+        let tracked_construction = construct_bo_into(
+            &program,
+            &slots,
+            &origins,
+            &mut_facts,
+            &tracked,
+            CopyLendMode::LendArm,
+        )
+        .expect("A12 funnel sampled family construction");
+        assert_eq!(
+            tracked_construction.eligibility.pairs, stage_construction.eligibility.pairs,
+            "sampled family construction eligibility diverged"
+        );
+        let tracker = tracked.tracker().expect("A12 funnel family tracker");
+        tracker.set_context("field-law");
+        constrain_field_ownership(&tracked, &slots, &program);
+        let tracks = tracker.tracks();
+        let s2_scope = if s2_losses.len() <= SAMPLE_K {
+            "exhaustive"
+        } else {
+            "sampled"
+        };
+        let s3_scope = if s3_losses.len() <= SAMPLE_K {
+            "exhaustive"
+        } else {
+            "sampled"
+        };
+        for index in s2_sample.iter().copied() {
+            let pair = stages[index].candidate.pair;
+            let (verdict, families) =
+                hard_query(&tracked, tracker, &tracks, tracked.owning_literal(pair.rhs));
+            assert_ne!(verdict, QueryVerdict::Sat, "sampled S2 loss became SAT");
+            sampled_core_unknown += usize::from(verdict == QueryVerdict::Unknown);
+            stages[index].s2_core = families;
+            stages[index].s2_core_scope = s2_scope;
+            stages[index].s2_core_status = verdict.label();
+        }
+        for index in s3_sample.iter().copied() {
+            let pair = stages[index].candidate.pair;
+            let (verdict, families) = hard_query(
+                &tracked,
+                tracker,
+                &tracks,
+                tracked.lend_guard(pair.lhs, pair.rhs),
+            );
+            assert_ne!(verdict, QueryVerdict::Sat, "sampled S3 loss became SAT");
+            sampled_core_unknown += usize::from(verdict == QueryVerdict::Unknown);
+            stages[index].s3_core = families;
+            stages[index].s3_core_scope = s3_scope;
+            stages[index].s3_core_status = verdict.label();
+        }
+        tracked.check_sat_count()
+    };
+    let s2_sample_set = s2_sample.into_iter().collect::<BTreeSet<_>>();
+    let s3_sample_set = s3_sample.into_iter().collect::<BTreeSet<_>>();
+    for index in s2_losses.iter().copied() {
+        if !s2_sample_set.contains(&index) {
+            stages[index].s2_core_scope = "unsampled";
+            stages[index].s2_core_status = "unsampled";
+        }
+    }
+    for index in s3_losses.iter().copied() {
+        if !s3_sample_set.contains(&index) {
+            stages[index].s3_core_scope = "unsampled";
+            stages[index].s3_core_status = "unsampled";
+        }
+    }
+
     let initial_solver = KindSolver::new(&slots);
     initial_solver.set_random_seed(0);
+    initial_solver.set_query_timeout(QUERY_TIMEOUT);
     let initial_construction = construct_bo_into(
         &program,
         &slots,
@@ -238,6 +418,7 @@ fn measure_program(tcx: TyCtxt<'_>, program_name: &str) -> Measurement {
 
     let final_solver = KindSolver::new(&slots);
     final_solver.set_random_seed(0);
+    final_solver.set_query_timeout(QUERY_TIMEOUT);
     let final_construction = construct_bo_into(
         &program,
         &slots,
@@ -268,28 +449,31 @@ fn measure_program(tcx: TyCtxt<'_>, program_name: &str) -> Measurement {
 
     let mut ledger = String::from(
         "program\tfunction\tlhs\trhs\tsite_count\tsites\ts0\ts1\ts2\ts3\ts4\t\
-         s0_s1_reason\ts2_core_families\ts3_core_families\tinitial_lhs_kind\t\
+         s0_s1_reason\ts2_query\ts3_query\ts2_core_families\ts3_core_families\t\
+         s2_core_scope\ts3_core_scope\ts2_core_status\ts3_core_status\tinitial_lhs_kind\t\
          initial_rhs_kind\tinitial_selected\tfinal_lhs_kind\tfinal_rhs_kind\t\
          final_selected\ts3_s4_reason\tcopy_lend_mode\tsmt_seed\tsat_seed\n",
     );
-    let mut bits = Vec::with_capacity(candidates.len());
-    for CopyLendPairCandidate { pair, sites, drop } in candidates {
+    let mut bits = Vec::with_capacity(stages.len());
+    let mut s2_unknown = 0usize;
+    let mut s3_unknown = 0usize;
+    for PairStage {
+        candidate: CopyLendPairCandidate { pair, sites, drop },
+        s2: s2_verdict,
+        s3: s3_verdict,
+        s2_core,
+        s3_core,
+        s2_core_scope,
+        s3_core_scope,
+        s2_core_status,
+        s3_core_status,
+    } in stages
+    {
         let s1 = drop.is_none();
-        let (s2, s2_core) = if s1 {
-            hard_query(&tracked, tracker, &tracks, tracked.owning_literal(pair.rhs))
-        } else {
-            (false, Vec::new())
-        };
-        let (s3, s3_core) = if s2 {
-            hard_query(
-                &tracked,
-                tracker,
-                &tracks,
-                tracked.lend_guard(pair.lhs, pair.rhs),
-            )
-        } else {
-            (false, Vec::new())
-        };
+        let s2 = s1 && s2_verdict == QueryVerdict::Sat;
+        let s3 = s2 && s3_verdict == Some(QueryVerdict::Sat);
+        s2_unknown += usize::from(s1 && s2_verdict == QueryVerdict::Unknown);
+        s3_unknown += usize::from(s2 && s3_verdict == Some(QueryVerdict::Unknown));
         let initial_lhs = initial_model.get(&pair.lhs);
         let initial_rhs = initial_model.get(&pair.rhs);
         let initial_selected =
@@ -327,35 +511,60 @@ fn measure_program(tcx: TyCtxt<'_>, program_name: &str) -> Measurement {
             .map(|site| format!("{}:{}", site.location.block, site.location.statement_index))
             .collect::<Vec<_>>()
             .join(",");
-        ledger.push_str(&format!(
-            "{}\t{}\t{}\t{}\t{}\t{}\t1\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\tlend_arm\t0\t0\n",
+        let cells = vec![
             clean_cell(program_name),
             clean_cell(&tcx.def_path_str(fn_did.to_def_id())),
             slotref_diagnostic(pair.lhs),
             slotref_diagnostic(pair.rhs),
-            sites.len(),
+            sites.len().to_string(),
             locations,
-            usize::from(s1),
-            usize::from(s2),
-            usize::from(s3),
-            usize::from(s4),
-            drop.map_or("eligible", |reason| reason.label()),
-            if s1 { join_families(&s2_core) } else { "na".to_owned() },
-            if s2 { join_families(&s3_core) } else { "na".to_owned() },
-            kind_label(initial_lhs),
-            kind_label(initial_rhs),
-            usize::from(initial_selected),
-            kind_label(final_lhs),
-            kind_label(final_rhs),
-            usize::from(s4),
+            "1".to_owned(),
+            usize::from(s1).to_string(),
+            usize::from(s2).to_string(),
+            usize::from(s3).to_string(),
+            usize::from(s4).to_string(),
+            drop.map_or("eligible", |reason| reason.label()).to_owned(),
+            if s1 { s2_verdict.label() } else { "na" }.to_owned(),
+            s3_verdict.map_or("na", QueryVerdict::label).to_owned(),
+            if s1 && s2_verdict == QueryVerdict::Unsat {
+                join_families(&s2_core)
+            } else {
+                "na".to_owned()
+            },
+            if s3_verdict == Some(QueryVerdict::Unsat) {
+                join_families(&s3_core)
+            } else {
+                "na".to_owned()
+            },
+            s2_core_scope.to_owned(),
+            s3_core_scope.to_owned(),
+            s2_core_status.to_owned(),
+            s3_core_status.to_owned(),
+            kind_label(initial_lhs).to_owned(),
+            kind_label(initial_rhs).to_owned(),
+            usize::from(initial_selected).to_string(),
+            kind_label(final_lhs).to_owned(),
+            kind_label(final_rhs).to_owned(),
+            usize::from(s4).to_string(),
             s3_s4_reason,
-        ));
+            "lend_arm".to_owned(),
+            "0".to_owned(),
+            "0".to_owned(),
+        ];
+        assert_eq!(cells.len(), 30, "A12 funnel ledger schema drifted");
+        ledger.push_str(&cells.join("\t"));
+        ledger.push('\n');
         bits.push(stage);
     }
 
     Measurement {
         s1_sites: final_construction.eligibility.sites.len(),
-        tracked_checks: tracked.check_sat_count(),
+        s2_unknown,
+        s3_unknown,
+        s2_sampled_losses: s2_sample_set.len(),
+        s3_sampled_losses: s3_sample_set.len(),
+        sampled_core_unknown,
+        tracked_checks,
         bits,
         ledger,
         s0_sites,
@@ -374,8 +583,9 @@ pub(crate) fn run_worker(tcx: TyCtxt<'_>, t_tcx: Duration) -> Row {
     let counts = summarize(&measurement.bits);
 
     let mut row = Row::default();
-    row.set("status", "ok");
-    row.set("data", "true");
+    let has_unknown = measurement.s2_unknown > 0 || measurement.s3_unknown > 0;
+    row.set("status", if has_unknown { "unknown" } else { "ok" });
+    row.set("data", if has_unknown { "false" } else { "true" });
     row.set("copy_lend_mode", CopyLendMode::current().label());
     row.set("repair", RepairMode::current().label());
     row.set("l2", "0");
@@ -384,11 +594,23 @@ pub(crate) fn run_worker(tcx: TyCtxt<'_>, t_tcx: Duration) -> Row {
     row.set("z3_full_version", z3::full_version().to_string());
     row.set("smt_seed", 0);
     row.set("sat_seed", 0);
+    row.set("funnel_query_timeout_s", QUERY_TIMEOUT.as_secs());
+    row.set("funnel_program_bound_s", program_bound_seconds(counts.s1));
+    row.set("funnel_sample_k", SAMPLE_K);
+    row.set("funnel_attribution_scope", "sampled-option-a");
     row.set("funnel_s0", counts.s0);
     row.set("funnel_s1", counts.s1);
     row.set("funnel_s2", counts.s2);
     row.set("funnel_s3", counts.s3);
     row.set("funnel_s4", counts.s4);
+    row.set("funnel_s2_unknown", measurement.s2_unknown);
+    row.set("funnel_s3_unknown", measurement.s3_unknown);
+    row.set("funnel_s2_sampled_losses", measurement.s2_sampled_losses);
+    row.set("funnel_s3_sampled_losses", measurement.s3_sampled_losses);
+    row.set(
+        "funnel_sampled_core_unknown",
+        measurement.sampled_core_unknown,
+    );
     row.set("funnel_s0_sites", measurement.s0_sites);
     row.set("funnel_s1_sites", measurement.s1_sites);
     row.set("funnel_initial_selected", counts.initial_selected);
@@ -411,11 +633,77 @@ pub(crate) fn run_worker(tcx: TyCtxt<'_>, t_tcx: Duration) -> Row {
     row
 }
 
+pub(crate) fn run_subject_worker(tcx: TyCtxt<'_>, t_tcx: Duration) -> Row {
+    let t0 = Instant::now();
+    assert_eq!(CopyLendMode::current(), CopyLendMode::LendArm);
+    let program = collect_program(tcx);
+    let origins = compute_origins(&program);
+    let slots = CrateSlots::build(&program);
+    let mut_facts = MutFacts::from_program(&program);
+    let candidates =
+        analyze_copy_lend_candidates(&program, &slots, &mut_facts, origins.native_flows());
+    let s1 = candidates
+        .iter()
+        .filter(|candidate| candidate.drop.is_none())
+        .count();
+    let mut row = Row::default();
+    row.set("status", "ok");
+    row.set("data", "false");
+    row.set("measurement", "funnel-bound-preflight");
+    row.set("copy_lend_mode", CopyLendMode::current().label());
+    row.set("smt_seed", 0);
+    row.set("sat_seed", 0);
+    row.set("funnel_s0", candidates.len());
+    row.set("funnel_s1", s1);
+    row.set("funnel_program_bound_s", program_bound_seconds(s1));
+    row.set("t_tcx_s", format!("{:.3}", t_tcx.as_secs_f64()));
+    row.set(
+        "t_total_s",
+        format!("{:.3}", (t_tcx + t0.elapsed()).as_secs_f64()),
+    );
+    row
+}
+
 fn usize_field(row: &Row, key: &str) -> usize {
     row.get(key)
         .unwrap_or_else(|| panic!("A12 funnel row lacks {key}: {row:?}"))
         .parse()
         .unwrap_or_else(|error| panic!("A12 funnel row has invalid {key}: {error}"))
+}
+
+fn aggregate_stage_counts(rows: &[Row]) -> StageCounts {
+    StageCounts {
+        s0: rows.iter().map(|row| usize_field(row, "funnel_s0")).sum(),
+        s1: rows.iter().map(|row| usize_field(row, "funnel_s1")).sum(),
+        s2: rows.iter().map(|row| usize_field(row, "funnel_s2")).sum(),
+        s3: rows.iter().map(|row| usize_field(row, "funnel_s3")).sum(),
+        s4: rows.iter().map(|row| usize_field(row, "funnel_s4")).sum(),
+        initial_selected: rows
+            .iter()
+            .map(|row| usize_field(row, "funnel_initial_selected"))
+            .sum(),
+        pre_replay_not_selected: rows
+            .iter()
+            .map(|row| usize_field(row, "funnel_pre_replay_not_selected"))
+            .sum(),
+        replay_lost: rows
+            .iter()
+            .map(|row| usize_field(row, "funnel_replay_lost"))
+            .sum(),
+    }
+}
+
+fn append_ledger(combined: &mut String, ledger: &str) {
+    let mut lines = ledger.lines();
+    let header = lines.next().expect("A12 funnel pair header");
+    if combined.is_empty() {
+        combined.push_str(header);
+        combined.push('\n');
+    }
+    for line in lines {
+        combined.push_str(line);
+        combined.push('\n');
+    }
 }
 
 fn aggregate_ledger(ledger: &str) -> BTreeMap<(String, String), usize> {
@@ -442,12 +730,18 @@ fn aggregate_ledger(ledger: &str) -> BTreeMap<(String, String), usize> {
                 .or_default() += 1;
         } else if fields[s2_i] == "0" {
             for family in fields[s2_core_i].split(',') {
+                if matches!(family, "none" | "na") {
+                    continue;
+                }
                 *counts
                     .entry(("S1->S2".to_owned(), family.to_owned()))
                     .or_default() += 1;
             }
         } else if fields[s3_i] == "0" {
             for family in fields[s3_core_i].split(',') {
+                if matches!(family, "none" | "na") {
+                    continue;
+                }
                 *counts
                     .entry(("S2->S3".to_owned(), family.to_owned()))
                     .or_default() += 1;
@@ -459,6 +753,150 @@ fn aggregate_ledger(ledger: &str) -> BTreeMap<(String, String), usize> {
         }
     }
     counts
+}
+
+fn sampled_attribution_tables(ledgers: &[(String, String)]) -> (String, String) {
+    let mut tsv = String::from(
+        "program\ttransition\tscope\tpopulation_losses\tsampled_losses\tcore_unknown\t\
+         family\tincidence\tpercent_of_sample\tcopy_lend_mode\tsample_k\n",
+    );
+    let mut markdown = String::from(
+        "| program | transition | scope | population losses | sampled | core Unknown | family | incidence | sample % |\n\
+         |---|---|---|---:|---:|---:|---|---:|---:|\n",
+    );
+    let mut aggregate_population = BTreeMap::<String, usize>::new();
+    let mut aggregate_sampled = BTreeMap::<String, usize>::new();
+    let mut aggregate_unknown = BTreeMap::<String, usize>::new();
+    let mut aggregate_families = BTreeMap::<(String, String), usize>::new();
+
+    for (program, ledger) in ledgers {
+        let mut lines = ledger.lines();
+        let header = lines.next().expect("Option-A funnel ledger header");
+        let columns = header.split('\t').collect::<Vec<_>>();
+        let index = |name: &str| {
+            columns
+                .iter()
+                .position(|column| *column == name)
+                .unwrap_or_else(|| panic!("Option-A funnel ledger lacks {name}"))
+        };
+        let records = lines
+            .filter(|line| !line.is_empty())
+            .map(|line| line.split('\t').collect::<Vec<_>>())
+            .collect::<Vec<_>>();
+        for (transition, from, to, scope_name, status_name, families_name) in [
+            (
+                "S1->S2",
+                "s1",
+                "s2",
+                "s2_core_scope",
+                "s2_core_status",
+                "s2_core_families",
+            ),
+            (
+                "S2->S3",
+                "s2",
+                "s3",
+                "s3_core_scope",
+                "s3_core_status",
+                "s3_core_families",
+            ),
+        ] {
+            let (from_i, to_i) = (index(from), index(to));
+            let (scope_i, status_i, families_i) =
+                (index(scope_name), index(status_name), index(families_name));
+            let losses = records
+                .iter()
+                .filter(|record| record[from_i] == "1" && record[to_i] == "0")
+                .collect::<Vec<_>>();
+            let sampled = losses
+                .iter()
+                .copied()
+                .filter(|record| matches!(record[scope_i], "sampled" | "exhaustive"))
+                .collect::<Vec<_>>();
+            let scope = if losses.len() <= SAMPLE_K {
+                "EXHAUSTIVE"
+            } else {
+                "SAMPLED"
+            };
+            assert_eq!(
+                sampled.len(),
+                losses.len().min(SAMPLE_K),
+                "{program} {transition} deterministic sample size drifted"
+            );
+            let unknown = sampled
+                .iter()
+                .filter(|record| record[status_i] == "unknown")
+                .count();
+            let mut families = BTreeMap::<String, usize>::new();
+            for record in sampled.iter().filter(|record| record[status_i] == "unsat") {
+                for family in record[families_i].split(',') {
+                    if !matches!(family, "none" | "na") {
+                        *families.entry(family.to_owned()).or_default() += 1;
+                    }
+                }
+            }
+            if families.is_empty() {
+                families.insert("none".to_owned(), 0);
+            }
+            *aggregate_population
+                .entry(transition.to_owned())
+                .or_default() += losses.len();
+            *aggregate_sampled.entry(transition.to_owned()).or_default() += sampled.len();
+            *aggregate_unknown.entry(transition.to_owned()).or_default() += unknown;
+            for (family, incidence) in &families {
+                if family != "none" {
+                    *aggregate_families
+                        .entry((transition.to_owned(), family.clone()))
+                        .or_default() += incidence;
+                }
+                let percent = if sampled.is_empty() {
+                    0.0
+                } else {
+                    *incidence as f64 * 100.0 / sampled.len() as f64
+                };
+                tsv.push_str(&format!(
+                    "{program}\t{transition}\t{scope}\t{}\t{}\t{unknown}\t{family}\t{incidence}\t{percent:.2}\tlend_arm\t{SAMPLE_K}\n",
+                    losses.len(),
+                    sampled.len(),
+                ));
+                markdown.push_str(&format!(
+                    "| {program} | {transition} | {scope} | {} | {} | {unknown} | {family} | {incidence} | {percent:.2} |\n",
+                    losses.len(),
+                    sampled.len(),
+                ));
+            }
+        }
+    }
+
+    for transition in ["S1->S2", "S2->S3"] {
+        let population = aggregate_population.get(transition).copied().unwrap_or(0);
+        let sampled = aggregate_sampled.get(transition).copied().unwrap_or(0);
+        let unknown = aggregate_unknown.get(transition).copied().unwrap_or(0);
+        let families = aggregate_families
+            .iter()
+            .filter(|((candidate, _), _)| candidate == transition)
+            .map(|((_, family), incidence)| (family.clone(), *incidence))
+            .collect::<Vec<_>>();
+        let families = if families.is_empty() {
+            vec![("none".to_owned(), 0)]
+        } else {
+            families
+        };
+        for (family, incidence) in families {
+            let percent = if sampled == 0 {
+                0.0
+            } else {
+                incidence as f64 * 100.0 / sampled as f64
+            };
+            tsv.push_str(&format!(
+                "ALL_FIVE\t{transition}\tSAMPLED\t{population}\t{sampled}\t{unknown}\t{family}\t{incidence}\t{percent:.2}\tlend_arm\t{SAMPLE_K}\n"
+            ));
+            markdown.push_str(&format!(
+                "| **ALL FIVE** | {transition} | **SAMPLED** | {population} | {sampled} | {unknown} | {family} | {incidence} | {percent:.2} |\n"
+            ));
+        }
+    }
+    (tsv, markdown)
 }
 
 fn route_for(counts: StageCounts) -> &'static str {
@@ -685,6 +1123,335 @@ fn a12_copy_lend_funnel_corpus() {
     );
 }
 
+#[test]
+#[ignore = "A12 Option-A completion: retain 15 exact shards, run remaining five"]
+fn a12_copy_lend_funnel_option_a_completion() {
+    const PRIOR: &[&str] = &[
+        "bst",
+        "avl",
+        "ht",
+        "libcsv",
+        "buffer",
+        "quadtree",
+        "urlparser",
+        "robotfindskitten",
+        "rgba",
+        "genann",
+        "libtree",
+        "json.h",
+        "binn",
+        "libzahl",
+        "lil",
+    ];
+    const REMAINING: &[&str] = &["heman", "bzip2", "lodepng", "tulipindicators", "brotli"];
+    assert_eq!(
+        std::env::var("CRAT_BO_COPY_LEND_MODE").as_deref(),
+        Ok("lend_arm")
+    );
+    assert_eq!(std::env::var("CRAT_BO_REPAIR").as_deref(), Ok("mode_a"));
+    assert_eq!(
+        std::env::var("CRAT_BO_L2_GUARDED_COMMITS").as_deref(),
+        Ok("0")
+    );
+    assert_eq!(std::env::var("CRAT_BOC1_MEM_MB").as_deref(), Ok("49152"));
+    assert_eq!(CORPUS.len(), 20);
+    assert_eq!(PRIOR.len() + REMAINING.len(), CORPUS.len());
+
+    let prior_root = std::env::var("CRAT_BOC1_FUNNEL_PRIOR_ROOT")
+        .map(std::path::PathBuf::from)
+        .expect("Option A requires CRAT_BOC1_FUNNEL_PRIOR_ROOT");
+    let root = orchestrate::workspace_root();
+    assert!(root.join("benchmarks/rs-crown-derived").is_dir());
+    assert!(root.join("deps_crate/target/debug/deps").is_dir());
+    let out = orchestrate::out_dir();
+    let pair_dir = out.join("pairs-option-a");
+    fs::create_dir_all(&pair_dir).expect("create Option-A output");
+
+    let mut rows = Vec::new();
+    let mut prior_ledgers = Vec::<(String, String)>::new();
+    let mut new_ledgers = Vec::<(String, String)>::new();
+    let mut combined_new = String::new();
+    let mut bounds = String::from(
+        "program\ts1_pairs\tprogram_bound_seconds\tpreflight_wall_seconds\t\
+         worker_wall_seconds\tcopy_lend_mode\n",
+    );
+    for program in CORPUS {
+        if PRIOR.contains(&program.name) {
+            let stdout_path = prior_root
+                .join("logs")
+                .join(format!("{}.copy-lend-funnel.out", program.name));
+            let stdout = fs::read_to_string(&stdout_path)
+                .unwrap_or_else(|error| panic!("read {}: {error}", stdout_path.display()));
+            let mut row = stdout
+                .lines()
+                .find_map(super::report::parse_kv_line)
+                .unwrap_or_else(|| panic!("{} prior row missing", program.name));
+            assert_eq!(row.get("status"), Some("ok"));
+            assert_eq!(row.get("copy_lend_mode"), Some("lend_arm"));
+            row.set("program", program.name);
+            row.set("sloc", program.sloc);
+            row.set("shard_scope", "prior-exhaustive");
+            row.set("shard_head", "c46a4cb9ea266615436771649eaa931066e5f38a");
+            let ledger_path = prior_root
+                .join("pairs")
+                .join(format!("{}.tsv", program.name));
+            let ledger = fs::read_to_string(&ledger_path)
+                .unwrap_or_else(|error| panic!("read {}: {error}", ledger_path.display()));
+            prior_ledgers.push((program.name.to_owned(), ledger));
+            rows.push(row);
+            continue;
+        }
+        assert!(REMAINING.contains(&program.name));
+        let preflight = orchestrate::run_child(
+            program.name,
+            &program.input_path(&root),
+            "copy-lend-funnel-subjects",
+            Duration::from_secs(14_400),
+        );
+        assert_eq!(
+            preflight.status, "ok",
+            "{} Option-A preflight failed: {}",
+            program.name, preflight.note
+        );
+        let preflight_row = preflight.row.expect("Option-A preflight row");
+        assert_eq!(preflight_row.get("copy_lend_mode"), Some("lend_arm"));
+        let s1 = usize_field(&preflight_row, "funnel_s1");
+        let bound = program_bound_seconds(s1);
+        assert_eq!(
+            usize_field(&preflight_row, "funnel_program_bound_s"),
+            usize::try_from(bound).expect("bound fits usize")
+        );
+        let pair_path = pair_dir.join(format!("{}.tsv", program.name));
+        let outcome = orchestrate::run_child_env(
+            program.name,
+            &program.input_path(&root),
+            "copy-lend-funnel",
+            Duration::from_secs(bound),
+            &[(
+                "CRAT_BOC1_FUNNEL_PAIR_ARTIFACT",
+                pair_path.display().to_string(),
+            )],
+        );
+        assert_eq!(
+            outcome.status, "ok",
+            "{} Option-A worker failed: {}",
+            program.name, outcome.note
+        );
+        let mut row = outcome.row.expect("Option-A worker row");
+        assert_eq!(row.get("copy_lend_mode"), Some("lend_arm"));
+        assert_eq!(usize_field(&row, "funnel_s1"), s1);
+        assert_eq!(usize_field(&row, "funnel_s2_unknown"), 0);
+        assert_eq!(usize_field(&row, "funnel_s3_unknown"), 0);
+        row.set("program", program.name);
+        row.set("sloc", program.sloc);
+        row.set("wall_s", format!("{:.3}", outcome.wall_s));
+        row.set("peak_rss_kb", outcome.peak_rss_kb);
+        row.set("shard_scope", "option-a-sampled");
+        row.set("shard_head", orchestrate::git_sha());
+        bounds.push_str(&format!(
+            "{}\t{s1}\t{bound}\t{:.3}\t{:.3}\tlend_arm\n",
+            program.name, preflight.wall_s, outcome.wall_s
+        ));
+        let ledger = fs::read_to_string(&pair_path).expect("read Option-A pair ledger");
+        append_ledger(&mut combined_new, &ledger);
+        new_ledgers.push((program.name.to_owned(), ledger));
+        rows.push(row);
+    }
+
+    let corpus_names = rows
+        .iter()
+        .map(|row| row.get("program").expect("program row"))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        corpus_names,
+        CORPUS
+            .iter()
+            .map(|program| program.name)
+            .collect::<Vec<_>>()
+    );
+    let aggregate = aggregate_stage_counts(&rows);
+    let exact_unknown = rows
+        .iter()
+        .map(|row| {
+            row.get("funnel_s2_unknown")
+                .and_then(|value| value.parse::<usize>().ok())
+                .unwrap_or(0)
+                + row
+                    .get("funnel_s3_unknown")
+                    .and_then(|value| value.parse::<usize>().ok())
+                    .unwrap_or(0)
+        })
+        .sum::<usize>();
+    assert_eq!(exact_unknown, 0, "exact funnel contains typed Unknown rows");
+    assert_eq!(
+        aggregate.s1, 911,
+        "A12 funnel S1 residual against three-way"
+    );
+    assert_eq!(aggregate.s4, 0, "A12 funnel S4 anchor drifted");
+    assert_eq!(
+        aggregate.pre_replay_not_selected + aggregate.replay_lost,
+        aggregate.s3 - aggregate.s4,
+        "S3->S4 attribution does not partition the full loss"
+    );
+
+    let mut prior_combined = String::new();
+    for (_, ledger) in &prior_ledgers {
+        append_ledger(&mut prior_combined, ledger);
+    }
+    let prior_counts = aggregate_ledger(&prior_combined);
+    let new_counts = aggregate_ledger(&combined_new);
+    let mut exact_edges = BTreeMap::<(String, String), usize>::new();
+    for (key, count) in prior_counts.iter().chain(new_counts.iter()) {
+        if matches!(key.0.as_str(), "S0->S1" | "S3->S4") {
+            *exact_edges.entry(key.clone()).or_default() += count;
+        }
+    }
+    let mut exact_edges_tsv =
+        String::from("transition\treason\tincidence\tscope\tcopy_lend_mode\n");
+    let mut exact_edges_md = String::new();
+    for ((transition, reason), incidence) in exact_edges {
+        exact_edges_tsv.push_str(&format!(
+            "{transition}\t{reason}\t{incidence}\tEXHAUSTIVE\tlend_arm\n"
+        ));
+        exact_edges_md.push_str(&format!(
+            "| {transition} | {reason} | {incidence} | EXHAUSTIVE |\n"
+        ));
+    }
+
+    let prior_stage = aggregate_stage_counts(
+        &rows
+            .iter()
+            .filter(|row| row.get("shard_scope") == Some("prior-exhaustive"))
+            .cloned()
+            .collect::<Vec<_>>(),
+    );
+    let prior_s2_losses = prior_stage.s1 - prior_stage.s2;
+    let mut prior_family_tsv = String::from(
+        "transition\tfamily\tincidence\tloss_denominator\tpercent\tscope\tcopy_lend_mode\n",
+    );
+    let mut prior_family_md = String::new();
+    for ((transition, family), incidence) in &prior_counts {
+        if transition != "S1->S2" && transition != "S2->S3" {
+            continue;
+        }
+        let denominator = if transition == "S1->S2" {
+            prior_s2_losses
+        } else {
+            prior_stage.s2 - prior_stage.s3
+        };
+        let percent = if denominator == 0 {
+            0.0
+        } else {
+            *incidence as f64 * 100.0 / denominator as f64
+        };
+        prior_family_tsv.push_str(&format!(
+            "{transition}\t{family}\t{incidence}\t{denominator}\t{percent:.2}\tEXHAUSTIVE\tlend_arm\n"
+        ));
+        prior_family_md.push_str(&format!(
+            "| {transition} | {family} | {incidence}/{denominator} | {percent:.2} | EXHAUSTIVE |\n"
+        ));
+    }
+    let (sample_tsv, sample_md) = sampled_attribution_tables(&new_ledgers);
+
+    let columns = [
+        "program",
+        "funnel_s0",
+        "funnel_s1",
+        "funnel_s2",
+        "funnel_s3",
+        "funnel_s4",
+        "funnel_initial_selected",
+        "funnel_pre_replay_not_selected",
+        "funnel_replay_lost",
+        "shard_scope",
+    ];
+    let report = format!(
+        "# A12 CopyLend funnel — Option A completion\n\n\
+         Mode `lend_arm`, default remains `baseline`; seeds 0/0; exact S0–S4; \
+         first 15 family cores exhaustive; remaining-five family cores K={SAMPLE_K} sampled.\n\n\
+         {}\n\
+         **TOTAL:** S0={} / S1={} / S2={} / S3={} / S4={}; initial selected={}; \
+         pre-replay nonselection={}; replay lost={}; exact Unknown={exact_unknown}.\n\n\
+         Transition losses: S0→S1={}, S1→S2={}, S2→S3={}, S3→S4={}.\n\n\
+         ## Exact edge attribution\n\n\
+         | transition | reason | incidence | scope |\n|---|---|---:|---|\n{exact_edges_md}\n\
+         ## First-15 family attribution\n\n\
+         | transition | family | incidence/denominator | % | scope |\n|---|---|---:|---:|---|\n{prior_family_md}\n\
+         ## Remaining-five family attribution\n\n{sample_md}\n\
+         The first-15 S3→S4 Ref/Ref result is correct behavior, not evidence for an objective reward. \
+         Loop-2 routing is reserved to the user.\n",
+        super::report::render_markdown(&rows, &columns),
+        aggregate.s0,
+        aggregate.s1,
+        aggregate.s2,
+        aggregate.s3,
+        aggregate.s4,
+        aggregate.initial_selected,
+        aggregate.pre_replay_not_selected,
+        aggregate.replay_lost,
+        aggregate.s0 - aggregate.s1,
+        aggregate.s1 - aggregate.s2,
+        aggregate.s2 - aggregate.s3,
+        aggregate.s3 - aggregate.s4,
+    );
+
+    fs::write(out.join("option-a-pair-ledger.tsv"), &combined_new)
+        .expect("write Option-A pair ledger");
+    fs::write(out.join("exact-edge-attribution.tsv"), exact_edges_tsv)
+        .expect("write exact edge attribution");
+    fs::write(
+        out.join("prior-exhaustive-family-attribution.tsv"),
+        prior_family_tsv,
+    )
+    .expect("write prior family attribution");
+    fs::write(
+        out.join("option-a-sampled-family-attribution.tsv"),
+        sample_tsv,
+    )
+    .expect("write sampled family attribution");
+    fs::write(out.join("program-bounds.tsv"), bounds).expect("write Option-A bounds");
+    fs::write(out.join("results.csv"), super::report::render_csv(&rows))
+        .expect("write Option-A results CSV");
+    let mut jsonl = provenance::line(
+        &orchestrate::git_sha(),
+        orchestrate::git_dirty(),
+        orchestrate::now_unix(),
+    );
+    jsonl.push('\n');
+    for row in &rows {
+        jsonl.push_str(&super::report::to_json_line(row));
+        jsonl.push('\n');
+    }
+    fs::write(out.join("results.jsonl"), jsonl).expect("write Option-A results JSONL");
+    fs::write(out.join("report.md"), &report).expect("write Option-A report");
+    fs::write(
+        out.join("receipt.txt"),
+        format!(
+            "schema=a12-copy-lend-funnel-option-a-v1\nstatus=ok\ndata=true\nanalysis_head={}\n\
+             analysis_dirty={}\nprior_head=c46a4cb9ea266615436771649eaa931066e5f38a\n\
+             prior_root={}\nderived_substrate_digest={CORPUS_DIGEST}\nprograms=20\nprior_exact_programs=15\n\
+             option_a_programs=5\ncopy_lend_mode=lend_arm\ndefault_mode=baseline\nrepair=mode_a\nl2=0\n\
+             smt_random_seed=0\nsat_random_seed=0\nquery_timeout_seconds=600\n\
+             program_bound_formula=max(14400,S1_pairs*300)\nsample_k={SAMPLE_K}\nsample_rule=first-K-by-pinned-pair-order\n\
+             s0={}\ns1={}\ns2={}\ns3={}\ns4={}\nexact_unknown={exact_unknown}\n\
+             initial_selected={}\npre_replay_not_selected={}\nreplay_lost={}\nloop2_route=user-reserved\n",
+            orchestrate::git_sha(),
+            orchestrate::git_dirty(),
+            prior_root.display(),
+            aggregate.s0,
+            aggregate.s1,
+            aggregate.s2,
+            aggregate.s3,
+            aggregate.s4,
+            aggregate.initial_selected,
+            aggregate.pre_replay_not_selected,
+            aggregate.replay_lost,
+        ),
+    )
+    .expect("write Option-A receipt");
+    println!("{report}");
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -755,6 +1522,21 @@ mod tests {
                 "registered family {family} must occur exactly once"
             );
         }
+    }
+
+    #[test]
+    fn option_a_sample_is_the_first_k_losses_in_pinned_order() {
+        let losses = (10..22).collect::<Vec<_>>();
+        assert_eq!(sample_loss_indices(&losses), (10..18).collect::<Vec<_>>());
+        assert_eq!(sample_loss_indices(&losses[..5]), losses[..5]);
+    }
+
+    #[test]
+    fn option_a_program_bound_inherits_the_census_formula() {
+        assert_eq!(program_bound_seconds(0), 14_400);
+        assert_eq!(program_bound_seconds(48), 14_400);
+        assert_eq!(program_bound_seconds(49), 14_700);
+        assert_eq!(program_bound_seconds(171), 51_300);
     }
 
     #[test]
