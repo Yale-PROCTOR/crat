@@ -4,7 +4,10 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use petgraph::{algo::kosaraju_scc, graphmap::DiGraphMap};
 
-use super::l2::{FnKey, MirLocationKey, SlotKey};
+use super::{
+    l2::{FnKey, MirLocationKey, SlotKey},
+    solver::{KindSolver, SlotRef},
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub(crate) struct ParamPair {
@@ -400,6 +403,40 @@ impl A5Mode {
             Self::CoarseConstraint => "coarse_constraint",
         }
     }
+
+    pub(crate) fn proposed_landing() -> Self {
+        Self::PreciseReplay
+    }
+
+    pub(crate) fn is_pricing_control(self) -> bool {
+        self == Self::CoarseConstraint
+    }
+}
+
+pub(crate) fn apply_coarse_constraints(
+    mode: A5Mode,
+    solver: &KindSolver,
+    pairs: impl IntoIterator<Item = (SlotRef, SlotRef)>,
+) -> usize {
+    if mode != A5Mode::CoarseConstraint {
+        return 0;
+    }
+    let mut canonical = BTreeMap::new();
+    for (left, right) in pairs {
+        assert_ne!(left, right, "A5 coarse pair must contain distinct slots");
+        let left_key = SlotKey::of(left);
+        let right_key = SlotKey::of(right);
+        let (key, pair) = if left_key < right_key {
+            ((left_key, right_key), (left, right))
+        } else {
+            ((right_key, left_key), (right, left))
+        };
+        canonical.insert(key, pair);
+    }
+    for &(left, right) in canonical.values() {
+        solver.add_a5_coarse_exclusion(left, right);
+    }
+    canonical.len()
 }
 
 impl A5World {

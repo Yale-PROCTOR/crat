@@ -9745,6 +9745,7 @@ mod borrow_ownership_solver {
     use crate::{
         analyses::borrow_ownership::{
             SlotKind,
+            a5_overlap::{A5Mode, apply_coarse_constraints},
             crate_slots::CrateSlots,
             slots::SlotId,
             solver::{KindSolver, SlotRef},
@@ -9924,6 +9925,41 @@ pub unsafe fn g(pp: *mut *mut i32) -> i32 {
             let model = ks.model_kinds().expect("satisfiable model");
             assert_eq!(model.get(&s0), Some(&SlotKind::Raw));
             assert_eq!(model.get(&s1), Some(&SlotKind::Raw));
+        });
+    }
+
+    #[test]
+    fn a5_baseline_and_precise_modes_do_not_add_coarse_constraints() {
+        with_g_slots(|_, slots, g, d0, d1| {
+            let left = SlotRef::Local(g, d0);
+            let right = SlotRef::Local(g, d1);
+            let expected = KindSolver::new(slots)
+                .model_kinds()
+                .expect("baseline model");
+            for mode in [A5Mode::Baseline, A5Mode::PreciseReplay] {
+                let solver = KindSolver::new(slots);
+                assert_eq!(apply_coarse_constraints(mode, &solver, [(left, right)]), 0);
+                assert_eq!(solver.model_kinds().expect("neutral model"), expected);
+            }
+            assert_eq!(A5Mode::proposed_landing(), A5Mode::PreciseReplay);
+            assert!(!A5Mode::PreciseReplay.is_pricing_control());
+        });
+    }
+
+    #[test]
+    fn a5_coarse_mode_forbids_both_slots_ref() {
+        with_g_slots(|_, slots, g, d0, d1| {
+            let left = SlotRef::Local(g, d0);
+            let right = SlotRef::Local(g, d1);
+            let solver = KindSolver::new(slots);
+            assert_eq!(
+                apply_coarse_constraints(A5Mode::CoarseConstraint, &solver, [(right, left)]),
+                1
+            );
+            solver.assume(left, SlotKind::Ref);
+            solver.assume(right, SlotKind::Ref);
+            assert_eq!(solver.check(), SatResult::Unsat);
+            assert!(A5Mode::CoarseConstraint.is_pricing_control());
         });
     }
 }

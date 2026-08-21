@@ -660,6 +660,29 @@ impl KindSolver {
         );
     }
 
+    /// A5 coarse pricing control: a may-overlapping formal pair cannot both
+    /// settle `Ref`. This is deliberately separate from precise replay and is
+    /// never the proposed landing consumer.
+    pub(crate) fn add_a5_coarse_exclusion(&self, left: SlotRef, right: SlotRef) {
+        assert_ne!(left, right, "A5 coarse pair must contain distinct slots");
+        let left_ref = &self
+            .vars
+            .get(&left)
+            .unwrap_or_else(|| panic!("unknown A5 slot: {left:?}"))
+            .ref_;
+        let right_ref = &self
+            .vars
+            .get(&right)
+            .unwrap_or_else(|| panic!("unknown A5 slot: {right:?}"))
+            .ref_;
+        assert_hard(
+            &self.solver,
+            self.tracker.as_ref(),
+            || format!("a5-coarse-exclusion({left:?},{right:?})"),
+            &Bool::or(&[&!left_ref, &!right_ref]),
+        );
+    }
+
     /// L2 context-conditioned single-literal commit. The planner supplies a
     /// witnessed-context clause. Ref-witnessed peers and the target contribute
     /// negative `ref` literals; Raw-witnessed peers contribute positive `ref`
