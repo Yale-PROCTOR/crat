@@ -100,6 +100,47 @@ pub(crate) struct CopyLendEligibility {
     pub(crate) sites: Vec<CopyLendSite>,
 }
 
+/// Exact primary exclusion used by the retained A12 funnel diagnostic. The
+/// production predicate and the diagnostic share this enum-returning
+/// classifier, so measurement cannot silently reinterpret eligibility.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CopyLendEligibilityDrop {
+    C2MutableOrMissingDestination,
+    C3FieldInClosure,
+    S22FreeDestination,
+    C3AggregateStore,
+    C3FieldStore,
+    C3Return,
+    C3UnresolvedStore,
+    C3OrdinaryCall,
+    C3ReallocSource,
+    C3OutwardUnknownCall,
+}
+
+impl CopyLendEligibilityDrop {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::C2MutableOrMissingDestination => "c2-mutable-or-missing-destination",
+            Self::C3FieldInClosure => "c3-field-in-closure",
+            Self::S22FreeDestination => "s2-2-free-destination",
+            Self::C3AggregateStore => "c3-aggregate-store",
+            Self::C3FieldStore => "c3-field-store",
+            Self::C3Return => "c3-return",
+            Self::C3UnresolvedStore => "c3-unresolved-store",
+            Self::C3OrdinaryCall => "c3-ordinary-call",
+            Self::C3ReallocSource => "c3-realloc-source",
+            Self::C3OutwardUnknownCall => "c3-outward-unknown-call",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct CopyLendPairCandidate {
+    pub(crate) pair: CopyLendPair,
+    pub(crate) sites: Vec<CopyLendSite>,
+    pub(crate) drop: Option<CopyLendEligibilityDrop>,
+}
+
 pub(crate) struct BoConstruction {
     pub(crate) mode: CopyLendMode,
     pub(crate) selectors: Selectors,
@@ -305,6 +346,23 @@ pub(crate) fn analyze_copy_lend_eligibility(
     origin_flows: &OriginFlowResults,
 ) -> CopyLendEligibility {
     let mut eligible = CopyLendEligibility::default();
+    for candidate in analyze_copy_lend_candidates(program, slots, mut_facts, origin_flows) {
+        if candidate.drop.is_none() {
+            eligible.pairs.insert(candidate.pair);
+            eligible.sites.extend(candidate.sites);
+        }
+    }
+    eligible.sites.sort_by_key(|site| site.sort_key());
+    eligible
+}
+
+pub(crate) fn analyze_copy_lend_candidates(
+    program: &RustProgram<'_>,
+    slots: &CrateSlots,
+    mut_facts: &MutFacts,
+    origin_flows: &OriginFlowResults,
+) -> Vec<CopyLendPairCandidate> {
+    let mut answer = Vec::new();
     for &fn_did in &program.functions {
         let body = program
             .tcx
@@ -330,9 +388,6 @@ pub(crate) fn analyze_copy_lend_eligibility(
         for (pair, mut sites) in by_pair {
             sites.sort_by_key(|site| site.sort_key());
             let lhs_local = sites[0].lhs_local;
-            if mut_facts.is_mutable(fn_did, lhs_local) {
-                continue;
-            }
             let closure = owner_closure(
                 [
                     SlotOwner::Local(sites[0].lhs_local),
@@ -342,20 +397,28 @@ pub(crate) fn analyze_copy_lend_eligibility(
             );
             let destination_flow =
                 owner_closure([SlotOwner::Local(sites[0].lhs_local)], &value_flows);
-            if closure
+            let drop = if mut_facts.is_mutable(fn_did, lhs_local) {
+                Some(CopyLendEligibilityDrop::C2MutableOrMissingDestination)
+            } else if closure
                 .iter()
                 .any(|owner| matches!(owner, SlotOwner::Field(_)))
-                || destination_flows_to_deallocator(program.tcx, &body, &destination_flow)
-                || has_live_outward_event(program, slots, fn_did, &body, &closure, &live_before)
             {
-                continue;
-            }
-            eligible.pairs.insert(pair);
-            eligible.sites.extend(sites);
+                Some(CopyLendEligibilityDrop::C3FieldInClosure)
+            } else if destination_flows_to_deallocator(program.tcx, &body, &destination_flow) {
+                Some(CopyLendEligibilityDrop::S22FreeDestination)
+            } else {
+                live_outward_event(program, slots, fn_did, &body, &closure, &live_before)
+            };
+            answer.push(CopyLendPairCandidate { pair, sites, drop });
         }
     }
-    eligible.sites.sort_by_key(|site| site.sort_key());
-    eligible
+    answer.sort_by_key(|candidate| {
+        (
+            SlotKey::of(candidate.pair.lhs),
+            SlotKey::of(candidate.pair.rhs),
+        )
+    });
+    answer
 }
 
 fn collect_copy_sites(
@@ -520,14 +583,14 @@ fn boundary_call(call: &crate::analyses::mir::terminator::MirFunctionCall<'_, '_
     }
 }
 
-fn has_live_outward_event<'tcx>(
+fn live_outward_event<'tcx>(
     program: &RustProgram<'tcx>,
     slots: &CrateSlots,
     fn_did: LocalDefId,
     body: &Body<'tcx>,
     closure: &FxHashSet<SlotOwner>,
     live_before: &FxHashMap<Location, DenseBitSet<Local>>,
-) -> bool {
+) -> Option<CopyLendEligibilityDrop> {
     for (block, data) in body.basic_blocks.iter_enumerated() {
         for (statement_index, statement) in data.statements.iter().enumerate() {
             let location = Location {
@@ -549,21 +612,24 @@ fn has_live_outward_event<'tcx>(
                 continue;
             }
             if matches!(rvalue, Rvalue::Aggregate(..)) {
-                return true;
+                return Some(CopyLendEligibilityDrop::C3AggregateStore);
             }
             if lhs
                 .projection
                 .iter()
                 .any(|projection| matches!(projection, ProjectionElem::Field(..)))
             {
-                return true;
+                return Some(CopyLendEligibilityDrop::C3FieldStore);
             }
             if lhs.local == RETURN_PLACE {
-                return true;
+                return Some(CopyLendEligibilityDrop::C3Return);
             }
             match resolve_place(slots, fn_did, body, *lhs, 0, None) {
                 Some(ResolvedSlot::Local(_)) => {}
-                Some(ResolvedSlot::Field(_)) | None => return true,
+                Some(ResolvedSlot::Field(_)) => {
+                    return Some(CopyLendEligibilityDrop::C3FieldStore);
+                }
+                None => return Some(CopyLendEligibilityDrop::C3UnresolvedStore),
             }
         }
         let Some(terminator) = data.terminator.as_ref() else {
@@ -586,8 +652,19 @@ fn has_live_outward_event<'tcx>(
                     .is_some_and(|place| closure.contains(&SlotOwner::Local(place.local)))
             })
         {
-            return true;
+            return Some(match call.func {
+                CallKind::FreeStanding(_) | CallKind::Impl(_) => {
+                    CopyLendEligibilityDrop::C3OrdinaryCall
+                }
+                CallKind::LibC(_) if known_deallocator(&call) => {
+                    CopyLendEligibilityDrop::C3ReallocSource
+                }
+                CallKind::LibC(_)
+                | CallKind::RustLib(_)
+                | CallKind::Closure
+                | CallKind::Dynamic => CopyLendEligibilityDrop::C3OutwardUnknownCall,
+            });
         }
     }
-    false
+    None
 }
