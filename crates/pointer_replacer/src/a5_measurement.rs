@@ -145,6 +145,10 @@ struct SnapshotCoverage {
     recursive: usize,
     volatile_or_atomic: usize,
     unresolved: usize,
+    target_type_mismatch: usize,
+    noncopy_scalar: usize,
+    final_markable: usize,
+    filter_unresolved: usize,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -263,12 +267,60 @@ fn combine_snapshot_verdicts(
     seen.then_some(combined)
 }
 
+fn target_type_filters(
+    tcx: TyCtxt<'_>,
+    targets: &[LocalDefId],
+    left: usize,
+    right: usize,
+) -> (bool, bool) {
+    let mut expected = None;
+    let mut agree = !targets.is_empty();
+    let mut copy_scalar = !targets.is_empty();
+    for &target in targets {
+        let body = tcx.mir_drops_elaborated_and_const_checked(target).borrow();
+        let Some(left_ty) = body
+            .local_decls
+            .get(Local::from_usize(left + 1))
+            .and_then(|d| d.ty.builtin_deref(true))
+        else {
+            return (false, false);
+        };
+        let Some(right_ty) = body
+            .local_decls
+            .get(Local::from_usize(right + 1))
+            .and_then(|d| d.ty.builtin_deref(true))
+        else {
+            return (false, false);
+        };
+        agree &= left_ty == right_ty && expected.is_none_or(|ty| ty == left_ty);
+        expected = Some(left_ty);
+        let scalar = matches!(
+            left_ty.kind(),
+            TyKind::Bool
+                | TyKind::Char
+                | TyKind::Int(_)
+                | TyKind::Uint(_)
+                | TyKind::Float(_)
+                | TyKind::RawPtr(..)
+                | TyKind::Ref(..)
+                | TyKind::FnPtr(..)
+        );
+        copy_scalar &= scalar
+            && tcx.type_is_copy_modulo_regions(
+                rustc_middle::ty::TypingEnv::post_analysis(tcx, target),
+                left_ty,
+            );
+    }
+    (agree, copy_scalar)
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct CallSite {
     id: String,
     arguments: Vec<FormalDecision>,
     pair_facts: BTreeMap<(usize, usize), PairFacts<String>>,
     snapshot_verdicts: BTreeMap<(usize, usize), SnapshotVerdict>,
+    post_filter: BTreeMap<(usize, usize), (bool, bool)>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -410,7 +462,15 @@ fn measure_program(input: &ProgramInput) -> Result<MeasuredProgram, String> {
                             mut_read_only += 1;
                             snapshot.mut_read_only += 1;
                             match site.snapshot_verdicts.get(&(left, right)) {
-                                Some(SnapshotVerdict::Markable) => snapshot.markable += 1,
+                                Some(SnapshotVerdict::Markable) => {
+                                    snapshot.markable += 1;
+                                    match site.post_filter.get(&(left, right)) {
+                                        Some((true, true)) => snapshot.final_markable += 1,
+                                        Some((false, _)) => snapshot.target_type_mismatch += 1,
+                                        Some((true, false)) => snapshot.noncopy_scalar += 1,
+                                        None => snapshot.filter_unresolved += 1,
+                                    }
+                                }
                                 Some(SnapshotVerdict::ReadAfterWrite) => {
                                     snapshot.read_after_write += 1
                                 }
@@ -1067,6 +1127,7 @@ fn measure_tcx(
                 .collect::<Result<Vec<_>, _>>()?;
             let mut pair_facts = BTreeMap::new();
             let mut snapshot_verdicts = BTreeMap::new();
+            let mut post_filter = BTreeMap::new();
             for left in 0..call_args.len() {
                 for right in left + 1..call_args.len() {
                     pair_facts.insert(
@@ -1096,6 +1157,10 @@ fn measure_tcx(
                             }))
                     {
                         snapshot_verdicts.insert((left, right), verdict);
+                        post_filter.insert(
+                            (left, right),
+                            target_type_filters(tcx, targets, left, right),
+                        );
                     }
                 }
             }
@@ -1112,6 +1177,7 @@ fn measure_tcx(
                 arguments,
                 pair_facts,
                 snapshot_verdicts,
+                post_filter,
             });
         }
     }
@@ -1200,6 +1266,22 @@ pub(super) fn run_worker(tcx: TyCtxt<'_>, t_tcx: Duration) -> super::report::Row
                 measured.snapshot.volatile_or_atomic,
             );
             row.set("a5_snapshot_unresolved", measured.snapshot.unresolved);
+            row.set(
+                "a5_snapshot_target_type_mismatch",
+                measured.snapshot.target_type_mismatch,
+            );
+            row.set(
+                "a5_snapshot_noncopy_scalar",
+                measured.snapshot.noncopy_scalar,
+            );
+            row.set(
+                "a5_snapshot_final_markable",
+                measured.snapshot.final_markable,
+            );
+            row.set(
+                "a5_snapshot_filter_unresolved",
+                measured.snapshot.filter_unresolved,
+            );
             row.set("calls_total", measured.coverage.calls_total);
             row.set("direct_local", measured.coverage.direct_local);
             row.set("indirect_local", measured.coverage.indirect_local);
@@ -2206,6 +2288,10 @@ fn a5_p1_corpus() {
             snapshot_sum("a5_snapshot_recursive"),
             snapshot_sum("a5_snapshot_volatile_or_atomic"),
             snapshot_sum("a5_snapshot_unresolved"),
+            snapshot_sum("a5_snapshot_target_type_mismatch"),
+            snapshot_sum("a5_snapshot_noncopy_scalar"),
+            snapshot_sum("a5_snapshot_final_markable"),
+            snapshot_sum("a5_snapshot_filter_unresolved"),
         ]
     });
     if let Some(
@@ -2217,12 +2303,18 @@ fn a5_p1_corpus() {
             recursive,
             volatile,
             unresolved,
+            type_mismatch,
+            noncopy,
+            final_markable,
+            filter_unresolved,
         ],
     ) = snapshot_totals
     {
         assert_eq!(den, 2_480);
         assert_eq!(unresolved, 0);
         assert_eq!(markable + read_after + opaque + recursive + volatile, den);
+        assert_eq!(filter_unresolved, 0);
+        assert_eq!(final_markable + type_mismatch + noncopy, markable);
     }
 
     let output = out.join("a5-p1");
@@ -2462,6 +2554,10 @@ fn a5_p1_corpus() {
             recursive,
             volatile,
             unresolved,
+            type_mismatch,
+            noncopy,
+            final_markable,
+            filter_unresolved,
         ],
     ) = snapshot_totals
     {
@@ -2471,7 +2567,9 @@ fn a5_p1_corpus() {
                 "status=ok\ndata=true\nanalysis_head={analysis_head}\na5_world=closed_world_frozen_graph\n\
                  a5_mode=precise_replay\nunknown_caller_seeding=false\ndenominator={den}\n\
                  markable={markable}\nread_after_write={read_after}\nopaque_escape={opaque}\n\
-                 recursive={recursive}\nvolatile_or_atomic={volatile}\nunresolved={unresolved}\n"
+                 recursive={recursive}\nvolatile_or_atomic={volatile}\nunresolved={unresolved}\n\
+                 target_type_mismatch={type_mismatch}\nnoncopy_scalar={noncopy}\n\
+                 final_markable={final_markable}\nfilter_unresolved={filter_unresolved}\n"
             ),
         )
         .expect("write snapshot coverage receipt");
@@ -2545,6 +2643,7 @@ mod tests {
                     ],
                     pair_facts: all_risky(3),
                     snapshot_verdicts: BTreeMap::new(),
+                    post_filter: BTreeMap::new(),
                 },
                 CallSite {
                     id: "caller:bb1:callee".to_owned(),
@@ -2554,6 +2653,7 @@ mod tests {
                     ],
                     pair_facts: all_risky(2),
                     snapshot_verdicts: BTreeMap::new(),
+                    post_filter: BTreeMap::new(),
                 },
             ],
             functions: BTreeMap::new(),
@@ -2677,12 +2777,14 @@ mod tests {
             arguments: vec![outer.clone(), deeper.clone()],
             pair_facts,
             snapshot_verdicts: BTreeMap::new(),
+            post_filter: BTreeMap::new(),
         };
         let one_ref_site = CallSite {
             id: "caller:bb2".to_owned(),
             arguments: vec![formal("callee", 3, 0)],
             pair_facts: BTreeMap::new(),
             snapshot_verdicts: BTreeMap::new(),
+            post_filter: BTreeMap::new(),
         };
         let program = ProgramInput {
             name: "fixture".to_owned(),

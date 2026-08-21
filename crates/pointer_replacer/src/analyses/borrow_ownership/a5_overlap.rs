@@ -533,6 +533,76 @@ pub(crate) fn check_snapshot_equivalence(graph: &SnapshotEffectGraph) -> Snapsho
     SnapshotVerdict::Markable
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct WitnessMarkability {
+    pub(crate) effect: SnapshotVerdict,
+    pub(crate) target_types_agree: bool,
+    pub(crate) copy_scalar: bool,
+    pub(crate) unknown_caller: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum MarkabilityFailure {
+    MissingWitness,
+    ReadAfterWrite,
+    OpaqueEscape,
+    Recursive,
+    VolatileOrAtomic,
+    TargetTypeMismatch,
+    NonCopyScalar,
+    UnknownCaller,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum AllWitnessesGate {
+    Discharged,
+    Demote {
+        reasons: BTreeSet<MarkabilityFailure>,
+    },
+}
+
+pub(crate) fn all_witnesses_gate(
+    witnesses: impl IntoIterator<Item = WitnessMarkability>,
+) -> AllWitnessesGate {
+    let mut seen = false;
+    let mut reasons = BTreeSet::new();
+    for witness in witnesses {
+        seen = true;
+        match witness.effect {
+            SnapshotVerdict::Markable => {}
+            SnapshotVerdict::ReadAfterWrite => {
+                reasons.insert(MarkabilityFailure::ReadAfterWrite);
+            }
+            SnapshotVerdict::OpaqueEscape => {
+                reasons.insert(MarkabilityFailure::OpaqueEscape);
+            }
+            SnapshotVerdict::Recursive => {
+                reasons.insert(MarkabilityFailure::Recursive);
+            }
+            SnapshotVerdict::VolatileOrAtomic => {
+                reasons.insert(MarkabilityFailure::VolatileOrAtomic);
+            }
+        }
+        if !witness.target_types_agree {
+            reasons.insert(MarkabilityFailure::TargetTypeMismatch);
+        }
+        if !witness.copy_scalar {
+            reasons.insert(MarkabilityFailure::NonCopyScalar);
+        }
+        if witness.unknown_caller {
+            reasons.insert(MarkabilityFailure::UnknownCaller);
+        }
+    }
+    if !seen {
+        reasons.insert(MarkabilityFailure::MissingWitness);
+    }
+    if reasons.is_empty() {
+        AllWitnessesGate::Discharged
+    } else {
+        AllWitnessesGate::Demote { reasons }
+    }
+}
+
 /// The only A5 call-world policy authorized for loop 2. Keeping the complete
 /// option set here makes the absence of an O1 build/config arm testable.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1266,5 +1336,70 @@ mod tests {
                 SnapshotVerdict::VolatileOrAtomic
             );
         }
+    }
+
+    fn markability(effect: SnapshotVerdict) -> WitnessMarkability {
+        WitnessMarkability {
+            effect,
+            target_types_agree: true,
+            copy_scalar: true,
+            unknown_caller: false,
+        }
+    }
+
+    #[test]
+    fn w8_read_after_write_kills_discharge() {
+        assert!(matches!(
+            all_witnesses_gate([markability(SnapshotVerdict::ReadAfterWrite)]),
+            AllWitnessesGate::Demote { .. }
+        ));
+    }
+
+    #[test]
+    fn w9_one_unmarkable_witness_kills_partial_discharge() {
+        assert!(matches!(
+            all_witnesses_gate([
+                markability(SnapshotVerdict::Markable),
+                markability(SnapshotVerdict::OpaqueEscape),
+            ]),
+            AllWitnessesGate::Demote { .. }
+        ));
+    }
+
+    #[test]
+    fn w10_target_type_disagreement_and_noncopy_demote() {
+        let mut mismatch = markability(SnapshotVerdict::Markable);
+        mismatch.target_types_agree = false;
+        let mut noncopy = markability(SnapshotVerdict::Markable);
+        noncopy.copy_scalar = false;
+        assert!(matches!(
+            all_witnesses_gate([mismatch]),
+            AllWitnessesGate::Demote { .. }
+        ));
+        assert!(matches!(
+            all_witnesses_gate([noncopy]),
+            AllWitnessesGate::Demote { .. }
+        ));
+    }
+
+    #[test]
+    fn unknown_caller_witness_kills_discharge() {
+        let mut unknown = markability(SnapshotVerdict::Markable);
+        unknown.unknown_caller = true;
+        assert!(matches!(
+            all_witnesses_gate([unknown]),
+            AllWitnessesGate::Demote { .. }
+        ));
+    }
+
+    #[test]
+    fn every_markable_witness_discharges_pair() {
+        assert_eq!(
+            all_witnesses_gate([
+                markability(SnapshotVerdict::Markable),
+                markability(SnapshotVerdict::Markable),
+            ]),
+            AllWitnessesGate::Discharged
+        );
     }
 }
