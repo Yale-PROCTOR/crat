@@ -94,9 +94,11 @@ mod tests {
                  fn caller(p: &mut i32) {{ let q: &i32 = &*p; {call}; }}"
             )
         };
-        assert!(::utils::compilation::run_compiler_on_str(&source(&marked), |_| {}).is_ok());
-        assert!(
-            ::utils::compilation::run_compiler_on_str(&source("two(&mut *p, q)"), |_| {}).is_err()
-        );
+        assert!(crate::bo_rewriter::verify::type_checks_str(&source(
+            &marked
+        )));
+        assert!(!crate::bo_rewriter::verify::type_checks_str(&source(
+            "two(&mut *p, q)"
+        )));
     }
 }
