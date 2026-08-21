@@ -268,6 +268,28 @@ pub(crate) fn revalidate_replaying(
         is_raw,
         is_mutable,
         None,
+        None,
+    )
+}
+
+pub(crate) fn revalidate_replaying_with_parameter_overlap(
+    program: &RustProgram,
+    slots: &CrateSlots,
+    is_ref: impl Fn(SlotRef) -> bool,
+    is_raw: impl Fn(SlotRef) -> bool,
+    is_mutable: impl MutProvider + Copy,
+    parameter_overlaps: &FxHashMap<LocalDefId, super::borrow_engine::ParameterOverlap>,
+) -> FxHashMap<LocalDefId, Vec<SlotConflict>> {
+    let origin_flows = super::origin_flow::analyze_program_origin_flow(program);
+    revalidate_replaying_with_flows(
+        program,
+        slots,
+        &origin_flows,
+        is_ref,
+        is_raw,
+        is_mutable,
+        None,
+        Some(parameter_overlaps),
     )
 }
 
@@ -279,6 +301,7 @@ fn revalidate_replaying_with_flows(
     is_raw: impl Fn(SlotRef) -> bool,
     is_mutable: impl MutProvider + Copy,
     selected_copy_lends: Option<&SelectedCopyLendLoans>,
+    parameter_overlaps: Option<&FxHashMap<LocalDefId, super::borrow_engine::ParameterOverlap>>,
 ) -> FxHashMap<LocalDefId, Vec<SlotConflict>> {
     let is_ref = &is_ref;
     let is_raw = &is_raw;
@@ -320,32 +343,49 @@ fn revalidate_replaying_with_flows(
     let edges = match super::borrow_engine::ForkEngineMode::current() {
         super::borrow_engine::ForkEngineMode::Production => {
             assert!(
-                selected_copy_lends.is_none_or(|selected| selected.is_empty()),
-                "CopyLend replay requires the BO fork engine"
+                selected_copy_lends.is_none_or(|selected| selected.is_empty())
+                    && parameter_overlaps.is_none(),
+                "CopyLend/A5 replay requires the BO fork engine"
             );
             borrow::borrow_conflicts_replaying(program, cand, raw, mutab)
         }
-        super::borrow_engine::ForkEngineMode::Fork => match selected_copy_lends {
-            Some(selected) => {
-                super::borrow_engine::borrow_conflicts_replaying_with_flows_and_copy_lends(
+        super::borrow_engine::ForkEngineMode::Fork => {
+            if let Some(parameter_overlaps) = parameter_overlaps {
+                let empty = SelectedCopyLendLoans::default();
+                super::borrow_engine::borrow_conflicts_replaying_with_flows_and_parameter_overlap(
                     program,
                     origin_flows,
                     cand,
                     raw,
                     mutab,
                     &raw_fields,
-                    selected,
+                    selected_copy_lends.unwrap_or(&empty),
+                    parameter_overlaps,
                 )
+            } else {
+                match selected_copy_lends {
+                    Some(selected) => {
+                        super::borrow_engine::borrow_conflicts_replaying_with_flows_and_copy_lends(
+                            program,
+                            origin_flows,
+                            cand,
+                            raw,
+                            mutab,
+                            &raw_fields,
+                            selected,
+                        )
+                    }
+                    None => super::borrow_engine::borrow_conflicts_replaying_with_flows(
+                        program,
+                        origin_flows,
+                        cand,
+                        raw,
+                        mutab,
+                        &raw_fields,
+                    ),
+                }
             }
-            None => super::borrow_engine::borrow_conflicts_replaying_with_flows(
-                program,
-                origin_flows,
-                cand,
-                raw,
-                mutab,
-                &raw_fields,
-            ),
-        },
+        }
     };
 
     map_edges_to_slots(slots, edges)
@@ -804,6 +844,7 @@ fn verify_to_fixpoint_counting_with_flows_impl(
             },
             is_mutable,
             selected_copy_lends.as_ref(),
+            None,
         );
         // §NB5-F — partition the residual-conflict guard by owner class. A non-`Ref` FIELD in a
         // residual is the A′ principle extended to field requirers: the field is a live requirer the
@@ -1405,6 +1446,7 @@ fn model_accepts_with_flows_impl(
         },
         is_mutable,
         selected_copy_lends,
+        None,
     );
     // The loop's accept is `committed == 0` reached WITHOUT tripping either of its two guards: the
     // `residual_nonref_field` decline (non-`Ref` FIELD residual) and the `guard_slots_are_ref`

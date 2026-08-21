@@ -4,6 +4,8 @@
 // immutable-loan skip (`continue; // loan of immutable provenance does not invalidate`) fires for
 // READS only, not writes. NO sync tripwire (divergence is the deliverable). NB6's validator uses the
 // UNFORKED production engine (D5).
+use std::collections::BTreeSet;
+
 use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_index::bit_set::{DenseBitSet, SparseBitMatrix};
 use rustc_middle::{
@@ -18,7 +20,8 @@ use rustc_mir_dataflow::points::{DenseLocationMap, PointIndex};
 
 use super::{
     BorrowSet, Loan,
-    places_conflict::{AccessDepth, PlaceConflictBias, places_conflict},
+    a5_places_conflict::{ParameterOverlap, places_conflict_with_parameter_overlap},
+    places_conflict::{AccessDepth, PlaceConflictBias},
 };
 use crate::analyses::{
     borrow::{Borrower, ProvenanceOwner, ProvenanceSet},
@@ -40,6 +43,12 @@ pub(crate) struct InvalidationAccess {
     pub(crate) accessor: Local,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct ParameterAccess<'tcx> {
+    place: Place<'tcx>,
+    kind: AccessKind,
+}
+
 pub fn compute_invalidates<'tcx>(
     tcx: TyCtxt<'tcx>,
     body: &Body<'tcx>,
@@ -55,6 +64,8 @@ pub fn compute_invalidates<'tcx>(
         provenance_set,
         location_map,
         &copy_lends,
+        None,
+        None,
         None,
     )
 }
@@ -74,6 +85,8 @@ pub(crate) fn compute_invalidates_with_copy_lends<'tcx>(
         provenance_set,
         location_map,
         copy_lends,
+        None,
+        None,
         None,
     )
 }
@@ -118,9 +131,59 @@ pub(crate) fn compute_invalidates_capturing_with_copy_lends<'tcx>(
         provenance_set,
         location_map,
         copy_lends,
+        None,
         Some(&mut accesses),
+        None,
     );
     (invalidates, accesses)
+}
+
+pub(crate) fn compute_invalidates_with_copy_lends_and_parameter_overlap<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    body: &Body<'tcx>,
+    borrow_set: &BorrowSet<'tcx>,
+    provenance_set: &ProvenanceSet,
+    location_map: &DenseLocationMap,
+    copy_lends: &DenseBitSet<Loan>,
+    parameter_overlap: &ParameterOverlap,
+) -> (Invalidates, Vec<(Local, Local)>) {
+    let mut parameter_accesses = Vec::new();
+    let invalidates = compute_invalidates_inner(
+        tcx,
+        body,
+        borrow_set,
+        provenance_set,
+        location_map,
+        copy_lends,
+        Some(parameter_overlap),
+        None,
+        Some(&mut parameter_accesses),
+    );
+    let mut conflicts = BTreeSet::new();
+    for (offset, left) in parameter_accesses.iter().enumerate() {
+        for right in &parameter_accesses[offset + 1..] {
+            if left.place.local == right.place.local
+                || !parameter_overlap.contains(left.place.local, right.place.local)
+                || (left.kind == AccessKind::Read && right.kind == AccessKind::Read)
+                || !places_conflict_with_parameter_overlap(
+                    tcx,
+                    body,
+                    left.place,
+                    right.place,
+                    AccessDepth::Deep,
+                    PlaceConflictBias::Overlap,
+                    Some(parameter_overlap),
+                )
+            {
+                continue;
+            }
+            conflicts.insert((
+                left.place.local.min(right.place.local),
+                left.place.local.max(right.place.local),
+            ));
+        }
+    }
+    (invalidates, conflicts.into_iter().collect())
 }
 
 fn compute_invalidates_inner<'tcx>(
@@ -130,7 +193,9 @@ fn compute_invalidates_inner<'tcx>(
     provenance_set: &ProvenanceSet,
     location_map: &DenseLocationMap,
     copy_lends: &DenseBitSet<Loan>,
+    parameter_overlap: Option<&ParameterOverlap>,
     accesses: Option<&mut Vec<InvalidationAccess>>,
+    parameter_accesses: Option<&mut Vec<ParameterAccess<'tcx>>>,
 ) -> Invalidates {
     let mut invalidates = SparseBitMatrix::new(borrow_set.loans.len());
 
@@ -148,6 +213,8 @@ fn compute_invalidates_inner<'tcx>(
         provenance_set,
         location_map,
         copy_lends,
+        parameter_overlap,
+        parameter_accesses,
         issued_loans: if routing_enabled {
             build_issued_loans(tcx, body, borrow_set)
         } else {
@@ -299,6 +366,10 @@ struct LoanInvalidatesGenerator<'g, 'tcx> {
     provenance_set: &'g ProvenanceSet,
     location_map: &'g DenseLocationMap,
     copy_lends: &'g DenseBitSet<Loan>,
+    /// A5 effective may-overlap among this function's depth-zero parameters.
+    parameter_overlap: Option<&'g ParameterOverlap>,
+    /// A5-only access stream used to derive conflicts without synthesizing CallArg loans.
+    parameter_accesses: Option<&'g mut Vec<ParameterAccess<'tcx>>>,
     /// §NB4-R routing chain (see `build_issued_loans`). Empty when routing is disabled.
     issued_loans: FxHashMap<Local, Vec<Loan>>,
     /// §NB4-R toggle (`CRAT_NB4R_ROUTING`); gates the cross-alias-write walk for sweep attribution.
@@ -307,12 +378,11 @@ struct LoanInvalidatesGenerator<'g, 'tcx> {
 
 /// §NB4-4a-ii **kind-labeling hoist** — the read/write kind of an access.
 ///
-/// **INERT TODAY, BY CONSTRUCTION**: `check_access_for_conflict` does not consult it. The
-/// immutable-loan skip fires for both kinds, and a mutable loan conflicts with both, so no
-/// decision depends on it. It is threaded now so that **4b's write-aware invalidation is a
-/// one-line change to the SKIP condition**, not a refactor of every access site — which keeps
-/// 4b's sweep row **WA-ALONE** instead of conflating write-awareness with a site→kind
-/// re-labeling. (Same hoisting logic as BB3-a and the effect axis landing in 4a.)
+/// **Baseline/A12 loan invalidation remains inert by construction**: the immutable-loan skip
+/// fires for both kinds, and a mutable loan conflicts with both. A5 precise replay separately
+/// consumes the label when pairing accesses across effectively-overlapping parameters; that path
+/// is absent when `parameter_overlap=None`. The label was originally threaded so 4b's
+/// write-aware invalidation was a one-line skip change rather than a site refactor.
 ///
 /// The site→kind table below is the 3b Task-0 table. Inertness is verified by the suite +
 /// a spot sweep being byte-identical across this commit; if it were NOT inert, that would mean
@@ -366,10 +436,29 @@ impl<'g, 'tcx> LoanInvalidatesGenerator<'g, 'tcx> {
         kind: AccessKind,
         copy_lends_only: bool,
     ) {
+        if place.projection.first() == Some(&PlaceElem::Deref)
+            && self
+                .parameter_overlap
+                .is_some_and(|overlap| overlap.has_local(place.local))
+            && let Some(parameter_accesses) = self.parameter_accesses.as_mut()
+        {
+            parameter_accesses.push(ParameterAccess { place, kind });
+        }
         let point_index = self.location_map.point_from_location(location);
 
-        // DIRECT check: loans keyed under the accessed local.
-        if let Some(borrows_for_place_base) = self.borrow_set.local_map.row(place.local) {
+        // DIRECT check: ordinary loans are keyed under the accessed local. A5 effective parameter
+        // overlap additionally opens the paired parameter rows for pointee accesses; otherwise the
+        // distinct-base `places_conflict` seam would never receive the pair in the first place.
+        let mut candidate_bases = vec![place.local];
+        if place.projection.first() == Some(&PlaceElem::Deref)
+            && let Some(parameter_overlap) = self.parameter_overlap
+        {
+            candidate_bases.extend(parameter_overlap.partners(place.local));
+        }
+        for candidate_base in candidate_bases {
+            let Some(borrows_for_place_base) = self.borrow_set.local_map.row(candidate_base) else {
+                continue;
+            };
             for loan in borrows_for_place_base.iter() {
                 if copy_lends_only && !self.copy_lends.contains(loan) {
                     continue;
@@ -382,13 +471,14 @@ impl<'g, 'tcx> LoanInvalidatesGenerator<'g, 'tcx> {
                 {
                     continue; // loan of immutable provenance does not invalidate
                 }
-                if places_conflict(
+                if places_conflict_with_parameter_overlap(
                     self.tcx,
                     self.body,
                     borrow_data.borrowed,
                     place,
                     access_depth,
                     PlaceConflictBias::Overlap,
+                    self.parameter_overlap,
                 ) {
                     self.insert_invalidation(point_index, loan, place.local);
                 }
@@ -482,13 +572,14 @@ impl<'g, 'tcx> LoanInvalidatesGenerator<'g, 'tcx> {
                     {
                         continue; // loan of immutable provenance does not invalidate (read-only cell)
                     }
-                    if places_conflict(
+                    if places_conflict_with_parameter_overlap(
                         self.tcx,
                         self.body,
                         borrow_data.borrowed,
                         routed,
                         routed_depth,
                         PlaceConflictBias::Overlap,
+                        self.parameter_overlap,
                     ) {
                         let accessor = if copy_lends_only { base } else { place.local };
                         self.insert_invalidation(point_index, loan, accessor);
