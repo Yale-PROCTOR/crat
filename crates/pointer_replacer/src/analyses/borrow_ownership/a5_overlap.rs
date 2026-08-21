@@ -381,7 +381,7 @@ pub(crate) fn classify_pair<T: Ord>(facts: &PairFacts<T>) -> PairClass {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum PairSide {
     Left,
     Right,
@@ -601,6 +601,71 @@ pub(crate) fn all_witnesses_gate(
     } else {
         AllWitnessesGate::Demote { reasons }
     }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct C9MarkKey {
+    pub(crate) caller: FnKey,
+    pub(crate) location: MirLocationKey,
+    pub(crate) targets: Vec<FnKey>,
+    pub(crate) pair: FunctionPairKey,
+    pub(crate) actuals: (SlotKey, SlotKey),
+    pub(crate) shared_side: PairSide,
+    pub(crate) pointee_type: String,
+}
+
+impl C9MarkKey {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new(
+        caller: FnKey,
+        location: MirLocationKey,
+        targets: impl IntoIterator<Item = FnKey>,
+        callee: FnKey,
+        left_param: u32,
+        left_actual: SlotKey,
+        right_param: u32,
+        right_actual: SlotKey,
+        shared_side: PairSide,
+        pointee_type: String,
+    ) -> Option<Self> {
+        let pair = FunctionPairKey::new(callee, left_param, right_param)?;
+        let (actuals, shared_side) = if left_param < right_param {
+            ((left_actual, right_actual), shared_side)
+        } else {
+            (
+                (right_actual, left_actual),
+                match shared_side {
+                    PairSide::Left => PairSide::Right,
+                    PairSide::Right => PairSide::Left,
+                },
+            )
+        };
+        let mut targets = targets.into_iter().collect::<Vec<_>>();
+        targets.sort_unstable();
+        targets.dedup();
+        Some(Self {
+            caller,
+            location,
+            targets,
+            pair,
+            actuals,
+            shared_side,
+            pointee_type,
+        })
+    }
+}
+
+pub(crate) fn plan_c9_marks(
+    witnesses: impl IntoIterator<Item = (C9MarkKey, WitnessMarkability)>,
+) -> BTreeSet<C9MarkKey> {
+    let witnesses = witnesses.into_iter().collect::<Vec<_>>();
+    if !matches!(
+        all_witnesses_gate(witnesses.iter().map(|(_, evidence)| *evidence)),
+        AllWitnessesGate::Discharged
+    ) {
+        return BTreeSet::new();
+    }
+    witnesses.into_iter().map(|(mark, _)| mark).collect()
 }
 
 /// The only A5 call-world policy authorized for loop 2. Keeping the complete
@@ -1401,5 +1466,37 @@ mod tests {
             ]),
             AllWitnessesGate::Discharged
         );
+    }
+
+    fn c9(block: u32) -> C9MarkKey {
+        C9MarkKey::new(
+            3,
+            MirLocationKey::new(block, 0),
+            [8, 7, 8],
+            7,
+            1,
+            slot(3, 1),
+            2,
+            slot(3, 2),
+            PairSide::Right,
+            "i32".to_owned(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn c9_mark_identity_sorts_targets_and_is_location_typed() {
+        let first = c9(1);
+        let second = c9(2);
+        assert_eq!(first.targets, vec![7, 8]);
+        assert_ne!(first, second);
+    }
+
+    #[test]
+    fn c9_planner_emits_all_marks_or_none() {
+        let good = markability(SnapshotVerdict::Markable);
+        assert_eq!(plan_c9_marks([(c9(1), good), (c9(2), good)]).len(), 2);
+        let bad = markability(SnapshotVerdict::ReadAfterWrite);
+        assert!(plan_c9_marks([(c9(1), good), (c9(2), bad)]).is_empty());
     }
 }

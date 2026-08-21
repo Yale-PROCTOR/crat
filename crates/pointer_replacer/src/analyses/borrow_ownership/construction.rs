@@ -1,6 +1,9 @@
 #[cfg(test)]
 use std::cell::Cell;
-use std::time::{Duration, Instant};
+use std::{
+    collections::BTreeSet,
+    time::{Duration, Instant},
+};
 
 use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_index::bit_set::DenseBitSet;
@@ -15,6 +18,7 @@ use rustc_span::def_id::LocalDefId;
 use super::coherence::add_coherence_tagging_uses;
 use super::{
     BoOwnEmissionStats, CrateCtxt, SlotKind,
+    a5_overlap::{C9MarkKey, WitnessMarkability, plan_c9_marks},
     borrow_verify::{
         verify_to_fixpoint_counting_with_flows,
         verify_to_fixpoint_counting_with_flows_and_copy_lends,
@@ -42,6 +46,12 @@ use crate::{
 };
 
 pub(crate) const COPY_LEND_MODE_ENV: &str = "CRAT_BO_COPY_LEND_MODE";
+
+pub(crate) fn plan_a5_c9_marks(
+    witnesses: impl IntoIterator<Item = (C9MarkKey, WitnessMarkability)>,
+) -> BTreeSet<C9MarkKey> {
+    plan_c9_marks(witnesses)
+}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) enum CopyLendMode {
