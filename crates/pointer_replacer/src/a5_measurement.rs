@@ -19,6 +19,7 @@ use crate::{
         borrow::lifetime_flow::{self, BodyLifetimeFlow},
         borrow_ownership::{
             SlotKind,
+            a5_overlap::{PairClass, PairFacts, SetPairEvidence, classify_pair},
             construction::{CopyLendMode, construct_bo_into, verify_bo_construction},
             crate_slots::CrateSlots,
             export::with_bo_export,
@@ -116,45 +117,16 @@ struct Timings {
 struct Measurement {
     counts: ProgramCounts,
     pairs: Vec<PairLedgerRow>,
+    classifier: ClassifierDifferential,
     coverage: CoverageCounts,
     timings: Timings,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-enum SetPairEvidence {
-    #[default]
-    Unknown,
-    Complete {
-        left: BTreeSet<String>,
-        right: BTreeSet<String>,
-    },
-    Incomplete {
-        left: BTreeSet<String>,
-        right: BTreeSet<String>,
-    },
-}
-
-impl SetPairEvidence {
-    fn proves_disjoint(&self) -> bool {
-        let Self::Complete { left, right } = self else {
-            return false;
-        };
-        !left.is_empty() && !right.is_empty() && left.is_disjoint(right)
-    }
-}
-
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-struct PairFacts {
-    storage_alias: bool,
-    projection_disjoint: bool,
-    origins: SetPairEvidence,
-    points_to: SetPairEvidence,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum PairClass {
-    ProvenDisjoint,
-    NotProvenDisjoint,
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct ClassifierDifferential {
+    candidates: usize,
+    not_proven_disjoint: usize,
+    byte_mismatches: usize,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -218,13 +190,19 @@ impl PairLedgerRow {
     }
 }
 
-fn classify_pair(facts: &PairFacts) -> PairClass {
+fn classify_pair_legacy(facts: &PairFacts<String>) -> PairClass {
     if facts.storage_alias {
         return PairClass::NotProvenDisjoint;
     }
+    let complete_disjoint = |evidence: &SetPairEvidence<String>| {
+        let SetPairEvidence::Complete { left, right } = evidence else {
+            return false;
+        };
+        !left.is_empty() && !right.is_empty() && left.is_disjoint(right)
+    };
     if facts.projection_disjoint
-        || facts.origins.proves_disjoint()
-        || facts.points_to.proves_disjoint()
+        || complete_disjoint(&facts.origins)
+        || complete_disjoint(&facts.points_to)
     {
         PairClass::ProvenDisjoint
     } else {
@@ -232,11 +210,24 @@ fn classify_pair(facts: &PairFacts) -> PairClass {
     }
 }
 
+fn classify_pair_differential(facts: &PairFacts<String>) -> Result<PairClass, String> {
+    let legacy = classify_pair_legacy(facts);
+    let shared = classify_pair(facts);
+    if legacy.label().as_bytes() != shared.label().as_bytes() {
+        return Err(format!(
+            "A5 classifier verdict mismatch: legacy={} shared={}",
+            legacy.label(),
+            shared.label()
+        ));
+    }
+    Ok(shared)
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct CallSite {
     id: String,
     arguments: Vec<FormalDecision>,
-    pair_facts: BTreeMap<(usize, usize), PairFacts>,
+    pair_facts: BTreeMap<(usize, usize), PairFacts<String>>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -311,6 +302,7 @@ impl ProgramCounts {
 struct MeasuredProgram {
     counts: ProgramCounts,
     pairs: Vec<PairLedgerRow>,
+    classifier: ClassifierDifferential,
 }
 
 fn measure_program(input: &ProgramInput) -> Result<MeasuredProgram, String> {
@@ -326,6 +318,7 @@ fn measure_program(input: &ProgramInput) -> Result<MeasuredProgram, String> {
     let mut sites_with_mut_read_only = 0;
     let mut sites_with_shared_shared = 0;
     let mut mutability_default_fires = 0;
+    let mut classifier = ClassifierDifferential::default();
 
     for site in &input.call_sites {
         if !site_ids.insert(site.id.as_str()) {
@@ -351,7 +344,18 @@ fn measure_program(input: &ProgramInput) -> Result<MeasuredProgram, String> {
                     .get(&(left, right))
                     .cloned()
                     .unwrap_or_default();
-                if classify_pair(&facts) == PairClass::NotProvenDisjoint {
+                classifier.candidates += 1;
+                let verdict = classify_pair_differential(&facts).map_err(|why| {
+                    classifier.byte_mismatches += 1;
+                    format!(
+                        "{why}; site={} arguments={}/{}",
+                        site.id,
+                        left + 1,
+                        right + 1
+                    )
+                })?;
+                if verdict == PairClass::NotProvenDisjoint {
+                    classifier.not_proven_disjoint += 1;
                     risky = true;
                     let left_formal = &site.arguments[left];
                     let right_formal = &site.arguments[right];
@@ -412,7 +416,14 @@ fn measure_program(input: &ProgramInput) -> Result<MeasuredProgram, String> {
         mutability_default_fires,
     };
     counts.validate()?;
-    Ok(MeasuredProgram { counts, pairs })
+    if classifier.not_proven_disjoint != pairs.len() {
+        return Err("shared classifier denominator disagrees with the pair ledger".to_owned());
+    }
+    Ok(MeasuredProgram {
+        counts,
+        pairs,
+        classifier,
+    })
 }
 
 fn unknown_reachable(
@@ -654,7 +665,7 @@ fn origin_pair_facts<'tcx>(
     caller_reachable_from_unknown: bool,
     left: &Operand<'tcx>,
     right: &Operand<'tcx>,
-) -> (bool, SetPairEvidence) {
+) -> (bool, SetPairEvidence<String>) {
     let left_place = left.place();
     let right_place = right.place();
     let storage_alias = match (left_place, right_place) {
@@ -705,7 +716,7 @@ fn call_pair_facts<'tcx>(
     caller: LocalDefId,
     left: &Operand<'tcx>,
     right: &Operand<'tcx>,
-) -> PairFacts {
+) -> PairFacts<String> {
     let left_place = left.place();
     let right_place = right.place();
     let (storage_alias, origins) =
@@ -1040,6 +1051,7 @@ fn measure_tcx(
     Ok(Measurement {
         counts: measured.counts,
         pairs: measured.pairs,
+        classifier: measured.classifier,
         coverage,
         timings: Timings {
             origins: origins_time,
@@ -1053,6 +1065,9 @@ pub(super) fn run_worker(tcx: TyCtxt<'_>, t_tcx: Duration) -> super::report::Row
     let t0 = Instant::now();
     let mut row = super::report::Row::default();
     row.set("copy_lend_mode", CopyLendMode::Baseline.label());
+    row.set("a5_world", "closed_world_frozen_graph");
+    row.set("a5_mode", "classifier_differential");
+    row.set("a5_abi_guard", "not-yet-consumed-item4");
     let program = std::env::var("CRAT_BOC1_NAME").unwrap_or_else(|_| "unnamed".to_owned());
     let Some(snapshot) = std::env::var_os("CRAT_A5_SNAPSHOT").map(std::path::PathBuf::from) else {
         row.set("status", "missing-snapshot");
@@ -1087,6 +1102,16 @@ pub(super) fn run_worker(tcx: TyCtxt<'_>, t_tcx: Duration) -> super::report::Row
             row.set("sites_with_mut_read_only", counts.sites_with_mut_read_only);
             row.set("sites_with_shared_shared", counts.sites_with_shared_shared);
             row.set("mut_default_fires", counts.mutability_default_fires);
+            row.set("a5_classifier_api", "shared-v1");
+            row.set("a5_classifier_candidates", measured.classifier.candidates);
+            row.set(
+                "a5_classifier_not_proven",
+                measured.classifier.not_proven_disjoint,
+            );
+            row.set(
+                "a5_classifier_byte_mismatches",
+                measured.classifier.byte_mismatches,
+            );
             row.set("calls_total", measured.coverage.calls_total);
             row.set("direct_local", measured.coverage.direct_local);
             row.set("indirect_local", measured.coverage.indirect_local);
@@ -1547,6 +1572,13 @@ fn a5_p1_corpus() {
         "9fc912af10fd3b235fe4d444d2fbac0bc521509b1c9447fc551acd0130e0e621";
     const DERIVED_SUBSTRATE_DIGEST: &str =
         "db96829b5c2b0db28fb4bb9ddd3d32901b5d4e6e4134da07ada0d513d94eb4c6";
+    let classifier_differential = match std::env::var("CRAT_A5_CLASSIFIER_DIFFERENTIAL").as_deref()
+    {
+        Ok("1") => true,
+        Err(std::env::VarError::NotPresent) | Ok("0") => false,
+        Ok(other) => panic!("CRAT_A5_CLASSIFIER_DIFFERENTIAL must be 0 or 1, got {other:?}"),
+        Err(error) => panic!("CRAT_A5_CLASSIFIER_DIFFERENTIAL is not valid Unicode: {error}"),
+    };
 
     assert_eq!(
         super::CORPUS.len(),
@@ -2036,6 +2068,37 @@ fn a5_p1_corpus() {
         })
         .collect::<Vec<_>>();
     let total = aggregate(&rows).expect("valid P1 aggregate");
+    let classifier_sum = |key: &str| {
+        final_runs
+            .values()
+            .map(|run| {
+                run.metadata
+                    .get(key)
+                    .unwrap_or_else(|| panic!("{} missing {key}", run.counts.program))
+                    .parse::<usize>()
+                    .unwrap_or_else(|why| panic!("{} invalid {key}: {why}", run.counts.program))
+            })
+            .sum::<usize>()
+    };
+    let classifier_candidates =
+        classifier_differential.then(|| classifier_sum("a5_classifier_candidates"));
+    let classifier_not_proven =
+        classifier_differential.then(|| classifier_sum("a5_classifier_not_proven"));
+    let classifier_byte_mismatches =
+        classifier_differential.then(|| classifier_sum("a5_classifier_byte_mismatches"));
+    if classifier_differential {
+        assert!(final_runs.values().all(|run| {
+            run.metadata.get("a5_classifier_api") == Some("shared-v1")
+                && run.metadata.get("a5_world") == Some("closed_world_frozen_graph")
+        }));
+        assert_eq!(classifier_byte_mismatches, Some(0));
+        assert_eq!(classifier_not_proven, Some(5_555));
+        assert!(classifier_candidates.is_some_and(|count| count >= 5_555));
+        assert_eq!(total.pair_denominator, 5_555);
+        assert_eq!(total.mut_mut, 2_391);
+        assert_eq!(total.mut_read_only, 2_480);
+        assert_eq!(total.shared_shared, 684);
+    }
 
     let output = out.join("a5-p1");
     fs::create_dir_all(&output).expect("create P1 output directory");
@@ -2249,6 +2312,22 @@ fn a5_p1_corpus() {
     fs::write(output.join("per-program.tsv"), tsv).expect("write P1 TSV");
     fs::write(output.join("report.md"), markdown).expect("write P1 markdown");
     fs::write(output.join("provenance.txt"), provenance).expect("write P1 provenance");
+    if classifier_differential {
+        fs::write(
+            output.join("classifier-differential.txt"),
+            format!(
+                "status=ok\ndata=true\nanalysis_head={analysis_head}\na5_world=closed_world_frozen_graph\n\
+                 a5_mode=classifier_differential\na5_abi_guard=not-yet-consumed-item4\n\
+                 classifier_api=shared-v1\nlegacy_oracle=count5-private-v1\n\
+                 candidates={}\nnot_proven_disjoint={}\nbyte_mismatches={}\n\
+                 pair_partition=5555=2391+2480+684\nunresolved=0\n",
+                classifier_candidates.expect("differential candidate total"),
+                classifier_not_proven.expect("differential NotProven total"),
+                classifier_byte_mismatches.expect("differential mismatch total"),
+            ),
+        )
+        .expect("write classifier differential receipt");
+    }
     println!("{}", render_count_line(&total));
 }
 
@@ -2351,9 +2430,9 @@ mod tests {
 
     #[test]
     fn absence_of_storage_alias_is_unknown_not_disjoint() {
-        let facts = PairFacts {
+        let facts = PairFacts::<String> {
             storage_alias: false,
-            ..PairFacts::default()
+            ..PairFacts::<String>::default()
         };
 
         assert_eq!(classify_pair(&facts), PairClass::NotProvenDisjoint);
@@ -2361,9 +2440,9 @@ mod tests {
 
     #[test]
     fn only_complete_positive_evidence_proves_disjointness() {
-        let projection_disjoint = PairFacts {
+        let projection_disjoint = PairFacts::<String> {
             projection_disjoint: true,
-            ..PairFacts::default()
+            ..PairFacts::<String>::default()
         };
         let complete_disjoint_origins = PairFacts {
             origins: SetPairEvidence::Complete {
@@ -2386,10 +2465,10 @@ mod tests {
             },
             ..PairFacts::default()
         };
-        let known_storage_alias = PairFacts {
+        let known_storage_alias = PairFacts::<String> {
             storage_alias: true,
             projection_disjoint: true,
-            ..PairFacts::default()
+            ..PairFacts::<String>::default()
         };
 
         assert_eq!(
@@ -2412,6 +2491,29 @@ mod tests {
             classify_pair(&known_storage_alias),
             PairClass::NotProvenDisjoint
         );
+    }
+
+    #[test]
+    fn shared_classifier_matches_the_legacy_verdict_bytes() {
+        let cases = [
+            PairFacts::default(),
+            PairFacts {
+                projection_disjoint: true,
+                ..PairFacts::default()
+            },
+            PairFacts {
+                storage_alias: true,
+                projection_disjoint: true,
+                ..PairFacts::default()
+            },
+        ];
+
+        for facts in cases {
+            assert_eq!(
+                classify_pair_differential(&facts),
+                Ok(classify_pair(&facts))
+            );
+        }
     }
 
     #[test]

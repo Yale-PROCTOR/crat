@@ -187,6 +187,15 @@ pub(crate) enum PairClass {
     NotProvenDisjoint,
 }
 
+impl PairClass {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::ProvenDisjoint => "proven-disjoint",
+            Self::NotProvenDisjoint => "not-proven-disjoint",
+        }
+    }
+}
+
 pub(crate) fn classify_pair<T: Ord>(facts: &PairFacts<T>) -> PairClass {
     if facts.storage_alias {
         return PairClass::NotProvenDisjoint;
