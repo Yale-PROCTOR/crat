@@ -385,6 +385,23 @@ pub(crate) enum A5World {
     ClosedWorldFrozenGraph,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum A5Mode {
+    Baseline,
+    PreciseReplay,
+    CoarseConstraint,
+}
+
+impl A5Mode {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Baseline => "baseline",
+            Self::PreciseReplay => "precise_replay",
+            Self::CoarseConstraint => "coarse_constraint",
+        }
+    }
+}
+
 impl A5World {
     pub(crate) const ALL: [Self; 1] = [Self::ClosedWorldFrozenGraph];
 
@@ -429,6 +446,17 @@ pub(crate) enum AbiGuardReason {
     UnresolvedTarget,
 }
 
+impl AbiGuardReason {
+    fn label(self) -> &'static str {
+        match self {
+            Self::ExternallyVisible => "externally-visible",
+            Self::AddressTaken => "address-taken",
+            Self::FunctionTarget => "function-target",
+            Self::UnresolvedTarget => "unresolved-target",
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum AbiGuardDisposition {
     Permitted { attested: bool },
@@ -439,6 +467,21 @@ impl AbiGuardDisposition {
     pub(crate) fn refused(reasons: impl IntoIterator<Item = AbiGuardReason>) -> Self {
         Self::Refused {
             reasons: reasons.into_iter().collect(),
+        }
+    }
+
+    fn stamp(&self) -> String {
+        match self {
+            Self::Permitted { attested: true } => "permitted:attested".to_owned(),
+            Self::Permitted { attested: false } => "permitted:internal".to_owned(),
+            Self::Refused { reasons } => format!(
+                "refused:{}",
+                reasons
+                    .iter()
+                    .map(|reason| reason.label())
+                    .collect::<Vec<_>>()
+                    .join(",")
+            ),
         }
     }
 }
@@ -470,6 +513,81 @@ pub(crate) fn a5_abi_guard(
         AbiGuardDisposition::Permitted { attested: false }
     } else {
         AbiGuardDisposition::Refused { reasons }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct A5SummaryArtifact {
+    pub(crate) summary_tsv: String,
+    pub(crate) receipt: String,
+}
+
+pub(crate) fn render_summary_artifact(
+    fixpoint: &MayOverlapFixpoint,
+    mode: A5Mode,
+    guard: &AbiGuardDisposition,
+) -> A5SummaryArtifact {
+    let world = A5World::ClosedWorldFrozenGraph;
+    let mut summary_tsv = String::from(
+        "callee_fn\tleft_param\tright_param\tcaller_fn\tblock\tstatement_index\t\
+         left_variant\tleft_owner\tleft_slot\tright_variant\tright_owner\tright_slot\t\
+         a5_world\ta5_mode\n",
+    );
+    for (pair, witness) in fixpoint.summary.ordered_rows() {
+        let params = pair.params();
+        let (left, right) = witness.actuals();
+        summary_tsv.push_str(&format!(
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+            pair.function(),
+            params.first(),
+            params.second(),
+            witness.caller,
+            witness.location.block,
+            witness.location.statement_index,
+            left.variant,
+            left.owner,
+            left.slot,
+            right.variant,
+            right.owner,
+            right.slot,
+            world.label(),
+            mode.label(),
+        ));
+    }
+    let pair_count = fixpoint.summary.witnesses.len();
+    let witness_count = fixpoint
+        .summary
+        .witnesses
+        .values()
+        .map(BTreeSet::len)
+        .sum::<usize>();
+    let sccs = fixpoint
+        .sccs
+        .iter()
+        .map(|component| {
+            component
+                .iter()
+                .map(u32::to_string)
+                .collect::<Vec<_>>()
+                .join(",")
+        })
+        .collect::<Vec<_>>()
+        .join(";");
+    let receipt = format!(
+        "schema=a5-summary-v1\nstatus=ok\ndata=true\na5_mode={}\na5_world={}\n\
+         unknown_caller_seeding={}\nabi_guard={}\npairs={pair_count}\nwitnesses={witness_count}\n\
+         scc_count={}\nsccs={}\nscc_iterations={}\nunresolved=0\n",
+        mode.label(),
+        world.label(),
+        world.seeds_unknown_callers(),
+        guard.stamp(),
+        fixpoint.sccs.len(),
+        sccs,
+        fixpoint.scc_iterations,
+    );
+    A5SummaryArtifact {
+        summary_tsv,
+        receipt,
     }
 }
 
@@ -784,5 +902,62 @@ mod tests {
         let edge = witness(2, 1, 1, 1, slot(1, 1), 2, slot(1, 2));
 
         assert!(CallTransfer::forwarded(edge, wrong_caller).is_err());
+    }
+
+    #[test]
+    fn summary_artifact_is_byte_identical_under_reverse_registration() {
+        let pair1 = FunctionPairKey::new(1, 1, 2).unwrap();
+        let transfers = [
+            CallTransfer::direct(witness(1, 0, 4, 1, slot(0, 1), 2, slot(0, 2))),
+            CallTransfer::forwarded(witness(2, 1, 3, 1, slot(1, 1), 2, slot(1, 2)), pair1).unwrap(),
+        ];
+        let forward = render_summary_artifact(
+            &solve_may_overlap(transfers),
+            A5Mode::PreciseReplay,
+            &AbiGuardDisposition::Permitted { attested: true },
+        );
+        let reverse = render_summary_artifact(
+            &solve_may_overlap(transfers.into_iter().rev()),
+            A5Mode::PreciseReplay,
+            &AbiGuardDisposition::Permitted { attested: true },
+        );
+
+        assert_eq!(forward, reverse);
+        assert_eq!(forward.summary_tsv.lines().count(), 3);
+    }
+
+    #[test]
+    fn summary_receipt_stamps_mode_world_guard_and_counts() {
+        let solved = solve_may_overlap([CallTransfer::direct(witness(
+            1,
+            0,
+            4,
+            1,
+            slot(0, 1),
+            2,
+            slot(0, 2),
+        ))]);
+        let artifact = render_summary_artifact(
+            &solved,
+            A5Mode::PreciseReplay,
+            &AbiGuardDisposition::refused([
+                AbiGuardReason::ExternallyVisible,
+                AbiGuardReason::AddressTaken,
+            ]),
+        );
+
+        assert!(artifact.receipt.contains("a5_mode=precise_replay\n"));
+        assert!(
+            artifact
+                .receipt
+                .contains("a5_world=closed_world_frozen_graph\n")
+        );
+        assert!(artifact.receipt.contains("unknown_caller_seeding=false\n"));
+        assert!(
+            artifact
+                .receipt
+                .contains("abi_guard=refused:externally-visible,address-taken\n")
+        );
+        assert!(artifact.receipt.contains("pairs=1\nwitnesses=1\n"));
     }
 }
