@@ -6,6 +6,7 @@
 
 use std::ops::Range;
 
+pub(crate) mod a5_overlap;
 mod assoc;
 pub(crate) mod borrow_engine;
 pub(crate) mod borrow_verify;
