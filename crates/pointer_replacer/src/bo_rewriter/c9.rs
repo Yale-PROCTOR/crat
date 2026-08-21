@@ -83,4 +83,20 @@ mod tests {
         assert!(!unmarked.contains("__crat_c9_4_2"));
         assert_ne!(emitted, unmarked);
     }
+
+    #[test]
+    fn w7_w13_compile_gate_is_nonvacuous() {
+        let marked =
+            render_marked_call(&mark(), "two", &["&mut *p".to_owned(), "q".to_owned()]).unwrap();
+        let source = |call: &str| {
+            format!(
+                "fn two(x: &mut i32, y: &i32) {{ *x = *y + 1; }} \
+                 fn caller(p: &mut i32) {{ let q: &i32 = &*p; {call}; }}"
+            )
+        };
+        assert!(::utils::compilation::run_compiler_on_str(&source(&marked), |_| {}).is_ok());
+        assert!(
+            ::utils::compilation::run_compiler_on_str(&source("two(&mut *p, q)"), |_| {}).is_err()
+        );
+    }
 }
