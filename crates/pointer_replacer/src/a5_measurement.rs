@@ -20,15 +20,17 @@ use crate::{
         borrow_ownership::{
             SlotKind,
             a5_overlap::{
-                A5World, PairClass, PairFacts, PairSide, SetPairEvidence, SnapshotVerdict,
-                classify_pair,
+                A5World, C9MarkKey, PairClass, PairFacts, PairSide, SetPairEvidence,
+                SnapshotVerdict, classify_pair,
             },
             a5_snapshot_effects::snapshot_verdict_for_target,
             construction::{CopyLendMode, construct_bo_into, verify_bo_construction},
             crate_slots::CrateSlots,
             export::with_bo_export,
+            l2::{MirLocationKey, SlotKey},
             mutability_facts::MutFacts,
             origins::compute_origins,
+            resolve::{ResolvedSlot, resolve_place},
             solver::{KindSolver, SlotRef},
         },
     },
@@ -125,6 +127,7 @@ struct Measurement {
     pairs: Vec<PairLedgerRow>,
     classifier: ClassifierDifferential,
     snapshot: SnapshotCoverage,
+    final_marks: Vec<C9MarkKey>,
     coverage: CoverageCounts,
     timings: Timings,
 }
@@ -314,6 +317,20 @@ fn target_type_filters(
     (agree, copy_scalar)
 }
 
+fn argument_slot_key<'tcx>(
+    slots: &CrateSlots,
+    function: LocalDefId,
+    body: &Body<'tcx>,
+    operand: &Operand<'tcx>,
+) -> Option<SlotKey> {
+    let place = operand.place()?;
+    let slot = match resolve_place(slots, function, body, place, 0, None)? {
+        ResolvedSlot::Local(slot) => SlotRef::Local(function, slot),
+        ResolvedSlot::Field(slot) => SlotRef::Field(slot),
+    };
+    Some(SlotKey::of(slot))
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct CallSite {
     id: String,
@@ -321,6 +338,7 @@ struct CallSite {
     pair_facts: BTreeMap<(usize, usize), PairFacts<String>>,
     snapshot_verdicts: BTreeMap<(usize, usize), SnapshotVerdict>,
     post_filter: BTreeMap<(usize, usize), (bool, bool)>,
+    mark_keys: BTreeMap<(usize, usize), C9MarkKey>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -397,6 +415,7 @@ struct MeasuredProgram {
     pairs: Vec<PairLedgerRow>,
     classifier: ClassifierDifferential,
     snapshot: SnapshotCoverage,
+    final_marks: Vec<C9MarkKey>,
 }
 
 fn measure_program(input: &ProgramInput) -> Result<MeasuredProgram, String> {
@@ -414,6 +433,7 @@ fn measure_program(input: &ProgramInput) -> Result<MeasuredProgram, String> {
     let mut mutability_default_fires = 0;
     let mut classifier = ClassifierDifferential::default();
     let mut snapshot = SnapshotCoverage::default();
+    let mut final_marks = Vec::new();
 
     for site in &input.call_sites {
         if !site_ids.insert(site.id.as_str()) {
@@ -465,7 +485,14 @@ fn measure_program(input: &ProgramInput) -> Result<MeasuredProgram, String> {
                                 Some(SnapshotVerdict::Markable) => {
                                     snapshot.markable += 1;
                                     match site.post_filter.get(&(left, right)) {
-                                        Some((true, true)) => snapshot.final_markable += 1,
+                                        Some((true, true)) => {
+                                            if let Some(mark) = site.mark_keys.get(&(left, right)) {
+                                                snapshot.final_markable += 1;
+                                                final_marks.push(mark.clone());
+                                            } else {
+                                                snapshot.filter_unresolved += 1;
+                                            }
+                                        }
                                         Some((false, _)) => snapshot.target_type_mismatch += 1,
                                         Some((true, false)) => snapshot.noncopy_scalar += 1,
                                         None => snapshot.filter_unresolved += 1,
@@ -542,6 +569,7 @@ fn measure_program(input: &ProgramInput) -> Result<MeasuredProgram, String> {
         pairs,
         classifier,
         snapshot,
+        final_marks,
     })
 }
 
@@ -1003,6 +1031,7 @@ fn measure_tcx(
     accepted_model_time: Duration,
 ) -> Result<Measurement, String> {
     let program = super::collect_program(tcx);
+    let slots = CrateSlots::build(&program);
     let mutability = MutFacts::from_program(&program);
     let functions = program.functions.iter().copied().collect::<FxHashSet<_>>();
     let roots = unknown_caller_roots(tcx, &program.functions);
@@ -1128,6 +1157,7 @@ fn measure_tcx(
             let mut pair_facts = BTreeMap::new();
             let mut snapshot_verdicts = BTreeMap::new();
             let mut post_filter = BTreeMap::new();
+            let mut mark_keys = BTreeMap::new();
             for left in 0..call_args.len() {
                 for right in left + 1..call_args.len() {
                     pair_facts.insert(
@@ -1161,6 +1191,39 @@ fn measure_tcx(
                             (left, right),
                             target_type_filters(tcx, targets, left, right),
                         );
+                        let filters = target_type_filters(tcx, targets, left, right);
+                        if filters == (true, true)
+                            && let (Some(left_actual), Some(right_actual)) = (
+                                argument_slot_key(&slots, caller, &body, &call_args[left].node),
+                                argument_slot_key(&slots, caller, &body, &call_args[right].node),
+                            )
+                        {
+                            let target = targets[0];
+                            let target_body =
+                                tcx.mir_drops_elaborated_and_const_checked(target).borrow();
+                            let pointee = target_body.local_decls[Local::from_usize(left + 1)]
+                                .ty
+                                .builtin_deref(true)
+                                .expect("type filter proved a pointee")
+                                .to_string();
+                            if let Some(mark) = C9MarkKey::new(
+                                caller.local_def_index.as_u32(),
+                                MirLocationKey::new(
+                                    block.as_u32(),
+                                    body.basic_blocks[block].statements.len(),
+                                ),
+                                targets.iter().map(|target| target.local_def_index.as_u32()),
+                                target.local_def_index.as_u32(),
+                                left as u32 + 1,
+                                left_actual,
+                                right as u32 + 1,
+                                right_actual,
+                                read_only,
+                                pointee,
+                            ) {
+                                mark_keys.insert((left, right), mark);
+                            }
+                        }
                     }
                 }
             }
@@ -1178,6 +1241,7 @@ fn measure_tcx(
                 pair_facts,
                 snapshot_verdicts,
                 post_filter,
+                mark_keys,
             });
         }
     }
@@ -1193,6 +1257,7 @@ fn measure_tcx(
         pairs: measured.pairs,
         classifier: measured.classifier,
         snapshot: measured.snapshot,
+        final_marks: measured.final_marks,
         coverage,
         timings: Timings {
             origins: origins_time,
@@ -1226,6 +1291,27 @@ pub(super) fn run_worker(tcx: TyCtxt<'_>, t_tcx: Duration) -> super::report::Row
             let counts = &measured.counts;
             for pair in &measured.pairs {
                 println!("{}", render_pair_line(pair));
+            }
+            for mark in &measured.final_marks {
+                let params = mark.pair.params();
+                println!(
+                    "A5C9MARK\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                    mark.caller,
+                    mark.location.block,
+                    mark.location.statement_index,
+                    params.first(),
+                    params.second(),
+                    match mark.shared_side {
+                        PairSide::Left => "left",
+                        PairSide::Right => "right",
+                    },
+                    mark.pointee_type,
+                    mark.targets
+                        .iter()
+                        .map(u32::to_string)
+                        .collect::<Vec<_>>()
+                        .join(",")
+                );
             }
             println!("{}", render_count_line(counts));
             row.set("status", "ok");
@@ -1282,6 +1368,7 @@ pub(super) fn run_worker(tcx: TyCtxt<'_>, t_tcx: Duration) -> super::report::Row
                 "a5_snapshot_filter_unresolved",
                 measured.snapshot.filter_unresolved,
             );
+            row.set("a5_c9_final_marks", measured.final_marks.len());
             row.set("calls_total", measured.coverage.calls_total);
             row.set("direct_local", measured.coverage.direct_local);
             row.set("indirect_local", measured.coverage.indirect_local);
@@ -2644,6 +2731,7 @@ mod tests {
                     pair_facts: all_risky(3),
                     snapshot_verdicts: BTreeMap::new(),
                     post_filter: BTreeMap::new(),
+                    mark_keys: BTreeMap::new(),
                 },
                 CallSite {
                     id: "caller:bb1:callee".to_owned(),
@@ -2654,6 +2742,7 @@ mod tests {
                     pair_facts: all_risky(2),
                     snapshot_verdicts: BTreeMap::new(),
                     post_filter: BTreeMap::new(),
+                    mark_keys: BTreeMap::new(),
                 },
             ],
             functions: BTreeMap::new(),
@@ -2778,6 +2867,7 @@ mod tests {
             pair_facts,
             snapshot_verdicts: BTreeMap::new(),
             post_filter: BTreeMap::new(),
+            mark_keys: BTreeMap::new(),
         };
         let one_ref_site = CallSite {
             id: "caller:bb2".to_owned(),
@@ -2785,6 +2875,7 @@ mod tests {
             pair_facts: BTreeMap::new(),
             snapshot_verdicts: BTreeMap::new(),
             post_filter: BTreeMap::new(),
+            mark_keys: BTreeMap::new(),
         };
         let program = ProgramInput {
             name: "fixture".to_owned(),

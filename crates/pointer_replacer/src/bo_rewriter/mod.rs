@@ -68,6 +68,7 @@ use crate::{
 
 pub(crate) mod apply;
 pub(crate) mod artifact;
+pub(crate) mod c9;
 pub(crate) mod decision;
 pub(crate) mod fat_facts;
 pub(crate) mod plan;
