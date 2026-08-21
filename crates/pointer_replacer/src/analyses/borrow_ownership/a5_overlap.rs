@@ -442,6 +442,97 @@ pub(crate) fn join_witness_mutability(
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SnapshotEffect {
+    None,
+    SharedRead,
+    MutableWrite,
+    OpaqueEscape,
+    Volatile,
+    Atomic,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct SnapshotEffectGraph {
+    events: Vec<SnapshotEffect>,
+    successors: Vec<BTreeSet<usize>>,
+    recursive: bool,
+}
+
+impl SnapshotEffectGraph {
+    pub(crate) fn new(
+        events: Vec<SnapshotEffect>,
+        edges: impl IntoIterator<Item = (usize, usize)>,
+    ) -> Result<Self, String> {
+        let mut successors = vec![BTreeSet::new(); events.len()];
+        for (from, to) in edges {
+            if from >= events.len() || to >= events.len() {
+                return Err("snapshot effect edge is outside the node universe".to_owned());
+            }
+            successors[from].insert(to);
+        }
+        Ok(Self {
+            events,
+            successors,
+            recursive: false,
+        })
+    }
+
+    pub(crate) fn recursive(events: Vec<SnapshotEffect>) -> Self {
+        Self {
+            successors: vec![BTreeSet::new(); events.len()],
+            events,
+            recursive: true,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SnapshotVerdict {
+    Markable,
+    ReadAfterWrite,
+    OpaqueEscape,
+    Recursive,
+    VolatileOrAtomic,
+}
+
+pub(crate) fn check_snapshot_equivalence(graph: &SnapshotEffectGraph) -> SnapshotVerdict {
+    if graph.recursive {
+        return SnapshotVerdict::Recursive;
+    }
+    if graph
+        .events
+        .iter()
+        .any(|effect| matches!(effect, SnapshotEffect::Volatile | SnapshotEffect::Atomic))
+    {
+        return SnapshotVerdict::VolatileOrAtomic;
+    }
+    if graph
+        .events
+        .iter()
+        .any(|effect| *effect == SnapshotEffect::OpaqueEscape)
+    {
+        return SnapshotVerdict::OpaqueEscape;
+    }
+    for (start, effect) in graph.events.iter().enumerate() {
+        if *effect != SnapshotEffect::MutableWrite {
+            continue;
+        }
+        let mut pending = graph.successors[start].iter().copied().collect::<Vec<_>>();
+        let mut seen = BTreeSet::new();
+        while let Some(node) = pending.pop() {
+            if !seen.insert(node) {
+                continue;
+            }
+            if graph.events[node] == SnapshotEffect::SharedRead {
+                return SnapshotVerdict::ReadAfterWrite;
+            }
+            pending.extend(graph.successors[node].iter().copied());
+        }
+    }
+    SnapshotVerdict::Markable
+}
+
 /// The only A5 call-world policy authorized for loop 2. Keeping the complete
 /// option set here makes the absence of an O1 build/config arm testable.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1106,5 +1197,74 @@ mod tests {
             }
         );
         assert_eq!(joined.missing_defaults, 0);
+    }
+
+    fn effects(events: &[SnapshotEffect], edges: &[(usize, usize)]) -> SnapshotEffectGraph {
+        SnapshotEffectGraph::new(events.to_vec(), edges.iter().copied()).unwrap()
+    }
+
+    #[test]
+    fn snapshot_read_before_write_is_markable() {
+        let graph = effects(
+            &[SnapshotEffect::SharedRead, SnapshotEffect::MutableWrite],
+            &[(0, 1)],
+        );
+        assert_eq!(
+            check_snapshot_equivalence(&graph),
+            SnapshotVerdict::Markable
+        );
+    }
+
+    #[test]
+    fn snapshot_read_after_write_is_unmarkable() {
+        let graph = effects(
+            &[SnapshotEffect::MutableWrite, SnapshotEffect::SharedRead],
+            &[(0, 1)],
+        );
+        assert_eq!(
+            check_snapshot_equivalence(&graph),
+            SnapshotVerdict::ReadAfterWrite
+        );
+    }
+
+    #[test]
+    fn snapshot_conditional_write_reaching_read_is_unmarkable() {
+        let graph = effects(
+            &[
+                SnapshotEffect::None,
+                SnapshotEffect::MutableWrite,
+                SnapshotEffect::None,
+                SnapshotEffect::SharedRead,
+            ],
+            &[(0, 1), (0, 2), (1, 3), (2, 3)],
+        );
+        assert_eq!(
+            check_snapshot_equivalence(&graph),
+            SnapshotVerdict::ReadAfterWrite
+        );
+    }
+
+    #[test]
+    fn snapshot_opaque_escape_and_recursion_fail_closed() {
+        let opaque = effects(&[SnapshotEffect::OpaqueEscape], &[]);
+        let recursive = SnapshotEffectGraph::recursive(vec![SnapshotEffect::SharedRead]);
+        assert_eq!(
+            check_snapshot_equivalence(&opaque),
+            SnapshotVerdict::OpaqueEscape
+        );
+        assert_eq!(
+            check_snapshot_equivalence(&recursive),
+            SnapshotVerdict::Recursive
+        );
+    }
+
+    #[test]
+    fn snapshot_volatile_and_atomic_effects_are_excluded() {
+        for effect in [SnapshotEffect::Volatile, SnapshotEffect::Atomic] {
+            assert_eq!(
+                check_snapshot_equivalence(&effects(&[effect], &[])),
+                SnapshotVerdict::VolatileOrAtomic
+            );
+        }
     }
 }
