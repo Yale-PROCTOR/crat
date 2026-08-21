@@ -24,7 +24,11 @@ use crate::{
                 SnapshotVerdict, classify_pair,
             },
             a5_snapshot_effects::snapshot_verdict_for_target,
-            construction::{CopyLendMode, construct_bo_into, verify_bo_construction},
+            borrow_engine::ParameterOverlap,
+            construction::{
+                CopyLendMode, construct_bo_into, verify_bo_construction,
+                verify_bo_construction_with_parameter_overlaps,
+            },
             crate_slots::CrateSlots,
             export::with_bo_export,
             l2::{MirLocationKey, SlotKey},
@@ -47,6 +51,8 @@ use projection_conflict::{AccessDepth, PlaceConflictBias, places_conflict};
 const COUNT_SENTINEL: &str = "A5P1 ";
 const BASE_SENTINEL: &str = "A5P1BASE ";
 const PAIR_SENTINEL: &str = "A5P1PAIR\t";
+const W14_PAIR_SENTINEL: &str = "A5W14PAIR\t";
+const W14_EXPOSURE_SENTINEL: &str = "A5W14EXPOSURE\t";
 const CLOSED_WORLD_FRAME_UNKNOWN_REACHABLE: usize = 2_318;
 const CLOSED_WORLD_FRAME_LOCAL_FUNCTIONS: usize = 2_456;
 
@@ -128,8 +134,44 @@ struct Measurement {
     classifier: ClassifierDifferential,
     snapshot: SnapshotCoverage,
     final_marks: Vec<C9MarkKey>,
+    w14: Option<W14Measurement>,
     coverage: CoverageCounts,
     timings: Timings,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ExposureClass {
+    Demoted,
+    Marked,
+    SharedSafe,
+    Unresolved,
+}
+
+impl ExposureClass {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Demoted => "demoted",
+            Self::Marked => "marked",
+            Self::SharedSafe => "shared-safe",
+            Self::Unresolved => "unresolved",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ExposureLedgerRow {
+    program: String,
+    formal: FormalKey,
+    baseline: SlotKind,
+    precise: SlotKind,
+    class: ExposureClass,
+}
+
+#[derive(Clone, Debug)]
+struct W14Measurement {
+    pairs: Vec<ExtendedPairLedgerRow>,
+    exposures: Vec<ExposureLedgerRow>,
+    precise_rounds: usize,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -151,6 +193,7 @@ struct SnapshotCoverage {
     target_type_mismatch: usize,
     noncopy_scalar: usize,
     final_markable: usize,
+    all_witness_demoted: usize,
     filter_unresolved: usize,
 }
 
@@ -190,6 +233,31 @@ struct PairLedgerRow {
     right_mutable: bool,
     left_default_fires: usize,
     right_default_fires: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct TargetFunction {
+    key: u32,
+    path: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct TargetFormalPair {
+    function: TargetFunction,
+    left_parameter: u32,
+    right_parameter: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ExtendedPairLedgerRow {
+    pair: PairLedgerRow,
+    target_formals: Vec<TargetFormalPair>,
+    left_formals: BTreeSet<FormalKey>,
+    right_formals: BTreeSet<FormalKey>,
+    raw_overlap: bool,
+    effective_overlap: bool,
+    markability: String,
+    selected_mark: bool,
 }
 
 impl PairLedgerRow {
@@ -334,6 +402,7 @@ fn argument_slot_key<'tcx>(
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct CallSite {
     id: String,
+    targets: Vec<TargetFunction>,
     arguments: Vec<FormalDecision>,
     pair_facts: BTreeMap<(usize, usize), PairFacts<String>>,
     snapshot_verdicts: BTreeMap<(usize, usize), SnapshotVerdict>,
@@ -413,9 +482,50 @@ impl ProgramCounts {
 struct MeasuredProgram {
     counts: ProgramCounts,
     pairs: Vec<PairLedgerRow>,
+    extended_pairs: Vec<ExtendedPairLedgerRow>,
     classifier: ClassifierDifferential,
     snapshot: SnapshotCoverage,
     final_marks: Vec<C9MarkKey>,
+}
+
+fn target_formal_pairs(site: &CallSite, left: usize, right: usize) -> Vec<TargetFormalPair> {
+    site.targets
+        .iter()
+        .cloned()
+        .map(|function| TargetFormalPair {
+            function,
+            left_parameter: left as u32 + 1,
+            right_parameter: right as u32 + 1,
+        })
+        .collect()
+}
+
+fn markability_reason(
+    site: &CallSite,
+    pair: (usize, usize),
+    class: PairMutability,
+) -> (&'static str, bool) {
+    if class == PairMutability::MutMut {
+        return ("mut-mut", false);
+    }
+    if class == PairMutability::SharedShared {
+        return ("shared-shared", false);
+    }
+    match site.snapshot_verdicts.get(&pair) {
+        Some(SnapshotVerdict::ReadAfterWrite) => ("read-after-write", false),
+        Some(SnapshotVerdict::OpaqueEscape) => ("opaque-escape", false),
+        Some(SnapshotVerdict::Recursive) => ("recursive", false),
+        Some(SnapshotVerdict::VolatileOrAtomic) => ("volatile-or-atomic", false),
+        None => ("snapshot-unresolved", false),
+        Some(SnapshotVerdict::Markable) => match site.post_filter.get(&pair) {
+            Some((false, _)) => ("target-type-mismatch", false),
+            Some((true, false)) => ("noncopy-scalar", false),
+            Some((true, true)) if site.mark_keys.contains_key(&pair) => {
+                ("markable-candidate", true)
+            }
+            Some((true, true)) | None => ("filter-unresolved", false),
+        },
+    }
 }
 
 fn measure_program(input: &ProgramInput) -> Result<MeasuredProgram, String> {
@@ -424,6 +534,7 @@ fn measure_program(input: &ProgramInput) -> Result<MeasuredProgram, String> {
     let mut sites_not_proven_disjoint = 0usize;
     let mut attributed = BTreeSet::new();
     let mut pairs = Vec::new();
+    let mut extended_pairs = Vec::new();
     let mut mut_mut = 0;
     let mut mut_read_only = 0;
     let mut shared_shared = 0;
@@ -434,6 +545,39 @@ fn measure_program(input: &ProgramInput) -> Result<MeasuredProgram, String> {
     let mut classifier = ClassifierDifferential::default();
     let mut snapshot = SnapshotCoverage::default();
     let mut final_marks = Vec::new();
+    let mut all_witnesses_markable = BTreeMap::<TargetFormalPair, bool>::new();
+
+    for site in &input.call_sites {
+        let ref_args = site
+            .arguments
+            .iter()
+            .enumerate()
+            .filter_map(|(index, formal)| formal.settles_ref.then_some(index))
+            .collect::<Vec<_>>();
+        for (offset, &left) in ref_args.iter().enumerate() {
+            for &right in &ref_args[offset + 1..] {
+                let facts = site
+                    .pair_facts
+                    .get(&(left, right))
+                    .cloned()
+                    .unwrap_or_default();
+                if classify_pair(&facts) != PairClass::NotProvenDisjoint {
+                    continue;
+                }
+                let class = PairMutability::from_sides(
+                    site.arguments[left].mutable,
+                    site.arguments[right].mutable,
+                );
+                let (_, candidate) = markability_reason(site, (left, right), class);
+                for target in target_formal_pairs(site, left, right) {
+                    all_witnesses_markable
+                        .entry(target)
+                        .and_modify(|all| *all &= candidate)
+                        .or_insert(candidate);
+                }
+            }
+        }
+    }
 
     for site in &input.call_sites {
         if !site_ids.insert(site.id.as_str()) {
@@ -476,6 +620,13 @@ fn measure_program(input: &ProgramInput) -> Result<MeasuredProgram, String> {
                     let right_formal = &site.arguments[right];
                     let class =
                         PairMutability::from_sides(left_formal.mutable, right_formal.mutable);
+                    let target_formals = target_formal_pairs(site, left, right);
+                    let (local_reason, candidate) = markability_reason(site, (left, right), class);
+                    let selected_mark = candidate
+                        && !target_formals.is_empty()
+                        && target_formals
+                            .iter()
+                            .all(|pair| all_witnesses_markable.get(pair).copied() == Some(true));
                     match class {
                         PairMutability::MutMut => mut_mut += 1,
                         PairMutability::MutReadOnly => {
@@ -486,9 +637,16 @@ fn measure_program(input: &ProgramInput) -> Result<MeasuredProgram, String> {
                                     snapshot.markable += 1;
                                     match site.post_filter.get(&(left, right)) {
                                         Some((true, true)) => {
-                                            if let Some(mark) = site.mark_keys.get(&(left, right)) {
+                                            if selected_mark
+                                                && let Some(mark) =
+                                                    site.mark_keys.get(&(left, right))
+                                            {
                                                 snapshot.final_markable += 1;
                                                 final_marks.push(mark.clone());
+                                            } else if candidate {
+                                                // A locally markable witness can still be demoted by
+                                                // another witness of the same formal pair.
+                                                snapshot.all_witness_demoted += 1;
                                             } else {
                                                 snapshot.filter_unresolved += 1;
                                             }
@@ -525,6 +683,23 @@ fn measure_program(input: &ProgramInput) -> Result<MeasuredProgram, String> {
                     };
                     pair.validate()?;
                     mutability_default_fires += pair.default_fires();
+                    let markability = if selected_mark {
+                        "selected-mark"
+                    } else if candidate {
+                        "all-witness-demotion"
+                    } else {
+                        local_reason
+                    };
+                    extended_pairs.push(ExtendedPairLedgerRow {
+                        pair: pair.clone(),
+                        target_formals,
+                        left_formals: left_formal.currently_predicted_refs.clone(),
+                        right_formals: right_formal.currently_predicted_refs.clone(),
+                        raw_overlap: true,
+                        effective_overlap: !selected_mark,
+                        markability: markability.to_owned(),
+                        selected_mark,
+                    });
                     pairs.push(pair);
                     for index in [left, right] {
                         let formal = &site.arguments[index];
@@ -564,12 +739,189 @@ fn measure_program(input: &ProgramInput) -> Result<MeasuredProgram, String> {
     if classifier.not_proven_disjoint != pairs.len() {
         return Err("shared classifier denominator disagrees with the pair ledger".to_owned());
     }
+    extended_pairs.sort_by(|left, right| {
+        (
+            left.pair.program.as_str(),
+            left.pair.site.as_str(),
+            left.pair.left_argument,
+            left.pair.right_argument,
+        )
+            .cmp(&(
+                right.pair.program.as_str(),
+                right.pair.site.as_str(),
+                right.pair.left_argument,
+                right.pair.right_argument,
+            ))
+    });
+    final_marks.sort();
     Ok(MeasuredProgram {
         counts,
         pairs,
+        extended_pairs,
         classifier,
         snapshot,
         final_marks,
+    })
+}
+
+fn build_parameter_overlaps(
+    program: &RustProgram<'_>,
+    rows: &[ExtendedPairLedgerRow],
+) -> Result<rustc_hash::FxHashMap<LocalDefId, ParameterOverlap>, String> {
+    let by_key = program
+        .functions
+        .iter()
+        .copied()
+        .map(|did| (did.local_def_index.as_u32(), did))
+        .collect::<BTreeMap<_, _>>();
+    let mut pairs = rustc_hash::FxHashMap::<LocalDefId, Vec<(Local, Local)>>::default();
+    for row in rows.iter().filter(|row| row.effective_overlap) {
+        for target in &row.target_formals {
+            let did = by_key.get(&target.function.key).copied().ok_or_else(|| {
+                format!(
+                    "W14 target {} ({}) is outside the local program",
+                    target.function.key, target.function.path
+                )
+            })?;
+            pairs.entry(did).or_default().push((
+                Local::from_usize(target.left_parameter as usize),
+                Local::from_usize(target.right_parameter as usize),
+            ));
+        }
+    }
+    Ok(pairs
+        .into_iter()
+        .map(|(did, pairs)| (did, ParameterOverlap::from_pairs(pairs)))
+        .collect())
+}
+
+fn build_exposure_ledger(
+    program: &str,
+    measured: &MeasuredProgram,
+    baseline: &AcceptedFormalModel,
+    precise: &AcceptedFormalModel,
+) -> Result<Vec<ExposureLedgerRow>, String> {
+    let mut participation = BTreeMap::<FormalKey, Vec<&ExtendedPairLedgerRow>>::new();
+    for row in &measured.extended_pairs {
+        for formal in row
+            .left_formals
+            .iter()
+            .chain(&row.right_formals)
+            .filter(|formal| formal.depth == 0)
+        {
+            participation.entry(formal.clone()).or_default().push(row);
+        }
+    }
+    if participation.len() != measured.counts.attributed_predicted_refs_depth0 {
+        return Err(format!(
+            "W14 exposure identity count {} disagrees with C3-d0 {}",
+            participation.len(),
+            measured.counts.attributed_predicted_refs_depth0
+        ));
+    }
+
+    let mut answer = Vec::with_capacity(participation.len());
+    for (formal, rows) in participation {
+        let baseline_kind = baseline
+            .kinds
+            .get(&formal)
+            .copied()
+            .ok_or_else(|| format!("W14 baseline lacks {formal:?}"))?;
+        if baseline_kind != SlotKind::Ref {
+            return Err(format!("W14 exposure {formal:?} is not baseline Ref"));
+        }
+        let precise_kind = precise
+            .kinds
+            .get(&formal)
+            .copied()
+            .ok_or_else(|| format!("W14 precise model lacks {formal:?}"))?;
+        let class = if precise_kind != SlotKind::Ref {
+            ExposureClass::Demoted
+        } else {
+            let non_shared = rows
+                .iter()
+                .copied()
+                .filter(|row| row.pair.class != PairMutability::SharedShared)
+                .collect::<Vec<_>>();
+            if non_shared.is_empty() {
+                ExposureClass::SharedSafe
+            } else if non_shared.iter().all(|row| row.selected_mark) {
+                ExposureClass::Marked
+            } else {
+                ExposureClass::Unresolved
+            }
+        };
+        answer.push(ExposureLedgerRow {
+            program: program.to_owned(),
+            formal,
+            baseline: baseline_kind,
+            precise: precise_kind,
+            class,
+        });
+    }
+    Ok(answer)
+}
+
+fn run_focused_w14(
+    program_name: &str,
+    program: &RustProgram<'_>,
+    slots: &CrateSlots,
+    mutability: &MutFacts,
+    formals: &BTreeMap<(String, u32), ArtifactFormal>,
+    baseline: &AcceptedFormalModel,
+    measured: &MeasuredProgram,
+) -> Result<W14Measurement, String> {
+    if measured.extended_pairs.len() != measured.pairs.len()
+        || measured.extended_pairs.iter().any(|row| !row.raw_overlap)
+    {
+        return Err("W14 raw/extended pair ledger does not cover the exact denominator".to_owned());
+    }
+    let parameter_overlaps = build_parameter_overlaps(program, &measured.extended_pairs)?;
+    let solver = KindSolver::new(slots);
+    let origins = compute_origins(program);
+    let construction = construct_bo_into(
+        program,
+        slots,
+        &origins,
+        mutability,
+        &solver,
+        CopyLendMode::Baseline,
+    )
+    .map_err(|error| format!("W14 construction failed: {error}"))?;
+    let (model, stats) = verify_bo_construction_with_parameter_overlaps(
+        program,
+        slots,
+        &origins,
+        &solver,
+        &construction,
+        mutability,
+        &parameter_overlaps,
+    );
+    let model = model.ok_or_else(|| "W14 precise replay declined".to_owned())?;
+    let precise = project_formal_kinds(program.tcx, program, slots, formals, &model)?;
+
+    for row in measured
+        .extended_pairs
+        .iter()
+        .filter(|row| row.selected_mark)
+    {
+        if row
+            .left_formals
+            .iter()
+            .chain(&row.right_formals)
+            .any(|formal| precise.kinds.get(formal) != Some(&SlotKind::Ref))
+        {
+            return Err(format!(
+                "selected mark at {} does not retain both formal sides as Ref",
+                row.pair.site
+            ));
+        }
+    }
+    let exposures = build_exposure_ledger(program_name, measured, baseline, &precise)?;
+    Ok(W14Measurement {
+        pairs: measured.extended_pairs.clone(),
+        exposures,
+        precise_rounds: stats.rounds,
     })
 }
 
@@ -964,31 +1316,20 @@ fn formal_for_argument(
     })
 }
 
-fn accepted_current_refs(
+struct AcceptedFormalModel {
+    refs: BTreeMap<(String, u32), BTreeSet<FormalKey>>,
+    kinds: BTreeMap<FormalKey, SlotKind>,
+}
+
+fn project_formal_kinds(
     tcx: TyCtxt<'_>,
     program: &RustProgram<'_>,
+    slots: &CrateSlots,
     formals: &BTreeMap<(String, u32), ArtifactFormal>,
-) -> Result<BTreeMap<(String, u32), BTreeSet<FormalKey>>, String> {
-    let slots = CrateSlots::build(program);
-    let mutable = MutFacts::from_program(program);
-    let (model, _export) = with_bo_export(|| {
-        let solver = KindSolver::new(&slots);
-        let origins = compute_origins(program);
-        let Ok(construction) = construct_bo_into(
-            program,
-            &slots,
-            &origins,
-            &mutable,
-            &solver,
-            CopyLendMode::Baseline,
-        ) else {
-            return None;
-        };
-        verify_bo_construction(program, &slots, &origins, &solver, &construction, &mutable)
-    });
-    let model = model.ok_or_else(|| "targeted accepted-model export declined".to_owned())?;
-
+    model: &rustc_hash::FxHashMap<SlotRef, SlotKind>,
+) -> Result<AcceptedFormalModel, String> {
     let mut refs = BTreeMap::new();
+    let mut kinds = BTreeMap::new();
     for &function in &program.functions {
         let path = tcx.def_path_str(function.to_def_id());
         let body = tcx
@@ -1009,26 +1350,60 @@ fn accepted_current_refs(
                 let slot = universe.slot_for_local_depth(local, depth).ok_or_else(|| {
                     format!("accepted model lacks {path}#arg{}@{depth}", parameter + 1)
                 })?;
-                if model.get(&SlotRef::Local(function, slot)) == Some(&SlotKind::Ref) {
-                    accepted_refs.insert(FormalKey {
-                        function: path.clone(),
-                        parameter: parameter as u32 + 1,
-                        depth,
-                    });
+                let formal_key = FormalKey {
+                    function: path.clone(),
+                    parameter: parameter as u32 + 1,
+                    depth,
+                };
+                let kind = model
+                    .get(&SlotRef::Local(function, slot))
+                    .copied()
+                    .ok_or_else(|| format!("accepted model has no kind for {formal_key:?}"))?;
+                if kind == SlotKind::Ref {
+                    accepted_refs.insert(formal_key.clone());
                 }
+                kinds.insert(formal_key, kind);
             }
             refs.insert(key, accepted_refs);
         }
     }
-    Ok(refs)
+    Ok(AcceptedFormalModel { refs, kinds })
+}
+
+fn accepted_current_model(
+    tcx: TyCtxt<'_>,
+    program: &RustProgram<'_>,
+    formals: &BTreeMap<(String, u32), ArtifactFormal>,
+) -> Result<AcceptedFormalModel, String> {
+    let slots = CrateSlots::build(program);
+    let mutable = MutFacts::from_program(program);
+    let (model, _export) = with_bo_export(|| {
+        let solver = KindSolver::new(&slots);
+        let origins = compute_origins(program);
+        let Ok(construction) = construct_bo_into(
+            program,
+            &slots,
+            &origins,
+            &mutable,
+            &solver,
+            CopyLendMode::Baseline,
+        ) else {
+            return None;
+        };
+        verify_bo_construction(program, &slots, &origins, &solver, &construction, &mutable)
+    });
+    let model = model.ok_or_else(|| "targeted accepted-model export declined".to_owned())?;
+
+    project_formal_kinds(tcx, program, &slots, formals, &model)
 }
 
 fn measure_tcx(
     program_name: &str,
     tcx: TyCtxt<'_>,
     formals: &BTreeMap<(String, u32), ArtifactFormal>,
-    current_refs: &BTreeMap<(String, u32), BTreeSet<FormalKey>>,
+    accepted: &AcceptedFormalModel,
     accepted_model_time: Duration,
+    focused_w14: bool,
 ) -> Result<Measurement, String> {
     let program = super::collect_program(tcx);
     let slots = CrateSlots::build(&program);
@@ -1148,10 +1523,26 @@ fn measure_tcx(
                 .iter()
                 .map(|target| tcx.def_path_str(target.to_def_id()))
                 .collect::<BTreeSet<_>>();
+            let mut target_functions = targets
+                .iter()
+                .map(|target| TargetFunction {
+                    key: target.local_def_index.as_u32(),
+                    path: tcx.def_path_str(target.to_def_id()),
+                })
+                .collect::<Vec<_>>();
+            target_functions.sort();
+            target_functions.dedup();
 
             let arguments = (0..call_args.len())
                 .map(|parameter| {
-                    formal_for_argument(tcx, targets, parameter, formals, current_refs, &mutability)
+                    formal_for_argument(
+                        tcx,
+                        targets,
+                        parameter,
+                        formals,
+                        &accepted.refs,
+                        &mutability,
+                    )
                 })
                 .collect::<Result<Vec<_>, _>>()?;
             let mut pair_facts = BTreeMap::new();
@@ -1237,6 +1628,7 @@ fn measure_tcx(
                         .span_to_diagnostic_string(block_data.terminator().source_info.span),
                     target_paths.into_iter().collect::<Vec<_>>().join("|")
                 ),
+                targets: target_functions,
                 arguments,
                 pair_facts,
                 snapshot_verdicts,
@@ -1251,6 +1643,19 @@ fn measure_tcx(
         call_sites,
         functions: function_nodes,
     })?;
+    let w14 = focused_w14
+        .then(|| {
+            run_focused_w14(
+                program_name,
+                &program,
+                &slots,
+                &mutability,
+                formals,
+                accepted,
+                &measured,
+            )
+        })
+        .transpose()?;
     coverage.validate()?;
     Ok(Measurement {
         counts: measured.counts,
@@ -1258,6 +1663,7 @@ fn measure_tcx(
         classifier: measured.classifier,
         snapshot: measured.snapshot,
         final_marks: measured.final_marks,
+        w14,
         coverage,
         timings: Timings {
             origins: origins_time,
@@ -1270,10 +1676,25 @@ fn measure_tcx(
 pub(super) fn run_worker(tcx: TyCtxt<'_>, t_tcx: Duration) -> super::report::Row {
     let t0 = Instant::now();
     let mut row = super::report::Row::default();
+    let focused_w14 = std::env::var("CRAT_A5_W14_FOCUSED").as_deref() == Ok("1");
     row.set("copy_lend_mode", CopyLendMode::Baseline.label());
     row.set("a5_world", A5World::ClosedWorldFrozenGraph.label());
-    row.set("a5_mode", "classifier_differential");
-    row.set("a5_abi_guard", "not-yet-consumed-item4");
+    row.set(
+        "a5_mode",
+        if focused_w14 {
+            "precise_replay"
+        } else {
+            "classifier_differential"
+        },
+    );
+    row.set(
+        "a5_abi_guard",
+        if focused_w14 {
+            "permitted:measurement-frozen-graph-attested"
+        } else {
+            "not-yet-consumed-item4"
+        },
+    );
     let program = std::env::var("CRAT_BOC1_NAME").unwrap_or_else(|_| "unnamed".to_owned());
     let Some(snapshot) = std::env::var_os("CRAT_A5_SNAPSHOT").map(std::path::PathBuf::from) else {
         row.set("status", "missing-snapshot");
@@ -1282,9 +1703,9 @@ pub(super) fn run_worker(tcx: TyCtxt<'_>, t_tcx: Duration) -> super::report::Row
     let measured = snapshot_formals(&snapshot, &program).and_then(|formals| {
         let t_model = Instant::now();
         let rust_program = super::collect_program(tcx);
-        let current_refs = accepted_current_refs(tcx, &rust_program, &formals)?;
+        let accepted = accepted_current_model(tcx, &rust_program, &formals)?;
         let model_time = t_model.elapsed();
-        measure_tcx(&program, tcx, &formals, &current_refs, model_time)
+        measure_tcx(&program, tcx, &formals, &accepted, model_time, focused_w14)
     });
     match measured {
         Ok(measured) => {
@@ -1312,6 +1733,44 @@ pub(super) fn run_worker(tcx: TyCtxt<'_>, t_tcx: Duration) -> super::report::Row
                         .collect::<Vec<_>>()
                         .join(",")
                 );
+            }
+            if let Some(w14) = &measured.w14 {
+                for pair in &w14.pairs {
+                    println!("{}", render_extended_pair_line(pair));
+                }
+                for exposure in &w14.exposures {
+                    println!("{}", render_exposure_line(exposure));
+                }
+                let exposure_count = |class| {
+                    w14.exposures
+                        .iter()
+                        .filter(|row| row.class == class)
+                        .count()
+                };
+                row.set("a5_w14_pairs", w14.pairs.len());
+                row.set(
+                    "a5_w14_effective_pairs",
+                    w14.pairs
+                        .iter()
+                        .filter(|pair| pair.effective_overlap)
+                        .count(),
+                );
+                row.set(
+                    "a5_w14_selected_marks",
+                    w14.pairs.iter().filter(|pair| pair.selected_mark).count(),
+                );
+                row.set("a5_w14_exposures", w14.exposures.len());
+                row.set("a5_w14_demoted", exposure_count(ExposureClass::Demoted));
+                row.set("a5_w14_marked", exposure_count(ExposureClass::Marked));
+                row.set(
+                    "a5_w14_shared_safe",
+                    exposure_count(ExposureClass::SharedSafe),
+                );
+                row.set(
+                    "a5_w14_unresolved",
+                    exposure_count(ExposureClass::Unresolved),
+                );
+                row.set("a5_w14_precise_rounds", w14.precise_rounds);
             }
             println!("{}", render_count_line(counts));
             row.set("status", "ok");
@@ -1363,6 +1822,10 @@ pub(super) fn run_worker(tcx: TyCtxt<'_>, t_tcx: Duration) -> super::report::Row
             row.set(
                 "a5_snapshot_final_markable",
                 measured.snapshot.final_markable,
+            );
+            row.set(
+                "a5_snapshot_all_witness_demoted",
+                measured.snapshot.all_witness_demoted,
             );
             row.set(
                 "a5_snapshot_filter_unresolved",
@@ -1447,6 +1910,77 @@ fn render_pair_line(pair: &PairLedgerRow) -> String {
         usize::from(pair.right_mutable),
         pair.left_default_fires,
         pair.right_default_fires,
+    )
+}
+
+fn kind_label(kind: SlotKind) -> &'static str {
+    match kind {
+        SlotKind::Raw => "raw",
+        SlotKind::Ref => "ref",
+        SlotKind::Owning => "owning",
+    }
+}
+
+fn formal_label(formal: &FormalKey) -> String {
+    format!("{}#{}@{}", formal.function, formal.parameter, formal.depth)
+}
+
+fn render_extended_pair_line(row: &ExtendedPairLedgerRow) -> String {
+    let targets = row
+        .target_formals
+        .iter()
+        .map(|target| {
+            format!(
+                "{}[{}]#{}/{}",
+                target.function.path,
+                target.function.key,
+                target.left_parameter,
+                target.right_parameter
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("|");
+    let left = row
+        .left_formals
+        .iter()
+        .map(formal_label)
+        .collect::<Vec<_>>()
+        .join("|");
+    let right = row
+        .right_formals
+        .iter()
+        .map(formal_label)
+        .collect::<Vec<_>>()
+        .join("|");
+    format!(
+        "{W14_PAIR_SENTINEL}{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\tbaseline\tprecise_replay\tclosed_world_frozen_graph\tpermitted:measurement-frozen-graph-attested",
+        row.pair.program,
+        row.pair.site,
+        row.pair.left_argument,
+        row.pair.right_argument,
+        row.pair.class.label(),
+        targets,
+        left,
+        right,
+        usize::from(row.raw_overlap),
+        usize::from(row.effective_overlap),
+        row.markability,
+        usize::from(row.selected_mark),
+    )
+}
+
+fn render_exposure_line(row: &ExposureLedgerRow) -> String {
+    format!(
+        "{W14_EXPOSURE_SENTINEL}{}\t{}\t{}\t{}\t{}\t{}\t{}->{}\t{}\tbaseline\tprecise_replay\tclosed_world_frozen_graph\tpermitted:measurement-frozen-graph-attested",
+        row.program,
+        row.formal.function,
+        row.formal.parameter,
+        row.formal.depth,
+        kind_label(row.baseline),
+        kind_label(row.precise),
+        kind_label(row.baseline),
+        kind_label(row.precise),
+        row.class.label(),
     )
 }
 
@@ -1675,9 +2209,98 @@ fn a5_substrate_dir(selector: Option<&str>) -> Result<&'static str, String> {
 struct FinalRun {
     counts: ProgramCounts,
     pairs: Vec<PairLedgerRow>,
+    w14_pairs: Vec<String>,
+    w14_exposures: Vec<String>,
     metadata: super::report::Row,
     raw_line: String,
     wall_seconds: f64,
+}
+
+fn parse_w14_ledgers(
+    stdout: &str,
+    metadata: &super::report::Row,
+    counts: &ProgramCounts,
+) -> Result<(Vec<String>, Vec<String>), String> {
+    let pairs = stdout
+        .lines()
+        .filter(|line| line.starts_with(W14_PAIR_SENTINEL))
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    let exposures = stdout
+        .lines()
+        .filter(|line| line.starts_with(W14_EXPOSURE_SENTINEL))
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    let Some(expected_pairs) = metadata.get("a5_w14_pairs") else {
+        if pairs.is_empty() && exposures.is_empty() {
+            return Ok((pairs, exposures));
+        }
+        return Err("W14 ledger rows exist without W14 metadata".to_owned());
+    };
+    let expected_pairs = expected_pairs
+        .parse::<usize>()
+        .map_err(|why| format!("invalid a5_w14_pairs: {why}"))?;
+    let expected_exposures = metadata
+        .get("a5_w14_exposures")
+        .ok_or_else(|| "W14 metadata lacks exposure count".to_owned())?
+        .parse::<usize>()
+        .map_err(|why| format!("invalid a5_w14_exposures: {why}"))?;
+    if pairs.len() != expected_pairs
+        || pairs.len() != counts.pair_denominator
+        || exposures.len() != expected_exposures
+        || exposures.len() != counts.attributed_predicted_refs_depth0
+    {
+        return Err("W14 ledger rows do not reconcile with worker metadata".to_owned());
+    }
+    let mut identities = BTreeSet::new();
+    for line in &pairs {
+        let columns = line
+            .strip_prefix(W14_PAIR_SENTINEL)
+            .expect("filtered W14 pair")
+            .split('\t')
+            .collect::<Vec<_>>();
+        if columns.len() != 16
+            || columns[0] != counts.program
+            || columns[8] != "1"
+            || columns[12..]
+                != [
+                    "baseline",
+                    "precise_replay",
+                    "closed_world_frozen_graph",
+                    "permitted:measurement-frozen-graph-attested",
+                ]
+        {
+            return Err("W14 pair row violates the exact schema/raw-overlap gate".to_owned());
+        }
+        if !identities.insert((columns[1], columns[2], columns[3])) {
+            return Err("W14 pair ledger contains a duplicate exact identity".to_owned());
+        }
+    }
+    identities.clear();
+    for line in &exposures {
+        let columns = line
+            .strip_prefix(W14_EXPOSURE_SENTINEL)
+            .expect("filtered W14 exposure")
+            .split('\t')
+            .collect::<Vec<_>>();
+        if columns.len() != 12
+            || columns[0] != counts.program
+            || columns[4] != "ref"
+            || columns[8..]
+                != [
+                    "baseline",
+                    "precise_replay",
+                    "closed_world_frozen_graph",
+                    "permitted:measurement-frozen-graph-attested",
+                ]
+        {
+            return Err("W14 exposure row violates the exact schema/baseline-Ref gate".to_owned());
+        }
+        if !identities.insert((columns[1], columns[2], columns[3])) {
+            return Err("W14 exposure ledger contains a duplicate formal identity".to_owned());
+        }
+    }
+    Ok((pairs, exposures))
 }
 
 #[derive(Clone, Debug)]
@@ -1736,9 +2359,12 @@ fn parse_completed_base(
                 ));
             }
             let pairs = parse_pair_ledger(stdout, &counts)?;
+            let (w14_pairs, w14_exposures) = parse_w14_ledgers(stdout, &metadata, &counts)?;
             Ok(CompletedBase::Final(FinalRun {
                 counts,
                 pairs,
+                w14_pairs,
+                w14_exposures,
                 metadata,
                 raw_line,
                 wall_seconds,
@@ -1837,6 +2463,30 @@ fn a5_p1_corpus() {
         Err(error) => panic!("CRAT_A5_CLASSIFIER_DIFFERENTIAL is not valid Unicode: {error}"),
     };
     let snapshot_coverage = std::env::var("CRAT_A5_SNAPSHOT_COVERAGE").as_deref() == Ok("1");
+    let focused_w14 = std::env::var("CRAT_A5_W14_FOCUSED").as_deref() == Ok("1");
+
+    if focused_w14 {
+        assert!(
+            classifier_differential && snapshot_coverage,
+            "W14 focused mode requires classifier and snapshot ledgers in the same run"
+        );
+        assert_eq!(
+            std::env::var("CRAT_BO_COPY_LEND_MODE").as_deref(),
+            Ok("baseline"),
+            "W14 focused mode keeps A12 dormant"
+        );
+        for key in [
+            "CRAT_A5_RECOVER_BROTLI",
+            "CRAT_A5_RECOVER_BROTLI_DEPTH",
+            "CRAT_A5_PRESERVED_BASE_DIR",
+            "CRAT_A5_PRESERVED_FINAL_DIR",
+        ] {
+            assert!(
+                std::env::var_os(key).is_none(),
+                "W14 focused mode refuses preserved or recovery rows: {key}"
+            );
+        }
+    }
 
     assert_eq!(
         super::CORPUS.len(),
@@ -2217,13 +2867,19 @@ fn a5_p1_corpus() {
                         .unwrap_or_else(|why| panic!("{}: {why}", program.name));
                     let pairs = parse_pair_ledger(&outcome.stdout, &counts)
                         .unwrap_or_else(|why| panic!("{}: {why}", program.name));
+                    let metadata = outcome.row.expect("final worker BOC1 row");
+                    let (w14_pairs, w14_exposures) =
+                        parse_w14_ledgers(&outcome.stdout, &metadata, &counts)
+                            .unwrap_or_else(|why| panic!("{}: {why}", program.name));
                     assert_eq!(counts.program, program.name);
                     final_runs.insert(
                         program.name,
                         FinalRun {
                             counts,
                             pairs,
-                            metadata: outcome.row.expect("final worker BOC1 row"),
+                            w14_pairs,
+                            w14_exposures,
+                            metadata,
                             raw_line,
                             wall_seconds: outcome.wall_s,
                         },
@@ -2270,6 +2926,9 @@ fn a5_p1_corpus() {
             .unwrap_or_else(|why| panic!("{}: {why}", program.name));
         let pairs = parse_pair_ledger(&outcome.stdout, &counts)
             .unwrap_or_else(|why| panic!("{}: {why}", program.name));
+        let metadata = outcome.row.expect("targeted worker BOC1 row");
+        let (w14_pairs, w14_exposures) = parse_w14_ledgers(&outcome.stdout, &metadata, &counts)
+            .unwrap_or_else(|why| panic!("{}: {why}", program.name));
         assert_eq!(counts.program, program.name);
         assert_eq!(counts.sites_with_two_ref_args, base.sites_with_two_ref_args);
         assert_eq!(
@@ -2307,7 +2966,9 @@ fn a5_p1_corpus() {
             FinalRun {
                 counts,
                 pairs,
-                metadata: outcome.row.expect("targeted worker BOC1 row"),
+                w14_pairs,
+                w14_exposures,
+                metadata,
                 raw_line,
                 wall_seconds: base_wall + outcome.wall_s,
             },
@@ -2378,6 +3039,7 @@ fn a5_p1_corpus() {
             snapshot_sum("a5_snapshot_target_type_mismatch"),
             snapshot_sum("a5_snapshot_noncopy_scalar"),
             snapshot_sum("a5_snapshot_final_markable"),
+            snapshot_sum("a5_snapshot_all_witness_demoted"),
             snapshot_sum("a5_snapshot_filter_unresolved"),
         ]
     });
@@ -2393,6 +3055,7 @@ fn a5_p1_corpus() {
             type_mismatch,
             noncopy,
             final_markable,
+            all_witness_demoted,
             filter_unresolved,
         ],
     ) = snapshot_totals
@@ -2401,14 +3064,45 @@ fn a5_p1_corpus() {
         assert_eq!(unresolved, 0);
         assert_eq!(markable + read_after + opaque + recursive + volatile, den);
         assert_eq!(filter_unresolved, 0);
-        assert_eq!(final_markable + type_mismatch + noncopy, markable);
+        assert_eq!(
+            final_markable + all_witness_demoted + type_mismatch + noncopy,
+            markable
+        );
     }
+
+    let w14_totals = focused_w14.then(|| {
+        let values = [
+            classifier_sum("a5_w14_pairs"),
+            classifier_sum("a5_w14_effective_pairs"),
+            classifier_sum("a5_w14_selected_marks"),
+            classifier_sum("a5_w14_exposures"),
+            classifier_sum("a5_w14_demoted"),
+            classifier_sum("a5_w14_marked"),
+            classifier_sum("a5_w14_shared_safe"),
+            classifier_sum("a5_w14_unresolved"),
+            classifier_sum("a5_w14_precise_rounds"),
+        ];
+        assert_eq!(values[0], 5_555, "W14 pair denominator moved");
+        assert_eq!(values[2], 4, "W14 selected-mark count moved");
+        assert_eq!(values[3], 2_014, "W14 exposure denominator moved");
+        assert_eq!(values[4] + values[5] + values[6] + values[7], values[3]);
+        values
+    });
 
     let output = out.join("a5-p1");
     fs::create_dir_all(&output).expect("create P1 output directory");
     let mut raw = String::new();
     let mut pair_ledger = String::from(
         "program\tsite\tleft_argument\tright_argument\tclass\tleft_mutable\tright_mutable\tleft_default_fires\tright_default_fires\n",
+    );
+    let mut w14_pair_ledger = String::from(
+        "program\tsite\tleft_argument\tright_argument\tclass\ttarget_formals\tleft_formals\tright_formals\traw_overlap\teffective_overlap\tmarkability\tselected_mark\tcopy_lend_mode\ta5_mode\ta5_world\ta5_abi_guard\n",
+    );
+    let mut w14_exposure_ledger = String::from(
+        "program\tfunction\tparameter\tdepth\tbaseline_kind\tprecise_kind\tmovement\tclass\tcopy_lend_mode\ta5_mode\ta5_world\ta5_abi_guard\n",
+    );
+    let mut w14_programs = String::from(
+        "program\tpairs\teffective_pairs\tselected_marks\texposures\tdemoted\tmarked\tshared_safe\tunresolved\tprecise_rounds\n",
     );
     let mut tsv = String::from(
         "program\tc1\tc2\tc3\tc3_depth0\tcg_num\tcg_den\tpair_den\tmut_mut\tmut_read_only\tshared_shared\tsite_mut_mut\tsite_mut_read_only\tsite_shared_shared\tmut_default_fires\tcalls_total\tdirect_local\tindirect_local\tdirect_external\tindirect_unresolved\tnon_fn_def_constant\tt_origins_s\tt_andersen_s\tt_model_s\twall_s\n",
@@ -2438,6 +3132,41 @@ fn a5_p1_corpus() {
                     .expect("rendered pair sentinel"),
             );
             pair_ledger.push('\n');
+        }
+        for pair in &run.w14_pairs {
+            w14_pair_ledger.push_str(
+                pair.strip_prefix(W14_PAIR_SENTINEL)
+                    .expect("parsed W14 pair sentinel"),
+            );
+            w14_pair_ledger.push('\n');
+        }
+        for exposure in &run.w14_exposures {
+            w14_exposure_ledger.push_str(
+                exposure
+                    .strip_prefix(W14_EXPOSURE_SENTINEL)
+                    .expect("parsed W14 exposure sentinel"),
+            );
+            w14_exposure_ledger.push('\n');
+        }
+        if focused_w14 {
+            let get_w14 = |key: &str| {
+                run.metadata
+                    .get(key)
+                    .unwrap_or_else(|| panic!("{} missing {key}", program.name))
+            };
+            w14_programs.push_str(&format!(
+                "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+                program.name,
+                get_w14("a5_w14_pairs"),
+                get_w14("a5_w14_effective_pairs"),
+                get_w14("a5_w14_selected_marks"),
+                get_w14("a5_w14_exposures"),
+                get_w14("a5_w14_demoted"),
+                get_w14("a5_w14_marked"),
+                get_w14("a5_w14_shared_safe"),
+                get_w14("a5_w14_unresolved"),
+                get_w14("a5_w14_precise_rounds"),
+            ));
         }
         let get = |key: &str| run.metadata.get(key).unwrap_or("missing");
         tsv.push_str(&format!(
@@ -2613,6 +3342,38 @@ fn a5_p1_corpus() {
     fs::write(output.join("raw-counts.txt"), raw).expect("write raw P1 rows");
     fs::write(output.join("pair-ledger.tsv"), pair_ledger)
         .expect("write exact count-(5) pair ledger");
+    if focused_w14 {
+        fs::write(output.join("w14-pair-ledger.tsv"), w14_pair_ledger)
+            .expect("write W14 extended pair ledger");
+        fs::write(output.join("w14-exposure-ledger.tsv"), w14_exposure_ledger)
+            .expect("write W14 exposure ledger");
+        fs::write(output.join("w14-per-program.tsv"), w14_programs)
+            .expect("write W14 per-program table");
+        let values = w14_totals.expect("focused W14 totals");
+        fs::write(
+            output.join("w14-receipt.txt"),
+            format!(
+                "status={}\ndata={}\nanalysis_head={analysis_head}\ncopy_lend_mode=baseline\n\
+                 a5_mode=precise_replay\na5_world=closed_world_frozen_graph\n\
+                 unknown_caller_seeding=false\na5_abi_guard=permitted:measurement-frozen-graph-attested\n\
+                 pairs={}\neffective_pairs={}\nselected_marks={}\nexposures={}\n\
+                 demoted={}\nmarked={}\nshared_safe={}\nunresolved={}\nprecise_rounds={}\n\
+                 pair_partition=5555=2391+2480+684\n",
+                if values[7] == 0 { "ok" } else { "unresolved" },
+                values[7] == 0,
+                values[0],
+                values[1],
+                values[2],
+                values[3],
+                values[4],
+                values[5],
+                values[6],
+                values[7],
+                values[8],
+            ),
+        )
+        .expect("write W14 receipt");
+    }
     fs::write(output.join("per-program.tsv"), tsv).expect("write P1 TSV");
     fs::write(output.join("report.md"), markdown).expect("write P1 markdown");
     fs::write(output.join("provenance.txt"), provenance).expect("write P1 provenance");
@@ -2644,6 +3405,7 @@ fn a5_p1_corpus() {
             type_mismatch,
             noncopy,
             final_markable,
+            all_witness_demoted,
             filter_unresolved,
         ],
     ) = snapshot_totals
@@ -2656,12 +3418,19 @@ fn a5_p1_corpus() {
                  markable={markable}\nread_after_write={read_after}\nopaque_escape={opaque}\n\
                  recursive={recursive}\nvolatile_or_atomic={volatile}\nunresolved={unresolved}\n\
                  target_type_mismatch={type_mismatch}\nnoncopy_scalar={noncopy}\n\
-                 final_markable={final_markable}\nfilter_unresolved={filter_unresolved}\n"
+                 final_markable={final_markable}\nall_witness_demoted={all_witness_demoted}\n\
+                 filter_unresolved={filter_unresolved}\n"
             ),
         )
         .expect("write snapshot coverage receipt");
     }
     println!("{}", render_count_line(&total));
+    if let Some(values) = w14_totals {
+        assert_eq!(
+            values[7], 0,
+            "W14 unresolved exposure residual; artifacts preserved for STOP"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -2700,6 +3469,52 @@ mod tests {
         }
     }
 
+    fn target() -> TargetFunction {
+        TargetFunction {
+            key: 7,
+            path: "callee".to_owned(),
+        }
+    }
+
+    fn mark(block: u32) -> C9MarkKey {
+        C9MarkKey::new(
+            9,
+            MirLocationKey::new(block, 0),
+            [7],
+            7,
+            1,
+            SlotKey {
+                variant: 1,
+                owner: 9,
+                slot: 1,
+            },
+            2,
+            SlotKey {
+                variant: 1,
+                owner: 9,
+                slot: 2,
+            },
+            PairSide::Right,
+            "i32".to_owned(),
+        )
+        .expect("mark")
+    }
+
+    fn mut_read_only_site(id: &str, block: u32, verdict: SnapshotVerdict) -> CallSite {
+        CallSite {
+            id: id.to_owned(),
+            targets: vec![target()],
+            arguments: vec![
+                formal_with_mutability("callee", 1, true, 0),
+                formal_with_mutability("callee", 2, false, 0),
+            ],
+            pair_facts: BTreeMap::from([((0, 1), PairFacts::default())]),
+            snapshot_verdicts: BTreeMap::from([((0, 1), verdict)]),
+            post_filter: BTreeMap::from([((0, 1), (true, true))]),
+            mark_keys: BTreeMap::from([((0, 1), mark(block))]),
+        }
+    }
+
     #[test]
     fn count5_mutability_join_ors_targets_and_defaults_missing_to_mutable() {
         assert_eq!(join_formal_mutability([Some(false), Some(true)]), (true, 0));
@@ -2723,6 +3538,7 @@ mod tests {
             call_sites: vec![
                 CallSite {
                     id: "caller:bb0:callee".to_owned(),
+                    targets: Vec::new(),
                     arguments: vec![
                         formal_with_mutability("callee", 1, true, 0),
                         formal_with_mutability("callee", 2, true, 0),
@@ -2735,6 +3551,7 @@ mod tests {
                 },
                 CallSite {
                     id: "caller:bb1:callee".to_owned(),
+                    targets: Vec::new(),
                     arguments: vec![
                         formal_with_mutability("callee", 1, false, 0),
                         formal_with_mutability("callee", 2, false, 0),
@@ -2765,6 +3582,83 @@ mod tests {
         assert_eq!(measured.pairs[0].class, PairMutability::MutMut);
         let encoded = render_pair_line(&measured.pairs[2]);
         assert_eq!(parse_pair_line(&encoded), Ok(measured.pairs[2].clone()));
+    }
+
+    #[test]
+    fn one_unmarkable_witness_keeps_the_formal_pair_effective() {
+        let call_sites = vec![
+            mut_read_only_site("caller:bb0", 0, SnapshotVerdict::Markable),
+            mut_read_only_site("caller:bb1", 1, SnapshotVerdict::ReadAfterWrite),
+        ];
+        let input = ProgramInput {
+            name: "fixture".to_owned(),
+            call_sites: call_sites.clone(),
+            functions: BTreeMap::new(),
+        };
+
+        let measured = measure_program(&input).expect("W14 pair measurement");
+        assert_eq!(measured.extended_pairs.len(), 2);
+        assert!(
+            measured
+                .extended_pairs
+                .iter()
+                .all(|row| row.raw_overlap && row.effective_overlap && !row.selected_mark)
+        );
+        assert_eq!(
+            measured.extended_pairs[0].markability,
+            "all-witness-demotion"
+        );
+        assert_eq!(measured.extended_pairs[1].markability, "read-after-write");
+        assert!(measured.final_marks.is_empty());
+
+        let reversed = measure_program(&ProgramInput {
+            name: "fixture".to_owned(),
+            call_sites: call_sites.into_iter().rev().collect(),
+            functions: BTreeMap::new(),
+        })
+        .expect("reverse W14 pair measurement");
+        assert_eq!(measured.extended_pairs, reversed.extended_pairs);
+        assert_eq!(measured.final_marks, reversed.final_marks);
+    }
+
+    #[test]
+    fn w14_selected_mark_requires_all_witnesses_and_two_final_refs() {
+        let input = ProgramInput {
+            name: "fixture".to_owned(),
+            call_sites: vec![mut_read_only_site(
+                "caller:bb0",
+                0,
+                SnapshotVerdict::Markable,
+            )],
+            functions: BTreeMap::new(),
+        };
+        let measured = measure_program(&input).expect("W14 pair measurement");
+        assert_eq!(measured.final_marks.len(), 1);
+        assert!(measured.extended_pairs[0].selected_mark);
+        assert!(!measured.extended_pairs[0].effective_overlap);
+
+        let keys = measured.extended_pairs[0]
+            .left_formals
+            .iter()
+            .chain(&measured.extended_pairs[0].right_formals)
+            .cloned()
+            .collect::<Vec<_>>();
+        let baseline = AcceptedFormalModel {
+            refs: BTreeMap::new(),
+            kinds: keys
+                .iter()
+                .cloned()
+                .map(|key| (key, SlotKind::Ref))
+                .collect(),
+        };
+        let exposure = build_exposure_ledger("fixture", &measured, &baseline, &baseline)
+            .expect("reconciled exposure");
+        assert_eq!(exposure.len(), 2);
+        assert!(
+            exposure
+                .iter()
+                .all(|row| row.class == ExposureClass::Marked)
+        );
     }
 
     #[test]
@@ -2863,6 +3757,7 @@ mod tests {
         pair_facts.insert((0, 1), PairFacts::default());
         let site = CallSite {
             id: "caller:bb0".to_owned(),
+            targets: Vec::new(),
             arguments: vec![outer.clone(), deeper.clone()],
             pair_facts,
             snapshot_verdicts: BTreeMap::new(),
@@ -2871,6 +3766,7 @@ mod tests {
         };
         let one_ref_site = CallSite {
             id: "caller:bb2".to_owned(),
+            targets: Vec::new(),
             arguments: vec![formal("callee", 3, 0)],
             pair_facts: BTreeMap::new(),
             snapshot_verdicts: BTreeMap::new(),
@@ -3180,10 +4076,11 @@ pub unsafe fn entry(p: *mut i32, q: *mut i32) { two(p, q); }
                     ),
                 ]);
 
-                let current_refs = accepted_current_refs(tcx, &program, &formals)
+                let accepted = accepted_current_model(tcx, &program, &formals)
                     .expect("current-head baseline model");
-                let measured = measure_tcx("fixture", tcx, &formals, &current_refs, Duration::ZERO)
-                    .expect("measured fixture");
+                let measured =
+                    measure_tcx("fixture", tcx, &formals, &accepted, Duration::ZERO, false)
+                        .expect("measured fixture");
 
                 assert_eq!(measured.counts.sites_with_two_ref_args, 1);
                 assert_eq!(measured.counts.sites_not_proven_disjoint, 1);
@@ -3191,6 +4088,18 @@ pub unsafe fn entry(p: *mut i32, q: *mut i32) { two(p, q); }
                 assert_eq!(measured.counts.attributed_predicted_refs_depth0, 2);
                 assert_eq!(measured.counts.unknown_caller_reachable, 2);
                 assert_eq!(measured.counts.local_functions, 2);
+
+                let focused =
+                    measure_tcx("fixture", tcx, &formals, &accepted, Duration::ZERO, true)
+                        .expect("focused W14 fixture");
+                let w14 = focused.w14.expect("focused W14 rows");
+                assert_eq!(w14.pairs.len(), 1);
+                assert_eq!(w14.exposures.len(), 2);
+                assert!(
+                    w14.exposures
+                        .iter()
+                        .all(|row| row.class != ExposureClass::Unresolved)
+                );
             },
         )
         .expect("fixture compiles");

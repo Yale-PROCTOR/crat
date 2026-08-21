@@ -22,6 +22,7 @@ use super::{
     borrow_verify::{
         verify_to_fixpoint_counting_with_flows,
         verify_to_fixpoint_counting_with_flows_and_copy_lends,
+        verify_to_fixpoint_counting_with_flows_and_parameter_overlaps,
     },
     boundary_table::{self, Matcher, Role},
     coherence::{
@@ -302,6 +303,34 @@ pub(crate) fn verify_bo_construction_with_flows(
         mut_facts,
     )
     .0
+}
+
+pub(crate) fn verify_bo_construction_with_parameter_overlaps(
+    program: &RustProgram<'_>,
+    slots: &CrateSlots,
+    origins: &OriginSummaries,
+    solver: &KindSolver,
+    construction: &BoConstruction,
+    mut_facts: &MutFacts,
+    parameter_overlaps: &FxHashMap<LocalDefId, super::borrow_engine::ParameterOverlap>,
+) -> (
+    Option<FxHashMap<SlotRef, SlotKind>>,
+    super::borrow_verify::RoundStats,
+) {
+    assert_eq!(
+        construction.mode,
+        CopyLendMode::Baseline,
+        "A5 focused replay must keep the independent CopyLend switch at baseline"
+    );
+    verify_to_fixpoint_counting_with_flows_and_parameter_overlaps(
+        program,
+        slots,
+        origins.native_flows(),
+        solver,
+        &construction.selectors,
+        mut_facts,
+        parameter_overlaps,
+    )
 }
 
 pub(crate) fn verify_bo_construction_counting(

@@ -101,6 +101,10 @@ mod tests {
             "verify_to_fixpoint_counting_with_flows_and_copy_lends",
         ),
         (
+            "src/analyses/borrow_ownership/borrow_verify.rs",
+            "verify_to_fixpoint_counting_with_flows_and_parameter_overlaps",
+        ),
+        (
             "src/analyses/borrow_ownership/coherence.rs",
             "add_coherence",
         ),

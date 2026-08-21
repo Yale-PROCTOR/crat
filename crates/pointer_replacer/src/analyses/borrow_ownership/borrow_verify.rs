@@ -720,6 +720,7 @@ pub(crate) fn verify_to_fixpoint_counting_with_flows(
         selectors,
         is_mutable,
         None,
+        None,
     )
 }
 
@@ -740,6 +741,28 @@ pub(crate) fn verify_to_fixpoint_counting_with_flows_and_copy_lends(
         selectors,
         is_mutable,
         Some(copy_lends),
+        None,
+    )
+}
+
+pub(crate) fn verify_to_fixpoint_counting_with_flows_and_parameter_overlaps(
+    program: &RustProgram,
+    slots: &CrateSlots,
+    origin_flows: &OriginFlowResults,
+    solver: &KindSolver,
+    selectors: &Selectors,
+    is_mutable: impl MutProvider + Copy,
+    parameter_overlaps: &FxHashMap<LocalDefId, super::borrow_engine::ParameterOverlap>,
+) -> (Option<FxHashMap<SlotRef, SlotKind>>, RoundStats) {
+    verify_to_fixpoint_counting_with_flows_impl(
+        program,
+        slots,
+        origin_flows,
+        solver,
+        selectors,
+        is_mutable,
+        None,
+        Some(parameter_overlaps),
     )
 }
 
@@ -751,6 +774,7 @@ fn verify_to_fixpoint_counting_with_flows_impl(
     selectors: &Selectors,
     is_mutable: impl MutProvider + Copy,
     copy_lends: Option<&FxHashSet<CopyLendPair>>,
+    parameter_overlaps: Option<&FxHashMap<LocalDefId, super::borrow_engine::ParameterOverlap>>,
 ) -> (Option<FxHashMap<SlotRef, SlotKind>>, RoundStats) {
     // §NB-R guard (release-active): a tracked solver's hard constraints are
     // track-gated; every solve in this loop would be vacuously SAT and the
@@ -762,6 +786,10 @@ fn verify_to_fixpoint_counting_with_flows_impl(
     let l2_enabled = l2::enabled_from_env();
     let repair = RepairMode::current();
     if l2_enabled {
+        assert!(
+            parameter_overlaps.is_none(),
+            "A5 parameter-overlap replay is not defined for the L2 validation loop"
+        );
         assert_eq!(
             repair,
             RepairMode::ModeA,
@@ -844,7 +872,7 @@ fn verify_to_fixpoint_counting_with_flows_impl(
             },
             is_mutable,
             selected_copy_lends.as_ref(),
-            None,
+            parameter_overlaps,
         );
         // §NB5-F — partition the residual-conflict guard by owner class. A non-`Ref` FIELD in a
         // residual is the A′ principle extended to field requirers: the field is a live requirer the
