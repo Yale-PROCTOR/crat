@@ -1947,6 +1947,34 @@ fn batch_number(row: &super::report::Row, key: &str) -> usize {
         .unwrap_or_else(|error| panic!("batch row {key} is not numeric: {error}"))
 }
 
+fn batch_model_digest_stamp(row: &super::report::Row, expected: &str) -> Result<(), String> {
+    match row.get("official_evaluation_sha256") {
+        Some(actual) if actual == expected => Ok(()),
+        Some(actual) => Err(format!(
+            "official evaluation digest stamp mismatch: expected {expected}, got {actual}"
+        )),
+        None => Err("batch-model row lacks verified official-evaluation digest stamp".to_owned()),
+    }
+}
+
+#[test]
+fn batch_model_digest_stamp_is_mandatory_and_exact() {
+    let expected = "7aa16d5b63ff39e6aaabd3590ec2be9c88c9d8a753bd9f74cd4e6056d9974fd7";
+    let missing = super::report::Row::default();
+    assert!(
+        batch_model_digest_stamp(&missing, expected).is_err(),
+        "an unstamped batch-model row must be refused"
+    );
+    let mut present = super::report::Row::default();
+    present.set("official_evaluation_sha256", expected);
+    assert_eq!(batch_model_digest_stamp(&present, expected), Ok(()));
+    present.set("official_evaluation_sha256", "wrong");
+    assert!(
+        batch_model_digest_stamp(&present, expected).is_err(),
+        "a merely present but wrong digest must be refused"
+    );
+}
+
 #[test]
 #[ignore = "A5 item-22 serialized baseline/precise/coarse corpus sweep"]
 fn a5_item22_batch_corpus() {
@@ -2124,11 +2152,8 @@ fn a5_item22_batch_corpus() {
                 assert_eq!(combined.get(key), Some(expected), "model stamp {key}");
                 assert_eq!(rewrite_row.get(key), Some(expected), "rewriter stamp {key}");
             }
-            assert_eq!(
-                combined.get("official_evaluation_sha256"),
-                Some(official_digest.as_str()),
-                "per-worker official artifact digest"
-            );
+            batch_model_digest_stamp(&combined, &official_digest)
+                .expect("per-worker official artifact digest");
             fs::write(
                 shard.join("shard-receipt.txt"),
                 format!(
