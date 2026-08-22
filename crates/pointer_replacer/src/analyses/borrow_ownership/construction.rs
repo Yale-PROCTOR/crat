@@ -47,11 +47,58 @@ use crate::{
 };
 
 pub(crate) const COPY_LEND_MODE_ENV: &str = "CRAT_BO_COPY_LEND_MODE";
+pub(crate) const A2_MODE_ENV: &str = "CRAT_BO_A2_MODE";
 
 pub(crate) fn plan_a5_c9_marks(
     witnesses: impl IntoIterator<Item = (C9MarkKey, WitnessMarkability)>,
 ) -> BTreeSet<C9MarkKey> {
     plan_c9_marks(witnesses)
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum A2Mode {
+    #[default]
+    Off,
+    DefinitelyOverwritten,
+}
+
+impl A2Mode {
+    pub(crate) fn current() -> Self {
+        #[cfg(test)]
+        if let Some(mode) = A2_MODE_OVERRIDE.with(Cell::get) {
+            return mode;
+        }
+        match std::env::var(A2_MODE_ENV) {
+            Err(std::env::VarError::NotPresent) => Self::Off,
+            Ok(value) => match value.as_str() {
+                "off" => Self::Off,
+                "definitely_overwritten" => Self::DefinitelyOverwritten,
+                other => {
+                    panic!("{A2_MODE_ENV} must be off or definitely_overwritten; got {other:?}")
+                }
+            },
+            Err(error) => panic!("{A2_MODE_ENV} is not valid Unicode: {error}"),
+        }
+    }
+
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::DefinitelyOverwritten => "definitely_overwritten",
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_override<T>(self, f: impl FnOnce() -> T) -> T {
+        struct Restore(Option<A2Mode>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                A2_MODE_OVERRIDE.with(|slot| slot.set(self.0));
+            }
+        }
+        let _restore = Restore(A2_MODE_OVERRIDE.with(|slot| slot.replace(Some(self))));
+        f()
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -113,6 +160,7 @@ impl CopyLendMode {
 #[cfg(test)]
 thread_local! {
     static COPY_LEND_MODE_OVERRIDE: Cell<Option<CopyLendMode>> = const { Cell::new(None) };
+    static A2_MODE_OVERRIDE: Cell<Option<A2Mode>> = const { Cell::new(None) };
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -164,6 +212,9 @@ pub(crate) struct CopyLendPairCandidate {
 
 pub(crate) struct BoConstruction {
     pub(crate) mode: CopyLendMode,
+    pub(crate) a2_mode: A2Mode,
+    pub(crate) a2_killed_memberships: usize,
+    pub(crate) a2_opaque_result_guards: usize,
     pub(crate) selectors: Selectors,
     pub(crate) eligibility: CopyLendEligibility,
     pub(crate) stats: BoOwnEmissionStats,
@@ -222,6 +273,9 @@ pub(crate) fn construct_bo_into(
     let coherence_elapsed = t.elapsed();
     Ok(BoConstruction {
         mode,
+        a2_mode: A2Mode::Off,
+        a2_killed_memberships: 0,
+        a2_opaque_result_guards: 0,
         selectors,
         eligibility,
         stats,
@@ -258,6 +312,9 @@ pub(crate) fn construct_tracked_census_baseline(
     }
     Ok(BoConstruction {
         mode: CopyLendMode::Baseline,
+        a2_mode: A2Mode::Off,
+        a2_killed_memberships: 0,
+        a2_opaque_result_guards: 0,
         selectors,
         eligibility: CopyLendEligibility::default(),
         stats,
@@ -265,6 +322,34 @@ pub(crate) fn construct_tracked_census_baseline(
         emit_elapsed,
         coherence_elapsed: t.elapsed(),
     })
+}
+
+pub(crate) fn construct_bo_into_a2(
+    program: &RustProgram<'_>,
+    slots: &CrateSlots,
+    origins: &OriginSummaries,
+    a2: &super::origin_flow::A2Plan,
+    mut_facts: &MutFacts,
+    solver: &KindSolver,
+    copy_lend_mode: CopyLendMode,
+) -> anyhow::Result<BoConstruction> {
+    let mut construction =
+        construct_bo_into(program, slots, origins, mut_facts, solver, copy_lend_mode)?;
+    let mut guards = 0usize;
+    for guard in &a2.opaque_result_guards {
+        let Some(universe) = slots.fn_local_slots.get(&guard.function) else {
+            continue;
+        };
+        let Some(slot) = universe.slot_for_local_depth(guard.local, guard.depth) else {
+            continue;
+        };
+        solver.add_borrow_exclusion(Some(SlotRef::Local(guard.function, slot)), &[]);
+        guards += 1;
+    }
+    construction.a2_mode = A2Mode::DefinitelyOverwritten;
+    construction.a2_killed_memberships = a2.killed_memberships;
+    construction.a2_opaque_result_guards = guards;
+    Ok(construction)
 }
 
 pub(crate) fn verify_bo_construction(

@@ -143,6 +143,10 @@ pub(crate) fn compute_origins_wrapped(program: &RustProgram<'_>) -> OriginSummar
 /// NB5-O native derivation over BO-owned MIR-flow and signature-slot types.
 pub(crate) fn compute_origins_native(program: &RustProgram<'_>) -> OriginSummaries {
     let flows = origin_flow::analyze_program_origin_flow(program);
+    origin_summaries_from_flows(flows)
+}
+
+fn origin_summaries_from_flows(flows: origin_flow::OriginFlowResults) -> OriginSummaries {
     let summaries = flows
         .iter()
         .map(|(&f, result)| {
@@ -159,6 +163,13 @@ pub(crate) fn compute_origins_native(program: &RustProgram<'_>) -> OriginSummari
         })
         .collect();
     OriginSummaries::native(summaries, flows)
+}
+
+pub(crate) fn compute_origins_a2(
+    program: &RustProgram<'_>,
+) -> (OriginSummaries, origin_flow::A2Plan) {
+    let (flows, plan) = origin_flow::analyze_program_origin_flow_a2(program);
+    (origin_summaries_from_flows(flows), plan)
 }
 
 /// Whole-program signature-origin summaries. NB5-O's zero-delta rs-crown differential retired the
