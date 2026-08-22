@@ -1,5 +1,7 @@
 //! Pure domain for A5 parameter may-overlap summaries.
 
+#[cfg(test)]
+use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet};
 
 use petgraph::{algo::kosaraju_scc, graphmap::DiGraphMap};
@@ -683,6 +685,44 @@ pub(crate) enum A5Mode {
 }
 
 impl A5Mode {
+    pub(crate) const ENV: &'static str = "CRAT_BO_A5_MODE";
+
+    pub(crate) fn current() -> Self {
+        #[cfg(test)]
+        if let Some(mode) = A5_MODE_OVERRIDE.with(Cell::get) {
+            return mode;
+        }
+        match std::env::var(Self::ENV) {
+            Err(std::env::VarError::NotPresent) => Self::Baseline,
+            Ok(value) => Self::parse(&value).unwrap_or_else(|error| panic!("{error}")),
+            Err(error) => panic!("{} is not valid Unicode: {error}", Self::ENV),
+        }
+    }
+
+    pub(crate) fn parse(value: &str) -> Result<Self, String> {
+        match value {
+            "baseline" => Ok(Self::Baseline),
+            "precise_replay" => Ok(Self::PreciseReplay),
+            "coarse_constraint" => Ok(Self::CoarseConstraint),
+            other => Err(format!(
+                "{} must be baseline, precise_replay, or coarse_constraint; got {other:?}",
+                Self::ENV
+            )),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_override<T>(self, f: impl FnOnce() -> T) -> T {
+        struct Restore(Option<A5Mode>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                A5_MODE_OVERRIDE.with(|slot| slot.set(self.0));
+            }
+        }
+        let _restore = Restore(A5_MODE_OVERRIDE.with(|slot| slot.replace(Some(self))));
+        f()
+    }
+
     pub(crate) fn label(self) -> &'static str {
         match self {
             Self::Baseline => "baseline",
@@ -698,6 +738,11 @@ impl A5Mode {
     pub(crate) fn is_pricing_control(self) -> bool {
         self == Self::CoarseConstraint
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    static A5_MODE_OVERRIDE: Cell<Option<A5Mode>> = const { Cell::new(None) };
 }
 
 pub(crate) fn apply_coarse_constraints(
@@ -754,6 +799,25 @@ pub(crate) enum WholeProgramAttestation {
     FrozenBenchmarkGraph,
 }
 
+impl WholeProgramAttestation {
+    pub(crate) const ENV: &'static str = "CRAT_BO_A5_ATTESTATION";
+
+    pub(crate) fn current() -> Option<Self> {
+        match std::env::var(Self::ENV) {
+            Err(std::env::VarError::NotPresent) => None,
+            Ok(value) => match value.as_str() {
+                "none" => None,
+                "frozen_benchmark_graph" => Some(Self::FrozenBenchmarkGraph),
+                other => panic!(
+                    "{} must be none or frozen_benchmark_graph; got {other:?}",
+                    Self::ENV
+                ),
+            },
+            Err(error) => panic!("{} is not valid Unicode: {error}", Self::ENV),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct AbiBoundaryFacts {
     pub(crate) externally_visible: bool,
@@ -794,7 +858,7 @@ impl AbiGuardDisposition {
         }
     }
 
-    fn stamp(&self) -> String {
+    pub(crate) fn stamp(&self) -> String {
         match self {
             Self::Permitted { attested: true } => "permitted:attested".to_owned(),
             Self::Permitted { attested: false } => "permitted:internal".to_owned(),
@@ -1054,6 +1118,24 @@ mod tests {
         );
         assert!(A5World::parse("open_world").is_err());
         assert!(!A5World::ClosedWorldFrozenGraph.seeds_unknown_callers());
+    }
+
+    #[test]
+    fn a5_mode_domain_is_exactly_the_ruled_three_configuration_matrix() {
+        assert_eq!(A5Mode::parse("baseline"), Ok(A5Mode::Baseline));
+        assert_eq!(A5Mode::parse("precise_replay"), Ok(A5Mode::PreciseReplay));
+        assert_eq!(
+            A5Mode::parse("coarse_constraint"),
+            Ok(A5Mode::CoarseConstraint)
+        );
+        assert!(A5Mode::parse("open_world").is_err());
+        assert!(A5Mode::parse("a2").is_err());
+        assert_eq!(
+            A5Mode::Baseline.with_override(A5Mode::current),
+            A5Mode::Baseline
+        );
+        assert_eq!(A5Mode::proposed_landing(), A5Mode::PreciseReplay);
+        assert!(A5Mode::CoarseConstraint.is_pricing_control());
     }
 
     #[test]

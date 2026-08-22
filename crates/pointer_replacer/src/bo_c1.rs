@@ -7314,6 +7314,7 @@ mod run {
                     "just_fabricated_len_const",
                     jc.fabricated_len_const.to_string(),
                 );
+                row.set("just_c9_mark", jc.c9_mark.to_string());
                 row.set("just_total", jc.total().to_string());
                 row.set("just_edits", d.plan_edits.to_string());
                 // **AND AS AN ARTIFACT.** The row goes to stdout, which this
@@ -7352,6 +7353,7 @@ mod run {
                     reroute,
                     drop_form,
                     store_form,
+                    c9_mark,
                 } = jc;
                 let jp = dir.join(format!("{name}.just.tsv"));
                 std::fs::write(
@@ -7361,6 +7363,7 @@ mod run {
                          seam_adapter\t{seam_adapter}\n\
                          reroute\t{reroute}\ndrop_form\t{drop_form}\n\
                          store_form\t{store_form}\n\
+                         c9_mark\t{c9_mark}\n\
                          fabricated_len_const\t{fabricated_len_const}\n\
                          subset:seam_adapter_fabricated\t{seam_adapter_fabricated}\n",
                     ),
@@ -10533,6 +10536,7 @@ fn the_reporting_site_reads_files_touched_not_the_map_size() {
         baseline_keys: 0,
         baseline_errors: 0,
         baseline_msg_env: 0,
+        a5_receipt: "a5_mode=baseline\n".to_owned(),
     };
     let (_emitted, _degraded, files_touched, reverted, ..) = run::emit_counters(&outcome);
     assert_eq!(

@@ -34,6 +34,73 @@ pub(crate) fn render_marked_call(
     ))
 }
 
+pub(crate) fn render_marked_source(mark: &C9MarkKey, source: &str) -> Result<String, String> {
+    let open = source
+        .char_indices()
+        .find_map(|(index, ch)| (ch == '(').then_some(index))
+        .ok_or_else(|| "C-9 call source has no argument list".to_owned())?;
+    let mut depth = 0usize;
+    let mut close = None;
+    for (offset, ch) in source[open..].char_indices() {
+        match ch {
+            '(' => depth += 1,
+            ')' => {
+                depth = depth
+                    .checked_sub(1)
+                    .ok_or_else(|| "C-9 call source has unmatched ')'".to_owned())?;
+                if depth == 0 {
+                    close = Some(open + offset);
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    let close = close.ok_or_else(|| "C-9 call source has unmatched '('".to_owned())?;
+    let callee = source[..open].trim();
+    if callee.is_empty() {
+        return Err("C-9 call source has an empty callee".to_owned());
+    }
+    let arguments = split_arguments(&source[open + 1..close])?;
+    let rendered = render_marked_call(mark, callee, &arguments)?;
+    Ok(format!("{rendered}{}", &source[close + 1..]))
+}
+
+fn split_arguments(source: &str) -> Result<Vec<String>, String> {
+    if source.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut answer = Vec::new();
+    let mut start = 0usize;
+    let mut stack = Vec::new();
+    for (index, ch) in source.char_indices() {
+        match ch {
+            '(' | '[' | '{' => stack.push(ch),
+            ')' | ']' | '}' => {
+                let Some(open) = stack.pop() else {
+                    return Err("C-9 argument source has an unmatched delimiter".to_owned());
+                };
+                if !matches!((open, ch), ('(', ')') | ('[', ']') | ('{', '}')) {
+                    return Err("C-9 argument source has mismatched delimiters".to_owned());
+                }
+            }
+            ',' if stack.is_empty() => {
+                answer.push(source[start..index].trim().to_owned());
+                start = index + 1;
+            }
+            _ => {}
+        }
+    }
+    if !stack.is_empty() {
+        return Err("C-9 argument source has an unclosed delimiter".to_owned());
+    }
+    answer.push(source[start..].trim().to_owned());
+    if answer.iter().any(String::is_empty) {
+        return Err("C-9 argument source contains an empty argument".to_owned());
+    }
+    Ok(answer)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -100,5 +167,13 @@ mod tests {
         assert!(!crate::bo_rewriter::verify::type_checks_str(&source(
             "two(&mut *p, q)"
         )));
+    }
+
+    #[test]
+    fn retained_mark_rewrites_one_source_call_with_nested_arguments() {
+        assert_eq!(
+            render_marked_source(&mark(), "two(&mut *p, pick(q, 1));").unwrap(),
+            "{ let __crat_c9_4_2: i32 = *(pick(q, 1)); two(&mut *p, &__crat_c9_4_2) };"
+        );
     }
 }

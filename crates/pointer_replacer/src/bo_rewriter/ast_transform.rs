@@ -1246,6 +1246,65 @@ impl MutVisitor for SeamGraftVisitor<'_> {
     }
 }
 
+/// Structural consumer for retained C-9 call-site marks.
+///
+/// This runs after the use and seam grafts so the snapshot block captures the
+/// already-rewritten shared argument. A retained mark is mandatory: an
+/// unmatched span, a non-call target, a parse failure, or a composition
+/// refusal aborts emission instead of silently producing the both-Ref model
+/// without its companion temp.
+struct C9GraftVisitor<'a> {
+    marks: &'a FxHashMap<
+        (u32, u32),
+        &'a crate::analyses::borrow_ownership::a5_producer::PlannedC9Mark,
+    >,
+    guard: &'a mut Composition,
+    consumed: FxHashSet<(u32, u32)>,
+    failure: Option<String>,
+}
+
+impl MutVisitor for C9GraftVisitor<'_> {
+    fn visit_expr(&mut self, e: &mut rustc_ast::Expr) {
+        if e.span.is_dummy() {
+            rustc_ast::mut_visit::walk_expr(self, e);
+            return;
+        }
+        let key = (e.span.lo().0, e.span.hi().0);
+        let Some(mark) = self.marks.get(&key).copied() else {
+            rustc_ast::mut_visit::walk_expr(self, e);
+            return;
+        };
+        if !matches!(e.kind, rustc_ast::ExprKind::Call(..)) {
+            self.failure = Some(format!(
+                "retained C-9 mark at {}..{} resolved to a non-call AST node",
+                key.0, key.1
+            ));
+            return;
+        }
+        let source = rustc_ast_pretty::pprust::expr_to_string(e);
+        let rendered = match super::c9::render_marked_source(&mark.key, &source) {
+            Ok(rendered) => rendered,
+            Err(why) => {
+                self.failure = Some(format!("could not render retained C-9 mark: {why}"));
+                return;
+            }
+        };
+        let parsed = match graft_expr(&rendered) {
+            Ok(parsed) => parsed,
+            Err(_) => {
+                self.failure = Some("retained C-9 mark did not round-trip as an expression".into());
+                return;
+            }
+        };
+        if !self.guard.claim(e.id, e.span, "c9") {
+            self.failure = Some("retained C-9 mark collided with another AST transform".into());
+            return;
+        }
+        self.consumed.insert(key);
+        e.kind = parsed.kind;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1606,6 +1665,42 @@ fn transform_with(
     s.visit_crate(&mut krate);
     let mut seams = s.finish();
     seams.key_collisions = seam_key_collisions;
+
+    // **C-9 — mandatory companion emission.** The plan is already filtered by
+    // the accepted model. Reverts use the mark's callee owner, matching the
+    // span-plan edit and the decision whose both-Ref result justified it.
+    let mut c9_marks = FxHashMap::default();
+    for mark in table
+        .c9_marks
+        .iter()
+        .filter(|mark| reverts.keeps(&mark.owner_fn))
+    {
+        let key = (mark.call_span.lo().0, mark.call_span.hi().0);
+        if c9_marks.insert(key, mark).is_some() {
+            return Err(format!(
+                "multiple retained C-9 emission plans target call span {}..{}",
+                key.0, key.1
+            ));
+        }
+    }
+    let mut c9 = C9GraftVisitor {
+        marks: &c9_marks,
+        guard: &mut guard,
+        consumed: FxHashSet::default(),
+        failure: None,
+    };
+    c9.visit_crate(&mut krate);
+    if let Some(why) = c9.failure.take() {
+        return Err(why);
+    }
+    let unmatched = c9_marks
+        .keys()
+        .filter(|key| !c9.consumed.contains(key))
+        .copied()
+        .collect::<Vec<_>>();
+    if !unmatched.is_empty() {
+        return Err(format!("unmatched retained C-9 call spans: {unmatched:?}"));
+    }
 
     // **Each pass counts its OWN refusals**, at the site where it was turned
     // away. This used to recompute `decls.refused` here by summing
@@ -2037,6 +2132,7 @@ pub(crate) struct JustificationCensus {
     pub reroute: usize,
     pub drop_form: usize,
     pub store_form: usize,
+    pub c9_mark: usize,
 }
 
 impl JustificationCensus {
@@ -2069,6 +2165,7 @@ impl JustificationCensus {
             + self.reroute
             + self.drop_form
             + self.store_form
+            + self.c9_mark
     }
 
     /// The plan's edit count, derived **without consulting any justification**.
@@ -2122,6 +2219,7 @@ impl JustificationCensus {
             J::ReRoute { .. } => self.reroute += 1,
             J::DropForm { .. } => self.drop_form += 1,
             J::StoreForm { .. } => self.store_form += 1,
+            J::C9Mark => self.c9_mark += 1,
         }
     }
 }
@@ -2960,7 +3058,7 @@ pub(crate) fn arms_full(
         _edited,
     ) = transform_inner(tcx, &RevertSet::default())?;
     let (table, _ctx) = super::decide_table_with_ctx(tcx)?;
-    let emission = super::emit_files(tcx, &table, &rustc_hash::FxHashSet::default())?;
+    let emission = super::emit_files(tcx, &table, &rustc_hash::FxHashSet::default(), &[])?;
 
     // The span layer's declaration and use edits, keyed by absolute offset.
     // `Edit::lo` is FILE-relative, so the file's own base is added back before
@@ -5025,6 +5123,7 @@ mod arm2_witnesses {
                 reroute: 1,
                 drop_form: 1,
                 store_form: 1,
+                c9_mark: 0,
             },
             "each variant must land in its OWN bucket — an arm-4 edit counted \
              as a `KindDecision` would report the market as zero while the \
@@ -5096,6 +5195,7 @@ mod arm2_witnesses {
                 reroute: 0,
                 drop_form: 1,
                 store_form: 0,
+                c9_mark: 0,
             },
             "the walk must reach EVERY file — the second file's edits are the \
              half a first-entry-only walk would miss"

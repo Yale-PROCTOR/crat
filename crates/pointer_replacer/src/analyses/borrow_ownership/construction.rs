@@ -13,12 +13,17 @@ use rustc_middle::mir::{
 };
 use rustc_mir_dataflow::Analysis;
 use rustc_span::def_id::LocalDefId;
+use sha2::{Digest, Sha256};
 
 #[cfg(test)]
 use super::coherence::add_coherence_tagging_uses;
 use super::{
     BoOwnEmissionStats, CrateCtxt, SlotKind,
-    a5_overlap::{C9MarkKey, WitnessMarkability, plan_c9_marks},
+    a5_overlap::{
+        A5Mode, A5World, AbiGuardDisposition, C9MarkKey, WholeProgramAttestation,
+        WitnessMarkability, apply_coarse_constraints, plan_c9_marks,
+    },
+    a5_producer::{A5Plan, PlannedC9Mark, produce_a5_plan},
     borrow_verify::{
         verify_to_fixpoint_counting_with_flows,
         verify_to_fixpoint_counting_with_flows_and_copy_lends,
@@ -221,6 +226,116 @@ pub(crate) struct BoConstruction {
     pub(crate) eligibility_elapsed: Duration,
     pub(crate) emit_elapsed: Duration,
     pub(crate) coherence_elapsed: Duration,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct VerifiedBo {
+    pub(crate) model: FxHashMap<SlotRef, SlotKind>,
+    pub(crate) retained_c9_marks: BTreeSet<C9MarkKey>,
+    pub(crate) retained_c9_plans: Vec<PlannedC9Mark>,
+    pub(crate) summary_artifact: super::a5_overlap::A5SummaryArtifact,
+    pub(crate) mark_artifact: String,
+    pub(crate) receipt: String,
+}
+
+const A5_PAIR_LEDGER_SHA256: &str =
+    "16dac90cf269c5480e6f612e54733dd210e41393a879202c7138e93cd7d360e1";
+const REPLAY_SAFE_DEFINITION: &str = "no incompatible access derived by precise replay with the effective parameter-overlap map injected; O2 closed-world frozen graph.";
+
+fn model_digest(model: &FxHashMap<SlotRef, SlotKind>) -> String {
+    let mut rows = model
+        .iter()
+        .map(|(&slot, kind)| {
+            let key = SlotKey::of(slot);
+            let kind = match kind {
+                SlotKind::Raw => "raw",
+                SlotKind::Ref => "ref",
+                SlotKind::Owning => "owning",
+            };
+            format!("{}\t{}\t{}\t{kind}", key.variant, key.owner, key.slot)
+        })
+        .collect::<Vec<_>>();
+    rows.sort();
+    format!("{:x}", Sha256::digest(rows.join("\n").as_bytes()))
+}
+
+fn summary_digest(plan: &A5Plan) -> String {
+    format!(
+        "{:x}",
+        Sha256::digest(
+            format!(
+                "{}{}",
+                plan.summary_artifact.receipt, plan.summary_artifact.summary_tsv
+            )
+            .as_bytes()
+        )
+    )
+}
+
+fn a5_mark_artifact(
+    mode: A5Mode,
+    plan: &A5Plan,
+    retained: &BTreeSet<C9MarkKey>,
+    selected_model_sha256: &str,
+) -> String {
+    let mut out = format!(
+        "# a5_mode={}\n# a5_world={}\n# a5_abi_guard={}\n# a5_producer=rustc-mir-current-v1\n\
+         # a5_pair_ledger_sha256={A5_PAIR_LEDGER_SHA256}\n# selected_model_sha256={selected_model_sha256}\n\
+         caller\tblock\tstatement\tcallee\tleft_param\tright_param\tshared_side\tpointee_type\tretained\n",
+        mode.label(),
+        A5World::ClosedWorldFrozenGraph.label(),
+        plan.abi_guard.stamp(),
+    );
+    for mark in &plan.planned_marks {
+        let pair = mark.key.pair;
+        out.push_str(&format!(
+            "{}\t{}\t{}\t{}\t{}\t{}\t{:?}\t{}\t{}\n",
+            mark.key.caller,
+            mark.key.location.block,
+            mark.key.location.statement_index,
+            pair.function(),
+            pair.params().first(),
+            pair.params().second(),
+            mark.key.shared_side,
+            mark.key.pointee_type,
+            retained.contains(&mark.key),
+        ));
+    }
+    out
+}
+
+fn a5_receipt(
+    mode: A5Mode,
+    plan: &A5Plan,
+    retained: usize,
+    retained_sites: usize,
+    selected_model_sha256: &str,
+) -> String {
+    format!(
+        "schema=bo-construction-v1\nstatus=ok\ndata=true\ncopy_lend_mode=baseline\n\
+         a2_mode=off\na5_mode={}\na5_world={}\nunknown_caller_seeding=false\n\
+         a5_abi_guard={}\na5_raw_pairs={}\na5_effective_pairs={}\n\
+         a5_planned_marks={}\na5_retained_marks={}\na5_retained_mark_sites={}\n\
+         a5_producer=rustc-mir-current-v1\n\
+         a5_foster_producer=MutFacts::from_program(mutability_analysis+SourceVarGroups::postprocess_mut_res)\n\
+         a5_pair_ledger_sha256={A5_PAIR_LEDGER_SHA256}\nselected_model_sha256={}\n\
+         a5_summary_sha256={}\nreplay_safe_definition={REPLAY_SAFE_DEFINITION}\n",
+        mode.label(),
+        A5World::ClosedWorldFrozenGraph.label(),
+        plan.abi_guard.stamp(),
+        plan.stats.raw_pairs,
+        plan.stats.effective_pairs,
+        plan.stats.planned_marks,
+        retained,
+        retained_sites,
+        selected_model_sha256,
+        summary_digest(plan),
+    )
+}
+
+pub(crate) fn baseline_a5_receipt(model: &FxHashMap<SlotRef, SlotKind>) -> String {
+    let plan = A5Plan::baseline();
+    a5_receipt(A5Mode::Baseline, &plan, 0, 0, &model_digest(model))
 }
 
 pub(crate) fn construct_bo_into(
@@ -450,6 +565,129 @@ pub(crate) fn verify_bo_construction_counting(
             )
         }
     }
+}
+
+pub(crate) fn solve_bo_a5_config(
+    program: &RustProgram<'_>,
+    slots: &CrateSlots,
+    origins: &OriginSummaries,
+    mut_facts: &MutFacts,
+    mode: A5Mode,
+    attestation: Option<WholeProgramAttestation>,
+) -> Option<VerifiedBo> {
+    assert_eq!(
+        CopyLendMode::current(),
+        CopyLendMode::Baseline,
+        "the A5 loop-2 matrix keeps dormant CopyLend semantics at baseline"
+    );
+
+    let baseline_solver = KindSolver::new(slots);
+    let baseline_construction = construct_bo_into(
+        program,
+        slots,
+        origins,
+        mut_facts,
+        &baseline_solver,
+        CopyLendMode::Baseline,
+    )
+    .ok()?;
+    let baseline_model = verify_bo_construction(
+        program,
+        slots,
+        origins,
+        &baseline_solver,
+        &baseline_construction,
+        mut_facts,
+    )?;
+    if mode == A5Mode::Baseline {
+        let plan = A5Plan::baseline();
+        let selected_model_sha256 = model_digest(&baseline_model);
+        return Some(VerifiedBo {
+            receipt: a5_receipt(mode, &plan, 0, 0, &selected_model_sha256),
+            mark_artifact: a5_mark_artifact(mode, &plan, &BTreeSet::new(), &selected_model_sha256),
+            summary_artifact: plan.summary_artifact.clone(),
+            model: baseline_model,
+            retained_c9_marks: BTreeSet::new(),
+            retained_c9_plans: Vec::new(),
+        });
+    }
+
+    let plan = produce_a5_plan(
+        program,
+        slots,
+        origins.native_flows(),
+        mut_facts,
+        &baseline_model,
+        mode,
+        attestation,
+    )
+    .ok()?;
+    if matches!(plan.abi_guard, AbiGuardDisposition::Refused { .. }) {
+        let selected_model_sha256 = model_digest(&baseline_model);
+        return Some(VerifiedBo {
+            receipt: a5_receipt(mode, &plan, 0, 0, &selected_model_sha256),
+            mark_artifact: a5_mark_artifact(mode, &plan, &BTreeSet::new(), &selected_model_sha256),
+            summary_artifact: plan.summary_artifact.clone(),
+            model: baseline_model,
+            retained_c9_marks: BTreeSet::new(),
+            retained_c9_plans: Vec::new(),
+        });
+    }
+
+    let solver = KindSolver::new(slots);
+    let construction = construct_bo_into(
+        program,
+        slots,
+        origins,
+        mut_facts,
+        &solver,
+        CopyLendMode::Baseline,
+    )
+    .ok()?;
+    let model = match mode {
+        A5Mode::Baseline => unreachable!(),
+        A5Mode::PreciseReplay => {
+            verify_bo_construction_with_parameter_overlaps(
+                program,
+                slots,
+                origins,
+                &solver,
+                &construction,
+                mut_facts,
+                &plan.effective_overlaps,
+            )
+            .0?
+        }
+        A5Mode::CoarseConstraint => {
+            apply_coarse_constraints(mode, &solver, plan.coarse_pairs.iter().copied());
+            verify_bo_construction(program, slots, origins, &solver, &construction, mut_facts)?
+        }
+    };
+    let retained_c9_marks = if mode == A5Mode::PreciseReplay {
+        plan.retained_marks(&model)
+    } else {
+        BTreeSet::new()
+    };
+    let retained_c9_plans = if mode == A5Mode::PreciseReplay {
+        plan.retained_mark_plans(&model)
+    } else {
+        Vec::new()
+    };
+    let selected_model_sha256 = model_digest(&model);
+    Some(VerifiedBo {
+        receipt: a5_receipt(
+            mode,
+            &plan,
+            retained_c9_marks.len(),
+            retained_c9_plans.len(),
+            &selected_model_sha256,
+        ),
+        mark_artifact: a5_mark_artifact(mode, &plan, &retained_c9_marks, &selected_model_sha256),
+        summary_artifact: plan.summary_artifact.clone(),
+        model,
+        retained_c9_marks,
+        retained_c9_plans,
+    })
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

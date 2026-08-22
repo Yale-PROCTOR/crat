@@ -24,7 +24,9 @@ use rustc_hir::def_id::LocalDefId;
 use rustc_middle::{mir::Local, ty::TyCtxt};
 use rustc_span::Span;
 
-use crate::analyses::borrow_ownership::{SlotKind, crate_slots::CrateSlots, solver::SlotRef};
+use crate::analyses::borrow_ownership::{
+    SlotKind, a5_producer::PlannedC9Mark, crate_slots::CrateSlots, solver::SlotRef,
+};
 
 pub(crate) mod co_conversion;
 pub(crate) mod construction;
@@ -677,6 +679,10 @@ pub(crate) enum Decision {
 #[derive(Clone, Debug, Default)]
 pub(crate) struct DecisionTable {
     pub entries: Vec<(Subject, Decision)>,
+    /// Retained post-solve C-9 call-site emission plans. These are construction
+    /// outputs, carried beside the subject decisions so both the span planner
+    /// and the structural AST emitter consume the same typed population.
+    pub c9_marks: Vec<PlannedC9Mark>,
     /// **S3.6-1 seam adapters.** Computed in this phase — it is the only phase
     /// that may read an analysis — and handed to `plan` as data, exactly as
     /// `Decision::Slice`'s use-edits are.
@@ -796,6 +802,7 @@ pub(crate) fn decide(ctx: &Ctx<'_, '_>, subjects: &[Subject]) -> DecisionTable {
         .collect();
     DecisionTable {
         entries,
+        c9_marks: Vec::new(),
         // `decide` stays PURE over subjects; seams need the call graph and are
         // filled by the driver, which is also where the analyses live.
         seams: Default::default(),
@@ -1399,6 +1406,7 @@ mod self_consistency_tests {
     fn table(entries: Vec<Subject>) -> DecisionTable {
         DecisionTable {
             seams: Default::default(),
+            c9_marks: Vec::new(),
             entries: entries
                 .into_iter()
                 .map(|s| (s, Decision::Ref { mutable: true }))

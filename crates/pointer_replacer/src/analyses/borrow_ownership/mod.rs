@@ -7,6 +7,7 @@
 use std::ops::Range;
 
 pub(crate) mod a5_overlap;
+pub(crate) mod a5_producer;
 pub(crate) mod a5_snapshot_effects;
 mod assoc;
 pub(crate) mod borrow_engine;

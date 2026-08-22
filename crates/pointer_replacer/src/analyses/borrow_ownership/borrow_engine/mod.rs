@@ -56,6 +56,7 @@ pub(crate) use conflicts::{
 pub(crate) use invalidates::{RoutedCompose, route_compose};
 #[cfg(test)]
 pub(crate) use origin_replay::selected_copy_lend_contains;
+pub(crate) use places_conflict::{AccessDepth, PlaceConflictBias, places_conflict};
 
 /// §NB3-3a — routes the `borrow_verify` seam (and the `bo_c1` mirror) to the forked BO engine vs
 /// the production `borrow` engine. **Default = `Fork` (flipped at 3a merge, A1).** During 3a dev the

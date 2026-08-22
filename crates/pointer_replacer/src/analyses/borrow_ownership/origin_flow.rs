@@ -793,6 +793,63 @@ impl BodyOriginFlow {
             .collect()
     }
 
+    pub(crate) fn depth0_origin_indices(
+        &self,
+        body: &Body<'_>,
+        local: Local,
+        caller_reachable_from_unknown: bool,
+    ) -> Option<(std::collections::BTreeSet<usize>, bool)> {
+        let target = self.slot_for_local(local, 0)?;
+        let origins = self
+            .slots
+            .indices()
+            .filter(|&source| source == target || self.value_flows.contains(source, target))
+            .map(|source| source.index())
+            .collect::<std::collections::BTreeSet<_>>();
+        let mut complete = !self.unknown_targets.contains(target);
+        if caller_reachable_from_unknown {
+            complete &= !body.args_iter().any(|argument| {
+                self.slot_for_local(argument, 0).is_some_and(|source| {
+                    source == target || self.value_flows.contains(source, target)
+                })
+            });
+        }
+        Some((origins, complete))
+    }
+
+    /// Depth-zero caller parameters whose values can flow into `local`.
+    ///
+    /// A5 uses this projection to distinguish a direct call-site overlap fact
+    /// from a fact that is conditional on one of the caller's parameter pairs.
+    /// The boolean is false when the ordinary origin analysis has an unknown
+    /// source for the local, in which case the producer must also retain a
+    /// direct conservative witness.
+    pub(crate) fn depth0_argument_origins(
+        &self,
+        body: &Body<'_>,
+        local: Local,
+    ) -> Option<(std::collections::BTreeSet<usize>, bool)> {
+        let target = self.slot_for_local(local, 0)?;
+        let arguments = body
+            .args_iter()
+            .filter_map(|argument| {
+                let source = self.slot_for_local(argument, 0)?;
+                (source == target || self.value_flows.contains(source, target))
+                    .then_some(argument.index())
+            })
+            .collect();
+        Some((arguments, !self.unknown_targets.contains(target)))
+    }
+
+    pub(crate) fn depth0_storage_alias(&self, left: Local, right: Local) -> bool {
+        match (self.slot_for_local(left, 0), self.slot_for_local(right, 0)) {
+            (Some(left), Some(right)) => {
+                left == right || self.storage_aliases.contains(left, right)
+            }
+            _ => false,
+        }
+    }
+
     fn slot_for_place<'tcx, D: HasLocalDecls<'tcx>>(
         &self,
         local_decls: &D,

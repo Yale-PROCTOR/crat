@@ -46,6 +46,8 @@
 //! derives from the post-`expand`→`extern`→`preprocess` form; see
 //! `docs/agents/2026-08-06-substrate-of-record.md`.
 
+use std::collections::BTreeSet;
+
 use rustc_hir::{ItemKind, OwnerNode};
 use rustc_middle::{
     mir::Local,
@@ -55,13 +57,15 @@ use rustc_middle::{
 use crate::{
     analyses::borrow_ownership::{
         SlotKind,
-        construction::{CopyLendMode, construct_bo_into, verify_bo_construction},
+        a5_overlap::{A5Mode, WholeProgramAttestation},
+        a5_producer::PlannedC9Mark,
+        construction::{baseline_a5_receipt, solve_bo_a5_config},
         crate_slots::{CrateSlots, ptr_chain_depth},
         export::with_bo_export,
         model_cache,
         mutability_facts::MutFacts,
         origins::compute_origins,
-        solver::{KindSolver, SlotRef},
+        solver::SlotRef,
     },
     utils::rustc::RustProgram,
 };
@@ -176,6 +180,8 @@ pub(crate) enum RewriteOutcome {
         /// counted and attributed, never silently dropped. Expected zero on the
         /// frozen corpus; a nonzero count is a finding to rule on.
         unplaceable: Vec<plan::Unplaceable>,
+        /// Resolved A5 construction and selected-model identity.
+        a5_receipt: String,
     },
     /// No emission, with whatever attribution was available.
     Degraded {
@@ -226,6 +232,8 @@ pub(crate) enum RewriteOutcome {
         /// matters, so this is the precondition for S2b.3's `unplaceable == 0`
         /// gate rather than a tidy-up.
         unplaceable: Vec<plan::Unplaceable>,
+        /// Resolved A5 construction and selected-model identity.
+        a5_receipt: String,
     },
 }
 
@@ -427,6 +435,23 @@ pub(crate) fn rewrite_m1_path_injected(
         max_rounds,
         inject,
         false,
+        None,
+    )
+}
+
+#[cfg(test)]
+pub(crate) fn rewrite_m1_a5(
+    input: &str,
+    mode: A5Mode,
+    attestation: Option<WholeProgramAttestation>,
+) -> RewriteOutcome {
+    rewrite_core_injected(
+        ::utils::compilation::str_to_input(input),
+        None,
+        MAX_REVERT_ROUNDS,
+        &|_| {},
+        false,
+        Some((mode, attestation)),
     )
 }
 
@@ -435,7 +460,7 @@ fn rewrite_core(
     tree_base: Option<&std::path::Path>,
     max_rounds: usize,
 ) -> RewriteOutcome {
-    rewrite_core_injected(input, tree_base, max_rounds, &|_| {}, false)
+    rewrite_core_injected(input, tree_base, max_rounds, &|_| {}, false, None)
 }
 
 /// [`rewrite_core`] with a hook applied to the finished decision table at the
@@ -451,6 +476,7 @@ fn rewrite_core_injected(
     max_rounds: usize,
     inject: &(dyn Fn(&mut decision::DecisionTable) + Sync),
     probe_only: bool,
+    a5_override: Option<(A5Mode, Option<WholeProgramAttestation>)>,
 ) -> RewriteOutcome {
     // The string entry's original text, so a baseline exists for it too.
     let virtual_original = match &input {
@@ -476,10 +502,17 @@ fn rewrite_core_injected(
         //
         // ⚠ Nothing may run a query ahead of this line.
         let capture = ast_transform::capture_ast(tcx)?;
-        let mut table = decide_table(tcx)?;
+        let (mut table, decide_ctx) = decide_table_with_ctx_config(tcx, a5_override)?;
+        let retained_c9_plans = decide_ctx.retained_c9_plans.clone();
+        let a5_receipt = decide_ctx.a5_receipt.clone();
         inject(&mut table);
         let table = table;
-        let emission = emit_files(tcx, &table, &rustc_hash::FxHashSet::default())?;
+        let emission = emit_files(
+            tcx,
+            &table,
+            &rustc_hash::FxHashSet::default(),
+            &retained_c9_plans,
+        )?;
         let (emission_plan, emission_texts) = (emission.plan.clone(), emission.texts.clone());
         // Structural gate: rollbacks must be zero.
         if !emission.rollbacks.is_empty() {
@@ -627,6 +660,7 @@ fn rewrite_core_injected(
             root_text,
             emitted_sites,
             emitted_subjects,
+            a5_receipt,
         ))
     });
 
@@ -729,6 +763,7 @@ fn verify_and_revert(
     root_text: String,
     emitted_sites: Vec<EmittedSite>,
     emitted_subjects: Vec<(String, String, String)>,
+    a5_receipt: String,
 ) -> RewriteOutcome {
     // `excluded` is a LOCAL again: the loop holds `tcx`, so a value that used
     // to cross the boundary is simply computed here. One of the ten, retired.
@@ -806,6 +841,7 @@ fn verify_and_revert(
         baseline_keys: 0,
         baseline_errors: 0,
         baseline_msg_env: 0,
+        a5_receipt,
     };
     let crate_dir = tree_base
         .and_then(|root| root.parent())
@@ -1660,6 +1696,13 @@ fn decide_table_with_ctx<'tcx>(
     decide_table_perturbed(tcx, |_| {})
 }
 
+fn decide_table_with_ctx_config<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    a5_override: Option<(A5Mode, Option<WholeProgramAttestation>)>,
+) -> Result<(decision::DecisionTable, DecideCtx), String> {
+    decide_table_perturbed_config(tcx, |_| {}, a5_override)
+}
+
 /// **Validation-transfer entry.** One emit, one diagnose, no revert loop.
 ///
 /// The loop's `.err` log concatenates every round's compile, so a structural-vs-
@@ -1685,6 +1728,7 @@ pub(crate) fn diagnose_once(
         MAX_REVERT_ROUNDS,
         &|_| {},
         true,
+        None,
     );
     let (observed_root, diags) = outcome.into_capture();
     // FAIL-CLOSED. A capture without its frame cannot be canonicalized, and the
@@ -1747,6 +1791,7 @@ struct OutcomeFacts {
     /// left inventing a normalization. That is precisely how a second and then
     /// a third path canonicalizer came to exist.
     observed_root: Option<std::path::PathBuf>,
+    a5_receipt: String,
 }
 
 impl RewriteOutcome {
@@ -1787,6 +1832,13 @@ impl RewriteOutcome {
             } => (observed_root, first_diags),
         }
     }
+
+    #[cfg(test)]
+    pub(crate) fn a5_receipt(&self) -> &str {
+        match self {
+            Self::Emitted { a5_receipt, .. } | Self::Degraded { a5_receipt, .. } => a5_receipt,
+        }
+    }
 }
 
 impl OutcomeFacts {
@@ -1813,6 +1865,7 @@ impl OutcomeFacts {
             baseline_keys: self.baseline_keys,
             baseline_errors: self.baseline_errors,
             baseline_msg_env: self.baseline_msg_env,
+            a5_receipt: self.a5_receipt,
         }
     }
 
@@ -1833,6 +1886,7 @@ impl OutcomeFacts {
             baseline_keys: self.baseline_keys,
             baseline_errors: self.baseline_errors,
             baseline_msg_env: self.baseline_msg_env,
+            a5_receipt: self.a5_receipt,
         }
     }
 }
@@ -2176,6 +2230,7 @@ pub(crate) fn emit_files<'tcx>(
     tcx: TyCtxt<'tcx>,
     table: &decision::DecisionTable,
     reverted: &rustc_hash::FxHashSet<rustc_hir::def_id::LocalDefId>,
+    retained_c9_plans: &[PlannedC9Mark],
 ) -> Result<Emission, String> {
     let source_map = tcx.sess.source_map();
     let text_of = |key: &plan::FileKey| -> Option<String> {
@@ -2216,6 +2271,26 @@ pub(crate) fn emit_files<'tcx>(
         |subject| tcx.def_path_str(subject.fn_did.to_def_id()),
         &|subject: &decision::Subject| reverted.contains(&subject.fn_did),
     );
+    for mark in retained_c9_plans {
+        if reverted.contains(&mark.caller_did) {
+            continue;
+        }
+        let (file, lo, hi) = span_to_loc(mark.call_span)
+            .map_err(|why| format!("unplaceable retained C-9 mark: {why}"))?;
+        let source = text_of(&file)
+            .ok_or_else(|| format!("no source text for retained C-9 mark file {file:?}"))?;
+        let original = source
+            .get(lo..hi)
+            .ok_or_else(|| "retained C-9 mark span is outside its source file".to_owned())?;
+        let replacement = c9::render_marked_source(&mark.key, original)?;
+        planned.by_file.entry(file).or_default().push(plan::Edit {
+            lo,
+            hi,
+            replacement,
+            justification: plan::Justification::C9Mark,
+            owner_fn: mark.owner_fn.clone(),
+        });
+    }
     // **The crate root, asked of the compiler rather than guessed** — not
     // `files()[0]`, which is source-map insertion order, and not the first
     // planned file, which is whichever file happened to hold an edit.
@@ -2283,10 +2358,19 @@ fn decide_table_perturbed<'tcx>(
     tcx: TyCtxt<'tcx>,
     perturb: impl FnOnce(&mut Vec<decision::Subject>),
 ) -> Result<(decision::DecisionTable, DecideCtx), String> {
+    decide_table_perturbed_config(tcx, perturb, None)
+}
+
+fn decide_table_perturbed_config<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    perturb: impl FnOnce(&mut Vec<decision::Subject>),
+    a5_override: Option<(A5Mode, Option<WholeProgramAttestation>)>,
+) -> Result<(decision::DecisionTable, DecideCtx), String> {
     let program = collect_program(tcx);
     let slots = CrateSlots::build(&program);
     let mut_facts = MutFacts::from_program(&program);
-    let copy_lend_mode = CopyLendMode::current();
+    let (a5_mode, attestation) =
+        a5_override.unwrap_or_else(|| (A5Mode::current(), WholeProgramAttestation::current()));
 
     // Phase 1 input: the BO run, under an explicit capture scope.
     //
@@ -2303,43 +2387,58 @@ fn decide_table_perturbed<'tcx>(
     // consumers of the decision table, and before this each ran the entire
     // pipeline — `total ≈ 3 × solve` on every program. Reusing the model here
     // makes a consumer's cost its own work, not another whole solve.
-    if let Some(memo) = model_cache::memo_get(&fp) {
-        return finish_decide(tcx, program, slots, mut_facts, memo, perturb);
+    if a5_mode == A5Mode::Baseline
+        && let Some(memo) = model_cache::memo_get(&fp)
+    {
+        let receipt = baseline_a5_receipt(&memo);
+        return finish_decide(
+            tcx,
+            program,
+            slots,
+            mut_facts,
+            memo,
+            Vec::new(),
+            receipt,
+            perturb,
+        );
     }
 
     // Tier 2: the on-disk cache.
-    if let Some(cached) = model_cache::load(tcx, &program, &slots) {
+    if a5_mode == A5Mode::Baseline
+        && let Some(cached) = model_cache::load(tcx, &program, &slots)
+    {
         model_cache::record_solve(model_cache::SolveProvenance {
             source: "cache",
             fingerprint: fp.clone(),
             solve_secs: 0.0,
         });
         model_cache::memo_put(&fp, &cached);
-        return finish_decide(tcx, program, slots, mut_facts, cached, perturb);
+        let receipt = baseline_a5_receipt(&cached);
+        return finish_decide(
+            tcx,
+            program,
+            slots,
+            mut_facts,
+            cached,
+            Vec::new(),
+            receipt,
+            perturb,
+        );
     }
     let solve_t0 = std::time::Instant::now();
-    let (model, _export) = with_bo_export(|| {
-        let solver = KindSolver::new(&slots);
-        let origins = compute_origins(&program);
-        let Ok(construction) = construct_bo_into(
-            &program,
-            &slots,
-            &origins,
-            &mut_facts,
-            &solver,
-            copy_lend_mode,
-        ) else {
-            return None;
-        };
-        verify_bo_construction(
-            &program,
-            &slots,
-            &origins,
-            &solver,
-            &construction,
-            &mut_facts,
-        )
-    });
+    let origins = compute_origins(&program);
+    let ((model, _retained_c9_marks, retained_c9_plans, a5_receipt), _export) =
+        with_bo_export(|| {
+            match solve_bo_a5_config(&program, &slots, &origins, &mut_facts, a5_mode, attestation) {
+                Some(verified) => (
+                    Some(verified.model),
+                    verified.retained_c9_marks,
+                    verified.retained_c9_plans,
+                    verified.receipt,
+                ),
+                None => (None, BTreeSet::new(), Vec::new(), String::new()),
+            }
+        });
     let Some(model) = model else {
         return Err("BO declined — no accepted model".to_owned());
     };
@@ -2350,10 +2449,21 @@ fn decide_table_perturbed<'tcx>(
         fingerprint: fp.clone(),
         solve_secs: solve_t0.elapsed().as_secs_f64(),
     });
-    model_cache::memo_put(&fp, &model);
-    model_cache::store(tcx, &program, &slots, &model);
+    if a5_mode == A5Mode::Baseline {
+        model_cache::memo_put(&fp, &model);
+        model_cache::store(tcx, &program, &slots, &model);
+    }
 
-    finish_decide(tcx, program, slots, mut_facts, model, perturb)
+    finish_decide(
+        tcx,
+        program,
+        slots,
+        mut_facts,
+        model,
+        retained_c9_plans,
+        a5_receipt,
+        perturb,
+    )
 }
 
 /// The phases after the solve, shared by the cached and real-solve paths.
@@ -2368,6 +2478,8 @@ fn finish_decide<'tcx>(
     slots: CrateSlots,
     mut_facts: MutFacts,
     model: rustc_hash::FxHashMap<SlotRef, SlotKind>,
+    retained_c9_plans: Vec<PlannedC9Mark>,
+    a5_receipt: String,
     perturb: impl FnOnce(&mut Vec<decision::Subject>),
 ) -> Result<(decision::DecisionTable, DecideCtx), String> {
     let mut subjects = collect_subjects(tcx, &program, &mut_facts);
@@ -2562,6 +2674,7 @@ fn finish_decide<'tcx>(
     // forms both ends actually settle on, so a subject withdrawn later would
     // leave glue bridging to a form that no longer exists.
     table.seams = decision::seam::synthesize(tcx, &facts, &subjects, &table);
+    table.c9_marks = retained_c9_plans.clone();
     let table = table;
 
     // Structural self-check: the table matches the subjects it was handed. NOT
@@ -2590,6 +2703,8 @@ fn finish_decide<'tcx>(
             escapes,
             subjects,
             hypothetical,
+            retained_c9_plans,
+            a5_receipt,
         },
     ))
 }
@@ -2624,6 +2739,8 @@ pub(crate) struct DecideCtx {
     /// R1's rule, the one that stopped the recon worker solving BO twice.
     subjects: Vec<decision::Subject>,
     hypothetical: decision::DecisionTable,
+    retained_c9_plans: Vec<PlannedC9Mark>,
+    a5_receipt: String,
 }
 
 impl DecideCtx {
