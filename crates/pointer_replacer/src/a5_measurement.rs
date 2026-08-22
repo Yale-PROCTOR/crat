@@ -1947,6 +1947,200 @@ fn batch_number(row: &super::report::Row, key: &str) -> usize {
         .unwrap_or_else(|error| panic!("batch row {key} is not numeric: {error}"))
 }
 
+const A5_POPULATION_REASON_KEYS: [&str; 27] = [
+    "rw_reason_arg-stays-raw",
+    "rw_reason_arg-unadaptable-shape",
+    "rw_reason_borrowed-into-raw-param",
+    "rw_reason_call-site-not-adapted",
+    "rw_reason_class-blocked",
+    "rw_reason_copy-source-coupled",
+    "rw_reason_duplicate-place-root",
+    "rw_reason_escapes-via-field-store",
+    "rw_reason_escapes-via-foreign-arg",
+    "rw_reason_escapes-via-return",
+    "rw_reason_flows-into-other-form",
+    "rw_reason_flows-into-raw-param",
+    "rw_reason_freed-slot",
+    "rw_reason_kind-owning",
+    "rw_reason_kind-raw",
+    "rw_reason_nested-use-edits",
+    "rw_reason_null-init",
+    "rw_reason_opt-local-construction",
+    "rw_reason_opt-use-unsupported",
+    "rw_reason_place-read-pointee",
+    "rw_reason_ptr-comparison",
+    "rw_reason_raw-pointer-operation",
+    "rw_reason_return-not-adapted",
+    "rw_reason_slice-local-construction",
+    "rw_reason_slice-neg-or-unknown-offset",
+    "rw_reason_slice-use-unsupported",
+    "rw_reason_unsupported-decl-shape",
+];
+
+const A5_OPERATIONAL_ROLLBACK_KEY: &str = "rw_reason_reverted-after-verify-failure";
+
+fn batch_population_reason_keys(
+    rows: &[super::report::Row],
+) -> Result<BTreeSet<&'static str>, String> {
+    let registered = A5_POPULATION_REASON_KEYS
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    let observed = rows
+        .iter()
+        .flat_map(|row| row.0.iter().map(|(key, _)| key.as_str()))
+        .filter(|key| key.starts_with("rw_reason_") && *key != "rw_reason_key_count")
+        .collect::<BTreeSet<_>>();
+    for key in &observed {
+        if *key != A5_OPERATIONAL_ROLLBACK_KEY && !registered.contains(key) {
+            return Err(format!("unregistered batch reason field {key}"));
+        }
+    }
+    let population = A5_POPULATION_REASON_KEYS
+        .into_iter()
+        .filter(|key| observed.contains(key))
+        .collect::<BTreeSet<_>>();
+    if population != registered {
+        let missing = registered
+            .difference(&population)
+            .copied()
+            .collect::<Vec<_>>();
+        return Err(format!(
+            "batch lacks registered population keys {missing:?}"
+        ));
+    }
+    Ok(population)
+}
+
+#[test]
+fn batch_population_oracle_is_exact_and_excludes_operational_reasons() {
+    let mut row = super::report::Row::default();
+    for key in A5_POPULATION_REASON_KEYS {
+        row.set(key, 1);
+    }
+    row.set(A5_OPERATIONAL_ROLLBACK_KEY, 1);
+    let mut rows = [row];
+
+    assert_eq!(
+        batch_population_reason_keys(&rows).expect("registered population universe"),
+        A5_POPULATION_REASON_KEYS.into_iter().collect(),
+        "operational rw_reason_* fields are not population keys"
+    );
+
+    rows[0].set("rw_reason_not-registered", 1);
+    assert!(
+        batch_population_reason_keys(&rows).is_err(),
+        "an unknown reason is a schema STOP, not a silently ignored field"
+    );
+}
+
+fn batch_optional_number(row: &super::report::Row, key: &str) -> Result<usize, String> {
+    row.get(key)
+        .map(|value| {
+            value
+                .parse::<usize>()
+                .map_err(|error| format!("batch row {key} is not numeric: {error}"))
+        })
+        .unwrap_or(Ok(0))
+}
+
+fn reconcile_batch_rollback_rows(rows: &mut [super::report::Row]) -> Result<(), String> {
+    for row in rows {
+        let program = row.get("program").unwrap_or("missing-program").to_owned();
+        let configuration = row
+            .get("configuration")
+            .unwrap_or("missing-configuration")
+            .to_owned();
+        let emitted = batch_optional_number(row, "rw_emitted")?;
+        let degraded = batch_optional_number(row, "rw_degraded")?;
+        let reverted = batch_optional_number(row, "rw_reverted")?;
+        let operational = batch_optional_number(row, A5_OPERATIONAL_ROLLBACK_KEY)?;
+        if operational != reverted {
+            return Err(format!(
+                "{program}/{configuration}: operational rollback {operational} != rw_reverted {reverted}"
+            ));
+        }
+        let decided_ref = emitted
+            .checked_add(reverted)
+            .ok_or_else(|| format!("{program}/{configuration}: decided-ref overflow"))?;
+        let degraded_pre_revert = degraded.checked_sub(reverted).ok_or_else(|| {
+            format!("{program}/{configuration}: degraded {degraded} is below reverted {reverted}")
+        })?;
+        let pre_revert_subjects = decided_ref
+            .checked_add(degraded_pre_revert)
+            .ok_or_else(|| format!("{program}/{configuration}: pre-frame overflow"))?;
+        let post_revert_subjects = emitted
+            .checked_add(degraded)
+            .ok_or_else(|| format!("{program}/{configuration}: post-frame overflow"))?;
+        if pre_revert_subjects != post_revert_subjects {
+            return Err(format!(
+                "{program}/{configuration}: S2b frame mismatch {pre_revert_subjects} != {post_revert_subjects}"
+            ));
+        }
+        row.set("rw_reverted_after_verify_failure", operational);
+        row.set("rw_decided_ref", decided_ref);
+        row.set("rw_degraded_pre_revert", degraded_pre_revert);
+        row.set("rw_subjects_pre_revert", pre_revert_subjects);
+        row.set("rw_subjects_post_revert", post_revert_subjects);
+    }
+    Ok(())
+}
+
+#[test]
+fn batch_rollback_reconciles_operational_and_both_s2b_frames() {
+    let mut row = super::report::Row::default();
+    row.set("program", "fixture");
+    row.set("configuration", "precise");
+    row.set("rw_emitted", 7);
+    row.set("rw_degraded", 5);
+    row.set("rw_reverted", 2);
+    row.set(A5_OPERATIONAL_ROLLBACK_KEY, 2);
+    let mut rows = [row];
+
+    reconcile_batch_rollback_rows(&mut rows).expect("two-frame reconciliation");
+    assert_eq!(rows[0].get("rw_reverted_after_verify_failure"), Some("2"));
+    assert_eq!(rows[0].get("rw_decided_ref"), Some("9"));
+    assert_eq!(rows[0].get("rw_degraded_pre_revert"), Some("3"));
+    assert_eq!(rows[0].get("rw_subjects_pre_revert"), Some("12"));
+    assert_eq!(rows[0].get("rw_subjects_post_revert"), Some("12"));
+
+    rows[0].set(A5_OPERATIONAL_ROLLBACK_KEY, 1);
+    assert!(reconcile_batch_rollback_rows(&mut rows).is_err());
+}
+
+fn parse_batch_csv(input: &str) -> Result<Vec<super::report::Row>, String> {
+    let mut lines = input.lines();
+    let header = lines
+        .next()
+        .ok_or_else(|| "batch CSV lacks header".to_owned())?
+        .split(',')
+        .collect::<Vec<_>>();
+    let unique = header.iter().copied().collect::<BTreeSet<_>>();
+    if unique.len() != header.len() {
+        return Err("batch CSV has duplicate header fields".to_owned());
+    }
+    lines
+        .enumerate()
+        .map(|(index, line)| {
+            let fields = line.split(',').collect::<Vec<_>>();
+            if fields.len() != header.len() {
+                return Err(format!(
+                    "batch CSV row {} has {} fields, expected {}",
+                    index + 2,
+                    fields.len(),
+                    header.len()
+                ));
+            }
+            let mut row = super::report::Row::default();
+            for (key, value) in header.iter().zip(fields) {
+                if !value.is_empty() {
+                    row.set(key, value);
+                }
+            }
+            Ok(row)
+        })
+        .collect()
+}
+
 fn batch_model_digest_stamp(row: &super::report::Row, expected: &str) -> Result<(), String> {
     match row.get("official_evaluation_sha256") {
         Some(actual) if actual == expected => Ok(()),
@@ -2319,6 +2513,14 @@ fn a5_item22_batch_corpus() {
         .expect("write A5 launch-4 preflight completion");
         return;
     }
+    reconcile_batch_rollback_rows(&mut rows)
+        .unwrap_or_else(|error| panic!("A5 item-22 rollback reconciliation STOP: {error}"));
+    fs::write(
+        output.join("per-program-reconciled.csv"),
+        super::report::render_csv(&rows),
+    )
+    .expect("write A5 reconciled per-program rows");
+    let measurement_head = super::orchestrate::git_sha();
     finish_a5_item22_batch(
         &output,
         &rows,
@@ -2327,6 +2529,81 @@ fn a5_item22_batch_corpus() {
         &official_link,
         &official_target,
         &official_digest,
+        &measurement_head,
+    );
+}
+
+#[test]
+#[ignore = "A5 item-22 aggregation-only replay over preserved launch-4 rows"]
+fn a5_item22_batch_aggregate_only() {
+    const DIGEST: &str = "db96829b5c2b0db28fb4bb9ddd3d32901b5d4e6e4134da07ada0d513d94eb4c6";
+    const OFFICIAL_DIGEST: &str =
+        "7aa16d5b63ff39e6aaabd3590ec2be9c88c9d8a753bd9f74cd4e6056d9974fd7";
+    let output = std::path::PathBuf::from(
+        std::env::var_os("CRAT_A5_BATCH_PRESERVED")
+            .expect("aggregation-only replay requires CRAT_A5_BATCH_PRESERVED"),
+    );
+    assert!(!output.join("aggregate.csv").exists());
+    assert!(!output.join("complete.txt").exists());
+    let raw = fs::read_to_string(output.join("per-program.csv"))
+        .expect("read preserved launch-4 worker rows");
+    let mut rows = parse_batch_csv(&raw).expect("parse preserved launch-4 worker rows");
+    assert_eq!(rows.len(), 60, "aggregation input row count");
+    batch_population_reason_keys(&rows).expect("registered 27-key population universe");
+
+    let mut configurations = BTreeMap::<&str, usize>::new();
+    for row in &rows {
+        assert_eq!(row.get("status"), Some("ok"), "model worker status");
+        assert_eq!(row.get("rw_status"), Some("ok"), "rewriter worker status");
+        batch_model_digest_stamp(row, OFFICIAL_DIGEST).expect("preserved digest stamp");
+        batch_attestation_stamp(row).expect("preserved attestation stamp");
+        *configurations
+            .entry(row.get("configuration").expect("configuration stamp"))
+            .or_default() += 1;
+    }
+    assert_eq!(
+        configurations,
+        BTreeMap::from([("baseline", 20), ("coarse", 20), ("precise", 20)])
+    );
+
+    let partial = fs::read_to_string(output.join("partial-receipt.txt"))
+        .expect("read preserved partial receipt");
+    for stamp in ["data=false", "completed_rows=60", "required_rows=60"] {
+        assert!(partial.lines().any(|line| line == stamp), "partial {stamp}");
+    }
+    let preflight = fs::read_to_string(output.join("preflight-receipt.txt"))
+        .expect("read preserved launch preflight receipt");
+    let measurement_head = preflight
+        .lines()
+        .find_map(|line| line.strip_prefix("analysis_head="))
+        .expect("measurement analysis head");
+
+    reconcile_batch_rollback_rows(&mut rows)
+        .unwrap_or_else(|error| panic!("A5 aggregation-only rollback STOP: {error}"));
+    fs::write(
+        output.join("per-program-reconciled.csv"),
+        super::report::render_csv(&rows),
+    )
+    .expect("write reconciled launch-4 per-program rows");
+
+    let root = super::orchestrate::workspace_root();
+    let official_link = root.join("benchmarks/rs-crown-transformed/evaluation.tsv");
+    let official_target = fs::read_link(&official_link).expect("official artifact symlink");
+    assert!(official_target.is_absolute());
+    assert_eq!(batch_sha256(&official_link).as_deref(), Ok(OFFICIAL_DIGEST));
+    finish_a5_item22_batch(
+        &output,
+        &rows,
+        [
+            ("baseline", "baseline"),
+            ("precise", "precise_replay"),
+            ("coarse", "coarse_constraint"),
+        ],
+        DIGEST,
+        &official_link,
+        &official_target,
+        OFFICIAL_DIGEST,
+        measurement_head,
     );
 }
 
@@ -2338,12 +2615,10 @@ fn finish_a5_item22_batch(
     official_link: &Path,
     official_target: &Path,
     official_digest: &str,
+    measurement_head: &str,
 ) {
-    let reason_keys = rows
-        .iter()
-        .flat_map(|row| row.0.iter().map(|(key, _)| key.as_str()))
-        .filter(|key| key.starts_with("rw_reason_") && *key != "rw_reason_key_count")
-        .collect::<BTreeSet<_>>();
+    let reason_keys = batch_population_reason_keys(rows)
+        .unwrap_or_else(|error| panic!("A5 batch reason-schema STOP: {error}"));
     assert_eq!(reason_keys.len(), 27, "A5 batch 27-key oracle cardinality");
     let mut aggregates = Vec::new();
     for (label, mode) in modes {
@@ -2386,6 +2661,12 @@ fn finish_a5_item22_batch(
             "a5_model_retained_marks",
             "rw_emitted",
             "rw_degraded",
+            "rw_reverted",
+            "rw_reverted_after_verify_failure",
+            "rw_decided_ref",
+            "rw_degraded_pre_revert",
+            "rw_subjects_pre_revert",
+            "rw_subjects_post_revert",
             "rw_a5_model_retained_marks",
             "rw_a5_emission_retained_marks",
         ] {
@@ -2400,6 +2681,28 @@ fn finish_a5_item22_batch(
                 .sum::<usize>();
             row.set(key, count);
         }
+        let expected_reverted = match label {
+            "baseline" => 1_056,
+            "precise" => 984,
+            "coarse" => 860,
+            other => panic!("unknown A5 batch configuration {other}"),
+        };
+        assert_eq!(sum("rw_reverted"), expected_reverted, "{label} reverted");
+        assert_eq!(
+            sum("rw_reverted_after_verify_failure"),
+            expected_reverted,
+            "{label} operational rollback"
+        );
+        assert_eq!(
+            sum("rw_decided_ref"),
+            sum("rw_emitted") + sum("rw_reverted"),
+            "{label} S2b decided-ref identity"
+        );
+        assert_eq!(
+            sum("rw_subjects_pre_revert"),
+            sum("rw_subjects_post_revert"),
+            "{label} S2b two-frame population identity"
+        );
         let mut projection = BTreeMap::<String, usize>::new();
         for program in super::CORPUS {
             let source = fs::read_to_string(
@@ -2517,7 +2820,7 @@ fn finish_a5_item22_batch(
     fs::write(
         output.join("receipt.txt"),
         format!(
-            "schema=a5-item22-batch-v1\nstatus=ok\ndata=true\nanalysis_head={}\nprograms=20\nconfigurations=baseline,precise_replay,coarse_constraint\na5_world=closed_world_frozen_graph\na5_abi_guard={A5_BATCH_ATTESTED_GUARD}\ncopy_lend_mode=baseline\na2_mode=off\nz3_smt_seed=0\nz3_sat_seed=0\nmem_cap_mib=49152\nworker_bound_s=14400\nderived_substrate_sha256={digest}\nofficial_evaluation_link={}\nofficial_evaluation_target={}\nofficial_evaluation_sha256_start={official_digest}\nofficial_evaluation_sha256_end={official_digest}\nofficial_evaluation_link_installed=true\n",
+            "schema=a5-item22-batch-v1\nstatus=ok\ndata=true\nanalysis_head={measurement_head}\naggregation_head={}\nprograms=20\nconfigurations=baseline,precise_replay,coarse_constraint\na5_world=closed_world_frozen_graph\na5_abi_guard={A5_BATCH_ATTESTED_GUARD}\ncopy_lend_mode=baseline\na2_mode=off\nz3_smt_seed=0\nz3_sat_seed=0\nmem_cap_mib=49152\nworker_bound_s=14400\nderived_substrate_sha256={digest}\nofficial_evaluation_link={}\nofficial_evaluation_target={}\nofficial_evaluation_sha256_start={official_digest}\nofficial_evaluation_sha256_end={official_digest}\nofficial_evaluation_link_installed=true\n",
             super::orchestrate::git_sha(),
             official_link.display(),
             official_target.display(),
