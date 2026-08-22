@@ -440,22 +440,6 @@ pub(crate) fn rewrite_m1_path_injected(
 }
 
 #[cfg(test)]
-pub(crate) fn rewrite_m1_a5(
-    input: &str,
-    mode: A5Mode,
-    attestation: Option<WholeProgramAttestation>,
-) -> RewriteOutcome {
-    rewrite_core_injected(
-        ::utils::compilation::str_to_input(input),
-        None,
-        MAX_REVERT_ROUNDS,
-        &|_| {},
-        false,
-        Some((mode, attestation)),
-    )
-}
-
-#[cfg(test)]
 pub(crate) fn rewrite_m1_path_a5_injected(
     root: &std::path::Path,
     mode: A5Mode,
@@ -2712,9 +2696,7 @@ fn finish_decide<'tcx>(
                     | decision::Decision::Opt { .. }
                     | decision::Decision::Degraded(_) => false,
                 };
-                subject.fn_did == mark.owner_did
-                    && subject.local == local
-                    && is_ref
+                subject.fn_did == mark.owner_did && subject.local == local && is_ref
             })
         })
     });

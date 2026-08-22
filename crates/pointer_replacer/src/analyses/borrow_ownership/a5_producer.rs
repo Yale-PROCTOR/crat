@@ -972,13 +972,25 @@ mod tests {
                 two(&mut (*h).symbol, q);
             }
         "#;
-        let precise = crate::bo_rewriter::rewrite_m1_a5(
-            code,
+        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let fixture = std::env::temp_dir().join(format!(
+            "crat-a5-production-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&fixture).expect("create production fixture directory");
+        let root = fixture.join("lib.rs");
+        std::fs::write(&root, code).expect("write production fixture");
+        let precise = crate::bo_rewriter::rewrite_m1_path_a5_injected(
+            &root,
             A5Mode::PreciseReplay,
             Some(WholeProgramAttestation::FrozenBenchmarkGraph),
+            &|_| {},
         );
-        let baseline = crate::bo_rewriter::rewrite_m1_a5(code, A5Mode::Baseline, None);
-        let default_baseline = crate::bo_rewriter::rewrite_m1(code);
+        let baseline =
+            crate::bo_rewriter::rewrite_m1_path_a5_injected(&root, A5Mode::Baseline, None, &|_| {});
+        let default_baseline = crate::bo_rewriter::rewrite_m1_path(&root);
+        std::fs::remove_dir_all(&fixture).expect("remove production fixture directory");
         assert!(precise.a5_receipt().contains("a5_mode=precise_replay\n"));
         assert!(baseline.a5_receipt().contains("a5_mode=baseline\n"));
         let precise_receipt = precise.a5_receipt().to_owned();
