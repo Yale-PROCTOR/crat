@@ -21,9 +21,10 @@ use crate::{
         borrow_ownership::{
             SlotKind,
             a5_overlap::{
-                A5World, C9MarkKey, PairClass, PairFacts, PairSide, SetPairEvidence,
-                SnapshotVerdict, classify_pair,
+                A5Mode, A5World, C9MarkKey, PairClass, PairFacts, PairSide, SetPairEvidence,
+                SnapshotVerdict, WholeProgramAttestation, classify_pair,
             },
+            a5_producer::produce_a5_plan,
             a5_snapshot_effects::snapshot_verdict_for_target,
             borrow_engine::ParameterOverlap,
             borrow_verify::revalidate_replaying_with_parameter_overlap,
@@ -2384,6 +2385,77 @@ pub(super) fn run_production_site_join_worker(
     row
 }
 
+pub(super) fn run_a5_site_repair_plan_worker(
+    tcx: TyCtxt<'_>,
+    t_tcx: Duration,
+) -> super::report::Row {
+    let t0 = Instant::now();
+    let mut row = super::report::Row::default();
+    row.set("t_tcx_s", t_tcx.as_secs_f64());
+    row.set("data", "false");
+    row.set("a5_mode", "precise_replay");
+    row.set("a5_world", "closed_world_frozen_graph");
+    let model_path = std::path::PathBuf::from(
+        std::env::var_os("CRAT_A5_SITE_REPAIR_BASELINE_MODEL").expect("preserved baseline model"),
+    );
+    let w14_path = std::path::PathBuf::from(
+        std::env::var_os("CRAT_A5_SITE_REPAIR_W14_PAIR").expect("preserved W14 pair ledger"),
+    );
+    let shard = std::path::PathBuf::from(
+        std::env::var_os("CRAT_A5_SITE_REPAIR_SHARD").expect("site-repair shard output"),
+    );
+    let program = super::collect_program(tcx);
+    let slots = CrateSlots::build(&program);
+    let model = read_preserved_model(&model_path, &program, &slots).expect("preserved baseline");
+    let origins = compute_origins(&program);
+    let mutability = MutFacts::from_program(&program);
+    let plan = produce_a5_plan(
+        &program,
+        &slots,
+        origins.native_flows(),
+        &mutability,
+        &model,
+        A5Mode::PreciseReplay,
+        Some(WholeProgramAttestation::FrozenBenchmarkGraph),
+    )
+    .expect("repaired A5 plan");
+    fs::create_dir_all(&shard).expect("create repaired-plan shard");
+    fs::write(
+        shard.join("summary.tsv"),
+        &plan.summary_artifact.summary_tsv,
+    )
+    .expect("write repaired summary");
+    fs::write(
+        shard.join("construction-receipt.txt"),
+        format!(
+            "status=ok\ndata=false\na5_raw_site_pairs={}\na5_raw_site_mut_mut={}\na5_raw_site_mut_read_only={}\na5_raw_site_shared_shared={}\n",
+            plan.stats.raw_site_pairs,
+            plan.stats.raw_site_mut_mut,
+            plan.stats.raw_site_mut_read_only,
+            plan.stats.raw_site_shared_shared,
+        ),
+    )
+    .expect("write repaired-plan receipt");
+    fs::copy(&w14_path, shard.join("w14-pair-ledger.tsv"))
+        .expect("install preserved W14 pair ledger beside repaired plan");
+    row.set("a5_raw_pairs", plan.stats.raw_pairs);
+    row.set("a5_effective_pairs", plan.stats.effective_pairs);
+    row.set("a5_production_pair_den", plan.stats.raw_site_pairs);
+    row.set("a5_production_mut_mut", plan.stats.raw_site_mut_mut);
+    row.set(
+        "a5_production_mut_read_only",
+        plan.stats.raw_site_mut_read_only,
+    );
+    row.set(
+        "a5_production_shared_shared",
+        plan.stats.raw_site_shared_shared,
+    );
+    row.set("a5_planned_marks", plan.stats.planned_marks);
+    row.set("status", "ok");
+    row.set("t_total_s", t0.elapsed().as_secs_f64());
+    row
+}
+
 fn batch_sha256(path: &Path) -> Result<String, String> {
     let bytes = fs::read(path).map_err(|error| format!("read {}: {error}", path.display()))?;
     Ok(format!("{:x}", Sha256::digest(bytes)))
@@ -3342,6 +3414,87 @@ fn a5_production_site_join_diagnostic() {
         ),
     )
     .expect("write production-site join receipt");
+}
+
+#[test]
+#[ignore = "A5 repaired producer plan-only 20-program differential"]
+fn a5_site_repair_plan_diagnostic() {
+    let launch_root = std::path::PathBuf::from(
+        std::env::var_os("CRAT_A5_SITE_REPAIR_LAUNCH_ROOT").expect("launch-4 artifact root"),
+    );
+    let output = super::orchestrate::out_dir().join("a5-site-repair-plan");
+    let repaired = output.join("precise");
+    fs::create_dir_all(&repaired).expect("create repaired-plan output");
+    let root = super::orchestrate::workspace_root();
+    let timeout = Duration::from_secs(14_400);
+    let mut rows = Vec::new();
+    for program in super::CORPUS {
+        let shard = repaired.join(program.name);
+        let common = vec![
+            (
+                "CRAT_A5_SITE_REPAIR_BASELINE_MODEL",
+                launch_root
+                    .join("baseline")
+                    .join(program.name)
+                    .join("model.tsv")
+                    .display()
+                    .to_string(),
+            ),
+            (
+                "CRAT_A5_SITE_REPAIR_W14_PAIR",
+                launch_root
+                    .join("precise")
+                    .join(program.name)
+                    .join("w14-pair-ledger.tsv")
+                    .display()
+                    .to_string(),
+            ),
+            ("CRAT_A5_SITE_REPAIR_SHARD", shard.display().to_string()),
+        ];
+        let child = super::orchestrate::run_child_labeled(
+            program.name,
+            &program.input_path(&root),
+            "a5-site-repair-plan",
+            "a5-site-repair-plan",
+            timeout,
+            &common,
+        );
+        let row = child.row.unwrap_or_default();
+        if child.status != "ok" || row.get("status") != Some("ok") {
+            fs::write(
+                output.join("receipt.txt"),
+                format!(
+                    "status=failed\ndata=false\nprogram={}\nchild_status={}\nnote={}\n",
+                    program.name, child.status, child.note
+                ),
+            )
+            .expect("write repaired-plan failure receipt");
+            panic!(
+                "A5 repaired-plan STOP: {} status={}",
+                program.name, child.status
+            );
+        }
+        rows.push(row);
+        fs::write(
+            output.join("per-program.csv"),
+            super::report::render_csv(&rows),
+        )
+        .expect("write repaired-plan partial rows");
+    }
+    let sum = |key| rows.iter().map(|row| batch_number(row, key)).sum::<usize>();
+    assert_eq!(sum("a5_production_pair_den"), 5_555);
+    assert_eq!(sum("a5_production_mut_mut"), 2_391);
+    assert_eq!(sum("a5_production_mut_read_only"), 2_480);
+    assert_eq!(sum("a5_production_shared_shared"), 684);
+    fs::write(
+        output.join("receipt.txt"),
+        format!(
+            "schema=a5-site-repair-plan-v1\nstatus=ok\ndata=false\nanalysis_head={}\nprograms=20\nproduction_site_pairs=5555\nproduction_mut_mut=2391\nproduction_mut_read_only=2480\nproduction_shared_shared=684\nplanned_marks={}\n",
+            super::orchestrate::git_sha(),
+            sum("a5_planned_marks")
+        ),
+    )
+    .expect("write repaired-plan receipt");
 }
 
 fn finish_a5_item22_batch(

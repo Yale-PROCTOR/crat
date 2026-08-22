@@ -14208,6 +14208,7 @@ fn boc1_run_one() {
             "a5-production-site-join" => {
                 a5_measurement::run_production_site_join_worker(tcx, t_tcx)
             }
+            "a5-site-repair-plan" => a5_measurement::run_a5_site_repair_plan_worker(tcx, t_tcx),
             "copy-lend-funnel" => copy_lend_funnel::run_worker(tcx, t_tcx),
             "copy-lend-funnel-subjects" => copy_lend_funnel::run_subject_worker(tcx, t_tcx),
             "p-b" => p_b_measurement::run_worker(tcx, t_tcx),

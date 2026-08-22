@@ -408,6 +408,19 @@ fn type_filters(
     (agree, copy_scalar, expected.map(|ty| ty.to_string()))
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SiteSeedDisposition {
+    Direct,
+    Excluded,
+}
+
+fn site_seed_disposition(verdict: PairClass) -> SiteSeedDisposition {
+    match verdict {
+        PairClass::NotProvenDisjoint => SiteSeedDisposition::Direct,
+        PairClass::ProvenDisjoint => SiteSeedDisposition::Excluded,
+    }
+}
+
 pub(crate) fn produce_a5_plan(
     program: &RustProgram<'_>,
     slots: &CrateSlots,
@@ -557,7 +570,7 @@ pub(crate) fn produce_a5_plan(
                     if facts.projection_disjoint {
                         continue;
                     }
-                    let (dependencies, dependencies_complete, shares_argument_origin) =
+                    let (dependencies, _dependencies_complete, _shares_argument_origin) =
                         caller_pair_dependencies(
                             &body,
                             flow,
@@ -565,12 +578,8 @@ pub(crate) fn produce_a5_plan(
                             &args[left].node,
                             &args[right].node,
                         );
-                    let direct = classify_pair(&facts) == PairClass::NotProvenDisjoint
-                        && (dependencies.is_empty()
-                            || !dependencies_complete
-                            || shares_argument_origin
-                            || facts.storage_alias);
-                    if !direct && dependencies.is_empty() {
+                    let disposition = site_seed_disposition(classify_pair(&facts));
+                    if disposition == SiteSeedDisposition::Excluded {
                         continue;
                     }
                     // Summary transfer is a value-flow fact, not a selected-
@@ -588,7 +597,7 @@ pub(crate) fn produce_a5_plan(
                             MirLocationKey::new(block.as_u32(), data.statements.len()),
                         )
                         .expect("distinct params");
-                        if direct {
+                        if disposition == SiteSeedDisposition::Direct {
                             transfers.push(CallTransfer::direct(key));
                         }
                         for &dependency in &dependencies {
@@ -840,6 +849,20 @@ mod tests {
         .expect("baseline construction");
         verify_bo_construction(program, slots, origins, &solver, &construction, mutability)
             .expect("baseline model")
+    }
+
+    #[test]
+    fn shared_classifier_alone_decides_production_site_scope() {
+        assert_eq!(
+            site_seed_disposition(PairClass::NotProvenDisjoint),
+            SiteSeedDisposition::Direct,
+            "a registered risky site must not be demoted to forwarded-only by dependency shape"
+        );
+        assert_eq!(
+            site_seed_disposition(PairClass::ProvenDisjoint),
+            SiteSeedDisposition::Excluded,
+            "a proven-disjoint site must not enter through forwarded dependencies"
+        );
     }
 
     #[test]
