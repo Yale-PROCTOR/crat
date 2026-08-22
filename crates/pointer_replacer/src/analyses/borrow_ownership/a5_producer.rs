@@ -410,13 +410,15 @@ fn type_filters(
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SiteSeedDisposition {
-    Direct,
+    DirectAndRecord,
+    ForwardOnly,
     Excluded,
 }
 
-fn site_seed_disposition(verdict: PairClass) -> SiteSeedDisposition {
+fn site_seed_disposition(verdict: PairClass, dependencies_empty: bool) -> SiteSeedDisposition {
     match verdict {
-        PairClass::NotProvenDisjoint => SiteSeedDisposition::Direct,
+        PairClass::NotProvenDisjoint => SiteSeedDisposition::DirectAndRecord,
+        PairClass::ProvenDisjoint if !dependencies_empty => SiteSeedDisposition::ForwardOnly,
         PairClass::ProvenDisjoint => SiteSeedDisposition::Excluded,
     }
 }
@@ -578,7 +580,8 @@ pub(crate) fn produce_a5_plan(
                             &args[left].node,
                             &args[right].node,
                         );
-                    let disposition = site_seed_disposition(classify_pair(&facts));
+                    let disposition =
+                        site_seed_disposition(classify_pair(&facts), dependencies.is_empty());
                     if disposition == SiteSeedDisposition::Excluded {
                         continue;
                     }
@@ -597,12 +600,15 @@ pub(crate) fn produce_a5_plan(
                             MirLocationKey::new(block.as_u32(), data.statements.len()),
                         )
                         .expect("distinct params");
-                        if disposition == SiteSeedDisposition::Direct {
+                        if disposition == SiteSeedDisposition::DirectAndRecord {
                             transfers.push(CallTransfer::direct(key));
                         }
                         for &dependency in &dependencies {
                             transfers.push(CallTransfer::forwarded(key, dependency)?);
                         }
+                    }
+                    if disposition == SiteSeedDisposition::ForwardOnly {
+                        continue;
                     }
                     let left_slots = targets
                         .iter()
@@ -854,14 +860,24 @@ mod tests {
     #[test]
     fn shared_classifier_alone_decides_production_site_scope() {
         assert_eq!(
-            site_seed_disposition(PairClass::NotProvenDisjoint),
-            SiteSeedDisposition::Direct,
+            site_seed_disposition(PairClass::NotProvenDisjoint, false),
+            SiteSeedDisposition::DirectAndRecord,
             "a registered risky site must not be demoted to forwarded-only by dependency shape"
         );
         assert_eq!(
-            site_seed_disposition(PairClass::ProvenDisjoint),
+            site_seed_disposition(PairClass::NotProvenDisjoint, true),
+            SiteSeedDisposition::DirectAndRecord,
+            "a registered risky site with no dependencies is still direct"
+        );
+        assert_eq!(
+            site_seed_disposition(PairClass::ProvenDisjoint, true),
             SiteSeedDisposition::Excluded,
-            "a proven-disjoint site must not enter through forwarded dependencies"
+            "the empty-dependency flag is not inverted"
+        );
+        assert_eq!(
+            site_seed_disposition(PairClass::ProvenDisjoint, false),
+            SiteSeedDisposition::ForwardOnly,
+            "a proven-disjoint site may transfer dependencies without entering the site ledger"
         );
     }
 
