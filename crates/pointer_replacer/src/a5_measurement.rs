@@ -53,6 +53,7 @@ const BASE_SENTINEL: &str = "A5P1BASE ";
 const PAIR_SENTINEL: &str = "A5P1PAIR\t";
 const W14_PAIR_SENTINEL: &str = "A5W14PAIR\t";
 const W14_EXPOSURE_SENTINEL: &str = "A5W14EXPOSURE\t";
+const REPLAY_SAFE_DEFINITION: &str = "no incompatible access derived by precise replay with the effective parameter-overlap map injected; O2 closed-world frozen graph.";
 const CLOSED_WORLD_FRAME_UNKNOWN_REACHABLE: usize = 2_318;
 const CLOSED_WORLD_FRAME_LOCAL_FUNCTIONS: usize = 2_456;
 
@@ -144,6 +145,7 @@ enum ExposureClass {
     Demoted,
     Marked,
     SharedSafe,
+    ReplaySafe,
     Unresolved,
 }
 
@@ -153,6 +155,7 @@ impl ExposureClass {
             Self::Demoted => "demoted",
             Self::Marked => "marked",
             Self::SharedSafe => "shared-safe",
+            Self::ReplaySafe => "replay-safe",
             Self::Unresolved => "unresolved",
         }
     }
@@ -165,6 +168,9 @@ struct ExposureLedgerRow {
     baseline: SlotKind,
     precise: SlotKind,
     class: ExposureClass,
+    effective_mut_mut: bool,
+    effective_mut_read_only: bool,
+    effective_shared_shared: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -840,8 +846,19 @@ fn build_exposure_ledger(
             .get(&formal)
             .copied()
             .ok_or_else(|| format!("W14 precise model lacks {formal:?}"))?;
+        let effective_mut_mut = rows
+            .iter()
+            .any(|row| row.effective_overlap && row.pair.class == PairMutability::MutMut);
+        let effective_mut_read_only = rows
+            .iter()
+            .any(|row| row.effective_overlap && row.pair.class == PairMutability::MutReadOnly);
+        let effective_shared_shared = rows
+            .iter()
+            .any(|row| row.effective_overlap && row.pair.class == PairMutability::SharedShared);
         let class = if precise_kind != SlotKind::Ref {
             ExposureClass::Demoted
+        } else if rows.iter().any(|row| row.selected_mark) {
+            ExposureClass::Marked
         } else {
             let non_shared = rows
                 .iter()
@@ -850,8 +867,8 @@ fn build_exposure_ledger(
                 .collect::<Vec<_>>();
             if non_shared.is_empty() {
                 ExposureClass::SharedSafe
-            } else if non_shared.iter().all(|row| row.selected_mark) {
-                ExposureClass::Marked
+            } else if effective_mut_mut || effective_mut_read_only {
+                ExposureClass::ReplaySafe
             } else {
                 ExposureClass::Unresolved
             }
@@ -862,6 +879,9 @@ fn build_exposure_ledger(
             baseline: baseline_kind,
             precise: precise_kind,
             class,
+            effective_mut_mut,
+            effective_mut_read_only,
+            effective_shared_shared,
         });
     }
     Ok(answer)
@@ -1808,6 +1828,17 @@ pub(super) fn run_worker(tcx: TyCtxt<'_>, t_tcx: Duration) -> super::report::Row
                         .filter(|row| row.class == class)
                         .count()
                 };
+                let incidence_count = |mut_mut, mut_read_only, shared_shared| {
+                    w14.exposures
+                        .iter()
+                        .filter(|row| {
+                            matches!(row.class, ExposureClass::Marked | ExposureClass::ReplaySafe)
+                                && row.effective_mut_mut == mut_mut
+                                && row.effective_mut_read_only == mut_read_only
+                                && row.effective_shared_shared == shared_shared
+                        })
+                        .count()
+                };
                 row.set("a5_w14_pairs", w14.pairs.len());
                 row.set(
                     "a5_w14_effective_pairs",
@@ -1839,9 +1870,18 @@ pub(super) fn run_worker(tcx: TyCtxt<'_>, t_tcx: Duration) -> super::report::Row
                     exposure_count(ExposureClass::SharedSafe),
                 );
                 row.set(
+                    "a5_w14_replay_safe",
+                    exposure_count(ExposureClass::ReplaySafe),
+                );
+                row.set(
                     "a5_w14_unresolved",
                     exposure_count(ExposureClass::Unresolved),
                 );
+                row.set("a5_w14_incidence_m", incidence_count(true, false, false));
+                row.set("a5_w14_incidence_mr", incidence_count(true, true, false));
+                row.set("a5_w14_incidence_r", incidence_count(false, true, false));
+                row.set("a5_w14_incidence_rs", incidence_count(false, true, true));
+                row.set("a5_w14_replay_safe_definition", REPLAY_SAFE_DEFINITION);
                 row.set("a5_w14_precise_rounds", w14.precise_rounds);
             }
             println!("{}", render_count_line(counts));
@@ -2044,8 +2084,14 @@ fn render_extended_pair_line(row: &ExtendedPairLedgerRow) -> String {
 }
 
 fn render_exposure_line(row: &ExposureLedgerRow) -> String {
+    let incidence = format!(
+        "{}{}{}",
+        if row.effective_mut_mut { "M" } else { "" },
+        if row.effective_mut_read_only { "R" } else { "" },
+        if row.effective_shared_shared { "S" } else { "" },
+    );
     format!(
-        "{W14_EXPOSURE_SENTINEL}{}\t{}\t{}\t{}\t{}\t{}\t{}->{}\t{}\tbaseline\tprecise_replay\tclosed_world_frozen_graph\tpermitted:measurement-frozen-graph-attested",
+        "{W14_EXPOSURE_SENTINEL}{}\t{}\t{}\t{}\t{}\t{}\t{}->{}\t{}\tbaseline\tprecise_replay\tclosed_world_frozen_graph\tpermitted:measurement-frozen-graph-attested\t{}\t{}\t{}\t{}",
         row.program,
         row.formal.function,
         row.formal.parameter,
@@ -2055,6 +2101,14 @@ fn render_exposure_line(row: &ExposureLedgerRow) -> String {
         kind_label(row.baseline),
         kind_label(row.precise),
         row.class.label(),
+        usize::from(row.effective_mut_mut),
+        usize::from(row.effective_mut_read_only),
+        usize::from(row.effective_shared_shared),
+        if incidence.is_empty() {
+            "none"
+        } else {
+            &incidence
+        },
     )
 }
 
@@ -2357,7 +2411,7 @@ fn parse_w14_ledgers(
             .expect("filtered W14 exposure")
             .split('\t')
             .collect::<Vec<_>>();
-        if columns.len() != 12
+        if !matches!(columns.len(), 12 | 16)
             || columns[0] != counts.program
             || columns[4] != "ref"
             || columns[8..]
@@ -2729,8 +2783,9 @@ fn a5_p1_corpus() {
             format!(
                 "status=ok\ndata=true\nprogram=brotli\nanalysis_head={analysis_head}\n\
                  copy_lend_mode=baseline\na5_mode=precise_replay\na5_world=closed_world_frozen_graph\n\
+                 replay_safe_definition={}\n\
                  mem_cap_mib=49152\npeak_rss_kb={}\nwall_s={:.3}\n",
-                outcome.peak_rss_kb, outcome.wall_s,
+                REPLAY_SAFE_DEFINITION, outcome.peak_rss_kb, outcome.wall_s,
             ),
         )
         .expect("write W14 recovery receipt");
@@ -3260,14 +3315,28 @@ fn a5_p1_corpus() {
             classifier_sum("a5_w14_demoted"),
             classifier_sum("a5_w14_marked"),
             classifier_sum("a5_w14_shared_safe"),
+            classifier_sum("a5_w14_replay_safe"),
             classifier_sum("a5_w14_unresolved"),
             classifier_sum("a5_w14_precise_rounds"),
+            classifier_sum("a5_w14_incidence_m"),
+            classifier_sum("a5_w14_incidence_mr"),
+            classifier_sum("a5_w14_incidence_r"),
+            classifier_sum("a5_w14_incidence_rs"),
         ];
         assert_eq!(values[0], 5_555, "W14 pair denominator moved");
         assert_eq!(values[2], 4, "W14 planned-mark count moved");
         assert_eq!(values[2], values[3] + values[4]);
         assert_eq!(values[5], 2_014, "W14 exposure denominator moved");
-        assert_eq!(values[6] + values[7] + values[8] + values[9], values[5]);
+        assert_eq!(values[6], 389, "W14 demoted exposure count moved");
+        assert_eq!(values[7], 2, "W14 marked exposure count moved");
+        assert_eq!(values[8], 114, "W14 shared-safe exposure count moved");
+        assert_eq!(values[9], 1_509, "W14 replay-safe exposure count moved");
+        assert_eq!(values[10], 0, "W14 unresolved exposure residual");
+        assert_eq!(
+            values[6] + values[7] + values[8] + values[9] + values[10],
+            values[5]
+        );
+        assert_eq!(values[12..16], [319, 336, 558, 298]);
         values
     });
 
@@ -3281,10 +3350,10 @@ fn a5_p1_corpus() {
         "program\tsite\tleft_argument\tright_argument\tclass\ttarget_formals\tleft_formals\tright_formals\traw_overlap\teffective_overlap\tmarkability\tretained_mark\tcopy_lend_mode\ta5_mode\ta5_world\ta5_abi_guard\tplanned_mark\tmodel_attribution\n",
     );
     let mut w14_exposure_ledger = String::from(
-        "program\tfunction\tparameter\tdepth\tbaseline_kind\tprecise_kind\tmovement\tclass\tcopy_lend_mode\ta5_mode\ta5_world\ta5_abi_guard\n",
+        "program\tfunction\tparameter\tdepth\tbaseline_kind\tprecise_kind\tmovement\tclass\tcopy_lend_mode\ta5_mode\ta5_world\ta5_abi_guard\teffective_mut_mut\teffective_mut_read_only\teffective_shared_shared\tincidence\n",
     );
     let mut w14_programs = String::from(
-        "program\tpairs\teffective_pairs\tplanned_marks\tretained_marks\tdemoted_by_model\texposures\tdemoted\tmarked\tshared_safe\tunresolved\tprecise_rounds\n",
+        "program\tpairs\teffective_pairs\tplanned_marks\tretained_marks\tdemoted_by_model\texposures\tdemoted\tmarked\tshared_safe\treplay_safe\tunresolved\tprecise_rounds\tincidence_m\tincidence_mr\tincidence_r\tincidence_rs\n",
     );
     let mut tsv = String::from(
         "program\tc1\tc2\tc3\tc3_depth0\tcg_num\tcg_den\tpair_den\tmut_mut\tmut_read_only\tshared_shared\tsite_mut_mut\tsite_mut_read_only\tsite_shared_shared\tmut_default_fires\tcalls_total\tdirect_local\tindirect_local\tdirect_external\tindirect_unresolved\tnon_fn_def_constant\tt_origins_s\tt_andersen_s\tt_model_s\twall_s\n",
@@ -3337,7 +3406,7 @@ fn a5_p1_corpus() {
                     .unwrap_or_else(|| panic!("{} missing {key}", program.name))
             };
             w14_programs.push_str(&format!(
-                "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+                "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
                 program.name,
                 get_w14("a5_w14_pairs"),
                 get_w14("a5_w14_effective_pairs"),
@@ -3350,8 +3419,13 @@ fn a5_p1_corpus() {
                 get_w14("a5_w14_demoted"),
                 get_w14("a5_w14_marked"),
                 get_w14("a5_w14_shared_safe"),
+                get_w14("a5_w14_replay_safe"),
                 get_w14("a5_w14_unresolved"),
                 get_w14("a5_w14_precise_rounds"),
+                get_w14("a5_w14_incidence_m"),
+                get_w14("a5_w14_incidence_mr"),
+                get_w14("a5_w14_incidence_r"),
+                get_w14("a5_w14_incidence_rs"),
             ));
         }
         let get = |key: &str| run.metadata.get(key).unwrap_or("missing");
@@ -3491,7 +3565,7 @@ fn a5_p1_corpus() {
         .map(|value| format!("{value:.3}"))
         .unwrap_or_else(|| "not-applicable".to_owned());
     let provenance = format!(
-        "date={DATE}\nanalysis_worktree_head={analysis_head}\nanalysis_semantics_head={ANALYSIS_SEMANTICS_HEAD}\ncopy_lend_mode=baseline\nfoster_fact_producer=MutFacts::from_program(mutability_analysis+SourceVarGroups::postprocess_mut_res)\nsnapshot_role=identity-and-pointer-depth-cross-check-only\nsnapshot_producer_head={SNAPSHOT_PRODUCER_HEAD}\nsnapshot_producer_branch_head={SNAPSHOT_PRODUCER_BRANCH_HEAD}\nsnapshot_producer_branch_delta=one-test-only-commit-after-capture\nmanifest_commit={MANIFEST_COMMIT}\nraw_frozen_corpus_sha256={RAW_FROZEN_DIGEST}\nderived_substrate_sha256={DERIVED_SUBSTRATE_DIGEST}\nsubstrate=derived\nsubstrate_selector={}\nrepair=mode_a\nl2=0\nsafe_mono=per_site\nfork_engine=fork\nmutability_facts=on-direct-from-program\nz3_smt_seed=0\nz3_sat_seed=0\ncorpus_shape=read-only-symlink-to-main-checkout-derived-corpus\ncorpus_link={}\ncorpus_target={}\nsnapshot={}\ndeps_shape={}\ndeps_link={}\ndeps_target={}\ndeps_rlibs={}\ndeps_bytemuck_derive=present\nresolver_DIR={}\nresolver_CWD={}\nbase_timeout_s={}\ndeep_timeout_s={}\ncurrent_head_baseline_model_programs={}\npreserved_base_dir={}\npreserved_base_rows={}\npreserved_base_hash_manifest_sha256={}\npreserved_base_wall_source=child-t_total_s\npreserved_final_dir={}\npreserved_final_rows={}\npreserved_final_hash_manifest_sha256={}\npreserved_final_wall_source=child-t_total_s\nbrotli_recovery_mem_cap_mib={}\nbrotli_recovery_peak_rss_kb={}\nbrotli_depth_recovery_mem_cap_mib={}\nbrotli_depth_recovery_peak_rss_kb={}\nbrotli_depth_recovery_wall_s={}\nbrotli_single_file_side_effect=derived-expand-collapsed-to-about-500k-sloc\n",
+        "date={DATE}\nanalysis_worktree_head={analysis_head}\nanalysis_semantics_head={ANALYSIS_SEMANTICS_HEAD}\ncopy_lend_mode=baseline\nfoster_fact_producer=MutFacts::from_program(mutability_analysis+SourceVarGroups::postprocess_mut_res)\nsnapshot_role=identity-and-pointer-depth-cross-check-only\nsnapshot_producer_head={SNAPSHOT_PRODUCER_HEAD}\nsnapshot_producer_branch_head={SNAPSHOT_PRODUCER_BRANCH_HEAD}\nsnapshot_producer_branch_delta=one-test-only-commit-after-capture\nmanifest_commit={MANIFEST_COMMIT}\nraw_frozen_corpus_sha256={RAW_FROZEN_DIGEST}\nderived_substrate_sha256={DERIVED_SUBSTRATE_DIGEST}\nreplay_safe_definition={REPLAY_SAFE_DEFINITION}\nsubstrate=derived\nsubstrate_selector={}\nrepair=mode_a\nl2=0\nsafe_mono=per_site\nfork_engine=fork\nmutability_facts=on-direct-from-program\nz3_smt_seed=0\nz3_sat_seed=0\ncorpus_shape=read-only-symlink-to-main-checkout-derived-corpus\ncorpus_link={}\ncorpus_target={}\nsnapshot={}\ndeps_shape={}\ndeps_link={}\ndeps_target={}\ndeps_rlibs={}\ndeps_bytemuck_derive=present\nresolver_DIR={}\nresolver_CWD={}\nbase_timeout_s={}\ndeep_timeout_s={}\ncurrent_head_baseline_model_programs={}\npreserved_base_dir={}\npreserved_base_rows={}\npreserved_base_hash_manifest_sha256={}\npreserved_base_wall_source=child-t_total_s\npreserved_final_dir={}\npreserved_final_rows={}\npreserved_final_hash_manifest_sha256={}\npreserved_final_wall_source=child-t_total_s\nbrotli_recovery_mem_cap_mib={}\nbrotli_recovery_peak_rss_kb={}\nbrotli_depth_recovery_mem_cap_mib={}\nbrotli_depth_recovery_peak_rss_kb={}\nbrotli_depth_recovery_wall_s={}\nbrotli_single_file_side_effect=derived-expand-collapsed-to-about-500k-sloc\n",
         substrate_selector.as_deref().unwrap_or("default-derived"),
         corpus_link.display(),
         corpus_target.display(),
@@ -3544,10 +3618,12 @@ fn a5_p1_corpus() {
                  unknown_caller_seeding=false\na5_abi_guard=permitted:measurement-frozen-graph-attested\n\
                  pairs={}\neffective_pairs={}\nplanned_marks={}\nretained_marks={}\n\
                  demoted_by_model={}\nexposures={}\n\
-                 demoted={}\nmarked={}\nshared_safe={}\nunresolved={}\nprecise_rounds={}\n\
+                 demoted={}\nmarked={}\nshared_safe={}\nreplay_safe={}\nunresolved={}\n\
+                 precise_rounds={}\nincidence_m={}\nincidence_mr={}\nincidence_r={}\nincidence_rs={}\n\
+                 replay_safe_definition={}\n\
                  pair_partition=5555=2391+2480+684\n",
-                if values[9] == 0 { "ok" } else { "unresolved" },
-                values[9] == 0,
+                if values[10] == 0 { "ok" } else { "unresolved" },
+                values[10] == 0,
                 values[0],
                 values[1],
                 values[2],
@@ -3559,6 +3635,12 @@ fn a5_p1_corpus() {
                 values[8],
                 values[9],
                 values[10],
+                values[11],
+                values[12],
+                values[13],
+                values[14],
+                values[15],
+                REPLAY_SAFE_DEFINITION,
             ),
         )
         .expect("write W14 receipt");
@@ -3572,9 +3654,11 @@ fn a5_p1_corpus() {
             format!(
                 "status=ok\ndata=true\nanalysis_head={analysis_head}\na5_world=closed_world_frozen_graph\n\
                  a5_mode=classifier_differential\na5_abi_guard=not-yet-consumed-item4\n\
+                 replay_safe_definition={}\n\
                  classifier_api=shared-v1\nlegacy_oracle=count5-private-v1\n\
                  candidates={}\nnot_proven_disjoint={}\nbyte_mismatches={}\n\
                  pair_partition=5555=2391+2480+684\nunresolved=0\n",
+                REPLAY_SAFE_DEFINITION,
                 classifier_candidates.expect("differential candidate total"),
                 classifier_not_proven.expect("differential NotProven total"),
                 classifier_byte_mismatches.expect("differential mismatch total"),
@@ -3604,11 +3688,13 @@ fn a5_p1_corpus() {
             format!(
                 "status=ok\ndata=true\nanalysis_head={analysis_head}\na5_world=closed_world_frozen_graph\n\
                  a5_mode=precise_replay\nunknown_caller_seeding=false\ndenominator={den}\n\
+                 replay_safe_definition={}\n\
                  markable={markable}\nread_after_write={read_after}\nopaque_escape={opaque}\n\
                  recursive={recursive}\nvolatile_or_atomic={volatile}\nunresolved={unresolved}\n\
                  target_type_mismatch={type_mismatch}\nnoncopy_scalar={noncopy}\n\
                  final_markable={final_markable}\nall_witness_demoted={all_witness_demoted}\n\
-                 filter_unresolved={filter_unresolved}\n"
+                 filter_unresolved={filter_unresolved}\n",
+                REPLAY_SAFE_DEFINITION,
             ),
         )
         .expect("write snapshot coverage receipt");
@@ -3616,7 +3702,7 @@ fn a5_p1_corpus() {
     println!("{}", render_count_line(&total));
     if let Some(values) = w14_totals {
         assert_eq!(
-            values[9], 0,
+            values[10], 0,
             "W14 unresolved exposure residual; artifacts preserved for STOP"
         );
     }
@@ -3808,6 +3894,32 @@ mod tests {
         .expect("reverse W14 pair measurement");
         assert_eq!(measured.extended_pairs, reversed.extended_pairs);
         assert_eq!(measured.final_marks, reversed.final_marks);
+
+        let kinds = measured
+            .extended_pairs
+            .iter()
+            .flat_map(|row| row.left_formals.iter().chain(&row.right_formals))
+            .cloned()
+            .map(|formal| (formal, SlotKind::Ref))
+            .collect::<BTreeMap<_, _>>();
+        let model = AcceptedFormalModel {
+            refs: BTreeMap::new(),
+            kinds,
+        };
+        let exposure = build_exposure_ledger(
+            "fixture",
+            &measured.extended_pairs,
+            measured.counts.attributed_predicted_refs_depth0,
+            &model,
+            &model,
+        )
+        .expect("replay-safe exposure");
+        assert!(exposure.iter().all(|row| {
+            row.class == ExposureClass::ReplaySafe
+                && !row.effective_mut_mut
+                && row.effective_mut_read_only
+                && !row.effective_shared_shared
+        }));
     }
 
     #[test]
