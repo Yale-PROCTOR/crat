@@ -2168,6 +2168,222 @@ pub(super) fn run_w14_drift_trace_worker(tcx: TyCtxt<'_>, t_tcx: Duration) -> su
     row
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct ProductionSiteKey {
+    callee: u32,
+    left_parameter: u32,
+    right_parameter: u32,
+    caller: u32,
+    block: u32,
+}
+
+fn parse_w14_site(site: &str) -> Result<(&str, u32), String> {
+    let marker = site
+        .find(":bb")
+        .ok_or_else(|| format!("W14 site lacks MIR block: {site}"))?;
+    let caller = &site[..marker];
+    let suffix = &site[marker + 3..];
+    let end = suffix
+        .find(':')
+        .ok_or_else(|| format!("W14 site lacks block terminator: {site}"))?;
+    let block = suffix[..end]
+        .parse()
+        .map_err(|error| format!("W14 site block: {error}"))?;
+    Ok((caller, block))
+}
+
+fn receipt_usize(receipt: &str, key: &str) -> Result<usize, String> {
+    receipt
+        .lines()
+        .find_map(|line| line.strip_prefix(&format!("{key}=")))
+        .ok_or_else(|| format!("receipt lacks {key}"))?
+        .parse()
+        .map_err(|error| format!("receipt {key}: {error}"))
+}
+
+pub(super) fn run_production_site_join_worker(
+    tcx: TyCtxt<'_>,
+    t_tcx: Duration,
+) -> super::report::Row {
+    let t0 = Instant::now();
+    let mut row = super::report::Row::default();
+    row.set("t_tcx_s", t_tcx.as_secs_f64());
+    row.set("data", "false");
+    row.set("join_kind", "registered-site-to-production-site-key");
+    let name = std::env::var("CRAT_BOC1_NAME").unwrap_or_else(|_| "unnamed".to_owned());
+    let pair_path = std::path::PathBuf::from(
+        std::env::var_os("CRAT_A5_SITE_JOIN_W14_PAIR").expect("W14 pair ledger"),
+    );
+    let summary_path = std::path::PathBuf::from(
+        std::env::var_os("CRAT_A5_SITE_JOIN_SUMMARY").expect("production summary"),
+    );
+    let receipt_path = std::path::PathBuf::from(
+        std::env::var_os("CRAT_A5_SITE_JOIN_RECEIPT").expect("construction receipt"),
+    );
+    let program = super::collect_program(tcx);
+    let path_to_did = program
+        .functions
+        .iter()
+        .copied()
+        .map(|did| {
+            (
+                tcx.def_path_str(did.to_def_id()),
+                did.local_def_index.as_u32(),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+
+    let summary = fs::read_to_string(&summary_path)
+        .unwrap_or_else(|error| panic!("read {}: {error}", summary_path.display()));
+    let mut summary_keys = BTreeSet::new();
+    let mut ambiguous_summary_keys = BTreeSet::new();
+    let mut statement_by_key = BTreeMap::new();
+    for (index, line) in summary.lines().enumerate() {
+        if index == 0 {
+            continue;
+        }
+        let fields = line.split('\t').collect::<Vec<_>>();
+        assert_eq!(fields.len(), 14, "summary row width");
+        let key = ProductionSiteKey {
+            callee: fields[0].parse().expect("summary callee"),
+            left_parameter: fields[1].parse().expect("summary left"),
+            right_parameter: fields[2].parse().expect("summary right"),
+            caller: fields[3].parse().expect("summary caller"),
+            block: fields[4].parse().expect("summary block"),
+        };
+        let statement = fields[5].parse::<usize>().expect("summary statement");
+        if statement_by_key
+            .insert(key.clone(), statement)
+            .is_some_and(|old| old != statement)
+        {
+            ambiguous_summary_keys.insert(key.clone());
+        }
+        summary_keys.insert(key);
+    }
+
+    let pairs = fs::read_to_string(&pair_path)
+        .unwrap_or_else(|error| panic!("read {}: {error}", pair_path.display()));
+    let mut registered_rows = 0usize;
+    let mut matched_rows = 0usize;
+    let mut unmatched_rows = 0usize;
+    let mut matched_keys = BTreeSet::new();
+    let mut expansions = BTreeMap::<ProductionSiteKey, usize>::new();
+    let mut class_by_key = BTreeMap::<ProductionSiteKey, String>::new();
+    let mut mixed_keys = BTreeSet::new();
+    let mut matched_class = BTreeMap::<String, usize>::new();
+    let mut unmatched_class = BTreeMap::<String, usize>::new();
+    for (index, line) in pairs.lines().enumerate() {
+        if index == 0 {
+            continue;
+        }
+        let fields = line.split('\t').collect::<Vec<_>>();
+        assert_eq!(fields.len(), 18, "W14 pair row width");
+        assert_eq!(fields[0], name, "W14 program identity");
+        assert!(!fields[5].contains('|'), "ambiguous W14 target set");
+        let (caller_path, block) = parse_w14_site(fields[1]).expect("W14 site identity");
+        let caller = path_to_did
+            .get(caller_path)
+            .copied()
+            .unwrap_or_else(|| panic!("W14 caller {caller_path} outside current program"));
+        let target = fields[5];
+        let target_path = target
+            .split_once('[')
+            .map(|(path, _)| path)
+            .expect("W14 target path");
+        let callee = path_to_did
+            .get(target_path)
+            .copied()
+            .unwrap_or_else(|| panic!("W14 callee {target_path} outside current program"));
+        let key = ProductionSiteKey {
+            callee,
+            left_parameter: fields[2].parse().expect("W14 left parameter"),
+            right_parameter: fields[3].parse().expect("W14 right parameter"),
+            caller,
+            block,
+        };
+        let class = fields[4].to_owned();
+        registered_rows += 1;
+        let matched = summary_keys.contains(&key);
+        if matched {
+            matched_rows += 1;
+            matched_keys.insert(key.clone());
+            *expansions.entry(key.clone()).or_default() += 1;
+            *matched_class.entry(class.clone()).or_default() += 1;
+            if class_by_key
+                .insert(key.clone(), class.clone())
+                .is_some_and(|old| old != class)
+            {
+                mixed_keys.insert(key.clone());
+            }
+        } else {
+            unmatched_rows += 1;
+            *unmatched_class.entry(class.clone()).or_default() += 1;
+        }
+        println!(
+            "A5SITEJOIN\t{name}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            caller_path,
+            block,
+            target_path,
+            fields[2],
+            fields[3],
+            class,
+            if matched { "matched" } else { "unmatched" }
+        );
+    }
+    let receipt = fs::read_to_string(&receipt_path)
+        .unwrap_or_else(|error| panic!("read {}: {error}", receipt_path.display()));
+    let production_pairs = receipt_usize(&receipt, "a5_raw_site_pairs").expect("site-pair count");
+    let production_mut_mut =
+        receipt_usize(&receipt, "a5_raw_site_mut_mut").expect("site mut-mut count");
+    let production_mut_read_only =
+        receipt_usize(&receipt, "a5_raw_site_mut_read_only").expect("site mut-read-only count");
+    let production_shared_shared =
+        receipt_usize(&receipt, "a5_raw_site_shared_shared").expect("site shared-shared count");
+    let multi_expansion = expansions.values().filter(|&&count| count != 1).count();
+    row.set("registered_site_rows", registered_rows);
+    row.set("production_site_pairs", production_pairs);
+    row.set("matched_registered_rows", matched_rows);
+    row.set("unique_matched_production_pairs", matched_keys.len());
+    row.set("registered_unmatched", unmatched_rows);
+    row.set(
+        "production_unmatched",
+        production_pairs.abs_diff(matched_keys.len()),
+    );
+    row.set("ambiguous_summary_keys", ambiguous_summary_keys.len());
+    row.set("mixed_class_pairs", mixed_keys.len());
+    row.set("multi_expansion_pairs", multi_expansion);
+    row.set(
+        "matched_mut_mut",
+        matched_class.get("mut_mut").copied().unwrap_or(0),
+    );
+    row.set(
+        "matched_mut_read_only",
+        matched_class.get("mut_read_only").copied().unwrap_or(0),
+    );
+    row.set(
+        "matched_shared_shared",
+        matched_class.get("shared_shared").copied().unwrap_or(0),
+    );
+    row.set(
+        "unmatched_mut_mut",
+        unmatched_class.get("mut_mut").copied().unwrap_or(0),
+    );
+    row.set(
+        "unmatched_mut_read_only",
+        unmatched_class.get("mut_read_only").copied().unwrap_or(0),
+    );
+    row.set(
+        "unmatched_shared_shared",
+        unmatched_class.get("shared_shared").copied().unwrap_or(0),
+    );
+    row.set("production_mut_mut", production_mut_mut);
+    row.set("production_mut_read_only", production_mut_read_only);
+    row.set("production_shared_shared", production_shared_shared);
+    row.set("status", "ok");
+    row.set("t_total_s", t0.elapsed().as_secs_f64());
+    row
+}
+
 fn batch_sha256(path: &Path) -> Result<String, String> {
     let bytes = fs::read(path).map_err(|error| format!("read {}: {error}", path.display()))?;
     Ok(format!("{:x}", Sha256::digest(bytes)))
@@ -3014,6 +3230,118 @@ fn a5_w14_drift_soundness_diagnostic() {
         ),
     )
     .expect("write W14 drift diagnostic receipt");
+}
+
+#[test]
+#[ignore = "A5 production-site versus registered-site exact join diagnostic"]
+fn a5_production_site_join_diagnostic() {
+    let launch_root = std::path::PathBuf::from(
+        std::env::var_os("CRAT_A5_SITE_JOIN_LAUNCH_ROOT").expect("launch-4 artifact root"),
+    );
+    let output = super::orchestrate::out_dir().join("a5-production-site-join");
+    fs::create_dir_all(&output).expect("create production-site join output");
+    let root = super::orchestrate::workspace_root();
+    let timeout = Duration::from_secs(14_400);
+    let mut rows = Vec::new();
+    for program in super::CORPUS {
+        let precise = launch_root.join("precise").join(program.name);
+        let common = vec![
+            (
+                "CRAT_A5_SITE_JOIN_W14_PAIR",
+                precise.join("w14-pair-ledger.tsv").display().to_string(),
+            ),
+            (
+                "CRAT_A5_SITE_JOIN_SUMMARY",
+                precise.join("summary.tsv").display().to_string(),
+            ),
+            (
+                "CRAT_A5_SITE_JOIN_RECEIPT",
+                precise
+                    .join("construction-receipt.txt")
+                    .display()
+                    .to_string(),
+            ),
+        ];
+        let child = super::orchestrate::run_child_labeled(
+            program.name,
+            &program.input_path(&root),
+            "a5-production-site-join",
+            "a5-production-site-join",
+            timeout,
+            &common,
+        );
+        let row = child.row.unwrap_or_default();
+        if child.status != "ok" || row.get("status") != Some("ok") {
+            fs::write(
+                output.join("receipt.txt"),
+                format!(
+                    "status=failed\ndata=false\nprogram={}\nchild_status={}\nnote={}\n",
+                    program.name, child.status, child.note
+                ),
+            )
+            .expect("write site-join failure receipt");
+            panic!(
+                "A5 production-site join STOP: {} status={}",
+                program.name, child.status
+            );
+        }
+        rows.push(row);
+        fs::write(
+            output.join("per-program.csv"),
+            super::report::render_csv(&rows),
+        )
+        .expect("write site-join partial rows");
+        fs::write(
+            output.join("partial-receipt.txt"),
+            format!(
+                "status=running\ndata=false\ncompleted_programs={}\nrequired_programs=20\n",
+                rows.len()
+            ),
+        )
+        .expect("write site-join partial receipt");
+    }
+    let sum = |key| rows.iter().map(|row| batch_number(row, key)).sum::<usize>();
+    assert_eq!(sum("registered_site_rows"), 5_555);
+    assert_eq!(sum("production_site_pairs"), 3_422);
+    assert_eq!(
+        sum("production_site_pairs"),
+        sum("production_mut_mut")
+            + sum("production_mut_read_only")
+            + sum("production_shared_shared")
+    );
+    let registered_unmatched = sum("registered_unmatched");
+    let production_unmatched = sum("production_unmatched");
+    let mixed = sum("mixed_class_pairs");
+    let ambiguous = sum("ambiguous_summary_keys");
+    let multi = sum("multi_expansion_pairs");
+    let status = if mixed != 0 || ambiguous != 0 {
+        "ambiguous"
+    } else if registered_unmatched != 0 || production_unmatched != 0 {
+        "scope-loss"
+    } else {
+        "exact-granularity"
+    };
+    fs::write(
+        output.join("receipt.txt"),
+        format!(
+            "schema=a5-production-site-join-v1\nstatus={status}\ndata=false\nanalysis_head={}\nregistered_site_rows={}\nproduction_site_pairs={}\nmatched_registered_rows={}\nunique_matched_production_pairs={}\nregistered_unmatched={registered_unmatched}\nproduction_unmatched={production_unmatched}\nmixed_class_pairs={mixed}\nambiguous_summary_keys={ambiguous}\nmulti_expansion_pairs={multi}\nmatched_mut_mut={}\nmatched_mut_read_only={}\nmatched_shared_shared={}\nunmatched_mut_mut={}\nunmatched_mut_read_only={}\nunmatched_shared_shared={}\nproduction_mut_mut={}\nproduction_mut_read_only={}\nproduction_shared_shared={}\nmodel_impact=changed-injected-facts-if-scope-restored\n",
+            super::orchestrate::git_sha(),
+            sum("registered_site_rows"),
+            sum("production_site_pairs"),
+            sum("matched_registered_rows"),
+            sum("unique_matched_production_pairs"),
+            sum("matched_mut_mut"),
+            sum("matched_mut_read_only"),
+            sum("matched_shared_shared"),
+            sum("unmatched_mut_mut"),
+            sum("unmatched_mut_read_only"),
+            sum("unmatched_shared_shared"),
+            sum("production_mut_mut"),
+            sum("production_mut_read_only"),
+            sum("production_shared_shared"),
+        ),
+    )
+    .expect("write production-site join receipt");
 }
 
 fn finish_a5_item22_batch(
