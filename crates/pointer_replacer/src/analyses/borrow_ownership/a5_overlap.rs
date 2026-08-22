@@ -1503,6 +1503,24 @@ mod tests {
     }
 
     #[test]
+    fn every_nonmarkable_snapshot_verdict_kills_discharge_at_the_all_witness_gate() {
+        for verdict in [
+            SnapshotVerdict::ReadAfterWrite,
+            SnapshotVerdict::OpaqueEscape,
+            SnapshotVerdict::Recursive,
+            SnapshotVerdict::VolatileOrAtomic,
+        ] {
+            assert!(
+                matches!(
+                    all_witnesses_gate([markability(verdict)]),
+                    AllWitnessesGate::Demote { .. }
+                ),
+                "{verdict:?} escaped the all-witness gate"
+            );
+        }
+    }
+
+    #[test]
     fn w9_one_unmarkable_witness_kills_partial_discharge() {
         assert!(matches!(
             all_witnesses_gate([
