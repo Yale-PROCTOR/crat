@@ -48,6 +48,7 @@ use super::{
     Decision, DecisionTable, Subject, SubjectKind,
     emitability::{ArgShape, EmitabilityFacts, RefKind},
 };
+use crate::analyses::borrow_ownership::{a5_overlap::PairSide, a5_producer::PlannedC9Mark};
 
 /// A node's identity — the same `(owner, binding)` key A1's emitability gates
 /// use, so a call argument that resolves to `Res::Local(b)` needs no
@@ -291,6 +292,41 @@ pub(crate) fn build(
     escapes: &[Escape],
     overlap: OverlapRule,
 ) -> CoConv {
+    build_with_c9_marks(facts, subjects, hypothetical, escapes, overlap, &[])
+}
+
+pub(crate) fn retained_c9_shared_params(
+    marks: &[PlannedC9Mark],
+    site: &super::emitability::CallSite,
+    callee: LocalDefId,
+) -> FxHashSet<usize> {
+    marks
+        .iter()
+        .filter(|mark| {
+            mark.caller_did == site.caller
+                && mark.call_span.lo() == site.span.lo()
+                && mark.call_span.hi() == site.span.hi()
+                && mark.key.pair.function() == callee.local_def_index.as_u32()
+        })
+        .filter_map(|mark| {
+            let params = mark.key.pair.params();
+            let shared = match mark.key.shared_side {
+                PairSide::Left => params.first(),
+                PairSide::Right => params.second(),
+            };
+            usize::try_from(shared).ok()?.checked_sub(1)
+        })
+        .collect()
+}
+
+pub(crate) fn build_with_c9_marks(
+    facts: &EmitabilityFacts,
+    subjects: &[Subject],
+    hypothetical: &DecisionTable,
+    escapes: &[Escape],
+    overlap: OverlapRule,
+    c9_marks: &[PlannedC9Mark],
+) -> CoConv {
     // ---- 1. the node set: subjects that would emit a PLAIN reference ----
     //
     // Slice and optional forms are deliberately excluded. `&mut [T]` and
@@ -392,6 +428,7 @@ pub(crate) fn build(
             .get(callee)
             .is_some_and(|refs| !RefKind::is_adaptable(refs));
         for site in &facts.call_args[callee] {
+            let marked_shared = retained_c9_shared_params(c9_marks, site, *callee);
             // **The within-site overlap gate runs FIRST**, and the ordering is
             // not cosmetic — it is reason honesty.
             //
@@ -417,6 +454,9 @@ pub(crate) fn build(
                 .args
                 .iter()
                 .filter_map(|arg| {
+                    if marked_shared.contains(&arg.index) {
+                        return None;
+                    }
                     let key = param_key
                         .get(&(*callee, arg.index))
                         .copied()
@@ -456,6 +496,13 @@ pub(crate) fn build(
             }
 
             for arg in &site.args {
+                // The retained C-9 temp replaces this argument with a fresh
+                // shared reference. It therefore contributes neither a
+                // duplicate-root conflict nor a caller/callee conversion
+                // edge at this site. Every other witness remains unchanged.
+                if marked_shared.contains(&arg.index) {
+                    continue;
+                }
                 let callee_subject = param_key.get(&(*callee, arg.index)).copied();
                 let callee_node = callee_subject.filter(|k| converts.contains(k));
 

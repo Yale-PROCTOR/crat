@@ -455,6 +455,23 @@ pub(crate) fn rewrite_m1_a5(
     )
 }
 
+#[cfg(test)]
+pub(crate) fn rewrite_m1_path_a5_injected(
+    root: &std::path::Path,
+    mode: A5Mode,
+    attestation: Option<WholeProgramAttestation>,
+    inject: &(dyn Fn(&mut decision::DecisionTable) + Sync),
+) -> RewriteOutcome {
+    rewrite_core_injected(
+        ::utils::compilation::path_to_input(root),
+        Some(root),
+        MAX_REVERT_ROUNDS,
+        inject,
+        false,
+        Some((mode, attestation)),
+    )
+}
+
 fn rewrite_core(
     input: rustc_session::config::Input,
     tree_base: Option<&std::path::Path>,
@@ -1839,6 +1856,15 @@ impl RewriteOutcome {
             Self::Emitted { a5_receipt, .. } | Self::Degraded { a5_receipt, .. } => a5_receipt,
         }
     }
+
+    #[cfg(test)]
+    pub(crate) fn reverted_count(&self) -> usize {
+        match self {
+            Self::Emitted { reverted_count, .. } | Self::Degraded { reverted_count, .. } => {
+                *reverted_count
+            }
+        }
+    }
 }
 
 impl OutcomeFacts {
@@ -2644,12 +2670,13 @@ fn finish_decide<'tcx>(
     // report, so `build` consumes them rather than the census reading them
     // alongside.
     let escapes = decision::co_conversion::escapes(tcx, &program.functions, &subjects);
-    let coconv = decision::co_conversion::build(
+    let coconv = decision::co_conversion::build_with_c9_marks(
         &facts,
         &subjects,
         &hypothetical,
         &escapes,
         decision::co_conversion::OverlapRule::BlindOnly,
+        &retained_c9_plans,
     );
     // **Production is decided AFTER the classes**, because step 2's gate reads
     // them. No cycle: the hypothetical above was decided with `None`.
@@ -2673,7 +2700,7 @@ fn finish_decide<'tcx>(
     // subject, including the nesting pass above: a seam is computed from the
     // forms both ends actually settle on, so a subject withdrawn later would
     // leave glue bridging to a form that no longer exists.
-    table.seams = decision::seam::synthesize(tcx, &facts, &subjects, &table);
+    table.seams = decision::seam::synthesize(tcx, &facts, &subjects, &table, &retained_c9_plans);
     table.c9_marks = retained_c9_plans.clone();
     let table = table;
 

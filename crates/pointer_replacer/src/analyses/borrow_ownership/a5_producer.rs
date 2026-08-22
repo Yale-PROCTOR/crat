@@ -960,11 +960,15 @@ mod tests {
     #[test]
     fn production_driver_emits_the_retained_c9_mark_only_in_precise_mode() {
         let code = r#"
+            struct H { symbol: i32, previous: i32 }
             unsafe fn two(x: *mut i32, y: *const i32) {
                 let snapshot = *y;
                 *x = snapshot + 1;
             }
-            unsafe fn caller(p: *mut i32) { two(p, p); }
+            unsafe fn caller(h: *mut H) {
+                let q: *const i32 = &(*h).symbol;
+                two(&mut (*h).symbol, q);
+            }
         "#;
         let precise = crate::bo_rewriter::rewrite_m1_a5(
             code,
@@ -972,8 +976,10 @@ mod tests {
             Some(WholeProgramAttestation::FrozenBenchmarkGraph),
         );
         let baseline = crate::bo_rewriter::rewrite_m1_a5(code, A5Mode::Baseline, None);
+        let default_baseline = crate::bo_rewriter::rewrite_m1(code);
         assert!(precise.a5_receipt().contains("a5_mode=precise_replay\n"));
         assert!(baseline.a5_receipt().contains("a5_mode=baseline\n"));
+        let precise_receipt = precise.a5_receipt().to_owned();
         let source = |outcome: crate::bo_rewriter::RewriteOutcome| match outcome {
             crate::bo_rewriter::RewriteOutcome::Emitted { source, .. } => source,
             crate::bo_rewriter::RewriteOutcome::Degraded { reason, .. } => {
@@ -982,14 +988,61 @@ mod tests {
         };
         let precise = source(precise);
         let baseline = source(baseline);
+        let default_baseline = source(default_baseline);
         assert!(
             precise.contains("__crat_c9_"),
-            "the precise production entry must materialize its retained mark: {precise}"
+            "the precise production entry must materialize its retained mark: {precise}\n{precise_receipt}"
+        );
+        assert!(
+            precise.contains("x: &mut i32") && precise.contains("y: &i32"),
+            "the marked production entry must actually promote both callee endpoints: {precise}"
         );
         assert!(
             !baseline.contains("__crat_c9_"),
             "baseline must carry no C-9 mark: {baseline}"
         );
-        assert_eq!(baseline, code, "A5 off must be byte-identical");
+        assert_eq!(
+            baseline, default_baseline,
+            "explicit A5-off and the absent-environment baseline must be byte-identical"
+        );
+    }
+
+    #[test]
+    fn w13_production_suppression_forces_the_verify_loop_to_take_back_the_model() {
+        let code = r#"
+            struct H { symbol: i32, previous: i32 }
+            unsafe fn two(x: *mut i32, y: *const i32) {
+                let snapshot = *y;
+                *x = snapshot + 1;
+            }
+            unsafe fn caller(h: *mut H) {
+                let q: *const i32 = &(*h).symbol;
+                two(&mut (*h).symbol, q);
+            }
+        "#;
+        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let fixture = std::env::temp_dir().join(format!(
+            "crat-a5-w13-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&fixture).expect("create W13 fixture directory");
+        let root = fixture.join("lib.rs");
+        std::fs::write(&root, code).expect("write W13 fixture");
+        let suppressed = crate::bo_rewriter::rewrite_m1_path_a5_injected(
+            &root,
+            A5Mode::PreciseReplay,
+            Some(WholeProgramAttestation::FrozenBenchmarkGraph),
+            &|table| table.c9_marks.clear(),
+        );
+        std::fs::remove_dir_all(&fixture).expect("remove W13 fixture directory");
+        assert!(
+            suppressed.a5_receipt().contains("a5_retained_marks=1\n"),
+            "the accepted model must still require the mark"
+        );
+        assert!(
+            suppressed.reverted_count() > 0,
+            "suppressing the selected mark must make production verification take back at least one conversion: {suppressed:#?}"
+        );
     }
 }
