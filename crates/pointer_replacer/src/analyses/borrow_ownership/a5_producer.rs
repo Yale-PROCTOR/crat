@@ -149,6 +149,7 @@ struct WitnessRecord {
     markability: WitnessMarkability,
     mark: Option<PlannedC9Mark>,
     endpoints: (SlotRef, SlotRef),
+    registered_site: bool,
 }
 
 fn indirect_targets(
@@ -607,9 +608,6 @@ pub(crate) fn produce_a5_plan(
                             transfers.push(CallTransfer::forwarded(key, dependency)?);
                         }
                     }
-                    if disposition == SiteSeedDisposition::ForwardOnly {
-                        continue;
-                    }
                     let left_slots = targets
                         .iter()
                         .map(|target| formal_slot(slots, *target, left))
@@ -706,6 +704,8 @@ pub(crate) fn produce_a5_plan(
                             markability,
                             mark,
                             endpoints: (left_slot, right_slot),
+                            registered_site: disposition
+                                == SiteSeedDisposition::DirectAndRecord,
                         });
                     }
                 }
@@ -733,6 +733,9 @@ pub(crate) fn produce_a5_plan(
             continue;
         }
         for witness in &witnesses {
+            if !witness.registered_site {
+                continue;
+            }
             let params = pair.params();
             let actuals = witness.key.actuals();
             site_classes
