@@ -6173,6 +6173,13 @@ mod run {
         );
         row.set("a5_planned_marks", verified.planned_c9_marks.len());
         row.set("a5_model_retained_marks", verified.retained_c9_marks.len());
+        row.set(
+            "a5_demoted_by_model_marks",
+            verified
+                .planned_c9_marks
+                .len()
+                .saturating_sub(verified.retained_c9_marks.len()),
+        );
 
         if let Some(records) =
             crown_projection::maybe_write_model_snapshot(tcx, &program, &slots, &verified.model)
@@ -6236,6 +6243,12 @@ mod run {
             row.set("a5_w14_effective_pairs", summary.effective_pairs);
             row.set("a5_w14_planned_marks", summary.planned_marks);
             row.set("a5_w14_model_retained_marks", summary.model_retained_marks);
+            row.set(
+                "a5_w14_demoted_by_model_marks",
+                summary
+                    .planned_marks
+                    .saturating_sub(summary.model_retained_marks),
+            );
             row.set("a5_w14_exposures", summary.exposures);
             row.set("a5_w14_demoted", summary.demoted);
             row.set("a5_w14_marked", summary.marked);
@@ -6243,6 +6256,73 @@ mod run {
             row.set("a5_w14_replay_safe", summary.replay_safe);
             row.set("a5_w14_unresolved", summary.unresolved);
             row.set("a5_w14_precise_rounds", summary.precise_rounds);
+            let site_join = super::a5_measurement::join_production_site_artifacts(
+                tcx,
+                Duration::ZERO,
+                &name,
+                &artifact_dir.join("w14-pair-ledger.tsv"),
+                &artifact_dir.join("summary.tsv"),
+                &artifact_dir.join("construction-receipt.txt"),
+            );
+            assert_eq!(site_join.get("status"), Some("ok"), "site-join status");
+            for key in [
+                "registered_site_rows",
+                "production_site_pairs",
+                "matched_registered_rows",
+                "unique_matched_production_pairs",
+                "registered_unmatched",
+                "production_unmatched",
+                "ambiguous_summary_keys",
+                "mixed_class_pairs",
+                "multi_expansion_pairs",
+                "matched_mut_mut",
+                "matched_mut_read_only",
+                "matched_shared_shared",
+                "production_mut_mut",
+                "production_mut_read_only",
+                "production_shared_shared",
+            ] {
+                row.set(
+                    &format!("a5_site_join_{key}"),
+                    site_join.get(key).expect("site-join key"),
+                );
+            }
+            let join_number = |key| {
+                site_join
+                    .get(key)
+                    .expect("site-join number")
+                    .parse::<usize>()
+                    .expect("numeric site-join value")
+            };
+            assert_eq!(join_number("registered_unmatched"), 0);
+            assert_eq!(join_number("production_unmatched"), 0);
+            assert_eq!(join_number("ambiguous_summary_keys"), 0);
+            assert_eq!(join_number("mixed_class_pairs"), 0);
+            assert_eq!(join_number("multi_expansion_pairs"), 0);
+            assert_eq!(
+                join_number("registered_site_rows"),
+                join_number("production_site_pairs")
+            );
+            assert_eq!(
+                join_number("matched_registered_rows"),
+                join_number("production_site_pairs")
+            );
+            assert_eq!(
+                join_number("unique_matched_production_pairs"),
+                join_number("production_site_pairs")
+            );
+            assert_eq!(
+                join_number("matched_mut_mut"),
+                join_number("production_mut_mut")
+            );
+            assert_eq!(
+                join_number("matched_mut_read_only"),
+                join_number("production_mut_read_only")
+            );
+            assert_eq!(
+                join_number("matched_shared_shared"),
+                join_number("production_shared_shared")
+            );
         }
         row.set("t_total_s", secs(t0.elapsed()));
         row

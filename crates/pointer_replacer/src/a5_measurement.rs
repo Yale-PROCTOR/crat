@@ -2202,25 +2202,19 @@ fn receipt_usize(receipt: &str, key: &str) -> Result<usize, String> {
         .map_err(|error| format!("receipt {key}: {error}"))
 }
 
-pub(super) fn run_production_site_join_worker(
+pub(super) fn join_production_site_artifacts(
     tcx: TyCtxt<'_>,
     t_tcx: Duration,
+    name: &str,
+    pair_path: &Path,
+    summary_path: &Path,
+    receipt_path: &Path,
 ) -> super::report::Row {
     let t0 = Instant::now();
     let mut row = super::report::Row::default();
     row.set("t_tcx_s", t_tcx.as_secs_f64());
     row.set("data", "false");
     row.set("join_kind", "registered-site-to-production-site-key");
-    let name = std::env::var("CRAT_BOC1_NAME").unwrap_or_else(|_| "unnamed".to_owned());
-    let pair_path = std::path::PathBuf::from(
-        std::env::var_os("CRAT_A5_SITE_JOIN_W14_PAIR").expect("W14 pair ledger"),
-    );
-    let summary_path = std::path::PathBuf::from(
-        std::env::var_os("CRAT_A5_SITE_JOIN_SUMMARY").expect("production summary"),
-    );
-    let receipt_path = std::path::PathBuf::from(
-        std::env::var_os("CRAT_A5_SITE_JOIN_RECEIPT").expect("construction receipt"),
-    );
     let program = super::collect_program(tcx);
     let path_to_did = program
         .functions
@@ -2383,6 +2377,23 @@ pub(super) fn run_production_site_join_worker(
     row.set("status", "ok");
     row.set("t_total_s", t0.elapsed().as_secs_f64());
     row
+}
+
+pub(super) fn run_production_site_join_worker(
+    tcx: TyCtxt<'_>,
+    t_tcx: Duration,
+) -> super::report::Row {
+    let name = std::env::var("CRAT_BOC1_NAME").unwrap_or_else(|_| "unnamed".to_owned());
+    let pair_path = std::path::PathBuf::from(
+        std::env::var_os("CRAT_A5_SITE_JOIN_W14_PAIR").expect("W14 pair ledger"),
+    );
+    let summary_path = std::path::PathBuf::from(
+        std::env::var_os("CRAT_A5_SITE_JOIN_SUMMARY").expect("production summary"),
+    );
+    let receipt_path = std::path::PathBuf::from(
+        std::env::var_os("CRAT_A5_SITE_JOIN_RECEIPT").expect("construction receipt"),
+    );
+    join_production_site_artifacts(tcx, t_tcx, &name, &pair_path, &summary_path, &receipt_path)
 }
 
 pub(super) fn run_a5_site_repair_plan_worker(
@@ -2798,6 +2809,7 @@ fn validate_launch4_preflight(
             "a5_production_shared_shared",
             "a5_planned_marks",
             "a5_model_retained_marks",
+            "a5_demoted_by_model_marks",
             "rw_a5_model_retained_marks",
             "rw_a5_emission_retained_marks",
         ] {
@@ -2817,6 +2829,7 @@ fn validate_launch4_preflight(
         "a5_w14_effective_pairs",
         "a5_w14_planned_marks",
         "a5_w14_model_retained_marks",
+        "a5_w14_demoted_by_model_marks",
         "a5_w14_exposures",
         "a5_w14_demoted",
         "a5_w14_marked",
@@ -2824,6 +2837,21 @@ fn validate_launch4_preflight(
         "a5_w14_replay_safe",
         "a5_w14_unresolved",
         "a5_w14_precise_rounds",
+        "a5_site_join_registered_site_rows",
+        "a5_site_join_production_site_pairs",
+        "a5_site_join_matched_registered_rows",
+        "a5_site_join_unique_matched_production_pairs",
+        "a5_site_join_registered_unmatched",
+        "a5_site_join_production_unmatched",
+        "a5_site_join_ambiguous_summary_keys",
+        "a5_site_join_mixed_class_pairs",
+        "a5_site_join_multi_expansion_pairs",
+        "a5_site_join_matched_mut_mut",
+        "a5_site_join_matched_mut_read_only",
+        "a5_site_join_matched_shared_shared",
+        "a5_site_join_production_mut_mut",
+        "a5_site_join_production_mut_read_only",
+        "a5_site_join_production_shared_shared",
     ] {
         batch_number(precise, key);
     }
@@ -3645,6 +3673,7 @@ fn finish_a5_item22_batch(
                 "a5_w14_effective_pairs",
                 "a5_w14_planned_marks",
                 "a5_w14_model_retained_marks",
+                "a5_w14_demoted_by_model_marks",
                 "a5_w14_exposures",
                 "a5_w14_demoted",
                 "a5_w14_marked",
@@ -3652,6 +3681,21 @@ fn finish_a5_item22_batch(
                 "a5_w14_replay_safe",
                 "a5_w14_unresolved",
                 "a5_w14_precise_rounds",
+                "a5_site_join_registered_site_rows",
+                "a5_site_join_production_site_pairs",
+                "a5_site_join_matched_registered_rows",
+                "a5_site_join_unique_matched_production_pairs",
+                "a5_site_join_registered_unmatched",
+                "a5_site_join_production_unmatched",
+                "a5_site_join_ambiguous_summary_keys",
+                "a5_site_join_mixed_class_pairs",
+                "a5_site_join_multi_expansion_pairs",
+                "a5_site_join_matched_mut_mut",
+                "a5_site_join_matched_mut_read_only",
+                "a5_site_join_matched_shared_shared",
+                "a5_site_join_production_mut_mut",
+                "a5_site_join_production_mut_read_only",
+                "a5_site_join_production_shared_shared",
             ] {
                 row.set(key, sum(key));
             }
@@ -3672,24 +3716,38 @@ fn finish_a5_item22_batch(
         ("a5_w14_mut_mut", 2_391),
         ("a5_w14_mut_read_only", 2_480),
         ("a5_w14_shared_shared", 684),
-        ("a5_w14_effective_pairs", 5_551),
         ("a5_w14_planned_marks", 4),
-        ("a5_w14_model_retained_marks", 1),
         ("a5_w14_exposures", 2_014),
-        // §18 (2026-08-22): the item-16 observer injected every
-        // `!selected_mark` site pair and over-derived 178 demotions. The
-        // production fixpoint/all-witness map is authoritative after the
-        // exact identity/map join plus zero-conflict adversarial replay.
-        ("a5_w14_demoted", 211),
-        ("a5_w14_marked", 2),
         ("a5_w14_shared_safe", 114),
-        ("a5_w14_replay_safe", 1_687),
         ("a5_w14_unresolved", 0),
     ] {
         assert_eq!(
             batch_number(precise, key),
             expected,
             "A5 item-22 gate {key}"
+        );
+    }
+    for (key, expected) in [
+        ("a5_site_join_registered_site_rows", 5_555),
+        ("a5_site_join_production_site_pairs", 5_555),
+        ("a5_site_join_matched_registered_rows", 5_555),
+        ("a5_site_join_unique_matched_production_pairs", 5_555),
+        ("a5_site_join_registered_unmatched", 0),
+        ("a5_site_join_production_unmatched", 0),
+        ("a5_site_join_ambiguous_summary_keys", 0),
+        ("a5_site_join_mixed_class_pairs", 0),
+        ("a5_site_join_multi_expansion_pairs", 0),
+        ("a5_site_join_matched_mut_mut", 2_391),
+        ("a5_site_join_matched_mut_read_only", 2_480),
+        ("a5_site_join_matched_shared_shared", 684),
+        ("a5_site_join_production_mut_mut", 2_391),
+        ("a5_site_join_production_mut_read_only", 2_480),
+        ("a5_site_join_production_shared_shared", 684),
+    ] {
+        assert_eq!(
+            batch_number(precise, key),
+            expected,
+            "A5 item-22 permanent site-join gate {key}"
         );
     }
     for aggregate in [&aggregates[1], &aggregates[2]] {
