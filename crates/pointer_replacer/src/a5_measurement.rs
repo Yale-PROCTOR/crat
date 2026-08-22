@@ -3195,10 +3195,14 @@ fn finish_a5_item22_batch(
         ("a5_w14_planned_marks", 4),
         ("a5_w14_model_retained_marks", 1),
         ("a5_w14_exposures", 2_014),
-        ("a5_w14_demoted", 389),
+        // §18 (2026-08-22): the item-16 observer injected every
+        // `!selected_mark` site pair and over-derived 178 demotions. The
+        // production fixpoint/all-witness map is authoritative after the
+        // exact identity/map join plus zero-conflict adversarial replay.
+        ("a5_w14_demoted", 211),
         ("a5_w14_marked", 2),
         ("a5_w14_shared_safe", 114),
-        ("a5_w14_replay_safe", 1_509),
+        ("a5_w14_replay_safe", 1_687),
         ("a5_w14_unresolved", 0),
     ] {
         assert_eq!(
