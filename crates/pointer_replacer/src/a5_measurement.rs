@@ -1972,6 +1972,31 @@ fn a5_item22_batch_corpus() {
     let output = super::orchestrate::out_dir().join("a5-item22-batch");
     fs::create_dir_all(&output).expect("create A5 item-22 output");
     let root = super::orchestrate::workspace_root();
+    let official_link = root.join("benchmarks/rs-crown-transformed/evaluation.tsv");
+    let official_target = fs::read_link(&official_link).expect("read official evaluation symlink");
+    assert!(
+        official_target.is_absolute(),
+        "official evaluation link must be absolute"
+    );
+    let official_digest = batch_sha256(&official_link).expect("hash official evaluation link");
+    assert_eq!(
+        official_digest,
+        "7aa16d5b63ff39e6aaabd3590ec2be9c88c9d8a753bd9f74cd4e6056d9974fd7"
+    );
+    let official_root = official_target
+        .parent()
+        .expect("official evaluation target parent")
+        .to_path_buf();
+    fs::write(
+        output.join("preflight-receipt.txt"),
+        format!(
+            "status=ready\ndata=false\nanalysis_head={}\nderived_substrate_sha256={DIGEST}\nofficial_evaluation_link={}\nofficial_evaluation_target={}\nofficial_evaluation_sha256_start={official_digest}\nofficial_evaluation_link_installed=true\n",
+            super::orchestrate::git_sha(),
+            official_link.display(),
+            official_target.display(),
+        ),
+    )
+    .expect("write A5 batch preflight receipt");
     let timeout = Duration::from_secs(14_400);
     let modes = [
         ("baseline", "baseline"),
@@ -2002,9 +2027,15 @@ fn a5_item22_batch_corpus() {
                 ),
                 (
                     "CRAT_BOC1_CROWN_ARTIFACT",
-                    root.join("benchmarks/rs-crown-transformed")
-                        .display()
-                        .to_string(),
+                    official_root.display().to_string(),
+                ),
+                (
+                    "CRAT_A5_OFFICIAL_EVALUATION",
+                    official_link.display().to_string(),
+                ),
+                (
+                    "CRAT_A5_OFFICIAL_EVALUATION_SHA256",
+                    official_digest.clone(),
                 ),
             ];
             eprintln!("[a5-item22] {label}/{} model", program.name);
@@ -2093,11 +2124,21 @@ fn a5_item22_batch_corpus() {
                 assert_eq!(combined.get(key), Some(expected), "model stamp {key}");
                 assert_eq!(rewrite_row.get(key), Some(expected), "rewriter stamp {key}");
             }
+            assert_eq!(
+                combined.get("official_evaluation_sha256"),
+                Some(official_digest.as_str()),
+                "per-worker official artifact digest"
+            );
             fs::write(
                 shard.join("shard-receipt.txt"),
                 format!(
-                    "status=ok\ndata=true\nprogram={}\na5_mode={mode}\na5_world=closed_world_frozen_graph\ncopy_lend_mode=baseline\na2_mode=off\nmodel_wall_s={:.3}\nrewriter_wall_s={:.3}\nderived_substrate_sha256={DIGEST}\n",
-                    program.name, model.wall_s, rewrite.wall_s
+                    "status=ok\ndata=true\nprogram={}\na5_mode={mode}\na5_world=closed_world_frozen_graph\ncopy_lend_mode=baseline\na2_mode=off\nmodel_wall_s={:.3}\nrewriter_wall_s={:.3}\nderived_substrate_sha256={DIGEST}\nofficial_evaluation_link={}\nofficial_evaluation_target={}\nofficial_evaluation_sha256={}\n",
+                    program.name,
+                    model.wall_s,
+                    rewrite.wall_s,
+                    official_link.display(),
+                    official_target.display(),
+                    official_digest,
                 ),
             )
             .expect("write A5 shard receipt");
@@ -2119,7 +2160,20 @@ fn a5_item22_batch_corpus() {
     }
     assert_eq!(rows.len(), 60);
 
-    finish_a5_item22_batch(&output, &rows, modes, DIGEST);
+    let final_digest = batch_sha256(&official_link).expect("rehash official evaluation link");
+    assert_eq!(
+        final_digest, official_digest,
+        "official evaluation digest moved during the sweep"
+    );
+    finish_a5_item22_batch(
+        &output,
+        &rows,
+        modes,
+        DIGEST,
+        &official_link,
+        &official_target,
+        &official_digest,
+    );
 }
 
 fn finish_a5_item22_batch(
@@ -2127,6 +2181,9 @@ fn finish_a5_item22_batch(
     rows: &[super::report::Row],
     modes: [(&str, &str); 3],
     digest: &str,
+    official_link: &Path,
+    official_target: &Path,
+    official_digest: &str,
 ) {
     let reason_keys = rows
         .iter()
@@ -2302,8 +2359,10 @@ fn finish_a5_item22_batch(
     fs::write(
         output.join("receipt.txt"),
         format!(
-            "schema=a5-item22-batch-v1\nstatus=ok\ndata=true\nanalysis_head={}\nprograms=20\nconfigurations=baseline,precise_replay,coarse_constraint\na5_world=closed_world_frozen_graph\ncopy_lend_mode=baseline\na2_mode=off\nz3_smt_seed=0\nz3_sat_seed=0\nmem_cap_mib=49152\nworker_bound_s=14400\nderived_substrate_sha256={digest}\n",
-            super::orchestrate::git_sha()
+            "schema=a5-item22-batch-v1\nstatus=ok\ndata=true\nanalysis_head={}\nprograms=20\nconfigurations=baseline,precise_replay,coarse_constraint\na5_world=closed_world_frozen_graph\ncopy_lend_mode=baseline\na2_mode=off\nz3_smt_seed=0\nz3_sat_seed=0\nmem_cap_mib=49152\nworker_bound_s=14400\nderived_substrate_sha256={digest}\nofficial_evaluation_link={}\nofficial_evaluation_target={}\nofficial_evaluation_sha256_start={official_digest}\nofficial_evaluation_sha256_end={official_digest}\nofficial_evaluation_link_installed=true\n",
+            super::orchestrate::git_sha(),
+            official_link.display(),
+            official_target.display(),
         ),
     )
     .expect("write A5 batch receipt");

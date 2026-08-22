@@ -4314,6 +4314,7 @@ mod run {
     use points_to::andersen;
     use rustc_hash::{FxHashMap, FxHashSet};
     use rustc_middle::ty::{TyCtxt, TyKind};
+    use sha2::{Digest, Sha256};
     use z3::{SatResult, ast::Bool};
 
     use super::{
@@ -5344,6 +5345,24 @@ mod run {
         let mut row = Row::default();
         row.set("t_tcx_s", secs(t_tcx));
         row.set("z3_full_version", z3::full_version().to_string());
+        let official_evaluation = std::path::PathBuf::from(
+            std::env::var_os("CRAT_A5_OFFICIAL_EVALUATION")
+                .expect("A5 batch requires CRAT_A5_OFFICIAL_EVALUATION"),
+        );
+        let official_expected = std::env::var("CRAT_A5_OFFICIAL_EVALUATION_SHA256")
+            .expect("A5 batch requires the official evaluation digest pin");
+        let official_actual = format!(
+            "{:x}",
+            Sha256::digest(
+                std::fs::read(&official_evaluation)
+                    .expect("read official evaluation through the worktree link")
+            )
+        );
+        assert_eq!(
+            official_actual, official_expected,
+            "official evaluation digest mismatch"
+        );
+        row.set("official_evaluation_sha256", official_actual);
 
         let program_name =
             std::env::var("CRAT_BOC1_NAME").expect("selector-core worker requires program name");
