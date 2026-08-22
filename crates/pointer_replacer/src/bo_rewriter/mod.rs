@@ -2298,7 +2298,7 @@ pub(crate) fn emit_files<'tcx>(
         &|subject: &decision::Subject| reverted.contains(&subject.fn_did),
     );
     for mark in retained_c9_plans {
-        if reverted.contains(&mark.caller_did) {
+        if reverted.contains(&mark.owner_did) {
             continue;
         }
         let (file, lo, hi) = span_to_loc(mark.call_span)
@@ -2504,7 +2504,7 @@ fn finish_decide<'tcx>(
     slots: CrateSlots,
     mut_facts: MutFacts,
     model: rustc_hash::FxHashMap<SlotRef, SlotKind>,
-    retained_c9_plans: Vec<PlannedC9Mark>,
+    mut retained_c9_plans: Vec<PlannedC9Mark>,
     a5_receipt: String,
     perturb: impl FnOnce(&mut Vec<decision::Subject>),
 ) -> Result<(decision::DecisionTable, DecideCtx), String> {
@@ -2701,6 +2701,17 @@ fn finish_decide<'tcx>(
     // forms both ends actually settle on, so a subject withdrawn later would
     // leave glue bridging to a form that no longer exists.
     table.seams = decision::seam::synthesize(tcx, &facts, &subjects, &table, &retained_c9_plans);
+    retained_c9_plans.retain(|mark| {
+        let params = mark.key.pair.params();
+        [params.first(), params.second()].into_iter().all(|param| {
+            let local = Local::from_usize(param as usize);
+            table.entries.iter().any(|(subject, decision)| {
+                subject.fn_did == mark.owner_did
+                    && subject.local == local
+                    && matches!(decision, decision::Decision::Ref { .. })
+            })
+        })
+    });
     table.c9_marks = retained_c9_plans.clone();
     let table = table;
 

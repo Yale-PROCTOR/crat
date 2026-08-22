@@ -36,6 +36,7 @@ pub(crate) struct PlannedC9Mark {
     pub(crate) endpoint_slots: BTreeSet<SlotKey>,
     pub(crate) call_span: rustc_span::Span,
     pub(crate) caller_did: LocalDefId,
+    pub(crate) owner_did: LocalDefId,
     pub(crate) owner_fn: String,
 }
 
@@ -655,6 +656,7 @@ pub(crate) fn produce_a5_plan(
                                 ]),
                                 call_span: data.terminator().source_info.span,
                                 caller_did: caller,
+                                owner_did: target,
                                 owner_fn: tcx.def_path_str(target.to_def_id()),
                             })
                         });
@@ -1043,6 +1045,41 @@ mod tests {
         assert!(
             suppressed.reverted_count() > 0,
             "suppressing the selected mark must make production verification take back at least one conversion: {suppressed:#?}"
+        );
+    }
+
+    #[test]
+    fn production_drops_a_model_retained_mark_when_rewriter_endpoints_do_not_convert() {
+        let code = r#"
+            unsafe fn two(x: *mut i32, y: *const i32) {
+                let snapshot = *y;
+                *x = snapshot + 1;
+            }
+            unsafe fn caller(p: *mut i32) { two(p, p); }
+        "#;
+        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let fixture = std::env::temp_dir().join(format!(
+            "crat-a5-orphan-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&fixture).expect("create orphan-mark fixture directory");
+        let root = fixture.join("lib.rs");
+        std::fs::write(&root, code).expect("write orphan-mark fixture");
+        let outcome = crate::bo_rewriter::rewrite_m1_path_a5_injected(
+            &root,
+            A5Mode::PreciseReplay,
+            Some(WholeProgramAttestation::FrozenBenchmarkGraph),
+            &|_| {},
+        );
+        std::fs::remove_dir_all(&fixture).expect("remove orphan-mark fixture directory");
+        assert!(outcome.a5_receipt().contains("a5_retained_marks=1\n"));
+        let crate::bo_rewriter::RewriteOutcome::Emitted { source, .. } = outcome else {
+            panic!("fixture must emit its conservative fallback")
+        };
+        assert!(
+            !source.contains("__crat_c9_"),
+            "a mark whose rewriter endpoints stayed raw must not ride as orphan glue: {source}"
         );
     }
 }
