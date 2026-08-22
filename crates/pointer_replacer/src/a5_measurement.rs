@@ -2414,7 +2414,7 @@ fn parse_w14_ledgers(
         if !matches!(columns.len(), 12 | 16)
             || columns[0] != counts.program
             || columns[4] != "ref"
-            || columns[8..]
+            || columns[8..12]
                 != [
                     "baseline",
                     "precise_replay",
@@ -3966,6 +3966,15 @@ mod tests {
                 .iter()
                 .all(|row| row.class == ExposureClass::Marked)
         );
+        let mut metadata = super::super::report::Row::default();
+        metadata.set("a5_w14_pairs", 1);
+        metadata.set("a5_w14_exposures", 2);
+        let stdout = std::iter::once(render_extended_pair_line(&measured.extended_pairs[0]))
+            .chain(exposure.iter().map(render_exposure_line))
+            .collect::<Vec<_>>()
+            .join("\n");
+        parse_w14_ledgers(&stdout, &metadata, &measured.counts)
+            .expect("new W14 schemas round-trip");
 
         let mut precise = AcceptedFormalModel {
             refs: BTreeMap::new(),
