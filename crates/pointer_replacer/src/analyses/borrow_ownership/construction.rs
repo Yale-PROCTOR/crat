@@ -816,4 +816,11 @@ mod mode_tests {
             Ok(CopyLendMode::Baseline)
         );
     }
+
+    #[test]
+    fn dormant_a2_defaults_off() {
+        assert_eq!(A2Mode::default(), A2Mode::Off);
+        assert_eq!(A2Mode::default().label(), "off");
+        assert_eq!(A2Mode::Off.with_override(A2Mode::current), A2Mode::Off);
+    }
 }
