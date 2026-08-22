@@ -2706,9 +2706,15 @@ fn finish_decide<'tcx>(
         [params.first(), params.second()].into_iter().all(|param| {
             let local = Local::from_usize(param as usize);
             table.entries.iter().any(|(subject, decision)| {
+                let is_ref = match decision {
+                    decision::Decision::Ref { .. } => true,
+                    decision::Decision::Slice { .. }
+                    | decision::Decision::Opt { .. }
+                    | decision::Decision::Degraded(_) => false,
+                };
                 subject.fn_did == mark.owner_did
                     && subject.local == local
-                    && matches!(decision, decision::Decision::Ref { .. })
+                    && is_ref
             })
         })
     });
