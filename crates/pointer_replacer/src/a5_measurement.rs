@@ -6,7 +6,7 @@ use std::{
 };
 
 use points_to::andersen::{self, Var};
-use rustc_hash::FxHashSet;
+use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_hir::def_id::LocalDefId;
 use rustc_middle::{
     mir::{BasicBlock, Body, Local, Operand, TerminatorKind},
@@ -26,6 +26,7 @@ use crate::{
             },
             a5_snapshot_effects::snapshot_verdict_for_target,
             borrow_engine::ParameterOverlap,
+            borrow_verify::revalidate_replaying_with_parameter_overlap,
             construction::{
                 CopyLendMode, construct_bo_into, verify_bo_construction,
                 verify_bo_construction_with_parameter_overlaps,
@@ -36,6 +37,7 @@ use crate::{
             mutability_facts::MutFacts,
             origins::compute_origins,
             resolve::{ResolvedSlot, resolve_place},
+            slots::SlotId,
             solver::{KindSolver, SlotRef},
         },
     },
@@ -1896,6 +1898,276 @@ pub(super) fn run_batch_w14(
     })
 }
 
+fn read_drift_exposures(
+    path: &Path,
+    program: &str,
+    expected_class: &str,
+) -> Result<BTreeSet<FormalKey>, String> {
+    let input = fs::read_to_string(path)
+        .map_err(|error| format!("read drift exposure {}: {error}", path.display()))?;
+    let mut rows = BTreeSet::new();
+    for (index, line) in input.lines().enumerate() {
+        if index == 0 {
+            continue;
+        }
+        let fields = line.split('\t').collect::<Vec<_>>();
+        if fields.len() != 16 {
+            return Err(format!(
+                "drift exposure {}:{} has {} fields",
+                path.display(),
+                index + 1,
+                fields.len()
+            ));
+        }
+        if fields[0] == program && fields[7] == expected_class {
+            rows.insert(FormalKey {
+                function: fields[1].to_owned(),
+                parameter: fields[2]
+                    .parse()
+                    .map_err(|error| format!("drift parameter: {error}"))?,
+                depth: fields[3]
+                    .parse()
+                    .map_err(|error| format!("drift depth: {error}"))?,
+            });
+        }
+    }
+    Ok(rows)
+}
+
+fn read_preserved_model(
+    path: &Path,
+    program: &RustProgram<'_>,
+    slots: &CrateSlots,
+) -> Result<FxHashMap<SlotRef, SlotKind>, String> {
+    let mut by_key = BTreeMap::<SlotKey, SlotRef>::new();
+    for &did in &program.functions {
+        let universe = &slots.fn_local_slots[&did];
+        for index in 0..universe.len() {
+            let slot = SlotRef::Local(did, SlotId::from_usize(index));
+            by_key.insert(SlotKey::of(slot), slot);
+        }
+    }
+    for index in 0..slots.field_slots.len() {
+        let slot = SlotRef::Field(SlotId::from_usize(index));
+        by_key.insert(SlotKey::of(slot), slot);
+    }
+
+    let input = fs::read_to_string(path)
+        .map_err(|error| format!("read preserved model {}: {error}", path.display()))?;
+    let mut model = FxHashMap::default();
+    for (index, line) in input.lines().enumerate() {
+        if index == 0 {
+            continue;
+        }
+        let fields = line.split('\t').collect::<Vec<_>>();
+        if fields.len() != 4 {
+            return Err(format!(
+                "preserved model {}:{} has {} fields",
+                path.display(),
+                index + 1,
+                fields.len()
+            ));
+        }
+        let key = SlotKey {
+            variant: fields[0]
+                .parse()
+                .map_err(|error| format!("model variant: {error}"))?,
+            owner: fields[1]
+                .parse()
+                .map_err(|error| format!("model owner: {error}"))?,
+            slot: fields[2]
+                .parse()
+                .map_err(|error| format!("model slot: {error}"))?,
+        };
+        let slot = by_key
+            .get(&key)
+            .copied()
+            .ok_or_else(|| format!("preserved model key {key:?} is outside current slots"))?;
+        let kind = match fields[3] {
+            "Raw" => SlotKind::Raw,
+            "Ref" => SlotKind::Ref,
+            "Owning" => SlotKind::Owning,
+            other => return Err(format!("unknown preserved model kind {other}")),
+        };
+        model.insert(slot, kind);
+    }
+    if model.len() != by_key.len() {
+        return Err(format!(
+            "preserved model covers {} of {} slots",
+            model.len(),
+            by_key.len()
+        ));
+    }
+    Ok(model)
+}
+
+fn read_production_overlap_map(
+    path: &Path,
+    program: &RustProgram<'_>,
+) -> Result<FxHashMap<LocalDefId, ParameterOverlap>, String> {
+    let by_key = program
+        .functions
+        .iter()
+        .copied()
+        .map(|did| (did.local_def_index.as_u32(), did))
+        .collect::<BTreeMap<_, _>>();
+    let input = fs::read_to_string(path)
+        .map_err(|error| format!("read production summary {}: {error}", path.display()))?;
+    let mut pairs = FxHashMap::<LocalDefId, Vec<(Local, Local)>>::default();
+    for (index, line) in input.lines().enumerate() {
+        if index == 0 {
+            continue;
+        }
+        let fields = line.split('\t').collect::<Vec<_>>();
+        if fields.len() != 14 {
+            return Err(format!(
+                "production summary {}:{} has {} fields",
+                path.display(),
+                index + 1,
+                fields.len()
+            ));
+        }
+        if fields[12] != "closed_world_frozen_graph" || fields[13] != "precise_replay" {
+            return Err("production summary has the wrong launch identity".to_owned());
+        }
+        let did_key = fields[0]
+            .parse::<u32>()
+            .map_err(|error| format!("summary callee: {error}"))?;
+        let did = by_key
+            .get(&did_key)
+            .copied()
+            .ok_or_else(|| format!("summary callee {did_key} is outside current program"))?;
+        pairs.entry(did).or_default().push((
+            Local::from_usize(
+                fields[1]
+                    .parse()
+                    .map_err(|error| format!("summary left parameter: {error}"))?,
+            ),
+            Local::from_usize(
+                fields[2]
+                    .parse()
+                    .map_err(|error| format!("summary right parameter: {error}"))?,
+            ),
+        ));
+    }
+    Ok(pairs
+        .into_iter()
+        .map(|(did, pairs)| (did, ParameterOverlap::from_pairs(pairs)))
+        .collect())
+}
+
+pub(super) fn run_w14_drift_trace_worker(tcx: TyCtxt<'_>, t_tcx: Duration) -> super::report::Row {
+    let t0 = Instant::now();
+    let mut row = super::report::Row::default();
+    row.set("t_tcx_s", t_tcx.as_secs_f64());
+    row.set("data", "false");
+    row.set("a5_world", "closed_world_frozen_graph");
+    row.set("a5_mode", "precise_replay");
+    row.set("trace_kind", "direct-replay-production-overlap-map");
+    let name = std::env::var("CRAT_BOC1_NAME").unwrap_or_else(|_| "unnamed".to_owned());
+    let old_exposure = std::path::PathBuf::from(
+        std::env::var_os("CRAT_A5_DRIFT_OLD_EXPOSURE").expect("old drift exposure ledger"),
+    );
+    let new_exposure = std::path::PathBuf::from(
+        std::env::var_os("CRAT_A5_DRIFT_NEW_EXPOSURE").expect("new drift exposure ledger"),
+    );
+    let model_path = std::path::PathBuf::from(
+        std::env::var_os("CRAT_A5_DRIFT_MODEL").expect("preserved production model"),
+    );
+    let summary_path = std::path::PathBuf::from(
+        std::env::var_os("CRAT_A5_DRIFT_SUMMARY").expect("preserved production summary"),
+    );
+    let heavy = std::env::var("CRAT_A5_DRIFT_HEAVY").as_deref() == Ok("1");
+    let program = super::collect_program(tcx);
+    let slots = CrateSlots::build(&program);
+    let old = read_drift_exposures(&old_exposure, &name, "demoted").expect("old drift rows");
+    let new = read_drift_exposures(&new_exposure, &name, "replay-safe").expect("new drift rows");
+    let drift = old.intersection(&new).cloned().collect::<Vec<_>>();
+    let sampled = if heavy && drift.len() > 10 {
+        drift.iter().take(10).cloned().collect::<Vec<_>>()
+    } else {
+        drift.clone()
+    };
+    let model = read_preserved_model(&model_path, &program, &slots).expect("preserved model");
+    let overlaps =
+        read_production_overlap_map(&summary_path, &program).expect("production overlap map");
+    let mutability = MutFacts::from_program(&program);
+    let conflicts = revalidate_replaying_with_parameter_overlap(
+        &program,
+        &slots,
+        |slot| model.get(&slot) == Some(&SlotKind::Ref),
+        |slot| model.get(&slot) == Some(&SlotKind::Raw),
+        &mutability,
+        &overlaps,
+    );
+    let by_path = program
+        .functions
+        .iter()
+        .copied()
+        .map(|did| (tcx.def_path_str(did.to_def_id()), did))
+        .collect::<BTreeMap<_, _>>();
+    let mut conflicting_rows = 0usize;
+    let mut conflict_edges = 0usize;
+    for formal in &sampled {
+        let did = by_path
+            .get(&formal.function)
+            .copied()
+            .expect("drift function in current program");
+        let local = Local::from_usize(formal.parameter as usize);
+        let slot = slots.fn_local_slots[&did]
+            .slot_for_local_depth(local, formal.depth)
+            .map(|slot| SlotRef::Local(did, slot))
+            .expect("drift formal slot");
+        let edges = conflicts
+            .get(&did)
+            .into_iter()
+            .flatten()
+            .filter(|conflict| conflict.issuer == Some(slot) || conflict.requirers.contains(&slot))
+            .collect::<Vec<_>>();
+        conflicting_rows += usize::from(!edges.is_empty());
+        conflict_edges += edges.len();
+        let trace = if edges.is_empty() {
+            "none".to_owned()
+        } else {
+            edges
+                .iter()
+                .map(|conflict| {
+                    let issuer = conflict
+                        .issuer
+                        .map(SlotKey::of)
+                        .map(|key| format!("{}:{}:{}", key.variant, key.owner, key.slot))
+                        .unwrap_or_else(|| "none".to_owned());
+                    let requirers = conflict
+                        .requirers
+                        .iter()
+                        .copied()
+                        .map(SlotKey::of)
+                        .map(|key| format!("{}:{}:{}", key.variant, key.owner, key.slot))
+                        .collect::<Vec<_>>()
+                        .join("|");
+                    format!("{issuer}->{requirers}")
+                })
+                .collect::<Vec<_>>()
+                .join(";")
+        };
+        println!(
+            "A5DRIFTTRACE\t{name}\t{}\t{}\t{}\t{trace}",
+            formal.function, formal.parameter, formal.depth
+        );
+    }
+    row.set("drift_total", drift.len());
+    row.set("drift_sampled", sampled.len());
+    row.set(
+        "drift_exhaustive",
+        usize::from(sampled.len() == drift.len()),
+    );
+    row.set("conflicting_rows", conflicting_rows);
+    row.set("conflict_edges", conflict_edges);
+    row.set("status", "ok");
+    row.set("t_total_s", t0.elapsed().as_secs_f64());
+    row
+}
+
 fn batch_sha256(path: &Path) -> Result<String, String> {
     let bytes = fs::read(path).map_err(|error| format!("read {}: {error}", path.display()))?;
     Ok(format!("{:x}", Sha256::digest(bytes)))
@@ -2605,6 +2877,143 @@ fn a5_item22_batch_aggregate_only() {
         OFFICIAL_DIGEST,
         measurement_head,
     );
+}
+
+#[test]
+#[ignore = "A5 W14 drift direct-replay diagnostic over preserved launch-4 models"]
+fn a5_w14_drift_soundness_diagnostic() {
+    const OLD_EXPOSURE_SHA256: &str =
+        "2cbf2f8ec8df784c9a672da1ff32164feb972275fdb968e71be8a66536630e9b";
+    const OLD_PAIR_SHA256: &str =
+        "a2da08e8fe3871b29eff9f12409c84c1400def2972396d2fc49915fb563ed65a";
+    let old_root = std::path::PathBuf::from(
+        std::env::var_os("CRAT_A5_DRIFT_OLD_ROOT").expect("old W14 artifact root"),
+    );
+    let launch_root = std::path::PathBuf::from(
+        std::env::var_os("CRAT_A5_DRIFT_LAUNCH_ROOT").expect("launch-4 artifact root"),
+    );
+    let old_exposure = old_root.join("w14-exposure-ledger.tsv");
+    assert_eq!(
+        batch_sha256(&old_exposure).as_deref(),
+        Ok(OLD_EXPOSURE_SHA256)
+    );
+    assert_eq!(
+        batch_sha256(&old_root.join("w14-pair-ledger.tsv")).as_deref(),
+        Ok(OLD_PAIR_SHA256)
+    );
+    let output = super::orchestrate::out_dir().join("a5-w14-drift-diagnostic");
+    fs::create_dir_all(&output).expect("create W14 drift diagnostic output");
+    let root = super::orchestrate::workspace_root();
+    let selected = [
+        "binn", "brotli", "bzip2", "heman", "json.h", "lodepng", "quadtree",
+    ];
+    let heavy = ["brotli", "heman", "lodepng"]
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    let expected = BTreeMap::from([
+        ("binn", 5usize),
+        ("brotli", 80),
+        ("bzip2", 4),
+        ("heman", 38),
+        ("json.h", 19),
+        ("lodepng", 30),
+        ("quadtree", 2),
+    ]);
+    let mut rows = Vec::new();
+    let timeout = Duration::from_secs(14_400);
+    for name in selected {
+        let corpus = super::CORPUS
+            .iter()
+            .find(|program| program.name == name)
+            .expect("drift program in corpus");
+        let precise = launch_root.join("precise").join(name);
+        let common = vec![
+            ("CRAT_BO_FORK_ENGINE", "fork".to_owned()),
+            ("CRAT_BO_COPY_LEND_MODE", "baseline".to_owned()),
+            ("CRAT_BO_A2_MODE", "off".to_owned()),
+            (
+                "CRAT_A5_DRIFT_OLD_EXPOSURE",
+                old_exposure.display().to_string(),
+            ),
+            (
+                "CRAT_A5_DRIFT_NEW_EXPOSURE",
+                precise
+                    .join("w14-exposure-ledger.tsv")
+                    .display()
+                    .to_string(),
+            ),
+            (
+                "CRAT_A5_DRIFT_MODEL",
+                precise.join("model.tsv").display().to_string(),
+            ),
+            (
+                "CRAT_A5_DRIFT_SUMMARY",
+                precise.join("summary.tsv").display().to_string(),
+            ),
+            (
+                "CRAT_A5_DRIFT_HEAVY",
+                usize::from(heavy.contains(name)).to_string(),
+            ),
+        ];
+        let child = super::orchestrate::run_child_labeled(
+            name,
+            &corpus.input_path(&root),
+            "a5-w14-drift-trace",
+            "a5-w14-drift-trace",
+            timeout,
+            &common,
+        );
+        let row = child.row.unwrap_or_default();
+        if child.status != "ok" || row.get("status") != Some("ok") {
+            fs::write(
+                output.join("receipt.txt"),
+                format!(
+                    "status=failed\ndata=false\nprogram={name}\nchild_status={}\nnote={}\n",
+                    child.status, child.note
+                ),
+            )
+            .expect("write W14 drift failure receipt");
+            panic!("W14 drift trace STOP: {name} status={}", child.status);
+        }
+        assert_eq!(batch_number(&row, "drift_total"), expected[name]);
+        rows.push(row);
+        fs::write(
+            output.join("per-program.csv"),
+            super::report::render_csv(&rows),
+        )
+        .expect("write W14 drift partial rows");
+        fs::write(
+            output.join("partial-receipt.txt"),
+            format!(
+                "status=running\ndata=false\ncompleted_programs={}\nrequired_programs=7\n",
+                rows.len()
+            ),
+        )
+        .expect("write W14 drift partial receipt");
+    }
+    let sum = |key| rows.iter().map(|row| batch_number(row, key)).sum::<usize>();
+    assert_eq!(sum("drift_total"), 178);
+    assert_eq!(sum("drift_sampled"), 60);
+    if sum("conflicting_rows") != 0 || sum("conflict_edges") != 0 {
+        fs::write(
+            output.join("receipt.txt"),
+            format!(
+                "status=production-defect\ndata=false\nconflicting_rows={}\nconflict_edges={}\n",
+                sum("conflicting_rows"),
+                sum("conflict_edges")
+            ),
+        )
+        .expect("write W14 drift production-defect receipt");
+        panic!("W14 drift direct replay found a production conflict");
+    }
+    fs::write(
+        output.join("receipt.txt"),
+        format!(
+            "schema=a5-w14-drift-v1\nstatus=ok\ndata=false\nanalysis_head={}\nold_exposure_sha256={OLD_EXPOSURE_SHA256}\nold_pair_sha256={OLD_PAIR_SHA256}\nidentity_rows=178\nfamily_stale_registered_expectation=178\nfamily_producer_change=0\nfamily_replay_classification_change=0\nsample_rule=exhaustive-sloc-le-4413-or-losses-le-10;first-10-pinned-identity-otherwise\nsampled_rows=60\nconflicting_rows=0\nconflict_edges=0\ntrace_kind=direct-replay-production-overlap-map\n",
+            super::orchestrate::git_sha()
+        ),
+    )
+    .expect("write W14 drift diagnostic receipt");
 }
 
 fn finish_a5_item22_batch(

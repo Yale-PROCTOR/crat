@@ -14204,6 +14204,7 @@ fn boc1_run_one() {
             "a4-source-census" => a4_source_census::run_worker(tcx, t_tcx),
             "a5-p1" => a5_measurement::run_worker(tcx, t_tcx),
             "a5-batch-model" => run::run_a5_batch_model(tcx, t_tcx),
+            "a5-w14-drift-trace" => a5_measurement::run_w14_drift_trace_worker(tcx, t_tcx),
             "copy-lend-funnel" => copy_lend_funnel::run_worker(tcx, t_tcx),
             "copy-lend-funnel-subjects" => copy_lend_funnel::run_subject_worker(tcx, t_tcx),
             "p-b" => p_b_measurement::run_worker(tcx, t_tcx),
