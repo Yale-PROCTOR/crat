@@ -101,6 +101,10 @@ impl CallSiteWitnessKey {
     pub(crate) fn caller(self) -> FnKey {
         self.caller
     }
+
+    pub(crate) fn location(self) -> MirLocationKey {
+        self.location
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]

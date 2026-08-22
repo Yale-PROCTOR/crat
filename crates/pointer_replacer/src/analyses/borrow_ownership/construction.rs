@@ -231,11 +231,21 @@ pub(crate) struct BoConstruction {
 #[derive(Clone, Debug)]
 pub(crate) struct VerifiedBo {
     pub(crate) model: FxHashMap<SlotRef, SlotKind>,
+    pub(crate) baseline_model: FxHashMap<SlotRef, SlotKind>,
     pub(crate) retained_c9_marks: BTreeSet<C9MarkKey>,
     pub(crate) retained_c9_plans: Vec<PlannedC9Mark>,
     pub(crate) summary_artifact: super::a5_overlap::A5SummaryArtifact,
     pub(crate) mark_artifact: String,
     pub(crate) receipt: String,
+    pub(crate) round_stats: super::borrow_verify::RoundStats,
+    pub(crate) selector_sources: usize,
+    pub(crate) selector_sinks: usize,
+    pub(crate) emission_stats: BoOwnEmissionStats,
+    pub(crate) construction_emit_elapsed: Duration,
+    pub(crate) construction_coherence_elapsed: Duration,
+    pub(crate) check_sat_count: usize,
+    pub(crate) planned_c9_marks: BTreeSet<C9MarkKey>,
+    pub(crate) producer_stats: super::a5_producer::A5ProducerStats,
 }
 
 const A5_PAIR_LEDGER_SHA256: &str =
@@ -315,6 +325,8 @@ fn a5_receipt(
         "schema=bo-construction-v1\nstatus=ok\ndata=true\ncopy_lend_mode=baseline\n\
          a2_mode=off\na5_mode={}\na5_world={}\nunknown_caller_seeding=false\n\
          a5_abi_guard={}\na5_raw_pairs={}\na5_effective_pairs={}\n\
+         a5_raw_site_pairs={}\na5_raw_site_mut_mut={}\na5_raw_site_mut_read_only={}\n\
+         a5_raw_site_shared_shared={}\n\
          a5_planned_marks={}\na5_retained_marks={}\na5_retained_mark_sites={}\n\
          a5_producer=rustc-mir-current-v1\n\
          a5_foster_producer=MutFacts::from_program(mutability_analysis+SourceVarGroups::postprocess_mut_res)\n\
@@ -325,6 +337,10 @@ fn a5_receipt(
         plan.abi_guard.stamp(),
         plan.stats.raw_pairs,
         plan.stats.effective_pairs,
+        plan.stats.raw_site_pairs,
+        plan.stats.raw_site_mut_mut,
+        plan.stats.raw_site_mut_read_only,
+        plan.stats.raw_site_shared_shared,
         plan.stats.planned_marks,
         retained,
         retained_sites,
@@ -591,14 +607,15 @@ pub(crate) fn solve_bo_a5_config(
         CopyLendMode::Baseline,
     )
     .ok()?;
-    let baseline_model = verify_bo_construction(
+    let (baseline_model, baseline_round_stats) = verify_bo_construction_counting(
         program,
         slots,
         origins,
         &baseline_solver,
         &baseline_construction,
         mut_facts,
-    )?;
+    );
+    let baseline_model = baseline_model?;
     if mode == A5Mode::Baseline {
         let plan = A5Plan::baseline();
         let selected_model_sha256 = model_digest(&baseline_model);
@@ -606,9 +623,19 @@ pub(crate) fn solve_bo_a5_config(
             receipt: a5_receipt(mode, &plan, 0, 0, &selected_model_sha256),
             mark_artifact: a5_mark_artifact(mode, &plan, &BTreeSet::new(), &selected_model_sha256),
             summary_artifact: plan.summary_artifact.clone(),
+            baseline_model: baseline_model.clone(),
             model: baseline_model,
             retained_c9_marks: BTreeSet::new(),
             retained_c9_plans: Vec::new(),
+            round_stats: baseline_round_stats,
+            selector_sources: baseline_construction.selectors.sources().len(),
+            selector_sinks: baseline_construction.selectors.sinks().len(),
+            emission_stats: baseline_construction.stats,
+            construction_emit_elapsed: baseline_construction.emit_elapsed,
+            construction_coherence_elapsed: baseline_construction.coherence_elapsed,
+            check_sat_count: baseline_solver.check_sat_count(),
+            planned_c9_marks: BTreeSet::new(),
+            producer_stats: plan.stats,
         });
     }
 
@@ -628,9 +655,23 @@ pub(crate) fn solve_bo_a5_config(
             receipt: a5_receipt(mode, &plan, 0, 0, &selected_model_sha256),
             mark_artifact: a5_mark_artifact(mode, &plan, &BTreeSet::new(), &selected_model_sha256),
             summary_artifact: plan.summary_artifact.clone(),
+            baseline_model: baseline_model.clone(),
             model: baseline_model,
             retained_c9_marks: BTreeSet::new(),
             retained_c9_plans: Vec::new(),
+            round_stats: baseline_round_stats,
+            selector_sources: baseline_construction.selectors.sources().len(),
+            selector_sinks: baseline_construction.selectors.sinks().len(),
+            emission_stats: baseline_construction.stats,
+            construction_emit_elapsed: baseline_construction.emit_elapsed,
+            construction_coherence_elapsed: baseline_construction.coherence_elapsed,
+            check_sat_count: baseline_solver.check_sat_count(),
+            planned_c9_marks: plan
+                .planned_marks
+                .iter()
+                .map(|mark| mark.key.clone())
+                .collect(),
+            producer_stats: plan.stats,
         });
     }
 
@@ -644,10 +685,10 @@ pub(crate) fn solve_bo_a5_config(
         CopyLendMode::Baseline,
     )
     .ok()?;
-    let model = match mode {
+    let (model, round_stats) = match mode {
         A5Mode::Baseline => unreachable!(),
         A5Mode::PreciseReplay => {
-            verify_bo_construction_with_parameter_overlaps(
+            let (model, stats) = verify_bo_construction_with_parameter_overlaps(
                 program,
                 slots,
                 origins,
@@ -655,12 +696,20 @@ pub(crate) fn solve_bo_a5_config(
                 &construction,
                 mut_facts,
                 &plan.effective_overlaps,
-            )
-            .0?
+            );
+            (model?, stats)
         }
         A5Mode::CoarseConstraint => {
             apply_coarse_constraints(mode, &solver, plan.coarse_pairs.iter().copied());
-            verify_bo_construction(program, slots, origins, &solver, &construction, mut_facts)?
+            let (model, stats) = verify_bo_construction_counting(
+                program,
+                slots,
+                origins,
+                &solver,
+                &construction,
+                mut_facts,
+            );
+            (model?, stats)
         }
     };
     let retained_c9_marks = if mode == A5Mode::PreciseReplay {
@@ -685,8 +734,22 @@ pub(crate) fn solve_bo_a5_config(
         mark_artifact: a5_mark_artifact(mode, &plan, &retained_c9_marks, &selected_model_sha256),
         summary_artifact: plan.summary_artifact.clone(),
         model,
+        baseline_model,
         retained_c9_marks,
         retained_c9_plans,
+        round_stats,
+        selector_sources: construction.selectors.sources().len(),
+        selector_sinks: construction.selectors.sinks().len(),
+        emission_stats: construction.stats,
+        construction_emit_elapsed: construction.emit_elapsed,
+        construction_coherence_elapsed: construction.coherence_elapsed,
+        check_sat_count: solver.check_sat_count(),
+        planned_c9_marks: plan
+            .planned_marks
+            .iter()
+            .map(|mark| mark.key.clone())
+            .collect(),
+        producer_stats: plan.stats,
     })
 }
 

@@ -45,6 +45,10 @@ pub(crate) struct A5ProducerStats {
     pub(crate) calls: usize,
     pub(crate) unresolved_calls: usize,
     pub(crate) raw_pairs: usize,
+    pub(crate) raw_site_pairs: usize,
+    pub(crate) raw_site_mut_mut: usize,
+    pub(crate) raw_site_mut_read_only: usize,
+    pub(crate) raw_site_shared_shared: usize,
     pub(crate) effective_pairs: usize,
     pub(crate) planned_marks: usize,
     pub(crate) missing_mutability_defaults: usize,
@@ -277,10 +281,14 @@ fn caller_pair_dependencies(
 }
 
 fn join_record_classes(records: &[WitnessRecord]) -> WitnessMutability {
+    join_classes(records.iter().map(|record| record.class))
+}
+
+fn join_classes(classes: impl IntoIterator<Item = WitnessMutability>) -> WitnessMutability {
     let mut left_mutable = false;
     let mut right_mutable = false;
-    for record in records {
-        match record.class {
+    for class in classes {
+        match class {
             WitnessMutability::MutMut => {
                 left_mutable = true;
                 right_mutable = true;
@@ -679,6 +687,9 @@ pub(crate) fn produce_a5_plan(
     let mut overlap_pairs = FxHashMap::<LocalDefId, Vec<(Local, Local)>>::default();
     let mut coarse = BTreeMap::<(SlotKey, SlotKey), (SlotRef, SlotRef)>::new();
     let mut planned = Vec::new();
+    let mut site_classes =
+        BTreeMap::<(u32, MirLocationKey, u32, u32, SlotKey, SlotKey), Vec<WitnessMutability>>::new(
+        );
     for (pair, witnesses) in records {
         if !fixpoint.summary().contains(pair) {
             continue;
@@ -690,6 +701,21 @@ pub(crate) fn produce_a5_plan(
             .collect::<Vec<_>>();
         if witnesses.is_empty() {
             continue;
+        }
+        for witness in &witnesses {
+            let params = pair.params();
+            let actuals = witness.key.actuals();
+            site_classes
+                .entry((
+                    witness.key.caller(),
+                    witness.key.location(),
+                    params.first(),
+                    params.second(),
+                    actuals.0,
+                    actuals.1,
+                ))
+                .or_default()
+                .push(witness.class);
         }
         stats.raw_pairs += 1;
         let class = join_record_classes(&witnesses);
@@ -718,6 +744,14 @@ pub(crate) fn produce_a5_plan(
     planned.sort_by(|left, right| left.key.cmp(&right.key));
     planned.dedup_by(|left, right| left.key == right.key);
     stats.planned_marks = planned.len();
+    stats.raw_site_pairs = site_classes.len();
+    for classes in site_classes.into_values() {
+        match join_classes(classes) {
+            WitnessMutability::MutMut => stats.raw_site_mut_mut += 1,
+            WitnessMutability::MutReadOnly { .. } => stats.raw_site_mut_read_only += 1,
+            WitnessMutability::SharedShared => stats.raw_site_shared_shared += 1,
+        }
+    }
     let effective_overlaps = overlap_pairs
         .into_iter()
         .map(|(target, pairs)| (target, ParameterOverlap::from_pairs(pairs)))

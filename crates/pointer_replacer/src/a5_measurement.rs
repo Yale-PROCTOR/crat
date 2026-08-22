@@ -13,6 +13,7 @@ use rustc_middle::{
     ty::TyCtxt,
 };
 use rustc_type_ir::TyKind;
+use sha2::{Digest, Sha256};
 
 use crate::{
     analyses::{
@@ -178,6 +179,31 @@ struct W14Measurement {
     pairs: Vec<ExtendedPairLedgerRow>,
     exposures: Vec<ExposureLedgerRow>,
     precise_rounds: usize,
+}
+
+struct BatchPrecise<'a> {
+    model: &'a rustc_hash::FxHashMap<SlotRef, SlotKind>,
+    planned_marks: &'a BTreeSet<C9MarkKey>,
+    model_retained_marks: usize,
+    rounds: usize,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(super) struct BatchW14Summary {
+    pub pair_den: usize,
+    pub mut_mut: usize,
+    pub mut_read_only: usize,
+    pub shared_shared: usize,
+    pub effective_pairs: usize,
+    pub planned_marks: usize,
+    pub model_retained_marks: usize,
+    pub exposures: usize,
+    pub demoted: usize,
+    pub marked: usize,
+    pub shared_safe: usize,
+    pub replay_safe: usize,
+    pub unresolved: usize,
+    pub precise_rounds: usize,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -961,35 +987,58 @@ fn run_focused_w14(
     formals: &BTreeMap<(String, u32), ArtifactFormal>,
     baseline: &AcceptedFormalModel,
     measured: &MeasuredProgram,
+    batch: Option<&BatchPrecise<'_>>,
 ) -> Result<W14Measurement, String> {
     if measured.extended_pairs.len() != measured.pairs.len()
         || measured.extended_pairs.iter().any(|row| !row.raw_overlap)
     {
         return Err("W14 raw/extended pair ledger does not cover the exact denominator".to_owned());
     }
-    let parameter_overlaps = build_parameter_overlaps(program, &measured.extended_pairs)?;
-    let solver = KindSolver::new(slots);
-    let origins = compute_origins(program);
-    let construction = construct_bo_into(
-        program,
-        slots,
-        &origins,
-        mutability,
-        &solver,
-        CopyLendMode::Baseline,
-    )
-    .map_err(|error| format!("W14 construction failed: {error}"))?;
-    let (model, stats) = verify_bo_construction_with_parameter_overlaps(
-        program,
-        slots,
-        &origins,
-        &solver,
-        &construction,
-        mutability,
-        &parameter_overlaps,
-    );
-    let model = model.ok_or_else(|| "W14 precise replay declined".to_owned())?;
-    let precise = project_formal_kinds(program.tcx, program, slots, formals, &model)?;
+    let (precise, precise_rounds) = if let Some(batch) = batch {
+        let measured_marks = measured
+            .final_marks
+            .iter()
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        if measured_marks != *batch.planned_marks {
+            return Err(format!(
+                "production planned-mark identities disagree with W14: production={} W14={}",
+                batch.planned_marks.len(),
+                measured_marks.len()
+            ));
+        }
+        (
+            project_formal_kinds(program.tcx, program, slots, formals, batch.model)?,
+            batch.rounds,
+        )
+    } else {
+        let parameter_overlaps = build_parameter_overlaps(program, &measured.extended_pairs)?;
+        let solver = KindSolver::new(slots);
+        let origins = compute_origins(program);
+        let construction = construct_bo_into(
+            program,
+            slots,
+            &origins,
+            mutability,
+            &solver,
+            CopyLendMode::Baseline,
+        )
+        .map_err(|error| format!("W14 construction failed: {error}"))?;
+        let (model, stats) = verify_bo_construction_with_parameter_overlaps(
+            program,
+            slots,
+            &origins,
+            &solver,
+            &construction,
+            mutability,
+            &parameter_overlaps,
+        );
+        let model = model.ok_or_else(|| "W14 precise replay declined".to_owned())?;
+        (
+            project_formal_kinds(program.tcx, program, slots, formals, &model)?,
+            stats.rounds,
+        )
+    };
 
     let filtered_pairs = filter_planned_marks_postsolve(&measured.extended_pairs, &precise);
     let exposures = build_exposure_ledger(
@@ -1002,7 +1051,7 @@ fn run_focused_w14(
     Ok(W14Measurement {
         pairs: filtered_pairs,
         exposures,
-        precise_rounds: stats.rounds,
+        precise_rounds,
     })
 }
 
@@ -1485,6 +1534,7 @@ fn measure_tcx(
     accepted: &AcceptedFormalModel,
     accepted_model_time: Duration,
     focused_w14: bool,
+    batch: Option<&BatchPrecise<'_>>,
 ) -> Result<Measurement, String> {
     let program = super::collect_program(tcx);
     let slots = CrateSlots::build(&program);
@@ -1734,6 +1784,7 @@ fn measure_tcx(
                 formals,
                 accepted,
                 &measured,
+                batch,
             )
         })
         .transpose()?;
@@ -1752,6 +1803,516 @@ fn measure_tcx(
             accepted_model: accepted_model_time,
         },
     })
+}
+
+pub(super) fn run_batch_w14(
+    program_name: &str,
+    tcx: TyCtxt<'_>,
+    baseline_model: &rustc_hash::FxHashMap<SlotRef, SlotKind>,
+    precise_model: &rustc_hash::FxHashMap<SlotRef, SlotKind>,
+    planned_marks: &BTreeSet<C9MarkKey>,
+    model_retained_marks: usize,
+    precise_rounds: usize,
+    artifact_dir: &Path,
+) -> Result<BatchW14Summary, String> {
+    let snapshot = std::env::var_os("CRAT_A5_SNAPSHOT")
+        .map(std::path::PathBuf::from)
+        .ok_or_else(|| "A5 batch requires CRAT_A5_SNAPSHOT".to_owned())?;
+    let formals = snapshot_formals(&snapshot, program_name)?;
+    let program = super::collect_program(tcx);
+    let slots = CrateSlots::build(&program);
+    let baseline = project_formal_kinds(tcx, &program, &slots, &formals, baseline_model)?;
+    let batch = BatchPrecise {
+        model: precise_model,
+        planned_marks,
+        model_retained_marks,
+        rounds: precise_rounds,
+    };
+    let measured = measure_tcx(
+        program_name,
+        tcx,
+        &formals,
+        &baseline,
+        Duration::ZERO,
+        true,
+        Some(&batch),
+    )?;
+    let w14 = measured
+        .w14
+        .as_ref()
+        .ok_or_else(|| "A5 batch W14 result is absent".to_owned())?;
+    let count = |class| {
+        w14.exposures
+            .iter()
+            .filter(|row| row.class == class)
+            .count()
+    };
+    let selected_marks = w14.pairs.iter().filter(|row| row.selected_mark).count();
+    if selected_marks != batch.model_retained_marks {
+        return Err(format!(
+            "production model-retained marks {} disagree with W14 {}",
+            batch.model_retained_marks, selected_marks
+        ));
+    }
+
+    fs::create_dir_all(artifact_dir)
+        .map_err(|error| format!("create A5 batch artifact dir: {error}"))?;
+    let mut pairs = String::from(
+        "program\tsite\tleft_argument\tright_argument\tclass\ttarget_formals\tleft_formals\tright_formals\traw_overlap\teffective_overlap\tmarkability\tretained_mark\tcopy_lend_mode\ta5_mode\ta5_world\ta5_abi_guard\tplanned_mark\tmodel_attribution\n",
+    );
+    for row in &w14.pairs {
+        let line = render_extended_pair_line(row);
+        pairs.push_str(line.strip_prefix(W14_PAIR_SENTINEL).unwrap_or(&line));
+        pairs.push('\n');
+    }
+    fs::write(artifact_dir.join("w14-pair-ledger.tsv"), pairs)
+        .map_err(|error| format!("write W14 pair ledger: {error}"))?;
+    let mut exposures = String::from(
+        "program\tfunction\tparameter\tdepth\tbaseline_kind\tprecise_kind\tmovement\tclass\tcopy_lend_mode\ta5_mode\ta5_world\ta5_abi_guard\teffective_mut_mut\teffective_mut_read_only\teffective_shared_shared\tincidence\n",
+    );
+    for row in &w14.exposures {
+        let line = render_exposure_line(row);
+        exposures.push_str(line.strip_prefix(W14_EXPOSURE_SENTINEL).unwrap_or(&line));
+        exposures.push('\n');
+    }
+    fs::write(artifact_dir.join("w14-exposure-ledger.tsv"), exposures)
+        .map_err(|error| format!("write W14 exposure ledger: {error}"))?;
+
+    Ok(BatchW14Summary {
+        pair_den: measured.counts.pair_denominator,
+        mut_mut: measured.counts.mut_mut,
+        mut_read_only: measured.counts.mut_read_only,
+        shared_shared: measured.counts.shared_shared,
+        effective_pairs: w14.pairs.iter().filter(|row| row.effective_overlap).count(),
+        planned_marks: w14.pairs.iter().filter(|row| row.planned_mark).count(),
+        model_retained_marks: selected_marks,
+        exposures: w14.exposures.len(),
+        demoted: count(ExposureClass::Demoted),
+        marked: count(ExposureClass::Marked),
+        shared_safe: count(ExposureClass::SharedSafe),
+        replay_safe: count(ExposureClass::ReplaySafe),
+        unresolved: count(ExposureClass::Unresolved),
+        precise_rounds: w14.precise_rounds,
+    })
+}
+
+fn batch_sha256(path: &Path) -> Result<String, String> {
+    let bytes = fs::read(path).map_err(|error| format!("read {}: {error}", path.display()))?;
+    Ok(format!("{:x}", Sha256::digest(bytes)))
+}
+
+fn batch_artifact_files(root: &Path, directory: &Path, out: &mut Vec<std::path::PathBuf>) {
+    let mut entries = fs::read_dir(directory)
+        .unwrap_or_else(|error| panic!("read {}: {error}", directory.display()))
+        .map(|entry| entry.expect("batch artifact entry").path())
+        .collect::<Vec<_>>();
+    entries.sort();
+    for path in entries {
+        if path.is_dir() {
+            batch_artifact_files(root, &path, out);
+        } else if path.file_name().and_then(|name| name.to_str())
+            != Some("artifact-manifest.sha256")
+        {
+            out.push(
+                path.strip_prefix(root)
+                    .expect("artifact below root")
+                    .to_path_buf(),
+            );
+        }
+    }
+}
+
+fn write_batch_manifest(root: &Path) -> Result<String, String> {
+    let mut files = Vec::new();
+    batch_artifact_files(root, root, &mut files);
+    files.sort();
+    let mut manifest = String::new();
+    for relative in files {
+        manifest.push_str(&format!(
+            "{}  ./{}\n",
+            batch_sha256(&root.join(&relative))?,
+            relative.display()
+        ));
+    }
+    let path = root.join("artifact-manifest.sha256");
+    fs::write(&path, manifest)
+        .map_err(|error| format!("write batch artifact manifest: {error}"))?;
+    batch_sha256(&path)
+}
+
+fn batch_number(row: &super::report::Row, key: &str) -> usize {
+    row.get(key)
+        .unwrap_or_else(|| panic!("batch row lacks {key}"))
+        .parse::<usize>()
+        .unwrap_or_else(|error| panic!("batch row {key} is not numeric: {error}"))
+}
+
+#[test]
+#[ignore = "A5 item-22 serialized baseline/precise/coarse corpus sweep"]
+fn a5_item22_batch_corpus() {
+    const DIGEST: &str = "db96829b5c2b0db28fb4bb9ddd3d32901b5d4e6e4134da07ada0d513d94eb4c6";
+    assert_eq!(
+        std::env::var("CRAT_BOC1_SUBSTRATE").as_deref(),
+        Ok("derived")
+    );
+    assert_eq!(std::env::var("CRAT_BOC1_MEM_MB").as_deref(), Ok("49152"));
+    assert_eq!(
+        std::env::var("CRAT_BOC1_TIMEOUT_SECS").as_deref(),
+        Ok("14400")
+    );
+    assert_eq!(super::CORPUS.len(), 20);
+    let snapshot = std::path::PathBuf::from(
+        std::env::var_os("CRAT_A5_SNAPSHOT").expect("batch requires CRAT_A5_SNAPSHOT"),
+    );
+    assert!(
+        snapshot.is_dir(),
+        "missing A5 snapshot {}",
+        snapshot.display()
+    );
+    let output = super::orchestrate::out_dir().join("a5-item22-batch");
+    fs::create_dir_all(&output).expect("create A5 item-22 output");
+    let root = super::orchestrate::workspace_root();
+    let timeout = Duration::from_secs(14_400);
+    let modes = [
+        ("baseline", "baseline"),
+        ("precise", "precise_replay"),
+        ("coarse", "coarse_constraint"),
+    ];
+    let mut rows = Vec::<super::report::Row>::new();
+
+    for (label, mode) in modes {
+        for program in super::CORPUS {
+            let input = program.input_path(&root);
+            let shard = output.join(label).join(program.name);
+            fs::create_dir_all(&shard).expect("create A5 batch shard");
+            let common = vec![
+                ("CRAT_BO_A5_MODE", mode.to_owned()),
+                (
+                    "CRAT_BO_A5_ATTESTATION",
+                    "frozen_benchmark_graph".to_owned(),
+                ),
+                ("CRAT_BO_COPY_LEND_MODE", "baseline".to_owned()),
+                ("CRAT_BO_A2_MODE", "off".to_owned()),
+                ("CRAT_BO_REPAIR", "mode_a".to_owned()),
+                ("CRAT_A5_SNAPSHOT", snapshot.display().to_string()),
+                ("CRAT_A5_BATCH_SHARD_DIR", shard.display().to_string()),
+                (
+                    "CRAT_BOC1_PROJECTION_SNAPSHOT",
+                    shard.join("model-projection.tsv").display().to_string(),
+                ),
+                (
+                    "CRAT_BOC1_CROWN_ARTIFACT",
+                    root.join("benchmarks/rs-crown-transformed")
+                        .display()
+                        .to_string(),
+                ),
+            ];
+            eprintln!("[a5-item22] {label}/{} model", program.name);
+            let model = super::orchestrate::run_child_labeled(
+                program.name,
+                &input,
+                "a5-batch-model",
+                &format!("a5-batch-model-{label}"),
+                timeout,
+                &common,
+            );
+            let model_row = model.row.clone().unwrap_or_default();
+            if model.status != "ok" || model_row.get("status") != Some("ok") {
+                fs::write(
+                    output.join("receipt.txt"),
+                    format!(
+                        "status=failed\ndata=false\nprogram={}\na5_mode={mode}\nphase=model\nchild_status={}\nnote={}\nderived_substrate_sha256={DIGEST}\n",
+                        program.name, model.status, model.note
+                    ),
+                )
+                .expect("write failed A5 batch receipt");
+                panic!(
+                    "A5 item-22 STOP: {label}/{} model status={} note={}",
+                    program.name, model.status, model.note
+                );
+            }
+
+            eprintln!("[a5-item22] {label}/{} rewriter", program.name);
+            let rewrite = super::orchestrate::run_child_labeled(
+                program.name,
+                &input,
+                "m1-emit",
+                &format!("a5-m1-emit-{label}"),
+                timeout,
+                &common,
+            );
+            let rewrite_row = rewrite.row.clone().unwrap_or_default();
+            if rewrite.status != "ok" || rewrite_row.get("status") != Some("ok") {
+                fs::write(
+                    output.join("receipt.txt"),
+                    format!(
+                        "status=failed\ndata=false\nprogram={}\na5_mode={mode}\nphase=rewriter\nchild_status={}\nnote={}\nderived_substrate_sha256={DIGEST}\n",
+                        program.name, rewrite.status, rewrite.note
+                    ),
+                )
+                .expect("write failed A5 batch receipt");
+                panic!(
+                    "A5 item-22 STOP: {label}/{} rewriter status={} note={}",
+                    program.name, rewrite.status, rewrite.note
+                );
+            }
+
+            let mut combined = super::report::Row::default();
+            combined.set("program", program.name);
+            combined.set("configuration", label);
+            for (key, value) in &model_row.0 {
+                if !matches!(key.as_str(), "program" | "mode") {
+                    combined.set(key, value);
+                }
+            }
+            for key in [
+                "status",
+                "emitted",
+                "degraded",
+                "files_touched",
+                "reverted",
+                "a5_model_retained_marks",
+                "a5_emission_retained_marks",
+                "t_total_s",
+            ] {
+                if let Some(value) = rewrite_row.get(key) {
+                    combined.set(&format!("rw_{key}"), value);
+                }
+            }
+            for (key, value) in &rewrite_row.0 {
+                if key.starts_with("reason_") {
+                    combined.set(&format!("rw_{key}"), value);
+                }
+            }
+            for (key, expected) in [
+                ("a5_mode", mode),
+                ("a5_world", "closed_world_frozen_graph"),
+                ("copy_lend_mode", "baseline"),
+                ("a2_mode", "off"),
+            ] {
+                assert_eq!(combined.get(key), Some(expected), "model stamp {key}");
+                assert_eq!(rewrite_row.get(key), Some(expected), "rewriter stamp {key}");
+            }
+            fs::write(
+                shard.join("shard-receipt.txt"),
+                format!(
+                    "status=ok\ndata=true\nprogram={}\na5_mode={mode}\na5_world=closed_world_frozen_graph\ncopy_lend_mode=baseline\na2_mode=off\nmodel_wall_s={:.3}\nrewriter_wall_s={:.3}\nderived_substrate_sha256={DIGEST}\n",
+                    program.name, model.wall_s, rewrite.wall_s
+                ),
+            )
+            .expect("write A5 shard receipt");
+            rows.push(combined);
+            fs::write(
+                output.join("per-program.csv"),
+                super::report::render_csv(&rows),
+            )
+            .expect("write A5 partial rows");
+            fs::write(
+                output.join("partial-receipt.txt"),
+                format!(
+                    "status=running\ndata=false\ncompleted_rows={}\nrequired_rows=60\nderived_substrate_sha256={DIGEST}\n",
+                    rows.len()
+                ),
+            )
+            .expect("write A5 partial receipt");
+        }
+    }
+    assert_eq!(rows.len(), 60);
+
+    finish_a5_item22_batch(&output, &rows, modes, DIGEST);
+}
+
+fn finish_a5_item22_batch(
+    output: &Path,
+    rows: &[super::report::Row],
+    modes: [(&str, &str); 3],
+    digest: &str,
+) {
+    let reason_keys = rows
+        .iter()
+        .flat_map(|row| row.0.iter().map(|(key, _)| key.as_str()))
+        .filter(|key| key.starts_with("rw_reason_") && *key != "rw_reason_key_count")
+        .collect::<BTreeSet<_>>();
+    assert_eq!(reason_keys.len(), 27, "A5 batch 27-key oracle cardinality");
+    let mut aggregates = Vec::new();
+    for (label, mode) in modes {
+        let selected = rows
+            .iter()
+            .filter(|row| row.get("configuration") == Some(label))
+            .collect::<Vec<_>>();
+        assert_eq!(selected.len(), 20);
+        let sum = |key| {
+            selected
+                .iter()
+                .map(|row| batch_number(row, key))
+                .sum::<usize>()
+        };
+        let mut row = super::report::Row::default();
+        row.set("configuration", label);
+        row.set("a5_mode", mode);
+        row.set("accepted", selected.len());
+        for key in [
+            "n_ref",
+            "n_raw",
+            "n_own",
+            "n_ref_d0",
+            "n_own_d0",
+            "sources_total",
+            "sources_kept",
+            "sinks_total",
+            "sinks_kept",
+            "s23_stores_owned",
+            "s23_owning_model",
+            "a5_production_pair_den",
+            "a5_production_mut_mut",
+            "a5_production_mut_read_only",
+            "a5_production_shared_shared",
+            "a5_planned_marks",
+            "a5_model_retained_marks",
+            "rw_emitted",
+            "rw_degraded",
+            "rw_a5_model_retained_marks",
+            "rw_a5_emission_retained_marks",
+        ] {
+            row.set(key, sum(key));
+        }
+        row.set("rw_reason_key_count", reason_keys.len());
+        for key in &reason_keys {
+            let count = selected
+                .iter()
+                .filter_map(|program| program.get(key))
+                .map(|value| value.parse::<usize>().expect("numeric reason count"))
+                .sum::<usize>();
+            row.set(key, count);
+        }
+        let mut projection = BTreeMap::<String, usize>::new();
+        for program in super::CORPUS {
+            let source = fs::read_to_string(
+                output
+                    .join(label)
+                    .join(program.name)
+                    .join("model-projection.tsv"),
+            )
+            .expect("read A5 projection snapshot");
+            for line in source.lines().skip(1) {
+                let fields = line.split('\t').collect::<Vec<_>>();
+                assert_eq!(fields.len(), 9, "projection row width");
+                *projection.entry(fields[2].to_owned()).or_default() += 1;
+            }
+        }
+        let projection_total = projection.values().sum::<usize>();
+        assert_eq!(projection_total, 2_414, "official projection universe");
+        row.set("projection_total", projection_total);
+        row.set(
+            "projection_ref_backed",
+            projection
+                .get("predicted-eliminated-ref-backed")
+                .copied()
+                .unwrap_or(0),
+        );
+        row.set(
+            "projection_owning_backed",
+            projection
+                .get("predicted-eliminated-owning-backed")
+                .copied()
+                .unwrap_or(0),
+        );
+        row.set(
+            "projection_remaining",
+            projection.get("predicted-remaining").copied().unwrap_or(0),
+        );
+        row.set(
+            "projection_unmapped",
+            projection
+                .get("unmapped-counted-remaining")
+                .copied()
+                .unwrap_or(0),
+        );
+        if label == "precise" {
+            for key in [
+                "a5_w14_pairs",
+                "a5_w14_mut_mut",
+                "a5_w14_mut_read_only",
+                "a5_w14_shared_shared",
+                "a5_w14_effective_pairs",
+                "a5_w14_planned_marks",
+                "a5_w14_model_retained_marks",
+                "a5_w14_exposures",
+                "a5_w14_demoted",
+                "a5_w14_marked",
+                "a5_w14_shared_safe",
+                "a5_w14_replay_safe",
+                "a5_w14_unresolved",
+                "a5_w14_precise_rounds",
+            ] {
+                row.set(key, sum(key));
+            }
+        }
+        aggregates.push(row);
+    }
+
+    let precise = &aggregates[1];
+    for aggregate in &aggregates {
+        assert_eq!(
+            batch_number(aggregate, "projection_unmapped"),
+            254,
+            "official projection unmapped validity limit"
+        );
+    }
+    for (key, expected) in [
+        ("a5_w14_pairs", 5_555),
+        ("a5_w14_mut_mut", 2_391),
+        ("a5_w14_mut_read_only", 2_480),
+        ("a5_w14_shared_shared", 684),
+        ("a5_w14_effective_pairs", 5_551),
+        ("a5_w14_planned_marks", 4),
+        ("a5_w14_model_retained_marks", 1),
+        ("a5_w14_exposures", 2_014),
+        ("a5_w14_demoted", 389),
+        ("a5_w14_marked", 2),
+        ("a5_w14_shared_safe", 114),
+        ("a5_w14_replay_safe", 1_509),
+        ("a5_w14_unresolved", 0),
+    ] {
+        assert_eq!(
+            batch_number(precise, key),
+            expected,
+            "A5 item-22 gate {key}"
+        );
+    }
+    for aggregate in [&aggregates[1], &aggregates[2]] {
+        assert_eq!(batch_number(aggregate, "a5_production_pair_den"), 5_555);
+        assert_eq!(batch_number(aggregate, "a5_production_mut_mut"), 2_391);
+        assert_eq!(
+            batch_number(aggregate, "a5_production_mut_read_only"),
+            2_480
+        );
+        assert_eq!(batch_number(aggregate, "a5_production_shared_shared"), 684);
+    }
+    assert!(
+        batch_number(precise, "rw_a5_emission_retained_marks")
+            <= batch_number(precise, "rw_a5_model_retained_marks")
+    );
+
+    fs::write(
+        output.join("aggregate.csv"),
+        super::report::render_csv(&aggregates),
+    )
+    .expect("write A5 aggregate");
+    fs::write(
+        output.join("receipt.txt"),
+        format!(
+            "schema=a5-item22-batch-v1\nstatus=ok\ndata=true\nanalysis_head={}\nprograms=20\nconfigurations=baseline,precise_replay,coarse_constraint\na5_world=closed_world_frozen_graph\ncopy_lend_mode=baseline\na2_mode=off\nz3_smt_seed=0\nz3_sat_seed=0\nmem_cap_mib=49152\nworker_bound_s=14400\nderived_substrate_sha256={digest}\n",
+            super::orchestrate::git_sha()
+        ),
+    )
+    .expect("write A5 batch receipt");
+    let manifest = write_batch_manifest(output).expect("write A5 batch manifest");
+    fs::write(
+        output.join("complete.txt"),
+        format!("status=ok\ndata=true\nmanifest_sha256={manifest}\n"),
+    )
+    .expect("write A5 batch completion");
 }
 
 pub(super) fn run_worker(tcx: TyCtxt<'_>, t_tcx: Duration) -> super::report::Row {
@@ -1786,7 +2347,15 @@ pub(super) fn run_worker(tcx: TyCtxt<'_>, t_tcx: Duration) -> super::report::Row
         let rust_program = super::collect_program(tcx);
         let accepted = accepted_current_model(tcx, &rust_program, &formals)?;
         let model_time = t_model.elapsed();
-        measure_tcx(&program, tcx, &formals, &accepted, model_time, focused_w14)
+        measure_tcx(
+            &program,
+            tcx,
+            &formals,
+            &accepted,
+            model_time,
+            focused_w14,
+            None,
+        )
     });
     match measured {
         Ok(measured) => {
@@ -4405,9 +4974,16 @@ pub unsafe fn entry(p: *mut i32, q: *mut i32) { two(p, q); }
 
                 let accepted = accepted_current_model(tcx, &program, &formals)
                     .expect("current-head baseline model");
-                let measured =
-                    measure_tcx("fixture", tcx, &formals, &accepted, Duration::ZERO, false)
-                        .expect("measured fixture");
+                let measured = measure_tcx(
+                    "fixture",
+                    tcx,
+                    &formals,
+                    &accepted,
+                    Duration::ZERO,
+                    false,
+                    None,
+                )
+                .expect("measured fixture");
 
                 assert_eq!(measured.counts.sites_with_two_ref_args, 1);
                 assert_eq!(measured.counts.sites_not_proven_disjoint, 1);
@@ -4416,9 +4992,16 @@ pub unsafe fn entry(p: *mut i32, q: *mut i32) { two(p, q); }
                 assert_eq!(measured.counts.unknown_caller_reachable, 2);
                 assert_eq!(measured.counts.local_functions, 2);
 
-                let focused =
-                    measure_tcx("fixture", tcx, &formals, &accepted, Duration::ZERO, true)
-                        .expect("focused W14 fixture");
+                let focused = measure_tcx(
+                    "fixture",
+                    tcx,
+                    &formals,
+                    &accepted,
+                    Duration::ZERO,
+                    true,
+                    None,
+                )
+                .expect("focused W14 fixture");
                 let w14 = focused.w14.expect("focused W14 rows");
                 assert_eq!(w14.pairs.len(), 1);
                 assert_eq!(w14.exposures.len(), 2);
