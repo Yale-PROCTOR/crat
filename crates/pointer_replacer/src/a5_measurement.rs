@@ -1957,6 +1957,18 @@ fn batch_model_digest_stamp(row: &super::report::Row, expected: &str) -> Result<
     }
 }
 
+const A5_BATCH_ATTESTED_GUARD: &str = "permitted:measurement-frozen-graph-attested";
+
+fn batch_attestation_stamp(row: &super::report::Row) -> Result<(), String> {
+    match row.get("a5_abi_guard") {
+        Some(A5_BATCH_ATTESTED_GUARD) => Ok(()),
+        Some(actual) => Err(format!(
+            "batch row lacks the permitted frozen-graph attestation: got {actual}"
+        )),
+        None => Err("batch row lacks the A5 ABI-guard stamp".to_owned()),
+    }
+}
+
 #[test]
 fn batch_model_digest_stamp_is_mandatory_and_exact() {
     let expected = "7aa16d5b63ff39e6aaabd3590ec2be9c88c9d8a753bd9f74cd4e6056d9974fd7";
@@ -1973,6 +1985,101 @@ fn batch_model_digest_stamp_is_mandatory_and_exact() {
         batch_model_digest_stamp(&present, expected).is_err(),
         "a merely present but wrong digest must be refused"
     );
+}
+
+#[test]
+fn batch_attestation_stamp_is_mandatory_and_product_default_is_not_accepted() {
+    let missing = super::report::Row::default();
+    assert!(batch_attestation_stamp(&missing).is_err());
+
+    let mut product_default = super::report::Row::default();
+    product_default.set("a5_abi_guard", "refused:unresolved-target");
+    assert!(batch_attestation_stamp(&product_default).is_err());
+
+    let mut attested = super::report::Row::default();
+    attested.set("a5_abi_guard", A5_BATCH_ATTESTED_GUARD);
+    assert_eq!(batch_attestation_stamp(&attested), Ok(()));
+}
+
+fn validate_launch4_preflight(
+    output: &Path,
+    rows: &[super::report::Row],
+    official_digest: &str,
+) -> Result<(), String> {
+    if rows.len() != 3 {
+        return Err(format!(
+            "preflight expected three bst rows, got {}",
+            rows.len()
+        ));
+    }
+    for (configuration, mode) in [
+        ("baseline", "baseline"),
+        ("precise", "precise_replay"),
+        ("coarse", "coarse_constraint"),
+    ] {
+        let row = rows
+            .iter()
+            .find(|row| row.get("configuration") == Some(configuration))
+            .ok_or_else(|| format!("preflight lacks {configuration} row"))?;
+        batch_model_digest_stamp(row, official_digest)?;
+        batch_attestation_stamp(row)?;
+        for (key, expected) in [
+            ("a5_mode", mode),
+            ("a5_world", "closed_world_frozen_graph"),
+            ("copy_lend_mode", "baseline"),
+            ("a2_mode", "off"),
+            ("rw_a5_abi_guard", A5_BATCH_ATTESTED_GUARD),
+        ] {
+            if row.get(key) != Some(expected) {
+                return Err(format!(
+                    "preflight {configuration} stamp {key} expected {expected:?}, got {:?}",
+                    row.get(key)
+                ));
+            }
+        }
+        for key in [
+            "a5_production_pair_den",
+            "a5_production_mut_mut",
+            "a5_production_mut_read_only",
+            "a5_production_shared_shared",
+            "a5_planned_marks",
+            "a5_model_retained_marks",
+            "rw_a5_model_retained_marks",
+            "rw_a5_emission_retained_marks",
+        ] {
+            batch_number(row, key);
+        }
+    }
+
+    let precise = rows
+        .iter()
+        .find(|row| row.get("configuration") == Some("precise"))
+        .expect("checked precise row");
+    for key in [
+        "a5_w14_pairs",
+        "a5_w14_mut_mut",
+        "a5_w14_mut_read_only",
+        "a5_w14_shared_shared",
+        "a5_w14_effective_pairs",
+        "a5_w14_planned_marks",
+        "a5_w14_model_retained_marks",
+        "a5_w14_exposures",
+        "a5_w14_demoted",
+        "a5_w14_marked",
+        "a5_w14_shared_safe",
+        "a5_w14_replay_safe",
+        "a5_w14_unresolved",
+        "a5_w14_precise_rounds",
+    ] {
+        batch_number(precise, key);
+    }
+    for artifact in ["w14-pair-ledger.tsv", "w14-exposure-ledger.tsv"] {
+        let path = output.join("precise").join("bst").join(artifact);
+        if !path.is_file() {
+            return Err(format!("preflight lacks {}", path.display()));
+        }
+    }
+    Ok(())
 }
 
 #[test]
@@ -2018,13 +2125,20 @@ fn a5_item22_batch_corpus() {
     fs::write(
         output.join("preflight-receipt.txt"),
         format!(
-            "status=ready\ndata=false\nanalysis_head={}\nderived_substrate_sha256={DIGEST}\nofficial_evaluation_link={}\nofficial_evaluation_target={}\nofficial_evaluation_sha256_start={official_digest}\nofficial_evaluation_link_installed=true\n",
+            "status=ready\ndata=false\nanalysis_head={}\na5_world=closed_world_frozen_graph\na5_abi_guard=required:{A5_BATCH_ATTESTED_GUARD}\ncopy_lend_mode=baseline\na2_mode=off\nderived_substrate_sha256={DIGEST}\nofficial_evaluation_link={}\nofficial_evaluation_target={}\nofficial_evaluation_sha256_start={official_digest}\nofficial_evaluation_link_installed=true\n",
             super::orchestrate::git_sha(),
             official_link.display(),
             official_target.display(),
         ),
     )
     .expect("write A5 batch preflight receipt");
+    let preflight = std::env::var("CRAT_A5_BATCH_PREFLIGHT").as_deref() == Ok("1");
+    let programs = if preflight {
+        &super::CORPUS[..1]
+    } else {
+        super::CORPUS
+    };
+    let required_rows = programs.len() * 3;
     let timeout = Duration::from_secs(14_400);
     let modes = [
         ("baseline", "baseline"),
@@ -2034,7 +2148,7 @@ fn a5_item22_batch_corpus() {
     let mut rows = Vec::<super::report::Row>::new();
 
     for (label, mode) in modes {
-        for program in super::CORPUS {
+        for program in programs {
             let input = program.input_path(&root);
             let shard = output.join(label).join(program.name);
             fs::create_dir_all(&shard).expect("create A5 batch shard");
@@ -2132,6 +2246,7 @@ fn a5_item22_batch_corpus() {
                 "reverted",
                 "a5_model_retained_marks",
                 "a5_emission_retained_marks",
+                "a5_abi_guard",
                 "t_total_s",
             ] {
                 if let Some(value) = rewrite_row.get(key) {
@@ -2146,6 +2261,7 @@ fn a5_item22_batch_corpus() {
             for (key, expected) in [
                 ("a5_mode", mode),
                 ("a5_world", "closed_world_frozen_graph"),
+                ("a5_abi_guard", A5_BATCH_ATTESTED_GUARD),
                 ("copy_lend_mode", "baseline"),
                 ("a2_mode", "off"),
             ] {
@@ -2154,10 +2270,11 @@ fn a5_item22_batch_corpus() {
             }
             batch_model_digest_stamp(&combined, &official_digest)
                 .expect("per-worker official artifact digest");
+            batch_attestation_stamp(&combined).expect("per-worker frozen-graph attestation");
             fs::write(
                 shard.join("shard-receipt.txt"),
                 format!(
-                    "status=ok\ndata=true\nprogram={}\na5_mode={mode}\na5_world=closed_world_frozen_graph\ncopy_lend_mode=baseline\na2_mode=off\nmodel_wall_s={:.3}\nrewriter_wall_s={:.3}\nderived_substrate_sha256={DIGEST}\nofficial_evaluation_link={}\nofficial_evaluation_target={}\nofficial_evaluation_sha256={}\n",
+                    "status=ok\ndata=true\nprogram={}\na5_mode={mode}\na5_world=closed_world_frozen_graph\na5_abi_guard={A5_BATCH_ATTESTED_GUARD}\ncopy_lend_mode=baseline\na2_mode=off\nmodel_wall_s={:.3}\nrewriter_wall_s={:.3}\nderived_substrate_sha256={DIGEST}\nofficial_evaluation_link={}\nofficial_evaluation_target={}\nofficial_evaluation_sha256={}\n",
                     program.name,
                     model.wall_s,
                     rewrite.wall_s,
@@ -2176,20 +2293,32 @@ fn a5_item22_batch_corpus() {
             fs::write(
                 output.join("partial-receipt.txt"),
                 format!(
-                    "status=running\ndata=false\ncompleted_rows={}\nrequired_rows=60\nderived_substrate_sha256={DIGEST}\n",
-                    rows.len()
+                    "status=running\ndata=false\ncompleted_rows={}\nrequired_rows={required_rows}\nderived_substrate_sha256={DIGEST}\n",
+                    rows.len(),
                 ),
             )
             .expect("write A5 partial receipt");
         }
     }
-    assert_eq!(rows.len(), 60);
+    assert_eq!(rows.len(), required_rows);
 
     let final_digest = batch_sha256(&official_link).expect("rehash official evaluation link");
     assert_eq!(
         final_digest, official_digest,
         "official evaluation digest moved during the sweep"
     );
+    if preflight {
+        validate_launch4_preflight(&output, &rows, &official_digest)
+            .unwrap_or_else(|error| panic!("A5 item-22 launch-4 preflight STOP: {error}"));
+        fs::write(
+            output.join("preflight-complete.txt"),
+            format!(
+                "status=ok\ndata=false\nprogram=bst\nconfigurations=baseline,precise_replay,coarse_constraint\nrows=3\na5_abi_guard={A5_BATCH_ATTESTED_GUARD}\nofficial_evaluation_sha256={official_digest}\n"
+            ),
+        )
+        .expect("write A5 launch-4 preflight completion");
+        return;
+    }
     finish_a5_item22_batch(
         &output,
         &rows,
@@ -2232,6 +2361,10 @@ fn finish_a5_item22_batch(
         let mut row = super::report::Row::default();
         row.set("configuration", label);
         row.set("a5_mode", mode);
+        row.set("a5_world", "closed_world_frozen_graph");
+        row.set("a5_abi_guard", A5_BATCH_ATTESTED_GUARD);
+        row.set("copy_lend_mode", "baseline");
+        row.set("a2_mode", "off");
         row.set("accepted", selected.len());
         for key in [
             "n_ref",
@@ -2384,7 +2517,7 @@ fn finish_a5_item22_batch(
     fs::write(
         output.join("receipt.txt"),
         format!(
-            "schema=a5-item22-batch-v1\nstatus=ok\ndata=true\nanalysis_head={}\nprograms=20\nconfigurations=baseline,precise_replay,coarse_constraint\na5_world=closed_world_frozen_graph\ncopy_lend_mode=baseline\na2_mode=off\nz3_smt_seed=0\nz3_sat_seed=0\nmem_cap_mib=49152\nworker_bound_s=14400\nderived_substrate_sha256={digest}\nofficial_evaluation_link={}\nofficial_evaluation_target={}\nofficial_evaluation_sha256_start={official_digest}\nofficial_evaluation_sha256_end={official_digest}\nofficial_evaluation_link_installed=true\n",
+            "schema=a5-item22-batch-v1\nstatus=ok\ndata=true\nanalysis_head={}\nprograms=20\nconfigurations=baseline,precise_replay,coarse_constraint\na5_world=closed_world_frozen_graph\na5_abi_guard={A5_BATCH_ATTESTED_GUARD}\ncopy_lend_mode=baseline\na2_mode=off\nz3_smt_seed=0\nz3_sat_seed=0\nmem_cap_mib=49152\nworker_bound_s=14400\nderived_substrate_sha256={digest}\nofficial_evaluation_link={}\nofficial_evaluation_target={}\nofficial_evaluation_sha256_start={official_digest}\nofficial_evaluation_sha256_end={official_digest}\nofficial_evaluation_link_installed=true\n",
             super::orchestrate::git_sha(),
             official_link.display(),
             official_target.display(),

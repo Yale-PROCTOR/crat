@@ -617,7 +617,11 @@ pub(crate) fn solve_bo_a5_config(
     );
     let baseline_model = baseline_model?;
     if mode == A5Mode::Baseline {
-        let plan = A5Plan::baseline();
+        let plan = if attestation == Some(WholeProgramAttestation::FrozenBenchmarkGraph) {
+            A5Plan::baseline_attested()
+        } else {
+            A5Plan::baseline()
+        };
         let selected_model_sha256 = model_digest(&baseline_model);
         return Some(VerifiedBo {
             receipt: a5_receipt(mode, &plan, 0, 0, &selected_model_sha256),

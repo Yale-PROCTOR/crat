@@ -6066,6 +6066,7 @@ mod run {
         for stamp in [
             format!("a5_mode={}\n", mode.label()),
             "a5_world=closed_world_frozen_graph\n".to_owned(),
+            "a5_abi_guard=permitted:measurement-frozen-graph-attested\n".to_owned(),
             "copy_lend_mode=baseline\n".to_owned(),
             "a2_mode=off\n".to_owned(),
         ] {
@@ -6074,6 +6075,10 @@ mod run {
                 "A5 construction receipt lacks {stamp:?}"
             );
         }
+        row.set(
+            "a5_abi_guard",
+            "permitted:measurement-frozen-graph-attested",
+        );
 
         let mut n_ref = 0usize;
         let mut n_raw = 0usize;
@@ -8295,7 +8300,13 @@ mod run {
                 .find_map(|line| line.strip_prefix(&format!("{key}=")))
                 .map(str::to_owned)
         };
-        for key in ["a5_mode", "a5_world", "copy_lend_mode", "a2_mode"] {
+        for key in [
+            "a5_mode",
+            "a5_world",
+            "a5_abi_guard",
+            "copy_lend_mode",
+            "a2_mode",
+        ] {
             row.set(
                 key,
                 receipt_field(key).unwrap_or_else(|| format!("missing-{key}")),

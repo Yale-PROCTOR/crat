@@ -68,7 +68,14 @@ pub(crate) struct A5Plan {
 
 impl A5Plan {
     pub(crate) fn baseline() -> Self {
-        let guard = AbiGuardDisposition::Permitted { attested: false };
+        Self::baseline_with_guard(AbiGuardDisposition::Permitted { attested: false })
+    }
+
+    pub(crate) fn baseline_attested() -> Self {
+        Self::baseline_with_guard(AbiGuardDisposition::Permitted { attested: true })
+    }
+
+    fn baseline_with_guard(guard: AbiGuardDisposition) -> Self {
         let fixpoint = solve_may_overlap(std::iter::empty());
         Self {
             mode: A5Mode::Baseline,
@@ -411,7 +418,13 @@ pub(crate) fn produce_a5_plan(
     attestation: Option<WholeProgramAttestation>,
 ) -> Result<A5Plan, String> {
     if mode == A5Mode::Baseline {
-        return Ok(A5Plan::baseline());
+        return Ok(
+            if attestation == Some(WholeProgramAttestation::FrozenBenchmarkGraph) {
+                A5Plan::baseline_attested()
+            } else {
+                A5Plan::baseline()
+            },
+        );
     }
     let tcx = program.tcx;
     let local_functions = program.functions.iter().copied().collect::<FxHashSet<_>>();
@@ -439,7 +452,9 @@ pub(crate) fn produce_a5_plan(
     let mut indirect_function_targets = FxHashSet::default();
     let mut resolved = FxHashMap::<(LocalDefId, BasicBlock), Vec<LocalDefId>>::default();
     let mut stats = A5ProducerStats::default();
-    let mut aggregate_guard = AbiGuardDisposition::Permitted { attested: false };
+    let mut aggregate_guard = AbiGuardDisposition::Permitted {
+        attested: attestation == Some(WholeProgramAttestation::FrozenBenchmarkGraph),
+    };
     for &caller in &program.functions {
         let body = tcx.mir_drops_elaborated_and_const_checked(caller).borrow();
         for (block, data) in body.basic_blocks.iter_enumerated() {

@@ -864,7 +864,9 @@ impl AbiGuardDisposition {
 
     pub(crate) fn stamp(&self) -> String {
         match self {
-            Self::Permitted { attested: true } => "permitted:attested".to_owned(),
+            Self::Permitted { attested: true } => {
+                "permitted:measurement-frozen-graph-attested".to_owned()
+            }
             Self::Permitted { attested: false } => "permitted:internal".to_owned(),
             Self::Refused { reasons } => format!(
                 "refused:{}",
@@ -883,11 +885,7 @@ pub(crate) fn a5_abi_guard(
     attestation: Option<WholeProgramAttestation>,
 ) -> AbiGuardDisposition {
     if attestation == Some(WholeProgramAttestation::FrozenBenchmarkGraph) {
-        return if facts.unresolved_target {
-            AbiGuardDisposition::refused([AbiGuardReason::UnresolvedTarget])
-        } else {
-            AbiGuardDisposition::Permitted { attested: true }
-        };
+        return AbiGuardDisposition::Permitted { attested: true };
     }
 
     let mut reasons = BTreeSet::new();
@@ -1230,14 +1228,17 @@ mod tests {
     }
 
     #[test]
-    fn unresolved_target_fails_closed_even_with_attestation() {
+    fn batch_attestation_permits_unresolved_while_product_context_refuses() {
         let facts = AbiBoundaryFacts {
             unresolved_target: true,
             ..AbiBoundaryFacts::default()
         };
 
+        let batch = a5_abi_guard(&facts, Some(WholeProgramAttestation::FrozenBenchmarkGraph));
+        assert_eq!(batch, AbiGuardDisposition::Permitted { attested: true });
+        assert_eq!(batch.stamp(), "permitted:measurement-frozen-graph-attested");
         assert_eq!(
-            a5_abi_guard(&facts, Some(WholeProgramAttestation::FrozenBenchmarkGraph)),
+            a5_abi_guard(&facts, None),
             AbiGuardDisposition::refused([AbiGuardReason::UnresolvedTarget])
         );
     }
