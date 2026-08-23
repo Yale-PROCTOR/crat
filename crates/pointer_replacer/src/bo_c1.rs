@@ -6027,6 +6027,7 @@ mod run {
         row.set("a5_world", A5World::ClosedWorldFrozenGraph.label());
         row.set("copy_lend_mode", CopyLendMode::Baseline.label());
         row.set("a2_mode", A2Mode::Off.label());
+        row.set("soundness_mode", "a14");
         row.set("z3_full_version", z3::full_version().to_string());
         let official_evaluation = std::path::PathBuf::from(
             std::env::var_os("CRAT_A5_OFFICIAL_EVALUATION")
@@ -6069,6 +6070,7 @@ mod run {
             "a5_abi_guard=permitted:measurement-frozen-graph-attested\n".to_owned(),
             "copy_lend_mode=baseline\n".to_owned(),
             "a2_mode=off\n".to_owned(),
+            "soundness_mode=a14\n".to_owned(),
         ] {
             assert!(
                 verified.receipt.contains(&stamp),
@@ -6086,7 +6088,13 @@ mod run {
                 .find_map(|line| line.strip_prefix(&format!("{key}=")))
                 .unwrap_or_else(|| panic!("missing construction receipt key {key}"))
         };
-        for key in ["nullable_slots", "nullable_fields"] {
+        for key in [
+            "nullable_slots",
+            "nullable_fields",
+            "a14_opaque_stores",
+            "a14_unresolved_unresolvable",
+            "a14_nullable_store_fields",
+        ] {
             row.set(key, receipt_value(key));
         }
 
@@ -6228,6 +6236,11 @@ mod run {
             &verified.nullable_artifact,
         )
         .expect("write nullable-slot artifact");
+        std::fs::write(
+            artifact_dir.join("field-ref-stores.tsv"),
+            &verified.field_ref_artifact,
+        )
+        .expect("write field-ref artifact");
         let mut model_rows = verified
             .model
             .iter()
@@ -9726,6 +9739,109 @@ fn null_is_option_none_not_raw_and_is_exported() {
         Local::from_u32(1),
         false,
         true,
+    );
+}
+
+#[test]
+fn a14_opaque_field_is_raw_but_null_initialized_field_stays_ref() {
+    use crate::analyses::borrow_ownership::{
+        SlotKind,
+        a5_overlap::A5Mode,
+        construction::{
+            CopyLendMode, construct_bo_into, solve_bo_a5_config, verify_bo_construction,
+        },
+        crate_slots::CrateSlots,
+        mutability_facts::MutFacts,
+        origins::compute_origins,
+        slots::StructFieldSlot,
+        solver::{KindSolver, SlotRef},
+    };
+
+    fn check(source: &str, expected: SlotKind) {
+        ::utils::compilation::run_compiler_on_str(source, |tcx| {
+            let program = collect_program(tcx);
+            let slots = CrateSlots::build(&program);
+            let field = SlotRef::Field(
+                slots
+                    .field_slots
+                    .slot_for_field_depth(
+                        StructFieldSlot {
+                            struct_did: program.structs[0],
+                            field_index: 0,
+                        },
+                        0,
+                    )
+                    .expect("Holder::ptr slot"),
+            );
+            let origins = compute_origins(&program);
+            let mutability = MutFacts::from_program(&program);
+            let solver = KindSolver::new(&slots);
+            let construction = construct_bo_into(
+                &program,
+                &slots,
+                &origins,
+                &mutability,
+                &solver,
+                CopyLendMode::Baseline,
+            )
+            .expect("A14 fixture construction");
+            let model = verify_bo_construction(
+                &program,
+                &slots,
+                &origins,
+                &solver,
+                &construction,
+                &mutability,
+            )
+            .expect("A14 fixture accepts");
+            assert_eq!(model[&field], expected);
+
+            let verified = solve_bo_a5_config(
+                &program,
+                &slots,
+                &origins,
+                &mutability,
+                A5Mode::Baseline,
+                None,
+            )
+            .expect("A14 fixture verified artifacts");
+            assert!(verified.receipt.contains("soundness_mode=a14\n"));
+            assert!(verified.receipt.contains("a14_opaque_stores="));
+            assert!(verified.receipt.contains("a14_unresolved_unresolvable="));
+            assert!(verified.receipt.contains("a14_nullable_store_fields="));
+            assert!(verified.receipt.contains("field_ref_ledger_sha256="));
+            assert!(verified.field_ref_artifact.lines().skip(1).next().is_some());
+        })
+        .unwrap_or_else(|error| error.raise());
+    }
+
+    check(
+        r#"
+unsafe extern "C" { fn op(p: *mut i32) -> *mut i32; }
+pub struct Holder { pub ptr: *mut i32 }
+pub unsafe fn f(p: *mut i32) -> *mut i32 {
+    let mut holder = Holder { ptr: unsafe { op(p) } };
+    holder.ptr = p;
+    holder.ptr
+}
+"#,
+        SlotKind::Raw,
+    );
+    check(
+        r#"
+unsafe extern "C" {
+    fn malloc(size: usize) -> *mut core::ffi::c_void;
+}
+pub struct Holder { pub ptr: *const i32 }
+pub unsafe fn f() -> i32 {
+    let p = unsafe { malloc(4) } as *const i32;
+    let q = p;
+    let mut holder = Holder { ptr: core::ptr::null() };
+    holder.ptr = q;
+    unsafe { *holder.ptr }
+}
+"#,
+        SlotKind::Ref,
     );
 }
 

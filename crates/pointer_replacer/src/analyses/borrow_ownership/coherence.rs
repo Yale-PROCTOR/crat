@@ -5,6 +5,7 @@ use z3::ast::Bool;
 
 use super::{
     SlotKind,
+    boundary_table::{self, Matcher},
     crate_slots::{CrateSlots, MAX_SLOT_DEPTH},
     export::{BorrowerKind, OwnerKey, PlaceKey},
     l2::MirLocationKey,
@@ -12,7 +13,10 @@ use super::{
     slots::StructFieldSlot,
     solver::{KindSolver, SlotRef},
 };
-use crate::utils::rustc::RustProgram;
+use crate::{
+    analyses::mir::{CallKind, TerminatorExt},
+    utils::rustc::RustProgram,
+};
 
 fn to_slot_ref(r: ResolvedSlot, fn_did: LocalDefId) -> SlotRef {
     match r {
@@ -340,6 +344,145 @@ pub(crate) fn constrain_field_ownership(
     for &field in &blocked {
         solver.forbid_field_own(field);
     }
+}
+
+#[derive(Clone, Debug, Default)]
+pub(crate) struct FieldRefPlan {
+    pub(crate) rows: Vec<FieldRefPlanRow>,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct FieldRefPlanRow {
+    pub(crate) field: SlotRef,
+    pub(crate) opaque: usize,
+    pub(crate) unresolved_unresolvable: usize,
+    pub(crate) nullable: usize,
+    pub(crate) safe: usize,
+}
+
+pub(crate) fn constrain_field_ref_worthiness(
+    solver: &KindSolver,
+    slots: &CrateSlots,
+    program: &RustProgram<'_>,
+    origin_flows: Option<&super::origin_flow::OriginFlowResults>,
+    nullability: &super::nullability::NullabilityFacts,
+) -> FieldRefPlan {
+    let opaque_sources = origin_flows
+        .map(|flows| positive_opaque_return_slots(slots, program, flows))
+        .unwrap_or_default();
+    let (stores, blocked) = scan_field_stores(slots, program);
+    let mut fields = stores.keys().copied().collect::<FxHashSet<_>>();
+    fields.extend(blocked.iter().copied());
+    fields.extend(
+        nullability
+            .slots()
+            .into_iter()
+            .filter(|slot| matches!(slot, SlotRef::Field(_))),
+    );
+    let mut rows = Vec::new();
+    for field in fields {
+        let all_rhs = stores.get(&field).cloned().unwrap_or_default();
+        let nullable = all_rhs
+            .iter()
+            .filter(|source| nullability.contains(source))
+            .count()
+            + usize::from(nullability.contains(&field));
+        let rhs = all_rhs
+            .into_iter()
+            .filter(|source| !nullability.contains(source))
+            .collect::<Vec<_>>();
+        let opaque = rhs
+            .iter()
+            .filter(|source| opaque_sources.contains(source))
+            .count();
+        let unresolved_unresolvable = usize::from(blocked.contains(&field));
+        let safe = rhs.len() - opaque;
+        if opaque > 0 || unresolved_unresolvable > 0 {
+            solver.forbid_field_ref(field);
+        } else {
+            solver.constrain_field_ref(field, &rhs);
+        }
+        rows.push(FieldRefPlanRow {
+            field,
+            opaque,
+            unresolved_unresolvable,
+            nullable,
+            safe,
+        });
+    }
+    rows.sort_by_key(|row| super::l2::SlotKey::of(row.field));
+    FieldRefPlan { rows }
+}
+
+fn owner_slot_ref(
+    slots: &CrateSlots,
+    fn_did: LocalDefId,
+    owner: super::slots::SlotOwner,
+) -> Option<SlotRef> {
+    match owner {
+        super::slots::SlotOwner::Local(local) => slots.fn_local_slots[&fn_did]
+            .slot_for_local_depth(local, 0)
+            .map(|slot| SlotRef::Local(fn_did, slot)),
+        super::slots::SlotOwner::Field(field) => slots
+            .field_slots
+            .slot_for_field_depth(field, 0)
+            .map(SlotRef::Field),
+    }
+}
+
+fn positive_opaque_return_slots(
+    slots: &CrateSlots,
+    program: &RustProgram<'_>,
+    origin_flows: &super::origin_flow::OriginFlowResults,
+) -> FxHashSet<SlotRef> {
+    let mut opaque = FxHashSet::default();
+    for &fn_did in &program.functions {
+        let body_ref = program
+            .tcx
+            .mir_drops_elaborated_and_const_checked(fn_did)
+            .borrow();
+        let body = &*body_ref;
+        for data in body.basic_blocks.iter() {
+            let Some(call) = data
+                .terminator
+                .as_ref()
+                .and_then(|terminator| terminator.as_call(program.tcx))
+            else {
+                continue;
+            };
+            let positive_opaque = match call.func {
+                CallKind::LibC(name) => {
+                    boundary_table::lookup(name.as_str(), Matcher::ForeignC).is_none()
+                }
+                CallKind::Impl(_) | CallKind::Closure | CallKind::Dynamic => true,
+                CallKind::FreeStanding(_) | CallKind::RustLib(_) => false,
+            };
+            if !positive_opaque {
+                continue;
+            }
+            if let Some(resolved) = resolve_place(slots, fn_did, body, call.destination, 0, None) {
+                opaque.insert(to_slot_ref(resolved, fn_did));
+            }
+        }
+
+        let flows = origin_flows[&fn_did].body.depth0_value_flows();
+        let mut changed = true;
+        while changed {
+            changed = false;
+            for &(source, target) in &flows {
+                let Some(source) = owner_slot_ref(slots, fn_did, source) else {
+                    continue;
+                };
+                let Some(target) = owner_slot_ref(slots, fn_did, target) else {
+                    continue;
+                };
+                if opaque.contains(&source) {
+                    changed |= opaque.insert(target);
+                }
+            }
+        }
+    }
+    opaque
 }
 
 /// §S2-3 — the field-store ownership scan, shared by `constrain_field_ownership` (which emits the

@@ -168,6 +168,8 @@ pub(crate) const CORE_LABEL_FAMILIES: &[&str] = &[
     "field-and-rev",
     "field-and",
     "field-forbid",
+    "field-ref-source",
+    "field-ref-forbid",
     "link-own",
     GUARDED_COMMIT_CORE_FAMILY,
     RECURRENCE_ESCALATION_CORE_FAMILY,
@@ -566,6 +568,43 @@ impl KindSolver {
             self.tracker.as_ref(),
             || format!("field-forbid({field:?})"),
             &!&vars.own,
+        );
+    }
+
+    /// A14 field ref-worthiness: a field may be Ref only when every non-null stored value is safe
+    /// (Ref or Owning). Null is handled orthogonally by §29; Raw is the only disqualifying kind.
+    pub(crate) fn constrain_field_ref(&self, field: SlotRef, rhs: &[SlotRef]) {
+        let field_ref = &self
+            .vars
+            .get(&field)
+            .unwrap_or_else(|| panic!("unknown slot: {field:?}"))
+            .ref_;
+        for &source in rhs {
+            let source_raw = &self
+                .vars
+                .get(&source)
+                .unwrap_or_else(|| panic!("unknown slot: {source:?}"))
+                .raw;
+            assert_hard(
+                &self.solver,
+                self.tracker.as_ref(),
+                || format!("field-ref-source({field:?}=>{source:?})"),
+                &Bool::or(&[&!field_ref, &!source_raw]),
+            );
+        }
+    }
+
+    pub(crate) fn forbid_field_ref(&self, field: SlotRef) {
+        let field_ref = &self
+            .vars
+            .get(&field)
+            .unwrap_or_else(|| panic!("unknown slot: {field:?}"))
+            .ref_;
+        assert_hard(
+            &self.solver,
+            self.tracker.as_ref(),
+            || format!("field-ref-forbid({field:?})"),
+            &!field_ref,
         );
     }
 

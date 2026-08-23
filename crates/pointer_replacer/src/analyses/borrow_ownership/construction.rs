@@ -31,7 +31,8 @@ use super::{
     },
     boundary_table::{self, Matcher, Role},
     coherence::{
-        CopyLendPair, add_coherence, add_coherence_removal_only, add_coherence_with_copy_lends,
+        CopyLendPair, FieldRefPlan, add_coherence, add_coherence_removal_only,
+        add_coherence_with_copy_lends, constrain_field_ref_worthiness,
     },
     crate_slots::CrateSlots,
     emit_crate_ownership_constraints, emit_crate_ownership_constraints_with_copy_lends,
@@ -199,6 +200,7 @@ pub(crate) struct CopyLendPairCandidate {
 pub(crate) struct BoConstruction {
     pub(crate) mode: CopyLendMode,
     pub(crate) nullability: super::nullability::NullabilityFacts,
+    pub(crate) field_ref_plan: FieldRefPlan,
     pub(crate) a2_mode: A2Mode,
     pub(crate) a2_killed_memberships: usize,
     pub(crate) a2_opaque_result_guards: usize,
@@ -220,6 +222,7 @@ pub(crate) struct VerifiedBo {
     pub(crate) mark_artifact: String,
     pub(crate) site_artifact: String,
     pub(crate) nullable_artifact: String,
+    pub(crate) field_ref_artifact: String,
     pub(crate) receipt: String,
     pub(crate) round_stats: super::borrow_verify::RoundStats,
     pub(crate) selector_sources: usize,
@@ -278,6 +281,65 @@ fn nullability_artifacts(construction: &BoConstruction) -> NullabilityArtifacts 
     NullabilityArtifacts {
         slots: rows.len(),
         fields: rows.iter().filter(|row| row.3).count(),
+        artifact,
+    }
+}
+
+struct A14Artifacts {
+    artifact: String,
+    opaque_stores: usize,
+    unresolved_unresolvable: usize,
+    nullable_store_fields: usize,
+}
+
+impl A14Artifacts {
+    fn empty() -> Self {
+        Self {
+            artifact: String::from(
+                "variant\towner\tslot\topaque\tunresolved_unresolvable\tnullable\tsafe\n",
+            ),
+            opaque_stores: 0,
+            unresolved_unresolvable: 0,
+            nullable_store_fields: 0,
+        }
+    }
+}
+
+fn a14_artifacts(construction: &BoConstruction) -> A14Artifacts {
+    let mut artifact =
+        String::from("variant\towner\tslot\topaque\tunresolved_unresolvable\tnullable\tsafe\n");
+    for row in &construction.field_ref_plan.rows {
+        let key = SlotKey::of(row.field);
+        artifact.push_str(&format!(
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+            key.variant,
+            key.owner,
+            key.slot,
+            row.opaque,
+            row.unresolved_unresolvable,
+            row.nullable,
+            row.safe,
+        ));
+    }
+    A14Artifacts {
+        opaque_stores: construction
+            .field_ref_plan
+            .rows
+            .iter()
+            .map(|row| row.opaque)
+            .sum(),
+        unresolved_unresolvable: construction
+            .field_ref_plan
+            .rows
+            .iter()
+            .map(|row| row.unresolved_unresolvable)
+            .sum(),
+        nullable_store_fields: construction
+            .field_ref_plan
+            .rows
+            .iter()
+            .filter(|row| row.nullable > 0)
+            .count(),
         artifact,
     }
 }
@@ -384,10 +446,11 @@ fn a5_receipt(
     retained_sites: usize,
     selected_model_sha256: &str,
     nullability: &NullabilityArtifacts,
+    a14: &A14Artifacts,
 ) -> String {
     format!(
         "schema=bo-construction-v1\nstatus=ok\ndata=true\ncopy_lend_mode=baseline\n\
-         a2_mode=off\na5_mode={}\na5_world={}\nunknown_caller_seeding=false\n\
+         a2_mode=off\nsoundness_mode=a14\na5_mode={}\na5_world={}\nunknown_caller_seeding=false\n\
          a5_abi_guard={}\na5_raw_pairs={}\na5_effective_pairs={}\n\
          a5_raw_site_pairs={}\na5_raw_site_mut_mut={}\na5_raw_site_mut_read_only={}\n\
          a5_raw_site_shared_shared={}\n\
@@ -396,7 +459,9 @@ fn a5_receipt(
          a5_foster_producer=MutFacts::from_program(mutability_analysis+SourceVarGroups::postprocess_mut_res)\n\
          a5_pair_ledger_sha256={A5_PAIR_LEDGER_SHA256}\nselected_model_sha256={}\n\
          a5_summary_sha256={}\nnullable_slots={}\nnullable_fields={}\n\
-         nullable_ledger_sha256={:x}\nreplay_safe_definition={REPLAY_SAFE_DEFINITION}\n",
+         nullable_ledger_sha256={:x}\na14_opaque_stores={}\n\
+         a14_unresolved_unresolvable={}\na14_nullable_store_fields={}\n\
+         field_ref_ledger_sha256={:x}\nreplay_safe_definition={REPLAY_SAFE_DEFINITION}\n",
         mode.label(),
         A5World::ClosedWorldFrozenGraph.label(),
         plan.abi_guard.stamp(),
@@ -414,6 +479,10 @@ fn a5_receipt(
         nullability.slots,
         nullability.fields,
         Sha256::digest(nullability.artifact.as_bytes()),
+        a14.opaque_stores,
+        a14.unresolved_unresolvable,
+        a14.nullable_store_fields,
+        Sha256::digest(a14.artifact.as_bytes()),
     )
 }
 
@@ -426,6 +495,7 @@ pub(crate) fn baseline_a5_receipt(model: &FxHashMap<SlotRef, SlotKind>) -> Strin
         0,
         &model_digest(model),
         &NullabilityArtifacts::empty(),
+        &A14Artifacts::empty(),
     )
 }
 
@@ -476,10 +546,19 @@ pub(crate) fn construct_bo_into(
             }
         }
     }
+    let nullability = super::nullability::analyze(program.tcx, &program.functions, slots);
+    let field_ref_plan = constrain_field_ref_worthiness(
+        solver,
+        slots,
+        program,
+        origins.try_native_flows(),
+        &nullability,
+    );
     let coherence_elapsed = t.elapsed();
     Ok(BoConstruction {
         mode,
-        nullability: super::nullability::analyze(program.tcx, &program.functions, slots),
+        nullability,
+        field_ref_plan,
         a2_mode: A2Mode::Off,
         a2_killed_memberships: 0,
         a2_opaque_result_guards: 0,
@@ -520,6 +599,7 @@ pub(crate) fn construct_tracked_census_baseline(
     Ok(BoConstruction {
         mode: CopyLendMode::Baseline,
         nullability: super::nullability::NullabilityFacts::default(),
+        field_ref_plan: FieldRefPlan::default(),
         a2_mode: A2Mode::Off,
         a2_killed_memberships: 0,
         a2_opaque_result_guards: 0,
@@ -694,6 +774,7 @@ pub(crate) fn solve_bo_a5_config(
     );
     let baseline_model = baseline_model?;
     let baseline_nullability = nullability_artifacts(&baseline_construction);
+    let baseline_a14 = a14_artifacts(&baseline_construction);
     if mode == A5Mode::Baseline {
         let plan = if attestation == Some(WholeProgramAttestation::FrozenBenchmarkGraph) {
             A5Plan::baseline_attested()
@@ -709,10 +790,12 @@ pub(crate) fn solve_bo_a5_config(
                 0,
                 &selected_model_sha256,
                 &baseline_nullability,
+                &baseline_a14,
             ),
             mark_artifact: a5_mark_artifact(mode, &plan, &BTreeSet::new(), &selected_model_sha256),
             site_artifact: a5_site_artifact(mode, &plan),
             nullable_artifact: baseline_nullability.artifact.clone(),
+            field_ref_artifact: baseline_a14.artifact.clone(),
             summary_artifact: plan.summary_artifact.clone(),
             baseline_model: baseline_model.clone(),
             model: baseline_model,
@@ -750,10 +833,12 @@ pub(crate) fn solve_bo_a5_config(
                 0,
                 &selected_model_sha256,
                 &baseline_nullability,
+                &baseline_a14,
             ),
             mark_artifact: a5_mark_artifact(mode, &plan, &BTreeSet::new(), &selected_model_sha256),
             site_artifact: a5_site_artifact(mode, &plan),
             nullable_artifact: baseline_nullability.artifact.clone(),
+            field_ref_artifact: baseline_a14.artifact.clone(),
             summary_artifact: plan.summary_artifact.clone(),
             baseline_model: baseline_model.clone(),
             model: baseline_model,
@@ -824,6 +909,7 @@ pub(crate) fn solve_bo_a5_config(
     };
     let selected_model_sha256 = model_digest(&model);
     let nullability = nullability_artifacts(&construction);
+    let a14 = a14_artifacts(&construction);
     Some(VerifiedBo {
         receipt: a5_receipt(
             mode,
@@ -832,10 +918,12 @@ pub(crate) fn solve_bo_a5_config(
             retained_c9_plans.len(),
             &selected_model_sha256,
             &nullability,
+            &a14,
         ),
         mark_artifact: a5_mark_artifact(mode, &plan, &retained_c9_marks, &selected_model_sha256),
         site_artifact: a5_site_artifact(mode, &plan),
         nullable_artifact: nullability.artifact,
+        field_ref_artifact: a14.artifact,
         summary_artifact: plan.summary_artifact.clone(),
         model,
         baseline_model,

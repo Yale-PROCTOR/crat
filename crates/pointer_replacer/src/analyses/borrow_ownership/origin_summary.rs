@@ -104,6 +104,10 @@ impl OriginSummaries {
             .as_ref()
             .expect("active BO origins must retain native body flows")
     }
+
+    pub(crate) fn try_native_flows(&self) -> Option<&OriginFlowResults> {
+        self.native_flows.as_ref()
+    }
 }
 
 impl FromIterator<(LocalDefId, OriginSummary)> for OriginSummaries {
