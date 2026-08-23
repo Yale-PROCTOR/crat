@@ -6079,6 +6079,16 @@ mod run {
             "a5_abi_guard",
             "permitted:measurement-frozen-graph-attested",
         );
+        let receipt_value = |key: &str| {
+            verified
+                .receipt
+                .lines()
+                .find_map(|line| line.strip_prefix(&format!("{key}=")))
+                .unwrap_or_else(|| panic!("missing construction receipt key {key}"))
+        };
+        for key in ["nullable_slots", "nullable_fields"] {
+            row.set(key, receipt_value(key));
+        }
 
         let mut n_ref = 0usize;
         let mut n_raw = 0usize;
@@ -6213,6 +6223,11 @@ mod run {
             &verified.site_artifact,
         )
         .expect("write A5 production-site artifact");
+        std::fs::write(
+            artifact_dir.join("nullable-slots.tsv"),
+            &verified.nullable_artifact,
+        )
+        .expect("write nullable-slot artifact");
         let mut model_rows = verified
             .model
             .iter()
@@ -9611,6 +9626,108 @@ pub unsafe fn delete_node(mut root: *mut node, mut key: i32) -> *mut node {
 // ---------------------------------------------------------------------------
 // §NB5-M wrapper-thinness guard (replaces the retired mirror-fidelity tests).
 // ---------------------------------------------------------------------------
+
+#[test]
+fn null_is_option_none_not_raw_and_is_exported() {
+    use rustc_middle::mir::Local;
+
+    use crate::analyses::borrow_ownership::{
+        SlotKind,
+        a5_overlap::A5Mode,
+        construction::{
+            CopyLendMode, construct_bo_into, solve_bo_a5_config, verify_bo_construction,
+        },
+        crate_slots::CrateSlots,
+        mutability_facts::MutFacts,
+        origins::compute_origins,
+        solver::{KindSolver, SlotRef},
+    };
+
+    fn check(source: &str, local: Local, literal: bool, is_null: bool) {
+        ::utils::compilation::run_compiler_on_str(source, |tcx| {
+            let program = collect_program(tcx);
+            let slots = CrateSlots::build(&program);
+            let fn_did = program.functions[0];
+            let slot_id = slots.fn_local_slots[&fn_did]
+                .slot_for_local_depth(local, 0)
+                .expect("null local slot");
+            let slot = SlotRef::Local(fn_did, slot_id);
+            let origins = compute_origins(&program);
+            let mutability = MutFacts::from_program(&program);
+            let solver = KindSolver::new(&slots);
+            let construction = construct_bo_into(
+                &program,
+                &slots,
+                &origins,
+                &mutability,
+                &solver,
+                CopyLendMode::Baseline,
+            )
+            .expect("null fixture construction");
+            assert_eq!(
+                construction.nullability.null_literal.is_empty(),
+                !literal,
+                "null-literal export column"
+            );
+            assert_eq!(
+                construction.nullability.is_null_use.is_empty(),
+                !is_null,
+                "is_null export column"
+            );
+            if literal {
+                assert!(construction.nullability.null_literal.contains(&slot));
+            }
+            let model = verify_bo_construction(
+                &program,
+                &slots,
+                &origins,
+                &solver,
+                &construction,
+                &mutability,
+            )
+            .expect("null fixture accepts");
+            assert_eq!(
+                model[&slot],
+                SlotKind::Ref,
+                "§29: null is Option None and never raw evidence"
+            );
+            for signal in &construction.nullability.is_null_use {
+                assert_eq!(
+                    model[signal],
+                    SlotKind::Ref,
+                    "is_null evidence must not create a Raw kind"
+                );
+            }
+            let verified = solve_bo_a5_config(
+                &program,
+                &slots,
+                &origins,
+                &mutability,
+                A5Mode::Baseline,
+                None,
+            )
+            .expect("null fixture verified artifacts");
+            assert!(verified.receipt.contains("nullable_slots="));
+            assert!(verified.receipt.contains("nullable_fields="));
+            assert!(verified.receipt.contains("nullable_ledger_sha256="));
+            assert!(verified.nullable_artifact.lines().skip(1).next().is_some());
+        })
+        .unwrap_or_else(|error| error.raise());
+    }
+
+    check(
+        "pub unsafe fn f() -> *mut i32 { core::ptr::null_mut() }",
+        Local::from_u32(0),
+        true,
+        false,
+    );
+    check(
+        "pub unsafe fn f(p: *mut i32) -> bool { p.is_null() }",
+        Local::from_u32(1),
+        false,
+        true,
+    );
+}
 
 /// §NB5-M: guards WRAPPER-THINNESS. `verify_to_fixpoint` is a model-only wrapper over
 /// `verify_to_fixpoint_counting` (the single CEGAR loop). This is a near-tautology today — the

@@ -25,6 +25,7 @@ mod infer;
 pub(crate) mod l2;
 pub(crate) mod model_cache;
 pub(crate) mod mutability_facts;
+pub(crate) mod nullability;
 pub(crate) mod origin_flow;
 pub(crate) mod origin_summary;
 pub(crate) mod origins;
@@ -335,8 +336,11 @@ fn emit_crate_ownership_constraints_impl<'tcx>(
     if let Some(tracker) = kind_solver.tracker() {
         tracker.set_context("nb4-4c-may-supply-demotion");
     }
+    let nullability = nullability::analyze(crate_ctxt.tcx, &fns, slots);
     for slot in origins::collect_no_borrow_origin_slots(origins, slots) {
-        kind_solver.add_borrow_exclusion(Some(slot), &[]); // ¬ref (may-supply)
+        if !nullability.contains(&slot) {
+            kind_solver.add_borrow_exclusion(Some(slot), &[]); // ¬ref (may-supply)
+        }
     }
 
     // E-R2: snapshot the Var -> Bool map before the database is dropped.

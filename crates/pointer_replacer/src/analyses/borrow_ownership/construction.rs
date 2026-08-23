@@ -198,6 +198,7 @@ pub(crate) struct CopyLendPairCandidate {
 
 pub(crate) struct BoConstruction {
     pub(crate) mode: CopyLendMode,
+    pub(crate) nullability: super::nullability::NullabilityFacts,
     pub(crate) a2_mode: A2Mode,
     pub(crate) a2_killed_memberships: usize,
     pub(crate) a2_opaque_result_guards: usize,
@@ -218,6 +219,7 @@ pub(crate) struct VerifiedBo {
     pub(crate) summary_artifact: super::a5_overlap::A5SummaryArtifact,
     pub(crate) mark_artifact: String,
     pub(crate) site_artifact: String,
+    pub(crate) nullable_artifact: String,
     pub(crate) receipt: String,
     pub(crate) round_stats: super::borrow_verify::RoundStats,
     pub(crate) selector_sources: usize,
@@ -233,6 +235,52 @@ pub(crate) struct VerifiedBo {
 const A5_PAIR_LEDGER_SHA256: &str =
     "16dac90cf269c5480e6f612e54733dd210e41393a879202c7138e93cd7d360e1";
 const REPLAY_SAFE_DEFINITION: &str = "no incompatible access derived by precise replay with the effective parameter-overlap map injected; O2 closed-world frozen graph.";
+
+struct NullabilityArtifacts {
+    artifact: String,
+    slots: usize,
+    fields: usize,
+}
+
+impl NullabilityArtifacts {
+    fn empty() -> Self {
+        Self {
+            artifact: String::from("variant\towner\tslot\tis_null_use\tnull_literal\tnullable\n"),
+            slots: 0,
+            fields: 0,
+        }
+    }
+}
+
+fn nullability_artifacts(construction: &BoConstruction) -> NullabilityArtifacts {
+    let mut rows = construction
+        .nullability
+        .slots()
+        .into_iter()
+        .map(|slot| {
+            let key = SlotKey::of(slot);
+            (
+                key,
+                construction.nullability.is_null_use.contains(&slot),
+                construction.nullability.null_literal.contains(&slot),
+                matches!(slot, SlotRef::Field(_)),
+            )
+        })
+        .collect::<Vec<_>>();
+    rows.sort_by_key(|row| row.0);
+    let mut artifact = String::from("variant\towner\tslot\tis_null_use\tnull_literal\tnullable\n");
+    for (key, is_null, literal, _) in &rows {
+        artifact.push_str(&format!(
+            "{}\t{}\t{}\t{}\t{}\ttrue\n",
+            key.variant, key.owner, key.slot, is_null, literal,
+        ));
+    }
+    NullabilityArtifacts {
+        slots: rows.len(),
+        fields: rows.iter().filter(|row| row.3).count(),
+        artifact,
+    }
+}
 
 fn model_digest(model: &FxHashMap<SlotRef, SlotKind>) -> String {
     let mut rows = model
@@ -335,6 +383,7 @@ fn a5_receipt(
     retained: usize,
     retained_sites: usize,
     selected_model_sha256: &str,
+    nullability: &NullabilityArtifacts,
 ) -> String {
     format!(
         "schema=bo-construction-v1\nstatus=ok\ndata=true\ncopy_lend_mode=baseline\n\
@@ -346,7 +395,8 @@ fn a5_receipt(
          a5_producer=rustc-mir-current-v1\n\
          a5_foster_producer=MutFacts::from_program(mutability_analysis+SourceVarGroups::postprocess_mut_res)\n\
          a5_pair_ledger_sha256={A5_PAIR_LEDGER_SHA256}\nselected_model_sha256={}\n\
-         a5_summary_sha256={}\nreplay_safe_definition={REPLAY_SAFE_DEFINITION}\n",
+         a5_summary_sha256={}\nnullable_slots={}\nnullable_fields={}\n\
+         nullable_ledger_sha256={:x}\nreplay_safe_definition={REPLAY_SAFE_DEFINITION}\n",
         mode.label(),
         A5World::ClosedWorldFrozenGraph.label(),
         plan.abi_guard.stamp(),
@@ -361,12 +411,22 @@ fn a5_receipt(
         retained_sites,
         selected_model_sha256,
         summary_digest(plan),
+        nullability.slots,
+        nullability.fields,
+        Sha256::digest(nullability.artifact.as_bytes()),
     )
 }
 
 pub(crate) fn baseline_a5_receipt(model: &FxHashMap<SlotRef, SlotKind>) -> String {
     let plan = A5Plan::baseline();
-    a5_receipt(A5Mode::Baseline, &plan, 0, 0, &model_digest(model))
+    a5_receipt(
+        A5Mode::Baseline,
+        &plan,
+        0,
+        0,
+        &model_digest(model),
+        &NullabilityArtifacts::empty(),
+    )
 }
 
 pub(crate) fn construct_bo_into(
@@ -419,6 +479,7 @@ pub(crate) fn construct_bo_into(
     let coherence_elapsed = t.elapsed();
     Ok(BoConstruction {
         mode,
+        nullability: super::nullability::analyze(program.tcx, &program.functions, slots),
         a2_mode: A2Mode::Off,
         a2_killed_memberships: 0,
         a2_opaque_result_guards: 0,
@@ -458,6 +519,7 @@ pub(crate) fn construct_tracked_census_baseline(
     }
     Ok(BoConstruction {
         mode: CopyLendMode::Baseline,
+        nullability: super::nullability::NullabilityFacts::default(),
         a2_mode: A2Mode::Off,
         a2_killed_memberships: 0,
         a2_opaque_result_guards: 0,
@@ -631,6 +693,7 @@ pub(crate) fn solve_bo_a5_config(
         mut_facts,
     );
     let baseline_model = baseline_model?;
+    let baseline_nullability = nullability_artifacts(&baseline_construction);
     if mode == A5Mode::Baseline {
         let plan = if attestation == Some(WholeProgramAttestation::FrozenBenchmarkGraph) {
             A5Plan::baseline_attested()
@@ -639,9 +702,17 @@ pub(crate) fn solve_bo_a5_config(
         };
         let selected_model_sha256 = model_digest(&baseline_model);
         return Some(VerifiedBo {
-            receipt: a5_receipt(mode, &plan, 0, 0, &selected_model_sha256),
+            receipt: a5_receipt(
+                mode,
+                &plan,
+                0,
+                0,
+                &selected_model_sha256,
+                &baseline_nullability,
+            ),
             mark_artifact: a5_mark_artifact(mode, &plan, &BTreeSet::new(), &selected_model_sha256),
             site_artifact: a5_site_artifact(mode, &plan),
+            nullable_artifact: baseline_nullability.artifact.clone(),
             summary_artifact: plan.summary_artifact.clone(),
             baseline_model: baseline_model.clone(),
             model: baseline_model,
@@ -672,9 +743,17 @@ pub(crate) fn solve_bo_a5_config(
     if matches!(plan.abi_guard, AbiGuardDisposition::Refused { .. }) {
         let selected_model_sha256 = model_digest(&baseline_model);
         return Some(VerifiedBo {
-            receipt: a5_receipt(mode, &plan, 0, 0, &selected_model_sha256),
+            receipt: a5_receipt(
+                mode,
+                &plan,
+                0,
+                0,
+                &selected_model_sha256,
+                &baseline_nullability,
+            ),
             mark_artifact: a5_mark_artifact(mode, &plan, &BTreeSet::new(), &selected_model_sha256),
             site_artifact: a5_site_artifact(mode, &plan),
+            nullable_artifact: baseline_nullability.artifact.clone(),
             summary_artifact: plan.summary_artifact.clone(),
             baseline_model: baseline_model.clone(),
             model: baseline_model,
@@ -744,6 +823,7 @@ pub(crate) fn solve_bo_a5_config(
         Vec::new()
     };
     let selected_model_sha256 = model_digest(&model);
+    let nullability = nullability_artifacts(&construction);
     Some(VerifiedBo {
         receipt: a5_receipt(
             mode,
@@ -751,9 +831,11 @@ pub(crate) fn solve_bo_a5_config(
             retained_c9_marks.len(),
             retained_c9_plans.len(),
             &selected_model_sha256,
+            &nullability,
         ),
         mark_artifact: a5_mark_artifact(mode, &plan, &retained_c9_marks, &selected_model_sha256),
         site_artifact: a5_site_artifact(mode, &plan),
+        nullable_artifact: nullability.artifact,
         summary_artifact: plan.summary_artifact.clone(),
         model,
         baseline_model,
