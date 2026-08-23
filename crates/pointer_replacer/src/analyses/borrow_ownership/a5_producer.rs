@@ -152,6 +152,196 @@ struct WitnessRecord {
     registered_site: bool,
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct A5SiteBranchAudit {
+    pub(crate) caller: u32,
+    pub(crate) caller_path: String,
+    pub(crate) block: u32,
+    pub(crate) target: u32,
+    pub(crate) target_path: String,
+    pub(crate) left_parameter: u32,
+    pub(crate) right_parameter: u32,
+    pub(crate) left_operand: String,
+    pub(crate) right_operand: String,
+    pub(crate) left_actual: Option<SlotKey>,
+    pub(crate) right_actual: Option<SlotKey>,
+    pub(crate) classifier: Option<PairClass>,
+    pub(crate) dependencies: usize,
+    pub(crate) family: &'static str,
+    pub(crate) terminator: String,
+}
+
+pub(crate) fn audit_a5_site_branches(
+    program: &RustProgram<'_>,
+    slots: &CrateSlots,
+    flows: &OriginFlowResults,
+) -> Vec<A5SiteBranchAudit> {
+    let tcx = program.tcx;
+    let local_functions = program.functions.iter().copied().collect::<FxHashSet<_>>();
+    let arena = typed_arena::Arena::new();
+    let type_shapes = utils::ty_shape::get_ty_shapes(&arena, tcx, false);
+    let config = andersen::Config {
+        use_optimized_mir: false,
+        c_exposed_fns: program
+            .functions
+            .iter()
+            .filter(|did| tcx.visibility(did.to_def_id()).is_public())
+            .map(|did| tcx.item_name(did.to_def_id()).to_string())
+            .collect(),
+    };
+    let pre = andersen::pre_analyze(&config, &type_shapes, tcx);
+    let solutions = andersen::analyze(&config, &pre, &type_shapes, tcx);
+    let mut unknown_locations = BTreeSet::new();
+    for variable in &pre.exposed_fn_arg_vars {
+        let start = pre.vars[variable];
+        let end = pre.index_info.get_end(start);
+        unknown_locations.extend(start.index()..=end.index());
+    }
+    let mut resolved = FxHashMap::<(LocalDefId, BasicBlock), Vec<LocalDefId>>::default();
+    for &caller in &program.functions {
+        let body = tcx.mir_drops_elaborated_and_const_checked(caller).borrow();
+        for (block, data) in body.basic_blocks.iter_enumerated() {
+            let function = match &data.terminator().kind {
+                TerminatorKind::Call { func, .. } | TerminatorKind::TailCall { func, .. } => func,
+                _ => continue,
+            };
+            let mut targets = if let Some(function) = function.constant() {
+                let TyKind::FnDef(target, _) = *function.ty().kind() else {
+                    continue;
+                };
+                let Some(target) = target.as_local() else {
+                    continue;
+                };
+                vec![target]
+            } else {
+                indirect_targets(&pre, &solutions, caller, block).unwrap_or_default()
+            };
+            targets.retain(|target| local_functions.contains(target));
+            targets.sort_unstable_by_key(|did| did.local_def_index.as_u32());
+            targets.dedup();
+            if !targets.is_empty() {
+                resolved.insert((caller, block), targets);
+            }
+        }
+    }
+
+    let mut answer = Vec::new();
+    for &caller in &program.functions {
+        let caller_path = tcx.def_path_str(caller.to_def_id());
+        let body = tcx.mir_drops_elaborated_and_const_checked(caller).borrow();
+        let flow = &flows[&caller].body;
+        for (block, data) in body.basic_blocks.iter_enumerated() {
+            let args = match &data.terminator().kind {
+                TerminatorKind::Call { args, .. } | TerminatorKind::TailCall { args, .. } => {
+                    &args[..]
+                }
+                _ => continue,
+            };
+            let Some(targets) = resolved.get(&(caller, block)) else {
+                continue;
+            };
+            for left in 0..args.len() {
+                for right in left + 1..args.len() {
+                    let left_actual = actual_slot(slots, caller, &body, &args[left].node);
+                    let right_actual = actual_slot(slots, caller, &body, &args[right].node);
+                    let mut classifier = None;
+                    let mut dependencies = 0usize;
+                    let family = if targets.iter().any(|target| {
+                        let target_body =
+                            tcx.mir_drops_elaborated_and_const_checked(*target).borrow();
+                        left >= target_body.arg_count || right >= target_body.arg_count
+                    }) {
+                        "target-arity"
+                    } else if left_actual.is_none() && right_actual.is_none() {
+                        "both-actual-slots-missing"
+                    } else if left_actual.is_none() {
+                        "left-actual-slot-missing"
+                    } else if right_actual.is_none() {
+                        "right-actual-slot-missing"
+                    } else {
+                        let facts = pair_facts(
+                            tcx,
+                            &body,
+                            flow,
+                            false,
+                            &pre,
+                            &solutions,
+                            &unknown_locations,
+                            caller,
+                            &args[left].node,
+                            &args[right].node,
+                        );
+                        if facts.projection_disjoint {
+                            "projection-disjoint"
+                        } else {
+                            let (dependency_rows, _, _) = caller_pair_dependencies(
+                                &body,
+                                flow,
+                                caller,
+                                &args[left].node,
+                                &args[right].node,
+                            );
+                            dependencies = dependency_rows.len();
+                            let verdict = classify_pair(&facts);
+                            classifier = Some(verdict);
+                            match site_seed_disposition(verdict, dependency_rows.is_empty()) {
+                                SiteSeedDisposition::DirectAndRecord => {
+                                    if targets.iter().all(|target| {
+                                        formal_slot(slots, *target, left).is_some()
+                                            && formal_slot(slots, *target, right).is_some()
+                                    }) {
+                                        "recorded-risky"
+                                    } else {
+                                        "target-formal-slot-missing"
+                                    }
+                                }
+                                SiteSeedDisposition::ForwardOnly => "forward-only-proven-disjoint",
+                                SiteSeedDisposition::Excluded => "excluded-proven-disjoint",
+                            }
+                        }
+                    };
+                    for &target in targets {
+                        answer.push(A5SiteBranchAudit {
+                            caller: caller.local_def_index.as_u32(),
+                            caller_path: caller_path.clone(),
+                            block: block.as_u32(),
+                            target: target.local_def_index.as_u32(),
+                            target_path: tcx.def_path_str(target.to_def_id()),
+                            left_parameter: left as u32 + 1,
+                            right_parameter: right as u32 + 1,
+                            left_operand: format!("{:?}", args[left].node),
+                            right_operand: format!("{:?}", args[right].node),
+                            left_actual: left_actual.map(SlotKey::of),
+                            right_actual: right_actual.map(SlotKey::of),
+                            classifier,
+                            dependencies,
+                            family,
+                            terminator: format!("{:?}", data.terminator().kind),
+                        });
+                    }
+                }
+            }
+        }
+    }
+    answer.sort_by(|left, right| {
+        (
+            left.caller,
+            left.block,
+            left.target,
+            left.left_parameter,
+            left.right_parameter,
+        )
+            .cmp(&(
+                right.caller,
+                right.block,
+                right.target,
+                right.left_parameter,
+                right.right_parameter,
+            ))
+    });
+    answer
+}
+
 fn indirect_targets(
     pre: &andersen::PreAnalysisData<'_>,
     solutions: &andersen::Solutions,
@@ -704,8 +894,7 @@ pub(crate) fn produce_a5_plan(
                             markability,
                             mark,
                             endpoints: (left_slot, right_slot),
-                            registered_site: disposition
-                                == SiteSeedDisposition::DirectAndRecord,
+                            registered_site: disposition == SiteSeedDisposition::DirectAndRecord,
                         });
                     }
                 }

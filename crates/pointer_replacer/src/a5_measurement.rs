@@ -21,9 +21,10 @@ use crate::{
         borrow_ownership::{
             SlotKind,
             a5_overlap::{
-                A5World, C9MarkKey, PairClass, PairFacts, PairSide, SetPairEvidence,
-                SnapshotVerdict, classify_pair,
+                A5Mode, A5World, C9MarkKey, PairClass, PairFacts, PairSide, SetPairEvidence,
+                SnapshotVerdict, WholeProgramAttestation, classify_pair,
             },
+            a5_producer::{audit_a5_site_branches, produce_a5_plan},
             a5_snapshot_effects::snapshot_verdict_for_target,
             borrow_engine::ParameterOverlap,
             borrow_verify::revalidate_replaying_with_parameter_overlap,
@@ -2395,6 +2396,205 @@ pub(super) fn run_production_site_join_worker(
     join_production_site_artifacts(tcx, t_tcx, &name, &pair_path, &summary_path, &receipt_path)
 }
 
+pub(super) fn run_site_scope_repartition_worker(
+    tcx: TyCtxt<'_>,
+    t_tcx: Duration,
+) -> super::report::Row {
+    let t0 = Instant::now();
+    let mut row = super::report::Row::default();
+    row.set("t_tcx_s", t_tcx.as_secs_f64());
+    row.set("data", "false");
+    row.set("a5_mode", "precise_replay");
+    row.set("frame", "in-process-census-derived-baseline");
+    let name = std::env::var("CRAT_BOC1_NAME").unwrap_or_else(|_| "unnamed".to_owned());
+    let w14_path = std::path::PathBuf::from(
+        std::env::var_os("CRAT_A5_SCOPE_W14_PAIR").expect("preserved W14 pair ledger"),
+    );
+    let shard = std::path::PathBuf::from(
+        std::env::var_os("CRAT_A5_SCOPE_SHARD").expect("scope-repartition shard"),
+    );
+    let program = super::collect_program(tcx);
+    let slots = CrateSlots::build(&program);
+    let origins = compute_origins(&program);
+    let mutability = MutFacts::from_program(&program);
+    let audits = audit_a5_site_branches(&program, &slots, origins.native_flows());
+    let audit_by_key = audits
+        .iter()
+        .map(|audit| {
+            (
+                (
+                    audit.caller_path.as_str(),
+                    audit.block,
+                    audit.target_path.as_str(),
+                    audit.left_parameter,
+                    audit.right_parameter,
+                ),
+                audit,
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    let did_by_path = program
+        .functions
+        .iter()
+        .copied()
+        .map(|did| (tcx.def_path_str(did.to_def_id()), did))
+        .collect::<BTreeMap<_, _>>();
+    let mut model = FxHashMap::default();
+    for &did in &program.functions {
+        for index in 0..slots.fn_local_slots[&did].len() {
+            model.insert(
+                SlotRef::Local(did, SlotId::from_usize(index)),
+                SlotKind::Raw,
+            );
+        }
+    }
+    for index in 0..slots.field_slots.len() {
+        model.insert(SlotRef::Field(SlotId::from_usize(index)), SlotKind::Raw);
+    }
+    let pairs = fs::read_to_string(&w14_path).expect("read preserved W14 pairs");
+    let mut registered = Vec::new();
+    let mut family_counts = BTreeMap::<&'static str, usize>::new();
+    for (index, line) in pairs.lines().enumerate() {
+        if index == 0 {
+            continue;
+        }
+        let fields = line.split('\t').collect::<Vec<_>>();
+        assert_eq!(fields.len(), 18, "W14 scope row width");
+        assert_eq!(fields[0], name);
+        let (caller, block) = parse_w14_site(fields[1]).expect("W14 scope site");
+        let target = fields[5]
+            .split_once('[')
+            .map(|(path, _)| path)
+            .expect("W14 scope target");
+        let left = fields[2].parse::<u32>().expect("W14 scope left");
+        let right = fields[3].parse::<u32>().expect("W14 scope right");
+        let audit = audit_by_key
+            .get(&(caller, block, target, left, right))
+            .copied()
+            .unwrap_or_else(|| {
+                panic!("W14 row lacks producer audit: {caller}:bb{block}:{target}#{left}/{right}")
+            });
+        *family_counts.entry(audit.family).or_default() += 1;
+        let target_did = did_by_path[target];
+        for parameter in [left, right] {
+            let slot = slots.fn_local_slots[&target_did]
+                .slot_for_local_depth(Local::from_usize(parameter as usize), 0)
+                .map(|slot| SlotRef::Local(target_did, slot))
+                .expect("W14 target formal slot");
+            model.insert(slot, SlotKind::Ref);
+        }
+        println!(
+            "A5SCOPE\t{name}\t{caller}\t{block}\t{target}\t{left}\t{right}\t{}\t{}",
+            fields[4], audit.family
+        );
+        registered.push(audit);
+    }
+    let plan = produce_a5_plan(
+        &program,
+        &slots,
+        origins.native_flows(),
+        &mutability,
+        &model,
+        A5Mode::PreciseReplay,
+        Some(WholeProgramAttestation::FrozenBenchmarkGraph),
+    )
+    .expect("attempt-3 in-process A5 plan");
+    fs::create_dir_all(&shard).expect("create scope-repartition shard");
+    let summary_path = shard.join("summary.tsv");
+    let receipt_path = shard.join("construction-receipt.txt");
+    let pair_path = shard.join("w14-pair-ledger.tsv");
+    fs::write(&summary_path, &plan.summary_artifact.summary_tsv).expect("write scope summary");
+    fs::write(
+        &receipt_path,
+        format!(
+            "status=ok\ndata=false\na5_raw_site_pairs={}\na5_raw_site_mut_mut={}\na5_raw_site_mut_read_only={}\na5_raw_site_shared_shared={}\n",
+            plan.stats.raw_site_pairs,
+            plan.stats.raw_site_mut_mut,
+            plan.stats.raw_site_mut_read_only,
+            plan.stats.raw_site_shared_shared,
+        ),
+    )
+    .expect("write scope receipt");
+    fs::write(&pair_path, &pairs).expect("write scope W14 pairs");
+    let joined = join_production_site_artifacts(
+        tcx,
+        Duration::ZERO,
+        &name,
+        &pair_path,
+        &summary_path,
+        &receipt_path,
+    );
+    for key in [
+        "registered_site_rows",
+        "production_site_pairs",
+        "matched_registered_rows",
+        "unique_matched_production_pairs",
+        "registered_unmatched",
+        "production_unmatched",
+        "ambiguous_summary_keys",
+        "mixed_class_pairs",
+        "multi_expansion_pairs",
+        "matched_mut_mut",
+        "matched_mut_read_only",
+        "matched_shared_shared",
+        "unmatched_mut_mut",
+        "unmatched_mut_read_only",
+        "unmatched_shared_shared",
+        "production_mut_mut",
+        "production_mut_read_only",
+        "production_shared_shared",
+    ] {
+        row.set(key, joined.get(key).expect("scope join field"));
+    }
+    let nonrecorded = family_counts
+        .iter()
+        .filter(|(family, _)| **family != "recorded-risky")
+        .map(|(_, count)| *count)
+        .sum::<usize>();
+    assert_eq!(
+        nonrecorded,
+        joined
+            .get("registered_unmatched")
+            .expect("scope unmatched")
+            .parse::<usize>()
+            .expect("numeric scope unmatched"),
+        "branch families must partition the exact registered residual"
+    );
+    for (family, count) in family_counts {
+        row.set(&format!("family_{family}"), count);
+    }
+    if name == "ht" {
+        for audit in registered.into_iter().filter(|audit| {
+            audit.block == 14
+                && matches!(
+                    audit.caller_path.as_str(),
+                    "src::ht::ht_expand" | "src::ht::ht_set"
+                )
+                && audit.target_path == "src::ht::ht_set_entry"
+        }) {
+            println!(
+                "A5HTCONTRAST\tcaller={}\tblock={}\ttarget={}\tpair={}/{}\tfamily={}\tclassifier={:?}\tdependencies={}\tleft_operand={}\tright_operand={}\tleft_actual={:?}\tright_actual={:?}\tterminator={}",
+                audit.caller_path,
+                audit.block,
+                audit.target_path,
+                audit.left_parameter,
+                audit.right_parameter,
+                audit.family,
+                audit.classifier,
+                audit.dependencies,
+                audit.left_operand,
+                audit.right_operand,
+                audit.left_actual,
+                audit.right_actual,
+                audit.terminator,
+            );
+        }
+    }
+    row.set("status", "ok");
+    row.set("t_total_s", t0.elapsed().as_secs_f64());
+    row
+}
+
 fn batch_sha256(path: &Path) -> Result<String, String> {
     let bytes = fs::read(path).map_err(|error| format!("read {}: {error}", path.display()))?;
     Ok(format!("{:x}", Sha256::digest(bytes)))
@@ -3370,6 +3570,97 @@ fn a5_production_site_join_diagnostic() {
         ),
     )
     .expect("write production-site join receipt");
+}
+
+#[test]
+#[ignore = "A5 attempt-3 in-process precise-frame site-scope repartition"]
+fn a5_site_scope_repartition_diagnostic() {
+    let launch_root = std::path::PathBuf::from(
+        std::env::var_os("CRAT_A5_SCOPE_LAUNCH_ROOT").expect("launch-4 artifact root"),
+    );
+    let output = super::orchestrate::out_dir().join("a5-site-scope-repartition");
+    fs::create_dir_all(&output).expect("create site-scope repartition output");
+    let root = super::orchestrate::workspace_root();
+    let timeout = Duration::from_secs(14_400);
+    let mut rows = Vec::new();
+    for program in super::CORPUS {
+        let shard = output.join("precise").join(program.name);
+        let common = vec![
+            (
+                "CRAT_A5_SCOPE_W14_PAIR",
+                launch_root
+                    .join("precise")
+                    .join(program.name)
+                    .join("w14-pair-ledger.tsv")
+                    .display()
+                    .to_string(),
+            ),
+            ("CRAT_A5_SCOPE_SHARD", shard.display().to_string()),
+        ];
+        let child = super::orchestrate::run_child_labeled(
+            program.name,
+            &program.input_path(&root),
+            "a5-site-scope-repartition",
+            "a5-site-scope-repartition",
+            timeout,
+            &common,
+        );
+        let row = child.row.unwrap_or_default();
+        if child.status != "ok" || row.get("status") != Some("ok") {
+            fs::write(
+                output.join("receipt.txt"),
+                format!(
+                    "status=failed\ndata=false\nprogram={}\nchild_status={}\nnote={}\n",
+                    program.name, child.status, child.note
+                ),
+            )
+            .expect("write scope-repartition failure receipt");
+            panic!(
+                "A5 scope-repartition STOP: {} status={}",
+                program.name, child.status
+            );
+        }
+        rows.push(row);
+        fs::write(
+            output.join("per-program.csv"),
+            super::report::render_csv(&rows),
+        )
+        .expect("write scope-repartition partial rows");
+    }
+    let sum = |key| rows.iter().map(|row| batch_number(row, key)).sum::<usize>();
+    assert_eq!(sum("registered_site_rows"), 5_555);
+    let family_keys = rows
+        .iter()
+        .flat_map(|row| row.0.iter().map(|(key, _)| key.as_str()))
+        .filter(|key| key.starts_with("family_"))
+        .collect::<BTreeSet<_>>();
+    let family_total = family_keys.iter().map(|key| sum(key)).sum::<usize>();
+    assert_eq!(family_total, 5_555);
+    let residual = sum("registered_unmatched");
+    let residual_family_total = family_keys
+        .iter()
+        .filter(|key| **key != "family_recorded-risky")
+        .map(|key| sum(key))
+        .sum::<usize>();
+    assert_eq!(residual_family_total, residual);
+    let mut families = String::new();
+    for key in &family_keys {
+        families.push_str(&format!("{}={}\n", key, sum(key)));
+    }
+    fs::write(
+        output.join("receipt.txt"),
+        format!(
+            "schema=a5-site-scope-repartition-v1\nstatus=ok\ndata=false\nanalysis_head={}\nprograms=20\nregistered_site_rows={}\nproduction_site_pairs={}\nregistered_unmatched={}\nproduction_unmatched={}\nmixed_class_pairs={}\nambiguous_summary_keys={}\n{families}",
+            super::orchestrate::git_sha(),
+            sum("registered_site_rows"),
+            sum("production_site_pairs"),
+            residual,
+            sum("production_unmatched"),
+            sum("mixed_class_pairs"),
+            sum("ambiguous_summary_keys"),
+        ),
+    )
+    .expect("write scope-repartition receipt");
 }
 
 fn finish_a5_item22_batch(
