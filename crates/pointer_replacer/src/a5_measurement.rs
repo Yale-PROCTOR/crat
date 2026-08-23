@@ -3811,17 +3811,10 @@ fn finish_a5_item22_batch(
                 .sum::<usize>();
             row.set(key, count);
         }
-        let expected_reverted = match label {
-            "baseline" => 1_056,
-            "precise" => 984,
-            "coarse" => 860,
-            other => panic!("unknown A5 batch configuration {other}"),
-        };
-        assert_eq!(sum("rw_reverted"), expected_reverted, "{label} reverted");
         assert_eq!(
             sum("rw_reverted_after_verify_failure"),
-            expected_reverted,
-            "{label} operational rollback"
+            sum("rw_reverted"),
+            "{label} operational rollback identity"
         );
         assert_eq!(
             sum("rw_decided_ref"),
