@@ -238,6 +238,8 @@ pub(crate) fn audit_a5_site_branches(
             }
         }
     }
+    let address_taken = crate::rewriter::collector::collect_fn_ptrs(program);
+    let unknown_reachable = closed_world_unknown_reachable(program, &resolved, &address_taken);
 
     let mut answer = Vec::new();
     for &caller in &program.functions {
@@ -277,7 +279,7 @@ pub(crate) fn audit_a5_site_branches(
                             tcx,
                             &body,
                             flow,
-                            false,
+                            unknown_reachable.contains(&caller),
                             &pre,
                             &solutions,
                             &unknown_locations,
@@ -547,6 +549,37 @@ fn merge_abi_guard(current: &mut AbiGuardDisposition, next: AbiGuardDisposition)
     }
 }
 
+fn closed_world_unknown_reachable(
+    program: &RustProgram<'_>,
+    resolved: &FxHashMap<(LocalDefId, BasicBlock), Vec<LocalDefId>>,
+    address_taken: &FxHashSet<LocalDefId>,
+) -> FxHashSet<LocalDefId> {
+    let mut pending = program
+        .functions
+        .iter()
+        .copied()
+        .filter(|did| {
+            program.tcx.visibility(did.to_def_id()).is_public() || address_taken.contains(did)
+        })
+        .collect::<Vec<_>>();
+    pending.sort_unstable_by_key(|did| did.local_def_index.as_u32());
+    let mut reachable = FxHashSet::default();
+    while let Some(function) = pending.pop() {
+        if !reachable.insert(function) {
+            continue;
+        }
+        let mut callees = resolved
+            .iter()
+            .filter(|((caller, _), _)| *caller == function)
+            .flat_map(|(_, targets)| targets.iter().copied())
+            .collect::<Vec<_>>();
+        callees.sort_unstable_by_key(|did| did.local_def_index.as_u32());
+        callees.dedup();
+        pending.extend(callees);
+    }
+    reachable
+}
+
 fn formal_slot(slots: &CrateSlots, target: LocalDefId, parameter: usize) -> Option<SlotRef> {
     let slot = slots
         .fn_local_slots
@@ -719,6 +752,8 @@ pub(crate) fn produce_a5_plan(
             resolved.insert((caller, block), targets);
         }
     }
+    let unknown_reachable =
+        closed_world_unknown_reachable(program, &resolved, &address_taken_functions);
 
     let mut transfers = Vec::new();
     let mut records = BTreeMap::<FunctionPairKey, Vec<WitnessRecord>>::new();
@@ -766,7 +801,7 @@ pub(crate) fn produce_a5_plan(
                         tcx,
                         &body,
                         flow,
-                        false,
+                        unknown_reachable.contains(&caller),
                         &pre,
                         &solutions,
                         &unknown_locations,
@@ -1114,6 +1149,33 @@ mod tests {
             SiteSeedDisposition::ForwardOnly,
             "a proven-disjoint site may transfer dependencies without entering the site ledger"
         );
+    }
+
+    #[test]
+    fn unknown_reachable_caller_keeps_ht_set_shaped_site_conservative() {
+        let code = r#"
+            unsafe fn ht_set_entry(x: *mut i32, y: *mut i32) {}
+            pub unsafe fn ht_set(x: *mut i32, y: *mut i32) {
+                ht_set_entry(x, y);
+            }
+        "#;
+        ::utils::compilation::run_compiler_on_str(code, |tcx| {
+            let program = program(tcx);
+            let slots = CrateSlots::build(&program);
+            let origins = compute_origins(&program);
+            let audit = audit_a5_site_branches(&program, &slots, origins.native_flows());
+            let site = audit
+                .iter()
+                .find(|row| {
+                    row.caller_path.ends_with("ht_set")
+                        && row.target_path.ends_with("ht_set_entry")
+                        && (row.left_parameter, row.right_parameter) == (1, 2)
+                })
+                .expect("ht_set-shaped site audit");
+            assert_eq!(site.classifier, Some(PairClass::NotProvenDisjoint));
+            assert_eq!(site.family, "recorded-risky");
+        })
+        .unwrap();
     }
 
     #[test]
