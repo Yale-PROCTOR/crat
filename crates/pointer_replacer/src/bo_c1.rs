@@ -6208,6 +6208,11 @@ mod run {
         .expect("write A5 summary artifact");
         std::fs::write(artifact_dir.join("marks.tsv"), &verified.mark_artifact)
             .expect("write A5 mark artifact");
+        std::fs::write(
+            artifact_dir.join("production-site-ledger.tsv"),
+            &verified.site_artifact,
+        )
+        .expect("write A5 production-site artifact");
         let mut model_rows = verified
             .model
             .iter()
@@ -6261,7 +6266,7 @@ mod run {
                 Duration::ZERO,
                 &name,
                 &artifact_dir.join("w14-pair-ledger.tsv"),
-                &artifact_dir.join("summary.tsv"),
+                &artifact_dir.join("production-site-ledger.tsv"),
                 &artifact_dir.join("construction-receipt.txt"),
             );
             assert_eq!(site_join.get("status"), Some("ok"), "site-join status");
@@ -6272,7 +6277,9 @@ mod run {
                 "unique_matched_production_pairs",
                 "registered_unmatched",
                 "production_unmatched",
+                "production_count_residual",
                 "ambiguous_summary_keys",
+                "ambiguous_production_keys",
                 "mixed_class_pairs",
                 "multi_expansion_pairs",
                 "matched_mut_mut",
@@ -6296,7 +6303,9 @@ mod run {
             };
             assert_eq!(join_number("registered_unmatched"), 0);
             assert_eq!(join_number("production_unmatched"), 0);
+            assert_eq!(join_number("production_count_residual"), 0);
             assert_eq!(join_number("ambiguous_summary_keys"), 0);
+            assert_eq!(join_number("ambiguous_production_keys"), 0);
             assert_eq!(join_number("mixed_class_pairs"), 0);
             assert_eq!(join_number("multi_expansion_pairs"), 0);
             assert_eq!(

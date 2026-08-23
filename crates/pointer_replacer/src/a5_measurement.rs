@@ -29,7 +29,7 @@ use crate::{
             borrow_engine::ParameterOverlap,
             borrow_verify::revalidate_replaying_with_parameter_overlap,
             construction::{
-                CopyLendMode, construct_bo_into, verify_bo_construction,
+                CopyLendMode, a5_site_artifact, construct_bo_into, verify_bo_construction,
                 verify_bo_construction_with_parameter_overlaps,
             },
             crate_slots::CrateSlots,
@@ -2207,7 +2207,7 @@ pub(super) fn join_production_site_artifacts(
     t_tcx: Duration,
     name: &str,
     pair_path: &Path,
-    summary_path: &Path,
+    site_path: &Path,
     receipt_path: &Path,
 ) -> super::report::Row {
     let t0 = Instant::now();
@@ -2228,32 +2228,39 @@ pub(super) fn join_production_site_artifacts(
         })
         .collect::<BTreeMap<_, _>>();
 
-    let summary = fs::read_to_string(&summary_path)
-        .unwrap_or_else(|error| panic!("read {}: {error}", summary_path.display()));
-    let mut summary_keys = BTreeSet::new();
-    let mut ambiguous_summary_keys = BTreeSet::new();
+    let sites = fs::read_to_string(&site_path)
+        .unwrap_or_else(|error| panic!("read {}: {error}", site_path.display()));
+    let mut production_keys = BTreeSet::new();
+    let mut ambiguous_production_keys = BTreeSet::new();
     let mut statement_by_key = BTreeMap::new();
-    for (index, line) in summary.lines().enumerate() {
+    let mut production_class_by_key = BTreeMap::<ProductionSiteKey, String>::new();
+    for (index, line) in sites.lines().enumerate() {
         if index == 0 {
             continue;
         }
         let fields = line.split('\t').collect::<Vec<_>>();
-        assert_eq!(fields.len(), 14, "summary row width");
+        assert_eq!(fields.len(), 16, "production-site row width");
         let key = ProductionSiteKey {
-            callee: fields[0].parse().expect("summary callee"),
-            left_parameter: fields[1].parse().expect("summary left"),
-            right_parameter: fields[2].parse().expect("summary right"),
-            caller: fields[3].parse().expect("summary caller"),
-            block: fields[4].parse().expect("summary block"),
+            callee: fields[3].parse().expect("site target"),
+            left_parameter: fields[4].parse().expect("site left"),
+            right_parameter: fields[5].parse().expect("site right"),
+            caller: fields[0].parse().expect("site caller"),
+            block: fields[1].parse().expect("site block"),
         };
-        let statement = fields[5].parse::<usize>().expect("summary statement");
+        let statement = fields[2].parse::<usize>().expect("site statement");
         if statement_by_key
             .insert(key.clone(), statement)
             .is_some_and(|old| old != statement)
         {
-            ambiguous_summary_keys.insert(key.clone());
+            ambiguous_production_keys.insert(key.clone());
         }
-        summary_keys.insert(key);
+        if production_class_by_key
+            .insert(key.clone(), fields[12].to_owned())
+            .is_some_and(|old| old != fields[12])
+        {
+            ambiguous_production_keys.insert(key.clone());
+        }
+        production_keys.insert(key);
     }
 
     let pairs = fs::read_to_string(&pair_path)
@@ -2298,7 +2305,7 @@ pub(super) fn join_production_site_artifacts(
         };
         let class = fields[4].to_owned();
         registered_rows += 1;
-        let matched = summary_keys.contains(&key);
+        let matched = production_keys.contains(&key);
         if matched {
             matched_rows += 1;
             matched_keys.insert(key.clone());
@@ -2308,6 +2315,9 @@ pub(super) fn join_production_site_artifacts(
                 .insert(key.clone(), class.clone())
                 .is_some_and(|old| old != class)
             {
+                mixed_keys.insert(key.clone());
+            }
+            if production_class_by_key.get(&key) != Some(&class) {
                 mixed_keys.insert(key.clone());
             }
         } else {
@@ -2342,9 +2352,14 @@ pub(super) fn join_production_site_artifacts(
     row.set("registered_unmatched", unmatched_rows);
     row.set(
         "production_unmatched",
-        production_pairs.abs_diff(matched_keys.len()),
+        production_keys.difference(&matched_keys).count(),
     );
-    row.set("ambiguous_summary_keys", ambiguous_summary_keys.len());
+    row.set(
+        "production_count_residual",
+        production_pairs.abs_diff(production_keys.len()),
+    );
+    row.set("ambiguous_summary_keys", ambiguous_production_keys.len());
+    row.set("ambiguous_production_keys", ambiguous_production_keys.len());
     row.set("mixed_class_pairs", mixed_keys.len());
     row.set("multi_expansion_pairs", multi_expansion);
     row.set(
@@ -2387,13 +2402,13 @@ pub(super) fn run_production_site_join_worker(
     let pair_path = std::path::PathBuf::from(
         std::env::var_os("CRAT_A5_SITE_JOIN_W14_PAIR").expect("W14 pair ledger"),
     );
-    let summary_path = std::path::PathBuf::from(
-        std::env::var_os("CRAT_A5_SITE_JOIN_SUMMARY").expect("production summary"),
+    let site_path = std::path::PathBuf::from(
+        std::env::var_os("CRAT_A5_SITE_JOIN_LEDGER").expect("production site ledger"),
     );
     let receipt_path = std::path::PathBuf::from(
         std::env::var_os("CRAT_A5_SITE_JOIN_RECEIPT").expect("construction receipt"),
     );
-    join_production_site_artifacts(tcx, t_tcx, &name, &pair_path, &summary_path, &receipt_path)
+    join_production_site_artifacts(tcx, t_tcx, &name, &pair_path, &site_path, &receipt_path)
 }
 
 pub(super) fn run_site_scope_repartition_worker(
@@ -2499,11 +2514,40 @@ pub(super) fn run_site_scope_repartition_worker(
         Some(WholeProgramAttestation::FrozenBenchmarkGraph),
     )
     .expect("attempt-3 in-process A5 plan");
+    let production_keys = plan
+        .site_ledger
+        .iter()
+        .map(|site| {
+            (
+                site.caller,
+                site.location.block,
+                site.target,
+                site.left_parameter,
+                site.right_parameter,
+            )
+        })
+        .collect::<BTreeSet<_>>();
+    let mut residual_family_counts = BTreeMap::<&'static str, usize>::new();
+    for audit in &registered {
+        let key = (
+            audit.caller,
+            audit.block,
+            audit.target,
+            audit.left_parameter,
+            audit.right_parameter,
+        );
+        if !production_keys.contains(&key) {
+            *residual_family_counts.entry(audit.family).or_default() += 1;
+        }
+    }
     fs::create_dir_all(&shard).expect("create scope-repartition shard");
     let summary_path = shard.join("summary.tsv");
+    let site_path = shard.join("production-site-ledger.tsv");
     let receipt_path = shard.join("construction-receipt.txt");
     let pair_path = shard.join("w14-pair-ledger.tsv");
     fs::write(&summary_path, &plan.summary_artifact.summary_tsv).expect("write scope summary");
+    fs::write(&site_path, a5_site_artifact(A5Mode::PreciseReplay, &plan))
+        .expect("write scope production-site ledger");
     fs::write(
         &receipt_path,
         format!(
@@ -2521,7 +2565,7 @@ pub(super) fn run_site_scope_repartition_worker(
         Duration::ZERO,
         &name,
         &pair_path,
-        &summary_path,
+        &site_path,
         &receipt_path,
     );
     for key in [
@@ -2531,7 +2575,9 @@ pub(super) fn run_site_scope_repartition_worker(
         "unique_matched_production_pairs",
         "registered_unmatched",
         "production_unmatched",
+        "production_count_residual",
         "ambiguous_summary_keys",
+        "ambiguous_production_keys",
         "mixed_class_pairs",
         "multi_expansion_pairs",
         "matched_mut_mut",
@@ -2546,13 +2592,9 @@ pub(super) fn run_site_scope_repartition_worker(
     ] {
         row.set(key, joined.get(key).expect("scope join field"));
     }
-    let nonrecorded = family_counts
-        .iter()
-        .filter(|(family, _)| **family != "recorded-risky")
-        .map(|(_, count)| *count)
-        .sum::<usize>();
+    let residual_family_total = residual_family_counts.values().sum::<usize>();
     assert_eq!(
-        nonrecorded,
+        residual_family_total,
         joined
             .get("registered_unmatched")
             .expect("scope unmatched")
@@ -2562,6 +2604,9 @@ pub(super) fn run_site_scope_repartition_worker(
     );
     for (family, count) in family_counts {
         row.set(&format!("family_{family}"), count);
+    }
+    for (family, count) in residual_family_counts {
+        row.set(&format!("residual_family_{family}"), count);
     }
     if name == "ht" {
         for audit in registered.into_iter().filter(|audit| {
@@ -2971,7 +3016,9 @@ fn validate_launch4_preflight(
         "a5_site_join_unique_matched_production_pairs",
         "a5_site_join_registered_unmatched",
         "a5_site_join_production_unmatched",
+        "a5_site_join_production_count_residual",
         "a5_site_join_ambiguous_summary_keys",
+        "a5_site_join_ambiguous_production_keys",
         "a5_site_join_mixed_class_pairs",
         "a5_site_join_multi_expansion_pairs",
         "a5_site_join_matched_mut_mut",
@@ -3479,8 +3526,11 @@ fn a5_production_site_join_diagnostic() {
                 precise.join("w14-pair-ledger.tsv").display().to_string(),
             ),
             (
-                "CRAT_A5_SITE_JOIN_SUMMARY",
-                precise.join("summary.tsv").display().to_string(),
+                "CRAT_A5_SITE_JOIN_LEDGER",
+                precise
+                    .join("production-site-ledger.tsv")
+                    .display()
+                    .to_string(),
             ),
             (
                 "CRAT_A5_SITE_JOIN_RECEIPT",
@@ -3637,14 +3687,21 @@ fn a5_site_scope_repartition_diagnostic() {
     let family_total = family_keys.iter().map(|key| sum(key)).sum::<usize>();
     assert_eq!(family_total, 5_555);
     let residual = sum("registered_unmatched");
-    let residual_family_total = family_keys
+    let residual_family_keys = rows
         .iter()
-        .filter(|key| **key != "family_recorded-risky")
+        .flat_map(|row| row.0.iter().map(|(key, _)| key.as_str()))
+        .filter(|key| key.starts_with("residual_family_"))
+        .collect::<BTreeSet<_>>();
+    let residual_family_total = residual_family_keys
+        .iter()
         .map(|key| sum(key))
         .sum::<usize>();
     assert_eq!(residual_family_total, residual);
     let mut families = String::new();
     for key in &family_keys {
+        families.push_str(&format!("{}={}\n", key, sum(key)));
+    }
+    for key in &residual_family_keys {
         families.push_str(&format!("{}={}\n", key, sum(key)));
     }
     fs::write(
@@ -3825,7 +3882,9 @@ fn finish_a5_item22_batch(
                 "a5_site_join_unique_matched_production_pairs",
                 "a5_site_join_registered_unmatched",
                 "a5_site_join_production_unmatched",
+                "a5_site_join_production_count_residual",
                 "a5_site_join_ambiguous_summary_keys",
+                "a5_site_join_ambiguous_production_keys",
                 "a5_site_join_mixed_class_pairs",
                 "a5_site_join_multi_expansion_pairs",
                 "a5_site_join_matched_mut_mut",
@@ -3872,7 +3931,9 @@ fn finish_a5_item22_batch(
         ("a5_site_join_unique_matched_production_pairs", 5_555),
         ("a5_site_join_registered_unmatched", 0),
         ("a5_site_join_production_unmatched", 0),
+        ("a5_site_join_production_count_residual", 0),
         ("a5_site_join_ambiguous_summary_keys", 0),
+        ("a5_site_join_ambiguous_production_keys", 0),
         ("a5_site_join_mixed_class_pairs", 0),
         ("a5_site_join_multi_expansion_pairs", 0),
         ("a5_site_join_matched_mut_mut", 2_391),

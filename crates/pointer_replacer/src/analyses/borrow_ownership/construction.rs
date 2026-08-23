@@ -236,6 +236,7 @@ pub(crate) struct VerifiedBo {
     pub(crate) retained_c9_plans: Vec<PlannedC9Mark>,
     pub(crate) summary_artifact: super::a5_overlap::A5SummaryArtifact,
     pub(crate) mark_artifact: String,
+    pub(crate) site_artifact: String,
     pub(crate) receipt: String,
     pub(crate) round_stats: super::borrow_verify::RoundStats,
     pub(crate) selector_sources: usize,
@@ -309,6 +310,39 @@ fn a5_mark_artifact(
             mark.key.shared_side,
             mark.key.pointee_type,
             retained.contains(&mark.key),
+        ));
+    }
+    out
+}
+
+pub(crate) fn a5_site_artifact(mode: A5Mode, plan: &A5Plan) -> String {
+    let mut out = String::from(
+        "caller\tblock\tstatement\ttarget\tleft_parameter\tright_parameter\tleft_variant\tleft_owner\tleft_slot\tright_variant\tright_owner\tright_slot\tclass\ta5_world\ta5_mode\ta5_abi_guard\n",
+    );
+    for site in &plan.site_ledger {
+        let class = match site.class {
+            super::a5_overlap::WitnessMutability::MutMut => "mut_mut",
+            super::a5_overlap::WitnessMutability::MutReadOnly { .. } => "mut_read_only",
+            super::a5_overlap::WitnessMutability::SharedShared => "shared_shared",
+        };
+        out.push_str(&format!(
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+            site.caller,
+            site.location.block,
+            site.location.statement_index,
+            site.target,
+            site.left_parameter,
+            site.right_parameter,
+            site.left_actual.variant,
+            site.left_actual.owner,
+            site.left_actual.slot,
+            site.right_actual.variant,
+            site.right_actual.owner,
+            site.right_actual.slot,
+            class,
+            A5World::ClosedWorldFrozenGraph.label(),
+            mode.label(),
+            plan.abi_guard.stamp(),
         ));
     }
     out
@@ -626,6 +660,7 @@ pub(crate) fn solve_bo_a5_config(
         return Some(VerifiedBo {
             receipt: a5_receipt(mode, &plan, 0, 0, &selected_model_sha256),
             mark_artifact: a5_mark_artifact(mode, &plan, &BTreeSet::new(), &selected_model_sha256),
+            site_artifact: a5_site_artifact(mode, &plan),
             summary_artifact: plan.summary_artifact.clone(),
             baseline_model: baseline_model.clone(),
             model: baseline_model,
@@ -658,6 +693,7 @@ pub(crate) fn solve_bo_a5_config(
         return Some(VerifiedBo {
             receipt: a5_receipt(mode, &plan, 0, 0, &selected_model_sha256),
             mark_artifact: a5_mark_artifact(mode, &plan, &BTreeSet::new(), &selected_model_sha256),
+            site_artifact: a5_site_artifact(mode, &plan),
             summary_artifact: plan.summary_artifact.clone(),
             baseline_model: baseline_model.clone(),
             model: baseline_model,
@@ -736,6 +772,7 @@ pub(crate) fn solve_bo_a5_config(
             &selected_model_sha256,
         ),
         mark_artifact: a5_mark_artifact(mode, &plan, &retained_c9_marks, &selected_model_sha256),
+        site_artifact: a5_site_artifact(mode, &plan),
         summary_artifact: plan.summary_artifact.clone(),
         model,
         baseline_model,

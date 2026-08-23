@@ -62,6 +62,7 @@ pub(crate) struct A5Plan {
     pub(crate) effective_overlaps: FxHashMap<LocalDefId, ParameterOverlap>,
     pub(crate) coarse_pairs: Vec<(SlotRef, SlotRef)>,
     pub(crate) planned_marks: Vec<PlannedC9Mark>,
+    pub(crate) site_ledger: Vec<A5ProductionSiteRow>,
     pub(crate) summary_artifact: A5SummaryArtifact,
     pub(crate) stats: A5ProducerStats,
 }
@@ -84,6 +85,7 @@ impl A5Plan {
             effective_overlaps: FxHashMap::default(),
             coarse_pairs: Vec::new(),
             planned_marks: Vec::new(),
+            site_ledger: Vec::new(),
             summary_artifact: render_summary_artifact(&fixpoint, A5Mode::Baseline, &guard),
             stats: A5ProducerStats::default(),
         }
@@ -138,6 +140,18 @@ impl A5Plan {
         });
         retained
     }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct A5ProductionSiteRow {
+    pub(crate) caller: u32,
+    pub(crate) location: MirLocationKey,
+    pub(crate) target: u32,
+    pub(crate) left_parameter: u32,
+    pub(crate) right_parameter: u32,
+    pub(crate) left_actual: SlotKey,
+    pub(crate) right_actual: SlotKey,
+    pub(crate) class: WitnessMutability,
 }
 
 #[derive(Clone)]
@@ -906,9 +920,10 @@ pub(crate) fn produce_a5_plan(
     let mut overlap_pairs = FxHashMap::<LocalDefId, Vec<(Local, Local)>>::default();
     let mut coarse = BTreeMap::<(SlotKey, SlotKey), (SlotRef, SlotRef)>::new();
     let mut planned = Vec::new();
-    let mut site_classes =
-        BTreeMap::<(u32, MirLocationKey, u32, u32, SlotKey, SlotKey), Vec<WitnessMutability>>::new(
-        );
+    let mut site_classes = BTreeMap::<
+        (u32, MirLocationKey, u32, u32, u32, SlotKey, SlotKey),
+        Vec<WitnessMutability>,
+    >::new();
     for (pair, witnesses) in records {
         if !fixpoint.summary().contains(pair) {
             continue;
@@ -931,6 +946,7 @@ pub(crate) fn produce_a5_plan(
                 .entry((
                     witness.key.caller(),
                     witness.key.location(),
+                    pair.function(),
                     params.first(),
                     params.second(),
                     actuals.0,
@@ -967,8 +983,34 @@ pub(crate) fn produce_a5_plan(
     planned.dedup_by(|left, right| left.key == right.key);
     stats.planned_marks = planned.len();
     stats.raw_site_pairs = site_classes.len();
-    for classes in site_classes.into_values() {
-        match join_classes(classes) {
+    let site_ledger = site_classes
+        .into_iter()
+        .map(
+            |(
+                (
+                    caller,
+                    location,
+                    target,
+                    left_parameter,
+                    right_parameter,
+                    left_actual,
+                    right_actual,
+                ),
+                classes,
+            )| A5ProductionSiteRow {
+                caller,
+                location,
+                target,
+                left_parameter,
+                right_parameter,
+                left_actual,
+                right_actual,
+                class: join_classes(classes),
+            },
+        )
+        .collect::<Vec<_>>();
+    for site in &site_ledger {
+        match site.class {
             WitnessMutability::MutMut => stats.raw_site_mut_mut += 1,
             WitnessMutability::MutReadOnly { .. } => stats.raw_site_mut_read_only += 1,
             WitnessMutability::SharedShared => stats.raw_site_shared_shared += 1,
@@ -986,6 +1028,7 @@ pub(crate) fn produce_a5_plan(
         effective_overlaps,
         coarse_pairs: coarse.into_values().collect(),
         planned_marks: planned,
+        site_ledger,
         summary_artifact,
         stats,
     })
