@@ -1811,6 +1811,7 @@ pub(crate) fn synthesize(
     facts: &super::emitability::EmitabilityFacts,
     subjects: &[Subject],
     table: &DecisionTable,
+    c9_marks: &[crate::analyses::borrow_ownership::a5_producer::PlannedC9Mark],
 ) -> SeamPlan {
     let sm = tcx.sess.source_map();
     let mut plan = SeamPlan::default();
@@ -1837,6 +1838,8 @@ pub(crate) fn synthesize(
 
     for callee in callees {
         for site in &facts.call_args[callee] {
+            let marked_shared =
+                super::co_conversion::retained_c9_shared_params(c9_marks, site, *callee);
             // ---- pass 1: what each position will look like after conversion ----
             //
             // Computed for the WHOLE site before any edit is emitted, because
@@ -1868,6 +1871,12 @@ pub(crate) fn synthesize(
             }
             let mut positions: Vec<Pos> = Vec::new();
             for arg in &site.args {
+                // C-9 rewrites this argument to `&snapshot_tmp` after the
+                // ordinary use/seam passes. No seam or within-site overlap
+                // gate applies to the original expression at this position.
+                if marked_shared.contains(&arg.index) {
+                    continue;
+                }
                 let expected = param_key
                     .get(&(*callee, arg.index))
                     .and_then(|k| decision_of.get(k))

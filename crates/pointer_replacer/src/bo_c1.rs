@@ -47,6 +47,8 @@ mod a4_measurement;
 mod a4_source_census;
 #[path = "a5_measurement.rs"]
 mod a5_measurement;
+#[path = "copy_lend_funnel.rs"]
+mod copy_lend_funnel;
 #[path = "kind_equate_core_census.rs"]
 mod kind_equate_core_census;
 #[path = "p_b_measurement.rs"]
@@ -4312,6 +4314,7 @@ mod run {
     use points_to::andersen;
     use rustc_hash::{FxHashMap, FxHashSet};
     use rustc_middle::ty::{TyCtxt, TyKind};
+    use sha2::{Digest, Sha256};
     use z3::{SatResult, ast::Bool};
 
     use super::{
@@ -4330,6 +4333,7 @@ mod run {
         borrow::{GBorrowInferCtxt, demote_pointers_iterative_with_fields},
         borrow_ownership::{
             SafeMonoMode, SlotKind,
+            a5_overlap::{A5Mode, A5World, WholeProgramAttestation},
             borrow_verify::{
                 RepairMode, model_accepts_with_flows, model_accepts_with_flows_and_copy_lends,
                 slotref_key, with_capture, with_mode_a_commit_trace,
@@ -4338,8 +4342,8 @@ mod run {
                 constrain_field_ownership, field_ownership_candidates, selected_copy_lend_sites,
             },
             construction::{
-                BoConstruction, CopyLendMode, construct_bo_into, verify_bo_construction_counting,
-                verify_bo_construction_with_flows,
+                A2Mode, BoConstruction, CopyLendMode, construct_bo_into, solve_bo_a5_config,
+                verify_bo_construction_counting, verify_bo_construction_with_flows,
             },
             crate_slots::CrateSlots,
             l2,
@@ -5341,7 +5345,6 @@ mod run {
         let mut row = Row::default();
         row.set("t_tcx_s", secs(t_tcx));
         row.set("z3_full_version", z3::full_version().to_string());
-
         let program_name =
             std::env::var("CRAT_BOC1_NAME").expect("selector-core worker requires program name");
         let trace_path = std::env::var("CRAT_BOC1_SELECTOR_TRACE")
@@ -6005,6 +6008,332 @@ mod run {
         row.set("check_sat_count", check_sat_count);
         row.set("t_total_s", secs(t0.elapsed()));
         row.set("status", "ok");
+        row
+    }
+
+    pub fn run_a5_batch_model(tcx: TyCtxt<'_>, t_tcx: Duration) -> Row {
+        let t0 = Instant::now();
+        let mut row = Row::default();
+        row.set("t_tcx_s", secs(t_tcx));
+        let mode = A5Mode::PreciseReplay;
+        assert_eq!(CopyLendMode::current(), CopyLendMode::Baseline);
+        assert_eq!(A2Mode::current(), A2Mode::Off);
+        assert_eq!(
+            WholeProgramAttestation::current(),
+            Some(WholeProgramAttestation::FrozenBenchmarkGraph),
+            "A5 batch requires the frozen-graph attestation"
+        );
+        row.set("a5_mode", mode.label());
+        row.set("a5_world", A5World::ClosedWorldFrozenGraph.label());
+        row.set("copy_lend_mode", CopyLendMode::Baseline.label());
+        row.set("a2_mode", A2Mode::Off.label());
+        row.set("z3_full_version", z3::full_version().to_string());
+        let official_evaluation = std::path::PathBuf::from(
+            std::env::var_os("CRAT_A5_OFFICIAL_EVALUATION")
+                .expect("A5 batch requires CRAT_A5_OFFICIAL_EVALUATION"),
+        );
+        let official_expected = std::env::var("CRAT_A5_OFFICIAL_EVALUATION_SHA256")
+            .expect("A5 batch requires the official evaluation digest pin");
+        let official_actual = format!(
+            "{:x}",
+            Sha256::digest(
+                std::fs::read(&official_evaluation)
+                    .expect("read official evaluation through the worktree link")
+            )
+        );
+        assert_eq!(
+            official_actual, official_expected,
+            "official evaluation digest mismatch"
+        );
+        row.set("official_evaluation_sha256", official_actual);
+
+        let program = collect_program(tcx);
+        let slots = CrateSlots::build(&program);
+        let origins = compute_origins(&program);
+        let mut_facts = MutFacts::from_program(&program);
+        let Some(verified) = solve_bo_a5_config(
+            &program,
+            &slots,
+            &origins,
+            &mut_facts,
+            mode,
+            Some(WholeProgramAttestation::FrozenBenchmarkGraph),
+        ) else {
+            row.set("status", "decline");
+            row.set("t_total_s", secs(t0.elapsed()));
+            return row;
+        };
+        for stamp in [
+            format!("a5_mode={}\n", mode.label()),
+            "a5_world=closed_world_frozen_graph\n".to_owned(),
+            "a5_abi_guard=permitted:measurement-frozen-graph-attested\n".to_owned(),
+            "copy_lend_mode=baseline\n".to_owned(),
+            "a2_mode=off\n".to_owned(),
+        ] {
+            assert!(
+                verified.receipt.contains(&stamp),
+                "A5 construction receipt lacks {stamp:?}"
+            );
+        }
+        row.set(
+            "a5_abi_guard",
+            "permitted:measurement-frozen-graph-attested",
+        );
+
+        let mut n_ref = 0usize;
+        let mut n_raw = 0usize;
+        let mut n_own = 0usize;
+        let mut n_ref_d0 = 0usize;
+        let mut n_raw_d0 = 0usize;
+        let mut n_own_d0 = 0usize;
+        let mut owning_fields = 0usize;
+        for (&slot, &kind) in &verified.model {
+            match kind {
+                SlotKind::Ref => n_ref += 1,
+                SlotKind::Raw => n_raw += 1,
+                SlotKind::Owning => n_own += 1,
+            }
+            match slot {
+                SlotRef::Local(did, id) if slots.fn_local_slots[&did].slot(id).depth == 0 => {
+                    match kind {
+                        SlotKind::Ref => n_ref_d0 += 1,
+                        SlotKind::Raw => n_raw_d0 += 1,
+                        SlotKind::Owning => n_own_d0 += 1,
+                    }
+                }
+                SlotRef::Field(id)
+                    if slots.field_slots.slot(id).depth == 0 && kind == SlotKind::Owning =>
+                {
+                    owning_fields += 1;
+                }
+                SlotRef::Local(..) | SlotRef::Field(_) => {}
+            }
+        }
+        row.set("status", "ok");
+        row.set("n_ref", n_ref);
+        row.set("n_raw", n_raw);
+        row.set("n_own", n_own);
+        row.set("n_ref_d0", n_ref_d0);
+        row.set("n_raw_d0", n_raw_d0);
+        row.set("n_own_d0", n_own_d0);
+        row.set(
+            "selectors",
+            verified.selector_sources + verified.selector_sinks,
+        );
+        row.set("sources_total", verified.selector_sources);
+        row.set("sinks_total", verified.selector_sinks);
+        row.set(
+            "sources_kept",
+            verified
+                .selector_sources
+                .saturating_sub(verified.round_stats.dropped_sources),
+        );
+        row.set(
+            "sinks_kept",
+            verified
+                .selector_sinks
+                .saturating_sub(verified.round_stats.dropped_sinks),
+        );
+        let (field_candidates, _) = field_ownership_candidates(&slots, &program);
+        row.set("s23_stores_owned", field_candidates.len());
+        row.set("s23_owning_model", owning_fields);
+        row.set("rounds", verified.round_stats.rounds);
+        row.set("commits_conflict", verified.round_stats.commits_conflict);
+        row.set("check_sat_count", verified.check_sat_count);
+        row.set("z3_ast_len", verified.emission_stats.z3_ast_len);
+        row.set(
+            "source_sink_emissions",
+            verified.emission_stats.source_sink_emissions,
+        );
+        row.set("t_emit_s", secs(verified.construction_emit_elapsed));
+        row.set(
+            "t_coherence_s",
+            secs(verified.construction_coherence_elapsed),
+        );
+        row.set("a5_raw_pairs", verified.producer_stats.raw_pairs);
+        row.set(
+            "a5_effective_pairs",
+            verified.producer_stats.effective_pairs,
+        );
+        row.set(
+            "a5_production_pair_den",
+            verified.producer_stats.raw_site_pairs,
+        );
+        row.set(
+            "a5_production_mut_mut",
+            verified.producer_stats.raw_site_mut_mut,
+        );
+        row.set(
+            "a5_production_mut_read_only",
+            verified.producer_stats.raw_site_mut_read_only,
+        );
+        row.set(
+            "a5_production_shared_shared",
+            verified.producer_stats.raw_site_shared_shared,
+        );
+        row.set("a5_planned_marks", verified.planned_c9_marks.len());
+        row.set("a5_model_retained_marks", verified.retained_c9_marks.len());
+        row.set(
+            "a5_demoted_by_model_marks",
+            verified
+                .planned_c9_marks
+                .len()
+                .saturating_sub(verified.retained_c9_marks.len()),
+        );
+
+        if let Some(records) =
+            crown_projection::maybe_write_model_snapshot(tcx, &program, &slots, &verified.model)
+        {
+            row.set("crown_projection_snapshot", records);
+        }
+
+        let artifact_dir = std::env::var_os("CRAT_A5_BATCH_SHARD_DIR")
+            .map(std::path::PathBuf::from)
+            .expect("A5 batch requires CRAT_A5_BATCH_SHARD_DIR");
+        std::fs::create_dir_all(&artifact_dir).expect("create A5 batch shard dir");
+        std::fs::write(
+            artifact_dir.join("construction-receipt.txt"),
+            &verified.receipt,
+        )
+        .expect("write A5 construction receipt");
+        std::fs::write(
+            artifact_dir.join("summary-receipt.txt"),
+            &verified.summary_artifact.receipt,
+        )
+        .expect("write A5 summary receipt");
+        std::fs::write(
+            artifact_dir.join("summary.tsv"),
+            &verified.summary_artifact.summary_tsv,
+        )
+        .expect("write A5 summary artifact");
+        std::fs::write(artifact_dir.join("marks.tsv"), &verified.mark_artifact)
+            .expect("write A5 mark artifact");
+        std::fs::write(
+            artifact_dir.join("production-site-ledger.tsv"),
+            &verified.site_artifact,
+        )
+        .expect("write A5 production-site artifact");
+        let mut model_rows = verified
+            .model
+            .iter()
+            .map(|(&slot, kind)| {
+                let key = l2::SlotKey::of(slot);
+                format!("{}\t{}\t{}\t{kind:?}\n", key.variant, key.owner, key.slot)
+            })
+            .collect::<Vec<_>>();
+        model_rows.sort();
+        std::fs::write(
+            artifact_dir.join("model.tsv"),
+            format!("variant\towner\tslot\tkind\n{}", model_rows.concat()),
+        )
+        .expect("write A5 model artifact");
+
+        if mode == A5Mode::PreciseReplay {
+            let name = std::env::var("CRAT_BOC1_NAME").expect("A5 batch program name");
+            let summary = super::a5_measurement::run_batch_w14(
+                &name,
+                tcx,
+                &verified.baseline_model,
+                &verified.model,
+                &verified.planned_c9_marks,
+                verified.retained_c9_marks.len(),
+                verified.round_stats.rounds,
+                &artifact_dir,
+            )
+            .unwrap_or_else(|error| panic!("A5 batch W14: {error}"));
+            row.set("a5_w14_pairs", summary.pair_den);
+            row.set("a5_w14_mut_mut", summary.mut_mut);
+            row.set("a5_w14_mut_read_only", summary.mut_read_only);
+            row.set("a5_w14_shared_shared", summary.shared_shared);
+            row.set("a5_w14_effective_pairs", summary.effective_pairs);
+            row.set("a5_w14_planned_marks", summary.planned_marks);
+            row.set("a5_w14_model_retained_marks", summary.model_retained_marks);
+            row.set(
+                "a5_w14_demoted_by_model_marks",
+                summary
+                    .planned_marks
+                    .saturating_sub(summary.model_retained_marks),
+            );
+            row.set("a5_w14_exposures", summary.exposures);
+            row.set("a5_w14_demoted", summary.demoted);
+            row.set("a5_w14_marked", summary.marked);
+            row.set("a5_w14_shared_safe", summary.shared_safe);
+            row.set("a5_w14_replay_safe", summary.replay_safe);
+            row.set("a5_w14_unresolved", summary.unresolved);
+            row.set("a5_w14_precise_rounds", summary.precise_rounds);
+            let site_join = super::a5_measurement::join_production_site_artifacts(
+                tcx,
+                Duration::ZERO,
+                &name,
+                &artifact_dir.join("w14-pair-ledger.tsv"),
+                &artifact_dir.join("production-site-ledger.tsv"),
+                &artifact_dir.join("construction-receipt.txt"),
+            );
+            assert_eq!(site_join.get("status"), Some("ok"), "site-join status");
+            for key in [
+                "registered_site_rows",
+                "production_site_pairs",
+                "matched_registered_rows",
+                "unique_matched_production_pairs",
+                "registered_unmatched",
+                "production_unmatched",
+                "production_count_residual",
+                "ambiguous_summary_keys",
+                "ambiguous_production_keys",
+                "mixed_class_pairs",
+                "multi_expansion_pairs",
+                "matched_mut_mut",
+                "matched_mut_read_only",
+                "matched_shared_shared",
+                "production_mut_mut",
+                "production_mut_read_only",
+                "production_shared_shared",
+            ] {
+                row.set(
+                    &format!("a5_site_join_{key}"),
+                    site_join.get(key).expect("site-join key"),
+                );
+            }
+            let join_number = |key| {
+                site_join
+                    .get(key)
+                    .expect("site-join number")
+                    .parse::<usize>()
+                    .expect("numeric site-join value")
+            };
+            assert_eq!(join_number("registered_unmatched"), 0);
+            assert_eq!(join_number("production_unmatched"), 0);
+            assert_eq!(join_number("production_count_residual"), 0);
+            assert_eq!(join_number("ambiguous_summary_keys"), 0);
+            assert_eq!(join_number("ambiguous_production_keys"), 0);
+            assert_eq!(join_number("mixed_class_pairs"), 0);
+            assert_eq!(join_number("multi_expansion_pairs"), 0);
+            assert_eq!(
+                join_number("registered_site_rows"),
+                join_number("production_site_pairs")
+            );
+            assert_eq!(
+                join_number("matched_registered_rows"),
+                join_number("production_site_pairs")
+            );
+            assert_eq!(
+                join_number("unique_matched_production_pairs"),
+                join_number("production_site_pairs")
+            );
+            assert_eq!(
+                join_number("matched_mut_mut"),
+                join_number("production_mut_mut")
+            );
+            assert_eq!(
+                join_number("matched_mut_read_only"),
+                join_number("production_mut_read_only")
+            );
+            assert_eq!(
+                join_number("matched_shared_shared"),
+                join_number("production_shared_shared")
+            );
+        }
+        row.set("t_total_s", secs(t0.elapsed()));
         row
     }
 
@@ -7312,6 +7641,7 @@ mod run {
                     "just_fabricated_len_const",
                     jc.fabricated_len_const.to_string(),
                 );
+                row.set("just_c9_mark", jc.c9_mark.to_string());
                 row.set("just_total", jc.total().to_string());
                 row.set("just_edits", d.plan_edits.to_string());
                 // **AND AS AN ARTIFACT.** The row goes to stdout, which this
@@ -7350,6 +7680,7 @@ mod run {
                     reroute,
                     drop_form,
                     store_form,
+                    c9_mark,
                 } = jc;
                 let jp = dir.join(format!("{name}.just.tsv"));
                 std::fs::write(
@@ -7359,6 +7690,7 @@ mod run {
                          seam_adapter\t{seam_adapter}\n\
                          reroute\t{reroute}\ndrop_form\t{drop_form}\n\
                          store_form\t{store_form}\n\
+                         c9_mark\t{c9_mark}\n\
                          fabricated_len_const\t{fabricated_len_const}\n\
                          subset:seam_adapter_fabricated\t{seam_adapter_fabricated}\n",
                     ),
@@ -8050,6 +8382,46 @@ mod run {
         let mut row = Row::default();
         let outcome = rewrite_m1_path(input);
         row.set("t_total_s", secs(t0.elapsed()));
+        let receipt_field = |key: &str| {
+            outcome
+                .a5_receipt()
+                .lines()
+                .find_map(|line| line.strip_prefix(&format!("{key}=")))
+                .map(str::to_owned)
+        };
+        for key in [
+            "a5_mode",
+            "a5_world",
+            "a5_abi_guard",
+            "copy_lend_mode",
+            "a2_mode",
+        ] {
+            row.set(
+                key,
+                receipt_field(key).unwrap_or_else(|| format!("missing-{key}")),
+            );
+        }
+        row.set(
+            "a5_model_retained_marks",
+            receipt_field("a5_retained_marks").unwrap_or_else(|| "missing".to_owned()),
+        );
+        let emission_retained = match &outcome {
+            RewriteOutcome::Emitted { source, .. } => source.matches("let __crat_c9_").count(),
+            RewriteOutcome::Degraded { .. } => 0,
+        };
+        row.set("a5_emission_retained_marks", emission_retained);
+        let mut reason_counts = BTreeMap::<&'static str, usize>::new();
+        let degradations = match &outcome {
+            RewriteOutcome::Emitted { degradations, .. }
+            | RewriteOutcome::Degraded { degradations, .. } => degradations,
+        };
+        for degradation in degradations {
+            *reason_counts.entry(degradation.reason.key()).or_default() += 1;
+        }
+        row.set("reason_key_count", reason_counts.len());
+        for (reason, count) in reason_counts {
+            row.set(&format!("reason_{reason}"), count);
+        }
 
         // ONE filling site, reading the outcome uniformly. The previous shape
         // matched on the variant and hand-filled each arm, which zeroed a real
@@ -10531,6 +10903,7 @@ fn the_reporting_site_reads_files_touched_not_the_map_size() {
         baseline_keys: 0,
         baseline_errors: 0,
         baseline_msg_env: 0,
+        a5_receipt: "a5_mode=baseline\n".to_owned(),
     };
     let (_emitted, _degraded, files_touched, reverted, ..) = run::emit_counters(&outcome);
     assert_eq!(
@@ -13875,6 +14248,9 @@ fn boc1_run_one() {
             | "a4-probe"
             | "a4-source-census"
             | "a5-p1"
+            | "a5-batch-model"
+            | "copy-lend-funnel"
+            | "copy-lend-funnel-subjects"
             | "kind-equate-core"
             | "s23-discover"
             | "s23-probe"
@@ -13916,6 +14292,22 @@ fn boc1_run_one() {
             "a4-probe" => a4_measurement::run_probe_worker(tcx, t_tcx),
             "a4-source-census" => a4_source_census::run_worker(tcx, t_tcx),
             "a5-p1" => a5_measurement::run_worker(tcx, t_tcx),
+            "a5-batch-model" => run::run_a5_batch_model(tcx, t_tcx),
+            "a5-w14-drift-trace" => a5_measurement::run_w14_drift_trace_worker(tcx, t_tcx),
+            "a5-production-site-join" => {
+                a5_measurement::run_production_site_join_worker(tcx, t_tcx)
+            }
+            "a5-site-scope-repartition" => {
+                a5_measurement::run_site_scope_repartition_worker(tcx, t_tcx)
+            }
+            "copy-lend-funnel" => {
+                crate::analyses::borrow_ownership::construction::CopyLendMode::LendArm
+                    .with_override(|| copy_lend_funnel::run_worker(tcx, t_tcx))
+            }
+            "copy-lend-funnel-subjects" => {
+                crate::analyses::borrow_ownership::construction::CopyLendMode::LendArm
+                    .with_override(|| copy_lend_funnel::run_subject_worker(tcx, t_tcx))
+            }
             "p-b" => p_b_measurement::run_worker(tcx, t_tcx),
             "kind-equate-core" => kind_equate_core_census::run_worker(tcx, t_tcx),
             "s23-discover" => s23_measurement::run_discovery_worker(tcx, t_tcx),

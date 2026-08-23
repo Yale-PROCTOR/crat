@@ -46,6 +46,16 @@ pub(crate) fn type_checks_crate(root: &Path) -> bool {
     diagnose_crate(root).errors == 0
 }
 
+/// The whole-crate compile observer for an in-memory single-file fixture.
+///
+/// This is deliberately routed through the same diagnostic counter as the
+/// path gate: `run_compiler_on_str(..., |_| {})` only parses and enters the
+/// global context, so it cannot serve as a borrow-check verdict.
+#[cfg(test)]
+pub(crate) fn type_checks_str(source: &str) -> bool {
+    diagnose_input(::utils::compilation::str_to_input(source)).errors == 0
+}
+
 static NEXT_TEMP: AtomicUsize = AtomicUsize::new(0);
 
 /// A rewritten copy of a crate, on disk, deleted when dropped.
@@ -429,11 +439,15 @@ impl rustc_errors::emitter::Emitter for Capture {
 
 /// Type-check the crate at `root` and return its error-level diagnostics.
 pub(crate) fn diagnose_crate(root: &Path) -> Diagnosis {
+    diagnose_input(::utils::compilation::path_to_input(root))
+}
+
+fn diagnose_input(input: rustc_session::config::Input) -> Diagnosis {
     let diags = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     let errors = std::sync::Arc::new(std::sync::Mutex::new(0usize));
     let unrenderable = std::sync::Arc::new(std::sync::Mutex::new(0usize));
 
-    let mut config = ::utils::compilation::make_config(::utils::compilation::path_to_input(root));
+    let mut config = ::utils::compilation::make_config(input);
     let (d, e, u) = (diags.clone(), errors.clone(), unrenderable.clone());
     config.psess_created = Some(Box::new(move |psess| {
         let source_map = psess.clone_source_map();

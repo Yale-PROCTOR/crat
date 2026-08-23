@@ -31,6 +31,7 @@
 // as they did under production `borrow` — keeps the mirrors byte-identical (no import rewiring).
 pub(crate) use crate::analyses::borrow::{BorrowSet, Loan};
 
+mod a5_places_conflict;
 mod conflicts;
 mod errors;
 mod invalidates;
@@ -40,10 +41,12 @@ mod places_conflict;
 
 // Name-parity re-exports: callers reach `borrow_engine::borrow_conflicts[_replaying]`, matching
 // production `borrow::borrow_conflicts[_replaying]` (the module path is the only distinguisher).
+pub(crate) use a5_places_conflict::ParameterOverlap;
 #[cfg(test)]
 pub(crate) use conflicts::{borrow_conflicts, borrow_conflicts_replaying};
 pub(crate) use conflicts::{
     borrow_conflicts_replaying_with_flows, borrow_conflicts_replaying_with_flows_and_copy_lends,
+    borrow_conflicts_replaying_with_flows_and_parameter_overlap,
     borrow_conflicts_replaying_witnessed, borrow_conflicts_replaying_witnessed_with_copy_lends,
     borrow_conflicts_with_flows,
 };
@@ -53,6 +56,7 @@ pub(crate) use conflicts::{
 pub(crate) use invalidates::{RoutedCompose, route_compose};
 #[cfg(test)]
 pub(crate) use origin_replay::selected_copy_lend_contains;
+pub(crate) use places_conflict::{AccessDepth, PlaceConflictBias, places_conflict};
 
 /// §NB3-3a — routes the `borrow_verify` seam (and the `bo_c1` mirror) to the forked BO engine vs
 /// the production `borrow` engine. **Default = `Fork` (flipped at 3a merge, A1).** During 3a dev the

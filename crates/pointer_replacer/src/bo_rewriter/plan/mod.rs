@@ -123,6 +123,8 @@ pub(crate) enum Justification {
         /// the revert set**, and the surviving set is a `plan` fact.
         fabricated: bool,
     },
+    /// A5 C-9 snapshot temp at one retained marked call site.
+    C9Mark,
     /// **The fabricated-extent const's declaration** (marker ruling,
     /// 2026-08-15). One per crate, in the crate root file, emitted only when at
     /// least one fabricated adapter survives.
@@ -577,6 +579,7 @@ mod tests {
     fn a_ref_decision_with_no_pointee_span_is_attributed_not_skipped() {
         let table = DecisionTable {
             seams: Default::default(),
+            c9_marks: Vec::new(),
             entries: vec![(alias_subject(), Decision::Ref { mutable: false })],
         };
 
@@ -627,6 +630,7 @@ mod tests {
     fn a_degraded_subject_is_not_also_reported_unplaceable() {
         let table = DecisionTable {
             seams: Default::default(),
+            c9_marks: Vec::new(),
             entries: vec![(
                 alias_subject(),
                 Decision::Degraded(crate::bo_rewriter::decision::Degradation {

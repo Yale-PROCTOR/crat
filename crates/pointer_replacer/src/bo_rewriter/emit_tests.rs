@@ -99,7 +99,7 @@ fn emit_injected(
     ::utils::compilation::run_compiler_on_path(&fixture.0.join("lib.rs"), |tcx| {
         let mut table = decide_table(tcx).expect("fixture yields a decision table");
         inject(&mut table);
-        emit_files(tcx, &table, &rustc_hash::FxHashSet::default()).expect("emission succeeds")
+        emit_files(tcx, &table, &rustc_hash::FxHashSet::default(), &[]).expect("emission succeeds")
     })
     .expect("fixture compiles")
 }
@@ -1360,6 +1360,7 @@ fn a_probe_does_not_compile_the_baseline_it_never_consults() {
         super::MAX_REVERT_ROUNDS,
         &|_| {},
         true,
+        None,
     );
     match probe {
         super::RewriteOutcome::Degraded {
@@ -1489,6 +1490,7 @@ fn a_degraded_outcome_still_reports_its_unplaceable_decisions() {
         super::MAX_REVERT_ROUNDS,
         &|_| {},
         true,
+        None,
     );
     match probe {
         super::RewriteOutcome::Degraded { unplaceable, .. } => {
@@ -1632,6 +1634,7 @@ fn a_degraded_outcome_reports_placements_too() {
         super::MAX_REVERT_ROUNDS,
         &|_| {},
         true,
+        None,
     );
     match probe {
         super::RewriteOutcome::Degraded { emitted_count, .. } => assert_eq!(
@@ -4337,7 +4340,7 @@ fn render_outside_a_compiler_session_still_delivers_the_const() {
     let (plan, texts) =
         ::utils::compilation::run_compiler_on_path(&fixture.0.join("lib.rs"), |tcx| {
             let table = decide_table(tcx).expect("decides");
-            let e = emit_files(tcx, &table, &rustc_hash::FxHashSet::default()).expect("emits");
+            let e = emit_files(tcx, &table, &rustc_hash::FxHashSet::default(), &[]).expect("emits");
             (e.plan, e.texts)
         })
         .expect("fixture compiles");

@@ -1,6 +1,7 @@
 use std::{
     cell::{Cell, RefCell},
     ops::Range,
+    time::Duration,
 };
 
 use rustc_hash::FxHashMap;
@@ -335,28 +336,43 @@ pub struct KindSolver {
 
 impl KindSolver {
     pub fn new(slots: &CrateSlots) -> Self {
-        Self::build(slots, None)
+        Self::build(slots, None, true)
     }
 
     /// §NB-R diagnostic constructor: every hard constraint is track-gated.
     /// The result must ONLY be driven via assumption solving (see
     /// `CoreTracker`); production solve paths refuse it.
     pub(crate) fn new_tracked(slots: &CrateSlots) -> Self {
-        Self::build(slots, Some(CoreTracker::new()))
+        Self::build(slots, Some(CoreTracker::new()), true)
     }
 
     /// Corpus selector-leak diagnostic constructor: all hard constraints in
     /// one `CORE_LABEL_FAMILIES` family share a single assumption marker.
     /// This preserves family membership while avoiding per-assertion tracking.
     pub(crate) fn new_family_tracked(slots: &CrateSlots) -> Self {
-        Self::build(slots, Some(CoreTracker::new_family()))
+        Self::build(slots, Some(CoreTracker::new_family()), true)
+    }
+
+    /// Measurement-only hard-SAT constructor. It emits the exact production
+    /// hard universe but omits soft kind preferences, so per-assumption funnel
+    /// queries answer achievability without repeatedly optimizing an irrelevant
+    /// objective.
+    #[cfg(test)]
+    pub(crate) fn new_hard_only(slots: &CrateSlots) -> Self {
+        Self::build(slots, None, false)
+    }
+
+    /// Family-core twin of [`Self::new_hard_only`].
+    #[cfg(test)]
+    pub(crate) fn new_family_tracked_hard_only(slots: &CrateSlots) -> Self {
+        Self::build(slots, Some(CoreTracker::new_family()), false)
     }
 
     pub(crate) fn tracker(&self) -> Option<&CoreTracker> {
         self.tracker.as_ref()
     }
 
-    fn build(slots: &CrateSlots, tracker: Option<CoreTracker>) -> Self {
+    fn build(slots: &CrateSlots, tracker: Option<CoreTracker>, add_objective: bool) -> Self {
         let solver = Optimize::new();
         let mut vars = FxHashMap::default();
 
@@ -373,11 +389,13 @@ impl KindSolver {
             });
         }
 
-        // Prefer Ref where hard constraints allow it, then Raw over unnecessary Owning.
-        let big = vars.len() as u64 + 1;
-        for kind_vars in vars.values() {
-            solver.assert_soft(&kind_vars.ref_, big, None);
-            solver.assert_soft(&kind_vars.raw, 1u64, None);
+        if add_objective {
+            // Prefer Ref where hard constraints allow it, then Raw over unnecessary Owning.
+            let big = vars.len() as u64 + 1;
+            for kind_vars in vars.values() {
+                solver.assert_soft(&kind_vars.ref_, big, None);
+                solver.assert_soft(&kind_vars.raw, 1u64, None);
+            }
         }
 
         KindSolver {
@@ -642,6 +660,29 @@ impl KindSolver {
         );
     }
 
+    /// A5 coarse pricing control: a may-overlapping formal pair cannot both
+    /// settle `Ref`. This is deliberately separate from precise replay and is
+    /// never the proposed landing consumer.
+    pub(crate) fn add_a5_coarse_exclusion(&self, left: SlotRef, right: SlotRef) {
+        assert_ne!(left, right, "A5 coarse pair must contain distinct slots");
+        let left_ref = &self
+            .vars
+            .get(&left)
+            .unwrap_or_else(|| panic!("unknown A5 slot: {left:?}"))
+            .ref_;
+        let right_ref = &self
+            .vars
+            .get(&right)
+            .unwrap_or_else(|| panic!("unknown A5 slot: {right:?}"))
+            .ref_;
+        assert_hard(
+            &self.solver,
+            self.tracker.as_ref(),
+            || format!("a5-coarse-exclusion({left:?},{right:?})"),
+            &Bool::or(&[&!left_ref, &!right_ref]),
+        );
+    }
+
     /// L2 context-conditioned single-literal commit. The planner supplies a
     /// witnessed-context clause. Ref-witnessed peers and the target contribute
     /// negative `ref` literals; Raw-witnessed peers contribute positive `ref`
@@ -781,6 +822,15 @@ impl KindSolver {
     pub(crate) fn set_random_seed(&self, seed: u32) {
         let mut params = z3::Params::new();
         params.set_u32("random_seed", seed);
+        self.solver.set_params(&params);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_query_timeout(&self, timeout: Duration) {
+        let millis = u32::try_from(timeout.as_millis())
+            .expect("diagnostic query timeout must fit a Z3 u32 millisecond parameter");
+        let mut params = z3::Params::new();
+        params.set_u32("timeout", millis);
         self.solver.set_params(&params);
     }
 

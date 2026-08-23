@@ -14,7 +14,7 @@ use rustc_index::bit_set::DenseBitSet;
 use rustc_middle::{mir::Local, ty::TyCtxt};
 use rustc_span::def_id::LocalDefId;
 
-use super::origin_replay::NativeBorrowContext;
+use super::{a5_places_conflict::ParameterOverlap, origin_replay::NativeBorrowContext};
 use crate::{
     analyses::{
         borrow::{
@@ -49,22 +49,41 @@ fn overwrite_with_engine_facts<'tcx>(
     ctxt: &GBorrowInferCtxt,
     inference: &mut BorrowInferenceResults<'tcx>,
     copy_lends: &DenseBitSet<Loan>,
-) {
+    parameter_overlap: Option<&ParameterOverlap>,
+) -> Vec<(Local, Local)> {
     let body = &*tcx.mir_drops_elaborated_and_const_checked(f).borrow();
     let provenance_set = ctxt.provenances.get(&f).unwrap();
-    inference.invalidates = super::invalidates::compute_invalidates_with_copy_lends(
-        tcx,
-        body,
-        &inference.borrow_set,
-        provenance_set,
-        &inference.location_map,
-        copy_lends,
-    );
+    let (invalidates, parameter_conflicts) = match parameter_overlap {
+        Some(parameter_overlap) => {
+            super::invalidates::compute_invalidates_with_copy_lends_and_parameter_overlap(
+                tcx,
+                body,
+                &inference.borrow_set,
+                provenance_set,
+                &inference.location_map,
+                copy_lends,
+                parameter_overlap,
+            )
+        }
+        None => (
+            super::invalidates::compute_invalidates_with_copy_lends(
+                tcx,
+                body,
+                &inference.borrow_set,
+                provenance_set,
+                &inference.location_map,
+                copy_lends,
+            ),
+            Vec::new(),
+        ),
+    };
+    inference.invalidates = invalidates;
     inference.errors = super::errors::compute_errors(
         &inference.borrow_set,
         &inference.loan_liveness,
         &inference.invalidates,
     );
+    parameter_conflicts
 }
 
 /// L2-only fork seam. The invalidation and error matrices are computed exactly
@@ -293,6 +312,7 @@ where
             &ctxt.borrow,
             &mut inference.facts,
             &inference.copy_lends,
+            None,
         );
         let invalid_loans = invalid_loan_set(&inference);
         if invalid_loans.is_empty() {
@@ -326,7 +346,7 @@ where
     for f in program.functions.iter().copied() {
         let mut inference = borrow_inference(program.tcx, f, &ctxt);
         let copy_lends = DenseBitSet::new_empty(inference.borrow_set.loans.len());
-        overwrite_with_engine_facts(program.tcx, f, &ctxt, &mut inference, &copy_lends);
+        overwrite_with_engine_facts(program.tcx, f, &ctxt, &mut inference, &copy_lends, None);
         let invalid_loans = invalid_loan_set(&inference);
         if invalid_loans.is_empty() {
             continue;
@@ -404,6 +424,66 @@ where
     K: Fn(LocalDefId) -> L,
     L: Fn(Local) -> bool,
 {
+    borrow_conflicts_replaying_with_flows_impl(
+        program,
+        flows,
+        is_ref,
+        is_raw,
+        is_mutable,
+        raw_fields,
+        selected_copy_lends,
+        None,
+    )
+}
+
+pub(crate) fn borrow_conflicts_replaying_with_flows_and_parameter_overlap<I, J, M, N, K, L>(
+    program: &RustProgram,
+    flows: &OriginFlowResults,
+    is_ref: I,
+    is_raw: M,
+    is_mutable: K,
+    raw_fields: &[StructFieldSlot],
+    selected_copy_lends: &SelectedCopyLendLoans,
+    parameter_overlaps: &FxHashMap<LocalDefId, ParameterOverlap>,
+) -> FxHashMap<LocalDefId, Vec<ConflictEdge>>
+where
+    I: Fn(LocalDefId) -> J,
+    J: Fn(Local) -> bool,
+    M: Fn(LocalDefId) -> N,
+    N: Fn(Local) -> bool,
+    K: Fn(LocalDefId) -> L,
+    L: Fn(Local) -> bool,
+{
+    borrow_conflicts_replaying_with_flows_impl(
+        program,
+        flows,
+        is_ref,
+        is_raw,
+        is_mutable,
+        raw_fields,
+        selected_copy_lends,
+        Some(parameter_overlaps),
+    )
+}
+
+fn borrow_conflicts_replaying_with_flows_impl<I, J, M, N, K, L>(
+    program: &RustProgram,
+    flows: &OriginFlowResults,
+    is_ref: I,
+    is_raw: M,
+    is_mutable: K,
+    raw_fields: &[StructFieldSlot],
+    selected_copy_lends: &SelectedCopyLendLoans,
+    parameter_overlaps: Option<&FxHashMap<LocalDefId, ParameterOverlap>>,
+) -> FxHashMap<LocalDefId, Vec<ConflictEdge>>
+where
+    I: Fn(LocalDefId) -> J,
+    J: Fn(Local) -> bool,
+    M: Fn(LocalDefId) -> N,
+    N: Fn(Local) -> bool,
+    K: Fn(LocalDefId) -> L,
+    L: Fn(Local) -> bool,
+{
     let is_candidate = |did: LocalDefId| {
         let ref_f = is_ref(did);
         let raw_f = is_raw(did);
@@ -428,18 +508,28 @@ where
     let mut out = FxHashMap::default();
     let no_copy_lends = FxHashSet::default();
     for f in program.functions.iter().copied() {
+        let is_ref_f = is_ref(f);
         let is_raw_f = is_raw(f);
         let copy_lends = selected_copy_lends.get(&f).unwrap_or(&no_copy_lends);
 
         let edges = loop {
             let mut inference = ctxt.infer(program.tcx, f, raw_fields, copy_lends);
-            overwrite_with_engine_facts(
+            let parameter_conflicts = overwrite_with_engine_facts(
                 program.tcx,
                 f,
                 &ctxt.borrow,
                 &mut inference.facts,
                 &inference.copy_lends,
+                parameter_overlaps.and_then(|overlaps| overlaps.get(&f)),
             );
+            let parameter_edges = parameter_conflicts
+                .into_iter()
+                .filter(|(left, right)| is_ref_f(*left) && is_ref_f(*right))
+                .map(|(left, right)| ConflictEdge {
+                    issuer: Some(ProvenanceOwner::Local(left)),
+                    requirers: vec![ProvenanceOwner::Local(right)],
+                })
+                .collect::<Vec<_>>();
             let invalid_loans = invalid_loan_set(&inference);
             if invalid_loans.is_empty() {
                 // E-R4: a conflict-free function is exactly the case where every
@@ -453,7 +543,7 @@ where
                     &invalid_loans,
                     &inference.copy_lends,
                 );
-                break Vec::new();
+                break parameter_edges;
             }
 
             let to_demote: Vec<(Local, Local)> = {
@@ -481,7 +571,9 @@ where
                     &invalid_loans,
                     &inference.copy_lends,
                 );
-                break extract_conflict_edges(&inference, provenance_set, &invalid_loans);
+                let mut edges = extract_conflict_edges(&inference, provenance_set, &invalid_loans);
+                edges.extend(parameter_edges);
+                break edges;
             }
 
             drop(inference);
@@ -772,6 +864,243 @@ mod nb5o_tests {
                 "replay fixture must exercise a conflict"
             );
             assert_eq!(canonical(native), canonical(wrapped));
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn a5_w1_effective_parameter_overlap_reaches_replay() {
+        let code = "unsafe fn f(x: *mut i32, y: *mut i32) { *x = *y + 1; }";
+        ::utils::compilation::run_compiler_on_str(code, |tcx| {
+            let program = program(tcx);
+            let function = program.functions[0];
+            let flows = crate::analyses::borrow_ownership::origin_flow::analyze_program_origin_flow(
+                &program,
+            );
+            let selected = SelectedCopyLendLoans::default();
+            let overlaps = FxHashMap::from_iter([(
+                function,
+                ParameterOverlap::from_pairs([(Local::from_usize(1), Local::from_usize(2))]),
+            )]);
+            let baseline = borrow_conflicts_replaying_with_flows_and_copy_lends(
+                &program,
+                &flows,
+                |_: LocalDefId| |_: Local| true,
+                |_: LocalDefId| |_: Local| false,
+                |_: LocalDefId| |_: Local| true,
+                &[],
+                &selected,
+            );
+            let precise = borrow_conflicts_replaying_with_flows_and_parameter_overlap(
+                &program,
+                &flows,
+                |_: LocalDefId| |_: Local| true,
+                |_: LocalDefId| |_: Local| false,
+                |_: LocalDefId| |_: Local| true,
+                &[],
+                &selected,
+                &overlaps,
+            );
+
+            assert!(baseline.is_empty(), "distinct bases are the old blind spot");
+            assert!(
+                precise
+                    .get(&function)
+                    .is_some_and(|edges| !edges.is_empty()),
+                "effective overlap must create a real replay conflict"
+            );
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn a5_w6_shared_shared_reads_stay_compatible() {
+        let code = "unsafe fn f(x: *const i32, y: *const i32) -> i32 { *x + *y }";
+        ::utils::compilation::run_compiler_on_str(code, |tcx| {
+            let program = program(tcx);
+            let function = program.functions[0];
+            let flows = crate::analyses::borrow_ownership::origin_flow::analyze_program_origin_flow(
+                &program,
+            );
+            let selected = SelectedCopyLendLoans::default();
+            let overlaps = FxHashMap::from_iter([(
+                function,
+                ParameterOverlap::from_pairs([(Local::from_usize(1), Local::from_usize(2))]),
+            )]);
+            let precise = borrow_conflicts_replaying_with_flows_and_parameter_overlap(
+                &program,
+                &flows,
+                |_: LocalDefId| |_: Local| true,
+                |_: LocalDefId| |_: Local| false,
+                |_: LocalDefId| |_: Local| false,
+                &[],
+                &selected,
+                &overlaps,
+            );
+
+            assert!(precise.is_empty());
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn a5_w12_parameter_overlap_changes_no_loan_identity_or_class() {
+        use crate::analyses::borrow_ownership::export::{BorrowerKind, LoanClass, with_bo_export};
+
+        let code = r#"
+unsafe fn g(p: *mut i32) { *p = 9; }
+unsafe fn f(p: *mut i32) -> i32 {
+    g(p);
+    *p
+}
+"#;
+        ::utils::compilation::run_compiler_on_str(code, |tcx| {
+            let program = program(tcx);
+            let function = program
+                .functions
+                .iter()
+                .copied()
+                .find(|&did| tcx.item_name(did.to_def_id()).as_str() == "f")
+                .expect("CALL_ARG function f");
+            let flows = crate::analyses::borrow_ownership::origin_flow::analyze_program_origin_flow(
+                &program,
+            );
+            let selected = SelectedCopyLendLoans::default();
+            let overlaps = FxHashMap::from_iter([(
+                function,
+                ParameterOverlap::from_pairs([(Local::from_usize(1), Local::from_usize(2))]),
+            )]);
+
+            // Conflict equality is deliberately excluded. W1 owns that
+            // territory and requires A5 to add parameter-overlap conflicts;
+            // H3 compares the complete old-loan observation only.
+            let (_, baseline_export) = with_bo_export(|| {
+                borrow_conflicts_replaying_with_flows_and_copy_lends(
+                    &program,
+                    &flows,
+                    |_: LocalDefId| |_: Local| true,
+                    |_: LocalDefId| |_: Local| false,
+                    |_: LocalDefId| |_: Local| true,
+                    &[],
+                    &selected,
+                )
+            });
+            let (_, precise_export) = with_bo_export(|| {
+                borrow_conflicts_replaying_with_flows_and_parameter_overlap(
+                    &program,
+                    &flows,
+                    |_: LocalDefId| |_: Local| true,
+                    |_: LocalDefId| |_: Local| false,
+                    |_: LocalDefId| |_: Local| true,
+                    &[],
+                    &selected,
+                    &overlaps,
+                )
+            });
+
+            assert!(
+                !baseline_export.loans.is_empty(),
+                "CALL_ARG structural precondition: existing old-loan population"
+            );
+            assert!(
+                baseline_export
+                    .loans
+                    .iter()
+                    .any(|loan| matches!(loan.key.borrower, BorrowerKind::CallArg { .. })),
+                "fixture must carry an existing CallArg population"
+            );
+            assert!(
+                baseline_export
+                    .loans
+                    .iter()
+                    .all(|loan| loan.class == LoanClass::Existing)
+            );
+            assert_eq!(precise_export.loans, baseline_export.loans);
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn a5_precise_replay_does_not_widen_copy_lend_class() {
+        use crate::analyses::borrow_ownership::{
+            coherence::SelectedCopyLendLoan,
+            export::{LoanClass, with_bo_export},
+        };
+
+        let code = "unsafe fn f(x: *const i32, y: *const i32) -> i32 { \
+                    let q = x; *q + *y }";
+        ::utils::compilation::run_compiler_on_str(code, |tcx| {
+            let program = program(tcx);
+            let function = program.functions[0];
+            let flows = crate::analyses::borrow_ownership::origin_flow::analyze_program_origin_flow(
+                &program,
+            );
+            let empty_selected = SelectedCopyLendLoans::default();
+            let (_, seed_export) = with_bo_export(|| {
+                borrow_conflicts_replaying_with_flows_and_copy_lends(
+                    &program,
+                    &flows,
+                    |_: LocalDefId| |_: Local| true,
+                    |_: LocalDefId| |_: Local| false,
+                    |_: LocalDefId| |_: Local| false,
+                    &[],
+                    &empty_selected,
+                )
+            });
+            let seed = seed_export
+                .loans
+                .iter()
+                .find(|loan| loan.key.fn_did == function)
+                .expect("fixture loan");
+            let selected_identity = SelectedCopyLendLoan {
+                location: seed.key.location,
+                borrowed: seed.key.place.clone(),
+                borrower: seed.key.borrower,
+            };
+            let selected = SelectedCopyLendLoans::from_iter([(
+                function,
+                FxHashSet::from_iter([selected_identity]),
+            )]);
+            let overlaps = FxHashMap::from_iter([(
+                function,
+                ParameterOverlap::from_pairs([(Local::from_usize(1), Local::from_usize(2))]),
+            )]);
+
+            let (baseline_edges, baseline_export) = with_bo_export(|| {
+                borrow_conflicts_replaying_with_flows_and_copy_lends(
+                    &program,
+                    &flows,
+                    |_: LocalDefId| |_: Local| true,
+                    |_: LocalDefId| |_: Local| false,
+                    |_: LocalDefId| |_: Local| false,
+                    &[],
+                    &selected,
+                )
+            });
+            let (precise_edges, precise_export) = with_bo_export(|| {
+                borrow_conflicts_replaying_with_flows_and_parameter_overlap(
+                    &program,
+                    &flows,
+                    |_: LocalDefId| |_: Local| true,
+                    |_: LocalDefId| |_: Local| false,
+                    |_: LocalDefId| |_: Local| false,
+                    &[],
+                    &selected,
+                    &overlaps,
+                )
+            });
+
+            assert_eq!(canonical(precise_edges), canonical(baseline_edges));
+            assert_eq!(precise_export.loans, baseline_export.loans);
+            assert_eq!(
+                precise_export
+                    .loans
+                    .iter()
+                    .filter(|loan| loan.class == LoanClass::CopyLend)
+                    .count(),
+                1,
+                "A5 must preserve exact typed CopyLend membership"
+            );
         })
         .unwrap();
     }

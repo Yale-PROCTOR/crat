@@ -5,7 +5,7 @@
 //! function, ordered slot, subset edge, and unknown-membership entry before the wrapped route was
 //! removed from the active BO path.
 
-use std::cell::Cell;
+use std::{cell::Cell, collections::VecDeque};
 
 use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_index::{
@@ -14,8 +14,8 @@ use rustc_index::{
 };
 use rustc_middle::{
     mir::{
-        BinOp, Body, Const, ConstOperand, ConstValue, HasLocalDecls, Local, Location, Operand,
-        Place, PlaceElem, RETURN_PLACE, Rvalue, Statement, StatementKind, Terminator,
+        BasicBlock, BinOp, Body, Const, ConstOperand, ConstValue, HasLocalDecls, Local, Location,
+        Operand, Place, PlaceElem, RETURN_PLACE, Rvalue, Statement, StatementKind, Terminator,
         visit::Visitor,
     },
     ty::{Ty, TyCtxt, TyKind},
@@ -111,6 +111,68 @@ struct LocalSlot {
     depth: u8,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct A2State {
+    may_originless: DenseBitSet<OriginSlot>,
+    modeled_sources: IndexVec<OriginSlot, DenseBitSet<OriginSlot>>,
+    unstable_bases: DenseBitSet<OriginSlot>,
+}
+
+impl A2State {
+    fn all_set(domain_size: usize) -> Self {
+        Self {
+            may_originless: DenseBitSet::new_filled(domain_size),
+            modeled_sources: IndexVec::from_raw(
+                (0..domain_size)
+                    .map(|_| DenseBitSet::new_empty(domain_size))
+                    .collect(),
+            ),
+            unstable_bases: DenseBitSet::new_empty(domain_size),
+        }
+    }
+
+    fn clear_as_modeled_entry(&mut self, slot: OriginSlot) {
+        self.may_originless.remove(slot);
+        self.modeled_sources[slot].clear();
+        self.modeled_sources[slot].insert(slot);
+    }
+
+    fn join_from(&mut self, other: &Self) -> bool {
+        let mut changed = self.may_originless.union(&other.may_originless);
+        changed |= self.unstable_bases.union(&other.unstable_bases);
+        for slot in self.modeled_sources.indices() {
+            changed |= self.modeled_sources[slot].union(&other.modeled_sources[slot]);
+        }
+        changed
+    }
+
+    fn set_originless(&mut self, target: OriginSlot) {
+        self.may_originless.insert(target);
+        self.modeled_sources[target].clear();
+    }
+
+    fn strong_copy(&mut self, target: OriginSlot, sources: &[OriginSlot]) -> bool {
+        if sources.is_empty()
+            || sources
+                .iter()
+                .any(|source| self.may_originless.contains(*source))
+        {
+            self.set_originless(target);
+            return false;
+        }
+        let mut modeled = DenseBitSet::new_empty(self.may_originless.domain_size());
+        for &source in sources {
+            modeled.union(&self.modeled_sources[source]);
+            if modeled.is_empty() {
+                modeled.insert(source);
+            }
+        }
+        self.may_originless.remove(target);
+        self.modeled_sources[target] = modeled;
+        true
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct DerivedPlaceKey {
     local: Local,
@@ -135,6 +197,28 @@ pub(crate) struct BodyOriginFlow {
 pub(crate) struct OriginFlowResult {
     pub summary: NativeOriginSummary,
     pub body: BodyOriginFlow,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct A2OpaqueResultGuard {
+    pub(crate) function: LocalDefId,
+    pub(crate) local: Local,
+    pub(crate) depth: u8,
+    pub(crate) location: crate::analyses::borrow_ownership::l2::MirLocationKey,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct A2RestoredSelfOrigin {
+    pub(crate) function: LocalDefId,
+    pub(crate) slot: SignatureSlot,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct A2Plan {
+    pub(crate) opaque_result_guards: Vec<A2OpaqueResultGuard>,
+    pub(crate) restored_self_origins: Vec<A2RestoredSelfOrigin>,
+    pub(crate) killed_memberships: usize,
+    pub(crate) iterations: usize,
 }
 
 pub(crate) type OriginFlowResults = FxHashMap<LocalDefId, OriginFlowResult>;
@@ -188,6 +272,70 @@ pub(crate) fn analyze_program_origin_flow(program: &RustProgram<'_>) -> OriginFl
     }
 
     results
+}
+
+pub(crate) fn analyze_program_origin_flow_a2(
+    program: &RustProgram<'_>,
+) -> (OriginFlowResults, A2Plan) {
+    let mut flows = analyze_program_origin_flow(program);
+    let mut plan = A2Plan {
+        iterations: 1,
+        ..A2Plan::default()
+    };
+    for &function in &program.functions {
+        let body = program
+            .tcx
+            .mir_drops_elaborated_and_const_checked(function)
+            .borrow();
+        let ordinary_unknown = flows[&function].summary.unknown_targets.count();
+        let result = compute_body_a2(program.tcx, &body, &flows[&function].body);
+        plan.killed_memberships +=
+            ordinary_unknown.saturating_sub(result.summary.unknown_targets.count());
+        plan.opaque_result_guards
+            .extend(result.guards.into_iter().map(|(local, depth, location)| {
+                A2OpaqueResultGuard {
+                    function,
+                    local,
+                    depth,
+                    location: crate::analyses::borrow_ownership::l2::MirLocationKey::new(
+                        location.block.as_u32(),
+                        location.statement_index,
+                    ),
+                }
+            }));
+        plan.restored_self_origins.extend(
+            result
+                .restored
+                .into_iter()
+                .map(|slot| A2RestoredSelfOrigin { function, slot }),
+        );
+        flows
+            .get_mut(&function)
+            .expect("A2 function result")
+            .summary = result.summary;
+    }
+    plan.opaque_result_guards.sort_by_key(|guard| {
+        (
+            guard.function.local_def_index.as_u32(),
+            guard.location,
+            guard.local.as_u32(),
+            guard.depth,
+        )
+    });
+    plan.opaque_result_guards.dedup();
+    plan.restored_self_origins.sort_by_key(|restored| {
+        (
+            restored.function.local_def_index.as_u32(),
+            match restored.slot.place.root {
+                SignatureRoot::Return => 0,
+                SignatureRoot::Arg(local) => local.as_u32() + 1,
+            },
+            restored.slot.place.deref_depth,
+            restored.slot.depth,
+        )
+    });
+    plan.restored_self_origins.dedup();
+    (flows, plan)
 }
 
 fn analyze_body_origin_flow_result<'tcx>(
@@ -645,6 +793,63 @@ impl BodyOriginFlow {
             .collect()
     }
 
+    pub(crate) fn depth0_origin_indices(
+        &self,
+        body: &Body<'_>,
+        local: Local,
+        caller_reachable_from_unknown: bool,
+    ) -> Option<(std::collections::BTreeSet<usize>, bool)> {
+        let target = self.slot_for_local(local, 0)?;
+        let origins = self
+            .slots
+            .indices()
+            .filter(|&source| source == target || self.value_flows.contains(source, target))
+            .map(|source| source.index())
+            .collect::<std::collections::BTreeSet<_>>();
+        let mut complete = !self.unknown_targets.contains(target);
+        if caller_reachable_from_unknown {
+            complete &= !body.args_iter().any(|argument| {
+                self.slot_for_local(argument, 0).is_some_and(|source| {
+                    source == target || self.value_flows.contains(source, target)
+                })
+            });
+        }
+        Some((origins, complete))
+    }
+
+    /// Depth-zero caller parameters whose values can flow into `local`.
+    ///
+    /// A5 uses this projection to distinguish a direct call-site overlap fact
+    /// from a fact that is conditional on one of the caller's parameter pairs.
+    /// The boolean is false when the ordinary origin analysis has an unknown
+    /// source for the local, in which case the producer must also retain a
+    /// direct conservative witness.
+    pub(crate) fn depth0_argument_origins(
+        &self,
+        body: &Body<'_>,
+        local: Local,
+    ) -> Option<(std::collections::BTreeSet<usize>, bool)> {
+        let target = self.slot_for_local(local, 0)?;
+        let arguments = body
+            .args_iter()
+            .filter_map(|argument| {
+                let source = self.slot_for_local(argument, 0)?;
+                (source == target || self.value_flows.contains(source, target))
+                    .then_some(argument.index())
+            })
+            .collect();
+        Some((arguments, !self.unknown_targets.contains(target)))
+    }
+
+    pub(crate) fn depth0_storage_alias(&self, left: Local, right: Local) -> bool {
+        match (self.slot_for_local(left, 0), self.slot_for_local(right, 0)) {
+            (Some(left), Some(right)) => {
+                left == right || self.storage_aliases.contains(left, right)
+            }
+            _ => false,
+        }
+    }
+
     fn slot_for_place<'tcx, D: HasLocalDecls<'tcx>>(
         &self,
         local_decls: &D,
@@ -737,6 +942,14 @@ impl BodyOriginFlow {
     }
 
     fn to_summary(&self, body: &Body<'_>) -> NativeOriginSummary {
+        self.to_summary_with_unknown(body, &self.unknown_targets)
+    }
+
+    fn to_summary_with_unknown(
+        &self,
+        body: &Body<'_>,
+        internal_unknown: &DenseBitSet<OriginSlot>,
+    ) -> NativeOriginSummary {
         let mut slots = IndexVec::new();
         let mut internal_to_summary = FxHashMap::default();
 
@@ -821,7 +1034,7 @@ impl BodyOriginFlow {
             }
         }
 
-        for target in self.unknown_targets.iter() {
+        for target in internal_unknown.iter() {
             let Some(&summary_target) = internal_to_summary.get(&target) else {
                 continue;
             };
@@ -836,6 +1049,265 @@ impl BodyOriginFlow {
             storage_aliases,
             unknown_targets,
         }
+    }
+
+    fn signature_slot_for_internal(
+        &self,
+        body: &Body<'_>,
+        slot: OriginSlot,
+    ) -> Option<SignatureSlot> {
+        let local_slot = self.slots[slot];
+        match local_slot.owner {
+            OriginOwner::Local(local)
+                if local == RETURN_PLACE || local.index() <= body.arg_count =>
+            {
+                Some(SignatureSlot {
+                    place: SignaturePlace {
+                        root: if local == RETURN_PLACE {
+                            SignatureRoot::Return
+                        } else {
+                            SignatureRoot::Arg(local)
+                        },
+                        deref_depth: 0,
+                        field: None,
+                    },
+                    depth: local_slot.depth,
+                })
+            }
+            OriginOwner::Field(field)
+                if field.base == RETURN_PLACE || field.base.index() <= body.arg_count =>
+            {
+                Some(SignatureSlot {
+                    place: SignaturePlace {
+                        root: if field.base == RETURN_PLACE {
+                            SignatureRoot::Return
+                        } else {
+                            SignatureRoot::Arg(field.base)
+                        },
+                        deref_depth: field.deref_depth,
+                        field: Some(field.field),
+                    },
+                    depth: local_slot.depth,
+                })
+            }
+            _ => None,
+        }
+    }
+}
+
+struct BodyA2Result {
+    summary: NativeOriginSummary,
+    guards: Vec<(Local, u8, Location)>,
+    restored: Vec<SignatureSlot>,
+}
+
+fn a2_exact_target<'tcx>(
+    flow: &BodyOriginFlow,
+    body: &Body<'tcx>,
+    state: &A2State,
+    place: Place<'tcx>,
+) -> Option<OriginSlot> {
+    let target = flow.slot_for_place(body, place, 0)?;
+    let base_depth = if let Some((_, deref_depth, _)) = direct_raw_pointer_field_slot(body, place) {
+        deref_depth
+    } else {
+        place_deref_depth(place)?
+    };
+    for depth in 0..base_depth {
+        let base = flow.slot_for_local(place.local, depth)?;
+        if state.unstable_bases.contains(base) {
+            return None;
+        }
+    }
+    Some(target)
+}
+
+fn a2_operand_sources<'tcx>(
+    flow: &BodyOriginFlow,
+    body: &Body<'tcx>,
+    operand: &Operand<'tcx>,
+) -> Vec<OriginSlot> {
+    match operand {
+        Operand::Copy(place) | Operand::Move(place) => {
+            flow.slot_for_place(body, *place, 0).into_iter().collect()
+        }
+        Operand::Constant(_) => Vec::new(),
+    }
+}
+
+fn a2_rvalue_sources<'tcx>(
+    flow: &BodyOriginFlow,
+    body: &Body<'tcx>,
+    rvalue: &Rvalue<'tcx>,
+) -> Vec<OriginSlot> {
+    match rvalue {
+        Rvalue::Use(operand)
+        | Rvalue::Cast(_, operand, _)
+        | Rvalue::ShallowInitBox(operand, _)
+        | Rvalue::WrapUnsafeBinder(operand, _) => a2_operand_sources(flow, body, operand),
+        Rvalue::CopyForDeref(place) => flow.slot_for_place(body, *place, 0).into_iter().collect(),
+        Rvalue::BinaryOp(BinOp::Offset, operands) => a2_operand_sources(flow, body, &operands.0),
+        Rvalue::Ref(_, _, place) | Rvalue::RawPtr(_, place) => {
+            flow.slot_for_place(body, *place, 0).into_iter().collect()
+        }
+        _ => Vec::new(),
+    }
+}
+
+fn a2_merge_input(
+    inputs: &mut IndexVec<BasicBlock, Option<A2State>>,
+    block: BasicBlock,
+    incoming: &A2State,
+    pending: &mut VecDeque<BasicBlock>,
+) {
+    match &mut inputs[block] {
+        Some(state) => {
+            if state.join_from(incoming) {
+                pending.push_back(block);
+            }
+        }
+        slot @ None => {
+            *slot = Some(incoming.clone());
+            pending.push_back(block);
+        }
+    }
+}
+
+fn compute_body_a2<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    body: &Body<'tcx>,
+    flow: &BodyOriginFlow,
+) -> BodyA2Result {
+    let domain_size = flow.slots.len();
+    let mut entry = A2State::all_set(domain_size);
+    for local in body.args_iter() {
+        for depth in 0..MAX_SIGNATURE_SLOT_DEPTH {
+            let Some(slot) = flow.slot_for_local(local, depth) else {
+                break;
+            };
+            entry.clear_as_modeled_entry(slot);
+        }
+    }
+
+    let mut inputs = IndexVec::from_elem_n(None, body.basic_blocks.len());
+    inputs[BasicBlock::from_usize(0)] = Some(entry);
+    let mut pending = VecDeque::from([BasicBlock::from_usize(0)]);
+    let mut exit: Option<A2State> = None;
+    let mut guards = Vec::new();
+    let mut restored = Vec::new();
+
+    while let Some(block) = pending.pop_front() {
+        let Some(mut state) = inputs[block].clone() else {
+            continue;
+        };
+        let data = &body.basic_blocks[block];
+        for statement in &data.statements {
+            let StatementKind::Assign(box (place, rvalue)) = &statement.kind else {
+                continue;
+            };
+            if pointer_slot_count(rvalue.ty(body, tcx)) == 0 {
+                continue;
+            }
+            let sources = a2_rvalue_sources(flow, body, rvalue);
+            if let Some(target) = a2_exact_target(flow, body, &state, *place) {
+                if sources.is_empty() {
+                    state.set_originless(target);
+                } else if state.strong_copy(target, &sources)
+                    && state.modeled_sources[target].contains(target)
+                    && let Some(signature) = flow.signature_slot_for_internal(body, target)
+                {
+                    restored.push(signature);
+                }
+                state.unstable_bases.insert(target);
+            }
+        }
+
+        let terminator = data.terminator();
+        let location = Location {
+            block,
+            statement_index: data.statements.len(),
+        };
+        match &terminator.kind {
+            rustc_middle::mir::TerminatorKind::Return => match &mut exit {
+                Some(current) => {
+                    current.join_from(&state);
+                }
+                slot @ None => *slot = Some(state),
+            },
+            rustc_middle::mir::TerminatorKind::Call {
+                destination,
+                target,
+                ..
+            } => {
+                let mut normal = state.clone();
+                if let Some(slot) = a2_exact_target(flow, body, &normal, *destination) {
+                    normal.set_originless(slot);
+                    if let LocalSlot {
+                        owner: OriginOwner::Local(local),
+                        depth,
+                    } = flow.slots[slot]
+                    {
+                        guards.push((local, depth, location));
+                    }
+                    normal.unstable_bases.insert(slot);
+                }
+                for successor in terminator.successors() {
+                    let edge = if Some(successor) == *target {
+                        &normal
+                    } else {
+                        &state
+                    };
+                    a2_merge_input(&mut inputs, successor, edge, &mut pending);
+                }
+            }
+            rustc_middle::mir::TerminatorKind::TailCall { .. } => match &mut exit {
+                Some(current) => {
+                    current.join_from(&state);
+                }
+                slot @ None => *slot = Some(state),
+            },
+            _ => {
+                for successor in terminator.successors() {
+                    a2_merge_input(&mut inputs, successor, &state, &mut pending);
+                }
+            }
+        }
+    }
+
+    let mut refined = flow.unknown_targets.clone();
+    match exit {
+        Some(exit) => {
+            refined.intersect(&exit.may_originless);
+        }
+        None => {}
+    }
+    restored.sort_by_key(|slot| {
+        (
+            match slot.place.root {
+                SignatureRoot::Return => 0,
+                SignatureRoot::Arg(local) => local.as_u32() + 1,
+            },
+            slot.place.deref_depth,
+            slot.place
+                .field
+                .map(|field| (field.struct_did.local_def_index.as_u32(), field.field_index)),
+            slot.depth,
+        )
+    });
+    restored.dedup();
+    guards.sort_by_key(|(local, depth, location)| {
+        (
+            location.block.as_u32(),
+            location.statement_index,
+            local.as_u32(),
+            *depth,
+        )
+    });
+    guards.dedup();
+    BodyA2Result {
+        summary: flow.to_summary_with_unknown(body, &refined),
+        guards,
+        restored,
     }
 }
 
@@ -1580,4 +2052,225 @@ fn same_matrix(
         }
     }
     true
+}
+
+#[cfg(test)]
+mod a2_tests {
+    use rustc_hir::{ItemKind, OwnerNode};
+    use rustc_middle::{mir::Local, ty::TyCtxt};
+
+    use super::*;
+
+    fn program(tcx: TyCtxt<'_>) -> RustProgram<'_> {
+        let mut functions = Vec::new();
+        let mut structs = Vec::new();
+        for owner in tcx
+            .hir_crate(())
+            .owners
+            .iter()
+            .filter_map(|owner| owner.as_owner())
+        {
+            let OwnerNode::Item(item) = owner.node() else {
+                continue;
+            };
+            match item.kind {
+                ItemKind::Fn { .. } => functions.push(item.owner_id.def_id),
+                ItemKind::Struct(..) => structs.push(item.owner_id.def_id),
+                _ => {}
+            }
+        }
+        RustProgram {
+            tcx,
+            functions,
+            structs,
+        }
+    }
+
+    fn function(program: &RustProgram<'_>, name: &str) -> LocalDefId {
+        program
+            .functions
+            .iter()
+            .copied()
+            .find(|did| program.tcx.item_name(did.to_def_id()).as_str() == name)
+            .expect("fixture function")
+    }
+
+    fn signature_slot(summary: &NativeOriginSummary, root: SignatureRoot, depth: u8) -> OriginSlot {
+        summary
+            .slots
+            .iter_enumerated()
+            .find_map(|(slot, value)| {
+                (value.place.root == root
+                    && value.place.deref_depth == 0
+                    && value.place.field.is_none()
+                    && value.depth == depth)
+                    .then_some(slot)
+            })
+            .expect("signature slot")
+    }
+
+    fn solved_kind(
+        program: &RustProgram<'_>,
+        function: LocalDefId,
+        local: Local,
+        depth: u8,
+        opaque_guards: bool,
+    ) -> crate::analyses::borrow_ownership::SlotKind {
+        use crate::analyses::borrow_ownership::{
+            construction::{CopyLendMode, construct_bo_into_a2, verify_bo_construction},
+            crate_slots::CrateSlots,
+            mutability_facts::MutFacts,
+            origins::compute_origins_a2,
+            solver::{KindSolver, SlotRef},
+        };
+
+        let slots = CrateSlots::build(program);
+        let (origins, mut a2) = compute_origins_a2(program);
+        if !opaque_guards {
+            a2.opaque_result_guards.clear();
+        }
+        let mutability = MutFacts::from_program(program);
+        let solver = KindSolver::new(&slots);
+        let construction = construct_bo_into_a2(
+            program,
+            &slots,
+            &origins,
+            &a2,
+            &mutability,
+            &solver,
+            CopyLendMode::Baseline,
+        )
+        .expect("A2 construction");
+        let model = verify_bo_construction(
+            program,
+            &slots,
+            &origins,
+            &solver,
+            &construction,
+            &mutability,
+        )
+        .expect("A2 accepted model");
+        let slot = slots.fn_local_slots[&function]
+            .slot_for_local_depth(local, depth)
+            .expect("kind slot");
+        model[&SlotRef::Local(function, slot)]
+    }
+
+    const OP: &str = "unsafe extern \"C\" { fn op(p: *mut i32) -> *mut i32; }";
+
+    #[test]
+    #[ignore = "PROPOSED version-sensitive A2 acceptance witness: slot-global coherence propagates the mandatory opaque-temp guard"]
+    fn a2_copy_chain_kills_stale_opaque_definition() {
+        let code = format!(
+            "{OP} unsafe fn f(p: *mut i32) -> *mut i32 {{ \
+             let mut q = op(p); q = p; q }}"
+        );
+        ::utils::compilation::run_compiler_on_str(&code, |tcx| {
+            let program = program(tcx);
+            let f = function(&program, "f");
+            let (flows, _plan) = analyze_program_origin_flow_a2(&program);
+            let summary = &flows[&f].summary;
+            let ret = signature_slot(summary, SignatureRoot::Return, 0);
+            assert!(
+                !summary.unknown_targets.contains(ret),
+                "A2 must kill the overwritten opaque definition reaching return"
+            );
+            assert_eq!(
+                solved_kind(&program, f, Local::from_usize(1), 0, false),
+                crate::analyses::borrow_ownership::SlotKind::Ref,
+                "diagnostic: deleting the opaque-temp guard recovers the copy-chain Ref"
+            );
+            assert_eq!(
+                solved_kind(&program, f, Local::from_usize(1), 0, true),
+                crate::analyses::borrow_ownership::SlotKind::Ref,
+                "copy-chain modeled parameter must recover Ref under A2"
+            );
+        })
+        .unwrap();
+    }
+
+    #[test]
+    #[ignore = "PROPOSED version-sensitive A2 acceptance witness: restored signature recovery requires version-sensitive coherence/rewriter handling"]
+    fn a2_restore_after_opaque_recovers_signature_origin() {
+        let code = format!(
+            "{OP} unsafe fn f(out: *mut *mut i32) {{ \
+             let old = *out; *out = op(old); *out = old; }}"
+        );
+        ::utils::compilation::run_compiler_on_str(&code, |tcx| {
+            let program = program(tcx);
+            let f = function(&program, "f");
+            let (flows, plan) = analyze_program_origin_flow_a2(&program);
+            let summary = &flows[&f].summary;
+            let out1 = signature_slot(summary, SignatureRoot::Arg(Local::from_usize(1)), 1);
+            assert!(!summary.unknown_targets.contains(out1));
+            assert!(
+                plan.restored_self_origins
+                    .iter()
+                    .any(|restored| restored.function == f && restored.slot == summary.slots[out1]),
+                "restore must carry a typed identity-origin witness"
+            );
+            assert_eq!(
+                solved_kind(&program, f, Local::from_usize(1), 1, false),
+                crate::analyses::borrow_ownership::SlotKind::Ref,
+                "diagnostic: deleting the opaque-temp guard recovers restored out@1"
+            );
+            assert_eq!(
+                solved_kind(&program, f, Local::from_usize(1), 1, true),
+                crate::analyses::borrow_ownership::SlotKind::Ref,
+                "restored out@1 must recover Ref under A2"
+            );
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn a2_branch_join_keeps_unknown() {
+        let code = format!(
+            "{OP} unsafe fn f(p: *mut i32, c: bool) -> *mut i32 {{ \
+             let q = if c {{ op(p) }} else {{ p }}; q }}"
+        );
+        ::utils::compilation::run_compiler_on_str(&code, |tcx| {
+            let program = program(tcx);
+            let f = function(&program, "f");
+            let (flows, _) = analyze_program_origin_flow_a2(&program);
+            let summary = &flows[&f].summary;
+            let ret = signature_slot(summary, SignatureRoot::Return, 0);
+            assert!(summary.unknown_targets.contains(ret));
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn a2_opaque_result_temp_stays_guarded() {
+        let code = format!(
+            "{OP} unsafe fn f(p: *mut i32) -> *mut i32 {{ \
+             let mut q = op(p); q = p; q }}"
+        );
+        ::utils::compilation::run_compiler_on_str(&code, |tcx| {
+            let program = program(tcx);
+            let (_, plan) = analyze_program_origin_flow_a2(&program);
+            assert!(
+                !plan.opaque_result_guards.is_empty(),
+                "opaque-result guard population is the nonvacuity precondition"
+            );
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn a2_reassigned_deref_base_cannot_strong_clear() {
+        let code = format!(
+            "{OP} unsafe fn f(mut out: *mut *mut i32, other: *mut *mut i32) {{ \
+             let old = *out; *out = op(old); out = other; *out = old; }}"
+        );
+        ::utils::compilation::run_compiler_on_str(&code, |tcx| {
+            let program = program(tcx);
+            let f = function(&program, "f");
+            let (flows, _) = analyze_program_origin_flow_a2(&program);
+            let summary = &flows[&f].summary;
+            let out1 = signature_slot(summary, SignatureRoot::Arg(Local::from_usize(1)), 1);
+            assert!(summary.unknown_targets.contains(out1));
+        })
+        .unwrap();
+    }
 }
