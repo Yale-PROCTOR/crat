@@ -3684,7 +3684,15 @@ fn a5_site_scope_repartition_diagnostic() {
         .flat_map(|row| row.0.iter().map(|(key, _)| key.as_str()))
         .filter(|key| key.starts_with("family_"))
         .collect::<BTreeSet<_>>();
-    let family_total = family_keys.iter().map(|key| sum(key)).sum::<usize>();
+    let optional_sum = |key| {
+        rows.iter()
+            .map(|row| batch_optional_number(row, key).expect("optional numeric family"))
+            .sum::<usize>()
+    };
+    let family_total = family_keys
+        .iter()
+        .map(|key| optional_sum(key))
+        .sum::<usize>();
     assert_eq!(family_total, 5_555);
     let residual = sum("registered_unmatched");
     let residual_family_keys = rows
@@ -3694,15 +3702,15 @@ fn a5_site_scope_repartition_diagnostic() {
         .collect::<BTreeSet<_>>();
     let residual_family_total = residual_family_keys
         .iter()
-        .map(|key| sum(key))
+        .map(|key| optional_sum(key))
         .sum::<usize>();
     assert_eq!(residual_family_total, residual);
     let mut families = String::new();
     for key in &family_keys {
-        families.push_str(&format!("{}={}\n", key, sum(key)));
+        families.push_str(&format!("{}={}\n", key, optional_sum(key)));
     }
     for key in &residual_family_keys {
-        families.push_str(&format!("{}={}\n", key, sum(key)));
+        families.push_str(&format!("{}={}\n", key, optional_sum(key)));
     }
     fs::write(
         output.join("receipt.txt"),
