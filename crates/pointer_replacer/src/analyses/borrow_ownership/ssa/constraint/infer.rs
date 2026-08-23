@@ -40,13 +40,18 @@ pub trait InferMode<'infercx, 'db, 'tcx> {
         consume: Option<Consume<SSAIdx>>,
     ) -> Option<Consume<Self::LocalSig>>;
 
-    fn copy_for_deref(infer_cx: &mut Self::Ctxt, consume: Option<Consume<Self::LocalSig>>);
+    fn copy_for_deref(
+        infer_cx: &mut Self::Ctxt,
+        consume: Option<Consume<Self::LocalSig>>,
+        location: Location,
+    );
 
     fn transfer<const ENSURE_MOVE: bool>(
         infer_cx: &mut Self::Ctxt,
         ty: Ty<'tcx>,
         lhs_result: Consume<Self::LocalSig>,
         rhs_result: Consume<Self::LocalSig>,
+        location: Option<Location>,
     );
 
     fn cast<const ENSURE_MOVE: bool>(
@@ -54,6 +59,7 @@ pub trait InferMode<'infercx, 'db, 'tcx> {
         ty: Ty<'tcx>,
         lhs: Consume<Self::LocalSig>,
         rhs: Consume<Self::LocalSig>,
+        location: Option<Location>,
     );
 
     fn borrow(infer_cx: &mut Self::Ctxt, consume: Consume<Self::LocalSig>) {
@@ -465,9 +471,21 @@ impl<'rn, 'tcx: 'rn> Renamer<'rn, 'tcx> {
                     (Some(lhs_consume), None) => Infer::unknown_source(infer_cx, lhs_consume),
                     (Some(lhs_consume), Some(rhs_consume)) => {
                         if operand.is_move() {
-                            Infer::transfer::<true>(infer_cx, stmt_ty, lhs_consume, rhs_consume)
+                            Infer::transfer::<true>(
+                                infer_cx,
+                                stmt_ty,
+                                lhs_consume,
+                                rhs_consume,
+                                Some(location),
+                            )
                         } else {
-                            Infer::transfer::<false>(infer_cx, stmt_ty, lhs_consume, rhs_consume)
+                            Infer::transfer::<false>(
+                                infer_cx,
+                                stmt_ty,
+                                lhs_consume,
+                                rhs_consume,
+                                Some(location),
+                            )
                         }
                     }
                 }
@@ -504,9 +522,21 @@ impl<'rn, 'tcx: 'rn> Renamer<'rn, 'tcx> {
                     (Some(lhs_consume), None) => Infer::unknown_source(infer_cx, lhs_consume),
                     (Some(lhs_consume), Some(rhs_consume)) => {
                         if operand.is_move() {
-                            Infer::cast::<true>(infer_cx, stmt_ty, lhs_consume, rhs_consume)
+                            Infer::cast::<true>(
+                                infer_cx,
+                                stmt_ty,
+                                lhs_consume,
+                                rhs_consume,
+                                Some(location),
+                            )
                         } else {
-                            Infer::cast::<false>(infer_cx, stmt_ty, lhs_consume, rhs_consume)
+                            Infer::cast::<false>(
+                                infer_cx,
+                                stmt_ty,
+                                lhs_consume,
+                                rhs_consume,
+                                Some(location),
+                            )
                         }
                     }
                 }
@@ -518,7 +548,7 @@ impl<'rn, 'tcx: 'rn> Renamer<'rn, 'tcx> {
                 let _ = consume_place_at::<Infer>(lhs, self.body, location, self, infer_cx);
                 let rhs_consume =
                     consume_place_at::<Infer>(rhs, self.body, location, self, infer_cx);
-                Infer::copy_for_deref(infer_cx, rhs_consume);
+                Infer::copy_for_deref(infer_cx, rhs_consume, location);
                 tracing::debug!("deref_copy is ignored")
             }
 

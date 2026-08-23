@@ -54,11 +54,9 @@ use rustc_middle::{
 
 use crate::{
     analyses::borrow_ownership::{
-        CrateCtxt, SlotKind,
-        borrow_verify::verify_to_fixpoint,
-        coherence::add_coherence,
+        SlotKind,
+        construction::{CopyLendMode, construct_bo_into, verify_bo_construction},
         crate_slots::{CrateSlots, ptr_chain_depth},
-        emit_crate_ownership_constraints,
         export::with_bo_export,
         model_cache,
         mutability_facts::MutFacts,
@@ -2287,6 +2285,7 @@ fn decide_table_perturbed<'tcx>(
     let program = collect_program(tcx);
     let slots = CrateSlots::build(&program);
     let mut_facts = MutFacts::from_program(&program);
+    let copy_lend_mode = CopyLendMode::current();
 
     // Phase 1 input: the BO run, under an explicit capture scope.
     //
@@ -2319,21 +2318,26 @@ fn decide_table_perturbed<'tcx>(
     }
     let solve_t0 = std::time::Instant::now();
     let (model, _export) = with_bo_export(|| {
-        let crate_ctxt = CrateCtxt::new(&program);
         let solver = KindSolver::new(&slots);
-        let Ok((_stats, selectors)) = emit_crate_ownership_constraints(
-            &crate_ctxt,
+        let origins = compute_origins(&program);
+        let Ok(construction) = construct_bo_into(
+            &program,
             &slots,
-            &compute_origins(&program),
+            &origins,
+            &mut_facts,
             &solver,
+            copy_lend_mode,
         ) else {
             return None;
         };
-        for &g in &program.functions {
-            let body = tcx.mir_drops_elaborated_and_const_checked(g).borrow();
-            add_coherence(&solver, &slots, g, &body);
-        }
-        verify_to_fixpoint(&program, &slots, &solver, &selectors, &mut_facts)
+        verify_bo_construction(
+            &program,
+            &slots,
+            &origins,
+            &solver,
+            &construction,
+            &mut_facts,
+        )
     });
     let Some(model) = model else {
         return Err("BO declined — no accepted model".to_owned());

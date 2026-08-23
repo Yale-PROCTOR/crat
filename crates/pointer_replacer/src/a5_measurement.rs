@@ -18,11 +18,9 @@ use crate::{
     analyses::{
         borrow::lifetime_flow::{self, BodyLifetimeFlow},
         borrow_ownership::{
-            CrateCtxt, SlotKind,
-            borrow_verify::verify_to_fixpoint,
-            coherence::add_coherence,
+            SlotKind,
+            construction::{CopyLendMode, construct_bo_into, verify_bo_construction},
             crate_slots::CrateSlots,
-            emit_crate_ownership_constraints,
             export::with_bo_export,
             mutability_facts::MutFacts,
             origins::compute_origins,
@@ -41,6 +39,7 @@ use projection_conflict::{AccessDepth, PlaceConflictBias, places_conflict};
 
 const COUNT_SENTINEL: &str = "A5P1 ";
 const BASE_SENTINEL: &str = "A5P1BASE ";
+const PAIR_SENTINEL: &str = "A5P1PAIR\t";
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 struct FormalKey {
@@ -53,6 +52,23 @@ struct FormalKey {
 struct FormalDecision {
     settles_ref: bool,
     currently_predicted_refs: BTreeSet<FormalKey>,
+    mutable: bool,
+    mutability_default_fires: usize,
+}
+
+fn join_formal_mutability(values: impl IntoIterator<Item = Option<bool>>) -> (bool, usize) {
+    let mut mutable = false;
+    let mut default_fires = 0;
+    for value in values {
+        match value {
+            Some(value) => mutable |= value,
+            None => {
+                mutable = true;
+                default_fires += 1;
+            }
+        }
+    }
+    (mutable, default_fires)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -99,6 +115,7 @@ struct Timings {
 #[derive(Clone, Debug)]
 struct Measurement {
     counts: ProgramCounts,
+    pairs: Vec<PairLedgerRow>,
     coverage: CoverageCounts,
     timings: Timings,
 }
@@ -140,6 +157,67 @@ enum PairClass {
     NotProvenDisjoint,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum PairMutability {
+    MutMut,
+    MutReadOnly,
+    SharedShared,
+}
+
+impl PairMutability {
+    fn from_sides(left: bool, right: bool) -> PairMutability {
+        match (left, right) {
+            (true, true) => PairMutability::MutMut,
+            (false, false) => PairMutability::SharedShared,
+            _ => PairMutability::MutReadOnly,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            PairMutability::MutMut => "mut_mut",
+            PairMutability::MutReadOnly => "mut_read_only",
+            PairMutability::SharedShared => "shared_shared",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PairLedgerRow {
+    program: String,
+    site: String,
+    left_argument: usize,
+    right_argument: usize,
+    class: PairMutability,
+    left_mutable: bool,
+    right_mutable: bool,
+    left_default_fires: usize,
+    right_default_fires: usize,
+}
+
+impl PairLedgerRow {
+    fn validate(&self) -> Result<(), String> {
+        if self.program.is_empty()
+            || self.site.is_empty()
+            || self.program.contains(['\t', '\n', '\r'])
+            || self.site.contains(['\t', '\n', '\r'])
+        {
+            return Err("pair ledger identity contains an empty or control field".to_owned());
+        }
+        if self.left_argument == 0 || self.left_argument >= self.right_argument {
+            return Err("pair ledger arguments are not ordered one-based indices".to_owned());
+        }
+        if self.class != PairMutability::from_sides(self.left_mutable, self.right_mutable) {
+            return Err("pair ledger class disagrees with side mutability".to_owned());
+        }
+        Ok(())
+    }
+
+    fn default_fires(&self) -> usize {
+        self.left_default_fires + self.right_default_fires
+    }
+}
+
 fn classify_pair(facts: &PairFacts) -> PairClass {
     if facts.storage_alias {
         return PairClass::NotProvenDisjoint;
@@ -174,7 +252,7 @@ struct ProgramInput {
     functions: BTreeMap<String, FunctionNode>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct ProgramCounts {
     program: String,
     sites_with_two_ref_args: usize,
@@ -183,6 +261,14 @@ struct ProgramCounts {
     attributed_predicted_refs_depth0: usize,
     unknown_caller_reachable: usize,
     local_functions: usize,
+    pair_denominator: usize,
+    mut_mut: usize,
+    mut_read_only: usize,
+    shared_shared: usize,
+    sites_with_mut_mut: usize,
+    sites_with_mut_read_only: usize,
+    sites_with_shared_shared: usize,
+    mutability_default_fires: usize,
 }
 
 impl ProgramCounts {
@@ -199,15 +285,47 @@ impl ProgramCounts {
         if self.unknown_caller_reachable > self.local_functions {
             return Err("call-graph numerator exceeds its denominator".to_owned());
         }
+        if self.pair_denominator != self.mut_mut + self.mut_read_only + self.shared_shared {
+            return Err("count-(5) pair partition does not reconcile".to_owned());
+        }
+        if self.pair_denominator < self.sites_not_proven_disjoint {
+            return Err(
+                "count-(5) pair denominator is smaller than its C2 site population".to_owned(),
+            );
+        }
+        if [
+            self.sites_with_mut_mut,
+            self.sites_with_mut_read_only,
+            self.sites_with_shared_shared,
+        ]
+        .into_iter()
+        .any(|count| count > self.sites_not_proven_disjoint)
+        {
+            return Err("count-(5) site incidence exceeds the C2 site denominator".to_owned());
+        }
         Ok(())
     }
 }
 
-fn measure_program(input: &ProgramInput) -> Result<ProgramCounts, String> {
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct MeasuredProgram {
+    counts: ProgramCounts,
+    pairs: Vec<PairLedgerRow>,
+}
+
+fn measure_program(input: &ProgramInput) -> Result<MeasuredProgram, String> {
     let mut site_ids = BTreeSet::new();
     let mut sites_with_two_ref_args = 0usize;
     let mut sites_not_proven_disjoint = 0usize;
     let mut attributed = BTreeSet::new();
+    let mut pairs = Vec::new();
+    let mut mut_mut = 0;
+    let mut mut_read_only = 0;
+    let mut shared_shared = 0;
+    let mut sites_with_mut_mut = 0;
+    let mut sites_with_mut_read_only = 0;
+    let mut sites_with_shared_shared = 0;
+    let mut mutability_default_fires = 0;
 
     for site in &input.call_sites {
         if !site_ids.insert(site.id.as_str()) {
@@ -225,6 +343,7 @@ fn measure_program(input: &ProgramInput) -> Result<ProgramCounts, String> {
         sites_with_two_ref_args += 1;
 
         let mut risky = false;
+        let mut site_classes = BTreeSet::new();
         for (offset, &left) in ref_args.iter().enumerate() {
             for &right in &ref_args[offset + 1..] {
                 let facts = site
@@ -234,6 +353,30 @@ fn measure_program(input: &ProgramInput) -> Result<ProgramCounts, String> {
                     .unwrap_or_default();
                 if classify_pair(&facts) == PairClass::NotProvenDisjoint {
                     risky = true;
+                    let left_formal = &site.arguments[left];
+                    let right_formal = &site.arguments[right];
+                    let class =
+                        PairMutability::from_sides(left_formal.mutable, right_formal.mutable);
+                    match class {
+                        PairMutability::MutMut => mut_mut += 1,
+                        PairMutability::MutReadOnly => mut_read_only += 1,
+                        PairMutability::SharedShared => shared_shared += 1,
+                    }
+                    site_classes.insert(class);
+                    let pair = PairLedgerRow {
+                        program: input.name.clone(),
+                        site: site.id.clone(),
+                        left_argument: left + 1,
+                        right_argument: right + 1,
+                        class,
+                        left_mutable: left_formal.mutable,
+                        right_mutable: right_formal.mutable,
+                        left_default_fires: left_formal.mutability_default_fires,
+                        right_default_fires: right_formal.mutability_default_fires,
+                    };
+                    pair.validate()?;
+                    mutability_default_fires += pair.default_fires();
+                    pairs.push(pair);
                     for index in [left, right] {
                         let formal = &site.arguments[index];
                         attributed.extend(formal.currently_predicted_refs.iter().cloned());
@@ -242,6 +385,11 @@ fn measure_program(input: &ProgramInput) -> Result<ProgramCounts, String> {
             }
         }
         sites_not_proven_disjoint += usize::from(risky);
+        sites_with_mut_mut += usize::from(site_classes.contains(&PairMutability::MutMut));
+        sites_with_mut_read_only +=
+            usize::from(site_classes.contains(&PairMutability::MutReadOnly));
+        sites_with_shared_shared +=
+            usize::from(site_classes.contains(&PairMutability::SharedShared));
     }
 
     let reachable = unknown_reachable(&input.functions)?;
@@ -254,9 +402,17 @@ fn measure_program(input: &ProgramInput) -> Result<ProgramCounts, String> {
         attributed_predicted_refs_depth0: attributed.iter().filter(|key| key.depth == 0).count(),
         unknown_caller_reachable: reachable.len(),
         local_functions: input.functions.len(),
+        pair_denominator: pairs.len(),
+        mut_mut,
+        mut_read_only,
+        shared_shared,
+        sites_with_mut_mut,
+        sites_with_mut_read_only,
+        sites_with_shared_shared,
+        mutability_default_fires,
     };
     counts.validate()?;
-    Ok(counts)
+    Ok(MeasuredProgram { counts, pairs })
 }
 
 fn unknown_reachable(
@@ -589,10 +745,12 @@ fn formal_for_argument(
     targets: &[LocalDefId],
     parameter: usize,
     formals: &BTreeMap<(String, u32), ArtifactFormal>,
-    deep_refs: &BTreeMap<(String, u32), BTreeSet<FormalKey>>,
+    current_refs: &BTreeMap<(String, u32), BTreeSet<FormalKey>>,
+    mutability: &MutFacts,
 ) -> Result<FormalDecision, String> {
     let mut settles_ref = true;
     let mut currently_predicted_refs = BTreeSet::new();
+    let mut target_mutability = Vec::with_capacity(targets.len());
     for &target in targets {
         let body = tcx.mir_drops_elaborated_and_const_checked(target).borrow();
         if parameter >= body.arg_count {
@@ -604,6 +762,9 @@ fn formal_for_argument(
             ));
         }
         let local = rustc_middle::mir::Local::from_usize(parameter + 1);
+        target_mutability.push(
+            (!mutability.is_defaulted(target, local)).then(|| mutability.is_mutable(target, local)),
+        );
         let path = tcx.def_path_str(target.to_def_id());
         let key = (path.clone(), parameter as u32 + 1);
         let Some(formal) = formals.get(&key) else {
@@ -617,28 +778,35 @@ fn formal_for_argument(
             settles_ref = false;
             continue;
         };
-        settles_ref &= formal.settles_ref;
-        if formal.currently_predicted_ref {
-            currently_predicted_refs.insert(FormalKey {
-                function: path.clone(),
-                parameter: parameter as u32 + 1,
-                depth: 0,
-            });
-        }
-        if let Some(deeper) = deep_refs.get(&key) {
-            currently_predicted_refs.extend(deeper.iter().cloned());
-        }
+        let refs = current_refs.get(&key).ok_or_else(|| {
+            format!(
+                "current-head baseline model has no formal identity for {}#arg{} (snapshot depth {})",
+                path,
+                parameter + 1,
+                formal.ptr_depth,
+            )
+        })?;
+        let depth_zero = FormalKey {
+            function: path,
+            parameter: parameter as u32 + 1,
+            depth: 0,
+        };
+        settles_ref &= refs.contains(&depth_zero);
+        currently_predicted_refs.extend(refs.iter().cloned());
     }
     if !settles_ref {
         currently_predicted_refs.clear();
     }
+    let (mutable, mutability_default_fires) = join_formal_mutability(target_mutability);
     Ok(FormalDecision {
         settles_ref,
         currently_predicted_refs,
+        mutable,
+        mutability_default_fires,
     })
 }
 
-fn accepted_deep_refs(
+fn accepted_current_refs(
     tcx: TyCtxt<'_>,
     program: &RustProgram<'_>,
     formals: &BTreeMap<(String, u32), ArtifactFormal>,
@@ -646,23 +814,19 @@ fn accepted_deep_refs(
     let slots = CrateSlots::build(program);
     let mutable = MutFacts::from_program(program);
     let (model, _export) = with_bo_export(|| {
-        let crate_ctxt = CrateCtxt::new(program);
         let solver = KindSolver::new(&slots);
-        let Ok((_stats, selectors)) = emit_crate_ownership_constraints(
-            &crate_ctxt,
+        let origins = compute_origins(program);
+        let Ok(construction) = construct_bo_into(
+            program,
             &slots,
-            &compute_origins(program),
+            &origins,
+            &mutable,
             &solver,
+            CopyLendMode::Baseline,
         ) else {
             return None;
         };
-        for &function in &program.functions {
-            let body = tcx
-                .mir_drops_elaborated_and_const_checked(function)
-                .borrow();
-            add_coherence(&solver, &slots, function, &body);
-        }
-        verify_to_fixpoint(program, &slots, &solver, &selectors, &mutable)
+        verify_bo_construction(program, &slots, &origins, &solver, &construction, &mutable)
     });
     let model = model.ok_or_else(|| "targeted accepted-model export declined".to_owned())?;
 
@@ -682,20 +846,20 @@ fn accepted_deep_refs(
                 continue;
             };
             let local = Local::from_usize(parameter + 1);
-            let mut deeper = BTreeSet::new();
-            for depth in 1..formal.ptr_depth {
+            let mut accepted_refs = BTreeSet::new();
+            for depth in 0..formal.ptr_depth {
                 let slot = universe.slot_for_local_depth(local, depth).ok_or_else(|| {
                     format!("accepted model lacks {path}#arg{}@{depth}", parameter + 1)
                 })?;
                 if model.get(&SlotRef::Local(function, slot)) == Some(&SlotKind::Ref) {
-                    deeper.insert(FormalKey {
+                    accepted_refs.insert(FormalKey {
                         function: path.clone(),
                         parameter: parameter as u32 + 1,
                         depth,
                     });
                 }
             }
-            refs.insert(key, deeper);
+            refs.insert(key, accepted_refs);
         }
     }
     Ok(refs)
@@ -705,10 +869,11 @@ fn measure_tcx(
     program_name: &str,
     tcx: TyCtxt<'_>,
     formals: &BTreeMap<(String, u32), ArtifactFormal>,
-    deep_refs: &BTreeMap<(String, u32), BTreeSet<FormalKey>>,
+    current_refs: &BTreeMap<(String, u32), BTreeSet<FormalKey>>,
     accepted_model_time: Duration,
 ) -> Result<Measurement, String> {
     let program = super::collect_program(tcx);
+    let mutability = MutFacts::from_program(&program);
     let functions = program.functions.iter().copied().collect::<FxHashSet<_>>();
     let roots = unknown_caller_roots(tcx, &program.functions);
 
@@ -826,7 +991,9 @@ fn measure_tcx(
                 .collect::<BTreeSet<_>>();
 
             let arguments = (0..call_args.len())
-                .map(|parameter| formal_for_argument(tcx, targets, parameter, formals, deep_refs))
+                .map(|parameter| {
+                    formal_for_argument(tcx, targets, parameter, formals, current_refs, &mutability)
+                })
                 .collect::<Result<Vec<_>, _>>()?;
             let mut pair_facts = BTreeMap::new();
             for left in 0..call_args.len() {
@@ -864,14 +1031,15 @@ fn measure_tcx(
         }
     }
 
-    let counts = measure_program(&ProgramInput {
+    let measured = measure_program(&ProgramInput {
         name: program_name.to_owned(),
         call_sites,
         functions: function_nodes,
     })?;
     coverage.validate()?;
     Ok(Measurement {
-        counts,
+        counts: measured.counts,
+        pairs: measured.pairs,
         coverage,
         timings: Timings {
             origins: origins_time,
@@ -884,40 +1052,41 @@ fn measure_tcx(
 pub(super) fn run_worker(tcx: TyCtxt<'_>, t_tcx: Duration) -> super::report::Row {
     let t0 = Instant::now();
     let mut row = super::report::Row::default();
+    row.set("copy_lend_mode", CopyLendMode::Baseline.label());
     let program = std::env::var("CRAT_BOC1_NAME").unwrap_or_else(|_| "unnamed".to_owned());
     let Some(snapshot) = std::env::var_os("CRAT_A5_SNAPSHOT").map(std::path::PathBuf::from) else {
         row.set("status", "missing-snapshot");
         return row;
     };
-    let deep = std::env::var("CRAT_A5_DEEP").as_deref() == Ok("1");
     let measured = snapshot_formals(&snapshot, &program).and_then(|formals| {
         let t_model = Instant::now();
-        let deep_refs = if deep {
-            let rust_program = super::collect_program(tcx);
-            accepted_deep_refs(tcx, &rust_program, &formals)?
-        } else {
-            BTreeMap::new()
-        };
-        let model_time = deep.then(|| t_model.elapsed()).unwrap_or_default();
-        measure_tcx(&program, tcx, &formals, &deep_refs, model_time)
+        let rust_program = super::collect_program(tcx);
+        let current_refs = accepted_current_refs(tcx, &rust_program, &formals)?;
+        let model_time = t_model.elapsed();
+        measure_tcx(&program, tcx, &formals, &current_refs, model_time)
     });
     match measured {
         Ok(measured) => {
             let counts = &measured.counts;
-            let needs_depth = !deep && counts.sites_not_proven_disjoint > 0;
-            if needs_depth {
-                println!("{}", render_base_line(counts));
-                row.set("status", "needs-depth");
-            } else {
-                println!("{}", render_count_line(counts));
-                row.set("status", "ok");
+            for pair in &measured.pairs {
+                println!("{}", render_pair_line(pair));
             }
+            println!("{}", render_count_line(counts));
+            row.set("status", "ok");
             row.set("c1", counts.sites_with_two_ref_args);
             row.set("c2", counts.sites_not_proven_disjoint);
             row.set("c3", counts.attributed_predicted_refs);
             row.set("c3_depth0", counts.attributed_predicted_refs_depth0);
             row.set("cg_num", counts.unknown_caller_reachable);
             row.set("cg_den", counts.local_functions);
+            row.set("pair_den", counts.pair_denominator);
+            row.set("mut_mut", counts.mut_mut);
+            row.set("mut_read_only", counts.mut_read_only);
+            row.set("shared_shared", counts.shared_shared);
+            row.set("sites_with_mut_mut", counts.sites_with_mut_mut);
+            row.set("sites_with_mut_read_only", counts.sites_with_mut_read_only);
+            row.set("sites_with_shared_shared", counts.sites_with_shared_shared);
+            row.set("mut_default_fires", counts.mutability_default_fires);
             row.set("calls_total", measured.coverage.calls_total);
             row.set("direct_local", measured.coverage.direct_local);
             row.set("indirect_local", measured.coverage.indirect_local);
@@ -963,7 +1132,7 @@ fn render_count_line_with_sentinel(sentinel: &str, counts: &ProgramCounts) -> St
         .validate()
         .expect("only valid P1 counts may be rendered");
     format!(
-        "{sentinel}program={} c1={} c2={} c3={} c3_depth0={} cg_num={} cg_den={}",
+        "{sentinel}program={} c1={} c2={} c3={} c3_depth0={} cg_num={} cg_den={} pair_den={} mut_mut={} mut_read_only={} shared_shared={} site_mut_mut={} site_mut_read_only={} site_shared_shared={} mut_default_fires={}",
         counts.program,
         counts.sites_with_two_ref_args,
         counts.sites_not_proven_disjoint,
@@ -971,7 +1140,76 @@ fn render_count_line_with_sentinel(sentinel: &str, counts: &ProgramCounts) -> St
         counts.attributed_predicted_refs_depth0,
         counts.unknown_caller_reachable,
         counts.local_functions,
+        counts.pair_denominator,
+        counts.mut_mut,
+        counts.mut_read_only,
+        counts.shared_shared,
+        counts.sites_with_mut_mut,
+        counts.sites_with_mut_read_only,
+        counts.sites_with_shared_shared,
+        counts.mutability_default_fires,
     )
+}
+
+fn render_pair_line(pair: &PairLedgerRow) -> String {
+    pair.validate()
+        .expect("only valid count-(5) pair rows may be rendered");
+    format!(
+        "{PAIR_SENTINEL}{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+        pair.program,
+        pair.site,
+        pair.left_argument,
+        pair.right_argument,
+        pair.class.label(),
+        usize::from(pair.left_mutable),
+        usize::from(pair.right_mutable),
+        pair.left_default_fires,
+        pair.right_default_fires,
+    )
+}
+
+fn parse_pair_line(line: &str) -> Result<PairLedgerRow, String> {
+    let columns = line
+        .trim_end()
+        .strip_prefix(PAIR_SENTINEL)
+        .ok_or_else(|| "missing A5P1PAIR sentinel".to_owned())?
+        .split('\t')
+        .collect::<Vec<_>>();
+    if columns.len() != 9 {
+        return Err(format!(
+            "pair ledger row has {} columns, expected 9",
+            columns.len()
+        ));
+    }
+    let number = |index: usize, name: &str| {
+        columns[index]
+            .parse::<usize>()
+            .map_err(|why| format!("invalid pair `{name}`: {why}"))
+    };
+    let boolean = |index: usize, name: &str| match columns[index] {
+        "0" => Ok(false),
+        "1" => Ok(true),
+        other => Err(format!("invalid pair `{name}` boolean `{other}`")),
+    };
+    let class = match columns[4] {
+        "mut_mut" => PairMutability::MutMut,
+        "mut_read_only" => PairMutability::MutReadOnly,
+        "shared_shared" => PairMutability::SharedShared,
+        other => return Err(format!("invalid pair class `{other}`")),
+    };
+    let row = PairLedgerRow {
+        program: columns[0].to_owned(),
+        site: columns[1].to_owned(),
+        left_argument: number(2, "left_argument")?,
+        right_argument: number(3, "right_argument")?,
+        class,
+        left_mutable: boolean(5, "left_mutable")?,
+        right_mutable: boolean(6, "right_mutable")?,
+        left_default_fires: number(7, "left_default_fires")?,
+        right_default_fires: number(8, "right_default_fires")?,
+    };
+    row.validate()?;
+    Ok(row)
 }
 
 fn parse_count_line(line: &str) -> Result<ProgramCounts, String> {
@@ -996,7 +1234,23 @@ fn parse_count_line_with_sentinel(sentinel: &str, line: &str) -> Result<ProgramC
             return Err(format!("duplicate field `{key}`"));
         }
     }
-    const EXPECTED: [&str; 7] = ["program", "c1", "c2", "c3", "c3_depth0", "cg_num", "cg_den"];
+    const EXPECTED: [&str; 15] = [
+        "program",
+        "c1",
+        "c2",
+        "c3",
+        "c3_depth0",
+        "cg_num",
+        "cg_den",
+        "pair_den",
+        "mut_mut",
+        "mut_read_only",
+        "shared_shared",
+        "site_mut_mut",
+        "site_mut_read_only",
+        "site_shared_shared",
+        "mut_default_fires",
+    ];
     if fields.len() != EXPECTED.len() || EXPECTED.iter().any(|key| !fields.contains_key(key)) {
         return Err("count row does not contain the exact P1 schema".to_owned());
     }
@@ -1013,6 +1267,14 @@ fn parse_count_line_with_sentinel(sentinel: &str, line: &str) -> Result<ProgramC
         attributed_predicted_refs_depth0: number("c3_depth0")?,
         unknown_caller_reachable: number("cg_num")?,
         local_functions: number("cg_den")?,
+        pair_denominator: number("pair_den")?,
+        mut_mut: number("mut_mut")?,
+        mut_read_only: number("mut_read_only")?,
+        shared_shared: number("shared_shared")?,
+        sites_with_mut_mut: number("site_mut_mut")?,
+        sites_with_mut_read_only: number("site_mut_read_only")?,
+        sites_with_shared_shared: number("site_shared_shared")?,
+        mutability_default_fires: number("mut_default_fires")?,
     };
     counts.validate()?;
     Ok(counts)
@@ -1034,6 +1296,48 @@ fn parse_single_raw_line(stdout: &str, sentinel: &str) -> Result<(String, Progra
     Ok((lines[0].to_owned(), counts))
 }
 
+fn parse_pair_ledger(stdout: &str, counts: &ProgramCounts) -> Result<Vec<PairLedgerRow>, String> {
+    let pairs = stdout
+        .lines()
+        .filter(|line| line.starts_with(PAIR_SENTINEL))
+        .map(parse_pair_line)
+        .collect::<Result<Vec<_>, _>>()?;
+    if pairs.iter().any(|pair| pair.program != counts.program) {
+        return Err("pair ledger contains a different program identity".to_owned());
+    }
+    let mut identities = BTreeSet::new();
+    if pairs.iter().any(|pair| {
+        !identities.insert((pair.site.as_str(), pair.left_argument, pair.right_argument))
+    }) {
+        return Err("pair ledger contains a duplicate exact pair identity".to_owned());
+    }
+    let mut by_class = BTreeMap::new();
+    for pair in &pairs {
+        *by_class.entry(pair.class).or_insert(0usize) += 1;
+    }
+    if pairs.len() != counts.pair_denominator
+        || by_class.get(&PairMutability::MutMut).copied().unwrap_or(0) != counts.mut_mut
+        || by_class
+            .get(&PairMutability::MutReadOnly)
+            .copied()
+            .unwrap_or(0)
+            != counts.mut_read_only
+        || by_class
+            .get(&PairMutability::SharedShared)
+            .copied()
+            .unwrap_or(0)
+            != counts.shared_shared
+        || pairs
+            .iter()
+            .map(PairLedgerRow::default_fires)
+            .sum::<usize>()
+            != counts.mutability_default_fires
+    {
+        return Err("pair ledger does not reconcile with the count-(5) row".to_owned());
+    }
+    Ok(pairs)
+}
+
 fn aggregate(rows: &[ProgramCounts]) -> Result<ProgramCounts, String> {
     let mut programs = BTreeSet::new();
     let mut total = ProgramCounts {
@@ -1044,6 +1348,14 @@ fn aggregate(rows: &[ProgramCounts]) -> Result<ProgramCounts, String> {
         attributed_predicted_refs_depth0: 0,
         unknown_caller_reachable: 0,
         local_functions: 0,
+        pair_denominator: 0,
+        mut_mut: 0,
+        mut_read_only: 0,
+        shared_shared: 0,
+        sites_with_mut_mut: 0,
+        sites_with_mut_read_only: 0,
+        sites_with_shared_shared: 0,
+        mutability_default_fires: 0,
     };
     for row in rows {
         if !programs.insert(row.program.as_str()) {
@@ -1055,6 +1367,14 @@ fn aggregate(rows: &[ProgramCounts]) -> Result<ProgramCounts, String> {
         total.attributed_predicted_refs_depth0 += row.attributed_predicted_refs_depth0;
         total.unknown_caller_reachable += row.unknown_caller_reachable;
         total.local_functions += row.local_functions;
+        total.pair_denominator += row.pair_denominator;
+        total.mut_mut += row.mut_mut;
+        total.mut_read_only += row.mut_read_only;
+        total.shared_shared += row.shared_shared;
+        total.sites_with_mut_mut += row.sites_with_mut_mut;
+        total.sites_with_mut_read_only += row.sites_with_mut_read_only;
+        total.sites_with_shared_shared += row.sites_with_shared_shared;
+        total.mutability_default_fires += row.mutability_default_fires;
     }
     total.validate()?;
     Ok(total)
@@ -1072,6 +1392,7 @@ fn a5_substrate_dir(selector: Option<&str>) -> Result<&'static str, String> {
 #[derive(Clone, Debug)]
 struct FinalRun {
     counts: ProgramCounts,
+    pairs: Vec<PairLedgerRow>,
     metadata: super::report::Row,
     raw_line: String,
     wall_seconds: f64,
@@ -1132,8 +1453,10 @@ fn parse_completed_base(
                     "{expected_program}: invalid final counts {counts:?}"
                 ));
             }
+            let pairs = parse_pair_ledger(stdout, &counts)?;
             Ok(CompletedBase::Final(FinalRun {
                 counts,
+                pairs,
                 metadata,
                 raw_line,
                 wall_seconds,
@@ -1215,7 +1538,8 @@ fn load_preserved_bases(directory: &Path) -> Result<BTreeMap<String, CompletedBa
 fn a5_p1_corpus() {
     use std::{fs, path::PathBuf};
 
-    const DATE: &str = "2026-08-07";
+    const DATE: &str = "2026-08-20";
+    const ANALYSIS_SEMANTICS_HEAD: &str = "809dd9de";
     const SNAPSHOT_PRODUCER_HEAD: &str = "3b26a0ff85517a33acf916e8dbe2624ffc924a85";
     const SNAPSHOT_PRODUCER_BRANCH_HEAD: &str = "52da86648db9d76d8945063792f37da61bf8c8b9";
     const MANIFEST_COMMIT: &str = "a654d5ecde8a0ea9fccc8a3e7b9caaa8fac5812d";
@@ -1308,13 +1632,15 @@ fn a5_p1_corpus() {
     );
 
     let deps_link = root.join("deps_crate/target");
-    assert!(
-        fs::symlink_metadata(&deps_link)
-            .expect("deps target metadata")
-            .file_type()
-            .is_symlink(),
-        "P1 records the approved read-only symlink provisioning shape"
-    );
+    let deps_shape = if fs::symlink_metadata(&deps_link)
+        .expect("deps target metadata")
+        .file_type()
+        .is_symlink()
+    {
+        "read-only-symlink-to-main-checkout-build"
+    } else {
+        "worktree-local-locked-build"
+    };
     let deps_target = deps_link.canonicalize().expect("canonical deps target");
     let deps_dir = deps_target.join("debug/deps");
     let deps_entries = fs::read_dir(&deps_dir).expect("read linked deps directory");
@@ -1324,7 +1650,8 @@ fn a5_p1_corpus() {
         let name = entry.file_name();
         let name = name.to_string_lossy();
         rlibs += usize::from(name.ends_with(".rlib"));
-        bytemuck_derive |= name.starts_with("libbytemuck_derive") && name.ends_with(".dylib");
+        bytemuck_derive |= name.starts_with("libbytemuck_derive")
+            && (name.ends_with(".dylib") || name.ends_with(".so"));
     }
     assert!(rlibs > 0, "linked deps target contains no rlibs");
     assert!(
@@ -1349,8 +1676,8 @@ fn a5_p1_corpus() {
     if std::env::var("CRAT_A5_RECOVER_BROTLI").as_deref() == Ok("1") {
         assert_eq!(
             std::env::var("CRAT_BOC1_MEM_MB").as_deref(),
-            Ok("24576"),
-            "the one-shot brotli recovery is authorized only at the 24,576-MiB cap"
+            Ok("49152"),
+            "the amended one-shot brotli recovery is authorized only at the 49,152-MiB cap"
         );
         assert!(
             std::env::var_os("CRAT_A5_PRESERVED_BASE_DIR").is_none(),
@@ -1372,7 +1699,7 @@ fn a5_p1_corpus() {
         let recovery_output = out.join("a5-p1-recovery");
         fs::create_dir_all(&recovery_output).expect("create P1 recovery output directory");
         let receipt = format!(
-            "program=brotli\nstatus={}\nmem_cap_mib=24576\npeak_rss_kb={}\npeak_rss_mib={:.3}\nwall_s={:.3}\nanalysis_worktree_head={analysis_head}\nsnapshot_producer_head={SNAPSHOT_PRODUCER_HEAD}\nmanifest_commit={MANIFEST_COMMIT}\nderived_substrate_sha256={DERIVED_SUBSTRATE_DIGEST}\nmachine_quiet_precondition=externally-verified\n",
+            "program=brotli\nstatus={}\nmem_cap_mib=49152\npeak_rss_kb={}\npeak_rss_mib={:.3}\nwall_s={:.3}\nanalysis_worktree_head={analysis_head}\nanalysis_semantics_head={ANALYSIS_SEMANTICS_HEAD}\ncopy_lend_mode=baseline\nsnapshot_producer_head={SNAPSHOT_PRODUCER_HEAD}\nmanifest_commit={MANIFEST_COMMIT}\nderived_substrate_sha256={DERIVED_SUBSTRATE_DIGEST}\nmachine_quiet_precondition=lambda7-high-memory\n",
             outcome.status,
             outcome.peak_rss_kb,
             outcome.peak_rss_kb as f64 / 1024.0,
@@ -1381,7 +1708,7 @@ fn a5_p1_corpus() {
         fs::write(recovery_output.join("receipt.txt"), &receipt)
             .expect("write P1 recovery receipt");
         println!(
-            "A5P1RECOVERY program=brotli status={} mem_cap_mib=24576 peak_rss_kb={} peak_rss_mib={:.3} wall_s={:.3}",
+            "A5P1RECOVERY program=brotli status={} mem_cap_mib=49152 peak_rss_kb={} peak_rss_mib={:.3} wall_s={:.3}",
             outcome.status,
             outcome.peak_rss_kb,
             outcome.peak_rss_kb as f64 / 1024.0,
@@ -1465,7 +1792,6 @@ fn a5_p1_corpus() {
     let mut brotli_depth_peak_rss_kb = None;
     let mut brotli_depth_wall_s = None;
     let preserved_final_directory = std::env::var_os("CRAT_A5_PRESERVED_FINAL_DIR");
-    let resumed_final_rows = preserved_final_directory.is_some();
     if let Some(directory) = preserved_final_directory {
         assert_eq!(
             std::env::var("CRAT_BOC1_MEM_MB").as_deref(),
@@ -1599,16 +1925,14 @@ fn a5_p1_corpus() {
                 "ok" => {
                     let (raw_line, counts) = parse_single_raw_line(&outcome.stdout, COUNT_SENTINEL)
                         .unwrap_or_else(|why| panic!("{}: {why}", program.name));
+                    let pairs = parse_pair_ledger(&outcome.stdout, &counts)
+                        .unwrap_or_else(|why| panic!("{}: {why}", program.name));
                     assert_eq!(counts.program, program.name);
-                    assert_eq!(
-                        counts.sites_not_proven_disjoint, 0,
-                        "{} returned a final base row despite needing a depth export",
-                        program.name
-                    );
                     final_runs.insert(
                         program.name,
                         FinalRun {
                             counts,
+                            pairs,
                             metadata: outcome.row.expect("final worker BOC1 row"),
                             raw_line,
                             wall_seconds: outcome.wall_s,
@@ -1634,14 +1958,7 @@ fn a5_p1_corpus() {
         needs_depth.len() < super::CORPUS.len(),
         "all 20 programs require a targeted accepted-model export; P1 refuses a suite-wide re-solve"
     );
-    let targeted_count = if resumed_final_rows {
-        final_runs
-            .values()
-            .filter(|run| run.counts.sites_not_proven_disjoint > 0)
-            .count()
-    } else {
-        needs_depth.len()
-    };
+    let current_head_baseline_model_count = super::CORPUS.len();
     for (program, base, base_wall) in needs_depth {
         let input = corpus_link.join(program.name).join(program.lib_root);
         let outcome = super::orchestrate::run_child_env(
@@ -1661,6 +1978,8 @@ fn a5_p1_corpus() {
         );
         let (raw_line, counts) = parse_single_raw_line(&outcome.stdout, COUNT_SENTINEL)
             .unwrap_or_else(|why| panic!("{}: {why}", program.name));
+        let pairs = parse_pair_ledger(&outcome.stdout, &counts)
+            .unwrap_or_else(|why| panic!("{}: {why}", program.name));
         assert_eq!(counts.program, program.name);
         assert_eq!(counts.sites_with_two_ref_args, base.sites_with_two_ref_args);
         assert_eq!(
@@ -1676,10 +1995,28 @@ fn a5_p1_corpus() {
             base.unknown_caller_reachable
         );
         assert_eq!(counts.local_functions, base.local_functions);
+        assert_eq!(counts.pair_denominator, base.pair_denominator);
+        assert_eq!(counts.mut_mut, base.mut_mut);
+        assert_eq!(counts.mut_read_only, base.mut_read_only);
+        assert_eq!(counts.shared_shared, base.shared_shared);
+        assert_eq!(counts.sites_with_mut_mut, base.sites_with_mut_mut);
+        assert_eq!(
+            counts.sites_with_mut_read_only,
+            base.sites_with_mut_read_only
+        );
+        assert_eq!(
+            counts.sites_with_shared_shared,
+            base.sites_with_shared_shared
+        );
+        assert_eq!(
+            counts.mutability_default_fires,
+            base.mutability_default_fires
+        );
         final_runs.insert(
             program.name,
             FinalRun {
                 counts,
+                pairs,
                 metadata: outcome.row.expect("targeted worker BOC1 row"),
                 raw_line,
                 wall_seconds: base_wall + outcome.wall_s,
@@ -1703,19 +2040,41 @@ fn a5_p1_corpus() {
     let output = out.join("a5-p1");
     fs::create_dir_all(&output).expect("create P1 output directory");
     let mut raw = String::new();
+    let mut pair_ledger = String::from(
+        "program\tsite\tleft_argument\tright_argument\tclass\tleft_mutable\tright_mutable\tleft_default_fires\tright_default_fires\n",
+    );
     let mut tsv = String::from(
-        "program\tc1\tc2\tc3\tc3_depth0\tcg_num\tcg_den\tcalls_total\tdirect_local\tindirect_local\tdirect_external\tindirect_unresolved\tnon_fn_def_constant\tt_origins_s\tt_andersen_s\tt_model_s\twall_s\n",
+        "program\tc1\tc2\tc3\tc3_depth0\tcg_num\tcg_den\tpair_den\tmut_mut\tmut_read_only\tshared_shared\tsite_mut_mut\tsite_mut_read_only\tsite_shared_shared\tmut_default_fires\tcalls_total\tdirect_local\tindirect_local\tdirect_external\tindirect_unresolved\tnon_fn_def_constant\tt_origins_s\tt_andersen_s\tt_model_s\twall_s\n",
     );
     let mut markdown = format!(
-        "# A5/P1 raw measurement\n\nHEAD `{analysis_head}`, date {DATE}; manifest docs `{MANIFEST_COMMIT}`.\n\n| program | C1 | C2 | C3-all | C3-d0 | unknown-reachable / local functions |\n|---|---:|---:|---:|---:|---:|\n"
+        "# A5 current-head refresh with count-(5)\n\nHEAD `{analysis_head}`, date {DATE}; manifest docs `{MANIFEST_COMMIT}` supplies identity/depth cross-checks only; all C1-C3 decisions come from the current-head `baseline` BO model.\n\n| program | C1 | C2/site denominator | C3-all | C3-d0 | pair denominator | mut+mut | mut+read-only | shared+shared | site mut+mut | site mut+read-only | site shared+shared | unknown-reachable / local functions |\n|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n"
     );
+    let percent = |numerator: usize, denominator: usize| {
+        if denominator == 0 {
+            "0 (N/A)".to_owned()
+        } else {
+            format!(
+                "{} ({:.2}%)",
+                numerator,
+                100.0 * numerator as f64 / denominator as f64
+            )
+        }
+    };
     for program in super::CORPUS {
         let run = &final_runs[program.name];
         raw.push_str(&run.raw_line);
         raw.push('\n');
+        for pair in &run.pairs {
+            pair_ledger.push_str(
+                render_pair_line(pair)
+                    .strip_prefix(PAIR_SENTINEL)
+                    .expect("rendered pair sentinel"),
+            );
+            pair_ledger.push('\n');
+        }
         let get = |key: &str| run.metadata.get(key).unwrap_or("missing");
         tsv.push_str(&format!(
-            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.3}\n",
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.3}\n",
             program.name,
             run.counts.sites_with_two_ref_args,
             run.counts.sites_not_proven_disjoint,
@@ -1723,6 +2082,14 @@ fn a5_p1_corpus() {
             run.counts.attributed_predicted_refs_depth0,
             run.counts.unknown_caller_reachable,
             run.counts.local_functions,
+            run.counts.pair_denominator,
+            run.counts.mut_mut,
+            run.counts.mut_read_only,
+            run.counts.shared_shared,
+            run.counts.sites_with_mut_mut,
+            run.counts.sites_with_mut_read_only,
+            run.counts.sites_with_shared_shared,
+            run.counts.mutability_default_fires,
             get("calls_total"),
             get("direct_local"),
             get("indirect_local"),
@@ -1735,29 +2102,71 @@ fn a5_p1_corpus() {
             run.wall_seconds,
         ));
         markdown.push_str(&format!(
-            "| {} | {} | {} | {} | {} | {} / {} |\n",
+            "| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} / {} |\n",
             program.name,
             run.counts.sites_with_two_ref_args,
             run.counts.sites_not_proven_disjoint,
             run.counts.attributed_predicted_refs,
             run.counts.attributed_predicted_refs_depth0,
+            run.counts.pair_denominator,
+            percent(run.counts.mut_mut, run.counts.pair_denominator),
+            percent(run.counts.mut_read_only, run.counts.pair_denominator),
+            percent(run.counts.shared_shared, run.counts.pair_denominator),
+            percent(
+                run.counts.sites_with_mut_mut,
+                run.counts.sites_not_proven_disjoint,
+            ),
+            percent(
+                run.counts.sites_with_mut_read_only,
+                run.counts.sites_not_proven_disjoint,
+            ),
+            percent(
+                run.counts.sites_with_shared_shared,
+                run.counts.sites_not_proven_disjoint,
+            ),
             run.counts.unknown_caller_reachable,
             run.counts.local_functions,
         ));
     }
     markdown.push_str(&format!(
-        "| **TOTAL / micro-average** | **{}** | **{}** | **{}** | **{}** | **{} / {} ({:.2}%)** |\n",
+        "| **TOTAL / micro-average** | **{}** | **{}** | **{}** | **{}** | **{}** | **{}** | **{}** | **{}** | **{}** | **{}** | **{}** | **{} / {} ({:.2}%)** |\n",
         total.sites_with_two_ref_args,
         total.sites_not_proven_disjoint,
         total.attributed_predicted_refs,
         total.attributed_predicted_refs_depth0,
+        total.pair_denominator,
+        percent(total.mut_mut, total.pair_denominator),
+        percent(total.mut_read_only, total.pair_denominator),
+        percent(total.shared_shared, total.pair_denominator),
+        percent(total.sites_with_mut_mut, total.sites_not_proven_disjoint),
+        percent(
+            total.sites_with_mut_read_only,
+            total.sites_not_proven_disjoint,
+        ),
+        percent(
+            total.sites_with_shared_shared,
+            total.sites_not_proven_disjoint,
+        ),
         total.unknown_caller_reachable,
         total.local_functions,
         100.0 * total.unknown_caller_reachable as f64 / total.local_functions as f64,
     ));
+    let nonzero_programs =
+        |field: fn(&ProgramCounts) -> usize| rows.iter().filter(|row| field(row) != 0).count();
+    markdown.push_str(&format!(
+        "\nCount-(5) program spread (nonzero / 20): pair denominator {}; mut+mut {}; mut+read-only {}; shared+shared {}; site mut+mut {}; site mut+read-only {}; site shared+shared {}. Missing-Foster default fires: {}.\n",
+        nonzero_programs(|row| row.pair_denominator),
+        nonzero_programs(|row| row.mut_mut),
+        nonzero_programs(|row| row.mut_read_only),
+        nonzero_programs(|row| row.shared_shared),
+        nonzero_programs(|row| row.sites_with_mut_mut),
+        nonzero_programs(|row| row.sites_with_mut_read_only),
+        nonzero_programs(|row| row.sites_with_shared_shared),
+        total.mutability_default_fires,
+    ));
     if let Some(peak_rss_kb) = brotli_peak_rss_kb {
         markdown.push_str(&format!(
-            "\nResource note: derived expansion collapsed brotli into one ~500k-SLOC file; its one-shot 24,576-MiB base-classification recovery peaked at {:.3} MiB RSS (200 ms sampling).\n",
+            "\nResource note: derived expansion collapsed brotli into one ~500k-SLOC file; its amended one-shot 49,152-MiB base-classification recovery peaked at {:.3} MiB RSS (200 ms sampling).\n",
             peak_rss_kb as f64 / 1024.0,
         ));
     }
@@ -1800,11 +2209,12 @@ fn a5_p1_corpus() {
         .map(|value| format!("{value:.3}"))
         .unwrap_or_else(|| "not-applicable".to_owned());
     let provenance = format!(
-        "date={DATE}\nanalysis_worktree_head={analysis_head}\nsnapshot_producer_head={SNAPSHOT_PRODUCER_HEAD}\nsnapshot_producer_branch_head={SNAPSHOT_PRODUCER_BRANCH_HEAD}\nsnapshot_producer_branch_delta=one-test-only-commit-after-capture\nmanifest_commit={MANIFEST_COMMIT}\nraw_frozen_corpus_sha256={RAW_FROZEN_DIGEST}\nderived_substrate_sha256={DERIVED_SUBSTRATE_DIGEST}\nsubstrate=derived\nsubstrate_selector={}\nrepair=mode_a\nl2=0\nsafe_mono=per_site\nfork_engine=fork\nmutability_facts=on-direct-from-program\nz3_smt_seed=0\nz3_sat_seed=0\ncorpus_shape=read-only-symlink-to-main-checkout-derived-corpus\ncorpus_link={}\ncorpus_target={}\nsnapshot={}\ndeps_shape=read-only-symlink-to-main-checkout-build\ndeps_link={}\ndeps_target={}\ndeps_rlibs={}\ndeps_bytemuck_derive=present\nresolver_DIR={}\nresolver_CWD={}\nbase_timeout_s={}\ndeep_timeout_s={}\ntargeted_programs={}\npreserved_base_dir={}\npreserved_base_rows={}\npreserved_base_hash_manifest_sha256={}\npreserved_base_wall_source=child-t_total_s\npreserved_final_dir={}\npreserved_final_rows={}\npreserved_final_hash_manifest_sha256={}\npreserved_final_wall_source=child-t_total_s\nbrotli_recovery_mem_cap_mib={}\nbrotli_recovery_peak_rss_kb={}\nbrotli_depth_recovery_mem_cap_mib={}\nbrotli_depth_recovery_peak_rss_kb={}\nbrotli_depth_recovery_wall_s={}\nbrotli_single_file_side_effect=derived-expand-collapsed-to-about-500k-sloc\n",
+        "date={DATE}\nanalysis_worktree_head={analysis_head}\nanalysis_semantics_head={ANALYSIS_SEMANTICS_HEAD}\ncopy_lend_mode=baseline\nfoster_fact_producer=MutFacts::from_program(mutability_analysis+SourceVarGroups::postprocess_mut_res)\nsnapshot_role=identity-and-pointer-depth-cross-check-only\nsnapshot_producer_head={SNAPSHOT_PRODUCER_HEAD}\nsnapshot_producer_branch_head={SNAPSHOT_PRODUCER_BRANCH_HEAD}\nsnapshot_producer_branch_delta=one-test-only-commit-after-capture\nmanifest_commit={MANIFEST_COMMIT}\nraw_frozen_corpus_sha256={RAW_FROZEN_DIGEST}\nderived_substrate_sha256={DERIVED_SUBSTRATE_DIGEST}\nsubstrate=derived\nsubstrate_selector={}\nrepair=mode_a\nl2=0\nsafe_mono=per_site\nfork_engine=fork\nmutability_facts=on-direct-from-program\nz3_smt_seed=0\nz3_sat_seed=0\ncorpus_shape=read-only-symlink-to-main-checkout-derived-corpus\ncorpus_link={}\ncorpus_target={}\nsnapshot={}\ndeps_shape={}\ndeps_link={}\ndeps_target={}\ndeps_rlibs={}\ndeps_bytemuck_derive=present\nresolver_DIR={}\nresolver_CWD={}\nbase_timeout_s={}\ndeep_timeout_s={}\ncurrent_head_baseline_model_programs={}\npreserved_base_dir={}\npreserved_base_rows={}\npreserved_base_hash_manifest_sha256={}\npreserved_base_wall_source=child-t_total_s\npreserved_final_dir={}\npreserved_final_rows={}\npreserved_final_hash_manifest_sha256={}\npreserved_final_wall_source=child-t_total_s\nbrotli_recovery_mem_cap_mib={}\nbrotli_recovery_peak_rss_kb={}\nbrotli_depth_recovery_mem_cap_mib={}\nbrotli_depth_recovery_peak_rss_kb={}\nbrotli_depth_recovery_wall_s={}\nbrotli_single_file_side_effect=derived-expand-collapsed-to-about-500k-sloc\n",
         substrate_selector.as_deref().unwrap_or("default-derived"),
         corpus_link.display(),
         corpus_target.display(),
         snapshot.display(),
+        deps_shape,
         deps_link.display(),
         deps_target.display(),
         rlibs,
@@ -1812,7 +2222,7 @@ fn a5_p1_corpus() {
         resolver_cwd.display(),
         base_timeout.as_secs(),
         deep_timeout.as_secs(),
-        targeted_count,
+        current_head_baseline_model_count,
         preserved_base_dir,
         if preserved_base_dir == "none" { 0 } else { 19 },
         preserved_base_hash_manifest_sha256,
@@ -1822,7 +2232,7 @@ fn a5_p1_corpus() {
         if brotli_peak_rss_kb == "not-applicable" {
             "not-applicable"
         } else {
-            "24576"
+            "49152"
         },
         brotli_peak_rss_kb,
         if brotli_depth_peak_rss_kb == "not-applicable" {
@@ -1834,6 +2244,8 @@ fn a5_p1_corpus() {
         brotli_depth_wall_s,
     );
     fs::write(output.join("raw-counts.txt"), raw).expect("write raw P1 rows");
+    fs::write(output.join("pair-ledger.tsv"), pair_ledger)
+        .expect("write exact count-(5) pair ledger");
     fs::write(output.join("per-program.tsv"), tsv).expect("write P1 TSV");
     fs::write(output.join("report.md"), markdown).expect("write P1 markdown");
     fs::write(output.join("provenance.txt"), provenance).expect("write P1 provenance");
@@ -1858,7 +2270,83 @@ mod tests {
                 parameter,
                 depth,
             }]),
+            mutable: true,
+            mutability_default_fires: 0,
         }
+    }
+
+    fn formal_with_mutability(
+        function: &str,
+        parameter: u32,
+        mutable: bool,
+        default_fires: usize,
+    ) -> FormalDecision {
+        FormalDecision {
+            mutable,
+            mutability_default_fires: default_fires,
+            ..formal(function, parameter, 0)
+        }
+    }
+
+    #[test]
+    fn count5_mutability_join_ors_targets_and_defaults_missing_to_mutable() {
+        assert_eq!(join_formal_mutability([Some(false), Some(true)]), (true, 0));
+        assert_eq!(join_formal_mutability([Some(false), None]), (true, 1));
+        assert_eq!(
+            join_formal_mutability([Some(false), Some(false)]),
+            (false, 0)
+        );
+    }
+
+    #[test]
+    fn count5_partitions_exact_pairs_and_tracks_nonexclusive_site_incidence() {
+        let all_risky = |argument_count: usize| {
+            (0..argument_count)
+                .flat_map(|left| (left + 1..argument_count).map(move |right| (left, right)))
+                .map(|pair| (pair, PairFacts::default()))
+                .collect()
+        };
+        let input = ProgramInput {
+            name: "fixture".to_owned(),
+            call_sites: vec![
+                CallSite {
+                    id: "caller:bb0:callee".to_owned(),
+                    arguments: vec![
+                        formal_with_mutability("callee", 1, true, 0),
+                        formal_with_mutability("callee", 2, true, 0),
+                        formal_with_mutability("callee", 3, false, 1),
+                    ],
+                    pair_facts: all_risky(3),
+                },
+                CallSite {
+                    id: "caller:bb1:callee".to_owned(),
+                    arguments: vec![
+                        formal_with_mutability("callee", 1, false, 0),
+                        formal_with_mutability("callee", 2, false, 0),
+                    ],
+                    pair_facts: all_risky(2),
+                },
+            ],
+            functions: BTreeMap::new(),
+        };
+
+        let measured = measure_program(&input).expect("valid count-(5) fixture");
+
+        assert_eq!(measured.counts.sites_not_proven_disjoint, 2);
+        assert_eq!(measured.counts.pair_denominator, 4);
+        assert_eq!(measured.counts.mut_mut, 1);
+        assert_eq!(measured.counts.mut_read_only, 2);
+        assert_eq!(measured.counts.shared_shared, 1);
+        assert_eq!(measured.counts.sites_with_mut_mut, 1);
+        assert_eq!(measured.counts.sites_with_mut_read_only, 1);
+        assert_eq!(measured.counts.sites_with_shared_shared, 1);
+        assert_eq!(measured.counts.mutability_default_fires, 2);
+        assert_eq!(measured.pairs.len(), 4);
+        assert_eq!(measured.pairs[0].left_argument, 1);
+        assert_eq!(measured.pairs[0].right_argument, 2);
+        assert_eq!(measured.pairs[0].class, PairMutability::MutMut);
+        let encoded = render_pair_line(&measured.pairs[2]);
+        assert_eq!(parse_pair_line(&encoded), Ok(measured.pairs[2].clone()));
     }
 
     #[test]
@@ -1955,7 +2443,7 @@ mod tests {
             functions: BTreeMap::new(),
         };
 
-        let measured = measure_program(&program).expect("valid fixture");
+        let measured = measure_program(&program).expect("valid fixture").counts;
 
         assert_eq!(measured.sites_with_two_ref_args, 2);
         assert_eq!(measured.sites_not_proven_disjoint, 2);
@@ -1989,7 +2477,7 @@ mod tests {
             functions,
         };
 
-        let measured = measure_program(&program).expect("valid fixture");
+        let measured = measure_program(&program).expect("valid fixture").counts;
 
         assert_eq!(measured.unknown_caller_reachable, 3);
         assert_eq!(measured.local_functions, 4);
@@ -2005,6 +2493,14 @@ mod tests {
             attributed_predicted_refs_depth0: 3,
             unknown_caller_reachable: 2,
             local_functions: 6,
+            pair_denominator: 5,
+            mut_mut: 2,
+            mut_read_only: 2,
+            shared_shared: 1,
+            sites_with_mut_mut: 2,
+            sites_with_mut_read_only: 2,
+            sites_with_shared_shared: 1,
+            mutability_default_fires: 0,
         };
         let encoded = render_count_line(&counts);
 
@@ -2051,6 +2547,10 @@ mod tests {
                 attributed_predicted_refs_depth0: 1,
                 unknown_caller_reachable: 1,
                 local_functions: 2,
+                pair_denominator: 1,
+                mut_mut: 1,
+                sites_with_mut_mut: 1,
+                ..ProgramCounts::default()
             },
             ProgramCounts {
                 program: "large".to_owned(),
@@ -2060,6 +2560,12 @@ mod tests {
                 attributed_predicted_refs_depth0: 3,
                 unknown_caller_reachable: 9,
                 local_functions: 10,
+                pair_denominator: 2,
+                mut_read_only: 1,
+                shared_shared: 1,
+                sites_with_mut_read_only: 1,
+                sites_with_shared_shared: 1,
+                ..ProgramCounts::default()
             },
         ];
 
@@ -2085,42 +2591,78 @@ mod tests {
 
     #[test]
     fn p1_resume_accepts_only_complete_independent_base_rows() {
-        let stdout = concat!(
-            "noise\n",
-            "A5P1BASE program=fixture c1=7 c2=5 c3=0 c3_depth0=0 cg_num=2 cg_den=6\n",
-            "BOC1 program=fixture mode=a5-p1 status=needs-depth t_total_s=1.250\n",
+        let counts = ProgramCounts {
+            program: "fixture".to_owned(),
+            sites_with_two_ref_args: 7,
+            sites_not_proven_disjoint: 1,
+            unknown_caller_reachable: 2,
+            local_functions: 6,
+            pair_denominator: 1,
+            mut_mut: 1,
+            sites_with_mut_mut: 1,
+            ..ProgramCounts::default()
+        };
+        let stdout = format!(
+            "noise\n{}\nBOC1 program=fixture mode=a5-p1 status=needs-depth t_total_s=1.250\n",
+            render_base_line(&counts),
         );
 
-        let row = parse_completed_base("fixture", stdout, "").expect("complete base row");
+        let row = parse_completed_base("fixture", &stdout, "").expect("complete base row");
         match row {
             CompletedBase::NeedsDepth {
                 counts,
                 wall_seconds,
             } => {
                 assert_eq!(counts.program, "fixture");
-                assert_eq!(counts.sites_not_proven_disjoint, 5);
+                assert_eq!(counts.sites_not_proven_disjoint, 1);
                 assert_eq!(wall_seconds, 1.25);
             }
             CompletedBase::Final(_) => panic!("fixture needs the depth export"),
         }
 
-        assert!(parse_completed_base("fixture", stdout, "warning").is_err());
-        assert!(parse_completed_base("other", stdout, "").is_err());
+        assert!(parse_completed_base("fixture", &stdout, "warning").is_err());
+        assert!(parse_completed_base("other", &stdout, "").is_err());
         assert!(parse_completed_base("fixture", "running 1 test\n", "").is_err());
     }
 
     #[test]
     fn p1_final_resume_accepts_targeted_rows_with_nonzero_c2() {
-        let stdout = concat!(
-            "A5P1 program=fixture c1=7 c2=5 c3=2 c3_depth0=1 cg_num=2 cg_den=6\n",
-            "BOC1 program=fixture mode=a5-p1 status=ok t_total_s=2.500\n",
+        let counts = ProgramCounts {
+            program: "fixture".to_owned(),
+            sites_with_two_ref_args: 7,
+            sites_not_proven_disjoint: 1,
+            attributed_predicted_refs: 2,
+            attributed_predicted_refs_depth0: 1,
+            unknown_caller_reachable: 2,
+            local_functions: 6,
+            pair_denominator: 1,
+            mut_mut: 1,
+            sites_with_mut_mut: 1,
+            ..ProgramCounts::default()
+        };
+        let pair = PairLedgerRow {
+            program: "fixture".to_owned(),
+            site: "caller:bb0:callee".to_owned(),
+            left_argument: 1,
+            right_argument: 2,
+            class: PairMutability::MutMut,
+            left_mutable: true,
+            right_mutable: true,
+            left_default_fires: 0,
+            right_default_fires: 0,
+        };
+        let stdout = format!(
+            "{}\n{}\nBOC1 program=fixture mode=a5-p1 status=ok t_total_s=2.500\n",
+            render_pair_line(&pair),
+            render_count_line(&counts),
         );
 
-        let row = parse_completed_base("fixture", stdout, "").expect("targeted final row");
+        let row = parse_completed_base("fixture", &stdout, "").expect("targeted final row");
         match row {
             CompletedBase::Final(run) => {
-                assert_eq!(run.counts.sites_not_proven_disjoint, 5);
+                assert_eq!(run.counts.sites_not_proven_disjoint, 1);
                 assert_eq!(run.counts.attributed_predicted_refs_depth0, 1);
+                assert_eq!(run.pairs, vec![pair]);
                 assert_eq!(run.wall_seconds, 2.5);
             }
             CompletedBase::NeedsDepth { .. } => panic!("targeted row must be final"),
@@ -2176,24 +2718,25 @@ pub unsafe fn entry(p: *mut i32, q: *mut i32) { two(p, q); }
                     (
                         (path.clone(), 1),
                         ArtifactFormal {
-                            settles_ref: true,
-                            currently_predicted_ref: true,
+                            settles_ref: false,
+                            currently_predicted_ref: false,
                             ptr_depth: 1,
                         },
                     ),
                     (
                         (path, 2),
                         ArtifactFormal {
-                            settles_ref: true,
-                            currently_predicted_ref: true,
+                            settles_ref: false,
+                            currently_predicted_ref: false,
                             ptr_depth: 1,
                         },
                     ),
                 ]);
 
-                let measured =
-                    measure_tcx("fixture", tcx, &formals, &BTreeMap::new(), Duration::ZERO)
-                        .expect("measured fixture");
+                let current_refs = accepted_current_refs(tcx, &program, &formals)
+                    .expect("current-head baseline model");
+                let measured = measure_tcx("fixture", tcx, &formals, &current_refs, Duration::ZERO)
+                    .expect("measured fixture");
 
                 assert_eq!(measured.counts.sites_with_two_ref_args, 1);
                 assert_eq!(measured.counts.sites_not_proven_disjoint, 1);

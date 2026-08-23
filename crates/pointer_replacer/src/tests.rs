@@ -9929,9 +9929,12 @@ pub unsafe fn g(pp: *mut *mut i32) -> i32 {
 }
 
 mod borrow_ownership_coherence {
-    use rustc_hash::FxHashMap;
+    use rustc_hash::{FxHashMap, FxHashSet};
     use rustc_hir::{ItemKind, OwnerNode};
-    use rustc_middle::{mir::Local, ty::TyCtxt};
+    use rustc_middle::{
+        mir::{Local, Location, Operand, Rvalue, StatementKind},
+        ty::TyCtxt,
+    };
     use rustc_span::def_id::LocalDefId;
     use z3::SatResult;
 
@@ -9940,18 +9943,28 @@ mod borrow_ownership_coherence {
             borrow::{GBorrowInferCtxt, demote_pointers_iterative_with_fields},
             borrow_ownership::{
                 CrateCtxt, SlotKind,
+                borrow_engine::{
+                    borrow_conflicts_replaying_with_flows_and_copy_lends,
+                    borrow_conflicts_replaying_witnessed_with_copy_lends,
+                },
                 borrow_verify::{
                     SlotConflict, materialize_guards, model_accepts, revalidate,
-                    revalidate_replaying, verify_to_fixpoint,
+                    revalidate_replaying, verify_l2_to_fixpoint_counting, verify_to_fixpoint,
                 },
-                coherence::{add_coherence, constrain_field_ownership},
+                coherence::{
+                    CopyLendPair, add_coherence, add_coherence_with_copy_lends,
+                    constrain_field_ownership, selected_copy_lend_sites,
+                },
+                construction::{CopyLendMode, analyze_copy_lend_eligibility, construct_bo_into},
                 crate_slots::CrateSlots,
-                emit_crate_ownership_constraints,
+                emit_crate_ownership_constraints, emit_crate_ownership_constraints_with_copy_lends,
+                export::{LoanClass, location_key, with_bo_export},
                 mutability_facts::MutFacts,
                 origins::{collect_no_borrow_origin_slots, compute_origins},
-                slots::{SlotId, StructFieldSlot},
-                solver::{KindSolver, SlotRef},
+                slots::{SlotId, SlotOwner, StructFieldSlot},
+                solver::{BoOwnDatabase, KindSolver, SlotRef},
                 sources::collect_malloc_source_slots,
+                ssa::constraint::{Database, Gen, Var},
             },
         },
         utils::rustc::RustProgram,
@@ -15235,6 +15248,1157 @@ pub unsafe fn use_it(x: *mut i32) {
 }
 "#,
             |tcx| assert_borrow_parity(tcx, "use_it", &[], &["q"]),
+        );
+    }
+
+    /// A depth-zero local copy whose source is forced `Owning` has two sound readings:
+    /// the current equal `Owning/Owning` arm, or the phase-1 shared-lend
+    /// `Ref/Owning` arm. The max-Ref objective must choose the latter.
+    #[test]
+    fn copy_lend_owner_source_prefers_shared_destination() {
+        run_compiler(
+            r#"
+pub unsafe fn copy_local(p: *const i32) -> i32 {
+    let q = p;
+    let value = unsafe { *q };
+    value
+}
+"#,
+            |tcx| {
+                let program = collect_program(tcx);
+                let slots = CrateSlots::build(&program);
+                let copy_local = function_by_name(&program, "copy_local");
+                let body = tcx
+                    .mir_drops_elaborated_and_const_checked(copy_local)
+                    .borrow();
+                let solver = KindSolver::new(&slots);
+
+                let p = local_slot(
+                    &slots,
+                    copy_local,
+                    local_by_var_name(tcx, copy_local, "p"),
+                    0,
+                );
+                let q = local_slot(
+                    &slots,
+                    copy_local,
+                    local_by_var_name(tcx, copy_local, "q"),
+                    0,
+                );
+                let copy_lends = FxHashSet::from_iter([CopyLendPair::new(q, p)]);
+                add_coherence_with_copy_lends(&solver, &slots, copy_local, &body, &copy_lends);
+                solver.assume(p, SlotKind::Owning);
+
+                assert_eq!(solver.check(), SatResult::Sat);
+                let model = solver.model_kinds().expect("satisfiable model");
+                assert_eq!(model.get(&p), Some(&SlotKind::Owning));
+                assert_eq!(
+                    model.get(&q),
+                    Some(&SlotKind::Ref),
+                    "an eligible owning-source local copy must select the shared lend arm"
+                );
+            },
+        );
+    }
+
+    /// The new disjunction must not disturb the existing equal-kind reading when the source is
+    /// pinned Raw: the owner-to-reference lend arm is unavailable without `rhs.own`. Pinning Raw
+    /// makes this non-vacuous — without the equality arm, the max-Ref objective would choose q=Ref.
+    #[test]
+    fn copy_lend_nonowning_source_keeps_equal_raw() {
+        run_compiler(
+            r#"
+pub unsafe fn copy_local(p: *const i32) -> i32 {
+    let q = p;
+    let value = unsafe { *q };
+    value
+}
+"#,
+            |tcx| {
+                let program = collect_program(tcx);
+                let slots = CrateSlots::build(&program);
+                let copy_local = function_by_name(&program, "copy_local");
+                let body = tcx
+                    .mir_drops_elaborated_and_const_checked(copy_local)
+                    .borrow();
+                let solver = KindSolver::new(&slots);
+
+                let p = local_slot(
+                    &slots,
+                    copy_local,
+                    local_by_var_name(tcx, copy_local, "p"),
+                    0,
+                );
+                let q = local_slot(
+                    &slots,
+                    copy_local,
+                    local_by_var_name(tcx, copy_local, "q"),
+                    0,
+                );
+                let copy_lends = FxHashSet::from_iter([CopyLendPair::new(q, p)]);
+                add_coherence_with_copy_lends(&solver, &slots, copy_local, &body, &copy_lends);
+                solver.assume(p, SlotKind::Raw);
+
+                assert_eq!(solver.check(), SatResult::Sat);
+                let model = solver.model_kinds().expect("satisfiable model");
+                assert_eq!(model.get(&p), Some(&SlotKind::Raw));
+                assert_eq!(model.get(&q), Some(&SlotKind::Raw));
+            },
+        );
+    }
+
+    /// Lend selection is a function of the one-hot kind model, not assertion order. Repeated
+    /// solves and reversing the order in which function bodies add their copy constraints must
+    /// therefore produce the same selected destination kinds.
+    #[test]
+    fn copy_lend_choice_is_stable_across_solves_and_function_registration_order() {
+        run_compiler(
+            r#"
+pub unsafe fn copy_a(pa: *const i32) -> i32 {
+    let qa = pa;
+    let value = unsafe { *qa };
+    value
+}
+
+pub unsafe fn copy_b(pb: *const i32) -> i32 {
+    let qb = pb;
+    let value = unsafe { *qb };
+    value
+}
+"#,
+            |tcx| {
+                let program = collect_program(tcx);
+                let slots = CrateSlots::build(&program);
+                let copy_a = function_by_name(&program, "copy_a");
+                let copy_b = function_by_name(&program, "copy_b");
+                let pairs = [
+                    (
+                        local_slot(&slots, copy_a, local_by_var_name(tcx, copy_a, "pa"), 0),
+                        local_slot(&slots, copy_a, local_by_var_name(tcx, copy_a, "qa"), 0),
+                    ),
+                    (
+                        local_slot(&slots, copy_b, local_by_var_name(tcx, copy_b, "pb"), 0),
+                        local_slot(&slots, copy_b, local_by_var_name(tcx, copy_b, "qb"), 0),
+                    ),
+                ];
+
+                let solve = |order: [LocalDefId; 2]| {
+                    let solver = KindSolver::new(&slots);
+                    let copy_lends = FxHashSet::from_iter(
+                        pairs
+                            .iter()
+                            .map(|(source, destination)| CopyLendPair::new(*destination, *source)),
+                    );
+                    for did in order {
+                        let body = tcx.mir_drops_elaborated_and_const_checked(did).borrow();
+                        add_coherence_with_copy_lends(&solver, &slots, did, &body, &copy_lends);
+                    }
+                    for (source, _) in pairs {
+                        solver.assume(source, SlotKind::Owning);
+                    }
+                    assert_eq!(solver.check(), SatResult::Sat);
+                    let first = solver.model_kinds().expect("first satisfiable model");
+                    let second = solver.model_kinds().expect("repeated satisfiable model");
+                    let read = |model: &FxHashMap<SlotRef, SlotKind>| {
+                        pairs
+                            .iter()
+                            .map(|(source, destination)| {
+                                (model.get(source).copied(), model.get(destination).copied())
+                            })
+                            .collect::<Vec<_>>()
+                    };
+                    assert_eq!(read(&first), read(&second), "repeated solve drifted");
+                    read(&first)
+                };
+
+                let forward = solve([copy_a, copy_b]);
+                let reverse = solve([copy_b, copy_a]);
+                assert_eq!(
+                    forward, reverse,
+                    "function registration order changed the model"
+                );
+                assert_eq!(
+                    forward,
+                    vec![
+                        (Some(SlotKind::Owning), Some(SlotKind::Ref)),
+                        (Some(SlotKind::Owning), Some(SlotKind::Ref)),
+                    ]
+                );
+            },
+        );
+    }
+
+    /// R1 RED: once the derived lend guard is true, Copy and Move have the same ownership
+    /// consequence. The destination is non-owning and the source owns both before and after the
+    /// site; the current `push_linear`/move split must not remain active on this branch.
+    #[test]
+    fn copy_lend_guarded_ownership_keeps_source_and_forbids_destination_for_copy_and_move() {
+        run_compiler(
+            r#"
+pub unsafe fn copy_local(p: *const i32) -> i32 {
+    let q = p;
+    let value = unsafe { *q };
+    value
+}
+"#,
+            |tcx| {
+                for ensure_move in [false, true] {
+                    let program = collect_program(tcx);
+                    let slots = CrateSlots::build(&program);
+                    let copy_local = function_by_name(&program, "copy_local");
+                    let p = local_slot(
+                        &slots,
+                        copy_local,
+                        local_by_var_name(tcx, copy_local, "p"),
+                        0,
+                    );
+                    let q = local_slot(
+                        &slots,
+                        copy_local,
+                        local_by_var_name(tcx, copy_local, "q"),
+                        0,
+                    );
+                    let solver = KindSolver::new(&slots);
+                    solver.lend_or_equate(q, p);
+                    solver.assume(p, SlotKind::Owning);
+                    let lend = solver.lend_guard(q, p);
+
+                    let mut database = BoOwnDatabase::new(solver.optimize(), solver.tracker());
+                    let mut var_gen = Gen::new();
+                    let mut vars = database.new_vars(&mut var_gen, 3);
+                    let destination_def = vars.next().expect("destination def");
+                    let source_def = vars.next().expect("source def");
+                    let source_use = vars.next().expect("source use");
+                    database.push_guarded_copy(
+                        &lend,
+                        destination_def,
+                        source_def,
+                        source_use,
+                        ensure_move,
+                    );
+
+                    let destination_ast = database.own_bool(destination_def).clone();
+                    let source_def_ast = database.own_bool(source_def).clone();
+                    let source_use_ast = database.own_bool(source_use).clone();
+                    solver.link_own(q, &destination_ast);
+                    solver.link_own(p, &z3::ast::Bool::or(&[&source_use_ast, &source_def_ast]));
+                    drop(database);
+
+                    assert_eq!(solver.check(), SatResult::Sat, "ensure_move={ensure_move}");
+                    let model = solver.optimize().get_model().expect("ownership model");
+                    let owned = |ast: &z3::ast::Bool| {
+                        model
+                            .eval(ast, true)
+                            .and_then(|value| value.as_bool())
+                            .unwrap_or(false)
+                    };
+                    assert!(!owned(&destination_ast), "ensure_move={ensure_move}");
+                    assert!(owned(&source_use_ast), "ensure_move={ensure_move}");
+                    assert!(owned(&source_def_ast), "ensure_move={ensure_move}");
+                }
+            },
+        );
+    }
+
+    /// R1 MIR-plumbing RED: the ownership emitter and coherence must consume the same explicit
+    /// pair plan. The accepted model's per-version readout at the copy site pins the lend branch,
+    /// not merely the slot-global kind result.
+    #[test]
+    fn copy_lend_mir_transfer_exports_source_retention_and_nonowning_destination() {
+        run_compiler(
+            r#"
+pub unsafe fn copy_local(p: *const i32) -> i32 {
+    let q = p;
+    let value = unsafe { *q };
+    value
+}
+"#,
+            |tcx| {
+                let program = collect_program(tcx);
+                let slots = CrateSlots::build(&program);
+                let crate_ctxt = CrateCtxt::new(&program);
+                let copy_local = function_by_name(&program, "copy_local");
+                let body = tcx
+                    .mir_drops_elaborated_and_const_checked(copy_local)
+                    .borrow();
+                let p_local = local_by_var_name(tcx, copy_local, "p");
+                let q_local = local_by_var_name(tcx, copy_local, "q");
+                let p = local_slot(&slots, copy_local, p_local, 0);
+                let q = local_slot(&slots, copy_local, q_local, 0);
+                let copy_lends = FxHashSet::from_iter([CopyLendPair::new(q, p)]);
+                let solver = KindSolver::new(&slots);
+
+                let (model, export) = with_bo_export(|| {
+                    let (_stats, selectors) = emit_crate_ownership_constraints_with_copy_lends(
+                        &crate_ctxt,
+                        &slots,
+                        &compute_origins(&program),
+                        &solver,
+                        &copy_lends,
+                    )
+                    .expect("ownership emission");
+                    add_coherence_with_copy_lends(&solver, &slots, copy_local, &body, &copy_lends);
+                    solver.assume(p, SlotKind::Owning);
+                    solver.model_kinds_relaxing(&selectors)
+                });
+                let model = model.expect("lend model must be satisfiable");
+                assert_eq!(model.get(&p), Some(&SlotKind::Owning));
+                assert_eq!(model.get(&q), Some(&SlotKind::Ref));
+
+                let copy_location = body
+                    .basic_blocks
+                    .iter_enumerated()
+                    .find_map(|(block, data)| {
+                        data.statements.iter().enumerate().find_map(
+                            |(statement_index, statement)| {
+                                let StatementKind::Assign(box (lhs, Rvalue::Use(operand))) =
+                                    &statement.kind
+                                else {
+                                    return None;
+                                };
+                                let (Operand::Copy(rhs) | Operand::Move(rhs)) = operand else {
+                                    return None;
+                                };
+                                (lhs.as_local() == Some(q_local) && rhs.as_local() == Some(p_local))
+                                    .then_some(Location {
+                                        block,
+                                        statement_index,
+                                    })
+                            },
+                        )
+                    })
+                    .expect("q = p MIR copy location");
+                let copy_key = location_key(copy_location);
+                let site = |local| {
+                    export
+                        .version_sites
+                        .iter()
+                        .find(|site| {
+                            site.fn_did == copy_local
+                                && site.local == local
+                                && site.location == copy_key
+                        })
+                        .unwrap_or_else(|| panic!("missing version site for {local:?}"))
+                };
+                let q_site = site(q_local);
+                let p_site = site(p_local);
+                let owns = export.version_owns.as_ref().expect("per-version model");
+                let owned = |var: Option<Var>| var.is_some_and(|var| owns[var]);
+                assert!(!owned(q_site.def_var), "lend destination must not own");
+                assert!(owned(p_site.use_var), "lend source must own before copy");
+                assert!(owned(p_site.def_var), "lend source must retain ownership");
+            },
+        );
+    }
+
+    /// R3/R1 CopyForDeref RED at the source-only semantic seam. A rustc deref temp has no
+    /// ownership signature, so this arm must preserve the source without inventing a destination
+    /// ownership variable.
+    #[test]
+    fn copy_lend_guarded_copy_for_deref_keeps_source_ownership() {
+        run_compiler(
+            r#"
+pub unsafe fn copy_local(p: *const i32) -> i32 {
+    let q = p;
+    let value = unsafe { *q };
+    value
+}
+"#,
+            |tcx| {
+                let program = collect_program(tcx);
+                let slots = CrateSlots::build(&program);
+                let copy_local = function_by_name(&program, "copy_local");
+                let p = local_slot(
+                    &slots,
+                    copy_local,
+                    local_by_var_name(tcx, copy_local, "p"),
+                    0,
+                );
+                let q = local_slot(
+                    &slots,
+                    copy_local,
+                    local_by_var_name(tcx, copy_local, "q"),
+                    0,
+                );
+                let solver = KindSolver::new(&slots);
+                solver.lend_or_equate(q, p);
+                solver.assume(p, SlotKind::Owning);
+                let lend = solver.lend_guard(q, p);
+
+                let mut database = BoOwnDatabase::new(solver.optimize(), solver.tracker());
+                let mut var_gen = Gen::new();
+                let mut vars = database.new_vars(&mut var_gen, 2);
+                let source_def = vars.next().expect("source def");
+                let source_use = vars.next().expect("source use");
+                database.push_guarded_lend_source(&lend, source_def, source_use);
+
+                let source_def_ast = database.own_bool(source_def).clone();
+                let source_use_ast = database.own_bool(source_use).clone();
+                solver.link_own(p, &z3::ast::Bool::or(&[&source_use_ast, &source_def_ast]));
+                drop(database);
+
+                assert_eq!(solver.check(), SatResult::Sat);
+                let model = solver.optimize().get_model().expect("ownership model");
+                let owned = |ast: &z3::ast::Bool| {
+                    model
+                        .eval(ast, true)
+                        .and_then(|value| value.as_bool())
+                        .unwrap_or(false)
+                };
+                assert!(owned(&source_use_ast));
+                assert!(owned(&source_def_ast));
+            },
+        );
+    }
+
+    /// Required witness 1 RED: the selected lend must survive into the final replay as a typed
+    /// loan at the exact copy location. A syntactic copy loan without the `CopyLend` class does not
+    /// discharge R3 because later invalidation cannot apply the new semantics selectively.
+    #[test]
+    fn copy_lend_emits_replay_loan() {
+        run_compiler(
+            r#"
+pub unsafe fn copy_local(p: *const i32) -> i32 {
+    let q = p;
+    let value = unsafe { *q };
+    value
+}
+"#,
+            |tcx| {
+                let program = collect_program(tcx);
+                let slots = CrateSlots::build(&program);
+                let crate_ctxt = CrateCtxt::new(&program);
+                let origins = compute_origins(&program);
+                let copy_local = function_by_name(&program, "copy_local");
+                let body = tcx
+                    .mir_drops_elaborated_and_const_checked(copy_local)
+                    .borrow();
+                let p_local = local_by_var_name(tcx, copy_local, "p");
+                let q_local = local_by_var_name(tcx, copy_local, "q");
+                let p = local_slot(&slots, copy_local, p_local, 0);
+                let q = local_slot(&slots, copy_local, q_local, 0);
+                let copy_lends = FxHashSet::from_iter([CopyLendPair::new(q, p)]);
+                let solver = KindSolver::new(&slots);
+
+                let (model, export) = with_bo_export(|| {
+                    let (_stats, selectors) = emit_crate_ownership_constraints_with_copy_lends(
+                        &crate_ctxt,
+                        &slots,
+                        &origins,
+                        &solver,
+                        &copy_lends,
+                    )
+                    .expect("ownership emission");
+                    add_coherence_with_copy_lends(&solver, &slots, copy_local, &body, &copy_lends);
+                    solver.assume(p, SlotKind::Owning);
+                    let model = solver
+                        .model_kinds_relaxing(&selectors)
+                        .expect("lend model must be satisfiable");
+                    let selected = selected_copy_lend_sites(&program, &slots, &copy_lends, &model);
+                    let conflicts = borrow_conflicts_replaying_with_flows_and_copy_lends(
+                        &program,
+                        origins.native_flows(),
+                        |did| {
+                            let model = &model;
+                            let slots = &slots;
+                            move |local| {
+                                slots
+                                    .fn_local_slots
+                                    .get(&did)
+                                    .and_then(|universe| universe.slot_for_local_depth(local, 0))
+                                    .map(|slot| SlotRef::Local(did, slot))
+                                    .is_some_and(|slot| model.get(&slot) == Some(&SlotKind::Ref))
+                            }
+                        },
+                        |did| {
+                            let model = &model;
+                            let slots = &slots;
+                            move |local| {
+                                slots
+                                    .fn_local_slots
+                                    .get(&did)
+                                    .and_then(|universe| universe.slot_for_local_depth(local, 0))
+                                    .map(|slot| SlotRef::Local(did, slot))
+                                    .is_some_and(|slot| model.get(&slot) != Some(&SlotKind::Ref))
+                            }
+                        },
+                        |_| |_| false,
+                        &[],
+                        &selected,
+                    );
+                    assert!(
+                        conflicts.values().all(Vec::is_empty),
+                        "conflict-free copy fixture must remain clean: {conflicts:?}"
+                    );
+                    model
+                });
+                assert_eq!(model.get(&p), Some(&SlotKind::Owning));
+                assert_eq!(model.get(&q), Some(&SlotKind::Ref));
+                let typed = export
+                    .loans
+                    .iter()
+                    .filter(|loan| loan.class == LoanClass::CopyLend)
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    typed.len(),
+                    1,
+                    "CopyLend registration must identify one exact loan, not every companion at its location: {:?}",
+                    export.loans
+                );
+                let typed = typed[0];
+                assert_eq!(typed.key.fn_did, copy_local);
+                assert_eq!(typed.key.place.local, p_local);
+                assert_eq!(
+                    typed.key.borrower,
+                    crate::analyses::borrow_ownership::export::BorrowerKind::Assign {
+                        owner: crate::analyses::borrow_ownership::export::OwnerKey::Local(
+                            q_local.as_u32(),
+                        ),
+                    }
+                );
+            },
+        );
+    }
+
+    /// Required witness 2 RED: CopyLend is shared, so a write through the retained owner while
+    /// the destination loan is live must invalidate it even though Foster marks the destination
+    /// read-only. The witnessed edge must name the source local as the invalidator.
+    #[test]
+    fn copy_lend_source_write_conflicts() {
+        run_compiler(
+            r#"
+pub unsafe fn copy_local(p: *mut i32) -> i32 {
+    let q = p;
+    unsafe { *p = 7 };
+    let value = unsafe { *q };
+    value
+}
+"#,
+            |tcx| {
+                let program = collect_program(tcx);
+                let slots = CrateSlots::build(&program);
+                let crate_ctxt = CrateCtxt::new(&program);
+                let origins = compute_origins(&program);
+                let copy_local = function_by_name(&program, "copy_local");
+                let body = tcx
+                    .mir_drops_elaborated_and_const_checked(copy_local)
+                    .borrow();
+                let p_local = local_by_var_name(tcx, copy_local, "p");
+                let q_local = local_by_var_name(tcx, copy_local, "q");
+                let p = local_slot(&slots, copy_local, p_local, 0);
+                let q = local_slot(&slots, copy_local, q_local, 0);
+                let copy_lends = FxHashSet::from_iter([CopyLendPair::new(q, p)]);
+                let solver = KindSolver::new(&slots);
+
+                let (_stats, selectors) = emit_crate_ownership_constraints_with_copy_lends(
+                    &crate_ctxt,
+                    &slots,
+                    &origins,
+                    &solver,
+                    &copy_lends,
+                )
+                .expect("ownership emission");
+                add_coherence_with_copy_lends(&solver, &slots, copy_local, &body, &copy_lends);
+                solver.assume(p, SlotKind::Owning);
+                let model = solver
+                    .model_kinds_relaxing(&selectors)
+                    .expect("lend model must be satisfiable");
+                let selected = selected_copy_lend_sites(&program, &slots, &copy_lends, &model);
+                let is_ref = |did| {
+                    let model = &model;
+                    let slots = &slots;
+                    move |local| {
+                        slots
+                            .fn_local_slots
+                            .get(&did)
+                            .and_then(|universe| universe.slot_for_local_depth(local, 0))
+                            .map(|slot| SlotRef::Local(did, slot))
+                            .is_some_and(|slot| model.get(&slot) == Some(&SlotKind::Ref))
+                    }
+                };
+                let is_raw = |did| {
+                    let model = &model;
+                    let slots = &slots;
+                    move |local| {
+                        slots
+                            .fn_local_slots
+                            .get(&did)
+                            .and_then(|universe| universe.slot_for_local_depth(local, 0))
+                            .map(|slot| SlotRef::Local(did, slot))
+                            .is_some_and(|slot| model.get(&slot) != Some(&SlotKind::Ref))
+                    }
+                };
+                let witnessed = borrow_conflicts_replaying_witnessed_with_copy_lends(
+                    &program,
+                    origins.native_flows(),
+                    is_ref,
+                    is_raw,
+                    |_| |_| false,
+                    &[],
+                    &selected,
+                );
+                let edges = witnessed
+                    .get(&copy_local)
+                    .expect("source write must produce a witnessed conflict");
+                assert!(
+                    edges
+                        .iter()
+                        .any(|edge| edge.invalidators.contains(&p_local)),
+                    "source local was not recorded as invalidator: {edges:?}"
+                );
+            },
+        );
+    }
+
+    /// Required witness 3 RED: the triptych's raw seam. A direct foreign-C `free(owner)` while
+    /// the shared CopyLend remains live until a later alias use must be reported by the oracle.
+    #[test]
+    fn copy_lend_triptych_free_then_use_conflicts() {
+        run_compiler(
+            r#"
+unsafe extern "C" {
+    fn free(p: *mut i32);
+}
+
+pub unsafe fn copy_local(p: *mut i32) -> i32 {
+    let q = p;
+    unsafe { free(p) };
+    let value = unsafe { *q };
+    value
+}
+"#,
+            |tcx| {
+                let program = collect_program(tcx);
+                let slots = CrateSlots::build(&program);
+                let crate_ctxt = CrateCtxt::new(&program);
+                let origins = compute_origins(&program);
+                let copy_local = function_by_name(&program, "copy_local");
+                let body = tcx
+                    .mir_drops_elaborated_and_const_checked(copy_local)
+                    .borrow();
+                let p_local = local_by_var_name(tcx, copy_local, "p");
+                let q_local = local_by_var_name(tcx, copy_local, "q");
+                let p = local_slot(&slots, copy_local, p_local, 0);
+                let q = local_slot(&slots, copy_local, q_local, 0);
+                let copy_lends = FxHashSet::from_iter([CopyLendPair::new(q, p)]);
+                let solver = KindSolver::new(&slots);
+
+                let (_stats, selectors) = emit_crate_ownership_constraints_with_copy_lends(
+                    &crate_ctxt,
+                    &slots,
+                    &origins,
+                    &solver,
+                    &copy_lends,
+                )
+                .expect("ownership emission");
+                add_coherence_with_copy_lends(&solver, &slots, copy_local, &body, &copy_lends);
+                solver.assume(p, SlotKind::Owning);
+                let model = solver
+                    .model_kinds_relaxing(&selectors)
+                    .expect("lend model must be satisfiable");
+                let selected = selected_copy_lend_sites(&program, &slots, &copy_lends, &model);
+                let is_ref = |did| {
+                    let model = &model;
+                    let slots = &slots;
+                    move |local| {
+                        slots
+                            .fn_local_slots
+                            .get(&did)
+                            .and_then(|universe| universe.slot_for_local_depth(local, 0))
+                            .map(|slot| SlotRef::Local(did, slot))
+                            .is_some_and(|slot| model.get(&slot) == Some(&SlotKind::Ref))
+                    }
+                };
+                let is_raw = |did| {
+                    let model = &model;
+                    let slots = &slots;
+                    move |local| {
+                        slots
+                            .fn_local_slots
+                            .get(&did)
+                            .and_then(|universe| universe.slot_for_local_depth(local, 0))
+                            .map(|slot| SlotRef::Local(did, slot))
+                            .is_some_and(|slot| model.get(&slot) != Some(&SlotKind::Ref))
+                    }
+                };
+                let witnessed = borrow_conflicts_replaying_witnessed_with_copy_lends(
+                    &program,
+                    origins.native_flows(),
+                    is_ref,
+                    is_raw,
+                    |_| |_| false,
+                    &[],
+                    &selected,
+                );
+                let edges = witnessed
+                    .get(&copy_local)
+                    .expect("free-before-use must produce a witnessed conflict");
+                assert!(
+                    edges
+                        .iter()
+                        .any(|edge| edge.invalidators.contains(&p_local)),
+                    "free argument was not recorded as invalidator: {edges:?}"
+                );
+            },
+        );
+    }
+
+    /// Targeted temporal-rule control: `free` must not acquire queue A1's global behaviour.
+    /// With no selected CopyLend sites, the syntactic shared copy loan remains an existing loan
+    /// class and the same foreign-C free call does not invalidate it.
+    #[test]
+    fn copy_lend_free_does_not_invalidate_unrelated_existing_loans() {
+        run_compiler(
+            r#"
+unsafe extern "C" {
+    fn free(p: *mut i32);
+}
+
+pub unsafe fn copy_local(p: *mut i32) -> i32 {
+    let q = p;
+    unsafe { free(p) };
+    let value = unsafe { *q };
+    value
+}
+"#,
+            |tcx| {
+                let program = collect_program(tcx);
+                let origins = compute_origins(&program);
+                let selected = Default::default();
+                let witnessed = borrow_conflicts_replaying_witnessed_with_copy_lends(
+                    &program,
+                    origins.native_flows(),
+                    |_| |_| true,
+                    |_| |_| false,
+                    |_| |_| false,
+                    &[],
+                    &selected,
+                );
+                assert!(
+                    witnessed.values().all(Vec::is_empty),
+                    "an untyped existing loan changed at free: {witnessed:?}"
+                );
+            },
+        );
+    }
+
+    /// Required witness 4: a non-conflicting copy recovers the allocation owner. The alias's last
+    /// use precedes `free(p)`, so the typed loan is dead at deallocation and the oracle accepts
+    /// `p=Owning, q=Ref`.
+    #[test]
+    fn copy_lend_recovers_owner_and_accepts() {
+        run_compiler(
+            r#"
+unsafe extern "C" {
+    fn malloc(size: usize) -> *mut core::ffi::c_void;
+    fn free(p: *mut core::ffi::c_void);
+}
+
+pub unsafe fn copy_local() -> i32 {
+    let p = unsafe { malloc(core::mem::size_of::<i32>()) } as *mut i32;
+    let q = p;
+    let value = unsafe { *q };
+    unsafe { free(p as *mut core::ffi::c_void) };
+    value
+}
+"#,
+            |tcx| {
+                let program = collect_program(tcx);
+                let slots = CrateSlots::build(&program);
+                let crate_ctxt = CrateCtxt::new(&program);
+                let origins = compute_origins(&program);
+                let copy_local = function_by_name(&program, "copy_local");
+                let body = tcx
+                    .mir_drops_elaborated_and_const_checked(copy_local)
+                    .borrow();
+                let p_local = local_by_var_name(tcx, copy_local, "p");
+                let q_local = local_by_var_name(tcx, copy_local, "q");
+                let p = local_slot(&slots, copy_local, p_local, 0);
+                let q = local_slot(&slots, copy_local, q_local, 0);
+                let copy_lends = FxHashSet::from_iter([CopyLendPair::new(q, p)]);
+                let solver = KindSolver::new(&slots);
+
+                let (_stats, selectors) = emit_crate_ownership_constraints_with_copy_lends(
+                    &crate_ctxt,
+                    &slots,
+                    &origins,
+                    &solver,
+                    &copy_lends,
+                )
+                .expect("ownership emission");
+                add_coherence_with_copy_lends(&solver, &slots, copy_local, &body, &copy_lends);
+                let model = solver
+                    .model_kinds_relaxing(&selectors)
+                    .expect("owner-recovery model must be satisfiable");
+                assert_eq!(model.get(&p), Some(&SlotKind::Owning));
+                assert_eq!(model.get(&q), Some(&SlotKind::Ref));
+
+                let selected = selected_copy_lend_sites(&program, &slots, &copy_lends, &model);
+                let is_ref = |did| {
+                    let model = &model;
+                    let slots = &slots;
+                    move |local| {
+                        slots
+                            .fn_local_slots
+                            .get(&did)
+                            .and_then(|universe| universe.slot_for_local_depth(local, 0))
+                            .map(|slot| SlotRef::Local(did, slot))
+                            .is_some_and(|slot| model.get(&slot) == Some(&SlotKind::Ref))
+                    }
+                };
+                let is_raw = |did| {
+                    let model = &model;
+                    let slots = &slots;
+                    move |local| {
+                        slots
+                            .fn_local_slots
+                            .get(&did)
+                            .and_then(|universe| universe.slot_for_local_depth(local, 0))
+                            .map(|slot| SlotRef::Local(did, slot))
+                            .is_some_and(|slot| model.get(&slot) != Some(&SlotKind::Ref))
+                    }
+                };
+                let conflicts = borrow_conflicts_replaying_with_flows_and_copy_lends(
+                    &program,
+                    origins.native_flows(),
+                    is_ref,
+                    is_raw,
+                    |_| |_| false,
+                    &[],
+                    &selected,
+                );
+                assert!(
+                    conflicts.values().all(Vec::is_empty),
+                    "dead-before-free CopyLend must be accepted: {conflicts:?}"
+                );
+            },
+        );
+    }
+
+    /// Phase-1b gate fact retained after ruling §7a: Foster's written-through semantics leave a
+    /// freed destination read-only. Eligibility must reject this shape through the unconditional
+    /// S2-2-mirror rule rather than changing Foster.
+    #[test]
+    fn copy_lend_phase1b_fact_free_destination_remains_foster_readonly() {
+        run_compiler(
+            r#"
+unsafe extern "C" {
+    fn free(p: *mut i32);
+}
+
+pub unsafe fn free_destination(p: *mut i32) {
+    let q = p;
+    unsafe { free(q) };
+}
+"#,
+            |tcx| {
+                let program = collect_program(tcx);
+                let function = function_by_name(&program, "free_destination");
+                let q = local_by_var_name(tcx, function, "q");
+                let facts = MutFacts::from_program(&program);
+                assert!(
+                    !facts.is_mutable(function, q),
+                    "ruling §7a fact drift: Foster unexpectedly classified free(q) mutable"
+                );
+            },
+        );
+    }
+
+    /// Phase-1b gate fact retained after ruling §7b. Fresh allocation has no modeled borrow origin,
+    /// so incoming `unknown_targets` contains the allocator-backed pair's genealogy. Eligibility
+    /// consumes outward-live boundary events instead of this incoming membership.
+    #[test]
+    fn copy_lend_phase1b_fact_allocator_pair_has_incoming_unknown_genealogy() {
+        run_compiler(
+            r#"
+unsafe extern "C" {
+    fn malloc(size: usize) -> *mut core::ffi::c_void;
+    fn free(p: *mut core::ffi::c_void);
+}
+
+pub unsafe fn copy_local() -> i32 {
+    let p = unsafe { malloc(core::mem::size_of::<i32>()) } as *mut i32;
+    let q = p;
+    let value = unsafe { *q };
+    unsafe { free(p as *mut core::ffi::c_void) };
+    value
+}
+"#,
+            |tcx| {
+                let program = collect_program(tcx);
+                let function = function_by_name(&program, "copy_local");
+                let p = local_by_var_name(tcx, function, "p");
+                let q = local_by_var_name(tcx, function, "q");
+                let origins = compute_origins(&program);
+                let unknown = origins.native_flows()[&function]
+                    .body
+                    .unknown_owner_depths();
+                for local in [p, q] {
+                    assert!(
+                        unknown.contains(&(SlotOwner::Local(local), 0)),
+                        "ruling §7b genealogy fact drift: {local:?}@d0 absent; facts={unknown:?}"
+                    );
+                }
+            },
+        );
+    }
+
+    #[test]
+    fn copy_lend_phase1b_eligibility_malloc_without_outward_event_is_eligible() {
+        run_compiler(
+            r#"
+unsafe extern "C" {
+    fn malloc(size: usize) -> *mut core::ffi::c_void;
+    fn free(p: *mut core::ffi::c_void);
+}
+pub unsafe fn f() -> i32 {
+    let p = unsafe { malloc(4) } as *mut i32;
+    let q = p;
+    let value = unsafe { *q };
+    unsafe { free(p as *mut core::ffi::c_void) };
+    value
+}
+"#,
+            |tcx| {
+                let program = collect_program(tcx);
+                let slots = CrateSlots::build(&program);
+                let origins = compute_origins(&program);
+                let facts = MutFacts::from_program(&program);
+                let function = function_by_name(&program, "f");
+                let p = local_slot(&slots, function, local_by_var_name(tcx, function, "p"), 0);
+                let q = local_slot(&slots, function, local_by_var_name(tcx, function, "q"), 0);
+                let eligibility =
+                    analyze_copy_lend_eligibility(&program, &slots, &facts, origins.native_flows());
+                assert!(eligibility.pairs.contains(&CopyLendPair::new(q, p)));
+            },
+        );
+    }
+
+    #[test]
+    fn copy_lend_phase1b_eligibility_live_outward_foreign_call_is_ineligible() {
+        run_compiler(
+            r#"
+unsafe extern "C" {
+    fn malloc(size: usize) -> *mut core::ffi::c_void;
+    fn free(p: *mut core::ffi::c_void);
+    fn opaque(p: *mut i32);
+}
+pub unsafe fn f() -> i32 {
+    let p = unsafe { malloc(4) } as *mut i32;
+    let q = p;
+    unsafe { opaque(q) };
+    let value = unsafe { *q };
+    unsafe { free(p as *mut core::ffi::c_void) };
+    value
+}
+"#,
+            |tcx| {
+                let program = collect_program(tcx);
+                let slots = CrateSlots::build(&program);
+                let origins = compute_origins(&program);
+                let facts = MutFacts::from_program(&program);
+                let function = function_by_name(&program, "f");
+                let p = local_slot(&slots, function, local_by_var_name(tcx, function, "p"), 0);
+                let q = local_slot(&slots, function, local_by_var_name(tcx, function, "q"), 0);
+                let eligibility =
+                    analyze_copy_lend_eligibility(&program, &slots, &facts, origins.native_flows());
+                assert!(!eligibility.pairs.contains(&CopyLendPair::new(q, p)));
+            },
+        );
+    }
+
+    #[test]
+    fn copy_lend_phase1b_eligibility_free_destination_is_unconditionally_ineligible() {
+        run_compiler(
+            r#"
+unsafe extern "C" { fn free(p: *mut i32); }
+pub unsafe fn f(p: *mut i32) {
+    let q = p;
+    unsafe { free(q) };
+}
+"#,
+            |tcx| {
+                let program = collect_program(tcx);
+                let slots = CrateSlots::build(&program);
+                let origins = compute_origins(&program);
+                let facts = MutFacts::from_program(&program);
+                let function = function_by_name(&program, "f");
+                let p = local_slot(&slots, function, local_by_var_name(tcx, function, "p"), 0);
+                let q = local_slot(&slots, function, local_by_var_name(tcx, function, "q"), 0);
+                let eligibility =
+                    analyze_copy_lend_eligibility(&program, &slots, &facts, origins.native_flows());
+                assert!(!eligibility.pairs.contains(&CopyLendPair::new(q, p)));
+            },
+        );
+    }
+
+    /// The production helper must consume exactly the same C2/C3 verdicts as the fixture-scale
+    /// producer. This is a differential, not a duplicated predicate: the expected matrix pins the
+    /// plain/free(source), outward-call, free(destination), and mutable-destination controls.
+    #[test]
+    fn copy_lend_phase1b_production_eligibility_matches_fixture_matrix() {
+        run_compiler(
+            r#"
+unsafe extern "C" {
+    fn malloc(size: usize) -> *mut core::ffi::c_void;
+    fn free(p: *mut core::ffi::c_void);
+    fn realloc(p: *mut core::ffi::c_void, size: usize) -> *mut core::ffi::c_void;
+    fn opaque(p: *const i32);
+}
+unsafe fn local_sink(p: *const i32) { let _ = unsafe { *p }; }
+struct Holder { ptr: *const i32 }
+pub unsafe fn plain() -> i32 {
+    let p = unsafe { malloc(4) } as *const i32;
+    let q = p;
+    unsafe { *q }
+}
+pub unsafe fn outward() -> i32 {
+    let p = unsafe { malloc(4) } as *const i32;
+    let q = p;
+    unsafe { opaque(q) };
+    unsafe { *q }
+}
+pub unsafe fn ordinary_call() -> i32 {
+    let p = unsafe { malloc(4) } as *const i32;
+    let q = p;
+    unsafe { local_sink(q) };
+    unsafe { *q }
+}
+pub unsafe fn field_escape() -> i32 {
+    let p = unsafe { malloc(4) } as *const i32;
+    let q = p;
+    let mut holder = Holder { ptr: core::ptr::null() };
+    holder.ptr = q;
+    unsafe { *holder.ptr }
+}
+pub unsafe fn return_escape() -> *const i32 {
+    let p = unsafe { malloc(4) } as *const i32;
+    let q = p;
+    q
+}
+pub unsafe fn realloc_source() -> i32 {
+    let p = unsafe { malloc(4) } as *const i32;
+    let q = p;
+    let _new = unsafe { realloc(p as *mut core::ffi::c_void, 8) };
+    unsafe { *q }
+}
+pub unsafe fn free_destination() {
+    let p = unsafe { malloc(4) } as *mut i32;
+    let q = p;
+    unsafe { free(q as *mut core::ffi::c_void) };
+}
+pub unsafe fn mutable_destination() -> i32 {
+    let p = unsafe { malloc(4) } as *mut i32;
+    let q = p;
+    unsafe { *q = 1 };
+    unsafe { *q }
+}
+pub unsafe fn free_source() -> i32 {
+    let p = unsafe { malloc(4) } as *const i32;
+    let q = p;
+    let value = unsafe { *q };
+    unsafe { free(p as *mut core::ffi::c_void) };
+    value
+}
+"#,
+            |tcx| {
+                let program = collect_program(tcx);
+                let slots = CrateSlots::build(&program);
+                let origins = compute_origins(&program);
+                let facts = MutFacts::from_program(&program);
+                let fixture =
+                    analyze_copy_lend_eligibility(&program, &slots, &facts, origins.native_flows());
+                let solver = KindSolver::new(&slots);
+                let production = construct_bo_into(
+                    &program,
+                    &slots,
+                    &origins,
+                    &facts,
+                    &solver,
+                    CopyLendMode::LendArm,
+                )
+                .expect("production construction");
+                assert_eq!(production.eligibility, fixture);
+
+                for (name, expected) in [
+                    ("plain", true),
+                    ("outward", false),
+                    ("ordinary_call", false),
+                    ("field_escape", false),
+                    ("return_escape", false),
+                    ("realloc_source", false),
+                    ("free_destination", false),
+                    ("mutable_destination", false),
+                    ("free_source", true),
+                ] {
+                    let function = function_by_name(&program, name);
+                    let p = local_slot(&slots, function, local_by_var_name(tcx, function, "p"), 0);
+                    let q_local = local_by_var_name(tcx, function, "q");
+                    let q = local_slot(&slots, function, q_local, 0);
+                    if name == "ordinary_call" {
+                        assert!(
+                            !facts.is_mutable(function, q_local),
+                            "ordinary-call control must isolate C3 from the C2 gate"
+                        );
+                    }
+                    assert_eq!(
+                        fixture.pairs.contains(&CopyLendPair::new(q, p)),
+                        expected,
+                        "eligibility matrix drift for {name}"
+                    );
+                }
+            },
+        );
+    }
+
+    #[test]
+    fn copy_lend_phase1b_l2_replay_receives_selected_loans() {
+        run_compiler(
+            r#"
+unsafe extern "C" {
+    fn malloc(size: usize) -> *mut core::ffi::c_void;
+    fn free(p: *mut core::ffi::c_void);
+}
+pub unsafe fn f() -> i32 {
+    let p = unsafe { malloc(4) } as *mut i32;
+    let q = p;
+    let value = unsafe { *q };
+    unsafe { free(p as *mut core::ffi::c_void) };
+    value
+}
+"#,
+            |tcx| {
+                let program = collect_program(tcx);
+                let slots = CrateSlots::build(&program);
+                let origins = compute_origins(&program);
+                let facts = MutFacts::from_program(&program);
+                let solver = KindSolver::new(&slots);
+                let construction = construct_bo_into(
+                    &program,
+                    &slots,
+                    &origins,
+                    &facts,
+                    &solver,
+                    CopyLendMode::LendArm,
+                )
+                .expect("lend construction");
+                let (model, stats) = verify_l2_to_fixpoint_counting(
+                    &program,
+                    &slots,
+                    origins.native_flows(),
+                    &solver,
+                    &construction.selectors,
+                    &facts,
+                    Some(&construction.eligibility.pairs),
+                );
+                assert_eq!(stats.copy_lend_replay_selections, 1);
+                let model = model.expect("L2 must accept the dead-before-free CopyLend");
+                let function = function_by_name(&program, "f");
+                let p = local_slot(&slots, function, local_by_var_name(tcx, function, "p"), 0);
+                let q = local_slot(&slots, function, local_by_var_name(tcx, function, "q"), 0);
+                assert_eq!(model.get(&p), Some(&SlotKind::Owning));
+                assert_eq!(model.get(&q), Some(&SlotKind::Ref));
+            },
         );
     }
 

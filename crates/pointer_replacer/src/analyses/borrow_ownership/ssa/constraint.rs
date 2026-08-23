@@ -273,6 +273,28 @@ pub trait Database {
         self.push_linear_impl(x, y, z);
         Infer::store_linear(store, x, y, z);
     }
+
+    /// A12's symbolic Copy/Move branch. Only BO's shared Optimize backend receives a lend guard;
+    /// the unit/no-op databases retain their existing unguarded paths and must never call this.
+    fn push_guarded_copy(
+        &mut self,
+        _lend: &z3::ast::Bool,
+        _destination_def: Var,
+        _source_def: Var,
+        _source_use: Var,
+        _ensure_move: bool,
+    ) {
+        panic!("guarded copy constraints require the BO Optimize database")
+    }
+
+    fn push_guarded_lend_source(
+        &mut self,
+        _lend: &z3::ast::Bool,
+        _source_def: Var,
+        _source_use: Var,
+    ) {
+        panic!("guarded CopyForDeref constraints require the BO Optimize database")
+    }
     fn push_assume_impl(&mut self, x: Var, sign: bool);
     fn push_assume<Infer: Mode>(&mut self, store: Infer::Store<'_>, x: Var, sign: bool) {
         self.push_assume_impl(x, sign);

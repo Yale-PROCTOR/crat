@@ -91,6 +91,6 @@ where
         arg.def = arg.def.start..arg.def.start + 1u32;
         let arg = arg;
 
-        <Analysis as InferMode>::transfer::<false>(self, ty, destination, arg)
+        <Analysis as InferMode>::transfer::<false>(self, ty, destination, arg, None)
     }
 }

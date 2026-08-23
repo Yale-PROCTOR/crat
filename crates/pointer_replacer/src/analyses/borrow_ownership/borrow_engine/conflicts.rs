@@ -21,7 +21,9 @@ use crate::{
             BorrowInferenceResults, Borrower, ConflictEdge, GBorrowInferCtxt, Loan, Provenance,
             ProvenanceOwner, ProvenanceSet, StructFieldSlot, collect_invalid_loan_demotions,
         },
-        borrow_ownership::origin_flow::OriginFlowResults,
+        borrow_ownership::{
+            coherence::SelectedCopyLendLoans, export::LoanClass, origin_flow::OriginFlowResults,
+        },
     },
     utils::rustc::RustProgram,
 };
@@ -46,15 +48,17 @@ fn overwrite_with_engine_facts<'tcx>(
     f: LocalDefId,
     ctxt: &GBorrowInferCtxt,
     inference: &mut BorrowInferenceResults<'tcx>,
+    copy_lends: &DenseBitSet<Loan>,
 ) {
     let body = &*tcx.mir_drops_elaborated_and_const_checked(f).borrow();
     let provenance_set = ctxt.provenances.get(&f).unwrap();
-    inference.invalidates = super::invalidates::compute_invalidates(
+    inference.invalidates = super::invalidates::compute_invalidates_with_copy_lends(
         tcx,
         body,
         &inference.borrow_set,
         provenance_set,
         &inference.location_map,
+        copy_lends,
     );
     inference.errors = super::errors::compute_errors(
         &inference.borrow_set,
@@ -71,16 +75,19 @@ fn overwrite_with_engine_facts_capturing<'tcx>(
     f: LocalDefId,
     ctxt: &GBorrowInferCtxt,
     inference: &mut BorrowInferenceResults<'tcx>,
+    copy_lends: &DenseBitSet<Loan>,
 ) -> Vec<super::invalidates::InvalidationAccess> {
     let body = &*tcx.mir_drops_elaborated_and_const_checked(f).borrow();
     let provenance_set = ctxt.provenances.get(&f).unwrap();
-    let (invalidates, mut accesses) = super::invalidates::compute_invalidates_capturing(
-        tcx,
-        body,
-        &inference.borrow_set,
-        provenance_set,
-        &inference.location_map,
-    );
+    let (invalidates, mut accesses) =
+        super::invalidates::compute_invalidates_capturing_with_copy_lends(
+            tcx,
+            body,
+            &inference.borrow_set,
+            provenance_set,
+            &inference.location_map,
+            copy_lends,
+        );
     inference.invalidates = invalidates;
     inference.errors = super::errors::compute_errors(
         &inference.borrow_set,
@@ -128,6 +135,7 @@ fn record_loan_identities(
     inference: &BorrowInferenceResults<'_>,
     provenance_set: &ProvenanceSet,
     invalid_loans: &DenseBitSet<Loan>,
+    copy_lends: &DenseBitSet<Loan>,
 ) {
     use crate::analyses::borrow_ownership::export;
     if !export::capturing() {
@@ -155,6 +163,11 @@ fn record_loan_identities(
             },
             run_local_handle: loan.index(),
             kind: export::LoanKind::from_provenance_mutability(mutable),
+            class: if copy_lends.contains(loan) {
+                LoanClass::CopyLend
+            } else {
+                LoanClass::Existing
+            },
             invalid: invalid_loans.contains(loan),
         });
     }
@@ -270,10 +283,17 @@ where
     L: Fn(Local) -> bool,
 {
     let ctxt = NativeBorrowContext::new(program, flows, is_candidate, is_mutable);
+    let no_copy_lends = FxHashSet::default();
     let mut out = FxHashMap::default();
     for f in program.functions.iter().copied() {
-        let mut inference = ctxt.infer(program.tcx, f, &[]);
-        overwrite_with_engine_facts(program.tcx, f, &ctxt.borrow, &mut inference);
+        let mut inference = ctxt.infer(program.tcx, f, &[], &no_copy_lends);
+        overwrite_with_engine_facts(
+            program.tcx,
+            f,
+            &ctxt.borrow,
+            &mut inference.facts,
+            &inference.copy_lends,
+        );
         let invalid_loans = invalid_loan_set(&inference);
         if invalid_loans.is_empty() {
             continue;
@@ -305,7 +325,8 @@ where
     let mut out = FxHashMap::default();
     for f in program.functions.iter().copied() {
         let mut inference = borrow_inference(program.tcx, f, &ctxt);
-        overwrite_with_engine_facts(program.tcx, f, &ctxt, &mut inference);
+        let copy_lends = DenseBitSet::new_empty(inference.borrow_set.loans.len());
+        overwrite_with_engine_facts(program.tcx, f, &ctxt, &mut inference, &copy_lends);
         let invalid_loans = invalid_loan_set(&inference);
         if invalid_loans.is_empty() {
             continue;
@@ -360,6 +381,29 @@ where
     K: Fn(LocalDefId) -> L,
     L: Fn(Local) -> bool,
 {
+    let selected = SelectedCopyLendLoans::default();
+    borrow_conflicts_replaying_with_flows_and_copy_lends(
+        program, flows, is_ref, is_raw, is_mutable, raw_fields, &selected,
+    )
+}
+
+pub(crate) fn borrow_conflicts_replaying_with_flows_and_copy_lends<I, J, M, N, K, L>(
+    program: &RustProgram,
+    flows: &OriginFlowResults,
+    is_ref: I,
+    is_raw: M,
+    is_mutable: K,
+    raw_fields: &[StructFieldSlot],
+    selected_copy_lends: &SelectedCopyLendLoans,
+) -> FxHashMap<LocalDefId, Vec<ConflictEdge>>
+where
+    I: Fn(LocalDefId) -> J,
+    J: Fn(Local) -> bool,
+    M: Fn(LocalDefId) -> N,
+    N: Fn(Local) -> bool,
+    K: Fn(LocalDefId) -> L,
+    L: Fn(Local) -> bool,
+{
     let is_candidate = |did: LocalDefId| {
         let ref_f = is_ref(did);
         let raw_f = is_raw(did);
@@ -382,12 +426,20 @@ where
     }
 
     let mut out = FxHashMap::default();
+    let no_copy_lends = FxHashSet::default();
     for f in program.functions.iter().copied() {
         let is_raw_f = is_raw(f);
+        let copy_lends = selected_copy_lends.get(&f).unwrap_or(&no_copy_lends);
 
         let edges = loop {
-            let mut inference = ctxt.infer(program.tcx, f, raw_fields);
-            overwrite_with_engine_facts(program.tcx, f, &ctxt.borrow, &mut inference);
+            let mut inference = ctxt.infer(program.tcx, f, raw_fields, copy_lends);
+            overwrite_with_engine_facts(
+                program.tcx,
+                f,
+                &ctxt.borrow,
+                &mut inference.facts,
+                &inference.copy_lends,
+            );
             let invalid_loans = invalid_loan_set(&inference);
             if invalid_loans.is_empty() {
                 // E-R4: a conflict-free function is exactly the case where every
@@ -399,6 +451,7 @@ where
                     &inference,
                     ctxt.borrow.provenances.get(&f).unwrap(),
                     &invalid_loans,
+                    &inference.copy_lends,
                 );
                 break Vec::new();
             }
@@ -421,7 +474,13 @@ where
                 // E-R4: record from the FINAL inference — the loop above may
                 // replay demotions, so earlier iterations are not the accepted
                 // borrow set.
-                record_loan_identities(f, &inference, provenance_set, &invalid_loans);
+                record_loan_identities(
+                    f,
+                    &inference,
+                    provenance_set,
+                    &invalid_loans,
+                    &inference.copy_lends,
+                );
                 break extract_conflict_edges(&inference, provenance_set, &invalid_loans);
             }
 
@@ -485,6 +544,29 @@ where
     K: Fn(LocalDefId) -> L,
     L: Fn(Local) -> bool,
 {
+    let selected = SelectedCopyLendLoans::default();
+    borrow_conflicts_replaying_witnessed_with_copy_lends(
+        program, flows, is_ref, is_raw, is_mutable, raw_fields, &selected,
+    )
+}
+
+pub(crate) fn borrow_conflicts_replaying_witnessed_with_copy_lends<I, J, M, N, K, L>(
+    program: &RustProgram,
+    flows: &OriginFlowResults,
+    is_ref: I,
+    is_raw: M,
+    is_mutable: K,
+    raw_fields: &[StructFieldSlot],
+    selected_copy_lends: &SelectedCopyLendLoans,
+) -> FxHashMap<LocalDefId, Vec<WitnessedConflictEdge>>
+where
+    I: Fn(LocalDefId) -> J,
+    J: Fn(Local) -> bool,
+    M: Fn(LocalDefId) -> N,
+    N: Fn(Local) -> bool,
+    K: Fn(LocalDefId) -> L,
+    L: Fn(Local) -> bool,
+{
     let is_candidate = |did: LocalDefId| {
         let ref_f = is_ref(did);
         let raw_f = is_raw(did);
@@ -499,13 +581,20 @@ where
     }
 
     let mut out = FxHashMap::default();
+    let no_copy_lends = FxHashSet::default();
     for f in program.functions.iter().copied() {
         let is_raw_f = is_raw(f);
+        let copy_lends = selected_copy_lends.get(&f).unwrap_or(&no_copy_lends);
 
         let edges = loop {
-            let mut inference = ctxt.infer(program.tcx, f, raw_fields);
-            let accesses =
-                overwrite_with_engine_facts_capturing(program.tcx, f, &ctxt.borrow, &mut inference);
+            let mut inference = ctxt.infer(program.tcx, f, raw_fields, copy_lends);
+            let accesses = overwrite_with_engine_facts_capturing(
+                program.tcx,
+                f,
+                &ctxt.borrow,
+                &mut inference.facts,
+                &inference.copy_lends,
+            );
             let invalid_loans = invalid_loan_set(&inference);
             if invalid_loans.is_empty() {
                 // D2: the witnessed/L2 replay is structurally identical to the
@@ -518,6 +607,7 @@ where
                     &inference,
                     ctxt.borrow.provenances.get(&f).unwrap(),
                     &invalid_loans,
+                    &inference.copy_lends,
                 );
                 break Vec::new();
             }
@@ -539,7 +629,13 @@ where
                 let provenance_set = ctxt.borrow.provenances.get(&f).unwrap();
                 // D2: record from the FINAL inference of this call, exactly as
                 // the Mode-A path does.
-                record_loan_identities(f, &inference, provenance_set, &invalid_loans);
+                record_loan_identities(
+                    f,
+                    &inference,
+                    provenance_set,
+                    &invalid_loans,
+                    &inference.copy_lends,
+                );
                 break extract_witnessed_conflict_edges(
                     &inference,
                     provenance_set,

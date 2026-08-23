@@ -40,7 +40,7 @@ use rustc_middle::{
     ty::TyCtxt,
 };
 
-use super::{boundary_table, crate_slots::CrateSlots, solver::SlotRef};
+use super::{boundary_table, coherence::CopyLendPair, crate_slots::CrateSlots, solver::SlotRef};
 
 /// Whether `func` resolves to an extern allocator declaration — gated on `Node::ForeignItem`
 /// exactly like the ownership boundary (`infer.rs`), so a crate-local fn merely *named*
@@ -71,6 +71,24 @@ pub(crate) fn collect_malloc_source_slots(
     tcx: TyCtxt<'_>,
     functions: &[rustc_span::def_id::LocalDefId],
     slots: &CrateSlots,
+) -> FxHashSet<SlotRef> {
+    collect_malloc_source_slots_impl(tcx, functions, slots, None)
+}
+
+pub(crate) fn collect_malloc_source_slots_with_copy_lends(
+    tcx: TyCtxt<'_>,
+    functions: &[rustc_span::def_id::LocalDefId],
+    slots: &CrateSlots,
+    copy_lends: &FxHashSet<CopyLendPair>,
+) -> FxHashSet<SlotRef> {
+    collect_malloc_source_slots_impl(tcx, functions, slots, Some(copy_lends))
+}
+
+fn collect_malloc_source_slots_impl(
+    tcx: TyCtxt<'_>,
+    functions: &[rustc_span::def_id::LocalDefId],
+    slots: &CrateSlots,
+    copy_lends: Option<&FxHashSet<CopyLendPair>>,
 ) -> FxHashSet<SlotRef> {
     let mut sources = FxHashSet::default();
     for &fn_did in functions {
@@ -111,12 +129,28 @@ pub(crate) fn collect_malloc_source_slots(
                     if source_locals.contains(&dest_local) {
                         continue;
                     }
-                    let rhs_local = match rvalue {
-                        Rvalue::Cast(_, op, _) | Rvalue::Use(op) => op.place(),
-                        Rvalue::CopyForDeref(place) => Some(*place),
-                        _ => None,
+                    let (rhs_place, copy_like) = match rvalue {
+                        Rvalue::Cast(_, op, _) => (op.place(), false),
+                        Rvalue::Use(op) => (op.place(), true),
+                        Rvalue::CopyForDeref(place) => (Some(*place), true),
+                        _ => (None, false),
+                    };
+                    let rhs_local = rhs_place.and_then(|place| place.as_local());
+                    if copy_like
+                        && let Some(rhs_local) = rhs_local
+                        && let (Some(lhs_slot), Some(rhs_slot)) = (
+                            universe.slot_for_local_depth(dest_local, 0),
+                            universe.slot_for_local_depth(rhs_local, 0),
+                        )
+                        && copy_lends.is_some_and(|pairs| {
+                            pairs.contains(&CopyLendPair::new(
+                                SlotRef::Local(fn_did, lhs_slot),
+                                SlotRef::Local(fn_did, rhs_slot),
+                            ))
+                        })
+                    {
+                        continue;
                     }
-                    .and_then(|place| place.as_local());
                     if rhs_local.is_some_and(|src| source_locals.contains(&src)) {
                         source_locals.insert(dest_local);
                         changed = true;

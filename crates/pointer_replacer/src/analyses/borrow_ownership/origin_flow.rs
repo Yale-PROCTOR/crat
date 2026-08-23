@@ -632,6 +632,19 @@ impl BodyOriginFlow {
         flows
     }
 
+    /// Phase-1b eligibility's read-only view of the existing flow-insensitive unknown fact.
+    /// No second unknown analysis is derived: this projects the closed matrix's exact members
+    /// onto the owner/depth vocabulary consumed by construction.
+    pub(crate) fn unknown_owner_depths(&self) -> FxHashSet<(SlotOwner, u8)> {
+        self.unknown_targets
+            .iter()
+            .filter_map(|slot| {
+                let local_slot = self.slots[slot];
+                slot_owner(local_slot.owner).map(|owner| (owner, local_slot.depth))
+            })
+            .collect()
+    }
+
     fn slot_for_place<'tcx, D: HasLocalDecls<'tcx>>(
         &self,
         local_decls: &D,

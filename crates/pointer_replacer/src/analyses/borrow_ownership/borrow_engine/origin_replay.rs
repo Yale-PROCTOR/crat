@@ -1,3 +1,5 @@
+use std::ops::{Deref, DerefMut};
+
 use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_index::{
     IndexVec,
@@ -19,6 +21,8 @@ use crate::{
             ProvenanceSet, StructFieldSlot, borrow_inference,
         },
         borrow_ownership::{
+            coherence::SelectedCopyLendLoan,
+            export,
             origin_flow::{self, OriginFlowResults},
             slots::SlotOwner,
         },
@@ -29,6 +33,32 @@ use crate::{
 pub(super) struct NativeBorrowContext<'a> {
     pub(super) borrow: GBorrowInferCtxt,
     flows: &'a OriginFlowResults,
+}
+
+pub(super) struct NativeInference<'tcx> {
+    pub(super) facts: BorrowInferenceResults<'tcx>,
+    pub(super) copy_lends: DenseBitSet<Loan>,
+}
+
+pub(crate) fn selected_copy_lend_contains(
+    selected: &FxHashSet<SelectedCopyLendLoan>,
+    identity: &SelectedCopyLendLoan,
+) -> bool {
+    selected.contains(identity)
+}
+
+impl<'tcx> Deref for NativeInference<'tcx> {
+    type Target = BorrowInferenceResults<'tcx>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.facts
+    }
+}
+
+impl DerefMut for NativeInference<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.facts
+    }
 }
 
 impl<'a> NativeBorrowContext<'a> {
@@ -77,8 +107,31 @@ impl<'a> NativeBorrowContext<'a> {
         tcx: TyCtxt<'tcx>,
         f: LocalDefId,
         disabled_fields: &[StructFieldSlot],
-    ) -> BorrowInferenceResults<'tcx> {
+        selected_copy_lends: &FxHashSet<SelectedCopyLendLoan>,
+    ) -> NativeInference<'tcx> {
         let mut inference = borrow_inference(tcx, f, &self.borrow);
+        let mut copy_lends = DenseBitSet::new_empty(inference.borrow_set.loans.len());
+        for (loan, data) in inference.borrow_set.loans.iter_enumerated() {
+            let borrower = match data.assigned {
+                Borrower::Assign(owner) => export::BorrowerKind::Assign {
+                    owner: export::OwnerKey::from_owner(owner),
+                },
+                Borrower::CallArg(callee, arg_index) => export::BorrowerKind::CallArg {
+                    callee: callee.local_def_index.as_u32(),
+                    arg_index,
+                },
+            };
+            if selected_copy_lend_contains(
+                selected_copy_lends,
+                &SelectedCopyLendLoan {
+                    location: export::location_key(data.location()),
+                    borrowed: export::PlaceKey::from_place(data.borrowed),
+                    borrower,
+                },
+            ) {
+                copy_lends.insert(loan);
+            }
+        }
         let provenance_set = self.borrow.provenances.get(&f).unwrap();
         let graph = NativeConstraintGraph::new(
             &inference,
@@ -99,7 +152,51 @@ impl<'a> NativeBorrowContext<'a> {
             &inference.requires,
             &inference.killed,
         );
-        inference
+        NativeInference {
+            facts: inference,
+            copy_lends,
+        }
+    }
+}
+
+#[cfg(test)]
+mod copy_lend_identity_tests {
+    use rustc_hash::FxHashSet;
+    use rustc_middle::mir::Local;
+
+    use super::selected_copy_lend_contains;
+    use crate::analyses::borrow_ownership::{
+        coherence::SelectedCopyLendLoan,
+        export::{BorrowerKind, OwnerKey, PlaceKey},
+        l2::MirLocationKey,
+    };
+
+    #[test]
+    fn same_location_companion_is_not_copy_lend() {
+        let selected = SelectedCopyLendLoan {
+            location: MirLocationKey::new(3, 7),
+            borrowed: PlaceKey {
+                local: Local::from_u32(1),
+                proj: Vec::new(),
+            },
+            borrower: BorrowerKind::Assign {
+                owner: OwnerKey::Local(2),
+            },
+        };
+        let companion = SelectedCopyLendLoan {
+            location: selected.location,
+            borrowed: PlaceKey {
+                local: Local::from_u32(9),
+                proj: Vec::new(),
+            },
+            borrower: selected.borrower,
+        };
+        let selected_set = FxHashSet::from_iter([selected.clone()]);
+        assert!(selected_copy_lend_contains(&selected_set, &selected));
+        assert!(
+            !selected_copy_lend_contains(&selected_set, &companion),
+            "same-location companion must retain Existing loan semantics"
+        );
     }
 }
 

@@ -29,11 +29,11 @@ use super::{
     report::Row,
 };
 use crate::analyses::borrow_ownership::{
-    CrateCtxt, SlotKind,
-    borrow_verify::{verify_to_fixpoint_counting_with_flows, with_mode_a_commit_trace},
-    coherence::{add_coherence, constrain_field_ownership},
+    SlotKind,
+    borrow_verify::with_mode_a_commit_trace,
+    coherence::constrain_field_ownership,
+    construction::{CopyLendMode, construct_bo_into, verify_bo_construction_counting},
     crate_slots::CrateSlots,
-    emit_crate_ownership_constraints,
     export::{BoExport, VersionSite, location_key, with_bo_export},
     l2::MirLocationKey,
     mutability_facts::{MutFacts, MutFactsMode},
@@ -908,33 +908,32 @@ fn replay_relaxed_candidate(
     ownership_diagnostic_package::with_removal_filter(
         RemovalFilter::ExactOwnAssumeLabels(omitted.clone()),
         || {
-            let crate_ctxt = CrateCtxt::new(program);
             let solver = KindSolver::new(slots);
-            let (_stats, selectors) =
-                emit_crate_ownership_constraints(&crate_ctxt, slots, origins, &solver)
-                    .expect("A4 relaxed emission");
-            for &fn_did in &program.functions {
-                let body = program
-                    .tcx
-                    .mir_drops_elaborated_and_const_checked(fn_did)
-                    .borrow();
-                add_coherence(&solver, slots, fn_did, &body);
-            }
+            let construction = construct_bo_into(
+                program,
+                slots,
+                origins,
+                mutability,
+                &solver,
+                CopyLendMode::current(),
+            )
+            .expect("A4 relaxed emission");
             for &index in sources {
                 solver.optimize().assert(
-                    selectors
+                    construction
+                        .selectors
                         .sources()
                         .get(index)
                         .unwrap_or_else(|| panic!("relaxed source index {index} drifted")),
                 );
             }
             solver.assert_owning(field);
-            verify_to_fixpoint_counting_with_flows(
+            verify_bo_construction_counting(
                 program,
                 slots,
-                origins.native_flows(),
+                origins,
                 &solver,
-                &selectors,
+                &construction,
                 mutability,
             )
             .0
@@ -960,13 +959,14 @@ fn tsv_cell(value: &str) -> String {
     value.replace(['\t', '\n', '\r'], "_")
 }
 
-fn render_records(program: &str, records: &[SimulationRecord]) -> String {
+fn render_records(program: &str, mode: CopyLendMode, records: &[SimulationRecord]) -> String {
     let mut out = String::from(
-        "program\tfield_key\tfield_slot\tbaseline_kind\tbaseline_force\tbaseline_core_families\tproof_eligible\tproof_reason\tselected_own_assumes\tsource_selector_indices\tnecessary_labels\trelaxed_force\trelaxed_kind\trelaxed_core_families\trelaxed_core_labels\n",
+        "copy_lend_mode\tprogram\tfield_key\tfield_slot\tbaseline_kind\tbaseline_force\tbaseline_core_families\tproof_eligible\tproof_reason\tselected_own_assumes\tsource_selector_indices\tnecessary_labels\trelaxed_force\trelaxed_kind\trelaxed_core_families\trelaxed_core_labels\n",
     );
     for record in records {
         out.push_str(&format!(
-            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+            mode.label(),
             tsv_cell(program),
             tsv_cell(&record.baseline.field_key),
             record.baseline.field_slot,
@@ -1039,7 +1039,6 @@ pub(super) fn run_probe_worker(tcx: TyCtxt<'_>, t_tcx: Duration) -> Row {
     let program = collect_program(tcx);
     let origins = compute_origins(&program);
     let slots = CrateSlots::build(&program);
-    let crate_ctxt = CrateCtxt::new(&program);
     let ordinary = KindSolver::new(&slots);
     let mutability = match MutFactsMode::current() {
         MutFactsMode::Off => MutFacts::all_mut(),
@@ -1047,20 +1046,22 @@ pub(super) fn run_probe_worker(tcx: TyCtxt<'_>, t_tcx: Duration) -> Row {
     };
     let (((ordinary_model, _ordinary_stats), commit_trace), ordinary_export) =
         with_bo_export(|| {
-            let (_stats, selectors) =
-                emit_crate_ownership_constraints(&crate_ctxt, &slots, &origins, &ordinary)
-                    .expect("A4 ordinary emission");
-            for &fn_did in &program.functions {
-                let body = tcx.mir_drops_elaborated_and_const_checked(fn_did).borrow();
-                add_coherence(&ordinary, &slots, fn_did, &body);
-            }
+            let construction = construct_bo_into(
+                &program,
+                &slots,
+                &origins,
+                &mutability,
+                &ordinary,
+                CopyLendMode::current(),
+            )
+            .expect("A4 ordinary emission");
             let ((model, stats), trace) = with_mode_a_commit_trace(|| {
-                verify_to_fixpoint_counting_with_flows(
+                verify_bo_construction_counting(
                     &program,
                     &slots,
-                    origins.native_flows(),
+                    &origins,
                     &ordinary,
-                    &selectors,
+                    &construction,
                     &mutability,
                 )
             });
@@ -1073,9 +1074,16 @@ pub(super) fn run_probe_worker(tcx: TyCtxt<'_>, t_tcx: Duration) -> Row {
 
     emit_phase(started, "tracked-start", None, 0);
     let tracked = KindSolver::new_tracked(&slots);
-    let ((_, tracked_selectors), tracked_export) = with_bo_export(|| {
-        emit_crate_ownership_constraints(&crate_ctxt, &slots, &origins, &tracked)
-            .expect("A4 tracked emission")
+    let (tracked_construction, tracked_export) = with_bo_export(|| {
+        construct_bo_into(
+            &program,
+            &slots,
+            &origins,
+            &mutability,
+            &tracked,
+            CopyLendMode::current(),
+        )
+        .expect("A4 tracked emission")
     });
     assert_eq!(
         ordinary_export.source_sites, tracked_export.source_sites,
@@ -1086,11 +1094,7 @@ pub(super) fn run_probe_worker(tcx: TyCtxt<'_>, t_tcx: Duration) -> Row {
         "A4 STOP phase=selector-alignment candidate=none: SSA provenance drift"
     );
     let tracker = tracked.tracker().expect("tracked solver has tracker");
-    tracker.set_context("coherence");
-    for &fn_did in &program.functions {
-        let body = tcx.mir_drops_elaborated_and_const_checked(fn_did).borrow();
-        add_coherence(&tracked, &slots, fn_did, &body);
-    }
+    let tracked_selectors = tracked_construction.selectors;
     tracker.set_context("field-law");
     constrain_field_ownership(&tracked, &slots, &program);
     for commit in &commit_trace {
@@ -1297,15 +1301,22 @@ pub(super) fn run_probe_worker(tcx: TyCtxt<'_>, t_tcx: Duration) -> Row {
             relaxed_core_families: relaxed_families,
             relaxed_core_labels: relaxed_labels,
         });
-        write_atomic_checkpoint(&checkpoint_path, &render_records(&program_name, &records))
-            .unwrap_or_else(|error| panic!("A4 STOP phase=checkpoint candidate={key}: {error}"));
+        write_atomic_checkpoint(
+            &checkpoint_path,
+            &render_records(&program_name, CopyLendMode::current(), &records),
+        )
+        .unwrap_or_else(|error| panic!("A4 STOP phase=checkpoint candidate={key}: {error}"));
         emit_phase(started, "checkpoint-written", Some(&key), records.len());
     }
 
-    write_atomic_checkpoint(&artifact_path, &render_records(&program_name, &records))
-        .unwrap_or_else(|error| panic!("A4 STOP phase=finalize candidate=none: {error}"));
+    write_atomic_checkpoint(
+        &artifact_path,
+        &render_records(&program_name, CopyLendMode::current(), &records),
+    )
+    .unwrap_or_else(|error| panic!("A4 STOP phase=finalize candidate=none: {error}"));
     emit_phase(started, "complete", None, records.len());
     let mut row = Row::default();
+    row.set("copy_lend_mode", CopyLendMode::current().label());
     row.set("t_tcx_s", format!("{:.3}", t_tcx.as_secs_f64()));
     row.set("queried", records.len());
     row.set(
@@ -1353,6 +1364,7 @@ const LIVENESS_BOUND_S: u64 = 14_400;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct ParsedSimulation {
+    copy_lend_mode: String,
     program: String,
     field_key: String,
     field_slot: usize,
@@ -1382,7 +1394,7 @@ fn parse_simulation(
     path: &Path,
     expected_program: Option<&str>,
 ) -> Result<Vec<ParsedSimulation>, String> {
-    const HEADER: &str = "program\tfield_key\tfield_slot\tbaseline_kind\tbaseline_force\tbaseline_core_families\tproof_eligible\tproof_reason\tselected_own_assumes\tsource_selector_indices\tnecessary_labels\trelaxed_force\trelaxed_kind\trelaxed_core_families\trelaxed_core_labels";
+    const HEADER: &str = "copy_lend_mode\tprogram\tfield_key\tfield_slot\tbaseline_kind\tbaseline_force\tbaseline_core_families\tproof_eligible\tproof_reason\tselected_own_assumes\tsource_selector_indices\tnecessary_labels\trelaxed_force\trelaxed_kind\trelaxed_core_families\trelaxed_core_labels";
     let input = fs::read_to_string(path)
         .map_err(|error| format!("read simulation {}: {error}", path.display()))?;
     let mut lines = input.lines();
@@ -1393,7 +1405,7 @@ fn parse_simulation(
     let mut identities = BTreeSet::new();
     for (offset, line) in lines.enumerate() {
         let columns = line.split('\t').collect::<Vec<_>>();
-        if columns.len() != 15 {
+        if columns.len() != 16 {
             return Err(format!(
                 "simulation {} line {} has {} columns",
                 path.display(),
@@ -1401,28 +1413,35 @@ fn parse_simulation(
                 columns.len()
             ));
         }
-        if expected_program.is_some_and(|program| columns[0] != program) {
+        if !matches!(columns[0], "baseline" | "removal_only" | "lend_arm") {
+            return Err(format!(
+                "simulation {} line {} copy-lend mode drift",
+                path.display(),
+                offset + 2
+            ));
+        }
+        if expected_program.is_some_and(|program| columns[1] != program) {
             return Err(format!(
                 "simulation {} line {} program mismatch",
                 path.display(),
                 offset + 2
             ));
         }
-        if !identities.insert((columns[0].to_owned(), columns[1].to_owned())) {
+        if !identities.insert((columns[1].to_owned(), columns[2].to_owned())) {
             return Err(format!(
                 "simulation {} line {} duplicates an identity",
                 path.display(),
                 offset + 2
             ));
         }
-        let relaxed_kind = match columns[12] {
+        let relaxed_kind = match columns[13] {
             "-" => None,
             kind => Some(parse_kind(kind)?),
         };
-        let source_indices = if columns[9].is_empty() {
+        let source_indices = if columns[10].is_empty() {
             Vec::new()
         } else {
-            columns[9]
+            columns[10]
                 .split('|')
                 .map(|value| {
                     value.parse::<usize>().map_err(|error| {
@@ -1431,29 +1450,30 @@ fn parse_simulation(
                 })
                 .collect::<Result<Vec<_>, _>>()?
         };
-        let proof_eligible = columns[6]
+        let proof_eligible = columns[7]
             .parse::<bool>()
             .map_err(|error| format!("simulation {} proof flag: {error}", path.display()))?;
         let row = ParsedSimulation {
-            program: columns[0].to_owned(),
-            field_key: columns[1].to_owned(),
-            field_slot: columns[2]
+            copy_lend_mode: columns[0].to_owned(),
+            program: columns[1].to_owned(),
+            field_key: columns[2].to_owned(),
+            field_slot: columns[3]
                 .parse()
                 .map_err(|error| format!("simulation {} field slot: {error}", path.display()))?,
-            baseline_kind: parse_kind(columns[3])?,
-            baseline_force: columns[4].to_owned(),
-            baseline_core_families: parse_list(columns[5]),
+            baseline_kind: parse_kind(columns[4])?,
+            baseline_force: columns[5].to_owned(),
+            baseline_core_families: parse_list(columns[6]),
             proof_eligible,
-            proof_reason: columns[7].to_owned(),
-            selected_labels: parse_list(columns[8]),
+            proof_reason: columns[8].to_owned(),
+            selected_labels: parse_list(columns[9]),
             source_indices,
-            necessary_labels: columns[10].parse().map_err(|error| {
+            necessary_labels: columns[11].parse().map_err(|error| {
                 format!("simulation {} necessary labels: {error}", path.display())
             })?,
-            relaxed_force: columns[11].to_owned(),
+            relaxed_force: columns[12].to_owned(),
             relaxed_kind,
-            relaxed_core_families: parse_list(columns[13]),
-            relaxed_core_labels: parse_list(columns[14]),
+            relaxed_core_families: parse_list(columns[14]),
+            relaxed_core_labels: parse_list(columns[15]),
         };
         if !matches!(row.baseline_force.as_str(), "sat" | "unsat") {
             return Err(format!(
