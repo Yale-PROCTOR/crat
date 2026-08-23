@@ -2944,9 +2944,9 @@ fn validate_launch4_preflight(
     rows: &[super::report::Row],
     official_digest: &str,
 ) -> Result<(), String> {
-    if rows.len() != 3 {
+    if rows.len() != 6 {
         return Err(format!(
-            "preflight expected three bst rows, got {}",
+            "preflight expected six bst/ht rows, got {}",
             rows.len()
         ));
     }
@@ -2955,85 +2955,94 @@ fn validate_launch4_preflight(
         ("precise", "precise_replay"),
         ("coarse", "coarse_constraint"),
     ] {
-        let row = rows
+        let selected = rows
             .iter()
-            .find(|row| row.get("configuration") == Some(configuration))
-            .ok_or_else(|| format!("preflight lacks {configuration} row"))?;
-        batch_model_digest_stamp(row, official_digest)?;
-        batch_attestation_stamp(row)?;
-        for (key, expected) in [
-            ("a5_mode", mode),
-            ("a5_world", "closed_world_frozen_graph"),
-            ("copy_lend_mode", "baseline"),
-            ("a2_mode", "off"),
-            ("rw_a5_abi_guard", A5_BATCH_ATTESTED_GUARD),
-        ] {
-            if row.get(key) != Some(expected) {
-                return Err(format!(
-                    "preflight {configuration} stamp {key} expected {expected:?}, got {:?}",
-                    row.get(key)
-                ));
-            }
+            .filter(|row| row.get("configuration") == Some(configuration))
+            .collect::<Vec<_>>();
+        if selected.len() != 2 {
+            return Err(format!("preflight {configuration} row count moved"));
         }
-        for key in [
-            "a5_production_pair_den",
-            "a5_production_mut_mut",
-            "a5_production_mut_read_only",
-            "a5_production_shared_shared",
-            "a5_planned_marks",
-            "a5_model_retained_marks",
-            "a5_demoted_by_model_marks",
-            "rw_a5_model_retained_marks",
-            "rw_a5_emission_retained_marks",
-        ] {
-            batch_number(row, key);
+        for row in selected {
+            batch_model_digest_stamp(row, official_digest)?;
+            batch_attestation_stamp(row)?;
+            for (key, expected) in [
+                ("a5_mode", mode),
+                ("a5_world", "closed_world_frozen_graph"),
+                ("copy_lend_mode", "baseline"),
+                ("a2_mode", "off"),
+                ("rw_a5_abi_guard", A5_BATCH_ATTESTED_GUARD),
+            ] {
+                if row.get(key) != Some(expected) {
+                    return Err(format!(
+                        "preflight {configuration} stamp {key} expected {expected:?}, got {:?}",
+                        row.get(key)
+                    ));
+                }
+            }
+            for key in [
+                "a5_production_pair_den",
+                "a5_production_mut_mut",
+                "a5_production_mut_read_only",
+                "a5_production_shared_shared",
+                "a5_planned_marks",
+                "a5_model_retained_marks",
+                "a5_demoted_by_model_marks",
+                "rw_a5_model_retained_marks",
+                "rw_a5_emission_retained_marks",
+            ] {
+                batch_number(row, key);
+            }
         }
     }
 
     let precise = rows
         .iter()
-        .find(|row| row.get("configuration") == Some("precise"))
-        .expect("checked precise row");
-    for key in [
-        "a5_w14_pairs",
-        "a5_w14_mut_mut",
-        "a5_w14_mut_read_only",
-        "a5_w14_shared_shared",
-        "a5_w14_effective_pairs",
-        "a5_w14_planned_marks",
-        "a5_w14_model_retained_marks",
-        "a5_w14_demoted_by_model_marks",
-        "a5_w14_exposures",
-        "a5_w14_demoted",
-        "a5_w14_marked",
-        "a5_w14_shared_safe",
-        "a5_w14_replay_safe",
-        "a5_w14_unresolved",
-        "a5_w14_precise_rounds",
-        "a5_site_join_registered_site_rows",
-        "a5_site_join_production_site_pairs",
-        "a5_site_join_matched_registered_rows",
-        "a5_site_join_unique_matched_production_pairs",
-        "a5_site_join_registered_unmatched",
-        "a5_site_join_production_unmatched",
-        "a5_site_join_production_count_residual",
-        "a5_site_join_ambiguous_summary_keys",
-        "a5_site_join_ambiguous_production_keys",
-        "a5_site_join_mixed_class_pairs",
-        "a5_site_join_multi_expansion_pairs",
-        "a5_site_join_matched_mut_mut",
-        "a5_site_join_matched_mut_read_only",
-        "a5_site_join_matched_shared_shared",
-        "a5_site_join_production_mut_mut",
-        "a5_site_join_production_mut_read_only",
-        "a5_site_join_production_shared_shared",
-    ] {
-        batch_number(precise, key);
+        .filter(|row| row.get("configuration") == Some("precise"))
+        .collect::<Vec<_>>();
+    for row in precise {
+        for key in [
+            "a5_w14_pairs",
+            "a5_w14_mut_mut",
+            "a5_w14_mut_read_only",
+            "a5_w14_shared_shared",
+            "a5_w14_effective_pairs",
+            "a5_w14_planned_marks",
+            "a5_w14_model_retained_marks",
+            "a5_w14_demoted_by_model_marks",
+            "a5_w14_exposures",
+            "a5_w14_demoted",
+            "a5_w14_marked",
+            "a5_w14_shared_safe",
+            "a5_w14_replay_safe",
+            "a5_w14_unresolved",
+            "a5_w14_precise_rounds",
+            "a5_site_join_registered_site_rows",
+            "a5_site_join_production_site_pairs",
+            "a5_site_join_matched_registered_rows",
+            "a5_site_join_unique_matched_production_pairs",
+            "a5_site_join_registered_unmatched",
+            "a5_site_join_production_unmatched",
+            "a5_site_join_production_count_residual",
+            "a5_site_join_ambiguous_summary_keys",
+            "a5_site_join_ambiguous_production_keys",
+            "a5_site_join_mixed_class_pairs",
+            "a5_site_join_multi_expansion_pairs",
+            "a5_site_join_matched_mut_mut",
+            "a5_site_join_matched_mut_read_only",
+            "a5_site_join_matched_shared_shared",
+            "a5_site_join_production_mut_mut",
+            "a5_site_join_production_mut_read_only",
+            "a5_site_join_production_shared_shared",
+        ] {
+            batch_number(row, key);
+        }
     }
-    for artifact in ["w14-pair-ledger.tsv", "w14-exposure-ledger.tsv"] {
-        let path = output.join("precise").join("bst").join(artifact);
-        if !path.is_file() {
-            return Err(format!("preflight lacks {}", path.display()));
+    for program in ["bst", "ht"] {
+        for artifact in ["w14-pair-ledger.tsv", "w14-exposure-ledger.tsv"] {
+            let path = output.join("precise").join(program).join(artifact);
+            if !path.is_file() {
+                return Err(format!("preflight lacks {}", path.display()));
+            }
         }
     }
     Ok(())
@@ -3091,9 +3100,9 @@ fn a5_item22_batch_corpus() {
     .expect("write A5 batch preflight receipt");
     let preflight = std::env::var("CRAT_A5_BATCH_PREFLIGHT").as_deref() == Ok("1");
     let programs = if preflight {
-        &super::CORPUS[..1]
+        vec![super::CORPUS[0], super::CORPUS[2]]
     } else {
-        super::CORPUS
+        super::CORPUS.to_vec()
     };
     let required_rows = programs.len() * 3;
     let timeout = Duration::from_secs(14_400);
@@ -3105,7 +3114,7 @@ fn a5_item22_batch_corpus() {
     let mut rows = Vec::<super::report::Row>::new();
 
     for (label, mode) in modes {
-        for program in programs {
+        for program in &programs {
             let input = program.input_path(&root);
             let shard = output.join(label).join(program.name);
             fs::create_dir_all(&shard).expect("create A5 batch shard");
@@ -3270,7 +3279,7 @@ fn a5_item22_batch_corpus() {
         fs::write(
             output.join("preflight-complete.txt"),
             format!(
-                "status=ok\ndata=false\nprogram=bst\nconfigurations=baseline,precise_replay,coarse_constraint\nrows=3\na5_abi_guard={A5_BATCH_ATTESTED_GUARD}\nofficial_evaluation_sha256={official_digest}\n"
+            "status=ok\ndata=false\nprograms=bst,ht\nconfigurations=baseline,precise_replay,coarse_constraint\nrows=6\na5_abi_guard={A5_BATCH_ATTESTED_GUARD}\nofficial_evaluation_sha256={official_digest}\n"
             ),
         )
         .expect("write A5 launch-4 preflight completion");
