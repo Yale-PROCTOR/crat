@@ -3119,12 +3119,10 @@ fn a5_item22_batch_corpus() {
             let shard = output.join(label).join(program.name);
             fs::create_dir_all(&shard).expect("create A5 batch shard");
             let common = vec![
-                ("CRAT_BO_A5_MODE", mode.to_owned()),
                 (
                     "CRAT_BO_A5_ATTESTATION",
                     "frozen_benchmark_graph".to_owned(),
                 ),
-                ("CRAT_BO_COPY_LEND_MODE", "baseline".to_owned()),
                 ("CRAT_BO_A2_MODE", "off".to_owned()),
                 ("CRAT_BO_REPAIR", "mode_a".to_owned()),
                 ("CRAT_A5_SNAPSHOT", snapshot.display().to_string()),
@@ -3429,7 +3427,6 @@ fn a5_w14_drift_soundness_diagnostic() {
         let precise = launch_root.join("precise").join(name);
         let common = vec![
             ("CRAT_BO_FORK_ENGINE", "fork".to_owned()),
-            ("CRAT_BO_COPY_LEND_MODE", "baseline".to_owned()),
             ("CRAT_BO_A2_MODE", "off".to_owned()),
             (
                 "CRAT_A5_DRIFT_OLD_EXPOSURE",
@@ -4849,8 +4846,8 @@ fn a5_p1_corpus() {
             "W14 focused mode requires classifier and snapshot ledgers in the same run"
         );
         assert_eq!(
-            std::env::var("CRAT_BO_COPY_LEND_MODE").as_deref(),
-            Ok("baseline"),
+            CopyLendMode::current(),
+            CopyLendMode::Baseline,
             "W14 focused mode keeps A12 dormant"
         );
         for key in [

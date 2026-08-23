@@ -1374,7 +1374,7 @@ mod tests {
         );
         let baseline =
             crate::bo_rewriter::rewrite_m1_path_a5_injected(&root, A5Mode::Baseline, None, &|_| {});
-        let default_baseline = crate::bo_rewriter::rewrite_m1_path(&root);
+        let production = crate::bo_rewriter::rewrite_m1_path(&root);
         std::fs::remove_dir_all(&fixture).expect("remove production fixture directory");
         assert!(precise.a5_receipt().contains("a5_mode=precise_replay\n"));
         assert!(baseline.a5_receipt().contains("a5_mode=baseline\n"));
@@ -1387,7 +1387,7 @@ mod tests {
         };
         let precise = source(precise);
         let baseline = source(baseline);
-        let default_baseline = source(default_baseline);
+        let production = source(production);
         assert!(
             precise.contains("__crat_c9_"),
             "the precise production entry must materialize its retained mark: {precise}\n{precise_receipt}"
@@ -1401,8 +1401,8 @@ mod tests {
             "baseline must carry no C-9 mark: {baseline}"
         );
         assert_eq!(
-            baseline, default_baseline,
-            "explicit A5-off and the absent-environment baseline must be byte-identical"
+            precise, production,
+            "the accepted precise configuration and the single production path must be byte-identical"
         );
     }
 

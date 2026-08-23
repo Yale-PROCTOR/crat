@@ -6015,7 +6015,7 @@ mod run {
         let t0 = Instant::now();
         let mut row = Row::default();
         row.set("t_tcx_s", secs(t_tcx));
-        let mode = A5Mode::current();
+        let mode = A5Mode::PreciseReplay;
         assert_eq!(CopyLendMode::current(), CopyLendMode::Baseline);
         assert_eq!(A2Mode::current(), A2Mode::Off);
         assert_eq!(
@@ -14300,8 +14300,14 @@ fn boc1_run_one() {
             "a5-site-scope-repartition" => {
                 a5_measurement::run_site_scope_repartition_worker(tcx, t_tcx)
             }
-            "copy-lend-funnel" => copy_lend_funnel::run_worker(tcx, t_tcx),
-            "copy-lend-funnel-subjects" => copy_lend_funnel::run_subject_worker(tcx, t_tcx),
+            "copy-lend-funnel" => {
+                crate::analyses::borrow_ownership::construction::CopyLendMode::LendArm
+                    .with_override(|| copy_lend_funnel::run_worker(tcx, t_tcx))
+            }
+            "copy-lend-funnel-subjects" => {
+                crate::analyses::borrow_ownership::construction::CopyLendMode::LendArm
+                    .with_override(|| copy_lend_funnel::run_subject_worker(tcx, t_tcx))
+            }
             "p-b" => p_b_measurement::run_worker(tcx, t_tcx),
             "kind-equate-core" => kind_equate_core_census::run_worker(tcx, t_tcx),
             "s23-discover" => s23_measurement::run_discovery_worker(tcx, t_tcx),

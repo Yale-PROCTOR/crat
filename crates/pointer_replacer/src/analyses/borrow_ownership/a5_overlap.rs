@@ -1,7 +1,5 @@
 //! Pure domain for A5 parameter may-overlap summaries.
 
-#[cfg(test)]
-use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet};
 
 use petgraph::{algo::kosaraju_scc, graphmap::DiGraphMap};
@@ -689,42 +687,8 @@ pub(crate) enum A5Mode {
 }
 
 impl A5Mode {
-    pub(crate) const ENV: &'static str = "CRAT_BO_A5_MODE";
-
-    pub(crate) fn current() -> Self {
-        #[cfg(test)]
-        if let Some(mode) = A5_MODE_OVERRIDE.with(Cell::get) {
-            return mode;
-        }
-        match std::env::var(Self::ENV) {
-            Err(std::env::VarError::NotPresent) => Self::Baseline,
-            Ok(value) => Self::parse(&value).unwrap_or_else(|error| panic!("{error}")),
-            Err(error) => panic!("{} is not valid Unicode: {error}", Self::ENV),
-        }
-    }
-
-    pub(crate) fn parse(value: &str) -> Result<Self, String> {
-        match value {
-            "baseline" => Ok(Self::Baseline),
-            "precise_replay" => Ok(Self::PreciseReplay),
-            "coarse_constraint" => Ok(Self::CoarseConstraint),
-            other => Err(format!(
-                "{} must be baseline, precise_replay, or coarse_constraint; got {other:?}",
-                Self::ENV
-            )),
-        }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn with_override<T>(self, f: impl FnOnce() -> T) -> T {
-        struct Restore(Option<A5Mode>);
-        impl Drop for Restore {
-            fn drop(&mut self) {
-                A5_MODE_OVERRIDE.with(|slot| slot.set(self.0));
-            }
-        }
-        let _restore = Restore(A5_MODE_OVERRIDE.with(|slot| slot.replace(Some(self))));
-        f()
+    pub(crate) fn production() -> Self {
+        Self::PreciseReplay
     }
 
     pub(crate) fn label(self) -> &'static str {
@@ -742,11 +706,6 @@ impl A5Mode {
     pub(crate) fn is_pricing_control(self) -> bool {
         self == Self::CoarseConstraint
     }
-}
-
-#[cfg(test)]
-thread_local! {
-    static A5_MODE_OVERRIDE: Cell<Option<A5Mode>> = const { Cell::new(None) };
 }
 
 pub(crate) fn apply_coarse_constraints(
@@ -1123,19 +1082,8 @@ mod tests {
     }
 
     #[test]
-    fn a5_mode_domain_is_exactly_the_ruled_three_configuration_matrix() {
-        assert_eq!(A5Mode::parse("baseline"), Ok(A5Mode::Baseline));
-        assert_eq!(A5Mode::parse("precise_replay"), Ok(A5Mode::PreciseReplay));
-        assert_eq!(
-            A5Mode::parse("coarse_constraint"),
-            Ok(A5Mode::CoarseConstraint)
-        );
-        assert!(A5Mode::parse("open_world").is_err());
-        assert!(A5Mode::parse("a2").is_err());
-        assert_eq!(
-            A5Mode::Baseline.with_override(A5Mode::current),
-            A5Mode::Baseline
-        );
+    fn accepted_precise_mode_is_the_single_production_selector() {
+        assert_eq!(A5Mode::production(), A5Mode::PreciseReplay);
         assert_eq!(A5Mode::proposed_landing(), A5Mode::PreciseReplay);
         assert!(A5Mode::CoarseConstraint.is_pricing_control());
     }

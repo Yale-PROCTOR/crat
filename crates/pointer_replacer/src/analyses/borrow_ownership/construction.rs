@@ -51,7 +51,6 @@ use crate::{
     utils::rustc::RustProgram,
 };
 
-pub(crate) const COPY_LEND_MODE_ENV: &str = "CRAT_BO_COPY_LEND_MODE";
 pub(crate) const A2_MODE_ENV: &str = "CRAT_BO_A2_MODE";
 
 pub(crate) fn plan_a5_c9_marks(
@@ -120,25 +119,7 @@ impl CopyLendMode {
         if let Some(mode) = COPY_LEND_MODE_OVERRIDE.with(Cell::get) {
             return mode;
         }
-        match std::env::var(COPY_LEND_MODE_ENV) {
-            Err(std::env::VarError::NotPresent) => Self::from_env_value(None)
-                .expect("the absent CopyLend mode has a defined baseline default"),
-            Ok(value) => {
-                Self::from_env_value(Some(&value)).unwrap_or_else(|error| panic!("{error}"))
-            }
-            Err(error) => panic!("{COPY_LEND_MODE_ENV} is not valid Unicode: {error}"),
-        }
-    }
-
-    fn from_env_value(value: Option<&str>) -> Result<Self, String> {
-        match value {
-            None | Some("baseline") => Ok(Self::Baseline),
-            Some("removal_only") => Ok(Self::RemovalOnly),
-            Some("lend_arm") => Ok(Self::LendArm),
-            Some(other) => Err(format!(
-                "{COPY_LEND_MODE_ENV} must be baseline, removal_only, or lend_arm; got {other:?}"
-            )),
-        }
+        Self::Baseline
     }
 
     #[cfg(test)]
@@ -1150,13 +1131,10 @@ mod mode_tests {
     use super::*;
 
     #[test]
-    fn copy_lend_default_remains_baseline_for_a5_development() {
+    fn copy_lend_production_stays_dormant_without_an_environment_switch() {
         assert_eq!(CopyLendMode::default(), CopyLendMode::Baseline);
         assert_eq!(CopyLendMode::default().label(), "baseline");
-        assert_eq!(
-            CopyLendMode::from_env_value(None),
-            Ok(CopyLendMode::Baseline)
-        );
+        assert_eq!(CopyLendMode::current(), CopyLendMode::Baseline);
     }
 
     #[test]

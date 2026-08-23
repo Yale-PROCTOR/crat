@@ -977,10 +977,7 @@ fn render_report(rows: &[Row], aggregate: StageCounts, attribution: &str, route:
 #[test]
 #[ignore = "A12 retained-mechanism funnel; deterministic 20-program measurement"]
 fn a12_copy_lend_funnel_corpus() {
-    assert_eq!(
-        std::env::var("CRAT_BO_COPY_LEND_MODE").as_deref(),
-        Ok("lend_arm")
-    );
+    assert_eq!(CopyLendMode::current(), CopyLendMode::LendArm);
     assert_eq!(std::env::var("CRAT_BO_REPAIR").as_deref(), Ok("mode_a"));
     assert_eq!(
         std::env::var("CRAT_BO_L2_GUARDED_COMMITS").as_deref(),
@@ -1158,10 +1155,7 @@ fn a12_copy_lend_funnel_option_a_completion() {
         "lil",
     ];
     const REMAINING: &[&str] = &["heman", "bzip2", "lodepng", "tulipindicators", "brotli"];
-    assert_eq!(
-        std::env::var("CRAT_BO_COPY_LEND_MODE").as_deref(),
-        Ok("lend_arm")
-    );
+    assert_eq!(CopyLendMode::current(), CopyLendMode::LendArm);
     assert_eq!(std::env::var("CRAT_BO_REPAIR").as_deref(), Ok("mode_a"));
     assert_eq!(
         std::env::var("CRAT_BO_L2_GUARDED_COMMITS").as_deref(),
