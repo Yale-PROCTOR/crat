@@ -10097,8 +10097,8 @@ mod borrow_ownership_coherence {
                 origins::{collect_no_borrow_origin_slots, compute_origins},
                 slots::{SlotId, SlotOwner, StructFieldSlot},
                 solver::{
-                    BoOwnDatabase, KindSolver, SelectorTrace, SelectorTraceOutcome,
-                    SelectorTracePhase, SlotRef, with_selector_trace,
+                    BoOwnDatabase, KindSolver, SelectorTrace, Selectors, SlotRef,
+                    with_selector_trace,
                 },
                 sources::collect_malloc_source_slots,
                 ssa::constraint::{Database, Gen, Var},
@@ -10178,37 +10178,34 @@ mod borrow_ownership_coherence {
         SlotRef::Local(fn_did, slot)
     }
 
-    type SelectorDecision = (
-        usize,
-        SelectorTracePhase,
-        usize,
-        Vec<usize>,
-        SelectorTraceOutcome,
-    );
-
-    fn selector_decisions(trace: &SelectorTrace) -> (Vec<SelectorDecision>, Vec<Vec<usize>>) {
-        let events = trace
+    fn selector_final_sets(trace: &SelectorTrace) -> Vec<(Vec<usize>, Vec<usize>)> {
+        trace
             .epochs
             .iter()
-            .enumerate()
-            .flat_map(|(epoch, trace)| {
-                trace.events.iter().map(move |event| {
-                    (
-                        epoch,
-                        event.phase,
-                        event.selector_index,
-                        event.active_before.clone(),
-                        event.outcome,
-                    )
-                })
+            .map(|epoch| {
+                let mut dropped = epoch.final_dropped.clone();
+                dropped.sort_unstable();
+                dropped.dedup();
+                let active = (0..trace.total)
+                    .filter(|index| dropped.binary_search(index).is_err())
+                    .collect();
+                (dropped, active)
             })
-            .collect();
-        let final_dropped = trace
-            .epochs
+            .collect()
+    }
+
+    fn dropped_selector_set(selectors: &Selectors, dropped: &[z3::ast::Bool]) -> Vec<usize> {
+        let mut dropped = dropped
             .iter()
-            .map(|epoch| epoch.final_dropped.clone())
-            .collect();
-        (events, final_dropped)
+            .map(|selector| {
+                selectors
+                    .index_of(selector)
+                    .expect("dropped selector belongs to the selector universe")
+            })
+            .collect::<Vec<_>>();
+        dropped.sort_unstable();
+        dropped.dedup();
+        dropped
     }
 
     /// The `Local` whose source-level variable name is `name`, via MIR debug info.
@@ -10728,10 +10725,13 @@ pub unsafe fn sink_side(a: *mut core::ffi::c_void) -> *mut core::ffi::c_void {
                     (model, dropped)
                 });
                 assert_eq!(
-                    selector_decisions(&legacy_trace),
-                    selector_decisions(&hard_trace)
+                    selector_final_sets(&legacy_trace),
+                    selector_final_sets(&hard_trace)
                 );
-                assert_eq!(hard_dropped, dropped);
+                assert_eq!(
+                    dropped_selector_set(&selectors, &hard_dropped),
+                    dropped_selector_set(&selectors, &dropped)
+                );
                 assert_eq!(hard_model, model);
                 assert_eq!(
                     dropped.len(),
@@ -10880,10 +10880,13 @@ pub unsafe fn sink_side2(a2: *mut core::ffi::c_void) -> *mut core::ffi::c_void {
                     (model, dropped)
                 });
                 assert_eq!(
-                    selector_decisions(&legacy_trace),
-                    selector_decisions(&hard_trace)
+                    selector_final_sets(&legacy_trace),
+                    selector_final_sets(&hard_trace)
                 );
-                assert_eq!(hard_dropped, dropped);
+                assert_eq!(
+                    dropped_selector_set(&selectors, &hard_dropped),
+                    dropped_selector_set(&selectors, &dropped)
+                );
                 assert_eq!(hard_model, model);
                 assert_eq!(
                     dropped.len(),
