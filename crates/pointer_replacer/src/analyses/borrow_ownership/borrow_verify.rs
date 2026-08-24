@@ -31,7 +31,7 @@ use super::{
     mutability_facts::MutProvider,
     origin_flow::OriginFlowResults,
     slots::{SlotId, SlotOwner},
-    solver::{KindSolver, L2SolveResult, Selectors, SlotRef},
+    solver::{HardLoopSolver, KindSolver, L2SolveResult, Selectors, SlotRef},
 };
 use crate::{
     analyses::borrow::{self, ConflictEdge, ProvenanceOwner},
@@ -682,6 +682,45 @@ fn record_dropped(stats: &mut RoundStats, selectors: &Selectors, dropped: &[Bool
     stats.dropped_sources = dropped.len() - stats.dropped_sinks;
 }
 
+#[derive(Clone, Copy)]
+pub(super) enum LoopBackend {
+    LegacyOptimize,
+    HardCheckRoundOptimize,
+}
+
+fn solve_round_model(
+    solver: &KindSolver,
+    selectors: &Selectors,
+    backend: LoopBackend,
+    hard: Option<&HardLoopSolver>,
+) -> Option<(FxHashMap<SlotRef, SlotKind>, Vec<Bool>)> {
+    match backend {
+        LoopBackend::LegacyOptimize => solver.model_kinds_relaxing_reporting(selectors),
+        LoopBackend::HardCheckRoundOptimize => {
+            let hard = hard.expect("R1a validation owns a hard checker");
+            let relaxed = solver.relax_selectors_hard_reporting(hard, selectors)?;
+            let dropped = relaxed.dropped().to_vec();
+            let model = solver.optimized_model_under(&relaxed)?;
+            Some((model, dropped))
+        }
+    }
+}
+
+fn solve_l2_round_model(
+    solver: &KindSolver,
+    selectors: &Selectors,
+    backend: LoopBackend,
+    hard: Option<&HardLoopSolver>,
+) -> L2SolveResult {
+    match backend {
+        LoopBackend::LegacyOptimize => solver.model_kinds_relaxing_reporting_l2(selectors),
+        LoopBackend::HardCheckRoundOptimize => solver.model_kinds_decomposed_reporting_l2(
+            hard.expect("R1a L2 validation owns a hard checker"),
+            selectors,
+        ),
+    }
+}
+
 /// The §8 BB2-ii CEGAR validate/re-solve loop (Mode A) with native counters. See
 /// `verify_to_fixpoint`'s contract above for scope/soundness. Uses `model_kinds_relaxing_reporting`
 /// (identical model to the plain twin the wrapper's callers used, plus the dropped-selector set for
@@ -721,6 +760,7 @@ pub(crate) fn verify_to_fixpoint_counting_with_flows(
         is_mutable,
         None,
         None,
+        LoopBackend::HardCheckRoundOptimize,
     )
 }
 
@@ -742,6 +782,7 @@ pub(crate) fn verify_to_fixpoint_counting_with_flows_and_copy_lends(
         is_mutable,
         Some(copy_lends),
         None,
+        LoopBackend::HardCheckRoundOptimize,
     )
 }
 
@@ -763,10 +804,11 @@ pub(crate) fn verify_to_fixpoint_counting_with_flows_and_parameter_overlaps(
         is_mutable,
         None,
         Some(parameter_overlaps),
+        LoopBackend::HardCheckRoundOptimize,
     )
 }
 
-fn verify_to_fixpoint_counting_with_flows_impl(
+pub(super) fn verify_to_fixpoint_counting_with_flows_impl(
     program: &RustProgram,
     slots: &CrateSlots,
     origin_flows: &OriginFlowResults,
@@ -775,6 +817,7 @@ fn verify_to_fixpoint_counting_with_flows_impl(
     is_mutable: impl MutProvider + Copy,
     copy_lends: Option<&FxHashSet<CopyLendPair>>,
     parameter_overlaps: Option<&FxHashMap<LocalDefId, super::borrow_engine::ParameterOverlap>>,
+    backend: LoopBackend,
 ) -> (Option<FxHashMap<SlotRef, SlotKind>>, RoundStats) {
     // §NB-R guard (release-active): a tracked solver's hard constraints are
     // track-gated; every solve in this loop would be vacuously SAT and the
@@ -810,11 +853,14 @@ fn verify_to_fixpoint_counting_with_flows_impl(
     // owns)`, so a field mixing an owned source and a borrowed value settles non-Owning (the
     // flow-insensitive global-field over-claim). Must precede the first solve.
     super::coherence::constrain_field_ownership(solver, slots, program);
+    let hard =
+        matches!(backend, LoopBackend::HardCheckRoundOptimize).then(|| solver.hard_loop_solver());
     let mut stats = RoundStats::default();
     // §NB5-L guard 1 — resolve the repair strategy ONCE per invocation into a local; NO mid-loop
     // re-reads, so the whole fixpoint runs one consistent strategy. Guard 3 stamps it into `stats`.
     stats.repair = repair;
-    let Some((mut model, dropped)) = solver.model_kinds_relaxing_reporting(selectors) else {
+    let Some((mut model, dropped)) = solve_round_model(solver, selectors, backend, hard.as_ref())
+    else {
         return (None, stats);
     };
     record_dropped(&mut stats, selectors, &dropped);
@@ -999,7 +1045,7 @@ fn verify_to_fixpoint_counting_with_flows_impl(
             // this path no longer silently accepts a dropped-`Field` residual (the old Local-only gap).
             return (Some(model), stats);
         }
-        model = match solver.model_kinds_relaxing_reporting(selectors) {
+        model = match solve_round_model(solver, selectors, backend, hard.as_ref()) {
             Some((m, dropped)) => {
                 record_dropped(&mut stats, selectors, &dropped);
                 m
@@ -1131,6 +1177,28 @@ pub(crate) fn verify_l2_to_fixpoint_counting(
     is_mutable: impl MutProvider + Copy,
     copy_lends: Option<&FxHashSet<CopyLendPair>>,
 ) -> (Option<FxHashMap<SlotRef, SlotKind>>, RoundStats) {
+    verify_l2_to_fixpoint_counting_impl(
+        program,
+        slots,
+        origin_flows,
+        solver,
+        selectors,
+        is_mutable,
+        copy_lends,
+        LoopBackend::HardCheckRoundOptimize,
+    )
+}
+
+pub(super) fn verify_l2_to_fixpoint_counting_impl(
+    program: &RustProgram,
+    slots: &CrateSlots,
+    origin_flows: &OriginFlowResults,
+    solver: &KindSolver,
+    selectors: &Selectors,
+    is_mutable: impl MutProvider + Copy,
+    copy_lends: Option<&FxHashSet<CopyLendPair>>,
+    backend: LoopBackend,
+) -> (Option<FxHashMap<SlotRef, SlotKind>>, RoundStats) {
     // D17: re-assert the load-bearing precondition at the door, not only at the
     // env entry. `debug_assert!` rather than `assert!` so the release-path cost
     // and behaviour of the existing single choke point are unchanged.
@@ -1151,12 +1219,15 @@ pub(crate) fn verify_l2_to_fixpoint_counting(
     let mut planner = Planner::new(slot_count);
 
     super::coherence::constrain_field_ownership(solver, slots, program);
+    let hard =
+        matches!(backend, LoopBackend::HardCheckRoundOptimize).then(|| solver.hard_loop_solver());
     let mut stats = RoundStats {
         repair: RepairMode::ModeA,
         ..RoundStats::default()
     };
 
-    let (mut model, dropped) = match solver.model_kinds_relaxing_reporting_l2(selectors) {
+    let (mut model, dropped) = match solve_l2_round_model(solver, selectors, backend, hard.as_ref())
+    {
         L2SolveResult::Sat { kinds, dropped } => (kinds, dropped),
         L2SolveResult::Unsat => {
             record_l2_decline(
@@ -1312,7 +1383,7 @@ pub(crate) fn verify_l2_to_fixpoint_counting(
         stats.commits_conflict += actions.len();
         stats.commits_per_round.push(actions.len());
 
-        match solver.model_kinds_relaxing_reporting_l2(selectors) {
+        match solve_l2_round_model(solver, selectors, backend, hard.as_ref()) {
             L2SolveResult::Sat { kinds, dropped } => {
                 model = kinds;
                 record_dropped(&mut stats, selectors, &dropped);

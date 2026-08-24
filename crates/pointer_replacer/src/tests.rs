@@ -9812,7 +9812,7 @@ mod borrow_ownership_solver {
             a5_overlap::{A5Mode, apply_coarse_constraints},
             crate_slots::CrateSlots,
             slots::SlotId,
-            solver::{KindSolver, SlotRef},
+            solver::{KindSolver, Selectors, SlotRef},
         },
         utils::rustc::RustProgram,
     };
@@ -9908,6 +9908,43 @@ pub unsafe fn g(pp: *mut *mut i32) -> i32 {
             let model = ks.model_kinds().expect("satisfiable model");
             assert_eq!(model.get(&s0), Some(&SlotKind::Ref));
             assert_eq!(model.get(&s1), Some(&SlotKind::Ref));
+        });
+    }
+
+    #[test]
+    fn hard_loop_materializes_only_the_optimized_round_model() {
+        with_g_slots(|_, slots, g, d0, d1| {
+            let solver = KindSolver::new(slots);
+            let hard = solver.hard_loop_solver();
+            let relaxed = solver
+                .relax_selectors_hard_reporting(&hard, &Selectors::new(Vec::new(), Vec::new()))
+                .expect("empty selector set is hard-SAT");
+            let model = solver
+                .optimized_model_under(&relaxed)
+                .expect("optimized round model");
+
+            assert_eq!(model.get(&SlotRef::Local(g, d0)), Some(&SlotKind::Ref));
+            assert_eq!(model.get(&SlotRef::Local(g, d1)), Some(&SlotKind::Ref));
+            assert_eq!(solver.hard_check_count(), 1);
+            assert_eq!(solver.optimize_materialization_count(), 1);
+            assert_eq!(solver.check_sat_count(), 2);
+            assert!(solver.hard_check_elapsed() > std::time::Duration::ZERO);
+            assert!(solver.optimize_materialization_elapsed() > std::time::Duration::ZERO);
+        });
+    }
+
+    #[test]
+    fn hard_loop_snapshots_and_syncs_only_hard_assertions() {
+        with_g_slots(|_, slots, g, d0, _| {
+            let solver = KindSolver::new(slots);
+            let hard = solver.hard_loop_solver();
+
+            assert_eq!(hard.assertion_count(), solver.hard_assertion_count());
+            let before = hard.assertion_count();
+            solver.add_borrow_exclusion(Some(SlotRef::Local(g, d0)), &[]);
+            assert_eq!(hard.sync_from(&solver), 1);
+            assert_eq!(hard.assertion_count(), before + 1);
+            assert_eq!(hard.assertion_count(), solver.hard_assertion_count());
         });
     }
 
@@ -10062,7 +10099,10 @@ mod borrow_ownership_coherence {
                 mutability_facts::MutFacts,
                 origins::{collect_no_borrow_origin_slots, compute_origins},
                 slots::{SlotId, SlotOwner, StructFieldSlot},
-                solver::{BoOwnDatabase, KindSolver, SlotRef},
+                solver::{
+                    BoOwnDatabase, KindSolver, SelectorTrace, Selectors, SlotRef,
+                    with_selector_trace,
+                },
                 sources::collect_malloc_source_slots,
                 ssa::constraint::{Database, Gen, Var},
             },
@@ -10139,6 +10179,88 @@ mod borrow_ownership_coherence {
             .unwrap_or_else(|| panic!("slot for local {local:?} depth {depth}"));
 
         SlotRef::Local(fn_did, slot)
+    }
+
+    fn selector_final_sets(trace: &SelectorTrace) -> Vec<(Vec<usize>, Vec<usize>)> {
+        trace
+            .epochs
+            .iter()
+            .map(|epoch| {
+                let mut dropped = epoch.final_dropped.clone();
+                dropped.sort_unstable();
+                dropped.dedup();
+                let active = (0..trace.total)
+                    .filter(|index| dropped.binary_search(index).is_err())
+                    .collect();
+                (dropped, active)
+            })
+            .collect()
+    }
+
+    fn dropped_selector_set(selectors: &Selectors, dropped: &[z3::ast::Bool]) -> Vec<usize> {
+        let mut dropped = dropped
+            .iter()
+            .map(|selector| {
+                selectors
+                    .index_of(selector)
+                    .expect("dropped selector belongs to the selector universe")
+            })
+            .collect::<Vec<_>>();
+        dropped.sort_unstable();
+        dropped.dedup();
+        dropped
+    }
+
+    fn selector_trace_sidecar(case: &str, legacy: &SelectorTrace, hard: &SelectorTrace) -> String {
+        let mut output = String::from(
+            "case\tbackend\tepoch\tstep\tphase\tselector\tactive_before\tcore_members\toutcome\tfinal_dropped\tfinal_active\n",
+        );
+        for (backend, trace) in [("legacy-optimize", legacy), ("plain-solver", hard)] {
+            for (epoch_index, epoch) in trace.epochs.iter().enumerate() {
+                let (final_dropped, final_active) = selector_final_sets(trace)[epoch_index].clone();
+                let join = |items: &[usize]| {
+                    items
+                        .iter()
+                        .map(usize::to_string)
+                        .collect::<Vec<_>>()
+                        .join(",")
+                };
+                for (step, event) in epoch.events.iter().enumerate() {
+                    let mut core = event.core_selectors.clone();
+                    core.sort_unstable();
+                    core.dedup();
+                    output.push_str(&format!(
+                        "{case}\t{backend}\t{epoch_index}\t{}\t{:?}\t{}\t{}\t{}\t{:?}\t{}\t{}\n",
+                        step + 1,
+                        event.phase,
+                        event.selector_index,
+                        join(&event.active_before),
+                        join(&core),
+                        event.outcome,
+                        join(&final_dropped),
+                        join(&final_active),
+                    ));
+                }
+            }
+        }
+        output
+    }
+
+    fn maybe_write_selector_trace_sidecar(
+        case: &str,
+        legacy: &SelectorTrace,
+        hard: &SelectorTrace,
+    ) {
+        let Some(directory) = std::env::var_os("CRAT_S24R1_SELECTOR_SIDECAR_DIR") else {
+            return;
+        };
+        let directory = std::path::PathBuf::from(directory);
+        std::fs::create_dir_all(&directory).expect("create S2-4-R1 selector sidecar directory");
+        std::fs::write(
+            directory.join(format!("{case}.tsv")),
+            selector_trace_sidecar(case, legacy, hard),
+        )
+        .expect("write S2-4-R1 selector sidecar");
     }
 
     /// The `Local` whose source-level variable name is `name`, via MIR debug info.
@@ -10641,9 +10763,32 @@ pub unsafe fn sink_side(a: *mut core::ffi::c_void) -> *mut core::ffi::c_void {
 
                 // RETENTION under the relax loop: leak exactly the sink,
                 // retain the source.
-                let (model, dropped) = kind_solver
-                    .model_kinds_relaxing_reporting(&selectors)
-                    .expect("relax loop must converge to SAT");
+                let ((model, dropped), legacy_trace) = with_selector_trace(|| {
+                    kind_solver
+                        .model_kinds_relaxing_reporting(&selectors)
+                        .expect("legacy relax loop must converge to SAT")
+                });
+                let ((hard_model, hard_dropped), hard_trace) = with_selector_trace(|| {
+                    let hard = kind_solver.hard_loop_solver();
+                    let relaxed = kind_solver
+                        .relax_selectors_hard_reporting(&hard, &selectors)
+                        .expect("hard relax loop must converge to SAT");
+                    let dropped = relaxed.dropped().to_vec();
+                    let model = kind_solver
+                        .optimized_model_under(&relaxed)
+                        .expect("hard decisions admit an optimized model");
+                    (model, dropped)
+                });
+                assert_eq!(
+                    selector_final_sets(&legacy_trace),
+                    selector_final_sets(&hard_trace)
+                );
+                maybe_write_selector_trace_sidecar("mixed-tie", &legacy_trace, &hard_trace);
+                assert_eq!(
+                    dropped_selector_set(&selectors, &hard_dropped),
+                    dropped_selector_set(&selectors, &dropped)
+                );
+                assert_eq!(hard_model, model);
                 assert_eq!(
                     dropped.len(),
                     1,
@@ -10774,9 +10919,35 @@ pub unsafe fn sink_side2(a2: *mut core::ffi::c_void) -> *mut core::ffi::c_void {
 
                 // POLICY PIN: both sinks leak, the source is retained — a
                 // 2-leak outcome preferred over the 1-leak source drop.
-                let (model, dropped) = kind_solver
-                    .model_kinds_relaxing_reporting(&selectors)
-                    .expect("relax loop must converge to SAT");
+                let ((model, dropped), legacy_trace) = with_selector_trace(|| {
+                    kind_solver
+                        .model_kinds_relaxing_reporting(&selectors)
+                        .expect("legacy relax loop must converge to SAT")
+                });
+                let ((hard_model, hard_dropped), hard_trace) = with_selector_trace(|| {
+                    let hard = kind_solver.hard_loop_solver();
+                    let relaxed = kind_solver
+                        .relax_selectors_hard_reporting(&hard, &selectors)
+                        .expect("hard relax loop must converge to SAT");
+                    let dropped = relaxed.dropped().to_vec();
+                    let model = kind_solver
+                        .optimized_model_under(&relaxed)
+                        .expect("hard decisions admit an optimized model");
+                    (model, dropped)
+                });
+                assert_eq!(
+                    selector_final_sets(&legacy_trace),
+                    selector_final_sets(&hard_trace)
+                );
+                let sidecar = selector_trace_sidecar("mixed-fanout", &legacy_trace, &hard_trace);
+                assert!(sidecar.contains("legacy-optimize"));
+                assert!(sidecar.contains("plain-solver"));
+                maybe_write_selector_trace_sidecar("mixed-fanout", &legacy_trace, &hard_trace);
+                assert_eq!(
+                    dropped_selector_set(&selectors, &hard_dropped),
+                    dropped_selector_set(&selectors, &dropped)
+                );
+                assert_eq!(hard_model, model);
                 assert_eq!(
                     dropped.len(),
                     2,

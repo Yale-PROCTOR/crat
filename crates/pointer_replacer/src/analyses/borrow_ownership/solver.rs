@@ -1,13 +1,13 @@
 use std::{
     cell::{Cell, RefCell},
     ops::Range,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use rustc_hash::FxHashMap;
 use rustc_index::IndexVec;
 use rustc_span::def_id::LocalDefId;
-use z3::{Model, Optimize, SatResult, ast::Bool};
+use z3::{Model, Optimize, SatResult, Solver, ast::Bool};
 
 use super::{
     SlotKind,
@@ -334,6 +334,56 @@ pub struct KindSolver {
     vars: FxHashMap<SlotRef, KindVars>,
     tracker: Option<CoreTracker>,
     check_sat_count: Cell<usize>,
+    hard_check_count: Cell<usize>,
+    optimize_materialization_count: Cell<usize>,
+    hard_check_elapsed: Cell<Duration>,
+    optimize_materialization_elapsed: Cell<Duration>,
+}
+
+/// R1a's private hard-query backend. It snapshots only `Optimize`'s hard
+/// assertions; soft preferences remain owned by `KindSolver::solver` and are
+/// consulted only by `optimized_model_under`.
+pub(crate) struct HardLoopSolver {
+    solver: Solver,
+    synced_assertions: Cell<usize>,
+}
+
+impl HardLoopSolver {
+    pub(crate) fn assertion_count(&self) -> usize {
+        self.solver.get_assertions().len()
+    }
+
+    /// Append hard assertions added since the previous synchronization.
+    pub(crate) fn sync_from(&self, source: &KindSolver) -> usize {
+        let assertions = source.solver.get_assertions();
+        let synced = self.synced_assertions.get();
+        assert!(
+            assertions.len() >= synced,
+            "Optimize hard assertions cannot shrink during validation"
+        );
+        for assertion in &assertions[synced..] {
+            self.solver.assert(assertion);
+        }
+        self.synced_assertions.set(assertions.len());
+        assertions.len() - synced
+    }
+}
+
+pub(crate) struct RelaxedSelectors {
+    assumptions: Vec<Bool>,
+    dropped: Vec<Bool>,
+}
+
+enum HardRelaxResult {
+    Sat(RelaxedSelectors),
+    Unsat,
+    Unknown,
+}
+
+impl RelaxedSelectors {
+    pub(crate) fn dropped(&self) -> &[Bool] {
+        &self.dropped
+    }
 }
 
 impl KindSolver {
@@ -405,6 +455,10 @@ impl KindSolver {
             vars,
             tracker,
             check_sat_count: Cell::new(0),
+            hard_check_count: Cell::new(0),
+            optimize_materialization_count: Cell::new(0),
+            hard_check_elapsed: Cell::new(Duration::ZERO),
+            optimize_materialization_elapsed: Cell::new(Duration::ZERO),
         }
     }
 
@@ -847,10 +901,65 @@ impl KindSolver {
         self.check_sat_count.get()
     }
 
+    pub(crate) fn hard_check_count(&self) -> usize {
+        self.hard_check_count.get()
+    }
+
+    pub(crate) fn optimize_materialization_count(&self) -> usize {
+        self.optimize_materialization_count.get()
+    }
+
+    pub(crate) fn hard_check_elapsed(&self) -> Duration {
+        self.hard_check_elapsed.get()
+    }
+
+    pub(crate) fn optimize_materialization_elapsed(&self) -> Duration {
+        self.optimize_materialization_elapsed.get()
+    }
+
+    pub(crate) fn hard_assertion_count(&self) -> usize {
+        self.solver.get_assertions().len()
+    }
+
+    pub(crate) fn hard_loop_solver(&self) -> HardLoopSolver {
+        assert!(
+            self.tracker.is_none(),
+            "tracked KindSolver must not enter the production hard loop"
+        );
+        let solver = Solver::new();
+        let assertions = self.solver.get_assertions();
+        for assertion in &assertions {
+            solver.assert(assertion);
+        }
+        HardLoopSolver {
+            solver,
+            synced_assertions: Cell::new(assertions.len()),
+        }
+    }
+
     pub(crate) fn check_with_assumptions(&self, assumptions: &[Bool]) -> SatResult {
         self.check_sat_count
             .set(self.check_sat_count.get().saturating_add(1));
         self.solver.check(assumptions)
+    }
+
+    fn hard_check_with_assumptions(
+        &self,
+        hard: &HardLoopSolver,
+        assumptions: &[Bool],
+    ) -> SatResult {
+        self.check_sat_count
+            .set(self.check_sat_count.get().saturating_add(1));
+        self.hard_check_count
+            .set(self.hard_check_count.get().saturating_add(1));
+        let started = Instant::now();
+        let outcome = hard.solver.check_assumptions(assumptions);
+        self.hard_check_elapsed.set(
+            self.hard_check_elapsed
+                .get()
+                .saturating_add(started.elapsed()),
+        );
+        outcome
     }
 
     pub(crate) fn optimize(&self) -> &Optimize {
@@ -897,6 +1006,189 @@ impl KindSolver {
         let model = self.solver.get_model()?;
         self.read_version_owns(&model);
         Some(self.read_kinds(&model))
+    }
+
+    /// Resolve the maximal selector assumption set using only the hard
+    /// constraints mirrored into a plain `z3::Solver`. No model is exposed by
+    /// this API; validation must call `optimized_model_under` next.
+    pub(crate) fn relax_selectors_hard_reporting(
+        &self,
+        hard: &HardLoopSolver,
+        selectors: &Selectors,
+    ) -> Option<RelaxedSelectors> {
+        match self.relax_selectors_hard_typed(hard, selectors) {
+            HardRelaxResult::Sat(relaxed) => Some(relaxed),
+            HardRelaxResult::Unsat | HardRelaxResult::Unknown => None,
+        }
+    }
+
+    fn relax_selectors_hard_typed(
+        &self,
+        hard: &HardLoopSolver,
+        selectors: &Selectors,
+    ) -> HardRelaxResult {
+        assert!(
+            self.tracker.is_none(),
+            "tracked KindSolver must not enter hard selector relaxation"
+        );
+        hard.sync_from(self);
+        let mut assumptions = selectors.all().to_vec();
+        let mut dropped = Vec::new();
+        let trace_epoch = SELECTOR_TRACE_CAPTURE.with(|capture| {
+            let mut capture = capture.borrow_mut();
+            let trace = capture.as_mut()?;
+            if trace.epochs.is_empty() {
+                trace.n_sources = selectors.n_sources;
+                trace.total = selectors.all.len();
+            } else {
+                assert_eq!(trace.n_sources, selectors.n_sources);
+                assert_eq!(trace.total, selectors.all.len());
+            }
+            let epoch = trace.epochs.len();
+            trace.epochs.push(SelectorEpochTrace::default());
+            Some(epoch)
+        });
+
+        loop {
+            match self.hard_check_with_assumptions(hard, &assumptions) {
+                SatResult::Sat => break,
+                SatResult::Unsat => {
+                    let core = hard.solver.get_unsat_core();
+                    let in_core = |selector: &Bool| core.iter().any(|item| item == selector);
+                    let Some(index) = assumptions
+                        .iter()
+                        .position(|selector| selectors.is_sink(selector) && in_core(selector))
+                        .or_else(|| assumptions.iter().position(in_core))
+                    else {
+                        return HardRelaxResult::Unsat;
+                    };
+                    if let Some(epoch) = trace_epoch {
+                        let selector_index = selectors
+                            .index_of(&assumptions[index])
+                            .expect("active selector belongs to selector universe");
+                        SELECTOR_TRACE_CAPTURE.with(|capture| {
+                            let mut capture = capture.borrow_mut();
+                            let trace = capture.as_mut().expect("selector trace active");
+                            trace.epochs[epoch].events.push(SelectorTraceEvent {
+                                epoch,
+                                phase: SelectorTracePhase::Drop,
+                                selector_index,
+                                active_before: selectors.indices_of(&assumptions),
+                                core_selectors: selectors.indices_of(&core),
+                                outcome: SelectorTraceOutcome::Dropped,
+                            });
+                        });
+                    }
+                    dropped.push(assumptions.swap_remove(index));
+                }
+                SatResult::Unknown => return HardRelaxResult::Unknown,
+            }
+        }
+
+        let mut index = 0;
+        while index < dropped.len() {
+            let selector = dropped[index].clone();
+            assumptions.push(selector.clone());
+            let outcome = self.hard_check_with_assumptions(hard, &assumptions);
+            if let Some(epoch) = trace_epoch {
+                let selector_index = selectors
+                    .index_of(&selector)
+                    .expect("dropped selector belongs to selector universe");
+                let core = (outcome == SatResult::Unsat)
+                    .then(|| hard.solver.get_unsat_core())
+                    .unwrap_or_default();
+                SELECTOR_TRACE_CAPTURE.with(|capture| {
+                    let mut capture = capture.borrow_mut();
+                    let trace = capture.as_mut().expect("selector trace active");
+                    trace.epochs[epoch].events.push(SelectorTraceEvent {
+                        epoch,
+                        phase: SelectorTracePhase::Reenable,
+                        selector_index,
+                        active_before: selectors.indices_of(&assumptions),
+                        core_selectors: selectors.indices_of(&core),
+                        outcome: if outcome == SatResult::Sat {
+                            SelectorTraceOutcome::Restored
+                        } else {
+                            SelectorTraceOutcome::StayedDropped
+                        },
+                    });
+                });
+            }
+            match outcome {
+                SatResult::Sat => {
+                    dropped.swap_remove(index);
+                }
+                SatResult::Unsat => {
+                    assumptions.pop();
+                    index += 1;
+                }
+                SatResult::Unknown => return HardRelaxResult::Unknown,
+            }
+        }
+
+        if let Some(epoch) = trace_epoch {
+            SELECTOR_TRACE_CAPTURE.with(|capture| {
+                let mut capture = capture.borrow_mut();
+                let trace = capture.as_mut().expect("selector trace active");
+                trace.epochs[epoch].final_dropped = selectors.indices_of(&dropped);
+            });
+        }
+        HardRelaxResult::Sat(RelaxedSelectors {
+            assumptions,
+            dropped,
+        })
+    }
+
+    /// Materialize the objective-selected model for one validation round after
+    /// hard-only selector decisions have fixed its active assumptions.
+    pub(crate) fn optimized_model_under(
+        &self,
+        relaxed: &RelaxedSelectors,
+    ) -> Option<FxHashMap<SlotRef, SlotKind>> {
+        self.optimize_materialization_count
+            .set(self.optimize_materialization_count.get().saturating_add(1));
+        let started = Instant::now();
+        if self.check_with_assumptions(&relaxed.assumptions) != SatResult::Sat {
+            self.optimize_materialization_elapsed.set(
+                self.optimize_materialization_elapsed
+                    .get()
+                    .saturating_add(started.elapsed()),
+            );
+            return None;
+        }
+        let Some(model) = self.solver.get_model() else {
+            self.optimize_materialization_elapsed.set(
+                self.optimize_materialization_elapsed
+                    .get()
+                    .saturating_add(started.elapsed()),
+            );
+            return None;
+        };
+        self.read_version_owns(&model);
+        let kinds = self.read_kinds(&model);
+        self.optimize_materialization_elapsed.set(
+            self.optimize_materialization_elapsed
+                .get()
+                .saturating_add(started.elapsed()),
+        );
+        Some(kinds)
+    }
+
+    pub(crate) fn model_kinds_decomposed_reporting_l2(
+        &self,
+        hard: &HardLoopSolver,
+        selectors: &Selectors,
+    ) -> L2SolveResult {
+        match self.relax_selectors_hard_typed(hard, selectors) {
+            HardRelaxResult::Sat(relaxed) => {
+                let dropped = relaxed.dropped.clone();
+                self.optimized_model_under(&relaxed)
+                    .map(|kinds| L2SolveResult::Sat { kinds, dropped })
+                    .unwrap_or(L2SolveResult::Unknown)
+            }
+            HardRelaxResult::Unsat => L2SolveResult::Unsat,
+            HardRelaxResult::Unknown => L2SolveResult::Unknown,
+        }
     }
 
     /// Solve assuming all of `selectors` (reproducing the hard sources and

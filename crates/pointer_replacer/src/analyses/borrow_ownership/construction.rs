@@ -16,6 +16,10 @@ use rustc_span::def_id::LocalDefId;
 use sha2::{Digest, Sha256};
 
 #[cfg(test)]
+use super::borrow_verify::{
+    LoopBackend, verify_l2_to_fixpoint_counting_impl, verify_to_fixpoint_counting_with_flows_impl,
+};
+#[cfg(test)]
 use super::coherence::add_coherence_tagging_uses;
 use super::{
     BoOwnEmissionStats, CrateCtxt, SlotKind,
@@ -231,6 +235,10 @@ pub(crate) struct VerifiedBo {
     pub(crate) construction_emit_elapsed: Duration,
     pub(crate) construction_coherence_elapsed: Duration,
     pub(crate) check_sat_count: usize,
+    pub(crate) hard_check_count: usize,
+    pub(crate) optimize_materialization_count: usize,
+    pub(crate) hard_check_elapsed: Duration,
+    pub(crate) optimize_materialization_elapsed: Duration,
     pub(crate) planned_c9_marks: BTreeSet<C9MarkKey>,
     pub(crate) producer_stats: super::a5_producer::A5ProducerStats,
 }
@@ -764,6 +772,83 @@ pub(crate) fn verify_bo_construction_counting(
     }
 }
 
+#[cfg(test)]
+#[derive(Clone, Copy)]
+pub(crate) enum TestValidationBackend {
+    LegacyOptimize,
+    HardCheckRoundOptimize,
+}
+
+#[cfg(test)]
+impl TestValidationBackend {
+    fn loop_backend(self) -> LoopBackend {
+        match self {
+            Self::LegacyOptimize => LoopBackend::LegacyOptimize,
+            Self::HardCheckRoundOptimize => LoopBackend::HardCheckRoundOptimize,
+        }
+    }
+}
+
+/// Test-only differential door. Construction remains identical to production;
+/// only the selector-check backend is varied after the shared construction has
+/// been built.
+#[cfg(test)]
+pub(crate) fn verify_bo_construction_counting_for_test(
+    program: &RustProgram<'_>,
+    slots: &CrateSlots,
+    origins: &OriginSummaries,
+    solver: &KindSolver,
+    construction: &BoConstruction,
+    mut_facts: &MutFacts,
+    backend: TestValidationBackend,
+) -> (
+    Option<FxHashMap<SlotRef, SlotKind>>,
+    super::borrow_verify::RoundStats,
+) {
+    let copy_lends =
+        (construction.mode == CopyLendMode::LendArm).then_some(&construction.eligibility.pairs);
+    verify_to_fixpoint_counting_with_flows_impl(
+        program,
+        slots,
+        origins.native_flows(),
+        solver,
+        &construction.selectors,
+        mut_facts,
+        copy_lends,
+        None,
+        backend.loop_backend(),
+    )
+}
+
+/// L2 twin of `verify_bo_construction_counting_for_test`, owned by the same
+/// production construction boundary.
+#[cfg(test)]
+pub(crate) fn verify_bo_construction_l2_for_test(
+    program: &RustProgram<'_>,
+    slots: &CrateSlots,
+    origins: &OriginSummaries,
+    solver: &KindSolver,
+    construction: &BoConstruction,
+    mut_facts: &MutFacts,
+    backend: TestValidationBackend,
+) -> (
+    Option<FxHashMap<SlotRef, SlotKind>>,
+    super::borrow_verify::RoundStats,
+) {
+    let copy_lends =
+        (construction.mode == CopyLendMode::LendArm).then_some(&construction.eligibility.pairs);
+    verify_l2_to_fixpoint_counting_impl(
+        program,
+        slots,
+        origins.native_flows(),
+        solver,
+        &construction.selectors,
+        mut_facts,
+        copy_lends,
+        backend.loop_backend(),
+    )
+}
+
 pub(crate) fn solve_bo_a5_config(
     program: &RustProgram<'_>,
     slots: &CrateSlots,
@@ -832,6 +917,10 @@ pub(crate) fn solve_bo_a5_config(
             construction_emit_elapsed: baseline_construction.emit_elapsed,
             construction_coherence_elapsed: baseline_construction.coherence_elapsed,
             check_sat_count: baseline_solver.check_sat_count(),
+            hard_check_count: baseline_solver.hard_check_count(),
+            optimize_materialization_count: baseline_solver.optimize_materialization_count(),
+            hard_check_elapsed: baseline_solver.hard_check_elapsed(),
+            optimize_materialization_elapsed: baseline_solver.optimize_materialization_elapsed(),
             planned_c9_marks: BTreeSet::new(),
             producer_stats: plan.stats,
         });
@@ -875,6 +964,10 @@ pub(crate) fn solve_bo_a5_config(
             construction_emit_elapsed: baseline_construction.emit_elapsed,
             construction_coherence_elapsed: baseline_construction.coherence_elapsed,
             check_sat_count: baseline_solver.check_sat_count(),
+            hard_check_count: baseline_solver.hard_check_count(),
+            optimize_materialization_count: baseline_solver.optimize_materialization_count(),
+            hard_check_elapsed: baseline_solver.hard_check_elapsed(),
+            optimize_materialization_elapsed: baseline_solver.optimize_materialization_elapsed(),
             planned_c9_marks: plan
                 .planned_marks
                 .iter()
@@ -960,6 +1053,10 @@ pub(crate) fn solve_bo_a5_config(
         construction_emit_elapsed: construction.emit_elapsed,
         construction_coherence_elapsed: construction.coherence_elapsed,
         check_sat_count: solver.check_sat_count(),
+        hard_check_count: solver.hard_check_count(),
+        optimize_materialization_count: solver.optimize_materialization_count(),
+        hard_check_elapsed: solver.hard_check_elapsed(),
+        optimize_materialization_elapsed: solver.optimize_materialization_elapsed(),
         planned_c9_marks: plan
             .planned_marks
             .iter()

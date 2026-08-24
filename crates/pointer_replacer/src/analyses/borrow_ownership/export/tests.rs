@@ -16,8 +16,13 @@ use crate::{
             verify_to_fixpoint, verify_to_fixpoint_counting,
         },
         coherence::add_coherence,
+        construction::{
+            CopyLendMode, TestValidationBackend, construct_bo_into,
+            verify_bo_construction_counting_for_test, verify_bo_construction_l2_for_test,
+        },
         crate_slots::CrateSlots,
         emit_crate_ownership_constraints, l2,
+        mutability_facts::MutFacts,
         origin_flow::analyze_program_origin_flow,
         origins::compute_origins,
         solver::{KindSolver, SlotRef},
@@ -793,6 +798,53 @@ fn capture_solve_counting(
     .unwrap_or_else(|e| e.raise())
 }
 
+fn capture_solve_counting_backend(
+    code: &str,
+    backend: TestValidationBackend,
+) -> (
+    Option<FxHashMap<SlotRef, super::SlotKindAlias>>,
+    RoundStats,
+    BoExport,
+) {
+    ::utils::compilation::run_compiler_on_str(code, move |tcx| {
+        let program = collect_program(tcx);
+        let slots = CrateSlots::build(&program);
+        let origins = compute_origins(&program);
+        let mut_facts = MutFacts::from_program(&program);
+        let ((model, stats), export) = with_bo_export(|| {
+            let solver = KindSolver::new(&slots);
+            let construction = construct_bo_into(
+                &program,
+                &slots,
+                &origins,
+                &mut_facts,
+                &solver,
+                CopyLendMode::Baseline,
+            )
+            .expect("shared construction");
+            verify_bo_construction_counting_for_test(
+                &program,
+                &slots,
+                &origins,
+                &solver,
+                &construction,
+                &mut_facts,
+                backend,
+            )
+        });
+        (model, stats, export)
+    })
+    .unwrap_or_else(|error| error.raise())
+}
+
+#[test]
+fn decomposed_multi_round_model_commits_and_export_match_legacy() {
+    let legacy = capture_solve_counting_backend(CASCADE, TestValidationBackend::LegacyOptimize);
+    let decomposed =
+        capture_solve_counting_backend(CASCADE, TestValidationBackend::HardCheckRoundOptimize);
+    assert_eq!(decomposed, legacy);
+}
+
 /// Solve through the **L2 guarded-commit loop**, under export capture (D2).
 ///
 /// **D10** — this used to `set_var("CRAT_BO_L2_GUARDED_COMMITS", "1")` inside a
@@ -850,6 +902,53 @@ fn capture_solve_l2(
         (model, stats, export)
     })
     .unwrap_or_else(|e| e.raise())
+}
+
+fn capture_solve_l2_backend(
+    code: &str,
+    backend: TestValidationBackend,
+) -> (
+    Option<FxHashMap<SlotRef, super::SlotKindAlias>>,
+    RoundStats,
+    BoExport,
+) {
+    ::utils::compilation::run_compiler_on_str(code, move |tcx| {
+        let program = collect_program(tcx);
+        let slots = CrateSlots::build(&program);
+        let origins = compute_origins(&program);
+        let mut_facts = MutFacts::from_program(&program);
+        let ((model, stats), export) = with_bo_export(|| {
+            let solver = KindSolver::new(&slots);
+            let construction = construct_bo_into(
+                &program,
+                &slots,
+                &origins,
+                &mut_facts,
+                &solver,
+                CopyLendMode::Baseline,
+            )
+            .expect("shared construction");
+            verify_bo_construction_l2_for_test(
+                &program,
+                &slots,
+                &origins,
+                &solver,
+                &construction,
+                &mut_facts,
+                backend,
+            )
+        });
+        (model, stats, export)
+    })
+    .unwrap_or_else(|error| error.raise())
+}
+
+#[test]
+fn decomposed_l2_model_actions_and_export_match_legacy() {
+    let legacy = capture_solve_l2_backend(CASCADE, TestValidationBackend::LegacyOptimize);
+    let decomposed =
+        capture_solve_l2_backend(CASCADE, TestValidationBackend::HardCheckRoundOptimize);
+    assert_eq!(decomposed, legacy);
 }
 
 /// **D2** — the witnessed/L2 replay path must capture loans too.
