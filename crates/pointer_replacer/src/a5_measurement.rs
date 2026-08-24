@@ -57,6 +57,11 @@ const BASE_SENTINEL: &str = "A5P1BASE ";
 const PAIR_SENTINEL: &str = "A5P1PAIR\t";
 const W14_PAIR_SENTINEL: &str = "A5W14PAIR\t";
 const W14_EXPOSURE_SENTINEL: &str = "A5W14EXPOSURE\t";
+
+fn relative_w14_span(span: String) -> String {
+    span.find("benchmarks/")
+        .map_or(span.clone(), |index| span[index..].to_owned())
+}
 const REPLAY_SAFE_DEFINITION: &str = "no incompatible access derived by precise replay with the effective parameter-overlap map injected; O2 closed-world frozen graph.";
 const CLOSED_WORLD_FRAME_UNKNOWN_REACHABLE: usize = 2_318;
 const CLOSED_WORLD_FRAME_LOCAL_FUNCTIONS: usize = 2_456;
@@ -1757,9 +1762,11 @@ fn measure_tcx(
                     "{}:bb{}:{}:{}",
                     caller_path,
                     block.index(),
-                    tcx.sess
-                        .source_map()
-                        .span_to_diagnostic_string(block_data.terminator().source_info.span),
+                    relative_w14_span(
+                        tcx.sess
+                            .source_map()
+                            .span_to_diagnostic_string(block_data.terminator().source_info.span),
+                    ),
                     target_paths.into_iter().collect::<Vec<_>>().join("|")
                 ),
                 targets: target_functions,
