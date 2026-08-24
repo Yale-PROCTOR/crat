@@ -10368,6 +10368,115 @@ unsafe fn tainted_caller(c: *mut Cell) -> i32 {
         );
     }
 
+    #[test]
+    fn a16_refined_input_ub_scope_controls() {
+        run_compiler(
+            r#"
+unsafe fn make() -> *mut i32 {
+    let mut value = 1;
+    let p = &mut value as *mut i32;
+    p
+}
+pub unsafe fn f() -> i32 {
+    let q = make();
+    *q
+}
+"#,
+            |tcx| {
+                let program = collect_program(tcx);
+                let slots = CrateSlots::build(&program);
+                let origins = compute_origins(&program);
+                let mut_facts = MutFacts::from_program(&program);
+                let solver = KindSolver::new(&slots);
+                let (_, links) =
+                    construct_bo_into_a16_refined(&program, &slots, &origins, &mut_facts, &solver)
+                        .expect("input-UB diagnostic construction");
+                assert_eq!(
+                    links, 0,
+                    "a stack-local return is not a modeled argument origin"
+                );
+            },
+        );
+
+        run_compiler(
+            r#"
+unsafe extern "C" {
+    fn malloc(size: usize) -> *mut core::ffi::c_void;
+    fn free(ptr: *mut core::ffi::c_void);
+}
+unsafe fn inner(p: *mut i32) -> *mut i32 { p }
+unsafe fn writer(p: *mut i32) { *p = 2; }
+unsafe fn middle(p: *mut i32) -> *mut i32 {
+    let q = inner(p);
+    writer(p);
+    q
+}
+pub unsafe fn f() -> i32 {
+    let owner = malloc(4) as *mut i32;
+    let q = middle(owner);
+    let value = *q;
+    free(owner as *mut core::ffi::c_void);
+    value
+}
+"#,
+            |tcx| {
+                let program = collect_program(tcx);
+                let slots = CrateSlots::build(&program);
+                let origins = compute_origins(&program);
+                let mut_facts = MutFacts::from_program(&program);
+                let f = function_by_name(&program, "f");
+                let q = local_slot(&slots, f, local_by_var_name(tcx, f, "q"), 0);
+
+                let baseline_solver = KindSolver::new(&slots);
+                let baseline = construct_bo_into(
+                    &program,
+                    &slots,
+                    &origins,
+                    &mut_facts,
+                    &baseline_solver,
+                    CopyLendMode::Baseline,
+                )
+                .expect("UB-free control baseline construction");
+                let baseline_model = verify_bo_construction_counting(
+                    &program,
+                    &slots,
+                    &origins,
+                    &baseline_solver,
+                    &baseline,
+                    &mut_facts,
+                )
+                .0
+                .expect("UB-free control baseline model");
+                assert_eq!(baseline_model.get(&q), Some(&SlotKind::Ref));
+
+                let refined_solver = KindSolver::new(&slots);
+                let (refined, links) = construct_bo_into_a16_refined(
+                    &program,
+                    &slots,
+                    &origins,
+                    &mut_facts,
+                    &refined_solver,
+                )
+                .expect("UB-free control refined construction");
+                assert_eq!(
+                    links, 2,
+                    "both argument-derived return boundaries are linked"
+                );
+                let refined_model = verify_bo_construction_counting(
+                    &program,
+                    &slots,
+                    &origins,
+                    &refined_solver,
+                    &refined,
+                    &mut_facts,
+                )
+                .0
+                .expect("UB-free control refined model");
+                assert_eq!(refined_model.get(&q), Some(&SlotKind::Raw));
+            },
+        );
+    }
+
     /// Shared §8 BB3-b assertion for a mixed-role-local fixture (a local conflated to one
     /// flow-insensitive `Owning` slot that also carries a reference role). `verify_to_fixpoint`
     /// must accept a model with **no hidden `Ref`-vs-`Ref` aliasing**: the BB3-b under-report was
