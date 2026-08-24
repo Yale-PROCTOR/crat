@@ -8441,6 +8441,27 @@ mod run {
         let mut row = Row::default();
         let outcome = rewrite_m1_path(input);
         row.set("t_total_s", secs(t0.elapsed()));
+        if let Some(directory) = std::env::var_os("CRAT_A16_EMISSION_OBSERVER_DIR") {
+            let directory = std::path::PathBuf::from(directory);
+            std::fs::create_dir_all(&directory).expect("create A16 emission observer directory");
+            let degradations = match &outcome {
+                RewriteOutcome::Emitted {
+                    source,
+                    degradations,
+                    ..
+                } => {
+                    std::fs::write(directory.join("emitted-root.rs"), source)
+                        .expect("write A16 observed emitted root");
+                    degradations
+                }
+                RewriteOutcome::Degraded { degradations, .. } => degradations,
+            };
+            std::fs::write(
+                directory.join("degradations.tsv"),
+                a16_emission_ledger_tsv(degradations),
+            )
+            .expect("write A16 emission degradation ledger");
+        }
         let receipt_field = |key: &str| {
             outcome
                 .a5_receipt()
@@ -8679,6 +8700,24 @@ mod run {
             }
         }
         row
+    }
+
+    pub(super) fn a16_emission_ledger_tsv(
+        degradations: &[crate::bo_rewriter::decision::Degradation],
+    ) -> String {
+        let mut rows = degradations
+            .iter()
+            .map(|degradation| {
+                format!(
+                    "{}\t{}\t{}\n",
+                    degradation.subject,
+                    degradation.reason.key(),
+                    degradation.site,
+                )
+            })
+            .collect::<Vec<_>>();
+        rows.sort();
+        format!("subject\treason\tsite\n{}", rows.concat())
     }
 
     pub fn run_m1_census(tcx: TyCtxt<'_>, t_tcx: Duration) -> Row {
@@ -14477,6 +14516,30 @@ mod fabrication_gate_witnesses {
             "two declarations mean the insertion ran per FILE, not per crate"
         );
     }
+}
+
+#[test]
+fn a16_emission_observer_is_sorted_and_typed() {
+    use crate::bo_rewriter::decision::{Degradation, DegradeReason};
+
+    let rows = [
+        Degradation {
+            subject: "z#2".to_owned(),
+            site: "z.rs:2".to_owned(),
+            reason: DegradeReason::KindRaw,
+        },
+        Degradation {
+            subject: "a#1".to_owned(),
+            site: "a.rs:1".to_owned(),
+            reason: DegradeReason::RevertedAfterVerifyFailure,
+        },
+    ];
+    assert_eq!(
+        run::a16_emission_ledger_tsv(&rows),
+        "subject\treason\tsite\n\
+a#1\treverted-after-verify-failure\ta.rs:1\n\
+z#2\tkind-raw\tz.rs:2\n"
+    );
 }
 
 // Worker (one program, one mode, one process).
