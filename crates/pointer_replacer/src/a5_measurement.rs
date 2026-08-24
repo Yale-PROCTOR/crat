@@ -5961,6 +5961,18 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    fn w14_source_roots_are_relative_and_stable() {
+        let left = relative_w14_span(
+            "/home/a/worktree/benchmarks/rs-crown-derived/binn/lib.rs:4:2: 4:9".to_owned(),
+        );
+        let right = relative_w14_span(
+            "/different/root/benchmarks/rs-crown-derived/binn/lib.rs:4:2: 4:9".to_owned(),
+        );
+        assert_eq!(left, right);
+        assert_eq!(left, "benchmarks/rs-crown-derived/binn/lib.rs:4:2: 4:9");
+    }
+
     fn set(values: &[&str]) -> BTreeSet<String> {
         values.iter().map(|value| (*value).to_owned()).collect()
     }

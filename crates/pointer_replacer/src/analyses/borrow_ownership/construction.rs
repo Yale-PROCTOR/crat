@@ -1301,6 +1301,14 @@ mod mode_tests {
     use super::*;
 
     #[test]
+    fn receipt_key_order_is_canonical_across_input_order() {
+        let left = canonical_receipt("z=3\nschema=x\ndata=true\nstatus=ok\na=1\n".to_owned());
+        let right = canonical_receipt("status=ok\na=1\ndata=true\nz=3\nschema=x\n".to_owned());
+        assert_eq!(left, right);
+        assert_eq!(left, "schema=x\nstatus=ok\ndata=true\na=1\nz=3\n");
+    }
+
+    #[test]
     fn copy_lend_production_stays_dormant_without_an_environment_switch() {
         assert_eq!(CopyLendMode::default(), CopyLendMode::Baseline);
         assert_eq!(CopyLendMode::default().label(), "baseline");
