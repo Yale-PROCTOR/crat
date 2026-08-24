@@ -41,6 +41,8 @@ use self::ownership_diagnostic_package::{
 };
 use crate::{analyses::borrow_ownership::solver::CORE_LABEL_FAMILIES, utils::rustc::RustProgram};
 
+#[path = "a16_return_kind_exposure.rs"]
+mod a16_return_kind_exposure;
 #[path = "a4_measurement.rs"]
 mod a4_measurement;
 #[path = "a4_source_census.rs"]
@@ -14546,6 +14548,7 @@ fn boc1_run_one() {
             "a4-source-census" => a4_source_census::run_worker(tcx, t_tcx),
             "a5-p1" => a5_measurement::run_worker(tcx, t_tcx),
             "a5-batch-model" => run::run_a5_batch_model(tcx, t_tcx),
+            "a16-return-kind-exposure" => a16_return_kind_exposure::run_worker(tcx, t_tcx),
             "a5-w14-drift-trace" => a5_measurement::run_w14_drift_trace_worker(tcx, t_tcx),
             "a5-production-site-join" => {
                 a5_measurement::run_production_site_join_worker(tcx, t_tcx)
