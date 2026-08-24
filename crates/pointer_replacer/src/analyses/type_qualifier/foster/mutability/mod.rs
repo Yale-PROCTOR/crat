@@ -158,15 +158,15 @@ impl<'infer, 'tcx, D: HasLocalDecls<'tcx>> Visitor<'tcx> for MutabilityAnalysis<
                     &mut rhs_deref,
                 );
 
-                // type safety
-                assert_eq!(
-                    lhs.end.index() - lhs.start.index(),
-                    rhs.end.index() - rhs.start.index(),
-                    "{:?}: {} = {:?}",
-                    place,
-                    local_decls.local_decls()[place.local].ty,
-                    rvalue
-                );
+                // An unencoded projection (currently a union field) can truncate the RHS
+                // qualifier range even when Rust types still agree. Bottom only the representable
+                // destination: silently zipping an empty RHS would leave it incorrectly `Imm`.
+                if lhs.end.index() - lhs.start.index() != rhs.end.index() - rhs.start.index() {
+                    for lhs in lhs {
+                        database.bottom(lhs);
+                    }
+                    return;
+                }
 
                 let mut lhs_rhs = lhs.zip(rhs);
                 if let Some((lhs, rhs)) = lhs_rhs.next() {
