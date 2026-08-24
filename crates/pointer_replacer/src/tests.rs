@@ -10069,7 +10069,7 @@ mod borrow_ownership_coherence {
     use rustc_hash::{FxHashMap, FxHashSet};
     use rustc_hir::{ItemKind, OwnerNode};
     use rustc_middle::{
-        mir::{Local, Location, Operand, Rvalue, StatementKind},
+        mir::{Local, Location, Operand, RETURN_PLACE, Rvalue, StatementKind},
         ty::TyCtxt,
     };
     use rustc_span::def_id::LocalDefId;
@@ -10092,7 +10092,10 @@ mod borrow_ownership_coherence {
                     CopyLendPair, add_coherence, add_coherence_with_copy_lends,
                     constrain_field_ownership, selected_copy_lend_sites,
                 },
-                construction::{CopyLendMode, analyze_copy_lend_eligibility, construct_bo_into},
+                construction::{
+                    CopyLendMode, analyze_copy_lend_eligibility, construct_bo_into,
+                    construct_bo_into_a16_refined, verify_bo_construction_counting,
+                },
                 crate_slots::CrateSlots,
                 emit_crate_ownership_constraints, emit_crate_ownership_constraints_with_copy_lends,
                 export::{LoanClass, location_key, with_bo_export},
@@ -10275,6 +10278,86 @@ mod borrow_ownership_coherence {
             }
         }
         panic!("no local named `{name}` in {did:?}");
+    }
+
+    #[test]
+    fn a16_refined_links_only_modeled_borrow_returns() {
+        run_compiler(
+            r#"
+unsafe extern "C" { fn malloc(size: usize) -> *mut core::ffi::c_void; }
+unsafe fn id(p: *mut i32) -> *mut i32 { p }
+unsafe fn fresh() -> *mut i32 { malloc(4) as *mut i32 }
+unsafe fn caller(p: *mut i32) -> i32 {
+    let q = id(p);
+    *q
+}
+unsafe fn fresh_caller() -> i32 {
+    let r = fresh();
+    *r
+}
+"#,
+            |tcx| {
+                let program = collect_program(tcx);
+                let slots = CrateSlots::build(&program);
+                let origins = compute_origins(&program);
+                let mut_facts = MutFacts::from_program(&program);
+                let id = function_by_name(&program, "id");
+                let caller = function_by_name(&program, "caller");
+                let id_return = SlotRef::Local(
+                    id,
+                    slots.fn_local_slots[&id]
+                        .slot_for_local_depth(RETURN_PLACE, 0)
+                        .expect("id return slot"),
+                );
+                let q = local_slot(&slots, caller, local_by_var_name(tcx, caller, "q"), 0);
+
+                let baseline_solver = KindSolver::new(&slots);
+                let baseline = construct_bo_into(
+                    &program,
+                    &slots,
+                    &origins,
+                    &mut_facts,
+                    &baseline_solver,
+                    CopyLendMode::Baseline,
+                )
+                .expect("baseline construction");
+                baseline_solver.assume(id_return, SlotKind::Raw);
+                let baseline_model = verify_bo_construction_counting(
+                    &program,
+                    &slots,
+                    &origins,
+                    &baseline_solver,
+                    &baseline,
+                    &mut_facts,
+                )
+                .0
+                .expect("baseline model");
+                assert_eq!(baseline_model.get(&q), Some(&SlotKind::Ref));
+
+                let refined_solver = KindSolver::new(&slots);
+                let (refined, links) = construct_bo_into_a16_refined(
+                    &program,
+                    &slots,
+                    &origins,
+                    &mut_facts,
+                    &refined_solver,
+                )
+                .expect("refined construction");
+                assert_eq!(links, 1, "only id's modeled return receives a link");
+                refined_solver.assume(id_return, SlotKind::Raw);
+                let refined_model = verify_bo_construction_counting(
+                    &program,
+                    &slots,
+                    &origins,
+                    &refined_solver,
+                    &refined,
+                    &mut_facts,
+                )
+                .0
+                .expect("refined model");
+                assert_ne!(refined_model.get(&q), Some(&SlotKind::Ref));
+            },
+        );
     }
 
     /// Shared §8 BB3-b assertion for a mixed-role-local fixture (a local conflated to one
