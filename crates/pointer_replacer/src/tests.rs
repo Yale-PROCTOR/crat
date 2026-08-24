@@ -9812,7 +9812,7 @@ mod borrow_ownership_solver {
             a5_overlap::{A5Mode, apply_coarse_constraints},
             crate_slots::CrateSlots,
             slots::SlotId,
-            solver::{KindSolver, SlotRef},
+            solver::{KindSolver, Selectors, SlotRef},
         },
         utils::rustc::RustProgram,
     };
@@ -9908,6 +9908,40 @@ pub unsafe fn g(pp: *mut *mut i32) -> i32 {
             let model = ks.model_kinds().expect("satisfiable model");
             assert_eq!(model.get(&s0), Some(&SlotKind::Ref));
             assert_eq!(model.get(&s1), Some(&SlotKind::Ref));
+        });
+    }
+
+    #[test]
+    fn hard_loop_materializes_only_the_optimized_round_model() {
+        with_g_slots(|_, slots, g, d0, d1| {
+            let solver = KindSolver::new(slots);
+            let hard = solver.hard_loop_solver();
+            let relaxed = solver
+                .relax_selectors_hard_reporting(&hard, &Selectors::new(Vec::new(), Vec::new()))
+                .expect("empty selector set is hard-SAT");
+            let model = solver
+                .optimized_model_under(&relaxed)
+                .expect("optimized round model");
+
+            assert_eq!(model.get(&SlotRef::Local(g, d0)), Some(&SlotKind::Ref));
+            assert_eq!(model.get(&SlotRef::Local(g, d1)), Some(&SlotKind::Ref));
+            assert_eq!(solver.hard_check_count(), 1);
+            assert_eq!(solver.optimize_materialization_count(), 1);
+        });
+    }
+
+    #[test]
+    fn hard_loop_snapshots_and_syncs_only_hard_assertions() {
+        with_g_slots(|_, slots, g, d0, _| {
+            let solver = KindSolver::new(slots);
+            let hard = solver.hard_loop_solver();
+
+            assert_eq!(hard.assertion_count(), solver.hard_assertion_count());
+            let before = hard.assertion_count();
+            solver.add_borrow_exclusion(Some(SlotRef::Local(g, d0)), &[]);
+            assert_eq!(hard.sync_from(&solver), 1);
+            assert_eq!(hard.assertion_count(), before + 1);
+            assert_eq!(hard.assertion_count(), solver.hard_assertion_count());
         });
     }
 
@@ -10062,7 +10096,10 @@ mod borrow_ownership_coherence {
                 mutability_facts::MutFacts,
                 origins::{collect_no_borrow_origin_slots, compute_origins},
                 slots::{SlotId, SlotOwner, StructFieldSlot},
-                solver::{BoOwnDatabase, KindSolver, SlotRef},
+                solver::{
+                    BoOwnDatabase, KindSolver, SelectorTrace, SelectorTraceOutcome,
+                    SelectorTracePhase, SlotRef, with_selector_trace,
+                },
                 sources::collect_malloc_source_slots,
                 ssa::constraint::{Database, Gen, Var},
             },
@@ -10139,6 +10176,39 @@ mod borrow_ownership_coherence {
             .unwrap_or_else(|| panic!("slot for local {local:?} depth {depth}"));
 
         SlotRef::Local(fn_did, slot)
+    }
+
+    type SelectorDecision = (
+        usize,
+        SelectorTracePhase,
+        usize,
+        Vec<usize>,
+        SelectorTraceOutcome,
+    );
+
+    fn selector_decisions(trace: &SelectorTrace) -> (Vec<SelectorDecision>, Vec<Vec<usize>>) {
+        let events = trace
+            .epochs
+            .iter()
+            .enumerate()
+            .flat_map(|(epoch, trace)| {
+                trace.events.iter().map(move |event| {
+                    (
+                        epoch,
+                        event.phase,
+                        event.selector_index,
+                        event.active_before.clone(),
+                        event.outcome,
+                    )
+                })
+            })
+            .collect();
+        let final_dropped = trace
+            .epochs
+            .iter()
+            .map(|epoch| epoch.final_dropped.clone())
+            .collect();
+        (events, final_dropped)
     }
 
     /// The `Local` whose source-level variable name is `name`, via MIR debug info.
@@ -10641,9 +10711,28 @@ pub unsafe fn sink_side(a: *mut core::ffi::c_void) -> *mut core::ffi::c_void {
 
                 // RETENTION under the relax loop: leak exactly the sink,
                 // retain the source.
-                let (model, dropped) = kind_solver
-                    .model_kinds_relaxing_reporting(&selectors)
-                    .expect("relax loop must converge to SAT");
+                let ((model, dropped), legacy_trace) = with_selector_trace(|| {
+                    kind_solver
+                        .model_kinds_relaxing_reporting(&selectors)
+                        .expect("legacy relax loop must converge to SAT")
+                });
+                let ((hard_model, hard_dropped), hard_trace) = with_selector_trace(|| {
+                    let hard = kind_solver.hard_loop_solver();
+                    let relaxed = kind_solver
+                        .relax_selectors_hard_reporting(&hard, &selectors)
+                        .expect("hard relax loop must converge to SAT");
+                    let dropped = relaxed.dropped().to_vec();
+                    let model = kind_solver
+                        .optimized_model_under(&relaxed)
+                        .expect("hard decisions admit an optimized model");
+                    (model, dropped)
+                });
+                assert_eq!(
+                    selector_decisions(&legacy_trace),
+                    selector_decisions(&hard_trace)
+                );
+                assert_eq!(hard_dropped, dropped);
+                assert_eq!(hard_model, model);
                 assert_eq!(
                     dropped.len(),
                     1,
@@ -10774,9 +10863,28 @@ pub unsafe fn sink_side2(a2: *mut core::ffi::c_void) -> *mut core::ffi::c_void {
 
                 // POLICY PIN: both sinks leak, the source is retained — a
                 // 2-leak outcome preferred over the 1-leak source drop.
-                let (model, dropped) = kind_solver
-                    .model_kinds_relaxing_reporting(&selectors)
-                    .expect("relax loop must converge to SAT");
+                let ((model, dropped), legacy_trace) = with_selector_trace(|| {
+                    kind_solver
+                        .model_kinds_relaxing_reporting(&selectors)
+                        .expect("legacy relax loop must converge to SAT")
+                });
+                let ((hard_model, hard_dropped), hard_trace) = with_selector_trace(|| {
+                    let hard = kind_solver.hard_loop_solver();
+                    let relaxed = kind_solver
+                        .relax_selectors_hard_reporting(&hard, &selectors)
+                        .expect("hard relax loop must converge to SAT");
+                    let dropped = relaxed.dropped().to_vec();
+                    let model = kind_solver
+                        .optimized_model_under(&relaxed)
+                        .expect("hard decisions admit an optimized model");
+                    (model, dropped)
+                });
+                assert_eq!(
+                    selector_decisions(&legacy_trace),
+                    selector_decisions(&hard_trace)
+                );
+                assert_eq!(hard_dropped, dropped);
+                assert_eq!(hard_model, model);
                 assert_eq!(
                     dropped.len(),
                     2,
