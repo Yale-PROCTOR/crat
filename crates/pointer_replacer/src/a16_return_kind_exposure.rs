@@ -117,6 +117,42 @@ fn model_sha256(path: &Path) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
 
+fn boundary_key(caller: &str, block: &str, statement: &str, callee: &str, depth: &str) -> String {
+    format!("{caller}\t{block}\t{statement}\t{callee}\t{depth}")
+}
+
+fn registered_upper_bound(path: &Path, program: &str) -> Result<BTreeSet<String>, String> {
+    let input = fs::read_to_string(path)
+        .map_err(|error| format!("read registered A16 ledger {}: {error}", path.display()))?;
+    let mut keys = BTreeSet::new();
+    for (line_no, line) in input.lines().enumerate() {
+        if line_no == 0 {
+            if !line.starts_with("program\tcaller\tblock\tstatement\tcallee\tdepth\t") {
+                return Err("registered A16 ledger header mismatch".to_owned());
+            }
+            continue;
+        }
+        let fields = line.split('\t').collect::<Vec<_>>();
+        if fields.len() != 15 {
+            return Err(format!(
+                "registered A16 ledger line {} has {} fields",
+                line_no + 1,
+                fields.len()
+            ));
+        }
+        if fields[0] == program && fields[14] == "ref-nonref" {
+            let key = boundary_key(fields[1], fields[2], fields[3], fields[4], fields[5]);
+            if !keys.insert(key) {
+                return Err(format!(
+                    "duplicate registered boundary at line {}",
+                    line_no + 1
+                ));
+            }
+        }
+    }
+    Ok(keys)
+}
+
 fn parse_model(
     path: &Path,
     program: &RustProgram<'_>,
@@ -203,6 +239,9 @@ pub(super) fn run_worker(tcx: rustc_middle::ty::TyCtxt<'_>, t_tcx: Duration) -> 
     let model_path = std::path::PathBuf::from(
         std::env::var_os("CRAT_A16_MODEL").expect("A16 launch-6 precise model"),
     );
+    let upper_bound_path = std::path::PathBuf::from(
+        std::env::var_os("CRAT_A16_UPPER_BOUND_LEDGER").expect("A16 registered upper-bound ledger"),
+    );
     let output =
         std::path::PathBuf::from(std::env::var_os("CRAT_A16_OUT").expect("A16 output directory"));
     let observer_head = std::env::var("CRAT_A16_OBSERVER").expect("A16 observer head");
@@ -213,6 +252,8 @@ pub(super) fn run_worker(tcx: rustc_middle::ty::TyCtxt<'_>, t_tcx: Duration) -> 
     let opaque_slots = positive_opaque_return_slots(&slots, &program, origins.native_flows());
     let model = parse_model(&model_path, &program, &slots)
         .unwrap_or_else(|error| panic!("A16 model join: {error}"));
+    let upper_bound = registered_upper_bound(&upper_bound_path, &name)
+        .unwrap_or_else(|error| panic!("A16 upper-bound join: {error}"));
 
     let mut universe = 0usize;
     let mut caller_non_ref = 0usize;
@@ -225,8 +266,9 @@ pub(super) fn run_worker(tcx: rustc_middle::ty::TyCtxt<'_>, t_tcx: Duration) -> 
     let mut exposure_origin_counts = BTreeMap::<&'static str, usize>::new();
     let mut refined_eligible = 0usize;
     let mut refined_eligible_exposure = 0usize;
+    let mut matched_upper_bound = BTreeSet::new();
     let mut ledger = String::from(
-        "program\tcaller\tblock\tstatement\tcallee\tdepth\tcaller_variant\tcaller_owner\tcaller_slot\tcallee_variant\tcallee_owner\tcallee_slot\tcaller_kind\tcallee_kind\tcell\torigin_class\torigin_modeled\torigin_unknown\torigin_fresh\torigin_opaque\trefined_eligible\n",
+        "program\tcaller\tblock\tstatement\tcallee\tdepth\tcaller_variant\tcaller_owner\tcaller_slot\tcallee_variant\tcallee_owner\tcallee_slot\tcaller_kind\tcallee_kind\tcell\tregistered_upper_bound\torigin_class\torigin_modeled\torigin_unknown\torigin_fresh\torigin_opaque\trefined_eligible\n",
     );
 
     for &caller in &program.functions {
@@ -284,6 +326,24 @@ pub(super) fn run_worker(tcx: rustc_middle::ty::TyCtxt<'_>, t_tcx: Duration) -> 
                     &fresh_slots,
                     &opaque_slots,
                 );
+                let caller_path = tcx.def_path_str(caller.to_def_id());
+                let callee_path = tcx.def_path_str(callee.to_def_id());
+                let block_index = block.index().to_string();
+                let statement_index = data.statements.len().to_string();
+                let depth_label = depth.to_string();
+                let boundary = boundary_key(
+                    &caller_path,
+                    &block_index,
+                    &statement_index,
+                    &callee_path,
+                    &depth_label,
+                );
+                let registered_upper_bound = upper_bound.contains(&boundary);
+                if registered_upper_bound {
+                    matched_upper_bound.insert(boundary);
+                    *exposure_origin_counts.entry(evidence.class).or_default() += 1;
+                    refined_eligible_exposure += usize::from(evidence.refined_eligible);
+                }
                 *origin_counts.entry(evidence.class).or_default() += 1;
                 refined_eligible += usize::from(evidence.refined_eligible);
                 let cell = classify(caller_kind, callee_kind);
@@ -298,8 +358,6 @@ pub(super) fn run_worker(tcx: rustc_middle::ty::TyCtxt<'_>, t_tcx: Duration) -> 
                     }
                     Cell::RefNonRef => {
                         ref_non_ref += 1;
-                        *exposure_origin_counts.entry(evidence.class).or_default() += 1;
-                        refined_eligible_exposure += usize::from(evidence.refined_eligible);
                         exposure_slots.insert(SlotKey::of(caller_slot));
                         match callee_kind {
                             SlotKind::Raw => exposure_raw += 1,
@@ -312,12 +370,12 @@ pub(super) fn run_worker(tcx: rustc_middle::ty::TyCtxt<'_>, t_tcx: Duration) -> 
                 let caller_key = SlotKey::of(caller_slot);
                 let callee_key = SlotKey::of(callee_slot);
                 ledger.push_str(&format!(
-                    "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:?}\t{:?}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+                    "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:?}\t{:?}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
                     name,
-                    tcx.def_path_str(caller.to_def_id()),
+                    caller_path,
                     block.index(),
                     data.statements.len(),
-                    tcx.def_path_str(callee.to_def_id()),
+                    callee_path,
                     depth,
                     caller_key.variant,
                     caller_key.owner,
@@ -328,6 +386,7 @@ pub(super) fn run_worker(tcx: rustc_middle::ty::TyCtxt<'_>, t_tcx: Duration) -> 
                     caller_kind,
                     callee_kind,
                     cell_label,
+                    registered_upper_bound,
                     evidence.class,
                     evidence.modeled,
                     evidence.unknown,
@@ -343,14 +402,21 @@ pub(super) fn run_worker(tcx: rustc_middle::ty::TyCtxt<'_>, t_tcx: Duration) -> 
         universe,
         "A16 partition residual"
     );
+    assert_eq!(
+        matched_upper_bound, upper_bound,
+        "registered A16 upper-bound identity mismatch"
+    );
 
     fs::create_dir_all(&output).expect("create A16 output directory");
     fs::write(output.join("return-kind-ledger.tsv"), ledger).expect("write A16 ledger");
     let model_digest = model_sha256(&model_path);
+    let upper_bound_digest = model_sha256(&upper_bound_path);
     let count = |map: &BTreeMap<&'static str, usize>, key| map.get(key).copied().unwrap_or(0);
     let receipt = format!(
-        "schema=a16-origin-census-v2\nstatus=ok\ndata=provisional\ncorpus=rs-crown\nanalysis_head=fec2e82c123e847f6497e2a0c583dbac0c947bdf\nobserver_head={observer_head}\nprogram={name}\nmodel_mode=a14-precise\na5_world=closed_world_frozen_graph\ncopy_lend_mode=baseline\na2_mode=off\nsolve_calls=0\nmodel={}\nmodel_sha256={model_digest}\nuniverse={universe}\ncaller_non_ref={caller_non_ref}\nref_ref={ref_ref}\nref_non_ref={ref_non_ref}\nexposure_raw={exposure_raw}\nexposure_owning={exposure_owning}\nexposure_unique_caller_slots={}\norigin_modeled={}\norigin_unknown={}\norigin_fresh={}\norigin_opaque={}\nexposure_origin_modeled={}\nexposure_origin_unknown={}\nexposure_origin_fresh={}\nexposure_origin_opaque={}\nrefined_eligible={refined_eligible}\nrefined_eligible_exposure={refined_eligible_exposure}\nunresolved=0\n",
+        "schema=a16-origin-census-v2\nstatus=ok\ndata=provisional\ncorpus=rs-crown\nanalysis_head=fec2e82c123e847f6497e2a0c583dbac0c947bdf\nobserver_head={observer_head}\nprogram={name}\nmodel_mode=a14-precise\na5_world=closed_world_frozen_graph\ncopy_lend_mode=baseline\na2_mode=off\nsolve_calls=0\nmodel={}\nmodel_sha256={model_digest}\nupper_bound_ledger={}\nupper_bound_ledger_sha256={upper_bound_digest}\nupper_bound_rows={}\nuniverse={universe}\ncaller_non_ref={caller_non_ref}\nref_ref={ref_ref}\nref_non_ref={ref_non_ref}\nexposure_raw={exposure_raw}\nexposure_owning={exposure_owning}\nexposure_unique_caller_slots={}\norigin_modeled={}\norigin_unknown={}\norigin_fresh={}\norigin_opaque={}\nexposure_origin_modeled={}\nexposure_origin_unknown={}\nexposure_origin_fresh={}\nexposure_origin_opaque={}\nrefined_eligible={refined_eligible}\nrefined_eligible_exposure={refined_eligible_exposure}\nunresolved=0\n",
         model_path.display(),
+        upper_bound_path.display(),
+        upper_bound.len(),
         exposure_slots.len(),
         count(&origin_counts, "modeled-borrow-origin"),
         count(&origin_counts, "unknown"),
@@ -372,6 +438,7 @@ pub(super) fn run_worker(tcx: rustc_middle::ty::TyCtxt<'_>, t_tcx: Duration) -> 
     row.set("analysis_head", "fec2e82c123e847f6497e2a0c583dbac0c947bdf");
     row.set("model_mode", "a14-precise");
     row.set("solve_calls", 0);
+    row.set("upper_bound_rows", upper_bound.len());
     row.set("universe", universe);
     row.set("caller_non_ref", caller_non_ref);
     row.set("ref_ref", ref_ref);
@@ -386,6 +453,22 @@ pub(super) fn run_worker(tcx: rustc_middle::ty::TyCtxt<'_>, t_tcx: Duration) -> 
     row.set("origin_unknown", count(&origin_counts, "unknown"));
     row.set("origin_fresh", count(&origin_counts, "fresh-owning"));
     row.set("origin_opaque", count(&origin_counts, "foreign-opaque"));
+    row.set(
+        "exposure_origin_modeled",
+        count(&exposure_origin_counts, "modeled-borrow-origin"),
+    );
+    row.set(
+        "exposure_origin_unknown",
+        count(&exposure_origin_counts, "unknown"),
+    );
+    row.set(
+        "exposure_origin_fresh",
+        count(&exposure_origin_counts, "fresh-owning"),
+    );
+    row.set(
+        "exposure_origin_opaque",
+        count(&exposure_origin_counts, "foreign-opaque"),
+    );
     row.set("refined_eligible", refined_eligible);
     row.set("refined_eligible_exposure", refined_eligible_exposure);
     row.set("unresolved", 0);
