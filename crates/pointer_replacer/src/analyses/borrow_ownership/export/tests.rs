@@ -12,13 +12,17 @@ use crate::{
     analyses::borrow_ownership::{
         CrateCtxt,
         borrow_verify::{
-            RepairMode, RoundStats, TestLoopBackend, model_accepts, verify_l2_to_fixpoint_counting,
-            verify_l2_to_fixpoint_counting_for_test, verify_to_fixpoint,
-            verify_to_fixpoint_counting, verify_to_fixpoint_counting_for_test,
+            RepairMode, RoundStats, model_accepts, verify_l2_to_fixpoint_counting,
+            verify_to_fixpoint, verify_to_fixpoint_counting,
         },
         coherence::add_coherence,
+        construction::{
+            CopyLendMode, TestValidationBackend, construct_bo_into,
+            verify_bo_construction_counting_for_test, verify_bo_construction_l2_for_test,
+        },
         crate_slots::CrateSlots,
         emit_crate_ownership_constraints, l2,
+        mutability_facts::MutFacts,
         origin_flow::analyze_program_origin_flow,
         origins::compute_origins,
         solver::{KindSolver, SlotRef},
@@ -796,7 +800,7 @@ fn capture_solve_counting(
 
 fn capture_solve_counting_backend(
     code: &str,
-    backend: TestLoopBackend,
+    backend: TestValidationBackend,
 ) -> (
     Option<FxHashMap<SlotRef, super::SlotKindAlias>>,
     RoundStats,
@@ -805,24 +809,27 @@ fn capture_solve_counting_backend(
     ::utils::compilation::run_compiler_on_str(code, move |tcx| {
         let program = collect_program(tcx);
         let slots = CrateSlots::build(&program);
+        let origins = compute_origins(&program);
+        let mut_facts = MutFacts::from_program(&program);
         let ((model, stats), export) = with_bo_export(|| {
-            let crate_ctxt = CrateCtxt::new(&program);
             let solver = KindSolver::new(&slots);
-            let (_stats, selectors) = emit_crate_ownership_constraints(
-                &crate_ctxt,
+            let construction = construct_bo_into(
+                &program,
                 &slots,
-                &compute_origins(&program),
+                &origins,
+                &mut_facts,
                 &solver,
+                CopyLendMode::Baseline,
             )
-            .expect("emission");
-            for &function in &program.functions {
-                let body = tcx
-                    .mir_drops_elaborated_and_const_checked(function)
-                    .borrow();
-                add_coherence(&solver, &slots, function, &body);
-            }
-            verify_to_fixpoint_counting_for_test(
-                &program, &slots, &solver, &selectors, true, backend,
+            .expect("shared construction");
+            verify_bo_construction_counting_for_test(
+                &program,
+                &slots,
+                &origins,
+                &solver,
+                &construction,
+                &mut_facts,
+                backend,
             )
         });
         (model, stats, export)
@@ -832,9 +839,9 @@ fn capture_solve_counting_backend(
 
 #[test]
 fn decomposed_multi_round_model_commits_and_export_match_legacy() {
-    let legacy = capture_solve_counting_backend(CASCADE, TestLoopBackend::LegacyOptimize);
+    let legacy = capture_solve_counting_backend(CASCADE, TestValidationBackend::LegacyOptimize);
     let decomposed =
-        capture_solve_counting_backend(CASCADE, TestLoopBackend::HardCheckRoundOptimize);
+        capture_solve_counting_backend(CASCADE, TestValidationBackend::HardCheckRoundOptimize);
     assert_eq!(decomposed, legacy);
 }
 
@@ -899,7 +906,7 @@ fn capture_solve_l2(
 
 fn capture_solve_l2_backend(
     code: &str,
-    backend: TestLoopBackend,
+    backend: TestValidationBackend,
 ) -> (
     Option<FxHashMap<SlotRef, super::SlotKindAlias>>,
     RoundStats,
@@ -908,31 +915,26 @@ fn capture_solve_l2_backend(
     ::utils::compilation::run_compiler_on_str(code, move |tcx| {
         let program = collect_program(tcx);
         let slots = CrateSlots::build(&program);
-        let origin_flows = analyze_program_origin_flow(&program);
+        let origins = compute_origins(&program);
+        let mut_facts = MutFacts::from_program(&program);
         let ((model, stats), export) = with_bo_export(|| {
-            let crate_ctxt = CrateCtxt::new(&program);
             let solver = KindSolver::new(&slots);
-            let (_stats, selectors) = emit_crate_ownership_constraints(
-                &crate_ctxt,
-                &slots,
-                &compute_origins(&program),
-                &solver,
-            )
-            .expect("emission");
-            for &function in &program.functions {
-                let body = tcx
-                    .mir_drops_elaborated_and_const_checked(function)
-                    .borrow();
-                add_coherence(&solver, &slots, function, &body);
-            }
-            verify_l2_to_fixpoint_counting_for_test(
+            let construction = construct_bo_into(
                 &program,
                 &slots,
-                &origin_flows,
+                &origins,
+                &mut_facts,
                 &solver,
-                &selectors,
-                true,
-                None,
+                CopyLendMode::Baseline,
+            )
+            .expect("shared construction");
+            verify_bo_construction_l2_for_test(
+                &program,
+                &slots,
+                &origins,
+                &solver,
+                &construction,
+                &mut_facts,
                 backend,
             )
         });
@@ -943,8 +945,9 @@ fn capture_solve_l2_backend(
 
 #[test]
 fn decomposed_l2_model_actions_and_export_match_legacy() {
-    let legacy = capture_solve_l2_backend(CASCADE, TestLoopBackend::LegacyOptimize);
-    let decomposed = capture_solve_l2_backend(CASCADE, TestLoopBackend::HardCheckRoundOptimize);
+    let legacy = capture_solve_l2_backend(CASCADE, TestValidationBackend::LegacyOptimize);
+    let decomposed =
+        capture_solve_l2_backend(CASCADE, TestValidationBackend::HardCheckRoundOptimize);
     assert_eq!(decomposed, legacy);
 }
 

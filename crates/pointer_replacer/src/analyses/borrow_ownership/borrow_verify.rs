@@ -683,26 +683,9 @@ fn record_dropped(stats: &mut RoundStats, selectors: &Selectors, dropped: &[Bool
 }
 
 #[derive(Clone, Copy)]
-enum LoopBackend {
+pub(super) enum LoopBackend {
     LegacyOptimize,
     HardCheckRoundOptimize,
-}
-
-#[cfg(test)]
-#[derive(Clone, Copy)]
-pub(crate) enum TestLoopBackend {
-    LegacyOptimize,
-    HardCheckRoundOptimize,
-}
-
-#[cfg(test)]
-impl From<TestLoopBackend> for LoopBackend {
-    fn from(value: TestLoopBackend) -> Self {
-        match value {
-            TestLoopBackend::LegacyOptimize => Self::LegacyOptimize,
-            TestLoopBackend::HardCheckRoundOptimize => Self::HardCheckRoundOptimize,
-        }
-    }
 }
 
 fn solve_round_model(
@@ -757,29 +740,6 @@ pub(crate) fn verify_to_fixpoint_counting(
         solver,
         selectors,
         is_mutable,
-    )
-}
-
-#[cfg(test)]
-pub(crate) fn verify_to_fixpoint_counting_for_test(
-    program: &RustProgram,
-    slots: &CrateSlots,
-    solver: &KindSolver,
-    selectors: &Selectors,
-    is_mutable: impl MutProvider + Copy,
-    backend: TestLoopBackend,
-) -> (Option<FxHashMap<SlotRef, SlotKind>>, RoundStats) {
-    let origin_flows = super::origin_flow::analyze_program_origin_flow(program);
-    verify_to_fixpoint_counting_with_flows_impl(
-        program,
-        slots,
-        &origin_flows,
-        solver,
-        selectors,
-        is_mutable,
-        None,
-        None,
-        backend.into(),
     )
 }
 
@@ -848,7 +808,7 @@ pub(crate) fn verify_to_fixpoint_counting_with_flows_and_parameter_overlaps(
     )
 }
 
-fn verify_to_fixpoint_counting_with_flows_impl(
+pub(super) fn verify_to_fixpoint_counting_with_flows_impl(
     program: &RustProgram,
     slots: &CrateSlots,
     origin_flows: &OriginFlowResults,
@@ -1229,30 +1189,7 @@ pub(crate) fn verify_l2_to_fixpoint_counting(
     )
 }
 
-#[cfg(test)]
-pub(crate) fn verify_l2_to_fixpoint_counting_for_test(
-    program: &RustProgram,
-    slots: &CrateSlots,
-    origin_flows: &OriginFlowResults,
-    solver: &KindSolver,
-    selectors: &Selectors,
-    is_mutable: impl MutProvider + Copy,
-    copy_lends: Option<&FxHashSet<CopyLendPair>>,
-    backend: TestLoopBackend,
-) -> (Option<FxHashMap<SlotRef, SlotKind>>, RoundStats) {
-    verify_l2_to_fixpoint_counting_impl(
-        program,
-        slots,
-        origin_flows,
-        solver,
-        selectors,
-        is_mutable,
-        copy_lends,
-        backend.into(),
-    )
-}
-
-fn verify_l2_to_fixpoint_counting_impl(
+pub(super) fn verify_l2_to_fixpoint_counting_impl(
     program: &RustProgram,
     slots: &CrateSlots,
     origin_flows: &OriginFlowResults,
