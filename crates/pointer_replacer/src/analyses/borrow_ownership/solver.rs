@@ -372,6 +372,12 @@ pub(crate) struct RelaxedSelectors {
     dropped: Vec<Bool>,
 }
 
+enum HardRelaxResult {
+    Sat(RelaxedSelectors),
+    Unsat,
+    Unknown,
+}
+
 impl RelaxedSelectors {
     pub(crate) fn dropped(&self) -> &[Bool] {
         &self.dropped
@@ -991,6 +997,17 @@ impl KindSolver {
         hard: &HardLoopSolver,
         selectors: &Selectors,
     ) -> Option<RelaxedSelectors> {
+        match self.relax_selectors_hard_typed(hard, selectors) {
+            HardRelaxResult::Sat(relaxed) => Some(relaxed),
+            HardRelaxResult::Unsat | HardRelaxResult::Unknown => None,
+        }
+    }
+
+    fn relax_selectors_hard_typed(
+        &self,
+        hard: &HardLoopSolver,
+        selectors: &Selectors,
+    ) -> HardRelaxResult {
         assert!(
             self.tracker.is_none(),
             "tracked KindSolver must not enter hard selector relaxation"
@@ -1019,10 +1036,13 @@ impl KindSolver {
                 SatResult::Unsat => {
                     let core = hard.solver.get_unsat_core();
                     let in_core = |selector: &Bool| core.iter().any(|item| item == selector);
-                    let index = assumptions
+                    let Some(index) = assumptions
                         .iter()
                         .position(|selector| selectors.is_sink(selector) && in_core(selector))
-                        .or_else(|| assumptions.iter().position(in_core))?;
+                        .or_else(|| assumptions.iter().position(in_core))
+                    else {
+                        return HardRelaxResult::Unsat;
+                    };
                     if let Some(epoch) = trace_epoch {
                         let selector_index = selectors
                             .index_of(&assumptions[index])
@@ -1042,7 +1062,7 @@ impl KindSolver {
                     }
                     dropped.push(assumptions.swap_remove(index));
                 }
-                SatResult::Unknown => return None,
+                SatResult::Unknown => return HardRelaxResult::Unknown,
             }
         }
 
@@ -1083,7 +1103,7 @@ impl KindSolver {
                     assumptions.pop();
                     index += 1;
                 }
-                SatResult::Unknown => return None,
+                SatResult::Unknown => return HardRelaxResult::Unknown,
             }
         }
 
@@ -1094,7 +1114,7 @@ impl KindSolver {
                 trace.epochs[epoch].final_dropped = selectors.indices_of(&dropped);
             });
         }
-        Some(RelaxedSelectors {
+        HardRelaxResult::Sat(RelaxedSelectors {
             assumptions,
             dropped,
         })
@@ -1114,6 +1134,23 @@ impl KindSolver {
         let model = self.solver.get_model()?;
         self.read_version_owns(&model);
         Some(self.read_kinds(&model))
+    }
+
+    pub(crate) fn model_kinds_decomposed_reporting_l2(
+        &self,
+        hard: &HardLoopSolver,
+        selectors: &Selectors,
+    ) -> L2SolveResult {
+        match self.relax_selectors_hard_typed(hard, selectors) {
+            HardRelaxResult::Sat(relaxed) => {
+                let dropped = relaxed.dropped.clone();
+                self.optimized_model_under(&relaxed)
+                    .map(|kinds| L2SolveResult::Sat { kinds, dropped })
+                    .unwrap_or(L2SolveResult::Unknown)
+            }
+            HardRelaxResult::Unsat => L2SolveResult::Unsat,
+            HardRelaxResult::Unknown => L2SolveResult::Unknown,
+        }
     }
 
     /// Solve assuming all of `selectors` (reproducing the hard sources and
