@@ -37,16 +37,18 @@ use super::{
     coherence::{
         CopyLendPair, FieldRefPlan, add_coherence, add_coherence_removal_only,
         add_coherence_with_copy_lends, constrain_field_ref_worthiness,
+        positive_opaque_return_slots,
     },
-    crate_slots::CrateSlots,
+    crate_slots::{CrateSlots, ptr_chain_depth},
     emit_crate_ownership_constraints, emit_crate_ownership_constraints_with_copy_lends,
     l2::{MirLocationKey, SlotKey},
     mutability_facts::MutFacts,
     origin_flow::OriginFlowResults,
-    origin_summary::OriginSummaries,
+    origin_summary::{OriginSummaries, SignatureRoot},
     resolve::{ResolvedSlot, resolve_place},
     slots::SlotOwner,
     solver::{KindSolver, Selectors, SlotRef},
+    sources::collect_malloc_source_slots,
 };
 use crate::{
     analyses::{
@@ -239,6 +241,7 @@ pub(crate) struct VerifiedBo {
     pub(crate) optimize_materialization_count: usize,
     pub(crate) hard_check_elapsed: Duration,
     pub(crate) optimize_materialization_elapsed: Duration,
+    pub(crate) a16_refined_links: usize,
     pub(crate) planned_c9_marks: BTreeSet<C9MarkKey>,
     pub(crate) producer_stats: super::a5_producer::A5ProducerStats,
 }
@@ -603,6 +606,134 @@ pub(crate) fn construct_bo_into(
     })
 }
 
+pub(crate) fn pure_modeled_return_origin(
+    origins: &OriginSummaries,
+    callee: LocalDefId,
+    depth: u8,
+) -> bool {
+    let summary = &origins[&callee];
+    let Some((returned, _)) = summary.slots.iter_enumerated().find(|(_, slot)| {
+        slot.place.root == SignatureRoot::Return
+            && slot.place.deref_depth == 0
+            && slot.place.field.is_none()
+            && slot.depth == depth
+    }) else {
+        return false;
+    };
+    if summary.unknown.contains(returned) {
+        return false;
+    }
+    summary.subset.rows().any(|source| {
+        source != returned
+            && !summary.unknown.contains(source)
+            && summary.subset.contains(source, returned)
+            && !summary.subset.contains(returned, source)
+            && matches!(summary.slots[source].place.root, SignatureRoot::Arg(_))
+    })
+}
+
+fn a16_resolved_slot_ref(fn_did: LocalDefId, slot: ResolvedSlot) -> SlotRef {
+    match slot {
+        ResolvedSlot::Local(slot) => SlotRef::Local(fn_did, slot),
+        ResolvedSlot::Field(slot) => SlotRef::Field(slot),
+    }
+}
+
+fn add_refined_return_kind_links(
+    program: &RustProgram<'_>,
+    slots: &CrateSlots,
+    origins: &OriginSummaries,
+    solver: &KindSolver,
+) -> usize {
+    let fresh_slots = collect_malloc_source_slots(program.tcx, &program.functions, slots);
+    let opaque_slots = positive_opaque_return_slots(slots, program, origins.native_flows());
+    let mut links = 0usize;
+    for &caller in &program.functions {
+        let body_ref = program
+            .tcx
+            .mir_drops_elaborated_and_const_checked(caller)
+            .borrow();
+        let body = &*body_ref;
+        for data in body.basic_blocks.iter() {
+            let Some(terminator) = data.terminator.as_ref() else {
+                continue;
+            };
+            let Some(call) = terminator.as_call(program.tcx) else {
+                continue;
+            };
+            let CallKind::FreeStanding(callee) = call.func else {
+                continue;
+            };
+            if !matches!(
+                program.tcx.hir_node_by_def_id(callee),
+                rustc_hir::Node::Item(_)
+            ) {
+                continue;
+            }
+            let rustc_middle::mir::TerminatorKind::Call { func, .. } = &terminator.kind else {
+                continue;
+            };
+            let rustc_middle::ty::TyKind::FnDef(direct, _) = func.ty(body, program.tcx).kind()
+            else {
+                continue;
+            };
+            if direct.as_local() != Some(callee) {
+                continue;
+            }
+            let depths = ptr_chain_depth(call.destination.ty(body, program.tcx).ty);
+            for depth in 0..depths {
+                let depth = u8::try_from(depth).expect("return pointer depth exceeds u8");
+                if !pure_modeled_return_origin(origins, callee, depth) {
+                    continue;
+                }
+                let Some(destination) =
+                    resolve_place(slots, caller, body, call.destination, depth, None)
+                else {
+                    continue;
+                };
+                let Some(return_slot) = slots
+                    .fn_local_slots
+                    .get(&callee)
+                    .and_then(|universe| universe.slot_for_local_depth(RETURN_PLACE, depth))
+                else {
+                    continue;
+                };
+                let return_slot = SlotRef::Local(callee, return_slot);
+                if fresh_slots.contains(&return_slot) || opaque_slots.contains(&return_slot) {
+                    continue;
+                }
+                solver.constrain_origin_return_ref(
+                    a16_resolved_slot_ref(caller, destination),
+                    return_slot,
+                );
+                links += 1;
+            }
+        }
+    }
+    links
+}
+
+/// Accepted A16-REFINE construction: add one-way links only for
+/// modeled-origin returns and report their exact site count.
+pub(crate) fn construct_bo_into_a16_refined(
+    program: &RustProgram<'_>,
+    slots: &CrateSlots,
+    origins: &OriginSummaries,
+    mut_facts: &MutFacts,
+    solver: &KindSolver,
+) -> anyhow::Result<(BoConstruction, usize)> {
+    let construction = construct_bo_into(
+        program,
+        slots,
+        origins,
+        mut_facts,
+        solver,
+        CopyLendMode::Baseline,
+    )?;
+    let links = add_refined_return_kind_links(program, slots, origins, solver);
+    Ok((construction, links))
+}
+
 /// D1-authorized parked-census migration: shared construction, baseline mode, with the harness's
 /// existing Use-family tracking preserved exactly. No eligibility or lend behavior is reachable.
 #[cfg(test)]
@@ -857,6 +988,46 @@ pub(crate) fn solve_bo_a5_config(
     mode: A5Mode,
     attestation: Option<WholeProgramAttestation>,
 ) -> Option<VerifiedBo> {
+    // A16-REFINE is part of the accepted precise production semantics. The
+    // retained Baseline mode is a diagnostic A5 control, not another
+    // production configuration.
+    let refined = mode == A5Mode::PreciseReplay;
+    let (verified, _links) = solve_bo_a5_config_inner(
+        program,
+        slots,
+        origins,
+        mut_facts,
+        mode,
+        attestation,
+        refined,
+    )?;
+    Some(stamp_a16_refined_receipt(verified, refined))
+}
+
+fn stamp_a16_refined_receipt(mut verified: VerifiedBo, refined: bool) -> VerifiedBo {
+    if refined {
+        verified.receipt = verified.receipt.replacen(
+            "soundness_mode=a14\n",
+            "soundness_mode=a14_a16_refined\n",
+            1,
+        );
+        verified.receipt.push_str(&format!(
+            "a16_refined_links={}\n",
+            verified.a16_refined_links
+        ));
+    }
+    verified
+}
+
+fn solve_bo_a5_config_inner(
+    program: &RustProgram<'_>,
+    slots: &CrateSlots,
+    origins: &OriginSummaries,
+    mut_facts: &MutFacts,
+    mode: A5Mode,
+    attestation: Option<WholeProgramAttestation>,
+    refined: bool,
+) -> Option<(VerifiedBo, usize)> {
     assert_eq!(
         CopyLendMode::current(),
         CopyLendMode::Baseline,
@@ -891,39 +1062,49 @@ pub(crate) fn solve_bo_a5_config(
             A5Plan::baseline()
         };
         let selected_model_sha256 = model_digest(&baseline_model);
-        return Some(VerifiedBo {
-            receipt: a5_receipt(
-                mode,
-                &plan,
-                0,
-                0,
-                &selected_model_sha256,
-                &baseline_nullability,
-                &baseline_a14,
-            ),
-            mark_artifact: a5_mark_artifact(mode, &plan, &BTreeSet::new(), &selected_model_sha256),
-            site_artifact: a5_site_artifact(mode, &plan),
-            nullable_artifact: baseline_nullability.artifact.clone(),
-            field_ref_artifact: baseline_a14.artifact.clone(),
-            summary_artifact: plan.summary_artifact.clone(),
-            baseline_model: baseline_model.clone(),
-            model: baseline_model,
-            retained_c9_marks: BTreeSet::new(),
-            retained_c9_plans: Vec::new(),
-            round_stats: baseline_round_stats,
-            selector_sources: baseline_construction.selectors.sources().len(),
-            selector_sinks: baseline_construction.selectors.sinks().len(),
-            emission_stats: baseline_construction.stats,
-            construction_emit_elapsed: baseline_construction.emit_elapsed,
-            construction_coherence_elapsed: baseline_construction.coherence_elapsed,
-            check_sat_count: baseline_solver.check_sat_count(),
-            hard_check_count: baseline_solver.hard_check_count(),
-            optimize_materialization_count: baseline_solver.optimize_materialization_count(),
-            hard_check_elapsed: baseline_solver.hard_check_elapsed(),
-            optimize_materialization_elapsed: baseline_solver.optimize_materialization_elapsed(),
-            planned_c9_marks: BTreeSet::new(),
-            producer_stats: plan.stats,
-        });
+        return Some((
+            VerifiedBo {
+                receipt: a5_receipt(
+                    mode,
+                    &plan,
+                    0,
+                    0,
+                    &selected_model_sha256,
+                    &baseline_nullability,
+                    &baseline_a14,
+                ),
+                mark_artifact: a5_mark_artifact(
+                    mode,
+                    &plan,
+                    &BTreeSet::new(),
+                    &selected_model_sha256,
+                ),
+                site_artifact: a5_site_artifact(mode, &plan),
+                nullable_artifact: baseline_nullability.artifact.clone(),
+                field_ref_artifact: baseline_a14.artifact.clone(),
+                summary_artifact: plan.summary_artifact.clone(),
+                baseline_model: baseline_model.clone(),
+                model: baseline_model,
+                retained_c9_marks: BTreeSet::new(),
+                retained_c9_plans: Vec::new(),
+                round_stats: baseline_round_stats,
+                selector_sources: baseline_construction.selectors.sources().len(),
+                selector_sinks: baseline_construction.selectors.sinks().len(),
+                emission_stats: baseline_construction.stats,
+                construction_emit_elapsed: baseline_construction.emit_elapsed,
+                construction_coherence_elapsed: baseline_construction.coherence_elapsed,
+                check_sat_count: baseline_solver.check_sat_count(),
+                hard_check_count: baseline_solver.hard_check_count(),
+                optimize_materialization_count: baseline_solver.optimize_materialization_count(),
+                hard_check_elapsed: baseline_solver.hard_check_elapsed(),
+                optimize_materialization_elapsed: baseline_solver
+                    .optimize_materialization_elapsed(),
+                a16_refined_links: 0,
+                planned_c9_marks: BTreeSet::new(),
+                producer_stats: plan.stats,
+            },
+            0,
+        ));
     }
 
     let plan = produce_a5_plan(
@@ -937,56 +1118,140 @@ pub(crate) fn solve_bo_a5_config(
     )
     .ok()?;
     if matches!(plan.abi_guard, AbiGuardDisposition::Refused { .. }) {
+        if refined {
+            // Refusing A5 promotion must not also disable the independently
+            // accepted A16-REFINE constraint. Product/unattested mode keeps
+            // the A5 guard's fallback while applying the same one-way return
+            // rule as the attested production path.
+            let solver = KindSolver::new(slots);
+            let (construction, refined_links) =
+                construct_bo_into_a16_refined(program, slots, origins, mut_facts, &solver).ok()?;
+            let (model, round_stats) = verify_bo_construction_counting(
+                program,
+                slots,
+                origins,
+                &solver,
+                &construction,
+                mut_facts,
+            );
+            let model = model?;
+            let selected_model_sha256 = model_digest(&model);
+            let nullability = nullability_artifacts(&construction);
+            let a14 = a14_artifacts(&construction);
+            return Some((
+                VerifiedBo {
+                    receipt: a5_receipt(
+                        mode,
+                        &plan,
+                        0,
+                        0,
+                        &selected_model_sha256,
+                        &nullability,
+                        &a14,
+                    ),
+                    mark_artifact: a5_mark_artifact(
+                        mode,
+                        &plan,
+                        &BTreeSet::new(),
+                        &selected_model_sha256,
+                    ),
+                    site_artifact: a5_site_artifact(mode, &plan),
+                    nullable_artifact: nullability.artifact,
+                    field_ref_artifact: a14.artifact,
+                    summary_artifact: plan.summary_artifact.clone(),
+                    baseline_model,
+                    model,
+                    retained_c9_marks: BTreeSet::new(),
+                    retained_c9_plans: Vec::new(),
+                    round_stats,
+                    selector_sources: construction.selectors.sources().len(),
+                    selector_sinks: construction.selectors.sinks().len(),
+                    emission_stats: construction.stats,
+                    construction_emit_elapsed: construction.emit_elapsed,
+                    construction_coherence_elapsed: construction.coherence_elapsed,
+                    check_sat_count: solver.check_sat_count(),
+                    hard_check_count: solver.hard_check_count(),
+                    optimize_materialization_count: solver.optimize_materialization_count(),
+                    hard_check_elapsed: solver.hard_check_elapsed(),
+                    optimize_materialization_elapsed: solver.optimize_materialization_elapsed(),
+                    a16_refined_links: refined_links,
+                    planned_c9_marks: plan
+                        .planned_marks
+                        .iter()
+                        .map(|mark| mark.key.clone())
+                        .collect(),
+                    producer_stats: plan.stats,
+                },
+                refined_links,
+            ));
+        }
         let selected_model_sha256 = model_digest(&baseline_model);
-        return Some(VerifiedBo {
-            receipt: a5_receipt(
-                mode,
-                &plan,
-                0,
-                0,
-                &selected_model_sha256,
-                &baseline_nullability,
-                &baseline_a14,
-            ),
-            mark_artifact: a5_mark_artifact(mode, &plan, &BTreeSet::new(), &selected_model_sha256),
-            site_artifact: a5_site_artifact(mode, &plan),
-            nullable_artifact: baseline_nullability.artifact.clone(),
-            field_ref_artifact: baseline_a14.artifact.clone(),
-            summary_artifact: plan.summary_artifact.clone(),
-            baseline_model: baseline_model.clone(),
-            model: baseline_model,
-            retained_c9_marks: BTreeSet::new(),
-            retained_c9_plans: Vec::new(),
-            round_stats: baseline_round_stats,
-            selector_sources: baseline_construction.selectors.sources().len(),
-            selector_sinks: baseline_construction.selectors.sinks().len(),
-            emission_stats: baseline_construction.stats,
-            construction_emit_elapsed: baseline_construction.emit_elapsed,
-            construction_coherence_elapsed: baseline_construction.coherence_elapsed,
-            check_sat_count: baseline_solver.check_sat_count(),
-            hard_check_count: baseline_solver.hard_check_count(),
-            optimize_materialization_count: baseline_solver.optimize_materialization_count(),
-            hard_check_elapsed: baseline_solver.hard_check_elapsed(),
-            optimize_materialization_elapsed: baseline_solver.optimize_materialization_elapsed(),
-            planned_c9_marks: plan
-                .planned_marks
-                .iter()
-                .map(|mark| mark.key.clone())
-                .collect(),
-            producer_stats: plan.stats,
-        });
+        return Some((
+            VerifiedBo {
+                receipt: a5_receipt(
+                    mode,
+                    &plan,
+                    0,
+                    0,
+                    &selected_model_sha256,
+                    &baseline_nullability,
+                    &baseline_a14,
+                ),
+                mark_artifact: a5_mark_artifact(
+                    mode,
+                    &plan,
+                    &BTreeSet::new(),
+                    &selected_model_sha256,
+                ),
+                site_artifact: a5_site_artifact(mode, &plan),
+                nullable_artifact: baseline_nullability.artifact.clone(),
+                field_ref_artifact: baseline_a14.artifact.clone(),
+                summary_artifact: plan.summary_artifact.clone(),
+                baseline_model: baseline_model.clone(),
+                model: baseline_model,
+                retained_c9_marks: BTreeSet::new(),
+                retained_c9_plans: Vec::new(),
+                round_stats: baseline_round_stats,
+                selector_sources: baseline_construction.selectors.sources().len(),
+                selector_sinks: baseline_construction.selectors.sinks().len(),
+                emission_stats: baseline_construction.stats,
+                construction_emit_elapsed: baseline_construction.emit_elapsed,
+                construction_coherence_elapsed: baseline_construction.coherence_elapsed,
+                check_sat_count: baseline_solver.check_sat_count(),
+                hard_check_count: baseline_solver.hard_check_count(),
+                optimize_materialization_count: baseline_solver.optimize_materialization_count(),
+                hard_check_elapsed: baseline_solver.hard_check_elapsed(),
+                optimize_materialization_elapsed: baseline_solver
+                    .optimize_materialization_elapsed(),
+                a16_refined_links: 0,
+                planned_c9_marks: plan
+                    .planned_marks
+                    .iter()
+                    .map(|mark| mark.key.clone())
+                    .collect(),
+                producer_stats: plan.stats,
+            },
+            0,
+        ));
     }
 
     let solver = KindSolver::new(slots);
-    let construction = construct_bo_into(
-        program,
-        slots,
-        origins,
-        mut_facts,
-        &solver,
-        CopyLendMode::Baseline,
-    )
-    .ok()?;
+    let (construction, refined_links) = if refined {
+        construct_bo_into_a16_refined(program, slots, origins, mut_facts, &solver).ok()?
+    } else {
+        (
+            construct_bo_into(
+                program,
+                slots,
+                origins,
+                mut_facts,
+                &solver,
+                CopyLendMode::Baseline,
+            )
+            .ok()?,
+            0,
+        )
+    };
     let (model, round_stats) = match mode {
         A5Mode::Baseline => unreachable!(),
         A5Mode::PreciseReplay => {
@@ -1027,43 +1292,52 @@ pub(crate) fn solve_bo_a5_config(
     let selected_model_sha256 = model_digest(&model);
     let nullability = nullability_artifacts(&construction);
     let a14 = a14_artifacts(&construction);
-    Some(VerifiedBo {
-        receipt: a5_receipt(
-            mode,
-            &plan,
-            retained_c9_marks.len(),
-            retained_c9_plans.len(),
-            &selected_model_sha256,
-            &nullability,
-            &a14,
-        ),
-        mark_artifact: a5_mark_artifact(mode, &plan, &retained_c9_marks, &selected_model_sha256),
-        site_artifact: a5_site_artifact(mode, &plan),
-        nullable_artifact: nullability.artifact,
-        field_ref_artifact: a14.artifact,
-        summary_artifact: plan.summary_artifact.clone(),
-        model,
-        baseline_model,
-        retained_c9_marks,
-        retained_c9_plans,
-        round_stats,
-        selector_sources: construction.selectors.sources().len(),
-        selector_sinks: construction.selectors.sinks().len(),
-        emission_stats: construction.stats,
-        construction_emit_elapsed: construction.emit_elapsed,
-        construction_coherence_elapsed: construction.coherence_elapsed,
-        check_sat_count: solver.check_sat_count(),
-        hard_check_count: solver.hard_check_count(),
-        optimize_materialization_count: solver.optimize_materialization_count(),
-        hard_check_elapsed: solver.hard_check_elapsed(),
-        optimize_materialization_elapsed: solver.optimize_materialization_elapsed(),
-        planned_c9_marks: plan
-            .planned_marks
-            .iter()
-            .map(|mark| mark.key.clone())
-            .collect(),
-        producer_stats: plan.stats,
-    })
+    Some((
+        VerifiedBo {
+            receipt: a5_receipt(
+                mode,
+                &plan,
+                retained_c9_marks.len(),
+                retained_c9_plans.len(),
+                &selected_model_sha256,
+                &nullability,
+                &a14,
+            ),
+            mark_artifact: a5_mark_artifact(
+                mode,
+                &plan,
+                &retained_c9_marks,
+                &selected_model_sha256,
+            ),
+            site_artifact: a5_site_artifact(mode, &plan),
+            nullable_artifact: nullability.artifact,
+            field_ref_artifact: a14.artifact,
+            summary_artifact: plan.summary_artifact.clone(),
+            model,
+            baseline_model,
+            retained_c9_marks,
+            retained_c9_plans,
+            round_stats,
+            selector_sources: construction.selectors.sources().len(),
+            selector_sinks: construction.selectors.sinks().len(),
+            emission_stats: construction.stats,
+            construction_emit_elapsed: construction.emit_elapsed,
+            construction_coherence_elapsed: construction.coherence_elapsed,
+            check_sat_count: solver.check_sat_count(),
+            hard_check_count: solver.hard_check_count(),
+            optimize_materialization_count: solver.optimize_materialization_count(),
+            hard_check_elapsed: solver.hard_check_elapsed(),
+            optimize_materialization_elapsed: solver.optimize_materialization_elapsed(),
+            a16_refined_links: refined_links,
+            planned_c9_marks: plan
+                .planned_marks
+                .iter()
+                .map(|mark| mark.key.clone())
+                .collect(),
+            producer_stats: plan.stats,
+        },
+        refined_links,
+    ))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

@@ -10069,7 +10069,7 @@ mod borrow_ownership_coherence {
     use rustc_hash::{FxHashMap, FxHashSet};
     use rustc_hir::{ItemKind, OwnerNode};
     use rustc_middle::{
-        mir::{Local, Location, Operand, Rvalue, StatementKind},
+        mir::{Local, Location, Operand, RETURN_PLACE, Rvalue, StatementKind},
         ty::TyCtxt,
     };
     use rustc_span::def_id::LocalDefId;
@@ -10080,6 +10080,7 @@ mod borrow_ownership_coherence {
             borrow::{GBorrowInferCtxt, demote_pointers_iterative_with_fields},
             borrow_ownership::{
                 CrateCtxt, SlotKind,
+                a5_overlap::{A5Mode, WholeProgramAttestation},
                 borrow_engine::{
                     borrow_conflicts_replaying_with_flows_and_copy_lends,
                     borrow_conflicts_replaying_witnessed_with_copy_lends,
@@ -10092,7 +10093,11 @@ mod borrow_ownership_coherence {
                     CopyLendPair, add_coherence, add_coherence_with_copy_lends,
                     constrain_field_ownership, selected_copy_lend_sites,
                 },
-                construction::{CopyLendMode, analyze_copy_lend_eligibility, construct_bo_into},
+                construction::{
+                    CopyLendMode, analyze_copy_lend_eligibility, construct_bo_into,
+                    construct_bo_into_a16_refined, solve_bo_a5_config,
+                    verify_bo_construction_counting,
+                },
                 crate_slots::CrateSlots,
                 emit_crate_ownership_constraints, emit_crate_ownership_constraints_with_copy_lends,
                 export::{LoanClass, location_key, with_bo_export},
@@ -10275,6 +10280,233 @@ mod borrow_ownership_coherence {
             }
         }
         panic!("no local named `{name}` in {did:?}");
+    }
+
+    #[test]
+    fn a16_refined_links_only_modeled_borrow_returns() {
+        run_compiler(
+            r#"
+unsafe extern "C" { fn malloc(size: usize) -> *mut core::ffi::c_void; }
+unsafe extern "C" { fn opaque(p: *mut i32) -> *mut i32; }
+struct Cell { p: *mut i32 }
+unsafe fn id(p: *mut i32) -> *mut i32 { p }
+unsafe fn fresh() -> *mut i32 { malloc(4) as *mut i32 }
+unsafe fn seed(c: *mut Cell, p: *mut i32) { (*c).p = opaque(p); }
+unsafe fn tainted(c: *mut Cell) -> *mut i32 { (*c).p }
+unsafe fn caller(p: *mut i32) -> i32 {
+    let q = id(p);
+    *q
+}
+unsafe fn fresh_caller() -> i32 {
+    let r = fresh();
+    *r
+}
+unsafe fn tainted_caller(c: *mut Cell) -> i32 {
+    let r = tainted(c);
+    *r
+}
+"#,
+            |tcx| {
+                let program = collect_program(tcx);
+                let slots = CrateSlots::build(&program);
+                let origins = compute_origins(&program);
+                let mut_facts = MutFacts::from_program(&program);
+                let id = function_by_name(&program, "id");
+                let caller = function_by_name(&program, "caller");
+                let id_return = SlotRef::Local(
+                    id,
+                    slots.fn_local_slots[&id]
+                        .slot_for_local_depth(RETURN_PLACE, 0)
+                        .expect("id return slot"),
+                );
+                let q = local_slot(&slots, caller, local_by_var_name(tcx, caller, "q"), 0);
+
+                let baseline_solver = KindSolver::new(&slots);
+                let baseline = construct_bo_into(
+                    &program,
+                    &slots,
+                    &origins,
+                    &mut_facts,
+                    &baseline_solver,
+                    CopyLendMode::Baseline,
+                )
+                .expect("baseline construction");
+                baseline_solver.assume(id_return, SlotKind::Raw);
+                let baseline_model = verify_bo_construction_counting(
+                    &program,
+                    &slots,
+                    &origins,
+                    &baseline_solver,
+                    &baseline,
+                    &mut_facts,
+                )
+                .0
+                .expect("baseline model");
+                assert_eq!(baseline_model.get(&q), Some(&SlotKind::Ref));
+
+                let refined_solver = KindSolver::new(&slots);
+                let (refined, links) = construct_bo_into_a16_refined(
+                    &program,
+                    &slots,
+                    &origins,
+                    &mut_facts,
+                    &refined_solver,
+                )
+                .expect("refined construction");
+                assert_eq!(links, 1, "only id's modeled return receives a link");
+                refined_solver.assume(id_return, SlotKind::Raw);
+                let refined_model = verify_bo_construction_counting(
+                    &program,
+                    &slots,
+                    &origins,
+                    &refined_solver,
+                    &refined,
+                    &mut_facts,
+                )
+                .0
+                .expect("refined model");
+                assert_ne!(refined_model.get(&q), Some(&SlotKind::Ref));
+            },
+        );
+    }
+
+    #[test]
+    fn a16_refined_input_ub_scope_controls() {
+        run_compiler(
+            r#"
+unsafe fn make() -> *mut i32 {
+    let mut value = 1;
+    let p = &mut value as *mut i32;
+    p
+}
+pub unsafe fn f() -> i32 {
+    let q = make();
+    *q
+}
+"#,
+            |tcx| {
+                let program = collect_program(tcx);
+                let slots = CrateSlots::build(&program);
+                let origins = compute_origins(&program);
+                let mut_facts = MutFacts::from_program(&program);
+                let solver = KindSolver::new(&slots);
+                let (_, links) =
+                    construct_bo_into_a16_refined(&program, &slots, &origins, &mut_facts, &solver)
+                        .expect("input-UB diagnostic construction");
+                assert_eq!(
+                    links, 0,
+                    "a stack-local return is not a modeled argument origin"
+                );
+            },
+        );
+
+        run_compiler(
+            r#"
+unsafe extern "C" {
+    fn malloc(size: usize) -> *mut core::ffi::c_void;
+    fn free(ptr: *mut core::ffi::c_void);
+}
+unsafe fn inner(p: *mut i32) -> *mut i32 { p }
+unsafe fn writer(p: *mut i32) { *p = 2; }
+unsafe fn middle(p: *mut i32) -> *mut i32 {
+    let q = inner(p);
+    writer(p);
+    q
+}
+pub unsafe fn f() -> i32 {
+    let owner = malloc(4) as *mut i32;
+    let q = middle(owner);
+    let value = *q;
+    free(owner as *mut core::ffi::c_void);
+    value
+}
+"#,
+            |tcx| {
+                let program = collect_program(tcx);
+                let slots = CrateSlots::build(&program);
+                let origins = compute_origins(&program);
+                let mut_facts = MutFacts::from_program(&program);
+                let f = function_by_name(&program, "f");
+                let q = local_slot(&slots, f, local_by_var_name(tcx, f, "q"), 0);
+
+                let baseline_solver = KindSolver::new(&slots);
+                let baseline = construct_bo_into(
+                    &program,
+                    &slots,
+                    &origins,
+                    &mut_facts,
+                    &baseline_solver,
+                    CopyLendMode::Baseline,
+                )
+                .expect("UB-free control baseline construction");
+                let baseline_model = verify_bo_construction_counting(
+                    &program,
+                    &slots,
+                    &origins,
+                    &baseline_solver,
+                    &baseline,
+                    &mut_facts,
+                )
+                .0
+                .expect("UB-free control baseline model");
+                assert_eq!(baseline_model.get(&q), Some(&SlotKind::Ref));
+
+                let refined_solver = KindSolver::new(&slots);
+                let (refined, links) = construct_bo_into_a16_refined(
+                    &program,
+                    &slots,
+                    &origins,
+                    &mut_facts,
+                    &refined_solver,
+                )
+                .expect("UB-free control refined construction");
+                assert_eq!(
+                    links, 2,
+                    "both argument-derived return boundaries are linked"
+                );
+                let refined_model = verify_bo_construction_counting(
+                    &program,
+                    &slots,
+                    &origins,
+                    &refined_solver,
+                    &refined,
+                    &mut_facts,
+                )
+                .0
+                .expect("UB-free control refined model");
+                assert_eq!(refined_model.get(&q), Some(&SlotKind::Raw));
+
+                let production = solve_bo_a5_config(
+                    &program,
+                    &slots,
+                    &origins,
+                    &mut_facts,
+                    A5Mode::PreciseReplay,
+                    Some(WholeProgramAttestation::FrozenBenchmarkGraph),
+                )
+                .expect("landed precise production model");
+                assert_eq!(production.model.get(&q), Some(&SlotKind::Raw));
+                assert_eq!(production.a16_refined_links, 2);
+                assert!(
+                    production
+                        .receipt
+                        .contains("soundness_mode=a14_a16_refined\n")
+                );
+
+                let unattested = solve_bo_a5_config(
+                    &program,
+                    &slots,
+                    &origins,
+                    &mut_facts,
+                    A5Mode::PreciseReplay,
+                    None,
+                )
+                .expect("unattested product fallback");
+                assert_eq!(unattested.model.get(&q), Some(&SlotKind::Raw));
+                assert_eq!(unattested.a16_refined_links, 2);
+                assert!(unattested.receipt.contains("a5_abi_guard=refused:"));
+            },
+        );
     }
 
     /// Shared §8 BB3-b assertion for a mixed-role-local fixture (a local conflated to one

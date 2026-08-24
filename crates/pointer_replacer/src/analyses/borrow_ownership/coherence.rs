@@ -430,7 +430,7 @@ fn owner_slot_ref(
     }
 }
 
-fn positive_opaque_return_slots(
+pub(crate) fn positive_opaque_return_slots(
     slots: &CrateSlots,
     program: &RustProgram<'_>,
     origin_flows: &super::origin_flow::OriginFlowResults,

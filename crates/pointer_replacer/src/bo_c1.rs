@@ -41,6 +41,8 @@ use self::ownership_diagnostic_package::{
 };
 use crate::{analyses::borrow_ownership::solver::CORE_LABEL_FAMILIES, utils::rustc::RustProgram};
 
+#[path = "a16_return_kind_exposure.rs"]
+mod a16_return_kind_exposure;
 #[path = "a4_measurement.rs"]
 mod a4_measurement;
 #[path = "a4_source_census.rs"]
@@ -6016,6 +6018,8 @@ mod run {
         let mut row = Row::default();
         row.set("t_tcx_s", secs(t_tcx));
         let mode = A5Mode::PreciseReplay;
+        let a16_refined = true;
+        let soundness_mode = "a14_a16_refined";
         assert_eq!(CopyLendMode::current(), CopyLendMode::Baseline);
         assert_eq!(A2Mode::current(), A2Mode::Off);
         assert_eq!(
@@ -6027,7 +6031,7 @@ mod run {
         row.set("a5_world", A5World::ClosedWorldFrozenGraph.label());
         row.set("copy_lend_mode", CopyLendMode::Baseline.label());
         row.set("a2_mode", A2Mode::Off.label());
-        row.set("soundness_mode", "a14");
+        row.set("soundness_mode", soundness_mode);
         row.set("z3_full_version", z3::full_version().to_string());
         let official_evaluation = std::path::PathBuf::from(
             std::env::var_os("CRAT_A5_OFFICIAL_EVALUATION")
@@ -6070,7 +6074,7 @@ mod run {
             "a5_abi_guard=permitted:measurement-frozen-graph-attested\n".to_owned(),
             "copy_lend_mode=baseline\n".to_owned(),
             "a2_mode=off\n".to_owned(),
-            "soundness_mode=a14\n".to_owned(),
+            format!("soundness_mode={soundness_mode}\n"),
         ] {
             assert!(
                 verified.receipt.contains(&stamp),
@@ -6081,6 +6085,8 @@ mod run {
             "a5_abi_guard",
             "permitted:measurement-frozen-graph-attested",
         );
+        row.set("a16_refined", a16_refined);
+        row.set("a16_refined_links", verified.a16_refined_links);
         let receipt_value = |key: &str| {
             verified
                 .receipt
@@ -8430,6 +8436,27 @@ mod run {
         let mut row = Row::default();
         let outcome = rewrite_m1_path(input);
         row.set("t_total_s", secs(t0.elapsed()));
+        if let Some(directory) = std::env::var_os("CRAT_A16_EMISSION_OBSERVER_DIR") {
+            let directory = std::path::PathBuf::from(directory);
+            std::fs::create_dir_all(&directory).expect("create A16 emission observer directory");
+            let degradations = match &outcome {
+                RewriteOutcome::Emitted {
+                    source,
+                    degradations,
+                    ..
+                } => {
+                    std::fs::write(directory.join("emitted-root.rs"), source)
+                        .expect("write A16 observed emitted root");
+                    degradations
+                }
+                RewriteOutcome::Degraded { degradations, .. } => degradations,
+            };
+            std::fs::write(
+                directory.join("degradations.tsv"),
+                a16_emission_ledger_tsv(degradations),
+            )
+            .expect("write A16 emission degradation ledger");
+        }
         let receipt_field = |key: &str| {
             outcome
                 .a5_receipt()
@@ -8443,6 +8470,7 @@ mod run {
             "a5_abi_guard",
             "copy_lend_mode",
             "a2_mode",
+            "soundness_mode",
         ] {
             row.set(
                 key,
@@ -8452,6 +8480,10 @@ mod run {
         row.set(
             "a5_model_retained_marks",
             receipt_field("a5_retained_marks").unwrap_or_else(|| "missing".to_owned()),
+        );
+        row.set(
+            "a16_refined_links",
+            receipt_field("a16_refined_links").unwrap_or_else(|| "0".to_owned()),
         );
         let emission_retained = match &outcome {
             RewriteOutcome::Emitted { source, .. } => source.matches("let __crat_c9_").count(),
@@ -8663,6 +8695,24 @@ mod run {
             }
         }
         row
+    }
+
+    pub(super) fn a16_emission_ledger_tsv(
+        degradations: &[crate::bo_rewriter::decision::Degradation],
+    ) -> String {
+        let mut rows = degradations
+            .iter()
+            .map(|degradation| {
+                format!(
+                    "{}\t{}\t{}\n",
+                    degradation.subject,
+                    degradation.reason.key(),
+                    degradation.site,
+                )
+            })
+            .collect::<Vec<_>>();
+        rows.sort();
+        format!("subject\treason\tsite\n{}", rows.concat())
     }
 
     pub fn run_m1_census(tcx: TyCtxt<'_>, t_tcx: Duration) -> Row {
@@ -14463,6 +14513,30 @@ mod fabrication_gate_witnesses {
     }
 }
 
+#[test]
+fn a16_emission_observer_is_sorted_and_typed() {
+    use crate::bo_rewriter::decision::{Degradation, DegradeReason};
+
+    let rows = [
+        Degradation {
+            subject: "z#2".to_owned(),
+            site: "z.rs:2".to_owned(),
+            reason: DegradeReason::KindRaw,
+        },
+        Degradation {
+            subject: "a#1".to_owned(),
+            site: "a.rs:1".to_owned(),
+            reason: DegradeReason::RevertedAfterVerifyFailure,
+        },
+    ];
+    assert_eq!(
+        run::a16_emission_ledger_tsv(&rows),
+        "subject\treason\tsite\n\
+a#1\treverted-after-verify-failure\ta.rs:1\n\
+z#2\tkind-raw\tz.rs:2\n"
+    );
+}
+
 // Worker (one program, one mode, one process).
 // ---------------------------------------------------------------------------
 
@@ -14546,6 +14620,7 @@ fn boc1_run_one() {
             "a4-source-census" => a4_source_census::run_worker(tcx, t_tcx),
             "a5-p1" => a5_measurement::run_worker(tcx, t_tcx),
             "a5-batch-model" => run::run_a5_batch_model(tcx, t_tcx),
+            "a16-return-kind-exposure" => a16_return_kind_exposure::run_worker(tcx, t_tcx),
             "a5-w14-drift-trace" => a5_measurement::run_w14_drift_trace_worker(tcx, t_tcx),
             "a5-production-site-join" => {
                 a5_measurement::run_production_site_join_worker(tcx, t_tcx)
