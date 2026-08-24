@@ -10285,14 +10285,22 @@ mod borrow_ownership_coherence {
         run_compiler(
             r#"
 unsafe extern "C" { fn malloc(size: usize) -> *mut core::ffi::c_void; }
+unsafe extern "C" { fn opaque(p: *mut i32) -> *mut i32; }
+struct Cell { p: *mut i32 }
 unsafe fn id(p: *mut i32) -> *mut i32 { p }
 unsafe fn fresh() -> *mut i32 { malloc(4) as *mut i32 }
+unsafe fn seed(c: *mut Cell, p: *mut i32) { (*c).p = opaque(p); }
+unsafe fn tainted(c: *mut Cell) -> *mut i32 { (*c).p }
 unsafe fn caller(p: *mut i32) -> i32 {
     let q = id(p);
     *q
 }
 unsafe fn fresh_caller() -> i32 {
     let r = fresh();
+    *r
+}
+unsafe fn tainted_caller(c: *mut Cell) -> i32 {
+    let r = tainted(c);
     *r
 }
 "#,

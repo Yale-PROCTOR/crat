@@ -37,6 +37,7 @@ use super::{
     coherence::{
         CopyLendPair, FieldRefPlan, add_coherence, add_coherence_removal_only,
         add_coherence_with_copy_lends, constrain_field_ref_worthiness,
+        positive_opaque_return_slots,
     },
     crate_slots::{CrateSlots, ptr_chain_depth},
     emit_crate_ownership_constraints, emit_crate_ownership_constraints_with_copy_lends,
@@ -47,6 +48,7 @@ use super::{
     resolve::{ResolvedSlot, resolve_place},
     slots::SlotOwner,
     solver::{KindSolver, Selectors, SlotRef},
+    sources::collect_malloc_source_slots,
 };
 use crate::{
     analyses::{
@@ -654,6 +656,8 @@ fn add_refined_return_kind_links(
     origins: &OriginSummaries,
     solver: &KindSolver,
 ) -> usize {
+    let fresh_slots = collect_malloc_source_slots(program.tcx, &program.functions, slots);
+    let opaque_slots = positive_opaque_return_slots(slots, program, origins.native_flows());
     let mut links = 0usize;
     for &caller in &program.functions {
         let body_ref = program
@@ -677,6 +681,16 @@ fn add_refined_return_kind_links(
             ) {
                 continue;
             }
+            let rustc_middle::mir::TerminatorKind::Call { func, .. } = &terminator.kind else {
+                continue;
+            };
+            let rustc_middle::ty::TyKind::FnDef(direct, _) = func.ty(body, program.tcx).kind()
+            else {
+                continue;
+            };
+            if direct.as_local() != Some(callee) {
+                continue;
+            }
             let depths = ptr_chain_depth(call.destination.ty(body, program.tcx).ty);
             for depth in 0..depths {
                 let depth = u8::try_from(depth).expect("return pointer depth exceeds u8");
@@ -695,9 +709,13 @@ fn add_refined_return_kind_links(
                 else {
                     continue;
                 };
+                let return_slot = SlotRef::Local(callee, return_slot);
+                if fresh_slots.contains(&return_slot) || opaque_slots.contains(&return_slot) {
+                    continue;
+                }
                 solver.constrain_origin_return_ref(
                     a16_resolved_slot_ref(caller, destination),
-                    SlotRef::Local(callee, return_slot),
+                    return_slot,
                 );
                 links += 1;
             }
