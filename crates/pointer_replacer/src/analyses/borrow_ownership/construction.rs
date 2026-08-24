@@ -439,6 +439,30 @@ pub(crate) fn a5_site_artifact(mode: A5Mode, plan: &A5Plan) -> String {
     out
 }
 
+fn canonical_receipt(input: String) -> String {
+    fn key(line: &str) -> &str {
+        line.split_once('=').map_or(line, |(key, _)| key)
+    }
+    let mut lines = input.lines().collect::<Vec<_>>();
+    lines.sort_by(|left, right| {
+        let rank = |key: &str| match key {
+            "schema" => 0,
+            "status" => 1,
+            "data" => 2,
+            _ => 3,
+        };
+        let left_key = key(left);
+        let right_key = key(right);
+        (rank(left_key), left_key).cmp(&(rank(right_key), right_key))
+    });
+    for pair in lines.windows(2) {
+        let left = pair[0].split_once('=').map_or(pair[0], |(key, _)| key);
+        let right = pair[1].split_once('=').map_or(pair[1], |(key, _)| key);
+        assert_ne!(left, right, "duplicate receipt key {left}");
+    }
+    format!("{}\n", lines.join("\n"))
+}
+
 fn a5_receipt(
     mode: A5Mode,
     plan: &A5Plan,
@@ -448,7 +472,7 @@ fn a5_receipt(
     nullability: &NullabilityArtifacts,
     a14: &A14Artifacts,
 ) -> String {
-    format!(
+    canonical_receipt(format!(
         "schema=bo-construction-v1\nstatus=ok\ndata=true\ncopy_lend_mode=baseline\n\
          a2_mode=off\nsoundness_mode=a14\na5_mode={}\na5_world={}\nunknown_caller_seeding=false\n\
          a5_abi_guard={}\na5_raw_pairs={}\na5_effective_pairs={}\n\
@@ -483,7 +507,7 @@ fn a5_receipt(
         a14.unresolved_unresolvable,
         a14.nullable_store_fields,
         Sha256::digest(a14.artifact.as_bytes()),
-    )
+    ))
 }
 
 pub(crate) fn baseline_a5_receipt(model: &FxHashMap<SlotRef, SlotKind>) -> String {
@@ -1299,6 +1323,14 @@ fn live_outward_event<'tcx>(
 #[cfg(test)]
 mod mode_tests {
     use super::*;
+
+    #[test]
+    fn receipt_key_order_is_canonical_across_input_order() {
+        let left = canonical_receipt("z=3\nschema=x\ndata=true\nstatus=ok\na=1\n".to_owned());
+        let right = canonical_receipt("status=ok\na=1\ndata=true\nz=3\nschema=x\n".to_owned());
+        assert_eq!(left, right);
+        assert_eq!(left, "schema=x\nstatus=ok\ndata=true\na=1\nz=3\n");
+    }
 
     #[test]
     fn copy_lend_production_stays_dormant_without_an_environment_switch() {

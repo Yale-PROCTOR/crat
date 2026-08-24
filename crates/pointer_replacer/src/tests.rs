@@ -8883,6 +8883,70 @@ pub unsafe extern "C" fn bar() {
     );
 }
 
+mod mut_depth_robustness {
+    use rustc_hir::{ItemKind, OwnerNode};
+
+    use crate::{
+        analyses::type_qualifier::foster::mutability::{Mutability, mutability_analysis},
+        utils::rustc::RustProgram,
+    };
+
+    #[test]
+    fn mut_depth_union_projected_pointer_load_is_conservatively_mutable() {
+        ::utils::compilation::run_compiler_on_str(
+            r#"
+#[repr(C)]
+union U { p: *mut i32, n: usize }
+#[repr(C)]
+struct S { p: *mut i32 }
+pub unsafe fn load_union(u: U) -> *mut i32 { unsafe { u.p } }
+pub unsafe fn load_struct(s: S) -> *mut i32 { s.p }
+"#,
+            |tcx| {
+                let mut functions = Vec::new();
+                let mut structs = Vec::new();
+                for maybe_owner in tcx.hir_crate(()).owners.iter() {
+                    let Some(owner) = maybe_owner.as_owner() else {
+                        continue;
+                    };
+                    let OwnerNode::Item(item) = owner.node() else {
+                        continue;
+                    };
+                    match item.kind {
+                        ItemKind::Fn { .. } => functions.push(item.owner_id.def_id),
+                        ItemKind::Struct(..) => structs.push(item.owner_id.def_id),
+                        _ => {}
+                    }
+                }
+                let program = RustProgram {
+                    tcx,
+                    functions,
+                    structs,
+                };
+                let result = mutability_analysis(&program);
+                let find = |name: &str| {
+                    *program
+                        .functions
+                        .iter()
+                        .find(|did| tcx.item_name(did.to_def_id()).as_str() == name)
+                        .unwrap_or_else(|| panic!("missing fixture function {name}"))
+                };
+                assert_eq!(
+                    result.function_body_fact(find("load_union"), 0, 0),
+                    Some(Mutability::Mut),
+                    "an unrepresentable union projection must conservatively bottom the return"
+                );
+                assert_eq!(
+                    result.function_body_fact(find("load_struct"), 0, 0),
+                    Some(Mutability::Imm),
+                    "the representable non-union path must retain the existing immutable result"
+                );
+            },
+        )
+        .unwrap_or_else(|error| error.raise());
+    }
+}
+
 mod ownership_analysis {
     use std::{
         fs,
