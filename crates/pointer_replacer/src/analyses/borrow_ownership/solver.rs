@@ -663,8 +663,9 @@ impl KindSolver {
         );
     }
 
-    /// Measurement-only A16-REFINE forecast: a caller may be Ref only if the
-    /// modeled-origin callee return is not Raw.
+    /// A16-REFINE: a caller may be Ref only if the modeled-origin callee
+    /// return is not Raw. This is deliberately one-way: it can demote the
+    /// caller, never license Ref from the callee.
     pub(crate) fn constrain_origin_return_ref(&self, caller: SlotRef, callee: SlotRef) {
         let caller_ref = &self
             .vars

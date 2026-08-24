@@ -4344,9 +4344,8 @@ mod run {
                 constrain_field_ownership, field_ownership_candidates, selected_copy_lend_sites,
             },
             construction::{
-                A2Mode, BoConstruction, CopyLendMode, a16_refine_measurement_enabled,
-                construct_bo_into, solve_bo_a5_config, verify_bo_construction_counting,
-                verify_bo_construction_with_flows,
+                A2Mode, BoConstruction, CopyLendMode, construct_bo_into, solve_bo_a5_config,
+                verify_bo_construction_counting, verify_bo_construction_with_flows,
             },
             crate_slots::CrateSlots,
             l2,
@@ -6019,12 +6018,8 @@ mod run {
         let mut row = Row::default();
         row.set("t_tcx_s", secs(t_tcx));
         let mode = A5Mode::PreciseReplay;
-        let a16_refined = a16_refine_measurement_enabled();
-        let soundness_mode = if a16_refined {
-            "a14_a16_refined"
-        } else {
-            "a14"
-        };
+        let a16_refined = true;
+        let soundness_mode = "a14_a16_refined";
         assert_eq!(CopyLendMode::current(), CopyLendMode::Baseline);
         assert_eq!(A2Mode::current(), A2Mode::Off);
         assert_eq!(

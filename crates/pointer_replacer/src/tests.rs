@@ -10080,6 +10080,7 @@ mod borrow_ownership_coherence {
             borrow::{GBorrowInferCtxt, demote_pointers_iterative_with_fields},
             borrow_ownership::{
                 CrateCtxt, SlotKind,
+                a5_overlap::{A5Mode, WholeProgramAttestation},
                 borrow_engine::{
                     borrow_conflicts_replaying_with_flows_and_copy_lends,
                     borrow_conflicts_replaying_witnessed_with_copy_lends,
@@ -10094,7 +10095,8 @@ mod borrow_ownership_coherence {
                 },
                 construction::{
                     CopyLendMode, analyze_copy_lend_eligibility, construct_bo_into,
-                    construct_bo_into_a16_refined, verify_bo_construction_counting,
+                    construct_bo_into_a16_refined, solve_bo_a5_config,
+                    verify_bo_construction_counting,
                 },
                 crate_slots::CrateSlots,
                 emit_crate_ownership_constraints, emit_crate_ownership_constraints_with_copy_lends,
@@ -10473,6 +10475,36 @@ pub unsafe fn f() -> i32 {
                 .0
                 .expect("UB-free control refined model");
                 assert_eq!(refined_model.get(&q), Some(&SlotKind::Raw));
+
+                let production = solve_bo_a5_config(
+                    &program,
+                    &slots,
+                    &origins,
+                    &mut_facts,
+                    A5Mode::PreciseReplay,
+                    Some(WholeProgramAttestation::FrozenBenchmarkGraph),
+                )
+                .expect("landed precise production model");
+                assert_eq!(production.model.get(&q), Some(&SlotKind::Raw));
+                assert_eq!(production.a16_refined_links, 2);
+                assert!(
+                    production
+                        .receipt
+                        .contains("soundness_mode=a14_a16_refined\n")
+                );
+
+                let unattested = solve_bo_a5_config(
+                    &program,
+                    &slots,
+                    &origins,
+                    &mut_facts,
+                    A5Mode::PreciseReplay,
+                    None,
+                )
+                .expect("unattested product fallback");
+                assert_eq!(unattested.model.get(&q), Some(&SlotKind::Raw));
+                assert_eq!(unattested.a16_refined_links, 2);
+                assert!(unattested.receipt.contains("a5_abi_guard=refused:"));
             },
         );
     }

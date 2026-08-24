@@ -59,17 +59,6 @@ use crate::{
 };
 
 pub(crate) const A2_MODE_ENV: &str = "CRAT_BO_A2_MODE";
-pub(crate) const A16_REFINE_MEASUREMENT_ENV: &str = "CRAT_BO_A16_REFINE_MEASUREMENT";
-
-pub(crate) fn a16_refine_measurement_enabled() -> bool {
-    match std::env::var(A16_REFINE_MEASUREMENT_ENV) {
-        Err(std::env::VarError::NotPresent) => false,
-        Ok(value) if value == "0" => false,
-        Ok(value) if value == "1" => true,
-        Ok(value) => panic!("{A16_REFINE_MEASUREMENT_ENV} must be 0 or 1; got {value:?}"),
-        Err(error) => panic!("{A16_REFINE_MEASUREMENT_ENV} is not valid Unicode: {error}"),
-    }
-}
 
 pub(crate) fn plan_a5_c9_marks(
     witnesses: impl IntoIterator<Item = (C9MarkKey, WitnessMarkability)>,
@@ -724,9 +713,8 @@ fn add_refined_return_kind_links(
     links
 }
 
-/// Measurement-only A16-REFINE construction. Production remains the landed
-/// A14 path; this explicit door adds one-way links only for modeled-origin
-/// returns and reports their exact site count.
+/// Accepted A16-REFINE construction: add one-way links only for
+/// modeled-origin returns and report their exact site count.
 pub(crate) fn construct_bo_into_a16_refined(
     program: &RustProgram<'_>,
     slots: &CrateSlots,
@@ -1000,14 +988,10 @@ pub(crate) fn solve_bo_a5_config(
     mode: A5Mode,
     attestation: Option<WholeProgramAttestation>,
 ) -> Option<VerifiedBo> {
-    let refined = a16_refine_measurement_enabled();
-    if refined {
-        assert_eq!(
-            mode,
-            A5Mode::PreciseReplay,
-            "A16-REFINE measurement requires A5 precise replay"
-        );
-    }
+    // A16-REFINE is part of the accepted precise production semantics. The
+    // retained Baseline mode is a diagnostic A5 control, not another
+    // production configuration.
+    let refined = mode == A5Mode::PreciseReplay;
     let (verified, _links) = solve_bo_a5_config_inner(
         program,
         slots,
@@ -1033,25 +1017,6 @@ fn stamp_a16_refined_receipt(mut verified: VerifiedBo, refined: bool) -> Verifie
         ));
     }
     verified
-}
-
-pub(crate) fn solve_bo_a5_config_a16_refined(
-    program: &RustProgram<'_>,
-    slots: &CrateSlots,
-    origins: &OriginSummaries,
-    mut_facts: &MutFacts,
-    attestation: Option<WholeProgramAttestation>,
-) -> Option<(VerifiedBo, usize)> {
-    let (verified, links) = solve_bo_a5_config_inner(
-        program,
-        slots,
-        origins,
-        mut_facts,
-        A5Mode::PreciseReplay,
-        attestation,
-        true,
-    )?;
-    Some((stamp_a16_refined_receipt(verified, true), links))
 }
 
 fn solve_bo_a5_config_inner(
@@ -1153,6 +1118,73 @@ fn solve_bo_a5_config_inner(
     )
     .ok()?;
     if matches!(plan.abi_guard, AbiGuardDisposition::Refused { .. }) {
+        if refined {
+            // Refusing A5 promotion must not also disable the independently
+            // accepted A16-REFINE constraint. Product/unattested mode keeps
+            // the A5 guard's fallback while applying the same one-way return
+            // rule as the attested production path.
+            let solver = KindSolver::new(slots);
+            let (construction, refined_links) =
+                construct_bo_into_a16_refined(program, slots, origins, mut_facts, &solver).ok()?;
+            let (model, round_stats) = verify_bo_construction_counting(
+                program,
+                slots,
+                origins,
+                &solver,
+                &construction,
+                mut_facts,
+            );
+            let model = model?;
+            let selected_model_sha256 = model_digest(&model);
+            let nullability = nullability_artifacts(&construction);
+            let a14 = a14_artifacts(&construction);
+            return Some((
+                VerifiedBo {
+                    receipt: a5_receipt(
+                        mode,
+                        &plan,
+                        0,
+                        0,
+                        &selected_model_sha256,
+                        &nullability,
+                        &a14,
+                    ),
+                    mark_artifact: a5_mark_artifact(
+                        mode,
+                        &plan,
+                        &BTreeSet::new(),
+                        &selected_model_sha256,
+                    ),
+                    site_artifact: a5_site_artifact(mode, &plan),
+                    nullable_artifact: nullability.artifact,
+                    field_ref_artifact: a14.artifact,
+                    summary_artifact: plan.summary_artifact.clone(),
+                    baseline_model,
+                    model,
+                    retained_c9_marks: BTreeSet::new(),
+                    retained_c9_plans: Vec::new(),
+                    round_stats,
+                    selector_sources: construction.selectors.sources().len(),
+                    selector_sinks: construction.selectors.sinks().len(),
+                    emission_stats: construction.stats,
+                    construction_emit_elapsed: construction.emit_elapsed,
+                    construction_coherence_elapsed: construction.coherence_elapsed,
+                    check_sat_count: solver.check_sat_count(),
+                    hard_check_count: solver.hard_check_count(),
+                    optimize_materialization_count: solver.optimize_materialization_count(),
+                    hard_check_elapsed: solver.hard_check_elapsed(),
+                    optimize_materialization_elapsed: solver.optimize_materialization_elapsed(),
+                    a16_refined_links: refined_links,
+                    planned_c9_marks: plan
+                        .planned_marks
+                        .iter()
+                        .map(|mark| mark.key.clone())
+                        .collect(),
+                    producer_stats: plan.stats,
+                },
+                refined_links,
+            ));
+        }
         let selected_model_sha256 = model_digest(&baseline_model);
         return Some((
             VerifiedBo {
