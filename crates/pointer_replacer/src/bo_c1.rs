@@ -4344,8 +4344,9 @@ mod run {
                 constrain_field_ownership, field_ownership_candidates, selected_copy_lend_sites,
             },
             construction::{
-                A2Mode, BoConstruction, CopyLendMode, construct_bo_into, solve_bo_a5_config,
-                verify_bo_construction_counting, verify_bo_construction_with_flows,
+                A2Mode, BoConstruction, CopyLendMode, a16_refine_measurement_enabled,
+                construct_bo_into, solve_bo_a5_config, verify_bo_construction_counting,
+                verify_bo_construction_with_flows,
             },
             crate_slots::CrateSlots,
             l2,
@@ -6018,6 +6019,12 @@ mod run {
         let mut row = Row::default();
         row.set("t_tcx_s", secs(t_tcx));
         let mode = A5Mode::PreciseReplay;
+        let a16_refined = a16_refine_measurement_enabled();
+        let soundness_mode = if a16_refined {
+            "a14_a16_refined"
+        } else {
+            "a14"
+        };
         assert_eq!(CopyLendMode::current(), CopyLendMode::Baseline);
         assert_eq!(A2Mode::current(), A2Mode::Off);
         assert_eq!(
@@ -6029,7 +6036,7 @@ mod run {
         row.set("a5_world", A5World::ClosedWorldFrozenGraph.label());
         row.set("copy_lend_mode", CopyLendMode::Baseline.label());
         row.set("a2_mode", A2Mode::Off.label());
-        row.set("soundness_mode", "a14");
+        row.set("soundness_mode", soundness_mode);
         row.set("z3_full_version", z3::full_version().to_string());
         let official_evaluation = std::path::PathBuf::from(
             std::env::var_os("CRAT_A5_OFFICIAL_EVALUATION")
@@ -6072,7 +6079,7 @@ mod run {
             "a5_abi_guard=permitted:measurement-frozen-graph-attested\n".to_owned(),
             "copy_lend_mode=baseline\n".to_owned(),
             "a2_mode=off\n".to_owned(),
-            "soundness_mode=a14\n".to_owned(),
+            format!("soundness_mode={soundness_mode}\n"),
         ] {
             assert!(
                 verified.receipt.contains(&stamp),
@@ -6083,6 +6090,8 @@ mod run {
             "a5_abi_guard",
             "permitted:measurement-frozen-graph-attested",
         );
+        row.set("a16_refined", a16_refined);
+        row.set("a16_refined_links", verified.a16_refined_links);
         let receipt_value = |key: &str| {
             verified
                 .receipt
@@ -8445,6 +8454,7 @@ mod run {
             "a5_abi_guard",
             "copy_lend_mode",
             "a2_mode",
+            "soundness_mode",
         ] {
             row.set(
                 key,
@@ -8454,6 +8464,10 @@ mod run {
         row.set(
             "a5_model_retained_marks",
             receipt_field("a5_retained_marks").unwrap_or_else(|| "missing".to_owned()),
+        );
+        row.set(
+            "a16_refined_links",
+            receipt_field("a16_refined_links").unwrap_or_else(|| "0".to_owned()),
         );
         let emission_retained = match &outcome {
             RewriteOutcome::Emitted { source, .. } => source.matches("let __crat_c9_").count(),

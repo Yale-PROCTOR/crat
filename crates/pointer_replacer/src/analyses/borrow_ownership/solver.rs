@@ -170,6 +170,7 @@ pub(crate) const CORE_LABEL_FAMILIES: &[&str] = &[
     "field-forbid",
     "field-ref-source",
     "field-ref-forbid",
+    "return-ref-origin",
     "link-own",
     GUARDED_COMMIT_CORE_FAMILY,
     RECURRENCE_ESCALATION_CORE_FAMILY,
@@ -659,6 +660,27 @@ impl KindSolver {
             self.tracker.as_ref(),
             || format!("field-ref-forbid({field:?})"),
             &!field_ref,
+        );
+    }
+
+    /// Measurement-only A16-REFINE forecast: a caller may be Ref only if the
+    /// modeled-origin callee return is not Raw.
+    pub(crate) fn constrain_origin_return_ref(&self, caller: SlotRef, callee: SlotRef) {
+        let caller_ref = &self
+            .vars
+            .get(&caller)
+            .unwrap_or_else(|| panic!("unknown caller slot: {caller:?}"))
+            .ref_;
+        let callee_raw = &self
+            .vars
+            .get(&callee)
+            .unwrap_or_else(|| panic!("unknown callee slot: {callee:?}"))
+            .raw;
+        assert_hard(
+            &self.solver,
+            self.tracker.as_ref(),
+            || format!("return-ref-origin({caller:?}=>{callee:?})"),
+            &Bool::or(&[&!caller_ref, &!callee_raw]),
         );
     }
 

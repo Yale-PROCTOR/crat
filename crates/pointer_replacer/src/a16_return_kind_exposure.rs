@@ -17,6 +17,7 @@ use crate::{
     analyses::borrow_ownership::{
         SlotKind,
         coherence::positive_opaque_return_slots,
+        construction::pure_modeled_return_origin,
         crate_slots::{CrateSlots, ptr_chain_depth},
         l2::SlotKey,
         origin_summary::SignatureRoot,
@@ -56,15 +57,7 @@ fn origin_evidence(
             .then_some(id)
     });
     let unknown = signature_return.is_none_or(|id| summary.unknown.contains(id));
-    let modeled = signature_return.is_some_and(|returned_id| {
-        summary.subset.rows().any(|source| {
-            source != returned_id
-                && !summary.unknown.contains(source)
-                && summary.subset.contains(source, returned_id)
-                && !summary.subset.contains(returned_id, source)
-                && matches!(summary.slots[source].place.root, SignatureRoot::Arg(_))
-        })
-    });
+    let modeled = pure_modeled_return_origin(origins, callee, depth);
     let fresh = fresh_slots.contains(&returned);
     let opaque = opaque_slots.contains(&returned);
     let class = if opaque {
