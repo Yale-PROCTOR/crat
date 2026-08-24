@@ -12,8 +12,8 @@ use crate::{
     analyses::borrow_ownership::{
         CrateCtxt,
         borrow_verify::{
-            RepairMode, RoundStats, model_accepts, verify_l2_to_fixpoint_counting,
-            verify_to_fixpoint, verify_to_fixpoint_counting,
+            RepairMode, RoundStats, TestLoopBackend, model_accepts, verify_l2_to_fixpoint_counting,
+            verify_to_fixpoint, verify_to_fixpoint_counting, verify_to_fixpoint_counting_for_test,
         },
         coherence::add_coherence,
         crate_slots::CrateSlots,
@@ -791,6 +791,50 @@ fn capture_solve_counting(
         (model, stats, export)
     })
     .unwrap_or_else(|e| e.raise())
+}
+
+fn capture_solve_counting_backend(
+    code: &str,
+    backend: TestLoopBackend,
+) -> (
+    Option<FxHashMap<SlotRef, super::SlotKindAlias>>,
+    RoundStats,
+    BoExport,
+) {
+    ::utils::compilation::run_compiler_on_str(code, move |tcx| {
+        let program = collect_program(tcx);
+        let slots = CrateSlots::build(&program);
+        let ((model, stats), export) = with_bo_export(|| {
+            let crate_ctxt = CrateCtxt::new(&program);
+            let solver = KindSolver::new(&slots);
+            let (_stats, selectors) = emit_crate_ownership_constraints(
+                &crate_ctxt,
+                &slots,
+                &compute_origins(&program),
+                &solver,
+            )
+            .expect("emission");
+            for &function in &program.functions {
+                let body = tcx
+                    .mir_drops_elaborated_and_const_checked(function)
+                    .borrow();
+                add_coherence(&solver, &slots, function, &body);
+            }
+            verify_to_fixpoint_counting_for_test(
+                &program, &slots, &solver, &selectors, true, backend,
+            )
+        });
+        (model, stats, export)
+    })
+    .unwrap_or_else(|error| error.raise())
+}
+
+#[test]
+fn decomposed_multi_round_model_commits_and_export_match_legacy() {
+    let legacy = capture_solve_counting_backend(CASCADE, TestLoopBackend::LegacyOptimize);
+    let decomposed =
+        capture_solve_counting_backend(CASCADE, TestLoopBackend::HardCheckRoundOptimize);
+    assert_eq!(decomposed, legacy);
 }
 
 /// Solve through the **L2 guarded-commit loop**, under export capture (D2).
