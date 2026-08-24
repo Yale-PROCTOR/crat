@@ -671,6 +671,12 @@ fn add_refined_return_kind_links(
             let CallKind::FreeStanding(callee) = call.func else {
                 continue;
             };
+            if !matches!(
+                program.tcx.hir_node_by_def_id(callee),
+                rustc_hir::Node::Item(_)
+            ) {
+                continue;
+            }
             let depths = ptr_chain_depth(call.destination.ty(body, program.tcx).ty);
             for depth in 0..depths {
                 let depth = u8::try_from(depth).expect("return pointer depth exceeds u8");
