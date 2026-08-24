@@ -231,6 +231,10 @@ pub(crate) struct VerifiedBo {
     pub(crate) construction_emit_elapsed: Duration,
     pub(crate) construction_coherence_elapsed: Duration,
     pub(crate) check_sat_count: usize,
+    pub(crate) hard_check_count: usize,
+    pub(crate) optimize_materialization_count: usize,
+    pub(crate) hard_check_elapsed: Duration,
+    pub(crate) optimize_materialization_elapsed: Duration,
     pub(crate) planned_c9_marks: BTreeSet<C9MarkKey>,
     pub(crate) producer_stats: super::a5_producer::A5ProducerStats,
 }
@@ -832,6 +836,10 @@ pub(crate) fn solve_bo_a5_config(
             construction_emit_elapsed: baseline_construction.emit_elapsed,
             construction_coherence_elapsed: baseline_construction.coherence_elapsed,
             check_sat_count: baseline_solver.check_sat_count(),
+            hard_check_count: baseline_solver.hard_check_count(),
+            optimize_materialization_count: baseline_solver.optimize_materialization_count(),
+            hard_check_elapsed: baseline_solver.hard_check_elapsed(),
+            optimize_materialization_elapsed: baseline_solver.optimize_materialization_elapsed(),
             planned_c9_marks: BTreeSet::new(),
             producer_stats: plan.stats,
         });
@@ -875,6 +883,10 @@ pub(crate) fn solve_bo_a5_config(
             construction_emit_elapsed: baseline_construction.emit_elapsed,
             construction_coherence_elapsed: baseline_construction.coherence_elapsed,
             check_sat_count: baseline_solver.check_sat_count(),
+            hard_check_count: baseline_solver.hard_check_count(),
+            optimize_materialization_count: baseline_solver.optimize_materialization_count(),
+            hard_check_elapsed: baseline_solver.hard_check_elapsed(),
+            optimize_materialization_elapsed: baseline_solver.optimize_materialization_elapsed(),
             planned_c9_marks: plan
                 .planned_marks
                 .iter()
@@ -960,6 +972,10 @@ pub(crate) fn solve_bo_a5_config(
         construction_emit_elapsed: construction.emit_elapsed,
         construction_coherence_elapsed: construction.coherence_elapsed,
         check_sat_count: solver.check_sat_count(),
+        hard_check_count: solver.hard_check_count(),
+        optimize_materialization_count: solver.optimize_materialization_count(),
+        hard_check_elapsed: solver.hard_check_elapsed(),
+        optimize_materialization_elapsed: solver.optimize_materialization_elapsed(),
         planned_c9_marks: plan
             .planned_marks
             .iter()

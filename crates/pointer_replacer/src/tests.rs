@@ -9927,6 +9927,9 @@ pub unsafe fn g(pp: *mut *mut i32) -> i32 {
             assert_eq!(model.get(&SlotRef::Local(g, d1)), Some(&SlotKind::Ref));
             assert_eq!(solver.hard_check_count(), 1);
             assert_eq!(solver.optimize_materialization_count(), 1);
+            assert_eq!(solver.check_sat_count(), 2);
+            assert!(solver.hard_check_elapsed() > std::time::Duration::ZERO);
+            assert!(solver.optimize_materialization_elapsed() > std::time::Duration::ZERO);
         });
     }
 
@@ -10206,6 +10209,58 @@ mod borrow_ownership_coherence {
         dropped.sort_unstable();
         dropped.dedup();
         dropped
+    }
+
+    fn selector_trace_sidecar(case: &str, legacy: &SelectorTrace, hard: &SelectorTrace) -> String {
+        let mut output = String::from(
+            "case\tbackend\tepoch\tstep\tphase\tselector\tactive_before\tcore_members\toutcome\tfinal_dropped\tfinal_active\n",
+        );
+        for (backend, trace) in [("legacy-optimize", legacy), ("plain-solver", hard)] {
+            for (epoch_index, epoch) in trace.epochs.iter().enumerate() {
+                let (final_dropped, final_active) = selector_final_sets(trace)[epoch_index].clone();
+                let join = |items: &[usize]| {
+                    items
+                        .iter()
+                        .map(usize::to_string)
+                        .collect::<Vec<_>>()
+                        .join(",")
+                };
+                for (step, event) in epoch.events.iter().enumerate() {
+                    let mut core = event.core_selectors.clone();
+                    core.sort_unstable();
+                    core.dedup();
+                    output.push_str(&format!(
+                        "{case}\t{backend}\t{epoch_index}\t{}\t{:?}\t{}\t{}\t{}\t{:?}\t{}\t{}\n",
+                        step + 1,
+                        event.phase,
+                        event.selector_index,
+                        join(&event.active_before),
+                        join(&core),
+                        event.outcome,
+                        join(&final_dropped),
+                        join(&final_active),
+                    ));
+                }
+            }
+        }
+        output
+    }
+
+    fn maybe_write_selector_trace_sidecar(
+        case: &str,
+        legacy: &SelectorTrace,
+        hard: &SelectorTrace,
+    ) {
+        let Some(directory) = std::env::var_os("CRAT_S24R1_SELECTOR_SIDECAR_DIR") else {
+            return;
+        };
+        let directory = std::path::PathBuf::from(directory);
+        std::fs::create_dir_all(&directory).expect("create S2-4-R1 selector sidecar directory");
+        std::fs::write(
+            directory.join(format!("{case}.tsv")),
+            selector_trace_sidecar(case, legacy, hard),
+        )
+        .expect("write S2-4-R1 selector sidecar");
     }
 
     /// The `Local` whose source-level variable name is `name`, via MIR debug info.
@@ -10728,6 +10783,7 @@ pub unsafe fn sink_side(a: *mut core::ffi::c_void) -> *mut core::ffi::c_void {
                     selector_final_sets(&legacy_trace),
                     selector_final_sets(&hard_trace)
                 );
+                maybe_write_selector_trace_sidecar("mixed-tie", &legacy_trace, &hard_trace);
                 assert_eq!(
                     dropped_selector_set(&selectors, &hard_dropped),
                     dropped_selector_set(&selectors, &dropped)
@@ -10883,6 +10939,10 @@ pub unsafe fn sink_side2(a2: *mut core::ffi::c_void) -> *mut core::ffi::c_void {
                     selector_final_sets(&legacy_trace),
                     selector_final_sets(&hard_trace)
                 );
+                let sidecar = selector_trace_sidecar("mixed-fanout", &legacy_trace, &hard_trace);
+                assert!(sidecar.contains("legacy-optimize"));
+                assert!(sidecar.contains("plain-solver"));
+                maybe_write_selector_trace_sidecar("mixed-fanout", &legacy_trace, &hard_trace);
                 assert_eq!(
                     dropped_selector_set(&selectors, &hard_dropped),
                     dropped_selector_set(&selectors, &dropped)

@@ -6158,6 +6158,16 @@ mod run {
         row.set("rounds", verified.round_stats.rounds);
         row.set("commits_conflict", verified.round_stats.commits_conflict);
         row.set("check_sat_count", verified.check_sat_count);
+        row.set("hard_check_count", verified.hard_check_count);
+        row.set(
+            "optimize_materialization_count",
+            verified.optimize_materialization_count,
+        );
+        row.set("t_hard_check_s", secs(verified.hard_check_elapsed));
+        row.set(
+            "t_optimize_materialization_s",
+            secs(verified.optimize_materialization_elapsed),
+        );
         row.set("z3_ast_len", verified.emission_stats.z3_ast_len);
         row.set(
             "source_sink_emissions",
@@ -6777,6 +6787,16 @@ mod run {
             rstats.copy_lend_replay_selections,
         );
         row.set("check_sat_count", solver.check_sat_count());
+        row.set("hard_check_count", solver.hard_check_count());
+        row.set(
+            "optimize_materialization_count",
+            solver.optimize_materialization_count(),
+        );
+        row.set("t_hard_check_s", secs(solver.hard_check_elapsed()));
+        row.set(
+            "t_optimize_materialization_s",
+            secs(solver.optimize_materialization_elapsed()),
+        );
         row.set(
             "commits_per_round",
             rstats

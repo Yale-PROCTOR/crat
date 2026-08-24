@@ -1,7 +1,7 @@
 use std::{
     cell::{Cell, RefCell},
     ops::Range,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use rustc_hash::FxHashMap;
@@ -336,6 +336,8 @@ pub struct KindSolver {
     check_sat_count: Cell<usize>,
     hard_check_count: Cell<usize>,
     optimize_materialization_count: Cell<usize>,
+    hard_check_elapsed: Cell<Duration>,
+    optimize_materialization_elapsed: Cell<Duration>,
 }
 
 /// R1a's private hard-query backend. It snapshots only `Optimize`'s hard
@@ -455,6 +457,8 @@ impl KindSolver {
             check_sat_count: Cell::new(0),
             hard_check_count: Cell::new(0),
             optimize_materialization_count: Cell::new(0),
+            hard_check_elapsed: Cell::new(Duration::ZERO),
+            optimize_materialization_elapsed: Cell::new(Duration::ZERO),
         }
     }
 
@@ -905,6 +909,14 @@ impl KindSolver {
         self.optimize_materialization_count.get()
     }
 
+    pub(crate) fn hard_check_elapsed(&self) -> Duration {
+        self.hard_check_elapsed.get()
+    }
+
+    pub(crate) fn optimize_materialization_elapsed(&self) -> Duration {
+        self.optimize_materialization_elapsed.get()
+    }
+
     pub(crate) fn hard_assertion_count(&self) -> usize {
         self.solver.get_assertions().len()
     }
@@ -940,7 +952,14 @@ impl KindSolver {
             .set(self.check_sat_count.get().saturating_add(1));
         self.hard_check_count
             .set(self.hard_check_count.get().saturating_add(1));
-        hard.solver.check_assumptions(assumptions)
+        let started = Instant::now();
+        let outcome = hard.solver.check_assumptions(assumptions);
+        self.hard_check_elapsed.set(
+            self.hard_check_elapsed
+                .get()
+                .saturating_add(started.elapsed()),
+        );
+        outcome
     }
 
     pub(crate) fn optimize(&self) -> &Optimize {
@@ -1128,12 +1147,31 @@ impl KindSolver {
     ) -> Option<FxHashMap<SlotRef, SlotKind>> {
         self.optimize_materialization_count
             .set(self.optimize_materialization_count.get().saturating_add(1));
+        let started = Instant::now();
         if self.check_with_assumptions(&relaxed.assumptions) != SatResult::Sat {
+            self.optimize_materialization_elapsed.set(
+                self.optimize_materialization_elapsed
+                    .get()
+                    .saturating_add(started.elapsed()),
+            );
             return None;
         }
-        let model = self.solver.get_model()?;
+        let Some(model) = self.solver.get_model() else {
+            self.optimize_materialization_elapsed.set(
+                self.optimize_materialization_elapsed
+                    .get()
+                    .saturating_add(started.elapsed()),
+            );
+            return None;
+        };
         self.read_version_owns(&model);
-        Some(self.read_kinds(&model))
+        let kinds = self.read_kinds(&model);
+        self.optimize_materialization_elapsed.set(
+            self.optimize_materialization_elapsed
+                .get()
+                .saturating_add(started.elapsed()),
+        );
+        Some(kinds)
     }
 
     pub(crate) fn model_kinds_decomposed_reporting_l2(
