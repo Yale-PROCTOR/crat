@@ -9,12 +9,11 @@ use rustc_mir_dataflow::{
 };
 
 use super::{Provenance, ProvenanceSet, direct_raw_pointer_field_slots_in_ty};
-use crate::analyses::{liveness::MaybeLiveLocals, mir::TerminatorExt};
+use crate::analyses::liveness::MaybeLiveLocals;
 
-/// The set of program points that a [`Provenance`] is live on exit
+/// The set of program points where a [`Provenance`] is live on entry.
 pub(crate) type ProvenanceLiveness = SparseBitMatrix<PointIndex, Provenance>;
 
-/// FIXME place holder provenance should be live throughout the fn body
 pub fn compute_provenance_liveness<'tcx>(
     location_map: &DenseLocationMap,
     tcx: TyCtxt<'tcx>,
@@ -22,6 +21,13 @@ pub fn compute_provenance_liveness<'tcx>(
     provenance_set: &ProvenanceSet,
 ) -> ProvenanceLiveness {
     let mut provenance_liveness = ProvenanceLiveness::new(provenance_set.provenance_data.len());
+    let placeholders = provenance_set
+        .provenance_data
+        .iter_enumerated()
+        .filter_map(|(provenance, data)| {
+            matches!(data, super::ProvenanceData::PlaceHolder(..)).then_some(provenance)
+        })
+        .collect::<Vec<_>>();
 
     let mut local_liveness = MaybeLiveLocals
         .iterate_to_fixpoint(tcx, body, None)
@@ -37,8 +43,13 @@ pub fn compute_provenance_liveness<'tcx>(
             };
 
             let point_index = location_map.point_from_location(location);
+            for provenance in placeholders.iter().copied() {
+                provenance_liveness.insert(point_index, provenance);
+            }
 
-            local_liveness.seek_before_primary_effect(location);
+            // `MaybeLiveLocals` is a backward analysis, so "after" the
+            // primary effect in analysis order is before it in program order.
+            local_liveness.seek_after_primary_effect(location);
             let liveness = local_liveness.get();
             for local in liveness.iter() {
                 if let Some(provenance) = provenance_set.local_data[local] {
@@ -50,19 +61,6 @@ pub fn compute_provenance_liveness<'tcx>(
                     {
                         provenance_liveness.insert(point_index, provenance);
                     }
-                }
-            }
-
-            if position == bb_len - 1 {
-                // This is a terminator
-                if let Some(terminator) = &bb_data.terminator
-                    && let Some(mir_call) = terminator.as_call(tcx)
-                    && let Some(dest_local) = mir_call.destination.as_local()
-                    && let Some(dest_provenance) = provenance_set.local_data[dest_local]
-                {
-                    // Make the destination provenance live at terminator location
-                    let point_index = location_map.point_from_location(location);
-                    provenance_liveness.insert(point_index, dest_provenance);
                 }
             }
         }

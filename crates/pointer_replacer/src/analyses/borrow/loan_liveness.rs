@@ -1,130 +1,241 @@
+use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_index::bit_set::{DenseBitSet, SparseBitMatrix};
-use rustc_middle::{
-    mir::{Body, Location, Statement, Terminator, TerminatorEdges},
-    ty::TyCtxt,
-};
-use rustc_mir_dataflow::{
-    Analysis,
-    points::{DenseLocationMap, PointIndex},
-};
+use rustc_middle::mir::{Body, Location};
+use rustc_mir_dataflow::points::{DenseLocationMap, PointIndex};
 
 use super::{
-    BorrowSet, Loan, killed::Killed, provenance_liveness::ProvenanceLiveness,
-    requires::ProvenanceRequiresLoan,
+    BorrowSet, ConstraintLocation, Loan, MembershipConstraint, Provenance,
+    ProvenanceConstraintGraph, ProvenanceData, ProvenanceSet, SubsetConstraint, killed::Killed,
+    provenance_liveness::ProvenanceLiveness,
 };
 
-/// The set of program points that a [`Loan`] is live on entry
+/// The set of program points where a loan is live on entry.
 pub(crate) type LoanLiveness = SparseBitMatrix<PointIndex, Loan>;
 
+/// Point-sensitive `requires(provenance, loan, point)` facts.
+pub(crate) struct LocalizedRequires {
+    rows: FxHashMap<(PointIndex, Provenance), DenseBitSet<Loan>>,
+}
+
+impl LocalizedRequires {
+    fn new() -> Self {
+        Self {
+            rows: FxHashMap::default(),
+        }
+    }
+
+    fn insert(&mut self, point: PointIndex, provenance: Provenance, loan: Loan, loans: usize) {
+        self.rows
+            .entry((point, provenance))
+            .or_insert_with(|| DenseBitSet::new_empty(loans))
+            .insert(loan);
+    }
+
+    pub fn contains(&self, point: PointIndex, provenance: Provenance, loan: Loan) -> bool {
+        self.rows
+            .get(&(point, provenance))
+            .is_some_and(|loans| loans.contains(loan))
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct LocalizedNode {
+    provenance: Provenance,
+    point: PointIndex,
+}
+
+struct LocalizedConstraintGraph {
+    point_edges: FxHashMap<LocalizedNode, Vec<Provenance>>,
+    logical_edges: FxHashMap<Provenance, Vec<Provenance>>,
+}
+
+impl LocalizedConstraintGraph {
+    fn new(location_map: &DenseLocationMap, constraints: &ProvenanceConstraintGraph) -> Self {
+        let mut point_edges: FxHashMap<LocalizedNode, Vec<Provenance>> = FxHashMap::default();
+        let mut logical_edges: FxHashMap<Provenance, Vec<Provenance>> = FxHashMap::default();
+
+        for SubsetConstraint { sup, sub, location } in constraints.subset.iter().copied() {
+            match location {
+                ConstraintLocation::Point(location) => {
+                    let node = LocalizedNode {
+                        provenance: sub,
+                        point: location_map.point_from_location(location),
+                    };
+                    point_edges.entry(node).or_default().push(sup);
+                }
+                ConstraintLocation::All => {
+                    logical_edges.entry(sub).or_default().push(sup);
+                }
+            }
+        }
+
+        Self {
+            point_edges,
+            logical_edges,
+        }
+    }
+
+    fn same_point_successors(&self, node: LocalizedNode) -> impl Iterator<Item = Provenance> + '_ {
+        self.point_edges
+            .get(&node)
+            .into_iter()
+            .flatten()
+            .chain(
+                self.logical_edges
+                    .get(&node.provenance)
+                    .into_iter()
+                    .flatten(),
+            )
+            .copied()
+    }
+}
+
 pub fn compute_loan_liveness<'tcx>(
-    tcx: TyCtxt<'tcx>,
     body: &Body<'tcx>,
     borrow_set: &BorrowSet<'tcx>,
     location_map: &DenseLocationMap,
     provenance_liveness: &ProvenanceLiveness,
-    requires: &ProvenanceRequiresLoan,
     killed: &Killed,
-) -> LoanLiveness {
-    let mut loan_liveness = SparseBitMatrix::new(borrow_set.loans.len());
+    provenance_set: &ProvenanceSet,
+    constraints: &ProvenanceConstraintGraph,
+) -> (LoanLiveness, LocalizedRequires) {
+    let graph = LocalizedConstraintGraph::new(location_map, constraints);
+    let mut loan_liveness = LoanLiveness::new(borrow_set.loans.len());
+    let mut requires = LocalizedRequires::new();
+    let mut visited = FxHashSet::default();
+    let mut stack = vec![];
 
-    let mut loan_live_at = LoanLiveAt {
-        borrow_set,
-        location_map,
-        provenance_liveness,
-        requires,
-        killed,
-    }
-    .iterate_to_fixpoint(tcx, body, None)
-    .into_results_cursor(body);
+    for MembershipConstraint { loan, provenance } in constraints.membership.iter().copied() {
+        visited.clear();
+        stack.clear();
 
-    for (bb, bb_data) in body.basic_blocks.iter_enumerated() {
-        loan_live_at.seek_to_block_start(bb);
+        let reserve_point = location_map.point_from_location(borrow_set.loans[loan].location);
+        let initial = same_point_closure(
+            &graph,
+            LocalizedNode {
+                provenance,
+                point: reserve_point,
+            },
+            provenance_set.provenance_data.len(),
+        );
 
-        let bb_len = bb_data.statements.len() + bb_data.terminator.is_some() as usize;
-        for position in 0..bb_len {
-            let location = Location {
-                block: bb,
-                statement_index: position,
-            };
+        // Loans are issued after their reservation location. Starting at successor
+        // points prevents a borrow from conflicting with the access that creates it.
+        for provenance in initial.iter() {
+            for successor in successor_points(body, location_map, reserve_point) {
+                if provenance_live_at(provenance_set, provenance_liveness, provenance, successor) {
+                    stack.push(LocalizedNode {
+                        provenance,
+                        point: successor,
+                    });
+                }
+            }
+        }
 
-            loan_live_at.seek_before_primary_effect(location);
-            let liveness = loan_live_at.get();
-            if !liveness.is_empty() {
-                let point_index = location_map.point_from_location(location);
-                loan_liveness.union_row(point_index, liveness);
+        while let Some(node) = stack.pop() {
+            if !visited.insert(node) {
+                continue;
+            }
+
+            if provenance_live_at(
+                provenance_set,
+                provenance_liveness,
+                node.provenance,
+                node.point,
+            ) {
+                loan_liveness.insert(node.point, loan);
+                requires.insert(node.point, node.provenance, loan, borrow_set.loans.len());
+            }
+
+            for successor in graph.same_point_successors(node) {
+                stack.push(LocalizedNode {
+                    provenance: successor,
+                    point: node.point,
+                });
+            }
+
+            if killed[node.point].contains(loan) {
+                continue;
+            }
+
+            for successor in successor_points(body, location_map, node.point) {
+                if provenance_live_at(
+                    provenance_set,
+                    provenance_liveness,
+                    node.provenance,
+                    successor,
+                ) {
+                    stack.push(LocalizedNode {
+                        provenance: node.provenance,
+                        point: successor,
+                    });
+                }
             }
         }
     }
 
-    loan_liveness
+    (loan_liveness, requires)
 }
 
-pub struct LoanLiveAt<'analysis, 'tcx> {
-    borrow_set: &'analysis BorrowSet<'tcx>,
-    location_map: &'analysis DenseLocationMap,
-    provenance_liveness: &'analysis ProvenanceLiveness,
-    requires: &'analysis ProvenanceRequiresLoan,
-    killed: &'analysis Killed,
-}
+fn same_point_closure(
+    graph: &LocalizedConstraintGraph,
+    start: LocalizedNode,
+    provenance_count: usize,
+) -> DenseBitSet<Provenance> {
+    let mut result = DenseBitSet::new_empty(provenance_count);
+    let mut stack = vec![start.provenance];
 
-impl<'analysis, 'tcx> LoanLiveAt<'analysis, 'tcx> {
-    fn apply_location_effect(&mut self, state: &mut DenseBitSet<Loan>, location: Location) {
-        let point_index = self.location_map.point_from_location(location);
-
-        let killed = &self.killed[point_index];
-
-        let mut requires = DenseBitSet::new_empty(killed.domain_size());
-
-        for provenance in self
-            .provenance_liveness
-            .row(point_index)
-            .into_iter()
-            .flat_map(|bit_set| bit_set.iter())
-        {
-            if let Some(loans) = self.requires.row(provenance) {
-                requires.union(loans);
-            }
+    while let Some(provenance) = stack.pop() {
+        if !result.insert(provenance) {
+            continue;
         }
-
-        state.intersect(&requires);
-        state.subtract(killed);
-
-        if let Some(loans) = self.borrow_set.location_map.get(&location) {
-            for &loan in loans {
-                state.insert(loan);
-            }
-        }
+        stack.extend(graph.same_point_successors(LocalizedNode {
+            provenance,
+            point: start.point,
+        }));
     }
+
+    result
 }
 
-impl<'analysis, 'tcx> Analysis<'tcx> for LoanLiveAt<'analysis, 'tcx> {
-    type Direction = rustc_mir_dataflow::Forward;
-    type Domain = DenseBitSet<Loan>;
+fn provenance_live_at(
+    provenance_set: &ProvenanceSet,
+    provenance_liveness: &ProvenanceLiveness,
+    provenance: Provenance,
+    point: PointIndex,
+) -> bool {
+    matches!(
+        provenance_set.provenance_data[provenance],
+        ProvenanceData::PlaceHolder(..)
+    ) || provenance_liveness
+        .row(point)
+        .is_some_and(|live| live.contains(provenance))
+}
 
-    const NAME: &'static str = "loan_live_at";
+fn successor_points(
+    body: &Body<'_>,
+    location_map: &DenseLocationMap,
+    point: PointIndex,
+) -> Vec<PointIndex> {
+    let location = location_map.to_location(point);
+    let block = &body.basic_blocks[location.block];
 
-    fn bottom_value(&self, _body: &Body<'tcx>) -> Self::Domain {
-        DenseBitSet::new_empty(self.borrow_set.loans.len())
+    if location.statement_index < block.statements.len() {
+        let successor = Location {
+            block: location.block,
+            statement_index: location.statement_index + 1,
+        };
+        return vec![location_map.point_from_location(successor)];
     }
 
-    fn initialize_start_block(&self, _: &Body<'tcx>, _: &mut Self::Domain) {}
-
-    fn apply_primary_statement_effect(
-        &mut self,
-        state: &mut Self::Domain,
-        _statement: &Statement<'tcx>,
-        location: Location,
-    ) {
-        self.apply_location_effect(state, location);
-    }
-
-    fn apply_primary_terminator_effect<'mir>(
-        &mut self,
-        state: &mut Self::Domain,
-        terminator: &'mir Terminator<'tcx>,
-        location: Location,
-    ) -> TerminatorEdges<'mir, 'tcx> {
-        self.apply_location_effect(state, location);
-        terminator.edges()
-    }
+    block
+        .terminator()
+        .successors()
+        .map(|block| {
+            location_map.point_from_location(Location {
+                block,
+                statement_index: 0,
+            })
+        })
+        .collect()
 }

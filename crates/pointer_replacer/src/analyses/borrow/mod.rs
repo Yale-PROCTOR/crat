@@ -7,9 +7,8 @@ use invalidates::{Invalidates, compute_invalidates};
 use itertools::Itertools as _;
 use killed::{Killed, compute_killed};
 use lifetime_flow::{LifetimeFlowResults, analyze_program_lifetime_flow};
-use loan_liveness::{LoanLiveness, compute_loan_liveness};
+use loan_liveness::{LoanLiveness, LocalizedRequires, compute_loan_liveness};
 use provenance_liveness::{ProvenanceLiveness, compute_provenance_liveness};
-use requires::{ProvenanceRequiresLoan, compute_requires};
 use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_hir::def_id::DefId;
 use rustc_index::{
@@ -45,7 +44,6 @@ pub mod lifetime_flow;
 mod loan_liveness;
 mod places_conflict;
 mod provenance_liveness;
-mod requires;
 mod subset_closure;
 
 rustc_index::newtype_index! {
@@ -624,7 +622,14 @@ impl<'tcx> HasBorrowSet<'tcx> for Body<'tcx> {
 pub struct SubsetConstraint {
     sup: Provenance,
     sub: Provenance,
-    _location: Location,
+    location: ConstraintLocation,
+}
+
+#[derive(Clone, Copy)]
+enum ConstraintLocation {
+    Point(Location),
+    #[allow(dead_code)]
+    All,
 }
 
 #[derive(Clone, Copy)]
@@ -696,7 +701,7 @@ impl ProvenanceConstraintGraph {
                         self.graph.subset.push(SubsetConstraint {
                             sup: lhs_provenance,
                             sub: rhs_provenance,
-                            _location: location,
+                            location: ConstraintLocation::Point(location),
                         });
                     }
                 }
@@ -757,7 +762,7 @@ impl ProvenanceConstraintGraph {
             .lifetime_flows
             .get(&body.source.def_id().expect_local())
         {
-            for (source, target) in lifetime_flow.body.depth0_value_flows() {
+            for (source, target, location) in lifetime_flow.body.localized_depth0_value_flows() {
                 let Some(source_provenance) = provenance_set.provenance_for_owner(source) else {
                     continue;
                 };
@@ -767,7 +772,7 @@ impl ProvenanceConstraintGraph {
                 graph.subset.push(SubsetConstraint {
                     sup: target_provenance,
                     sub: source_provenance,
-                    _location: Location::START,
+                    location: ConstraintLocation::Point(location),
                 });
             }
         }
@@ -793,7 +798,7 @@ pub struct BorrowInferenceResults<'tcx> {
     pub provenance_liveness: ProvenanceLiveness,
     pub killed: Killed,
     pub subset_closure: SubSetClosure,
-    pub requires: ProvenanceRequiresLoan,
+    pub requires: LocalizedRequires,
     pub loan_liveness: LoanLiveness,
     pub invalidates: Invalidates,
     pub errors: Errors,
@@ -814,15 +819,14 @@ pub fn borrow_inference<'tcx>(
     let constraint_graph =
         ProvenanceConstraintGraph::new(tcx, body, &borrow_set, provenance_set, global_borrow_ctxt);
     let subset_closure = compute_subset_closure(provenance_set, &constraint_graph);
-    let requires = compute_requires(&borrow_set, provenance_set, &constraint_graph);
-    let loan_liveness = compute_loan_liveness(
-        tcx,
+    let (loan_liveness, requires) = compute_loan_liveness(
         body,
         &borrow_set,
         &location_map,
         &provenance_liveness,
-        &requires,
         &killed,
+        provenance_set,
+        &constraint_graph,
     );
     let invalidates = compute_invalidates(tcx, body, &borrow_set, provenance_set, &location_map);
     let errors = compute_errors(&borrow_set, &loan_liveness, &invalidates);
@@ -1053,7 +1057,7 @@ pub fn demote_pointers_iterative_with_fields(
                         continue;
                     };
                     for provenance in live_provenances.iter() {
-                        if !requires.contains(provenance, loan) {
+                        if !requires.contains(row, provenance, loan) {
                             continue;
                         }
                         match provenance_set.provenance_data[provenance].owner() {

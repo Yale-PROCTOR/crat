@@ -94,6 +94,14 @@ pub struct BodyLifetimeFlow {
     pub value_flows: SparseBitMatrix<LifetimeSlot, LifetimeSlot>,
     pub storage_aliases: SparseBitMatrix<LifetimeSlot, LifetimeSlot>,
     pub unknown_targets: DenseBitSet<LifetimeSlot>,
+    localized_value_flows: Vec<LocalizedValueFlow>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct LocalizedValueFlow {
+    source: LifetimeSlot,
+    target: LifetimeSlot,
+    location: Location,
 }
 
 #[derive(Clone, Debug)]
@@ -212,6 +220,7 @@ impl PartialEq for BodyLifetimeFlow {
             && same_matrix(&self.value_flows, &other.value_flows)
             && same_matrix(&self.storage_aliases, &other.storage_aliases)
             && self.unknown_targets == other.unknown_targets
+            && self.localized_value_flows == other.localized_value_flows
     }
 }
 
@@ -558,6 +567,7 @@ impl BodyLifetimeFlow {
             value_flows: SparseBitMatrix::new(domain_size),
             storage_aliases: SparseBitMatrix::new(domain_size),
             unknown_targets: DenseBitSet::new_empty(domain_size),
+            localized_value_flows: vec![],
         }
     }
 
@@ -569,34 +579,52 @@ impl BodyLifetimeFlow {
         self.slot_map.get(&(owner, depth)).copied()
     }
 
-    pub fn depth0_value_flows(&self) -> Vec<(ProvenanceOwner, ProvenanceOwner)> {
-        let mut flows = vec![];
+    pub fn localized_depth0_value_flows(
+        &self,
+    ) -> Vec<(ProvenanceOwner, ProvenanceOwner, Location)> {
+        let mut flows = FxHashSet::default();
 
-        for source in self.value_flows.rows() {
-            let source_slot = self.slots[source];
-            if source_slot.depth != 0 {
-                continue;
-            }
-            let Some(source_owner) = provenance_owner(source_slot.owner) else {
-                continue;
-            };
+        for flow in self.localized_value_flows.iter().copied() {
+            let sources = std::iter::once(flow.source).chain(
+                self.storage_aliases
+                    .row(flow.source)
+                    .into_iter()
+                    .flat_map(|aliases| aliases.iter()),
+            );
+            let targets = std::iter::once(flow.target)
+                .chain(
+                    self.storage_aliases
+                        .row(flow.target)
+                        .into_iter()
+                        .flat_map(|aliases| aliases.iter()),
+                )
+                .collect::<Vec<_>>();
 
-            let Some(targets) = self.value_flows.row(source) else {
-                continue;
-            };
+            for source in sources {
+                let source_slot = self.slots[source];
+                if source_slot.depth != 0 {
+                    continue;
+                }
+                let Some(source_owner) = provenance_owner(source_slot.owner) else {
+                    continue;
+                };
 
-            for target in targets.iter() {
-                let target_slot = self.slots[target];
-                if target_slot.depth == 0 {
+                for target in targets.iter().copied() {
+                    let target_slot = self.slots[target];
+                    if target_slot.depth != 0 {
+                        continue;
+                    }
                     let Some(target_owner) = provenance_owner(target_slot.owner) else {
                         continue;
                     };
-                    flows.push((source_owner, target_owner));
+                    if source_owner != target_owner {
+                        flows.insert((source_owner, target_owner, flow.location));
+                    }
                 }
             }
         }
 
-        flows
+        flows.into_iter().collect()
     }
 
     fn slot_for_place<'tcx, D: HasLocalDecls<'tcx>>(
@@ -627,9 +655,14 @@ impl BodyLifetimeFlow {
         self.slot_for_owner(local_slot.owner, local_slot.depth.checked_add(offset)?)
     }
 
-    fn add_flow(&mut self, source: LifetimeSlot, target: LifetimeSlot) {
+    fn add_flow(&mut self, source: LifetimeSlot, target: LifetimeSlot, location: Location) {
         if source != target {
             self.value_flows.insert(source, target);
+            self.localized_value_flows.push(LocalizedValueFlow {
+                source,
+                target,
+                location,
+            });
         }
     }
 
@@ -859,7 +892,7 @@ impl<'flow, 'summary, 'tcx> FlowVisitor<'flow, 'summary, 'tcx> {
         }
 
         for source in sources {
-            self.flow.add_flow(source, target);
+            self.flow.add_flow(source, target, location);
             self.flow.add_descendant_aliases(source, target);
         }
     }
@@ -946,7 +979,12 @@ impl<'flow, 'summary, 'tcx> FlowVisitor<'flow, 'summary, 'tcx> {
         is_slice_like_ref_ty(place.ty(self.body, self.tcx).ty)
     }
 
-    fn assign_from_place_address(&mut self, target: LifetimeSlot, place: Place<'tcx>) {
+    fn assign_from_place_address(
+        &mut self,
+        target: LifetimeSlot,
+        place: Place<'tcx>,
+        location: Location,
+    ) {
         match place_deref_depth(place) {
             Some(0) => {
                 if let Some(place_slot) = self.flow.slot_for_place(self.body, place, 0)
@@ -960,14 +998,14 @@ impl<'flow, 'summary, 'tcx> FlowVisitor<'flow, 'summary, 'tcx> {
                     .flow
                     .slot_for_local(place.local, deref_depth.saturating_sub(1))
                 {
-                    self.flow.add_flow(source, target);
+                    self.flow.add_flow(source, target, location);
                     self.flow.add_descendant_aliases(source, target);
                 }
             }
             None => {
                 if let Some(deref_depth) = place_deref_interior_depth(place) {
                     if let Some(source) = self.flow.slot_for_local(place.local, deref_depth - 1) {
-                        self.flow.add_flow(source, target);
+                        self.flow.add_flow(source, target, location);
                     } else {
                         self.flow.mark_unknown(target);
                     }
@@ -1055,7 +1093,7 @@ impl<'flow, 'summary, 'tcx> FlowVisitor<'flow, 'summary, 'tcx> {
             self.flow.mark_unknown(target);
         } else {
             for source in sources {
-                self.flow.add_flow(source, target);
+                self.flow.add_flow(source, target, location);
             }
         }
     }
@@ -1064,6 +1102,7 @@ impl<'flow, 'summary, 'tcx> FlowVisitor<'flow, 'summary, 'tcx> {
         &mut self,
         call: &MirFunctionCall<'_, 'tcx>,
         summary: &LifetimeFlowSummary,
+        location: Location,
     ) {
         for source in summary.value_flows.rows() {
             let Some(source_slot) = self.instantiate_signature_slot(call, summary.slots[source])
@@ -1079,7 +1118,7 @@ impl<'flow, 'summary, 'tcx> FlowVisitor<'flow, 'summary, 'tcx> {
                 else {
                     continue;
                 };
-                self.flow.add_flow(source_slot, target_slot);
+                self.flow.add_flow(source_slot, target_slot, location);
             }
         }
 
@@ -1193,12 +1232,12 @@ impl<'tcx> Visitor<'tcx> for FlowVisitor<'_, '_, 'tcx> {
             }
             Rvalue::CopyForDeref(place) => {
                 for source in self.place_slots_or_derived(*place, location) {
-                    self.flow.add_flow(source, target);
+                    self.flow.add_flow(source, target, location);
                     self.flow.add_descendant_aliases(source, target);
                 }
             }
             Rvalue::Ref(_, _, place) | Rvalue::RawPtr(_, place) => {
-                self.assign_from_place_address(target, *place);
+                self.assign_from_place_address(target, *place, location);
             }
             Rvalue::ThreadLocalRef(_) => self.flow.mark_unknown(target),
             Rvalue::BinaryOp(BinOp::Offset, operands) => {
@@ -1246,7 +1285,7 @@ impl<'tcx> Visitor<'tcx> for FlowVisitor<'_, '_, 'tcx> {
         match &call.func {
             CallKind::FreeStanding(callee) if self.program_functions.contains(callee) => {
                 if let Some(summary) = self.callee_summaries.get(callee) {
-                    self.apply_call_summary(&call, summary);
+                    self.apply_call_summary(&call, summary, location);
                 } else {
                     self.mark_unknown_call_effects(&call);
                 }

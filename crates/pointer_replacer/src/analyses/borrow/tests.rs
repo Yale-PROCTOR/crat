@@ -140,6 +140,21 @@ fn run_promoted_shared_fields(code: &str) -> Vec<String> {
     .unwrap()
 }
 
+fn run_promoted_mut_locals(code: &str) -> Vec<String> {
+    ::utils::compilation::run_compiler_on_str(code, |tcx| {
+        let program = build_rust_program(tcx);
+        let mutables = all_mutable_facts(&program);
+        let results = mutable_references_no_guarantee(&program, &mutables);
+        let mut promoted = vec![];
+        for (&did, locals) in &results.mutable_locals {
+            promoted.extend(user_var_names(tcx, did, locals));
+        }
+        promoted.sort();
+        promoted
+    })
+    .unwrap()
+}
+
 fn get_return_provenance_params(code: &str) -> FxHashMap<String, Vec<String>> {
     ::utils::compilation::run_compiler_on_str(code, |tcx| {
         let program = build_rust_program(tcx);
@@ -927,6 +942,60 @@ fn test_demote_strategy_no_ub() {
         ",
     );
     assert_eq!(demoted, vec!["x", "y"], "both x and y should be demoted");
+}
+
+#[test]
+fn flow_sensitive_loan_liveness_across_branches() {
+    let demoted = run_demote(
+        "
+        unsafe fn f(cond: bool) {
+            let mut x = 0i32;
+            let p = &raw mut x;
+            if cond {
+                *p = 1;
+            } else {
+                x = 2;
+            }
+        }
+        ",
+    );
+    assert_eq!(
+        demoted,
+        Vec::<String>::new(),
+        "p is live only on the then edge, so the write to x on the else edge is valid"
+    );
+}
+
+#[test]
+fn flow_sensitive_subset_constraints_across_branches() {
+    // The previous global-requires analysis demoted both `a` and `b` here:
+    // the then-only `a -> b` subset edge was also applied on the else branch.
+    let code = "
+        unsafe fn f(cond: bool) {
+            let mut x = 0i32;
+            let mut y = 0i32;
+            let a = &raw mut x;
+            let mut b = &raw mut y;
+            if cond {
+                b = a;
+                *b = 1;
+            } else {
+                x = 2;
+                *b = 3;
+            }
+        }
+        ";
+    let demoted = run_demote(code);
+    assert_eq!(
+        demoted,
+        Vec::<String>::new(),
+        "the a-to-b subset edge exists only on the then branch"
+    );
+    assert_eq!(
+        run_promoted_mut_locals(code),
+        vec!["a", "b"],
+        "flow sensitivity should preserve both mutable-reference candidates"
+    );
 }
 
 #[test]

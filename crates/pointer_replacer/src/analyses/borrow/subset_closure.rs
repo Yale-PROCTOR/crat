@@ -43,7 +43,7 @@ impl ProvenanceConstraintGraph {
                     continue;
                 }
                 answer.insert(provenance, other_provenance);
-                stack.extend_from_slice(&subset_graph[provenance]);
+                stack.extend_from_slice(&subset_graph[other_provenance]);
             }
         }
 
