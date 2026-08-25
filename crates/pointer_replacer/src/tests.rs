@@ -17624,7 +17624,8 @@ pub unsafe fn f_drop(b: *mut F) {
         use crate::analyses::{
             borrow::ConflictEdge,
             borrow_ownership::borrow_engine::{
-                PointRequiresMode, borrow_conflicts, loan_liveness_census, with_point_requires,
+                PointRequiresMode, borrow_conflicts, demotion_witness_census, loan_liveness_census,
+                with_point_requires,
             },
         };
 
@@ -17676,47 +17677,112 @@ pub unsafe fn f_drop(b: *mut F) {
             captured
         }
 
-        /// **W1 — the over-require witness.** Two reborrows of the same pointee, the first's
-        /// last use strictly before the second's write:
+        /// **W1 — the edge-gate regression control (RE-AUTHORED; see §3.6 of the port record).**
+        ///
+        /// This fixture originally shipped as an "over-require" witness asserting that the
+        /// landed conflict here DISAPPEARS under the port. That premise was refuted: the landed
+        /// conflict is real, and the port's first cut only dropped it because its CFG step was
+        /// gated at the wrong end relative to a matrix that holds EXIT liveness. The shape is
+        /// kept — it is the one that exposed the defect — but it now asserts the opposite:
         ///
         /// ```ignore
         /// let a = &mut *p as *mut i32;   // loan L_a
-        /// let v = *a;                    // a's LAST use
+        /// let v = *a;                    // a's last use
         /// let b = &mut *p as *mut i32;
-        /// *b = 1;                        // invalidates L_a — but a is already dead
+        /// *b = 1;                        // invalidates L_a — the borrow is still in scope here
+        /// v
         /// ```
         ///
-        /// The landed engine reports a conflict here whose `requirers` list is **empty**: at the
-        /// error point no live provenance requires `L_a` at all, and the loan is only still in
-        /// `loan_liveness` because that fact is sampled before the primary effect that would
-        /// intersect it away. An empty `requirers` is the visible fingerprint of the
-        /// over-requirement — an issuer demoted on the strength of a borrow nothing alive holds.
-        ///
-        /// The port's walk never records a loan at a point where the provenance carrying it is
-        /// dead, so the loan is not live at the write and the conflict disappears. This is the one
-        /// shape A2 can move (port-exploration §2.4(b)); the canonical branch-local reassignment
-        /// shape is A1's market, not A2's, and stays put — `port_localized_facts_are_a_subset`
-        /// carries it as a shape the tripwire must clear.
+        /// The landed engine reports one edge whose `requirers` list is EMPTY. That is not a
+        /// defect: `extract_conflict_edges` attributes requirers only among provenances live at
+        /// the error ROW, and here the invalidation lands one step past `a`'s last use, so the
+        /// issuer carries the demotion alone. Both modes must report it identically.
         #[test]
-        fn port_over_require_trailing_point_conflict_disappears() {
+        fn port_reborrow_chain_conflict_survives_the_edge_gate() {
             const CODE: &str = "unsafe fn f(p: *mut i32) -> i32 { let a = &mut *p as *mut i32; \
                  let v = *a; let b = &mut *p as *mut i32; *b = 1; v }";
             let off = edges_in(PointRequiresMode::Off, CODE);
+            let on = edges_in(PointRequiresMode::On, CODE);
             assert!(
                 !off.is_empty(),
-                "non-vacuity: the landed engine must report this conflict, or the witness proves \
-                 nothing; got {off:?}"
+                "non-vacuity: the landed engine must report this conflict; got {off:?}"
             );
             assert!(
                 off.iter().any(|e| e.ends_with("requirers=[]")),
-                "the landed conflict must be the over-requiring kind — an invalid loan with NO \
-                 live requirer at the error point; got {off:?}"
+                "the shape's signature is an issuer-only edge (no live requirer at the error \
+                 row); got {off:?}"
             );
+            assert_eq!(
+                off, on,
+                "the port must not drop this conflict — dropping it is exactly the edge-gate \
+                 off-by-one the port record's §3.6 diagnoses"
+            );
+        }
+
+        /// **W7 — conflict generation, witnessed on its own.** Not `off == on`: this pins the
+        /// ACTUAL edge content produced under flag-on, so an engine that stopped generating
+        /// conflicts in both modes cannot satisfy it. Required by the adversarial review — a
+        /// mutual-consistency assertion cannot detect a required invalidation deleted on both
+        /// sides (§2.2).
+        #[test]
+        fn port_conflict_generation_is_witnessed_independently() {
+            const CODE: &str = "unsafe fn f() { let mut x = 0i32; let a = &mut x as *mut i32; \
+                 let b = &mut x as *mut i32; let c = &mut x as *mut i32; *a = 1; *b = 2; *c = 3; }";
             let on = edges_in(PointRequiresMode::On, CODE);
+            assert_eq!(
+                on.len(),
+                2,
+                "flag-on must GENERATE both aliasing conflicts in this three-alias shape, not \
+                 merely agree with flag-off about them; got {on:?}"
+            );
             assert!(
-                on.is_empty(),
-                "the borrow is dead at the write, so the point-keyed engine must drop the \
-                 conflict; got {on:?}"
+                on.iter().all(|e| e.contains("issuer=Some(")),
+                "each generated edge must carry an issuer; got {on:?}"
+            );
+            assert!(
+                on.iter().any(|e| e.contains("requirers=[\"Local(")),
+                "at least one generated edge must attribute a live requirer — this is the half \
+                 that the point-keyed predicate could silently empty; got {on:?}"
+            );
+        }
+
+        /// **W8 — demotion witnesses, observed on their own.** The other half of the review's
+        /// requirement: the demotion side is read straight out of the forked collector, with no
+        /// reference to the conflict-edge set, so the two can disagree loudly rather than fail
+        /// silently together.
+        #[test]
+        fn port_demotion_witnesses_are_observed_independently() {
+            const CODE: &str = "unsafe fn f() { let mut x = 0i32; let a = &mut x as *mut i32; \
+                 let b = &mut x as *mut i32; let c = &mut x as *mut i32; *a = 1; *b = 2; *c = 3; }";
+            fn witnesses(mode: PointRequiresMode, code: &str) -> Vec<(usize, usize)> {
+                let mut captured = Vec::new();
+                run_compiler(code, |tcx| {
+                    let program = collect_program(tcx);
+                    captured = with_point_requires(mode, || {
+                        let census = demotion_witness_census(
+                            &program,
+                            |_: LocalDefId| |_: Local| true,
+                            |_: LocalDefId| |_: Local| true,
+                        );
+                        let mut all: Vec<(usize, usize)> =
+                            census.values().flatten().copied().collect();
+                        all.sort();
+                        all
+                    });
+                });
+                captured
+            }
+            let on = witnesses(PointRequiresMode::On, CODE);
+            assert!(
+                !on.is_empty(),
+                "flag-on must PRODUCE demotion witnesses for this shape, independently of what \
+                 the conflict-edge surface reports; got {on:?}"
+            );
+            assert_eq!(
+                witnesses(PointRequiresMode::Off, CODE),
+                on,
+                "the demotion side must agree with the landed engine — checked separately from \
+                 the edge side, so a predicate that emptied both would still be caught"
             );
         }
 

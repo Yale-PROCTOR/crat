@@ -42,10 +42,6 @@ mod places_conflict;
 // Name-parity re-exports: callers reach `borrow_engine::borrow_conflicts[_replaying]`, matching
 // production `borrow::borrow_conflicts[_replaying]` (the module path is the only distinguisher).
 pub(crate) use a5_places_conflict::ParameterOverlap;
-// §NB4-R: the compose/type-check decision, re-exported so its fallback is unit-testable in isolation
-// (grouping-independent — see `nb4r_route_compose_fallback_on_type_mismatch`).
-#[cfg(test)]
-pub(crate) use conflicts::loan_liveness_census;
 #[cfg(test)]
 pub(crate) use conflicts::{borrow_conflicts, borrow_conflicts_replaying};
 pub(crate) use conflicts::{
@@ -54,6 +50,10 @@ pub(crate) use conflicts::{
     borrow_conflicts_replaying_witnessed, borrow_conflicts_replaying_witnessed_with_copy_lends,
     borrow_conflicts_with_flows,
 };
+// §NB4-R: the compose/type-check decision, re-exported so its fallback is unit-testable in isolation
+// (grouping-independent — see `nb4r_route_compose_fallback_on_type_mismatch`).
+#[cfg(test)]
+pub(crate) use conflicts::{demotion_witness_census, loan_liveness_census};
 #[cfg(test)]
 pub(crate) use invalidates::{RoutedCompose, route_compose};
 #[cfg(test)]

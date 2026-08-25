@@ -461,6 +461,54 @@ where
     out
 }
 
+/// §HLZ-PORT witness instrument (test-only) — the DEMOTION side, observed on its own.
+///
+/// The adversarial review's point (2026-08-25, §39 addendum 15): asserting that conflict edges
+/// and demotion witnesses agree only proves they are mutually consistent, and the same
+/// incomplete predicate applied to both can delete a required invalidation on both sides while
+/// keeping BB2-i silent. So the two are witnessed SEPARATELY — this returns the demotion
+/// witnesses directly, with no reference to the edge set.
+#[cfg(test)]
+pub(crate) fn demotion_witness_census<I, J, K, L>(
+    program: &RustProgram,
+    is_candidate: I,
+    is_mutable: K,
+) -> FxHashMap<LocalDefId, Vec<(usize, usize)>>
+where
+    I: Fn(LocalDefId) -> J,
+    J: Fn(Local) -> bool,
+    K: Fn(LocalDefId) -> L,
+    L: Fn(Local) -> bool,
+{
+    let flows =
+        crate::analyses::borrow_ownership::origin_flow::analyze_program_origin_flow(program);
+    let ctxt = NativeBorrowContext::new(program, &flows, is_candidate, is_mutable);
+    let no_copy_lends = FxHashSet::default();
+    let mut out = FxHashMap::default();
+    for f in program.functions.iter().copied() {
+        let mut inference = ctxt.infer(program.tcx, f, &[], &no_copy_lends);
+        overwrite_with_engine_facts(
+            program.tcx,
+            f,
+            &ctxt.borrow,
+            &mut inference.facts,
+            &inference.copy_lends,
+            None,
+        );
+        let invalid_loans = invalid_loan_set(&inference);
+        let provenance_set = ctxt.borrow.provenances.get(&f).unwrap();
+        let mut witnesses: Vec<(usize, usize)> =
+            collect_invalid_loan_demotions_forked(&inference, provenance_set, &invalid_loans)
+                .into_iter()
+                .map(|(local, base)| (local.index(), base.index()))
+                .collect();
+        witnesses.sort();
+        witnesses.dedup();
+        out.insert(f, witnesses);
+    }
+    out
+}
+
 #[cfg(test)]
 fn borrow_conflicts_wrapped<I, J, K, L>(
     program: &RustProgram,

@@ -270,7 +270,10 @@ pub(super) fn compute_loan_liveness_localized<'tcx>(
     let mut loan_liveness = SparseBitMatrix::new(borrow_set.loans.len());
     let mut requires = LocalizedRequires::new();
     let mut visited = FxHashSet::default();
-    let mut stack: Vec<LocalizedNode> = vec![];
+    // `bool` = reached by a CFG edge step. Such a node's ENTRY liveness is already established by
+    // the edge gate (the source was live on exit), so it records unconditionally; a node reached
+    // by an unconditional same-point subset hop still has to prove liveness for itself.
+    let mut stack: Vec<(LocalizedNode, bool)> = vec![];
 
     for &(loan, provenance) in membership {
         visited.clear();
@@ -288,44 +291,61 @@ pub(super) fn compute_loan_liveness_localized<'tcx>(
 
         // Loans are issued after their reservation location. Starting at successor points
         // prevents a borrow from conflicting with the access that creates it.
+        //
+        // §HLZ-PORT EDGE GATE (see the note at the bottom of this file): the liveness test is
+        // taken at the SOURCE point, not the target, because our `provenance_liveness` holds
+        // EXIT liveness. `live_on_exit(q, pt)` is exactly "q is live on the edge out of pt",
+        // which is what his entry-liveness test at the target expresses.
         for provenance in initial.iter() {
+            if !provenance_live_at(provenance_liveness, provenance, reserve_point) {
+                continue;
+            }
             for successor in successor_points(body, location_map, reserve_point) {
-                if provenance_live_at(provenance_liveness, provenance, successor) {
-                    stack.push(LocalizedNode {
+                stack.push((
+                    LocalizedNode {
                         provenance,
                         point: successor,
-                    });
-                }
+                    },
+                    true,
+                ));
             }
         }
 
-        while let Some(node) = stack.pop() {
+        while let Some((node, by_edge)) = stack.pop() {
             if !visited.insert(node) {
                 continue;
             }
 
-            if provenance_live_at(provenance_liveness, node.provenance, node.point) {
+            if by_edge || provenance_live_at(provenance_liveness, node.provenance, node.point) {
                 loan_liveness.insert(node.point, loan);
                 requires.insert(node.point, node.provenance, loan, borrow_set.loans.len());
             }
 
             for successor in graph.same_point_successors(node) {
-                stack.push(LocalizedNode {
-                    provenance: successor,
-                    point: node.point,
-                });
+                stack.push((
+                    LocalizedNode {
+                        provenance: successor,
+                        point: node.point,
+                    },
+                    false,
+                ));
             }
 
             if killed[node.point].contains(loan) {
                 continue;
             }
 
-            for successor in successor_points(body, location_map, node.point) {
-                if provenance_live_at(provenance_liveness, node.provenance, successor) {
-                    stack.push(LocalizedNode {
-                        provenance: node.provenance,
-                        point: successor,
-                    });
+            // §HLZ-PORT EDGE GATE — same reason as the seed above: gate the CFG step on the
+            // SOURCE point's (exit) liveness.
+            if provenance_live_at(provenance_liveness, node.provenance, node.point) {
+                for successor in successor_points(body, location_map, node.point) {
+                    stack.push((
+                        LocalizedNode {
+                            provenance: node.provenance,
+                            point: successor,
+                        },
+                        true,
+                    ));
                 }
             }
         }
@@ -394,6 +414,41 @@ fn successor_points(
         })
         .collect()
 }
+
+// ===========================================================================================
+// §HLZ-PORT EDGE GATE — why the liveness test sits at the source, not the target
+//
+// hlz's traversal gates the CFG step on the TARGET point's liveness, and pairs that with a
+// `provenance_liveness` repair in the same commit: `seek_before_primary_effect` ->
+// `seek_after_primary_effect`, doc comment "live on exit" -> "live on entry"
+// (`borrow/provenance_liveness.rs:14`, `:41` pre-hlz; `:14`, `:50-52` on 8d3878a2). The repair
+// is not decoration — `MaybeLiveLocals` is a BACKWARD analysis, so "before the primary effect"
+// in analysis order is AFTER it in program order, i.e. pre-hlz sampling yields liveness on
+// EXIT. Gating on the target's liveness while holding an exit-liveness matrix shortens every
+// loan's window by one point at the tail.
+//
+// We cannot take his repair directly: our production `analyses/borrow/` is byte-frozen for this
+// port, and a faithful fork of `compute_provenance_liveness` is impossible without editing it —
+// the field branch needs `ProvenanceSet::field_data` and `direct_raw_pointer_field_slots_in_ty`,
+// BOTH PRIVATE (`borrow/mod.rs:162`, `:288`).
+//
+// So the same predicate is expressed on the matrix we already have. For liveness,
+//     exit(pt) = ⋃ { entry(s) : s ∈ succ(pt) },
+// so testing `live_on_exit(q, pt)` before stepping to `pt'` is his `live_on_entry(q, pt')` test
+// — exactly equal where `pt` has one successor, and a UNION (hence more permissive, the
+// conservative direction) at a branch. That union is also precisely what the landed dataflow
+// did: its `required(pt)` was built from this same exit matrix and applied to every successor.
+//
+// EXCLUDED, deliberately: hlz's second `provenance_liveness` change — placeholder provenances
+// live at every point (`provenance_liveness.rs:24-30`, `:46-48`). It is a genuine tightening on
+// parameter-shaped code and is a separate decision with its own measurement (seat, §39
+// addendum 15).
+//
+// The record gate at the node is left as it is: a node arrives either by an edge step (whose
+// gate is above) or by an unconditional same-point subset hop, and for the latter the exit
+// matrix is also what both downstream consumers intersect against
+// (`conflicts.rs:226-230`, `borrow/mod.rs:1273-1277`).
+// ===========================================================================================
 
 /// §HLZ-PORT monotonicity tripwire — RELEASE-ACTIVE by design.
 ///
