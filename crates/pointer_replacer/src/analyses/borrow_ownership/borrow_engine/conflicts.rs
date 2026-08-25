@@ -14,7 +14,10 @@ use rustc_index::bit_set::DenseBitSet;
 use rustc_middle::{mir::Local, ty::TyCtxt};
 use rustc_span::def_id::LocalDefId;
 
-use super::{a5_places_conflict::ParameterOverlap, origin_replay::NativeBorrowContext};
+use super::{
+    a5_places_conflict::ParameterOverlap,
+    origin_replay::{NativeBorrowContext, NativeInference},
+};
 use crate::{
     analyses::{
         borrow::{
@@ -195,7 +198,7 @@ fn record_loan_identities(
 /// Attribute each invalid loan to its issuer + the live provenances that required it.
 /// (Verbatim from `borrow/mod.rs::extract_conflict_edges` @ fc3bd4cf.)
 fn extract_conflict_edges(
-    inference: &BorrowInferenceResults<'_>,
+    inference: &NativeInference<'_>,
     provenance_set: &ProvenanceSet,
     invalid_loans: &DenseBitSet<Loan>,
 ) -> Vec<ConflictEdge> {
@@ -205,7 +208,7 @@ fn extract_conflict_edges(
         requires,
         errors,
         ..
-    } = inference;
+    } = &inference.facts;
 
     let mut edges = Vec::new();
     for loan in invalid_loans.iter() {
@@ -227,7 +230,13 @@ fn extract_conflict_edges(
                 continue;
             };
             for provenance in live.iter() {
-                if requires.contains(provenance, loan) && seen.insert(provenance) {
+                // §HLZ-PORT: `row` is the error POINT and is already in scope — the same shape
+                // the colleague's own edit has. `Off` keeps the whole-body predicate verbatim.
+                let required = match &inference.localized_requires {
+                    Some(localized) => localized.contains(row, provenance, loan),
+                    None => requires.contains(provenance, loan),
+                };
+                if required && seen.insert(provenance) {
                     requirers.push(provenance_set.provenance_data[provenance].owner());
                 }
             }
@@ -237,10 +246,85 @@ fn extract_conflict_edges(
     edges
 }
 
+/// §HLZ-PORT — the demotion-witness half of the SAME predicate.
+///
+/// Production `collect_invalid_loan_demotions` (`borrow/mod.rs:1246`) and
+/// `extract_conflict_edges` above test `requires` over the same `(error row, live provenance)`
+/// pairs. Between them sits the release-active BB2-i stray-Raw assertion: a non-witness Raw local
+/// must appear in no residual edge. Point-keying ONE of the two would let a local be dropped from
+/// the witness set while surviving as a requirer (or the reverse) and fire it. So the fork carries
+/// its own copy, and under `Off` it delegates to production verbatim rather than duplicating it.
+fn collect_invalid_loan_demotions_forked(
+    inference: &NativeInference<'_>,
+    provenance_set: &ProvenanceSet,
+    invalid_loans: &DenseBitSet<Loan>,
+) -> Vec<(Local, Local)> {
+    let Some(localized) = &inference.localized_requires else {
+        return collect_invalid_loan_demotions(&inference.facts, provenance_set, invalid_loans)
+            .local_witnesses;
+    };
+
+    let BorrowInferenceResults {
+        borrow_set,
+        errors,
+        provenance_liveness,
+        ..
+    } = &inference.facts;
+
+    // Only the local witnesses are returned: BOTH fork callers use `local_witnesses` and discard
+    // the field half (they carry their own §NB5-F2 field candidacy), and naming production's
+    // `InvalidLoanDemotions` here would add a 16th entry to the §0.2 self-containment allowlist
+    // for a value nothing reads. The field branches below are kept as no-ops so this stays a
+    // line-for-line mirror of `borrow/mod.rs:1262-1305`.
+    let mut local_witnesses = Vec::new();
+
+    // Requirer path (mirrors `borrow/mod.rs:1262-1290`; only the predicate gains the point key).
+    for loan in invalid_loans.iter() {
+        let borrow_data = &borrow_set.loans[loan];
+        for row in errors.rows() {
+            let Some(loans) = errors.row(row) else {
+                continue;
+            };
+            if !loans.contains(loan) {
+                continue;
+            }
+            let Some(live_provenances) = provenance_liveness.row(row) else {
+                continue;
+            };
+            for provenance in live_provenances.iter() {
+                if !localized.contains(row, provenance, loan) {
+                    continue;
+                }
+                match provenance_set.provenance_data[provenance].owner() {
+                    ProvenanceOwner::Local(local) => {
+                        local_witnesses.push((local, borrow_data.borrowed.local));
+                    }
+                    ProvenanceOwner::Field(_) => {}
+                }
+            }
+        }
+    }
+
+    // Issuer path (verbatim from `borrow/mod.rs:1292-1305`; it never consults `requires`).
+    for loan in invalid_loans.iter() {
+        let borrow_data = &borrow_set.loans[loan];
+        if let Borrower::Assign(assigned) = borrow_data.assigned {
+            match assigned {
+                ProvenanceOwner::Local(local) => {
+                    local_witnesses.push((local, borrow_data.borrowed.local));
+                }
+                ProvenanceOwner::Field(_) => {}
+            }
+        }
+    }
+
+    local_witnesses
+}
+
 /// Attach the invalidating access roots to the unchanged one-edge-per-loan
 /// aggregation. Event unioning happens only on the L2 feature-on path.
 fn extract_witnessed_conflict_edges(
-    inference: &BorrowInferenceResults<'_>,
+    inference: &NativeInference<'_>,
     provenance_set: &ProvenanceSet,
     invalid_loans: &DenseBitSet<Loan>,
     accesses: Vec<super::invalidates::InvalidationAccess>,
@@ -257,7 +341,7 @@ fn extract_witnessed_conflict_edges(
         .into_iter()
         .zip(invalid_loans.iter())
         .map(|(edge, loan)| {
-            let location = inference.borrow_set.loans[loan].location();
+            let location = inference.facts.borrow_set.loans[loan].location();
             WitnessedConflictEdge {
                 edge,
                 loan: loan.index(),
@@ -327,6 +411,56 @@ where
     out
 }
 
+/// §HLZ-PORT witness instrument (test-only). Per function, one row per loan:
+/// `(loan index, is the borrower a `CallArg`, number of points at which the loan is live)`.
+///
+/// Exists because the port's `CallArg` claim (§2.4(a) of the port-exploration record) is about
+/// `loan_liveness`, which no public entry point exposes — the conflict-edge surface reports the
+/// ABSENCE of an edge in both modes and so cannot distinguish "never live" from "live but inert".
+/// Reads the facts BEFORE `overwrite_with_engine_facts`, so it observes the loan-liveness stage
+/// alone with no invalidation coupling.
+#[cfg(test)]
+pub(crate) fn loan_liveness_census<I, J, K, L>(
+    program: &RustProgram,
+    is_candidate: I,
+    is_mutable: K,
+) -> FxHashMap<LocalDefId, Vec<(usize, bool, usize)>>
+where
+    I: Fn(LocalDefId) -> J,
+    J: Fn(Local) -> bool,
+    K: Fn(LocalDefId) -> L,
+    L: Fn(Local) -> bool,
+{
+    let flows =
+        crate::analyses::borrow_ownership::origin_flow::analyze_program_origin_flow(program);
+    let ctxt = NativeBorrowContext::new(program, &flows, is_candidate, is_mutable);
+    let no_copy_lends = FxHashSet::default();
+    let mut out = FxHashMap::default();
+    for f in program.functions.iter().copied() {
+        let inference = ctxt.infer(program.tcx, f, &[], &no_copy_lends);
+        let mut rows = Vec::new();
+        for (loan, data) in inference.borrow_set.loans.iter_enumerated() {
+            let live_points = inference
+                .loan_liveness
+                .rows()
+                .filter(|&row| {
+                    inference
+                        .loan_liveness
+                        .row(row)
+                        .is_some_and(|loans| loans.contains(loan))
+                })
+                .count();
+            rows.push((
+                loan.index(),
+                matches!(data.assigned, Borrower::CallArg(..)),
+                live_points,
+            ));
+        }
+        out.insert(f, rows);
+    }
+    out
+}
+
 #[cfg(test)]
 fn borrow_conflicts_wrapped<I, J, K, L>(
     program: &RustProgram,
@@ -352,6 +486,14 @@ where
             continue;
         }
         let provenance_set = ctxt.provenances.get(&f).unwrap();
+        // §HLZ-PORT: this test-only path runs production `borrow_inference` directly and never
+        // goes through `NativeBorrowContext::infer`, so it has no localized relation by
+        // construction — `None` keeps it on the whole-body predicate, which is what it compares.
+        let inference = NativeInference {
+            facts: inference,
+            copy_lends,
+            localized_requires: None,
+        };
         out.insert(
             f,
             extract_conflict_edges(&inference, provenance_set, &invalid_loans),
@@ -548,10 +690,12 @@ where
 
             let to_demote: Vec<(Local, Local)> = {
                 let provenance_set = ctxt.borrow.provenances.get(&f).unwrap();
-                let demotions =
-                    collect_invalid_loan_demotions(&inference, provenance_set, &invalid_loans);
-                demotions
-                    .local_witnesses
+                let local_witnesses = collect_invalid_loan_demotions_forked(
+                    &inference,
+                    provenance_set,
+                    &invalid_loans,
+                );
+                local_witnesses
                     .into_iter()
                     .filter(|(local, _base)| {
                         is_raw_f(*local) && provenance_set.local_data[*local].is_some()
@@ -706,10 +850,12 @@ where
 
             let to_demote: Vec<(Local, Local)> = {
                 let provenance_set = ctxt.borrow.provenances.get(&f).unwrap();
-                let demotions =
-                    collect_invalid_loan_demotions(&inference, provenance_set, &invalid_loans);
-                demotions
-                    .local_witnesses
+                let local_witnesses = collect_invalid_loan_demotions_forked(
+                    &inference,
+                    provenance_set,
+                    &invalid_loans,
+                );
+                local_witnesses
                     .into_iter()
                     .filter(|(local, _base)| {
                         is_raw_f(*local) && provenance_set.local_data[*local].is_some()

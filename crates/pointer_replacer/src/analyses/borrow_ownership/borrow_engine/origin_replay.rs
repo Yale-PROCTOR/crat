@@ -12,7 +12,10 @@ use rustc_middle::{
 use rustc_span::def_id::LocalDefId;
 use smallvec::{SmallVec, smallvec};
 
-use super::loan_liveness;
+use super::{
+    PointRequiresMode,
+    loan_liveness::{self, EdgeLocation, LocalizedRequires},
+};
 use crate::{
     analyses::{
         bo_adapter,
@@ -38,6 +41,10 @@ pub(super) struct NativeBorrowContext<'a> {
 pub(super) struct NativeInference<'tcx> {
     pub(super) facts: BorrowInferenceResults<'tcx>,
     pub(super) copy_lends: DenseBitSet<Loan>,
+    /// §HLZ-PORT (A2). `Some` only under `PointRequiresMode::On`. Deliberately carried HERE and
+    /// not on `facts`, so production `BorrowInferenceResults` keeps its type and production's own
+    /// consumers keep their behaviour by construction (port-exploration §2.1).
+    pub(super) localized_requires: Option<LocalizedRequires>,
 }
 
 pub(crate) fn selected_copy_lend_contains(
@@ -141,9 +148,12 @@ impl<'a> NativeBorrowContext<'a> {
         );
         let subset_graph = graph.subset_graph(provenance_set);
         inference.subset_closure = graph.subset_closure(provenance_set, &subset_graph);
+        // The landed whole-body relation is computed in BOTH modes: `Off` consumes it, and `On`
+        // needs it as the tripwire's reference (and leaves it on `facts` so production's own
+        // consumers are untouched).
         inference.requires = graph.requires(&inference, provenance_set, &subset_graph);
         let body = &*tcx.mir_drops_elaborated_and_const_checked(f).borrow();
-        inference.loan_liveness = loan_liveness::compute_loan_liveness(
+        let landed_loan_liveness = loan_liveness::compute_loan_liveness(
             tcx,
             body,
             &inference.borrow_set,
@@ -152,9 +162,37 @@ impl<'a> NativeBorrowContext<'a> {
             &inference.requires,
             &inference.killed,
         );
+        let localized_requires = match PointRequiresMode::current() {
+            PointRequiresMode::Off => {
+                inference.loan_liveness = landed_loan_liveness;
+                None
+            }
+            PointRequiresMode::On => {
+                let (ported_loan_liveness, ported_requires) =
+                    loan_liveness::compute_loan_liveness_localized(
+                        body,
+                        &inference.borrow_set,
+                        &inference.location_map,
+                        &inference.provenance_liveness,
+                        &inference.killed,
+                        provenance_set.provenance_data.len(),
+                        &graph.subset,
+                        &graph.membership,
+                    );
+                loan_liveness::assert_localized_subset(
+                    &landed_loan_liveness,
+                    &inference.requires,
+                    &ported_loan_liveness,
+                    &ported_requires,
+                );
+                inference.loan_liveness = ported_loan_liveness;
+                Some(ported_requires)
+            }
+        };
         NativeInference {
             facts: inference,
             copy_lends,
+            localized_requires,
         }
     }
 }
@@ -202,7 +240,9 @@ mod copy_lend_identity_tests {
 
 #[derive(Default)]
 struct NativeConstraintGraph {
-    subset: Vec<(Provenance, Provenance)>,
+    /// §HLZ-PORT (A2): the third component is the edge's program point, or `All` for the
+    /// closure-derived depth-0 value flows that have none. `Off` ignores it entirely.
+    subset: Vec<(Provenance, Provenance, EdgeLocation)>,
     membership: Vec<(Loan, Provenance)>,
 }
 
@@ -243,7 +283,10 @@ impl NativeConstraintGraph {
                     .all(|projection| matches!(projection, PlaceElem::Deref))
                 && let Some(source) = provenance_set.local_data[rhs.local]
             {
-                graph.subset.push((source, lhs));
+                // Loan-derived reborrow: the location is in hand, so this edge is located.
+                graph
+                    .subset
+                    .push((source, lhs, EdgeLocation::Point(data.location())));
             }
         }
 
@@ -267,7 +310,11 @@ impl NativeConstraintGraph {
                 ) else {
                     continue;
                 };
-                graph.subset.push((source, target));
+                // A2: `depth0_value_flows` reads the CLOSED matrix (`origin_flow.rs:925-931`), so
+                // these are transitive-closure edges with no single location. Emitting them `All`
+                // reproduces the landed flow-insensitive behaviour exactly; locating them means
+                // touching `origin_flow`, which is A1 and is not authorized here.
+                graph.subset.push((source, target, EdgeLocation::All));
             }
         }
 
@@ -279,7 +326,7 @@ impl NativeConstraintGraph {
         provenance_set: &ProvenanceSet,
     ) -> IndexVec<Provenance, SmallVec<[Provenance; 4]>> {
         let mut graph = IndexVec::from_elem(smallvec![], &provenance_set.provenance_data);
-        for &(sub, sup) in &self.subset {
+        for &(sub, sup, _) in &self.subset {
             graph[sub].push(sup);
         }
         graph

@@ -42,6 +42,10 @@ mod places_conflict;
 // Name-parity re-exports: callers reach `borrow_engine::borrow_conflicts[_replaying]`, matching
 // production `borrow::borrow_conflicts[_replaying]` (the module path is the only distinguisher).
 pub(crate) use a5_places_conflict::ParameterOverlap;
+// §NB4-R: the compose/type-check decision, re-exported so its fallback is unit-testable in isolation
+// (grouping-independent — see `nb4r_route_compose_fallback_on_type_mismatch`).
+#[cfg(test)]
+pub(crate) use conflicts::loan_liveness_census;
 #[cfg(test)]
 pub(crate) use conflicts::{borrow_conflicts, borrow_conflicts_replaying};
 pub(crate) use conflicts::{
@@ -50,8 +54,6 @@ pub(crate) use conflicts::{
     borrow_conflicts_replaying_witnessed, borrow_conflicts_replaying_witnessed_with_copy_lends,
     borrow_conflicts_with_flows,
 };
-// §NB4-R: the compose/type-check decision, re-exported so its fallback is unit-testable in isolation
-// (grouping-independent — see `nb4r_route_compose_fallback_on_type_mismatch`).
 #[cfg(test)]
 pub(crate) use invalidates::{RoutedCompose, route_compose};
 #[cfg(test)]
@@ -96,6 +98,83 @@ impl ForkEngineMode {
             ForkEngineMode::Fork => "fork",
         }
     }
+}
+
+/// §HLZ-PORT (A2) — point-keyed `requires` + fused reachability loan-liveness inside the fork.
+///
+/// `Off` (the DEFAULT) runs the landed `LoanLiveAt` dataflow and the whole-body
+/// `NativeConstraintGraph::requires`, so a flag-off suite must be byte-identical to the landed
+/// head — that identity is this port's instrument-integrity proof.
+///
+/// `On` replaces both with one worklist reachability walk over `(provenance, point)` nodes that
+/// emits `loan_liveness` and a point-keyed `LocalizedRequires` together, after Hanliang Zhang's
+/// `hlz/flow-sensitive-borrow-inference @ 8d3878a2`. Scope is **A2**: only loan-derived reborrow
+/// subset edges carry a program point; `origin_flow`'s closure-derived depth-0 value flows are
+/// emitted `EdgeLocation::All` because a transitive-closure edge has no single location, and
+/// locating them would mean touching `origin_flow` (that is A1, not authorized here).
+///
+/// Production `analyses/borrow/` is NOT edited in either mode: the point-keyed relation rides on
+/// the fork's own `NativeInference` wrapper, so `borrow::borrow_conflicts` (the D5-independent NB6
+/// validator) and production demotion keep their present behaviour by construction.
+///
+/// Env `CRAT_BO_POINT_REQUIRES ∈ {on|1, off|0}`; tests override per-thread via
+/// `with_point_requires`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum PointRequiresMode {
+    Off,
+    On,
+}
+
+thread_local! {
+    static POINT_REQUIRES_OVERRIDE: std::cell::Cell<Option<PointRequiresMode>> =
+        const { std::cell::Cell::new(None) };
+}
+
+impl PointRequiresMode {
+    /// PROPOSED, not landed: the port ships default-off so the branch's suite proves instrument
+    /// integrity against the landed head before anything is measured.
+    pub(crate) const DEFAULT: Self = PointRequiresMode::Off;
+
+    pub(crate) fn current() -> Self {
+        if let Some(mode) = POINT_REQUIRES_OVERRIDE.with(|cell| cell.get()) {
+            return mode;
+        }
+        // Fail loud on a mistyped selector, exactly as `ForkEngineMode` does: a silent fallback
+        // would mask which engine produced a measured number.
+        match std::env::var("CRAT_BO_POINT_REQUIRES") {
+            Ok(v) => match v.as_str() {
+                "on" | "1" => PointRequiresMode::On,
+                "off" | "0" => PointRequiresMode::Off,
+                other => panic!(
+                    "CRAT_BO_POINT_REQUIRES={other:?} is not a valid selector \
+                     (expected on|1 or off|0) — refusing to silently fall back"
+                ),
+            },
+            Err(_) => Self::DEFAULT,
+        }
+    }
+
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            PointRequiresMode::Off => "off",
+            PointRequiresMode::On => "on",
+        }
+    }
+}
+
+/// Run `f` with the point-keyed `requires` mode forced, restoring the previous value on the way
+/// out (panic-safe). Lets one test assert BOTH modes in one process, so the witnesses do not
+/// depend on how the suite's environment happens to be set.
+#[cfg(test)]
+pub(crate) fn with_point_requires<T>(mode: PointRequiresMode, f: impl FnOnce() -> T) -> T {
+    struct Guard(Option<PointRequiresMode>);
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            POINT_REQUIRES_OVERRIDE.with(|cell| cell.set(self.0));
+        }
+    }
+    let _guard = Guard(POINT_REQUIRES_OVERRIDE.with(|cell| cell.replace(Some(mode))));
+    f()
 }
 
 #[cfg(test)]
