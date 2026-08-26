@@ -14,7 +14,10 @@ use rustc_index::bit_set::DenseBitSet;
 use rustc_middle::{mir::Local, ty::TyCtxt};
 use rustc_span::def_id::LocalDefId;
 
-use super::{a5_places_conflict::ParameterOverlap, origin_replay::NativeBorrowContext};
+use super::{
+    a5_places_conflict::ParameterOverlap,
+    origin_replay::{NativeBorrowContext, NativeInference},
+};
 use crate::{
     analyses::{
         borrow::{
@@ -195,7 +198,7 @@ fn record_loan_identities(
 /// Attribute each invalid loan to its issuer + the live provenances that required it.
 /// (Verbatim from `borrow/mod.rs::extract_conflict_edges` @ fc3bd4cf.)
 fn extract_conflict_edges(
-    inference: &BorrowInferenceResults<'_>,
+    inference: &NativeInference<'_>,
     provenance_set: &ProvenanceSet,
     invalid_loans: &DenseBitSet<Loan>,
 ) -> Vec<ConflictEdge> {
@@ -205,7 +208,7 @@ fn extract_conflict_edges(
         requires,
         errors,
         ..
-    } = inference;
+    } = &inference.facts;
 
     let mut edges = Vec::new();
     for loan in invalid_loans.iter() {
@@ -227,7 +230,74 @@ fn extract_conflict_edges(
                 continue;
             };
             for provenance in live.iter() {
-                if requires.contains(provenance, loan) && seen.insert(provenance) {
+                // §HLZ-PORT: `row` is the error POINT and is already in scope — the same shape
+                // the colleague's own edit has. `Off` keeps the whole-body predicate verbatim.
+                let required = match &inference.localized_requires {
+                    Some(localized) => localized.contains(row, provenance, loan),
+                    None => requires.contains(provenance, loan),
+                };
+                // §6.4 drop attribution: a requirer the WHOLE-BODY relation keeps at a live,
+                // erroring point and the point-keyed one drops. `all_only` says whether it is
+                // reachable using `All` edges alone — those apply at every point, so `all_only =
+                // false` attributes the drop to a LOCATED reborrow edge rather than to any
+                // approximation A2 introduces.
+                if let Some(closure) = &inference.all_only_closure
+                    && !required
+                    && requires.contains(provenance, loan)
+                {
+                    let all_only = closure
+                        .get(&loan)
+                        .is_some_and(|set| set.contains(provenance));
+                    // Was the requirer even live where the loan was reserved? If not, its
+                    // liveness at the error point comes from a LATER definition, so the value it
+                    // holds there cannot be the borrow reserved earlier — which is what makes the
+                    // drop a true point-sensitive unreachability rather than a lost path.
+                    let reserve_point = inference
+                        .facts
+                        .location_map
+                        .point_from_location(borrow_set.loans[loan].location());
+                    let live_at_reserve = inference
+                        .facts
+                        .provenance_liveness
+                        .row(reserve_point)
+                        .is_some_and(|live| live.contains(provenance));
+                    let verdict = census_drop(inference, loan, provenance, row, live_at_reserve);
+                    crate::analyses::borrow_ownership::borrow_engine::record_requirer_drop(
+                        format!(
+                            "loan={} point={row:?} provenance={provenance:?} owner={:?} \
+                             all_only_reachable={all_only} live_at_reserve={live_at_reserve} \
+                             {verdict}",
+                            loan.index(),
+                            provenance_set.provenance_data[provenance].owner(),
+                        ),
+                    );
+                }
+                // Instrument control: run the SAME census over requirers the port KEEPS. A census
+                // that can only ever answer "unreachable" would make "0 counterexamples" vacuous;
+                // these rows demonstrate the reachability arm firing on the same code path.
+                if let Some(_closure) = &inference.all_only_closure
+                    && required
+                    && requires.contains(provenance, loan)
+                {
+                    let reserve_point = inference
+                        .facts
+                        .location_map
+                        .point_from_location(borrow_set.loans[loan].location());
+                    let live_at_reserve = inference
+                        .facts
+                        .provenance_liveness
+                        .row(reserve_point)
+                        .is_some_and(|live| live.contains(provenance));
+                    let verdict = census_drop(inference, loan, provenance, row, live_at_reserve);
+                    crate::analyses::borrow_ownership::borrow_engine::record_requirer_drop(
+                        format!(
+                            "control=kept loan={} point={row:?} provenance={provenance:?} \
+                             live_at_reserve={live_at_reserve} {verdict}",
+                            loan.index(),
+                        ),
+                    );
+                }
+                if required && seen.insert(provenance) {
                     requirers.push(provenance_set.provenance_data[provenance].owner());
                 }
             }
@@ -237,10 +307,201 @@ fn extract_conflict_edges(
     edges
 }
 
+/// §8.1 census — per-drop proof obligation, re-derived INDEPENDENTLY of the walk.
+///
+/// For a requirer `q` the whole-body relation keeps at a live erroring point `e` and the
+/// point-keyed relation drops, this recomputes the liveness-gated propagation of `q` from the
+/// loan's reservation point using only the raw CFG, `provenance_liveness` and `killed` — none of
+/// the walk's own state. If `e` is reachable under that gate the drop is a **COUNTEREXAMPLE** and
+/// the realized path is printed; otherwise the drop is **PROVEN-TRUE-UNREACHABLE** and the gap is
+/// located.
+///
+/// The gap is necessarily EPOCH-SEPARATING and that follows from backward liveness rather than
+/// from a second check: `q` is dead on exit at the gap point `p` but live at `e`, and `e` is
+/// CFG-reachable from `p`; a backward may-liveness that reports `q` dead at `p` asserts that every
+/// path out of `p` redefines `q` before any use, so the use that makes `q` live at `e` is fed by a
+/// definition strictly after `p`. The value `q` holds at `e` therefore cannot be the borrow
+/// reserved before `p`.
+fn census_drop(
+    inference: &NativeInference<'_>,
+    loan: Loan,
+    q: Provenance,
+    e: rustc_mir_dataflow::points::PointIndex,
+    live_at_reserve: bool,
+) -> String {
+    use rustc_mir_dataflow::points::PointIndex;
+    let (Some(succ), Some(reserve_of)) = (&inference.succ_points, &inference.loan_reserve) else {
+        return "verdict=NO-CENSUS".to_string();
+    };
+    if !live_at_reserve {
+        // Not live where the loan was reserved: the walk never seeds it, and its liveness at the
+        // error point is fed by a later definition. Nothing to trace.
+        return "verdict=PROVEN-TRUE-UNREACHABLE gap=seed reason=not-live-at-reserve".to_string();
+    }
+    let reserve = reserve_of[&loan];
+    let live = |p: PointIndex| {
+        inference
+            .facts
+            .provenance_liveness
+            .row(p)
+            .is_some_and(|r| r.contains(q))
+    };
+    let killed = |p: PointIndex| inference.facts.killed[p].contains(loan);
+
+    // Gated forward closure, with parent links so a counterexample can print its path.
+    let mut parent: FxHashMap<PointIndex, PointIndex> = FxHashMap::default();
+    let mut seen: FxHashSet<PointIndex> = FxHashSet::default();
+    let mut work: Vec<PointIndex> = Vec::new();
+    if live(reserve) {
+        for &s in succ.get(&reserve).map(|v| &v[..]).unwrap_or(&[]) {
+            if seen.insert(s) {
+                parent.insert(s, reserve);
+                work.push(s);
+            }
+        }
+    }
+    while let Some(p) = work.pop() {
+        if killed(p) || !live(p) {
+            continue;
+        }
+        for &s in succ.get(&p).map(|v| &v[..]).unwrap_or(&[]) {
+            if seen.insert(s) {
+                parent.insert(s, p);
+                work.push(s);
+            }
+        }
+    }
+    if seen.contains(&e) {
+        let mut path = vec![e];
+        let mut cur = e;
+        while let Some(&pp) = parent.get(&cur) {
+            path.push(pp);
+            cur = pp;
+            if path.len() > 64 {
+                break;
+            }
+        }
+        path.reverse();
+        return format!(
+            "verdict=COUNTEREXAMPLE realized_path={:?}",
+            path.iter().map(|p| p.index()).collect::<Vec<_>>()
+        );
+    }
+
+    // Locate the gap: a point the gate REACHED whose raw successor set leads on toward `e`, and at
+    // which the gate then failed. Restrict to points that can still reach `e` in the raw CFG.
+    let mut reaches_e: FxHashSet<PointIndex> = FxHashSet::default();
+    reaches_e.insert(e);
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for (&p, outs) in succ.iter() {
+            if !reaches_e.contains(&p) && outs.iter().any(|s| reaches_e.contains(s)) {
+                reaches_e.insert(p);
+                changed = true;
+            }
+        }
+    }
+    let mut gap = None;
+    for &p in seen.iter().chain(std::iter::once(&reserve)) {
+        if reaches_e.contains(&p) && (killed(p) || !live(p)) {
+            let reason = if killed(p) { "killed" } else { "dead-on-exit" };
+            match gap {
+                Some((g, _)) if p.index() >= g => {}
+                _ => gap = Some((p.index(), reason)),
+            }
+        }
+    }
+    match gap {
+        Some((p, reason)) => format!(
+            "verdict=PROVEN-TRUE-UNREACHABLE gap_point={p} gap_reason={reason} \
+             epoch_separating=by-backward-liveness"
+        ),
+        // No gated-reached point on a path to `e` at all: the propagation never entered `e`'s
+        // dominating region, which is a stronger form of the same conclusion.
+        None => "verdict=PROVEN-TRUE-UNREACHABLE gap=no-gated-point-reaches-error".to_string(),
+    }
+}
+
+/// §HLZ-PORT — the demotion-witness half of the SAME predicate.
+///
+/// Production `collect_invalid_loan_demotions` (`borrow/mod.rs:1246`) and
+/// `extract_conflict_edges` above test `requires` over the same `(error row, live provenance)`
+/// pairs. Between them sits the release-active BB2-i stray-Raw assertion: a non-witness Raw local
+/// must appear in no residual edge. Point-keying ONE of the two would let a local be dropped from
+/// the witness set while surviving as a requirer (or the reverse) and fire it. So the fork carries
+/// its own copy, and under `Off` it delegates to production verbatim rather than duplicating it.
+fn collect_invalid_loan_demotions_forked(
+    inference: &NativeInference<'_>,
+    provenance_set: &ProvenanceSet,
+    invalid_loans: &DenseBitSet<Loan>,
+) -> Vec<(Local, Local)> {
+    let Some(localized) = &inference.localized_requires else {
+        return collect_invalid_loan_demotions(&inference.facts, provenance_set, invalid_loans)
+            .local_witnesses;
+    };
+
+    let BorrowInferenceResults {
+        borrow_set,
+        errors,
+        provenance_liveness,
+        ..
+    } = &inference.facts;
+
+    // Only the local witnesses are returned: BOTH fork callers use `local_witnesses` and discard
+    // the field half (they carry their own §NB5-F2 field candidacy), and naming production's
+    // `InvalidLoanDemotions` here would add a 16th entry to the §0.2 self-containment allowlist
+    // for a value nothing reads. The field branches below are kept as no-ops so this stays a
+    // line-for-line mirror of `borrow/mod.rs:1262-1305`.
+    let mut local_witnesses = Vec::new();
+
+    // Requirer path (mirrors `borrow/mod.rs:1262-1290`; only the predicate gains the point key).
+    for loan in invalid_loans.iter() {
+        let borrow_data = &borrow_set.loans[loan];
+        for row in errors.rows() {
+            let Some(loans) = errors.row(row) else {
+                continue;
+            };
+            if !loans.contains(loan) {
+                continue;
+            }
+            let Some(live_provenances) = provenance_liveness.row(row) else {
+                continue;
+            };
+            for provenance in live_provenances.iter() {
+                if !localized.contains(row, provenance, loan) {
+                    continue;
+                }
+                match provenance_set.provenance_data[provenance].owner() {
+                    ProvenanceOwner::Local(local) => {
+                        local_witnesses.push((local, borrow_data.borrowed.local));
+                    }
+                    ProvenanceOwner::Field(_) => {}
+                }
+            }
+        }
+    }
+
+    // Issuer path (verbatim from `borrow/mod.rs:1292-1305`; it never consults `requires`).
+    for loan in invalid_loans.iter() {
+        let borrow_data = &borrow_set.loans[loan];
+        if let Borrower::Assign(assigned) = borrow_data.assigned {
+            match assigned {
+                ProvenanceOwner::Local(local) => {
+                    local_witnesses.push((local, borrow_data.borrowed.local));
+                }
+                ProvenanceOwner::Field(_) => {}
+            }
+        }
+    }
+
+    local_witnesses
+}
+
 /// Attach the invalidating access roots to the unchanged one-edge-per-loan
 /// aggregation. Event unioning happens only on the L2 feature-on path.
 fn extract_witnessed_conflict_edges(
-    inference: &BorrowInferenceResults<'_>,
+    inference: &NativeInference<'_>,
     provenance_set: &ProvenanceSet,
     invalid_loans: &DenseBitSet<Loan>,
     accesses: Vec<super::invalidates::InvalidationAccess>,
@@ -257,7 +518,7 @@ fn extract_witnessed_conflict_edges(
         .into_iter()
         .zip(invalid_loans.iter())
         .map(|(edge, loan)| {
-            let location = inference.borrow_set.loans[loan].location();
+            let location = inference.facts.borrow_set.loans[loan].location();
             WitnessedConflictEdge {
                 edge,
                 loan: loan.index(),
@@ -327,6 +588,104 @@ where
     out
 }
 
+/// §HLZ-PORT witness instrument (test-only). Per function, one row per loan:
+/// `(loan index, is the borrower a `CallArg`, number of points at which the loan is live)`.
+///
+/// Exists because the port's `CallArg` claim (§2.4(a) of the port-exploration record) is about
+/// `loan_liveness`, which no public entry point exposes — the conflict-edge surface reports the
+/// ABSENCE of an edge in both modes and so cannot distinguish "never live" from "live but inert".
+/// Reads the facts BEFORE `overwrite_with_engine_facts`, so it observes the loan-liveness stage
+/// alone with no invalidation coupling.
+#[cfg(test)]
+pub(crate) fn loan_liveness_census<I, J, K, L>(
+    program: &RustProgram,
+    is_candidate: I,
+    is_mutable: K,
+) -> FxHashMap<LocalDefId, Vec<(usize, bool, usize)>>
+where
+    I: Fn(LocalDefId) -> J,
+    J: Fn(Local) -> bool,
+    K: Fn(LocalDefId) -> L,
+    L: Fn(Local) -> bool,
+{
+    let flows =
+        crate::analyses::borrow_ownership::origin_flow::analyze_program_origin_flow(program);
+    let ctxt = NativeBorrowContext::new(program, &flows, is_candidate, is_mutable);
+    let no_copy_lends = FxHashSet::default();
+    let mut out = FxHashMap::default();
+    for f in program.functions.iter().copied() {
+        let inference = ctxt.infer(program.tcx, f, &[], &no_copy_lends);
+        let mut rows = Vec::new();
+        for (loan, data) in inference.borrow_set.loans.iter_enumerated() {
+            let live_points = inference
+                .loan_liveness
+                .rows()
+                .filter(|&row| {
+                    inference
+                        .loan_liveness
+                        .row(row)
+                        .is_some_and(|loans| loans.contains(loan))
+                })
+                .count();
+            rows.push((
+                loan.index(),
+                matches!(data.assigned, Borrower::CallArg(..)),
+                live_points,
+            ));
+        }
+        out.insert(f, rows);
+    }
+    out
+}
+
+/// §HLZ-PORT witness instrument (test-only) — the DEMOTION side, observed on its own.
+///
+/// The adversarial review's point (2026-08-25, §39 addendum 15): asserting that conflict edges
+/// and demotion witnesses agree only proves they are mutually consistent, and the same
+/// incomplete predicate applied to both can delete a required invalidation on both sides while
+/// keeping BB2-i silent. So the two are witnessed SEPARATELY — this returns the demotion
+/// witnesses directly, with no reference to the edge set.
+#[cfg(test)]
+pub(crate) fn demotion_witness_census<I, J, K, L>(
+    program: &RustProgram,
+    is_candidate: I,
+    is_mutable: K,
+) -> FxHashMap<LocalDefId, Vec<(usize, usize)>>
+where
+    I: Fn(LocalDefId) -> J,
+    J: Fn(Local) -> bool,
+    K: Fn(LocalDefId) -> L,
+    L: Fn(Local) -> bool,
+{
+    let flows =
+        crate::analyses::borrow_ownership::origin_flow::analyze_program_origin_flow(program);
+    let ctxt = NativeBorrowContext::new(program, &flows, is_candidate, is_mutable);
+    let no_copy_lends = FxHashSet::default();
+    let mut out = FxHashMap::default();
+    for f in program.functions.iter().copied() {
+        let mut inference = ctxt.infer(program.tcx, f, &[], &no_copy_lends);
+        overwrite_with_engine_facts(
+            program.tcx,
+            f,
+            &ctxt.borrow,
+            &mut inference.facts,
+            &inference.copy_lends,
+            None,
+        );
+        let invalid_loans = invalid_loan_set(&inference);
+        let provenance_set = ctxt.borrow.provenances.get(&f).unwrap();
+        let mut witnesses: Vec<(usize, usize)> =
+            collect_invalid_loan_demotions_forked(&inference, provenance_set, &invalid_loans)
+                .into_iter()
+                .map(|(local, base)| (local.index(), base.index()))
+                .collect();
+        witnesses.sort();
+        witnesses.dedup();
+        out.insert(f, witnesses);
+    }
+    out
+}
+
 #[cfg(test)]
 fn borrow_conflicts_wrapped<I, J, K, L>(
     program: &RustProgram,
@@ -352,6 +711,17 @@ where
             continue;
         }
         let provenance_set = ctxt.provenances.get(&f).unwrap();
+        // §HLZ-PORT: this test-only path runs production `borrow_inference` directly and never
+        // goes through `NativeBorrowContext::infer`, so it has no localized relation by
+        // construction — `None` keeps it on the whole-body predicate, which is what it compares.
+        let inference = NativeInference {
+            facts: inference,
+            copy_lends,
+            localized_requires: None,
+            all_only_closure: None,
+            succ_points: None,
+            loan_reserve: None,
+        };
         out.insert(
             f,
             extract_conflict_edges(&inference, provenance_set, &invalid_loans),
@@ -548,10 +918,12 @@ where
 
             let to_demote: Vec<(Local, Local)> = {
                 let provenance_set = ctxt.borrow.provenances.get(&f).unwrap();
-                let demotions =
-                    collect_invalid_loan_demotions(&inference, provenance_set, &invalid_loans);
-                demotions
-                    .local_witnesses
+                let local_witnesses = collect_invalid_loan_demotions_forked(
+                    &inference,
+                    provenance_set,
+                    &invalid_loans,
+                );
+                local_witnesses
                     .into_iter()
                     .filter(|(local, _base)| {
                         is_raw_f(*local) && provenance_set.local_data[*local].is_some()
@@ -706,10 +1078,12 @@ where
 
             let to_demote: Vec<(Local, Local)> = {
                 let provenance_set = ctxt.borrow.provenances.get(&f).unwrap();
-                let demotions =
-                    collect_invalid_loan_demotions(&inference, provenance_set, &invalid_loans);
-                demotions
-                    .local_witnesses
+                let local_witnesses = collect_invalid_loan_demotions_forked(
+                    &inference,
+                    provenance_set,
+                    &invalid_loans,
+                );
+                local_witnesses
                     .into_iter()
                     .filter(|(local, _base)| {
                         is_raw_f(*local) && provenance_set.local_data[*local].is_some()

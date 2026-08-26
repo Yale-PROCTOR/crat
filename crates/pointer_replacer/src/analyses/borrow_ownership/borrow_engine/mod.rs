@@ -53,6 +53,8 @@ pub(crate) use conflicts::{
 // §NB4-R: the compose/type-check decision, re-exported so its fallback is unit-testable in isolation
 // (grouping-independent — see `nb4r_route_compose_fallback_on_type_mismatch`).
 #[cfg(test)]
+pub(crate) use conflicts::{demotion_witness_census, loan_liveness_census};
+#[cfg(test)]
 pub(crate) use invalidates::{RoutedCompose, route_compose};
 #[cfg(test)]
 pub(crate) use origin_replay::selected_copy_lend_contains;
@@ -95,6 +97,22 @@ impl ForkEngineMode {
             ForkEngineMode::Production => "production",
             ForkEngineMode::Fork => "fork",
         }
+    }
+}
+
+/// §6.4 drop attribution sink. Env-gated (`CRAT_BO_REQUIRER_DROP_OUT`), append-only, flushed by
+/// the caller. Never touched on the default path.
+pub(crate) fn record_requirer_drop(line: String) {
+    use std::io::Write as _;
+    let Some(path) = std::env::var_os("CRAT_BO_REQUIRER_DROP_OUT") else {
+        return;
+    };
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        let _ = writeln!(f, "{line}");
     }
 }
 

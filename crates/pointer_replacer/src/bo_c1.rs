@@ -14605,6 +14605,142 @@ fn boc1_run_one() {
     let result = ::utils::compilation::run_compiler_on_path(Path::new(&input), |tcx| {
         let t_tcx = t0.elapsed();
         match mode.as_str() {
+            // §HLZ-PORT attribution (§5.6 item 1) — env-gated E-R4 loan-identity dump. Default off,
+            // so the sweep contract is unchanged; when set, the SAME `run_bo` runs inside
+            // `with_bo_export` and its loan identities are written as TSV. Test-only harness file.
+            "bo" if std::env::var_os("CRAT_BOC1_ER4_OUT").is_some() => {
+                let path = std::env::var("CRAT_BOC1_ER4_OUT").expect("CRAT_BOC1_ER4_OUT");
+                let ((row, trace), export) =
+                    crate::analyses::borrow_ownership::export::with_bo_export(|| {
+                        crate::analyses::borrow_ownership::borrow_verify::with_mode_a_commit_trace(
+                            || run::run_bo(tcx, t_tcx),
+                        )
+                    });
+                // §HLZ-PORT §5.6 item 1 — the Mode-A commit trace, in the loop's natural commit
+                // order. Round 0 agrees between the arms (identical conflict edges at all-Ref
+                // candidacy), so the +15 commits are a LOOP-PATH effect and this is where they
+                // become visible per round.
+                {
+                    let mut t = String::from("round\ttarget\tconflict\n");
+                    for ev in &trace {
+                        t.push_str(&format!(
+                            "{}\t{:?}\t{:?}\n",
+                            ev.round, ev.target, ev.conflict
+                        ));
+                    }
+                    std::fs::write(format!("{path}.commits"), t)
+                        .unwrap_or_else(|e| panic!("ER4 commit trace: {e}"));
+                }
+                let mut out = String::from(
+                    "fn\tborrower\tcallee_or_owner\tplace\tlocation\tkind\tclass\tinvalid\n",
+                );
+                let mut rows: Vec<String> = export
+                    .loans
+                    .iter()
+                    .map(|loan| {
+                        let borrower = match &loan.key.borrower {
+                            crate::analyses::borrow_ownership::export::BorrowerKind::Assign {
+                                owner,
+                            } => format!("assign\t{owner:?}"),
+                            crate::analyses::borrow_ownership::export::BorrowerKind::CallArg {
+                                callee,
+                                arg_index,
+                            } => format!("callarg\tcallee={callee}:arg={arg_index}"),
+                        };
+                        format!(
+                            "{}\t{}\t{:?}\t{:?}\t{:?}\t{:?}\t{}",
+                            tcx.def_path_str(loan.key.fn_did.to_def_id()),
+                            borrower,
+                            loan.key.place,
+                            loan.key.location,
+                            loan.kind,
+                            loan.class,
+                            loan.invalid,
+                        )
+                    })
+                    .collect();
+                rows.sort();
+                for r in rows {
+                    out.push_str(&r);
+                    out.push('\n');
+                }
+                // The `invalid` column above CANNOT carry a positive: it reads the FINAL,
+                // already-repaired round (the 2026-08-04 CallArg record's own instrument control
+                // fired on exactly this, and it discarded the data). The observation point that
+                // record adopted instead is the round-0 conflict-edge set at an ALL-Ref
+                // candidacy, so the dump carries that too — an `issuer=None` edge is the
+                // owner-less/`CallArg` signature.
+                {
+                    use rustc_middle::mir::Local;
+                    use rustc_span::def_id::LocalDefId;
+                    let program = collect_program(tcx);
+                    let edges = crate::analyses::borrow_ownership::borrow_engine::borrow_conflicts(
+                        &program,
+                        |_: LocalDefId| |_: Local| true,
+                        |_: LocalDefId| |_: Local| true,
+                    );
+                    let mut lines: Vec<String> = edges
+                        .iter()
+                        .flat_map(|(did, es)| {
+                            let name = tcx.def_path_str(did.to_def_id());
+                            es.iter().map(move |e| {
+                                let mut req: Vec<String> =
+                                    e.requirers.iter().map(|o| format!("{o:?}")).collect();
+                                req.sort();
+                                format!(
+                                    "{name}\t{}\t{req:?}",
+                                    match e.issuer {
+                                        Some(o) => format!("{o:?}"),
+                                        None => "OWNERLESS".to_string(),
+                                    }
+                                )
+                            })
+                        })
+                        .collect();
+                    lines.sort();
+                    let mut edge_out = String::from("fn\tissuer\trequirers\n");
+                    for l in lines {
+                        edge_out.push_str(&l);
+                        edge_out.push('\n');
+                    }
+                    std::fs::write(format!("{path}.edges"), edge_out)
+                        .unwrap_or_else(|e| panic!("ER4 edge dump: {e}"));
+                }
+                // §8 landing-gate evidence: for every function, its `arg_count` and the
+                // source-level `var_debug_info` name of each local that has one. A moved local is
+                // a PARAMETER iff its index <= arg_count (that is the W14 exposure population),
+                // and it has a SOURCE DECLARATION iff it appears here with a name (that is what
+                // the official declaration metric counts). Both questions answered from MIR.
+                {
+                    let mut lines: Vec<String> = Vec::new();
+                    for &f in &collect_program(tcx).functions {
+                        let body = tcx.mir_drops_elaborated_and_const_checked(f).borrow();
+                        let name = tcx.def_path_str(f.to_def_id());
+                        let mut named: Vec<String> = body
+                            .var_debug_info
+                            .iter()
+                            .filter_map(|vdi| match vdi.value {
+                                rustc_middle::mir::VarDebugInfoContents::Place(pl) => {
+                                    Some(format!("_{}={}", pl.local.index(), vdi.name))
+                                }
+                                _ => None,
+                            })
+                            .collect();
+                        named.sort();
+                        lines.push(format!(
+                            "{name}\targ_count={}\tlocals={}\tnamed={}",
+                            body.arg_count,
+                            body.local_decls.len(),
+                            named.join(",")
+                        ));
+                    }
+                    lines.sort();
+                    std::fs::write(format!("{path}.locals"), lines.join("\n") + "\n")
+                        .unwrap_or_else(|e| panic!("ER4 locals dump: {e}"));
+                }
+                std::fs::write(&path, out).unwrap_or_else(|e| panic!("ER4 dump {path}: {e}"));
+                row
+            }
             "bo" => run::run_bo(tcx, t_tcx),
             "prod" => run::run_prod(tcx, t_tcx),
             "prod-own" => run::run_prod_ownership(tcx, t_tcx),

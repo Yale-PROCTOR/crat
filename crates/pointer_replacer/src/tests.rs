@@ -17608,6 +17608,239 @@ pub unsafe fn f_drop(b: *mut F) {
             |tcx| assert_ownership_parity(tcx, "f_stash", &[], &[fld("F", 0), loc("src")]),
         );
     }
+
+    /// §HLZ-PORT — witnesses for the point-keyed `requires` engine, LANDED.
+    ///
+    /// These shipped RED-first against a flag and asserted BOTH modes. The runtime selector was
+    /// retired at landing (launch-6 precedent), so each now pins the landed engine's behaviour
+    /// directly — the content the two-mode comparison used to establish, asserted as content.
+    mod hlz_port_witnesses {
+        use rustc_hash::FxHashMap;
+        use rustc_middle::mir::Local;
+        use rustc_span::def_id::LocalDefId;
+
+        use super::{collect_program, run_compiler};
+        use crate::analyses::{
+            borrow::ConflictEdge,
+            borrow_ownership::borrow_engine::{
+                borrow_conflicts, demotion_witness_census, loan_liveness_census,
+            },
+        };
+
+        /// Canonical, order-insensitive rendering of a conflict-edge map.
+        fn canonical(edges: &FxHashMap<LocalDefId, Vec<ConflictEdge>>) -> Vec<String> {
+            let mut out: Vec<String> = edges
+                .iter()
+                .flat_map(|(did, es)| {
+                    es.iter().map(move |e| {
+                        let mut requirers: Vec<String> =
+                            e.requirers.iter().map(|o| format!("{o:?}")).collect();
+                        requirers.sort();
+                        format!("{did:?} issuer={:?} requirers={requirers:?}", e.issuer)
+                    })
+                })
+                .collect();
+            out.sort();
+            out
+        }
+
+        fn edges(code: &str) -> Vec<String> {
+            edges_with_mut(code, true)
+        }
+
+        fn edges_with_mut(code: &str, mutb: bool) -> Vec<String> {
+            let mut captured = Vec::new();
+            run_compiler(code, |tcx| {
+                let program = collect_program(tcx);
+                captured = canonical(&borrow_conflicts(
+                    &program,
+                    |_: LocalDefId| |_: Local| true,
+                    move |_: LocalDefId| move |_: Local| mutb,
+                ));
+            });
+            captured
+        }
+
+        /// **W1 — the edge-gate regression control.** Two reborrows of the same pointee, the
+        /// first's last use strictly before the second's write. The conflict is REAL: the borrow
+        /// is still in scope at the write, and an early cut of the port dropped it only because
+        /// its CFG step was gated at the wrong end relative to a matrix holding EXIT liveness
+        /// (port record §3.6/§4). Its `requirers=[]` signature is not a defect either — the
+        /// invalidation lands one step past the borrower's last use, so the issuer carries the
+        /// demotion alone.
+        #[test]
+        fn port_reborrow_chain_conflict_survives_the_edge_gate() {
+            const CODE: &str = "unsafe fn f(p: *mut i32) -> i32 { let a = &mut *p as *mut i32; \
+                 let v = *a; let b = &mut *p as *mut i32; *b = 1; v }";
+            let e = edges(CODE);
+            assert_eq!(
+                e.len(),
+                1,
+                "exactly one conflict is expected here; got {e:?}"
+            );
+            assert!(
+                e[0].ends_with("requirers=[]"),
+                "the shape's signature is an issuer-only edge (no live requirer at the error \
+                 row); got {e:?}"
+            );
+        }
+
+        /// **W2 — the survival control.** A write while the borrow is still live is a genuine
+        /// invalidation and must be reported. Without this, W1 would be satisfied by an engine
+        /// that simply stopped reporting conflicts.
+        #[test]
+        fn port_live_requirer_conflict_survives() {
+            const CODE: &str =
+                "unsafe fn f() -> i32 { let mut x = 0i32; let p = &raw mut x; x = 2; *p }";
+            assert!(
+                !edges(CODE).is_empty(),
+                "a write while the borrow is live must conflict"
+            );
+        }
+
+        /// **W3 — `CallArg` inertness is structural.** The walk is seeded from `membership`
+        /// alone, and `NativeConstraintGraph::new` never gives a `CallArg` loan a membership
+        /// constraint (production does not either — `borrow/mod.rs` pushes membership only in
+        /// `visit_assign`). So such a loan is live at NO point, where the flow-insensitive
+        /// engine kept it live at exactly the one point after its call terminator ("M1
+        /// temporal"). Asserted on `loan_liveness` directly: the conflict-edge surface reports an
+        /// absence either way and cannot tell "never live" from "live but inert".
+        #[test]
+        fn port_callarg_loan_never_live() {
+            const CODE: &str = "unsafe fn g(q: *mut i32) { *q = 1; } \
+                                unsafe fn f() { let mut x = 0i32; let p = &raw mut x; g(p); }";
+            let mut points = Vec::new();
+            run_compiler(CODE, |tcx| {
+                let program = collect_program(tcx);
+                let census = loan_liveness_census(
+                    &program,
+                    |_: LocalDefId| |_: Local| true,
+                    |_: LocalDefId| |_: Local| true,
+                );
+                points = census
+                    .values()
+                    .flatten()
+                    .filter(|(_, is_call_arg, _)| *is_call_arg)
+                    .map(|(_, _, live_points)| *live_points)
+                    .collect();
+                points.sort();
+            });
+            assert_eq!(
+                points,
+                vec![0],
+                "seeded from `membership` alone, a CallArg loan must be live at no point at all"
+            );
+        }
+
+        /// **W4 — NB4-R routed cross-alias write.** The engine never reads or writes
+        /// `invalidates`, but `errors = loan_liveness ∩ invalidates`, so a routed invalidation
+        /// would silently stop producing an error if the left operand lost the loan. This is the
+        /// S2-6 closure shape whose routed edge the fork adds over production.
+        #[test]
+        fn port_cross_alias_write_still_routed() {
+            const CODE: &str = "#[inline(never)] unsafe fn id(mut p: *mut i32) -> *mut i32 { p } \
+                 unsafe fn f(mut p: *mut i32) -> i32 { let b = p; let x = id(p); let z = x; \
+                 let r0 = *z; *b = 5; r0 + *z }";
+            assert!(
+                !edges(CODE).is_empty(),
+                "the routed cross-alias write must still conflict"
+            );
+        }
+
+        /// **W5 — the mutability axis stays flat on the read shape.** The read/write asymmetry
+        /// lives in the fork's `invalidates`, which the engine does not consult; the observable is
+        /// that this shape's conflict is generated identically at both mutabilities. The
+        /// `mut=true` arm carries the non-vacuity.
+        #[test]
+        fn port_write_aware_immutable_read_still_skipped() {
+            const CODE: &str = "unsafe fn f() { let mut x = 0i32; let a = &mut x as *mut i32; \
+                 let b = &mut x as *mut i32; let u = *a; let v = *b; let _ = (u, v); }";
+            let hot = edges_with_mut(CODE, true);
+            assert!(!hot.is_empty(), "aliasing mutable borrows must conflict");
+            assert_eq!(
+                hot,
+                edges_with_mut(CODE, false),
+                "the engine must not introduce a mutability-dependent difference here"
+            );
+        }
+
+        /// **W6 — monotonicity, executed rather than argued.** The engine carries a
+        /// release-active subset tripwire (`loan_liveness♯ ⊆ loan_liveness` and
+        /// `requires♯ ⊆ requires` after projecting the point key away) against the retained
+        /// flow-insensitive reference. This drives it over the other witnesses' shapes plus the
+        /// branch shapes it is most likely to catch. A fire is a STOP, not a fix.
+        #[test]
+        fn port_localized_facts_are_a_subset() {
+            const SHAPES: &[&str] = &[
+                "unsafe fn f() -> i32 { let mut x = 0i32; let p = &raw mut x; let v = *p; x = 2; v }",
+                "unsafe fn f() -> i32 { let mut x = 0i32; let p = &raw mut x; x = 2; *p }",
+                "unsafe fn f(cond: bool) { let mut x = 0i32; let mut y = 0i32; let a = &raw mut x; \
+                 let mut b = &raw mut y; if cond { b = a; *b = 1; } else { x = 2; *b = 3; } }",
+                "unsafe fn f(c: bool, p: *mut i32) -> i32 { let mut q = p; let mut t = 0i32; \
+                 if c { q = &raw mut t; } *q = 1; *q }",
+                "#[inline(never)] unsafe fn id(mut p: *mut i32) -> *mut i32 { p } \
+                 unsafe fn f(mut p: *mut i32) -> i32 { let b = p; let x = id(p); let z = x; \
+                 let r0 = *z; *b = 5; r0 + *z }",
+                "unsafe fn g(q: *mut i32) { *q = 1; } \
+                 unsafe fn f() { let mut x = 0i32; let p = &raw mut x; g(p); }",
+            ];
+            for code in SHAPES {
+                // The assertion is inside the engine; reaching here without a panic IS the pass.
+                let _ = edges(code);
+            }
+        }
+
+        /// **W7 — conflict generation, witnessed on its own.** Pins the ACTUAL edge content, so
+        /// an engine that stopped generating conflicts cannot satisfy it. Required by the
+        /// adversarial review: a mutual-consistency assertion between two consumers of one
+        /// relation cannot detect a required invalidation deleted on both sides.
+        #[test]
+        fn port_conflict_generation_is_witnessed_independently() {
+            const CODE: &str = "unsafe fn f() { let mut x = 0i32; let a = &mut x as *mut i32; \
+                 let b = &mut x as *mut i32; let c = &mut x as *mut i32; *a = 1; *b = 2; *c = 3; }";
+            let e = edges(CODE);
+            assert_eq!(
+                e.len(),
+                2,
+                "both aliasing conflicts must be GENERATED in this three-alias shape; got {e:?}"
+            );
+            assert!(
+                e.iter().all(|x| x.contains("issuer=Some(")),
+                "each generated edge must carry an issuer; got {e:?}"
+            );
+            assert!(
+                e.iter().any(|x| x.contains("requirers=[\"Local(")),
+                "at least one generated edge must attribute a live requirer — the half the
+                 point-keyed predicate could silently empty; got {e:?}"
+            );
+        }
+
+        /// **W8 — demotion witnesses, observed on their own.** The other half of the review's
+        /// requirement: read straight out of the forked collector, with no reference to the
+        /// conflict-edge set, so the two can disagree loudly rather than fail silently together.
+        #[test]
+        fn port_demotion_witnesses_are_observed_independently() {
+            const CODE: &str = "unsafe fn f() { let mut x = 0i32; let a = &mut x as *mut i32; \
+                 let b = &mut x as *mut i32; let c = &mut x as *mut i32; *a = 1; *b = 2; *c = 3; }";
+            let mut all: Vec<(usize, usize)> = Vec::new();
+            run_compiler(CODE, |tcx| {
+                let program = collect_program(tcx);
+                let census = demotion_witness_census(
+                    &program,
+                    |_: LocalDefId| |_: Local| true,
+                    |_: LocalDefId| |_: Local| true,
+                );
+                all = census.values().flatten().copied().collect();
+                all.sort();
+            });
+            assert_eq!(
+                all,
+                vec![(2, 1), (3, 1), (4, 1), (5, 1)],
+                "the demotion side must PRODUCE these witnesses, checked separately from the edge \
+                 side so a predicate that emptied both would still be caught"
+            );
+        }
+    }
 }
 
 mod borrow_ownership_resolve {

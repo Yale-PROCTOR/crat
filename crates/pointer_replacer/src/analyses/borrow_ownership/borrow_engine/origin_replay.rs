@@ -9,10 +9,11 @@ use rustc_middle::{
     mir::{Local, PlaceElem},
     ty::TyCtxt,
 };
+use rustc_mir_dataflow::points::PointIndex;
 use rustc_span::def_id::LocalDefId;
 use smallvec::{SmallVec, smallvec};
 
-use super::loan_liveness;
+use super::loan_liveness::{self, EdgeLocation, LocalizedRequires};
 use crate::{
     analyses::{
         bo_adapter,
@@ -38,6 +39,28 @@ pub(super) struct NativeBorrowContext<'a> {
 pub(super) struct NativeInference<'tcx> {
     pub(super) facts: BorrowInferenceResults<'tcx>,
     pub(super) copy_lends: DenseBitSet<Loan>,
+    /// §HLZ-PORT (A2), LANDED — the point-keyed relation, carried HERE and not on `facts`, so
+    /// production `BorrowInferenceResults` keeps its type and production's own consumers keep
+    /// their behaviour by construction (port-exploration §2.1).
+    ///
+    /// `None` is NOT a switch — the runtime selector was retired at landing. It marks the one
+    /// `#[cfg(test)]` construction path (`borrow_conflicts_wrapped`) that builds facts from
+    /// production `borrow_inference` directly and therefore has no `NativeConstraintGraph` to
+    /// localize; that path keeps the whole-body predicate, which is what its NB5-O differential
+    /// compares against.
+    pub(super) localized_requires: Option<LocalizedRequires>,
+    /// §6.4 drop attribution (env-gated, `Some` only under `CRAT_BO_REQUIRER_DROP_OUT`).
+    /// Per loan, the provenances reachable from its membership provenance using **`All` edges
+    /// only** — i.e. ignoring every located reborrow edge. `All` edges apply at EVERY point, so a
+    /// provenance in this set can never be dropped by an edge LOCATION; if a dropped requirer is
+    /// NOT in it, the drop is attributable to a located reborrow edge, which A2 places at the
+    /// reborrow's own `data.location()`.
+    pub(super) all_only_closure: Option<FxHashMap<Loan, DenseBitSet<Provenance>>>,
+    /// §8.1 census support (same env gate). The raw MIR CFG over points, and each loan's
+    /// reservation point — the two things `extract_conflict_edges` needs to re-derive the
+    /// liveness-gated propagation INDEPENDENTLY of the walk that produced the facts.
+    pub(super) succ_points: Option<FxHashMap<PointIndex, Vec<PointIndex>>>,
+    pub(super) loan_reserve: Option<FxHashMap<Loan, PointIndex>>,
 }
 
 pub(crate) fn selected_copy_lend_contains(
@@ -141,9 +164,12 @@ impl<'a> NativeBorrowContext<'a> {
         );
         let subset_graph = graph.subset_graph(provenance_set);
         inference.subset_closure = graph.subset_closure(provenance_set, &subset_graph);
+        // The landed whole-body relation is computed in BOTH modes: `Off` consumes it, and `On`
+        // needs it as the tripwire's reference (and leaves it on `facts` so production's own
+        // consumers are untouched).
         inference.requires = graph.requires(&inference, provenance_set, &subset_graph);
         let body = &*tcx.mir_drops_elaborated_and_const_checked(f).borrow();
-        inference.loan_liveness = loan_liveness::compute_loan_liveness(
+        let landed_loan_liveness = loan_liveness::compute_loan_liveness(
             tcx,
             body,
             &inference.borrow_set,
@@ -152,9 +178,108 @@ impl<'a> NativeBorrowContext<'a> {
             &inference.requires,
             &inference.killed,
         );
+        let (ported_loan_liveness, ported_requires) =
+            loan_liveness::compute_loan_liveness_localized(
+                body,
+                &inference.borrow_set,
+                &inference.location_map,
+                &inference.provenance_liveness,
+                &inference.killed,
+                provenance_set.provenance_data.len(),
+                &graph.subset,
+                &graph.membership,
+            );
+        // The monotonicity tripwire stays RELEASE-ACTIVE (user decision at landing): the landed
+        // flow-insensitive dataflow above is retained solely as its reference, not as a selectable
+        // engine. A fire is a STOP. `CRAT_BO_POINT_REQUIRES_TRIPWIRE=off` skips both the reference
+        // computation and the assert for anyone who needs the cycles back.
+        loan_liveness::assert_localized_subset(
+            &landed_loan_liveness,
+            &inference.requires,
+            &ported_loan_liveness,
+            &ported_requires,
+        );
+        inference.loan_liveness = ported_loan_liveness;
+        let localized_requires = Some(ported_requires);
+        let all_only_closure = if std::env::var_os("CRAT_BO_REQUIRER_DROP_OUT").is_some() {
+            let mut all_graph: IndexVec<Provenance, SmallVec<[Provenance; 4]>> =
+                IndexVec::from_elem(smallvec![], &provenance_set.provenance_data);
+            for &(sub, sup, location) in &graph.subset {
+                if matches!(location, EdgeLocation::All) {
+                    all_graph[sub].push(sup);
+                }
+            }
+            let mut per_loan = FxHashMap::default();
+            for &(loan, provenance) in &graph.membership {
+                let mut seen = DenseBitSet::new_empty(provenance_set.provenance_data.len());
+                let mut stack = vec![provenance];
+                while let Some(p) = stack.pop() {
+                    if !seen.insert(p) {
+                        continue;
+                    }
+                    stack.extend_from_slice(&all_graph[p]);
+                }
+                per_loan.insert(loan, seen);
+            }
+            Some(per_loan)
+        } else {
+            None
+        };
+        let (succ_points, loan_reserve) = if all_only_closure.is_some() {
+            let mut succ: FxHashMap<PointIndex, Vec<PointIndex>> = FxHashMap::default();
+            for (bb, data) in body.basic_blocks.iter_enumerated() {
+                let len = data.statements.len() + data.terminator.is_some() as usize;
+                for i in 0..len {
+                    let loc = rustc_middle::mir::Location {
+                        block: bb,
+                        statement_index: i,
+                    };
+                    let pt = inference.location_map.point_from_location(loc);
+                    let outs = if i + 1 < len {
+                        vec![inference.location_map.point_from_location(
+                            rustc_middle::mir::Location {
+                                block: bb,
+                                statement_index: i + 1,
+                            },
+                        )]
+                    } else {
+                        data.terminator()
+                            .successors()
+                            .map(|b| {
+                                inference.location_map.point_from_location(
+                                    rustc_middle::mir::Location {
+                                        block: b,
+                                        statement_index: 0,
+                                    },
+                                )
+                            })
+                            .collect()
+                    };
+                    succ.insert(pt, outs);
+                }
+            }
+            let reserve = inference
+                .borrow_set
+                .loans
+                .iter_enumerated()
+                .map(|(loan, data)| {
+                    (
+                        loan,
+                        inference.location_map.point_from_location(data.location()),
+                    )
+                })
+                .collect();
+            (Some(succ), Some(reserve))
+        } else {
+            (None, None)
+        };
         NativeInference {
             facts: inference,
             copy_lends,
+            localized_requires,
+            all_only_closure,
+            succ_points,
+            loan_reserve,
         }
     }
 }
@@ -202,7 +327,9 @@ mod copy_lend_identity_tests {
 
 #[derive(Default)]
 struct NativeConstraintGraph {
-    subset: Vec<(Provenance, Provenance)>,
+    /// §HLZ-PORT (A2): the third component is the edge's program point, or `All` for the
+    /// closure-derived depth-0 value flows that have none. `Off` ignores it entirely.
+    subset: Vec<(Provenance, Provenance, EdgeLocation)>,
     membership: Vec<(Loan, Provenance)>,
 }
 
@@ -243,7 +370,10 @@ impl NativeConstraintGraph {
                     .all(|projection| matches!(projection, PlaceElem::Deref))
                 && let Some(source) = provenance_set.local_data[rhs.local]
             {
-                graph.subset.push((source, lhs));
+                // Loan-derived reborrow: the location is in hand, so this edge is located.
+                graph
+                    .subset
+                    .push((source, lhs, EdgeLocation::Point(data.location())));
             }
         }
 
@@ -267,7 +397,11 @@ impl NativeConstraintGraph {
                 ) else {
                     continue;
                 };
-                graph.subset.push((source, target));
+                // A2: `depth0_value_flows` reads the CLOSED matrix (`origin_flow.rs:925-931`), so
+                // these are transitive-closure edges with no single location. Emitting them `All`
+                // reproduces the landed flow-insensitive behaviour exactly; locating them means
+                // touching `origin_flow`, which is A1 and is not authorized here.
+                graph.subset.push((source, target, EdgeLocation::All));
             }
         }
 
@@ -279,7 +413,7 @@ impl NativeConstraintGraph {
         provenance_set: &ProvenanceSet,
     ) -> IndexVec<Provenance, SmallVec<[Provenance; 4]>> {
         let mut graph = IndexVec::from_elem(smallvec![], &provenance_set.provenance_data);
-        for &(sub, sup) in &self.subset {
+        for &(sub, sup, _) in &self.subset {
             graph[sub].push(sup);
         }
         graph
