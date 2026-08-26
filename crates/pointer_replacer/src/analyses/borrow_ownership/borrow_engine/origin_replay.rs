@@ -13,10 +13,7 @@ use rustc_mir_dataflow::points::PointIndex;
 use rustc_span::def_id::LocalDefId;
 use smallvec::{SmallVec, smallvec};
 
-use super::{
-    PointRequiresMode,
-    loan_liveness::{self, EdgeLocation, LocalizedRequires},
-};
+use super::loan_liveness::{self, EdgeLocation, LocalizedRequires};
 use crate::{
     analyses::{
         bo_adapter,
@@ -42,9 +39,15 @@ pub(super) struct NativeBorrowContext<'a> {
 pub(super) struct NativeInference<'tcx> {
     pub(super) facts: BorrowInferenceResults<'tcx>,
     pub(super) copy_lends: DenseBitSet<Loan>,
-    /// §HLZ-PORT (A2). `Some` only under `PointRequiresMode::On`. Deliberately carried HERE and
-    /// not on `facts`, so production `BorrowInferenceResults` keeps its type and production's own
-    /// consumers keep their behaviour by construction (port-exploration §2.1).
+    /// §HLZ-PORT (A2), LANDED — the point-keyed relation, carried HERE and not on `facts`, so
+    /// production `BorrowInferenceResults` keeps its type and production's own consumers keep
+    /// their behaviour by construction (port-exploration §2.1).
+    ///
+    /// `None` is NOT a switch — the runtime selector was retired at landing. It marks the one
+    /// `#[cfg(test)]` construction path (`borrow_conflicts_wrapped`) that builds facts from
+    /// production `borrow_inference` directly and therefore has no `NativeConstraintGraph` to
+    /// localize; that path keeps the whole-body predicate, which is what its NB5-O differential
+    /// compares against.
     pub(super) localized_requires: Option<LocalizedRequires>,
     /// §6.4 drop attribution (env-gated, `Some` only under `CRAT_BO_REQUIRER_DROP_OUT`).
     /// Per loan, the provenances reachable from its membership provenance using **`All` edges
@@ -175,33 +178,29 @@ impl<'a> NativeBorrowContext<'a> {
             &inference.requires,
             &inference.killed,
         );
-        let localized_requires = match PointRequiresMode::current() {
-            PointRequiresMode::Off => {
-                inference.loan_liveness = landed_loan_liveness;
-                None
-            }
-            PointRequiresMode::On => {
-                let (ported_loan_liveness, ported_requires) =
-                    loan_liveness::compute_loan_liveness_localized(
-                        body,
-                        &inference.borrow_set,
-                        &inference.location_map,
-                        &inference.provenance_liveness,
-                        &inference.killed,
-                        provenance_set.provenance_data.len(),
-                        &graph.subset,
-                        &graph.membership,
-                    );
-                loan_liveness::assert_localized_subset(
-                    &landed_loan_liveness,
-                    &inference.requires,
-                    &ported_loan_liveness,
-                    &ported_requires,
-                );
-                inference.loan_liveness = ported_loan_liveness;
-                Some(ported_requires)
-            }
-        };
+        let (ported_loan_liveness, ported_requires) =
+            loan_liveness::compute_loan_liveness_localized(
+                body,
+                &inference.borrow_set,
+                &inference.location_map,
+                &inference.provenance_liveness,
+                &inference.killed,
+                provenance_set.provenance_data.len(),
+                &graph.subset,
+                &graph.membership,
+            );
+        // The monotonicity tripwire stays RELEASE-ACTIVE (user decision at landing): the landed
+        // flow-insensitive dataflow above is retained solely as its reference, not as a selectable
+        // engine. A fire is a STOP. `CRAT_BO_POINT_REQUIRES_TRIPWIRE=off` skips both the reference
+        // computation and the assert for anyone who needs the cycles back.
+        loan_liveness::assert_localized_subset(
+            &landed_loan_liveness,
+            &inference.requires,
+            &ported_loan_liveness,
+            &ported_requires,
+        );
+        inference.loan_liveness = ported_loan_liveness;
+        let localized_requires = Some(ported_requires);
         let all_only_closure = if std::env::var_os("CRAT_BO_REQUIRER_DROP_OUT").is_some() {
             let mut all_graph: IndexVec<Provenance, SmallVec<[Provenance; 4]>> =
                 IndexVec::from_elem(smallvec![], &provenance_set.provenance_data);
