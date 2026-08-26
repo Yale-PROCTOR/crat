@@ -12635,6 +12635,58 @@ unsafe fn f(mut p: *mut i32) -> i32 {
 
     /// §NB4-4a helper — solve `f` to fixpoint under fact-driven mutability; return each named
     /// local's depth-0 accepted kind + its Foster mutability.
+    /// §ESC-W1 — **KNOWN GAP, pinned.** The save/caller escape shape:
+    ///
+    /// ```ignore
+    /// unsafe fn save(out: *mut *mut i32, x: *mut i32) { *out = x; *x = 1; }
+    /// // caller: save(&raw mut slot, &raw mut cell); then reads *slot
+    /// ```
+    ///
+    /// The C-side input is UB-FREE — `cell` outlives the call, `*x = 1` writes a live cell, and
+    /// the caller's later read through the escaped pointer is valid — so §28's input-UB discharge
+    /// does NOT apply. There is nonetheless no valid all-references typing: `x: &mut i32` moved
+    /// into `*out` cannot then be used at `*x = 1`, and reborrowing to fix that shortens the
+    /// lifetime below the caller's read. **The required verdict is therefore `x = Raw`.**
+    ///
+    /// The analysis settles `x = Ref` (and `out = Ref`, and the caller's `slot = Ref`). This test
+    /// pins that CURRENT behaviour rather than the required one, so the gap is a recorded fact
+    /// instead of a standing red — and so that any change which closes it fails here loudly and
+    /// gets to claim the credit.
+    ///
+    /// Measured non-sensitivity (2026-08-26): forcing the caller's `slot` Raw with pointer
+    /// arithmetic, removing the post-store write, and removing the escape each leave `out`/`x` at
+    /// `Ref`. So this is not a near-miss — no guard engages at all. The
+    /// placeholder-always-live arm (`CRAT_BO_PLACEHOLDER_LIVE`) does not move it either.
+    #[test]
+    fn escw1_escape_shape_x_stays_ref_known_gap() {
+        const CODE: &str = r#"
+unsafe fn save(out: *mut *mut i32, x: *mut i32) { *out = x; *x = 1; }
+unsafe fn caller() -> i32 {
+    let mut cell = 0i32;
+    let mut slot: *mut i32 = core::ptr::null_mut();
+    save(&raw mut slot, &raw mut cell);
+    *slot
+}
+"#;
+        run_compiler(CODE, |tcx| {
+            let program = collect_program(tcx);
+            let m = nb4_accept(tcx, &program, "save", &["out", "x"]);
+            assert_eq!(
+                (m[0].0, m[1].0),
+                (Some(SlotKind::Ref), Some(SlotKind::Ref)),
+                "ESC-W1 pins the KNOWN GAP: `x` should be Raw (no valid all-refs typing, UB-free \
+                 input) but settles Ref. If this fails, the gap moved — read \
+                 docs/agents/tasks/2026-08-25-hlz-port-exploration.md §12 before re-pinning."
+            );
+            let c = nb4_accept(tcx, &program, "caller", &["slot"]);
+            assert_eq!(
+                c[0].0,
+                Some(SlotKind::Ref),
+                "the caller's escaped pointer is Ref as well"
+            );
+        });
+    }
+
     fn nb4_accept<'tcx>(
         tcx: TyCtxt<'tcx>,
         program: &RustProgram<'tcx>,
