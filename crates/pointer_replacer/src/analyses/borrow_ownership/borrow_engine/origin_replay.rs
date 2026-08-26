@@ -9,6 +9,7 @@ use rustc_middle::{
     mir::{Local, PlaceElem},
     ty::TyCtxt,
 };
+use rustc_mir_dataflow::points::PointIndex;
 use rustc_span::def_id::LocalDefId;
 use smallvec::{SmallVec, smallvec};
 
@@ -52,6 +53,11 @@ pub(super) struct NativeInference<'tcx> {
     /// NOT in it, the drop is attributable to a located reborrow edge, which A2 places at the
     /// reborrow's own `data.location()`.
     pub(super) all_only_closure: Option<FxHashMap<Loan, DenseBitSet<Provenance>>>,
+    /// §8.1 census support (same env gate). The raw MIR CFG over points, and each loan's
+    /// reservation point — the two things `extract_conflict_edges` needs to re-derive the
+    /// liveness-gated propagation INDEPENDENTLY of the walk that produced the facts.
+    pub(super) succ_points: Option<FxHashMap<PointIndex, Vec<PointIndex>>>,
+    pub(super) loan_reserve: Option<FxHashMap<Loan, PointIndex>>,
 }
 
 pub(crate) fn selected_copy_lend_contains(
@@ -220,11 +226,61 @@ impl<'a> NativeBorrowContext<'a> {
         } else {
             None
         };
+        let (succ_points, loan_reserve) = if all_only_closure.is_some() {
+            let mut succ: FxHashMap<PointIndex, Vec<PointIndex>> = FxHashMap::default();
+            for (bb, data) in body.basic_blocks.iter_enumerated() {
+                let len = data.statements.len() + data.terminator.is_some() as usize;
+                for i in 0..len {
+                    let loc = rustc_middle::mir::Location {
+                        block: bb,
+                        statement_index: i,
+                    };
+                    let pt = inference.location_map.point_from_location(loc);
+                    let outs = if i + 1 < len {
+                        vec![inference.location_map.point_from_location(
+                            rustc_middle::mir::Location {
+                                block: bb,
+                                statement_index: i + 1,
+                            },
+                        )]
+                    } else {
+                        data.terminator()
+                            .successors()
+                            .map(|b| {
+                                inference.location_map.point_from_location(
+                                    rustc_middle::mir::Location {
+                                        block: b,
+                                        statement_index: 0,
+                                    },
+                                )
+                            })
+                            .collect()
+                    };
+                    succ.insert(pt, outs);
+                }
+            }
+            let reserve = inference
+                .borrow_set
+                .loans
+                .iter_enumerated()
+                .map(|(loan, data)| {
+                    (
+                        loan,
+                        inference.location_map.point_from_location(data.location()),
+                    )
+                })
+                .collect();
+            (Some(succ), Some(reserve))
+        } else {
+            (None, None)
+        };
         NativeInference {
             facts: inference,
             copy_lends,
             localized_requires,
             all_only_closure,
+            succ_points,
+            loan_reserve,
         }
     }
 }

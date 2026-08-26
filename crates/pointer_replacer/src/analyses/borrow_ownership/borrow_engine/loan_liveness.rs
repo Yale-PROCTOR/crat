@@ -269,7 +269,14 @@ pub(super) fn compute_loan_liveness_localized<'tcx>(
     let graph = LocalizedConstraintGraph::new(location_map, subset);
     let mut loan_liveness = SparseBitMatrix::new(borrow_set.loans.len());
     let mut requires = LocalizedRequires::new();
-    let mut visited = FxHashSet::default();
+    // Keyed on `(node, by_edge)`, NOT on the node alone. The record decision is
+    // `by_edge || live(node)`, so it is a property of HOW the node was reached; keying `visited`
+    // on the node alone let whichever push happened to pop first decide, and silently discarded a
+    // later edge-step arrival that would have licensed a record the sideways arrival did not.
+    // That made the output pop-order-shaped rather than semantic (recorded as a residual at the
+    // 2026-08-25 close, §8.2 item 1; repaired here on reopening). Re-expanding a node once per
+    // reach-kind is wasted work, not wrong work: every write below is into an idempotent set.
+    let mut visited: FxHashSet<(LocalizedNode, bool)> = FxHashSet::default();
     // `bool` = reached by a CFG edge step. Such a node's ENTRY liveness is already established by
     // the edge gate (the source was live on exit), so it records unconditionally; a node reached
     // by an unconditional same-point subset hop still has to prove liveness for itself.
@@ -312,7 +319,7 @@ pub(super) fn compute_loan_liveness_localized<'tcx>(
         }
 
         while let Some((node, by_edge)) = stack.pop() {
-            if !visited.insert(node) {
+            if !visited.insert((node, by_edge)) {
                 continue;
             }
 

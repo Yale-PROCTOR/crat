@@ -14706,6 +14706,38 @@ fn boc1_run_one() {
                     std::fs::write(format!("{path}.edges"), edge_out)
                         .unwrap_or_else(|e| panic!("ER4 edge dump: {e}"));
                 }
+                // §8 landing-gate evidence: for every function, its `arg_count` and the
+                // source-level `var_debug_info` name of each local that has one. A moved local is
+                // a PARAMETER iff its index <= arg_count (that is the W14 exposure population),
+                // and it has a SOURCE DECLARATION iff it appears here with a name (that is what
+                // the official declaration metric counts). Both questions answered from MIR.
+                {
+                    let mut lines: Vec<String> = Vec::new();
+                    for &f in &collect_program(tcx).functions {
+                        let body = tcx.mir_drops_elaborated_and_const_checked(f).borrow();
+                        let name = tcx.def_path_str(f.to_def_id());
+                        let mut named: Vec<String> = body
+                            .var_debug_info
+                            .iter()
+                            .filter_map(|vdi| match vdi.value {
+                                rustc_middle::mir::VarDebugInfoContents::Place(pl) => {
+                                    Some(format!("_{}={}", pl.local.index(), vdi.name))
+                                }
+                                _ => None,
+                            })
+                            .collect();
+                        named.sort();
+                        lines.push(format!(
+                            "{name}\targ_count={}\tlocals={}\tnamed={}",
+                            body.arg_count,
+                            body.local_decls.len(),
+                            named.join(",")
+                        ));
+                    }
+                    lines.sort();
+                    std::fs::write(format!("{path}.locals"), lines.join("\n") + "\n")
+                        .unwrap_or_else(|e| panic!("ER4 locals dump: {e}"));
+                }
                 std::fs::write(&path, out).unwrap_or_else(|e| panic!("ER4 dump {path}: {e}"));
                 row
             }
