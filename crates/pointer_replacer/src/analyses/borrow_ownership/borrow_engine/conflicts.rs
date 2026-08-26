@@ -236,6 +236,40 @@ fn extract_conflict_edges(
                     Some(localized) => localized.contains(row, provenance, loan),
                     None => requires.contains(provenance, loan),
                 };
+                // §6.4 drop attribution: a requirer the WHOLE-BODY relation keeps at a live,
+                // erroring point and the point-keyed one drops. `all_only` says whether it is
+                // reachable using `All` edges alone — those apply at every point, so `all_only =
+                // false` attributes the drop to a LOCATED reborrow edge rather than to any
+                // approximation A2 introduces.
+                if let Some(closure) = &inference.all_only_closure
+                    && !required
+                    && requires.contains(provenance, loan)
+                {
+                    let all_only = closure
+                        .get(&loan)
+                        .is_some_and(|set| set.contains(provenance));
+                    // Was the requirer even live where the loan was reserved? If not, its
+                    // liveness at the error point comes from a LATER definition, so the value it
+                    // holds there cannot be the borrow reserved earlier — which is what makes the
+                    // drop a true point-sensitive unreachability rather than a lost path.
+                    let reserve_point = inference
+                        .facts
+                        .location_map
+                        .point_from_location(borrow_set.loans[loan].location());
+                    let live_at_reserve = inference
+                        .facts
+                        .provenance_liveness
+                        .row(reserve_point)
+                        .is_some_and(|live| live.contains(provenance));
+                    crate::analyses::borrow_ownership::borrow_engine::record_requirer_drop(
+                        format!(
+                            "loan={} point={row:?} provenance={provenance:?} owner={:?} \
+                             all_only_reachable={all_only} live_at_reserve={live_at_reserve}",
+                            loan.index(),
+                            provenance_set.provenance_data[provenance].owner(),
+                        ),
+                    );
+                }
                 if required && seen.insert(provenance) {
                     requirers.push(provenance_set.provenance_data[provenance].owner());
                 }
@@ -541,6 +575,7 @@ where
             facts: inference,
             copy_lends,
             localized_requires: None,
+            all_only_closure: None,
         };
         out.insert(
             f,

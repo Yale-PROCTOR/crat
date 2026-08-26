@@ -45,6 +45,13 @@ pub(super) struct NativeInference<'tcx> {
     /// not on `facts`, so production `BorrowInferenceResults` keeps its type and production's own
     /// consumers keep their behaviour by construction (port-exploration §2.1).
     pub(super) localized_requires: Option<LocalizedRequires>,
+    /// §6.4 drop attribution (env-gated, `Some` only under `CRAT_BO_REQUIRER_DROP_OUT`).
+    /// Per loan, the provenances reachable from its membership provenance using **`All` edges
+    /// only** — i.e. ignoring every located reborrow edge. `All` edges apply at EVERY point, so a
+    /// provenance in this set can never be dropped by an edge LOCATION; if a dropped requirer is
+    /// NOT in it, the drop is attributable to a located reborrow edge, which A2 places at the
+    /// reborrow's own `data.location()`.
+    pub(super) all_only_closure: Option<FxHashMap<Loan, DenseBitSet<Provenance>>>,
 }
 
 pub(crate) fn selected_copy_lend_contains(
@@ -189,10 +196,35 @@ impl<'a> NativeBorrowContext<'a> {
                 Some(ported_requires)
             }
         };
+        let all_only_closure = if std::env::var_os("CRAT_BO_REQUIRER_DROP_OUT").is_some() {
+            let mut all_graph: IndexVec<Provenance, SmallVec<[Provenance; 4]>> =
+                IndexVec::from_elem(smallvec![], &provenance_set.provenance_data);
+            for &(sub, sup, location) in &graph.subset {
+                if matches!(location, EdgeLocation::All) {
+                    all_graph[sub].push(sup);
+                }
+            }
+            let mut per_loan = FxHashMap::default();
+            for &(loan, provenance) in &graph.membership {
+                let mut seen = DenseBitSet::new_empty(provenance_set.provenance_data.len());
+                let mut stack = vec![provenance];
+                while let Some(p) = stack.pop() {
+                    if !seen.insert(p) {
+                        continue;
+                    }
+                    stack.extend_from_slice(&all_graph[p]);
+                }
+                per_loan.insert(loan, seen);
+            }
+            Some(per_loan)
+        } else {
+            None
+        };
         NativeInference {
             facts: inference,
             copy_lends,
             localized_requires,
+            all_only_closure,
         }
     }
 }
