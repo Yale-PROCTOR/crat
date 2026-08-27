@@ -3639,8 +3639,11 @@ pub unsafe fn free_nested() {
     );
 }
 
+/// T2-W1: both endpoints of a move-shaped ownership chain are licensed as
+/// owning kinds, while the linear move keeps one runtime responsibility and
+/// the existing free-site policy emits exactly one `drop` at the C free site.
 #[test]
-fn test_rewriter_keeps_scalar_raw_malloc_when_only_alias_is_freed() {
+fn t2_move_chain_owns_both_slots_and_drops_once_at_free() {
     run_test(
         r#"
 extern "C" {
@@ -3656,10 +3659,16 @@ pub unsafe fn free_nested_alias() {
 }
 "#,
         &[
+            "let p: Box<*mut i32>",
+            "let mut q: Box<*mut i32> = p",
+            "drop(q)",
+        ],
+        &[
             "malloc(std::mem::size_of::<*mut i32>())",
             "free(q as *mut core::ffi::c_void",
+            "Box::into_raw(",
+            "Box::from_raw(",
         ],
-        &["Box::into_raw(", "Box::from_raw("],
     );
 }
 
@@ -12658,7 +12667,7 @@ unsafe fn f(mut p: *mut i32) -> i32 {
     /// `Ref`. So this is not a near-miss — no guard engages at all. The
     /// placeholder-always-live arm (`CRAT_BO_PLACEHOLDER_LIVE`) does not move it either.
     #[test]
-    fn escw1_escape_shape_x_stays_ref_known_gap() {
+    fn escw1_escape_shape_demotes_x_raw() {
         const CODE: &str = r#"
 unsafe fn save(out: *mut *mut i32, x: *mut i32) { *out = x; *x = 1; }
 unsafe fn caller() -> i32 {
@@ -12672,17 +12681,10 @@ unsafe fn caller() -> i32 {
             let program = collect_program(tcx);
             let m = nb4_accept(tcx, &program, "save", &["out", "x"]);
             assert_eq!(
-                (m[0].0, m[1].0),
-                (Some(SlotKind::Ref), Some(SlotKind::Ref)),
-                "ESC-W1 pins the KNOWN GAP: `x` should be Raw (no valid all-refs typing, UB-free \
-                 input) but settles Ref. If this fails, the gap moved — read \
-                 docs/agents/tasks/2026-08-25-hlz-port-exploration.md §12 before re-pinning."
-            );
-            let c = nb4_accept(tcx, &program, "caller", &["slot"]);
-            assert_eq!(
-                c[0].0,
-                Some(SlotKind::Ref),
-                "the caller's escaped pointer is Ref as well"
+                m[1].0,
+                Some(SlotKind::Raw),
+                "②-minimal must keep the selected escaped copy loan live through exit so the \
+                 post-store write demotes save::x"
             );
         });
     }

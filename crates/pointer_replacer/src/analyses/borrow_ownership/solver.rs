@@ -286,6 +286,10 @@ pub(crate) struct SelectorTraceEvent {
     pub selector_index: usize,
     pub active_before: Vec<usize>,
     pub core_selectors: Vec<usize>,
+    /// Canonical diagnostic labels for every typed assumption in this core.
+    /// T2 fills this with endpoint and mandatory-track labels; legacy paths
+    /// leave it empty.
+    pub core_labels: Vec<String>,
     pub outcome: SelectorTraceOutcome,
 }
 
@@ -1098,6 +1102,7 @@ impl KindSolver {
                                 selector_index,
                                 active_before: selectors.indices_of(&assumptions),
                                 core_selectors: selectors.indices_of(&core),
+                                core_labels: Vec::new(),
                                 outcome: SelectorTraceOutcome::Dropped,
                             });
                         });
@@ -1129,6 +1134,7 @@ impl KindSolver {
                         selector_index,
                         active_before: selectors.indices_of(&assumptions),
                         core_selectors: selectors.indices_of(&core),
+                        core_labels: Vec::new(),
                         outcome: if outcome == SatResult::Sat {
                             SelectorTraceOutcome::Restored
                         } else {
@@ -1306,6 +1312,7 @@ impl KindSolver {
                                 selector_index,
                                 active_before: selectors.indices_of(&assumptions),
                                 core_selectors: selectors.indices_of(&core),
+                                core_labels: Vec::new(),
                                 outcome: SelectorTraceOutcome::Dropped,
                             });
                         });
@@ -1341,6 +1348,7 @@ impl KindSolver {
                         selector_index,
                         active_before: selectors.indices_of(&assumptions),
                         core_selectors: selectors.indices_of(&core),
+                        core_labels: Vec::new(),
                         outcome: if outcome == SatResult::Sat {
                             SelectorTraceOutcome::Restored
                         } else {
@@ -1637,10 +1645,12 @@ pub(crate) struct BoOwnDatabase<'opt> {
     /// is asserted as `selector ⇒ owning`; assuming all selectors reproduces the
     /// hard source, while the relax loop can drop a selector to leak that source.
     source_selectors: Vec<Bool>,
+    source_keys: Vec<super::export::T2AssertKey>,
     /// §NB-F: one selector per `sink` (free/realloc arg) ownership assertion —
     /// the sink twin of `source_selectors`. Dropping one LEAKS THE FREE (the
     /// freed value's owning is no longer forced; nothing asserts ¬own/¬ref).
     sink_selectors: Vec<Bool>,
+    sink_keys: Vec<super::export::T2AssertKey>,
 }
 
 impl BoOwnDatabase<'_> {
@@ -1662,7 +1672,9 @@ impl<'opt> BoOwnDatabase<'opt> {
             z3_ast,
             source_sink_emissions: 0,
             source_selectors: Vec::new(),
+            source_keys: Vec::new(),
             sink_selectors: Vec::new(),
+            sink_keys: Vec::new(),
         }
     }
 
@@ -1768,9 +1780,17 @@ impl<'opt> BoOwnDatabase<'opt> {
         &self.source_selectors
     }
 
+    pub(crate) fn source_keys(&self) -> &[super::export::T2AssertKey] {
+        &self.source_keys
+    }
+
     /// §NB-F: selector literals for the emitted `sink` ownerships.
     pub(crate) fn sink_selectors(&self) -> &[Bool] {
         &self.sink_selectors
+    }
+
+    pub(crate) fn sink_keys(&self) -> &[super::export::T2AssertKey] {
+        &self.sink_keys
     }
 }
 
@@ -1781,14 +1801,36 @@ impl<'opt> BoOwnDatabase<'opt> {
 pub(crate) struct Selectors {
     all: Vec<Bool>,
     n_sources: usize,
+    keys: Vec<super::export::T2AssertKey>,
 }
 
 impl Selectors {
     pub(crate) fn new(sources: Vec<Bool>, sinks: Vec<Bool>) -> Self {
+        assert!(
+            sources.is_empty() && sinks.is_empty(),
+            "nonempty selector construction must carry typed T2 keys"
+        );
+        Self::new_with_keys(sources, Vec::new(), sinks, Vec::new())
+    }
+
+    pub(crate) fn new_with_keys(
+        sources: Vec<Bool>,
+        source_keys: Vec<super::export::T2AssertKey>,
+        sinks: Vec<Bool>,
+        sink_keys: Vec<super::export::T2AssertKey>,
+    ) -> Self {
+        assert_eq!(sources.len(), source_keys.len());
+        assert_eq!(sinks.len(), sink_keys.len());
         let n_sources = sources.len();
         let mut all = sources;
         all.extend(sinks);
-        Selectors { all, n_sources }
+        let mut keys = source_keys;
+        keys.extend(sink_keys);
+        Selectors {
+            all,
+            n_sources,
+            keys,
+        }
     }
 
     pub(crate) fn all(&self) -> &[Bool] {
@@ -1801,6 +1843,10 @@ impl Selectors {
 
     pub(crate) fn sinks(&self) -> &[Bool] {
         &self.all[self.n_sources..]
+    }
+
+    pub(crate) fn keys(&self) -> &[super::export::T2AssertKey] {
+        &self.keys
     }
 
     /// Whether a (core/dropped) literal is a sink selector — z3 node identity,
@@ -1913,6 +1959,10 @@ impl Database for BoOwnDatabase<'_> {
         let clause = Bool::or(&[&not_sel, &self.z3_ast[var]]);
         self.optimize.assert(&clause);
         self.source_selectors.push(selector);
+        self.source_keys.push(super::export::current_t2_assert_key(
+            super::export::BoundaryRole::Source,
+            var,
+        ));
         // E-R3 capture: index-aligned with `source_selectors` by construction —
         // this is the only writer and it pushes exactly once. Recording-only.
         super::export::record_selector(super::export::BoundaryRole::Source, var);
@@ -1930,6 +1980,10 @@ impl Database for BoOwnDatabase<'_> {
         let clause = Bool::or(&[&not_sel, &self.z3_ast[var]]);
         self.optimize.assert(&clause);
         self.sink_selectors.push(selector);
+        self.sink_keys.push(super::export::current_t2_assert_key(
+            super::export::BoundaryRole::Sink,
+            var,
+        ));
         // E-R3 capture: sink twin of the source push above; same alignment
         // guarantee, same recording-only contract.
         super::export::record_selector(super::export::BoundaryRole::Sink, var);

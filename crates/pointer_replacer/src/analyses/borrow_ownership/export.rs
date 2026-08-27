@@ -390,10 +390,45 @@ pub(crate) struct VersionSite {
 // §4 E-R3 — selector provenance
 // ---------------------------------------------------------------------------
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub(crate) enum BoundaryRole {
     Source,
     Sink,
+}
+
+/// Stable runtime identity of one T2 endpoint assertion. Artifact writers
+/// render `fn_did` through `TyCtxt::def_path_str`; the in-process key keeps the
+/// typed MIR/function identities used by construction.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct T2AssertKey {
+    pub(crate) fn_did: LocalDefId,
+    pub(crate) location: MirLocationKey,
+    pub(crate) callee: String,
+    pub(crate) role: BoundaryRole,
+    pub(crate) var: Var,
+}
+
+impl T2AssertKey {
+    pub(crate) fn sort_key(&self) -> (u32, MirLocationKey, &str, BoundaryRole, u32) {
+        (
+            self.fn_did.local_def_index.as_u32(),
+            self.location,
+            self.callee.as_str(),
+            self.role,
+            self.var.as_u32(),
+        )
+    }
+
+    pub(crate) fn label(&self, function_path: &str) -> String {
+        let role = match self.role {
+            BoundaryRole::Source => "source",
+            BoundaryRole::Sink => "sink",
+        };
+        format!(
+            "t2-assert[{role}]({function_path}:{}:{}:{},{:?})",
+            self.location.block, self.location.statement_index, self.callee, self.var,
+        )
+    }
 }
 
 /// The allocation or free call site behind one retractable selector.
@@ -680,9 +715,6 @@ pub(crate) fn with_terminator_site<T>(
     location: Location,
     f: impl FnOnce() -> T,
 ) -> T {
-    if !capturing() {
-        return f();
-    }
     struct Restore(Option<(LocalDefId, MirLocationKey)>);
     impl Drop for Restore {
         fn drop(&mut self) {
@@ -696,9 +728,6 @@ pub(crate) fn with_terminator_site<T>(
 
 /// Set the callee-name half for the duration of `f`.
 pub(crate) fn with_callee<T>(callee: &str, f: impl FnOnce() -> T) -> T {
-    if !capturing() {
-        return f();
-    }
     struct Restore(Option<String>);
     impl Drop for Restore {
         fn drop(&mut self) {
@@ -719,6 +748,22 @@ pub(crate) fn current_call_site() -> Option<CallSite> {
         location,
         callee,
     })
+}
+
+/// Join the always-scoped call cursor into the key used by T2 construction.
+/// Unlike `record_selector`, this is normative construction input and
+/// therefore remains available when export capture is off.
+pub(crate) fn current_t2_assert_key(role: BoundaryRole, var: Var) -> T2AssertKey {
+    let call = current_call_site().unwrap_or_else(|| {
+        panic!("T2 endpoint assertion emitted outside a modeled call-site cursor")
+    });
+    T2AssertKey {
+        fn_did: call.fn_did,
+        location: call.location,
+        callee: call.callee,
+        role,
+        var,
+    }
 }
 
 /// Record one retractable selector at its push site (E-R3).
