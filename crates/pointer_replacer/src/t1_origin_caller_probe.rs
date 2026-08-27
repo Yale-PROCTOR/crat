@@ -371,6 +371,8 @@ struct ProbeOutput {
     rows: Vec<ProbeRow>,
     call_world_calls: usize,
     call_world_unresolved: usize,
+    endpoint_slots: usize,
+    endpoint_sites: usize,
 }
 
 fn slot_from_key(
@@ -424,6 +426,8 @@ fn probe_targets(
     targets: &[LicP1Target],
 ) -> Result<ProbeOutput, String> {
     let endpoints = capture_sink_endpoints(program, slots, origins, facts)?;
+    let endpoint_slots = endpoints.len();
+    let endpoint_sites = endpoints.values().map(Vec::len).sum();
     let world = resolve_closed_world_call_world(
         program,
         Some(WholeProgramAttestation::FrozenBenchmarkGraph),
@@ -484,6 +488,8 @@ fn probe_targets(
         rows,
         call_world_calls: world.calls,
         call_world_unresolved: world.unresolved_calls,
+        endpoint_slots,
+        endpoint_sites,
     })
 }
 
@@ -563,6 +569,8 @@ pub(crate) fn run_worker(tcx: TyCtxt<'_>, t_tcx: Duration) -> super::report::Row
             rows: Vec::new(),
             call_world_calls: 0,
             call_world_unresolved: 0,
+            endpoint_slots: 0,
+            endpoint_sites: 0,
         }
     } else {
         let program = super::collect_program(tcx);
@@ -608,6 +616,8 @@ pub(crate) fn run_worker(tcx: TyCtxt<'_>, t_tcx: Duration) -> super::report::Row
     receipt.set("ambiguous_endpoints", ambiguous_endpoints);
     receipt.set("call_world_calls", output.call_world_calls);
     receipt.set("call_world_unresolved", output.call_world_unresolved);
+    receipt.set("endpoint_slots", output.endpoint_slots);
+    receipt.set("endpoint_sites", output.endpoint_sites);
     receipt.set("solver_checks", 0);
     receipt.set("t_tcx_s", format!("{:.3}", t_tcx.as_secs_f64()));
     receipt.set(
