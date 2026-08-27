@@ -7139,12 +7139,12 @@ mod run {
         // tracked solver the hard constraints would be disabled and the reply
         // would be a bogus "sat-in-replay".
         assert!(
-            solver.tracker().is_none(),
-            "tracked KindSolver must not enter decline_reason (constraints are track-gated)"
+            !solver.is_diagnostic_tracked(),
+            "diagnostic-tracked KindSolver must not enter decline_reason"
         );
         let mut assumptions: Vec<Bool> = selectors.all().to_vec();
         loop {
-            match solver.optimize().check(&assumptions) {
+            match solver.check_with_assumptions(&assumptions) {
                 // Should not happen (relaxing declined); a nondeterministic
                 // Unknown->Sat flip lands here rather than lying.
                 SatResult::Sat => return "sat-in-replay",

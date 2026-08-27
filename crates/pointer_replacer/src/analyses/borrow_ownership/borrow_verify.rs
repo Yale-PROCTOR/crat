@@ -823,8 +823,8 @@ pub(super) fn verify_to_fixpoint_counting_with_flows_impl(
     // track-gated; every solve in this loop would be vacuously SAT and the
     // accepted model meaningless. Tracked instances belong to the explain path.
     assert!(
-        solver.tracker().is_none(),
-        "tracked KindSolver must not enter verify_to_fixpoint (constraints are track-gated)"
+        !solver.is_diagnostic_tracked(),
+        "diagnostic-tracked KindSolver must not enter verify_to_fixpoint"
     );
     let l2_enabled = l2::enabled_from_env();
     let repair = RepairMode::current();
@@ -1203,8 +1203,8 @@ pub(super) fn verify_l2_to_fixpoint_counting_impl(
     // env entry. `debug_assert!` rather than `assert!` so the release-path cost
     // and behaviour of the existing single choke point are unchanged.
     debug_assert!(
-        solver.tracker().is_none(),
-        "tracked KindSolver must not enter the l2 door (constraints are track-gated)"
+        !solver.is_diagnostic_tracked(),
+        "diagnostic-tracked KindSolver must not enter the l2 door"
     );
     let diagnostics_enabled = l2::diagnostics_enabled_from_env();
     let mut transition_diagnostics =
