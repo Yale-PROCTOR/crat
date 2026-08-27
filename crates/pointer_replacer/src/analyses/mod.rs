@@ -6,7 +6,10 @@ mod encoding;
 pub mod fn_ptr_groups;
 pub mod fn_ptr_rewrite_decision;
 mod lattice;
-mod liveness;
+// §ESC-GAP census: widened to `pub(crate)` so the crate-root measurement harness can sample
+// the SAME `MaybeLiveLocals` the landed `borrow::provenance_liveness` samples, rather than a
+// second copy that could drift. Visibility only â no item changed.
+pub(crate) mod liveness;
 #[cfg(test)]
 pub(crate) use liveness::DefUse;
 mod mir;

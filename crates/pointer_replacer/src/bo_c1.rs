@@ -51,6 +51,8 @@ mod a4_source_census;
 mod a5_measurement;
 #[path = "copy_lend_funnel.rs"]
 mod copy_lend_funnel;
+#[path = "esc_gap_census.rs"]
+mod esc_gap_census;
 #[path = "kind_equate_core_census.rs"]
 mod kind_equate_core_census;
 #[path = "p_b_measurement.rs"]
@@ -4320,7 +4322,7 @@ mod run {
     use z3::{SatResult, ast::Bool};
 
     use super::{
-        collect_program, crown_projection,
+        collect_program, crown_projection, esc_gap_census,
         ownership_diagnostic_package::{
             self, FunctionPrecisionRecord, NecessityEvidence, PairRemovalOutcome,
             ProductionPrecisionEvidence, RemovalFilter,
@@ -6988,6 +6990,23 @@ mod run {
                 }
                 row.set("s23_owning_model", s23_owning_model);
                 row.set("s23_fields_raw", s23_fields_raw);
+                // §ESC-GAP ② pricing census (measurement-only, default off). Consumes the
+                // ACCEPTED model as given — no re-solve, no analysis query, no behaviour change.
+                if let Some(dir) = std::env::var_os("CRAT_ESC_GAP_CENSUS_DIR") {
+                    let name =
+                        std::env::var("CRAT_BOC1_NAME").unwrap_or_else(|_| "unnamed".to_string());
+                    let written = esc_gap_census::write_program_census(
+                        Path::new(&dir),
+                        &name,
+                        tcx,
+                        &program,
+                        &slots,
+                        m,
+                        &mut_facts,
+                    )
+                    .unwrap_or_else(|error| panic!("{error}"));
+                    row.set("esc_gap_census_rows", written);
+                }
                 if let Some(path) = std::env::var_os("CRAT_BOC1_MODEL_KIND_SNAPSHOT") {
                     let records = bo_model_kind_records(tcx, &slots, m);
                     ownership_yield::write_model_kind_snapshot(Path::new(&path), &records)

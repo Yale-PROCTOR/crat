@@ -19,7 +19,10 @@ use crate::{
     utils::rustc::RustProgram,
 };
 
-mod eliminable_temporaries;
+// §ESC-GAP census: widened to `pub(crate)` so the crate-root measurement harness can reuse this
+// module's existing notion of a trivially-eliminable MIR temporary instead of re-deriving one.
+// Visibility only â no item changed.
+pub(crate) mod eliminable_temporaries;
 
 pub type OutputParams = FxHashMap<LocalDefId, MixedBitSet<Local>>;
 
