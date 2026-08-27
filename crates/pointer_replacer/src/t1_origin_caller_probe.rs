@@ -8,7 +8,6 @@ use std::{
 };
 
 use rustc_hash::{FxHashMap, FxHashSet};
-use rustc_index::Idx;
 use rustc_middle::{
     mir::{Body, Local, Operand, Rvalue, StatementKind, TerminatorKind},
     ty::TyCtxt,
