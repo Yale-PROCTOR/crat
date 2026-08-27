@@ -1,7 +1,7 @@
 //! T1 closed-world origin/caller market probe (measurement-only).
 
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     fs,
     path::Path,
     time::{Duration, Instant},
@@ -630,6 +630,555 @@ fn endpoint_diagnostics_tsv_empty() -> String {
         .to_owned()
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CallFamily {
+    Allocator,
+    LocalFunction,
+    Extern,
+    LibcOther,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TerminalShape {
+    NoEndpointPlaceholder,
+    CallAllocator,
+    CallLocalFunction,
+    CallExtern,
+    CallLibcOther,
+    Parameter,
+    MultiDef,
+    SingleLoad,
+    Other,
+}
+
+impl TerminalShape {
+    fn label(self) -> &'static str {
+        match self {
+            Self::NoEndpointPlaceholder => "no-endpoint-placeholder",
+            Self::CallAllocator => "call-destination-allocator",
+            Self::CallLocalFunction => "call-destination-local-function",
+            Self::CallExtern => "call-destination-extern",
+            Self::CallLibcOther => "call-destination-libc-other",
+            Self::Parameter => "function-parameter",
+            Self::MultiDef => "multi-def-local",
+            Self::SingleLoad => "single-load",
+            Self::Other => "other",
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct TerminalFacts {
+    call: Option<CallFamily>,
+    parameter: bool,
+    definitions: usize,
+    single_load: bool,
+}
+
+fn classify_terminal_facts(facts: TerminalFacts) -> TerminalShape {
+    if facts.definitions > 1 {
+        return TerminalShape::MultiDef;
+    }
+    if let Some(call) = facts.call {
+        return match call {
+            CallFamily::Allocator => TerminalShape::CallAllocator,
+            CallFamily::LocalFunction => TerminalShape::CallLocalFunction,
+            CallFamily::Extern => TerminalShape::CallExtern,
+            CallFamily::LibcOther => TerminalShape::CallLibcOther,
+        };
+    }
+    if facts.parameter && facts.definitions == 0 {
+        TerminalShape::Parameter
+    } else if facts.definitions == 1 && facts.single_load {
+        TerminalShape::SingleLoad
+    } else {
+        TerminalShape::Other
+    }
+}
+
+#[derive(Clone, Debug)]
+struct EndpointTrace {
+    key: LicP1Key,
+    placeholder: bool,
+    callee: String,
+    location: String,
+    terminal_local: Option<Local>,
+    terminal_slot: Option<SlotKey>,
+    load_slot: Option<SlotKey>,
+}
+
+fn parse_endpoint_traces(text: &str, program: &str) -> Result<Vec<EndpointTrace>, String> {
+    let mut lines = text.lines();
+    let header = lines.next().ok_or("missing endpoint trace header")?;
+    let columns = header
+        .split('\t')
+        .enumerate()
+        .map(|(index, name)| (name, index))
+        .collect::<BTreeMap<_, _>>();
+    let get = |fields: &[&str], name: &str| -> Result<String, String> {
+        let index = columns
+            .get(name)
+            .ok_or_else(|| format!("missing endpoint column {name}"))?;
+        fields
+            .get(*index)
+            .map(|value| (*value).to_owned())
+            .ok_or_else(|| format!("short endpoint row at {name}"))
+    };
+    let mut answer = Vec::new();
+    for line in lines.filter(|line| !line.is_empty()) {
+        let fields = line.split('\t').collect::<Vec<_>>();
+        if get(&fields, "program")? != program {
+            continue;
+        }
+        let endpoint_count = get(&fields, "function_endpoint_count")?
+            .parse::<usize>()
+            .map_err(|_| "invalid endpoint count".to_owned())?;
+        let chain = get(&fields, "local_chain")?;
+        let terminal_local = chain
+            .rsplit("->")
+            .next()
+            .filter(|local| local.starts_with('_'))
+            .and_then(|local| local[1..].parse::<u32>().ok())
+            .map(Local::from_u32);
+        let parse_optional_slot = |name: &str| -> Result<Option<SlotKey>, String> {
+            let value = get(&fields, name)?;
+            (value != "-").then(|| parse_slot_key(&value)).transpose()
+        };
+        answer.push(EndpointTrace {
+            key: LicP1Key {
+                program: program.to_owned(),
+                function: get(&fields, "function")?,
+                lhs: parse_slot_key(&get(&fields, "lhs")?)?,
+                rhs: parse_slot_key(&get(&fields, "rhs")?)?,
+            },
+            placeholder: endpoint_count == 0,
+            callee: get(&fields, "callee")?,
+            location: get(&fields, "location")?,
+            terminal_local,
+            terminal_slot: parse_optional_slot("terminal_slot")?,
+            load_slot: parse_optional_slot("load_slot")?,
+        });
+    }
+    Ok(answer)
+}
+
+#[derive(Clone, Debug)]
+struct CharacterizedTerminal {
+    trace: EndpointTrace,
+    shape: TerminalShape,
+    detail: String,
+}
+
+fn call_family(tcx: TyCtxt<'_>, body: &Body<'_>, local: Local) -> Vec<(CallFamily, String)> {
+    let mut answer = Vec::new();
+    for data in body.basic_blocks.iter() {
+        let TerminatorKind::Call {
+            func, destination, ..
+        } = &data.terminator().kind
+        else {
+            continue;
+        };
+        if destination.as_local() != Some(local) {
+            continue;
+        }
+        let Some((callee, _)) = func.const_fn_def() else {
+            answer.push((CallFamily::Extern, "indirect-call".to_owned()));
+            continue;
+        };
+        let name = tcx.item_name(callee).to_string();
+        let Some(local_callee) = callee.as_local() else {
+            answer.push((CallFamily::Extern, name));
+            continue;
+        };
+        match tcx.hir_node_by_def_id(local_callee) {
+            rustc_hir::Node::ForeignItem(item) => {
+                let name = item.ident.as_str();
+                let family = if boundary_table::sources_foreign().any(|source| source == name) {
+                    CallFamily::Allocator
+                } else if boundary_table::lookup(
+                    name,
+                    crate::analyses::borrow_ownership::boundary_table::Matcher::ForeignC,
+                )
+                .is_some()
+                {
+                    CallFamily::LibcOther
+                } else {
+                    CallFamily::Extern
+                };
+                answer.push((family, name.to_owned()));
+            }
+            rustc_hir::Node::Item(_) | rustc_hir::Node::ImplItem(_) => {
+                answer.push((CallFamily::LocalFunction, name));
+            }
+            _ => answer.push((CallFamily::Extern, name)),
+        }
+    }
+    answer
+}
+
+fn characterize_terminal(
+    tcx: TyCtxt<'_>,
+    slots: &CrateSlots,
+    function: rustc_span::def_id::LocalDefId,
+    body: &Body<'_>,
+    trace: EndpointTrace,
+) -> CharacterizedTerminal {
+    if trace.placeholder {
+        return CharacterizedTerminal {
+            trace,
+            shape: TerminalShape::NoEndpointPlaceholder,
+            detail: "no E-R3 endpoint in containing function".to_owned(),
+        };
+    }
+    let Some(local) = trace.terminal_local else {
+        return CharacterizedTerminal {
+            trace,
+            shape: TerminalShape::Other,
+            detail: "terminal local absent from stored chain".to_owned(),
+        };
+    };
+    let statement_definitions = body
+        .basic_blocks
+        .iter()
+        .flat_map(|data| data.statements.iter())
+        .filter(|statement| {
+            matches!(&statement.kind, StatementKind::Assign(assign) if assign.0.as_local() == Some(local))
+        })
+        .count();
+    let calls = call_family(tcx, body, local);
+    let definitions = statement_definitions + calls.len();
+    let load = single_load_slot(slots, function, body, local);
+    let shape = classify_terminal_facts(TerminalFacts {
+        call: if definitions == 1 {
+            calls.first().map(|call| call.0)
+        } else {
+            None
+        },
+        parameter: local.index() >= 1 && local.index() <= body.arg_count,
+        definitions,
+        single_load: load.is_some(),
+    });
+    let detail = match shape {
+        TerminalShape::CallAllocator
+        | TerminalShape::CallLocalFunction
+        | TerminalShape::CallExtern
+        | TerminalShape::CallLibcOther => calls[0].1.clone(),
+        TerminalShape::Parameter => format!("argument{}", local.index()),
+        TerminalShape::MultiDef => format!("definitions={definitions}"),
+        TerminalShape::SingleLoad => load.map(slot_text).unwrap_or_else(|| "-".to_owned()),
+        TerminalShape::Other => format!("definitions={definitions}"),
+        TerminalShape::NoEndpointPlaceholder => unreachable!(),
+    };
+    CharacterizedTerminal {
+        trace,
+        shape,
+        detail,
+    }
+}
+
+fn terminal_rows_tsv(rows: &[CharacterizedTerminal]) -> String {
+    let mut output = String::from(
+        "program\tfunction\tlhs\trhs\tcallee\tlocation\tterminal_local\tterminal_slot\t\
+         load_slot\tterminal_class\tdetail\n",
+    );
+    for row in rows {
+        output.push_str(&format!(
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+            row.trace.key.program,
+            row.trace.key.function,
+            LicP1Key::slot_text(row.trace.key.lhs),
+            LicP1Key::slot_text(row.trace.key.rhs),
+            row.trace.callee,
+            row.trace.location,
+            row.trace
+                .terminal_local
+                .map(|local| format!("{local:?}"))
+                .unwrap_or_else(|| "-".to_owned()),
+            row.trace
+                .terminal_slot
+                .map(LicP1Key::slot_text)
+                .unwrap_or_else(|| "-".to_owned()),
+            row.trace
+                .load_slot
+                .map(LicP1Key::slot_text)
+                .unwrap_or_else(|| "-".to_owned()),
+            row.shape.label(),
+            clean(&row.detail),
+        ));
+    }
+    output
+}
+
+fn slot_owner_from_key(
+    program: &RustProgram<'_>,
+    slots: &CrateSlots,
+    function_path: &str,
+    key: SlotKey,
+) -> Result<(SlotOwner, u8), String> {
+    if key.variant == 0 {
+        if key.slot >= slots.field_slots.len() {
+            return Err(format!("field slot index drift: {}", key.slot));
+        }
+        let slot = slots
+            .field_slots
+            .slot(crate::analyses::borrow_ownership::slots::SlotId::from_usize(key.slot));
+        return Ok((slot.owner, slot.depth));
+    }
+    match slot_from_key(program, slots, function_path, key)? {
+        SlotRef::Local(function, slot) => {
+            let slot = slots.fn_local_slots[&function].slot(slot);
+            Ok((slot.owner, slot.depth))
+        }
+        SlotRef::Field(slot) => {
+            let slot = slots.field_slots.slot(slot);
+            Ok((slot.owner, slot.depth))
+        }
+    }
+}
+
+fn owner_text(tcx: TyCtxt<'_>, owner: SlotOwner) -> String {
+    match owner {
+        SlotOwner::Local(local) => format!("local:{local:?}"),
+        SlotOwner::Field(field) => format!(
+            "field:{}:{}",
+            tcx.def_path_str(field.struct_did.to_def_id()),
+            field.field_index
+        ),
+    }
+}
+
+fn owner_sort_key(tcx: TyCtxt<'_>, owner: SlotOwner) -> String {
+    owner_text(tcx, owner)
+}
+
+fn shortest_owner_path(
+    tcx: TyCtxt<'_>,
+    edges: &[(SlotOwner, SlotOwner)],
+    start: SlotOwner,
+    end: SlotOwner,
+) -> Option<Vec<SlotOwner>> {
+    let mut outgoing: FxHashMap<SlotOwner, Vec<SlotOwner>> = FxHashMap::default();
+    for &(source, target) in edges {
+        outgoing.entry(source).or_default().push(target);
+    }
+    for targets in outgoing.values_mut() {
+        targets.sort_by_key(|owner| owner_sort_key(tcx, *owner));
+        targets.dedup();
+    }
+    let mut queue = VecDeque::from([start]);
+    let mut previous = FxHashMap::default();
+    let mut seen = FxHashSet::from_iter([start]);
+    while let Some(node) = queue.pop_front() {
+        if node == end {
+            let mut path = vec![node];
+            let mut cursor = node;
+            while let Some(&parent) = previous.get(&cursor) {
+                path.push(parent);
+                cursor = parent;
+            }
+            path.reverse();
+            return Some(path);
+        }
+        for &next in outgoing.get(&node).into_iter().flatten() {
+            if seen.insert(next) {
+                previous.insert(next, node);
+                queue.push_back(next);
+            }
+        }
+    }
+    None
+}
+
+fn render_owner_path(tcx: TyCtxt<'_>, path: Option<Vec<SlotOwner>>) -> String {
+    let Some(path) = path else {
+        return "-".to_owned();
+    };
+    let mut output = owner_text(tcx, path[0]);
+    for edge in path.windows(2) {
+        let hop = match (edge[0], edge[1]) {
+            (SlotOwner::Local(_), SlotOwner::Field(_)) => "store-into-field",
+            (SlotOwner::Field(_), SlotOwner::Local(_)) => "load-from-field",
+            _ => "value-flow",
+        };
+        output.push_str(&format!(" -[{hop}]-> {}", owner_text(tcx, edge[1])));
+    }
+    output
+}
+
+fn field_path_rows_tsv(
+    program: &RustProgram<'_>,
+    slots: &CrateSlots,
+    origins: &OriginSummaries,
+    rows: &[CharacterizedTerminal],
+) -> Result<String, String> {
+    let mut output = String::from(
+        "program\tfunction\tlhs\trhs\tfield_slot\trhs_depth\tfield_depth\tfact_scope\t\
+         rhs_to_field\tfield_to_rhs\tany_path\n",
+    );
+    for row in rows
+        .iter()
+        .filter(|row| row.shape == TerminalShape::SingleLoad)
+    {
+        let load = row
+            .trace
+            .load_slot
+            .ok_or("single-load row lacks load slot")?;
+        let (rhs, rhs_depth) =
+            slot_owner_from_key(program, slots, &row.trace.key.function, row.trace.key.rhs)?;
+        let (field, field_depth) =
+            slot_owner_from_key(program, slots, &row.trace.key.function, load)?;
+        let SlotRef::Local(function, _) =
+            slot_from_key(program, slots, &row.trace.key.function, row.trace.key.rhs)?
+        else {
+            return Err("field-path RHS is not local".to_owned());
+        };
+        let edges = origins.native_flows()[&function].body.depth0_value_flows();
+        let in_scope = rhs_depth == 0 && field_depth == 0;
+        let forward = in_scope
+            .then(|| shortest_owner_path(program.tcx, &edges, rhs, field))
+            .flatten();
+        let reverse = in_scope
+            .then(|| shortest_owner_path(program.tcx, &edges, field, rhs))
+            .flatten();
+        let any = usize::from(forward.is_some() || reverse.is_some());
+        output.push_str(&format!(
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+            row.trace.key.program,
+            row.trace.key.function,
+            LicP1Key::slot_text(row.trace.key.lhs),
+            LicP1Key::slot_text(row.trace.key.rhs),
+            LicP1Key::slot_text(load),
+            rhs_depth,
+            field_depth,
+            if in_scope {
+                "closed-depth0-value-flow"
+            } else {
+                "outside-depth0-facts"
+            },
+            clean(&render_owner_path(program.tcx, forward)),
+            clean(&render_owner_path(program.tcx, reverse)),
+            any,
+        ));
+    }
+    Ok(output)
+}
+
+pub(crate) fn run_characterization_worker(tcx: TyCtxt<'_>, t_tcx: Duration) -> super::report::Row {
+    let started = Instant::now();
+    let program_name = std::env::var("CRAT_BOC1_NAME").expect("T1 program name");
+    let input_path = std::env::var("CRAT_T1_ENDPOINT_INPUT").expect("T1 endpoint trace input path");
+    let terminal_path = std::env::var("CRAT_T1_TERMINAL_OUTPUT").expect("T1 terminal output path");
+    let field_path = std::env::var("CRAT_T1_FIELD_PATH_OUTPUT").expect("T1 field-path output path");
+    let input = fs::read_to_string(Path::new(&input_path)).expect("read T1 endpoint traces");
+    let traces = parse_endpoint_traces(&input, &program_name).expect("parse T1 endpoint traces");
+
+    let rows = if traces.is_empty() {
+        Vec::new()
+    } else {
+        let program = super::collect_program(tcx);
+        let slots = CrateSlots::build(&program);
+        traces
+            .into_iter()
+            .map(|trace| {
+                if trace.placeholder {
+                    return CharacterizedTerminal {
+                        trace,
+                        shape: TerminalShape::NoEndpointPlaceholder,
+                        detail: "no E-R3 endpoint in containing function".to_owned(),
+                    };
+                }
+                let SlotRef::Local(function, _) =
+                    slot_from_key(&program, &slots, &trace.key.function, trace.key.rhs)
+                        .expect("resolve characterization function")
+                else {
+                    panic!("T1 characterization RHS must be local")
+                };
+                let body = tcx
+                    .mir_drops_elaborated_and_const_checked(function)
+                    .borrow();
+                characterize_terminal(tcx, &slots, function, &body, trace)
+            })
+            .collect::<Vec<_>>()
+    };
+    fs::write(Path::new(&terminal_path), terminal_rows_tsv(&rows))
+        .expect("write T1 terminal characterization");
+
+    let field_rows = if rows
+        .iter()
+        .any(|row| row.shape == TerminalShape::SingleLoad)
+    {
+        let program = super::collect_program(tcx);
+        let slots = CrateSlots::build(&program);
+        let origins = crate::analyses::borrow_ownership::origins::compute_origins(&program);
+        field_path_rows_tsv(&program, &slots, &origins, &rows)
+            .expect("project T1 field value-flow paths")
+    } else {
+        "program\tfunction\tlhs\trhs\tfield_slot\trhs_depth\tfield_depth\tfact_scope\t\
+         rhs_to_field\tfield_to_rhs\tany_path\n"
+            .to_owned()
+    };
+    fs::write(Path::new(&field_path), &field_rows).expect("write T1 field-path characterization");
+
+    let mut counts = BTreeMap::new();
+    for row in &rows {
+        *counts.entry(row.shape.label()).or_insert(0usize) += 1;
+    }
+    let field_load_rows = rows
+        .iter()
+        .filter(|row| row.shape == TerminalShape::SingleLoad)
+        .count();
+    let field_path_yes = field_rows
+        .lines()
+        .skip(1)
+        .filter(|line| line.rsplit('\t').next() == Some("1"))
+        .count();
+    let mut receipt = super::report::Row::default();
+    receipt.set("status", "ok");
+    receipt.set("data", "provisional");
+    receipt.set("corpus", "rs-crown");
+    receipt.set("frame", "c080e9e7");
+    receipt.set("program", program_name);
+    receipt.set("trace_rows", rows.len());
+    receipt.set(
+        "real_endpoints",
+        rows.iter()
+            .filter(|row| row.shape != TerminalShape::NoEndpointPlaceholder)
+            .count(),
+    );
+    receipt.set(
+        "no_endpoint_placeholders",
+        counts
+            .get(TerminalShape::NoEndpointPlaceholder.label())
+            .copied()
+            .unwrap_or(0),
+    );
+    for shape in [
+        TerminalShape::CallAllocator,
+        TerminalShape::CallLocalFunction,
+        TerminalShape::CallExtern,
+        TerminalShape::CallLibcOther,
+        TerminalShape::Parameter,
+        TerminalShape::MultiDef,
+        TerminalShape::SingleLoad,
+        TerminalShape::Other,
+    ] {
+        receipt.set(
+            &format!("terminal_{}", shape.label().replace('-', "_")),
+            counts.get(shape.label()).copied().unwrap_or(0),
+        );
+    }
+    receipt.set("field_load_rows", field_load_rows);
+    receipt.set("field_path_yes", field_path_yes);
+    receipt.set("field_path_no", field_load_rows - field_path_yes);
+    receipt.set("solver_checks", 0);
+    receipt.set("t_tcx_s", format!("{:.3}", t_tcx.as_secs_f64()));
+    receipt.set(
+        "t_total_s",
+        format!("{:.3}", started.elapsed().as_secs_f64()),
+    );
+    receipt
+}
+
 fn clean(value: &str) -> String {
     value.replace(['\t', '\n', '\r'], " ")
 }
@@ -1206,7 +1755,15 @@ mod tests {
             let diagnostic = endpoint_diagnostics_tsv(&program, &slots, &[target], &endpoints)
                 .expect("diagnostic");
             assert!(diagnostic.contains("\tfree\tbb"), "{diagnostic}");
-            assert!(diagnostic.trim_end().ends_with("\t1"), "{diagnostic}");
+            let fields = diagnostic
+                .lines()
+                .nth(1)
+                .expect("diagnostic data row")
+                .split('\t')
+                .collect::<Vec<_>>();
+            assert_eq!(fields[10], "1", "direct terminal reaches RHS: {diagnostic}");
+            assert_eq!(fields[11], "-", "direct terminal has no load: {diagnostic}");
+            assert_eq!(fields[12], "0", "no load cannot hit RHS: {diagnostic}");
         })
         .unwrap();
     }
@@ -1316,5 +1873,58 @@ mod tests {
             assert!(tsv.contains("\tYES\tclosed_world_frozen_graph\trs-crown\tc080e9e7\n"));
         })
         .unwrap();
+    }
+
+    #[test]
+    fn terminal_shape_precedence_is_closed_and_typed() {
+        assert_eq!(
+            classify_terminal_facts(TerminalFacts {
+                call: Some(CallFamily::Allocator),
+                parameter: false,
+                definitions: 0,
+                single_load: false,
+            }),
+            TerminalShape::CallAllocator
+        );
+        assert_eq!(
+            classify_terminal_facts(TerminalFacts {
+                call: None,
+                parameter: true,
+                definitions: 0,
+                single_load: false,
+            }),
+            TerminalShape::Parameter
+        );
+        assert_eq!(
+            classify_terminal_facts(TerminalFacts {
+                call: None,
+                parameter: false,
+                definitions: 2,
+                single_load: true,
+            }),
+            TerminalShape::MultiDef
+        );
+        assert_eq!(
+            classify_terminal_facts(TerminalFacts {
+                call: None,
+                parameter: false,
+                definitions: 1,
+                single_load: true,
+            }),
+            TerminalShape::SingleLoad
+        );
+    }
+
+    #[test]
+    fn endpoint_trace_parser_keeps_placeholder_and_real_units_distinct() {
+        let input = "program\tfunction\tlhs\trhs\tfunction_endpoint_count\tcallee\tlocation\t\
+                     operand_local\tlocal_chain\tterminal_slot\treaches_rhs\tload_slot\tload_hits_rhs\n\
+                     p\tcrate::f\tlocal:1:2\tlocal:1:3\t0\t-\t-\t-\t-\t-\t0\t-\t0\n\
+                     p\tcrate::g\tlocal:2:2\tlocal:2:3\t1\tfree\tbb1:4\t_5\t_5->_1\tlocal:2:0\t0\tfield:7\t0\n";
+        let rows = parse_endpoint_traces(input, "p").expect("trace fixture");
+        assert_eq!(rows.len(), 2);
+        assert!(rows[0].placeholder);
+        assert!(!rows[1].placeholder);
+        assert_eq!(rows[1].terminal_local, Some(Local::from_u32(1)));
     }
 }

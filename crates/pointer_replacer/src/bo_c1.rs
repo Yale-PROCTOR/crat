@@ -14780,6 +14780,7 @@ fn boc1_run_one() {
             "s23-discover" => s23_measurement::run_discovery_worker(tcx, t_tcx),
             "s23-probe" => s23_measurement::run_probe_worker(tcx, t_tcx),
             "t1-origin-caller" => t1_origin_caller_probe::run_worker(tcx, t_tcx),
+            "t1-characterize" => t1_origin_caller_probe::run_characterization_worker(tcx, t_tcx),
             "selector-core" => run::run_selector_core(tcx, t_tcx),
             "selector-necessity" => run::run_selector_necessity(tcx, t_tcx),
             detail if detail.starts_with("selector-detail-") => {
