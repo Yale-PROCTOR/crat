@@ -25,6 +25,7 @@ use crate::{
         mutability_facts::MutFacts,
         origin_flow::OriginFlowResults,
         origin_summary::OriginSummaries,
+        resolve::{ResolvedSlot, resolve_place},
         slots::SlotOwner,
         solver::{KindSolver, SlotRef},
         sources::collect_malloc_source_slots,
@@ -283,6 +284,42 @@ struct SinkEndpoint {
     operand_local: Local,
     chain: Vec<Local>,
     local: Local,
+    load_slot: Option<SlotRef>,
+}
+
+fn single_load_slot(
+    slots: &CrateSlots,
+    function: rustc_span::def_id::LocalDefId,
+    body: &Body<'_>,
+    local: Local,
+) -> Option<SlotRef> {
+    let mut definitions = 0usize;
+    let mut loaded = None;
+    for data in body.basic_blocks.iter() {
+        for statement in &data.statements {
+            let StatementKind::Assign(assign) = &statement.kind else {
+                continue;
+            };
+            if assign.0.as_local() != Some(local) {
+                continue;
+            }
+            definitions += 1;
+            let place = match &assign.1 {
+                Rvalue::Use(Operand::Copy(place) | Operand::Move(place))
+                | Rvalue::CopyForDeref(place)
+                    if !place.projection.is_empty() =>
+                {
+                    *place
+                }
+                _ => continue,
+            };
+            loaded = match resolve_place(slots, function, body, place, 0, None)? {
+                ResolvedSlot::Local(slot) => Some(SlotRef::Local(function, slot)),
+                ResolvedSlot::Field(slot) => Some(SlotRef::Field(slot)),
+            };
+        }
+    }
+    (definitions == 1).then_some(loaded).flatten()
 }
 
 fn capture_sink_endpoints(
@@ -324,6 +361,7 @@ fn capture_sink_endpoints(
             let Some((local, _allocator_rooted)) = terminal else {
                 continue;
             };
+            let load_slot = single_load_slot(slots, call.fn_did, &body, local);
             let Some(slot) = slots
                 .fn_local_slots
                 .get(&call.fn_did)
@@ -341,6 +379,7 @@ fn capture_sink_endpoints(
                     operand_local,
                     chain,
                     local,
+                    load_slot,
                 });
         }
     }
@@ -535,7 +574,7 @@ fn endpoint_diagnostics_tsv(
         });
         if matches.is_empty() {
             rows.push(format!(
-                "{}\t{}\t{}\t{}\t0\t-\t-\t-\t-\t-\t0",
+                "{}\t{}\t{}\t{}\t0\t-\t-\t-\t-\t-\t0\t-\t0",
                 target.key.program,
                 target.key.function,
                 LicP1Key::slot_text(target.key.lhs),
@@ -545,8 +584,12 @@ fn endpoint_diagnostics_tsv(
         }
         let count = matches.len();
         for (terminal_slot, endpoint) in matches {
+            let load_slot = endpoint
+                .load_slot
+                .map(slot_text)
+                .unwrap_or_else(|| "-".to_owned());
             rows.push(format!(
-                "{}\t{}\t{}\t{}\t{}\t{}\tbb{}:{}\t_{}\t{}\t{}\t{}",
+                "{}\t{}\t{}\t{}\t{}\t{}\tbb{}:{}\t_{}\t{}\t{}\t{}\t{}\t{}",
                 target.key.program,
                 target.key.function,
                 LicP1Key::slot_text(target.key.lhs),
@@ -564,13 +607,15 @@ fn endpoint_diagnostics_tsv(
                     .join("->"),
                 slot_text(terminal_slot),
                 usize::from(terminal_slot == rhs),
+                load_slot,
+                usize::from(endpoint.load_slot == Some(rhs)),
             ));
         }
     }
     rows.sort();
     let mut output = String::from(
         "program\tfunction\tlhs\trhs\tfunction_endpoint_count\tcallee\tlocation\t\
-         operand_local\tlocal_chain\tterminal_slot\treaches_rhs\n",
+         operand_local\tlocal_chain\tterminal_slot\treaches_rhs\tload_slot\tload_hits_rhs\n",
     );
     for row in rows {
         output.push_str(&row);
@@ -581,7 +626,7 @@ fn endpoint_diagnostics_tsv(
 
 fn endpoint_diagnostics_tsv_empty() -> String {
     "program\tfunction\tlhs\trhs\tfunction_endpoint_count\tcallee\tlocation\t\
-     operand_local\tlocal_chain\tterminal_slot\treaches_rhs\n"
+     operand_local\tlocal_chain\tterminal_slot\treaches_rhs\tload_slot\tload_hits_rhs\n"
         .to_owned()
 }
 
@@ -1162,6 +1207,47 @@ mod tests {
                 .expect("diagnostic");
             assert!(diagnostic.contains("\tfree\tbb"), "{diagnostic}");
             assert!(diagnostic.trim_end().ends_with("\t1"), "{diagnostic}");
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn endpoint_single_load_diagnostic_resolves_owned_slot_key() {
+        let code = r#"
+            extern "C" { fn free(p: *mut core::ffi::c_void); }
+            unsafe fn release(pp: *mut *mut i32) { free((*pp) as *mut core::ffi::c_void); }
+        "#;
+        ::utils::compilation::run_compiler_on_str(code, |tcx| {
+            let program = super::super::collect_program(tcx);
+            let release = program.functions[0];
+            let body = tcx.mir_drops_elaborated_and_const_checked(release).borrow();
+            let pp = body
+                .var_debug_info
+                .iter()
+                .find_map(|info| {
+                    (info.name.as_str() == "pp").then(|| match info.value {
+                        rustc_middle::mir::VarDebugInfoContents::Place(place) => Some(place.local),
+                        _ => None,
+                    })?
+                })
+                .expect("pp local");
+            let slots = CrateSlots::build(&program);
+            let loaded = slots
+                .fn_local_slots
+                .get(&release)
+                .and_then(|universe| universe.slot_for_local_depth(pp, 1))
+                .map(|slot| SlotRef::Local(release, slot))
+                .expect("loaded pointee slot");
+            let origins = crate::analyses::borrow_ownership::origins::compute_origins(&program);
+            let facts = MutFacts::from_program(&program);
+            let endpoints = capture_sink_endpoints(&program, &slots, &origins, &facts)
+                .expect("endpoint capture");
+            let endpoint = endpoints
+                .values()
+                .flatten()
+                .find(|endpoint| endpoint.callee == "free")
+                .expect("free endpoint");
+            assert_eq!(endpoint.load_slot, Some(loaded), "{endpoint:#?}");
         })
         .unwrap();
     }
