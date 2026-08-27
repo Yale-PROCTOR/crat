@@ -227,26 +227,32 @@ impl LocalDefChain {
     }
 
     fn terminal(&self, mut local: Local) -> Option<(Local, bool)> {
+        self.trace(local).1
+    }
+
+    fn trace(&self, mut local: Local) -> (Vec<Local>, Option<(Local, bool)>) {
         let mut seen = FxHashSet::default();
+        let mut chain = vec![local];
         for _ in 0..LOCAL_CHAIN_LIMIT {
             if !seen.insert(local) {
-                return None;
+                return (chain, None);
             }
             if self.allocator_destinations.contains(&local) {
-                return Some((local, true));
+                return (chain, Some((local, true)));
             }
             let Some(definitions) = self.definitions.get(&local) else {
-                return Some((local, false));
+                return (chain, Some((local, false)));
             };
             if definitions.len() != 1 {
-                return None;
+                return (chain, None);
             }
             let Some(next) = definitions[0] else {
-                return Some((local, false));
+                return (chain, Some((local, false)));
             };
             local = next;
+            chain.push(local);
         }
-        None
+        (chain, None)
     }
 }
 
@@ -274,6 +280,8 @@ struct SinkEndpoint {
     function: rustc_span::def_id::LocalDefId,
     location: crate::analyses::borrow_ownership::l2::MirLocationKey,
     callee: String,
+    operand_local: Local,
+    chain: Vec<Local>,
     local: Local,
 }
 
@@ -311,9 +319,9 @@ fn capture_sink_endpoints(
                 .tcx
                 .mir_drops_elaborated_and_const_checked(call.fn_did)
                 .borrow();
-            let Some((local, _allocator_rooted)) =
-                LocalDefChain::new(program.tcx, &body).terminal(local)
-            else {
+            let operand_local = local;
+            let (chain, terminal) = LocalDefChain::new(program.tcx, &body).trace(local);
+            let Some((local, _allocator_rooted)) = terminal else {
                 continue;
             };
             let Some(slot) = slots
@@ -330,6 +338,8 @@ fn capture_sink_endpoints(
                     function: call.fn_did,
                     location: call.location,
                     callee: call.callee.clone(),
+                    operand_local,
+                    chain,
                     local,
                 });
         }
@@ -372,6 +382,7 @@ struct ProbeOutput {
     call_world_unresolved: usize,
     endpoint_slots: usize,
     endpoint_sites: usize,
+    endpoint_diagnostic: String,
 }
 
 fn slot_from_key(
@@ -425,6 +436,7 @@ fn probe_targets(
     targets: &[LicP1Target],
 ) -> Result<ProbeOutput, String> {
     let endpoints = capture_sink_endpoints(program, slots, origins, facts)?;
+    let endpoint_diagnostic = endpoint_diagnostics_tsv(program, slots, targets, &endpoints)?;
     let endpoint_slots = endpoints.len();
     let endpoint_sites = endpoints.values().map(Vec::len).sum();
     let world = resolve_closed_world_call_world(
@@ -489,7 +501,88 @@ fn probe_targets(
         call_world_unresolved: world.unresolved_calls,
         endpoint_slots,
         endpoint_sites,
+        endpoint_diagnostic,
     })
+}
+
+fn endpoint_diagnostics_tsv(
+    program: &RustProgram<'_>,
+    slots: &CrateSlots,
+    targets: &[LicP1Target],
+    endpoints: &FxHashMap<SlotRef, Vec<SinkEndpoint>>,
+) -> Result<String, String> {
+    let mut rows = Vec::new();
+    for target in targets {
+        let rhs = slot_from_key(program, slots, &target.key.function, target.key.rhs)?;
+        let SlotRef::Local(function, _) = rhs else {
+            continue;
+        };
+        let mut matches = endpoints
+            .iter()
+            .flat_map(|(&terminal_slot, endpoints)| {
+                endpoints
+                    .iter()
+                    .filter(move |endpoint| endpoint.function == function)
+                    .map(move |endpoint| (terminal_slot, endpoint))
+            })
+            .collect::<Vec<_>>();
+        matches.sort_by_key(|(slot, endpoint)| {
+            (
+                endpoint.location,
+                endpoint.callee.clone(),
+                SlotKey::of(*slot),
+            )
+        });
+        if matches.is_empty() {
+            rows.push(format!(
+                "{}\t{}\t{}\t{}\t0\t-\t-\t-\t-\t-\t0",
+                target.key.program,
+                target.key.function,
+                LicP1Key::slot_text(target.key.lhs),
+                LicP1Key::slot_text(target.key.rhs),
+            ));
+            continue;
+        }
+        let count = matches.len();
+        for (terminal_slot, endpoint) in matches {
+            rows.push(format!(
+                "{}\t{}\t{}\t{}\t{}\t{}\tbb{}:{}\t_{}\t{}\t{}\t{}",
+                target.key.program,
+                target.key.function,
+                LicP1Key::slot_text(target.key.lhs),
+                LicP1Key::slot_text(target.key.rhs),
+                count,
+                endpoint.callee,
+                endpoint.location.block,
+                endpoint.location.statement_index,
+                endpoint.operand_local.as_u32(),
+                endpoint
+                    .chain
+                    .iter()
+                    .map(|local| format!("{local:?}"))
+                    .collect::<Vec<_>>()
+                    .join("->"),
+                slot_text(terminal_slot),
+                usize::from(terminal_slot == rhs),
+            ));
+        }
+    }
+    rows.sort();
+    let mut output = String::from(
+        "program\tfunction\tlhs\trhs\tfunction_endpoint_count\tcallee\tlocation\t\
+         operand_local\tlocal_chain\tterminal_slot\treaches_rhs\n",
+    );
+    for row in rows {
+        output.push_str(&row);
+        output.push('\n');
+    }
+    Ok(output)
+}
+
+fn endpoint_diagnostics_tsv_empty() -> String {
+    "program\tfunction\tlhs\trhs\tfunction_endpoint_count\tcallee\tlocation\t\
+     operand_local\tlocal_chain\tterminal_slot\treaches_rhs\n"
+        .to_owned()
 }
 
 fn clean(value: &str) -> String {
@@ -570,6 +663,7 @@ pub(crate) fn run_worker(tcx: TyCtxt<'_>, t_tcx: Duration) -> super::report::Row
             call_world_unresolved: 0,
             endpoint_slots: 0,
             endpoint_sites: 0,
+            endpoint_diagnostic: endpoint_diagnostics_tsv_empty(),
         }
     } else {
         let program = super::collect_program(tcx);
@@ -580,6 +674,9 @@ pub(crate) fn run_worker(tcx: TyCtxt<'_>, t_tcx: Duration) -> super::report::Row
             .expect("T1 probe")
     };
     fs::write(Path::new(&output_path), rows_tsv(&output.rows)).expect("write T1 rows");
+    if let Some(path) = std::env::var_os("CRAT_T1_DIAG_OUTPUT") {
+        fs::write(Path::new(&path), &output.endpoint_diagnostic).expect("write T1 diagnostics");
+    }
 
     let mut yes = 0usize;
     let mut no = 0usize;
@@ -1050,6 +1147,21 @@ mod tests {
             });
             assert_eq!(matched.len(), 1, "{matched:#?}");
             assert_eq!(matched[0].callee, "free");
+            assert_ne!(matched[0].operand_local, matched[0].local);
+            assert_eq!(matched[0].chain.first(), Some(&matched[0].operand_local));
+            assert_eq!(matched[0].chain.last(), Some(&matched[0].local));
+            let target = LicP1Target {
+                key: LicP1Key {
+                    program: "fixture".to_owned(),
+                    function: tcx.def_path_str(release.to_def_id()),
+                    lhs: SlotKey::of(rhs),
+                    rhs: SlotKey::of(rhs),
+                },
+            };
+            let diagnostic = endpoint_diagnostics_tsv(&program, &slots, &[target], &endpoints)
+                .expect("diagnostic");
+            assert!(diagnostic.contains("\tfree\tbb"), "{diagnostic}");
+            assert!(diagnostic.trim_end().ends_with("\t1"), "{diagnostic}");
         })
         .unwrap();
     }
