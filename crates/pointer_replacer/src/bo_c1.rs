@@ -59,6 +59,8 @@ mod p_b_measurement;
 mod promote_failure_measurement;
 #[path = "s23_measurement.rs"]
 mod s23_measurement;
+#[path = "t1_origin_caller_probe.rs"]
+mod t1_origin_caller_probe;
 
 /// Copy of tests.rs `borrow_ownership_coherence::collect_program` (kept local so
 /// tests.rs stays untouched): every top-level fn/struct item, in HIR owner order.
