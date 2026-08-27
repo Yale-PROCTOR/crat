@@ -1405,8 +1405,14 @@ mod tests {
             assert!(artifact.contains("entry\tdirect\tdirect\n"), "{artifact}");
             assert!(artifact.contains("entry\tsink\tindirect\n"), "{artifact}");
             assert!(artifact.contains("direct\tsink\tdirect\n"), "{artifact}");
-            assert!(artifact.contains("unknown-reachable\tentry\n"), "{artifact}");
-            assert!(artifact.contains("unknown-reachable\tdirect\n"), "{artifact}");
+            assert!(
+                artifact.contains("unknown-reachable\tentry\n"),
+                "{artifact}"
+            );
+            assert!(
+                artifact.contains("unknown-reachable\tdirect\n"),
+                "{artifact}"
+            );
             assert!(artifact.contains("unknown-reachable\tsink\n"), "{artifact}");
             assert_eq!(world.calls, 3);
             assert_eq!(world.unresolved_calls, 0);

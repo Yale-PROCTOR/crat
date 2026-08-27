@@ -14583,6 +14583,7 @@ fn boc1_run_one() {
             | "kind-equate-core"
             | "s23-discover"
             | "s23-probe"
+            | "t1-origin-caller"
     ) || mode.starts_with("selector-detail-")
     {
         z3::set_global_param("smt.random_seed", "0");
@@ -14778,6 +14779,7 @@ fn boc1_run_one() {
             "kind-equate-core" => kind_equate_core_census::run_worker(tcx, t_tcx),
             "s23-discover" => s23_measurement::run_discovery_worker(tcx, t_tcx),
             "s23-probe" => s23_measurement::run_probe_worker(tcx, t_tcx),
+            "t1-origin-caller" => t1_origin_caller_probe::run_worker(tcx, t_tcx),
             "selector-core" => run::run_selector_core(tcx, t_tcx),
             "selector-necessity" => run::run_selector_necessity(tcx, t_tcx),
             detail if detail.starts_with("selector-detail-") => {
