@@ -16,9 +16,7 @@ use rustc_span::def_id::LocalDefId;
 use sha2::{Digest, Sha256};
 
 #[cfg(test)]
-use super::borrow_verify::{
-    LoopBackend, verify_l2_to_fixpoint_counting_impl, verify_to_fixpoint_counting_with_flows_impl,
-};
+use super::borrow_verify::verify_l2_to_fixpoint_counting_impl;
 #[cfg(test)]
 use super::coherence::add_coherence_tagging_uses;
 use super::{
@@ -29,10 +27,8 @@ use super::{
     },
     a5_producer::{A5Plan, PlannedC9Mark, produce_a5_plan},
     borrow_verify::{
-        verify_to_fixpoint_counting_with_flows,
-        verify_to_fixpoint_counting_with_flows_and_copy_lends_and_escaped,
-        verify_to_fixpoint_counting_with_flows_and_escaped_copy_lends,
-        verify_to_fixpoint_counting_with_flows_and_parameter_overlaps_and_escaped,
+        LoopBackend, verify_to_fixpoint_counting_with_flows,
+        verify_to_fixpoint_counting_with_flows_impl,
     },
     boundary_table::{self, Matcher, Role},
     coherence::{
@@ -864,17 +860,44 @@ pub(crate) fn verify_bo_construction_with_parameter_overlaps(
         "A5 focused replay must keep the independent CopyLend switch at baseline"
     );
     super::esc_minimal::with_presentations(&construction.esc_minimal, || {
-        verify_to_fixpoint_counting_with_flows_and_parameter_overlaps_and_escaped(
+        verify_constructed_to_fixpoint(
             program,
             slots,
-            origins.native_flows(),
+            origins,
             solver,
-            &construction.selectors,
+            construction,
             mut_facts,
-            parameter_overlaps,
-            &construction.esc_minimal.loans,
+            Some(parameter_overlaps),
         )
     })
+}
+
+fn verify_constructed_to_fixpoint(
+    program: &RustProgram<'_>,
+    slots: &CrateSlots,
+    origins: &OriginSummaries,
+    solver: &KindSolver,
+    construction: &BoConstruction,
+    mut_facts: &MutFacts,
+    parameter_overlaps: Option<&FxHashMap<LocalDefId, super::borrow_engine::ParameterOverlap>>,
+) -> (
+    Option<FxHashMap<SlotRef, SlotKind>>,
+    super::borrow_verify::RoundStats,
+) {
+    let copy_lends =
+        (construction.mode == CopyLendMode::LendArm).then_some(&construction.eligibility.pairs);
+    verify_to_fixpoint_counting_with_flows_impl(
+        program,
+        slots,
+        origins.native_flows(),
+        solver,
+        &construction.selectors,
+        mut_facts,
+        copy_lends,
+        Some(&construction.esc_minimal.loans),
+        parameter_overlaps,
+        LoopBackend::HardCheckRoundOptimize,
+    )
 }
 
 pub(crate) fn verify_bo_construction_counting(
@@ -888,28 +911,16 @@ pub(crate) fn verify_bo_construction_counting(
     Option<FxHashMap<SlotRef, SlotKind>>,
     super::borrow_verify::RoundStats,
 ) {
-    super::esc_minimal::with_presentations(&construction.esc_minimal, || match construction.mode {
-        CopyLendMode::LendArm => verify_to_fixpoint_counting_with_flows_and_copy_lends_and_escaped(
+    super::esc_minimal::with_presentations(&construction.esc_minimal, || {
+        verify_constructed_to_fixpoint(
             program,
             slots,
-            origins.native_flows(),
+            origins,
             solver,
-            &construction.selectors,
+            construction,
             mut_facts,
-            &construction.eligibility.pairs,
-            &construction.esc_minimal.loans,
-        ),
-        CopyLendMode::Baseline | CopyLendMode::RemovalOnly => {
-            verify_to_fixpoint_counting_with_flows_and_escaped_copy_lends(
-                program,
-                slots,
-                origins.native_flows(),
-                solver,
-                &construction.selectors,
-                mut_facts,
-                &construction.esc_minimal.loans,
-            )
-        }
+            None,
+        )
     })
 }
 
