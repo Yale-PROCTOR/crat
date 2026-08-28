@@ -1199,6 +1199,25 @@ impl KindSolver {
             .clone()
     }
 
+    /// W2 baseline-identity oracle: hold every typed endpoint assertion off
+    /// while retaining the complete mandatory hard universe and objective.
+    #[cfg(test)]
+    pub(crate) fn model_without_t2_for_test(
+        &self,
+        selectors: &Selectors,
+    ) -> Option<FxHashMap<SlotRef, SlotKind>> {
+        let disabled = selectors
+            .all()
+            .iter()
+            .map(|selector| !selector)
+            .collect::<Vec<_>>();
+        if self.check_with_assumptions(&disabled) != SatResult::Sat {
+            return None;
+        }
+        let model = self.solver.get_model()?;
+        Some(self.read_kinds(&model))
+    }
+
     pub fn model_kinds(&self) -> Option<FxHashMap<SlotRef, SlotKind>> {
         // §NB-R guard (release-active, BB3-c style): a tracked solver's hard
         // constraints are `track ⇒ c` — without the tracks assumed they are

@@ -754,10 +754,10 @@ fn sink_site_names_the_free_call() {
     );
 }
 
-/// T2-W2: an exact free endpoint whose incoming value has no modeled origin
-/// cannot retain the endpoint assertion. The mandatory licensing clause must
-/// appear beside the typed T2 label, T2 yields first, restoration fails, and
-/// the existing Raw verdict remains authoritative.
+/// T2-W2 (addendum-55 erratum): an exact free endpoint whose incoming value
+/// has no modeled origin cannot retain the endpoint assertion. The mandatory
+/// licensing clause appears beside the typed T2 label, T2 yields first,
+/// restoration fails, and the post-retraction model equals the no-T2 baseline.
 #[test]
 fn t2_unknown_origin_free_retracts_with_named_license_core() {
     const CODE: &str = r#"
@@ -802,9 +802,16 @@ unsafe fn release() {
             )
         });
         let model = model.expect("T2 retraction preserves acceptance");
+        let baseline = solver
+            .model_without_t2_for_test(&construction.selectors)
+            .expect("no-T2 baseline accepts");
+        assert_eq!(
+            model, baseline,
+            "W2 post-retraction model must equal baseline"
+        );
         let release = function_named(&program, "release");
         let p = named_depth0_slot(&program, &slots, release, "p");
-        assert_eq!(model.get(&p), Some(&SlotKindAlias::Raw));
+        assert_eq!(model.get(&p), baseline.get(&p));
 
         let epoch = trace.epochs.last().expect("T2 trace epoch");
         assert!(epoch.final_dropped.contains(&sink_index));

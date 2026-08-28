@@ -3671,6 +3671,28 @@ pub unsafe fn free_move_alias() {
     );
 }
 
+/// T2-W2 emission companion: model-level baseline identity may legitimately
+/// be `Ref`, but S2-2 still preserves the raw C free placement after T2
+/// retracts at an unknown-origin endpoint.
+#[test]
+fn t2_unknown_origin_retraction_preserves_raw_free_placement() {
+    run_test(
+        r#"
+extern "C" {
+    fn opaque() -> *mut i32;
+    fn free(ptr: *mut core::ffi::c_void);
+}
+
+pub unsafe fn release_unknown() {
+    let p = opaque();
+    free(p as *mut core::ffi::c_void);
+}
+"#,
+        &["free((p).as_deref_mut().map_or(std::ptr::null_mut"],
+        &["drop(p)", "Box::from_raw("],
+    );
+}
+
 #[test]
 fn test_rewriter_bridges_raw_scalar_calloc_root_and_free() {
     run_test(
