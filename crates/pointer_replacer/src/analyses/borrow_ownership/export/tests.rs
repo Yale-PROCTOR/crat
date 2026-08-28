@@ -26,7 +26,10 @@ use crate::{
         mutability_facts::MutFacts,
         origin_flow::analyze_program_origin_flow,
         origins::compute_origins,
-        solver::{KindSolver, SelectorTraceOutcome, SlotRef, with_selector_trace},
+        solver::{
+            KindSolver, SelectorTraceOutcome, SlotRef, with_assumption_check_trace,
+            with_selector_trace,
+        },
     },
     utils::rustc::RustProgram,
 };
@@ -71,12 +74,23 @@ fn named_depth0_slot(
     function: rustc_span::def_id::LocalDefId,
     name: &str,
 ) -> SlotRef {
+    let local = named_local(program, function, name);
+    let slot = slots.fn_local_slots[&function]
+        .slot_for_local_depth(local, 0)
+        .unwrap_or_else(|| panic!("missing depth-zero slot for {name}"));
+    SlotRef::Local(function, slot)
+}
+
+fn named_local(
+    program: &RustProgram<'_>,
+    function: rustc_span::def_id::LocalDefId,
+    name: &str,
+) -> rustc_middle::mir::Local {
     let body = program
         .tcx
         .mir_drops_elaborated_and_const_checked(function)
         .borrow();
-    let local = body
-        .var_debug_info
+    body.var_debug_info
         .iter()
         .find_map(|info| {
             (info.name.as_str() == name).then(|| match info.value {
@@ -84,11 +98,7 @@ fn named_depth0_slot(
                 _ => None,
             })?
         })
-        .unwrap_or_else(|| panic!("missing local {name}"));
-    let slot = slots.fn_local_slots[&function]
-        .slot_for_local_depth(local, 0)
-        .unwrap_or_else(|| panic!("missing depth-zero slot for {name}"));
-    SlotRef::Local(function, slot)
+        .unwrap_or_else(|| panic!("missing local {name}"))
 }
 
 /// Solve one inline program under export capture, exactly as `bo_c1`'s
@@ -895,6 +905,122 @@ unsafe fn wrapper() {
         )
         .expect("shared construction");
         assert!(construction.selectors.keys().is_empty());
+    })
+    .unwrap_or_else(|error| error.raise());
+}
+
+/// Observation-only W1 causal-chain dump authorized after the first T2
+/// MAX-3 stop. It makes no assertion about the expected repair; the diagnostic
+/// output is the deliverable.
+#[test]
+fn t2_w1_causal_chain_diagnostic() {
+    const CODE: &str = r#"
+unsafe extern "C" {
+    fn malloc(n: usize) -> *mut core::ffi::c_void;
+    fn free(p: *mut core::ffi::c_void);
+}
+unsafe fn chain() {
+    let p = malloc(core::mem::size_of::<i32>()) as *mut i32;
+    let q = p;
+    free(q as *mut core::ffi::c_void);
+}
+"#;
+    ::utils::compilation::run_compiler_on_str(CODE, |tcx| {
+        let program = collect_program(tcx);
+        let slots = CrateSlots::build(&program);
+        let origins = compute_origins(&program);
+        let facts = MutFacts::from_program(&program);
+        let arm = arm_scope();
+        let solver = KindSolver::new(&slots);
+        let construction = construct_bo_into(
+            &program,
+            &slots,
+            &origins,
+            &facts,
+            &solver,
+            CopyLendMode::Baseline,
+        )
+        .expect("shared construction");
+        eprintln!("T2-W1 keys={}", construction.selectors.keys().len());
+        for (index, (key, literal)) in construction
+            .selectors
+            .keys()
+            .iter()
+            .zip(construction.selectors.all())
+            .enumerate()
+        {
+            eprintln!("T2-W1 key[{index}]={} literal={literal}", key.label());
+        }
+
+        let (((model, stats), checks), selector_trace) = with_selector_trace(|| {
+            with_assumption_check_trace(|| {
+                verify_bo_construction_counting(
+                    &program,
+                    &slots,
+                    &origins,
+                    &solver,
+                    &construction,
+                    &facts,
+                )
+            })
+        });
+        let export = arm.finish();
+        for (index, check) in checks.iter().enumerate() {
+            let t2 = construction
+                .selectors
+                .all()
+                .iter()
+                .enumerate()
+                .filter(|(_, literal)| check.bundle.iter().any(|item| item == *literal))
+                .map(|(index, _)| index)
+                .collect::<Vec<_>>();
+            eprintln!(
+                "T2-W1 check[{index}] phase={:?} outcome={:?} explicit={} bundle={} t2={t2:?}",
+                check.phase,
+                check.outcome,
+                check.explicit.len(),
+                check.bundle.len(),
+            );
+            eprintln!("T2-W1 check[{index}] labels={:?}", check.labels);
+        }
+        for (epoch, trace) in selector_trace.epochs.iter().enumerate() {
+            eprintln!(
+                "T2-W1 epoch[{epoch}] final_dropped={:?} events={:#?}",
+                trace.final_dropped, trace.events
+            );
+        }
+
+        let model = model.expect("W1 accepts");
+        let chain = function_named(&program, "chain");
+        let p_slot = named_depth0_slot(&program, &slots, chain, "p");
+        let q_slot = named_depth0_slot(&program, &slots, chain, "q");
+        let owns = export.version_owns.as_ref().expect("version ownerships");
+        for (name, local, slot) in [
+            ("p", named_local(&program, chain, "p"), p_slot),
+            ("q", named_local(&program, chain, "q"), q_slot),
+        ] {
+            let versions = export
+                .version_sites
+                .iter()
+                .filter(|site| site.fn_did == chain && site.local == local)
+                .map(|site| {
+                    let use_value = site.use_var.map(|var| (var, owns[var]));
+                    let def_value = site.def_var.map(|var| (var, owns[var]));
+                    (site.location, use_value, def_value)
+                })
+                .collect::<Vec<_>>();
+            eprintln!(
+                "T2-W1 model {name}: versions={versions:?} own_bit={} kind={:?}",
+                model.get(&slot) == Some(&SlotKindAlias::Owning),
+                model.get(&slot)
+            );
+        }
+        eprintln!(
+            "T2-W1 stats dropped_sources={} dropped_sinks={} optimize_materializations={}",
+            stats.dropped_sources,
+            stats.dropped_sinks,
+            solver.optimize_materialization_count(),
+        );
     })
     .unwrap_or_else(|error| error.raise());
 }

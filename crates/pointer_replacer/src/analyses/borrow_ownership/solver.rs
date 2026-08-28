@@ -268,6 +268,51 @@ thread_local! {
 }
 
 #[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AssumptionCheckPhase {
+    Hard,
+    Optimize,
+    OptimizeMaterialization,
+}
+
+#[cfg(test)]
+#[derive(Clone, Debug)]
+pub(crate) struct AssumptionCheckEvent {
+    pub(crate) phase: AssumptionCheckPhase,
+    pub(crate) explicit: Vec<Bool>,
+    pub(crate) bundle: Vec<Bool>,
+    pub(crate) labels: Vec<String>,
+    pub(crate) outcome: SatResult,
+}
+
+#[cfg(test)]
+thread_local! {
+    static ASSUMPTION_CHECK_CAPTURE: RefCell<Option<Vec<AssumptionCheckEvent>>> =
+        const { RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn with_assumption_check_trace<T>(
+    f: impl FnOnce() -> T,
+) -> (T, Vec<AssumptionCheckEvent>) {
+    struct Restore(Option<Vec<AssumptionCheckEvent>>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            ASSUMPTION_CHECK_CAPTURE.with(|capture| {
+                *capture.borrow_mut() = self.0.take();
+            });
+        }
+    }
+    let _restore =
+        Restore(ASSUMPTION_CHECK_CAPTURE.with(|capture| capture.replace(Some(Vec::new()))));
+    let output = f();
+    let events = ASSUMPTION_CHECK_CAPTURE
+        .with(|capture| capture.borrow_mut().take())
+        .unwrap_or_default();
+    (output, events)
+}
+
+#[cfg(test)]
 pub(crate) fn with_own_assume_site<T>(site: OwnAssumeSite, f: impl FnOnce() -> T) -> T {
     struct Restore(OwnAssumeSite);
     impl Drop for Restore {
@@ -497,6 +542,38 @@ impl KindSolver {
         labels.sort();
         labels.dedup();
         labels
+    }
+
+    #[cfg(test)]
+    fn record_assumption_event(
+        &self,
+        phase: AssumptionCheckPhase,
+        explicit: &[Bool],
+        bundle: &[Bool],
+        outcome: SatResult,
+    ) {
+        ASSUMPTION_CHECK_CAPTURE.with(|capture| {
+            let mut capture = capture.borrow_mut();
+            let Some(events) = capture.as_mut() else {
+                return;
+            };
+            let labels = bundle
+                .iter()
+                .map(|literal| {
+                    self.tracker
+                        .as_ref()
+                        .and_then(|tracker| tracker.label_of(literal))
+                        .unwrap_or_else(|| literal.to_string())
+                })
+                .collect();
+            events.push(AssumptionCheckEvent {
+                phase,
+                explicit: explicit.to_vec(),
+                bundle: bundle.to_vec(),
+                labels,
+                outcome,
+            });
+        });
     }
 
     fn build(slots: &CrateSlots, tracker: Option<CoreTracker>, add_objective: bool) -> Self {
@@ -1059,7 +1136,16 @@ impl KindSolver {
     pub(crate) fn check_with_assumptions(&self, assumptions: &[Bool]) -> SatResult {
         self.check_sat_count
             .set(self.check_sat_count.get().saturating_add(1));
-        self.solver.check(&self.assumption_bundle(assumptions))
+        let bundle = self.assumption_bundle(assumptions);
+        let outcome = self.solver.check(&bundle);
+        #[cfg(test)]
+        self.record_assumption_event(
+            AssumptionCheckPhase::Optimize,
+            assumptions,
+            &bundle,
+            outcome,
+        );
+        outcome
     }
 
     fn hard_check_with_assumptions(
@@ -1072,9 +1158,10 @@ impl KindSolver {
         self.hard_check_count
             .set(self.hard_check_count.get().saturating_add(1));
         let started = Instant::now();
-        let outcome = hard
-            .solver
-            .check_assumptions(&self.assumption_bundle(assumptions));
+        let bundle = self.assumption_bundle(assumptions);
+        let outcome = hard.solver.check_assumptions(&bundle);
+        #[cfg(test)]
+        self.record_assumption_event(AssumptionCheckPhase::Hard, assumptions, &bundle, outcome);
         self.hard_check_elapsed.set(
             self.hard_check_elapsed
                 .get()
@@ -1315,7 +1402,18 @@ impl KindSolver {
         self.optimize_materialization_count
             .set(self.optimize_materialization_count.get().saturating_add(1));
         let started = Instant::now();
-        if self.check_with_assumptions(&relaxed.assumptions) != SatResult::Sat {
+        self.check_sat_count
+            .set(self.check_sat_count.get().saturating_add(1));
+        let bundle = self.assumption_bundle(&relaxed.assumptions);
+        let outcome = self.solver.check(&bundle);
+        #[cfg(test)]
+        self.record_assumption_event(
+            AssumptionCheckPhase::OptimizeMaterialization,
+            &relaxed.assumptions,
+            &bundle,
+            outcome,
+        );
+        if outcome != SatResult::Sat {
             self.optimize_materialization_elapsed.set(
                 self.optimize_materialization_elapsed
                     .get()

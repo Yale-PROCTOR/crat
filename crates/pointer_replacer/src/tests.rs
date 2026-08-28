@@ -3651,20 +3651,19 @@ extern "C" {
     fn free(ptr: *mut core::ffi::c_void);
 }
 
-pub unsafe fn free_nested_alias() {
-    let p: *mut *mut i32 =
-        malloc(std::mem::size_of::<*mut i32>()) as *mut *mut i32;
+pub unsafe fn free_move_alias() {
+    let p: *mut i32 = malloc(std::mem::size_of::<i32>()) as *mut i32;
     let q = p;
     free(q as *mut core::ffi::c_void);
 }
 "#,
         &[
-            "let p: Box<*mut i32>",
-            "let mut q: Box<*mut i32> = p",
+            "let mut p: Box<i32>",
+            "let mut q: Box<i32> = (Some(p)).unwrap()",
             "drop(q)",
         ],
         &[
-            "malloc(std::mem::size_of::<*mut i32>())",
+            "malloc(std::mem::size_of::<i32>())",
             "free(q as *mut core::ffi::c_void",
             "Box::into_raw(",
             "Box::from_raw(",
