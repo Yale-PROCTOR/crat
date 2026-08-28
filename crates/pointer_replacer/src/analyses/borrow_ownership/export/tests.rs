@@ -1221,6 +1221,7 @@ fn capture_solve_l2(
                 &selectors,
                 true,
                 None,
+                None,
             )
         });
         (model, stats, export)
@@ -1392,6 +1393,7 @@ fn l2_door_rejects_a_tracked_solver() {
             &solver,
             &selectors,
             true,
+            None,
             None,
         );
         None::<()>
