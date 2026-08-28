@@ -6,7 +6,7 @@ mod encoding;
 pub mod fn_ptr_groups;
 pub mod fn_ptr_rewrite_decision;
 mod lattice;
-mod liveness;
+pub(crate) mod liveness;
 #[cfg(test)]
 pub(crate) use liveness::DefUse;
 mod mir;
