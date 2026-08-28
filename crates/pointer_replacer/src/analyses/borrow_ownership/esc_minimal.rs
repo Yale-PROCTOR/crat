@@ -13,6 +13,7 @@ use rustc_span::def_id::LocalDefId;
 use super::{
     coherence::{SelectedCopyLendLoan, SelectedCopyLendLoans},
     crate_slots::CrateSlots,
+    domain::SlotKind,
     export::{BorrowerKind, OwnerKey, PlaceKey},
     l2::MirLocationKey,
     resolve::{ResolvedSlot, resolve_place},
@@ -95,20 +96,24 @@ pub(crate) struct EscRuntimeSite {
 pub(crate) struct EscMinimalSelection {
     pub(crate) sites: Vec<EscRuntimeSite>,
     pub(crate) loans: SelectedCopyLendLoans,
-    presentations:
-        FxHashMap<(LocalDefId, SelectedCopyLendLoan), (ProvenanceOwner, ProvenanceOwner)>,
+    presentations: FxHashMap<(LocalDefId, SelectedCopyLendLoan), EscPresentation>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct EscPresentation {
+    source: SlotRef,
+    source_owner: ProvenanceOwner,
+    destination_owner: ProvenanceOwner,
 }
 
 thread_local! {
     static PRESENTATIONS: RefCell<
-        Option<FxHashMap<(LocalDefId, SelectedCopyLendLoan), (ProvenanceOwner, ProvenanceOwner)>>,
+        Option<FxHashMap<(LocalDefId, SelectedCopyLendLoan), EscPresentation>>,
     > = const { RefCell::new(None) };
 }
 
 pub(crate) fn with_presentations<T>(selection: &EscMinimalSelection, f: impl FnOnce() -> T) -> T {
-    struct Restore(
-        Option<FxHashMap<(LocalDefId, SelectedCopyLendLoan), (ProvenanceOwner, ProvenanceOwner)>>,
-    );
+    struct Restore(Option<FxHashMap<(LocalDefId, SelectedCopyLendLoan), EscPresentation>>);
     impl Drop for Restore {
         fn drop(&mut self) {
             PRESENTATIONS.with(|presentations| {
@@ -130,7 +135,50 @@ pub(crate) fn presentation_for(
         presentations
             .borrow()
             .as_ref()
-            .and_then(|presentations| presentations.get(&(fn_did, loan.clone())).copied())
+            .and_then(|presentations| presentations.get(&(fn_did, loan.clone())))
+            .map(|presentation| (presentation.source_owner, presentation.destination_owner))
+    })
+}
+
+/// Select exactly the escaped loans whose resolved source is still `Ref` in this validation
+/// round. Addendum 61's source demotion is the ② class's kill switch; the allowlist identity stays
+/// fixed, but a non-Ref source must not carry CopyLend invalidation or exit-liveness semantics into
+/// the next replay.
+pub(crate) fn active_loans_for_model(
+    escaped: &SelectedCopyLendLoans,
+    model: &FxHashMap<SlotRef, SlotKind>,
+) -> SelectedCopyLendLoans {
+    PRESENTATIONS.with(|presentations| {
+        let presentations = presentations.borrow();
+        let presentations = presentations
+            .as_ref()
+            .expect("② active-loan filtering requires the construction presentation scope");
+        let mut active = SelectedCopyLendLoans::default();
+        let mut visited = 0;
+        for (&fn_did, loans) in escaped {
+            for loan in loans {
+                let presentation = presentations
+                    .get(&(fn_did, loan.clone()))
+                    .expect("escaped loan missing exact presentation row");
+                visited += 1;
+                if model.get(&presentation.source) == Some(&SlotKind::Ref) {
+                    assert!(
+                        active.entry(fn_did).or_default().insert(loan.clone()),
+                        "duplicate active escaped loan"
+                    );
+                }
+            }
+        }
+        assert_eq!(
+            visited,
+            escaped.values().map(FxHashSet::len).sum::<usize>(),
+            "② active-loan filter must visit every escaped identity exactly once"
+        );
+        assert!(
+            active.values().map(FxHashSet::len).sum::<usize>() <= 36,
+            "② active-loan class exceeded the exact 36-site allowlist"
+        );
+        active
     })
 }
 
@@ -519,10 +567,11 @@ pub(crate) fn select(program: &RustProgram<'_>, slots: &CrateSlots) -> EscMinima
                 .presentations
                 .insert(
                     (row.fn_did, loan.clone()),
-                    (
-                        presentation_owner(slots, row.rhs),
-                        presentation_owner(slots, row.lhs),
-                    ),
+                    EscPresentation {
+                        source: row.rhs,
+                        source_owner: presentation_owner(slots, row.rhs),
+                        destination_owner: presentation_owner(slots, row.lhs),
+                    },
                 )
                 .is_none(),
             "duplicate ②-minimal presentation identity"

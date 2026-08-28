@@ -12665,9 +12665,7 @@ unsafe fn f(mut p: *mut i32) -> i32 {
     // `⋁¬ref(live requirers)`; the issuer stays in the menu only when no such requirer exists.
     // (This RESTRICTS the commit menu — it adds no new assertion kind, so §3 invariant 7 holds.)
 
-    /// §NB4-4a helper — solve `f` to fixpoint under fact-driven mutability; return each named
-    /// local's depth-0 accepted kind + its Foster mutability.
-    /// §ESC-W1 — **KNOWN GAP, pinned.** The save/caller escape shape:
+    /// §ESC-W1 — ②-minimal pin transition. The save/caller escape shape:
     ///
     /// ```ignore
     /// unsafe fn save(out: *mut *mut i32, x: *mut i32) { *out = x; *x = 1; }
@@ -12680,15 +12678,10 @@ unsafe fn f(mut p: *mut i32) -> i32 {
     /// into `*out` cannot then be used at `*x = 1`, and reborrowing to fix that shortens the
     /// lifetime below the caller's read. **The required verdict is therefore `x = Raw`.**
     ///
-    /// The analysis settles `x = Ref` (and `out = Ref`, and the caller's `slot = Ref`). This test
-    /// pins that CURRENT behaviour rather than the required one, so the gap is a recorded fact
-    /// instead of a standing red — and so that any change which closes it fails here loudly and
-    /// gets to claim the credit.
-    ///
-    /// Measured non-sensitivity (2026-08-26): forcing the caller's `slot` Raw with pointer
-    /// arithmetic, removing the post-store write, and removing the escape each leave `out`/`x` at
-    /// `Ref`. So this is not a near-miss — no guard engages at all. The
-    /// placeholder-always-live arm (`CRAT_BO_PLACEHOLDER_LIVE`) does not move it either.
+    /// The ②-minimal selected feeder loan is extended through exit in the first replay. Addendum
+    /// 61 repairs that class through its presented source issuer. The next round must therefore
+    /// carry zero selected loans—the source is no longer Ref—and settle `x = Raw`; persistence is
+    /// a release-active convergence failure in the replay engine.
     #[test]
     fn escw1_escape_shape_demotes_x_raw() {
         const CODE: &str = r#"
@@ -12734,15 +12727,20 @@ unsafe fn caller() -> i32 {
                     (((model, stats), export), extensions, selected_sites)
                 });
             assert_eq!(selected_sites, 1, "ESC-W1 selects one exact N4 site");
-            assert_eq!(stats.copy_lend_replay_selections, 1);
+            assert_eq!(
+                stats.copy_lend_replay_selections, 0,
+                "the post-demotion validation round must remove the selected loan"
+            );
             assert!(!extensions.is_empty(), "escaped loan was not extended");
             let copy_lends = export
                 .loans
                 .iter()
                 .filter(|loan| loan.class == LoanClass::CopyLend)
                 .collect::<Vec<_>>();
-            assert_eq!(copy_lends.len(), 1, "exactly one selected CopyLend loan");
-            assert!(copy_lends[0].invalid, "post-store write must invalidate it");
+            assert!(
+                copy_lends.is_empty(),
+                "the accepted final round must contain no selected CopyLend loan"
+            );
             let model = model.expect("ESC-W1 accepts after conservative repair");
             let save = function_by_name(&program, "save");
             let x = local_by_var_name(tcx, save, "x");

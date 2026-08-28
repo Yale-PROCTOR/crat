@@ -187,6 +187,9 @@ pub(crate) fn with_mode_a_commit_trace<T>(f: impl FnOnce() -> T) -> (T, Vec<Mode
 pub(crate) struct SlotConflict {
     pub issuer: Option<SlotRef>,
     pub requirers: Vec<SlotRef>,
+    /// Exact ESC-GAP ② class marker, carried from the selected loan row. False preserves the
+    /// ordinary A-prime repair menu byte-for-byte.
+    pub(crate) esc_issuer_first: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -497,6 +500,7 @@ fn revalidate_replaying_witnessed(
                                 .into_iter()
                                 .filter_map(|owner| owner_to_slot(slots, fn_did, owner))
                                 .collect(),
+                            esc_issuer_first: edge.esc_issuer_first,
                         },
                         loan,
                         stable_loan_key: issuer.map(|issuer| {
@@ -534,6 +538,7 @@ fn map_edges_to_slots(
                         .into_iter()
                         .filter_map(|o| owner_to_slot(slots, fn_did, o))
                         .collect(),
+                    esc_issuer_first: e.esc_issuer_first,
                 })
                 .collect();
             (fn_did, translated)
@@ -974,8 +979,15 @@ pub(super) fn verify_to_fixpoint_counting_with_flows_impl(
         // predicate. Reset so the export holds the FINAL round's BorrowSet,
         // not the union over rejected intermediate models.
         super::export::begin_round();
-        let selected_copy_lends =
-            selected_copy_lends_for_round(program, slots, &model, copy_lends, escaped_copy_lends);
+        let active_escaped_copy_lends = escaped_copy_lends
+            .map(|escaped| super::esc_minimal::active_loans_for_model(escaped, &model));
+        let selected_copy_lends = selected_copy_lends_for_round(
+            program,
+            slots,
+            &model,
+            copy_lends,
+            active_escaped_copy_lends.as_ref(),
+        );
         stats.copy_lend_replay_selections = selected_copy_lend_count(&selected_copy_lends);
         let selected_copy_lends =
             (stats.copy_lend_replay_selections != 0).then_some(selected_copy_lends);
@@ -1021,7 +1033,7 @@ pub(super) fn verify_to_fixpoint_counting_with_flows_impl(
             },
             is_mutable,
             selected_copy_lends.as_ref(),
-            escaped_copy_lends,
+            active_escaped_copy_lends.as_ref(),
             parameter_overlaps,
         );
         // §NB5-F — partition the residual-conflict guard by owner class. A non-`Ref` FIELD in a
@@ -1365,8 +1377,15 @@ pub(super) fn verify_l2_to_fixpoint_counting_impl(
         }
         // D1: same per-round reset on the L2 path.
         super::export::begin_round();
-        let selected_copy_lends =
-            selected_copy_lends_for_round(program, slots, &model, copy_lends, escaped_copy_lends);
+        let active_escaped_copy_lends = escaped_copy_lends
+            .map(|escaped| super::esc_minimal::active_loans_for_model(escaped, &model));
+        let selected_copy_lends = selected_copy_lends_for_round(
+            program,
+            slots,
+            &model,
+            copy_lends,
+            active_escaped_copy_lends.as_ref(),
+        );
         stats.copy_lend_replay_selections = selected_copy_lend_count(&selected_copy_lends);
         let selected_copy_lends =
             (stats.copy_lend_replay_selections != 0).then_some(selected_copy_lends);
@@ -1381,7 +1400,7 @@ pub(super) fn verify_l2_to_fixpoint_counting_impl(
             },
             is_mutable,
             selected_copy_lends.as_ref(),
-            escaped_copy_lends,
+            active_escaped_copy_lends.as_ref(),
         );
         let mut observations = Vec::new();
         for (did, conflicts) in &conflicts {
@@ -1714,6 +1733,16 @@ fn representative(
 /// `residual_nonref_field` decline + `guard_slots_are_ref` assert rule out on the live path.
 fn a_prime_menu(conflict: &SlotConflict, model: &FxHashMap<SlotRef, SlotKind>) -> Vec<SlotRef> {
     let is_ref = |s: &SlotRef| model.get(s) == Some(&SlotKind::Ref);
+    if conflict.esc_issuer_first {
+        let issuer = conflict
+            .issuer
+            .expect("②-selected conflict presentation must carry a resolved-source issuer");
+        assert!(
+            is_ref(&issuer),
+            "②-selected conflict persisted after its resolved source was demoted"
+        );
+        return vec![issuer];
+    }
     let beyond: Vec<SlotRef> = conflict
         .requirers
         .iter()
@@ -1891,6 +1920,7 @@ mod nb5l_a_prime_menu_tests {
         let conflict = SlotConflict {
             issuer: Some(i),
             requirers: vec![r1, r2],
+            esc_issuer_first: false,
         };
         let m = model(&[(i, SlotKind::Ref), (r1, SlotKind::Ref), (r2, SlotKind::Ref)]);
         let menu = a_prime_menu(&conflict, &m);
@@ -1915,6 +1945,7 @@ mod nb5l_a_prime_menu_tests {
         let conflict = SlotConflict {
             issuer: Some(i),
             requirers: vec![i],
+            esc_issuer_first: false,
         };
         let m = model(&[(i, SlotKind::Ref)]);
         let menu = a_prime_menu(&conflict, &m);
@@ -1934,8 +1965,25 @@ mod nb5l_a_prime_menu_tests {
         let conflict = SlotConflict {
             issuer: Some(i),
             requirers: vec![r],
+            esc_issuer_first: false,
         };
         let m = model(&[(i, SlotKind::Ref), (r, SlotKind::Raw)]);
         assert_eq!(a_prime_menu(&conflict, &m), vec![i]);
+    }
+
+    /// Addendum 61: the exact ② class has a different kill switch. Its presented source issuer is
+    /// the sole repair target even when a live destination requirer exists; ordinary rows above
+    /// retain the A-prime requirer-first menu.
+    #[test]
+    fn esc_selected_menu_is_issuer_only() {
+        let (source, destination) = (field(0), field(1));
+        let conflict = SlotConflict {
+            issuer: Some(source),
+            requirers: vec![destination],
+            esc_issuer_first: true,
+        };
+        let m = model(&[(source, SlotKind::Ref), (destination, SlotKind::Ref)]);
+        assert_eq!(a_prime_menu(&conflict, &m), vec![source]);
+        assert_eq!(representative(&conflict, &m), Some(source));
     }
 }

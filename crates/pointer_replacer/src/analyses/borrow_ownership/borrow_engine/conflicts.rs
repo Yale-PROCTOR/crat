@@ -304,14 +304,21 @@ fn extract_conflict_edges(
                 }
             }
         }
-        if let Some(&(resolved_source, resolved_destination)) =
+        let esc_issuer_first = if let Some(&(resolved_source, resolved_destination)) =
             inference.escaped_presentations.get(&loan)
         {
             issuer = Some(resolved_source);
             requirers.clear();
             requirers.push(resolved_destination);
-        }
-        edges.push(ConflictEdge { issuer, requirers });
+            true
+        } else {
+            false
+        };
+        edges.push(ConflictEdge {
+            issuer,
+            requirers,
+            esc_issuer_first,
+        });
     }
     edges
 }
@@ -532,6 +539,38 @@ fn escaped_demotion_exemptions(
     }
     selected.retain(|pair| !ordinary.contains(pair));
     selected
+}
+
+/// Addendum 61 convergence tripwire. A marked row may exist only while its presented source is
+/// still `Ref`; after issuer-first repair demotes that source, the active-loan filter must remove
+/// the selected loan before the next replay. This check precedes the generic stray-Raw invariant
+/// so persistence is reported as the class-specific STOP rather than looking like an ordinary
+/// replay failure.
+fn assert_escaped_conflicts_pre_demotion<'a>(
+    edges: impl Iterator<Item = &'a ConflictEdge>,
+    is_ref: impl Fn(Local) -> bool,
+    registered: usize,
+) {
+    let mut marked = 0;
+    for edge in edges.filter(|edge| edge.esc_issuer_first) {
+        marked += 1;
+        match edge.issuer {
+            Some(ProvenanceOwner::Local(source)) => assert!(
+                is_ref(source),
+                "②-selected loan conflict persisted after its resolved source was demoted"
+            ),
+            Some(ProvenanceOwner::Field(_)) => {
+                // Field slots are held out of the ②-minimal wave. Keep this explicit so a future
+                // field-bearing allowlist row cannot silently bypass the Local convergence check.
+                panic!("②-minimal selected source unexpectedly resolved to a field")
+            }
+            None => panic!("②-selected conflict presentation lost its resolved-source issuer"),
+        }
+    }
+    assert!(
+        marked <= registered && marked <= 36,
+        "② conflict presentation count exceeded its matched allowlist class"
+    );
 }
 
 /// Attach the invalidating access roots to the unchanged one-edge-per-loan
@@ -1028,6 +1067,7 @@ where
                 .map(|(left, right)| ConflictEdge {
                     issuer: Some(ProvenanceOwner::Local(left)),
                     requirers: vec![ProvenanceOwner::Local(right)],
+                    esc_issuer_first: false,
                 })
                 .collect::<Vec<_>>();
             let invalid_loans = invalid_loan_set(&inference);
@@ -1097,6 +1137,7 @@ where
 
         // BB2-i stray-Raw inert-ness invariant (verbatim; release-active tripwire).
         let provenance_set = ctxt.borrow.provenances.get(&f).unwrap();
+        assert_escaped_conflicts_pre_demotion(edges.iter(), &is_ref_f, escaped_copy_lends.len());
         assert!(
             provenance_set
                 .local_data
@@ -1310,6 +1351,11 @@ where
         };
 
         let provenance_set = ctxt.borrow.provenances.get(&f).unwrap();
+        assert_escaped_conflicts_pre_demotion(
+            edges.iter().map(|witnessed| &witnessed.edge),
+            |local| !is_raw_f(local),
+            escaped_copy_lends.len(),
+        );
         assert!(
             provenance_set
                 .local_data
