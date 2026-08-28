@@ -566,7 +566,7 @@ where
     let no_copy_lends = FxHashSet::default();
     let mut out = FxHashMap::default();
     for f in program.functions.iter().copied() {
-        let mut inference = ctxt.infer(program.tcx, f, &[], &no_copy_lends);
+        let mut inference = ctxt.infer(program.tcx, f, &[], &no_copy_lends, &no_copy_lends);
         overwrite_with_engine_facts(
             program.tcx,
             f,
@@ -614,7 +614,7 @@ where
     let no_copy_lends = FxHashSet::default();
     let mut out = FxHashMap::default();
     for f in program.functions.iter().copied() {
-        let inference = ctxt.infer(program.tcx, f, &[], &no_copy_lends);
+        let inference = ctxt.infer(program.tcx, f, &[], &no_copy_lends, &no_copy_lends);
         let mut rows = Vec::new();
         for (loan, data) in inference.borrow_set.loans.iter_enumerated() {
             let live_points = inference
@@ -663,7 +663,7 @@ where
     let no_copy_lends = FxHashSet::default();
     let mut out = FxHashMap::default();
     for f in program.functions.iter().copied() {
-        let mut inference = ctxt.infer(program.tcx, f, &[], &no_copy_lends);
+        let mut inference = ctxt.infer(program.tcx, f, &[], &no_copy_lends, &no_copy_lends);
         overwrite_with_engine_facts(
             program.tcx,
             f,
@@ -794,6 +794,7 @@ where
     K: Fn(LocalDefId) -> L,
     L: Fn(Local) -> bool,
 {
+    let escaped = SelectedCopyLendLoans::default();
     borrow_conflicts_replaying_with_flows_impl(
         program,
         flows,
@@ -802,6 +803,38 @@ where
         is_mutable,
         raw_fields,
         selected_copy_lends,
+        &escaped,
+        None,
+    )
+}
+
+pub(crate) fn borrow_conflicts_replaying_with_flows_and_copy_lends_and_escaped<I, J, M, N, K, L>(
+    program: &RustProgram,
+    flows: &OriginFlowResults,
+    is_ref: I,
+    is_raw: M,
+    is_mutable: K,
+    raw_fields: &[StructFieldSlot],
+    selected_copy_lends: &SelectedCopyLendLoans,
+    escaped_copy_lends: &SelectedCopyLendLoans,
+) -> FxHashMap<LocalDefId, Vec<ConflictEdge>>
+where
+    I: Fn(LocalDefId) -> J,
+    J: Fn(Local) -> bool,
+    M: Fn(LocalDefId) -> N,
+    N: Fn(Local) -> bool,
+    K: Fn(LocalDefId) -> L,
+    L: Fn(Local) -> bool,
+{
+    borrow_conflicts_replaying_with_flows_impl(
+        program,
+        flows,
+        is_ref,
+        is_raw,
+        is_mutable,
+        raw_fields,
+        selected_copy_lends,
+        escaped_copy_lends,
         None,
     )
 }
@@ -824,6 +857,7 @@ where
     K: Fn(LocalDefId) -> L,
     L: Fn(Local) -> bool,
 {
+    let escaped = SelectedCopyLendLoans::default();
     borrow_conflicts_replaying_with_flows_impl(
         program,
         flows,
@@ -832,6 +866,46 @@ where
         is_mutable,
         raw_fields,
         selected_copy_lends,
+        &escaped,
+        Some(parameter_overlaps),
+    )
+}
+
+pub(crate) fn borrow_conflicts_replaying_with_flows_and_parameter_overlap_and_escaped<
+    I,
+    J,
+    M,
+    N,
+    K,
+    L,
+>(
+    program: &RustProgram,
+    flows: &OriginFlowResults,
+    is_ref: I,
+    is_raw: M,
+    is_mutable: K,
+    raw_fields: &[StructFieldSlot],
+    selected_copy_lends: &SelectedCopyLendLoans,
+    escaped_copy_lends: &SelectedCopyLendLoans,
+    parameter_overlaps: &FxHashMap<LocalDefId, ParameterOverlap>,
+) -> FxHashMap<LocalDefId, Vec<ConflictEdge>>
+where
+    I: Fn(LocalDefId) -> J,
+    J: Fn(Local) -> bool,
+    M: Fn(LocalDefId) -> N,
+    N: Fn(Local) -> bool,
+    K: Fn(LocalDefId) -> L,
+    L: Fn(Local) -> bool,
+{
+    borrow_conflicts_replaying_with_flows_impl(
+        program,
+        flows,
+        is_ref,
+        is_raw,
+        is_mutable,
+        raw_fields,
+        selected_copy_lends,
+        escaped_copy_lends,
         Some(parameter_overlaps),
     )
 }
@@ -844,6 +918,7 @@ fn borrow_conflicts_replaying_with_flows_impl<I, J, M, N, K, L>(
     is_mutable: K,
     raw_fields: &[StructFieldSlot],
     selected_copy_lends: &SelectedCopyLendLoans,
+    escaped_copy_lends: &SelectedCopyLendLoans,
     parameter_overlaps: Option<&FxHashMap<LocalDefId, ParameterOverlap>>,
 ) -> FxHashMap<LocalDefId, Vec<ConflictEdge>>
 where
@@ -881,9 +956,11 @@ where
         let is_ref_f = is_ref(f);
         let is_raw_f = is_raw(f);
         let copy_lends = selected_copy_lends.get(&f).unwrap_or(&no_copy_lends);
+        let escaped_copy_lends = escaped_copy_lends.get(&f).unwrap_or(&no_copy_lends);
 
         let edges = loop {
-            let mut inference = ctxt.infer(program.tcx, f, raw_fields, copy_lends);
+            let mut inference =
+                ctxt.infer(program.tcx, f, raw_fields, copy_lends, escaped_copy_lends);
             let parameter_conflicts = overwrite_with_engine_facts(
                 program.tcx,
                 f,
@@ -1031,6 +1108,37 @@ where
     K: Fn(LocalDefId) -> L,
     L: Fn(Local) -> bool,
 {
+    let escaped = SelectedCopyLendLoans::default();
+    borrow_conflicts_replaying_witnessed_with_copy_lends_and_escaped(
+        program,
+        flows,
+        is_ref,
+        is_raw,
+        is_mutable,
+        raw_fields,
+        selected_copy_lends,
+        &escaped,
+    )
+}
+
+pub(crate) fn borrow_conflicts_replaying_witnessed_with_copy_lends_and_escaped<I, J, M, N, K, L>(
+    program: &RustProgram,
+    flows: &OriginFlowResults,
+    is_ref: I,
+    is_raw: M,
+    is_mutable: K,
+    raw_fields: &[StructFieldSlot],
+    selected_copy_lends: &SelectedCopyLendLoans,
+    escaped_copy_lends: &SelectedCopyLendLoans,
+) -> FxHashMap<LocalDefId, Vec<WitnessedConflictEdge>>
+where
+    I: Fn(LocalDefId) -> J,
+    J: Fn(Local) -> bool,
+    M: Fn(LocalDefId) -> N,
+    N: Fn(Local) -> bool,
+    K: Fn(LocalDefId) -> L,
+    L: Fn(Local) -> bool,
+{
     let is_candidate = |did: LocalDefId| {
         let ref_f = is_ref(did);
         let raw_f = is_raw(did);
@@ -1049,9 +1157,11 @@ where
     for f in program.functions.iter().copied() {
         let is_raw_f = is_raw(f);
         let copy_lends = selected_copy_lends.get(&f).unwrap_or(&no_copy_lends);
+        let escaped_copy_lends = escaped_copy_lends.get(&f).unwrap_or(&no_copy_lends);
 
         let edges = loop {
-            let mut inference = ctxt.infer(program.tcx, f, raw_fields, copy_lends);
+            let mut inference =
+                ctxt.infer(program.tcx, f, raw_fields, copy_lends, escaped_copy_lends);
             let accesses = overwrite_with_engine_facts_capturing(
                 program.tcx,
                 f,

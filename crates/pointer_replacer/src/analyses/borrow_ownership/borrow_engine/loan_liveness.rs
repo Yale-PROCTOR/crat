@@ -1,4 +1,7 @@
-use rustc_hash::FxHashMap;
+#[cfg(test)]
+use std::cell::RefCell;
+
+use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_index::{
     IndexVec,
     bit_set::{DenseBitSet, SparseBitMatrix},
@@ -151,8 +154,6 @@ impl<'tcx> Analysis<'tcx> for LoanLiveAt<'_> {
 //      closure-derived depth-0 value flows are `All`, since a transitive-closure edge has no
 //      single location and locating them means touching `origin_flow` (that is A1).
 // ===========================================================================================
-
-use rustc_hash::FxHashSet;
 
 /// Where a subset constraint applies. `All` is the escape hatch for a constraint with no
 /// meaningful program point; it behaves exactly as the landed flow-insensitive relation did.
@@ -420,6 +421,88 @@ fn successor_points(
             })
         })
         .collect()
+}
+
+#[cfg(test)]
+thread_local! {
+    static ESCAPED_EXTENSION_CAPTURE: RefCell<Option<Vec<(Loan, PointIndex)>>> =
+        const { RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn with_escaped_extension_trace<T>(
+    f: impl FnOnce() -> T,
+) -> (T, Vec<(Loan, PointIndex)>) {
+    struct Restore(Option<Vec<(Loan, PointIndex)>>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            ESCAPED_EXTENSION_CAPTURE.with(|capture| {
+                *capture.borrow_mut() = self.0.take();
+            });
+        }
+    }
+    let _restore =
+        Restore(ESCAPED_EXTENSION_CAPTURE.with(|capture| capture.replace(Some(Vec::new()))));
+    let output = f();
+    let events = ESCAPED_EXTENSION_CAPTURE
+        .with(|capture| capture.borrow_mut().take())
+        .unwrap_or_default();
+    (output, events)
+}
+
+/// ②-minimal: keep only the typed escaped CopyLend loans live from the
+/// successors of their reservation points through every reachable exit.
+pub(super) fn extend_escaped_loans_to_exit(
+    body: &Body<'_>,
+    borrow_set: &BorrowSet<'_>,
+    location_map: &DenseLocationMap,
+    escaped: &DenseBitSet<Loan>,
+    loan_liveness: &mut SparseBitMatrix<PointIndex, Loan>,
+) {
+    for loan in escaped.iter() {
+        let reserve = location_map.point_from_location(borrow_set.loans[loan].location());
+        let mut stack = successor_points(body, location_map, reserve);
+        let mut visited = FxHashSet::default();
+        while let Some(point) = stack.pop() {
+            if !visited.insert(point) {
+                continue;
+            }
+            loan_liveness.insert(point, loan);
+            #[cfg(test)]
+            ESCAPED_EXTENSION_CAPTURE.with(|capture| {
+                if let Some(events) = capture.borrow_mut().as_mut() {
+                    events.push((loan, point));
+                }
+            });
+            stack.extend(successor_points(body, location_map, point));
+        }
+    }
+}
+
+/// Load-bearing differential: ② may add liveness only for its selected escaped
+/// loans. Every other `(point, loan)` bit is byte-identical.
+pub(super) fn assert_non_escaped_liveness_equal(
+    before: &SparseBitMatrix<PointIndex, Loan>,
+    after: &SparseBitMatrix<PointIndex, Loan>,
+    escaped: &DenseBitSet<Loan>,
+) {
+    let points = before.rows().chain(after.rows()).collect::<FxHashSet<_>>();
+    for point in points {
+        for loan in before
+            .row(point)
+            .into_iter()
+            .flat_map(|row| row.iter())
+            .chain(after.row(point).into_iter().flat_map(|row| row.iter()))
+            .filter(|loan| !escaped.contains(*loan))
+        {
+            let before_has = before.row(point).is_some_and(|row| row.contains(loan));
+            let after_has = after.row(point).is_some_and(|row| row.contains(loan));
+            assert_eq!(
+                before_has, after_has,
+                "②-minimal changed non-selected loan {loan:?} at {point:?}"
+            );
+        }
+    }
 }
 
 // ===========================================================================================

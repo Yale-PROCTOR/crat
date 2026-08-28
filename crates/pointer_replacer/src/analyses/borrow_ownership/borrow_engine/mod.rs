@@ -46,9 +46,11 @@ pub(crate) use a5_places_conflict::ParameterOverlap;
 pub(crate) use conflicts::{borrow_conflicts, borrow_conflicts_replaying};
 pub(crate) use conflicts::{
     borrow_conflicts_replaying_with_flows, borrow_conflicts_replaying_with_flows_and_copy_lends,
+    borrow_conflicts_replaying_with_flows_and_copy_lends_and_escaped,
     borrow_conflicts_replaying_with_flows_and_parameter_overlap,
+    borrow_conflicts_replaying_with_flows_and_parameter_overlap_and_escaped,
     borrow_conflicts_replaying_witnessed, borrow_conflicts_replaying_witnessed_with_copy_lends,
-    borrow_conflicts_with_flows,
+    borrow_conflicts_replaying_witnessed_with_copy_lends_and_escaped, borrow_conflicts_with_flows,
 };
 // §NB4-R: the compose/type-check decision, re-exported so its fallback is unit-testable in isolation
 // (grouping-independent — see `nb4r_route_compose_fallback_on_type_mismatch`).
@@ -56,6 +58,8 @@ pub(crate) use conflicts::{
 pub(crate) use conflicts::{demotion_witness_census, loan_liveness_census};
 #[cfg(test)]
 pub(crate) use invalidates::{RoutedCompose, route_compose};
+#[cfg(test)]
+pub(crate) use loan_liveness::with_escaped_extension_trace;
 #[cfg(test)]
 pub(crate) use origin_replay::selected_copy_lend_contains;
 pub(crate) use places_conflict::{AccessDepth, PlaceConflictBias, places_conflict};

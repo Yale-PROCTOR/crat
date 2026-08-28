@@ -131,9 +131,13 @@ impl<'a> NativeBorrowContext<'a> {
         f: LocalDefId,
         disabled_fields: &[StructFieldSlot],
         selected_copy_lends: &FxHashSet<SelectedCopyLendLoan>,
+        escaped_copy_lends: &FxHashSet<SelectedCopyLendLoan>,
     ) -> NativeInference<'tcx> {
         let mut inference = borrow_inference(tcx, f, &self.borrow);
         let mut copy_lends = DenseBitSet::new_empty(inference.borrow_set.loans.len());
+        let mut escaped_lends = DenseBitSet::new_empty(inference.borrow_set.loans.len());
+        let mut unmatched_selected = selected_copy_lends.clone();
+        let mut unmatched_escaped = escaped_copy_lends.clone();
         for (loan, data) in inference.borrow_set.loans.iter_enumerated() {
             let borrower = match data.assigned {
                 Borrower::Assign(owner) => export::BorrowerKind::Assign {
@@ -144,17 +148,38 @@ impl<'a> NativeBorrowContext<'a> {
                     arg_index,
                 },
             };
-            if selected_copy_lend_contains(
-                selected_copy_lends,
-                &SelectedCopyLendLoan {
-                    location: export::location_key(data.location()),
-                    borrowed: export::PlaceKey::from_place(data.borrowed),
-                    borrower,
-                },
-            ) {
+            let identity = SelectedCopyLendLoan {
+                location: export::location_key(data.location()),
+                borrowed: export::PlaceKey::from_place(data.borrowed),
+                borrower,
+            };
+            if selected_copy_lend_contains(selected_copy_lends, &identity) {
+                assert!(
+                    unmatched_selected.remove(&identity),
+                    "selected CopyLend identity matched multiple BorrowSet loans: {identity:?}"
+                );
                 copy_lends.insert(loan);
             }
+            if selected_copy_lend_contains(escaped_copy_lends, &identity) {
+                assert!(
+                    selected_copy_lends.contains(&identity),
+                    "escaped CopyLend must also carry typed CopyLend invalidation semantics"
+                );
+                assert!(
+                    unmatched_escaped.remove(&identity),
+                    "escaped CopyLend identity matched multiple BorrowSet loans: {identity:?}"
+                );
+                escaped_lends.insert(loan);
+            }
         }
+        assert!(
+            unmatched_selected.is_empty(),
+            "selected CopyLend identities did not match BorrowSet: {unmatched_selected:#?}"
+        );
+        assert!(
+            unmatched_escaped.is_empty(),
+            "escaped CopyLend identities did not match BorrowSet: {unmatched_escaped:#?}"
+        );
         let provenance_set = self.borrow.provenances.get(&f).unwrap();
         let graph = NativeConstraintGraph::new(
             &inference,
@@ -178,7 +203,7 @@ impl<'a> NativeBorrowContext<'a> {
             &inference.requires,
             &inference.killed,
         );
-        let (ported_loan_liveness, ported_requires) =
+        let (mut ported_loan_liveness, ported_requires) =
             loan_liveness::compute_loan_liveness_localized(
                 body,
                 &inference.borrow_set,
@@ -198,6 +223,19 @@ impl<'a> NativeBorrowContext<'a> {
             &inference.requires,
             &ported_loan_liveness,
             &ported_requires,
+        );
+        let ordinary_loan_liveness = ported_loan_liveness.clone();
+        loan_liveness::extend_escaped_loans_to_exit(
+            body,
+            &inference.borrow_set,
+            &inference.location_map,
+            &escaped_lends,
+            &mut ported_loan_liveness,
+        );
+        loan_liveness::assert_non_escaped_liveness_equal(
+            &ordinary_loan_liveness,
+            &ported_loan_liveness,
+            &escaped_lends,
         );
         inference.loan_liveness = ported_loan_liveness;
         let localized_requires = Some(ported_requires);

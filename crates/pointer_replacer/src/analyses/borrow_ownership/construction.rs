@@ -30,8 +30,9 @@ use super::{
     a5_producer::{A5Plan, PlannedC9Mark, produce_a5_plan},
     borrow_verify::{
         verify_to_fixpoint_counting_with_flows,
-        verify_to_fixpoint_counting_with_flows_and_copy_lends,
-        verify_to_fixpoint_counting_with_flows_and_parameter_overlaps,
+        verify_to_fixpoint_counting_with_flows_and_copy_lends_and_escaped,
+        verify_to_fixpoint_counting_with_flows_and_escaped_copy_lends,
+        verify_to_fixpoint_counting_with_flows_and_parameter_overlaps_and_escaped,
     },
     boundary_table::{self, Matcher, Role},
     coherence::{
@@ -212,6 +213,7 @@ pub(crate) struct BoConstruction {
     pub(crate) a2_opaque_result_guards: usize,
     pub(crate) selectors: Selectors,
     pub(crate) eligibility: CopyLendEligibility,
+    pub(crate) esc_minimal: super::esc_minimal::EscMinimalSelection,
     pub(crate) stats: BoOwnEmissionStats,
     pub(crate) eligibility_elapsed: Duration,
     pub(crate) emit_elapsed: Duration,
@@ -543,6 +545,7 @@ pub(crate) fn construct_bo_into(
     mode: CopyLendMode,
 ) -> anyhow::Result<BoConstruction> {
     let crate_ctxt = CrateCtxt::new(program);
+    let esc_minimal = super::esc_minimal::select(program, slots);
     let t = Instant::now();
     let eligibility = if mode == CopyLendMode::LendArm {
         analyze_copy_lend_eligibility(program, slots, mut_facts, origins.native_flows())
@@ -599,6 +602,7 @@ pub(crate) fn construct_bo_into(
         a2_opaque_result_guards: 0,
         selectors,
         eligibility,
+        esc_minimal,
         stats,
         eligibility_elapsed,
         emit_elapsed,
@@ -768,6 +772,7 @@ pub(crate) fn construct_tracked_census_baseline(
         a2_opaque_result_guards: 0,
         selectors,
         eligibility: CopyLendEligibility::default(),
+        esc_minimal: super::esc_minimal::select(program, slots),
         stats,
         eligibility_elapsed: Duration::ZERO,
         emit_elapsed,
@@ -858,7 +863,7 @@ pub(crate) fn verify_bo_construction_with_parameter_overlaps(
         CopyLendMode::Baseline,
         "A5 focused replay must keep the independent CopyLend switch at baseline"
     );
-    verify_to_fixpoint_counting_with_flows_and_parameter_overlaps(
+    verify_to_fixpoint_counting_with_flows_and_parameter_overlaps_and_escaped(
         program,
         slots,
         origins.native_flows(),
@@ -866,6 +871,7 @@ pub(crate) fn verify_bo_construction_with_parameter_overlaps(
         &construction.selectors,
         mut_facts,
         parameter_overlaps,
+        &construction.esc_minimal.loans,
     )
 }
 
@@ -881,7 +887,7 @@ pub(crate) fn verify_bo_construction_counting(
     super::borrow_verify::RoundStats,
 ) {
     match construction.mode {
-        CopyLendMode::LendArm => verify_to_fixpoint_counting_with_flows_and_copy_lends(
+        CopyLendMode::LendArm => verify_to_fixpoint_counting_with_flows_and_copy_lends_and_escaped(
             program,
             slots,
             origins.native_flows(),
@@ -889,15 +895,17 @@ pub(crate) fn verify_bo_construction_counting(
             &construction.selectors,
             mut_facts,
             &construction.eligibility.pairs,
+            &construction.esc_minimal.loans,
         ),
         CopyLendMode::Baseline | CopyLendMode::RemovalOnly => {
-            verify_to_fixpoint_counting_with_flows(
+            verify_to_fixpoint_counting_with_flows_and_escaped_copy_lends(
                 program,
                 slots,
                 origins.native_flows(),
                 solver,
                 &construction.selectors,
                 mut_facts,
+                &construction.esc_minimal.loans,
             )
         }
     }
@@ -946,6 +954,7 @@ pub(crate) fn verify_bo_construction_counting_for_test(
         &construction.selectors,
         mut_facts,
         copy_lends,
+        Some(&construction.esc_minimal.loans),
         None,
         backend.loop_backend(),
     )
@@ -976,6 +985,7 @@ pub(crate) fn verify_bo_construction_l2_for_test(
         &construction.selectors,
         mut_facts,
         copy_lends,
+        Some(&construction.esc_minimal.loans),
         backend.loop_backend(),
     )
 }

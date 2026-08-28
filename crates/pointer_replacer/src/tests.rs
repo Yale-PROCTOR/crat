@@ -10114,6 +10114,7 @@ mod borrow_ownership_coherence {
                 borrow_engine::{
                     borrow_conflicts_replaying_with_flows_and_copy_lends,
                     borrow_conflicts_replaying_witnessed_with_copy_lends,
+                    with_escaped_extension_trace,
                 },
                 borrow_verify::{
                     SlotConflict, materialize_guards, model_accepts, revalidate,
@@ -10130,6 +10131,7 @@ mod borrow_ownership_coherence {
                 },
                 crate_slots::CrateSlots,
                 emit_crate_ownership_constraints, emit_crate_ownership_constraints_with_copy_lends,
+                esc_minimal::with_fixture_selection,
                 export::{LoanClass, location_key, with_bo_export},
                 mutability_facts::MutFacts,
                 origins::{collect_no_borrow_origin_slots, compute_origins},
@@ -12700,9 +12702,53 @@ unsafe fn caller() -> i32 {
 "#;
         run_compiler(CODE, |tcx| {
             let program = collect_program(tcx);
-            let m = nb4_accept(tcx, &program, "save", &["out", "x"]);
+            let slots = CrateSlots::build(&program);
+            let origins = compute_origins(&program);
+            let facts = MutFacts::from_program(&program);
+            let solver = KindSolver::new(&slots);
+            let (((model, stats), export), extensions, selected_sites) =
+                with_fixture_selection(|| {
+                    let construction = construct_bo_into(
+                        &program,
+                        &slots,
+                        &origins,
+                        &facts,
+                        &solver,
+                        CopyLendMode::Baseline,
+                    )
+                    .expect("ESC-W1 shared construction");
+                    let selected_sites = construction.esc_minimal.sites.len();
+                    let (((model, stats), export), extensions) =
+                        with_escaped_extension_trace(|| {
+                            with_bo_export(|| {
+                                verify_bo_construction_counting(
+                                    &program,
+                                    &slots,
+                                    &origins,
+                                    &solver,
+                                    &construction,
+                                    &facts,
+                                )
+                            })
+                        });
+                    (((model, stats), export), extensions, selected_sites)
+                });
+            assert_eq!(selected_sites, 1, "ESC-W1 selects one exact N4 site");
+            assert_eq!(stats.copy_lend_replay_selections, 1);
+            assert!(!extensions.is_empty(), "escaped loan was not extended");
+            let copy_lends = export
+                .loans
+                .iter()
+                .filter(|loan| loan.class == LoanClass::CopyLend)
+                .collect::<Vec<_>>();
+            assert_eq!(copy_lends.len(), 1, "exactly one selected CopyLend loan");
+            assert!(copy_lends[0].invalid, "post-store write must invalidate it");
+            let model = model.expect("ESC-W1 accepts after conservative repair");
+            let save = function_by_name(&program, "save");
+            let x = local_by_var_name(tcx, save, "x");
+            let x = local_slot(&slots, save, x, 0);
             assert_eq!(
-                m[1].0,
+                model.get(&x).copied(),
                 Some(SlotKind::Raw),
                 "②-minimal must keep the selected escaped copy loan live through exit so the \
                  post-store write demotes save::x"
@@ -16968,6 +17014,7 @@ pub unsafe fn f() -> i32 {
                     &construction.selectors,
                     &facts,
                     Some(&construction.eligibility.pairs),
+                    None,
                 );
                 assert_eq!(stats.copy_lend_replay_selections, 1);
                 let model = model.expect("L2 must accept the dead-before-free CopyLend");

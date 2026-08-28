@@ -95,12 +95,40 @@ pub(crate) struct EscMinimalSelection {
     pub(crate) loans: SelectedCopyLendLoans,
 }
 
+#[cfg(test)]
+thread_local! {
+    static FIXTURE_SELECTION: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+pub(crate) fn with_fixture_selection<T>(f: impl FnOnce() -> T) -> T {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            FIXTURE_SELECTION.with(|enabled| enabled.set(self.0));
+        }
+    }
+    let previous = FIXTURE_SELECTION.with(|enabled| enabled.replace(true));
+    let _restore = Restore(previous);
+    f()
+}
+
+fn fixture_selection_enabled() -> bool {
+    #[cfg(test)]
+    {
+        return FIXTURE_SELECTION.with(std::cell::Cell::get);
+    }
+    #[cfg(not(test))]
+    false
+}
+
 #[derive(Clone, Debug)]
 struct Site {
     function: String,
     fn_did: LocalDefId,
     location: MirLocationKey,
-    syntactic_source: PlaceKey,
+    loan_location: MirLocationKey,
+    loan_borrowed: PlaceKey,
     lhs: SlotRef,
     rhs: SlotRef,
     borrower: BorrowerKind,
@@ -124,13 +152,16 @@ fn copy_form<'tcx>(rvalue: &Rvalue<'tcx>) -> Option<Place<'tcx>> {
 
 fn chase_origin<'tcx>(
     mut place: Place<'tcx>,
-    temp_defs: &FxHashMap<Local, Place<'tcx>>,
+    temp_defs: &FxHashMap<Local, TempDef<'tcx>>,
 ) -> Place<'tcx> {
     for _ in 0..ORIGIN_CHASE_LIMIT {
         if !place.projection.is_empty() {
             break;
         }
-        let Some(&next) = temp_defs.get(&place.local) else {
+        let Some(next) = temp_defs
+            .get(&place.local)
+            .map(|definition| definition.source)
+        else {
             break;
         };
         if next == place {
@@ -139,6 +170,12 @@ fn chase_origin<'tcx>(
         place = next;
     }
     place
+}
+
+#[derive(Clone, Copy)]
+struct TempDef<'tcx> {
+    source: Place<'tcx>,
+    location: Location,
 }
 
 fn escaping(body: &Body<'_>, destination: Place<'_>) -> bool {
@@ -213,8 +250,8 @@ fn collect_sites(
             .borrow();
         let eliminable = eliminable_temporaries(&body);
         let mut temp_defs = FxHashMap::default();
-        for data in body.basic_blocks.iter() {
-            for statement in &data.statements {
+        for (block, data) in body.basic_blocks.iter_enumerated() {
+            for (statement_index, statement) in data.statements.iter().enumerate() {
                 let StatementKind::Assign(assign) = &statement.kind else {
                     continue;
                 };
@@ -225,7 +262,16 @@ fn collect_sites(
                     && let Some(source) = copy_form(&assign.1)
                     && source.ty(&body.local_decls, program.tcx).ty.is_any_ptr()
                 {
-                    temp_defs.insert(destination, source);
+                    temp_defs.insert(
+                        destination,
+                        TempDef {
+                            source,
+                            location: Location {
+                                block,
+                                statement_index,
+                            },
+                        },
+                    );
                 }
             }
         }
@@ -237,6 +283,9 @@ fn collect_sites(
             origin: Place<'tcx>,
             lhs: SlotRef,
             rhs: SlotRef,
+            loan_location: Location,
+            loan_source: Place<'tcx>,
+            loan_borrower: BorrowerKind,
         }
         let mut pending = Vec::new();
         for (block, data) in body.basic_blocks.iter_enumerated() {
@@ -257,6 +306,31 @@ fn collect_sites(
                 ) else {
                     continue;
                 };
+                let lhs = slot_ref(fn_did, lhs);
+                let (loan_location, loan_source, loan_borrower) = source
+                    .as_local()
+                    .and_then(|local| temp_defs.get(&local).map(|definition| (local, *definition)))
+                    .map(|(borrower, definition)| {
+                        (
+                            definition.location,
+                            definition.source,
+                            BorrowerKind::Assign {
+                                owner: OwnerKey::Local(borrower.as_u32()),
+                            },
+                        )
+                    })
+                    .unwrap_or_else(|| {
+                        (
+                            Location {
+                                block,
+                                statement_index,
+                            },
+                            source,
+                            BorrowerKind::Assign {
+                                owner: owner_key(slots, lhs),
+                            },
+                        )
+                    });
                 pending.push(Pending {
                     location: Location {
                         block,
@@ -265,8 +339,11 @@ fn collect_sites(
                     source,
                     destination: assign.0,
                     origin,
-                    lhs: slot_ref(fn_did, lhs),
+                    lhs,
                     rhs: slot_ref(fn_did, rhs),
+                    loan_location,
+                    loan_source,
+                    loan_borrower,
                 });
             }
         }
@@ -309,14 +386,17 @@ fn collect_sites(
                     row.location.block.as_u32(),
                     row.location.statement_index,
                 ),
-                syntactic_source: PlaceKey::from_place(
-                    row.source.project_deeper(&[PlaceElem::Deref], program.tcx),
+                loan_location: MirLocationKey::new(
+                    row.loan_location.block.as_u32(),
+                    row.loan_location.statement_index,
+                ),
+                loan_borrowed: PlaceKey::from_place(
+                    row.loan_source
+                        .project_deeper(&[PlaceElem::Deref], program.tcx),
                 ),
                 lhs: row.lhs,
                 rhs: row.rhs,
-                borrower: BorrowerKind::Assign {
-                    owner: owner_key(slots, row.lhs),
-                },
+                borrower: row.loan_borrower,
                 resolved_origin_slot: origin_key,
                 destination_place,
                 escaping: is_escaping,
@@ -331,37 +411,46 @@ fn collect_sites(
 }
 
 pub(crate) fn select(program: &RustProgram<'_>, slots: &CrateSlots) -> EscMinimalSelection {
-    let rows = collect_sites(program, slots, true);
+    let fixture_selection = fixture_selection_enabled();
+    let rows = collect_sites(program, slots, !fixture_selection);
     let present_functions = program
         .functions
         .iter()
         .map(|did| program.tcx.def_path_str(did.to_def_id()))
         .collect::<FxHashSet<_>>();
-    let expected = artifact_keys()
-        .iter()
-        .filter(|key| present_functions.contains(key.function))
-        .collect::<Vec<_>>();
+    let expected = if fixture_selection {
+        Vec::new()
+    } else {
+        artifact_keys()
+            .iter()
+            .filter(|key| present_functions.contains(key.function))
+            .collect::<Vec<_>>()
+    };
     let selected = rows.iter().filter(|row| row.selected).collect::<Vec<_>>();
-    assert_eq!(
-        selected.len(),
-        expected.len(),
-        "②-minimal exact allowlist did not join one-to-one in this crate"
-    );
+    if !fixture_selection {
+        assert_eq!(
+            selected.len(),
+            expected.len(),
+            "②-minimal exact allowlist did not join one-to-one in this crate"
+        );
+    }
 
     let mut answer = EscMinimalSelection::default();
     for row in selected {
-        let artifact = artifact_keys()
-            .iter()
-            .find(|key| {
-                key.function == row.function
-                    && key.location == row.location
-                    && key.resolved_origin_slot == row.resolved_origin_slot
-                    && key.destination_place == row.destination_place
-            })
-            .expect("selected row has artifact key");
+        let artifact = (!fixture_selection).then(|| {
+            artifact_keys()
+                .iter()
+                .find(|key| {
+                    key.function == row.function
+                        && key.location == row.location
+                        && key.resolved_origin_slot == row.resolved_origin_slot
+                        && key.destination_place == row.destination_place
+                })
+                .expect("selected row has artifact key")
+        });
         let loan = SelectedCopyLendLoan {
-            location: row.location,
-            borrowed: row.syntactic_source.clone(),
+            location: row.loan_location,
+            borrowed: row.loan_borrowed.clone(),
             borrower: row.borrower,
         };
         assert!(
@@ -374,7 +463,7 @@ pub(crate) fn select(program: &RustProgram<'_>, slots: &CrateSlots) -> EscMinima
         );
         answer.sites.push(EscRuntimeSite {
             key: EscCopySiteKey {
-                program: artifact.program.to_owned(),
+                program: artifact.map_or("fixture", |key| key.program).to_owned(),
                 function: row.function.clone(),
                 location: row.location,
                 resolved_origin_slot: row.resolved_origin_slot.clone(),

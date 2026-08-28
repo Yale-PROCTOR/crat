@@ -269,6 +269,7 @@ pub(crate) fn revalidate_replaying(
         is_mutable,
         None,
         None,
+        None,
     )
 }
 
@@ -289,6 +290,7 @@ pub(crate) fn revalidate_replaying_with_parameter_overlap(
         is_raw,
         is_mutable,
         None,
+        None,
         Some(parameter_overlaps),
     )
 }
@@ -301,6 +303,7 @@ fn revalidate_replaying_with_flows(
     is_raw: impl Fn(SlotRef) -> bool,
     is_mutable: impl MutProvider + Copy,
     selected_copy_lends: Option<&SelectedCopyLendLoans>,
+    escaped_copy_lends: Option<&SelectedCopyLendLoans>,
     parameter_overlaps: Option<&FxHashMap<LocalDefId, super::borrow_engine::ParameterOverlap>>,
 ) -> FxHashMap<LocalDefId, Vec<SlotConflict>> {
     let is_ref = &is_ref;
@@ -344,6 +347,7 @@ fn revalidate_replaying_with_flows(
         super::borrow_engine::ForkEngineMode::Production => {
             assert!(
                 selected_copy_lends.is_none_or(|selected| selected.is_empty())
+                    && escaped_copy_lends.is_none_or(|selected| selected.is_empty())
                     && parameter_overlaps.is_none(),
                 "CopyLend/A5 replay requires the BO fork engine"
             );
@@ -352,7 +356,7 @@ fn revalidate_replaying_with_flows(
         super::borrow_engine::ForkEngineMode::Fork => {
             if let Some(parameter_overlaps) = parameter_overlaps {
                 let empty = SelectedCopyLendLoans::default();
-                super::borrow_engine::borrow_conflicts_replaying_with_flows_and_parameter_overlap(
+                super::borrow_engine::borrow_conflicts_replaying_with_flows_and_parameter_overlap_and_escaped(
                     program,
                     origin_flows,
                     cand,
@@ -360,12 +364,13 @@ fn revalidate_replaying_with_flows(
                     mutab,
                     &raw_fields,
                     selected_copy_lends.unwrap_or(&empty),
+                    escaped_copy_lends.unwrap_or(&empty),
                     parameter_overlaps,
                 )
             } else {
                 match selected_copy_lends {
                     Some(selected) => {
-                        super::borrow_engine::borrow_conflicts_replaying_with_flows_and_copy_lends(
+                        super::borrow_engine::borrow_conflicts_replaying_with_flows_and_copy_lends_and_escaped(
                             program,
                             origin_flows,
                             cand,
@@ -373,6 +378,7 @@ fn revalidate_replaying_with_flows(
                             mutab,
                             &raw_fields,
                             selected,
+                            escaped_copy_lends.unwrap_or(&SelectedCopyLendLoans::default()),
                         )
                     }
                     None => super::borrow_engine::borrow_conflicts_replaying_with_flows(
@@ -402,6 +408,7 @@ fn revalidate_replaying_witnessed(
     is_raw: impl Fn(SlotRef) -> bool,
     is_mutable: impl MutProvider + Copy,
     selected_copy_lends: Option<&SelectedCopyLendLoans>,
+    escaped_copy_lends: Option<&SelectedCopyLendLoans>,
 ) -> FxHashMap<LocalDefId, Vec<WitnessedSlotConflict>> {
     let is_ref = &is_ref;
     let is_raw = &is_raw;
@@ -440,7 +447,7 @@ fn revalidate_replaying_witnessed(
     );
     let edges = match selected_copy_lends {
         Some(selected) => {
-            super::borrow_engine::borrow_conflicts_replaying_witnessed_with_copy_lends(
+            super::borrow_engine::borrow_conflicts_replaying_witnessed_with_copy_lends_and_escaped(
                 program,
                 origin_flows,
                 cand,
@@ -448,6 +455,7 @@ fn revalidate_replaying_witnessed(
                 mutab,
                 &raw_fields,
                 selected,
+                escaped_copy_lends.unwrap_or(&SelectedCopyLendLoans::default()),
             )
         }
         None => super::borrow_engine::borrow_conflicts_replaying_witnessed(
@@ -721,6 +729,26 @@ fn solve_l2_round_model(
     }
 }
 
+fn selected_copy_lends_for_round(
+    program: &RustProgram,
+    slots: &CrateSlots,
+    model: &FxHashMap<SlotRef, SlotKind>,
+    pair_lends: Option<&FxHashSet<CopyLendPair>>,
+    escaped: Option<&SelectedCopyLendLoans>,
+) -> SelectedCopyLendLoans {
+    let mut selected = escaped.cloned().unwrap_or_default();
+    if let Some(pairs) = pair_lends {
+        for (fn_did, loans) in selected_copy_lend_sites(program, slots, pairs, model) {
+            selected.entry(fn_did).or_default().extend(loans);
+        }
+    }
+    selected
+}
+
+fn selected_copy_lend_count(selected: &SelectedCopyLendLoans) -> usize {
+    selected.values().map(FxHashSet::len).sum()
+}
+
 /// The §8 BB2-ii CEGAR validate/re-solve loop (Mode A) with native counters. See
 /// `verify_to_fixpoint`'s contract above for scope/soundness. Uses `model_kinds_relaxing_reporting`
 /// (identical model to the plain twin the wrapper's callers used, plus the dropped-selector set for
@@ -760,6 +788,7 @@ pub(crate) fn verify_to_fixpoint_counting_with_flows(
         is_mutable,
         None,
         None,
+        None,
         LoopBackend::HardCheckRoundOptimize,
     )
 }
@@ -782,6 +811,7 @@ pub(crate) fn verify_to_fixpoint_counting_with_flows_and_copy_lends(
         is_mutable,
         Some(copy_lends),
         None,
+        None,
         LoopBackend::HardCheckRoundOptimize,
     )
 }
@@ -803,6 +833,78 @@ pub(crate) fn verify_to_fixpoint_counting_with_flows_and_parameter_overlaps(
         selectors,
         is_mutable,
         None,
+        None,
+        Some(parameter_overlaps),
+        LoopBackend::HardCheckRoundOptimize,
+    )
+}
+
+pub(crate) fn verify_to_fixpoint_counting_with_flows_and_escaped_copy_lends(
+    program: &RustProgram,
+    slots: &CrateSlots,
+    origin_flows: &OriginFlowResults,
+    solver: &KindSolver,
+    selectors: &Selectors,
+    is_mutable: impl MutProvider + Copy,
+    escaped_copy_lends: &SelectedCopyLendLoans,
+) -> (Option<FxHashMap<SlotRef, SlotKind>>, RoundStats) {
+    verify_to_fixpoint_counting_with_flows_impl(
+        program,
+        slots,
+        origin_flows,
+        solver,
+        selectors,
+        is_mutable,
+        None,
+        Some(escaped_copy_lends),
+        None,
+        LoopBackend::HardCheckRoundOptimize,
+    )
+}
+
+pub(crate) fn verify_to_fixpoint_counting_with_flows_and_copy_lends_and_escaped(
+    program: &RustProgram,
+    slots: &CrateSlots,
+    origin_flows: &OriginFlowResults,
+    solver: &KindSolver,
+    selectors: &Selectors,
+    is_mutable: impl MutProvider + Copy,
+    copy_lends: &FxHashSet<CopyLendPair>,
+    escaped_copy_lends: &SelectedCopyLendLoans,
+) -> (Option<FxHashMap<SlotRef, SlotKind>>, RoundStats) {
+    verify_to_fixpoint_counting_with_flows_impl(
+        program,
+        slots,
+        origin_flows,
+        solver,
+        selectors,
+        is_mutable,
+        Some(copy_lends),
+        Some(escaped_copy_lends),
+        None,
+        LoopBackend::HardCheckRoundOptimize,
+    )
+}
+
+pub(crate) fn verify_to_fixpoint_counting_with_flows_and_parameter_overlaps_and_escaped(
+    program: &RustProgram,
+    slots: &CrateSlots,
+    origin_flows: &OriginFlowResults,
+    solver: &KindSolver,
+    selectors: &Selectors,
+    is_mutable: impl MutProvider + Copy,
+    parameter_overlaps: &FxHashMap<LocalDefId, super::borrow_engine::ParameterOverlap>,
+    escaped_copy_lends: &SelectedCopyLendLoans,
+) -> (Option<FxHashMap<SlotRef, SlotKind>>, RoundStats) {
+    verify_to_fixpoint_counting_with_flows_impl(
+        program,
+        slots,
+        origin_flows,
+        solver,
+        selectors,
+        is_mutable,
+        None,
+        Some(escaped_copy_lends),
         Some(parameter_overlaps),
         LoopBackend::HardCheckRoundOptimize,
     )
@@ -816,6 +918,7 @@ pub(super) fn verify_to_fixpoint_counting_with_flows_impl(
     selectors: &Selectors,
     is_mutable: impl MutProvider + Copy,
     copy_lends: Option<&FxHashSet<CopyLendPair>>,
+    escaped_copy_lends: Option<&SelectedCopyLendLoans>,
     parameter_overlaps: Option<&FxHashMap<LocalDefId, super::borrow_engine::ParameterOverlap>>,
     backend: LoopBackend,
 ) -> (Option<FxHashMap<SlotRef, SlotKind>>, RoundStats) {
@@ -846,6 +949,7 @@ pub(super) fn verify_to_fixpoint_counting_with_flows_impl(
             selectors,
             is_mutable,
             copy_lends,
+            escaped_copy_lends,
         );
     }
     let cap = round_cap(slots);
@@ -871,11 +975,10 @@ pub(super) fn verify_to_fixpoint_counting_with_flows_impl(
         // not the union over rejected intermediate models.
         super::export::begin_round();
         let selected_copy_lends =
-            copy_lends.map(|pairs| selected_copy_lend_sites(program, slots, pairs, &model));
-        stats.copy_lend_replay_selections = selected_copy_lends
-            .as_ref()
-            .map(|selected| selected.values().map(FxHashSet::len).sum())
-            .unwrap_or(0);
+            selected_copy_lends_for_round(program, slots, &model, copy_lends, escaped_copy_lends);
+        stats.copy_lend_replay_selections = selected_copy_lend_count(&selected_copy_lends);
+        let selected_copy_lends =
+            (stats.copy_lend_replay_selections != 0).then_some(selected_copy_lends);
         let conflicts = revalidate_replaying_with_flows(
             program,
             slots,
@@ -918,6 +1021,7 @@ pub(super) fn verify_to_fixpoint_counting_with_flows_impl(
             },
             is_mutable,
             selected_copy_lends.as_ref(),
+            escaped_copy_lends,
             parameter_overlaps,
         );
         // §NB5-F — partition the residual-conflict guard by owner class. A non-`Ref` FIELD in a
@@ -1176,6 +1280,7 @@ pub(crate) fn verify_l2_to_fixpoint_counting(
     selectors: &Selectors,
     is_mutable: impl MutProvider + Copy,
     copy_lends: Option<&FxHashSet<CopyLendPair>>,
+    escaped_copy_lends: Option<&SelectedCopyLendLoans>,
 ) -> (Option<FxHashMap<SlotRef, SlotKind>>, RoundStats) {
     verify_l2_to_fixpoint_counting_impl(
         program,
@@ -1185,6 +1290,7 @@ pub(crate) fn verify_l2_to_fixpoint_counting(
         selectors,
         is_mutable,
         copy_lends,
+        escaped_copy_lends,
         LoopBackend::HardCheckRoundOptimize,
     )
 }
@@ -1197,6 +1303,7 @@ pub(super) fn verify_l2_to_fixpoint_counting_impl(
     selectors: &Selectors,
     is_mutable: impl MutProvider + Copy,
     copy_lends: Option<&FxHashSet<CopyLendPair>>,
+    escaped_copy_lends: Option<&SelectedCopyLendLoans>,
     backend: LoopBackend,
 ) -> (Option<FxHashMap<SlotRef, SlotKind>>, RoundStats) {
     // D17: re-assert the load-bearing precondition at the door, not only at the
@@ -1259,11 +1366,10 @@ pub(super) fn verify_l2_to_fixpoint_counting_impl(
         // D1: same per-round reset on the L2 path.
         super::export::begin_round();
         let selected_copy_lends =
-            copy_lends.map(|pairs| selected_copy_lend_sites(program, slots, pairs, &model));
-        stats.copy_lend_replay_selections = selected_copy_lends
-            .as_ref()
-            .map(|selected| selected.values().map(FxHashSet::len).sum())
-            .unwrap_or(0);
+            selected_copy_lends_for_round(program, slots, &model, copy_lends, escaped_copy_lends);
+        stats.copy_lend_replay_selections = selected_copy_lend_count(&selected_copy_lends);
+        let selected_copy_lends =
+            (stats.copy_lend_replay_selections != 0).then_some(selected_copy_lends);
         let conflicts = revalidate_replaying_witnessed(
             program,
             slots,
@@ -1275,6 +1381,7 @@ pub(super) fn verify_l2_to_fixpoint_counting_impl(
             },
             is_mutable,
             selected_copy_lends.as_ref(),
+            escaped_copy_lends,
         );
         let mut observations = Vec::new();
         for (did, conflicts) in &conflicts {
@@ -1545,6 +1652,7 @@ fn model_accepts_with_flows_impl(
         },
         is_mutable,
         selected_copy_lends,
+        None,
         None,
     );
     // The loop's accept is `committed == 0` reached WITHOUT tripping either of its two guards: the
