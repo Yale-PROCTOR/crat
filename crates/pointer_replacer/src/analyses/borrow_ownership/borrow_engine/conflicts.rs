@@ -215,7 +215,7 @@ fn extract_conflict_edges(
     let mut edges = Vec::new();
     for loan in invalid_loans.iter() {
         let borrow_data = &borrow_set.loans[loan];
-        let issuer = match borrow_data.assigned {
+        let mut issuer = match borrow_data.assigned {
             Borrower::Assign(owner) => Some(owner),
             Borrower::CallArg(..) => None,
         };
@@ -303,6 +303,13 @@ fn extract_conflict_edges(
                     requirers.push(provenance_set.provenance_data[provenance].owner());
                 }
             }
+        }
+        if let Some(&(resolved_source, resolved_destination)) =
+            inference.escaped_presentations.get(&loan)
+        {
+            issuer = Some(resolved_source);
+            requirers.clear();
+            requirers.push(resolved_destination);
         }
         edges.push(ConflictEdge { issuer, requirers });
     }
@@ -748,6 +755,7 @@ where
             facts: inference,
             copy_lends,
             escaped_lends,
+            escaped_presentations: FxHashMap::default(),
             localized_requires: None,
             all_only_closure: None,
             succ_points: None,

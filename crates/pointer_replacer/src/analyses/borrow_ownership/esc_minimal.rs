@@ -1,6 +1,6 @@
 //! ESC-GAP ②-minimal exact-site selector.
 
-use std::sync::OnceLock;
+use std::{cell::RefCell, sync::OnceLock};
 
 use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_middle::{
@@ -22,7 +22,9 @@ use super::{
 };
 use crate::{
     analyses::{
-        liveness::MaybeLiveLocals, output_params::eliminable_temporaries::eliminable_temporaries,
+        borrow::{ProvenanceOwner, StructFieldSlot as BorrowFieldSlot},
+        liveness::MaybeLiveLocals,
+        output_params::eliminable_temporaries::eliminable_temporaries,
     },
     utils::rustc::RustProgram,
 };
@@ -93,6 +95,43 @@ pub(crate) struct EscRuntimeSite {
 pub(crate) struct EscMinimalSelection {
     pub(crate) sites: Vec<EscRuntimeSite>,
     pub(crate) loans: SelectedCopyLendLoans,
+    presentations:
+        FxHashMap<(LocalDefId, SelectedCopyLendLoan), (ProvenanceOwner, ProvenanceOwner)>,
+}
+
+thread_local! {
+    static PRESENTATIONS: RefCell<
+        Option<FxHashMap<(LocalDefId, SelectedCopyLendLoan), (ProvenanceOwner, ProvenanceOwner)>>,
+    > = const { RefCell::new(None) };
+}
+
+pub(crate) fn with_presentations<T>(selection: &EscMinimalSelection, f: impl FnOnce() -> T) -> T {
+    struct Restore(
+        Option<FxHashMap<(LocalDefId, SelectedCopyLendLoan), (ProvenanceOwner, ProvenanceOwner)>>,
+    );
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            PRESENTATIONS.with(|presentations| {
+                *presentations.borrow_mut() = self.0.take();
+            });
+        }
+    }
+    let previous = PRESENTATIONS
+        .with(|presentations| presentations.replace(Some(selection.presentations.clone())));
+    let _restore = Restore(previous);
+    f()
+}
+
+pub(crate) fn presentation_for(
+    fn_did: LocalDefId,
+    loan: &SelectedCopyLendLoan,
+) -> Option<(ProvenanceOwner, ProvenanceOwner)> {
+    PRESENTATIONS.with(|presentations| {
+        presentations
+            .borrow()
+            .as_ref()
+            .and_then(|presentations| presentations.get(&(fn_did, loan.clone())).copied())
+    })
 }
 
 #[cfg(test)]
@@ -225,6 +264,20 @@ fn owner_key(slots: &CrateSlots, slot: SlotRef) -> OwnerKey {
             struct_did: field.struct_did.local_def_index.as_u32(),
             field_index: field.field_index,
         },
+    }
+}
+
+fn presentation_owner(slots: &CrateSlots, slot: SlotRef) -> ProvenanceOwner {
+    let owner = match slot {
+        SlotRef::Local(fn_did, slot) => slots.fn_local_slots[&fn_did].slot(slot).owner,
+        SlotRef::Field(slot) => slots.field_slots.slot(slot).owner,
+    };
+    match owner {
+        SlotOwner::Local(local) => ProvenanceOwner::Local(local),
+        SlotOwner::Field(field) => ProvenanceOwner::Field(BorrowFieldSlot {
+            struct_did: field.struct_did,
+            field_index: field.field_index,
+        }),
     }
 }
 
@@ -460,6 +513,19 @@ pub(crate) fn select(program: &RustProgram<'_>, slots: &CrateSlots) -> EscMinima
                 .or_default()
                 .insert(loan.clone()),
             "duplicate ②-minimal selected loan"
+        );
+        assert!(
+            answer
+                .presentations
+                .insert(
+                    (row.fn_did, loan.clone()),
+                    (
+                        presentation_owner(slots, row.rhs),
+                        presentation_owner(slots, row.lhs),
+                    ),
+                )
+                .is_none(),
+            "duplicate ②-minimal presentation identity"
         );
         answer.sites.push(EscRuntimeSite {
             key: EscCopySiteKey {

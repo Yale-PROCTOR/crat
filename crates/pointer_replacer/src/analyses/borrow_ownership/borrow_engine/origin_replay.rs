@@ -23,7 +23,7 @@ use crate::{
         },
         borrow_ownership::{
             coherence::SelectedCopyLendLoan,
-            export,
+            esc_minimal, export,
             origin_flow::{self, OriginFlowResults},
             slots::SlotOwner,
         },
@@ -40,6 +40,10 @@ pub(super) struct NativeInference<'tcx> {
     pub(super) facts: BorrowInferenceResults<'tcx>,
     pub(super) copy_lends: DenseBitSet<Loan>,
     pub(super) escaped_lends: DenseBitSet<Loan>,
+    /// Addendum 59: the selected feeder loan keeps its construction-time identity, while the
+    /// repair boundary sees the resolved source and destination parties from the allowlist row.
+    /// No ordinary loan can enter this map.
+    pub(super) escaped_presentations: FxHashMap<Loan, (ProvenanceOwner, ProvenanceOwner)>,
     /// §HLZ-PORT (A2), LANDED — the point-keyed relation, carried HERE and not on `facts`, so
     /// production `BorrowInferenceResults` keeps its type and production's own consumers keep
     /// their behaviour by construction (port-exploration §2.1).
@@ -137,6 +141,7 @@ impl<'a> NativeBorrowContext<'a> {
         let mut inference = borrow_inference(tcx, f, &self.borrow);
         let mut copy_lends = DenseBitSet::new_empty(inference.borrow_set.loans.len());
         let mut escaped_lends = DenseBitSet::new_empty(inference.borrow_set.loans.len());
+        let mut escaped_presentations = FxHashMap::default();
         let mut unmatched_selected = selected_copy_lends.clone();
         let mut unmatched_escaped = escaped_copy_lends.clone();
         for (loan, data) in inference.borrow_set.loans.iter_enumerated() {
@@ -171,6 +176,15 @@ impl<'a> NativeBorrowContext<'a> {
                     "escaped CopyLend identity matched multiple BorrowSet loans: {identity:?}"
                 );
                 escaped_lends.insert(loan);
+                let parties = esc_minimal::presentation_for(f, &identity).unwrap_or_else(|| {
+                    panic!(
+                        "②-selected feeder loan missing transparent-temp presentation: {identity:?}"
+                    )
+                });
+                assert!(
+                    escaped_presentations.insert(loan, parties).is_none(),
+                    "②-selected feeder loan received duplicate presentation"
+                );
             }
         }
         assert!(
@@ -185,6 +199,11 @@ impl<'a> NativeBorrowContext<'a> {
             escaped_lends.iter().count(),
             escaped_copy_lends.len(),
             "② exemption registration count must equal matched allowlist loans"
+        );
+        assert_eq!(
+            escaped_presentations.len(),
+            escaped_copy_lends.len(),
+            "② presentation registration count must equal matched allowlist loans"
         );
         let provenance_set = self.borrow.provenances.get(&f).unwrap();
         let graph = NativeConstraintGraph::new(
@@ -321,6 +340,7 @@ impl<'a> NativeBorrowContext<'a> {
             facts: inference,
             copy_lends,
             escaped_lends,
+            escaped_presentations,
             localized_requires,
             all_only_closure,
             succ_points,
