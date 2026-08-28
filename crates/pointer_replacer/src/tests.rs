@@ -10833,7 +10833,7 @@ pub unsafe fn leak() -> *mut *mut core::ffi::c_void {
                 // broken impl that ignored selectors could not pass.
                 assert_eq!(selectors.all().len(), 1);
                 assert_eq!(
-                    kind_solver.optimize().check(selectors.all()),
+                    kind_solver.check_with_assumptions(selectors.all()),
                     SatResult::Unsat,
                     "the source-owning constraint must make the single solve UNSAT"
                 );
@@ -10897,7 +10897,7 @@ pub unsafe fn two_allocs() -> *mut *mut core::ffi::c_void {
                 assert_eq!(selectors.sources().len(), 2);
                 assert_eq!(selectors.sinks().len(), 1);
                 assert_eq!(
-                    kind_solver.optimize().check(selectors.all()),
+                    kind_solver.check_with_assumptions(selectors.all()),
                     SatResult::Unsat
                 );
 
@@ -11010,17 +11010,17 @@ pub unsafe fn sink_side(a: *mut core::ffi::c_void) -> *mut core::ffi::c_void {
                 // individually satisfiable — a true either/or tie that
                 // phase-2 restoration cannot undo.
                 assert_eq!(
-                    kind_solver.optimize().check(&[s.clone(), k.clone()]),
+                    kind_solver.check_with_assumptions(&[s.clone(), k.clone()]),
                     SatResult::Unsat,
                     "mixed pair {{source, sink}} must be a genuine joint conflict"
                 );
                 assert_eq!(
-                    kind_solver.optimize().check(&[s.clone()]),
+                    kind_solver.check_with_assumptions(&[s.clone()]),
                     SatResult::Sat,
                     "the source alone must be satisfiable (m escapes via the return)"
                 );
                 assert_eq!(
-                    kind_solver.optimize().check(&[k.clone()]),
+                    kind_solver.check_with_assumptions(&[k.clone()]),
                     SatResult::Sat,
                     "the sink alone must be satisfiable (a's unit is voluntary)"
                 );
@@ -11168,8 +11168,7 @@ pub unsafe fn sink_side2(a2: *mut core::ffi::c_void) -> *mut core::ffi::c_void {
                 let k2 = selectors.sinks()[1].clone();
                 let check = |set: &[&z3::ast::Bool]| {
                     kind_solver
-                        .optimize()
-                        .check(&set.iter().map(|&b| b.clone()).collect::<Vec<_>>())
+                        .check_with_assumptions(&set.iter().map(|&b| b.clone()).collect::<Vec<_>>())
                 };
 
                 // The overlapping-core structure: the source ties with EACH
@@ -11297,8 +11296,7 @@ pub unsafe fn ctrl2(a: *mut core::ffi::c_void) {
                 let s2 = selectors.sources()[1].clone();
                 let check = |set: &[&z3::ast::Bool]| {
                     kind_solver
-                        .optimize()
-                        .check(&set.iter().map(|&b| b.clone()).collect::<Vec<_>>())
+                        .check_with_assumptions(&set.iter().map(|&b| b.clone()).collect::<Vec<_>>())
                 };
 
                 // THE PURE-SOURCE TIE PROOF: jointly infeasible, each alone SAT.
@@ -11407,17 +11405,23 @@ pub unsafe fn ctrl() {
                 // Tie proof, sink/sink: jointly infeasible, each side SAT,
                 // and the source allies with either free.
                 assert_eq!(
-                    kind_solver.optimize().check(&[k1.clone(), k2.clone()]),
+                    kind_solver.check_with_assumptions(&[k1.clone(), k2.clone()]),
                     SatResult::Unsat
                 );
-                assert_eq!(kind_solver.optimize().check(&[k1.clone()]), SatResult::Sat);
-                assert_eq!(kind_solver.optimize().check(&[k2.clone()]), SatResult::Sat);
                 assert_eq!(
-                    kind_solver.optimize().check(&[s.clone(), k1.clone()]),
+                    kind_solver.check_with_assumptions(&[k1.clone()]),
                     SatResult::Sat
                 );
                 assert_eq!(
-                    kind_solver.optimize().check(&[s.clone(), k2.clone()]),
+                    kind_solver.check_with_assumptions(&[k2.clone()]),
+                    SatResult::Sat
+                );
+                assert_eq!(
+                    kind_solver.check_with_assumptions(&[s.clone(), k1.clone()]),
+                    SatResult::Sat
+                );
+                assert_eq!(
+                    kind_solver.check_with_assumptions(&[s.clone(), k2.clone()]),
                     SatResult::Sat
                 );
 
