@@ -55,6 +55,8 @@ mod copy_lend_funnel;
 mod kind_equate_core_census;
 #[path = "p_b_measurement.rs"]
 mod p_b_measurement;
+#[path = "phase2_t2_esc_measurement.rs"]
+mod phase2_t2_esc_measurement;
 #[path = "promote_failure_measurement.rs"]
 mod promote_failure_measurement;
 #[path = "s23_measurement.rs"]
@@ -6058,14 +6060,36 @@ mod run {
         let slots = CrateSlots::build(&program);
         let origins = compute_origins(&program);
         let mut_facts = MutFacts::from_program(&program);
-        let Some(verified) = solve_bo_a5_config(
-            &program,
-            &slots,
-            &origins,
-            &mut_facts,
-            mode,
-            Some(WholeProgramAttestation::FrozenBenchmarkGraph),
-        ) else {
+        let phase2_capture = std::env::var_os("CRAT_PHASE2_T2_ESC_CAPTURE").is_some();
+        let (verified, t2_capture) = if phase2_capture {
+            let ((verified, trace), export) =
+                crate::analyses::borrow_ownership::export::with_bo_export(|| {
+                    crate::analyses::borrow_ownership::solver::with_selector_trace(|| {
+                        solve_bo_a5_config(
+                            &program,
+                            &slots,
+                            &origins,
+                            &mut_facts,
+                            mode,
+                            Some(WholeProgramAttestation::FrozenBenchmarkGraph),
+                        )
+                    })
+                });
+            (verified, Some((trace, export)))
+        } else {
+            (
+                solve_bo_a5_config(
+                    &program,
+                    &slots,
+                    &origins,
+                    &mut_facts,
+                    mode,
+                    Some(WholeProgramAttestation::FrozenBenchmarkGraph),
+                ),
+                None,
+            )
+        };
+        let Some(verified) = verified else {
             row.set("status", "decline");
             row.set("t_total_s", secs(t0.elapsed()));
             return row;
@@ -6165,6 +6189,10 @@ mod run {
         row.set("s23_owning_model", owning_fields);
         row.set("rounds", verified.round_stats.rounds);
         row.set("commits_conflict", verified.round_stats.commits_conflict);
+        row.set(
+            "copy_lend_replay_selections",
+            verified.round_stats.copy_lend_replay_selections,
+        );
         row.set("check_sat_count", verified.check_sat_count);
         row.set("hard_check_count", verified.hard_check_count);
         row.set(
@@ -6273,6 +6301,19 @@ mod run {
             format!("variant\towner\tslot\tkind\n{}", model_rows.concat()),
         )
         .expect("write A5 model artifact");
+
+        if let Some((trace, export)) = t2_capture {
+            super::phase2_t2_esc_measurement::write_worker_artifacts(
+                tcx,
+                &program,
+                &slots,
+                &verified,
+                &trace,
+                &export,
+                &artifact_dir,
+                &mut row,
+            );
+        }
 
         if mode == A5Mode::PreciseReplay {
             let name = std::env::var("CRAT_BOC1_NAME").expect("A5 batch program name");
