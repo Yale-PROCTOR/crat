@@ -39,6 +39,7 @@ pub(super) struct NativeBorrowContext<'a> {
 pub(super) struct NativeInference<'tcx> {
     pub(super) facts: BorrowInferenceResults<'tcx>,
     pub(super) copy_lends: DenseBitSet<Loan>,
+    pub(super) escaped_lends: DenseBitSet<Loan>,
     /// §HLZ-PORT (A2), LANDED — the point-keyed relation, carried HERE and not on `facts`, so
     /// production `BorrowInferenceResults` keeps its type and production's own consumers keep
     /// their behaviour by construction (port-exploration §2.1).
@@ -180,6 +181,11 @@ impl<'a> NativeBorrowContext<'a> {
             unmatched_escaped.is_empty(),
             "escaped CopyLend identities did not match BorrowSet: {unmatched_escaped:#?}"
         );
+        assert_eq!(
+            escaped_lends.iter().count(),
+            escaped_copy_lends.len(),
+            "② exemption registration count must equal matched allowlist loans"
+        );
         let provenance_set = self.borrow.provenances.get(&f).unwrap();
         let graph = NativeConstraintGraph::new(
             &inference,
@@ -314,6 +320,7 @@ impl<'a> NativeBorrowContext<'a> {
         NativeInference {
             facts: inference,
             copy_lends,
+            escaped_lends,
             localized_requires,
             all_only_closure,
             succ_points,

@@ -25,7 +25,9 @@ use crate::{
             ProvenanceOwner, ProvenanceSet, StructFieldSlot, collect_invalid_loan_demotions,
         },
         borrow_ownership::{
-            coherence::SelectedCopyLendLoans, export::LoanClass, origin_flow::OriginFlowResults,
+            coherence::SelectedCopyLendLoans,
+            export::{self, LoanClass},
+            origin_flow::OriginFlowResults,
         },
     },
     utils::rustc::RustProgram,
@@ -441,61 +443,88 @@ fn collect_invalid_loan_demotions_forked(
             .local_witnesses;
     };
 
+    let mut local_witnesses = Vec::new();
+    for loan in invalid_loans.iter() {
+        local_witnesses.extend(local_witnesses_for_loan(
+            inference,
+            provenance_set,
+            localized,
+            loan,
+        ));
+    }
+
+    local_witnesses
+}
+
+fn local_witnesses_for_loan(
+    inference: &NativeInference<'_>,
+    provenance_set: &ProvenanceSet,
+    localized: &super::loan_liveness::LocalizedRequires,
+    loan: Loan,
+) -> Vec<(Local, Local)> {
     let BorrowInferenceResults {
         borrow_set,
         errors,
         provenance_liveness,
         ..
     } = &inference.facts;
-
-    // Only the local witnesses are returned: BOTH fork callers use `local_witnesses` and discard
-    // the field half (they carry their own §NB5-F2 field candidacy), and naming production's
-    // `InvalidLoanDemotions` here would add a 16th entry to the §0.2 self-containment allowlist
-    // for a value nothing reads. The field branches below are kept as no-ops so this stays a
-    // line-for-line mirror of `borrow/mod.rs:1262-1305`.
+    let borrow_data = &borrow_set.loans[loan];
     let mut local_witnesses = Vec::new();
 
-    // Requirer path (mirrors `borrow/mod.rs:1262-1290`; only the predicate gains the point key).
-    for loan in invalid_loans.iter() {
-        let borrow_data = &borrow_set.loans[loan];
-        for row in errors.rows() {
-            let Some(loans) = errors.row(row) else {
-                continue;
-            };
-            if !loans.contains(loan) {
+    for row in errors.rows() {
+        let Some(loans) = errors.row(row) else {
+            continue;
+        };
+        if !loans.contains(loan) {
+            continue;
+        }
+        let Some(live_provenances) = provenance_liveness.row(row) else {
+            continue;
+        };
+        for provenance in live_provenances.iter() {
+            if !localized.contains(row, provenance, loan) {
                 continue;
             }
-            let Some(live_provenances) = provenance_liveness.row(row) else {
-                continue;
-            };
-            for provenance in live_provenances.iter() {
-                if !localized.contains(row, provenance, loan) {
-                    continue;
-                }
-                match provenance_set.provenance_data[provenance].owner() {
-                    ProvenanceOwner::Local(local) => {
-                        local_witnesses.push((local, borrow_data.borrowed.local));
-                    }
-                    ProvenanceOwner::Field(_) => {}
-                }
+            if let ProvenanceOwner::Local(local) =
+                provenance_set.provenance_data[provenance].owner()
+            {
+                local_witnesses.push((local, borrow_data.borrowed.local));
             }
         }
     }
 
-    // Issuer path (verbatim from `borrow/mod.rs:1292-1305`; it never consults `requires`).
-    for loan in invalid_loans.iter() {
-        let borrow_data = &borrow_set.loans[loan];
-        if let Borrower::Assign(assigned) = borrow_data.assigned {
-            match assigned {
-                ProvenanceOwner::Local(local) => {
-                    local_witnesses.push((local, borrow_data.borrowed.local));
-                }
-                ProvenanceOwner::Field(_) => {}
-            }
-        }
+    if let Borrower::Assign(ProvenanceOwner::Local(local)) = borrow_data.assigned {
+        local_witnesses.push((local, borrow_data.borrowed.local));
     }
-
     local_witnesses
+}
+
+fn escaped_demotion_exemptions(
+    inference: &NativeInference<'_>,
+    provenance_set: &ProvenanceSet,
+    invalid_loans: &DenseBitSet<Loan>,
+) -> FxHashSet<(Local, Local)> {
+    let Some(localized) = &inference.localized_requires else {
+        assert!(
+            inference.escaped_lends.is_empty(),
+            "escaped CopyLends require localized replay"
+        );
+        return FxHashSet::default();
+    };
+    let mut selected = FxHashSet::default();
+    let mut ordinary = FxHashSet::default();
+    for loan in invalid_loans.iter() {
+        let target = if inference.escaped_lends.contains(loan) {
+            &mut selected
+        } else {
+            &mut ordinary
+        };
+        for pair in local_witnesses_for_loan(inference, provenance_set, localized, loan) {
+            target.insert(pair);
+        }
+    }
+    selected.retain(|pair| !ordinary.contains(pair));
+    selected
 }
 
 /// Attach the invalidating access roots to the unchanged one-edge-per-loan
@@ -705,6 +734,7 @@ where
     for f in program.functions.iter().copied() {
         let mut inference = borrow_inference(program.tcx, f, &ctxt);
         let copy_lends = DenseBitSet::new_empty(inference.borrow_set.loans.len());
+        let escaped_lends = DenseBitSet::new_empty(inference.borrow_set.loans.len());
         overwrite_with_engine_facts(program.tcx, f, &ctxt, &mut inference, &copy_lends, None);
         let invalid_loans = invalid_loan_set(&inference);
         if invalid_loans.is_empty() {
@@ -717,6 +747,7 @@ where
         let inference = NativeInference {
             facts: inference,
             copy_lends,
+            escaped_lends,
             localized_requires: None,
             all_only_closure: None,
             succ_points: None,
@@ -957,6 +988,20 @@ where
         let is_raw_f = is_raw(f);
         let copy_lends = selected_copy_lends.get(&f).unwrap_or(&no_copy_lends);
         let escaped_copy_lends = escaped_copy_lends.get(&f).unwrap_or(&no_copy_lends);
+        let escaped_borrower_locals = escaped_copy_lends
+            .iter()
+            .map(|identity| match identity.borrower {
+                export::BorrowerKind::Assign {
+                    owner: export::OwnerKey::Local(local),
+                } => Local::from_u32(local),
+                other => panic!("② feeder borrower must be a local temp, got {other:?}"),
+            })
+            .collect::<FxHashSet<_>>();
+        assert_eq!(
+            escaped_borrower_locals.len(),
+            escaped_copy_lends.len(),
+            "② exemption identities must map one-to-one to temp borrowers"
+        );
 
         let edges = loop {
             let mut inference =
@@ -995,6 +1040,9 @@ where
 
             let to_demote: Vec<(Local, Local)> = {
                 let provenance_set = ctxt.borrow.provenances.get(&f).unwrap();
+                let exemptions =
+                    escaped_demotion_exemptions(&inference, provenance_set, &invalid_loans);
+                assert!(exemptions.len() <= escaped_copy_lends.len());
                 let local_witnesses = collect_invalid_loan_demotions_forked(
                     &inference,
                     provenance_set,
@@ -1002,6 +1050,7 @@ where
                 );
                 local_witnesses
                     .into_iter()
+                    .filter(|pair| !exemptions.contains(pair))
                     .filter(|(local, _base)| {
                         is_raw_f(*local) && provenance_set.local_data[*local].is_some()
                     })
@@ -1046,6 +1095,9 @@ where
                 .iter_enumerated()
                 .all(|(local, data)| {
                     if !(is_raw_f(local) && data.is_some()) {
+                        return true;
+                    }
+                    if escaped_borrower_locals.contains(&local) {
                         return true;
                     }
                     !edges.iter().any(|e| {
@@ -1158,6 +1210,20 @@ where
         let is_raw_f = is_raw(f);
         let copy_lends = selected_copy_lends.get(&f).unwrap_or(&no_copy_lends);
         let escaped_copy_lends = escaped_copy_lends.get(&f).unwrap_or(&no_copy_lends);
+        let escaped_borrower_locals = escaped_copy_lends
+            .iter()
+            .map(|identity| match identity.borrower {
+                export::BorrowerKind::Assign {
+                    owner: export::OwnerKey::Local(local),
+                } => Local::from_u32(local),
+                other => panic!("② feeder borrower must be a local temp, got {other:?}"),
+            })
+            .collect::<FxHashSet<_>>();
+        assert_eq!(
+            escaped_borrower_locals.len(),
+            escaped_copy_lends.len(),
+            "② exemption identities must map one-to-one to temp borrowers"
+        );
 
         let edges = loop {
             let mut inference =
@@ -1188,6 +1254,9 @@ where
 
             let to_demote: Vec<(Local, Local)> = {
                 let provenance_set = ctxt.borrow.provenances.get(&f).unwrap();
+                let exemptions =
+                    escaped_demotion_exemptions(&inference, provenance_set, &invalid_loans);
+                assert!(exemptions.len() <= escaped_copy_lends.len());
                 let local_witnesses = collect_invalid_loan_demotions_forked(
                     &inference,
                     provenance_set,
@@ -1195,6 +1264,7 @@ where
                 );
                 local_witnesses
                     .into_iter()
+                    .filter(|pair| !exemptions.contains(pair))
                     .filter(|(local, _base)| {
                         is_raw_f(*local) && provenance_set.local_data[*local].is_some()
                     })
@@ -1238,6 +1308,9 @@ where
                 .iter_enumerated()
                 .all(|(local, data)| {
                     if !(is_raw_f(local) && data.is_some()) {
+                        return true;
+                    }
+                    if escaped_borrower_locals.contains(&local) {
                         return true;
                     }
                     !edges.iter().any(|witnessed| {
