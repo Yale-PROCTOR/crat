@@ -6221,6 +6221,18 @@ mod run {
             "optimize_materialization_count",
             verified.optimize_materialization_count,
         );
+        row.set(
+            "lazy_plain_hard_check_count",
+            verified.lazy_plain_hard_check_count,
+        );
+        row.set(
+            "lazy_tracked_recheck_count",
+            verified.lazy_tracked_recheck_count,
+        );
+        row.set(
+            "lazy_plain_materialization_count",
+            verified.lazy_plain_materialization_count,
+        );
         row.set("t_hard_check_s", secs(verified.hard_check_elapsed));
         row.set(
             "t_optimize_materialization_s",

@@ -416,6 +416,9 @@ pub struct KindSolver {
     check_sat_count: Cell<usize>,
     hard_check_count: Cell<usize>,
     optimize_materialization_count: Cell<usize>,
+    lazy_plain_hard_check_count: Cell<usize>,
+    lazy_tracked_recheck_count: Cell<usize>,
+    lazy_plain_materialization_count: Cell<usize>,
     hard_check_elapsed: Cell<Duration>,
     optimize_materialization_elapsed: Cell<Duration>,
     mandatory_scope_lengths: RefCell<Vec<usize>>,
@@ -423,7 +426,9 @@ pub struct KindSolver {
 
 /// R1a's private hard-query backend. It snapshots only `Optimize`'s hard
 /// assertions; soft preferences remain owned by `KindSolver::solver` and are
-/// consulted only by `optimized_model_under`.
+/// consulted only by `optimized_model_under`. LIC Phase 2 activates each
+/// candidate assumption set as temporary plain-hard assertions first and pays
+/// for a tracked assumption recheck only when that first check is UNSAT.
 pub(crate) struct HardLoopSolver {
     solver: Solver,
     synced_assertions: Cell<usize>,
@@ -609,6 +614,9 @@ impl KindSolver {
             check_sat_count: Cell::new(0),
             hard_check_count: Cell::new(0),
             optimize_materialization_count: Cell::new(0),
+            lazy_plain_hard_check_count: Cell::new(0),
+            lazy_tracked_recheck_count: Cell::new(0),
+            lazy_plain_materialization_count: Cell::new(0),
             hard_check_elapsed: Cell::new(Duration::ZERO),
             optimize_materialization_elapsed: Cell::new(Duration::ZERO),
             mandatory_scope_lengths: RefCell::new(Vec::new()),
@@ -1105,6 +1113,18 @@ impl KindSolver {
         self.optimize_materialization_count.get()
     }
 
+    pub(crate) fn lazy_plain_hard_check_count(&self) -> usize {
+        self.lazy_plain_hard_check_count.get()
+    }
+
+    pub(crate) fn lazy_tracked_recheck_count(&self) -> usize {
+        self.lazy_tracked_recheck_count.get()
+    }
+
+    pub(crate) fn lazy_plain_materialization_count(&self) -> usize {
+        self.lazy_plain_materialization_count.get()
+    }
+
     pub(crate) fn hard_check_elapsed(&self) -> Duration {
         self.hard_check_elapsed.get()
     }
@@ -1159,7 +1179,31 @@ impl KindSolver {
             .set(self.hard_check_count.get().saturating_add(1));
         let started = Instant::now();
         let bundle = self.assumption_bundle(assumptions);
-        let outcome = hard.solver.check_assumptions(&bundle);
+        self.lazy_plain_hard_check_count
+            .set(self.lazy_plain_hard_check_count.get().saturating_add(1));
+        // The formulas remain the exact tracked construction, but the fixed
+        // set is activated with ordinary hard assertions rather than an
+        // assumption vector. On UNSAT only, repeat under assumptions so the
+        // core retains its typed mandatory/T2 identities.
+        hard.solver.push();
+        for literal in &bundle {
+            hard.solver.assert(literal);
+        }
+        let initial = hard.solver.check();
+        hard.solver.pop(1);
+        let outcome = if initial == SatResult::Unsat {
+            self.lazy_tracked_recheck_count
+                .set(self.lazy_tracked_recheck_count.get().saturating_add(1));
+            let tracked = hard.solver.check_assumptions(&bundle);
+            assert_eq!(
+                tracked,
+                SatResult::Unsat,
+                "lazy plain-hard UNSAT must reproduce on the tracked core backend"
+            );
+            tracked
+        } else {
+            initial
+        };
         #[cfg(test)]
         self.record_assumption_event(AssumptionCheckPhase::Hard, assumptions, &bundle, outcome);
         self.hard_check_elapsed.set(
@@ -1413,7 +1457,9 @@ impl KindSolver {
     }
 
     /// Materialize the objective-selected model for one validation round after
-    /// hard-only selector decisions have fixed its active assumptions.
+    /// hard-only selector decisions have fixed its active set. The fixed
+    /// mandatory and surviving T2 literals are temporary plain-hard assertions;
+    /// the Optimize check itself carries no assumptions.
     pub(crate) fn optimized_model_under(
         &self,
         relaxed: &RelaxedSelectors,
@@ -1424,7 +1470,16 @@ impl KindSolver {
         self.check_sat_count
             .set(self.check_sat_count.get().saturating_add(1));
         let bundle = self.assumption_bundle(&relaxed.assumptions);
-        let outcome = self.solver.check(&bundle);
+        self.lazy_plain_materialization_count.set(
+            self.lazy_plain_materialization_count
+                .get()
+                .saturating_add(1),
+        );
+        self.solver.push();
+        for literal in &bundle {
+            self.solver.assert(literal);
+        }
+        let outcome = self.solver.check(&[]);
         #[cfg(test)]
         self.record_assumption_event(
             AssumptionCheckPhase::OptimizeMaterialization,
@@ -1432,30 +1487,21 @@ impl KindSolver {
             &bundle,
             outcome,
         );
-        if outcome != SatResult::Sat {
-            self.optimize_materialization_elapsed.set(
-                self.optimize_materialization_elapsed
-                    .get()
-                    .saturating_add(started.elapsed()),
-            );
-            return None;
-        }
-        let Some(model) = self.solver.get_model() else {
-            self.optimize_materialization_elapsed.set(
-                self.optimize_materialization_elapsed
-                    .get()
-                    .saturating_add(started.elapsed()),
-            );
-            return None;
+        let kinds = if outcome == SatResult::Sat {
+            self.solver.get_model().map(|model| {
+                self.read_version_owns(&model);
+                self.read_kinds(&model)
+            })
+        } else {
+            None
         };
-        self.read_version_owns(&model);
-        let kinds = self.read_kinds(&model);
+        self.solver.pop();
         self.optimize_materialization_elapsed.set(
             self.optimize_materialization_elapsed
                 .get()
                 .saturating_add(started.elapsed()),
         );
-        Some(kinds)
+        kinds
     }
 
     pub(crate) fn model_kinds_decomposed_reporting_l2(

@@ -801,6 +801,16 @@ unsafe fn release() {
                 &mut_facts,
             )
         });
+        assert!(solver.lazy_plain_hard_check_count() > 0);
+        assert!(
+            solver.lazy_tracked_recheck_count() > 0,
+            "an UNSAT endpoint set must re-enter the tracked core backend"
+        );
+        assert_eq!(
+            solver.lazy_plain_materialization_count(),
+            solver.optimize_materialization_count(),
+            "every accepted round model must materialize without assumptions"
+        );
         let model = model.expect("T2 retraction preserves acceptance");
         let baseline = solver
             .model_without_t2_for_test(&construction.selectors)
@@ -1027,6 +1037,17 @@ unsafe fn chain() {
             stats.dropped_sources,
             stats.dropped_sinks,
             solver.optimize_materialization_count(),
+        );
+        assert!(solver.lazy_plain_hard_check_count() > 0);
+        assert_eq!(
+            solver.lazy_tracked_recheck_count(),
+            0,
+            "an all-SAT endpoint set must never pay for tracked core extraction"
+        );
+        assert_eq!(
+            solver.lazy_plain_materialization_count(),
+            solver.optimize_materialization_count(),
+            "every accepted round model must materialize without assumptions"
         );
     })
     .unwrap_or_else(|error| error.raise());
