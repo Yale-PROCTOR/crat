@@ -6022,9 +6022,23 @@ mod run {
         let t0 = Instant::now();
         let mut row = Row::default();
         row.set("t_tcx_s", secs(t_tcx));
-        let mode = A5Mode::PreciseReplay;
-        let a16_refined = true;
-        let soundness_mode = "a14_a16_refined";
+        let baseline_only = match std::env::var("CRAT_PHASE2_BASELINE_ONLY") {
+            Err(std::env::VarError::NotPresent) => false,
+            Ok(value) if value == "1" => true,
+            Ok(value) => panic!("CRAT_PHASE2_BASELINE_ONLY must be absent or 1, got {value:?}"),
+            Err(error) => panic!("CRAT_PHASE2_BASELINE_ONLY is not valid Unicode: {error}"),
+        };
+        let mode = if baseline_only {
+            A5Mode::Baseline
+        } else {
+            A5Mode::PreciseReplay
+        };
+        let a16_refined = !baseline_only;
+        let soundness_mode = if baseline_only {
+            "a14"
+        } else {
+            "a14_a16_refined"
+        };
         assert_eq!(CopyLendMode::current(), CopyLendMode::Baseline);
         assert_eq!(A2Mode::current(), A2Mode::Off);
         assert_eq!(
@@ -6037,6 +6051,7 @@ mod run {
         row.set("copy_lend_mode", CopyLendMode::Baseline.label());
         row.set("a2_mode", A2Mode::Off.label());
         row.set("soundness_mode", soundness_mode);
+        row.set("phase2_baseline_only", baseline_only);
         row.set("z3_full_version", z3::full_version().to_string());
         let official_evaluation = std::path::PathBuf::from(
             std::env::var_os("CRAT_A5_OFFICIAL_EVALUATION")

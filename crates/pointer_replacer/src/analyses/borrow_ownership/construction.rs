@@ -312,6 +312,13 @@ impl A5PreledgerDecline {
         }
     }
 
+    fn with_detail(reason: A5PreledgerDeclineReason, detail: String) -> Self {
+        Self {
+            reason,
+            detail: Some(detail),
+        }
+    }
+
     pub(crate) fn reason(&self) -> A5PreledgerDeclineReason {
         self.reason
     }
@@ -1171,8 +1178,26 @@ fn solve_bo_a5_config_inner(
         &baseline_construction,
         mut_facts,
     );
-    let baseline_model = baseline_model
-        .ok_or_else(|| A5PreledgerDecline::at(A5PreledgerDeclineReason::BaselineVerification))?;
+    let baseline_model = baseline_model.ok_or_else(|| {
+        let first = baseline_solver
+            .round_model_failure()
+            .map(|failure| failure.summary())
+            .unwrap_or_else(|| "untyped-round-decline".to_owned());
+        A5PreledgerDecline::with_detail(
+            A5PreledgerDeclineReason::BaselineVerification,
+            format!(
+                "expected=accepted-model got={first} rounds={} commits={} selected_copy_lends={} dropped_sources={} dropped_sinks={} field_conflict={:?} cap_exhausted={} l2_decline={:?}",
+                baseline_round_stats.rounds,
+                baseline_round_stats.commits_conflict,
+                baseline_round_stats.copy_lend_replay_selections,
+                baseline_round_stats.dropped_sources,
+                baseline_round_stats.dropped_sinks,
+                baseline_round_stats.field_conflict_decline,
+                baseline_round_stats.cap_exhausted,
+                baseline_round_stats.l2_decline,
+            ),
+        )
+    })?;
     let baseline_nullability = nullability_artifacts(&baseline_construction);
     let baseline_a14 = a14_artifacts(&baseline_construction);
     if mode == A5Mode::Baseline {

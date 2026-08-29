@@ -422,6 +422,7 @@ pub struct KindSolver {
     hard_check_elapsed: Cell<Duration>,
     optimize_materialization_elapsed: Cell<Duration>,
     mandatory_scope_lengths: RefCell<Vec<usize>>,
+    round_model_failure: RefCell<Option<RoundModelFailure>>,
 }
 
 /// R1a's private hard-query backend. It snapshots only `Optimize`'s hard
@@ -464,6 +465,55 @@ enum HardRelaxResult {
     Sat(RelaxedSelectors),
     Unsat,
     Unknown,
+}
+
+/// Observation-only first failure from the decomposed round-model path.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum RoundModelFailure {
+    HardUnsat {
+        active_t2: usize,
+        core_labels: Vec<String>,
+    },
+    HardUnknown {
+        active_t2: usize,
+        reason: String,
+    },
+    OptimizeUnsat {
+        active_t2: usize,
+    },
+    OptimizeUnknown {
+        active_t2: usize,
+        reason: String,
+    },
+    OptimizeMissingModel {
+        active_t2: usize,
+    },
+}
+
+impl RoundModelFailure {
+    pub(crate) fn summary(&self) -> String {
+        match self {
+            Self::HardUnsat {
+                active_t2,
+                core_labels,
+            } => format!(
+                "hard-unsat active_t2={active_t2} core_labels={}",
+                core_labels.join(" | ")
+            ),
+            Self::HardUnknown { active_t2, reason } => {
+                format!("hard-unknown active_t2={active_t2} reason={reason}")
+            }
+            Self::OptimizeUnsat { active_t2 } => {
+                format!("optimize-unsat active_t2={active_t2}")
+            }
+            Self::OptimizeUnknown { active_t2, reason } => {
+                format!("optimize-unknown active_t2={active_t2} reason={reason}")
+            }
+            Self::OptimizeMissingModel { active_t2 } => {
+                format!("optimize-missing-model active_t2={active_t2}")
+            }
+        }
+    }
 }
 
 impl RelaxedSelectors {
@@ -620,6 +670,7 @@ impl KindSolver {
             hard_check_elapsed: Cell::new(Duration::ZERO),
             optimize_materialization_elapsed: Cell::new(Duration::ZERO),
             mandatory_scope_lengths: RefCell::new(Vec::new()),
+            round_model_failure: RefCell::new(None),
         }
     }
 
@@ -1125,6 +1176,17 @@ impl KindSolver {
         self.lazy_plain_materialization_count.get()
     }
 
+    fn record_round_model_failure(&self, failure: RoundModelFailure) {
+        let mut slot = self.round_model_failure.borrow_mut();
+        if slot.is_none() {
+            *slot = Some(failure);
+        }
+    }
+
+    pub(crate) fn round_model_failure(&self) -> Option<RoundModelFailure> {
+        self.round_model_failure.borrow().clone()
+    }
+
     pub(crate) fn hard_check_elapsed(&self) -> Duration {
         self.hard_check_elapsed.get()
     }
@@ -1190,11 +1252,25 @@ impl KindSolver {
             hard.solver.assert(literal);
         }
         let initial = hard.solver.check();
+        let initial_unknown_reason = (initial == SatResult::Unknown).then(|| {
+            hard.solver
+                .get_reason_unknown()
+                .unwrap_or_else(|| "-".to_owned())
+        });
         hard.solver.pop(1);
         let outcome = if initial == SatResult::Unsat {
             self.lazy_tracked_recheck_count
                 .set(self.lazy_tracked_recheck_count.get().saturating_add(1));
             let tracked = hard.solver.check_assumptions(&bundle);
+            if tracked == SatResult::Unknown {
+                self.record_round_model_failure(RoundModelFailure::HardUnknown {
+                    active_t2: assumptions.len(),
+                    reason: hard
+                        .solver
+                        .get_reason_unknown()
+                        .unwrap_or_else(|| "-".to_owned()),
+                });
+            }
             assert_eq!(
                 tracked,
                 SatResult::Unsat,
@@ -1204,6 +1280,12 @@ impl KindSolver {
         } else {
             initial
         };
+        if let Some(reason) = initial_unknown_reason {
+            self.record_round_model_failure(RoundModelFailure::HardUnknown {
+                active_t2: assumptions.len(),
+                reason,
+            });
+        }
         #[cfg(test)]
         self.record_assumption_event(AssumptionCheckPhase::Hard, assumptions, &bundle, outcome);
         self.hard_check_elapsed.set(
@@ -1350,7 +1432,12 @@ impl KindSolver {
                             .and_then(|tracker| tracker.label_of(literal))
                             .is_some()
                     });
+                    let core_labels = self.core_labels(selectors, &core);
                     if t2_core.is_empty() {
+                        self.record_round_model_failure(RoundModelFailure::HardUnsat {
+                            active_t2: assumptions.len(),
+                            core_labels,
+                        });
                         return HardRelaxResult::Unsat;
                     }
                     assert!(
@@ -1368,7 +1455,6 @@ impl KindSolver {
                         .iter()
                         .position(|selector| selectors.index_of(selector) == Some(selector_index))
                         .expect("core T2 assertion is active");
-                    let core_labels = self.core_labels(selectors, &core);
                     if let Some(epoch) = trace_epoch {
                         SELECTOR_TRACE_CAPTURE.with(|capture| {
                             let mut capture = capture.borrow_mut();
@@ -1480,6 +1566,11 @@ impl KindSolver {
             self.solver.assert(literal);
         }
         let outcome = self.solver.check(&[]);
+        let unknown_reason = (outcome == SatResult::Unknown).then(|| {
+            self.solver
+                .get_reason_unknown()
+                .unwrap_or_else(|| "-".to_owned())
+        });
         #[cfg(test)]
         self.record_assumption_event(
             AssumptionCheckPhase::OptimizeMaterialization,
@@ -1488,11 +1579,29 @@ impl KindSolver {
             outcome,
         );
         let kinds = if outcome == SatResult::Sat {
-            self.solver.get_model().map(|model| {
-                self.read_version_owns(&model);
-                self.read_kinds(&model)
-            })
+            match self.solver.get_model() {
+                Some(model) => {
+                    self.read_version_owns(&model);
+                    Some(self.read_kinds(&model))
+                }
+                None => {
+                    self.record_round_model_failure(RoundModelFailure::OptimizeMissingModel {
+                        active_t2: relaxed.assumptions.len(),
+                    });
+                    None
+                }
+            }
         } else {
+            self.record_round_model_failure(match outcome {
+                SatResult::Unsat => RoundModelFailure::OptimizeUnsat {
+                    active_t2: relaxed.assumptions.len(),
+                },
+                SatResult::Unknown => RoundModelFailure::OptimizeUnknown {
+                    active_t2: relaxed.assumptions.len(),
+                    reason: unknown_reason.unwrap_or_else(|| "-".to_owned()),
+                },
+                SatResult::Sat => unreachable!(),
+            });
             None
         };
         self.solver.pop();

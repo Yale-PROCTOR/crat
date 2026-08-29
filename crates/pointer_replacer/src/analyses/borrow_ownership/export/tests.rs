@@ -27,8 +27,8 @@ use crate::{
         origin_flow::analyze_program_origin_flow,
         origins::compute_origins,
         solver::{
-            KindSolver, SelectorTraceOutcome, SlotRef, with_assumption_check_trace,
-            with_selector_trace,
+            KindSolver, RoundModelFailure, SelectorTraceOutcome, SlotRef,
+            with_assumption_check_trace, with_selector_trace,
         },
     },
     utils::rustc::RustProgram,
@@ -653,7 +653,7 @@ fn declining_run_records_no_certificate() {
     ::utils::compilation::run_compiler_on_str(CALL_ARG, |tcx| {
         let program = collect_program(tcx);
         let slots = CrateSlots::build(&program);
-        let (model, export) = with_bo_export(|| {
+        let ((model, failure), export) = with_bo_export(|| {
             let crate_ctxt = CrateCtxt::new(&program);
             let solver = KindSolver::new(&slots);
             let (_stats, selectors) = emit_crate_ownership_constraints(
@@ -677,7 +677,8 @@ fn declining_run_records_no_certificate() {
                 .expect("fixture has at least one local slot");
             solver.assume(victim, super::SlotKindAlias::Ref);
             solver.add_borrow_exclusion(Some(victim), &[]);
-            verify_to_fixpoint(&program, &slots, &solver, &selectors, true)
+            let model = verify_to_fixpoint(&program, &slots, &solver, &selectors, true);
+            (model, solver.round_model_failure())
         });
         assert!(
             model.is_none(),
@@ -689,6 +690,20 @@ fn declining_run_records_no_certificate() {
              accept point never ran; anything else destroys the invariant the \
              Option was introduced to carry. Got {:?}",
             export.residual_conflicts
+        );
+        let Some(RoundModelFailure::HardUnsat {
+            active_t2,
+            core_labels,
+        }) = failure
+        else {
+            panic!("pre-loop contradiction lacks its typed first failure: {failure:?}");
+        };
+        assert_eq!(active_t2, 0);
+        assert!(core_labels.iter().any(|label| label.contains("kind-pin")));
+        assert!(
+            core_labels
+                .iter()
+                .any(|label| label.contains("borrow-exclusion"))
         );
     })
     .unwrap_or_else(|e| e.raise())
