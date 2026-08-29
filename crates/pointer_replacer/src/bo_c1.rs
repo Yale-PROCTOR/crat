@@ -6088,7 +6088,8 @@ mod run {
                 )
             }
         };
-        let phase2_capture = std::env::var_os("CRAT_PHASE2_T2_ESC_CAPTURE").is_some();
+        let phase2_capture =
+            !baseline_only && std::env::var_os("CRAT_PHASE2_T2_ESC_CAPTURE").is_some();
         let (verified, t2_capture) = if phase2_capture {
             let ((verified, trace), export) =
                 crate::analyses::borrow_ownership::export::with_bo_export(|| {

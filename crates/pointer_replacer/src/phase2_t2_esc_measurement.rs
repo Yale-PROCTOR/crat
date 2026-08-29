@@ -29,6 +29,8 @@ use crate::{
 
 const DERIVED_DIGEST: &str = "db96829b5c2b0db28fb4bb9ddd3d32901b5d4e6e4134da07ada0d513d94eb4c6";
 const OFFICIAL_DIGEST: &str = "7aa16d5b63ff39e6aaabd3590ec2be9c88c9d8a753bd9f74cd4e6056d9974fd7";
+const C080_REPIN_RECEIPT_SHA256: &str =
+    "d130ade6780caa7755ffd079c8763cee0a5f9db18c10f24d168aa04d2672d8c7";
 
 fn number(row: &report::Row, key: &str) -> usize {
     row.get(key)
@@ -432,6 +434,15 @@ fn phase2_t2_esc_batch_corpus() {
             .expect("phase-2 batch requires LIC-P1 OwnLost ledger"),
     );
     assert!(snapshot.is_dir() && baseline.is_dir() && ownlost.is_file());
+    let baseline_repin = baseline.join("repin-receipt.txt");
+    assert_eq!(
+        sha256(&baseline_repin),
+        C080_REPIN_RECEIPT_SHA256,
+        "phase-2 baseline target must carry the c080 repin receipt"
+    );
+    let baseline_repin_text = fs::read_to_string(&baseline_repin).expect("read c080 repin receipt");
+    assert!(baseline_repin_text.contains("analysis_head=c080e9e7\n"));
+    assert!(baseline_repin_text.contains("spot_semantic_artifacts=33/33\n"));
 
     let official_link = root.join("benchmarks/rs-crown-transformed/evaluation.tsv");
     let official_target = fs::read_link(&official_link).expect("official artifact symlink");
@@ -441,7 +452,7 @@ fn phase2_t2_esc_batch_corpus() {
     fs::write(
         output.join("preflight-receipt.txt"),
         format!(
-            "status=ready\ndata=false\nanalysis_head={}\ncorpus=rs-crown\nprograms=20\nmode=phase2-t2-esc\na5_mode=precise_replay\na5_world=closed_world_frozen_graph\na5_abi_guard=permitted:measurement-frozen-graph-attested\ncopy_lend_mode=baseline\na2_mode=off\nderived_substrate_sha256={DERIVED_DIGEST}\nofficial_evaluation_sha256={OFFICIAL_DIGEST}\nbaseline_target={}\nownlost_ledger={}\n",
+            "status=ready\ndata=false\nanalysis_head={}\ncorpus=rs-crown\nprograms=20\nmode=phase2-t2-esc\na5_mode=precise_replay\na5_world=closed_world_frozen_graph\na5_abi_guard=permitted:measurement-frozen-graph-attested\ncopy_lend_mode=baseline\na2_mode=off\nderived_substrate_sha256={DERIVED_DIGEST}\nofficial_evaluation_sha256={OFFICIAL_DIGEST}\nbaseline_target={}\nbaseline_target_frame=c080e9e7\nbaseline_repin_receipt_sha256={C080_REPIN_RECEIPT_SHA256}\nownlost_ledger={}\n",
             orchestrate::git_sha(),
             baseline.display(),
             ownlost.display(),
