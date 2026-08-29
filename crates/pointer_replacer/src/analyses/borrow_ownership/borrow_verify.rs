@@ -1905,18 +1905,18 @@ mod nb5l_a_prime_menu_tests {
         assert_eq!(a_prime_menu(&conflict, &m), vec![i]);
     }
 
-    /// Addendum 61: the exact ② class has a different kill switch. Its presented source issuer is
-    /// the sole repair target even when a live destination requirer exists; ordinary rows above
-    /// retain the A-prime requirer-first menu.
+    /// Addenda 61/65: the exact ② class has a different kill switch. Its
+    /// presented source issuer is the sole guard and repair party; the escape
+    /// destination is receipt-only and may be Ref or Raw.
     #[test]
     fn esc_selected_menu_is_issuer_only() {
         let (source, destination) = (field(0), field(1));
         let conflict = SlotConflict {
             issuer: Some(source),
-            requirers: vec![destination],
+            requirers: vec![],
             esc_issuer_first: true,
         };
-        let m = model(&[(source, SlotKind::Ref), (destination, SlotKind::Ref)]);
+        let m = model(&[(source, SlotKind::Ref), (destination, SlotKind::Raw)]);
         assert_eq!(a_prime_menu(&conflict, &m), vec![source]);
         assert_eq!(representative(&conflict, &m), Some(source));
     }

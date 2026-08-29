@@ -624,8 +624,42 @@ pub(crate) fn construct_bo_into(
     solver: &KindSolver,
     mode: CopyLendMode,
 ) -> anyhow::Result<BoConstruction> {
+    construct_bo_into_with_esc(program, slots, origins, mut_facts, solver, mode, true)
+}
+
+fn construct_bo_a5_reference(
+    program: &RustProgram<'_>,
+    slots: &CrateSlots,
+    origins: &OriginSummaries,
+    mut_facts: &MutFacts,
+    solver: &KindSolver,
+) -> anyhow::Result<BoConstruction> {
+    construct_bo_into_with_esc(
+        program,
+        slots,
+        origins,
+        mut_facts,
+        solver,
+        CopyLendMode::Baseline,
+        false,
+    )
+}
+
+fn construct_bo_into_with_esc(
+    program: &RustProgram<'_>,
+    slots: &CrateSlots,
+    origins: &OriginSummaries,
+    mut_facts: &MutFacts,
+    solver: &KindSolver,
+    mode: CopyLendMode,
+    enable_esc_minimal: bool,
+) -> anyhow::Result<BoConstruction> {
     let crate_ctxt = CrateCtxt::new(program);
-    let esc_minimal = super::esc_minimal::select(program, slots);
+    let esc_minimal = if enable_esc_minimal {
+        super::esc_minimal::select(program, slots)
+    } else {
+        super::esc_minimal::EscMinimalSelection::default()
+    };
     let t = Instant::now();
     let eligibility = if mode == CopyLendMode::LendArm {
         analyze_copy_lend_eligibility(program, slots, mut_facts, origins.native_flows())
@@ -1159,17 +1193,15 @@ fn solve_bo_a5_config_inner(
     );
 
     let baseline_solver = KindSolver::new(slots);
-    let baseline_construction = construct_bo_into(
-        program,
-        slots,
-        origins,
-        mut_facts,
-        &baseline_solver,
-        CopyLendMode::Baseline,
-    )
-    .map_err(|error| {
-        A5PreledgerDecline::from_error(A5PreledgerDeclineReason::BaselineConstruction, error)
-    })?;
+    let baseline_construction =
+        construct_bo_a5_reference(program, slots, origins, mut_facts, &baseline_solver).map_err(
+            |error| {
+                A5PreledgerDecline::from_error(
+                    A5PreledgerDeclineReason::BaselineConstruction,
+                    error,
+                )
+            },
+        )?;
     let (baseline_model, baseline_round_stats) = verify_bo_construction_counting(
         program,
         slots,

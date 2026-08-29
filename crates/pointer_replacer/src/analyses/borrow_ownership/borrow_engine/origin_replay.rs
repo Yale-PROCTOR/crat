@@ -41,7 +41,8 @@ pub(super) struct NativeInference<'tcx> {
     pub(super) copy_lends: DenseBitSet<Loan>,
     pub(super) escaped_lends: DenseBitSet<Loan>,
     /// Addendum 59: the selected feeder loan keeps its construction-time identity, while the
-    /// repair boundary sees the resolved source and destination parties from the allowlist row.
+    /// repair boundary sees the resolved source issuer; the destination remains
+    /// receipt metadata and is not a guard/repair party.
     /// No ordinary loan can enter this map.
     pub(super) escaped_presentations: FxHashMap<Loan, (ProvenanceOwner, ProvenanceOwner)>,
     /// §HLZ-PORT (A2), LANDED — the point-keyed relation, carried HERE and not on `facts`, so

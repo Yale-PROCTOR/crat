@@ -12758,6 +12758,147 @@ unsafe fn caller() -> i32 {
         });
     }
 
+    /// §39 addendum 65 R-a — brotli's param-deref FIELD destination shape.
+    /// The selected escape row may discharge only by demoting its presented
+    /// source issuer. A Raw destination field is a legal mixed-emission
+    /// channel: it remains receipt evidence, never a guard/repair party.
+    #[test]
+    fn escw2_field_store_escape_demotes_source_and_leaves_destination_raw() {
+        const CODE: &str = r#"
+struct Holder { p: *mut i32 }
+unsafe extern "C" { fn opaque() -> *mut i32; }
+unsafe fn save(out: *mut Holder, x: *mut i32) {
+    (*out).p = opaque();
+    (*out).p = x;
+    *x = 1;
+}
+unsafe fn caller() -> i32 {
+    let mut cell = 0i32;
+    let mut holder = Holder { p: core::ptr::null_mut() };
+    save(&raw mut holder, &raw mut cell);
+    *holder.p
+}
+"#;
+        run_compiler(CODE, |tcx| {
+            let program = collect_program(tcx);
+            let slots = CrateSlots::build(&program);
+            let origins = compute_origins(&program);
+            let facts = MutFacts::from_program(&program);
+            let save = function_by_name(&program, "save");
+            let x = local_by_var_name(tcx, save, "x");
+            let x = local_slot(&slots, save, x, 0);
+            let holder = struct_by_name(&program, "Holder");
+            let field = slots
+                .field_slots
+                .slot_for_field_depth(
+                    StructFieldSlot {
+                        struct_did: holder,
+                        field_index: 0,
+                    },
+                    0,
+                )
+                .expect("Holder::p depth-0 slot");
+            let field = SlotRef::Field(field);
+
+            let baseline_solver = KindSolver::new(&slots);
+            let baseline_construction = construct_bo_into(
+                &program,
+                &slots,
+                &origins,
+                &facts,
+                &baseline_solver,
+                CopyLendMode::Baseline,
+            )
+            .expect("field-store baseline construction");
+            assert!(baseline_construction.esc_minimal.sites.is_empty());
+            let (baseline, _) = verify_bo_construction_counting(
+                &program,
+                &slots,
+                &origins,
+                &baseline_solver,
+                &baseline_construction,
+                &facts,
+            );
+            let baseline = baseline.expect("field-store baseline accepts");
+            assert_eq!(baseline.get(&x), Some(&SlotKind::Ref));
+            assert_eq!(baseline.get(&field), Some(&SlotKind::Raw));
+
+            let selected_solver = KindSolver::new(&slots);
+            let (((selected, stats), extensions), selected_site) = with_fixture_selection(|| {
+                let construction = construct_bo_into(
+                    &program,
+                    &slots,
+                    &origins,
+                    &facts,
+                    &selected_solver,
+                    CopyLendMode::Baseline,
+                )
+                .expect("field-store selected construction");
+                let selected_site = construction
+                    .esc_minimal
+                    .sites
+                    .first()
+                    .map(|site| (construction.esc_minimal.sites.len(), site.lhs));
+                let ((model, stats), extensions) = with_escaped_extension_trace(|| {
+                    verify_bo_construction_counting(
+                        &program,
+                        &slots,
+                        &origins,
+                        &selected_solver,
+                        &construction,
+                        &facts,
+                    )
+                });
+                (((model, stats), extensions), selected_site)
+            });
+            assert_eq!(
+                selected_site,
+                Some((1, field)),
+                "the destination field remains explicit receipt metadata"
+            );
+            assert!(!extensions.is_empty(), "selected field loan reaches exit");
+            assert_eq!(stats.copy_lend_replay_selections, 0);
+            let selected = selected.expect("issuer-only field-store repair accepts");
+            assert_eq!(selected.get(&x), Some(&SlotKind::Raw));
+            assert_eq!(
+                selected.get(&field),
+                baseline.get(&field),
+                "the Raw destination field is receipt-only and remains untouched"
+            );
+        });
+    }
+
+    /// §39 addendum 65 R-b — the A5 reference solve is the c080 comparison
+    /// layer. Even inside a fixture-selection scope it must not consume ②;
+    /// only the subsequent candidate construction may do so.
+    #[test]
+    fn a5_baseline_reference_does_not_consume_esc_selection() {
+        const CODE: &str = r#"
+unsafe fn save(out: *mut *mut i32, x: *mut i32) { *out = x; *x = 1; }
+unsafe fn caller() -> i32 {
+    let mut cell = 0i32;
+    let mut slot: *mut i32 = core::ptr::null_mut();
+    save(&raw mut slot, &raw mut cell);
+    *slot
+}
+"#;
+        run_compiler(CODE, |tcx| {
+            let program = collect_program(tcx);
+            let slots = CrateSlots::build(&program);
+            let origins = compute_origins(&program);
+            let facts = MutFacts::from_program(&program);
+            let verified = with_fixture_selection(|| {
+                solve_bo_a5_config(&program, &slots, &origins, &facts, A5Mode::Baseline, None)
+                    .expect("A5 reference solve must accept")
+            });
+            let save = function_by_name(&program, "save");
+            let x = local_by_var_name(tcx, save, "x");
+            let x = local_slot(&slots, save, x, 0);
+            assert_eq!(verified.model.get(&x), Some(&SlotKind::Ref));
+            assert_eq!(verified.round_stats.copy_lend_replay_selections, 0);
+        });
+    }
+
     fn nb4_accept<'tcx>(
         tcx: TyCtxt<'tcx>,
         program: &RustProgram<'tcx>,

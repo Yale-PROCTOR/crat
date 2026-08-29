@@ -304,12 +304,11 @@ fn extract_conflict_edges(
                 }
             }
         }
-        let esc_issuer_first = if let Some(&(resolved_source, resolved_destination)) =
+        let esc_issuer_first = if let Some(&(resolved_source, _resolved_destination)) =
             inference.escaped_presentations.get(&loan)
         {
             issuer = Some(resolved_source);
             requirers.clear();
-            requirers.push(resolved_destination);
             true
         } else {
             false
