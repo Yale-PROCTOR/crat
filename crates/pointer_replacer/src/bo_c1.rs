@@ -6127,6 +6127,24 @@ mod run {
                         format!("reason\tdetail\n{}\t{}\n", decline.reason().label(), detail,),
                     )
                     .expect("write A5 pre-ledger decline artifact");
+                    let mut field_slots =
+                        String::from("slot_id\tstruct_path\tfield_index\tdepth\n");
+                    for index in 0..slots.field_slots.len() {
+                        let slot_id = SlotId::from_usize(index);
+                        let slot = slots.field_slots.slot(slot_id);
+                        let SlotOwner::Field(field) = slot.owner else {
+                            panic!("global field universe contains a local owner")
+                        };
+                        field_slots.push_str(&format!(
+                            "{}\t{}\t{}\t{}\n",
+                            index,
+                            tcx.def_path_str(field.struct_did.to_def_id()),
+                            field.field_index,
+                            slot.depth,
+                        ));
+                    }
+                    std::fs::write(artifact_dir.join("preledger-field-slots.tsv"), field_slots)
+                        .expect("write A5 pre-ledger field-slot map");
                 }
                 return row;
             }

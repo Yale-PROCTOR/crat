@@ -1186,13 +1186,14 @@ fn solve_bo_a5_config_inner(
         A5PreledgerDecline::with_detail(
             A5PreledgerDeclineReason::BaselineVerification,
             format!(
-                "expected=accepted-model got={first} rounds={} commits={} selected_copy_lends={} dropped_sources={} dropped_sinks={} field_conflict={:?} cap_exhausted={} l2_decline={:?}",
+                "expected=accepted-model got={first} rounds={} commits={} selected_copy_lends={} dropped_sources={} dropped_sinks={} field_conflict={:?} field_kind={:?} cap_exhausted={} l2_decline={:?}",
                 baseline_round_stats.rounds,
                 baseline_round_stats.commits_conflict,
                 baseline_round_stats.copy_lend_replay_selections,
                 baseline_round_stats.dropped_sources,
                 baseline_round_stats.dropped_sinks,
                 baseline_round_stats.field_conflict_decline,
+                baseline_round_stats.field_conflict_kind,
                 baseline_round_stats.cap_exhausted,
                 baseline_round_stats.l2_decline,
             ),

@@ -672,6 +672,9 @@ pub(crate) struct RoundStats {
     /// accept or an UNSAT-family decline (bo_c1 classifies those via its selector-core
     /// `decline_reason`).
     pub field_conflict_decline: Option<SlotRef>,
+    /// Diagnostic twin of `field_conflict_decline`: the accepted round model's
+    /// exact non-Ref kind for that field.
+    pub field_conflict_kind: Option<SlotKind>,
     /// §NB5-L guard 3 — the `RepairMode` that produced these stats (the mode-stamp). Self-describing
     /// results: the sweep row and any `RoundStats` dump say which repair strategy ran, so the S7
     /// differential is never mode-ambiguous. Defaults to `ModeA` (= `RepairMode::DEFAULT`).
@@ -976,6 +979,7 @@ pub(super) fn verify_to_fixpoint_counting_with_flows_impl(
         // case.) The field early-return runs first, so the assert now effectively guards Locals only.
         if let Some(field) = residual_nonref_field(&conflicts, &model) {
             stats.field_conflict_decline = Some(field);
+            stats.field_conflict_kind = model.get(&field).copied();
             return (None, stats);
         }
         assert!(
@@ -1346,6 +1350,7 @@ pub(super) fn verify_l2_to_fixpoint_counting_impl(
                         })
                     {
                         stats.field_conflict_decline = Some(field);
+                        stats.field_conflict_kind = model.get(&field).copied();
                         emit_l2_final_diagnostics(diagnostic_slots.as_mut(), &model);
                         return (None, stats);
                     }
