@@ -92,9 +92,32 @@ pub(crate) struct EscRuntimeSite {
     pub(crate) loan: SelectedCopyLendLoan,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum EscExclusionReason {
+    FieldIssuerOutOfScope,
+}
+
+impl EscExclusionReason {
+    pub(crate) const fn label(self) -> &'static str {
+        match self {
+            Self::FieldIssuerOutOfScope => "field-issuer-out-of-scope",
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct EscExcludedSite {
+    pub(crate) key: EscCopySiteKey,
+    pub(crate) fn_did: LocalDefId,
+    pub(crate) lhs: SlotRef,
+    pub(crate) rhs: SlotRef,
+    pub(crate) reason: EscExclusionReason,
+}
+
 #[derive(Clone, Debug, Default)]
 pub(crate) struct EscMinimalSelection {
     pub(crate) sites: Vec<EscRuntimeSite>,
+    pub(crate) excluded_sites: Vec<EscExcludedSite>,
     pub(crate) loans: SelectedCopyLendLoans,
     presentations: FxHashMap<(LocalDefId, SelectedCopyLendLoan), EscPresentation>,
 }
@@ -549,6 +572,23 @@ pub(crate) fn select(program: &RustProgram<'_>, slots: &CrateSlots) -> EscMinima
                 })
                 .expect("selected row has artifact key")
         });
+        let key = EscCopySiteKey {
+            program: artifact.map_or("fixture", |key| key.program).to_owned(),
+            function: row.function.clone(),
+            location: row.location,
+            resolved_origin_slot: row.resolved_origin_slot.clone(),
+            destination_place: row.destination_place.clone(),
+        };
+        if matches!(row.rhs, SlotRef::Field(_)) {
+            answer.excluded_sites.push(EscExcludedSite {
+                key,
+                fn_did: row.fn_did,
+                lhs: row.lhs,
+                rhs: row.rhs,
+                reason: EscExclusionReason::FieldIssuerOutOfScope,
+            });
+            continue;
+        }
         let loan = SelectedCopyLendLoan {
             location: row.loan_location,
             borrowed: row.loan_borrowed.clone(),
@@ -577,18 +617,28 @@ pub(crate) fn select(program: &RustProgram<'_>, slots: &CrateSlots) -> EscMinima
             "duplicate ②-minimal presentation identity"
         );
         answer.sites.push(EscRuntimeSite {
-            key: EscCopySiteKey {
-                program: artifact.map_or("fixture", |key| key.program).to_owned(),
-                function: row.function.clone(),
-                location: row.location,
-                resolved_origin_slot: row.resolved_origin_slot.clone(),
-                destination_place: row.destination_place.clone(),
-            },
+            key,
             fn_did: row.fn_did,
             lhs: row.lhs,
             rhs: row.rhs,
             loan,
         });
+    }
+    if !fixture_selection {
+        let expected_field_issuers = expected
+            .iter()
+            .filter(|key| key.resolved_origin_slot.contains("::field"))
+            .count();
+        assert_eq!(
+            answer.sites.len() + answer.excluded_sites.len(),
+            expected.len(),
+            "② allowlist keys must partition into selected plus typed-excluded"
+        );
+        assert_eq!(
+            answer.excluded_sites.len(),
+            expected_field_issuers,
+            "② field-issuer exclusions must match the exact joined allowlist rows"
+        );
     }
     answer
 }
@@ -627,7 +677,7 @@ fn fixture_sites(code: &str) -> Vec<Site> {
 
 #[cfg(test)]
 mod tests {
-    use super::fixture_sites;
+    use super::{EscExclusionReason, artifact_keys, fixture_sites};
 
     const ESC_W1: &str = r#"
 unsafe fn save(out: *mut *mut i32, x: *mut i32) { *out = x; *x = 1; }
@@ -658,6 +708,19 @@ unsafe fn caller() -> i32 {
     *slot
 }
 "#;
+
+    #[test]
+    fn field_issuer_allowlist_residual_is_exact_and_typed() {
+        let rows = artifact_keys()
+            .iter()
+            .filter(|key| key.program == "brotli" && key.resolved_origin_slot.contains("::field"))
+            .collect::<Vec<_>>();
+        assert_eq!(rows.len(), 3);
+        assert_eq!(
+            EscExclusionReason::FieldIssuerOutOfScope.label(),
+            "field-issuer-out-of-scope"
+        );
+    }
 
     #[test]
     fn escgap_selector_nonvacuity_escw1_copy_is_selected() {

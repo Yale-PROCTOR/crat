@@ -258,6 +258,25 @@ pub(super) fn write_worker_artifacts(
     }
     fs::write(artifact_dir.join("esc-selected-sites.tsv"), esc_tsv)
         .expect("write phase-2 ESC ledger");
+    let mut excluded_tsv = String::from(
+        "program\tfunction\tstore_block\tstore_statement\tresolved_origin_slot\tdestination_place\tsource_slot\tdestination_slot\treason\n",
+    );
+    for site in &esc.excluded_sites {
+        excluded_tsv.push_str(&format!(
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+            site.key.program,
+            site.key.function,
+            site.key.location.block,
+            site.key.location.statement_index,
+            site.key.resolved_origin_slot,
+            site.key.destination_place,
+            slot_label(site.rhs),
+            slot_label(site.lhs),
+            site.reason.label(),
+        ));
+    }
+    fs::write(artifact_dir.join("esc-excluded-sites.tsv"), excluded_tsv)
+        .expect("write phase-2 ESC exclusion ledger");
 
     row.set("t2_endpoints", endpoint_count);
     row.set("t2_sources", source_count);
@@ -266,10 +285,21 @@ pub(super) fn write_worker_artifacts(
     row.set("t2_retracted", retracted);
     row.set("t2_core_events", core_events);
     row.set("t1_unknown_origin_core_incidence", license_core_events);
-    row.set("esc_selected_sites", esc.sites.len());
+    let selected_loans = esc.loans.values().map(|set| set.len()).sum::<usize>();
+    assert_eq!(selected_loans, esc.sites.len());
     row.set(
-        "esc_selected_loans",
-        esc.loans.values().map(|set| set.len()).sum::<usize>(),
+        "esc_joined_keys",
+        esc.sites.len() + esc.excluded_sites.len(),
+    );
+    row.set("esc_selected_sites", esc.sites.len());
+    row.set("esc_selected_loans", selected_loans);
+    row.set("esc_excluded_sites", esc.excluded_sites.len());
+    row.set(
+        "esc_excluded_field_issuer",
+        esc.excluded_sites
+            .iter()
+            .filter(|site| site.reason == esc_minimal::EscExclusionReason::FieldIssuerOutOfScope)
+            .count(),
     );
     row.set("esc_liveness_tripwire", "passed");
 }
@@ -570,7 +600,10 @@ fn phase2_t2_esc_batch_corpus() {
     let mut official_den = 0usize;
     let mut official_before = 0usize;
     let mut official_after = 0usize;
+    let mut esc_joined = 0usize;
     let mut esc_sites = 0usize;
+    let mut esc_excluded = 0usize;
+    let mut esc_field_issuers = 0usize;
     let mut endpoints = 0usize;
     let mut retracted = 0usize;
     let mut t1_cores = 0usize;
@@ -588,7 +621,10 @@ fn phase2_t2_esc_batch_corpus() {
         total_ref += number(row, "n_ref");
         total_raw += number(row, "n_raw");
         total_own += number(row, "n_own");
+        esc_joined += number(row, "esc_joined_keys");
         esc_sites += number(row, "esc_selected_sites");
+        esc_excluded += number(row, "esc_excluded_sites");
+        esc_field_issuers += number(row, "esc_excluded_field_issuer");
         endpoints += number(row, "t2_endpoints");
         retracted += number(row, "t2_retracted");
         t1_cores += number(row, "t1_unknown_origin_core_incidence");
@@ -673,7 +709,10 @@ fn phase2_t2_esc_batch_corpus() {
     }
     assert_eq!((old_ref, old_raw, old_own), (48_901, 10_458, 239));
     assert_eq!((official_before, official_den), (1_609, 2_414));
-    assert_eq!(esc_sites, 36, "② exact allowlist join");
+    assert_eq!(esc_joined, 36, "② exact allowlist join");
+    assert_eq!(esc_sites, 33, "② wave-1 selected population");
+    assert_eq!(esc_excluded, 3, "② typed exclusion population");
+    assert_eq!(esc_field_issuers, 3, "② field-issuer residual population");
     fs::write(output.join("model-movement.tsv"), &movement).expect("write movement ledger");
     fs::write(output.join("a5-pair-mark-deltas.tsv"), &pair_deltas).expect("write A5 delta ledger");
 
@@ -778,7 +817,7 @@ fn phase2_t2_esc_batch_corpus() {
     fs::write(
         output.join("receipt.txt"),
         format!(
-            "status=complete\ndata={}\nanalysis_head={}\ncorpus=rs-crown\nprograms=20/20\nmode=phase2-t2-esc\na5_mode=precise_replay\na5_world=closed_world_frozen_graph\na5_abi_guard=permitted:measurement-frozen-graph-attested\ncopy_lend_mode=baseline\na2_mode=off\nderived_substrate_sha256={DERIVED_DIGEST}\nofficial_evaluation_sha256={OFFICIAL_DIGEST}\nmodel_movement_rows={movement_rows}\nownlost_rows={ownlost_rows}\nownlost_flips_observed={ownlost_flips}\nownlost_direct_retractions={ownlost_retractions}\nownlost_baseline_owning={ownlost_baseline_owning}\nownlost_owning_regressions={ownlost_regressions}\nendpoint_slots={}\nendpoint_baseline_owning={endpoint_baseline_owning}\nendpoint_owning_regressions={endpoint_regressions}\nt2_endpoints={endpoints}\nt2_retracted_global={retracted}\nt1_unknown_origin_core_incidence={t1_cores}\nesc_selected_sites={esc_sites}\na5_changed_pair_mark_rows={changed_pairs}\nobjective_bearing_checks={objective_checks}\nobjective_model_wall_s={optimize_wall:.3}\nlazy_plain_hard_checks={lazy_plain_hard_checks}\nlazy_tracked_rechecks={lazy_tracked_rechecks}\nlazy_plain_materializations={lazy_plain_materializations}\nworker_model_wall_s={model_wall:.3}\nrn1_matched19_baseline_wall_s=212.147\nreframed_no_owning_regression={}\n",
+            "status=complete\ndata={}\nanalysis_head={}\ncorpus=rs-crown\nprograms=20/20\nmode=phase2-t2-esc\na5_mode=precise_replay\na5_world=closed_world_frozen_graph\na5_abi_guard=permitted:measurement-frozen-graph-attested\ncopy_lend_mode=baseline\na2_mode=off\nderived_substrate_sha256={DERIVED_DIGEST}\nofficial_evaluation_sha256={OFFICIAL_DIGEST}\nmodel_movement_rows={movement_rows}\nownlost_rows={ownlost_rows}\nownlost_flips_observed={ownlost_flips}\nownlost_direct_retractions={ownlost_retractions}\nownlost_baseline_owning={ownlost_baseline_owning}\nownlost_owning_regressions={ownlost_regressions}\nendpoint_slots={}\nendpoint_baseline_owning={endpoint_baseline_owning}\nendpoint_owning_regressions={endpoint_regressions}\nt2_endpoints={endpoints}\nt2_retracted_global={retracted}\nt1_unknown_origin_core_incidence={t1_cores}\nesc_joined_keys={esc_joined}\nesc_selected_sites={esc_sites}\nesc_excluded_sites={esc_excluded}\nesc_excluded_field_issuer={esc_field_issuers}\na5_changed_pair_mark_rows={changed_pairs}\nobjective_bearing_checks={objective_checks}\nobjective_model_wall_s={optimize_wall:.3}\nlazy_plain_hard_checks={lazy_plain_hard_checks}\nlazy_tracked_rechecks={lazy_tracked_rechecks}\nlazy_plain_materializations={lazy_plain_materializations}\nworker_model_wall_s={model_wall:.3}\nrn1_matched19_baseline_wall_s=212.147\nreframed_no_owning_regression={}\n",
             if expected { "true" } else { "false" },
             orchestrate::git_sha(),
             endpoint_slots.len(),
