@@ -4348,8 +4348,9 @@ mod run {
                 constrain_field_ownership, field_ownership_candidates, selected_copy_lend_sites,
             },
             construction::{
-                A2Mode, BoConstruction, CopyLendMode, construct_bo_into, solve_bo_a5_config,
-                verify_bo_construction_counting, verify_bo_construction_with_flows,
+                A2Mode, BoConstruction, CopyLendMode, construct_bo_into,
+                solve_bo_a5_config_reporting, verify_bo_construction_counting,
+                verify_bo_construction_with_flows,
             },
             crate_slots::CrateSlots,
             l2,
@@ -6065,7 +6066,7 @@ mod run {
             let ((verified, trace), export) =
                 crate::analyses::borrow_ownership::export::with_bo_export(|| {
                     crate::analyses::borrow_ownership::solver::with_selector_trace(|| {
-                        solve_bo_a5_config(
+                        solve_bo_a5_config_reporting(
                             &program,
                             &slots,
                             &origins,
@@ -6078,7 +6079,7 @@ mod run {
             (verified, Some((trace, export)))
         } else {
             (
-                solve_bo_a5_config(
+                solve_bo_a5_config_reporting(
                     &program,
                     &slots,
                     &origins,
@@ -6089,10 +6090,31 @@ mod run {
                 None,
             )
         };
-        let Some(verified) = verified else {
-            row.set("status", "decline");
-            row.set("t_total_s", secs(t0.elapsed()));
-            return row;
+        let verified = match verified {
+            Ok(verified) => verified,
+            Err(decline) => {
+                row.set("status", "decline");
+                row.set("decline_reason", decline.reason().label());
+                row.set("decline_detail", decline.detail().unwrap_or("-"));
+                row.set("t_total_s", secs(t0.elapsed()));
+                if phase2_capture {
+                    let detail = decline
+                        .detail()
+                        .unwrap_or("-")
+                        .replace(['\t', '\n', '\r'], " ");
+                    let artifact_dir = std::env::var_os("CRAT_A5_BATCH_SHARD_DIR")
+                        .map(std::path::PathBuf::from)
+                        .expect("A5 batch requires CRAT_A5_BATCH_SHARD_DIR");
+                    std::fs::create_dir_all(&artifact_dir)
+                        .expect("create A5 pre-ledger decline artifact dir");
+                    std::fs::write(
+                        artifact_dir.join("preledger-decline.tsv"),
+                        format!("reason\tdetail\n{}\t{}\n", decline.reason().label(), detail,),
+                    )
+                    .expect("write A5 pre-ledger decline artifact");
+                }
+                return row;
+            }
         };
         for stamp in [
             format!("a5_mode={}\n", mode.label()),

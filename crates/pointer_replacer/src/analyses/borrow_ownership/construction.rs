@@ -244,6 +244,80 @@ pub(crate) struct VerifiedBo {
     pub(crate) producer_stats: super::a5_producer::A5ProducerStats,
 }
 
+/// Typed diagnostic for every `None` boundary before the production A5 worker
+/// can write its model and T2/ESC ledgers. Production callers retain the
+/// historical `Option` API; measurement callers use the reporting twin below.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum A5PreledgerDeclineReason {
+    BaselineConstruction,
+    BaselineVerification,
+    A5PlanProduction,
+    RefinedFallbackConstruction,
+    RefinedFallbackVerification,
+    PreciseConstruction,
+    PreciseVerification,
+    CoarseConstruction,
+    CoarseVerification,
+}
+
+impl A5PreledgerDeclineReason {
+    pub(crate) const ALL: [Self; 9] = [
+        Self::BaselineConstruction,
+        Self::BaselineVerification,
+        Self::A5PlanProduction,
+        Self::RefinedFallbackConstruction,
+        Self::RefinedFallbackVerification,
+        Self::PreciseConstruction,
+        Self::PreciseVerification,
+        Self::CoarseConstruction,
+        Self::CoarseVerification,
+    ];
+
+    pub(crate) const fn label(self) -> &'static str {
+        match self {
+            Self::BaselineConstruction => "baseline-construction",
+            Self::BaselineVerification => "baseline-verification",
+            Self::A5PlanProduction => "a5-plan-production",
+            Self::RefinedFallbackConstruction => "refined-fallback-construction",
+            Self::RefinedFallbackVerification => "refined-fallback-verification",
+            Self::PreciseConstruction => "precise-construction",
+            Self::PreciseVerification => "precise-verification",
+            Self::CoarseConstruction => "coarse-construction",
+            Self::CoarseVerification => "coarse-verification",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct A5PreledgerDecline {
+    reason: A5PreledgerDeclineReason,
+    detail: Option<String>,
+}
+
+impl A5PreledgerDecline {
+    fn at(reason: A5PreledgerDeclineReason) -> Self {
+        Self {
+            reason,
+            detail: None,
+        }
+    }
+
+    fn from_error(reason: A5PreledgerDeclineReason, error: impl std::fmt::Display) -> Self {
+        Self {
+            reason,
+            detail: Some(error.to_string()),
+        }
+    }
+
+    pub(crate) fn reason(&self) -> A5PreledgerDeclineReason {
+        self.reason
+    }
+
+    pub(crate) fn detail(&self) -> Option<&str> {
+        self.detail.as_deref()
+    }
+}
+
 const A5_PAIR_LEDGER_SHA256: &str =
     "16dac90cf269c5480e6f612e54733dd210e41393a879202c7138e93cd7d360e1";
 const REPLAY_SAFE_DEFINITION: &str = "no incompatible access derived by precise replay with the effective parameter-overlap map injected; O2 closed-world frozen graph.";
@@ -1015,6 +1089,19 @@ pub(crate) fn solve_bo_a5_config(
     mode: A5Mode,
     attestation: Option<WholeProgramAttestation>,
 ) -> Option<VerifiedBo> {
+    solve_bo_a5_config_reporting(program, slots, origins, mut_facts, mode, attestation).ok()
+}
+
+/// Diagnostic twin of `solve_bo_a5_config`: identical construction and solve,
+/// with a typed reason at every historical pre-ledger `None` exit.
+pub(crate) fn solve_bo_a5_config_reporting(
+    program: &RustProgram<'_>,
+    slots: &CrateSlots,
+    origins: &OriginSummaries,
+    mut_facts: &MutFacts,
+    mode: A5Mode,
+    attestation: Option<WholeProgramAttestation>,
+) -> Result<VerifiedBo, A5PreledgerDecline> {
     // A16-REFINE is part of the accepted precise production semantics. The
     // retained Baseline mode is a diagnostic A5 control, not another
     // production configuration.
@@ -1028,7 +1115,7 @@ pub(crate) fn solve_bo_a5_config(
         attestation,
         refined,
     )?;
-    Some(stamp_a16_refined_receipt(verified, refined))
+    Ok(stamp_a16_refined_receipt(verified, refined))
 }
 
 fn stamp_a16_refined_receipt(mut verified: VerifiedBo, refined: bool) -> VerifiedBo {
@@ -1054,7 +1141,7 @@ fn solve_bo_a5_config_inner(
     mode: A5Mode,
     attestation: Option<WholeProgramAttestation>,
     refined: bool,
-) -> Option<(VerifiedBo, usize)> {
+) -> Result<(VerifiedBo, usize), A5PreledgerDecline> {
     assert_eq!(
         CopyLendMode::current(),
         CopyLendMode::Baseline,
@@ -1070,7 +1157,9 @@ fn solve_bo_a5_config_inner(
         &baseline_solver,
         CopyLendMode::Baseline,
     )
-    .ok()?;
+    .map_err(|error| {
+        A5PreledgerDecline::from_error(A5PreledgerDeclineReason::BaselineConstruction, error)
+    })?;
     let (baseline_model, baseline_round_stats) = verify_bo_construction_counting(
         program,
         slots,
@@ -1079,7 +1168,8 @@ fn solve_bo_a5_config_inner(
         &baseline_construction,
         mut_facts,
     );
-    let baseline_model = baseline_model?;
+    let baseline_model = baseline_model
+        .ok_or_else(|| A5PreledgerDecline::at(A5PreledgerDeclineReason::BaselineVerification))?;
     let baseline_nullability = nullability_artifacts(&baseline_construction);
     let baseline_a14 = a14_artifacts(&baseline_construction);
     if mode == A5Mode::Baseline {
@@ -1089,7 +1179,7 @@ fn solve_bo_a5_config_inner(
             A5Plan::baseline()
         };
         let selected_model_sha256 = model_digest(&baseline_model);
-        return Some((
+        return Ok((
             VerifiedBo {
                 receipt: a5_receipt(
                     mode,
@@ -1143,7 +1233,9 @@ fn solve_bo_a5_config_inner(
         mode,
         attestation,
     )
-    .ok()?;
+    .map_err(|error| {
+        A5PreledgerDecline::from_error(A5PreledgerDeclineReason::A5PlanProduction, error)
+    })?;
     if matches!(plan.abi_guard, AbiGuardDisposition::Refused { .. }) {
         if refined {
             // Refusing A5 promotion must not also disable the independently
@@ -1152,7 +1244,13 @@ fn solve_bo_a5_config_inner(
             // rule as the attested production path.
             let solver = KindSolver::new(slots);
             let (construction, refined_links) =
-                construct_bo_into_a16_refined(program, slots, origins, mut_facts, &solver).ok()?;
+                construct_bo_into_a16_refined(program, slots, origins, mut_facts, &solver)
+                    .map_err(|error| {
+                        A5PreledgerDecline::from_error(
+                            A5PreledgerDeclineReason::RefinedFallbackConstruction,
+                            error,
+                        )
+                    })?;
             let (model, round_stats) = verify_bo_construction_counting(
                 program,
                 slots,
@@ -1161,11 +1259,13 @@ fn solve_bo_a5_config_inner(
                 &construction,
                 mut_facts,
             );
-            let model = model?;
+            let model = model.ok_or_else(|| {
+                A5PreledgerDecline::at(A5PreledgerDeclineReason::RefinedFallbackVerification)
+            })?;
             let selected_model_sha256 = model_digest(&model);
             let nullability = nullability_artifacts(&construction);
             let a14 = a14_artifacts(&construction);
-            return Some((
+            return Ok((
                 VerifiedBo {
                     receipt: a5_receipt(
                         mode,
@@ -1213,7 +1313,7 @@ fn solve_bo_a5_config_inner(
             ));
         }
         let selected_model_sha256 = model_digest(&baseline_model);
-        return Some((
+        return Ok((
             VerifiedBo {
                 receipt: a5_receipt(
                     mode,
@@ -1264,7 +1364,11 @@ fn solve_bo_a5_config_inner(
 
     let solver = KindSolver::new(slots);
     let (construction, refined_links) = if refined {
-        construct_bo_into_a16_refined(program, slots, origins, mut_facts, &solver).ok()?
+        construct_bo_into_a16_refined(program, slots, origins, mut_facts, &solver).map_err(
+            |error| {
+                A5PreledgerDecline::from_error(A5PreledgerDeclineReason::PreciseConstruction, error)
+            },
+        )?
     } else {
         (
             construct_bo_into(
@@ -1275,7 +1379,9 @@ fn solve_bo_a5_config_inner(
                 &solver,
                 CopyLendMode::Baseline,
             )
-            .ok()?,
+            .map_err(|error| {
+                A5PreledgerDecline::from_error(A5PreledgerDeclineReason::CoarseConstruction, error)
+            })?,
             0,
         )
     };
@@ -1291,7 +1397,12 @@ fn solve_bo_a5_config_inner(
                 mut_facts,
                 &plan.effective_overlaps,
             );
-            (model?, stats)
+            (
+                model.ok_or_else(|| {
+                    A5PreledgerDecline::at(A5PreledgerDeclineReason::PreciseVerification)
+                })?,
+                stats,
+            )
         }
         A5Mode::CoarseConstraint => {
             apply_coarse_constraints(mode, &solver, plan.coarse_pairs.iter().copied());
@@ -1303,7 +1414,12 @@ fn solve_bo_a5_config_inner(
                 &construction,
                 mut_facts,
             );
-            (model?, stats)
+            (
+                model.ok_or_else(|| {
+                    A5PreledgerDecline::at(A5PreledgerDeclineReason::CoarseVerification)
+                })?,
+                stats,
+            )
         }
     };
     let retained_c9_marks = if mode == A5Mode::PreciseReplay {
@@ -1319,7 +1435,7 @@ fn solve_bo_a5_config_inner(
     let selected_model_sha256 = model_digest(&model);
     let nullability = nullability_artifacts(&construction);
     let a14 = a14_artifacts(&construction);
-    Some((
+    Ok((
         VerifiedBo {
             receipt: a5_receipt(
                 mode,
@@ -1721,6 +1837,24 @@ fn live_outward_event<'tcx>(
 #[cfg(test)]
 mod mode_tests {
     use super::*;
+
+    #[test]
+    fn a5_preledger_decline_reason_labels_are_complete_and_stable() {
+        assert_eq!(
+            A5PreledgerDeclineReason::ALL.map(A5PreledgerDeclineReason::label),
+            [
+                "baseline-construction",
+                "baseline-verification",
+                "a5-plan-production",
+                "refined-fallback-construction",
+                "refined-fallback-verification",
+                "precise-construction",
+                "precise-verification",
+                "coarse-construction",
+                "coarse-verification",
+            ]
+        );
+    }
 
     #[test]
     fn receipt_key_order_is_canonical_across_input_order() {
