@@ -26,6 +26,7 @@ use crate::{
         },
         borrow_ownership::{
             coherence::SelectedCopyLendLoans,
+            esc_minimal,
             export::{self, LoanClass},
             origin_flow::OriginFlowResults,
         },
@@ -510,34 +511,6 @@ fn local_witnesses_for_loan(
         local_witnesses.push((local, borrow_data.borrowed.local));
     }
     local_witnesses
-}
-
-fn escaped_demotion_exemptions(
-    inference: &NativeInference<'_>,
-    provenance_set: &ProvenanceSet,
-    invalid_loans: &DenseBitSet<Loan>,
-) -> FxHashSet<(Local, Local)> {
-    let Some(localized) = &inference.localized_requires else {
-        assert!(
-            inference.escaped_lends.is_empty(),
-            "escaped CopyLends require localized replay"
-        );
-        return FxHashSet::default();
-    };
-    let mut selected = FxHashSet::default();
-    let mut ordinary = FxHashSet::default();
-    for loan in invalid_loans.iter() {
-        let target = if inference.escaped_lends.contains(loan) {
-            &mut selected
-        } else {
-            &mut ordinary
-        };
-        for pair in local_witnesses_for_loan(inference, provenance_set, localized, loan) {
-            target.insert(pair);
-        }
-    }
-    selected.retain(|pair| !ordinary.contains(pair));
-    selected
 }
 
 /// Addendum 61 convergence tripwire. A marked row may exist only while its presented source is
@@ -1087,9 +1060,8 @@ where
 
             let to_demote: Vec<(Local, Local)> = {
                 let provenance_set = ctxt.borrow.provenances.get(&f).unwrap();
-                let exemptions =
-                    escaped_demotion_exemptions(&inference, provenance_set, &invalid_loans);
-                assert!(exemptions.len() <= escaped_copy_lends.len());
+                let exemptions = esc_minimal::demotion_exemptions_for(f, escaped_copy_lends);
+                assert_eq!(exemptions.len(), escaped_copy_lends.len());
                 let local_witnesses = collect_invalid_loan_demotions_forked(
                     &inference,
                     provenance_set,
@@ -1302,9 +1274,8 @@ where
 
             let to_demote: Vec<(Local, Local)> = {
                 let provenance_set = ctxt.borrow.provenances.get(&f).unwrap();
-                let exemptions =
-                    escaped_demotion_exemptions(&inference, provenance_set, &invalid_loans);
-                assert!(exemptions.len() <= escaped_copy_lends.len());
+                let exemptions = esc_minimal::demotion_exemptions_for(f, escaped_copy_lends);
+                assert_eq!(exemptions.len(), escaped_copy_lends.len());
                 let local_witnesses = collect_invalid_loan_demotions_forked(
                     &inference,
                     provenance_set,

@@ -458,8 +458,10 @@ pub(super) fn extend_escaped_loans_to_exit(
     location_map: &DenseLocationMap,
     escaped: &DenseBitSet<Loan>,
     loan_liveness: &mut SparseBitMatrix<PointIndex, Loan>,
-) {
+) -> usize {
+    let mut extended = 0usize;
     for loan in escaped.iter() {
+        extended += 1;
         let reserve = location_map.point_from_location(borrow_set.loans[loan].location());
         let mut stack = successor_points(body, location_map, reserve);
         let mut visited = FxHashSet::default();
@@ -477,6 +479,7 @@ pub(super) fn extend_escaped_loans_to_exit(
             stack.extend(successor_points(body, location_map, point));
         }
     }
+    extended
 }
 
 /// Load-bearing differential: ② may add liveness only for its selected escaped

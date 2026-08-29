@@ -12703,8 +12703,8 @@ unsafe fn caller() -> i32 {
             let origins = compute_origins(&program);
             let facts = MutFacts::from_program(&program);
             let solver = KindSolver::new(&slots);
-            let (((model, stats), export), extensions, selected_sites) =
-                with_fixture_selection(|| {
+            let (((model, stats), export), extensions, selected_sites) = with_fixture_selection(
+                || {
                     let construction = construct_bo_into(
                         &program,
                         &slots,
@@ -12715,6 +12715,11 @@ unsafe fn caller() -> i32 {
                     )
                     .expect("ESC-W1 shared construction");
                     let selected_sites = construction.esc_minimal.sites.len();
+                    assert_eq!(
+                        construction.esc_minimal.cross_stage_counts(),
+                        (1, 1, 1, 1),
+                        "one effective selection must feed selection, exemption, extension, and receipt"
+                    );
                     let (((model, stats), export), extensions) =
                         with_escaped_extension_trace(|| {
                             with_bo_export(|| {
@@ -12729,7 +12734,8 @@ unsafe fn caller() -> i32 {
                             })
                         });
                     (((model, stats), export), extensions, selected_sites)
-                });
+                },
+            );
             assert_eq!(selected_sites, 1, "ESC-W1 selects one exact N4 site");
             assert_eq!(
                 stats.copy_lend_replay_selections, 0,

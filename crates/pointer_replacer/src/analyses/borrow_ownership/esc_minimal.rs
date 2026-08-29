@@ -119,7 +119,27 @@ pub(crate) struct EscMinimalSelection {
     pub(crate) sites: Vec<EscRuntimeSite>,
     pub(crate) excluded_sites: Vec<EscExcludedSite>,
     pub(crate) loans: SelectedCopyLendLoans,
+    demotion_exemptions: FxHashMap<LocalDefId, FxHashSet<(Local, Local)>>,
     presentations: FxHashMap<(LocalDefId, SelectedCopyLendLoan), EscPresentation>,
+}
+
+impl EscMinimalSelection {
+    pub(crate) fn cross_stage_counts(&self) -> (usize, usize, usize, usize) {
+        let selected = self.sites.len();
+        let exemptions = self
+            .demotion_exemptions
+            .values()
+            .map(FxHashSet::len)
+            .sum::<usize>();
+        let extensions = self.loans.values().map(FxHashSet::len).sum::<usize>();
+        let receipt_rows = self.sites.len();
+        assert_eq!(
+            (selected, selected, selected),
+            (exemptions, extensions, receipt_rows),
+            "② effective selection must feed every downstream consumer one-to-one"
+        );
+        (selected, exemptions, extensions, receipt_rows)
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -129,23 +149,31 @@ struct EscPresentation {
     destination_owner: ProvenanceOwner,
 }
 
+#[derive(Clone, Debug)]
+struct EscScope {
+    presentations: FxHashMap<(LocalDefId, SelectedCopyLendLoan), EscPresentation>,
+    demotion_exemptions: FxHashMap<LocalDefId, FxHashSet<(Local, Local)>>,
+}
+
 thread_local! {
-    static PRESENTATIONS: RefCell<
-        Option<FxHashMap<(LocalDefId, SelectedCopyLendLoan), EscPresentation>>,
-    > = const { RefCell::new(None) };
+    static EFFECTIVE_SELECTION: RefCell<Option<EscScope>> = const { RefCell::new(None) };
 }
 
 pub(crate) fn with_presentations<T>(selection: &EscMinimalSelection, f: impl FnOnce() -> T) -> T {
-    struct Restore(Option<FxHashMap<(LocalDefId, SelectedCopyLendLoan), EscPresentation>>);
+    struct Restore(Option<EscScope>);
     impl Drop for Restore {
         fn drop(&mut self) {
-            PRESENTATIONS.with(|presentations| {
-                *presentations.borrow_mut() = self.0.take();
+            EFFECTIVE_SELECTION.with(|selection| {
+                *selection.borrow_mut() = self.0.take();
             });
         }
     }
-    let previous = PRESENTATIONS
-        .with(|presentations| presentations.replace(Some(selection.presentations.clone())));
+    selection.cross_stage_counts();
+    let scope = EscScope {
+        presentations: selection.presentations.clone(),
+        demotion_exemptions: selection.demotion_exemptions.clone(),
+    };
+    let previous = EFFECTIVE_SELECTION.with(|selection| selection.replace(Some(scope)));
     let _restore = Restore(previous);
     f()
 }
@@ -154,12 +182,59 @@ pub(crate) fn presentation_for(
     fn_did: LocalDefId,
     loan: &SelectedCopyLendLoan,
 ) -> Option<(ProvenanceOwner, ProvenanceOwner)> {
-    PRESENTATIONS.with(|presentations| {
-        presentations
+    EFFECTIVE_SELECTION.with(|selection| {
+        selection
             .borrow()
             .as_ref()
-            .and_then(|presentations| presentations.get(&(fn_did, loan.clone())))
+            .and_then(|selection| selection.presentations.get(&(fn_did, loan.clone())))
             .map(|presentation| (presentation.source_owner, presentation.destination_owner))
+    })
+}
+
+pub(crate) fn demotion_exemption(loan: &SelectedCopyLendLoan) -> (Local, Local) {
+    let BorrowerKind::Assign {
+        owner: OwnerKey::Local(borrower),
+    } = loan.borrower
+    else {
+        panic!(
+            "② feeder borrower must be a local temp, got {:?}",
+            loan.borrower
+        )
+    };
+    (Local::from_u32(borrower), loan.borrowed.local)
+}
+
+pub(crate) fn demotion_exemptions_for(
+    fn_did: LocalDefId,
+    loans: &FxHashSet<SelectedCopyLendLoan>,
+) -> FxHashSet<(Local, Local)> {
+    if loans.is_empty() {
+        return FxHashSet::default();
+    }
+    EFFECTIVE_SELECTION.with(|selection| {
+        let selection = selection.borrow();
+        let selection = selection
+            .as_ref()
+            .expect("② pruning exemptions require the effective-selection scope");
+        let registered = selection
+            .demotion_exemptions
+            .get(&fn_did)
+            .cloned()
+            .unwrap_or_default();
+        let active = loans
+            .iter()
+            .map(demotion_exemption)
+            .collect::<FxHashSet<_>>();
+        assert_eq!(
+            active.len(),
+            loans.len(),
+            "② active loan identities must map one-to-one to pruning exemptions"
+        );
+        assert!(
+            active.is_subset(&registered),
+            "② active pruning exemption escaped the effective selection"
+        );
+        active
     })
 }
 
@@ -171,16 +246,17 @@ pub(crate) fn active_loans_for_model(
     escaped: &SelectedCopyLendLoans,
     model: &FxHashMap<SlotRef, SlotKind>,
 ) -> SelectedCopyLendLoans {
-    PRESENTATIONS.with(|presentations| {
-        let presentations = presentations.borrow();
-        let presentations = presentations
+    EFFECTIVE_SELECTION.with(|selection| {
+        let selection = selection.borrow();
+        let selection = selection
             .as_ref()
             .expect("② active-loan filtering requires the construction presentation scope");
         let mut active = SelectedCopyLendLoans::default();
         let mut visited = 0;
         for (&fn_did, loans) in escaped {
             for loan in loans {
-                let presentation = presentations
+                let presentation = selection
+                    .presentations
                     .get(&(fn_did, loan.clone()))
                     .expect("escaped loan missing exact presentation row");
                 visited += 1;
@@ -198,8 +274,13 @@ pub(crate) fn active_loans_for_model(
             "② active-loan filter must visit every escaped identity exactly once"
         );
         assert!(
-            active.values().map(FxHashSet::len).sum::<usize>() <= 36,
-            "② active-loan class exceeded the exact 36-site allowlist"
+            active.values().map(FxHashSet::len).sum::<usize>()
+                <= selection
+                    .demotion_exemptions
+                    .values()
+                    .map(FxHashSet::len)
+                    .sum::<usize>(),
+            "② active-loan class exceeded the effective selection"
         );
         active
     })
@@ -604,6 +685,14 @@ pub(crate) fn select(program: &RustProgram<'_>, slots: &CrateSlots) -> EscMinima
         );
         assert!(
             answer
+                .demotion_exemptions
+                .entry(row.fn_did)
+                .or_default()
+                .insert(demotion_exemption(&loan)),
+            "duplicate ②-minimal pruning exemption"
+        );
+        assert!(
+            answer
                 .presentations
                 .insert(
                     (row.fn_did, loan.clone()),
@@ -640,6 +729,7 @@ pub(crate) fn select(program: &RustProgram<'_>, slots: &CrateSlots) -> EscMinima
             "② field-issuer exclusions must match the exact joined allowlist rows"
         );
     }
+    answer.cross_stage_counts();
     answer
 }
 
@@ -677,7 +767,14 @@ fn fixture_sites(code: &str) -> Vec<Site> {
 
 #[cfg(test)]
 mod tests {
-    use super::{EscExclusionReason, artifact_keys, fixture_sites};
+    use rustc_middle::mir::Local;
+
+    use super::{EscExclusionReason, artifact_keys, demotion_exemption, fixture_sites};
+    use crate::analyses::borrow_ownership::{
+        coherence::SelectedCopyLendLoan,
+        export::{BorrowerKind, OwnerKey, PlaceKey},
+        l2::MirLocationKey,
+    };
 
     const ESC_W1: &str = r#"
 unsafe fn save(out: *mut *mut i32, x: *mut i32) { *out = x; *x = 1; }
@@ -719,6 +816,24 @@ unsafe fn caller() -> i32 {
         assert_eq!(
             EscExclusionReason::FieldIssuerOutOfScope.label(),
             "field-issuer-out-of-scope"
+        );
+    }
+
+    #[test]
+    fn one_effective_loan_has_one_exact_pruning_exemption() {
+        let loan = SelectedCopyLendLoan {
+            location: MirLocationKey::new(3, 7),
+            borrowed: PlaceKey {
+                local: Local::from_u32(9),
+                proj: Vec::new(),
+            },
+            borrower: BorrowerKind::Assign {
+                owner: OwnerKey::Local(5),
+            },
+        };
+        assert_eq!(
+            demotion_exemption(&loan),
+            (Local::from_u32(5), Local::from_u32(9))
         );
     }
 

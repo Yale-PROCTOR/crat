@@ -114,7 +114,7 @@ fn assume_sites(labels: &BTreeSet<String>) -> String {
 /// trace, and it cannot alter either.
 pub(super) fn write_worker_artifacts(
     _tcx: TyCtxt<'_>,
-    program: &RustProgram<'_>,
+    _program: &RustProgram<'_>,
     slots: &CrateSlots,
     verified: &VerifiedBo,
     trace: &SelectorTrace,
@@ -235,7 +235,7 @@ pub(super) fn write_worker_artifacts(
     fs::write(artifact_dir.join("t2-core-events.tsv"), core_tsv)
         .expect("write phase-2 core ledger");
 
-    let esc = esc_minimal::select(program, slots);
+    let esc = &verified.esc_minimal;
     let mut esc_tsv = String::from(
         "program\tfunction\tstore_block\tstore_statement\tresolved_origin_slot\tdestination_place\tsource_slot\tdestination_slot\tloan_location\tloan_borrowed\tloan_borrower\n",
     );
@@ -285,14 +285,23 @@ pub(super) fn write_worker_artifacts(
     row.set("t2_retracted", retracted);
     row.set("t2_core_events", core_events);
     row.set("t1_unknown_origin_core_incidence", license_core_events);
+    let (selected_sites, pruning_exemptions, escaped_extensions, receipt_rows) =
+        esc.cross_stage_counts();
     let selected_loans = esc.loans.values().map(|set| set.len()).sum::<usize>();
-    assert_eq!(selected_loans, esc.sites.len());
-    row.set(
-        "esc_joined_keys",
-        esc.sites.len() + esc.excluded_sites.len(),
-    );
-    row.set("esc_selected_sites", esc.sites.len());
+    assert_eq!(selected_loans, selected_sites);
+    fs::write(
+        artifact_dir.join("esc-cross-stage-receipt.txt"),
+        format!(
+            "status=passed\nselected={selected_sites}\nexemptions={pruning_exemptions}\nescaped_extensions={escaped_extensions}\nreceipt_rows={receipt_rows}\n"
+        ),
+    )
+    .expect("write phase-2 ESC cross-stage receipt");
+    row.set("esc_joined_keys", selected_sites + esc.excluded_sites.len());
+    row.set("esc_selected_sites", selected_sites);
     row.set("esc_selected_loans", selected_loans);
+    row.set("esc_pruning_exemptions", pruning_exemptions);
+    row.set("esc_escaped_extensions", escaped_extensions);
+    row.set("esc_receipt_rows", receipt_rows);
     row.set("esc_excluded_sites", esc.excluded_sites.len());
     row.set(
         "esc_excluded_field_issuer",
@@ -602,6 +611,9 @@ fn phase2_t2_esc_batch_corpus() {
     let mut official_after = 0usize;
     let mut esc_joined = 0usize;
     let mut esc_sites = 0usize;
+    let mut esc_exemptions = 0usize;
+    let mut esc_extensions = 0usize;
+    let mut esc_receipt_rows = 0usize;
     let mut esc_excluded = 0usize;
     let mut esc_field_issuers = 0usize;
     let mut endpoints = 0usize;
@@ -623,6 +635,9 @@ fn phase2_t2_esc_batch_corpus() {
         total_own += number(row, "n_own");
         esc_joined += number(row, "esc_joined_keys");
         esc_sites += number(row, "esc_selected_sites");
+        esc_exemptions += number(row, "esc_pruning_exemptions");
+        esc_extensions += number(row, "esc_escaped_extensions");
+        esc_receipt_rows += number(row, "esc_receipt_rows");
         esc_excluded += number(row, "esc_excluded_sites");
         esc_field_issuers += number(row, "esc_excluded_field_issuer");
         endpoints += number(row, "t2_endpoints");
@@ -711,6 +726,9 @@ fn phase2_t2_esc_batch_corpus() {
     assert_eq!((official_before, official_den), (1_609, 2_414));
     assert_eq!(esc_joined, 36, "② exact allowlist join");
     assert_eq!(esc_sites, 33, "② wave-1 selected population");
+    assert_eq!(esc_exemptions, 33, "② pruning-exemption population");
+    assert_eq!(esc_extensions, 33, "② live-to-exit extension population");
+    assert_eq!(esc_receipt_rows, 33, "② selected receipt population");
     assert_eq!(esc_excluded, 3, "② typed exclusion population");
     assert_eq!(esc_field_issuers, 3, "② field-issuer residual population");
     fs::write(output.join("model-movement.tsv"), &movement).expect("write movement ledger");
@@ -817,7 +835,7 @@ fn phase2_t2_esc_batch_corpus() {
     fs::write(
         output.join("receipt.txt"),
         format!(
-            "status=complete\ndata={}\nanalysis_head={}\ncorpus=rs-crown\nprograms=20/20\nmode=phase2-t2-esc\na5_mode=precise_replay\na5_world=closed_world_frozen_graph\na5_abi_guard=permitted:measurement-frozen-graph-attested\ncopy_lend_mode=baseline\na2_mode=off\nderived_substrate_sha256={DERIVED_DIGEST}\nofficial_evaluation_sha256={OFFICIAL_DIGEST}\nmodel_movement_rows={movement_rows}\nownlost_rows={ownlost_rows}\nownlost_flips_observed={ownlost_flips}\nownlost_direct_retractions={ownlost_retractions}\nownlost_baseline_owning={ownlost_baseline_owning}\nownlost_owning_regressions={ownlost_regressions}\nendpoint_slots={}\nendpoint_baseline_owning={endpoint_baseline_owning}\nendpoint_owning_regressions={endpoint_regressions}\nt2_endpoints={endpoints}\nt2_retracted_global={retracted}\nt1_unknown_origin_core_incidence={t1_cores}\nesc_joined_keys={esc_joined}\nesc_selected_sites={esc_sites}\nesc_excluded_sites={esc_excluded}\nesc_excluded_field_issuer={esc_field_issuers}\na5_changed_pair_mark_rows={changed_pairs}\nobjective_bearing_checks={objective_checks}\nobjective_model_wall_s={optimize_wall:.3}\nlazy_plain_hard_checks={lazy_plain_hard_checks}\nlazy_tracked_rechecks={lazy_tracked_rechecks}\nlazy_plain_materializations={lazy_plain_materializations}\nworker_model_wall_s={model_wall:.3}\nrn1_matched19_baseline_wall_s=212.147\nreframed_no_owning_regression={}\n",
+            "status=complete\ndata={}\nanalysis_head={}\ncorpus=rs-crown\nprograms=20/20\nmode=phase2-t2-esc\na5_mode=precise_replay\na5_world=closed_world_frozen_graph\na5_abi_guard=permitted:measurement-frozen-graph-attested\ncopy_lend_mode=baseline\na2_mode=off\nderived_substrate_sha256={DERIVED_DIGEST}\nofficial_evaluation_sha256={OFFICIAL_DIGEST}\nmodel_movement_rows={movement_rows}\nownlost_rows={ownlost_rows}\nownlost_flips_observed={ownlost_flips}\nownlost_direct_retractions={ownlost_retractions}\nownlost_baseline_owning={ownlost_baseline_owning}\nownlost_owning_regressions={ownlost_regressions}\nendpoint_slots={}\nendpoint_baseline_owning={endpoint_baseline_owning}\nendpoint_owning_regressions={endpoint_regressions}\nt2_endpoints={endpoints}\nt2_retracted_global={retracted}\nt1_unknown_origin_core_incidence={t1_cores}\nesc_joined_keys={esc_joined}\nesc_selected_sites={esc_sites}\nesc_pruning_exemptions={esc_exemptions}\nesc_escaped_extensions={esc_extensions}\nesc_receipt_rows={esc_receipt_rows}\nesc_excluded_sites={esc_excluded}\nesc_excluded_field_issuer={esc_field_issuers}\na5_changed_pair_mark_rows={changed_pairs}\nobjective_bearing_checks={objective_checks}\nobjective_model_wall_s={optimize_wall:.3}\nlazy_plain_hard_checks={lazy_plain_hard_checks}\nlazy_tracked_rechecks={lazy_tracked_rechecks}\nlazy_plain_materializations={lazy_plain_materializations}\nworker_model_wall_s={model_wall:.3}\nrn1_matched19_baseline_wall_s=212.147\nreframed_no_owning_regression={}\n",
             if expected { "true" } else { "false" },
             orchestrate::git_sha(),
             endpoint_slots.len(),

@@ -206,6 +206,12 @@ impl<'a> NativeBorrowContext<'a> {
             escaped_copy_lends.len(),
             "② presentation registration count must equal matched allowlist loans"
         );
+        let escaped_exemptions = esc_minimal::demotion_exemptions_for(f, escaped_copy_lends);
+        assert_eq!(
+            escaped_exemptions.len(),
+            escaped_copy_lends.len(),
+            "② pruning-exemption registration count must equal the effective selection"
+        );
         let provenance_set = self.borrow.provenances.get(&f).unwrap();
         let graph = NativeConstraintGraph::new(
             &inference,
@@ -251,12 +257,17 @@ impl<'a> NativeBorrowContext<'a> {
             &ported_requires,
         );
         let ordinary_loan_liveness = ported_loan_liveness.clone();
-        loan_liveness::extend_escaped_loans_to_exit(
+        let escaped_extensions = loan_liveness::extend_escaped_loans_to_exit(
             body,
             &inference.borrow_set,
             &inference.location_map,
             &escaped_lends,
             &mut ported_loan_liveness,
+        );
+        assert_eq!(
+            escaped_extensions,
+            escaped_copy_lends.len(),
+            "② live-to-exit extension count must equal the effective selection"
         );
         loan_liveness::assert_non_escaped_liveness_equal(
             &ordinary_loan_liveness,
