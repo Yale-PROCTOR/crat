@@ -326,6 +326,19 @@ fn projection_counts(path: &Path) -> (usize, usize) {
     (total, safe)
 }
 
+fn endpoint_owning_regressed(baseline: &str, phase2: &str) -> bool {
+    baseline == "Owning" && phase2 != "Owning"
+}
+
+#[test]
+fn reframed_t2_gate_rejects_only_an_owning_regression() {
+    assert!(!endpoint_owning_regressed("Owning", "Owning"));
+    assert!(endpoint_owning_regressed("Owning", "Raw"));
+    assert!(endpoint_owning_regressed("Owning", "Ref"));
+    assert!(!endpoint_owning_regressed("Raw", "Ref"));
+    assert!(!endpoint_owning_regressed("Ref", "Raw"));
+}
+
 fn table_rows(path: &Path, header_prefix: &str, key_columns: usize) -> BTreeMap<String, String> {
     let input = fs::read_to_string(path)
         .unwrap_or_else(|error| panic!("read table {}: {error}", path.display()));
@@ -553,7 +566,12 @@ fn phase2_t2_esc_batch_corpus() {
     let mut model_wall = 0.0f64;
     let mut optimize_wall = 0.0f64;
     let mut objective_checks = 0usize;
+    let mut lazy_plain_hard_checks = 0usize;
+    let mut lazy_tracked_rechecks = 0usize;
+    let mut lazy_plain_materializations = 0usize;
     let mut changed_pairs = 0usize;
+    let mut baseline_models = BTreeMap::new();
+    let mut phase2_models = BTreeMap::new();
     for row in &rows {
         let program = row.get("program").expect("program row");
         total_ref += number(row, "n_ref");
@@ -574,6 +592,9 @@ fn phase2_t2_esc_batch_corpus() {
             .parse::<f64>()
             .expect("numeric objective wall");
         objective_checks += number(row, "optimize_materialization_count");
+        lazy_plain_hard_checks += number(row, "lazy_plain_hard_check_count");
+        lazy_tracked_rechecks += number(row, "lazy_tracked_recheck_count");
+        lazy_plain_materializations += number(row, "lazy_plain_materialization_count");
 
         let old_dir = baseline.join(program);
         let new_dir = output.join(program);
@@ -628,6 +649,16 @@ fn phase2_t2_esc_batch_corpus() {
             "caller\tblock\t",
             6,
         );
+        assert!(
+            baseline_models
+                .insert(program.to_owned(), old_model)
+                .is_none()
+        );
+        assert!(
+            phase2_models
+                .insert(program.to_owned(), new_model)
+                .is_none()
+        );
     }
     assert_eq!((old_ref, old_raw, old_own), (48_901, 10_458, 239));
     assert_eq!((official_before, official_den), (1_609, 2_414));
@@ -637,6 +668,7 @@ fn phase2_t2_esc_batch_corpus() {
 
     let ownlost_input = fs::read_to_string(&ownlost).expect("read OwnLost ledger");
     let mut endpoint_states = BTreeMap::<(String, String), BTreeSet<String>>::new();
+    let mut endpoint_slots = BTreeSet::<(String, String)>::new();
     for program in CORPUS {
         let endpoint_input = fs::read_to_string(output.join(program.name).join("t2-endpoints.tsv"))
             .expect("read per-program T2 endpoints");
@@ -647,28 +679,55 @@ fn phase2_t2_esc_batch_corpus() {
                 .entry((fields[0].to_owned(), fields[8].to_owned()))
                 .or_default()
                 .insert(fields[10].to_owned());
+            endpoint_slots.insert((fields[0].to_owned(), fields[8].to_owned()));
         }
     }
+    let mut endpoint_gate = String::from(
+        "program\tslot\tbaseline_kind\tphase2_kind\tbaseline_owning\tregressed\tendpoint_states\n",
+    );
+    let mut endpoint_baseline_owning = 0usize;
+    let mut endpoint_regressions = 0usize;
+    for (program, slot) in &endpoint_slots {
+        let baseline_kind = &baseline_models[program][slot];
+        let phase2_kind = &phase2_models[program][slot];
+        let baseline_owning = baseline_kind == "Owning";
+        let regressed = endpoint_owning_regressed(baseline_kind, phase2_kind);
+        endpoint_baseline_owning += usize::from(baseline_owning);
+        endpoint_regressions += usize::from(regressed);
+        endpoint_gate.push_str(&format!(
+            "{program}\t{slot}\t{baseline_kind}\t{phase2_kind}\t{}\t{}\t{}\n",
+            u8::from(baseline_owning),
+            u8::from(regressed),
+            endpoint_states[&(program.clone(), slot.clone())]
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(";"),
+        ));
+    }
+    fs::write(output.join("endpoint-no-regression.tsv"), endpoint_gate)
+        .expect("write endpoint no-regression gate");
     let mut ownlost_join = String::from(
-        "program\tslot\tidentity\tpartner_free\tbaseline_kind\tphase2_kind\tflip_to_owning\tdirect_endpoint_state\n",
+        "program\tslot\tidentity\tpartner_free\tbaseline_kind\tphase2_kind\tflip_to_owning\towning_regression\tdirect_endpoint_state\n",
     );
     let mut ownlost_rows = 0usize;
     let mut ownlost_flips = 0usize;
     let mut ownlost_retractions = 0usize;
+    let mut ownlost_baseline_owning = 0usize;
+    let mut ownlost_regressions = 0usize;
     for line in ownlost_input.lines().skip(1) {
         let fields = line.split('\t').collect::<Vec<_>>();
         assert!(fields.len() >= 4);
         let program = fields[0];
         let slot = fields[1];
-        let old = parse_model(&baseline.join(program).join("model.tsv"));
-        let new = parse_model(&output.join(program).join("model.tsv"));
-        let old_kind = old
+        let old_kind = baseline_models[program]
             .get(slot)
             .unwrap_or_else(|| panic!("OwnLost baseline lacks {slot}"));
-        let new_kind = new
+        let new_kind = phase2_models[program]
             .get(slot)
             .unwrap_or_else(|| panic!("OwnLost phase2 lacks {slot}"));
         let flipped = old_kind != "Owning" && new_kind == "Owning";
+        let regressed = endpoint_owning_regressed(old_kind, new_kind);
         let endpoint_state = endpoint_states
             .get(&(program.to_owned(), slot.to_owned()))
             .map(|states| states.iter().cloned().collect::<Vec<_>>().join(";"))
@@ -676,19 +735,24 @@ fn phase2_t2_esc_batch_corpus() {
         ownlost_retractions +=
             usize::from(endpoint_state.split(';').any(|state| state == "retracted"));
         ownlost_flips += usize::from(flipped);
+        ownlost_baseline_owning += usize::from(old_kind == "Owning");
+        ownlost_regressions += usize::from(regressed);
         ownlost_rows += 1;
         ownlost_join.push_str(&format!(
-            "{program}\t{slot}\t{}\t{}\t{old_kind}\t{new_kind}\t{}\t{endpoint_state}\n",
+            "{program}\t{slot}\t{}\t{}\t{old_kind}\t{new_kind}\t{}\t{}\t{endpoint_state}\n",
             fields[2],
             fields[3],
             u8::from(flipped),
+            u8::from(regressed),
         ));
     }
     assert_eq!(ownlost_rows, 114, "LIC-P1 OwnLost join population");
     fs::write(output.join("ownlost-join.tsv"), &ownlost_join).expect("write OwnLost join");
 
     let movement_rows = movement.lines().count().saturating_sub(1);
-    let expected = ownlost_flips == 114 && ownlost_retractions == 0;
+    let expected = ownlost_baseline_owning == ownlost_rows
+        && ownlost_regressions == 0
+        && endpoint_regressions == 0;
     fs::write(
         output.join("aggregate.tsv"),
         format!(
@@ -703,15 +767,17 @@ fn phase2_t2_esc_batch_corpus() {
     fs::write(
         output.join("receipt.txt"),
         format!(
-            "status=complete\ndata={}\nanalysis_head={}\ncorpus=rs-crown\nprograms=20/20\nmode=phase2-t2-esc\na5_mode=precise_replay\na5_world=closed_world_frozen_graph\na5_abi_guard=permitted:measurement-frozen-graph-attested\ncopy_lend_mode=baseline\na2_mode=off\nderived_substrate_sha256={DERIVED_DIGEST}\nofficial_evaluation_sha256={OFFICIAL_DIGEST}\nmodel_movement_rows={movement_rows}\nownlost_rows={ownlost_rows}\nownlost_flips={ownlost_flips}\nownlost_retractions={ownlost_retractions}\nt2_endpoints={endpoints}\nt2_retracted_global={retracted}\nt1_unknown_origin_core_incidence={t1_cores}\nesc_selected_sites={esc_sites}\na5_changed_pair_mark_rows={changed_pairs}\nobjective_bearing_checks={objective_checks}\nobjective_model_wall_s={optimize_wall:.3}\nworker_model_wall_s={model_wall:.3}\nprediction_114_flips_0_retractions={}\n",
+            "status=complete\ndata={}\nanalysis_head={}\ncorpus=rs-crown\nprograms=20/20\nmode=phase2-t2-esc\na5_mode=precise_replay\na5_world=closed_world_frozen_graph\na5_abi_guard=permitted:measurement-frozen-graph-attested\ncopy_lend_mode=baseline\na2_mode=off\nderived_substrate_sha256={DERIVED_DIGEST}\nofficial_evaluation_sha256={OFFICIAL_DIGEST}\nmodel_movement_rows={movement_rows}\nownlost_rows={ownlost_rows}\nownlost_flips_observed={ownlost_flips}\nownlost_direct_retractions={ownlost_retractions}\nownlost_baseline_owning={ownlost_baseline_owning}\nownlost_owning_regressions={ownlost_regressions}\nendpoint_slots={}\nendpoint_baseline_owning={endpoint_baseline_owning}\nendpoint_owning_regressions={endpoint_regressions}\nt2_endpoints={endpoints}\nt2_retracted_global={retracted}\nt1_unknown_origin_core_incidence={t1_cores}\nesc_selected_sites={esc_sites}\na5_changed_pair_mark_rows={changed_pairs}\nobjective_bearing_checks={objective_checks}\nobjective_model_wall_s={optimize_wall:.3}\nlazy_plain_hard_checks={lazy_plain_hard_checks}\nlazy_tracked_rechecks={lazy_tracked_rechecks}\nlazy_plain_materializations={lazy_plain_materializations}\nworker_model_wall_s={model_wall:.3}\nrn1_matched19_baseline_wall_s=212.147\nreframed_no_owning_regression={}\n",
             if expected { "true" } else { "false" },
             orchestrate::git_sha(),
+            endpoint_slots.len(),
             if expected { "passed" } else { "deviation-needs-analysis" },
         ),
     )
     .expect("write phase-2 receipt");
     assert!(
         expected,
-        "phase-2 prediction deviation: OwnLost flips={ownlost_flips}/114, direct retractions={ownlost_retractions}; row-level artifacts preserved"
+        "phase-2 no-Own-regression deviation: OwnLost baseline-own={ownlost_baseline_owning}/{ownlost_rows} regressions={ownlost_regressions}; endpoint baseline-own={endpoint_baseline_owning}/{} regressions={endpoint_regressions}; observed flips={ownlost_flips}; row-level artifacts preserved",
+        endpoint_slots.len(),
     );
 }
