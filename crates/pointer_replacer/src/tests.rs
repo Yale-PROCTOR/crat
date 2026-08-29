@@ -10127,7 +10127,7 @@ mod borrow_ownership_coherence {
                 construction::{
                     CopyLendMode, analyze_copy_lend_eligibility, construct_bo_into,
                     construct_bo_into_a16_refined, solve_bo_a5_config,
-                    verify_bo_construction_counting,
+                    solve_bo_a5_reference_reporting, verify_bo_construction_counting,
                 },
                 crate_slots::CrateSlots,
                 emit_crate_ownership_constraints, emit_crate_ownership_constraints_with_copy_lends,
@@ -12888,8 +12888,14 @@ unsafe fn caller() -> i32 {
             let origins = compute_origins(&program);
             let facts = MutFacts::from_program(&program);
             let verified = with_fixture_selection(|| {
-                solve_bo_a5_config(&program, &slots, &origins, &facts, A5Mode::Baseline, None)
-                    .expect("A5 reference solve must accept")
+                solve_bo_a5_reference_reporting(
+                    &program,
+                    &slots,
+                    &origins,
+                    &facts,
+                    Some(WholeProgramAttestation::FrozenBenchmarkGraph),
+                )
+                .expect("A5 reference solve must accept")
             });
             let save = function_by_name(&program, "save");
             let x = local_by_var_name(tcx, save, "x");

@@ -4349,8 +4349,8 @@ mod run {
             },
             construction::{
                 A2Mode, BoConstruction, CopyLendMode, construct_bo_into,
-                solve_bo_a5_config_reporting, verify_bo_construction_counting,
-                verify_bo_construction_with_flows,
+                solve_bo_a5_config_reporting, solve_bo_a5_reference_reporting,
+                verify_bo_construction_counting, verify_bo_construction_with_flows,
             },
             crate_slots::CrateSlots,
             l2,
@@ -6028,17 +6028,9 @@ mod run {
             Ok(value) => panic!("CRAT_PHASE2_BASELINE_ONLY must be absent or 1, got {value:?}"),
             Err(error) => panic!("CRAT_PHASE2_BASELINE_ONLY is not valid Unicode: {error}"),
         };
-        let mode = if baseline_only {
-            A5Mode::Baseline
-        } else {
-            A5Mode::PreciseReplay
-        };
-        let a16_refined = !baseline_only;
-        let soundness_mode = if baseline_only {
-            "a14"
-        } else {
-            "a14_a16_refined"
-        };
+        let mode = A5Mode::PreciseReplay;
+        let a16_refined = true;
+        let soundness_mode = "a14_a16_refined";
         assert_eq!(CopyLendMode::current(), CopyLendMode::Baseline);
         assert_eq!(A2Mode::current(), A2Mode::Off);
         assert_eq!(
@@ -6076,24 +6068,16 @@ mod run {
         let slots = CrateSlots::build(&program);
         let origins = compute_origins(&program);
         let mut_facts = MutFacts::from_program(&program);
-        let phase2_capture = std::env::var_os("CRAT_PHASE2_T2_ESC_CAPTURE").is_some();
-        let (verified, t2_capture) = if phase2_capture {
-            let ((verified, trace), export) =
-                crate::analyses::borrow_ownership::export::with_bo_export(|| {
-                    crate::analyses::borrow_ownership::solver::with_selector_trace(|| {
-                        solve_bo_a5_config_reporting(
-                            &program,
-                            &slots,
-                            &origins,
-                            &mut_facts,
-                            mode,
-                            Some(WholeProgramAttestation::FrozenBenchmarkGraph),
-                        )
-                    })
-                });
-            (verified, Some((trace, export)))
-        } else {
-            (
+        let solve = || {
+            if baseline_only {
+                solve_bo_a5_reference_reporting(
+                    &program,
+                    &slots,
+                    &origins,
+                    &mut_facts,
+                    Some(WholeProgramAttestation::FrozenBenchmarkGraph),
+                )
+            } else {
                 solve_bo_a5_config_reporting(
                     &program,
                     &slots,
@@ -6101,9 +6085,18 @@ mod run {
                     &mut_facts,
                     mode,
                     Some(WholeProgramAttestation::FrozenBenchmarkGraph),
-                ),
-                None,
-            )
+                )
+            }
+        };
+        let phase2_capture = std::env::var_os("CRAT_PHASE2_T2_ESC_CAPTURE").is_some();
+        let (verified, t2_capture) = if phase2_capture {
+            let ((verified, trace), export) =
+                crate::analyses::borrow_ownership::export::with_bo_export(|| {
+                    crate::analyses::borrow_ownership::solver::with_selector_trace(&solve)
+                });
+            (verified, Some((trace, export)))
+        } else {
+            (solve(), None)
         };
         let verified = match verified {
             Ok(verified) => verified,

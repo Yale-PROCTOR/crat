@@ -840,14 +840,29 @@ pub(crate) fn construct_bo_into_a16_refined(
     mut_facts: &MutFacts,
     solver: &KindSolver,
 ) -> anyhow::Result<(BoConstruction, usize)> {
-    let construction = construct_bo_into(
-        program,
-        slots,
-        origins,
-        mut_facts,
-        solver,
-        CopyLendMode::Baseline,
-    )?;
+    construct_bo_into_a16_refined_with_esc(program, slots, origins, mut_facts, solver, true)
+}
+
+fn construct_bo_into_a16_refined_with_esc(
+    program: &RustProgram<'_>,
+    slots: &CrateSlots,
+    origins: &OriginSummaries,
+    mut_facts: &MutFacts,
+    solver: &KindSolver,
+    enable_esc_minimal: bool,
+) -> anyhow::Result<(BoConstruction, usize)> {
+    let construction = if enable_esc_minimal {
+        construct_bo_into(
+            program,
+            slots,
+            origins,
+            mut_facts,
+            solver,
+            CopyLendMode::Baseline,
+        )?
+    } else {
+        construct_bo_a5_reference(program, slots, origins, mut_facts, solver)?
+    };
     let links = add_refined_return_kind_links(program, slots, origins, solver);
     Ok((construction, links))
 }
@@ -1158,8 +1173,32 @@ pub(crate) fn solve_bo_a5_config_reporting(
         mode,
         attestation,
         refined,
+        true,
     )?;
     Ok(stamp_a16_refined_receipt(verified, refined))
+}
+
+/// Measurement reference: accepted A5/A16 production semantics with Phase-2
+/// escaped-loan selection disabled in both the planning baseline and candidate
+/// construction. This is the byte-equivalence path to c080.
+pub(crate) fn solve_bo_a5_reference_reporting(
+    program: &RustProgram<'_>,
+    slots: &CrateSlots,
+    origins: &OriginSummaries,
+    mut_facts: &MutFacts,
+    attestation: Option<WholeProgramAttestation>,
+) -> Result<VerifiedBo, A5PreledgerDecline> {
+    let (verified, _links) = solve_bo_a5_config_inner(
+        program,
+        slots,
+        origins,
+        mut_facts,
+        A5Mode::PreciseReplay,
+        attestation,
+        true,
+        false,
+    )?;
+    Ok(stamp_a16_refined_receipt(verified, true))
 }
 
 fn stamp_a16_refined_receipt(mut verified: VerifiedBo, refined: bool) -> VerifiedBo {
@@ -1185,6 +1224,7 @@ fn solve_bo_a5_config_inner(
     mode: A5Mode,
     attestation: Option<WholeProgramAttestation>,
     refined: bool,
+    enable_esc_minimal: bool,
 ) -> Result<(VerifiedBo, usize), A5PreledgerDecline> {
     assert_eq!(
         CopyLendMode::current(),
@@ -1308,14 +1348,20 @@ fn solve_bo_a5_config_inner(
             // the A5 guard's fallback while applying the same one-way return
             // rule as the attested production path.
             let solver = KindSolver::new(slots);
-            let (construction, refined_links) =
-                construct_bo_into_a16_refined(program, slots, origins, mut_facts, &solver)
-                    .map_err(|error| {
-                        A5PreledgerDecline::from_error(
-                            A5PreledgerDeclineReason::RefinedFallbackConstruction,
-                            error,
-                        )
-                    })?;
+            let (construction, refined_links) = construct_bo_into_a16_refined_with_esc(
+                program,
+                slots,
+                origins,
+                mut_facts,
+                &solver,
+                enable_esc_minimal,
+            )
+            .map_err(|error| {
+                A5PreledgerDecline::from_error(
+                    A5PreledgerDeclineReason::RefinedFallbackConstruction,
+                    error,
+                )
+            })?;
             let (model, round_stats) = verify_bo_construction_counting(
                 program,
                 slots,
@@ -1436,21 +1482,31 @@ fn solve_bo_a5_config_inner(
 
     let solver = KindSolver::new(slots);
     let (construction, refined_links) = if refined {
-        construct_bo_into_a16_refined(program, slots, origins, mut_facts, &solver).map_err(
-            |error| {
-                A5PreledgerDecline::from_error(A5PreledgerDeclineReason::PreciseConstruction, error)
-            },
-        )?
+        construct_bo_into_a16_refined_with_esc(
+            program,
+            slots,
+            origins,
+            mut_facts,
+            &solver,
+            enable_esc_minimal,
+        )
+        .map_err(|error| {
+            A5PreledgerDecline::from_error(A5PreledgerDeclineReason::PreciseConstruction, error)
+        })?
     } else {
         (
-            construct_bo_into(
-                program,
-                slots,
-                origins,
-                mut_facts,
-                &solver,
-                CopyLendMode::Baseline,
-            )
+            if enable_esc_minimal {
+                construct_bo_into(
+                    program,
+                    slots,
+                    origins,
+                    mut_facts,
+                    &solver,
+                    CopyLendMode::Baseline,
+                )
+            } else {
+                construct_bo_a5_reference(program, slots, origins, mut_facts, &solver)
+            }
             .map_err(|error| {
                 A5PreledgerDecline::from_error(A5PreledgerDeclineReason::CoarseConstruction, error)
             })?,
