@@ -856,6 +856,10 @@ pub fn borrow_inference<'tcx>(
 pub struct ConflictEdge {
     pub issuer: Option<ProvenanceOwner>,
     pub requirers: Vec<ProvenanceOwner>,
+    /// BO-only repair-class marker. Ordinary borrow conflicts keep this false; an exact
+    /// ESC-GAP ② selected loan sets it so the unified repair loop can use that class's issuer
+    /// kill switch without changing A-prime selection for any ordinary row.
+    pub(crate) esc_issuer_first: bool,
 }
 
 /// §8 verifier (read-only): run `borrow_inference` with a given ref-candidacy +
@@ -945,7 +949,11 @@ fn extract_conflict_edges(
                 }
             }
         }
-        edges.push(ConflictEdge { issuer, requirers });
+        edges.push(ConflictEdge {
+            issuer,
+            requirers,
+            esc_issuer_first: false,
+        });
     }
     edges
 }

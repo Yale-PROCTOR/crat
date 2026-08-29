@@ -549,6 +549,162 @@ fn merge_abi_guard(current: &mut AbiGuardDisposition, next: AbiGuardDisposition)
     }
 }
 
+/// The O2 frozen-call-world product shared by production A5 and read-only
+/// measurement consumers. Construction is a pure extraction of A5's former
+/// inline call-target block; it does not seed unknown callers.
+#[derive(Clone, Debug)]
+pub(crate) struct ClosedWorldCallWorld {
+    pub(crate) resolved: FxHashMap<(LocalDefId, BasicBlock), Vec<LocalDefId>>,
+    pub(crate) unknown_reachable: FxHashSet<LocalDefId>,
+    pub(crate) calls: usize,
+    pub(crate) unresolved_calls: usize,
+    indirect_function_targets: FxHashSet<LocalDefId>,
+    indirect_sites: FxHashSet<(LocalDefId, BasicBlock)>,
+    aggregate_guard: AbiGuardDisposition,
+}
+
+impl ClosedWorldCallWorld {
+    pub(crate) fn artifact(&self, tcx: TyCtxt<'_>) -> String {
+        let mut rows = self
+            .resolved
+            .iter()
+            .flat_map(|(&(caller_did, block), targets)| {
+                let caller = tcx.item_name(caller_did.to_def_id()).to_string();
+                let kind = if self.indirect_sites.contains(&(caller_did, block)) {
+                    "indirect"
+                } else {
+                    "direct"
+                };
+                targets.iter().map(move |target| {
+                    format!(
+                        "{}\t{}\t{}\n",
+                        caller,
+                        tcx.item_name(target.to_def_id()),
+                        kind
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
+        rows.sort();
+        let mut output = rows.concat();
+        let mut unknown = self
+            .unknown_reachable
+            .iter()
+            .map(|function| {
+                format!(
+                    "unknown-reachable\t{}\n",
+                    tcx.item_name(function.to_def_id())
+                )
+            })
+            .collect::<Vec<_>>();
+        unknown.sort();
+        output.push_str(&unknown.concat());
+        output
+    }
+}
+
+fn resolve_closed_world_call_world_from_analysis(
+    program: &RustProgram<'_>,
+    pre: &andersen::PreAnalysisData<'_>,
+    solutions: &andersen::Solutions,
+    address_taken_functions: &FxHashSet<LocalDefId>,
+    attestation: Option<WholeProgramAttestation>,
+) -> ClosedWorldCallWorld {
+    let tcx = program.tcx;
+    let local_functions = program.functions.iter().copied().collect::<FxHashSet<_>>();
+    let mut indirect_function_targets = FxHashSet::default();
+    let mut indirect_sites = FxHashSet::default();
+    let mut resolved = FxHashMap::<(LocalDefId, BasicBlock), Vec<LocalDefId>>::default();
+    let mut calls = 0usize;
+    let mut unresolved_calls = 0usize;
+    let mut aggregate_guard = AbiGuardDisposition::Permitted {
+        attested: attestation == Some(WholeProgramAttestation::FrozenBenchmarkGraph),
+    };
+    for &caller in &program.functions {
+        let body = tcx.mir_drops_elaborated_and_const_checked(caller).borrow();
+        for (block, data) in body.basic_blocks.iter_enumerated() {
+            let function = match &data.terminator().kind {
+                TerminatorKind::Call { func, .. } | TerminatorKind::TailCall { func, .. } => func,
+                _ => continue,
+            };
+            calls += 1;
+            let indirect = function.constant().is_none();
+            let mut targets = if let Some(function) = function.constant() {
+                let TyKind::FnDef(target, _) = *function.ty().kind() else {
+                    continue;
+                };
+                let Some(target) = target.as_local() else {
+                    continue;
+                };
+                vec![target]
+            } else {
+                indirect_targets(pre, solutions, caller, block).unwrap_or_default()
+            };
+            targets.retain(|target| local_functions.contains(target));
+            targets.sort_unstable_by_key(|did| did.local_def_index.as_u32());
+            targets.dedup();
+            if targets.is_empty() {
+                unresolved_calls += 1;
+                merge_abi_guard(
+                    &mut aggregate_guard,
+                    a5_abi_guard(
+                        &AbiBoundaryFacts {
+                            unresolved_target: true,
+                            ..AbiBoundaryFacts::default()
+                        },
+                        attestation,
+                    ),
+                );
+                continue;
+            }
+            if indirect {
+                indirect_sites.insert((caller, block));
+                indirect_function_targets.extend(targets.iter().copied());
+            }
+            resolved.insert((caller, block), targets);
+        }
+    }
+    let unknown_reachable =
+        closed_world_unknown_reachable(program, &resolved, address_taken_functions);
+    ClosedWorldCallWorld {
+        resolved,
+        unknown_reachable,
+        calls,
+        unresolved_calls,
+        indirect_function_targets,
+        indirect_sites,
+        aggregate_guard,
+    }
+}
+
+pub(crate) fn resolve_closed_world_call_world(
+    program: &RustProgram<'_>,
+    attestation: Option<WholeProgramAttestation>,
+) -> ClosedWorldCallWorld {
+    let tcx = program.tcx;
+    let arena = typed_arena::Arena::new();
+    let type_shapes = utils::ty_shape::get_ty_shapes(&arena, tcx, false);
+    let config = andersen::Config {
+        use_optimized_mir: false,
+        c_exposed_fns: program
+            .functions
+            .iter()
+            .filter(|did| tcx.visibility(did.to_def_id()).is_public())
+            .map(|did| tcx.item_name(did.to_def_id()).to_string())
+            .collect(),
+    };
+    let pre = andersen::pre_analyze(&config, &type_shapes, tcx);
+    let solutions = andersen::analyze(&config, &pre, &type_shapes, tcx);
+    let address_taken_functions = crate::rewriter::collector::collect_fn_ptrs(program);
+    resolve_closed_world_call_world_from_analysis(
+        program,
+        &pre,
+        &solutions,
+        &address_taken_functions,
+        attestation,
+    )
+}
+
 fn closed_world_unknown_reachable(
     program: &RustProgram<'_>,
     resolved: &FxHashMap<(LocalDefId, BasicBlock), Vec<LocalDefId>>,
@@ -680,7 +836,6 @@ pub(crate) fn produce_a5_plan(
         );
     }
     let tcx = program.tcx;
-    let local_functions = program.functions.iter().copied().collect::<FxHashSet<_>>();
     let arena = typed_arena::Arena::new();
     let type_shapes = utils::ty_shape::get_ty_shapes(&arena, tcx, false);
     let config = andersen::Config {
@@ -701,59 +856,22 @@ pub(crate) fn produce_a5_plan(
         let end = pre.index_info.get_end(start);
         unknown_locations.extend(start.index()..=end.index());
     }
-
-    let mut indirect_function_targets = FxHashSet::default();
-    let mut resolved = FxHashMap::<(LocalDefId, BasicBlock), Vec<LocalDefId>>::default();
-    let mut stats = A5ProducerStats::default();
-    let mut aggregate_guard = AbiGuardDisposition::Permitted {
-        attested: attestation == Some(WholeProgramAttestation::FrozenBenchmarkGraph),
+    let call_world = resolve_closed_world_call_world_from_analysis(
+        program,
+        &pre,
+        &solutions,
+        &address_taken_functions,
+        attestation,
+    );
+    let resolved = &call_world.resolved;
+    let indirect_function_targets = &call_world.indirect_function_targets;
+    let unknown_reachable = &call_world.unknown_reachable;
+    let mut stats = A5ProducerStats {
+        calls: call_world.calls,
+        unresolved_calls: call_world.unresolved_calls,
+        ..A5ProducerStats::default()
     };
-    for &caller in &program.functions {
-        let body = tcx.mir_drops_elaborated_and_const_checked(caller).borrow();
-        for (block, data) in body.basic_blocks.iter_enumerated() {
-            let function = match &data.terminator().kind {
-                TerminatorKind::Call { func, .. } | TerminatorKind::TailCall { func, .. } => func,
-                _ => continue,
-            };
-            stats.calls += 1;
-            let mut targets = if let Some(function) = function.constant() {
-                let TyKind::FnDef(target, _) = *function.ty().kind() else {
-                    continue;
-                };
-                let Some(target) = target.as_local() else {
-                    // A statically known foreign/library call is not an
-                    // unresolved local call-graph edge.
-                    continue;
-                };
-                vec![target]
-            } else {
-                indirect_targets(&pre, &solutions, caller, block).unwrap_or_default()
-            };
-            targets.retain(|target| local_functions.contains(target));
-            targets.sort_unstable_by_key(|did| did.local_def_index.as_u32());
-            targets.dedup();
-            if targets.is_empty() {
-                stats.unresolved_calls += 1;
-                merge_abi_guard(
-                    &mut aggregate_guard,
-                    a5_abi_guard(
-                        &AbiBoundaryFacts {
-                            unresolved_target: true,
-                            ..AbiBoundaryFacts::default()
-                        },
-                        attestation,
-                    ),
-                );
-                continue;
-            }
-            if function.constant().is_none() {
-                indirect_function_targets.extend(targets.iter().copied());
-            }
-            resolved.insert((caller, block), targets);
-        }
-    }
-    let unknown_reachable =
-        closed_world_unknown_reachable(program, &resolved, &address_taken_functions);
+    let mut aggregate_guard = call_world.aggregate_guard.clone();
 
     let mut transfers = Vec::new();
     let mut records = BTreeMap::<FunctionPairKey, Vec<WitnessRecord>>::new();
@@ -1262,6 +1380,42 @@ mod tests {
                     .is_some_and(|pairs| pairs.contains(Local::from_usize(1), Local::from_usize(2))),
                 "the direct entry(p,p) witness must propagate through forward's parameter pair"
             );
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn shared_call_world_preserves_direct_indirect_and_o2_roots() {
+        let code = r#"
+            unsafe fn sink(x: *mut i32, y: *mut i32) { *x += 1; *y += 1; }
+            unsafe fn direct(x: *mut i32, y: *mut i32) { sink(x, y); }
+            pub unsafe fn entry(p: *mut i32) {
+                let target: unsafe fn(*mut i32, *mut i32) = sink;
+                direct(p, p);
+                target(p, p);
+            }
+        "#;
+        ::utils::compilation::run_compiler_on_str(code, |tcx| {
+            let program = program(tcx);
+            let world = resolve_closed_world_call_world(
+                &program,
+                Some(WholeProgramAttestation::FrozenBenchmarkGraph),
+            );
+            let artifact = world.artifact(tcx);
+            assert!(artifact.contains("entry\tdirect\tdirect\n"), "{artifact}");
+            assert!(artifact.contains("entry\tsink\tindirect\n"), "{artifact}");
+            assert!(artifact.contains("direct\tsink\tdirect\n"), "{artifact}");
+            assert!(
+                artifact.contains("unknown-reachable\tentry\n"),
+                "{artifact}"
+            );
+            assert!(
+                artifact.contains("unknown-reachable\tdirect\n"),
+                "{artifact}"
+            );
+            assert!(artifact.contains("unknown-reachable\tsink\n"), "{artifact}");
+            assert_eq!(world.calls, 3);
+            assert_eq!(world.unresolved_calls, 0);
         })
         .unwrap();
     }

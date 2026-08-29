@@ -187,6 +187,9 @@ pub(crate) fn with_mode_a_commit_trace<T>(f: impl FnOnce() -> T) -> (T, Vec<Mode
 pub(crate) struct SlotConflict {
     pub issuer: Option<SlotRef>,
     pub requirers: Vec<SlotRef>,
+    /// Exact ESC-GAP ② class marker, carried from the selected loan row. False preserves the
+    /// ordinary A-prime repair menu byte-for-byte.
+    pub(crate) esc_issuer_first: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -269,6 +272,7 @@ pub(crate) fn revalidate_replaying(
         is_mutable,
         None,
         None,
+        None,
     )
 }
 
@@ -289,6 +293,7 @@ pub(crate) fn revalidate_replaying_with_parameter_overlap(
         is_raw,
         is_mutable,
         None,
+        None,
         Some(parameter_overlaps),
     )
 }
@@ -301,6 +306,7 @@ fn revalidate_replaying_with_flows(
     is_raw: impl Fn(SlotRef) -> bool,
     is_mutable: impl MutProvider + Copy,
     selected_copy_lends: Option<&SelectedCopyLendLoans>,
+    escaped_copy_lends: Option<&SelectedCopyLendLoans>,
     parameter_overlaps: Option<&FxHashMap<LocalDefId, super::borrow_engine::ParameterOverlap>>,
 ) -> FxHashMap<LocalDefId, Vec<SlotConflict>> {
     let is_ref = &is_ref;
@@ -344,6 +350,7 @@ fn revalidate_replaying_with_flows(
         super::borrow_engine::ForkEngineMode::Production => {
             assert!(
                 selected_copy_lends.is_none_or(|selected| selected.is_empty())
+                    && escaped_copy_lends.is_none_or(|selected| selected.is_empty())
                     && parameter_overlaps.is_none(),
                 "CopyLend/A5 replay requires the BO fork engine"
             );
@@ -352,7 +359,7 @@ fn revalidate_replaying_with_flows(
         super::borrow_engine::ForkEngineMode::Fork => {
             if let Some(parameter_overlaps) = parameter_overlaps {
                 let empty = SelectedCopyLendLoans::default();
-                super::borrow_engine::borrow_conflicts_replaying_with_flows_and_parameter_overlap(
+                super::borrow_engine::borrow_conflicts_replaying_with_flows_and_parameter_overlap_and_escaped(
                     program,
                     origin_flows,
                     cand,
@@ -360,12 +367,13 @@ fn revalidate_replaying_with_flows(
                     mutab,
                     &raw_fields,
                     selected_copy_lends.unwrap_or(&empty),
+                    escaped_copy_lends.unwrap_or(&empty),
                     parameter_overlaps,
                 )
             } else {
                 match selected_copy_lends {
                     Some(selected) => {
-                        super::borrow_engine::borrow_conflicts_replaying_with_flows_and_copy_lends(
+                        super::borrow_engine::borrow_conflicts_replaying_with_flows_and_copy_lends_and_escaped(
                             program,
                             origin_flows,
                             cand,
@@ -373,6 +381,7 @@ fn revalidate_replaying_with_flows(
                             mutab,
                             &raw_fields,
                             selected,
+                            escaped_copy_lends.unwrap_or(&SelectedCopyLendLoans::default()),
                         )
                     }
                     None => super::borrow_engine::borrow_conflicts_replaying_with_flows(
@@ -402,6 +411,7 @@ fn revalidate_replaying_witnessed(
     is_raw: impl Fn(SlotRef) -> bool,
     is_mutable: impl MutProvider + Copy,
     selected_copy_lends: Option<&SelectedCopyLendLoans>,
+    escaped_copy_lends: Option<&SelectedCopyLendLoans>,
 ) -> FxHashMap<LocalDefId, Vec<WitnessedSlotConflict>> {
     let is_ref = &is_ref;
     let is_raw = &is_raw;
@@ -440,7 +450,7 @@ fn revalidate_replaying_witnessed(
     );
     let edges = match selected_copy_lends {
         Some(selected) => {
-            super::borrow_engine::borrow_conflicts_replaying_witnessed_with_copy_lends(
+            super::borrow_engine::borrow_conflicts_replaying_witnessed_with_copy_lends_and_escaped(
                 program,
                 origin_flows,
                 cand,
@@ -448,6 +458,7 @@ fn revalidate_replaying_witnessed(
                 mutab,
                 &raw_fields,
                 selected,
+                escaped_copy_lends.unwrap_or(&SelectedCopyLendLoans::default()),
             )
         }
         None => super::borrow_engine::borrow_conflicts_replaying_witnessed(
@@ -489,6 +500,7 @@ fn revalidate_replaying_witnessed(
                                 .into_iter()
                                 .filter_map(|owner| owner_to_slot(slots, fn_did, owner))
                                 .collect(),
+                            esc_issuer_first: edge.esc_issuer_first,
                         },
                         loan,
                         stable_loan_key: issuer.map(|issuer| {
@@ -526,6 +538,7 @@ fn map_edges_to_slots(
                         .into_iter()
                         .filter_map(|o| owner_to_slot(slots, fn_did, o))
                         .collect(),
+                    esc_issuer_first: e.esc_issuer_first,
                 })
                 .collect();
             (fn_did, translated)
@@ -659,6 +672,9 @@ pub(crate) struct RoundStats {
     /// accept or an UNSAT-family decline (bo_c1 classifies those via its selector-core
     /// `decline_reason`).
     pub field_conflict_decline: Option<SlotRef>,
+    /// Diagnostic twin of `field_conflict_decline`: the accepted round model's
+    /// exact non-Ref kind for that field.
+    pub field_conflict_kind: Option<SlotKind>,
     /// §NB5-L guard 3 — the `RepairMode` that produced these stats (the mode-stamp). Self-describing
     /// results: the sweep row and any `RoundStats` dump say which repair strategy ran, so the S7
     /// differential is never mode-ambiguous. Defaults to `ModeA` (= `RepairMode::DEFAULT`).
@@ -721,6 +737,26 @@ fn solve_l2_round_model(
     }
 }
 
+fn selected_copy_lends_for_round(
+    program: &RustProgram,
+    slots: &CrateSlots,
+    model: &FxHashMap<SlotRef, SlotKind>,
+    pair_lends: Option<&FxHashSet<CopyLendPair>>,
+    escaped: Option<&SelectedCopyLendLoans>,
+) -> SelectedCopyLendLoans {
+    let mut selected = escaped.cloned().unwrap_or_default();
+    if let Some(pairs) = pair_lends {
+        for (fn_did, loans) in selected_copy_lend_sites(program, slots, pairs, model) {
+            selected.entry(fn_did).or_default().extend(loans);
+        }
+    }
+    selected
+}
+
+fn selected_copy_lend_count(selected: &SelectedCopyLendLoans) -> usize {
+    selected.values().map(FxHashSet::len).sum()
+}
+
 /// The §8 BB2-ii CEGAR validate/re-solve loop (Mode A) with native counters. See
 /// `verify_to_fixpoint`'s contract above for scope/soundness. Uses `model_kinds_relaxing_reporting`
 /// (identical model to the plain twin the wrapper's callers used, plus the dropped-selector set for
@@ -760,6 +796,7 @@ pub(crate) fn verify_to_fixpoint_counting_with_flows(
         is_mutable,
         None,
         None,
+        None,
         LoopBackend::HardCheckRoundOptimize,
     )
 }
@@ -782,6 +819,7 @@ pub(crate) fn verify_to_fixpoint_counting_with_flows_and_copy_lends(
         is_mutable,
         Some(copy_lends),
         None,
+        None,
         LoopBackend::HardCheckRoundOptimize,
     )
 }
@@ -803,6 +841,7 @@ pub(crate) fn verify_to_fixpoint_counting_with_flows_and_parameter_overlaps(
         selectors,
         is_mutable,
         None,
+        None,
         Some(parameter_overlaps),
         LoopBackend::HardCheckRoundOptimize,
     )
@@ -816,6 +855,7 @@ pub(super) fn verify_to_fixpoint_counting_with_flows_impl(
     selectors: &Selectors,
     is_mutable: impl MutProvider + Copy,
     copy_lends: Option<&FxHashSet<CopyLendPair>>,
+    escaped_copy_lends: Option<&SelectedCopyLendLoans>,
     parameter_overlaps: Option<&FxHashMap<LocalDefId, super::borrow_engine::ParameterOverlap>>,
     backend: LoopBackend,
 ) -> (Option<FxHashMap<SlotRef, SlotKind>>, RoundStats) {
@@ -823,8 +863,8 @@ pub(super) fn verify_to_fixpoint_counting_with_flows_impl(
     // track-gated; every solve in this loop would be vacuously SAT and the
     // accepted model meaningless. Tracked instances belong to the explain path.
     assert!(
-        solver.tracker().is_none(),
-        "tracked KindSolver must not enter verify_to_fixpoint (constraints are track-gated)"
+        !solver.is_diagnostic_tracked(),
+        "diagnostic-tracked KindSolver must not enter verify_to_fixpoint"
     );
     let l2_enabled = l2::enabled_from_env();
     let repair = RepairMode::current();
@@ -846,6 +886,7 @@ pub(super) fn verify_to_fixpoint_counting_with_flows_impl(
             selectors,
             is_mutable,
             copy_lends,
+            escaped_copy_lends,
         );
     }
     let cap = round_cap(slots);
@@ -870,12 +911,18 @@ pub(super) fn verify_to_fixpoint_counting_with_flows_impl(
         // predicate. Reset so the export holds the FINAL round's BorrowSet,
         // not the union over rejected intermediate models.
         super::export::begin_round();
+        let active_escaped_copy_lends = escaped_copy_lends
+            .map(|escaped| super::esc_minimal::active_loans_for_model(escaped, &model));
+        let selected_copy_lends = selected_copy_lends_for_round(
+            program,
+            slots,
+            &model,
+            copy_lends,
+            active_escaped_copy_lends.as_ref(),
+        );
+        stats.copy_lend_replay_selections = selected_copy_lend_count(&selected_copy_lends);
         let selected_copy_lends =
-            copy_lends.map(|pairs| selected_copy_lend_sites(program, slots, pairs, &model));
-        stats.copy_lend_replay_selections = selected_copy_lends
-            .as_ref()
-            .map(|selected| selected.values().map(FxHashSet::len).sum())
-            .unwrap_or(0);
+            (stats.copy_lend_replay_selections != 0).then_some(selected_copy_lends);
         let conflicts = revalidate_replaying_with_flows(
             program,
             slots,
@@ -918,6 +965,7 @@ pub(super) fn verify_to_fixpoint_counting_with_flows_impl(
             },
             is_mutable,
             selected_copy_lends.as_ref(),
+            active_escaped_copy_lends.as_ref(),
             parameter_overlaps,
         );
         // §NB5-F — partition the residual-conflict guard by owner class. A non-`Ref` FIELD in a
@@ -931,6 +979,7 @@ pub(super) fn verify_to_fixpoint_counting_with_flows_impl(
         // case.) The field early-return runs first, so the assert now effectively guards Locals only.
         if let Some(field) = residual_nonref_field(&conflicts, &model) {
             stats.field_conflict_decline = Some(field);
+            stats.field_conflict_kind = model.get(&field).copied();
             return (None, stats);
         }
         assert!(
@@ -1176,6 +1225,7 @@ pub(crate) fn verify_l2_to_fixpoint_counting(
     selectors: &Selectors,
     is_mutable: impl MutProvider + Copy,
     copy_lends: Option<&FxHashSet<CopyLendPair>>,
+    escaped_copy_lends: Option<&SelectedCopyLendLoans>,
 ) -> (Option<FxHashMap<SlotRef, SlotKind>>, RoundStats) {
     verify_l2_to_fixpoint_counting_impl(
         program,
@@ -1185,6 +1235,7 @@ pub(crate) fn verify_l2_to_fixpoint_counting(
         selectors,
         is_mutable,
         copy_lends,
+        escaped_copy_lends,
         LoopBackend::HardCheckRoundOptimize,
     )
 }
@@ -1197,14 +1248,15 @@ pub(super) fn verify_l2_to_fixpoint_counting_impl(
     selectors: &Selectors,
     is_mutable: impl MutProvider + Copy,
     copy_lends: Option<&FxHashSet<CopyLendPair>>,
+    escaped_copy_lends: Option<&SelectedCopyLendLoans>,
     backend: LoopBackend,
 ) -> (Option<FxHashMap<SlotRef, SlotKind>>, RoundStats) {
     // D17: re-assert the load-bearing precondition at the door, not only at the
     // env entry. `debug_assert!` rather than `assert!` so the release-path cost
     // and behaviour of the existing single choke point are unchanged.
     debug_assert!(
-        solver.tracker().is_none(),
-        "tracked KindSolver must not enter the l2 door (constraints are track-gated)"
+        !solver.is_diagnostic_tracked(),
+        "diagnostic-tracked KindSolver must not enter the l2 door"
     );
     let diagnostics_enabled = l2::diagnostics_enabled_from_env();
     let mut transition_diagnostics =
@@ -1258,12 +1310,18 @@ pub(super) fn verify_l2_to_fixpoint_counting_impl(
         }
         // D1: same per-round reset on the L2 path.
         super::export::begin_round();
+        let active_escaped_copy_lends = escaped_copy_lends
+            .map(|escaped| super::esc_minimal::active_loans_for_model(escaped, &model));
+        let selected_copy_lends = selected_copy_lends_for_round(
+            program,
+            slots,
+            &model,
+            copy_lends,
+            active_escaped_copy_lends.as_ref(),
+        );
+        stats.copy_lend_replay_selections = selected_copy_lend_count(&selected_copy_lends);
         let selected_copy_lends =
-            copy_lends.map(|pairs| selected_copy_lend_sites(program, slots, pairs, &model));
-        stats.copy_lend_replay_selections = selected_copy_lends
-            .as_ref()
-            .map(|selected| selected.values().map(FxHashSet::len).sum())
-            .unwrap_or(0);
+            (stats.copy_lend_replay_selections != 0).then_some(selected_copy_lends);
         let conflicts = revalidate_replaying_witnessed(
             program,
             slots,
@@ -1275,6 +1333,7 @@ pub(super) fn verify_l2_to_fixpoint_counting_impl(
             },
             is_mutable,
             selected_copy_lends.as_ref(),
+            active_escaped_copy_lends.as_ref(),
         );
         let mut observations = Vec::new();
         for (did, conflicts) in &conflicts {
@@ -1291,6 +1350,7 @@ pub(super) fn verify_l2_to_fixpoint_counting_impl(
                         })
                     {
                         stats.field_conflict_decline = Some(field);
+                        stats.field_conflict_kind = model.get(&field).copied();
                         emit_l2_final_diagnostics(diagnostic_slots.as_mut(), &model);
                         return (None, stats);
                     }
@@ -1546,6 +1606,7 @@ fn model_accepts_with_flows_impl(
         is_mutable,
         selected_copy_lends,
         None,
+        None,
     );
     // The loop's accept is `committed == 0` reached WITHOUT tripping either of its two guards: the
     // `residual_nonref_field` decline (non-`Ref` FIELD residual) and the `guard_slots_are_ref`
@@ -1606,6 +1667,16 @@ fn representative(
 /// `residual_nonref_field` decline + `guard_slots_are_ref` assert rule out on the live path.
 fn a_prime_menu(conflict: &SlotConflict, model: &FxHashMap<SlotRef, SlotKind>) -> Vec<SlotRef> {
     let is_ref = |s: &SlotRef| model.get(s) == Some(&SlotKind::Ref);
+    if conflict.esc_issuer_first {
+        let issuer = conflict
+            .issuer
+            .expect("②-selected conflict presentation must carry a resolved-source issuer");
+        assert!(
+            is_ref(&issuer),
+            "②-selected conflict persisted after its resolved source was demoted"
+        );
+        return vec![issuer];
+    }
     let beyond: Vec<SlotRef> = conflict
         .requirers
         .iter()
@@ -1783,6 +1854,7 @@ mod nb5l_a_prime_menu_tests {
         let conflict = SlotConflict {
             issuer: Some(i),
             requirers: vec![r1, r2],
+            esc_issuer_first: false,
         };
         let m = model(&[(i, SlotKind::Ref), (r1, SlotKind::Ref), (r2, SlotKind::Ref)]);
         let menu = a_prime_menu(&conflict, &m);
@@ -1807,6 +1879,7 @@ mod nb5l_a_prime_menu_tests {
         let conflict = SlotConflict {
             issuer: Some(i),
             requirers: vec![i],
+            esc_issuer_first: false,
         };
         let m = model(&[(i, SlotKind::Ref)]);
         let menu = a_prime_menu(&conflict, &m);
@@ -1826,8 +1899,25 @@ mod nb5l_a_prime_menu_tests {
         let conflict = SlotConflict {
             issuer: Some(i),
             requirers: vec![r],
+            esc_issuer_first: false,
         };
         let m = model(&[(i, SlotKind::Ref), (r, SlotKind::Raw)]);
         assert_eq!(a_prime_menu(&conflict, &m), vec![i]);
+    }
+
+    /// Addenda 61/65: the exact ② class has a different kill switch. Its
+    /// presented source issuer is the sole guard and repair party; the escape
+    /// destination is receipt-only and may be Ref or Raw.
+    #[test]
+    fn esc_selected_menu_is_issuer_only() {
+        let (source, destination) = (field(0), field(1));
+        let conflict = SlotConflict {
+            issuer: Some(source),
+            requirers: vec![],
+            esc_issuer_first: true,
+        };
+        let m = model(&[(source, SlotKind::Ref), (destination, SlotKind::Raw)]);
+        assert_eq!(a_prime_menu(&conflict, &m), vec![source]);
+        assert_eq!(representative(&conflict, &m), Some(source));
     }
 }

@@ -16,9 +16,7 @@ use rustc_span::def_id::LocalDefId;
 use sha2::{Digest, Sha256};
 
 #[cfg(test)]
-use super::borrow_verify::{
-    LoopBackend, verify_l2_to_fixpoint_counting_impl, verify_to_fixpoint_counting_with_flows_impl,
-};
+use super::borrow_verify::verify_l2_to_fixpoint_counting_impl;
 #[cfg(test)]
 use super::coherence::add_coherence_tagging_uses;
 use super::{
@@ -29,9 +27,8 @@ use super::{
     },
     a5_producer::{A5Plan, PlannedC9Mark, produce_a5_plan},
     borrow_verify::{
-        verify_to_fixpoint_counting_with_flows,
-        verify_to_fixpoint_counting_with_flows_and_copy_lends,
-        verify_to_fixpoint_counting_with_flows_and_parameter_overlaps,
+        LoopBackend, verify_to_fixpoint_counting_with_flows,
+        verify_to_fixpoint_counting_with_flows_impl,
     },
     boundary_table::{self, Matcher, Role},
     coherence::{
@@ -212,6 +209,7 @@ pub(crate) struct BoConstruction {
     pub(crate) a2_opaque_result_guards: usize,
     pub(crate) selectors: Selectors,
     pub(crate) eligibility: CopyLendEligibility,
+    pub(crate) esc_minimal: super::esc_minimal::EscMinimalSelection,
     pub(crate) stats: BoOwnEmissionStats,
     pub(crate) eligibility_elapsed: Duration,
     pub(crate) emit_elapsed: Duration,
@@ -231,6 +229,7 @@ pub(crate) struct VerifiedBo {
     pub(crate) field_ref_artifact: String,
     pub(crate) receipt: String,
     pub(crate) round_stats: super::borrow_verify::RoundStats,
+    pub(crate) esc_minimal: super::esc_minimal::EscMinimalSelection,
     pub(crate) selector_sources: usize,
     pub(crate) selector_sinks: usize,
     pub(crate) emission_stats: BoOwnEmissionStats,
@@ -239,11 +238,95 @@ pub(crate) struct VerifiedBo {
     pub(crate) check_sat_count: usize,
     pub(crate) hard_check_count: usize,
     pub(crate) optimize_materialization_count: usize,
+    pub(crate) lazy_plain_hard_check_count: usize,
+    pub(crate) lazy_tracked_recheck_count: usize,
+    pub(crate) lazy_plain_materialization_count: usize,
     pub(crate) hard_check_elapsed: Duration,
     pub(crate) optimize_materialization_elapsed: Duration,
     pub(crate) a16_refined_links: usize,
     pub(crate) planned_c9_marks: BTreeSet<C9MarkKey>,
     pub(crate) producer_stats: super::a5_producer::A5ProducerStats,
+}
+
+/// Typed diagnostic for every `None` boundary before the production A5 worker
+/// can write its model and T2/ESC ledgers. Production callers retain the
+/// historical `Option` API; measurement callers use the reporting twin below.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum A5PreledgerDeclineReason {
+    BaselineConstruction,
+    BaselineVerification,
+    A5PlanProduction,
+    RefinedFallbackConstruction,
+    RefinedFallbackVerification,
+    PreciseConstruction,
+    PreciseVerification,
+    CoarseConstruction,
+    CoarseVerification,
+}
+
+impl A5PreledgerDeclineReason {
+    pub(crate) const ALL: [Self; 9] = [
+        Self::BaselineConstruction,
+        Self::BaselineVerification,
+        Self::A5PlanProduction,
+        Self::RefinedFallbackConstruction,
+        Self::RefinedFallbackVerification,
+        Self::PreciseConstruction,
+        Self::PreciseVerification,
+        Self::CoarseConstruction,
+        Self::CoarseVerification,
+    ];
+
+    pub(crate) const fn label(self) -> &'static str {
+        match self {
+            Self::BaselineConstruction => "baseline-construction",
+            Self::BaselineVerification => "baseline-verification",
+            Self::A5PlanProduction => "a5-plan-production",
+            Self::RefinedFallbackConstruction => "refined-fallback-construction",
+            Self::RefinedFallbackVerification => "refined-fallback-verification",
+            Self::PreciseConstruction => "precise-construction",
+            Self::PreciseVerification => "precise-verification",
+            Self::CoarseConstruction => "coarse-construction",
+            Self::CoarseVerification => "coarse-verification",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct A5PreledgerDecline {
+    reason: A5PreledgerDeclineReason,
+    detail: Option<String>,
+}
+
+impl A5PreledgerDecline {
+    fn at(reason: A5PreledgerDeclineReason) -> Self {
+        Self {
+            reason,
+            detail: None,
+        }
+    }
+
+    fn from_error(reason: A5PreledgerDeclineReason, error: impl std::fmt::Display) -> Self {
+        Self {
+            reason,
+            detail: Some(error.to_string()),
+        }
+    }
+
+    fn with_detail(reason: A5PreledgerDeclineReason, detail: String) -> Self {
+        Self {
+            reason,
+            detail: Some(detail),
+        }
+    }
+
+    pub(crate) fn reason(&self) -> A5PreledgerDeclineReason {
+        self.reason
+    }
+
+    pub(crate) fn detail(&self) -> Option<&str> {
+        self.detail.as_deref()
+    }
 }
 
 const A5_PAIR_LEDGER_SHA256: &str =
@@ -542,7 +625,42 @@ pub(crate) fn construct_bo_into(
     solver: &KindSolver,
     mode: CopyLendMode,
 ) -> anyhow::Result<BoConstruction> {
+    construct_bo_into_with_esc(program, slots, origins, mut_facts, solver, mode, true)
+}
+
+fn construct_bo_a5_reference(
+    program: &RustProgram<'_>,
+    slots: &CrateSlots,
+    origins: &OriginSummaries,
+    mut_facts: &MutFacts,
+    solver: &KindSolver,
+) -> anyhow::Result<BoConstruction> {
+    construct_bo_into_with_esc(
+        program,
+        slots,
+        origins,
+        mut_facts,
+        solver,
+        CopyLendMode::Baseline,
+        false,
+    )
+}
+
+fn construct_bo_into_with_esc(
+    program: &RustProgram<'_>,
+    slots: &CrateSlots,
+    origins: &OriginSummaries,
+    mut_facts: &MutFacts,
+    solver: &KindSolver,
+    mode: CopyLendMode,
+    enable_esc_minimal: bool,
+) -> anyhow::Result<BoConstruction> {
     let crate_ctxt = CrateCtxt::new(program);
+    let esc_minimal = if enable_esc_minimal {
+        super::esc_minimal::select(program, slots)
+    } else {
+        super::esc_minimal::EscMinimalSelection::default()
+    };
     let t = Instant::now();
     let eligibility = if mode == CopyLendMode::LendArm {
         analyze_copy_lend_eligibility(program, slots, mut_facts, origins.native_flows())
@@ -599,6 +717,7 @@ pub(crate) fn construct_bo_into(
         a2_opaque_result_guards: 0,
         selectors,
         eligibility,
+        esc_minimal,
         stats,
         eligibility_elapsed,
         emit_elapsed,
@@ -722,14 +841,29 @@ pub(crate) fn construct_bo_into_a16_refined(
     mut_facts: &MutFacts,
     solver: &KindSolver,
 ) -> anyhow::Result<(BoConstruction, usize)> {
-    let construction = construct_bo_into(
-        program,
-        slots,
-        origins,
-        mut_facts,
-        solver,
-        CopyLendMode::Baseline,
-    )?;
+    construct_bo_into_a16_refined_with_esc(program, slots, origins, mut_facts, solver, true)
+}
+
+fn construct_bo_into_a16_refined_with_esc(
+    program: &RustProgram<'_>,
+    slots: &CrateSlots,
+    origins: &OriginSummaries,
+    mut_facts: &MutFacts,
+    solver: &KindSolver,
+    enable_esc_minimal: bool,
+) -> anyhow::Result<(BoConstruction, usize)> {
+    let construction = if enable_esc_minimal {
+        construct_bo_into(
+            program,
+            slots,
+            origins,
+            mut_facts,
+            solver,
+            CopyLendMode::Baseline,
+        )?
+    } else {
+        construct_bo_a5_reference(program, slots, origins, mut_facts, solver)?
+    };
     let links = add_refined_return_kind_links(program, slots, origins, solver);
     Ok((construction, links))
 }
@@ -768,6 +902,7 @@ pub(crate) fn construct_tracked_census_baseline(
         a2_opaque_result_guards: 0,
         selectors,
         eligibility: CopyLendEligibility::default(),
+        esc_minimal: super::esc_minimal::select(program, slots),
         stats,
         eligibility_elapsed: Duration::ZERO,
         emit_elapsed,
@@ -858,14 +993,44 @@ pub(crate) fn verify_bo_construction_with_parameter_overlaps(
         CopyLendMode::Baseline,
         "A5 focused replay must keep the independent CopyLend switch at baseline"
     );
-    verify_to_fixpoint_counting_with_flows_and_parameter_overlaps(
+    super::esc_minimal::with_presentations(&construction.esc_minimal, || {
+        verify_constructed_to_fixpoint(
+            program,
+            slots,
+            origins,
+            solver,
+            construction,
+            mut_facts,
+            Some(parameter_overlaps),
+        )
+    })
+}
+
+fn verify_constructed_to_fixpoint(
+    program: &RustProgram<'_>,
+    slots: &CrateSlots,
+    origins: &OriginSummaries,
+    solver: &KindSolver,
+    construction: &BoConstruction,
+    mut_facts: &MutFacts,
+    parameter_overlaps: Option<&FxHashMap<LocalDefId, super::borrow_engine::ParameterOverlap>>,
+) -> (
+    Option<FxHashMap<SlotRef, SlotKind>>,
+    super::borrow_verify::RoundStats,
+) {
+    let copy_lends =
+        (construction.mode == CopyLendMode::LendArm).then_some(&construction.eligibility.pairs);
+    verify_to_fixpoint_counting_with_flows_impl(
         program,
         slots,
         origins.native_flows(),
         solver,
         &construction.selectors,
         mut_facts,
+        copy_lends,
+        Some(&construction.esc_minimal.loans),
         parameter_overlaps,
+        LoopBackend::HardCheckRoundOptimize,
     )
 }
 
@@ -880,27 +1045,17 @@ pub(crate) fn verify_bo_construction_counting(
     Option<FxHashMap<SlotRef, SlotKind>>,
     super::borrow_verify::RoundStats,
 ) {
-    match construction.mode {
-        CopyLendMode::LendArm => verify_to_fixpoint_counting_with_flows_and_copy_lends(
+    super::esc_minimal::with_presentations(&construction.esc_minimal, || {
+        verify_constructed_to_fixpoint(
             program,
             slots,
-            origins.native_flows(),
+            origins,
             solver,
-            &construction.selectors,
+            construction,
             mut_facts,
-            &construction.eligibility.pairs,
-        ),
-        CopyLendMode::Baseline | CopyLendMode::RemovalOnly => {
-            verify_to_fixpoint_counting_with_flows(
-                program,
-                slots,
-                origins.native_flows(),
-                solver,
-                &construction.selectors,
-                mut_facts,
-            )
-        }
-    }
+            None,
+        )
+    })
 }
 
 #[cfg(test)]
@@ -938,17 +1093,20 @@ pub(crate) fn verify_bo_construction_counting_for_test(
 ) {
     let copy_lends =
         (construction.mode == CopyLendMode::LendArm).then_some(&construction.eligibility.pairs);
-    verify_to_fixpoint_counting_with_flows_impl(
-        program,
-        slots,
-        origins.native_flows(),
-        solver,
-        &construction.selectors,
-        mut_facts,
-        copy_lends,
-        None,
-        backend.loop_backend(),
-    )
+    super::esc_minimal::with_presentations(&construction.esc_minimal, || {
+        verify_to_fixpoint_counting_with_flows_impl(
+            program,
+            slots,
+            origins.native_flows(),
+            solver,
+            &construction.selectors,
+            mut_facts,
+            copy_lends,
+            Some(&construction.esc_minimal.loans),
+            None,
+            backend.loop_backend(),
+        )
+    })
 }
 
 /// L2 twin of `verify_bo_construction_counting_for_test`, owned by the same
@@ -968,16 +1126,19 @@ pub(crate) fn verify_bo_construction_l2_for_test(
 ) {
     let copy_lends =
         (construction.mode == CopyLendMode::LendArm).then_some(&construction.eligibility.pairs);
-    verify_l2_to_fixpoint_counting_impl(
-        program,
-        slots,
-        origins.native_flows(),
-        solver,
-        &construction.selectors,
-        mut_facts,
-        copy_lends,
-        backend.loop_backend(),
-    )
+    super::esc_minimal::with_presentations(&construction.esc_minimal, || {
+        verify_l2_to_fixpoint_counting_impl(
+            program,
+            slots,
+            origins.native_flows(),
+            solver,
+            &construction.selectors,
+            mut_facts,
+            copy_lends,
+            Some(&construction.esc_minimal.loans),
+            backend.loop_backend(),
+        )
+    })
 }
 
 pub(crate) fn solve_bo_a5_config(
@@ -988,6 +1149,19 @@ pub(crate) fn solve_bo_a5_config(
     mode: A5Mode,
     attestation: Option<WholeProgramAttestation>,
 ) -> Option<VerifiedBo> {
+    solve_bo_a5_config_reporting(program, slots, origins, mut_facts, mode, attestation).ok()
+}
+
+/// Diagnostic twin of `solve_bo_a5_config`: identical construction and solve,
+/// with a typed reason at every historical pre-ledger `None` exit.
+pub(crate) fn solve_bo_a5_config_reporting(
+    program: &RustProgram<'_>,
+    slots: &CrateSlots,
+    origins: &OriginSummaries,
+    mut_facts: &MutFacts,
+    mode: A5Mode,
+    attestation: Option<WholeProgramAttestation>,
+) -> Result<VerifiedBo, A5PreledgerDecline> {
     // A16-REFINE is part of the accepted precise production semantics. The
     // retained Baseline mode is a diagnostic A5 control, not another
     // production configuration.
@@ -1000,8 +1174,32 @@ pub(crate) fn solve_bo_a5_config(
         mode,
         attestation,
         refined,
+        true,
     )?;
-    Some(stamp_a16_refined_receipt(verified, refined))
+    Ok(stamp_a16_refined_receipt(verified, refined))
+}
+
+/// Measurement reference: accepted A5/A16 production semantics with Phase-2
+/// escaped-loan selection disabled in both the planning baseline and candidate
+/// construction. This is the byte-equivalence path to c080.
+pub(crate) fn solve_bo_a5_reference_reporting(
+    program: &RustProgram<'_>,
+    slots: &CrateSlots,
+    origins: &OriginSummaries,
+    mut_facts: &MutFacts,
+    attestation: Option<WholeProgramAttestation>,
+) -> Result<VerifiedBo, A5PreledgerDecline> {
+    let (verified, _links) = solve_bo_a5_config_inner(
+        program,
+        slots,
+        origins,
+        mut_facts,
+        A5Mode::PreciseReplay,
+        attestation,
+        true,
+        false,
+    )?;
+    Ok(stamp_a16_refined_receipt(verified, true))
 }
 
 fn stamp_a16_refined_receipt(mut verified: VerifiedBo, refined: bool) -> VerifiedBo {
@@ -1027,7 +1225,8 @@ fn solve_bo_a5_config_inner(
     mode: A5Mode,
     attestation: Option<WholeProgramAttestation>,
     refined: bool,
-) -> Option<(VerifiedBo, usize)> {
+    enable_esc_minimal: bool,
+) -> Result<(VerifiedBo, usize), A5PreledgerDecline> {
     assert_eq!(
         CopyLendMode::current(),
         CopyLendMode::Baseline,
@@ -1035,15 +1234,15 @@ fn solve_bo_a5_config_inner(
     );
 
     let baseline_solver = KindSolver::new(slots);
-    let baseline_construction = construct_bo_into(
-        program,
-        slots,
-        origins,
-        mut_facts,
-        &baseline_solver,
-        CopyLendMode::Baseline,
-    )
-    .ok()?;
+    let baseline_construction =
+        construct_bo_a5_reference(program, slots, origins, mut_facts, &baseline_solver).map_err(
+            |error| {
+                A5PreledgerDecline::from_error(
+                    A5PreledgerDeclineReason::BaselineConstruction,
+                    error,
+                )
+            },
+        )?;
     let (baseline_model, baseline_round_stats) = verify_bo_construction_counting(
         program,
         slots,
@@ -1052,7 +1251,27 @@ fn solve_bo_a5_config_inner(
         &baseline_construction,
         mut_facts,
     );
-    let baseline_model = baseline_model?;
+    let baseline_model = baseline_model.ok_or_else(|| {
+        let first = baseline_solver
+            .round_model_failure()
+            .map(|failure| failure.summary())
+            .unwrap_or_else(|| "untyped-round-decline".to_owned());
+        A5PreledgerDecline::with_detail(
+            A5PreledgerDeclineReason::BaselineVerification,
+            format!(
+                "expected=accepted-model got={first} rounds={} commits={} selected_copy_lends={} dropped_sources={} dropped_sinks={} field_conflict={:?} field_kind={:?} cap_exhausted={} l2_decline={:?}",
+                baseline_round_stats.rounds,
+                baseline_round_stats.commits_conflict,
+                baseline_round_stats.copy_lend_replay_selections,
+                baseline_round_stats.dropped_sources,
+                baseline_round_stats.dropped_sinks,
+                baseline_round_stats.field_conflict_decline,
+                baseline_round_stats.field_conflict_kind,
+                baseline_round_stats.cap_exhausted,
+                baseline_round_stats.l2_decline,
+            ),
+        )
+    })?;
     let baseline_nullability = nullability_artifacts(&baseline_construction);
     let baseline_a14 = a14_artifacts(&baseline_construction);
     if mode == A5Mode::Baseline {
@@ -1062,7 +1281,7 @@ fn solve_bo_a5_config_inner(
             A5Plan::baseline()
         };
         let selected_model_sha256 = model_digest(&baseline_model);
-        return Some((
+        return Ok((
             VerifiedBo {
                 receipt: a5_receipt(
                     mode,
@@ -1088,6 +1307,7 @@ fn solve_bo_a5_config_inner(
                 retained_c9_marks: BTreeSet::new(),
                 retained_c9_plans: Vec::new(),
                 round_stats: baseline_round_stats,
+                esc_minimal: baseline_construction.esc_minimal.clone(),
                 selector_sources: baseline_construction.selectors.sources().len(),
                 selector_sinks: baseline_construction.selectors.sinks().len(),
                 emission_stats: baseline_construction.stats,
@@ -1096,6 +1316,10 @@ fn solve_bo_a5_config_inner(
                 check_sat_count: baseline_solver.check_sat_count(),
                 hard_check_count: baseline_solver.hard_check_count(),
                 optimize_materialization_count: baseline_solver.optimize_materialization_count(),
+                lazy_plain_hard_check_count: baseline_solver.lazy_plain_hard_check_count(),
+                lazy_tracked_recheck_count: baseline_solver.lazy_tracked_recheck_count(),
+                lazy_plain_materialization_count: baseline_solver
+                    .lazy_plain_materialization_count(),
                 hard_check_elapsed: baseline_solver.hard_check_elapsed(),
                 optimize_materialization_elapsed: baseline_solver
                     .optimize_materialization_elapsed(),
@@ -1116,7 +1340,9 @@ fn solve_bo_a5_config_inner(
         mode,
         attestation,
     )
-    .ok()?;
+    .map_err(|error| {
+        A5PreledgerDecline::from_error(A5PreledgerDeclineReason::A5PlanProduction, error)
+    })?;
     if matches!(plan.abi_guard, AbiGuardDisposition::Refused { .. }) {
         if refined {
             // Refusing A5 promotion must not also disable the independently
@@ -1124,8 +1350,20 @@ fn solve_bo_a5_config_inner(
             // the A5 guard's fallback while applying the same one-way return
             // rule as the attested production path.
             let solver = KindSolver::new(slots);
-            let (construction, refined_links) =
-                construct_bo_into_a16_refined(program, slots, origins, mut_facts, &solver).ok()?;
+            let (construction, refined_links) = construct_bo_into_a16_refined_with_esc(
+                program,
+                slots,
+                origins,
+                mut_facts,
+                &solver,
+                enable_esc_minimal,
+            )
+            .map_err(|error| {
+                A5PreledgerDecline::from_error(
+                    A5PreledgerDeclineReason::RefinedFallbackConstruction,
+                    error,
+                )
+            })?;
             let (model, round_stats) = verify_bo_construction_counting(
                 program,
                 slots,
@@ -1134,11 +1372,13 @@ fn solve_bo_a5_config_inner(
                 &construction,
                 mut_facts,
             );
-            let model = model?;
+            let model = model.ok_or_else(|| {
+                A5PreledgerDecline::at(A5PreledgerDeclineReason::RefinedFallbackVerification)
+            })?;
             let selected_model_sha256 = model_digest(&model);
             let nullability = nullability_artifacts(&construction);
             let a14 = a14_artifacts(&construction);
-            return Some((
+            return Ok((
                 VerifiedBo {
                     receipt: a5_receipt(
                         mode,
@@ -1164,6 +1404,7 @@ fn solve_bo_a5_config_inner(
                     retained_c9_marks: BTreeSet::new(),
                     retained_c9_plans: Vec::new(),
                     round_stats,
+                    esc_minimal: construction.esc_minimal.clone(),
                     selector_sources: construction.selectors.sources().len(),
                     selector_sinks: construction.selectors.sinks().len(),
                     emission_stats: construction.stats,
@@ -1172,6 +1413,9 @@ fn solve_bo_a5_config_inner(
                     check_sat_count: solver.check_sat_count(),
                     hard_check_count: solver.hard_check_count(),
                     optimize_materialization_count: solver.optimize_materialization_count(),
+                    lazy_plain_hard_check_count: solver.lazy_plain_hard_check_count(),
+                    lazy_tracked_recheck_count: solver.lazy_tracked_recheck_count(),
+                    lazy_plain_materialization_count: solver.lazy_plain_materialization_count(),
                     hard_check_elapsed: solver.hard_check_elapsed(),
                     optimize_materialization_elapsed: solver.optimize_materialization_elapsed(),
                     a16_refined_links: refined_links,
@@ -1186,7 +1430,7 @@ fn solve_bo_a5_config_inner(
             ));
         }
         let selected_model_sha256 = model_digest(&baseline_model);
-        return Some((
+        return Ok((
             VerifiedBo {
                 receipt: a5_receipt(
                     mode,
@@ -1212,6 +1456,7 @@ fn solve_bo_a5_config_inner(
                 retained_c9_marks: BTreeSet::new(),
                 retained_c9_plans: Vec::new(),
                 round_stats: baseline_round_stats,
+                esc_minimal: baseline_construction.esc_minimal.clone(),
                 selector_sources: baseline_construction.selectors.sources().len(),
                 selector_sinks: baseline_construction.selectors.sinks().len(),
                 emission_stats: baseline_construction.stats,
@@ -1220,6 +1465,10 @@ fn solve_bo_a5_config_inner(
                 check_sat_count: baseline_solver.check_sat_count(),
                 hard_check_count: baseline_solver.hard_check_count(),
                 optimize_materialization_count: baseline_solver.optimize_materialization_count(),
+                lazy_plain_hard_check_count: baseline_solver.lazy_plain_hard_check_count(),
+                lazy_tracked_recheck_count: baseline_solver.lazy_tracked_recheck_count(),
+                lazy_plain_materialization_count: baseline_solver
+                    .lazy_plain_materialization_count(),
                 hard_check_elapsed: baseline_solver.hard_check_elapsed(),
                 optimize_materialization_elapsed: baseline_solver
                     .optimize_materialization_elapsed(),
@@ -1237,18 +1486,34 @@ fn solve_bo_a5_config_inner(
 
     let solver = KindSolver::new(slots);
     let (construction, refined_links) = if refined {
-        construct_bo_into_a16_refined(program, slots, origins, mut_facts, &solver).ok()?
+        construct_bo_into_a16_refined_with_esc(
+            program,
+            slots,
+            origins,
+            mut_facts,
+            &solver,
+            enable_esc_minimal,
+        )
+        .map_err(|error| {
+            A5PreledgerDecline::from_error(A5PreledgerDeclineReason::PreciseConstruction, error)
+        })?
     } else {
         (
-            construct_bo_into(
-                program,
-                slots,
-                origins,
-                mut_facts,
-                &solver,
-                CopyLendMode::Baseline,
-            )
-            .ok()?,
+            if enable_esc_minimal {
+                construct_bo_into(
+                    program,
+                    slots,
+                    origins,
+                    mut_facts,
+                    &solver,
+                    CopyLendMode::Baseline,
+                )
+            } else {
+                construct_bo_a5_reference(program, slots, origins, mut_facts, &solver)
+            }
+            .map_err(|error| {
+                A5PreledgerDecline::from_error(A5PreledgerDeclineReason::CoarseConstruction, error)
+            })?,
             0,
         )
     };
@@ -1264,7 +1529,12 @@ fn solve_bo_a5_config_inner(
                 mut_facts,
                 &plan.effective_overlaps,
             );
-            (model?, stats)
+            (
+                model.ok_or_else(|| {
+                    A5PreledgerDecline::at(A5PreledgerDeclineReason::PreciseVerification)
+                })?,
+                stats,
+            )
         }
         A5Mode::CoarseConstraint => {
             apply_coarse_constraints(mode, &solver, plan.coarse_pairs.iter().copied());
@@ -1276,7 +1546,12 @@ fn solve_bo_a5_config_inner(
                 &construction,
                 mut_facts,
             );
-            (model?, stats)
+            (
+                model.ok_or_else(|| {
+                    A5PreledgerDecline::at(A5PreledgerDeclineReason::CoarseVerification)
+                })?,
+                stats,
+            )
         }
     };
     let retained_c9_marks = if mode == A5Mode::PreciseReplay {
@@ -1292,7 +1567,7 @@ fn solve_bo_a5_config_inner(
     let selected_model_sha256 = model_digest(&model);
     let nullability = nullability_artifacts(&construction);
     let a14 = a14_artifacts(&construction);
-    Some((
+    Ok((
         VerifiedBo {
             receipt: a5_receipt(
                 mode,
@@ -1318,6 +1593,7 @@ fn solve_bo_a5_config_inner(
             retained_c9_marks,
             retained_c9_plans,
             round_stats,
+            esc_minimal: construction.esc_minimal.clone(),
             selector_sources: construction.selectors.sources().len(),
             selector_sinks: construction.selectors.sinks().len(),
             emission_stats: construction.stats,
@@ -1326,6 +1602,9 @@ fn solve_bo_a5_config_inner(
             check_sat_count: solver.check_sat_count(),
             hard_check_count: solver.hard_check_count(),
             optimize_materialization_count: solver.optimize_materialization_count(),
+            lazy_plain_hard_check_count: solver.lazy_plain_hard_check_count(),
+            lazy_tracked_recheck_count: solver.lazy_tracked_recheck_count(),
+            lazy_plain_materialization_count: solver.lazy_plain_materialization_count(),
             hard_check_elapsed: solver.hard_check_elapsed(),
             optimize_materialization_elapsed: solver.optimize_materialization_elapsed(),
             a16_refined_links: refined_links,
@@ -1694,6 +1973,24 @@ fn live_outward_event<'tcx>(
 #[cfg(test)]
 mod mode_tests {
     use super::*;
+
+    #[test]
+    fn a5_preledger_decline_reason_labels_are_complete_and_stable() {
+        assert_eq!(
+            A5PreledgerDeclineReason::ALL.map(A5PreledgerDeclineReason::label),
+            [
+                "baseline-construction",
+                "baseline-verification",
+                "a5-plan-production",
+                "refined-fallback-construction",
+                "refined-fallback-verification",
+                "precise-construction",
+                "precise-verification",
+                "coarse-construction",
+                "coarse-verification",
+            ]
+        );
+    }
 
     #[test]
     fn receipt_key_order_is_canonical_across_input_order() {

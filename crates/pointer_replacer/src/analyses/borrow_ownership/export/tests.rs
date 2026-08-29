@@ -18,14 +18,18 @@ use crate::{
         coherence::add_coherence,
         construction::{
             CopyLendMode, TestValidationBackend, construct_bo_into,
-            verify_bo_construction_counting_for_test, verify_bo_construction_l2_for_test,
+            verify_bo_construction_counting, verify_bo_construction_counting_for_test,
+            verify_bo_construction_l2_for_test,
         },
         crate_slots::CrateSlots,
         emit_crate_ownership_constraints, l2,
         mutability_facts::MutFacts,
         origin_flow::analyze_program_origin_flow,
         origins::compute_origins,
-        solver::{KindSolver, SlotRef},
+        solver::{
+            KindSolver, RoundModelFailure, SelectorTraceOutcome, SlotRef,
+            with_assumption_check_trace, with_selector_trace,
+        },
     },
     utils::rustc::RustProgram,
 };
@@ -53,6 +57,48 @@ fn collect_program(tcx: TyCtxt<'_>) -> RustProgram<'_> {
         functions,
         structs,
     }
+}
+
+fn function_named(program: &RustProgram<'_>, name: &str) -> rustc_span::def_id::LocalDefId {
+    program
+        .functions
+        .iter()
+        .copied()
+        .find(|did| program.tcx.item_name(did.to_def_id()).as_str() == name)
+        .unwrap_or_else(|| panic!("missing function {name}"))
+}
+
+fn named_depth0_slot(
+    program: &RustProgram<'_>,
+    slots: &CrateSlots,
+    function: rustc_span::def_id::LocalDefId,
+    name: &str,
+) -> SlotRef {
+    let local = named_local(program, function, name);
+    let slot = slots.fn_local_slots[&function]
+        .slot_for_local_depth(local, 0)
+        .unwrap_or_else(|| panic!("missing depth-zero slot for {name}"));
+    SlotRef::Local(function, slot)
+}
+
+fn named_local(
+    program: &RustProgram<'_>,
+    function: rustc_span::def_id::LocalDefId,
+    name: &str,
+) -> rustc_middle::mir::Local {
+    let body = program
+        .tcx
+        .mir_drops_elaborated_and_const_checked(function)
+        .borrow();
+    body.var_debug_info
+        .iter()
+        .find_map(|info| {
+            (info.name.as_str() == name).then(|| match info.value {
+                rustc_middle::mir::VarDebugInfoContents::Place(place) => Some(place.local),
+                _ => None,
+            })?
+        })
+        .unwrap_or_else(|| panic!("missing local {name}"))
 }
 
 /// Solve one inline program under export capture, exactly as `bo_c1`'s
@@ -607,7 +653,7 @@ fn declining_run_records_no_certificate() {
     ::utils::compilation::run_compiler_on_str(CALL_ARG, |tcx| {
         let program = collect_program(tcx);
         let slots = CrateSlots::build(&program);
-        let (model, export) = with_bo_export(|| {
+        let ((model, failure), export) = with_bo_export(|| {
             let crate_ctxt = CrateCtxt::new(&program);
             let solver = KindSolver::new(&slots);
             let (_stats, selectors) = emit_crate_ownership_constraints(
@@ -631,7 +677,8 @@ fn declining_run_records_no_certificate() {
                 .expect("fixture has at least one local slot");
             solver.assume(victim, super::SlotKindAlias::Ref);
             solver.add_borrow_exclusion(Some(victim), &[]);
-            verify_to_fixpoint(&program, &slots, &solver, &selectors, true)
+            let model = verify_to_fixpoint(&program, &slots, &solver, &selectors, true);
+            (model, solver.round_model_failure())
         });
         assert!(
             model.is_none(),
@@ -643,6 +690,20 @@ fn declining_run_records_no_certificate() {
              accept point never ran; anything else destroys the invariant the \
              Option was introduced to carry. Got {:?}",
             export.residual_conflicts
+        );
+        let Some(RoundModelFailure::HardUnsat {
+            active_t2,
+            core_labels,
+        }) = failure
+        else {
+            panic!("pre-loop contradiction lacks its typed first failure: {failure:?}");
+        };
+        assert_eq!(active_t2, 0);
+        assert!(core_labels.iter().any(|label| label.contains("kind-pin")));
+        assert!(
+            core_labels
+                .iter()
+                .any(|label| label.contains("borrow-exclusion"))
         );
     })
     .unwrap_or_else(|e| e.raise())
@@ -706,6 +767,305 @@ fn sink_site_names_the_free_call() {
         callees.iter().any(|c| c == "free"),
         "sink selector was not attributed to the free call; got {callees:?}"
     );
+}
+
+/// T2-W2 (addendum-55 erratum): an exact free endpoint whose incoming value
+/// has no modeled origin cannot retain the endpoint assertion. The mandatory
+/// licensing clause appears beside the typed T2 label, T2 yields first,
+/// restoration fails, and the post-retraction model equals the no-T2 baseline.
+#[test]
+fn t2_unknown_origin_free_retracts_with_named_license_core() {
+    const CODE: &str = r#"
+unsafe extern "C" {
+    fn opaque() -> *mut i32;
+    fn free(p: *mut core::ffi::c_void);
+}
+unsafe fn release() {
+    let p = opaque();
+    free(p as *mut core::ffi::c_void);
+}
+"#;
+    ::utils::compilation::run_compiler_on_str(CODE, |tcx| {
+        let program = collect_program(tcx);
+        let slots = CrateSlots::build(&program);
+        let origins = compute_origins(&program);
+        let mut_facts = MutFacts::from_program(&program);
+        let solver = KindSolver::new(&slots);
+        let construction = construct_bo_into(
+            &program,
+            &slots,
+            &origins,
+            &mut_facts,
+            &solver,
+            CopyLendMode::Baseline,
+        )
+        .expect("shared construction");
+        let sink_index = construction
+            .selectors
+            .keys()
+            .iter()
+            .position(|key| key.callee == "free" && key.role == BoundaryRole::Sink)
+            .expect("typed free assertion");
+        let ((model, _stats), trace) = with_selector_trace(|| {
+            verify_bo_construction_counting(
+                &program,
+                &slots,
+                &origins,
+                &solver,
+                &construction,
+                &mut_facts,
+            )
+        });
+        assert!(solver.lazy_plain_hard_check_count() > 0);
+        assert!(
+            solver.lazy_tracked_recheck_count() > 0,
+            "an UNSAT endpoint set must re-enter the tracked core backend"
+        );
+        assert_eq!(
+            solver.lazy_plain_materialization_count(),
+            solver.optimize_materialization_count(),
+            "every accepted round model must materialize without assumptions"
+        );
+        let model = model.expect("T2 retraction preserves acceptance");
+        let baseline = solver
+            .model_without_t2_for_test(&construction.selectors)
+            .expect("no-T2 baseline accepts");
+        assert_eq!(
+            model, baseline,
+            "W2 post-retraction model must equal baseline"
+        );
+        let release = function_named(&program, "release");
+        let p = named_depth0_slot(&program, &slots, release, "p");
+        assert_eq!(model.get(&p), baseline.get(&p));
+
+        let epoch = trace.epochs.last().expect("T2 trace epoch");
+        assert!(epoch.final_dropped.contains(&sink_index));
+        let dropped = epoch
+            .events
+            .iter()
+            .find(|event| event.selector_index == sink_index && event.core_labels.len() > 1)
+            .expect("typed T2+license core");
+        assert!(
+            dropped
+                .core_labels
+                .iter()
+                .any(|label| label.contains("t2-assert"))
+        );
+        assert!(
+            dropped
+                .core_labels
+                .iter()
+                .any(|label| label.contains("own-assume") || label.contains("link-own"))
+        );
+        assert!(epoch.events.iter().any(|event| {
+            event.selector_index == sink_index
+                && event.outcome == SelectorTraceOutcome::StayedDropped
+        }));
+    })
+    .unwrap_or_else(|error| error.raise());
+}
+
+/// T2-N1: a long move chain receives assertions at its allocation and
+/// deallocation endpoints only. Chain middles remain governed exclusively by
+/// existing transfer/coherence constraints.
+#[test]
+fn t2_chain_middles_do_not_receive_assertions() {
+    const CODE: &str = r#"
+unsafe extern "C" {
+    fn malloc(n: usize) -> *mut core::ffi::c_void;
+    fn free(p: *mut core::ffi::c_void);
+}
+unsafe fn chain() {
+    let p = malloc(4) as *mut i32;
+    let q = p;
+    let r = q;
+    free(r as *mut core::ffi::c_void);
+}
+"#;
+    ::utils::compilation::run_compiler_on_str(CODE, |tcx| {
+        let program = collect_program(tcx);
+        let slots = CrateSlots::build(&program);
+        let origins = compute_origins(&program);
+        let facts = MutFacts::from_program(&program);
+        let solver = KindSolver::new(&slots);
+        let construction = construct_bo_into(
+            &program,
+            &slots,
+            &origins,
+            &facts,
+            &solver,
+            CopyLendMode::Baseline,
+        )
+        .expect("shared construction");
+        let keys = construction.selectors.keys();
+        assert_eq!(keys.len(), 2, "only malloc/free endpoints may assert");
+        assert_eq!(
+            keys.iter()
+                .map(|key| key.callee.as_str())
+                .collect::<Vec<_>>(),
+            vec!["malloc", "free"]
+        );
+    })
+    .unwrap_or_else(|error| error.raise());
+}
+
+/// T2-N2: local functions that merely reuse libc spellings are not boundary
+/// rows and therefore create no endpoint assertions.
+#[test]
+fn t2_local_wrapper_names_do_not_match_foreign_boundaries() {
+    const CODE: &str = r#"
+unsafe fn malloc(_n: usize) -> *mut i32 { core::ptr::null_mut() }
+unsafe fn free(_p: *mut i32) {}
+unsafe fn wrapper() {
+    let p = malloc(4);
+    free(p);
+}
+"#;
+    ::utils::compilation::run_compiler_on_str(CODE, |tcx| {
+        let program = collect_program(tcx);
+        let slots = CrateSlots::build(&program);
+        let origins = compute_origins(&program);
+        let facts = MutFacts::from_program(&program);
+        let solver = KindSolver::new(&slots);
+        let construction = construct_bo_into(
+            &program,
+            &slots,
+            &origins,
+            &facts,
+            &solver,
+            CopyLendMode::Baseline,
+        )
+        .expect("shared construction");
+        assert!(construction.selectors.keys().is_empty());
+    })
+    .unwrap_or_else(|error| error.raise());
+}
+
+/// Observation-only W1 causal-chain dump authorized after the first T2
+/// MAX-3 stop. It makes no assertion about the expected repair; the diagnostic
+/// output is the deliverable.
+#[test]
+fn t2_w1_causal_chain_diagnostic() {
+    const CODE: &str = r#"
+unsafe extern "C" {
+    fn malloc(n: usize) -> *mut core::ffi::c_void;
+    fn free(p: *mut core::ffi::c_void);
+}
+unsafe fn chain() {
+    let p = malloc(core::mem::size_of::<i32>()) as *mut i32;
+    let q = p;
+    free(q as *mut core::ffi::c_void);
+}
+"#;
+    ::utils::compilation::run_compiler_on_str(CODE, |tcx| {
+        let program = collect_program(tcx);
+        let slots = CrateSlots::build(&program);
+        let origins = compute_origins(&program);
+        let facts = MutFacts::from_program(&program);
+        let arm = arm_scope();
+        let solver = KindSolver::new(&slots);
+        let construction = construct_bo_into(
+            &program,
+            &slots,
+            &origins,
+            &facts,
+            &solver,
+            CopyLendMode::Baseline,
+        )
+        .expect("shared construction");
+        eprintln!("T2-W1 keys={}", construction.selectors.keys().len());
+        for (index, (key, literal)) in construction
+            .selectors
+            .keys()
+            .iter()
+            .zip(construction.selectors.all())
+            .enumerate()
+        {
+            eprintln!("T2-W1 key[{index}]={} literal={literal}", key.label());
+        }
+
+        let (((model, stats), checks), selector_trace) = with_selector_trace(|| {
+            with_assumption_check_trace(|| {
+                verify_bo_construction_counting(
+                    &program,
+                    &slots,
+                    &origins,
+                    &solver,
+                    &construction,
+                    &facts,
+                )
+            })
+        });
+        let export = arm.finish();
+        for (index, check) in checks.iter().enumerate() {
+            let t2 = construction
+                .selectors
+                .all()
+                .iter()
+                .enumerate()
+                .filter(|(_, literal)| check.bundle.iter().any(|item| item == *literal))
+                .map(|(index, _)| index)
+                .collect::<Vec<_>>();
+            eprintln!(
+                "T2-W1 check[{index}] phase={:?} outcome={:?} explicit={} bundle={} t2={t2:?}",
+                check.phase,
+                check.outcome,
+                check.explicit.len(),
+                check.bundle.len(),
+            );
+            eprintln!("T2-W1 check[{index}] labels={:?}", check.labels);
+        }
+        for (epoch, trace) in selector_trace.epochs.iter().enumerate() {
+            eprintln!(
+                "T2-W1 epoch[{epoch}] final_dropped={:?} events={:#?}",
+                trace.final_dropped, trace.events
+            );
+        }
+
+        let model = model.expect("W1 accepts");
+        let chain = function_named(&program, "chain");
+        let p_slot = named_depth0_slot(&program, &slots, chain, "p");
+        let q_slot = named_depth0_slot(&program, &slots, chain, "q");
+        let owns = export.version_owns.as_ref().expect("version ownerships");
+        for (name, local, slot) in [
+            ("p", named_local(&program, chain, "p"), p_slot),
+            ("q", named_local(&program, chain, "q"), q_slot),
+        ] {
+            let versions = export
+                .version_sites
+                .iter()
+                .filter(|site| site.fn_did == chain && site.local == local)
+                .map(|site| {
+                    let use_value = site.use_var.map(|var| (var, owns[var]));
+                    let def_value = site.def_var.map(|var| (var, owns[var]));
+                    (site.location, use_value, def_value)
+                })
+                .collect::<Vec<_>>();
+            eprintln!(
+                "T2-W1 model {name}: versions={versions:?} own_bit={} kind={:?}",
+                model.get(&slot) == Some(&SlotKindAlias::Owning),
+                model.get(&slot)
+            );
+        }
+        eprintln!(
+            "T2-W1 stats dropped_sources={} dropped_sinks={} optimize_materializations={}",
+            stats.dropped_sources,
+            stats.dropped_sinks,
+            solver.optimize_materialization_count(),
+        );
+        assert!(solver.lazy_plain_hard_check_count() > 0);
+        assert_eq!(
+            solver.lazy_tracked_recheck_count(),
+            0,
+            "an all-SAT endpoint set must never pay for tracked core extraction"
+        );
+        assert_eq!(
+            solver.lazy_plain_materialization_count(),
+            solver.optimize_materialization_count(),
+            "every accepted round model must materialize without assumptions"
+        );
+    })
+    .unwrap_or_else(|error| error.raise());
 }
 
 /// RED 6/7 — a transfer produces a move-point candidate; a plain
@@ -897,6 +1257,7 @@ fn capture_solve_l2(
                 &selectors,
                 true,
                 None,
+                None,
             )
         });
         (model, stats, export)
@@ -1068,6 +1429,7 @@ fn l2_door_rejects_a_tracked_solver() {
             &solver,
             &selectors,
             true,
+            None,
             None,
         );
         None::<()>

@@ -254,11 +254,15 @@ impl<'rn, 'tcx: 'rn> Renamer<'rn, 'tcx> {
             // deeper in the boundary dispatch can attribute itself to this call
             // site. No-op unless a capture scope is active.
             match self.body.source.def_id().as_local() {
-                Some(fn_did) => crate::analyses::borrow_ownership::export::with_terminator_site(
-                    fn_did,
-                    location,
-                    || self.go_terminator::<Infer>(infer_cx, terminator, location),
-                ),
+                Some(fn_did) => {
+                    let function_path = self.tcx.def_path_str(fn_did.to_def_id());
+                    crate::analyses::borrow_ownership::export::with_terminator_site(
+                        fn_did,
+                        function_path,
+                        location,
+                        || self.go_terminator::<Infer>(infer_cx, terminator, location),
+                    )
+                }
                 None => self.go_terminator::<Infer>(infer_cx, terminator, location),
             }
         }

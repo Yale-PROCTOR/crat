@@ -20,6 +20,7 @@ pub mod crate_slots;
 #[cfg(test)]
 mod dependency_ratchet;
 mod domain;
+pub(crate) mod esc_minimal;
 pub(crate) mod export;
 mod infer;
 pub(crate) mod l2;
@@ -346,9 +347,11 @@ fn emit_crate_ownership_constraints_impl<'tcx>(
     // E-R2: snapshot the Var -> Bool map before the database is dropped.
     database.snapshot_version_asts();
 
-    let selectors = Selectors::new(
+    let selectors = Selectors::new_with_keys(
         database.source_selectors().to_vec(),
+        database.source_keys().to_vec(),
         database.sink_selectors().to_vec(),
+        database.sink_keys().to_vec(),
     );
     let stats = BoOwnEmissionStats {
         z3_ast_len: database.z3_ast_len(),

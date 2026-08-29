@@ -25,7 +25,10 @@ use crate::{
             ProvenanceOwner, ProvenanceSet, StructFieldSlot, collect_invalid_loan_demotions,
         },
         borrow_ownership::{
-            coherence::SelectedCopyLendLoans, export::LoanClass, origin_flow::OriginFlowResults,
+            coherence::SelectedCopyLendLoans,
+            esc_minimal,
+            export::{self, LoanClass},
+            origin_flow::OriginFlowResults,
         },
     },
     utils::rustc::RustProgram,
@@ -213,7 +216,7 @@ fn extract_conflict_edges(
     let mut edges = Vec::new();
     for loan in invalid_loans.iter() {
         let borrow_data = &borrow_set.loans[loan];
-        let issuer = match borrow_data.assigned {
+        let mut issuer = match borrow_data.assigned {
             Borrower::Assign(owner) => Some(owner),
             Borrower::CallArg(..) => None,
         };
@@ -302,7 +305,20 @@ fn extract_conflict_edges(
                 }
             }
         }
-        edges.push(ConflictEdge { issuer, requirers });
+        let esc_issuer_first = if let Some(&(resolved_source, _resolved_destination)) =
+            inference.escaped_presentations.get(&loan)
+        {
+            issuer = Some(resolved_source);
+            requirers.clear();
+            true
+        } else {
+            false
+        };
+        edges.push(ConflictEdge {
+            issuer,
+            requirers,
+            esc_issuer_first,
+        });
     }
     edges
 }
@@ -441,61 +457,92 @@ fn collect_invalid_loan_demotions_forked(
             .local_witnesses;
     };
 
+    let mut local_witnesses = Vec::new();
+    for loan in invalid_loans.iter() {
+        local_witnesses.extend(local_witnesses_for_loan(
+            inference,
+            provenance_set,
+            localized,
+            loan,
+        ));
+    }
+
+    local_witnesses
+}
+
+fn local_witnesses_for_loan(
+    inference: &NativeInference<'_>,
+    provenance_set: &ProvenanceSet,
+    localized: &super::loan_liveness::LocalizedRequires,
+    loan: Loan,
+) -> Vec<(Local, Local)> {
     let BorrowInferenceResults {
         borrow_set,
         errors,
         provenance_liveness,
         ..
     } = &inference.facts;
-
-    // Only the local witnesses are returned: BOTH fork callers use `local_witnesses` and discard
-    // the field half (they carry their own §NB5-F2 field candidacy), and naming production's
-    // `InvalidLoanDemotions` here would add a 16th entry to the §0.2 self-containment allowlist
-    // for a value nothing reads. The field branches below are kept as no-ops so this stays a
-    // line-for-line mirror of `borrow/mod.rs:1262-1305`.
+    let borrow_data = &borrow_set.loans[loan];
     let mut local_witnesses = Vec::new();
 
-    // Requirer path (mirrors `borrow/mod.rs:1262-1290`; only the predicate gains the point key).
-    for loan in invalid_loans.iter() {
-        let borrow_data = &borrow_set.loans[loan];
-        for row in errors.rows() {
-            let Some(loans) = errors.row(row) else {
-                continue;
-            };
-            if !loans.contains(loan) {
+    for row in errors.rows() {
+        let Some(loans) = errors.row(row) else {
+            continue;
+        };
+        if !loans.contains(loan) {
+            continue;
+        }
+        let Some(live_provenances) = provenance_liveness.row(row) else {
+            continue;
+        };
+        for provenance in live_provenances.iter() {
+            if !localized.contains(row, provenance, loan) {
                 continue;
             }
-            let Some(live_provenances) = provenance_liveness.row(row) else {
-                continue;
-            };
-            for provenance in live_provenances.iter() {
-                if !localized.contains(row, provenance, loan) {
-                    continue;
-                }
-                match provenance_set.provenance_data[provenance].owner() {
-                    ProvenanceOwner::Local(local) => {
-                        local_witnesses.push((local, borrow_data.borrowed.local));
-                    }
-                    ProvenanceOwner::Field(_) => {}
-                }
+            if let ProvenanceOwner::Local(local) =
+                provenance_set.provenance_data[provenance].owner()
+            {
+                local_witnesses.push((local, borrow_data.borrowed.local));
             }
         }
     }
 
-    // Issuer path (verbatim from `borrow/mod.rs:1292-1305`; it never consults `requires`).
-    for loan in invalid_loans.iter() {
-        let borrow_data = &borrow_set.loans[loan];
-        if let Borrower::Assign(assigned) = borrow_data.assigned {
-            match assigned {
-                ProvenanceOwner::Local(local) => {
-                    local_witnesses.push((local, borrow_data.borrowed.local));
-                }
-                ProvenanceOwner::Field(_) => {}
-            }
-        }
+    if let Borrower::Assign(ProvenanceOwner::Local(local)) = borrow_data.assigned {
+        local_witnesses.push((local, borrow_data.borrowed.local));
     }
-
     local_witnesses
+}
+
+/// Addendum 61 convergence tripwire. A marked row may exist only while its presented source is
+/// still `Ref`; after issuer-first repair demotes that source, the active-loan filter must remove
+/// the selected loan before the next replay. This check precedes the generic stray-Raw invariant
+/// so persistence is reported as the class-specific STOP rather than looking like an ordinary
+/// replay failure.
+fn assert_escaped_conflicts_pre_demotion<'a>(
+    edges: impl Iterator<Item = &'a ConflictEdge>,
+    is_ref: impl Fn(Local) -> bool,
+    registered: usize,
+) {
+    let mut marked = 0;
+    for edge in edges.filter(|edge| edge.esc_issuer_first) {
+        marked += 1;
+        match edge.issuer {
+            Some(ProvenanceOwner::Local(source)) => assert!(
+                is_ref(source),
+                "②-selected loan conflict persisted after its resolved source was demoted"
+            ),
+            Some(ProvenanceOwner::Field(_)) => {
+                // Field slots are held out of the ②-minimal wave. Keep this explicit so a future
+                // field-bearing allowlist row cannot silently bypass the Local convergence check.
+                panic!("②-minimal selected source unexpectedly resolved to a field")
+            }
+            None => panic!("②-selected conflict presentation lost its resolved-source issuer"),
+        }
+    }
+    assert!(
+        marked <= registered && marked <= 36,
+        "② conflict presentation count exceeded its matched allowlist class"
+    );
 }
 
 /// Attach the invalidating access roots to the unchanged one-edge-per-loan
@@ -566,7 +613,7 @@ where
     let no_copy_lends = FxHashSet::default();
     let mut out = FxHashMap::default();
     for f in program.functions.iter().copied() {
-        let mut inference = ctxt.infer(program.tcx, f, &[], &no_copy_lends);
+        let mut inference = ctxt.infer(program.tcx, f, &[], &no_copy_lends, &no_copy_lends);
         overwrite_with_engine_facts(
             program.tcx,
             f,
@@ -614,7 +661,7 @@ where
     let no_copy_lends = FxHashSet::default();
     let mut out = FxHashMap::default();
     for f in program.functions.iter().copied() {
-        let inference = ctxt.infer(program.tcx, f, &[], &no_copy_lends);
+        let inference = ctxt.infer(program.tcx, f, &[], &no_copy_lends, &no_copy_lends);
         let mut rows = Vec::new();
         for (loan, data) in inference.borrow_set.loans.iter_enumerated() {
             let live_points = inference
@@ -663,7 +710,7 @@ where
     let no_copy_lends = FxHashSet::default();
     let mut out = FxHashMap::default();
     for f in program.functions.iter().copied() {
-        let mut inference = ctxt.infer(program.tcx, f, &[], &no_copy_lends);
+        let mut inference = ctxt.infer(program.tcx, f, &[], &no_copy_lends, &no_copy_lends);
         overwrite_with_engine_facts(
             program.tcx,
             f,
@@ -705,6 +752,7 @@ where
     for f in program.functions.iter().copied() {
         let mut inference = borrow_inference(program.tcx, f, &ctxt);
         let copy_lends = DenseBitSet::new_empty(inference.borrow_set.loans.len());
+        let escaped_lends = DenseBitSet::new_empty(inference.borrow_set.loans.len());
         overwrite_with_engine_facts(program.tcx, f, &ctxt, &mut inference, &copy_lends, None);
         let invalid_loans = invalid_loan_set(&inference);
         if invalid_loans.is_empty() {
@@ -717,6 +765,8 @@ where
         let inference = NativeInference {
             facts: inference,
             copy_lends,
+            escaped_lends,
+            escaped_presentations: FxHashMap::default(),
             localized_requires: None,
             all_only_closure: None,
             succ_points: None,
@@ -794,6 +844,7 @@ where
     K: Fn(LocalDefId) -> L,
     L: Fn(Local) -> bool,
 {
+    let escaped = SelectedCopyLendLoans::default();
     borrow_conflicts_replaying_with_flows_impl(
         program,
         flows,
@@ -802,6 +853,38 @@ where
         is_mutable,
         raw_fields,
         selected_copy_lends,
+        &escaped,
+        None,
+    )
+}
+
+pub(crate) fn borrow_conflicts_replaying_with_flows_and_copy_lends_and_escaped<I, J, M, N, K, L>(
+    program: &RustProgram,
+    flows: &OriginFlowResults,
+    is_ref: I,
+    is_raw: M,
+    is_mutable: K,
+    raw_fields: &[StructFieldSlot],
+    selected_copy_lends: &SelectedCopyLendLoans,
+    escaped_copy_lends: &SelectedCopyLendLoans,
+) -> FxHashMap<LocalDefId, Vec<ConflictEdge>>
+where
+    I: Fn(LocalDefId) -> J,
+    J: Fn(Local) -> bool,
+    M: Fn(LocalDefId) -> N,
+    N: Fn(Local) -> bool,
+    K: Fn(LocalDefId) -> L,
+    L: Fn(Local) -> bool,
+{
+    borrow_conflicts_replaying_with_flows_impl(
+        program,
+        flows,
+        is_ref,
+        is_raw,
+        is_mutable,
+        raw_fields,
+        selected_copy_lends,
+        escaped_copy_lends,
         None,
     )
 }
@@ -824,6 +907,7 @@ where
     K: Fn(LocalDefId) -> L,
     L: Fn(Local) -> bool,
 {
+    let escaped = SelectedCopyLendLoans::default();
     borrow_conflicts_replaying_with_flows_impl(
         program,
         flows,
@@ -832,6 +916,46 @@ where
         is_mutable,
         raw_fields,
         selected_copy_lends,
+        &escaped,
+        Some(parameter_overlaps),
+    )
+}
+
+pub(crate) fn borrow_conflicts_replaying_with_flows_and_parameter_overlap_and_escaped<
+    I,
+    J,
+    M,
+    N,
+    K,
+    L,
+>(
+    program: &RustProgram,
+    flows: &OriginFlowResults,
+    is_ref: I,
+    is_raw: M,
+    is_mutable: K,
+    raw_fields: &[StructFieldSlot],
+    selected_copy_lends: &SelectedCopyLendLoans,
+    escaped_copy_lends: &SelectedCopyLendLoans,
+    parameter_overlaps: &FxHashMap<LocalDefId, ParameterOverlap>,
+) -> FxHashMap<LocalDefId, Vec<ConflictEdge>>
+where
+    I: Fn(LocalDefId) -> J,
+    J: Fn(Local) -> bool,
+    M: Fn(LocalDefId) -> N,
+    N: Fn(Local) -> bool,
+    K: Fn(LocalDefId) -> L,
+    L: Fn(Local) -> bool,
+{
+    borrow_conflicts_replaying_with_flows_impl(
+        program,
+        flows,
+        is_ref,
+        is_raw,
+        is_mutable,
+        raw_fields,
+        selected_copy_lends,
+        escaped_copy_lends,
         Some(parameter_overlaps),
     )
 }
@@ -844,6 +968,7 @@ fn borrow_conflicts_replaying_with_flows_impl<I, J, M, N, K, L>(
     is_mutable: K,
     raw_fields: &[StructFieldSlot],
     selected_copy_lends: &SelectedCopyLendLoans,
+    escaped_copy_lends: &SelectedCopyLendLoans,
     parameter_overlaps: Option<&FxHashMap<LocalDefId, ParameterOverlap>>,
 ) -> FxHashMap<LocalDefId, Vec<ConflictEdge>>
 where
@@ -881,9 +1006,25 @@ where
         let is_ref_f = is_ref(f);
         let is_raw_f = is_raw(f);
         let copy_lends = selected_copy_lends.get(&f).unwrap_or(&no_copy_lends);
+        let escaped_copy_lends = escaped_copy_lends.get(&f).unwrap_or(&no_copy_lends);
+        let escaped_borrower_locals = escaped_copy_lends
+            .iter()
+            .map(|identity| match identity.borrower {
+                export::BorrowerKind::Assign {
+                    owner: export::OwnerKey::Local(local),
+                } => Local::from_u32(local),
+                other => panic!("② feeder borrower must be a local temp, got {other:?}"),
+            })
+            .collect::<FxHashSet<_>>();
+        assert_eq!(
+            escaped_borrower_locals.len(),
+            escaped_copy_lends.len(),
+            "② exemption identities must map one-to-one to temp borrowers"
+        );
 
         let edges = loop {
-            let mut inference = ctxt.infer(program.tcx, f, raw_fields, copy_lends);
+            let mut inference =
+                ctxt.infer(program.tcx, f, raw_fields, copy_lends, escaped_copy_lends);
             let parameter_conflicts = overwrite_with_engine_facts(
                 program.tcx,
                 f,
@@ -898,6 +1039,7 @@ where
                 .map(|(left, right)| ConflictEdge {
                     issuer: Some(ProvenanceOwner::Local(left)),
                     requirers: vec![ProvenanceOwner::Local(right)],
+                    esc_issuer_first: false,
                 })
                 .collect::<Vec<_>>();
             let invalid_loans = invalid_loan_set(&inference);
@@ -918,6 +1060,8 @@ where
 
             let to_demote: Vec<(Local, Local)> = {
                 let provenance_set = ctxt.borrow.provenances.get(&f).unwrap();
+                let exemptions = esc_minimal::demotion_exemptions_for(f, escaped_copy_lends);
+                assert_eq!(exemptions.len(), escaped_copy_lends.len());
                 let local_witnesses = collect_invalid_loan_demotions_forked(
                     &inference,
                     provenance_set,
@@ -925,6 +1069,7 @@ where
                 );
                 local_witnesses
                     .into_iter()
+                    .filter(|pair| !exemptions.contains(pair))
                     .filter(|(local, _base)| {
                         is_raw_f(*local) && provenance_set.local_data[*local].is_some()
                     })
@@ -963,12 +1108,16 @@ where
 
         // BB2-i stray-Raw inert-ness invariant (verbatim; release-active tripwire).
         let provenance_set = ctxt.borrow.provenances.get(&f).unwrap();
+        assert_escaped_conflicts_pre_demotion(edges.iter(), &is_ref_f, escaped_copy_lends.len());
         assert!(
             provenance_set
                 .local_data
                 .iter_enumerated()
                 .all(|(local, data)| {
                     if !(is_raw_f(local) && data.is_some()) {
+                        return true;
+                    }
+                    if escaped_borrower_locals.contains(&local) {
                         return true;
                     }
                     !edges.iter().any(|e| {
@@ -1031,6 +1180,37 @@ where
     K: Fn(LocalDefId) -> L,
     L: Fn(Local) -> bool,
 {
+    let escaped = SelectedCopyLendLoans::default();
+    borrow_conflicts_replaying_witnessed_with_copy_lends_and_escaped(
+        program,
+        flows,
+        is_ref,
+        is_raw,
+        is_mutable,
+        raw_fields,
+        selected_copy_lends,
+        &escaped,
+    )
+}
+
+pub(crate) fn borrow_conflicts_replaying_witnessed_with_copy_lends_and_escaped<I, J, M, N, K, L>(
+    program: &RustProgram,
+    flows: &OriginFlowResults,
+    is_ref: I,
+    is_raw: M,
+    is_mutable: K,
+    raw_fields: &[StructFieldSlot],
+    selected_copy_lends: &SelectedCopyLendLoans,
+    escaped_copy_lends: &SelectedCopyLendLoans,
+) -> FxHashMap<LocalDefId, Vec<WitnessedConflictEdge>>
+where
+    I: Fn(LocalDefId) -> J,
+    J: Fn(Local) -> bool,
+    M: Fn(LocalDefId) -> N,
+    N: Fn(Local) -> bool,
+    K: Fn(LocalDefId) -> L,
+    L: Fn(Local) -> bool,
+{
     let is_candidate = |did: LocalDefId| {
         let ref_f = is_ref(did);
         let raw_f = is_raw(did);
@@ -1049,9 +1229,25 @@ where
     for f in program.functions.iter().copied() {
         let is_raw_f = is_raw(f);
         let copy_lends = selected_copy_lends.get(&f).unwrap_or(&no_copy_lends);
+        let escaped_copy_lends = escaped_copy_lends.get(&f).unwrap_or(&no_copy_lends);
+        let escaped_borrower_locals = escaped_copy_lends
+            .iter()
+            .map(|identity| match identity.borrower {
+                export::BorrowerKind::Assign {
+                    owner: export::OwnerKey::Local(local),
+                } => Local::from_u32(local),
+                other => panic!("② feeder borrower must be a local temp, got {other:?}"),
+            })
+            .collect::<FxHashSet<_>>();
+        assert_eq!(
+            escaped_borrower_locals.len(),
+            escaped_copy_lends.len(),
+            "② exemption identities must map one-to-one to temp borrowers"
+        );
 
         let edges = loop {
-            let mut inference = ctxt.infer(program.tcx, f, raw_fields, copy_lends);
+            let mut inference =
+                ctxt.infer(program.tcx, f, raw_fields, copy_lends, escaped_copy_lends);
             let accesses = overwrite_with_engine_facts_capturing(
                 program.tcx,
                 f,
@@ -1078,6 +1274,8 @@ where
 
             let to_demote: Vec<(Local, Local)> = {
                 let provenance_set = ctxt.borrow.provenances.get(&f).unwrap();
+                let exemptions = esc_minimal::demotion_exemptions_for(f, escaped_copy_lends);
+                assert_eq!(exemptions.len(), escaped_copy_lends.len());
                 let local_witnesses = collect_invalid_loan_demotions_forked(
                     &inference,
                     provenance_set,
@@ -1085,6 +1283,7 @@ where
                 );
                 local_witnesses
                     .into_iter()
+                    .filter(|pair| !exemptions.contains(pair))
                     .filter(|(local, _base)| {
                         is_raw_f(*local) && provenance_set.local_data[*local].is_some()
                     })
@@ -1122,12 +1321,20 @@ where
         };
 
         let provenance_set = ctxt.borrow.provenances.get(&f).unwrap();
+        assert_escaped_conflicts_pre_demotion(
+            edges.iter().map(|witnessed| &witnessed.edge),
+            |local| !is_raw_f(local),
+            escaped_copy_lends.len(),
+        );
         assert!(
             provenance_set
                 .local_data
                 .iter_enumerated()
                 .all(|(local, data)| {
                     if !(is_raw_f(local) && data.is_some()) {
+                        return true;
+                    }
+                    if escaped_borrower_locals.contains(&local) {
                         return true;
                     }
                     !edges.iter().any(|witnessed| {

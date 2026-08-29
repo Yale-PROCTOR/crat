@@ -3639,8 +3639,11 @@ pub unsafe fn free_nested() {
     );
 }
 
+/// T2-W1: both endpoints of a move-shaped ownership chain are licensed as
+/// owning kinds, while the linear move keeps one runtime responsibility and
+/// the existing free-site policy emits exactly one `drop` at the C free site.
 #[test]
-fn test_rewriter_keeps_scalar_raw_malloc_when_only_alias_is_freed() {
+fn t2_move_chain_owns_both_slots_and_drops_once_at_free() {
     run_test(
         r#"
 extern "C" {
@@ -3648,18 +3651,45 @@ extern "C" {
     fn free(ptr: *mut core::ffi::c_void);
 }
 
-pub unsafe fn free_nested_alias() {
-    let p: *mut *mut i32 =
-        malloc(std::mem::size_of::<*mut i32>()) as *mut *mut i32;
+pub unsafe fn free_move_alias() {
+    let p: *mut i32 = malloc(std::mem::size_of::<i32>()) as *mut i32;
     let q = p;
     free(q as *mut core::ffi::c_void);
 }
 "#,
         &[
-            "malloc(std::mem::size_of::<*mut i32>())",
-            "free(q as *mut core::ffi::c_void",
+            "let mut p: Box<i32>",
+            "let mut q: Box<i32> = (Some(p)).unwrap()",
+            "drop(q)",
         ],
-        &["Box::into_raw(", "Box::from_raw("],
+        &[
+            "malloc(std::mem::size_of::<i32>())",
+            "free(q as *mut core::ffi::c_void",
+            "Box::into_raw(",
+            "Box::from_raw(",
+        ],
+    );
+}
+
+/// T2-W2 emission companion: model-level baseline identity may legitimately
+/// be `Ref`, but S2-2 still preserves the raw C free placement after T2
+/// retracts at an unknown-origin endpoint.
+#[test]
+fn t2_unknown_origin_retraction_preserves_raw_free_placement() {
+    run_test(
+        r#"
+extern "C" {
+    fn opaque() -> *mut i32;
+    fn free(ptr: *mut core::ffi::c_void);
+}
+
+pub unsafe fn release_unknown() {
+    let p = opaque();
+    free(p as *mut core::ffi::c_void);
+}
+"#,
+        &["free((p).as_deref_mut().map_or(std::ptr::null_mut"],
+        &["drop(p)", "Box::from_raw("],
     );
 }
 
@@ -10084,6 +10114,7 @@ mod borrow_ownership_coherence {
                 borrow_engine::{
                     borrow_conflicts_replaying_with_flows_and_copy_lends,
                     borrow_conflicts_replaying_witnessed_with_copy_lends,
+                    with_escaped_extension_trace,
                 },
                 borrow_verify::{
                     SlotConflict, materialize_guards, model_accepts, revalidate,
@@ -10096,10 +10127,11 @@ mod borrow_ownership_coherence {
                 construction::{
                     CopyLendMode, analyze_copy_lend_eligibility, construct_bo_into,
                     construct_bo_into_a16_refined, solve_bo_a5_config,
-                    verify_bo_construction_counting,
+                    solve_bo_a5_reference_reporting, verify_bo_construction_counting,
                 },
                 crate_slots::CrateSlots,
                 emit_crate_ownership_constraints, emit_crate_ownership_constraints_with_copy_lends,
+                esc_minimal::with_fixture_selection,
                 export::{LoanClass, location_key, with_bo_export},
                 mutability_facts::MutFacts,
                 origins::{collect_no_borrow_origin_slots, compute_origins},
@@ -10801,7 +10833,7 @@ pub unsafe fn leak() -> *mut *mut core::ffi::c_void {
                 // broken impl that ignored selectors could not pass.
                 assert_eq!(selectors.all().len(), 1);
                 assert_eq!(
-                    kind_solver.optimize().check(selectors.all()),
+                    kind_solver.check_with_assumptions(selectors.all()),
                     SatResult::Unsat,
                     "the source-owning constraint must make the single solve UNSAT"
                 );
@@ -10865,7 +10897,7 @@ pub unsafe fn two_allocs() -> *mut *mut core::ffi::c_void {
                 assert_eq!(selectors.sources().len(), 2);
                 assert_eq!(selectors.sinks().len(), 1);
                 assert_eq!(
-                    kind_solver.optimize().check(selectors.all()),
+                    kind_solver.check_with_assumptions(selectors.all()),
                     SatResult::Unsat
                 );
 
@@ -10978,17 +11010,17 @@ pub unsafe fn sink_side(a: *mut core::ffi::c_void) -> *mut core::ffi::c_void {
                 // individually satisfiable — a true either/or tie that
                 // phase-2 restoration cannot undo.
                 assert_eq!(
-                    kind_solver.optimize().check(&[s.clone(), k.clone()]),
+                    kind_solver.check_with_assumptions(&[s.clone(), k.clone()]),
                     SatResult::Unsat,
                     "mixed pair {{source, sink}} must be a genuine joint conflict"
                 );
                 assert_eq!(
-                    kind_solver.optimize().check(&[s.clone()]),
+                    kind_solver.check_with_assumptions(&[s.clone()]),
                     SatResult::Sat,
                     "the source alone must be satisfiable (m escapes via the return)"
                 );
                 assert_eq!(
-                    kind_solver.optimize().check(&[k.clone()]),
+                    kind_solver.check_with_assumptions(&[k.clone()]),
                     SatResult::Sat,
                     "the sink alone must be satisfiable (a's unit is voluntary)"
                 );
@@ -11136,8 +11168,7 @@ pub unsafe fn sink_side2(a2: *mut core::ffi::c_void) -> *mut core::ffi::c_void {
                 let k2 = selectors.sinks()[1].clone();
                 let check = |set: &[&z3::ast::Bool]| {
                     kind_solver
-                        .optimize()
-                        .check(&set.iter().map(|&b| b.clone()).collect::<Vec<_>>())
+                        .check_with_assumptions(&set.iter().map(|&b| b.clone()).collect::<Vec<_>>())
                 };
 
                 // The overlapping-core structure: the source ties with EACH
@@ -11265,8 +11296,7 @@ pub unsafe fn ctrl2(a: *mut core::ffi::c_void) {
                 let s2 = selectors.sources()[1].clone();
                 let check = |set: &[&z3::ast::Bool]| {
                     kind_solver
-                        .optimize()
-                        .check(&set.iter().map(|&b| b.clone()).collect::<Vec<_>>())
+                        .check_with_assumptions(&set.iter().map(|&b| b.clone()).collect::<Vec<_>>())
                 };
 
                 // THE PURE-SOURCE TIE PROOF: jointly infeasible, each alone SAT.
@@ -11375,17 +11405,23 @@ pub unsafe fn ctrl() {
                 // Tie proof, sink/sink: jointly infeasible, each side SAT,
                 // and the source allies with either free.
                 assert_eq!(
-                    kind_solver.optimize().check(&[k1.clone(), k2.clone()]),
+                    kind_solver.check_with_assumptions(&[k1.clone(), k2.clone()]),
                     SatResult::Unsat
                 );
-                assert_eq!(kind_solver.optimize().check(&[k1.clone()]), SatResult::Sat);
-                assert_eq!(kind_solver.optimize().check(&[k2.clone()]), SatResult::Sat);
                 assert_eq!(
-                    kind_solver.optimize().check(&[s.clone(), k1.clone()]),
+                    kind_solver.check_with_assumptions(&[k1.clone()]),
                     SatResult::Sat
                 );
                 assert_eq!(
-                    kind_solver.optimize().check(&[s.clone(), k2.clone()]),
+                    kind_solver.check_with_assumptions(&[k2.clone()]),
+                    SatResult::Sat
+                );
+                assert_eq!(
+                    kind_solver.check_with_assumptions(&[s.clone(), k1.clone()]),
+                    SatResult::Sat
+                );
+                assert_eq!(
+                    kind_solver.check_with_assumptions(&[s.clone(), k2.clone()]),
                     SatResult::Sat
                 );
 
@@ -12633,9 +12669,7 @@ unsafe fn f(mut p: *mut i32) -> i32 {
     // `⋁¬ref(live requirers)`; the issuer stays in the menu only when no such requirer exists.
     // (This RESTRICTS the commit menu — it adds no new assertion kind, so §3 invariant 7 holds.)
 
-    /// §NB4-4a helper — solve `f` to fixpoint under fact-driven mutability; return each named
-    /// local's depth-0 accepted kind + its Foster mutability.
-    /// §ESC-W1 — **KNOWN GAP, pinned.** The save/caller escape shape:
+    /// §ESC-W1 — ②-minimal pin transition. The save/caller escape shape:
     ///
     /// ```ignore
     /// unsafe fn save(out: *mut *mut i32, x: *mut i32) { *out = x; *x = 1; }
@@ -12648,17 +12682,12 @@ unsafe fn f(mut p: *mut i32) -> i32 {
     /// into `*out` cannot then be used at `*x = 1`, and reborrowing to fix that shortens the
     /// lifetime below the caller's read. **The required verdict is therefore `x = Raw`.**
     ///
-    /// The analysis settles `x = Ref` (and `out = Ref`, and the caller's `slot = Ref`). This test
-    /// pins that CURRENT behaviour rather than the required one, so the gap is a recorded fact
-    /// instead of a standing red — and so that any change which closes it fails here loudly and
-    /// gets to claim the credit.
-    ///
-    /// Measured non-sensitivity (2026-08-26): forcing the caller's `slot` Raw with pointer
-    /// arithmetic, removing the post-store write, and removing the escape each leave `out`/`x` at
-    /// `Ref`. So this is not a near-miss — no guard engages at all. The
-    /// placeholder-always-live arm (`CRAT_BO_PLACEHOLDER_LIVE`) does not move it either.
+    /// The ②-minimal selected feeder loan is extended through exit in the first replay. Addendum
+    /// 61 repairs that class through its presented source issuer. The next round must therefore
+    /// carry zero selected loans—the source is no longer Ref—and settle `x = Raw`; persistence is
+    /// a release-active convergence failure in the replay engine.
     #[test]
-    fn escw1_escape_shape_x_stays_ref_known_gap() {
+    fn escw1_escape_shape_demotes_x_raw() {
         const CODE: &str = r#"
 unsafe fn save(out: *mut *mut i32, x: *mut i32) { *out = x; *x = 1; }
 unsafe fn caller() -> i32 {
@@ -12670,20 +12699,215 @@ unsafe fn caller() -> i32 {
 "#;
         run_compiler(CODE, |tcx| {
             let program = collect_program(tcx);
-            let m = nb4_accept(tcx, &program, "save", &["out", "x"]);
-            assert_eq!(
-                (m[0].0, m[1].0),
-                (Some(SlotKind::Ref), Some(SlotKind::Ref)),
-                "ESC-W1 pins the KNOWN GAP: `x` should be Raw (no valid all-refs typing, UB-free \
-                 input) but settles Ref. If this fails, the gap moved — read \
-                 docs/agents/tasks/2026-08-25-hlz-port-exploration.md §12 before re-pinning."
+            let slots = CrateSlots::build(&program);
+            let origins = compute_origins(&program);
+            let facts = MutFacts::from_program(&program);
+            let solver = KindSolver::new(&slots);
+            let (((model, stats), export), extensions, selected_sites) = with_fixture_selection(
+                || {
+                    let construction = construct_bo_into(
+                        &program,
+                        &slots,
+                        &origins,
+                        &facts,
+                        &solver,
+                        CopyLendMode::Baseline,
+                    )
+                    .expect("ESC-W1 shared construction");
+                    let selected_sites = construction.esc_minimal.sites.len();
+                    assert_eq!(
+                        construction.esc_minimal.cross_stage_counts(),
+                        (1, 1, 1, 1),
+                        "one effective selection must feed selection, exemption, extension, and receipt"
+                    );
+                    let (((model, stats), export), extensions) =
+                        with_escaped_extension_trace(|| {
+                            with_bo_export(|| {
+                                verify_bo_construction_counting(
+                                    &program,
+                                    &slots,
+                                    &origins,
+                                    &solver,
+                                    &construction,
+                                    &facts,
+                                )
+                            })
+                        });
+                    (((model, stats), export), extensions, selected_sites)
+                },
             );
-            let c = nb4_accept(tcx, &program, "caller", &["slot"]);
+            assert_eq!(selected_sites, 1, "ESC-W1 selects one exact N4 site");
             assert_eq!(
-                c[0].0,
-                Some(SlotKind::Ref),
-                "the caller's escaped pointer is Ref as well"
+                stats.copy_lend_replay_selections, 0,
+                "the post-demotion validation round must remove the selected loan"
             );
+            assert!(!extensions.is_empty(), "escaped loan was not extended");
+            let copy_lends = export
+                .loans
+                .iter()
+                .filter(|loan| loan.class == LoanClass::CopyLend)
+                .collect::<Vec<_>>();
+            assert!(
+                copy_lends.is_empty(),
+                "the accepted final round must contain no selected CopyLend loan"
+            );
+            let model = model.expect("ESC-W1 accepts after conservative repair");
+            let save = function_by_name(&program, "save");
+            let x = local_by_var_name(tcx, save, "x");
+            let x = local_slot(&slots, save, x, 0);
+            assert_eq!(
+                model.get(&x).copied(),
+                Some(SlotKind::Raw),
+                "②-minimal must keep the selected escaped copy loan live through exit so the \
+                 post-store write demotes save::x"
+            );
+        });
+    }
+
+    /// §39 addendum 65 R-a — brotli's param-deref FIELD destination shape.
+    /// The selected escape row may discharge only by demoting its presented
+    /// source issuer. A Raw destination field is a legal mixed-emission
+    /// channel: it remains receipt evidence, never a guard/repair party.
+    #[test]
+    fn escw2_field_store_escape_demotes_source_and_leaves_destination_raw() {
+        const CODE: &str = r#"
+struct Holder { p: *mut i32 }
+unsafe extern "C" { fn opaque() -> *mut i32; }
+unsafe fn save(out: *mut Holder, x: *mut i32) {
+    (*out).p = opaque();
+    (*out).p = x;
+    *x = 1;
+}
+unsafe fn caller() -> i32 {
+    let mut cell = 0i32;
+    let mut holder = Holder { p: core::ptr::null_mut() };
+    save(&raw mut holder, &raw mut cell);
+    *holder.p
+}
+"#;
+        run_compiler(CODE, |tcx| {
+            let program = collect_program(tcx);
+            let slots = CrateSlots::build(&program);
+            let origins = compute_origins(&program);
+            let facts = MutFacts::from_program(&program);
+            let save = function_by_name(&program, "save");
+            let x = local_by_var_name(tcx, save, "x");
+            let x = local_slot(&slots, save, x, 0);
+            let holder = struct_by_name(&program, "Holder");
+            let field = slots
+                .field_slots
+                .slot_for_field_depth(
+                    StructFieldSlot {
+                        struct_did: holder,
+                        field_index: 0,
+                    },
+                    0,
+                )
+                .expect("Holder::p depth-0 slot");
+            let field = SlotRef::Field(field);
+
+            let baseline_solver = KindSolver::new(&slots);
+            let baseline_construction = construct_bo_into(
+                &program,
+                &slots,
+                &origins,
+                &facts,
+                &baseline_solver,
+                CopyLendMode::Baseline,
+            )
+            .expect("field-store baseline construction");
+            assert!(baseline_construction.esc_minimal.sites.is_empty());
+            let (baseline, _) = verify_bo_construction_counting(
+                &program,
+                &slots,
+                &origins,
+                &baseline_solver,
+                &baseline_construction,
+                &facts,
+            );
+            let baseline = baseline.expect("field-store baseline accepts");
+            assert_eq!(baseline.get(&x), Some(&SlotKind::Ref));
+            assert_eq!(baseline.get(&field), Some(&SlotKind::Raw));
+
+            let selected_solver = KindSolver::new(&slots);
+            let (((selected, stats), extensions), selected_site) = with_fixture_selection(|| {
+                let construction = construct_bo_into(
+                    &program,
+                    &slots,
+                    &origins,
+                    &facts,
+                    &selected_solver,
+                    CopyLendMode::Baseline,
+                )
+                .expect("field-store selected construction");
+                let selected_site = construction
+                    .esc_minimal
+                    .sites
+                    .first()
+                    .map(|site| (construction.esc_minimal.sites.len(), site.lhs));
+                let ((model, stats), extensions) = with_escaped_extension_trace(|| {
+                    verify_bo_construction_counting(
+                        &program,
+                        &slots,
+                        &origins,
+                        &selected_solver,
+                        &construction,
+                        &facts,
+                    )
+                });
+                (((model, stats), extensions), selected_site)
+            });
+            assert_eq!(
+                selected_site,
+                Some((1, field)),
+                "the destination field remains explicit receipt metadata"
+            );
+            assert!(!extensions.is_empty(), "selected field loan reaches exit");
+            assert_eq!(stats.copy_lend_replay_selections, 0);
+            let selected = selected.expect("issuer-only field-store repair accepts");
+            assert_eq!(selected.get(&x), Some(&SlotKind::Raw));
+            assert_eq!(
+                selected.get(&field),
+                baseline.get(&field),
+                "the Raw destination field is receipt-only and remains untouched"
+            );
+        });
+    }
+
+    /// §39 addendum 65 R-b — the A5 reference solve is the c080 comparison
+    /// layer. Even inside a fixture-selection scope it must not consume ②;
+    /// only the subsequent candidate construction may do so.
+    #[test]
+    fn a5_baseline_reference_does_not_consume_esc_selection() {
+        const CODE: &str = r#"
+unsafe fn save(out: *mut *mut i32, x: *mut i32) { *out = x; *x = 1; }
+unsafe fn caller() -> i32 {
+    let mut cell = 0i32;
+    let mut slot: *mut i32 = core::ptr::null_mut();
+    save(&raw mut slot, &raw mut cell);
+    *slot
+}
+"#;
+        run_compiler(CODE, |tcx| {
+            let program = collect_program(tcx);
+            let slots = CrateSlots::build(&program);
+            let origins = compute_origins(&program);
+            let facts = MutFacts::from_program(&program);
+            let verified = with_fixture_selection(|| {
+                solve_bo_a5_reference_reporting(
+                    &program,
+                    &slots,
+                    &origins,
+                    &facts,
+                    Some(WholeProgramAttestation::FrozenBenchmarkGraph),
+                )
+                .expect("A5 reference solve must accept")
+            });
+            let save = function_by_name(&program, "save");
+            let x = local_by_var_name(tcx, save, "x");
+            let x = local_slot(&slots, save, x, 0);
+            assert_eq!(verified.model.get(&x), Some(&SlotKind::Ref));
+            assert_eq!(verified.round_stats.copy_lend_replay_selections, 0);
         });
     }
 
@@ -16945,6 +17169,7 @@ pub unsafe fn f() -> i32 {
                     &construction.selectors,
                     &facts,
                     Some(&construction.eligibility.pairs),
+                    None,
                 );
                 assert_eq!(stats.copy_lend_replay_selections, 1);
                 let model = model.expect("L2 must accept the dead-before-free CopyLend");

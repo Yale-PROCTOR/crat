@@ -55,10 +55,14 @@ mod copy_lend_funnel;
 mod kind_equate_core_census;
 #[path = "p_b_measurement.rs"]
 mod p_b_measurement;
+#[path = "phase2_t2_esc_measurement.rs"]
+mod phase2_t2_esc_measurement;
 #[path = "promote_failure_measurement.rs"]
 mod promote_failure_measurement;
 #[path = "s23_measurement.rs"]
 mod s23_measurement;
+#[path = "t1_origin_caller_probe.rs"]
+mod t1_origin_caller_probe;
 
 /// Copy of tests.rs `borrow_ownership_coherence::collect_program` (kept local so
 /// tests.rs stays untouched): every top-level fn/struct item, in HIR owner order.
@@ -4344,7 +4348,8 @@ mod run {
                 constrain_field_ownership, field_ownership_candidates, selected_copy_lend_sites,
             },
             construction::{
-                A2Mode, BoConstruction, CopyLendMode, construct_bo_into, solve_bo_a5_config,
+                A2Mode, BoConstruction, CopyLendMode, construct_bo_into,
+                solve_bo_a5_config_reporting, solve_bo_a5_reference_reporting,
                 verify_bo_construction_counting, verify_bo_construction_with_flows,
             },
             crate_slots::CrateSlots,
@@ -6017,6 +6022,12 @@ mod run {
         let t0 = Instant::now();
         let mut row = Row::default();
         row.set("t_tcx_s", secs(t_tcx));
+        let baseline_only = match std::env::var("CRAT_PHASE2_BASELINE_ONLY") {
+            Err(std::env::VarError::NotPresent) => false,
+            Ok(value) if value == "1" => true,
+            Ok(value) => panic!("CRAT_PHASE2_BASELINE_ONLY must be absent or 1, got {value:?}"),
+            Err(error) => panic!("CRAT_PHASE2_BASELINE_ONLY is not valid Unicode: {error}"),
+        };
         let mode = A5Mode::PreciseReplay;
         let a16_refined = true;
         let soundness_mode = "a14_a16_refined";
@@ -6032,6 +6043,7 @@ mod run {
         row.set("copy_lend_mode", CopyLendMode::Baseline.label());
         row.set("a2_mode", A2Mode::Off.label());
         row.set("soundness_mode", soundness_mode);
+        row.set("phase2_baseline_only", baseline_only);
         row.set("z3_full_version", z3::full_version().to_string());
         let official_evaluation = std::path::PathBuf::from(
             std::env::var_os("CRAT_A5_OFFICIAL_EVALUATION")
@@ -6056,17 +6068,80 @@ mod run {
         let slots = CrateSlots::build(&program);
         let origins = compute_origins(&program);
         let mut_facts = MutFacts::from_program(&program);
-        let Some(verified) = solve_bo_a5_config(
-            &program,
-            &slots,
-            &origins,
-            &mut_facts,
-            mode,
-            Some(WholeProgramAttestation::FrozenBenchmarkGraph),
-        ) else {
-            row.set("status", "decline");
-            row.set("t_total_s", secs(t0.elapsed()));
-            return row;
+        let solve = || {
+            if baseline_only {
+                solve_bo_a5_reference_reporting(
+                    &program,
+                    &slots,
+                    &origins,
+                    &mut_facts,
+                    Some(WholeProgramAttestation::FrozenBenchmarkGraph),
+                )
+            } else {
+                solve_bo_a5_config_reporting(
+                    &program,
+                    &slots,
+                    &origins,
+                    &mut_facts,
+                    mode,
+                    Some(WholeProgramAttestation::FrozenBenchmarkGraph),
+                )
+            }
+        };
+        let phase2_capture =
+            !baseline_only && std::env::var_os("CRAT_PHASE2_T2_ESC_CAPTURE").is_some();
+        let (verified, t2_capture) = if phase2_capture {
+            let ((verified, trace), export) =
+                crate::analyses::borrow_ownership::export::with_bo_export(|| {
+                    crate::analyses::borrow_ownership::solver::with_selector_trace(&solve)
+                });
+            (verified, Some((trace, export)))
+        } else {
+            (solve(), None)
+        };
+        let verified = match verified {
+            Ok(verified) => verified,
+            Err(decline) => {
+                row.set("status", "decline");
+                row.set("decline_reason", decline.reason().label());
+                row.set("decline_detail", decline.detail().unwrap_or("-"));
+                row.set("t_total_s", secs(t0.elapsed()));
+                if phase2_capture {
+                    let detail = decline
+                        .detail()
+                        .unwrap_or("-")
+                        .replace(['\t', '\n', '\r'], " ");
+                    let artifact_dir = std::env::var_os("CRAT_A5_BATCH_SHARD_DIR")
+                        .map(std::path::PathBuf::from)
+                        .expect("A5 batch requires CRAT_A5_BATCH_SHARD_DIR");
+                    std::fs::create_dir_all(&artifact_dir)
+                        .expect("create A5 pre-ledger decline artifact dir");
+                    std::fs::write(
+                        artifact_dir.join("preledger-decline.tsv"),
+                        format!("reason\tdetail\n{}\t{}\n", decline.reason().label(), detail,),
+                    )
+                    .expect("write A5 pre-ledger decline artifact");
+                    let mut field_slots =
+                        String::from("slot_id\tstruct_path\tfield_index\tdepth\n");
+                    for index in 0..slots.field_slots.len() {
+                        let slot_id = SlotId::from_usize(index);
+                        let slot = slots.field_slots.slot(slot_id);
+                        let SlotOwner::Field(field) = slot.owner else {
+                            panic!("global field universe contains a local owner")
+                        };
+                        field_slots.push_str(&format!(
+                            "{}\t{}\t{}\t{}\n",
+                            index,
+                            tcx.def_path_str(field.struct_did.to_def_id()),
+                            field.field_index,
+                            slot.depth,
+                        ));
+                    }
+                    std::fs::write(artifact_dir.join("preledger-field-slots.tsv"), field_slots)
+                        .expect("write A5 pre-ledger field-slot map");
+                }
+                return row;
+            }
         };
         for stamp in [
             format!("a5_mode={}\n", mode.label()),
@@ -6163,11 +6238,27 @@ mod run {
         row.set("s23_owning_model", owning_fields);
         row.set("rounds", verified.round_stats.rounds);
         row.set("commits_conflict", verified.round_stats.commits_conflict);
+        row.set(
+            "copy_lend_replay_selections",
+            verified.round_stats.copy_lend_replay_selections,
+        );
         row.set("check_sat_count", verified.check_sat_count);
         row.set("hard_check_count", verified.hard_check_count);
         row.set(
             "optimize_materialization_count",
             verified.optimize_materialization_count,
+        );
+        row.set(
+            "lazy_plain_hard_check_count",
+            verified.lazy_plain_hard_check_count,
+        );
+        row.set(
+            "lazy_tracked_recheck_count",
+            verified.lazy_tracked_recheck_count,
+        );
+        row.set(
+            "lazy_plain_materialization_count",
+            verified.lazy_plain_materialization_count,
         );
         row.set("t_hard_check_s", secs(verified.hard_check_elapsed));
         row.set(
@@ -6271,6 +6362,19 @@ mod run {
             format!("variant\towner\tslot\tkind\n{}", model_rows.concat()),
         )
         .expect("write A5 model artifact");
+
+        if let Some((trace, export)) = t2_capture {
+            super::phase2_t2_esc_measurement::write_worker_artifacts(
+                tcx,
+                &program,
+                &slots,
+                &verified,
+                &trace,
+                &export,
+                &artifact_dir,
+                &mut row,
+            );
+        }
 
         if mode == A5Mode::PreciseReplay {
             let name = std::env::var("CRAT_BOC1_NAME").expect("A5 batch program name");
@@ -7137,12 +7241,12 @@ mod run {
         // tracked solver the hard constraints would be disabled and the reply
         // would be a bogus "sat-in-replay".
         assert!(
-            solver.tracker().is_none(),
-            "tracked KindSolver must not enter decline_reason (constraints are track-gated)"
+            !solver.is_diagnostic_tracked(),
+            "diagnostic-tracked KindSolver must not enter decline_reason"
         );
         let mut assumptions: Vec<Bool> = selectors.all().to_vec();
         loop {
-            match solver.optimize().check(&assumptions) {
+            match solver.check_with_assumptions(&assumptions) {
                 // Should not happen (relaxing declined); a nondeterministic
                 // Unknown->Sat flip lands here rather than lying.
                 SatResult::Sat => return "sat-in-replay",
@@ -14581,6 +14685,7 @@ fn boc1_run_one() {
             | "kind-equate-core"
             | "s23-discover"
             | "s23-probe"
+            | "t1-origin-caller"
     ) || mode.starts_with("selector-detail-")
     {
         z3::set_global_param("smt.random_seed", "0");
@@ -14776,6 +14881,8 @@ fn boc1_run_one() {
             "kind-equate-core" => kind_equate_core_census::run_worker(tcx, t_tcx),
             "s23-discover" => s23_measurement::run_discovery_worker(tcx, t_tcx),
             "s23-probe" => s23_measurement::run_probe_worker(tcx, t_tcx),
+            "t1-origin-caller" => t1_origin_caller_probe::run_worker(tcx, t_tcx),
+            "t1-characterize" => t1_origin_caller_probe::run_characterization_worker(tcx, t_tcx),
             "selector-core" => run::run_selector_core(tcx, t_tcx),
             "selector-necessity" => run::run_selector_necessity(tcx, t_tcx),
             detail if detail.starts_with("selector-detail-") => {

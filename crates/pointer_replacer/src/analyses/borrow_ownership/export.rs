@@ -390,10 +390,50 @@ pub(crate) struct VersionSite {
 // §4 E-R3 — selector provenance
 // ---------------------------------------------------------------------------
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub(crate) enum BoundaryRole {
     Source,
     Sink,
+}
+
+/// Stable runtime identity of one T2 endpoint assertion. Artifact writers
+/// render `fn_did` through `TyCtxt::def_path_str`; the in-process key keeps the
+/// typed MIR/function identities used by construction.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct T2AssertKey {
+    pub(crate) fn_did: LocalDefId,
+    pub(crate) function_path: String,
+    pub(crate) location: MirLocationKey,
+    pub(crate) callee: String,
+    pub(crate) role: BoundaryRole,
+    pub(crate) var: Var,
+}
+
+impl T2AssertKey {
+    pub(crate) fn sort_key(&self) -> (&str, MirLocationKey, &str, BoundaryRole, u32) {
+        (
+            self.function_path.as_str(),
+            self.location,
+            self.callee.as_str(),
+            self.role,
+            self.var.as_u32(),
+        )
+    }
+
+    pub(crate) fn label(&self) -> String {
+        let role = match self.role {
+            BoundaryRole::Source => "source",
+            BoundaryRole::Sink => "sink",
+        };
+        format!(
+            "t2-assert[{role}]({}:{}:{}:{},{:?})",
+            self.function_path,
+            self.location.block,
+            self.location.statement_index,
+            self.callee,
+            self.var,
+        )
+    }
 }
 
 /// The allocation or free call site behind one retractable selector.
@@ -413,6 +453,7 @@ pub(crate) struct SelectorSite {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct CallSite {
     pub fn_did: LocalDefId,
+    pub function_path: String,
     pub location: MirLocationKey,
     pub callee: String,
 }
@@ -669,7 +710,7 @@ pub(crate) fn record(f: impl FnOnce(&mut BoExport)) {
 // `infer::with_own_assume_site`.
 
 thread_local! {
-    static LOCATION_CURSOR: RefCell<Option<(LocalDefId, MirLocationKey)>> =
+    static LOCATION_CURSOR: RefCell<Option<(LocalDefId, String, MirLocationKey)>> =
         const { RefCell::new(None) };
     static CALLEE_CURSOR: RefCell<Option<String>> = const { RefCell::new(None) };
 }
@@ -677,28 +718,24 @@ thread_local! {
 /// Set the `(fn_did, location)` half for the duration of `f`.
 pub(crate) fn with_terminator_site<T>(
     fn_did: LocalDefId,
+    function_path: String,
     location: Location,
     f: impl FnOnce() -> T,
 ) -> T {
-    if !capturing() {
-        return f();
-    }
-    struct Restore(Option<(LocalDefId, MirLocationKey)>);
+    struct Restore(Option<(LocalDefId, String, MirLocationKey)>);
     impl Drop for Restore {
         fn drop(&mut self) {
             LOCATION_CURSOR.with(|c| *c.borrow_mut() = self.0.take());
         }
     }
-    let _restore =
-        Restore(LOCATION_CURSOR.with(|c| c.replace(Some((fn_did, location_key(location))))));
+    let _restore = Restore(
+        LOCATION_CURSOR.with(|c| c.replace(Some((fn_did, function_path, location_key(location))))),
+    );
     f()
 }
 
 /// Set the callee-name half for the duration of `f`.
 pub(crate) fn with_callee<T>(callee: &str, f: impl FnOnce() -> T) -> T {
-    if !capturing() {
-        return f();
-    }
     struct Restore(Option<String>);
     impl Drop for Restore {
         fn drop(&mut self) {
@@ -712,13 +749,31 @@ pub(crate) fn with_callee<T>(callee: &str, f: impl FnOnce() -> T) -> T {
 /// Join both halves. `None` when either is missing — recorded as unknown rather
 /// than guessed.
 pub(crate) fn current_call_site() -> Option<CallSite> {
-    let (fn_did, location) = LOCATION_CURSOR.with(|c| *c.borrow())?;
+    let (fn_did, function_path, location) = LOCATION_CURSOR.with(|c| c.borrow().clone())?;
     let callee = CALLEE_CURSOR.with(|c| c.borrow().clone())?;
     Some(CallSite {
         fn_did,
+        function_path,
         location,
         callee,
     })
+}
+
+/// Join the always-scoped call cursor into the key used by T2 construction.
+/// Unlike `record_selector`, this is normative construction input and
+/// therefore remains available when export capture is off.
+pub(crate) fn current_t2_assert_key(role: BoundaryRole, var: Var) -> T2AssertKey {
+    let call = current_call_site().unwrap_or_else(|| {
+        panic!("T2 endpoint assertion emitted outside a modeled call-site cursor")
+    });
+    T2AssertKey {
+        fn_did: call.fn_did,
+        function_path: call.function_path,
+        location: call.location,
+        callee: call.callee,
+        role,
+        var,
+    }
 }
 
 /// Record one retractable selector at its push site (E-R3).

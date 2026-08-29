@@ -51,6 +51,7 @@ pub(crate) struct CoreTracker {
     entries: RefCell<Vec<(Bool, String)>>,
     context: RefCell<String>,
     granularity: CoreTrackingGranularity,
+    purpose: CoreTrackingPurpose,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -59,12 +60,28 @@ enum CoreTrackingGranularity {
     Family,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CoreTrackingPurpose {
+    ProductionMandatory,
+    Diagnostic,
+}
+
 impl CoreTracker {
     fn new() -> Self {
         CoreTracker {
             entries: RefCell::new(Vec::new()),
             context: RefCell::new(String::from("init")),
             granularity: CoreTrackingGranularity::Assertion,
+            purpose: CoreTrackingPurpose::Diagnostic,
+        }
+    }
+
+    fn new_mandatory() -> Self {
+        CoreTracker {
+            entries: RefCell::new(Vec::new()),
+            context: RefCell::new(String::from("init")),
+            granularity: CoreTrackingGranularity::Assertion,
+            purpose: CoreTrackingPurpose::ProductionMandatory,
         }
     }
 
@@ -73,7 +90,12 @@ impl CoreTracker {
             entries: RefCell::new(Vec::new()),
             context: RefCell::new(String::from("init")),
             granularity: CoreTrackingGranularity::Family,
+            purpose: CoreTrackingPurpose::Diagnostic,
         }
+    }
+
+    fn is_mandatory(&self) -> bool {
+        self.purpose == CoreTrackingPurpose::ProductionMandatory
     }
 
     /// Set the provenance context (e.g. the fn being emitted, or the
@@ -137,6 +159,14 @@ impl CoreTracker {
             .iter()
             .map(|(track, _)| track.clone())
             .collect()
+    }
+
+    fn len(&self) -> usize {
+        self.entries.borrow().len()
+    }
+
+    fn truncate(&self, len: usize) {
+        self.entries.borrow_mut().truncate(len);
     }
 
     #[cfg(test)]
@@ -238,6 +268,51 @@ thread_local! {
 }
 
 #[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AssumptionCheckPhase {
+    Hard,
+    Optimize,
+    OptimizeMaterialization,
+}
+
+#[cfg(test)]
+#[derive(Clone, Debug)]
+pub(crate) struct AssumptionCheckEvent {
+    pub(crate) phase: AssumptionCheckPhase,
+    pub(crate) explicit: Vec<Bool>,
+    pub(crate) bundle: Vec<Bool>,
+    pub(crate) labels: Vec<String>,
+    pub(crate) outcome: SatResult,
+}
+
+#[cfg(test)]
+thread_local! {
+    static ASSUMPTION_CHECK_CAPTURE: RefCell<Option<Vec<AssumptionCheckEvent>>> =
+        const { RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn with_assumption_check_trace<T>(
+    f: impl FnOnce() -> T,
+) -> (T, Vec<AssumptionCheckEvent>) {
+    struct Restore(Option<Vec<AssumptionCheckEvent>>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            ASSUMPTION_CHECK_CAPTURE.with(|capture| {
+                *capture.borrow_mut() = self.0.take();
+            });
+        }
+    }
+    let _restore =
+        Restore(ASSUMPTION_CHECK_CAPTURE.with(|capture| capture.replace(Some(Vec::new()))));
+    let output = f();
+    let events = ASSUMPTION_CHECK_CAPTURE
+        .with(|capture| capture.borrow_mut().take())
+        .unwrap_or_default();
+    (output, events)
+}
+
+#[cfg(test)]
 pub(crate) fn with_own_assume_site<T>(site: OwnAssumeSite, f: impl FnOnce() -> T) -> T {
     struct Restore(OwnAssumeSite);
     impl Drop for Restore {
@@ -286,6 +361,10 @@ pub(crate) struct SelectorTraceEvent {
     pub selector_index: usize,
     pub active_before: Vec<usize>,
     pub core_selectors: Vec<usize>,
+    /// Canonical diagnostic labels for every typed assumption in this core.
+    /// T2 fills this with endpoint and mandatory-track labels; legacy paths
+    /// leave it empty.
+    pub core_labels: Vec<String>,
     pub outcome: SelectorTraceOutcome,
 }
 
@@ -337,13 +416,20 @@ pub struct KindSolver {
     check_sat_count: Cell<usize>,
     hard_check_count: Cell<usize>,
     optimize_materialization_count: Cell<usize>,
+    lazy_plain_hard_check_count: Cell<usize>,
+    lazy_tracked_recheck_count: Cell<usize>,
+    lazy_plain_materialization_count: Cell<usize>,
     hard_check_elapsed: Cell<Duration>,
     optimize_materialization_elapsed: Cell<Duration>,
+    mandatory_scope_lengths: RefCell<Vec<usize>>,
+    round_model_failure: RefCell<Option<RoundModelFailure>>,
 }
 
 /// R1a's private hard-query backend. It snapshots only `Optimize`'s hard
 /// assertions; soft preferences remain owned by `KindSolver::solver` and are
-/// consulted only by `optimized_model_under`.
+/// consulted only by `optimized_model_under`. LIC Phase 2 activates each
+/// candidate assumption set as temporary plain-hard assertions first and pays
+/// for a tracked assumption recheck only when that first check is UNSAT.
 pub(crate) struct HardLoopSolver {
     solver: Solver,
     synced_assertions: Cell<usize>,
@@ -381,6 +467,55 @@ enum HardRelaxResult {
     Unknown,
 }
 
+/// Observation-only first failure from the decomposed round-model path.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum RoundModelFailure {
+    HardUnsat {
+        active_t2: usize,
+        core_labels: Vec<String>,
+    },
+    HardUnknown {
+        active_t2: usize,
+        reason: String,
+    },
+    OptimizeUnsat {
+        active_t2: usize,
+    },
+    OptimizeUnknown {
+        active_t2: usize,
+        reason: String,
+    },
+    OptimizeMissingModel {
+        active_t2: usize,
+    },
+}
+
+impl RoundModelFailure {
+    pub(crate) fn summary(&self) -> String {
+        match self {
+            Self::HardUnsat {
+                active_t2,
+                core_labels,
+            } => format!(
+                "hard-unsat active_t2={active_t2} core_labels={}",
+                core_labels.join(" | ")
+            ),
+            Self::HardUnknown { active_t2, reason } => {
+                format!("hard-unknown active_t2={active_t2} reason={reason}")
+            }
+            Self::OptimizeUnsat { active_t2 } => {
+                format!("optimize-unsat active_t2={active_t2}")
+            }
+            Self::OptimizeUnknown { active_t2, reason } => {
+                format!("optimize-unknown active_t2={active_t2} reason={reason}")
+            }
+            Self::OptimizeMissingModel { active_t2 } => {
+                format!("optimize-missing-model active_t2={active_t2}")
+            }
+        }
+    }
+}
+
 impl RelaxedSelectors {
     pub(crate) fn dropped(&self) -> &[Bool] {
         &self.dropped
@@ -389,7 +524,7 @@ impl RelaxedSelectors {
 
 impl KindSolver {
     pub fn new(slots: &CrateSlots) -> Self {
-        Self::build(slots, None, true)
+        Self::build(slots, Some(CoreTracker::new_mandatory()), true)
     }
 
     /// §NB-R diagnostic constructor: every hard constraint is track-gated.
@@ -412,7 +547,7 @@ impl KindSolver {
     /// objective.
     #[cfg(test)]
     pub(crate) fn new_hard_only(slots: &CrateSlots) -> Self {
-        Self::build(slots, None, false)
+        Self::build(slots, Some(CoreTracker::new_mandatory()), false)
     }
 
     /// Family-core twin of [`Self::new_hard_only`].
@@ -423,6 +558,77 @@ impl KindSolver {
 
     pub(crate) fn tracker(&self) -> Option<&CoreTracker> {
         self.tracker.as_ref()
+    }
+
+    pub(crate) fn is_diagnostic_tracked(&self) -> bool {
+        self.tracker
+            .as_ref()
+            .is_some_and(|tracker| !tracker.is_mandatory())
+    }
+
+    fn mandatory_tracks(&self) -> Vec<Bool> {
+        self.tracker
+            .as_ref()
+            .filter(|tracker| tracker.is_mandatory())
+            .map(CoreTracker::tracks)
+            .unwrap_or_default()
+    }
+
+    fn assumption_bundle(&self, assumptions: &[Bool]) -> Vec<Bool> {
+        let mut bundle = self.mandatory_tracks();
+        bundle.extend_from_slice(assumptions);
+        bundle
+    }
+
+    fn core_labels(&self, selectors: &Selectors, core: &[Bool]) -> Vec<String> {
+        let mut labels = core
+            .iter()
+            .filter_map(|literal| {
+                selectors
+                    .index_of(literal)
+                    .map(|index| selectors.keys[index].label())
+                    .or_else(|| {
+                        self.tracker
+                            .as_ref()
+                            .and_then(|tracker| tracker.label_of(literal))
+                    })
+            })
+            .collect::<Vec<_>>();
+        labels.sort();
+        labels.dedup();
+        labels
+    }
+
+    #[cfg(test)]
+    fn record_assumption_event(
+        &self,
+        phase: AssumptionCheckPhase,
+        explicit: &[Bool],
+        bundle: &[Bool],
+        outcome: SatResult,
+    ) {
+        ASSUMPTION_CHECK_CAPTURE.with(|capture| {
+            let mut capture = capture.borrow_mut();
+            let Some(events) = capture.as_mut() else {
+                return;
+            };
+            let labels = bundle
+                .iter()
+                .map(|literal| {
+                    self.tracker
+                        .as_ref()
+                        .and_then(|tracker| tracker.label_of(literal))
+                        .unwrap_or_else(|| literal.to_string())
+                })
+                .collect();
+            events.push(AssumptionCheckEvent {
+                phase,
+                explicit: explicit.to_vec(),
+                bundle: bundle.to_vec(),
+                labels,
+                outcome,
+            });
+        });
     }
 
     fn build(slots: &CrateSlots, tracker: Option<CoreTracker>, add_objective: bool) -> Self {
@@ -458,8 +664,13 @@ impl KindSolver {
             check_sat_count: Cell::new(0),
             hard_check_count: Cell::new(0),
             optimize_materialization_count: Cell::new(0),
+            lazy_plain_hard_check_count: Cell::new(0),
+            lazy_tracked_recheck_count: Cell::new(0),
+            lazy_plain_materialization_count: Cell::new(0),
             hard_check_elapsed: Cell::new(Duration::ZERO),
             optimize_materialization_elapsed: Cell::new(Duration::ZERO),
+            mandatory_scope_lengths: RefCell::new(Vec::new()),
+            round_model_failure: RefCell::new(None),
         }
     }
 
@@ -855,12 +1066,33 @@ impl KindSolver {
     /// `push_scope` → `add_borrow_exclusion(C\{ci})` → `model_kinds_relaxing` → `pop_scope`. Only the
     /// non-tracked production solve path uses it (the audit builds `KindSolver::new`).
     pub(crate) fn push_scope(&self) {
+        if let Some(tracker) = self
+            .tracker
+            .as_ref()
+            .filter(|tracker| tracker.is_mandatory())
+        {
+            self.mandatory_scope_lengths
+                .borrow_mut()
+                .push(tracker.len());
+        }
         self.solver.push();
     }
 
     /// §NB5-L2 — backtrack one scope (see `push_scope`). Precondition: balanced with `push_scope`.
     pub(crate) fn pop_scope(&self) {
         self.solver.pop();
+        if let Some(tracker) = self
+            .tracker
+            .as_ref()
+            .filter(|tracker| tracker.is_mandatory())
+        {
+            let len = self
+                .mandatory_scope_lengths
+                .borrow_mut()
+                .pop()
+                .expect("mandatory-track scope stack underflow");
+            tracker.truncate(len);
+        }
     }
 
     /// §NB4-4c — assert `¬own(slot)`: a monotone ownership-exclusion clause, the companion to
@@ -914,8 +1146,8 @@ impl KindSolver {
         // SAT (all hard constraints are track-gated) — refuse, like the other
         // production solve paths.
         assert!(
-            self.tracker.is_none(),
-            "tracked KindSolver must not enter check() (constraints are track-gated)"
+            !self.is_diagnostic_tracked(),
+            "diagnostic-tracked KindSolver must not enter check()"
         );
         self.check_with_assumptions(&[])
     }
@@ -932,6 +1164,29 @@ impl KindSolver {
         self.optimize_materialization_count.get()
     }
 
+    pub(crate) fn lazy_plain_hard_check_count(&self) -> usize {
+        self.lazy_plain_hard_check_count.get()
+    }
+
+    pub(crate) fn lazy_tracked_recheck_count(&self) -> usize {
+        self.lazy_tracked_recheck_count.get()
+    }
+
+    pub(crate) fn lazy_plain_materialization_count(&self) -> usize {
+        self.lazy_plain_materialization_count.get()
+    }
+
+    fn record_round_model_failure(&self, failure: RoundModelFailure) {
+        let mut slot = self.round_model_failure.borrow_mut();
+        if slot.is_none() {
+            *slot = Some(failure);
+        }
+    }
+
+    pub(crate) fn round_model_failure(&self) -> Option<RoundModelFailure> {
+        self.round_model_failure.borrow().clone()
+    }
+
     pub(crate) fn hard_check_elapsed(&self) -> Duration {
         self.hard_check_elapsed.get()
     }
@@ -946,8 +1201,8 @@ impl KindSolver {
 
     pub(crate) fn hard_loop_solver(&self) -> HardLoopSolver {
         assert!(
-            self.tracker.is_none(),
-            "tracked KindSolver must not enter the production hard loop"
+            !self.is_diagnostic_tracked(),
+            "diagnostic-tracked KindSolver must not enter the production hard loop"
         );
         let solver = Solver::new();
         let assertions = self.solver.get_assertions();
@@ -963,7 +1218,16 @@ impl KindSolver {
     pub(crate) fn check_with_assumptions(&self, assumptions: &[Bool]) -> SatResult {
         self.check_sat_count
             .set(self.check_sat_count.get().saturating_add(1));
-        self.solver.check(assumptions)
+        let bundle = self.assumption_bundle(assumptions);
+        let outcome = self.solver.check(&bundle);
+        #[cfg(test)]
+        self.record_assumption_event(
+            AssumptionCheckPhase::Optimize,
+            assumptions,
+            &bundle,
+            outcome,
+        );
+        outcome
     }
 
     fn hard_check_with_assumptions(
@@ -976,7 +1240,54 @@ impl KindSolver {
         self.hard_check_count
             .set(self.hard_check_count.get().saturating_add(1));
         let started = Instant::now();
-        let outcome = hard.solver.check_assumptions(assumptions);
+        let bundle = self.assumption_bundle(assumptions);
+        self.lazy_plain_hard_check_count
+            .set(self.lazy_plain_hard_check_count.get().saturating_add(1));
+        // The formulas remain the exact tracked construction, but the fixed
+        // set is activated with ordinary hard assertions rather than an
+        // assumption vector. On UNSAT only, repeat under assumptions so the
+        // core retains its typed mandatory/T2 identities.
+        hard.solver.push();
+        for literal in &bundle {
+            hard.solver.assert(literal);
+        }
+        let initial = hard.solver.check();
+        let initial_unknown_reason = (initial == SatResult::Unknown).then(|| {
+            hard.solver
+                .get_reason_unknown()
+                .unwrap_or_else(|| "-".to_owned())
+        });
+        hard.solver.pop(1);
+        let outcome = if initial == SatResult::Unsat {
+            self.lazy_tracked_recheck_count
+                .set(self.lazy_tracked_recheck_count.get().saturating_add(1));
+            let tracked = hard.solver.check_assumptions(&bundle);
+            if tracked == SatResult::Unknown {
+                self.record_round_model_failure(RoundModelFailure::HardUnknown {
+                    active_t2: assumptions.len(),
+                    reason: hard
+                        .solver
+                        .get_reason_unknown()
+                        .unwrap_or_else(|| "-".to_owned()),
+                });
+            }
+            assert_eq!(
+                tracked,
+                SatResult::Unsat,
+                "lazy plain-hard UNSAT must reproduce on the tracked core backend"
+            );
+            tracked
+        } else {
+            initial
+        };
+        if let Some(reason) = initial_unknown_reason {
+            self.record_round_model_failure(RoundModelFailure::HardUnknown {
+                active_t2: assumptions.len(),
+                reason,
+            });
+        }
+        #[cfg(test)]
+        self.record_assumption_event(AssumptionCheckPhase::Hard, assumptions, &bundle, outcome);
         self.hard_check_elapsed.set(
             self.hard_check_elapsed
                 .get()
@@ -1014,14 +1325,33 @@ impl KindSolver {
             .clone()
     }
 
+    /// W2 baseline-identity oracle: hold every typed endpoint assertion off
+    /// while retaining the complete mandatory hard universe and objective.
+    #[cfg(test)]
+    pub(crate) fn model_without_t2_for_test(
+        &self,
+        selectors: &Selectors,
+    ) -> Option<FxHashMap<SlotRef, SlotKind>> {
+        let disabled = selectors
+            .all()
+            .iter()
+            .map(|selector| !selector)
+            .collect::<Vec<_>>();
+        if self.check_with_assumptions(&disabled) != SatResult::Sat {
+            return None;
+        }
+        let model = self.solver.get_model()?;
+        Some(self.read_kinds(&model))
+    }
+
     pub fn model_kinds(&self) -> Option<FxHashMap<SlotRef, SlotKind>> {
         // §NB-R guard (release-active, BB3-c style): a tracked solver's hard
         // constraints are `track ⇒ c` — without the tracks assumed they are
         // vacuously satisfiable, so this path would return a silently wrong
         // model instead of an error.
         assert!(
-            self.tracker.is_none(),
-            "tracked KindSolver must not enter model_kinds (constraints are track-gated)"
+            !self.is_diagnostic_tracked(),
+            "diagnostic-tracked KindSolver must not enter model_kinds"
         );
         if self.check() != SatResult::Sat {
             return None;
@@ -1051,10 +1381,22 @@ impl KindSolver {
         selectors: &Selectors,
     ) -> HardRelaxResult {
         assert!(
-            self.tracker.is_none(),
-            "tracked KindSolver must not enter hard selector relaxation"
+            !self.is_diagnostic_tracked(),
+            "diagnostic-tracked KindSolver must not enter hard selector relaxation"
         );
         hard.sync_from(self);
+        let expected_hard = self.mandatory_tracks().len() + selectors.all().len();
+        assert_eq!(
+            self.hard_assertion_count(),
+            expected_hard,
+            "T2 no-bypass tripwire: every Optimize hard assertion must be either a mandatory \
+             tracked constraint or a typed endpoint assertion"
+        );
+        assert_eq!(
+            hard.assertion_count(),
+            expected_hard,
+            "T2 hard-loop mirror omitted or duplicated a tracked assertion"
+        );
         let mut assumptions = selectors.all().to_vec();
         let mut dropped = Vec::new();
         let trace_epoch = SELECTOR_TRACE_CAPTURE.with(|capture| {
@@ -1078,17 +1420,42 @@ impl KindSolver {
                 SatResult::Unsat => {
                     let core = hard.solver.get_unsat_core();
                     let in_core = |selector: &Bool| core.iter().any(|item| item == selector);
-                    let Some(index) = assumptions
+                    let mut t2_core = assumptions
                         .iter()
-                        .position(|selector| selectors.is_sink(selector) && in_core(selector))
-                        .or_else(|| assumptions.iter().position(in_core))
-                    else {
+                        .filter(|selector| in_core(selector))
+                        .filter_map(|selector| selectors.index_of(selector))
+                        .collect::<Vec<_>>();
+                    let mandatory_core = core.iter().any(|literal| {
+                        self.tracker
+                            .as_ref()
+                            .filter(|tracker| tracker.is_mandatory())
+                            .and_then(|tracker| tracker.label_of(literal))
+                            .is_some()
+                    });
+                    let core_labels = self.core_labels(selectors, &core);
+                    if t2_core.is_empty() {
+                        self.record_round_model_failure(RoundModelFailure::HardUnsat {
+                            active_t2: assumptions.len(),
+                            core_labels,
+                        });
                         return HardRelaxResult::Unsat;
-                    };
+                    }
+                    assert!(
+                        mandatory_core,
+                        "T2-only UNSAT core is an incomplete mandatory-track universe: {:?}",
+                        self.core_labels(selectors, &core)
+                    );
+                    t2_core.sort_by(|left, right| {
+                        selectors.keys[*left]
+                            .sort_key()
+                            .cmp(&selectors.keys[*right].sort_key())
+                    });
+                    let selector_index = t2_core[0];
+                    let index = assumptions
+                        .iter()
+                        .position(|selector| selectors.index_of(selector) == Some(selector_index))
+                        .expect("core T2 assertion is active");
                     if let Some(epoch) = trace_epoch {
-                        let selector_index = selectors
-                            .index_of(&assumptions[index])
-                            .expect("active selector belongs to selector universe");
                         SELECTOR_TRACE_CAPTURE.with(|capture| {
                             let mut capture = capture.borrow_mut();
                             let trace = capture.as_mut().expect("selector trace active");
@@ -1098,6 +1465,7 @@ impl KindSolver {
                                 selector_index,
                                 active_before: selectors.indices_of(&assumptions),
                                 core_selectors: selectors.indices_of(&core),
+                                core_labels,
                                 outcome: SelectorTraceOutcome::Dropped,
                             });
                         });
@@ -1108,6 +1476,17 @@ impl KindSolver {
             }
         }
 
+        dropped.sort_by(|left, right| {
+            let left = selectors
+                .index_of(left)
+                .expect("dropped T2 assertion belongs to selector universe");
+            let right = selectors
+                .index_of(right)
+                .expect("dropped T2 assertion belongs to selector universe");
+            selectors.keys[left]
+                .sort_key()
+                .cmp(&selectors.keys[right].sort_key())
+        });
         let mut index = 0;
         while index < dropped.len() {
             let selector = dropped[index].clone();
@@ -1129,6 +1508,7 @@ impl KindSolver {
                         selector_index,
                         active_before: selectors.indices_of(&assumptions),
                         core_selectors: selectors.indices_of(&core),
+                        core_labels: self.core_labels(selectors, &core),
                         outcome: if outcome == SatResult::Sat {
                             SelectorTraceOutcome::Restored
                         } else {
@@ -1163,7 +1543,9 @@ impl KindSolver {
     }
 
     /// Materialize the objective-selected model for one validation round after
-    /// hard-only selector decisions have fixed its active assumptions.
+    /// hard-only selector decisions have fixed its active set. The fixed
+    /// mandatory and surviving T2 literals are temporary plain-hard assertions;
+    /// the Optimize check itself carries no assumptions.
     pub(crate) fn optimized_model_under(
         &self,
         relaxed: &RelaxedSelectors,
@@ -1171,30 +1553,64 @@ impl KindSolver {
         self.optimize_materialization_count
             .set(self.optimize_materialization_count.get().saturating_add(1));
         let started = Instant::now();
-        if self.check_with_assumptions(&relaxed.assumptions) != SatResult::Sat {
-            self.optimize_materialization_elapsed.set(
-                self.optimize_materialization_elapsed
-                    .get()
-                    .saturating_add(started.elapsed()),
-            );
-            return None;
+        self.check_sat_count
+            .set(self.check_sat_count.get().saturating_add(1));
+        let bundle = self.assumption_bundle(&relaxed.assumptions);
+        self.lazy_plain_materialization_count.set(
+            self.lazy_plain_materialization_count
+                .get()
+                .saturating_add(1),
+        );
+        self.solver.push();
+        for literal in &bundle {
+            self.solver.assert(literal);
         }
-        let Some(model) = self.solver.get_model() else {
-            self.optimize_materialization_elapsed.set(
-                self.optimize_materialization_elapsed
-                    .get()
-                    .saturating_add(started.elapsed()),
-            );
-            return None;
+        let outcome = self.solver.check(&[]);
+        let unknown_reason = (outcome == SatResult::Unknown).then(|| {
+            self.solver
+                .get_reason_unknown()
+                .unwrap_or_else(|| "-".to_owned())
+        });
+        #[cfg(test)]
+        self.record_assumption_event(
+            AssumptionCheckPhase::OptimizeMaterialization,
+            &relaxed.assumptions,
+            &bundle,
+            outcome,
+        );
+        let kinds = if outcome == SatResult::Sat {
+            match self.solver.get_model() {
+                Some(model) => {
+                    self.read_version_owns(&model);
+                    Some(self.read_kinds(&model))
+                }
+                None => {
+                    self.record_round_model_failure(RoundModelFailure::OptimizeMissingModel {
+                        active_t2: relaxed.assumptions.len(),
+                    });
+                    None
+                }
+            }
+        } else {
+            self.record_round_model_failure(match outcome {
+                SatResult::Unsat => RoundModelFailure::OptimizeUnsat {
+                    active_t2: relaxed.assumptions.len(),
+                },
+                SatResult::Unknown => RoundModelFailure::OptimizeUnknown {
+                    active_t2: relaxed.assumptions.len(),
+                    reason: unknown_reason.unwrap_or_else(|| "-".to_owned()),
+                },
+                SatResult::Sat => unreachable!(),
+            });
+            None
         };
-        self.read_version_owns(&model);
-        let kinds = self.read_kinds(&model);
+        self.solver.pop();
         self.optimize_materialization_elapsed.set(
             self.optimize_materialization_elapsed
                 .get()
                 .saturating_add(started.elapsed()),
         );
-        Some(kinds)
+        kinds
     }
 
     pub(crate) fn model_kinds_decomposed_reporting_l2(
@@ -1248,6 +1664,13 @@ impl KindSolver {
         &self,
         selectors: &Selectors,
     ) -> Option<(FxHashMap<SlotRef, SlotKind>, Vec<Bool>)> {
+        if self.tracker.as_ref().is_some_and(CoreTracker::is_mandatory) {
+            let hard = self.hard_loop_solver();
+            let relaxed = self.relax_selectors_hard_reporting(&hard, selectors)?;
+            let dropped = relaxed.dropped().to_vec();
+            let model = self.optimized_model_under(&relaxed)?;
+            return Some((model, dropped));
+        }
         // §NB-R guard (release-active): under tracking, this loop's unsat-core
         // search would see foreign track literals in cores and its selector
         // matching would silently misbehave. Tracked instances are driven only
@@ -1306,6 +1729,7 @@ impl KindSolver {
                                 selector_index,
                                 active_before: selectors.indices_of(&assumptions),
                                 core_selectors: selectors.indices_of(&core),
+                                core_labels: Vec::new(),
                                 outcome: SelectorTraceOutcome::Dropped,
                             });
                         });
@@ -1341,6 +1765,7 @@ impl KindSolver {
                         selector_index,
                         active_before: selectors.indices_of(&assumptions),
                         core_selectors: selectors.indices_of(&core),
+                        core_labels: Vec::new(),
                         outcome: if outcome == SatResult::Sat {
                             SelectorTraceOutcome::Restored
                         } else {
@@ -1385,6 +1810,10 @@ impl KindSolver {
     /// feature-on loop can emit the ruled diagnostic without altering the
     /// feature-off solver path.
     pub(crate) fn model_kinds_relaxing_reporting_l2(&self, selectors: &Selectors) -> L2SolveResult {
+        if self.tracker.as_ref().is_some_and(CoreTracker::is_mandatory) {
+            let hard = self.hard_loop_solver();
+            return self.model_kinds_decomposed_reporting_l2(&hard, selectors);
+        }
         assert!(
             self.tracker.is_none(),
             "tracked KindSolver must not enter model_kinds_relaxing (constraints are track-gated)"
@@ -1637,10 +2066,12 @@ pub(crate) struct BoOwnDatabase<'opt> {
     /// is asserted as `selector ⇒ owning`; assuming all selectors reproduces the
     /// hard source, while the relax loop can drop a selector to leak that source.
     source_selectors: Vec<Bool>,
+    source_keys: Vec<super::export::T2AssertKey>,
     /// §NB-F: one selector per `sink` (free/realloc arg) ownership assertion —
     /// the sink twin of `source_selectors`. Dropping one LEAKS THE FREE (the
     /// freed value's owning is no longer forced; nothing asserts ¬own/¬ref).
     sink_selectors: Vec<Bool>,
+    sink_keys: Vec<super::export::T2AssertKey>,
 }
 
 impl BoOwnDatabase<'_> {
@@ -1662,7 +2093,9 @@ impl<'opt> BoOwnDatabase<'opt> {
             z3_ast,
             source_sink_emissions: 0,
             source_selectors: Vec::new(),
+            source_keys: Vec::new(),
             sink_selectors: Vec::new(),
+            sink_keys: Vec::new(),
         }
     }
 
@@ -1768,9 +2201,17 @@ impl<'opt> BoOwnDatabase<'opt> {
         &self.source_selectors
     }
 
+    pub(crate) fn source_keys(&self) -> &[super::export::T2AssertKey] {
+        &self.source_keys
+    }
+
     /// §NB-F: selector literals for the emitted `sink` ownerships.
     pub(crate) fn sink_selectors(&self) -> &[Bool] {
         &self.sink_selectors
+    }
+
+    pub(crate) fn sink_keys(&self) -> &[super::export::T2AssertKey] {
+        &self.sink_keys
     }
 }
 
@@ -1781,14 +2222,36 @@ impl<'opt> BoOwnDatabase<'opt> {
 pub(crate) struct Selectors {
     all: Vec<Bool>,
     n_sources: usize,
+    keys: Vec<super::export::T2AssertKey>,
 }
 
 impl Selectors {
     pub(crate) fn new(sources: Vec<Bool>, sinks: Vec<Bool>) -> Self {
+        assert!(
+            sources.is_empty() && sinks.is_empty(),
+            "nonempty selector construction must carry typed T2 keys"
+        );
+        Self::new_with_keys(sources, Vec::new(), sinks, Vec::new())
+    }
+
+    pub(crate) fn new_with_keys(
+        sources: Vec<Bool>,
+        source_keys: Vec<super::export::T2AssertKey>,
+        sinks: Vec<Bool>,
+        sink_keys: Vec<super::export::T2AssertKey>,
+    ) -> Self {
+        assert_eq!(sources.len(), source_keys.len());
+        assert_eq!(sinks.len(), sink_keys.len());
         let n_sources = sources.len();
         let mut all = sources;
         all.extend(sinks);
-        Selectors { all, n_sources }
+        let mut keys = source_keys;
+        keys.extend(sink_keys);
+        Selectors {
+            all,
+            n_sources,
+            keys,
+        }
     }
 
     pub(crate) fn all(&self) -> &[Bool] {
@@ -1801,6 +2264,10 @@ impl Selectors {
 
     pub(crate) fn sinks(&self) -> &[Bool] {
         &self.all[self.n_sources..]
+    }
+
+    pub(crate) fn keys(&self) -> &[super::export::T2AssertKey] {
+        &self.keys
     }
 
     /// Whether a (core/dropped) literal is a sink selector — z3 node identity,
@@ -1913,6 +2380,10 @@ impl Database for BoOwnDatabase<'_> {
         let clause = Bool::or(&[&not_sel, &self.z3_ast[var]]);
         self.optimize.assert(&clause);
         self.source_selectors.push(selector);
+        self.source_keys.push(super::export::current_t2_assert_key(
+            super::export::BoundaryRole::Source,
+            var,
+        ));
         // E-R3 capture: index-aligned with `source_selectors` by construction —
         // this is the only writer and it pushes exactly once. Recording-only.
         super::export::record_selector(super::export::BoundaryRole::Source, var);
@@ -1930,6 +2401,10 @@ impl Database for BoOwnDatabase<'_> {
         let clause = Bool::or(&[&not_sel, &self.z3_ast[var]]);
         self.optimize.assert(&clause);
         self.sink_selectors.push(selector);
+        self.sink_keys.push(super::export::current_t2_assert_key(
+            super::export::BoundaryRole::Sink,
+            var,
+        ));
         // E-R3 capture: sink twin of the source push above; same alignment
         // guarantee, same recording-only contract.
         super::export::record_selector(super::export::BoundaryRole::Sink, var);
