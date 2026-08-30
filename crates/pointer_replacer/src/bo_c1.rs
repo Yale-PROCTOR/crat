@@ -15698,23 +15698,25 @@ fn e2_candidate_receipts_do_not_enter_placed_adapter_counters() {
 /// lifetime-market split before the corpus worker can emit its first row.
 #[test]
 fn degraded_mass_ledger_is_exact_once_and_lifetime_typed() {
-    let seed = "subject_key\towner_fn\tmir_local\targ_index\tptr_depth\tfamily\tmodel_kind\tdecision\treason\tsite\tplaced\texclusion\n\
-f::p#1\tf\t1\t1\t0\tref\tref\tref\t-\tf.rs:1\t1\t-\n\
-g::s#1\tg\t1\t1\t0\tslice\tref\tslice\t-\tg.rs:1\t1\t-\n\
-h::o#1\th\t1\t1\t0\toptional\tref\tdegraded\treturn-not-adapted\th.rs:1\t0\t-\n\
-i::b#1\ti\t1\t1\t0\tbox\towning\tdegraded\tkind-owning\ti.rs:1\t0\t-\n\
-j::r#1\tj\t1\t1\t0\traw\traw\tdegraded\tkind-raw\tj.rs:1\t0\t-\n\
-extern::arg#1\textern\t1\t1\t0\tunmodeled\tunmodeled\texcluded\t-\t-\t0\tforeign-item\n";
+    let seed = "subject_key\towner_fn\tmir_local\targ_index\tptr_depth\tfamily\tmodel_kind\tdecision\treason\treason_detail\tsite\tplaced\texclusion\n\
+f::p#1\tf\t1\t1\t0\tref\tref\tref\t-\t-\tf.rs:1\t1\t-\n\
+g::s#1\tg\t1\t1\t0\tslice\tref\tslice\t-\t-\tg.rs:1\t1\t-\n\
+h::o#1\th\t1\t1\t0\toptional\tref\tdegraded\treturn-not-adapted\t-\th.rs:1\t0\t-\n\
+i::b#1\ti\t1\t1\t0\tbox\towning\tdegraded\tkind-owning\t-\ti.rs:1\t0\t-\n\
+j::r#1\tj\t1\t1\t0\traw\traw\tdegraded\tkind-raw\t-\tj.rs:1\t0\t-\n\
+k::c#1\tk\t1\t1\t0\tref\tref\tdegraded\tclass-blocked\tescapes-via-return\tk.rs:1\t0\t-\n\
+extern::arg#1\textern\t1\t1\t0\tunmodeled\tunmodeled\texcluded\t-\t-\t-\t0\tforeign-item\n";
     let ledger = run::degraded_mass_ledger_for_test(seed, &[("g", "call-site-not-adapted")])
         .expect("exact ledger");
     let rows = ledger.lines().skip(1).collect::<Vec<_>>();
-    assert_eq!(rows.len(), 6);
+    assert_eq!(rows.len(), 7);
     assert!(rows[0].contains("\trealized-as-predicted\t-\t0"));
     assert!(rows[1].contains("\treverted\tcall-site-not-adapted\t0"));
     assert!(rows[2].contains("\tdegraded\treturn-not-adapted\t1"));
     assert!(rows[3].contains("\tdegraded\tkind-owning\t0"));
     assert!(rows[4].contains("\tdegraded\tkind-raw\t0"));
-    assert!(rows[5].contains("\ttyped-excluded\tforeign-item\t0"));
+    assert!(rows[5].contains("\tdegraded\tclass-blocked:escapes-via-return\t1"));
+    assert!(rows[6].contains("\ttyped-excluded\tforeign-item\t0"));
 
     let duplicate = format!("{seed}{}\n", seed.lines().nth(1).unwrap());
     let error = run::degraded_mass_ledger_for_test(&duplicate, &[])
