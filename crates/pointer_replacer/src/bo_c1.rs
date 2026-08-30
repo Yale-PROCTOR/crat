@@ -8538,6 +8538,19 @@ mod run {
                 return row;
             }
         };
+        let receipt_field = |key: &str| {
+            capture
+                .a5_receipt
+                .lines()
+                .find_map(|line| line.strip_prefix(&format!("{key}=")))
+                .unwrap_or("missing")
+        };
+        let a5_mode = receipt_field("a5_mode");
+        let a5_world = receipt_field("a5_world");
+        let a5_abi_guard = receipt_field("a5_abi_guard");
+        let copy_lend_mode = receipt_field("copy_lend_mode");
+        let a2_mode = receipt_field("a2_mode");
+        let soundness_mode = receipt_field("soundness_mode");
 
         let mut primary = BTreeMap::<String, &'static str>::new();
         for (index, revert) in capture.reverts.iter().enumerate() {
@@ -8565,7 +8578,7 @@ mod run {
         }
 
         let mut artifact = String::from(
-            "program\trevert_key\tfunction\tclass\terror_code\tmessage_head\tfile\tline\tdirection\tattribution\trewrite_shapes\trepro_context\tinput_root\n",
+            "corpus\tanalysis_frame\tdata\ta5_mode\ta5_world\ta5_abi_guard\tcopy_lend_mode\ta2_mode\tsoundness_mode\tprogram\trevert_key\tfunction\tclass\terror_code\tmessage_head\tfile\tline\tdirection\tattribution\trewrite_shapes\trepro_context\tinput_root\n",
         );
         for (index, revert) in capture.reverts.iter().enumerate() {
             let key = if revert.function == "<unattributed>" {
@@ -8593,7 +8606,14 @@ mod run {
                 .collect::<Vec<_>>()
                 .join(" | ");
             artifact.push_str(&format!(
-                "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:?}\t{}\t{}\t{}\t{}\n",
+                "rs-crown\t{}\tprovisional\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:?}\t{}\t{}\t{}\t{}\n",
+                crate::analyses::borrow_ownership::model_cache::ANALYSIS_FRAME,
+                a5_mode,
+                a5_world,
+                a5_abi_guard,
+                copy_lend_mode,
+                a2_mode,
+                soundness_mode,
                 name,
                 tsv_field(&key, 300),
                 tsv_field(&revert.function, 300),
@@ -8621,7 +8641,14 @@ mod run {
         std::fs::write(&a5_receipt_path, &capture.a5_receipt).expect("write E1 A5 receipt");
         let solve = &capture.solve_receipt;
         let cache_receipt = format!(
-            "program\tsource\tcache_status\tfingerprint\tmodel_sha256\tcache_entry\tsolve_wall_s\n{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+            "corpus\tanalysis_frame\tdata\ta5_mode\ta5_world\ta5_abi_guard\tcopy_lend_mode\ta2_mode\tsoundness_mode\tprogram\tsource\tcache_status\tfingerprint\tmodel_sha256\tcache_entry\tsolve_wall_s\nrs-crown\t{}\tprovisional\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+            crate::analyses::borrow_ownership::model_cache::ANALYSIS_FRAME,
+            a5_mode,
+            a5_world,
+            a5_abi_guard,
+            copy_lend_mode,
+            a2_mode,
+            soundness_mode,
             name,
             solve.source,
             solve.cache_status,
@@ -8634,6 +8661,20 @@ mod run {
         std::fs::write(&cache_receipt_path, cache_receipt).expect("write E1 cache receipt");
 
         row.set("e1_reverts", primary.len());
+        row.set("corpus", "rs-crown");
+        row.set(
+            "analysis_frame",
+            crate::analyses::borrow_ownership::model_cache::ANALYSIS_FRAME,
+        );
+        row.set("data", "provisional");
+        row.set("a5_mode", a5_mode);
+        row.set("a5_world", a5_world);
+        row.set("a5_abi_guard", a5_abi_guard);
+        row.set("copy_lend_mode", copy_lend_mode);
+        row.set("a2_mode", a2_mode);
+        row.set("soundness_mode", soundness_mode);
+        row.set("verify_iterations", 1);
+        row.set("repair_rounds", 0);
         row.set("e1_diag_rows", capture.reverts.len());
         row.set("e1_novel_errors", capture.novel_error_count);
         row.set("baseline_keys", capture.baseline_keys);
