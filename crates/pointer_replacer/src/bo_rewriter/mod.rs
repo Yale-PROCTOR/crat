@@ -3547,7 +3547,12 @@ fn e1_subject_seed_tsv(
             }
         };
         let unplaced_reason = unplaced.remove(key.as_str());
-        let emits = !matches!(decision, decision::Decision::Degraded(_));
+        let emits = match decision {
+            decision::Decision::Ref { .. }
+            | decision::Decision::Slice { .. }
+            | decision::Decision::Opt { .. } => true,
+            decision::Decision::Degraded(_) => false,
+        };
         let placed = emits && unplaced_reason.is_none();
         let exclusion = unplaced_reason
             .map(|reason| format!("unplaceable:{reason}"))
