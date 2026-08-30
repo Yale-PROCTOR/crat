@@ -11,10 +11,10 @@ pub unsafe fn g26_sum(buf: &[i32]) -> i32 {
 pub unsafe fn g26_caller(data: *mut i32) -> i32 {
     let t = g26_sum(core::slice::from_raw_parts(
         data,
-        crate::SEAM_LEN_PLACEHOLDER,
+        crate::FALLBACK_SLICE_EXTENT,
     ));
     *data = t;
     t
 }
 
-const SEAM_LEN_PLACEHOLDER: usize = 1024;
+const FALLBACK_SLICE_EXTENT: usize = 1024;

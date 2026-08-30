@@ -984,6 +984,66 @@ fn find_by_span<'a>(e: &'a rustc_ast::Expr, want: rustc_span::Span) -> Option<&'
     f.hit
 }
 
+/// Build the §29 checked optional wrapper while retaining the original
+/// argument and the already-built payload as AST subtrees. Only the fixed
+/// wrapper syntax is parsed; the two placeholders are each replaced exactly
+/// once, so a template typo is a typed build refusal rather than a textual
+/// rewrite of the argument.
+fn checked_optional(
+    argument: rustc_ast::Expr,
+    payload: rustc_ast::Expr,
+) -> Option<rustc_ast::ExprKind> {
+    const ARG: &str = "__CRAT_E_ADAPT_ARG";
+    const PAYLOAD: &str = "__CRAT_E_ADAPT_PAYLOAD";
+    let text = format!(
+        "{{ let __crat_call_adapter_ptr = {ARG}; \
+         if __crat_call_adapter_ptr.is_null() {{ None }} \
+         else {{ Some({PAYLOAD}) }} }}"
+    );
+    let mut parsed = graft_expr(&text).ok()?;
+
+    struct Replace {
+        argument: rustc_ast::Expr,
+        payload: rustc_ast::Expr,
+        arg_hits: usize,
+        payload_hits: usize,
+    }
+    impl Replace {
+        fn is_path(expr: &rustc_ast::Expr, name: &str) -> bool {
+            matches!(
+                &expr.kind,
+                rustc_ast::ExprKind::Path(None, path)
+                    if path.segments.len() == 1
+                        && path.segments[0].ident.name == Symbol::intern(name)
+            )
+        }
+    }
+    impl MutVisitor for Replace {
+        fn visit_expr(&mut self, expr: &mut rustc_ast::Expr) {
+            if Self::is_path(expr, ARG) {
+                *expr = self.argument.clone();
+                self.arg_hits += 1;
+                return;
+            }
+            if Self::is_path(expr, PAYLOAD) {
+                *expr = self.payload.clone();
+                self.payload_hits += 1;
+                return;
+            }
+            rustc_ast::mut_visit::walk_expr(self, expr);
+        }
+    }
+
+    let mut replace = Replace {
+        argument,
+        payload,
+        arg_hits: 0,
+        payload_hits: 0,
+    };
+    replace.visit_expr(&mut parsed);
+    (replace.arg_hits == 1 && replace.payload_hits == 1).then_some(parsed.kind)
+}
+
 /// **ARM 3 — the seam pass.** The THIRD span-keyed walk over one crate, and the
 /// first whose targets share a syntactic category with another pass's.
 ///
@@ -1070,8 +1130,11 @@ impl<'a> SeamGraftVisitor<'a> {
 
     /// Build the adapter around `e`'s own subtree, or decline with a typed row.
     fn build(&mut self, e: &rustc_ast::Expr, target: &SeamTarget) -> Option<rustc_ast::ExprKind> {
-        use super::decision::seam::{GlueCore, SeamLen};
+        use super::decision::seam::{GlueCore, NullArm};
         let spec = &target.spec;
+        if spec.null_arm == NullArm::LiteralNone {
+            return graft_expr("None").ok().map(|parsed| parsed.kind);
+        }
         // The unwrap family is deliberately unbuilt — see [`SeamGraftStats`].
         if spec.unwrap.is_some() {
             self.stats.unsupported += 1;
@@ -1153,10 +1216,16 @@ impl<'a> SeamGraftVisitor<'a> {
             },
         };
 
+        let source_arg = (*arg).clone();
+        let core_arg = if spec.null_arm == NullArm::Checked {
+            P(graft_expr("__crat_call_adapter_ptr").expect("fixed adapter path parses"))
+        } else {
+            arg
+        };
         let core = match shape {
-            None => arg,
+            None => core_arg,
             Some(shape) => {
-                let Some(kind) = glue_expr(shape, spec.mutable, arg, len) else {
+                let Some(kind) = glue_expr(shape, spec.mutable, core_arg, len) else {
                     // `glue_expr` declines exactly one way: a length-bearing
                     // shape with no length.
                     self.stats.len_absent += 1;
@@ -1165,7 +1234,9 @@ impl<'a> SeamGraftVisitor<'a> {
                 expr(kind)
             }
         };
-        Some(if spec.optional {
+        Some(if spec.null_arm == NullArm::Checked {
+            checked_optional(source_arg, (*core).clone())?
+        } else if spec.optional {
             glue_expr(GlueShape::Some_, spec.mutable, core, None)
                 .expect("the `Some` wrapper is length-free and cannot decline")
         } else {
@@ -1825,7 +1896,7 @@ pub(crate) fn ast_emitted_source(
 /// emission is keyed by source file rather than collapsed into the root.
 ///
 /// The const is appended to the ROOT file only — it is declared once per crate
-/// and named as `crate::SEAM_LEN_PLACEHOLDER`, so a copy per file would be a
+/// and named as `crate::FALLBACK_SLICE_EXTENT`, so a copy per file would be a
 /// duplicate-definition error, not redundancy.
 ///
 /// ⚠ **`tcx` IS STILL REQUIRED, and only for one thing: the source map.**
@@ -4936,6 +5007,9 @@ mod arm2_witnesses {
                 span: DUMMY_SP,
                 replacement: String::new(),
                 owner_fn: String::new(),
+                caller_fn: String::new(),
+                param_index: 0,
+                source_shape: "bare-local",
                 family,
                 len_arm: None,
                 spec: GlueSpec::core(GlueCore::Reborrow, true),
@@ -5647,11 +5721,11 @@ mod arm3_witnesses {
             // shape the AST layer renders unwitnessed.
             assert_eq!(
                 rendered(GlueShape::FromRawParts, true, Some(SeamLen::Fabricated)),
-                "core::slice::from_raw_parts_mut((*s).ptr, crate::SEAM_LEN_PLACEHOLDER)"
+                "core::slice::from_raw_parts_mut((*s).ptr, crate::FALLBACK_SLICE_EXTENT)"
             );
             assert_eq!(
                 rendered(GlueShape::FromRawParts, false, Some(SeamLen::Fabricated)),
-                "core::slice::from_raw_parts((*s).ptr, crate::SEAM_LEN_PLACEHOLDER)"
+                "core::slice::from_raw_parts((*s).ptr, crate::FALLBACK_SLICE_EXTENT)"
             );
             // safe family
             assert_eq!(

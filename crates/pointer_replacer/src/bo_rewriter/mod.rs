@@ -105,10 +105,17 @@ pub(crate) struct E1EditContext {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum E1DiagnosticSite {
+    CallBoundary,
+    BodyExpression,
+    Other,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct E1RevertDiagnostic {
     pub(crate) function: String,
     pub(crate) diagnostic: verify::Diag,
-    pub(crate) call_site_not_adapted: bool,
+    pub(crate) site_kind: E1DiagnosticSite,
     pub(crate) attribution: String,
     pub(crate) edits: Vec<E1EditContext>,
 }
@@ -121,6 +128,9 @@ pub(crate) struct E1RevertDiagnostic {
 pub(crate) struct E1Capture {
     pub(crate) observed_root: std::path::PathBuf,
     pub(crate) reverts: Vec<E1RevertDiagnostic>,
+    /// Exact call-adapter rows rendered from the SAME `DecisionTable` consumed
+    /// by the one E1 emission iteration.
+    pub(crate) adapter_receipt: String,
     pub(crate) novel_error_count: usize,
     pub(crate) baseline_keys: usize,
     pub(crate) baseline_errors: usize,
@@ -219,6 +229,8 @@ pub(crate) enum RewriteOutcome {
         a5_receipt: String,
         /// E1's single-iteration diagnostic rows. Empty on ordinary runs.
         e1_reverts: Vec<E1RevertDiagnostic>,
+        /// E1's adapter receipt, empty on ordinary runs.
+        e1_adapter_receipt: String,
         /// Baseline-subtracted error count from the one verify invocation.
         e1_novel_error_count: usize,
         /// Cache/solve receipt captured inside the compiler callback.
@@ -277,6 +289,8 @@ pub(crate) enum RewriteOutcome {
         a5_receipt: String,
         /// E1's single-iteration diagnostic rows. Empty on ordinary runs.
         e1_reverts: Vec<E1RevertDiagnostic>,
+        /// E1's adapter receipt, empty on ordinary runs.
+        e1_adapter_receipt: String,
         /// Baseline-subtracted error count from the one verify invocation.
         e1_novel_error_count: usize,
         /// Cache/solve receipt captured inside the compiler callback.
@@ -873,6 +887,12 @@ fn verify_and_revert(
     // the seed is already the ruled definition.
     let mut files_edited = files.len();
     let planned_edit_sites = edit_sites(&emission_plan, &emission_texts);
+    let nested_seam_composition = emission_plan.by_file.values().any(|edits| {
+        edits
+            .iter()
+            .enumerate()
+            .any(|(index, _)| nested_kind_under_seam(edits, index))
+    });
     let e1_edit_contexts = if census_once {
         e1_edit_contexts(&emission_plan, &emission_texts)
     } else {
@@ -901,6 +921,11 @@ fn verify_and_revert(
         baseline_msg_env: 0,
         a5_receipt,
         e1_reverts: Vec::new(),
+        e1_adapter_receipt: if census_once {
+            seam_tsv_from_table(tcx, table)
+        } else {
+            String::new()
+        },
         e1_novel_error_count: 0,
         solve_receipt: model_cache::solve_receipt(),
     };
@@ -960,6 +985,16 @@ fn verify_and_revert(
     loop {
         let materialized = match tree_base {
             Some(root) => verify::materialize(root, &files),
+            // String fixtures use the SAME AST round product as file-backed
+            // production. `root_text` is only the no-edit fallback; selecting it
+            // unconditionally here bypassed the use→seam composition the round
+            // had just built and made the test entry a second emitter.
+            None if nested_seam_composition => verify::materialize_single_file(
+                files
+                    .values()
+                    .next()
+                    .map_or(root_text.as_str(), String::as_str),
+            ),
             None => verify::materialize_single_file(&root_text),
         };
         let staged = match materialized {
@@ -1137,7 +1172,7 @@ fn verify_and_revert(
                     facts.e1_reverts.push(E1RevertDiagnostic {
                         function: "<unattributed>".to_owned(),
                         diagnostic: diagnostic.clone(),
-                        call_site_not_adapted: e1_call_site_not_adapted(diagnostic),
+                        site_kind: e1_diagnostic_site(diagnostic),
                         attribution: "unattributed".to_owned(),
                         edits: Vec::new(),
                     });
@@ -1152,7 +1187,7 @@ fn verify_and_revert(
                     facts.e1_reverts.push(E1RevertDiagnostic {
                         function: owner,
                         diagnostic: diagnostic.clone(),
-                        call_site_not_adapted: e1_call_site_not_adapted(diagnostic),
+                        site_kind: e1_diagnostic_site(diagnostic),
                         attribution: attribution.to_owned(),
                         edits,
                     });
@@ -1171,7 +1206,7 @@ fn verify_and_revert(
                         code: None,
                         related: Vec::new(),
                     },
-                    call_site_not_adapted: false,
+                    site_kind: E1DiagnosticSite::Other,
                     attribution: "spanless".to_owned(),
                     edits: Vec::new(),
                 });
@@ -2032,6 +2067,7 @@ struct OutcomeFacts {
     observed_root: Option<std::path::PathBuf>,
     a5_receipt: String,
     e1_reverts: Vec<E1RevertDiagnostic>,
+    e1_adapter_receipt: String,
     e1_novel_error_count: usize,
     solve_receipt: Option<model_cache::SolveReceipt>,
 }
@@ -2083,6 +2119,7 @@ impl RewriteOutcome {
         let (
             observed_root,
             e1_reverts,
+            e1_adapter_receipt,
             novel_error_count,
             baseline_keys,
             baseline_errors,
@@ -2092,24 +2129,12 @@ impl RewriteOutcome {
             unplaceable,
             a5_receipt,
             solve_receipt,
+            outcome_reason,
         ) = match self {
             RewriteOutcome::Emitted {
                 observed_root,
                 e1_reverts,
-                e1_novel_error_count,
-                baseline_keys,
-                baseline_errors,
-                baseline_msg_env,
-                emitted_count,
-                files_touched,
-                unplaceable,
-                a5_receipt,
-                solve_receipt,
-                ..
-            }
-            | RewriteOutcome::Degraded {
-                observed_root,
-                e1_reverts,
+                e1_adapter_receipt,
                 e1_novel_error_count,
                 baseline_keys,
                 baseline_errors,
@@ -2123,6 +2148,7 @@ impl RewriteOutcome {
             } => (
                 observed_root,
                 e1_reverts,
+                e1_adapter_receipt,
                 e1_novel_error_count,
                 baseline_keys,
                 baseline_errors,
@@ -2132,12 +2158,44 @@ impl RewriteOutcome {
                 unplaceable.len(),
                 a5_receipt,
                 solve_receipt,
+                "emitted".to_owned(),
+            ),
+            RewriteOutcome::Degraded {
+                reason,
+                observed_root,
+                e1_reverts,
+                e1_adapter_receipt,
+                e1_novel_error_count,
+                baseline_keys,
+                baseline_errors,
+                baseline_msg_env,
+                emitted_count,
+                files_touched,
+                unplaceable,
+                a5_receipt,
+                solve_receipt,
+                ..
+            } => (
+                observed_root,
+                e1_reverts,
+                e1_adapter_receipt,
+                e1_novel_error_count,
+                baseline_keys,
+                baseline_errors,
+                baseline_msg_env,
+                emitted_count,
+                files_touched,
+                unplaceable.len(),
+                a5_receipt,
+                solve_receipt,
+                reason,
             ),
         };
         Ok(E1Capture {
             observed_root: observed_root
-                .ok_or_else(|| "E1 capture has no observed root".to_owned())?,
+                .ok_or_else(|| format!("E1 capture has no observed root: {outcome_reason}"))?,
             reverts: e1_reverts,
+            adapter_receipt: e1_adapter_receipt,
             novel_error_count,
             baseline_keys,
             baseline_errors,
@@ -2194,6 +2252,7 @@ impl OutcomeFacts {
             baseline_msg_env: self.baseline_msg_env,
             a5_receipt: self.a5_receipt,
             e1_reverts: self.e1_reverts,
+            e1_adapter_receipt: self.e1_adapter_receipt,
             e1_novel_error_count: self.e1_novel_error_count,
             solve_receipt: self.solve_receipt,
         }
@@ -2218,6 +2277,7 @@ impl OutcomeFacts {
             baseline_msg_env: self.baseline_msg_env,
             a5_receipt: self.a5_receipt,
             e1_reverts: self.e1_reverts,
+            e1_adapter_receipt: self.e1_adapter_receipt,
             e1_novel_error_count: self.e1_novel_error_count,
             solve_receipt: self.solve_receipt,
         }
@@ -2441,11 +2501,27 @@ fn e1_region_owners(
     owners
 }
 
-fn e1_call_site_not_adapted(diagnostic: &verify::Diag) -> bool {
-    diagnostic.direction == verify::Direction::RawIntoRewritten
+fn e1_diagnostic_site(diagnostic: &verify::Diag) -> E1DiagnosticSite {
+    let callee_relation = diagnostic.message.contains("function defined here")
+        || diagnostic
+            .related
+            .iter()
+            .any(|related| related.message.contains("function defined here"));
+    if callee_relation {
+        E1DiagnosticSite::CallBoundary
+    } else if diagnostic.direction == verify::Direction::RawIntoRewritten
         || (matches!(diagnostic.code.as_deref(), Some("E0308" | "ErrCode(308)"))
-            && diagnostic.message.contains("found raw pointer")
-            && diagnostic.message.contains("function defined here"))
+            && diagnostic.message.contains("found raw pointer"))
+    {
+        E1DiagnosticSite::BodyExpression
+    } else {
+        E1DiagnosticSite::Other
+    }
+}
+
+#[cfg(test)]
+fn e1_call_site_not_adapted(diagnostic: &verify::Diag) -> bool {
+    e1_diagnostic_site(diagnostic) == E1DiagnosticSite::CallBoundary
 }
 
 fn attribute(
@@ -2673,12 +2749,47 @@ pub(crate) fn validate_plan(
         let Some(source) = texts.get(key) else {
             continue;
         };
-        let applied = apply::apply(source, kept);
+        // Wave-1 call adapters make one previously-zero composition live: a
+        // seam can strictly contain an ordinary `KindDecision` use edit. The AST
+        // choke point applies use first and seam second; this span projection is
+        // validation-only and cannot represent nesting. Suppress exactly the
+        // contained inner use from the obsolete splice projection while keeping
+        // both edits in the real plan for attribution, reverts, and AST
+        // consumption. Every other overlap still reaches `apply` and rolls back.
+        let validation_edits = kept
+            .iter()
+            .enumerate()
+            .filter(|(inner_index, inner)| {
+                !matches!(
+                    inner.justification,
+                    plan::Justification::KindDecision { .. }
+                ) || !nested_kind_under_seam(kept, *inner_index)
+            })
+            .map(|(_, edit)| edit.clone())
+            .collect::<Vec<_>>();
+        let applied = apply::apply(source, &validation_edits);
         rollbacks.extend(applied.rollbacks);
         maps.insert(key.clone(), applied.line_map);
         files.insert(key.clone(), applied.source);
     }
     (files, rollbacks, maps)
+}
+
+/// Exactly the one nested plan class the AST pass orders deliberately:
+/// ordinary `KindDecision` use first, strictly enclosing call seam second.
+/// Equal spans and every other justification remain ordinary overlap failures.
+fn nested_kind_under_seam(edits: &[plan::Edit], inner_index: usize) -> bool {
+    let inner = &edits[inner_index];
+    matches!(
+        inner.justification,
+        plan::Justification::KindDecision { .. }
+    ) && edits.iter().enumerate().any(|(outer_index, outer)| {
+        outer_index != inner_index
+            && matches!(outer.justification, plan::Justification::SeamAdapter { .. })
+            && outer.lo <= inner.lo
+            && inner.hi <= outer.hi
+            && (outer.lo < inner.lo || inner.hi < outer.hi)
+    })
 }
 
 /// A source file's identity for editing. `None` for anything not written back
@@ -2767,7 +2878,7 @@ pub(crate) fn emit_files<'tcx>(
     // **The crate root, asked of the compiler rather than guessed** — not
     // `files()[0]`, which is source-map insertion order, and not the first
     // planned file, which is whichever file happened to hold an edit.
-    // `crate::SEAM_LEN_PLACEHOLDER` resolves from exactly one module.
+    // `crate::FALLBACK_SLICE_EXTENT` resolves from exactly one module.
     planned.root_file = {
         let root = tcx.def_span(rustc_hir::def_id::CRATE_DEF_ID);
         file_key(&source_map.lookup_byte_offset(root.lo()).sf.name)
@@ -4124,9 +4235,17 @@ pub(crate) fn decisions_with_ty_span_erased(
 /// adapted position.
 pub(crate) fn seam_tsv(tcx: TyCtxt<'_>) -> Result<String, String> {
     let (table, _ctx) = decide_table_with_ctx(tcx)?;
+    Ok(seam_tsv_from_table(tcx, &table))
+}
+
+/// Render adapter receipts from the table production already accepted. E1
+/// calls this inside its sole compiler callback, so receipt production cannot
+/// trigger a second analysis or solve.
+fn seam_tsv_from_table(tcx: TyCtxt<'_>, table: &decision::DecisionTable) -> String {
     let sm = tcx.sess.source_map();
-    let mut out =
-        String::from("kind\towner_fn\tfamily_or_reason\tsite\tlen_arm\tglue_shape\tcaller\n");
+    let mut out = String::from(
+        "kind\towner_fn\tfamily_or_reason\tsite\tlen_arm\tglue_shape\tcaller\tparam_index\ttemplate\tnull_arm\textent_arm\tadapter_key\tsource_shape\n",
+    );
     for edit in &table.seams.edits {
         let family = match edit.family {
             decision::seam::SeamFamily::Safe => "safe",
@@ -4153,11 +4272,23 @@ pub(crate) fn seam_tsv(tcx: TyCtxt<'_>) -> Result<String, String> {
         // `GlueSpec::shape_key`, which reproduces the classifier's two ordering
         // quirks deliberately so the movement is only where it was wrong.
         let shape = edit.spec.shape_key();
+        let site = sm.span_to_diagnostic_string(edit.span);
+        let adapter_key = format!(
+            "{}=>{}#{}@{}",
+            edit.caller_fn, edit.owner_fn, edit.param_index, site
+        );
         out.push_str(&format!(
-            "placed\t{}\t{}\t{}\t{arm}\t{shape}\t-\n",
+            "placed\t{}\t{}\t{}\t{arm}\t{shape}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
             edit.owner_fn,
             family,
-            sm.span_to_diagnostic_string(edit.span)
+            site,
+            edit.caller_fn,
+            edit.param_index,
+            edit.spec.template_key(),
+            edit.spec.null_arm_key(),
+            edit.spec.extent_arm_key(),
+            adapter_key,
+            edit.source_shape,
         ));
     }
     // **`owner_fn` is the REVERT KEY on every row kind** (2026-08-12). It was
@@ -4167,19 +4298,25 @@ pub(crate) fn seam_tsv(tcx: TyCtxt<'_>) -> Result<String, String> {
     // CALLEE's conversion, which is why `SeamEdit::owner_fn` is the callee.
     // The caller is real information and moves to its own column rather than
     // being dropped.
-    for (caller, callee, span, block) in &table.seams.blocked {
+    for (caller, callee, index, span, block) in &table.seams.blocked {
+        let caller = tcx.def_path_str(caller.to_def_id());
+        let callee = tcx.def_path_str(callee.to_def_id());
+        let site = sm.span_to_diagnostic_string(*span);
+        let adapter_key = format!("{caller}=>{callee}#{index}@{site}");
         out.push_str(&format!(
-            "blocked\t{}\t{}\t{}\t-\t-\t{}\n",
-            tcx.def_path_str(callee.to_def_id()),
+            "blocked\t{}\t{}\t{}\t-\t-\t{}\t{}\t-\t-\t-\t{}\t-\n",
+            callee,
             block.key(),
-            sm.span_to_diagnostic_string(*span),
-            tcx.def_path_str(caller.to_def_id()),
+            site,
+            caller,
+            index,
+            adapter_key,
         ));
     }
     // Item 4a: companion-length coverage, one row per LENGTH-GATED POSITION.
     for (callee, index, evidence) in &table.seams.length_evidence {
         out.push_str(&format!(
-            "lengated\t{callee}\t{}\t#{index}\n",
+            "lengated\t{callee}\t{}\t#{index}\t-\t-\t-\t{index}\t-\t-\t-\t-\t-\n",
             evidence.key()
         ));
     }
@@ -4187,7 +4324,9 @@ pub(crate) fn seam_tsv(tcx: TyCtxt<'_>) -> Result<String, String> {
     // The census is a prioritization overlay and has already been shown
     // incomplete twice; a silent adaptation would hide the third case.
     for (found, expected) in &table.seams.uncensused {
-        out.push_str(&format!("uncensused\t-\t{found:?} -> {expected:?}\t-\n"));
+        out.push_str(&format!(
+            "uncensused\t-\t{found:?} -> {expected:?}\t-\t-\t-\t-\t-\t-\t-\t-\t-\t-\n"
+        ));
     }
-    Ok(out)
+    out
 }

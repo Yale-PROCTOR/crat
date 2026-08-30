@@ -196,17 +196,19 @@ impl SeamLen {
     }
 }
 
-/// The fabricated slice-seam extent (user ruling, 2026-08-12).
-pub(crate) const FABRICATED_SEAM_LEN: usize = 1024;
+/// The one ruled fallback slice extent (§39 addendum 77). This is the numeric
+/// source of truth for call-site adapters and the existing borrowed-slice
+/// emission path alike.
+pub(crate) const FALLBACK_SLICE_EXTENT: usize = 1024;
 
 /// The const's name in the emitted crate (marker ruling, 2026-08-15).
-pub(crate) const SEAM_LEN_CONST: &str = "SEAM_LEN_PLACEHOLDER";
+pub(crate) const SEAM_LEN_CONST: &str = "FALLBACK_SLICE_EXTENT";
 
 /// The path a fabricated extent is spelled as at the call site.
 ///
 /// Crate-qualified so a fabricated site in a non-root file resolves — the
 /// spelling the frozen legacy rewriter already used for `crate::slice_cursor::`.
-pub(crate) const FABRICATED_LEN_PATH: &str = "crate::SEAM_LEN_PLACEHOLDER";
+pub(crate) const FABRICATED_LEN_PATH: &str = "crate::FALLBACK_SLICE_EXTENT";
 
 /// **The const item, as emitted text — produced from a real AST item.**
 ///
@@ -223,7 +225,7 @@ pub(crate) const FABRICATED_LEN_PATH: &str = "crate::SEAM_LEN_PLACEHOLDER";
 /// One producer, two consumers: the span layer splices this string and the AST
 /// layer appends it, so the two emitters cannot disagree about the const's text.
 pub(crate) fn fabricated_len_item() -> String {
-    let item = ::utils::item!("const {SEAM_LEN_CONST}: usize = {FABRICATED_SEAM_LEN};");
+    let item = ::utils::item!("const {SEAM_LEN_CONST}: usize = {FALLBACK_SLICE_EXTENT};");
     rustc_ast_pretty::pprust::item_to_string(&item)
 }
 
@@ -246,6 +248,13 @@ pub(crate) struct SeamEdit {
     /// The edit lands in the caller's file and is owned by the callee, which is
     /// the divergence `plan`'s `owner_fn` doc was written for.
     pub owner_fn: String,
+    /// The caller side of `CallAdapterKey`.
+    pub caller_fn: String,
+    /// The callee's zero-based parameter position.
+    pub param_index: usize,
+    /// The HIR argument classifier's carried answer. This is receipt-only; no
+    /// consumer re-infers the source shape from replacement text.
+    pub source_shape: &'static str,
     pub family: SeamFamily,
     /// **Which adjacency arm licensed this slice seam's length** (ruling B,
     /// 2026-08-11). `None` for every non-slice seam, which needs no length.
@@ -358,6 +367,19 @@ pub(crate) enum GlueCore {
     FromRefMut,
 }
 
+/// How an optional TARGET treats null at the call boundary.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum NullArm {
+    /// Not a raw-to-optional boundary. `optional=true` still means a known-safe
+    /// reference/slice is wrapped in `Some`.
+    None,
+    /// The source expression is a raw pointer. Evaluate it once, test
+    /// `is_null`, and construct the payload only on the non-null branch.
+    Checked,
+    /// The source expression is syntactically a null literal.
+    LiteralNone,
+}
+
 /// One adapter, described rather than rendered.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct GlueSpec {
@@ -380,6 +402,9 @@ pub(crate) struct GlueSpec {
     pub len: Option<SeamLen>,
     /// Wrap the result in `Some(...)`.
     pub optional: bool,
+    /// The §29 boundary behavior. Separate from `optional`: a safe reference
+    /// uses ordinary `Some`, while a raw expression must be checked.
+    pub null_arm: NullArm,
 }
 
 impl GlueSpec {
@@ -390,6 +415,7 @@ impl GlueSpec {
             unwrap: None,
             len: None,
             optional: false,
+            null_arm: NullArm::None,
         }
     }
 
@@ -418,6 +444,51 @@ impl GlueSpec {
         self
     }
 
+    pub(crate) fn checked(mut self) -> Self {
+        self.optional = true;
+        self.null_arm = NullArm::Checked;
+        self
+    }
+
+    pub(crate) fn literal_none(mutable: bool) -> Self {
+        Self {
+            core: GlueCore::Bare,
+            mutable,
+            unwrap: None,
+            len: None,
+            optional: true,
+            null_arm: NullArm::LiteralNone,
+        }
+    }
+
+    pub(crate) fn null_arm_key(&self) -> &'static str {
+        match self.null_arm {
+            NullArm::Checked => "checked-is-null",
+            NullArm::LiteralNone => "literal-none",
+            NullArm::None if self.optional => "known-some",
+            NullArm::None => "-",
+        }
+    }
+
+    pub(crate) fn extent_arm_key(&self) -> &'static str {
+        match self.len.as_ref() {
+            Some(SeamLen::Licensed(_)) => "evidence-backed",
+            Some(SeamLen::Fabricated) => "fallback-1024",
+            None => "-",
+        }
+    }
+
+    pub(crate) fn template_key(&self) -> &'static str {
+        if self.optional {
+            "optional"
+        } else {
+            match self.core {
+                GlueCore::FromRawParts | GlueCore::FromRefMut => "slice",
+                GlueCore::Reborrow | GlueCore::Index0 | GlueCore::Bare => "scalar-reference",
+            }
+        }
+    }
+
     /// **The census's `glue_shape`, CARRIED rather than inferred** — condition 5
     /// of the option-A ruling.
     ///
@@ -436,6 +507,17 @@ impl GlueSpec {
     /// the places it was NOT right are the measured movement rather than a
     /// change of vocabulary mixed in with it.
     pub(crate) fn shape_key(&self) -> &'static str {
+        match self.null_arm {
+            NullArm::LiteralNone => return "none",
+            NullArm::Checked => {
+                return match self.core {
+                    GlueCore::FromRawParts => "checked_from_raw_parts",
+                    GlueCore::Reborrow => "checked_reborrow",
+                    _ => "checked_optional",
+                };
+            }
+            NullArm::None => {}
+        }
         if let Some(found_mutable) = self.unwrap {
             return if found_mutable {
                 "as_mut_unwrap"
@@ -490,6 +572,16 @@ impl GlueSpec {
     /// first — so this is fail-closed structure rather than a live path, and it
     /// moves no corpus line.
     pub(crate) fn render(&self, text: &str) -> Option<String> {
+        if self.null_arm == NullArm::LiteralNone {
+            return Some("None".to_owned());
+        }
+        let argument = text;
+        let checked_name = "__crat_call_adapter_ptr";
+        let text = if self.null_arm == NullArm::Checked {
+            checked_name
+        } else {
+            text
+        };
         let base = match self.unwrap {
             None => text.to_owned(),
             Some(found_mutable) => unwrap_expr(text, found_mutable),
@@ -526,7 +618,11 @@ impl GlueSpec {
                 format!("core::slice::{ctor}({base})")
             }
         };
-        Some(if self.optional {
+        Some(if self.null_arm == NullArm::Checked {
+            format!(
+                "{{ let {checked_name} = {argument}; if {checked_name}.is_null() {{ None }} else {{ Some({inner}) }} }}"
+            )
+        } else if self.optional {
             format!("Some({inner})")
         } else {
             inner
@@ -606,7 +702,7 @@ pub(crate) fn glue(
             },
             Raw,
         ) => Some((
-            GlueSpec::core(GlueCore::Reborrow, mutable).wrapped(),
+            GlueSpec::core(GlueCore::Reborrow, mutable).checked(),
             SeamFamily::Reborrow,
         )),
 
@@ -637,7 +733,7 @@ pub(crate) fn glue(
             },
             Raw,
         ) => Some((
-            with_length(GlueSpec::core(GlueCore::FromRawParts, mutable), len).wrapped(),
+            with_length(GlueSpec::core(GlueCore::FromRawParts, mutable), len).checked(),
             SeamFamily::Reborrow,
         )),
 
@@ -777,6 +873,16 @@ pub(crate) fn glue(
         // call. Measured, and it is why E3b predicts no counter movement here.
         (Raw, _) => None,
     })
+}
+
+/// The §29 null-literal arm. Kept beside [`glue`] so both the span and AST
+/// consumers receive an ordinary carried [`GlueSpec`]; null is not a special
+/// rewrite path below the decision layer.
+fn glue_null(expected: Form) -> Result<Option<(GlueSpec, SeamFamily)>, SeamBlock> {
+    match expected {
+        Form::Opt { mutable, .. } => Ok(Some((GlueSpec::literal_none(mutable), SeamFamily::Safe))),
+        _ => Err(SeamBlock::UnnameableOperand),
+    }
 }
 
 #[cfg(test)]
@@ -1050,9 +1156,9 @@ mod tests {
         );
     }
 
-    /// **Optional over a raw base composes both families**, and the composition
-    /// is `Some(&mut *p)` — not `&mut *Some(p)`, which does not parse as a
-    /// pointer operation at all.
+    /// **Optional over a raw base composes both families** behind one explicit
+    /// null check. The binding evaluates the source once and the borrow is built
+    /// only in the non-null branch.
     #[test]
     fn optional_over_raw_composes_reborrow_inside_some() {
         let (spec, fam) = g(
@@ -1064,7 +1170,10 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        assert_eq!(spec.render(T).unwrap(), "Some(&mut *p)");
+        assert_eq!(
+            spec.render(T).unwrap(),
+            "{ let __crat_call_adapter_ptr = p; if __crat_call_adapter_ptr.is_null() { None } else { Some(&mut *__crat_call_adapter_ptr) } }"
+        );
         assert_eq!(fam, SeamFamily::Reborrow, "the raw base carries the family");
     }
 
@@ -1231,7 +1340,7 @@ mod tests {
             .expect("fabricated specs render");
         assert_eq!(
             fabricated,
-            "core::slice::from_raw_parts(p, crate::SEAM_LEN_PLACEHOLDER)"
+            "core::slice::from_raw_parts(p, crate::FALLBACK_SLICE_EXTENT)"
         );
         assert!(
             !fabricated.contains("1024"),
@@ -1304,7 +1413,7 @@ mod tests {
                 ),
                 "p"
             ),
-            "Some(core::slice::from_raw_parts_mut(p, (n) as usize))"
+            "{ let __crat_call_adapter_ptr = p; if __crat_call_adapter_ptr.is_null() { None } else { Some(core::slice::from_raw_parts_mut(__crat_call_adapter_ptr, (n) as usize)) } }"
         );
         // **Without one, the position now FABRICATES** (ruling 2026-08-12,
         // superseding ruling item 4's `None` arm). What ruling B settled is
@@ -1316,7 +1425,7 @@ mod tests {
         assert_eq!(spec.len, Some(SeamLen::Fabricated));
         assert_eq!(
             spec.render("p").as_deref(),
-            Some("core::slice::from_raw_parts_mut(p, crate::SEAM_LEN_PLACEHOLDER)")
+            Some("core::slice::from_raw_parts_mut(p, crate::FALLBACK_SLICE_EXTENT)")
         );
     }
 
@@ -1455,9 +1564,14 @@ mod tests {
                 "the assertions above only mean anything if the two spans differ"
             );
 
-            // And the shapes with no nameable operand answer NOTHING rather
-            // than defaulting.
-            assert_eq!(text_span_of(ArgShape::NullLit, whole), None);
+            // A null literal is now a nameable whole-argument target: the AST
+            // layer replaces it with `None` and deliberately keeps no payload.
+            assert_eq!(text_span_of(ArgShape::NullLit, whole), Some(whole));
+            assert_eq!(
+                text_span_of(ArgShape::RawExpr { root: None }, whole),
+                Some(whole)
+            );
+            // The genuinely unnameable shapes still answer NOTHING.
             assert_eq!(text_span_of(ArgShape::Cast { inner: operand }, whole), None);
             assert_eq!(text_span_of(ArgShape::Other, whole), None);
         });
@@ -1502,7 +1616,10 @@ mod tests {
     /// was not are the next test, and they are the schema movement.
     #[test]
     fn the_carried_shape_agrees_with_the_retired_classifier() {
-        for spec in every_emitting_spec() {
+        for spec in every_emitting_spec()
+            .into_iter()
+            .filter(|spec| spec.null_arm == NullArm::None)
+        {
             assert_eq!(
                 spec.shape_key(),
                 inferred_shape(&spec.render("p").expect("emitting spec renders")),
@@ -1742,7 +1859,7 @@ use super::{Decision, DecisionTable, Subject, SubjectKind, emitability::ArgShape
 #[derive(Clone, Debug, Default)]
 pub(crate) struct SeamPlan {
     pub edits: Vec<SeamEdit>,
-    /// `(caller, callee, argument span, reason)`.
+    /// `(caller, callee, parameter index, argument span, reason)`.
     ///
     /// **The callee rides here because the CALLER is the wrong axis for
     /// pricing** (2026-08-12). A refused seam costs the *callee's* conversion —
@@ -1754,7 +1871,7 @@ pub(crate) struct SeamPlan {
     ///
     /// Two names rather than one, because they are two different functions and
     /// collapsing them is what made the question unanswerable.
-    pub blocked: Vec<(LocalDefId, LocalDefId, Span, SeamBlock)>,
+    pub blocked: Vec<(LocalDefId, LocalDefId, usize, Span, SeamBlock)>,
     /// **Ruling item 4a — companion-length coverage**, one row per
     /// length-gated position: `(callee path, pointer param index, evidence)`.
     ///
@@ -1868,6 +1985,11 @@ pub(crate) fn synthesize(
                 text_span: Span,
                 root: Option<HirId>,
                 blind: bool,
+                /// A literal `None` carries no borrow and therefore cannot
+                /// participate in the site's overlap relation.
+                borrows: bool,
+                literal_null: bool,
+                source_shape: &'static str,
             }
             let mut positions: Vec<Pos> = Vec::new();
             for arg in &site.args {
@@ -1890,12 +2012,14 @@ pub(crate) fn synthesize(
                 // out of this match rather than reconstructed below, because
                 // the two cast shapes read the OPERAND's snippet while every
                 // other shape reads the argument's own.
-                let (found, text, blind) = match arg.shape {
+                let (found, text, blind, borrows, literal_null) = match arg.shape {
                     ArgShape::BareLocal(hir) => (
                         decision_of
                             .get(&(site.caller, hir))
                             .map_or(Form::Raw, |d| form_of(d)),
                         sm.span_to_snippet(arg.span).ok(),
+                        false,
+                        true,
                         false,
                     ),
                     ArgShape::AddrOf {
@@ -1917,23 +2041,46 @@ pub(crate) fn synthesize(
                             Form::Ref { mutable },
                             sm.span_to_snippet(arg.span).ok(),
                             blind,
+                            true,
+                            false,
                         )
                     }
-                    ArgShape::AddrOfCast { mutable, inner } => {
-                        (Form::Ref { mutable }, sm.span_to_snippet(inner).ok(), true)
-                    }
+                    ArgShape::AddrOfCast { mutable, inner } => (
+                        Form::Ref { mutable },
+                        sm.span_to_snippet(inner).ok(),
+                        true,
+                        true,
+                        false,
+                    ),
                     ArgShape::CastOfLocal { binding, inner } => (
                         decision_of
                             .get(&(site.caller, binding))
                             .map_or(Form::Raw, |d| form_of(d)),
                         sm.span_to_snippet(inner).ok(),
                         false,
+                        true,
+                        false,
+                    ),
+                    ArgShape::RawExpr { .. } => (
+                        Form::Raw,
+                        sm.span_to_snippet(arg.span).ok(),
+                        true,
+                        true,
+                        false,
+                    ),
+                    ArgShape::NullLit if matches!(expected, Form::Opt { .. }) => (
+                        Form::Raw,
+                        sm.span_to_snippet(arg.span).ok(),
+                        false,
+                        false,
+                        true,
                     ),
                     // Not an expression this slice can name.
                     ArgShape::NullLit | ArgShape::Cast { .. } | ArgShape::Other => {
                         plan.blocked.push((
                             site.caller,
                             *callee,
+                            arg.index,
                             arg.span,
                             SeamBlock::UnnameableOperand,
                         ));
@@ -1951,6 +2098,7 @@ pub(crate) fn synthesize(
                     plan.blocked.push((
                         site.caller,
                         *callee,
+                        arg.index,
                         arg.span,
                         SeamBlock::UnnameableOperand,
                     ));
@@ -1965,6 +2113,9 @@ pub(crate) fn synthesize(
                     text_span,
                     root: arg.shape.place_root(),
                     blind,
+                    borrows,
+                    literal_null,
+                    source_shape: arg.shape.key(),
                 });
             }
 
@@ -1985,6 +2136,9 @@ pub(crate) fn synthesize(
             let mut refused: Vec<usize> = Vec::new();
             for i in 0..positions.len() {
                 for j in (i + 1)..positions.len() {
+                    if !positions[i].borrows || !positions[j].borrows {
+                        continue;
+                    }
                     // Two SHARED borrows of one place are legal, so a conflict
                     // needs at least one `&mut`.
                     if !is_mut(&positions[i].expected) && !is_mut(&positions[j].expected) {
@@ -2004,14 +2158,20 @@ pub(crate) fn synthesize(
             // ---- pass 3: emit ----
             for (idx, pos) in positions.iter().enumerate() {
                 if refused.contains(&idx) {
-                    plan.blocked
-                        .push((site.caller, *callee, pos.span, SeamBlock::SiteOverlap));
+                    plan.blocked.push((
+                        site.caller,
+                        *callee,
+                        pos.index,
+                        pos.span,
+                        SeamBlock::SiteOverlap,
+                    ));
                     continue;
                 }
                 let Some(text) = pos.text.as_deref() else {
                     plan.blocked.push((
                         site.caller,
                         *callee,
+                        pos.index,
                         pos.span,
                         SeamBlock::UnnameableOperand,
                     ));
@@ -2026,7 +2186,7 @@ pub(crate) fn synthesize(
                 let wants_len = matches!(
                     (pos.expected, pos.found),
                     (Form::Slice { .. }, Form::Raw) | (Form::Opt { slice: true, .. }, Form::Raw)
-                );
+                ) && !pos.literal_null;
                 let (len_text, len_evidence) = if wants_len {
                     let arm = length_evidence(tcx, *callee, pos.index);
                     let companion = match arm {
@@ -2047,7 +2207,7 @@ pub(crate) fn synthesize(
                     // emitted length were "one derivation". They were two
                     // expressions reading one variable, which agree by
                     // coincidence and not by construction: forcing this one to
-                    // `Licensed` left every emitted `crate::SEAM_LEN_PLACEHOLDER`
+                    // `Licensed` left every emitted `crate::FALLBACK_SLICE_EXTENT`
                     // in place while the artifact reported all 370 placements as
                     // licensed, with the whole suite green.
                     //
@@ -2061,7 +2221,12 @@ pub(crate) fn synthesize(
                 } else {
                     (None, None)
                 };
-                match glue(pos.expected, pos.found, len_text.as_deref()) {
+                let result = if pos.literal_null {
+                    glue_null(pos.expected)
+                } else {
+                    glue(pos.expected, pos.found, len_text.as_deref())
+                };
+                match result {
                     Ok(None) => {}
                     Ok(Some((spec, family))) => {
                         // Rule 1 (2026-08-11): the census is a prioritization
@@ -2087,6 +2252,7 @@ pub(crate) fn synthesize(
                             plan.blocked.push((
                                 site.caller,
                                 *callee,
+                                pos.index,
                                 pos.span,
                                 SeamBlock::LengthUnknown,
                             ));
@@ -2118,6 +2284,9 @@ pub(crate) fn synthesize(
                             span: pos.span,
                             replacement,
                             owner_fn: tcx.def_path_str(callee.to_def_id()),
+                            caller_fn: tcx.def_path_str(site.caller.to_def_id()),
+                            param_index: pos.index,
+                            source_shape: pos.source_shape,
                             family,
                             len_arm,
                             spec,
@@ -2142,7 +2311,8 @@ pub(crate) fn synthesize(
                             SeamBlock::LengthUnknown,
                             "glue must not gate on length after the fabrication ruling"
                         );
-                        plan.blocked.push((site.caller, *callee, pos.span, block));
+                        plan.blocked
+                            .push((site.caller, *callee, pos.index, pos.span, block));
                     }
                 }
             }
@@ -2168,9 +2338,12 @@ pub(crate) fn synthesize(
 /// already blocked as `UnnameableOperand` before any text is read.
 fn text_span_of(shape: ArgShape, arg_span: Span) -> Option<Span> {
     match shape {
-        ArgShape::BareLocal(_) | ArgShape::AddrOf { .. } => Some(arg_span),
+        ArgShape::BareLocal(_)
+        | ArgShape::AddrOf { .. }
+        | ArgShape::RawExpr { .. }
+        | ArgShape::NullLit => Some(arg_span),
         ArgShape::AddrOfCast { inner, .. } | ArgShape::CastOfLocal { inner, .. } => Some(inner),
-        ArgShape::NullLit | ArgShape::Cast { .. } | ArgShape::Other => None,
+        ArgShape::Cast { .. } | ArgShape::Other => None,
     }
 }
 
