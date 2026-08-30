@@ -1949,6 +1949,16 @@ pub(crate) fn cache_decide_receipt_for_test(tcx: TyCtxt<'_>) -> Result<String, S
     decide_table_with_ctx(tcx).map(|(_, context)| context.a5_receipt)
 }
 
+#[cfg(test)]
+pub(crate) fn cache_fingerprint_for_test(tcx: TyCtxt<'_>) -> String {
+    let program = collect_program(tcx);
+    model_cache::fingerprint(
+        &program,
+        A5Mode::PreciseReplay,
+        Some(WholeProgramAttestation::FrozenBenchmarkGraph),
+    )
+}
+
 fn decide_table_with_ctx_config<'tcx>(
     tcx: TyCtxt<'tcx>,
     a5_override: Option<(A5Mode, Option<WholeProgramAttestation>)>,

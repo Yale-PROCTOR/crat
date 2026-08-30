@@ -209,11 +209,9 @@ pub(crate) fn fingerprint(
     a5_mode: A5Mode,
     attestation: Option<WholeProgramAttestation>,
 ) -> String {
-    let mut h = Sha256::new();
-
     // §39 addendum 74: the accepted analysis frame and the complete resolved
     // solver configuration are key material, not a launch-time convention.
-    h.update(solver_identity(a5_mode, attestation).as_bytes());
+    let solver = solver_identity(a5_mode, attestation);
 
     // 1. The program's own source. Per-program, not the whole-corpus digest, so
     //    one program changing does not void the other nineteen.
@@ -226,24 +224,28 @@ pub(crate) fn fingerprint(
             files.push((canonical_program_path(p), f.src_hash.hash_bytes().to_vec()));
         }
     }
-    h.update(program_identity(
-        tcx.crate_name(LOCAL_CRATE).as_str(),
-        files,
-    ));
+    let program = program_identity(tcx.crate_name(LOCAL_CRATE).as_str(), files);
 
     // 2. The analysis code. Any edit under `analyses/` changes what a solve
     //    means, so a cache written by the old code must not be read by the new.
-    h.update(code_fingerprint_cached().as_bytes());
+    let code = code_fingerprint_cached();
 
     // 3. The toolchain.
-    h.update(
-        std::fs::read(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../rust-toolchain.toml"
-        ))
-        .unwrap_or_default(),
-    );
+    let toolchain = std::fs::read(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../rust-toolchain.toml"
+    ))
+    .unwrap_or_default();
 
+    fingerprint_components(&solver, &program, code, &toolchain)
+}
+
+fn fingerprint_components(solver: &str, program: &str, code: &str, toolchain: &[u8]) -> String {
+    let mut h = Sha256::new();
+    h.update(solver.as_bytes());
+    h.update(program.as_bytes());
+    h.update(code.as_bytes());
+    h.update(toolchain);
     format!("{:x}", h.finalize())
 }
 
@@ -266,11 +268,29 @@ fn analysis_code_fingerprint_at(root: &Path) -> String {
     }
     let mut files = Vec::new();
     walk(root, &mut files);
-    files.sort();
+    files.sort_by(|left, right| {
+        left.strip_prefix(root)
+            .expect("walked analysis file is under root")
+            .cmp(
+                right
+                    .strip_prefix(root)
+                    .expect("walked analysis file is under root"),
+            )
+    });
     let mut h = Sha256::new();
     for f in &files {
-        h.update(f.display().to_string().as_bytes());
-        h.update(std::fs::read(f).unwrap_or_default());
+        let relative = f
+            .strip_prefix(root)
+            .expect("walked analysis file is under root")
+            .components()
+            .map(|component| component.as_os_str().to_string_lossy())
+            .collect::<Vec<_>>()
+            .join("/");
+        let content = std::fs::read(f).unwrap_or_default();
+        let content_hash = Sha256::digest(content);
+        h.update((relative.len() as u64).to_le_bytes());
+        h.update(relative.as_bytes());
+        h.update(content_hash);
     }
     format!("{:x}", h.finalize())
 }
@@ -293,10 +313,51 @@ pub(crate) fn rekey_entry(
     new_dir: &Path,
     new_fingerprint: &str,
 ) -> Result<PathBuf, String> {
+    if new_fingerprint.len() != 64 || !new_fingerprint.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        return Err(format!("invalid new fingerprint {new_fingerprint:?}"));
+    }
     let bytes = std::fs::read(old_path).map_err(|error| error.to_string())?;
+    let newline = bytes
+        .iter()
+        .position(|byte| *byte == b'\n')
+        .ok_or_else(|| "cache entry has no fingerprint line".to_owned())?;
+    let first = std::str::from_utf8(&bytes[..newline]).map_err(|error| error.to_string())?;
+    let old_fingerprint = first
+        .strip_prefix("# fingerprint ")
+        .ok_or_else(|| format!("invalid cache fingerprint line {first:?}"))?;
+    let old_name = old_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .and_then(|name| name.strip_suffix(".model.tsv"))
+        .ok_or_else(|| format!("invalid cache entry path {}", old_path.display()))?;
+    if old_name != old_fingerprint {
+        return Err(format!(
+            "source cache key mismatch: filename={old_name} header={old_fingerprint}"
+        ));
+    }
     std::fs::create_dir_all(new_dir).map_err(|error| error.to_string())?;
     let new_path = entry_path(new_dir, new_fingerprint);
-    std::fs::write(&new_path, bytes).map_err(|error| error.to_string())?;
+    let mut staged = format!("# fingerprint {new_fingerprint}\n").into_bytes();
+    staged.extend_from_slice(&bytes[newline + 1..]);
+    let mut output = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&new_path)
+        .map_err(|error| error.to_string())?;
+    std::io::Write::write_all(&mut output, &staged).map_err(|error| error.to_string())?;
+    let permissions = std::fs::metadata(old_path)
+        .map_err(|error| error.to_string())?
+        .permissions();
+    std::fs::set_permissions(&new_path, permissions).map_err(|error| error.to_string())?;
+    let check = std::fs::read(&new_path).map_err(|error| error.to_string())?;
+    let staged_newline = check
+        .iter()
+        .position(|byte| *byte == b'\n')
+        .ok_or_else(|| "staged cache entry has no fingerprint line".to_owned())?;
+    if check[staged_newline + 1..] != bytes[newline + 1..] {
+        return Err("re-key changed bytes after line 1".to_owned());
+    }
     Ok(new_path)
 }
 
@@ -810,6 +871,22 @@ mod tests {
             analysis_code_fingerprint_at(&a),
             analysis_code_fingerprint_at(&b),
             "absolute worktree location entered the cache key"
+        );
+        let left_key = fingerprint_components(
+            "solver",
+            "program",
+            &analysis_code_fingerprint_at(&a),
+            b"toolchain",
+        );
+        let right_key = fingerprint_components(
+            "solver",
+            "program",
+            &analysis_code_fingerprint_at(&b),
+            b"toolchain",
+        );
+        assert_eq!(
+            left_key, right_key,
+            "the complete cache key is not portable"
         );
         std::fs::write(b.join("nested/a.rs"), "pub fn changed() {}\n").expect("mutate content");
         assert_ne!(

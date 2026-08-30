@@ -14941,10 +14941,164 @@ fn m1_emit_corpus() {
     );
 }
 
+fn e1_rekey_cache_corpus() {
+    use std::fs;
+
+    use sha2::{Digest, Sha256};
+
+    let root = orchestrate::workspace_root();
+    let old_dir = std::env::var_os("CRAT_E1_REKEY_OLD_DIR")
+        .map(std::path::PathBuf::from)
+        .expect("re-key requires CRAT_E1_REKEY_OLD_DIR");
+    let new_dir = std::env::var_os("CRAT_E1_REKEY_NEW_DIR")
+        .map(std::path::PathBuf::from)
+        .expect("re-key requires CRAT_E1_REKEY_NEW_DIR");
+    let receipt_dir = std::env::var_os("CRAT_E1_REKEY_RECEIPT_DIR")
+        .map(std::path::PathBuf::from)
+        .expect("re-key requires CRAT_E1_REKEY_RECEIPT_DIR");
+    let artifact = std::env::var_os("CRAT_E1_REKEY_ARTIFACT")
+        .map(std::path::PathBuf::from)
+        .expect("re-key requires CRAT_E1_REKEY_ARTIFACT");
+    assert_eq!(
+        fs::read_dir(&old_dir).expect("old cache").count(),
+        20,
+        "accepted source cache must contain exactly 20 entries"
+    );
+    fs::create_dir_all(&new_dir).expect("staged cache dir");
+    assert_eq!(
+        fs::read_dir(&new_dir).expect("staged cache").count(),
+        0,
+        "staged cache must start empty"
+    );
+
+    let receipt_fields = |program: &str| {
+        let path = receipt_dir.join(format!("{program}.cache-receipt.tsv"));
+        let text = fs::read_to_string(path).expect("accepted cache receipt");
+        let mut lines = text.lines();
+        let header = lines
+            .next()
+            .expect("receipt header")
+            .split('\t')
+            .collect::<Vec<_>>();
+        let row = lines
+            .next()
+            .expect("receipt row")
+            .split('\t')
+            .collect::<Vec<_>>();
+        let field = |name: &str| {
+            let index = header
+                .iter()
+                .position(|value| *value == name)
+                .unwrap_or_else(|| panic!("missing {name} in {header:?}"));
+            row[index].to_owned()
+        };
+        (field("fingerprint"), field("model_sha256"))
+    };
+    let model_sha = |text: &str| {
+        let rows = text
+            .lines()
+            .filter_map(|line| line.strip_prefix("M\t"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        format!("{:x}", Sha256::digest(rows.as_bytes()))
+    };
+
+    let mut output = String::from(
+        "program\told_fingerprint\tnew_fingerprint\tmodel_sha256\ttail_sha256\tloader_pending\n",
+    );
+    let mut new_keys = std::collections::BTreeSet::new();
+    for program in CORPUS {
+        let input = program.input_path(&root);
+        let new_fingerprint = ::utils::compilation::run_compiler_on_path(&input, |tcx| {
+            crate::bo_rewriter::cache_fingerprint_for_test(tcx)
+        })
+        .expect("analysis-free cache fingerprint");
+        assert!(
+            new_keys.insert(new_fingerprint.clone()),
+            "duplicate new cache key for {}",
+            program.name
+        );
+        let (old_fingerprint, expected_model) = receipt_fields(program.name);
+        let old_path = old_dir.join(format!("{old_fingerprint}.model.tsv"));
+        let old = fs::read(&old_path).expect("accepted cache entry");
+        let old_newline = old
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .expect("old fingerprint line");
+        let old_text = std::str::from_utf8(&old).expect("cache is UTF-8");
+        assert_eq!(
+            model_sha(old_text),
+            expected_model,
+            "{} model SHA",
+            program.name
+        );
+        let staged = crate::analyses::borrow_ownership::model_cache::rekey_entry(
+            &old_path,
+            &new_dir,
+            &new_fingerprint,
+        )
+        .expect("re-key accepted entry");
+        let new = fs::read(&staged).expect("staged entry");
+        let new_newline = new
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .expect("new fingerprint line");
+        assert_eq!(
+            &old[old_newline + 1..],
+            &new[new_newline + 1..],
+            "{} bytes after line 1 moved",
+            program.name
+        );
+        let new_text = std::str::from_utf8(&new).expect("staged cache is UTF-8");
+        assert_eq!(
+            model_sha(new_text),
+            expected_model,
+            "{} staged model SHA",
+            program.name
+        );
+        assert!(
+            old_path.is_file(),
+            "{} source entry was removed",
+            program.name
+        );
+        output.push_str(&format!(
+            "{}\t{}\t{}\t{}\t{:x}\t1\n",
+            program.name,
+            old_fingerprint,
+            new_fingerprint,
+            expected_model,
+            Sha256::digest(&new[new_newline + 1..]),
+        ));
+        println!(
+            "E1-REKEY program={} old={} new={} status=ok",
+            program.name, old_fingerprint, new_fingerprint
+        );
+    }
+    assert_eq!(new_keys.len(), 20);
+    assert_eq!(
+        fs::read_dir(&new_dir).expect("staged cache final").count(),
+        20
+    );
+    assert_eq!(
+        fs::read_dir(&old_dir).expect("old cache final").count(),
+        20,
+        "accepted source cache moved"
+    );
+    if let Some(parent) = artifact.parent() {
+        fs::create_dir_all(parent).expect("re-key artifact parent");
+    }
+    fs::write(artifact, output).expect("write re-key map");
+}
+
 #[test]
 #[ignore = "Item E measurement: serialized 20-program single-iteration revert census"]
 fn e1_revert_census_corpus() {
     use std::{fs, time::Duration};
+
+    if std::env::var("CRAT_E1_REKEY").as_deref() == Ok("1") {
+        e1_rekey_cache_corpus();
+        return;
+    }
 
     let readback = std::env::var("CRAT_E1_READBACK").as_deref() == Ok("1");
     assert_eq!(
