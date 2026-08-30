@@ -33,29 +33,170 @@
 //! `target/boc1/**`. Cross-lane consumption, if ever, goes via published
 //! manifests.
 
-use std::path::{Path, PathBuf};
+use std::{
+    collections::BTreeMap,
+    path::{Path, PathBuf},
+};
 
 use rustc_hash::FxHashMap;
 use rustc_middle::ty::TyCtxt;
+use rustc_span::def_id::LOCAL_CRATE;
 use sha2::{Digest, Sha256};
 
 use super::{
-    SlotKind,
+    SafeMonoMode, SlotKind,
+    a5_overlap::{A5Mode, A5World, WholeProgramAttestation},
+    borrow_engine::ForkEngineMode,
+    borrow_verify::RepairMode,
+    construction::{A2Mode, CopyLendMode},
     crate_slots::CrateSlots,
     slot_key::{field_key, local_key},
     solver::SlotRef,
 };
 use crate::utils::rustc::RustProgram;
 
+/// The frozen analysis semantics consumed by Item E. Rewriter/cache-only
+/// changes after this commit do not advance this identity.
+pub(crate) const ANALYSIS_FRAME: &str = "borrow-ownership@782663881fe7d1d463414aa9236aab09b1c21b0d";
+
+const CACHE_SCHEMA: &str = "bo-model-cache-v2";
+const A14_MARKER: &str = "positive-opacity-v1";
+const A16_MARKER: &str = "modeled-origin-one-way-v1";
+const T2_MARKER: &str = "endpoint-force-retraction-v1";
+const ESC_MINIMAL_MARKER: &str = "direct-escape-minimal-v1";
+const ESC_MINIMAL_ALLOWLIST: &[u8] = include_bytes!("esc_minimal_allowlist.tsv");
+
+/// The readable solver identity that is hashed into every cache key.
+///
+/// This is deliberately explicit even though the analyses-tree hash remains
+/// in the fingerprint. The ② allowlist is not Rust source, and named markers
+/// make a receipt auditable without reverse-engineering which code bytes imply
+/// which accepted configuration.
+pub(crate) fn solver_identity(
+    a5_mode: A5Mode,
+    attestation: Option<WholeProgramAttestation>,
+) -> String {
+    let mut fields = BTreeMap::new();
+    fields.insert("a14", A14_MARKER.to_owned());
+    fields.insert("a16", A16_MARKER.to_owned());
+    fields.insert("a2_mode", A2Mode::current().label().to_owned());
+    fields.insert("a5_mode", a5_mode.label().to_owned());
+    fields.insert(
+        "a5_attestation",
+        match attestation {
+            Some(WholeProgramAttestation::FrozenBenchmarkGraph) => "frozen_benchmark_graph",
+            None => "none",
+        }
+        .to_owned(),
+    );
+    fields.insert(
+        "a5_world",
+        A5World::ClosedWorldFrozenGraph.label().to_owned(),
+    );
+    fields.insert("analysis_frame", ANALYSIS_FRAME.to_owned());
+    fields.insert("copy_lend_mode", CopyLendMode::current().label().to_owned());
+    fields.insert(
+        "esc_allowlist_sha256",
+        format!("{:x}", Sha256::digest(ESC_MINIMAL_ALLOWLIST)),
+    );
+    fields.insert("esc_minimal", ESC_MINIMAL_MARKER.to_owned());
+    fields.insert("fork_engine", ForkEngineMode::current().label().to_owned());
+    fields.insert(
+        "l2_guarded_commits",
+        super::l2::enabled_from_env().to_string(),
+    );
+    fields.insert(
+        "nb4r_routing",
+        if matches!(
+            std::env::var("CRAT_NB4R_ROUTING").as_deref(),
+            Ok("off" | "0")
+        ) {
+            "off"
+        } else {
+            "on"
+        }
+        .to_owned(),
+    );
+    fields.insert("repair_mode", RepairMode::current().label().to_owned());
+    fields.insert("safe_mono", SafeMonoMode::current().label().to_owned());
+    fields.insert("t2", T2_MARKER.to_owned());
+    fields.insert("mutability", "foster-from-program-v1".to_owned());
+    for key in [
+        "CRAT_BO_EXPORT",
+        "CRAT_BO_L2_TRANSITION_DIAGNOSTICS",
+        "CRAT_BO_POINT_REQUIRES_TRIPWIRE",
+        "CRAT_POINTER_DECISION_DIAGNOSTICS",
+    ] {
+        fields.insert(key, std::env::var(key).unwrap_or_default());
+    }
+    fields
+        .into_iter()
+        .map(|(key, value)| format!("{key}={value}"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn program_identity(
+    crate_name: &str,
+    files: impl IntoIterator<Item = (String, Vec<u8>)>,
+) -> String {
+    let mut files = files.into_iter().collect::<Vec<_>>();
+    files.sort_by(|left, right| left.0.cmp(&right.0).then(left.1.cmp(&right.1)));
+    let mut hash = Sha256::new();
+    hash.update(crate_name.as_bytes());
+    for (path, source_hash) in files {
+        hash.update(path.as_bytes());
+        hash.update((source_hash.len() as u64).to_le_bytes());
+        hash.update(source_hash);
+    }
+    format!("{:x}", hash.finalize())
+}
+
+fn canonical_program_path(path: &Path) -> String {
+    std::fs::canonicalize(path)
+        .unwrap_or_else(|_| path.to_path_buf())
+        .display()
+        .to_string()
+}
+
 /// `CRAT_BO_CACHE=1` enables reads. Writes happen whenever a real solve runs
 /// with a cache directory configured, so a bypassed gate sweep still refreshes
 /// what dev iteration will read next.
 pub(crate) fn read_enabled() -> bool {
+    #[cfg(test)]
+    if let Some((read, _)) = TEST_CONFIG.with(|config| config.borrow().clone()) {
+        return read;
+    }
     matches!(std::env::var("CRAT_BO_CACHE").as_deref(), Ok("1"))
 }
 
 pub(crate) fn dir() -> Option<PathBuf> {
+    #[cfg(test)]
+    if let Some((_, dir)) = TEST_CONFIG.with(|config| config.borrow().clone()) {
+        return Some(dir);
+    }
     std::env::var_os("CRAT_BO_CACHE_DIR").map(PathBuf::from)
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_CONFIG: std::cell::RefCell<Option<(bool, PathBuf)>> = const {
+        std::cell::RefCell::new(None)
+    };
+}
+
+#[cfg(test)]
+pub(crate) fn with_test_config<T>(read: bool, dir: &Path, run: impl FnOnce() -> T) -> T {
+    struct Restore(Option<(bool, PathBuf)>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            TEST_CONFIG.with(|config| *config.borrow_mut() = self.0.take());
+        }
+    }
+    let previous =
+        TEST_CONFIG.with(|config| config.borrow_mut().replace((read, dir.to_path_buf())));
+    let _restore = Restore(previous);
+    run()
 }
 
 /// Everything the cached model is a function of.
@@ -63,34 +204,32 @@ pub(crate) fn dir() -> Option<PathBuf> {
 /// A change to **any** of these must invalidate, so they are hashed together
 /// into one value rather than checked severally — a severally-checked key grows
 /// a forgotten term.
-pub(crate) fn fingerprint(program: &RustProgram<'_>) -> String {
+pub(crate) fn fingerprint(
+    program: &RustProgram<'_>,
+    a5_mode: A5Mode,
+    attestation: Option<WholeProgramAttestation>,
+) -> String {
     let mut h = Sha256::new();
 
-    // D3: the comparison mode is part of launch identity. A cache entry from one arm must never
-    // answer another arm's solve even when source and analysis code are byte-identical.
-    h.update(
-        super::construction::CopyLendMode::current()
-            .label()
-            .as_bytes(),
-    );
+    // §39 addendum 74: the accepted analysis frame and the complete resolved
+    // solver configuration are key material, not a launch-time convention.
+    h.update(solver_identity(a5_mode, attestation).as_bytes());
 
     // 1. The program's own source. Per-program, not the whole-corpus digest, so
     //    one program changing does not void the other nineteen.
     let tcx = program.tcx;
-    let mut files: Vec<(String, u64)> = Vec::new();
+    let mut files = Vec::new();
     for f in tcx.sess.source_map().files().iter() {
         if let rustc_span::FileName::Real(rp) = &f.name
             && let Some(p) = rp.local_path()
         {
-            files.push((
-                p.display().to_string(),
-                f.src_hash.hash_bytes().len() as u64,
-            ));
-            h.update(p.display().to_string().as_bytes());
-            h.update(f.src_hash.hash_bytes());
+            files.push((canonical_program_path(p), f.src_hash.hash_bytes().to_vec()));
         }
     }
-    let _ = files;
+    h.update(program_identity(
+        tcx.crate_name(LOCAL_CRATE).as_str(),
+        files,
+    ));
 
     // 2. The analysis code. Any edit under `analyses/` changes what a solve
     //    means, so a cache written by the old code must not be read by the new.
@@ -104,18 +243,6 @@ pub(crate) fn fingerprint(program: &RustProgram<'_>) -> String {
         ))
         .unwrap_or_default(),
     );
-
-    // 4. Mode flags that reach the solver.
-    for k in [
-        "CRAT_BO_L2_GUARDED_COMMITS",
-        "CRAT_BO_SAFE_MONO",
-        "CRAT_BO_STRONG_MONO",
-        "CRAT_BO_PER_SITE",
-        "CRAT_BO_EXPORT",
-    ] {
-        h.update(k.as_bytes());
-        h.update(std::env::var(k).unwrap_or_default().as_bytes());
-    }
 
     format!("{:x}", h.finalize())
 }
@@ -153,40 +280,117 @@ fn entry_path(d: &Path, fingerprint: &str) -> PathBuf {
     d.join(format!("{fingerprint}.model.tsv"))
 }
 
-/// Serialize the accepted model under canonical slot keys.
+pub(crate) fn configured_entry_path(fingerprint: &str) -> Option<PathBuf> {
+    Some(entry_path(&dir()?, fingerprint))
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct CachedModel {
+    /// The exact `VerifiedBo.model` consumed by the rewriter.
+    pub(crate) model: FxHashMap<SlotRef, SlotKind>,
+    /// A5's planning baseline, needed to reconstruct current-session C9 mark
+    /// spans without another solver invocation.
+    pub(crate) baseline_model: FxHashMap<SlotRef, SlotKind>,
+    /// The construction receipt from the solve that produced `model`.
+    pub(crate) a5_receipt: String,
+}
+
+fn kind_label(kind: SlotKind) -> &'static str {
+    match kind {
+        SlotKind::Ref => "ref",
+        SlotKind::Raw => "raw",
+        SlotKind::Owning => "owning",
+    }
+}
+
+fn parse_kind(kind: &str) -> Option<SlotKind> {
+    match kind {
+        "ref" => Some(SlotKind::Ref),
+        "raw" => Some(SlotKind::Raw),
+        "owning" => Some(SlotKind::Owning),
+        _ => None,
+    }
+}
+
+fn canonical_model_rows(
+    tcx: TyCtxt<'_>,
+    slots: &CrateSlots,
+    model: &FxHashMap<SlotRef, SlotKind>,
+) -> Option<Vec<String>> {
+    let mut rows = Vec::with_capacity(model.len());
+    for (&slot, &kind) in model {
+        rows.push(format!(
+            "{}\t{}",
+            render_key(tcx, slots, slot)?,
+            kind_label(kind)
+        ));
+    }
+    rows.sort();
+    Some(rows)
+}
+
+/// SHA-256 of the session-independent bytes representing the consumed model.
+pub(crate) fn model_bytes_sha256(
+    tcx: TyCtxt<'_>,
+    slots: &CrateSlots,
+    model: &FxHashMap<SlotRef, SlotKind>,
+) -> Option<String> {
+    let rows = canonical_model_rows(tcx, slots, model)?;
+    Some(format!("{:x}", Sha256::digest(rows.join("\n").as_bytes())))
+}
+
+fn attestation_label(attestation: Option<WholeProgramAttestation>) -> &'static str {
+    match attestation {
+        Some(WholeProgramAttestation::FrozenBenchmarkGraph) => "frozen_benchmark_graph",
+        None => "none",
+    }
+}
+
+/// Serialize the accepted model and its minimum precise-replay rehydration
+/// payload under canonical slot keys.
 pub(crate) fn store(
     tcx: TyCtxt<'_>,
     program: &RustProgram<'_>,
     slots: &CrateSlots,
-    model: &FxHashMap<SlotRef, SlotKind>,
-) {
-    let (Some(d), fp) = (dir(), fingerprint(program)) else {
-        return;
-    };
+    cached: &CachedModel,
+    a5_mode: A5Mode,
+    attestation: Option<WholeProgramAttestation>,
+) -> Option<PathBuf> {
+    let d = dir()?;
+    let fp = fingerprint(program, a5_mode, attestation);
     if std::fs::create_dir_all(&d).is_err() {
-        return;
+        return None;
+    };
+    let mut payload = Vec::new();
+    for row in canonical_model_rows(tcx, slots, &cached.model)? {
+        payload.push(format!("M\t{row}"));
     }
-    let mut lines: Vec<String> = model
-        .iter()
-        .filter_map(|(r, k)| {
-            let key = render_key(tcx, slots, *r)?;
-            let kind = match k {
-                SlotKind::Ref => "ref",
-                SlotKind::Raw => "raw",
-                SlotKind::Owning => "owning",
-            };
-            Some(format!("{key}\t{kind}"))
-        })
-        .collect();
-    // Sorted: a cache entry that permutes between runs is not comparable, and
-    // D19's lesson is that report order is part of the artifact.
-    lines.sort();
-    let mode = super::construction::CopyLendMode::current().label();
+    for row in canonical_model_rows(tcx, slots, &cached.baseline_model)? {
+        payload.push(format!("B\t{row}"));
+    }
+    for line in cached.a5_receipt.lines() {
+        if line.contains(['\t', '\r']) {
+            return None;
+        }
+        payload.push(format!("R\t{line}"));
+    }
+    if cached.a5_receipt.is_empty() {
+        return None;
+    }
+    let payload = payload.join("\n");
+    let identity = solver_identity(a5_mode, attestation);
+    let identity_sha = format!("{:x}", Sha256::digest(identity.as_bytes()));
+    let payload_sha = format!("{:x}", Sha256::digest(payload.as_bytes()));
     let body = format!(
-        "# fingerprint {fp}\n# copy_lend_mode {mode}\n{}\n",
-        lines.join("\n")
+        "# fingerprint {fp}\n# schema {CACHE_SCHEMA}\n# analysis_frame {ANALYSIS_FRAME}\n\
+         # solver_identity_sha256 {identity_sha}\n# a5_mode {}\n# a5_attestation {}\n\
+         # payload_sha256 {payload_sha}\n{payload}\n",
+        a5_mode.label(),
+        attestation_label(attestation),
     );
-    let _ = std::fs::write(entry_path(&d, &fp), body);
+    let path = entry_path(&d, &fp);
+    std::fs::write(&path, body).ok()?;
+    Some(path)
 }
 
 fn render_key(tcx: TyCtxt<'_>, slots: &CrateSlots, r: SlotRef) -> Option<String> {
@@ -213,22 +417,40 @@ pub(crate) fn load(
     tcx: TyCtxt<'_>,
     program: &RustProgram<'_>,
     slots: &CrateSlots,
-) -> Option<FxHashMap<SlotRef, SlotKind>> {
+    a5_mode: A5Mode,
+    attestation: Option<WholeProgramAttestation>,
+) -> Option<CachedModel> {
     if !read_enabled() {
         return None;
     }
     let d = dir()?;
-    let fp = fingerprint(program);
+    let fp = fingerprint(program, a5_mode, attestation);
     let text = std::fs::read_to_string(entry_path(&d, &fp)).ok()?;
 
     // The fingerprint is in the key AND in the body. The body check catches a
     // file renamed or copied into place — the shape a manifest check exists for.
-    let first = text.lines().next()?;
+    let mut lines = text.lines();
+    let first = lines.next()?;
     if first != format!("# fingerprint {fp}") {
         return None;
     }
-    let mode = super::construction::CopyLendMode::current().label();
-    if text.lines().nth(1)? != format!("# copy_lend_mode {mode}") {
+    if lines.next()? != format!("# schema {CACHE_SCHEMA}")
+        || lines.next()? != format!("# analysis_frame {ANALYSIS_FRAME}")
+    {
+        return None;
+    }
+    let identity = solver_identity(a5_mode, attestation);
+    let identity_sha = format!("{:x}", Sha256::digest(identity.as_bytes()));
+    if lines.next()? != format!("# solver_identity_sha256 {identity_sha}")
+        || lines.next()? != format!("# a5_mode {}", a5_mode.label())
+        || lines.next()? != format!("# a5_attestation {}", attestation_label(attestation))
+    {
+        return None;
+    }
+    let payload_sha_line = lines.next()?;
+    let payload = lines.collect::<Vec<_>>().join("\n");
+    let payload_sha = format!("{:x}", Sha256::digest(payload.as_bytes()));
+    if payload_sha_line != format!("# payload_sha256 {payload_sha}") {
         return None;
     }
 
@@ -240,38 +462,188 @@ pub(crate) fn load(
         for i in 0..universe.len() {
             let id = super::slots::SlotId::from_usize(i);
             if let Some(k) = render_key(tcx, slots, SlotRef::Local(fn_did, id)) {
-                by_key.insert(k, SlotRef::Local(fn_did, id));
+                if by_key.insert(k, SlotRef::Local(fn_did, id)).is_some() {
+                    return None;
+                }
             }
         }
     }
     for i in 0..slots.field_slots.len() {
         let id = super::slots::SlotId::from_usize(i);
         if let Some(k) = render_key(tcx, slots, SlotRef::Field(id)) {
-            by_key.insert(k, SlotRef::Field(id));
+            if by_key.insert(k, SlotRef::Field(id)).is_some() {
+                return None;
+            }
         }
     }
 
-    let mut out = FxHashMap::default();
-    for line in text.lines().skip(2) {
-        if line.trim().is_empty() {
-            continue;
-        }
-        let (key, kind) = line.split_once('\t')?;
-        let r = *by_key.get(key)?;
-        let k = match kind {
-            "ref" => SlotKind::Ref,
-            "raw" => SlotKind::Raw,
-            "owning" => SlotKind::Owning,
+    let mut model = FxHashMap::default();
+    let mut baseline_model = FxHashMap::default();
+    let mut receipt = Vec::new();
+    for line in payload.lines() {
+        let mut fields = line.splitn(3, '\t');
+        match (fields.next()?, fields.next(), fields.next()) {
+            ("M", Some(key), Some(kind)) => {
+                let slot = *by_key.get(key)?;
+                if model.insert(slot, parse_kind(kind)?).is_some() {
+                    return None;
+                }
+            }
+            ("B", Some(key), Some(kind)) => {
+                let slot = *by_key.get(key)?;
+                if baseline_model.insert(slot, parse_kind(kind)?).is_some() {
+                    return None;
+                }
+            }
+            ("R", Some(line), None) => receipt.push(line.to_owned()),
             _ => return None,
-        };
-        out.insert(r, k);
+        }
     }
-    Some(out)
+    if model.len() != by_key.len() || baseline_model.len() != by_key.len() || receipt.is_empty() {
+        return None;
+    }
+    Some(CachedModel {
+        model,
+        baseline_model,
+        a5_receipt: format!("{}\n", receipt.join("\n")),
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Item E / §39 addendum 74: a production cache key names the accepted
+    /// solver world explicitly. The analyses-tree hash remains a backstop, but
+    /// it is not a substitute for a readable identity: in particular the
+    /// ②-minimal allowlist is a TSV and therefore was outside the old `.rs`
+    /// tree walk.
+    #[test]
+    fn precise_cache_identity_names_every_frozen_solver_marker() {
+        let identity = solver_identity(
+            super::super::a5_overlap::A5Mode::PreciseReplay,
+            Some(super::super::a5_overlap::WholeProgramAttestation::FrozenBenchmarkGraph),
+        );
+        for required in [
+            "analysis_frame=borrow-ownership@782663881fe7d1d463414aa9236aab09b1c21b0d",
+            "a5_mode=precise_replay",
+            "a5_world=closed_world_frozen_graph",
+            "a5_attestation=frozen_benchmark_graph",
+            "a14=positive-opacity-v1",
+            "a16=modeled-origin-one-way-v1",
+            "t2=endpoint-force-retraction-v1",
+            "esc_minimal=direct-escape-minimal-v1",
+            "esc_allowlist_sha256=",
+            "copy_lend_mode=baseline",
+            "a2_mode=off",
+        ] {
+            assert!(
+                identity.contains(required),
+                "cache identity omitted {required:?}:\n{identity}"
+            );
+        }
+    }
+
+    #[test]
+    fn cache_identity_separates_a5_mode_and_graph_attestation() {
+        use super::super::a5_overlap::{A5Mode, WholeProgramAttestation};
+
+        let precise_attested = solver_identity(
+            A5Mode::PreciseReplay,
+            Some(WholeProgramAttestation::FrozenBenchmarkGraph),
+        );
+        let precise_unattested = solver_identity(A5Mode::PreciseReplay, None);
+        let baseline = solver_identity(
+            A5Mode::Baseline,
+            Some(WholeProgramAttestation::FrozenBenchmarkGraph),
+        );
+        assert_ne!(precise_attested, precise_unattested);
+        assert_ne!(precise_attested, baseline);
+    }
+
+    #[test]
+    fn program_identity_is_independent_of_source_map_iteration_order() {
+        let left = vec![
+            ("z.rs".to_owned(), vec![3, 4]),
+            ("a.rs".to_owned(), vec![1, 2]),
+        ];
+        let mut right = left.clone();
+        right.reverse();
+        assert_eq!(
+            program_identity("fixture", left),
+            program_identity("fixture", right)
+        );
+        assert_ne!(
+            program_identity("fixture", [("a.rs".to_owned(), vec![1, 2])]),
+            program_identity("other", [("a.rs".to_owned(), vec![1, 2])]),
+        );
+    }
+
+    #[test]
+    fn program_path_identity_ignores_dotdot_launch_spelling() {
+        let manifest = Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
+        let dotted = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src")
+            .join("..")
+            .join("Cargo.toml");
+        assert_eq!(
+            canonical_program_path(&manifest),
+            canonical_program_path(&dotted)
+        );
+    }
+
+    /// Production's accepted PreciseReplay path must write and consume the
+    /// existing cache mechanism, preserving both the consumed model bytes and
+    /// the construction receipt. Resetting the in-process memo between calls
+    /// forces the second compiler session through the on-disk tier.
+    #[test]
+    fn precise_rewriter_cache_hit_preserves_model_and_receipt() {
+        struct TestDir(PathBuf);
+        impl Drop for TestDir {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let directory = TestDir(
+            std::env::temp_dir().join(format!("crat-precise-cache-test-{}", std::process::id())),
+        );
+        let _ = std::fs::remove_dir_all(&directory.0);
+        std::fs::create_dir_all(&directory.0).expect("cache tempdir");
+        let source = "pub unsafe fn read(p: *const i32) -> i32 { unsafe { *p } }";
+
+        ::utils::compilation::run_compiler_on_str(source, |tcx| {
+            reset_for_test();
+            let first_receipt = with_test_config(false, &directory.0, || {
+                crate::bo_rewriter::cache_decide_receipt_for_test(tcx)
+            })
+            .expect("fresh precise decision");
+            let first_provenance = last_solve().expect("fresh solve provenance");
+            assert_eq!(first_provenance.source, "real");
+            assert_eq!(first_provenance.cache_status, "bypass");
+            assert!(
+                first_provenance
+                    .cache_entry
+                    .as_ref()
+                    .is_some_and(|path| Path::new(path).is_file()),
+                "fresh precise solve did not write an entry: {first_provenance:?}"
+            );
+            let first_model = first_provenance.model_sha256;
+
+            reset_for_test();
+            let second_receipt = with_test_config(true, &directory.0, || {
+                crate::bo_rewriter::cache_decide_receipt_for_test(tcx)
+            })
+            .expect("cached precise decision");
+            let second_provenance = last_solve().expect("cache-hit provenance");
+            assert_eq!(second_provenance.source, "cache");
+            assert_eq!(second_provenance.cache_status, "hit");
+            assert_eq!(second_provenance.solve_secs, 0.0);
+            assert_eq!(second_provenance.model_sha256, first_model);
+            assert_eq!(second_receipt, first_receipt);
+            reset_for_test();
+        })
+        .unwrap_or_else(|error| error.raise());
+    }
 
     /// The three refusal shapes, at the level they are decidable without a
     /// compiler session: the entry's own self-identification.
@@ -353,7 +725,13 @@ mod tests {
 pub(crate) struct SolveProvenance {
     /// `"real"` or `"cache"`.
     pub source: &'static str,
+    /// `"hit"`, `"miss"`, or `"bypass"` (reads disabled).
+    pub cache_status: &'static str,
     pub fingerprint: String,
+    /// SHA-256 of the canonical bytes of the consumed `VerifiedBo.model`.
+    pub model_sha256: String,
+    /// Written/consumed cache entry, when a directory was configured.
+    pub cache_entry: Option<String>,
     /// Wall seconds spent in the BO solve — **0.0 on a cache hit**, which is
     /// the saving, and the residual is everything else the pipeline still pays.
     pub solve_secs: f64,
@@ -388,6 +766,35 @@ pub(crate) fn render_provenance() -> String {
     }
 }
 
+pub(crate) fn render_cache_status() -> &'static str {
+    last_solve().map_or("none", |provenance| provenance.cache_status)
+}
+
+pub(crate) fn render_model_sha256() -> String {
+    last_solve().map_or_else(|| "none".to_owned(), |provenance| provenance.model_sha256)
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct SolveReceipt {
+    pub(crate) source: String,
+    pub(crate) cache_status: String,
+    pub(crate) fingerprint: String,
+    pub(crate) model_sha256: String,
+    pub(crate) cache_entry: Option<String>,
+    pub(crate) solve_wall_s: String,
+}
+
+pub(crate) fn solve_receipt() -> Option<SolveReceipt> {
+    last_solve().map(|provenance| SolveReceipt {
+        source: provenance.source.to_owned(),
+        cache_status: provenance.cache_status.to_owned(),
+        fingerprint: provenance.fingerprint,
+        model_sha256: provenance.model_sha256,
+        cache_entry: provenance.cache_entry,
+        solve_wall_s: format!("{:.6}", provenance.solve_secs),
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Per-process memoization, and the counter that keeps it honest
 // ---------------------------------------------------------------------------
@@ -411,7 +818,7 @@ pub(crate) fn derivations() -> usize {
 
 thread_local! {
     static DERIVATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-    static MEMO: std::cell::RefCell<Option<(String, FxHashMap<SlotRef, SlotKind>)>> =
+    static MEMO: std::cell::RefCell<Option<(String, CachedModel)>> =
         const { std::cell::RefCell::new(None) };
 }
 
@@ -427,7 +834,7 @@ fn code_fingerprint_cached() -> &'static str {
 ///
 /// Keyed rather than unconditional because the test suite runs many fixtures in
 /// one process: an unkeyed memo would serve fixture A's model to fixture B.
-pub(crate) fn memo_get(fp: &str) -> Option<FxHashMap<SlotRef, SlotKind>> {
+pub(crate) fn memo_get(fp: &str) -> Option<CachedModel> {
     MEMO.with(|m| {
         m.borrow()
             .as_ref()
@@ -436,7 +843,14 @@ pub(crate) fn memo_get(fp: &str) -> Option<FxHashMap<SlotRef, SlotKind>> {
     })
 }
 
-pub(crate) fn memo_put(fp: &str, model: &FxHashMap<SlotRef, SlotKind>) {
-    MEMO.with(|m| *m.borrow_mut() = Some((fp.to_owned(), model.clone())));
+pub(crate) fn memo_put(fp: &str, cached: &CachedModel) {
+    MEMO.with(|m| *m.borrow_mut() = Some((fp.to_owned(), cached.clone())));
     DERIVATIONS.with(|c| c.set(c.get() + 1));
+}
+
+#[cfg(test)]
+pub(crate) fn reset_for_test() {
+    MEMO.with(|memo| *memo.borrow_mut() = None);
+    DERIVATIONS.with(|count| count.set(0));
+    LAST_SOLVE.with(|last| *last.borrow_mut() = None);
 }

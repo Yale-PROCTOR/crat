@@ -8262,10 +8262,23 @@ mod run {
             "solve",
             crate::analyses::borrow_ownership::model_cache::render_provenance(),
         );
+        row.set(
+            "cache_status",
+            crate::analyses::borrow_ownership::model_cache::render_cache_status(),
+        );
+        row.set(
+            "cache_model_sha256",
+            crate::analyses::borrow_ownership::model_cache::render_model_sha256(),
+        );
         // §7 — the per-phase split: what the cache saves, and the residual
         // floor the rewriter always pays.
         if let Some(p) = crate::analyses::borrow_ownership::model_cache::last_solve() {
             row.set("t_solve_s", format!("{:.3}", p.solve_secs));
+            row.set("cache_fingerprint", p.fingerprint);
+            row.set(
+                "cache_entry",
+                p.cache_entry.unwrap_or_else(|| "none".to_owned()),
+            );
         }
 
         let verdict = compare::compare(&a_decoded, &b_decoded);
@@ -8441,6 +8454,270 @@ mod run {
             }
         }
         row.set("t_total_s", secs(t0.elapsed()));
+        row
+    }
+
+    const E1_CLASSES: [&str; 5] = [
+        "missing-lifetime",
+        "e0308-type-mismatch",
+        "borrow-conflict",
+        "call-site-not-adapted",
+        "typed-other",
+    ];
+
+    fn e1_code(code: Option<&str>) -> String {
+        let Some(code) = code else {
+            return "none".to_owned();
+        };
+        if let Some(number) = code
+            .strip_prefix("ErrCode(")
+            .and_then(|value| value.strip_suffix(')'))
+            .and_then(|value| value.parse::<u32>().ok())
+        {
+            format!("E{number:04}")
+        } else {
+            code.to_owned()
+        }
+    }
+
+    pub(super) fn e1_class(revert: &crate::bo_rewriter::E1RevertDiagnostic) -> &'static str {
+        let code = e1_code(revert.diagnostic.code.as_deref());
+        let message = revert.diagnostic.message.to_ascii_lowercase();
+        if code == "E0106" || message.contains("missing lifetime specifier") {
+            "missing-lifetime"
+        } else if matches!(code.as_str(), "E0502" | "E0506") {
+            "borrow-conflict"
+        } else if revert.call_site_not_adapted {
+            // Mechanism beats the carrier code: a call-boundary E0308 belongs
+            // to the explicitly requested call-site class, while the raw code
+            // remains present in the artifact for independent aggregation.
+            "call-site-not-adapted"
+        } else if code == "E0308" {
+            "e0308-type-mismatch"
+        } else {
+            "typed-other"
+        }
+    }
+
+    fn e1_rank(class: &str) -> usize {
+        match class {
+            "missing-lifetime" => 0,
+            "borrow-conflict" => 1,
+            "call-site-not-adapted" => 2,
+            "e0308-type-mismatch" => 3,
+            _ => 4,
+        }
+    }
+
+    fn tsv_field(value: &str, limit: usize) -> String {
+        value
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .chars()
+            .take(limit)
+            .collect::<String>()
+            .replace(['\t', '\r', '\n'], " ")
+    }
+
+    /// Item E's one-iteration per-function diagnostic census worker.
+    pub fn run_e1_revert_census(input: &std::path::Path) -> Row {
+        let started = Instant::now();
+        let mut row = Row::default();
+        let name = std::env::var("CRAT_BOC1_NAME").unwrap_or_else(|_| "unnamed".to_owned());
+        let directory = std::env::var_os("CRAT_E1_ARTIFACT_DIR")
+            .map(std::path::PathBuf::from)
+            .expect("E1 census requires CRAT_E1_ARTIFACT_DIR");
+        std::fs::create_dir_all(&directory).expect("create E1 artifact directory");
+        let capture = match crate::bo_rewriter::diagnose_e1_once(input) {
+            Ok(capture) => capture,
+            Err(error) => {
+                row.set("status", "instrument-error");
+                row.set("detail", super::report::sanitize(&error));
+                row.set("t_total_s", secs(started.elapsed()));
+                return row;
+            }
+        };
+        let receipt_field = |key: &str| {
+            capture
+                .a5_receipt
+                .lines()
+                .find_map(|line| line.strip_prefix(&format!("{key}=")))
+                .unwrap_or("missing")
+        };
+        let a5_mode = receipt_field("a5_mode");
+        let a5_world = receipt_field("a5_world");
+        let a5_abi_guard = receipt_field("a5_abi_guard");
+        let copy_lend_mode = receipt_field("copy_lend_mode");
+        let a2_mode = receipt_field("a2_mode");
+        let soundness_mode = receipt_field("soundness_mode");
+
+        let mut primary = BTreeMap::<String, &'static str>::new();
+        for (index, revert) in capture.reverts.iter().enumerate() {
+            let key = if revert.function == "<unattributed>" {
+                format!("<unattributed>#{index}")
+            } else {
+                revert.function.clone()
+            };
+            let class = e1_class(revert);
+            primary
+                .entry(key)
+                .and_modify(|current| {
+                    if e1_rank(class) < e1_rank(current) {
+                        *current = class;
+                    }
+                })
+                .or_insert(class);
+        }
+        let mut counts = E1_CLASSES
+            .into_iter()
+            .map(|class| (class, 0usize))
+            .collect::<BTreeMap<_, _>>();
+        for class in primary.values() {
+            *counts.get_mut(class).expect("registered E1 class") += 1;
+        }
+
+        let mut artifact = String::from(
+            "corpus\tanalysis_frame\tdata\ta5_mode\ta5_world\ta5_abi_guard\tcopy_lend_mode\ta2_mode\tsoundness_mode\tprogram\trevert_key\tfunction\tclass\terror_code\tmessage_head\tfile\tline\tdirection\tattribution\trelated_locations\trewrite_shapes\trepro_context\tinput_root\n",
+        );
+        for (index, revert) in capture.reverts.iter().enumerate() {
+            let key = if revert.function == "<unattributed>" {
+                format!("<unattributed>#{index}")
+            } else {
+                revert.function.clone()
+            };
+            let class = primary[&key];
+            let mut shapes = revert
+                .edits
+                .iter()
+                .map(|edit| edit.shape.as_str())
+                .collect::<Vec<_>>();
+            shapes.sort_unstable();
+            shapes.dedup();
+            let context = revert
+                .edits
+                .iter()
+                .map(|edit| {
+                    format!(
+                        "{}:{}-{} => {}",
+                        edit.file, edit.lo_line, edit.hi_line, edit.replacement_head
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(" | ");
+            let related = revert
+                .diagnostic
+                .related
+                .iter()
+                .map(|related| {
+                    format!(
+                        "{}:{}:{}",
+                        crate::bo_rewriter::verify::crate_relative(
+                            &related.file,
+                            &capture.observed_root,
+                        ),
+                        related.line,
+                        related.message,
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(" | ");
+            artifact.push_str(&format!(
+                "rs-crown\t{}\tprovisional\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:?}\t{}\t{}\t{}\t{}\t{}\n",
+                crate::analyses::borrow_ownership::model_cache::ANALYSIS_FRAME,
+                a5_mode,
+                a5_world,
+                a5_abi_guard,
+                copy_lend_mode,
+                a2_mode,
+                soundness_mode,
+                name,
+                tsv_field(&key, 300),
+                tsv_field(&revert.function, 300),
+                class,
+                e1_code(revert.diagnostic.code.as_deref()),
+                tsv_field(&revert.diagnostic.message, 300),
+                tsv_field(
+                    &crate::bo_rewriter::verify::crate_relative(
+                        &revert.diagnostic.file,
+                        &capture.observed_root,
+                    ),
+                    400,
+                ),
+                revert.diagnostic.line,
+                revert.diagnostic.direction,
+                revert.attribution,
+                tsv_field(&related, 800),
+                tsv_field(&shapes.join(" | "), 600),
+                tsv_field(&context, 1200),
+                input.display(),
+            ));
+        }
+        let artifact_path = directory.join(format!("{name}.reverts.tsv"));
+        std::fs::write(&artifact_path, artifact).expect("write E1 revert artifact");
+        let a5_receipt_path = directory.join(format!("{name}.a5-receipt.txt"));
+        std::fs::write(&a5_receipt_path, &capture.a5_receipt).expect("write E1 A5 receipt");
+        let solve = &capture.solve_receipt;
+        let cache_receipt = format!(
+            "corpus\tanalysis_frame\tdata\ta5_mode\ta5_world\ta5_abi_guard\tcopy_lend_mode\ta2_mode\tsoundness_mode\tprogram\tsource\tcache_status\tfingerprint\tmodel_sha256\tcache_entry\tsolve_wall_s\nrs-crown\t{}\tprovisional\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+            crate::analyses::borrow_ownership::model_cache::ANALYSIS_FRAME,
+            a5_mode,
+            a5_world,
+            a5_abi_guard,
+            copy_lend_mode,
+            a2_mode,
+            soundness_mode,
+            name,
+            solve.source,
+            solve.cache_status,
+            solve.fingerprint,
+            solve.model_sha256,
+            solve.cache_entry.as_deref().unwrap_or("none"),
+            solve.solve_wall_s,
+        );
+        let cache_receipt_path = directory.join(format!("{name}.cache-receipt.tsv"));
+        std::fs::write(&cache_receipt_path, cache_receipt).expect("write E1 cache receipt");
+
+        row.set("e1_reverts", primary.len());
+        row.set("corpus", "rs-crown");
+        row.set(
+            "analysis_frame",
+            crate::analyses::borrow_ownership::model_cache::ANALYSIS_FRAME,
+        );
+        row.set("data", "provisional");
+        row.set("a5_mode", a5_mode);
+        row.set("a5_world", a5_world);
+        row.set("a5_abi_guard", a5_abi_guard);
+        row.set("copy_lend_mode", copy_lend_mode);
+        row.set("a2_mode", a2_mode);
+        row.set("soundness_mode", soundness_mode);
+        row.set("verify_iterations", 1);
+        row.set("repair_rounds", 0);
+        row.set("e1_diag_rows", capture.reverts.len());
+        row.set("e1_novel_errors", capture.novel_error_count);
+        row.set("attempted_placements", capture.attempted_placements);
+        row.set("files_touched", capture.files_touched);
+        row.set("unplaceable", capture.unplaceable);
+        row.set("baseline_keys", capture.baseline_keys);
+        row.set("baseline_errors", capture.baseline_errors);
+        row.set("baseline_msg_env", capture.baseline_msg_env);
+        for class in E1_CLASSES {
+            row.set(&format!("e1_{}", class.replace('-', "_")), counts[class]);
+        }
+        row.set("solve", &solve.source);
+        row.set("cache_status", &solve.cache_status);
+        row.set("cache_fingerprint", &solve.fingerprint);
+        row.set("cache_model_sha256", &solve.model_sha256);
+        row.set(
+            "cache_entry",
+            solve.cache_entry.as_deref().unwrap_or("none"),
+        );
+        row.set("t_solve_s", &solve.solve_wall_s);
+        row.set("revert_artifact", artifact_path.display());
+        row.set("a5_receipt_artifact", a5_receipt_path.display());
+        row.set("cache_receipt_artifact", cache_receipt_path.display());
+        row.set("status", "ok");
+        row.set("t_total_s", secs(started.elapsed()));
         row
     }
 
@@ -9111,7 +9388,11 @@ pub unsafe fn f() -> i32 {
                     .iter()
                     .map(|mode| {
                         mode.with_override(|| {
-                            crate::analyses::borrow_ownership::model_cache::fingerprint(&program)
+                            crate::analyses::borrow_ownership::model_cache::fingerprint(
+                                &program,
+                                crate::analyses::borrow_ownership::a5_overlap::A5Mode::PreciseReplay,
+                                None,
+                            )
                         })
                     })
                     .collect::<std::collections::BTreeSet<_>>();
@@ -11311,6 +11592,9 @@ fn the_reporting_site_reads_files_touched_not_the_map_size() {
         baseline_errors: 0,
         baseline_msg_env: 0,
         a5_receipt: "a5_mode=baseline\n".to_owned(),
+        e1_reverts: Vec::new(),
+        e1_novel_error_count: 0,
+        solve_receipt: None,
     };
     let (_emitted, _degraded, files_touched, reverted, ..) = run::emit_counters(&outcome);
     assert_eq!(
@@ -14556,6 +14840,111 @@ fn m1_emit_corpus() {
     );
 }
 
+#[test]
+#[ignore = "Item E measurement: serialized 20-program single-iteration revert census"]
+fn e1_revert_census_corpus() {
+    use std::{fs, time::Duration};
+
+    let readback = std::env::var("CRAT_E1_READBACK").as_deref() == Ok("1");
+    assert_eq!(
+        std::env::var("CRAT_BO_CACHE").as_deref() == Ok("1"),
+        readback,
+        "populate requires cache reads off; readback requires them on"
+    );
+    let root = orchestrate::workspace_root();
+    let artifact_dir = std::env::var_os("CRAT_E1_ARTIFACT_DIR")
+        .map(std::path::PathBuf::from)
+        .expect("E1 corpus requires CRAT_E1_ARTIFACT_DIR");
+    let cache_dir = std::env::var_os("CRAT_BO_CACHE_DIR")
+        .map(std::path::PathBuf::from)
+        .expect("E1 corpus requires CRAT_BO_CACHE_DIR");
+    fs::create_dir_all(&artifact_dir).expect("create E1 artifact directory");
+    fs::create_dir_all(&cache_dir).expect("create E1 cache directory");
+    if !readback {
+        assert_eq!(
+            fs::read_dir(&cache_dir)
+                .expect("read initial E1 cache")
+                .count(),
+            0,
+            "populate cache must start empty"
+        );
+    }
+    let timeout = Duration::from_secs(
+        std::env::var("CRAT_E1_TIMEOUT_SECS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(14_400),
+    );
+    let mut rows = Vec::new();
+    for program in CORPUS {
+        let input = program.input_path(&root);
+        let outcome = orchestrate::run_child_env(
+            program.name,
+            &input,
+            "e1-revert-census",
+            timeout,
+            &[
+                ("CRAT_E1_ARTIFACT_DIR", artifact_dir.display().to_string()),
+                ("CRAT_BO_CACHE_DIR", cache_dir.display().to_string()),
+                (
+                    "CRAT_BO_A5_ATTESTATION",
+                    "frozen_benchmark_graph".to_owned(),
+                ),
+            ],
+        );
+        let mut row = outcome.row.unwrap_or_else(|| {
+            panic!(
+                "{} produced no E1 row: status={} note={}",
+                program.name, outcome.status, outcome.note
+            )
+        });
+        row.set("program", program.name);
+        row.set("worker_wall_s", format!("{:.3}", outcome.wall_s));
+        row.set("peak_rss_kb", outcome.peak_rss_kb);
+        assert_eq!(row.get("status"), Some("ok"), "{row:?}");
+        assert_eq!(
+            row.get("solve"),
+            Some(if readback { "cache" } else { "real" }),
+            "{row:?}"
+        );
+        assert_eq!(
+            row.get("cache_status"),
+            Some(if readback { "hit" } else { "bypass" }),
+            "{row:?}"
+        );
+        assert_eq!(row.get("verify_iterations"), Some("1"), "{row:?}");
+        assert_eq!(row.get("repair_rounds"), Some("0"), "{row:?}");
+        assert!(
+            row.get("cache_entry")
+                .is_some_and(|path| std::path::Path::new(path).is_file()),
+            "{} did not populate its precise cache entry: {row:?}",
+            program.name
+        );
+        println!(
+            "E1-PROGRESS program={} source={} status=ok wall_s={:.3} rss_kb={}",
+            program.name,
+            if readback { "cache" } else { "real" },
+            outcome.wall_s,
+            outcome.peak_rss_kb
+        );
+        rows.push(row);
+    }
+    assert_eq!(rows.len(), 20);
+    let cache_entries = fs::read_dir(&cache_dir)
+        .expect("read populated E1 cache")
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_name().to_string_lossy().ends_with(".model.tsv"))
+        .count();
+    assert_eq!(cache_entries, 20, "one precise cache entry per program");
+    let summary = rows
+        .iter()
+        .map(report::to_kv_line)
+        .collect::<Vec<_>>()
+        .join("\n")
+        + "\n";
+    fs::write(artifact_dir.join("e1-results.kv"), summary).expect("write E1 corpus rows");
+}
+
 /// **A panic is a failure; a resource deferral is an absence** (R8, 2026-08-15).
 ///
 /// Lifted out of the sweep because a decision only a 600 s corpus run can
@@ -14641,6 +15030,56 @@ z#2\tkind-raw\tz.rs:2\n"
     );
 }
 
+#[test]
+fn e1_revert_classes_are_disjoint_and_callsite_mechanism_beats_e0308_carrier() {
+    use crate::bo_rewriter::{
+        E1RevertDiagnostic,
+        verify::{Diag, Direction},
+    };
+
+    let classify = |code: Option<&str>, message: &str, call_site_not_adapted: bool| {
+        run::e1_class(&E1RevertDiagnostic {
+            function: "f".to_owned(),
+            diagnostic: Diag {
+                file: "lib.rs".to_owned(),
+                line: 1,
+                message: message.to_owned(),
+                direction: Direction::Other,
+                code: code.map(str::to_owned),
+                related: Vec::new(),
+            },
+            call_site_not_adapted,
+            attribution: "test".to_owned(),
+            edits: Vec::new(),
+        })
+    };
+    assert_eq!(
+        classify(Some("E0106"), "missing lifetime specifier", false),
+        "missing-lifetime"
+    );
+    assert_eq!(
+        classify(Some("E0308"), "mismatched types", false),
+        "e0308-type-mismatch"
+    );
+    assert_eq!(
+        classify(Some("ErrCode(308)"), "mismatched types", false),
+        "e0308-type-mismatch"
+    );
+    assert_eq!(
+        classify(Some("E0502"), "cannot borrow", false),
+        "borrow-conflict"
+    );
+    assert_eq!(
+        classify(Some("E0506"), "cannot assign", false),
+        "borrow-conflict"
+    );
+    assert_eq!(
+        classify(Some("E0308"), "mismatched call argument", true),
+        "call-site-not-adapted"
+    );
+    assert_eq!(classify(Some("E9999"), "other", false), "typed-other");
+}
+
 // Worker (one program, one mode, one process).
 // ---------------------------------------------------------------------------
 
@@ -14686,6 +15125,7 @@ fn boc1_run_one() {
             | "s23-discover"
             | "s23-probe"
             | "t1-origin-caller"
+            | "e1-revert-census"
     ) || mode.starts_with("selector-detail-")
     {
         z3::set_global_param("smt.random_seed", "0");
@@ -14702,6 +15142,14 @@ fn boc1_run_one() {
     if mode == "m1-emit" {
         let mut row = run::run_m1_emit(Path::new(&input));
         row.set("program", name.clone());
+        println!("{}", report::to_kv_line(&row));
+        return;
+    }
+
+    if mode == "e1-revert-census" {
+        let mut row = run::run_e1_revert_census(Path::new(&input));
+        row.set("program", name.clone());
+        row.set("mode", "e1-revert-census");
         println!("{}", report::to_kv_line(&row));
         return;
     }

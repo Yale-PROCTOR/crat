@@ -46,8 +46,6 @@
 //! derives from the post-`expand`→`extern`→`preprocess` form; see
 //! `docs/agents/2026-08-06-substrate-of-record.md`.
 
-use std::collections::BTreeSet;
-
 use rustc_hir::{ItemKind, OwnerNode};
 use rustc_middle::{
     mir::Local,
@@ -59,7 +57,7 @@ use crate::{
         SlotKind,
         a5_overlap::{A5Mode, WholeProgramAttestation},
         a5_producer::PlannedC9Mark,
-        construction::{baseline_a5_receipt, solve_bo_a5_config},
+        construction::{cached_precise_rewriter_payload, solve_bo_a5_config},
         crate_slots::{CrateSlots, ptr_chain_depth},
         export::with_bo_export,
         model_cache,
@@ -96,6 +94,43 @@ mod emit_tests;
 mod goldens;
 #[cfg(test)]
 mod import_denylist;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct E1EditContext {
+    pub(crate) file: String,
+    pub(crate) lo_line: usize,
+    pub(crate) hi_line: usize,
+    pub(crate) shape: String,
+    pub(crate) replacement_head: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct E1RevertDiagnostic {
+    pub(crate) function: String,
+    pub(crate) diagnostic: verify::Diag,
+    pub(crate) call_site_not_adapted: bool,
+    pub(crate) attribution: String,
+    pub(crate) edits: Vec<E1EditContext>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[allow(
+    dead_code,
+    reason = "Item E's corpus worker is cfg(test); this transport crosses the production rewriter callback only for that measurement"
+)]
+pub(crate) struct E1Capture {
+    pub(crate) observed_root: std::path::PathBuf,
+    pub(crate) reverts: Vec<E1RevertDiagnostic>,
+    pub(crate) novel_error_count: usize,
+    pub(crate) baseline_keys: usize,
+    pub(crate) baseline_errors: usize,
+    pub(crate) baseline_msg_env: usize,
+    pub(crate) attempted_placements: usize,
+    pub(crate) files_touched: usize,
+    pub(crate) unplaceable: usize,
+    pub(crate) a5_receipt: String,
+    pub(crate) solve_receipt: model_cache::SolveReceipt,
+}
 
 /// What one M1 rewrite attempt produced.
 ///
@@ -182,6 +217,12 @@ pub(crate) enum RewriteOutcome {
         unplaceable: Vec<plan::Unplaceable>,
         /// Resolved A5 construction and selected-model identity.
         a5_receipt: String,
+        /// E1's single-iteration diagnostic rows. Empty on ordinary runs.
+        e1_reverts: Vec<E1RevertDiagnostic>,
+        /// Baseline-subtracted error count from the one verify invocation.
+        e1_novel_error_count: usize,
+        /// Cache/solve receipt captured inside the compiler callback.
+        solve_receipt: Option<model_cache::SolveReceipt>,
     },
     /// No emission, with whatever attribution was available.
     Degraded {
@@ -234,6 +275,12 @@ pub(crate) enum RewriteOutcome {
         unplaceable: Vec<plan::Unplaceable>,
         /// Resolved A5 construction and selected-model identity.
         a5_receipt: String,
+        /// E1's single-iteration diagnostic rows. Empty on ordinary runs.
+        e1_reverts: Vec<E1RevertDiagnostic>,
+        /// Baseline-subtracted error count from the one verify invocation.
+        e1_novel_error_count: usize,
+        /// Cache/solve receipt captured inside the compiler callback.
+        solve_receipt: Option<model_cache::SolveReceipt>,
     },
 }
 
@@ -435,6 +482,7 @@ pub(crate) fn rewrite_m1_path_injected(
         max_rounds,
         inject,
         false,
+        false,
         None,
     )
 }
@@ -452,6 +500,7 @@ pub(crate) fn rewrite_m1_path_a5_injected(
         MAX_REVERT_ROUNDS,
         inject,
         false,
+        false,
         Some((mode, attestation)),
     )
 }
@@ -461,7 +510,7 @@ fn rewrite_core(
     tree_base: Option<&std::path::Path>,
     max_rounds: usize,
 ) -> RewriteOutcome {
-    rewrite_core_injected(input, tree_base, max_rounds, &|_| {}, false, None)
+    rewrite_core_injected(input, tree_base, max_rounds, &|_| {}, false, false, None)
 }
 
 /// [`rewrite_core`] with a hook applied to the finished decision table at the
@@ -477,6 +526,7 @@ fn rewrite_core_injected(
     max_rounds: usize,
     inject: &(dyn Fn(&mut decision::DecisionTable) + Sync),
     probe_only: bool,
+    census_once: bool,
     a5_override: Option<(A5Mode, Option<WholeProgramAttestation>)>,
 ) -> RewriteOutcome {
     // The string entry's original text, so a baseline exists for it too.
@@ -652,6 +702,7 @@ fn rewrite_core_injected(
             virtual_original,
             max_rounds,
             probe_only,
+            census_once,
             emission.files,
             emission_plan,
             emission_texts,
@@ -755,6 +806,7 @@ fn verify_and_revert(
     virtual_original: Option<String>,
     max_rounds: usize,
     probe_only: bool,
+    census_once: bool,
     files: std::collections::BTreeMap<plan::FileKey, String>,
     emission_plan: plan::Plan,
     emission_texts: std::collections::BTreeMap<plan::FileKey, String>,
@@ -821,6 +873,11 @@ fn verify_and_revert(
     // the seed is already the ruled definition.
     let mut files_edited = files.len();
     let planned_edit_sites = edit_sites(&emission_plan, &emission_texts);
+    let e1_edit_contexts = if census_once {
+        e1_edit_contexts(&emission_plan, &emission_texts)
+    } else {
+        Vec::new()
+    };
     let mut baseline: Option<verify::Baseline> = None;
     let mut facts = OutcomeFacts {
         degradations,
@@ -843,6 +900,9 @@ fn verify_and_revert(
         baseline_errors: 0,
         baseline_msg_env: 0,
         a5_receipt,
+        e1_reverts: Vec::new(),
+        e1_novel_error_count: 0,
+        solve_receipt: model_cache::solve_receipt(),
     };
     let crate_dir = tree_base
         .and_then(|root| root.parent())
@@ -967,6 +1027,158 @@ fn verify_and_revert(
         if facts.first_diags.is_empty() {
             facts.first_diags = novel.clone();
             facts.observed_root = Some(observed_root.clone());
+        }
+        if census_once {
+            facts.first_diags = novel.clone();
+            facts.observed_root = Some(observed_root.clone());
+            facts.e1_novel_error_count = novel_errors;
+            for diagnostic in &novel {
+                let mut owners = attribute(
+                    std::slice::from_ref(diagnostic),
+                    &line_maps,
+                    &observed_root,
+                    &facts.emitted_sites,
+                    &planned_edit_sites,
+                    &reverted,
+                    crate_dir.as_deref().unwrap_or(std::path::Path::new("")),
+                );
+                let mut attribution = "standard";
+                if owners.is_empty() {
+                    let original_root = crate_dir.as_deref().unwrap_or(std::path::Path::new(""));
+                    if let Some(original_line) =
+                        e1_bijective_line(diagnostic, &line_maps, &observed_root, original_root)
+                    {
+                        let mut remapped = diagnostic.clone();
+                        remapped.line = original_line;
+                        owners = attribute(
+                            std::slice::from_ref(&remapped),
+                            &std::collections::BTreeMap::new(),
+                            &observed_root,
+                            &facts.emitted_sites,
+                            &planned_edit_sites,
+                            &reverted,
+                            original_root,
+                        );
+                        if !owners.is_empty() {
+                            attribution = "equal-line-segment";
+                        }
+                    }
+                }
+                if owners.is_empty() {
+                    let original_root = crate_dir.as_deref().unwrap_or(std::path::Path::new(""));
+                    for related in &diagnostic.related {
+                        let mut related_diagnostic = verify::Diag {
+                            file: related.file.clone(),
+                            line: related.line,
+                            message: related.message.clone(),
+                            direction: verify::Direction::Other,
+                            code: diagnostic.code.clone(),
+                            related: Vec::new(),
+                        };
+                        let mut related_owners = attribute(
+                            std::slice::from_ref(&related_diagnostic),
+                            &line_maps,
+                            &observed_root,
+                            &facts.emitted_sites,
+                            &planned_edit_sites,
+                            &reverted,
+                            original_root,
+                        );
+                        if related_owners.is_empty()
+                            && let Some(original_line) = e1_bijective_line(
+                                &related_diagnostic,
+                                &line_maps,
+                                &observed_root,
+                                original_root,
+                            )
+                        {
+                            related_diagnostic.line = original_line;
+                            related_owners = attribute(
+                                std::slice::from_ref(&related_diagnostic),
+                                &std::collections::BTreeMap::new(),
+                                &observed_root,
+                                &facts.emitted_sites,
+                                &planned_edit_sites,
+                                &reverted,
+                                original_root,
+                            );
+                        }
+                        if related_owners.is_empty() {
+                            related_owners = e1_region_owners(
+                                &related_diagnostic,
+                                &line_maps,
+                                &observed_root,
+                                original_root,
+                                &facts.emitted_sites,
+                                &planned_edit_sites,
+                            );
+                        }
+                        owners.extend(related_owners);
+                    }
+                    if !owners.is_empty() {
+                        attribution = "related-span";
+                    }
+                }
+                if owners.is_empty() {
+                    let original_root = crate_dir.as_deref().unwrap_or(std::path::Path::new(""));
+                    owners = e1_region_owners(
+                        diagnostic,
+                        &line_maps,
+                        &observed_root,
+                        original_root,
+                        &facts.emitted_sites,
+                        &planned_edit_sites,
+                    );
+                    if !owners.is_empty() {
+                        attribution = "region-span";
+                    }
+                }
+                if owners.is_empty() {
+                    facts.e1_reverts.push(E1RevertDiagnostic {
+                        function: "<unattributed>".to_owned(),
+                        diagnostic: diagnostic.clone(),
+                        call_site_not_adapted: e1_call_site_not_adapted(diagnostic),
+                        attribution: "unattributed".to_owned(),
+                        edits: Vec::new(),
+                    });
+                    continue;
+                }
+                for owner in owners {
+                    let edits = e1_edit_contexts
+                        .iter()
+                        .filter(|(candidate, _)| *candidate == owner)
+                        .map(|(_, edit)| edit.clone())
+                        .collect();
+                    facts.e1_reverts.push(E1RevertDiagnostic {
+                        function: owner,
+                        diagnostic: diagnostic.clone(),
+                        call_site_not_adapted: e1_call_site_not_adapted(diagnostic),
+                        attribution: attribution.to_owned(),
+                        edits,
+                    });
+                }
+            }
+            if novel_errors > 0 && facts.e1_reverts.is_empty() {
+                facts.e1_reverts.push(E1RevertDiagnostic {
+                    function: "<unattributed>".to_owned(),
+                    diagnostic: verify::Diag {
+                        file: "<spanless>".to_owned(),
+                        line: 0,
+                        message: format!(
+                            "{novel_errors} baseline-subtracted error(s) carried no located diagnostic"
+                        ),
+                        direction: verify::Direction::Other,
+                        code: None,
+                        related: Vec::new(),
+                    },
+                    call_site_not_adapted: false,
+                    attribution: "spanless".to_owned(),
+                    edits: Vec::new(),
+                });
+            }
+            facts.files_touched = files_edited;
+            return facts
+                .degraded("e1-single-iteration: first differential diagnose recorded".to_owned());
         }
         if novel.is_empty() && novel_errors == 0 {
             let source = std::fs::read_to_string(staged.root()).unwrap_or_default();
@@ -1697,6 +1909,11 @@ fn decide_table_with_ctx<'tcx>(
     decide_table_perturbed(tcx, |_| {})
 }
 
+#[cfg(test)]
+pub(crate) fn cache_decide_receipt_for_test(tcx: TyCtxt<'_>) -> Result<String, String> {
+    decide_table_with_ctx(tcx).map(|(_, context)| context.a5_receipt)
+}
+
 fn decide_table_with_ctx_config<'tcx>(
     tcx: TyCtxt<'tcx>,
     a5_override: Option<(A5Mode, Option<WholeProgramAttestation>)>,
@@ -1729,6 +1946,7 @@ pub(crate) fn diagnose_once(
         MAX_REVERT_ROUNDS,
         &|_| {},
         true,
+        false,
         None,
     );
     let (observed_root, diags) = outcome.into_capture();
@@ -1743,6 +1961,26 @@ pub(crate) fn diagnose_once(
             .to_owned()
     })?;
     Ok((observed_root, diags))
+}
+
+/// Item E's one-iteration differential verifier. It runs the ordinary round-0
+/// emission and baseline-subtracted compile, records every attribution, and
+/// returns before any revert, re-render, or bisect step can execute.
+#[allow(
+    dead_code,
+    reason = "Item E's cfg(test) corpus worker is the sole consumer of this one-iteration instrument"
+)]
+pub(crate) fn diagnose_e1_once(root: &std::path::Path) -> Result<E1Capture, String> {
+    rewrite_core_injected(
+        ::utils::compilation::path_to_input(root),
+        Some(root),
+        MAX_REVERT_ROUNDS,
+        &|_| {},
+        false,
+        true,
+        None,
+    )
+    .into_e1_capture()
 }
 
 /// Everything BOTH outcomes carry, built once and filled in one place.
@@ -1793,6 +2031,9 @@ struct OutcomeFacts {
     /// a third path canonicalizer came to exist.
     observed_root: Option<std::path::PathBuf>,
     a5_receipt: String,
+    e1_reverts: Vec<E1RevertDiagnostic>,
+    e1_novel_error_count: usize,
+    solve_receipt: Option<model_cache::SolveReceipt>,
 }
 
 impl RewriteOutcome {
@@ -1832,6 +2073,82 @@ impl RewriteOutcome {
                 ..
             } => (observed_root, first_diags),
         }
+    }
+
+    #[allow(
+        dead_code,
+        reason = "consumed only by Item E's cfg(test) one-iteration corpus worker"
+    )]
+    fn into_e1_capture(self) -> Result<E1Capture, String> {
+        let (
+            observed_root,
+            e1_reverts,
+            novel_error_count,
+            baseline_keys,
+            baseline_errors,
+            baseline_msg_env,
+            attempted_placements,
+            files_touched,
+            unplaceable,
+            a5_receipt,
+            solve_receipt,
+        ) = match self {
+            RewriteOutcome::Emitted {
+                observed_root,
+                e1_reverts,
+                e1_novel_error_count,
+                baseline_keys,
+                baseline_errors,
+                baseline_msg_env,
+                emitted_count,
+                files_touched,
+                unplaceable,
+                a5_receipt,
+                solve_receipt,
+                ..
+            }
+            | RewriteOutcome::Degraded {
+                observed_root,
+                e1_reverts,
+                e1_novel_error_count,
+                baseline_keys,
+                baseline_errors,
+                baseline_msg_env,
+                emitted_count,
+                files_touched,
+                unplaceable,
+                a5_receipt,
+                solve_receipt,
+                ..
+            } => (
+                observed_root,
+                e1_reverts,
+                e1_novel_error_count,
+                baseline_keys,
+                baseline_errors,
+                baseline_msg_env,
+                emitted_count,
+                files_touched,
+                unplaceable.len(),
+                a5_receipt,
+                solve_receipt,
+            ),
+        };
+        Ok(E1Capture {
+            observed_root: observed_root
+                .ok_or_else(|| "E1 capture has no observed root".to_owned())?,
+            reverts: e1_reverts,
+            novel_error_count,
+            baseline_keys,
+            baseline_errors,
+            baseline_msg_env,
+            attempted_placements,
+            files_touched,
+            unplaceable,
+            a5_receipt,
+            solve_receipt: solve_receipt
+                .ok_or_else(|| "E1 capture has no solve receipt".to_owned())?,
+        })
     }
 
     #[cfg(test)]
@@ -1876,6 +2193,9 @@ impl OutcomeFacts {
             baseline_errors: self.baseline_errors,
             baseline_msg_env: self.baseline_msg_env,
             a5_receipt: self.a5_receipt,
+            e1_reverts: self.e1_reverts,
+            e1_novel_error_count: self.e1_novel_error_count,
+            solve_receipt: self.solve_receipt,
         }
     }
 
@@ -1897,6 +2217,9 @@ impl OutcomeFacts {
             baseline_errors: self.baseline_errors,
             baseline_msg_env: self.baseline_msg_env,
             a5_receipt: self.a5_receipt,
+            e1_reverts: self.e1_reverts,
+            e1_novel_error_count: self.e1_novel_error_count,
+            solve_receipt: self.solve_receipt,
         }
     }
 }
@@ -1957,6 +2280,60 @@ fn edit_sites(
     out
 }
 
+fn e1_edit_contexts(
+    planned: &plan::Plan,
+    texts: &std::collections::BTreeMap<plan::FileKey, String>,
+) -> Vec<(String, E1EditContext)> {
+    let mut out = Vec::new();
+    for (key, edits) in &planned.by_file {
+        let Some(text) = texts.get(key) else {
+            continue;
+        };
+        let file = match key {
+            plan::FileKey::Real(path) => path.display().to_string(),
+            plan::FileKey::Virtual(name) => name.clone(),
+        };
+        for edit in edits {
+            let (lo_line, hi_line) = line_span(text, edit.lo, edit.hi);
+            let replacement_head = edit
+                .replacement
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+                .chars()
+                .take(160)
+                .collect();
+            out.push((
+                edit.owner_fn.clone(),
+                E1EditContext {
+                    file: file.clone(),
+                    lo_line,
+                    hi_line,
+                    shape: format!("{:?}", edit.justification),
+                    replacement_head,
+                },
+            ));
+        }
+    }
+    out.sort_by(|left, right| {
+        (
+            left.0.as_str(),
+            left.1.file.as_str(),
+            left.1.lo_line,
+            left.1.hi_line,
+            left.1.shape.as_str(),
+        )
+            .cmp(&(
+                right.0.as_str(),
+                right.1.file.as_str(),
+                right.1.lo_line,
+                right.1.hi_line,
+                right.1.shape.as_str(),
+            ))
+    });
+    out
+}
+
 /// Functions whose own rewrite is implicated by these diagnostics.
 ///
 /// Direction is recorded on the diagnostic and reported, but is deliberately
@@ -1985,6 +2362,92 @@ fn edit_sites(
 /// case, where the caller's argument needs no change at all — still attributes
 /// to nobody. That case is what escalation and bisect exist for, and
 /// `attribution_blind` is what counts it.
+fn e1_bijective_line(
+    diagnostic: &verify::Diag,
+    line_maps: &std::collections::BTreeMap<plan::FileKey, apply::LineMap>,
+    observed_root: &std::path::Path,
+    original_root: &std::path::Path,
+) -> Option<usize> {
+    let diagnostic_file = verify::crate_relative(&diagnostic.file, observed_root);
+    let mut candidates = line_maps
+        .iter()
+        .filter_map(|(key, map)| match key {
+            plan::FileKey::Real(path)
+                if verify::crate_relative(&path.display().to_string(), original_root)
+                    == diagnostic_file =>
+            {
+                Some(map)
+            }
+            plan::FileKey::Virtual(name) if *name == diagnostic_file => Some(map),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    if candidates.is_empty() && line_maps.len() == 1 {
+        candidates.extend(line_maps.values());
+    }
+    if candidates.len() != 1 {
+        return None;
+    }
+    candidates[0].to_original_if_bijective(diagnostic.line)
+}
+
+fn e1_region_owners(
+    diagnostic: &verify::Diag,
+    line_maps: &std::collections::BTreeMap<plan::FileKey, apply::LineMap>,
+    observed_root: &std::path::Path,
+    original_root: &std::path::Path,
+    sites: &[EmittedSite],
+    edits: &[EditSite],
+) -> std::collections::BTreeSet<String> {
+    let diagnostic_file = verify::crate_relative(&diagnostic.file, observed_root);
+    let mut maps = line_maps
+        .iter()
+        .filter_map(|(key, map)| match key {
+            plan::FileKey::Real(path)
+                if verify::crate_relative(&path.display().to_string(), original_root)
+                    == diagnostic_file =>
+            {
+                Some(map)
+            }
+            plan::FileKey::Virtual(name) if *name == diagnostic_file => Some(map),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    if maps.is_empty() && line_maps.len() == 1 {
+        maps.extend(line_maps.values());
+    }
+    let Some((lo, hi)) = (maps.len() == 1)
+        .then(|| maps[0].original_region(diagnostic.line))
+        .flatten()
+    else {
+        return std::collections::BTreeSet::new();
+    };
+    let single_file = line_maps.len() == 1;
+    let same_file =
+        |file: &str| single_file || verify::crate_relative(file, original_root) == diagnostic_file;
+    let mut owners = edits
+        .iter()
+        .filter(|edit| same_file(&edit.file) && edit.lo_line <= hi && lo <= edit.hi_line)
+        .map(|edit| edit.fn_path.clone())
+        .collect::<std::collections::BTreeSet<_>>();
+    if owners.is_empty() {
+        owners.extend(
+            sites
+                .iter()
+                .filter(|site| same_file(&site.file) && site.lo_line <= hi && lo <= site.hi_line)
+                .map(|site| site.fn_path.clone()),
+        );
+    }
+    owners
+}
+
+fn e1_call_site_not_adapted(diagnostic: &verify::Diag) -> bool {
+    diagnostic.direction == verify::Direction::RawIntoRewritten
+        || (matches!(diagnostic.code.as_deref(), Some("E0308" | "ErrCode(308)"))
+            && diagnostic.message.contains("found raw pointer")
+            && diagnostic.message.contains("function defined here"))
+}
+
 fn attribute(
     diags: &[verify::Diag],
     // **I-31**: emitted→original line translation, per file, produced by the
@@ -2371,6 +2834,35 @@ fn decide_table_perturbed<'tcx>(
     decide_table_perturbed_config(tcx, perturb, None)
 }
 
+fn cached_rewriter_plans(
+    program: &RustProgram<'_>,
+    slots: &CrateSlots,
+    mut_facts: &MutFacts,
+    a5_mode: A5Mode,
+    attestation: Option<WholeProgramAttestation>,
+    cached: &model_cache::CachedModel,
+) -> Result<Vec<PlannedC9Mark>, String> {
+    match a5_mode {
+        A5Mode::Baseline => Ok(Vec::new()),
+        A5Mode::PreciseReplay => {
+            let origins = compute_origins(program);
+            cached_precise_rewriter_payload(
+                program,
+                slots,
+                &origins,
+                mut_facts,
+                &cached.baseline_model,
+                &cached.model,
+                attestation,
+                &cached.a5_receipt,
+            )
+        }
+        A5Mode::CoarseConstraint => {
+            Err("the pricing-only coarse A5 mode is not cacheable".to_owned())
+        }
+    }
+}
+
 fn decide_table_perturbed_config<'tcx>(
     tcx: TyCtxt<'tcx>,
     perturb: impl FnOnce(&mut Vec<decision::Subject>),
@@ -2391,87 +2883,105 @@ fn decide_table_perturbed_config<'tcx>(
     // ONE fingerprint computation, shared by the memo and the on-disk cache —
     // they are two tiers of the same question, so they must not disagree about
     // which program this is.
-    let fp = model_cache::fingerprint(&program);
+    let fp = model_cache::fingerprint(&program, a5_mode, attestation);
+    let cacheable = matches!(a5_mode, A5Mode::Baseline | A5Mode::PreciseReplay);
 
     // Tier 1: the in-process memo. The recon worker has three independent
     // consumers of the decision table, and before this each ran the entire
     // pipeline — `total ≈ 3 × solve` on every program. Reusing the model here
     // makes a consumer's cost its own work, not another whole solve.
-    if a5_mode == A5Mode::Baseline
-        && let Some(memo) = model_cache::memo_get(&fp)
+    if cacheable
+        && let Some(cached) = model_cache::memo_get(&fp)
+        && let Ok(retained_c9_plans) =
+            cached_rewriter_plans(&program, &slots, &mut_facts, a5_mode, attestation, &cached)
     {
-        let receipt = baseline_a5_receipt(&memo);
         return finish_decide(
             tcx,
             program,
             slots,
             mut_facts,
-            memo,
-            Vec::new(),
-            receipt,
+            cached.model,
+            retained_c9_plans,
+            cached.a5_receipt,
             perturb,
         );
     }
 
     // Tier 2: the on-disk cache.
-    if a5_mode == A5Mode::Baseline
-        && let Some(cached) = model_cache::load(tcx, &program, &slots)
+    if cacheable
+        && let Some(cached) = model_cache::load(tcx, &program, &slots, a5_mode, attestation)
+        && let Ok(retained_c9_plans) =
+            cached_rewriter_plans(&program, &slots, &mut_facts, a5_mode, attestation, &cached)
     {
+        let model_sha256 = model_cache::model_bytes_sha256(tcx, &slots, &cached.model)
+            .ok_or_else(|| "cached model contains an unrenderable slot key".to_owned())?;
         model_cache::record_solve(model_cache::SolveProvenance {
             source: "cache",
+            cache_status: "hit",
             fingerprint: fp.clone(),
+            model_sha256,
+            cache_entry: model_cache::configured_entry_path(&fp)
+                .map(|path| path.display().to_string()),
             solve_secs: 0.0,
         });
         model_cache::memo_put(&fp, &cached);
-        let receipt = baseline_a5_receipt(&cached);
         return finish_decide(
             tcx,
             program,
             slots,
             mut_facts,
-            cached,
-            Vec::new(),
-            receipt,
+            cached.model,
+            retained_c9_plans,
+            cached.a5_receipt,
             perturb,
         );
     }
     let solve_t0 = std::time::Instant::now();
     let origins = compute_origins(&program);
-    let ((model, _retained_c9_marks, retained_c9_plans, a5_receipt), _export) =
-        with_bo_export(|| {
-            match solve_bo_a5_config(&program, &slots, &origins, &mut_facts, a5_mode, attestation) {
-                Some(verified) => (
-                    Some(verified.model),
-                    verified.retained_c9_marks,
-                    verified.retained_c9_plans,
-                    verified.receipt,
-                ),
-                None => (None, BTreeSet::new(), Vec::new(), String::new()),
-            }
-        });
-    let Some(model) = model else {
+    let (verified, _export) = with_bo_export(|| {
+        solve_bo_a5_config(&program, &slots, &origins, &mut_facts, a5_mode, attestation)
+    });
+    let Some(verified) = verified else {
         return Err("BO declined — no accepted model".to_owned());
+    };
+    let solve_secs = solve_t0.elapsed().as_secs_f64();
+    let model_sha256 = model_cache::model_bytes_sha256(tcx, &slots, &verified.model)
+        .ok_or_else(|| "fresh model contains an unrenderable slot key".to_owned())?;
+    let cached = model_cache::CachedModel {
+        model: verified.model.clone(),
+        baseline_model: verified.baseline_model.clone(),
+        a5_receipt: verified.receipt.clone(),
+    };
+    let cache_entry = if cacheable {
+        model_cache::memo_put(&fp, &cached);
+        model_cache::store(tcx, &program, &slots, &cached, a5_mode, attestation)
+            .map(|path| path.display().to_string())
+    } else {
+        None
     };
     // Write-through on every real solve, so a bypassed gate sweep refreshes
     // what dev iteration reads next.
     model_cache::record_solve(model_cache::SolveProvenance {
         source: "real",
+        cache_status: if model_cache::read_enabled() {
+            "miss"
+        } else {
+            "bypass"
+        },
         fingerprint: fp.clone(),
-        solve_secs: solve_t0.elapsed().as_secs_f64(),
+        model_sha256,
+        cache_entry,
+        solve_secs,
     });
-    if a5_mode == A5Mode::Baseline {
-        model_cache::memo_put(&fp, &model);
-        model_cache::store(tcx, &program, &slots, &model);
-    }
 
     finish_decide(
         tcx,
         program,
         slots,
         mut_facts,
-        model,
-        retained_c9_plans,
-        a5_receipt,
+        verified.model,
+        verified.retained_c9_plans,
+        verified.receipt,
         perturb,
     )
 }

@@ -438,7 +438,7 @@ fn a14_artifacts(construction: &BoConstruction) -> A14Artifacts {
     }
 }
 
-fn model_digest(model: &FxHashMap<SlotRef, SlotKind>) -> String {
+pub(crate) fn model_digest(model: &FxHashMap<SlotRef, SlotKind>) -> String {
     let mut rows = model
         .iter()
         .map(|(&slot, kind)| {
@@ -453,6 +453,65 @@ fn model_digest(model: &FxHashMap<SlotRef, SlotKind>) -> String {
         .collect::<Vec<_>>();
     rows.sort();
     format!("{:x}", Sha256::digest(rows.join("\n").as_bytes()))
+}
+
+fn receipt_field<'a>(receipt: &'a str, key: &str) -> Option<&'a str> {
+    receipt
+        .lines()
+        .find_map(|line| line.strip_prefix(&format!("{key}=")))
+}
+
+/// Rebuild only the session-local C9 mark carriers needed by the rewriter from
+/// a cached precise model. No solver is constructed or queried here: the A5
+/// plan is a deterministic MIR/fact projection from the cached baseline model,
+/// and the persisted construction receipt is checked against both the plan and
+/// the consumed final model before its spans are admitted.
+pub(crate) fn cached_precise_rewriter_payload(
+    program: &RustProgram<'_>,
+    slots: &CrateSlots,
+    origins: &OriginSummaries,
+    mut_facts: &MutFacts,
+    baseline_model: &FxHashMap<SlotRef, SlotKind>,
+    model: &FxHashMap<SlotRef, SlotKind>,
+    attestation: Option<WholeProgramAttestation>,
+    receipt: &str,
+) -> Result<Vec<PlannedC9Mark>, String> {
+    let plan = produce_a5_plan(
+        program,
+        slots,
+        origins.native_flows(),
+        mut_facts,
+        baseline_model,
+        A5Mode::PreciseReplay,
+        attestation,
+    )
+    .map_err(|error| format!("cached precise A5 plan: {error:#}"))?;
+    let (retained_marks, retained_plans) =
+        if matches!(plan.abi_guard, AbiGuardDisposition::Refused { .. }) {
+            (BTreeSet::new(), Vec::new())
+        } else {
+            (plan.retained_marks(model), plan.retained_mark_plans(model))
+        };
+    let expected = [
+        ("a5_mode", A5Mode::PreciseReplay.label().to_owned()),
+        (
+            "a5_world",
+            A5World::ClosedWorldFrozenGraph.label().to_owned(),
+        ),
+        ("selected_model_sha256", model_digest(model)),
+        ("a5_summary_sha256", summary_digest(&plan)),
+        ("a5_retained_marks", retained_marks.len().to_string()),
+        ("a5_retained_mark_sites", retained_plans.len().to_string()),
+    ];
+    for (key, value) in expected {
+        if receipt_field(receipt, key) != Some(value.as_str()) {
+            return Err(format!(
+                "cached precise receipt mismatch for {key}: expected {value:?}, got {:?}",
+                receipt_field(receipt, key)
+            ));
+        }
+    }
+    Ok(retained_plans)
 }
 
 fn summary_digest(plan: &A5Plan) -> String {
