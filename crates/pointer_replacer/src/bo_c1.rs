@@ -14819,6 +14819,96 @@ fn m1_emit_corpus() {
     );
 }
 
+#[test]
+#[ignore = "Item E measurement: serialized 20-program single-iteration revert census"]
+fn e1_revert_census_corpus() {
+    use std::{fs, time::Duration};
+
+    assert!(
+        std::env::var_os("CRAT_BO_CACHE").is_none(),
+        "the E1 populate pass must run fresh solves, never cache reads"
+    );
+    let root = orchestrate::workspace_root();
+    let artifact_dir = std::env::var_os("CRAT_E1_ARTIFACT_DIR")
+        .map(std::path::PathBuf::from)
+        .expect("E1 corpus requires CRAT_E1_ARTIFACT_DIR");
+    let cache_dir = std::env::var_os("CRAT_BO_CACHE_DIR")
+        .map(std::path::PathBuf::from)
+        .expect("E1 corpus requires CRAT_BO_CACHE_DIR");
+    fs::create_dir_all(&artifact_dir).expect("create E1 artifact directory");
+    fs::create_dir_all(&cache_dir).expect("create E1 cache directory");
+    assert_eq!(
+        fs::read_dir(&cache_dir)
+            .expect("read initial E1 cache")
+            .count(),
+        0,
+        "populate cache must start empty"
+    );
+    let timeout = Duration::from_secs(
+        std::env::var("CRAT_E1_TIMEOUT_SECS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(14_400),
+    );
+    let mut rows = Vec::new();
+    for program in CORPUS {
+        let input = program.input_path(&root);
+        let outcome = orchestrate::run_child_env(
+            program.name,
+            &input,
+            "e1-revert-census",
+            timeout,
+            &[
+                ("CRAT_E1_ARTIFACT_DIR", artifact_dir.display().to_string()),
+                ("CRAT_BO_CACHE_DIR", cache_dir.display().to_string()),
+                (
+                    "CRAT_BO_A5_ATTESTATION",
+                    "frozen_benchmark_graph".to_owned(),
+                ),
+            ],
+        );
+        let mut row = outcome.row.unwrap_or_else(|| {
+            panic!(
+                "{} produced no E1 row: status={} note={}",
+                program.name, outcome.status, outcome.note
+            )
+        });
+        row.set("program", program.name);
+        row.set("worker_wall_s", format!("{:.3}", outcome.wall_s));
+        row.set("peak_rss_kb", outcome.peak_rss_kb);
+        assert_eq!(row.get("status"), Some("ok"), "{row:?}");
+        assert_eq!(row.get("solve"), Some("real"), "{row:?}");
+        assert_eq!(row.get("cache_status"), Some("bypass"), "{row:?}");
+        assert_eq!(row.get("verify_iterations"), Some("1"), "{row:?}");
+        assert_eq!(row.get("repair_rounds"), Some("0"), "{row:?}");
+        assert!(
+            row.get("cache_entry")
+                .is_some_and(|path| std::path::Path::new(path).is_file()),
+            "{} did not populate its precise cache entry: {row:?}",
+            program.name
+        );
+        println!(
+            "E1-PROGRESS program={} status=ok wall_s={:.3} rss_kb={}",
+            program.name, outcome.wall_s, outcome.peak_rss_kb
+        );
+        rows.push(row);
+    }
+    assert_eq!(rows.len(), 20);
+    let cache_entries = fs::read_dir(&cache_dir)
+        .expect("read populated E1 cache")
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_name().to_string_lossy().ends_with(".model.tsv"))
+        .count();
+    assert_eq!(cache_entries, 20, "one precise cache entry per program");
+    let summary = rows
+        .iter()
+        .map(report::to_kv_line)
+        .collect::<Vec<_>>()
+        .join("\n")
+        + "\n";
+    fs::write(artifact_dir.join("e1-results.kv"), summary).expect("write E1 corpus rows");
+}
+
 /// **A panic is a failure; a resource deferral is an absence** (R8, 2026-08-15).
 ///
 /// Lifted out of the sweep because a decision only a 600 s corpus run can
