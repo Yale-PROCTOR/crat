@@ -136,6 +136,22 @@ pub(crate) fn solver_identity(
         .join("\n")
 }
 
+fn program_identity(
+    crate_name: &str,
+    files: impl IntoIterator<Item = (String, Vec<u8>)>,
+) -> String {
+    let mut files = files.into_iter().collect::<Vec<_>>();
+    files.sort_by(|left, right| left.0.cmp(&right.0).then(left.1.cmp(&right.1)));
+    let mut hash = Sha256::new();
+    hash.update(crate_name.as_bytes());
+    for (path, source_hash) in files {
+        hash.update(path.as_bytes());
+        hash.update((source_hash.len() as u64).to_le_bytes());
+        hash.update(source_hash);
+    }
+    format!("{:x}", hash.finalize())
+}
+
 /// `CRAT_BO_CACHE=1` enables reads. Writes happen whenever a real solve runs
 /// with a cache directory configured, so a bypassed gate sweep still refreshes
 /// what dev iteration will read next.
@@ -195,21 +211,18 @@ pub(crate) fn fingerprint(
     // 1. The program's own source. Per-program, not the whole-corpus digest, so
     //    one program changing does not void the other nineteen.
     let tcx = program.tcx;
-    h.update(tcx.crate_name(LOCAL_CRATE).as_str().as_bytes());
-    let mut files: Vec<(String, u64)> = Vec::new();
+    let mut files = Vec::new();
     for f in tcx.sess.source_map().files().iter() {
         if let rustc_span::FileName::Real(rp) = &f.name
             && let Some(p) = rp.local_path()
         {
-            files.push((
-                p.display().to_string(),
-                f.src_hash.hash_bytes().len() as u64,
-            ));
-            h.update(p.display().to_string().as_bytes());
-            h.update(f.src_hash.hash_bytes());
+            files.push((p.display().to_string(), f.src_hash.hash_bytes().to_vec()));
         }
     }
-    let _ = files;
+    h.update(program_identity(
+        tcx.crate_name(LOCAL_CRATE).as_str(),
+        files,
+    ));
 
     // 2. The analysis code. Any edit under `analyses/` changes what a solve
     //    means, so a cache written by the old code must not be read by the new.
@@ -539,6 +552,24 @@ mod tests {
         );
         assert_ne!(precise_attested, precise_unattested);
         assert_ne!(precise_attested, baseline);
+    }
+
+    #[test]
+    fn program_identity_is_independent_of_source_map_iteration_order() {
+        let left = vec![
+            ("z.rs".to_owned(), vec![3, 4]),
+            ("a.rs".to_owned(), vec![1, 2]),
+        ];
+        let mut right = left.clone();
+        right.reverse();
+        assert_eq!(
+            program_identity("fixture", left),
+            program_identity("fixture", right)
+        );
+        assert_ne!(
+            program_identity("fixture", [("a.rs".to_owned(), vec![1, 2])]),
+            program_identity("other", [("a.rs".to_owned(), vec![1, 2])]),
+        );
     }
 
     /// Production's accepted PreciseReplay path must write and consume the
