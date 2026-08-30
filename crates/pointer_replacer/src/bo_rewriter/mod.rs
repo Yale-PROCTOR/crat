@@ -1103,10 +1103,34 @@ fn verify_and_revert(
                                 original_root,
                             );
                         }
+                        if related_owners.is_empty() {
+                            related_owners = e1_region_owners(
+                                &related_diagnostic,
+                                &line_maps,
+                                &observed_root,
+                                original_root,
+                                &facts.emitted_sites,
+                                &planned_edit_sites,
+                            );
+                        }
                         owners.extend(related_owners);
                     }
                     if !owners.is_empty() {
                         attribution = "related-span";
+                    }
+                }
+                if owners.is_empty() {
+                    let original_root = crate_dir.as_deref().unwrap_or(std::path::Path::new(""));
+                    owners = e1_region_owners(
+                        diagnostic,
+                        &line_maps,
+                        &observed_root,
+                        original_root,
+                        &facts.emitted_sites,
+                        &planned_edit_sites,
+                    );
+                    if !owners.is_empty() {
+                        attribution = "region-span";
                     }
                 }
                 if owners.is_empty() {
@@ -2365,6 +2389,56 @@ fn e1_bijective_line(
         return None;
     }
     candidates[0].to_original_if_bijective(diagnostic.line)
+}
+
+fn e1_region_owners(
+    diagnostic: &verify::Diag,
+    line_maps: &std::collections::BTreeMap<plan::FileKey, apply::LineMap>,
+    observed_root: &std::path::Path,
+    original_root: &std::path::Path,
+    sites: &[EmittedSite],
+    edits: &[EditSite],
+) -> std::collections::BTreeSet<String> {
+    let diagnostic_file = verify::crate_relative(&diagnostic.file, observed_root);
+    let mut maps = line_maps
+        .iter()
+        .filter_map(|(key, map)| match key {
+            plan::FileKey::Real(path)
+                if verify::crate_relative(&path.display().to_string(), original_root)
+                    == diagnostic_file =>
+            {
+                Some(map)
+            }
+            plan::FileKey::Virtual(name) if *name == diagnostic_file => Some(map),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    if maps.is_empty() && line_maps.len() == 1 {
+        maps.extend(line_maps.values());
+    }
+    let Some((lo, hi)) = (maps.len() == 1)
+        .then(|| maps[0].original_region(diagnostic.line))
+        .flatten()
+    else {
+        return std::collections::BTreeSet::new();
+    };
+    let single_file = line_maps.len() == 1;
+    let same_file =
+        |file: &str| single_file || verify::crate_relative(file, original_root) == diagnostic_file;
+    let mut owners = edits
+        .iter()
+        .filter(|edit| same_file(&edit.file) && edit.lo_line <= hi && lo <= edit.hi_line)
+        .map(|edit| edit.fn_path.clone())
+        .collect::<std::collections::BTreeSet<_>>();
+    if owners.is_empty() {
+        owners.extend(
+            sites
+                .iter()
+                .filter(|site| same_file(&site.file) && site.lo_line <= hi && lo <= site.hi_line)
+                .map(|site| site.fn_path.clone()),
+        );
+    }
+    owners
 }
 
 fn e1_call_site_not_adapted(diagnostic: &verify::Diag) -> bool {

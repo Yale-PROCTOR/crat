@@ -217,6 +217,22 @@ impl LineMap {
         }
         Some((emit_line as isize - delta).max(1) as usize)
     }
+
+    /// The exact original region corresponding to an emitted line. Inside a
+    /// reprinted function this returns that function splice's complete original
+    /// line span; outside a splice it returns the ordinary mapped singleton.
+    pub(crate) fn original_region(&self, emit_line: usize) -> Option<(usize, usize)> {
+        for segment in &self.segments {
+            if emit_line < segment.emit_lo {
+                break;
+            }
+            if emit_line <= segment.emit_hi {
+                return Some((segment.orig_lo, segment.orig_hi));
+            }
+        }
+        self.to_original_if_bijective(emit_line)
+            .map(|line| (line, line))
+    }
 }
 
 #[cfg(test)]
@@ -246,6 +262,7 @@ mod tests {
         };
         assert_eq!(equal.to_original(60), 57, "ordinary gate map collapses");
         assert_eq!(equal.to_original_if_bijective(60), Some(60));
+        assert_eq!(equal.original_region(60), Some((57, 65)));
 
         let unequal = LineMap {
             segments: vec![Segment {
@@ -256,6 +273,7 @@ mod tests {
             }],
         };
         assert_eq!(unequal.to_original_if_bijective(60), None);
+        assert_eq!(unequal.original_region(60), Some((57, 65)));
     }
 
     /// **THE libtree SHAPE — accumulated drift, and it must discriminate.**
