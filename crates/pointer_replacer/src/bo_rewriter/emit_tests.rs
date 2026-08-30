@@ -1177,6 +1177,7 @@ fn a_repeat_of_a_masked_class_is_still_novel() {
         message: "reference casting".to_owned(),
         direction: verify::Direction::Other,
         code: None,
+        related: Vec::new(),
     };
     let baseline = verify::Baseline {
         keys: std::iter::once((verify::baseline_key(&diag(1), root), 1)).collect(),
@@ -1230,6 +1231,7 @@ fn both_sides_key_the_same_file_identically() {
                 message: "same message".to_owned(),
                 direction: verify::Direction::Other,
                 code: None,
+                related: Vec::new(),
             },
             root,
         )
@@ -3984,6 +3986,7 @@ mod attribution_and_escapes {
             message: "mismatched types".to_owned(),
             direction: Direction::RawIntoRewritten,
             code: Some("E0308".to_owned()),
+            related: Vec::new(),
         }
     }
 

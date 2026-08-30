@@ -215,6 +215,13 @@ fn classify(message: &str) -> Direction {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct RelatedDiag {
+    pub file: String,
+    pub line: usize,
+    pub message: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Diag {
     pub file: String,
     pub line: usize,
@@ -224,6 +231,10 @@ pub(crate) struct Diag {
     /// distinction that made S2b.0's `error[`-counting instrument blind to
     /// deny-by-default lints.
     pub code: Option<String>,
+    /// Located child notes, notably rustc's callee-definition span for an
+    /// unadapted call argument. Diagnostic identity deliberately ignores these;
+    /// E1 consumes them only when the primary span names no rewrite owner.
+    pub related: Vec<RelatedDiag>,
 }
 
 /// Identity of a diagnostic that is STABLE UNDER LINE DRIFT.
@@ -421,6 +432,28 @@ impl rustc_errors::emitter::Emitter for Capture {
         if message.is_empty() {
             *self.unrenderable.lock().unwrap() += 1;
         }
+        let related = diag
+            .children
+            .iter()
+            .filter_map(|child| {
+                let span = child.span.primary_span()?;
+                let loc = self.source_map.lookup_char_pos(span.lo());
+                let message = child
+                    .messages
+                    .iter()
+                    .filter_map(|(message, _)| match message {
+                        rustc_errors::DiagMessage::Str(text) => Some(text.as_ref()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                Some(RelatedDiag {
+                    file: loc.file.name.prefer_local().to_string(),
+                    line: loc.line,
+                    message,
+                })
+            })
+            .collect();
         if let Some(span) = diag.span.primary_span() {
             let loc = self.source_map.lookup_char_pos(span.lo());
             let direction = classify(&message);
@@ -430,6 +463,7 @@ impl rustc_errors::emitter::Emitter for Capture {
                 message,
                 direction,
                 code: diag.code.map(|c| format!("{c:?}")),
+                related,
             });
         }
         // Forward LAST: extraction borrows, rendering consumes.
@@ -479,4 +513,24 @@ fn diagnose_input(input: rustc_session::config::Input) -> Diagnosis {
         diags: diags.lock().unwrap().clone(),
         unrenderable: *unrenderable.lock().unwrap(),
     }
+}
+
+#[cfg(test)]
+#[test]
+fn call_mismatch_capture_retains_the_callee_definition_span() {
+    let diagnosis = diagnose_input(::utils::compilation::str_to_input(
+        "fn callee(_: &i32) {} fn caller(p: *const i32) { callee(p); }",
+    ));
+    let mismatch = diagnosis
+        .diags
+        .iter()
+        .find(|diagnostic| matches!(diagnostic.code.as_deref(), Some("E0308" | "ErrCode(308)")))
+        .expect("E0308 mismatch diagnostic");
+    assert!(
+        mismatch
+            .related
+            .iter()
+            .any(|related| related.message.contains("function defined here")),
+        "callee-definition span was discarded: {mismatch:?}"
+    );
 }

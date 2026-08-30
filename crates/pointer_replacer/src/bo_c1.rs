@@ -8578,7 +8578,7 @@ mod run {
         }
 
         let mut artifact = String::from(
-            "corpus\tanalysis_frame\tdata\ta5_mode\ta5_world\ta5_abi_guard\tcopy_lend_mode\ta2_mode\tsoundness_mode\tprogram\trevert_key\tfunction\tclass\terror_code\tmessage_head\tfile\tline\tdirection\tattribution\trewrite_shapes\trepro_context\tinput_root\n",
+            "corpus\tanalysis_frame\tdata\ta5_mode\ta5_world\ta5_abi_guard\tcopy_lend_mode\ta2_mode\tsoundness_mode\tprogram\trevert_key\tfunction\tclass\terror_code\tmessage_head\tfile\tline\tdirection\tattribution\trelated_locations\trewrite_shapes\trepro_context\tinput_root\n",
         );
         for (index, revert) in capture.reverts.iter().enumerate() {
             let key = if revert.function == "<unattributed>" {
@@ -8605,8 +8605,25 @@ mod run {
                 })
                 .collect::<Vec<_>>()
                 .join(" | ");
+            let related = revert
+                .diagnostic
+                .related
+                .iter()
+                .map(|related| {
+                    format!(
+                        "{}:{}:{}",
+                        crate::bo_rewriter::verify::crate_relative(
+                            &related.file,
+                            &capture.observed_root,
+                        ),
+                        related.line,
+                        related.message,
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(" | ");
             artifact.push_str(&format!(
-                "rs-crown\t{}\tprovisional\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:?}\t{}\t{}\t{}\t{}\n",
+                "rs-crown\t{}\tprovisional\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:?}\t{}\t{}\t{}\t{}\t{}\n",
                 crate::analyses::borrow_ownership::model_cache::ANALYSIS_FRAME,
                 a5_mode,
                 a5_world,
@@ -8630,6 +8647,7 @@ mod run {
                 revert.diagnostic.line,
                 revert.diagnostic.direction,
                 revert.attribution,
+                tsv_field(&related, 800),
                 tsv_field(&shapes.join(" | "), 600),
                 tsv_field(&context, 1200),
                 input.display(),
@@ -8677,6 +8695,9 @@ mod run {
         row.set("repair_rounds", 0);
         row.set("e1_diag_rows", capture.reverts.len());
         row.set("e1_novel_errors", capture.novel_error_count);
+        row.set("attempted_placements", capture.attempted_placements);
+        row.set("files_touched", capture.files_touched);
+        row.set("unplaceable", capture.unplaceable);
         row.set("baseline_keys", capture.baseline_keys);
         row.set("baseline_errors", capture.baseline_errors);
         row.set("baseline_msg_env", capture.baseline_msg_env);
@@ -14824,9 +14845,11 @@ fn m1_emit_corpus() {
 fn e1_revert_census_corpus() {
     use std::{fs, time::Duration};
 
-    assert!(
-        std::env::var_os("CRAT_BO_CACHE").is_none(),
-        "the E1 populate pass must run fresh solves, never cache reads"
+    let readback = std::env::var("CRAT_E1_READBACK").as_deref() == Ok("1");
+    assert_eq!(
+        std::env::var("CRAT_BO_CACHE").as_deref() == Ok("1"),
+        readback,
+        "populate requires cache reads off; readback requires them on"
     );
     let root = orchestrate::workspace_root();
     let artifact_dir = std::env::var_os("CRAT_E1_ARTIFACT_DIR")
@@ -14837,13 +14860,15 @@ fn e1_revert_census_corpus() {
         .expect("E1 corpus requires CRAT_BO_CACHE_DIR");
     fs::create_dir_all(&artifact_dir).expect("create E1 artifact directory");
     fs::create_dir_all(&cache_dir).expect("create E1 cache directory");
-    assert_eq!(
-        fs::read_dir(&cache_dir)
-            .expect("read initial E1 cache")
-            .count(),
-        0,
-        "populate cache must start empty"
-    );
+    if !readback {
+        assert_eq!(
+            fs::read_dir(&cache_dir)
+                .expect("read initial E1 cache")
+                .count(),
+            0,
+            "populate cache must start empty"
+        );
+    }
     let timeout = Duration::from_secs(
         std::env::var("CRAT_E1_TIMEOUT_SECS")
             .ok()
@@ -14877,8 +14902,16 @@ fn e1_revert_census_corpus() {
         row.set("worker_wall_s", format!("{:.3}", outcome.wall_s));
         row.set("peak_rss_kb", outcome.peak_rss_kb);
         assert_eq!(row.get("status"), Some("ok"), "{row:?}");
-        assert_eq!(row.get("solve"), Some("real"), "{row:?}");
-        assert_eq!(row.get("cache_status"), Some("bypass"), "{row:?}");
+        assert_eq!(
+            row.get("solve"),
+            Some(if readback { "cache" } else { "real" }),
+            "{row:?}"
+        );
+        assert_eq!(
+            row.get("cache_status"),
+            Some(if readback { "hit" } else { "bypass" }),
+            "{row:?}"
+        );
         assert_eq!(row.get("verify_iterations"), Some("1"), "{row:?}");
         assert_eq!(row.get("repair_rounds"), Some("0"), "{row:?}");
         assert!(
@@ -14888,8 +14921,11 @@ fn e1_revert_census_corpus() {
             program.name
         );
         println!(
-            "E1-PROGRESS program={} status=ok wall_s={:.3} rss_kb={}",
-            program.name, outcome.wall_s, outcome.peak_rss_kb
+            "E1-PROGRESS program={} source={} status=ok wall_s={:.3} rss_kb={}",
+            program.name,
+            if readback { "cache" } else { "real" },
+            outcome.wall_s,
+            outcome.peak_rss_kb
         );
         rows.push(row);
     }
@@ -15010,6 +15046,7 @@ fn e1_revert_classes_are_disjoint_and_callsite_mechanism_beats_e0308_carrier() {
                 message: message.to_owned(),
                 direction: Direction::Other,
                 code: code.map(str::to_owned),
+                related: Vec::new(),
             },
             call_site_not_adapted,
             attribution: "test".to_owned(),

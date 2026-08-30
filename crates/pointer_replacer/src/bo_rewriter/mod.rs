@@ -125,6 +125,9 @@ pub(crate) struct E1Capture {
     pub(crate) baseline_keys: usize,
     pub(crate) baseline_errors: usize,
     pub(crate) baseline_msg_env: usize,
+    pub(crate) attempted_placements: usize,
+    pub(crate) files_touched: usize,
+    pub(crate) unplaceable: usize,
     pub(crate) a5_receipt: String,
     pub(crate) solve_receipt: model_cache::SolveReceipt,
 }
@@ -1062,6 +1065,51 @@ fn verify_and_revert(
                     }
                 }
                 if owners.is_empty() {
+                    let original_root = crate_dir.as_deref().unwrap_or(std::path::Path::new(""));
+                    for related in &diagnostic.related {
+                        let mut related_diagnostic = verify::Diag {
+                            file: related.file.clone(),
+                            line: related.line,
+                            message: related.message.clone(),
+                            direction: verify::Direction::Other,
+                            code: diagnostic.code.clone(),
+                            related: Vec::new(),
+                        };
+                        let mut related_owners = attribute(
+                            std::slice::from_ref(&related_diagnostic),
+                            &line_maps,
+                            &observed_root,
+                            &facts.emitted_sites,
+                            &planned_edit_sites,
+                            &reverted,
+                            original_root,
+                        );
+                        if related_owners.is_empty()
+                            && let Some(original_line) = e1_bijective_line(
+                                &related_diagnostic,
+                                &line_maps,
+                                &observed_root,
+                                original_root,
+                            )
+                        {
+                            related_diagnostic.line = original_line;
+                            related_owners = attribute(
+                                std::slice::from_ref(&related_diagnostic),
+                                &std::collections::BTreeMap::new(),
+                                &observed_root,
+                                &facts.emitted_sites,
+                                &planned_edit_sites,
+                                &reverted,
+                                original_root,
+                            );
+                        }
+                        owners.extend(related_owners);
+                    }
+                    if !owners.is_empty() {
+                        attribution = "related-span";
+                    }
+                }
+                if owners.is_empty() {
                     facts.e1_reverts.push(E1RevertDiagnostic {
                         function: "<unattributed>".to_owned(),
                         diagnostic: diagnostic.clone(),
@@ -1097,6 +1145,7 @@ fn verify_and_revert(
                         ),
                         direction: verify::Direction::Other,
                         code: None,
+                        related: Vec::new(),
                     },
                     call_site_not_adapted: false,
                     attribution: "spanless".to_owned(),
@@ -2014,6 +2063,9 @@ impl RewriteOutcome {
             baseline_keys,
             baseline_errors,
             baseline_msg_env,
+            attempted_placements,
+            files_touched,
+            unplaceable,
             a5_receipt,
             solve_receipt,
         ) = match self {
@@ -2024,6 +2076,9 @@ impl RewriteOutcome {
                 baseline_keys,
                 baseline_errors,
                 baseline_msg_env,
+                emitted_count,
+                files_touched,
+                unplaceable,
                 a5_receipt,
                 solve_receipt,
                 ..
@@ -2035,6 +2090,9 @@ impl RewriteOutcome {
                 baseline_keys,
                 baseline_errors,
                 baseline_msg_env,
+                emitted_count,
+                files_touched,
+                unplaceable,
                 a5_receipt,
                 solve_receipt,
                 ..
@@ -2045,6 +2103,9 @@ impl RewriteOutcome {
                 baseline_keys,
                 baseline_errors,
                 baseline_msg_env,
+                emitted_count,
+                files_touched,
+                unplaceable.len(),
                 a5_receipt,
                 solve_receipt,
             ),
@@ -2057,6 +2118,9 @@ impl RewriteOutcome {
             baseline_keys,
             baseline_errors,
             baseline_msg_env,
+            attempted_placements,
+            files_touched,
+            unplaceable,
             a5_receipt,
             solve_receipt: solve_receipt
                 .ok_or_else(|| "E1 capture has no solve receipt".to_owned())?,
