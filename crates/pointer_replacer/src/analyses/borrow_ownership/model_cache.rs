@@ -152,6 +152,13 @@ fn program_identity(
     format!("{:x}", hash.finalize())
 }
 
+fn canonical_program_path(path: &Path) -> String {
+    std::fs::canonicalize(path)
+        .unwrap_or_else(|_| path.to_path_buf())
+        .display()
+        .to_string()
+}
+
 /// `CRAT_BO_CACHE=1` enables reads. Writes happen whenever a real solve runs
 /// with a cache directory configured, so a bypassed gate sweep still refreshes
 /// what dev iteration will read next.
@@ -216,7 +223,7 @@ pub(crate) fn fingerprint(
         if let rustc_span::FileName::Real(rp) = &f.name
             && let Some(p) = rp.local_path()
         {
-            files.push((p.display().to_string(), f.src_hash.hash_bytes().to_vec()));
+            files.push((canonical_program_path(p), f.src_hash.hash_bytes().to_vec()));
         }
     }
     h.update(program_identity(
@@ -569,6 +576,19 @@ mod tests {
         assert_ne!(
             program_identity("fixture", [("a.rs".to_owned(), vec![1, 2])]),
             program_identity("other", [("a.rs".to_owned(), vec![1, 2])]),
+        );
+    }
+
+    #[test]
+    fn program_path_identity_ignores_dotdot_launch_spelling() {
+        let manifest = Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
+        let dotted = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src")
+            .join("..")
+            .join("Cargo.toml");
+        assert_eq!(
+            canonical_program_path(&manifest),
+            canonical_program_path(&dotted)
         );
     }
 
