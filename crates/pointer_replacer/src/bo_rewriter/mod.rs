@@ -131,6 +131,8 @@ pub(crate) struct E1Capture {
     /// Exact call-adapter rows rendered from the SAME `DecisionTable` consumed
     /// by the one E1 emission iteration.
     pub(crate) adapter_receipt: String,
+    /// Every subject and item-axis exclusion from that same table/plan.
+    pub(crate) subject_receipt: String,
     pub(crate) novel_error_count: usize,
     pub(crate) baseline_keys: usize,
     pub(crate) baseline_errors: usize,
@@ -231,6 +233,8 @@ pub(crate) enum RewriteOutcome {
         e1_reverts: Vec<E1RevertDiagnostic>,
         /// E1's adapter receipt, empty on ordinary runs.
         e1_adapter_receipt: String,
+        /// E1's identity-bearing subject seed, empty on ordinary runs.
+        e1_subject_receipt: String,
         /// Baseline-subtracted error count from the one verify invocation.
         e1_novel_error_count: usize,
         /// Cache/solve receipt captured inside the compiler callback.
@@ -291,6 +295,8 @@ pub(crate) enum RewriteOutcome {
         e1_reverts: Vec<E1RevertDiagnostic>,
         /// E1's adapter receipt, empty on ordinary runs.
         e1_adapter_receipt: String,
+        /// E1's identity-bearing subject seed, empty on ordinary runs.
+        e1_subject_receipt: String,
         /// Baseline-subtracted error count from the one verify invocation.
         e1_novel_error_count: usize,
         /// Cache/solve receipt captured inside the compiler callback.
@@ -600,6 +606,11 @@ fn rewrite_core_injected(
                     .join(" | ")
             ));
         }
+        let e1_subject_receipt = if census_once {
+            e1_subject_seed_tsv(tcx, &table, &decide_ctx, &emission.unplaceable)?
+        } else {
+            String::new()
+        };
         let degradations: Vec<decision::Degradation> = table.degradations().cloned().collect();
         let mut emitted_sites: Vec<EmittedSite> = Vec::new();
         // One entry per EMITTED SUBJECT (not per function), so a revert can move
@@ -727,6 +738,7 @@ fn rewrite_core_injected(
             emitted_sites,
             emitted_subjects,
             a5_receipt,
+            e1_subject_receipt,
         ))
     });
 
@@ -831,6 +843,7 @@ fn verify_and_revert(
     emitted_sites: Vec<EmittedSite>,
     emitted_subjects: Vec<(String, String, String)>,
     a5_receipt: String,
+    e1_subject_receipt: String,
 ) -> RewriteOutcome {
     // `excluded` is a LOCAL again: the loop holds `tcx`, so a value that used
     // to cross the boundary is simply computed here. One of the ten, retired.
@@ -926,6 +939,7 @@ fn verify_and_revert(
         } else {
             String::new()
         },
+        e1_subject_receipt,
         e1_novel_error_count: 0,
         solve_receipt: model_cache::solve_receipt(),
     };
@@ -2078,6 +2092,7 @@ struct OutcomeFacts {
     a5_receipt: String,
     e1_reverts: Vec<E1RevertDiagnostic>,
     e1_adapter_receipt: String,
+    e1_subject_receipt: String,
     e1_novel_error_count: usize,
     solve_receipt: Option<model_cache::SolveReceipt>,
 }
@@ -2130,6 +2145,7 @@ impl RewriteOutcome {
             observed_root,
             e1_reverts,
             e1_adapter_receipt,
+            e1_subject_receipt,
             novel_error_count,
             baseline_keys,
             baseline_errors,
@@ -2145,6 +2161,7 @@ impl RewriteOutcome {
                 observed_root,
                 e1_reverts,
                 e1_adapter_receipt,
+                e1_subject_receipt,
                 e1_novel_error_count,
                 baseline_keys,
                 baseline_errors,
@@ -2159,6 +2176,7 @@ impl RewriteOutcome {
                 observed_root,
                 e1_reverts,
                 e1_adapter_receipt,
+                e1_subject_receipt,
                 e1_novel_error_count,
                 baseline_keys,
                 baseline_errors,
@@ -2175,6 +2193,7 @@ impl RewriteOutcome {
                 observed_root,
                 e1_reverts,
                 e1_adapter_receipt,
+                e1_subject_receipt,
                 e1_novel_error_count,
                 baseline_keys,
                 baseline_errors,
@@ -2189,6 +2208,7 @@ impl RewriteOutcome {
                 observed_root,
                 e1_reverts,
                 e1_adapter_receipt,
+                e1_subject_receipt,
                 e1_novel_error_count,
                 baseline_keys,
                 baseline_errors,
@@ -2206,6 +2226,7 @@ impl RewriteOutcome {
                 .ok_or_else(|| format!("E1 capture has no observed root: {outcome_reason}"))?,
             reverts: e1_reverts,
             adapter_receipt: e1_adapter_receipt,
+            subject_receipt: e1_subject_receipt,
             novel_error_count,
             baseline_keys,
             baseline_errors,
@@ -2263,6 +2284,7 @@ impl OutcomeFacts {
             a5_receipt: self.a5_receipt,
             e1_reverts: self.e1_reverts,
             e1_adapter_receipt: self.e1_adapter_receipt,
+            e1_subject_receipt: self.e1_subject_receipt,
             e1_novel_error_count: self.e1_novel_error_count,
             solve_receipt: self.solve_receipt,
         }
@@ -2288,6 +2310,7 @@ impl OutcomeFacts {
             a5_receipt: self.a5_receipt,
             e1_reverts: self.e1_reverts,
             e1_adapter_receipt: self.e1_adapter_receipt,
+            e1_subject_receipt: self.e1_subject_receipt,
             e1_novel_error_count: self.e1_novel_error_count,
             solve_receipt: self.solve_receipt,
         }
@@ -3410,6 +3433,174 @@ impl DecideCtx {
     pub(crate) fn escapes_for_test(&self) -> &[decision::co_conversion::Escape] {
         &self.escapes
     }
+}
+
+fn e1_subject_model_kind(ctx: &DecideCtx, subject: &decision::Subject) -> Option<SlotKind> {
+    let universe = ctx.slots.fn_local_slots.get(&subject.fn_did)?;
+    let slot = universe.slot_for_local_depth(subject.local, 0)?;
+    ctx.model
+        .get(&SlotRef::Local(subject.fn_did, slot))
+        .copied()
+}
+
+fn e1_subject_family(
+    model: Option<SlotKind>,
+    decision: &decision::Decision,
+    hypothetical: Option<&decision::Decision>,
+) -> &'static str {
+    match model {
+        Some(SlotKind::Raw) => "raw",
+        Some(SlotKind::Owning) => "box",
+        None => "unmodeled",
+        Some(SlotKind::Ref) => {
+            let form = match decision {
+                decision::Decision::Ref { .. } => Some("ref"),
+                decision::Decision::Slice { .. } => Some("slice"),
+                decision::Decision::Opt { .. } => Some("optional"),
+                decision::Decision::Degraded(_) => match hypothetical {
+                    Some(decision::Decision::Ref { .. }) => Some("ref"),
+                    Some(decision::Decision::Slice { .. }) => Some("slice"),
+                    Some(decision::Decision::Opt { .. }) => Some("optional"),
+                    Some(decision::Decision::Degraded(_)) | None => None,
+                },
+            };
+            form.unwrap_or_else(|| match decision {
+                decision::Decision::Degraded(record) => match record.reason {
+                    decision::DegradeReason::SliceUseUnsupported
+                    | decision::DegradeReason::SliceNegOrUnknownOffset
+                    | decision::DegradeReason::SliceLocalConstruction => "slice",
+                    decision::DegradeReason::NullInit
+                    | decision::DegradeReason::OptUseUnsupported
+                    | decision::DegradeReason::OptLocalConstruction
+                    | decision::DegradeReason::OptNeedsMutBinding => "optional",
+                    _ => "ref",
+                },
+                decision::Decision::Ref { .. }
+                | decision::Decision::Slice { .. }
+                | decision::Decision::Opt { .. } => unreachable!("emitting form mapped above"),
+            })
+        }
+    }
+}
+
+/// Addendum 90's identity seed, produced inside the one E1 compiler callback
+/// from the exact table and plan that emission consumes.  Classification of
+/// first-pass reverts happens after verification, but no subject or model fact
+/// is re-derived there.
+fn e1_subject_seed_tsv(
+    tcx: TyCtxt<'_>,
+    table: &decision::DecisionTable,
+    ctx: &DecideCtx,
+    unplaceable: &[plan::Unplaceable],
+) -> Result<String, String> {
+    let mut unplaced = unplaceable
+        .iter()
+        .map(|row| (row.subject.as_str(), row.reason))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let hypothetical = ctx
+        .hypothetical
+        .entries
+        .iter()
+        .map(|(subject, decision)| {
+            (
+                (subject.fn_did.local_def_index.as_u32(), subject.local),
+                decision,
+            )
+        })
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let mut rows = Vec::new();
+    for (subject, decision) in &table.entries {
+        let owner = tcx.def_path_str(subject.fn_did.to_def_id());
+        let key = subject.identity_key(&owner);
+        let model = e1_subject_model_kind(ctx, subject);
+        let family = e1_subject_family(
+            model,
+            decision,
+            hypothetical
+                .get(&(subject.fn_did.local_def_index.as_u32(), subject.local))
+                .copied(),
+        );
+        let model_key = match model {
+            Some(SlotKind::Raw) => "raw",
+            Some(SlotKind::Ref) => "ref",
+            Some(SlotKind::Owning) => "owning",
+            None => "unmodeled",
+        };
+        let (decision_key, reason, site) = match decision {
+            decision::Decision::Ref { .. } => (
+                "ref",
+                "-",
+                decision::emitability::EmitabilityFacts::site(tcx, subject.attribution_span()),
+            ),
+            decision::Decision::Slice { .. } => (
+                "slice",
+                "-",
+                decision::emitability::EmitabilityFacts::site(tcx, subject.attribution_span()),
+            ),
+            decision::Decision::Opt { .. } => (
+                "optional",
+                "-",
+                decision::emitability::EmitabilityFacts::site(tcx, subject.attribution_span()),
+            ),
+            decision::Decision::Degraded(record) => {
+                ("degraded", record.reason.key(), record.site.clone())
+            }
+        };
+        let unplaced_reason = unplaced.remove(key.as_str());
+        let emits = !matches!(decision, decision::Decision::Degraded(_));
+        let placed = emits && unplaced_reason.is_none();
+        let exclusion = unplaced_reason
+            .map(|reason| format!("unplaceable:{reason}"))
+            .unwrap_or_else(|| "-".to_owned());
+        let arg_index = match subject.kind {
+            decision::SubjectKind::Param { hir_index } => (hir_index + 1).to_string(),
+            decision::SubjectKind::Local => "-".to_owned(),
+        };
+        rows.push((
+            key.clone(),
+            format!(
+                "{key}\t{owner}\t{}\t{arg_index}\t{}\t{family}\t{model_key}\t{decision_key}\t{reason}\t{}\t{}\t{exclusion}",
+                subject.local.as_u32(),
+                subject.ptr_depth,
+                site.replace(['\t', '\r', '\n'], " "),
+                u8::from(placed),
+            ),
+        ));
+    }
+    if !unplaced.is_empty() {
+        return Err(format!(
+            "unplaceable subject(s) absent from decision table: {}",
+            unplaced.keys().copied().collect::<Vec<_>>().join(",")
+        ));
+    }
+
+    let universe = decision::universe::classify(tcx);
+    for subject in universe.excluded_subjects {
+        let owner = tcx.def_path_str(subject.did.to_def_id());
+        let key = format!("{owner}::arg#{}@d0", subject.arg_index);
+        rows.push((
+            key.clone(),
+            format!(
+                "{key}\t{owner}\t{}\t{}\t{}\tunmodeled\tunmodeled\texcluded\t-\t-\t0\t{}",
+                subject.arg_index, subject.arg_index, subject.ptr_depth, subject.reason
+            ),
+        ));
+    }
+    rows.sort_by(|left, right| left.0.cmp(&right.0));
+    let mut seen = std::collections::BTreeSet::new();
+    for (key, _) in &rows {
+        if !seen.insert(key) {
+            return Err(format!("duplicate E1 subject seed identity {key}"));
+        }
+    }
+    let mut out = String::from(
+        "subject_key\towner_fn\tmir_local\targ_index\tptr_depth\tfamily\tmodel_kind\tdecision\treason\tsite\tplaced\texclusion\n",
+    );
+    for (_, row) in rows {
+        out.push_str(&row);
+        out.push('\n');
+    }
+    Ok(out)
 }
 
 /// **Producer A's artifact** for the crate in `tcx`.

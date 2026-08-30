@@ -68,6 +68,18 @@ pub(crate) struct Excluded {
     pub foreign_items: usize,
 }
 
+/// One pointer parameter excluded by M1's item-axis scope, with enough owned
+/// identity for a corpus ledger to prove that the aggregate did not hide a
+/// subject.  The analysis never constructs a kind for these rows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ExcludedSubject {
+    pub did: LocalDefId,
+    /// One-based source/signature position, parallel to artifact `arg_index`.
+    pub arg_index: usize,
+    pub ptr_depth: usize,
+    pub reason: &'static str,
+}
+
 /// The item-axis census.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct UniverseReport {
@@ -81,6 +93,9 @@ pub(crate) struct UniverseReport {
     /// Pointer params on those free functions.
     pub subjects: usize,
     pub excluded: Excluded,
+    /// Identity-bearing form of [`Self::excluded`]. Counts above are derived
+    /// from this vector, never from a second walk.
+    pub excluded_subjects: Vec<ExcludedSubject>,
 }
 
 /// Pointer parameters of `did`, counted on the **resolved** signature.
@@ -90,14 +105,18 @@ pub(crate) struct UniverseReport {
 /// syntactic count would report an aliased parameter as absent — the exact
 /// blind spot that made the `4171/0/0/2039` census unable to detect its own
 /// error.
-fn ptr_params(tcx: TyCtxt<'_>, did: LocalDefId) -> usize {
+fn ptr_params(tcx: TyCtxt<'_>, did: LocalDefId) -> Vec<(usize, usize)> {
     tcx.fn_sig(did)
         .skip_binder()
         .skip_binder()
         .inputs()
         .iter()
-        .filter(|ty| ptr_chain_depth(**ty) > 0)
-        .count()
+        .enumerate()
+        .filter_map(|(index, ty)| {
+            let depth = ptr_chain_depth(*ty);
+            (depth > 0).then_some((index + 1, usize::from(depth)))
+        })
+        .collect()
 }
 
 /// Classify every item in the crate, by scope class.
@@ -118,24 +137,63 @@ pub(crate) fn classify(tcx: TyCtxt<'_>) -> UniverseReport {
         // here would let a collector-invented function hide behind "it had no
         // pointer parameters anyway".
         report.free_fns.insert(did);
-        report.subjects += ptr_params(tcx, did);
+        report.subjects += ptr_params(tcx, did).len();
     }
     for id in items.impl_items() {
         let did = id.owner_id.def_id;
         if tcx.def_kind(did) == DefKind::AssocFn {
-            report.excluded.impl_items += ptr_params(tcx, did);
+            let params = ptr_params(tcx, did);
+            report.excluded.impl_items += params.len();
+            report
+                .excluded_subjects
+                .extend(
+                    params
+                        .into_iter()
+                        .map(|(arg_index, ptr_depth)| ExcludedSubject {
+                            did,
+                            arg_index,
+                            ptr_depth,
+                            reason: "impl-item",
+                        }),
+                );
         }
     }
     for id in items.trait_items() {
         let did = id.owner_id.def_id;
         if tcx.def_kind(did) == DefKind::AssocFn {
-            report.excluded.trait_items += ptr_params(tcx, did);
+            let params = ptr_params(tcx, did);
+            report.excluded.trait_items += params.len();
+            report
+                .excluded_subjects
+                .extend(
+                    params
+                        .into_iter()
+                        .map(|(arg_index, ptr_depth)| ExcludedSubject {
+                            did,
+                            arg_index,
+                            ptr_depth,
+                            reason: "trait-item",
+                        }),
+                );
         }
     }
     for id in items.foreign_items() {
         let did = id.owner_id.def_id;
         if tcx.def_kind(did) == DefKind::Fn {
-            report.excluded.foreign_items += ptr_params(tcx, did);
+            let params = ptr_params(tcx, did);
+            report.excluded.foreign_items += params.len();
+            report
+                .excluded_subjects
+                .extend(
+                    params
+                        .into_iter()
+                        .map(|(arg_index, ptr_depth)| ExcludedSubject {
+                            did,
+                            arg_index,
+                            ptr_depth,
+                            reason: "foreign-item",
+                        }),
+                );
         }
     }
 

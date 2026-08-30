@@ -8585,6 +8585,188 @@ mod run {
         ]
     }
 
+    const DEGRADED_MASS_FAMILIES: [&str; 4] = ["ref", "slice", "optional", "box"];
+
+    fn degraded_mass_lifetime_reason(reason: &str) -> bool {
+        matches!(
+            reason,
+            "return-not-adapted"
+                | "escapes-via-return"
+                | "escapes-via-foreign-arg"
+                | "escapes-via-field-store"
+                | "escapes-via-static-store"
+                | "borrowed-into-raw-param"
+        )
+    }
+
+    #[derive(Clone, Debug, Default)]
+    struct DegradedMassCounts {
+        subjects: usize,
+        realized: usize,
+        degraded: usize,
+        reverted: usize,
+        excluded: usize,
+        lifetime_degraded: usize,
+        predicted_by_family: BTreeMap<String, usize>,
+        realized_by_family: BTreeMap<String, usize>,
+        degraded_reasons: BTreeMap<String, usize>,
+    }
+
+    struct DegradedMassLedger {
+        tsv: String,
+        counts: DegradedMassCounts,
+    }
+
+    fn degraded_mass_ledger(
+        seed: &str,
+        revert_classes: &BTreeMap<String, String>,
+    ) -> Result<DegradedMassLedger, String> {
+        const HEADER: [&str; 12] = [
+            "subject_key",
+            "owner_fn",
+            "mir_local",
+            "arg_index",
+            "ptr_depth",
+            "family",
+            "model_kind",
+            "decision",
+            "reason",
+            "site",
+            "placed",
+            "exclusion",
+        ];
+        let mut lines = seed.lines();
+        let header = lines
+            .next()
+            .ok_or_else(|| "degraded-mass seed has no header".to_owned())?
+            .split('\t')
+            .collect::<Vec<_>>();
+        if header != HEADER {
+            return Err(format!(
+                "degraded-mass seed header mismatch: expected {HEADER:?}, got {header:?}"
+            ));
+        }
+
+        let mut out = format!(
+            "{}\tdisposition\tdisposition_reason\tlifetime_related\n",
+            HEADER.join("\t")
+        );
+        let mut seen = BTreeSet::new();
+        let mut matched_reverts = BTreeSet::new();
+        let mut counts = DegradedMassCounts::default();
+        for (index, line) in lines.enumerate() {
+            let cols = line.split('\t').collect::<Vec<_>>();
+            if cols.len() != HEADER.len() {
+                return Err(format!(
+                    "degraded-mass seed row {} has {} columns, expected {}",
+                    index + 2,
+                    cols.len(),
+                    HEADER.len()
+                ));
+            }
+            let subject_key = cols[0];
+            if !seen.insert(subject_key.to_owned()) {
+                return Err(format!("duplicate subject identity {subject_key}"));
+            }
+            let owner_fn = cols[1];
+            let family = cols[5];
+            let decision = cols[7];
+            let reason = cols[8];
+            let placed = cols[10];
+            let exclusion = cols[11];
+            if !matches!(placed, "0" | "1") {
+                return Err(format!("{subject_key}: invalid placed bit {placed:?}"));
+            }
+
+            if DEGRADED_MASS_FAMILIES.contains(&family) {
+                *counts
+                    .predicted_by_family
+                    .entry(family.to_owned())
+                    .or_default() += 1;
+            }
+
+            let (disposition, disposition_reason) = if decision == "excluded" {
+                if exclusion == "-" {
+                    return Err(format!("{subject_key}: excluded row lacks a typed reason"));
+                }
+                counts.excluded += 1;
+                ("typed-excluded", exclusion)
+            } else if decision == "degraded" {
+                if reason == "-" {
+                    return Err(format!("{subject_key}: degraded row lacks a typed reason"));
+                }
+                counts.degraded += 1;
+                *counts
+                    .degraded_reasons
+                    .entry(reason.to_owned())
+                    .or_default() += 1;
+                ("degraded", reason)
+            } else if placed == "0" {
+                if exclusion == "-" {
+                    return Err(format!("{subject_key}: unplaced row lacks a typed reason"));
+                }
+                counts.excluded += 1;
+                ("typed-excluded", exclusion)
+            } else if let Some(class) = revert_classes.get(owner_fn) {
+                matched_reverts.insert(owner_fn.to_owned());
+                counts.reverted += 1;
+                ("reverted", class.as_str())
+            } else {
+                counts.realized += 1;
+                if DEGRADED_MASS_FAMILIES.contains(&family) {
+                    *counts
+                        .realized_by_family
+                        .entry(family.to_owned())
+                        .or_default() += 1;
+                }
+                ("realized-as-predicted", "-")
+            };
+            let lifetime =
+                disposition == "degraded" && degraded_mass_lifetime_reason(disposition_reason);
+            counts.lifetime_degraded += usize::from(lifetime);
+            counts.subjects += 1;
+            out.push_str(line);
+            out.push_str(&format!(
+                "\t{disposition}\t{disposition_reason}\t{}\n",
+                u8::from(lifetime)
+            ));
+        }
+
+        let unmatched = revert_classes
+            .keys()
+            .filter(|owner| !matched_reverts.contains(*owner))
+            .cloned()
+            .collect::<Vec<_>>();
+        if !unmatched.is_empty() {
+            return Err(format!(
+                "revert owner(s) matched no placed subject: {}",
+                unmatched.join(",")
+            ));
+        }
+        if counts.subjects != counts.realized + counts.degraded + counts.reverted + counts.excluded
+        {
+            return Err("degraded-mass disposition partition residual".to_owned());
+        }
+        Ok(DegradedMassLedger { tsv: out, counts })
+    }
+
+    #[cfg(test)]
+    pub(super) fn degraded_mass_ledger_for_test(
+        seed: &str,
+        revert_classes: &[(&str, &str)],
+    ) -> Result<String, String> {
+        let classes = revert_classes
+            .iter()
+            .map(|(owner, class)| ((*owner).to_owned(), (*class).to_owned()))
+            .collect();
+        degraded_mass_ledger(seed, &classes).map(|ledger| ledger.tsv)
+    }
+
+    #[cfg(test)]
+    pub(super) fn degraded_mass_lifetime_reason_for_test(reason: &str) -> bool {
+        degraded_mass_lifetime_reason(reason)
+    }
+
     /// Item E's one-iteration per-function diagnostic census worker.
     pub fn run_e1_revert_census(input: &std::path::Path) -> Row {
         let started = Instant::now();
@@ -8686,6 +8868,60 @@ mod run {
         for class in primary.values() {
             *counts.get_mut(class).expect("registered E1 class") += 1;
         }
+
+        let revert_classes = primary
+            .iter()
+            .map(|(owner, class)| (owner.clone(), (*class).to_owned()))
+            .collect::<BTreeMap<_, _>>();
+        let mass = match degraded_mass_ledger(&capture.subject_receipt, &revert_classes) {
+            Ok(ledger) => ledger,
+            Err(error) => {
+                row.set("status", "instrument-error");
+                row.set("detail", super::report::sanitize(&error));
+                row.set("t_total_s", secs(started.elapsed()));
+                return row;
+            }
+        };
+        let mut stamped_subjects = format!(
+            "corpus\tanalysis_frame\tdata\ta5_mode\ta5_world\ta5_abi_guard\tcopy_lend_mode\ta2_mode\tsoundness_mode\tprogram\t{}\n",
+            mass.tsv.lines().next().expect("subject ledger header")
+        );
+        for line in mass.tsv.lines().skip(1) {
+            let line = adapter_roots.iter().fold(line.to_owned(), |line, root| {
+                line.replace(root, "<program>")
+            });
+            stamped_subjects.push_str(&format!(
+                "rs-crown\t{}\tprovisional\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+                crate::analyses::borrow_ownership::model_cache::ANALYSIS_FRAME,
+                a5_mode,
+                a5_world,
+                a5_abi_guard,
+                copy_lend_mode,
+                a2_mode,
+                soundness_mode,
+                name,
+                line,
+            ));
+        }
+        let subject_path = directory.join(format!("{name}.subjects.tsv"));
+        std::fs::write(&subject_path, &stamped_subjects)
+            .expect("write degraded-mass subject artifact");
+
+        let mut taxonomy = String::from(
+            "corpus\tanalysis_frame\tdata\tprogram\treason\tcount\tlifetime_related\n",
+        );
+        for (reason, count) in &mass.counts.degraded_reasons {
+            taxonomy.push_str(&format!(
+                "rs-crown\t{}\tprovisional\t{}\t{}\t{}\t{}\n",
+                crate::analyses::borrow_ownership::model_cache::ANALYSIS_FRAME,
+                name,
+                reason,
+                count,
+                u8::from(degraded_mass_lifetime_reason(reason)),
+            ));
+        }
+        let taxonomy_path = directory.join(format!("{name}.degraded-reasons.tsv"));
+        std::fs::write(&taxonomy_path, taxonomy).expect("write degraded-mass taxonomy artifact");
 
         let mut artifact = String::from(
             "corpus\tanalysis_frame\tdata\ta5_mode\ta5_world\ta5_abi_guard\tcopy_lend_mode\ta2_mode\tsoundness_mode\tprogram\trevert_key\tfunction\tclass\tadapter_residual\terror_code\tmessage_head\tfile\tline\tdirection\tattribution\trelated_locations\trewrite_shapes\trepro_context\tinput_root\n",
@@ -8796,6 +9032,34 @@ mod run {
         std::fs::write(&cache_receipt_path, cache_receipt).expect("write E1 cache receipt");
 
         row.set("e1_reverts", primary.len());
+        row.set("subject_rows", mass.counts.subjects);
+        row.set("subject_realized", mass.counts.realized);
+        row.set("subject_degraded", mass.counts.degraded);
+        row.set("subject_reverted", mass.counts.reverted);
+        row.set("subject_excluded", mass.counts.excluded);
+        row.set("subject_lifetime_degraded", mass.counts.lifetime_degraded);
+        let mut promotable = 0usize;
+        let mut promoted = 0usize;
+        for family in DEGRADED_MASS_FAMILIES {
+            let predicted = mass
+                .counts
+                .predicted_by_family
+                .get(family)
+                .copied()
+                .unwrap_or_default();
+            let realized = mass
+                .counts
+                .realized_by_family
+                .get(family)
+                .copied()
+                .unwrap_or_default();
+            row.set(&format!("subject_{family}_predicted"), predicted);
+            row.set(&format!("subject_{family}_realized"), realized);
+            promotable += predicted;
+            promoted += realized;
+        }
+        row.set("subject_promotable", promotable);
+        row.set("subject_promoted", promoted);
         row.set("corpus", "rs-crown");
         row.set(
             "analysis_frame",
@@ -8839,6 +9103,8 @@ mod run {
         );
         row.set("t_solve_s", &solve.solve_wall_s);
         row.set("revert_artifact", artifact_path.display());
+        row.set("subject_artifact", subject_path.display());
+        row.set("taxonomy_artifact", taxonomy_path.display());
         row.set("adapter_receipt_artifact", adapter_path.display());
         row.set("a5_receipt_artifact", a5_receipt_path.display());
         row.set("cache_receipt_artifact", cache_receipt_path.display());
@@ -11720,6 +11986,7 @@ fn the_reporting_site_reads_files_touched_not_the_map_size() {
         a5_receipt: "a5_mode=baseline\n".to_owned(),
         e1_reverts: Vec::new(),
         e1_adapter_receipt: String::new(),
+        e1_subject_receipt: String::new(),
         e1_novel_error_count: 0,
         solve_receipt: None,
     };
@@ -15431,13 +15698,13 @@ fn e2_candidate_receipts_do_not_enter_placed_adapter_counters() {
 /// lifetime-market split before the corpus worker can emit its first row.
 #[test]
 fn degraded_mass_ledger_is_exact_once_and_lifetime_typed() {
-    let seed = "subject_key\towner_fn\tmir_local\tfamily\tmodel_kind\tdecision\treason\tsite\tplaced\texclusion\n\
-f::p#1\tf\t1\tref\tref\tref\t-\tf.rs:1\t1\t-\n\
-g::s#1\tg\t1\tslice\tref\tslice\t-\tg.rs:1\t1\t-\n\
-h::o#1\th\t1\toptional\tref\tdegraded\treturn-not-adapted\th.rs:1\t0\t-\n\
-i::b#1\ti\t1\tbox\towning\tdegraded\tkind-owning\ti.rs:1\t0\t-\n\
-j::r#1\tj\t1\traw\traw\tdegraded\tkind-raw\tj.rs:1\t0\t-\n\
-extern::arg#1\textern\t1\tunmodeled\tunmodeled\texcluded\t-\t-\t0\tforeign-item\n";
+    let seed = "subject_key\towner_fn\tmir_local\targ_index\tptr_depth\tfamily\tmodel_kind\tdecision\treason\tsite\tplaced\texclusion\n\
+f::p#1\tf\t1\t1\t0\tref\tref\tref\t-\tf.rs:1\t1\t-\n\
+g::s#1\tg\t1\t1\t0\tslice\tref\tslice\t-\tg.rs:1\t1\t-\n\
+h::o#1\th\t1\t1\t0\toptional\tref\tdegraded\treturn-not-adapted\th.rs:1\t0\t-\n\
+i::b#1\ti\t1\t1\t0\tbox\towning\tdegraded\tkind-owning\ti.rs:1\t0\t-\n\
+j::r#1\tj\t1\t1\t0\traw\traw\tdegraded\tkind-raw\tj.rs:1\t0\t-\n\
+extern::arg#1\textern\t1\t1\t0\tunmodeled\tunmodeled\texcluded\t-\t-\t0\tforeign-item\n";
     let ledger = run::degraded_mass_ledger_for_test(seed, &[("g", "call-site-not-adapted")])
         .expect("exact ledger");
     let rows = ledger.lines().skip(1).collect::<Vec<_>>();
@@ -15465,7 +15732,10 @@ fn degraded_mass_lifetime_market_registry_is_explicit() {
         "escapes-via-static-store",
         "borrowed-into-raw-param",
     ] {
-        assert!(run::degraded_mass_lifetime_reason_for_test(reason), "{reason}");
+        assert!(
+            run::degraded_mass_lifetime_reason_for_test(reason),
+            "{reason}"
+        );
     }
     for reason in [
         "kind-raw",
@@ -15474,7 +15744,10 @@ fn degraded_mass_lifetime_market_registry_is_explicit() {
         "slice-use-unsupported",
         "reverted-after-verify-failure",
     ] {
-        assert!(!run::degraded_mass_lifetime_reason_for_test(reason), "{reason}");
+        assert!(
+            !run::degraded_mass_lifetime_reason_for_test(reason),
+            "{reason}"
+        );
     }
 }
 

@@ -1044,6 +1044,14 @@ fn impl_method_pointer_params_are_counted_as_excluded_not_invisible() {
         report.subjects, 1,
         "the free function is the only M1 subject; report was {report:?}"
     );
+    assert_eq!(report.excluded_subjects.len(), 2);
+    assert!(
+        report
+            .excluded_subjects
+            .iter()
+            .all(|subject| subject.reason == "impl-item"),
+        "the identity rows must retain the same typed class as the aggregate"
+    );
 }
 
 /// **The exclusion counts reach a CONSUMER** (§4).
