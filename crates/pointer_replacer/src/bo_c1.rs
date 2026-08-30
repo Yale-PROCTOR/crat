@@ -8535,6 +8535,56 @@ mod run {
             .replace(['\t', '\r', '\n'], " ")
     }
 
+    #[derive(Default)]
+    struct E1AdapterCounts {
+        placed: usize,
+        blocked: usize,
+        fallback: usize,
+        evidence: usize,
+        checked_null: usize,
+        body_placed: usize,
+        body_blocked: usize,
+    }
+
+    fn e1_adapter_counts(adapters: &str) -> E1AdapterCounts {
+        let mut counts = E1AdapterCounts::default();
+        for line in adapters.lines().skip(1) {
+            let cols = line.split('\t').collect::<Vec<_>>();
+            match cols.first().copied() {
+                Some("placed") => {
+                    counts.placed += 1;
+                    match cols.get(10).copied() {
+                        Some("fallback-1024") => counts.fallback += 1,
+                        Some("evidence-backed") => counts.evidence += 1,
+                        _ => {}
+                    }
+                    if cols.get(9) == Some(&"checked-is-null") {
+                        counts.checked_null += 1;
+                    }
+                }
+                Some("blocked") => counts.blocked += 1,
+                Some("body-placed") => counts.body_placed += 1,
+                Some("body-blocked") => counts.body_blocked += 1,
+                _ => {}
+            }
+        }
+        counts
+    }
+
+    #[cfg(test)]
+    pub(super) fn e1_adapter_counts_for_test(adapters: &str) -> [usize; 7] {
+        let counts = e1_adapter_counts(adapters);
+        [
+            counts.placed,
+            counts.blocked,
+            counts.fallback,
+            counts.evidence,
+            counts.checked_null,
+            counts.body_placed,
+            counts.body_blocked,
+        ]
+    }
+
     /// Item E's one-iteration per-function diagnostic census worker.
     pub fn run_e1_revert_census(input: &std::path::Path) -> Row {
         let started = Instant::now();
@@ -8610,31 +8660,7 @@ mod run {
         std::fs::write(&adapter_path, &stamped_adapters)
             .expect("write E1 adapter receipt artifact");
 
-        let mut adapter_placed = 0usize;
-        let mut adapter_blocked = 0usize;
-        let mut adapter_fallback = 0usize;
-        let mut adapter_evidence = 0usize;
-        let mut adapter_checked_null = 0usize;
-        let mut body_adapter_placed = 0usize;
-        let mut body_adapter_blocked = 0usize;
-        for line in adapters.lines().skip(1) {
-            let cols = line.split('\t').collect::<Vec<_>>();
-            match cols.first().copied() {
-                Some("placed") => adapter_placed += 1,
-                Some("blocked") => adapter_blocked += 1,
-                Some("body-placed") => body_adapter_placed += 1,
-                Some("body-blocked") => body_adapter_blocked += 1,
-                _ => {}
-            }
-            match cols.get(10).copied() {
-                Some("fallback-1024") => adapter_fallback += 1,
-                Some("evidence-backed") => adapter_evidence += 1,
-                _ => {}
-            }
-            if cols.get(9) == Some(&"checked-is-null") {
-                adapter_checked_null += 1;
-            }
-        }
+        let adapter_counts = e1_adapter_counts(adapters);
 
         let mut primary = BTreeMap::<String, &'static str>::new();
         for (index, revert) in capture.reverts.iter().enumerate() {
@@ -8789,13 +8815,13 @@ mod run {
         row.set("attempted_placements", capture.attempted_placements);
         row.set("files_touched", capture.files_touched);
         row.set("unplaceable", capture.unplaceable);
-        row.set("adapter_placed", adapter_placed);
-        row.set("adapter_blocked", adapter_blocked);
-        row.set("adapter_extent_fallback", adapter_fallback);
-        row.set("adapter_extent_evidence", adapter_evidence);
-        row.set("adapter_checked_null", adapter_checked_null);
-        row.set("body_adapter_placed", body_adapter_placed);
-        row.set("body_adapter_blocked", body_adapter_blocked);
+        row.set("adapter_placed", adapter_counts.placed);
+        row.set("adapter_blocked", adapter_counts.blocked);
+        row.set("adapter_extent_fallback", adapter_counts.fallback);
+        row.set("adapter_extent_evidence", adapter_counts.evidence);
+        row.set("adapter_checked_null", adapter_counts.checked_null);
+        row.set("body_adapter_placed", adapter_counts.body_placed);
+        row.set("body_adapter_blocked", adapter_counts.body_blocked);
         row.set("adapter_model_source", "same-decision-table");
         row.set("baseline_keys", capture.baseline_keys);
         row.set("baseline_errors", capture.baseline_errors);
@@ -15374,6 +15400,28 @@ fn e_adapt_classifier_residual_classes_are_disjoint_and_callsite_mechanism_beats
     assert_eq!(
         classify(Some("E9999"), "other", E1DiagnosticSite::Other),
         "typed-other"
+    );
+}
+
+/// Addendum-88 census reconciliation repair. Enriched BLOCKED rows now carry
+/// candidate extent/null arms, but the placement counters must remain a count
+/// of `kind=placed` only. This sixth post-wave control preregisters the suite at
+/// 1,574/6/87.
+#[test]
+fn e2_candidate_receipts_do_not_enter_placed_adapter_counters() {
+    let header = "kind\ta\tb\tc\td\te\tf\tg\ttemplate\tnull_arm\textent_arm";
+    let rows = [
+        "placed\t-\t-\t-\t-\t-\t-\t-\t-\tchecked-is-null\tfallback-1024",
+        "placed\t-\t-\t-\t-\t-\t-\t-\t-\t-\tevidence-backed",
+        "blocked\t-\t-\t-\t-\t-\t-\t-\tslice\tchecked-is-null\tfallback-1024",
+        "body-placed\t-\t-\t-\t-\t-\t-\t-\t-\t-\t-",
+        "body-blocked\t-\t-\t-\t-\t-\t-\t-\t-\t-\t-",
+    ];
+    let receipt = format!("{header}\n{}\n", rows.join("\n"));
+    assert_eq!(
+        run::e1_adapter_counts_for_test(&receipt),
+        [2, 1, 1, 1, 1, 1, 1],
+        "blocked candidate facts leaked into placed counters"
     );
 }
 
