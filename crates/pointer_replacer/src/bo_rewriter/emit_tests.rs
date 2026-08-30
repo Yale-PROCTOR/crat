@@ -4490,6 +4490,293 @@ fn e_adapt_classifier_separates_call_boundary_from_body_expression() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// Item E call-site adaptation wave 2 — RED-first production-path witnesses.
+//
+// Full-suite preregistration at the RED commit: five new ordinary tests move
+// the landed 1,566/6/87 identity to exactly 1,571/6/87 once GREEN. The expected
+// count is written before the implementation and may not be edited to fit it.
+// ---------------------------------------------------------------------------
+
+struct E2Attempt {
+    fixture: Fixture,
+    emission: Emission,
+    receipt: String,
+}
+
+/// Inject only the form decision, then re-run the SAME seam/body synthesis and
+/// AST emitter production uses. The hook is test-only; the synthesis is not.
+fn e2_attempt(
+    src: &str,
+    inject: &(dyn Fn(&mut super::decision::DecisionTable) + Sync),
+) -> E2Attempt {
+    let fixture = Fixture::new(&[("lib.rs", src)]);
+    let (emission, receipt) = ::utils::compilation::run_compiler_on_path(&fixture.root(), |tcx| {
+        let (mut table, ctx) = super::decide_table_with_ctx(tcx).expect("wave-2 decision table");
+        inject(&mut table);
+        table.seams = super::decision::seam::synthesize(
+            tcx,
+            &ctx.facts,
+            &ctx.subjects,
+            &table,
+            &ctx.retained_c9_plans,
+        );
+        let receipt = super::seam_tsv_from_table(tcx, &table);
+        let emission = emit_files(
+            tcx,
+            &table,
+            &rustc_hash::FxHashSet::default(),
+            &ctx.retained_c9_plans,
+        )
+        .expect("wave-2 attempted emission");
+        (emission, receipt)
+    })
+    .expect("wave-2 fixture compiles before rewriting");
+    E2Attempt {
+        fixture,
+        emission,
+        receipt,
+    }
+}
+
+fn force_body_forms(
+    table: &mut super::decision::DecisionTable,
+    raw_suffixes: &[&str],
+    refs: &[(&str, bool)],
+) {
+    for (subject, decision) in &mut table.entries {
+        if raw_suffixes
+            .iter()
+            .any(|suffix| subject.label.ends_with(suffix))
+        {
+            *decision = super::decision::Decision::Degraded(super::decision::Degradation {
+                subject: subject.label.clone(),
+                site: "<e2-injected>".to_owned(),
+                reason: super::decision::DegradeReason::CallSiteNotAdapted,
+            });
+        }
+        if let Some((_, mutable)) = refs
+            .iter()
+            .find(|(suffix, _)| subject.label.ends_with(suffix))
+        {
+            *decision = super::decision::Decision::Ref { mutable: *mutable };
+        }
+    }
+}
+
+fn e2_root_text(attempt: &E2Attempt) -> &str {
+    text_for(&attempt.emission, "lib.rs").expect("wave-2 root emitted")
+}
+
+fn e2_type_checks(attempt: &E2Attempt) -> bool {
+    let temp = verify::materialize(&attempt.fixture.root(), &attempt.emission.files)
+        .expect("materialize wave-2 attempt");
+    verify::type_checks_crate(temp.root())
+}
+
+/// E2-BODY-W1 — the local initializer uses the common scalar-reference glue.
+#[test]
+fn e2_body_w1_initializer_uses_the_production_scalar_adapter() {
+    let src = format!(
+        "{E_ADAPT_PRE}\
+         pub mod src {{ pub mod json {{\n\
+         pub unsafe fn json_extract_get_array_size(p: *const i32) -> i32 {{\n\
+         \x20   let q: *const i32 = p; *q\n\
+         }}\n\
+         }} }}\n"
+    );
+    let attempt = e2_attempt(&src, &|table| {
+        force_body_forms(
+            table,
+            &["json_extract_get_array_size::p"],
+            &[("json_extract_get_array_size::q", false)],
+        );
+    });
+    assert!(
+        attempt.receipt.lines().any(|line| {
+            line.starts_with("body-placed\t")
+                && line.contains("json_extract_get_array_size")
+                && line.contains("local-initializer")
+        }),
+        "the initializer must ride the production receipt:\n{}",
+        attempt.receipt
+    );
+    assert!(
+        e2_root_text(&attempt).contains("&*p"),
+        "{}",
+        e2_root_text(&attempt)
+    );
+    assert!(
+        e2_type_checks(&attempt),
+        "the adapted initializer must compile"
+    );
+}
+
+/// E2-BODY-W2 — a later assignment reuses the mutable scalar adapter.
+#[test]
+fn e2_body_w2_assignment_uses_the_production_scalar_adapter() {
+    let src = format!(
+        "{E_ADAPT_PRE}\
+         pub mod src {{ pub mod json {{\n\
+         pub unsafe fn json_extract_get_object_size(p: *mut i32) -> i32 {{\n\
+         \x20   let mut x = 0; let mut q: *mut i32 = &mut x; q = p; *q += 1; *q\n\
+         }}\n\
+         }} }}\n"
+    );
+    let attempt = e2_attempt(&src, &|table| {
+        force_body_forms(
+            table,
+            &["json_extract_get_object_size::p"],
+            &[("json_extract_get_object_size::q", true)],
+        );
+    });
+    assert!(
+        attempt.receipt.lines().any(|line| {
+            line.starts_with("body-placed\t")
+                && line.contains("json_extract_get_object_size")
+                && line.contains("assignment-rhs")
+        }),
+        "the assignment must ride the production receipt:\n{}",
+        attempt.receipt
+    );
+    assert!(
+        e2_root_text(&attempt).contains("q = &mut *p"),
+        "{}",
+        e2_root_text(&attempt)
+    );
+    assert!(
+        e2_type_checks(&attempt),
+        "the adapted assignment must compile"
+    );
+}
+
+/// E2-N3 — a side-effecting RHS stays residual and is never duplicated.
+#[test]
+fn e2_body_n3_side_effecting_assignment_is_evaluated_once_and_refused() {
+    let src = format!(
+        "{E_ADAPT_PRE}\
+         pub mod src {{ pub mod json {{\n\
+         unsafe fn next(p: *const i32, calls: &mut i32) -> *const i32 {{ *calls += 1; p }}\n\
+         pub unsafe fn json_extract_get_string_size(p: *const i32, calls: &mut i32) -> i32 {{\n\
+         \x20   let mut x = 0; let mut q: *const i32 = &mut x; q = next(p, calls); *q\n\
+         }}\n\
+         }} }}\n"
+    );
+    let attempt = e2_attempt(&src, &|table| {
+        force_body_forms(
+            table,
+            &["json_extract_get_string_size::p"],
+            &[("json_extract_get_string_size::q", false)],
+        );
+    });
+    assert!(
+        attempt.receipt.lines().any(|line| {
+            line.starts_with("body-blocked\t")
+                && line.contains("json_extract_get_string_size")
+                && line.contains("body-side-effecting-rhs")
+        }),
+        "the side-effect control must be typed, not silently absent:\n{}",
+        attempt.receipt
+    );
+    assert_eq!(
+        e2_root_text(&attempt).matches("next(p, calls)").count(),
+        1,
+        "the attempted rewrite duplicated or removed the side effect:\n{}",
+        e2_root_text(&attempt)
+    );
+}
+
+/// The exact-eight allowlist is a production fact: an identical ninth function
+/// must not acquire a body adapter.
+#[test]
+fn e2_body_scope_adapts_only_the_enumerated_function_identity() {
+    let src = format!(
+        "{E_ADAPT_PRE}\
+         pub mod src {{ pub mod json {{\n\
+         pub unsafe fn json_extract_get_array_size(p: *const i32) -> i32 {{ let q: *const i32 = p; *q }}\n\
+         pub unsafe fn ninth_not_scoped(p: *const i32) -> i32 {{ let q: *const i32 = p; *q }}\n\
+         }} }}\n"
+    );
+    let attempt = e2_attempt(&src, &|table| {
+        force_body_forms(
+            table,
+            &["json_extract_get_array_size::p", "ninth_not_scoped::p"],
+            &[
+                ("json_extract_get_array_size::q", false),
+                ("ninth_not_scoped::q", false),
+            ],
+        );
+    });
+    let body = attempt
+        .receipt
+        .lines()
+        .filter(|line| line.starts_with("body-"))
+        .collect::<Vec<_>>();
+    assert!(
+        body.iter()
+            .any(|line| line.contains("json_extract_get_array_size")),
+        "{body:?}"
+    );
+    assert!(
+        body.iter().all(|line| !line.contains("ninth_not_scoped")),
+        "{body:?}"
+    );
+}
+
+/// E2-SCHEMA-W1 — a refusal retains the candidate and the peer pair that made
+/// the pre-gate decision possible.
+#[test]
+fn e2_schema_w1_blocked_rows_retain_candidate_forms_and_peer_pairs() {
+    let src = format!(
+        "{E_ADAPT_PRE}\
+         pub unsafe fn callee(a: *mut i32, b: *mut i32) {{ *a += *b; }}\n\
+         pub unsafe fn caller(p: *mut i32) {{ callee(p, p); }}\n"
+    );
+    let attempt = e2_attempt(&src, &|table| {
+        force_body_forms(
+            table,
+            &["caller::p"],
+            &[("callee::a", true), ("callee::b", true)],
+        );
+    });
+    let mut lines = attempt.receipt.lines();
+    let header = lines
+        .next()
+        .expect("receipt header")
+        .split('\t')
+        .collect::<Vec<_>>();
+    let column = |name: &str| {
+        header
+            .iter()
+            .position(|value| *value == name)
+            .unwrap_or_else(|| panic!("missing {name} in {header:?}"))
+    };
+    let expected = column("expected_form");
+    let found = column("found_form");
+    let candidate = column("candidate_template");
+    let peers = column("peer_pairs");
+    let root = column("root_identity");
+    let blind = column("blind");
+    let context = column("context");
+    let blocked = lines
+        .filter(|line| line.starts_with("blocked\t"))
+        .map(|line| line.split('\t').collect::<Vec<_>>())
+        .collect::<Vec<_>>();
+    assert_eq!(blocked.len(), 2, "{}", attempt.receipt);
+    for row in blocked {
+        assert_eq!(row[expected], "ref-mut", "{row:?}");
+        assert_eq!(row[found], "raw", "{row:?}");
+        assert_eq!(row[candidate], "scalar-reference", "{row:?}");
+        assert_eq!(
+            row[peers], "0/1[same_root=1,left_blind=0,right_blind=0]",
+            "{row:?}"
+        );
+        assert!(row[root].ends_with("caller::p"), "{row:?}");
+        assert_eq!(row[blind], "0", "{row:?}");
+        assert_eq!(row[context], "call-argument", "{row:?}");
+    }
+}
+
 /// **A BLOCKED seam row names the CALLEE in `owner_fn`, and the caller in its
 /// own column.**
 ///
