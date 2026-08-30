@@ -184,7 +184,7 @@ pub(crate) struct Plan {
     /// Decisions that produced no placed edit, with attribution.
     pub unplaceable: Vec<Unplaceable>,
     /// **The crate ROOT file** — where a crate-level item must go, and the only
-    /// place `crate::SEAM_LEN_PLACEHOLDER` resolves from.
+    /// place `crate::FALLBACK_SLICE_EXTENT` resolves from.
     ///
     /// Filled by the caller, which is the only party holding a `TyCtxt`; `plan`
     /// itself takes no compiler type. `None` leaves the fabricated-const

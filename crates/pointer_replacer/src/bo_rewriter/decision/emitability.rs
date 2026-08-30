@@ -158,6 +158,14 @@ pub(crate) enum ArgShape {
     AddrOfCast { mutable: bool, inner: Span },
     /// `q as *mut T` where `q` is a local binding.
     CastOfLocal { binding: HirId, inner: Span },
+    /// A nameable expression whose resolved type is a raw pointer: an offset,
+    /// field read, call result, array `.as_ptr()`/`.as_mut_ptr()`, or a cast not
+    /// covered by the two peel-only arms above.
+    ///
+    /// The whole argument remains the adapter's subtree. `root` is best-effort
+    /// overlap evidence; `None` stays conservative wherever a mutable borrow is
+    /// involved.
+    RawExpr { root: Option<HirId> },
     /// A null pointer literal. **Blocks**: `&mut T` cannot represent null.
     NullLit,
     /// Any other cast.
@@ -175,6 +183,7 @@ impl ArgShape {
             ArgShape::AddrOfCast { mutable: true, .. } => "addr-of-mut-cast",
             ArgShape::AddrOfCast { mutable: false, .. } => "addr-of-cast",
             ArgShape::CastOfLocal { .. } => "cast-of-local",
+            ArgShape::RawExpr { .. } => "raw-expr",
             ArgShape::NullLit => "null-lit",
             ArgShape::Cast { .. } => "cast",
             ArgShape::Other => "other",
@@ -196,6 +205,7 @@ impl ArgShape {
         match self {
             ArgShape::BareLocal(id) | ArgShape::CastOfLocal { binding: id, .. } => Some(id),
             ArgShape::AddrOf { base, .. } => base,
+            ArgShape::RawExpr { root } => root,
             _ => None,
         }
     }
@@ -219,7 +229,9 @@ fn place_root(expr: &Expr<'_>) -> (Option<HirId>, bool) {
             ExprKind::Field(base, _)
             | ExprKind::Index(base, _, _)
             | ExprKind::AddrOf(_, _, base)
+            | ExprKind::Cast(base, _)
             | ExprKind::DropTemps(base) => cur = base,
+            ExprKind::MethodCall(_, receiver, _, _) => cur = receiver,
             _ => return (BodyFacts::resolved_local(cur), through_deref),
         }
     }
@@ -268,23 +280,34 @@ fn is_zero_literal(expr: &Expr<'_>) -> bool {
     )
 }
 
-/// Classify an argument expression by its **outermost** operator.
-fn classify_arg(expr: &Expr<'_>) -> ArgShape {
+/// Classify an argument expression by its **outermost** operator and resolved
+/// type. The type check is what keeps `Other` fail-closed: wave 1 admits a
+/// complex expression only when rustc says the expression itself is a raw
+/// pointer, never because its spelling merely resembles one.
+fn classify_arg(tcx: TyCtxt<'_>, expr: &Expr<'_>) -> ArgShape {
+    let raw_pointer = matches!(
+        tcx.typeck(expr.hir_id.owner.def_id).expr_ty(expr).kind(),
+        rustc_middle::ty::TyKind::RawPtr(..)
+    );
     match &expr.kind {
         // Casts first: both the null form and the strip-the-cast forms are
         // casts, and testing the operand is the only way to tell them apart.
         ExprKind::Cast(inner, _) => {
             if is_zero_literal(inner) {
                 ArgShape::NullLit
-            } else if let ExprKind::AddrOf(_, mutability, _) = &inner.kind {
+            } else if let ExprKind::AddrOf(_, mutability, _) = &peel_casts(expr).kind {
                 ArgShape::AddrOfCast {
                     mutable: matches!(mutability, Mutability::Mut),
-                    inner: inner.span,
+                    inner: peel_casts(expr).span,
                 }
-            } else if let Some(binding) = BodyFacts::resolved_local(inner) {
+            } else if let Some(binding) = BodyFacts::resolved_local(peel_casts(expr)) {
                 ArgShape::CastOfLocal {
                     binding,
-                    inner: inner.span,
+                    inner: peel_casts(expr).span,
+                }
+            } else if raw_pointer {
+                ArgShape::RawExpr {
+                    root: place_root(expr).0,
                 }
             } else {
                 ArgShape::Cast { inner: inner.span }
@@ -302,6 +325,9 @@ fn classify_arg(expr: &Expr<'_>) -> ArgShape {
             Some(binding) => ArgShape::BareLocal(binding),
             // A bare `0` with no cast still cannot become a reference.
             None if is_zero_literal(expr) => ArgShape::NullLit,
+            None if raw_pointer => ArgShape::RawExpr {
+                root: place_root(expr).0,
+            },
             None => ArgShape::Other,
         },
     }
@@ -477,7 +503,7 @@ impl<'tcx> Visitor<'tcx> for BodyFacts<'_, 'tcx> {
                                 .map(|(index, arg)| Arg {
                                     index,
                                     span: arg.span,
-                                    shape: classify_arg(arg),
+                                    shape: classify_arg(self.tcx, arg),
                                 })
                                 .collect(),
                         });

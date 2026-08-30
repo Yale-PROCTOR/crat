@@ -462,6 +462,11 @@ pub(crate) fn build_with_c9_marks(
                         .copied()
                         .filter(|k| converts.contains(k))?;
                     let blind = match arg.shape {
+                        // A reborrow built over an arbitrary raw expression is
+                        // outside borrowck's place reasoning. Keep the existing
+                        // overlap contract: one mutable position makes an
+                        // unknown/may-overlap pair refuse.
+                        ArgShape::RawExpr { .. } => true,
                         ArgShape::AddrOf { base: None, .. } => true,
                         ArgShape::AddrOf {
                             base: Some(b),
@@ -575,6 +580,12 @@ pub(crate) fn build_with_c9_marks(
                     ArgShape::AddrOfCast { .. } | ArgShape::CastOfLocal { .. } => {
                         block(&mut node_block, callee_key, BlockReason::ArgCastFormUnbuilt);
                     }
+                    // Wave 1's type-aware, nameable raw-expression arm. It
+                    // forms no caller/callee class edge: an offset/call/field
+                    // expression is a value at this site, not the caller
+                    // binding's kind identity. The seam and the unchanged
+                    // whole-site overlap gate decide its presentation.
+                    ArgShape::RawExpr { .. } => {}
                     ArgShape::NullLit => {
                         block(&mut node_block, callee_key, BlockReason::ArgNullLiteral);
                     }

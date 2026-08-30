@@ -8457,11 +8457,14 @@ mod run {
         row
     }
 
-    const E1_CLASSES: [&str; 5] = [
+    const E1_CLASSES: [&str; 8] = [
         "missing-lifetime",
         "e0308-type-mismatch",
         "borrow-conflict",
+        "borrow-scheduling-residual",
+        "raw-topology-residual",
         "call-site-not-adapted",
+        "body-expression",
         "typed-other",
     ];
 
@@ -8487,11 +8490,20 @@ mod run {
             "missing-lifetime"
         } else if matches!(code.as_str(), "E0502" | "E0506") {
             "borrow-conflict"
-        } else if revert.call_site_not_adapted {
+        } else if code == "E0499" {
+            "borrow-scheduling-residual"
+        } else if revert.site_kind == crate::bo_rewriter::E1DiagnosticSite::CallBoundary
+            && message.contains("expected raw pointer")
+            && message.contains("found raw pointer")
+        {
+            "raw-topology-residual"
+        } else if revert.site_kind == crate::bo_rewriter::E1DiagnosticSite::CallBoundary {
             // Mechanism beats the carrier code: a call-boundary E0308 belongs
             // to the explicitly requested call-site class, while the raw code
             // remains present in the artifact for independent aggregation.
             "call-site-not-adapted"
+        } else if revert.site_kind == crate::bo_rewriter::E1DiagnosticSite::BodyExpression {
+            "body-expression"
         } else if code == "E0308" {
             "e0308-type-mismatch"
         } else {
@@ -8503,9 +8515,12 @@ mod run {
         match class {
             "missing-lifetime" => 0,
             "borrow-conflict" => 1,
-            "call-site-not-adapted" => 2,
-            "e0308-type-mismatch" => 3,
-            _ => 4,
+            "borrow-scheduling-residual" => 2,
+            "raw-topology-residual" => 3,
+            "call-site-not-adapted" => 4,
+            "body-expression" => 5,
+            "e0308-type-mismatch" => 6,
+            _ => 7,
         }
     }
 
@@ -8552,6 +8567,71 @@ mod run {
         let a2_mode = receipt_field("a2_mode");
         let soundness_mode = receipt_field("soundness_mode");
 
+        // From the SAME `DecisionTable` as the one E1 emission iteration — no
+        // second compiler callback, analysis construction, cache lookup, or
+        // solve exists on this path.
+        let adapters = &capture.adapter_receipt;
+        let mut stamped_adapters = format!(
+            "corpus\tanalysis_frame\tdata\ta5_mode\ta5_world\ta5_abi_guard\tcopy_lend_mode\ta2_mode\tsoundness_mode\tprogram\t{}\n",
+            adapters.lines().next().expect("adapter receipt header")
+        );
+        let mut adapter_roots = input
+            .parent()
+            .map(|path| path.display().to_string())
+            .into_iter()
+            .collect::<Vec<_>>();
+        adapter_roots.extend(
+            input
+                .canonicalize()
+                .ok()
+                .and_then(|path| path.parent().map(std::path::Path::to_path_buf))
+                .map(|path| path.display().to_string()),
+        );
+        adapter_roots.sort();
+        adapter_roots.dedup();
+        for line in adapters.lines().skip(1) {
+            let line = adapter_roots.iter().fold(line.to_owned(), |line, root| {
+                line.replace(root, "<program>")
+            });
+            stamped_adapters.push_str(&format!(
+                "rs-crown\t{}\tprovisional\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+                crate::analyses::borrow_ownership::model_cache::ANALYSIS_FRAME,
+                a5_mode,
+                a5_world,
+                a5_abi_guard,
+                copy_lend_mode,
+                a2_mode,
+                soundness_mode,
+                name,
+                line,
+            ));
+        }
+        let adapter_path = directory.join(format!("{name}.adapters.tsv"));
+        std::fs::write(&adapter_path, &stamped_adapters)
+            .expect("write E1 adapter receipt artifact");
+
+        let mut adapter_placed = 0usize;
+        let mut adapter_blocked = 0usize;
+        let mut adapter_fallback = 0usize;
+        let mut adapter_evidence = 0usize;
+        let mut adapter_checked_null = 0usize;
+        for line in adapters.lines().skip(1) {
+            let cols = line.split('\t').collect::<Vec<_>>();
+            match cols.first().copied() {
+                Some("placed") => adapter_placed += 1,
+                Some("blocked") => adapter_blocked += 1,
+                _ => {}
+            }
+            match cols.get(10).copied() {
+                Some("fallback-1024") => adapter_fallback += 1,
+                Some("evidence-backed") => adapter_evidence += 1,
+                _ => {}
+            }
+            if cols.get(9) == Some(&"checked-is-null") {
+                adapter_checked_null += 1;
+            }
+        }
+
         let mut primary = BTreeMap::<String, &'static str>::new();
         for (index, revert) in capture.reverts.iter().enumerate() {
             let key = if revert.function == "<unattributed>" {
@@ -8578,7 +8658,7 @@ mod run {
         }
 
         let mut artifact = String::from(
-            "corpus\tanalysis_frame\tdata\ta5_mode\ta5_world\ta5_abi_guard\tcopy_lend_mode\ta2_mode\tsoundness_mode\tprogram\trevert_key\tfunction\tclass\terror_code\tmessage_head\tfile\tline\tdirection\tattribution\trelated_locations\trewrite_shapes\trepro_context\tinput_root\n",
+            "corpus\tanalysis_frame\tdata\ta5_mode\ta5_world\ta5_abi_guard\tcopy_lend_mode\ta2_mode\tsoundness_mode\tprogram\trevert_key\tfunction\tclass\tadapter_residual\terror_code\tmessage_head\tfile\tline\tdirection\tattribution\trelated_locations\trewrite_shapes\trepro_context\tinput_root\n",
         );
         for (index, revert) in capture.reverts.iter().enumerate() {
             let key = if revert.function == "<unattributed>" {
@@ -8587,6 +8667,12 @@ mod run {
                 revert.function.clone()
             };
             let class = primary[&key];
+            let residual = match class {
+                "body-expression" => "body-adapter-residual:initializer-assignment",
+                "raw-topology-residual" => "call-adapter-residual:raw-topology",
+                "borrow-scheduling-residual" => "call-adapter-residual:borrow-scheduling",
+                _ => "-",
+            };
             let mut shapes = revert
                 .edits
                 .iter()
@@ -8623,7 +8709,7 @@ mod run {
                 .collect::<Vec<_>>()
                 .join(" | ");
             artifact.push_str(&format!(
-                "rs-crown\t{}\tprovisional\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:?}\t{}\t{}\t{}\t{}\t{}\n",
+                "rs-crown\t{}\tprovisional\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:?}\t{}\t{}\t{}\t{}\t{}\n",
                 crate::analyses::borrow_ownership::model_cache::ANALYSIS_FRAME,
                 a5_mode,
                 a5_world,
@@ -8635,6 +8721,7 @@ mod run {
                 tsv_field(&key, 300),
                 tsv_field(&revert.function, 300),
                 class,
+                residual,
                 e1_code(revert.diagnostic.code.as_deref()),
                 tsv_field(&revert.diagnostic.message, 300),
                 tsv_field(
@@ -8698,6 +8785,12 @@ mod run {
         row.set("attempted_placements", capture.attempted_placements);
         row.set("files_touched", capture.files_touched);
         row.set("unplaceable", capture.unplaceable);
+        row.set("adapter_placed", adapter_placed);
+        row.set("adapter_blocked", adapter_blocked);
+        row.set("adapter_extent_fallback", adapter_fallback);
+        row.set("adapter_extent_evidence", adapter_evidence);
+        row.set("adapter_checked_null", adapter_checked_null);
+        row.set("adapter_model_source", "same-decision-table");
         row.set("baseline_keys", capture.baseline_keys);
         row.set("baseline_errors", capture.baseline_errors);
         row.set("baseline_msg_env", capture.baseline_msg_env);
@@ -8714,6 +8807,7 @@ mod run {
         );
         row.set("t_solve_s", &solve.solve_wall_s);
         row.set("revert_artifact", artifact_path.display());
+        row.set("adapter_receipt_artifact", adapter_path.display());
         row.set("a5_receipt_artifact", a5_receipt_path.display());
         row.set("cache_receipt_artifact", cache_receipt_path.display());
         row.set("status", "ok");
@@ -9008,7 +9102,7 @@ mod run {
             let decl = format!(
                 "const {}: usize = {};",
                 crate::bo_rewriter::decision::seam::SEAM_LEN_CONST,
-                crate::bo_rewriter::decision::seam::FABRICATED_SEAM_LEN
+                crate::bo_rewriter::decision::seam::FALLBACK_SLICE_EXTENT
             );
             let (mut decls, mut refs) = (0usize, 0usize);
             for text in files.values() {
@@ -11593,6 +11687,7 @@ fn the_reporting_site_reads_files_touched_not_the_map_size() {
         baseline_msg_env: 0,
         a5_receipt: "a5_mode=baseline\n".to_owned(),
         e1_reverts: Vec::new(),
+        e1_adapter_receipt: String::new(),
         e1_novel_error_count: 0,
         solve_receipt: None,
     };
@@ -15031,13 +15126,13 @@ z#2\tkind-raw\tz.rs:2\n"
 }
 
 #[test]
-fn e1_revert_classes_are_disjoint_and_callsite_mechanism_beats_e0308_carrier() {
+fn e_adapt_classifier_residual_classes_are_disjoint_and_callsite_mechanism_beats_e0308_carrier() {
     use crate::bo_rewriter::{
-        E1RevertDiagnostic,
+        E1DiagnosticSite, E1RevertDiagnostic,
         verify::{Diag, Direction},
     };
 
-    let classify = |code: Option<&str>, message: &str, call_site_not_adapted: bool| {
+    let classify = |code: Option<&str>, message: &str, site_kind: E1DiagnosticSite| {
         run::e1_class(&E1RevertDiagnostic {
             function: "f".to_owned(),
             diagnostic: Diag {
@@ -15048,36 +15143,78 @@ fn e1_revert_classes_are_disjoint_and_callsite_mechanism_beats_e0308_carrier() {
                 code: code.map(str::to_owned),
                 related: Vec::new(),
             },
-            call_site_not_adapted,
+            site_kind,
             attribution: "test".to_owned(),
             edits: Vec::new(),
         })
     };
     assert_eq!(
-        classify(Some("E0106"), "missing lifetime specifier", false),
+        classify(
+            Some("E0106"),
+            "missing lifetime specifier",
+            E1DiagnosticSite::Other
+        ),
         "missing-lifetime"
     );
     assert_eq!(
-        classify(Some("E0308"), "mismatched types", false),
+        classify(Some("E0308"), "mismatched types", E1DiagnosticSite::Other),
         "e0308-type-mismatch"
     );
     assert_eq!(
-        classify(Some("ErrCode(308)"), "mismatched types", false),
+        classify(
+            Some("ErrCode(308)"),
+            "mismatched types",
+            E1DiagnosticSite::Other
+        ),
         "e0308-type-mismatch"
     );
     assert_eq!(
-        classify(Some("E0502"), "cannot borrow", false),
+        classify(Some("E0502"), "cannot borrow", E1DiagnosticSite::Other),
         "borrow-conflict"
     );
     assert_eq!(
-        classify(Some("E0506"), "cannot assign", false),
+        classify(Some("E0506"), "cannot assign", E1DiagnosticSite::Other),
         "borrow-conflict"
     );
     assert_eq!(
-        classify(Some("E0308"), "mismatched call argument", true),
+        classify(
+            Some("E0308"),
+            "mismatched call argument",
+            E1DiagnosticSite::CallBoundary
+        ),
         "call-site-not-adapted"
     );
-    assert_eq!(classify(Some("E9999"), "other", false), "typed-other");
+    assert_eq!(
+        classify(
+            Some("E0308"),
+            "expected reference found raw pointer",
+            E1DiagnosticSite::BodyExpression
+        ),
+        "body-expression",
+        "§79: type direction alone must not classify a body initializer as a call"
+    );
+    assert_eq!(
+        classify(
+            Some("E0308"),
+            "expected raw pointer found raw pointer function defined here",
+            E1DiagnosticSite::CallBoundary
+        ),
+        "raw-topology-residual",
+        "E-ADAPT-N2: nested raw topology stays a typed wave-1 residual"
+    );
+    assert_eq!(
+        classify(
+            Some("E0499"),
+            "cannot borrow twice",
+            E1DiagnosticSite::Other
+        ),
+        "borrow-scheduling-residual",
+        "E-ADAPT-N3: scheduling remains a typed wave-1 residual"
+    );
+    assert_eq!(
+        classify(Some("E9999"), "other", E1DiagnosticSite::Other),
+        "typed-other"
+    );
 }
 
 // Worker (one program, one mode, one process).

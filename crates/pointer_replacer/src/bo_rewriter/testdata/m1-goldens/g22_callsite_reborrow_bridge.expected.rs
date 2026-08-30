@@ -9,6 +9,13 @@ pub unsafe fn g22_probe(n: Option<&G22Node>) -> i32 {
     (*n.unwrap()).key
 }
 pub unsafe fn g22_caller(node: *mut G22Node) -> *mut G22Node {
-    let _b = g22_probe(Some(&*node));
+    let _b = g22_probe({
+        let __crat_call_adapter_ptr = node;
+        if __crat_call_adapter_ptr.is_null() {
+            None
+        } else {
+            Some(&*__crat_call_adapter_ptr)
+        }
+    });
     node
 }

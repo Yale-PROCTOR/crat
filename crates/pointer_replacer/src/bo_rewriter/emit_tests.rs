@@ -3347,8 +3347,8 @@ fn a_direct_call_records_each_argument_shape() {
     );
     assert_eq!(
         shapes_of(&call("target(q.offset(1))")),
-        vec!["other"],
-        "arithmetic is NOT a shape this slice can adapt"
+        vec!["raw-expr"],
+        "wave 1 admits the whole expression only because its resolved type is a raw pointer"
     );
 
     // The INDEX is the callee's 0-based parameter position — the same key as
@@ -3601,7 +3601,7 @@ mod coconv_witnesses {
     /// aliased class admissible and fails here; blocking unconditionally fails
     /// on `g21_ok`.
     #[test]
-    fn a_duplicated_argument_blocks_only_its_own_class() {
+    fn e_adapt_n1_duplicated_argument_blocks_only_its_own_class() {
         let rows = census(&format!(
             "{PRE}pub unsafe fn g21_ok(p: *mut i32) {{ *p = 1; }}\n\
              pub unsafe fn g21_aliased(a: *mut i32, b: *mut i32) {{ *a += *b; }}\n\
@@ -3676,7 +3676,11 @@ mod coconv_witnesses {
         };
         assert_eq!(case("0 as *mut i32"), "arg-null-literal");
         assert_eq!(case("(&mut x) as *mut i32"), "arg-cast-form-unbuilt");
-        assert_eq!(case("1usize as *mut i32"), "arg-unadaptable-shape");
+        assert_eq!(
+            case("1usize as *mut i32"),
+            "-",
+            "a resolved raw expression is a wave-1 adapter source; no spelling heuristic blocks it"
+        );
         assert_eq!(
             case("&mut x"),
             "-",
@@ -4257,6 +4261,235 @@ fn a_mismatched_argument_gets_seam_glue_in_the_emitted_text() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// Item E call-site adaptation wave 1 — RED-first production-path witnesses.
+// ---------------------------------------------------------------------------
+
+/// Run the SAME decision/seam producer that production uses and return its
+/// durable position ledger. This is deliberately not a miniature adapter
+/// implementation in the harness: the fixture enters through `seam_tsv`,
+/// which calls `decide_table_with_ctx` and therefore `seam::synthesize`.
+fn e_adapt_seams(src: &str) -> String {
+    let fixture = Fixture::new(&[("lib.rs", src)]);
+    ::utils::compilation::run_compiler_on_path(&fixture.root(), |tcx| {
+        super::seam_tsv(tcx).expect("wave-1 seam receipt")
+    })
+    .expect("wave-1 fixture compiles before rewriting")
+}
+
+/// The production rewrite/verify entry, not a harness-only rendering of a
+/// `GlueSpec`.
+fn e_adapt_source(src: &str) -> String {
+    match super::rewrite_m1(src) {
+        super::RewriteOutcome::Emitted { source, .. } => source,
+        other => panic!("wave-1 fixture must survive production verify: {other:?}"),
+    }
+}
+
+const E_ADAPT_PRE: &str = "#![allow(dead_code, unused_unsafe, unused_mut, unused_variables)]\n";
+
+/// E-ADAPT-W1 — raw expressions into shared slices, covering BOTH extent arms.
+///
+/// The first callee has an adjacent count and must retain the licensed arm. The
+/// second has no count and must name the §77 fallback. Both callers use an
+/// offset expression rather than a bare local: that is the corpus shape the
+/// existing argument classifier calls `Other`, so the witness is RED before
+/// wave 1 even though g25/g26 already cover the glue algebra in isolation.
+#[test]
+fn e_adapt_w1_slice_uses_licensed_then_named_fallback_extent() {
+    let src = format!(
+        "{E_ADAPT_PRE}\
+         pub unsafe fn with_len(p: *const i32, n: usize) -> i32 {{\n\
+         \x20   let mut out = 0; let mut i = 0;\n\
+         \x20   while i < n {{ out += *p.offset(i as isize); i += 1; }} out\n\
+         }}\n\
+         pub unsafe fn without_len(p: *const i32) -> i32 {{ *p.offset(0) + *p.offset(1) }}\n\
+         pub unsafe fn caller(base: *const i32, n: usize) -> i32 {{\n\
+         \x20   with_len(base.offset(0), n) + without_len(base.offset(1))\n\
+         }}\n"
+    );
+    let seams = e_adapt_seams(&src);
+    let emitted = e_adapt_source(&src);
+    assert!(
+        seams.contains("len-following") && seams.contains("len-fabricated"),
+        "the two-arm producer must report one licensed and one fallback row:\n{seams}"
+    );
+    assert!(
+        emitted.contains("crate::FALLBACK_SLICE_EXTENT"),
+        "the missing-evidence site must use the ruled name:\n{emitted}"
+    );
+    assert_eq!(
+        emitted
+            .matches("const FALLBACK_SLICE_EXTENT: usize = 1024;")
+            .count(),
+        1,
+        "one or many fallback sites produce exactly one survivor-derived const"
+    );
+}
+
+/// E-ADAPT-W2 — null is `None`, and a maybe-null raw expression is checked at
+/// the boundary. The raw expression appears once in each emitted argument;
+/// no optional extraction is permitted.
+#[test]
+fn e_adapt_w2_optional_maps_null_to_none_without_unwrap() {
+    let src = format!(
+        "{E_ADAPT_PRE}\
+         pub unsafe fn optional(p: *const i32) -> i32 {{\n\
+         \x20   if p.is_null() {{ 0 }} else {{ *p }}\n\
+         }}\n\
+         pub unsafe fn caller(base: *const i32) -> i32 {{\n\
+         \x20   optional(0 as *const i32) + optional(base.offset(1))\n\
+         }}\n"
+    );
+    let seams = e_adapt_seams(&src);
+    let emitted = e_adapt_source(&src);
+    assert!(
+        emitted.contains("optional(None)"),
+        "null must become None:\n{emitted}"
+    );
+    assert!(
+        emitted.contains("is_null"),
+        "a maybe-null raw expression needs an explicit boundary test:\n{emitted}"
+    );
+    let caller_line = emitted
+        .lines()
+        .find(|line| line.contains("optional(None)"))
+        .expect("the emitted caller line is present");
+    assert!(
+        !caller_line.contains("unwrap"),
+        "wave-1 optional ADAPTERS never extract with unwrap; the converted callee body is a different layer:\n{caller_line}"
+    );
+    assert!(
+        seams.lines().next().is_some_and(|h| h.contains("null_arm")),
+        "the production receipt must carry the null arm:\n{seams}"
+    );
+}
+
+/// E-ADAPT-W3 — scalar, slice, and optional adapters compose atomically at one
+/// call. Every target is shared so the overlap control is not the reason this
+/// fixture passes or fails.
+#[test]
+fn e_adapt_w3_mixed_safe_call_is_atomic_and_fully_receipted() {
+    let src = format!(
+        "{E_ADAPT_PRE}\
+         pub unsafe fn mixed(a: *const i32, b: *const i32, c: *const i32, n: usize) -> i32 {{\n\
+         \x20   let mut out = *a; let mut i = 0;\n\
+         \x20   while i < n {{ out += *b.offset(i as isize); i += 1; }}\n\
+         \x20   if c.is_null() {{ out }} else {{ out + *c }}\n\
+         }}\n\
+         pub unsafe fn caller(x: *const i32, y: *const i32) -> i32 {{\n\
+         \x20   mixed(x.offset(0), y.offset(0), 0 as *const i32, 2)\n\
+         }}\n"
+    );
+    let seams = e_adapt_seams(&src);
+    let emitted = e_adapt_source(&src);
+    let placed = seams
+        .lines()
+        .filter(|line| line.starts_with("placed\t"))
+        .count();
+    assert!(
+        placed >= 3,
+        "all three pointer positions need receipts:\n{seams}"
+    );
+    assert!(
+        emitted.contains("mixed(") && emitted.contains("None"),
+        "the whole mixed call must survive as one adapted call:\n{emitted}"
+    );
+}
+
+/// The corpus's first plan-level interaction: the raw call argument contains a
+/// use rewrite of its own. The AST pipeline is deliberately ordered use-first,
+/// seam-second; plan validation must recognize exactly that sanctioned
+/// containment without weakening ordinary overlap rejection.
+#[test]
+fn e_adapt_w3_nested_use_then_seam_composes_at_the_ast_choke_point() {
+    let src = format!(
+        "{E_ADAPT_PRE}\
+         pub struct Node {{ pub value: i32, pub next: *mut Node }}\n\
+         pub unsafe fn consume(p: *mut Node) -> i32 {{\n\
+         \x20   if p.is_null() {{ 0 }} else {{ (*p).value }}\n\
+         }}\n\
+         pub unsafe fn caller(root: *mut Node) -> i32 {{\n\
+         \x20   if root.is_null() {{ 0 }} else {{ consume((*root).next) }}\n\
+         }}\n"
+    );
+    let emitted = e_adapt_source(&src);
+    assert!(
+        emitted.contains("consume({") && emitted.contains(".next"),
+        "the inner field-use rewrite and outer optional seam must both survive:\n{emitted}"
+    );
+}
+
+/// E-ADAPT-W4 — a non-bare raw expression into a scalar-reference target.
+#[test]
+fn e_adapt_w4_scalar_reference_reborrows_the_raw_expression() {
+    let src = format!(
+        "{E_ADAPT_PRE}\
+         pub unsafe fn scalar(p: *const i32) -> i32 {{ *p }}\n\
+         pub unsafe fn caller(base: *const i32) -> i32 {{ scalar(base.offset(1)) }}\n"
+    );
+    let seams = e_adapt_seams(&src);
+    let emitted = e_adapt_source(&src);
+    assert!(
+        seams.contains("\treborrow\t") && seams.contains("\t0\tscalar-reference\t"),
+        "the raw-expression bridge must be typed as the scalar template:\n{seams}"
+    );
+    assert!(
+        emitted.contains("scalar(&*base.offset(1))"),
+        "the call-scoped shared reborrow must surround the whole expression:\n{emitted}"
+    );
+}
+
+/// E-ADAPT-N4 — fallback identity is inseparable from its receipt and name.
+#[test]
+fn e_adapt_n4_fallback_name_and_receipt_are_one_production_fact() {
+    let src = format!(
+        "{E_ADAPT_PRE}\
+         pub unsafe fn sum(p: *const i32) -> i32 {{ *p.offset(0) + *p.offset(1) }}\n\
+         pub unsafe fn caller(p: *const i32) -> i32 {{ sum(p.offset(0)) }}\n"
+    );
+    let seams = e_adapt_seams(&src);
+    let emitted = e_adapt_source(&src);
+    assert_eq!(seams.matches("len-fabricated").count(), 1, "{seams}");
+    assert_eq!(
+        emitted.matches("crate::FALLBACK_SLICE_EXTENT").count(),
+        1,
+        "{emitted}"
+    );
+    assert!(!emitted.contains("SEAM_LEN_PLACEHOLDER"), "{emitted}");
+}
+
+/// §79 classifier control — `RawIntoRewritten` describes the TYPE direction,
+/// not the syntactic site. Only rustc's callee-definition relation makes this a
+/// call boundary; the same direction at a local initializer is a body
+/// expression and must not re-enter the 89-row adapter market.
+#[test]
+fn e_adapt_classifier_separates_call_boundary_from_body_expression() {
+    let body = verify::Diag {
+        file: "lib.rs".to_owned(),
+        line: 10,
+        message: "expected reference found raw pointer".to_owned(),
+        direction: verify::Direction::RawIntoRewritten,
+        code: Some("E0308".to_owned()),
+        related: Vec::new(),
+    };
+    assert!(
+        !super::e1_call_site_not_adapted(&body),
+        "a body initializer is not a call merely because its type direction is RawIntoRewritten"
+    );
+
+    let mut call = body.clone();
+    call.related.push(verify::RelatedDiag {
+        file: "lib.rs".to_owned(),
+        line: 2,
+        message: "function defined here".to_owned(),
+    });
+    assert!(
+        super::e1_call_site_not_adapted(&call),
+        "the callee-definition relation is the positive call-boundary evidence"
+    );
+}
+
 /// **A BLOCKED seam row names the CALLEE in `owner_fn`, and the caller in its
 /// own column.**
 ///
@@ -4274,7 +4507,7 @@ fn a_mismatched_argument_gets_seam_glue_in_the_emitted_text() {
 /// *Mutation-tested:* swapping the two back — `owner_fn` = caller, trailing
 /// column = callee — fails both assertions, and each on its own.
 #[test]
-fn a_blocked_seam_row_names_the_callee_as_its_revert_key() {
+fn a_null_literal_seam_row_names_both_call_parties_and_the_literal_arm() {
     let src = "#![allow(dead_code, unused_unsafe, unused_mut, unused_variables)]\n\
                pub unsafe fn callee(p: *mut i32) -> i32 {\n\
                \x20   if p.is_null() { 0 } else { *p }\n\
@@ -4290,23 +4523,28 @@ fn a_blocked_seam_row_names_the_callee_as_its_revert_key() {
 
     let hdr: Vec<&str> = tsv.lines().next().expect("header").split('\t').collect();
     let col = |n: &str| hdr.iter().position(|h| *h == n).expect("column present");
-    let (c_owner, c_caller) = (col("owner_fn"), col("caller"));
-    let blocked: Vec<Vec<&str>> = tsv
+    let (c_owner, c_caller, c_null) = (col("owner_fn"), col("caller"), col("null_arm"));
+    let placed: Vec<Vec<&str>> = tsv
         .lines()
         .skip(1)
         .map(|l| l.split('\t').collect::<Vec<_>>())
-        .filter(|f| f.first() == Some(&"blocked"))
+        .filter(|f| f.first() == Some(&"placed"))
         .collect();
-    assert_eq!(blocked.len(), 1, "one refused position expected:\n{tsv}");
+    assert_eq!(
+        placed.len(),
+        1,
+        "one literal-None position expected:\n{tsv}"
+    );
     assert!(
-        blocked[0][c_owner].ends_with("callee"),
+        placed[0][c_owner].ends_with("callee"),
         "`owner_fn` must be the CALLEE — it is the revert key on every row \
          kind:\n{tsv}"
     );
     assert!(
-        blocked[0][c_caller].ends_with("caller"),
+        placed[0][c_caller].ends_with("caller"),
         "the caller must be recorded, not dropped:\n{tsv}"
     );
+    assert_eq!(placed[0][c_null], "literal-none", "{tsv}");
 }
 
 /// **`render` RUNS OUTSIDE THE COMPILER SESSION, AND THE CONST STILL LANDS.**
@@ -4362,7 +4600,7 @@ fn render_outside_a_compiler_session_still_delivers_the_const() {
     let n: usize = files
         .values()
         .map(|t| {
-            t.matches("const SEAM_LEN_PLACEHOLDER: usize = 1024;")
+            t.matches("const FALLBACK_SLICE_EXTENT: usize = 1024;")
                 .count()
         })
         .sum();
@@ -4476,7 +4714,7 @@ fn both_layers_emit_the_fabricated_const() {
                        \x20   s\n\
                        }\n\
                        pub unsafe fn fab_one(d: *mut i32) -> i32 { fab_total(d) }\n";
-    let decl = "const SEAM_LEN_PLACEHOLDER: usize = 1024;";
+    let decl = "const FALLBACK_SLICE_EXTENT: usize = 1024;";
 
     let ast = super::ast_emitted_source_of(SRC).expect("the AST layer emits");
     assert_eq!(
@@ -4485,7 +4723,7 @@ fn both_layers_emit_the_fabricated_const() {
         "the AST layer — the LAYER OF RECORD — must declare the const it names:\n{ast}"
     );
     assert!(
-        ast.contains("crate::SEAM_LEN_PLACEHOLDER"),
+        ast.contains("crate::FALLBACK_SLICE_EXTENT"),
         "and a fabricated site must name it, or the count above is vacuous:\n{ast}"
     );
 
@@ -4543,7 +4781,7 @@ fn a_function_carrying_both_arms_renders_identically_in_both_layers() {
     // fired, or where the caller kept every raw parameter — which is exactly
     // the shape it exists to cover.
     assert!(
-        span.contains("crate::SEAM_LEN_PLACEHOLDER"),
+        span.contains("crate::FALLBACK_SLICE_EXTENT"),
         "arm 3 (a fabricated seam) must be present:\n{span}"
     );
     assert!(
