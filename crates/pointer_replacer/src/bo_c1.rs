@@ -15425,6 +15425,59 @@ fn e2_candidate_receipts_do_not_enter_placed_adapter_counters() {
     );
 }
 
+/// Addendum 90: the promote-rate ledger is an identity partition, not four
+/// independently counted aggregates.  The fixture covers every disposition,
+/// all four promotable families, the non-promotable Raw population, and the
+/// lifetime-market split before the corpus worker can emit its first row.
+#[test]
+fn degraded_mass_ledger_is_exact_once_and_lifetime_typed() {
+    let seed = "subject_key\towner_fn\tmir_local\tfamily\tmodel_kind\tdecision\treason\tsite\tplaced\texclusion\n\
+f::p#1\tf\t1\tref\tref\tref\t-\tf.rs:1\t1\t-\n\
+g::s#1\tg\t1\tslice\tref\tslice\t-\tg.rs:1\t1\t-\n\
+h::o#1\th\t1\toptional\tref\tdegraded\treturn-not-adapted\th.rs:1\t0\t-\n\
+i::b#1\ti\t1\tbox\towning\tdegraded\tkind-owning\ti.rs:1\t0\t-\n\
+j::r#1\tj\t1\traw\traw\tdegraded\tkind-raw\tj.rs:1\t0\t-\n\
+extern::arg#1\textern\t1\tunmodeled\tunmodeled\texcluded\t-\t-\t0\tforeign-item\n";
+    let ledger = run::degraded_mass_ledger_for_test(seed, &[("g", "call-site-not-adapted")])
+        .expect("exact ledger");
+    let rows = ledger.lines().skip(1).collect::<Vec<_>>();
+    assert_eq!(rows.len(), 6);
+    assert!(rows[0].contains("\trealized-as-predicted\t-\t0"));
+    assert!(rows[1].contains("\treverted\tcall-site-not-adapted\t0"));
+    assert!(rows[2].contains("\tdegraded\treturn-not-adapted\t1"));
+    assert!(rows[3].contains("\tdegraded\tkind-owning\t0"));
+    assert!(rows[4].contains("\tdegraded\tkind-raw\t0"));
+    assert!(rows[5].contains("\ttyped-excluded\tforeign-item\t0"));
+
+    let duplicate = format!("{seed}{}\n", seed.lines().nth(1).unwrap());
+    let error = run::degraded_mass_ledger_for_test(&duplicate, &[])
+        .expect_err("duplicate identities must fail the census");
+    assert!(error.contains("duplicate subject identity"), "{error}");
+}
+
+#[test]
+fn degraded_mass_lifetime_market_registry_is_explicit() {
+    for reason in [
+        "return-not-adapted",
+        "escapes-via-return",
+        "escapes-via-foreign-arg",
+        "escapes-via-field-store",
+        "escapes-via-static-store",
+        "borrowed-into-raw-param",
+    ] {
+        assert!(run::degraded_mass_lifetime_reason_for_test(reason), "{reason}");
+    }
+    for reason in [
+        "kind-raw",
+        "kind-owning",
+        "call-site-not-adapted",
+        "slice-use-unsupported",
+        "reverted-after-verify-failure",
+    ] {
+        assert!(!run::degraded_mass_lifetime_reason_for_test(reason), "{reason}");
+    }
+}
+
 // Worker (one program, one mode, one process).
 // ---------------------------------------------------------------------------
 
