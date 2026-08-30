@@ -252,7 +252,7 @@ pub(crate) fn fingerprint(
 /// Computed at runtime rather than baked in at build time: a baked constant
 /// would be stale exactly when the sources change without a rebuild of this
 /// file, which is the failure mode it exists to prevent.
-fn analysis_code_fingerprint() -> String {
+fn analysis_code_fingerprint_at(root: &Path) -> String {
     fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
         let Ok(rd) = std::fs::read_dir(dir) else { return };
         for e in rd.flatten() {
@@ -264,7 +264,6 @@ fn analysis_code_fingerprint() -> String {
             }
         }
     }
-    let root = Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/src/analyses"));
     let mut files = Vec::new();
     walk(root, &mut files);
     files.sort();
@@ -276,8 +275,29 @@ fn analysis_code_fingerprint() -> String {
     format!("{:x}", h.finalize())
 }
 
+fn analysis_code_fingerprint() -> String {
+    analysis_code_fingerprint_at(Path::new(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/analyses"
+    )))
+}
+
 fn entry_path(d: &Path, fingerprint: &str) -> PathBuf {
     d.join(format!("{fingerprint}.model.tsv"))
+}
+
+/// Stage one accepted entry under a new key without touching the source.
+/// RED-first placeholder: addendum 88 requires line 1 to move too.
+pub(crate) fn rekey_entry(
+    old_path: &Path,
+    new_dir: &Path,
+    new_fingerprint: &str,
+) -> Result<PathBuf, String> {
+    let bytes = std::fs::read(old_path).map_err(|error| error.to_string())?;
+    std::fs::create_dir_all(new_dir).map_err(|error| error.to_string())?;
+    let new_path = entry_path(new_dir, new_fingerprint);
+    std::fs::write(&new_path, bytes).map_err(|error| error.to_string())?;
+    Ok(new_path)
 }
 
 pub(crate) fn configured_entry_path(fingerprint: &str) -> Option<PathBuf> {
@@ -645,6 +665,71 @@ mod tests {
         .unwrap_or_else(|error| error.raise());
     }
 
+    /// Addendum 88 / R1 — the permitted re-key changes only the filename and
+    /// first line, and the staged entry must then load through production.
+    #[test]
+    fn rekey_changes_only_the_key_line_and_round_trips_through_the_loader() {
+        struct TestDir(PathBuf);
+        impl Drop for TestDir {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let root =
+            std::env::temp_dir().join(format!("crat-cache-rekey-test-{}", std::process::id()));
+        let source_dir = TestDir(root.join("old"));
+        let staged_dir = TestDir(root.join("staged"));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&source_dir.0).expect("old cache dir");
+        std::fs::create_dir_all(&staged_dir.0).expect("staged cache dir");
+        let source = "pub unsafe fn read(p: *const i32) -> i32 { unsafe { *p } }";
+
+        ::utils::compilation::run_compiler_on_str(source, |tcx| {
+            reset_for_test();
+            let receipt = with_test_config(false, &source_dir.0, || {
+                crate::bo_rewriter::cache_decide_receipt_for_test(tcx)
+            })
+            .expect("fresh precise decision");
+            let provenance = last_solve().expect("fresh solve provenance");
+            let current_fp = provenance.fingerprint;
+            let current_model = provenance.model_sha256;
+            let current_path = provenance.cache_entry.expect("fresh cache entry");
+            let current_text = std::fs::read_to_string(&current_path).expect("fresh entry text");
+            let (_, tail) = current_text.split_once('\n').expect("fingerprint line");
+
+            let legacy_fp = "f".repeat(64);
+            assert_ne!(legacy_fp, current_fp);
+            let legacy_path = entry_path(&source_dir.0, &legacy_fp);
+            std::fs::write(&legacy_path, format!("# fingerprint {legacy_fp}\n{tail}"))
+                .expect("legacy entry");
+            std::fs::remove_file(&current_path).expect("remove current-key source entry");
+
+            let staged = rekey_entry(&legacy_path, &staged_dir.0, &current_fp)
+                .expect("stage re-keyed entry");
+            let staged_text = std::fs::read_to_string(&staged).expect("staged entry text");
+            let (staged_first, staged_tail) = staged_text.split_once('\n').expect("staged header");
+            assert_eq!(staged_first, format!("# fingerprint {current_fp}"));
+            assert_eq!(staged_tail.as_bytes(), tail.as_bytes());
+            assert!(
+                legacy_path.is_file(),
+                "the accepted source must be retained"
+            );
+
+            reset_for_test();
+            let loaded_receipt = with_test_config(true, &staged_dir.0, || {
+                crate::bo_rewriter::cache_decide_receipt_for_test(tcx)
+            })
+            .expect("staged precise decision");
+            let loaded = last_solve().expect("staged load provenance");
+            assert_eq!(loaded.source, "cache");
+            assert_eq!(loaded.cache_status, "hit");
+            assert_eq!(loaded.model_sha256, current_model);
+            assert_eq!(loaded_receipt, receipt);
+            reset_for_test();
+        })
+        .unwrap_or_else(|error| error.raise());
+    }
+
     /// The three refusal shapes, at the level they are decidable without a
     /// compiler session: the entry's own self-identification.
     ///
@@ -693,6 +778,44 @@ mod tests {
             format!("{:x}", Sha256::new().finalize()),
             "the fingerprint is the hash of NOTHING — the walk found no files, \
              so it would agree across every possible edit"
+        );
+    }
+
+    /// Addendum 87's permanent portability control. Together with the re-key
+    /// test above these two tests preregister the suite at 1,573/6/87.
+    #[test]
+    fn analysis_code_fingerprint_is_identical_across_distinct_worktree_roots() {
+        struct Roots(Vec<PathBuf>);
+        impl Drop for Roots {
+            fn drop(&mut self) {
+                for root in &self.0 {
+                    let _ = std::fs::remove_dir_all(root);
+                }
+            }
+        }
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let a = std::env::temp_dir().join(format!("crat-cache-root-a-{nonce}"));
+        let b = std::env::temp_dir().join(format!("crat-cache-root-b-{nonce}"));
+        let _roots = Roots(vec![a.clone(), b.clone()]);
+        for root in [&a, &b] {
+            std::fs::create_dir_all(root.join("nested")).expect("analysis tree");
+            std::fs::write(root.join("mod.rs"), "mod nested;\n").expect("root source");
+            std::fs::write(root.join("nested/a.rs"), "pub fn a() {}\n").expect("nested source");
+        }
+        assert_ne!(a, b, "the control needs distinct roots");
+        assert_eq!(
+            analysis_code_fingerprint_at(&a),
+            analysis_code_fingerprint_at(&b),
+            "absolute worktree location entered the cache key"
+        );
+        std::fs::write(b.join("nested/a.rs"), "pub fn changed() {}\n").expect("mutate content");
+        assert_ne!(
+            analysis_code_fingerprint_at(&a),
+            analysis_code_fingerprint_at(&b),
+            "content stopped contributing to the cache key"
         );
     }
 
