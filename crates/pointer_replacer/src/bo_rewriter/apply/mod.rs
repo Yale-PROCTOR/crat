@@ -194,6 +194,29 @@ impl LineMap {
         }
         (emit_line as isize - delta).max(1) as usize
     }
+
+    /// Exact offset-preserving map for a replacement whose original and
+    /// emitted line spans have equal length. E1 uses this only when the normal
+    /// owner-attribution map (which intentionally collapses a whole reprinted
+    /// function to its start) names no function. Unequal spans return `None`
+    /// rather than guessing an interior correspondence.
+    pub(crate) fn to_original_if_bijective(&self, emit_line: usize) -> Option<usize> {
+        let mut delta: isize = 0;
+        for segment in &self.segments {
+            if emit_line < segment.emit_lo {
+                break;
+            }
+            if emit_line <= segment.emit_hi {
+                if segment.orig_hi - segment.orig_lo != segment.emit_hi - segment.emit_lo {
+                    return None;
+                }
+                return Some(segment.orig_lo + emit_line - segment.emit_lo);
+            }
+            delta += (segment.emit_hi - segment.emit_lo) as isize
+                - (segment.orig_hi - segment.orig_lo) as isize;
+        }
+        Some((emit_line as isize - delta).max(1) as usize)
+    }
 }
 
 #[cfg(test)]
@@ -209,6 +232,30 @@ mod tests {
             justification: Justification::KindDecision { kind: "test" },
             owner_fn: "test::owner".to_owned(),
         }
+    }
+
+    #[test]
+    fn e1_bijective_line_map_preserves_equal_span_offsets_and_refuses_unequal_spans() {
+        let equal = LineMap {
+            segments: vec![Segment {
+                orig_lo: 57,
+                orig_hi: 65,
+                emit_lo: 57,
+                emit_hi: 65,
+            }],
+        };
+        assert_eq!(equal.to_original(60), 57, "ordinary gate map collapses");
+        assert_eq!(equal.to_original_if_bijective(60), Some(60));
+
+        let unequal = LineMap {
+            segments: vec![Segment {
+                orig_lo: 57,
+                orig_hi: 65,
+                emit_lo: 57,
+                emit_hi: 63,
+            }],
+        };
+        assert_eq!(unequal.to_original_if_bijective(60), None);
     }
 
     /// **THE libtree SHAPE — accumulated drift, and it must discriminate.**
