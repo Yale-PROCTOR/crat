@@ -377,9 +377,9 @@ pub(crate) struct BlockedSeam {
     pub expected: Option<Form>,
     pub found: Option<Form>,
     pub source_shape: &'static str,
-    pub candidate_template: Option<&'static str>,
-    pub null_arm: Option<&'static str>,
-    pub extent_arm: Option<&'static str>,
+    pub candidate_template: String,
+    pub null_arm: String,
+    pub extent_arm: String,
     pub root_identity: String,
     pub blind: bool,
     pub peers: Vec<PeerConflict>,
@@ -2084,9 +2084,9 @@ fn blocked_call(
         expected: None,
         found: None,
         source_shape: "-",
-        candidate_template: None,
-        null_arm: None,
-        extent_arm: None,
+        candidate_template: "unavailable".to_owned(),
+        null_arm: "unavailable".to_owned(),
+        extent_arm: "unavailable".to_owned(),
         root_identity: "-".to_owned(),
         blind: false,
         peers: Vec::new(),
@@ -2410,10 +2410,25 @@ pub(crate) fn synthesize(
             // ---- pass 3: emit ----
             for (idx, pos) in positions.iter().enumerate() {
                 if !conflicts[idx].is_empty() {
-                    let candidate = candidates[idx]
-                        .as_ref()
-                        .ok()
-                        .and_then(|value| value.as_ref());
+                    let (candidate_template, null_arm, extent_arm) = match &candidates[idx] {
+                        Ok(Some(candidate)) => (
+                            candidate.spec.template_key().to_owned(),
+                            match candidate.spec.null_arm_key() {
+                                "-" => "none".to_owned(),
+                                value => value.to_owned(),
+                            },
+                            match candidate.spec.extent_arm_key() {
+                                "-" => "none".to_owned(),
+                                value => value.to_owned(),
+                            },
+                        ),
+                        Ok(None) => ("none".to_owned(), "none".to_owned(), "none".to_owned()),
+                        Err(block) => (
+                            format!("error:{}", block.key()),
+                            "unavailable".to_owned(),
+                            "unavailable".to_owned(),
+                        ),
+                    };
                     plan.blocked.push(BlockedSeam {
                         caller: site.caller,
                         callee: *callee,
@@ -2423,9 +2438,9 @@ pub(crate) fn synthesize(
                         expected: Some(pos.expected),
                         found: Some(pos.found),
                         source_shape: pos.source_shape,
-                        candidate_template: candidate.map(|value| value.spec.template_key()),
-                        null_arm: candidate.map(|value| value.spec.null_arm_key()),
-                        extent_arm: candidate.map(|value| value.spec.extent_arm_key()),
+                        candidate_template,
+                        null_arm,
+                        extent_arm,
                         root_identity: root_label(&labels, site.caller, pos.root),
                         blind: pos.blind,
                         peers: conflicts[idx].clone(),
@@ -2479,9 +2494,9 @@ pub(crate) fn synthesize(
                             expected: Some(pos.expected),
                             found: Some(pos.found),
                             source_shape: pos.source_shape,
-                            candidate_template: None,
-                            null_arm: None,
-                            extent_arm: None,
+                            candidate_template: format!("error:{}", block.key()),
+                            null_arm: "unavailable".to_owned(),
+                            extent_arm: "unavailable".to_owned(),
                             root_identity: root_label(&labels, site.caller, pos.root),
                             blind: pos.blind,
                             peers: Vec::new(),

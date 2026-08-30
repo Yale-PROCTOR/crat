@@ -4775,6 +4775,39 @@ fn e2_schema_w1_blocked_rows_retain_candidate_forms_and_peer_pairs() {
         assert_eq!(row[blind], "0", "{row:?}");
         assert_eq!(row[context], "call-argument", "{row:?}");
     }
+
+    let no_edit = e2_attempt(&src, &|table| {
+        force_body_forms(
+            table,
+            &[],
+            &[
+                ("caller::p", true),
+                ("callee::a", true),
+                ("callee::b", true),
+            ],
+        );
+    });
+    let mut no_edit_lines = no_edit.receipt.lines();
+    let no_edit_header = no_edit_lines
+        .next()
+        .expect("no-edit receipt header")
+        .split('\t')
+        .collect::<Vec<_>>();
+    let no_edit_candidate = no_edit_header
+        .iter()
+        .position(|value| *value == "candidate_template")
+        .expect("candidate column");
+    let no_edit_rows = no_edit_lines
+        .filter(|line| line.starts_with("blocked\t"))
+        .map(|line| line.split('\t').collect::<Vec<_>>())
+        .collect::<Vec<_>>();
+    assert_eq!(no_edit_rows.len(), 2, "{}", no_edit.receipt);
+    assert!(
+        no_edit_rows
+            .iter()
+            .all(|row| row[no_edit_candidate] == "none"),
+        "a computed no-edit candidate must not collapse back to missing: {no_edit_rows:?}"
+    );
 }
 
 /// **A BLOCKED seam row names the CALLEE in `owner_fn`, and the caller in its
