@@ -3526,25 +3526,37 @@ fn e1_subject_seed_tsv(
             Some(SlotKind::Owning) => "owning",
             None => "unmodeled",
         };
-        let (decision_key, reason, site) = match decision {
+        let (decision_key, reason, reason_detail, site) = match decision {
             decision::Decision::Ref { .. } => (
                 "ref",
                 "-",
+                "-".to_owned(),
                 decision::emitability::EmitabilityFacts::site(tcx, subject.attribution_span()),
             ),
             decision::Decision::Slice { .. } => (
                 "slice",
                 "-",
+                "-".to_owned(),
                 decision::emitability::EmitabilityFacts::site(tcx, subject.attribution_span()),
             ),
             decision::Decision::Opt { .. } => (
                 "optional",
                 "-",
+                "-".to_owned(),
                 decision::emitability::EmitabilityFacts::site(tcx, subject.attribution_span()),
             ),
-            decision::Decision::Degraded(record) => {
-                ("degraded", record.reason.key(), record.site.clone())
-            }
+            decision::Decision::Degraded(record) => (
+                "degraded",
+                record.reason.key(),
+                match &record.reason {
+                    decision::DegradeReason::ClassBlocked { via }
+                    | decision::DegradeReason::SilentCoercion { via } => via.key().to_owned(),
+                    decision::DegradeReason::RawPointerOperation { op } => op.clone(),
+                    decision::DegradeReason::UnsupportedDeclShape { shape } => (*shape).to_owned(),
+                    _ => "-".to_owned(),
+                },
+                record.site.clone(),
+            ),
         };
         let unplaced_reason = unplaced.remove(key.as_str());
         let emits = match decision {
@@ -3564,9 +3576,10 @@ fn e1_subject_seed_tsv(
         rows.push((
             key.clone(),
             format!(
-                "{key}\t{owner}\t{}\t{arg_index}\t{}\t{family}\t{model_key}\t{decision_key}\t{reason}\t{}\t{}\t{exclusion}",
+                "{key}\t{owner}\t{}\t{arg_index}\t{}\t{family}\t{model_key}\t{decision_key}\t{reason}\t{}\t{}\t{}\t{exclusion}",
                 subject.local.as_u32(),
                 subject.ptr_depth,
+                reason_detail.replace(['\t', '\r', '\n'], " "),
                 site.replace(['\t', '\r', '\n'], " "),
                 u8::from(placed),
             ),
@@ -3586,7 +3599,7 @@ fn e1_subject_seed_tsv(
         rows.push((
             key.clone(),
             format!(
-                "{key}\t{owner}\t{}\t{}\t{}\tunmodeled\tunmodeled\texcluded\t-\t-\t0\t{}",
+                "{key}\t{owner}\t{}\t{}\t{}\tunmodeled\tunmodeled\texcluded\t-\t-\t-\t0\t{}",
                 subject.arg_index, subject.arg_index, subject.ptr_depth, subject.reason
             ),
         ));
@@ -3599,7 +3612,7 @@ fn e1_subject_seed_tsv(
         }
     }
     let mut out = String::from(
-        "subject_key\towner_fn\tmir_local\targ_index\tptr_depth\tfamily\tmodel_kind\tdecision\treason\tsite\tplaced\texclusion\n",
+        "subject_key\towner_fn\tmir_local\targ_index\tptr_depth\tfamily\tmodel_kind\tdecision\treason\treason_detail\tsite\tplaced\texclusion\n",
     );
     for (_, row) in rows {
         out.push_str(&row);

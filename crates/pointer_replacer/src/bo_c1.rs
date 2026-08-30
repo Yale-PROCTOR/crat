@@ -8599,6 +8599,13 @@ mod run {
         )
     }
 
+    fn degraded_mass_lifetime_cause(reason: &str) -> bool {
+        degraded_mass_lifetime_reason(reason)
+            || reason
+                .strip_prefix("class-blocked:")
+                .is_some_and(degraded_mass_lifetime_reason)
+    }
+
     #[derive(Clone, Debug, Default)]
     struct DegradedMassCounts {
         subjects: usize,
@@ -8621,7 +8628,7 @@ mod run {
         seed: &str,
         revert_classes: &BTreeMap<String, String>,
     ) -> Result<DegradedMassLedger, String> {
-        const HEADER: [&str; 12] = [
+        const HEADER: [&str; 13] = [
             "subject_key",
             "owner_fn",
             "mir_local",
@@ -8631,6 +8638,7 @@ mod run {
             "model_kind",
             "decision",
             "reason",
+            "reason_detail",
             "site",
             "placed",
             "exclusion",
@@ -8672,8 +8680,9 @@ mod run {
             let family = cols[5];
             let decision = cols[7];
             let reason = cols[8];
-            let placed = cols[10];
-            let exclusion = cols[11];
+            let reason_detail = cols[9];
+            let placed = cols[11];
+            let exclusion = cols[12];
             if !matches!(placed, "0" | "1") {
                 return Err(format!("{subject_key}: invalid placed bit {placed:?}"));
             }
@@ -8690,27 +8699,32 @@ mod run {
                     return Err(format!("{subject_key}: excluded row lacks a typed reason"));
                 }
                 counts.excluded += 1;
-                ("typed-excluded", exclusion)
+                ("typed-excluded", exclusion.to_owned())
             } else if decision == "degraded" {
                 if reason == "-" {
                     return Err(format!("{subject_key}: degraded row lacks a typed reason"));
                 }
+                let typed_reason = if reason == "class-blocked" && reason_detail != "-" {
+                    format!("class-blocked:{reason_detail}")
+                } else {
+                    reason.to_owned()
+                };
                 counts.degraded += 1;
                 *counts
                     .degraded_reasons
-                    .entry(reason.to_owned())
+                    .entry(typed_reason.clone())
                     .or_default() += 1;
-                ("degraded", reason)
+                ("degraded", typed_reason)
             } else if placed == "0" {
                 if exclusion == "-" {
                     return Err(format!("{subject_key}: unplaced row lacks a typed reason"));
                 }
                 counts.excluded += 1;
-                ("typed-excluded", exclusion)
+                ("typed-excluded", exclusion.to_owned())
             } else if let Some(class) = revert_classes.get(owner_fn) {
                 matched_reverts.insert(owner_fn.to_owned());
                 counts.reverted += 1;
-                ("reverted", class.as_str())
+                ("reverted", class.clone())
             } else {
                 counts.realized += 1;
                 if DEGRADED_MASS_FAMILIES.contains(&family) {
@@ -8719,10 +8733,10 @@ mod run {
                         .entry(family.to_owned())
                         .or_default() += 1;
                 }
-                ("realized-as-predicted", "-")
+                ("realized-as-predicted", "-".to_owned())
             };
             let lifetime =
-                disposition == "degraded" && degraded_mass_lifetime_reason(disposition_reason);
+                disposition == "degraded" && degraded_mass_lifetime_cause(&disposition_reason);
             counts.lifetime_degraded += usize::from(lifetime);
             counts.subjects += 1;
             out.push_str(line);
@@ -8917,7 +8931,7 @@ mod run {
                 name,
                 reason,
                 count,
-                u8::from(degraded_mass_lifetime_reason(reason)),
+                u8::from(degraded_mass_lifetime_cause(reason)),
             ));
         }
         let taxonomy_path = directory.join(format!("{name}.degraded-reasons.tsv"));
