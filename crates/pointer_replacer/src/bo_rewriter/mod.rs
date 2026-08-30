@@ -4244,7 +4244,7 @@ pub(crate) fn seam_tsv(tcx: TyCtxt<'_>) -> Result<String, String> {
 fn seam_tsv_from_table(tcx: TyCtxt<'_>, table: &decision::DecisionTable) -> String {
     let sm = tcx.sess.source_map();
     let mut out = String::from(
-        "kind\towner_fn\tfamily_or_reason\tsite\tlen_arm\tglue_shape\tcaller\tparam_index\ttemplate\tnull_arm\textent_arm\tadapter_key\tsource_shape\n",
+        "kind\towner_fn\tfamily_or_reason\tsite\tlen_arm\tglue_shape\tcaller\tparam_index\ttemplate\tnull_arm\textent_arm\tadapter_key\tsource_shape\tcontext\tdestination\texpected_form\tfound_form\tcandidate_template\tpeer_pairs\troot_identity\tblind\n",
     );
     for edit in &table.seams.edits {
         let family = match edit.family {
@@ -4278,7 +4278,7 @@ fn seam_tsv_from_table(tcx: TyCtxt<'_>, table: &decision::DecisionTable) -> Stri
             edit.caller_fn, edit.owner_fn, edit.param_index, site
         );
         out.push_str(&format!(
-            "placed\t{}\t{}\t{}\t{arm}\t{shape}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+            "placed\t{}\t{}\t{}\t{arm}\t{shape}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\tcall-argument\tparam:{}\t{}\t{}\t{}\t-\t{}\t{}\n",
             edit.owner_fn,
             family,
             site,
@@ -4289,6 +4289,12 @@ fn seam_tsv_from_table(tcx: TyCtxt<'_>, table: &decision::DecisionTable) -> Stri
             edit.spec.extent_arm_key(),
             adapter_key,
             edit.source_shape,
+            edit.param_index,
+            edit.expected.key(),
+            edit.found.key(),
+            edit.spec.template_key(),
+            edit.root_identity,
+            u8::from(edit.blind),
         ));
     }
     // **`owner_fn` is the REVERT KEY on every row kind** (2026-08-12). It was
@@ -4298,25 +4304,95 @@ fn seam_tsv_from_table(tcx: TyCtxt<'_>, table: &decision::DecisionTable) -> Stri
     // CALLEE's conversion, which is why `SeamEdit::owner_fn` is the callee.
     // The caller is real information and moves to its own column rather than
     // being dropped.
-    for (caller, callee, index, span, block) in &table.seams.blocked {
-        let caller = tcx.def_path_str(caller.to_def_id());
-        let callee = tcx.def_path_str(callee.to_def_id());
-        let site = sm.span_to_diagnostic_string(*span);
-        let adapter_key = format!("{caller}=>{callee}#{index}@{site}");
+    for blocked in &table.seams.blocked {
+        let caller = tcx.def_path_str(blocked.caller.to_def_id());
+        let callee = tcx.def_path_str(blocked.callee.to_def_id());
+        let site = sm.span_to_diagnostic_string(blocked.span);
+        let adapter_key = format!("{caller}=>{callee}#{}@{site}", blocked.index);
+        let peers = if blocked.peers.is_empty() {
+            "-".to_owned()
+        } else {
+            blocked
+                .peers
+                .iter()
+                .map(decision::seam::PeerConflict::key)
+                .collect::<Vec<_>>()
+                .join(";")
+        };
         out.push_str(&format!(
-            "blocked\t{}\t{}\t{}\t-\t-\t{}\t{}\t-\t-\t-\t{}\t-\n",
+            "blocked\t{}\t{}\t{}\t-\t-\t{}\t{}\t{}\t{}\t{}\t{}\t{}\tcall-argument\tparam:{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
             callee,
-            block.key(),
+            blocked.block.key(),
             site,
             caller,
-            index,
+            blocked.index,
+            blocked.candidate_template.unwrap_or("-"),
+            blocked.null_arm.unwrap_or("-"),
+            blocked.extent_arm.unwrap_or("-"),
             adapter_key,
+            blocked.source_shape,
+            blocked.index,
+            blocked.expected.map_or("-", decision::seam::Form::key),
+            blocked.found.map_or("-", decision::seam::Form::key),
+            blocked.candidate_template.unwrap_or("-"),
+            peers,
+            blocked.root_identity,
+            u8::from(blocked.blind),
+        ));
+    }
+    for edit in &table.seams.body_edits {
+        let family = match edit.family {
+            decision::seam::SeamFamily::Safe => "safe",
+            decision::seam::SeamFamily::Reborrow => "reborrow",
+        };
+        let site = sm.span_to_diagnostic_string(edit.span);
+        let adapter_key = format!("{}#{}@{}", edit.owner_fn, edit.context.key(), site);
+        out.push_str(&format!(
+            "body-placed\t{}\t{}\t{}\t-\t{}\t{}\t-\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t-\t{}\t{}\n",
+            edit.owner_fn,
+            family,
+            site,
+            edit.spec.shape_key(),
+            edit.owner_fn,
+            edit.spec.template_key(),
+            edit.spec.null_arm_key(),
+            edit.spec.extent_arm_key(),
+            adapter_key,
+            edit.source_shape,
+            edit.context.key(),
+            edit.destination,
+            edit.expected.key(),
+            edit.found.key(),
+            edit.spec.template_key(),
+            edit.root_identity,
+            u8::from(edit.blind),
+        ));
+    }
+    for blocked in &table.seams.body_blocked {
+        let site = sm.span_to_diagnostic_string(blocked.span);
+        let adapter_key = format!("{}#{}@{}", blocked.owner_fn, blocked.context.key(), site);
+        out.push_str(&format!(
+            "body-blocked\t{}\t{}\t{}\t-\t-\t{}\t-\t{}\t-\t-\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t-\t{}\t{}\n",
+            blocked.owner_fn,
+            blocked.block.key(),
+            site,
+            blocked.owner_fn,
+            blocked.candidate_template.unwrap_or("-"),
+            adapter_key,
+            blocked.source_shape,
+            blocked.context.key(),
+            blocked.destination,
+            blocked.expected.key(),
+            blocked.found.map_or("-", decision::seam::Form::key),
+            blocked.candidate_template.unwrap_or("-"),
+            blocked.root_identity,
+            u8::from(blocked.blind),
         ));
     }
     // Item 4a: companion-length coverage, one row per LENGTH-GATED POSITION.
     for (callee, index, evidence) in &table.seams.length_evidence {
         out.push_str(&format!(
-            "lengated\t{callee}\t{}\t#{index}\t-\t-\t-\t{index}\t-\t-\t-\t-\t-\n",
+            "lengated\t{callee}\t{}\t#{index}\t-\t-\t-\t{index}\t-\t-\t-\t-\t-\t-\t-\t-\t-\t-\t-\t-\t-\n",
             evidence.key()
         ));
     }
@@ -4325,7 +4401,7 @@ fn seam_tsv_from_table(tcx: TyCtxt<'_>, table: &decision::DecisionTable) -> Stri
     // incomplete twice; a silent adaptation would hide the third case.
     for (found, expected) in &table.seams.uncensused {
         out.push_str(&format!(
-            "uncensused\t-\t{found:?} -> {expected:?}\t-\t-\t-\t-\t-\t-\t-\t-\t-\t-\n"
+            "uncensused\t-\t{found:?} -> {expected:?}\t-\t-\t-\t-\t-\t-\t-\t-\t-\t-\t-\t-\t-\t-\t-\t-\t-\n"
         ));
     }
     out

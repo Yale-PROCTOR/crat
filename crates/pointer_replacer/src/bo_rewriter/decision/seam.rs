@@ -49,6 +49,34 @@ pub(crate) enum Form {
     Opt { mutable: bool, slice: bool },
 }
 
+impl Form {
+    pub(crate) fn key(self) -> &'static str {
+        match self {
+            Form::Raw => "raw",
+            Form::Ref { mutable: true } => "ref-mut",
+            Form::Ref { mutable: false } => "ref-shared",
+            Form::Slice { mutable: true } => "slice-mut",
+            Form::Slice { mutable: false } => "slice-shared",
+            Form::Opt {
+                mutable: true,
+                slice: true,
+            } => "opt-slice-mut",
+            Form::Opt {
+                mutable: false,
+                slice: true,
+            } => "opt-slice-shared",
+            Form::Opt {
+                mutable: true,
+                slice: false,
+            } => "opt-ref-mut",
+            Form::Opt {
+                mutable: false,
+                slice: false,
+            } => "opt-ref-shared",
+        }
+    }
+}
+
 /// Why a position could not be adapted. **A first-class outcome**, never a
 /// silent skip — an unadapted position is a revert, and a revert with no reason
 /// is a yield number nobody can attribute.
@@ -288,6 +316,109 @@ pub(crate) struct SeamEdit {
     /// already knows, and a `Paren` between the cast and its operand would make
     /// the guess silently wrong.
     pub arg_span: Span,
+    /// Candidate facts retained for the common receipt schema.
+    pub expected: Form,
+    pub found: Form,
+    pub root_identity: String,
+    pub blind: bool,
+}
+
+/// One placed initializer/assignment adapter. It deliberately carries the
+/// same `GlueSpec`/family pair as [`SeamEdit`]; only ownership and context
+/// differ.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct BodyEdit {
+    pub span: Span,
+    pub replacement: String,
+    pub owner_fn: String,
+    pub destination: String,
+    pub context: super::emitability::BodyAdapterContext,
+    pub source_shape: &'static str,
+    pub family: SeamFamily,
+    pub spec: GlueSpec,
+    pub arg_span: Span,
+    pub expected: Form,
+    pub found: Form,
+    pub root_identity: String,
+    pub blind: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct PeerConflict {
+    pub left: usize,
+    pub right: usize,
+    pub same_root: bool,
+    pub left_blind: bool,
+    pub right_blind: bool,
+}
+
+impl PeerConflict {
+    pub(crate) fn key(&self) -> String {
+        format!(
+            "{}/{}[same_root={},left_blind={},right_blind={}]",
+            self.left,
+            self.right,
+            u8::from(self.same_root),
+            u8::from(self.left_blind),
+            u8::from(self.right_blind)
+        )
+    }
+}
+
+/// A call position rejected after candidate construction. Strings are carried
+/// here so the receipt never re-derives a form from emitted text.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct BlockedSeam {
+    pub caller: LocalDefId,
+    pub callee: LocalDefId,
+    pub index: usize,
+    pub span: Span,
+    pub block: SeamBlock,
+    pub expected: Option<Form>,
+    pub found: Option<Form>,
+    pub source_shape: &'static str,
+    pub candidate_template: Option<&'static str>,
+    pub null_arm: Option<&'static str>,
+    pub extent_arm: Option<&'static str>,
+    pub root_identity: String,
+    pub blind: bool,
+    pub peers: Vec<PeerConflict>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum BodyBlock {
+    SideEffectingRhs,
+    UnnameableRhs,
+    NullRequiredRef,
+    SharedToMut,
+    RenderRefused,
+}
+
+impl BodyBlock {
+    pub(crate) fn key(self) -> &'static str {
+        match self {
+            Self::SideEffectingRhs => "body-side-effecting-rhs",
+            Self::UnnameableRhs => "body-unnameable-rhs",
+            Self::NullRequiredRef => "body-null-required-ref",
+            Self::SharedToMut => "body-shared-to-mut",
+            Self::RenderRefused => "body-render-refused",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct BlockedBody {
+    pub owner_fn: String,
+    pub destination: String,
+    pub span: Span,
+    pub context: super::emitability::BodyAdapterContext,
+    pub block: BodyBlock,
+    pub expected: Form,
+    pub found: Option<Form>,
+    pub source_shape: &'static str,
+    pub candidate_template: Option<&'static str>,
+    pub root_identity: String,
+    pub blind: bool,
 }
 
 /// **The authorization rule for fabrication, as a pure function** (R8).
@@ -1859,7 +1990,10 @@ use super::{Decision, DecisionTable, Subject, SubjectKind, emitability::ArgShape
 #[derive(Clone, Debug, Default)]
 pub(crate) struct SeamPlan {
     pub edits: Vec<SeamEdit>,
-    /// `(caller, callee, parameter index, argument span, reason)`.
+    pub body_edits: Vec<BodyEdit>,
+    pub body_blocked: Vec<BlockedBody>,
+    /// Rejected call positions, including the candidate and peer facts that
+    /// existed before the gate.
     ///
     /// **The callee rides here because the CALLER is the wrong axis for
     /// pricing** (2026-08-12). A refused seam costs the *callee's* conversion —
@@ -1871,7 +2005,7 @@ pub(crate) struct SeamPlan {
     ///
     /// Two names rather than one, because they are two different functions and
     /// collapsing them is what made the question unanswerable.
-    pub blocked: Vec<(LocalDefId, LocalDefId, usize, Span, SeamBlock)>,
+    pub blocked: Vec<BlockedSeam>,
     /// **Ruling item 4a — companion-length coverage**, one row per
     /// length-gated position: `(callee path, pointer param index, evidence)`.
     ///
@@ -1917,6 +2051,48 @@ fn in_census(found: Form, expected: Form) -> bool {
     )
 }
 
+#[derive(Clone)]
+struct Candidate {
+    spec: GlueSpec,
+    family: SeamFamily,
+    replacement: String,
+    len_arm: Option<LenArm>,
+}
+
+fn root_label(
+    labels: &FxHashMap<(LocalDefId, HirId), String>,
+    owner: LocalDefId,
+    root: Option<HirId>,
+) -> String {
+    root.and_then(|hir| labels.get(&(owner, hir)).cloned())
+        .unwrap_or_else(|| "-".to_owned())
+}
+
+fn blocked_call(
+    caller: LocalDefId,
+    callee: LocalDefId,
+    index: usize,
+    span: Span,
+    block: SeamBlock,
+) -> BlockedSeam {
+    BlockedSeam {
+        caller,
+        callee,
+        index,
+        span,
+        block,
+        expected: None,
+        found: None,
+        source_shape: "-",
+        candidate_template: None,
+        null_arm: None,
+        extent_arm: None,
+        root_identity: "-".to_owned(),
+        blind: false,
+        peers: Vec::new(),
+    }
+}
+
 /// Compute every seam adapter the crate needs.
 ///
 /// Driven by the **type-level matrix**: the walk asks [`glue`] about every
@@ -1935,8 +2111,10 @@ pub(crate) fn synthesize(
 
     // subject key -> decision, and (fn, param index) -> subject key.
     let mut decision_of: FxHashMap<(LocalDefId, HirId), &Decision> = FxHashMap::default();
+    let mut labels: FxHashMap<(LocalDefId, HirId), String> = FxHashMap::default();
     for (subject, decision) in &table.entries {
         decision_of.insert((subject.fn_did, subject.hir_id), decision);
+        labels.insert((subject.fn_did, subject.hir_id), subject.label.clone());
     }
     let mut param_key: FxHashMap<(LocalDefId, usize), (LocalDefId, HirId)> = FxHashMap::default();
     for subject in subjects {
@@ -2077,7 +2255,7 @@ pub(crate) fn synthesize(
                     ),
                     // Not an expression this slice can name.
                     ArgShape::NullLit | ArgShape::Cast { .. } | ArgShape::Other => {
-                        plan.blocked.push((
+                        plan.blocked.push(blocked_call(
                             site.caller,
                             *callee,
                             arg.index,
@@ -2095,7 +2273,7 @@ pub(crate) fn synthesize(
                     // blocked above. Fail-closed rather than defaulting to
                     // `arg.span`, which would hand the AST layer a subtree the
                     // replacement was not built from.
-                    plan.blocked.push((
+                    plan.blocked.push(blocked_call(
                         site.caller,
                         *callee,
                         arg.index,
@@ -2119,6 +2297,67 @@ pub(crate) fn synthesize(
                 });
             }
 
+            // ---- pass 1.5: build every candidate BEFORE the site gate ----
+            //
+            // The old tuple receipt was poor because the gate ran before the
+            // only `glue` call. Building here is observational: no AST node is
+            // claimed and no edit is emitted until pass 3.
+            let candidates = positions
+                .iter()
+                .map(|pos| {
+                    let Some(text) = pos.text.as_deref() else {
+                        return Err(SeamBlock::UnnameableOperand);
+                    };
+                    let wants_len = matches!(
+                        (pos.expected, pos.found),
+                        (Form::Slice { .. }, Form::Raw)
+                            | (Form::Opt { slice: true, .. }, Form::Raw)
+                    ) && !pos.literal_null;
+                    let (len_text, len_evidence) = if wants_len {
+                        let arm = length_evidence(tcx, *callee, pos.index);
+                        let companion = match arm {
+                            LenEvidence::Following => Some(pos.index + 1),
+                            LenEvidence::Preceding => pos.index.checked_sub(1),
+                            LenEvidence::Elsewhere | LenEvidence::None => None,
+                        };
+                        (
+                            companion
+                                .and_then(|i| site.args.iter().find(|a| a.index == i))
+                                .and_then(|a| sm.span_to_snippet(a.span).ok()),
+                            Some(arm),
+                        )
+                    } else {
+                        (None, None)
+                    };
+                    let result = if pos.literal_null {
+                        glue_null(pos.expected)
+                    } else {
+                        glue(pos.expected, pos.found, len_text.as_deref())
+                    };
+                    result.and_then(|answer| {
+                        answer
+                            .map(|(spec, family)| {
+                                let replacement =
+                                    spec.render(text).ok_or(SeamBlock::LengthUnknown)?;
+                                let len_arm = spec.len.as_ref().zip(len_evidence).map(|(l, e)| {
+                                    if l.is_fabricated() {
+                                        LenArm::Fabricated(e)
+                                    } else {
+                                        LenArm::Licensed(e)
+                                    }
+                                });
+                                Ok(Candidate {
+                                    spec,
+                                    family,
+                                    replacement,
+                                    len_arm,
+                                })
+                            })
+                            .transpose()
+                    })
+                })
+                .collect::<Vec<_>>();
+
             // ---- pass 2: THE SITE GATES, applied to adapter-generated
             // arguments exactly as to converted ones (ruling item 3) ----
             //
@@ -2133,7 +2372,7 @@ pub(crate) fn synthesize(
                         | Form::Opt { mutable: true, .. }
                 )
             };
-            let mut refused: Vec<usize> = Vec::new();
+            let mut conflicts = vec![Vec::<PeerConflict>::new(); positions.len()];
             for i in 0..positions.len() {
                 for j in (i + 1)..positions.len() {
                     if !positions[i].borrows || !positions[j].borrows {
@@ -2149,131 +2388,64 @@ pub(crate) fn synthesize(
                         (Some(x), Some(y)) if x != y
                     );
                     if same_root || positions[i].blind || positions[j].blind {
-                        refused.push(i);
-                        refused.push(j);
+                        let (left_blind, right_blind) = if positions[i].index <= positions[j].index
+                        {
+                            (positions[i].blind, positions[j].blind)
+                        } else {
+                            (positions[j].blind, positions[i].blind)
+                        };
+                        let conflict = PeerConflict {
+                            left: positions[i].index.min(positions[j].index),
+                            right: positions[i].index.max(positions[j].index),
+                            same_root,
+                            left_blind,
+                            right_blind,
+                        };
+                        conflicts[i].push(conflict.clone());
+                        conflicts[j].push(conflict);
                     }
                 }
             }
 
             // ---- pass 3: emit ----
             for (idx, pos) in positions.iter().enumerate() {
-                if refused.contains(&idx) {
-                    plan.blocked.push((
-                        site.caller,
-                        *callee,
-                        pos.index,
-                        pos.span,
-                        SeamBlock::SiteOverlap,
-                    ));
+                if !conflicts[idx].is_empty() {
+                    let candidate = candidates[idx]
+                        .as_ref()
+                        .ok()
+                        .and_then(|value| value.as_ref());
+                    plan.blocked.push(BlockedSeam {
+                        caller: site.caller,
+                        callee: *callee,
+                        index: pos.index,
+                        span: pos.span,
+                        block: SeamBlock::SiteOverlap,
+                        expected: Some(pos.expected),
+                        found: Some(pos.found),
+                        source_shape: pos.source_shape,
+                        candidate_template: candidate.map(|value| value.spec.template_key()),
+                        null_arm: candidate.map(|value| value.spec.null_arm_key()),
+                        extent_arm: candidate.map(|value| value.spec.extent_arm_key()),
+                        root_identity: root_label(&labels, site.caller, pos.root),
+                        blind: pos.blind,
+                        peers: conflicts[idx].clone(),
+                    });
                     continue;
                 }
-                let Some(text) = pos.text.as_deref() else {
-                    plan.blocked.push((
-                        site.caller,
-                        *callee,
-                        pos.index,
-                        pos.span,
-                        SeamBlock::UnnameableOperand,
-                    ));
-                    continue;
-                };
-                // **Ruling B — the companion length, resolved at the CALL
-                // SITE.** The evidence arm comes from the callee's signature
-                // (which parameter is the integer); the TEXT comes from this
-                // caller's argument in that position. Both are needed: the
-                // signature says where to look, only the site says what is
-                // actually passed.
-                let wants_len = matches!(
-                    (pos.expected, pos.found),
-                    (Form::Slice { .. }, Form::Raw) | (Form::Opt { slice: true, .. }, Form::Raw)
-                ) && !pos.literal_null;
-                let (len_text, len_evidence) = if wants_len {
-                    let arm = length_evidence(tcx, *callee, pos.index);
-                    let companion = match arm {
-                        LenEvidence::Following => Some(pos.index + 1),
-                        LenEvidence::Preceding => pos.index.checked_sub(1),
-                        // Ruling B licenses ADJACENCY ONLY. `Elsewhere` and
-                        // `Absent` stay gated — 93 of the 370 — because a
-                        // non-adjacent integer is not evidence of anything.
-                        LenEvidence::Elsewhere | LenEvidence::None => None,
-                    };
-                    let text = companion
-                        .and_then(|i| site.args.iter().find(|a| a.index == i))
-                        .and_then(|a| sm.span_to_snippet(a.span).ok());
-                    // ⚠ **ONLY THE EVIDENCE TRAVELS FROM HERE** (repaired
-                    // 2026-08-15, adversarial finding ADV-FAB-01). This block
-                    // used to also decide the audit ARM, by a second `match` on
-                    // `text` — and the doc on `SeamLen` claimed the arm and the
-                    // emitted length were "one derivation". They were two
-                    // expressions reading one variable, which agree by
-                    // coincidence and not by construction: forcing this one to
-                    // `Licensed` left every emitted `crate::FALLBACK_SLICE_EXTENT`
-                    // in place while the artifact reported all 370 placements as
-                    // licensed, with the whole suite green.
-                    //
-                    // The arm is now derived from `spec.len` AFTER `glue`
-                    // answers, so the tag and the text have one producer for
-                    // real. What survives here is the SIGNATURE evidence, which
-                    // `glue` genuinely cannot know — `Elsewhere` (a non-adjacent
-                    // integer exists) vs `None` (none does), the derivability
-                    // input bound-verification needs.
-                    (text, Some(arm))
-                } else {
-                    (None, None)
-                };
-                let result = if pos.literal_null {
-                    glue_null(pos.expected)
-                } else {
-                    glue(pos.expected, pos.found, len_text.as_deref())
-                };
-                match result {
+                match &candidates[idx] {
                     Ok(None) => {}
-                    Ok(Some((spec, family))) => {
+                    Ok(Some(candidate)) => {
                         // Rule 1 (2026-08-11): the census is a prioritization
                         // overlay, so a pair with no row is REPORTED, not
                         // refused.
                         if !in_census(pos.found, pos.expected) {
                             plan.uncensused.push((pos.found, pos.expected));
                         }
-                        // **The rendering happens HERE**, over exactly the text
-                        // the arms used to receive. `pos.text_span` is the span
-                        // that text was read from, and it is carried beside the
-                        // string so the AST layer can find the same subtree
-                        // rather than re-deriving which part of the argument the
-                        // span layer kept.
-                        //
-                        // A refusing render blocks under the EXISTING
-                        // `LengthUnknown` key — the same outcome `glue` would
-                        // have produced, so this is not new refusal vocabulary
-                        // (STOP 4). Unreachable today; it exists so that no
-                        // future producer of a spec can route a length-less
-                        // slice adapter into a file.
-                        let Some(replacement) = spec.render(text) else {
-                            plan.blocked.push((
-                                site.caller,
-                                *callee,
-                                pos.index,
-                                pos.span,
-                                SeamBlock::LengthUnknown,
-                            ));
-                            continue;
-                        };
-                        // **THE AUDIT TAG, DERIVED FROM THE SPEC** — the one
-                        // value that also decides the emitted text. A licensed
-                        // placement cannot be reported fabricated, or the
-                        // reverse, without changing what the crate says.
-                        let len_arm = spec.len.as_ref().zip(len_evidence).map(|(l, e)| {
-                            if l.is_fabricated() {
-                                LenArm::Fabricated(e)
-                            } else {
-                                LenArm::Licensed(e)
-                            }
-                        });
                         // The `lengated` census row is keyed on the SPEC too,
                         // for the same reason: it exists to preserve the 42/51
                         // derivability split across fabrication, so it must fire
                         // exactly where fabrication happened.
-                        if let Some(LenArm::Fabricated(e)) = len_arm {
+                        if let Some(LenArm::Fabricated(e)) = candidate.len_arm {
                             plan.length_evidence.push((
                                 tcx.def_path_str(callee.to_def_id()),
                                 pos.index,
@@ -2282,40 +2454,228 @@ pub(crate) fn synthesize(
                         }
                         plan.edits.push(SeamEdit {
                             span: pos.span,
-                            replacement,
+                            replacement: candidate.replacement.clone(),
                             owner_fn: tcx.def_path_str(callee.to_def_id()),
                             caller_fn: tcx.def_path_str(site.caller.to_def_id()),
                             param_index: pos.index,
                             source_shape: pos.source_shape,
-                            family,
-                            len_arm,
-                            spec,
+                            family: candidate.family,
+                            len_arm: candidate.len_arm,
+                            spec: candidate.spec.clone(),
                             arg_span: pos.text_span,
+                            expected: pos.expected,
+                            found: pos.found,
+                            root_identity: root_label(&labels, site.caller, pos.root),
+                            blind: pos.blind,
                         });
                     }
                     Err(block) => {
-                        // **The item-4a push MOVED to the fabrication site**
-                        // (2026-08-12) and does not run here any more: `glue`
-                        // no longer returns `LengthUnknown`, so this arm cannot
-                        // reach it, and a copy left behind would have been a
-                        // second producer of the same census row waiting for
-                        // the day the first one moved.
-                        //
-                        // The only surviving `LengthUnknown` producer is the
-                        // render refusal above, which pushes a `blocked` row and
-                        // no evidence row — correctly, since a refused render
-                        // means the spec had no length at all, which is a
-                        // different fact from "the signature offers none".
-                        debug_assert_ne!(
-                            block,
-                            SeamBlock::LengthUnknown,
-                            "glue must not gate on length after the fabrication ruling"
-                        );
-                        plan.blocked
-                            .push((site.caller, *callee, pos.index, pos.span, block));
+                        plan.blocked.push(BlockedSeam {
+                            caller: site.caller,
+                            callee: *callee,
+                            index: pos.index,
+                            span: pos.span,
+                            block: *block,
+                            expected: Some(pos.expected),
+                            found: Some(pos.found),
+                            source_shape: pos.source_shape,
+                            candidate_template: None,
+                            null_arm: None,
+                            extent_arm: None,
+                            root_identity: root_label(&labels, site.caller, pos.root),
+                            blind: pos.blind,
+                            peers: Vec::new(),
+                        });
                     }
                 }
             }
+        }
+    }
+
+    // Item E wave 2 — scalar-reference body adapters. The allowlist lives in
+    // the HIR producer, so there is no second scope decision here.
+    let mut body_sites = facts.body_adapters.clone();
+    body_sites.sort_by_key(|site| {
+        (
+            site.owner.local_def_index.as_u32(),
+            site.rhs_span.lo().0,
+            site.rhs_span.hi().0,
+        )
+    });
+    for site in body_sites {
+        let Some(destination_decision) = decision_of.get(&(site.owner, site.destination)) else {
+            continue;
+        };
+        let expected = form_of(destination_decision);
+        if !matches!(expected, Form::Ref { .. }) {
+            continue;
+        }
+        let owner_fn = tcx.def_path_str(site.owner.to_def_id());
+        let destination = labels
+            .get(&(site.owner, site.destination))
+            .cloned()
+            .unwrap_or_else(|| format!("{owner_fn}::<unknown-destination>"));
+        if site.side_effecting {
+            plan.body_blocked.push(BlockedBody {
+                owner_fn,
+                destination,
+                span: site.rhs_span,
+                context: site.context,
+                block: BodyBlock::SideEffectingRhs,
+                expected,
+                found: Some(Form::Raw),
+                source_shape: site.shape.key(),
+                candidate_template: None,
+                root_identity: root_label(&labels, site.owner, site.shape.place_root()),
+                blind: true,
+            });
+            continue;
+        }
+
+        let (found, text_span, root, blind) = match site.shape {
+            ArgShape::BareLocal(hir) => (
+                decision_of
+                    .get(&(site.owner, hir))
+                    .map_or(Form::Raw, |decision| form_of(decision)),
+                site.rhs_span,
+                Some(hir),
+                false,
+            ),
+            ArgShape::AddrOf {
+                mutable,
+                base,
+                through_deref,
+            } => {
+                let blind = match (base, through_deref) {
+                    (None, _) => true,
+                    (Some(binding), true) => !decision_of
+                        .get(&(site.owner, binding))
+                        .is_some_and(|decision| !matches!(decision, Decision::Degraded(_))),
+                    (Some(_), false) => false,
+                };
+                (Form::Ref { mutable }, site.rhs_span, base, blind)
+            }
+            ArgShape::AddrOfCast { mutable, inner } => (Form::Ref { mutable }, inner, None, true),
+            ArgShape::CastOfLocal { binding, inner } => (
+                decision_of
+                    .get(&(site.owner, binding))
+                    .map_or(Form::Raw, |decision| form_of(decision)),
+                inner,
+                Some(binding),
+                false,
+            ),
+            ArgShape::NullLit => {
+                plan.body_blocked.push(BlockedBody {
+                    owner_fn,
+                    destination,
+                    span: site.rhs_span,
+                    context: site.context,
+                    block: BodyBlock::NullRequiredRef,
+                    expected,
+                    found: Some(Form::Raw),
+                    source_shape: site.shape.key(),
+                    candidate_template: None,
+                    root_identity: "-".to_owned(),
+                    blind: false,
+                });
+                continue;
+            }
+            ArgShape::RawExpr { .. } | ArgShape::Cast { .. } | ArgShape::Other => {
+                plan.body_blocked.push(BlockedBody {
+                    owner_fn,
+                    destination,
+                    span: site.rhs_span,
+                    context: site.context,
+                    block: BodyBlock::UnnameableRhs,
+                    expected,
+                    found: Some(Form::Raw),
+                    source_shape: site.shape.key(),
+                    candidate_template: None,
+                    root_identity: root_label(&labels, site.owner, site.shape.place_root()),
+                    blind: true,
+                });
+                continue;
+            }
+        };
+        let text = sm.span_to_snippet(text_span).ok();
+        let result = glue(expected, found, None);
+        match result {
+            Ok(None) => {}
+            Ok(Some((spec, family))) => {
+                let Some(text) = text.as_deref() else {
+                    plan.body_blocked.push(BlockedBody {
+                        owner_fn,
+                        destination,
+                        span: site.rhs_span,
+                        context: site.context,
+                        block: BodyBlock::RenderRefused,
+                        expected,
+                        found: Some(found),
+                        source_shape: site.shape.key(),
+                        candidate_template: Some(spec.template_key()),
+                        root_identity: root_label(&labels, site.owner, root),
+                        blind,
+                    });
+                    continue;
+                };
+                let Some(replacement) = spec.render(text) else {
+                    plan.body_blocked.push(BlockedBody {
+                        owner_fn,
+                        destination,
+                        span: site.rhs_span,
+                        context: site.context,
+                        block: BodyBlock::RenderRefused,
+                        expected,
+                        found: Some(found),
+                        source_shape: site.shape.key(),
+                        candidate_template: Some(spec.template_key()),
+                        root_identity: root_label(&labels, site.owner, root),
+                        blind,
+                    });
+                    continue;
+                };
+                plan.body_edits.push(BodyEdit {
+                    span: site.rhs_span,
+                    replacement,
+                    owner_fn,
+                    destination,
+                    context: site.context,
+                    source_shape: site.shape.key(),
+                    family,
+                    spec,
+                    arg_span: text_span,
+                    expected,
+                    found,
+                    root_identity: root_label(&labels, site.owner, root),
+                    blind,
+                });
+            }
+            Err(SeamBlock::SharedToMut) => plan.body_blocked.push(BlockedBody {
+                owner_fn,
+                destination,
+                span: site.rhs_span,
+                context: site.context,
+                block: BodyBlock::SharedToMut,
+                expected,
+                found: Some(found),
+                source_shape: site.shape.key(),
+                candidate_template: None,
+                root_identity: root_label(&labels, site.owner, root),
+                blind,
+            }),
+            Err(_) => plan.body_blocked.push(BlockedBody {
+                owner_fn,
+                destination,
+                span: site.rhs_span,
+                context: site.context,
+                block: BodyBlock::UnnameableRhs,
+                expected,
+                found: Some(found),
+                source_shape: site.shape.key(),
+                candidate_template: None,
+                root_identity: root_label(&labels, site.owner, root),
+                blind,
+            }),
         }
     }
     plan

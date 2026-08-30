@@ -318,6 +318,28 @@ pub(crate) fn plan(
             }),
         }
     }
+    for body in &table.seams.body_edits {
+        match span_to_loc(body.span) {
+            Ok((file, lo, hi)) => by_file.entry(file).or_default().push(Edit {
+                lo,
+                hi,
+                replacement: body.replacement.clone(),
+                justification: Justification::SeamAdapter {
+                    family: match body.family {
+                        super::decision::seam::SeamFamily::Safe => "safe",
+                        super::decision::seam::SeamFamily::Reborrow => "reborrow",
+                    },
+                    fabricated: false,
+                },
+                owner_fn: body.owner_fn.clone(),
+            }),
+            Err(reason) => unplaceable.push(Unplaceable {
+                reason,
+                detail: format!("body adapter for {}", body.destination),
+                subject: body.owner_fn.clone(),
+            }),
+        }
+    }
 
     for (subject, decision) in &table.entries {
         if reverted(subject) {

@@ -261,6 +261,55 @@ pub(crate) struct CallSite {
     pub args: Vec<Arg>,
 }
 
+/// Wave-2's two body positions. Kept beside [`CallSite`] because both are HIR
+/// expression facts consumed by the same adapter synthesizer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum BodyAdapterContext {
+    LocalInitializer,
+    AssignmentRhs,
+}
+
+impl BodyAdapterContext {
+    pub(crate) fn key(self) -> &'static str {
+        match self {
+            Self::LocalInitializer => "local-initializer",
+            Self::AssignmentRhs => "assignment-rhs",
+        }
+    }
+}
+
+/// One exact scalar-reference adapter candidate in an allowlisted function.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct BodyAdapterSite {
+    pub owner: LocalDefId,
+    pub destination: HirId,
+    pub rhs_span: Span,
+    pub shape: ArgShape,
+    pub context: BodyAdapterContext,
+    /// Calls/method calls are deliberately not adapted in wave 2. This bit is
+    /// carried from the HIR classification rather than rediscovered from text.
+    pub side_effecting: bool,
+}
+
+const WAVE2_BODY_FUNCTIONS: &[&str] = &[
+    "src::enc::backward_references_hq::BrotliZopfliCreateCommands",
+    "src::enc::block_splitter::BrotliSplitBlock",
+    "src::enc::block_splitter::CountLiterals",
+    "src::json::json_extract_get_array_size",
+    "src::json::json_extract_get_object_size",
+    "src::json::json_extract_get_string_size",
+    "src::libtree::visited_files_contains",
+    "src::lodepng::color_tree_add",
+];
+
+fn wave2_body_owner(tcx: TyCtxt<'_>, owner: LocalDefId) -> bool {
+    WAVE2_BODY_FUNCTIONS.contains(&tcx.def_path_str(owner.to_def_id()).as_str())
+}
+
+fn body_side_effecting(expr: &Expr<'_>) -> bool {
+    matches!(expr.kind, ExprKind::Call(..) | ExprKind::MethodCall(..))
+}
+
 /// Peel `as` casts to reach the underlying operand.
 ///
 /// C2Rust writes null as `0 as *mut T` but also as `0 as libc::c_int as *mut T`,
@@ -382,6 +431,9 @@ pub(crate) struct EmitabilityFacts {
     /// **The decision layer must not read this at task 0** — the S3.6-0 pattern
     /// that makes zero corpus delta structural rather than lucky.
     pub call_args: FxHashMap<LocalDefId, Vec<CallSite>>,
+    /// Item-E wave 2's exact, allowlisted body positions. An empty entry for a
+    /// ninth function is the scope control; no downstream name filter exists.
+    pub body_adapters: Vec<BodyAdapterSite>,
 }
 
 /// Gather A1 facts for the whole crate in one HIR pass per function body.
@@ -434,7 +486,38 @@ impl BodyFacts<'_, '_> {
 }
 
 impl<'tcx> Visitor<'tcx> for BodyFacts<'_, 'tcx> {
+    fn visit_stmt(&mut self, stmt: &'tcx rustc_hir::Stmt<'tcx>) {
+        if wave2_body_owner(self.tcx, self.fn_did)
+            && let rustc_hir::StmtKind::Let(local) = stmt.kind
+            && matches!(local.pat.kind, rustc_hir::PatKind::Binding(..))
+            && let Some(init) = local.init
+        {
+            self.facts.body_adapters.push(BodyAdapterSite {
+                owner: self.fn_did,
+                destination: local.pat.hir_id,
+                rhs_span: init.span,
+                shape: classify_arg(self.tcx, init),
+                context: BodyAdapterContext::LocalInitializer,
+                side_effecting: body_side_effecting(init),
+            });
+        }
+        rustc_hir::intravisit::walk_stmt(self, stmt);
+    }
+
     fn visit_expr(&mut self, expr: &'tcx Expr<'tcx>) {
+        if wave2_body_owner(self.tcx, self.fn_did)
+            && let ExprKind::Assign(lhs, rhs, _) = expr.kind
+            && let Some(destination) = Self::resolved_local(lhs)
+        {
+            self.facts.body_adapters.push(BodyAdapterSite {
+                owner: self.fn_did,
+                destination,
+                rhs_span: rhs.span,
+                shape: classify_arg(self.tcx, rhs),
+                context: BodyAdapterContext::AssignmentRhs,
+                side_effecting: body_side_effecting(rhs),
+            });
+        }
         match &expr.kind {
             // (1) raw-pointer-only method on a local
             ExprKind::MethodCall(segment, receiver, _, _) => {

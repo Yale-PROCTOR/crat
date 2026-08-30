@@ -1104,6 +1104,18 @@ impl SeamTarget {
             },
         }
     }
+
+    fn of_body(edit: &super::decision::seam::BodyEdit) -> Self {
+        use super::decision::seam::SeamFamily;
+        Self {
+            spec: edit.spec.clone(),
+            arg_span: edit.arg_span,
+            reborrow: match edit.family {
+                SeamFamily::Reborrow => true,
+                SeamFamily::Safe => false,
+            },
+        }
+    }
 }
 
 impl<'a> SeamGraftVisitor<'a> {
@@ -1804,8 +1816,19 @@ fn transform_with(
     let mut seam_contains_use = 0usize;
     let mut use_contains_seam = 0usize;
     let mut seam_use_partial = 0usize;
-    for seam in &table.seams.edits {
-        let (slo, shi) = (seam.span.lo().0, seam.span.hi().0);
+    for (slo, shi) in table
+        .seams
+        .edits
+        .iter()
+        .map(|edit| (edit.span.lo().0, edit.span.hi().0))
+        .chain(
+            table
+                .seams
+                .body_edits
+                .iter()
+                .map(|edit| (edit.span.lo().0, edit.span.hi().0)),
+        )
+    {
         for (ulo, uhi) in uses.keys() {
             let (ulo, uhi) = (*ulo, *uhi);
             seam_pairs += 1;
@@ -2495,6 +2518,17 @@ pub(crate) fn filtered_inputs(
             &mut out.seams,
             (edit.span.lo().0, edit.span.hi().0),
             SeamTarget::of(edit),
+            &mut out.seam_key_collisions,
+        );
+    }
+    for edit in &table.seams.body_edits {
+        if !reverts.keeps(&edit.owner_fn) {
+            continue;
+        }
+        insert_counting(
+            &mut out.seams,
+            (edit.span.lo().0, edit.span.hi().0),
+            SeamTarget::of_body(edit),
             &mut out.seam_key_collisions,
         );
     }
@@ -5014,6 +5048,10 @@ mod arm2_witnesses {
                 len_arm: None,
                 spec: GlueSpec::core(GlueCore::Reborrow, true),
                 arg_span: DUMMY_SP,
+                expected: super::super::decision::seam::Form::Ref { mutable: true },
+                found: super::super::decision::seam::Form::Raw,
+                root_identity: "f::p".to_owned(),
+                blind: false,
             };
             assert!(
                 SeamTarget::of(&edit(super::super::decision::seam::SeamFamily::Reborrow)).reborrow,

@@ -8615,11 +8615,15 @@ mod run {
         let mut adapter_fallback = 0usize;
         let mut adapter_evidence = 0usize;
         let mut adapter_checked_null = 0usize;
+        let mut body_adapter_placed = 0usize;
+        let mut body_adapter_blocked = 0usize;
         for line in adapters.lines().skip(1) {
             let cols = line.split('\t').collect::<Vec<_>>();
             match cols.first().copied() {
                 Some("placed") => adapter_placed += 1,
                 Some("blocked") => adapter_blocked += 1,
+                Some("body-placed") => body_adapter_placed += 1,
+                Some("body-blocked") => body_adapter_blocked += 1,
                 _ => {}
             }
             match cols.get(10).copied() {
@@ -8790,6 +8794,8 @@ mod run {
         row.set("adapter_extent_fallback", adapter_fallback);
         row.set("adapter_extent_evidence", adapter_evidence);
         row.set("adapter_checked_null", adapter_checked_null);
+        row.set("body_adapter_placed", body_adapter_placed);
+        row.set("body_adapter_blocked", body_adapter_blocked);
         row.set("adapter_model_source", "same-decision-table");
         row.set("baseline_keys", capture.baseline_keys);
         row.set("baseline_errors", capture.baseline_errors);
