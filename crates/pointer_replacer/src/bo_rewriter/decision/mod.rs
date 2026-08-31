@@ -33,6 +33,7 @@ pub(crate) mod box_facts;
 pub(crate) mod co_conversion;
 pub(crate) mod construction;
 pub(crate) mod emitability;
+pub(crate) mod lifetime;
 pub(crate) mod seam;
 pub(crate) mod universe;
 
