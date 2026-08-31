@@ -5667,6 +5667,36 @@ fn e2_w3_output_storage_uses_source_not_temp_lifetime() {
     assert_eq!(receipt[0].target, "arg1/deref0/depth1");
 }
 
+/// E2-W1 structural RED — the production AST path must materialize the plan,
+/// not merely let co-conversion skip the return escape.  Separate SCC names
+/// make the accepted source-to-return direction visible as `'a: 'b`.
+#[test]
+fn e2_w1_production_emits_named_signature_lifetimes() {
+    let fixture = Fixture::new(&[(
+        "lib.rs",
+        "#![allow(dead_code, unused_unsafe)]\n\
+         pub unsafe fn id(p: *const i32) -> *const i32 { p }\n",
+    )]);
+    let outcome = super::rewrite_m1_path_a5_injected(
+        &fixture.root(),
+        crate::analyses::borrow_ownership::a5_overlap::A5Mode::PreciseReplay,
+        Some(
+            crate::analyses::borrow_ownership::a5_overlap::WholeProgramAttestation::FrozenBenchmarkGraph,
+        ),
+        &|_| {},
+    );
+    let super::RewriteOutcome::Emitted { files, .. } = outcome else {
+        panic!("E2-W1 production rewrite must survive: {outcome:#?}");
+    };
+    let emitted = files
+        .values()
+        .find(|source| source.contains("fn id"))
+        .expect("emitted E2-W1 function");
+    assert!(emitted.contains("fn id<'a: 'b>"), "{emitted}");
+    assert!(emitted.contains("p: &'a i32"), "{emitted}");
+    assert!(emitted.contains("-> &'b i32"), "{emitted}");
+}
+
 fn receipt_column(receipt: &str, name: &str) -> usize {
     receipt
         .lines()
