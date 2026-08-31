@@ -15918,9 +15918,13 @@ fn box_fact_two_root_determinism() {
         std::env::var_os("CRAT_BOX_ROOT_B").expect("two-root gate requires CRAT_BOX_ROOT_B"),
     );
     assert_ne!(
+        root_a, root_b,
+        "two-root gate requires distinct launch paths"
+    );
+    assert_eq!(
         root_a.canonicalize().expect("canonical root A"),
         root_b.canonicalize().expect("canonical root B"),
-        "two-root gate requires distinct physical roots"
+        "two-root gate must consume one frozen substrate identity"
     );
     let artifact_dir = PathBuf::from(
         std::env::var_os("CRAT_BOX_FACT_ARTIFACT_DIR")
