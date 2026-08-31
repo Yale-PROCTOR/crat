@@ -2124,7 +2124,9 @@ pub(crate) struct SeamPlan {
 /// The form a decision emits.
 fn form_of(decision: &Decision) -> Form {
     match decision {
-        Decision::Ref { mutable } => Form::Ref { mutable: *mutable },
+        Decision::Ref { mutable } | Decision::InferredRef { mutable, .. } => {
+            Form::Ref { mutable: *mutable }
+        }
         Decision::Slice { mutable, .. } => Form::Slice { mutable: *mutable },
         Decision::Opt { mutable, slice, .. } => Form::Opt {
             mutable: *mutable,

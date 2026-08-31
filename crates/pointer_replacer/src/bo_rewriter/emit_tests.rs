@@ -5462,8 +5462,9 @@ fn e2_w7_direct_call_result_local_is_inferred_safe() {
              *q\n\
          }\n",
     )]);
-    let decision = ::utils::compilation::run_compiler_on_path(&fixture.root(), |tcx| {
-        let (table, _) = super::decide_table_with_ctx_config(
+    let (decision, return_permits, inferred_permits, failure) =
+        ::utils::compilation::run_compiler_on_path(&fixture.root(), |tcx| {
+        let (table, ctx) = super::decide_table_with_ctx_config(
             tcx,
             Some((
                 crate::analyses::borrow_ownership::a5_overlap::A5Mode::PreciseReplay,
@@ -5473,12 +5474,18 @@ fn e2_w7_direct_call_result_local_is_inferred_safe() {
             )),
         )
         .expect("E2-W7 decision table");
-        table
+        let (subject, decision) = table
             .entries
             .iter()
             .find(|(subject, _)| subject.label.ends_with("caller::q"))
-            .map(|(_, decision)| decision.clone())
-            .expect("caller::q subject")
+            .expect("caller::q subject");
+        (
+            decision.clone(),
+            ctx.lifetime_eligibility.return_permit_count(),
+            ctx.lifetime_eligibility.inferred_permit_count(),
+            ctx.lifetime_eligibility
+                .failure((subject.fn_did, subject.hir_id)),
+        )
     })
     .expect("E2-W7 fixture compiles before rewriting");
 
@@ -5487,7 +5494,98 @@ fn e2_w7_direct_call_result_local_is_inferred_safe() {
             decision,
             super::decision::Decision::InferredRef { mutable: false, .. }
         ),
-        "{decision:#?}"
+        "decision={decision:#?}; return_permits={return_permits}; \
+         inferred_permits={inferred_permits}; failure={failure:?}"
+    );
+}
+
+/// E2-W7 conservative controls — allocator, foreign, and indirect results may
+/// not acquire an inferred local lifetime merely because their accepted model
+/// happens to contain a reference-shaped slot.
+#[test]
+fn e2_w7_only_a_direct_local_call_result_may_be_inferred_safe() {
+    fn observed(
+        source: &str,
+        suffix: &str,
+    ) -> (
+        super::decision::Decision,
+        Option<super::decision::lifetime::LifetimeFailure>,
+    ) {
+        let fixture = Fixture::new(&[("lib.rs", source)]);
+        ::utils::compilation::run_compiler_on_path(&fixture.root(), |tcx| {
+            let (table, ctx) = super::decide_table_with_ctx_config(
+                tcx,
+                Some((
+                    crate::analyses::borrow_ownership::a5_overlap::A5Mode::PreciseReplay,
+                    Some(
+                        crate::analyses::borrow_ownership::a5_overlap::WholeProgramAttestation::FrozenBenchmarkGraph,
+                    ),
+                )),
+            )
+            .expect("E2-W7 negative decision table");
+            let (subject, decision) = table
+                .entries
+                .iter()
+                .find(|(subject, _)| subject.label.ends_with(suffix))
+                .expect("negative-control subject");
+            (
+                decision.clone(),
+                ctx.lifetime_eligibility
+                    .failure((subject.fn_did, subject.hir_id)),
+            )
+        })
+        .expect("E2-W7 negative fixture compiles before rewriting")
+    }
+
+    let (allocator, _) = observed(
+        "#![allow(dead_code, unused_unsafe)]\n\
+         unsafe extern \"C\" { fn malloc(n: usize) -> *mut core::ffi::c_void; }\n\
+         pub unsafe fn caller() -> *mut i32 {\n\
+             let q = malloc(4) as *mut i32;\n\
+             q\n\
+         }\n",
+        "caller::q",
+    );
+    assert!(
+        !matches!(allocator, super::decision::Decision::InferredRef { .. }),
+        "allocator result gained an inferred lifetime: {allocator:#?}"
+    );
+
+    let (foreign, foreign_failure) = observed(
+        "#![allow(dead_code, unused_unsafe)]\n\
+         unsafe extern \"C\" { fn foreign(p: *const i32) -> *const i32; }\n\
+         pub unsafe fn caller(p: *const i32) -> i32 {\n\
+             let q = foreign(p);\n\
+             *q\n\
+         }\n",
+        "caller::q",
+    );
+    assert!(
+        !matches!(foreign, super::decision::Decision::InferredRef { .. }),
+        "foreign result gained an inferred lifetime: {foreign:#?}"
+    );
+    assert_eq!(
+        foreign_failure,
+        Some(super::decision::lifetime::LifetimeFailure::ExternalContractAbsent)
+    );
+
+    let (indirect, indirect_failure) = observed(
+        "#![allow(dead_code, unused_unsafe)]\n\
+         unsafe fn id(p: *const i32) -> *const i32 { p }\n\
+         pub unsafe fn caller(p: *const i32) -> i32 {\n\
+             let f: unsafe fn(*const i32) -> *const i32 = id;\n\
+             let q = f(p);\n\
+             *q\n\
+         }\n",
+        "caller::q",
+    );
+    assert!(
+        !matches!(indirect, super::decision::Decision::InferredRef { .. }),
+        "indirect result gained an inferred lifetime: {indirect:#?}"
+    );
+    assert_eq!(
+        indirect_failure,
+        Some(super::decision::lifetime::LifetimeFailure::FnPtrWebHeld)
     );
 }
 

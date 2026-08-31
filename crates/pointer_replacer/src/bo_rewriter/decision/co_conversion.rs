@@ -364,7 +364,7 @@ pub(crate) fn build_with_c9_marks_and_lifetimes(
         // shape that once dropped a subject from `emitted_subjects` entirely.
         // A `match` makes the next disposition a compile error here.
         let mutable = match decision {
-            Decision::Ref { mutable } => *mutable,
+            Decision::Ref { mutable } | Decision::InferredRef { mutable, .. } => *mutable,
             Decision::Slice { .. }
             | Decision::Opt { .. }
             | Decision::Box(_)
@@ -382,7 +382,10 @@ pub(crate) fn build_with_c9_marks_and_lifetimes(
         .iter()
         .filter_map(|(subject, decision)| match decision {
             Decision::Slice { .. } | Decision::Opt { .. } => Some((subject.fn_did, subject.hir_id)),
-            Decision::Ref { .. } | Decision::Box(_) | Decision::Degraded(_) => None,
+            Decision::Ref { .. }
+            | Decision::InferredRef { .. }
+            | Decision::Box(_)
+            | Decision::Degraded(_) => None,
         })
         .collect();
     let index: FxHashMap<NodeKey, usize> = order.iter().enumerate().map(|(i, k)| (*k, i)).collect();

@@ -656,6 +656,7 @@ fn rewrite_core_injected(
             // error at this site.
             match decision {
                 decision::Decision::Ref { .. }
+                | decision::Decision::InferredRef { .. }
                 | decision::Decision::Slice { .. }
                 | decision::Decision::Opt { .. }
                 | decision::Decision::Box(_) => {}
@@ -3356,7 +3357,7 @@ fn finish_decide<'tcx>(
         &opt_accessors,
         &opt_fat,
     );
-    let ctx_of = |gate, coconv| decision::Ctx {
+    let ctx_of = |gate, coconv, lifetime_eligibility| decision::Ctx {
         tcx,
         model: &model,
         slots: &slots,
@@ -3370,6 +3371,7 @@ fn finish_decide<'tcx>(
         subjects: &subjects,
         gate,
         coconv,
+        lifetime_eligibility,
     };
 
     // **S3.6-1 task 2 — the co-conversion classes.**
@@ -3386,7 +3388,10 @@ fn finish_decide<'tcx>(
     // task 2 only.** Production has passed `LiftAdaptable` since S3.6-1 and the
     // `BlockAll` variant was deleted at M-3 (X-3). Task 3 is where the verdict
     // reaches a gate.
-    let hypothetical = decision::decide(&ctx_of(decision::RefGate::LiftAdaptable, None), &subjects);
+    let hypothetical = decision::decide(
+        &ctx_of(decision::RefGate::LiftAdaptable, None, None),
+        &subjects,
+    );
     // Escapes are computed BEFORE the classes now: P1 makes them a gate, not a
     // report, so `build` consumes them rather than the census reading them
     // alongside.
@@ -3397,13 +3402,23 @@ fn finish_decide<'tcx>(
         &model,
         analysis.origins.as_ref(),
         &hypothetical,
+        &subjects,
+        &ctors,
         &escapes,
         analysis.attestation,
+    );
+    let e2_hypothetical = decision::decide(
+        &ctx_of(
+            decision::RefGate::LiftAdaptable,
+            None,
+            Some(&lifetime_eligibility),
+        ),
+        &subjects,
     );
     let coconv = decision::co_conversion::build_with_c9_marks_and_lifetimes(
         &facts,
         &subjects,
-        &hypothetical,
+        &e2_hypothetical,
         &escapes,
         decision::co_conversion::OverlapRule::BlindOnly,
         &retained_c9_plans,
@@ -3416,7 +3431,11 @@ fn finish_decide<'tcx>(
     // `referenced` gate, and the class gate then governs every node uniformly.
     // The pinned population still blocks inside `LiftAdaptable`.
     let mut table = decision::decide(
-        &ctx_of(decision::RefGate::LiftAdaptable, Some(&coconv)),
+        &ctx_of(
+            decision::RefGate::LiftAdaptable,
+            Some(&coconv),
+            Some(&lifetime_eligibility),
+        ),
         &subjects,
     );
 
@@ -3452,7 +3471,7 @@ fn finish_decide<'tcx>(
             let local = Local::from_usize(param as usize);
             table.entries.iter().any(|(subject, decision)| {
                 let is_ref = match decision {
-                    decision::Decision::Ref { .. } => true,
+                    decision::Decision::Ref { .. } | decision::Decision::InferredRef { .. } => true,
                     decision::Decision::Slice { .. }
                     | decision::Decision::Opt { .. }
                     | decision::Decision::Box(_)
@@ -3638,6 +3657,7 @@ fn box_mir_drop_policies(
             let plan = match decision {
                 decision::Decision::Box(plan) => plan,
                 decision::Decision::Ref { .. }
+                | decision::Decision::InferredRef { .. }
                 | decision::Decision::Slice { .. }
                 | decision::Decision::Opt { .. }
                 | decision::Decision::Degraded(_) => return None,
@@ -3712,6 +3732,7 @@ pub(crate) fn box_plan_artifact(tcx: TyCtxt<'_>) -> Result<BoxPlanArtifact, Stri
                     "-".to_owned(),
                 ),
                 decision::Decision::Ref { .. }
+                | decision::Decision::InferredRef { .. }
                 | decision::Decision::Slice { .. }
                 | decision::Decision::Opt { .. } => {
                     return Err(format!(
@@ -3774,12 +3795,15 @@ fn e1_subject_family(
         None => "unmodeled",
         Some(SlotKind::Ref) => {
             let form = match decision {
-                decision::Decision::Ref { .. } => Some("ref"),
+                decision::Decision::Ref { .. } | decision::Decision::InferredRef { .. } => {
+                    Some("ref")
+                }
                 decision::Decision::Slice { .. } => Some("slice"),
                 decision::Decision::Opt { .. } => Some("optional"),
                 decision::Decision::Box(_) => Some("box"),
                 decision::Decision::Degraded(_) => match hypothetical {
-                    Some(decision::Decision::Ref { .. }) => Some("ref"),
+                    Some(decision::Decision::Ref { .. })
+                    | Some(decision::Decision::InferredRef { .. }) => Some("ref"),
                     Some(decision::Decision::Slice { .. }) => Some("slice"),
                     Some(decision::Decision::Opt { .. }) => Some("optional"),
                     Some(decision::Decision::Box(_)) => Some("box"),
@@ -3798,6 +3822,7 @@ fn e1_subject_family(
                     _ => "ref",
                 },
                 decision::Decision::Ref { .. }
+                | decision::Decision::InferredRef { .. }
                 | decision::Decision::Slice { .. }
                 | decision::Decision::Opt { .. }
                 | decision::Decision::Box(_) => unreachable!("emitting form mapped above"),
@@ -3856,6 +3881,12 @@ fn e1_subject_seed_tsv(
                 "-".to_owned(),
                 decision::emitability::EmitabilityFacts::site(tcx, subject.attribution_span()),
             ),
+            decision::Decision::InferredRef { callee, .. } => (
+                "inferred-ref",
+                "-",
+                tcx.def_path_str(callee.to_def_id()),
+                decision::emitability::EmitabilityFacts::site(tcx, subject.attribution_span()),
+            ),
             decision::Decision::Slice { .. } => (
                 "slice",
                 "-",
@@ -3890,6 +3921,7 @@ fn e1_subject_seed_tsv(
         let unplaced_reason = unplaced.remove(key.as_str());
         let emits = match decision {
             decision::Decision::Ref { .. }
+            | decision::Decision::InferredRef { .. }
             | decision::Decision::Slice { .. }
             | decision::Decision::Opt { .. }
             | decision::Decision::Box(_) => true,
@@ -4570,6 +4602,7 @@ fn freed_slots_tsv_from(
                 (s.fn_did, s.local),
                 match d {
                     decision::Decision::Ref { .. } => "emitted-ref".to_owned(),
+                    decision::Decision::InferredRef { .. } => "inferred-ref".to_owned(),
                     decision::Decision::Slice { .. } => "emitted-slice".to_owned(),
                     decision::Decision::Opt { slice, .. } => {
                         if *slice {

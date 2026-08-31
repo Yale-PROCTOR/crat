@@ -60,7 +60,7 @@ pub(crate) fn rows(tcx: TyCtxt<'_>, table: &DecisionTable) -> Vec<Row> {
         .map(|(subject, decision)| {
             // EXHAUSTIVE. Adding a `Decision` variant must break this build.
             let (outcome, degrade_reason) = match decision {
-                Decision::Ref { mutable } => (
+                Decision::Ref { mutable } | Decision::InferredRef { mutable, .. } => (
                     if *mutable {
                         Outcome::RefMut
                     } else {

@@ -273,6 +273,7 @@ pub(crate) fn census(tcx: TyCtxt<'_>) -> Result<(Vec<BridgeRow>, IdemStats), Str
             // number the phase gates on.
             decided: match decision {
                 super::decision::Decision::Ref { .. }
+                | super::decision::Decision::InferredRef { .. }
                 | super::decision::Decision::Slice { .. }
                 | super::decision::Decision::Opt { .. }
                 | super::decision::Decision::Box(_) => true,

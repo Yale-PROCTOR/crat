@@ -20,8 +20,9 @@ use rustc_middle::{
 };
 
 use super::{
-    Decision, DecisionTable,
+    Decision, DecisionTable, DegradeReason, Subject,
     co_conversion::{Escape, EscapeKind, NodeKey},
+    construction::{CallResultTarget, Construction, ConstructionFacts},
 };
 use crate::{
     analyses::borrow_ownership::{
@@ -136,6 +137,26 @@ pub(crate) struct ReturnLifetimePermit {
     origin_target: OriginSlot,
 }
 
+/// Evidence that an unannotated local receives a borrowed form from one
+/// lifetime-bearing direct local callee.  Construction is private for the same
+/// reason as [`ReturnLifetimePermit`]: the no-declaration-splice exception is
+/// unavailable without the complete typed proof.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct InferredLifetimePermit {
+    subject: NodeKey,
+    callee: LocalDefId,
+}
+
+impl InferredLifetimePermit {
+    fn new(subject: NodeKey, callee: LocalDefId) -> Self {
+        Self { subject, callee }
+    }
+
+    pub(crate) fn callee(self) -> LocalDefId {
+        self.callee
+    }
+}
+
 impl ReturnLifetimePermit {
     fn new(
         subject: NodeKey,
@@ -168,6 +189,7 @@ impl ReturnLifetimePermit {
 #[derive(Clone, Debug, Default)]
 pub(crate) struct LifetimeEligibility {
     return_permits: FxHashMap<NodeKey, ReturnLifetimePermit>,
+    inferred_permits: FxHashMap<NodeKey, InferredLifetimePermit>,
     failures: FxHashMap<NodeKey, LifetimeFailure>,
 }
 
@@ -178,6 +200,15 @@ impl LifetimeEligibility {
 
     pub(crate) fn return_permit_count(&self) -> usize {
         self.return_permits.len()
+    }
+
+    pub(crate) fn inferred_permit(&self, subject: NodeKey) -> Option<InferredLifetimePermit> {
+        self.inferred_permits.get(&subject).copied()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn inferred_permit_count(&self) -> usize {
+        self.inferred_permits.len()
     }
 
     pub(crate) fn failure(&self, subject: NodeKey) -> Option<LifetimeFailure> {
@@ -193,6 +224,7 @@ impl LifetimeEligibility {
         );
         Self {
             return_permits: [(subject, permit)].into_iter().collect(),
+            inferred_permits: FxHashMap::default(),
             failures: FxHashMap::default(),
         }
     }
@@ -222,6 +254,8 @@ pub(crate) fn derive_return_eligibility(
     model: &FxHashMap<SlotRef, SlotKind>,
     origins: Option<&OriginSummaries>,
     hypothetical: &DecisionTable,
+    subjects: &[Subject],
+    constructions: &ConstructionFacts,
     escapes: &[Escape],
     attestation: Option<WholeProgramAttestation>,
 ) -> LifetimeEligibility {
@@ -327,6 +361,71 @@ pub(crate) fn derive_return_eligibility(
                 result.failures.insert(subject, failure);
             }
         }
+    }
+
+    let return_plan_functions = result
+        .return_permits
+        .values()
+        .map(|permit| permit.function)
+        .collect::<FxHashSet<_>>();
+    for subject in subjects {
+        let key = (subject.fn_did, subject.hir_id);
+        let is_return_residual = decisions.get(&key).is_some_and(|decision| {
+            matches!(
+                decision,
+                Decision::Degraded(record)
+                    if record.reason == DegradeReason::ReturnNotAdapted
+            )
+        });
+        if !is_return_residual || !matches!(subject.ctor, Some(Construction::CallResult)) {
+            continue;
+        }
+        let Some(target) = constructions.call_result_targets.get(&key).copied() else {
+            result
+                .failures
+                .insert(key, LifetimeFailure::ExternalContractAbsent);
+            continue;
+        };
+        let callee = match target {
+            CallResultTarget::DirectLocal(callee) => callee,
+            CallResultTarget::Indirect => {
+                result.failures.insert(key, LifetimeFailure::FnPtrWebHeld);
+                continue;
+            }
+            CallResultTarget::Foreign | CallResultTarget::Unresolved => {
+                result
+                    .failures
+                    .insert(key, LifetimeFailure::ExternalContractAbsent);
+                continue;
+            }
+        };
+        let Ok(web) = &web else {
+            result.failures.insert(key, LifetimeFailure::FnPtrWebHeld);
+            continue;
+        };
+        if web.contains(subject.fn_did) || web.contains(callee) {
+            result.failures.insert(key, LifetimeFailure::FnPtrWebHeld);
+            continue;
+        }
+        let Some(slot) = slots
+            .fn_local_slots
+            .get(&subject.fn_did)
+            .and_then(|universe| universe.slot_for_local_depth(subject.local, 0))
+        else {
+            result.failures.insert(key, LifetimeFailure::OriginConflict);
+            continue;
+        };
+        if model.get(&SlotRef::Local(subject.fn_did, slot)) != Some(&SlotKind::Ref) {
+            result.failures.insert(key, LifetimeFailure::OriginConflict);
+            continue;
+        }
+        if !return_plan_functions.contains(&callee) {
+            result.failures.insert(key, LifetimeFailure::OriginAbsent);
+            continue;
+        }
+        result
+            .inferred_permits
+            .insert(key, InferredLifetimePermit::new(key, callee));
     }
 
     result

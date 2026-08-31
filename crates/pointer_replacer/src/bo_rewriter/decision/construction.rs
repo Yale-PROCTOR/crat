@@ -35,6 +35,7 @@
 use rustc_hash::FxHashMap;
 use rustc_hir::{
     HirId,
+    def::{DefKind, Res},
     def_id::LocalDefId,
     intravisit::{self, Visitor},
 };
@@ -115,6 +116,10 @@ impl Construction {
 #[derive(Default)]
 pub(crate) struct ConstructionFacts {
     pub by_binding: FxHashMap<(LocalDefId, HirId), Construction>,
+    /// Typed target of a non-allocator call-result construction.  This is a
+    /// sidecar rather than payload in [`Construction::CallResult`] so the
+    /// long-lived construction key and all unrelated receipts remain stable.
+    pub call_result_targets: FxHashMap<(LocalDefId, HirId), CallResultTarget>,
     pub init_spans: FxHashMap<(LocalDefId, HirId), rustc_span::Span>,
     pub statement_spans: FxHashMap<(LocalDefId, HirId), rustc_span::Span>,
     pub first_stores: FxHashMap<(LocalDefId, HirId), Vec<FirstStore>>,
@@ -122,6 +127,17 @@ pub(crate) struct ConstructionFacts {
     pub zero_memsets: FxHashMap<(LocalDefId, HirId), Vec<ZeroMemset>>,
     pub owner_overwrites: FxHashMap<(LocalDefId, HirId), Vec<OwnerOverwrite>>,
     pub realloc_calls: FxHashMap<(LocalDefId, HirId), Vec<rustc_span::Span>>,
+}
+
+/// The only call-result target class allowed to license an inferred E2 local
+/// is [`DirectLocal`](Self::DirectLocal).  Every other class stays explicit so
+/// absence of a local callee can never be mistaken for evidence.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CallResultTarget {
+    DirectLocal(LocalDefId),
+    Indirect,
+    Foreign,
+    Unresolved,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -269,6 +285,38 @@ impl Collector<'_, '_> {
             _ => Construction::Other,
         }
     }
+
+    fn call_result_target(&self, init: &rustc_hir::Expr<'_>) -> Option<CallResultTarget> {
+        let e = Self::peel(init);
+        let rustc_hir::ExprKind::Call(callee, _) = &e.kind else {
+            return None;
+        };
+        match &callee.kind {
+            rustc_hir::ExprKind::Path(rustc_hir::QPath::Resolved(_, path)) => match path.res {
+                Res::Def(DefKind::Fn | DefKind::AssocFn, did) => {
+                    Some(if self.tcx.is_mir_available(did) {
+                        did.as_local()
+                            .map(CallResultTarget::DirectLocal)
+                            .unwrap_or(CallResultTarget::Foreign)
+                    } else {
+                        // An `extern` declaration can surface as `DefKind::Fn`
+                        // in this HIR position. Local DefId is therefore not
+                        // body evidence; MIR availability is the fail-closed
+                        // discriminator for a rewrite-owned callee.
+                        CallResultTarget::Foreign
+                    })
+                }
+                Res::Local(_) => Some(CallResultTarget::Indirect),
+                Res::Err => Some(CallResultTarget::Unresolved),
+                Res::Def(..) => Some(CallResultTarget::Foreign),
+                _ => Some(CallResultTarget::Unresolved),
+            },
+            // A call through a local, field, cast, closure, or other computed
+            // expression is indirect even if type checking later identifies a
+            // finite target set. E2-FN deliberately does not rewrite webs.
+            _ => Some(CallResultTarget::Indirect),
+        }
+    }
 }
 
 impl<'tcx> Visitor<'tcx> for Collector<'_, 'tcx> {
@@ -278,6 +326,13 @@ impl<'tcx> Visitor<'tcx> for Collector<'_, 'tcx> {
             && let Some(init) = local.init
         {
             let c = self.classify(init);
+            if matches!(c, Construction::CallResult)
+                && let Some(target) = self.call_result_target(init)
+            {
+                self.facts
+                    .call_result_targets
+                    .insert((self.fn_did, local.pat.hir_id), target);
+            }
             self.facts
                 .by_binding
                 .insert((self.fn_did, local.pat.hir_id), c);

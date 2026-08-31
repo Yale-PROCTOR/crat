@@ -642,6 +642,11 @@ pub(crate) struct Degradation {
 pub(crate) enum Decision {
     /// Emit a reference form: `&T` or `&mut T`.
     Ref { mutable: bool },
+    /// An unannotated local whose borrowed type is supplied by a direct local
+    /// callee's E2 lifetime-bearing return.  It is semantically a reference,
+    /// but deliberately distinct from [`Ref`](Self::Ref): no local type span
+    /// exists and therefore no declaration splice may be planned.
+    InferredRef { mutable: bool, callee: LocalDefId },
     /// **S3.2′-2 — emit a borrowed slice form: `&[T]` or `&mut [T]`.**
     ///
     /// Carries its use-site rewrites, because a slice form is the first M1
@@ -751,6 +756,7 @@ impl DecisionTable {
         self.entries.iter().filter_map(|(_, d)| match d {
             Decision::Degraded(record) => Some(record),
             Decision::Ref { .. }
+            | Decision::InferredRef { .. }
             | Decision::Slice { .. }
             | Decision::Opt { .. }
             | Decision::Box(_) => None,
@@ -807,6 +813,9 @@ pub(crate) struct Ctx<'a, 'tcx> {
     /// hypothetical pass must not consult a verdict derived from itself — and
     /// `Some` on the production pass that consumes them.
     pub(crate) coconv: Option<&'a co_conversion::CoConv>,
+    /// E2's pre-decision typed permits. `None` on the ordinary hypothetical
+    /// comparator; `Some` on the E2-aware hypothetical and final pass.
+    pub(crate) lifetime_eligibility: Option<&'a lifetime::LifetimeEligibility>,
 }
 
 pub(crate) fn decide(ctx: &Ctx<'_, '_>, subjects: &[Subject]) -> DecisionTable {
@@ -962,13 +971,28 @@ fn decide_one(ctx: &Ctx<'_, '_>, subject: &Subject) -> Decision {
     // compile error here, because a form this veto does not name is a form that
     // escapes it.
     match decision {
-        Decision::Ref { .. } | Decision::Slice { .. } | Decision::Opt { .. } | Decision::Box(_) => {
-            degrade(
-                subject,
-                EmitabilityFacts::site(ctx.tcx, subject.attribution_span()),
-                residual_reason(subject.ctor.as_ref()),
-            )
+        Decision::Ref { mutable } => {
+            if let Some(permit) = ctx.lifetime_eligibility.and_then(|eligibility| {
+                eligibility.inferred_permit((subject.fn_did, subject.hir_id))
+            }) {
+                Decision::InferredRef {
+                    mutable,
+                    callee: permit.callee(),
+                }
+            } else {
+                degrade(
+                    subject,
+                    EmitabilityFacts::site(ctx.tcx, subject.attribution_span()),
+                    residual_reason(subject.ctor.as_ref()),
+                )
+            }
         }
+        Decision::InferredRef { .. } => decision,
+        Decision::Slice { .. } | Decision::Opt { .. } | Decision::Box(_) => degrade(
+            subject,
+            EmitabilityFacts::site(ctx.tcx, subject.attribution_span()),
+            residual_reason(subject.ctor.as_ref()),
+        ),
         Decision::Degraded(_) => decision,
     }
 }
@@ -988,6 +1012,7 @@ fn decide_one_ladder(ctx: &Ctx<'_, '_>, subject: &Subject) -> Decision {
         subjects,
         gate,
         coconv,
+        lifetime_eligibility,
     } = ctx;
     let decl_site = EmitabilityFacts::site(tcx, subject.attribution_span());
 
@@ -1202,7 +1227,13 @@ fn decide_one_ladder(ctx: &Ctx<'_, '_>, subject: &Subject) -> Decision {
         // holding. Without this placement 158 subjects would be attributed to a
         // gate that is not blocking them, 121 of them in functions that are not
         // even pinned.
-        if subject.ty_span.is_none() {
+        if subject.ty_span.is_none()
+            && !lifetime_eligibility.is_some_and(|eligibility| {
+                eligibility
+                    .inferred_permit((subject.fn_did, subject.hir_id))
+                    .is_some()
+            })
+        {
             return degrade(subject, decl_site, residual_reason(subject.ctor.as_ref()));
         }
         // **S3.6-1 step 3 — THE CLASS GATE, and it consults `admits`.**

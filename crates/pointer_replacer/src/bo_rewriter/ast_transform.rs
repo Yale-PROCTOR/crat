@@ -1763,6 +1763,9 @@ fn transform_with(
         // population is defined by which disposition was reached.
         let (form, mutable, use_edits) = match decision {
             super::decision::Decision::Ref { mutable } => (DeclForm::Ref, *mutable, None),
+            // Its direct callee's rewritten return type supplies the inferred
+            // local type. No declaration splice exists or is synthesized.
+            super::decision::Decision::InferredRef { .. } => continue,
             super::decision::Decision::Slice { mutable, uses } => {
                 (DeclForm::Slice, *mutable, Some(uses))
             }
@@ -2603,7 +2606,8 @@ pub(crate) fn filtered_inputs(
     };
     for (subject, decision) in &table.entries {
         let use_edits = match decision {
-            super::decision::Decision::Ref { .. } => None,
+            super::decision::Decision::Ref { .. }
+            | super::decision::Decision::InferredRef { .. } => None,
             super::decision::Decision::Slice { uses, .. } => Some(uses),
             super::decision::Decision::Opt { uses, .. } => Some(uses),
             super::decision::Decision::Box(_) => None,
