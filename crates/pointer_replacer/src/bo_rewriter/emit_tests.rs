@@ -131,6 +131,7 @@ const BOX_W1_PREAMBLE: &str = "#![allow(dead_code, unused_unsafe, unused_mut, un
 extern \"C\" {\n\
     fn malloc(size: usize) -> *mut core::ffi::c_void;\n\
     fn calloc(count: usize, size: usize) -> *mut core::ffi::c_void;\n\
+    fn memset(ptr: *mut core::ffi::c_void, value: i32, bytes: usize) -> *mut core::ffi::c_void;\n\
     fn free(ptr: *mut core::ffi::c_void);\n\
 }\n";
 
@@ -217,6 +218,36 @@ fn box_w2_calloc_uses_licensed_slice_extent() {
         !source.contains("FALLBACK_SLICE_EXTENT"),
         "licensed site fabricated: {source}"
     );
+}
+
+#[test]
+fn box_w3_memset_slice_uses_named_fallback_and_deletes_statement() {
+    let src = format!(
+        "{BOX_W1_PREAMBLE}\n\
+         pub unsafe fn f(n: usize) {{\n\
+             let p: *mut i32 = malloc(n * core::mem::size_of::<i32>()) as *mut i32;\n\
+             memset(p as *mut core::ffi::c_void, 0, n * core::mem::size_of::<i32>());\n\
+             free(p as *mut core::ffi::c_void);\n\
+         }}\n"
+    );
+    let super::RewriteOutcome::Emitted { source, .. } = super::rewrite_m1(&src) else {
+        panic!("BOX-W3 fixture must emit");
+    };
+    assert!(source.contains("p: Box<[i32]>"), "{source}");
+    assert!(
+        source.contains("crate::FALLBACK_SLICE_EXTENT"),
+        "fallback arm missing: {source}"
+    );
+    assert_eq!(
+        source.matches("const FALLBACK_SLICE_EXTENT").count(),
+        1,
+        "{source}"
+    );
+    assert!(
+        !source.contains("memset("),
+        "zeroing statement survived: {source}"
+    );
+    assert!(source.contains("drop(p)"), "{source}");
 }
 
 const ROOT_WITH_MODULE: &str = "#![allow(dead_code, unused_unsafe)]\npub mod m;\n";
