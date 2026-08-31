@@ -3486,16 +3486,62 @@ impl DecideCtx {
     }
 }
 
+pub(crate) struct BoxFactArtifacts {
+    pub(crate) endpoints: String,
+    pub(crate) version_sites: String,
+    pub(crate) equations: String,
+    pub(crate) subjects: String,
+    pub(crate) receipt: String,
+}
+
 /// Render the production derive-on-load Box facts for external differential
 /// controls. The derivation itself runs unconditionally in `finish_decide`;
 /// this accessor does not create a second MIR walk.
-pub(crate) fn box_facts_tsv(tcx: TyCtxt<'_>) -> Result<(String, String, String), String> {
+pub(crate) fn box_fact_artifacts(tcx: TyCtxt<'_>) -> Result<BoxFactArtifacts, String> {
     let (_table, ctx) = decide_table_with_ctx(tcx)?;
-    Ok((
-        ctx.box_facts.endpoints_tsv(),
-        ctx.box_facts.version_sites_tsv(),
-        ctx.box_facts.canonical_sha256().to_owned(),
-    ))
+    let mut subject_rows = ctx
+        .subjects
+        .iter()
+        .filter(|subject| e1_subject_model_kind(&ctx, subject) == Some(SlotKind::Owning))
+        .map(|subject| {
+            let owner = tcx.def_path_str(subject.fn_did.to_def_id());
+            let arg_index = match subject.kind {
+                decision::SubjectKind::Param { hir_index } => (hir_index + 1).to_string(),
+                decision::SubjectKind::Local => "-".to_owned(),
+            };
+            (
+                subject.identity_key(&owner),
+                format!(
+                    "{}\t{}\t{}\t{}\t{}",
+                    subject.identity_key(&owner),
+                    owner,
+                    subject.local.as_u32(),
+                    arg_index,
+                    subject.ptr_depth,
+                ),
+            )
+        })
+        .collect::<Vec<_>>();
+    subject_rows.sort_by(|left, right| left.0.cmp(&right.0));
+    let mut subjects = String::from("subject_key\towner_fn\tmir_local\targ_index\tptr_depth\n");
+    for (_, row) in subject_rows {
+        subjects.push_str(&row);
+        subjects.push('\n');
+    }
+    let receipt = format!(
+        "box_fact_schema=box-facts-v1\nbox_fact_sha256={}\nbox_replay_error={}\nbox_endpoints={}\nbox_owning_subjects={}\n",
+        ctx.box_facts.canonical_sha256(),
+        ctx.box_facts.replay_error().unwrap_or("none"),
+        ctx.box_facts.endpoints().len(),
+        subjects.lines().skip(1).count(),
+    );
+    Ok(BoxFactArtifacts {
+        endpoints: ctx.box_facts.endpoints_tsv(),
+        version_sites: ctx.box_facts.version_sites_tsv(),
+        equations: ctx.box_facts.equations_tsv(),
+        subjects,
+        receipt,
+    })
 }
 
 fn e1_subject_model_kind(ctx: &DecideCtx, subject: &decision::Subject) -> Option<SlotKind> {

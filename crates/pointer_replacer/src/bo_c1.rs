@@ -9164,6 +9164,92 @@ mod run {
         row
     }
 
+    /// Box wave-1's derive-on-load fact worker. The explicit cache preflight
+    /// makes a miss terminal for this mode: no solve arm is reachable.
+    pub fn run_box_fact_worker(tcx: TyCtxt<'_>, t_tcx: Duration) -> Row {
+        let started = Instant::now();
+        let mut row = Row::default();
+        let program = collect_program(tcx);
+        let slots = CrateSlots::build(&program);
+        let mode = A5Mode::PreciseReplay;
+        let attestation = Some(WholeProgramAttestation::FrozenBenchmarkGraph);
+        let fingerprint = model_cache::fingerprint(&program, mode, attestation);
+        row.set("fingerprint", &fingerprint);
+        if model_cache::load(tcx, &program, &slots, mode, attestation).is_none() {
+            row.set("status", "cache-miss");
+            row.set("cache_status", "miss");
+            row.set("solve_wall_s", "0.000000");
+            row.set("t_tcx_s", secs(t_tcx));
+            row.set("t_total_s", secs(started.elapsed() + t_tcx));
+            return row;
+        }
+
+        let artifacts = match crate::bo_rewriter::box_fact_artifacts(tcx) {
+            Ok(artifacts) => artifacts,
+            Err(error) => {
+                row.set("status", "instrument-error");
+                row.set("detail", super::report::sanitize(&error));
+                row.set("cache_status", "hit");
+                row.set("solve_wall_s", "0.000000");
+                row.set("t_tcx_s", secs(t_tcx));
+                row.set("t_total_s", secs(started.elapsed() + t_tcx));
+                return row;
+            }
+        };
+        let name = std::env::var("CRAT_BOC1_NAME").unwrap_or_else(|_| "unnamed".to_owned());
+        let directory = std::env::var_os("CRAT_BOX_FACT_ARTIFACT_DIR")
+            .map(std::path::PathBuf::from)
+            .expect("Box fact worker requires CRAT_BOX_FACT_ARTIFACT_DIR");
+        std::fs::create_dir_all(&directory).expect("create Box fact artifact directory");
+        for (suffix, contents) in [
+            ("endpoints.tsv", artifacts.endpoints.as_str()),
+            ("version-sites.tsv", artifacts.version_sites.as_str()),
+            ("equations.tsv", artifacts.equations.as_str()),
+            ("subjects.tsv", artifacts.subjects.as_str()),
+            ("receipt.txt", artifacts.receipt.as_str()),
+        ] {
+            std::fs::write(directory.join(format!("{name}.{suffix}")), contents)
+                .unwrap_or_else(|error| panic!("write Box fact {suffix}: {error}"));
+        }
+
+        let mut endpoints = 0usize;
+        let mut active = 0usize;
+        let mut active_sources = 0usize;
+        let mut active_sinks = 0usize;
+        let mut unknown = 0usize;
+        for line in artifacts.endpoints.lines().skip(1) {
+            let fields = line.split('\t').collect::<Vec<_>>();
+            assert_eq!(fields.len(), 11, "Box endpoint schema: {line}");
+            endpoints += 1;
+            if fields[9] == "active" {
+                active += 1;
+                active_sources += usize::from(fields[0] == "Source");
+                active_sinks += usize::from(fields[0] == "Sink");
+            }
+            unknown += usize::from(fields[9] == "unknown");
+        }
+        let solve = model_cache::last_solve().expect("Box fact cache provenance");
+        assert_eq!(solve.source, "cache");
+        assert_eq!(solve.cache_status, "hit");
+        assert_eq!(solve.solve_secs, 0.0);
+        row.set("status", "ok");
+        row.set("cache_status", "hit");
+        row.set("solve_wall_s", "0.000000");
+        row.set("model_sha256", &solve.model_sha256);
+        row.set("box_endpoints", endpoints);
+        row.set("box_active_endpoints", active);
+        row.set("box_active_sources", active_sources);
+        row.set("box_active_sinks", active_sinks);
+        row.set("box_unknown_endpoints", unknown);
+        row.set(
+            "box_owning_subjects",
+            artifacts.subjects.lines().skip(1).count(),
+        );
+        row.set("t_tcx_s", secs(t_tcx));
+        row.set("t_total_s", secs(started.elapsed() + t_tcx));
+        row
+    }
+
     /// **S2b.0 — full M1 pipeline on one program.** decide → plan → apply →
     /// verify, whole-crate gate, temp copies only.
     ///
@@ -15544,6 +15630,282 @@ fn e1_revert_census_corpus() {
     fs::write(artifact_dir.join("e1-results.kv"), summary).expect("write E1 corpus rows");
 }
 
+#[test]
+#[ignore = "Box wave-1: cache-only 20-program endpoint/subject differential"]
+fn box_fact_differential_corpus() {
+    use std::{
+        collections::{BTreeMap, BTreeSet},
+        fs,
+        path::PathBuf,
+        time::Duration,
+    };
+
+    fn key(parts: &[&str]) -> String {
+        parts.join("\u{1f}")
+    }
+
+    let root = orchestrate::workspace_root();
+    let artifact_dir = PathBuf::from(
+        std::env::var_os("CRAT_BOX_FACT_ARTIFACT_DIR")
+            .expect("Box differential requires CRAT_BOX_FACT_ARTIFACT_DIR"),
+    );
+    let cache_dir = PathBuf::from(
+        std::env::var_os("CRAT_BO_CACHE_DIR").expect("Box differential requires CRAT_BO_CACHE_DIR"),
+    );
+    let endpoint_control = PathBuf::from(
+        std::env::var_os("CRAT_BOX_T2_CONTROL")
+            .expect("Box differential requires CRAT_BOX_T2_CONTROL"),
+    );
+    let subject_control = PathBuf::from(
+        std::env::var_os("CRAT_BOX_SUBJECT_CONTROL")
+            .expect("Box differential requires CRAT_BOX_SUBJECT_CONTROL"),
+    );
+    fs::create_dir_all(&artifact_dir).expect("create Box differential artifact dir");
+    let timeout = Duration::from_secs(14_400);
+    let mut program_rows = Vec::new();
+    for program in CORPUS {
+        let input = program.input_path(&root);
+        let outcome = orchestrate::run_child_env(
+            program.name,
+            &input,
+            "box-facts",
+            timeout,
+            &[
+                ("CRAT_BO_CACHE", "1".to_owned()),
+                ("CRAT_BO_CACHE_DIR", cache_dir.display().to_string()),
+                (
+                    "CRAT_BO_A5_ATTESTATION",
+                    "frozen_benchmark_graph".to_owned(),
+                ),
+                (
+                    "CRAT_BOX_FACT_ARTIFACT_DIR",
+                    artifact_dir.display().to_string(),
+                ),
+            ],
+        );
+        let mut row = outcome.row.unwrap_or_else(|| {
+            panic!(
+                "{} produced no Box fact row: status={} note={}",
+                program.name, outcome.status, outcome.note
+            )
+        });
+        row.set("program", program.name);
+        row.set("worker_wall_s", format!("{:.3}", outcome.wall_s));
+        row.set("peak_rss_kb", outcome.peak_rss_kb);
+        assert_eq!(row.get("status"), Some("ok"), "{row:?}");
+        assert_eq!(row.get("cache_status"), Some("hit"), "{row:?}");
+        assert_eq!(row.get("solve_wall_s"), Some("0.000000"), "{row:?}");
+        eprintln!(
+            "BOX-FACT program={} stage=complete rc=0 wall={:.3} rss={} digest={}",
+            program.name,
+            outcome.wall_s,
+            outcome.peak_rss_kb,
+            row.get("fingerprint").unwrap_or("missing"),
+        );
+        program_rows.push(row);
+    }
+
+    let mut expected = BTreeMap::<String, String>::new();
+    let control = fs::read_to_string(&endpoint_control).expect("read T2 endpoint control");
+    for line in control.lines().skip(1) {
+        let fields = line.split('\t').collect::<Vec<_>>();
+        assert_eq!(fields.len(), 14, "T2 control schema: {line}");
+        let endpoint_key = key(&[
+            fields[0], fields[2], fields[3], fields[4], fields[5], fields[6], fields[8],
+        ]);
+        assert!(
+            expected
+                .insert(endpoint_key, fields[10].to_owned())
+                .is_none(),
+            "duplicate T2 control endpoint: {line}"
+        );
+    }
+    assert_eq!(expected.len(), 350);
+
+    let mut derived = BTreeMap::<String, (String, String)>::new();
+    for program in CORPUS {
+        let input =
+            fs::read_to_string(artifact_dir.join(format!("{}.endpoints.tsv", program.name)))
+                .unwrap_or_else(|error| panic!("read {} Box endpoints: {error}", program.name));
+        for line in input.lines().skip(1) {
+            let fields = line.split('\t').collect::<Vec<_>>();
+            assert_eq!(fields.len(), 11, "derived endpoint schema: {line}");
+            let endpoint_key = key(&[
+                program.name,
+                fields[0],
+                fields[1],
+                fields[2],
+                fields[3],
+                fields[4],
+                fields[6],
+            ]);
+            let state = if fields[9] == "active" {
+                "active"
+            } else if fields[9].starts_with("inactive-") {
+                "retracted"
+            } else {
+                fields[9]
+            };
+            assert!(
+                derived
+                    .insert(endpoint_key, (state.to_owned(), fields[10].to_owned()))
+                    .is_none(),
+                "duplicate derived endpoint: {line}"
+            );
+        }
+    }
+
+    let mut divergence = String::from(
+        "program\trole\tfunction\tblock\tstatement\tcallee\tslot\texpected_state\tderived_state\tunknown_reason\tdivergence\n",
+    );
+    let all_keys = expected
+        .keys()
+        .chain(derived.keys())
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let mut divergence_count = 0usize;
+    for endpoint_key in all_keys {
+        let expected_state = expected
+            .get(&endpoint_key)
+            .map(String::as_str)
+            .unwrap_or("missing");
+        let (derived_state, unknown_reason) = derived
+            .get(&endpoint_key)
+            .map(|(state, reason)| (state.as_str(), reason.as_str()))
+            .unwrap_or(("missing", "endpoint-not-derived"));
+        if expected_state == derived_state {
+            continue;
+        }
+        divergence_count += 1;
+        let fields = endpoint_key.split('\u{1f}').collect::<Vec<_>>();
+        assert_eq!(fields.len(), 7);
+        let class = match (expected_state, derived_state) {
+            ("missing", _) => "production-only",
+            (_, "missing") => "control-only",
+            _ => "state-mismatch",
+        };
+        divergence.push_str(&format!(
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+            fields[0],
+            fields[1],
+            fields[2],
+            fields[3],
+            fields[4],
+            fields[5],
+            fields[6],
+            expected_state,
+            derived_state,
+            unknown_reason,
+            class,
+        ));
+    }
+    fs::write(
+        artifact_dir.join("active-endpoint-divergence.tsv"),
+        &divergence,
+    )
+    .expect("write active endpoint divergence");
+
+    let expected_subjects = fs::read_to_string(&subject_control)
+        .expect("read 57-subject control")
+        .lines()
+        .skip(1)
+        .map(|line| {
+            let fields = line.split('\t').collect::<Vec<_>>();
+            assert_eq!(fields.len(), 11, "57-subject control schema: {line}");
+            key(&[fields[0], fields[1]])
+        })
+        .collect::<BTreeSet<_>>();
+    assert_eq!(expected_subjects.len(), 57);
+    let mut derived_subjects = BTreeSet::new();
+    for program in CORPUS {
+        let input = fs::read_to_string(artifact_dir.join(format!("{}.subjects.tsv", program.name)))
+            .unwrap_or_else(|error| panic!("read {} Box subjects: {error}", program.name));
+        for line in input.lines().skip(1) {
+            let fields = line.split('\t').collect::<Vec<_>>();
+            assert_eq!(fields.len(), 5, "derived subject schema: {line}");
+            assert!(derived_subjects.insert(key(&[program.name, fields[0]])));
+        }
+    }
+    let missing_subjects = expected_subjects
+        .difference(&derived_subjects)
+        .cloned()
+        .collect::<Vec<_>>();
+    let extra_subjects = derived_subjects
+        .difference(&expected_subjects)
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut subject_diff = String::from("identity\tdirection\n");
+    for identity in &missing_subjects {
+        subject_diff.push_str(&format!(
+            "{}\tcontrol-only\n",
+            identity.replace('\u{1f}', "\t")
+        ));
+    }
+    for identity in &extra_subjects {
+        subject_diff.push_str(&format!(
+            "{}\tproduction-only\n",
+            identity.replace('\u{1f}', "\t")
+        ));
+    }
+    fs::write(
+        artifact_dir.join("box-subject-divergence.tsv"),
+        subject_diff,
+    )
+    .expect("write Box subject divergence");
+
+    let active = derived
+        .values()
+        .filter(|(state, _)| state == "active")
+        .count();
+    let active_sources = derived
+        .iter()
+        .filter(|(key, (state, _))| {
+            key.split('\u{1f}').nth(1) == Some("Source") && state == "active"
+        })
+        .count();
+    let active_sinks = active - active_sources;
+    let summary = format!(
+        "status={}\ndata={}\nprograms=20/20\ncache_hits=20/20\nsolver_seconds=0\nendpoints={}\nactive={}\nactive_sources={}\nactive_sinks={}\nendpoint_divergence={}\nowning_subjects={}\nsubject_missing={}\nsubject_extra={}\n",
+        if divergence_count == 0 && missing_subjects.is_empty() && extra_subjects.is_empty() {
+            "complete"
+        } else {
+            "differential-stop"
+        },
+        divergence_count == 0 && missing_subjects.is_empty() && extra_subjects.is_empty(),
+        derived.len(),
+        active,
+        active_sources,
+        active_sinks,
+        divergence_count,
+        derived_subjects.len(),
+        missing_subjects.len(),
+        extra_subjects.len(),
+    );
+    fs::write(artifact_dir.join("differential-receipt.txt"), summary)
+        .expect("write Box differential receipt");
+    fs::write(
+        artifact_dir.join("per-program.kv"),
+        program_rows
+            .iter()
+            .map(report::to_kv_line)
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n",
+    )
+    .expect("write Box program rows");
+
+    assert_eq!(derived.len(), 350, "endpoint population drift");
+    assert_eq!((active, active_sources, active_sinks), (61, 30, 31));
+    assert_eq!(
+        divergence_count, 0,
+        "Box active-endpoint differential fired; see active-endpoint-divergence.tsv"
+    );
+    assert!(
+        missing_subjects.is_empty() && extra_subjects.is_empty(),
+        "57-subject identity differential fired; see box-subject-divergence.tsv"
+    );
+}
+
 /// **A panic is a failure; a resource deferral is an absence** (R8, 2026-08-15).
 ///
 /// Lifted out of the sweep because a decision only a 600 s corpus run can
@@ -15850,6 +16212,7 @@ fn boc1_run_one() {
             | "s23-probe"
             | "t1-origin-caller"
             | "e1-revert-census"
+            | "box-facts"
     ) || mode.starts_with("selector-detail-")
     {
         z3::set_global_param("smt.random_seed", "0");
@@ -16025,6 +16388,7 @@ fn boc1_run_one() {
             "prod-box" => run::run_prod_box(tcx, t_tcx),
             "m1-census" => run::run_m1_census(tcx, t_tcx),
             "e1-cache-preflight" => run::run_e1_cache_preflight(tcx, t_tcx),
+            "box-facts" => run::run_box_fact_worker(tcx, t_tcx),
             "substrate-sanity" => run::run_substrate_sanity(tcx, t_tcx),
             "free-overlap" => run::run_free_overlap(tcx, t_tcx),
             "use-census" => run::run_use_census(tcx, t_tcx),

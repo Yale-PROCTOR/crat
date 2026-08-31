@@ -679,6 +679,51 @@ impl BoxOwnershipFacts {
         self.replay_error.as_deref()
     }
 
+    pub(crate) fn equations_tsv(&self) -> String {
+        let mut rows = self
+            .equations
+            .iter()
+            .map(|equation| match *equation {
+                RecordedEquation::Linear {
+                    left,
+                    right,
+                    result,
+                } => format!(
+                    "linear\t{}\t{}\t{}\t-",
+                    left.as_u32(),
+                    right.as_u32(),
+                    result.as_u32()
+                ),
+                RecordedEquation::Assume { var, value } => {
+                    format!("assume\t{}\t-\t-\t{}", var.as_u32(), u8::from(value))
+                }
+                RecordedEquation::Equal { left, right } => {
+                    format!("equal\t{}\t{}\t-\t-", left.as_u32(), right.as_u32())
+                }
+                RecordedEquation::LessEqual { left, right } => {
+                    format!("less-equal\t{}\t{}\t-\t-", left.as_u32(), right.as_u32())
+                }
+                RecordedEquation::EqMin {
+                    result,
+                    left,
+                    right,
+                } => format!(
+                    "eq-min\t{}\t{}\t{}\t-",
+                    result.as_u32(),
+                    left.as_u32(),
+                    right.as_u32()
+                ),
+            })
+            .collect::<Vec<_>>();
+        rows.sort();
+        let mut output = String::from("relation\tx\ty\tz\tvalue\n");
+        for row in rows {
+            output.push_str(&row);
+            output.push('\n');
+        }
+        output
+    }
+
     fn canonical_bytes(&self) -> Vec<u8> {
         let mut bytes = render_equations(&self.equations).into_bytes();
         bytes.extend(self.version_sites_tsv().bytes());
