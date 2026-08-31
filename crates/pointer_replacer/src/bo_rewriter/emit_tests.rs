@@ -5793,6 +5793,59 @@ fn e2_w6_lifetime_callee_keeps_adapter_one_evaluation() {
     assert_eq!(emitted.matches("source()").count(), 2, "{emitted}");
 }
 
+/// E2-N3/N4 RED — boundary and field tranches stay closed, but their refusal
+/// is typed by E2 rather than disappearing behind the ordinary degradation.
+#[test]
+fn e2_n3_n4_external_and_field_rows_are_loudly_held() {
+    fn held(source: &str, suffix: &str) -> super::decision::lifetime::LifetimeFailure {
+        let fixture = Fixture::new(&[("lib.rs", source)]);
+        ::utils::compilation::run_compiler_on_path(&fixture.root(), |tcx| {
+            let (table, ctx) = super::decide_table_with_ctx_config(
+                tcx,
+                Some((
+                    crate::analyses::borrow_ownership::a5_overlap::A5Mode::PreciseReplay,
+                    Some(
+                        crate::analyses::borrow_ownership::a5_overlap::WholeProgramAttestation::FrozenBenchmarkGraph,
+                    ),
+                )),
+            )
+            .expect("E2-N3/N4 decision table");
+            let (subject, decision) = table
+                .entries
+                .iter()
+                .find(|(subject, _)| subject.label.ends_with(suffix))
+                .expect("held subject");
+            assert!(
+                matches!(decision, super::decision::Decision::Degraded(_)),
+                "held tranche emitted: {decision:#?}"
+            );
+            ctx.lifetime_eligibility
+                .failure((subject.fn_did, subject.hir_id))
+                .expect("held row must carry an E2 failure")
+        })
+        .expect("E2-N3/N4 fixture compiles before rewriting")
+    }
+
+    assert_eq!(
+        held(
+            "#![allow(dead_code, unused_unsafe)]\n\
+             unsafe extern \"C\" { fn retain(p: *const i32); }\n\
+             pub unsafe fn f(p: *const i32) { retain(p); }\n",
+            "f::p",
+        ),
+        super::decision::lifetime::LifetimeFailure::ExternalContractAbsent,
+    );
+    assert_eq!(
+        held(
+            "#![allow(dead_code, unused_unsafe)]\n\
+             pub struct Holder { pub p: *const i32 }\n\
+             pub unsafe fn f(h: *mut Holder, p: *const i32) { (*h).p = p; }\n",
+            "f::p",
+        ),
+        super::decision::lifetime::LifetimeFailure::FieldHeld,
+    );
+}
+
 fn receipt_column(receipt: &str, name: &str) -> usize {
     receipt
         .lines()
