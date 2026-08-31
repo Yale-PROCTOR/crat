@@ -166,7 +166,6 @@ enum SinkCarrierReason {
     ProjectionBase,
     MissingDef,
     MissingVersionSite,
-    Cycle,
 }
 
 impl SinkCarrierReason {
@@ -177,7 +176,6 @@ impl SinkCarrierReason {
             SinkCarrierReason::ProjectionBase => "sink-carrier-projection-base",
             SinkCarrierReason::MissingDef => "sink-carrier-missing-def",
             SinkCarrierReason::MissingVersionSite => "sink-carrier-version-site-missing",
-            SinkCarrierReason::Cycle => "sink-carrier-cycle",
         }
     }
 }
@@ -385,30 +383,102 @@ struct CarrierPresentation {
     slot: SlotRef,
 }
 
+/// The r3-accepted endpoint-naming domain: exactly eliminable argument-0
+/// temporaries of known ForeignC Sink calls. This type is intentionally not
+/// interchangeable with [`BoxMoveTemps`].
+#[derive(Default)]
+struct SinkNamingTemps(FxHashSet<Local>);
+
+impl SinkNamingTemps {
+    fn from_seeds(seeds: impl IntoIterator<Item = Local>) -> Self {
+        Self(seeds.into_iter().collect())
+    }
+
+    fn contains(&self, local: Local) -> bool {
+        self.0.contains(&local)
+    }
+}
+
+/// The widened copy-transparent domain used by Box responsibility/move
+/// routing. It may recursively include a carrier that endpoint naming must not
+/// inspect.
+#[derive(Default)]
+struct BoxMoveTemps(FxHashSet<Local>);
+
+impl BoxMoveTemps {
+    fn closed_from_seeds(
+        seeds: impl IntoIterator<Item = Local>,
+        definitions: &IndexVec<Local, Option<SinkCarrierDef>>,
+        is_transparent: impl Fn(Local) -> bool,
+    ) -> Self {
+        let mut values = seeds.into_iter().collect::<FxHashSet<_>>();
+        let mut pending = values.iter().copied().collect::<Vec<_>>();
+        while let Some(local) = pending.pop() {
+            if let Some(SinkCarrierDef::Copy(carrier)) = definitions[local]
+                && is_transparent(carrier)
+                && values.insert(carrier)
+            {
+                pending.push(carrier);
+            }
+        }
+        Self(values)
+    }
+
+    fn contains(&self, local: Local) -> bool {
+        self.0.contains(&local)
+    }
+}
+
+#[derive(Default)]
+struct SinkNamingPresentations(FxHashMap<Local, CarrierPresentation>);
+
+impl SinkNamingPresentations {
+    fn insert(&mut self, local: Local, presentation: CarrierPresentation) {
+        self.0.insert(local, presentation);
+    }
+
+    fn get(&self, local: Local) -> Option<&CarrierPresentation> {
+        self.0.get(&local)
+    }
+}
+
+#[derive(Default)]
+struct BoxMovePresentations(FxHashMap<Local, CarrierPresentation>);
+
+impl BoxMovePresentations {
+    fn insert(&mut self, local: Local, presentation: CarrierPresentation) {
+        self.0.insert(local, presentation);
+    }
+
+    fn get(&self, local: Local) -> Option<&CarrierPresentation> {
+        self.0.get(&local)
+    }
+}
+
+fn resolve_sink_naming_carrier(
+    operand: Local,
+    naming: &SinkNamingTemps,
+    definitions: &IndexVec<Local, Option<SinkCarrierDef>>,
+) -> Result<Local, SinkCarrierReason> {
+    resolve_sink_carrier(operand, naming.contains(operand), definitions[operand])
+}
+
 fn resolve_sink_presentation(
     operand: Local,
     direct: CarrierPresentation,
-    eliminable: &rustc_index::bit_set::MixedBitSet<Local>,
+    naming: &SinkNamingTemps,
     definitions: &IndexVec<Local, Option<SinkCarrierDef>>,
-    presentations: &FxHashMap<Local, CarrierPresentation>,
+    presentations: &SinkNamingPresentations,
 ) -> Result<CarrierPresentation, SinkCarrierReason> {
-    let mut current = operand;
-    let mut resolved = direct;
-    let mut seen = FxHashSet::default();
-    while eliminable.contains(current) {
-        if !seen.insert(current) {
-            return Err(SinkCarrierReason::Cycle);
-        }
-        let carrier = resolve_sink_carrier(current, true, definitions[current])?;
-        let presentation = presentations
-            .get(&current)
-            .copied()
-            .filter(|presentation| presentation.carrier == carrier)
-            .ok_or(SinkCarrierReason::MissingVersionSite)?;
-        resolved = presentation;
-        current = carrier;
+    let carrier = resolve_sink_naming_carrier(operand, naming, definitions)?;
+    if carrier == operand {
+        return Ok(direct);
     }
-    Ok(resolved)
+    presentations
+        .get(operand)
+        .copied()
+        .filter(|presentation| presentation.carrier == carrier)
+        .ok_or(SinkCarrierReason::MissingVersionSite)
 }
 
 fn record_sink_definition(
@@ -465,7 +535,12 @@ struct MinimalWalk<'a, 'tcx> {
     version_sites: Vec<VersionSite>,
     candidates: Vec<EndpointCandidate>,
     var_slots: FxHashMap<Var, SlotRef>,
+    /// Source-level ownership transfers; these alone participate in the
+    /// branching/ambiguity guard.
     move_edges: Vec<(SlotRef, SlotRef)>,
+    /// Eliminable argument-carrier projections. They extend reachability to
+    /// the r3 endpoint name but never create a second ownership branch.
+    transparent_move_edges: Vec<(SlotRef, SlotRef)>,
     field_held: FxHashSet<SlotRef>,
     boundary_held: FxHashSet<SlotRef>,
 }
@@ -486,6 +561,7 @@ impl<'a, 'tcx> MinimalWalk<'a, 'tcx> {
             candidates: Vec::new(),
             var_slots: FxHashMap::default(),
             move_edges: Vec::new(),
+            transparent_move_edges: Vec::new(),
             field_held: FxHashSet::default(),
             boundary_held: FxHashSet::default(),
         }
@@ -549,12 +625,13 @@ impl<'a, 'tcx> MinimalWalk<'a, 'tcx> {
         let function_path = self.program.tcx.def_path_str(fn_did.to_def_id());
         let eliminable = eliminable_temporaries(body);
         let sink_definitions = sink_carrier_definitions(body);
-        let mut transparent_argument_temps = FxHashSet::default();
+        let mut sink_naming_seeds = FxHashSet::default();
+        let mut box_move_seeds = FxHashSet::default();
         for data in body.basic_blocks.iter() {
             let Some(terminator) = data.terminator.as_ref() else {
                 continue;
             };
-            let TerminatorKind::Call { args, .. } = &terminator.kind else {
+            let TerminatorKind::Call { func, args, .. } = &terminator.kind else {
                 continue;
             };
             for local in args
@@ -563,22 +640,29 @@ impl<'a, 'tcx> MinimalWalk<'a, 'tcx> {
                 .filter_map(|place| place.as_local())
                 .filter(|local| eliminable.contains(*local))
             {
-                transparent_argument_temps.insert(local);
+                box_move_seeds.insert(local);
             }
-        }
-        let mut pending = transparent_argument_temps
-            .iter()
-            .copied()
-            .collect::<Vec<_>>();
-        while let Some(local) = pending.pop() {
-            if let Some(SinkCarrierDef::Copy(carrier)) = sink_definitions[local]
-                && eliminable.contains(carrier)
-                && transparent_argument_temps.insert(carrier)
+            let is_sink = foreign_callee_name(self.program, func)
+                .as_deref()
+                .and_then(|name| boundary_table::lookup(name, Matcher::ForeignC))
+                .is_some_and(|entry| entry.roles.contains(&Role::Sink));
+            if is_sink
+                && let Some(local) = args
+                    .first()
+                    .and_then(|arg| arg.node.place())
+                    .and_then(|place| place.as_local())
+                && eliminable.contains(local)
             {
-                pending.push(carrier);
+                sink_naming_seeds.insert(local);
             }
         }
-        let mut carrier_presentations = FxHashMap::<Local, CarrierPresentation>::default();
+        let sink_naming_temps = SinkNamingTemps::from_seeds(sink_naming_seeds);
+        let box_move_temps =
+            BoxMoveTemps::closed_from_seeds(box_move_seeds, &sink_definitions, |local| {
+                eliminable.contains(local)
+            });
+        let mut sink_naming_presentations = SinkNamingPresentations::default();
+        let mut box_move_presentations = BoxMovePresentations::default();
         let mut current = FxHashMap::<Local, Var>::default();
         for local in body.local_decls.indices() {
             if let Some(slot) = self.slot_for_local(fn_did, local) {
@@ -611,7 +695,7 @@ impl<'a, 'tcx> MinimalWalk<'a, 'tcx> {
                     }
                     continue;
                 };
-                if transparent_argument_temps.contains(&lhs_local) {
+                if sink_naming_temps.contains(lhs_local) || box_move_temps.contains(lhs_local) {
                     if let Some(rhs_local) = rhs_local
                         && let Some((rhs_use, rhs_def, rhs_slot)) = self.consume(
                             fn_did,
@@ -622,15 +706,21 @@ impl<'a, 'tcx> MinimalWalk<'a, 'tcx> {
                             "sink-carrier-copy",
                         )
                     {
-                        carrier_presentations.insert(
-                            lhs_local,
-                            CarrierPresentation {
-                                carrier: rhs_local,
-                                r#use: rhs_use,
-                                def: rhs_def,
-                                slot: rhs_slot,
-                            },
-                        );
+                        let presentation = CarrierPresentation {
+                            carrier: rhs_local,
+                            r#use: rhs_use,
+                            def: rhs_def,
+                            slot: rhs_slot,
+                        };
+                        if sink_naming_temps.contains(lhs_local) {
+                            sink_naming_presentations.insert(lhs_local, presentation);
+                        }
+                        if box_move_temps.contains(lhs_local) {
+                            box_move_presentations.insert(lhs_local, presentation);
+                            if let Some(lhs_slot) = self.slot_for_local(fn_did, lhs_local) {
+                                self.transparent_move_edges.push((rhs_slot, lhs_slot));
+                            }
+                        }
                     }
                     continue;
                 }
@@ -738,8 +828,8 @@ impl<'a, 'tcx> MinimalWalk<'a, 'tcx> {
                 && let Some((_, destination_def, _)) = destination
                 && let Some(Some((arg_local, (arg_use, arg_def, _)))) = arg_consumes.first()
             {
-                let (arg_use, arg_def) = carrier_presentations
-                    .get(arg_local)
+                let (arg_use, arg_def) = box_move_presentations
+                    .get(*arg_local)
                     .map_or((*arg_use, *arg_def), |presentation| {
                         (presentation.r#use, presentation.def)
                     });
@@ -781,9 +871,9 @@ impl<'a, 'tcx> MinimalWalk<'a, 'tcx> {
                     let (endpoint_var, endpoint_def, slot) = match resolve_sink_presentation(
                         arg_local,
                         direct,
-                        &eliminable,
+                        &sink_naming_temps,
                         &sink_definitions,
-                        &carrier_presentations,
+                        &sink_naming_presentations,
                     ) {
                         Ok(presentation) => (
                             presentation.r#use,
@@ -814,8 +904,8 @@ impl<'a, 'tcx> MinimalWalk<'a, 'tcx> {
                     });
                 } else if roles.is_empty() {
                     self.boundary_held.insert(
-                        carrier_presentations
-                            .get(&arg_local)
+                        box_move_presentations
+                            .get(arg_local)
                             .map_or(direct_slot, |presentation| presentation.slot),
                     );
                     self.equations.push(RecordedEquation::LessEqual {
@@ -942,6 +1032,7 @@ impl<'a, 'tcx> MinimalWalk<'a, 'tcx> {
             replay_error,
             canonical_sha256: String::new(),
             move_edges: self.move_edges,
+            transparent_move_edges: self.transparent_move_edges,
             field_held: self.field_held,
             boundary_held: self.boundary_held,
         };
@@ -949,6 +1040,10 @@ impl<'a, 'tcx> MinimalWalk<'a, 'tcx> {
             .move_edges
             .sort_unstable_by_key(|(from, to)| (slot_order_key(*from), slot_order_key(*to)));
         facts.move_edges.dedup();
+        facts
+            .transparent_move_edges
+            .sort_unstable_by_key(|(from, to)| (slot_order_key(*from), slot_order_key(*to)));
+        facts.transparent_move_edges.dedup();
         facts.canonical_sha256 = format!("{:x}", Sha256::digest(facts.canonical_bytes()));
         Ok(facts)
     }
@@ -1031,6 +1126,7 @@ pub(crate) struct BoxOwnershipFacts {
     replay_error: Option<String>,
     canonical_sha256: String,
     move_edges: Vec<(SlotRef, SlotRef)>,
+    transparent_move_edges: Vec<(SlotRef, SlotRef)>,
     field_held: FxHashSet<SlotRef>,
     boundary_held: FxHashSet<SlotRef>,
 }
@@ -1585,9 +1681,24 @@ impl BoxOwnershipFacts {
                 .iter()
                 .map(|sink| {
                     let sink_slot = sink.slot_ref.ok_or(BoxPlanFailure::EndpointUnjoined)?;
-                    let matched = subjects
+                    let reaching = subjects
                         .iter()
-                        .filter(|candidate| subject_slot(candidate) == Some(sink_slot))
+                        .filter_map(|candidate| {
+                            let candidate_slot = subject_slot(candidate)?;
+                            self.move_reaches(candidate_slot, sink_slot)
+                                .then_some((candidate, candidate_slot))
+                        })
+                        .collect::<Vec<_>>();
+                    let matched = reaching
+                        .iter()
+                        .filter(|(_, candidate_slot)| {
+                            !reaching.iter().any(|(_, other_slot)| {
+                                candidate_slot != other_slot
+                                    && self.move_reaches(*candidate_slot, *other_slot)
+                                    && self.move_reaches(*other_slot, sink_slot)
+                            })
+                        })
+                        .map(|(candidate, _)| *candidate)
                         .collect::<Vec<_>>();
                     let [sink_subject] = matched.as_slice() else {
                         return Err(BoxPlanFailure::AstUnplaceable);
@@ -1727,6 +1838,16 @@ impl BoxOwnershipFacts {
         for &(from, to) in &self.move_edges {
             bytes.extend(format!("move\t{}\t{}\n", slot_label(from), slot_label(to)).bytes());
         }
+        for &(from, to) in &self.transparent_move_edges {
+            bytes.extend(
+                format!(
+                    "transparent-move\t{}\t{}\n",
+                    slot_label(from),
+                    slot_label(to)
+                )
+                .bytes(),
+            );
+        }
         for (kind, slots) in [
             ("field-held", &self.field_held),
             ("boundary-held", &self.boundary_held),
@@ -1750,7 +1871,12 @@ impl BoxOwnershipFacts {
             if !seen.insert(current) {
                 continue;
             }
-            for &(_, next) in self.move_edges.iter().filter(|(from, _)| *from == current) {
+            for &(_, next) in self
+                .move_edges
+                .iter()
+                .chain(&self.transparent_move_edges)
+                .filter(|(from, _)| *from == current)
+            {
                 if next == target {
                     return true;
                 }
@@ -1821,10 +1947,10 @@ mod tests {
     use rustc_index::IndexVec;
 
     use super::{
-        BoxMoveTemps, BoxScopeFailure, EndpointStatus, FactValue, RecordedEquation,
-        SinkCarrierDef, SinkCarrierReason, SinkNamingTemps, box_scope, classify_endpoint,
-        exactly_one_sink_per_exit_graph, render_equations, replay_values,
-        resolve_sink_carrier, resolve_sink_naming_carrier, scalar_initializer_supported,
+        BoxMoveTemps, BoxScopeFailure, EndpointStatus, FactValue, RecordedEquation, SinkCarrierDef,
+        SinkCarrierReason, SinkNamingTemps, box_scope, classify_endpoint,
+        exactly_one_sink_per_exit_graph, render_equations, replay_values, resolve_sink_carrier,
+        resolve_sink_naming_carrier, scalar_initializer_supported,
     };
     use crate::analyses::borrow_ownership::{SlotKind, ssa::constraint::Var};
 
@@ -1963,7 +2089,7 @@ mod tests {
         definitions[carrier] = Some(SinkCarrierDef::Projected);
 
         let naming = SinkNamingTemps::from_seeds([sink_temp]);
-        let moves = BoxMoveTemps::closed_from_seeds([sink_temp], &definitions);
+        let moves = BoxMoveTemps::closed_from_seeds([sink_temp], &definitions, |_| true);
         assert!(naming.contains(sink_temp));
         assert!(!naming.contains(carrier));
         assert!(moves.contains(sink_temp));
