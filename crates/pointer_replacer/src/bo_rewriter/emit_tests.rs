@@ -5447,6 +5447,50 @@ fn e2_w1_return_decision_uses_the_typed_permit() {
     assert_eq!(permits, 1);
 }
 
+/// E2-W7 RED — an unannotated local fed by a direct local call may use the
+/// callee's modeled lifetime plan without inventing a local declaration
+/// splice.  The explicit decision arm is load-bearing: treating this as an
+/// ordinary `Ref` would let the no-`ty_span` residual gate erase the evidence.
+#[test]
+fn e2_w7_direct_call_result_local_is_inferred_safe() {
+    let fixture = Fixture::new(&[(
+        "lib.rs",
+        "#![allow(dead_code, unused_unsafe)]\n\
+         pub unsafe fn id(p: *const i32) -> *const i32 { p }\n\
+         pub unsafe fn caller(p: *const i32) -> i32 {\n\
+             let q = id(p);\n\
+             *q\n\
+         }\n",
+    )]);
+    let decision = ::utils::compilation::run_compiler_on_path(&fixture.root(), |tcx| {
+        let (table, _) = super::decide_table_with_ctx_config(
+            tcx,
+            Some((
+                crate::analyses::borrow_ownership::a5_overlap::A5Mode::PreciseReplay,
+                Some(
+                    crate::analyses::borrow_ownership::a5_overlap::WholeProgramAttestation::FrozenBenchmarkGraph,
+                ),
+            )),
+        )
+        .expect("E2-W7 decision table");
+        table
+            .entries
+            .iter()
+            .find(|(subject, _)| subject.label.ends_with("caller::q"))
+            .map(|(_, decision)| decision.clone())
+            .expect("caller::q subject")
+    })
+    .expect("E2-W7 fixture compiles before rewriting");
+
+    assert!(
+        matches!(
+            decision,
+            super::decision::Decision::InferredRef { mutable: false, .. }
+        ),
+        "{decision:#?}"
+    );
+}
+
 fn receipt_column(receipt: &str, name: &str) -> usize {
     receipt
         .lines()
