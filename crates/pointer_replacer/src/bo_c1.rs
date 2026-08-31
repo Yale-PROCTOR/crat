@@ -15949,13 +15949,20 @@ fn box_fact_differential_corpus() {
         .collect::<BTreeSet<_>>();
     assert_eq!(expected_subjects.len(), 57);
     let mut derived_subjects = BTreeSet::new();
+    let mut subject_by_slot = BTreeMap::<String, String>::new();
+    let mut subject_slot_duplicates = Vec::new();
     for program in CORPUS {
         let input = fs::read_to_string(artifact_dir.join(format!("{}.subjects.tsv", program.name)))
             .unwrap_or_else(|error| panic!("read {} Box subjects: {error}", program.name));
         for line in input.lines().skip(1) {
             let fields = line.split('\t').collect::<Vec<_>>();
-            assert_eq!(fields.len(), 5, "derived subject schema: {line}");
-            assert!(derived_subjects.insert(key(&[program.name, fields[0]])));
+            assert_eq!(fields.len(), 6, "derived subject schema: {line}");
+            let identity = key(&[program.name, fields[0]]);
+            assert!(derived_subjects.insert(identity.clone()));
+            let slot = key(&[program.name, fields[5]]);
+            if let Some(previous) = subject_by_slot.insert(slot.clone(), identity.clone()) {
+                subject_slot_duplicates.push((slot, previous, identity));
+            }
         }
     }
     let missing_subjects = expected_subjects
@@ -15985,6 +15992,66 @@ fn box_fact_differential_corpus() {
     )
     .expect("write Box subject divergence");
 
+    let mut active_by_slot = BTreeMap::<String, Vec<String>>::new();
+    for (endpoint_key, (state, _)) in &derived {
+        if state != "active" {
+            continue;
+        }
+        let fields = endpoint_key.split('\u{1f}').collect::<Vec<_>>();
+        assert_eq!(fields.len(), 7);
+        active_by_slot
+            .entry(key(&[fields[0], fields[6]]))
+            .or_default()
+            .push(endpoint_key.clone());
+    }
+    let endpoint_slot_duplicates = active_by_slot
+        .iter()
+        .filter(|(_, endpoints)| endpoints.len() != 1)
+        .collect::<Vec<_>>();
+    let mut join_rows = String::from("program\tslot\tunit\tidentity\tjoin_class\n");
+    let mut joined = 0usize;
+    let mut subject_only = 0usize;
+    for (slot, subject) in &subject_by_slot {
+        let fields = slot.split('\u{1f}').collect::<Vec<_>>();
+        let class = match active_by_slot.get(slot).map(Vec::as_slice) {
+            Some([_]) => {
+                joined += 1;
+                "joined"
+            }
+            Some(_) => "ambiguous",
+            None => {
+                subject_only += 1;
+                "subject-only"
+            }
+        };
+        join_rows.push_str(&format!(
+            "{}\t{}\tsubject\t{}\t{}\n",
+            fields[0], fields[1], subject, class
+        ));
+    }
+    let mut endpoint_only = 0usize;
+    for (slot, endpoints) in &active_by_slot {
+        let fields = slot.split('\u{1f}').collect::<Vec<_>>();
+        for endpoint in endpoints {
+            let class = if subject_by_slot.contains_key(slot) {
+                if endpoints.len() == 1 {
+                    "joined"
+                } else {
+                    "ambiguous"
+                }
+            } else {
+                endpoint_only += 1;
+                "endpoint-only"
+            };
+            join_rows.push_str(&format!(
+                "{}\t{}\tendpoint\t{}\t{}\n",
+                fields[0], fields[1], endpoint, class
+            ));
+        }
+    }
+    fs::write(artifact_dir.join("box-57-61-join.tsv"), join_rows).expect("write Box 57/61 join");
+    let join_ambiguities = subject_slot_duplicates.len() + endpoint_slot_duplicates.len();
+
     let active = derived
         .values()
         .filter(|(state, _)| state == "active")
@@ -15997,13 +16064,20 @@ fn box_fact_differential_corpus() {
         .count();
     let active_sinks = active - active_sources;
     let summary = format!(
-        "status={}\ndata={}\nprograms=20/20\ncache_hits=20/20\nsolver_seconds=0\nendpoints={}\nactive={}\nactive_sources={}\nactive_sinks={}\nendpoint_divergence={}\nowning_subjects={}\nsubject_missing={}\nsubject_extra={}\n",
-        if divergence_count == 0 && missing_subjects.is_empty() && extra_subjects.is_empty() {
+        "status={}\ndata={}\nprograms=20/20\ncache_hits=20/20\nsolver_seconds=0\nendpoints={}\nactive={}\nactive_sources={}\nactive_sinks={}\nendpoint_divergence={}\nowning_subjects={}\nsubject_missing={}\nsubject_extra={}\njoin={}\nsubject_only={}\nendpoint_only={}\njoin_ambiguities={}\n",
+        if divergence_count == 0
+            && missing_subjects.is_empty()
+            && extra_subjects.is_empty()
+            && join_ambiguities == 0
+        {
             "complete"
         } else {
             "differential-stop"
         },
-        divergence_count == 0 && missing_subjects.is_empty() && extra_subjects.is_empty(),
+        divergence_count == 0
+            && missing_subjects.is_empty()
+            && extra_subjects.is_empty()
+            && join_ambiguities == 0,
         derived.len(),
         active,
         active_sources,
@@ -16012,6 +16086,10 @@ fn box_fact_differential_corpus() {
         derived_subjects.len(),
         missing_subjects.len(),
         extra_subjects.len(),
+        joined,
+        subject_only,
+        endpoint_only,
+        join_ambiguities,
     );
     fs::write(artifact_dir.join("differential-receipt.txt"), summary)
         .expect("write Box differential receipt");
@@ -16035,6 +16113,12 @@ fn box_fact_differential_corpus() {
     assert!(
         missing_subjects.is_empty() && extra_subjects.is_empty(),
         "57-subject identity differential fired; see box-subject-divergence.tsv"
+    );
+    assert_eq!(joined + subject_only, 57, "57-row join partition");
+    assert_eq!(joined + endpoint_only, 61, "61-row join partition");
+    assert_eq!(
+        join_ambiguities, 0,
+        "57/61 SlotKey join is ambiguous; see box-57-61-join.tsv"
     );
 }
 

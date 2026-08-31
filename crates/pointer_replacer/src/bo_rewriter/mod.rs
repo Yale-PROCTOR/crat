@@ -3558,6 +3558,10 @@ pub(crate) fn box_fact_artifacts(tcx: TyCtxt<'_>) -> Result<BoxFactArtifacts, St
         .filter(|subject| e1_subject_model_kind(&ctx, subject) == Some(SlotKind::Owning))
         .map(|subject| {
             let owner = tcx.def_path_str(subject.fn_did.to_def_id());
+            let slot = ctx.slots.fn_local_slots[&subject.fn_did]
+                .slot_for_local_depth(subject.local, 0)
+                .expect("Owning subject has a depth-0 slot");
+            let slot = decision::box_facts::slot_label(SlotRef::Local(subject.fn_did, slot));
             let arg_index = match subject.kind {
                 decision::SubjectKind::Param { hir_index } => (hir_index + 1).to_string(),
                 decision::SubjectKind::Local => "-".to_owned(),
@@ -3565,18 +3569,20 @@ pub(crate) fn box_fact_artifacts(tcx: TyCtxt<'_>) -> Result<BoxFactArtifacts, St
             (
                 subject.identity_key(&owner),
                 format!(
-                    "{}\t{}\t{}\t{}\t{}",
+                    "{}\t{}\t{}\t{}\t{}\t{}",
                     subject.identity_key(&owner),
                     owner,
                     subject.local.as_u32(),
                     arg_index,
                     subject.ptr_depth,
+                    slot,
                 ),
             )
         })
         .collect::<Vec<_>>();
     subject_rows.sort_by(|left, right| left.0.cmp(&right.0));
-    let mut subjects = String::from("subject_key\towner_fn\tmir_local\targ_index\tptr_depth\n");
+    let mut subjects =
+        String::from("subject_key\towner_fn\tmir_local\targ_index\tptr_depth\tslot\n");
     for (_, row) in subject_rows {
         subjects.push_str(&row);
         subjects.push('\n');

@@ -966,7 +966,7 @@ fn foreign_callee_name(program: &RustProgram<'_>, func: &Operand<'_>) -> Option<
     Some(item.ident.name.to_string())
 }
 
-fn slot_label(slot: SlotRef) -> String {
+pub(crate) fn slot_label(slot: SlotRef) -> String {
     match slot {
         SlotRef::Local(did, slot) => {
             format!("local:{}:{}", did.local_def_index.as_u32(), slot.index())
