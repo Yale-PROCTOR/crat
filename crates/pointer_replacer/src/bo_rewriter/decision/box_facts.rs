@@ -1821,9 +1821,10 @@ mod tests {
     use rustc_index::IndexVec;
 
     use super::{
-        BoxScopeFailure, EndpointStatus, FactValue, RecordedEquation, SinkCarrierDef,
-        SinkCarrierReason, box_scope, classify_endpoint, exactly_one_sink_per_exit_graph,
-        render_equations, replay_values, resolve_sink_carrier, scalar_initializer_supported,
+        BoxMoveTemps, BoxScopeFailure, EndpointStatus, FactValue, RecordedEquation,
+        SinkCarrierDef, SinkCarrierReason, SinkNamingTemps, box_scope, classify_endpoint,
+        exactly_one_sink_per_exit_graph, render_equations, replay_values,
+        resolve_sink_carrier, resolve_sink_naming_carrier, scalar_initializer_supported,
     };
     use crate::analyses::borrow_ownership::{SlotKind, ssa::constraint::Var};
 
@@ -1951,6 +1952,27 @@ mod tests {
         ] {
             assert_eq!(resolve_sink_carrier(temp, true, definition), Err(expected));
         }
+    }
+
+    #[test]
+    fn box_n7_sink_naming_stops_before_move_domain_projection_base() {
+        let sink_temp = rustc_middle::mir::Local::from_usize(10);
+        let carrier = rustc_middle::mir::Local::from_usize(11);
+        let mut definitions = IndexVec::from_elem_n(None, 12);
+        definitions[sink_temp] = Some(SinkCarrierDef::Copy(carrier));
+        definitions[carrier] = Some(SinkCarrierDef::Projected);
+
+        let naming = SinkNamingTemps::from_seeds([sink_temp]);
+        let moves = BoxMoveTemps::closed_from_seeds([sink_temp], &definitions);
+        assert!(naming.contains(sink_temp));
+        assert!(!naming.contains(carrier));
+        assert!(moves.contains(sink_temp));
+        assert!(moves.contains(carrier));
+        assert_eq!(
+            resolve_sink_naming_carrier(sink_temp, &naming, &definitions),
+            Ok(carrier),
+            "the widened move domain must not drag endpoint naming into the carrier's projection-base definition"
+        );
     }
 
     #[test]
