@@ -132,6 +132,7 @@ extern \"C\" {\n\
     fn malloc(size: usize) -> *mut core::ffi::c_void;\n\
     fn calloc(count: usize, size: usize) -> *mut core::ffi::c_void;\n\
     fn memset(ptr: *mut core::ffi::c_void, value: i32, bytes: usize) -> *mut core::ffi::c_void;\n\
+    fn realloc(ptr: *mut core::ffi::c_void, size: usize) -> *mut core::ffi::c_void;\n\
     fn free(ptr: *mut core::ffi::c_void);\n\
 }\n";
 
@@ -356,6 +357,119 @@ fn box_w6_mutually_exclusive_free_sites_both_become_drops() {
     );
     assert_eq!(source.matches("drop(p)").count(), 2, "{source}");
     assert!(!source.contains("free(p as"), "{source}");
+}
+
+#[test]
+fn box_n1_scope_exit_uses_implicit_close_waiver() {
+    use super::decision::box_facts::ImplicitCloseKind;
+
+    assert_eq!(
+        ImplicitCloseKind::Overwrite.receipt(),
+        "waiver-drop(overwrite)"
+    );
+    assert_eq!(
+        ImplicitCloseKind::ScopeExit.receipt(),
+        "waiver-drop(scope-exit)"
+    );
+    assert_eq!(ImplicitCloseKind::Unwind.receipt(), "waiver-drop(unwind)");
+}
+
+#[test]
+fn box_w7_overwrite_uses_plain_assignment_and_auto_drop() {
+    let src = format!(
+        "{BOX_W1_PREAMBLE}\n\
+         pub unsafe fn f() -> i32 {{\n\
+             let mut p: *mut i32 = malloc(core::mem::size_of::<i32>()) as *mut i32;\n\
+             *p = 1;\n\
+             p = malloc(core::mem::size_of::<i32>()) as *mut i32;\n\
+             *p = 2;\n\
+             let out = *p;\n\
+             free(p as *mut core::ffi::c_void);\n\
+             out\n\
+         }}\n"
+    );
+    let super::RewriteOutcome::Emitted {
+        source,
+        degradations,
+        ..
+    } = super::rewrite_m1(&src)
+    else {
+        panic!("BOX-W7 fixture must emit");
+    };
+    assert!(
+        source.contains("p: Box<i32> = Box::new(1)"),
+        "degradations={degradations:#?}\n{source}"
+    );
+    assert!(
+        source.contains("p = Box::new(2)"),
+        "plain overwrite missing: {source}"
+    );
+    assert!(
+        !source.contains("forget"),
+        "omission-preserving form survived: {source}"
+    );
+    assert_eq!(source.matches("drop(p)").count(), 1, "{source}");
+}
+
+#[test]
+fn box_w8_nullable_owner_uses_none_some_and_take() {
+    let src = format!(
+        "{BOX_W1_PREAMBLE}\n\
+         pub unsafe fn f() {{\n\
+             let mut p: *mut i32 = 0 as *mut i32;\n\
+             p = malloc(core::mem::size_of::<i32>()) as *mut i32;\n\
+             *p = 7;\n\
+             free(p as *mut core::ffi::c_void);\n\
+         }}\n"
+    );
+    let super::RewriteOutcome::Emitted {
+        source,
+        degradations,
+        ..
+    } = super::rewrite_m1(&src)
+    else {
+        panic!("BOX-W8 fixture must emit");
+    };
+    assert!(
+        source.contains("p: Option<Box<i32>> = None"),
+        "degradations={degradations:#?}\n{source}"
+    );
+    assert!(source.contains("p = Some(Box::new(7))"), "{source}");
+    assert!(source.contains("drop(p.take())"), "{source}");
+    assert!(
+        !source.contains("unwrap"),
+        "nullable Box used unchecked unwrap: {source}"
+    );
+}
+
+#[test]
+fn box_w5_realloc_is_one_atomic_consume_and_replacement() {
+    let src = format!(
+        "{BOX_W1_PREAMBLE}\n\
+         pub unsafe fn f(n: usize, m: usize) {{\n\
+             let mut p: *mut i32 = calloc(n, core::mem::size_of::<i32>()) as *mut i32;\n\
+             p = realloc(p as *mut core::ffi::c_void, m * core::mem::size_of::<i32>()) as *mut i32;\n\
+             free(p as *mut core::ffi::c_void);\n\
+         }}\n"
+    );
+    let super::RewriteOutcome::Emitted { source, .. } = super::rewrite_m1(&src) else {
+        panic!("BOX-W5 fixture must emit");
+    };
+    assert!(source.contains("p: Box<[i32]>"), "{source}");
+    assert!(
+        source.contains("Vec::from(p)"),
+        "old Box was not consumed: {source}"
+    );
+    assert!(
+        source.contains(".resize("),
+        "replacement extent was not applied: {source}"
+    );
+    assert!(source.contains("into_boxed_slice()"), "{source}");
+    assert_eq!(source.matches("drop(p)").count(), 1, "{source}");
+    assert!(
+        !source.contains("realloc(p as"),
+        "raw realloc survived: {source}"
+    );
 }
 
 const ROOT_WITH_MODULE: &str = "#![allow(dead_code, unused_unsafe)]\npub mod m;\n";

@@ -120,6 +120,7 @@ pub(crate) struct ConstructionFacts {
     pub first_stores: FxHashMap<(LocalDefId, HirId), Vec<FirstStore>>,
     pub deallocator_calls: FxHashMap<(LocalDefId, HirId), Vec<rustc_span::Span>>,
     pub zero_memsets: FxHashMap<(LocalDefId, HirId), Vec<ZeroMemset>>,
+    pub owner_overwrites: FxHashMap<(LocalDefId, HirId), Vec<OwnerOverwrite>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -134,6 +135,13 @@ pub(crate) struct ZeroMemset {
     pub statement_span: rustc_span::Span,
     pub call_span: rustc_span::Span,
     pub bytes: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct OwnerOverwrite {
+    pub statement_span: rustc_span::Span,
+    pub value_span: rustc_span::Span,
+    pub construction: Construction,
 }
 
 const ALLOCATORS: &[&str] = &[
@@ -302,6 +310,24 @@ impl<'tcx> Visitor<'tcx> for Collector<'_, 'tcx> {
                     value_span: rhs.span,
                     value,
                 });
+        }
+        if let Some(expression) = expression
+            && let rustc_hir::ExprKind::Assign(lhs, rhs, _) = expression.kind
+            && let rustc_hir::ExprKind::Path(rustc_hir::QPath::Resolved(_, lhs_path)) = lhs.kind
+            && let rustc_hir::def::Res::Local(binding) = lhs_path.res
+        {
+            let construction = self.classify(rhs);
+            if matches!(construction, Construction::Alloc { .. }) {
+                self.facts
+                    .owner_overwrites
+                    .entry((self.fn_did, binding))
+                    .or_default()
+                    .push(OwnerOverwrite {
+                        statement_span: stmt.span,
+                        value_span: rhs.span,
+                        construction,
+                    });
+            }
         }
         let memset_expression = expression.map(|expression| match expression.kind {
             rustc_hir::ExprKind::Assign(_, rhs, _) => Self::peel(rhs),
