@@ -226,6 +226,7 @@ pub(crate) struct LifetimeEligibility {
     return_permits: FxHashMap<NodeKey, ReturnLifetimePermit>,
     inferred_permits: FxHashMap<NodeKey, InferredLifetimePermit>,
     output_storage_permits: FxHashMap<(LocalDefId, FnSignatureSlot), OutputStorageLifetimePermit>,
+    output_storage_escapes: FxHashSet<(NodeKey, NodeKey)>,
     failures: FxHashMap<NodeKey, LifetimeFailure>,
 }
 
@@ -249,6 +250,10 @@ impl LifetimeEligibility {
 
     pub(crate) fn failure(&self, subject: NodeKey) -> Option<LifetimeFailure> {
         self.failures.get(&subject).copied()
+    }
+
+    pub(crate) fn permits_output_storage(&self, source: NodeKey, target: NodeKey) -> bool {
+        self.output_storage_escapes.contains(&(source, target))
     }
 
     #[cfg(test)]
@@ -283,6 +288,7 @@ impl LifetimeEligibility {
             return_permits: [(subject, permit)].into_iter().collect(),
             inferred_permits: FxHashMap::default(),
             output_storage_permits: FxHashMap::default(),
+            output_storage_escapes: FxHashSet::default(),
             failures: FxHashMap::default(),
         }
     }
@@ -483,6 +489,43 @@ pub(crate) fn derive_return_eligibility(
         }
     }
 
+    let signature_of = |key: NodeKey| {
+        subjects
+            .iter()
+            .find(|subject| (subject.fn_did, subject.hir_id) == key)
+            .and_then(|subject| match subject.kind {
+                super::SubjectKind::Param { hir_index } => {
+                    Some(FnSignatureSlot::arg(hir_index + 1, 0, 0))
+                }
+                super::SubjectKind::Local => None,
+            })
+    };
+    for escape in escapes
+        .iter()
+        .filter(|escape| escape.kind == EscapeKind::FieldStore)
+    {
+        let Some(target) = escape.target else { continue };
+        let (Some(source_slot), Some(target_root)) =
+            (signature_of(escape.subject), signature_of(target))
+        else {
+            continue;
+        };
+        let target_slot = FnSignatureSlot {
+            root: target_root.root,
+            deref_depth: 0,
+            depth: 1,
+        };
+        if result
+            .output_storage_permits
+            .get(&(escape.subject.0, target_slot))
+            .is_some_and(|permit| permit.sources.contains(&source_slot))
+        {
+            result
+                .output_storage_escapes
+                .insert((escape.subject, target));
+        }
+    }
+
     let return_plan_functions = result
         .return_permits
         .values()
@@ -573,6 +616,24 @@ pub(crate) struct FunctionPlan {
     pub(crate) outlives: Vec<(String, String)>,
 }
 
+/// Final, analysis-blind carrier handed to seam planning and structural AST
+/// emission. Eligibility retains origin identities; this value retains only
+/// the settled signature plan.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct LifetimePlan {
+    functions: FxHashMap<LocalDefId, FunctionPlan>,
+}
+
+impl LifetimePlan {
+    pub(crate) fn function(&self, did: LocalDefId) -> Option<&FunctionPlan> {
+        self.functions.get(&did)
+    }
+
+    pub(crate) fn function_count(&self) -> usize {
+        self.functions.len()
+    }
+}
+
 impl FunctionPlan {
     pub(crate) fn lifetime_for(&self, slot: FnSignatureSlot) -> Option<&str> {
         self.lifetimes.get(&slot).map(String::as_str)
@@ -588,6 +649,102 @@ impl FunctionPlan {
         }
         rows.join("\n")
     }
+
+    pub(crate) fn lifetimes(&self) -> impl Iterator<Item = (&FnSignatureSlot, &str)> {
+        self.lifetimes
+            .iter()
+            .map(|(slot, lifetime)| (slot, lifetime.as_str()))
+    }
+
+    pub(crate) fn generated_names(&self) -> Vec<&str> {
+        let mut names = self
+            .lifetimes
+            .values()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        names.sort_unstable();
+        names.dedup();
+        names
+    }
+}
+
+fn existing_lifetime_names(program: &RustProgram<'_>, did: LocalDefId) -> BTreeSet<String> {
+    let rustc_hir::Node::Item(item) = program.tcx.hir_node_by_def_id(did) else {
+        return BTreeSet::new();
+    };
+    let Some(generics) = item.kind.generics() else {
+        return BTreeSet::new();
+    };
+    generics
+        .params
+        .iter()
+        .filter(|param| matches!(param.kind, rustc_hir::GenericParamKind::Lifetime { .. }))
+        .map(|param| {
+            param
+                .name
+                .ident()
+                .name
+                .as_str()
+                .trim_start_matches('\'')
+                .to_owned()
+        })
+        .collect()
+}
+
+pub(crate) fn finalize(
+    program: &RustProgram<'_>,
+    origins: Option<&OriginSummaries>,
+    eligibility: &LifetimeEligibility,
+    table: &DecisionTable,
+) -> Result<LifetimePlan, String> {
+    let Some(origins) = origins else {
+        return Ok(LifetimePlan::default());
+    };
+    let final_decisions = table
+        .entries
+        .iter()
+        .map(|(subject, decision)| ((subject.fn_did, subject.hir_id), decision))
+        .collect::<FxHashMap<_, _>>();
+    let mut required = FxHashMap::<LocalDefId, BTreeSet<OriginSlot>>::default();
+    for (subject, permit) in &eligibility.return_permits {
+        if !matches!(
+            final_decisions.get(subject),
+            Some(Decision::Ref { .. } | Decision::Slice { .. } | Decision::Opt { .. })
+        ) {
+            continue;
+        }
+        let slots = required.entry(permit.function).or_default();
+        slots.extend(permit.origin_sources.iter().copied());
+        slots.insert(permit.origin_target);
+    }
+    for permit in eligibility.output_storage_permits.values() {
+        let slots = required.entry(permit.function).or_default();
+        slots.extend(permit.origin_sources.iter().copied());
+        slots.insert(permit.origin_target);
+    }
+
+    let mut functions = FxHashMap::default();
+    let mut owners = required.into_iter().collect::<Vec<_>>();
+    owners.sort_by_key(|(did, _)| did.local_def_index.as_u32());
+    for (did, slots) in owners {
+        let summary = origins.get(&did).ok_or_else(|| {
+            format!(
+                "lifetime-origin-absent: no summary for {}",
+                program.tcx.def_path_str(did.to_def_id())
+            )
+        })?;
+        let required = slots.into_iter().collect::<Vec<_>>();
+        let plan = plan_function(summary, &required, &existing_lifetime_names(program, did))
+            .map_err(|failure| {
+                format!(
+                    "{}: {}",
+                    failure.key(),
+                    program.tcx.def_path_str(did.to_def_id())
+                )
+            })?;
+        functions.insert(did, plan);
+    }
+    Ok(LifetimePlan { functions })
 }
 
 fn next_lifetime_name(used: &mut BTreeSet<String>) -> String {

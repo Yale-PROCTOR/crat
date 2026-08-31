@@ -5692,9 +5692,53 @@ fn e2_w1_production_emits_named_signature_lifetimes() {
         .values()
         .find(|source| source.contains("fn id"))
         .expect("emitted E2-W1 function");
-    assert!(emitted.contains("fn id<'a: 'b>"), "{emitted}");
+    assert!(emitted.contains("fn id<'a: 'b, 'b>"), "{emitted}");
     assert!(emitted.contains("p: &'a i32"), "{emitted}");
     assert!(emitted.contains("-> &'b i32"), "{emitted}");
+}
+
+/// E2-W2/W3/W5 production-path coverage: multiple source bounds, nested
+/// output storage, and collision-free insertion beside user generics all pass
+/// through the same structural visitor as E2-W1.
+#[test]
+fn e2_structural_plan_covers_bounds_output_storage_and_existing_generics() {
+    let fixture = Fixture::new(&[(
+        "lib.rs",
+        "#![allow(dead_code, unused_unsafe, unused_lifetimes)]\n\
+         pub unsafe fn choose(a: *const i32, b: *const i32, pick: bool) -> *const i32 {\n\
+             if pick { return a; }\n\
+             b\n\
+         }\n\
+         pub unsafe fn store(out: *mut *const i32, p: *const i32) { *out = p; }\n\
+         pub unsafe fn existing<'a, T>(p: *const T) -> *const T { p }\n",
+    )]);
+    let outcome = super::rewrite_m1_path_a5_injected(
+        &fixture.root(),
+        crate::analyses::borrow_ownership::a5_overlap::A5Mode::PreciseReplay,
+        Some(
+            crate::analyses::borrow_ownership::a5_overlap::WholeProgramAttestation::FrozenBenchmarkGraph,
+        ),
+        &|_| {},
+    );
+    let super::RewriteOutcome::Emitted { files, .. } = outcome else {
+        panic!("E2 structural fixture must survive: {outcome:#?}");
+    };
+    let emitted = files
+        .values()
+        .find(|source| source.contains("fn choose"))
+        .expect("emitted E2 structural fixture");
+    assert!(
+        emitted.contains("fn choose<'a: 'c, 'b: 'c, 'c>"),
+        "{emitted}"
+    );
+    assert!(
+        emitted.contains("fn store<'a, 'b: 'a>(out: &mut &'a i32, p: &'b i32)"),
+        "{emitted}"
+    );
+    assert!(
+        emitted.contains("fn existing<'a, 'b: 'c, 'c, T>"),
+        "{emitted}"
+    );
 }
 
 fn receipt_column(receipt: &str, name: &str) -> usize {

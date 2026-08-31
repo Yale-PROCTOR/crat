@@ -205,6 +205,7 @@ mod tests {
             entries,
             seams: Default::default(),
             c9_marks: Vec::new(),
+            lifetime_plan: Default::default(),
         }
     }
 

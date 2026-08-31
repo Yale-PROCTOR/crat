@@ -22,8 +22,9 @@
 //! oracle (`b4294374`, digest `4ed9d2a6…`) is what says so.
 
 use rustc_ast::{
-    AngleBracketedArg, AngleBracketedArgs, DUMMY_NODE_ID, GenericArg, GenericArgs, MutTy,
-    Mutability, NodeId, Path, PathSegment, Ty, TyKind, mut_visit::MutVisitor, ptr::P,
+    AngleBracketedArg, AngleBracketedArgs, DUMMY_NODE_ID, GenericArg, GenericArgs, GenericBound,
+    GenericParam, GenericParamKind, Lifetime, MutTy, Mutability, NodeId, Path, PathSegment, Ty,
+    TyKind, mut_visit::MutVisitor, ptr::P,
 };
 use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_hir::HirId;
@@ -95,6 +96,25 @@ fn option_of(inner: P<Ty>) -> TyKind {
 /// position, and it is pinned by `declared_forms_render_the_span_layers_text`
 /// so a corpus diff is attributable to the walk rather than to the renderer.
 pub(crate) fn decl_ty_kind(form: DeclForm, mutable: bool, pointee: P<Ty>) -> TyKind {
+    decl_ty_kind_with_lifetime(form, mutable, pointee, None)
+}
+
+fn ast_lifetime(name: &str) -> Lifetime {
+    Lifetime {
+        id: DUMMY_NODE_ID,
+        ident: Ident::new(
+            Symbol::intern(&format!("'{}", name.trim_start_matches('\''))),
+            DUMMY_SP,
+        ),
+    }
+}
+
+fn decl_ty_kind_with_lifetime(
+    form: DeclForm,
+    mutable: bool,
+    pointee: P<Ty>,
+    lifetime: Option<&str>,
+) -> TyKind {
     let mutbl = if mutable {
         Mutability::Mut
     } else {
@@ -116,7 +136,7 @@ pub(crate) fn decl_ty_kind(form: DeclForm, mutable: bool, pointee: P<Ty>) -> TyK
     match form {
         DeclForm::Ref | DeclForm::Slice | DeclForm::Opt { .. } => {
             let reference = TyKind::Ref(
-                None,
+                lifetime.map(ast_lifetime),
                 MutTy {
                     ty: referent,
                     mutbl,
@@ -146,6 +166,140 @@ pub(crate) fn decl_ty_kind(form: DeclForm, mutable: bool, pointee: P<Ty>) -> TyK
                 boxed
             }
         }
+    }
+}
+
+fn generated_lifetime_param(name: &str, outlives: impl Iterator<Item = String>) -> GenericParam {
+    GenericParam {
+        id: DUMMY_NODE_ID,
+        ident: ast_lifetime(name).ident,
+        attrs: Default::default(),
+        bounds: outlives
+            .map(|shorter| GenericBound::Outlives(ast_lifetime(&shorter)))
+            .collect(),
+        is_placeholder: false,
+        kind: GenericParamKind::Lifetime,
+        colon_span: None,
+    }
+}
+
+fn rewrite_raw_layer(ty: &mut Ty, depth: u8, lifetime: &str) -> bool {
+    if depth == 0 {
+        let TyKind::Ptr(mut_ty) = &ty.kind else {
+            return false;
+        };
+        let pointee = mut_ty.ty.clone();
+        let mutbl = mut_ty.mutbl;
+        ty.kind = TyKind::Ref(Some(ast_lifetime(lifetime)), MutTy { ty: pointee, mutbl });
+        return true;
+    }
+    let TyKind::Ptr(mut_ty) = &mut ty.kind else {
+        return false;
+    };
+    rewrite_raw_layer(&mut mut_ty.ty, depth - 1, lifetime)
+}
+
+/// Structural E2 signature pass. It owns generated lifetime parameters,
+/// return layers, and nested output-storage layers. Depth-zero input layers
+/// remain owned by [`RefDeclVisitor`], which receives the same plan below.
+struct LifetimeSignatureVisitor<'a> {
+    global_map: &'a rustc_ast::node_id::NodeMap<LocalDefId>,
+    plans: &'a super::decision::lifetime::LifetimePlan,
+    reverted_fns: &'a FxHashSet<LocalDefId>,
+    unplaceable: Vec<(LocalDefId, super::decision::lifetime::FnSignatureSlot)>,
+}
+
+impl LifetimeSignatureVisitor<'_> {
+    fn apply_function(&mut self, did: LocalDefId, function: &mut rustc_ast::Fn) {
+        if self.reverted_fns.contains(&did) {
+            return;
+        }
+        let Some(plan) = self.plans.function(did) else {
+            return;
+        };
+
+        let mut insert_at = function
+            .generics
+            .params
+            .iter()
+            .position(|param| !matches!(param.kind, GenericParamKind::Lifetime))
+            .unwrap_or(function.generics.params.len());
+        for name in plan.generated_names() {
+            let bounds = plan
+                .outlives
+                .iter()
+                .filter(|(longer, _)| longer == name)
+                .map(|(_, shorter)| shorter.clone());
+            function
+                .generics
+                .params
+                .insert(insert_at, generated_lifetime_param(name, bounds));
+            insert_at += 1;
+        }
+
+        let mut layers = plan
+            .lifetimes()
+            .map(|(slot, lifetime)| (*slot, lifetime.to_owned()))
+            .collect::<Vec<_>>();
+        // Deepest first: converting an outer raw pointer to a reference must
+        // not hide a still-raw nested layer from this pass.
+        layers.sort_by_key(|(slot, _)| std::cmp::Reverse(slot.deref_depth + slot.depth));
+        for (slot, lifetime) in layers {
+            let effective_depth = slot.deref_depth.saturating_add(slot.depth);
+            let placed = match slot.root {
+                super::decision::lifetime::FnSignatureRoot::Return => {
+                    match &mut function.sig.decl.output {
+                        rustc_ast::FnRetTy::Default(_) => false,
+                        rustc_ast::FnRetTy::Ty(ty) => {
+                            rewrite_raw_layer(ty, effective_depth, &lifetime)
+                        }
+                    }
+                }
+                super::decision::lifetime::FnSignatureRoot::Arg(local) => {
+                    let Some(input) = local.checked_sub(1).map(|index| index as usize) else {
+                        self.unplaceable.push((did, slot));
+                        continue;
+                    };
+                    // Depth zero is placed by RefDeclVisitor from the same map.
+                    effective_depth == 0
+                        || function
+                            .sig
+                            .decl
+                            .inputs
+                            .get_mut(input)
+                            .is_some_and(|param| {
+                                rewrite_raw_layer(&mut param.ty, effective_depth, &lifetime)
+                            })
+                }
+            };
+            if !placed {
+                self.unplaceable.push((did, slot));
+            }
+        }
+    }
+}
+
+impl MutVisitor for LifetimeSignatureVisitor<'_> {
+    fn visit_item(&mut self, item: &mut rustc_ast::Item) {
+        if let rustc_ast::ItemKind::Fn(function) = &mut item.kind
+            && let Some(&did) = self.global_map.get(&item.id)
+        {
+            self.apply_function(did, function);
+        }
+        rustc_ast::mut_visit::walk_item(self, item);
+    }
+
+    fn visit_assoc_item(
+        &mut self,
+        item: &mut rustc_ast::AssocItem,
+        ctxt: rustc_ast::visit::AssocCtxt,
+    ) {
+        if let rustc_ast::AssocItemKind::Fn(function) = &mut item.kind
+            && let Some(&did) = self.global_map.get(&item.id)
+        {
+            self.apply_function(did, function);
+        }
+        rustc_ast::mut_visit::walk_assoc_item(self, item, ctxt);
     }
 }
 
@@ -599,7 +753,7 @@ pub(crate) struct RefDeclVisitor<'a> {
     pub local_map: &'a rustc_ast::node_id::NodeMap<HirId>,
     /// `(fn_did, hir_id)` → which form this subject's declaration becomes, and
     /// whether it is mutable.
-    pub decisions: &'a FxHashMap<(LocalDefId, HirId), (DeclForm, bool)>,
+    pub decisions: &'a FxHashMap<(LocalDefId, HirId), (DeclForm, bool, Option<String>)>,
     /// AST `NodeId` → `LocalDefId`, used to set `current_fn` at each item.
     pub global_map: &'a rustc_ast::node_id::NodeMap<LocalDefId>,
     /// **THE REVERT SET, CONSULTED AT THE SITE** — the F2 repair.
@@ -671,9 +825,10 @@ impl RefDeclVisitor<'_> {
             }
             return;
         };
-        let Some(&(form, mutable)) = self.decisions.get(&(fn_did, hir_id)) else {
+        let Some((form, mutable, lifetime)) = self.decisions.get(&(fn_did, hir_id)) else {
             return;
         };
+        let (form, mutable) = (*form, *mutable);
         // **THE REVERT CHECK, AT THE SITE.** Before the shape check and before
         // the claim, so a withheld declaration behaves exactly as it did when
         // the population was pre-filtered: untouched, unclaimed, unrendered.
@@ -713,7 +868,7 @@ impl RefDeclVisitor<'_> {
             unreachable!("shape checked immediately above")
         };
         let pointee = mut_ty.ty.clone();
-        ty.kind = decl_ty_kind(form, mutable, pointee);
+        ty.kind = decl_ty_kind_with_lifetime(form, mutable, pointee, lifetime.as_deref());
         let render = (ty.span.lo().0, rustc_ast_pretty::pprust::ty_to_string(ty));
         // **RECORDED AT THE REALIZED REWRITE, not at the attempt.** Every early
         // return above is a non-placement, so this list and the three form
@@ -1754,7 +1909,21 @@ fn transform_with(
 > {
     let mut krate = capture.krate.clone();
     let map = &capture.map;
-    let mut decisions: FxHashMap<(LocalDefId, HirId), (DeclForm, bool)> = FxHashMap::default();
+    let mut lifetime_visitor = LifetimeSignatureVisitor {
+        global_map: &map.global_map,
+        plans: &table.lifetime_plan,
+        reverted_fns: &reverts.fns,
+        unplaceable: Vec::new(),
+    };
+    lifetime_visitor.visit_crate(&mut krate);
+    if !lifetime_visitor.unplaceable.is_empty() {
+        return Err(format!(
+            "lifetime-ast-unplaceable: {:?}",
+            lifetime_visitor.unplaceable
+        ));
+    }
+    let mut decisions: FxHashMap<(LocalDefId, HirId), (DeclForm, bool, Option<String>)> =
+        FxHashMap::default();
     let mut uses: FxHashMap<(u32, u32), String> = FxHashMap::default();
     let mut use_key_collisions = 0usize;
     let mut decision_key_collisions = 0usize;
@@ -1789,10 +1958,24 @@ fn transform_with(
         // `uses` and `seams` siblings both had one. Fixing the instance in
         // `phase3_fn_parity` and leaving the class here is the pattern the
         // phase-4 boundary was about.
+        let lifetime = match subject.kind {
+            super::decision::SubjectKind::Param { hir_index } => table
+                .lifetime_plan
+                .function(subject.fn_did)
+                .and_then(|plan| {
+                    plan.lifetime_for(super::decision::lifetime::FnSignatureSlot::arg(
+                        hir_index + 1,
+                        0,
+                        0,
+                    ))
+                })
+                .map(str::to_owned),
+            super::decision::SubjectKind::Local => None,
+        };
         insert_counting(
             &mut decisions,
             (subject.fn_did, subject.hir_id),
-            (form, mutable),
+            (form, mutable, lifetime),
             &mut decision_key_collisions,
         );
         for u in use_edits.into_iter().flatten() {
@@ -3840,7 +4023,7 @@ mod arm2_witnesses {
             let mut decisions = FxHashMap::default();
             decisions.insert(
                 (rustc_hir::def_id::CRATE_DEF_ID, rustc_hir::CRATE_HIR_ID),
-                (DeclForm::Ref, true),
+                (DeclForm::Ref, true, None),
             );
 
             let subject_hirs: FxHashSet<HirId> = decisions.keys().map(|(_, h)| *h).collect();
@@ -3926,7 +4109,7 @@ mod arm2_witnesses {
             let mut decisions = FxHashMap::default();
             decisions.insert(
                 (rustc_hir::def_id::CRATE_DEF_ID, rustc_hir::CRATE_HIR_ID),
-                (DeclForm::Ref, true),
+                (DeclForm::Ref, true, None),
             );
             let subject_hirs: FxHashSet<HirId> = decisions.keys().map(|(_, h)| *h).collect();
 
@@ -4096,7 +4279,7 @@ mod arm2_witnesses {
             let mut decisions = FxHashMap::default();
             decisions.insert(
                 (rustc_hir::def_id::CRATE_DEF_ID, rustc_hir::CRATE_HIR_ID),
-                (DeclForm::Ref, true),
+                (DeclForm::Ref, true, None),
             );
             let subject_hirs: FxHashSet<HirId> = FxHashSet::default();
             let no_reverts: FxHashSet<LocalDefId> = FxHashSet::default();
@@ -4331,7 +4514,7 @@ mod arm2_witnesses {
             global_map.insert(item_id, rustc_hir::def_id::CRATE_DEF_ID);
             let a = (rustc_hir::def_id::CRATE_DEF_ID, rustc_hir::CRATE_HIR_ID);
             let mut decisions = FxHashMap::default();
-            decisions.insert(a, (DeclForm::Ref, true));
+            decisions.insert(a, (DeclForm::Ref, true, None));
             let subject_hirs: FxHashSet<HirId> = FxHashSet::default();
             let reverted: FxHashSet<LocalDefId> =
                 [rustc_hir::def_id::CRATE_DEF_ID].into_iter().collect();
@@ -4440,7 +4623,7 @@ mod arm2_witnesses {
             let mut decisions = FxHashMap::default();
             decisions.insert(
                 (rustc_hir::def_id::CRATE_DEF_ID, rustc_hir::CRATE_HIR_ID),
-                (DeclForm::Ref, true),
+                (DeclForm::Ref, true, None),
             );
             let subject_hirs: FxHashSet<HirId> = FxHashSet::default();
 

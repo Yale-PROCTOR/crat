@@ -678,6 +678,7 @@ mod tests {
         let table = DecisionTable {
             seams: Default::default(),
             c9_marks: Vec::new(),
+            lifetime_plan: Default::default(),
             entries: vec![(alias_subject(), Decision::Ref { mutable: false })],
         };
 
@@ -729,6 +730,7 @@ mod tests {
         let table = DecisionTable {
             seams: Default::default(),
             c9_marks: Vec::new(),
+            lifetime_plan: Default::default(),
             entries: vec![(
                 alias_subject(),
                 Decision::Degraded(crate::bo_rewriter::decision::Degradation {

@@ -3446,6 +3446,13 @@ fn finish_decide<'tcx>(
     // standing, measured.
     decision::refuse_nested_use_edits(tcx, &mut table);
 
+    table.lifetime_plan = decision::lifetime::finalize(
+        &program,
+        analysis.origins.as_ref(),
+        &lifetime_eligibility,
+        &table,
+    )?;
+
     // **S3.6-1 seam adapters.** Runs AFTER every gate that can still refuse a
     // subject, including the nesting pass above: a seam is computed from the
     // forms both ends actually settle on, so a subject withdrawn later would

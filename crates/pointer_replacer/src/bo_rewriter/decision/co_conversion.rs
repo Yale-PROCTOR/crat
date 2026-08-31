@@ -428,8 +428,7 @@ pub(crate) fn build_with_c9_marks_and_lifetimes(
         if !converts.contains(&escape.subject) {
             continue;
         }
-        let Some(reason) = escape_block_reason(escape.kind, escape.subject, lifetime_eligibility)
-        else {
+        let Some(reason) = escape_block_reason(escape, lifetime_eligibility) else {
             continue;
         };
         block(&mut node_block, escape.subject, reason);
@@ -656,14 +655,20 @@ pub(crate) fn build_with_c9_marks_and_lifetimes(
 }
 
 fn escape_block_reason(
-    kind: EscapeKind,
-    subject: NodeKey,
+    escape: &Escape,
     lifetime_eligibility: &LifetimeEligibility,
 ) -> Option<BlockReason> {
-    match kind {
-        EscapeKind::Return if lifetime_eligibility.return_permit(subject).is_some() => None,
+    match escape.kind {
+        EscapeKind::Return if lifetime_eligibility.return_permit(escape.subject).is_some() => None,
         EscapeKind::Return => Some(BlockReason::EscapesViaReturn),
         EscapeKind::ForeignArg => Some(BlockReason::EscapesViaForeignArg),
+        EscapeKind::FieldStore
+            if escape.target.is_some_and(|target| {
+                lifetime_eligibility.permits_output_storage(escape.subject, target)
+            }) =>
+        {
+            None
+        }
         EscapeKind::FieldStore => Some(BlockReason::EscapesViaFieldStore),
         EscapeKind::StaticStore => Some(BlockReason::EscapesViaStaticStore),
     }
@@ -675,7 +680,15 @@ fn escape_block_reason_for_test(
     subject: NodeKey,
     lifetime_eligibility: &LifetimeEligibility,
 ) -> Option<BlockReason> {
-    escape_block_reason(kind, subject, lifetime_eligibility)
+    escape_block_reason(
+        &Escape {
+            subject,
+            kind,
+            span: rustc_span::DUMMY_SP,
+            target: None,
+        },
+        lifetime_eligibility,
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -734,6 +747,7 @@ pub(crate) struct Escape {
     pub subject: NodeKey,
     pub kind: EscapeKind,
     pub span: Span,
+    pub target: Option<NodeKey>,
 }
 
 /// Count the escape shapes, per subject, over every subject-bearing function.
@@ -775,10 +789,14 @@ pub(crate) fn escapes(
                 && self.owned.contains(&(self.fn_did, hir_id))
                 && let Some(kind) = self.classify(expr)
             {
+                let target = (kind == EscapeKind::FieldStore)
+                    .then(|| self.field_store_target(expr))
+                    .flatten();
                 self.out.push(Escape {
                     subject: (self.fn_did, hir_id),
                     kind,
                     span: expr.span,
+                    target,
                 });
             }
             intravisit::walk_expr(self, expr);
@@ -786,6 +804,28 @@ pub(crate) fn escapes(
     }
 
     impl V<'_, '_> {
+        fn field_store_target(&self, use_expr: &Expr<'_>) -> Option<NodeKey> {
+            let rustc_hir::Node::Expr(parent) = self.tcx.parent_hir_node(use_expr.hir_id) else {
+                return None;
+            };
+            let ExprKind::Assign(lhs, rhs, _) = &parent.kind else {
+                return None;
+            };
+            if rhs.hir_id != use_expr.hir_id {
+                return None;
+            }
+            let ExprKind::Unary(rustc_hir::UnOp::Deref, base) = &lhs.kind else {
+                return None;
+            };
+            let ExprKind::Path(QPath::Resolved(_, path)) = &base.kind else {
+                return None;
+            };
+            let Res::Local(binding) = path.res else {
+                return None;
+            };
+            Some((self.fn_did, binding))
+        }
+
         /// Is this callee one the class machinery can actually see?
         ///
         /// **Membership in the program's function list, not `DefId` locality.**
