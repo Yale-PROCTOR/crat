@@ -671,4 +671,34 @@ mod tests {
         .expect("N7 unattested fixture compiles");
         assert_eq!(result, Err(LifetimeFailure::FnPtrWebHeld));
     }
+
+    #[test]
+    fn e2_p_b_differential_is_identity_exact_and_typed() {
+        let code = r#"
+            pub unsafe fn leaf(p: *mut i32) -> *mut i32 { p }
+            pub unsafe fn root(p: *mut i32) -> *mut i32 { leaf(p) }
+            pub unsafe fn install() {
+                let _callback: unsafe fn(*mut i32) -> *mut i32 = root;
+            }
+        "#;
+        let differential = ::utils::compilation::run_compiler_on_str(code, |tcx| {
+            let program = crate::bo_rewriter::collect_program(tcx);
+            fn_ptr_web_differential(
+                &program,
+                Some(WholeProgramAttestation::FrozenBenchmarkGraph),
+            )
+            .expect("attested P-b differential")
+        })
+        .expect("P-b differential fixture compiles");
+
+        assert_eq!(differential.production_roots, 1);
+        assert_eq!(differential.oracle_roots, 1);
+        assert_eq!(differential.production_members, 2);
+        assert_eq!(differential.oracle_members, 2);
+        assert!(differential.divergences.is_empty(), "{differential:#?}");
+        assert_eq!(
+            differential.tsv().lines().next(),
+            Some("side\tunit\tfunction\treason")
+        );
+    }
 }
