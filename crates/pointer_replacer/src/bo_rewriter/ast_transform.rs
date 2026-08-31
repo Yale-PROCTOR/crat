@@ -5376,6 +5376,7 @@ mod arm2_witnesses {
                 span: DUMMY_SP,
                 replacement: String::new(),
                 owner_fn: String::new(),
+                lifetime_plan_digest: None,
                 caller_fn: String::new(),
                 param_index: 0,
                 source_shape: "bare-local",

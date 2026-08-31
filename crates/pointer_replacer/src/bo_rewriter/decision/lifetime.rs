@@ -18,6 +18,7 @@ use rustc_middle::{
     mir::{RETURN_PLACE, TerminatorKind},
     ty::TyKind,
 };
+use sha2::{Digest, Sha256};
 
 use super::{
     Decision, DecisionTable, DegradeReason, Subject,
@@ -648,6 +649,10 @@ impl FunctionPlan {
             rows.push(format!("outlives\t{longer}\t{shorter}"));
         }
         rows.join("\n")
+    }
+
+    pub(crate) fn digest(&self) -> String {
+        format!("{:x}", Sha256::digest(self.receipt().as_bytes()))
     }
 
     pub(crate) fn lifetimes(&self) -> impl Iterator<Item = (&FnSignatureSlot, &str)> {
