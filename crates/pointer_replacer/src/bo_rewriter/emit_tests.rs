@@ -5916,6 +5916,44 @@ fn e2_n5_cache_and_fresh_paths_share_plan_model_a5_and_source_bytes() {
     crate::analyses::borrow_ownership::model_cache::reset_for_test();
 }
 
+/// E2-N6 — lifetime diagnostics are one-iteration row data, not a false
+/// success. Both missing lifetime selection and an omitted input constraint
+/// must reach the repaired full-analysis observer with their rustc codes.
+#[test]
+fn e2_n6_compile_errors_surface_as_iteration_data() {
+    let missing = Fixture::new(&[(
+        "lib.rs",
+        "pub fn choose(a: &i32, b: &i32, pick: bool) -> &i32 {\n\
+             if pick { a } else { b }\n\
+         }\n",
+    )]);
+    let missing_diagnosis = super::verify::diagnose_crate(&missing.root());
+    assert!(missing_diagnosis.errors > 0);
+    assert!(
+        missing_diagnosis
+            .diags
+            .iter()
+            .any(|diag| matches!(diag.code.as_deref(), Some("E0106" | "ErrCode(106)"))),
+        "{missing_diagnosis:#?}"
+    );
+
+    let constraint = Fixture::new(&[(
+        "lib.rs",
+        "pub fn choose<'a>(a: &i32, b: &'a i32, pick: bool) -> &'a i32 {\n\
+             if pick { a } else { b }\n\
+         }\n",
+    )]);
+    let constraint_diagnosis = super::verify::diagnose_crate(&constraint.root());
+    assert!(constraint_diagnosis.errors > 0);
+    assert!(
+        constraint_diagnosis.diags.iter().any(|diag| matches!(
+            diag.code.as_deref(),
+            Some("E0621" | "E0623" | "ErrCode(621)" | "ErrCode(623)")
+        )),
+        "{constraint_diagnosis:#?}"
+    );
+}
+
 fn receipt_column(receipt: &str, name: &str) -> usize {
     receipt
         .lines()
