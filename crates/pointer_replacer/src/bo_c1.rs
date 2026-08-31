@@ -41,6 +41,11 @@ use self::ownership_diagnostic_package::{
 };
 use crate::{analyses::borrow_ownership::solver::CORE_LABEL_FAMILIES, utils::rustc::RustProgram};
 
+/// The established solve-time field emitted by the E1/Box census worker.
+/// Parent census gates consume this constant rather than borrowing the
+/// wave-3 summarizer's `solve_wall_s` dialect.
+const E1_WORKER_SOLVE_SECONDS_KEY: &str = "t_solve_s";
+
 #[path = "a16_return_kind_exposure.rs"]
 mod a16_return_kind_exposure;
 #[path = "a4_measurement.rs"]
@@ -4324,7 +4329,7 @@ mod run {
     use z3::{SatResult, ast::Bool};
 
     use super::{
-        collect_program, crown_projection,
+        E1_WORKER_SOLVE_SECONDS_KEY, collect_program, crown_projection,
         ownership_diagnostic_package::{
             self, FunctionPrecisionRecord, NecessityEvidence, PairRemovalOutcome,
             ProductionPrecisionEvidence, RemovalFilter,
@@ -8277,7 +8282,7 @@ mod run {
         // §7 — the per-phase split: what the cache saves, and the residual
         // floor the rewriter always pays.
         if let Some(p) = crate::analyses::borrow_ownership::model_cache::last_solve() {
-            row.set("t_solve_s", format!("{:.3}", p.solve_secs));
+            row.set(E1_WORKER_SOLVE_SECONDS_KEY, format!("{:.3}", p.solve_secs));
             row.set("cache_fingerprint", p.fingerprint);
             row.set(
                 "cache_entry",
@@ -9132,7 +9137,7 @@ mod run {
             "cache_entry",
             solve.cache_entry.as_deref().unwrap_or("none"),
         );
-        row.set("t_solve_s", &solve.solve_wall_s);
+        row.set(E1_WORKER_SOLVE_SECONDS_KEY, &solve.solve_wall_s);
         row.set("revert_artifact", artifact_path.display());
         row.set("subject_artifact", subject_path.display());
         row.set("taxonomy_artifact", taxonomy_path.display());
@@ -16251,7 +16256,11 @@ fn box_wave1_corpus_census() {
         row.set("peak_rss_kb", outcome.peak_rss_kb);
         assert_eq!(row.get("status"), Some("ok"), "{row:?}");
         assert_eq!(row.get("cache_status"), Some("hit"), "{row:?}");
-        assert_eq!(row.get("solve_wall_s"), Some("0.000000"), "{row:?}");
+        assert_eq!(
+            row.get(E1_WORKER_SOLVE_SECONDS_KEY),
+            Some("0.000000"),
+            "{row:?}"
+        );
         assert_eq!(row.get("box_param_planned"), Some("0"), "{row:?}");
         assert_eq!(row.get("box_depth2_planned"), Some("0"), "{row:?}");
         eprintln!(
@@ -16305,6 +16314,17 @@ fn box_wave1_corpus_census() {
 /// `m1_emit_corpus` green.
 fn status_is_failure(status: &str) -> bool {
     status.contains("panic")
+}
+
+#[test]
+fn e1_worker_solve_time_key_has_one_spelling_source() {
+    let source = include_str!("bo_c1.rs");
+    let spelling = ["t_solve", "s"].join("_");
+    assert_eq!(
+        source.matches(&format!("\"{spelling}\"")).count(),
+        1,
+        "the E1 worker solve-time key must be spelled only by E1_WORKER_SOLVE_SECONDS_KEY"
+    );
 }
 
 /// **Declared iff referenced, exactly once** (R8, 2026-08-15).
