@@ -127,6 +127,65 @@ fn text_for<'a>(emission: &'a Emission, name: &str) -> Option<&'a String> {
     })
 }
 
+const BOX_W1_PREAMBLE: &str = "#![allow(dead_code, unused_unsafe, unused_mut, unused_variables)]\n\
+extern \"C\" {\n\
+    fn malloc(size: usize) -> *mut core::ffi::c_void;\n\
+    fn free(ptr: *mut core::ffi::c_void);\n\
+}\n";
+
+#[test]
+fn box_w1_malloc_literal_first_store_emits_box_and_free_site_drop() {
+    let src = format!(
+        "{BOX_W1_PREAMBLE}\n\
+         pub unsafe fn f() -> i32 {{\n\
+             let mut p: *mut i32 = malloc(core::mem::size_of::<i32>()) as *mut i32;\n\
+             *p = 7;\n\
+             let out = *p;\n\
+             free(p as *mut core::ffi::c_void);\n\
+             out\n\
+         }}\n"
+    );
+    let super::RewriteOutcome::Emitted { source, .. } = super::rewrite_m1(&src) else {
+        panic!("BOX-W1 fixture must emit");
+    };
+    assert!(source.contains("p: Box<i32>"), "{source}");
+    assert!(source.contains("Box::new(7)"), "{source}");
+    assert!(
+        !source.contains("*p = 7"),
+        "redundant store survived: {source}"
+    );
+    assert!(
+        source.contains("drop(p)"),
+        "C free site did not become drop: {source}"
+    );
+    assert!(
+        !source.contains("free(p as"),
+        "raw free call survived: {source}"
+    );
+}
+
+#[test]
+fn box_n5_depth_two_local_stays_out_of_wave1() {
+    let src = format!(
+        "{BOX_W1_PREAMBLE}\n\
+         pub unsafe fn f() {{\n\
+             let p: *mut *mut i32 = malloc(core::mem::size_of::<*mut i32>()) as *mut *mut i32;\n\
+             free(p as *mut core::ffi::c_void);\n\
+         }}\n"
+    );
+    let super::RewriteOutcome::Emitted { source, .. } = super::rewrite_m1(&src) else {
+        panic!("BOX-N5 fixture must complete without a Box decision");
+    };
+    assert!(
+        source.contains("p: *mut *mut i32"),
+        "depth-2 local moved: {source}"
+    );
+    assert!(
+        !source.contains("Box<"),
+        "depth-2 local entered Box wave: {source}"
+    );
+}
+
 const ROOT_WITH_MODULE: &str = "#![allow(dead_code, unused_unsafe)]\npub mod m;\n";
 const MODULE_SUBJECT: &str = "pub unsafe fn bump(p: *mut i32) -> i32 {\n    *p += 1;\n    *p\n}\n";
 
