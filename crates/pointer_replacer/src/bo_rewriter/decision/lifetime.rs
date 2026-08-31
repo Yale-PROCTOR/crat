@@ -526,6 +526,16 @@ pub(crate) fn derive_return_eligibility(
                 .insert((escape.subject, target));
         }
     }
+    for escape in escapes {
+        let failure = match escape.kind {
+            EscapeKind::ForeignArg => Some(LifetimeFailure::ExternalContractAbsent),
+            EscapeKind::FieldStore if escape.target.is_none() => Some(LifetimeFailure::FieldHeld),
+            _ => None,
+        };
+        if let Some(failure) = failure {
+            result.failures.entry(escape.subject).or_insert(failure);
+        }
+    }
 
     let return_plan_functions = result
         .return_permits
