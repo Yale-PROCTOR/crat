@@ -142,6 +142,8 @@ pub(crate) struct E1Capture {
     pub(crate) files_touched: usize,
     pub(crate) unplaceable: usize,
     pub(crate) a5_receipt: String,
+    /// D4's emitted-MIR Box-drop reconciliation. Empty on non-census paths.
+    pub(crate) box_drop_receipt: String,
     pub(crate) solve_receipt: model_cache::SolveReceipt,
 }
 
@@ -238,6 +240,8 @@ pub(crate) enum RewriteOutcome {
         e1_subject_receipt: String,
         /// Baseline-subtracted error count from the one verify invocation.
         e1_novel_error_count: usize,
+        /// D4's emitted-MIR Box-drop reconciliation.
+        e1_box_drop_receipt: String,
         /// Cache/solve receipt captured inside the compiler callback.
         solve_receipt: Option<model_cache::SolveReceipt>,
     },
@@ -300,6 +304,8 @@ pub(crate) enum RewriteOutcome {
         e1_subject_receipt: String,
         /// Baseline-subtracted error count from the one verify invocation.
         e1_novel_error_count: usize,
+        /// D4's emitted-MIR Box-drop reconciliation.
+        e1_box_drop_receipt: String,
         /// Cache/solve receipt captured inside the compiler callback.
         solve_receipt: Option<model_cache::SolveReceipt>,
     },
@@ -612,6 +618,11 @@ fn rewrite_core_injected(
         } else {
             String::new()
         };
+        let e1_box_drop_policies = if census_once {
+            box_mir_drop_policies(tcx, &table, &emission.unplaceable)
+        } else {
+            Vec::new()
+        };
         let degradations: Vec<decision::Degradation> = table.degradations().cloned().collect();
         let mut emitted_sites: Vec<EmittedSite> = Vec::new();
         // One entry per EMITTED SUBJECT (not per function), so a revert can move
@@ -741,6 +752,7 @@ fn rewrite_core_injected(
             emitted_subjects,
             a5_receipt,
             e1_subject_receipt,
+            e1_box_drop_policies,
         ))
     });
 
@@ -846,6 +858,7 @@ fn verify_and_revert(
     emitted_subjects: Vec<(String, String, String)>,
     a5_receipt: String,
     e1_subject_receipt: String,
+    e1_box_drop_policies: Vec<verify::BoxMirDropPolicy>,
 ) -> RewriteOutcome {
     // `excluded` is a LOCAL again: the loop holds `tcx`, so a value that used
     // to cross the boundary is simply computed here. One of the ten, retired.
@@ -943,6 +956,7 @@ fn verify_and_revert(
         },
         e1_subject_receipt,
         e1_novel_error_count: 0,
+        e1_box_drop_receipt: String::new(),
         solve_receipt: model_cache::solve_receipt(),
     };
     let crate_dir = tree_base
@@ -1083,6 +1097,28 @@ fn verify_and_revert(
             facts.first_diags = novel.clone();
             facts.observed_root = Some(observed_root.clone());
             facts.e1_novel_error_count = novel_errors;
+            facts.e1_box_drop_receipt = match verify::box_mir_drops_path(staged.root()) {
+                Ok(mut drops) => {
+                    drops.retain(|drop| {
+                        e1_box_drop_policies.iter().any(|policy| {
+                            policy.function == drop.function && policy.local_name == drop.local_name
+                        })
+                    });
+                    match verify::reconcile_box_mir_drop_policies(&drops, &e1_box_drop_policies) {
+                        Ok(tsv) => {
+                            format!("status=ok\ndata=provisional\nrows={}\n{tsv}", drops.len())
+                        }
+                        Err(error) => format!(
+                            "status=error\ndata=false\ndetail={}\n",
+                            error.replace(['\t', '\r', '\n'], " ")
+                        ),
+                    }
+                }
+                Err(error) => format!(
+                    "status=error\ndata=false\ndetail={}\n",
+                    error.replace(['\t', '\r', '\n'], " ")
+                ),
+            };
             for diagnostic in &novel {
                 let mut owners = attribute(
                     std::slice::from_ref(diagnostic),
@@ -2096,6 +2132,7 @@ struct OutcomeFacts {
     e1_adapter_receipt: String,
     e1_subject_receipt: String,
     e1_novel_error_count: usize,
+    e1_box_drop_receipt: String,
     solve_receipt: Option<model_cache::SolveReceipt>,
 }
 
@@ -2149,6 +2186,7 @@ impl RewriteOutcome {
             e1_adapter_receipt,
             e1_subject_receipt,
             novel_error_count,
+            e1_box_drop_receipt,
             baseline_keys,
             baseline_errors,
             baseline_msg_env,
@@ -2165,6 +2203,7 @@ impl RewriteOutcome {
                 e1_adapter_receipt,
                 e1_subject_receipt,
                 e1_novel_error_count,
+                e1_box_drop_receipt,
                 baseline_keys,
                 baseline_errors,
                 baseline_msg_env,
@@ -2180,6 +2219,7 @@ impl RewriteOutcome {
                 e1_adapter_receipt,
                 e1_subject_receipt,
                 e1_novel_error_count,
+                e1_box_drop_receipt,
                 baseline_keys,
                 baseline_errors,
                 baseline_msg_env,
@@ -2197,6 +2237,7 @@ impl RewriteOutcome {
                 e1_adapter_receipt,
                 e1_subject_receipt,
                 e1_novel_error_count,
+                e1_box_drop_receipt,
                 baseline_keys,
                 baseline_errors,
                 baseline_msg_env,
@@ -2212,6 +2253,7 @@ impl RewriteOutcome {
                 e1_adapter_receipt,
                 e1_subject_receipt,
                 e1_novel_error_count,
+                e1_box_drop_receipt,
                 baseline_keys,
                 baseline_errors,
                 baseline_msg_env,
@@ -2237,6 +2279,7 @@ impl RewriteOutcome {
             files_touched,
             unplaceable,
             a5_receipt,
+            box_drop_receipt: e1_box_drop_receipt,
             solve_receipt: solve_receipt
                 .ok_or_else(|| "E1 capture has no solve receipt".to_owned())?,
         })
@@ -2288,6 +2331,7 @@ impl OutcomeFacts {
             e1_adapter_receipt: self.e1_adapter_receipt,
             e1_subject_receipt: self.e1_subject_receipt,
             e1_novel_error_count: self.e1_novel_error_count,
+            e1_box_drop_receipt: self.e1_box_drop_receipt,
             solve_receipt: self.solve_receipt,
         }
     }
@@ -2314,6 +2358,7 @@ impl OutcomeFacts {
             e1_adapter_receipt: self.e1_adapter_receipt,
             e1_subject_receipt: self.e1_subject_receipt,
             e1_novel_error_count: self.e1_novel_error_count,
+            e1_box_drop_receipt: self.e1_box_drop_receipt,
             solve_receipt: self.solve_receipt,
         }
     }
@@ -3554,6 +3599,46 @@ pub(crate) struct BoxPlanArtifact {
     pub(crate) a5_global_setup_wall_s: f64,
     pub(crate) a5_pair_classification_wall_s: f64,
     pub(crate) a5_receipt_render_wall_s: f64,
+}
+
+fn box_mir_drop_policies(
+    tcx: TyCtxt<'_>,
+    table: &decision::DecisionTable,
+    unplaceable: &[plan::Unplaceable],
+) -> Vec<verify::BoxMirDropPolicy> {
+    let unplaceable = unplaceable
+        .iter()
+        .map(|row| row.subject.as_str())
+        .collect::<std::collections::BTreeSet<_>>();
+    let mut policies = table
+        .entries
+        .iter()
+        .filter_map(|(subject, decision)| {
+            let decision::Decision::Box(plan) = decision else {
+                return None;
+            };
+            let function = tcx.def_path_str(subject.fn_did.to_def_id());
+            let subject_key = subject.identity_key(&function);
+            if unplaceable.contains(subject_key.as_str()) {
+                return None;
+            }
+            Some(verify::BoxMirDropPolicy {
+                subject: subject_key,
+                function,
+                local_name: subject.param_name.clone(),
+                overwrite_sites: plan
+                    .overwrite_spans
+                    .iter()
+                    .map(|span| decision::emitability::EmitabilityFacts::site(tcx, *span))
+                    .collect(),
+                retained_sink: plan.retained_sink,
+                optional: plan.optional,
+                implicit_scope_close: plan.implicit_scope_close,
+            })
+        })
+        .collect::<Vec<_>>();
+    policies.sort_by(|left, right| left.subject.cmp(&right.subject));
+    policies
 }
 
 pub(crate) fn box_plan_artifact(tcx: TyCtxt<'_>) -> Result<BoxPlanArtifact, String> {

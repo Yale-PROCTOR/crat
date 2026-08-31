@@ -504,12 +504,37 @@ fn box_d4_emitted_mir_drop_observer_distinguishes_close_sites() {
 
 #[test]
 fn box_d4_unreceipted_implicit_drop_is_rejected() {
-    let source = "#![allow(dead_code)]\npub fn f() { let p: Box<i32> = Box::new(1); let _ = *p; }\n";
+    let source =
+        "#![allow(dead_code)]\npub fn f() { let p: Box<i32> = Box::new(1); let _ = *p; }\n";
     let drops = super::verify::box_mir_drops_str(source).expect("observe emitted MIR drops");
     assert!(!drops.is_empty(), "fixture must contain an implicit Drop");
     let error = super::verify::reconcile_box_mir_drops(&drops, &[])
         .expect_err("an implicit Drop without a waiver receipt must fail");
     assert!(error.contains("unreceipted"), "wrong failure: {error}");
+}
+
+#[test]
+fn box_d4_overwrite_scope_and_unwind_drops_receive_distinct_receipts() {
+    let source = "#![allow(dead_code, unused_assignments)]\n\
+                  pub fn f() { let mut p: Box<i32> = Box::new(1); p = Box::new(2); let _ = *p; }\n";
+    let drops = super::verify::box_mir_drops_str(source).expect("observe emitted MIR drops");
+    let receipt = super::verify::reconcile_box_mir_drop_policies(
+        &drops,
+        &[super::verify::BoxMirDropPolicy {
+            subject: "f::p#1".to_owned(),
+            function: "f".to_owned(),
+            local_name: Some("p".to_owned()),
+            overwrite_sites: vec!["<original>:2:57".to_owned()],
+            retained_sink: false,
+            optional: false,
+            implicit_scope_close: true,
+        }],
+    )
+    .expect("all implicit drops are authorized");
+    assert!(receipt.contains("waiver-drop(overwrite)"), "{receipt}");
+    assert!(receipt.contains("waiver-drop(scope-exit)"), "{receipt}");
+    assert!(receipt.contains("waiver-drop(unwind)"), "{receipt}");
+    assert!(receipt.contains("<original>:2:57"), "{receipt}");
 }
 
 const ROOT_WITH_MODULE: &str = "#![allow(dead_code, unused_unsafe)]\npub mod m;\n";

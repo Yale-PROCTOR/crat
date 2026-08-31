@@ -20,6 +20,341 @@ use std::{
 
 use super::plan::FileKey;
 
+/// One reachable MIR `Drop` terminator whose dropped local contains a Box.
+///
+/// Explicit `drop(value)` calls are not rows: they consume the value through a
+/// call terminator. This ledger observes only compiler-inserted cleanup, which
+/// is exactly the population that addendum 101 D4 requires to carry a retained
+/// C-sink identity or an explicit waiver receipt.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct BoxMirDrop {
+    pub(crate) function: String,
+    pub(crate) local: u32,
+    pub(crate) local_name: Option<String>,
+    pub(crate) file: String,
+    pub(crate) site: String,
+    pub(crate) line: usize,
+    pub(crate) cleanup: bool,
+    pub(crate) optional: bool,
+}
+
+/// One production authorization for a compiler-inserted Box drop.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct BoxMirDropAllowance {
+    pub(crate) function: String,
+    pub(crate) local_name: Option<String>,
+    pub(crate) line: Option<usize>,
+    pub(crate) cleanup: Option<bool>,
+    pub(crate) site: Option<String>,
+    pub(crate) reason: String,
+}
+
+/// The pre-emission authorization carried by one accepted Box plan.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct BoxMirDropPolicy {
+    pub(crate) subject: String,
+    pub(crate) function: String,
+    pub(crate) local_name: Option<String>,
+    pub(crate) overwrite_sites: Vec<String>,
+    pub(crate) retained_sink: bool,
+    pub(crate) optional: bool,
+    pub(crate) implicit_scope_close: bool,
+}
+
+fn box_container_kind(
+    tcx: rustc_middle::ty::TyCtxt<'_>,
+    ty: rustc_middle::ty::Ty<'_>,
+) -> Option<bool> {
+    if ty.is_box() {
+        return Some(false);
+    }
+    let rustc_middle::ty::TyKind::Adt(def, args) = ty.kind() else {
+        return None;
+    };
+    if !tcx.is_diagnostic_item(rustc_span::sym::Option, def.did()) {
+        return None;
+    }
+    args.types().any(|inner| inner.is_box()).then_some(true)
+}
+
+fn collect_box_mir_drops(tcx: rustc_middle::ty::TyCtxt<'_>) -> Vec<BoxMirDrop> {
+    use rustc_middle::mir::{TerminatorKind, VarDebugInfoContents};
+
+    let mut rows = Vec::new();
+    for maybe_owner in tcx.hir_crate(()).owners.iter() {
+        let Some(owner) = maybe_owner.as_owner() else {
+            continue;
+        };
+        let rustc_hir::OwnerNode::Item(item) = owner.node() else {
+            continue;
+        };
+        if !matches!(item.kind, rustc_hir::ItemKind::Fn { .. }) {
+            continue;
+        }
+        let did = item.owner_id.def_id;
+        let body = tcx.mir_drops_elaborated_and_const_checked(did).borrow();
+        let function = tcx.def_path_str(did.to_def_id());
+        for (block, data) in body.basic_blocks.iter_enumerated() {
+            let TerminatorKind::Drop { place, .. } = &data.terminator().kind else {
+                continue;
+            };
+            let Some(optional) = box_container_kind(tcx, body.local_decls[place.local].ty) else {
+                continue;
+            };
+            let names = body
+                .var_debug_info
+                .iter()
+                .filter_map(|info| match info.value {
+                    VarDebugInfoContents::Place(debug_place)
+                        if debug_place.as_local() == Some(place.local) =>
+                    {
+                        Some(info.name.to_string())
+                    }
+                    _ => None,
+                })
+                .collect::<std::collections::BTreeSet<_>>();
+            let span = data.terminator().source_info.span.source_callsite();
+            let pos = tcx.sess.source_map().lookup_char_pos(span.lo());
+            rows.push(BoxMirDrop {
+                function: function.clone(),
+                local: place.local.as_u32(),
+                local_name: (names.len() == 1).then(|| names.iter().next().unwrap().clone()),
+                file: pos.file.name.prefer_local().to_string(),
+                site: tcx.sess.source_map().span_to_diagnostic_string(span),
+                line: pos.line,
+                cleanup: body.basic_blocks[block].is_cleanup,
+                optional,
+            });
+        }
+    }
+    rows.sort_by(|left, right| {
+        (
+            left.function.as_str(),
+            left.local,
+            left.line,
+            left.cleanup,
+            left.site.as_str(),
+        )
+            .cmp(&(
+                right.function.as_str(),
+                right.local,
+                right.line,
+                right.cleanup,
+                right.site.as_str(),
+            ))
+    });
+    rows
+}
+
+/// Reconcile observations against the accepted Box plan and render the D4
+/// receipt rows. The emitted sites themselves are exact; each overwrite row is
+/// paired in lexical order with the plan's exact original-source overwrite
+/// site, so the receipt carries both coordinate frames without asking a
+/// whole-function AST line map to invent an interior offset.
+pub(crate) fn reconcile_box_mir_drop_policies(
+    drops: &[BoxMirDrop],
+    policies: &[BoxMirDropPolicy],
+) -> Result<String, String> {
+    let mut grouped: std::collections::BTreeMap<usize, Vec<BoxMirDrop>> =
+        std::collections::BTreeMap::new();
+    for drop in drops {
+        let candidates = policies
+            .iter()
+            .enumerate()
+            .filter(|policy| {
+                policy.1.function == drop.function && policy.1.local_name == drop.local_name
+            })
+            .collect::<Vec<_>>();
+        let [(policy_index, _)] = candidates.as_slice() else {
+            return Err(format!(
+                "Box MIR Drop policy identity is ambiguous: function={} local={} name={} policies={}",
+                drop.function,
+                drop.local,
+                drop.local_name.as_deref().unwrap_or("<unnamed>"),
+                candidates.len(),
+            ));
+        };
+        grouped.entry(*policy_index).or_default().push(drop.clone());
+    }
+
+    let mut allowances = Vec::new();
+    let mut plan_sites =
+        std::collections::BTreeMap::<(String, u32, usize, bool, String), String>::new();
+    for (policy_index, policy) in policies.iter().enumerate() {
+        let mut observed = grouped.remove(&policy_index).unwrap_or_default();
+        observed.sort_by(|left, right| {
+            (left.cleanup, left.line, left.site.as_str()).cmp(&(
+                right.cleanup,
+                right.line,
+                right.site.as_str(),
+            ))
+        });
+        let normal = observed
+            .iter()
+            .filter(|drop| !drop.cleanup)
+            .cloned()
+            .collect::<Vec<_>>();
+        let terminal_close =
+            usize::from(policy.implicit_scope_close || (policy.optional && policy.retained_sink));
+        let expected_normal = policy.overwrite_sites.len() + terminal_close;
+        if normal.len() != expected_normal {
+            return Err(format!(
+                "unreceipted Box MIR Drop population: subject={} function={} name={} expected_normal={} got_normal={} overwrites={} terminal_close={}",
+                policy.subject,
+                policy.function,
+                policy.local_name.as_deref().unwrap_or("<unnamed>"),
+                expected_normal,
+                normal.len(),
+                policy.overwrite_sites.len(),
+                terminal_close,
+            ));
+        }
+        for (index, drop) in normal.iter().enumerate() {
+            let (reason, plan_site) = if let Some(site) = policy.overwrite_sites.get(index) {
+                ("waiver-drop(overwrite)", site.clone())
+            } else if policy.implicit_scope_close {
+                ("waiver-drop(scope-exit)", "function-exit".to_owned())
+            } else {
+                (
+                    "retained-c-sink(empty-option-close)",
+                    "retained-c-sink".to_owned(),
+                )
+            };
+            allowances.push(BoxMirDropAllowance {
+                function: drop.function.clone(),
+                local_name: drop.local_name.clone(),
+                line: Some(drop.line),
+                cleanup: Some(drop.cleanup),
+                site: Some(drop.site.clone()),
+                reason: reason.to_owned(),
+            });
+            plan_sites.insert(
+                (
+                    drop.function.clone(),
+                    drop.local,
+                    drop.line,
+                    drop.cleanup,
+                    drop.site.clone(),
+                ),
+                plan_site,
+            );
+        }
+        for drop in observed.iter().filter(|drop| drop.cleanup) {
+            allowances.push(BoxMirDropAllowance {
+                function: drop.function.clone(),
+                local_name: drop.local_name.clone(),
+                line: Some(drop.line),
+                cleanup: Some(drop.cleanup),
+                site: Some(drop.site.clone()),
+                reason: "waiver-drop(unwind)".to_owned(),
+            });
+            plan_sites.insert(
+                (
+                    drop.function.clone(),
+                    drop.local,
+                    drop.line,
+                    drop.cleanup,
+                    drop.site.clone(),
+                ),
+                "compiler-cleanup-edge".to_owned(),
+            );
+        }
+    }
+    debug_assert!(grouped.is_empty());
+    let matched = reconcile_box_mir_drops(drops, &allowances)?;
+    let mut output = String::from(
+        "function\tlocal\tlocal_name\temitted_site\temitted_line\tcleanup\toptional\treceipt\tplan_site\n",
+    );
+    for (drop, receipt) in matched {
+        let plan_site = plan_sites
+            .get(&(
+                drop.function.clone(),
+                drop.local,
+                drop.line,
+                drop.cleanup,
+                drop.site.clone(),
+            ))
+            .ok_or_else(|| "matched Box drop lost its plan-site receipt".to_owned())?;
+        output.push_str(&format!(
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+            drop.function,
+            drop.local,
+            drop.local_name.as_deref().unwrap_or("<unnamed>"),
+            drop.site.replace(['\t', '\r', '\n'], " "),
+            drop.line,
+            u8::from(drop.cleanup),
+            u8::from(drop.optional),
+            receipt,
+            plan_site.replace(['\t', '\r', '\n'], " "),
+        ));
+    }
+    Ok(output)
+}
+
+#[cfg(test)]
+pub(crate) fn box_mir_drops_str(source: &str) -> Result<Vec<BoxMirDrop>, String> {
+    ::utils::compilation::run_compiler_on_str(source, |tcx| {
+        ::utils::type_check(tcx);
+        collect_box_mir_drops(tcx)
+    })
+    .map_err(|_| "emitted source failed before the Box MIR drop observer".to_owned())
+}
+
+#[allow(
+    dead_code,
+    reason = "Box wave-1's cfg(test) corpus worker is the first path consumer"
+)]
+pub(crate) fn box_mir_drops_path(root: &Path) -> Result<Vec<BoxMirDrop>, String> {
+    ::utils::compilation::run_compiler_on_path(root, |tcx| {
+        ::utils::type_check(tcx);
+        collect_box_mir_drops(tcx)
+    })
+    .map_err(|_| "emitted crate failed before the Box MIR drop observer".to_owned())
+}
+
+/// Fail closed when any compiler-inserted Box drop lacks a named authorization.
+///
+/// A `None` allowance line is deliberately broad only in the coordinate axis:
+/// it still matches an exact function and binding identity. Production uses it
+/// for the empty `Option<Box<_>>` shell left after `drop(p.take())`, whose
+/// allocation generation is already closed at the retained C sink.
+pub(crate) fn reconcile_box_mir_drops(
+    drops: &[BoxMirDrop],
+    allowances: &[BoxMirDropAllowance],
+) -> Result<Vec<(BoxMirDrop, String)>, String> {
+    let mut matched = Vec::new();
+    for drop in drops {
+        let candidates = allowances
+            .iter()
+            .filter(|allowance| {
+                allowance.function == drop.function
+                    && allowance.local_name == drop.local_name
+                    && allowance.line.is_none_or(|line| line == drop.line)
+                    && allowance
+                        .cleanup
+                        .is_none_or(|cleanup| cleanup == drop.cleanup)
+                    && allowance
+                        .site
+                        .as_ref()
+                        .is_none_or(|site| site == &drop.site)
+            })
+            .collect::<Vec<_>>();
+        let [allowance] = candidates.as_slice() else {
+            return Err(format!(
+                "unreceipted Box MIR Drop: function={} local={} name={} site={} cleanup={} candidates={}",
+                drop.function,
+                drop.local,
+                drop.local_name.as_deref().unwrap_or("<unnamed>"),
+                drop.site,
+                drop.cleanup,
+                candidates.len(),
+            ));
+        };
+        matched.push((drop.clone(), allowance.reason.clone()));
+    }
+    Ok(matched)
+}
+
 /// The same hard gate, over a crate **rooted at a path**.
 ///
 /// A multi-file crate cannot be handed to the string gate: its modules resolve

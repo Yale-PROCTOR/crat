@@ -9048,6 +9048,19 @@ mod run {
         );
         let cache_receipt_path = directory.join(format!("{name}.cache-receipt.tsv"));
         std::fs::write(&cache_receipt_path, cache_receipt).expect("write E1 cache receipt");
+        let box_drop_receipt_path = directory.join(format!("{name}.box-drops.tsv"));
+        std::fs::write(&box_drop_receipt_path, &capture.box_drop_receipt)
+            .expect("write Box MIR drop receipt");
+        let box_drop_status = capture
+            .box_drop_receipt
+            .lines()
+            .find_map(|line| line.strip_prefix("status="))
+            .unwrap_or("missing");
+        let box_drop_rows = capture
+            .box_drop_receipt
+            .lines()
+            .find_map(|line| line.strip_prefix("rows="))
+            .unwrap_or("0");
 
         row.set("e1_reverts", primary.len());
         row.set("subject_rows", mass.counts.subjects);
@@ -9126,6 +9139,9 @@ mod run {
         row.set("adapter_receipt_artifact", adapter_path.display());
         row.set("a5_receipt_artifact", a5_receipt_path.display());
         row.set("cache_receipt_artifact", cache_receipt_path.display());
+        row.set("box_drop_status", box_drop_status);
+        row.set("box_drop_rows", box_drop_rows);
+        row.set("box_drop_artifact", box_drop_receipt_path.display());
         row.set("status", "ok");
         row.set("t_total_s", secs(started.elapsed()));
         row
@@ -9134,6 +9150,10 @@ mod run {
     pub fn run_box_census(input: &std::path::Path) -> Row {
         let mut row = run_e1_revert_census(input);
         if row.get("status") != Some("ok") {
+            return row;
+        }
+        if row.get("box_drop_status") != Some("ok") {
+            row.set("status", "box-drop-postcheck-error");
             return row;
         }
         let started = Instant::now();
@@ -12236,6 +12256,7 @@ fn the_reporting_site_reads_files_touched_not_the_map_size() {
         e1_adapter_receipt: String::new(),
         e1_subject_receipt: String::new(),
         e1_novel_error_count: 0,
+        e1_box_drop_receipt: String::new(),
         solve_receipt: None,
     };
     let (_emitted, _degraded, files_touched, reverted, ..) = run::emit_counters(&outcome);

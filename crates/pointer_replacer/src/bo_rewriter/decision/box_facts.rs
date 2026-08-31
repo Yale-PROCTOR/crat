@@ -1063,6 +1063,17 @@ pub(crate) struct BoxPlan {
     pub(crate) delete_statements: Vec<Span>,
     pub(crate) receipts: Vec<String>,
     pub(crate) fabricated_extent: bool,
+    /// Exact source assignments whose old generation is closed by Rust's
+    /// ordinary overwrite drop. The emitted-MIR postcheck maps only these
+    /// lines to `waiver-drop(overwrite)`.
+    pub(crate) overwrite_spans: Vec<Span>,
+    /// A surviving C free consumes the final generation. Nullable plans still
+    /// have an implicit drop of the now-empty `Option`; the postcheck maps that
+    /// shell to this retained sink rather than inventing a waiver.
+    pub(crate) retained_sink: bool,
+    /// No retained sink survives for the final generation, so a normal exit
+    /// may close it under the output-behavior waiver.
+    pub(crate) implicit_scope_close: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1255,6 +1266,13 @@ impl BoxOwnershipFacts {
                 } if callee == "calloc" && count.trim() != "1" => BoxShape::Slice,
                 _ => BoxShape::Sized,
             };
+            let retained_sink = self.endpoints.iter().any(|endpoint| {
+                endpoint.role == EndpointRole::Sink
+                    && endpoint.status == EndpointStatus::Active
+                    && endpoint
+                        .slot_ref
+                        .is_some_and(|sink| self.move_reaches(slot, sink))
+            });
             return Ok(BoxPlan {
                 shape,
                 optional: false,
@@ -1265,6 +1283,9 @@ impl BoxOwnershipFacts {
                     upstream.label, subject.label
                 )],
                 fabricated_extent: false,
+                overwrite_spans: Vec::new(),
+                retained_sink,
+                implicit_scope_close: !retained_sink,
             });
         }
         let all_active_sinks = self
@@ -1616,6 +1637,21 @@ impl BoxOwnershipFacts {
                 super::emitability::EmitabilityFacts::site(tcx, subject.binding_span)
             ));
         }
+        let overwrite_spans = constructions
+            .owner_overwrites
+            .get(&key)
+            .into_iter()
+            .flatten()
+            .filter_map(|overwrite| {
+                (!matches!(
+                    &overwrite.construction,
+                    super::construction::Construction::Alloc { callee, .. }
+                        if callee == "realloc"
+                ))
+                .then_some(overwrite.statement_span)
+            })
+            .collect();
+        let retained_sink = !active_sinks.is_empty();
         Ok(BoxPlan {
             shape,
             optional,
@@ -1623,6 +1659,9 @@ impl BoxOwnershipFacts {
             delete_statements,
             receipts,
             fabricated_extent,
+            overwrite_spans,
+            retained_sink,
+            implicit_scope_close: !retained_sink,
         })
     }
 
