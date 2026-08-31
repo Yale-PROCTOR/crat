@@ -5589,6 +5589,39 @@ fn e2_w7_only_a_direct_local_call_result_may_be_inferred_safe() {
     );
 }
 
+/// E2-W3 RED — output storage receives the modeled source lifetime, not the
+/// temporary local used to carry the call argument.  The permit is keyed to
+/// the field-free signature-depth slot (`*out`), so a later AST pass has no
+/// opportunity to substitute an implementation temporary.
+#[test]
+fn e2_w3_output_storage_uses_source_not_temp_lifetime() {
+    let fixture = Fixture::new(&[(
+        "lib.rs",
+        "#![allow(dead_code, unused_unsafe)]\n\
+         pub unsafe fn store(out: *mut *const i32, p: *const i32) {\n\
+             *out = p;\n\
+         }\n",
+    )]);
+    let receipt = ::utils::compilation::run_compiler_on_path(&fixture.root(), |tcx| {
+        let (_, ctx) = super::decide_table_with_ctx_config(
+            tcx,
+            Some((
+                crate::analyses::borrow_ownership::a5_overlap::A5Mode::PreciseReplay,
+                Some(
+                    crate::analyses::borrow_ownership::a5_overlap::WholeProgramAttestation::FrozenBenchmarkGraph,
+                ),
+            )),
+        )
+        .expect("E2-W3 decision table");
+        ctx.lifetime_eligibility.output_storage_receipts()
+    })
+    .expect("E2-W3 fixture compiles before rewriting");
+
+    assert_eq!(receipt.len(), 1, "{receipt:#?}");
+    assert_eq!(receipt[0].source, "arg2/deref0/depth0");
+    assert_eq!(receipt[0].target, "arg1/deref1/depth0");
+}
+
 fn receipt_column(receipt: &str, name: &str) -> usize {
     receipt
         .lines()
