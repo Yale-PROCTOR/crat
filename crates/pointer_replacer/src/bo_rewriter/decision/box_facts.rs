@@ -791,8 +791,8 @@ mod tests {
     use rustc_index::IndexVec;
 
     use super::{
-        EndpointStatus, FactValue, RecordedEquation, classify_endpoint, render_equations,
-        replay_values,
+        EndpointStatus, FactValue, RecordedEquation, SinkCarrierDef, SinkCarrierReason,
+        classify_endpoint, render_equations, replay_values, resolve_sink_carrier,
     };
     use crate::analyses::borrow_ownership::{SlotKind, ssa::constraint::Var};
 
@@ -887,5 +887,38 @@ mod tests {
             render_equations(&[left.clone(), right.clone()]),
             render_equations(&[right, left]),
         );
+    }
+
+    #[test]
+    fn box_n7_copy_temp_sink_resolves_to_its_carrier() {
+        let temp = rustc_middle::mir::Local::from_usize(9);
+        let carrier = rustc_middle::mir::Local::from_usize(4);
+        assert_eq!(
+            resolve_sink_carrier(temp, true, Some(SinkCarrierDef::Copy(carrier))),
+            Ok(carrier),
+            "mutation killer: deleting sink-carrier resolution returns the temp"
+        );
+    }
+
+    #[test]
+    fn box_n7_direct_sink_argument_keeps_its_identity() {
+        let direct = rustc_middle::mir::Local::from_usize(4);
+        assert_eq!(resolve_sink_carrier(direct, false, None), Ok(direct));
+    }
+
+    #[test]
+    fn box_n7_ambiguous_sink_carriers_fail_closed_by_reason() {
+        let temp = rustc_middle::mir::Local::from_usize(9);
+        for (definition, expected) in [
+            (Some(SinkCarrierDef::Multiple), SinkCarrierReason::MultiDef),
+            (Some(SinkCarrierDef::NonCopy), SinkCarrierReason::NonCopyDef),
+            (
+                Some(SinkCarrierDef::Projected),
+                SinkCarrierReason::ProjectionBase,
+            ),
+            (None, SinkCarrierReason::MissingDef),
+        ] {
+            assert_eq!(resolve_sink_carrier(temp, true, definition), Err(expected));
+        }
     }
 }
