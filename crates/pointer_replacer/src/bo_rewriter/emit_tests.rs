@@ -5846,6 +5846,69 @@ fn e2_n3_n4_external_and_field_rows_are_loudly_held() {
     );
 }
 
+/// E2-N5 RED — an on-disk cache hit must reproduce the consumed model, A5
+/// receipt, finalized lifetime plan, and structurally emitted source bytes.
+#[test]
+fn e2_n5_cache_and_fresh_paths_share_plan_model_a5_and_source_bytes() {
+    let fixture = Fixture::new(&[(
+        "lib.rs",
+        "#![allow(dead_code, unused_unsafe)]\n\
+         pub unsafe fn id(p: *const i32) -> *const i32 { p }\n",
+    )]);
+    let cache_dir = fixture.0.join("cache");
+    std::fs::create_dir_all(&cache_dir).expect("E2-N5 cache directory");
+
+    let run = |read: bool| {
+        crate::analyses::borrow_ownership::model_cache::reset_for_test();
+        crate::analyses::borrow_ownership::model_cache::with_test_config(read, &cache_dir, || {
+            ::utils::compilation::run_compiler_on_path(&fixture.root(), |tcx| {
+                let capture = super::ast_transform::capture_ast(tcx)?;
+                let (table, ctx) = super::decide_table_with_ctx_config(
+                    tcx,
+                    Some((
+                        crate::analyses::borrow_ownership::a5_overlap::A5Mode::PreciseReplay,
+                        Some(
+                            crate::analyses::borrow_ownership::a5_overlap::WholeProgramAttestation::FrozenBenchmarkGraph,
+                        ),
+                    )),
+                )?;
+                let model = crate::analyses::borrow_ownership::model_cache::model_bytes_sha256(
+                    tcx,
+                    &ctx.slots,
+                    &ctx.model,
+                )
+                .ok_or_else(|| "E2-N5 model key did not render".to_owned())?;
+                let (files, _, _) = super::ast_transform::ast_emitted_files_from(
+                    tcx,
+                    &capture,
+                    &super::ast_transform::RevertSet::default(),
+                    None,
+                    &table,
+                )?;
+                Ok::<_, String>(format!(
+                    "model={model}\na5={}\nplan={}\nsource={files:?}",
+                    ctx.a5_receipt,
+                    table.lifetime_plan.canonical_receipt(tcx),
+                ))
+            })
+            .expect("E2-N5 fixture compiles")
+        })
+    };
+
+    let fresh = run(false).expect("E2-N5 fresh path");
+    let fresh_provenance =
+        crate::analyses::borrow_ownership::model_cache::last_solve().expect("fresh provenance");
+    assert_eq!(fresh_provenance.source, "real");
+
+    let cached = run(true).expect("E2-N5 cached path");
+    let cached_provenance =
+        crate::analyses::borrow_ownership::model_cache::last_solve().expect("cache provenance");
+    assert_eq!(cached_provenance.source, "cache");
+    assert_eq!(cached_provenance.solve_secs, 0.0);
+    assert_eq!(cached, fresh);
+    crate::analyses::borrow_ownership::model_cache::reset_for_test();
+}
+
 fn receipt_column(receipt: &str, name: &str) -> usize {
     receipt
         .lines()
