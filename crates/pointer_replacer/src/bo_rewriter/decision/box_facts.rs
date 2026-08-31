@@ -1015,8 +1015,9 @@ mod tests {
     use rustc_index::IndexVec;
 
     use super::{
-        EndpointStatus, FactValue, RecordedEquation, SinkCarrierDef, SinkCarrierReason,
-        classify_endpoint, render_equations, replay_values, resolve_sink_carrier,
+        BoxScopeFailure, EndpointStatus, FactValue, RecordedEquation, SinkCarrierDef,
+        SinkCarrierReason, box_scope, classify_endpoint, render_equations, replay_values,
+        resolve_sink_carrier, scalar_initializer_supported,
     };
     use crate::analyses::borrow_ownership::{SlotKind, ssa::constraint::Var};
 
@@ -1143,6 +1144,24 @@ mod tests {
             (None, SinkCarrierReason::MissingDef),
         ] {
             assert_eq!(resolve_sink_carrier(temp, true, definition), Err(expected));
+        }
+    }
+
+    #[test]
+    fn box_wave1_scope_is_local_depth_one_only() {
+        assert_eq!(box_scope(false, 1), Ok(()));
+        assert_eq!(box_scope(true, 1), Err(BoxScopeFailure::ParameterHeld));
+        assert_eq!(box_scope(false, 2), Err(BoxScopeFailure::PointerDepth));
+        assert_eq!(box_scope(true, 2), Err(BoxScopeFailure::PointerDepth));
+    }
+
+    #[test]
+    fn box_w1_scalar_initializer_vocabulary_is_closed() {
+        for admitted in ["u8", "u32", "usize", "i8", "i32", "isize", "f32", "f64"] {
+            assert!(scalar_initializer_supported(admitted), "{admitted}");
+        }
+        for refused in ["bool", "char", "*mut i32", "S", "[u8; 4]", "()"] {
+            assert!(!scalar_initializer_supported(refused), "{refused}");
         }
     }
 }
