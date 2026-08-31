@@ -328,6 +328,28 @@ fn box_n2_sibling_copy_split_does_not_create_two_boxes() {
     );
 }
 
+#[test]
+fn box_w6_mutually_exclusive_free_sites_both_become_drops() {
+    let src = format!(
+        "{BOX_W1_PREAMBLE}\n\
+         pub unsafe fn f(flag: bool) {{\n\
+             let mut p: *mut i32 = malloc(core::mem::size_of::<i32>()) as *mut i32;\n\
+             *p = 3;\n\
+             if flag {{\n\
+                 free(p as *mut core::ffi::c_void);\n\
+             }} else {{\n\
+                 free(p as *mut core::ffi::c_void);\n\
+             }}\n\
+         }}\n"
+    );
+    let super::RewriteOutcome::Emitted { source, .. } = super::rewrite_m1(&src) else {
+        panic!("BOX-W6 fixture must emit");
+    };
+    assert!(source.contains("p: Box<i32>"), "{source}");
+    assert_eq!(source.matches("drop(p)").count(), 2, "{source}");
+    assert!(!source.contains("free(p as"), "{source}");
+}
+
 const ROOT_WITH_MODULE: &str = "#![allow(dead_code, unused_unsafe)]\npub mod m;\n";
 const MODULE_SUBJECT: &str = "pub unsafe fn bump(p: *mut i32) -> i32 {\n    *p += 1;\n    *p\n}\n";
 
