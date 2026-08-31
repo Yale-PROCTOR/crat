@@ -1117,7 +1117,7 @@ impl BoxOwnershipFacts {
             .as_deref()
             .ok_or(BoxPlanFailure::AstUnplaceable)?;
         let mut delete_statements = Vec::new();
-        let (initializer, initializer_arm) = match construction {
+        let (initializer, initializer_arm, shape) = match construction {
             super::construction::Construction::Alloc {
                 callee,
                 size,
@@ -1134,14 +1134,27 @@ impl BoxOwnershipFacts {
                 (
                     format!("Box::new({})", store.value),
                     "malloc-literal-first-store",
+                    BoxShape::Sized,
                 )
             }
             super::construction::Construction::Alloc {
                 callee,
+                size,
                 count: Some(count),
-                ..
-            } if callee == "calloc" && count.trim() == "1" => {
-                (format!("Box::new(0 as {normalized})"), "calloc-zero-scalar")
+            } if callee == "calloc" && size.contains(&format!("size_of::<{normalized}>")) => {
+                if count.trim() == "1" {
+                    (
+                        format!("Box::new(0 as {normalized})"),
+                        "calloc-zero-scalar",
+                        BoxShape::Sized,
+                    )
+                } else {
+                    (
+                        format!("vec![0 as {normalized}; {count}].into_boxed_slice()"),
+                        "calloc-zero-slice",
+                        BoxShape::Slice,
+                    )
+                }
             }
             super::construction::Construction::Alloc { callee, .. } if callee == "realloc" => {
                 return Err(BoxPlanFailure::ReallocUnsupported);
@@ -1197,7 +1210,7 @@ impl BoxOwnershipFacts {
             ));
         }
         Ok(BoxPlan {
-            shape: BoxShape::Sized,
+            shape,
             optional: false,
             expr_edits,
             delete_statements,
