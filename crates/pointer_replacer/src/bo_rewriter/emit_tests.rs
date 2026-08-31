@@ -5409,6 +5409,44 @@ fn e2_x1_carrier_reaches_the_lifetime_producer_intact() {
     assert!(receipt.native_flows, "{receipt:?}");
 }
 
+/// E2-W1 RED — a modeled argument-to-return origin must create the private
+/// permit and let the existing decision ladder pass the return-escape gate.
+#[test]
+fn e2_w1_return_decision_uses_the_typed_permit() {
+    let fixture = Fixture::new(&[(
+        "lib.rs",
+        "#![allow(dead_code, unused_unsafe)]\n\
+         pub unsafe fn id(p: *mut i32) -> *mut i32 { p }\n",
+    )]);
+    let (decision, permits) =
+        ::utils::compilation::run_compiler_on_path(&fixture.root(), |tcx| {
+            let (table, ctx) = super::decide_table_with_ctx_config(
+                tcx,
+                Some((
+                    crate::analyses::borrow_ownership::a5_overlap::A5Mode::PreciseReplay,
+                    Some(
+                        crate::analyses::borrow_ownership::a5_overlap::WholeProgramAttestation::FrozenBenchmarkGraph,
+                    ),
+                )),
+            )
+            .expect("E2-W1 decision table");
+            let decision = table
+                .entries
+                .iter()
+                .find(|(subject, _)| subject.label.ends_with("id::p"))
+                .map(|(_, decision)| decision.clone())
+                .expect("id::p subject");
+            (decision, ctx.lifetime_eligibility.return_permit_count())
+        })
+        .expect("E2-W1 fixture compiles before rewriting");
+
+    assert!(
+        matches!(decision, super::decision::Decision::Ref { mutable: true }),
+        "{decision:#?}"
+    );
+    assert_eq!(permits, 1);
+}
+
 fn receipt_column(receipt: &str, name: &str) -> usize {
     receipt
         .lines()
