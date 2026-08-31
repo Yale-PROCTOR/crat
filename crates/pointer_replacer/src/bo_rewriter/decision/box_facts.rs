@@ -111,6 +111,50 @@ pub(crate) struct EndpointFact {
     pub(crate) unknown_reason: Option<String>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SinkCarrierDef {
+    Copy(Local),
+    Multiple,
+    NonCopy,
+    Projected,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SinkCarrierReason {
+    MultiDef,
+    NonCopyDef,
+    ProjectionBase,
+    MissingDef,
+}
+
+impl SinkCarrierReason {
+    fn key(self) -> &'static str {
+        match self {
+            SinkCarrierReason::MultiDef => "sink-carrier-multi-def",
+            SinkCarrierReason::NonCopyDef => "sink-carrier-non-copy-def",
+            SinkCarrierReason::ProjectionBase => "sink-carrier-projection-base",
+            SinkCarrierReason::MissingDef => "sink-carrier-missing-def",
+        }
+    }
+}
+
+fn resolve_sink_carrier(
+    operand: Local,
+    is_eliminable_temp: bool,
+    definition: Option<SinkCarrierDef>,
+) -> Result<Local, SinkCarrierReason> {
+    if !is_eliminable_temp {
+        return Ok(operand);
+    }
+    match definition {
+        Some(SinkCarrierDef::Copy(carrier)) => Ok(carrier),
+        Some(SinkCarrierDef::Multiple) => Err(SinkCarrierReason::MultiDef),
+        Some(SinkCarrierDef::NonCopy) => Err(SinkCarrierReason::NonCopyDef),
+        Some(SinkCarrierDef::Projected) => Err(SinkCarrierReason::ProjectionBase),
+        None => Err(SinkCarrierReason::MissingDef),
+    }
+}
+
 pub(crate) fn classify_endpoint(value: FactValue, slot: SlotKind) -> EndpointStatus {
     match (value, slot) {
         (FactValue::MustOwn, SlotKind::Owning) => EndpointStatus::Active,
