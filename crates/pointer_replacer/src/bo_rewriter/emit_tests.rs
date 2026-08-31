@@ -4985,8 +4985,24 @@ fn receipt_column(receipt: &str, name: &str) -> usize {
 #[test]
 fn e_adapt_w3_w1_proven_disjoint_site_emits_its_slice_adapter() {
     let attempt = e3_attempt(E3_CLEAR_RAW, true, true);
+    let header = attempt
+        .receipt
+        .lines()
+        .next()
+        .expect("receipt header")
+        .split('\t')
+        .collect::<Vec<_>>();
+    assert_eq!(
+        header
+            .iter()
+            .copied()
+            .collect::<std::collections::BTreeSet<_>>()
+            .len(),
+        header.len(),
+        "every receipt column name must be unique: {header:?}"
+    );
     let verdict = receipt_column(&attempt.receipt, "overlap_verdict");
-    let guard = receipt_column(&attempt.receipt, "a5_abi_guard");
+    let guard = receipt_column(&attempt.receipt, "overlap_a5_abi_guard");
     let placed = attempt
         .receipt
         .lines()

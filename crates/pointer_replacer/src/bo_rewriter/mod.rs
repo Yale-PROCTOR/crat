@@ -4511,7 +4511,7 @@ pub(crate) fn seam_tsv(tcx: TyCtxt<'_>) -> Result<String, String> {
 fn seam_tsv_from_table(tcx: TyCtxt<'_>, table: &decision::DecisionTable) -> String {
     let sm = tcx.sess.source_map();
     let mut out = String::from(
-        "kind\towner_fn\tfamily_or_reason\tsite\tlen_arm\tglue_shape\tcaller\tparam_index\ttemplate\tnull_arm\textent_arm\tadapter_key\tsource_shape\tcontext\tdestination\texpected_form\tfound_form\tcandidate_template\tpeer_pairs\troot_identity\tblind\toverlap_verdict\toverlap_reason\tresolved_call_location\ta5_peer_proofs\ta5_world\ta5_abi_guard\n",
+        "kind\towner_fn\tfamily_or_reason\tsite\tlen_arm\tglue_shape\tcaller\tparam_index\ttemplate\tnull_arm\textent_arm\tadapter_key\tsource_shape\tcontext\tdestination\texpected_form\tfound_form\tcandidate_template\tpeer_pairs\troot_identity\tblind\toverlap_verdict\toverlap_reason\tresolved_call_location\ta5_peer_proofs\toverlap_a5_world\toverlap_a5_abi_guard\n",
     );
     for edit in &table.seams.edits {
         let family = match edit.family {
