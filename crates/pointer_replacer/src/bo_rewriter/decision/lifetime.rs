@@ -643,6 +643,24 @@ impl LifetimePlan {
     pub(crate) fn function_count(&self) -> usize {
         self.functions.len()
     }
+
+    pub(crate) fn canonical_receipt(&self, tcx: rustc_middle::ty::TyCtxt<'_>) -> String {
+        let mut rows = self
+            .functions
+            .iter()
+            .map(|(&did, plan)| {
+                (
+                    tcx.def_path_str(did.to_def_id()),
+                    plan.receipt().replace('\n', " | "),
+                )
+            })
+            .collect::<Vec<_>>();
+        rows.sort_by(|left, right| left.0.cmp(&right.0));
+        rows.into_iter()
+            .map(|(function, receipt)| format!("{function}\t{receipt}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
 }
 
 impl FunctionPlan {

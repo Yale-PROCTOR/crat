@@ -5859,9 +5859,12 @@ fn e2_n5_cache_and_fresh_paths_share_plan_model_a5_and_source_bytes() {
     std::fs::create_dir_all(&cache_dir).expect("E2-N5 cache directory");
 
     let run = |read: bool| {
-        crate::analyses::borrow_ownership::model_cache::reset_for_test();
-        crate::analyses::borrow_ownership::model_cache::with_test_config(read, &cache_dir, || {
-            ::utils::compilation::run_compiler_on_path(&fixture.root(), |tcx| {
+        ::utils::compilation::run_compiler_on_path(&fixture.root(), |tcx| {
+            crate::analyses::borrow_ownership::model_cache::reset_for_test();
+            crate::analyses::borrow_ownership::model_cache::with_test_config(
+                read,
+                &cache_dir,
+                || {
                 let capture = super::ast_transform::capture_ast(tcx)?;
                 let (table, ctx) = super::decide_table_with_ctx_config(
                     tcx,
@@ -5885,26 +5888,30 @@ fn e2_n5_cache_and_fresh_paths_share_plan_model_a5_and_source_bytes() {
                     None,
                     &table,
                 )?;
-                Ok::<_, String>(format!(
-                    "model={model}\na5={}\nplan={}\nsource={files:?}",
-                    ctx.a5_receipt,
-                    table.lifetime_plan.canonical_receipt(tcx),
+                let provenance =
+                    crate::analyses::borrow_ownership::model_cache::last_solve()
+                        .ok_or_else(|| "E2-N5 solve provenance missing".to_owned())?;
+                Ok::<_, String>((
+                    format!(
+                        "model={model}\na5={}\nplan={}\nsource={files:?}",
+                        ctx.a5_receipt,
+                        table.lifetime_plan.canonical_receipt(tcx),
+                    ),
+                    provenance.source,
+                    provenance.solve_secs,
                 ))
-            })
-            .expect("E2-N5 fixture compiles")
+                },
+            )
         })
+        .expect("E2-N5 fixture compiles")
     };
 
-    let fresh = run(false).expect("E2-N5 fresh path");
-    let fresh_provenance =
-        crate::analyses::borrow_ownership::model_cache::last_solve().expect("fresh provenance");
-    assert_eq!(fresh_provenance.source, "real");
+    let (fresh, fresh_source, _) = run(false).expect("E2-N5 fresh path");
+    assert_eq!(fresh_source, "real");
 
-    let cached = run(true).expect("E2-N5 cached path");
-    let cached_provenance =
-        crate::analyses::borrow_ownership::model_cache::last_solve().expect("cache provenance");
-    assert_eq!(cached_provenance.source, "cache");
-    assert_eq!(cached_provenance.solve_secs, 0.0);
+    let (cached, cached_source, cached_solve_secs) = run(true).expect("E2-N5 cached path");
+    assert_eq!(cached_source, "cache");
+    assert_eq!(cached_solve_secs, 0.0);
     assert_eq!(cached, fresh);
     crate::analyses::borrow_ownership::model_cache::reset_for_test();
 }
