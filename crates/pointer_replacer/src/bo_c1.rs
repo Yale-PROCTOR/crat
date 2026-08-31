@@ -15906,6 +15906,84 @@ fn box_fact_differential_corpus() {
     );
 }
 
+#[test]
+#[ignore = "Box wave-1: derive-on-load receipts must be root-independent"]
+fn box_fact_two_root_determinism() {
+    use std::{fs, path::PathBuf, time::Duration};
+
+    let root_a = PathBuf::from(
+        std::env::var_os("CRAT_BOX_ROOT_A").expect("two-root gate requires CRAT_BOX_ROOT_A"),
+    );
+    let root_b = PathBuf::from(
+        std::env::var_os("CRAT_BOX_ROOT_B").expect("two-root gate requires CRAT_BOX_ROOT_B"),
+    );
+    assert_ne!(
+        root_a.canonicalize().expect("canonical root A"),
+        root_b.canonicalize().expect("canonical root B"),
+        "two-root gate requires distinct physical roots"
+    );
+    let artifact_dir = PathBuf::from(
+        std::env::var_os("CRAT_BOX_FACT_ARTIFACT_DIR")
+            .expect("two-root gate requires CRAT_BOX_FACT_ARTIFACT_DIR"),
+    );
+    let cache_dir = PathBuf::from(
+        std::env::var_os("CRAT_BO_CACHE_DIR").expect("two-root gate requires CRAT_BO_CACHE_DIR"),
+    );
+    fs::create_dir_all(&artifact_dir).expect("create two-root artifact dir");
+    let mut rows = Vec::new();
+    for (label, input) in [("root-a", root_a), ("root-b", root_b)] {
+        let outcome = orchestrate::run_child_env(
+            label,
+            &input,
+            "box-facts",
+            Duration::from_secs(600),
+            &[
+                ("CRAT_BO_CACHE", "1".to_owned()),
+                ("CRAT_BO_CACHE_DIR", cache_dir.display().to_string()),
+                (
+                    "CRAT_BO_A5_ATTESTATION",
+                    "frozen_benchmark_graph".to_owned(),
+                ),
+                (
+                    "CRAT_BOX_FACT_ARTIFACT_DIR",
+                    artifact_dir.display().to_string(),
+                ),
+            ],
+        );
+        let row = outcome
+            .row
+            .unwrap_or_else(|| panic!("{label} produced no row: {}", outcome.note));
+        assert_eq!(row.get("status"), Some("ok"), "{row:?}");
+        assert_eq!(row.get("cache_status"), Some("hit"), "{row:?}");
+        assert_eq!(row.get("solve_wall_s"), Some("0.000000"), "{row:?}");
+        rows.push(row);
+    }
+    assert_eq!(rows[0].get("fingerprint"), rows[1].get("fingerprint"));
+    assert_eq!(rows[0].get("model_sha256"), rows[1].get("model_sha256"));
+    for suffix in [
+        "endpoints.tsv",
+        "version-sites.tsv",
+        "equations.tsv",
+        "subjects.tsv",
+        "receipt.txt",
+    ] {
+        let left = fs::read(artifact_dir.join(format!("root-a.{suffix}")))
+            .unwrap_or_else(|error| panic!("read root-a {suffix}: {error}"));
+        let right = fs::read(artifact_dir.join(format!("root-b.{suffix}")))
+            .unwrap_or_else(|error| panic!("read root-b {suffix}: {error}"));
+        assert_eq!(left, right, "two-root Box fact drift in {suffix}");
+    }
+    fs::write(
+        artifact_dir.join("two-root-receipt.txt"),
+        format!(
+            "status=complete\ndata=true\ncache_hits=2/2\nsolver_seconds=0\nfingerprint={}\nmodel_sha256={}\nartifact_families=5/5-byte-identical\n",
+            rows[0].get("fingerprint").expect("fingerprint"),
+            rows[0].get("model_sha256").expect("model SHA"),
+        ),
+    )
+    .expect("write two-root receipt");
+}
+
 /// **A panic is a failure; a resource deferral is an absence** (R8, 2026-08-15).
 ///
 /// Lifted out of the sweep because a decision only a 600 s corpus run can
