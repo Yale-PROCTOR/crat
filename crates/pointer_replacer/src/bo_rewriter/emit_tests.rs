@@ -4810,6 +4810,174 @@ fn e2_schema_w1_blocked_rows_retain_candidate_forms_and_peer_pairs() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// Item E call-site adaptation wave 3 — RED-first production-path witnesses.
+// ---------------------------------------------------------------------------
+
+const E3_CLEAR_FIELDS: &str = "#![allow(dead_code, unused_unsafe, unused_mut, unused_variables)]\n\
+    #[repr(C)] pub struct Pair { pub left: i32, pub right: i32 }\n\
+    pub unsafe fn target(a: *mut i32, b: *mut i32) { *a += 1; *b += 1; }\n\
+    pub unsafe fn caller(pair: *mut Pair) {\n\
+        target(&mut (*pair).left, &mut (*pair).right);\n\
+    }\n";
+
+const E3_OVERLAP: &str = "#![allow(dead_code, unused_unsafe, unused_mut, unused_variables)]\n\
+    pub unsafe fn target(a: *mut i32, b: *mut i32) { *a += 1; *b += 1; }\n\
+    pub unsafe fn caller(p: *mut i32) { target(p, p); }\n";
+
+fn force_wave3_target_forms(table: &mut super::decision::DecisionTable, slice: bool) {
+    for (subject, decision) in &mut table.entries {
+        if subject.label.ends_with("caller::pair") || subject.label.ends_with("caller::p") {
+            *decision = super::decision::Decision::Degraded(super::decision::Degradation {
+                subject: subject.label.clone(),
+                site: "<wave3-injected>".to_owned(),
+                reason: super::decision::DegradeReason::CallSiteNotAdapted,
+            });
+        }
+        if subject.label.ends_with("target::a") || subject.label.ends_with("target::b") {
+            *decision = if slice {
+                super::decision::Decision::Slice {
+                    mutable: true,
+                    uses: Vec::new(),
+                }
+            } else {
+                super::decision::Decision::Ref { mutable: true }
+            };
+        }
+    }
+}
+
+/// Drive an injected form decision through the production proof derivation and
+/// the production seam synthesis. The only test seam is the form injection;
+/// site facts, attestation, lookup, candidate construction, and emission are
+/// the shipping path.
+fn e3_attempt(src: &str, attested: bool, slice: bool) -> E2Attempt {
+    let fixture = Fixture::new(&[("lib.rs", src)]);
+    let (emission, receipt) = ::utils::compilation::run_compiler_on_path(&fixture.root(), |tcx| {
+        let attestation = attested.then_some(
+            crate::analyses::borrow_ownership::a5_overlap::WholeProgramAttestation::FrozenBenchmarkGraph,
+        );
+        let (mut table, ctx) = super::decide_table_with_ctx_config(
+            tcx,
+            Some((
+                crate::analyses::borrow_ownership::a5_overlap::A5Mode::PreciseReplay,
+                attestation,
+            )),
+        )
+        .expect("wave-3 decision table");
+        force_wave3_target_forms(&mut table, slice);
+        table.seams = super::decision::seam::synthesize(
+            tcx,
+            &ctx.facts,
+            &ctx.subjects,
+            &table,
+            &ctx.retained_c9_plans,
+            &ctx.analysis.a5_site_proofs,
+        );
+        let receipt = super::seam_tsv_from_table(tcx, &table);
+        let emission = emit_files(
+            tcx,
+            &table,
+            &rustc_hash::FxHashSet::default(),
+            &ctx.retained_c9_plans,
+        )
+        .expect("wave-3 attempted emission");
+        (emission, receipt)
+    })
+    .expect("wave-3 fixture compiles before rewriting");
+    E2Attempt {
+        fixture,
+        emission,
+        receipt,
+    }
+}
+
+fn receipt_column(receipt: &str, name: &str) -> usize {
+    receipt
+        .lines()
+        .next()
+        .expect("receipt header")
+        .split('\t')
+        .position(|column| column == name)
+        .unwrap_or_else(|| panic!("missing receipt column {name}: {receipt}"))
+}
+
+/// E-ADAPT-W3-W1 — a same-root field pair that the frozen A5 site producer
+/// proves disjoint discharges SiteOverlap and reaches the existing slice seam.
+#[test]
+fn e_adapt_w3_w1_proven_disjoint_site_emits_its_slice_adapter() {
+    let attempt = e3_attempt(E3_CLEAR_FIELDS, true, true);
+    let verdict = receipt_column(&attempt.receipt, "overlap_verdict");
+    let guard = receipt_column(&attempt.receipt, "a5_abi_guard");
+    let placed = attempt
+        .receipt
+        .lines()
+        .skip(1)
+        .map(|line| line.split('\t').collect::<Vec<_>>())
+        .filter(|row| row.first() == Some(&"placed"))
+        .collect::<Vec<_>>();
+    assert_eq!(placed.len(), 2, "{}", attempt.receipt);
+    assert!(placed.iter().all(|row| row[verdict] == "clear"));
+    assert!(placed.iter().all(|row| {
+        row[guard] == "permitted:measurement-frozen-graph-attested"
+    }));
+    assert!(
+        e2_root_text(&attempt).contains("core::slice::from_mut"),
+        "{}",
+        e2_root_text(&attempt)
+    );
+}
+
+/// E-ADAPT-W3-N1 — a genuine overlap remains closed even under attestation.
+#[test]
+fn e_adapt_w3_n1_overlapping_site_stays_closed() {
+    let attempt = e3_attempt(E3_OVERLAP, true, true);
+    assert!(
+        attempt.receipt.lines().any(|line| {
+            line.starts_with("blocked\t")
+                && line.contains("\toverlapping\t")
+                && line.contains("a5-not-proven-disjoint")
+        }),
+        "{}",
+        attempt.receipt
+    );
+    assert!(!e2_root_text(&attempt).contains("from_raw_parts"));
+}
+
+/// E-ADAPT-W3-N2 — a clear site with no required glue is recorded but never
+/// changed. Clear is evidence for one gate, not an edit command.
+#[test]
+fn e_adapt_w3_n2_clear_template_none_is_untouched() {
+    let attempt = e3_attempt(E3_CLEAR_FIELDS, true, false);
+    assert!(
+        attempt.receipt.lines().any(|line| {
+            line.starts_with("overlap-proof\t")
+                && line.contains("\tnone\t")
+                && line.contains("\tclear\t")
+        }),
+        "{}",
+        attempt.receipt
+    );
+    assert_eq!(e2_root_text(&attempt), E3_CLEAR_FIELDS);
+}
+
+/// E-ADAPT-W3-N3 — the identical closed-world-dependent site fails closed when
+/// the attestation is absent. Product default remains refusal.
+#[test]
+fn e_adapt_w3_n3_unattested_site_fails_closed_with_typed_reason() {
+    let attempt = e3_attempt(E3_CLEAR_FIELDS, false, true);
+    assert!(
+        attempt.receipt.lines().any(|line| {
+            line.starts_with("blocked\t")
+                && line.contains("\tundeterminable\t")
+                && line.contains("seam-a5-attestation-absent")
+        }),
+        "{}",
+        attempt.receipt
+    );
+    assert!(!e2_root_text(&attempt).contains("core::slice::from_mut"));
+}
+
 /// **A BLOCKED seam row names the CALLEE in `owner_fn`, and the caller in its
 /// own column.**
 ///
