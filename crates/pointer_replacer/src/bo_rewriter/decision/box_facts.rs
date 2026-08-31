@@ -466,6 +466,8 @@ struct MinimalWalk<'a, 'tcx> {
     candidates: Vec<EndpointCandidate>,
     var_slots: FxHashMap<Var, SlotRef>,
     move_edges: Vec<(SlotRef, SlotRef)>,
+    field_held: FxHashSet<SlotRef>,
+    boundary_held: FxHashSet<SlotRef>,
 }
 
 impl<'a, 'tcx> MinimalWalk<'a, 'tcx> {
@@ -484,6 +486,8 @@ impl<'a, 'tcx> MinimalWalk<'a, 'tcx> {
             candidates: Vec::new(),
             var_slots: FxHashMap::default(),
             move_edges: Vec::new(),
+            field_held: FxHashSet::default(),
+            boundary_held: FxHashSet::default(),
         }
     }
 
@@ -592,9 +596,6 @@ impl<'a, 'tcx> MinimalWalk<'a, 'tcx> {
                 let StatementKind::Assign(box (lhs, rhs)) = &statement.kind else {
                     continue;
                 };
-                let Some(lhs_local) = lhs.as_local() else {
-                    continue;
-                };
                 let rhs_operand = match rhs {
                     Rvalue::Use(operand) | Rvalue::Cast(_, operand, _) => Some(operand),
                     _ => None,
@@ -602,6 +603,14 @@ impl<'a, 'tcx> MinimalWalk<'a, 'tcx> {
                 let rhs_local = rhs_operand
                     .and_then(Operand::place)
                     .and_then(|place| place.as_local());
+                let Some(lhs_local) = lhs.as_local() else {
+                    if let Some(rhs_local) = rhs_local
+                        && let Some(slot) = self.slot_for_local(fn_did, rhs_local)
+                    {
+                        self.field_held.insert(slot);
+                    }
+                    continue;
+                };
                 if transparent_argument_temps.contains(&lhs_local) {
                     if let Some(rhs_local) = rhs_local
                         && let Some((rhs_use, rhs_def, rhs_slot)) = self.consume(
@@ -803,7 +812,12 @@ impl<'a, 'tcx> MinimalWalk<'a, 'tcx> {
                         slot,
                         span: terminator.source_info.span,
                     });
-                } else if callee.is_none() {
+                } else if roles.is_empty() {
+                    self.boundary_held.insert(
+                        carrier_presentations
+                            .get(&arg_local)
+                            .map_or(direct_slot, |presentation| presentation.slot),
+                    );
                     self.equations.push(RecordedEquation::LessEqual {
                         left: arg_def,
                         right: arg_use,
@@ -928,6 +942,8 @@ impl<'a, 'tcx> MinimalWalk<'a, 'tcx> {
             replay_error,
             canonical_sha256: String::new(),
             move_edges: self.move_edges,
+            field_held: self.field_held,
+            boundary_held: self.boundary_held,
         };
         facts
             .move_edges
@@ -1005,6 +1021,8 @@ pub(crate) struct BoxOwnershipFacts {
     replay_error: Option<String>,
     canonical_sha256: String,
     move_edges: Vec<(SlotRef, SlotRef)>,
+    field_held: FxHashSet<SlotRef>,
+    boundary_held: FxHashSet<SlotRef>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1056,6 +1074,7 @@ pub(crate) enum BoxPlanFailure {
     EndpointUnjoined,
     MoveAmbiguous,
     FieldHeld,
+    BoundaryHeld,
     InitializerUnsupported,
     ReallocUnsupported,
     FreeDuplicate,
@@ -1074,6 +1093,7 @@ impl BoxPlanFailure {
             BoxPlanFailure::EndpointUnjoined => "box-endpoint-unjoined",
             BoxPlanFailure::MoveAmbiguous => "box-move-ambiguous",
             BoxPlanFailure::FieldHeld => "box-field-held",
+            BoxPlanFailure::BoundaryHeld => "box-param-caller-unknown",
             BoxPlanFailure::InitializerUnsupported => "box-initializer-unsupported",
             BoxPlanFailure::ReallocUnsupported => "box-realloc-transition-unsupported",
             BoxPlanFailure::FreeDuplicate => "box-free-duplicate",
@@ -1177,6 +1197,20 @@ impl BoxOwnershipFacts {
             return Err(BoxPlanFailure::MoveAmbiguous);
         }
         let source_slot = all_sources[0].slot_ref.expect("source slot");
+        if self
+            .field_held
+            .iter()
+            .any(|held| *held == slot || self.move_reaches(slot, *held))
+        {
+            return Err(BoxPlanFailure::FieldHeld);
+        }
+        if self
+            .boundary_held
+            .iter()
+            .any(|held| *held == slot || self.move_reaches(slot, *held))
+        {
+            return Err(BoxPlanFailure::BoundaryHeld);
+        }
         if matches!(construction, super::construction::Construction::CopyOf) {
             if self.move_edges.iter().any(|(from, _)| {
                 self.move_reaches(source_slot, *from)
@@ -1233,7 +1267,7 @@ impl BoxOwnershipFacts {
                 fabricated_extent: false,
             });
         }
-        let active_sinks = self
+        let all_active_sinks = self
             .endpoints
             .iter()
             .filter(|endpoint| {
@@ -1244,6 +1278,32 @@ impl BoxOwnershipFacts {
                         .is_some_and(|sink| self.move_reaches(slot, sink))
             })
             .collect::<Vec<_>>();
+        let realloc_sinks = all_active_sinks
+            .iter()
+            .copied()
+            .filter(|sink| sink.callee == "realloc")
+            .collect::<Vec<_>>();
+        let active_sinks = all_active_sinks
+            .iter()
+            .copied()
+            .filter(|sink| sink.callee != "realloc")
+            .collect::<Vec<_>>();
+        let realloc_overwrites = constructions
+            .owner_overwrites
+            .get(&key)
+            .into_iter()
+            .flatten()
+            .filter(|overwrite| {
+                matches!(
+                    &overwrite.construction,
+                    super::construction::Construction::Alloc { callee, .. }
+                        if callee == "realloc"
+                )
+            })
+            .count();
+        if realloc_sinks.len() != realloc_overwrites {
+            return Err(BoxPlanFailure::ReallocUnsupported);
+        }
         if active_sinks.len() > 1
             && !exactly_one_sink_per_exit(
                 &body,
@@ -1372,21 +1432,19 @@ impl BoxOwnershipFacts {
             }
             _ => return Err(BoxPlanFailure::InitializerUnsupported),
         };
-        let expected_active_callee = match construction {
-            super::construction::Construction::Alloc { callee, .. } => callee.as_str(),
-            super::construction::Construction::NullLit => constructions
-                .owner_overwrites
-                .get(&key)
-                .and_then(|overwrites| overwrites.last())
-                .and_then(|overwrite| match &overwrite.construction {
-                    super::construction::Construction::Alloc { callee, .. } => {
-                        Some(callee.as_str())
-                    }
-                    _ => None,
-                })
-                .ok_or(BoxPlanFailure::ConstructionUnmappable)?,
-            _ => return Err(BoxPlanFailure::ConstructionUnmappable),
-        };
+        let expected_active_callee = constructions
+            .owner_overwrites
+            .get(&key)
+            .and_then(|overwrites| overwrites.last())
+            .and_then(|overwrite| match &overwrite.construction {
+                super::construction::Construction::Alloc { callee, .. } => Some(callee.as_str()),
+                _ => None,
+            })
+            .or_else(|| match construction {
+                super::construction::Construction::Alloc { callee, .. } => Some(callee.as_str()),
+                _ => None,
+            })
+            .ok_or(BoxPlanFailure::ConstructionUnmappable)?;
         if active_sources.last().expect("active source").callee != expected_active_callee {
             return Err(BoxPlanFailure::EndpointUnjoined);
         }
@@ -1396,6 +1454,7 @@ impl BoxOwnershipFacts {
             replacement: initializer,
             receipt: initializer_arm,
         }];
+        let mut fabricated_extent = fabricated_extent;
         if overwrite_count > 0 {
             let overwrites = constructions
                 .owner_overwrites
@@ -1404,34 +1463,60 @@ impl BoxOwnershipFacts {
             let stores = constructions
                 .first_stores
                 .get(&key)
-                .ok_or(BoxPlanFailure::InitializerUnsupported)?;
-            let store_offset = usize::from(!matches!(
+                .map(Vec::as_slice)
+                .unwrap_or(&[]);
+            let mut store_index = usize::from(matches!(
                 construction,
-                super::construction::Construction::NullLit
+                super::construction::Construction::Alloc { callee, .. } if callee == "malloc"
             ));
-            for (overwrite, store) in overwrites.iter().zip(stores.iter().skip(store_offset)) {
-                let super::construction::Construction::Alloc {
-                    callee,
-                    size,
-                    count: None,
-                } = &overwrite.construction
-                else {
-                    return Err(BoxPlanFailure::StoreFormUnknown);
-                };
-                if callee != "malloc" || !size.contains(&format!("size_of::<{normalized}>")) {
-                    return Err(BoxPlanFailure::StoreFormUnknown);
+            let name = subject
+                .param_name
+                .as_deref()
+                .ok_or(BoxPlanFailure::AstUnplaceable)?;
+            for overwrite in overwrites {
+                match &overwrite.construction {
+                    super::construction::Construction::Alloc {
+                        callee,
+                        size,
+                        count: None,
+                    } if callee == "malloc"
+                        && size.contains(&format!("size_of::<{normalized}>")) =>
+                    {
+                        let store = stores
+                            .get(store_index)
+                            .ok_or(BoxPlanFailure::InitializerUnsupported)?;
+                        store_index += 1;
+                        let replacement = format!("Box::new({})", store.value);
+                        expr_edits.push(BoxExprEdit {
+                            span: overwrite.value_span,
+                            replacement: if optional {
+                                format!("Some({replacement})")
+                            } else {
+                                replacement
+                            },
+                            receipt: "malloc-overwrite-literal-first-store",
+                        });
+                        delete_statements.push(store.statement_span);
+                    }
+                    super::construction::Construction::Alloc { callee, .. }
+                        if callee == "realloc" && shape == BoxShape::Slice && !optional =>
+                    {
+                        fabricated_extent = true;
+                        expr_edits.push(BoxExprEdit {
+                            span: overwrite.value_span,
+                            replacement: format!(
+                                "{{ let mut __crat_box_vec = Vec::from({name}); \
+                                 __crat_box_vec.resize(crate::FALLBACK_SLICE_EXTENT, \
+                                 0 as {normalized}); __crat_box_vec.into_boxed_slice() }}"
+                            ),
+                            receipt: "realloc-atomic",
+                        });
+                    }
+                    _ => return Err(BoxPlanFailure::StoreFormUnknown),
                 }
-                let replacement = format!("Box::new({})", store.value);
-                expr_edits.push(BoxExprEdit {
-                    span: overwrite.value_span,
-                    replacement: if optional {
-                        format!("Some({replacement})")
-                    } else {
-                        replacement
-                    },
-                    receipt: "malloc-overwrite-literal-first-store",
-                });
-                delete_statements.push(store.statement_span);
+            }
+            if store_index != stores.len() {
+                return Err(BoxPlanFailure::InitializerUnsupported);
             }
         }
         let mut receipts = vec![format!(
@@ -1450,9 +1535,17 @@ impl BoxOwnershipFacts {
             .into_iter()
             .flatten()
         {
+            let is_realloc = matches!(
+                &overwrite.construction,
+                super::construction::Construction::Alloc { callee, .. } if callee == "realloc"
+            );
             receipts.push(format!(
                 "{} site={}",
-                ImplicitCloseKind::Overwrite.receipt(),
+                if is_realloc {
+                    "box-realloc-atomic"
+                } else {
+                    ImplicitCloseKind::Overwrite.receipt()
+                },
                 super::emitability::EmitabilityFacts::site(tcx, overwrite.statement_span)
             ));
         }
@@ -1481,14 +1574,24 @@ impl BoxOwnershipFacts {
                 .param_name
                 .as_deref()
                 .ok_or(BoxPlanFailure::AstUnplaceable)?;
-            let calls = constructions
+            let realloc_calls = constructions
+                .realloc_calls
+                .get(&sink_key)
+                .into_iter()
+                .flatten()
+                .map(|span| (span.lo(), span.hi()))
+                .collect::<FxHashSet<_>>();
+            let mut calls = constructions
                 .deallocator_calls
                 .get(&sink_key)
-                .ok_or(BoxPlanFailure::AstUnplaceable)?;
+                .ok_or(BoxPlanFailure::AstUnplaceable)?
+                .iter()
+                .copied()
+                .filter(|span| !realloc_calls.contains(&(span.lo(), span.hi())))
+                .collect::<Vec<_>>();
             if calls.len() != active_sinks.len() {
                 return Err(BoxPlanFailure::FreeDuplicate);
             }
-            let mut calls = calls.clone();
             calls.sort_unstable_by_key(|span| span.lo());
             for (sink, call_span) in active_sinks.iter().zip(calls) {
                 expr_edits.push(BoxExprEdit {
@@ -1574,6 +1677,16 @@ impl BoxOwnershipFacts {
         bytes.extend(self.endpoints_tsv().bytes());
         for &(from, to) in &self.move_edges {
             bytes.extend(format!("move\t{}\t{}\n", slot_label(from), slot_label(to)).bytes());
+        }
+        for (kind, slots) in [
+            ("field-held", &self.field_held),
+            ("boundary-held", &self.boundary_held),
+        ] {
+            let mut slots = slots.iter().copied().collect::<Vec<_>>();
+            slots.sort_unstable_by_key(|slot| slot_order_key(*slot));
+            for slot in slots {
+                bytes.extend(format!("{kind}\t{}\n", slot_label(slot)).bytes());
+            }
         }
         bytes
     }

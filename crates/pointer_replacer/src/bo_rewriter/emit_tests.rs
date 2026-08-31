@@ -452,10 +452,18 @@ fn box_w5_realloc_is_one_atomic_consume_and_replacement() {
              free(p as *mut core::ffi::c_void);\n\
          }}\n"
     );
-    let super::RewriteOutcome::Emitted { source, .. } = super::rewrite_m1(&src) else {
+    let super::RewriteOutcome::Emitted {
+        source,
+        degradations,
+        ..
+    } = super::rewrite_m1(&src)
+    else {
         panic!("BOX-W5 fixture must emit");
     };
-    assert!(source.contains("p: Box<[i32]>"), "{source}");
+    assert!(
+        source.contains("p: Box<[i32]>"),
+        "degradations={degradations:#?}\n{source}"
+    );
     assert!(
         source.contains("Vec::from(p)"),
         "old Box was not consumed: {source}"

@@ -121,6 +121,7 @@ pub(crate) struct ConstructionFacts {
     pub deallocator_calls: FxHashMap<(LocalDefId, HirId), Vec<rustc_span::Span>>,
     pub zero_memsets: FxHashMap<(LocalDefId, HirId), Vec<ZeroMemset>>,
     pub owner_overwrites: FxHashMap<(LocalDefId, HirId), Vec<OwnerOverwrite>>,
+    pub realloc_calls: FxHashMap<(LocalDefId, HirId), Vec<rustc_span::Span>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -372,11 +373,24 @@ impl<'tcx> Visitor<'tcx> for Collector<'_, 'tcx> {
                 Self::peel(argument).kind
             && let rustc_hir::def::Res::Local(binding) = argument_path.res
         {
+            let callee_name = path
+                .segments
+                .last()
+                .expect("matched callee segment")
+                .ident
+                .name;
             self.facts
                 .deallocator_calls
                 .entry((self.fn_did, binding))
                 .or_default()
                 .push(expression.span);
+            if callee_name.as_str() == "realloc" {
+                self.facts
+                    .realloc_calls
+                    .entry((self.fn_did, binding))
+                    .or_default()
+                    .push(expression.span);
+            }
         }
         intravisit::walk_expr(self, expression);
     }

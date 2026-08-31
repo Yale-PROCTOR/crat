@@ -515,7 +515,7 @@ pub(crate) fn plan(
                         hi,
                         replacement: edit.replacement.clone(),
                         justification: if box_plan.fabricated_extent
-                            && edit.receipt == "memset-zero-slice"
+                            && matches!(edit.receipt, "memset-zero-slice" | "realloc-atomic")
                         {
                             Justification::SeamAdapter {
                                 family: "box",
