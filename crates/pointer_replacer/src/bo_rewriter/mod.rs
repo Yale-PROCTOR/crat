@@ -3623,8 +3623,12 @@ fn box_mir_drop_policies(
         .entries
         .iter()
         .filter_map(|(subject, decision)| {
-            let decision::Decision::Box(plan) = decision else {
-                return None;
+            let plan = match decision {
+                decision::Decision::Box(plan) => plan,
+                decision::Decision::Ref { .. }
+                | decision::Decision::Slice { .. }
+                | decision::Decision::Opt { .. }
+                | decision::Decision::Degraded(_) => return None,
             };
             let function = tcx.def_path_str(subject.fn_did.to_def_id());
             let subject_key = subject.identity_key(&function);
