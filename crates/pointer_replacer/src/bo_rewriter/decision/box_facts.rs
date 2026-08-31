@@ -983,31 +983,41 @@ fn slot_order_key(slot: SlotRef) -> (u8, u32, usize) {
 }
 
 fn exactly_one_sink_per_exit(body: &Body<'_>, source: LocationKey, sinks: &[LocationKey]) -> bool {
-    let start = rustc_middle::mir::BasicBlock::from_u32(source.block);
+    exactly_one_sink_per_exit_graph(
+        source.block,
+        &sinks.iter().map(|sink| sink.block).collect::<Vec<_>>(),
+        |block| {
+            body.basic_blocks[rustc_middle::mir::BasicBlock::from_u32(block)]
+                .terminator()
+                .successors()
+                .map(|next| next.as_u32())
+                .collect()
+        },
+    )
+}
+
+fn exactly_one_sink_per_exit_graph(
+    start: u32,
+    sinks: &[u32],
+    successors: impl Fn(u32) -> Vec<u32>,
+) -> bool {
     let mut pending = vec![(start, 0usize)];
     let mut seen = FxHashSet::default();
     while let Some((block, count_before)) = pending.pop() {
         if !seen.insert((block, count_before)) {
             continue;
         }
-        let count = count_before
-            + sinks
-                .iter()
-                .filter(|sink| sink.block == block.as_u32())
-                .count();
+        let count = count_before + sinks.iter().filter(|sink| **sink == block).count();
         if count > 1 {
             return false;
         }
-        let successors = body.basic_blocks[block]
-            .terminator()
-            .successors()
-            .collect::<Vec<_>>();
-        if successors.is_empty() {
+        let next = successors(block);
+        if next.is_empty() {
             if count != 1 {
                 return false;
             }
         } else {
-            pending.extend(successors.into_iter().map(|next| (next, count)));
+            pending.extend(next.into_iter().map(|next| (next, count)));
         }
     }
     true
@@ -1812,8 +1822,8 @@ mod tests {
 
     use super::{
         BoxScopeFailure, EndpointStatus, FactValue, RecordedEquation, SinkCarrierDef,
-        SinkCarrierReason, box_scope, classify_endpoint, render_equations, replay_values,
-        resolve_sink_carrier, scalar_initializer_supported,
+        SinkCarrierReason, box_scope, classify_endpoint, exactly_one_sink_per_exit_graph,
+        render_equations, replay_values, resolve_sink_carrier, scalar_initializer_supported,
     };
     use crate::analyses::borrow_ownership::{SlotKind, ssa::constraint::Var};
 
@@ -1941,6 +1951,24 @@ mod tests {
         ] {
             assert_eq!(resolve_sink_carrier(temp, true, definition), Err(expected));
         }
+    }
+
+    #[test]
+    fn box_n3_sink_paths_require_exactly_one_sink_each() {
+        let diamond = |block| match block {
+            0 => vec![1, 2],
+            1 | 2 => vec![3],
+            _ => Vec::new(),
+        };
+        assert!(exactly_one_sink_per_exit_graph(0, &[1, 2], diamond));
+        assert!(
+            !exactly_one_sink_per_exit_graph(0, &[1, 3], diamond),
+            "one branch reaches two sinks and must fail box-free-duplicate"
+        );
+        assert!(
+            !exactly_one_sink_per_exit_graph(0, &[1], diamond),
+            "one branch reaches no sink and must fail closed"
+        );
     }
 
     #[test]
