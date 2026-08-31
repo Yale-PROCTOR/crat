@@ -480,6 +480,38 @@ fn box_w5_realloc_is_one_atomic_consume_and_replacement() {
     );
 }
 
+#[test]
+fn box_d4_emitted_mir_drop_observer_distinguishes_close_sites() {
+    let source = "#![allow(dead_code, unused_assignments)]\n\
+                  pub fn explicit() { let p: Box<i32> = Box::new(1); drop(p); }\n\
+                  pub fn scope() { let p: Box<i32> = Box::new(1); let _ = *p; }\n\
+                  pub fn overwrite() { let mut p: Box<i32> = Box::new(1); p = Box::new(2); let _ = *p; }\n";
+    let drops = super::verify::box_mir_drops_str(source).expect("observe emitted MIR drops");
+
+    assert!(
+        drops.iter().all(|drop| drop.function != "explicit"),
+        "an explicit drop call must consume the Box without an implicit MIR Drop: {drops:#?}"
+    );
+    assert!(
+        drops.iter().any(|drop| drop.function == "scope"),
+        "scope-close MIR Drop was not observed: {drops:#?}"
+    );
+    assert!(
+        drops.iter().any(|drop| drop.function == "overwrite"),
+        "overwrite/unwind MIR Drop was not observed: {drops:#?}"
+    );
+}
+
+#[test]
+fn box_d4_unreceipted_implicit_drop_is_rejected() {
+    let source = "#![allow(dead_code)]\npub fn f() { let p: Box<i32> = Box::new(1); let _ = *p; }\n";
+    let drops = super::verify::box_mir_drops_str(source).expect("observe emitted MIR drops");
+    assert!(!drops.is_empty(), "fixture must contain an implicit Drop");
+    let error = super::verify::reconcile_box_mir_drops(&drops, &[])
+        .expect_err("an implicit Drop without a waiver receipt must fail");
+    assert!(error.contains("unreceipted"), "wrong failure: {error}");
+}
+
 const ROOT_WITH_MODULE: &str = "#![allow(dead_code, unused_unsafe)]\npub mod m;\n";
 const MODULE_SUBJECT: &str = "pub unsafe fn bump(p: *mut i32) -> i32 {\n    *p += 1;\n    *p\n}\n";
 
