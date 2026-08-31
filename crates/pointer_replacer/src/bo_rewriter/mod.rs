@@ -3391,13 +3391,23 @@ fn finish_decide<'tcx>(
     // report, so `build` consumes them rather than the census reading them
     // alongside.
     let escapes = decision::co_conversion::escapes(tcx, &program.functions, &subjects);
-    let coconv = decision::co_conversion::build_with_c9_marks(
+    let lifetime_eligibility = decision::lifetime::derive_return_eligibility(
+        &program,
+        &slots,
+        &model,
+        analysis.origins.as_ref(),
+        &hypothetical,
+        &escapes,
+        analysis.attestation,
+    );
+    let coconv = decision::co_conversion::build_with_c9_marks_and_lifetimes(
         &facts,
         &subjects,
         &hypothetical,
         &escapes,
         decision::co_conversion::OverlapRule::BlindOnly,
         &retained_c9_plans,
+        &lifetime_eligibility,
     );
     // **Production is decided AFTER the classes**, because step 2's gate reads
     // them. No cycle: the hypothetical above was decided with `None`.
@@ -3478,6 +3488,7 @@ fn finish_decide<'tcx>(
             model,
             facts,
             coconv,
+            lifetime_eligibility,
             escapes,
             subjects,
             hypothetical,
@@ -3505,6 +3516,7 @@ pub(crate) struct DecideCtx {
     /// the census exporter, for R1's reason: the second derivation is what made
     /// the recon worker solve BO twice per program.
     coconv: decision::co_conversion::CoConv,
+    lifetime_eligibility: decision::lifetime::LifetimeEligibility,
     /// The escape shapes, measured **separately and deliberately not gated**.
     ///
     /// The handoff's boundary, kept: the pinned-callee flow is the hazard this

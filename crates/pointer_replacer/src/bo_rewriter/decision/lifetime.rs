@@ -14,15 +14,25 @@ use rustc_hir::{
     def_id::LocalDefId,
     intravisit::{Visitor, walk_expr},
 };
-use rustc_middle::{mir::TerminatorKind, ty::TyKind};
+use rustc_middle::{
+    mir::{RETURN_PLACE, TerminatorKind},
+    ty::TyKind,
+};
 
+use super::{
+    Decision, DecisionTable,
+    co_conversion::{Escape, EscapeKind, NodeKey},
+};
 use crate::{
     analyses::borrow_ownership::{
+        SlotKind,
         a5_overlap::WholeProgramAttestation,
         a5_producer::resolve_closed_world_call_world,
+        crate_slots::CrateSlots,
         origin_summary::{
             OriginSlot, OriginSummaries, OriginSummary, SignatureRoot, SignatureSlot,
         },
+        solver::SlotRef,
     },
     utils::rustc::RustProgram,
 };
@@ -116,51 +126,210 @@ pub(crate) enum LifetimeFailure {
 /// The only token that may discharge one `escapes-via-return` row. Its
 /// constructor is private to this module so co-conversion cannot manufacture a
 /// bypass from a boolean or an arbitrary subject set.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ReturnLifetimePermit {
-    subject: super::co_conversion::NodeKey,
-    source: FnSignatureSlot,
+    subject: NodeKey,
+    function: LocalDefId,
+    sources: Vec<FnSignatureSlot>,
     target: FnSignatureSlot,
+    origin_sources: Vec<OriginSlot>,
+    origin_target: OriginSlot,
 }
 
 impl ReturnLifetimePermit {
     fn new(
-        subject: super::co_conversion::NodeKey,
-        source: FnSignatureSlot,
-        target: FnSignatureSlot,
+        subject: NodeKey,
+        function: LocalDefId,
+        sources: Vec<(FnSignatureSlot, OriginSlot)>,
+        target: (FnSignatureSlot, OriginSlot),
     ) -> Self {
+        let (sources, origin_sources) = sources.into_iter().unzip();
+        let (target, origin_target) = target;
         Self {
             subject,
-            source,
+            function,
+            sources,
             target,
+            origin_sources,
+            origin_target,
         }
+    }
+
+    fn for_test(subject: NodeKey, source: FnSignatureSlot, target: FnSignatureSlot) -> Self {
+        Self::new(
+            subject,
+            subject.0,
+            vec![(source, OriginSlot::from_usize(0))],
+            (target, OriginSlot::from_usize(1)),
+        )
     }
 }
 
 #[derive(Clone, Debug, Default)]
 pub(crate) struct LifetimeEligibility {
-    return_permits: FxHashMap<super::co_conversion::NodeKey, ReturnLifetimePermit>,
+    return_permits: FxHashMap<NodeKey, ReturnLifetimePermit>,
+    failures: FxHashMap<NodeKey, LifetimeFailure>,
 }
 
 impl LifetimeEligibility {
-    pub(crate) fn return_permit(
-        &self,
-        subject: super::co_conversion::NodeKey,
-    ) -> Option<&ReturnLifetimePermit> {
+    pub(crate) fn return_permit(&self, subject: NodeKey) -> Option<&ReturnLifetimePermit> {
         self.return_permits.get(&subject)
     }
 
+    pub(crate) fn return_permit_count(&self) -> usize {
+        self.return_permits.len()
+    }
+
+    pub(crate) fn failure(&self, subject: NodeKey) -> Option<LifetimeFailure> {
+        self.failures.get(&subject).copied()
+    }
+
     #[cfg(test)]
-    pub(crate) fn with_return_permit_for_test(subject: super::co_conversion::NodeKey) -> Self {
-        let permit = ReturnLifetimePermit::new(
+    pub(crate) fn with_return_permit_for_test(subject: NodeKey) -> Self {
+        let permit = ReturnLifetimePermit::for_test(
             subject,
             FnSignatureSlot::arg(1, 0, 0),
             FnSignatureSlot::RETURN,
         );
         Self {
             return_permits: [(subject, permit)].into_iter().collect(),
+            failures: FxHashMap::default(),
         }
     }
+}
+
+fn model_is_ref(
+    model: &FxHashMap<SlotRef, SlotKind>,
+    slots: &CrateSlots,
+    function: LocalDefId,
+    signature: SignatureSlot,
+) -> bool {
+    let local = match signature.place.root {
+        SignatureRoot::Arg(local) => local,
+        SignatureRoot::Return => RETURN_PLACE,
+    };
+    slots
+        .fn_local_slots
+        .get(&function)
+        .and_then(|universe| universe.slot_for_local_depth(local, signature.depth))
+        .and_then(|slot| model.get(&SlotRef::Local(function, slot)))
+        == Some(&SlotKind::Ref)
+}
+
+pub(crate) fn derive_return_eligibility(
+    program: &RustProgram<'_>,
+    slots: &CrateSlots,
+    model: &FxHashMap<SlotRef, SlotKind>,
+    origins: Option<&OriginSummaries>,
+    hypothetical: &DecisionTable,
+    escapes: &[Escape],
+    attestation: Option<WholeProgramAttestation>,
+) -> LifetimeEligibility {
+    let mut result = LifetimeEligibility::default();
+    let decisions = hypothetical
+        .entries
+        .iter()
+        .map(|(subject, decision)| ((subject.fn_did, subject.hir_id), decision))
+        .collect::<FxHashMap<_, _>>();
+    let web = derive_fn_ptr_web(program, attestation);
+
+    let mut return_subjects = escapes
+        .iter()
+        .filter(|escape| escape.kind == EscapeKind::Return)
+        .map(|escape| escape.subject)
+        .collect::<Vec<_>>();
+    return_subjects
+        .sort_unstable_by_key(|(did, hir)| (did.local_def_index.as_u32(), hir.local_id.as_u32()));
+    return_subjects.dedup();
+
+    for subject in return_subjects {
+        if !matches!(decisions.get(&subject), Some(Decision::Ref { .. })) {
+            continue;
+        }
+        let function = subject.0;
+        let Ok(web) = &web else {
+            result
+                .failures
+                .insert(subject, LifetimeFailure::FnPtrWebHeld);
+            continue;
+        };
+        if web.contains(function) {
+            result
+                .failures
+                .insert(subject, LifetimeFailure::FnPtrWebHeld);
+            continue;
+        }
+        let Some(summary) = origins.and_then(|origins| origins.get(&function)) else {
+            result
+                .failures
+                .insert(subject, LifetimeFailure::OriginAbsent);
+            continue;
+        };
+
+        let targets = summary
+            .slots
+            .iter_enumerated()
+            .filter(|(_, slot)| {
+                slot.place.root == SignatureRoot::Return
+                    && slot.place.field.is_none()
+                    && slot.place.deref_depth == 0
+                    && slot.depth == 0
+            })
+            .collect::<Vec<_>>();
+        let [(target_origin, target_signature)] = targets.as_slice() else {
+            result
+                .failures
+                .insert(subject, LifetimeFailure::OriginConflict);
+            continue;
+        };
+        if !model_is_ref(model, slots, function, **target_signature) {
+            result
+                .failures
+                .insert(subject, LifetimeFailure::OriginConflict);
+            continue;
+        }
+
+        let sources = summary
+            .slots
+            .iter_enumerated()
+            .filter(|(origin, slot)| {
+                matches!(slot.place.root, SignatureRoot::Arg(_))
+                    && slot.place.field.is_none()
+                    && slot.place.deref_depth == 0
+                    && summary.subset.contains(*origin, *target_origin)
+                    && model_is_ref(model, slots, function, **slot)
+            })
+            .collect::<Vec<_>>();
+        let mut required = sources
+            .iter()
+            .map(|(origin, _)| *origin)
+            .collect::<Vec<_>>();
+        required.push(*target_origin);
+        if let Err(failure) = plan_function(summary, &required, &BTreeSet::new()) {
+            result.failures.insert(subject, failure);
+            continue;
+        }
+
+        let sources = sources
+            .into_iter()
+            .map(|(origin, slot)| FnSignatureSlot::from_summary(*slot).map(|slot| (slot, origin)))
+            .collect::<Result<Vec<_>, _>>();
+        let target =
+            FnSignatureSlot::from_summary(**target_signature).map(|slot| (slot, *target_origin));
+        match (sources, target) {
+            (Ok(sources), Ok(target)) => {
+                result.return_permits.insert(
+                    subject,
+                    ReturnLifetimePermit::new(subject, function, sources, target),
+                );
+            }
+            (Err(failure), _) | (_, Err(failure)) => {
+                result.failures.insert(subject, failure);
+            }
+        }
+    }
+
+    result
 }
 
 impl LifetimeFailure {

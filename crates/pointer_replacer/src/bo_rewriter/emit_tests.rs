@@ -5388,7 +5388,7 @@ fn e2_x1_carrier_reaches_the_lifetime_producer_intact() {
     let fixture = Fixture::new(&[(
         "lib.rs",
         "#![allow(dead_code, unused_unsafe)]\n\
-         pub unsafe fn id(p: *mut i32) -> *mut i32 { p }\n",
+         pub unsafe fn id(p: *const i32) -> *const i32 { p }\n",
     )]);
     let receipt = ::utils::compilation::run_compiler_on_path(&fixture.root(), |tcx| {
         let (_, ctx) = super::decide_table_with_ctx_config(
@@ -5441,7 +5441,7 @@ fn e2_w1_return_decision_uses_the_typed_permit() {
         .expect("E2-W1 fixture compiles before rewriting");
 
     assert!(
-        matches!(decision, super::decision::Decision::Ref { mutable: true }),
+        matches!(decision, super::decision::Decision::Ref { mutable: false }),
         "{decision:#?}"
     );
     assert_eq!(permits, 1);
