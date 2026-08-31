@@ -4353,7 +4353,7 @@ mod run {
                 verify_bo_construction_counting, verify_bo_construction_with_flows,
             },
             crate_slots::CrateSlots,
-            l2,
+            l2, model_cache,
             mutability_facts::{MutFacts, MutFactsMode, MutProvider},
             origins::compute_origins,
             slots::{SlotId, SlotOwner},
@@ -9124,6 +9124,43 @@ mod run {
         row.set("cache_receipt_artifact", cache_receipt_path.display());
         row.set("status", "ok");
         row.set("t_total_s", secs(started.elapsed()));
+        row
+    }
+
+    /// Wave-3's no-fallback cache preflight. It computes the exact production
+    /// key and attempts one load, but has no solve arm by construction.
+    pub fn run_e1_cache_preflight(tcx: TyCtxt<'_>, t_tcx: Duration) -> Row {
+        let started = Instant::now();
+        let mut row = Row::default();
+        let program = collect_program(tcx);
+        let slots = CrateSlots::build(&program);
+        let mode = A5Mode::PreciseReplay;
+        let attestation = Some(WholeProgramAttestation::FrozenBenchmarkGraph);
+        let fingerprint = model_cache::fingerprint(&program, mode, attestation);
+        row.set("fingerprint", &fingerprint);
+        row.set(
+            "cache_entry",
+            model_cache::configured_entry_path(&fingerprint)
+                .map_or_else(|| "none".to_owned(), |path| path.display().to_string()),
+        );
+        match model_cache::load(tcx, &program, &slots, mode, attestation) {
+            Some(cached) => {
+                row.set("status", "ok");
+                row.set("cache_status", "hit");
+                row.set(
+                    "model_sha256",
+                    model_cache::model_bytes_sha256(tcx, &slots, &cached.model)
+                        .unwrap_or_else(|| "unrenderable".to_owned()),
+                );
+            }
+            None => {
+                row.set("status", "cache-miss");
+                row.set("cache_status", "miss");
+            }
+        }
+        row.set("solve_wall_s", "0.000000");
+        row.set("t_tcx_s", secs(t_tcx));
+        row.set("t_total_s", secs(started.elapsed() + t_tcx));
         row
     }
 
@@ -15987,6 +16024,7 @@ fn boc1_run_one() {
             "prod-precision" => run::run_prod_ownership(tcx, t_tcx),
             "prod-box" => run::run_prod_box(tcx, t_tcx),
             "m1-census" => run::run_m1_census(tcx, t_tcx),
+            "e1-cache-preflight" => run::run_e1_cache_preflight(tcx, t_tcx),
             "substrate-sanity" => run::run_substrate_sanity(tcx, t_tcx),
             "free-overlap" => run::run_free_overlap(tcx, t_tcx),
             "use-census" => run::run_use_census(tcx, t_tcx),
