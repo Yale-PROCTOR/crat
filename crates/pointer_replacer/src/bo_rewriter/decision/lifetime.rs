@@ -400,6 +400,33 @@ fn web_reason_order(reason: &WebDerivation) -> (u8, u32, u32) {
     }
 }
 
+fn edge_derivation(
+    program: &RustProgram<'_>,
+    caller: LocalDefId,
+    block: rustc_middle::mir::BasicBlock,
+) -> WebDerivation {
+    let body_ref = program
+        .tcx
+        .mir_drops_elaborated_and_const_checked(caller)
+        .borrow();
+    let body = &*body_ref;
+    let call = match &body.basic_blocks[block].terminator().kind {
+        TerminatorKind::Call { func, .. } | TerminatorKind::TailCall { func, .. } => func,
+        _ => unreachable!("closed call-world key must name a call"),
+    };
+    if matches!(call.ty(body, program.tcx).kind(), TyKind::FnDef(..)) {
+        WebDerivation::Direct {
+            caller,
+            block: block.as_u32(),
+        }
+    } else {
+        WebDerivation::Andersen {
+            caller,
+            block: block.as_u32(),
+        }
+    }
+}
+
 pub(crate) fn derive_fn_ptr_web(
     program: &RustProgram<'_>,
     attestation: Option<WholeProgramAttestation>,
@@ -429,29 +456,8 @@ pub(crate) fn derive_fn_ptr_web(
             if caller != function {
                 continue;
             }
-            let body_ref = program
-                .tcx
-                .mir_drops_elaborated_and_const_checked(function)
-                .borrow();
-            let body = &*body_ref;
-            let call = match &body.basic_blocks[block].terminator().kind {
-                TerminatorKind::Call { func, .. } | TerminatorKind::TailCall { func, .. } => func,
-                _ => unreachable!("closed call-world key must name a call"),
-            };
-            let direct = matches!(call.ty(body, program.tcx).kind(), TyKind::FnDef(..));
             for &target in targets {
-                let reason = if direct {
-                    WebDerivation::Direct {
-                        caller: function,
-                        block: block.as_u32(),
-                    }
-                } else {
-                    WebDerivation::Andersen {
-                        caller: function,
-                        block: block.as_u32(),
-                    }
-                };
-                edges.push((target, reason));
+                edges.push((target, edge_derivation(program, caller, block)));
             }
         }
         edges.sort_by_key(|(target, reason)| {
@@ -470,6 +476,143 @@ pub(crate) fn derive_fn_ptr_web(
         roots,
         members,
         reasons,
+    })
+}
+
+#[cfg(test)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct FnPtrWebDivergence {
+    side: &'static str,
+    unit: &'static str,
+    function: String,
+    reason: String,
+}
+
+#[cfg(test)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct FnPtrWebDifferential {
+    pub(crate) production_roots: usize,
+    pub(crate) oracle_roots: usize,
+    pub(crate) production_members: usize,
+    pub(crate) oracle_members: usize,
+    pub(crate) divergences: Vec<FnPtrWebDivergence>,
+}
+
+#[cfg(test)]
+impl FnPtrWebDifferential {
+    pub(crate) fn tsv(&self) -> String {
+        let mut output = String::from("side\tunit\tfunction\treason\n");
+        for row in &self.divergences {
+            output.push_str(&format!(
+                "{}\t{}\t{}\t{}\n",
+                row.side, row.unit, row.function, row.reason
+            ));
+        }
+        output
+    }
+}
+
+#[cfg(test)]
+fn derivation_text(tcx: rustc_middle::ty::TyCtxt<'_>, reason: &WebDerivation) -> String {
+    match *reason {
+        WebDerivation::AdjustedFnPtr => "adjusted-fnptr".to_owned(),
+        WebDerivation::Direct { caller, block } => {
+            format!("direct:{}:bb{block}", tcx.def_path_str(caller))
+        }
+        WebDerivation::Andersen { caller, block } => {
+            format!("andersen:{}:bb{block}", tcx.def_path_str(caller))
+        }
+    }
+}
+
+#[cfg(test)]
+fn oracle_web(
+    program: &RustProgram<'_>,
+    roots: &FxHashSet<LocalDefId>,
+    resolved: &FxHashMap<(LocalDefId, rustc_middle::mir::BasicBlock), Vec<LocalDefId>>,
+) -> (FxHashSet<LocalDefId>, FxHashMap<LocalDefId, WebDerivation>) {
+    let mut members = FxHashSet::default();
+    let mut reasons = roots
+        .iter()
+        .copied()
+        .map(|root| (root, WebDerivation::AdjustedFnPtr))
+        .collect::<FxHashMap<_, _>>();
+    let mut pending = roots.iter().copied().collect::<Vec<_>>();
+    while let Some(function) = pending.pop() {
+        if !members.insert(function) {
+            continue;
+        }
+        let mut outgoing = resolved
+            .iter()
+            .filter(|((caller, _), _)| *caller == function)
+            .flat_map(|(&(caller, block), targets)| {
+                targets
+                    .iter()
+                    .copied()
+                    .map(move |target| (target, edge_derivation(program, caller, block)))
+            })
+            .collect::<Vec<_>>();
+        outgoing.sort_by_key(|(target, reason)| {
+            (target.local_def_index.as_u32(), web_reason_order(reason))
+        });
+        for (target, reason) in outgoing.into_iter().rev() {
+            if !members.contains(&target) {
+                reasons.entry(target).or_insert(reason);
+                pending.push(target);
+            }
+        }
+    }
+    (members, reasons)
+}
+
+#[cfg(test)]
+pub(crate) fn fn_ptr_web_differential(
+    program: &RustProgram<'_>,
+    attestation: Option<WholeProgramAttestation>,
+) -> Result<FnPtrWebDifferential, LifetimeFailure> {
+    let production = derive_fn_ptr_web(program, attestation)?;
+    let local = program.functions.iter().copied().collect::<FxHashSet<_>>();
+    let mut oracle_roots = crate::rewriter::collector::collect_fn_ptrs(program);
+    oracle_roots.retain(|function| local.contains(function));
+    let call_world = resolve_closed_world_call_world(program, attestation);
+    let (oracle_members, oracle_reasons) = oracle_web(program, &oracle_roots, &call_world.resolved);
+
+    let mut divergences = Vec::new();
+    for (unit, production_set, oracle_set) in [
+        ("root", &production.roots, &oracle_roots),
+        ("closure", &production.members, &oracle_members),
+    ] {
+        for function in production_set.difference(oracle_set) {
+            divergences.push(FnPtrWebDivergence {
+                side: "production-only",
+                unit,
+                function: program.tcx.def_path_str(*function),
+                reason: derivation_text(program.tcx, &production.reasons[function]),
+            });
+        }
+        for function in oracle_set.difference(production_set) {
+            divergences.push(FnPtrWebDivergence {
+                side: "p-b-only",
+                unit,
+                function: program.tcx.def_path_str(*function),
+                reason: derivation_text(program.tcx, &oracle_reasons[function]),
+            });
+        }
+    }
+    divergences.sort_by(|left, right| {
+        (left.unit, left.function.as_str(), left.side).cmp(&(
+            right.unit,
+            right.function.as_str(),
+            right.side,
+        ))
+    });
+
+    Ok(FnPtrWebDifferential {
+        production_roots: production.roots.len(),
+        oracle_roots: oracle_roots.len(),
+        production_members: production.members.len(),
+        oracle_members: oracle_members.len(),
+        divergences,
     })
 }
 
