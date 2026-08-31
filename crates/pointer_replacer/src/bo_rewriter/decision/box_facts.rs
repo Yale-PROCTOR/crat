@@ -166,6 +166,7 @@ enum SinkCarrierReason {
     ProjectionBase,
     MissingDef,
     MissingVersionSite,
+    Cycle,
 }
 
 impl SinkCarrierReason {
@@ -176,6 +177,7 @@ impl SinkCarrierReason {
             SinkCarrierReason::ProjectionBase => "sink-carrier-projection-base",
             SinkCarrierReason::MissingDef => "sink-carrier-missing-def",
             SinkCarrierReason::MissingVersionSite => "sink-carrier-version-site-missing",
+            SinkCarrierReason::Cycle => "sink-carrier-cycle",
         }
     }
 }
@@ -383,6 +385,32 @@ struct CarrierPresentation {
     slot: SlotRef,
 }
 
+fn resolve_sink_presentation(
+    operand: Local,
+    direct: CarrierPresentation,
+    eliminable: &rustc_index::bit_set::MixedBitSet<Local>,
+    definitions: &IndexVec<Local, Option<SinkCarrierDef>>,
+    presentations: &FxHashMap<Local, CarrierPresentation>,
+) -> Result<CarrierPresentation, SinkCarrierReason> {
+    let mut current = operand;
+    let mut resolved = direct;
+    let mut seen = FxHashSet::default();
+    while eliminable.contains(current) {
+        if !seen.insert(current) {
+            return Err(SinkCarrierReason::Cycle);
+        }
+        let carrier = resolve_sink_carrier(current, true, definitions[current])?;
+        let presentation = presentations
+            .get(&current)
+            .copied()
+            .filter(|presentation| presentation.carrier == carrier)
+            .ok_or(SinkCarrierReason::MissingVersionSite)?;
+        resolved = presentation;
+        current = carrier;
+    }
+    Ok(resolved)
+}
+
 fn record_sink_definition(
     definitions: &mut IndexVec<Local, Option<SinkCarrierDef>>,
     local: Local,
@@ -532,6 +560,18 @@ impl<'a, 'tcx> MinimalWalk<'a, 'tcx> {
                 .filter(|local| eliminable.contains(*local))
             {
                 transparent_argument_temps.insert(local);
+            }
+        }
+        let mut pending = transparent_argument_temps
+            .iter()
+            .copied()
+            .collect::<Vec<_>>();
+        while let Some(local) = pending.pop() {
+            if let Some(SinkCarrierDef::Copy(carrier)) = sink_definitions[local]
+                && eliminable.contains(carrier)
+                && transparent_argument_temps.insert(carrier)
+            {
+                pending.push(carrier);
             }
         }
         let mut carrier_presentations = FxHashMap::<Local, CarrierPresentation>::default();
@@ -723,41 +763,23 @@ impl<'a, 'tcx> MinimalWalk<'a, 'tcx> {
                     continue;
                 };
                 if is_sink && index == 0 {
-                    let (endpoint_var, endpoint_def, slot) = match resolve_sink_carrier(
+                    let direct = CarrierPresentation {
+                        carrier: arg_local,
+                        r#use: arg_use,
+                        def: arg_def,
+                        slot: direct_slot,
+                    };
+                    let (endpoint_var, endpoint_def, slot) = match resolve_sink_presentation(
                         arg_local,
-                        eliminable.contains(arg_local),
-                        sink_definitions[arg_local],
+                        direct,
+                        &eliminable,
+                        &sink_definitions,
+                        &carrier_presentations,
                     ) {
-                        Ok(carrier) if carrier == arg_local => {
-                            (arg_use, arg_def, CandidateSlot::Resolved(direct_slot))
-                        }
-                        Ok(carrier) => carrier_presentations.get(&arg_local).copied().map_or(
-                            (
-                                arg_use,
-                                arg_def,
-                                CandidateSlot::Undeterminable {
-                                    direct: direct_slot,
-                                    reason: SinkCarrierReason::MissingVersionSite,
-                                },
-                            ),
-                            |presentation| {
-                                if presentation.carrier == carrier {
-                                    (
-                                        presentation.r#use,
-                                        presentation.def,
-                                        CandidateSlot::Resolved(presentation.slot),
-                                    )
-                                } else {
-                                    (
-                                        arg_use,
-                                        arg_def,
-                                        CandidateSlot::Undeterminable {
-                                            direct: direct_slot,
-                                            reason: SinkCarrierReason::MissingVersionSite,
-                                        },
-                                    )
-                                }
-                            },
+                        Ok(presentation) => (
+                            presentation.r#use,
+                            presentation.def,
+                            CandidateSlot::Resolved(presentation.slot),
                         ),
                         Err(reason) => (
                             arg_use,
@@ -1042,6 +1064,8 @@ impl BoxOwnershipFacts {
         subject: &super::Subject,
         slot: SlotRef,
         constructions: &super::construction::ConstructionFacts,
+        slots: &CrateSlots,
+        subjects: &[super::Subject],
     ) -> Result<BoxPlan, BoxPlanFailure> {
         box_scope(
             matches!(subject.kind, super::SubjectKind::Param { .. }),
@@ -1065,6 +1089,13 @@ impl BoxOwnershipFacts {
         if !scalar_initializer_supported(&normalized) {
             return Err(BoxPlanFailure::InitializerUnsupported);
         }
+        let subject_slot = |candidate: &super::Subject| {
+            slots
+                .fn_local_slots
+                .get(&candidate.fn_did)
+                .and_then(|universe| universe.slot_for_local_depth(candidate.local, 0))
+                .map(|slot| SlotRef::Local(candidate.fn_did, slot))
+        };
 
         let active_sources = self
             .endpoints
@@ -1083,6 +1114,68 @@ impl BoxOwnershipFacts {
         if active_sources.len() != 1 {
             return Err(BoxPlanFailure::MoveAmbiguous);
         }
+        let source_slot = active_sources[0].slot_ref.expect("active source slot");
+        let key = (subject.fn_did, subject.hir_id);
+        let construction = constructions
+            .by_binding
+            .get(&key)
+            .ok_or(BoxPlanFailure::ConstructionUnmappable)?;
+        if matches!(construction, super::construction::Construction::CopyOf) {
+            if self.move_edges.iter().any(|(from, _)| {
+                self.move_reaches(source_slot, *from)
+                    && self
+                        .move_edges
+                        .iter()
+                        .filter(|(candidate, _)| candidate == from)
+                        .map(|(_, to)| *to)
+                        .collect::<rustc_hash::FxHashSet<_>>()
+                        .len()
+                        > 1
+            }) {
+                return Err(BoxPlanFailure::MoveAmbiguous);
+            }
+            let upstream = subjects
+                .iter()
+                .filter(|candidate| candidate.fn_did == subject.fn_did)
+                .filter_map(|candidate| {
+                    let candidate_slot = subject_slot(candidate)?;
+                    let construction = constructions
+                        .by_binding
+                        .get(&(candidate.fn_did, candidate.hir_id))?;
+                    matches!(
+                        construction,
+                        super::construction::Construction::Alloc { .. }
+                    )
+                    .then_some((candidate, candidate_slot, construction))
+                })
+                .filter(|(_, candidate_slot, _)| {
+                    self.move_reaches(source_slot, *candidate_slot)
+                        && self.move_reaches(*candidate_slot, slot)
+                })
+                .collect::<Vec<_>>();
+            let [(upstream, _, upstream_construction)] = upstream.as_slice() else {
+                return Err(BoxPlanFailure::MoveAmbiguous);
+            };
+            let shape = match upstream_construction {
+                super::construction::Construction::Alloc {
+                    callee,
+                    count: Some(count),
+                    ..
+                } if callee == "calloc" && count.trim() != "1" => BoxShape::Slice,
+                _ => BoxShape::Sized,
+            };
+            return Ok(BoxPlan {
+                shape,
+                optional: false,
+                expr_edits: Vec::new(),
+                delete_statements: Vec::new(),
+                receipts: vec![format!(
+                    "box-move-companion source={} destination={}",
+                    upstream.label, subject.label
+                )],
+                fabricated_extent: false,
+            });
+        }
         let active_sinks = self
             .endpoints
             .iter()
@@ -1100,7 +1193,6 @@ impl BoxOwnershipFacts {
         if subject.freed_at.is_some() && active_sinks.is_empty() {
             return Err(BoxPlanFailure::EndpointUnjoined);
         }
-        let source_slot = active_sources[0].slot_ref.expect("active source slot");
         if self.move_edges.iter().any(|(from, _)| {
             if !self.move_reaches(source_slot, *from) {
                 return false;
@@ -1123,18 +1215,9 @@ impl BoxOwnershipFacts {
             return Err(BoxPlanFailure::MoveAmbiguous);
         }
 
-        let key = (subject.fn_did, subject.hir_id);
-        let construction = constructions
-            .by_binding
-            .get(&key)
-            .ok_or(BoxPlanFailure::ConstructionUnmappable)?;
         let init_span = *constructions
             .init_spans
             .get(&key)
-            .ok_or(BoxPlanFailure::AstUnplaceable)?;
-        let name = subject
-            .param_name
-            .as_deref()
             .ok_or(BoxPlanFailure::AstUnplaceable)?;
         let mut delete_statements = Vec::new();
         let (initializer, initializer_arm, shape, fabricated_extent) = match construction {
@@ -1220,10 +1303,36 @@ impl BoxOwnershipFacts {
             ));
         }
         if let Some(sink) = active_sinks.first() {
+            let sink_slot = sink.slot_ref.ok_or(BoxPlanFailure::EndpointUnjoined)?;
+            let sink_subjects = subjects
+                .iter()
+                .filter(|candidate| subject_slot(candidate) == Some(sink_slot))
+                .collect::<Vec<_>>();
+            let [sink_subject] = sink_subjects.as_slice() else {
+                #[cfg(test)]
+                eprintln!(
+                    "BOX-SINK-SUBJECT-MISS slot={} candidates={:?}",
+                    slot_label(sink_slot),
+                    subjects
+                        .iter()
+                        .map(|candidate| (&candidate.label, subject_slot(candidate)))
+                        .collect::<Vec<_>>()
+                );
+                return Err(BoxPlanFailure::AstUnplaceable);
+            };
+            let sink_key = (sink_subject.fn_did, sink_subject.hir_id);
+            let name = sink_subject
+                .param_name
+                .as_deref()
+                .ok_or(BoxPlanFailure::AstUnplaceable)?;
             let calls = constructions
                 .deallocator_calls
-                .get(&key)
-                .ok_or(BoxPlanFailure::AstUnplaceable)?;
+                .get(&sink_key)
+                .ok_or_else(|| {
+                    #[cfg(test)]
+                    eprintln!("BOX-SINK-CALL-MISS subject={}", sink_subject.label);
+                    BoxPlanFailure::AstUnplaceable
+                })?;
             let [call_span] = calls.as_slice() else {
                 return Err(BoxPlanFailure::FreeDuplicate);
             };

@@ -3319,6 +3319,7 @@ fn finish_decide<'tcx>(
         opt_uses: &opt_uses,
         box_facts: &box_facts,
         constructions: &ctors,
+        subjects: &subjects,
         gate,
         coconv,
     };

@@ -798,6 +798,7 @@ pub(crate) struct Ctx<'a, 'tcx> {
     pub(crate) opt_uses: &'a FxHashMap<(LocalDefId, rustc_hir::HirId), emitability::OptUses>,
     pub(crate) box_facts: &'a box_facts::BoxOwnershipFacts,
     pub(crate) constructions: &'a construction::ConstructionFacts,
+    pub(crate) subjects: &'a [Subject],
     /// **S3.6-1** — see [`RefGate`]. A mode rather than a fact, which is why it
     /// is `Copy` and not a borrow like everything else here.
     pub(crate) gate: RefGate,
@@ -983,6 +984,7 @@ fn decide_one_ladder(ctx: &Ctx<'_, '_>, subject: &Subject) -> Decision {
         opt_uses,
         box_facts,
         constructions,
+        subjects,
         gate,
         coconv,
     } = ctx;
@@ -1043,6 +1045,8 @@ fn decide_one_ladder(ctx: &Ctx<'_, '_>, subject: &Subject) -> Decision {
                 subject,
                 SlotRef::Local(subject.fn_did, slot_id),
                 constructions,
+                slots,
+                subjects,
             ) {
                 Ok(plan) => Decision::Box(plan),
                 Err(failure) => degrade(subject, decl_site, DegradeReason::BoxFailure { failure }),

@@ -258,6 +258,76 @@ fn box_w3_memset_slice_uses_named_fallback_and_deletes_statement() {
     assert!(source.contains("drop(p)"), "{source}");
 }
 
+#[test]
+fn box_w4_exact_copy_chain_threads_one_owner_to_the_free_site() {
+    let src = format!(
+        "{BOX_W1_PREAMBLE}\n\
+         pub unsafe fn f() -> i32 {{\n\
+             let mut p: *mut i32 = malloc(core::mem::size_of::<i32>()) as *mut i32;\n\
+             *p = 9;\n\
+             let q: *mut i32 = p;\n\
+             let out = *q;\n\
+             free(q as *mut core::ffi::c_void);\n\
+             out\n\
+         }}\n"
+    );
+    let outcome = super::rewrite_m1(&src);
+    let super::RewriteOutcome::Emitted {
+        source,
+        degradations,
+        ..
+    } = outcome
+    else {
+        let super::RewriteOutcome::Degraded {
+            reason,
+            degradations,
+            unplaceable,
+            ..
+        } = outcome
+        else {
+            unreachable!()
+        };
+        panic!(
+            "BOX-W4 fixture must emit: reason={reason} degradations={degradations:#?} \
+             unplaceable={unplaceable:#?}"
+        );
+    };
+    assert!(
+        source.contains("p: Box<i32>"),
+        "degradations={degradations:#?}\nsource binding did not convert: {source}"
+    );
+    assert!(
+        source.contains("q: Box<i32> = p"),
+        "move binding did not convert: {source}"
+    );
+    assert!(
+        source.contains("drop(q)"),
+        "free responsibility did not follow q: {source}"
+    );
+    assert_eq!(source.matches("Box::new(9)").count(), 1, "{source}");
+}
+
+#[test]
+fn box_n2_sibling_copy_split_does_not_create_two_boxes() {
+    let src = format!(
+        "{BOX_W1_PREAMBLE}\n\
+         pub unsafe fn f() -> i32 {{\n\
+             let mut p: *mut i32 = malloc(core::mem::size_of::<i32>()) as *mut i32;\n\
+             *p = 9;\n\
+             let q: *mut i32 = p;\n\
+             let r: *mut i32 = p;\n\
+             *q + *r\n\
+         }}\n"
+    );
+    let super::RewriteOutcome::Emitted { source, .. } = super::rewrite_m1(&src) else {
+        panic!("BOX-N2 fixture must complete conservatively");
+    };
+    assert!(
+        !source.contains("Box<"),
+        "sibling split over-licensed Box: {source}"
+    );
+}
+
 const ROOT_WITH_MODULE: &str = "#![allow(dead_code, unused_unsafe)]\npub mod m;\n";
 const MODULE_SUBJECT: &str = "pub unsafe fn bump(p: *mut i32) -> i32 {\n    *p += 1;\n    *p\n}\n";
 
