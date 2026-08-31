@@ -836,12 +836,10 @@ impl<'a, 'tcx> MinimalWalk<'a, 'tcx> {
             assign(&mut seeds, candidate.var, value)?;
         }
 
+        let direct_values = seeds.clone();
         let (values, replay_error) = match replay_values(seeds, &self.equations) {
             Ok(values) => (values, None),
-            Err(error) => (
-                IndexVec::from_raw(vec![FactValue::Unknown; self.next_var as usize]),
-                Some(error),
-            ),
+            Err(error) => (direct_values, Some(error)),
         };
         let mut endpoints = Vec::with_capacity(self.candidates.len());
         for candidate in self.candidates {
@@ -966,6 +964,37 @@ fn slot_order_key(slot: SlotRef) -> (u8, u32, usize) {
         SlotRef::Field(slot) => (0, 0, slot.index()),
         SlotRef::Local(did, slot) => (1, did.local_def_index.as_u32(), slot.index()),
     }
+}
+
+fn exactly_one_sink_per_exit(body: &Body<'_>, source: LocationKey, sinks: &[LocationKey]) -> bool {
+    let start = rustc_middle::mir::BasicBlock::from_u32(source.block);
+    let mut pending = vec![(start, 0usize)];
+    let mut seen = FxHashSet::default();
+    while let Some((block, count_before)) = pending.pop() {
+        if !seen.insert((block, count_before)) {
+            continue;
+        }
+        let count = count_before
+            + sinks
+                .iter()
+                .filter(|sink| sink.block == block.as_u32())
+                .count();
+        if count > 1 {
+            return false;
+        }
+        let successors = body.basic_blocks[block]
+            .terminator()
+            .successors()
+            .collect::<Vec<_>>();
+        if successors.is_empty() {
+            if count != 1 {
+                return false;
+            }
+        } else {
+            pending.extend(successors.into_iter().map(|next| (next, count)));
+        }
+    }
+    true
 }
 
 #[derive(Clone, Debug)]
@@ -1187,7 +1216,16 @@ impl BoxOwnershipFacts {
                         .is_some_and(|sink| self.move_reaches(slot, sink))
             })
             .collect::<Vec<_>>();
-        if active_sinks.len() > 1 {
+        if active_sinks.len() > 1
+            && !exactly_one_sink_per_exit(
+                &body,
+                active_sources[0].location,
+                &active_sinks
+                    .iter()
+                    .map(|sink| sink.location)
+                    .collect::<Vec<_>>(),
+            )
+        {
             return Err(BoxPlanFailure::FreeDuplicate);
         }
         if subject.freed_at.is_some() && active_sinks.is_empty() {
@@ -1302,23 +1340,25 @@ impl BoxOwnershipFacts {
                 super::emitability::EmitabilityFacts::site(tcx, *store_span)
             ));
         }
-        if let Some(sink) = active_sinks.first() {
-            let sink_slot = sink.slot_ref.ok_or(BoxPlanFailure::EndpointUnjoined)?;
-            let sink_subjects = subjects
+        if !active_sinks.is_empty() {
+            let mut sink_subjects = active_sinks
                 .iter()
-                .filter(|candidate| subject_slot(candidate) == Some(sink_slot))
-                .collect::<Vec<_>>();
-            let [sink_subject] = sink_subjects.as_slice() else {
-                #[cfg(test)]
-                eprintln!(
-                    "BOX-SINK-SUBJECT-MISS slot={} candidates={:?}",
-                    slot_label(sink_slot),
-                    subjects
+                .map(|sink| {
+                    let sink_slot = sink.slot_ref.ok_or(BoxPlanFailure::EndpointUnjoined)?;
+                    let matched = subjects
                         .iter()
-                        .map(|candidate| (&candidate.label, subject_slot(candidate)))
-                        .collect::<Vec<_>>()
-                );
-                return Err(BoxPlanFailure::AstUnplaceable);
+                        .filter(|candidate| subject_slot(candidate) == Some(sink_slot))
+                        .collect::<Vec<_>>();
+                    let [sink_subject] = matched.as_slice() else {
+                        return Err(BoxPlanFailure::AstUnplaceable);
+                    };
+                    Ok(*sink_subject)
+                })
+                .collect::<Result<Vec<_>, BoxPlanFailure>>()?;
+            sink_subjects.sort_unstable_by_key(|subject| subject.local.as_u32());
+            sink_subjects.dedup_by_key(|subject| subject.local);
+            let [sink_subject] = sink_subjects.as_slice() else {
+                return Err(BoxPlanFailure::MoveAmbiguous);
             };
             let sink_key = (sink_subject.fn_did, sink_subject.hir_id);
             let name = sink_subject
@@ -1328,24 +1368,24 @@ impl BoxOwnershipFacts {
             let calls = constructions
                 .deallocator_calls
                 .get(&sink_key)
-                .ok_or_else(|| {
-                    #[cfg(test)]
-                    eprintln!("BOX-SINK-CALL-MISS subject={}", sink_subject.label);
-                    BoxPlanFailure::AstUnplaceable
-                })?;
-            let [call_span] = calls.as_slice() else {
+                .ok_or(BoxPlanFailure::AstUnplaceable)?;
+            if calls.len() != active_sinks.len() {
                 return Err(BoxPlanFailure::FreeDuplicate);
-            };
-            expr_edits.push(BoxExprEdit {
-                span: *call_span,
-                replacement: format!("drop({name})"),
-                receipt: "c-free-site-drop",
-            });
-            receipts.push(format!(
-                "box-destruction callee={} site={}",
-                sink.callee,
-                super::emitability::EmitabilityFacts::site(tcx, *call_span)
-            ));
+            }
+            let mut calls = calls.clone();
+            calls.sort_unstable_by_key(|span| span.lo());
+            for (sink, call_span) in active_sinks.iter().zip(calls) {
+                expr_edits.push(BoxExprEdit {
+                    span: call_span,
+                    replacement: format!("drop({name})"),
+                    receipt: "c-free-site-drop",
+                });
+                receipts.push(format!(
+                    "box-destruction callee={} site={}",
+                    sink.callee,
+                    super::emitability::EmitabilityFacts::site(tcx, call_span)
+                ));
+            }
         } else {
             receipts.push(format!(
                 "waiver-drop(scope-exit) site={}",

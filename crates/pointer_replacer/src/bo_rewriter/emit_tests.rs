@@ -342,10 +342,18 @@ fn box_w6_mutually_exclusive_free_sites_both_become_drops() {
              }}\n\
          }}\n"
     );
-    let super::RewriteOutcome::Emitted { source, .. } = super::rewrite_m1(&src) else {
+    let super::RewriteOutcome::Emitted {
+        source,
+        degradations,
+        ..
+    } = super::rewrite_m1(&src)
+    else {
         panic!("BOX-W6 fixture must emit");
     };
-    assert!(source.contains("p: Box<i32>"), "{source}");
+    assert!(
+        source.contains("p: Box<i32>"),
+        "degradations={degradations:#?}\n{source}"
+    );
     assert_eq!(source.matches("drop(p)").count(), 2, "{source}");
     assert!(!source.contains("free(p as"), "{source}");
 }
