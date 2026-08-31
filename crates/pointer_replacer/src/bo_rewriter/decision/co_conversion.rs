@@ -828,3 +828,39 @@ pub(crate) fn escapes(
     }
     out
 }
+
+#[cfg(test)]
+mod e2_return_permit_tests {
+    use rustc_hir::{CRATE_HIR_ID, def_id::CRATE_DEF_ID};
+
+    use super::*;
+    use crate::bo_rewriter::decision::lifetime::LifetimeEligibility;
+
+    #[test]
+    fn e2_return_permit_skips_only_the_named_return_escape() {
+        let subject = (CRATE_DEF_ID, CRATE_HIR_ID);
+        let permitted = LifetimeEligibility::with_return_permit_for_test(subject);
+        let empty = LifetimeEligibility::default();
+
+        assert_eq!(
+            escape_block_reason_for_test(EscapeKind::Return, subject, &permitted),
+            None
+        );
+        assert_eq!(
+            escape_block_reason_for_test(EscapeKind::Return, subject, &empty),
+            Some(BlockReason::EscapesViaReturn)
+        );
+        assert_eq!(
+            escape_block_reason_for_test(EscapeKind::ForeignArg, subject, &permitted),
+            Some(BlockReason::EscapesViaForeignArg)
+        );
+        assert_eq!(
+            escape_block_reason_for_test(EscapeKind::FieldStore, subject, &permitted),
+            Some(BlockReason::EscapesViaFieldStore)
+        );
+        assert_eq!(
+            escape_block_reason_for_test(EscapeKind::StaticStore, subject, &permitted),
+            Some(BlockReason::EscapesViaStaticStore)
+        );
+    }
+}

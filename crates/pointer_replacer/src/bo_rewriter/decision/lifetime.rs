@@ -113,6 +113,56 @@ pub(crate) enum LifetimeFailure {
     SeamIncompatible,
 }
 
+/// The only token that may discharge one `escapes-via-return` row. Its
+/// constructor is private to this module so co-conversion cannot manufacture a
+/// bypass from a boolean or an arbitrary subject set.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ReturnLifetimePermit {
+    subject: super::co_conversion::NodeKey,
+    source: FnSignatureSlot,
+    target: FnSignatureSlot,
+}
+
+impl ReturnLifetimePermit {
+    fn new(
+        subject: super::co_conversion::NodeKey,
+        source: FnSignatureSlot,
+        target: FnSignatureSlot,
+    ) -> Self {
+        Self {
+            subject,
+            source,
+            target,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub(crate) struct LifetimeEligibility {
+    return_permits: FxHashMap<super::co_conversion::NodeKey, ReturnLifetimePermit>,
+}
+
+impl LifetimeEligibility {
+    pub(crate) fn return_permit(
+        &self,
+        subject: super::co_conversion::NodeKey,
+    ) -> Option<&ReturnLifetimePermit> {
+        self.return_permits.get(&subject)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_return_permit_for_test(subject: super::co_conversion::NodeKey) -> Self {
+        let permit = ReturnLifetimePermit::new(
+            subject,
+            FnSignatureSlot::arg(1, 0, 0),
+            FnSignatureSlot::RETURN,
+        );
+        Self {
+            return_permits: [(subject, permit)].into_iter().collect(),
+        }
+    }
+}
+
 impl LifetimeFailure {
     pub(crate) fn key(self) -> &'static str {
         match self {
