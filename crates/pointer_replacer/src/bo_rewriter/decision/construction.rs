@@ -119,6 +119,7 @@ pub(crate) struct ConstructionFacts {
     pub statement_spans: FxHashMap<(LocalDefId, HirId), rustc_span::Span>,
     pub first_stores: FxHashMap<(LocalDefId, HirId), Vec<FirstStore>>,
     pub deallocator_calls: FxHashMap<(LocalDefId, HirId), Vec<rustc_span::Span>>,
+    pub zero_memsets: FxHashMap<(LocalDefId, HirId), Vec<ZeroMemset>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -126,6 +127,13 @@ pub(crate) struct FirstStore {
     pub statement_span: rustc_span::Span,
     pub value_span: rustc_span::Span,
     pub value: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ZeroMemset {
+    pub statement_span: rustc_span::Span,
+    pub call_span: rustc_span::Span,
+    pub bytes: String,
 }
 
 const ALLOCATORS: &[&str] = &[
@@ -293,6 +301,34 @@ impl<'tcx> Visitor<'tcx> for Collector<'_, 'tcx> {
                     statement_span: stmt.span,
                     value_span: rhs.span,
                     value,
+                });
+        }
+        let memset_expression = expression.map(|expression| match expression.kind {
+            rustc_hir::ExprKind::Assign(_, rhs, _) => Self::peel(rhs),
+            _ => expression,
+        });
+        if let Some(memset_expression) = memset_expression
+            && let rustc_hir::ExprKind::Call(callee, args) = memset_expression.kind
+            && let rustc_hir::ExprKind::Path(rustc_hir::QPath::Resolved(_, path)) = callee.kind
+            && path
+                .segments
+                .last()
+                .is_some_and(|segment| segment.ident.name.as_str() == "memset")
+            && let [pointer, value, bytes] = args
+            && self.snippet(Self::peel(value).span).trim() == "0"
+            && let rustc_hir::ExprKind::Path(rustc_hir::QPath::Resolved(_, argument_path)) =
+                Self::peel(pointer).kind
+            && let rustc_hir::def::Res::Local(binding) = argument_path.res
+        {
+            let bytes = self.snippet(bytes.span);
+            self.facts
+                .zero_memsets
+                .entry((self.fn_did, binding))
+                .or_default()
+                .push(ZeroMemset {
+                    statement_span: stmt.span,
+                    call_span: memset_expression.span,
+                    bytes,
                 });
         }
         intravisit::walk_stmt(self, stmt);

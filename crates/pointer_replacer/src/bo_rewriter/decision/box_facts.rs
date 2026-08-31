@@ -517,26 +517,21 @@ impl<'a, 'tcx> MinimalWalk<'a, 'tcx> {
         let function_path = self.program.tcx.def_path_str(fn_did.to_def_id());
         let eliminable = eliminable_temporaries(body);
         let sink_definitions = sink_carrier_definitions(body);
-        let mut sink_argument_temps = FxHashSet::default();
+        let mut transparent_argument_temps = FxHashSet::default();
         for data in body.basic_blocks.iter() {
             let Some(terminator) = data.terminator.as_ref() else {
                 continue;
             };
-            let TerminatorKind::Call { func, args, .. } = &terminator.kind else {
+            let TerminatorKind::Call { args, .. } = &terminator.kind else {
                 continue;
             };
-            let is_sink = foreign_callee_name(self.program, func)
-                .as_deref()
-                .and_then(|name| boundary_table::lookup(name, Matcher::ForeignC))
-                .is_some_and(|entry| entry.roles.contains(&Role::Sink));
-            if is_sink
-                && let Some(local) = args
-                    .first()
-                    .and_then(|arg| arg.node.place())
-                    .and_then(|place| place.as_local())
-                && eliminable.contains(local)
+            for local in args
+                .iter()
+                .filter_map(|arg| arg.node.place())
+                .filter_map(|place| place.as_local())
+                .filter(|local| eliminable.contains(*local))
             {
-                sink_argument_temps.insert(local);
+                transparent_argument_temps.insert(local);
             }
         }
         let mut carrier_presentations = FxHashMap::<Local, CarrierPresentation>::default();
@@ -567,7 +562,7 @@ impl<'a, 'tcx> MinimalWalk<'a, 'tcx> {
                 let rhs_local = rhs_operand
                     .and_then(Operand::place)
                     .and_then(|place| place.as_local());
-                if sink_argument_temps.contains(&lhs_local) {
+                if transparent_argument_temps.contains(&lhs_local) {
                     if let Some(rhs_local) = rhs_local
                         && let Some((rhs_use, rhs_def, rhs_slot)) = self.consume(
                             fn_did,
@@ -688,6 +683,23 @@ impl<'a, 'tcx> MinimalWalk<'a, 'tcx> {
                 .unwrap_or(&[]);
             let is_source = roles.contains(&Role::Source);
             let is_sink = roles.contains(&Role::Sink);
+            let is_flow_transfer = roles.contains(&Role::FlowTransfer);
+
+            if is_flow_transfer
+                && let Some((_, destination_def, _)) = destination
+                && let Some(Some((arg_local, (arg_use, arg_def, _)))) = arg_consumes.first()
+            {
+                let (arg_use, arg_def) = carrier_presentations
+                    .get(arg_local)
+                    .map_or((*arg_use, *arg_def), |presentation| {
+                        (presentation.r#use, presentation.def)
+                    });
+                self.equations.push(RecordedEquation::Linear {
+                    left: destination_def,
+                    right: arg_def,
+                    result: arg_use,
+                });
+            }
 
             if let Some((destination_use, destination_def, slot)) = destination {
                 self.equations.push(RecordedEquation::Assume {
@@ -964,6 +976,7 @@ pub(crate) struct BoxPlan {
     pub(crate) expr_edits: Vec<BoxExprEdit>,
     pub(crate) delete_statements: Vec<Span>,
     pub(crate) receipts: Vec<String>,
+    pub(crate) fabricated_extent: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1070,21 +1083,6 @@ impl BoxOwnershipFacts {
         if active_sources.len() != 1 {
             return Err(BoxPlanFailure::MoveAmbiguous);
         }
-        if self.move_edges.iter().any(|(from, _)| {
-            self.move_edges
-                .iter()
-                .filter(|(candidate, _)| candidate == from)
-                .map(|(_, to)| *to)
-                .collect::<rustc_hash::FxHashSet<_>>()
-                .len()
-                > 1
-                && self.move_reaches(
-                    active_sources[0].slot_ref.expect("active source slot"),
-                    *from,
-                )
-        }) {
-            return Err(BoxPlanFailure::MoveAmbiguous);
-        }
         let active_sinks = self
             .endpoints
             .iter()
@@ -1102,6 +1100,28 @@ impl BoxOwnershipFacts {
         if subject.freed_at.is_some() && active_sinks.is_empty() {
             return Err(BoxPlanFailure::EndpointUnjoined);
         }
+        let source_slot = active_sources[0].slot_ref.expect("active source slot");
+        if self.move_edges.iter().any(|(from, _)| {
+            if !self.move_reaches(source_slot, *from) {
+                return false;
+            }
+            self.move_edges
+                .iter()
+                .filter(|(candidate, _)| candidate == from)
+                .map(|(_, to)| *to)
+                .filter(|to| {
+                    self.move_reaches(*to, slot)
+                        || active_sinks.iter().any(|sink| {
+                            sink.slot_ref
+                                .is_some_and(|sink_slot| self.move_reaches(*to, sink_slot))
+                        })
+                })
+                .collect::<rustc_hash::FxHashSet<_>>()
+                .len()
+                > 1
+        }) {
+            return Err(BoxPlanFailure::MoveAmbiguous);
+        }
 
         let key = (subject.fn_did, subject.hir_id);
         let construction = constructions
@@ -1117,25 +1137,37 @@ impl BoxOwnershipFacts {
             .as_deref()
             .ok_or(BoxPlanFailure::AstUnplaceable)?;
         let mut delete_statements = Vec::new();
-        let (initializer, initializer_arm, shape) = match construction {
+        let (initializer, initializer_arm, shape, fabricated_extent) = match construction {
             super::construction::Construction::Alloc {
                 callee,
                 size,
                 count: None,
             } if callee == "malloc" && size.contains(&format!("size_of::<{normalized}>")) => {
-                let stores = constructions
-                    .first_stores
-                    .get(&key)
-                    .ok_or(BoxPlanFailure::InitializerUnsupported)?;
-                let [store] = stores.as_slice() else {
+                if let Some(stores) = constructions.first_stores.get(&key)
+                    && let [store] = stores.as_slice()
+                {
+                    delete_statements.push(store.statement_span);
+                    (
+                        format!("Box::new({})", store.value),
+                        "malloc-literal-first-store",
+                        BoxShape::Sized,
+                        false,
+                    )
+                } else if let Some(memsets) = constructions.zero_memsets.get(&key)
+                    && let [memset] = memsets.as_slice()
+                {
+                    delete_statements.push(memset.statement_span);
+                    (
+                        format!(
+                            "vec![0 as {normalized}; crate::FALLBACK_SLICE_EXTENT].into_boxed_slice()"
+                        ),
+                        "memset-zero-slice",
+                        BoxShape::Slice,
+                        true,
+                    )
+                } else {
                     return Err(BoxPlanFailure::InitializerUnsupported);
-                };
-                delete_statements.push(store.statement_span);
-                (
-                    format!("Box::new({})", store.value),
-                    "malloc-literal-first-store",
-                    BoxShape::Sized,
-                )
+                }
             }
             super::construction::Construction::Alloc {
                 callee,
@@ -1147,12 +1179,14 @@ impl BoxOwnershipFacts {
                         format!("Box::new(0 as {normalized})"),
                         "calloc-zero-scalar",
                         BoxShape::Sized,
+                        false,
                     )
                 } else {
                     (
                         format!("vec![0 as {normalized}; {count}].into_boxed_slice()"),
                         "calloc-zero-slice",
                         BoxShape::Slice,
+                        false,
                     )
                 }
             }
@@ -1215,6 +1249,7 @@ impl BoxOwnershipFacts {
             expr_edits,
             delete_statements,
             receipts,
+            fabricated_extent,
         })
     }
 

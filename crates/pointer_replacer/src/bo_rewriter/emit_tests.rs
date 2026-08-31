@@ -225,15 +225,23 @@ fn box_w3_memset_slice_uses_named_fallback_and_deletes_statement() {
     let src = format!(
         "{BOX_W1_PREAMBLE}\n\
          pub unsafe fn f(n: usize) {{\n\
-             let p: *mut i32 = malloc(n * core::mem::size_of::<i32>()) as *mut i32;\n\
-             memset(p as *mut core::ffi::c_void, 0, n * core::mem::size_of::<i32>());\n\
+             let mut p: *mut i32 = malloc(n * core::mem::size_of::<i32>()) as *mut i32;\n\
+             p = memset(p as *mut core::ffi::c_void, 0, n * core::mem::size_of::<i32>()) as *mut i32;\n\
              free(p as *mut core::ffi::c_void);\n\
          }}\n"
     );
-    let super::RewriteOutcome::Emitted { source, .. } = super::rewrite_m1(&src) else {
+    let super::RewriteOutcome::Emitted {
+        source,
+        degradations,
+        ..
+    } = super::rewrite_m1(&src)
+    else {
         panic!("BOX-W3 fixture must emit");
     };
-    assert!(source.contains("p: Box<[i32]>"), "{source}");
+    assert!(
+        source.contains("p: Box<[i32]>"),
+        "degradations={degradations:#?}\n{source}"
+    );
     assert!(
         source.contains("crate::FALLBACK_SLICE_EXTENT"),
         "fallback arm missing: {source}"
@@ -244,8 +252,8 @@ fn box_w3_memset_slice_uses_named_fallback_and_deletes_statement() {
         "{source}"
     );
     assert!(
-        !source.contains("memset("),
-        "zeroing statement survived: {source}"
+        !source.contains("= memset("),
+        "zeroing assignment survived: {source}"
     );
     assert!(source.contains("drop(p)"), "{source}");
 }

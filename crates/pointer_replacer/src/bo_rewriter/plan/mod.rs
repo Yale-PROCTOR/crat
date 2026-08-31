@@ -514,7 +514,14 @@ pub(crate) fn plan(
                         lo,
                         hi,
                         replacement: edit.replacement.clone(),
-                        justification: if edit.receipt == "c-free-site-drop" {
+                        justification: if box_plan.fabricated_extent
+                            && edit.receipt == "memset-zero-slice"
+                        {
+                            Justification::SeamAdapter {
+                                family: "box",
+                                fabricated: true,
+                            }
+                        } else if edit.receipt == "c-free-site-drop" {
                             Justification::DropForm {
                                 selector_site: edit.receipt.to_owned(),
                             }

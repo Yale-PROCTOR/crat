@@ -1834,6 +1834,7 @@ fn transform_with(
     // site check, so their revert semantics live entirely in how these maps are
     // built — and production builds them in exactly ONE place.
     let filtered = filtered_inputs(&table, reverts);
+    let box_fabricated = filtered.box_fabricated;
     let uses = filtered.uses;
     let statement_deletes = filtered.statement_deletes;
     let use_key_collisions = use_key_collisions + filtered.use_key_collisions;
@@ -1856,6 +1857,7 @@ fn transform_with(
     s.visit_crate(&mut krate);
     let mut seams = s.finish();
     seams.key_collisions = seam_key_collisions;
+    seams.len_fabricated += box_fabricated;
 
     // **C-9 — mandatory companion emission.** The plan is already filtered by
     // the accepted model. Reverts use the mark's callee owner, matching the
@@ -2579,6 +2581,7 @@ pub(crate) struct FilteredInputs {
     pub use_key_collisions: usize,
     pub seam_key_collisions: usize,
     pub statement_deletes: FxHashSet<(u32, u32)>,
+    pub box_fabricated: usize,
 }
 
 /// Build both filtered maps from one decision table and one revert set.
@@ -2596,6 +2599,7 @@ pub(crate) fn filtered_inputs(
         use_key_collisions: 0,
         seam_key_collisions: 0,
         statement_deletes: FxHashSet::default(),
+        box_fabricated: 0,
     };
     for (subject, decision) in &table.entries {
         let use_edits = match decision {
@@ -2611,6 +2615,7 @@ pub(crate) fn filtered_inputs(
             continue;
         }
         if let super::decision::Decision::Box(plan) = decision {
+            out.box_fabricated += usize::from(plan.fabricated_extent);
             for edit in &plan.expr_edits {
                 insert_counting(
                     &mut out.uses,
