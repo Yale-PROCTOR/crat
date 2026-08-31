@@ -5741,6 +5741,58 @@ fn e2_structural_plan_covers_bounds_output_storage_and_existing_generics() {
     );
 }
 
+/// E2-W6 RED — a call adapter owned by a lifetime-bearing callee carries that
+/// exact plan identity, evaluates the source expression once, and survives the
+/// ordinary production verifier as one atomic function-owned rewrite.
+#[test]
+fn e2_w6_lifetime_callee_keeps_adapter_one_evaluation() {
+    let source = "#![allow(dead_code, unused_unsafe)]\n\
+         unsafe extern \"C\" { fn source() -> *const i32; }\n\
+         pub unsafe fn first(p: *const i32) -> *const i32 { p }\n\
+         pub unsafe fn caller() -> i32 { *first(source()) }\n";
+    let fixture = Fixture::new(&[("lib.rs", source)]);
+    let receipt = ::utils::compilation::run_compiler_on_path(&fixture.root(), |tcx| {
+        let (table, _) = super::decide_table_with_ctx_config(
+            tcx,
+            Some((
+                crate::analyses::borrow_ownership::a5_overlap::A5Mode::PreciseReplay,
+                Some(
+                    crate::analyses::borrow_ownership::a5_overlap::WholeProgramAttestation::FrozenBenchmarkGraph,
+                ),
+            )),
+        )
+        .expect("E2-W6 decision table");
+        super::seam_tsv_from_table(tcx, &table)
+    })
+    .expect("E2-W6 fixture compiles before rewriting");
+    let digest_column = receipt_column(&receipt, "lifetime_plan_digest");
+    let placed = receipt
+        .lines()
+        .skip(1)
+        .map(|line| line.split('\t').collect::<Vec<_>>())
+        .find(|columns| columns.first() == Some(&"placed"))
+        .expect("E2-W6 placed adapter row");
+    assert_ne!(placed[digest_column], "-", "{receipt}");
+
+    let outcome = super::rewrite_m1_path_a5_injected(
+        &fixture.root(),
+        crate::analyses::borrow_ownership::a5_overlap::A5Mode::PreciseReplay,
+        Some(
+            crate::analyses::borrow_ownership::a5_overlap::WholeProgramAttestation::FrozenBenchmarkGraph,
+        ),
+        &|_| {},
+    );
+    let super::RewriteOutcome::Emitted { files, .. } = outcome else {
+        panic!("E2-W6 production rewrite must survive: {outcome:#?}");
+    };
+    let emitted = files
+        .values()
+        .find(|text| text.contains("fn first"))
+        .expect("E2-W6 emitted source");
+    assert!(emitted.contains("fn first<'a: 'b, 'b>"), "{emitted}");
+    assert_eq!(emitted.matches("source()").count(), 2, "{emitted}");
+}
+
 fn receipt_column(receipt: &str, name: &str) -> usize {
     receipt
         .lines()
