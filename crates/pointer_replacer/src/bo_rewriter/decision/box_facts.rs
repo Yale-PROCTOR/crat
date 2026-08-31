@@ -32,6 +32,41 @@ pub(crate) enum FactValue {
     Unknown,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum BoxScopeFailure {
+    PointerDepth,
+    ParameterHeld,
+}
+
+pub(crate) fn box_scope(is_parameter: bool, pointer_depth: u8) -> Result<(), BoxScopeFailure> {
+    if pointer_depth != 1 {
+        return Err(BoxScopeFailure::PointerDepth);
+    }
+    if is_parameter {
+        return Err(BoxScopeFailure::ParameterHeld);
+    }
+    Ok(())
+}
+
+pub(crate) fn scalar_initializer_supported(normalized: &str) -> bool {
+    matches!(
+        normalized,
+        "u8" | "u16"
+            | "u32"
+            | "u64"
+            | "u128"
+            | "usize"
+            | "i8"
+            | "i16"
+            | "i32"
+            | "i64"
+            | "i128"
+            | "isize"
+            | "f32"
+            | "f64"
+    )
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum RecordedEquation {
     Linear { left: Var, right: Var, result: Var },
