@@ -5602,7 +5602,8 @@ fn e2_w3_output_storage_uses_source_not_temp_lifetime() {
              *out = p;\n\
          }\n",
     )]);
-    let receipt = ::utils::compilation::run_compiler_on_path(&fixture.root(), |tcx| {
+    let (receipt, diagnostic) =
+        ::utils::compilation::run_compiler_on_path(&fixture.root(), |tcx| {
         let (_, ctx) = super::decide_table_with_ctx_config(
             tcx,
             Some((
@@ -5613,13 +5614,57 @@ fn e2_w3_output_storage_uses_source_not_temp_lifetime() {
             )),
         )
         .expect("E2-W3 decision table");
-        ctx.lifetime_eligibility.output_storage_receipts()
+        let mut diagnostic = Vec::new();
+        if let Some(origins) = ctx.analysis.origins.as_ref() {
+            for (&did, summary) in origins.iter() {
+                if !tcx.def_path_str(did.to_def_id()).ends_with("store") {
+                    continue;
+                }
+                for (origin, slot) in summary.slots.iter_enumerated() {
+                    let local = match slot.place.root {
+                        crate::analyses::borrow_ownership::origin_summary::SignatureRoot::Arg(local) => local,
+                        crate::analyses::borrow_ownership::origin_summary::SignatureRoot::Return => rustc_middle::mir::RETURN_PLACE,
+                    };
+                    let depth = slot.place.deref_depth.saturating_add(slot.depth);
+                    let kind = ctx
+                        .slots
+                        .fn_local_slots
+                        .get(&did)
+                        .and_then(|universe| universe.slot_for_local_depth(local, depth))
+                        .and_then(|slot| ctx.model.get(&crate::analyses::borrow_ownership::solver::SlotRef::Local(did, slot)))
+                        .copied();
+                    let incoming = summary
+                        .slots
+                        .indices()
+                        .filter(|source| summary.subset.contains(*source, origin))
+                        .map(|source| format!("{source:?}"))
+                        .collect::<Vec<_>>();
+                    diagnostic.push(format!(
+                        "{origin:?}={:?}/deref{}/depth{} model={kind:?} unknown={} incoming={incoming:?}",
+                        slot.place.root,
+                        slot.place.deref_depth,
+                        slot.depth,
+                        summary.unknown.contains(origin),
+                    ));
+                }
+            }
+        }
+        (
+            ctx.lifetime_eligibility.output_storage_receipts(),
+            diagnostic,
+        )
     })
     .expect("E2-W3 fixture compiles before rewriting");
 
-    assert_eq!(receipt.len(), 1, "{receipt:#?}");
+    assert_eq!(
+        receipt.len(),
+        1,
+        "receipt={receipt:#?}; summary={diagnostic:#?}"
+    );
     assert_eq!(receipt[0].source, "arg2/deref0/depth0");
-    assert_eq!(receipt[0].target, "arg1/deref1/depth0");
+    // NB5-O represents this raw-pointer layer as signature `depth=1`; the
+    // separate `deref_depth` component is reserved for a projected place.
+    assert_eq!(receipt[0].target, "arg1/deref0/depth1");
 }
 
 fn receipt_column(receipt: &str, name: &str) -> usize {

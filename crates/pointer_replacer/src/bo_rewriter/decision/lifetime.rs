@@ -97,7 +97,8 @@ impl FnSignatureSlot {
 
     fn needs_modeled_source(self) -> bool {
         matches!(self.root, FnSignatureRoot::Return)
-            || matches!(self.root, FnSignatureRoot::Arg(_)) && self.deref_depth > 0
+            || matches!(self.root, FnSignatureRoot::Arg(_))
+                && self.deref_depth.saturating_add(self.depth) > 0
     }
 
     fn receipt_key(self) -> String {
@@ -147,6 +148,40 @@ pub(crate) struct InferredLifetimePermit {
     callee: LocalDefId,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct OutputStorageLifetimePermit {
+    function: LocalDefId,
+    sources: Vec<FnSignatureSlot>,
+    target: FnSignatureSlot,
+    origin_sources: Vec<OriginSlot>,
+    origin_target: OriginSlot,
+}
+
+impl OutputStorageLifetimePermit {
+    fn new(
+        function: LocalDefId,
+        sources: Vec<(FnSignatureSlot, OriginSlot)>,
+        target: (FnSignatureSlot, OriginSlot),
+    ) -> Self {
+        let (sources, origin_sources) = sources.into_iter().unzip();
+        let (target, origin_target) = target;
+        Self {
+            function,
+            sources,
+            target,
+            origin_sources,
+            origin_target,
+        }
+    }
+}
+
+#[cfg(test)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct OutputStorageReceipt {
+    pub(crate) source: String,
+    pub(crate) target: String,
+}
+
 impl InferredLifetimePermit {
     fn new(subject: NodeKey, callee: LocalDefId) -> Self {
         Self { subject, callee }
@@ -190,6 +225,7 @@ impl ReturnLifetimePermit {
 pub(crate) struct LifetimeEligibility {
     return_permits: FxHashMap<NodeKey, ReturnLifetimePermit>,
     inferred_permits: FxHashMap<NodeKey, InferredLifetimePermit>,
+    output_storage_permits: FxHashMap<(LocalDefId, FnSignatureSlot), OutputStorageLifetimePermit>,
     failures: FxHashMap<NodeKey, LifetimeFailure>,
 }
 
@@ -216,6 +252,27 @@ impl LifetimeEligibility {
     }
 
     #[cfg(test)]
+    pub(crate) fn output_storage_receipts(&self) -> Vec<OutputStorageReceipt> {
+        let mut permits = self.output_storage_permits.values().collect::<Vec<_>>();
+        permits.sort_by_key(|permit| {
+            (
+                permit.function.local_def_index.as_u32(),
+                permit.target,
+                permit.sources.clone(),
+            )
+        });
+        permits
+            .into_iter()
+            .flat_map(|permit| {
+                permit.sources.iter().map(|source| OutputStorageReceipt {
+                    source: source.receipt_key(),
+                    target: permit.target.receipt_key(),
+                })
+            })
+            .collect()
+    }
+
+    #[cfg(test)]
     pub(crate) fn with_return_permit_for_test(subject: NodeKey) -> Self {
         let permit = ReturnLifetimePermit::for_test(
             subject,
@@ -225,6 +282,7 @@ impl LifetimeEligibility {
         Self {
             return_permits: [(subject, permit)].into_iter().collect(),
             inferred_permits: FxHashMap::default(),
+            output_storage_permits: FxHashMap::default(),
             failures: FxHashMap::default(),
         }
     }
@@ -240,10 +298,13 @@ fn model_is_ref(
         SignatureRoot::Arg(local) => local,
         SignatureRoot::Return => RETURN_PLACE,
     };
+    let Some(depth) = signature.place.deref_depth.checked_add(signature.depth) else {
+        return false;
+    };
     slots
         .fn_local_slots
         .get(&function)
-        .and_then(|universe| universe.slot_for_local_depth(local, signature.depth))
+        .and_then(|universe| universe.slot_for_local_depth(local, depth))
         .and_then(|slot| model.get(&SlotRef::Local(function, slot)))
         == Some(&SlotKind::Ref)
 }
@@ -359,6 +420,65 @@ pub(crate) fn derive_return_eligibility(
             }
             (Err(failure), _) | (_, Err(failure)) => {
                 result.failures.insert(subject, failure);
+            }
+        }
+    }
+
+    if let (Ok(web), Some(origins)) = (&web, origins) {
+        for (&function, summary) in origins.iter() {
+            if web.contains(function) {
+                continue;
+            }
+            for (target_origin, target_signature) in summary.slots.iter_enumerated() {
+                if !matches!(target_signature.place.root, SignatureRoot::Arg(_))
+                    || target_signature.place.field.is_some()
+                    || target_signature
+                        .place
+                        .deref_depth
+                        .saturating_add(target_signature.depth)
+                        == 0
+                    || !model_is_ref(model, slots, function, *target_signature)
+                {
+                    continue;
+                }
+                let sources = summary
+                    .slots
+                    .iter_enumerated()
+                    .filter(|(source_origin, source_signature)| {
+                        *source_origin != target_origin
+                            && matches!(source_signature.place.root, SignatureRoot::Arg(_))
+                            && source_signature.place.field.is_none()
+                            && summary.subset.contains(*source_origin, target_origin)
+                            && model_is_ref(model, slots, function, **source_signature)
+                    })
+                    .collect::<Vec<_>>();
+                if sources.is_empty() {
+                    continue;
+                }
+                let mut required = sources
+                    .iter()
+                    .map(|(origin, _)| *origin)
+                    .collect::<Vec<_>>();
+                required.push(target_origin);
+                if plan_function(summary, &required, &BTreeSet::new()).is_err() {
+                    continue;
+                }
+                let Ok(sources) = sources
+                    .into_iter()
+                    .map(|(origin, slot)| {
+                        FnSignatureSlot::from_summary(*slot).map(|slot| (slot, origin))
+                    })
+                    .collect::<Result<Vec<_>, _>>()
+                else {
+                    continue;
+                };
+                let Ok(target) = FnSignatureSlot::from_summary(*target_signature) else {
+                    continue;
+                };
+                result.output_storage_permits.insert(
+                    (function, target),
+                    OutputStorageLifetimePermit::new(function, sources, (target, target_origin)),
+                );
             }
         }
     }
