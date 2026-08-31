@@ -3176,6 +3176,7 @@ fn finish_decide<'tcx>(
     analysis: DecisionAnalysisCarrier,
     perturb: impl FnOnce(&mut Vec<decision::Subject>),
 ) -> Result<(decision::DecisionTable, DecideCtx), String> {
+    let box_facts = decision::box_facts::BoxOwnershipFacts::derive(&program, &slots, &model)?;
     let mut subjects = collect_subjects(tcx, &program, &mut_facts);
     // S3.1: the second universe. Appended rather than merged into
     // `collect_subjects` so the parameter census keeps measuring the parameter
@@ -3431,6 +3432,7 @@ fn finish_decide<'tcx>(
             a5_receipt,
             analysis,
             a5_site_proofs,
+            box_facts,
         },
     ))
 }
@@ -3469,6 +3471,7 @@ pub(crate) struct DecideCtx {
     a5_receipt: String,
     analysis: DecisionAnalysisCarrier,
     a5_site_proofs: decision::a5_site_proof::A5SeamProofIndex,
+    box_facts: decision::box_facts::BoxOwnershipFacts,
 }
 
 impl DecideCtx {
@@ -3481,6 +3484,18 @@ impl DecideCtx {
     pub(crate) fn escapes_for_test(&self) -> &[decision::co_conversion::Escape] {
         &self.escapes
     }
+}
+
+/// Render the production derive-on-load Box facts for external differential
+/// controls. The derivation itself runs unconditionally in `finish_decide`;
+/// this accessor does not create a second MIR walk.
+pub(crate) fn box_facts_tsv(tcx: TyCtxt<'_>) -> Result<(String, String, String), String> {
+    let (_table, ctx) = decide_table_with_ctx(tcx)?;
+    Ok((
+        ctx.box_facts.endpoints_tsv(),
+        ctx.box_facts.version_sites_tsv(),
+        ctx.box_facts.canonical_sha256().to_owned(),
+    ))
 }
 
 fn e1_subject_model_kind(ctx: &DecideCtx, subject: &decision::Subject) -> Option<SlotKind> {
