@@ -701,7 +701,11 @@ fn every_golden_outcome_is_attributed() {
     // market — so the golden is ratified spec that degrades. Registering it
     // here is the intentional edit this guard was designed to force, and it
     // makes the Degraded arm's assertions load-bearing for the first time.
-    const EXPECTED_DEGRADED: &[&str] = &["g18_reslice_rebind"];
+    // Box wave-1 adds the deliberate W9-HOLD boundary refusal: g06's owning
+    // caller local reaches a callee parameter, which this body-locals-only wave
+    // must leave unchanged. The golden remains one of the standing RED six;
+    // only its typed outcome branch changes from wrong emission to refusal.
+    const EXPECTED_DEGRADED: &[&str] = &["g06_move_reroute", "g18_reslice_rebind"];
     assert_eq!(
         degraded.iter().copied().collect::<Vec<_>>(),
         EXPECTED_DEGRADED,

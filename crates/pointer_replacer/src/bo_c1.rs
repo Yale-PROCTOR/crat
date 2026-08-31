@@ -9131,6 +9131,84 @@ mod run {
         row
     }
 
+    pub fn run_box_census(input: &std::path::Path) -> Row {
+        let mut row = run_e1_revert_census(input);
+        if row.get("status") != Some("ok") {
+            return row;
+        }
+        let started = Instant::now();
+        let artifact = match ::utils::compilation::run_compiler_on_path(input, |tcx| {
+            crate::bo_rewriter::box_plan_artifact(tcx)
+        }) {
+            Ok(Ok(artifact)) => artifact,
+            Ok(Err(error)) => {
+                row.set("status", "box-plan-error");
+                row.set("box_detail", super::report::sanitize(&error));
+                return row;
+            }
+            Err(_) => {
+                row.set("status", "box-plan-compile-error");
+                return row;
+            }
+        };
+        let name = std::env::var("CRAT_BOC1_NAME").unwrap_or_else(|_| "unnamed".to_owned());
+        let directory = std::env::var_os("CRAT_BOX_CENSUS_ARTIFACT_DIR")
+            .map(std::path::PathBuf::from)
+            .expect("Box census requires CRAT_BOX_CENSUS_ARTIFACT_DIR");
+        std::fs::create_dir_all(&directory).expect("create Box census artifact directory");
+        std::fs::write(
+            directory.join(format!("{name}.box-plans.tsv")),
+            &artifact.tsv,
+        )
+        .expect("write Box plan ledger");
+
+        let mut rows = 0usize;
+        let mut planned = 0usize;
+        let mut params_planned = 0usize;
+        let mut depth_two = 0usize;
+        let mut depth_two_planned = 0usize;
+        let mut fabricated = 0usize;
+        let mut waiver_overwrite = 0usize;
+        let mut waiver_scope = 0usize;
+        let mut waiver_unwind = 0usize;
+        for line in artifact.tsv.lines().skip(1) {
+            let fields = line.split('\t').collect::<Vec<_>>();
+            assert_eq!(fields.len(), 13, "Box plan schema: {line}");
+            rows += 1;
+            planned += usize::from(fields[5] == "planned");
+            params_planned += usize::from(fields[5] == "planned" && fields[3] == "1");
+            depth_two += usize::from(fields[4] == "2");
+            depth_two_planned += usize::from(fields[4] == "2" && fields[5] == "planned");
+            fabricated += fields[11].parse::<usize>().expect("fabricated bit");
+            waiver_overwrite += fields[12].matches("waiver-drop(overwrite)").count();
+            waiver_scope += fields[12].matches("waiver-drop(scope-exit)").count();
+            waiver_unwind += fields[12].matches("waiver-drop(unwind)").count();
+        }
+        row.set("box_rows", rows);
+        row.set("box_planned", planned);
+        row.set("box_param_planned", params_planned);
+        row.set("box_depth2_rows", depth_two);
+        row.set("box_depth2_planned", depth_two_planned);
+        row.set("box_fabricated_extent", fabricated);
+        row.set("box_waiver_overwrite", waiver_overwrite);
+        row.set("box_waiver_scope_exit", waiver_scope);
+        row.set("box_waiver_unwind", waiver_unwind);
+        row.set(
+            "a5_global_setup_wall_s",
+            format!("{:.6}", artifact.a5_global_setup_wall_s),
+        );
+        row.set(
+            "a5_pair_classification_wall_s",
+            format!("{:.6}", artifact.a5_pair_classification_wall_s),
+        );
+        row.set(
+            "a5_receipt_render_wall_s",
+            format!("{:.6}", artifact.a5_receipt_render_wall_s),
+        );
+        row.set("box_receipt_wall_s", secs(started.elapsed()));
+        row
+    }
+
     /// Wave-3's no-fallback cache preflight. It computes the exact production
     /// key and attempts one load, but has no solve arm by construction.
     pub fn run_e1_cache_preflight(tcx: TyCtxt<'_>, t_tcx: Duration) -> Row {
@@ -16021,6 +16099,99 @@ fn box_fact_two_root_determinism() {
     .expect("write two-root receipt");
 }
 
+#[test]
+#[ignore = "Box wave-1: serialized cache-only 20-program emission census"]
+fn box_wave1_corpus_census() {
+    use std::{fs, path::PathBuf, time::Duration};
+
+    let root = orchestrate::workspace_root();
+    let artifact_dir = PathBuf::from(
+        std::env::var_os("CRAT_BOX_CENSUS_ARTIFACT_DIR")
+            .expect("Box census requires CRAT_BOX_CENSUS_ARTIFACT_DIR"),
+    );
+    let cache_dir = PathBuf::from(
+        std::env::var_os("CRAT_BO_CACHE_DIR").expect("Box census requires CRAT_BO_CACHE_DIR"),
+    );
+    fs::create_dir_all(&artifact_dir).expect("create Box census artifact directory");
+    let mut rows = Vec::new();
+    for program in CORPUS {
+        let input = program.input_path(&root);
+        let outcome = orchestrate::run_child_env(
+            program.name,
+            &input,
+            "box-census",
+            Duration::from_secs(14_400),
+            &[
+                ("CRAT_BO_CACHE", "1".to_owned()),
+                ("CRAT_BO_CACHE_DIR", cache_dir.display().to_string()),
+                (
+                    "CRAT_BO_A5_ATTESTATION",
+                    "frozen_benchmark_graph".to_owned(),
+                ),
+                ("CRAT_E1_ARTIFACT_DIR", artifact_dir.display().to_string()),
+                (
+                    "CRAT_BOX_CENSUS_ARTIFACT_DIR",
+                    artifact_dir.display().to_string(),
+                ),
+            ],
+        );
+        let mut row = outcome.row.unwrap_or_else(|| {
+            panic!(
+                "{} produced no Box census row: status={} note={}",
+                program.name, outcome.status, outcome.note
+            )
+        });
+        row.set("program", program.name);
+        row.set("worker_wall_s", format!("{:.3}", outcome.wall_s));
+        row.set("peak_rss_kb", outcome.peak_rss_kb);
+        assert_eq!(row.get("status"), Some("ok"), "{row:?}");
+        assert_eq!(row.get("cache_status"), Some("hit"), "{row:?}");
+        assert_eq!(row.get("solve_wall_s"), Some("0.000000"), "{row:?}");
+        assert_eq!(row.get("box_param_planned"), Some("0"), "{row:?}");
+        assert_eq!(row.get("box_depth2_planned"), Some("0"), "{row:?}");
+        eprintln!(
+            "BOX-CENSUS program={} stage=complete rc=0 wall={:.3} rss={} digest={}",
+            program.name,
+            outcome.wall_s,
+            outcome.peak_rss_kb,
+            row.get("fingerprint").unwrap_or("missing"),
+        );
+        rows.push(row);
+    }
+    let number = |row: &report::Row, key: &str| {
+        row.get(key)
+            .unwrap_or_else(|| panic!("Box census row lacks {key}: {row:?}"))
+            .parse::<usize>()
+            .unwrap_or_else(|error| panic!("Box census {key}: {error}"))
+    };
+    let total = |key: &str| rows.iter().map(|row| number(row, key)).sum::<usize>();
+    assert_eq!(rows.len(), 20);
+    assert_eq!(total("box_rows"), 57);
+    assert_eq!(total("box_param_planned"), 0);
+    assert_eq!(total("box_depth2_rows"), 4);
+    assert_eq!(total("box_depth2_planned"), 0);
+    let summary = rows
+        .iter()
+        .map(report::to_kv_line)
+        .collect::<Vec<_>>()
+        .join("\n")
+        + "\n";
+    fs::write(artifact_dir.join("box-census-results.kv"), summary).expect("write Box census rows");
+    fs::write(
+        artifact_dir.join("box-census-receipt.txt"),
+        format!(
+            "status=complete\ndata=true\nprograms=20/20\ncache_hits=20/20\nsolver_seconds=0\nbox_rows=57\nbox_planned={}\nbox_realized={}\nbox_param_planned=0\nbox_depth2_rows=4\nbox_depth2_planned=0\nbox_fabricated_extent={}\nbox_waiver_overwrite={}\nbox_waiver_scope_exit={}\nbox_waiver_unwind={}\n",
+            total("box_planned"),
+            total("subject_box_realized"),
+            total("box_fabricated_extent"),
+            total("box_waiver_overwrite"),
+            total("box_waiver_scope_exit"),
+            total("box_waiver_unwind"),
+        ),
+    )
+    .expect("write Box census receipt");
+}
+
 /// **A panic is a failure; a resource deferral is an absence** (R8, 2026-08-15).
 ///
 /// Lifted out of the sweep because a decision only a 600 s corpus run can
@@ -16328,6 +16499,7 @@ fn boc1_run_one() {
             | "t1-origin-caller"
             | "e1-revert-census"
             | "box-facts"
+            | "box-census"
     ) || mode.starts_with("selector-detail-")
     {
         z3::set_global_param("smt.random_seed", "0");
@@ -16352,6 +16524,14 @@ fn boc1_run_one() {
         let mut row = run::run_e1_revert_census(Path::new(&input));
         row.set("program", name.clone());
         row.set("mode", "e1-revert-census");
+        println!("{}", report::to_kv_line(&row));
+        return;
+    }
+
+    if mode == "box-census" {
+        let mut row = run::run_box_census(Path::new(&input));
+        row.set("program", name.clone());
+        row.set("mode", "box-census");
         println!("{}", report::to_kv_line(&row));
         return;
     }

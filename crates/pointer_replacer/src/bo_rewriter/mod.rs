@@ -3549,6 +3549,102 @@ pub(crate) fn box_fact_artifacts(tcx: TyCtxt<'_>) -> Result<BoxFactArtifacts, St
     })
 }
 
+pub(crate) struct BoxPlanArtifact {
+    pub(crate) tsv: String,
+    pub(crate) a5_global_setup_wall_s: f64,
+    pub(crate) a5_pair_classification_wall_s: f64,
+    pub(crate) a5_receipt_render_wall_s: f64,
+}
+
+pub(crate) fn box_plan_artifact(tcx: TyCtxt<'_>) -> Result<BoxPlanArtifact, String> {
+    let (table, ctx) = decide_table_with_ctx(tcx)?;
+    let a5_global_setup_wall_s = ctx.a5_site_proofs.global_setup_wall_s();
+    let a5_pair_classification_wall_s = ctx.a5_site_proofs.pair_classification_wall_s();
+    let receipt_started = std::time::Instant::now();
+    let _receipt = seam_tsv_from_table(tcx, &table);
+    let a5_receipt_render_wall_s = receipt_started.elapsed().as_secs_f64();
+    let decisions = table
+        .entries
+        .iter()
+        .map(|(subject, decision)| ((subject.fn_did, subject.local), decision))
+        .collect::<rustc_hash::FxHashMap<_, _>>();
+    let mut rows = Vec::new();
+    for subject in ctx
+        .subjects
+        .iter()
+        .filter(|subject| e1_subject_model_kind(&ctx, subject) == Some(SlotKind::Owning))
+    {
+        let owner = tcx.def_path_str(subject.fn_did.to_def_id());
+        let decision = decisions[&(subject.fn_did, subject.local)];
+        let (outcome, reason, shape, optional, edits, deletes, fabricated, receipts) =
+            match decision {
+                decision::Decision::Box(plan) => (
+                    "planned",
+                    "-",
+                    match plan.shape {
+                        decision::box_facts::BoxShape::Sized => "sized",
+                        decision::box_facts::BoxShape::Slice => "slice",
+                    },
+                    u8::from(plan.optional),
+                    plan.expr_edits.len(),
+                    plan.delete_statements.len(),
+                    u8::from(plan.fabricated_extent),
+                    plan.receipts.join(" | "),
+                ),
+                decision::Decision::Degraded(record) => (
+                    "filtered",
+                    record.reason.key(),
+                    "-",
+                    0,
+                    0,
+                    0,
+                    0,
+                    "-".to_owned(),
+                ),
+                decision::Decision::Ref { .. }
+                | decision::Decision::Slice { .. }
+                | decision::Decision::Opt { .. } => {
+                    return Err(format!(
+                        "Owning subject {} received non-Box safe form",
+                        subject.label
+                    ));
+                }
+            };
+        rows.push((
+            subject.identity_key(&owner),
+            format!(
+                "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                subject.identity_key(&owner),
+                owner,
+                subject.local.as_u32(),
+                u8::from(matches!(subject.kind, decision::SubjectKind::Param { .. })),
+                subject.ptr_depth,
+                outcome,
+                reason,
+                shape,
+                optional,
+                edits,
+                deletes,
+                fabricated,
+            ) + &format!("\t{}", receipts.replace(['\t', '\r', '\n'], " ")),
+        ));
+    }
+    rows.sort_by(|left, right| left.0.cmp(&right.0));
+    let mut output = String::from(
+        "subject_key\towner_fn\tmir_local\tis_param\tptr_depth\toutcome\treason\tshape\toptional\texpr_edits\tstatement_deletes\tfabricated_extent\treceipts\n",
+    );
+    for (_, row) in rows {
+        output.push_str(&row);
+        output.push('\n');
+    }
+    Ok(BoxPlanArtifact {
+        tsv: output,
+        a5_global_setup_wall_s,
+        a5_pair_classification_wall_s,
+        a5_receipt_render_wall_s,
+    })
+}
+
 fn e1_subject_model_kind(ctx: &DecideCtx, subject: &decision::Subject) -> Option<SlotKind> {
     let universe = ctx.slots.fn_local_slots.get(&subject.fn_did)?;
     let slot = universe.slot_for_local_depth(subject.local, 0)?;

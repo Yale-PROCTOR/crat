@@ -91,6 +91,8 @@ pub(crate) struct A5SeamProofIndex {
     unavailable: Option<&'static str>,
     world: &'static str,
     guard: &'static str,
+    global_setup_wall_s: f64,
+    pair_classification_wall_s: f64,
 }
 
 impl A5SeamProofIndex {
@@ -123,8 +125,10 @@ impl A5SeamProofIndex {
             );
         };
 
+        let started = std::time::Instant::now();
         let audits = audit_a5_site_branches(program, slots, origins.native_flows());
-        Self::from_audits(program.tcx, program, audits)
+        let global_setup_wall_s = started.elapsed().as_secs_f64();
+        Self::from_audits(program.tcx, program, audits, global_setup_wall_s)
     }
 
     fn unavailable(reason: &'static str, world: &'static str, guard: &'static str) -> Self {
@@ -133,6 +137,8 @@ impl A5SeamProofIndex {
             unavailable: Some(reason),
             world,
             guard,
+            global_setup_wall_s: 0.0,
+            pair_classification_wall_s: 0.0,
         }
     }
 
@@ -140,7 +146,9 @@ impl A5SeamProofIndex {
         tcx: TyCtxt<'_>,
         program: &RustProgram<'_>,
         audits: Vec<A5SiteBranchAudit>,
+        global_setup_wall_s: f64,
     ) -> Self {
+        let started = std::time::Instant::now();
         let functions = program
             .functions
             .iter()
@@ -173,6 +181,8 @@ impl A5SeamProofIndex {
             unavailable: None,
             world: ATTESTED_WORLD,
             guard: ATTESTED_GUARD,
+            global_setup_wall_s,
+            pair_classification_wall_s: started.elapsed().as_secs_f64(),
         }
     }
 
@@ -212,6 +222,14 @@ impl A5SeamProofIndex {
 
     pub(crate) fn guard(&self) -> &'static str {
         self.guard
+    }
+
+    pub(crate) fn global_setup_wall_s(&self) -> f64 {
+        self.global_setup_wall_s
+    }
+
+    pub(crate) fn pair_classification_wall_s(&self) -> f64 {
+        self.pair_classification_wall_s
     }
 }
 
