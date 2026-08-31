@@ -1097,28 +1097,31 @@ fn verify_and_revert(
             facts.first_diags = novel.clone();
             facts.observed_root = Some(observed_root.clone());
             facts.e1_novel_error_count = novel_errors;
-            facts.e1_box_drop_receipt = match verify::box_mir_drops_path(staged.root()) {
-                Ok(mut drops) => {
-                    drops.retain(|drop| {
-                        e1_box_drop_policies.iter().any(|policy| {
-                            policy.function == drop.function && policy.local_name == drop.local_name
-                        })
-                    });
-                    match verify::reconcile_box_mir_drop_policies(&drops, &e1_box_drop_policies) {
-                        Ok(tsv) => {
-                            format!("status=ok\ndata=provisional\nrows={}\n{tsv}", drops.len())
+            facts.e1_box_drop_receipt =
+                match verify::box_mir_drops_path(staged.root(), &e1_box_drop_policies) {
+                    Ok(mut drops) => {
+                        drops.retain(|drop| {
+                            e1_box_drop_policies.iter().any(|policy| {
+                                policy.function == drop.function
+                                    && policy.local_name == drop.local_name
+                            })
+                        });
+                        match verify::reconcile_box_mir_drop_policies(&drops, &e1_box_drop_policies)
+                        {
+                            Ok(tsv) => {
+                                format!("status=ok\ndata=provisional\nrows={}\n{tsv}", drops.len())
+                            }
+                            Err(error) => format!(
+                                "status=error\ndata=false\ndetail={}\n",
+                                error.replace(['\t', '\r', '\n'], " ")
+                            ),
                         }
-                        Err(error) => format!(
-                            "status=error\ndata=false\ndetail={}\n",
-                            error.replace(['\t', '\r', '\n'], " ")
-                        ),
                     }
-                }
-                Err(error) => format!(
-                    "status=error\ndata=false\ndetail={}\n",
-                    error.replace(['\t', '\r', '\n'], " ")
-                ),
-            };
+                    Err(error) => format!(
+                        "status=error\ndata=false\ndetail={}\n",
+                        error.replace(['\t', '\r', '\n'], " ")
+                    ),
+                };
             for diagnostic in &novel {
                 let mut owners = attribute(
                     std::slice::from_ref(diagnostic),

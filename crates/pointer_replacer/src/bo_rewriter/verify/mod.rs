@@ -77,7 +77,10 @@ fn box_container_kind(
     args.types().any(|inner| inner.is_box()).then_some(true)
 }
 
-fn collect_box_mir_drops(tcx: rustc_middle::ty::TyCtxt<'_>) -> Vec<BoxMirDrop> {
+fn collect_box_mir_drops(
+    tcx: rustc_middle::ty::TyCtxt<'_>,
+    functions: Option<&std::collections::BTreeSet<String>>,
+) -> Vec<BoxMirDrop> {
     use rustc_middle::mir::{TerminatorKind, VarDebugInfoContents};
 
     let mut rows = Vec::new();
@@ -92,8 +95,11 @@ fn collect_box_mir_drops(tcx: rustc_middle::ty::TyCtxt<'_>) -> Vec<BoxMirDrop> {
             continue;
         }
         let did = item.owner_id.def_id;
-        let body = tcx.mir_drops_elaborated_and_const_checked(did).borrow();
         let function = tcx.def_path_str(did.to_def_id());
+        if functions.is_some_and(|functions| !functions.contains(&function)) {
+            continue;
+        }
+        let body = tcx.mir_drops_elaborated_and_const_checked(did).borrow();
         for (block, data) in body.basic_blocks.iter_enumerated() {
             let TerminatorKind::Drop { place, .. } = &data.terminator().kind else {
                 continue;
@@ -293,21 +299,27 @@ pub(crate) fn reconcile_box_mir_drop_policies(
 
 #[cfg(test)]
 pub(crate) fn box_mir_drops_str(source: &str) -> Result<Vec<BoxMirDrop>, String> {
-    ::utils::compilation::run_compiler_on_str(source, |tcx| {
-        ::utils::type_check(tcx);
-        collect_box_mir_drops(tcx)
-    })
-    .map_err(|_| "emitted source failed before the Box MIR drop observer".to_owned())
+    ::utils::compilation::run_compiler_on_str(source, |tcx| collect_box_mir_drops(tcx, None))
+        .map_err(|_| "emitted source failed before the Box MIR drop observer".to_owned())
 }
 
 #[allow(
     dead_code,
     reason = "Box wave-1's cfg(test) corpus worker is the first path consumer"
 )]
-pub(crate) fn box_mir_drops_path(root: &Path) -> Result<Vec<BoxMirDrop>, String> {
+pub(crate) fn box_mir_drops_path(
+    root: &Path,
+    policies: &[BoxMirDropPolicy],
+) -> Result<Vec<BoxMirDrop>, String> {
+    let functions = policies
+        .iter()
+        .map(|policy| policy.function.clone())
+        .collect::<std::collections::BTreeSet<_>>();
+    if functions.is_empty() {
+        return Ok(Vec::new());
+    }
     ::utils::compilation::run_compiler_on_path(root, |tcx| {
-        ::utils::type_check(tcx);
-        collect_box_mir_drops(tcx)
+        collect_box_mir_drops(tcx, Some(&functions))
     })
     .map_err(|_| "emitted crate failed before the Box MIR drop observer".to_owned())
 }
