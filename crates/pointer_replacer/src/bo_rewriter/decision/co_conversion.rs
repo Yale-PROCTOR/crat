@@ -47,6 +47,7 @@ use rustc_span::Span;
 use super::{
     Decision, DecisionTable, Subject, SubjectKind,
     emitability::{ArgShape, EmitabilityFacts, RefKind},
+    lifetime::LifetimeEligibility,
 };
 use crate::analyses::borrow_ownership::{a5_overlap::PairSide, a5_producer::PlannedC9Mark};
 
@@ -327,6 +328,26 @@ pub(crate) fn build_with_c9_marks(
     overlap: OverlapRule,
     c9_marks: &[PlannedC9Mark],
 ) -> CoConv {
+    build_with_c9_marks_and_lifetimes(
+        facts,
+        subjects,
+        hypothetical,
+        escapes,
+        overlap,
+        c9_marks,
+        &LifetimeEligibility::default(),
+    )
+}
+
+pub(crate) fn build_with_c9_marks_and_lifetimes(
+    facts: &EmitabilityFacts,
+    subjects: &[Subject],
+    hypothetical: &DecisionTable,
+    escapes: &[Escape],
+    overlap: OverlapRule,
+    c9_marks: &[PlannedC9Mark],
+    lifetime_eligibility: &LifetimeEligibility,
+) -> CoConv {
     // ---- 1. the node set: subjects that would emit a PLAIN reference ----
     //
     // Slice and optional forms are deliberately excluded. `&mut [T]` and
@@ -404,11 +425,9 @@ pub(crate) fn build_with_c9_marks(
         if !converts.contains(&escape.subject) {
             continue;
         }
-        let reason = match escape.kind {
-            EscapeKind::Return => BlockReason::EscapesViaReturn,
-            EscapeKind::ForeignArg => BlockReason::EscapesViaForeignArg,
-            EscapeKind::FieldStore => BlockReason::EscapesViaFieldStore,
-            EscapeKind::StaticStore => BlockReason::EscapesViaStaticStore,
+        let Some(reason) = escape_block_reason(escape.kind, escape.subject, lifetime_eligibility)
+        else {
+            continue;
         };
         block(&mut node_block, escape.subject, reason);
     }
@@ -631,6 +650,29 @@ pub(crate) fn build_with_c9_marks(
         classes,
         node_block,
     }
+}
+
+fn escape_block_reason(
+    kind: EscapeKind,
+    subject: NodeKey,
+    lifetime_eligibility: &LifetimeEligibility,
+) -> Option<BlockReason> {
+    match kind {
+        EscapeKind::Return if lifetime_eligibility.return_permit(subject).is_some() => None,
+        EscapeKind::Return => Some(BlockReason::EscapesViaReturn),
+        EscapeKind::ForeignArg => Some(BlockReason::EscapesViaForeignArg),
+        EscapeKind::FieldStore => Some(BlockReason::EscapesViaFieldStore),
+        EscapeKind::StaticStore => Some(BlockReason::EscapesViaStaticStore),
+    }
+}
+
+#[cfg(test)]
+fn escape_block_reason_for_test(
+    kind: EscapeKind,
+    subject: NodeKey,
+    lifetime_eligibility: &LifetimeEligibility,
+) -> Option<BlockReason> {
+    escape_block_reason(kind, subject, lifetime_eligibility)
 }
 
 // ---------------------------------------------------------------------------
