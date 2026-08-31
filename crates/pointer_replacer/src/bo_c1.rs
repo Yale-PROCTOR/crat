@@ -7648,6 +7648,7 @@ mod run {
                     rewritten: _,
                     slice_rewritten: _,
                     opt_rewritten: _,
+                    box_rewritten: _,
                     not_a_pointer_decl: _,
                     refused: _,
                     orphan_subject: _,
@@ -7669,6 +7670,9 @@ mod run {
                     refused: _,
                     multi_matched: _,
                     rendered: _,
+                    statements_deleted: _,
+                    statement_unmatched: _,
+                    statement_refused: _,
                 } = &gr;
                 row.set("arm1_rewritten", st.rewritten.to_string());
                 row.set("arm1_not_ptr_decl", st.not_a_pointer_decl.to_string());
@@ -11615,6 +11619,10 @@ struct OutcomeCounts {
     opt_ref_shared: usize,
     opt_slice_mut: usize,
     opt_slice_shared: usize,
+    box_sized: usize,
+    box_slice: usize,
+    opt_box_sized: usize,
+    opt_box_slice: usize,
     degraded: usize,
     /// Rows carrying **no** outcome. Producer A sets one on every row it emits,
     /// so this is a schema violation rather than a category — recorded, never
@@ -11645,6 +11653,10 @@ impl OutcomeCounts {
         self.opt_ref_shared += other.opt_ref_shared;
         self.opt_slice_mut += other.opt_slice_mut;
         self.opt_slice_shared += other.opt_slice_shared;
+        self.box_sized += other.box_sized;
+        self.box_slice += other.box_slice;
+        self.opt_box_sized += other.opt_box_sized;
+        self.opt_box_slice += other.opt_box_slice;
         self.degraded += other.degraded;
         self.unclassified += other.unclassified;
         for (reason, n) in &other.by_reason {
@@ -11720,6 +11732,10 @@ fn count_outcomes(rows: &[crate::coverage_recon::schema::Row]) -> OutcomeCounts 
             Some(Outcome::OptRefShared) => c.opt_ref_shared += 1,
             Some(Outcome::OptSliceMut) => c.opt_slice_mut += 1,
             Some(Outcome::OptSliceShared) => c.opt_slice_shared += 1,
+            Some(Outcome::Box) => c.box_sized += 1,
+            Some(Outcome::BoxSlice) => c.box_slice += 1,
+            Some(Outcome::OptBox) => c.opt_box_sized += 1,
+            Some(Outcome::OptBoxSlice) => c.opt_box_slice += 1,
             Some(Outcome::Degraded) => {
                 c.degraded += 1;
                 // A degraded row with no reason is counted under an explicit
@@ -11748,6 +11764,7 @@ fn count_line(scope: &str, c: &OutcomeCounts) -> String {
          decided_slice={} slice_mut={} slice_shared={} \
          decided_opt={} opt_ref_mut={} opt_ref_shared={} opt_slice_mut={} \
          opt_slice_shared={} \
+         box_sized={} box_slice={} opt_box_sized={} opt_box_slice={} \
          degraded={} unclassified={} label={PRE_S3_LABEL:?}",
         c.rows,
         c.decided_ref(),
@@ -11761,6 +11778,10 @@ fn count_line(scope: &str, c: &OutcomeCounts) -> String {
         c.opt_ref_shared,
         c.opt_slice_mut,
         c.opt_slice_shared,
+        c.box_sized,
+        c.box_slice,
+        c.opt_box_sized,
+        c.opt_box_slice,
         c.degraded,
         c.unclassified,
     )
@@ -11799,9 +11820,13 @@ fn every_bucket_is_merged_and_reported() {
         opt_ref_shared: 17,
         opt_slice_mut: 19,
         opt_slice_shared: 23,
-        degraded: 29,
-        unclassified: 31,
-        by_reason: [("a-reason".to_owned(), 37usize)].into_iter().collect(),
+        box_sized: 29,
+        box_slice: 31,
+        opt_box_sized: 37,
+        opt_box_slice: 41,
+        degraded: 43,
+        unclassified: 47,
+        by_reason: [("a-reason".to_owned(), 53usize)].into_iter().collect(),
     };
 
     let mut got = OutcomeCounts::default();
@@ -11819,9 +11844,13 @@ fn every_bucket_is_merged_and_reported() {
         opt_ref_shared: 34,
         opt_slice_mut: 38,
         opt_slice_shared: 46,
-        degraded: 58,
-        unclassified: 62,
-        by_reason: [("a-reason".to_owned(), 74usize)].into_iter().collect(),
+        box_sized: 58,
+        box_slice: 62,
+        opt_box_sized: 74,
+        opt_box_slice: 82,
+        degraded: 86,
+        unclassified: 94,
+        by_reason: [("a-reason".to_owned(), 106usize)].into_iter().collect(),
     };
     assert_eq!(
         got, want,
@@ -11848,8 +11877,12 @@ fn every_bucket_is_merged_and_reported() {
         ("opt_ref_shared", 17),
         ("opt_slice_mut", 19),
         ("opt_slice_shared", 23),
-        ("degraded", 29),
-        ("unclassified", 31),
+        ("box_sized", 29),
+        ("box_slice", 31),
+        ("opt_box_sized", 37),
+        ("opt_box_slice", 41),
+        ("degraded", 43),
+        ("unclassified", 47),
     ] {
         assert!(
             line.contains(&format!("{key}={value}")),
