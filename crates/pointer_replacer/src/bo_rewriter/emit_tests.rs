@@ -130,6 +130,7 @@ fn text_for<'a>(emission: &'a Emission, name: &str) -> Option<&'a String> {
 const BOX_W1_PREAMBLE: &str = "#![allow(dead_code, unused_unsafe, unused_mut, unused_variables)]\n\
 extern \"C\" {\n\
     fn malloc(size: usize) -> *mut core::ffi::c_void;\n\
+    fn calloc(count: usize, size: usize) -> *mut core::ffi::c_void;\n\
     fn free(ptr: *mut core::ffi::c_void);\n\
 }\n";
 
@@ -191,6 +192,30 @@ fn box_n5_depth_two_local_stays_out_of_wave1() {
     assert!(
         !source.contains("Box<"),
         "depth-2 local entered Box wave: {source}"
+    );
+}
+
+#[test]
+fn box_w2_calloc_uses_licensed_slice_extent() {
+    let src = format!(
+        "{BOX_W1_PREAMBLE}\n\
+         pub unsafe fn f(n: usize) {{\n\
+             let p: *mut i32 = calloc(n, core::mem::size_of::<i32>()) as *mut i32;\n\
+             free(p as *mut core::ffi::c_void);\n\
+         }}\n"
+    );
+    let super::RewriteOutcome::Emitted { source, .. } = super::rewrite_m1(&src) else {
+        panic!("BOX-W2 fixture must emit");
+    };
+    assert!(source.contains("p: Box<[i32]>"), "{source}");
+    assert!(
+        source.contains("vec![0 as i32; n].into_boxed_slice()"),
+        "licensed count was not consumed: {source}"
+    );
+    assert!(source.contains("drop(p)"), "{source}");
+    assert!(
+        !source.contains("FALLBACK_SLICE_EXTENT"),
+        "licensed site fabricated: {source}"
     );
 }
 
