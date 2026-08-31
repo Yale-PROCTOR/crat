@@ -7,8 +7,24 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::analyses::borrow_ownership::origin_summary::{
-    OriginSlot, OriginSummaries, OriginSummary, SignatureRoot, SignatureSlot,
+use rustc_hash::{FxHashMap, FxHashSet};
+use rustc_hir::{
+    ExprKind, QPath,
+    def::{DefKind, Res},
+    def_id::LocalDefId,
+    intravisit::{Visitor, walk_expr},
+};
+use rustc_middle::{mir::TerminatorKind, ty::TyKind};
+
+use crate::{
+    analyses::borrow_ownership::{
+        a5_overlap::WholeProgramAttestation,
+        a5_producer::resolve_closed_world_call_world,
+        origin_summary::{
+            OriginSlot, OriginSummaries, OriginSummary, SignatureRoot, SignatureSlot,
+        },
+    },
+    utils::rustc::RustProgram,
 };
 
 /// The minimal E2-X1 observation used to prove that the carrier reaches this
@@ -252,6 +268,211 @@ pub(crate) fn plan_function(
     })
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum WebDerivation {
+    AdjustedFnPtr,
+    Direct { caller: LocalDefId, block: u32 },
+    Andersen { caller: LocalDefId, block: u32 },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct FnPtrWeb {
+    roots: FxHashSet<LocalDefId>,
+    members: FxHashSet<LocalDefId>,
+    reasons: FxHashMap<LocalDefId, WebDerivation>,
+}
+
+impl FnPtrWeb {
+    pub(crate) fn contains(&self, function: LocalDefId) -> bool {
+        self.members.contains(&function)
+    }
+
+    pub(crate) fn root_count(&self) -> usize {
+        self.roots.len()
+    }
+
+    pub(crate) fn member_count(&self) -> usize {
+        self.members.len()
+    }
+
+    #[cfg(test)]
+    fn root_paths(&self, tcx: rustc_middle::ty::TyCtxt<'_>) -> Vec<String> {
+        let mut paths = self
+            .roots
+            .iter()
+            .map(|did| tcx.item_name(did.to_def_id()).to_string())
+            .collect::<Vec<_>>();
+        paths.sort();
+        paths
+    }
+
+    #[cfg(test)]
+    fn member_paths(&self, tcx: rustc_middle::ty::TyCtxt<'_>) -> Vec<String> {
+        let mut paths = self
+            .members
+            .iter()
+            .map(|did| tcx.item_name(did.to_def_id()).to_string())
+            .collect::<Vec<_>>();
+        paths.sort();
+        paths
+    }
+
+    #[cfg(test)]
+    fn reason_rows(&self, tcx: rustc_middle::ty::TyCtxt<'_>) -> Vec<String> {
+        let mut rows = self
+            .reasons
+            .iter()
+            .map(|(did, reason)| {
+                let name = tcx.item_name(did.to_def_id());
+                match reason {
+                    WebDerivation::AdjustedFnPtr => format!("root\t{name}\tadjusted-fnptr"),
+                    WebDerivation::Direct { caller, block } => format!(
+                        "closure\t{name}\tdirect:{}:bb{block}",
+                        tcx.item_name(caller.to_def_id())
+                    ),
+                    WebDerivation::Andersen { caller, block } => format!(
+                        "closure\t{name}\tandersen:{}:bb{block}",
+                        tcx.item_name(caller.to_def_id())
+                    ),
+                }
+            })
+            .collect::<Vec<_>>();
+        rows.sort();
+        rows
+    }
+}
+
+fn collect_fn_ptr_roots(program: &RustProgram<'_>) -> FxHashSet<LocalDefId> {
+    struct RootCollector<'tcx> {
+        tcx: rustc_middle::ty::TyCtxt<'tcx>,
+        roots: FxHashSet<LocalDefId>,
+    }
+
+    impl<'tcx> Visitor<'tcx> for RootCollector<'tcx> {
+        fn visit_expr(&mut self, expression: &'tcx rustc_hir::Expr<'tcx>) {
+            let mut function = None;
+            if let ExprKind::Path(QPath::Resolved(_, path)) = &expression.kind
+                && let Res::Def(DefKind::Fn | DefKind::AssocFn, did) = path.res
+            {
+                function = did.as_local();
+            } else if let ExprKind::Cast(inner, ty) = &expression.kind
+                && matches!(ty.kind, rustc_hir::TyKind::BareFn(_))
+                && let ExprKind::Path(QPath::Resolved(_, path)) = &inner.kind
+                && let Res::Def(DefKind::Fn | DefKind::AssocFn, did) = path.res
+            {
+                function = did.as_local();
+            }
+
+            if let Some(function) = function
+                && matches!(
+                    self.tcx
+                        .typeck(expression.hir_id.owner)
+                        .expr_ty_adjusted(expression)
+                        .kind(),
+                    TyKind::FnPtr(..)
+                )
+            {
+                self.roots.insert(function);
+            }
+            walk_expr(self, expression);
+        }
+    }
+
+    let local_functions = program.functions.iter().copied().collect::<FxHashSet<_>>();
+    let mut collector = RootCollector {
+        tcx: program.tcx,
+        roots: FxHashSet::default(),
+    };
+    for &function in &program.functions {
+        collector.visit_body(program.tcx.hir_body_owned_by(function));
+    }
+    collector
+        .roots
+        .retain(|function| local_functions.contains(function));
+    collector.roots
+}
+
+fn web_reason_order(reason: &WebDerivation) -> (u8, u32, u32) {
+    match *reason {
+        WebDerivation::AdjustedFnPtr => (0, 0, 0),
+        WebDerivation::Direct { caller, block } => (1, caller.local_def_index.as_u32(), block),
+        WebDerivation::Andersen { caller, block } => (2, caller.local_def_index.as_u32(), block),
+    }
+}
+
+pub(crate) fn derive_fn_ptr_web(
+    program: &RustProgram<'_>,
+    attestation: Option<WholeProgramAttestation>,
+) -> Result<FnPtrWeb, LifetimeFailure> {
+    if attestation != Some(WholeProgramAttestation::FrozenBenchmarkGraph) {
+        return Err(LifetimeFailure::FnPtrWebHeld);
+    }
+
+    let roots = collect_fn_ptr_roots(program);
+    let call_world = resolve_closed_world_call_world(program, attestation);
+    let mut members = FxHashSet::default();
+    let mut reasons = roots
+        .iter()
+        .copied()
+        .map(|root| (root, WebDerivation::AdjustedFnPtr))
+        .collect::<FxHashMap<_, _>>();
+    let mut pending = roots.iter().copied().collect::<Vec<_>>();
+    pending.sort_unstable_by_key(|did| std::cmp::Reverse(did.local_def_index.as_u32()));
+
+    while let Some(function) = pending.pop() {
+        if !members.insert(function) {
+            continue;
+        }
+
+        let mut edges = Vec::new();
+        for (&(caller, block), targets) in &call_world.resolved {
+            if caller != function {
+                continue;
+            }
+            let body_ref = program
+                .tcx
+                .mir_drops_elaborated_and_const_checked(function)
+                .borrow();
+            let body = &*body_ref;
+            let call = match &body.basic_blocks[block].terminator().kind {
+                TerminatorKind::Call { func, .. } | TerminatorKind::TailCall { func, .. } => func,
+                _ => unreachable!("closed call-world key must name a call"),
+            };
+            let direct = matches!(call.ty(body, program.tcx).kind(), TyKind::FnDef(..));
+            for &target in targets {
+                let reason = if direct {
+                    WebDerivation::Direct {
+                        caller: function,
+                        block: block.as_u32(),
+                    }
+                } else {
+                    WebDerivation::Andersen {
+                        caller: function,
+                        block: block.as_u32(),
+                    }
+                };
+                edges.push((target, reason));
+            }
+        }
+        edges.sort_by_key(|(target, reason)| {
+            (target.local_def_index.as_u32(), web_reason_order(reason))
+        });
+        edges.dedup_by_key(|(target, _)| *target);
+        for (target, reason) in edges.into_iter().rev() {
+            if !members.contains(&target) {
+                reasons.entry(target).or_insert(reason);
+                pending.push(target);
+            }
+        }
+    }
+
+    Ok(FnPtrWeb {
+        roots,
+        members,
+        reasons,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
@@ -263,9 +484,8 @@ mod tests {
     use rustc_middle::mir::Local;
 
     use super::*;
-    use crate::analyses::borrow_ownership::{
-        a5_overlap::WholeProgramAttestation,
-        origin_summary::{OriginSlot, OriginSummary, SignaturePlace, SignatureRoot, SignatureSlot},
+    use crate::analyses::borrow_ownership::origin_summary::{
+        OriginSlot, OriginSummary, SignaturePlace, SignatureRoot, SignatureSlot,
     };
 
     fn arg(index: usize) -> SignatureSlot {
