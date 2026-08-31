@@ -344,7 +344,10 @@ pub(crate) fn build_with_c9_marks(
         // A `match` makes the next disposition a compile error here.
         let mutable = match decision {
             Decision::Ref { mutable } => *mutable,
-            Decision::Slice { .. } | Decision::Opt { .. } | Decision::Degraded(_) => continue,
+            Decision::Slice { .. }
+            | Decision::Opt { .. }
+            | Decision::Box(_)
+            | Decision::Degraded(_) => continue,
         };
         let key = (subject.fn_did, subject.hir_id);
         order.push(key);
@@ -358,7 +361,7 @@ pub(crate) fn build_with_c9_marks(
         .iter()
         .filter_map(|(subject, decision)| match decision {
             Decision::Slice { .. } | Decision::Opt { .. } => Some((subject.fn_did, subject.hir_id)),
-            Decision::Ref { .. } | Decision::Degraded(_) => None,
+            Decision::Ref { .. } | Decision::Box(_) | Decision::Degraded(_) => None,
         })
         .collect();
     let index: FxHashMap<NodeKey, usize> = order.iter().enumerate().map(|(i, k)| (*k, i)).collect();

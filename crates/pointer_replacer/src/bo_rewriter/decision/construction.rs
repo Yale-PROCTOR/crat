@@ -115,6 +115,17 @@ impl Construction {
 #[derive(Default)]
 pub(crate) struct ConstructionFacts {
     pub by_binding: FxHashMap<(LocalDefId, HirId), Construction>,
+    pub init_spans: FxHashMap<(LocalDefId, HirId), rustc_span::Span>,
+    pub statement_spans: FxHashMap<(LocalDefId, HirId), rustc_span::Span>,
+    pub first_stores: FxHashMap<(LocalDefId, HirId), Vec<FirstStore>>,
+    pub deallocator_calls: FxHashMap<(LocalDefId, HirId), Vec<rustc_span::Span>>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct FirstStore {
+    pub statement_span: rustc_span::Span,
+    pub value_span: rustc_span::Span,
+    pub value: String,
 }
 
 const ALLOCATORS: &[&str] = &[
@@ -253,7 +264,58 @@ impl<'tcx> Visitor<'tcx> for Collector<'_, 'tcx> {
             self.facts
                 .by_binding
                 .insert((self.fn_did, local.pat.hir_id), c);
+            self.facts
+                .init_spans
+                .insert((self.fn_did, local.pat.hir_id), init.span);
+            self.facts
+                .statement_spans
+                .insert((self.fn_did, local.pat.hir_id), stmt.span);
+        }
+        let expression = match stmt.kind {
+            rustc_hir::StmtKind::Semi(expression) | rustc_hir::StmtKind::Expr(expression) => {
+                Some(expression)
+            }
+            _ => None,
+        };
+        if let Some(expression) = expression
+            && let rustc_hir::ExprKind::Assign(lhs, rhs, _) = expression.kind
+            && let rustc_hir::ExprKind::Unary(rustc_hir::UnOp::Deref, base) = lhs.kind
+            && let rustc_hir::ExprKind::Path(rustc_hir::QPath::Resolved(_, path)) = base.kind
+            && let rustc_hir::def::Res::Local(binding) = path.res
+            && matches!(Self::peel(rhs).kind, rustc_hir::ExprKind::Lit(_))
+        {
+            let value = self.snippet(rhs.span);
+            self.facts
+                .first_stores
+                .entry((self.fn_did, binding))
+                .or_default()
+                .push(FirstStore {
+                    statement_span: stmt.span,
+                    value_span: rhs.span,
+                    value,
+                });
         }
         intravisit::walk_stmt(self, stmt);
+    }
+
+    fn visit_expr(&mut self, expression: &'tcx rustc_hir::Expr<'tcx>) {
+        if let rustc_hir::ExprKind::Call(callee, args) = expression.kind
+            && let rustc_hir::ExprKind::Path(rustc_hir::QPath::Resolved(_, path)) = callee.kind
+            && path
+                .segments
+                .last()
+                .is_some_and(|segment| matches!(segment.ident.name.as_str(), "free" | "realloc"))
+            && let Some(argument) = args.first()
+            && let rustc_hir::ExprKind::Path(rustc_hir::QPath::Resolved(_, argument_path)) =
+                Self::peel(argument).kind
+            && let rustc_hir::def::Res::Local(binding) = argument_path.res
+        {
+            self.facts
+                .deallocator_calls
+                .entry((self.fn_did, binding))
+                .or_default()
+                .push(expression.span);
+        }
+        intravisit::walk_expr(self, expression);
     }
 }

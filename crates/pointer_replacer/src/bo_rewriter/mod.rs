@@ -646,7 +646,8 @@ fn rewrite_core_injected(
             match decision {
                 decision::Decision::Ref { .. }
                 | decision::Decision::Slice { .. }
-                | decision::Decision::Opt { .. } => {}
+                | decision::Decision::Opt { .. }
+                | decision::Decision::Box(_) => {}
                 decision::Decision::Degraded(_) => continue,
             }
             let owner = tcx.def_path_str(subject.fn_did.to_def_id());
@@ -3316,6 +3317,8 @@ fn finish_decide<'tcx>(
         sign: &sign,
         slice_uses: &slice_uses,
         opt_uses: &opt_uses,
+        box_facts: &box_facts,
+        constructions: &ctors,
         gate,
         coconv,
     };
@@ -3393,6 +3396,7 @@ fn finish_decide<'tcx>(
                     decision::Decision::Ref { .. } => true,
                     decision::Decision::Slice { .. }
                     | decision::Decision::Opt { .. }
+                    | decision::Decision::Box(_)
                     | decision::Decision::Degraded(_) => false,
                 };
                 subject.fn_did == mark.owner_did && subject.local == local && is_ref
@@ -3566,10 +3570,12 @@ fn e1_subject_family(
                 decision::Decision::Ref { .. } => Some("ref"),
                 decision::Decision::Slice { .. } => Some("slice"),
                 decision::Decision::Opt { .. } => Some("optional"),
+                decision::Decision::Box(_) => Some("box"),
                 decision::Decision::Degraded(_) => match hypothetical {
                     Some(decision::Decision::Ref { .. }) => Some("ref"),
                     Some(decision::Decision::Slice { .. }) => Some("slice"),
                     Some(decision::Decision::Opt { .. }) => Some("optional"),
+                    Some(decision::Decision::Box(_)) => Some("box"),
                     Some(decision::Decision::Degraded(_)) | None => None,
                 },
             };
@@ -3586,7 +3592,8 @@ fn e1_subject_family(
                 },
                 decision::Decision::Ref { .. }
                 | decision::Decision::Slice { .. }
-                | decision::Decision::Opt { .. } => unreachable!("emitting form mapped above"),
+                | decision::Decision::Opt { .. }
+                | decision::Decision::Box(_) => unreachable!("emitting form mapped above"),
             })
         }
     }
@@ -3654,6 +3661,12 @@ fn e1_subject_seed_tsv(
                 "-".to_owned(),
                 decision::emitability::EmitabilityFacts::site(tcx, subject.attribution_span()),
             ),
+            decision::Decision::Box(_) => (
+                "box",
+                "-",
+                "-".to_owned(),
+                decision::emitability::EmitabilityFacts::site(tcx, subject.attribution_span()),
+            ),
             decision::Decision::Degraded(record) => (
                 "degraded",
                 record.reason.key(),
@@ -3671,7 +3684,8 @@ fn e1_subject_seed_tsv(
         let emits = match decision {
             decision::Decision::Ref { .. }
             | decision::Decision::Slice { .. }
-            | decision::Decision::Opt { .. } => true,
+            | decision::Decision::Opt { .. }
+            | decision::Decision::Box(_) => true,
             decision::Decision::Degraded(_) => false,
         };
         let placed = emits && unplaced_reason.is_none();
@@ -4357,6 +4371,7 @@ fn freed_slots_tsv_from(
                             "emitted-opt-ref".to_owned()
                         }
                     }
+                    decision::Decision::Box(_) => "emitted-box".to_owned(),
                     decision::Decision::Degraded(r) => r.reason.key().to_owned(),
                 },
             )

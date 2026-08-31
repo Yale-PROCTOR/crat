@@ -92,6 +92,11 @@ pub(crate) enum Outcome {
     OptRefMut,
     OptSliceShared,
     OptSliceMut,
+    /// Box wave-1 owning forms.
+    Box,
+    BoxSlice,
+    OptBox,
+    OptBoxSlice,
 }
 
 /// Whether the pairing for this row can be trusted.

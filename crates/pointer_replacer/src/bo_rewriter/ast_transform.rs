@@ -48,6 +48,8 @@ pub(crate) enum DeclForm {
     Slice,
     /// `Option<&T>` and its three twins; `slice` selects the fat one.
     Opt { slice: bool },
+    /// `Box<T>` / `Box<[T]>`, optionally wrapped for nullable ownership.
+    Box { slice: bool, optional: bool },
 }
 
 /// Wrap `inner` in `Option<…>`, **structurally**.
@@ -61,13 +63,13 @@ pub(crate) enum DeclForm {
 /// synthetic-span invariant. Nothing keys on a constructed node's span; the
 /// differential keys on the *declaration's* span, which is the original's and
 /// is not replaced.
-fn option_of(inner: P<Ty>) -> TyKind {
+fn wrapper_of(name: &str, inner: P<Ty>) -> TyKind {
     let args = AngleBracketedArgs {
         span: DUMMY_SP,
         args: ThinVec::from_iter([AngleBracketedArg::Arg(GenericArg::Type(inner))]),
     };
     let segment = PathSegment {
-        ident: Ident::new(Symbol::intern("Option"), DUMMY_SP),
+        ident: Ident::new(Symbol::intern(name), DUMMY_SP),
         id: DUMMY_NODE_ID,
         args: Some(P(GenericArgs::AngleBracketed(args))),
     };
@@ -79,6 +81,10 @@ fn option_of(inner: P<Ty>) -> TyKind {
             tokens: None,
         },
     )
+}
+
+fn option_of(inner: P<Ty>) -> TyKind {
+    wrapper_of("Option", inner)
 }
 
 /// Build the declared type for `form`, **keeping `pointee` as a subtree**.
@@ -95,29 +101,51 @@ pub(crate) fn decl_ty_kind(form: DeclForm, mutable: bool, pointee: P<Ty>) -> TyK
         Mutability::Not
     };
     let referent = match form {
-        DeclForm::Ref | DeclForm::Opt { slice: false } => pointee,
-        DeclForm::Slice | DeclForm::Opt { slice: true } => P(Ty {
-            id: DUMMY_NODE_ID,
-            kind: TyKind::Slice(pointee),
-            span: DUMMY_SP,
-            tokens: None,
-        }),
+        DeclForm::Ref | DeclForm::Opt { slice: false } | DeclForm::Box { slice: false, .. } => {
+            pointee
+        }
+        DeclForm::Slice | DeclForm::Opt { slice: true } | DeclForm::Box { slice: true, .. } => {
+            P(Ty {
+                id: DUMMY_NODE_ID,
+                kind: TyKind::Slice(pointee),
+                span: DUMMY_SP,
+                tokens: None,
+            })
+        }
     };
-    let reference = TyKind::Ref(
-        None,
-        MutTy {
-            ty: referent,
-            mutbl,
-        },
-    );
     match form {
-        DeclForm::Ref | DeclForm::Slice => reference,
-        DeclForm::Opt { .. } => option_of(P(Ty {
-            id: DUMMY_NODE_ID,
-            kind: reference,
-            span: DUMMY_SP,
-            tokens: None,
-        })),
+        DeclForm::Ref | DeclForm::Slice | DeclForm::Opt { .. } => {
+            let reference = TyKind::Ref(
+                None,
+                MutTy {
+                    ty: referent,
+                    mutbl,
+                },
+            );
+            match form {
+                DeclForm::Ref | DeclForm::Slice => reference,
+                DeclForm::Opt { .. } => option_of(P(Ty {
+                    id: DUMMY_NODE_ID,
+                    kind: reference,
+                    span: DUMMY_SP,
+                    tokens: None,
+                })),
+                DeclForm::Box { .. } => unreachable!(),
+            }
+        }
+        DeclForm::Box { optional, .. } => {
+            let boxed = wrapper_of("Box", referent);
+            if optional {
+                option_of(P(Ty {
+                    id: DUMMY_NODE_ID,
+                    kind: boxed,
+                    span: DUMMY_SP,
+                    tokens: None,
+                }))
+            } else {
+                boxed
+            }
+        }
     }
 }
 
@@ -500,6 +528,8 @@ pub(crate) struct RefDeclStats {
     pub slice_rewritten: usize,
     /// **Arm 2** — declarations rewritten to an `Option<…>` form.
     pub opt_rewritten: usize,
+    /// Box wave-1 declarations rewritten to `Box<T>` / `Box<[T]>`.
+    pub box_rewritten: usize,
     /// Subjects the table settled `Ref` whose declaration was NOT a syntactic
     /// pointer in the AST. Counted, never silently skipped: a decided subject
     /// the transform cannot reach is a ledger movement.
@@ -670,6 +700,7 @@ impl RefDeclVisitor<'_> {
             DeclForm::Ref => "decl:ref",
             DeclForm::Slice => "decl:slice",
             DeclForm::Opt { .. } => "decl:opt",
+            DeclForm::Box { .. } => "decl:box",
         };
         if !self.guard.claim(ty.id, ty.span, claimant) {
             self.stats.refused += 1;
@@ -700,6 +731,10 @@ impl RefDeclVisitor<'_> {
             }
             DeclForm::Opt { .. } => {
                 self.stats.opt_rewritten += 1;
+                self.stats.rendered_arm2.push(render);
+            }
+            DeclForm::Box { .. } => {
+                self.stats.box_rewritten += 1;
                 self.stats.rendered_arm2.push(render);
             }
         }
@@ -773,6 +808,9 @@ pub(crate) struct UseGraftStats {
     /// `(offset, rendered text)` per graft — the text differential's left-hand
     /// side, keyed exactly as the declaration renders are.
     pub rendered: Vec<(u32, String)>,
+    pub statements_deleted: usize,
+    pub statement_unmatched: usize,
+    pub statement_refused: usize,
 }
 
 /// Grafts each use rewrite onto the node whose span the decision layer named.
@@ -865,6 +903,61 @@ impl MutVisitor for UseGraftVisitor<'_> {
             }
         }
         rustc_ast::mut_visit::walk_expr(self, e);
+    }
+}
+
+#[derive(Default)]
+struct StatementDeleteStats {
+    deleted: usize,
+    unmatched: usize,
+    refused: usize,
+}
+
+struct StatementDeleteVisitor<'a> {
+    targets: &'a FxHashSet<(u32, u32)>,
+    consumed: FxHashSet<(u32, u32)>,
+    guard: &'a mut Composition,
+    stats: StatementDeleteStats,
+}
+
+impl<'a> StatementDeleteVisitor<'a> {
+    fn new(targets: &'a FxHashSet<(u32, u32)>, guard: &'a mut Composition) -> Self {
+        Self {
+            targets,
+            consumed: FxHashSet::default(),
+            guard,
+            stats: StatementDeleteStats::default(),
+        }
+    }
+
+    fn finish(mut self) -> StatementDeleteStats {
+        self.stats.unmatched = self
+            .targets
+            .iter()
+            .filter(|target| !self.consumed.contains(target))
+            .count();
+        self.stats
+    }
+}
+
+impl MutVisitor for StatementDeleteVisitor<'_> {
+    fn flat_map_stmt(
+        &mut self,
+        statement: rustc_ast::Stmt,
+    ) -> smallvec::SmallVec<[rustc_ast::Stmt; 1]> {
+        let key = (statement.span.lo().0, statement.span.hi().0);
+        if self.targets.contains(&key) {
+            self.consumed.insert(key);
+            if self
+                .guard
+                .claim(statement.id, statement.span, "box-statement-delete")
+            {
+                self.stats.deleted += 1;
+                return smallvec::SmallVec::new();
+            }
+            self.stats.refused += 1;
+        }
+        rustc_ast::mut_visit::walk_flat_map_stmt(self, statement)
     }
 }
 
@@ -1678,6 +1771,14 @@ fn transform_with(
                 slice,
                 uses,
             } => (DeclForm::Opt { slice: *slice }, *mutable, Some(uses)),
+            super::decision::Decision::Box(plan) => (
+                DeclForm::Box {
+                    slice: matches!(plan.shape, super::decision::box_facts::BoxShape::Slice),
+                    optional: plan.optional,
+                },
+                false,
+                None,
+            ),
             super::decision::Decision::Degraded(_) => continue,
         };
         // **ITEM 7 — the registered finding, repaired.** This join fed
@@ -1734,10 +1835,17 @@ fn transform_with(
     // built — and production builds them in exactly ONE place.
     let filtered = filtered_inputs(&table, reverts);
     let uses = filtered.uses;
+    let statement_deletes = filtered.statement_deletes;
     let use_key_collisions = use_key_collisions + filtered.use_key_collisions;
     let mut g = UseGraftVisitor::new(&uses, &mut guard);
     g.visit_crate(&mut krate);
-    let grafts = g.finish();
+    let mut grafts = g.finish();
+    let mut deletes = StatementDeleteVisitor::new(&statement_deletes, &mut guard);
+    deletes.visit_crate(&mut krate);
+    let delete_stats = deletes.finish();
+    grafts.statements_deleted = delete_stats.deleted;
+    grafts.statement_unmatched = delete_stats.unmatched;
+    grafts.statement_refused = delete_stats.refused;
 
     // **ARM 3 — the seam pass, and it runs THIRD by requirement, not by
     // convenience.** A seam's argument may contain a use rewrite, so the use
@@ -2470,6 +2578,7 @@ pub(crate) struct FilteredInputs {
     /// counter agrees with itself while being short.
     pub use_key_collisions: usize,
     pub seam_key_collisions: usize,
+    pub statement_deletes: FxHashSet<(u32, u32)>,
 }
 
 /// Build both filtered maps from one decision table and one revert set.
@@ -2486,18 +2595,35 @@ pub(crate) fn filtered_inputs(
         seams: FxHashMap::default(),
         use_key_collisions: 0,
         seam_key_collisions: 0,
+        statement_deletes: FxHashSet::default(),
     };
     for (subject, decision) in &table.entries {
         let use_edits = match decision {
             super::decision::Decision::Ref { .. } => None,
             super::decision::Decision::Slice { uses, .. } => Some(uses),
             super::decision::Decision::Opt { uses, .. } => Some(uses),
+            super::decision::Decision::Box(_) => None,
             super::decision::Decision::Degraded(_) => continue,
         };
         // ARM 2's filter: no site check downstream, so a reverted subject's
         // uses must never enter the map.
         if !reverts.keeps_subject(subject.fn_did) {
             continue;
+        }
+        if let super::decision::Decision::Box(plan) = decision {
+            for edit in &plan.expr_edits {
+                insert_counting(
+                    &mut out.uses,
+                    (edit.span.lo().0, edit.span.hi().0),
+                    edit.replacement.clone(),
+                    &mut out.use_key_collisions,
+                );
+            }
+            out.statement_deletes.extend(
+                plan.delete_statements
+                    .iter()
+                    .map(|span| (span.lo().0, span.hi().0)),
+            );
         }
         for u in use_edits.into_iter().flatten() {
             insert_counting(
@@ -4571,6 +4697,13 @@ mod arm2_witnesses {
                 (DeclForm::Ref, true),
                 (DeclForm::Slice, false),
                 (DeclForm::Opt { slice: true }, true),
+                (
+                    DeclForm::Box {
+                        slice: false,
+                        optional: false,
+                    },
+                    false,
+                ),
             ] {
                 let mut ty = ::utils::ast::parse_ty("*mut libc::c_int".to_owned());
                 let TyKind::Ptr(mut_ty) = &ty.kind else { panic!("fixture is a raw pointer") };
@@ -4590,11 +4723,20 @@ mod arm2_witnesses {
                         stats.opt_rewritten += 1;
                         stats.rendered_arm2.push(render);
                     }
+                    DeclForm::Box { .. } => {
+                        stats.box_rewritten += 1;
+                        stats.rendered_arm2.push(render);
+                    }
                 }
             }
             assert_eq!(
-                (stats.rewritten, stats.slice_rewritten, stats.opt_rewritten),
-                (1, 1, 1)
+                (
+                    stats.rewritten,
+                    stats.slice_rewritten,
+                    stats.opt_rewritten,
+                    stats.box_rewritten,
+                ),
+                (1, 1, 1, 1)
             );
             assert_eq!(
                 stats.rendered.len(),
@@ -4602,10 +4744,11 @@ mod arm2_witnesses {
                 "arm 1's differential is computed over `rendered` ALONE, so an \
                  arm-2 render leaking into it moves the pinned 780"
             );
-            assert_eq!(stats.rendered_arm2.len(), 2);
+            assert_eq!(stats.rendered_arm2.len(), 3);
             assert_eq!(stats.rendered[0].1, "&mut libc::c_int");
             assert_eq!(stats.rendered_arm2[0].1, "&[libc::c_int]");
             assert_eq!(stats.rendered_arm2[1].1, "Option<&mut [libc::c_int]>");
+            assert_eq!(stats.rendered_arm2[2].1, "Box<libc::c_int>");
         });
     }
 

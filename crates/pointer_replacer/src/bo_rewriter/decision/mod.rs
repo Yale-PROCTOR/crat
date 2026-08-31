@@ -364,6 +364,8 @@ pub(crate) enum DegradeReason {
     KindRaw,
     /// BO decided owning; Box forms and the drop policy arrive in S3.
     KindOwning,
+    /// Box wave-1 filter failure, preserving the exact first-failure class.
+    BoxFailure { failure: box_facts::BoxPlanFailure },
     /// The parameter is used in an operation that exists only on raw pointers.
     RawPointerOperation { op: String },
     /// The function is referenced in-crate — called, address-taken, or cast to
@@ -599,6 +601,7 @@ impl DegradeReason {
             DegradeReason::RevertedAfterVerifyFailure => "reverted-after-verify-failure",
             DegradeReason::KindRaw => "kind-raw",
             DegradeReason::KindOwning => "kind-owning",
+            DegradeReason::BoxFailure { failure } => failure.key(),
             DegradeReason::RawPointerOperation { .. } => "raw-pointer-operation",
             DegradeReason::CallSiteNotAdapted => "call-site-not-adapted",
             DegradeReason::PtrComparison => "ptr-comparison",
@@ -668,6 +671,8 @@ pub(crate) enum Decision {
         slice: bool,
         uses: Vec<emitability::UseEdit>,
     },
+    /// Box wave-1: a complete local construction/destruction plan.
+    Box(box_facts::BoxPlan),
     /// Not emitted, with the reason ATTRIBUTED. **A first-class outcome.**
     ///
     /// §1.6 admits only conflict-non-increasing rewrites; everything outside
@@ -744,7 +749,10 @@ impl DecisionTable {
     pub(crate) fn degradations(&self) -> impl Iterator<Item = &Degradation> {
         self.entries.iter().filter_map(|(_, d)| match d {
             Decision::Degraded(record) => Some(record),
-            Decision::Ref { .. } | Decision::Slice { .. } | Decision::Opt { .. } => None,
+            Decision::Ref { .. }
+            | Decision::Slice { .. }
+            | Decision::Opt { .. }
+            | Decision::Box(_) => None,
         })
     }
 
@@ -788,6 +796,8 @@ pub(crate) struct Ctx<'a, 'tcx> {
     pub(crate) sign: &'a super::sign_facts::SignFacts,
     pub(crate) slice_uses: &'a FxHashMap<(LocalDefId, rustc_hir::HirId), emitability::SliceUses>,
     pub(crate) opt_uses: &'a FxHashMap<(LocalDefId, rustc_hir::HirId), emitability::OptUses>,
+    pub(crate) box_facts: &'a box_facts::BoxOwnershipFacts,
+    pub(crate) constructions: &'a construction::ConstructionFacts,
     /// **S3.6-1** — see [`RefGate`]. A mode rather than a fact, which is why it
     /// is `Copy` and not a borrow like everything else here.
     pub(crate) gate: RefGate,
@@ -852,6 +862,7 @@ pub(crate) fn refuse_nested_use_edits(tcx: TyCtxt<'_>, table: &mut DecisionTable
         for (i, (_, decision)) in table.entries.iter().enumerate() {
             let uses = match decision {
                 Decision::Slice { uses, .. } | Decision::Opt { uses, .. } => uses.as_slice(),
+                Decision::Box(_) => &[],
                 _ => &[],
             };
             edits.extend(uses.iter().map(|u| (i, u.span)));
@@ -949,11 +960,13 @@ fn decide_one(ctx: &Ctx<'_, '_>, subject: &Subject) -> Decision {
     // compile error here, because a form this veto does not name is a form that
     // escapes it.
     match decision {
-        Decision::Ref { .. } | Decision::Slice { .. } | Decision::Opt { .. } => degrade(
-            subject,
-            EmitabilityFacts::site(ctx.tcx, subject.attribution_span()),
-            residual_reason(subject.ctor.as_ref()),
-        ),
+        Decision::Ref { .. } | Decision::Slice { .. } | Decision::Opt { .. } | Decision::Box(_) => {
+            degrade(
+                subject,
+                EmitabilityFacts::site(ctx.tcx, subject.attribution_span()),
+                residual_reason(subject.ctor.as_ref()),
+            )
+        }
         Decision::Degraded(_) => decision,
     }
 }
@@ -968,6 +981,8 @@ fn decide_one_ladder(ctx: &Ctx<'_, '_>, subject: &Subject) -> Decision {
         sign,
         slice_uses,
         opt_uses,
+        box_facts,
+        constructions,
         gate,
         coconv,
     } = ctx;
@@ -1022,7 +1037,17 @@ fn decide_one_ladder(ctx: &Ctx<'_, '_>, subject: &Subject) -> Decision {
     match model.get(&SlotRef::Local(subject.fn_did, slot_id)) {
         Some(SlotKind::Ref) => {}
         Some(SlotKind::Raw) => return degrade(subject, decl_site, DegradeReason::KindRaw),
-        Some(SlotKind::Owning) => return degrade(subject, decl_site, DegradeReason::KindOwning),
+        Some(SlotKind::Owning) => {
+            return match box_facts.plan_for_subject(
+                tcx,
+                subject,
+                SlotRef::Local(subject.fn_did, slot_id),
+                constructions,
+            ) {
+                Ok(plan) => Decision::Box(plan),
+                Err(failure) => degrade(subject, decl_site, DegradeReason::BoxFailure { failure }),
+            };
+        }
         None => return degrade(subject, decl_site, DegradeReason::NoSlot),
     }
 

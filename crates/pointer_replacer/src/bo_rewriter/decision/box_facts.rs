@@ -7,7 +7,7 @@
 use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_index::IndexVec;
 use rustc_middle::mir::{Body, Local, Location, Operand, Rvalue, StatementKind, TerminatorKind};
-use rustc_span::def_id::LocalDefId;
+use rustc_span::{Span, def_id::LocalDefId};
 use rustc_type_ir::TyKind::FnDef;
 use sha2::{Digest, Sha256};
 
@@ -147,6 +147,8 @@ pub(crate) struct EndpointFact {
     pub(crate) value: FactValue,
     pub(crate) status: EndpointStatus,
     pub(crate) unknown_reason: Option<String>,
+    slot_ref: Option<SlotRef>,
+    span: Span,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -361,6 +363,7 @@ struct EndpointCandidate {
     callee: String,
     var: Var,
     slot: CandidateSlot,
+    span: Span,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -434,6 +437,7 @@ struct MinimalWalk<'a, 'tcx> {
     version_sites: Vec<VersionSite>,
     candidates: Vec<EndpointCandidate>,
     var_slots: FxHashMap<Var, SlotRef>,
+    move_edges: Vec<(SlotRef, SlotRef)>,
 }
 
 impl<'a, 'tcx> MinimalWalk<'a, 'tcx> {
@@ -451,6 +455,7 @@ impl<'a, 'tcx> MinimalWalk<'a, 'tcx> {
             version_sites: Vec::new(),
             candidates: Vec::new(),
             var_slots: FxHashMap::default(),
+            move_edges: Vec::new(),
         }
     }
 
@@ -603,14 +608,17 @@ impl<'a, 'tcx> MinimalWalk<'a, 'tcx> {
                         "assignment-rhs",
                     )
                 });
-                let Some((lhs_use, lhs_def, _)) = lhs_consume else {
+                let Some((lhs_use, lhs_def, lhs_slot)) = lhs_consume else {
                     continue;
                 };
                 self.equations.push(RecordedEquation::Assume {
                     var: lhs_use,
                     value: false,
                 });
-                if let (Some(operand), Some((rhs_use, rhs_def, _))) = (rhs_operand, rhs_consume) {
+                if let (Some(operand), Some((rhs_use, rhs_def, rhs_slot))) =
+                    (rhs_operand, rhs_consume)
+                {
+                    self.move_edges.push((rhs_slot, lhs_slot));
                     if operand.is_move() {
                         self.equations.push(RecordedEquation::Equal {
                             left: lhs_def,
@@ -694,6 +702,7 @@ impl<'a, 'tcx> MinimalWalk<'a, 'tcx> {
                         callee: callee.clone().expect("source callee"),
                         var: destination_def,
                         slot: CandidateSlot::Resolved(slot),
+                        span: terminator.source_info.span,
                     });
                 }
             }
@@ -758,6 +767,7 @@ impl<'a, 'tcx> MinimalWalk<'a, 'tcx> {
                         callee: callee.clone().expect("sink callee"),
                         var: endpoint_var,
                         slot,
+                        span: terminator.source_info.span,
                     });
                 } else if callee.is_none() {
                     self.equations.push(RecordedEquation::LessEqual {
@@ -801,7 +811,8 @@ impl<'a, 'tcx> MinimalWalk<'a, 'tcx> {
         };
         let mut endpoints = Vec::with_capacity(self.candidates.len());
         for candidate in self.candidates {
-            let (slot, final_kind, value, status, identity_reason) = match candidate.slot {
+            let (slot, slot_ref, final_kind, value, status, identity_reason) = match candidate.slot
+            {
                 CandidateSlot::Resolved(slot) => {
                     let final_kind = self
                         .model
@@ -811,6 +822,7 @@ impl<'a, 'tcx> MinimalWalk<'a, 'tcx> {
                     let value = values[candidate.var];
                     (
                         slot_label(slot),
+                        Some(slot),
                         Some(final_kind),
                         value,
                         classify_endpoint(value, final_kind),
@@ -819,6 +831,7 @@ impl<'a, 'tcx> MinimalWalk<'a, 'tcx> {
                 }
                 CandidateSlot::Undeterminable { direct, reason } => (
                     format!("undeterminable:{}", slot_label(direct)),
+                    None,
                     None,
                     FactValue::Unknown,
                     EndpointStatus::Unknown,
@@ -842,6 +855,8 @@ impl<'a, 'tcx> MinimalWalk<'a, 'tcx> {
                             .unwrap_or_else(|| "constraint-underdetermined".to_owned())
                     })
                 }),
+                slot_ref,
+                span: candidate.span,
             });
         }
         endpoints.sort_by(|left, right| {
@@ -880,7 +895,12 @@ impl<'a, 'tcx> MinimalWalk<'a, 'tcx> {
             endpoints,
             replay_error,
             canonical_sha256: String::new(),
+            move_edges: self.move_edges,
         };
+        facts
+            .move_edges
+            .sort_unstable_by_key(|(from, to)| (slot_order_key(*from), slot_order_key(*to)));
+        facts.move_edges.dedup();
         facts.canonical_sha256 = format!("{:x}", Sha256::digest(facts.canonical_bytes()));
         Ok(facts)
     }
@@ -907,6 +927,13 @@ fn slot_label(slot: SlotRef) -> String {
     }
 }
 
+fn slot_order_key(slot: SlotRef) -> (u8, u32, usize) {
+    match slot {
+        SlotRef::Field(slot) => (0, 0, slot.index()),
+        SlotRef::Local(did, slot) => (1, did.local_def_index.as_u32(), slot.index()),
+    }
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct BoxOwnershipFacts {
     equations: Vec<RecordedEquation>,
@@ -914,6 +941,65 @@ pub(crate) struct BoxOwnershipFacts {
     endpoints: Vec<EndpointFact>,
     replay_error: Option<String>,
     canonical_sha256: String,
+    move_edges: Vec<(SlotRef, SlotRef)>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum BoxShape {
+    Sized,
+    Slice,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct BoxExprEdit {
+    pub(crate) span: Span,
+    pub(crate) replacement: String,
+    pub(crate) receipt: &'static str,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct BoxPlan {
+    pub(crate) shape: BoxShape,
+    pub(crate) optional: bool,
+    pub(crate) expr_edits: Vec<BoxExprEdit>,
+    pub(crate) delete_statements: Vec<Span>,
+    pub(crate) receipts: Vec<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum BoxPlanFailure {
+    PointerDepth,
+    ParameterHeld,
+    ConstructionUnmappable,
+    EndpointInactive,
+    EndpointUnjoined,
+    MoveAmbiguous,
+    FieldHeld,
+    InitializerUnsupported,
+    ReallocUnsupported,
+    FreeDuplicate,
+    StoreFormUnknown,
+    AstUnplaceable,
+}
+
+impl BoxPlanFailure {
+    pub(crate) fn key(self) -> &'static str {
+        match self {
+            BoxPlanFailure::PointerDepth | BoxPlanFailure::ConstructionUnmappable => {
+                "box-construction-unmappable"
+            }
+            BoxPlanFailure::ParameterHeld => "box-param-caller-unknown",
+            BoxPlanFailure::EndpointInactive => "box-endpoint-inactive",
+            BoxPlanFailure::EndpointUnjoined => "box-endpoint-unjoined",
+            BoxPlanFailure::MoveAmbiguous => "box-move-ambiguous",
+            BoxPlanFailure::FieldHeld => "box-field-held",
+            BoxPlanFailure::InitializerUnsupported => "box-initializer-unsupported",
+            BoxPlanFailure::ReallocUnsupported => "box-realloc-transition-unsupported",
+            BoxPlanFailure::FreeDuplicate => "box-free-duplicate",
+            BoxPlanFailure::StoreFormUnknown => "box-store-form-unknown",
+            BoxPlanFailure::AstUnplaceable => "box-ast-unplaceable",
+        }
+    }
 }
 
 impl BoxOwnershipFacts {
@@ -935,6 +1021,188 @@ impl BoxOwnershipFacts {
 
     pub(crate) fn replay_error(&self) -> Option<&str> {
         self.replay_error.as_deref()
+    }
+
+    pub(crate) fn plan_for_subject(
+        &self,
+        tcx: rustc_middle::ty::TyCtxt<'_>,
+        subject: &super::Subject,
+        slot: SlotRef,
+        constructions: &super::construction::ConstructionFacts,
+    ) -> Result<BoxPlan, BoxPlanFailure> {
+        box_scope(
+            matches!(subject.kind, super::SubjectKind::Param { .. }),
+            subject.ptr_depth,
+        )
+        .map_err(|failure| match failure {
+            BoxScopeFailure::PointerDepth => BoxPlanFailure::PointerDepth,
+            BoxScopeFailure::ParameterHeld => BoxPlanFailure::ParameterHeld,
+        })?;
+        if subject.ty_span.is_none() || subject.pointee_span.is_none() {
+            return Err(BoxPlanFailure::ConstructionUnmappable);
+        }
+        let body = tcx
+            .mir_drops_elaborated_and_const_checked(subject.fn_did)
+            .borrow();
+        let ty = body.local_decls[subject.local].ty;
+        let rustc_middle::ty::TyKind::RawPtr(pointee, _) = ty.kind() else {
+            return Err(BoxPlanFailure::ConstructionUnmappable);
+        };
+        let normalized = format!("{pointee}");
+        if !scalar_initializer_supported(&normalized) {
+            return Err(BoxPlanFailure::InitializerUnsupported);
+        }
+
+        let active_sources = self
+            .endpoints
+            .iter()
+            .filter(|endpoint| {
+                endpoint.role == EndpointRole::Source
+                    && endpoint.status == EndpointStatus::Active
+                    && endpoint
+                        .slot_ref
+                        .is_some_and(|source| self.move_reaches(source, slot))
+            })
+            .collect::<Vec<_>>();
+        if active_sources.is_empty() {
+            return Err(BoxPlanFailure::EndpointInactive);
+        }
+        if active_sources.len() != 1 {
+            return Err(BoxPlanFailure::MoveAmbiguous);
+        }
+        if self.move_edges.iter().any(|(from, _)| {
+            self.move_edges
+                .iter()
+                .filter(|(candidate, _)| candidate == from)
+                .map(|(_, to)| *to)
+                .collect::<rustc_hash::FxHashSet<_>>()
+                .len()
+                > 1
+                && self.move_reaches(
+                    active_sources[0].slot_ref.expect("active source slot"),
+                    *from,
+                )
+        }) {
+            return Err(BoxPlanFailure::MoveAmbiguous);
+        }
+        let active_sinks = self
+            .endpoints
+            .iter()
+            .filter(|endpoint| {
+                endpoint.role == EndpointRole::Sink
+                    && endpoint.status == EndpointStatus::Active
+                    && endpoint
+                        .slot_ref
+                        .is_some_and(|sink| self.move_reaches(slot, sink))
+            })
+            .collect::<Vec<_>>();
+        if active_sinks.len() > 1 {
+            return Err(BoxPlanFailure::FreeDuplicate);
+        }
+        if subject.freed_at.is_some() && active_sinks.is_empty() {
+            return Err(BoxPlanFailure::EndpointUnjoined);
+        }
+
+        let key = (subject.fn_did, subject.hir_id);
+        let construction = constructions
+            .by_binding
+            .get(&key)
+            .ok_or(BoxPlanFailure::ConstructionUnmappable)?;
+        let init_span = *constructions
+            .init_spans
+            .get(&key)
+            .ok_or(BoxPlanFailure::AstUnplaceable)?;
+        let name = subject
+            .param_name
+            .as_deref()
+            .ok_or(BoxPlanFailure::AstUnplaceable)?;
+        let mut delete_statements = Vec::new();
+        let (initializer, initializer_arm) = match construction {
+            super::construction::Construction::Alloc {
+                callee,
+                size,
+                count: None,
+            } if callee == "malloc" && size.contains(&format!("size_of::<{normalized}>")) => {
+                let stores = constructions
+                    .first_stores
+                    .get(&key)
+                    .ok_or(BoxPlanFailure::InitializerUnsupported)?;
+                let [store] = stores.as_slice() else {
+                    return Err(BoxPlanFailure::InitializerUnsupported);
+                };
+                delete_statements.push(store.statement_span);
+                (
+                    format!("Box::new({})", store.value),
+                    "malloc-literal-first-store",
+                )
+            }
+            super::construction::Construction::Alloc {
+                callee,
+                count: Some(count),
+                ..
+            } if callee == "calloc" && count.trim() == "1" => {
+                (format!("Box::new(0 as {normalized})"), "calloc-zero-scalar")
+            }
+            super::construction::Construction::Alloc { callee, .. } if callee == "realloc" => {
+                return Err(BoxPlanFailure::ReallocUnsupported);
+            }
+            _ => return Err(BoxPlanFailure::InitializerUnsupported),
+        };
+        if active_sources[0].callee.as_str()
+            != match construction {
+                super::construction::Construction::Alloc { callee, .. } => callee.as_str(),
+                _ => return Err(BoxPlanFailure::ConstructionUnmappable),
+            }
+        {
+            return Err(BoxPlanFailure::EndpointUnjoined);
+        }
+
+        let mut expr_edits = vec![BoxExprEdit {
+            span: init_span,
+            replacement: initializer,
+            receipt: initializer_arm,
+        }];
+        let mut receipts = vec![format!(
+            "box-construction arm={initializer_arm} site={}",
+            super::emitability::EmitabilityFacts::site(tcx, init_span)
+        )];
+        if let Some(store_span) = delete_statements.first() {
+            receipts.push(format!(
+                "box-deleted-statement arm={initializer_arm} span={}",
+                super::emitability::EmitabilityFacts::site(tcx, *store_span)
+            ));
+        }
+        if let Some(sink) = active_sinks.first() {
+            let calls = constructions
+                .deallocator_calls
+                .get(&key)
+                .ok_or(BoxPlanFailure::AstUnplaceable)?;
+            let [call_span] = calls.as_slice() else {
+                return Err(BoxPlanFailure::FreeDuplicate);
+            };
+            expr_edits.push(BoxExprEdit {
+                span: *call_span,
+                replacement: format!("drop({name})"),
+                receipt: "c-free-site-drop",
+            });
+            receipts.push(format!(
+                "box-destruction callee={} site={}",
+                sink.callee,
+                super::emitability::EmitabilityFacts::site(tcx, *call_span)
+            ));
+        } else {
+            receipts.push(format!(
+                "waiver-drop(scope-exit) site={}",
+                super::emitability::EmitabilityFacts::site(tcx, subject.binding_span)
+            ));
+        }
+        Ok(BoxPlan {
+            shape: BoxShape::Sized,
+            optional: false,
+            expr_edits,
+            delete_statements,
+            receipts,
+        })
     }
 
     pub(crate) fn equations_tsv(&self) -> String {
@@ -986,7 +1254,30 @@ impl BoxOwnershipFacts {
         let mut bytes = render_equations(&self.equations).into_bytes();
         bytes.extend(self.version_sites_tsv().bytes());
         bytes.extend(self.endpoints_tsv().bytes());
+        for &(from, to) in &self.move_edges {
+            bytes.extend(format!("move\t{}\t{}\n", slot_label(from), slot_label(to)).bytes());
+        }
         bytes
+    }
+
+    fn move_reaches(&self, start: SlotRef, target: SlotRef) -> bool {
+        if start == target {
+            return true;
+        }
+        let mut seen = rustc_hash::FxHashSet::default();
+        let mut pending = vec![start];
+        while let Some(current) = pending.pop() {
+            if !seen.insert(current) {
+                continue;
+            }
+            for &(_, next) in self.move_edges.iter().filter(|(from, _)| *from == current) {
+                if next == target {
+                    return true;
+                }
+                pending.push(next);
+            }
+        }
+        false
     }
 
     pub(crate) fn version_sites_tsv(&self) -> String {

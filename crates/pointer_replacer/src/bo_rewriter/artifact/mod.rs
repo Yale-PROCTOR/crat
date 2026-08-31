@@ -85,6 +85,15 @@ pub(crate) fn rows(tcx: TyCtxt<'_>, table: &DecisionTable) -> Vec<Row> {
                     },
                     None,
                 ),
+                Decision::Box(plan) => (
+                    match (plan.optional, plan.shape) {
+                        (false, super::decision::box_facts::BoxShape::Sized) => Outcome::Box,
+                        (false, super::decision::box_facts::BoxShape::Slice) => Outcome::BoxSlice,
+                        (true, super::decision::box_facts::BoxShape::Sized) => Outcome::OptBox,
+                        (true, super::decision::box_facts::BoxShape::Slice) => Outcome::OptBoxSlice,
+                    },
+                    None,
+                ),
                 Decision::Degraded(record) => {
                     (Outcome::Degraded, Some(record.reason.key().to_owned()))
                 }

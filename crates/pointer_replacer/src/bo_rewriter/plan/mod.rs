@@ -350,10 +350,10 @@ pub(crate) fn plan(
         // `Unplaceable` record — measured with a variant probe before the
         // repair: the build named only `artifact::rows` and `degradations()`.
         // A `match` makes the next disposition a compile error at this site.
-        let (mutable, use_edits_in, optional, fat) = match decision {
-            Decision::Ref { mutable } => (mutable, None, false, false),
+        let (mutable, use_edits_in, optional, fat, box_plan) = match decision {
+            Decision::Ref { mutable } => (mutable, None, false, false, None),
             // S3.2′-2: the first disposition that is not declaration-only.
-            Decision::Slice { mutable, uses } => (mutable, Some(uses), false, true),
+            Decision::Slice { mutable, uses } => (mutable, Some(uses), false, true, None),
             // S3.2′-3: an optional form, thin or fat. Its uses travel the same
             // channel — declaration and uses move together or not at all, which
             // `use_failure` below enforces for every form that has uses.
@@ -361,7 +361,14 @@ pub(crate) fn plan(
                 mutable,
                 slice,
                 uses,
-            } => (mutable, Some(uses), true, *slice),
+            } => (mutable, Some(uses), true, *slice, None),
+            Decision::Box(plan) => (
+                &false,
+                None,
+                plan.optional,
+                matches!(plan.shape, super::decision::box_facts::BoxShape::Slice),
+                Some(plan),
+            ),
             // Degraded subjects produce no edit BY DESIGN — the decision phase
             // already recorded why, and re-deciding here would duplicate the
             // authority the architecture puts in one place.
@@ -475,11 +482,19 @@ pub(crate) fn plan(
             });
             continue;
         };
-        let base = match (fat, *mutable) {
-            (false, true) => format!("&mut {pointee}"),
-            (false, false) => format!("&{pointee}"),
-            (true, true) => format!("&mut [{pointee}]"),
-            (true, false) => format!("&[{pointee}]"),
+        let base = if box_plan.is_some() {
+            if fat {
+                format!("Box<[{pointee}]>")
+            } else {
+                format!("Box<{pointee}>")
+            }
+        } else {
+            match (fat, *mutable) {
+                (false, true) => format!("&mut {pointee}"),
+                (false, false) => format!("&{pointee}"),
+                (true, true) => format!("&mut [{pointee}]"),
+                (true, false) => format!("&[{pointee}]"),
+            }
         };
         let replacement = if optional {
             format!("Option<{base}>")
@@ -492,6 +507,48 @@ pub(crate) fn plan(
         // ill-typed crate, not a partial rewrite.
         let mut use_edits = Vec::new();
         let mut use_failure = None;
+        if let Some(box_plan) = box_plan {
+            for edit in &box_plan.expr_edits {
+                match span_to_loc(edit.span) {
+                    Ok((file, lo, hi)) if file == ty_file => use_edits.push(Edit {
+                        lo,
+                        hi,
+                        replacement: edit.replacement.clone(),
+                        justification: if edit.receipt == "c-free-site-drop" {
+                            Justification::DropForm {
+                                selector_site: edit.receipt.to_owned(),
+                            }
+                        } else {
+                            Justification::KindDecision { kind: "Box(expr)" }
+                        },
+                        owner_fn: owner_of(subject),
+                    }),
+                    Ok(_) => {
+                        use_failure = Some("Box edit is in a different file from the declaration")
+                    }
+                    Err(reason) => use_failure = Some(reason),
+                }
+            }
+            for &span in &box_plan.delete_statements {
+                match span_to_loc(span) {
+                    Ok((file, lo, hi)) if file == ty_file => use_edits.push(Edit {
+                        lo,
+                        hi,
+                        replacement: String::new(),
+                        justification: Justification::StoreForm {
+                            form: "box-delete-initializer-store",
+                        },
+                        owner_fn: owner_of(subject),
+                    }),
+                    Ok(_) => {
+                        use_failure = Some(
+                            "Box deleted statement is in a different file from the declaration",
+                        )
+                    }
+                    Err(reason) => use_failure = Some(reason),
+                }
+            }
+        }
         for use_edit in use_edits_in.into_iter().flatten() {
             match span_to_loc(use_edit.span) {
                 Ok((file, lo, hi)) if file == ty_file => use_edits.push(Edit {
@@ -517,15 +574,24 @@ pub(crate) fn plan(
             });
             continue;
         }
-        let kind = match (optional, fat, *mutable) {
-            (false, false, true) => "Ref(mut)",
-            (false, false, false) => "Ref(shared)",
-            (false, true, true) => "Slice(mut)",
-            (false, true, false) => "Slice(shared)",
-            (true, false, true) => "OptRef(mut)",
-            (true, false, false) => "OptRef(shared)",
-            (true, true, true) => "OptSlice(mut)",
-            (true, true, false) => "OptSlice(shared)",
+        let kind = if box_plan.is_some() {
+            match (optional, fat) {
+                (false, false) => "Box",
+                (false, true) => "BoxSlice",
+                (true, false) => "OptBox",
+                (true, true) => "OptBoxSlice",
+            }
+        } else {
+            match (optional, fat, *mutable) {
+                (false, false, true) => "Ref(mut)",
+                (false, false, false) => "Ref(shared)",
+                (false, true, true) => "Slice(mut)",
+                (false, true, false) => "Slice(shared)",
+                (true, false, true) => "OptRef(mut)",
+                (true, false, false) => "OptRef(shared)",
+                (true, true, true) => "OptSlice(mut)",
+                (true, true, false) => "OptSlice(shared)",
+            }
         };
         by_file
             .entry(ty_file.clone())

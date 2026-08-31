@@ -2131,7 +2131,7 @@ fn form_of(decision: &Decision) -> Form {
             slice: *slice,
         },
         // A degraded subject keeps its raw pointer type.
-        Decision::Degraded(_) => Form::Raw,
+        Decision::Box(_) | Decision::Degraded(_) => Form::Raw,
     }
 }
 

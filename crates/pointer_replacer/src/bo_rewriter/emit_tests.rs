@@ -145,10 +145,18 @@ fn box_w1_malloc_literal_first_store_emits_box_and_free_site_drop() {
              out\n\
          }}\n"
     );
-    let super::RewriteOutcome::Emitted { source, .. } = super::rewrite_m1(&src) else {
+    let super::RewriteOutcome::Emitted {
+        source,
+        degradations,
+        ..
+    } = super::rewrite_m1(&src)
+    else {
         panic!("BOX-W1 fixture must emit");
     };
-    assert!(source.contains("p: Box<i32>"), "{source}");
+    assert!(
+        source.contains("p: Box<i32>"),
+        "degradations={degradations:#?}\n{source}"
+    );
     assert!(source.contains("Box::new(7)"), "{source}");
     assert!(
         !source.contains("*p = 7"),
