@@ -263,8 +263,9 @@ mod tests {
     use rustc_middle::mir::Local;
 
     use super::*;
-    use crate::analyses::borrow_ownership::origin_summary::{
-        OriginSlot, OriginSummary, SignaturePlace, SignatureRoot, SignatureSlot,
+    use crate::analyses::borrow_ownership::{
+        a5_overlap::WholeProgramAttestation,
+        origin_summary::{OriginSlot, OriginSummary, SignaturePlace, SignatureRoot, SignatureSlot},
     };
 
     fn arg(index: usize) -> SignatureSlot {
@@ -397,5 +398,57 @@ mod tests {
             ),
             Err(LifetimeFailure::OriginAbsent)
         );
+    }
+
+    #[test]
+    fn e2_n7_fnptr_root_and_forward_callee_are_both_held() {
+        let code = r#"
+            pub unsafe fn leaf(p: *mut i32) -> *mut i32 { p }
+            pub unsafe fn root(p: *mut i32) -> *mut i32 { leaf(p) }
+            pub unsafe fn install() {
+                let _callback: unsafe fn(*mut i32) -> *mut i32 = root;
+            }
+            pub unsafe fn direct_only(p: *mut i32) -> *mut i32 { p }
+        "#;
+        let (roots, members, reasons) = ::utils::compilation::run_compiler_on_str(code, |tcx| {
+            let program = crate::bo_rewriter::collect_program(tcx);
+            let web = derive_fn_ptr_web(
+                &program,
+                Some(WholeProgramAttestation::FrozenBenchmarkGraph),
+            )
+            .expect("attested fixture web");
+            (
+                web.root_paths(tcx),
+                web.member_paths(tcx),
+                web.reason_rows(tcx),
+            )
+        })
+        .expect("N7 fixture compiles");
+
+        assert_eq!(roots, vec!["root"]);
+        assert_eq!(members, vec!["leaf", "root"]);
+        assert!(
+            reasons
+                .iter()
+                .any(|row| row == "root\troot\tadjusted-fnptr")
+        );
+        assert!(
+            reasons
+                .iter()
+                .any(|row| row.starts_with("closure\tleaf\tdirect:"))
+        );
+        assert!(!members.iter().any(|name| name == "install"));
+        assert!(!members.iter().any(|name| name == "direct_only"));
+    }
+
+    #[test]
+    fn e2_n7_unattested_web_fails_closed() {
+        let code = "pub unsafe fn f(p: *mut i32) -> *mut i32 { p }";
+        let result = ::utils::compilation::run_compiler_on_str(code, |tcx| {
+            let program = crate::bo_rewriter::collect_program(tcx);
+            derive_fn_ptr_web(&program, None)
+        })
+        .expect("N7 unattested fixture compiles");
+        assert_eq!(result, Err(LifetimeFailure::FnPtrWebHeld));
     }
 }
