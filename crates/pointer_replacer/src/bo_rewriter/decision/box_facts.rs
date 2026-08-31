@@ -4,7 +4,7 @@
 //! the conservative concrete replay before the frozen ownership emitter is
 //! connected to it.
 
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_index::IndexVec;
 use rustc_middle::mir::{Body, Local, Location, Operand, Rvalue, StatementKind, TerminatorKind};
 use rustc_span::def_id::LocalDefId;
@@ -128,7 +128,7 @@ enum SinkCarrierReason {
     NonCopyDef,
     ProjectionBase,
     MissingDef,
-    MissingCarrierSlot,
+    MissingVersionSite,
 }
 
 impl SinkCarrierReason {
@@ -138,7 +138,7 @@ impl SinkCarrierReason {
             SinkCarrierReason::NonCopyDef => "sink-carrier-non-copy-def",
             SinkCarrierReason::ProjectionBase => "sink-carrier-projection-base",
             SinkCarrierReason::MissingDef => "sink-carrier-missing-def",
-            SinkCarrierReason::MissingCarrierSlot => "sink-carrier-slot-unmapped",
+            SinkCarrierReason::MissingVersionSite => "sink-carrier-version-site-missing",
         }
     }
 }
@@ -337,6 +337,14 @@ enum CandidateSlot {
     },
 }
 
+#[derive(Clone, Copy, Debug)]
+struct CarrierPresentation {
+    carrier: Local,
+    r#use: Var,
+    def: Var,
+    slot: SlotRef,
+}
+
 fn record_sink_definition(
     definitions: &mut IndexVec<Local, Option<SinkCarrierDef>>,
     local: Local,
@@ -469,6 +477,29 @@ impl<'a, 'tcx> MinimalWalk<'a, 'tcx> {
         let function_path = self.program.tcx.def_path_str(fn_did.to_def_id());
         let eliminable = eliminable_temporaries(body);
         let sink_definitions = sink_carrier_definitions(body);
+        let mut sink_argument_temps = FxHashSet::default();
+        for data in body.basic_blocks.iter() {
+            let Some(terminator) = data.terminator.as_ref() else {
+                continue;
+            };
+            let TerminatorKind::Call { func, args, .. } = &terminator.kind else {
+                continue;
+            };
+            let is_sink = foreign_callee_name(self.program, func)
+                .as_deref()
+                .and_then(|name| boundary_table::lookup(name, Matcher::ForeignC))
+                .is_some_and(|entry| entry.roles.contains(&Role::Sink));
+            if is_sink
+                && let Some(local) = args
+                    .first()
+                    .and_then(|arg| arg.node.place())
+                    .and_then(|place| place.as_local())
+                && eliminable.contains(local)
+            {
+                sink_argument_temps.insert(local);
+            }
+        }
+        let mut carrier_presentations = FxHashMap::<Local, CarrierPresentation>::default();
         let mut current = FxHashMap::<Local, Var>::default();
         for local in body.local_decls.indices() {
             if let Some(slot) = self.slot_for_local(fn_did, local) {
@@ -496,6 +527,29 @@ impl<'a, 'tcx> MinimalWalk<'a, 'tcx> {
                 let rhs_local = rhs_operand
                     .and_then(Operand::place)
                     .and_then(|place| place.as_local());
+                if sink_argument_temps.contains(&lhs_local) {
+                    if let Some(rhs_local) = rhs_local
+                        && let Some((rhs_use, rhs_def, rhs_slot)) = self.consume(
+                            fn_did,
+                            &function_path,
+                            &mut current,
+                            rhs_local,
+                            location,
+                            "sink-carrier-copy",
+                        )
+                    {
+                        carrier_presentations.insert(
+                            lhs_local,
+                            CarrierPresentation {
+                                carrier: rhs_local,
+                                r#use: rhs_use,
+                                def: rhs_def,
+                                slot: rhs_slot,
+                            },
+                        );
+                    }
+                    continue;
+                }
                 let lhs_consume = self.consume(
                     fn_did,
                     &function_path,
@@ -613,33 +667,61 @@ impl<'a, 'tcx> MinimalWalk<'a, 'tcx> {
                     continue;
                 };
                 if is_sink && index == 0 {
-                    self.equations.push(RecordedEquation::Assume {
-                        var: arg_def,
-                        value: false,
-                    });
-                    let slot = match resolve_sink_carrier(
+                    let (endpoint_var, endpoint_def, slot) = match resolve_sink_carrier(
                         arg_local,
                         eliminable.contains(arg_local),
                         sink_definitions[arg_local],
                     ) {
-                        Ok(carrier) => self.slot_for_local(fn_did, carrier).map_or(
+                        Ok(carrier) if carrier == arg_local => {
+                            (arg_use, arg_def, CandidateSlot::Resolved(direct_slot))
+                        }
+                        Ok(carrier) => carrier_presentations.get(&arg_local).copied().map_or(
+                            (
+                                arg_use,
+                                arg_def,
+                                CandidateSlot::Undeterminable {
+                                    direct: direct_slot,
+                                    reason: SinkCarrierReason::MissingVersionSite,
+                                },
+                            ),
+                            |presentation| {
+                                if presentation.carrier == carrier {
+                                    (
+                                        presentation.r#use,
+                                        presentation.def,
+                                        CandidateSlot::Resolved(presentation.slot),
+                                    )
+                                } else {
+                                    (
+                                        arg_use,
+                                        arg_def,
+                                        CandidateSlot::Undeterminable {
+                                            direct: direct_slot,
+                                            reason: SinkCarrierReason::MissingVersionSite,
+                                        },
+                                    )
+                                }
+                            },
+                        ),
+                        Err(reason) => (
+                            arg_use,
+                            arg_def,
                             CandidateSlot::Undeterminable {
                                 direct: direct_slot,
-                                reason: SinkCarrierReason::MissingCarrierSlot,
+                                reason,
                             },
-                            CandidateSlot::Resolved,
                         ),
-                        Err(reason) => CandidateSlot::Undeterminable {
-                            direct: direct_slot,
-                            reason,
-                        },
                     };
+                    self.equations.push(RecordedEquation::Assume {
+                        var: endpoint_def,
+                        value: false,
+                    });
                     self.candidates.push(EndpointCandidate {
                         role: EndpointRole::Sink,
                         function_path: function_path.clone(),
                         location: location.into(),
                         callee: callee.clone().expect("sink callee"),
-                        var: arg_use,
+                        var: endpoint_var,
                         slot,
                     });
                 } else if callee.is_none() {
