@@ -5954,6 +5954,59 @@ fn e2_n6_compile_errors_surface_as_iteration_data() {
     );
 }
 
+/// E2 task-22 exact-once receipt control: one table drives subject, function,
+/// failure, and seam artifacts, and the typed lifetime justification carries
+/// the same digest as the function row.
+#[test]
+fn e2_receipts_reconcile_subject_function_and_plan_identity_once() {
+    let fixture = Fixture::new(&[(
+        "lib.rs",
+        "#![allow(dead_code, unused_unsafe)]\n\
+         pub unsafe fn id(p: *const i32) -> *const i32 { p }\n",
+    )]);
+    let (entries, artifacts) =
+        ::utils::compilation::run_compiler_on_path(&fixture.root(), |tcx| {
+            let (table, ctx) = super::decide_table_with_ctx_config(
+                tcx,
+                Some((
+                    crate::analyses::borrow_ownership::a5_overlap::A5Mode::PreciseReplay,
+                    Some(
+                        crate::analyses::borrow_ownership::a5_overlap::WholeProgramAttestation::FrozenBenchmarkGraph,
+                    ),
+                )),
+            )
+            .expect("E2 receipt decision table");
+            (table.entries.len(), ctx.e2_artifacts)
+        })
+        .expect("E2 receipt fixture compiles");
+
+    let subjects = artifacts.subjects.lines().skip(1).collect::<Vec<_>>();
+    assert_eq!(subjects.len(), entries, "{}", artifacts.subjects);
+    assert_eq!(
+        subjects
+            .iter()
+            .map(|row| row.split('\t').next().unwrap())
+            .collect::<std::collections::BTreeSet<_>>()
+            .len(),
+        entries,
+        "{}",
+        artifacts.subjects,
+    );
+    let functions = artifacts.functions.lines().skip(1).collect::<Vec<_>>();
+    assert_eq!(functions.len(), 1, "{}", artifacts.functions);
+    let function_digest = functions[0].split('\t').nth(1).expect("function digest");
+    let subject_digest = subjects[0].split('\t').nth(9).expect("subject digest");
+    assert_eq!(subject_digest, function_digest);
+    assert!(subjects[0].contains("\tplanned\tlifetime-plan\t"));
+    assert_eq!(
+        artifacts.failures.lines().count(),
+        1,
+        "{}",
+        artifacts.failures
+    );
+    assert!(artifacts.seams.starts_with("kind\towner_fn\t"));
+}
+
 fn receipt_column(receipt: &str, name: &str) -> usize {
     receipt
         .lines()

@@ -2523,6 +2523,10 @@ pub(crate) struct JustificationCensus {
     pub drop_form: usize,
     pub store_form: usize,
     pub c9_mark: usize,
+    /// E2 structural signatures are not byte-splice edits, so this stays zero
+    /// in `of_plan`; the exhaustive arm prevents a future explicit receipt
+    /// from vanishing into an unnamed bucket.
+    pub lifetime_plan: usize,
 }
 
 impl JustificationCensus {
@@ -2556,6 +2560,7 @@ impl JustificationCensus {
             + self.drop_form
             + self.store_form
             + self.c9_mark
+            + self.lifetime_plan
     }
 
     /// The plan's edit count, derived **without consulting any justification**.
@@ -2610,6 +2615,7 @@ impl JustificationCensus {
             J::DropForm { .. } => self.drop_form += 1,
             J::StoreForm { .. } => self.store_form += 1,
             J::C9Mark => self.c9_mark += 1,
+            J::LifetimePlan { .. } => self.lifetime_plan += 1,
         }
     }
 }
@@ -5573,6 +5579,7 @@ mod arm2_witnesses {
                 drop_form: 1,
                 store_form: 1,
                 c9_mark: 0,
+                lifetime_plan: 0,
             },
             "each variant must land in its OWN bucket — an arm-4 edit counted \
              as a `KindDecision` would report the market as zero while the \
@@ -5645,6 +5652,7 @@ mod arm2_witnesses {
                 drop_form: 1,
                 store_form: 0,
                 c9_mark: 0,
+                lifetime_plan: 0,
             },
             "the walk must reach EVERY file — the second file's edits are the \
              half a first-entry-only walk would miss"

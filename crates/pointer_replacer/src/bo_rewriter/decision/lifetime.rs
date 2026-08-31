@@ -257,6 +257,16 @@ impl LifetimeEligibility {
         self.output_storage_escapes.contains(&(source, target))
     }
 
+    pub(crate) fn is_output_source(&self, source: NodeKey) -> bool {
+        self.output_storage_escapes
+            .iter()
+            .any(|(candidate, _)| *candidate == source)
+    }
+
+    pub(crate) fn failures(&self) -> impl Iterator<Item = (NodeKey, LifetimeFailure)> + '_ {
+        self.failures.iter().map(|(&key, &failure)| (key, failure))
+    }
+
     #[cfg(test)]
     pub(crate) fn output_storage_receipts(&self) -> Vec<OutputStorageReceipt> {
         let mut permits = self.output_storage_permits.values().collect::<Vec<_>>();
@@ -551,7 +561,14 @@ pub(crate) fn derive_return_eligibility(
                     if record.reason == DegradeReason::ReturnNotAdapted
             )
         });
-        if !is_return_residual || !matches!(subject.ctor, Some(Construction::CallResult)) {
+        if !is_return_residual {
+            continue;
+        }
+        if matches!(subject.ctor, Some(Construction::Alloc { .. })) {
+            result.failures.insert(key, LifetimeFailure::OriginAbsent);
+            continue;
+        }
+        if !matches!(subject.ctor, Some(Construction::CallResult)) {
             continue;
         }
         let Some(target) = constructions.call_result_targets.get(&key).copied() else {
@@ -642,6 +659,10 @@ impl LifetimePlan {
 
     pub(crate) fn function_count(&self) -> usize {
         self.functions.len()
+    }
+
+    pub(crate) fn functions(&self) -> impl Iterator<Item = (LocalDefId, &FunctionPlan)> + '_ {
+        self.functions.iter().map(|(&did, plan)| (did, plan))
     }
 
     pub(crate) fn canonical_receipt(&self, tcx: rustc_middle::ty::TyCtxt<'_>) -> String {

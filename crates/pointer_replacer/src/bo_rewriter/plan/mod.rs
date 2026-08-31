@@ -125,6 +125,10 @@ pub(crate) enum Justification {
     },
     /// A5 C-9 snapshot temp at one retained marked call site.
     C9Mark,
+    /// E2-FN structural signature emission, keyed to the finalized plan bytes.
+    /// The AST pass owns node placement; this typed justification keeps the
+    /// receipt vocabulary aligned with span/seam ownership.
+    LifetimePlan { digest: String },
     /// **The fabricated-extent const's declaration** (marker ruling,
     /// 2026-08-15). One per crate, in the crate root file, emitted only when at
     /// least one fabricated adapter survives.

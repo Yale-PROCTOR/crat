@@ -7848,6 +7848,7 @@ mod run {
                     drop_form,
                     store_form,
                     c9_mark,
+                    lifetime_plan,
                 } = jc;
                 let jp = dir.join(format!("{name}.just.tsv"));
                 std::fs::write(
@@ -7858,6 +7859,7 @@ mod run {
                          reroute\t{reroute}\ndrop_form\t{drop_form}\n\
                          store_form\t{store_form}\n\
                          c9_mark\t{c9_mark}\n\
+                         lifetime_plan\t{lifetime_plan}\n\
                          fabricated_len_const\t{fabricated_len_const}\n\
                          subset:seam_adapter_fabricated\t{seam_adapter_fabricated}\n",
                     ),

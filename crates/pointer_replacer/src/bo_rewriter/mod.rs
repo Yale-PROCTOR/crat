@@ -147,6 +147,14 @@ pub(crate) struct E1Capture {
     pub(crate) solve_receipt: model_cache::SolveReceipt,
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct E2Artifacts {
+    pub(crate) subjects: String,
+    pub(crate) functions: String,
+    pub(crate) failures: String,
+    pub(crate) seams: String,
+}
+
 /// What one M1 rewrite attempt produced.
 ///
 /// `Degraded` is a first-class outcome, not an error: §1.6 admits only
@@ -3497,6 +3505,7 @@ fn finish_decide<'tcx>(
     if let Err(why) = table.is_self_consistent_over(&subjects) {
         return Err(format!("decision table self-consistency: {why}"));
     }
+    let e2_artifacts = e2_artifacts_from_table(tcx, &table, &hypothetical, &lifetime_eligibility);
 
     // C.2: the in-process coverage gate is GONE. Its replacement is the
     // harness reconciliation in `coverage_recon`, driven from outside this
@@ -3523,6 +3532,7 @@ fn finish_decide<'tcx>(
             analysis,
             a5_site_proofs,
             box_facts,
+            e2_artifacts,
         },
     ))
 }
@@ -3563,6 +3573,7 @@ pub(crate) struct DecideCtx {
     analysis: DecisionAnalysisCarrier,
     a5_site_proofs: decision::a5_site_proof::A5SeamProofIndex,
     box_facts: decision::box_facts::BoxOwnershipFacts,
+    e2_artifacts: E2Artifacts,
 }
 
 impl DecideCtx {
@@ -3835,6 +3846,149 @@ fn e1_subject_family(
                 | decision::Decision::Box(_) => unreachable!("emitting form mapped above"),
             })
         }
+    }
+}
+
+fn e2_artifacts_from_table(
+    tcx: TyCtxt<'_>,
+    table: &decision::DecisionTable,
+    ordinary: &decision::DecisionTable,
+    eligibility: &decision::lifetime::LifetimeEligibility,
+) -> E2Artifacts {
+    let ordinary = ordinary
+        .entries
+        .iter()
+        .map(|(subject, decision)| ((subject.fn_did, subject.hir_id), decision))
+        .collect::<rustc_hash::FxHashMap<_, _>>();
+    let mut subject_rows = Vec::new();
+    let mut failure_rows = Vec::new();
+    for (subject, final_decision) in &table.entries {
+        let key = (subject.fn_did, subject.hir_id);
+        let owner = tcx.def_path_str(subject.fn_did.to_def_id());
+        let subject_key = subject.identity_key(&owner);
+        let plan = table.lifetime_plan.function(subject.fn_did);
+        let planned = plan.is_some()
+            && (eligibility.return_permit(key).is_some()
+                || eligibility.inferred_permit(key).is_some()
+                || eligibility.is_output_source(key));
+        let fallback_failure = match final_decision {
+            decision::Decision::Degraded(record) => match &record.reason {
+                decision::DegradeReason::SilentCoercion { via }
+                | decision::DegradeReason::ClassBlocked { via } => match via {
+                    decision::co_conversion::BlockReason::EscapesViaFieldStore => {
+                        Some(decision::lifetime::LifetimeFailure::FieldHeld)
+                    }
+                    decision::co_conversion::BlockReason::EscapesViaForeignArg
+                    | decision::co_conversion::BlockReason::BorrowedIntoRawParam => {
+                        Some(decision::lifetime::LifetimeFailure::ExternalContractAbsent)
+                    }
+                    _ => None,
+                },
+                _ => None,
+            },
+            _ => None,
+        };
+        let failure = eligibility.failure(key).or(fallback_failure);
+        let disposition = if planned {
+            "planned"
+        } else if let Some(failure) = failure {
+            failure.key()
+        } else {
+            "not-e2"
+        };
+        let ordinary_decision = ordinary.get(&key).copied();
+        let ordinary_key = match ordinary_decision {
+            Some(decision::Decision::Ref { .. }) => "ref",
+            Some(decision::Decision::InferredRef { .. }) => "inferred-ref",
+            Some(decision::Decision::Slice { .. }) => "slice",
+            Some(decision::Decision::Opt { .. }) => "optional",
+            Some(decision::Decision::Box(_)) => "box",
+            Some(decision::Decision::Degraded(record)) => record.reason.key(),
+            None => "missing",
+        };
+        let final_key = match final_decision {
+            decision::Decision::Ref { .. } => "ref",
+            decision::Decision::InferredRef { .. } => "inferred-ref",
+            decision::Decision::Slice { .. } => "slice",
+            decision::Decision::Opt { .. } => "optional",
+            decision::Decision::Box(_) => "box",
+            decision::Decision::Degraded(record) => record.reason.key(),
+        };
+        let digest = plan.map_or_else(|| "-".to_owned(), |plan| plan.digest());
+        let justification = if planned {
+            plan::Justification::LifetimePlan {
+                digest: digest.clone(),
+            }
+        } else {
+            plan::Justification::KindDecision { kind: "none" }
+        };
+        let justification_key = match justification {
+            plan::Justification::LifetimePlan { .. } => "lifetime-plan",
+            _ => "-",
+        };
+        let construction = subject
+            .ctor
+            .as_ref()
+            .map_or("-", decision::construction::Construction::key);
+        subject_rows.push(format!(
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            subject_key,
+            owner,
+            subject.local.as_u32(),
+            subject.ptr_depth,
+            construction,
+            ordinary_key,
+            final_key,
+            disposition,
+            justification_key,
+            digest,
+        ));
+        if let Some(failure) = failure {
+            failure_rows.push(format!(
+                "{}\t{}\t{}\t{}",
+                subject_key,
+                owner,
+                failure.key(),
+                construction,
+            ));
+        }
+    }
+    subject_rows.sort();
+    failure_rows.sort();
+
+    let mut function_rows = table
+        .lifetime_plan
+        .functions()
+        .map(|(did, function)| {
+            format!(
+                "{}\t{}\t{}\t{}\t{}",
+                tcx.def_path_str(did.to_def_id()),
+                function.digest(),
+                function.sccs.len(),
+                function.outlives.len(),
+                function.receipt().replace('\n', " | "),
+            )
+        })
+        .collect::<Vec<_>>();
+    function_rows.sort();
+
+    E2Artifacts {
+        subjects: format!(
+            "subject_key\towner_fn\tmir_local\tptr_depth\tconstruction\tordinary_decision\tfinal_decision\te2_disposition\tjustification\tlifetime_plan_digest\n{}{}",
+            subject_rows.join("\n"),
+            if subject_rows.is_empty() { "" } else { "\n" },
+        ),
+        functions: format!(
+            "function\tlifetime_plan_digest\tsccs\toutlives\tplan_receipt\n{}{}",
+            function_rows.join("\n"),
+            if function_rows.is_empty() { "" } else { "\n" },
+        ),
+        failures: format!(
+            "subject_key\towner_fn\tfailure\tconstruction\n{}{}",
+            failure_rows.join("\n"),
+            if failure_rows.is_empty() { "" } else { "\n" },
+        ),
+        seams: seam_tsv_from_table(tcx, table),
     }
 }
 
