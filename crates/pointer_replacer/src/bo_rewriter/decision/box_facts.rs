@@ -12,12 +12,15 @@ use rustc_type_ir::TyKind::FnDef;
 use sha2::{Digest, Sha256};
 
 use crate::{
-    analyses::borrow_ownership::{
-        SlotKind,
-        boundary_table::{self, Matcher, Role},
-        crate_slots::CrateSlots,
-        solver::SlotRef,
-        ssa::constraint::Var,
+    analyses::{
+        borrow_ownership::{
+            SlotKind,
+            boundary_table::{self, Matcher, Role},
+            crate_slots::CrateSlots,
+            solver::SlotRef,
+            ssa::constraint::Var,
+        },
+        output_params::eliminable_temporaries::eliminable_temporaries,
     },
     utils::rustc::RustProgram,
 };
@@ -105,7 +108,7 @@ pub(crate) struct EndpointFact {
     pub(crate) callee: String,
     pub(crate) var: Var,
     pub(crate) slot: String,
-    pub(crate) final_kind: SlotKind,
+    pub(crate) final_kind: Option<SlotKind>,
     pub(crate) value: FactValue,
     pub(crate) status: EndpointStatus,
     pub(crate) unknown_reason: Option<String>,
@@ -125,6 +128,7 @@ enum SinkCarrierReason {
     NonCopyDef,
     ProjectionBase,
     MissingDef,
+    MissingCarrierSlot,
 }
 
 impl SinkCarrierReason {
@@ -134,6 +138,7 @@ impl SinkCarrierReason {
             SinkCarrierReason::NonCopyDef => "sink-carrier-non-copy-def",
             SinkCarrierReason::ProjectionBase => "sink-carrier-projection-base",
             SinkCarrierReason::MissingDef => "sink-carrier-missing-def",
+            SinkCarrierReason::MissingCarrierSlot => "sink-carrier-slot-unmapped",
         }
     }
 }
@@ -320,7 +325,61 @@ struct EndpointCandidate {
     location: LocationKey,
     callee: String,
     var: Var,
-    slot: SlotRef,
+    slot: CandidateSlot,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum CandidateSlot {
+    Resolved(SlotRef),
+    Undeterminable {
+        direct: SlotRef,
+        reason: SinkCarrierReason,
+    },
+}
+
+fn record_sink_definition(
+    definitions: &mut IndexVec<Local, Option<SinkCarrierDef>>,
+    local: Local,
+    definition: SinkCarrierDef,
+) {
+    definitions[local] = Some(match definitions[local] {
+        None => definition,
+        Some(_) => SinkCarrierDef::Multiple,
+    });
+}
+
+fn sink_carrier_definitions(body: &Body<'_>) -> IndexVec<Local, Option<SinkCarrierDef>> {
+    let mut definitions = IndexVec::from_elem_n(None, body.local_decls.len());
+    for data in body.basic_blocks.iter() {
+        for statement in &data.statements {
+            let StatementKind::Assign(box (destination, rvalue)) = &statement.kind else {
+                continue;
+            };
+            let definition = if destination.as_local().is_none() {
+                SinkCarrierDef::Projected
+            } else {
+                match rvalue {
+                    Rvalue::Use(Operand::Copy(source) | Operand::Move(source))
+                    | Rvalue::Cast(_, Operand::Copy(source) | Operand::Move(source), _) => source
+                        .as_local()
+                        .map_or(SinkCarrierDef::Projected, SinkCarrierDef::Copy),
+                    _ => SinkCarrierDef::NonCopy,
+                }
+            };
+            record_sink_definition(&mut definitions, destination.local, definition);
+        }
+        if let Some(terminator) = &data.terminator
+            && let TerminatorKind::Call { destination, .. } = &terminator.kind
+        {
+            let definition = if destination.as_local().is_some() {
+                SinkCarrierDef::NonCopy
+            } else {
+                SinkCarrierDef::Projected
+            };
+            record_sink_definition(&mut definitions, destination.local, definition);
+        }
+    }
+    definitions
 }
 
 struct MinimalWalk<'a, 'tcx> {
@@ -408,6 +467,8 @@ impl<'a, 'tcx> MinimalWalk<'a, 'tcx> {
 
     fn walk_body(&mut self, fn_did: LocalDefId, body: &Body<'tcx>) -> Result<(), String> {
         let function_path = self.program.tcx.def_path_str(fn_did.to_def_id());
+        let eliminable = eliminable_temporaries(body);
+        let sink_definitions = sink_carrier_definitions(body);
         let mut current = FxHashMap::<Local, Var>::default();
         for local in body.local_decls.indices() {
             if let Some(slot) = self.slot_for_local(fn_did, local) {
@@ -498,21 +559,18 @@ impl<'a, 'tcx> MinimalWalk<'a, 'tcx> {
             };
             let mut arg_consumes = Vec::with_capacity(args.len());
             for arg in args {
-                let consume = arg
-                    .node
-                    .place()
-                    .and_then(|place| place.as_local())
-                    .and_then(|local| {
-                        self.consume(
-                            fn_did,
-                            &function_path,
-                            &mut current,
-                            local,
-                            location,
-                            "call-argument",
-                        )
-                    });
-                arg_consumes.push(consume);
+                let local = arg.node.place().and_then(|place| place.as_local());
+                let consume = local.and_then(|local| {
+                    self.consume(
+                        fn_did,
+                        &function_path,
+                        &mut current,
+                        local,
+                        location,
+                        "call-argument",
+                    )
+                });
+                arg_consumes.push(local.zip(consume));
             }
             let destination = destination.as_local().and_then(|local| {
                 self.consume(
@@ -546,12 +604,12 @@ impl<'a, 'tcx> MinimalWalk<'a, 'tcx> {
                         location: location.into(),
                         callee: callee.clone().expect("source callee"),
                         var: destination_def,
-                        slot,
+                        slot: CandidateSlot::Resolved(slot),
                     });
                 }
             }
             for (index, consume) in arg_consumes.into_iter().enumerate() {
-                let Some((arg_use, arg_def, slot)) = consume else {
+                let Some((arg_local, (arg_use, arg_def, direct_slot))) = consume else {
                     continue;
                 };
                 if is_sink && index == 0 {
@@ -559,6 +617,23 @@ impl<'a, 'tcx> MinimalWalk<'a, 'tcx> {
                         var: arg_def,
                         value: false,
                     });
+                    let slot = match resolve_sink_carrier(
+                        arg_local,
+                        eliminable.contains(arg_local),
+                        sink_definitions[arg_local],
+                    ) {
+                        Ok(carrier) => self.slot_for_local(fn_did, carrier).map_or(
+                            CandidateSlot::Undeterminable {
+                                direct: direct_slot,
+                                reason: SinkCarrierReason::MissingCarrierSlot,
+                            },
+                            CandidateSlot::Resolved,
+                        ),
+                        Err(reason) => CandidateSlot::Undeterminable {
+                            direct: direct_slot,
+                            reason,
+                        },
+                    };
                     self.candidates.push(EndpointCandidate {
                         role: EndpointRole::Sink,
                         function_path: function_path.clone(),
@@ -589,10 +664,13 @@ impl<'a, 'tcx> MinimalWalk<'a, 'tcx> {
             }
         }
         for candidate in &self.candidates {
-            let value = match self.model.get(&candidate.slot) {
-                Some(SlotKind::Owning) => FactValue::MustOwn,
-                Some(SlotKind::Raw | SlotKind::Ref) => FactValue::NotOwn,
-                None => FactValue::Unknown,
+            let value = match candidate.slot {
+                CandidateSlot::Resolved(slot) => match self.model.get(&slot) {
+                    Some(SlotKind::Owning) => FactValue::MustOwn,
+                    Some(SlotKind::Raw | SlotKind::Ref) => FactValue::NotOwn,
+                    None => FactValue::Unknown,
+                },
+                CandidateSlot::Undeterminable { .. } => FactValue::Unknown,
             };
             assign(&mut seeds, candidate.var, value)?;
         }
@@ -606,27 +684,46 @@ impl<'a, 'tcx> MinimalWalk<'a, 'tcx> {
         };
         let mut endpoints = Vec::with_capacity(self.candidates.len());
         for candidate in self.candidates {
-            let final_kind = self
-                .model
-                .get(&candidate.slot)
-                .copied()
-                .ok_or_else(|| format!("Box endpoint model lacks slot {:?}", candidate.slot))?;
-            let value = values[candidate.var];
-            let status = classify_endpoint(value, final_kind);
+            let (slot, final_kind, value, status, identity_reason) = match candidate.slot {
+                CandidateSlot::Resolved(slot) => {
+                    let final_kind = self
+                        .model
+                        .get(&slot)
+                        .copied()
+                        .ok_or_else(|| format!("Box endpoint model lacks slot {slot:?}"))?;
+                    let value = values[candidate.var];
+                    (
+                        slot_label(slot),
+                        Some(final_kind),
+                        value,
+                        classify_endpoint(value, final_kind),
+                        None,
+                    )
+                }
+                CandidateSlot::Undeterminable { direct, reason } => (
+                    format!("undeterminable:{}", slot_label(direct)),
+                    None,
+                    FactValue::Unknown,
+                    EndpointStatus::Unknown,
+                    Some(reason.key().to_owned()),
+                ),
+            };
             endpoints.push(EndpointFact {
                 role: candidate.role,
                 function_path: candidate.function_path,
                 location: candidate.location,
                 callee: candidate.callee,
                 var: candidate.var,
-                slot: slot_label(candidate.slot),
+                slot,
                 final_kind,
                 value,
                 status,
-                unknown_reason: (status == EndpointStatus::Unknown).then(|| {
-                    replay_error
-                        .clone()
-                        .unwrap_or_else(|| "constraint-underdetermined".to_owned())
+                unknown_reason: identity_reason.or_else(|| {
+                    (status == EndpointStatus::Unknown).then(|| {
+                        replay_error
+                            .clone()
+                            .unwrap_or_else(|| "constraint-underdetermined".to_owned())
+                    })
                 }),
             });
         }
@@ -802,9 +899,10 @@ impl BoxOwnershipFacts {
         );
         for endpoint in &self.endpoints {
             let kind = match endpoint.final_kind {
-                SlotKind::Ref => "Ref",
-                SlotKind::Raw => "Raw",
-                SlotKind::Owning => "Owning",
+                Some(SlotKind::Ref) => "Ref",
+                Some(SlotKind::Raw) => "Raw",
+                Some(SlotKind::Owning) => "Owning",
+                None => "-",
             };
             let value = match endpoint.value {
                 FactValue::MustOwn => "must-own",
