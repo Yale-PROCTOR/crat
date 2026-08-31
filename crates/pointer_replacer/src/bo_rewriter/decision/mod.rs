@@ -28,6 +28,7 @@ use crate::analyses::borrow_ownership::{
     SlotKind, a5_producer::PlannedC9Mark, crate_slots::CrateSlots, solver::SlotRef,
 };
 
+pub(crate) mod a5_site_proof;
 pub(crate) mod co_conversion;
 pub(crate) mod construction;
 pub(crate) mod emitability;

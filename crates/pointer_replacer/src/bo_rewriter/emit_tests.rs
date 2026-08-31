@@ -4520,6 +4520,7 @@ fn e2_attempt(
             &ctx.subjects,
             &table,
             &ctx.retained_c9_plans,
+            &ctx.a5_site_proofs,
         );
         let receipt = super::seam_tsv_from_table(tcx, &table);
         let emission = emit_files(
@@ -4814,12 +4815,44 @@ fn e2_schema_w1_blocked_rows_retain_candidate_forms_and_peer_pairs() {
 // Item E call-site adaptation wave 3 — RED-first production-path witnesses.
 // ---------------------------------------------------------------------------
 
-const E3_CLEAR_FIELDS: &str = "#![allow(dead_code, unused_unsafe, unused_mut, unused_variables)]\n\
-    #[repr(C)] pub struct Pair { pub left: i32, pub right: i32 }\n\
+const E3_CLEAR_RAW: &str = "#![allow(dead_code, unused_unsafe, unused_mut, unused_variables)]\n\
+    extern \"C\" { fn malloc(size: usize) -> *mut core::ffi::c_void; }\n\
     pub unsafe fn target(a: *mut i32, b: *mut i32) { *a += 1; *b += 1; }\n\
-    pub unsafe fn caller(pair: *mut Pair) {\n\
-        target(&mut (*pair).left, &mut (*pair).right);\n\
+    pub unsafe fn caller() {\n\
+        let left = malloc(8) as *mut i32;\n\
+        let right = malloc(8) as *mut i32;\n\
+        target(left.offset(0), right.offset(0));\n\
     }\n";
+
+const E3_CLEAR_REFS: &str = "#![allow(dead_code, unused_unsafe, unused_mut, unused_variables)]\n\
+    extern \"C\" { fn malloc(size: usize) -> *mut core::ffi::c_void; }\n\
+    pub unsafe fn target(a: *mut i32, b: *mut i32) { *a += 1; *b += 1; }\n\
+    pub unsafe fn caller() {\n\
+        let left = malloc(8) as *mut i32;\n\
+        let right = malloc(8) as *mut i32;\n\
+        target(&mut *left, &mut *right);\n\
+    }\n";
+
+const E3_CLEAR_LICENSED: &str = "#![allow(dead_code, unused_unsafe, unused_mut, unused_variables)]\n\
+    extern \"C\" { fn malloc(size: usize) -> *mut core::ffi::c_void; }\n\
+    pub unsafe fn target(a: *mut i32, a_len: usize, b: *mut i32, b_len: usize) {\n\
+        if a_len != 0 { *a += 1; } if b_len != 0 { *b += 1; }\n\
+    }\n\
+    pub unsafe fn caller() {\n\
+        let left = malloc(8) as *mut i32;\n\
+        let right = malloc(8) as *mut i32;\n\
+        target(left.offset(0), 2, right.offset(0), 2);\n\
+    }\n";
+
+const E3_SCOPED_PAIR: &str = "#![allow(dead_code, unused_unsafe, unused_mut, unused_variables)]\n\
+    extern \"C\" { fn malloc(size: usize) -> *mut core::ffi::c_void; }\n\
+    pub unsafe fn target(a: *mut i32, b: *mut i32) { *a += 1; *b += 1; }\n\
+    pub unsafe fn clear_caller() {\n\
+        let left = malloc(8) as *mut i32;\n\
+        let right = malloc(8) as *mut i32;\n\
+        target(left.offset(0), right.offset(0));\n\
+    }\n\
+    pub unsafe fn overlap_caller(p: *mut i32) { target(p, p); }\n";
 
 const E3_OVERLAP: &str = "#![allow(dead_code, unused_unsafe, unused_mut, unused_variables)]\n\
     pub unsafe fn target(a: *mut i32, b: *mut i32) { *a += 1; *b += 1; }\n\
@@ -4827,7 +4860,10 @@ const E3_OVERLAP: &str = "#![allow(dead_code, unused_unsafe, unused_mut, unused_
 
 fn force_wave3_target_forms(table: &mut super::decision::DecisionTable, slice: bool) {
     for (subject, decision) in &mut table.entries {
-        if subject.label.ends_with("caller::pair") || subject.label.ends_with("caller::p") {
+        if subject.label.ends_with("caller::left")
+            || subject.label.ends_with("caller::right")
+            || subject.label.ends_with("caller::p")
+        {
             *decision = super::decision::Decision::Degraded(super::decision::Degradation {
                 subject: subject.label.clone(),
                 site: "<wave3-injected>".to_owned(),
@@ -4847,11 +4883,44 @@ fn force_wave3_target_forms(table: &mut super::decision::DecisionTable, slice: b
     }
 }
 
+fn force_wave3_target_slices(table: &mut super::decision::DecisionTable) {
+    for (subject, decision) in &mut table.entries {
+        if subject.label.ends_with("target::a") || subject.label.ends_with("target::b") {
+            *decision = super::decision::Decision::Slice {
+                mutable: true,
+                uses: Vec::new(),
+            };
+        }
+        if subject.label.ends_with("caller::left")
+            || subject.label.ends_with("caller::right")
+            || subject.label.ends_with("clear_caller::left")
+            || subject.label.ends_with("clear_caller::right")
+            || subject.label.ends_with("overlap_caller::p")
+        {
+            *decision = super::decision::Decision::Degraded(super::decision::Degradation {
+                subject: subject.label.clone(),
+                site: "<wave3-injected>".to_owned(),
+                reason: super::decision::DegradeReason::CallSiteNotAdapted,
+            });
+        }
+    }
+}
+
 /// Drive an injected form decision through the production proof derivation and
 /// the production seam synthesis. The only test seam is the form injection;
 /// site facts, attestation, lookup, candidate construction, and emission are
 /// the shipping path.
 fn e3_attempt(src: &str, attested: bool, slice: bool) -> E2Attempt {
+    e3_attempt_with(src, attested, &|table| {
+        force_wave3_target_forms(table, slice);
+    })
+}
+
+fn e3_attempt_with(
+    src: &str,
+    attested: bool,
+    inject: &(dyn Fn(&mut super::decision::DecisionTable) + Sync),
+) -> E2Attempt {
     let fixture = Fixture::new(&[("lib.rs", src)]);
     let (emission, receipt) = ::utils::compilation::run_compiler_on_path(&fixture.root(), |tcx| {
         let attestation = attested.then_some(
@@ -4865,14 +4934,23 @@ fn e3_attempt(src: &str, attested: bool, slice: bool) -> E2Attempt {
             )),
         )
         .expect("wave-3 decision table");
-        force_wave3_target_forms(&mut table, slice);
+        assert!(
+            ctx.analysis.origins.is_some(),
+            "the consumer-neutral E2-X1 carrier must retain full OriginSummaries"
+        );
+        assert_eq!(
+            ctx.analysis.a5_mode,
+            crate::analyses::borrow_ownership::a5_overlap::A5Mode::PreciseReplay
+        );
+        assert_eq!(ctx.analysis.attestation, attestation);
+        inject(&mut table);
         table.seams = super::decision::seam::synthesize(
             tcx,
             &ctx.facts,
             &ctx.subjects,
             &table,
             &ctx.retained_c9_plans,
-            &ctx.analysis.a5_site_proofs,
+            &ctx.a5_site_proofs,
         );
         let receipt = super::seam_tsv_from_table(tcx, &table);
         let emission = emit_files(
@@ -4906,7 +4984,7 @@ fn receipt_column(receipt: &str, name: &str) -> usize {
 /// proves disjoint discharges SiteOverlap and reaches the existing slice seam.
 #[test]
 fn e_adapt_w3_w1_proven_disjoint_site_emits_its_slice_adapter() {
-    let attempt = e3_attempt(E3_CLEAR_FIELDS, true, true);
+    let attempt = e3_attempt(E3_CLEAR_RAW, true, true);
     let verdict = receipt_column(&attempt.receipt, "overlap_verdict");
     let guard = receipt_column(&attempt.receipt, "a5_abi_guard");
     let placed = attempt
@@ -4918,11 +4996,13 @@ fn e_adapt_w3_w1_proven_disjoint_site_emits_its_slice_adapter() {
         .collect::<Vec<_>>();
     assert_eq!(placed.len(), 2, "{}", attempt.receipt);
     assert!(placed.iter().all(|row| row[verdict] == "clear"));
-    assert!(placed.iter().all(|row| {
-        row[guard] == "permitted:measurement-frozen-graph-attested"
-    }));
     assert!(
-        e2_root_text(&attempt).contains("core::slice::from_mut"),
+        placed
+            .iter()
+            .all(|row| { row[guard] == "permitted:measurement-frozen-graph-attested" })
+    );
+    assert!(
+        e2_root_text(&attempt).contains("core::slice::from_raw_parts_mut"),
         "{}",
         e2_root_text(&attempt)
     );
@@ -4948,7 +5028,7 @@ fn e_adapt_w3_n1_overlapping_site_stays_closed() {
 /// changed. Clear is evidence for one gate, not an edit command.
 #[test]
 fn e_adapt_w3_n2_clear_template_none_is_untouched() {
-    let attempt = e3_attempt(E3_CLEAR_FIELDS, true, false);
+    let attempt = e3_attempt(E3_CLEAR_REFS, true, false);
     assert!(
         attempt.receipt.lines().any(|line| {
             line.starts_with("overlap-proof\t")
@@ -4958,14 +5038,19 @@ fn e_adapt_w3_n2_clear_template_none_is_untouched() {
         "{}",
         attempt.receipt
     );
-    assert_eq!(e2_root_text(&attempt), E3_CLEAR_FIELDS);
+    assert!(
+        e2_root_text(&attempt).contains("target(&mut *left, &mut *right);"),
+        "the call argument must remain byte-shaped as written:\n{}",
+        e2_root_text(&attempt)
+    );
+    assert!(!e2_root_text(&attempt).contains("core::slice::"));
 }
 
 /// E-ADAPT-W3-N3 — the identical closed-world-dependent site fails closed when
 /// the attestation is absent. Product default remains refusal.
 #[test]
 fn e_adapt_w3_n3_unattested_site_fails_closed_with_typed_reason() {
-    let attempt = e3_attempt(E3_CLEAR_FIELDS, false, true);
+    let attempt = e3_attempt(E3_CLEAR_RAW, false, true);
     assert!(
         attempt.receipt.lines().any(|line| {
             line.starts_with("blocked\t")
@@ -4976,6 +5061,83 @@ fn e_adapt_w3_n3_unattested_site_fails_closed_with_typed_reason() {
         attempt.receipt
     );
     assert!(!e2_root_text(&attempt).contains("core::slice::from_mut"));
+}
+
+/// E-ADAPT-W3-N6 — evidence-backed extents remain preferred after the overlap
+/// gate opens. Both raw slice arguments have their own following count.
+#[test]
+fn e_adapt_w3_n6_clear_site_prefers_licensed_extent() {
+    let attempt = e3_attempt_with(E3_CLEAR_LICENSED, true, &force_wave3_target_slices);
+    let len_arm = receipt_column(&attempt.receipt, "len_arm");
+    let placed = attempt
+        .receipt
+        .lines()
+        .skip(1)
+        .map(|line| line.split('\t').collect::<Vec<_>>())
+        .filter(|row| row.first() == Some(&"placed"))
+        .collect::<Vec<_>>();
+    assert_eq!(placed.len(), 2, "{}", attempt.receipt);
+    assert!(placed.iter().all(|row| row[len_arm] == "len-following"));
+    assert!(!e2_root_text(&attempt).contains("FALLBACK_SLICE_EXTENT"));
+}
+
+/// E-ADAPT-W3-N7 — absent sound extent evidence uses only the named fallback,
+/// and the receipt carries the fabricated arm.
+#[test]
+fn e_adapt_w3_n7_clear_site_receipts_named_fallback_extent() {
+    let attempt = e3_attempt(E3_CLEAR_RAW, true, true);
+    let len_arm = receipt_column(&attempt.receipt, "len_arm");
+    let placed = attempt
+        .receipt
+        .lines()
+        .skip(1)
+        .map(|line| line.split('\t').collect::<Vec<_>>())
+        .filter(|row| row.first() == Some(&"placed"))
+        .collect::<Vec<_>>();
+    assert_eq!(placed.len(), 2, "{}", attempt.receipt);
+    assert!(placed.iter().all(|row| row[len_arm] == "len-fabricated"));
+    assert_eq!(
+        e2_root_text(&attempt)
+            .matches("const FALLBACK_SLICE_EXTENT: usize = 1024;")
+            .count(),
+        1
+    );
+}
+
+/// E-ADAPT-W3-N8 — two calls to the same target receive independent site
+/// verdicts: the clear site opens and the overlapping neighbor stays closed.
+#[test]
+fn e_adapt_w3_n8_site_key_does_not_license_an_overlapping_neighbor() {
+    let attempt = e3_attempt_with(E3_SCOPED_PAIR, true, &force_wave3_target_slices);
+    let proof_rows = attempt
+        .receipt
+        .lines()
+        .filter(|line| line.starts_with("overlap-proof\t"))
+        .collect::<Vec<_>>();
+    assert_eq!(proof_rows.len(), 4, "{}", attempt.receipt);
+    assert_eq!(
+        proof_rows
+            .iter()
+            .filter(|row| row.contains("\tclear\tall-peers-clear\t"))
+            .count(),
+        2
+    );
+    assert_eq!(
+        proof_rows
+            .iter()
+            .filter(|row| row.contains("\toverlapping\tat-least-one-peer-overlapping\t"))
+            .count(),
+        2
+    );
+    assert!(e2_root_text(&attempt).contains("target(p, p);"));
+    assert_eq!(
+        e2_root_text(&attempt)
+            .matches("core::slice::from_raw_parts_mut")
+            .count(),
+        2,
+        "only the two clear-call arguments may adapt:\n{}",
+        e2_root_text(&attempt)
+    );
 }
 
 /// **A BLOCKED seam row names the CALLEE in `owner_fn`, and the caller in its

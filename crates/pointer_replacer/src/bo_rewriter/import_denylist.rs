@@ -210,6 +210,54 @@ fn denylist_matches_a_synthetic_breach() {
     );
 }
 
+const WAVE3_DOC_INPUTS: &[&str] = &[
+    "adapter-overlap-153.tsv",
+    "2026-08-30-item-e-adapter-overlap-audit",
+    "0c6be335bd5412700e40497fd64e57525e0018d02be7bc229cdd386b7cd627a5",
+    "88558cfb668aae13c4c9362eb4389927fa493c8306ee59a24c9f983208e457c8",
+];
+
+fn wave3_docs_input_offense(line: &str) -> Option<String> {
+    WAVE3_DOC_INPUTS
+        .iter()
+        .find(|needle| line.contains(**needle))
+        .map(|needle| format!("production names wave-3 control input {needle:?}"))
+        .or_else(|| {
+            (line.contains("docs/agents/") && (line.contains("read") || line.contains("open")))
+                .then(|| "production appears to read a docs artifact path".to_owned())
+        })
+}
+
+/// Addendum 96: the TSV is an external differential oracle, never a production
+/// input or an embedded 41-key allowlist.
+#[test]
+fn wave3_production_never_reads_or_embeds_the_docs_control() {
+    let root = module_root();
+    let breaches = scan_root(
+        root,
+        &|file| is_test_only_file(file),
+        &wave3_docs_input_offense,
+    );
+    assert!(
+        breaches.is_empty(),
+        "wave-3 production must derive site proofs from frozen facts:\n{}",
+        breaches.join("\n")
+    );
+}
+
+#[test]
+fn wave3_docs_input_ratchet_matches_a_synthetic_breach() {
+    assert!(
+        wave3_docs_input_offense("std::fs::read_to_string(\"adapter-overlap-153.tsv\")").is_some()
+    );
+    assert!(
+        wave3_docs_input_offense(
+            "let keys = \"88558cfb668aae13c4c9362eb4389927fa493c8306ee59a24c9f983208e457c8\";"
+        )
+        .is_some()
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Per-phase rules (M1 architecture directive)
 // ---------------------------------------------------------------------------

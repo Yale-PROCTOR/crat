@@ -62,6 +62,7 @@ use crate::{
         export::with_bo_export,
         model_cache,
         mutability_facts::MutFacts,
+        origin_summary::OriginSummaries,
         origins::compute_origins,
         solver::SlotRef,
     },
@@ -2978,6 +2979,18 @@ fn decide_table_perturbed<'tcx>(
     decide_table_perturbed_config(tcx, perturb, None)
 }
 
+/// Read-only analysis inputs carried across the solve/cache boundary without
+/// shaping them for a particular rewriter consumer.
+///
+/// A5 site proofs are the first reader. E2-FN is ruled to reuse this same
+/// carrier: in particular, the complete `OriginSummaries` object remains
+/// intact rather than being projected into an A5-specific export.
+struct DecisionAnalysisCarrier {
+    origins: Option<OriginSummaries>,
+    a5_mode: A5Mode,
+    attestation: Option<WholeProgramAttestation>,
+}
+
 fn cached_rewriter_plans(
     program: &RustProgram<'_>,
     slots: &CrateSlots,
@@ -2985,12 +2998,12 @@ fn cached_rewriter_plans(
     a5_mode: A5Mode,
     attestation: Option<WholeProgramAttestation>,
     cached: &model_cache::CachedModel,
-) -> Result<Vec<PlannedC9Mark>, String> {
+) -> Result<(Vec<PlannedC9Mark>, Option<OriginSummaries>), String> {
     match a5_mode {
-        A5Mode::Baseline => Ok(Vec::new()),
+        A5Mode::Baseline => Ok((Vec::new(), None)),
         A5Mode::PreciseReplay => {
             let origins = compute_origins(program);
-            cached_precise_rewriter_payload(
+            let plans = cached_precise_rewriter_payload(
                 program,
                 slots,
                 &origins,
@@ -2999,7 +3012,8 @@ fn cached_rewriter_plans(
                 &cached.model,
                 attestation,
                 &cached.a5_receipt,
-            )
+            )?;
+            Ok((plans, Some(origins)))
         }
         A5Mode::CoarseConstraint => {
             Err("the pricing-only coarse A5 mode is not cacheable".to_owned())
@@ -3036,7 +3050,7 @@ fn decide_table_perturbed_config<'tcx>(
     // makes a consumer's cost its own work, not another whole solve.
     if cacheable
         && let Some(cached) = model_cache::memo_get(&fp)
-        && let Ok(retained_c9_plans) =
+        && let Ok((retained_c9_plans, origins)) =
             cached_rewriter_plans(&program, &slots, &mut_facts, a5_mode, attestation, &cached)
     {
         return finish_decide(
@@ -3047,6 +3061,11 @@ fn decide_table_perturbed_config<'tcx>(
             cached.model,
             retained_c9_plans,
             cached.a5_receipt,
+            DecisionAnalysisCarrier {
+                origins,
+                a5_mode,
+                attestation,
+            },
             perturb,
         );
     }
@@ -3054,7 +3073,7 @@ fn decide_table_perturbed_config<'tcx>(
     // Tier 2: the on-disk cache.
     if cacheable
         && let Some(cached) = model_cache::load(tcx, &program, &slots, a5_mode, attestation)
-        && let Ok(retained_c9_plans) =
+        && let Ok((retained_c9_plans, origins)) =
             cached_rewriter_plans(&program, &slots, &mut_facts, a5_mode, attestation, &cached)
     {
         let model_sha256 = model_cache::model_bytes_sha256(tcx, &slots, &cached.model)
@@ -3077,6 +3096,11 @@ fn decide_table_perturbed_config<'tcx>(
             cached.model,
             retained_c9_plans,
             cached.a5_receipt,
+            DecisionAnalysisCarrier {
+                origins,
+                a5_mode,
+                attestation,
+            },
             perturb,
         );
     }
@@ -3126,6 +3150,11 @@ fn decide_table_perturbed_config<'tcx>(
         verified.model,
         verified.retained_c9_plans,
         verified.receipt,
+        DecisionAnalysisCarrier {
+            origins: Some(origins),
+            a5_mode,
+            attestation,
+        },
         perturb,
     )
 }
@@ -3144,6 +3173,7 @@ fn finish_decide<'tcx>(
     model: rustc_hash::FxHashMap<SlotRef, SlotKind>,
     mut retained_c9_plans: Vec<PlannedC9Mark>,
     a5_receipt: String,
+    analysis: DecisionAnalysisCarrier,
     perturb: impl FnOnce(&mut Vec<decision::Subject>),
 ) -> Result<(decision::DecisionTable, DecideCtx), String> {
     let mut subjects = collect_subjects(tcx, &program, &mut_facts);
@@ -3338,7 +3368,21 @@ fn finish_decide<'tcx>(
     // subject, including the nesting pass above: a seam is computed from the
     // forms both ends actually settle on, so a subject withdrawn later would
     // leave glue bridging to a form that no longer exists.
-    table.seams = decision::seam::synthesize(tcx, &facts, &subjects, &table, &retained_c9_plans);
+    let a5_site_proofs = decision::a5_site_proof::A5SeamProofIndex::derive(
+        &program,
+        &slots,
+        analysis.origins.as_ref(),
+        analysis.a5_mode,
+        analysis.attestation,
+    );
+    table.seams = decision::seam::synthesize(
+        tcx,
+        &facts,
+        &subjects,
+        &table,
+        &retained_c9_plans,
+        &a5_site_proofs,
+    );
     retained_c9_plans.retain(|mark| {
         let params = mark.key.pair.params();
         [params.first(), params.second()].into_iter().all(|param| {
@@ -3385,6 +3429,8 @@ fn finish_decide<'tcx>(
             hypothetical,
             retained_c9_plans,
             a5_receipt,
+            analysis,
+            a5_site_proofs,
         },
     ))
 }
@@ -3421,6 +3467,8 @@ pub(crate) struct DecideCtx {
     hypothetical: decision::DecisionTable,
     retained_c9_plans: Vec<PlannedC9Mark>,
     a5_receipt: String,
+    analysis: DecisionAnalysisCarrier,
+    a5_site_proofs: decision::a5_site_proof::A5SeamProofIndex,
 }
 
 impl DecideCtx {
@@ -4463,7 +4511,7 @@ pub(crate) fn seam_tsv(tcx: TyCtxt<'_>) -> Result<String, String> {
 fn seam_tsv_from_table(tcx: TyCtxt<'_>, table: &decision::DecisionTable) -> String {
     let sm = tcx.sess.source_map();
     let mut out = String::from(
-        "kind\towner_fn\tfamily_or_reason\tsite\tlen_arm\tglue_shape\tcaller\tparam_index\ttemplate\tnull_arm\textent_arm\tadapter_key\tsource_shape\tcontext\tdestination\texpected_form\tfound_form\tcandidate_template\tpeer_pairs\troot_identity\tblind\n",
+        "kind\towner_fn\tfamily_or_reason\tsite\tlen_arm\tglue_shape\tcaller\tparam_index\ttemplate\tnull_arm\textent_arm\tadapter_key\tsource_shape\tcontext\tdestination\texpected_form\tfound_form\tcandidate_template\tpeer_pairs\troot_identity\tblind\toverlap_verdict\toverlap_reason\tresolved_call_location\ta5_peer_proofs\ta5_world\ta5_abi_guard\n",
     );
     for edit in &table.seams.edits {
         let family = match edit.family {
@@ -4497,7 +4545,7 @@ fn seam_tsv_from_table(tcx: TyCtxt<'_>, table: &decision::DecisionTable) -> Stri
             edit.caller_fn, edit.owner_fn, edit.param_index, site
         );
         out.push_str(&format!(
-            "placed\t{}\t{}\t{}\t{arm}\t{shape}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\tcall-argument\tparam:{}\t{}\t{}\t{}\t-\t{}\t{}\n",
+            "placed\t{}\t{}\t{}\t{arm}\t{shape}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\tcall-argument\tparam:{}\t{}\t{}\t{}\t-\t{}\t{}",
             edit.owner_fn,
             family,
             site,
@@ -4515,6 +4563,7 @@ fn seam_tsv_from_table(tcx: TyCtxt<'_>, table: &decision::DecisionTable) -> Stri
             edit.root_identity,
             u8::from(edit.blind),
         ));
+        push_overlap_columns(&mut out, edit.overlap.as_ref());
     }
     // **`owner_fn` is the REVERT KEY on every row kind** (2026-08-12). It was
     // the callee on `placed` rows and the CALLER on these, so the two kinds
@@ -4539,7 +4588,7 @@ fn seam_tsv_from_table(tcx: TyCtxt<'_>, table: &decision::DecisionTable) -> Stri
                 .join(";")
         };
         out.push_str(&format!(
-            "blocked\t{}\t{}\t{}\t-\t-\t{}\t{}\t{}\t{}\t{}\t{}\t{}\tcall-argument\tparam:{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+            "blocked\t{}\t{}\t{}\t-\t-\t{}\t{}\t{}\t{}\t{}\t{}\t{}\tcall-argument\tparam:{}\t{}\t{}\t{}\t{}\t{}\t{}",
             callee,
             blocked.block.key(),
             site,
@@ -4558,6 +4607,7 @@ fn seam_tsv_from_table(tcx: TyCtxt<'_>, table: &decision::DecisionTable) -> Stri
             blocked.root_identity,
             u8::from(blocked.blind),
         ));
+        push_overlap_columns(&mut out, blocked.overlap.as_ref());
     }
     for edit in &table.seams.body_edits {
         let family = match edit.family {
@@ -4567,7 +4617,7 @@ fn seam_tsv_from_table(tcx: TyCtxt<'_>, table: &decision::DecisionTable) -> Stri
         let site = sm.span_to_diagnostic_string(edit.span);
         let adapter_key = format!("{}#{}@{}", edit.owner_fn, edit.context.key(), site);
         out.push_str(&format!(
-            "body-placed\t{}\t{}\t{}\t-\t{}\t{}\t-\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t-\t{}\t{}\n",
+            "body-placed\t{}\t{}\t{}\t-\t{}\t{}\t-\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t-\t{}\t{}",
             edit.owner_fn,
             family,
             site,
@@ -4586,12 +4636,13 @@ fn seam_tsv_from_table(tcx: TyCtxt<'_>, table: &decision::DecisionTable) -> Stri
             edit.root_identity,
             u8::from(edit.blind),
         ));
+        push_overlap_columns(&mut out, None);
     }
     for blocked in &table.seams.body_blocked {
         let site = sm.span_to_diagnostic_string(blocked.span);
         let adapter_key = format!("{}#{}@{}", blocked.owner_fn, blocked.context.key(), site);
         out.push_str(&format!(
-            "body-blocked\t{}\t{}\t{}\t-\t-\t{}\t-\t{}\t-\t-\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t-\t{}\t{}\n",
+            "body-blocked\t{}\t{}\t{}\t-\t-\t{}\t-\t{}\t-\t-\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t-\t{}\t{}",
             blocked.owner_fn,
             blocked.block.key(),
             site,
@@ -4607,21 +4658,55 @@ fn seam_tsv_from_table(tcx: TyCtxt<'_>, table: &decision::DecisionTable) -> Stri
             blocked.root_identity,
             u8::from(blocked.blind),
         ));
+        push_overlap_columns(&mut out, None);
     }
     // Item 4a: companion-length coverage, one row per LENGTH-GATED POSITION.
     for (callee, index, evidence) in &table.seams.length_evidence {
         out.push_str(&format!(
-            "lengated\t{callee}\t{}\t#{index}\t-\t-\t-\t{index}\t-\t-\t-\t-\t-\t-\t-\t-\t-\t-\t-\t-\t-\n",
+            "lengated\t{callee}\t{}\t#{index}\t-\t-\t-\t{index}\t-\t-\t-\t-\t-\t-\t-\t-\t-\t-\t-\t-\t-",
             evidence.key()
         ));
+        push_overlap_columns(&mut out, None);
     }
     // Rule 1 (2026-08-11): a pair that fired with no census row is REPORTED.
     // The census is a prioritization overlay and has already been shown
     // incomplete twice; a silent adaptation would hide the third case.
     for (found, expected) in &table.seams.uncensused {
         out.push_str(&format!(
-            "uncensused\t-\t{found:?} -> {expected:?}\t-\t-\t-\t-\t-\t-\t-\t-\t-\t-\t-\t-\t-\t-\t-\t-\t-\n"
+            "uncensused\t-\t{found:?} -> {expected:?}\t-\t-\t-\t-\t-\t-\t-\t-\t-\t-\t-\t-\t-\t-\t-\t-\t-"
         ));
+        push_overlap_columns(&mut out, None);
+    }
+    for proof in &table.seams.overlap_proofs {
+        let caller = tcx.def_path_str(proof.caller.to_def_id());
+        let callee = tcx.def_path_str(proof.callee.to_def_id());
+        let site = sm.span_to_diagnostic_string(proof.span);
+        let adapter_key = format!("{caller}=>{callee}#{}@{site}", proof.index);
+        out.push_str(&format!(
+            "overlap-proof\t{callee}\t{}\t{site}\t-\t-\t{caller}\t{}\t{}\t-\t-\t{adapter_key}\t-\tcall-argument\tparam:{}\t-\t-\t{}\t-\t-\t-",
+            proof.reason,
+            proof.index,
+            proof.candidate_template,
+            proof.index,
+            proof.candidate_template,
+        ));
+        push_overlap_columns(&mut out, Some(proof));
     }
     out
+}
+
+fn push_overlap_columns(output: &mut String, proof: Option<&decision::seam::A5PositionProof>) {
+    if let Some(proof) = proof {
+        output.push_str(&format!(
+            "\t{}\t{}\t{}\t{}\t{}\t{}\n",
+            proof.verdict.key(),
+            proof.reason,
+            proof.locations,
+            proof.peer_receipts,
+            proof.world,
+            proof.guard,
+        ));
+    } else {
+        output.push_str("\t-\t-\t-\t-\t-\t-\n");
+    }
 }

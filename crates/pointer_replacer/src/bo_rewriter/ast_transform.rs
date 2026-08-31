@@ -5052,6 +5052,7 @@ mod arm2_witnesses {
                 found: super::super::decision::seam::Form::Raw,
                 root_identity: "f::p".to_owned(),
                 blind: false,
+                overlap: None,
             };
             assert!(
                 SeamTarget::of(&edit(super::super::decision::seam::SeamFamily::Reborrow)).reborrow,

@@ -33,7 +33,11 @@
 //! is proven. **65.7 % of the measured market sits behind that gate**, which is
 //! why it is a first-class outcome here rather than a `None`.
 
+use std::collections::BTreeSet;
+
 use rustc_span::Span;
+
+use super::a5_site_proof::{A5PeerProof, A5SeamProofIndex, A5SiteProofVerdict};
 
 /// The pointer-ish form a value has at an argument position.
 ///
@@ -321,6 +325,9 @@ pub(crate) struct SeamEdit {
     pub found: Form,
     pub root_identity: String,
     pub blind: bool,
+    /// The attested site proof that discharged the conservative overlap gate.
+    /// `None` means this position never needed that gate.
+    pub overlap: Option<A5PositionProof>,
 }
 
 /// One placed initializer/assignment adapter. It deliberately carries the
@@ -350,6 +357,95 @@ pub(crate) struct PeerConflict {
     pub same_root: bool,
     pub left_blind: bool,
     pub right_blind: bool,
+    pub proof: A5PeerProof,
+}
+
+/// One position-level aggregation of all peer proofs consulted by the seam.
+/// Carried into both placed and blocked receipts; a clear no-op candidate also
+/// remains in `SeamPlan::overlap_proofs` so it cannot vanish from the control.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct A5PositionProof {
+    pub caller: LocalDefId,
+    pub callee: LocalDefId,
+    pub index: usize,
+    pub span: Span,
+    pub candidate_template: String,
+    pub verdict: A5SiteProofVerdict,
+    pub reason: String,
+    pub locations: String,
+    pub peer_receipts: String,
+    pub world: &'static str,
+    pub guard: &'static str,
+}
+
+impl A5PositionProof {
+    fn from_conflicts(
+        caller: LocalDefId,
+        callee: LocalDefId,
+        index: usize,
+        span: Span,
+        candidate_template: String,
+        conflicts: &[PeerConflict],
+        proofs: &A5SeamProofIndex,
+    ) -> Self {
+        debug_assert!(!conflicts.is_empty());
+        let verdict = if conflicts
+            .iter()
+            .any(|conflict| conflict.proof.verdict == A5SiteProofVerdict::Overlapping)
+        {
+            A5SiteProofVerdict::Overlapping
+        } else if conflicts
+            .iter()
+            .any(|conflict| conflict.proof.verdict == A5SiteProofVerdict::Undeterminable)
+        {
+            A5SiteProofVerdict::Undeterminable
+        } else {
+            A5SiteProofVerdict::Clear
+        };
+        let reason = match verdict {
+            A5SiteProofVerdict::Clear => "all-peers-clear".to_owned(),
+            A5SiteProofVerdict::Overlapping => "at-least-one-peer-overlapping".to_owned(),
+            A5SiteProofVerdict::Undeterminable => conflicts
+                .iter()
+                .filter(|conflict| conflict.proof.verdict == A5SiteProofVerdict::Undeterminable)
+                .map(|conflict| conflict.proof.reason)
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect::<Vec<_>>()
+                .join(";"),
+        };
+        let locations = conflicts
+            .iter()
+            .map(|conflict| conflict.proof.location_key())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>()
+            .join(";");
+        let peer_receipts = conflicts
+            .iter()
+            .map(|conflict| conflict.proof.receipt(conflict.left, conflict.right))
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>()
+            .join(";");
+        Self {
+            caller,
+            callee,
+            index,
+            span,
+            candidate_template,
+            verdict,
+            reason,
+            locations,
+            peer_receipts,
+            world: proofs.world(),
+            guard: proofs.guard(),
+        }
+    }
+
+    fn clears_site_overlap(&self) -> bool {
+        self.verdict == A5SiteProofVerdict::Clear
+    }
 }
 
 impl PeerConflict {
@@ -383,6 +479,7 @@ pub(crate) struct BlockedSeam {
     pub root_identity: String,
     pub blind: bool,
     pub peers: Vec<PeerConflict>,
+    pub overlap: Option<A5PositionProof>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2006,6 +2103,9 @@ pub(crate) struct SeamPlan {
     /// Two names rather than one, because they are two different functions and
     /// collapsing them is what made the question unanswerable.
     pub blocked: Vec<BlockedSeam>,
+    /// Every syntactic site-overlap position, including clear positions whose
+    /// candidate is `none` and therefore has no placed/blocked edit row.
+    pub overlap_proofs: Vec<A5PositionProof>,
     /// **Ruling item 4a — companion-length coverage**, one row per
     /// length-gated position: `(callee path, pointer param index, evidence)`.
     ///
@@ -2090,6 +2190,7 @@ fn blocked_call(
         root_identity: "-".to_owned(),
         blind: false,
         peers: Vec::new(),
+        overlap: None,
     }
 }
 
@@ -2105,6 +2206,7 @@ pub(crate) fn synthesize(
     subjects: &[Subject],
     table: &DecisionTable,
     c9_marks: &[crate::analyses::borrow_ownership::a5_producer::PlannedC9Mark],
+    a5_site_proofs: &A5SeamProofIndex,
 ) -> SeamPlan {
     let sm = tcx.sess.source_map();
     let mut plan = SeamPlan::default();
@@ -2394,12 +2496,21 @@ pub(crate) fn synthesize(
                         } else {
                             (positions[j].blind, positions[i].blind)
                         };
+                        let proof = a5_site_proofs.lookup(
+                            site.caller.local_def_index.as_u32(),
+                            callee.local_def_index.as_u32(),
+                            positions[i].index,
+                            positions[j].index,
+                            positions[i].span,
+                            positions[j].span,
+                        );
                         let conflict = PeerConflict {
                             left: positions[i].index.min(positions[j].index),
                             right: positions[i].index.max(positions[j].index),
                             same_root,
                             left_blind,
                             right_blind,
+                            proof,
                         };
                         conflicts[i].push(conflict.clone());
                         conflicts[j].push(conflict);
@@ -2409,26 +2520,43 @@ pub(crate) fn synthesize(
 
             // ---- pass 3: emit ----
             for (idx, pos) in positions.iter().enumerate() {
-                if !conflicts[idx].is_empty() {
-                    let (candidate_template, null_arm, extent_arm) = match &candidates[idx] {
-                        Ok(Some(candidate)) => (
-                            candidate.spec.template_key().to_owned(),
-                            match candidate.spec.null_arm_key() {
-                                "-" => "none".to_owned(),
-                                value => value.to_owned(),
-                            },
-                            match candidate.spec.extent_arm_key() {
-                                "-" => "none".to_owned(),
-                                value => value.to_owned(),
-                            },
-                        ),
-                        Ok(None) => ("none".to_owned(), "none".to_owned(), "none".to_owned()),
-                        Err(block) => (
-                            format!("error:{}", block.key()),
-                            "unavailable".to_owned(),
-                            "unavailable".to_owned(),
-                        ),
-                    };
+                let (candidate_template, null_arm, extent_arm) = match &candidates[idx] {
+                    Ok(Some(candidate)) => (
+                        candidate.spec.template_key().to_owned(),
+                        match candidate.spec.null_arm_key() {
+                            "-" => "none".to_owned(),
+                            value => value.to_owned(),
+                        },
+                        match candidate.spec.extent_arm_key() {
+                            "-" => "none".to_owned(),
+                            value => value.to_owned(),
+                        },
+                    ),
+                    Ok(None) => ("none".to_owned(), "none".to_owned(), "none".to_owned()),
+                    Err(block) => (
+                        format!("error:{}", block.key()),
+                        "unavailable".to_owned(),
+                        "unavailable".to_owned(),
+                    ),
+                };
+                let overlap = (!conflicts[idx].is_empty()).then(|| {
+                    A5PositionProof::from_conflicts(
+                        site.caller,
+                        *callee,
+                        pos.index,
+                        pos.span,
+                        candidate_template.clone(),
+                        &conflicts[idx],
+                        a5_site_proofs,
+                    )
+                });
+                if let Some(proof) = &overlap {
+                    plan.overlap_proofs.push(proof.clone());
+                }
+                if overlap
+                    .as_ref()
+                    .is_some_and(|proof| !proof.clears_site_overlap())
+                {
                     plan.blocked.push(BlockedSeam {
                         caller: site.caller,
                         callee: *callee,
@@ -2438,12 +2566,13 @@ pub(crate) fn synthesize(
                         expected: Some(pos.expected),
                         found: Some(pos.found),
                         source_shape: pos.source_shape,
-                        candidate_template,
-                        null_arm,
-                        extent_arm,
+                        candidate_template: candidate_template.clone(),
+                        null_arm: null_arm.clone(),
+                        extent_arm: extent_arm.clone(),
                         root_identity: root_label(&labels, site.caller, pos.root),
                         blind: pos.blind,
                         peers: conflicts[idx].clone(),
+                        overlap,
                     });
                     continue;
                 }
@@ -2482,6 +2611,7 @@ pub(crate) fn synthesize(
                             found: pos.found,
                             root_identity: root_label(&labels, site.caller, pos.root),
                             blind: pos.blind,
+                            overlap,
                         });
                     }
                     Err(block) => {
@@ -2500,6 +2630,7 @@ pub(crate) fn synthesize(
                             root_identity: root_label(&labels, site.caller, pos.root),
                             blind: pos.blind,
                             peers: Vec::new(),
+                            overlap,
                         });
                     }
                 }
