@@ -29,6 +29,7 @@ use crate::analyses::borrow_ownership::{
 };
 
 pub(crate) mod a5_site_proof;
+pub(crate) mod box_facts;
 pub(crate) mod co_conversion;
 pub(crate) mod construction;
 pub(crate) mod emitability;
