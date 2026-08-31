@@ -5380,6 +5380,35 @@ fn e3_attempt_with(
     }
 }
 
+/// E2-X1 RED — the consumer-neutral carrier already reaches `finish_decide`,
+/// but E2-FN has no consumer yet. The lifetime producer must receive the intact
+/// summary object rather than an A5-shaped projection of it.
+#[test]
+fn e2_x1_carrier_reaches_the_lifetime_producer_intact() {
+    let fixture = Fixture::new(&[(
+        "lib.rs",
+        "#![allow(dead_code, unused_unsafe)]\n\
+         pub unsafe fn id(p: *mut i32) -> *mut i32 { p }\n",
+    )]);
+    let receipt = ::utils::compilation::run_compiler_on_path(&fixture.root(), |tcx| {
+        let (_, ctx) = super::decide_table_with_ctx_config(
+            tcx,
+            Some((
+                crate::analyses::borrow_ownership::a5_overlap::A5Mode::PreciseReplay,
+                Some(
+                    crate::analyses::borrow_ownership::a5_overlap::WholeProgramAttestation::FrozenBenchmarkGraph,
+                ),
+            )),
+        )
+        .expect("E2-X1 decision table");
+        super::decision::lifetime::carrier_receipt(ctx.analysis.origins.as_ref())
+    })
+    .expect("E2-X1 fixture compiles before rewriting");
+
+    assert!(receipt.summary_count > 0, "{receipt:?}");
+    assert!(receipt.native_flows, "{receipt:?}");
+}
+
 fn receipt_column(receipt: &str, name: &str) -> usize {
     receipt
         .lines()
