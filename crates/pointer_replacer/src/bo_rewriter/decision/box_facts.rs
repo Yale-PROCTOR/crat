@@ -455,6 +455,158 @@ impl BoxMovePresentations {
     }
 }
 
+/// The third sealed presentation domain. These rows project a ForeignC Source
+/// call's compiler temporary onto the source binding whose construction is
+/// being planned. They are deliberately not accepted by endpoint naming or
+/// semantic move-routing APIs.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ConstructionBridgeHop {
+    source: Local,
+    destination: Local,
+    source_var: Var,
+    destination_var: Var,
+    location: LocationKey,
+    transparent: bool,
+    destination_single_def: bool,
+    block_single_predecessor: bool,
+}
+
+#[derive(Clone, Debug, Default)]
+struct ConstructionBridgeTemps(Vec<ConstructionBridgeHop>);
+
+impl ConstructionBridgeTemps {
+    fn from_hops(hops: impl IntoIterator<Item = ConstructionBridgeHop>) -> Self {
+        Self(hops.into_iter().collect())
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ConstructionBridgePresentation {
+    source: Local,
+    subject: Local,
+    hops: Vec<ConstructionBridgeHop>,
+}
+
+impl ConstructionBridgePresentation {
+    fn receipt(&self, endpoint: &EndpointFact, subject_slot: SlotRef) -> String {
+        let hops = self
+            .hops
+            .iter()
+            .map(|hop| {
+                format!(
+                    "{}:{}:{}>{}:{}>{}",
+                    hop.location.block,
+                    hop.location.statement,
+                    hop.source.as_u32(),
+                    hop.destination.as_u32(),
+                    hop.source_var.as_u32(),
+                    hop.destination_var.as_u32(),
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        format!(
+            "box-construction-bridge endpoint={}:{}:{}:{}:{}:{} subject_local={} subject_slot={} hops={}",
+            endpoint.function_path,
+            endpoint.location.block,
+            endpoint.location.statement,
+            endpoint.callee,
+            endpoint.var.as_u32(),
+            endpoint.slot,
+            self.subject.as_u32(),
+            slot_label(subject_slot),
+            if hops.is_empty() { "direct" } else { &hops },
+        )
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ConstructionBridgeFailure {
+    MissingVersionSite,
+    MultipleDefinitions,
+    BranchOrJoinFed,
+    NonTransparentRvalue,
+    ProjectedPlace,
+    CrossFunctionHop,
+    MultipleTerminals,
+    DifferentSubject,
+}
+
+impl ConstructionBridgeFailure {
+    fn key(self) -> &'static str {
+        match self {
+            Self::MissingVersionSite => "missing-version-site",
+            Self::MultipleDefinitions => "multiple-definitions",
+            Self::BranchOrJoinFed => "branch-or-join-fed",
+            Self::NonTransparentRvalue => "nontransparent-rvalue",
+            Self::ProjectedPlace => "projected-place",
+            Self::CrossFunctionHop => "cross-function-hop",
+            Self::MultipleTerminals => "multiple-terminals",
+            Self::DifferentSubject => "different-subject",
+        }
+    }
+}
+
+fn resolve_construction_bridge(
+    source: Local,
+    source_var: Var,
+    subject: Local,
+    domain: &ConstructionBridgeTemps,
+) -> Result<ConstructionBridgePresentation, ConstructionBridgeFailure> {
+    if source == subject {
+        return Ok(ConstructionBridgePresentation {
+            source,
+            subject,
+            hops: Vec::new(),
+        });
+    }
+
+    let mut current_local = source;
+    let mut current_var = source_var;
+    let mut seen = FxHashSet::default();
+    let mut path = Vec::new();
+    loop {
+        if !seen.insert((current_local, current_var)) {
+            return Err(ConstructionBridgeFailure::MultipleTerminals);
+        }
+        let candidates = domain
+            .0
+            .iter()
+            .filter(|hop| hop.source == current_local && hop.source_var == current_var)
+            .collect::<Vec<_>>();
+        let [hop] = candidates.as_slice() else {
+            return Err(if candidates.is_empty() {
+                if path.is_empty() {
+                    ConstructionBridgeFailure::MissingVersionSite
+                } else {
+                    ConstructionBridgeFailure::DifferentSubject
+                }
+            } else {
+                ConstructionBridgeFailure::MultipleTerminals
+            });
+        };
+        if !hop.destination_single_def {
+            return Err(ConstructionBridgeFailure::MultipleDefinitions);
+        }
+        if !hop.block_single_predecessor {
+            return Err(ConstructionBridgeFailure::BranchOrJoinFed);
+        }
+        if !hop.transparent {
+            return Err(ConstructionBridgeFailure::NonTransparentRvalue);
+        }
+        path.push((*hop).clone());
+        if hop.destination == subject {
+            return Ok(ConstructionBridgePresentation {
+                source,
+                subject,
+                hops: path,
+            });
+        }
+        current_local = hop.destination;
+        current_var = hop.destination_var;
+    }
+}
+
 fn resolve_sink_naming_carrier(
     operand: Local,
     naming: &SinkNamingTemps,
@@ -541,6 +693,7 @@ struct MinimalWalk<'a, 'tcx> {
     /// Eliminable argument-carrier projections. They extend reachability to
     /// the r3 endpoint name but never create a second ownership branch.
     transparent_move_edges: Vec<(SlotRef, SlotRef)>,
+    construction_bridge_temps: ConstructionBridgeTemps,
     field_held: FxHashSet<SlotRef>,
     boundary_held: FxHashSet<SlotRef>,
 }
@@ -562,6 +715,7 @@ impl<'a, 'tcx> MinimalWalk<'a, 'tcx> {
             var_slots: FxHashMap::default(),
             move_edges: Vec::new(),
             transparent_move_edges: Vec::new(),
+            construction_bridge_temps: ConstructionBridgeTemps::default(),
             field_held: FxHashSet::default(),
             boundary_held: FxHashSet::default(),
         }
@@ -752,6 +906,34 @@ impl<'a, 'tcx> MinimalWalk<'a, 'tcx> {
                 if let (Some(operand), Some((rhs_use, rhs_def, rhs_slot))) =
                     (rhs_operand, rhs_consume)
                 {
+                    let pointer_pair = matches!(
+                        body.local_decls[rhs_local.expect("RHS local")].ty.kind(),
+                        rustc_middle::ty::TyKind::RawPtr(..)
+                    ) && matches!(
+                        body.local_decls[lhs_local].ty.kind(),
+                        rustc_middle::ty::TyKind::RawPtr(..)
+                    );
+                    let transparent = match rhs {
+                        Rvalue::Use(_) => pointer_pair,
+                        Rvalue::Cast(_, _, _) => pointer_pair,
+                        _ => false,
+                    };
+                    self.construction_bridge_temps
+                        .0
+                        .push(ConstructionBridgeHop {
+                            source: rhs_local.expect("RHS consume has a local"),
+                            destination: lhs_local,
+                            source_var: rhs_use,
+                            destination_var: lhs_def,
+                            location: location.into(),
+                            transparent,
+                            destination_single_def: !matches!(
+                                sink_definitions[lhs_local],
+                                Some(SinkCarrierDef::Multiple)
+                            ),
+                            block_single_predecessor: block.as_u32() == 0
+                                || body.basic_blocks.predecessors()[block].len() == 1,
+                        });
                     self.move_edges.push((rhs_slot, lhs_slot));
                     if operand.is_move() {
                         self.equations.push(RecordedEquation::Equal {
@@ -1033,6 +1215,7 @@ impl<'a, 'tcx> MinimalWalk<'a, 'tcx> {
             canonical_sha256: String::new(),
             move_edges: self.move_edges,
             transparent_move_edges: self.transparent_move_edges,
+            construction_bridge_temps: self.construction_bridge_temps,
             field_held: self.field_held,
             boundary_held: self.boundary_held,
         };
@@ -1127,6 +1310,7 @@ pub(crate) struct BoxOwnershipFacts {
     canonical_sha256: String,
     move_edges: Vec<(SlotRef, SlotRef)>,
     transparent_move_edges: Vec<(SlotRef, SlotRef)>,
+    construction_bridge_temps: ConstructionBridgeTemps,
     field_held: FxHashSet<SlotRef>,
     boundary_held: FxHashSet<SlotRef>,
 }
@@ -1169,6 +1353,10 @@ pub(crate) struct BoxPlan {
     pub(crate) delete_statements: Vec<Span>,
     pub(crate) receipts: Vec<String>,
     pub(crate) fabricated_extent: bool,
+    /// The initializer carries the complete Box type for an unannotated source
+    /// binding reached through the sealed construction-presentation domain.
+    /// The AST planner therefore places value edits but no declaration splice.
+    pub(crate) inferred_binding: bool,
     /// Exact source assignments whose old generation is closed by Rust's
     /// ordinary overwrite drop. The emitted-MIR postcheck maps only these
     /// lines to `waiver-drop(overwrite)`.
@@ -1182,11 +1370,12 @@ pub(crate) struct BoxPlan {
     pub(crate) implicit_scope_close: bool,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum BoxPlanFailure {
     PointerDepth,
     ParameterHeld,
     ConstructionUnmappable,
+    ConstructionBridge(ConstructionBridgeFailure),
     EndpointInactive,
     EndpointUnjoined,
     MoveAmbiguous,
@@ -1200,11 +1389,11 @@ pub(crate) enum BoxPlanFailure {
 }
 
 impl BoxPlanFailure {
-    pub(crate) fn key(self) -> &'static str {
+    pub(crate) fn key(&self) -> &'static str {
         match self {
-            BoxPlanFailure::PointerDepth | BoxPlanFailure::ConstructionUnmappable => {
-                "box-construction-unmappable"
-            }
+            BoxPlanFailure::PointerDepth
+            | BoxPlanFailure::ConstructionUnmappable
+            | BoxPlanFailure::ConstructionBridge(_) => "box-construction-unmappable",
             BoxPlanFailure::ParameterHeld => "box-param-caller-unknown",
             BoxPlanFailure::EndpointInactive => "box-endpoint-inactive",
             BoxPlanFailure::EndpointUnjoined => "box-endpoint-unjoined",
@@ -1216,6 +1405,15 @@ impl BoxPlanFailure {
             BoxPlanFailure::FreeDuplicate => "box-free-duplicate",
             BoxPlanFailure::StoreFormUnknown => "box-store-form-unknown",
             BoxPlanFailure::AstUnplaceable => "box-ast-unplaceable",
+        }
+    }
+
+    pub(crate) fn detail(&self) -> String {
+        match self {
+            Self::ConstructionBridge(reason) => {
+                format!("construction-bridge-{}", reason.key())
+            }
+            _ => "-".to_owned(),
         }
     }
 }
@@ -1241,6 +1439,35 @@ impl BoxOwnershipFacts {
         self.replay_error.as_deref()
     }
 
+    fn construction_bridge_for(
+        &self,
+        endpoint: &EndpointFact,
+        subject: Local,
+    ) -> Result<ConstructionBridgePresentation, ConstructionBridgeFailure> {
+        let source_sites = self
+            .version_sites
+            .iter()
+            .filter(|site| {
+                site.function_path == endpoint.function_path
+                    && site.relation == "call-destination"
+                    && site.def_var == Some(endpoint.var)
+            })
+            .collect::<Vec<_>>();
+        let [source_site] = source_sites.as_slice() else {
+            return Err(if source_sites.is_empty() {
+                ConstructionBridgeFailure::MissingVersionSite
+            } else {
+                ConstructionBridgeFailure::MultipleDefinitions
+            });
+        };
+        resolve_construction_bridge(
+            source_site.local,
+            endpoint.var,
+            subject,
+            &self.construction_bridge_temps,
+        )
+    }
+
     pub(crate) fn plan_for_subject(
         &self,
         tcx: rustc_middle::ty::TyCtxt<'_>,
@@ -1258,9 +1485,6 @@ impl BoxOwnershipFacts {
             BoxScopeFailure::PointerDepth => BoxPlanFailure::PointerDepth,
             BoxScopeFailure::ParameterHeld => BoxPlanFailure::ParameterHeld,
         })?;
-        if subject.ty_span.is_none() || subject.pointee_span.is_none() {
-            return Err(BoxPlanFailure::ConstructionUnmappable);
-        }
         let body = tcx
             .mir_drops_elaborated_and_const_checked(subject.fn_did)
             .borrow();
@@ -1314,6 +1538,23 @@ impl BoxOwnershipFacts {
             return Err(BoxPlanFailure::MoveAmbiguous);
         }
         let source_slot = all_sources[0].slot_ref.expect("source slot");
+        let construction_bridge = match (subject.ty_span, subject.pointee_span) {
+            (Some(_), Some(_)) => None,
+            (None, None) => {
+                if active_sources.len() != 1 {
+                    return Err(BoxPlanFailure::MoveAmbiguous);
+                }
+                Some(
+                    self.construction_bridge_for(active_sources[0], subject.local)
+                        .map_err(BoxPlanFailure::ConstructionBridge)?,
+                )
+            }
+            _ => return Err(BoxPlanFailure::ConstructionUnmappable),
+        };
+        let construction_bridge_receipt = construction_bridge
+            .as_ref()
+            .map(|bridge| bridge.receipt(active_sources[0], slot));
+        let inferred_binding = construction_bridge.is_some();
         if self
             .field_held
             .iter()
@@ -1384,11 +1625,15 @@ impl BoxOwnershipFacts {
                 optional: false,
                 expr_edits: Vec::new(),
                 delete_statements: Vec::new(),
-                receipts: vec![format!(
-                    "box-move-companion source={} destination={}",
-                    upstream.label, subject.label
-                )],
+                receipts: construction_bridge_receipt
+                    .into_iter()
+                    .chain([format!(
+                        "box-move-companion source={} destination={}",
+                        upstream.label, subject.label
+                    )])
+                    .collect(),
                 fabricated_extent: false,
+                inferred_binding,
                 overwrite_spans: Vec::new(),
                 retained_sink,
                 implicit_scope_close: !retained_sink,
@@ -1650,6 +1895,9 @@ impl BoxOwnershipFacts {
             "box-construction arm={initializer_arm} site={}",
             super::emitability::EmitabilityFacts::site(tcx, init_span)
         )];
+        if let Some(receipt) = construction_bridge_receipt {
+            receipts.push(receipt);
+        }
         for store_span in &delete_statements {
             receipts.push(format!(
                 "box-deleted-statement arm={initializer_arm} span={}",
@@ -1780,6 +2028,7 @@ impl BoxOwnershipFacts {
             delete_statements,
             receipts,
             fabricated_extent,
+            inferred_binding,
             overwrite_spans,
             retained_sink,
             implicit_scope_close: !retained_sink,
@@ -1947,10 +2196,12 @@ mod tests {
     use rustc_index::IndexVec;
 
     use super::{
-        BoxMoveTemps, BoxScopeFailure, EndpointStatus, FactValue, RecordedEquation, SinkCarrierDef,
-        SinkCarrierReason, SinkNamingTemps, box_scope, classify_endpoint,
-        exactly_one_sink_per_exit_graph, render_equations, replay_values, resolve_sink_carrier,
-        resolve_sink_naming_carrier, scalar_initializer_supported,
+        BoxMoveTemps, BoxScopeFailure, ConstructionBridgeFailure, ConstructionBridgeHop,
+        ConstructionBridgeTemps, EndpointStatus, FactValue, LocationKey, RecordedEquation,
+        SinkCarrierDef, SinkCarrierReason, SinkNamingTemps, box_scope, classify_endpoint,
+        exactly_one_sink_per_exit_graph, render_equations, replay_values,
+        resolve_construction_bridge, resolve_sink_carrier, resolve_sink_naming_carrier,
+        scalar_initializer_supported,
     };
     use crate::analyses::borrow_ownership::{SlotKind, ssa::constraint::Var};
 
@@ -2098,6 +2349,92 @@ mod tests {
             resolve_sink_naming_carrier(sink_temp, &naming, &definitions),
             Ok(carrier),
             "the widened move domain must not drag endpoint naming into the carrier's projection-base definition"
+        );
+    }
+
+    #[test]
+    fn box2_w1_construction_bridge_follows_one_transparent_definition() {
+        let source = rustc_middle::mir::Local::from_usize(9);
+        let subject = rustc_middle::mir::Local::from_usize(8);
+        let hops = ConstructionBridgeTemps::from_hops([ConstructionBridgeHop {
+            source,
+            destination: subject,
+            source_var: var(1),
+            destination_var: var(2),
+            location: LocationKey {
+                block: 2,
+                statement: 2,
+            },
+            transparent: true,
+            destination_single_def: true,
+            block_single_predecessor: true,
+        }]);
+
+        let presentation = resolve_construction_bridge(source, var(1), subject, &hops)
+            .expect("one transparent definition is an exact bridge");
+        assert_eq!(presentation.source, source);
+        assert_eq!(presentation.subject, subject);
+        assert_eq!(presentation.hops.len(), 1);
+    }
+
+    #[test]
+    fn box2_n1_nontransparent_construction_definition_fails_closed() {
+        let source = rustc_middle::mir::Local::from_usize(9);
+        let subject = rustc_middle::mir::Local::from_usize(8);
+        let hops = ConstructionBridgeTemps::from_hops([ConstructionBridgeHop {
+            source,
+            destination: subject,
+            source_var: var(1),
+            destination_var: var(2),
+            location: LocationKey {
+                block: 2,
+                statement: 2,
+            },
+            transparent: false,
+            destination_single_def: true,
+            block_single_predecessor: true,
+        }]);
+        assert_eq!(
+            resolve_construction_bridge(source, var(1), subject, &hops),
+            Err(ConstructionBridgeFailure::NonTransparentRvalue),
+            "mutation killer: widening the bridge through a nontransparent definition must fail"
+        );
+    }
+
+    #[test]
+    fn box2_n2_multidef_and_join_fed_bridges_fail_closed() {
+        let source = rustc_middle::mir::Local::from_usize(9);
+        let subject = rustc_middle::mir::Local::from_usize(8);
+        let hop = |destination_single_def, block_single_predecessor| ConstructionBridgeHop {
+            source,
+            destination: subject,
+            source_var: var(1),
+            destination_var: var(2),
+            location: LocationKey {
+                block: 2,
+                statement: 2,
+            },
+            transparent: true,
+            destination_single_def,
+            block_single_predecessor,
+        };
+        assert_eq!(
+            resolve_construction_bridge(
+                source,
+                var(1),
+                subject,
+                &ConstructionBridgeTemps::from_hops([hop(false, true)]),
+            ),
+            Err(ConstructionBridgeFailure::MultipleDefinitions),
+        );
+        assert_eq!(
+            resolve_construction_bridge(
+                source,
+                var(1),
+                subject,
+                &ConstructionBridgeTemps::from_hops([hop(true, false)]),
+            ),
+            Err(ConstructionBridgeFailure::BranchOrJoinFed),
         );
     }
 

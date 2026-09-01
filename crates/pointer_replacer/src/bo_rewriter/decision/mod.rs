@@ -640,6 +640,7 @@ impl DegradeReason {
             }
             DegradeReason::RawPointerOperation { op } => op.clone(),
             DegradeReason::UnsupportedDeclShape { shape } => (*shape).to_owned(),
+            DegradeReason::BoxFailure { failure } => failure.detail(),
             _ => "-".to_owned(),
         }
     }
@@ -1007,6 +1008,7 @@ fn decide_one(ctx: &Ctx<'_, '_>, subject: &Subject) -> Decision {
             }
         }
         Decision::InferredRef { .. } => decision,
+        Decision::Box(ref plan) if plan.inferred_binding => decision,
         Decision::Slice { .. } | Decision::Opt { .. } | Decision::Box(_) => degrade(
             subject,
             EmitabilityFacts::site(ctx.tcx, subject.attribution_span()),

@@ -405,108 +405,106 @@ pub(crate) fn plan(
         // by hand and the driver built the same string by hand beside it — a
         // duplicated canonicalizer whose two copies had to be edited together.
         let identity = || subject.identity_key(&owner_of(subject));
-        // A `Ref` decision implies a syntactic raw-pointer declaration:
-        // `decide_one` degrades every other shape with `UnsupportedDeclShape`,
-        // precisely because there is no pointee text to copy through an alias.
-        //
-        // So this arm is UNREACHABLE through the shipping pipeline — which is
-        // exactly why it is ATTRIBUTED rather than skipped. An unreachable arm
-        // that `continue`s silently is a subject that vanishes leaving no
-        // counter behind the moment its premise stops holding, and the premise
-        // lives in a different phase. Backstop against our own bugs, in the
-        // shape design counter (c) requires; witnessed by a data-level
-        // injection, since nothing in the pipeline can reach it.
-        let Some(pointee_span) = subject.pointee_span else {
-            unplaceable.push(Unplaceable {
-                reason: "Ref decision on a declaration with no pointee span",
-                detail: attribution(),
-                subject: identity(),
-            });
-            continue;
-        };
-        // S3.1: a subject with no DECLARED TYPE has no splice target. Reachable
-        // only for locals (an unannotated `let`, or a destructuring pattern
-        // whose annotation belongs to the pattern rather than the component),
-        // and such subjects degrade in the decision phase — so this arm is a
-        // backstop over a population the decision phase has already removed,
-        // not the place the case is handled. Recorded because S2b.2's audit
-        // requires every non-placing arm to be listed with what it owes.
-        let Some(subject_ty_span) = subject.ty_span else {
-            unplaceable.push(Unplaceable {
-                reason: "subject has no declared type to splice",
-                detail: attribution(),
-                subject: identity(),
-            });
-            continue;
-        };
-        let (ty_file, ty_lo, ty_hi) = match span_to_loc(subject_ty_span) {
-            Ok(located) => located,
-            Err(reason) => {
+        // A bridge-admitted unannotated Box binding gets its complete type from
+        // the rewritten initializer. It still needs a file anchor for its value
+        // edits, but deliberately has no declaration splice. Every other form
+        // retains the long-standing syntactic-pointee requirement.
+        let inferred_box = box_plan.is_some_and(|plan| plan.inferred_binding);
+        let (ty_file, declaration_edit) = if inferred_box {
+            match span_to_loc(subject.binding_span) {
+                Ok((file, _, _)) => (file, None),
+                Err(reason) => {
+                    unplaceable.push(Unplaceable {
+                        reason,
+                        detail: attribution(),
+                        subject: identity(),
+                    });
+                    continue;
+                }
+            }
+        } else {
+            let Some(pointee_span) = subject.pointee_span else {
                 unplaceable.push(Unplaceable {
-                    reason,
+                    reason: "Ref decision on a declaration with no pointee span",
+                    detail: attribution(),
+                    subject: identity(),
+                });
+                continue;
+            };
+            let Some(subject_ty_span) = subject.ty_span else {
+                unplaceable.push(Unplaceable {
+                    reason: "subject has no declared type to splice",
+                    detail: attribution(),
+                    subject: identity(),
+                });
+                continue;
+            };
+            let (ty_file, ty_lo, ty_hi) = match span_to_loc(subject_ty_span) {
+                Ok(located) => located,
+                Err(reason) => {
+                    unplaceable.push(Unplaceable {
+                        reason,
+                        detail: attribution(),
+                        subject: identity(),
+                    });
+                    continue;
+                }
+            };
+            let (pointee_file, p_lo, p_hi) = match span_to_loc(pointee_span) {
+                Ok(located) => located,
+                Err(reason) => {
+                    unplaceable.push(Unplaceable {
+                        reason,
+                        detail: attribution(),
+                        subject: identity(),
+                    });
+                    continue;
+                }
+            };
+            if pointee_file != ty_file {
+                unplaceable.push(Unplaceable {
+                    reason: "pointee text is in a different file from the declaration",
                     detail: attribution(),
                     subject: identity(),
                 });
                 continue;
             }
-        };
-        let (pointee_file, p_lo, p_hi) = match span_to_loc(pointee_span) {
-            Ok(located) => located,
-            Err(reason) => {
+            let Some(source) = source_of(&ty_file) else {
                 unplaceable.push(Unplaceable {
-                    reason,
+                    reason: "no source text available for the declaring file",
                     detail: attribution(),
                     subject: identity(),
                 });
                 continue;
-            }
-        };
-        // The pointee's text is copied through verbatim, so it must come from
-        // the same file the type is spliced into. Different files here would
-        // mean copying bytes across a file boundary by offset — exactly the
-        // collapse this grouping exists to prevent.
-        if pointee_file != ty_file {
-            unplaceable.push(Unplaceable {
-                reason: "pointee text is in a different file from the declaration",
-                detail: attribution(),
-                subject: identity(),
-            });
-            continue;
-        }
-        let Some(source) = source_of(&ty_file) else {
-            unplaceable.push(Unplaceable {
-                reason: "no source text available for the declaring file",
-                detail: attribution(),
-                subject: identity(),
-            });
-            continue;
-        };
-        let Some(pointee) = source.get(p_lo..p_hi) else {
-            unplaceable.push(Unplaceable {
-                reason: "pointee range is outside its own file's source",
-                detail: attribution(),
-                subject: identity(),
-            });
-            continue;
-        };
-        let base = if box_plan.is_some() {
-            if fat {
-                format!("Box<[{pointee}]>")
+            };
+            let Some(pointee) = source.get(p_lo..p_hi) else {
+                unplaceable.push(Unplaceable {
+                    reason: "pointee range is outside its own file's source",
+                    detail: attribution(),
+                    subject: identity(),
+                });
+                continue;
+            };
+            let base = if box_plan.is_some() {
+                if fat {
+                    format!("Box<[{pointee}]>")
+                } else {
+                    format!("Box<{pointee}>")
+                }
             } else {
-                format!("Box<{pointee}>")
-            }
-        } else {
-            match (fat, *mutable) {
-                (false, true) => format!("&mut {pointee}"),
-                (false, false) => format!("&{pointee}"),
-                (true, true) => format!("&mut [{pointee}]"),
-                (true, false) => format!("&[{pointee}]"),
-            }
-        };
-        let replacement = if optional {
-            format!("Option<{base}>")
-        } else {
-            base
+                match (fat, *mutable) {
+                    (false, true) => format!("&mut {pointee}"),
+                    (false, false) => format!("&{pointee}"),
+                    (true, true) => format!("&mut [{pointee}]"),
+                    (true, false) => format!("&[{pointee}]"),
+                }
+            };
+            let replacement = if optional {
+                format!("Option<{base}>")
+            } else {
+                base
+            };
+            (ty_file, Some((ty_lo, ty_hi, replacement)))
         };
         // The USE-SITE edits, placed before the declaration edit is pushed so a
         // use that cannot be located takes the whole subject with it. A subject
@@ -611,13 +609,15 @@ pub(crate) fn plan(
             .entry(ty_file.clone())
             .or_default()
             .extend(use_edits);
-        by_file.entry(ty_file).or_default().push(Edit {
-            lo: ty_lo,
-            hi: ty_hi,
-            replacement,
-            justification: Justification::KindDecision { kind },
-            owner_fn: owner_of(subject),
-        });
+        if let Some((ty_lo, ty_hi, replacement)) = declaration_edit {
+            by_file.entry(ty_file).or_default().push(Edit {
+                lo: ty_lo,
+                hi: ty_hi,
+                replacement,
+                justification: Justification::KindDecision { kind },
+                owner_fn: owner_of(subject),
+            });
+        }
     }
     Plan {
         by_file,
