@@ -5741,6 +5741,77 @@ fn e2_structural_plan_covers_bounds_output_storage_and_existing_generics() {
     );
 }
 
+/// E2-W2b production witness — branch-local cross-assignment gives NB5-O a
+/// genuine two-way argument relation, and both arguments then reach return.
+/// The plan shape is asserted before the emitted signature is compiled.
+#[test]
+fn e2_w2b_mutual_argument_plan_shape_and_emitted_signature() {
+    let source = "#![allow(dead_code, unused_unsafe, unused_assignments)]\n\
+         pub unsafe fn cross(\n\
+             mut a: *const i32,\n\
+             mut b: *const i32,\n\
+             choose_a: bool,\n\
+         ) -> *const i32 {\n\
+             if choose_a { a = b; } else { b = a; }\n\
+             if choose_a { return a; }\n\
+             b\n\
+         }\n";
+    let fixture = Fixture::new(&[("lib.rs", source)]);
+    let plan_dump = ::utils::compilation::run_compiler_on_path(&fixture.root(), |tcx| {
+        let (table, _) = super::decide_table_with_ctx_config(
+            tcx,
+            Some((
+                crate::analyses::borrow_ownership::a5_overlap::A5Mode::PreciseReplay,
+                Some(
+                    crate::analyses::borrow_ownership::a5_overlap::WholeProgramAttestation::FrozenBenchmarkGraph,
+                ),
+            )),
+        )
+        .expect("E2-W2b decision table");
+        let (did, plan) = table
+            .lifetime_plan
+            .functions()
+            .find(|(did, _)| tcx.def_path_str(did.to_def_id()).ends_with("cross"))
+            .expect("E2-W2b cross plan");
+        let arg1 = super::decision::lifetime::FnSignatureSlot::arg(1, 0, 0);
+        let arg2 = super::decision::lifetime::FnSignatureSlot::arg(2, 0, 0);
+        let mutual = plan
+            .sccs
+            .iter()
+            .filter(|scc| scc.contains(&arg1) || scc.contains(&arg2))
+            .collect::<Vec<_>>();
+        assert_eq!(mutual.len(), 1, "{}: {}", tcx.def_path_str(did.to_def_id()), plan.receipt());
+        assert_eq!(mutual[0], &vec![arg1, arg2], "{}", plan.receipt());
+        assert_eq!(plan.lifetime_for(arg1), plan.lifetime_for(arg2));
+        assert!(plan.outlives.iter().all(|(longer, shorter)| longer != shorter));
+        plan.receipt()
+    })
+    .expect("E2-W2b fixture compiles before rewriting");
+
+    let outcome = super::rewrite_m1_path_a5_injected(
+        &fixture.root(),
+        crate::analyses::borrow_ownership::a5_overlap::A5Mode::PreciseReplay,
+        Some(
+            crate::analyses::borrow_ownership::a5_overlap::WholeProgramAttestation::FrozenBenchmarkGraph,
+        ),
+        &|_| {},
+    );
+    let super::RewriteOutcome::Emitted { files, .. } = outcome else {
+        panic!("E2-W2b emitted signature failed: plan={plan_dump}; outcome={outcome:#?}");
+    };
+    let emitted = files
+        .values()
+        .find(|text| text.contains("fn cross"))
+        .expect("E2-W2b emitted function");
+    assert!(
+        emitted.contains("fn cross<'a: 'b, 'b>")
+            && emitted.contains("a: &'a i32")
+            && emitted.contains("b: &'a i32")
+            && emitted.contains("-> &'b i32"),
+        "plan={plan_dump}; emitted={emitted}",
+    );
+}
+
 /// E2-W6 RED — a call adapter owned by a lifetime-bearing callee carries that
 /// exact plan identity, evaluates the source expression once, and survives the
 /// ordinary production verifier as one atomic function-owned rewrite.

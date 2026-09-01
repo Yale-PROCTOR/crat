@@ -1361,6 +1361,44 @@ mod tests {
         assert_eq!(plan.sccs.len(), 3);
     }
 
+    /// E2-W2b — compilation cannot distinguish an SCC collapse from two
+    /// lifetimes carrying reflexive bounds, so the plan shape is the oracle.
+    #[test]
+    fn e2_w2b_mutual_arguments_collapse_to_one_lifetime_without_reflexive_bound() {
+        let summary = summary(
+            vec![arg(1), arg(2), ret()],
+            &[(0, 1), (1, 0), (0, 2), (1, 2)],
+            &[],
+        );
+        let plan = plan_function(
+            &summary,
+            &[
+                OriginSlot::from_usize(0),
+                OriginSlot::from_usize(1),
+                OriginSlot::from_usize(2),
+            ],
+            &BTreeSet::new(),
+        )
+        .expect("mutually reachable argument plan");
+        let arg1 = FnSignatureSlot::arg(1, 0, 0);
+        let arg2 = FnSignatureSlot::arg(2, 0, 0);
+        let mutual = plan
+            .sccs
+            .iter()
+            .filter(|scc| scc.contains(&arg1) || scc.contains(&arg2))
+            .collect::<Vec<_>>();
+        assert_eq!(mutual.len(), 1, "plan={}", plan.receipt());
+        assert_eq!(mutual[0], &vec![arg1, arg2], "plan={}", plan.receipt());
+        assert_eq!(plan.lifetime_for(arg1), plan.lifetime_for(arg2));
+        assert!(
+            plan.outlives
+                .iter()
+                .all(|(longer, shorter)| longer != shorter),
+            "reflexive outlives relation survived SCC collapse: {}",
+            plan.receipt(),
+        );
+    }
+
     #[test]
     fn e2_w5_existing_names_and_input_order_do_not_change_plan_bytes() {
         let summary = summary(vec![arg(1), ret()], &[(0, 1)], &[]);
