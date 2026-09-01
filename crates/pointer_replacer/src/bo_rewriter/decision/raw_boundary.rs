@@ -968,6 +968,22 @@ impl BridgeTemplate {
             Self::KnownFreeDrop => "known-free-drop",
         }
     }
+
+    pub(crate) fn render(
+        self,
+        _argument: &str,
+        _target_mutability: RawMutability,
+        _box_slice: bool,
+    ) -> Result<BridgeRender, RawBoundaryBlockReason> {
+        Err(RawBoundaryBlockReason::TemplateUnavailable)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum BridgeRender {
+    ZeroSyntax,
+    Edit(String),
+    Lifecycle,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1665,5 +1681,71 @@ mod tests {
             "{verdict:#?}"
         );
         assert_eq!(verification, Ok(()));
+    }
+
+    #[test]
+    fn rb_w5_optional_mutable_ref_bridge_is_one_evaluation_without_unwrap() {
+        let rendered = BridgeTemplate::OptRefMutToRawMut
+            .render("p", RawMutability::Mut, false)
+            .expect("optional bridge");
+        let BridgeRender::Edit(text) = rendered else {
+            panic!("expected edit, got {rendered:?}");
+        };
+        assert_eq!(text.matches('p').count(), 1, "{text}");
+        assert!(text.contains("as_deref_mut"), "{text}");
+        assert!(!text.contains("unwrap"), "{text}");
+    }
+
+    #[test]
+    fn rb_w6_shared_source_to_mutable_target_is_typed_block() {
+        let target = RawTargetType {
+            rendered: "*mut i32".to_owned(),
+            pointee: "i32".to_owned(),
+            mutability: RawMutability::Mut,
+        };
+        assert_eq!(
+            template_for(
+                &super::super::Decision::Ref { mutable: false },
+                &target,
+                None,
+            ),
+            Err(RawBoundaryBlockReason::SharedToMut)
+        );
+        assert_eq!(
+            RawBoundaryBlockReason::SharedToMut.key(),
+            "raw-boundary-shared-to-mut"
+        );
+    }
+
+    #[test]
+    fn rb_w7_box_borrow_view_does_not_consume_the_owner() {
+        let rendered = BridgeTemplate::BoxBorrowViewToRaw
+            .render("owner", RawMutability::Mut, false)
+            .expect("Box view");
+        let BridgeRender::Edit(text) = rendered else {
+            panic!("expected edit, got {rendered:?}");
+        };
+        assert_eq!(text, "core::ptr::from_mut(owner.as_mut())");
+        assert!(!text.contains("into_raw"), "{text}");
+    }
+
+    #[test]
+    fn rb_w8_known_free_uses_the_existing_lifecycle_path() {
+        assert_eq!(
+            BridgeTemplate::KnownFreeDrop
+                .render("owner", RawMutability::Mut, false)
+                .expect("lifecycle"),
+            BridgeRender::Lifecycle
+        );
+    }
+
+    #[test]
+    fn zero_syntax_ref_bridge_is_receipted_without_an_edit() {
+        assert_eq!(
+            BridgeTemplate::RefMutToRawMut
+                .render("p", RawMutability::Mut, false)
+                .expect("zero syntax"),
+            BridgeRender::ZeroSyntax
+        );
     }
 }
