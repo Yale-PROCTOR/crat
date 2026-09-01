@@ -125,6 +125,10 @@ pub(crate) enum Justification {
     },
     /// A5 C-9 snapshot temp at one retained marked call site.
     C9Mark,
+    /// E2-FN structural signature emission, keyed to the finalized plan bytes.
+    /// The AST pass owns node placement; this typed justification keeps the
+    /// receipt vocabulary aligned with span/seam ownership.
+    LifetimePlan { digest: String },
     /// **The fabricated-extent const's declaration** (marker ruling,
     /// 2026-08-15). One per crate, in the crate root file, emitted only when at
     /// least one fabricated adapter survives.
@@ -352,6 +356,9 @@ pub(crate) fn plan(
         // A `match` makes the next disposition a compile error at this site.
         let (mutable, use_edits_in, optional, fat, box_plan) = match decision {
             Decision::Ref { mutable } => (mutable, None, false, false, None),
+            // The direct callee supplies this local's type. There is no local
+            // declaration span to edit; the signature owner is planned by E2.
+            Decision::InferredRef { .. } => continue,
             // S3.2′-2: the first disposition that is not declaration-only.
             Decision::Slice { mutable, uses } => (mutable, Some(uses), false, true, None),
             // S3.2′-3: an optional form, thin or fat. Its uses travel the same
@@ -675,6 +682,7 @@ mod tests {
         let table = DecisionTable {
             seams: Default::default(),
             c9_marks: Vec::new(),
+            lifetime_plan: Default::default(),
             entries: vec![(alias_subject(), Decision::Ref { mutable: false })],
         };
 
@@ -726,6 +734,7 @@ mod tests {
         let table = DecisionTable {
             seams: Default::default(),
             c9_marks: Vec::new(),
+            lifetime_plan: Default::default(),
             entries: vec![(
                 alias_subject(),
                 Decision::Degraded(crate::bo_rewriter::decision::Degradation {

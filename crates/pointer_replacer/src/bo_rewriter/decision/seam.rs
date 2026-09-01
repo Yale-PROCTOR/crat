@@ -280,6 +280,9 @@ pub(crate) struct SeamEdit {
     /// The edit lands in the caller's file and is owned by the callee, which is
     /// the divergence `plan`'s `owner_fn` doc was written for.
     pub owner_fn: String,
+    /// Digest of the callee's finalized E2 signature plan. `None` means this
+    /// seam is unrelated to E2; it may never be reconstructed downstream.
+    pub lifetime_plan_digest: Option<String>,
     /// The caller side of `CallAdapterKey`.
     pub caller_fn: String,
     /// The callee's zero-based parameter position.
@@ -2124,7 +2127,9 @@ pub(crate) struct SeamPlan {
 /// The form a decision emits.
 fn form_of(decision: &Decision) -> Form {
     match decision {
-        Decision::Ref { mutable } => Form::Ref { mutable: *mutable },
+        Decision::Ref { mutable } | Decision::InferredRef { mutable, .. } => {
+            Form::Ref { mutable: *mutable }
+        }
         Decision::Slice { mutable, .. } => Form::Slice { mutable: *mutable },
         Decision::Opt { mutable, slice, .. } => Form::Opt {
             mutable: *mutable,
@@ -2600,6 +2605,10 @@ pub(crate) fn synthesize(
                             span: pos.span,
                             replacement: candidate.replacement.clone(),
                             owner_fn: tcx.def_path_str(callee.to_def_id()),
+                            lifetime_plan_digest: table
+                                .lifetime_plan
+                                .function(*callee)
+                                .map(super::lifetime::FunctionPlan::digest),
                             caller_fn: tcx.def_path_str(site.caller.to_def_id()),
                             param_index: pos.index,
                             source_shape: pos.source_shape,

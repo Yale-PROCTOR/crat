@@ -5380,6 +5380,1039 @@ fn e3_attempt_with(
     }
 }
 
+/// E2-X1 RED — the consumer-neutral carrier already reaches `finish_decide`,
+/// but E2-FN has no consumer yet. The lifetime producer must receive the intact
+/// summary object rather than an A5-shaped projection of it.
+#[test]
+fn e2_x1_carrier_reaches_the_lifetime_producer_intact() {
+    let fixture = Fixture::new(&[(
+        "lib.rs",
+        "#![allow(dead_code, unused_unsafe)]\n\
+         pub unsafe fn id(p: *const i32) -> *const i32 { p }\n",
+    )]);
+    let receipt = ::utils::compilation::run_compiler_on_path(&fixture.root(), |tcx| {
+        let (_, ctx) = super::decide_table_with_ctx_config(
+            tcx,
+            Some((
+                crate::analyses::borrow_ownership::a5_overlap::A5Mode::PreciseReplay,
+                Some(
+                    crate::analyses::borrow_ownership::a5_overlap::WholeProgramAttestation::FrozenBenchmarkGraph,
+                ),
+            )),
+        )
+        .expect("E2-X1 decision table");
+        super::decision::lifetime::carrier_receipt(ctx.analysis.origins.as_ref())
+    })
+    .expect("E2-X1 fixture compiles before rewriting");
+
+    assert!(receipt.summary_count > 0, "{receipt:?}");
+    assert!(receipt.native_flows, "{receipt:?}");
+}
+
+/// E2-W1 RED — a modeled argument-to-return origin must create the private
+/// permit and let the existing decision ladder pass the return-escape gate.
+#[test]
+fn e2_w1_return_decision_uses_the_typed_permit() {
+    let fixture = Fixture::new(&[(
+        "lib.rs",
+        "#![allow(dead_code, unused_unsafe)]\n\
+         pub unsafe fn id(p: *mut i32) -> *mut i32 { p }\n",
+    )]);
+    let (decision, permits) =
+        ::utils::compilation::run_compiler_on_path(&fixture.root(), |tcx| {
+            let (table, ctx) = super::decide_table_with_ctx_config(
+                tcx,
+                Some((
+                    crate::analyses::borrow_ownership::a5_overlap::A5Mode::PreciseReplay,
+                    Some(
+                        crate::analyses::borrow_ownership::a5_overlap::WholeProgramAttestation::FrozenBenchmarkGraph,
+                    ),
+                )),
+            )
+            .expect("E2-W1 decision table");
+            let decision = table
+                .entries
+                .iter()
+                .find(|(subject, _)| subject.label.ends_with("id::p"))
+                .map(|(_, decision)| decision.clone())
+                .expect("id::p subject");
+            (decision, ctx.lifetime_eligibility.return_permit_count())
+        })
+        .expect("E2-W1 fixture compiles before rewriting");
+
+    assert!(
+        matches!(decision, super::decision::Decision::Ref { mutable: false }),
+        "{decision:#?}"
+    );
+    assert_eq!(permits, 1);
+}
+
+/// Addendum-117 RED — an origin-backed return permit removes only the
+/// return-escape blocker. If a later ordinary raw-flow blocker then wins, the
+/// E2 ledger must name that secondary degradation and retain its typed payload;
+/// it must neither call the row planned nor drop the later reason.
+#[test]
+fn e2_w8_return_permit_reports_secondary_degradation_payload() {
+    let fixture = Fixture::new(&[(
+        "lib.rs",
+        "#![allow(dead_code, unused_unsafe)]\n\
+         pub unsafe fn raw_sink(p: *mut i32) -> usize { p as usize }\n\
+         pub unsafe fn returns_after_raw_flow(p: *mut i32) -> *mut i32 {\n\
+             *p = 1;\n\
+             let _ = raw_sink(p);\n\
+             p\n\
+         }\n",
+    )]);
+    let (permits, subjects) =
+        ::utils::compilation::run_compiler_on_path(&fixture.root(), |tcx| {
+            let (_, ctx) = super::decide_table_with_ctx_config(
+                tcx,
+                Some((
+                    crate::analyses::borrow_ownership::a5_overlap::A5Mode::PreciseReplay,
+                    Some(
+                        crate::analyses::borrow_ownership::a5_overlap::WholeProgramAttestation::FrozenBenchmarkGraph,
+                    ),
+                )),
+            )
+            .expect("E2-W8 decision table");
+            (
+                ctx.lifetime_eligibility.return_permit_count(),
+                ctx.e2_artifacts.subjects,
+            )
+        })
+        .expect("E2-W8 fixture compiles before rewriting");
+
+    assert_eq!(permits, 1, "{subjects}");
+    let row = subjects
+        .lines()
+        .skip(1)
+        .find(|row| row.contains("returns_after_raw_flow::p#"))
+        .unwrap_or_else(|| panic!("E2-W8 subject missing:\n{subjects}"));
+    let fields = row.split('\t').collect::<Vec<_>>();
+    assert_eq!(
+        fields[receipt_column(&subjects, "final_decision")],
+        "flows-into-raw-param",
+        "{row}",
+    );
+    assert_eq!(
+        fields[receipt_column(&subjects, "e2_disposition")],
+        "lifetime-secondary-degradation",
+        "{row}",
+    );
+    assert_eq!(
+        fields[receipt_column(&subjects, "secondary_reason")],
+        "flows-into-raw-param",
+        "{row}",
+    );
+    assert_eq!(
+        fields[receipt_column(&subjects, "secondary_reason_detail")],
+        "flows-into-raw-param",
+        "{row}",
+    );
+}
+
+/// Addendum-120 collateral RED — `ClassBlocked { via }` means the blocker is
+/// owned by a classmate. Even when `via` names return escape, the permitted row
+/// receives the secondary class and keeps `(class-blocked, via)` as payload.
+#[test]
+fn e2_w9_classmate_primary_is_secondary_class_coupling() {
+    let decision = super::decision::Decision::Degraded(super::decision::Degradation {
+        subject: "permitted-row".to_owned(),
+        site: "fixture".to_owned(),
+        reason: super::decision::DegradeReason::ClassBlocked {
+            via: super::decision::co_conversion::BlockReason::EscapesViaReturn,
+        },
+    });
+    let disposition = super::e2_terminal_disposition(false, true, None, &decision)
+        .expect("class coupling is a secondary disposition");
+
+    assert_eq!(
+        disposition.key(),
+        "lifetime-secondary-degradation",
+        "{disposition:?}",
+    );
+    assert_eq!(
+        disposition.secondary_payload(),
+        ("class-blocked".to_owned(), "escapes-via-return".to_owned()),
+    );
+}
+
+/// Addendum-121 RED — the collateral row itself need not carry a permit. The
+/// `ClassBlocked` variant already says a classmate owns `via`, so this row must
+/// retain the secondary class and payload even with no direct permit.
+#[test]
+fn e2_w9b_permitless_classmate_coupling_is_secondary() {
+    let decision = super::decision::Decision::Degraded(super::decision::Degradation {
+        subject: "permitless-collateral-row".to_owned(),
+        site: "fixture".to_owned(),
+        reason: super::decision::DegradeReason::ClassBlocked {
+            via: super::decision::co_conversion::BlockReason::EscapesViaReturn,
+        },
+    });
+    let disposition = super::e2_terminal_disposition(false, false, None, &decision)
+        .expect("permit-less class coupling is a secondary disposition");
+
+    assert_eq!(
+        disposition.key(),
+        "lifetime-secondary-degradation",
+        "{disposition:?}",
+    );
+    assert_eq!(
+        disposition.secondary_payload(),
+        ("class-blocked".to_owned(), "escapes-via-return".to_owned()),
+    );
+}
+
+/// Addendum-120 invariant RED — a permitted row cannot retain its own direct
+/// return-escape blocker. That state is a typed construction failure, not a
+/// secondary disposition and not `not-e2`.
+#[test]
+fn e2_n8_permitted_own_primary_is_loud_invariant_violation() {
+    let decision = super::decision::Decision::Degraded(super::decision::Degradation {
+        subject: "permitted-row".to_owned(),
+        site: "fixture".to_owned(),
+        reason: super::decision::DegradeReason::SilentCoercion {
+            via: super::decision::co_conversion::BlockReason::EscapesViaReturn,
+        },
+    });
+    let error = super::e2_terminal_disposition(false, true, None, &decision)
+        .expect_err("an own-primary blocker must stop artifact construction");
+
+    assert_eq!(error.key(), "lifetime-invariant-permitted-own-primary");
+    assert_eq!(
+        error.payload(),
+        (
+            "escapes-via-return".to_owned(),
+            "escapes-via-return".to_owned()
+        ),
+    );
+}
+
+/// E2-W7 RED — an unannotated local fed by a direct local call may use the
+/// callee's modeled lifetime plan without inventing a local declaration
+/// splice.  The explicit decision arm is load-bearing: treating this as an
+/// ordinary `Ref` would let the no-`ty_span` residual gate erase the evidence.
+#[test]
+fn e2_w7_direct_call_result_local_is_inferred_safe() {
+    let fixture = Fixture::new(&[(
+        "lib.rs",
+        "#![allow(dead_code, unused_unsafe)]\n\
+         pub unsafe fn id(p: *const i32) -> *const i32 { p }\n\
+         pub unsafe fn caller(p: *const i32) -> i32 {\n\
+             let q = id(p);\n\
+             *q\n\
+         }\n",
+    )]);
+    let (decision, return_permits, inferred_permits, failure) =
+        ::utils::compilation::run_compiler_on_path(&fixture.root(), |tcx| {
+        let (table, ctx) = super::decide_table_with_ctx_config(
+            tcx,
+            Some((
+                crate::analyses::borrow_ownership::a5_overlap::A5Mode::PreciseReplay,
+                Some(
+                    crate::analyses::borrow_ownership::a5_overlap::WholeProgramAttestation::FrozenBenchmarkGraph,
+                ),
+            )),
+        )
+        .expect("E2-W7 decision table");
+        let (subject, decision) = table
+            .entries
+            .iter()
+            .find(|(subject, _)| subject.label.ends_with("caller::q"))
+            .expect("caller::q subject");
+        (
+            decision.clone(),
+            ctx.lifetime_eligibility.return_permit_count(),
+            ctx.lifetime_eligibility.inferred_permit_count(),
+            ctx.lifetime_eligibility
+                .failure((subject.fn_did, subject.hir_id)),
+        )
+    })
+    .expect("E2-W7 fixture compiles before rewriting");
+
+    assert!(
+        matches!(
+            decision,
+            super::decision::Decision::InferredRef { mutable: false, .. }
+        ),
+        "decision={decision:#?}; return_permits={return_permits}; \
+         inferred_permits={inferred_permits}; failure={failure:?}"
+    );
+}
+
+/// E2-W7 conservative controls — allocator, foreign, and indirect results may
+/// not acquire an inferred local lifetime merely because their accepted model
+/// happens to contain a reference-shaped slot.
+#[test]
+fn e2_w7_only_a_direct_local_call_result_may_be_inferred_safe() {
+    fn observed(
+        source: &str,
+        suffix: &str,
+    ) -> (
+        super::decision::Decision,
+        Option<super::decision::lifetime::LifetimeFailure>,
+    ) {
+        let fixture = Fixture::new(&[("lib.rs", source)]);
+        ::utils::compilation::run_compiler_on_path(&fixture.root(), |tcx| {
+            let (table, ctx) = super::decide_table_with_ctx_config(
+                tcx,
+                Some((
+                    crate::analyses::borrow_ownership::a5_overlap::A5Mode::PreciseReplay,
+                    Some(
+                        crate::analyses::borrow_ownership::a5_overlap::WholeProgramAttestation::FrozenBenchmarkGraph,
+                    ),
+                )),
+            )
+            .expect("E2-W7 negative decision table");
+            let (subject, decision) = table
+                .entries
+                .iter()
+                .find(|(subject, _)| subject.label.ends_with(suffix))
+                .expect("negative-control subject");
+            (
+                decision.clone(),
+                ctx.lifetime_eligibility
+                    .failure((subject.fn_did, subject.hir_id)),
+            )
+        })
+        .expect("E2-W7 negative fixture compiles before rewriting")
+    }
+
+    let (allocator, _) = observed(
+        "#![allow(dead_code, unused_unsafe)]\n\
+         unsafe extern \"C\" { fn malloc(n: usize) -> *mut core::ffi::c_void; }\n\
+         pub unsafe fn caller() -> *mut i32 {\n\
+             let q = malloc(4) as *mut i32;\n\
+             q\n\
+         }\n",
+        "caller::q",
+    );
+    assert!(
+        !matches!(allocator, super::decision::Decision::InferredRef { .. }),
+        "allocator result gained an inferred lifetime: {allocator:#?}"
+    );
+
+    let (foreign, foreign_failure) = observed(
+        "#![allow(dead_code, unused_unsafe)]\n\
+         unsafe extern \"C\" { fn foreign(p: *const i32) -> *const i32; }\n\
+         pub unsafe fn caller(p: *const i32) -> i32 {\n\
+             let q = foreign(p);\n\
+             *q\n\
+         }\n",
+        "caller::q",
+    );
+    assert!(
+        !matches!(foreign, super::decision::Decision::InferredRef { .. }),
+        "foreign result gained an inferred lifetime: {foreign:#?}"
+    );
+    assert_eq!(
+        foreign_failure,
+        Some(super::decision::lifetime::LifetimeFailure::ExternalContractAbsent)
+    );
+
+    let (indirect, indirect_failure) = observed(
+        "#![allow(dead_code, unused_unsafe)]\n\
+         unsafe fn id(p: *const i32) -> *const i32 { p }\n\
+         pub unsafe fn caller(p: *const i32) -> i32 {\n\
+             let f: unsafe fn(*const i32) -> *const i32 = id;\n\
+             let q = f(p);\n\
+             *q\n\
+         }\n",
+        "caller::q",
+    );
+    assert!(
+        !matches!(indirect, super::decision::Decision::InferredRef { .. }),
+        "indirect result gained an inferred lifetime: {indirect:#?}"
+    );
+    assert_eq!(
+        indirect_failure,
+        Some(super::decision::lifetime::LifetimeFailure::FnPtrWebHeld)
+    );
+}
+
+/// E2-W3 RED — output storage receives the modeled source lifetime, not the
+/// temporary local used to carry the call argument.  The permit is keyed to
+/// the field-free signature-depth slot (`*out`), so a later AST pass has no
+/// opportunity to substitute an implementation temporary.
+#[test]
+fn e2_w3_output_storage_uses_source_not_temp_lifetime() {
+    let fixture = Fixture::new(&[(
+        "lib.rs",
+        "#![allow(dead_code, unused_unsafe)]\n\
+         pub unsafe fn store(out: *mut *const i32, p: *const i32) {\n\
+             *out = p;\n\
+         }\n",
+    )]);
+    let (receipt, diagnostic) =
+        ::utils::compilation::run_compiler_on_path(&fixture.root(), |tcx| {
+        let (_, ctx) = super::decide_table_with_ctx_config(
+            tcx,
+            Some((
+                crate::analyses::borrow_ownership::a5_overlap::A5Mode::PreciseReplay,
+                Some(
+                    crate::analyses::borrow_ownership::a5_overlap::WholeProgramAttestation::FrozenBenchmarkGraph,
+                ),
+            )),
+        )
+        .expect("E2-W3 decision table");
+        let mut diagnostic = Vec::new();
+        if let Some(origins) = ctx.analysis.origins.as_ref() {
+            for (&did, summary) in origins.iter() {
+                if !tcx.def_path_str(did.to_def_id()).ends_with("store") {
+                    continue;
+                }
+                for (origin, slot) in summary.slots.iter_enumerated() {
+                    let local = match slot.place.root {
+                        crate::analyses::borrow_ownership::origin_summary::SignatureRoot::Arg(local) => local,
+                        crate::analyses::borrow_ownership::origin_summary::SignatureRoot::Return => rustc_middle::mir::RETURN_PLACE,
+                    };
+                    let depth = slot.place.deref_depth.saturating_add(slot.depth);
+                    let kind = ctx
+                        .slots
+                        .fn_local_slots
+                        .get(&did)
+                        .and_then(|universe| universe.slot_for_local_depth(local, depth))
+                        .and_then(|slot| ctx.model.get(&crate::analyses::borrow_ownership::solver::SlotRef::Local(did, slot)))
+                        .copied();
+                    let incoming = summary
+                        .slots
+                        .indices()
+                        .filter(|source| summary.subset.contains(*source, origin))
+                        .map(|source| format!("{source:?}"))
+                        .collect::<Vec<_>>();
+                    diagnostic.push(format!(
+                        "{origin:?}={:?}/deref{}/depth{} model={kind:?} unknown={} incoming={incoming:?}",
+                        slot.place.root,
+                        slot.place.deref_depth,
+                        slot.depth,
+                        summary.unknown.contains(origin),
+                    ));
+                }
+            }
+        }
+        (
+            ctx.lifetime_eligibility.output_storage_receipts(),
+            diagnostic,
+        )
+    })
+    .expect("E2-W3 fixture compiles before rewriting");
+
+    assert_eq!(
+        receipt.len(),
+        1,
+        "receipt={receipt:#?}; summary={diagnostic:#?}"
+    );
+    assert_eq!(receipt[0].source, "arg2/deref0/depth0");
+    // NB5-O represents this raw-pointer layer as signature `depth=1`; the
+    // separate `deref_depth` component is reserved for a projected place.
+    assert_eq!(receipt[0].target, "arg1/deref0/depth1");
+}
+
+/// E2-W1 structural RED — the production AST path must materialize the plan,
+/// not merely let co-conversion skip the return escape.  Separate SCC names
+/// make the accepted source-to-return direction visible as `'a: 'b`.
+#[test]
+fn e2_w1_production_emits_named_signature_lifetimes() {
+    let fixture = Fixture::new(&[(
+        "lib.rs",
+        "#![allow(dead_code, unused_unsafe)]\n\
+         pub unsafe fn id(p: *const i32) -> *const i32 { p }\n",
+    )]);
+    let outcome = super::rewrite_m1_path_a5_injected(
+        &fixture.root(),
+        crate::analyses::borrow_ownership::a5_overlap::A5Mode::PreciseReplay,
+        Some(
+            crate::analyses::borrow_ownership::a5_overlap::WholeProgramAttestation::FrozenBenchmarkGraph,
+        ),
+        &|_| {},
+    );
+    let super::RewriteOutcome::Emitted { files, .. } = outcome else {
+        panic!("E2-W1 production rewrite must survive: {outcome:#?}");
+    };
+    let emitted = files
+        .values()
+        .find(|source| source.contains("fn id"))
+        .expect("emitted E2-W1 function");
+    assert!(emitted.contains("fn id<'a: 'b, 'b>"), "{emitted}");
+    assert!(emitted.contains("p: &'a i32"), "{emitted}");
+    assert!(emitted.contains("-> &'b i32"), "{emitted}");
+    let signature = emitted
+        .lines()
+        .find(|line| line.contains("fn id"))
+        .expect("E2-W1 emitted signature line");
+    assert_eq!(
+        signature, "pub unsafe fn id<'a: 'b, 'b>(p: &'a i32) -> &'b i32 { p }",
+        "an unreceipted lifetime node must move this exact structural line",
+    );
+}
+
+/// E2-W2/W3/W5 production-path coverage: multiple source bounds, nested
+/// output storage, and collision-free insertion beside user generics all pass
+/// through the same structural visitor as E2-W1.
+#[test]
+fn e2_structural_plan_covers_bounds_output_storage_and_existing_generics() {
+    let fixture = Fixture::new(&[(
+        "lib.rs",
+        "#![allow(dead_code, unused_unsafe, unused_lifetimes)]\n\
+         pub unsafe fn choose(a: *const i32, b: *const i32, pick: bool) -> *const i32 {\n\
+             if pick { return a; }\n\
+             b\n\
+         }\n\
+         pub unsafe fn store(out: *mut *const i32, p: *const i32) { *out = p; }\n\
+         pub unsafe fn existing<'a, T>(p: *const T) -> *const T { p }\n",
+    )]);
+    let outcome = super::rewrite_m1_path_a5_injected(
+        &fixture.root(),
+        crate::analyses::borrow_ownership::a5_overlap::A5Mode::PreciseReplay,
+        Some(
+            crate::analyses::borrow_ownership::a5_overlap::WholeProgramAttestation::FrozenBenchmarkGraph,
+        ),
+        &|_| {},
+    );
+    let super::RewriteOutcome::Emitted { files, .. } = outcome else {
+        panic!("E2 structural fixture must survive: {outcome:#?}");
+    };
+    let emitted = files
+        .values()
+        .find(|source| source.contains("fn choose"))
+        .expect("emitted E2 structural fixture");
+    assert!(
+        emitted.contains("fn choose<'a: 'c, 'b: 'c, 'c>"),
+        "{emitted}"
+    );
+    assert!(
+        emitted.contains("fn store<'a, 'b: 'a>(out: &mut &'a i32, p: &'b i32)"),
+        "{emitted}"
+    );
+    assert!(
+        emitted.contains("fn existing<'a, 'b: 'c, 'c, T>"),
+        "{emitted}"
+    );
+}
+
+/// E2-W2 precision-side negative — body-local reassignment does not create a
+/// caller-visible relation between signature origins. Each input retains its
+/// own SCC and both independently outlive the return.
+#[test]
+fn e2_w2_local_reassignment_keeps_signature_origins_distinct() {
+    let source = "#![allow(dead_code, unused_unsafe, unused_assignments)]\n\
+         pub unsafe fn cross(\n\
+             mut a: *const i32,\n\
+             mut b: *const i32,\n\
+             choose_a: bool,\n\
+         ) -> *const i32 {\n\
+             if choose_a { a = b; } else { b = a; }\n\
+             if choose_a { return a; }\n\
+             b\n\
+         }\n";
+    let fixture = Fixture::new(&[("lib.rs", source)]);
+    let plan_dump = ::utils::compilation::run_compiler_on_path(&fixture.root(), |tcx| {
+        let (table, _) = super::decide_table_with_ctx_config(
+            tcx,
+            Some((
+                crate::analyses::borrow_ownership::a5_overlap::A5Mode::PreciseReplay,
+                Some(
+                    crate::analyses::borrow_ownership::a5_overlap::WholeProgramAttestation::FrozenBenchmarkGraph,
+                ),
+            )),
+        )
+        .expect("E2-W2 local-reassignment decision table");
+        let (did, plan) = table
+            .lifetime_plan
+            .functions()
+            .find(|(did, _)| tcx.def_path_str(did.to_def_id()).ends_with("cross"))
+            .expect("E2-W2 local-reassignment plan");
+        let arg1 = super::decision::lifetime::FnSignatureSlot::arg(1, 0, 0);
+        let arg2 = super::decision::lifetime::FnSignatureSlot::arg(2, 0, 0);
+        let mutual = plan
+            .sccs
+            .iter()
+            .filter(|scc| scc.contains(&arg1) || scc.contains(&arg2))
+            .collect::<Vec<_>>();
+        assert_eq!(mutual.len(), 2, "{}: {}", tcx.def_path_str(did.to_def_id()), plan.receipt());
+        assert_ne!(plan.lifetime_for(arg1), plan.lifetime_for(arg2));
+        assert!(plan.outlives.iter().all(|(longer, shorter)| longer != shorter));
+        plan.receipt()
+    })
+    .expect("E2-W2 local-reassignment fixture compiles before rewriting");
+
+    let outcome = super::rewrite_m1_path_a5_injected(
+        &fixture.root(),
+        crate::analyses::borrow_ownership::a5_overlap::A5Mode::PreciseReplay,
+        Some(
+            crate::analyses::borrow_ownership::a5_overlap::WholeProgramAttestation::FrozenBenchmarkGraph,
+        ),
+        &|_| {},
+    );
+    let super::RewriteOutcome::Emitted {
+        files,
+        reverted_count,
+        ..
+    } = outcome
+    else {
+        panic!("E2-W2 emitted signature failed: plan={plan_dump}; outcome={outcome:#?}");
+    };
+    let emitted = files
+        .values()
+        .find(|text| text.contains("fn cross"))
+        .expect("E2-W2 emitted function");
+    assert!(reverted_count >= 1, "plan={plan_dump}; emitted={emitted}");
+    assert!(
+        emitted.contains("mut a: *const i32")
+            && emitted.contains("mut b: *const i32")
+            && !emitted.contains("fn cross<'"),
+        "the precision-side negative must revert, never unify by convenience: \
+         plan={plan_dump}; emitted={emitted}",
+    );
+}
+
+/// E2-W2b — caller-visible cross-storage makes the two output signature slots
+/// mutually reachable. The structural plan assertion, not compilation alone,
+/// is what kills omission of SCC collapse.
+#[test]
+fn e2_w2b_mutual_output_storage_collapses_and_emits() {
+    let source = "#![allow(dead_code, unused_unsafe)]\n\
+         pub unsafe fn cross_store(x: *mut *const i32, y: *mut *const i32) {\n\
+             let tmp = *x;\n\
+             *x = *y;\n\
+             *y = tmp;\n\
+         }\n";
+    let fixture = Fixture::new(&[("lib.rs", source)]);
+    let plan_dump = ::utils::compilation::run_compiler_on_path(&fixture.root(), |tcx| {
+        let (table, _) = super::decide_table_with_ctx_config(
+            tcx,
+            Some((
+                crate::analyses::borrow_ownership::a5_overlap::A5Mode::PreciseReplay,
+                Some(
+                    crate::analyses::borrow_ownership::a5_overlap::WholeProgramAttestation::FrozenBenchmarkGraph,
+                ),
+            )),
+        )
+        .expect("E2-W2b decision table");
+        let (did, plan) = table
+            .lifetime_plan
+            .functions()
+            .find(|(did, _)| tcx.def_path_str(did.to_def_id()).ends_with("cross_store"))
+            .expect("E2-W2b cross-storage plan");
+        let x = super::decision::lifetime::FnSignatureSlot::arg(1, 0, 1);
+        let y = super::decision::lifetime::FnSignatureSlot::arg(2, 0, 1);
+        let mutual = plan
+            .sccs
+            .iter()
+            .filter(|scc| scc.contains(&x) || scc.contains(&y))
+            .collect::<Vec<_>>();
+        assert_eq!(mutual.len(), 1, "{}: {}", tcx.def_path_str(did.to_def_id()), plan.receipt());
+        assert_eq!(mutual[0], &vec![x, y], "{}", plan.receipt());
+        assert_eq!(plan.lifetime_for(x), plan.lifetime_for(y));
+        assert!(
+            plan.outlives.iter().all(|(longer, shorter)| longer != shorter),
+            "{}",
+            plan.receipt(),
+        );
+        plan.receipt()
+    })
+    .expect("E2-W2b fixture compiles before rewriting");
+
+    let outcome = super::rewrite_m1_path_a5_injected(
+        &fixture.root(),
+        crate::analyses::borrow_ownership::a5_overlap::A5Mode::PreciseReplay,
+        Some(
+            crate::analyses::borrow_ownership::a5_overlap::WholeProgramAttestation::FrozenBenchmarkGraph,
+        ),
+        &|_| {},
+    );
+    let super::RewriteOutcome::Emitted { files, .. } = outcome else {
+        panic!("E2-W2b emitted signature failed: plan={plan_dump}; outcome={outcome:#?}");
+    };
+    let emitted = files
+        .values()
+        .find(|text| text.contains("fn cross_store"))
+        .expect("E2-W2b emitted function");
+    assert!(
+        emitted.contains("x: &mut &'a i32") && emitted.contains("y: &mut &'a i32"),
+        "plan={plan_dump}; emitted={emitted}",
+    );
+}
+
+/// E2-W6 RED — a call adapter owned by a lifetime-bearing callee carries that
+/// exact plan identity, evaluates the source expression once, and survives the
+/// ordinary production verifier as one atomic function-owned rewrite.
+#[test]
+fn e2_w6_lifetime_callee_keeps_adapter_one_evaluation() {
+    let source = "#![allow(dead_code, unused_unsafe)]\n\
+         unsafe extern \"C\" { fn source() -> *const i32; }\n\
+         pub unsafe fn first(p: *const i32) -> *const i32 { p }\n\
+         pub unsafe fn caller() -> i32 { *first(source()) }\n";
+    let fixture = Fixture::new(&[("lib.rs", source)]);
+    let receipt = ::utils::compilation::run_compiler_on_path(&fixture.root(), |tcx| {
+        let (table, _) = super::decide_table_with_ctx_config(
+            tcx,
+            Some((
+                crate::analyses::borrow_ownership::a5_overlap::A5Mode::PreciseReplay,
+                Some(
+                    crate::analyses::borrow_ownership::a5_overlap::WholeProgramAttestation::FrozenBenchmarkGraph,
+                ),
+            )),
+        )
+        .expect("E2-W6 decision table");
+        super::seam_tsv_from_table(tcx, &table)
+    })
+    .expect("E2-W6 fixture compiles before rewriting");
+    let digest_column = receipt_column(&receipt, "lifetime_plan_digest");
+    let placed = receipt
+        .lines()
+        .skip(1)
+        .map(|line| line.split('\t').collect::<Vec<_>>())
+        .find(|columns| columns.first() == Some(&"placed"))
+        .expect("E2-W6 placed adapter row");
+    assert_ne!(placed[digest_column], "-", "{receipt}");
+
+    let outcome = super::rewrite_m1_path_a5_injected(
+        &fixture.root(),
+        crate::analyses::borrow_ownership::a5_overlap::A5Mode::PreciseReplay,
+        Some(
+            crate::analyses::borrow_ownership::a5_overlap::WholeProgramAttestation::FrozenBenchmarkGraph,
+        ),
+        &|_| {},
+    );
+    let super::RewriteOutcome::Emitted { files, .. } = outcome else {
+        panic!("E2-W6 production rewrite must survive: {outcome:#?}");
+    };
+    let emitted = files
+        .values()
+        .find(|text| text.contains("fn first"))
+        .expect("E2-W6 emitted source");
+    assert!(emitted.contains("fn first<'a: 'b, 'b>"), "{emitted}");
+    assert_eq!(emitted.matches("source()").count(), 2, "{emitted}");
+}
+
+/// E2-N3/N4 RED — boundary and field tranches stay closed, but their refusal
+/// is typed by E2 rather than disappearing behind the ordinary degradation.
+#[test]
+fn e2_n3_n4_external_and_field_rows_are_loudly_held() {
+    fn held(source: &str, suffix: &str) -> super::decision::lifetime::LifetimeFailure {
+        let fixture = Fixture::new(&[("lib.rs", source)]);
+        ::utils::compilation::run_compiler_on_path(&fixture.root(), |tcx| {
+            let (table, ctx) = super::decide_table_with_ctx_config(
+                tcx,
+                Some((
+                    crate::analyses::borrow_ownership::a5_overlap::A5Mode::PreciseReplay,
+                    Some(
+                        crate::analyses::borrow_ownership::a5_overlap::WholeProgramAttestation::FrozenBenchmarkGraph,
+                    ),
+                )),
+            )
+            .expect("E2-N3/N4 decision table");
+            let (subject, decision) = table
+                .entries
+                .iter()
+                .find(|(subject, _)| subject.label.ends_with(suffix))
+                .expect("held subject");
+            assert!(
+                matches!(decision, super::decision::Decision::Degraded(_)),
+                "held tranche emitted: {decision:#?}"
+            );
+            ctx.lifetime_eligibility
+                .failure((subject.fn_did, subject.hir_id))
+                .expect("held row must carry an E2 failure")
+        })
+        .expect("E2-N3/N4 fixture compiles before rewriting")
+    }
+
+    assert_eq!(
+        held(
+            "#![allow(dead_code, unused_unsafe)]\n\
+             unsafe extern \"C\" { fn retain(p: *const i32); }\n\
+             pub unsafe fn f(p: *const i32) { retain(p); }\n",
+            "f::p",
+        ),
+        super::decision::lifetime::LifetimeFailure::ExternalContractAbsent,
+    );
+    assert_eq!(
+        held(
+            "#![allow(dead_code, unused_unsafe)]\n\
+             pub struct Holder { pub p: *const i32 }\n\
+             pub unsafe fn f(h: *mut Holder, p: *const i32) { (*h).p = p; }\n",
+            "f::p",
+        ),
+        super::decision::lifetime::LifetimeFailure::FieldHeld,
+    );
+}
+
+/// E2-N7 eligibility-layer control. The root is already pinned by the existing
+/// function-pointer gate; its forward callee is the live E2 candidate on which
+/// deleting the web guard would create a plan.
+#[test]
+fn e2_n7_fnptr_web_members_are_held_at_lifetime_eligibility() {
+    let fixture = Fixture::new(&[(
+        "lib.rs",
+        "#![allow(dead_code, unused_unsafe)]\n\
+         pub unsafe fn leaf(p: *const i32) -> *const i32 { p }\n\
+         pub unsafe fn root(p: *const i32) -> *const i32 { let _ = leaf(p); p }\n\
+         pub unsafe fn install() {\n\
+             let _callback: unsafe fn(*const i32) -> *const i32 = root;\n\
+         }\n",
+    )]);
+    ::utils::compilation::run_compiler_on_path(&fixture.root(), |tcx| {
+        let (table, ctx) = super::decide_table_with_ctx_config(
+            tcx,
+            Some((
+                crate::analyses::borrow_ownership::a5_overlap::A5Mode::PreciseReplay,
+                Some(
+                    crate::analyses::borrow_ownership::a5_overlap::WholeProgramAttestation::FrozenBenchmarkGraph,
+                ),
+            )),
+        )
+        .expect("E2-N7 eligibility decision table");
+        for suffix in ["leaf::p", "root::p"] {
+            let (subject, decision) = table
+                .entries
+                .iter()
+                .find(|(subject, _)| subject.label.ends_with(suffix))
+                .unwrap_or_else(|| panic!("missing {suffix}"));
+            assert!(
+                matches!(decision, super::decision::Decision::Degraded(_)),
+                "{suffix} escaped the web hold: {decision:#?}",
+            );
+            let failure = ctx
+                .lifetime_eligibility
+                .failure((subject.fn_did, subject.hir_id));
+            if suffix == "leaf::p" {
+                assert_eq!(
+                    failure,
+                    Some(super::decision::lifetime::LifetimeFailure::FnPtrWebHeld),
+                    "the forward-callee candidate must reach the E2 web guard: {decision:#?}",
+                );
+            } else {
+                assert_eq!(
+                    failure, None,
+                    "the fn-pointer root is pinned before E2 eligibility: {decision:#?}",
+                );
+            }
+            assert!(table.lifetime_plan.function(subject.fn_did).is_none());
+        }
+    })
+    .expect("E2-N7 eligibility fixture compiles");
+}
+
+/// E2-N5 RED — an on-disk cache hit must reproduce the consumed model, A5
+/// receipt, finalized lifetime plan, and structurally emitted source bytes.
+#[test]
+fn e2_n5_cache_and_fresh_paths_share_plan_model_a5_and_source_bytes() {
+    let fixture = Fixture::new(&[(
+        "lib.rs",
+        "#![allow(dead_code, unused_unsafe)]\n\
+         pub unsafe fn id(p: *const i32) -> *const i32 { p }\n",
+    )]);
+    let cache_dir = fixture.0.join("cache");
+    std::fs::create_dir_all(&cache_dir).expect("E2-N5 cache directory");
+
+    let run = |read: bool| {
+        ::utils::compilation::run_compiler_on_path(&fixture.root(), |tcx| {
+            crate::analyses::borrow_ownership::model_cache::reset_for_test();
+            crate::analyses::borrow_ownership::model_cache::with_test_config(
+                read,
+                &cache_dir,
+                || {
+                let capture = super::ast_transform::capture_ast(tcx)?;
+                let (table, ctx) = super::decide_table_with_ctx_config(
+                    tcx,
+                    Some((
+                        crate::analyses::borrow_ownership::a5_overlap::A5Mode::PreciseReplay,
+                        Some(
+                            crate::analyses::borrow_ownership::a5_overlap::WholeProgramAttestation::FrozenBenchmarkGraph,
+                        ),
+                    )),
+                )?;
+                let model = crate::analyses::borrow_ownership::model_cache::model_bytes_sha256(
+                    tcx,
+                    &ctx.slots,
+                    &ctx.model,
+                )
+                .ok_or_else(|| "E2-N5 model key did not render".to_owned())?;
+                let (files, _, _) = super::ast_transform::ast_emitted_files_from(
+                    tcx,
+                    &capture,
+                    &super::ast_transform::RevertSet::default(),
+                    None,
+                    &table,
+                )?;
+                let provenance =
+                    crate::analyses::borrow_ownership::model_cache::last_solve()
+                        .ok_or_else(|| "E2-N5 solve provenance missing".to_owned())?;
+                Ok::<_, String>((
+                    format!(
+                        "model={model}\na5={}\nplan={}\nsource={files:?}",
+                        ctx.a5_receipt,
+                        table.lifetime_plan.canonical_receipt(tcx),
+                    ),
+                    provenance.source,
+                    provenance.solve_secs,
+                ))
+                },
+            )
+        })
+        .expect("E2-N5 fixture compiles")
+    };
+
+    let (fresh, fresh_source, _) = run(false).expect("E2-N5 fresh path");
+    assert_eq!(fresh_source, "real");
+
+    let (cached, cached_source, cached_solve_secs) = run(true).expect("E2-N5 cached path");
+    assert_eq!(cached_source, "cache");
+    assert_eq!(cached_solve_secs, 0.0);
+    assert_eq!(cached, fresh);
+    crate::analyses::borrow_ownership::model_cache::reset_for_test();
+}
+
+/// Task 29 — path-independent lifetime plans/receipts and off-tranche source
+/// identity across two distinct source roots.
+#[test]
+fn e2_n5_two_roots_share_plan_receipts_and_unowned_source_bytes() {
+    let source = "#![allow(dead_code, unused_unsafe)]\n\
+         pub unsafe fn id(p: *const i32) -> *const i32 { p }\n\
+         pub fn untouched(x: i32) -> i32 { x + 1 }\n";
+    let left = Fixture::new(&[("lib.rs", source)]);
+    let right = Fixture::new(&[("lib.rs", source)]);
+    assert_ne!(left.0, right.0);
+
+    let run = |fixture: &Fixture| {
+        ::utils::compilation::run_compiler_on_path(&fixture.root(), |tcx| {
+            let capture = super::ast_transform::capture_ast(tcx)?;
+            let (table, ctx) = super::decide_table_with_ctx_config(
+                tcx,
+                Some((
+                    crate::analyses::borrow_ownership::a5_overlap::A5Mode::PreciseReplay,
+                    Some(
+                        crate::analyses::borrow_ownership::a5_overlap::WholeProgramAttestation::FrozenBenchmarkGraph,
+                    ),
+                )),
+            )?;
+            let (files, _, _) = super::ast_transform::ast_emitted_files_from(
+                tcx,
+                &capture,
+                &super::ast_transform::RevertSet::default(),
+                None,
+                &table,
+            )?;
+            let emitted = files
+                .values()
+                .find(|text| text.contains("fn id"))
+                .cloned()
+                .ok_or_else(|| "E2 two-root source missing".to_owned())?;
+            Ok::<_, String>((
+                table.lifetime_plan.canonical_receipt(tcx),
+                ctx.e2_artifacts.subjects,
+                ctx.e2_artifacts.functions,
+                ctx.e2_artifacts.failures,
+                emitted,
+            ))
+        })
+        .expect("E2 two-root fixture compiles")
+        .expect("E2 two-root derivation")
+    };
+
+    let left = run(&left);
+    let right = run(&right);
+    assert_eq!(left, right);
+    assert!(
+        left.4.contains("pub fn untouched(x: i32) -> i32 { x + 1 }"),
+        "off-tranche function moved:\n{}",
+        left.4,
+    );
+}
+
+/// E2-N6 — lifetime diagnostics are one-iteration row data, not a false
+/// success. Both missing lifetime selection and an omitted input constraint
+/// must reach the repaired full-analysis observer with their rustc codes.
+#[test]
+fn e2_n6_compile_errors_surface_as_iteration_data() {
+    let missing = Fixture::new(&[(
+        "lib.rs",
+        "pub fn choose(a: &i32, b: &i32, pick: bool) -> &i32 {\n\
+             if pick { a } else { b }\n\
+         }\n",
+    )]);
+    let missing_diagnosis = super::verify::diagnose_crate(&missing.root());
+    assert!(missing_diagnosis.errors > 0);
+    assert!(
+        missing_diagnosis
+            .diags
+            .iter()
+            .any(|diag| matches!(diag.code.as_deref(), Some("E0106" | "ErrCode(106)"))),
+        "{missing_diagnosis:#?}"
+    );
+
+    let constraint = Fixture::new(&[(
+        "lib.rs",
+        "pub fn choose<'a>(a: &i32, b: &'a i32, pick: bool) -> &'a i32 {\n\
+             if pick { a } else { b }\n\
+         }\n",
+    )]);
+    let constraint_diagnosis = super::verify::diagnose_crate(&constraint.root());
+    assert!(constraint_diagnosis.errors > 0);
+    assert!(
+        constraint_diagnosis.diags.iter().any(|diag| matches!(
+            diag.code.as_deref(),
+            Some("E0621" | "E0623" | "ErrCode(621)" | "ErrCode(623)")
+        )),
+        "{constraint_diagnosis:#?}"
+    );
+}
+
+/// E2 task-22 exact-once receipt control: one table drives subject, function,
+/// failure, and seam artifacts, and the typed lifetime justification carries
+/// the same digest as the function row.
+#[test]
+fn e2_receipts_reconcile_subject_function_and_plan_identity_once() {
+    let fixture = Fixture::new(&[(
+        "lib.rs",
+        "#![allow(dead_code, unused_unsafe)]\n\
+         pub unsafe fn id(p: *const i32) -> *const i32 { p }\n",
+    )]);
+    let (entries, artifacts) =
+        ::utils::compilation::run_compiler_on_path(&fixture.root(), |tcx| {
+            let (table, ctx) = super::decide_table_with_ctx_config(
+                tcx,
+                Some((
+                    crate::analyses::borrow_ownership::a5_overlap::A5Mode::PreciseReplay,
+                    Some(
+                        crate::analyses::borrow_ownership::a5_overlap::WholeProgramAttestation::FrozenBenchmarkGraph,
+                    ),
+                )),
+            )
+            .expect("E2 receipt decision table");
+            (table.entries.len(), ctx.e2_artifacts)
+        })
+        .expect("E2 receipt fixture compiles");
+
+    let subjects = artifacts.subjects.lines().skip(1).collect::<Vec<_>>();
+    assert_eq!(subjects.len(), entries, "{}", artifacts.subjects);
+    assert_eq!(
+        subjects
+            .iter()
+            .map(|row| row.split('\t').next().unwrap())
+            .collect::<std::collections::BTreeSet<_>>()
+            .len(),
+        entries,
+        "{}",
+        artifacts.subjects,
+    );
+    let functions = artifacts.functions.lines().skip(1).collect::<Vec<_>>();
+    assert_eq!(functions.len(), 1, "{}", artifacts.functions);
+    let function_digest = functions[0].split('\t').nth(1).expect("function digest");
+    let subject_digest = subjects[0].split('\t').nth(9).expect("subject digest");
+    assert_eq!(subject_digest, function_digest);
+    assert!(subjects[0].contains("\tplanned\tlifetime-plan\t"));
+    assert_eq!(
+        artifacts.failures.lines().count(),
+        1,
+        "{}",
+        artifacts.failures
+    );
+    assert!(artifacts.seams.starts_with("kind\towner_fn\t"));
+}
+
 fn receipt_column(receipt: &str, name: &str) -> usize {
     receipt
         .lines()

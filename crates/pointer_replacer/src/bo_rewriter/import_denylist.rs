@@ -258,6 +258,131 @@ fn wave3_docs_input_ratchet_matches_a_synthetic_breach() {
     );
 }
 
+fn e2_docs_or_legacy_input_offense(line: &str) -> Option<String> {
+    const E2_INPUTS: &[&str] = &[
+        "e2-subjects.tsv",
+        "e2-functions.tsv",
+        "2026-08-30-e2-lifetime-emission-design",
+        "rewriter::lifetimes",
+    ];
+    E2_INPUTS
+        .iter()
+        .find(|needle| line.contains(**needle))
+        .map(|needle| format!("E2 production names forbidden input {needle:?}"))
+        .or_else(|| {
+            (line.contains("docs/agents/")
+                && (line.contains("read") || line.contains("include_bytes")))
+            .then(|| "E2 production appears to consume a docs artifact".to_owned())
+        })
+}
+
+/// E2-FN derives from the carried analysis facts. Design/census files and the
+/// legacy lifetime emitter remain external controls/precedent only.
+#[test]
+fn dependency_ratchet_e2_has_no_docs_or_legacy_runtime_input() {
+    let breaches = scan_root(
+        module_root(),
+        &|file| is_test_only_file(file),
+        &e2_docs_or_legacy_input_offense,
+    );
+    assert!(
+        breaches.is_empty(),
+        "E2 runtime-input breach:\n{}",
+        breaches.join("\n")
+    );
+}
+
+#[test]
+fn e2_runtime_input_ratchet_matches_synthetic_breaches() {
+    assert!(
+        e2_docs_or_legacy_input_offense(
+            "let rows = std::fs::read_to_string(\"docs/agents/e2-subjects.tsv\");"
+        )
+        .is_some()
+    );
+    assert!(
+        e2_docs_or_legacy_input_offense("use crate::rewriter::lifetimes::LifetimePlans;").is_some()
+    );
+}
+
+fn cached_model_fields(source: &str) -> Vec<String> {
+    let Some((_, tail)) = source.split_once("struct CachedModel {") else {
+        return Vec::new();
+    };
+    let body = tail.split_once('}').map_or(tail, |(body, _)| body);
+    body.lines()
+        .filter_map(|line| {
+            let line = line.trim();
+            let field = line.strip_prefix("pub(crate) ")?.split_once(':')?.0;
+            Some(field.trim().to_owned())
+        })
+        .collect()
+}
+
+/// The E2 carrier is re-derived after cache load; adding a persisted lifetime
+/// product would silently invalidate the frozen-model byte contract.
+#[test]
+fn dependency_ratchet_e2_keeps_cached_model_three_field_schema() {
+    let source = fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("src/analyses/borrow_ownership/model_cache.rs"),
+    )
+    .expect("model cache source");
+    assert_eq!(
+        cached_model_fields(&source),
+        ["model", "baseline_model", "a5_receipt"],
+    );
+    assert_eq!(
+        cached_model_fields(
+            "struct CachedModel {\n pub(crate) model: M,\n pub(crate) lifetime_plan: P,\n}"
+        ),
+        ["model", "lifetime_plan"],
+        "the schema parser must expose a synthetic E2 cache breach",
+    );
+}
+
+fn e2_return_bypass_count(source: &str) -> usize {
+    source
+        .lines()
+        .take_while(|line| !line.contains("#[cfg(test)]"))
+        .filter(|line| {
+            line.contains("EscapeKind::Return") && line.contains("return_permit(escape.subject)")
+        })
+        .count()
+}
+
+/// There is one typed return-escape opening and no boolean/set bypass.
+#[test]
+fn dependency_ratchet_e2_return_escape_has_one_typed_choke_point() {
+    let source = fs::read_to_string(module_root().join("decision/co_conversion.rs"))
+        .expect("co-conversion source");
+    assert_eq!(e2_return_bypass_count(&source), 1);
+    assert_eq!(
+        e2_return_bypass_count(
+            "match x {\n EscapeKind::Return if allowed.contains(&subject) => None,\n}"
+        ),
+        0,
+        "an untyped boolean/set bypass must not satisfy the ratchet",
+    );
+}
+
+/// Only the decision phase may consume OriginSummaries; later phases receive
+/// LifetimePlan. The shared carrier in mod.rs is transport, not a later-phase
+/// consumer, and is intentionally outside these phase directories.
+#[test]
+fn dependency_ratchet_e2_origin_summary_stays_in_decision_phase() {
+    for phase in ["plan", "apply", "verify", "artifact"] {
+        let dir = phase_dir(phase);
+        let hits = scan_root(&dir, &|_| false, &|line| {
+            line.contains("OriginSummar")
+                .then(|| line.trim().to_owned())
+        });
+        assert!(
+            hits.is_empty(),
+            "{phase} consumes E2 origin facts: {hits:?}"
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Per-phase rules (M1 architecture directive)
 // ---------------------------------------------------------------------------
@@ -1367,7 +1492,7 @@ fn emission_call_sites(root: &Path, skip: &dyn Fn(&Path) -> bool) -> Vec<String>
 fn is_test_only_file(path: &Path) -> bool {
     matches!(
         path.file_name().and_then(|n| n.to_str()),
-        Some("goldens.rs" | "emit_tests.rs" | "import_denylist.rs")
+        Some("goldens.rs" | "emit_tests.rs" | "import_denylist.rs" | "lifetime_oracle_tests.rs")
     )
 }
 

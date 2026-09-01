@@ -134,6 +134,7 @@ pub(crate) struct E1Capture {
     pub(crate) adapter_receipt: String,
     /// Every subject and item-axis exclusion from that same table/plan.
     pub(crate) subject_receipt: String,
+    pub(crate) e2_artifacts: E2Artifacts,
     pub(crate) novel_error_count: usize,
     pub(crate) baseline_keys: usize,
     pub(crate) baseline_errors: usize,
@@ -145,6 +146,29 @@ pub(crate) struct E1Capture {
     /// D4's emitted-MIR Box-drop reconciliation. Empty on non-census paths.
     pub(crate) box_drop_receipt: String,
     pub(crate) solve_receipt: model_cache::SolveReceipt,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct E2Artifacts {
+    pub(crate) subjects: String,
+    pub(crate) functions: String,
+    pub(crate) failures: String,
+    pub(crate) seams: String,
+    pub(crate) pb_web: String,
+    pub(crate) timings: E2Timings,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct E2Timings {
+    pub(crate) cache_load_wall_s: String,
+    pub(crate) origin_derivation_wall_s: String,
+    pub(crate) pb_web_wall_s: String,
+    pub(crate) eligibility_wall_s: String,
+    pub(crate) finalization_wall_s: String,
+    pub(crate) seam_wall_s: String,
+    pub(crate) ast_placement_wall_s: String,
+    pub(crate) receipt_render_wall_s: String,
+    pub(crate) compiler_verification_wall_s: String,
 }
 
 /// What one M1 rewrite attempt produced.
@@ -238,6 +262,7 @@ pub(crate) enum RewriteOutcome {
         e1_adapter_receipt: String,
         /// E1's identity-bearing subject seed, empty on ordinary runs.
         e1_subject_receipt: String,
+        e2_artifacts: E2Artifacts,
         /// Baseline-subtracted error count from the one verify invocation.
         e1_novel_error_count: usize,
         /// D4's emitted-MIR Box-drop reconciliation.
@@ -302,6 +327,7 @@ pub(crate) enum RewriteOutcome {
         e1_adapter_receipt: String,
         /// E1's identity-bearing subject seed, empty on ordinary runs.
         e1_subject_receipt: String,
+        e2_artifacts: E2Artifacts,
         /// Baseline-subtracted error count from the one verify invocation.
         e1_novel_error_count: usize,
         /// D4's emitted-MIR Box-drop reconciliation.
@@ -656,6 +682,7 @@ fn rewrite_core_injected(
             // error at this site.
             match decision {
                 decision::Decision::Ref { .. }
+                | decision::Decision::InferredRef { .. }
                 | decision::Decision::Slice { .. }
                 | decision::Decision::Opt { .. }
                 | decision::Decision::Box(_) => {}
@@ -752,6 +779,7 @@ fn rewrite_core_injected(
             emitted_subjects,
             a5_receipt,
             e1_subject_receipt,
+            decide_ctx.e2_artifacts.clone(),
             e1_box_drop_policies,
         ))
     });
@@ -858,6 +886,7 @@ fn verify_and_revert(
     emitted_subjects: Vec<(String, String, String)>,
     a5_receipt: String,
     e1_subject_receipt: String,
+    e2_artifacts: E2Artifacts,
     e1_box_drop_policies: Vec<verify::BoxMirDropPolicy>,
 ) -> RewriteOutcome {
     // `excluded` is a LOCAL again: the loop holds `tcx`, so a value that used
@@ -955,6 +984,7 @@ fn verify_and_revert(
             String::new()
         },
         e1_subject_receipt,
+        e2_artifacts,
         e1_novel_error_count: 0,
         e1_box_drop_receipt: String::new(),
         solve_receipt: model_cache::solve_receipt(),
@@ -979,6 +1009,7 @@ fn verify_and_revert(
     // The incoming `files` is still what `root_key` is taken from and what the
     // pre-loop rollback gate judged — that gate validates the PLAN (byte-offset
     // collisions), which is layer-independent, so it keeps its meaning.
+    let ast_started = std::time::Instant::now();
     let (mut files, mut files_edited, mut line_maps) = match round_files(
         tcx,
         capture,
@@ -1006,6 +1037,8 @@ fn verify_and_revert(
             return facts.degraded(format!("round-0 emit failed: {why}"));
         }
     };
+    facts.e2_artifacts.timings.ast_placement_wall_s =
+        format!("{:.6}", ast_started.elapsed().as_secs_f64());
     facts.files_touched = files_edited;
     let mut rounds = 0usize;
     let mut previous_errors: Option<usize> = None;
@@ -1037,7 +1070,11 @@ fn verify_and_revert(
         };
         let probe_started = std::time::Instant::now();
         let diagnosis = verify::diagnose_crate(staged.root());
-        probe_secs = probe_secs.max(probe_started.elapsed().as_secs_f64());
+        let probe_wall_s = probe_started.elapsed().as_secs_f64();
+        probe_secs = probe_secs.max(probe_wall_s);
+        if census_once {
+            facts.e2_artifacts.timings.compiler_verification_wall_s = format!("{probe_wall_s:.6}");
+        }
         if probe_only {
             // INSTRUMENTS MEASURE THE CAPTURE; GATES CONSUME THE
             // FILTERED VIEW. The probe payload is the RAW diagnosis and
@@ -2134,6 +2171,7 @@ struct OutcomeFacts {
     e1_reverts: Vec<E1RevertDiagnostic>,
     e1_adapter_receipt: String,
     e1_subject_receipt: String,
+    e2_artifacts: E2Artifacts,
     e1_novel_error_count: usize,
     e1_box_drop_receipt: String,
     solve_receipt: Option<model_cache::SolveReceipt>,
@@ -2188,6 +2226,7 @@ impl RewriteOutcome {
             e1_reverts,
             e1_adapter_receipt,
             e1_subject_receipt,
+            e2_artifacts,
             novel_error_count,
             e1_box_drop_receipt,
             baseline_keys,
@@ -2205,6 +2244,7 @@ impl RewriteOutcome {
                 e1_reverts,
                 e1_adapter_receipt,
                 e1_subject_receipt,
+                e2_artifacts,
                 e1_novel_error_count,
                 e1_box_drop_receipt,
                 baseline_keys,
@@ -2221,6 +2261,7 @@ impl RewriteOutcome {
                 e1_reverts,
                 e1_adapter_receipt,
                 e1_subject_receipt,
+                e2_artifacts,
                 e1_novel_error_count,
                 e1_box_drop_receipt,
                 baseline_keys,
@@ -2239,6 +2280,7 @@ impl RewriteOutcome {
                 e1_reverts,
                 e1_adapter_receipt,
                 e1_subject_receipt,
+                e2_artifacts,
                 e1_novel_error_count,
                 e1_box_drop_receipt,
                 baseline_keys,
@@ -2255,6 +2297,7 @@ impl RewriteOutcome {
                 e1_reverts,
                 e1_adapter_receipt,
                 e1_subject_receipt,
+                e2_artifacts,
                 e1_novel_error_count,
                 e1_box_drop_receipt,
                 baseline_keys,
@@ -2274,6 +2317,7 @@ impl RewriteOutcome {
             reverts: e1_reverts,
             adapter_receipt: e1_adapter_receipt,
             subject_receipt: e1_subject_receipt,
+            e2_artifacts,
             novel_error_count,
             baseline_keys,
             baseline_errors,
@@ -2333,6 +2377,7 @@ impl OutcomeFacts {
             e1_reverts: self.e1_reverts,
             e1_adapter_receipt: self.e1_adapter_receipt,
             e1_subject_receipt: self.e1_subject_receipt,
+            e2_artifacts: self.e2_artifacts,
             e1_novel_error_count: self.e1_novel_error_count,
             e1_box_drop_receipt: self.e1_box_drop_receipt,
             solve_receipt: self.solve_receipt,
@@ -2360,6 +2405,7 @@ impl OutcomeFacts {
             e1_reverts: self.e1_reverts,
             e1_adapter_receipt: self.e1_adapter_receipt,
             e1_subject_receipt: self.e1_subject_receipt,
+            e2_artifacts: self.e2_artifacts,
             e1_novel_error_count: self.e1_novel_error_count,
             e1_box_drop_receipt: self.e1_box_drop_receipt,
             solve_receipt: self.solve_receipt,
@@ -3038,6 +3084,8 @@ struct DecisionAnalysisCarrier {
     origins: Option<OriginSummaries>,
     a5_mode: A5Mode,
     attestation: Option<WholeProgramAttestation>,
+    cache_load_wall_s: f64,
+    origin_derivation_wall_s: f64,
 }
 
 fn cached_rewriter_plans(
@@ -3047,11 +3095,13 @@ fn cached_rewriter_plans(
     a5_mode: A5Mode,
     attestation: Option<WholeProgramAttestation>,
     cached: &model_cache::CachedModel,
-) -> Result<(Vec<PlannedC9Mark>, Option<OriginSummaries>), String> {
+) -> Result<(Vec<PlannedC9Mark>, Option<OriginSummaries>, f64), String> {
     match a5_mode {
-        A5Mode::Baseline => Ok((Vec::new(), None)),
+        A5Mode::Baseline => Ok((Vec::new(), None, 0.0)),
         A5Mode::PreciseReplay => {
+            let origin_started = std::time::Instant::now();
             let origins = compute_origins(program);
+            let origin_derivation_wall_s = origin_started.elapsed().as_secs_f64();
             let plans = cached_precise_rewriter_payload(
                 program,
                 slots,
@@ -3062,7 +3112,7 @@ fn cached_rewriter_plans(
                 attestation,
                 &cached.a5_receipt,
             )?;
-            Ok((plans, Some(origins)))
+            Ok((plans, Some(origins), origin_derivation_wall_s))
         }
         A5Mode::CoarseConstraint => {
             Err("the pricing-only coarse A5 mode is not cacheable".to_owned())
@@ -3092,6 +3142,7 @@ fn decide_table_perturbed_config<'tcx>(
     // which program this is.
     let fp = model_cache::fingerprint(&program, a5_mode, attestation);
     let cacheable = matches!(a5_mode, A5Mode::Baseline | A5Mode::PreciseReplay);
+    let cache_started = std::time::Instant::now();
 
     // Tier 1: the in-process memo. The recon worker has three independent
     // consumers of the decision table, and before this each ran the entire
@@ -3099,7 +3150,7 @@ fn decide_table_perturbed_config<'tcx>(
     // makes a consumer's cost its own work, not another whole solve.
     if cacheable
         && let Some(cached) = model_cache::memo_get(&fp)
-        && let Ok((retained_c9_plans, origins)) =
+        && let Ok((retained_c9_plans, origins, origin_derivation_wall_s)) =
             cached_rewriter_plans(&program, &slots, &mut_facts, a5_mode, attestation, &cached)
     {
         return finish_decide(
@@ -3114,6 +3165,8 @@ fn decide_table_perturbed_config<'tcx>(
                 origins,
                 a5_mode,
                 attestation,
+                cache_load_wall_s: cache_started.elapsed().as_secs_f64(),
+                origin_derivation_wall_s,
             },
             perturb,
         );
@@ -3122,7 +3175,7 @@ fn decide_table_perturbed_config<'tcx>(
     // Tier 2: the on-disk cache.
     if cacheable
         && let Some(cached) = model_cache::load(tcx, &program, &slots, a5_mode, attestation)
-        && let Ok((retained_c9_plans, origins)) =
+        && let Ok((retained_c9_plans, origins, origin_derivation_wall_s)) =
             cached_rewriter_plans(&program, &slots, &mut_facts, a5_mode, attestation, &cached)
     {
         let model_sha256 = model_cache::model_bytes_sha256(tcx, &slots, &cached.model)
@@ -3149,12 +3202,16 @@ fn decide_table_perturbed_config<'tcx>(
                 origins,
                 a5_mode,
                 attestation,
+                cache_load_wall_s: cache_started.elapsed().as_secs_f64(),
+                origin_derivation_wall_s,
             },
             perturb,
         );
     }
     let solve_t0 = std::time::Instant::now();
+    let origin_started = std::time::Instant::now();
     let origins = compute_origins(&program);
+    let origin_derivation_wall_s = origin_started.elapsed().as_secs_f64();
     let (verified, _export) = with_bo_export(|| {
         solve_bo_a5_config(&program, &slots, &origins, &mut_facts, a5_mode, attestation)
     });
@@ -3203,6 +3260,8 @@ fn decide_table_perturbed_config<'tcx>(
             origins: Some(origins),
             a5_mode,
             attestation,
+            cache_load_wall_s: cache_started.elapsed().as_secs_f64(),
+            origin_derivation_wall_s,
         },
         perturb,
     )
@@ -3356,7 +3415,7 @@ fn finish_decide<'tcx>(
         &opt_accessors,
         &opt_fat,
     );
-    let ctx_of = |gate, coconv| decision::Ctx {
+    let ctx_of = |gate, coconv, lifetime_eligibility| decision::Ctx {
         tcx,
         model: &model,
         slots: &slots,
@@ -3370,6 +3429,7 @@ fn finish_decide<'tcx>(
         subjects: &subjects,
         gate,
         coconv,
+        lifetime_eligibility,
     };
 
     // **S3.6-1 task 2 — the co-conversion classes.**
@@ -3386,18 +3446,41 @@ fn finish_decide<'tcx>(
     // task 2 only.** Production has passed `LiftAdaptable` since S3.6-1 and the
     // `BlockAll` variant was deleted at M-3 (X-3). Task 3 is where the verdict
     // reaches a gate.
-    let hypothetical = decision::decide(&ctx_of(decision::RefGate::LiftAdaptable, None), &subjects);
+    let hypothetical = decision::decide(
+        &ctx_of(decision::RefGate::LiftAdaptable, None, None),
+        &subjects,
+    );
     // Escapes are computed BEFORE the classes now: P1 makes them a gate, not a
     // report, so `build` consumes them rather than the census reading them
     // alongside.
     let escapes = decision::co_conversion::escapes(tcx, &program.functions, &subjects);
-    let coconv = decision::co_conversion::build_with_c9_marks(
+    let lifetime_eligibility = decision::lifetime::derive_return_eligibility(
+        &program,
+        &slots,
+        &model,
+        analysis.origins.as_ref(),
+        &hypothetical,
+        &subjects,
+        &ctors,
+        &escapes,
+        analysis.attestation,
+    );
+    let e2_hypothetical = decision::decide(
+        &ctx_of(
+            decision::RefGate::LiftAdaptable,
+            None,
+            Some(&lifetime_eligibility),
+        ),
+        &subjects,
+    );
+    let coconv = decision::co_conversion::build_with_c9_marks_and_lifetimes(
         &facts,
         &subjects,
-        &hypothetical,
+        &e2_hypothetical,
         &escapes,
         decision::co_conversion::OverlapRule::BlindOnly,
         &retained_c9_plans,
+        &lifetime_eligibility,
     );
     // **Production is decided AFTER the classes**, because step 2's gate reads
     // them. No cycle: the hypothetical above was decided with `None`.
@@ -3406,7 +3489,11 @@ fn finish_decide<'tcx>(
     // `referenced` gate, and the class gate then governs every node uniformly.
     // The pinned population still blocks inside `LiftAdaptable`.
     let mut table = decision::decide(
-        &ctx_of(decision::RefGate::LiftAdaptable, Some(&coconv)),
+        &ctx_of(
+            decision::RefGate::LiftAdaptable,
+            Some(&coconv),
+            Some(&lifetime_eligibility),
+        ),
         &subjects,
     );
 
@@ -3417,10 +3504,20 @@ fn finish_decide<'tcx>(
     // standing, measured.
     decision::refuse_nested_use_edits(tcx, &mut table);
 
+    let finalization_started = std::time::Instant::now();
+    table.lifetime_plan = decision::lifetime::finalize(
+        &program,
+        analysis.origins.as_ref(),
+        &lifetime_eligibility,
+        &table,
+    )?;
+    let finalization_wall_s = finalization_started.elapsed().as_secs_f64();
+
     // **S3.6-1 seam adapters.** Runs AFTER every gate that can still refuse a
     // subject, including the nesting pass above: a seam is computed from the
     // forms both ends actually settle on, so a subject withdrawn later would
     // leave glue bridging to a form that no longer exists.
+    let seam_started = std::time::Instant::now();
     let a5_site_proofs = decision::a5_site_proof::A5SeamProofIndex::derive(
         &program,
         &slots,
@@ -3428,6 +3525,7 @@ fn finish_decide<'tcx>(
         analysis.a5_mode,
         analysis.attestation,
     );
+    let seam_wall_s = seam_started.elapsed().as_secs_f64();
     table.seams = decision::seam::synthesize(
         tcx,
         &facts,
@@ -3442,7 +3540,7 @@ fn finish_decide<'tcx>(
             let local = Local::from_usize(param as usize);
             table.entries.iter().any(|(subject, decision)| {
                 let is_ref = match decision {
-                    decision::Decision::Ref { .. } => true,
+                    decision::Decision::Ref { .. } | decision::Decision::InferredRef { .. } => true,
                     decision::Decision::Slice { .. }
                     | decision::Decision::Opt { .. }
                     | decision::Decision::Box(_)
@@ -3461,6 +3559,20 @@ fn finish_decide<'tcx>(
     if let Err(why) = table.is_self_consistent_over(&subjects) {
         return Err(format!("decision table self-consistency: {why}"));
     }
+    let receipt_started = std::time::Instant::now();
+    let mut e2_artifacts =
+        e2_artifacts_from_table(tcx, &table, &hypothetical, &lifetime_eligibility)?;
+    e2_artifacts.timings = E2Timings {
+        cache_load_wall_s: format!("{:.6}", analysis.cache_load_wall_s),
+        origin_derivation_wall_s: format!("{:.6}", analysis.origin_derivation_wall_s),
+        pb_web_wall_s: format!("{:.6}", lifetime_eligibility.web_wall_s()),
+        eligibility_wall_s: format!("{:.6}", lifetime_eligibility.derive_wall_s()),
+        finalization_wall_s: format!("{finalization_wall_s:.6}"),
+        seam_wall_s: format!("{seam_wall_s:.6}"),
+        ast_placement_wall_s: "pending".to_owned(),
+        receipt_render_wall_s: format!("{:.6}", receipt_started.elapsed().as_secs_f64()),
+        compiler_verification_wall_s: "pending".to_owned(),
+    };
 
     // C.2: the in-process coverage gate is GONE. Its replacement is the
     // harness reconciliation in `coverage_recon`, driven from outside this
@@ -3478,6 +3590,7 @@ fn finish_decide<'tcx>(
             model,
             facts,
             coconv,
+            lifetime_eligibility,
             escapes,
             subjects,
             hypothetical,
@@ -3486,6 +3599,7 @@ fn finish_decide<'tcx>(
             analysis,
             a5_site_proofs,
             box_facts,
+            e2_artifacts,
         },
     ))
 }
@@ -3505,6 +3619,7 @@ pub(crate) struct DecideCtx {
     /// the census exporter, for R1's reason: the second derivation is what made
     /// the recon worker solve BO twice per program.
     coconv: decision::co_conversion::CoConv,
+    lifetime_eligibility: decision::lifetime::LifetimeEligibility,
     /// The escape shapes, measured **separately and deliberately not gated**.
     ///
     /// The handoff's boundary, kept: the pinned-callee flow is the hazard this
@@ -3525,6 +3640,7 @@ pub(crate) struct DecideCtx {
     analysis: DecisionAnalysisCarrier,
     a5_site_proofs: decision::a5_site_proof::A5SeamProofIndex,
     box_facts: decision::box_facts::BoxOwnershipFacts,
+    e2_artifacts: E2Artifacts,
 }
 
 impl DecideCtx {
@@ -3626,6 +3742,7 @@ fn box_mir_drop_policies(
             let plan = match decision {
                 decision::Decision::Box(plan) => plan,
                 decision::Decision::Ref { .. }
+                | decision::Decision::InferredRef { .. }
                 | decision::Decision::Slice { .. }
                 | decision::Decision::Opt { .. }
                 | decision::Decision::Degraded(_) => return None,
@@ -3700,6 +3817,7 @@ pub(crate) fn box_plan_artifact(tcx: TyCtxt<'_>) -> Result<BoxPlanArtifact, Stri
                     "-".to_owned(),
                 ),
                 decision::Decision::Ref { .. }
+                | decision::Decision::InferredRef { .. }
                 | decision::Decision::Slice { .. }
                 | decision::Decision::Opt { .. } => {
                     return Err(format!(
@@ -3762,12 +3880,15 @@ fn e1_subject_family(
         None => "unmodeled",
         Some(SlotKind::Ref) => {
             let form = match decision {
-                decision::Decision::Ref { .. } => Some("ref"),
+                decision::Decision::Ref { .. } | decision::Decision::InferredRef { .. } => {
+                    Some("ref")
+                }
                 decision::Decision::Slice { .. } => Some("slice"),
                 decision::Decision::Opt { .. } => Some("optional"),
                 decision::Decision::Box(_) => Some("box"),
                 decision::Decision::Degraded(_) => match hypothetical {
-                    Some(decision::Decision::Ref { .. }) => Some("ref"),
+                    Some(decision::Decision::Ref { .. })
+                    | Some(decision::Decision::InferredRef { .. }) => Some("ref"),
                     Some(decision::Decision::Slice { .. }) => Some("slice"),
                     Some(decision::Decision::Opt { .. }) => Some("optional"),
                     Some(decision::Decision::Box(_)) => Some("box"),
@@ -3786,12 +3907,295 @@ fn e1_subject_family(
                     _ => "ref",
                 },
                 decision::Decision::Ref { .. }
+                | decision::Decision::InferredRef { .. }
                 | decision::Decision::Slice { .. }
                 | decision::Decision::Opt { .. }
                 | decision::Decision::Box(_) => unreachable!("emitting form mapped above"),
             })
         }
     }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum E2TerminalDisposition<'a> {
+    Planned,
+    Failure(decision::lifetime::LifetimeFailure),
+    SecondaryDegradation(&'a decision::Degradation),
+    NotE2,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct E2DispositionInvariant<'a> {
+    record: &'a decision::Degradation,
+}
+
+impl E2DispositionInvariant<'_> {
+    fn key(self) -> &'static str {
+        "lifetime-invariant-permitted-own-primary"
+    }
+
+    fn payload(self) -> (String, String) {
+        (
+            self.record.reason.key().to_owned(),
+            self.record.reason.detail(),
+        )
+    }
+
+    fn message(self, subject_key: &str) -> String {
+        let (reason, detail) = self.payload();
+        format!(
+            "{}: subject={subject_key} reason={reason} detail={detail} site={}",
+            self.key(),
+            self.record.site.replace(['\t', '\r', '\n'], " "),
+        )
+    }
+}
+
+impl E2TerminalDisposition<'_> {
+    fn key(self) -> &'static str {
+        match self {
+            Self::Planned => "planned",
+            Self::Failure(failure) => failure.key(),
+            Self::SecondaryDegradation(_) => "lifetime-secondary-degradation",
+            Self::NotE2 => "not-e2",
+        }
+    }
+
+    fn secondary_payload(self) -> (String, String) {
+        match self {
+            Self::SecondaryDegradation(record) => {
+                (record.reason.key().to_owned(), record.reason.detail())
+            }
+            Self::Planned | Self::Failure(_) | Self::NotE2 => ("-".to_owned(), "-".to_owned()),
+        }
+    }
+}
+
+fn e2_terminal_disposition<'a>(
+    planned: bool,
+    has_lifetime_permit: bool,
+    failure: Option<decision::lifetime::LifetimeFailure>,
+    final_decision: &'a decision::Decision,
+) -> Result<E2TerminalDisposition<'a>, E2DispositionInvariant<'a>> {
+    use decision::lifetime::LifetimeFailure as F;
+
+    // Fixed classification order: tranche holds and origin failures through
+    // conflict are known before the final decision. A secondary blocker first
+    // exists after that decision, and therefore precedes AST/seam placement.
+    if let Some(
+        failure @ (F::FieldHeld
+        | F::ExternalContractAbsent
+        | F::FnPtrWebHeld
+        | F::OriginUnknown
+        | F::OriginAbsent
+        | F::OriginConflict),
+    ) = failure
+    {
+        return Ok(E2TerminalDisposition::Failure(failure));
+    }
+
+    // ClassBlocked is collateral by construction: `via` belongs to a
+    // classmate. Hoist it above the row-local permit test so a permit-less
+    // class member preserves the secondary reason and payload.
+    let class_coupling = match final_decision {
+        decision::Decision::Degraded(record)
+            if matches!(record.reason, decision::DegradeReason::ClassBlocked { .. }) =>
+        {
+            Some(record)
+        }
+        decision::Decision::Degraded(_)
+        | decision::Decision::Ref { .. }
+        | decision::Decision::InferredRef { .. }
+        | decision::Decision::Slice { .. }
+        | decision::Decision::Opt { .. }
+        | decision::Decision::Box(_) => None,
+    };
+    if let Some(record) = class_coupling {
+        return Ok(E2TerminalDisposition::SecondaryDegradation(record));
+    }
+
+    if has_lifetime_permit {
+        match final_decision {
+            decision::Decision::Degraded(record) => match &record.reason {
+                decision::DegradeReason::SilentCoercion {
+                    via: decision::co_conversion::BlockReason::EscapesViaReturn,
+                } => return Err(E2DispositionInvariant { record }),
+                // `ClassBlocked { via }` is class coupling: `via` belongs to a
+                // classmate, so this row always reports a secondary blocker.
+                _ => return Ok(E2TerminalDisposition::SecondaryDegradation(record)),
+            },
+            decision::Decision::Ref { .. }
+            | decision::Decision::InferredRef { .. }
+            | decision::Decision::Slice { .. }
+            | decision::Decision::Opt { .. }
+            | decision::Decision::Box(_) => {}
+        }
+    }
+
+    if let Some(failure @ (F::AstUnplaceable | F::SeamIncompatible)) = failure {
+        return Ok(E2TerminalDisposition::Failure(failure));
+    }
+    if planned {
+        Ok(E2TerminalDisposition::Planned)
+    } else {
+        Ok(E2TerminalDisposition::NotE2)
+    }
+}
+
+fn e2_artifacts_from_table(
+    tcx: TyCtxt<'_>,
+    table: &decision::DecisionTable,
+    ordinary: &decision::DecisionTable,
+    eligibility: &decision::lifetime::LifetimeEligibility,
+) -> Result<E2Artifacts, String> {
+    let ordinary = ordinary
+        .entries
+        .iter()
+        .map(|(subject, decision)| ((subject.fn_did, subject.hir_id), decision))
+        .collect::<rustc_hash::FxHashMap<_, _>>();
+    let mut subject_rows = Vec::new();
+    let mut failure_rows = Vec::new();
+    for (subject, final_decision) in &table.entries {
+        let key = (subject.fn_did, subject.hir_id);
+        let owner = tcx.def_path_str(subject.fn_did.to_def_id());
+        let subject_key = subject.identity_key(&owner);
+        let plan = table.lifetime_plan.function(subject.fn_did);
+        let has_lifetime_permit = eligibility.return_permit(key).is_some()
+            || eligibility.inferred_permit(key).is_some()
+            || eligibility.is_output_source(key);
+        let planned = plan.is_some() && has_lifetime_permit;
+        let fallback_failure = match final_decision {
+            decision::Decision::Degraded(record) => match &record.reason {
+                decision::DegradeReason::SilentCoercion { via }
+                | decision::DegradeReason::ClassBlocked { via } => match via {
+                    decision::co_conversion::BlockReason::EscapesViaFieldStore => {
+                        Some(decision::lifetime::LifetimeFailure::FieldHeld)
+                    }
+                    decision::co_conversion::BlockReason::EscapesViaForeignArg
+                    | decision::co_conversion::BlockReason::BorrowedIntoRawParam => {
+                        Some(decision::lifetime::LifetimeFailure::ExternalContractAbsent)
+                    }
+                    _ => None,
+                },
+                _ => None,
+            },
+            _ => None,
+        };
+        let failure = eligibility.failure(key).or(fallback_failure);
+        let disposition =
+            e2_terminal_disposition(planned, has_lifetime_permit, failure, final_decision)
+                .map_err(|invariant| invariant.message(&subject_key))?;
+        let (secondary_reason, secondary_detail) = disposition.secondary_payload();
+        let ordinary_decision = ordinary.get(&key).copied();
+        let ordinary_key = match ordinary_decision {
+            Some(decision::Decision::Ref { .. }) => "ref",
+            Some(decision::Decision::InferredRef { .. }) => "inferred-ref",
+            Some(decision::Decision::Slice { .. }) => "slice",
+            Some(decision::Decision::Opt { .. }) => "optional",
+            Some(decision::Decision::Box(_)) => "box",
+            Some(decision::Decision::Degraded(record)) => record.reason.key(),
+            None => "missing",
+        };
+        let final_key = match final_decision {
+            decision::Decision::Ref { .. } => "ref",
+            decision::Decision::InferredRef { .. } => "inferred-ref",
+            decision::Decision::Slice { .. } => "slice",
+            decision::Decision::Opt { .. } => "optional",
+            decision::Decision::Box(_) => "box",
+            decision::Decision::Degraded(record) => record.reason.key(),
+        };
+        let digest = plan.map_or_else(|| "-".to_owned(), |plan| plan.digest());
+        let justification = if planned {
+            plan::Justification::LifetimePlan {
+                digest: digest.clone(),
+            }
+        } else {
+            plan::Justification::KindDecision { kind: "none" }
+        };
+        let justification_key = match justification {
+            plan::Justification::LifetimePlan { .. } => "lifetime-plan",
+            _ => "-",
+        };
+        let construction = subject
+            .ctor
+            .as_ref()
+            .map_or("-", decision::construction::Construction::key);
+        subject_rows.push(format!(
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            subject_key,
+            owner,
+            subject.local.as_u32(),
+            subject.ptr_depth,
+            construction,
+            ordinary_key,
+            final_key,
+            disposition.key(),
+            justification_key,
+            digest,
+            secondary_reason,
+            secondary_detail,
+        ));
+        if let Some(failure) = failure {
+            failure_rows.push(format!(
+                "{}\t{}\t{}\t{}",
+                subject_key,
+                owner,
+                failure.key(),
+                construction,
+            ));
+        }
+    }
+    subject_rows.sort();
+    failure_rows.sort();
+
+    let mut function_rows = table
+        .lifetime_plan
+        .functions()
+        .map(|(did, function)| {
+            format!(
+                "{}\t{}\t{}\t{}\t{}",
+                tcx.def_path_str(did.to_def_id()),
+                function.digest(),
+                function.sccs.len(),
+                function.outlives.len(),
+                function.receipt().replace('\n', " | "),
+            )
+        })
+        .collect::<Vec<_>>();
+    function_rows.sort();
+    let mut pb_rows = Vec::new();
+    for root in eligibility.web_roots() {
+        pb_rows.push(format!("root\t{root}\tadjusted-fnptr"));
+    }
+    for (member, reason) in eligibility.web_members() {
+        pb_rows.push(format!("closure\t{member}\t{reason}"));
+    }
+    pb_rows.sort();
+
+    Ok(E2Artifacts {
+        subjects: format!(
+            "subject_key\towner_fn\tmir_local\tptr_depth\tconstruction\tordinary_decision\tfinal_decision\te2_disposition\tjustification\tlifetime_plan_digest\tsecondary_reason\tsecondary_reason_detail\n{}{}",
+            subject_rows.join("\n"),
+            if subject_rows.is_empty() { "" } else { "\n" },
+        ),
+        functions: format!(
+            "function\tlifetime_plan_digest\tsccs\toutlives\tplan_receipt\n{}{}",
+            function_rows.join("\n"),
+            if function_rows.is_empty() { "" } else { "\n" },
+        ),
+        failures: format!(
+            "subject_key\towner_fn\tfailure\tconstruction\n{}{}",
+            failure_rows.join("\n"),
+            if failure_rows.is_empty() { "" } else { "\n" },
+        ),
+        seams: seam_tsv_from_table(tcx, table),
+        pb_web: format!(
+            "unit\tfunction\treason\n{}{}",
+            pb_rows.join("\n"),
+            if pb_rows.is_empty() { "" } else { "\n" },
+        ),
+        timings: E2Timings::default(),
+    })
 }
 
 /// Addendum 90's identity seed, produced inside the one E1 compiler callback
@@ -3844,6 +4248,12 @@ fn e1_subject_seed_tsv(
                 "-".to_owned(),
                 decision::emitability::EmitabilityFacts::site(tcx, subject.attribution_span()),
             ),
+            decision::Decision::InferredRef { callee, .. } => (
+                "inferred-ref",
+                "-",
+                tcx.def_path_str(callee.to_def_id()),
+                decision::emitability::EmitabilityFacts::site(tcx, subject.attribution_span()),
+            ),
             decision::Decision::Slice { .. } => (
                 "slice",
                 "-",
@@ -3865,19 +4275,14 @@ fn e1_subject_seed_tsv(
             decision::Decision::Degraded(record) => (
                 "degraded",
                 record.reason.key(),
-                match &record.reason {
-                    decision::DegradeReason::ClassBlocked { via }
-                    | decision::DegradeReason::SilentCoercion { via } => via.key().to_owned(),
-                    decision::DegradeReason::RawPointerOperation { op } => op.clone(),
-                    decision::DegradeReason::UnsupportedDeclShape { shape } => (*shape).to_owned(),
-                    _ => "-".to_owned(),
-                },
+                record.reason.detail(),
                 record.site.clone(),
             ),
         };
         let unplaced_reason = unplaced.remove(key.as_str());
         let emits = match decision {
             decision::Decision::Ref { .. }
+            | decision::Decision::InferredRef { .. }
             | decision::Decision::Slice { .. }
             | decision::Decision::Opt { .. }
             | decision::Decision::Box(_) => true,
@@ -4558,6 +4963,7 @@ fn freed_slots_tsv_from(
                 (s.fn_did, s.local),
                 match d {
                     decision::Decision::Ref { .. } => "emitted-ref".to_owned(),
+                    decision::Decision::InferredRef { .. } => "inferred-ref".to_owned(),
                     decision::Decision::Slice { .. } => "emitted-slice".to_owned(),
                     decision::Decision::Opt { slice, .. } => {
                         if *slice {
@@ -4782,7 +5188,7 @@ pub(crate) fn seam_tsv(tcx: TyCtxt<'_>) -> Result<String, String> {
 fn seam_tsv_from_table(tcx: TyCtxt<'_>, table: &decision::DecisionTable) -> String {
     let sm = tcx.sess.source_map();
     let mut out = String::from(
-        "kind\towner_fn\tfamily_or_reason\tsite\tlen_arm\tglue_shape\tcaller\tparam_index\ttemplate\tnull_arm\textent_arm\tadapter_key\tsource_shape\tcontext\tdestination\texpected_form\tfound_form\tcandidate_template\tpeer_pairs\troot_identity\tblind\toverlap_verdict\toverlap_reason\tresolved_call_location\ta5_peer_proofs\toverlap_a5_world\toverlap_a5_abi_guard\n",
+        "kind\towner_fn\tfamily_or_reason\tsite\tlen_arm\tglue_shape\tcaller\tparam_index\ttemplate\tnull_arm\textent_arm\tadapter_key\tsource_shape\tcontext\tdestination\texpected_form\tfound_form\tcandidate_template\tpeer_pairs\troot_identity\tblind\toverlap_verdict\toverlap_reason\tresolved_call_location\ta5_peer_proofs\toverlap_a5_world\toverlap_a5_abi_guard\tlifetime_plan_digest\n",
     );
     for edit in &table.seams.edits {
         let family = match edit.family {
@@ -4834,7 +5240,11 @@ fn seam_tsv_from_table(tcx: TyCtxt<'_>, table: &decision::DecisionTable) -> Stri
             edit.root_identity,
             u8::from(edit.blind),
         ));
-        push_overlap_columns(&mut out, edit.overlap.as_ref());
+        push_overlap_columns(
+            &mut out,
+            edit.overlap.as_ref(),
+            edit.lifetime_plan_digest.as_deref().unwrap_or("-"),
+        );
     }
     // **`owner_fn` is the REVERT KEY on every row kind** (2026-08-12). It was
     // the callee on `placed` rows and the CALLER on these, so the two kinds
@@ -4878,7 +5288,7 @@ fn seam_tsv_from_table(tcx: TyCtxt<'_>, table: &decision::DecisionTable) -> Stri
             blocked.root_identity,
             u8::from(blocked.blind),
         ));
-        push_overlap_columns(&mut out, blocked.overlap.as_ref());
+        push_overlap_columns(&mut out, blocked.overlap.as_ref(), "-");
     }
     for edit in &table.seams.body_edits {
         let family = match edit.family {
@@ -4907,7 +5317,7 @@ fn seam_tsv_from_table(tcx: TyCtxt<'_>, table: &decision::DecisionTable) -> Stri
             edit.root_identity,
             u8::from(edit.blind),
         ));
-        push_overlap_columns(&mut out, None);
+        push_overlap_columns(&mut out, None, "-");
     }
     for blocked in &table.seams.body_blocked {
         let site = sm.span_to_diagnostic_string(blocked.span);
@@ -4929,7 +5339,7 @@ fn seam_tsv_from_table(tcx: TyCtxt<'_>, table: &decision::DecisionTable) -> Stri
             blocked.root_identity,
             u8::from(blocked.blind),
         ));
-        push_overlap_columns(&mut out, None);
+        push_overlap_columns(&mut out, None, "-");
     }
     // Item 4a: companion-length coverage, one row per LENGTH-GATED POSITION.
     for (callee, index, evidence) in &table.seams.length_evidence {
@@ -4937,7 +5347,7 @@ fn seam_tsv_from_table(tcx: TyCtxt<'_>, table: &decision::DecisionTable) -> Stri
             "lengated\t{callee}\t{}\t#{index}\t-\t-\t-\t{index}\t-\t-\t-\t-\t-\t-\t-\t-\t-\t-\t-\t-\t-",
             evidence.key()
         ));
-        push_overlap_columns(&mut out, None);
+        push_overlap_columns(&mut out, None, "-");
     }
     // Rule 1 (2026-08-11): a pair that fired with no census row is REPORTED.
     // The census is a prioritization overlay and has already been shown
@@ -4946,7 +5356,7 @@ fn seam_tsv_from_table(tcx: TyCtxt<'_>, table: &decision::DecisionTable) -> Stri
         out.push_str(&format!(
             "uncensused\t-\t{found:?} -> {expected:?}\t-\t-\t-\t-\t-\t-\t-\t-\t-\t-\t-\t-\t-\t-\t-\t-\t-"
         ));
-        push_overlap_columns(&mut out, None);
+        push_overlap_columns(&mut out, None, "-");
     }
     for proof in &table.seams.overlap_proofs {
         let caller = tcx.def_path_str(proof.caller.to_def_id());
@@ -4961,15 +5371,19 @@ fn seam_tsv_from_table(tcx: TyCtxt<'_>, table: &decision::DecisionTable) -> Stri
             proof.index,
             proof.candidate_template,
         ));
-        push_overlap_columns(&mut out, Some(proof));
+        push_overlap_columns(&mut out, Some(proof), "-");
     }
     out
 }
 
-fn push_overlap_columns(output: &mut String, proof: Option<&decision::seam::A5PositionProof>) {
+fn push_overlap_columns(
+    output: &mut String,
+    proof: Option<&decision::seam::A5PositionProof>,
+    lifetime_plan_digest: &str,
+) {
     if let Some(proof) = proof {
         output.push_str(&format!(
-            "\t{}\t{}\t{}\t{}\t{}\t{}\n",
+            "\t{}\t{}\t{}\t{}\t{}\t{}\t{lifetime_plan_digest}\n",
             proof.verdict.key(),
             proof.reason,
             proof.locations,
@@ -4978,6 +5392,6 @@ fn push_overlap_columns(output: &mut String, proof: Option<&decision::seam::A5Po
             proof.guard,
         ));
     } else {
-        output.push_str("\t-\t-\t-\t-\t-\t-\n");
+        output.push_str(&format!("\t-\t-\t-\t-\t-\t-\t{lifetime_plan_digest}\n"));
     }
 }

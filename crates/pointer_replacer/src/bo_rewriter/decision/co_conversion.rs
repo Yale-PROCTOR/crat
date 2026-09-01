@@ -47,6 +47,7 @@ use rustc_span::Span;
 use super::{
     Decision, DecisionTable, Subject, SubjectKind,
     emitability::{ArgShape, EmitabilityFacts, RefKind},
+    lifetime::LifetimeEligibility,
 };
 use crate::analyses::borrow_ownership::{a5_overlap::PairSide, a5_producer::PlannedC9Mark};
 
@@ -327,6 +328,26 @@ pub(crate) fn build_with_c9_marks(
     overlap: OverlapRule,
     c9_marks: &[PlannedC9Mark],
 ) -> CoConv {
+    build_with_c9_marks_and_lifetimes(
+        facts,
+        subjects,
+        hypothetical,
+        escapes,
+        overlap,
+        c9_marks,
+        &LifetimeEligibility::default(),
+    )
+}
+
+pub(crate) fn build_with_c9_marks_and_lifetimes(
+    facts: &EmitabilityFacts,
+    subjects: &[Subject],
+    hypothetical: &DecisionTable,
+    escapes: &[Escape],
+    overlap: OverlapRule,
+    c9_marks: &[PlannedC9Mark],
+    lifetime_eligibility: &LifetimeEligibility,
+) -> CoConv {
     // ---- 1. the node set: subjects that would emit a PLAIN reference ----
     //
     // Slice and optional forms are deliberately excluded. `&mut [T]` and
@@ -343,7 +364,7 @@ pub(crate) fn build_with_c9_marks(
         // shape that once dropped a subject from `emitted_subjects` entirely.
         // A `match` makes the next disposition a compile error here.
         let mutable = match decision {
-            Decision::Ref { mutable } => *mutable,
+            Decision::Ref { mutable } | Decision::InferredRef { mutable, .. } => *mutable,
             Decision::Slice { .. }
             | Decision::Opt { .. }
             | Decision::Box(_)
@@ -361,7 +382,10 @@ pub(crate) fn build_with_c9_marks(
         .iter()
         .filter_map(|(subject, decision)| match decision {
             Decision::Slice { .. } | Decision::Opt { .. } => Some((subject.fn_did, subject.hir_id)),
-            Decision::Ref { .. } | Decision::Box(_) | Decision::Degraded(_) => None,
+            Decision::Ref { .. }
+            | Decision::InferredRef { .. }
+            | Decision::Box(_)
+            | Decision::Degraded(_) => None,
         })
         .collect();
     let index: FxHashMap<NodeKey, usize> = order.iter().enumerate().map(|(i, k)| (*k, i)).collect();
@@ -404,11 +428,8 @@ pub(crate) fn build_with_c9_marks(
         if !converts.contains(&escape.subject) {
             continue;
         }
-        let reason = match escape.kind {
-            EscapeKind::Return => BlockReason::EscapesViaReturn,
-            EscapeKind::ForeignArg => BlockReason::EscapesViaForeignArg,
-            EscapeKind::FieldStore => BlockReason::EscapesViaFieldStore,
-            EscapeKind::StaticStore => BlockReason::EscapesViaStaticStore,
+        let Some(reason) = escape_block_reason(escape, lifetime_eligibility) else {
+            continue;
         };
         block(&mut node_block, escape.subject, reason);
     }
@@ -633,6 +654,43 @@ pub(crate) fn build_with_c9_marks(
     }
 }
 
+fn escape_block_reason(
+    escape: &Escape,
+    lifetime_eligibility: &LifetimeEligibility,
+) -> Option<BlockReason> {
+    match escape.kind {
+        EscapeKind::Return if lifetime_eligibility.return_permit(escape.subject).is_some() => None,
+        EscapeKind::Return => Some(BlockReason::EscapesViaReturn),
+        EscapeKind::ForeignArg => Some(BlockReason::EscapesViaForeignArg),
+        EscapeKind::FieldStore
+            if escape.target.is_some_and(|target| {
+                lifetime_eligibility.permits_output_storage(escape.subject, target)
+            }) =>
+        {
+            None
+        }
+        EscapeKind::FieldStore => Some(BlockReason::EscapesViaFieldStore),
+        EscapeKind::StaticStore => Some(BlockReason::EscapesViaStaticStore),
+    }
+}
+
+#[cfg(test)]
+fn escape_block_reason_for_test(
+    kind: EscapeKind,
+    subject: NodeKey,
+    lifetime_eligibility: &LifetimeEligibility,
+) -> Option<BlockReason> {
+    escape_block_reason(
+        &Escape {
+            subject,
+            kind,
+            span: rustc_span::DUMMY_SP,
+            target: None,
+        },
+        lifetime_eligibility,
+    )
+}
+
 // ---------------------------------------------------------------------------
 // The escape census — MEASUREMENT ONLY, and the boundary is the point
 // ---------------------------------------------------------------------------
@@ -689,6 +747,7 @@ pub(crate) struct Escape {
     pub subject: NodeKey,
     pub kind: EscapeKind,
     pub span: Span,
+    pub target: Option<NodeKey>,
 }
 
 /// Count the escape shapes, per subject, over every subject-bearing function.
@@ -730,10 +789,14 @@ pub(crate) fn escapes(
                 && self.owned.contains(&(self.fn_did, hir_id))
                 && let Some(kind) = self.classify(expr)
             {
+                let target = (kind == EscapeKind::FieldStore)
+                    .then(|| self.field_store_target(expr))
+                    .flatten();
                 self.out.push(Escape {
                     subject: (self.fn_did, hir_id),
                     kind,
                     span: expr.span,
+                    target,
                 });
             }
             intravisit::walk_expr(self, expr);
@@ -741,6 +804,28 @@ pub(crate) fn escapes(
     }
 
     impl V<'_, '_> {
+        fn field_store_target(&self, use_expr: &Expr<'_>) -> Option<NodeKey> {
+            let rustc_hir::Node::Expr(parent) = self.tcx.parent_hir_node(use_expr.hir_id) else {
+                return None;
+            };
+            let ExprKind::Assign(lhs, rhs, _) = &parent.kind else {
+                return None;
+            };
+            if rhs.hir_id != use_expr.hir_id {
+                return None;
+            }
+            let ExprKind::Unary(rustc_hir::UnOp::Deref, base) = &lhs.kind else {
+                return None;
+            };
+            let ExprKind::Path(QPath::Resolved(_, path)) = &base.kind else {
+                return None;
+            };
+            let Res::Local(binding) = path.res else {
+                return None;
+            };
+            Some((self.fn_did, binding))
+        }
+
         /// Is this callee one the class machinery can actually see?
         ///
         /// **Membership in the program's function list, not `DefId` locality.**
@@ -827,4 +912,40 @@ pub(crate) fn escapes(
         v.visit_body(body);
     }
     out
+}
+
+#[cfg(test)]
+mod e2_return_permit_tests {
+    use rustc_hir::{CRATE_HIR_ID, def_id::CRATE_DEF_ID};
+
+    use super::*;
+    use crate::bo_rewriter::decision::lifetime::LifetimeEligibility;
+
+    #[test]
+    fn e2_return_permit_skips_only_the_named_return_escape() {
+        let subject = (CRATE_DEF_ID, CRATE_HIR_ID);
+        let permitted = LifetimeEligibility::with_return_permit_for_test(subject);
+        let empty = LifetimeEligibility::default();
+
+        assert_eq!(
+            escape_block_reason_for_test(EscapeKind::Return, subject, &permitted),
+            None
+        );
+        assert_eq!(
+            escape_block_reason_for_test(EscapeKind::Return, subject, &empty),
+            Some(BlockReason::EscapesViaReturn)
+        );
+        assert_eq!(
+            escape_block_reason_for_test(EscapeKind::ForeignArg, subject, &permitted),
+            Some(BlockReason::EscapesViaForeignArg)
+        );
+        assert_eq!(
+            escape_block_reason_for_test(EscapeKind::FieldStore, subject, &permitted),
+            Some(BlockReason::EscapesViaFieldStore)
+        );
+        assert_eq!(
+            escape_block_reason_for_test(EscapeKind::StaticStore, subject, &permitted),
+            Some(BlockReason::EscapesViaStaticStore)
+        );
+    }
 }
