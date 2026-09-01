@@ -46,6 +46,8 @@ mod box_census_schema;
 #[cfg(test)]
 mod crown_usage_metric;
 #[cfg(test)]
+mod raw_boundary_census_schema;
+#[cfg(test)]
 mod recon_fixtures;
 #[cfg(test)]
 mod tests;

@@ -17830,13 +17830,82 @@ fn box_census_schema_renamed_identifier_is_a_compile_error() {
     );
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct RawBoundaryPrimaryControlCounts {
+    libc_subjects: usize,
+    libc_edges: usize,
+    free_subjects: usize,
+    t2_local: usize,
+    t2_raw_caller: usize,
+    t2_flow_collateral: usize,
+    t2_arg_collateral: usize,
+    crown_return: usize,
+}
+
+fn parse_raw_boundary_primary_control(
+    input: &str,
+) -> Result<RawBoundaryPrimaryControlCounts, String> {
+    let mut lines = input.lines();
+    let header = lines.next().ok_or_else(|| "control is empty".to_owned())?;
+    let names = header
+        .split('\t')
+        .enumerate()
+        .map(|(index, name)| (name, index))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let column = |name: &str| {
+        names
+            .get(name)
+            .copied()
+            .ok_or_else(|| format!("control lacks {name}"))
+    };
+    let category = column("category")?;
+    let subkind = column("typed_subkind")?;
+    let edges = column("consumer_edges")?;
+    let key = column("record_key")?;
+    let mut seen = std::collections::BTreeSet::new();
+    let mut out = RawBoundaryPrimaryControlCounts::default();
+    for (offset, line) in lines.enumerate() {
+        let fields = line.split('\t').collect::<Vec<_>>();
+        let value = |index: usize| {
+            fields
+                .get(index)
+                .copied()
+                .ok_or_else(|| format!("control row {} is short", offset + 2))
+        };
+        let identity = value(key)?;
+        if !seen.insert(identity.to_owned()) {
+            return Err(format!("duplicate control identity {identity}"));
+        }
+        match (value(category)?, value(subkind)?) {
+            ("LIBC-CONTRACT-OPENABLE", "known-libc-no-independent-hard-conflict") => {
+                out.libc_subjects += 1;
+                out.libc_edges += value(edges)?
+                    .split(';')
+                    .filter(|edge| !edge.is_empty() && *edge != "-")
+                    .count();
+            }
+            (_, "unsafe-bridge-known-no-retention-free-boundary") => out.free_subjects += 1,
+            (_, "flows-into-raw-param/retention-unknown-local") => out.t2_local += 1,
+            (_, "arg-stays-raw/raw-caller-boundary") => out.t2_raw_caller += 1,
+            (_, "class-collateral/flows-into-raw-param") => out.t2_flow_collateral += 1,
+            (_, "class-collateral/arg-stays-raw") => out.t2_arg_collateral += 1,
+            (_, "return-boundary-lifetime-origin-absent") => out.crown_return += 1,
+            _ => {}
+        }
+    }
+    Ok(out)
+}
+
 #[test]
 fn raw_boundary_census_schema_is_one_shared_authority() {
     use crate::raw_boundary_census_schema as schema;
 
     let keys = schema::ALL;
     assert_eq!(
-        keys.iter().copied().collect::<BTreeSet<_>>().len(),
+        keys.iter()
+            .copied()
+            .collect::<std::collections::BTreeSet<_>>()
+            .len(),
         keys.len(),
         "raw-boundary worker/parent keys must be unique"
     );
