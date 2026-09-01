@@ -18294,6 +18294,717 @@ fn parse_raw_boundary_primary_control(
     Ok(out)
 }
 
+#[derive(Debug)]
+struct ParsedTsv {
+    columns: std::collections::BTreeMap<String, usize>,
+    rows: Vec<Vec<String>>,
+}
+
+impl ParsedTsv {
+    fn parse(input: &str) -> Result<Self, String> {
+        let mut lines = input.lines();
+        let header = lines.next().ok_or_else(|| "TSV is empty".to_owned())?;
+        let columns = header
+            .split('\t')
+            .enumerate()
+            .map(|(index, name)| (name.to_owned(), index))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        let width = columns.len();
+        let mut rows = Vec::new();
+        for (offset, line) in lines.enumerate() {
+            let fields = line.split('\t').map(str::to_owned).collect::<Vec<_>>();
+            if fields.len() != width {
+                return Err(format!(
+                    "TSV row {} has {} fields, expected {width}",
+                    offset + 2,
+                    fields.len()
+                ));
+            }
+            rows.push(fields);
+        }
+        Ok(Self { columns, rows })
+    }
+
+    fn index(&self, name: &str) -> Result<usize, String> {
+        self.columns
+            .get(name)
+            .copied()
+            .ok_or_else(|| format!("TSV lacks {name}"))
+    }
+
+    fn field<'a>(&self, row: &'a [String], name: &str) -> Result<&'a str, String> {
+        row.get(self.index(name)?)
+            .map(String::as_str)
+            .ok_or_else(|| format!("TSV row lacks {name}"))
+    }
+}
+
+#[derive(Clone, Debug)]
+struct RawBoundaryControlReconciliation {
+    libc_subjects: usize,
+    libc_edges: usize,
+    free_rows: usize,
+    t2_rows: usize,
+    box_rows: usize,
+    crown_rows: usize,
+    arm_b_rows: usize,
+    divergences: String,
+    arm_b_ledger: String,
+}
+
+fn control_edge_parts(edge: &str) -> Option<(&str, usize, usize)> {
+    let (callee, rest) = edge.split_once('#')?;
+    let (argument, site) = rest.split_once('@')?;
+    let argument = argument.parse::<usize>().ok()?;
+    let line = site
+        .split_once(".rs:")?
+        .1
+        .split(':')
+        .next()?
+        .parse::<usize>()
+        .ok()?;
+    Some((callee, argument, line))
+}
+
+fn diagnostic_site_line(site: &str) -> Option<usize> {
+    site.split_once(".rs:")?
+        .1
+        .split(':')
+        .next()?
+        .parse::<usize>()
+        .ok()
+}
+
+fn reconcile_raw_boundary_controls(
+    primary: &str,
+    box_control: &str,
+    subject_artifacts: &[(String, String)],
+    disposition_artifacts: &[(String, String)],
+) -> Result<RawBoundaryControlReconciliation, String> {
+    let primary = ParsedTsv::parse(primary)?;
+    let box_control = ParsedTsv::parse(box_control)?;
+    let mut subject_index = std::collections::BTreeMap::<
+        (String, String),
+        std::collections::BTreeMap<String, String>,
+    >::new();
+    for (program, text) in subject_artifacts {
+        let parsed = ParsedTsv::parse(text)?;
+        for row in &parsed.rows {
+            let identity = parsed.field(row, "subject_identity")?.to_owned();
+            let record = parsed
+                .columns
+                .iter()
+                .map(|(name, index)| (name.clone(), row[*index].clone()))
+                .collect();
+            if subject_index
+                .insert((program.clone(), identity.clone()), record)
+                .is_some()
+            {
+                return Err(format!("duplicate production subject {program}:{identity}"));
+            }
+        }
+    }
+    let mut dispositions = Vec::<std::collections::BTreeMap<String, String>>::new();
+    for (program, text) in disposition_artifacts {
+        let parsed = ParsedTsv::parse(text)?;
+        for row in &parsed.rows {
+            let mut record = parsed
+                .columns
+                .iter()
+                .map(|(name, index)| (name.clone(), row[*index].clone()))
+                .collect::<std::collections::BTreeMap<_, _>>();
+            record.insert("program".to_owned(), program.clone());
+            dispositions.push(record);
+        }
+    }
+    let mut divergences = String::from("control\tprogram\tidentity\treason\tdetail\n");
+    let mut arm_b = String::from(
+        "unit\tprogram\tidentity\tboundary_direction\tmodel_kind\tblocker\tmissing_fact\tarm_a_applicable\n",
+    );
+    let mut counts = RawBoundaryControlReconciliation {
+        libc_subjects: 0,
+        libc_edges: 0,
+        free_rows: 0,
+        t2_rows: 0,
+        box_rows: 0,
+        crown_rows: 0,
+        arm_b_rows: 0,
+        divergences: String::new(),
+        arm_b_ledger: String::new(),
+    };
+    for row in &primary.rows {
+        let program = primary.field(row, "program")?;
+        let identity = primary.field(row, "record_key")?;
+        let category = primary.field(row, "category")?;
+        let subkind = primary.field(row, "typed_subkind")?;
+        let subject = subject_index.get(&(program.to_owned(), identity.to_owned()));
+        match (category, subkind) {
+            ("LIBC-CONTRACT-OPENABLE", "known-libc-no-independent-hard-conflict") => {
+                counts.libc_subjects += 1;
+                if subject.is_none() {
+                    divergences.push_str(&format!(
+                        "libc\t{program}\t{identity}\tmissing-production-subject\t-\n"
+                    ));
+                }
+                for edge in primary.field(row, "consumer_edges")?.split(';') {
+                    let Some((callee, argument, line)) = control_edge_parts(edge) else {
+                        divergences.push_str(&format!(
+                            "libc\t{program}\t{identity}\tmalformed-control-edge\t{edge}\n"
+                        ));
+                        continue;
+                    };
+                    counts.libc_edges += 1;
+                    let matches = dispositions
+                        .iter()
+                        .filter(|record| {
+                            record.get("program").is_some_and(|value| value == program)
+                                && record
+                                    .get("subject_identity")
+                                    .is_some_and(|value| value == identity)
+                                && record.get("tier").is_some_and(|value| value == "T1")
+                                && record.get("argument_index").is_some_and(|value| {
+                                    value.parse::<usize>().ok() == Some(argument)
+                                })
+                                && record
+                                    .get("callee")
+                                    .is_some_and(|value| value.split("::").last() == Some(callee))
+                                && record
+                                    .get("source_site")
+                                    .and_then(|value| diagnostic_site_line(value))
+                                    == Some(line)
+                        })
+                        .count();
+                    if matches != 1 {
+                        divergences.push_str(&format!(
+                            "libc-edge\t{program}\t{identity}\texact-site-match-{matches}\t{edge}\n"
+                        ));
+                    }
+                }
+            }
+            (_, "unsafe-bridge-known-no-retention-free-boundary") => {
+                counts.free_rows += 1;
+                let matches = dispositions
+                    .iter()
+                    .filter(|record| {
+                        record.get("program").is_some_and(|value| value == program)
+                            && record
+                                .get("subject_identity")
+                                .is_some_and(|value| value == identity)
+                            && record.get("tier").is_some_and(|value| value == "T1")
+                            && record
+                                .get("template")
+                                .is_some_and(|value| value == "known-free-drop")
+                    })
+                    .count();
+                if matches != 1 {
+                    divergences.push_str(&format!(
+                        "free\t{program}\t{identity}\texact-lifecycle-match-{matches}\t-\n"
+                    ));
+                }
+            }
+            (_, "flows-into-raw-param/retention-unknown-local")
+            | (_, "arg-stays-raw/raw-caller-boundary")
+            | (_, "class-collateral/flows-into-raw-param")
+            | (_, "class-collateral/arg-stays-raw") => {
+                counts.t2_rows += 1;
+                let Some(subject) = subject else {
+                    divergences.push_str(&format!(
+                        "t2\t{program}\t{identity}\tmissing-production-subject\t{subkind}\n"
+                    ));
+                    continue;
+                };
+                let direct_tiers = subject.get("direct_tiers").map_or("-", String::as_str);
+                let class_block = subject.get("class_block").map_or("-", String::as_str);
+                let node_block = subject.get("node_block").map_or("-", String::as_str);
+                let matches = match subkind {
+                    "flows-into-raw-param/retention-unknown-local" => {
+                        direct_tiers.split(';').any(|tier| tier == "T2")
+                    }
+                    "arg-stays-raw/raw-caller-boundary" => {
+                        class_block == "arg-stays-raw" || node_block == "arg-stays-raw"
+                    }
+                    "class-collateral/flows-into-raw-param" => {
+                        class_block == "flows-into-raw-param"
+                    }
+                    "class-collateral/arg-stays-raw" => class_block == "arg-stays-raw",
+                    _ => false,
+                };
+                if !matches {
+                    divergences.push_str(&format!(
+                        "t2\t{program}\t{identity}\tclassification-mismatch\t{subkind}:tiers={direct_tiers}:class={class_block}:node={node_block}\n"
+                    ));
+                }
+            }
+            (_, "return-boundary-lifetime-origin-absent") => {
+                counts.crown_rows += 1;
+                counts.arm_b_rows += 1;
+                arm_b.push_str(&format!(
+                    "crown-return\t{program}\t{identity}\treturn\tcomparison-only\towning-return-contract-absent\towning-return-contract\t0\n"
+                ));
+            }
+            _ => {}
+        }
+    }
+    for row in &box_control.rows {
+        if box_control.field(row, "reason")? != "box-param-caller-unknown" {
+            continue;
+        }
+        let identity = box_control.field(row, "subject_key")?;
+        let program = box_control
+            .columns
+            .get("program")
+            .and_then(|index| row.get(*index))
+            .map(String::as_str)
+            .or_else(|| {
+                subject_index.keys().find_map(|(program, candidate)| {
+                    (candidate == identity).then_some(program.as_str())
+                })
+            })
+            .unwrap_or("<missing>");
+        let subject = subject_index.get(&(program.to_owned(), identity.to_owned()));
+        if subject.is_none() {
+            divergences.push_str(&format!(
+                "box\t{program}\t{identity}\tmissing-production-subject\t-\n"
+            ));
+        }
+        let model_kind = box_control
+            .columns
+            .get("model_kind")
+            .and_then(|index| row.get(*index))
+            .map_or("owning", String::as_str);
+        let arm_a = subject.is_some_and(|subject| {
+            subject
+                .get("direct_tiers")
+                .is_some_and(|tiers| tiers.split(';').any(|tier| matches!(tier, "T1" | "T2")))
+        });
+        counts.box_rows += 1;
+        counts.arm_b_rows += 1;
+        arm_b.push_str(&format!(
+            "box-boundary\t{program}\t{identity}\targument\t{model_kind}\tcaller-move-summary-absent\tcaller-move-summary\t{}\n",
+            u8::from(arm_a)
+        ));
+    }
+    counts.divergences = divergences;
+    counts.arm_b_ledger = arm_b;
+    Ok(counts)
+}
+
+#[derive(Clone, Debug)]
+struct RawBoundaryDiagnosticReconciliation {
+    baseline: usize,
+    unchanged: usize,
+    resolved: usize,
+    changed: usize,
+    new: usize,
+    rows: String,
+}
+
+fn diagnostic_identities(
+    inputs: &[(String, String)],
+) -> Result<Vec<(String, String, String, String, String, String)>, String> {
+    let mut out = Vec::new();
+    for (program, input) in inputs {
+        let parsed = ParsedTsv::parse(input)?;
+        for row in &parsed.rows {
+            out.push((
+                program.clone(),
+                parsed.field(row, "function")?.to_owned(),
+                parsed.field(row, "error_code")?.to_owned(),
+                parsed.field(row, "message_head")?.to_owned(),
+                parsed.field(row, "file")?.to_owned(),
+                parsed.field(row, "line")?.to_owned(),
+            ));
+        }
+    }
+    out.sort();
+    Ok(out)
+}
+
+fn reconcile_raw_boundary_diagnostics(
+    baseline: &[(String, String)],
+    current: &[(String, String)],
+) -> Result<RawBoundaryDiagnosticReconciliation, String> {
+    let baseline_rows = diagnostic_identities(baseline)?;
+    let current_rows = diagnostic_identities(current)?;
+    let mut baseline_counts = std::collections::BTreeMap::new();
+    let mut current_counts = std::collections::BTreeMap::new();
+    for row in &baseline_rows {
+        *baseline_counts.entry(row.clone()).or_insert(0usize) += 1;
+    }
+    for row in &current_rows {
+        *current_counts.entry(row.clone()).or_insert(0usize) += 1;
+    }
+    let mut output =
+        String::from("movement\tprogram\tfunction\terror_code\tmessage_head\tfile\tline\n");
+    let mut unchanged = 0usize;
+    let mut resolved_rows = Vec::new();
+    let mut new_rows = Vec::new();
+    for (identity, count) in &baseline_counts {
+        let same = (*count).min(current_counts.get(identity).copied().unwrap_or(0));
+        unchanged += same;
+        for _ in 0..same {
+            output.push_str(&format!(
+                "unchanged\t{}\t{}\t{}\t{}\t{}\t{}\n",
+                identity.0, identity.1, identity.2, identity.3, identity.4, identity.5
+            ));
+        }
+        for _ in same..*count {
+            resolved_rows.push(identity.clone());
+        }
+    }
+    for (identity, count) in &current_counts {
+        let same = (*count).min(baseline_counts.get(identity).copied().unwrap_or(0));
+        for _ in same..*count {
+            new_rows.push(identity.clone());
+        }
+    }
+    let mut changed = Vec::new();
+    let mut used_new = vec![false; new_rows.len()];
+    let mut still_resolved = Vec::new();
+    for old in resolved_rows {
+        if let Some(index) = new_rows.iter().enumerate().find_map(|(index, new)| {
+            (!used_new[index]
+                && new.0 == old.0
+                && new.1 == old.1
+                && new.2 == old.2
+                && new.4 == old.4
+                && new.5 == old.5)
+                .then_some(index)
+        }) {
+            used_new[index] = true;
+            changed.push((old, new_rows[index].clone()));
+        } else {
+            still_resolved.push(old);
+        }
+    }
+    for row in &still_resolved {
+        output.push_str(&format!(
+            "resolved\t{}\t{}\t{}\t{}\t{}\t{}\n",
+            row.0, row.1, row.2, row.3, row.4, row.5
+        ));
+    }
+    for (old, new) in &changed {
+        output.push_str(&format!(
+            "changed\t{}\t{}\t{}\t{} => {}\t{}\t{}\n",
+            old.0, old.1, old.2, old.3, new.3, old.4, old.5
+        ));
+    }
+    let fresh = new_rows
+        .into_iter()
+        .enumerate()
+        .filter_map(|(index, row)| (!used_new[index]).then_some(row))
+        .collect::<Vec<_>>();
+    for row in &fresh {
+        output.push_str(&format!(
+            "new\t{}\t{}\t{}\t{}\t{}\t{}\n",
+            row.0, row.1, row.2, row.3, row.4, row.5
+        ));
+    }
+    Ok(RawBoundaryDiagnosticReconciliation {
+        baseline: baseline_rows.len(),
+        unchanged,
+        resolved: still_resolved.len(),
+        changed: changed.len(),
+        new: fresh.len(),
+        rows: output,
+    })
+}
+
+fn raw_boundary_control_box_rows(directory: &std::path::Path) -> Result<String, String> {
+    let mut output = String::new();
+    for program in CORPUS {
+        let path = directory.join(format!("{}.subject-seed.tsv", program.name));
+        let text = std::fs::read_to_string(&path)
+            .map_err(|error| format!("read {}: {error}", path.display()))?;
+        let mut lines = text.lines();
+        let header = lines
+            .next()
+            .ok_or_else(|| format!("{} is empty", path.display()))?;
+        if output.is_empty() {
+            output.push_str("program\t");
+            output.push_str(header);
+            output.push('\n');
+        }
+        for line in lines {
+            output.push_str(program.name);
+            output.push('\t');
+            output.push_str(line);
+            output.push('\n');
+        }
+    }
+    Ok(output)
+}
+
+fn raw_boundary_program_artifacts(
+    directory: &std::path::Path,
+    suffix: &str,
+) -> Result<Vec<(String, String)>, String> {
+    CORPUS
+        .iter()
+        .map(|program| {
+            let path = directory.join(format!("{}.{}", program.name, suffix));
+            std::fs::read_to_string(&path)
+                .map(|text| (program.name.to_owned(), text))
+                .map_err(|error| format!("read {}: {error}", path.display()))
+        })
+        .collect()
+}
+
+fn raw_boundary_write_manifest(directory: &std::path::Path) -> Result<(), String> {
+    use sha2::{Digest, Sha256};
+    let mut paths = std::fs::read_dir(directory)
+        .map_err(|error| format!("read {}: {error}", directory.display()))?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.is_file() && path.file_name().is_some_and(|name| name != "SHA256SUMS"))
+        .collect::<Vec<_>>();
+    paths.sort();
+    let mut manifest = String::new();
+    for path in paths {
+        let bytes =
+            std::fs::read(&path).map_err(|error| format!("read {}: {error}", path.display()))?;
+        manifest.push_str(&format!(
+            "{:x}  {}\n",
+            Sha256::digest(&bytes),
+            path.file_name().unwrap().to_string_lossy()
+        ));
+    }
+    std::fs::write(directory.join("SHA256SUMS"), manifest)
+        .map_err(|error| format!("write SHA256SUMS: {error}"))
+}
+
+#[test]
+#[ignore = "raw-boundary wave 1: serialized release cache-only 20-program census"]
+fn raw_boundary_wave1_corpus_census() {
+    use std::{fs, path::PathBuf, time::Duration};
+
+    use sha2::{Digest, Sha256};
+
+    let root = orchestrate::workspace_root();
+    let artifact_dir = PathBuf::from(
+        std::env::var_os("CRAT_RAW_BOUNDARY_ARTIFACT_DIR")
+            .expect("raw-boundary census requires artifact directory"),
+    );
+    let cache_dir = PathBuf::from(
+        std::env::var_os("CRAT_BO_CACHE_DIR").expect("raw-boundary census requires cache"),
+    );
+    let code_frame =
+        std::env::var("CRAT_RAW_BOUNDARY_CODE_FRAME").expect("raw-boundary code frame");
+    let primary_control = PathBuf::from(
+        std::env::var_os("CRAT_RAW_BOUNDARY_PRIMARY_CONTROL")
+            .expect("raw-boundary primary control"),
+    );
+    let box_control_dir = PathBuf::from(
+        std::env::var_os("CRAT_RAW_BOUNDARY_BOX_CONTROL_DIR")
+            .expect("raw-boundary Box control directory"),
+    );
+    let diagnostic_control_dir = PathBuf::from(
+        std::env::var_os("CRAT_RAW_BOUNDARY_DIAGNOSTIC_CONTROL_DIR")
+            .expect("raw-boundary diagnostic control directory"),
+    );
+    fs::create_dir_all(&artifact_dir).expect("create raw-boundary census directory");
+    let primary = fs::read_to_string(&primary_control).expect("read primary control");
+    assert_eq!(
+        format!("{:x}", Sha256::digest(primary.as_bytes())),
+        "60869d0e423f4e0fd65a74ca55df025e3fbd4968cc76ecaa0f1490f0e924cdca",
+        "primary control digest drift"
+    );
+    let control_counts = parse_raw_boundary_primary_control(&primary).expect("parse primary");
+    assert_eq!(
+        (
+            control_counts.libc_subjects,
+            control_counts.libc_edges,
+            control_counts.free_subjects,
+            control_counts.t2_local,
+            control_counts.t2_raw_caller,
+            control_counts.t2_flow_collateral,
+            control_counts.t2_arg_collateral,
+            control_counts.crown_return,
+        ),
+        (57, 76, 5, 368, 335, 200, 147, 25),
+        "primary market population drift"
+    );
+    let recipe = STANDING_CENSUS_LAUNCH_RECIPE;
+    let mut rows = Vec::new();
+    for program in CORPUS {
+        let outcome = orchestrate::run_child_env_with_memory_limit_mib(
+            program.name,
+            &program.input_path(&root),
+            "raw-boundary-census",
+            Duration::from_secs(recipe.timeout_secs),
+            recipe.memory_mib,
+            &recipe.raw_boundary_child_env(&cache_dir, &artifact_dir, &code_frame),
+        );
+        let mut row = outcome.row.unwrap_or_else(|| {
+            panic!(
+                "{} produced no raw-boundary row: status={} note={}",
+                program.name, outcome.status, outcome.note
+            )
+        });
+        row.set("program", program.name);
+        row.set("worker_wall_s", format!("{:.3}", outcome.wall_s));
+        row.set("peak_rss_kb", outcome.peak_rss_kb);
+        assert_eq!(row.get(raw_schema::STATUS), Some("ok"), "{row:?}");
+        assert_eq!(row.get(raw_schema::CACHE_STATUS), Some("hit"), "{row:?}");
+        assert_eq!(
+            row.get(raw_schema::SOLVE_WALL_S),
+            Some("0.000000"),
+            "{row:?}"
+        );
+        assert_eq!(row.get(raw_schema::WAVE), Some("wave1"), "{row:?}");
+        eprintln!(
+            "RAW-BOUNDARY-CENSUS program={} stage=complete rc=0 wall={:.3} rss={} digest={}",
+            program.name,
+            outcome.wall_s,
+            outcome.peak_rss_kb,
+            row.get(raw_schema::CACHE_FINGERPRINT).unwrap_or("missing")
+        );
+        rows.push(row);
+    }
+    assert_eq!(rows.len(), 20);
+    let subjects = raw_boundary_program_artifacts(&artifact_dir, "raw-boundary-subject-index.tsv")
+        .expect("read current subjects");
+    let dispositions =
+        raw_boundary_program_artifacts(&artifact_dir, "raw-boundary-dispositions.tsv")
+            .expect("read current dispositions");
+    let box_control = raw_boundary_control_box_rows(&box_control_dir).expect("Box controls");
+    let controls =
+        reconcile_raw_boundary_controls(&primary, &box_control, &subjects, &dispositions)
+            .expect("reconcile raw-boundary controls");
+    fs::write(
+        artifact_dir.join("control-divergences.tsv"),
+        &controls.divergences,
+    )
+    .expect("write control divergences");
+    fs::write(artifact_dir.join("arm-b-62.tsv"), &controls.arm_b_ledger)
+        .expect("write Arm-B ledger");
+    assert_eq!(
+        (
+            controls.libc_subjects,
+            controls.libc_edges,
+            controls.free_rows,
+            controls.t2_rows,
+            controls.box_rows,
+            controls.crown_rows,
+            controls.arm_b_rows,
+        ),
+        (57, 76, 5, 1_050, 37, 25, 62),
+        "external population reconciliation drift"
+    );
+    assert_eq!(
+        controls.divergences.lines().count(),
+        1,
+        "{}",
+        controls.divergences
+    );
+    assert_eq!(controls.arm_b_ledger.lines().count(), 63);
+
+    let baseline_diagnostics =
+        raw_boundary_program_artifacts(&diagnostic_control_dir, "compiler-diagnostics.tsv")
+            .expect("read baseline diagnostics");
+    let current_diagnostics =
+        raw_boundary_program_artifacts(&artifact_dir, "raw-boundary-compiler-diagnostics.tsv")
+            .expect("read current diagnostics");
+    let diagnostic_recon =
+        reconcile_raw_boundary_diagnostics(&baseline_diagnostics, &current_diagnostics)
+            .expect("reconcile diagnostics");
+    assert_eq!(diagnostic_recon.baseline, 115, "baseline diagnostic drift");
+    fs::write(
+        artifact_dir.join("diagnostic-movement.tsv"),
+        &diagnostic_recon.rows,
+    )
+    .expect("write diagnostic movement");
+
+    let total = |key: &str| {
+        rows.iter()
+            .map(|row| {
+                row.get(key)
+                    .unwrap_or_else(|| panic!("missing {key}: {row:?}"))
+                    .parse::<usize>()
+                    .unwrap_or_else(|error| panic!("parse {key}: {error}"))
+            })
+            .sum::<usize>()
+    };
+    let mut aggregate = report::Row::default();
+    aggregate.set(raw_schema::CORPUS, "rs-crown");
+    aggregate.set(
+        raw_schema::ANALYSIS_FRAME,
+        crate::analyses::borrow_ownership::model_cache::ANALYSIS_FRAME,
+    );
+    aggregate.set(raw_schema::CODE_FRAME, &code_frame);
+    aggregate.set(raw_schema::WAVE, "wave1");
+    aggregate.set(raw_schema::DATA, "true");
+    for key in [
+        raw_schema::SITE_ROWS,
+        raw_schema::SUBJECT_ROWS,
+        raw_schema::T1_CANDIDATE_SITES,
+        raw_schema::T2_CANDIDATE_SITES,
+        raw_schema::T2_WAIVER_SITES,
+        raw_schema::BLOCKED_SITES,
+        raw_schema::ZERO_SYNTAX_SITES,
+        raw_schema::EXPLICIT_BRIDGE_SITES,
+        raw_schema::LIFECYCLE_SITES,
+        raw_schema::T1_COMPILER_SURVIVING,
+        raw_schema::T2_COMPILER_SURVIVING,
+        raw_schema::T1_REALIZED_SUBJECTS,
+        raw_schema::T2_REALIZED_SUBJECTS,
+        raw_schema::MASKED_SECONDARY,
+        raw_schema::ADDRESS_OBSERVATION_EDITS,
+        raw_schema::ATOM_ATTEMPTS,
+        raw_schema::ATOM_SUCCESSES,
+        raw_schema::ATOM_AMBIGUOUS,
+        raw_schema::ATOM_SECOND_VERIFY,
+        raw_schema::ATOM_FUNCTION_FALLBACK,
+    ] {
+        aggregate.set(key, total(key));
+    }
+    aggregate.set(raw_schema::CONTROL_LIBC_SUBJECTS, controls.libc_subjects);
+    aggregate.set(raw_schema::CONTROL_LIBC_EDGES, controls.libc_edges);
+    aggregate.set(raw_schema::CONTROL_FREE_ROWS, controls.free_rows);
+    aggregate.set(raw_schema::CONTROL_T2_ROWS, controls.t2_rows);
+    aggregate.set(raw_schema::CONTROL_BOX_ROWS, controls.box_rows);
+    aggregate.set(raw_schema::CONTROL_CROWN_ROWS, controls.crown_rows);
+    aggregate.set(
+        raw_schema::CONTROL_DIAGNOSTIC_ROWS,
+        diagnostic_recon.baseline,
+    );
+    aggregate.set(raw_schema::CONTROL_DIVERGENCES, 0);
+    aggregate.set(raw_schema::ARM_B_ROWS, controls.arm_b_rows);
+    aggregate.set(raw_schema::ARM_B_BOX_ROWS, controls.box_rows);
+    aggregate.set(raw_schema::ARM_B_CROWN_ROWS, controls.crown_rows);
+    aggregate.set(raw_schema::STATUS, "ok");
+    let per_program = rows
+        .iter()
+        .map(report::to_kv_line)
+        .collect::<Vec<_>>()
+        .join("\n")
+        + "\n";
+    fs::write(artifact_dir.join("per-program.kv"), per_program).expect("write per-program rows");
+    fs::write(
+        artifact_dir.join("aggregate.kv"),
+        format!("{}\n", report::to_kv_line(&aggregate)),
+    )
+    .expect("write aggregate");
+    fs::write(
+        artifact_dir.join("census-receipt.txt"),
+        format!(
+            "status=complete\ndata=true\nprograms=20/20\ncache_hits=20/20\nsolver_seconds=0\nlibc={}/{}\nfree={}\nt2={}\narm_b={}\ndiagnostics_baseline={}\ndiagnostics_unchanged={}\ndiagnostics_resolved={}\ndiagnostics_changed={}\ndiagnostics_new={}\n",
+            controls.libc_subjects,
+            controls.libc_edges,
+            controls.free_rows,
+            controls.t2_rows,
+            controls.arm_b_rows,
+            diagnostic_recon.baseline,
+            diagnostic_recon.unchanged,
+            diagnostic_recon.resolved,
+            diagnostic_recon.changed,
+            diagnostic_recon.new,
+        ),
+    )
+    .expect("write census receipt");
+    raw_boundary_write_manifest(&artifact_dir).expect("write artifact manifest");
+}
+
 #[test]
 fn raw_boundary_census_schema_is_one_shared_authority() {
     use crate::raw_boundary_census_schema as schema;
@@ -18317,6 +19028,31 @@ fn raw_boundary_census_schema_is_one_shared_authority() {
     ] {
         assert!(keys.contains(&required), "missing shared key {required}");
     }
+    let source = include_str!("bo_c1.rs");
+    for key in keys {
+        assert_eq!(
+            source.matches(&format!("\"{key}\"")).count(),
+            0,
+            "raw-boundary census key {key:?} bypasses the shared authority"
+        );
+    }
+}
+
+#[test]
+fn raw_boundary_census_schema_renamed_identifier_is_a_compile_error() {
+    let schema =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/raw_boundary_census_schema.rs");
+    let source = format!(
+        "#![allow(dead_code)]\n#[path = {:?}] mod schema;\nconst _: &str = schema::SITE_ROWS_RENAMED;\n",
+        schema
+    );
+    let result = ::utils::compilation::run_compiler_on_str(&source, |tcx| {
+        ::utils::type_check(tcx);
+    });
+    assert!(
+        result.is_err(),
+        "a stale raw-boundary schema consumer unexpectedly compiled"
+    );
 }
 
 #[test]
@@ -18388,7 +19124,12 @@ fn raw_boundary_external_join_fixture_is_bidirectional_and_builds_arm_b() {
     assert_eq!(result.box_rows, 1);
     assert_eq!(result.crown_rows, 1);
     assert_eq!(result.arm_b_rows, 2);
-    assert_eq!(result.divergences.lines().count(), 1, "{}", result.divergences);
+    assert_eq!(
+        result.divergences.lines().count(),
+        1,
+        "{}",
+        result.divergences
+    );
     assert_eq!(result.arm_b_ledger.lines().count(), 3);
 }
 
@@ -18409,7 +19150,15 @@ fn raw_boundary_diagnostic_control_fixture_reports_movement_without_repinning() 
         &[("p".to_owned(), current.to_owned())],
     )
     .expect("diagnostics reconcile");
-    assert_eq!((result.baseline, result.unchanged, result.resolved, result.new), (2, 1, 1, 1));
+    assert_eq!(
+        (
+            result.baseline,
+            result.unchanged,
+            result.resolved,
+            result.new
+        ),
+        (2, 1, 1, 1)
+    );
     assert_eq!(result.rows.lines().count(), 4);
 }
 

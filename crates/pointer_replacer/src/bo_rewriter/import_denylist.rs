@@ -215,6 +215,10 @@ const WAVE3_DOC_INPUTS: &[&str] = &[
     "2026-08-30-item-e-adapter-overlap-audit",
     "0c6be335bd5412700e40497fd64e57525e0018d02be7bc229cdd386b7cd627a5",
     "88558cfb668aae13c4c9362eb4389927fa493c8306ee59a24c9f983208e457c8",
+    // Raw-boundary wave-1's external controls use the same no-docs boundary.
+    "two-strategy-reads.tsv",
+    "60869d0e423f4e0fd65a74ca55df025e3fbd4968cc76ecaa0f1490f0e924cdca",
+    "arm-b-62.tsv",
 ];
 
 fn wave3_docs_input_offense(line: &str) -> Option<String> {
