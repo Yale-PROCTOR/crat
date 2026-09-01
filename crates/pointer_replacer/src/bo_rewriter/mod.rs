@@ -3561,7 +3561,7 @@ fn finish_decide<'tcx>(
     }
     let receipt_started = std::time::Instant::now();
     let mut e2_artifacts =
-        e2_artifacts_from_table(tcx, &table, &hypothetical, &lifetime_eligibility);
+        e2_artifacts_from_table(tcx, &table, &hypothetical, &lifetime_eligibility)?;
     e2_artifacts.timings = E2Timings {
         cache_load_wall_s: format!("{:.6}", analysis.cache_load_wall_s),
         origin_derivation_wall_s: format!("{:.6}", analysis.origin_derivation_wall_s),
@@ -3924,6 +3924,33 @@ enum E2TerminalDisposition<'a> {
     NotE2,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct E2DispositionInvariant<'a> {
+    record: &'a decision::Degradation,
+}
+
+impl E2DispositionInvariant<'_> {
+    fn key(self) -> &'static str {
+        "lifetime-invariant-permitted-own-primary"
+    }
+
+    fn payload(self) -> (String, String) {
+        (
+            self.record.reason.key().to_owned(),
+            self.record.reason.detail(),
+        )
+    }
+
+    fn message(self, subject_key: &str) -> String {
+        let (reason, detail) = self.payload();
+        format!(
+            "{}: subject={subject_key} reason={reason} detail={detail} site={}",
+            self.key(),
+            self.record.site.replace(['\t', '\r', '\n'], " "),
+        )
+    }
+}
+
 impl E2TerminalDisposition<'_> {
     fn key(self) -> &'static str {
         match self {
@@ -3949,7 +3976,7 @@ fn e2_terminal_disposition<'a>(
     has_lifetime_permit: bool,
     failure: Option<decision::lifetime::LifetimeFailure>,
     final_decision: &'a decision::Decision,
-) -> E2TerminalDisposition<'a> {
+) -> Result<E2TerminalDisposition<'a>, E2DispositionInvariant<'a>> {
     use decision::lifetime::LifetimeFailure as F;
 
     // Fixed classification order: tranche holds and origin failures through
@@ -3964,40 +3991,34 @@ fn e2_terminal_disposition<'a>(
         | F::OriginConflict),
     ) = failure
     {
-        return E2TerminalDisposition::Failure(failure);
+        return Ok(E2TerminalDisposition::Failure(failure));
     }
 
     if has_lifetime_permit {
-        let secondary = match final_decision {
-            decision::Decision::Degraded(record) => {
-                let still_primary = matches!(
-                    &record.reason,
-                    decision::DegradeReason::SilentCoercion {
-                        via: decision::co_conversion::BlockReason::EscapesViaReturn,
-                    } | decision::DegradeReason::ClassBlocked {
-                        via: decision::co_conversion::BlockReason::EscapesViaReturn,
-                    }
-                );
-                (!still_primary).then_some(record)
-            }
+        match final_decision {
+            decision::Decision::Degraded(record) => match &record.reason {
+                decision::DegradeReason::SilentCoercion {
+                    via: decision::co_conversion::BlockReason::EscapesViaReturn,
+                } => return Err(E2DispositionInvariant { record }),
+                // `ClassBlocked { via }` is class coupling: `via` belongs to a
+                // classmate, so this row always reports a secondary blocker.
+                _ => return Ok(E2TerminalDisposition::SecondaryDegradation(record)),
+            },
             decision::Decision::Ref { .. }
             | decision::Decision::InferredRef { .. }
             | decision::Decision::Slice { .. }
             | decision::Decision::Opt { .. }
-            | decision::Decision::Box(_) => None,
-        };
-        if let Some(record) = secondary {
-            return E2TerminalDisposition::SecondaryDegradation(record);
+            | decision::Decision::Box(_) => {}
         }
     }
 
     if let Some(failure @ (F::AstUnplaceable | F::SeamIncompatible)) = failure {
-        return E2TerminalDisposition::Failure(failure);
+        return Ok(E2TerminalDisposition::Failure(failure));
     }
     if planned {
-        E2TerminalDisposition::Planned
+        Ok(E2TerminalDisposition::Planned)
     } else {
-        E2TerminalDisposition::NotE2
+        Ok(E2TerminalDisposition::NotE2)
     }
 }
 
@@ -4006,7 +4027,7 @@ fn e2_artifacts_from_table(
     table: &decision::DecisionTable,
     ordinary: &decision::DecisionTable,
     eligibility: &decision::lifetime::LifetimeEligibility,
-) -> E2Artifacts {
+) -> Result<E2Artifacts, String> {
     let ordinary = ordinary
         .entries
         .iter()
@@ -4042,7 +4063,8 @@ fn e2_artifacts_from_table(
         };
         let failure = eligibility.failure(key).or(fallback_failure);
         let disposition =
-            e2_terminal_disposition(planned, has_lifetime_permit, failure, final_decision);
+            e2_terminal_disposition(planned, has_lifetime_permit, failure, final_decision)
+                .map_err(|invariant| invariant.message(&subject_key))?;
         let (secondary_reason, secondary_detail) = disposition.secondary_payload();
         let ordinary_decision = ordinary.get(&key).copied();
         let ordinary_key = match ordinary_decision {
@@ -4130,7 +4152,7 @@ fn e2_artifacts_from_table(
     }
     pb_rows.sort();
 
-    E2Artifacts {
+    Ok(E2Artifacts {
         subjects: format!(
             "subject_key\towner_fn\tmir_local\tptr_depth\tconstruction\tordinary_decision\tfinal_decision\te2_disposition\tjustification\tlifetime_plan_digest\tsecondary_reason\tsecondary_reason_detail\n{}{}",
             subject_rows.join("\n"),
@@ -4153,7 +4175,7 @@ fn e2_artifacts_from_table(
             if pb_rows.is_empty() { "" } else { "\n" },
         ),
         timings: E2Timings::default(),
-    }
+    })
 }
 
 /// Addendum 90's identity seed, produced inside the one E1 compiler callback

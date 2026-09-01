@@ -5511,6 +5511,57 @@ fn e2_w8_return_permit_reports_secondary_degradation_payload() {
     );
 }
 
+/// Addendum-120 collateral RED — `ClassBlocked { via }` means the blocker is
+/// owned by a classmate. Even when `via` names return escape, the permitted row
+/// receives the secondary class and keeps `(class-blocked, via)` as payload.
+#[test]
+fn e2_w9_classmate_primary_is_secondary_class_coupling() {
+    let decision = super::decision::Decision::Degraded(super::decision::Degradation {
+        subject: "permitted-row".to_owned(),
+        site: "fixture".to_owned(),
+        reason: super::decision::DegradeReason::ClassBlocked {
+            via: super::decision::co_conversion::BlockReason::EscapesViaReturn,
+        },
+    });
+    let disposition = super::e2_terminal_disposition(false, true, None, &decision)
+        .expect("class coupling is a secondary disposition");
+
+    assert_eq!(
+        disposition.key(),
+        "lifetime-secondary-degradation",
+        "{disposition:?}",
+    );
+    assert_eq!(
+        disposition.secondary_payload(),
+        ("class-blocked".to_owned(), "escapes-via-return".to_owned()),
+    );
+}
+
+/// Addendum-120 invariant RED — a permitted row cannot retain its own direct
+/// return-escape blocker. That state is a typed construction failure, not a
+/// secondary disposition and not `not-e2`.
+#[test]
+fn e2_n8_permitted_own_primary_is_loud_invariant_violation() {
+    let decision = super::decision::Decision::Degraded(super::decision::Degradation {
+        subject: "permitted-row".to_owned(),
+        site: "fixture".to_owned(),
+        reason: super::decision::DegradeReason::SilentCoercion {
+            via: super::decision::co_conversion::BlockReason::EscapesViaReturn,
+        },
+    });
+    let error = super::e2_terminal_disposition(false, true, None, &decision)
+        .expect_err("an own-primary blocker must stop artifact construction");
+
+    assert_eq!(error.key(), "lifetime-invariant-permitted-own-primary");
+    assert_eq!(
+        error.payload(),
+        (
+            "escapes-via-return".to_owned(),
+            "escapes-via-return".to_owned()
+        ),
+    );
+}
+
 /// E2-W7 RED — an unannotated local fed by a direct local call may use the
 /// callee's modeled lifetime plan without inventing a local declaration
 /// splice.  The explicit decision arm is load-bearing: treating this as an
