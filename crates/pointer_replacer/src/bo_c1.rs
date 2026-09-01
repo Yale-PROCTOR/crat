@@ -45,6 +45,56 @@ use crate::{analyses::borrow_ownership::solver::CORE_LABEL_FAMILIES, utils::rust
 /// Parent census gates consume this constant rather than borrowing the
 /// wave-3 summarizer's `solve_wall_s` dialect.
 const E1_WORKER_SOLVE_SECONDS_KEY: &str = "t_solve_s";
+const BOC1_EFFECTIVE_MEMORY_MIB_ENV: &str = "CRAT_BOC1_EFFECTIVE_MEM_MB";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct E2FnCensusLaunchRecipe {
+    profile: &'static str,
+    memory_mib: u64,
+    timeout_secs: u64,
+    attestation: &'static str,
+}
+
+impl E2FnCensusLaunchRecipe {
+    fn child_env(
+        self,
+        cache_dir: &std::path::Path,
+        artifact_dir: &std::path::Path,
+        code_frame: &str,
+    ) -> Vec<(&'static str, String)> {
+        vec![
+            ("CRAT_BO_CACHE", "1".to_owned()),
+            ("CRAT_BO_CACHE_DIR", cache_dir.display().to_string()),
+            ("CRAT_BO_A5_ATTESTATION", self.attestation.to_owned()),
+            ("CRAT_E2_ARTIFACT_DIR", artifact_dir.display().to_string()),
+            ("CRAT_E2_CODE_FRAME", code_frame.to_owned()),
+            ("CRAT_E2_CARGO_PROFILE", self.profile.to_owned()),
+            ("CRAT_BOC1_MEM_MB", self.memory_mib.to_string()),
+        ]
+    }
+}
+
+const E2_FN_CENSUS_LAUNCH_RECIPE: E2FnCensusLaunchRecipe = E2FnCensusLaunchRecipe {
+    profile: "release",
+    memory_mib: 49_152,
+    timeout_secs: 14_400,
+    attestation: "frozen_benchmark_graph",
+};
+
+fn e2_resource_bound_non_citable_reason(
+    configured_mib: Option<&str>,
+    effective_mib: Option<&str>,
+) -> Option<&'static str> {
+    let effective_mib = effective_mib.and_then(|value| value.parse::<u64>().ok());
+    if effective_mib.is_none_or(|value| value < E2_FN_CENSUS_LAUNCH_RECIPE.memory_mib) {
+        return Some("insufficient-memory-bound");
+    }
+    let configured_mib = configured_mib.and_then(|value| value.parse::<u64>().ok());
+    if configured_mib != Some(E2_FN_CENSUS_LAUNCH_RECIPE.memory_mib) {
+        return Some("configured-memory-bound-mismatch");
+    }
+    None
+}
 
 #[path = "a16_return_kind_exposure.rs"]
 mod a16_return_kind_exposure;
@@ -9165,6 +9215,19 @@ mod run {
             std::env::var("CRAT_E2_CODE_FRAME").unwrap_or_else(|_| "missing-code-frame".to_owned());
         let launch_profile =
             std::env::var("CRAT_E2_CARGO_PROFILE").unwrap_or_else(|_| "missing-profile".to_owned());
+        let configured_memory_mib =
+            std::env::var("CRAT_BOC1_MEM_MB").unwrap_or_else(|_| "missing".to_owned());
+        let effective_memory_mib = std::env::var(super::BOC1_EFFECTIVE_MEMORY_MIB_ENV)
+            .unwrap_or_else(|_| "missing".to_owned());
+        let non_citable_reason = super::e2_resource_bound_non_citable_reason(
+            Some(&configured_memory_mib),
+            Some(&effective_memory_mib),
+        );
+        let data_status = if non_citable_reason.is_some() {
+            "false"
+        } else {
+            "provisional"
+        };
         let build_profile = if cfg!(debug_assertions) {
             "debug"
         } else {
@@ -9198,13 +9261,17 @@ mod run {
             ("a2_mode", receipt_field("a2_mode")),
             ("soundness_mode", receipt_field("soundness_mode")),
         ];
-        let prefix_header = "corpus\tanalysis_frame\tcode_frame\tdata\tbuild_profile\tdebug_assertions\ta5_mode\ta5_world\ta5_abi_guard\tcopy_lend_mode\ta2_mode\tsoundness_mode\tprogram";
+        let prefix_header = "corpus\tanalysis_frame\tcode_frame\tdata\tbuild_profile\tdebug_assertions\tresource_bound_configured_mib\tresource_bound_effective_mib\tnon_citable_reason\ta5_mode\ta5_world\ta5_abi_guard\tcopy_lend_mode\ta2_mode\tsoundness_mode\tprogram";
         let prefix = format!(
-            "rs-crown\t{}\t{}\tprovisional\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            "rs-crown\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
             model_cache::ANALYSIS_FRAME,
             code_frame,
+            data_status,
             build_profile,
             u8::from(cfg!(debug_assertions)),
+            configured_memory_mib,
+            effective_memory_mib,
+            non_citable_reason.unwrap_or("none"),
             stamps[0].1,
             stamps[1].1,
             stamps[2].1,
@@ -9412,10 +9479,13 @@ mod run {
         row.set("corpus", "rs-crown");
         row.set("analysis_frame", model_cache::ANALYSIS_FRAME);
         row.set("code_frame", code_frame);
-        row.set("data", "provisional");
+        row.set("data", data_status);
         row.set("build_profile", build_profile);
         row.set("launch_profile", &launch_profile);
         row.set("debug_assertions", u8::from(cfg!(debug_assertions)));
+        row.set("resource_bound_configured_mib", &configured_memory_mib);
+        row.set("resource_bound_effective_mib", &effective_memory_mib);
+        row.set("non_citable_reason", non_citable_reason.unwrap_or("none"));
         for (key, value) in stamps {
             row.set(key, value);
         }
@@ -9459,7 +9529,9 @@ mod run {
         let pb_ok = pb_diff.lines().count() == 1;
         row.set(
             "status",
-            if !profile_ok {
+            if non_citable_reason.is_some() {
+                "non-citable-resource-bound"
+            } else if !profile_ok {
                 "debug-build-profile"
             } else if !cache_ok {
                 "cache-gate-failed"
@@ -16157,6 +16229,37 @@ fn e2_fn_cache_preflight_corpus() {
         .expect("write E2 cache preflight");
 }
 
+#[test]
+fn e2_fn_census_launch_recipe_pins_and_gates_the_resource_bound() {
+    use std::path::Path;
+
+    let recipe = E2_FN_CENSUS_LAUNCH_RECIPE;
+    assert_eq!(recipe.profile, "release");
+    assert_eq!(recipe.memory_mib, 49_152);
+    assert_eq!(recipe.timeout_secs, 14_400);
+    assert_eq!(recipe.attestation, "frozen_benchmark_graph");
+    let env = recipe.child_env(Path::new("/cache"), Path::new("/artifacts"), "branch@frame");
+    assert!(env.contains(&("CRAT_BO_CACHE", "1".to_owned())));
+    assert!(env.contains(&("CRAT_BO_CACHE_DIR", "/cache".to_owned())));
+    assert!(env.contains(&(
+        "CRAT_BO_A5_ATTESTATION",
+        "frozen_benchmark_graph".to_owned(),
+    )));
+    assert!(env.contains(&("CRAT_BOC1_MEM_MB", "49152".to_owned(),)));
+    assert_eq!(
+        orchestrate::resolved_memory_limit_kb(Some(recipe.memory_mib), Some("8192")),
+        Ok(Some(49_152 * 1024)),
+    );
+    assert_eq!(
+        e2_resource_bound_non_citable_reason(Some("49152"), Some("49152")),
+        None,
+    );
+    assert_eq!(
+        e2_resource_bound_non_citable_reason(Some("49152"), Some("24576")),
+        Some("insufficient-memory-bound"),
+    );
+}
+
 fn e2_fn_census_corpus() {
     use std::{collections::BTreeMap, fs, path::PathBuf, time::Duration};
 
@@ -16201,26 +16304,19 @@ fn e2_fn_census_corpus() {
         std::env::var_os("CRAT_E2_MARKET_DIR").expect("E2 census requires CRAT_E2_MARKET_DIR"),
     );
     let code_frame = std::env::var("CRAT_E2_CODE_FRAME").expect("E2 code-frame stamp");
+    let recipe = E2_FN_CENSUS_LAUNCH_RECIPE;
     fs::create_dir_all(&artifact_dir).expect("create E2 census artifact directory");
     let mut rows = Vec::new();
     for program in CORPUS {
         let input = program.input_path(&root);
-        let outcome = orchestrate::run_child_env(
+        let child_env = recipe.child_env(&cache_dir, &artifact_dir, &code_frame);
+        let outcome = orchestrate::run_child_env_with_memory_limit_mib(
             program.name,
             &input,
             "e2-fn-census",
-            Duration::from_secs(14_400),
-            &[
-                ("CRAT_BO_CACHE", "1".to_owned()),
-                ("CRAT_BO_CACHE_DIR", cache_dir.display().to_string()),
-                (
-                    "CRAT_BO_A5_ATTESTATION",
-                    "frozen_benchmark_graph".to_owned(),
-                ),
-                ("CRAT_E2_ARTIFACT_DIR", artifact_dir.display().to_string()),
-                ("CRAT_E2_CODE_FRAME", code_frame.clone()),
-                ("CRAT_E2_CARGO_PROFILE", "release".to_owned()),
-            ],
+            Duration::from_secs(recipe.timeout_secs),
+            recipe.memory_mib,
+            &child_env,
         );
         let mut row = outcome.row.unwrap_or_else(|| {
             panic!(
@@ -16231,6 +16327,26 @@ fn e2_fn_census_corpus() {
         row.set("program", program.name);
         row.set("worker_wall_s", format!("{:.3}", outcome.wall_s));
         row.set("peak_rss_kb", outcome.peak_rss_kb);
+        let configured_memory_mib = recipe.memory_mib.to_string();
+        assert_eq!(
+            row.get("resource_bound_configured_mib"),
+            Some(configured_memory_mib.as_str()),
+            "{} worker launch stamp disagrees with the recipe",
+            program.name,
+        );
+        row.set("resource_bound_configured_mib", recipe.memory_mib);
+        assert_eq!(
+            row.get("non_citable_reason"),
+            Some("none"),
+            "{} census row is not citable: {row:?}",
+            program.name,
+        );
+        assert_eq!(
+            row.get("resource_bound_effective_mib"),
+            Some(configured_memory_mib.as_str()),
+            "{} worker did not observe the standing resource bound",
+            program.name,
+        );
         assert_eq!(row.get("status"), Some("ok"), "{row:?}");
         assert_eq!(row.get("cache_status"), Some("hit"), "{row:?}");
         assert_eq!(row.get("solve_wall_s"), Some("0.000000"), "{row:?}");
@@ -16403,8 +16519,11 @@ fn e2_fn_census_corpus() {
     fs::write(artifact_dir.join("e2-results.kv"), results).expect("write E2 results");
     fs::write(artifact_dir.join("e2-market-join.tsv"), joined).expect("write E2 market join");
     let aggregate = format!(
-        "status=ok\ndata=provisional\ncorpus=rs-crown\ncode_frame={code_frame}\nanalysis_frame={}\nmarket_total={market_total}\ndirect={direct}\ncollateral={collateral}\nfn_tranche={fn_tranche}\nfield_held={field_tranche}\nboundary_residual={boundary_tranche}\nplanned={planned}\ncompiler_survived={survived}\noff_market_planned={off_market_planned}\npb_roots={pb_roots}\npb_members={pb_members}\nkind_triple=48859/10500/239\nofficial=1607/2414=66.5700%\ncauses={cause_counts:?}\ndispositions={disposition_counts:?}\n",
+        "status=ok\ndata=provisional\nnon_citable_reason=none\ncorpus=rs-crown\ncode_frame={code_frame}\nanalysis_frame={}\nbuild_profile={}\nresource_bound_configured_mib={}\nresource_bound_effective_mib={}\nmarket_total={market_total}\ndirect={direct}\ncollateral={collateral}\nfn_tranche={fn_tranche}\nfield_held={field_tranche}\nboundary_residual={boundary_tranche}\nplanned={planned}\ncompiler_survived={survived}\noff_market_planned={off_market_planned}\npb_roots={pb_roots}\npb_members={pb_members}\nkind_triple=48859/10500/239\nofficial=1607/2414=66.5700%\ncauses={cause_counts:?}\ndispositions={disposition_counts:?}\n",
         crate::analyses::borrow_ownership::model_cache::ANALYSIS_FRAME,
+        recipe.profile,
+        recipe.memory_mib,
+        recipe.memory_mib,
     );
     fs::write(artifact_dir.join("e2-aggregate.txt"), aggregate).expect("write E2 aggregate");
 
@@ -18046,6 +18165,16 @@ mod orchestrate {
             .ok_or_else(|| format!("CRAT_BOC1_MEM_MB={mib} overflows KiB"))
     }
 
+    pub(super) fn resolved_memory_limit_kb(
+        explicit_mib: Option<u64>,
+        environment_raw: Option<&str>,
+    ) -> Result<Option<u64>, String> {
+        match explicit_mib {
+            Some(mib) => memory_limit_kb(Some(&mib.to_string())),
+            None => memory_limit_kb(environment_raw),
+        }
+    }
+
     pub fn workspace_root() -> PathBuf {
         Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
     }
@@ -18172,6 +18301,28 @@ mod orchestrate {
         run_child_labeled(program, input, mode, mode, timeout, extra)
     }
 
+    /// `run_child_env` with a caller-owned launch-recipe memory cap. The
+    /// explicit value wins over ambient process state and is also stamped into
+    /// the worker as the supervisor's effective bound.
+    pub fn run_child_env_with_memory_limit_mib(
+        program: &str,
+        input: &Path,
+        mode: &str,
+        timeout: Duration,
+        memory_mib: u64,
+        extra: &[(&str, String)],
+    ) -> ChildOutcome {
+        run_child_labeled_with_memory_limit_mib(
+            program,
+            input,
+            mode,
+            mode,
+            timeout,
+            Some(memory_mib),
+            extra,
+        )
+    }
+
     pub fn run_child_labeled(
         program: &str,
         input: &Path,
@@ -18180,8 +18331,22 @@ mod orchestrate {
         timeout: Duration,
         extra: &[(&str, String)],
     ) -> ChildOutcome {
+        run_child_labeled_with_memory_limit_mib(
+            program, input, mode, log_label, timeout, None, extra,
+        )
+    }
+
+    fn run_child_labeled_with_memory_limit_mib(
+        program: &str,
+        input: &Path,
+        mode: &str,
+        log_label: &str,
+        timeout: Duration,
+        explicit_memory_mib: Option<u64>,
+        extra: &[(&str, String)],
+    ) -> ChildOutcome {
         let memory_limit_raw = std::env::var("CRAT_BOC1_MEM_MB").ok();
-        let mem_cap_kb = memory_limit_kb(memory_limit_raw.as_deref())
+        let mem_cap_kb = resolved_memory_limit_kb(explicit_memory_mib, memory_limit_raw.as_deref())
             .unwrap_or_else(|error| panic!("memory-limit configuration: {error}"));
         let logs = out_dir().join("logs");
         fs::create_dir_all(&logs).expect("create log dir");
@@ -18205,6 +18370,12 @@ mod orchestrate {
         for (key, value) in extra {
             command.env(key, value);
         }
+        command.env(
+            super::BOC1_EFFECTIVE_MEMORY_MIB_ENV,
+            mem_cap_kb
+                .map(|value| (value / 1024).to_string())
+                .unwrap_or_else(|| "uncapped".to_owned()),
+        );
         if ownership_yield::enabled() {
             let snapshot = yield_snapshot_path(program, mode);
             fs::create_dir_all(snapshot.parent().expect("snapshot parent"))
