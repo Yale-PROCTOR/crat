@@ -5537,6 +5537,32 @@ fn e2_w9_classmate_primary_is_secondary_class_coupling() {
     );
 }
 
+/// Addendum-121 RED — the collateral row itself need not carry a permit. The
+/// `ClassBlocked` variant already says a classmate owns `via`, so this row must
+/// retain the secondary class and payload even with no direct permit.
+#[test]
+fn e2_w9b_permitless_classmate_coupling_is_secondary() {
+    let decision = super::decision::Decision::Degraded(super::decision::Degradation {
+        subject: "permitless-collateral-row".to_owned(),
+        site: "fixture".to_owned(),
+        reason: super::decision::DegradeReason::ClassBlocked {
+            via: super::decision::co_conversion::BlockReason::EscapesViaReturn,
+        },
+    });
+    let disposition = super::e2_terminal_disposition(false, false, None, &decision)
+        .expect("permit-less class coupling is a secondary disposition");
+
+    assert_eq!(
+        disposition.key(),
+        "lifetime-secondary-degradation",
+        "{disposition:?}",
+    );
+    assert_eq!(
+        disposition.secondary_payload(),
+        ("class-blocked".to_owned(), "escapes-via-return".to_owned()),
+    );
+}
+
 /// Addendum-120 invariant RED — a permitted row cannot retain its own direct
 /// return-escape blocker. That state is a typed construction failure, not a
 /// secondary disposition and not `not-e2`.

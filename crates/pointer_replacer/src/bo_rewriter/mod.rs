@@ -3994,6 +3994,26 @@ fn e2_terminal_disposition<'a>(
         return Ok(E2TerminalDisposition::Failure(failure));
     }
 
+    // ClassBlocked is collateral by construction: `via` belongs to a
+    // classmate. Hoist it above the row-local permit test so a permit-less
+    // class member preserves the secondary reason and payload.
+    let class_coupling = match final_decision {
+        decision::Decision::Degraded(record)
+            if matches!(record.reason, decision::DegradeReason::ClassBlocked { .. }) =>
+        {
+            Some(record)
+        }
+        decision::Decision::Degraded(_)
+        | decision::Decision::Ref { .. }
+        | decision::Decision::InferredRef { .. }
+        | decision::Decision::Slice { .. }
+        | decision::Decision::Opt { .. }
+        | decision::Decision::Box(_) => None,
+    };
+    if let Some(record) = class_coupling {
+        return Ok(E2TerminalDisposition::SecondaryDegradation(record));
+    }
+
     if has_lifetime_permit {
         match final_decision {
             decision::Decision::Degraded(record) => match &record.reason {
