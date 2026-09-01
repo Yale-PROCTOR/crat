@@ -3968,18 +3968,26 @@ fn e2_terminal_disposition<'a>(
     }
 
     if has_lifetime_permit {
-        if let decision::Decision::Degraded(record) = final_decision {
-            let still_primary = matches!(
-                &record.reason,
-                decision::DegradeReason::SilentCoercion {
-                    via: decision::co_conversion::BlockReason::EscapesViaReturn,
-                } | decision::DegradeReason::ClassBlocked {
-                    via: decision::co_conversion::BlockReason::EscapesViaReturn,
-                }
-            );
-            if !still_primary {
-                return E2TerminalDisposition::SecondaryDegradation(record);
+        let secondary = match final_decision {
+            decision::Decision::Degraded(record) => {
+                let still_primary = matches!(
+                    &record.reason,
+                    decision::DegradeReason::SilentCoercion {
+                        via: decision::co_conversion::BlockReason::EscapesViaReturn,
+                    } | decision::DegradeReason::ClassBlocked {
+                        via: decision::co_conversion::BlockReason::EscapesViaReturn,
+                    }
+                );
+                (!still_primary).then_some(record)
             }
+            decision::Decision::Ref { .. }
+            | decision::Decision::InferredRef { .. }
+            | decision::Decision::Slice { .. }
+            | decision::Decision::Opt { .. }
+            | decision::Decision::Box(_) => None,
+        };
+        if let Some(record) = secondary {
+            return E2TerminalDisposition::SecondaryDegradation(record);
         }
     }
 
