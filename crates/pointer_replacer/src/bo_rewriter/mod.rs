@@ -1046,7 +1046,7 @@ fn verify_and_revert(
         .map(|d| d.to_path_buf());
     let mut reverted: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     let mut reverted_atoms: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-    let mut atom_reverify_used = false;
+    let mut atom_reverify_count = 0usize;
     let mut pending_atom_retry: Option<(String, Vec<String>)> = None;
     let mut census_captured = false;
     // **ROUND 0 THROUGH THE SWITCH — the FOURTH site** (ruling 2026-08-18).
@@ -1128,7 +1128,7 @@ fn verify_and_revert(
         let probe_started = std::time::Instant::now();
         let diagnosis = verify::diagnose_crate(staged.root());
         let probe_wall_s = probe_started.elapsed().as_secs_f64();
-        if atom_reverify_used {
+        if atom_reverify_count > 0 {
             facts.raw_boundary_artifacts.timings.atom_reverify_wall_s =
                 format!("{probe_wall_s:.6}");
         } else if facts.raw_boundary_artifacts.timings.initial_verify_wall_s == "pending" {
@@ -1414,7 +1414,7 @@ fn verify_and_revert(
         // edit-span index is filtered by the same function/atom predicates as
         // rendering before attribution, so a removed atom cannot be selected
         // again through stale plan metadata.
-        if !atom_reverify_used {
+        if atom_reverify_count < MAX_ATOM_REVERIFIES {
             let live_atom_sites = planned_edit_sites
                 .iter()
                 .filter(|edit| {
@@ -1437,7 +1437,7 @@ fn verify_and_revert(
                 selection.kind,
                 AtomSelectionKind::Exact | AtomSelectionKind::GroupAtomic
             ) {
-                atom_reverify_used = true;
+                atom_reverify_count += 1;
                 let selected_atoms = selection.atoms.into_iter().collect::<Vec<_>>();
                 reverted_atoms.extend(selected_atoms.iter().cloned());
                 pending_atom_retry = Some((selection.reason.to_owned(), selected_atoms));
@@ -2622,6 +2622,8 @@ impl OutcomeFacts {
 /// Hard ceiling on revert rounds. Paired with the no-progress detector, never
 /// relied on alone: a cap that fires is a loop that stopped being understood.
 const MAX_REVERT_ROUNDS: usize = 8;
+/// Raw-boundary atom mode is one bounded retry, never a repair loop.
+const MAX_ATOM_REVERIFIES: usize = 1;
 
 /// Where one planned edit landed, in the lines a diagnostic is reported in.
 ///
@@ -6092,5 +6094,10 @@ mod raw_boundary_atom_tests {
         assert_eq!(selected.kind, AtomSelectionKind::Fallback);
         assert_eq!(selected.reason, "atom-attribution-ambiguous");
         assert!(selected.atoms.is_empty());
+    }
+
+    #[test]
+    fn raw_boundary_atom_reverify_is_bounded_to_one() {
+        assert_eq!(super::MAX_ATOM_REVERIFIES, 1);
     }
 }

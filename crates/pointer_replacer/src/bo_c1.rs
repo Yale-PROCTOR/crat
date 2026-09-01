@@ -19131,6 +19131,14 @@ fn raw_boundary_external_join_fixture_is_bidirectional_and_builds_arm_b() {
         result.divergences
     );
     assert_eq!(result.arm_b_ledger.lines().count(), 3);
+    for line in result.arm_b_ledger.lines().skip(1) {
+        let fields = line.split('\t').collect::<Vec<_>>();
+        assert!(!fields[5].is_empty(), "blocker payload disappeared: {line}");
+        assert!(
+            !fields[6].is_empty(),
+            "missing-fact payload disappeared: {line}"
+        );
+    }
 }
 
 #[test]
