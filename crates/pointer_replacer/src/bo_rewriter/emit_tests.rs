@@ -5695,6 +5695,14 @@ fn e2_w1_production_emits_named_signature_lifetimes() {
     assert!(emitted.contains("fn id<'a: 'b, 'b>"), "{emitted}");
     assert!(emitted.contains("p: &'a i32"), "{emitted}");
     assert!(emitted.contains("-> &'b i32"), "{emitted}");
+    let signature = emitted
+        .lines()
+        .find(|line| line.contains("fn id"))
+        .expect("E2-W1 emitted signature line");
+    assert_eq!(
+        signature, "pub unsafe fn id<'a: 'b, 'b>(p: &'a i32) -> &'b i32 { p }",
+        "an unreceipted lifetime node must move this exact structural line",
+    );
 }
 
 /// E2-W2/W3/W5 production-path coverage: multiple source bounds, nested
@@ -5988,6 +5996,62 @@ fn e2_n3_n4_external_and_field_rows_are_loudly_held() {
         ),
         super::decision::lifetime::LifetimeFailure::FieldHeld,
     );
+}
+
+/// E2-N7 eligibility-layer control. The root is already pinned by the existing
+/// function-pointer gate; its forward callee is the live E2 candidate on which
+/// deleting the web guard would create a plan.
+#[test]
+fn e2_n7_fnptr_web_members_are_held_at_lifetime_eligibility() {
+    let fixture = Fixture::new(&[(
+        "lib.rs",
+        "#![allow(dead_code, unused_unsafe)]\n\
+         pub unsafe fn leaf(p: *const i32) -> *const i32 { p }\n\
+         pub unsafe fn root(p: *const i32) -> *const i32 { let _ = leaf(p); p }\n\
+         pub unsafe fn install() {\n\
+             let _callback: unsafe fn(*const i32) -> *const i32 = root;\n\
+         }\n",
+    )]);
+    ::utils::compilation::run_compiler_on_path(&fixture.root(), |tcx| {
+        let (table, ctx) = super::decide_table_with_ctx_config(
+            tcx,
+            Some((
+                crate::analyses::borrow_ownership::a5_overlap::A5Mode::PreciseReplay,
+                Some(
+                    crate::analyses::borrow_ownership::a5_overlap::WholeProgramAttestation::FrozenBenchmarkGraph,
+                ),
+            )),
+        )
+        .expect("E2-N7 eligibility decision table");
+        for suffix in ["leaf::p", "root::p"] {
+            let (subject, decision) = table
+                .entries
+                .iter()
+                .find(|(subject, _)| subject.label.ends_with(suffix))
+                .unwrap_or_else(|| panic!("missing {suffix}"));
+            assert!(
+                matches!(decision, super::decision::Decision::Degraded(_)),
+                "{suffix} escaped the web hold: {decision:#?}",
+            );
+            let failure = ctx
+                .lifetime_eligibility
+                .failure((subject.fn_did, subject.hir_id));
+            if suffix == "leaf::p" {
+                assert_eq!(
+                    failure,
+                    Some(super::decision::lifetime::LifetimeFailure::FnPtrWebHeld),
+                    "the forward-callee candidate must reach the E2 web guard: {decision:#?}",
+                );
+            } else {
+                assert_eq!(
+                    failure, None,
+                    "the fn-pointer root is pinned before E2 eligibility: {decision:#?}",
+                );
+            }
+            assert!(table.lifetime_plan.function(subject.fn_did).is_none());
+        }
+    })
+    .expect("E2-N7 eligibility fixture compiles");
 }
 
 /// E2-N5 RED — an on-disk cache hit must reproduce the consumed model, A5

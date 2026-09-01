@@ -1451,6 +1451,30 @@ mod tests {
     }
 
     #[test]
+    fn e2_n4_field_signature_slot_is_held_before_planning() {
+        let field = SignatureSlot {
+            place: SignaturePlace {
+                root: SignatureRoot::Arg(Local::from_usize(1)),
+                deref_depth: 0,
+                field: Some(crate::analyses::borrow_ownership::slots::StructFieldSlot {
+                    struct_did: rustc_hir::def_id::CRATE_DEF_ID,
+                    field_index: 0,
+                }),
+            },
+            depth: 0,
+        };
+        let summary = summary(vec![arg(1), field], &[(0, 1)], &[]);
+        assert_eq!(
+            plan_function(
+                &summary,
+                &[OriginSlot::from_usize(0), OriginSlot::from_usize(1)],
+                &BTreeSet::new(),
+            ),
+            Err(LifetimeFailure::FieldHeld),
+        );
+    }
+
+    #[test]
     fn e2_n7_fnptr_root_and_forward_callee_are_both_held() {
         let code = r#"
             pub unsafe fn leaf(p: *mut i32) -> *mut i32 { p }
