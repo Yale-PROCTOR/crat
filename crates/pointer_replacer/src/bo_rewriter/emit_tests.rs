@@ -205,6 +205,60 @@ fn box2_w1_unannotated_calloc_cast_chain_reaches_the_subject() {
     assert!(!source.contains("calloc(size"), "{source}");
 }
 
+/// BOX2-W2 — when no first-store or memset evidence exists, an exact
+/// `count * size_of::<T>()` allocation admits the numeric default-fill slice
+/// arm and preserves the evidence-backed count.
+#[test]
+fn box2_w2_malloc_slice_uses_numeric_default_fill() {
+    let src = format!(
+        "{BOX_W1_PREAMBLE}\n\
+         pub unsafe fn f(n: usize) {{\n\
+             let p: *mut f64 = malloc(n * core::mem::size_of::<f64>()) as *mut f64;\n\
+             free(p as *mut core::ffi::c_void);\n\
+         }}\n"
+    );
+    let super::RewriteOutcome::Emitted {
+        source,
+        degradations,
+        ..
+    } = super::rewrite_m1(&src)
+    else {
+        panic!("BOX2-W2 fixture must emit");
+    };
+    assert!(
+        source.contains("p: Box<[f64]> = vec![0 as f64; n].into_boxed_slice()"),
+        "degradations={degradations:#?}\n{source}"
+    );
+    assert!(source.contains("drop(p)"), "{source}");
+}
+
+/// BOX2-W3 — the sized twin uses the same admitted numeric vocabulary but
+/// must not manufacture a slice or an extent.
+#[test]
+fn box2_w3_malloc_sized_uses_numeric_default_fill() {
+    let src = format!(
+        "{BOX_W1_PREAMBLE}\n\
+         pub unsafe fn f() {{\n\
+             let p: *mut i32 = malloc(core::mem::size_of::<i32>()) as *mut i32;\n\
+             free(p as *mut core::ffi::c_void);\n\
+         }}\n"
+    );
+    let super::RewriteOutcome::Emitted {
+        source,
+        degradations,
+        ..
+    } = super::rewrite_m1(&src)
+    else {
+        panic!("BOX2-W3 fixture must emit");
+    };
+    assert!(
+        source.contains("p: Box<i32> = Box::new(0 as i32)"),
+        "degradations={degradations:#?}\n{source}"
+    );
+    assert!(!source.contains("Box<[i32]>"), "{source}");
+    assert!(source.contains("drop(p)"), "{source}");
+}
+
 #[test]
 fn box_n5_depth_two_local_stays_out_of_wave1() {
     let src = format!(
