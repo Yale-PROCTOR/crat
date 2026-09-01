@@ -37,6 +37,7 @@ pub(crate) mod lifetime;
 #[cfg(test)]
 pub(crate) mod lifetime_oracle_tests;
 pub(crate) mod raw_boundary;
+pub(crate) mod raw_boundary_contracts;
 pub(crate) mod seam;
 pub(crate) mod universe;
 
