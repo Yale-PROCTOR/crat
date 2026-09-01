@@ -3,6 +3,7 @@
 //! This module is rewriter-side by design. It consumes the frozen model/MIR and
 //! never contributes a solver constraint or cache field.
 
+use rustc_hash::FxHashMap;
 use rustc_hir::{HirId, def_id::LocalDefId};
 use rustc_middle::{
     mir::{Operand, TerminatorKind},
@@ -10,7 +11,12 @@ use rustc_middle::{
 };
 use rustc_span::{Span, def_id::DefId};
 
-use crate::utils::rustc::RustProgram;
+use crate::{
+    analyses::borrow_ownership::{
+        a5_overlap::WholeProgramAttestation, origin_summary::OriginSummaries,
+    },
+    utils::rustc::RustProgram,
+};
 
 /// A lifetime-free, artifact-stable call-site identity.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -338,6 +344,157 @@ impl SiteMatchFailure {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub(crate) enum RetentionUnknownReason {
+    CalleeUnresolved,
+    FnPtrWeb,
+    OpenBoundary,
+    MultiDef,
+    NontransparentDef,
+    ProjectionAmbiguous,
+    OutputStorage,
+    FieldOrGlobalStore,
+    Return,
+    LocalSummaryUnknown,
+    AttestationAbsent,
+    AnalysisIncomplete,
+}
+
+impl RetentionUnknownReason {
+    pub(crate) const ALL: [Self; 12] = [
+        Self::CalleeUnresolved,
+        Self::FnPtrWeb,
+        Self::OpenBoundary,
+        Self::MultiDef,
+        Self::NontransparentDef,
+        Self::ProjectionAmbiguous,
+        Self::OutputStorage,
+        Self::FieldOrGlobalStore,
+        Self::Return,
+        Self::LocalSummaryUnknown,
+        Self::AttestationAbsent,
+        Self::AnalysisIncomplete,
+    ];
+
+    pub(crate) fn key(self) -> &'static str {
+        match self {
+            Self::CalleeUnresolved => "retention-callee-unresolved",
+            Self::FnPtrWeb => "retention-fnptr-web",
+            Self::OpenBoundary => "retention-open-boundary",
+            Self::MultiDef => "retention-multi-def",
+            Self::NontransparentDef => "retention-nontransparent-def",
+            Self::ProjectionAmbiguous => "retention-projection-ambiguous",
+            Self::OutputStorage => "retention-output-storage",
+            Self::FieldOrGlobalStore => "retention-field-or-global-store",
+            Self::Return => "retention-return",
+            Self::LocalSummaryUnknown => "retention-local-summary-unknown",
+            Self::AttestationAbsent => "retention-attestation-absent",
+            Self::AnalysisIncomplete => "retention-analysis-incomplete",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub(crate) enum RetentionEventKind {
+    Return,
+    OutputStorage,
+    FieldOrGlobalStore,
+    UnknownCall,
+    KnownNoRetainCall,
+    LocalCall,
+    DereferenceOnly,
+    Free,
+    MultiDef,
+    Nontransparent,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub(crate) struct RetentionStep {
+    pub location: String,
+    pub kind: RetentionEventKind,
+    pub detail: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct RetentionCertificate {
+    pub function: String,
+    pub argument_index: usize,
+    pub steps: Vec<RetentionStep>,
+    pub attestation: &'static str,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum RetentionVerdict {
+    NoRetain {
+        certificate: RetentionCertificate,
+    },
+    Retains {
+        sink: RetentionStep,
+        path: Vec<RetentionStep>,
+    },
+    Unknown {
+        reason: RetentionUnknownReason,
+        frontier: Vec<RetentionStep>,
+    },
+}
+
+#[derive(Clone, Debug, Default)]
+pub(crate) struct RetentionSummaries {
+    rows: FxHashMap<(LocalDefId, usize), RetentionVerdict>,
+}
+
+impl RetentionSummaries {
+    pub(crate) fn derive(
+        program: &RustProgram<'_>,
+        _origins: Option<&OriginSummaries>,
+        _attestation: Option<WholeProgramAttestation>,
+    ) -> Self {
+        let mut rows = FxHashMap::default();
+        for &function in &program.functions {
+            let body = program
+                .tcx
+                .mir_drops_elaborated_and_const_checked(function)
+                .borrow();
+            for argument_index in 0..body.arg_count {
+                let local = rustc_middle::mir::Local::from_usize(argument_index + 1);
+                if !matches!(body.local_decls[local].ty.kind(), TyKind::RawPtr(..)) {
+                    continue;
+                }
+                rows.insert(
+                    (function, argument_index),
+                    RetentionVerdict::Unknown {
+                        reason: RetentionUnknownReason::AnalysisIncomplete,
+                        frontier: Vec::new(),
+                    },
+                );
+            }
+        }
+        Self { rows }
+    }
+
+    pub(crate) fn get(
+        &self,
+        function: LocalDefId,
+        argument_index: usize,
+    ) -> Option<&RetentionVerdict> {
+        self.rows.get(&(function, argument_index))
+    }
+
+    pub(crate) fn verify_certificate(
+        &self,
+        function: LocalDefId,
+        argument_index: usize,
+        certificate: &RetentionCertificate,
+    ) -> Result<(), &'static str> {
+        match self.get(function, argument_index) {
+            Some(RetentionVerdict::NoRetain {
+                certificate: expected,
+            }) if expected == certificate => Ok(()),
+            _ => Err("retention-certificate-invalid"),
+        }
+    }
+}
+
 /// Select the one MIR call which represents an already-resolved HIR call site.
 /// Zero and multiple matches stay typed rather than choosing by traversal
 /// order.
@@ -362,6 +519,39 @@ pub(crate) fn select_unique_site(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn retention_of(
+        src: &str,
+        function_suffix: &str,
+        attestation: Option<WholeProgramAttestation>,
+    ) -> (RetentionVerdict, Result<(), &'static str>) {
+        ::utils::compilation::run_compiler_on_str(src, |tcx| {
+            let program = crate::bo_rewriter::collect_program(tcx);
+            let origins = crate::analyses::borrow_ownership::origins::compute_origins(&program);
+            let function = program
+                .functions
+                .iter()
+                .copied()
+                .find(|function| {
+                    tcx.def_path_str(function.to_def_id())
+                        .ends_with(function_suffix)
+                })
+                .expect("fixture function");
+            let summaries = RetentionSummaries::derive(&program, Some(&origins), attestation);
+            let verdict = summaries
+                .get(function, 0)
+                .expect("argument summary")
+                .clone();
+            let verification = match &verdict {
+                RetentionVerdict::NoRetain { certificate } => {
+                    summaries.verify_certificate(function, 0, certificate)
+                }
+                _ => Err("not-a-certificate"),
+            };
+            (verdict, verification)
+        })
+        .expect("fixture compiles")
+    }
 
     fn symbol(name: &str, foreign: bool) -> ForeignSymbolKey {
         ForeignSymbolKey {
@@ -514,6 +704,112 @@ mod tests {
             .expect("printf vararg contract")
             .retention,
             super::super::raw_boundary_contracts::RetentionContract::NoRetain
+        );
+    }
+
+    #[test]
+    fn rb_w2_local_pointee_access_without_escape_has_a_verified_certificate() {
+        let (verdict, verification) = retention_of(
+            "unsafe fn no_retain(p: *mut i32) { let _ = *p; *p = 1; }",
+            "no_retain",
+            Some(WholeProgramAttestation::FrozenBenchmarkGraph),
+        );
+        assert!(
+            matches!(verdict, RetentionVerdict::NoRetain { .. }),
+            "{verdict:#?}"
+        );
+        assert_eq!(verification, Ok(()));
+    }
+
+    #[test]
+    fn rb_w3_returned_pointer_is_positive_retention() {
+        let (verdict, _) = retention_of(
+            "unsafe fn returns(p: *mut i32) -> *mut i32 { p }",
+            "returns",
+            Some(WholeProgramAttestation::FrozenBenchmarkGraph),
+        );
+        assert!(
+            matches!(
+                verdict,
+                RetentionVerdict::Retains {
+                    sink: RetentionStep {
+                        kind: RetentionEventKind::Return,
+                        ..
+                    },
+                    ..
+                }
+            ),
+            "{verdict:#?}"
+        );
+    }
+
+    #[test]
+    fn rb_w10_missing_attestation_is_typed_unknown() {
+        let (verdict, _) = retention_of(
+            "unsafe fn no_retain(p: *mut i32) { let _ = *p; }",
+            "no_retain",
+            None,
+        );
+        assert!(
+            matches!(
+                verdict,
+                RetentionVerdict::Unknown {
+                    reason: RetentionUnknownReason::AttestationAbsent,
+                    ..
+                }
+            ),
+            "{verdict:#?}"
+        );
+    }
+
+    #[test]
+    fn rb_n1_multi_definition_alias_is_typed_unknown() {
+        let (verdict, _) = retention_of(
+            "unsafe fn branch(p: *mut i32, q: *mut i32, flag: bool) { let mut x = p; if flag { x = q; } let _ = *x; }",
+            "branch",
+            Some(WholeProgramAttestation::FrozenBenchmarkGraph),
+        );
+        assert!(
+            matches!(
+                verdict,
+                RetentionVerdict::Unknown {
+                    reason: RetentionUnknownReason::MultiDef,
+                    ..
+                }
+            ),
+            "{verdict:#?}"
+        );
+    }
+
+    #[test]
+    fn rb_n2_function_pointer_call_is_typed_unknown() {
+        let (verdict, _) = retention_of(
+            "unsafe fn indirect(p: *mut i32, cb: unsafe fn(*mut i32)) { cb(p); }",
+            "indirect",
+            Some(WholeProgramAttestation::FrozenBenchmarkGraph),
+        );
+        assert!(
+            matches!(
+                verdict,
+                RetentionVerdict::Unknown {
+                    reason: RetentionUnknownReason::FnPtrWeb,
+                    ..
+                }
+            ),
+            "{verdict:#?}"
+        );
+    }
+
+    #[test]
+    fn rb_n3_positive_retention_never_collapses_to_unknown() {
+        let (verdict, _) = retention_of(
+            "unsafe fn returns(p: *mut i32) -> *mut i32 { p }",
+            "returns",
+            Some(WholeProgramAttestation::FrozenBenchmarkGraph),
+        );
+        assert!(
+            matches!(verdict, RetentionVerdict::Retains { .. }),
+            "{verdict:#?}"
         );
     }
 }
