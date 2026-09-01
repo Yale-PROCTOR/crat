@@ -18343,6 +18343,77 @@ fn raw_boundary_primary_control_fixture_keeps_all_exact_populations() {
 }
 
 #[test]
+fn raw_boundary_external_join_fixture_is_bidirectional_and_builds_arm_b() {
+    let primary = concat!(
+        "read\tprogram\trecord_key\tcategory\ttyped_subkind\tconsumer_edges\n",
+        "A\tp\tp::f::libc#1\tLIBC-CONTRACT-OPENABLE\tknown-libc-no-independent-hard-conflict\tstrlen#0@p/lib.rs:4\n",
+        "B\tp\tp::f::free#2\tOUR-WALL\tunsafe-bridge-known-no-retention-free-boundary\tfree#0@p/lib.rs:5\n",
+        "A\tp\tp::f::local#3\tCONDITIONAL CORE\tflows-into-raw-param/retention-unknown-local\t-\n",
+        "A\tp\tp::f::caller#4\tCONDITIONAL CORE\targ-stays-raw/raw-caller-boundary\t-\n",
+        "A\tp\tp::f::flow#5\tCONDITIONAL CORE\tclass-collateral/flows-into-raw-param\t-\n",
+        "A\tp\tp::f::arg#6\tCONDITIONAL CORE\tclass-collateral/arg-stays-raw\t-\n",
+        "B\tp\tcrown::r\tOUR-WALL\treturn-boundary-lifetime-origin-absent\t-\n",
+    );
+    let box_control = concat!(
+        "subject_key\towner_fn\tmir_local\targ_index\tptr_depth\tfamily\tmodel_kind\tdecision\treason\n",
+        "p::f::box#7\tp::f\t7\t-\t1\tbox\towning\tdegraded\tbox-param-caller-unknown\n",
+    );
+    let subjects = concat!(
+        "subject_identity\towner\tmir_local\tsubject_kind\thypothetical\tsettled\tdirect_site_count\tdirect_tiers\traw_open\tclass_id\tclass_admits\tclass_block\tnode_block\tptr_depth\n",
+        "p::f::libc#1\tp::f\t1\tparam\tref\tref\t1\tT1\t1\t0\t1\t-\t-\t1\n",
+        "p::f::free#2\tp::f\t2\tparam\tbox\tbox\t1\tT1\t1\t1\t1\t-\t-\t1\n",
+        "p::f::local#3\tp::f\t3\tparam\tref\tref\t1\tT2\t1\t2\t1\t-\t-\t1\n",
+        "p::f::caller#4\tp::f\t4\tparam\tref\tdegraded\t0\t-\t0\t3\t0\targ-stays-raw\targ-stays-raw\t1\n",
+        "p::f::flow#5\tp::f\t5\tparam\tref\tdegraded\t0\t-\t0\t4\t0\tflows-into-raw-param\t-\t1\n",
+        "p::f::arg#6\tp::f\t6\tparam\tref\tdegraded\t0\t-\t0\t5\t0\targ-stays-raw\t-\t1\n",
+        "p::f::box#7\tp::f\t7\tlocal\tbox\tdegraded\t0\t-\t0\t-\t0\t-\t-\t1\n",
+    );
+    let dispositions = concat!(
+        "caller\tblock\tstatement_index\tcallee\targument_index\tsubject\tsubject_identity\tsource_site\ttier\ttemplate\twaiver_id\tevidence\treason\tdetail\tatom_group\n",
+        "p::f\t0\t0\tstrlen\t0\th\tp::f::libc#1\tp/lib.rs:4:1: 4:2\tT1\tref-shared-to-raw-const\t-\tcontract\t-\t-\ta\n",
+        "p::f\t0\t1\tfree\t0\th\tp::f::free#2\tp/lib.rs:5:1: 5:2\tT1\tknown-free-drop\t-\tcontract\t-\t-\tb\n",
+        "p::f\t0\t2\tp::local\t0\th\tp::f::local#3\tp/lib.rs:6:1: 6:2\tT2\tref-shared-to-raw-const\tw\tretention-unknown\tretention-open-boundary\t-\tc\n",
+    );
+    let result = reconcile_raw_boundary_controls(
+        primary,
+        box_control,
+        &[("p".to_owned(), subjects.to_owned())],
+        &[("p".to_owned(), dispositions.to_owned())],
+    )
+    .expect("fixture reconciles");
+    assert_eq!(result.libc_subjects, 1);
+    assert_eq!(result.libc_edges, 1);
+    assert_eq!(result.free_rows, 1);
+    assert_eq!(result.t2_rows, 4);
+    assert_eq!(result.box_rows, 1);
+    assert_eq!(result.crown_rows, 1);
+    assert_eq!(result.arm_b_rows, 2);
+    assert_eq!(result.divergences.lines().count(), 1, "{}", result.divergences);
+    assert_eq!(result.arm_b_ledger.lines().count(), 3);
+}
+
+#[test]
+fn raw_boundary_diagnostic_control_fixture_reports_movement_without_repinning() {
+    let baseline = concat!(
+        "function\terror_code\tmessage_head\tfile\tline\tattribution\n",
+        "f\tE0308\tmismatch\tp/lib.rs\t4\tstandard\n",
+        "g\tE0499\talias\tp/lib.rs\t8\tstandard\n",
+    );
+    let current = concat!(
+        "function\terror_code\tmessage_head\tfile\tline\tattribution\n",
+        "g\tE0499\talias\tp/lib.rs\t8\tstandard\n",
+        "h\tE0308\tnew\tp/lib.rs\t12\tstandard\n",
+    );
+    let result = reconcile_raw_boundary_diagnostics(
+        &[("p".to_owned(), baseline.to_owned())],
+        &[("p".to_owned(), current.to_owned())],
+    )
+    .expect("diagnostics reconcile");
+    assert_eq!((result.baseline, result.unchanged, result.resolved, result.new), (2, 1, 1, 1));
+    assert_eq!(result.rows.lines().count(), 4);
+}
+
+#[test]
 fn box_census_receipt_consumes_only_the_raw_capture_schema() {
     let mut row = report::Row::default();
     for key in [
