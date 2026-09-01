@@ -175,6 +175,36 @@ fn box_w1_malloc_literal_first_store_emits_box_and_free_site_drop() {
     );
 }
 
+/// BOX2-W1 — C2Rust lowers an unannotated allocator binding through a
+/// call-destination temporary and a pointer cast before assigning the source
+/// binding. The Box construction bridge must follow that one exact transparent
+/// chain; the initializer supplies the inferred Box type, so no declaration
+/// type splice is required.
+#[test]
+fn box2_w1_unannotated_calloc_cast_chain_reaches_the_subject() {
+    let src = format!(
+        "{BOX_W1_PREAMBLE}\n\
+         pub unsafe fn f(size: usize) {{\n\
+             let mut ff = calloc(size, core::mem::size_of::<f32>()) as *mut f32;\n\
+             free(ff as *mut core::ffi::c_void);\n\
+         }}\n"
+    );
+    let super::RewriteOutcome::Emitted {
+        source,
+        degradations,
+        ..
+    } = super::rewrite_m1(&src)
+    else {
+        panic!("BOX2-W1 fixture must emit");
+    };
+    assert!(
+        source.contains("let mut ff = vec![0 as f32; size].into_boxed_slice()"),
+        "degradations={degradations:#?}\n{source}"
+    );
+    assert!(source.contains("drop(ff)"), "{source}");
+    assert!(!source.contains("calloc(size"), "{source}");
+}
+
 #[test]
 fn box_n5_depth_two_local_stays_out_of_wave1() {
     let src = format!(
