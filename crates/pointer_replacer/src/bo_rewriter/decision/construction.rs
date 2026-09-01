@@ -127,6 +127,16 @@ pub(crate) struct ConstructionFacts {
     pub zero_memsets: FxHashMap<(LocalDefId, HirId), Vec<ZeroMemset>>,
     pub owner_overwrites: FxHashMap<(LocalDefId, HirId), Vec<OwnerOverwrite>>,
     pub realloc_calls: FxHashMap<(LocalDefId, HirId), Vec<rustc_span::Span>>,
+    /// Positive layout evidence that an allocator size combines a fixed header
+    /// with a separately-sized trailing region. Box wave 2 holds this class;
+    /// it is not an initializer failure.
+    pub flexible_tail_allocations: FxHashMap<(LocalDefId, HirId), FlexibleTailEvidence>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct FlexibleTailEvidence {
+    pub expression: String,
+    pub span: rustc_span::Span,
 }
 
 /// The only call-result target class allowed to license an inferred E2 local
@@ -175,6 +185,7 @@ pub(crate) fn collect(tcx: TyCtxt<'_>, fns: &[LocalDefId]) -> ConstructionFacts 
             tcx,
             fn_did,
             facts: &mut facts,
+            local_values: FxHashMap::default(),
         };
         v.visit_body(tcx.hir_body(body_id));
     }
@@ -185,6 +196,7 @@ struct Collector<'a, 'tcx> {
     tcx: TyCtxt<'tcx>,
     fn_did: LocalDefId,
     facts: &'a mut ConstructionFacts,
+    local_values: FxHashMap<HirId, (String, rustc_span::Span)>,
 }
 
 impl Collector<'_, '_> {
@@ -317,6 +329,38 @@ impl Collector<'_, '_> {
             _ => Some(CallResultTarget::Indirect),
         }
     }
+
+    fn flexible_tail_evidence(&self, init: &rustc_hir::Expr<'_>) -> Option<FlexibleTailEvidence> {
+        let e = Self::peel(init);
+        let rustc_hir::ExprKind::Call(callee, args) = &e.kind else {
+            return None;
+        };
+        let rustc_hir::ExprKind::Path(rustc_hir::QPath::Resolved(_, path)) = &callee.kind else {
+            return None;
+        };
+        let name = path.segments.last()?.ident.name.as_str();
+        if !matches!(name, "malloc" | "calloc" | "xmalloc" | "xcalloc") {
+            return None;
+        }
+        let size = match (name, *args) {
+            ("calloc" | "xcalloc", [_, size]) | (_, [size]) => *size,
+            _ => return None,
+        };
+        let (expression, span) = match &Self::peel(&size).kind {
+            rustc_hir::ExprKind::Path(rustc_hir::QPath::Resolved(_, path)) => {
+                let Res::Local(binding) = path.res else {
+                    return None;
+                };
+                self.local_values.get(&binding)?.clone()
+            }
+            _ => (self.snippet(size.span), size.span),
+        };
+        let size_of_count = expression.matches("size_of::<").count();
+        let combines_regions = expression.contains('+') || expression.contains("wrapping_add");
+        let has_trailing_extent = expression.contains('*') || expression.contains("wrapping_mul");
+        (size_of_count >= 2 && combines_regions && has_trailing_extent)
+            .then_some(FlexibleTailEvidence { expression, span })
+    }
 }
 
 impl<'tcx> Visitor<'tcx> for Collector<'_, 'tcx> {
@@ -326,6 +370,11 @@ impl<'tcx> Visitor<'tcx> for Collector<'_, 'tcx> {
             && let Some(init) = local.init
         {
             let c = self.classify(init);
+            if let Some(evidence) = self.flexible_tail_evidence(init) {
+                self.facts
+                    .flexible_tail_allocations
+                    .insert((self.fn_did, local.pat.hir_id), evidence);
+            }
             if matches!(c, Construction::CallResult)
                 && let Some(target) = self.call_result_target(init)
             {
@@ -342,6 +391,8 @@ impl<'tcx> Visitor<'tcx> for Collector<'_, 'tcx> {
             self.facts
                 .statement_spans
                 .insert((self.fn_did, local.pat.hir_id), stmt.span);
+            self.local_values
+                .insert(local.pat.hir_id, (self.snippet(init.span), init.span));
         }
         let expression = match stmt.kind {
             rustc_hir::StmtKind::Semi(expression) | rustc_hir::StmtKind::Expr(expression) => {

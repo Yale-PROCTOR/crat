@@ -205,6 +205,31 @@ fn box2_w1_unannotated_calloc_cast_chain_reaches_the_subject() {
     assert!(!source.contains("calloc(size"), "{source}");
 }
 
+#[test]
+fn box2_w1_bridge_receipt_names_the_exact_temp_chain() {
+    let src = format!(
+        "{BOX_W1_PREAMBLE}\n\
+         pub unsafe fn f(size: usize) {{\n\
+             let mut ff = calloc(size, core::mem::size_of::<f32>()) as *mut f32;\n\
+             free(ff as *mut core::ffi::c_void);\n\
+         }}\n"
+    );
+    let bridges = ::utils::compilation::run_compiler_on_str(&src, |tcx| {
+        super::box_plan_artifact(tcx)
+            .expect("Box plan artifact")
+            .bridges
+    })
+    .expect("fixture compiles");
+    let rows = bridges.lines().skip(1).collect::<Vec<_>>();
+    assert_eq!(rows.len(), 1, "{bridges}");
+    let fields = rows[0].split('\t').collect::<Vec<_>>();
+    assert_eq!(fields[9], "resolved", "{bridges}");
+    assert_eq!(fields[10], "-", "{bridges}");
+    assert!(fields[11].contains("call-destination"), "{bridges}");
+    assert!(fields[11].contains("assignment-rhs"), "{bridges}");
+    assert!(fields[11].contains("assignment-lhs"), "{bridges}");
+}
+
 /// BOX2-W2 — when no first-store or memset evidence exists, an exact
 /// `count * size_of::<T>()` allocation admits the numeric default-fill slice
 /// arm and preserves the evidence-backed count.
@@ -257,6 +282,66 @@ fn box2_w3_malloc_sized_uses_numeric_default_fill() {
     );
     assert!(!source.contains("Box<[i32]>"), "{source}");
     assert!(source.contains("drop(p)"), "{source}");
+}
+
+/// BOX2-N3/R1 — a fixed header plus a separately-sized trailing allocation is
+/// a representation question, not an initializer failure. Wave 2 must retain
+/// the exact positive layout evidence in its dedicated hold.
+#[test]
+fn box2_n3_flexible_tail_is_a_typed_hold_with_layout_evidence() {
+    let src = format!(
+        "{BOX_W1_PREAMBLE}\n\
+         #[repr(C)] struct Tail {{ len: i32, values: [f64; 1] }}\n\
+         pub unsafe fn f(n: usize) {{\n\
+             let bytes = core::mem::size_of::<Tail>() + (n - 1) * core::mem::size_of::<f64>();\n\
+             let p: *mut Tail = malloc(bytes) as *mut Tail;\n\
+             free(p as *mut core::ffi::c_void);\n\
+         }}\n"
+    );
+    let super::RewriteOutcome::Emitted {
+        source,
+        degradations,
+        ..
+    } = super::rewrite_m1(&src)
+    else {
+        panic!("BOX2-N3 fixture must complete conservatively");
+    };
+    let row = degradations
+        .iter()
+        .find(|row| row.subject == "f::p")
+        .expect("flexible-tail subject has a typed row");
+    assert_eq!(row.reason.key(), "box-flexible-tail-held");
+    let detail = row.reason.detail();
+    assert!(detail.contains("root_site="), "{detail}");
+    assert!(detail.contains("size_of::<Tail>"), "{detail}");
+    assert!(!source.contains("Box<"), "{source}");
+}
+
+#[test]
+fn box2_n3_nonadmitted_struct_default_fill_stays_closed() {
+    let src = format!(
+        "{BOX_W1_PREAMBLE}\n\
+         #[repr(C)] struct Pair {{ x: i32, y: i32 }}\n\
+         pub unsafe fn f() {{\n\
+             let p: *mut Pair = malloc(core::mem::size_of::<Pair>()) as *mut Pair;\n\
+             free(p as *mut core::ffi::c_void);\n\
+         }}\n"
+    );
+    let super::RewriteOutcome::Emitted {
+        source,
+        degradations,
+        ..
+    } = super::rewrite_m1(&src)
+    else {
+        panic!("BOX2-N3 non-admitted fixture must complete conservatively");
+    };
+    assert!(
+        degradations
+            .iter()
+            .any(|row| row.subject == "f::p" && row.reason.key() == "box-initializer-unsupported"),
+        "{degradations:#?}"
+    );
+    assert!(!source.contains("Box<Pair>"), "{source}");
 }
 
 #[test]

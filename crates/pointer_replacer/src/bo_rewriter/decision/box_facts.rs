@@ -67,6 +67,140 @@ pub(crate) fn scalar_initializer_supported(normalized: &str) -> bool {
     )
 }
 
+fn void_byte_backing_candidate(normalized: &str) -> bool {
+    normalized == "c_void"
+        || normalized.ends_with("::c_void")
+        || normalized == "core::ffi::c_void"
+        || normalized == "std::ffi::c_void"
+}
+
+fn calloc_zero_parity_supported(normalized: &str) -> bool {
+    scalar_initializer_supported(normalized)
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct DefaultFillPlan {
+    initializer: String,
+    receipt: &'static str,
+    shape: BoxShape,
+    fabricated_extent: bool,
+    pointee_override: Option<String>,
+}
+
+fn numeric_default_fill(
+    normalized: &str,
+    callee: &str,
+    size: &str,
+    count: Option<&str>,
+) -> Option<DefaultFillPlan> {
+    if callee != "malloc" || count.is_some() {
+        return None;
+    }
+    if void_byte_backing_candidate(normalized) {
+        let extent = size.trim();
+        if extent.is_empty() {
+            return None;
+        }
+        return Some(DefaultFillPlan {
+            initializer: format!("vec![0 as u8; ({extent}) as usize].into_boxed_slice()"),
+            receipt: "default-fill-slice-u8",
+            shape: BoxShape::Slice,
+            fabricated_extent: false,
+            pointee_override: Some("u8".to_owned()),
+        });
+    }
+    if !scalar_initializer_supported(normalized) {
+        return None;
+    }
+
+    let compact = size.split_whitespace().collect::<String>();
+    let marker = format!("size_of::<{normalized}>()");
+    if !compact.contains(&marker) {
+        return None;
+    }
+    let multiplicands = compact.split('*').collect::<Vec<_>>();
+    if multiplicands.len() == 2 {
+        let extent = if multiplicands[0].contains(&marker) {
+            multiplicands[1]
+        } else if multiplicands[1].contains(&marker) {
+            multiplicands[0]
+        } else {
+            return None;
+        }
+        .trim_matches(['(', ')']);
+        if extent.is_empty() {
+            return None;
+        }
+        return Some(DefaultFillPlan {
+            initializer: format!("vec![0 as {normalized}; {extent}].into_boxed_slice()"),
+            receipt: "default-fill-slice",
+            shape: BoxShape::Slice,
+            fabricated_extent: false,
+            pointee_override: None,
+        });
+    }
+    if !compact.contains('*') && !compact.contains("wrapping_mul") {
+        return Some(DefaultFillPlan {
+            initializer: format!("Box::new(0 as {normalized})"),
+            receipt: "default-fill-sized",
+            shape: BoxShape::Sized,
+            fabricated_extent: false,
+            pointee_override: None,
+        });
+    }
+    Some(DefaultFillPlan {
+        initializer: format!(
+            "vec![0 as {normalized}; crate::FALLBACK_SLICE_EXTENT].into_boxed_slice()"
+        ),
+        receipt: "default-fill-slice-fallback",
+        shape: BoxShape::Slice,
+        fabricated_extent: true,
+        pointee_override: None,
+    })
+}
+
+fn flexible_tail_evidence(
+    tcx: rustc_middle::ty::TyCtxt<'_>,
+    key: (LocalDefId, rustc_hir::HirId),
+    constructions: &super::construction::ConstructionFacts,
+) -> Option<String> {
+    let subject_site = constructions
+        .init_spans
+        .get(&key)
+        .map(|span| super::emitability::EmitabilityFacts::site(tcx, *span))?;
+    let direct = constructions
+        .flexible_tail_allocations
+        .get(&key)
+        .map(|evidence| (key.0, evidence));
+    let inherited = match constructions.call_result_targets.get(&key) {
+        Some(super::construction::CallResultTarget::DirectLocal(callee)) => {
+            let roots = constructions
+                .flexible_tail_allocations
+                .iter()
+                .filter(|((owner, _), _)| owner == callee)
+                .map(|((owner, _), evidence)| (*owner, evidence))
+                .collect::<Vec<_>>();
+            let [root] = roots.as_slice() else {
+                return None;
+            };
+            Some(*root)
+        }
+        Some(
+            super::construction::CallResultTarget::Indirect
+            | super::construction::CallResultTarget::Foreign
+            | super::construction::CallResultTarget::Unresolved,
+        )
+        | None => None,
+    };
+    let (owner, evidence) = direct.or(inherited)?;
+    let root_site = super::emitability::EmitabilityFacts::site(tcx, evidence.span);
+    Some(format!(
+        "subject_site={subject_site};root_fn={};root_site={root_site};layout={}",
+        tcx.def_path_str(owner.to_def_id()),
+        evidence.expression.replace(['\t', '\r', '\n'], " "),
+    ))
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum RecordedEquation {
     Linear { left: Var, right: Var, result: Var },
@@ -1353,6 +1487,9 @@ pub(crate) struct BoxPlan {
     pub(crate) delete_statements: Vec<Span>,
     pub(crate) receipts: Vec<String>,
     pub(crate) fabricated_extent: bool,
+    /// A positively-evidenced storage element that differs from the source
+    /// spelling (currently only `c_void` backed by an exact byte extent).
+    pub(crate) pointee_override: Option<String>,
     /// The initializer carries the complete Box type for an unannotated source
     /// binding reached through the sealed construction-presentation domain.
     /// The AST planner therefore places value edits but no declaration splice.
@@ -1376,6 +1513,7 @@ pub(crate) enum BoxPlanFailure {
     ParameterHeld,
     ConstructionUnmappable,
     ConstructionBridge(ConstructionBridgeFailure),
+    FlexibleTailHeld { evidence: String },
     EndpointInactive,
     EndpointUnjoined,
     MoveAmbiguous,
@@ -1394,6 +1532,7 @@ impl BoxPlanFailure {
             BoxPlanFailure::PointerDepth
             | BoxPlanFailure::ConstructionUnmappable
             | BoxPlanFailure::ConstructionBridge(_) => "box-construction-unmappable",
+            BoxPlanFailure::FlexibleTailHeld { .. } => "box-flexible-tail-held",
             BoxPlanFailure::ParameterHeld => "box-param-caller-unknown",
             BoxPlanFailure::EndpointInactive => "box-endpoint-inactive",
             BoxPlanFailure::EndpointUnjoined => "box-endpoint-unjoined",
@@ -1413,6 +1552,7 @@ impl BoxPlanFailure {
             Self::ConstructionBridge(reason) => {
                 format!("construction-bridge-{}", reason.key())
             }
+            Self::FlexibleTailHeld { evidence } => evidence.clone(),
             _ => "-".to_owned(),
         }
     }
@@ -1444,6 +1584,19 @@ impl BoxOwnershipFacts {
         endpoint: &EndpointFact,
         subject: Local,
     ) -> Result<ConstructionBridgePresentation, ConstructionBridgeFailure> {
+        let source_site = self.construction_source_site(endpoint)?;
+        resolve_construction_bridge(
+            source_site.local,
+            endpoint.var,
+            subject,
+            &self.construction_bridge_temps,
+        )
+    }
+
+    fn construction_source_site(
+        &self,
+        endpoint: &EndpointFact,
+    ) -> Result<&VersionSite, ConstructionBridgeFailure> {
         let source_sites = self
             .version_sites
             .iter()
@@ -1460,12 +1613,136 @@ impl BoxOwnershipFacts {
                 ConstructionBridgeFailure::MultipleDefinitions
             });
         };
-        resolve_construction_bridge(
-            source_site.local,
-            endpoint.var,
-            subject,
-            &self.construction_bridge_temps,
-        )
+        Ok(source_site)
+    }
+
+    pub(crate) fn construction_bridges_tsv(
+        &self,
+        tcx: rustc_middle::ty::TyCtxt<'_>,
+        subjects: &[super::Subject],
+        slots: &CrateSlots,
+        constructions: &super::construction::ConstructionFacts,
+        model: &FxHashMap<SlotRef, SlotKind>,
+    ) -> String {
+        let mut rows = Vec::new();
+        for subject in subjects {
+            if subject.ty_span.is_some()
+                || subject.pointee_span.is_some()
+                || subject.ptr_depth != 1
+                || !matches!(subject.kind, super::SubjectKind::Local)
+                || !matches!(
+                    constructions
+                        .by_binding
+                        .get(&(subject.fn_did, subject.hir_id)),
+                    Some(super::construction::Construction::Alloc { .. })
+                )
+            {
+                continue;
+            }
+            let Some(slot) = slots
+                .fn_local_slots
+                .get(&subject.fn_did)
+                .and_then(|universe| universe.slot_for_local_depth(subject.local, 0))
+                .map(|slot| SlotRef::Local(subject.fn_did, slot))
+            else {
+                continue;
+            };
+            if model.get(&slot) != Some(&SlotKind::Owning) {
+                continue;
+            }
+            let owner = tcx.def_path_str(subject.fn_did.to_def_id());
+            let subject_key = subject.identity_key(&owner);
+            let sources = self
+                .endpoints
+                .iter()
+                .filter(|endpoint| {
+                    endpoint.role == EndpointRole::Source
+                        && endpoint.status == EndpointStatus::Active
+                        && endpoint
+                            .slot_ref
+                            .is_some_and(|source| self.move_reaches(source, slot))
+                })
+                .collect::<Vec<_>>();
+            let (endpoint, outcome, reason, relation) = if let [endpoint] = sources.as_slice() {
+                match (
+                    self.construction_source_site(endpoint),
+                    self.construction_bridge_for(endpoint, subject.local),
+                ) {
+                    (Ok(source_site), Ok(presentation)) => {
+                        let mut relation = format!(
+                            "call-destination({},{}:{},def={})",
+                            source_site.local.as_u32(),
+                            source_site.location.block,
+                            source_site.location.statement,
+                            endpoint.var.as_u32(),
+                        );
+                        for hop in &presentation.hops {
+                            relation.push_str(&format!(
+                                "=>assignment-rhs({},{}:{},use={})=>assignment-lhs({},{}:{},def={})",
+                                hop.source.as_u32(),
+                                hop.location.block,
+                                hop.location.statement,
+                                hop.source_var.as_u32(),
+                                hop.destination.as_u32(),
+                                hop.location.block,
+                                hop.location.statement,
+                                hop.destination_var.as_u32(),
+                            ));
+                        }
+                        (*endpoint, "resolved", "-".to_owned(), relation)
+                    }
+                    (_, Err(failure)) | (Err(failure), _) => (
+                        *endpoint,
+                        "undeterminable",
+                        format!("construction-bridge-{}", failure.key()),
+                        "-".to_owned(),
+                    ),
+                }
+            } else {
+                let endpoint = sources.first().copied().or_else(|| {
+                    self.endpoints.iter().find(|endpoint| {
+                        endpoint.role == EndpointRole::Source && endpoint.function_path == owner
+                    })
+                });
+                let Some(endpoint) = endpoint else {
+                    continue;
+                };
+                (
+                    endpoint,
+                    "undeterminable",
+                    if sources.is_empty() {
+                        "construction-bridge-missing-source"
+                    } else {
+                        "construction-bridge-multiple-sources"
+                    }
+                    .to_owned(),
+                    "-".to_owned(),
+                )
+            };
+            rows.push((
+                subject_key.clone(),
+                format!(
+                    "{subject_key}\t{owner}\t{}\t{}\t{}\tbb{}:{}\t{}\t{}\t{}\t{outcome}\t{reason}\t{relation}",
+                    subject.local.as_u32(),
+                    slot_label(slot),
+                    endpoint.role.key(),
+                    endpoint.location.block,
+                    endpoint.location.statement,
+                    endpoint.callee,
+                    endpoint.var.as_u32(),
+                    endpoint.slot,
+                ),
+            ));
+        }
+        rows.sort_by(|left, right| left.0.cmp(&right.0));
+        let mut output = String::from(
+            "subject_key\towner_fn\tmir_local\tsubject_slot\tendpoint_role\tendpoint_location\tendpoint_callee\tendpoint_var\tendpoint_slot\toutcome\treason\tbridge_relation\n",
+        );
+        for (_, row) in rows {
+            output.push_str(&row);
+            output.push('\n');
+        }
+        output
     }
 
     pub(crate) fn plan_for_subject(
@@ -1493,7 +1770,15 @@ impl BoxOwnershipFacts {
             return Err(BoxPlanFailure::ConstructionUnmappable);
         };
         let normalized = format!("{pointee}");
-        if !scalar_initializer_supported(&normalized) {
+        let key = (subject.fn_did, subject.hir_id);
+        let construction = constructions
+            .by_binding
+            .get(&key)
+            .ok_or(BoxPlanFailure::ConstructionUnmappable)?;
+        if let Some(evidence) = flexible_tail_evidence(tcx, key, constructions) {
+            return Err(BoxPlanFailure::FlexibleTailHeld { evidence });
+        }
+        if !scalar_initializer_supported(&normalized) && !void_byte_backing_candidate(&normalized) {
             return Err(BoxPlanFailure::InitializerUnsupported);
         }
         let subject_slot = |candidate: &super::Subject| {
@@ -1523,11 +1808,6 @@ impl BoxOwnershipFacts {
         if active_sources.is_empty() {
             return Err(BoxPlanFailure::EndpointInactive);
         }
-        let key = (subject.fn_did, subject.hir_id);
-        let construction = constructions
-            .by_binding
-            .get(&key)
-            .ok_or(BoxPlanFailure::ConstructionUnmappable)?;
         let overwrite_count = constructions.owner_overwrites.get(&key).map_or(0, Vec::len);
         let expected_sources = match construction {
             super::construction::Construction::CopyOf => 1,
@@ -1633,6 +1913,7 @@ impl BoxOwnershipFacts {
                     )])
                     .collect(),
                 fabricated_extent: false,
+                pointee_override: None,
                 inferred_binding,
                 overwrite_spans: Vec::new(),
                 retained_sink,
@@ -1718,92 +1999,124 @@ impl BoxOwnershipFacts {
             .get(&key)
             .ok_or(BoxPlanFailure::AstUnplaceable)?;
         let mut delete_statements = Vec::new();
-        let (initializer, initializer_arm, shape, fabricated_extent, optional) = match construction
-        {
-            super::construction::Construction::Alloc {
-                callee,
-                size,
-                count: None,
-            } if callee == "malloc" && size.contains(&format!("size_of::<{normalized}>")) => {
-                if let Some(stores) = constructions.first_stores.get(&key)
-                    && stores.len() == 1 + overwrite_count
-                {
-                    let store = &stores[0];
-                    delete_statements.push(store.statement_span);
-                    (
-                        format!("Box::new({})", store.value),
-                        "malloc-literal-first-store",
-                        BoxShape::Sized,
-                        false,
-                        false,
-                    )
-                } else if overwrite_count == 0
-                    && let Some(memsets) = constructions.zero_memsets.get(&key)
-                    && let [memset] = memsets.as_slice()
-                {
-                    delete_statements.push(memset.statement_span);
-                    (
-                        format!(
-                            "vec![0 as {normalized}; crate::FALLBACK_SLICE_EXTENT].into_boxed_slice()"
-                        ),
-                        "memset-zero-slice",
-                        BoxShape::Slice,
-                        true,
-                        false,
-                    )
-                } else {
-                    return Err(BoxPlanFailure::InitializerUnsupported);
+        let (initializer, initializer_arm, shape, fabricated_extent, optional, pointee_override) =
+            match construction {
+                super::construction::Construction::Alloc {
+                    callee,
+                    size,
+                    count: None,
+                } if callee == "malloc" && size.contains(&format!("size_of::<{normalized}>")) => {
+                    if let Some(stores) = constructions.first_stores.get(&key)
+                        && stores.len() == 1 + overwrite_count
+                    {
+                        let store = &stores[0];
+                        delete_statements.push(store.statement_span);
+                        (
+                            format!("Box::new({})", store.value),
+                            "malloc-literal-first-store",
+                            BoxShape::Sized,
+                            false,
+                            false,
+                            None,
+                        )
+                    } else if overwrite_count == 0
+                        && let Some(memsets) = constructions.zero_memsets.get(&key)
+                        && let [memset] = memsets.as_slice()
+                    {
+                        delete_statements.push(memset.statement_span);
+                        (
+                            format!(
+                                "vec![0 as {normalized}; crate::FALLBACK_SLICE_EXTENT].into_boxed_slice()"
+                            ),
+                            "memset-zero-slice",
+                            BoxShape::Slice,
+                            true,
+                            false,
+                            None,
+                        )
+                    } else {
+                        let fill = numeric_default_fill(&normalized, callee, size, None)
+                            .ok_or(BoxPlanFailure::InitializerUnsupported)?;
+                        (
+                            fill.initializer,
+                            fill.receipt,
+                            fill.shape,
+                            fill.fabricated_extent,
+                            false,
+                            fill.pointee_override,
+                        )
+                    }
                 }
-            }
-            super::construction::Construction::Alloc {
-                callee,
-                size,
-                count: Some(count),
-            } if callee == "calloc" && size.contains(&format!("size_of::<{normalized}>")) => {
-                if count.trim() == "1" {
+                super::construction::Construction::Alloc {
+                    callee,
+                    size,
+                    count: Some(count),
+                } if callee == "calloc"
+                    && size.contains(&format!("size_of::<{normalized}>"))
+                    && calloc_zero_parity_supported(&normalized) =>
+                {
+                    if count.trim() == "1" {
+                        (
+                            format!("Box::new(0 as {normalized})"),
+                            "calloc-zero-scalar",
+                            BoxShape::Sized,
+                            false,
+                            false,
+                            None,
+                        )
+                    } else {
+                        (
+                            format!("vec![0 as {normalized}; {count}].into_boxed_slice()"),
+                            "calloc-zero-slice",
+                            BoxShape::Slice,
+                            false,
+                            false,
+                            None,
+                        )
+                    }
+                }
+                super::construction::Construction::NullLit if overwrite_count > 0 => {
+                    let overwrites = constructions
+                        .owner_overwrites
+                        .get(&key)
+                        .ok_or(BoxPlanFailure::InitializerUnsupported)?;
+                    let shape = if overwrites.iter().any(|overwrite| {
+                        matches!(
+                            &overwrite.construction,
+                            super::construction::Construction::Alloc {
+                                callee,
+                                count: Some(count),
+                                ..
+                            } if callee == "calloc" && count.trim() != "1"
+                        )
+                    }) {
+                        BoxShape::Slice
+                    } else {
+                        BoxShape::Sized
+                    };
+                    ("None".to_owned(), "null-init", shape, false, true, None)
+                }
+                super::construction::Construction::Alloc { callee, .. } if callee == "realloc" => {
+                    return Err(BoxPlanFailure::ReallocUnsupported);
+                }
+                super::construction::Construction::Alloc {
+                    callee,
+                    size,
+                    count,
+                } => {
+                    let fill = numeric_default_fill(&normalized, callee, size, count.as_deref())
+                        .ok_or(BoxPlanFailure::InitializerUnsupported)?;
                     (
-                        format!("Box::new(0 as {normalized})"),
-                        "calloc-zero-scalar",
-                        BoxShape::Sized,
+                        fill.initializer,
+                        fill.receipt,
+                        fill.shape,
+                        fill.fabricated_extent,
                         false,
-                        false,
-                    )
-                } else {
-                    (
-                        format!("vec![0 as {normalized}; {count}].into_boxed_slice()"),
-                        "calloc-zero-slice",
-                        BoxShape::Slice,
-                        false,
-                        false,
+                        fill.pointee_override,
                     )
                 }
-            }
-            super::construction::Construction::NullLit if overwrite_count > 0 => {
-                let overwrites = constructions
-                    .owner_overwrites
-                    .get(&key)
-                    .ok_or(BoxPlanFailure::InitializerUnsupported)?;
-                let shape = if overwrites.iter().any(|overwrite| {
-                    matches!(
-                        &overwrite.construction,
-                        super::construction::Construction::Alloc {
-                            callee,
-                            count: Some(count),
-                            ..
-                        } if callee == "calloc" && count.trim() != "1"
-                    )
-                }) {
-                    BoxShape::Slice
-                } else {
-                    BoxShape::Sized
-                };
-                ("None".to_owned(), "null-init", shape, false, true)
-            }
-            super::construction::Construction::Alloc { callee, .. } if callee == "realloc" => {
-                return Err(BoxPlanFailure::ReallocUnsupported);
-            }
-            _ => return Err(BoxPlanFailure::InitializerUnsupported),
-        };
+                _ => return Err(BoxPlanFailure::InitializerUnsupported),
+            };
         let expected_active_callee = constructions
             .owner_overwrites
             .get(&key)
@@ -2028,6 +2341,7 @@ impl BoxOwnershipFacts {
             delete_statements,
             receipts,
             fabricated_extent,
+            pointee_override,
             inferred_binding,
             overwrite_spans,
             retained_sink,
@@ -2198,10 +2512,10 @@ mod tests {
     use super::{
         BoxMoveTemps, BoxScopeFailure, ConstructionBridgeFailure, ConstructionBridgeHop,
         ConstructionBridgeTemps, EndpointStatus, FactValue, LocationKey, RecordedEquation,
-        SinkCarrierDef, SinkCarrierReason, SinkNamingTemps, box_scope, classify_endpoint,
-        exactly_one_sink_per_exit_graph, render_equations, replay_values,
-        resolve_construction_bridge, resolve_sink_carrier, resolve_sink_naming_carrier,
-        scalar_initializer_supported,
+        SinkCarrierDef, SinkCarrierReason, SinkNamingTemps, box_scope,
+        calloc_zero_parity_supported, classify_endpoint, exactly_one_sink_per_exit_graph,
+        numeric_default_fill, render_equations, replay_values, resolve_construction_bridge,
+        resolve_sink_carrier, resolve_sink_naming_carrier, scalar_initializer_supported,
     };
     use crate::analyses::borrow_ownership::{SlotKind, ssa::constraint::Var};
 
@@ -2472,5 +2786,34 @@ mod tests {
         for refused in ["bool", "char", "*mut i32", "S", "[u8; 4]", "()"] {
             assert!(!scalar_initializer_supported(refused), "{refused}");
         }
+    }
+
+    #[test]
+    fn box2_w4_calloc_zero_parity_is_limited_to_admitted_numeric_leaves() {
+        for admitted in ["u8", "i32", "usize", "f64"] {
+            assert!(calloc_zero_parity_supported(admitted), "{admitted}");
+        }
+        for refused in ["bool", "char", "c_void", "*mut i32", "Pair"] {
+            assert!(!calloc_zero_parity_supported(refused), "{refused}");
+        }
+    }
+
+    #[test]
+    fn box2_default_fill_admits_exact_void_byte_extent_as_u8_slice_only() {
+        let fill = numeric_default_fill(
+            "core::ffi::c_void",
+            "malloc",
+            "(items * size) as core::ffi::c_ulong",
+            None,
+        )
+        .expect("exact byte extent admits the u8 backing candidate");
+        assert_eq!(fill.shape, super::BoxShape::Slice);
+        assert_eq!(fill.pointee_override.as_deref(), Some("u8"));
+        assert_eq!(fill.receipt, "default-fill-slice-u8");
+        assert!(fill.initializer.contains("(items * size)"));
+        assert!(
+            numeric_default_fill("Pair", "malloc", "size_of::<Pair>()", None).is_none(),
+            "mutation killer: an unadmitted element type must not receive a fill"
+        );
     }
 }

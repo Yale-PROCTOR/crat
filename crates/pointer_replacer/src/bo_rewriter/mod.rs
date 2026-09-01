@@ -3599,6 +3599,7 @@ fn finish_decide<'tcx>(
             analysis,
             a5_site_proofs,
             box_facts,
+            constructions: ctors,
             e2_artifacts,
         },
     ))
@@ -3640,6 +3641,7 @@ pub(crate) struct DecideCtx {
     analysis: DecisionAnalysisCarrier,
     a5_site_proofs: decision::a5_site_proof::A5SeamProofIndex,
     box_facts: decision::box_facts::BoxOwnershipFacts,
+    constructions: decision::construction::ConstructionFacts,
     e2_artifacts: E2Artifacts,
 }
 
@@ -3721,6 +3723,7 @@ pub(crate) fn box_fact_artifacts(tcx: TyCtxt<'_>) -> Result<BoxFactArtifacts, St
 
 pub(crate) struct BoxPlanArtifact {
     pub(crate) tsv: String,
+    pub(crate) bridges: String,
     pub(crate) a5_global_setup_wall_s: f64,
     pub(crate) a5_pair_classification_wall_s: f64,
     pub(crate) a5_receipt_render_wall_s: f64,
@@ -3773,6 +3776,13 @@ fn box_mir_drop_policies(
 
 pub(crate) fn box_plan_artifact(tcx: TyCtxt<'_>) -> Result<BoxPlanArtifact, String> {
     let (table, ctx) = decide_table_with_ctx(tcx)?;
+    let bridges = ctx.box_facts.construction_bridges_tsv(
+        tcx,
+        &ctx.subjects,
+        &ctx.slots,
+        &ctx.constructions,
+        &ctx.model,
+    );
     let a5_global_setup_wall_s = ctx.a5_site_proofs.global_setup_wall_s();
     let a5_pair_classification_wall_s = ctx.a5_site_proofs.pair_classification_wall_s();
     let receipt_started = std::time::Instant::now();
@@ -3814,7 +3824,7 @@ pub(crate) fn box_plan_artifact(tcx: TyCtxt<'_>) -> Result<BoxPlanArtifact, Stri
                     0,
                     0,
                     0,
-                    "-".to_owned(),
+                    record.reason.detail(),
                 ),
                 decision::Decision::Ref { .. }
                 | decision::Decision::InferredRef { .. }
@@ -3855,6 +3865,7 @@ pub(crate) fn box_plan_artifact(tcx: TyCtxt<'_>) -> Result<BoxPlanArtifact, Stri
     }
     Ok(BoxPlanArtifact {
         tsv: output,
+        bridges,
         a5_global_setup_wall_s,
         a5_pair_classification_wall_s,
         a5_receipt_render_wall_s,

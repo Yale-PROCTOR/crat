@@ -9578,6 +9578,11 @@ mod run {
             &artifact.tsv,
         )
         .expect("write Box plan ledger");
+        std::fs::write(
+            directory.join(format!("{name}.box-bridges.tsv")),
+            &artifact.bridges,
+        )
+        .expect("write Box construction-bridge ledger");
 
         let mut rows = 0usize;
         let mut planned = 0usize;
@@ -9602,6 +9607,16 @@ mod run {
             waiver_unwind += fields[12].matches("waiver-drop(unwind)").count();
         }
         row.set("box_rows", rows);
+        row.set("box_bridge_rows", artifact.bridges.lines().skip(1).count());
+        row.set(
+            "box_bridge_resolved",
+            artifact
+                .bridges
+                .lines()
+                .skip(1)
+                .filter(|line| line.split('\t').nth(9) == Some("resolved"))
+                .count(),
+        );
         row.set("box_planned", planned);
         row.set("box_param_planned", params_planned);
         row.set("box_depth2_rows", depth_two);

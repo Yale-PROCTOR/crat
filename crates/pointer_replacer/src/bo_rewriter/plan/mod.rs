@@ -477,7 +477,7 @@ pub(crate) fn plan(
                 });
                 continue;
             };
-            let Some(pointee) = source.get(p_lo..p_hi) else {
+            let Some(source_pointee) = source.get(p_lo..p_hi) else {
                 unplaceable.push(Unplaceable {
                     reason: "pointee range is outside its own file's source",
                     detail: attribution(),
@@ -485,6 +485,9 @@ pub(crate) fn plan(
                 });
                 continue;
             };
+            let pointee = box_plan
+                .and_then(|plan| plan.pointee_override.as_deref())
+                .unwrap_or(source_pointee);
             let base = if box_plan.is_some() {
                 if fat {
                     format!("Box<[{pointee}]>")
