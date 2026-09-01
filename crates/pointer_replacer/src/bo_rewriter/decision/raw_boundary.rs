@@ -491,4 +491,29 @@ mod tests {
         assert!(!sites.sites[0].key.callee.foreign);
         assert_eq!(sites.sites[0].key.argument_index, 0);
     }
+
+    #[test]
+    fn rb_x1_variadic_raw_argument_keeps_its_position_and_contract() {
+        let src = r#"
+            extern "C" { fn printf(fmt: *const i8, ...) -> i32; }
+            unsafe fn caller(fmt: *const i8, p: *const i8) { printf(fmt, p); }
+        "#;
+        let facts = ::utils::compilation::run_compiler_on_str(src, |tcx| {
+            let program = crate::bo_rewriter::collect_program(tcx);
+            super::super::emitability::collect(tcx, &program.functions).foreign_call_args
+        })
+        .expect("fixture compiles");
+        assert_eq!(facts.len(), 2, "{facts:#?}");
+        assert_eq!(facts[1].argument_index, 1);
+        assert_eq!(
+            super::super::raw_boundary_contracts::classify_contract(
+                &facts[1].callee,
+                facts[1].argument_index,
+                &facts[1].target,
+            )
+            .expect("printf vararg contract")
+            .retention,
+            super::super::raw_boundary_contracts::RetentionContract::NoRetain
+        );
+    }
 }

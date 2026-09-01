@@ -615,10 +615,16 @@ impl<'tcx> Visitor<'tcx> for BodyFacts<'_, 'tcx> {
                         let typeck = self.tcx.typeck(self.fn_did);
                         let symbol = symbol_key(self.tcx, def_id, self.locals);
                         for (index, arg) in args.iter().enumerate() {
-                            let Some(target_ty) = sig.inputs().get(index).copied() else {
-                                continue;
-                            };
-                            let Some(target) = raw_target_type(target_ty) else {
+                            let source_ty = typeck.expr_ty(arg);
+                            let target = sig
+                                .inputs()
+                                .get(index)
+                                .copied()
+                                .and_then(raw_target_type)
+                                .or_else(|| {
+                                    sig.c_variadic.then(|| raw_target_type(source_ty)).flatten()
+                                });
+                            let Some(target) = target else {
                                 continue;
                             };
                             let shape = classify_arg(self.tcx, arg);
@@ -630,7 +636,7 @@ impl<'tcx> Visitor<'tcx> for BodyFacts<'_, 'tcx> {
                                 argument_span: arg.span,
                                 root: shape.place_root(),
                                 shape: shape.key(),
-                                source_type: format!("{:?}", typeck.expr_ty(arg)),
+                                source_type: format!("{source_ty:?}"),
                                 target,
                             });
                         }
