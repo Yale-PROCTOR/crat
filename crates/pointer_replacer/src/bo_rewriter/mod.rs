@@ -5473,3 +5473,86 @@ fn push_overlap_columns(
         output.push_str(&format!("\t-\t-\t-\t-\t-\t-\t{lifetime_plan_digest}\n"));
     }
 }
+
+#[cfg(test)]
+mod raw_boundary_atom_tests {
+    use super::{
+        AtomSelectionKind, EditSite, atom_surviving_edit_ids, select_atoms_on_original_lines,
+        verify,
+    };
+
+    fn diag(line: usize, code: &str, related: &[usize]) -> verify::Diag {
+        verify::Diag {
+            file: "fixture.rs".to_owned(),
+            line,
+            message: "fixture diagnostic".to_owned(),
+            direction: verify::Direction::Other,
+            code: Some(code.to_owned()),
+            related: related
+                .iter()
+                .map(|line| verify::RelatedDiag {
+                    file: "fixture.rs".to_owned(),
+                    line: *line,
+                    message: "related fixture span".to_owned(),
+                })
+                .collect(),
+        }
+    }
+
+    fn site(line: usize, id: &str, group: &[&str], covered: bool) -> EditSite {
+        EditSite {
+            file: "fixture.rs".to_owned(),
+            fn_path: "crate::f".to_owned(),
+            lo_line: line,
+            hi_line: line,
+            edit_id: id.to_owned(),
+            atom_ids: group.iter().map(|id| (*id).to_owned()).collect(),
+            atom_covered: covered,
+        }
+    }
+
+    /// RB-W11: an exact failure removes its dependency group and preserves an
+    /// independent raw-boundary atom in the same function.
+    #[test]
+    fn rb_w11_exact_atom_preserves_independent_atom() {
+        let sites = vec![
+            site(2, "a-edit", &["a-site"], true),
+            site(3, "b-edit", &["b-site"], true),
+        ];
+        let selected = select_atoms_on_original_lines(&[diag(2, "E0308", &[])], &sites);
+        assert_eq!(selected.kind, AtomSelectionKind::Exact);
+        assert_eq!(selected.atoms, ["a-site".to_owned()].into_iter().collect());
+        assert_eq!(
+            atom_surviving_edit_ids(&sites, &selected.atoms),
+            ["b-edit".to_owned()].into_iter().collect()
+        );
+    }
+
+    /// RB-W12: alias diagnostics consume primary and related spans as one
+    /// canonically sorted group, never one side selected by traversal order.
+    #[test]
+    fn rb_w12_alias_diagnostic_reverts_related_atoms_as_one_group() {
+        let sites = vec![
+            site(2, "left", &["left-site"], true),
+            site(5, "right", &["right-site"], true),
+        ];
+        let selected = select_atoms_on_original_lines(&[diag(2, "E0499", &[5])], &sites);
+        assert_eq!(selected.kind, AtomSelectionKind::GroupAtomic);
+        assert_eq!(
+            selected.atoms,
+            ["left-site".to_owned(), "right-site".to_owned()]
+                .into_iter()
+                .collect()
+        );
+    }
+
+    /// RB-N4: an unowned or uncovered diagnostic cannot guess an atom.
+    #[test]
+    fn rb_n4_ambiguous_atom_routes_to_function_fallback() {
+        let sites = vec![site(2, "known", &["known-site"], true)];
+        let selected = select_atoms_on_original_lines(&[diag(9, "E0308", &[])], &sites);
+        assert_eq!(selected.kind, AtomSelectionKind::Fallback);
+        assert_eq!(selected.reason, "atom-attribution-ambiguous");
+        assert!(selected.atoms.is_empty());
+    }
+}
