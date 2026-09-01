@@ -7223,3 +7223,27 @@ fn reverting_every_function_reproduces_the_substrate() {
          --- emitted ---\n{out}\n--- substrate ---\n{SRC}"
     );
 }
+
+/// RB-W4 — an exact foreign boundary with unknown retention is admitted only
+/// by the user-confirmed T2 waiver. The source needs no syntax edit because
+/// Rust already coerces `&mut T` to `*mut T`; the decision and tier receipt are
+/// the missing mechanism.
+#[test]
+fn rb_w4_confirmed_t2_unknown_foreign_boundary_emits_zero_syntax() {
+    let src = "#![allow(dead_code, unused_unsafe)]\n\
+               extern \"C\" { fn opaque(p: *mut i32); }\n\
+               pub unsafe fn f(p: *mut i32) { opaque(p); }\n";
+    assert_eq!(
+        reason_of(&decisions_of(src), "p", true),
+        "<emitted>",
+        "confirmed T2 must lift the exact foreign-argument escape"
+    );
+    let super::RewriteOutcome::Emitted { source, .. } = super::rewrite_m1(src) else {
+        panic!("T2 fixture must emit");
+    };
+    assert!(source.contains("p: &mut i32"), "{source}");
+    assert!(
+        source.contains("opaque(p)"),
+        "zero-syntax coercion must stay exact: {source}"
+    );
+}
