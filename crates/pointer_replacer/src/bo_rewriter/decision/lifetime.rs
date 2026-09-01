@@ -355,7 +355,16 @@ pub(crate) fn derive_return_eligibility(
     return_subjects.dedup();
 
     for subject in return_subjects {
-        if !matches!(decisions.get(&subject), Some(Decision::Ref { .. })) {
+        let candidate = match decisions.get(&subject) {
+            Some(Decision::Ref { .. }) => true,
+            Some(Decision::InferredRef { .. }) => false,
+            Some(Decision::Slice { .. }) => false,
+            Some(Decision::Opt { .. }) => false,
+            Some(Decision::Box(_)) => false,
+            Some(Decision::Degraded(_)) => false,
+            None => false,
+        };
+        if !candidate {
             continue;
         }
         let function = subject.0;
@@ -1175,76 +1184,49 @@ fn derivation_text(tcx: rustc_middle::ty::TyCtxt<'_>, reason: &WebDerivation) ->
 }
 
 #[cfg(test)]
-fn oracle_web(
-    program: &RustProgram<'_>,
-    roots: &FxHashSet<LocalDefId>,
-    resolved: &FxHashMap<(LocalDefId, rustc_middle::mir::BasicBlock), Vec<LocalDefId>>,
-) -> (FxHashSet<LocalDefId>, FxHashMap<LocalDefId, WebDerivation>) {
-    let mut members = FxHashSet::default();
-    let mut reasons = roots
-        .iter()
-        .copied()
-        .map(|root| (root, WebDerivation::AdjustedFnPtr))
-        .collect::<FxHashMap<_, _>>();
-    let mut pending = roots.iter().copied().collect::<Vec<_>>();
-    while let Some(function) = pending.pop() {
-        if !members.insert(function) {
-            continue;
-        }
-        let mut outgoing = resolved
-            .iter()
-            .filter(|((caller, _), _)| *caller == function)
-            .flat_map(|(&(caller, block), targets)| {
-                targets
-                    .iter()
-                    .copied()
-                    .map(move |target| (target, edge_derivation(program, caller, block)))
-            })
-            .collect::<Vec<_>>();
-        outgoing.sort_by_key(|(target, reason)| {
-            (target.local_def_index.as_u32(), web_reason_order(reason))
-        });
-        for (target, reason) in outgoing.into_iter().rev() {
-            if !members.contains(&target) {
-                reasons.entry(target).or_insert(reason);
-                pending.push(target);
-            }
-        }
-    }
-    (members, reasons)
-}
-
-#[cfg(test)]
 pub(crate) fn fn_ptr_web_differential(
     program: &RustProgram<'_>,
     attestation: Option<WholeProgramAttestation>,
+    oracle_roots: &BTreeSet<String>,
+    oracle_members: &BTreeSet<String>,
 ) -> Result<FnPtrWebDifferential, LifetimeFailure> {
     let production = derive_fn_ptr_web(program, attestation)?;
-    let local = program.functions.iter().copied().collect::<FxHashSet<_>>();
-    let mut oracle_roots = crate::rewriter::collector::collect_fn_ptrs(program);
-    oracle_roots.retain(|function| local.contains(function));
-    let call_world = resolve_closed_world_call_world(program, attestation);
-    let (oracle_members, oracle_reasons) = oracle_web(program, &oracle_roots, &call_world.resolved);
+    let production_roots = production
+        .roots
+        .iter()
+        .map(|did| program.tcx.def_path_str(*did))
+        .collect::<BTreeSet<_>>();
+    let production_members = production
+        .members
+        .iter()
+        .map(|did| program.tcx.def_path_str(*did))
+        .collect::<BTreeSet<_>>();
+    let production_by_path = production
+        .members
+        .iter()
+        .map(|did| (program.tcx.def_path_str(*did), *did))
+        .collect::<BTreeMap<_, _>>();
 
     let mut divergences = Vec::new();
     for (unit, production_set, oracle_set) in [
-        ("root", &production.roots, &oracle_roots),
-        ("closure", &production.members, &oracle_members),
+        ("root", &production_roots, oracle_roots),
+        ("closure", &production_members, oracle_members),
     ] {
         for function in production_set.difference(oracle_set) {
+            let did = production_by_path[function];
             divergences.push(FnPtrWebDivergence {
                 side: "production-only",
                 unit,
-                function: program.tcx.def_path_str(*function),
-                reason: derivation_text(program.tcx, &production.reasons[function]),
+                function: function.clone(),
+                reason: derivation_text(program.tcx, &production.reasons[&did]),
             });
         }
         for function in oracle_set.difference(production_set) {
             divergences.push(FnPtrWebDivergence {
                 side: "p-b-only",
                 unit,
-                function: program.tcx.def_path_str(*function),
-                reason: derivation_text(program.tcx, &oracle_reasons[function]),
+                function: function.clone(),
+                reason: "frozen-control".to_owned(),
             });
         }
     }
@@ -1257,9 +1239,9 @@ pub(crate) fn fn_ptr_web_differential(
     });
 
     Ok(FnPtrWebDifferential {
-        production_roots: production.roots.len(),
+        production_roots: production_roots.len(),
         oracle_roots: oracle_roots.len(),
-        production_members: production.members.len(),
+        production_members: production_members.len(),
         oracle_members: oracle_members.len(),
         divergences,
     })
@@ -1540,6 +1522,8 @@ mod tests {
             fn_ptr_web_differential(
                 &program,
                 Some(WholeProgramAttestation::FrozenBenchmarkGraph),
+                &BTreeSet::from(["root".to_owned()]),
+                &BTreeSet::from(["leaf".to_owned(), "root".to_owned()]),
             )
             .expect("attested P-b differential")
         })

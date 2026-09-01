@@ -34,6 +34,8 @@ pub(crate) mod co_conversion;
 pub(crate) mod construction;
 pub(crate) mod emitability;
 pub(crate) mod lifetime;
+#[cfg(test)]
+pub(crate) mod lifetime_oracle_tests;
 pub(crate) mod seam;
 pub(crate) mod universe;
 

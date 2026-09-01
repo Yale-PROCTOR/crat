@@ -1492,7 +1492,7 @@ fn emission_call_sites(root: &Path, skip: &dyn Fn(&Path) -> bool) -> Vec<String>
 fn is_test_only_file(path: &Path) -> bool {
     matches!(
         path.file_name().and_then(|n| n.to_str()),
-        Some("goldens.rs" | "emit_tests.rs" | "import_denylist.rs")
+        Some("goldens.rs" | "emit_tests.rs" | "import_denylist.rs" | "lifetime_oracle_tests.rs")
     )
 }
 
