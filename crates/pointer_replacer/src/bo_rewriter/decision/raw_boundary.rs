@@ -51,8 +51,18 @@ pub(crate) fn select_unique_site(
     expected: &ForeignSymbolKey,
     candidates: &[MirCallCandidate],
 ) -> Result<(u32, u32), SiteMatchFailure> {
-    let _ = (expected, candidates);
-    Err(SiteMatchFailure::Missing)
+    let mut matching = candidates.iter().filter(|site| site.callee == *expected);
+    let Some(site) = matching.next() else {
+        return Err(if candidates.is_empty() {
+            SiteMatchFailure::Missing
+        } else {
+            SiteMatchFailure::CalleeMismatch
+        });
+    };
+    if matching.next().is_some() {
+        return Err(SiteMatchFailure::Ambiguous);
+    }
+    Ok((site.block, site.statement_index))
 }
 
 #[cfg(test)]
