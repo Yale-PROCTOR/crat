@@ -331,6 +331,10 @@ pub(crate) struct SeamEdit {
     /// The attested site proof that discharged the conservative overlap gate.
     /// `None` means this position never needed that gate.
     pub overlap: Option<A5PositionProof>,
+    /// Raw-boundary subject/site dependency group. Empty for every older seam
+    /// family; populated once by the decision layer and never inferred from
+    /// replacement text.
+    pub atom_ids: Vec<String>,
 }
 
 /// One placed initializer/assignment adapter. It deliberately carries the
@@ -2179,6 +2183,10 @@ pub(crate) struct SeamPlan {
     pub uncensused: Vec<(Form, Form)>,
     /// Raw-boundary T1/T2/blocked receipts, including zero-syntax sites.
     pub raw_boundary_receipts: String,
+    /// Exact site atoms grouped by their converted subject. This is the sole
+    /// source for declaration/use dependency closure during atom reverts.
+    pub raw_boundary_atom_groups:
+        rustc_hash::FxHashMap<(LocalDefId, HirId), Vec<super::raw_boundary::SubjectAtomKey>>,
 }
 
 /// The form a decision emits.
@@ -2698,6 +2706,7 @@ pub(crate) fn synthesize_with_raw_boundary(
                             root_identity: root_label(&labels, site.caller, pos.root),
                             blind: pos.blind,
                             overlap,
+                            atom_ids: Vec::new(),
                         });
                     }
                     Err(block) => {
@@ -2727,6 +2736,7 @@ pub(crate) fn synthesize_with_raw_boundary(
     // Raw-boundary wave 1 — explicit safe-to-raw sites. Zero-syntax and
     // lifecycle templates remain in the receipt but produce no edit.
     plan.raw_boundary_receipts = raw_boundary.receipts_tsv();
+    plan.raw_boundary_atom_groups = raw_boundary.subject_atom_groups();
     for (key, disposition, site) in raw_boundary.emission_sites() {
         let Some(template) = disposition.template() else {
             continue;
@@ -2750,6 +2760,11 @@ pub(crate) fn synthesize_with_raw_boundary(
             .node
             .and_then(|node| decision_of.get(&node).copied())
             .map_or(Form::Raw, form_of);
+        let atom_ids = site
+            .node
+            .and_then(|node| plan.raw_boundary_atom_groups.get(&node))
+            .map(|atoms| atoms.iter().map(|atom| atom.id.clone()).collect())
+            .unwrap_or_default();
         plan.edits.push(SeamEdit {
             span: site.span,
             replacement,
@@ -2767,6 +2782,7 @@ pub(crate) fn synthesize_with_raw_boundary(
             root_identity: key.subject.clone(),
             blind: false,
             overlap: None,
+            atom_ids,
         });
     }
     for site in raw_boundary.address_sites() {
@@ -2781,6 +2797,11 @@ pub(crate) fn synthesize_with_raw_boundary(
             .get(&site.node)
             .copied()
             .map_or(Form::Raw, form_of);
+        let atom_ids = plan
+            .raw_boundary_atom_groups
+            .get(&site.node)
+            .map(|atoms| atoms.iter().map(|atom| atom.id.clone()).collect())
+            .unwrap_or_default();
         plan.edits.push(SeamEdit {
             span: site.span,
             replacement,
@@ -2798,6 +2819,7 @@ pub(crate) fn synthesize_with_raw_boundary(
             root_identity: format!("address:{}:{}", site.op, site.span.lo().0),
             blind: false,
             overlap: None,
+            atom_ids,
         });
     }
 

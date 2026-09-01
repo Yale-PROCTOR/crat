@@ -4710,6 +4710,9 @@ mod attribution_and_escapes {
             fn_path: "k::callee".to_owned(),
             lo_line: 10,
             hi_line: 10,
+            edit_id: "caller-edit".to_owned(),
+            atom_ids: Vec::new(),
+            atom_covered: false,
         }];
         let diags = [diag("/crate/caller.rs", 10)];
 
@@ -4765,6 +4768,9 @@ mod attribution_and_escapes {
             fn_path: "k::callee".to_owned(),
             lo_line: 1,
             hi_line: 1,
+            edit_id: "callee-edit".to_owned(),
+            atom_ids: Vec::new(),
+            atom_covered: false,
         }];
         let owners = attribute(
             &[diag("/crate/callee.rs", 20)],
@@ -4811,6 +4817,9 @@ mod attribution_and_escapes {
             fn_path: "k::callee".to_owned(),
             lo_line: 10,
             hi_line: 10,
+            edit_id: "reverted-edit".to_owned(),
+            atom_ids: Vec::new(),
+            atom_covered: false,
         }];
         let reverted = BTreeSet::from(["k::callee".to_owned()]);
 
@@ -4849,6 +4858,7 @@ mod attribution_and_escapes {
                 replacement: "zzz".to_owned(),
                 justification: Justification::KindDecision { kind: "Ref(mut)" },
                 owner_fn: "k::f".to_owned(),
+                atom_ids: Vec::new(),
             }],
         );
         let texts = BTreeMap::from([(key, text.to_owned())]);

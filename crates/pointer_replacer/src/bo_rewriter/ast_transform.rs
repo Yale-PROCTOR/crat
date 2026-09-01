@@ -1995,6 +1995,15 @@ fn transform_with(
     let mut use_key_collisions = 0usize;
     let mut decision_key_collisions = 0usize;
     for (subject, decision) in &table.entries {
+        // Atom reverts are subject-granular. Function reverts remain visible to
+        // RefDeclVisitor's at-site control; atom reverts are filtered here
+        // because the visitor historically receives only a function set.
+        if reverts
+            .atom_subjects
+            .contains(&(subject.fn_did, subject.hir_id))
+        {
+            continue;
+        }
         // EXHAUSTIVE — the denylist rejects the bypass shape, and the arm's
         // population is defined by which disposition was reached.
         let (form, mutable, use_edits) = match decision {
@@ -2782,6 +2791,12 @@ fn compare_renders(
 pub(crate) struct RevertSet {
     pub fns: FxHashSet<LocalDefId>,
     pub names: FxHashSet<String>,
+    /// Exact raw-boundary atom IDs selected by the verifier.
+    pub atom_names: FxHashSet<String>,
+    /// Subject closures implied by those exact IDs. This pair is the AST-side
+    /// identity; it lets one subject be withheld without reverting siblings in
+    /// the same function.
+    pub atom_subjects: FxHashSet<(LocalDefId, HirId)>,
     pub subjects: usize,
 }
 
@@ -2804,10 +2819,16 @@ impl RevertSet {
         !self.names.contains(owner_fn)
     }
 
+    /// Does a carried edit survive both the established function revert and
+    /// the raw-boundary atom dependency closure?
+    pub(crate) fn keeps_edit(&self, owner_fn: &str, atom_ids: &[String]) -> bool {
+        self.keeps(owner_fn) && atom_ids.iter().all(|atom| !self.atom_names.contains(atom))
+    }
+
     /// Does a subject survive? `emit_files`'s own rule, restated for the AST
     /// side so both layers hold back the same functions.
-    pub(crate) fn keeps_subject(&self, fn_did: LocalDefId) -> bool {
-        !self.fns.contains(&fn_did)
+    pub(crate) fn keeps_subject(&self, fn_did: LocalDefId, hir_id: HirId) -> bool {
+        !self.fns.contains(&fn_did) && !self.atom_subjects.contains(&(fn_did, hir_id))
     }
 }
 
@@ -2872,7 +2893,7 @@ pub(crate) fn filtered_inputs(
         };
         // ARM 2's filter: no site check downstream, so a reverted subject's
         // uses must never enter the map.
-        if !reverts.keeps_subject(subject.fn_did) {
+        if !reverts.keeps_subject(subject.fn_did, subject.hir_id) {
             continue;
         }
         if let super::decision::Decision::Box(plan) = decision {
@@ -2903,7 +2924,7 @@ pub(crate) fn filtered_inputs(
     for edit in &table.seams.edits {
         // ARM 3's filter, on the CALLEE's path: reverting a callee reverts its
         // seams with it, because `owner_fn` is the revert key.
-        if !reverts.keeps(&edit.owner_fn) {
+        if !reverts.keeps_edit(&edit.owner_fn, &edit.atom_ids) {
             continue;
         }
         insert_counting(
@@ -3082,6 +3103,8 @@ fn resolve_reverts(
     Ok(RevertSet {
         fns: out,
         names: seen,
+        atom_names: FxHashSet::default(),
+        atom_subjects: FxHashSet::default(),
         subjects,
     })
 }
@@ -3099,6 +3122,45 @@ pub(crate) fn revert_set_from_names(
 ) -> Result<RevertSet, String> {
     let wanted: FxHashSet<&str> = names.iter().map(String::as_str).collect();
     resolve_reverts(tcx, &wanted, names.len(), "verify-loop")
+}
+
+/// Verify-loop adapter for the mixed function/atom population. Atom IDs are
+/// validated against the carried decision table, and a selected site expands
+/// to exactly its subject dependency group. Unknown IDs fail loudly rather
+/// than becoming a no-op revert.
+pub(crate) fn revert_set_from_names_and_atoms(
+    tcx: rustc_middle::ty::TyCtxt<'_>,
+    names: &std::collections::BTreeSet<String>,
+    atoms: &std::collections::BTreeSet<String>,
+    table: &super::decision::DecisionTable,
+) -> Result<RevertSet, String> {
+    let mut out = revert_set_from_names(tcx, names)?;
+    if atoms.is_empty() {
+        return Ok(out);
+    }
+    let mut known = FxHashSet::default();
+    for (node, group) in &table.seams.raw_boundary_atom_groups {
+        for atom in group {
+            known.insert(atom.id.clone());
+            if atoms.contains(&atom.id) {
+                out.atom_subjects.insert(*node);
+            }
+        }
+    }
+    let missing = atoms
+        .iter()
+        .filter(|atom| !known.contains(*atom))
+        .cloned()
+        .collect::<Vec<_>>();
+    if !missing.is_empty() {
+        return Err(format!(
+            "{} selected raw-boundary atom(s) are absent from the decision table: {}",
+            missing.len(),
+            missing.join(",")
+        ));
+    }
+    out.atom_names.extend(atoms.iter().cloned());
+    Ok(out)
 }
 
 /// **THE EDIT DUMP** — the emitted layer's SURVIVING edits under a held revert set.
@@ -5484,6 +5546,7 @@ mod arm2_witnesses {
                 root_identity: "f::p".to_owned(),
                 blind: false,
                 overlap: None,
+                atom_ids: Vec::new(),
             };
             assert!(
                 SeamTarget::of(&edit(super::super::decision::seam::SeamFamily::Reborrow)).reborrow,
@@ -5707,6 +5770,7 @@ mod arm2_witnesses {
             replacement: String::new(),
             justification: j,
             owner_fn: String::new(),
+            atom_ids: Vec::new(),
         };
         let mut plan = Plan::default();
         plan.by_file.insert(
@@ -5782,6 +5846,7 @@ mod arm2_witnesses {
             replacement: String::new(),
             justification: J::KindDecision { kind: "Ref" },
             owner_fn: String::new(),
+            atom_ids: Vec::new(),
         };
         let mut whole = Plan::default();
         whole

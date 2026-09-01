@@ -247,6 +247,7 @@ mod tests {
             replacement: text.to_owned(),
             justification: Justification::KindDecision { kind: "test" },
             owner_fn: "test::owner".to_owned(),
+            atom_ids: Vec::new(),
         }
     }
 

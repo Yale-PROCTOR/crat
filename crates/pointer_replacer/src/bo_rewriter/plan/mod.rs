@@ -167,6 +167,11 @@ pub(crate) struct Edit {
     /// Carried as a rendered path rather than a `LocalDefId` so no compiler type
     /// enters `plan`.
     pub owner_fn: String,
+    /// Exact raw-boundary dependency group. Empty for every pre-wave edit.
+    /// A group is carried, not reconstructed, so removing one atom can remove
+    /// its declaration/use/seam closure while leaving an independent subject
+    /// in the same function intact.
+    pub atom_ids: Vec<String>,
 }
 
 /// The finished plan handed to [`super::apply`], **grouped by file**.
@@ -311,6 +316,7 @@ pub(crate) fn plan(
                     fabricated: seam.spec.len.as_ref().is_some_and(|l| l.is_fabricated()),
                 },
                 owner_fn: seam.owner_fn.clone(),
+                atom_ids: seam.atom_ids.clone(),
             }),
             // A span that cannot be located is RECORDED, never dropped: a seam
             // that silently vanishes leaves the callee converted and the call
@@ -336,6 +342,7 @@ pub(crate) fn plan(
                     fabricated: false,
                 },
                 owner_fn: body.owner_fn.clone(),
+                atom_ids: Vec::new(),
             }),
             Err(reason) => unplaceable.push(Unplaceable {
                 reason,
@@ -349,6 +356,12 @@ pub(crate) fn plan(
         if reverted(subject) {
             continue;
         }
+        let subject_atom_ids = table
+            .seams
+            .raw_boundary_atom_groups
+            .get(&(subject.fn_did, subject.hir_id))
+            .map(|atoms| atoms.iter().map(|atom| atom.id.clone()).collect::<Vec<_>>())
+            .unwrap_or_default();
         // EXHAUSTIVE (S3.0, ruling 5). A `let …else` here compiled clean against
         // a third `Decision` variant and silently produced no edit AND no
         // `Unplaceable` record — measured with a variant probe before the
@@ -542,6 +555,7 @@ pub(crate) fn plan(
                             Justification::KindDecision { kind: "Box(expr)" }
                         },
                         owner_fn: owner_of(subject),
+                        atom_ids: subject_atom_ids.clone(),
                     }),
                     Ok(_) => {
                         use_failure = Some("Box edit is in a different file from the declaration")
@@ -559,6 +573,7 @@ pub(crate) fn plan(
                             form: "box-delete-initializer-store",
                         },
                         owner_fn: owner_of(subject),
+                        atom_ids: subject_atom_ids.clone(),
                     }),
                     Ok(_) => {
                         use_failure = Some(
@@ -579,6 +594,7 @@ pub(crate) fn plan(
                         kind: if optional { "Opt(use)" } else { "Slice(use)" },
                     },
                     owner_fn: owner_of(subject),
+                    atom_ids: subject_atom_ids.clone(),
                 }),
                 Ok(_) => {
                     use_failure = Some("slice use is in a different file from the declaration")
@@ -624,6 +640,7 @@ pub(crate) fn plan(
                 replacement,
                 justification: Justification::KindDecision { kind },
                 owner_fn: owner_of(subject),
+                atom_ids: subject_atom_ids,
             });
         }
     }

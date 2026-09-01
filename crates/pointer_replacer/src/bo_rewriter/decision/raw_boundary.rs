@@ -34,6 +34,39 @@ pub(crate) struct RawBoundarySiteKey {
     pub subject: String,
 }
 
+/// One exact raw-boundary edit identity.  The subject half supplies the
+/// dependency group; the site half keeps two uses of the same subject
+/// independently attributable until the closure is applied.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct SubjectAtomKey {
+    pub id: String,
+    pub node: (LocalDefId, HirId),
+    pub owner: String,
+}
+
+fn site_atom_id(key: &RawBoundarySiteKey) -> String {
+    format!(
+        "raw-boundary-site:{}:{}:{}:{}:{}:{}",
+        key.caller,
+        key.block,
+        key.statement_index,
+        key.callee.path,
+        key.argument_index,
+        key.subject
+    )
+}
+
+fn address_atom_id(site: &AddressViewSite) -> String {
+    format!(
+        "raw-boundary-address:{}:{}:{}:{}:{}",
+        site.owner,
+        site.node.0.local_def_index.as_u32(),
+        site.node.1.local_id.as_u32(),
+        site.span.lo().0,
+        site.op
+    )
+}
+
 /// Resolved callee identity. `foreign` is load-bearing: a same-spelled local
 /// function is not a libc contract match.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -1507,6 +1540,47 @@ impl RawBoundaryDispositionIndex {
 
     pub(crate) fn address_sites(&self) -> &[AddressViewSite] {
         &self.address_sites
+    }
+
+    /// Exact site atoms grouped by the subject whose safe declaration and use
+    /// edits they jointly justify. Every consumer receives the already-sorted
+    /// group; none reconstructs dependency closure from rendered text.
+    pub(crate) fn subject_atom_groups(
+        &self,
+    ) -> FxHashMap<(LocalDefId, HirId), Vec<SubjectAtomKey>> {
+        let mut groups = FxHashMap::<(LocalDefId, HirId), Vec<SubjectAtomKey>>::default();
+        for (key, disposition) in &self.by_site {
+            if !disposition.is_open() {
+                continue;
+            }
+            let Some(site) = self
+                .render_sites
+                .get(key)
+                .filter(|site| site.target_stays_raw)
+            else {
+                continue;
+            };
+            let Some(node) = site.node else {
+                continue;
+            };
+            groups.entry(node).or_default().push(SubjectAtomKey {
+                id: site_atom_id(key),
+                node,
+                owner: key.caller.clone(),
+            });
+        }
+        for site in &self.address_sites {
+            groups.entry(site.node).or_default().push(SubjectAtomKey {
+                id: address_atom_id(site),
+                node: site.node,
+                owner: site.owner.clone(),
+            });
+        }
+        for atoms in groups.values_mut() {
+            atoms.sort_by(|left, right| left.id.cmp(&right.id));
+            atoms.dedup_by(|left, right| left.id == right.id);
+        }
+        groups
     }
 
     pub(crate) fn opens_node(&self, node: (LocalDefId, HirId)) -> bool {

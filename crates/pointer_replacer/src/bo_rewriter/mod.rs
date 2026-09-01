@@ -654,7 +654,7 @@ fn rewrite_core_injected(
         // One entry per EMITTED SUBJECT (not per function), so a revert can move
         // exactly the right number of subjects from emitted to degraded and the
         // accounting identity survives the loop.
-        let mut emitted_subjects: Vec<(String, String, String)> = Vec::new();
+        let mut emitted_subjects: Vec<(String, String, String, Vec<String>)> = Vec::new();
         // PLACEMENT-TRUTH (S2b.3). A `Ref` decision that `plan` could not place
         // produced no edit, so counting it as emitted over-reports the rewrite
         // by exactly the unplaceable set. Exposure is zero on the frozen corpus
@@ -701,6 +701,12 @@ fn rewrite_core_injected(
                 owner.clone(),
                 key,
                 decision::emitability::EmitabilityFacts::site(tcx, subject.attribution_span()),
+                table
+                    .seams
+                    .raw_boundary_atom_groups
+                    .get(&(subject.fn_did, subject.hir_id))
+                    .map(|atoms| atoms.iter().map(|atom| atom.id.clone()).collect())
+                    .unwrap_or_default(),
             ));
             if !seen_fns.insert(subject.fn_did) {
                 continue;
@@ -836,6 +842,7 @@ fn round_files(
     emission_plan: &plan::Plan,
     emission_texts: &std::collections::BTreeMap<plan::FileKey, String>,
     reverted: &std::collections::BTreeSet<String>,
+    reverted_atoms: &std::collections::BTreeSet<String>,
     root_key: Option<&plan::FileKey>,
     table: &decision::DecisionTable,
 ) -> Result<
@@ -854,7 +861,8 @@ fn round_files(
     ),
     String,
 > {
-    let reverts = ast_transform::revert_set_from_names(tcx, reverted)?;
+    let reverts =
+        ast_transform::revert_set_from_names_and_atoms(tcx, reverted, reverted_atoms, table)?;
     // **PER-FILE (A1, revived 2026-08-18).** The one-entry map that stood here
     // was licensed by C-20's corpus measurement — 20/20 single crate-source
     // file — and that measurement still holds. What it did not cover is the
@@ -883,7 +891,7 @@ fn verify_and_revert(
     emitted_count: usize,
     root_text: String,
     emitted_sites: Vec<EmittedSite>,
-    emitted_subjects: Vec<(String, String, String)>,
+    emitted_subjects: Vec<(String, String, String, Vec<String>)>,
     a5_receipt: String,
     e1_subject_receipt: String,
     e2_artifacts: E2Artifacts,
@@ -993,6 +1001,8 @@ fn verify_and_revert(
         .and_then(|root| root.parent())
         .map(|d| d.to_path_buf());
     let mut reverted: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let mut reverted_atoms: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let mut atom_reverify_used = false;
     // **ROUND 0 THROUGH THE SWITCH — the FOURTH site** (ruling 2026-08-18).
     //
     // `files` arrives from `emit_files`, whose product is `render`'s: the SPAN
@@ -1015,6 +1025,7 @@ fn verify_and_revert(
         capture,
         &emission_plan,
         &emission_texts,
+        &std::collections::BTreeSet::new(),
         &std::collections::BTreeSet::new(),
         root_key.as_ref(),
         table,
@@ -1309,13 +1320,15 @@ fn verify_and_revert(
         }
         if novel.is_empty() && novel_errors == 0 {
             let source = std::fs::read_to_string(staged.root()).unwrap_or_default();
-            let (kept, taken): (Vec<_>, Vec<_>) = emitted_subjects
-                .iter()
-                .partition(|(owner, _, _)| !reverted.contains(owner));
+            let (kept, taken): (Vec<_>, Vec<_>) =
+                emitted_subjects.iter().partition(|(owner, _, _, atoms)| {
+                    !reverted.contains(owner)
+                        && atoms.iter().all(|atom| !reverted_atoms.contains(atom))
+                });
             // ACCOUNTING: a reverted subject moves from emitted to
             // degraded under its OWN reason key, so
             // `emitted_final + degraded == row count` survives the loop.
-            for (_, subject, site) in &taken {
+            for (_, subject, site, _) in &taken {
                 facts.degradations.push(decision::Degradation {
                     subject: subject.clone(),
                     site: site.clone(),
@@ -1326,6 +1339,70 @@ fn verify_and_revert(
             facts.reverted_count = taken.len();
             facts.files_touched = files_edited;
             return facts.emitted(source, files);
+        }
+
+        // Raw-boundary subject-atom pass: exactly one compiler reverify. The
+        // edit-span index is filtered by the same function/atom predicates as
+        // rendering before attribution, so a removed atom cannot be selected
+        // again through stale plan metadata.
+        if !atom_reverify_used {
+            let live_atom_sites = planned_edit_sites
+                .iter()
+                .filter(|edit| {
+                    !reverted.contains(&edit.fn_path)
+                        && edit
+                            .atom_ids
+                            .iter()
+                            .all(|atom| !reverted_atoms.contains(atom))
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            let selection = select_subject_atoms(
+                &novel,
+                &line_maps,
+                &observed_root,
+                &live_atom_sites,
+                crate_dir.as_deref().unwrap_or(std::path::Path::new("")),
+            );
+            if matches!(
+                selection.kind,
+                AtomSelectionKind::Exact | AtomSelectionKind::GroupAtomic
+            ) {
+                atom_reverify_used = true;
+                reverted_atoms.extend(selection.atoms);
+                let (next_files, rollbacks, next_edited, next_maps) = match round_files(
+                    tcx,
+                    capture,
+                    &emission_plan,
+                    &emission_texts,
+                    &reverted,
+                    &reverted_atoms,
+                    root_key.as_ref(),
+                    table,
+                ) {
+                    Ok(quad) => quad,
+                    Err(why) => {
+                        escalation =
+                            Some(format!("escalation-required: atom re-emit failed: {why}"));
+                        break;
+                    }
+                };
+                if !rollbacks.is_empty() {
+                    escalation = Some(format!(
+                        "escalation-required: atom re-render rolled back {} edit(s)",
+                        rollbacks.len()
+                    ));
+                    break;
+                }
+                files = next_files;
+                files_edited = next_edited;
+                line_maps = next_maps;
+                // The atom retry is its own bounded phase; its result must be
+                // allowed to fall through to ordinary function attribution
+                // rather than tripping the general no-progress detector.
+                previous_errors = None;
+                continue;
+            }
         }
 
         // DUAL TERMINATION, both arms. Neither alone: a no-progress
@@ -1384,6 +1461,7 @@ fn verify_and_revert(
             &emission_plan,
             &emission_texts,
             &reverted,
+            &reverted_atoms,
             root_key.as_ref(),
             table,
         ) {
@@ -1466,6 +1544,7 @@ fn verify_and_revert(
             &emission_plan,
             &emission_texts,
             trial,
+            &reverted_atoms,
             root_key.as_ref(),
             table,
         ) else {
@@ -1501,6 +1580,7 @@ fn verify_and_revert(
         &emission_plan,
         &emission_texts,
         &final_reverted,
+        &reverted_atoms,
         root_key.as_ref(),
         table,
     ) {
@@ -1554,10 +1634,12 @@ fn verify_and_revert(
             } =>
         {
             let source = std::fs::read_to_string(staged.root()).unwrap_or_default();
-            let (kept, taken): (Vec<_>, Vec<_>) = emitted_subjects
-                .iter()
-                .partition(|(owner, _, _)| !final_reverted.contains(owner));
-            for (_, subject, site) in &taken {
+            let (kept, taken): (Vec<_>, Vec<_>) =
+                emitted_subjects.iter().partition(|(owner, _, _, atoms)| {
+                    !final_reverted.contains(owner)
+                        && atoms.iter().all(|atom| !reverted_atoms.contains(atom))
+                });
+            for (_, subject, site, _) in &taken {
                 facts.degradations.push(decision::Degradation {
                     subject: subject.clone(),
                     site: site.clone(),
@@ -2431,6 +2513,204 @@ pub(crate) struct EditSite {
     pub fn_path: String,
     pub lo_line: usize,
     pub hi_line: usize,
+    /// Stable plan-edit identity used only in atom coverage/receipts.
+    pub edit_id: String,
+    /// Already-expanded subject dependency group.
+    pub atom_ids: Vec<String>,
+    /// False means another edit under this owner has no atom coverage, so the
+    /// verifier must use the established function fallback.
+    pub atom_covered: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AtomSelectionKind {
+    Exact,
+    GroupAtomic,
+    Fallback,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct AtomSelection {
+    pub kind: AtomSelectionKind,
+    pub atoms: std::collections::BTreeSet<String>,
+    pub reason: &'static str,
+}
+
+fn atom_fallback(reason: &'static str) -> AtomSelection {
+    AtomSelection {
+        kind: AtomSelectionKind::Fallback,
+        atoms: std::collections::BTreeSet::new(),
+        reason,
+    }
+}
+
+/// Pure selection over original-source lines. Production first translates
+/// rustc's emitted lines back to these coordinates; the unit witnesses use it
+/// directly so exact-vs-group-vs-fallback is observable without a compiler.
+pub(crate) fn select_atoms_on_original_lines(
+    diags: &[verify::Diag],
+    edits: &[EditSite],
+) -> AtomSelection {
+    let mut files = edits
+        .iter()
+        .map(|edit| edit.file.as_str())
+        .collect::<Vec<_>>();
+    files.sort_unstable();
+    files.dedup();
+    let single_file = files.len() <= 1;
+    let at = |file: &str, line: usize| {
+        edits
+            .iter()
+            .filter(|edit| {
+                (single_file || edit.file == file) && edit.lo_line <= line && line <= edit.hi_line
+            })
+            .collect::<Vec<_>>()
+    };
+    let mut selected = std::collections::BTreeSet::new();
+    let mut grouped = false;
+    for diagnostic in diags {
+        let primary = at(&diagnostic.file, diagnostic.line);
+        if primary.is_empty() {
+            return atom_fallback("atom-attribution-ambiguous");
+        }
+        if primary
+            .iter()
+            .any(|edit| !edit.atom_covered || edit.atom_ids.is_empty())
+        {
+            return atom_fallback("atom-coverage-incomplete");
+        }
+        let alias_group = matches!(diagnostic.code.as_deref(), Some("E0499" | "E0502"));
+        let primary_groups = primary
+            .iter()
+            .map(|edit| edit.atom_ids.as_slice())
+            .collect::<std::collections::BTreeSet<_>>();
+        if !alias_group && primary_groups.len() != 1 {
+            return atom_fallback("atom-attribution-ambiguous");
+        }
+        for edit in primary {
+            selected.extend(edit.atom_ids.iter().cloned());
+        }
+        if alias_group {
+            grouped = true;
+            for related in &diagnostic.related {
+                let related_sites = at(&related.file, related.line);
+                if related_sites
+                    .iter()
+                    .any(|edit| !edit.atom_covered || edit.atom_ids.is_empty())
+                {
+                    return atom_fallback("atom-coverage-incomplete");
+                }
+                for edit in related_sites {
+                    selected.extend(edit.atom_ids.iter().cloned());
+                }
+            }
+        }
+    }
+    if selected.is_empty() {
+        return atom_fallback("atom-attribution-ambiguous");
+    }
+    AtomSelection {
+        kind: if grouped || selected.len() > 1 {
+            AtomSelectionKind::GroupAtomic
+        } else {
+            AtomSelectionKind::Exact
+        },
+        atoms: selected,
+        reason: if grouped {
+            "atom-related-span-group"
+        } else {
+            "atom-exact"
+        },
+    }
+}
+
+fn select_subject_atoms(
+    diags: &[verify::Diag],
+    line_maps: &std::collections::BTreeMap<plan::FileKey, apply::LineMap>,
+    observed_root: &std::path::Path,
+    edits: &[EditSite],
+    original_root: &std::path::Path,
+) -> AtomSelection {
+    let maps = line_maps
+        .iter()
+        .map(|(key, map)| {
+            let original = match key {
+                plan::FileKey::Real(path) => path.display().to_string(),
+                plan::FileKey::Virtual(name) => name.clone(),
+            };
+            (
+                verify::crate_relative(&original, original_root),
+                original,
+                map,
+            )
+        })
+        .collect::<Vec<_>>();
+    let edit_files = edits
+        .iter()
+        .map(|edit| edit.file.clone())
+        .collect::<std::collections::BTreeSet<_>>();
+    let translate = |file: &str, line: usize| {
+        let relative = verify::crate_relative(file, observed_root);
+        let matched = maps
+            .iter()
+            .filter(|(candidate, _, _)| *candidate == relative)
+            .collect::<Vec<_>>();
+        if let [(_, original, map)] = matched.as_slice() {
+            return ((*original).clone(), map.to_original(line));
+        }
+        if maps.len() == 1 {
+            return (maps[0].1.clone(), maps[0].2.to_original(line));
+        }
+        let matching_files = edit_files
+            .iter()
+            .filter(|candidate| verify::crate_relative(candidate, original_root) == relative)
+            .cloned()
+            .collect::<Vec<_>>();
+        if let [original] = matching_files.as_slice() {
+            (original.clone(), line)
+        } else {
+            (file.to_owned(), line)
+        }
+    };
+    let translated = diags
+        .iter()
+        .map(|diagnostic| {
+            let (file, line) = translate(&diagnostic.file, diagnostic.line);
+            let related = diagnostic
+                .related
+                .iter()
+                .map(|related| {
+                    let (file, line) = translate(&related.file, related.line);
+                    verify::RelatedDiag {
+                        file,
+                        line,
+                        message: related.message.clone(),
+                    }
+                })
+                .collect();
+            verify::Diag {
+                file,
+                line,
+                message: diagnostic.message.clone(),
+                direction: diagnostic.direction,
+                code: diagnostic.code.clone(),
+                related,
+            }
+        })
+        .collect::<Vec<_>>();
+    select_atoms_on_original_lines(&translated, edits)
+}
+
+#[cfg(test)]
+pub(crate) fn atom_surviving_edit_ids(
+    edits: &[EditSite],
+    reverted: &std::collections::BTreeSet<String>,
+) -> std::collections::BTreeSet<String> {
+    edits
+        .iter()
+        .filter(|edit| edit.atom_ids.iter().all(|atom| !reverted.contains(atom)))
+        .map(|edit| edit.edit_id.clone())
+        .collect()
 }
 
 /// Line range of a byte range in `text`, 1-based, inclusive.
@@ -2447,6 +2727,17 @@ fn edit_sites(
     planned: &plan::Plan,
     texts: &std::collections::BTreeMap<plan::FileKey, String>,
 ) -> Vec<EditSite> {
+    let mut owners_with_atoms = std::collections::BTreeSet::new();
+    let mut owners_with_uncovered_edits = std::collections::BTreeSet::new();
+    for edit in planned.by_file.values().flatten() {
+        if edit.atom_ids.is_empty() {
+            if edit.owner_fn != "<crate>" {
+                owners_with_uncovered_edits.insert(edit.owner_fn.clone());
+            }
+        } else {
+            owners_with_atoms.insert(edit.owner_fn.clone());
+        }
+    }
     let mut out = Vec::new();
     for (key, edits) in &planned.by_file {
         let Some(text) = texts.get(key) else {
@@ -2456,13 +2747,18 @@ fn edit_sites(
             plan::FileKey::Real(path) => path.display().to_string(),
             plan::FileKey::Virtual(name) => name.clone(),
         };
-        for edit in edits {
+        for (index, edit) in edits.iter().enumerate() {
             let (lo_line, hi_line) = line_span(text, edit.lo, edit.hi);
             out.push(EditSite {
                 file: file.clone(),
                 fn_path: edit.owner_fn.clone(),
                 lo_line,
                 hi_line,
+                edit_id: format!("{file}:{}:{}:{}:{index}", edit.lo, edit.hi, edit.owner_fn),
+                atom_ids: edit.atom_ids.clone(),
+                atom_covered: !edit.atom_ids.is_empty()
+                    && owners_with_atoms.contains(&edit.owner_fn)
+                    && !owners_with_uncovered_edits.contains(&edit.owner_fn),
             });
         }
     }
@@ -2869,6 +3165,7 @@ pub(crate) fn validate_plan(
             // against the revert set — it is not a sentinel that must be kept
             // out of it, it is simply not subject to it.
             owner_fn: "<crate>".to_owned(),
+            atom_ids: Vec::new(),
         });
     }
     for (key, kept) in &kept_by_file {
@@ -3002,6 +3299,7 @@ pub(crate) fn emit_files<'tcx>(
             replacement,
             justification: plan::Justification::C9Mark,
             owner_fn: mark.owner_fn.clone(),
+            atom_ids: Vec::new(),
         });
     }
     // **The crate root, asked of the compiler rather than guessed** — not
