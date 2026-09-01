@@ -5447,6 +5447,70 @@ fn e2_w1_return_decision_uses_the_typed_permit() {
     assert_eq!(permits, 1);
 }
 
+/// Addendum-117 RED — an origin-backed return permit removes only the
+/// return-escape blocker. If a later ordinary raw-flow blocker then wins, the
+/// E2 ledger must name that secondary degradation and retain its typed payload;
+/// it must neither call the row planned nor drop the later reason.
+#[test]
+fn e2_w8_return_permit_reports_secondary_degradation_payload() {
+    let fixture = Fixture::new(&[(
+        "lib.rs",
+        "#![allow(dead_code, unused_unsafe)]\n\
+         pub unsafe fn raw_sink(p: *mut i32) -> usize { p as usize }\n\
+         pub unsafe fn returns_after_raw_flow(p: *mut i32) -> *mut i32 {\n\
+             *p = 1;\n\
+             let _ = raw_sink(p);\n\
+             p\n\
+         }\n",
+    )]);
+    let (permits, subjects) =
+        ::utils::compilation::run_compiler_on_path(&fixture.root(), |tcx| {
+            let (_, ctx) = super::decide_table_with_ctx_config(
+                tcx,
+                Some((
+                    crate::analyses::borrow_ownership::a5_overlap::A5Mode::PreciseReplay,
+                    Some(
+                        crate::analyses::borrow_ownership::a5_overlap::WholeProgramAttestation::FrozenBenchmarkGraph,
+                    ),
+                )),
+            )
+            .expect("E2-W8 decision table");
+            (
+                ctx.lifetime_eligibility.return_permit_count(),
+                ctx.e2_artifacts.subjects,
+            )
+        })
+        .expect("E2-W8 fixture compiles before rewriting");
+
+    assert_eq!(permits, 1, "{subjects}");
+    let row = subjects
+        .lines()
+        .skip(1)
+        .find(|row| row.contains("returns_after_raw_flow::p#"))
+        .unwrap_or_else(|| panic!("E2-W8 subject missing:\n{subjects}"));
+    let fields = row.split('\t').collect::<Vec<_>>();
+    assert_eq!(
+        fields[receipt_column(&subjects, "final_decision")],
+        "flows-into-raw-param",
+        "{row}",
+    );
+    assert_eq!(
+        fields[receipt_column(&subjects, "e2_disposition")],
+        "lifetime-secondary-degradation",
+        "{row}",
+    );
+    assert_eq!(
+        fields[receipt_column(&subjects, "secondary_reason")],
+        "flows-into-raw-param",
+        "{row}",
+    );
+    assert_eq!(
+        fields[receipt_column(&subjects, "secondary_reason_detail")],
+        "flows-into-raw-param",
+        "{row}",
+    );
+}
+
 /// E2-W7 RED — an unannotated local fed by a direct local call may use the
 /// callee's modeled lifetime plan without inventing a local declaration
 /// splice.  The explicit decision arm is load-bearing: treating this as an

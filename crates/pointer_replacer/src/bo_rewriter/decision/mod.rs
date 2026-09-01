@@ -629,6 +629,20 @@ impl DegradeReason {
             DegradeReason::ClassBlocked { .. } => "class-blocked",
         }
     }
+
+    /// Stable typed payload accompanying a degradation key in diagnostic
+    /// ledgers. Most reasons need no second component; variants carrying a
+    /// concrete blocker preserve that blocker rather than flattening it away.
+    pub(crate) fn detail(&self) -> String {
+        match self {
+            DegradeReason::ClassBlocked { via } | DegradeReason::SilentCoercion { via } => {
+                via.key().to_owned()
+            }
+            DegradeReason::RawPointerOperation { op } => op.clone(),
+            DegradeReason::UnsupportedDeclShape { shape } => (*shape).to_owned(),
+            _ => "-".to_owned(),
+        }
+    }
 }
 
 /// A degradation, **attributed**: subject, site and reason.

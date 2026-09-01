@@ -3916,6 +3916,83 @@ fn e1_subject_family(
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+enum E2TerminalDisposition<'a> {
+    Planned,
+    Failure(decision::lifetime::LifetimeFailure),
+    SecondaryDegradation(&'a decision::Degradation),
+    NotE2,
+}
+
+impl E2TerminalDisposition<'_> {
+    fn key(self) -> &'static str {
+        match self {
+            Self::Planned => "planned",
+            Self::Failure(failure) => failure.key(),
+            Self::SecondaryDegradation(_) => "lifetime-secondary-degradation",
+            Self::NotE2 => "not-e2",
+        }
+    }
+
+    fn secondary_payload(self) -> (String, String) {
+        match self {
+            Self::SecondaryDegradation(record) => {
+                (record.reason.key().to_owned(), record.reason.detail())
+            }
+            Self::Planned | Self::Failure(_) | Self::NotE2 => ("-".to_owned(), "-".to_owned()),
+        }
+    }
+}
+
+fn e2_terminal_disposition<'a>(
+    planned: bool,
+    has_lifetime_permit: bool,
+    failure: Option<decision::lifetime::LifetimeFailure>,
+    final_decision: &'a decision::Decision,
+) -> E2TerminalDisposition<'a> {
+    use decision::lifetime::LifetimeFailure as F;
+
+    // Fixed classification order: tranche holds and origin failures through
+    // conflict are known before the final decision. A secondary blocker first
+    // exists after that decision, and therefore precedes AST/seam placement.
+    if let Some(
+        failure @ (F::FieldHeld
+        | F::ExternalContractAbsent
+        | F::FnPtrWebHeld
+        | F::OriginUnknown
+        | F::OriginAbsent
+        | F::OriginConflict),
+    ) = failure
+    {
+        return E2TerminalDisposition::Failure(failure);
+    }
+
+    if has_lifetime_permit {
+        if let decision::Decision::Degraded(record) = final_decision {
+            let still_primary = matches!(
+                &record.reason,
+                decision::DegradeReason::SilentCoercion {
+                    via: decision::co_conversion::BlockReason::EscapesViaReturn,
+                } | decision::DegradeReason::ClassBlocked {
+                    via: decision::co_conversion::BlockReason::EscapesViaReturn,
+                }
+            );
+            if !still_primary {
+                return E2TerminalDisposition::SecondaryDegradation(record);
+            }
+        }
+    }
+
+    if let Some(failure @ (F::AstUnplaceable | F::SeamIncompatible)) = failure {
+        return E2TerminalDisposition::Failure(failure);
+    }
+    if planned {
+        E2TerminalDisposition::Planned
+    } else {
+        E2TerminalDisposition::NotE2
+    }
+}
+
 fn e2_artifacts_from_table(
     tcx: TyCtxt<'_>,
     table: &decision::DecisionTable,
@@ -3934,10 +4011,10 @@ fn e2_artifacts_from_table(
         let owner = tcx.def_path_str(subject.fn_did.to_def_id());
         let subject_key = subject.identity_key(&owner);
         let plan = table.lifetime_plan.function(subject.fn_did);
-        let planned = plan.is_some()
-            && (eligibility.return_permit(key).is_some()
-                || eligibility.inferred_permit(key).is_some()
-                || eligibility.is_output_source(key));
+        let has_lifetime_permit = eligibility.return_permit(key).is_some()
+            || eligibility.inferred_permit(key).is_some()
+            || eligibility.is_output_source(key);
+        let planned = plan.is_some() && has_lifetime_permit;
         let fallback_failure = match final_decision {
             decision::Decision::Degraded(record) => match &record.reason {
                 decision::DegradeReason::SilentCoercion { via }
@@ -3956,13 +4033,9 @@ fn e2_artifacts_from_table(
             _ => None,
         };
         let failure = eligibility.failure(key).or(fallback_failure);
-        let disposition = if planned {
-            "planned"
-        } else if let Some(failure) = failure {
-            failure.key()
-        } else {
-            "not-e2"
-        };
+        let disposition =
+            e2_terminal_disposition(planned, has_lifetime_permit, failure, final_decision);
+        let (secondary_reason, secondary_detail) = disposition.secondary_payload();
         let ordinary_decision = ordinary.get(&key).copied();
         let ordinary_key = match ordinary_decision {
             Some(decision::Decision::Ref { .. }) => "ref",
@@ -3998,7 +4071,7 @@ fn e2_artifacts_from_table(
             .as_ref()
             .map_or("-", decision::construction::Construction::key);
         subject_rows.push(format!(
-            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
             subject_key,
             owner,
             subject.local.as_u32(),
@@ -4006,9 +4079,11 @@ fn e2_artifacts_from_table(
             construction,
             ordinary_key,
             final_key,
-            disposition,
+            disposition.key(),
             justification_key,
             digest,
+            secondary_reason,
+            secondary_detail,
         ));
         if let Some(failure) = failure {
             failure_rows.push(format!(
@@ -4049,7 +4124,7 @@ fn e2_artifacts_from_table(
 
     E2Artifacts {
         subjects: format!(
-            "subject_key\towner_fn\tmir_local\tptr_depth\tconstruction\tordinary_decision\tfinal_decision\te2_disposition\tjustification\tlifetime_plan_digest\n{}{}",
+            "subject_key\towner_fn\tmir_local\tptr_depth\tconstruction\tordinary_decision\tfinal_decision\te2_disposition\tjustification\tlifetime_plan_digest\tsecondary_reason\tsecondary_reason_detail\n{}{}",
             subject_rows.join("\n"),
             if subject_rows.is_empty() { "" } else { "\n" },
         ),
@@ -4150,13 +4225,7 @@ fn e1_subject_seed_tsv(
             decision::Decision::Degraded(record) => (
                 "degraded",
                 record.reason.key(),
-                match &record.reason {
-                    decision::DegradeReason::ClassBlocked { via }
-                    | decision::DegradeReason::SilentCoercion { via } => via.key().to_owned(),
-                    decision::DegradeReason::RawPointerOperation { op } => op.clone(),
-                    decision::DegradeReason::UnsupportedDeclShape { shape } => (*shape).to_owned(),
-                    _ => "-".to_owned(),
-                },
+                record.reason.detail(),
                 record.site.clone(),
             ),
         };
