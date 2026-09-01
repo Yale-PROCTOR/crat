@@ -17831,6 +17831,51 @@ fn box_census_schema_renamed_identifier_is_a_compile_error() {
 }
 
 #[test]
+fn raw_boundary_census_schema_is_one_shared_authority() {
+    use crate::raw_boundary_census_schema as schema;
+
+    let keys = schema::ALL;
+    assert_eq!(
+        keys.iter().copied().collect::<BTreeSet<_>>().len(),
+        keys.len(),
+        "raw-boundary worker/parent keys must be unique"
+    );
+    for required in [
+        schema::T1_CANDIDATE_SITES,
+        schema::T2_CANDIDATE_SITES,
+        schema::T2_WAIVER_SITES,
+        schema::ATOM_ATTEMPTS,
+        schema::ARM_B_ROWS,
+        schema::RETENTION_FIXPOINT_WALL_S,
+    ] {
+        assert!(keys.contains(&required), "missing shared key {required}");
+    }
+}
+
+#[test]
+fn raw_boundary_primary_control_fixture_keeps_all_exact_populations() {
+    let fixture = concat!(
+        "read\tprogram\trecord_key\tcategory\ttyped_subkind\tconsumer_edges\n",
+        "A\tp\tlibc\tLIBC-CONTRACT-OPENABLE\tknown-libc-no-independent-hard-conflict\tstrlen#0@p/lib.rs:1\n",
+        "B\tp\tfree\tOUR-WALL\tunsafe-bridge-known-no-retention-free-boundary\tfree#0@p/lib.rs:2\n",
+        "A\tp\tlocal\tCONDITIONAL CORE\tflows-into-raw-param/retention-unknown-local\t-\n",
+        "A\tp\traw-caller\tCONDITIONAL CORE\targ-stays-raw/raw-caller-boundary\t-\n",
+        "A\tp\tflow-collateral\tCONDITIONAL CORE\tclass-collateral/flows-into-raw-param\t-\n",
+        "A\tp\targ-collateral\tCONDITIONAL CORE\tclass-collateral/arg-stays-raw\t-\n",
+        "B\tp\tcrown\tOUR-WALL\treturn-boundary-lifetime-origin-absent\t-\n",
+    );
+    let counts = parse_raw_boundary_primary_control(fixture).expect("fixture parses");
+    assert_eq!(counts.libc_subjects, 1);
+    assert_eq!(counts.libc_edges, 1);
+    assert_eq!(counts.free_subjects, 1);
+    assert_eq!(counts.t2_local, 1);
+    assert_eq!(counts.t2_raw_caller, 1);
+    assert_eq!(counts.t2_flow_collateral, 1);
+    assert_eq!(counts.t2_arg_collateral, 1);
+    assert_eq!(counts.crown_return, 1);
+}
+
+#[test]
 fn box_census_receipt_consumes_only_the_raw_capture_schema() {
     let mut row = report::Row::default();
     for key in [
