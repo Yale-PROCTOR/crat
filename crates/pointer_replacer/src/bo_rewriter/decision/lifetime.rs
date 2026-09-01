@@ -229,6 +229,10 @@ pub(crate) struct LifetimeEligibility {
     output_storage_permits: FxHashMap<(LocalDefId, FnSignatureSlot), OutputStorageLifetimePermit>,
     output_storage_escapes: FxHashSet<(NodeKey, NodeKey)>,
     failures: FxHashMap<NodeKey, LifetimeFailure>,
+    web_roots: BTreeSet<String>,
+    web_members: BTreeMap<String, String>,
+    web_wall_s: f64,
+    derive_wall_s: f64,
 }
 
 impl LifetimeEligibility {
@@ -267,6 +271,22 @@ impl LifetimeEligibility {
         self.failures.iter().map(|(&key, &failure)| (key, failure))
     }
 
+    pub(crate) fn web_roots(&self) -> &BTreeSet<String> {
+        &self.web_roots
+    }
+
+    pub(crate) fn web_members(&self) -> &BTreeMap<String, String> {
+        &self.web_members
+    }
+
+    pub(crate) fn web_wall_s(&self) -> f64 {
+        self.web_wall_s
+    }
+
+    pub(crate) fn derive_wall_s(&self) -> f64 {
+        self.derive_wall_s
+    }
+
     #[cfg(test)]
     pub(crate) fn output_storage_receipts(&self) -> Vec<OutputStorageReceipt> {
         let mut permits = self.output_storage_permits.values().collect::<Vec<_>>();
@@ -301,6 +321,10 @@ impl LifetimeEligibility {
             output_storage_permits: FxHashMap::default(),
             output_storage_escapes: FxHashSet::default(),
             failures: FxHashMap::default(),
+            web_roots: BTreeSet::new(),
+            web_members: BTreeMap::new(),
+            web_wall_s: 0.0,
+            derive_wall_s: 0.0,
         }
     }
 }
@@ -337,13 +361,33 @@ pub(crate) fn derive_return_eligibility(
     escapes: &[Escape],
     attestation: Option<WholeProgramAttestation>,
 ) -> LifetimeEligibility {
+    let derive_started = std::time::Instant::now();
     let mut result = LifetimeEligibility::default();
     let decisions = hypothetical
         .entries
         .iter()
         .map(|(subject, decision)| ((subject.fn_did, subject.hir_id), decision))
         .collect::<FxHashMap<_, _>>();
+    let web_started = std::time::Instant::now();
     let web = derive_fn_ptr_web(program, attestation);
+    result.web_wall_s = web_started.elapsed().as_secs_f64();
+    if let Ok(web) = &web {
+        result.web_roots = web
+            .roots
+            .iter()
+            .map(|did| program.tcx.def_path_str(*did))
+            .collect();
+        result.web_members = web
+            .members
+            .iter()
+            .map(|did| {
+                (
+                    program.tcx.def_path_str(*did),
+                    derivation_text(program.tcx, &web.reasons[did]),
+                )
+            })
+            .collect();
+    }
 
     let mut return_subjects = escapes
         .iter()
@@ -628,6 +672,7 @@ pub(crate) fn derive_return_eligibility(
             .insert(key, InferredLifetimePermit::new(key, callee));
     }
 
+    result.derive_wall_s = derive_started.elapsed().as_secs_f64();
     result
 }
 
@@ -1170,7 +1215,6 @@ impl FnPtrWebDifferential {
     }
 }
 
-#[cfg(test)]
 fn derivation_text(tcx: rustc_middle::ty::TyCtxt<'_>, reason: &WebDerivation) -> String {
     match *reason {
         WebDerivation::AdjustedFnPtr => "adjusted-fnptr".to_owned(),

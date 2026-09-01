@@ -9154,6 +9154,324 @@ mod run {
         row
     }
 
+    /// E2-FN's one-iteration cache-only worker. All artifacts come from the
+    /// same decision table and first verifier observation as E1; the frozen
+    /// P-b identities are joined only here, outside production.
+    pub fn run_e2_fn_census(input: &std::path::Path) -> Row {
+        let started = Instant::now();
+        let mut row = Row::default();
+        let name = std::env::var("CRAT_BOC1_NAME").unwrap_or_else(|_| "unnamed".to_owned());
+        let code_frame =
+            std::env::var("CRAT_E2_CODE_FRAME").unwrap_or_else(|_| "missing-code-frame".to_owned());
+        let launch_profile =
+            std::env::var("CRAT_E2_CARGO_PROFILE").unwrap_or_else(|_| "missing-profile".to_owned());
+        let build_profile = if cfg!(debug_assertions) {
+            "debug"
+        } else {
+            "release"
+        };
+        let directory = std::env::var_os("CRAT_E2_ARTIFACT_DIR")
+            .map(std::path::PathBuf::from)
+            .expect("E2 census requires CRAT_E2_ARTIFACT_DIR");
+        std::fs::create_dir_all(&directory).expect("create E2 artifact directory");
+        let capture = match crate::bo_rewriter::diagnose_e1_once(input) {
+            Ok(capture) => capture,
+            Err(error) => {
+                row.set("status", "instrument-error");
+                row.set("detail", super::report::sanitize(&error));
+                row.set("t_total_s", secs(started.elapsed()));
+                return row;
+            }
+        };
+        let receipt_field = |key: &str| {
+            capture
+                .a5_receipt
+                .lines()
+                .find_map(|line| line.strip_prefix(&format!("{key}=")))
+                .unwrap_or("missing")
+        };
+        let stamps = [
+            ("a5_mode", receipt_field("a5_mode")),
+            ("a5_world", receipt_field("a5_world")),
+            ("a5_abi_guard", receipt_field("a5_abi_guard")),
+            ("copy_lend_mode", receipt_field("copy_lend_mode")),
+            ("a2_mode", receipt_field("a2_mode")),
+            ("soundness_mode", receipt_field("soundness_mode")),
+        ];
+        let prefix_header = "corpus\tanalysis_frame\tcode_frame\tdata\tbuild_profile\tdebug_assertions\ta5_mode\ta5_world\ta5_abi_guard\tcopy_lend_mode\ta2_mode\tsoundness_mode\tprogram";
+        let prefix = format!(
+            "rs-crown\t{}\t{}\tprovisional\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            model_cache::ANALYSIS_FRAME,
+            code_frame,
+            build_profile,
+            u8::from(cfg!(debug_assertions)),
+            stamps[0].1,
+            stamps[1].1,
+            stamps[2].1,
+            stamps[3].1,
+            stamps[4].1,
+            stamps[5].1,
+            name,
+        );
+        let mut roots = input
+            .parent()
+            .map(|path| path.display().to_string())
+            .into_iter()
+            .collect::<Vec<_>>();
+        roots.extend(
+            input
+                .canonicalize()
+                .ok()
+                .and_then(|path| path.parent().map(std::path::Path::to_path_buf))
+                .map(|path| path.display().to_string()),
+        );
+        roots.sort();
+        roots.dedup();
+        let stamp = |raw: &str| {
+            let mut lines = raw.lines();
+            let header = lines.next().unwrap_or_default();
+            let mut output = format!("{prefix_header}\t{header}\n");
+            for line in lines {
+                let normalized = roots.iter().fold(line.to_owned(), |line, root| {
+                    line.replace(root, "<program>")
+                });
+                output.push_str(&format!("{prefix}\t{normalized}\n"));
+            }
+            output
+        };
+
+        let reverted = capture
+            .reverts
+            .iter()
+            .map(|diagnostic| diagnostic.function.as_str())
+            .collect::<BTreeSet<_>>();
+        let mut subject_lines = capture.e2_artifacts.subjects.lines();
+        let subject_header = subject_lines.next().unwrap_or_default();
+        let mut subjects =
+            format!("{subject_header}\tast_placement\tcompiler_survival\tcompiler_class\n");
+        let mut planned = 0usize;
+        let mut survived = 0usize;
+        for line in subject_lines {
+            let fields = line.split('\t').collect::<Vec<_>>();
+            let owner = fields.get(1).copied().unwrap_or("<missing>");
+            let disposition = fields.get(7).copied().unwrap_or("<missing>");
+            let is_planned = disposition == "planned";
+            planned += usize::from(is_planned);
+            let was_reverted = reverted.contains(owner);
+            survived += usize::from(is_planned && !was_reverted);
+            let class = capture
+                .reverts
+                .iter()
+                .find(|diagnostic| diagnostic.function == owner)
+                .and_then(|diagnostic| diagnostic.diagnostic.code.as_deref())
+                .map(|code| e1_code(Some(code)))
+                .unwrap_or_else(|| "-".to_owned());
+            subjects.push_str(&format!(
+                "{line}\t{}\t{}\t{class}\n",
+                if is_planned { "placed" } else { "none" },
+                if !is_planned {
+                    "not-planned"
+                } else if was_reverted {
+                    "reverted"
+                } else {
+                    "survived"
+                },
+            ));
+        }
+
+        let mut function_lines = capture.e2_artifacts.functions.lines();
+        let function_header = function_lines.next().unwrap_or_default();
+        let mut functions = format!("{function_header}\tcompiler_survival\n");
+        for line in function_lines {
+            let owner = line.split('\t').next().unwrap_or("<missing>");
+            functions.push_str(&format!(
+                "{line}\t{}\n",
+                if reverted.contains(owner) {
+                    "reverted"
+                } else {
+                    "survived"
+                }
+            ));
+        }
+
+        let control =
+            match crate::bo_rewriter::decision::lifetime_oracle_tests::load_frozen_pb_control() {
+                Ok(control) => control,
+                Err(error) => {
+                    row.set("status", "p-b-control-error");
+                    row.set("detail", super::report::sanitize(&error));
+                    row.set("t_total_s", secs(started.elapsed()));
+                    return row;
+                }
+            };
+        let (expected_roots, expected_members) = control.for_program(&name);
+        let mut produced_roots = BTreeSet::new();
+        let mut produced_members = BTreeSet::new();
+        let mut produced_reasons = BTreeMap::new();
+        for line in capture.e2_artifacts.pb_web.lines().skip(1) {
+            let fields = line.split('\t').collect::<Vec<_>>();
+            if fields.len() != 3 {
+                continue;
+            }
+            match fields[0] {
+                "root" => {
+                    produced_roots.insert(fields[1].to_owned());
+                }
+                "closure" => {
+                    produced_members.insert(fields[1].to_owned());
+                    produced_reasons.insert(fields[1].to_owned(), fields[2].to_owned());
+                }
+                _ => {}
+            }
+        }
+        let mut pb_diff = String::from("side\tunit\tfunction\treason\n");
+        for (unit, produced, expected) in [
+            ("root", &produced_roots, &expected_roots),
+            ("closure", &produced_members, &expected_members),
+        ] {
+            for function in produced.difference(expected) {
+                pb_diff.push_str(&format!(
+                    "production-only\t{unit}\t{function}\t{}\n",
+                    produced_reasons
+                        .get(function)
+                        .map_or("adjusted-fnptr", String::as_str)
+                ));
+            }
+            for function in expected.difference(produced) {
+                pb_diff.push_str(&format!("p-b-only\t{unit}\t{function}\tfrozen-control\n"));
+            }
+        }
+
+        let subjects_path = directory.join(format!("{name}.e2-subjects.tsv"));
+        let functions_path = directory.join(format!("{name}.e2-functions.tsv"));
+        let failures_path = directory.join(format!("{name}.e2-failures.tsv"));
+        let seams_path = directory.join(format!("{name}.e2-seams.tsv"));
+        let pb_path = directory.join(format!("{name}.e2-pb-web.tsv"));
+        let pb_diff_path = directory.join(format!("{name}.e2-pb-differential.tsv"));
+        std::fs::write(&subjects_path, stamp(&subjects)).expect("write E2 subjects");
+        std::fs::write(&functions_path, stamp(&functions)).expect("write E2 functions");
+        std::fs::write(&failures_path, stamp(&capture.e2_artifacts.failures))
+            .expect("write E2 failures");
+        std::fs::write(&seams_path, stamp(&capture.e2_artifacts.seams)).expect("write E2 seams");
+        std::fs::write(&pb_path, stamp(&capture.e2_artifacts.pb_web)).expect("write E2 P-b web");
+        std::fs::write(&pb_diff_path, &pb_diff).expect("write E2 P-b differential");
+
+        let mut diagnostics =
+            String::from("function\terror_code\tmessage_head\tfile\tline\tattribution\n");
+        for diagnostic in &capture.reverts {
+            diagnostics.push_str(&format!(
+                "{}\t{}\t{}\t{}\t{}\t{}\n",
+                tsv_field(&diagnostic.function, 300),
+                e1_code(diagnostic.diagnostic.code.as_deref()),
+                tsv_field(&diagnostic.diagnostic.message, 300),
+                tsv_field(
+                    &crate::bo_rewriter::verify::crate_relative(
+                        &diagnostic.diagnostic.file,
+                        &capture.observed_root,
+                    ),
+                    400,
+                ),
+                diagnostic.diagnostic.line,
+                diagnostic.attribution,
+            ));
+        }
+        let diagnostics_path = directory.join(format!("{name}.compiler-diagnostics.tsv"));
+        std::fs::write(&diagnostics_path, stamp(&diagnostics)).expect("write E2 diagnostics");
+
+        let timing = &capture.e2_artifacts.timings;
+        let timings = format!(
+            "cache_load_s\torigin_derivation_s\tpb_web_s\teligibility_s\tfinalization_s\tseam_s\tast_placement_s\treceipt_render_s\tcompiler_verification_s\tworker_total_s\n{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+            timing.cache_load_wall_s,
+            timing.origin_derivation_wall_s,
+            timing.pb_web_wall_s,
+            timing.eligibility_wall_s,
+            timing.finalization_wall_s,
+            timing.seam_wall_s,
+            timing.ast_placement_wall_s,
+            timing.receipt_render_wall_s,
+            timing.compiler_verification_wall_s,
+            secs(started.elapsed()),
+        );
+        let timings_path = directory.join(format!("{name}.timings.tsv"));
+        std::fs::write(&timings_path, stamp(&timings)).expect("write E2 timings");
+        let solve = &capture.solve_receipt;
+        let cache_receipt = format!(
+            "source\tcache_status\tfingerprint\tmodel_sha256\tcache_entry\tsolve_wall_s\n{}\t{}\t{}\t{}\t{}\t{}\n",
+            solve.source,
+            solve.cache_status,
+            solve.fingerprint,
+            solve.model_sha256,
+            solve.cache_entry.as_deref().unwrap_or("none"),
+            solve.solve_wall_s,
+        );
+        let cache_path = directory.join(format!("{name}.cache-receipt.tsv"));
+        std::fs::write(&cache_path, stamp(&cache_receipt)).expect("write E2 cache receipt");
+        let a5_path = directory.join(format!("{name}.a5-receipt.txt"));
+        std::fs::write(&a5_path, &capture.a5_receipt).expect("write E2 A5 receipt");
+
+        row.set("corpus", "rs-crown");
+        row.set("analysis_frame", model_cache::ANALYSIS_FRAME);
+        row.set("code_frame", code_frame);
+        row.set("data", "provisional");
+        row.set("build_profile", build_profile);
+        row.set("launch_profile", &launch_profile);
+        row.set("debug_assertions", u8::from(cfg!(debug_assertions)));
+        for (key, value) in stamps {
+            row.set(key, value);
+        }
+        row.set("cache_status", &solve.cache_status);
+        row.set("solve", &solve.source);
+        row.set("solve_wall_s", &solve.solve_wall_s);
+        row.set("cache_fingerprint", &solve.fingerprint);
+        row.set("cache_model_sha256", &solve.model_sha256);
+        row.set("e2_subject_rows", subjects.lines().skip(1).count());
+        row.set("e2_planned", planned);
+        row.set("e2_survived", survived);
+        row.set(
+            "e2_failure_rows",
+            capture.e2_artifacts.failures.lines().skip(1).count(),
+        );
+        row.set("e2_function_rows", functions.lines().skip(1).count());
+        row.set("pb_roots", produced_roots.len());
+        row.set("pb_members", produced_members.len());
+        row.set("pb_expected_roots", expected_roots.len());
+        row.set("pb_expected_members", expected_members.len());
+        row.set("pb_divergences", pb_diff.lines().skip(1).count());
+        row.set("compiler_diagnostics", capture.reverts.len());
+        row.set("subjects_artifact", subjects_path.display());
+        row.set("functions_artifact", functions_path.display());
+        row.set("failures_artifact", failures_path.display());
+        row.set("seams_artifact", seams_path.display());
+        row.set("pb_artifact", pb_path.display());
+        row.set("pb_differential_artifact", pb_diff_path.display());
+        row.set("diagnostics_artifact", diagnostics_path.display());
+        row.set("timings_artifact", timings_path.display());
+        row.set("cache_artifact", cache_path.display());
+        row.set("a5_receipt_artifact", a5_path.display());
+        row.set("verify_iterations", 1);
+        row.set("repair_rounds", 0);
+        row.set("t_total_s", secs(started.elapsed()));
+        let profile_ok =
+            build_profile == "release" && launch_profile == "release" && !cfg!(debug_assertions);
+        let cache_ok = solve.source == "cache"
+            && solve.cache_status == "hit"
+            && solve.solve_wall_s == "0.000000";
+        let pb_ok = pb_diff.lines().count() == 1;
+        row.set(
+            "status",
+            if !profile_ok {
+                "debug-build-profile"
+            } else if !cache_ok {
+                "cache-gate-failed"
+            } else if !pb_ok {
+                "p-b-divergence"
+            } else {
+                "ok"
+            },
+        );
+        row
+    }
+
     pub fn run_box_census(input: &std::path::Path) -> Row {
         let mut row = run_e1_revert_census(input);
         if row.get("status") != Some("ok") {
@@ -12262,6 +12580,7 @@ fn the_reporting_site_reads_files_touched_not_the_map_size() {
         e1_reverts: Vec::new(),
         e1_adapter_receipt: String::new(),
         e1_subject_receipt: String::new(),
+        e2_artifacts: crate::bo_rewriter::E2Artifacts::default(),
         e1_novel_error_count: 0,
         e1_box_drop_receipt: String::new(),
         solve_receipt: None,
@@ -15664,6 +15983,14 @@ fn e1_rekey_cache_corpus() {
 fn e1_revert_census_corpus() {
     use std::{fs, time::Duration};
 
+    if std::env::var("CRAT_E2_CACHE_PREFLIGHT").as_deref() == Ok("1") {
+        e2_fn_cache_preflight_corpus();
+        return;
+    }
+    if std::env::var("CRAT_E2_FN_CENSUS").as_deref() == Ok("1") {
+        e2_fn_census_corpus();
+        return;
+    }
     if std::env::var("CRAT_E1_REKEY").as_deref() == Ok("1") {
         e1_rekey_cache_corpus();
         return;
@@ -15767,6 +16094,338 @@ fn e1_revert_census_corpus() {
         .join("\n")
         + "\n";
     fs::write(artifact_dir.join("e1-results.kv"), summary).expect("write E1 corpus rows");
+}
+
+fn e2_fn_cache_preflight_corpus() {
+    use std::{fs, path::PathBuf, time::Duration};
+
+    let root = orchestrate::workspace_root();
+    let artifact_dir = PathBuf::from(
+        std::env::var_os("CRAT_E2_ARTIFACT_DIR")
+            .expect("E2 preflight requires CRAT_E2_ARTIFACT_DIR"),
+    );
+    let cache_dir = PathBuf::from(
+        std::env::var_os("CRAT_BO_CACHE_DIR").expect("E2 preflight requires CRAT_BO_CACHE_DIR"),
+    );
+    fs::create_dir_all(&artifact_dir).expect("create E2 preflight artifact directory");
+    let mut rows = Vec::new();
+    for program in CORPUS {
+        let input = program.input_path(&root);
+        let outcome = orchestrate::run_child_env(
+            program.name,
+            &input,
+            "e1-cache-preflight",
+            Duration::from_secs(14_400),
+            &[
+                ("CRAT_BO_CACHE", "1".to_owned()),
+                ("CRAT_BO_CACHE_DIR", cache_dir.display().to_string()),
+                (
+                    "CRAT_BO_A5_ATTESTATION",
+                    "frozen_benchmark_graph".to_owned(),
+                ),
+            ],
+        );
+        let mut row = outcome.row.unwrap_or_else(|| {
+            panic!(
+                "{} produced no cache-preflight row: status={} note={}",
+                program.name, outcome.status, outcome.note
+            )
+        });
+        row.set("program", program.name);
+        row.set("worker_wall_s", format!("{:.3}", outcome.wall_s));
+        row.set("peak_rss_kb", outcome.peak_rss_kb);
+        assert_eq!(row.get("status"), Some("ok"), "{row:?}");
+        assert_eq!(row.get("cache_status"), Some("hit"), "{row:?}");
+        assert_eq!(row.get("solve_wall_s"), Some("0.000000"), "{row:?}");
+        eprintln!(
+            "E2-PREFLIGHT program={} stage=cache rc=0 wall={:.3} rss={} digest={}",
+            program.name,
+            outcome.wall_s,
+            outcome.peak_rss_kb,
+            row.get("fingerprint").unwrap_or("missing"),
+        );
+        rows.push(row);
+    }
+    assert_eq!(rows.len(), 20);
+    let summary = rows
+        .iter()
+        .map(report::to_kv_line)
+        .collect::<Vec<_>>()
+        .join("\n")
+        + "\n";
+    fs::write(artifact_dir.join("e2-cache-preflight.kv"), summary)
+        .expect("write E2 cache preflight");
+}
+
+fn e2_fn_census_corpus() {
+    use std::{collections::BTreeMap, fs, path::PathBuf, time::Duration};
+
+    use sha2::{Digest, Sha256};
+
+    fn read_tsv(path: &std::path::Path) -> Vec<BTreeMap<String, String>> {
+        let text = fs::read_to_string(path)
+            .unwrap_or_else(|error| panic!("read TSV {}: {error}", path.display()));
+        let mut lines = text.lines();
+        let header = lines
+            .next()
+            .unwrap_or_else(|| panic!("empty TSV {}", path.display()))
+            .split('\t')
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        lines
+            .map(|line| {
+                let fields = line.split('\t').collect::<Vec<_>>();
+                assert_eq!(
+                    fields.len(),
+                    header.len(),
+                    "schema width {}: {line}",
+                    path.display()
+                );
+                header
+                    .iter()
+                    .cloned()
+                    .zip(fields.into_iter().map(str::to_owned))
+                    .collect()
+            })
+            .collect()
+    }
+
+    let root = orchestrate::workspace_root();
+    let artifact_dir = PathBuf::from(
+        std::env::var_os("CRAT_E2_ARTIFACT_DIR").expect("E2 census requires CRAT_E2_ARTIFACT_DIR"),
+    );
+    let cache_dir = PathBuf::from(
+        std::env::var_os("CRAT_BO_CACHE_DIR").expect("E2 census requires CRAT_BO_CACHE_DIR"),
+    );
+    let market_dir = PathBuf::from(
+        std::env::var_os("CRAT_E2_MARKET_DIR").expect("E2 census requires CRAT_E2_MARKET_DIR"),
+    );
+    let code_frame = std::env::var("CRAT_E2_CODE_FRAME").expect("E2 code-frame stamp");
+    fs::create_dir_all(&artifact_dir).expect("create E2 census artifact directory");
+    let mut rows = Vec::new();
+    for program in CORPUS {
+        let input = program.input_path(&root);
+        let outcome = orchestrate::run_child_env(
+            program.name,
+            &input,
+            "e2-fn-census",
+            Duration::from_secs(14_400),
+            &[
+                ("CRAT_BO_CACHE", "1".to_owned()),
+                ("CRAT_BO_CACHE_DIR", cache_dir.display().to_string()),
+                (
+                    "CRAT_BO_A5_ATTESTATION",
+                    "frozen_benchmark_graph".to_owned(),
+                ),
+                ("CRAT_E2_ARTIFACT_DIR", artifact_dir.display().to_string()),
+                ("CRAT_E2_CODE_FRAME", code_frame.clone()),
+                ("CRAT_E2_CARGO_PROFILE", "release".to_owned()),
+            ],
+        );
+        let mut row = outcome.row.unwrap_or_else(|| {
+            panic!(
+                "{} produced no E2 row: status={} note={}",
+                program.name, outcome.status, outcome.note
+            )
+        });
+        row.set("program", program.name);
+        row.set("worker_wall_s", format!("{:.3}", outcome.wall_s));
+        row.set("peak_rss_kb", outcome.peak_rss_kb);
+        assert_eq!(row.get("status"), Some("ok"), "{row:?}");
+        assert_eq!(row.get("cache_status"), Some("hit"), "{row:?}");
+        assert_eq!(row.get("solve_wall_s"), Some("0.000000"), "{row:?}");
+        assert_eq!(row.get("build_profile"), Some("release"), "{row:?}");
+        assert_eq!(row.get("launch_profile"), Some("release"), "{row:?}");
+        assert_eq!(row.get("debug_assertions"), Some("0"), "{row:?}");
+        assert_eq!(row.get("pb_divergences"), Some("0"), "{row:?}");
+        eprintln!(
+            "E2-CENSUS program={} stage=complete rc=0 wall={:.3} rss={} digest={}",
+            program.name,
+            outcome.wall_s,
+            outcome.peak_rss_kb,
+            row.get("cache_fingerprint").unwrap_or("missing"),
+        );
+        rows.push(row);
+    }
+    assert_eq!(rows.len(), 20);
+
+    let mut cause_counts = BTreeMap::<String, usize>::new();
+    let mut disposition_counts = BTreeMap::<String, usize>::new();
+    let mut market_total = 0usize;
+    let mut direct = 0usize;
+    let mut collateral = 0usize;
+    let mut fn_tranche = 0usize;
+    let mut field_tranche = 0usize;
+    let mut boundary_tranche = 0usize;
+    let mut planned = 0usize;
+    let mut survived = 0usize;
+    let mut off_market_planned = 0usize;
+    let mut joined = String::from(
+        "program\tsubject_key\tprior_cause\tprior_class\te2_disposition\tcompiler_survival\n",
+    );
+    let mut pb_roots = 0usize;
+    let mut pb_members = 0usize;
+
+    for program in CORPUS {
+        let old_rows = read_tsv(&market_dir.join(format!("{}.subjects.tsv", program.name)));
+        let market = old_rows
+            .into_iter()
+            .filter(|row| {
+                row.get("lifetime_related")
+                    .is_some_and(|value| value == "1")
+            })
+            .map(|row| (row["subject_key"].clone(), row))
+            .collect::<BTreeMap<_, _>>();
+        let new_rows = read_tsv(&artifact_dir.join(format!("{}.e2-subjects.tsv", program.name)));
+        let mut new_by_key = BTreeMap::new();
+        for row in new_rows {
+            let key = row["subject_key"].clone();
+            assert!(
+                new_by_key.insert(key.clone(), row).is_none(),
+                "duplicate E2 row {key}"
+            );
+        }
+        for (key, old) in &market {
+            let new = new_by_key
+                .get(key)
+                .unwrap_or_else(|| panic!("{} missing E2 market row {key}", program.name));
+            let collateral_row = old["reason"] == "class-blocked";
+            let cause = if collateral_row {
+                old["reason_detail"].as_str()
+            } else {
+                old["reason"].as_str()
+            };
+            let disposition = new["e2_disposition"].as_str();
+            assert_ne!(disposition, "not-e2", "{} / {key}", program.name);
+            *cause_counts.entry(cause.to_owned()).or_default() += 1;
+            *disposition_counts
+                .entry(disposition.to_owned())
+                .or_default() += 1;
+            market_total += 1;
+            collateral += usize::from(collateral_row);
+            direct += usize::from(!collateral_row);
+            match cause {
+                "escapes-via-return" | "return-not-adapted" => {
+                    fn_tranche += 1;
+                    assert!(
+                        disposition == "planned" || disposition.starts_with("lifetime-"),
+                        "{} / {key}: {disposition}",
+                        program.name
+                    );
+                }
+                "escapes-via-field-store" => {
+                    field_tranche += 1;
+                    assert_eq!(
+                        disposition, "lifetime-field-held",
+                        "{} / {key}",
+                        program.name
+                    );
+                }
+                "escapes-via-foreign-arg" | "borrowed-into-raw-param" => {
+                    boundary_tranche += 1;
+                    assert_eq!(
+                        disposition, "lifetime-external-contract-absent",
+                        "{} / {key}",
+                        program.name
+                    );
+                }
+                other => panic!("unregistered E2 market cause {other}"),
+            }
+            planned += usize::from(disposition == "planned");
+            survived += usize::from(new["compiler_survival"] == "survived");
+            joined.push_str(&format!(
+                "{}\t{}\t{}\t{}\t{}\t{}\n",
+                program.name,
+                key,
+                cause,
+                if collateral_row {
+                    "collateral"
+                } else {
+                    "direct"
+                },
+                disposition,
+                new["compiler_survival"],
+            ));
+        }
+        off_market_planned += new_by_key
+            .iter()
+            .filter(|(key, row)| !market.contains_key(*key) && row["e2_disposition"] == "planned")
+            .count();
+
+        let worker = rows
+            .iter()
+            .find(|row| row.get("program") == Some(program.name))
+            .expect("worker row");
+        pb_roots += worker
+            .get("pb_roots")
+            .expect("pb roots")
+            .parse::<usize>()
+            .expect("pb roots integer");
+        pb_members += worker
+            .get("pb_members")
+            .expect("pb members")
+            .parse::<usize>()
+            .expect("pb members integer");
+        let old_cache = read_tsv(&market_dir.join(format!("{}.cache-receipt.tsv", program.name)));
+        assert_eq!(old_cache.len(), 1);
+        assert_eq!(
+            worker.get("cache_model_sha256"),
+            old_cache[0].get("model_sha256").map(String::as_str),
+            "{} model bytes moved",
+            program.name
+        );
+        assert_eq!(
+            fs::read(artifact_dir.join(format!("{}.a5-receipt.txt", program.name))).unwrap(),
+            fs::read(market_dir.join(format!("{}.a5-receipt.txt", program.name))).unwrap(),
+            "{} A5 receipt moved",
+            program.name
+        );
+    }
+
+    assert_eq!(market_total, 394);
+    assert_eq!((direct, collateral), (343, 51));
+    assert_eq!(
+        (fn_tranche, field_tranche, boundary_tranche),
+        (182, 23, 189)
+    );
+    assert_eq!(
+        off_market_planned, 0,
+        "E2 planned outside the registered market"
+    );
+    assert_eq!((pb_roots, pb_members), (93, 164));
+
+    let results = rows
+        .iter()
+        .map(report::to_kv_line)
+        .collect::<Vec<_>>()
+        .join("\n")
+        + "\n";
+    fs::write(artifact_dir.join("e2-results.kv"), results).expect("write E2 results");
+    fs::write(artifact_dir.join("e2-market-join.tsv"), joined).expect("write E2 market join");
+    let aggregate = format!(
+        "status=ok\ndata=provisional\ncorpus=rs-crown\ncode_frame={code_frame}\nanalysis_frame={}\nmarket_total={market_total}\ndirect={direct}\ncollateral={collateral}\nfn_tranche={fn_tranche}\nfield_held={field_tranche}\nboundary_residual={boundary_tranche}\nplanned={planned}\ncompiler_survived={survived}\noff_market_planned={off_market_planned}\npb_roots={pb_roots}\npb_members={pb_members}\nkind_triple=48859/10500/239\nofficial=1607/2414=66.5700%\ncauses={cause_counts:?}\ndispositions={disposition_counts:?}\n",
+        crate::analyses::borrow_ownership::model_cache::ANALYSIS_FRAME,
+    );
+    fs::write(artifact_dir.join("e2-aggregate.txt"), aggregate).expect("write E2 aggregate");
+
+    let mut artifact_files = fs::read_dir(&artifact_dir)
+        .expect("read E2 artifact directory")
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_file()))
+        .map(|entry| entry.path())
+        .filter(|path| path.file_name().and_then(|name| name.to_str()) != Some("SHA256SUMS"))
+        .collect::<Vec<_>>();
+    artifact_files.sort();
+    let mut manifest = String::new();
+    for path in artifact_files {
+        let bytes = fs::read(&path).expect("hash E2 artifact");
+        manifest.push_str(&format!(
+            "{:x}  {}\n",
+            Sha256::digest(bytes),
+            path.file_name().unwrap().to_string_lossy(),
+        ));
+    }
+    fs::write(artifact_dir.join("SHA256SUMS"), manifest).expect("write E2 manifest");
 }
 
 #[test]
@@ -16625,6 +17284,7 @@ fn boc1_run_one() {
             | "s23-probe"
             | "t1-origin-caller"
             | "e1-revert-census"
+            | "e2-fn-census"
             | "box-facts"
             | "box-census"
     ) || mode.starts_with("selector-detail-")
@@ -16651,6 +17311,14 @@ fn boc1_run_one() {
         let mut row = run::run_e1_revert_census(Path::new(&input));
         row.set("program", name.clone());
         row.set("mode", "e1-revert-census");
+        println!("{}", report::to_kv_line(&row));
+        return;
+    }
+
+    if mode == "e2-fn-census" {
+        let mut row = run::run_e2_fn_census(Path::new(&input));
+        row.set("program", name.clone());
+        row.set("mode", "e2-fn-census");
         println!("{}", report::to_kv_line(&row));
         return;
     }

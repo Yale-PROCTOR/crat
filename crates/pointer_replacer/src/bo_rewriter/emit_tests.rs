@@ -6124,6 +6124,63 @@ fn e2_n5_cache_and_fresh_paths_share_plan_model_a5_and_source_bytes() {
     crate::analyses::borrow_ownership::model_cache::reset_for_test();
 }
 
+/// Task 29 — path-independent lifetime plans/receipts and off-tranche source
+/// identity across two distinct source roots.
+#[test]
+fn e2_n5_two_roots_share_plan_receipts_and_unowned_source_bytes() {
+    let source = "#![allow(dead_code, unused_unsafe)]\n\
+         pub unsafe fn id(p: *const i32) -> *const i32 { p }\n\
+         pub fn untouched(x: i32) -> i32 { x + 1 }\n";
+    let left = Fixture::new(&[("lib.rs", source)]);
+    let right = Fixture::new(&[("lib.rs", source)]);
+    assert_ne!(left.0, right.0);
+
+    let run = |fixture: &Fixture| {
+        ::utils::compilation::run_compiler_on_path(&fixture.root(), |tcx| {
+            let capture = super::ast_transform::capture_ast(tcx)?;
+            let (table, ctx) = super::decide_table_with_ctx_config(
+                tcx,
+                Some((
+                    crate::analyses::borrow_ownership::a5_overlap::A5Mode::PreciseReplay,
+                    Some(
+                        crate::analyses::borrow_ownership::a5_overlap::WholeProgramAttestation::FrozenBenchmarkGraph,
+                    ),
+                )),
+            )?;
+            let (files, _, _) = super::ast_transform::ast_emitted_files_from(
+                tcx,
+                &capture,
+                &super::ast_transform::RevertSet::default(),
+                None,
+                &table,
+            )?;
+            let emitted = files
+                .values()
+                .find(|text| text.contains("fn id"))
+                .cloned()
+                .ok_or_else(|| "E2 two-root source missing".to_owned())?;
+            Ok::<_, String>((
+                table.lifetime_plan.canonical_receipt(tcx),
+                ctx.e2_artifacts.subjects,
+                ctx.e2_artifacts.functions,
+                ctx.e2_artifacts.failures,
+                emitted,
+            ))
+        })
+        .expect("E2 two-root fixture compiles")
+        .expect("E2 two-root derivation")
+    };
+
+    let left = run(&left);
+    let right = run(&right);
+    assert_eq!(left, right);
+    assert!(
+        left.4.contains("pub fn untouched(x: i32) -> i32 { x + 1 }"),
+        "off-tranche function moved:\n{}",
+        left.4,
+    );
+}
+
 /// E2-N6 — lifetime diagnostics are one-iteration row data, not a false
 /// success. Both missing lifetime selection and an omitted input constraint
 /// must reach the repaired full-analysis observer with their rustc codes.

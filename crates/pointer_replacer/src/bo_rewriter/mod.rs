@@ -134,6 +134,7 @@ pub(crate) struct E1Capture {
     pub(crate) adapter_receipt: String,
     /// Every subject and item-axis exclusion from that same table/plan.
     pub(crate) subject_receipt: String,
+    pub(crate) e2_artifacts: E2Artifacts,
     pub(crate) novel_error_count: usize,
     pub(crate) baseline_keys: usize,
     pub(crate) baseline_errors: usize,
@@ -153,6 +154,21 @@ pub(crate) struct E2Artifacts {
     pub(crate) functions: String,
     pub(crate) failures: String,
     pub(crate) seams: String,
+    pub(crate) pb_web: String,
+    pub(crate) timings: E2Timings,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct E2Timings {
+    pub(crate) cache_load_wall_s: String,
+    pub(crate) origin_derivation_wall_s: String,
+    pub(crate) pb_web_wall_s: String,
+    pub(crate) eligibility_wall_s: String,
+    pub(crate) finalization_wall_s: String,
+    pub(crate) seam_wall_s: String,
+    pub(crate) ast_placement_wall_s: String,
+    pub(crate) receipt_render_wall_s: String,
+    pub(crate) compiler_verification_wall_s: String,
 }
 
 /// What one M1 rewrite attempt produced.
@@ -246,6 +262,7 @@ pub(crate) enum RewriteOutcome {
         e1_adapter_receipt: String,
         /// E1's identity-bearing subject seed, empty on ordinary runs.
         e1_subject_receipt: String,
+        e2_artifacts: E2Artifacts,
         /// Baseline-subtracted error count from the one verify invocation.
         e1_novel_error_count: usize,
         /// D4's emitted-MIR Box-drop reconciliation.
@@ -310,6 +327,7 @@ pub(crate) enum RewriteOutcome {
         e1_adapter_receipt: String,
         /// E1's identity-bearing subject seed, empty on ordinary runs.
         e1_subject_receipt: String,
+        e2_artifacts: E2Artifacts,
         /// Baseline-subtracted error count from the one verify invocation.
         e1_novel_error_count: usize,
         /// D4's emitted-MIR Box-drop reconciliation.
@@ -761,6 +779,7 @@ fn rewrite_core_injected(
             emitted_subjects,
             a5_receipt,
             e1_subject_receipt,
+            decide_ctx.e2_artifacts.clone(),
             e1_box_drop_policies,
         ))
     });
@@ -867,6 +886,7 @@ fn verify_and_revert(
     emitted_subjects: Vec<(String, String, String)>,
     a5_receipt: String,
     e1_subject_receipt: String,
+    e2_artifacts: E2Artifacts,
     e1_box_drop_policies: Vec<verify::BoxMirDropPolicy>,
 ) -> RewriteOutcome {
     // `excluded` is a LOCAL again: the loop holds `tcx`, so a value that used
@@ -964,6 +984,7 @@ fn verify_and_revert(
             String::new()
         },
         e1_subject_receipt,
+        e2_artifacts,
         e1_novel_error_count: 0,
         e1_box_drop_receipt: String::new(),
         solve_receipt: model_cache::solve_receipt(),
@@ -988,6 +1009,7 @@ fn verify_and_revert(
     // The incoming `files` is still what `root_key` is taken from and what the
     // pre-loop rollback gate judged — that gate validates the PLAN (byte-offset
     // collisions), which is layer-independent, so it keeps its meaning.
+    let ast_started = std::time::Instant::now();
     let (mut files, mut files_edited, mut line_maps) = match round_files(
         tcx,
         capture,
@@ -1015,6 +1037,8 @@ fn verify_and_revert(
             return facts.degraded(format!("round-0 emit failed: {why}"));
         }
     };
+    facts.e2_artifacts.timings.ast_placement_wall_s =
+        format!("{:.6}", ast_started.elapsed().as_secs_f64());
     facts.files_touched = files_edited;
     let mut rounds = 0usize;
     let mut previous_errors: Option<usize> = None;
@@ -1046,7 +1070,11 @@ fn verify_and_revert(
         };
         let probe_started = std::time::Instant::now();
         let diagnosis = verify::diagnose_crate(staged.root());
-        probe_secs = probe_secs.max(probe_started.elapsed().as_secs_f64());
+        let probe_wall_s = probe_started.elapsed().as_secs_f64();
+        probe_secs = probe_secs.max(probe_wall_s);
+        if census_once {
+            facts.e2_artifacts.timings.compiler_verification_wall_s = format!("{probe_wall_s:.6}");
+        }
         if probe_only {
             // INSTRUMENTS MEASURE THE CAPTURE; GATES CONSUME THE
             // FILTERED VIEW. The probe payload is the RAW diagnosis and
@@ -2143,6 +2171,7 @@ struct OutcomeFacts {
     e1_reverts: Vec<E1RevertDiagnostic>,
     e1_adapter_receipt: String,
     e1_subject_receipt: String,
+    e2_artifacts: E2Artifacts,
     e1_novel_error_count: usize,
     e1_box_drop_receipt: String,
     solve_receipt: Option<model_cache::SolveReceipt>,
@@ -2197,6 +2226,7 @@ impl RewriteOutcome {
             e1_reverts,
             e1_adapter_receipt,
             e1_subject_receipt,
+            e2_artifacts,
             novel_error_count,
             e1_box_drop_receipt,
             baseline_keys,
@@ -2214,6 +2244,7 @@ impl RewriteOutcome {
                 e1_reverts,
                 e1_adapter_receipt,
                 e1_subject_receipt,
+                e2_artifacts,
                 e1_novel_error_count,
                 e1_box_drop_receipt,
                 baseline_keys,
@@ -2230,6 +2261,7 @@ impl RewriteOutcome {
                 e1_reverts,
                 e1_adapter_receipt,
                 e1_subject_receipt,
+                e2_artifacts,
                 e1_novel_error_count,
                 e1_box_drop_receipt,
                 baseline_keys,
@@ -2248,6 +2280,7 @@ impl RewriteOutcome {
                 e1_reverts,
                 e1_adapter_receipt,
                 e1_subject_receipt,
+                e2_artifacts,
                 e1_novel_error_count,
                 e1_box_drop_receipt,
                 baseline_keys,
@@ -2264,6 +2297,7 @@ impl RewriteOutcome {
                 e1_reverts,
                 e1_adapter_receipt,
                 e1_subject_receipt,
+                e2_artifacts,
                 e1_novel_error_count,
                 e1_box_drop_receipt,
                 baseline_keys,
@@ -2283,6 +2317,7 @@ impl RewriteOutcome {
             reverts: e1_reverts,
             adapter_receipt: e1_adapter_receipt,
             subject_receipt: e1_subject_receipt,
+            e2_artifacts,
             novel_error_count,
             baseline_keys,
             baseline_errors,
@@ -2342,6 +2377,7 @@ impl OutcomeFacts {
             e1_reverts: self.e1_reverts,
             e1_adapter_receipt: self.e1_adapter_receipt,
             e1_subject_receipt: self.e1_subject_receipt,
+            e2_artifacts: self.e2_artifacts,
             e1_novel_error_count: self.e1_novel_error_count,
             e1_box_drop_receipt: self.e1_box_drop_receipt,
             solve_receipt: self.solve_receipt,
@@ -2369,6 +2405,7 @@ impl OutcomeFacts {
             e1_reverts: self.e1_reverts,
             e1_adapter_receipt: self.e1_adapter_receipt,
             e1_subject_receipt: self.e1_subject_receipt,
+            e2_artifacts: self.e2_artifacts,
             e1_novel_error_count: self.e1_novel_error_count,
             e1_box_drop_receipt: self.e1_box_drop_receipt,
             solve_receipt: self.solve_receipt,
@@ -3047,6 +3084,8 @@ struct DecisionAnalysisCarrier {
     origins: Option<OriginSummaries>,
     a5_mode: A5Mode,
     attestation: Option<WholeProgramAttestation>,
+    cache_load_wall_s: f64,
+    origin_derivation_wall_s: f64,
 }
 
 fn cached_rewriter_plans(
@@ -3056,11 +3095,13 @@ fn cached_rewriter_plans(
     a5_mode: A5Mode,
     attestation: Option<WholeProgramAttestation>,
     cached: &model_cache::CachedModel,
-) -> Result<(Vec<PlannedC9Mark>, Option<OriginSummaries>), String> {
+) -> Result<(Vec<PlannedC9Mark>, Option<OriginSummaries>, f64), String> {
     match a5_mode {
-        A5Mode::Baseline => Ok((Vec::new(), None)),
+        A5Mode::Baseline => Ok((Vec::new(), None, 0.0)),
         A5Mode::PreciseReplay => {
+            let origin_started = std::time::Instant::now();
             let origins = compute_origins(program);
+            let origin_derivation_wall_s = origin_started.elapsed().as_secs_f64();
             let plans = cached_precise_rewriter_payload(
                 program,
                 slots,
@@ -3071,7 +3112,7 @@ fn cached_rewriter_plans(
                 attestation,
                 &cached.a5_receipt,
             )?;
-            Ok((plans, Some(origins)))
+            Ok((plans, Some(origins), origin_derivation_wall_s))
         }
         A5Mode::CoarseConstraint => {
             Err("the pricing-only coarse A5 mode is not cacheable".to_owned())
@@ -3101,6 +3142,7 @@ fn decide_table_perturbed_config<'tcx>(
     // which program this is.
     let fp = model_cache::fingerprint(&program, a5_mode, attestation);
     let cacheable = matches!(a5_mode, A5Mode::Baseline | A5Mode::PreciseReplay);
+    let cache_started = std::time::Instant::now();
 
     // Tier 1: the in-process memo. The recon worker has three independent
     // consumers of the decision table, and before this each ran the entire
@@ -3108,7 +3150,7 @@ fn decide_table_perturbed_config<'tcx>(
     // makes a consumer's cost its own work, not another whole solve.
     if cacheable
         && let Some(cached) = model_cache::memo_get(&fp)
-        && let Ok((retained_c9_plans, origins)) =
+        && let Ok((retained_c9_plans, origins, origin_derivation_wall_s)) =
             cached_rewriter_plans(&program, &slots, &mut_facts, a5_mode, attestation, &cached)
     {
         return finish_decide(
@@ -3123,6 +3165,8 @@ fn decide_table_perturbed_config<'tcx>(
                 origins,
                 a5_mode,
                 attestation,
+                cache_load_wall_s: cache_started.elapsed().as_secs_f64(),
+                origin_derivation_wall_s,
             },
             perturb,
         );
@@ -3131,7 +3175,7 @@ fn decide_table_perturbed_config<'tcx>(
     // Tier 2: the on-disk cache.
     if cacheable
         && let Some(cached) = model_cache::load(tcx, &program, &slots, a5_mode, attestation)
-        && let Ok((retained_c9_plans, origins)) =
+        && let Ok((retained_c9_plans, origins, origin_derivation_wall_s)) =
             cached_rewriter_plans(&program, &slots, &mut_facts, a5_mode, attestation, &cached)
     {
         let model_sha256 = model_cache::model_bytes_sha256(tcx, &slots, &cached.model)
@@ -3158,12 +3202,16 @@ fn decide_table_perturbed_config<'tcx>(
                 origins,
                 a5_mode,
                 attestation,
+                cache_load_wall_s: cache_started.elapsed().as_secs_f64(),
+                origin_derivation_wall_s,
             },
             perturb,
         );
     }
     let solve_t0 = std::time::Instant::now();
+    let origin_started = std::time::Instant::now();
     let origins = compute_origins(&program);
+    let origin_derivation_wall_s = origin_started.elapsed().as_secs_f64();
     let (verified, _export) = with_bo_export(|| {
         solve_bo_a5_config(&program, &slots, &origins, &mut_facts, a5_mode, attestation)
     });
@@ -3212,6 +3260,8 @@ fn decide_table_perturbed_config<'tcx>(
             origins: Some(origins),
             a5_mode,
             attestation,
+            cache_load_wall_s: cache_started.elapsed().as_secs_f64(),
+            origin_derivation_wall_s,
         },
         perturb,
     )
@@ -3454,17 +3504,20 @@ fn finish_decide<'tcx>(
     // standing, measured.
     decision::refuse_nested_use_edits(tcx, &mut table);
 
+    let finalization_started = std::time::Instant::now();
     table.lifetime_plan = decision::lifetime::finalize(
         &program,
         analysis.origins.as_ref(),
         &lifetime_eligibility,
         &table,
     )?;
+    let finalization_wall_s = finalization_started.elapsed().as_secs_f64();
 
     // **S3.6-1 seam adapters.** Runs AFTER every gate that can still refuse a
     // subject, including the nesting pass above: a seam is computed from the
     // forms both ends actually settle on, so a subject withdrawn later would
     // leave glue bridging to a form that no longer exists.
+    let seam_started = std::time::Instant::now();
     let a5_site_proofs = decision::a5_site_proof::A5SeamProofIndex::derive(
         &program,
         &slots,
@@ -3472,6 +3525,7 @@ fn finish_decide<'tcx>(
         analysis.a5_mode,
         analysis.attestation,
     );
+    let seam_wall_s = seam_started.elapsed().as_secs_f64();
     table.seams = decision::seam::synthesize(
         tcx,
         &facts,
@@ -3505,7 +3559,20 @@ fn finish_decide<'tcx>(
     if let Err(why) = table.is_self_consistent_over(&subjects) {
         return Err(format!("decision table self-consistency: {why}"));
     }
-    let e2_artifacts = e2_artifacts_from_table(tcx, &table, &hypothetical, &lifetime_eligibility);
+    let receipt_started = std::time::Instant::now();
+    let mut e2_artifacts =
+        e2_artifacts_from_table(tcx, &table, &hypothetical, &lifetime_eligibility);
+    e2_artifacts.timings = E2Timings {
+        cache_load_wall_s: format!("{:.6}", analysis.cache_load_wall_s),
+        origin_derivation_wall_s: format!("{:.6}", analysis.origin_derivation_wall_s),
+        pb_web_wall_s: format!("{:.6}", lifetime_eligibility.web_wall_s()),
+        eligibility_wall_s: format!("{:.6}", lifetime_eligibility.derive_wall_s()),
+        finalization_wall_s: format!("{finalization_wall_s:.6}"),
+        seam_wall_s: format!("{seam_wall_s:.6}"),
+        ast_placement_wall_s: "pending".to_owned(),
+        receipt_render_wall_s: format!("{:.6}", receipt_started.elapsed().as_secs_f64()),
+        compiler_verification_wall_s: "pending".to_owned(),
+    };
 
     // C.2: the in-process coverage gate is GONE. Its replacement is the
     // harness reconciliation in `coverage_recon`, driven from outside this
@@ -3971,6 +4038,14 @@ fn e2_artifacts_from_table(
         })
         .collect::<Vec<_>>();
     function_rows.sort();
+    let mut pb_rows = Vec::new();
+    for root in eligibility.web_roots() {
+        pb_rows.push(format!("root\t{root}\tadjusted-fnptr"));
+    }
+    for (member, reason) in eligibility.web_members() {
+        pb_rows.push(format!("closure\t{member}\t{reason}"));
+    }
+    pb_rows.sort();
 
     E2Artifacts {
         subjects: format!(
@@ -3989,6 +4064,12 @@ fn e2_artifacts_from_table(
             if failure_rows.is_empty() { "" } else { "\n" },
         ),
         seams: seam_tsv_from_table(tcx, table),
+        pb_web: format!(
+            "unit\tfunction\treason\n{}{}",
+            pb_rows.join("\n"),
+            if pb_rows.is_empty() { "" } else { "\n" },
+        ),
+        timings: E2Timings::default(),
     }
 }
 
