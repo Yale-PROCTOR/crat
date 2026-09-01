@@ -3,10 +3,15 @@
 //! This module is rewriter-side by design. It consumes the frozen model/MIR and
 //! never contributes a solver constraint or cache field.
 
+use std::collections::{BTreeMap, BTreeSet};
+
 use rustc_hash::FxHashMap;
 use rustc_hir::{HirId, def_id::LocalDefId};
 use rustc_middle::{
-    mir::{Operand, TerminatorKind},
+    mir::{
+        Body, Local, Location, Operand, ProjectionElem, RETURN_PLACE, Rvalue, StatementKind,
+        TerminatorKind,
+    },
     ty::{Ty, TyCtxt, TyKind},
 };
 use rustc_span::{Span, def_id::DefId};
@@ -396,6 +401,7 @@ impl RetentionUnknownReason {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) enum RetentionEventKind {
+    Transparent,
     Return,
     OutputStorage,
     FieldOrGlobalStore,
@@ -438,38 +444,461 @@ pub(crate) enum RetentionVerdict {
     },
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RetentionDependency {
+    callee: LocalDefId,
+    argument_index: usize,
+    step: RetentionStep,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RetentionBodyFacts {
+    function: LocalDefId,
+    function_path: String,
+    argument_index: usize,
+    steps: Vec<RetentionStep>,
+    retains: Vec<RetentionStep>,
+    unknowns: BTreeMap<RetentionUnknownReason, Vec<RetentionStep>>,
+    dependencies: Vec<RetentionDependency>,
+}
+
 #[derive(Clone, Debug, Default)]
 pub(crate) struct RetentionSummaries {
     rows: FxHashMap<(LocalDefId, usize), RetentionVerdict>,
+    facts: FxHashMap<(LocalDefId, usize), RetentionBodyFacts>,
+    attested: bool,
+}
+
+fn location_label(location: Location) -> String {
+    format!(
+        "bb{}:s{}",
+        location.block.as_u32(),
+        location.statement_index
+    )
+}
+
+fn retention_step(
+    location: Location,
+    kind: RetentionEventKind,
+    detail: impl Into<String>,
+) -> RetentionStep {
+    RetentionStep {
+        location: location_label(location),
+        kind,
+        detail: detail.into(),
+    }
+}
+
+fn transparent_operand<'a, 'tcx>(rhs: &'a Rvalue<'tcx>) -> Option<&'a Operand<'tcx>> {
+    match rhs {
+        Rvalue::Use(operand) | Rvalue::Cast(_, operand, _) => Some(operand),
+        _ => None,
+    }
+}
+
+fn plain_operand_local(operand: &Operand<'_>) -> Option<Local> {
+    operand.place().and_then(|place| place.as_local())
+}
+
+fn collect_retention_facts<'tcx>(
+    program: &RustProgram<'tcx>,
+    function: LocalDefId,
+    argument_index: usize,
+    body: &Body<'tcx>,
+) -> RetentionBodyFacts {
+    let tcx = program.tcx;
+    let function_path = tcx.def_path_str(function.to_def_id());
+    let root = Local::from_usize(argument_index + 1);
+    let mut definitions = vec![0usize; body.local_decls.len()];
+    let mut aliases = Vec::<(Local, Local, RetentionStep)>::new();
+
+    for (block, data) in body.basic_blocks.iter_enumerated() {
+        for (statement_index, statement) in data.statements.iter().enumerate() {
+            let location = Location {
+                block,
+                statement_index,
+            };
+            let StatementKind::Assign(box (lhs, rhs)) = &statement.kind else {
+                continue;
+            };
+            if let Some(destination) = lhs.as_local() {
+                definitions[destination.index()] += 1;
+                if let Some(source) = transparent_operand(rhs).and_then(plain_operand_local)
+                    && matches!(body.local_decls[source].ty.kind(), TyKind::RawPtr(..))
+                    && matches!(body.local_decls[destination].ty.kind(), TyKind::RawPtr(..))
+                {
+                    aliases.push((
+                        source,
+                        destination,
+                        retention_step(
+                            location,
+                            RetentionEventKind::Transparent,
+                            format!("_{}->_{}", source.as_u32(), destination.as_u32()),
+                        ),
+                    ));
+                }
+            }
+        }
+    }
+
+    let mut reachable = BTreeSet::from([root.as_u32()]);
+    loop {
+        let before = reachable.len();
+        for (source, destination, _) in &aliases {
+            if reachable.contains(&source.as_u32()) {
+                reachable.insert(destination.as_u32());
+            }
+        }
+        if reachable.len() == before {
+            break;
+        }
+    }
+    let is_reachable = |local: Local| reachable.contains(&local.as_u32());
+
+    let mut facts = RetentionBodyFacts {
+        function,
+        function_path,
+        argument_index,
+        steps: aliases
+            .iter()
+            .filter(|(source, _, _)| is_reachable(*source))
+            .map(|(_, _, step)| step.clone())
+            .collect(),
+        retains: Vec::new(),
+        unknowns: BTreeMap::new(),
+        dependencies: Vec::new(),
+    };
+
+    for local in body.local_decls.indices() {
+        if local != root && is_reachable(local) && definitions[local.index()] > 1 {
+            facts
+                .unknowns
+                .entry(RetentionUnknownReason::MultiDef)
+                .or_default()
+                .push(RetentionStep {
+                    location: "body".to_owned(),
+                    kind: RetentionEventKind::MultiDef,
+                    detail: format!(
+                        "_{} has {} definitions",
+                        local.as_u32(),
+                        definitions[local.index()]
+                    ),
+                });
+        }
+    }
+
+    for (block, data) in body.basic_blocks.iter_enumerated() {
+        for (statement_index, statement) in data.statements.iter().enumerate() {
+            let location = Location {
+                block,
+                statement_index,
+            };
+            let StatementKind::Assign(box (lhs, rhs)) = &statement.kind else {
+                continue;
+            };
+            if is_reachable(lhs.local) && !lhs.projection.is_empty() {
+                facts.steps.push(retention_step(
+                    location,
+                    RetentionEventKind::DereferenceOnly,
+                    format!("access through _{}", lhs.local.as_u32()),
+                ));
+            }
+            let Some(source_place) = transparent_operand(rhs).and_then(Operand::place) else {
+                continue;
+            };
+            if is_reachable(source_place.local) && !source_place.projection.is_empty() {
+                facts.steps.push(retention_step(
+                    location,
+                    RetentionEventKind::DereferenceOnly,
+                    format!("read through _{}", source_place.local.as_u32()),
+                ));
+                continue;
+            }
+            let Some(source) = source_place.as_local().filter(|local| is_reachable(*local)) else {
+                continue;
+            };
+            if lhs.local == RETURN_PLACE && lhs.projection.is_empty() {
+                facts.retains.push(retention_step(
+                    location,
+                    RetentionEventKind::Return,
+                    format!("return _{}", source.as_u32()),
+                ));
+            } else if !lhs.projection.is_empty() {
+                let output_storage = lhs.local.as_usize() > 0
+                    && lhs.local.as_usize() <= body.arg_count
+                    && matches!(lhs.projection.first(), Some(ProjectionElem::Deref));
+                let (reason, kind) = if output_storage {
+                    (
+                        RetentionUnknownReason::OutputStorage,
+                        RetentionEventKind::OutputStorage,
+                    )
+                } else {
+                    (
+                        RetentionUnknownReason::FieldOrGlobalStore,
+                        RetentionEventKind::FieldOrGlobalStore,
+                    )
+                };
+                let step = retention_step(
+                    location,
+                    kind,
+                    format!("store _{} through _{}", source.as_u32(), lhs.local.as_u32()),
+                );
+                facts.retains.push(step.clone());
+                facts.unknowns.entry(reason).or_default().push(step);
+            }
+        }
+
+        let location = Location {
+            block,
+            statement_index: data.statements.len(),
+        };
+        let terminator = data.terminator();
+        let (func, args) = match &terminator.kind {
+            TerminatorKind::Call { func, args, .. }
+            | TerminatorKind::TailCall { func, args, .. } => (func, args),
+            _ => continue,
+        };
+        for (index, argument) in args.iter().enumerate() {
+            let Some(local) = argument.node.place().and_then(|place| place.as_local()) else {
+                continue;
+            };
+            if !is_reachable(local) {
+                continue;
+            }
+            let Some(callee) = operand_callee(func) else {
+                let step = retention_step(
+                    location,
+                    RetentionEventKind::UnknownCall,
+                    format!("fn-pointer argument {index}"),
+                );
+                facts
+                    .unknowns
+                    .entry(RetentionUnknownReason::FnPtrWeb)
+                    .or_default()
+                    .push(step.clone());
+                facts.steps.push(step);
+                continue;
+            };
+            if let Some(local_callee) = callee
+                .as_local()
+                .filter(|callee| program.functions.contains(callee))
+            {
+                let step = retention_step(
+                    location,
+                    RetentionEventKind::LocalCall,
+                    format!("{} arg{index}", tcx.def_path_str(callee)),
+                );
+                facts.dependencies.push(RetentionDependency {
+                    callee: local_callee,
+                    argument_index: index,
+                    step: step.clone(),
+                });
+                facts.steps.push(step);
+                continue;
+            }
+            let key = symbol_key(tcx, callee, &program.functions);
+            let sig = tcx.fn_sig(callee).skip_binder().skip_binder();
+            let source_ty = argument.node.ty(body, tcx);
+            let target = sig
+                .inputs()
+                .get(index)
+                .copied()
+                .and_then(raw_target_type)
+                .or_else(|| sig.c_variadic.then(|| raw_target_type(source_ty)).flatten());
+            let Some(target) = target else {
+                let step = retention_step(
+                    location,
+                    RetentionEventKind::UnknownCall,
+                    format!("{} arg{index} target-unresolved", key.symbol),
+                );
+                facts
+                    .unknowns
+                    .entry(RetentionUnknownReason::CalleeUnresolved)
+                    .or_default()
+                    .push(step.clone());
+                facts.steps.push(step);
+                continue;
+            };
+            match super::raw_boundary_contracts::classify_contract(&key, index, &target) {
+                Ok(contract) => {
+                    let (kind, detail) = match contract.ownership {
+                        super::raw_boundary_contracts::OwnershipContract::Consume => {
+                            (RetentionEventKind::Free, "consume")
+                        }
+                        _ => (RetentionEventKind::KnownNoRetainCall, "no-retain"),
+                    };
+                    facts.steps.push(retention_step(
+                        location,
+                        kind,
+                        format!("{} arg{index} {detail}", key.symbol),
+                    ));
+                }
+                Err(error) => {
+                    let step = retention_step(
+                        location,
+                        RetentionEventKind::UnknownCall,
+                        format!("{} arg{index} {error:?}", key.symbol),
+                    );
+                    facts
+                        .unknowns
+                        .entry(RetentionUnknownReason::OpenBoundary)
+                        .or_default()
+                        .push(step.clone());
+                    facts.steps.push(step);
+                }
+            }
+        }
+    }
+
+    facts.steps.sort();
+    facts.steps.dedup();
+    facts.retains.sort();
+    facts.retains.dedup();
+    for steps in facts.unknowns.values_mut() {
+        steps.sort();
+        steps.dedup();
+    }
+    facts.dependencies.sort_by_key(|dependency| {
+        (
+            dependency.callee.local_def_index.as_u32(),
+            dependency.argument_index,
+            dependency.step.clone(),
+        )
+    });
+    facts.dependencies.dedup();
+    facts
+}
+
+fn direct_verdict(facts: &RetentionBodyFacts, attested: bool) -> RetentionVerdict {
+    if !attested {
+        return RetentionVerdict::Unknown {
+            reason: RetentionUnknownReason::AttestationAbsent,
+            frontier: facts.steps.clone(),
+        };
+    }
+    if let Some(sink) = facts.retains.first().cloned() {
+        return RetentionVerdict::Retains {
+            sink: sink.clone(),
+            path: vec![sink],
+        };
+    }
+    if let Some((&reason, frontier)) = facts.unknowns.first_key_value() {
+        return RetentionVerdict::Unknown {
+            reason,
+            frontier: frontier.clone(),
+        };
+    }
+    RetentionVerdict::NoRetain {
+        certificate: RetentionCertificate {
+            function: facts.function_path.clone(),
+            argument_index: facts.argument_index,
+            steps: facts.steps.clone(),
+            attestation: "closed_world_frozen_graph",
+        },
+    }
+}
+
+fn evaluate_retention(
+    facts: &FxHashMap<(LocalDefId, usize), RetentionBodyFacts>,
+    attested: bool,
+) -> FxHashMap<(LocalDefId, usize), RetentionVerdict> {
+    let mut rows = facts
+        .iter()
+        .map(|(&key, facts)| (key, direct_verdict(facts, attested)))
+        .collect::<FxHashMap<_, _>>();
+    let mut keys = facts.keys().copied().collect::<Vec<_>>();
+    keys.sort_by_key(|(function, argument)| (function.local_def_index.as_u32(), *argument));
+    for _ in 0..=keys.len() {
+        let previous = rows.clone();
+        for key in &keys {
+            let fact = &facts[key];
+            let direct = direct_verdict(fact, attested);
+            let next = if matches!(direct, RetentionVerdict::Retains { .. }) {
+                direct
+            } else if let Some((dependency, sink)) =
+                fact.dependencies.iter().find_map(|dependency| {
+                    match previous.get(&(dependency.callee, dependency.argument_index)) {
+                        Some(RetentionVerdict::Retains { sink, .. }) => {
+                            Some((dependency, sink.clone()))
+                        }
+                        _ => None,
+                    }
+                })
+            {
+                RetentionVerdict::Retains {
+                    sink: sink.clone(),
+                    path: vec![dependency.step.clone(), sink],
+                }
+            } else if matches!(direct, RetentionVerdict::Unknown { .. }) {
+                direct
+            } else if let Some(dependency) = fact.dependencies.iter().find(|dependency| {
+                !matches!(
+                    previous.get(&(dependency.callee, dependency.argument_index)),
+                    Some(RetentionVerdict::NoRetain { .. })
+                )
+            }) {
+                RetentionVerdict::Unknown {
+                    reason: RetentionUnknownReason::LocalSummaryUnknown,
+                    frontier: vec![dependency.step.clone()],
+                }
+            } else {
+                direct
+            };
+            rows.insert(*key, next);
+        }
+        if rows == previous {
+            break;
+        }
+    }
+    rows
 }
 
 impl RetentionSummaries {
     pub(crate) fn derive(
         program: &RustProgram<'_>,
-        _origins: Option<&OriginSummaries>,
-        _attestation: Option<WholeProgramAttestation>,
+        origins: Option<&OriginSummaries>,
+        attestation: Option<WholeProgramAttestation>,
     ) -> Self {
-        let mut rows = FxHashMap::default();
+        let attested = attestation == Some(WholeProgramAttestation::FrozenBenchmarkGraph);
+        let mut facts = FxHashMap::default();
         for &function in &program.functions {
             let body = program
                 .tcx
                 .mir_drops_elaborated_and_const_checked(function)
                 .borrow();
             for argument_index in 0..body.arg_count {
-                let local = rustc_middle::mir::Local::from_usize(argument_index + 1);
+                let local = Local::from_usize(argument_index + 1);
                 if !matches!(body.local_decls[local].ty.kind(), TyKind::RawPtr(..)) {
                     continue;
                 }
-                rows.insert(
+                facts.insert(
                     (function, argument_index),
-                    RetentionVerdict::Unknown {
-                        reason: RetentionUnknownReason::AnalysisIncomplete,
-                        frontier: Vec::new(),
-                    },
+                    collect_retention_facts(program, function, argument_index, &body),
                 );
             }
         }
-        Self { rows }
+        let rows = if origins.is_none() {
+            facts
+                .keys()
+                .copied()
+                .map(|key| {
+                    (
+                        key,
+                        RetentionVerdict::Unknown {
+                            reason: RetentionUnknownReason::AnalysisIncomplete,
+                            frontier: Vec::new(),
+                        },
+                    )
+                })
+                .collect()
+        } else {
+            evaluate_retention(&facts, attested)
+        };
+        Self {
+            rows,
+            facts,
+            attested,
+        }
     }
 
     pub(crate) fn get(
@@ -486,10 +915,12 @@ impl RetentionSummaries {
         argument_index: usize,
         certificate: &RetentionCertificate,
     ) -> Result<(), &'static str> {
-        match self.get(function, argument_index) {
+        let replay = evaluate_retention(&self.facts, self.attested);
+        let sorted_unique = certificate.steps.windows(2).all(|pair| pair[0] < pair[1]);
+        match replay.get(&(function, argument_index)) {
             Some(RetentionVerdict::NoRetain {
                 certificate: expected,
-            }) if expected == certificate => Ok(()),
+            }) if expected == certificate && sorted_unique => Ok(()),
             _ => Err("retention-certificate-invalid"),
         }
     }
@@ -811,5 +1242,40 @@ mod tests {
             matches!(verdict, RetentionVerdict::Retains { .. }),
             "{verdict:#?}"
         );
+    }
+
+    #[test]
+    fn retention_unknown_reason_vocabulary_is_exact_and_exhaustive() {
+        assert_eq!(
+            RetentionUnknownReason::ALL.map(RetentionUnknownReason::key),
+            [
+                "retention-callee-unresolved",
+                "retention-fnptr-web",
+                "retention-open-boundary",
+                "retention-multi-def",
+                "retention-nontransparent-def",
+                "retention-projection-ambiguous",
+                "retention-output-storage",
+                "retention-field-or-global-store",
+                "retention-return",
+                "retention-local-summary-unknown",
+                "retention-attestation-absent",
+                "retention-analysis-incomplete",
+            ]
+        );
+    }
+
+    #[test]
+    fn local_no_retain_summary_propagates_to_its_caller() {
+        let (verdict, verification) = retention_of(
+            "unsafe fn leaf(p: *mut i32) { *p = 1; } unsafe fn wrapper(p: *mut i32) { leaf(p); }",
+            "wrapper",
+            Some(WholeProgramAttestation::FrozenBenchmarkGraph),
+        );
+        assert!(
+            matches!(verdict, RetentionVerdict::NoRetain { .. }),
+            "{verdict:#?}"
+        );
+        assert_eq!(verification, Ok(()));
     }
 }
