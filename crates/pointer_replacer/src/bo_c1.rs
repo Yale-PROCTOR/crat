@@ -39,7 +39,10 @@ use self::ownership_diagnostic_package::{
     AssumeSite, BoxDecisionEvidence, FunctionPrecisionRecord, NecessityEvidence,
     ProductionPrecisionEvidence,
 };
-use crate::{analyses::borrow_ownership::solver::CORE_LABEL_FAMILIES, utils::rustc::RustProgram};
+use crate::{
+    analyses::borrow_ownership::solver::CORE_LABEL_FAMILIES, box_census_schema as box_schema,
+    utils::rustc::RustProgram,
+};
 
 /// The established solve-time field emitted by the E1/Box census worker.
 /// Parent census gates consume this constant rather than borrowing the
@@ -4405,7 +4408,7 @@ mod run {
     use z3::{SatResult, ast::Bool};
 
     use super::{
-        E1_WORKER_SOLVE_SECONDS_KEY, collect_program, crown_projection,
+        E1_WORKER_SOLVE_SECONDS_KEY, box_schema, collect_program, crown_projection,
         ownership_diagnostic_package::{
             self, FunctionPrecisionRecord, NecessityEvidence, PairRemovalOutcome,
             ProductionPrecisionEvidence, RemovalFilter,
@@ -9222,7 +9225,7 @@ mod run {
         row.set("adapter_receipt_artifact", adapter_path.display());
         row.set("a5_receipt_artifact", a5_receipt_path.display());
         row.set("cache_receipt_artifact", cache_receipt_path.display());
-        row.set("box_drop_status", box_drop_status);
+        row.set(box_schema::DROP_STATUS, box_drop_status);
         row.set("box_drop_rows", box_drop_rows);
         row.set("box_drop_artifact", box_drop_receipt_path.display());
         row.set("status", "ok");
@@ -9599,10 +9602,10 @@ mod run {
             }
         };
         let mut row = Row::default();
-        row.set("box_code_frame", &code_frame);
-        row.set("box_launch_profile", &launch_profile);
-        row.set("box_resource_bound_configured_mib", &configured_memory);
-        row.set("box_resource_bound_effective_mib", &effective_memory);
+        row.set(box_schema::CODE_FRAME, &code_frame);
+        row.set(box_schema::LAUNCH_PROFILE, &launch_profile);
+        row.set(box_schema::RESOURCE_CONFIGURED_MIB, &configured_memory);
+        row.set(box_schema::RESOURCE_EFFECTIVE_MIB, &effective_memory);
         row.set(
             "build_profile",
             if cfg!(debug_assertions) {
@@ -9628,7 +9631,7 @@ mod run {
             .lines()
             .find_map(|line| line.strip_prefix("status="))
             .unwrap_or("missing");
-        row.set("box_drop_status", drop_status);
+        row.set(box_schema::DROP_STATUS, drop_status);
 
         let normalize = |text: &str| {
             let root = input
@@ -9782,10 +9785,13 @@ mod run {
             flexible_tail_held += usize::from(fields[6] == "box-flexible-tail-held");
             default_fill += fields[12].matches("default-fill-").count();
         }
-        row.set("box_rows", rows);
-        row.set("box_bridge_rows", artifact.bridges.lines().skip(1).count());
+        row.set(box_schema::ROWS, rows);
         row.set(
-            "box_bridge_resolved",
+            box_schema::BRIDGE_ROWS,
+            artifact.bridges.lines().skip(1).count(),
+        );
+        row.set(
+            box_schema::BRIDGE_RESOLVED,
             artifact
                 .bridges
                 .lines()
@@ -9794,7 +9800,7 @@ mod run {
                 .count(),
         );
         row.set(
-            "box_default_fill_candidates",
+            box_schema::DEFAULT_FILL_CANDIDATES,
             artifact
                 .default_fill_candidates
                 .lines()
@@ -9803,7 +9809,7 @@ mod run {
                 .count(),
         );
         row.set(
-            "box_flexible_tail_evidence_rows",
+            box_schema::FLEXIBLE_TAIL_EVIDENCE_ROWS,
             artifact
                 .default_fill_candidates
                 .lines()
@@ -9811,16 +9817,16 @@ mod run {
                 .filter(|line| line.split('\t').nth(3) == Some("held"))
                 .count(),
         );
-        row.set("box_planned", planned);
-        row.set("box_param_planned", params_planned);
-        row.set("box_depth2_rows", depth_two);
-        row.set("box_depth2_planned", depth_two_planned);
-        row.set("box_fabricated_extent", fabricated);
-        row.set("box_waiver_overwrite", waiver_overwrite);
-        row.set("box_waiver_scope_exit", waiver_scope);
-        row.set("box_waiver_unwind", waiver_unwind);
-        row.set("box_flexible_tail_held", flexible_tail_held);
-        row.set("box_default_fill", default_fill);
+        row.set(box_schema::PLANNED, planned);
+        row.set(box_schema::PARAM_PLANNED, params_planned);
+        row.set(box_schema::DEPTH2_ROWS, depth_two);
+        row.set(box_schema::DEPTH2_PLANNED, depth_two_planned);
+        row.set(box_schema::FABRICATED_EXTENT, fabricated);
+        row.set(box_schema::WAIVER_OVERWRITE, waiver_overwrite);
+        row.set(box_schema::WAIVER_SCOPE_EXIT, waiver_scope);
+        row.set(box_schema::WAIVER_UNWIND, waiver_unwind);
+        row.set(box_schema::FLEXIBLE_TAIL_HELD, flexible_tail_held);
+        row.set(box_schema::DEFAULT_FILL, default_fill);
         row.set(
             "a5_global_setup_wall_s",
             format!("{:.6}", artifact.a5_global_setup_wall_s),
@@ -9833,7 +9839,7 @@ mod run {
             "a5_receipt_render_wall_s",
             format!("{:.6}", artifact.a5_receipt_render_wall_s),
         );
-        row.set("box_receipt_wall_s", secs(started.elapsed()));
+        row.set(box_schema::RECEIPT_WALL_S, secs(started.elapsed()));
         row
     }
 
@@ -17205,6 +17211,37 @@ fn box_fact_two_root_determinism() {
     .expect("write two-root receipt");
 }
 
+fn box_census_total(rows: &[report::Row], key: &str) -> usize {
+    rows.iter()
+        .map(|row| {
+            row.get(key)
+                .unwrap_or_else(|| panic!("Box census row lacks {key}: {row:?}"))
+                .parse::<usize>()
+                .unwrap_or_else(|error| panic!("Box census {key}: {error}"))
+        })
+        .sum()
+}
+
+fn box_census_receipt(rows: &[report::Row]) -> String {
+    format!(
+        "status=complete\ndata=true\nprograms=20/20\ncache_hits=20/20\nsolver_seconds=0\n{}=57\n{}={}\n{}=0\n{}=4\n{}=0\n{}={}\n{}={}\n{}={}\n{}={}\n",
+        box_schema::ROWS,
+        box_schema::PLANNED,
+        box_census_total(rows, box_schema::PLANNED),
+        box_schema::PARAM_PLANNED,
+        box_schema::DEPTH2_ROWS,
+        box_schema::DEPTH2_PLANNED,
+        box_schema::FABRICATED_EXTENT,
+        box_census_total(rows, box_schema::FABRICATED_EXTENT),
+        box_schema::WAIVER_OVERWRITE,
+        box_census_total(rows, box_schema::WAIVER_OVERWRITE),
+        box_schema::WAIVER_SCOPE_EXIT,
+        box_census_total(rows, box_schema::WAIVER_SCOPE_EXIT),
+        box_schema::WAIVER_UNWIND,
+        box_census_total(rows, box_schema::WAIVER_UNWIND),
+    )
+}
+
 #[test]
 #[ignore = "Box wave-1: serialized cache-only 20-program emission census"]
 fn box_wave1_corpus_census() {
@@ -17247,23 +17284,23 @@ fn box_wave1_corpus_census() {
         row.set("peak_rss_kb", outcome.peak_rss_kb);
         assert_eq!(row.get("status"), Some("ok"), "{row:?}");
         assert_eq!(
-            row.get("box_code_frame"),
+            row.get(box_schema::CODE_FRAME),
             Some(code_frame.as_str()),
             "{row:?}"
         );
         assert_eq!(
-            row.get("box_launch_profile"),
+            row.get(box_schema::LAUNCH_PROFILE),
             Some(recipe.profile),
             "{row:?}"
         );
         let memory = recipe.memory_mib.to_string();
         assert_eq!(
-            row.get("box_resource_bound_configured_mib"),
+            row.get(box_schema::RESOURCE_CONFIGURED_MIB),
             Some(memory.as_str()),
             "{row:?}"
         );
         assert_eq!(
-            row.get("box_resource_bound_effective_mib"),
+            row.get(box_schema::RESOURCE_EFFECTIVE_MIB),
             Some(memory.as_str()),
             "{row:?}"
         );
@@ -17273,8 +17310,8 @@ fn box_wave1_corpus_census() {
             Some("0.000000"),
             "{row:?}"
         );
-        assert_eq!(row.get("box_param_planned"), Some("0"), "{row:?}");
-        assert_eq!(row.get("box_depth2_planned"), Some("0"), "{row:?}");
+        assert_eq!(row.get(box_schema::PARAM_PLANNED), Some("0"), "{row:?}");
+        assert_eq!(row.get(box_schema::DEPTH2_PLANNED), Some("0"), "{row:?}");
         eprintln!(
             "BOX-CENSUS program={} stage=complete rc=0 wall={:.3} rss={} digest={}",
             program.name,
@@ -17299,25 +17336,24 @@ fn box_wave1_corpus_census() {
         ));
         rows.push(row);
     }
-    let number = |row: &report::Row, key: &str| {
-        row.get(key)
-            .unwrap_or_else(|| panic!("Box census row lacks {key}: {row:?}"))
-            .parse::<usize>()
-            .unwrap_or_else(|error| panic!("Box census {key}: {error}"))
-    };
-    let total = |key: &str| rows.iter().map(|row| number(row, key)).sum::<usize>();
     assert_eq!(rows.len(), 20);
-    assert_eq!(total("box_rows"), 57);
-    assert_eq!(total("box_param_planned"), 0);
-    assert_eq!(total("box_depth2_rows"), 4);
-    assert_eq!(total("box_depth2_planned"), 0);
-    assert_eq!(total("box_default_fill_candidates"), 1);
-    assert_eq!(total("box_flexible_tail_evidence_rows"), 14);
-    assert_eq!(total("box_flexible_tail_held"), 14);
+    assert_eq!(box_census_total(&rows, box_schema::ROWS), 57);
+    assert_eq!(box_census_total(&rows, box_schema::PARAM_PLANNED), 0);
+    assert_eq!(box_census_total(&rows, box_schema::DEPTH2_ROWS), 4);
+    assert_eq!(box_census_total(&rows, box_schema::DEPTH2_PLANNED), 0);
     assert_eq!(
-        total("box_bridge_rows")
-            + total("box_default_fill_candidates")
-            + total("box_flexible_tail_evidence_rows"),
+        box_census_total(&rows, box_schema::DEFAULT_FILL_CANDIDATES),
+        1
+    );
+    assert_eq!(
+        box_census_total(&rows, box_schema::FLEXIBLE_TAIL_EVIDENCE_ROWS),
+        14
+    );
+    assert_eq!(box_census_total(&rows, box_schema::FLEXIBLE_TAIL_HELD), 14);
+    assert_eq!(
+        box_census_total(&rows, box_schema::BRIDGE_ROWS)
+            + box_census_total(&rows, box_schema::DEFAULT_FILL_CANDIDATES)
+            + box_census_total(&rows, box_schema::FLEXIBLE_TAIL_EVIDENCE_ROWS),
         38,
         "Box wave-2 population must reconcile 23 + 1 + 14",
     );
@@ -17403,15 +17439,7 @@ fn box_wave1_corpus_census() {
     fs::write(artifact_dir.join("box-census-results.kv"), summary).expect("write Box census rows");
     fs::write(
         artifact_dir.join("box-census-receipt.txt"),
-        format!(
-            "status=complete\ndata=true\nprograms=20/20\ncache_hits=20/20\nsolver_seconds=0\nbox_rows=57\nbox_planned={}\nbox_realized={}\nbox_param_planned=0\nbox_depth2_rows=4\nbox_depth2_planned=0\nbox_fabricated_extent={}\nbox_waiver_overwrite={}\nbox_waiver_scope_exit={}\nbox_waiver_unwind={}\n",
-            total("box_planned"),
-            total("subject_box_realized"),
-            total("box_fabricated_extent"),
-            total("box_waiver_overwrite"),
-            total("box_waiver_scope_exit"),
-            total("box_waiver_unwind"),
-        ),
+        box_census_receipt(&rows),
     )
     .expect("write Box census receipt");
 }
@@ -17756,6 +17784,70 @@ fn box_wave2_production_bridge_reads_no_docs_or_control_tsv() {
             "{name} reads the harness control"
         );
     }
+}
+
+#[test]
+fn box_census_schema_keys_are_single_source_compile_time_dependencies() {
+    use crate::box_census_schema as schema;
+
+    let keys = schema::ALL;
+    let unique = keys
+        .iter()
+        .copied()
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(
+        unique.len(),
+        keys.len(),
+        "Box census schema contains duplicate keys"
+    );
+
+    // The module-level identifiers are the compile-time coupling: renaming one
+    // without updating either worker or parent makes this test target fail to
+    // build. Raw spellings in bo_c1 would bypass that guarantee and are banned.
+    let source = include_str!("bo_c1.rs");
+    for key in keys {
+        assert_eq!(
+            source.matches(&format!("\"{key}\"")).count(),
+            0,
+            "Box census key {key:?} bypasses the shared schema module"
+        );
+    }
+}
+
+#[test]
+fn box_census_schema_renamed_identifier_is_a_compile_error() {
+    let schema = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/box_census_schema.rs");
+    let source = format!(
+        "#![allow(dead_code)]\n#[path = {:?}] mod schema;\nconst _: &str = schema::ROWS_RENAMED;\n",
+        schema
+    );
+    let result = ::utils::compilation::run_compiler_on_str(&source, |tcx| {
+        ::utils::type_check(tcx);
+    });
+    assert!(
+        result.is_err(),
+        "a consumer using a renamed schema identifier unexpectedly compiled"
+    );
+}
+
+#[test]
+fn box_census_receipt_consumes_only_the_raw_capture_schema() {
+    let mut row = report::Row::default();
+    for key in [
+        box_schema::PLANNED,
+        box_schema::FABRICATED_EXTENT,
+        box_schema::WAIVER_OVERWRITE,
+        box_schema::WAIVER_SCOPE_EXIT,
+        box_schema::WAIVER_UNWIND,
+    ] {
+        row.set(key, 0);
+    }
+    let receipt = box_census_receipt(&[row]);
+    assert!(receipt.contains("box_planned=0"), "{receipt}");
+    assert!(
+        !receipt.contains("subject_box_realized") && !receipt.contains("box_realized"),
+        "legacy realization keys survived: {receipt}"
+    );
 }
 
 /// **A panic is a failure; a resource deferral is an absence** (R8, 2026-08-15).
