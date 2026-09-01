@@ -7283,3 +7283,24 @@ fn rb_w5_optional_foreign_boundary_bridge_is_repeatable_and_compiles() {
     );
     assert!(!source.contains("unwrap"), "{source}");
 }
+
+/// RB-W9 — value observation is rewritten to raw views derived from the safe
+/// subjects; the observed addresses are sinks and never become provenance.
+#[test]
+fn rb_w9_value_observing_comparison_uses_safe_address_views() {
+    let src = "#![allow(dead_code, unused_unsafe)]\n\
+               extern \"C\" { fn observe(p: *const i32); }\n\
+               pub unsafe fn f(p: *const i32, q: *const i32) -> bool {\n\
+                   observe(p); observe(q); p == q\n\
+               }\n";
+    let super::RewriteOutcome::Emitted { source, .. } = super::rewrite_m1(src) else {
+        panic!("address-observation fixture must emit");
+    };
+    assert!(source.contains("p: &i32"), "{source}");
+    assert!(source.contains("q: &i32"), "{source}");
+    assert_eq!(source.matches("core::ptr::from_ref").count(), 2, "{source}");
+    assert!(
+        !source.contains(" as *const _ as usize as *const"),
+        "{source}"
+    );
+}
