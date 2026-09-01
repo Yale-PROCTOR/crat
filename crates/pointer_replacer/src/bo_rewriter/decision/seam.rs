@@ -611,6 +611,13 @@ pub(crate) enum NullArm {
     LiteralNone,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct RawBoundaryGlue {
+    pub template: super::raw_boundary::BridgeTemplate,
+    pub target_mutability: super::raw_boundary::RawMutability,
+    pub box_slice: bool,
+}
+
 /// One adapter, described rather than rendered.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct GlueSpec {
@@ -636,6 +643,9 @@ pub(crate) struct GlueSpec {
     /// The §29 boundary behavior. Separate from `optional`: a safe reference
     /// uses ordinary `Some`, while a raw expression must be checked.
     pub null_arm: NullArm,
+    /// Raw-boundary wave-1's explicit safe-to-raw form. Kept inside the seam
+    /// algebra so span and AST consumers share one carried template.
+    pub raw_boundary: Option<RawBoundaryGlue>,
 }
 
 impl GlueSpec {
@@ -647,6 +657,7 @@ impl GlueSpec {
             len: None,
             optional: false,
             null_arm: NullArm::None,
+            raw_boundary: None,
         }
     }
 
@@ -689,6 +700,27 @@ impl GlueSpec {
             len: None,
             optional: true,
             null_arm: NullArm::LiteralNone,
+            raw_boundary: None,
+        }
+    }
+
+    pub(crate) fn raw_boundary(
+        template: super::raw_boundary::BridgeTemplate,
+        target_mutability: super::raw_boundary::RawMutability,
+        box_slice: bool,
+    ) -> Self {
+        Self {
+            core: GlueCore::Bare,
+            mutable: target_mutability == super::raw_boundary::RawMutability::Mut,
+            unwrap: None,
+            len: None,
+            optional: false,
+            null_arm: NullArm::None,
+            raw_boundary: Some(RawBoundaryGlue {
+                template,
+                target_mutability,
+                box_slice,
+            }),
         }
     }
 
@@ -710,6 +742,9 @@ impl GlueSpec {
     }
 
     pub(crate) fn template_key(&self) -> &'static str {
+        if let Some(raw) = self.raw_boundary {
+            return raw.template.key();
+        }
         if self.optional {
             "optional"
         } else {
@@ -738,6 +773,9 @@ impl GlueSpec {
     /// the places it was NOT right are the measured movement rather than a
     /// change of vocabulary mixed in with it.
     pub(crate) fn shape_key(&self) -> &'static str {
+        if self.raw_boundary.is_some() {
+            return "raw-boundary";
+        }
         match self.null_arm {
             NullArm::LiteralNone => return "none",
             NullArm::Checked => {
@@ -803,6 +841,17 @@ impl GlueSpec {
     /// first — so this is fail-closed structure rather than a live path, and it
     /// moves no corpus line.
     pub(crate) fn render(&self, text: &str) -> Option<String> {
+        if let Some(raw) = self.raw_boundary {
+            return match raw
+                .template
+                .render(text, raw.target_mutability, raw.box_slice)
+                .ok()?
+            {
+                super::raw_boundary::BridgeRender::ZeroSyntax => Some(text.to_owned()),
+                super::raw_boundary::BridgeRender::Edit(replacement) => Some(replacement),
+                super::raw_boundary::BridgeRender::Lifecycle => Some(text.to_owned()),
+            };
+        }
         if self.null_arm == NullArm::LiteralNone {
             return Some("None".to_owned());
         }
@@ -2122,6 +2171,8 @@ pub(crate) struct SeamPlan {
     /// is a prioritization overlay. A pair appearing here is not an error; it is
     /// the overlay being incomplete, which is expected and must be visible.
     pub uncensused: Vec<(Form, Form)>,
+    /// Raw-boundary T1/T2/blocked receipts, including zero-syntax sites.
+    pub raw_boundary_receipts: String,
 }
 
 /// The form a decision emits.
@@ -2212,6 +2263,26 @@ pub(crate) fn synthesize(
     table: &DecisionTable,
     c9_marks: &[crate::analyses::borrow_ownership::a5_producer::PlannedC9Mark],
     a5_site_proofs: &A5SeamProofIndex,
+) -> SeamPlan {
+    synthesize_with_raw_boundary(
+        tcx,
+        facts,
+        subjects,
+        table,
+        c9_marks,
+        a5_site_proofs,
+        &super::raw_boundary::RawBoundaryDispositionIndex::default(),
+    )
+}
+
+pub(crate) fn synthesize_with_raw_boundary(
+    tcx: TyCtxt<'_>,
+    facts: &super::emitability::EmitabilityFacts,
+    subjects: &[Subject],
+    table: &DecisionTable,
+    c9_marks: &[crate::analyses::borrow_ownership::a5_producer::PlannedC9Mark],
+    a5_site_proofs: &A5SeamProofIndex,
+    raw_boundary: &super::raw_boundary::RawBoundaryDispositionIndex,
 ) -> SeamPlan {
     let sm = tcx.sess.source_map();
     let mut plan = SeamPlan::default();
@@ -2645,6 +2716,52 @@ pub(crate) fn synthesize(
                 }
             }
         }
+    }
+
+    // Raw-boundary wave 1 — explicit safe-to-raw sites. Zero-syntax and
+    // lifecycle templates remain in the receipt but produce no edit.
+    plan.raw_boundary_receipts = raw_boundary.receipts_tsv();
+    for (key, disposition, site) in raw_boundary.emission_sites() {
+        let Some(template) = disposition.template() else {
+            continue;
+        };
+        let Ok(argument) = sm.span_to_snippet(site.span) else {
+            continue;
+        };
+        let spec = GlueSpec::raw_boundary(template, site.target.mutability, site.box_slice);
+        let Some(replacement) = spec.render(&argument) else {
+            continue;
+        };
+        match template.render(&argument, site.target.mutability, site.box_slice) {
+            Ok(super::raw_boundary::BridgeRender::Edit(_)) => {}
+            Ok(
+                super::raw_boundary::BridgeRender::ZeroSyntax
+                | super::raw_boundary::BridgeRender::Lifecycle,
+            ) => continue,
+            Err(_) => continue,
+        }
+        let found = site
+            .node
+            .and_then(|node| decision_of.get(&node).copied())
+            .map_or(Form::Raw, form_of);
+        plan.edits.push(SeamEdit {
+            span: site.span,
+            replacement,
+            owner_fn: key.caller.clone(),
+            lifetime_plan_digest: None,
+            caller_fn: key.caller.clone(),
+            param_index: key.argument_index,
+            source_shape: site.source_shape,
+            family: SeamFamily::Safe,
+            len_arm: None,
+            spec,
+            arg_span: site.span,
+            expected: Form::Raw,
+            found,
+            root_identity: key.subject.clone(),
+            blind: false,
+            overlap: None,
+        });
     }
 
     // Item E wave 2 — scalar-reference body adapters. The allowlist lives in

@@ -7247,3 +7247,39 @@ fn rb_w4_confirmed_t2_unknown_foreign_boundary_emits_zero_syntax() {
         "zero-syntax coercion must stay exact: {source}"
     );
 }
+
+/// RB-W5 — the explicit optional bridge borrows the Option at each call. Two
+/// calls make move-on-first-use visible; the emitted source must contain no
+/// unchecked unwrap.
+#[test]
+fn rb_w5_optional_foreign_boundary_bridge_is_repeatable_and_compiles() {
+    let src = "#![allow(dead_code, unused_unsafe)]\n\
+               extern \"C\" { fn opaque(p: *mut i32); }\n\
+               pub unsafe fn f(mut p: *mut i32) {\n\
+                   if !p.is_null() { opaque(p); opaque(p); }\n\
+               }\n";
+    let decisions = decisions_of(src);
+    assert_eq!(
+        reason_of(&decisions, "p", true),
+        "<emitted>",
+        "decision did not reach the optional bridge: {decisions:#?}"
+    );
+    let super::RewriteOutcome::Emitted {
+        source,
+        degradations,
+        ..
+    } = super::rewrite_m1(src)
+    else {
+        panic!("optional T2 fixture must emit");
+    };
+    assert!(
+        source.contains("p: Option<&mut i32>"),
+        "degradations={degradations:#?}\n{source}"
+    );
+    assert_eq!(
+        source.matches("p.as_deref_mut().map_or").count(),
+        2,
+        "{source}"
+    );
+    assert!(!source.contains("unwrap"), "{source}");
+}

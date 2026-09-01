@@ -3408,12 +3408,14 @@ fn finish_decide<'tcx>(
         .filter(|s| fat.is_array(s.fn_did, s.local))
         .map(|s| (s.fn_did, s.hir_id))
         .collect();
+    let raw_boundary_argument_paths = facts.raw_boundary_argument_paths();
     let opt_uses = decision::emitability::collect_opt_uses(
         tcx,
         &program.functions,
         &names,
         &opt_accessors,
         &opt_fat,
+        &raw_boundary_argument_paths,
     );
     let ctx_of = |gate, coconv, lifetime_eligibility| decision::Ctx {
         tcx,
@@ -3538,13 +3540,14 @@ fn finish_decide<'tcx>(
         analysis.attestation,
     );
     let seam_wall_s = seam_started.elapsed().as_secs_f64();
-    table.seams = decision::seam::synthesize(
+    table.seams = decision::seam::synthesize_with_raw_boundary(
         tcx,
         &facts,
         &subjects,
         &table,
         &retained_c9_plans,
         &a5_site_proofs,
+        &raw_boundary,
     );
     retained_c9_plans.retain(|mark| {
         let params = mark.key.pair.params();

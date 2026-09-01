@@ -971,11 +971,42 @@ impl BridgeTemplate {
 
     pub(crate) fn render(
         self,
-        _argument: &str,
-        _target_mutability: RawMutability,
-        _box_slice: bool,
+        argument: &str,
+        target_mutability: RawMutability,
+        box_slice: bool,
     ) -> Result<BridgeRender, RawBoundaryBlockReason> {
-        Err(RawBoundaryBlockReason::TemplateUnavailable)
+        match self {
+            Self::RefMutToRawMut | Self::RefMutToRawConst | Self::RefSharedToRawConst => {
+                Ok(BridgeRender::ZeroSyntax)
+            }
+            Self::SliceMutToRawMut => Ok(BridgeRender::Edit(format!("{argument}.as_mut_ptr()"))),
+            Self::SliceToRawConst => Ok(BridgeRender::Edit(format!("{argument}.as_ptr()"))),
+            Self::OptRefMutToRawMut => Ok(BridgeRender::Edit(format!(
+                "{argument}.as_deref_mut().map_or(core::ptr::null_mut(), core::ptr::from_mut)"
+            ))),
+            Self::OptRefToRawConst => Ok(BridgeRender::Edit(format!(
+                "{argument}.as_deref().map_or(core::ptr::null(), core::ptr::from_ref)"
+            ))),
+            Self::OptSliceToRaw => Ok(BridgeRender::Edit(match target_mutability {
+                RawMutability::Mut => format!(
+                    "{argument}.as_deref_mut().map_or(core::ptr::null_mut(), |slice| slice.as_mut_ptr())"
+                ),
+                RawMutability::Const => format!(
+                    "{argument}.as_deref().map_or(core::ptr::null(), |slice| slice.as_ptr())"
+                ),
+            })),
+            Self::BoxBorrowViewToRaw if box_slice => {
+                Ok(BridgeRender::Edit(match target_mutability {
+                    RawMutability::Mut => format!("{argument}.as_mut_ptr()"),
+                    RawMutability::Const => format!("{argument}.as_ptr()"),
+                }))
+            }
+            Self::BoxBorrowViewToRaw => Ok(BridgeRender::Edit(match target_mutability {
+                RawMutability::Mut => format!("core::ptr::from_mut({argument}.as_mut())"),
+                RawMutability::Const => format!("core::ptr::from_ref({argument}.as_ref())"),
+            })),
+            Self::KnownFreeDrop => Ok(BridgeRender::Lifecycle),
+        }
     }
 }
 
@@ -1030,6 +1061,16 @@ pub(crate) enum RawBoundaryDisposition {
         reason: RawBoundaryBlockReason,
         detail: String,
     },
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct RawBoundaryRenderSite {
+    pub span: Span,
+    pub target: RawTargetType,
+    pub box_slice: bool,
+    pub source_shape: &'static str,
+    pub node: Option<(LocalDefId, HirId)>,
+    pub target_stays_raw: bool,
 }
 
 impl RawBoundaryDisposition {
@@ -1110,6 +1151,7 @@ fn template_for(
 #[derive(Clone, Debug, Default)]
 pub(crate) struct RawBoundaryDispositionIndex {
     by_site: BTreeMap<RawBoundarySiteKey, RawBoundaryDisposition>,
+    render_sites: BTreeMap<RawBoundarySiteKey, RawBoundaryRenderSite>,
     site_lookup: Vec<((LocalDefId, HirId), Span, usize, RawBoundarySiteKey)>,
     open_nodes: FxHashSet<(LocalDefId, HirId)>,
     blocked_nodes: FxHashMap<(LocalDefId, HirId), RawBoundaryBlockReason>,
@@ -1231,6 +1273,40 @@ impl RawBoundaryDispositionIndex {
             let disposition = disposition.unwrap_or_else(|(reason, detail)| {
                 RawBoundaryDisposition::Blocked { reason, detail }
             });
+            let box_slice = site
+                .node
+                .and_then(|node| decisions.get(&node).copied())
+                .is_some_and(|decision| {
+                    matches!(
+                        decision,
+                        super::Decision::Box(plan)
+                            if plan.shape == super::box_facts::BoxShape::Slice
+                    )
+                });
+            let target_stays_raw = site.callee_local.is_none_or(|callee| {
+                hypothetical
+                    .entries
+                    .iter()
+                    .find_map(|(subject, decision)| {
+                        let super::SubjectKind::Param { hir_index } = subject.kind else {
+                            return None;
+                        };
+                        (subject.fn_did == callee && hir_index == site.key.argument_index)
+                            .then_some(matches!(decision, super::Decision::Degraded(_)))
+                    })
+                    .unwrap_or(true)
+            });
+            out.render_sites.insert(
+                site.key.clone(),
+                RawBoundaryRenderSite {
+                    span: site.source_span,
+                    target: site.target.clone(),
+                    box_slice,
+                    source_shape: site.source_shape,
+                    node: site.node,
+                    target_stays_raw,
+                },
+            );
             if let Some(node) = site.node {
                 nodes.entry(node).or_default().push(disposition.is_open());
                 out.site_lookup.push((
@@ -1281,6 +1357,66 @@ impl RawBoundaryDispositionIndex {
 
     pub(crate) fn disposition(&self, key: &RawBoundarySiteKey) -> Option<&RawBoundaryDisposition> {
         self.by_site.get(key)
+    }
+
+    pub(crate) fn emission_sites(
+        &self,
+    ) -> impl Iterator<
+        Item = (
+            &RawBoundarySiteKey,
+            &RawBoundaryDisposition,
+            &RawBoundaryRenderSite,
+        ),
+    > {
+        self.by_site.iter().filter_map(|(key, disposition)| {
+            self.render_sites
+                .get(key)
+                .filter(|site| site.target_stays_raw)
+                .map(|site| (key, disposition, site))
+        })
+    }
+
+    pub(crate) fn receipts_tsv(&self) -> String {
+        let mut out = String::from(
+            "caller\tblock\tstatement_index\tcallee\targument_index\tsubject\ttier\ttemplate\twaiver_id\tevidence\treason\tdetail\n",
+        );
+        for (key, disposition) in &self.by_site {
+            let (template, waiver, evidence, reason, detail) = match disposition {
+                RawBoundaryDisposition::T1 { template, evidence } => {
+                    (template.key(), "-", evidence.as_str(), "-", "-")
+                }
+                RawBoundaryDisposition::T2 {
+                    template,
+                    reason,
+                    waiver_id,
+                } => (
+                    template.key(),
+                    *waiver_id,
+                    "retention-unknown",
+                    reason.key(),
+                    "-",
+                ),
+                RawBoundaryDisposition::Blocked { reason, detail } => {
+                    ("-", "-", "-", reason.key(), detail.as_str())
+                }
+            };
+            out.push_str(&format!(
+                "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+                key.caller,
+                key.block,
+                key.statement_index,
+                key.callee.path,
+                key.argument_index,
+                key.subject,
+                disposition.tier(),
+                template,
+                waiver,
+                evidence,
+                reason,
+                detail,
+            ));
+        }
+        out
     }
 
     pub(crate) fn opens_node(&self, node: (LocalDefId, HirId)) -> bool {
@@ -1691,7 +1827,7 @@ mod tests {
         let BridgeRender::Edit(text) = rendered else {
             panic!("expected edit, got {rendered:?}");
         };
-        assert_eq!(text.matches('p').count(), 1, "{text}");
+        assert_eq!(text.matches("p.").count(), 1, "{text}");
         assert!(text.contains("as_deref_mut"), "{text}");
         assert!(!text.contains("unwrap"), "{text}");
     }

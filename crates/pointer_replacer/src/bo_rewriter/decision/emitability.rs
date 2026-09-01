@@ -679,6 +679,39 @@ impl EmitabilityFacts {
     pub(crate) fn site(tcx: TyCtxt<'_>, span: Span) -> String {
         tcx.sess.source_map().span_to_diagnostic_string(span)
     }
+
+    pub(crate) fn raw_boundary_argument_paths(
+        &self,
+    ) -> rustc_hash::FxHashSet<(LocalDefId, HirId, u32, u32)> {
+        let mut out = rustc_hash::FxHashSet::default();
+        for fact in &self.foreign_call_args {
+            if let Some(root) = fact.root {
+                out.insert((
+                    fact.caller,
+                    root,
+                    fact.argument_span.lo().0,
+                    fact.argument_span.hi().0,
+                ));
+            }
+        }
+        for calls in self.call_args.values() {
+            for call in calls {
+                for argument in &call.args {
+                    if argument.target.is_some()
+                        && let Some(root) = argument.shape.place_root()
+                    {
+                        out.insert((
+                            call.caller,
+                            root,
+                            argument.span.lo().0,
+                            argument.span.hi().0,
+                        ));
+                    }
+                }
+            }
+        }
+        out
+    }
 }
 
 /// The arithmetic ops a borrowed-slice form can absorb.
@@ -916,6 +949,7 @@ pub(crate) fn collect_opt_uses(
     name_of: &FxHashMap<(LocalDefId, HirId), String>,
     accessor_of: &FxHashMap<(LocalDefId, HirId), Accessor>,
     fat: &rustc_hash::FxHashSet<(LocalDefId, HirId)>,
+    raw_boundary_arguments: &rustc_hash::FxHashSet<(LocalDefId, HirId, u32, u32)>,
 ) -> FxHashMap<(LocalDefId, HirId), OptUses> {
     struct V<'a, 'tcx> {
         tcx: TyCtxt<'tcx>,
@@ -924,6 +958,7 @@ pub(crate) fn collect_opt_uses(
         name_of: &'a FxHashMap<(LocalDefId, HirId), String>,
         accessor_of: &'a FxHashMap<(LocalDefId, HirId), Accessor>,
         fat: &'a rustc_hash::FxHashSet<(LocalDefId, HirId)>,
+        raw_boundary_arguments: &'a rustc_hash::FxHashSet<(LocalDefId, HirId, u32, u32)>,
     }
     impl<'tcx> Visitor<'tcx> for V<'_, 'tcx> {
         fn visit_expr(&mut self, expr: &'tcx Expr<'tcx>) {
@@ -932,6 +967,16 @@ pub(crate) fn collect_opt_uses(
                 && self.name_of.contains_key(&(self.fn_did, hir_id))
             {
                 let key = (self.fn_did, hir_id);
+                if self.raw_boundary_arguments.contains(&(
+                    self.fn_did,
+                    hir_id,
+                    expr.span.lo().0,
+                    expr.span.hi().0,
+                )) {
+                    self.out.entry(key).or_default().non_test_uses += 1;
+                    intravisit::walk_expr(self, expr);
+                    return;
+                }
                 let classified = self.classify(expr, key);
                 let entry = self.out.entry(key).or_default();
                 match classified {
@@ -1048,6 +1093,7 @@ pub(crate) fn collect_opt_uses(
             name_of,
             accessor_of,
             fat,
+            raw_boundary_arguments,
         };
         v.visit_body(tcx.hir_body(body_id));
     }

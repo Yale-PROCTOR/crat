@@ -1305,6 +1305,45 @@ fn checked_optional(
     (replace.arg_hits == 1 && replace.payload_hits == 1).then_some(parsed.kind)
 }
 
+fn raw_boundary_expr(
+    argument: rustc_ast::Expr,
+    raw: super::decision::seam::RawBoundaryGlue,
+) -> Option<rustc_ast::ExprKind> {
+    const ARG: &str = "__CRAT_RAW_BOUNDARY_ARG";
+    let rendered = match raw
+        .template
+        .render(ARG, raw.target_mutability, raw.box_slice)
+        .ok()?
+    {
+        super::decision::raw_boundary::BridgeRender::Edit(rendered) => rendered,
+        super::decision::raw_boundary::BridgeRender::ZeroSyntax
+        | super::decision::raw_boundary::BridgeRender::Lifecycle => return None,
+    };
+    let mut parsed = graft_expr(&rendered).ok()?;
+    struct Replace {
+        argument: rustc_ast::Expr,
+        hits: usize,
+    }
+    impl MutVisitor for Replace {
+        fn visit_expr(&mut self, expr: &mut rustc_ast::Expr) {
+            if matches!(
+                &expr.kind,
+                rustc_ast::ExprKind::Path(None, path)
+                    if path.segments.len() == 1
+                        && path.segments[0].ident.name == Symbol::intern(ARG)
+            ) {
+                *expr = self.argument.clone();
+                self.hits += 1;
+                return;
+            }
+            rustc_ast::mut_visit::walk_expr(self, expr);
+        }
+    }
+    let mut replace = Replace { argument, hits: 0 };
+    replace.visit_expr(&mut parsed);
+    (replace.hits == 1).then_some(parsed.kind)
+}
+
 /// **ARM 3 — the seam pass.** The THIRD span-keyed walk over one crate, and the
 /// first whose targets share a syntactic category with another pass's.
 ///
@@ -1405,6 +1444,18 @@ impl<'a> SeamGraftVisitor<'a> {
     fn build(&mut self, e: &rustc_ast::Expr, target: &SeamTarget) -> Option<rustc_ast::ExprKind> {
         use super::decision::seam::{GlueCore, NullArm};
         let spec = &target.spec;
+        if let Some(raw) = spec.raw_boundary {
+            return raw_boundary_expr(
+                rustc_ast::Expr {
+                    id: DUMMY_NODE_ID,
+                    kind: e.kind.clone(),
+                    span: e.span,
+                    attrs: Default::default(),
+                    tokens: None,
+                },
+                raw,
+            );
+        }
         if spec.null_arm == NullArm::LiteralNone {
             return graft_expr("None").ok().map(|parsed| parsed.kind);
         }
