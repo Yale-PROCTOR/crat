@@ -48,33 +48,59 @@ const E1_WORKER_SOLVE_SECONDS_KEY: &str = "t_solve_s";
 const BOC1_EFFECTIVE_MEMORY_MIB_ENV: &str = "CRAT_BOC1_EFFECTIVE_MEM_MB";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct E2FnCensusLaunchRecipe {
+struct StandingCensusLaunchRecipe {
     profile: &'static str,
     memory_mib: u64,
     timeout_secs: u64,
     attestation: &'static str,
 }
 
-impl E2FnCensusLaunchRecipe {
+impl StandingCensusLaunchRecipe {
+    fn common_child_env(self, cache_dir: &std::path::Path) -> Vec<(&'static str, String)> {
+        vec![
+            ("CRAT_BO_CACHE", "1".to_owned()),
+            ("CRAT_BO_CACHE_DIR", cache_dir.display().to_string()),
+            ("CRAT_BO_A5_ATTESTATION", self.attestation.to_owned()),
+            ("CRAT_BOC1_MEM_MB", self.memory_mib.to_string()),
+        ]
+    }
+
     fn child_env(
         self,
         cache_dir: &std::path::Path,
         artifact_dir: &std::path::Path,
         code_frame: &str,
     ) -> Vec<(&'static str, String)> {
-        vec![
-            ("CRAT_BO_CACHE", "1".to_owned()),
-            ("CRAT_BO_CACHE_DIR", cache_dir.display().to_string()),
-            ("CRAT_BO_A5_ATTESTATION", self.attestation.to_owned()),
+        let mut env = self.common_child_env(cache_dir);
+        env.extend([
             ("CRAT_E2_ARTIFACT_DIR", artifact_dir.display().to_string()),
             ("CRAT_E2_CODE_FRAME", code_frame.to_owned()),
             ("CRAT_E2_CARGO_PROFILE", self.profile.to_owned()),
-            ("CRAT_BOC1_MEM_MB", self.memory_mib.to_string()),
-        ]
+        ]);
+        env
+    }
+
+    fn box_child_env(
+        self,
+        cache_dir: &std::path::Path,
+        artifact_dir: &std::path::Path,
+        code_frame: &str,
+    ) -> Vec<(&'static str, String)> {
+        let mut env = self.common_child_env(cache_dir);
+        env.extend([
+            ("CRAT_E1_ARTIFACT_DIR", artifact_dir.display().to_string()),
+            (
+                "CRAT_BOX_CENSUS_ARTIFACT_DIR",
+                artifact_dir.display().to_string(),
+            ),
+            ("CRAT_BOX_CODE_FRAME", code_frame.to_owned()),
+            ("CRAT_BOX_CARGO_PROFILE", self.profile.to_owned()),
+        ]);
+        env
     }
 }
 
-const E2_FN_CENSUS_LAUNCH_RECIPE: E2FnCensusLaunchRecipe = E2FnCensusLaunchRecipe {
+const STANDING_CENSUS_LAUNCH_RECIPE: StandingCensusLaunchRecipe = StandingCensusLaunchRecipe {
     profile: "release",
     memory_mib: 49_152,
     timeout_secs: 14_400,
@@ -86,11 +112,11 @@ fn e2_resource_bound_non_citable_reason(
     effective_mib: Option<&str>,
 ) -> Option<&'static str> {
     let effective_mib = effective_mib.and_then(|value| value.parse::<u64>().ok());
-    if effective_mib.is_none_or(|value| value < E2_FN_CENSUS_LAUNCH_RECIPE.memory_mib) {
+    if effective_mib.is_none_or(|value| value < STANDING_CENSUS_LAUNCH_RECIPE.memory_mib) {
         return Some("insufficient-memory-bound");
     }
     let configured_mib = configured_mib.and_then(|value| value.parse::<u64>().ok());
-    if configured_mib != Some(E2_FN_CENSUS_LAUNCH_RECIPE.memory_mib) {
+    if configured_mib != Some(STANDING_CENSUS_LAUNCH_RECIPE.memory_mib) {
         return Some("configured-memory-bound-mismatch");
     }
     None
@@ -9545,15 +9571,151 @@ mod run {
     }
 
     pub fn run_box_census(input: &std::path::Path) -> Row {
-        let mut row = run_e1_revert_census(input);
-        if row.get("status") != Some("ok") {
-            return row;
-        }
-        if row.get("box_drop_status") != Some("ok") {
-            row.set("status", "box-drop-postcheck-error");
-            return row;
-        }
+        let code_frame = std::env::var("CRAT_BOX_CODE_FRAME")
+            .unwrap_or_else(|_| "missing-code-frame".to_owned());
+        let launch_profile = std::env::var("CRAT_BOX_CARGO_PROFILE")
+            .unwrap_or_else(|_| "missing-profile".to_owned());
+        let configured_memory =
+            std::env::var("CRAT_BOC1_MEM_MB").unwrap_or_else(|_| "missing".to_owned());
+        let effective_memory = std::env::var(super::BOC1_EFFECTIVE_MEMORY_MIB_ENV)
+            .unwrap_or_else(|_| "missing".to_owned());
         let started = Instant::now();
+        let name = std::env::var("CRAT_BOC1_NAME").unwrap_or_else(|_| "unnamed".to_owned());
+        let directory = std::env::var_os("CRAT_BOX_CENSUS_ARTIFACT_DIR")
+            .map(std::path::PathBuf::from)
+            .expect("Box census requires CRAT_BOX_CENSUS_ARTIFACT_DIR");
+        std::fs::create_dir_all(&directory).expect("create Box census artifact directory");
+        // Box's single-iteration diagnostic workflow consumes the raw capture,
+        // not E1's degraded-mass aggregation. The latter requires every
+        // diagnostic to map to a placed subject; compiler failures are DATA in
+        // this census, including an unattributed row.
+        let capture = match crate::bo_rewriter::diagnose_e1_once(input) {
+            Ok(capture) => capture,
+            Err(error) => {
+                let mut row = Row::default();
+                row.set("status", "box-diagnostic-instrument-error");
+                row.set("box_detail", super::report::sanitize(&error));
+                return row;
+            }
+        };
+        let mut row = Row::default();
+        row.set("box_code_frame", &code_frame);
+        row.set("box_launch_profile", &launch_profile);
+        row.set("box_resource_bound_configured_mib", &configured_memory);
+        row.set("box_resource_bound_effective_mib", &effective_memory);
+        row.set(
+            "build_profile",
+            if cfg!(debug_assertions) {
+                "debug"
+            } else {
+                "release"
+            },
+        );
+        row.set("debug_assertions", u8::from(cfg!(debug_assertions)));
+        row.set("compiler_diagnostics", capture.reverts.len());
+        row.set("compiler_errors", capture.novel_error_count);
+        row.set("attempted_placements", capture.attempted_placements);
+        row.set("files_touched", capture.files_touched);
+        row.set("unplaceable", capture.unplaceable);
+        let solve = &capture.solve_receipt;
+        row.set("source", &solve.source);
+        row.set("cache_status", &solve.cache_status);
+        row.set("fingerprint", &solve.fingerprint);
+        row.set("model_sha256", &solve.model_sha256);
+        row.set(E1_WORKER_SOLVE_SECONDS_KEY, &solve.solve_wall_s);
+        let drop_status = capture
+            .box_drop_receipt
+            .lines()
+            .find_map(|line| line.strip_prefix("status="))
+            .unwrap_or("missing");
+        row.set("box_drop_status", drop_status);
+
+        let normalize = |text: &str| {
+            let root = input
+                .parent()
+                .map(|path| path.display().to_string())
+                .unwrap_or_default();
+            if root.is_empty() {
+                text.to_owned()
+            } else {
+                text.replace(&root, "<program>")
+            }
+        };
+        let mut diagnostics =
+            String::from("function\terror_code\tmessage_head\tfile\tline\tattribution\n");
+        for diagnostic in &capture.reverts {
+            diagnostics.push_str(&format!(
+                "{}\t{}\t{}\t{}\t{}\t{}\n",
+                tsv_field(&diagnostic.function, 300),
+                e1_code(diagnostic.diagnostic.code.as_deref()),
+                tsv_field(&diagnostic.diagnostic.message, 300),
+                tsv_field(
+                    &crate::bo_rewriter::verify::crate_relative(
+                        &diagnostic.diagnostic.file,
+                        &capture.observed_root,
+                    ),
+                    400,
+                ),
+                diagnostic.diagnostic.line,
+                diagnostic.attribution,
+            ));
+        }
+        std::fs::write(
+            directory.join(format!("{name}.compiler-diagnostics.tsv")),
+            diagnostics,
+        )
+        .expect("write Box compiler diagnostics");
+        std::fs::write(
+            directory.join(format!("{name}.subject-seed.tsv")),
+            normalize(&capture.subject_receipt),
+        )
+        .expect("write Box subject seed");
+        std::fs::write(
+            directory.join(format!("{name}.a5-receipt.txt")),
+            &capture.a5_receipt,
+        )
+        .expect("write Box A5 receipt");
+        std::fs::write(
+            directory.join(format!("{name}.box-drops.tsv")),
+            normalize(&capture.box_drop_receipt),
+        )
+        .expect("write Box drop receipt");
+        std::fs::write(
+            directory.join(format!("{name}.cache-receipt.tsv")),
+            format!(
+                "source\tcache_status\tfingerprint\tmodel_sha256\tcache_entry\tsolve_wall_s\n{}\t{}\t{}\t{}\t{}\t{}\n",
+                solve.source,
+                solve.cache_status,
+                solve.fingerprint,
+                solve.model_sha256,
+                solve.cache_entry.as_deref().unwrap_or("none"),
+                solve.solve_wall_s,
+            ),
+        )
+        .expect("write Box cache receipt");
+
+        let resource_ok = super::e2_resource_bound_non_citable_reason(
+            Some(&configured_memory),
+            Some(&effective_memory),
+        )
+        .is_none();
+        let profile_ok = launch_profile == "release" && !cfg!(debug_assertions);
+        let cache_ok = solve.source == "cache"
+            && solve.cache_status == "hit"
+            && solve.solve_wall_s == "0.000000";
+        row.set(
+            "status",
+            if !resource_ok {
+                "non-citable-resource-bound"
+            } else if !profile_ok {
+                "debug-build-profile"
+            } else if !cache_ok {
+                "cache-gate-failed"
+            } else {
+                "ok"
+            },
+        );
+
         let artifact = match ::utils::compilation::run_compiler_on_path(input, |tcx| {
             crate::bo_rewriter::box_plan_artifact(tcx)
         }) {
@@ -9568,11 +9730,6 @@ mod run {
                 return row;
             }
         };
-        let name = std::env::var("CRAT_BOC1_NAME").unwrap_or_else(|_| "unnamed".to_owned());
-        let directory = std::env::var_os("CRAT_BOX_CENSUS_ARTIFACT_DIR")
-            .map(std::path::PathBuf::from)
-            .expect("Box census requires CRAT_BOX_CENSUS_ARTIFACT_DIR");
-        std::fs::create_dir_all(&directory).expect("create Box census artifact directory");
         std::fs::write(
             directory.join(format!("{name}.box-plans.tsv")),
             &artifact.tsv,
@@ -9583,6 +9740,16 @@ mod run {
             &artifact.bridges,
         )
         .expect("write Box construction-bridge ledger");
+        std::fs::write(
+            directory.join(format!("{name}.box-endpoints.tsv")),
+            &artifact.endpoints,
+        )
+        .expect("write Box endpoint ledger");
+        std::fs::write(
+            directory.join(format!("{name}.box-subjects.tsv")),
+            &artifact.subjects,
+        )
+        .expect("write Box subject ledger");
 
         let mut rows = 0usize;
         let mut planned = 0usize;
@@ -9593,6 +9760,8 @@ mod run {
         let mut waiver_overwrite = 0usize;
         let mut waiver_scope = 0usize;
         let mut waiver_unwind = 0usize;
+        let mut flexible_tail_held = 0usize;
+        let mut default_fill = 0usize;
         for line in artifact.tsv.lines().skip(1) {
             let fields = line.split('\t').collect::<Vec<_>>();
             assert_eq!(fields.len(), 13, "Box plan schema: {line}");
@@ -9605,6 +9774,8 @@ mod run {
             waiver_overwrite += fields[12].matches("waiver-drop(overwrite)").count();
             waiver_scope += fields[12].matches("waiver-drop(scope-exit)").count();
             waiver_unwind += fields[12].matches("waiver-drop(unwind)").count();
+            flexible_tail_held += usize::from(fields[6] == "box-flexible-tail-held");
+            default_fill += fields[12].matches("default-fill-").count();
         }
         row.set("box_rows", rows);
         row.set("box_bridge_rows", artifact.bridges.lines().skip(1).count());
@@ -9625,6 +9796,8 @@ mod run {
         row.set("box_waiver_overwrite", waiver_overwrite);
         row.set("box_waiver_scope_exit", waiver_scope);
         row.set("box_waiver_unwind", waiver_unwind);
+        row.set("box_flexible_tail_held", flexible_tail_held);
+        row.set("box_default_fill", default_fill);
         row.set(
             "a5_global_setup_wall_s",
             format!("{:.6}", artifact.a5_global_setup_wall_s),
@@ -16248,7 +16421,7 @@ fn e2_fn_cache_preflight_corpus() {
 fn e2_fn_census_launch_recipe_pins_and_gates_the_resource_bound() {
     use std::path::Path;
 
-    let recipe = E2_FN_CENSUS_LAUNCH_RECIPE;
+    let recipe = STANDING_CENSUS_LAUNCH_RECIPE;
     assert_eq!(recipe.profile, "release");
     assert_eq!(recipe.memory_mib, 49_152);
     assert_eq!(recipe.timeout_secs, 14_400);
@@ -16261,6 +16434,11 @@ fn e2_fn_census_launch_recipe_pins_and_gates_the_resource_bound() {
         "frozen_benchmark_graph".to_owned(),
     )));
     assert!(env.contains(&("CRAT_BOC1_MEM_MB", "49152".to_owned(),)));
+    let box_env = recipe.box_child_env(Path::new("/cache"), Path::new("/box"), "box@frame");
+    assert!(box_env.contains(&("CRAT_E1_ARTIFACT_DIR", "/box".to_owned())));
+    assert!(box_env.contains(&("CRAT_BOX_CENSUS_ARTIFACT_DIR", "/box".to_owned())));
+    assert!(box_env.contains(&("CRAT_BOX_CODE_FRAME", "box@frame".to_owned())));
+    assert!(box_env.contains(&("CRAT_BOX_CARGO_PROFILE", "release".to_owned())));
     assert_eq!(
         orchestrate::resolved_memory_limit_kb(Some(recipe.memory_mib), Some("8192")),
         Ok(Some(49_152 * 1024)),
@@ -16319,7 +16497,7 @@ fn e2_fn_census_corpus() {
         std::env::var_os("CRAT_E2_MARKET_DIR").expect("E2 census requires CRAT_E2_MARKET_DIR"),
     );
     let code_frame = std::env::var("CRAT_E2_CODE_FRAME").expect("E2 code-frame stamp");
-    let recipe = E2_FN_CENSUS_LAUNCH_RECIPE;
+    let recipe = STANDING_CENSUS_LAUNCH_RECIPE;
     fs::create_dir_all(&artifact_dir).expect("create E2 census artifact directory");
     let mut rows = Vec::new();
     for program in CORPUS {
@@ -17017,28 +17195,23 @@ fn box_wave1_corpus_census() {
     let cache_dir = PathBuf::from(
         std::env::var_os("CRAT_BO_CACHE_DIR").expect("Box census requires CRAT_BO_CACHE_DIR"),
     );
+    let code_frame = std::env::var("CRAT_BOX_CODE_FRAME").expect("Box code-frame stamp");
+    let recipe = STANDING_CENSUS_LAUNCH_RECIPE;
     fs::create_dir_all(&artifact_dir).expect("create Box census artifact directory");
     let mut rows = Vec::new();
+    let mut bridge_outputs = Vec::new();
+    let mut endpoint_outputs = Vec::new();
+    let mut subject_outputs = Vec::new();
     for program in CORPUS {
         let input = program.input_path(&root);
-        let outcome = orchestrate::run_child_env(
+        let child_env = recipe.box_child_env(&cache_dir, &artifact_dir, &code_frame);
+        let outcome = orchestrate::run_child_env_with_memory_limit_mib(
             program.name,
             &input,
             "box-census",
-            Duration::from_secs(14_400),
-            &[
-                ("CRAT_BO_CACHE", "1".to_owned()),
-                ("CRAT_BO_CACHE_DIR", cache_dir.display().to_string()),
-                (
-                    "CRAT_BO_A5_ATTESTATION",
-                    "frozen_benchmark_graph".to_owned(),
-                ),
-                ("CRAT_E1_ARTIFACT_DIR", artifact_dir.display().to_string()),
-                (
-                    "CRAT_BOX_CENSUS_ARTIFACT_DIR",
-                    artifact_dir.display().to_string(),
-                ),
-            ],
+            Duration::from_secs(recipe.timeout_secs),
+            recipe.memory_mib,
+            &child_env,
         );
         let mut row = outcome.row.unwrap_or_else(|| {
             panic!(
@@ -17050,6 +17223,27 @@ fn box_wave1_corpus_census() {
         row.set("worker_wall_s", format!("{:.3}", outcome.wall_s));
         row.set("peak_rss_kb", outcome.peak_rss_kb);
         assert_eq!(row.get("status"), Some("ok"), "{row:?}");
+        assert_eq!(
+            row.get("box_code_frame"),
+            Some(code_frame.as_str()),
+            "{row:?}"
+        );
+        assert_eq!(
+            row.get("box_launch_profile"),
+            Some(recipe.profile),
+            "{row:?}"
+        );
+        let memory = recipe.memory_mib.to_string();
+        assert_eq!(
+            row.get("box_resource_bound_configured_mib"),
+            Some(memory.as_str()),
+            "{row:?}"
+        );
+        assert_eq!(
+            row.get("box_resource_bound_effective_mib"),
+            Some(memory.as_str()),
+            "{row:?}"
+        );
         assert_eq!(row.get("cache_status"), Some("hit"), "{row:?}");
         assert_eq!(
             row.get(E1_WORKER_SOLVE_SECONDS_KEY),
@@ -17065,6 +17259,21 @@ fn box_wave1_corpus_census() {
             outcome.peak_rss_kb,
             row.get("fingerprint").unwrap_or("missing"),
         );
+        bridge_outputs.push((
+            program.name.to_owned(),
+            fs::read_to_string(artifact_dir.join(format!("{}.box-bridges.tsv", program.name)))
+                .expect("read worker bridge artifact"),
+        ));
+        endpoint_outputs.push((
+            program.name.to_owned(),
+            fs::read_to_string(artifact_dir.join(format!("{}.box-endpoints.tsv", program.name)))
+                .expect("read worker endpoint artifact"),
+        ));
+        subject_outputs.push((
+            program.name.to_owned(),
+            fs::read_to_string(artifact_dir.join(format!("{}.box-subjects.tsv", program.name)))
+                .expect("read worker subject artifact"),
+        ));
         rows.push(row);
     }
     let number = |row: &report::Row, key: &str| {
@@ -17079,6 +17288,79 @@ fn box_wave1_corpus_census() {
     assert_eq!(total("box_param_planned"), 0);
     assert_eq!(total("box_depth2_rows"), 4);
     assert_eq!(total("box_depth2_planned"), 0);
+    let bridge_control = PathBuf::from(
+        std::env::var_os("CRAT_BOX_BRIDGE_CONTROL_TSV")
+            .expect("Box wave-2 census requires CRAT_BOX_BRIDGE_CONTROL_TSV"),
+    );
+    let bridge_recon = reconcile_box_bridge_control(
+        &fs::read_to_string(&bridge_control).expect("read Box bridge control"),
+        &bridge_outputs,
+    );
+    fs::write(
+        artifact_dir.join("box-bridge-divergences.tsv"),
+        &bridge_recon.divergences,
+    )
+    .expect("write Box bridge divergence table");
+    assert_eq!(bridge_recon.expected, 23, "bridge control population drift");
+    assert_eq!(
+        bridge_recon.produced, 23,
+        "bridge production population drift"
+    );
+    assert_eq!(bridge_recon.matched, 23, "{}", bridge_recon.divergences);
+    assert_eq!(
+        bridge_recon.divergences.lines().count(),
+        1,
+        "{}",
+        bridge_recon.divergences,
+    );
+    let endpoint_control = PathBuf::from(
+        std::env::var_os("CRAT_BOX_T2_CONTROL")
+            .expect("Box wave-2 census requires CRAT_BOX_T2_CONTROL"),
+    );
+    let endpoint_recon = reconcile_box_endpoint_control(
+        &fs::read_to_string(&endpoint_control).expect("read Box endpoint control"),
+        &endpoint_outputs,
+    );
+    fs::write(
+        artifact_dir.join("box-endpoint-divergences.tsv"),
+        &endpoint_recon.divergences,
+    )
+    .expect("write Box endpoint divergence table");
+    assert_eq!(
+        (
+            endpoint_recon.expected,
+            endpoint_recon.produced,
+            endpoint_recon.matched,
+            endpoint_recon.active,
+            endpoint_recon.active_sources,
+        ),
+        (350, 350, 350, 61, 30),
+        "{}",
+        endpoint_recon.divergences,
+    );
+    let subject_control = PathBuf::from(
+        std::env::var_os("CRAT_BOX_SUBJECT_CONTROL")
+            .expect("Box wave-2 census requires CRAT_BOX_SUBJECT_CONTROL"),
+    );
+    let subject_recon = reconcile_box_subject_control(
+        &fs::read_to_string(&subject_control).expect("read Box subject control"),
+        &subject_outputs,
+    );
+    fs::write(
+        artifact_dir.join("box-subject-divergences.tsv"),
+        &subject_recon.divergences,
+    )
+    .expect("write Box subject divergence table");
+    assert_eq!(
+        (
+            subject_recon.expected,
+            subject_recon.produced,
+            subject_recon.matched,
+        ),
+        (57, 57, 57),
+        "{}",
+        subject_recon.divergences,
+    );
     let summary = rows
         .iter()
         .map(report::to_kv_line)
@@ -17099,6 +17381,348 @@ fn box_wave1_corpus_census() {
         ),
     )
     .expect("write Box census receipt");
+}
+
+#[derive(Debug)]
+struct BoxBridgeReconciliation {
+    expected: usize,
+    produced: usize,
+    matched: usize,
+    divergences: String,
+}
+
+#[derive(Debug)]
+struct BoxEndpointReconciliation {
+    expected: usize,
+    produced: usize,
+    active: usize,
+    active_sources: usize,
+    matched: usize,
+    divergences: String,
+}
+
+fn reconcile_box_endpoint_control(
+    control: &str,
+    produced: &[(String, String)],
+) -> BoxEndpointReconciliation {
+    use std::collections::BTreeMap;
+
+    let mut expected = BTreeMap::new();
+    for row in box_bridge_rows(control) {
+        let key = [
+            &row["program"],
+            &row["role"],
+            &row["function"],
+            &row["block"],
+            &row["statement"],
+            &row["callee"],
+            &row["slot"],
+        ]
+        .map(String::as_str)
+        .join("\u{1f}");
+        assert!(
+            expected.insert(key, row["state"].clone()).is_none(),
+            "duplicate endpoint control key"
+        );
+    }
+    let mut actual = BTreeMap::new();
+    for (program, text) in produced {
+        for row in box_bridge_rows(text) {
+            let key = [
+                program.as_str(),
+                &row["role"],
+                &row["function"],
+                &row["block"],
+                &row["statement"],
+                &row["callee"],
+                &row["slot"],
+            ]
+            .join("\u{1f}");
+            let state = match row["state"].as_str() {
+                "active" => "active",
+                state if state.starts_with("inactive-") => "retracted",
+                state => state,
+            };
+            assert!(
+                actual.insert(key, state.to_owned()).is_none(),
+                "duplicate produced endpoint key"
+            );
+        }
+    }
+    let mut divergences = String::from("identity\texpected\tgot\n");
+    let mut matched = 0usize;
+    for key in expected
+        .keys()
+        .chain(actual.keys())
+        .collect::<std::collections::BTreeSet<_>>()
+    {
+        let wanted = expected.get(key.as_str()).map_or("missing", String::as_str);
+        let got = actual.get(key.as_str()).map_or("missing", String::as_str);
+        if wanted == got {
+            matched += 1;
+        } else {
+            divergences.push_str(&format!(
+                "{}\t{wanted}\t{got}\n",
+                key.replace('\u{1f}', "\t")
+            ));
+        }
+    }
+    let active = actual
+        .values()
+        .filter(|state| state.as_str() == "active")
+        .count();
+    let active_sources = actual
+        .iter()
+        .filter(|(key, state)| {
+            key.split('\u{1f}').nth(1) == Some("Source") && state.as_str() == "active"
+        })
+        .count();
+    BoxEndpointReconciliation {
+        expected: expected.len(),
+        produced: actual.len(),
+        active,
+        active_sources,
+        matched,
+        divergences,
+    }
+}
+
+#[derive(Debug)]
+struct BoxSubjectReconciliation {
+    expected: usize,
+    produced: usize,
+    matched: usize,
+    divergences: String,
+}
+
+fn reconcile_box_subject_control(
+    control: &str,
+    produced: &[(String, String)],
+) -> BoxSubjectReconciliation {
+    use std::collections::BTreeMap;
+
+    let mut expected = BTreeMap::new();
+    for row in box_bridge_rows(control) {
+        let key = (row["program"].clone(), row["subject_key"].clone());
+        let identity = [
+            row["owner_fn"].clone(),
+            row["mir_local"].clone(),
+            row["arg_index"].clone(),
+            row["ptr_depth"].clone(),
+        ];
+        assert!(
+            expected.insert(key, identity).is_none(),
+            "duplicate subject control key"
+        );
+    }
+    let mut actual = BTreeMap::new();
+    for (program, text) in produced {
+        for row in box_bridge_rows(text) {
+            let key = (program.clone(), row["subject_key"].clone());
+            let identity = [
+                row["owner_fn"].clone(),
+                row["mir_local"].clone(),
+                row["arg_index"].clone(),
+                row["ptr_depth"].clone(),
+            ];
+            assert!(
+                actual.insert(key, identity).is_none(),
+                "duplicate produced subject key"
+            );
+        }
+    }
+    let mut divergences = String::from("program\tsubject_key\texpected\tgot\n");
+    let mut matched = 0usize;
+    for key in expected
+        .keys()
+        .chain(actual.keys())
+        .collect::<std::collections::BTreeSet<_>>()
+    {
+        let wanted = expected.get(key);
+        let got = actual.get(key);
+        if wanted == got {
+            matched += 1;
+        } else {
+            divergences.push_str(&format!(
+                "{}\t{}\t{}\t{}\n",
+                key.0,
+                key.1,
+                wanted.map_or("missing".to_owned(), |row| row.join("|")),
+                got.map_or("missing".to_owned(), |row| row.join("|")),
+            ));
+        }
+    }
+    BoxSubjectReconciliation {
+        expected: expected.len(),
+        produced: actual.len(),
+        matched,
+        divergences,
+    }
+}
+
+fn box_bridge_rows(text: &str) -> Vec<std::collections::BTreeMap<String, String>> {
+    let mut lines = text.lines();
+    let header = lines
+        .next()
+        .expect("Box bridge TSV has a header")
+        .split('\t')
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    lines
+        .map(|line| {
+            let fields = line.split('\t').collect::<Vec<_>>();
+            assert_eq!(fields.len(), header.len(), "Box bridge TSV width: {line}");
+            header
+                .iter()
+                .cloned()
+                .zip(fields.into_iter().map(str::to_owned))
+                .collect()
+        })
+        .collect()
+}
+
+fn reconcile_box_bridge_control(
+    control: &str,
+    produced: &[(String, String)],
+) -> BoxBridgeReconciliation {
+    use std::collections::BTreeMap;
+
+    let mut expected = BTreeMap::new();
+    for row in box_bridge_rows(control) {
+        let key = (row["program"].clone(), row["subject_key"].clone());
+        assert!(
+            expected.insert(key, row).is_none(),
+            "duplicate bridge control key"
+        );
+    }
+    let mut actual = BTreeMap::new();
+    for (program, text) in produced {
+        for row in box_bridge_rows(text) {
+            let key = (program.clone(), row["subject_key"].clone());
+            assert!(
+                actual.insert(key, row).is_none(),
+                "duplicate produced bridge key"
+            );
+        }
+    }
+
+    let fields = [
+        ("owner_fn", "owner_fn"),
+        ("mir_local", "mir_local"),
+        ("subject_slot", "subject_slot"),
+        ("endpoint_location", "endpoint_location"),
+        ("allocator_family", "endpoint_callee"),
+        ("endpoint_var", "endpoint_var"),
+        ("endpoint_slot", "endpoint_slot"),
+        ("bridge_relation", "bridge_relation"),
+    ];
+    let mut matched = 0usize;
+    let mut divergences = String::from("program\tsubject_key\tclass\tfield\texpected\tgot\n");
+    for (key, expected_row) in &expected {
+        let Some(actual_row) = actual.get(key) else {
+            divergences.push_str(&format!(
+                "{}\t{}\tmissing-produced\t-\tpresent\tmissing\n",
+                key.0, key.1
+            ));
+            continue;
+        };
+        let mut row_ok = actual_row
+            .get("outcome")
+            .is_some_and(|value| value == "resolved")
+            && actual_row.get("reason").is_some_and(|value| value == "-")
+            && actual_row
+                .get("endpoint_role")
+                .is_some_and(|value| value == "Source");
+        if !row_ok {
+            divergences.push_str(&format!(
+                "{}\t{}\tstate\toutcome/reason\tresolved/-\t{}/{}\n",
+                key.0,
+                key.1,
+                actual_row.get("outcome").map_or("missing", String::as_str),
+                actual_row.get("reason").map_or("missing", String::as_str),
+            ));
+        }
+        for (expected_field, actual_field) in fields {
+            if expected_row.get(expected_field) != actual_row.get(actual_field) {
+                row_ok = false;
+                divergences.push_str(&format!(
+                    "{}\t{}\tfield-mismatch\t{}\t{}\t{}\n",
+                    key.0,
+                    key.1,
+                    expected_field,
+                    expected_row
+                        .get(expected_field)
+                        .map_or("missing", String::as_str),
+                    actual_row
+                        .get(actual_field)
+                        .map_or("missing", String::as_str),
+                ));
+            }
+        }
+        matched += usize::from(row_ok);
+    }
+    for key in actual.keys().filter(|key| !expected.contains_key(*key)) {
+        divergences.push_str(&format!(
+            "{}\t{}\tproduction-only\t-\tmissing\tpresent\n",
+            key.0, key.1
+        ));
+    }
+    BoxBridgeReconciliation {
+        expected: expected.len(),
+        produced: actual.len(),
+        matched,
+        divergences,
+    }
+}
+
+#[test]
+fn box_wave2_bridge_control_is_row_exact_and_loud_on_drift() {
+    let control = "program\tsubject_key\towner_fn\tmir_local\tallocator_family\tendpoint_location\tbridge_relation\tsubject_slot\tendpoint_slot\tendpoint_var\n\
+p\tf::x#1\tf\t1\tmalloc\tbb1:0\tchain\tlocal:1:0\tlocal:1:1\t9\n";
+    let produced = "subject_key\towner_fn\tmir_local\tsubject_slot\tendpoint_role\tendpoint_location\tendpoint_callee\tendpoint_var\tendpoint_slot\toutcome\treason\tbridge_relation\n\
+f::x#1\tf\t1\tlocal:1:0\tSource\tbb1:0\tmalloc\t9\tlocal:1:1\tresolved\t-\tchain\n";
+    let exact = reconcile_box_bridge_control(control, &[("p".to_owned(), produced.to_owned())]);
+    assert_eq!((exact.expected, exact.produced, exact.matched), (1, 1, 1));
+    assert_eq!(
+        exact.divergences.lines().count(),
+        1,
+        "{}",
+        exact.divergences
+    );
+
+    let drifted = produced.replace("\tchain\n", "\twrong-chain\n");
+    let drift = reconcile_box_bridge_control(control, &[("p".to_owned(), drifted)]);
+    assert_eq!(drift.matched, 0);
+    assert!(drift.divergences.contains("bridge_relation"));
+}
+
+#[test]
+fn box_wave2_production_bridge_reads_no_docs_or_control_tsv() {
+    for (name, source) in [
+        (
+            "box_facts",
+            include_str!("bo_rewriter/decision/box_facts.rs"),
+        ),
+        (
+            "construction",
+            include_str!("bo_rewriter/decision/construction.rs"),
+        ),
+        ("decision", include_str!("bo_rewriter/decision/mod.rs")),
+        ("planner", include_str!("bo_rewriter/plan/mod.rs")),
+    ] {
+        assert!(
+            !source.contains("agents/artifacts"),
+            "{name} imports docs data"
+        );
+        assert!(
+            !source.contains("box-b3-subreasons.tsv"),
+            "{name} embeds the external control"
+        );
+        assert!(
+            !source.contains("CRAT_BOX_BRIDGE_CONTROL_TSV"),
+            "{name} reads the harness control"
+        );
+    }
 }
 
 /// **A panic is a failure; a resource deferral is an absence** (R8, 2026-08-15).

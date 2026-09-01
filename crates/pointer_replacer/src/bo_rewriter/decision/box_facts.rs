@@ -84,7 +84,7 @@ struct DefaultFillPlan {
     receipt: &'static str,
     shape: BoxShape,
     fabricated_extent: bool,
-    pointee_override: Option<String>,
+    pointee_override: Option<BoxPointeeOverride>,
 }
 
 fn numeric_default_fill(
@@ -106,7 +106,7 @@ fn numeric_default_fill(
             receipt: "default-fill-slice-u8",
             shape: BoxShape::Slice,
             fabricated_extent: false,
-            pointee_override: Some("u8".to_owned()),
+            pointee_override: Some(BoxPointeeOverride::U8),
         });
     }
     if !scalar_initializer_supported(normalized) {
@@ -812,6 +812,26 @@ fn sink_carrier_definitions(body: &Body<'_>) -> IndexVec<Local, Option<SinkCarri
     definitions
 }
 
+fn construction_whole_local_definition_counts(body: &Body<'_>) -> IndexVec<Local, usize> {
+    let mut counts = IndexVec::from_elem_n(0, body.local_decls.len());
+    for data in body.basic_blocks.iter() {
+        for statement in &data.statements {
+            if let StatementKind::Assign(box (destination, _)) = &statement.kind
+                && let Some(local) = destination.as_local()
+            {
+                counts[local] += 1;
+            }
+        }
+        if let Some(terminator) = &data.terminator
+            && let TerminatorKind::Call { destination, .. } = &terminator.kind
+            && let Some(local) = destination.as_local()
+        {
+            counts[local] += 1;
+        }
+    }
+    counts
+}
+
 struct MinimalWalk<'a, 'tcx> {
     program: &'a RustProgram<'tcx>,
     slots: &'a CrateSlots,
@@ -913,6 +933,7 @@ impl<'a, 'tcx> MinimalWalk<'a, 'tcx> {
         let function_path = self.program.tcx.def_path_str(fn_did.to_def_id());
         let eliminable = eliminable_temporaries(body);
         let sink_definitions = sink_carrier_definitions(body);
+        let construction_definition_counts = construction_whole_local_definition_counts(body);
         let mut sink_naming_seeds = FxHashSet::default();
         let mut box_move_seeds = FxHashSet::default();
         for data in body.basic_blocks.iter() {
@@ -957,6 +978,13 @@ impl<'a, 'tcx> MinimalWalk<'a, 'tcx> {
                 let var = self.new_var(slot);
                 current.insert(local, var);
             }
+        }
+        if matches!(
+            body.local_decls[rustc_middle::mir::RETURN_PLACE].ty.kind(),
+            rustc_middle::ty::TyKind::RawPtr(..)
+        ) && let Some(slot) = self.slot_for_local(fn_did, rustc_middle::mir::RETURN_PLACE)
+        {
+            self.boundary_held.insert(slot);
         }
 
         for (block, data) in body.basic_blocks.iter_enumerated() {
@@ -1061,10 +1089,7 @@ impl<'a, 'tcx> MinimalWalk<'a, 'tcx> {
                             destination_var: lhs_def,
                             location: location.into(),
                             transparent,
-                            destination_single_def: !matches!(
-                                sink_definitions[lhs_local],
-                                Some(SinkCarrierDef::Multiple)
-                            ),
+                            destination_single_def: construction_definition_counts[lhs_local] == 1,
                             block_single_predecessor: block.as_u32() == 0
                                 || body.basic_blocks.predecessors()[block].len() == 1,
                         });
@@ -1456,6 +1481,19 @@ pub(crate) enum BoxShape {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum BoxPointeeOverride {
+    U8,
+}
+
+impl BoxPointeeOverride {
+    pub(crate) fn source_name(self) -> &'static str {
+        match self {
+            Self::U8 => "u8",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ImplicitCloseKind {
     Overwrite,
     ScopeExit,
@@ -1489,7 +1527,7 @@ pub(crate) struct BoxPlan {
     pub(crate) fabricated_extent: bool,
     /// A positively-evidenced storage element that differs from the source
     /// spelling (currently only `c_void` backed by an exact byte extent).
-    pub(crate) pointee_override: Option<String>,
+    pub(crate) pointee_override: Option<BoxPointeeOverride>,
     /// The initializer carries the complete Box type for an unannotated source
     /// binding reached through the sealed construction-presentation domain.
     /// The AST planner therefore places value edits but no declaration splice.
@@ -2510,9 +2548,9 @@ mod tests {
     use rustc_index::IndexVec;
 
     use super::{
-        BoxMoveTemps, BoxScopeFailure, ConstructionBridgeFailure, ConstructionBridgeHop,
-        ConstructionBridgeTemps, EndpointStatus, FactValue, LocationKey, RecordedEquation,
-        SinkCarrierDef, SinkCarrierReason, SinkNamingTemps, box_scope,
+        BoxMoveTemps, BoxPointeeOverride, BoxScopeFailure, ConstructionBridgeFailure,
+        ConstructionBridgeHop, ConstructionBridgeTemps, EndpointStatus, FactValue, LocationKey,
+        RecordedEquation, SinkCarrierDef, SinkCarrierReason, SinkNamingTemps, box_scope,
         calloc_zero_parity_supported, classify_endpoint, exactly_one_sink_per_exit_graph,
         numeric_default_fill, render_equations, replay_values, resolve_construction_bridge,
         resolve_sink_carrier, resolve_sink_naming_carrier, scalar_initializer_supported,
@@ -2808,7 +2846,10 @@ mod tests {
         )
         .expect("exact byte extent admits the u8 backing candidate");
         assert_eq!(fill.shape, super::BoxShape::Slice);
-        assert_eq!(fill.pointee_override.as_deref(), Some("u8"));
+        assert_eq!(
+            fill.pointee_override.map(BoxPointeeOverride::source_name),
+            Some("u8")
+        );
         assert_eq!(fill.receipt, "default-fill-slice-u8");
         assert!(fill.initializer.contains("(items * size)"));
         assert!(

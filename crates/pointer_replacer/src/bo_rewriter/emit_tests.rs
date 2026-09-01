@@ -230,6 +230,30 @@ fn box2_w1_bridge_receipt_names_the_exact_temp_chain() {
     assert!(fields[11].contains("assignment-lhs"), "{bridges}");
 }
 
+#[test]
+fn box2_w1b_projected_pointee_stores_do_not_redefine_the_pointer_binding() {
+    let src = format!(
+        "{BOX_W1_PREAMBLE}\n\
+         #[repr(C)] struct Image {{ width: i32, height: i32 }}\n\
+         pub unsafe fn f() {{\n\
+             let mut img = malloc(core::mem::size_of::<Image>()) as *mut Image;\n\
+             (*img).width = 1;\n\
+             (*img).height = 2;\n\
+             free(img as *mut core::ffi::c_void);\n\
+         }}\n"
+    );
+    let bridges = ::utils::compilation::run_compiler_on_str(&src, |tcx| {
+        super::box_plan_artifact(tcx)
+            .expect("Box plan artifact")
+            .bridges
+    })
+    .expect("fixture compiles");
+    let row = bridges.lines().nth(1).expect("one bridge row");
+    let fields = row.split('\t').collect::<Vec<_>>();
+    assert_eq!(fields[9], "resolved", "{bridges}");
+    assert_eq!(fields[10], "-", "{bridges}");
+}
+
 /// BOX2-W2 — when no first-store or memset evidence exists, an exact
 /// `count * size_of::<T>()` allocation admits the numeric default-fill slice
 /// arm and preserves the evidence-backed count.
@@ -342,6 +366,60 @@ fn box2_n3_nonadmitted_struct_default_fill_stays_closed() {
         "{degradations:#?}"
     );
     assert!(!source.contains("Box<Pair>"), "{source}");
+}
+
+/// BOX2-N4/B5 — a body-local owner returned through the unchanged raw
+/// signature is outside the locals-only wave. Default-fill may classify its
+/// construction, but the return boundary must win before any Box is emitted.
+#[test]
+fn box2_n4_returned_default_fill_candidate_stays_boundary_held() {
+    let src = format!(
+        "{BOX_W1_PREAMBLE}\n\
+         pub unsafe fn f(items: usize, size: usize) -> *mut core::ffi::c_void {{\n\
+             let v: *mut core::ffi::c_void = malloc(items * size);\n\
+             v\n\
+         }}\n"
+    );
+    let super::RewriteOutcome::Emitted {
+        source,
+        degradations,
+        ..
+    } = super::rewrite_m1(&src)
+    else {
+        panic!("BOX2-N4 fixture must complete conservatively");
+    };
+    assert!(
+        degradations
+            .iter()
+            .any(|row| { row.subject == "f::v" && row.reason.key() == "box-param-caller-unknown" }),
+        "{degradations:#?}"
+    );
+    assert!(source.contains("v: *mut core::ffi::c_void"), "{source}");
+    assert!(!source.contains("Box<["), "{source}");
+}
+
+#[test]
+fn box2_w5_void_byte_extent_emits_u8_box_when_no_boundary_blocks() {
+    let src = format!(
+        "{BOX_W1_PREAMBLE}\n\
+         pub unsafe fn f(items: usize, size: usize) {{\n\
+             let v: *mut core::ffi::c_void = malloc(items * size);\n\
+             free(v);\n\
+         }}\n"
+    );
+    let super::RewriteOutcome::Emitted {
+        source,
+        degradations,
+        ..
+    } = super::rewrite_m1(&src)
+    else {
+        panic!("BOX2-W5 fixture must emit");
+    };
+    assert!(
+        source.contains("v: Box<[u8]> = vec![0 as u8; (items * size) as usize]"),
+        "degradations={degradations:#?}\n{source}"
+    );
+    assert!(source.contains("drop(v)"), "{source}");
 }
 
 #[test]

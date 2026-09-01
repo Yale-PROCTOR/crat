@@ -3724,6 +3724,8 @@ pub(crate) fn box_fact_artifacts(tcx: TyCtxt<'_>) -> Result<BoxFactArtifacts, St
 pub(crate) struct BoxPlanArtifact {
     pub(crate) tsv: String,
     pub(crate) bridges: String,
+    pub(crate) endpoints: String,
+    pub(crate) subjects: String,
     pub(crate) a5_global_setup_wall_s: f64,
     pub(crate) a5_pair_classification_wall_s: f64,
     pub(crate) a5_receipt_render_wall_s: f64,
@@ -3783,6 +3785,7 @@ pub(crate) fn box_plan_artifact(tcx: TyCtxt<'_>) -> Result<BoxPlanArtifact, Stri
         &ctx.constructions,
         &ctx.model,
     );
+    let endpoints = ctx.box_facts.endpoints_tsv();
     let a5_global_setup_wall_s = ctx.a5_site_proofs.global_setup_wall_s();
     let a5_pair_classification_wall_s = ctx.a5_site_proofs.pair_classification_wall_s();
     let receipt_started = std::time::Instant::now();
@@ -3794,12 +3797,33 @@ pub(crate) fn box_plan_artifact(tcx: TyCtxt<'_>) -> Result<BoxPlanArtifact, Stri
         .map(|(subject, decision)| ((subject.fn_did, subject.local), decision))
         .collect::<rustc_hash::FxHashMap<_, _>>();
     let mut rows = Vec::new();
+    let mut subject_rows = Vec::new();
     for subject in ctx
         .subjects
         .iter()
         .filter(|subject| e1_subject_model_kind(&ctx, subject) == Some(SlotKind::Owning))
     {
         let owner = tcx.def_path_str(subject.fn_did.to_def_id());
+        let subject_slot = ctx.slots.fn_local_slots[&subject.fn_did]
+            .slot_for_local_depth(subject.local, 0)
+            .expect("Owning subject has a depth-0 slot");
+        let subject_slot =
+            decision::box_facts::slot_label(SlotRef::Local(subject.fn_did, subject_slot));
+        subject_rows.push((
+            subject.identity_key(&owner),
+            format!(
+                "{}\t{}\t{}\t{}\t{}\t{}",
+                subject.identity_key(&owner),
+                owner,
+                subject.local.as_u32(),
+                match subject.kind {
+                    decision::SubjectKind::Param { hir_index } => (hir_index + 1).to_string(),
+                    decision::SubjectKind::Local => "-".to_owned(),
+                },
+                subject.ptr_depth,
+                subject_slot,
+            ),
+        ));
         let decision = decisions[&(subject.fn_did, subject.local)];
         let (outcome, reason, shape, optional, edits, deletes, fabricated, receipts) =
             match decision {
@@ -3863,9 +3887,18 @@ pub(crate) fn box_plan_artifact(tcx: TyCtxt<'_>) -> Result<BoxPlanArtifact, Stri
         output.push_str(&row);
         output.push('\n');
     }
+    subject_rows.sort_by(|left, right| left.0.cmp(&right.0));
+    let mut subjects =
+        String::from("subject_key\towner_fn\tmir_local\targ_index\tptr_depth\tslot\n");
+    for (_, row) in subject_rows {
+        subjects.push_str(&row);
+        subjects.push('\n');
+    }
     Ok(BoxPlanArtifact {
         tsv: output,
         bridges,
+        endpoints,
+        subjects,
         a5_global_setup_wall_s,
         a5_pair_classification_wall_s,
         a5_receipt_render_wall_s,

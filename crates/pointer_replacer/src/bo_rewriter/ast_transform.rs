@@ -50,7 +50,11 @@ pub(crate) enum DeclForm {
     /// `Option<&T>` and its three twins; `slice` selects the fat one.
     Opt { slice: bool },
     /// `Box<T>` / `Box<[T]>`, optionally wrapped for nullable ownership.
-    Box { slice: bool, optional: bool },
+    Box {
+        slice: bool,
+        optional: bool,
+        pointee_override: Option<super::decision::box_facts::BoxPointeeOverride>,
+    },
 }
 
 /// Wrap `inner` in `Option<…>`, **structurally**.
@@ -112,9 +116,18 @@ fn ast_lifetime(name: &str) -> Lifetime {
 fn decl_ty_kind_with_lifetime(
     form: DeclForm,
     mutable: bool,
-    pointee: P<Ty>,
+    mut pointee: P<Ty>,
     lifetime: Option<&str>,
 ) -> TyKind {
+    if let DeclForm::Box {
+        pointee_override: Some(override_kind),
+        ..
+    } = form
+    {
+        pointee = P(::utils::ast::parse_ty(
+            override_kind.source_name().to_owned(),
+        ));
+    }
     let mutbl = if mutable {
         Mutability::Mut
     } else {
@@ -1947,6 +1960,7 @@ fn transform_with(
                 DeclForm::Box {
                     slice: matches!(plan.shape, super::decision::box_facts::BoxShape::Slice),
                     optional: plan.optional,
+                    pointee_override: plan.pointee_override,
                 },
                 false,
                 None,
@@ -4899,6 +4913,7 @@ mod arm2_witnesses {
                     DeclForm::Box {
                         slice: false,
                         optional: false,
+                        pointee_override: None,
                     },
                     false,
                 ),
@@ -4947,6 +4962,26 @@ mod arm2_witnesses {
             assert_eq!(stats.rendered_arm2[0].1, "&[libc::c_int]");
             assert_eq!(stats.rendered_arm2[1].1, "Option<&mut [libc::c_int]>");
             assert_eq!(stats.rendered_arm2[2].1, "Box<libc::c_int>");
+        });
+    }
+
+    #[test]
+    fn box_u8_backing_override_is_shared_by_the_ast_declaration_path() {
+        rustc_span::create_default_session_globals_then(|| {
+            let mut ty = ::utils::ast::parse_ty("*mut core::ffi::c_void".to_owned());
+            let TyKind::Ptr(mut_ty) = &ty.kind else { panic!("fixture is a raw pointer") };
+            ty.kind = decl_ty_kind(
+                DeclForm::Box {
+                    slice: true,
+                    optional: false,
+                    pointee_override: Some(
+                        super::super::decision::box_facts::BoxPointeeOverride::U8,
+                    ),
+                },
+                false,
+                mut_ty.ty.clone(),
+            );
+            assert_eq!(rustc_ast_pretty::pprust::ty_to_string(&ty), "Box<[u8]>");
         });
     }
 

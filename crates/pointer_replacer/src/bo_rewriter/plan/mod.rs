@@ -486,7 +486,8 @@ pub(crate) fn plan(
                 continue;
             };
             let pointee = box_plan
-                .and_then(|plan| plan.pointee_override.as_deref())
+                .and_then(|plan| plan.pointee_override)
+                .map(super::decision::box_facts::BoxPointeeOverride::source_name)
                 .unwrap_or(source_pointee);
             let base = if box_plan.is_some() {
                 if fat {
@@ -523,8 +524,12 @@ pub(crate) fn plan(
                         hi,
                         replacement: edit.replacement.clone(),
                         justification: if box_plan.fabricated_extent
-                            && matches!(edit.receipt, "memset-zero-slice" | "realloc-atomic")
-                        {
+                            && matches!(
+                                edit.receipt,
+                                "memset-zero-slice"
+                                    | "realloc-atomic"
+                                    | "default-fill-slice-fallback"
+                            ) {
                             Justification::SeamAdapter {
                                 family: "box",
                                 fabricated: true,
