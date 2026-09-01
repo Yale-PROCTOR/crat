@@ -48,6 +48,7 @@ use super::{
     Decision, DecisionTable, Subject, SubjectKind,
     emitability::{ArgShape, EmitabilityFacts, RefKind},
     lifetime::LifetimeEligibility,
+    raw_boundary::RawBoundaryDispositionIndex,
 };
 use crate::analyses::borrow_ownership::{a5_overlap::PairSide, a5_producer::PlannedC9Mark};
 
@@ -348,6 +349,29 @@ pub(crate) fn build_with_c9_marks_and_lifetimes(
     c9_marks: &[PlannedC9Mark],
     lifetime_eligibility: &LifetimeEligibility,
 ) -> CoConv {
+    build_with_c9_marks_lifetimes_and_raw_boundary(
+        facts,
+        subjects,
+        hypothetical,
+        escapes,
+        overlap,
+        c9_marks,
+        lifetime_eligibility,
+        &RawBoundaryDispositionIndex::default(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn build_with_c9_marks_lifetimes_and_raw_boundary(
+    facts: &EmitabilityFacts,
+    subjects: &[Subject],
+    hypothetical: &DecisionTable,
+    escapes: &[Escape],
+    overlap: OverlapRule,
+    c9_marks: &[PlannedC9Mark],
+    lifetime_eligibility: &LifetimeEligibility,
+    raw_boundary: &RawBoundaryDispositionIndex,
+) -> CoConv {
     // ---- 1. the node set: subjects that would emit a PLAIN reference ----
     //
     // Slice and optional forms are deliberately excluded. `&mut [T]` and
@@ -426,6 +450,11 @@ pub(crate) fn build_with_c9_marks_and_lifetimes(
     // than by archaeology.
     for escape in escapes {
         if !converts.contains(&escape.subject) {
+            continue;
+        }
+        if escape.kind == EscapeKind::ForeignArg
+            && raw_boundary.opens_span(escape.subject, escape.span)
+        {
             continue;
         }
         let Some(reason) = escape_block_reason(escape, lifetime_eligibility) else {
@@ -559,6 +588,9 @@ pub(crate) fn build_with_c9_marks_and_lifetimes(
                 if let Some(caller) = caller_node {
                     let reaches_a_converting_param = callee_node.is_some();
                     if !reaches_a_converting_param {
+                        if raw_boundary.opens_argument(caller, arg.span, arg.index) {
+                            continue;
+                        }
                         // The three arms are DISJOINT, not merely ordered: a
                         // pinned callee's parameters degrade
                         // `call-site-not-adapted` even under `LiftAdaptable`,

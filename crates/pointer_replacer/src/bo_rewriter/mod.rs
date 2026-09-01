@@ -3473,7 +3473,18 @@ fn finish_decide<'tcx>(
         ),
         &subjects,
     );
-    let coconv = decision::co_conversion::build_with_c9_marks_and_lifetimes(
+    let raw_boundary_sites = decision::raw_boundary::RawBoundarySiteFacts::derive(&program, &facts);
+    let retention = decision::raw_boundary::RetentionSummaries::derive(
+        &program,
+        analysis.origins.as_ref(),
+        analysis.attestation,
+    );
+    let raw_boundary = decision::raw_boundary::RawBoundaryDispositionIndex::derive(
+        &raw_boundary_sites,
+        &retention,
+        &e2_hypothetical,
+    );
+    let coconv = decision::co_conversion::build_with_c9_marks_lifetimes_and_raw_boundary(
         &facts,
         &subjects,
         &e2_hypothetical,
@@ -3481,6 +3492,7 @@ fn finish_decide<'tcx>(
         decision::co_conversion::OverlapRule::BlindOnly,
         &retained_c9_plans,
         &lifetime_eligibility,
+        &raw_boundary,
     );
     // **Production is decided AFTER the classes**, because step 2's gate reads
     // them. No cycle: the hypothetical above was decided with `None`.
@@ -3600,6 +3612,9 @@ fn finish_decide<'tcx>(
             a5_site_proofs,
             box_facts,
             constructions: ctors,
+            raw_boundary_sites,
+            retention,
+            raw_boundary,
             e2_artifacts,
         },
     ))
@@ -3642,6 +3657,9 @@ pub(crate) struct DecideCtx {
     a5_site_proofs: decision::a5_site_proof::A5SeamProofIndex,
     box_facts: decision::box_facts::BoxOwnershipFacts,
     constructions: decision::construction::ConstructionFacts,
+    raw_boundary_sites: decision::raw_boundary::RawBoundarySiteFacts,
+    retention: decision::raw_boundary::RetentionSummaries,
+    raw_boundary: decision::raw_boundary::RawBoundaryDispositionIndex,
     e2_artifacts: E2Artifacts,
 }
 

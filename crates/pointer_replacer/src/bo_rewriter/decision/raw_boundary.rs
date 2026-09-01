@@ -5,7 +5,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_hir::{HirId, def_id::LocalDefId};
 use rustc_middle::{
     mir::{
@@ -106,6 +106,8 @@ pub(crate) enum BoundaryDirection {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct RawBoundarySiteFact {
     pub key: RawBoundarySiteKey,
+    pub node: Option<(LocalDefId, HirId)>,
+    pub callee_local: Option<LocalDefId>,
     pub direction: BoundaryDirection,
     pub source_span: Span,
     pub source_shape: &'static str,
@@ -116,6 +118,7 @@ pub(crate) struct RawBoundarySiteFact {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct RawBoundarySiteFailure {
     pub caller: String,
+    pub node: Option<(LocalDefId, HirId)>,
     pub callee: ForeignSymbolKey,
     pub argument_index: usize,
     pub source_span: Span,
@@ -210,6 +213,8 @@ impl RawBoundarySiteFacts {
                             .root
                             .map_or_else(|| "<unrooted>".to_owned(), |root| format!("{root:?}")),
                     },
+                    node: fact.root.map(|root| (fact.caller, root)),
+                    callee_local: None,
                     direction: BoundaryDirection::OutgoingArgument,
                     source_span: fact.argument_span,
                     source_shape: fact.shape,
@@ -218,6 +223,7 @@ impl RawBoundarySiteFacts {
                 }),
                 Err(reason) => out.failures.push(RawBoundarySiteFailure {
                     caller: tcx.def_path_str(fact.caller.to_def_id()),
+                    node: fact.root.map(|root| (fact.caller, root)),
                     callee: fact.callee.clone(),
                     argument_index: fact.argument_index,
                     source_span: fact.argument_span,
@@ -252,6 +258,8 @@ impl RawBoundarySiteFacts {
                                     |root| format!("{root:?}"),
                                 ),
                             },
+                            node: argument.shape.place_root().map(|root| (call.caller, root)),
+                            callee_local: Some(callee),
                             direction: BoundaryDirection::OutgoingArgument,
                             source_span: argument.span,
                             source_shape: argument.shape.key(),
@@ -260,6 +268,7 @@ impl RawBoundarySiteFacts {
                         }),
                         Err(reason) => out.failures.push(RawBoundarySiteFailure {
                             caller: tcx.def_path_str(call.caller.to_def_id()),
+                            node: argument.shape.place_root().map(|root| (call.caller, root)),
                             callee: callee_key.clone(),
                             argument_index: argument.index,
                             source_span: argument.span,
@@ -923,6 +932,385 @@ impl RetentionSummaries {
             }) if expected == certificate && sorted_unique => Ok(()),
             _ => Err("retention-certificate-invalid"),
         }
+    }
+}
+
+pub(crate) const RAW_BOUNDARY_WAIVER_ID: &str =
+    "c-aliasing-semantics-at-unsafe-bridges/v1@2026-09-01";
+pub(crate) const RAW_BOUNDARY_WAIVER_TEXT: &str = "C-aliasing semantics at unsafe bridges. At a receipted T2 site, crat may expose a raw pointer derived from a safe reference to a boundary whose retention behavior is unknown, in order to preserve the source program's C calling convention. Current Rust aliasing models can invalidate a retained raw alias when the originating mutable reference remains live or is later reused. The conditional soundness claim therefore excludes an execution that retains and later uses that raw alias unless no-retention is independently established. This waiver licenses only the recorded safe-to-raw view at that call. It licenses no integer-to-pointer round trip, ownership transfer, unchecked null dereference, positive-retention site, or unreceipted reuse.";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum BridgeTemplate {
+    RefMutToRawMut,
+    RefMutToRawConst,
+    RefSharedToRawConst,
+    SliceMutToRawMut,
+    SliceToRawConst,
+    OptRefMutToRawMut,
+    OptRefToRawConst,
+    OptSliceToRaw,
+    BoxBorrowViewToRaw,
+    KnownFreeDrop,
+}
+
+impl BridgeTemplate {
+    pub(crate) fn key(self) -> &'static str {
+        match self {
+            Self::RefMutToRawMut => "ref-mut-to-raw-mut",
+            Self::RefMutToRawConst => "ref-mut-to-raw-const",
+            Self::RefSharedToRawConst => "ref-shared-to-raw-const",
+            Self::SliceMutToRawMut => "slice-mut-to-raw-mut",
+            Self::SliceToRawConst => "slice-to-raw-const",
+            Self::OptRefMutToRawMut => "opt-ref-mut-to-raw-mut",
+            Self::OptRefToRawConst => "opt-ref-to-raw-const",
+            Self::OptSliceToRaw => "opt-slice-to-raw",
+            Self::BoxBorrowViewToRaw => "box-borrow-view-to-raw",
+            Self::KnownFreeDrop => "known-free-drop",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RawBoundaryBlockReason {
+    SiteUnresolved,
+    SubjectUnrooted,
+    SubjectNotSafe,
+    SharedToMut,
+    OwnershipTransfer,
+    PositiveRetention,
+    ContractInvalid,
+    TemplateUnavailable,
+    WaiverUnconfirmed,
+}
+
+impl RawBoundaryBlockReason {
+    pub(crate) fn key(self) -> &'static str {
+        match self {
+            Self::SiteUnresolved => "raw-boundary-site-unresolved",
+            Self::SubjectUnrooted => "raw-boundary-subject-unrooted",
+            Self::SubjectNotSafe => "raw-boundary-subject-not-safe",
+            Self::SharedToMut => "raw-boundary-shared-to-mut",
+            Self::OwnershipTransfer => "raw-boundary-ownership-transfer",
+            Self::PositiveRetention => "raw-boundary-positive-retention",
+            Self::ContractInvalid => "raw-boundary-contract-invalid",
+            Self::TemplateUnavailable => "raw-boundary-template-unavailable",
+            Self::WaiverUnconfirmed => "raw-boundary-waiver-unconfirmed",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum RawBoundaryDisposition {
+    T1 {
+        template: BridgeTemplate,
+        evidence: String,
+    },
+    T2 {
+        template: BridgeTemplate,
+        reason: RetentionUnknownReason,
+        waiver_id: &'static str,
+    },
+    Blocked {
+        reason: RawBoundaryBlockReason,
+        detail: String,
+    },
+}
+
+impl RawBoundaryDisposition {
+    pub(crate) fn is_open(&self) -> bool {
+        matches!(self, Self::T1 { .. } | Self::T2 { .. })
+    }
+
+    pub(crate) fn tier(&self) -> &'static str {
+        match self {
+            Self::T1 { .. } => "t1",
+            Self::T2 { .. } => "t2",
+            Self::Blocked { .. } => "blocked",
+        }
+    }
+
+    pub(crate) fn template(&self) -> Option<BridgeTemplate> {
+        match self {
+            Self::T1 { template, .. } | Self::T2 { template, .. } => Some(*template),
+            Self::Blocked { .. } => None,
+        }
+    }
+}
+
+fn template_for(
+    decision: &super::Decision,
+    target: &RawTargetType,
+    ownership: Option<super::raw_boundary_contracts::OwnershipContract>,
+) -> Result<BridgeTemplate, RawBoundaryBlockReason> {
+    use super::{Decision, box_facts::BoxShape, raw_boundary_contracts::OwnershipContract};
+
+    if matches!(
+        ownership,
+        Some(OwnershipContract::AtomicSourceSink | OwnershipContract::Produce)
+    ) {
+        return Err(RawBoundaryBlockReason::OwnershipTransfer);
+    }
+    match decision {
+        Decision::Ref { mutable } | Decision::InferredRef { mutable, .. } => {
+            match (*mutable, target.mutability) {
+                (true, RawMutability::Mut) => Ok(BridgeTemplate::RefMutToRawMut),
+                (true, RawMutability::Const) => Ok(BridgeTemplate::RefMutToRawConst),
+                (false, RawMutability::Const) => Ok(BridgeTemplate::RefSharedToRawConst),
+                (false, RawMutability::Mut) => Err(RawBoundaryBlockReason::SharedToMut),
+            }
+        }
+        Decision::Slice { mutable, .. } => match (*mutable, target.mutability) {
+            (true, RawMutability::Mut) => Ok(BridgeTemplate::SliceMutToRawMut),
+            (_, RawMutability::Const) => Ok(BridgeTemplate::SliceToRawConst),
+            (false, RawMutability::Mut) => Err(RawBoundaryBlockReason::SharedToMut),
+        },
+        Decision::Opt { mutable, slice, .. } => {
+            if *slice {
+                match (*mutable, target.mutability) {
+                    (false, RawMutability::Mut) => Err(RawBoundaryBlockReason::SharedToMut),
+                    _ => Ok(BridgeTemplate::OptSliceToRaw),
+                }
+            } else {
+                match (*mutable, target.mutability) {
+                    (true, RawMutability::Mut) => Ok(BridgeTemplate::OptRefMutToRawMut),
+                    (_, RawMutability::Const) => Ok(BridgeTemplate::OptRefToRawConst),
+                    (false, RawMutability::Mut) => Err(RawBoundaryBlockReason::SharedToMut),
+                }
+            }
+        }
+        Decision::Box(plan) => {
+            if ownership == Some(OwnershipContract::Consume) {
+                Ok(BridgeTemplate::KnownFreeDrop)
+            } else if plan.shape == BoxShape::Sized || plan.shape == BoxShape::Slice {
+                Ok(BridgeTemplate::BoxBorrowViewToRaw)
+            } else {
+                Err(RawBoundaryBlockReason::TemplateUnavailable)
+            }
+        }
+        Decision::Degraded(_) => Err(RawBoundaryBlockReason::SubjectNotSafe),
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub(crate) struct RawBoundaryDispositionIndex {
+    by_site: BTreeMap<RawBoundarySiteKey, RawBoundaryDisposition>,
+    site_lookup: Vec<((LocalDefId, HirId), Span, usize, RawBoundarySiteKey)>,
+    open_nodes: FxHashSet<(LocalDefId, HirId)>,
+    blocked_nodes: FxHashMap<(LocalDefId, HirId), RawBoundaryBlockReason>,
+}
+
+impl RawBoundaryDispositionIndex {
+    pub(crate) fn derive(
+        site_facts: &RawBoundarySiteFacts,
+        retention: &RetentionSummaries,
+        hypothetical: &super::DecisionTable,
+    ) -> Self {
+        let decisions = hypothetical
+            .entries
+            .iter()
+            .map(|(subject, decision)| ((subject.fn_did, subject.hir_id), decision))
+            .collect::<FxHashMap<_, _>>();
+        let mut out = Self::default();
+        let mut nodes = FxHashMap::<(LocalDefId, HirId), Vec<bool>>::default();
+        for site in &site_facts.sites {
+            let disposition: Result<RawBoundaryDisposition, (RawBoundaryBlockReason, String)> =
+                (|| {
+                    let node = site.node.ok_or_else(|| {
+                        (
+                            RawBoundaryBlockReason::SubjectUnrooted,
+                            "site has no subject root".to_owned(),
+                        )
+                    })?;
+                    let decision = decisions.get(&node).copied().ok_or_else(|| {
+                        (
+                            RawBoundaryBlockReason::SubjectNotSafe,
+                            "hypothetical has no safe subject decision".to_owned(),
+                        )
+                    })?;
+                    let contract = super::raw_boundary_contracts::classify_contract(
+                        &site.key.callee,
+                        site.key.argument_index,
+                        &site.target,
+                    );
+                    let (retention_verdict, ownership, evidence) =
+                        match contract {
+                            Ok(contract) => (
+                                RetentionVerdict::NoRetain {
+                                    certificate: RetentionCertificate {
+                                        function: site.key.callee.path.clone(),
+                                        argument_index: site.key.argument_index,
+                                        steps: Vec::new(),
+                                        attestation: "boundary-contract",
+                                    },
+                                },
+                                Some(contract.ownership),
+                                format!("contract:{}", contract.provenance),
+                            ),
+                            Err(
+                                super::raw_boundary_contracts::ContractFailure::PositionUnmodeled,
+                            ) if site.callee_local.is_none() => (
+                                RetentionVerdict::Unknown {
+                                    reason: RetentionUnknownReason::OpenBoundary,
+                                    frontier: Vec::new(),
+                                },
+                                None,
+                                "foreign-retention-unknown".to_owned(),
+                            ),
+                            Err(super::raw_boundary_contracts::ContractFailure::NotForeign)
+                                if site.callee_local.is_some() =>
+                            {
+                                let callee = site.callee_local.expect("guarded local callee");
+                                (
+                                    retention
+                                        .get(callee, site.key.argument_index)
+                                        .cloned()
+                                        .unwrap_or(RetentionVerdict::Unknown {
+                                            reason: RetentionUnknownReason::LocalSummaryUnknown,
+                                            frontier: Vec::new(),
+                                        }),
+                                    None,
+                                    "local-retention-summary".to_owned(),
+                                )
+                            }
+                            Err(error) => {
+                                return Err((
+                                    RawBoundaryBlockReason::ContractInvalid,
+                                    format!("{error:?}"),
+                                ));
+                            }
+                        };
+                    let template = template_for(decision, &site.target, ownership)
+                        .map_err(|reason| (reason, "template-preflight".to_owned()))?;
+                    match retention_verdict {
+                        RetentionVerdict::NoRetain { certificate } => {
+                            if site.callee_local.is_some()
+                                && retention
+                                    .verify_certificate(
+                                        site.callee_local.expect("local"),
+                                        site.key.argument_index,
+                                        &certificate,
+                                    )
+                                    .is_err()
+                            {
+                                return Err((
+                                    RawBoundaryBlockReason::ContractInvalid,
+                                    "retention-certificate-invalid".to_owned(),
+                                ));
+                            }
+                            Ok(RawBoundaryDisposition::T1 { template, evidence })
+                        }
+                        RetentionVerdict::Retains { sink, .. } => Err((
+                            RawBoundaryBlockReason::PositiveRetention,
+                            format!("{sink:?}"),
+                        )),
+                        RetentionVerdict::Unknown { reason, .. } => {
+                            Ok(RawBoundaryDisposition::T2 {
+                                template,
+                                reason,
+                                waiver_id: RAW_BOUNDARY_WAIVER_ID,
+                            })
+                        }
+                    }
+                })();
+            let disposition = disposition.unwrap_or_else(|(reason, detail)| {
+                RawBoundaryDisposition::Blocked { reason, detail }
+            });
+            if let Some(node) = site.node {
+                nodes.entry(node).or_default().push(disposition.is_open());
+                out.site_lookup.push((
+                    node,
+                    site.source_span.source_callsite(),
+                    site.key.argument_index,
+                    site.key.clone(),
+                ));
+                if let RawBoundaryDisposition::Blocked { reason, .. } = &disposition {
+                    out.blocked_nodes.entry(node).or_insert(*reason);
+                }
+            }
+            out.by_site.insert(site.key.clone(), disposition);
+        }
+        for failure in &site_facts.failures {
+            if let Some(node) = failure.node {
+                nodes.entry(node).or_default().push(false);
+                out.blocked_nodes
+                    .entry(node)
+                    .or_insert(RawBoundaryBlockReason::SiteUnresolved);
+            }
+        }
+        for (node, verdicts) in nodes {
+            if !verdicts.is_empty() && verdicts.into_iter().all(|open| open) {
+                out.open_nodes.insert(node);
+            }
+        }
+        out.site_lookup.sort_by(|left, right| {
+            (
+                left.0.0.local_def_index.as_u32(),
+                left.0.1.local_id.as_u32(),
+                left.1.lo(),
+                left.1.hi(),
+                left.2,
+                &left.3,
+            )
+                .cmp(&(
+                    right.0.0.local_def_index.as_u32(),
+                    right.0.1.local_id.as_u32(),
+                    right.1.lo(),
+                    right.1.hi(),
+                    right.2,
+                    &right.3,
+                ))
+        });
+        out
+    }
+
+    pub(crate) fn disposition(&self, key: &RawBoundarySiteKey) -> Option<&RawBoundaryDisposition> {
+        self.by_site.get(key)
+    }
+
+    pub(crate) fn opens_node(&self, node: (LocalDefId, HirId)) -> bool {
+        self.open_nodes.contains(&node)
+    }
+
+    pub(crate) fn opens_span(&self, node: (LocalDefId, HirId), span: Span) -> bool {
+        let span = span.source_callsite();
+        self.opens_node(node)
+            && self
+                .site_lookup
+                .iter()
+                .any(|(candidate, site_span, _, key)| {
+                    *candidate == node
+                        && (site_span.contains(span) || span.contains(*site_span))
+                        && self
+                            .by_site
+                            .get(key)
+                            .is_some_and(RawBoundaryDisposition::is_open)
+                })
+    }
+
+    pub(crate) fn opens_argument(
+        &self,
+        node: (LocalDefId, HirId),
+        span: Span,
+        argument_index: usize,
+    ) -> bool {
+        let span = span.source_callsite();
+        self.opens_node(node)
+            && self
+                .site_lookup
+                .iter()
+                .any(|(candidate, site_span, index, key)| {
+                    *candidate == node
+                        && *index == argument_index
+                        && (site_span.contains(span) || span.contains(*site_span))
+                        && self
+                            .by_site
+                            .get(key)
+                            .is_some_and(RawBoundaryDisposition::is_open)
+                })
+    }
+
+    pub(crate) fn block_reason(&self, node: (LocalDefId, HirId)) -> Option<RawBoundaryBlockReason> {
+        self.blocked_nodes.get(&node).copied()
     }
 }
 
