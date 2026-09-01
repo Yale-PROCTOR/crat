@@ -3724,6 +3724,7 @@ pub(crate) fn box_fact_artifacts(tcx: TyCtxt<'_>) -> Result<BoxFactArtifacts, St
 pub(crate) struct BoxPlanArtifact {
     pub(crate) tsv: String,
     pub(crate) bridges: String,
+    pub(crate) default_fill_candidates: String,
     pub(crate) endpoints: String,
     pub(crate) subjects: String,
     pub(crate) a5_global_setup_wall_s: f64,
@@ -3786,6 +3787,13 @@ pub(crate) fn box_plan_artifact(tcx: TyCtxt<'_>) -> Result<BoxPlanArtifact, Stri
         &ctx.model,
     );
     let endpoints = ctx.box_facts.endpoints_tsv();
+    let default_fill_candidates = ctx.box_facts.default_fill_candidates_tsv(
+        tcx,
+        &ctx.subjects,
+        &ctx.slots,
+        &ctx.constructions,
+        &ctx.model,
+    );
     let a5_global_setup_wall_s = ctx.a5_site_proofs.global_setup_wall_s();
     let a5_pair_classification_wall_s = ctx.a5_site_proofs.pair_classification_wall_s();
     let receipt_started = std::time::Instant::now();
@@ -3897,6 +3905,7 @@ pub(crate) fn box_plan_artifact(tcx: TyCtxt<'_>) -> Result<BoxPlanArtifact, Stri
     Ok(BoxPlanArtifact {
         tsv: output,
         bridges,
+        default_fill_candidates,
         endpoints,
         subjects,
         a5_global_setup_wall_s,

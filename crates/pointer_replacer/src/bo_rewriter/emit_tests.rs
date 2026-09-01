@@ -339,6 +339,19 @@ fn box2_n3_flexible_tail_is_a_typed_hold_with_layout_evidence() {
     assert!(detail.contains("root_site="), "{detail}");
     assert!(detail.contains("size_of::<Tail>"), "{detail}");
     assert!(!source.contains("Box<"), "{source}");
+    let evidence = ::utils::compilation::run_compiler_on_str(&src, |tcx| {
+        super::box_plan_artifact(tcx)
+            .expect("Box plan artifact")
+            .default_fill_candidates
+    })
+    .expect("fixture compiles");
+    let row = evidence
+        .lines()
+        .nth(1)
+        .expect("one flexible-tail evidence row");
+    let fields = row.split('\t').collect::<Vec<_>>();
+    assert_eq!(fields[3], "held", "{evidence}");
+    assert_eq!(fields[4], "box-flexible-tail-held", "{evidence}");
 }
 
 #[test]
@@ -420,6 +433,20 @@ fn box2_w5_void_byte_extent_emits_u8_box_when_no_boundary_blocks() {
         "degradations={degradations:#?}\n{source}"
     );
     assert!(source.contains("drop(v)"), "{source}");
+    let evidence = ::utils::compilation::run_compiler_on_str(&src, |tcx| {
+        super::box_plan_artifact(tcx)
+            .expect("Box plan artifact")
+            .default_fill_candidates
+    })
+    .expect("fixture compiles");
+    let row = evidence
+        .lines()
+        .nth(1)
+        .expect("one default-fill evidence row");
+    let fields = row.split('\t').collect::<Vec<_>>();
+    assert_eq!(fields[3], "candidate", "{evidence}");
+    assert_eq!(fields[4], "default-fill-slice-u8", "{evidence}");
+    assert_eq!(fields[5], "u8", "{evidence}");
 }
 
 #[test]

@@ -9741,6 +9741,11 @@ mod run {
         )
         .expect("write Box construction-bridge ledger");
         std::fs::write(
+            directory.join(format!("{name}.box-default-fill.tsv")),
+            normalize(&artifact.default_fill_candidates),
+        )
+        .expect("write Box default-fill evidence ledger");
+        std::fs::write(
             directory.join(format!("{name}.box-endpoints.tsv")),
             &artifact.endpoints,
         )
@@ -9786,6 +9791,24 @@ mod run {
                 .lines()
                 .skip(1)
                 .filter(|line| line.split('\t').nth(9) == Some("resolved"))
+                .count(),
+        );
+        row.set(
+            "box_default_fill_candidates",
+            artifact
+                .default_fill_candidates
+                .lines()
+                .skip(1)
+                .filter(|line| line.split('\t').nth(3) == Some("candidate"))
+                .count(),
+        );
+        row.set(
+            "box_flexible_tail_evidence_rows",
+            artifact
+                .default_fill_candidates
+                .lines()
+                .skip(1)
+                .filter(|line| line.split('\t').nth(3) == Some("held"))
                 .count(),
         );
         row.set("box_planned", planned);
@@ -17288,6 +17311,16 @@ fn box_wave1_corpus_census() {
     assert_eq!(total("box_param_planned"), 0);
     assert_eq!(total("box_depth2_rows"), 4);
     assert_eq!(total("box_depth2_planned"), 0);
+    assert_eq!(total("box_default_fill_candidates"), 1);
+    assert_eq!(total("box_flexible_tail_evidence_rows"), 14);
+    assert_eq!(total("box_flexible_tail_held"), 14);
+    assert_eq!(
+        total("box_bridge_rows")
+            + total("box_default_fill_candidates")
+            + total("box_flexible_tail_evidence_rows"),
+        38,
+        "Box wave-2 population must reconcile 23 + 1 + 14",
+    );
     let bridge_control = PathBuf::from(
         std::env::var_os("CRAT_BOX_BRIDGE_CONTROL_TSV")
             .expect("Box wave-2 census requires CRAT_BOX_BRIDGE_CONTROL_TSV"),

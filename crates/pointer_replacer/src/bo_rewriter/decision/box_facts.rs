@@ -1783,6 +1783,104 @@ impl BoxOwnershipFacts {
         output
     }
 
+    pub(crate) fn default_fill_candidates_tsv(
+        &self,
+        tcx: rustc_middle::ty::TyCtxt<'_>,
+        subjects: &[super::Subject],
+        slots: &CrateSlots,
+        constructions: &super::construction::ConstructionFacts,
+        model: &FxHashMap<SlotRef, SlotKind>,
+    ) -> String {
+        let mut rows = Vec::new();
+        for subject in subjects {
+            if subject.ptr_depth != 1 || !matches!(subject.kind, super::SubjectKind::Local) {
+                continue;
+            }
+            let Some(slot) = slots
+                .fn_local_slots
+                .get(&subject.fn_did)
+                .and_then(|universe| universe.slot_for_local_depth(subject.local, 0))
+                .map(|slot| SlotRef::Local(subject.fn_did, slot))
+            else {
+                continue;
+            };
+            if model.get(&slot) != Some(&SlotKind::Owning) {
+                continue;
+            }
+            let key = (subject.fn_did, subject.hir_id);
+            let owner = tcx.def_path_str(subject.fn_did.to_def_id());
+            let subject_key = subject.identity_key(&owner);
+            if let Some(evidence) = flexible_tail_evidence(tcx, key, constructions) {
+                rows.push((
+                    subject_key.clone(),
+                    format!(
+                        "{subject_key}\t{owner}\t{}\theld\tbox-flexible-tail-held\t-\t-\t0\t{evidence}",
+                        subject.local.as_u32(),
+                    ),
+                ));
+                continue;
+            }
+            if constructions
+                .first_stores
+                .get(&key)
+                .is_some_and(|rows| !rows.is_empty())
+                || constructions
+                    .zero_memsets
+                    .get(&key)
+                    .is_some_and(|rows| !rows.is_empty())
+            {
+                continue;
+            }
+            let Some(super::construction::Construction::Alloc {
+                callee,
+                size,
+                count,
+            }) = constructions.by_binding.get(&key)
+            else {
+                continue;
+            };
+            let body = tcx
+                .mir_drops_elaborated_and_const_checked(subject.fn_did)
+                .borrow();
+            let rustc_middle::ty::TyKind::RawPtr(pointee, _) =
+                body.local_decls[subject.local].ty.kind()
+            else {
+                continue;
+            };
+            let normalized = format!("{pointee}");
+            let Some(fill) = numeric_default_fill(&normalized, callee, size, count.as_deref())
+            else {
+                continue;
+            };
+            rows.push((
+                subject_key.clone(),
+                format!(
+                    "{subject_key}\t{owner}\t{}\tcandidate\t{}\t{}\t{}\t{}\tconstruction={}",
+                    subject.local.as_u32(),
+                    fill.receipt,
+                    fill.pointee_override
+                        .map(BoxPointeeOverride::source_name)
+                        .unwrap_or(normalized.as_str()),
+                    match fill.shape {
+                        BoxShape::Sized => "sized",
+                        BoxShape::Slice => "slice",
+                    },
+                    u8::from(fill.fabricated_extent),
+                    size.replace(['\t', '\r', '\n'], " "),
+                ),
+            ));
+        }
+        rows.sort_by(|left, right| left.0.cmp(&right.0));
+        let mut output = String::from(
+            "subject_key\towner_fn\tmir_local\tclass\tarm\telement\tshape\tfabricated_extent\tevidence\n",
+        );
+        for (_, row) in rows {
+            output.push_str(&row);
+            output.push('\n');
+        }
+        output
+    }
+
     pub(crate) fn plan_for_subject(
         &self,
         tcx: rustc_middle::ty::TyCtxt<'_>,
