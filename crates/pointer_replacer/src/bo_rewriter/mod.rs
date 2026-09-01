@@ -135,6 +135,7 @@ pub(crate) struct E1Capture {
     /// Every subject and item-axis exclusion from that same table/plan.
     pub(crate) subject_receipt: String,
     pub(crate) e2_artifacts: E2Artifacts,
+    pub(crate) raw_boundary_artifacts: RawBoundaryArtifacts,
     pub(crate) novel_error_count: usize,
     pub(crate) baseline_keys: usize,
     pub(crate) baseline_errors: usize,
@@ -169,6 +170,30 @@ pub(crate) struct E2Timings {
     pub(crate) ast_placement_wall_s: String,
     pub(crate) receipt_render_wall_s: String,
     pub(crate) compiler_verification_wall_s: String,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct RawBoundaryArtifacts {
+    pub(crate) sites: String,
+    pub(crate) retention: String,
+    pub(crate) dispositions: String,
+    pub(crate) subjects: String,
+    pub(crate) atoms: String,
+    pub(crate) atom_outcomes: String,
+    pub(crate) final_reverts: String,
+    pub(crate) timings: RawBoundaryTimings,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct RawBoundaryTimings {
+    pub(crate) site_derivation_wall_s: String,
+    pub(crate) retention_fixpoint_wall_s: String,
+    pub(crate) certificate_replay_wall_s: String,
+    pub(crate) decision_wall_s: String,
+    pub(crate) render_wall_s: String,
+    pub(crate) receipt_wall_s: String,
+    pub(crate) initial_verify_wall_s: String,
+    pub(crate) atom_reverify_wall_s: String,
 }
 
 /// What one M1 rewrite attempt produced.
@@ -263,6 +288,7 @@ pub(crate) enum RewriteOutcome {
         /// E1's identity-bearing subject seed, empty on ordinary runs.
         e1_subject_receipt: String,
         e2_artifacts: E2Artifacts,
+        raw_boundary_artifacts: RawBoundaryArtifacts,
         /// Baseline-subtracted error count from the one verify invocation.
         e1_novel_error_count: usize,
         /// D4's emitted-MIR Box-drop reconciliation.
@@ -328,6 +354,7 @@ pub(crate) enum RewriteOutcome {
         /// E1's identity-bearing subject seed, empty on ordinary runs.
         e1_subject_receipt: String,
         e2_artifacts: E2Artifacts,
+        raw_boundary_artifacts: RawBoundaryArtifacts,
         /// Baseline-subtracted error count from the one verify invocation.
         e1_novel_error_count: usize,
         /// D4's emitted-MIR Box-drop reconciliation.
@@ -536,6 +563,7 @@ pub(crate) fn rewrite_m1_path_injected(
         inject,
         false,
         false,
+        false,
         None,
     )
 }
@@ -554,6 +582,7 @@ pub(crate) fn rewrite_m1_path_a5_injected(
         inject,
         false,
         false,
+        false,
         Some((mode, attestation)),
     )
 }
@@ -563,7 +592,16 @@ fn rewrite_core(
     tree_base: Option<&std::path::Path>,
     max_rounds: usize,
 ) -> RewriteOutcome {
-    rewrite_core_injected(input, tree_base, max_rounds, &|_| {}, false, false, None)
+    rewrite_core_injected(
+        input,
+        tree_base,
+        max_rounds,
+        &|_| {},
+        false,
+        false,
+        false,
+        None,
+    )
 }
 
 /// [`rewrite_core`] with a hook applied to the finished decision table at the
@@ -580,6 +618,7 @@ fn rewrite_core_injected(
     inject: &(dyn Fn(&mut decision::DecisionTable) + Sync),
     probe_only: bool,
     census_once: bool,
+    raw_boundary_full: bool,
     a5_override: Option<(A5Mode, Option<WholeProgramAttestation>)>,
 ) -> RewriteOutcome {
     // The string entry's original text, so a baseline exists for it too.
@@ -774,6 +813,7 @@ fn rewrite_core_injected(
             max_rounds,
             probe_only,
             census_once,
+            raw_boundary_full,
             emission.files,
             emission_plan,
             emission_texts,
@@ -786,6 +826,7 @@ fn rewrite_core_injected(
             a5_receipt,
             e1_subject_receipt,
             decide_ctx.e2_artifacts.clone(),
+            decide_ctx.raw_boundary_artifacts.clone(),
             e1_box_drop_policies,
         ))
     });
@@ -883,6 +924,7 @@ fn verify_and_revert(
     max_rounds: usize,
     probe_only: bool,
     census_once: bool,
+    raw_boundary_full: bool,
     files: std::collections::BTreeMap<plan::FileKey, String>,
     emission_plan: plan::Plan,
     emission_texts: std::collections::BTreeMap<plan::FileKey, String>,
@@ -895,6 +937,7 @@ fn verify_and_revert(
     a5_receipt: String,
     e1_subject_receipt: String,
     e2_artifacts: E2Artifacts,
+    raw_boundary_artifacts: RawBoundaryArtifacts,
     e1_box_drop_policies: Vec<verify::BoxMirDropPolicy>,
 ) -> RewriteOutcome {
     // `excluded` is a LOCAL again: the loop holds `tcx`, so a value that used
@@ -993,6 +1036,7 @@ fn verify_and_revert(
         },
         e1_subject_receipt,
         e2_artifacts,
+        raw_boundary_artifacts,
         e1_novel_error_count: 0,
         e1_box_drop_receipt: String::new(),
         solve_receipt: model_cache::solve_receipt(),
@@ -1003,6 +1047,8 @@ fn verify_and_revert(
     let mut reverted: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     let mut reverted_atoms: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     let mut atom_reverify_used = false;
+    let mut pending_atom_retry: Option<(String, Vec<String>)> = None;
+    let mut census_captured = false;
     // **ROUND 0 THROUGH THE SWITCH — the FOURTH site** (ruling 2026-08-18).
     //
     // `files` arrives from `emit_files`, whose product is `render`'s: the SPAN
@@ -1082,8 +1128,15 @@ fn verify_and_revert(
         let probe_started = std::time::Instant::now();
         let diagnosis = verify::diagnose_crate(staged.root());
         let probe_wall_s = probe_started.elapsed().as_secs_f64();
+        if atom_reverify_used {
+            facts.raw_boundary_artifacts.timings.atom_reverify_wall_s =
+                format!("{probe_wall_s:.6}");
+        } else if facts.raw_boundary_artifacts.timings.initial_verify_wall_s == "pending" {
+            facts.raw_boundary_artifacts.timings.initial_verify_wall_s =
+                format!("{probe_wall_s:.6}");
+        }
         probe_secs = probe_secs.max(probe_wall_s);
-        if census_once {
+        if census_once && !census_captured {
             facts.e2_artifacts.timings.compiler_verification_wall_s = format!("{probe_wall_s:.6}");
         }
         if probe_only {
@@ -1141,7 +1194,8 @@ fn verify_and_revert(
             facts.first_diags = novel.clone();
             facts.observed_root = Some(observed_root.clone());
         }
-        if census_once {
+        if census_once && !census_captured {
+            census_captured = true;
             facts.first_diags = novel.clone();
             facts.observed_root = Some(observed_root.clone());
             facts.e1_novel_error_count = novel_errors;
@@ -1315,10 +1369,23 @@ fn verify_and_revert(
                 });
             }
             facts.files_touched = files_edited;
-            return facts
-                .degraded("e1-single-iteration: first differential diagnose recorded".to_owned());
+            if !raw_boundary_full {
+                return facts.degraded(
+                    "e1-single-iteration: first differential diagnose recorded".to_owned(),
+                );
+            }
         }
         if novel.is_empty() && novel_errors == 0 {
+            if let Some((reason, atoms)) = pending_atom_retry.take() {
+                facts
+                    .raw_boundary_artifacts
+                    .atom_outcomes
+                    .push_str(&format!(
+                        "atom-succeeded\t{}\t{}\n",
+                        reason,
+                        atoms.join(";")
+                    ));
+            }
             let source = std::fs::read_to_string(staged.root()).unwrap_or_default();
             let (kept, taken): (Vec<_>, Vec<_>) =
                 emitted_subjects.iter().partition(|(owner, _, _, atoms)| {
@@ -1338,6 +1405,8 @@ fn verify_and_revert(
             facts.emitted_count = kept.len();
             facts.reverted_count = taken.len();
             facts.files_touched = files_edited;
+            facts.raw_boundary_artifacts.final_reverts =
+                render_raw_boundary_final_reverts(&reverted, &reverted_atoms);
             return facts.emitted(source, files);
         }
 
@@ -1369,7 +1438,9 @@ fn verify_and_revert(
                 AtomSelectionKind::Exact | AtomSelectionKind::GroupAtomic
             ) {
                 atom_reverify_used = true;
-                reverted_atoms.extend(selection.atoms);
+                let selected_atoms = selection.atoms.into_iter().collect::<Vec<_>>();
+                reverted_atoms.extend(selected_atoms.iter().cloned());
+                pending_atom_retry = Some((selection.reason.to_owned(), selected_atoms));
                 let (next_files, rollbacks, next_edited, next_maps) = match round_files(
                     tcx,
                     capture,
@@ -1403,6 +1474,24 @@ fn verify_and_revert(
                 previous_errors = None;
                 continue;
             }
+            if !live_atom_sites.is_empty() {
+                facts
+                    .raw_boundary_artifacts
+                    .atom_outcomes
+                    .push_str(&format!(
+                        "atom-ambiguous-fallback\t{}\t-\n",
+                        selection.reason
+                    ));
+            }
+        } else if let Some((reason, atoms)) = pending_atom_retry.take() {
+            facts
+                .raw_boundary_artifacts
+                .atom_outcomes
+                .push_str(&format!(
+                    "atom-second-verify-fallback\t{}\t{}\n",
+                    reason,
+                    atoms.join(";")
+                ));
         }
 
         // DUAL TERMINATION, both arms. Neither alone: a no-progress
@@ -1653,6 +1742,8 @@ fn verify_and_revert(
             facts.files_touched = final_edited;
             facts.bisect_probes = probes;
             facts.escalated = Some(escalation);
+            facts.raw_boundary_artifacts.final_reverts =
+                render_raw_boundary_final_reverts(&final_reverted, &reverted_atoms);
             facts.emitted(source, final_files)
         }
         _ => {
@@ -2166,6 +2257,7 @@ pub(crate) fn diagnose_once(
         &|_| {},
         true,
         false,
+        false,
         None,
     );
     let (observed_root, diags) = outcome.into_capture();
@@ -2196,6 +2288,29 @@ pub(crate) fn diagnose_e1_once(root: &std::path::Path) -> Result<E1Capture, Stri
         MAX_REVERT_ROUNDS,
         &|_| {},
         false,
+        true,
+        false,
+        None,
+    )
+    .into_e1_capture()
+}
+
+/// Raw-boundary census entry: capture the one-iteration diagnostic payload,
+/// then allow exactly the production atom/function verifier to converge. It is
+/// one decision/emission pass and therefore one cache load, not two stitched
+/// measurements.
+#[allow(
+    dead_code,
+    reason = "consumed by the cfg(test) raw-boundary corpus worker"
+)]
+pub(crate) fn diagnose_raw_boundary_census(root: &std::path::Path) -> Result<E1Capture, String> {
+    rewrite_core_injected(
+        ::utils::compilation::path_to_input(root),
+        Some(root),
+        MAX_REVERT_ROUNDS,
+        &|_| {},
+        false,
+        true,
         true,
         None,
     )
@@ -2254,6 +2369,7 @@ struct OutcomeFacts {
     e1_adapter_receipt: String,
     e1_subject_receipt: String,
     e2_artifacts: E2Artifacts,
+    raw_boundary_artifacts: RawBoundaryArtifacts,
     e1_novel_error_count: usize,
     e1_box_drop_receipt: String,
     solve_receipt: Option<model_cache::SolveReceipt>,
@@ -2309,6 +2425,7 @@ impl RewriteOutcome {
             e1_adapter_receipt,
             e1_subject_receipt,
             e2_artifacts,
+            raw_boundary_artifacts,
             novel_error_count,
             e1_box_drop_receipt,
             baseline_keys,
@@ -2327,6 +2444,7 @@ impl RewriteOutcome {
                 e1_adapter_receipt,
                 e1_subject_receipt,
                 e2_artifacts,
+                raw_boundary_artifacts,
                 e1_novel_error_count,
                 e1_box_drop_receipt,
                 baseline_keys,
@@ -2344,6 +2462,7 @@ impl RewriteOutcome {
                 e1_adapter_receipt,
                 e1_subject_receipt,
                 e2_artifacts,
+                raw_boundary_artifacts,
                 e1_novel_error_count,
                 e1_box_drop_receipt,
                 baseline_keys,
@@ -2363,6 +2482,7 @@ impl RewriteOutcome {
                 e1_adapter_receipt,
                 e1_subject_receipt,
                 e2_artifacts,
+                raw_boundary_artifacts,
                 e1_novel_error_count,
                 e1_box_drop_receipt,
                 baseline_keys,
@@ -2380,6 +2500,7 @@ impl RewriteOutcome {
                 e1_adapter_receipt,
                 e1_subject_receipt,
                 e2_artifacts,
+                raw_boundary_artifacts,
                 e1_novel_error_count,
                 e1_box_drop_receipt,
                 baseline_keys,
@@ -2400,6 +2521,7 @@ impl RewriteOutcome {
             adapter_receipt: e1_adapter_receipt,
             subject_receipt: e1_subject_receipt,
             e2_artifacts,
+            raw_boundary_artifacts,
             novel_error_count,
             baseline_keys,
             baseline_errors,
@@ -2460,6 +2582,7 @@ impl OutcomeFacts {
             e1_adapter_receipt: self.e1_adapter_receipt,
             e1_subject_receipt: self.e1_subject_receipt,
             e2_artifacts: self.e2_artifacts,
+            raw_boundary_artifacts: self.raw_boundary_artifacts,
             e1_novel_error_count: self.e1_novel_error_count,
             e1_box_drop_receipt: self.e1_box_drop_receipt,
             solve_receipt: self.solve_receipt,
@@ -2488,6 +2611,7 @@ impl OutcomeFacts {
             e1_adapter_receipt: self.e1_adapter_receipt,
             e1_subject_receipt: self.e1_subject_receipt,
             e2_artifacts: self.e2_artifacts,
+            raw_boundary_artifacts: self.raw_boundary_artifacts,
             e1_novel_error_count: self.e1_novel_error_count,
             e1_box_drop_receipt: self.e1_box_drop_receipt,
             solve_receipt: self.solve_receipt,
@@ -2542,6 +2666,20 @@ fn atom_fallback(reason: &'static str) -> AtomSelection {
         atoms: std::collections::BTreeSet::new(),
         reason,
     }
+}
+
+fn render_raw_boundary_final_reverts(
+    functions: &std::collections::BTreeSet<String>,
+    atoms: &std::collections::BTreeSet<String>,
+) -> String {
+    let mut out = String::from("kind\tidentity\n");
+    for function in functions {
+        out.push_str(&format!("function\t{function}\n"));
+    }
+    for atom in atoms {
+        out.push_str(&format!("atom\t{atom}\n"));
+    }
+    out
 }
 
 /// Pure selection over original-source lines. Production first translates
@@ -3775,18 +3913,24 @@ fn finish_decide<'tcx>(
         ),
         &subjects,
     );
+    let raw_boundary_sites_started = std::time::Instant::now();
     let raw_boundary_sites = decision::raw_boundary::RawBoundarySiteFacts::derive(&program, &facts);
+    let raw_boundary_site_derivation_wall_s = raw_boundary_sites_started.elapsed().as_secs_f64();
+    let retention_started = std::time::Instant::now();
     let retention = decision::raw_boundary::RetentionSummaries::derive(
         &program,
         analysis.origins.as_ref(),
         analysis.attestation,
     );
+    let retention_fixpoint_wall_s = retention_started.elapsed().as_secs_f64();
+    let raw_boundary_decision_started = std::time::Instant::now();
     let raw_boundary = decision::raw_boundary::RawBoundaryDispositionIndex::derive(
         &raw_boundary_sites,
         &retention,
         &e2_hypothetical,
         &facts,
     );
+    let raw_boundary_decision_wall_s = raw_boundary_decision_started.elapsed().as_secs_f64();
     let coconv = decision::co_conversion::build_with_c9_marks_lifetimes_and_raw_boundary(
         &facts,
         &subjects,
@@ -3851,6 +3995,7 @@ fn finish_decide<'tcx>(
         &a5_site_proofs,
         &raw_boundary,
     );
+    let raw_boundary_render_wall_s = seam_started.elapsed().as_secs_f64();
     retained_c9_plans.retain(|mark| {
         let params = mark.key.pair.params();
         [params.first(), params.second()].into_iter().all(|param| {
@@ -3890,6 +4035,29 @@ fn finish_decide<'tcx>(
         receipt_render_wall_s: format!("{:.6}", receipt_started.elapsed().as_secs_f64()),
         compiler_verification_wall_s: "pending".to_owned(),
     };
+    let raw_boundary_receipt_started = std::time::Instant::now();
+    let raw_boundary_artifacts = RawBoundaryArtifacts {
+        sites: raw_boundary_sites.to_tsv(),
+        retention: retention.to_tsv(),
+        dispositions: raw_boundary.receipts_tsv(),
+        subjects: raw_boundary_subjects_tsv(tcx, &hypothetical, &table, &coconv, &raw_boundary),
+        atoms: raw_boundary.atoms_tsv(),
+        atom_outcomes: String::from("outcome\treason\tatoms\n"),
+        final_reverts: String::from("kind\tidentity\n"),
+        timings: RawBoundaryTimings {
+            site_derivation_wall_s: format!("{raw_boundary_site_derivation_wall_s:.6}"),
+            retention_fixpoint_wall_s: format!("{retention_fixpoint_wall_s:.6}"),
+            certificate_replay_wall_s: format!("{:.6}", raw_boundary.certificate_replay_wall_s()),
+            decision_wall_s: format!("{raw_boundary_decision_wall_s:.6}"),
+            render_wall_s: format!("{raw_boundary_render_wall_s:.6}"),
+            receipt_wall_s: format!(
+                "{:.6}",
+                raw_boundary_receipt_started.elapsed().as_secs_f64()
+            ),
+            initial_verify_wall_s: "pending".to_owned(),
+            atom_reverify_wall_s: "0.000000".to_owned(),
+        },
+    };
 
     // C.2: the in-process coverage gate is GONE. Its replacement is the
     // harness reconciliation in `coverage_recon`, driven from outside this
@@ -3920,9 +4088,80 @@ fn finish_decide<'tcx>(
             raw_boundary_sites,
             retention,
             raw_boundary,
+            raw_boundary_artifacts,
             e2_artifacts,
         },
     ))
+}
+
+fn raw_boundary_subjects_tsv(
+    tcx: TyCtxt<'_>,
+    hypothetical: &decision::DecisionTable,
+    settled: &decision::DecisionTable,
+    coconv: &decision::co_conversion::CoConv,
+    raw_boundary: &decision::raw_boundary::RawBoundaryDispositionIndex,
+) -> String {
+    let decision_key = |decision: &decision::Decision| match decision {
+        decision::Decision::Ref { .. } => "ref",
+        decision::Decision::InferredRef { .. } => "inferred-ref",
+        decision::Decision::Slice { .. } => "slice",
+        decision::Decision::Opt { .. } => "optional",
+        decision::Decision::Box(_) => "box",
+        decision::Decision::Degraded(_) => "degraded",
+    };
+    let settled = settled
+        .entries
+        .iter()
+        .map(|(subject, decision)| ((subject.fn_did, subject.hir_id), decision))
+        .collect::<rustc_hash::FxHashMap<_, _>>();
+    let mut rows = Vec::new();
+    for (subject, hypothetical_decision) in &hypothetical.entries {
+        let node = (subject.fn_did, subject.hir_id);
+        let owner = tcx.def_path_str(subject.fn_did.to_def_id());
+        let identity = subject.identity_key(&owner);
+        let direct = raw_boundary.node_dispositions(node);
+        let tiers = direct
+            .iter()
+            .map(|(_, disposition)| disposition.tier())
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>()
+            .join(";");
+        let class_block = coconv.class_block(node).map_or("-", |reason| reason.key());
+        let node_block = coconv.node_block(node).map_or("-", |reason| reason.key());
+        let settled_decision = settled.get(&node).copied();
+        rows.push((
+            identity.clone(),
+            format!(
+                "{identity}\t{owner}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+                subject.local.as_u32(),
+                match subject.kind {
+                    decision::SubjectKind::Param { .. } => "param",
+                    decision::SubjectKind::Local => "local",
+                },
+                decision_key(hypothetical_decision),
+                settled_decision.map_or("missing", |decision| decision_key(decision)),
+                direct.len(),
+                if tiers.is_empty() { "-" } else { &tiers },
+                u8::from(raw_boundary.opens_node(node)),
+                coconv
+                    .class_of(node)
+                    .map_or_else(|| "-".to_owned(), |id| id.to_string()),
+                u8::from(coconv.admits(node)),
+                class_block,
+                node_block,
+                subject.ptr_depth,
+            ),
+        ));
+    }
+    rows.sort_by(|left, right| left.0.cmp(&right.0));
+    let mut out = String::from(
+        "subject_identity\towner\tmir_local\tsubject_kind\thypothetical\tsettled\tdirect_site_count\tdirect_tiers\traw_open\tclass_id\tclass_admits\tclass_block\tnode_block\tptr_depth\n",
+    );
+    for (_, row) in rows {
+        out.push_str(&row);
+    }
+    out
 }
 
 /// **R1 — the pipeline's by-products, returned instead of recomputed.**
@@ -3965,6 +4204,7 @@ pub(crate) struct DecideCtx {
     raw_boundary_sites: decision::raw_boundary::RawBoundarySiteFacts,
     retention: decision::raw_boundary::RetentionSummaries,
     raw_boundary: decision::raw_boundary::RawBoundaryDispositionIndex,
+    raw_boundary_artifacts: RawBoundaryArtifacts,
     e2_artifacts: E2Artifacts,
 }
 

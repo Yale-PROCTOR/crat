@@ -41,7 +41,7 @@ use self::ownership_diagnostic_package::{
 };
 use crate::{
     analyses::borrow_ownership::solver::CORE_LABEL_FAMILIES, box_census_schema as box_schema,
-    utils::rustc::RustProgram,
+    raw_boundary_census_schema as raw_schema, utils::rustc::RustProgram,
 };
 
 /// The established solve-time field emitted by the E1/Box census worker.
@@ -98,6 +98,24 @@ impl StandingCensusLaunchRecipe {
             ),
             ("CRAT_BOX_CODE_FRAME", code_frame.to_owned()),
             ("CRAT_BOX_CARGO_PROFILE", self.profile.to_owned()),
+        ]);
+        env
+    }
+
+    fn raw_boundary_child_env(
+        self,
+        cache_dir: &std::path::Path,
+        artifact_dir: &std::path::Path,
+        code_frame: &str,
+    ) -> Vec<(&'static str, String)> {
+        let mut env = self.common_child_env(cache_dir);
+        env.extend([
+            (
+                "CRAT_RAW_BOUNDARY_ARTIFACT_DIR",
+                artifact_dir.display().to_string(),
+            ),
+            ("CRAT_RAW_BOUNDARY_CODE_FRAME", code_frame.to_owned()),
+            ("CRAT_RAW_BOUNDARY_CARGO_PROFILE", self.profile.to_owned()),
         ]);
         env
     }
@@ -4414,6 +4432,7 @@ mod run {
             ProductionPrecisionEvidence, RemovalFilter,
         },
         ownership_yield::{self, ModelKindRecord, OwnerClass, SlotRecord},
+        raw_schema,
         report::Row,
         selector_leak_diagnosis::{
             self, CommitEvent, CoreEvidence, DetailEvidence, OutParamTag, SelectorClass, TracePhase,
@@ -9573,6 +9592,384 @@ mod run {
         row
     }
 
+    pub fn run_raw_boundary_census(input: &std::path::Path) -> Row {
+        let started = Instant::now();
+        let mut row = Row::default();
+        let name = std::env::var("CRAT_BOC1_NAME").unwrap_or_else(|_| "unnamed".to_owned());
+        let code_frame = std::env::var("CRAT_RAW_BOUNDARY_CODE_FRAME")
+            .unwrap_or_else(|_| "missing-code-frame".to_owned());
+        let launch_profile = std::env::var("CRAT_RAW_BOUNDARY_CARGO_PROFILE")
+            .unwrap_or_else(|_| "missing-profile".to_owned());
+        let configured_memory =
+            std::env::var("CRAT_BOC1_MEM_MB").unwrap_or_else(|_| "missing".to_owned());
+        let effective_memory = std::env::var(super::BOC1_EFFECTIVE_MEMORY_MIB_ENV)
+            .unwrap_or_else(|_| "missing".to_owned());
+        let directory = std::env::var_os("CRAT_RAW_BOUNDARY_ARTIFACT_DIR")
+            .map(std::path::PathBuf::from)
+            .expect("raw-boundary census requires CRAT_RAW_BOUNDARY_ARTIFACT_DIR");
+        std::fs::create_dir_all(&directory).expect("create raw-boundary artifact directory");
+        let capture = match crate::bo_rewriter::diagnose_raw_boundary_census(input) {
+            Ok(capture) => capture,
+            Err(error) => {
+                row.set(raw_schema::STATUS, "instrument-error");
+                row.set("detail", super::report::sanitize(&error));
+                return row;
+            }
+        };
+        let build_profile = if cfg!(debug_assertions) {
+            "debug"
+        } else {
+            "release"
+        };
+        let non_citable_reason = super::e2_resource_bound_non_citable_reason(
+            Some(&configured_memory),
+            Some(&effective_memory),
+        );
+        let data = if non_citable_reason.is_some() {
+            "false"
+        } else {
+            "provisional"
+        };
+        let solve = &capture.solve_receipt;
+
+        let roots = input
+            .parent()
+            .map(|path| path.display().to_string())
+            .into_iter()
+            .chain(
+                input
+                    .canonicalize()
+                    .ok()
+                    .and_then(|path| path.parent().map(std::path::Path::to_path_buf))
+                    .map(|path| path.display().to_string()),
+            )
+            .collect::<BTreeSet<_>>();
+        let stamp = |raw: &str| {
+            let mut lines = raw.lines();
+            let header = lines.next().unwrap_or_default();
+            let prefix_header = "corpus\tanalysis_frame\tcode_frame\traw_boundary_wave\tdata\tbuild_profile\tresource_configured_mib\tresource_effective_mib\tprogram";
+            let prefix = format!(
+                "rs-crown\t{}\t{}\twave1\t{}\t{}\t{}\t{}\t{}",
+                model_cache::ANALYSIS_FRAME,
+                code_frame,
+                data,
+                build_profile,
+                configured_memory,
+                effective_memory,
+                name,
+            );
+            let mut output = format!("{prefix_header}\t{header}\n");
+            for line in lines {
+                let normalized = roots.iter().fold(line.to_owned(), |line, root| {
+                    line.replace(root, "<program>")
+                });
+                output.push_str(&format!("{prefix}\t{normalized}\n"));
+            }
+            output
+        };
+        let artifact = &capture.raw_boundary_artifacts;
+        let artifact_rows = [
+            ("sites", artifact.sites.as_str()),
+            ("retention", artifact.retention.as_str()),
+            ("dispositions", artifact.dispositions.as_str()),
+            ("subject-index", artifact.subjects.as_str()),
+            ("atoms", artifact.atoms.as_str()),
+            ("atom-outcomes", artifact.atom_outcomes.as_str()),
+            ("final-reverts", artifact.final_reverts.as_str()),
+            ("subjects", capture.subject_receipt.as_str()),
+        ];
+        for (suffix, contents) in artifact_rows {
+            std::fs::write(
+                directory.join(format!("{name}.raw-boundary-{suffix}.tsv")),
+                stamp(contents),
+            )
+            .unwrap_or_else(|error| panic!("write raw-boundary {suffix}: {error}"));
+        }
+        let mut diagnostics =
+            String::from("function\terror_code\tmessage_head\tfile\tline\tattribution\n");
+        for diagnostic in &capture.reverts {
+            diagnostics.push_str(&format!(
+                "{}\t{}\t{}\t{}\t{}\t{}\n",
+                tsv_field(&diagnostic.function, 300),
+                e1_code(diagnostic.diagnostic.code.as_deref()),
+                tsv_field(&diagnostic.diagnostic.message, 300),
+                tsv_field(
+                    &crate::bo_rewriter::verify::crate_relative(
+                        &diagnostic.diagnostic.file,
+                        &capture.observed_root,
+                    ),
+                    400,
+                ),
+                diagnostic.diagnostic.line,
+                diagnostic.attribution,
+            ));
+        }
+        let diagnostics_path =
+            directory.join(format!("{name}.raw-boundary-compiler-diagnostics.tsv"));
+        std::fs::write(&diagnostics_path, stamp(&diagnostics))
+            .expect("write raw-boundary diagnostics");
+
+        let subject_decisions = capture
+            .subject_receipt
+            .lines()
+            .skip(1)
+            .filter_map(|line| {
+                let fields = line.split('\t').collect::<Vec<_>>();
+                Some((fields.first()?.to_string(), fields.get(7)?.to_string()))
+            })
+            .collect::<BTreeMap<_, _>>();
+        let mut reverted_functions = BTreeSet::new();
+        let mut reverted_atoms = BTreeSet::new();
+        for line in artifact.final_reverts.lines().skip(1) {
+            let mut fields = line.split('\t');
+            match (fields.next(), fields.next()) {
+                (Some("function"), Some(identity)) => {
+                    reverted_functions.insert(identity.to_owned());
+                }
+                (Some("atom"), Some(identity)) => {
+                    reverted_atoms.insert(identity.to_owned());
+                }
+                _ => {}
+            }
+        }
+        #[derive(Default)]
+        struct SubjectOutcome {
+            has_t1: bool,
+            has_t2: bool,
+            blocked: bool,
+            survives: bool,
+        }
+        let mut subjects = BTreeMap::<String, SubjectOutcome>::new();
+        let mut t1_sites = 0usize;
+        let mut t2_sites = 0usize;
+        let mut blocked_sites = 0usize;
+        let mut t1_surviving = 0usize;
+        let mut t2_surviving = 0usize;
+        let mut zero_syntax = 0usize;
+        let mut explicit = 0usize;
+        let mut lifecycle = 0usize;
+        for line in artifact.dispositions.lines().skip(1) {
+            let fields = line.split('\t').collect::<Vec<_>>();
+            if fields.len() != 15 {
+                continue;
+            }
+            let caller = fields[0];
+            let identity = fields[6];
+            let tier = fields[8];
+            let template = fields[9];
+            let atom_group = fields[14]
+                .split(';')
+                .filter(|atom| *atom != "-" && !atom.is_empty())
+                .collect::<Vec<_>>();
+            let survives = !reverted_functions.contains(caller)
+                && atom_group
+                    .iter()
+                    .all(|atom| !reverted_atoms.contains(*atom));
+            let outcome = subjects.entry(identity.to_owned()).or_default();
+            outcome.survives |= survives;
+            match tier {
+                "T1" => {
+                    t1_sites += 1;
+                    t1_surviving += usize::from(survives);
+                    outcome.has_t1 = true;
+                }
+                "T2" => {
+                    t2_sites += 1;
+                    t2_surviving += usize::from(survives);
+                    outcome.has_t2 = true;
+                }
+                _ => {
+                    blocked_sites += 1;
+                    outcome.blocked = true;
+                }
+            }
+            if matches!(tier, "T1" | "T2") {
+                match template {
+                    "ref-mut-to-raw-mut" | "ref-mut-to-raw-const" | "ref-shared-to-raw-const" => {
+                        zero_syntax += 1
+                    }
+                    "known-free-drop" => lifecycle += 1,
+                    _ => explicit += 1,
+                }
+            }
+        }
+        let emits = |identity: &str| {
+            subject_decisions.get(identity).is_some_and(|decision| {
+                matches!(
+                    decision.as_str(),
+                    "ref" | "inferred-ref" | "slice" | "optional" | "box"
+                )
+            })
+        };
+        let t1_realized = subjects
+            .iter()
+            .filter(|(identity, outcome)| {
+                outcome.has_t1
+                    && !outcome.has_t2
+                    && !outcome.blocked
+                    && outcome.survives
+                    && emits(identity)
+            })
+            .count();
+        let t2_realized = subjects
+            .iter()
+            .filter(|(identity, outcome)| {
+                outcome.has_t2 && !outcome.blocked && outcome.survives && emits(identity)
+            })
+            .count();
+        let masked_secondary = subjects
+            .iter()
+            .filter(|(identity, outcome)| (outcome.has_t1 || outcome.has_t2) && !emits(identity))
+            .count();
+        let atom_counts = artifact.atom_outcomes.lines().skip(1).fold(
+            BTreeMap::<&str, usize>::new(),
+            |mut counts, line| {
+                let key = line.split('\t').next().unwrap_or("-");
+                *counts.entry(key).or_default() += 1;
+                counts
+            },
+        );
+        let address_edits = artifact
+            .atoms
+            .lines()
+            .skip(1)
+            .filter(|line| line.starts_with("raw-boundary-address:"))
+            .count();
+        let waiver_sha = format!(
+            "{:x}",
+            Sha256::digest(
+                crate::bo_rewriter::decision::raw_boundary::RAW_BOUNDARY_WAIVER_TEXT.as_bytes()
+            )
+        );
+        let timing = &artifact.timings;
+        let timings = format!(
+            "site_derivation_s\tretention_fixpoint_s\tcertificate_replay_s\tdecision_s\trender_s\treceipt_s\tinitial_verify_s\tatom_reverify_s\tworker_total_s\n{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+            timing.site_derivation_wall_s,
+            timing.retention_fixpoint_wall_s,
+            timing.certificate_replay_wall_s,
+            timing.decision_wall_s,
+            timing.render_wall_s,
+            timing.receipt_wall_s,
+            timing.initial_verify_wall_s,
+            timing.atom_reverify_wall_s,
+            secs(started.elapsed()),
+        );
+        std::fs::write(
+            directory.join(format!("{name}.raw-boundary-timings.tsv")),
+            stamp(&timings),
+        )
+        .expect("write raw-boundary timings");
+
+        row.set(raw_schema::CORPUS, "rs-crown");
+        row.set(raw_schema::ANALYSIS_FRAME, model_cache::ANALYSIS_FRAME);
+        row.set(raw_schema::CODE_FRAME, &code_frame);
+        row.set(raw_schema::WAVE, "wave1");
+        row.set(raw_schema::DATA, data);
+        row.set(raw_schema::BUILD_PROFILE, build_profile);
+        row.set(raw_schema::LAUNCH_PROFILE, &launch_profile);
+        row.set(raw_schema::RESOURCE_CONFIGURED_MIB, &configured_memory);
+        row.set(raw_schema::RESOURCE_EFFECTIVE_MIB, &effective_memory);
+        row.set(raw_schema::CACHE_STATUS, &solve.cache_status);
+        row.set(raw_schema::CACHE_FINGERPRINT, &solve.fingerprint);
+        row.set(raw_schema::CACHE_MODEL_SHA256, &solve.model_sha256);
+        row.set(raw_schema::SOLVE_WALL_S, &solve.solve_wall_s);
+        row.set(
+            raw_schema::WAIVER_ID,
+            crate::bo_rewriter::decision::raw_boundary::RAW_BOUNDARY_WAIVER_ID,
+        );
+        row.set(raw_schema::WAIVER_CONFIRMED, 1);
+        row.set(raw_schema::WAIVER_TEXT_SHA256, waiver_sha);
+        row.set(
+            raw_schema::SITE_ROWS,
+            artifact.sites.lines().skip(1).count(),
+        );
+        row.set(raw_schema::SUBJECT_ROWS, subjects.len());
+        row.set(raw_schema::T1_CANDIDATE_SITES, t1_sites);
+        row.set(raw_schema::T2_CANDIDATE_SITES, t2_sites);
+        row.set(raw_schema::T2_WAIVER_SITES, t2_sites);
+        row.set(raw_schema::BLOCKED_SITES, blocked_sites);
+        row.set(raw_schema::ZERO_SYNTAX_SITES, zero_syntax);
+        row.set(raw_schema::EXPLICIT_BRIDGE_SITES, explicit);
+        row.set(raw_schema::LIFECYCLE_SITES, lifecycle);
+        row.set(raw_schema::T1_COMPILER_SURVIVING, t1_surviving);
+        row.set(raw_schema::T2_COMPILER_SURVIVING, t2_surviving);
+        row.set(raw_schema::T1_REALIZED_SUBJECTS, t1_realized);
+        row.set(raw_schema::T2_REALIZED_SUBJECTS, t2_realized);
+        row.set(raw_schema::MASKED_SECONDARY, masked_secondary);
+        row.set(raw_schema::ADDRESS_OBSERVATION_EDITS, address_edits);
+        row.set(
+            raw_schema::ATOM_ATTEMPTS,
+            atom_counts.get("atom-succeeded").copied().unwrap_or(0)
+                + atom_counts
+                    .get("atom-second-verify-fallback")
+                    .copied()
+                    .unwrap_or(0),
+        );
+        row.set(
+            raw_schema::ATOM_SUCCESSES,
+            atom_counts.get("atom-succeeded").copied().unwrap_or(0),
+        );
+        row.set(
+            raw_schema::ATOM_AMBIGUOUS,
+            atom_counts
+                .get("atom-ambiguous-fallback")
+                .copied()
+                .unwrap_or(0),
+        );
+        row.set(
+            raw_schema::ATOM_SECOND_VERIFY,
+            atom_counts
+                .get("atom-second-verify-fallback")
+                .copied()
+                .unwrap_or(0),
+        );
+        row.set(raw_schema::ATOM_FUNCTION_FALLBACK, reverted_functions.len());
+        row.set(raw_schema::ARM_B_ROWS, 0);
+        row.set(raw_schema::ARM_B_BOX_ROWS, 0);
+        row.set(raw_schema::ARM_B_CROWN_ROWS, 0);
+        row.set(
+            raw_schema::SITE_DERIVATION_WALL_S,
+            &timing.site_derivation_wall_s,
+        );
+        row.set(
+            raw_schema::RETENTION_FIXPOINT_WALL_S,
+            &timing.retention_fixpoint_wall_s,
+        );
+        row.set(
+            raw_schema::CERTIFICATE_REPLAY_WALL_S,
+            &timing.certificate_replay_wall_s,
+        );
+        row.set(raw_schema::DECISION_WALL_S, &timing.decision_wall_s);
+        row.set(raw_schema::RENDER_WALL_S, &timing.render_wall_s);
+        row.set(raw_schema::RECEIPT_WALL_S, &timing.receipt_wall_s);
+        row.set(
+            raw_schema::INITIAL_VERIFY_WALL_S,
+            &timing.initial_verify_wall_s,
+        );
+        row.set(
+            raw_schema::ATOM_REVERIFY_WALL_S,
+            &timing.atom_reverify_wall_s,
+        );
+        let profile_ok =
+            build_profile == "release" && launch_profile == "release" && !cfg!(debug_assertions);
+        let cache_ok = solve.source == "cache"
+            && solve.cache_status == "hit"
+            && solve.solve_wall_s == "0.000000";
+        row.set(
+            raw_schema::STATUS,
+            if non_citable_reason.is_some() {
+                "non-citable-resource-bound"
+            } else if !profile_ok {
+                "debug-build-profile"
+            } else if !cache_ok {
+                "cache-gate-failed"
+            } else {
+                "ok"
+            },
+        );
+        row
+    }
+
     pub fn run_box_census(input: &std::path::Path) -> Row {
         let code_frame = std::env::var("CRAT_BOX_CODE_FRAME")
             .unwrap_or_else(|_| "missing-code-frame".to_owned());
@@ -12870,6 +13267,7 @@ fn the_reporting_site_reads_files_touched_not_the_map_size() {
         e1_adapter_receipt: String::new(),
         e1_subject_receipt: String::new(),
         e2_artifacts: crate::bo_rewriter::E2Artifacts::default(),
+        raw_boundary_artifacts: crate::bo_rewriter::RawBoundaryArtifacts::default(),
         e1_novel_error_count: 0,
         e1_box_drop_receipt: String::new(),
         solve_receipt: None,
@@ -18284,6 +18682,7 @@ fn boc1_run_one() {
             | "e2-fn-census"
             | "box-facts"
             | "box-census"
+            | "raw-boundary-census"
     ) || mode.starts_with("selector-detail-")
     {
         z3::set_global_param("smt.random_seed", "0");
@@ -18324,6 +18723,14 @@ fn boc1_run_one() {
         let mut row = run::run_box_census(Path::new(&input));
         row.set("program", name.clone());
         row.set("mode", "box-census");
+        println!("{}", report::to_kv_line(&row));
+        return;
+    }
+
+    if mode == "raw-boundary-census" {
+        let mut row = run::run_raw_boundary_census(Path::new(&input));
+        row.set("program", name.clone());
+        row.set("mode", "raw-boundary-census");
         println!("{}", report::to_kv_line(&row));
         return;
     }

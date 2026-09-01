@@ -143,6 +143,7 @@ pub(crate) struct RawBoundarySiteFact {
     pub callee_local: Option<LocalDefId>,
     pub direction: BoundaryDirection,
     pub source_span: Span,
+    pub source_site: String,
     pub source_shape: &'static str,
     pub source_type: String,
     pub target: RawTargetType,
@@ -155,6 +156,7 @@ pub(crate) struct RawBoundarySiteFailure {
     pub callee: ForeignSymbolKey,
     pub argument_index: usize,
     pub source_span: Span,
+    pub source_site: String,
     pub reason: SiteMatchFailure,
 }
 
@@ -250,6 +252,10 @@ impl RawBoundarySiteFacts {
                     callee_local: None,
                     direction: BoundaryDirection::OutgoingArgument,
                     source_span: fact.argument_span,
+                    source_site: tcx
+                        .sess
+                        .source_map()
+                        .span_to_diagnostic_string(fact.argument_span),
                     source_shape: fact.shape,
                     source_type: fact.source_type.clone(),
                     target: fact.target.clone(),
@@ -260,6 +266,10 @@ impl RawBoundarySiteFacts {
                     callee: fact.callee.clone(),
                     argument_index: fact.argument_index,
                     source_span: fact.argument_span,
+                    source_site: tcx
+                        .sess
+                        .source_map()
+                        .span_to_diagnostic_string(fact.argument_span),
                     reason,
                 }),
             }
@@ -295,6 +305,10 @@ impl RawBoundarySiteFacts {
                             callee_local: Some(callee),
                             direction: BoundaryDirection::OutgoingArgument,
                             source_span: argument.span,
+                            source_site: tcx
+                                .sess
+                                .source_map()
+                                .span_to_diagnostic_string(argument.span),
                             source_shape: argument.shape.key(),
                             source_type: argument.source_type.clone(),
                             target,
@@ -305,6 +319,10 @@ impl RawBoundarySiteFacts {
                             callee: callee_key.clone(),
                             argument_index: argument.index,
                             source_span: argument.span,
+                            source_site: tcx
+                                .sess
+                                .source_map()
+                                .span_to_diagnostic_string(argument.span),
                             reason,
                         }),
                     }
@@ -324,11 +342,11 @@ impl RawBoundarySiteFacts {
 
     pub(crate) fn to_tsv(&self) -> String {
         let mut out = String::from(
-            "status\tcaller\tblock\tstatement_index\tcallee_path\tcallee_symbol\tforeign\tabi\tsignature\targument_index\tsubject\tsource_lo\tsource_hi\tsource_shape\tsource_type\ttarget_type\ttarget_pointee\ttarget_mutability\treason\n",
+            "status\tcaller\tblock\tstatement_index\tcallee_path\tcallee_symbol\tforeign\tabi\tsignature\targument_index\tsubject\tsource_site\tsource_lo\tsource_hi\tsource_shape\tsource_type\ttarget_type\ttarget_pointee\ttarget_mutability\treason\n",
         );
         for site in &self.sites {
             out.push_str(&format!(
-                "site\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t-\n",
+                "site\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t-\n",
                 site.key.caller,
                 site.key.block,
                 site.key.statement_index,
@@ -339,6 +357,7 @@ impl RawBoundarySiteFacts {
                 site.key.callee.signature,
                 site.key.argument_index,
                 site.key.subject,
+                site.source_site,
                 site.source_span.lo().0,
                 site.source_span.hi().0,
                 site.source_shape,
@@ -350,7 +369,7 @@ impl RawBoundarySiteFacts {
         }
         for failure in &self.failures {
             out.push_str(&format!(
-                "failure\t{}\t-\t-\t{}\t{}\t{}\t{}\t{}\t{}\t-\t{}\t{}\t-\t-\t-\t-\t-\t{}\n",
+                "failure\t{}\t-\t-\t{}\t{}\t{}\t{}\t{}\t{}\t-\t{}\t{}\t{}\t-\t-\t-\t-\t-\t{}\n",
                 failure.caller,
                 failure.callee.path,
                 failure.callee.symbol,
@@ -358,6 +377,7 @@ impl RawBoundarySiteFacts {
                 failure.callee.abi,
                 failure.callee.signature,
                 failure.argument_index,
+                failure.source_site,
                 failure.source_span.lo().0,
                 failure.source_span.hi().0,
                 failure.reason.key(),
@@ -966,6 +986,59 @@ impl RetentionSummaries {
             _ => Err("retention-certificate-invalid"),
         }
     }
+
+    pub(crate) fn to_tsv(&self) -> String {
+        let mut keys = self.rows.keys().copied().collect::<Vec<_>>();
+        keys.sort_by_key(|(function, argument)| (function.local_def_index.as_u32(), *argument));
+        let mut out = String::from(
+            "function\tlocal_def_index\targument_index\tverdict\treason\tpath_or_frontier\tattested\n",
+        );
+        for key in keys {
+            let facts = self.facts.get(&key);
+            let function = facts.map_or("<missing>", |facts| facts.function_path.as_str());
+            let (verdict, reason, steps) = match &self.rows[&key] {
+                RetentionVerdict::NoRetain { certificate } => (
+                    "no-retain",
+                    "-",
+                    certificate
+                        .steps
+                        .iter()
+                        .map(|step| format!("{}:{:?}:{}", step.location, step.kind, step.detail))
+                        .collect::<Vec<_>>()
+                        .join(";"),
+                ),
+                RetentionVerdict::Retains { sink, path } => (
+                    "retains",
+                    "positive-retention",
+                    path.iter()
+                        .chain(std::iter::once(sink))
+                        .map(|step| format!("{}:{:?}:{}", step.location, step.kind, step.detail))
+                        .collect::<Vec<_>>()
+                        .join(";"),
+                ),
+                RetentionVerdict::Unknown { reason, frontier } => (
+                    "unknown",
+                    reason.key(),
+                    frontier
+                        .iter()
+                        .map(|step| format!("{}:{:?}:{}", step.location, step.kind, step.detail))
+                        .collect::<Vec<_>>()
+                        .join(";"),
+                ),
+            };
+            out.push_str(&format!(
+                "{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+                function,
+                key.0.local_def_index.as_u32(),
+                key.1,
+                verdict,
+                reason,
+                if steps.is_empty() { "-" } else { &steps },
+                u8::from(self.attested),
+            ));
+        }
+        out
+    }
 }
 
 pub(crate) const RAW_BOUNDARY_WAIVER_ID: &str =
@@ -1130,8 +1203,10 @@ pub(crate) struct RawBoundaryRenderSite {
     pub target: RawTargetType,
     pub box_slice: bool,
     pub source_shape: &'static str,
+    pub source_site: String,
     pub node: Option<(LocalDefId, HirId)>,
     pub target_stays_raw: bool,
+    pub subject_identity: String,
 }
 
 #[derive(Clone, Debug)]
@@ -1227,6 +1302,7 @@ pub(crate) struct RawBoundaryDispositionIndex {
     open_nodes: FxHashSet<(LocalDefId, HirId)>,
     blocked_nodes: FxHashMap<(LocalDefId, HirId), RawBoundaryBlockReason>,
     address_sites: Vec<AddressViewSite>,
+    certificate_replay_wall_s: f64,
 }
 
 impl RawBoundaryDispositionIndex {
@@ -1239,9 +1315,10 @@ impl RawBoundaryDispositionIndex {
         let decisions = hypothetical
             .entries
             .iter()
-            .map(|(subject, decision)| ((subject.fn_did, subject.hir_id), decision))
+            .map(|(subject, decision)| ((subject.fn_did, subject.hir_id), (subject, decision)))
             .collect::<FxHashMap<_, _>>();
         let mut out = Self::default();
+        let mut certificate_replay_wall_s = 0.0f64;
         let mut nodes = FxHashMap::<(LocalDefId, HirId), Vec<bool>>::default();
         for site in &site_facts.sites {
             let disposition: Result<RawBoundaryDisposition, (RawBoundaryBlockReason, String)> =
@@ -1252,7 +1329,7 @@ impl RawBoundaryDispositionIndex {
                             "site has no subject root".to_owned(),
                         )
                     })?;
-                    let decision = decisions.get(&node).copied().ok_or_else(|| {
+                    let (_, decision) = decisions.get(&node).copied().ok_or_else(|| {
                         (
                             RawBoundaryBlockReason::SubjectNotSafe,
                             "hypothetical has no safe subject decision".to_owned(),
@@ -1314,15 +1391,18 @@ impl RawBoundaryDispositionIndex {
                         .map_err(|reason| (reason, "template-preflight".to_owned()))?;
                     match retention_verdict {
                         RetentionVerdict::NoRetain { certificate } => {
-                            if site.callee_local.is_some()
+                            let certificate_started = std::time::Instant::now();
+                            let certificate_invalid = site.callee_local.is_some()
                                 && retention
                                     .verify_certificate(
                                         site.callee_local.expect("local"),
                                         site.key.argument_index,
                                         &certificate,
                                     )
-                                    .is_err()
-                            {
+                                    .is_err();
+                            certificate_replay_wall_s +=
+                                certificate_started.elapsed().as_secs_f64();
+                            if certificate_invalid {
                                 return Err((
                                     RawBoundaryBlockReason::ContractInvalid,
                                     "retention-certificate-invalid".to_owned(),
@@ -1348,7 +1428,7 @@ impl RawBoundaryDispositionIndex {
             });
             let box_slice = site
                 .node
-                .and_then(|node| decisions.get(&node).copied())
+                .and_then(|node| decisions.get(&node).map(|(_, decision)| *decision))
                 .is_some_and(|decision| {
                     matches!(
                         decision,
@@ -1376,8 +1456,16 @@ impl RawBoundaryDispositionIndex {
                     target: site.target.clone(),
                     box_slice,
                     source_shape: site.source_shape,
+                    source_site: site.source_site.clone(),
                     node: site.node,
                     target_stays_raw,
+                    subject_identity: site
+                        .node
+                        .and_then(|node| decisions.get(&node).map(|(subject, _)| *subject))
+                        .map_or_else(
+                            || format!("{}::{}", site.key.caller, site.key.subject),
+                            |subject| subject.identity_key(&site.key.caller),
+                        ),
                 },
             );
             if let Some(node) = site.node {
@@ -1417,7 +1505,7 @@ impl RawBoundaryDispositionIndex {
                 continue;
             }
             for operand in &observation.operands {
-                let Some(decision) = decisions.get(&operand.node).copied() else {
+                let Some((_, decision)) = decisions.get(&operand.node).copied() else {
                     continue;
                 };
                 let target = RawTargetType {
@@ -1471,6 +1559,7 @@ impl RawBoundaryDispositionIndex {
                     &right.3,
                 ))
         });
+        out.certificate_replay_wall_s = certificate_replay_wall_s;
         out
     }
 
@@ -1497,8 +1586,9 @@ impl RawBoundaryDispositionIndex {
 
     pub(crate) fn receipts_tsv(&self) -> String {
         let mut out = String::from(
-            "caller\tblock\tstatement_index\tcallee\targument_index\tsubject\ttier\ttemplate\twaiver_id\tevidence\treason\tdetail\n",
+            "caller\tblock\tstatement_index\tcallee\targument_index\tsubject\tsubject_identity\tsource_site\ttier\ttemplate\twaiver_id\tevidence\treason\tdetail\tatom_group\n",
         );
+        let atom_groups = self.subject_atom_groups();
         for (key, disposition) in &self.by_site {
             let (template, waiver, evidence, reason, detail) = match disposition {
                 RawBoundaryDisposition::T1 { template, evidence } => {
@@ -1519,20 +1609,38 @@ impl RawBoundaryDispositionIndex {
                     ("-", "-", "-", reason.key(), detail.as_str())
                 }
             };
+            let render = self.render_sites.get(key);
+            let subject_identity = render.map_or("-", |site| site.subject_identity.as_str());
+            let atom_group = render
+                .and_then(|site| site.node)
+                .map(|node| {
+                    atom_groups
+                        .get(&node)
+                        .into_iter()
+                        .flatten()
+                        .map(|atom| atom.id.as_str())
+                        .collect::<Vec<_>>()
+                        .join(";")
+                })
+                .filter(|group| !group.is_empty())
+                .unwrap_or_else(|| "-".to_owned());
             out.push_str(&format!(
-                "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+                "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
                 key.caller,
                 key.block,
                 key.statement_index,
                 key.callee.path,
                 key.argument_index,
                 key.subject,
+                subject_identity,
+                render.map_or("-", |site| site.source_site.as_str()),
                 disposition.tier(),
                 template,
                 waiver,
                 evidence,
                 reason,
                 detail,
+                atom_group,
             ));
         }
         out
@@ -1540,6 +1648,36 @@ impl RawBoundaryDispositionIndex {
 
     pub(crate) fn address_sites(&self) -> &[AddressViewSite] {
         &self.address_sites
+    }
+
+    pub(crate) fn certificate_replay_wall_s(&self) -> f64 {
+        self.certificate_replay_wall_s
+    }
+
+    pub(crate) fn atoms_tsv(&self) -> String {
+        let groups = self.subject_atom_groups();
+        let mut rows = groups
+            .values()
+            .flatten()
+            .map(|atom| {
+                (
+                    atom.id.clone(),
+                    format!(
+                        "{}\t{}\t{}\t{}\n",
+                        atom.id,
+                        atom.owner,
+                        atom.node.0.local_def_index.as_u32(),
+                        atom.node.1.local_id.as_u32()
+                    ),
+                )
+            })
+            .collect::<Vec<_>>();
+        rows.sort_by(|left, right| left.0.cmp(&right.0));
+        let mut out = String::from("atom_id\towner\tlocal_def_index\thir_local_id\n");
+        for (_, row) in rows {
+            out.push_str(&row);
+        }
+        out
     }
 
     /// Exact site atoms grouped by the subject whose safe declaration and use
@@ -1585,6 +1723,23 @@ impl RawBoundaryDispositionIndex {
 
     pub(crate) fn opens_node(&self, node: (LocalDefId, HirId)) -> bool {
         self.open_nodes.contains(&node)
+    }
+
+    pub(crate) fn node_dispositions(
+        &self,
+        node: (LocalDefId, HirId),
+    ) -> Vec<(&RawBoundarySiteKey, &RawBoundaryDisposition)> {
+        let mut rows = self
+            .render_sites
+            .iter()
+            .filter_map(|(key, site)| {
+                (site.node == Some(node))
+                    .then(|| self.by_site.get(key).map(|disposition| (key, disposition)))
+                    .flatten()
+            })
+            .collect::<Vec<_>>();
+        rows.sort_by(|left, right| left.0.cmp(right.0));
+        rows
     }
 
     pub(crate) fn opens_span(&self, node: (LocalDefId, HirId), span: Span) -> bool {

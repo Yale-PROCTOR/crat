@@ -7,6 +7,7 @@ pub(crate) const CORPUS: &str = "raw_boundary_corpus";
 pub(crate) const ANALYSIS_FRAME: &str = "raw_boundary_analysis_frame";
 pub(crate) const CODE_FRAME: &str = "raw_boundary_code_frame";
 pub(crate) const WAVE: &str = "raw_boundary_wave";
+pub(crate) const DATA: &str = "raw_boundary_data";
 pub(crate) const BUILD_PROFILE: &str = "raw_boundary_build_profile";
 pub(crate) const LAUNCH_PROFILE: &str = "raw_boundary_launch_profile";
 pub(crate) const RESOURCE_CONFIGURED_MIB: &str = "raw_boundary_resource_configured_mib";
@@ -64,6 +65,7 @@ pub(crate) const ALL: &[&str] = &[
     ANALYSIS_FRAME,
     CODE_FRAME,
     WAVE,
+    DATA,
     BUILD_PROFILE,
     LAUNCH_PROFILE,
     RESOURCE_CONFIGURED_MIB,

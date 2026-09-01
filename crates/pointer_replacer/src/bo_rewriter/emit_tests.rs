@@ -2047,6 +2047,7 @@ fn a_probe_does_not_compile_the_baseline_it_never_consults() {
         &|_| {},
         true,
         false,
+        false,
         None,
     );
     match probe {
@@ -2177,6 +2178,7 @@ fn a_degraded_outcome_still_reports_its_unplaceable_decisions() {
         super::MAX_REVERT_ROUNDS,
         &|_| {},
         true,
+        false,
         false,
         None,
     );
@@ -2322,6 +2324,7 @@ fn a_degraded_outcome_reports_placements_too() {
         super::MAX_REVERT_ROUNDS,
         &|_| {},
         true,
+        false,
         false,
         None,
     );
