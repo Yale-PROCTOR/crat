@@ -33,6 +33,8 @@ use rustc_hir::{
 use rustc_middle::ty::TyCtxt;
 use rustc_span::Span;
 
+use super::raw_boundary::{ForeignCallArgFact, raw_target_type, symbol_key};
+
 /// Methods that exist on raw pointers and not on references.
 ///
 /// Deliberately a small, exact list rather than a heuristic: a false positive
@@ -238,13 +240,15 @@ fn place_root(expr: &Expr<'_>) -> (Option<HirId>, bool) {
 }
 
 /// One argument at one call site.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Arg {
     /// The callee's **0-based parameter index**, which is `SubjectKind::Param`'s
     /// `hir_index` — the same key, so the join needs no translation.
     pub index: usize,
     pub span: Span,
     pub shape: ArgShape,
+    pub source_type: String,
+    pub target: Option<super::raw_boundary::RawTargetType>,
 }
 
 /// One direct call to a local `fn`, with everything adaptation needs.
@@ -431,6 +435,10 @@ pub(crate) struct EmitabilityFacts {
     /// **The decision layer must not read this at task 0** — the S3.6-0 pattern
     /// that makes zero corpus delta structural rather than lucky.
     pub call_args: FxHashMap<LocalDefId, Vec<CallSite>>,
+    /// Resolved arguments to non-body callees. Unlike [`call_args`], every row
+    /// carries the exact callee identity and raw target type needed by the
+    /// raw-boundary contract gate.
+    pub foreign_call_args: Vec<ForeignCallArgFact>,
     /// Item-E wave 2's exact, allowlisted body positions. An empty entry for a
     /// ninth function is the scope control; no downstream name filter exists.
     pub body_adapters: Vec<BodyAdapterSite>,
@@ -570,26 +578,63 @@ impl<'tcx> Visitor<'tcx> for BodyFacts<'_, 'tcx> {
             ExprKind::Call(callee, args) => {
                 if let ExprKind::Path(QPath::Resolved(_, path)) = &callee.kind
                     && let Res::Def(rustc_hir::def::DefKind::Fn, def_id) = path.res
-                    && let Some(local_did) = def_id.as_local()
-                    && self.locals.contains(&local_did)
                 {
-                    self.facts
-                        .call_args
-                        .entry(local_did)
-                        .or_default()
-                        .push(CallSite {
-                            caller: self.fn_did,
-                            span: expr.span,
-                            args: args
-                                .iter()
-                                .enumerate()
-                                .map(|(index, arg)| Arg {
-                                    index,
-                                    span: arg.span,
-                                    shape: classify_arg(self.tcx, arg),
-                                })
-                                .collect(),
-                        });
+                    if let Some(local_did) = def_id.as_local()
+                        && self.locals.contains(&local_did)
+                    {
+                        let sig = self.tcx.fn_sig(def_id).skip_binder().skip_binder();
+                        let typeck = self.tcx.typeck(self.fn_did);
+                        self.facts
+                            .call_args
+                            .entry(local_did)
+                            .or_default()
+                            .push(CallSite {
+                                caller: self.fn_did,
+                                span: expr.span,
+                                args: args
+                                    .iter()
+                                    .enumerate()
+                                    .map(|(index, arg)| {
+                                        let target = sig
+                                            .inputs()
+                                            .get(index)
+                                            .copied()
+                                            .and_then(raw_target_type);
+                                        Arg {
+                                            index,
+                                            span: arg.span,
+                                            shape: classify_arg(self.tcx, arg),
+                                            source_type: format!("{:?}", typeck.expr_ty(arg)),
+                                            target,
+                                        }
+                                    })
+                                    .collect(),
+                            });
+                    } else {
+                        let sig = self.tcx.fn_sig(def_id).skip_binder().skip_binder();
+                        let typeck = self.tcx.typeck(self.fn_did);
+                        let symbol = symbol_key(self.tcx, def_id, self.locals);
+                        for (index, arg) in args.iter().enumerate() {
+                            let Some(target_ty) = sig.inputs().get(index).copied() else {
+                                continue;
+                            };
+                            let Some(target) = raw_target_type(target_ty) else {
+                                continue;
+                            };
+                            let shape = classify_arg(self.tcx, arg);
+                            self.facts.foreign_call_args.push(ForeignCallArgFact {
+                                caller: self.fn_did,
+                                callee: symbol.clone(),
+                                call_span: expr.span,
+                                argument_index: index,
+                                argument_span: arg.span,
+                                root: shape.place_root(),
+                                shape: shape.key(),
+                                source_type: format!("{:?}", typeck.expr_ty(arg)),
+                                target,
+                            });
+                        }
+                    }
                 }
             }
             // (4) pointer comparison — F5.
