@@ -2791,6 +2791,43 @@ mod tests {
     }
 
     #[test]
+    fn box2_bridge_failure_vocabulary_is_exhaustive_and_typed() {
+        for (failure, key) in [
+            (
+                ConstructionBridgeFailure::MissingVersionSite,
+                "missing-version-site",
+            ),
+            (
+                ConstructionBridgeFailure::MultipleDefinitions,
+                "multiple-definitions",
+            ),
+            (
+                ConstructionBridgeFailure::BranchOrJoinFed,
+                "branch-or-join-fed",
+            ),
+            (
+                ConstructionBridgeFailure::NonTransparentRvalue,
+                "nontransparent-rvalue",
+            ),
+            (ConstructionBridgeFailure::ProjectedPlace, "projected-place"),
+            (
+                ConstructionBridgeFailure::CrossFunctionHop,
+                "cross-function-hop",
+            ),
+            (
+                ConstructionBridgeFailure::MultipleTerminals,
+                "multiple-terminals",
+            ),
+            (
+                ConstructionBridgeFailure::DifferentSubject,
+                "different-subject",
+            ),
+        ] {
+            assert_eq!(failure.key(), key);
+        }
+    }
+
+    #[test]
     fn box_n3_sink_paths_require_exactly_one_sink_each() {
         let diamond = |block| match block {
             0 => vec![1, 2],

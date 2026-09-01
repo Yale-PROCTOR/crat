@@ -9732,7 +9732,7 @@ mod run {
         };
         std::fs::write(
             directory.join(format!("{name}.box-plans.tsv")),
-            &artifact.tsv,
+            normalize(&artifact.tsv),
         )
         .expect("write Box plan ledger");
         std::fs::write(
