@@ -975,7 +975,35 @@ impl BridgeTemplate {
         target_mutability: RawMutability,
         box_slice: bool,
     ) -> Result<BridgeRender, RawBoundaryBlockReason> {
+        self.render_mode(argument, target_mutability, box_slice, false)
+    }
+
+    pub(crate) fn render_explicit(
+        self,
+        argument: &str,
+        target_mutability: RawMutability,
+        box_slice: bool,
+    ) -> Result<BridgeRender, RawBoundaryBlockReason> {
+        self.render_mode(argument, target_mutability, box_slice, true)
+    }
+
+    fn render_mode(
+        self,
+        argument: &str,
+        target_mutability: RawMutability,
+        box_slice: bool,
+        force_explicit: bool,
+    ) -> Result<BridgeRender, RawBoundaryBlockReason> {
         match self {
+            Self::RefMutToRawMut if force_explicit => Ok(BridgeRender::Edit(format!(
+                "core::ptr::from_mut(&mut *{argument})"
+            ))),
+            Self::RefMutToRawConst if force_explicit => Ok(BridgeRender::Edit(format!(
+                "core::ptr::from_ref(&*{argument})"
+            ))),
+            Self::RefSharedToRawConst if force_explicit => Ok(BridgeRender::Edit(format!(
+                "core::ptr::from_ref({argument})"
+            ))),
             Self::RefMutToRawMut | Self::RefMutToRawConst | Self::RefSharedToRawConst => {
                 Ok(BridgeRender::ZeroSyntax)
             }
@@ -1073,6 +1101,16 @@ pub(crate) struct RawBoundaryRenderSite {
     pub target_stays_raw: bool,
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct AddressViewSite {
+    pub owner: String,
+    pub span: Span,
+    pub node: (LocalDefId, HirId),
+    pub template: BridgeTemplate,
+    pub target: RawTargetType,
+    pub op: &'static str,
+}
+
 impl RawBoundaryDisposition {
     pub(crate) fn is_open(&self) -> bool {
         matches!(self, Self::T1 { .. } | Self::T2 { .. })
@@ -1155,6 +1193,7 @@ pub(crate) struct RawBoundaryDispositionIndex {
     site_lookup: Vec<((LocalDefId, HirId), Span, usize, RawBoundarySiteKey)>,
     open_nodes: FxHashSet<(LocalDefId, HirId)>,
     blocked_nodes: FxHashMap<(LocalDefId, HirId), RawBoundaryBlockReason>,
+    address_sites: Vec<AddressViewSite>,
 }
 
 impl RawBoundaryDispositionIndex {
@@ -1162,6 +1201,7 @@ impl RawBoundaryDispositionIndex {
         site_facts: &RawBoundarySiteFacts,
         retention: &RetentionSummaries,
         hypothetical: &super::DecisionTable,
+        emitability: &super::emitability::EmitabilityFacts,
     ) -> Self {
         let decisions = hypothetical
             .entries
@@ -1334,6 +1374,52 @@ impl RawBoundaryDispositionIndex {
                 out.open_nodes.insert(node);
             }
         }
+        for observation in &emitability.address_observations {
+            if observation.operands.len() != 2
+                || !observation
+                    .operands
+                    .iter()
+                    .all(|operand| out.open_nodes.contains(&operand.node))
+            {
+                continue;
+            }
+            for operand in &observation.operands {
+                let Some(decision) = decisions.get(&operand.node).copied() else {
+                    continue;
+                };
+                let target = RawTargetType {
+                    rendered: "*const _".to_owned(),
+                    pointee: "_".to_owned(),
+                    mutability: RawMutability::Const,
+                };
+                let Ok(template) = template_for(decision, &target, None) else {
+                    continue;
+                };
+                out.address_sites.push(AddressViewSite {
+                    owner: site_facts
+                        .sites
+                        .iter()
+                        .find(|site| site.node == Some(operand.node))
+                        .map_or_else(
+                            || observation.owner.local_def_index.as_u32().to_string(),
+                            |site| site.key.caller.clone(),
+                        ),
+                    span: operand.span,
+                    node: operand.node,
+                    template,
+                    target,
+                    op: observation.op,
+                });
+            }
+        }
+        out.address_sites.sort_by_key(|site| {
+            (
+                site.node.0.local_def_index.as_u32(),
+                site.node.1.local_id.as_u32(),
+                site.span.lo(),
+                site.span.hi(),
+            )
+        });
         out.site_lookup.sort_by(|left, right| {
             (
                 left.0.0.local_def_index.as_u32(),
@@ -1417,6 +1503,10 @@ impl RawBoundaryDispositionIndex {
             ));
         }
         out
+    }
+
+    pub(crate) fn address_sites(&self) -> &[AddressViewSite] {
+        &self.address_sites
     }
 
     pub(crate) fn opens_node(&self, node: (LocalDefId, HirId)) -> bool {

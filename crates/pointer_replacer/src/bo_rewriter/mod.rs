@@ -3417,7 +3417,7 @@ fn finish_decide<'tcx>(
         &opt_fat,
         &raw_boundary_argument_paths,
     );
-    let ctx_of = |gate, coconv, lifetime_eligibility| decision::Ctx {
+    let ctx_of = |gate, coconv, lifetime_eligibility, raw_boundary| decision::Ctx {
         tcx,
         model: &model,
         slots: &slots,
@@ -3432,6 +3432,7 @@ fn finish_decide<'tcx>(
         gate,
         coconv,
         lifetime_eligibility,
+        raw_boundary,
     };
 
     // **S3.6-1 task 2 — the co-conversion classes.**
@@ -3449,7 +3450,7 @@ fn finish_decide<'tcx>(
     // `BlockAll` variant was deleted at M-3 (X-3). Task 3 is where the verdict
     // reaches a gate.
     let hypothetical = decision::decide(
-        &ctx_of(decision::RefGate::LiftAdaptable, None, None),
+        &ctx_of(decision::RefGate::LiftAdaptable, None, None, None),
         &subjects,
     );
     // Escapes are computed BEFORE the classes now: P1 makes them a gate, not a
@@ -3472,6 +3473,7 @@ fn finish_decide<'tcx>(
             decision::RefGate::LiftAdaptable,
             None,
             Some(&lifetime_eligibility),
+            None,
         ),
         &subjects,
     );
@@ -3485,6 +3487,7 @@ fn finish_decide<'tcx>(
         &raw_boundary_sites,
         &retention,
         &e2_hypothetical,
+        &facts,
     );
     let coconv = decision::co_conversion::build_with_c9_marks_lifetimes_and_raw_boundary(
         &facts,
@@ -3507,6 +3510,7 @@ fn finish_decide<'tcx>(
             decision::RefGate::LiftAdaptable,
             Some(&coconv),
             Some(&lifetime_eligibility),
+            Some(&raw_boundary),
         ),
         &subjects,
     );

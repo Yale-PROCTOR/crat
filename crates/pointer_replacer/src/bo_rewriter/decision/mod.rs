@@ -837,6 +837,10 @@ pub(crate) struct Ctx<'a, 'tcx> {
     /// E2's pre-decision typed permits. `None` on the ordinary hypothetical
     /// comparator; `Some` on the E2-aware hypothetical and final pass.
     pub(crate) lifetime_eligibility: Option<&'a lifetime::LifetimeEligibility>,
+    /// Raw-boundary dispositions are absent on the hypothetical passes and
+    /// present on the single final pass. Address observations may be candidates
+    /// hypothetically but lift only when every boundary site is open.
+    pub(crate) raw_boundary: Option<&'a raw_boundary::RawBoundaryDispositionIndex>,
 }
 
 pub(crate) fn decide(ctx: &Ctx<'_, '_>, subjects: &[Subject]) -> DecisionTable {
@@ -1036,6 +1040,7 @@ fn decide_one_ladder(ctx: &Ctx<'_, '_>, subject: &Subject) -> Decision {
         gate,
         coconv,
         lifetime_eligibility,
+        raw_boundary,
     } = ctx;
     let decl_site = EmitabilityFacts::site(tcx, subject.attribution_span());
 
@@ -1172,11 +1177,18 @@ fn decide_one_ladder(ctx: &Ctx<'_, '_>, subject: &Subject) -> Decision {
         None => Form::Plain,
     };
     if let Some(span) = facts.ptr_comparisons.get(&(subject.fn_did, subject.hir_id)) {
-        return degrade(
-            subject,
-            EmitabilityFacts::site(tcx, *span),
-            DegradeReason::PtrComparison,
-        );
+        let node = (subject.fn_did, subject.hir_id);
+        let address_candidate = facts.is_value_observation_candidate(node);
+        let address_open = address_candidate
+            && (coconv.is_none()
+                || raw_boundary.is_some_and(|raw_boundary| raw_boundary.opens_node(node)));
+        if !address_open {
+            return degrade(
+                subject,
+                EmitabilityFacts::site(tcx, *span),
+                DegradeReason::PtrComparison,
+            );
+        }
     }
     // **S3.6-0 recorded the reference KIND; S3.6-1 makes the gate a MODE.**
     //

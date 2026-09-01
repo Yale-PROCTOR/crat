@@ -616,6 +616,7 @@ pub(crate) struct RawBoundaryGlue {
     pub template: super::raw_boundary::BridgeTemplate,
     pub target_mutability: super::raw_boundary::RawMutability,
     pub box_slice: bool,
+    pub force_explicit: bool,
 }
 
 /// One adapter, described rather than rendered.
@@ -708,6 +709,7 @@ impl GlueSpec {
         template: super::raw_boundary::BridgeTemplate,
         target_mutability: super::raw_boundary::RawMutability,
         box_slice: bool,
+        force_explicit: bool,
     ) -> Self {
         Self {
             core: GlueCore::Bare,
@@ -720,6 +722,7 @@ impl GlueSpec {
                 template,
                 target_mutability,
                 box_slice,
+                force_explicit,
             }),
         }
     }
@@ -842,11 +845,14 @@ impl GlueSpec {
     /// moves no corpus line.
     pub(crate) fn render(&self, text: &str) -> Option<String> {
         if let Some(raw) = self.raw_boundary {
-            return match raw
-                .template
-                .render(text, raw.target_mutability, raw.box_slice)
-                .ok()?
-            {
+            let rendered = if raw.force_explicit {
+                raw.template
+                    .render_explicit(text, raw.target_mutability, raw.box_slice)
+            } else {
+                raw.template
+                    .render(text, raw.target_mutability, raw.box_slice)
+            };
+            return match rendered.ok()? {
                 super::raw_boundary::BridgeRender::ZeroSyntax => Some(text.to_owned()),
                 super::raw_boundary::BridgeRender::Edit(replacement) => Some(replacement),
                 super::raw_boundary::BridgeRender::Lifecycle => Some(text.to_owned()),
@@ -2728,7 +2734,7 @@ pub(crate) fn synthesize_with_raw_boundary(
         let Ok(argument) = sm.span_to_snippet(site.span) else {
             continue;
         };
-        let spec = GlueSpec::raw_boundary(template, site.target.mutability, site.box_slice);
+        let spec = GlueSpec::raw_boundary(template, site.target.mutability, site.box_slice, false);
         let Some(replacement) = spec.render(&argument) else {
             continue;
         };
@@ -2759,6 +2765,37 @@ pub(crate) fn synthesize_with_raw_boundary(
             expected: Form::Raw,
             found,
             root_identity: key.subject.clone(),
+            blind: false,
+            overlap: None,
+        });
+    }
+    for site in raw_boundary.address_sites() {
+        let Ok(argument) = sm.span_to_snippet(site.span) else {
+            continue;
+        };
+        let spec = GlueSpec::raw_boundary(site.template, site.target.mutability, false, true);
+        let Some(replacement) = spec.render(&argument) else {
+            continue;
+        };
+        let found = decision_of
+            .get(&site.node)
+            .copied()
+            .map_or(Form::Raw, form_of);
+        plan.edits.push(SeamEdit {
+            span: site.span,
+            replacement,
+            owner_fn: site.owner.clone(),
+            lifetime_plan_digest: None,
+            caller_fn: site.owner.clone(),
+            param_index: usize::MAX,
+            source_shape: "address-observation",
+            family: SeamFamily::Safe,
+            len_arm: None,
+            spec,
+            arg_span: site.span,
+            expected: Form::Raw,
+            found,
+            root_identity: format!("address:{}:{}", site.op, site.span.lo().0),
             blind: false,
             overlap: None,
         });

@@ -1310,11 +1310,14 @@ fn raw_boundary_expr(
     raw: super::decision::seam::RawBoundaryGlue,
 ) -> Option<rustc_ast::ExprKind> {
     const ARG: &str = "__CRAT_RAW_BOUNDARY_ARG";
-    let rendered = match raw
-        .template
-        .render(ARG, raw.target_mutability, raw.box_slice)
-        .ok()?
-    {
+    let rendered = if raw.force_explicit {
+        raw.template
+            .render_explicit(ARG, raw.target_mutability, raw.box_slice)
+    } else {
+        raw.template
+            .render(ARG, raw.target_mutability, raw.box_slice)
+    };
+    let rendered = match rendered.ok()? {
         super::decision::raw_boundary::BridgeRender::Edit(rendered) => rendered,
         super::decision::raw_boundary::BridgeRender::ZeroSyntax
         | super::decision::raw_boundary::BridgeRender::Lifecycle => return None,

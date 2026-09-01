@@ -295,6 +295,20 @@ pub(crate) struct BodyAdapterSite {
     pub side_effecting: bool,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct AddressOperand {
+    pub node: (LocalDefId, HirId),
+    pub span: Span,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct AddressObservationFact {
+    pub owner: LocalDefId,
+    pub span: Span,
+    pub op: &'static str,
+    pub operands: Vec<AddressOperand>,
+}
+
 const WAVE2_BODY_FUNCTIONS: &[&str] = &[
     "src::enc::backward_references_hq::BrotliZopfliCreateCommands",
     "src::enc::block_splitter::BrotliSplitBlock",
@@ -421,6 +435,9 @@ pub(crate) struct EmitabilityFacts {
     /// silently inverts a bounds check — so it must be refused at decision
     /// time, not discovered by a behavioral test that does not exist yet.
     pub ptr_comparisons: FxHashMap<(LocalDefId, HirId), Span>,
+    /// Value-observing pointer comparisons, with both operand identities. These
+    /// are address sinks only; arithmetic/deref uses never enter this vector.
+    pub address_observations: Vec<AddressObservationFact>,
     /// **S3.6-1** — `callee -> every direct call site, with its arguments`.
     ///
     /// Recorded here rather than derived later, because it is not derivable
@@ -647,6 +664,40 @@ impl<'tcx> Visitor<'tcx> for BodyFacts<'_, 'tcx> {
             ExprKind::Binary(op, lhs, rhs) => {
                 use rustc_hir::BinOpKind::*;
                 if matches!(op.node, Lt | Le | Gt | Ge | Eq | Ne) {
+                    let typeck = self.tcx.typeck(self.fn_did);
+                    let operands = [lhs, rhs]
+                        .into_iter()
+                        .filter_map(|side| {
+                            let hir = Self::resolved_local(side)?;
+                            matches!(
+                                typeck.expr_ty(side).kind(),
+                                rustc_middle::ty::TyKind::RawPtr(..)
+                            )
+                            .then_some(AddressOperand {
+                                node: (self.fn_did, hir),
+                                span: side.span,
+                            })
+                        })
+                        .collect::<Vec<_>>();
+                    if operands.len() == 2 {
+                        let op = match op.node {
+                            Lt => "lt",
+                            Le => "le",
+                            Gt => "gt",
+                            Ge => "ge",
+                            Eq => "eq",
+                            Ne => "ne",
+                            _ => unreachable!(),
+                        };
+                        self.facts
+                            .address_observations
+                            .push(AddressObservationFact {
+                                owner: self.fn_did,
+                                span: expr.span,
+                                op,
+                                operands,
+                            });
+                    }
                     for side in [lhs, rhs] {
                         if let Some(hir_id) = Self::resolved_local(side) {
                             self.facts
@@ -711,6 +762,15 @@ impl EmitabilityFacts {
             }
         }
         out
+    }
+
+    pub(crate) fn is_value_observation_candidate(&self, node: (LocalDefId, HirId)) -> bool {
+        self.address_observations.iter().any(|observation| {
+            observation
+                .operands
+                .iter()
+                .any(|operand| operand.node == node)
+        })
     }
 }
 
