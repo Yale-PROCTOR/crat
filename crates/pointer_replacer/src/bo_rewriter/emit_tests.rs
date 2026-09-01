@@ -5741,11 +5741,11 @@ fn e2_structural_plan_covers_bounds_output_storage_and_existing_generics() {
     );
 }
 
-/// E2-W2b production witness — branch-local cross-assignment gives NB5-O a
-/// genuine two-way argument relation, and both arguments then reach return.
-/// The plan shape is asserted before the emitted signature is compiled.
+/// E2-W2 precision-side negative — body-local reassignment does not create a
+/// caller-visible relation between signature origins. Each input retains its
+/// own SCC and both independently outlive the return.
 #[test]
-fn e2_w2b_mutual_argument_plan_shape_and_emitted_signature() {
+fn e2_w2_local_reassignment_keeps_signature_origins_distinct() {
     let source = "#![allow(dead_code, unused_unsafe, unused_assignments)]\n\
          pub unsafe fn cross(\n\
              mut a: *const i32,\n\
@@ -5767,12 +5767,12 @@ fn e2_w2b_mutual_argument_plan_shape_and_emitted_signature() {
                 ),
             )),
         )
-        .expect("E2-W2b decision table");
+        .expect("E2-W2 local-reassignment decision table");
         let (did, plan) = table
             .lifetime_plan
             .functions()
             .find(|(did, _)| tcx.def_path_str(did.to_def_id()).ends_with("cross"))
-            .expect("E2-W2b cross plan");
+            .expect("E2-W2 local-reassignment plan");
         let arg1 = super::decision::lifetime::FnSignatureSlot::arg(1, 0, 0);
         let arg2 = super::decision::lifetime::FnSignatureSlot::arg(2, 0, 0);
         let mutual = plan
@@ -5780,10 +5780,86 @@ fn e2_w2b_mutual_argument_plan_shape_and_emitted_signature() {
             .iter()
             .filter(|scc| scc.contains(&arg1) || scc.contains(&arg2))
             .collect::<Vec<_>>();
-        assert_eq!(mutual.len(), 1, "{}: {}", tcx.def_path_str(did.to_def_id()), plan.receipt());
-        assert_eq!(mutual[0], &vec![arg1, arg2], "{}", plan.receipt());
-        assert_eq!(plan.lifetime_for(arg1), plan.lifetime_for(arg2));
+        assert_eq!(mutual.len(), 2, "{}: {}", tcx.def_path_str(did.to_def_id()), plan.receipt());
+        assert_ne!(plan.lifetime_for(arg1), plan.lifetime_for(arg2));
         assert!(plan.outlives.iter().all(|(longer, shorter)| longer != shorter));
+        plan.receipt()
+    })
+    .expect("E2-W2 local-reassignment fixture compiles before rewriting");
+
+    let outcome = super::rewrite_m1_path_a5_injected(
+        &fixture.root(),
+        crate::analyses::borrow_ownership::a5_overlap::A5Mode::PreciseReplay,
+        Some(
+            crate::analyses::borrow_ownership::a5_overlap::WholeProgramAttestation::FrozenBenchmarkGraph,
+        ),
+        &|_| {},
+    );
+    let super::RewriteOutcome::Emitted {
+        files,
+        reverted_count,
+        ..
+    } = outcome
+    else {
+        panic!("E2-W2 emitted signature failed: plan={plan_dump}; outcome={outcome:#?}");
+    };
+    let emitted = files
+        .values()
+        .find(|text| text.contains("fn cross"))
+        .expect("E2-W2 emitted function");
+    assert!(reverted_count >= 1, "plan={plan_dump}; emitted={emitted}");
+    assert!(
+        emitted.contains("mut a: *const i32")
+            && emitted.contains("mut b: *const i32")
+            && !emitted.contains("fn cross<'"),
+        "the precision-side negative must revert, never unify by convenience: \
+         plan={plan_dump}; emitted={emitted}",
+    );
+}
+
+/// E2-W2b — caller-visible cross-storage makes the two output signature slots
+/// mutually reachable. The structural plan assertion, not compilation alone,
+/// is what kills omission of SCC collapse.
+#[test]
+fn e2_w2b_mutual_output_storage_collapses_and_emits() {
+    let source = "#![allow(dead_code, unused_unsafe)]\n\
+         pub unsafe fn cross_store(x: *mut *const i32, y: *mut *const i32) {\n\
+             let tmp = *x;\n\
+             *x = *y;\n\
+             *y = tmp;\n\
+         }\n";
+    let fixture = Fixture::new(&[("lib.rs", source)]);
+    let plan_dump = ::utils::compilation::run_compiler_on_path(&fixture.root(), |tcx| {
+        let (table, _) = super::decide_table_with_ctx_config(
+            tcx,
+            Some((
+                crate::analyses::borrow_ownership::a5_overlap::A5Mode::PreciseReplay,
+                Some(
+                    crate::analyses::borrow_ownership::a5_overlap::WholeProgramAttestation::FrozenBenchmarkGraph,
+                ),
+            )),
+        )
+        .expect("E2-W2b decision table");
+        let (did, plan) = table
+            .lifetime_plan
+            .functions()
+            .find(|(did, _)| tcx.def_path_str(did.to_def_id()).ends_with("cross_store"))
+            .expect("E2-W2b cross-storage plan");
+        let x = super::decision::lifetime::FnSignatureSlot::arg(1, 0, 1);
+        let y = super::decision::lifetime::FnSignatureSlot::arg(2, 0, 1);
+        let mutual = plan
+            .sccs
+            .iter()
+            .filter(|scc| scc.contains(&x) || scc.contains(&y))
+            .collect::<Vec<_>>();
+        assert_eq!(mutual.len(), 1, "{}: {}", tcx.def_path_str(did.to_def_id()), plan.receipt());
+        assert_eq!(mutual[0], &vec![x, y], "{}", plan.receipt());
+        assert_eq!(plan.lifetime_for(x), plan.lifetime_for(y));
+        assert!(
+            plan.outlives.iter().all(|(longer, shorter)| longer != shorter),
+            "{}",
+            plan.receipt(),
+        );
         plan.receipt()
     })
     .expect("E2-W2b fixture compiles before rewriting");
@@ -5801,13 +5877,10 @@ fn e2_w2b_mutual_argument_plan_shape_and_emitted_signature() {
     };
     let emitted = files
         .values()
-        .find(|text| text.contains("fn cross"))
+        .find(|text| text.contains("fn cross_store"))
         .expect("E2-W2b emitted function");
     assert!(
-        emitted.contains("fn cross<'a: 'b, 'b>")
-            && emitted.contains("a: &'a i32")
-            && emitted.contains("b: &'a i32")
-            && emitted.contains("-> &'b i32"),
+        emitted.contains("x: &mut &'a i32") && emitted.contains("y: &mut &'a i32"),
         "plan={plan_dump}; emitted={emitted}",
     );
 }
