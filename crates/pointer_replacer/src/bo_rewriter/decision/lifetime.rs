@@ -365,7 +365,9 @@ pub(crate) fn derive_return_eligibility(
     subjects: &[Subject],
     constructions: &ConstructionFacts,
     escapes: &[Escape],
-    attestation: Option<WholeProgramAttestation>,
+    web: Result<FnPtrWeb, LifetimeFailure>,
+    web_wall_s: f64,
+    exposure: &super::exposure::ExposurePolicy,
 ) -> LifetimeEligibility {
     let derive_started = std::time::Instant::now();
     let mut result = LifetimeEligibility::default();
@@ -374,9 +376,7 @@ pub(crate) fn derive_return_eligibility(
         .iter()
         .map(|(subject, decision)| ((subject.fn_did, subject.hir_id), decision))
         .collect::<FxHashMap<_, _>>();
-    let web_started = std::time::Instant::now();
-    let web = derive_fn_ptr_web(program, attestation);
-    result.web_wall_s = web_started.elapsed().as_secs_f64();
+    result.web_wall_s = web_wall_s;
     if let Ok(web) = &web {
         result.web_roots = web
             .roots
@@ -425,7 +425,12 @@ pub(crate) fn derive_return_eligibility(
                 .insert(subject, LifetimeFailure::FnPtrWebHeld);
             continue;
         };
-        if web.contains(function) {
+        if web.contains(function)
+            && matches!(
+                exposure.plan(function),
+                super::exposure::ExposureSurfacePlan::NotApplicable
+            )
+        {
             result
                 .failures
                 .insert(subject, LifetimeFailure::FnPtrWebHeld);

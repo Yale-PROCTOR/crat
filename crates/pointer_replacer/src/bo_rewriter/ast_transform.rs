@@ -28,7 +28,7 @@ use rustc_ast::{
 };
 use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_hir::HirId;
-use rustc_span::{DUMMY_SP, Ident, Symbol, def_id::LocalDefId};
+use rustc_span::{DUMMY_SP, Ident, Symbol, def_id::LocalDefId, symbol::sym};
 use thin_vec::ThinVec;
 
 // The length's provenance is a DECISION-layer type: `finish_len` is the only
@@ -1924,6 +1924,286 @@ fn transform_inner(
     transform_with(&capture, &table, reverts)
 }
 
+fn surface_argument(param: &rustc_ast::Param) -> Result<String, String> {
+    let rustc_ast::PatKind::Ident(_, ident, None) = &param.pat.kind else {
+        return Err("inbound-wrapper-unplaceable: non-identifier parameter".to_owned());
+    };
+    let name = ident.name.to_string();
+    let ty = rustc_ast_pretty::pprust::ty_to_string(&param.ty);
+    let expression = if ty.starts_with("Option<&mut [") {
+        format!(
+            "if {name}.is_null() {{ None }} else {{ Some(unsafe {{ core::slice::from_raw_parts_mut({name}, crate::FALLBACK_SLICE_EXTENT) }}) }}"
+        )
+    } else if ty.starts_with("Option<&[") {
+        format!(
+            "if {name}.is_null() {{ None }} else {{ Some(unsafe {{ core::slice::from_raw_parts({name}, crate::FALLBACK_SLICE_EXTENT) }}) }}"
+        )
+    } else if ty.starts_with("Option<&mut ") {
+        format!("unsafe {{ {name}.as_mut() }}")
+    } else if ty.starts_with("Option<&") {
+        format!("unsafe {{ {name}.as_ref() }}")
+    } else if ty.starts_with("&mut [") {
+        format!(
+            "unsafe {{ core::slice::from_raw_parts_mut({name}, crate::FALLBACK_SLICE_EXTENT) }}"
+        )
+    } else if ty.starts_with("&[") {
+        format!("unsafe {{ core::slice::from_raw_parts({name}, crate::FALLBACK_SLICE_EXTENT) }}")
+    } else if ty.starts_with("&mut ") {
+        format!("unsafe {{ &mut *{name} }}")
+    } else if ty.starts_with('&') {
+        format!("unsafe {{ &*{name} }}")
+    } else if ty.starts_with("Box<") || ty.starts_with("Option<Box<") {
+        return Err("inbound-wrapper-unplaceable: owning parameter held by Arm B".to_owned());
+    } else {
+        name
+    };
+    Ok(expression)
+}
+
+fn surface_wrapper_block(
+    inner_name: &str,
+    function: &rustc_ast::Fn,
+) -> Result<P<rustc_ast::Block>, String> {
+    if function.sig.decl.c_variadic() {
+        return Err("inbound-wrapper-unplaceable: variadic function".to_owned());
+    }
+    let arguments = function
+        .sig
+        .decl
+        .inputs
+        .iter()
+        .map(surface_argument)
+        .collect::<Result<Vec<_>, _>>()?
+        .join(", ");
+    let call = format!("unsafe {{ {inner_name}({arguments}) }}");
+    let body = match &function.sig.decl.output {
+        rustc_ast::FnRetTy::Default(_) => call,
+        rustc_ast::FnRetTy::Ty(ty) => {
+            let ty = rustc_ast_pretty::pprust::ty_to_string(ty);
+            if ty.starts_with("Option<&mut [") {
+                format!(
+                    "{{ let __crat_result = {call}; __crat_result.map_or(core::ptr::null_mut(), |value| value.as_mut_ptr()) }}"
+                )
+            } else if ty.starts_with("Option<&[") {
+                format!(
+                    "{{ let __crat_result = {call}; __crat_result.map_or(core::ptr::null(), |value| value.as_ptr()) }}"
+                )
+            } else if ty.starts_with("Option<&mut ") {
+                format!(
+                    "{{ let __crat_result = {call}; __crat_result.map_or(core::ptr::null_mut(), core::ptr::from_mut) }}"
+                )
+            } else if ty.starts_with("Option<&") {
+                format!(
+                    "{{ let __crat_result = {call}; __crat_result.map_or(core::ptr::null(), core::ptr::from_ref) }}"
+                )
+            } else if ty.starts_with("&mut [") {
+                format!("{{ let __crat_result = {call}; __crat_result.as_mut_ptr() }}")
+            } else if ty.starts_with("&[") {
+                format!("{{ let __crat_result = {call}; __crat_result.as_ptr() }}")
+            } else if ty.starts_with("&mut ") {
+                format!("{{ let __crat_result = {call}; core::ptr::from_mut(__crat_result) }}")
+            } else if ty.starts_with('&') {
+                format!("{{ let __crat_result = {call}; core::ptr::from_ref(__crat_result) }}")
+            } else if ty.starts_with("Box<") || ty.starts_with("Option<Box<") {
+                return Err("inbound-wrapper-unplaceable: owning return held by Arm B".to_owned());
+            } else {
+                call
+            }
+        }
+    };
+    let expression = ::utils::ast::parse_expr(format!("{{ {body} }}"));
+    let rustc_ast::ExprKind::Block(block, _) = expression.kind else {
+        return Err("inbound-wrapper-unplaceable: wrapper body did not parse as block".to_owned());
+    };
+    Ok(block)
+}
+
+fn collect_original_functions(
+    items: &[P<rustc_ast::Item>],
+    out: &mut FxHashMap<NodeId, P<rustc_ast::Item>>,
+) {
+    for item in items {
+        if matches!(item.kind, rustc_ast::ItemKind::Fn(_)) {
+            out.insert(item.id, item.clone());
+        }
+        if let rustc_ast::ItemKind::Mod(_, _, rustc_ast::ModKind::Loaded(inner, _, _, _)) =
+            &item.kind
+        {
+            collect_original_functions(inner, out);
+        }
+    }
+}
+
+struct SurfaceCallVisitor<'a> {
+    names: &'a FxHashMap<Symbol, Symbol>,
+}
+
+impl MutVisitor for SurfaceCallVisitor<'_> {
+    fn visit_expr(&mut self, expression: &mut rustc_ast::Expr) {
+        if let rustc_ast::ExprKind::Call(callee, _) = &mut expression.kind
+            && let rustc_ast::ExprKind::Path(None, path) = &mut callee.kind
+            && let Some(segment) = path.segments.last_mut()
+            && let Some(&replacement) = self.names.get(&segment.ident.name)
+        {
+            segment.ident = Ident::new(replacement, segment.ident.span);
+        }
+        rustc_ast::mut_visit::walk_expr(self, expression);
+    }
+}
+
+fn collect_surface_names(
+    items: &[P<rustc_ast::Item>],
+    global_map: &rustc_ast::node_id::NodeMap<LocalDefId>,
+    exposure: &super::decision::exposure::ExposurePolicy,
+    out: &mut FxHashMap<Symbol, Symbol>,
+) -> Result<(), String> {
+    for item in items {
+        if let rustc_ast::ItemKind::Mod(_, _, rustc_ast::ModKind::Loaded(inner, _, _, _)) =
+            &item.kind
+        {
+            collect_surface_names(inner, global_map, exposure, out)?;
+            continue;
+        }
+        let Some(&did) = global_map.get(&item.id) else {
+            continue;
+        };
+        if matches!(
+            exposure.plan(did),
+            super::decision::exposure::ExposureSurfacePlan::ClosedWorldDirect
+                | super::decision::exposure::ExposureSurfacePlan::NotApplicable
+        ) {
+            continue;
+        }
+        let rustc_ast::ItemKind::Fn(function) = &item.kind else {
+            continue;
+        };
+        let original = function.ident.name;
+        let replacement = Symbol::intern(&format!("__crat_safe_{original}"));
+        if out.insert(original, replacement).is_some() {
+            return Err(format!(
+                "inbound-wrapper-unplaceable: duplicate surface function name {original}"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn apply_surface_plans_to_items(
+    items: &mut ThinVec<P<rustc_ast::Item>>,
+    originals: &FxHashMap<NodeId, P<rustc_ast::Item>>,
+    global_map: &rustc_ast::node_id::NodeMap<LocalDefId>,
+    exposure: &super::decision::exposure::ExposurePolicy,
+    surface_names: &FxHashMap<Symbol, Symbol>,
+    reverted: &FxHashSet<LocalDefId>,
+    guard: &mut Composition,
+) -> Result<(), String> {
+    let existing_names = items
+        .iter()
+        .filter_map(|item| match &item.kind {
+            rustc_ast::ItemKind::Fn(function) => Some(function.ident.name),
+            _ => None,
+        })
+        .collect::<FxHashSet<_>>();
+    let mut rewritten = ThinVec::new();
+    for mut item in std::mem::take(items) {
+        if let rustc_ast::ItemKind::Mod(_, _, rustc_ast::ModKind::Loaded(inner, _, _, _)) =
+            &mut item.kind
+        {
+            apply_surface_plans_to_items(
+                inner,
+                originals,
+                global_map,
+                exposure,
+                surface_names,
+                reverted,
+                guard,
+            )?;
+            rewritten.push(item);
+            continue;
+        }
+        let Some(&did) = global_map.get(&item.id) else {
+            rewritten.push(item);
+            continue;
+        };
+        let plan = exposure.plan(did);
+        if reverted.contains(&did)
+            || matches!(
+                plan,
+                super::decision::exposure::ExposureSurfacePlan::ClosedWorldDirect
+                    | super::decision::exposure::ExposureSurfacePlan::NotApplicable
+            )
+        {
+            rewritten.push(item);
+            continue;
+        }
+        let Some(mut outer) = originals.get(&item.id).cloned() else {
+            return Err("inbound-wrapper-unplaceable: original function missing".to_owned());
+        };
+        let replacement_span = super::ast_bridge::item_span_with_attrs(&outer);
+        let rustc_ast::ItemKind::Fn(inner_fn) = &mut item.kind else {
+            return Err("inbound-wrapper-unplaceable: surface target is not function".to_owned());
+        };
+        let rustc_ast::ItemKind::Fn(outer_fn) = &mut outer.kind else {
+            return Err("inbound-wrapper-unplaceable: original target is not function".to_owned());
+        };
+        if !guard.claim(item.id, item.span, "surface") {
+            return Err("inbound-wrapper-unplaceable: surface composition refused".to_owned());
+        }
+        let inner_name = format!("__crat_safe_{}", inner_fn.ident.name);
+        if existing_names.contains(&Symbol::intern(&inner_name)) {
+            return Err(format!(
+                "inbound-wrapper-unplaceable: generated inner name collides: {inner_name}"
+            ));
+        }
+        if let Some(body) = inner_fn.body.as_mut() {
+            SurfaceCallVisitor {
+                names: surface_names,
+            }
+            .visit_block(body);
+        }
+        outer_fn.body = Some(surface_wrapper_block(&inner_name, inner_fn)?);
+        inner_fn.ident = Ident::new(Symbol::intern(&inner_name), inner_fn.ident.span);
+        item.attrs
+            .retain(|attr| !attr.has_name(sym::no_mangle) && !attr.has_name(sym::export_name));
+        outer.span = replacement_span;
+        item.span = replacement_span;
+        rewritten.push(outer);
+        rewritten.push(item);
+    }
+    *items = rewritten;
+    Ok(())
+}
+
+fn apply_surface_plans(
+    capture: &AstCapture,
+    table: &super::decision::DecisionTable,
+    reverts: &RevertSet,
+    krate: &mut rustc_ast::Crate,
+    guard: &mut Composition,
+) -> Result<(), String> {
+    let Some(exposure) = table.exposure.as_ref() else {
+        return Ok(());
+    };
+    let mut originals = FxHashMap::default();
+    collect_original_functions(&capture.krate.items, &mut originals);
+    let mut surface_names = FxHashMap::default();
+    collect_surface_names(
+        &capture.krate.items,
+        &capture.map.global_map,
+        exposure,
+        &mut surface_names,
+    )?;
+    apply_surface_plans_to_items(
+        &mut krate.items,
+        &originals,
+        &capture.map.global_map,
+        exposure,
+        &surface_names,
+        &reverts.fns,
+        guard,
+    )
+}
+
 /// **THE ONE AST CAPTURE PER SESSION** (M-2/A).
 ///
 /// `expanded_ast` **panics once the HIR is built** — it clones a resolver that
@@ -2157,6 +2437,12 @@ fn transform_with(
     if !unmatched.is_empty() {
         return Err(format!("unmatched retained C-9 call spans: {unmatched:?}"));
     }
+
+    // Surface policy runs after every inner-body transform. The transformed
+    // function becomes the safe inner; the pristine capture supplies the raw
+    // outer declaration and attributes. One function-span claim makes the
+    // two-item replacement one edit region.
+    apply_surface_plans(capture, table, reverts, &mut krate, &mut guard)?;
 
     // **Each pass counts its OWN refusals**, at the site where it was turned
     // away. This used to recompute `decls.refused` here by summing

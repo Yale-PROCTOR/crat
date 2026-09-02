@@ -314,18 +314,51 @@ impl ExposurePolicy {
 
     pub(crate) fn receipts_tsv(&self) -> String {
         let mut out = String::from(
-            "function\tconfigured_name\taddress_taken\tseed_provenance\tfnptr_web\tsurface_plan\tconfigured_input_sha256\tseed_manifest_sha256\n",
+            "function\tconfigured_name\taddress_taken\tseed_provenance\tfnptr_web\tsurface_plan\tsurface_edit\touter_identity\tinner_identity\touter_metric\tinner_metric\tconfigured_input_sha256\tseed_manifest_sha256\n",
         );
         for row in &self.functions {
             let seed = row.seed.unwrap_or_default();
+            let (surface_edit, outer_identity, inner_identity, outer_metric, inner_metric) =
+                match row.plan {
+                    ExposureSurfacePlan::PositiveSeedShim
+                    | ExposureSurfacePlan::FnPtrRawWrapper => {
+                        let name = row.path.rsplit("::").next().unwrap_or(&row.path);
+                        (
+                            "planned",
+                            row.path.as_str(),
+                            format!("__crat_safe_{name}"),
+                            "unconverted",
+                            "converted",
+                        )
+                    }
+                    ExposureSurfacePlan::ClosedWorldDirect => (
+                        "direct",
+                        row.path.as_str(),
+                        String::new(),
+                        "converted",
+                        "not-applicable",
+                    ),
+                    ExposureSurfacePlan::NotApplicable => (
+                        "none",
+                        row.path.as_str(),
+                        String::new(),
+                        "not-applicable",
+                        "not-applicable",
+                    ),
+                };
             out.push_str(&format!(
-                "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+                "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
                 row.path,
                 u8::from(seed.configured_name),
                 u8::from(seed.address_taken),
                 seed.key(),
                 u8::from(row.fnptr_web),
                 row.plan.key(),
+                surface_edit,
+                outer_identity,
+                inner_identity,
+                outer_metric,
+                inner_metric,
                 self.configured_input_sha256,
                 self.manifest_sha256,
             ));
@@ -592,14 +625,19 @@ mod tests {
                 )
                 .expect("configured exposure decision table");
                 let receipt = &ctx.raw_boundary_artifacts.exposure;
-                assert!(
-                    receipt.lines().any(|line| {
+                let api = receipt
+                    .lines()
+                    .find(|line| {
                         line.starts_with(
                             "api\t1\t0\tconfigured-name\t0\tpositive-seed-entry-shim\t",
                         )
-                    }),
-                    "{receipt}"
-                );
+                    })
+                    .expect("configured surface receipt");
+                let api = api.split('\t').collect::<Vec<_>>();
+                assert_eq!(api[6], "planned");
+                assert_eq!(api[7], "api");
+                assert_eq!(api[8], "__crat_safe_api");
+                assert_eq!(&api[9..11], ["unconverted", "converted"]);
                 assert!(
                     receipt.lines().any(|line| {
                         line.starts_with(

@@ -6698,11 +6698,11 @@ fn e2_n3_n4_external_and_field_rows_are_loudly_held() {
     );
 }
 
-/// E2-N7 eligibility-layer control. The root is already pinned by the existing
-/// function-pointer gate; its forward callee is the live E2 candidate on which
-/// deleting the web guard would create a plan.
+/// C-W4 / deliberate E2-N7 transition. The address-taken root gets a positive
+/// seed shim and its forward web member gets a raw wrapper, so both safe inner
+/// signatures may now consume E2 lifetime plans without changing the web type.
 #[test]
-fn e2_n7_fnptr_web_members_are_held_at_lifetime_eligibility() {
+fn c_w4_fnptr_web_members_open_only_behind_ruled_surfaces() {
     let fixture = Fixture::new(&[(
         "lib.rs",
         "#![allow(dead_code, unused_unsafe)]\n\
@@ -6730,25 +6730,20 @@ fn e2_n7_fnptr_web_members_are_held_at_lifetime_eligibility() {
                 .find(|(subject, _)| subject.label.ends_with(suffix))
                 .unwrap_or_else(|| panic!("missing {suffix}"));
             assert!(
-                matches!(decision, super::decision::Decision::Degraded(_)),
-                "{suffix} escaped the web hold: {decision:#?}",
+                matches!(decision, super::decision::Decision::Ref { .. }),
+                "{suffix} did not reach its safe inner: {decision:#?}",
             );
             let failure = ctx
                 .lifetime_eligibility
                 .failure((subject.fn_did, subject.hir_id));
-            if suffix == "leaf::p" {
-                assert_eq!(
-                    failure,
-                    Some(super::decision::lifetime::LifetimeFailure::FnPtrWebHeld),
-                    "the forward-callee candidate must reach the E2 web guard: {decision:#?}",
-                );
+            assert_eq!(failure, None, "{suffix}: {decision:#?}");
+            assert!(table.lifetime_plan.function(subject.fn_did).is_some());
+            let expected = if suffix == "root::p" {
+                super::decision::exposure::ExposureSurfacePlan::PositiveSeedShim
             } else {
-                assert_eq!(
-                    failure, None,
-                    "the fn-pointer root is pinned before E2 eligibility: {decision:#?}",
-                );
-            }
-            assert!(table.lifetime_plan.function(subject.fn_did).is_none());
+                super::decision::exposure::ExposureSurfacePlan::FnPtrRawWrapper
+            };
+            assert_eq!(ctx.exposure.plan(subject.fn_did), expected);
         }
     })
     .expect("E2-N7 eligibility fixture compiles");
@@ -7672,5 +7667,151 @@ fn rb_x3_family_contracts_reach_the_shared_emission_path() {
         source.matches(".cast_mut()").count(),
         2,
         "the family permission must not become a general implicit coercion: {source}"
+    );
+}
+
+fn configured_exposure_input(name: &str) -> super::decision::exposure::ConfiguredExposureInput {
+    let digest = match name {
+        "api" => "14c2529eb4498c5d1ffd6915d05bf58a91bdda796af59f41d480d11c099d0479",
+        other => panic!("fixture has no pinned digest for {other}"),
+    };
+    super::decision::exposure::ConfiguredExposureInput::checked(
+        "fixture-config",
+        [name.to_owned()],
+        digest,
+    )
+    .expect("configured exposure fixture input")
+}
+
+/// C-W5a/C-W5c — a positive seed gets one raw outer plus a safe inner, while
+/// an unseeded function in the same crate converts directly under R4.
+#[test]
+fn c_w5_surface_emission_separates_seed_shim_from_closed_world_direct() {
+    let fixture = Fixture::new(&[(
+        "lib.rs",
+        "#![allow(dead_code, unused_unsafe)]\n\
+         #[no_mangle]\n\
+         pub unsafe extern \"C\" fn api(p: *const i32) -> *const i32 { p }\n\
+         pub unsafe extern \"C\" fn helper(p: *const i32) -> *const i32 { p }\n",
+    )]);
+    let run_config = super::EmissionRunConfig {
+        configured_exposure: configured_exposure_input("api"),
+    };
+    let outcome = super::rewrite_m1_path_with_emission_config(
+        &fixture.root(),
+        crate::analyses::borrow_ownership::a5_overlap::A5Mode::PreciseReplay,
+        Some(
+            crate::analyses::borrow_ownership::a5_overlap::WholeProgramAttestation::FrozenBenchmarkGraph,
+        ),
+        &run_config,
+    );
+    let super::RewriteOutcome::Emitted { files, .. } = outcome else {
+        panic!("C-W5 surface fixture must emit: {outcome:#?}")
+    };
+    let source = files
+        .values()
+        .find(|source| source.contains("fn api"))
+        .expect("emitted root");
+    assert!(
+        source.contains("fn api(p: *const i32) -> *const i32"),
+        "{source}"
+    );
+    assert!(source.contains("fn __crat_safe_api<'"), "{source}");
+    assert!(
+        source.contains("core::ptr::from_ref(__crat_result)"),
+        "{source}"
+    );
+    assert!(!source.contains("__crat_safe_helper"), "{source}");
+    assert!(source.contains("fn helper<'"), "{source}");
+}
+
+/// C-W5d — an explicit empty configured input does not mean internal, but the
+/// closed-world rule still performs the direct conversion and emits no shim.
+#[test]
+fn c_w5_empty_seed_direct_conversion_has_no_surface_wrapper() {
+    let fixture = Fixture::new(&[(
+        "lib.rs",
+        "#![allow(dead_code, unused_unsafe)]\n\
+         pub unsafe extern \"C\" fn api(p: *const i32) -> *const i32 { p }\n",
+    )]);
+    let run_config = super::EmissionRunConfig::default();
+    let outcome = super::rewrite_m1_path_with_emission_config(
+        &fixture.root(),
+        crate::analyses::borrow_ownership::a5_overlap::A5Mode::PreciseReplay,
+        Some(
+            crate::analyses::borrow_ownership::a5_overlap::WholeProgramAttestation::FrozenBenchmarkGraph,
+        ),
+        &run_config,
+    );
+    let super::RewriteOutcome::Emitted { files, .. } = outcome else {
+        panic!("C-W5d surface fixture must emit: {outcome:#?}")
+    };
+    let source = files.values().next().expect("emitted root");
+    assert!(!source.contains("__crat_safe_api"), "{source}");
+    assert!(source.contains("fn api<'"), "{source}");
+}
+
+/// C-N2 — seed membership is audit evidence, not permission to manufacture a
+/// wrapper when every signature subject is blocked by a later arm.
+#[test]
+fn c_n2_seed_without_settled_signature_subject_has_no_pointless_wrapper() {
+    let fixture = Fixture::new(&[(
+        "lib.rs",
+        "#![allow(dead_code, unused_unsafe)]\n\
+         pub unsafe extern \"C\" fn api(p: *const i32) -> *const i32 { p.offset(1) }\n",
+    )]);
+    let run_config = super::EmissionRunConfig {
+        configured_exposure: configured_exposure_input("api"),
+    };
+    let outcome = super::rewrite_m1_path_with_emission_config(
+        &fixture.root(),
+        crate::analyses::borrow_ownership::a5_overlap::A5Mode::PreciseReplay,
+        Some(
+            crate::analyses::borrow_ownership::a5_overlap::WholeProgramAttestation::FrozenBenchmarkGraph,
+        ),
+        &run_config,
+    );
+    let super::RewriteOutcome::Emitted { files, .. } = outcome else {
+        panic!("C-N2 blocked seed fixture must remain emittable: {outcome:#?}")
+    };
+    let source = files.values().next().expect("emitted root");
+    assert!(!source.contains("__crat_safe_api"), "{source}");
+    assert!(source.contains("fn api(p: *const i32)"), "{source}");
+}
+
+/// C-W4 — an address-taken root gets the positive-seed shim and its forward
+/// web member gets a raw-signature wrapper. Calls inside the safe root target
+/// the member's safe inner; the web/table binding remains raw.
+#[test]
+fn c_w4_fnptr_web_uses_raw_surfaces_and_safe_inner_calls() {
+    let fixture = Fixture::new(&[(
+        "lib.rs",
+        "#![allow(dead_code, unused_unsafe)]\n\
+         pub unsafe fn leaf(p: *const i32) -> *const i32 { p }\n\
+         pub unsafe fn root(p: *const i32) -> *const i32 { leaf(p) }\n\
+         pub unsafe fn install() {\n\
+             let _callback: unsafe fn(*const i32) -> *const i32 = root;\n\
+         }\n",
+    )]);
+    let outcome = super::rewrite_m1_path_with_emission_config(
+        &fixture.root(),
+        crate::analyses::borrow_ownership::a5_overlap::A5Mode::PreciseReplay,
+        Some(
+            crate::analyses::borrow_ownership::a5_overlap::WholeProgramAttestation::FrozenBenchmarkGraph,
+        ),
+        &super::EmissionRunConfig::default(),
+    );
+    let super::RewriteOutcome::Emitted { files, .. } = outcome else {
+        panic!("C-W4 web fixture must emit: {outcome:#?}")
+    };
+    let source = files.values().next().expect("emitted root");
+    assert!(source.contains("fn root(p: *const i32)"), "{source}");
+    assert!(source.contains("fn __crat_safe_root(p: &i32)"), "{source}");
+    assert!(source.contains("fn leaf(p: *const i32)"), "{source}");
+    assert!(source.contains("fn __crat_safe_leaf<'"), "{source}");
+    assert!(source.contains("__crat_safe_leaf(p)"), "{source}");
+    assert!(
+        source.contains("let _callback: unsafe fn(*const i32) -> *const i32 = root"),
+        "{source}"
     );
 }

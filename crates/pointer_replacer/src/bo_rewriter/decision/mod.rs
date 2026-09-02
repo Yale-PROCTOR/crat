@@ -810,6 +810,7 @@ pub(crate) enum Decision {
 #[derive(Clone, Debug, Default)]
 pub(crate) struct DecisionTable {
     pub entries: Vec<(Subject, Decision)>,
+    pub(crate) exposure: Option<exposure::ExposurePolicy>,
     /// Final E2 carrier; later phases consume it without origin facts.
     pub(crate) lifetime_plan: lifetime::LifetimePlan,
     /// Retained post-solve C-9 call-site emission plans. These are construction
@@ -940,6 +941,7 @@ pub(crate) struct Ctx<'a, 'tcx> {
     /// present on the single final pass. Address observations may be candidates
     /// hypothetically but lift only when every boundary site is open.
     pub(crate) raw_boundary: Option<&'a raw_boundary::RawBoundaryDispositionIndex>,
+    pub(crate) exposure: Option<&'a exposure::ExposurePolicy>,
 }
 
 pub(crate) fn decide(ctx: &Ctx<'_, '_>, subjects: &[Subject]) -> DecisionTable {
@@ -949,6 +951,7 @@ pub(crate) fn decide(ctx: &Ctx<'_, '_>, subjects: &[Subject]) -> DecisionTable {
         .collect();
     DecisionTable {
         entries,
+        exposure: None,
         lifetime_plan: Default::default(),
         c9_marks: Vec::new(),
         // `decide` stays PURE over subjects; seams need the call graph and are
@@ -1140,6 +1143,7 @@ fn decide_one_ladder(ctx: &Ctx<'_, '_>, subject: &Subject) -> Decision {
         coconv,
         lifetime_eligibility,
         raw_boundary,
+        exposure,
     } = ctx;
     let decl_site = EmitabilityFacts::site(tcx, subject.attribution_span());
 
@@ -1300,8 +1304,14 @@ fn decide_one_ladder(ctx: &Ctx<'_, '_>, subject: &Subject) -> Decision {
     if let Some(refs) = facts.referenced.get(&subject.fn_did)
         && let Some((_kind, span)) = refs.first()
     {
+        let surface_handles = exposure.is_some_and(|policy| {
+            !matches!(
+                policy.plan(subject.fn_did),
+                exposure::ExposureSurfacePlan::NotApplicable
+            )
+        });
         let blocks = match gate {
-            RefGate::LiftAdaptable => !emitability::RefKind::is_adaptable(refs),
+            RefGate::LiftAdaptable => !emitability::RefKind::is_adaptable(refs) && !surface_handles,
         };
         if blocks {
             return degrade(
@@ -1602,6 +1612,7 @@ mod self_consistency_tests {
 
     fn table(entries: Vec<Subject>) -> DecisionTable {
         DecisionTable {
+            exposure: None,
             seams: Default::default(),
             c9_marks: Vec::new(),
             lifetime_plan: Default::default(),

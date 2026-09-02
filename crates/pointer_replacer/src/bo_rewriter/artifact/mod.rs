@@ -203,6 +203,7 @@ mod tests {
     fn table(entries: Vec<(Subject, Decision)>) -> DecisionTable {
         DecisionTable {
             entries,
+            exposure: None,
             seams: Default::default(),
             c9_marks: Vec::new(),
             lifetime_plan: Default::default(),

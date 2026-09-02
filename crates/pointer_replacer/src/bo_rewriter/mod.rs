@@ -3949,7 +3949,7 @@ fn finish_decide<'tcx>(
         &opt_fat,
         &raw_boundary_argument_paths,
     );
-    let ctx_of = |gate, coconv, lifetime_eligibility, raw_boundary| decision::Ctx {
+    let ctx_of = |gate, coconv, lifetime_eligibility, raw_boundary, exposure| decision::Ctx {
         tcx,
         model: &model,
         slots: &slots,
@@ -3965,7 +3965,25 @@ fn finish_decide<'tcx>(
         coconv,
         lifetime_eligibility,
         raw_boundary,
+        exposure,
     };
+
+    let web_started = std::time::Instant::now();
+    let fnptr_web = decision::lifetime::derive_fn_ptr_web(&program, analysis.attestation);
+    let fnptr_web_wall_s = web_started.elapsed().as_secs_f64();
+    let exposure_seed = decision::exposure::ExposureSeed::derive(
+        &program,
+        &run_config.configured_exposure,
+        fnptr_web.as_ref().ok(),
+    )
+    .map_err(|error| format!("raw-boundary exposure seed: {error:?}"))?;
+    let all_functions = program.functions.iter().copied().collect();
+    let preliminary_exposure = decision::exposure::ExposurePolicy::derive(
+        &program,
+        &exposure_seed,
+        fnptr_web.as_ref().ok(),
+        &all_functions,
+    );
 
     // **S3.6-1 task 2 — the co-conversion classes.**
     //
@@ -3982,7 +4000,13 @@ fn finish_decide<'tcx>(
     // `BlockAll` variant was deleted at M-3 (X-3). Task 3 is where the verdict
     // reaches a gate.
     let hypothetical = decision::decide(
-        &ctx_of(decision::RefGate::LiftAdaptable, None, None, None),
+        &ctx_of(
+            decision::RefGate::LiftAdaptable,
+            None,
+            None,
+            None,
+            Some(&preliminary_exposure),
+        ),
         &subjects,
     );
     // Escapes are computed BEFORE the classes now: P1 makes them a gate, not a
@@ -3998,7 +4022,9 @@ fn finish_decide<'tcx>(
         &subjects,
         &ctors,
         &escapes,
-        analysis.attestation,
+        fnptr_web.clone(),
+        fnptr_web_wall_s,
+        &preliminary_exposure,
     );
     let e2_hypothetical = decision::decide(
         &ctx_of(
@@ -4006,6 +4032,7 @@ fn finish_decide<'tcx>(
             None,
             Some(&lifetime_eligibility),
             None,
+            Some(&preliminary_exposure),
         ),
         &subjects,
     );
@@ -4018,16 +4045,10 @@ fn finish_decide<'tcx>(
         })
         .map(|(subject, _)| subject.fn_did)
         .collect::<rustc_hash::FxHashSet<_>>();
-    let exposure_seed = decision::exposure::ExposureSeed::derive(
-        &program,
-        &run_config.configured_exposure,
-        lifetime_eligibility.fnptr_web(),
-    )
-    .map_err(|error| format!("raw-boundary exposure seed: {error:?}"))?;
-    let exposure = decision::exposure::ExposurePolicy::derive(
+    let candidate_exposure = decision::exposure::ExposurePolicy::derive(
         &program,
         &exposure_seed,
-        lifetime_eligibility.fnptr_web(),
+        fnptr_web.as_ref().ok(),
         &converting_signature_functions,
     );
     let raw_boundary_sites_started = std::time::Instant::now();
@@ -4070,9 +4091,30 @@ fn finish_decide<'tcx>(
             Some(&coconv),
             Some(&lifetime_eligibility),
             Some(&raw_boundary),
+            Some(&candidate_exposure),
         ),
         &subjects,
     );
+    // Surface policies are provisional until the full ladder settles. A raw
+    // wrapper or entry shim exists only when at least one signature subject
+    // survives every arm; blocked functions retain their seed/web evidence but
+    // receive NotApplicable and therefore no pointless surface edit.
+    let settled_signature_functions = table
+        .entries
+        .iter()
+        .filter(|(subject, decision)| {
+            matches!(subject.kind, decision::SubjectKind::Param { .. })
+                && !matches!(decision, decision::Decision::Degraded(_))
+        })
+        .map(|(subject, _)| subject.fn_did)
+        .collect::<rustc_hash::FxHashSet<_>>();
+    let exposure = decision::exposure::ExposurePolicy::derive(
+        &program,
+        &exposure_seed,
+        fnptr_web.as_ref().ok(),
+        &settled_signature_functions,
+    );
+    table.exposure = Some(exposure.clone());
 
     // Use-edit nesting is a property of a PAIR of edits, so it cannot be seen by
     // `decide_one`, which is handed one subject at a time. Runs here, over the

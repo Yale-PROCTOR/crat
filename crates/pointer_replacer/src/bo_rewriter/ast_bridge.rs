@@ -445,6 +445,24 @@ pub(crate) fn splice_fn_prints_per_file(
     collect_fn_spans(&krate.items, &mut spans);
     let mut printed: Vec<(rustc_span::Span, String)> = Vec::new();
     collect_fn_prints(&krate.items, &mut printed);
+    // A raw-boundary surface replacement deliberately represents one original
+    // function span with TWO printed items: raw outer first, safe inner second.
+    // Collapse that pair into one splice. No unrelated duplicate span is
+    // absorbed: the safe-inner name is the type marker for this one sanctioned
+    // shape.
+    let mut surface_combined: Vec<(rustc_span::Span, String)> = Vec::new();
+    for (span, text) in printed {
+        if let Some((previous_span, previous_text)) = surface_combined.last_mut()
+            && *previous_span == span
+            && text.contains("fn __crat_safe_")
+        {
+            previous_text.push('\n');
+            previous_text.push_str(&text);
+        } else {
+            surface_combined.push((span, text));
+        }
+    }
+    let mut printed = surface_combined;
     // **SPLICE ONLY WHAT CHANGED** (fix ruling, 2026-08-18). Reprinting an
     // untouched function normalizes its spacing and DROPS its interior
     // comments — a defect against byte preservation for untransformed code,

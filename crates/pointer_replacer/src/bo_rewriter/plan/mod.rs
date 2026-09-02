@@ -705,6 +705,7 @@ mod tests {
     #[test]
     fn a_ref_decision_with_no_pointee_span_is_attributed_not_skipped() {
         let table = DecisionTable {
+            exposure: None,
             seams: Default::default(),
             c9_marks: Vec::new(),
             lifetime_plan: Default::default(),
@@ -757,6 +758,7 @@ mod tests {
     #[test]
     fn a_degraded_subject_is_not_also_reported_unplaceable() {
         let table = DecisionTable {
+            exposure: None,
             seams: Default::default(),
             c9_marks: Vec::new(),
             lifetime_plan: Default::default(),
