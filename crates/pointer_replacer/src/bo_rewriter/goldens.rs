@@ -598,6 +598,9 @@ fn g06_class_is_attributed_at_decision_time() {
                 DegradeReason::CallSiteNotAdapted
                     | DegradeReason::SilentCoercion { .. }
                     | DegradeReason::ClassBlocked { .. }
+                    | DegradeReason::BoxFailure {
+                        failure: super::decision::box_facts::BoxPlanFailure::BoundaryHeld,
+                    }
             )
         })
         .unwrap_or_else(|| {
@@ -877,8 +880,7 @@ const PREAMBLE: &str = "#![allow(dead_code, unused_unsafe, unused_mut, unused_as
 /// solver change that stops returning `Ref` here degrades one assertion instead
 /// of erasing the fixture's whole meaning.
 #[test]
-fn ptr_comparison_shape_is_degraded_with_its_own_reason() {
-    use super::decision::DegradeReason;
+fn ptr_comparison_shape_emits_explicit_address_views() {
     let src = format!(
         "{PREAMBLE}pub unsafe fn advance(p: *mut u8, plimit: *mut u8) -> i32 {{\n    \
          if p > plimit {{ return 0; }}\n    1\n}}\n"
@@ -891,17 +893,14 @@ fn ptr_comparison_shape_is_degraded_with_its_own_reason() {
         "the comparison fact was not collected at all; got {facts:#?}"
     );
 
-    // (2) attribution, end to end.
-    let records = reasons_for_source(&src);
-    let hit = records
-        .iter()
-        .find(|d| d.reason == DegradeReason::PtrComparison)
-        .unwrap_or_else(|| panic!("no PtrComparison degradation attributed; got {records:#?}"));
-    assert!(
-        hit.subject.contains("advance"),
-        "degradation names the wrong subject: {hit:?}"
-    );
-    assert!(hit.site.contains(':'), "no site: {hit:?}");
+    // (2) emission, end to end: the comparison remains address-valued rather
+    // than becoming a pointee comparison on references.
+    let RewriteOutcome::Emitted { source, .. } = rewrite_m1(&src) else {
+        panic!("value-observing comparison must emit")
+    };
+    assert!(source.contains("p: &u8"), "{source}");
+    assert!(source.contains("plimit: &u8"), "{source}");
+    assert_eq!(source.matches("core::ptr::from_ref").count(), 2, "{source}");
 }
 
 /// **F1 fixture — the fn-table / address-taken shape, which had NO fixture.**
@@ -939,7 +938,7 @@ fn address_taken_function_is_degraded_not_silently_rewritten() {
          `ExprKind::Call` only. Facts: {facts:#?}"
     );
 
-    // (2) and it is attributed, per subject.
+    // (2) the product/unattested default remains fail-closed.
     let records = reasons_for_source(&src);
     assert!(
         records
@@ -961,17 +960,8 @@ fn address_taken_function_is_degraded_not_silently_rewritten() {
             emitted_count,
             ..
         } => {
-            assert_eq!(
-                emitted_count, 0,
-                "`descent` is address-taken, so nothing in this fixture is \
-                 emittable; emitting {emitted_count} means the degradation was \
-                 recorded but not honoured"
-            );
-            assert_eq!(
-                source, src,
-                "no subject was emitted, so the source must come through byte \
-                 for byte"
-            );
+            assert_eq!(emitted_count, 0);
+            assert_eq!(source, src);
         }
     }
 }

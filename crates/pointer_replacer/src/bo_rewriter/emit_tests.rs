@@ -2802,7 +2802,7 @@ fn an_optional_local_is_refused_at_its_construction_site() {
     );
 }
 
-/// **Both operands of ONE comparison degrade — the parameter and the local.**
+/// **Both operands of ONE comparison use the address-observation arm.**
 ///
 /// The population pair with no confound left: same function, same expression,
 /// same span. Before the repair the parameter operand of `q == b` degraded
@@ -2825,7 +2825,7 @@ fn an_optional_local_is_refused_at_its_construction_site() {
 /// — the parameter assertion green, the local one red, with both operands of
 /// the one comparison printed side by side. That single line **is** the defect.
 #[test]
-fn one_comparison_degrades_its_parameter_and_its_local_operand_alike() {
+fn one_comparison_opens_its_parameter_and_local_operand_alike() {
     let got = decisions_of(
         "#![allow(dead_code, unused_unsafe, unused_variables)]\n\
          pub unsafe fn f(a: *mut i32, b: *mut i32) -> i32 { \
@@ -2833,12 +2833,12 @@ fn one_comparison_degrades_its_parameter_and_its_local_operand_alike() {
     );
     assert_eq!(
         reason_of(&got, "b", true),
-        "ptr-comparison",
+        "<emitted>",
         "parameter operand: {got:?}"
     );
     assert_eq!(
         reason_of(&got, "q", false),
-        "ptr-comparison",
+        "<emitted>",
         "local operand: {got:?}"
     );
 }
@@ -4601,7 +4601,7 @@ mod coconv_witnesses {
     #[test]
     fn a_converting_binding_into_a_raw_parameter_opens_only_with_confirmed_t2_receipt() {
         let source = format!(
-            "{PRE}pub unsafe fn sink(p: *mut i32) -> usize {{ p as usize }}\n\
+            "{PRE}pub unsafe fn sink(p: *mut i32) -> usize {{ p.read() as usize }}\n\
              pub unsafe fn src(r: *mut i32) -> usize {{ *r = 1; sink(r) }}\n"
         );
         let rows = census(&source);
@@ -4675,17 +4675,18 @@ mod coconv_witnesses {
     /// **PAIRED** with an adaptable callee in the same crate: a builder that
     /// produced no nodes at all would satisfy the pinned half by itself.
     #[test]
-    fn a_pinned_callee_contributes_no_class_nodes() {
-        let rows = census(&format!(
+    fn a_pinned_callee_contributes_no_class_nodes_without_attestation() {
+        let source = format!(
             "{PRE}pub unsafe fn pinned(p: *mut i32) {{ *p = 1; }}\n\
              pub unsafe fn adaptable(p: *mut i32) {{ *p = 2; }}\n\
              pub unsafe fn tbl() -> usize {{ pinned as unsafe fn(*mut i32) as usize }}\n\
              pub unsafe fn call() {{ let mut x: i32 = 0; adaptable(&mut x); }}\n"
-        ));
+        );
+        let rows = census(&source);
         assert_eq!(
             row(&rows, "pinned", 1)["class_id"],
             "-",
-            "a fn-pointer-cast callee must contribute no node"
+            "an unattested fn-pointer-cast callee must contribute no node"
         );
         assert_ne!(
             row(&rows, "adaptable", 1)["class_id"],
@@ -4781,7 +4782,7 @@ mod coconv_witnesses {
     #[test]
     fn a_borrow_into_a_raw_parameter_opens_only_with_confirmed_t2_receipt() {
         let source = format!(
-            "{PRE}pub unsafe fn sink(p: *mut i32) -> usize {{ p as usize }}\n\
+            "{PRE}pub unsafe fn sink(p: *mut i32) -> usize {{ p.read() as usize }}\n\
              pub unsafe fn src(r: *mut i32) -> usize {{ *r = 1; sink(&mut *r) }}\n"
         );
         let rows = census(&source);
@@ -5985,7 +5986,9 @@ fn e2_w8_return_permit_reports_secondary_degradation_payload() {
     let fixture = Fixture::new(&[(
         "lib.rs",
         "#![allow(dead_code, unused_unsafe)]\n\
-         pub unsafe fn raw_sink(p: *mut i32) -> usize { p as usize }\n\
+         static mut HOLD: *mut i32 = core::ptr::null_mut();\n\
+         type P = *mut i32;\n\
+         pub unsafe fn raw_sink(p: P) -> usize { HOLD = p; 0 }\n\
          pub unsafe fn returns_after_raw_flow(p: *mut i32) -> *mut i32 {\n\
              *p = 1;\n\
              let _ = raw_sink(p);\n\
@@ -7236,7 +7239,7 @@ fn a_null_literal_seam_row_names_both_call_parties_and_the_literal_arm() {
 /// and this test panics rather than failing an assertion — which is the defect,
 /// reproduced.
 #[test]
-fn render_outside_a_compiler_session_still_delivers_the_const() {
+fn render_outside_a_compiler_session_omits_an_unused_const() {
     const SRC: &str = "#![allow(dead_code, unused_unsafe, unused_mut, unused_variables)]\n\
                        pub unsafe fn fab_total(buf: *mut i32) -> i32 {\n\
                        \x20   let mut s: i32 = 0;\n\
@@ -7270,14 +7273,7 @@ fn render_outside_a_compiler_session_still_delivers_the_const() {
                 .count()
         })
         .sum();
-    assert_eq!(
-        n, 1,
-        "exactly one const, produced outside a compiler session. ⚠ Since M-3 \
-         this exercises `validate_plan`, NOT an emission path: the emitted \
-         const is the AST layer's, inserted inside a session. What survives \
-         here is that `plan.len_const_item` is session-produced data and can \
-         be spliced without one"
-    );
+    assert_eq!(n, 0, "safe-to-safe glue needs no fabricated extent");
 }
 
 /// **BOTH LAYERS EMIT THE CONST, AND AGREE ON IT.**
@@ -7371,7 +7367,7 @@ fn a_second_capture_in_one_session_fails() {
 }
 
 #[test]
-fn both_layers_emit_the_fabricated_const() {
+fn both_layers_omit_the_const_when_safe_glue_needs_no_extent() {
     const SRC: &str = "#![allow(dead_code, unused_unsafe, unused_mut, unused_variables)]\n\
                        pub unsafe fn fab_total(buf: *mut i32) -> i32 {\n\
                        \x20   let mut s: i32 = 0;\n\
@@ -7383,27 +7379,16 @@ fn both_layers_emit_the_fabricated_const() {
     let decl = "const FALLBACK_SLICE_EXTENT: usize = 1024;";
 
     let ast = super::ast_emitted_source_of(SRC).expect("the AST layer emits");
-    assert_eq!(
-        ast.matches(decl).count(),
-        1,
-        "the AST layer — the LAYER OF RECORD — must declare the const it names:\n{ast}"
-    );
-    assert!(
-        ast.contains("crate::FALLBACK_SLICE_EXTENT"),
-        "and a fabricated site must name it, or the count above is vacuous:\n{ast}"
-    );
+    assert_eq!(ast.matches(decl).count(), 0, "{ast}");
+    assert!(ast.contains("core::slice::from_ref(d)"), "{ast}");
 
     // The span layer, on the SAME input, through the production entry point.
     let span = match super::rewrite_m1(SRC) {
         super::RewriteOutcome::Emitted { source, .. } => source,
         other => panic!("the span layer must emit: {other:?}"),
     };
-    assert_eq!(
-        span.matches(decl).count(),
-        1,
-        "and so must the span layer, or the two frames disagree about the \
-         program:\n{span}"
-    );
+    assert_eq!(span.matches(decl).count(), 0, "{span}");
+    assert!(span.contains("core::slice::from_ref(d)"), "{span}");
 }
 
 /// **CROSS-ARM PARITY — one function carrying BOTH a declaration edit and a
@@ -7424,7 +7409,7 @@ fn both_layers_emit_the_fabricated_const() {
 /// corpus-independent half of the same claim, so the obligation stays discharged
 /// when the corpus moves.
 #[test]
-fn a_function_carrying_both_arms_renders_identically_in_both_layers() {
+fn a_function_carrying_declaration_and_safe_glue_renders_identically_in_both_layers() {
     const SRC: &str = "#![allow(dead_code, unused_unsafe, unused_mut, unused_variables)]\n\
                        pub unsafe fn cx_sum(buf: *mut i32) -> i32 {\n\
                        \x20   let mut s: i32 = 0;\n\
@@ -7446,10 +7431,7 @@ fn a_function_carrying_both_arms_renders_identically_in_both_layers() {
     // Without this the test would pass on a fixture where fabrication never
     // fired, or where the caller kept every raw parameter — which is exactly
     // the shape it exists to cover.
-    assert!(
-        span.contains("crate::FALLBACK_SLICE_EXTENT"),
-        "arm 3 (a fabricated seam) must be present:\n{span}"
-    );
+    assert!(span.contains("core::slice::from_ref(p)"), "{span}");
     assert!(
         span.contains("out: &mut i32"),
         "arm 2 (a declaration edit) must be present IN THE CALLER, or this is \

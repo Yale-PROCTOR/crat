@@ -3502,10 +3502,11 @@ pub(crate) fn validate_plan(
             .iter()
             .enumerate()
             .filter(|(inner_index, inner)| {
-                !matches!(
+                (!matches!(
                     inner.justification,
                     plan::Justification::KindDecision { .. }
-                ) || !nested_kind_under_seam(kept, *inner_index)
+                ) || !nested_kind_under_seam(kept, *inner_index))
+                    && !nested_c9_over_seam(kept, *inner_index)
             })
             .map(|(_, edit)| edit.clone())
             .collect::<Vec<_>>();
@@ -3532,6 +3533,22 @@ fn nested_kind_under_seam(edits: &[plan::Edit], inner_index: usize) -> bool {
             && inner.hi <= outer.hi
             && (outer.lo < inner.lo || inner.hi < outer.hi)
     })
+}
+
+/// C-9 owns the enclosing call while a seam owns one argument. The AST choke
+/// point composes those structural edits; the byte-splice validator cannot.
+/// Suppress only the enclosing C-9 projection when it strictly contains a seam
+/// and keep both edits in the authoritative plan and receipts.
+fn nested_c9_over_seam(edits: &[plan::Edit], c9_index: usize) -> bool {
+    let c9 = &edits[c9_index];
+    matches!(c9.justification, plan::Justification::C9Mark)
+        && edits.iter().enumerate().any(|(seam_index, seam)| {
+            seam_index != c9_index
+                && matches!(seam.justification, plan::Justification::SeamAdapter { .. })
+                && c9.lo <= seam.lo
+                && seam.hi <= c9.hi
+                && (c9.lo < seam.lo || seam.hi < c9.hi)
+        })
 }
 
 /// A source file's identity for editing. `None` for anything not written back
@@ -3906,6 +3923,16 @@ fn finish_decide<'tcx>(
     run_config: &EmissionRunConfig,
     perturb: impl FnOnce(&mut Vec<decision::Subject>),
 ) -> Result<(decision::DecisionTable, DecideCtx), String> {
+    fn decision_is_safe(decision: &decision::Decision) -> bool {
+        match decision {
+            decision::Decision::Ref { .. }
+            | decision::Decision::InferredRef { .. }
+            | decision::Decision::Slice { .. }
+            | decision::Decision::Opt { .. }
+            | decision::Decision::Box(_) => true,
+            decision::Decision::Degraded(_) => false,
+        }
+    }
     let box_facts = decision::box_facts::BoxOwnershipFacts::derive(&program, &slots, &model)?;
     let mut subjects = collect_subjects(tcx, &program, &mut_facts);
     // S3.1: the second universe. Appended rather than merged into
@@ -4067,7 +4094,13 @@ fn finish_decide<'tcx>(
         fnptr_web.as_ref().ok(),
     )
     .map_err(|error| format!("raw-boundary exposure seed: {error:?}"))?;
-    let all_functions = program.functions.iter().copied().collect();
+    let surface_world_attested =
+        analysis.attestation == Some(WholeProgramAttestation::FrozenBenchmarkGraph);
+    let all_functions = if surface_world_attested {
+        program.functions.iter().copied().collect()
+    } else {
+        rustc_hash::FxHashSet::default()
+    };
     let preliminary_exposure = decision::exposure::ExposurePolicy::derive(
         &program,
         &exposure_seed,
@@ -4131,15 +4164,21 @@ fn finish_decide<'tcx>(
         .iter()
         .filter(|(subject, decision)| {
             matches!(subject.kind, decision::SubjectKind::Param { .. })
-                && !matches!(decision, decision::Decision::Degraded(_))
+                && decision_is_safe(decision)
         })
         .map(|(subject, _)| subject.fn_did)
         .collect::<rustc_hash::FxHashSet<_>>();
+    let no_surface_functions = rustc_hash::FxHashSet::default();
+    let candidate_surface_functions = if surface_world_attested {
+        &converting_signature_functions
+    } else {
+        &no_surface_functions
+    };
     let candidate_exposure = decision::exposure::ExposurePolicy::derive(
         &program,
         &exposure_seed,
         fnptr_web.as_ref().ok(),
-        &converting_signature_functions,
+        candidate_surface_functions,
     );
     let raw_boundary_sites_started = std::time::Instant::now();
     let raw_boundary_sites = decision::raw_boundary::RawBoundarySiteFacts::derive(&program, &facts);
@@ -4207,7 +4246,7 @@ fn finish_decide<'tcx>(
         .iter()
         .filter(|(subject, decision)| {
             matches!(subject.kind, decision::SubjectKind::Param { .. })
-                && !matches!(decision, decision::Decision::Degraded(_))
+                && decision_is_safe(decision)
         })
         .map(|(subject, _)| subject.fn_did)
         .collect::<rustc_hash::FxHashSet<_>>();
@@ -4215,7 +4254,11 @@ fn finish_decide<'tcx>(
         &program,
         &exposure_seed,
         fnptr_web.as_ref().ok(),
-        &settled_signature_functions,
+        if surface_world_attested {
+            &settled_signature_functions
+        } else {
+            &no_surface_functions
+        },
     );
     table.exposure = Some(exposure.clone());
 
@@ -4254,20 +4297,29 @@ fn finish_decide<'tcx>(
     let seam_wall_s = seam_started.elapsed().as_secs_f64();
     let raw_boundary_render_wall_s = seam_started.elapsed().as_secs_f64();
     retained_c9_plans.retain(|mark| {
+        let call_span = mark.call_span.source_callsite();
+        let caller = tcx.def_path_str(mark.caller_did.to_def_id());
+        let nested_reborrow = table.seams.edits.iter().any(|edit| {
+            edit.caller_fn == caller
+                && edit.family == decision::seam::SeamFamily::Reborrow
+                && call_span.contains(edit.span.source_callsite())
+        });
         let params = mark.key.pair.params();
-        [params.first(), params.second()].into_iter().all(|param| {
-            let local = Local::from_usize(param as usize);
-            table.entries.iter().any(|(subject, decision)| {
-                let is_ref = match decision {
-                    decision::Decision::Ref { .. } | decision::Decision::InferredRef { .. } => true,
-                    decision::Decision::Slice { .. }
-                    | decision::Decision::Opt { .. }
-                    | decision::Decision::Box(_)
-                    | decision::Decision::Degraded(_) => false,
-                };
-                subject.fn_did == mark.owner_did && subject.local == local && is_ref
+        !nested_reborrow
+            && [params.first(), params.second()].into_iter().all(|param| {
+                let local = Local::from_usize(param as usize);
+                table.entries.iter().any(|(subject, decision)| {
+                    let is_ref = match decision {
+                        decision::Decision::Ref { .. }
+                        | decision::Decision::InferredRef { .. } => true,
+                        decision::Decision::Slice { .. }
+                        | decision::Decision::Opt { .. }
+                        | decision::Decision::Box(_)
+                        | decision::Decision::Degraded(_) => false,
+                    };
+                    subject.fn_did == mark.owner_did && subject.local == local && is_ref
+                })
             })
-        })
     });
     table.c9_marks = retained_c9_plans.clone();
     let table = table;
@@ -4465,7 +4517,15 @@ fn arm_outcomes_tsv(
             }
         }
         let decision = decisions.get(&key).copied();
-        if matches!(decision, Some(Decision::Degraded(_))) && blocked_arm.is_none() {
+        let decision_degraded = decision.is_some_and(|decision| match decision {
+            Decision::Ref { .. }
+            | Decision::InferredRef { .. }
+            | Decision::Slice { .. }
+            | Decision::Opt { .. }
+            | Decision::Box(_) => false,
+            Decision::Degraded(_) => true,
+        });
+        if decision_degraded && blocked_arm.is_none() {
             let arm = Arm::ALL
                 .into_iter()
                 .find(|&arm| required.contains(arm))
@@ -4476,7 +4536,7 @@ fn arm_outcomes_tsv(
         }
         let terminal = if blocked_arm.is_some() {
             "blocked"
-        } else if matches!(decision, Some(Decision::Degraded(_))) {
+        } else if decision_degraded {
             "typed-excluded"
         } else {
             "planned"
