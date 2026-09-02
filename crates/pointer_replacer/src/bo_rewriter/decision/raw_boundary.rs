@@ -1963,9 +1963,10 @@ impl RawBoundaryDispositionIndex {
     /// still owes an A5 proof receipt for that identity; unlike
     /// [`Self::opens_argument`], this observation does not claim the site is an
     /// active Arm-A edit.
-    pub(crate) fn tracks_argument(
+    pub(crate) fn tracks_call_argument(
         &self,
-        node: (LocalDefId, HirId),
+        caller: LocalDefId,
+        callee_path: &str,
         span: Span,
         argument_index: usize,
     ) -> bool {
@@ -1973,7 +1974,8 @@ impl RawBoundaryDispositionIndex {
         self.site_lookup
             .iter()
             .any(|(candidate, site_span, index, key)| {
-                *candidate == node
+                candidate.0 == caller
+                    && key.callee.path == callee_path
                     && *index == argument_index
                     && (site_span.contains(span) || span.contains(*site_span))
                     && self

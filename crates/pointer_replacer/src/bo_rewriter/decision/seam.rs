@@ -2340,9 +2340,12 @@ pub(crate) fn synthesize_with_raw_boundary(
                     .get(&(*callee, arg.index))
                     .and_then(|k| decision_of.get(k))
                     .map_or(Form::Raw, |d| form_of(d));
-                let source_node = arg.shape.place_root().map(|root| (site.caller, root));
-                let raw_boundary_observation = source_node
-                    .is_some_and(|node| raw_boundary.tracks_argument(node, arg.span, arg.index));
+                let raw_boundary_observation = raw_boundary.tracks_call_argument(
+                    site.caller,
+                    &tcx.def_path_str(callee.to_def_id()),
+                    arg.span,
+                    arg.index,
+                );
                 // A raw parameter needs nothing: a reference coerces to a raw
                 // pointer at a call, so every found form satisfies it. The
                 // raw-boundary market is the one exception to dropping the
