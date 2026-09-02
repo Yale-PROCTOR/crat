@@ -2566,7 +2566,15 @@ pub(crate) fn synthesize_with_raw_boundary(
                         (positions[i].root, positions[j].root),
                         (Some(x), Some(y)) if x != y
                     );
-                    if same_root || positions[i].blind || positions[j].blind {
+                    // An active raw-boundary pair already owns its syntax and
+                    // therefore cannot be blocked here, but the external PAIR
+                    // control still requires the attested A5 verdict even when
+                    // the syntactic roots look distinct. Ordinary seam pairs
+                    // retain the established same-root/blind trigger exactly.
+                    let boundary_observation = positions[i].raw_boundary_observation
+                        && positions[j].raw_boundary_observation;
+                    if same_root || positions[i].blind || positions[j].blind || boundary_observation
+                    {
                         let (left_blind, right_blind) = if positions[i].index <= positions[j].index
                         {
                             (positions[i].blind, positions[j].blind)
