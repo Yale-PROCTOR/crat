@@ -1387,6 +1387,7 @@ pub(crate) struct RawBoundaryDispositionIndex {
     blocked_nodes: FxHashMap<(LocalDefId, HirId), RawBoundaryBlockReason>,
     address_open_nodes: FxHashSet<(LocalDefId, HirId)>,
     address_sites: Vec<AddressViewSite>,
+    address_classes: FxHashMap<(LocalDefId, HirId), super::emitability::AddressUseClass>,
     certificate_replay_wall_s: f64,
 }
 
@@ -1655,6 +1656,21 @@ impl RawBoundaryDispositionIndex {
                 site.span.hi(),
             )
         });
+        let mut address_nodes = emitability
+            .raw_only_uses
+            .keys()
+            .copied()
+            .collect::<FxHashSet<_>>();
+        address_nodes.extend(
+            emitability
+                .address_observations
+                .iter()
+                .flat_map(|observation| observation.operands.iter().map(|operand| operand.node)),
+        );
+        out.address_classes = address_nodes
+            .into_iter()
+            .map(|node| (node, emitability.address_use_class(node)))
+            .collect();
         out.site_lookup.sort_by(|left, right| {
             (
                 left.0.0.local_def_index.as_u32(),
@@ -1776,18 +1792,32 @@ impl RawBoundaryDispositionIndex {
 
     pub(crate) fn addresses_tsv(&self, tcx: TyCtxt<'_>) -> String {
         let mut out = String::from(
-            "owner\tlocal_def_index\thir_local_id\tsite\top\ttemplate\ttarget_mutability\tuse_class\n",
+            "owner\tlocal_def_index\thir_local_id\tuse_class\trealized_edit_count\tops\n",
         );
-        for site in &self.address_sites {
+        let mut classes = self.address_classes.iter().collect::<Vec<_>>();
+        classes
+            .sort_by_key(|(node, _)| (node.0.local_def_index.as_u32(), node.1.local_id.as_u32()));
+        for (&node, &class) in classes {
+            let sites = self
+                .address_sites
+                .iter()
+                .filter(|site| site.node == node)
+                .collect::<Vec<_>>();
+            let ops = sites
+                .iter()
+                .map(|site| site.op)
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect::<Vec<_>>()
+                .join(";");
             out.push_str(&format!(
-                "{}\t{}\t{}\t{}\t{}\t{}\t{}\tvalue-only\n",
-                site.owner,
-                site.node.0.local_def_index.as_u32(),
-                site.node.1.local_id.as_u32(),
-                super::emitability::EmitabilityFacts::site(tcx, site.span),
-                site.op,
-                site.template.key(),
-                site.target.mutability.key(),
+                "{}\t{}\t{}\t{}\t{}\t{}\n",
+                tcx.def_path_str(node.0.to_def_id()),
+                node.0.local_def_index.as_u32(),
+                node.1.local_id.as_u32(),
+                class.key(),
+                sites.len(),
+                if ops.is_empty() { "-" } else { &ops },
             ));
         }
         out

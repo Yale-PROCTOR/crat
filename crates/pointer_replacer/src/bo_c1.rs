@@ -197,6 +197,14 @@ impl StandingCensusLaunchRecipe {
                 exposure_input_sha256,
             ),
         ]);
+        for key in [
+            "CRAT_RAW_BOUNDARY_UNIFIED_CONTROL",
+            "CRAT_RAW_BOUNDARY_DIAGNOSTIC_CONTROL",
+        ] {
+            if let Ok(value) = std::env::var(key) {
+                env.push((key, value));
+            }
+        }
         env
     }
 }
@@ -8724,6 +8732,23 @@ mod run {
             .replace(['\t', '\r', '\n'], " ")
     }
 
+    fn named_tsv_rows(input: &str) -> Vec<BTreeMap<String, String>> {
+        let mut lines = input.lines();
+        let Some(header) = lines.next() else {
+            return Vec::new();
+        };
+        let header = header.split('\t').map(str::to_owned).collect::<Vec<_>>();
+        lines
+            .map(|line| {
+                header
+                    .iter()
+                    .cloned()
+                    .zip(line.split('\t').map(str::to_owned))
+                    .collect()
+            })
+            .collect()
+    }
+
     #[derive(Default)]
     struct E1AdapterCounts {
         placed: usize,
@@ -9923,7 +9948,7 @@ mod run {
             let header = lines.next().unwrap_or_default();
             let prefix_header = "corpus\tanalysis_frame\tcode_frame\traw_boundary_wave\tdata\tbuild_profile\tresource_configured_mib\tresource_effective_mib\tprogram";
             let prefix = format!(
-                "rs-crown\t{}\t{}\twave1\t{}\t{}\t{}\t{}\t{}",
+                "rs-crown\t{}\t{}\twave2\t{}\t{}\t{}\t{}\t{}",
                 model_cache::ANALYSIS_FRAME,
                 code_frame,
                 data,
@@ -9945,6 +9970,11 @@ mod run {
         let artifact_rows = [
             ("exposure", artifact.exposure.as_str()),
             ("d4-edges", artifact.d4_edges.as_str()),
+            ("pairs", artifact.pairs.as_str()),
+            ("addresses", artifact.addresses.as_str()),
+            ("arm-outcomes", artifact.arm_outcomes.as_str()),
+            ("edit-keys", artifact.edit_keys.as_str()),
+            ("adapters", capture.adapter_receipt.as_str()),
             ("sites", artifact.sites.as_str()),
             ("retention", artifact.retention.as_str()),
             ("dispositions", artifact.dispositions.as_str()),
@@ -10115,6 +10145,203 @@ mod run {
             .skip(1)
             .filter(|line| line.starts_with("raw-boundary-address:"))
             .count();
+        let exposure_rows = named_tsv_rows(&artifact.exposure);
+        let exposure_configured = exposure_rows
+            .iter()
+            .filter(|row| row.get("configured_name").is_some_and(|value| value == "1"))
+            .count();
+        let exposure_address = exposure_rows
+            .iter()
+            .filter(|row| row.get("address_taken").is_some_and(|value| value == "1"))
+            .count();
+        let exposure_both = exposure_rows
+            .iter()
+            .filter(|row| {
+                row.get("seed_provenance")
+                    .is_some_and(|value| value == "both")
+            })
+            .count();
+        let exposure_union = exposure_rows
+            .iter()
+            .filter(|row| {
+                row.get("seed_provenance")
+                    .is_some_and(|value| value != "none")
+            })
+            .count();
+        let unique_exposure_value = |field: &str| {
+            let values = exposure_rows
+                .iter()
+                .filter_map(|row| row.get(field).cloned())
+                .collect::<BTreeSet<_>>();
+            assert_eq!(values.len(), 1, "{name} exposure {field} disagreement");
+            values.into_iter().next().unwrap_or_default()
+        };
+        let exposure_input_digest = unique_exposure_value("configured_input_sha256");
+        let exposure_manifest_digest = unique_exposure_value("seed_manifest_sha256");
+        let surface_count = |key: &str| {
+            exposure_rows
+                .iter()
+                .filter(|row| row.get("surface_plan").is_some_and(|value| value == key))
+                .count()
+        };
+        let arm_rows = named_tsv_rows(&artifact.arm_outcomes);
+        let arm_required = |arm: &str| {
+            arm_rows
+                .iter()
+                .filter(|row| {
+                    row.get("required_arms")
+                        .is_some_and(|arms| arms.split('+').any(|candidate| candidate == arm))
+                })
+                .count()
+        };
+        let arm_terminal = |terminal: &str| {
+            arm_rows
+                .iter()
+                .filter(|row| row.get("terminal").is_some_and(|value| value == terminal))
+                .count()
+        };
+        let pair_rows = named_tsv_rows(&artifact.pairs);
+        let pair_field = |field: &str, value: &str| {
+            pair_rows
+                .iter()
+                .filter(|row| row.get(field).is_some_and(|candidate| candidate == value))
+                .count()
+        };
+        let adapter_rows = named_tsv_rows(&capture.adapter_receipt);
+        let glue_placed = adapter_rows
+            .iter()
+            .filter(|row| {
+                row.get("kind").is_some_and(|value| value == "placed")
+                    && row
+                        .get("found_form")
+                        .is_some_and(|value| value != "raw" && value != "-")
+                    && row
+                        .get("expected_form")
+                        .is_some_and(|value| value != "raw" && value != "-")
+            })
+            .count();
+        let glue_blocked = adapter_rows
+            .iter()
+            .filter(|row| {
+                row.get("kind").is_some_and(|value| value == "blocked")
+                    && row
+                        .get("family_or_reason")
+                        .is_some_and(|value| value.starts_with("glue-"))
+            })
+            .count();
+        let address_rows = named_tsv_rows(&artifact.addresses);
+        let address_class = |class: &str| {
+            address_rows
+                .iter()
+                .filter(|row| row.get("use_class").is_some_and(|value| value == class))
+                .count()
+        };
+        let atom_keyed_edits = artifact.edit_keys.lines().skip(1).count();
+        let mut unified_control_rows = 0usize;
+        let mut unified_production_matched = 0usize;
+        let mut unified_control_unmatched = 0usize;
+        let unified_production_unmatched = 0usize;
+        let mut masked_reasons = BTreeMap::<String, usize>::new();
+        if let Some(path) = std::env::var_os("CRAT_RAW_BOUNDARY_UNIFIED_CONTROL") {
+            let control_text = std::fs::read_to_string(&path)
+                .unwrap_or_else(|error| panic!("read unified market control: {error}"));
+            let control = named_tsv_rows(&control_text)
+                .into_iter()
+                .filter(|row| row.get("program").is_some_and(|value| value == &name))
+                .collect::<Vec<_>>();
+            let mut seen = BTreeSet::new();
+            let mut ledger = String::from(
+                "program\tsubject_identity\tmasked\tinbound\tclass_collateral\tmasked_reason\tproduction_present\tterminal\trequired_arms\tapplied_arms\n",
+            );
+            for row in control {
+                let identity = row
+                    .get("subject_identity")
+                    .unwrap_or_else(|| panic!("unified control missing subject identity"));
+                assert!(
+                    seen.insert(identity.clone()),
+                    "duplicate unified control {name}:{identity}"
+                );
+                unified_control_rows += 1;
+                let production = arm_rows
+                    .iter()
+                    .find(|production| production.get("subject_identity") == Some(identity));
+                unified_production_matched += usize::from(production.is_some());
+                unified_control_unmatched += usize::from(production.is_none());
+                if row.get("masked").is_some_and(|value| value == "1") {
+                    *masked_reasons
+                        .entry(
+                            row.get("masked_reason")
+                                .cloned()
+                                .unwrap_or_else(|| "-".to_owned()),
+                        )
+                        .or_default() += 1;
+                }
+                ledger.push_str(&format!(
+                    "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+                    name,
+                    identity,
+                    row.get("masked").map_or("-", String::as_str),
+                    row.get("inbound").map_or("-", String::as_str),
+                    row.get("class_collateral").map_or("-", String::as_str),
+                    row.get("masked_reason").map_or("-", String::as_str),
+                    u8::from(production.is_some()),
+                    production
+                        .and_then(|row| row.get("terminal"))
+                        .map_or("missing", String::as_str),
+                    production
+                        .and_then(|row| row.get("required_arms"))
+                        .map_or("-", String::as_str),
+                    production
+                        .and_then(|row| row.get("applied_arms"))
+                        .map_or("-", String::as_str),
+                ));
+            }
+            std::fs::write(
+                directory.join(format!("{name}.raw-boundary-unified-ledger.tsv")),
+                stamp(&ledger),
+            )
+            .expect("write unified market ledger");
+        }
+        let mut diagnostic_control_matched = 0usize;
+        if let Some(path) = std::env::var_os("CRAT_RAW_BOUNDARY_DIAGNOSTIC_CONTROL") {
+            let control_text = std::fs::read_to_string(&path)
+                .unwrap_or_else(|error| panic!("read diagnostic control: {error}"));
+            let control = named_tsv_rows(&control_text)
+                .into_iter()
+                .filter(|row| row.get("program").is_some_and(|value| value == &name))
+                .collect::<Vec<_>>();
+            let mut ledger = String::from(
+                "program\tdiagnostic_identity\tfunction\tcontrol_code\tcandidate_arms\tpost_disposition\n",
+            );
+            for row in control {
+                let identity = row.get("diagnostic_identity").map_or("-", String::as_str);
+                let function = row.get("function").map_or("-", String::as_str);
+                let code = row.get("error_code").map_or("-", String::as_str);
+                let current = capture.reverts.iter().any(|revert| {
+                    revert.function == function
+                        && (code == "-" || e1_code(revert.diagnostic.code.as_deref()) == code)
+                });
+                diagnostic_control_matched += 1;
+                ledger.push_str(&format!(
+                    "{}\t{}\t{}\t{}\t{}\t{}\n",
+                    name,
+                    identity,
+                    function,
+                    code,
+                    row.get("candidate_arms").map_or("-", String::as_str),
+                    if current {
+                        "compiler-diagnostic"
+                    } else {
+                        "no-current-diagnostic"
+                    },
+                ));
+            }
+            std::fs::write(
+                directory.join(format!("{name}.raw-boundary-diagnostic-ledger.tsv")),
+                stamp(&ledger),
+            )
+            .expect("write diagnostic control ledger");
+        }
         let waiver_sha = format!(
             "{:x}",
             Sha256::digest(
@@ -10143,7 +10370,7 @@ mod run {
         row.set(raw_schema::CORPUS, "rs-crown");
         row.set(raw_schema::ANALYSIS_FRAME, model_cache::ANALYSIS_FRAME);
         row.set(raw_schema::CODE_FRAME, &code_frame);
-        row.set(raw_schema::WAVE, "wave1");
+        row.set(raw_schema::WAVE, "wave2");
         row.set(raw_schema::DATA, data);
         row.set(raw_schema::BUILD_PROFILE, build_profile);
         row.set(raw_schema::LAUNCH_PROFILE, &launch_profile);
@@ -10185,6 +10412,119 @@ mod run {
         row.set(raw_schema::T2_REALIZED_SUBJECTS, t2_realized);
         row.set(raw_schema::MASKED_SECONDARY, masked_secondary);
         row.set(raw_schema::ADDRESS_OBSERVATION_EDITS, address_edits);
+        row.set(raw_schema::EXPOSURE_CONFIGURED_MATCHES, exposure_configured);
+        row.set(raw_schema::EXPOSURE_ADDRESS_ROOTS, exposure_address);
+        row.set(raw_schema::EXPOSURE_BOTH, exposure_both);
+        row.set(raw_schema::EXPOSURE_SEED_UNION, exposure_union);
+        row.set(raw_schema::EXPOSURE_INPUT_SHA256, exposure_input_digest);
+        row.set(
+            raw_schema::EXPOSURE_MANIFEST_SHA256,
+            exposure_manifest_digest,
+        );
+        row.set(
+            raw_schema::SURFACE_ENTRY_SHIMS,
+            surface_count("positive-seed-entry-shim"),
+        );
+        row.set(
+            raw_schema::SURFACE_WEB_WRAPPERS,
+            surface_count("fnptr-web-raw-wrapper"),
+        );
+        row.set(
+            raw_schema::SURFACE_CLOSED_DIRECT,
+            surface_count("exposure-indeterminate-closed-world"),
+        );
+        row.set(
+            raw_schema::SURFACE_NOT_APPLICABLE,
+            surface_count("not-applicable"),
+        );
+        row.set(raw_schema::ARM_OUTCOME_ROWS, arm_rows.len());
+        row.set(raw_schema::ARM_SURFACE_REQUIRED, arm_required("surface"));
+        row.set(raw_schema::ARM_D4_REQUIRED, arm_required("d4"));
+        row.set(raw_schema::ARM_C_REQUIRED, arm_required("c"));
+        row.set(raw_schema::ARM_PAIR_REQUIRED, arm_required("pair"));
+        row.set(raw_schema::ARM_GLUE_REQUIRED, arm_required("glue"));
+        row.set(raw_schema::ARM_ADDR_REQUIRED, arm_required("addr"));
+        row.set(raw_schema::ARM_PLANNED_UNIQUE, arm_terminal("planned"));
+        row.set(raw_schema::ARM_BLOCKED_UNIQUE, arm_terminal("blocked"));
+        row.set(raw_schema::PAIR_CLEAR, pair_field("verdict", "clear"));
+        row.set(
+            raw_schema::PAIR_OVERLAPPING,
+            pair_field("verdict", "overlapping"),
+        );
+        row.set(
+            raw_schema::PAIR_UNDETERMINABLE,
+            pair_field("verdict", "undeterminable"),
+        );
+        row.set(raw_schema::PAIR_PRIMARY, pair_field("role", "primary"));
+        row.set(raw_schema::PAIR_RAW_VIEW, pair_field("role", "raw-view"));
+        row.set(raw_schema::PAIR_T1, pair_field("tier", "T1"));
+        row.set(raw_schema::PAIR_T2, pair_field("tier", "T2"));
+        row.set(raw_schema::PAIR_BLOCKED, pair_field("role", "blocked"));
+        row.set(raw_schema::GLUE_PLACED, glue_placed);
+        row.set(raw_schema::GLUE_BLOCKED, glue_blocked);
+        row.set(raw_schema::ADDR_VALUE_ONLY, address_class("value-only"));
+        row.set(raw_schema::ADDR_ACCESS_ONLY, address_class("access-only"));
+        row.set(raw_schema::ADDR_BOTH, address_class("both"));
+        row.set(raw_schema::ADDR_NEITHER, address_class("neither"));
+        row.set(raw_schema::ATOM_KEYED_EDITS, atom_keyed_edits);
+        row.set(
+            raw_schema::ATOM_BISECT_ATTEMPTS,
+            atom_counts
+                .get("atom-bounded-group-bisection")
+                .copied()
+                .unwrap_or(0),
+        );
+        row.set(raw_schema::UNIFIED_CONTROL_ROWS, unified_control_rows);
+        row.set(
+            raw_schema::UNIFIED_PRODUCTION_MATCHED,
+            unified_production_matched,
+        );
+        row.set(
+            raw_schema::UNIFIED_CONTROL_UNMATCHED,
+            unified_control_unmatched,
+        );
+        row.set(
+            raw_schema::UNIFIED_PRODUCTION_UNMATCHED,
+            unified_production_unmatched,
+        );
+        row.set(
+            raw_schema::DIAGNOSTIC_CONTROL_MATCHED,
+            diagnostic_control_matched,
+        );
+        let masked_reason_count = |reason: &str| masked_reasons.get(reason).copied().unwrap_or(0);
+        row.set(
+            raw_schema::R1_CLASS_BLOCKED,
+            masked_reason_count("class-blocked"),
+        );
+        row.set(
+            raw_schema::R1_ARG_STAYS_RAW,
+            masked_reason_count("arg-stays-raw"),
+        );
+        row.set(
+            raw_schema::R1_DUPLICATE_PLACE_ROOT,
+            masked_reason_count("duplicate-place-root"),
+        );
+        row.set(
+            raw_schema::R1_FLOWS_INTO_RAW_PARAM,
+            masked_reason_count("flows-into-raw-param"),
+        );
+        row.set(
+            raw_schema::R1_FLOWS_INTO_OTHER_FORM,
+            masked_reason_count("flows-into-other-form"),
+        );
+        row.set(
+            raw_schema::R1_BORROWED_INTO_RAW_PARAM,
+            masked_reason_count("borrowed-into-raw-param"),
+        );
+        row.set(
+            raw_schema::R1_PTR_COMPARISON,
+            masked_reason_count("ptr-comparison"),
+        );
+        row.set(
+            raw_schema::R1_ESCAPES_VIA_FOREIGN_ARG,
+            masked_reason_count("escapes-via-foreign-arg"),
+        );
+        row.set(raw_schema::R1_OTHER, masked_reason_count("other"));
         row.set(
             raw_schema::ATOM_ATTEMPTS,
             atom_counts.get("atom-succeeded").copied().unwrap_or(0)
@@ -10243,6 +10583,12 @@ mod run {
         let cache_ok = solve.source == "cache"
             && solve.cache_status == "hit"
             && solve.solve_wall_s == "0.000000";
+        let controls_requested = std::env::var_os("CRAT_RAW_BOUNDARY_UNIFIED_CONTROL").is_some()
+            || std::env::var_os("CRAT_RAW_BOUNDARY_DIAGNOSTIC_CONTROL").is_some();
+        let controls_ok = !controls_requested
+            || (unified_control_unmatched == 0
+                && unified_control_rows == unified_production_matched
+                && diagnostic_control_matched > 0);
         row.set(
             raw_schema::STATUS,
             if non_citable_reason.is_some() {
@@ -10251,6 +10597,8 @@ mod run {
                 "debug-build-profile"
             } else if !cache_ok {
                 "cache-gate-failed"
+            } else if !controls_ok {
+                "control-reconciliation-failed"
             } else {
                 "ok"
             },
@@ -19456,8 +19804,8 @@ fn raw_boundary_fingerprint_component_side_read() {
 }
 
 #[test]
-#[ignore = "raw-boundary wave 1: two-root and representative-program preflight"]
-fn raw_boundary_wave1_preflight() {
+#[ignore = "raw-boundary wave 2: two-root and representative-program preflight"]
+fn raw_boundary_wave2_preflight() {
     use std::{fs, path::PathBuf, time::Duration};
 
     let root = orchestrate::workspace_root();
@@ -19515,6 +19863,13 @@ fn raw_boundary_wave1_preflight() {
         row
     };
     let suffixes = [
+        "raw-boundary-exposure.tsv",
+        "raw-boundary-d4-edges.tsv",
+        "raw-boundary-pairs.tsv",
+        "raw-boundary-addresses.tsv",
+        "raw-boundary-arm-outcomes.tsv",
+        "raw-boundary-edit-keys.tsv",
+        "raw-boundary-adapters.tsv",
         "raw-boundary-sites.tsv",
         "raw-boundary-retention.tsv",
         "raw-boundary-dispositions.tsv",
@@ -19572,11 +19927,33 @@ fn raw_boundary_wave1_preflight() {
 }
 
 #[test]
-#[ignore = "raw-boundary wave 1: serialized release cache-only 20-program census"]
-fn raw_boundary_wave1_corpus_census() {
-    use std::{fs, path::PathBuf, time::Duration};
+#[ignore = "raw-boundary wave 2: serialized release cache-only 20-program census"]
+fn raw_boundary_wave2_corpus_census() {
+    use std::{
+        collections::{BTreeMap, BTreeSet},
+        fs,
+        path::PathBuf,
+        time::Duration,
+    };
 
     use sha2::{Digest, Sha256};
+
+    fn named_tsv_rows(input: &str) -> Vec<BTreeMap<String, String>> {
+        let mut lines = input.lines();
+        let Some(header) = lines.next() else {
+            return Vec::new();
+        };
+        let header = header.split('\t').map(str::to_owned).collect::<Vec<_>>();
+        lines
+            .map(|line| {
+                header
+                    .iter()
+                    .cloned()
+                    .zip(line.split('\t').map(str::to_owned))
+                    .collect()
+            })
+            .collect()
+    }
 
     let root = orchestrate::workspace_root();
     let artifact_dir = PathBuf::from(
@@ -19654,7 +20031,7 @@ fn raw_boundary_wave1_corpus_census() {
             Some("0"),
             "{row:?}"
         );
-        assert_eq!(row.get(raw_schema::WAVE), Some("wave1"), "{row:?}");
+        assert_eq!(row.get(raw_schema::WAVE), Some("wave2"), "{row:?}");
         eprintln!(
             "RAW-BOUNDARY-CENSUS program={} stage=complete rc=0 wall={:.3} rss={} digest={}",
             program.name,
@@ -19738,6 +20115,60 @@ fn raw_boundary_wave1_corpus_census() {
     )
     .expect("write diagnostic movement");
 
+    let pair_control_path = PathBuf::from(
+        std::env::var_os("CRAT_RAW_BOUNDARY_PAIR_SITE_CONTROL")
+            .expect("raw-boundary PAIR site control"),
+    );
+    let pair_control = fs::read_to_string(&pair_control_path).expect("read PAIR site control");
+    let expected_pair_sites = named_tsv_rows(&pair_control)
+        .into_iter()
+        .filter(|row| {
+            row.get("fact_verdict")
+                .is_some_and(|verdict| verdict == "overlapping")
+        })
+        .map(|row| {
+            (
+                row["program"].clone(),
+                row["adapter_key"].clone(),
+                row["fact_verdict"].clone(),
+            )
+        })
+        .collect::<BTreeSet<_>>();
+    assert_eq!(expected_pair_sites.len(), 73, "PAIR site control drift");
+    let current_adapters =
+        raw_boundary_program_artifacts(&artifact_dir, "raw-boundary-adapters.tsv")
+            .expect("read current adapter receipts");
+    let mut observed_pair_sites = BTreeSet::new();
+    for (program, text) in current_adapters {
+        for row in named_tsv_rows(&text) {
+            if row.get("kind").is_some_and(|kind| kind == "overlap-proof") {
+                observed_pair_sites.insert((
+                    program.clone(),
+                    row.get("adapter_key").cloned().unwrap_or_default(),
+                    row.get("overlap_verdict").cloned().unwrap_or_default(),
+                ));
+            }
+        }
+    }
+    let mut pair_divergences = String::from("program\tadapter_key\texpected\tobserved\n");
+    for (program, key, expected) in &expected_pair_sites {
+        let observed = observed_pair_sites
+            .iter()
+            .find(|(candidate_program, candidate_key, _)| {
+                candidate_program == program && candidate_key == key
+            })
+            .map_or("missing", |(_, _, verdict)| verdict.as_str());
+        if observed != expected {
+            pair_divergences.push_str(&format!("{program}\t{key}\t{expected}\t{observed}\n"));
+        }
+    }
+    fs::write(
+        artifact_dir.join("pair-site-control-divergences.tsv"),
+        &pair_divergences,
+    )
+    .expect("write PAIR site divergences");
+    assert_eq!(pair_divergences.lines().count(), 1, "{pair_divergences}");
+
     let total = |key: &str| {
         rows.iter()
             .map(|row| {
@@ -19755,7 +20186,7 @@ fn raw_boundary_wave1_corpus_census() {
         crate::analyses::borrow_ownership::model_cache::ANALYSIS_FRAME,
     );
     aggregate.set(raw_schema::CODE_FRAME, &code_frame);
-    aggregate.set(raw_schema::WAVE, "wave1");
+    aggregate.set(raw_schema::WAVE, "wave2");
     aggregate.set(raw_schema::DATA, "true");
     for key in [
         raw_schema::SITE_ROWS,
@@ -19779,9 +20210,76 @@ fn raw_boundary_wave1_corpus_census() {
         raw_schema::ATOM_AMBIGUOUS,
         raw_schema::ATOM_SECOND_VERIFY,
         raw_schema::ATOM_FUNCTION_FALLBACK,
+        raw_schema::EXPOSURE_CONFIGURED_MATCHES,
+        raw_schema::EXPOSURE_ADDRESS_ROOTS,
+        raw_schema::EXPOSURE_BOTH,
+        raw_schema::EXPOSURE_SEED_UNION,
+        raw_schema::SURFACE_ENTRY_SHIMS,
+        raw_schema::SURFACE_WEB_WRAPPERS,
+        raw_schema::SURFACE_CLOSED_DIRECT,
+        raw_schema::SURFACE_NOT_APPLICABLE,
+        raw_schema::UNIFIED_CONTROL_ROWS,
+        raw_schema::UNIFIED_PRODUCTION_MATCHED,
+        raw_schema::UNIFIED_CONTROL_UNMATCHED,
+        raw_schema::UNIFIED_PRODUCTION_UNMATCHED,
+        raw_schema::ARM_OUTCOME_ROWS,
+        raw_schema::ARM_SURFACE_REQUIRED,
+        raw_schema::ARM_D4_REQUIRED,
+        raw_schema::ARM_C_REQUIRED,
+        raw_schema::ARM_PAIR_REQUIRED,
+        raw_schema::ARM_GLUE_REQUIRED,
+        raw_schema::ARM_ADDR_REQUIRED,
+        raw_schema::ARM_PLANNED_UNIQUE,
+        raw_schema::ARM_BLOCKED_UNIQUE,
+        raw_schema::PAIR_CLEAR,
+        raw_schema::PAIR_OVERLAPPING,
+        raw_schema::PAIR_UNDETERMINABLE,
+        raw_schema::PAIR_PRIMARY,
+        raw_schema::PAIR_RAW_VIEW,
+        raw_schema::PAIR_T1,
+        raw_schema::PAIR_T2,
+        raw_schema::PAIR_BLOCKED,
+        raw_schema::GLUE_PLACED,
+        raw_schema::GLUE_BLOCKED,
+        raw_schema::ADDR_VALUE_ONLY,
+        raw_schema::ADDR_ACCESS_ONLY,
+        raw_schema::ADDR_BOTH,
+        raw_schema::ADDR_NEITHER,
+        raw_schema::ATOM_KEYED_EDITS,
+        raw_schema::ATOM_BISECT_ATTEMPTS,
+        raw_schema::DIAGNOSTIC_CONTROL_MATCHED,
+        raw_schema::R1_CLASS_BLOCKED,
+        raw_schema::R1_ARG_STAYS_RAW,
+        raw_schema::R1_DUPLICATE_PLACE_ROOT,
+        raw_schema::R1_FLOWS_INTO_RAW_PARAM,
+        raw_schema::R1_FLOWS_INTO_OTHER_FORM,
+        raw_schema::R1_BORROWED_INTO_RAW_PARAM,
+        raw_schema::R1_PTR_COMPARISON,
+        raw_schema::R1_ESCAPES_VIA_FOREIGN_ARG,
+        raw_schema::R1_OTHER,
     ] {
         aggregate.set(key, total(key));
     }
+    assert_eq!(total(raw_schema::UNIFIED_CONTROL_ROWS), 1_291);
+    assert_eq!(total(raw_schema::UNIFIED_PRODUCTION_MATCHED), 1_291);
+    assert_eq!(total(raw_schema::UNIFIED_CONTROL_UNMATCHED), 0);
+    assert_eq!(total(raw_schema::UNIFIED_PRODUCTION_UNMATCHED), 0);
+    assert_eq!(total(raw_schema::DIAGNOSTIC_CONTROL_MATCHED), 358);
+    assert_eq!(
+        [
+            total(raw_schema::R1_CLASS_BLOCKED),
+            total(raw_schema::R1_ARG_STAYS_RAW),
+            total(raw_schema::R1_DUPLICATE_PLACE_ROOT),
+            total(raw_schema::R1_FLOWS_INTO_RAW_PARAM),
+            total(raw_schema::R1_FLOWS_INTO_OTHER_FORM),
+            total(raw_schema::R1_BORROWED_INTO_RAW_PARAM),
+            total(raw_schema::R1_PTR_COMPARISON),
+            total(raw_schema::R1_ESCAPES_VIA_FOREIGN_ARG),
+            total(raw_schema::R1_OTHER),
+        ],
+        [386, 212, 122, 82, 51, 34, 33, 20, 4],
+        "wave-2 R1 control split drift",
+    );
     aggregate.set(raw_schema::CONTROL_LIBC_SUBJECTS, controls.libc_subjects);
     aggregate.set(raw_schema::CONTROL_LIBC_EDGES, controls.libc_edges);
     aggregate.set(raw_schema::CONTROL_FREE_ROWS, controls.free_rows);
@@ -19792,6 +20290,8 @@ fn raw_boundary_wave1_corpus_census() {
         raw_schema::CONTROL_DIAGNOSTIC_ROWS,
         diagnostic_recon.baseline,
     );
+    aggregate.set(raw_schema::CONTROL_PAIR_SUBJECT_ROWS, 122);
+    aggregate.set(raw_schema::CONTROL_PAIR_SITE_ROWS, 73);
     aggregate.set(raw_schema::CONTROL_DIVERGENCES, 0);
     aggregate.set(raw_schema::ARM_B_ROWS, controls.arm_b_rows);
     aggregate.set(raw_schema::ARM_B_BOX_ROWS, controls.box_rows);

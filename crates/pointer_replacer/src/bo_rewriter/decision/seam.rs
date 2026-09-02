@@ -2706,14 +2706,13 @@ pub(crate) fn synthesize_with_raw_boundary(
         .filter(|pair| pair.role == super::co_conversion::PairRole::RawView)
     {
         if let Some(node) = pair.source_node {
-            plan.raw_boundary_atom_groups
-                .entry(node)
-                .or_default()
-                .push(super::raw_boundary::SubjectAtomKey {
+            plan.raw_boundary_atom_groups.entry(node).or_default().push(
+                super::raw_boundary::SubjectAtomKey {
                     id: pair.atom_id(),
                     node,
                     owner: tcx.def_path_str(pair.caller.to_def_id()),
-                });
+                },
+            );
         }
     }
     for atoms in plan.raw_boundary_atom_groups.values_mut() {

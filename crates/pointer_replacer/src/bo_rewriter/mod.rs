@@ -179,6 +179,7 @@ pub(crate) struct RawBoundaryArtifacts {
     pub(crate) pairs: String,
     pub(crate) addresses: String,
     pub(crate) arm_outcomes: String,
+    pub(crate) edit_keys: String,
     pub(crate) sites: String,
     pub(crate) retention: String,
     pub(crate) dispositions: String,
@@ -1106,6 +1107,20 @@ fn verify_and_revert(
         e1_novel_error_count: 0,
         e1_box_drop_receipt: String::new(),
         solve_receipt: model_cache::solve_receipt(),
+    };
+    facts.raw_boundary_artifacts.edit_keys = {
+        let mut keys = planned_edit_sites
+            .iter()
+            .map(|edit| edit.edit_id.clone())
+            .collect::<Vec<_>>();
+        keys.sort();
+        keys.dedup();
+        let mut out = String::from("edit_key\n");
+        for key in keys {
+            out.push_str(&key);
+            out.push('\n');
+        }
+        out
     };
     let crate_dir = tree_base
         .and_then(|root| root.parent())
@@ -4284,6 +4299,7 @@ fn finish_decide<'tcx>(
         pairs: coconv.pair_receipts_tsv(tcx),
         addresses: raw_boundary.addresses_tsv(tcx),
         arm_outcomes: arm_outcomes_tsv(tcx, &subjects, &table, &coconv, &raw_boundary),
+        edit_keys: String::from("edit_key\n"),
         sites: raw_boundary_sites.to_tsv(),
         retention: retention.to_tsv(),
         dispositions: raw_boundary.receipts_tsv(),
