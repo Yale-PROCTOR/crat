@@ -3506,6 +3506,10 @@ pub(crate) fn validate_plan(
                     inner.justification,
                     plan::Justification::KindDecision { .. }
                 ) || !nested_kind_under_seam(kept, *inner_index))
+                    && (!matches!(
+                        inner.justification,
+                        plan::Justification::KindDecision { .. }
+                    ) || !exact_kind_composed_by_seam(kept, *inner_index))
                     && !nested_c9_over_seam(kept, *inner_index)
             })
             .map(|(_, edit)| edit.clone())
@@ -3533,6 +3537,26 @@ fn nested_kind_under_seam(edits: &[plan::Edit], inner_index: usize) -> bool {
             && inner.hi <= outer.hi
             && (outer.lo < inner.lo || inner.hi < outer.hi)
     })
+}
+
+/// The AST path has a typed use-to-seam handoff for one exact-span seam. This
+/// projection cannot represent sequential ownership of one byte range, so it
+/// omits the use projection only when the plan proves the handoff is unique.
+fn exact_kind_composed_by_seam(edits: &[plan::Edit], kind_index: usize) -> bool {
+    let kind = &edits[kind_index];
+    matches!(kind.justification, plan::Justification::KindDecision { .. })
+        && edits
+            .iter()
+            .enumerate()
+            .filter(|(seam_index, seam)| {
+                *seam_index != kind_index
+                    && matches!(seam.justification, plan::Justification::SeamAdapter { .. })
+                    && seam.edit_kind != "body-adapter"
+                    && seam.lo == kind.lo
+                    && seam.hi == kind.hi
+            })
+            .count()
+            == 1
 }
 
 /// C-9 owns the enclosing call while a seam owns one argument. The AST choke
@@ -4555,12 +4579,14 @@ fn arm_outcomes_tsv(
                 .key()
             })
             .collect::<Vec<_>>();
+        let owner = tcx.def_path_str(subject.fn_did.to_def_id());
+        let identity = subject.identity_key(&owner);
         rows.push((
-            subject.label.clone(),
+            identity.clone(),
             format!(
                 "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
-                subject.label,
-                tcx.def_path_str(subject.fn_did.to_def_id()),
+                identity,
+                owner,
                 required.render(),
                 ready.render(),
                 ready.render(),

@@ -648,6 +648,44 @@ impl Composition {
         }
     }
 
+    /// Admit the one ruled same-node composition: a seam wrapping an exact
+    /// subject-use graft. The use pass has already replaced the expression;
+    /// this handoff lets the seam consume that rewritten subtree without
+    /// converting ordinary collision order into precedence.
+    ///
+    /// A missing use claim, or any different holder, remains a counted refusal.
+    pub(crate) fn claim_seam_after_exact_use(
+        &mut self,
+        node: NodeId,
+        span: rustc_span::Span,
+    ) -> bool {
+        let holder = self.claimed.get(&node).copied();
+        if holder != Some("use") {
+            self.refused.push(Refusal {
+                node,
+                holder: holder.unwrap_or("missing-exact-use"),
+                challenger: "seam",
+            });
+            return false;
+        }
+        let Some(index) = self
+            .edited
+            .iter()
+            .zip(&self.claimants)
+            .rposition(|(edited, claimant)| *edited == span && *claimant == "use")
+        else {
+            self.refused.push(Refusal {
+                node,
+                holder: "use-claim-without-edit",
+                challenger: "seam",
+            });
+            return false;
+        };
+        self.claimed.insert(node, "use+seam");
+        self.claimants[index] = "use+seam";
+        true
+    }
+
     /// The spans this transform actually edited. Empty means the transform
     /// changed nothing — and then nothing is reprinted, which is the correct
     /// answer, not a degenerate one.
@@ -1379,6 +1417,10 @@ pub(crate) struct SeamTarget {
     pub spec: super::decision::seam::GlueSpec,
     pub arg_span: rustc_span::Span,
     pub reborrow: bool,
+    /// This seam owns the same AST expression as one already-selected use
+    /// graft. The only legal order is use first, then seam around the rewritten
+    /// value; every other same-node collision remains refused.
+    pub exact_use_composition: bool,
 }
 
 impl SeamTarget {
@@ -1396,7 +1438,7 @@ impl SeamTarget {
     /// silently become `safe`, and `safe` is the column meaning
     /// "compiler-checked end to end" — so the default a `matches!` picks is the
     /// flattering one.
-    fn of(edit: &super::decision::seam::SeamEdit) -> Self {
+    fn of(edit: &super::decision::seam::SeamEdit, exact_use_composition: bool) -> Self {
         use super::decision::seam::SeamFamily;
         Self {
             spec: edit.spec.clone(),
@@ -1405,6 +1447,7 @@ impl SeamTarget {
                 SeamFamily::Reborrow => true,
                 SeamFamily::Safe => false,
             },
+            exact_use_composition,
         }
     }
 
@@ -1417,6 +1460,7 @@ impl SeamTarget {
                 SeamFamily::Reborrow => true,
                 SeamFamily::Safe => false,
             },
+            exact_use_composition: false,
         }
     }
 }
@@ -1609,7 +1653,12 @@ impl MutVisitor for SeamGraftVisitor<'_> {
                 rustc_ast::mut_visit::walk_expr(self, e);
                 return;
             };
-            if !self.guard.claim(e.id, e.span, "seam") {
+            let claimed = if target.exact_use_composition {
+                self.guard.claim_seam_after_exact_use(e.id, e.span)
+            } else {
+                self.guard.claim(e.id, e.span, "seam")
+            };
+            if !claimed {
                 self.stats.refused += 1;
                 return;
             }
@@ -1764,6 +1813,33 @@ mod tests {
         assert!(g.claim(NodeId::from_u32(1), rustc_span::DUMMY_SP, "decl:ref"));
         assert!(g.claim(NodeId::from_u32(2), rustc_span::DUMMY_SP, "use"));
         assert!(g.refused.is_empty(), "distinct nodes must not be refused");
+    }
+
+    /// Addendum-142 regression: the sole same-node exception is an exact use
+    /// followed by its seam. Mutation: replacing the handoff with `claim`
+    /// refuses the second step; admitting a missing/different first claimant
+    /// fails the two negative assertions.
+    #[test]
+    fn an_exact_use_claim_hands_off_to_its_seam_only() {
+        let node = NodeId::from_u32(7);
+        let span = rustc_span::DUMMY_SP;
+        let mut composed = Composition::default();
+        assert!(composed.claim(node, span, "use"));
+        assert!(composed.claim_seam_after_exact_use(node, span));
+        assert!(composed.refused.is_empty());
+        assert_eq!(
+            composed.edited_with_claimants().collect::<Vec<_>>(),
+            vec![(span, "use+seam")]
+        );
+
+        let mut missing = Composition::default();
+        assert!(!missing.claim_seam_after_exact_use(node, span));
+        assert_eq!(missing.refused[0].holder, "missing-exact-use");
+
+        let mut wrong = Composition::default();
+        assert!(wrong.claim(node, span, "decl:ref"));
+        assert!(!wrong.claim_seam_after_exact_use(node, span));
+        assert_eq!(wrong.refused[0].holder, "decl:ref");
     }
 
     /// **The claimant travels with its span, in order, and REFUSALS DO NOT
@@ -3213,10 +3289,12 @@ pub(crate) fn filtered_inputs(
         if !reverts.keeps_edit(&edit.owner_fn, &edit.atom_ids) {
             continue;
         }
+        let key = (edit.span.lo().0, edit.span.hi().0);
+        let exact_use_composition = out.uses.contains_key(&key);
         insert_counting(
             &mut out.seams,
-            (edit.span.lo().0, edit.span.hi().0),
-            SeamTarget::of(edit),
+            key,
+            SeamTarget::of(edit, exact_use_composition),
             &mut out.seam_key_collisions,
         );
     }
@@ -5593,6 +5671,7 @@ mod arm2_witnesses {
                         spec: spec.clone(),
                         arg_span: *arg_span,
                         reborrow: *reborrow,
+                        exact_use_composition: false,
                     },
                 )
             })
@@ -5835,12 +5914,17 @@ mod arm2_witnesses {
                 atom_ids: Vec::new(),
             };
             assert!(
-                SeamTarget::of(&edit(super::super::decision::seam::SeamFamily::Reborrow)).reborrow,
+                SeamTarget::of(
+                    &edit(super::super::decision::seam::SeamFamily::Reborrow),
+                    false,
+                )
+                .reborrow,
                 "a reborrow adapter must stay countable as one — it is the \
                  population carrying the aliasing exposure"
             );
             assert!(
-                !SeamTarget::of(&edit(super::super::decision::seam::SeamFamily::Safe)).reborrow,
+                !SeamTarget::of(&edit(super::super::decision::seam::SeamFamily::Safe), false,)
+                    .reborrow,
                 "and a safe one must not be inflated into it"
             );
         });
@@ -5907,6 +5991,7 @@ mod arm2_witnesses {
                     spec: GlueSpec::core(GlueCore::Reborrow, true),
                     arg_span: arg,
                     reborrow: true,
+                    exact_use_composition: false,
                 },
             )]
             .into_iter()
@@ -6342,6 +6427,7 @@ mod arm2_witnesses {
                     spec: GlueSpec::core(GlueCore::Bare, true).with_unwrap(true),
                     arg_span: arg,
                     reborrow: false,
+                    exact_use_composition: false,
                 },
             )]
             .into_iter()
@@ -6458,6 +6544,7 @@ mod arm2_witnesses {
                     spec: GlueSpec::core(GlueCore::Reborrow, true),
                     arg_span: arg,
                     reborrow: true,
+                    exact_use_composition: false,
                 },
             )]
             .into_iter()
@@ -6481,6 +6568,51 @@ mod arm2_witnesses {
                 "the holder's transform stands and the refused one did not \
                  land: {text}"
             );
+        });
+    }
+
+    /// Addendum-142 exact-region regression: when the decision input marks the
+    /// seam as the consumer of an exact use edit, the same two passes compose
+    /// in their fixed order. Mutation: clearing `exact_use_composition` turns
+    /// this back into the refusal witnessed above and loses the seam wrapper.
+    #[test]
+    fn an_exact_use_is_wrapped_by_its_designated_seam() {
+        rustc_span::create_default_session_globals_then(|| {
+            let src = "fn f(p: *mut u8) { g(*p.offset(1)) }";
+            let mut krate = ::utils::ast::parse_crate(src.to_owned());
+            let arg = call_arg_span(&krate);
+            let mut guard = Composition::default();
+            let uses: FxHashMap<(u32, u32), String> =
+                [((arg.lo().0, arg.hi().0), "p[1]".to_owned())]
+                    .into_iter()
+                    .collect();
+            let mut use_pass = UseGraftVisitor::new(&uses, &mut guard);
+            use_pass.visit_crate(&mut krate);
+            assert_eq!(use_pass.finish().grafted, 1);
+
+            let seams: FxHashMap<(u32, u32), SeamTarget> = [(
+                (arg.lo().0, arg.hi().0),
+                SeamTarget {
+                    spec: GlueSpec::core(GlueCore::Reborrow, true),
+                    arg_span: arg,
+                    reborrow: true,
+                    exact_use_composition: true,
+                },
+            )]
+            .into_iter()
+            .collect();
+            let mut seam_pass = SeamGraftVisitor::new(&seams, &mut guard);
+            seam_pass.visit_crate(&mut krate);
+            let stats = seam_pass.finish();
+            assert_eq!(stats.grafted, 1);
+            assert_eq!(stats.refused, 0);
+            assert!(guard.refused.is_empty());
+            assert_eq!(
+                guard.edited_with_claimants().collect::<Vec<_>>(),
+                vec![(arg, "use+seam")]
+            );
+            let text = pprust::item_to_string(&krate.items[0]);
+            assert!(text.contains("g(&mut *p[1])"), "{text}");
         });
     }
 }
