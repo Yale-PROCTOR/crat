@@ -54,6 +54,25 @@ fn raw_boundary_pair_control_member(prior_verdict: &str, fact_verdict: &str) -> 
     prior_verdict == "a5-unknown" && fact_verdict == "overlapping"
 }
 
+const RAW_BOUNDARY_R1_NAMED_REASONS: [&str; 8] = [
+    "class-blocked",
+    "arg-stays-raw",
+    "duplicate-place-root",
+    "flows-into-raw-param",
+    "flows-into-other-form",
+    "borrowed-into-raw-param",
+    "ptr-comparison",
+    "escapes-via-foreign-arg",
+];
+
+fn raw_boundary_r1_other_count(counts: &std::collections::BTreeMap<String, usize>) -> usize {
+    counts
+        .iter()
+        .filter(|(reason, _)| !RAW_BOUNDARY_R1_NAMED_REASONS.contains(&reason.as_str()))
+        .map(|(_, count)| *count)
+        .sum()
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CacheOnlyRefusal {
     ManifestMiss,
@@ -10528,7 +10547,10 @@ mod run {
             raw_schema::R1_ESCAPES_VIA_FOREIGN_ARG,
             masked_reason_count("escapes-via-foreign-arg"),
         );
-        row.set(raw_schema::R1_OTHER, masked_reason_count("other"));
+        row.set(
+            raw_schema::R1_OTHER,
+            super::raw_boundary_r1_other_count(&masked_reasons),
+        );
         row.set(
             raw_schema::ATOM_ATTEMPTS,
             atom_counts.get("atom-succeeded").copied().unwrap_or(0)
@@ -20476,6 +20498,21 @@ fn raw_boundary_pair_control_selects_only_newly_resolved_overlaps() {
         "overlapping"
     ));
     assert!(!raw_boundary_pair_control_member("a5-unknown", "clear"));
+}
+
+/// The R1 `other` cell is the residual of the eight named classes. The control
+/// carries two concrete residual reasons rather than a literal `other` label;
+/// looking up that label would silently report 0/4.
+#[test]
+fn raw_boundary_r1_other_sums_unlisted_reason_labels() {
+    let counts = [
+        ("class-blocked".to_owned(), 386),
+        ("escapes-via-field-store".to_owned(), 2),
+        ("arg-cast-form-unbuilt".to_owned(), 2),
+    ]
+    .into_iter()
+    .collect();
+    assert_eq!(raw_boundary_r1_other_count(&counts), 4);
 }
 
 #[test]
