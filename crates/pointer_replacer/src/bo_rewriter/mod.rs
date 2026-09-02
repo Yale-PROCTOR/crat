@@ -4310,8 +4310,9 @@ fn finish_decide<'tcx>(
                 let local = Local::from_usize(param as usize);
                 table.entries.iter().any(|(subject, decision)| {
                     let is_ref = match decision {
-                        decision::Decision::Ref { .. }
-                        | decision::Decision::InferredRef { .. } => true,
+                        decision::Decision::Ref { .. } | decision::Decision::InferredRef { .. } => {
+                            true
+                        }
                         decision::Decision::Slice { .. }
                         | decision::Decision::Opt { .. }
                         | decision::Decision::Box(_)
