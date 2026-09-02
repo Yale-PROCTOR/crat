@@ -87,8 +87,9 @@ fn accepted_cache_manifest_contains(
         .ok_or_else(|| "accepted cache manifest lacks program".to_owned())?;
     let fingerprint_column = columns
         .get("fingerprint")
+        .or_else(|| columns.get("new_fingerprint"))
         .copied()
-        .ok_or_else(|| "accepted cache manifest lacks fingerprint".to_owned())?;
+        .ok_or_else(|| "accepted cache manifest lacks fingerprint/new_fingerprint".to_owned())?;
     Ok(lines.any(|line| {
         let fields = line.split('\t').collect::<Vec<_>>();
         fields.get(program_column) == Some(&program)
@@ -18940,6 +18941,195 @@ fn raw_boundary_write_manifest(directory: &std::path::Path) -> Result<(), String
 }
 
 #[test]
+#[ignore = "raw-boundary cache portability: bounded four-component side-read"]
+fn raw_boundary_fingerprint_component_side_read() {
+    use std::{fs, path::PathBuf};
+
+    use sha2::{Digest, Sha256};
+
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    struct Components {
+        fingerprint: String,
+        solver: String,
+        crate_name: String,
+        files: Vec<(String, String)>,
+        analysis_hash: String,
+        toolchain: Vec<u8>,
+    }
+
+    fn analysis_hash(root: &std::path::Path) -> String {
+        fn walk(dir: &std::path::Path, out: &mut Vec<PathBuf>) {
+            let Ok(entries) = fs::read_dir(dir) else {
+                return;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    walk(&path, out);
+                } else if path.extension().is_some_and(|extension| extension == "rs") {
+                    out.push(path);
+                }
+            }
+        }
+        let mut files = Vec::new();
+        walk(root, &mut files);
+        files.sort_by(|left, right| {
+            left.strip_prefix(root)
+                .unwrap()
+                .cmp(right.strip_prefix(root).unwrap())
+        });
+        let mut hash = Sha256::new();
+        for file in files {
+            let relative = file
+                .strip_prefix(root)
+                .unwrap()
+                .components()
+                .map(|component| component.as_os_str().to_string_lossy())
+                .collect::<Vec<_>>()
+                .join("/");
+            let content_hash = Sha256::digest(fs::read(&file).unwrap_or_default());
+            hash.update((relative.len() as u64).to_le_bytes());
+            hash.update(relative.as_bytes());
+            hash.update(content_hash);
+        }
+        format!("{:x}", hash.finalize())
+    }
+
+    fn collect(input: &std::path::Path) -> Components {
+        let analysis_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/analyses");
+        let toolchain = fs::read(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../rust-toolchain.toml"),
+        )
+        .unwrap_or_default();
+        let analysis_hash = analysis_hash(&analysis_root);
+        ::utils::compilation::run_compiler_on_path(input, |tcx| {
+            let program = collect_program(tcx);
+            let solver = crate::analyses::borrow_ownership::model_cache::solver_identity(
+                crate::analyses::borrow_ownership::a5_overlap::A5Mode::PreciseReplay,
+                Some(
+                    crate::analyses::borrow_ownership::a5_overlap::WholeProgramAttestation::FrozenBenchmarkGraph,
+                ),
+            );
+            let mut files = tcx
+                .sess
+                .source_map()
+                .files()
+                .iter()
+                .filter_map(|file| {
+                    let rustc_span::FileName::Real(real) = &file.name else {
+                        return None;
+                    };
+                    let path = real.local_path()?;
+                    Some((
+                        fs::canonicalize(path)
+                            .unwrap_or_else(|_| path.to_path_buf())
+                            .display()
+                            .to_string(),
+                        file.src_hash
+                            .hash_bytes()
+                            .iter()
+                            .map(|byte| format!("{byte:02x}"))
+                            .collect::<String>(),
+                    ))
+                })
+                .collect::<Vec<_>>();
+            files.sort();
+            Components {
+                fingerprint: crate::analyses::borrow_ownership::model_cache::fingerprint(
+                    &program,
+                    crate::analyses::borrow_ownership::a5_overlap::A5Mode::PreciseReplay,
+                    Some(
+                        crate::analyses::borrow_ownership::a5_overlap::WholeProgramAttestation::FrozenBenchmarkGraph,
+                    ),
+                ),
+                solver,
+                crate_name: tcx
+                    .crate_name(rustc_span::def_id::LOCAL_CRATE)
+                    .as_str()
+                    .to_owned(),
+                files,
+                analysis_hash: analysis_hash.clone(),
+                toolchain: toolchain.clone(),
+            }
+        })
+        .expect("fingerprint component input compiles")
+    }
+
+    fn render(label: &str, components: &Components) -> String {
+        let mut output = format!(
+            "label={label}\nfingerprint={}\n[solver]\n{}\n[program]\ncrate_name={}\n",
+            components.fingerprint, components.solver, components.crate_name
+        );
+        for (path, source_hash) in &components.files {
+            output.push_str(&format!("file={path}\tsrc_hash={source_hash}\n"));
+        }
+        output.push_str(&format!(
+            "[analysis]\nhash={}\n[toolchain]\nlen={}\nsha256={:x}\nbytes_hex={}\n",
+            components.analysis_hash,
+            components.toolchain.len(),
+            Sha256::digest(&components.toolchain),
+            components
+                .toolchain
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>(),
+        ));
+        output
+    }
+
+    let relocated = PathBuf::from(
+        std::env::var_os("CRAT_RAW_BOUNDARY_RELOCATED_INPUT").expect("relocated input"),
+    );
+    let standard = PathBuf::from(
+        std::env::var_os("CRAT_RAW_BOUNDARY_STANDARD_INPUT").expect("standard input"),
+    );
+    let output_dir = PathBuf::from(
+        std::env::var_os("CRAT_RAW_BOUNDARY_FINGERPRINT_ARTIFACT_DIR")
+            .expect("fingerprint artifact directory"),
+    );
+    fs::create_dir_all(&output_dir).expect("create fingerprint artifact directory");
+    let relocated = collect(&relocated);
+    let standard = collect(&standard);
+    fs::write(
+        output_dir.join("relocated.txt"),
+        render("relocated", &relocated),
+    )
+    .unwrap();
+    fs::write(
+        output_dir.join("standard.txt"),
+        render("standard", &standard),
+    )
+    .unwrap();
+    let solver_same = relocated.solver == standard.solver;
+    let program_same =
+        relocated.crate_name == standard.crate_name && relocated.files == standard.files;
+    let analysis_same = relocated.analysis_hash == standard.analysis_hash;
+    let toolchain_same = relocated.toolchain == standard.toolchain;
+    let differing = [
+        (!solver_same).then_some("solver"),
+        (!program_same).then_some("program-key"),
+        (!analysis_same).then_some("analyses-tree"),
+        (!toolchain_same).then_some("toolchain"),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>();
+    fs::write(
+        output_dir.join("comparison.txt"),
+        format!(
+            "solver_same={}\nprogram_same={}\nanalysis_same={}\ntoolchain_same={}\ndiffering_component={}\n",
+            u8::from(solver_same),
+            u8::from(program_same),
+            u8::from(analysis_same),
+            u8::from(toolchain_same),
+            differing.join(","),
+        ),
+    )
+    .unwrap();
+    assert_eq!(differing, vec!["program-key"]);
+}
+
+#[test]
 #[ignore = "raw-boundary wave 1: two-root and representative-program preflight"]
 fn raw_boundary_wave1_preflight() {
     use std::{fs, path::PathBuf, time::Duration};
@@ -19350,6 +19540,21 @@ fn raw_boundary_cache_only_unknown_fingerprint_refuses_before_solver() {
         calls.load(Ordering::SeqCst),
         0,
         "cache-only refusal occurred after the solver continuation"
+    );
+}
+
+#[test]
+fn raw_boundary_cache_manifest_accepts_ratified_rekey_map_column() {
+    let manifest = "program\told_fingerprint\tnew_fingerprint\n\
+                    bst\told\tnew\n";
+    assert_eq!(
+        accepted_cache_manifest_contains(manifest, "bst", "new"),
+        Ok(true)
+    );
+    assert_eq!(
+        accepted_cache_manifest_contains(manifest, "bst", "old"),
+        Ok(false),
+        "the ratified method consumes the re-keyed identity, not the retired key"
     );
 }
 
