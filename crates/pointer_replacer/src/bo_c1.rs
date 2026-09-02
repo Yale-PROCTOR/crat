@@ -18782,6 +18782,106 @@ fn raw_boundary_write_manifest(directory: &std::path::Path) -> Result<(), String
 }
 
 #[test]
+#[ignore = "raw-boundary wave 1: two-root and representative-program preflight"]
+fn raw_boundary_wave1_preflight() {
+    use std::{fs, path::PathBuf, time::Duration};
+
+    let root = orchestrate::workspace_root();
+    let artifact_dir = PathBuf::from(
+        std::env::var_os("CRAT_RAW_BOUNDARY_ARTIFACT_DIR")
+            .expect("raw-boundary preflight artifact directory"),
+    );
+    let cache_dir =
+        PathBuf::from(std::env::var_os("CRAT_BO_CACHE_DIR").expect("raw-boundary preflight cache"));
+    let code_frame =
+        std::env::var("CRAT_RAW_BOUNDARY_CODE_FRAME").expect("raw-boundary code frame");
+    let root_a =
+        PathBuf::from(std::env::var_os("CRAT_RAW_BOUNDARY_BST_ROOT_A").expect("bst root A"));
+    let root_b =
+        PathBuf::from(std::env::var_os("CRAT_RAW_BOUNDARY_BST_ROOT_B").expect("bst root B"));
+    assert_ne!(root_a, root_b);
+    assert_eq!(
+        root_a.canonicalize().unwrap(),
+        root_b.canonicalize().unwrap()
+    );
+    fs::create_dir_all(&artifact_dir).expect("create preflight directory");
+    let recipe = STANDING_CENSUS_LAUNCH_RECIPE;
+    let run = |name: &str, input: &std::path::Path| {
+        let outcome = orchestrate::run_child_env_with_memory_limit_mib(
+            name,
+            input,
+            "raw-boundary-census",
+            Duration::from_secs(recipe.timeout_secs),
+            recipe.memory_mib,
+            &recipe.raw_boundary_child_env(&cache_dir, &artifact_dir, &code_frame),
+        );
+        let row = outcome
+            .row
+            .unwrap_or_else(|| panic!("{name} preflight produced no row: {}", outcome.note));
+        assert_eq!(row.get(raw_schema::STATUS), Some("ok"), "{row:?}");
+        assert_eq!(row.get(raw_schema::CACHE_STATUS), Some("hit"), "{row:?}");
+        assert_eq!(
+            row.get(raw_schema::SOLVE_WALL_S),
+            Some("0.000000"),
+            "{row:?}"
+        );
+        row
+    };
+    let suffixes = [
+        "raw-boundary-sites.tsv",
+        "raw-boundary-retention.tsv",
+        "raw-boundary-dispositions.tsv",
+        "raw-boundary-subject-index.tsv",
+        "raw-boundary-atoms.tsv",
+    ];
+    let first = run("bst", &root_a);
+    let root_a_artifacts = suffixes
+        .iter()
+        .map(|suffix| {
+            fs::read(artifact_dir.join(format!("bst.{suffix}")))
+                .unwrap_or_else(|error| panic!("read root-A {suffix}: {error}"))
+        })
+        .collect::<Vec<_>>();
+    let second = run("bst", &root_b);
+    assert_eq!(
+        first.get(raw_schema::CACHE_FINGERPRINT),
+        second.get(raw_schema::CACHE_FINGERPRINT)
+    );
+    assert_eq!(
+        first.get(raw_schema::CACHE_MODEL_SHA256),
+        second.get(raw_schema::CACHE_MODEL_SHA256)
+    );
+    for (suffix, expected) in suffixes.iter().zip(root_a_artifacts) {
+        let got = fs::read(artifact_dir.join(format!("bst.{suffix}")))
+            .unwrap_or_else(|error| panic!("read root-B {suffix}: {error}"));
+        assert_eq!(expected, got, "two-root drift in {suffix}");
+    }
+    for (program_name, required_key) in [
+        ("bzip2", raw_schema::T1_CANDIDATE_SITES),
+        ("binn", raw_schema::T2_CANDIDATE_SITES),
+        ("heman", raw_schema::SUBJECT_ROWS),
+        ("brotli", raw_schema::SUBJECT_ROWS),
+    ] {
+        let program = CORPUS
+            .iter()
+            .find(|program| program.name == program_name)
+            .expect("preflight program exists");
+        let row = run(program_name, &program.input_path(&root));
+        assert!(
+            row.get(required_key)
+                .and_then(|value| value.parse::<usize>().ok())
+                .is_some_and(|value| value > 0),
+            "{program_name} did not exercise {required_key}: {row:?}"
+        );
+    }
+    fs::write(
+        artifact_dir.join("preflight-receipt.txt"),
+        "status=complete\ndata=false\ncache_hits=6/6\nsolver_seconds=0\ntwo_root_families=5/5-byte-identical\nrepresentatives=bst,bzip2,binn,heman,brotli\n",
+    )
+    .expect("write preflight receipt");
+}
+
+#[test]
 #[ignore = "raw-boundary wave 1: serialized release cache-only 20-program census"]
 fn raw_boundary_wave1_corpus_census() {
     use std::{fs, path::PathBuf, time::Duration};
