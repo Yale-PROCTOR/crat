@@ -1958,6 +1958,31 @@ impl RawBoundaryDispositionIndex {
                 })
     }
 
+    /// Whether this exact argument is in the T1/T2 boundary market, including
+    /// a site whose final surface makes the raw bridge syntax a no-op. PAIR
+    /// still owes an A5 proof receipt for that identity; unlike
+    /// [`Self::opens_argument`], this observation does not claim the site is an
+    /// active Arm-A edit.
+    pub(crate) fn tracks_argument(
+        &self,
+        node: (LocalDefId, HirId),
+        span: Span,
+        argument_index: usize,
+    ) -> bool {
+        let span = span.source_callsite();
+        self.site_lookup
+            .iter()
+            .any(|(candidate, site_span, index, key)| {
+                *candidate == node
+                    && *index == argument_index
+                    && (site_span.contains(span) || span.contains(*site_span))
+                    && self
+                        .by_site
+                        .get(key)
+                        .is_some_and(RawBoundaryDisposition::is_open)
+            })
+    }
+
     pub(crate) fn block_reason(&self, node: (LocalDefId, HirId)) -> Option<RawBoundaryBlockReason> {
         self.blocked_nodes.get(&node).copied()
     }

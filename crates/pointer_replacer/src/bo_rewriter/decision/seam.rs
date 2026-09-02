@@ -2322,6 +2322,10 @@ pub(crate) fn synthesize_with_raw_boundary(
                 /// participate in the site's overlap relation.
                 borrows: bool,
                 literal_null: bool,
+                /// The raw-boundary arm already owns (or has rendered inert)
+                /// this position. It enters PAIR for proof/receipt coverage,
+                /// never so this seam stage can block or edit it.
+                raw_boundary_observation: bool,
                 source_shape: &'static str,
             }
             let mut positions: Vec<Pos> = Vec::new();
@@ -2336,9 +2340,15 @@ pub(crate) fn synthesize_with_raw_boundary(
                     .get(&(*callee, arg.index))
                     .and_then(|k| decision_of.get(k))
                     .map_or(Form::Raw, |d| form_of(d));
+                let source_node = arg.shape.place_root().map(|root| (site.caller, root));
+                let raw_boundary_observation = source_node
+                    .is_some_and(|node| raw_boundary.tracks_argument(node, arg.span, arg.index));
                 // A raw parameter needs nothing: a reference coerces to a raw
-                // pointer at a call, so every found form satisfies it.
-                if matches!(expected, Form::Raw) {
+                // pointer at a call, so every found form satisfies it. The
+                // raw-boundary market is the one exception to dropping the
+                // position entirely: PAIR owes its A5 receipt even when the
+                // boundary bridge itself rendered as zero syntax.
+                if matches!(expected, Form::Raw) && !raw_boundary_observation {
                     continue;
                 }
                 // The third element is the span `text` is read from — carried
@@ -2448,6 +2458,7 @@ pub(crate) fn synthesize_with_raw_boundary(
                     blind,
                     borrows,
                     literal_null,
+                    raw_boundary_observation,
                     source_shape: arg.shape.key(),
                 });
             }
@@ -2535,7 +2546,17 @@ pub(crate) fn synthesize_with_raw_boundary(
                     }
                     // Two SHARED borrows of one place are legal, so a conflict
                     // needs at least one `&mut`.
-                    if !is_mut(&positions[i].expected) && !is_mut(&positions[j].expected) {
+                    let left_form = if positions[i].raw_boundary_observation {
+                        positions[i].found
+                    } else {
+                        positions[i].expected
+                    };
+                    let right_form = if positions[j].raw_boundary_observation {
+                        positions[j].found
+                    } else {
+                        positions[j].expected
+                    };
+                    if !is_mut(&left_form) && !is_mut(&right_form) {
                         continue;
                     }
                     let same_root = !matches!(
@@ -2609,6 +2630,7 @@ pub(crate) fn synthesize_with_raw_boundary(
                 if overlap
                     .as_ref()
                     .is_some_and(|proof| !proof.clears_site_overlap())
+                    && !pos.raw_boundary_observation
                 {
                     plan.blocked.push(BlockedSeam {
                         caller: site.caller,
