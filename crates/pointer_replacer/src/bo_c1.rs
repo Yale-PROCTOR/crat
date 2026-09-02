@@ -50,6 +50,52 @@ use crate::{
 const E1_WORKER_SOLVE_SECONDS_KEY: &str = "t_solve_s";
 const BOC1_EFFECTIVE_MEMORY_MIB_ENV: &str = "CRAT_BOC1_EFFECTIVE_MEM_MB";
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CacheOnlyRefusal {
+    ManifestMiss,
+    EntryUnavailable,
+}
+
+/// The cache-only choke point. The continuation contains every operation that
+/// may enter the ordinary load-or-solve path, so a refusal structurally occurs
+/// before that operation rather than being inferred from a later receipt.
+fn cache_only_before_solve<T>(
+    allowed: Result<(), CacheOnlyRefusal>,
+    proceed: impl FnOnce() -> T,
+) -> Result<T, CacheOnlyRefusal> {
+    allowed?;
+    Ok(proceed())
+}
+
+fn accepted_cache_manifest_contains(
+    manifest: &str,
+    program: &str,
+    fingerprint: &str,
+) -> Result<bool, String> {
+    let mut lines = manifest.lines();
+    let header = lines
+        .next()
+        .ok_or_else(|| "accepted cache manifest is empty".to_owned())?;
+    let columns = header
+        .split('\t')
+        .enumerate()
+        .map(|(index, name)| (name, index))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let program_column = columns
+        .get("program")
+        .copied()
+        .ok_or_else(|| "accepted cache manifest lacks program".to_owned())?;
+    let fingerprint_column = columns
+        .get("fingerprint")
+        .copied()
+        .ok_or_else(|| "accepted cache manifest lacks fingerprint".to_owned())?;
+    Ok(lines.any(|line| {
+        let fields = line.split('\t').collect::<Vec<_>>();
+        fields.get(program_column) == Some(&program)
+            && fields.get(fingerprint_column) == Some(&fingerprint)
+    }))
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct StandingCensusLaunchRecipe {
     profile: &'static str,
@@ -109,6 +155,8 @@ impl StandingCensusLaunchRecipe {
         code_frame: &str,
     ) -> Vec<(&'static str, String)> {
         let mut env = self.common_child_env(cache_dir);
+        let cache_manifest = std::env::var("CRAT_RAW_BOUNDARY_CACHE_MANIFEST")
+            .expect("raw-boundary parent requires accepted cache manifest");
         env.extend([
             (
                 "CRAT_RAW_BOUNDARY_ARTIFACT_DIR",
@@ -116,6 +164,7 @@ impl StandingCensusLaunchRecipe {
             ),
             ("CRAT_RAW_BOUNDARY_CODE_FRAME", code_frame.to_owned()),
             ("CRAT_RAW_BOUNDARY_CARGO_PROFILE", self.profile.to_owned()),
+            ("CRAT_RAW_BOUNDARY_CACHE_MANIFEST", cache_manifest),
         ]);
         env
     }
@@ -9592,6 +9641,34 @@ mod run {
         row
     }
 
+    fn raw_boundary_cache_fingerprint(input: &std::path::Path) -> Result<String, String> {
+        ::utils::compilation::run_compiler_on_path(input, |tcx| {
+            let program = collect_program(tcx);
+            model_cache::fingerprint(
+                &program,
+                A5Mode::PreciseReplay,
+                Some(WholeProgramAttestation::FrozenBenchmarkGraph),
+            )
+        })
+        .map_err(|error| format!("raw-boundary fingerprint compiler: {error:?}"))
+    }
+
+    fn raw_boundary_cache_entry_available(input: &std::path::Path) -> Result<bool, String> {
+        ::utils::compilation::run_compiler_on_path(input, |tcx| {
+            let program = collect_program(tcx);
+            let slots = CrateSlots::build(&program);
+            model_cache::load(
+                tcx,
+                &program,
+                &slots,
+                A5Mode::PreciseReplay,
+                Some(WholeProgramAttestation::FrozenBenchmarkGraph),
+            )
+            .is_some()
+        })
+        .map_err(|error| format!("raw-boundary cache-load compiler: {error:?}"))
+    }
+
     pub fn run_raw_boundary_census(input: &std::path::Path) -> Row {
         let started = Instant::now();
         let mut row = Row::default();
@@ -9608,11 +9685,88 @@ mod run {
             .map(std::path::PathBuf::from)
             .expect("raw-boundary census requires CRAT_RAW_BOUNDARY_ARTIFACT_DIR");
         std::fs::create_dir_all(&directory).expect("create raw-boundary artifact directory");
-        let capture = match crate::bo_rewriter::diagnose_raw_boundary_census(input) {
-            Ok(capture) => capture,
+        let fingerprint = match raw_boundary_cache_fingerprint(input) {
+            Ok(fingerprint) => fingerprint,
             Err(error) => {
+                row.set(raw_schema::STATUS, "fingerprint-error");
+                row.set("detail", super::report::sanitize(&error));
+                row.set(raw_schema::SOLVER_INVOCATIONS, 0);
+                row.set(raw_schema::SOLVE_WALL_S, "0.000000");
+                return row;
+            }
+        };
+        let manifest_path = std::env::var_os("CRAT_RAW_BOUNDARY_CACHE_MANIFEST")
+            .map(std::path::PathBuf::from)
+            .expect("raw-boundary worker requires accepted cache manifest");
+        let manifest = match std::fs::read_to_string(&manifest_path) {
+            Ok(manifest) => manifest,
+            Err(error) => {
+                row.set(raw_schema::STATUS, "manifest-error");
+                row.set("detail", super::report::sanitize(&error.to_string()));
+                row.set(raw_schema::SOLVER_INVOCATIONS, 0);
+                row.set(raw_schema::SOLVE_WALL_S, "0.000000");
+                return row;
+            }
+        };
+        let manifest_match =
+            match super::accepted_cache_manifest_contains(&manifest, &name, &fingerprint) {
+                Ok(found) => found,
+                Err(error) => {
+                    row.set(raw_schema::STATUS, "manifest-error");
+                    row.set("detail", super::report::sanitize(&error));
+                    row.set(raw_schema::SOLVER_INVOCATIONS, 0);
+                    row.set(raw_schema::SOLVE_WALL_S, "0.000000");
+                    return row;
+                }
+            };
+        let entry_available = match super::cache_only_before_solve(
+            manifest_match
+                .then_some(())
+                .ok_or(super::CacheOnlyRefusal::ManifestMiss),
+            || raw_boundary_cache_entry_available(input),
+        ) {
+            Err(reason) => {
+                row.set(raw_schema::CODE_FRAME, &code_frame);
+                row.set(raw_schema::CACHE_STATUS, "manifest-miss");
+                row.set(raw_schema::CACHE_FINGERPRINT, &fingerprint);
+                row.set(raw_schema::SOLVER_INVOCATIONS, 0);
+                row.set(raw_schema::SOLVE_WALL_S, "0.000000");
+                row.set(raw_schema::DATA, "false");
+                row.set(raw_schema::STATUS, "cache-gate-failed");
+                row.set("detail", format!("{reason:?}"));
+                return row;
+            }
+            Ok(Err(error)) => {
+                row.set(raw_schema::STATUS, "cache-load-error");
+                row.set("detail", super::report::sanitize(&error));
+                row.set(raw_schema::SOLVER_INVOCATIONS, 0);
+                row.set(raw_schema::SOLVE_WALL_S, "0.000000");
+                return row;
+            }
+            Ok(Ok(available)) => available,
+        };
+        let capture = match super::cache_only_before_solve(
+            entry_available
+                .then_some(())
+                .ok_or(super::CacheOnlyRefusal::EntryUnavailable),
+            || crate::bo_rewriter::diagnose_raw_boundary_census(input),
+        ) {
+            Err(reason) => {
+                row.set(raw_schema::CODE_FRAME, &code_frame);
+                row.set(raw_schema::CACHE_STATUS, "entry-unavailable");
+                row.set(raw_schema::CACHE_FINGERPRINT, &fingerprint);
+                row.set(raw_schema::SOLVER_INVOCATIONS, 0);
+                row.set(raw_schema::SOLVE_WALL_S, "0.000000");
+                row.set(raw_schema::DATA, "false");
+                row.set(raw_schema::STATUS, "cache-gate-failed");
+                row.set("detail", format!("{reason:?}"));
+                return row;
+            }
+            Ok(Ok(capture)) => capture,
+            Ok(Err(error)) => {
                 row.set(raw_schema::STATUS, "instrument-error");
                 row.set("detail", super::report::sanitize(&error));
+                row.set(raw_schema::SOLVER_INVOCATIONS, 0);
                 return row;
             }
         };
@@ -9877,6 +10031,10 @@ mod run {
         row.set(raw_schema::CACHE_FINGERPRINT, &solve.fingerprint);
         row.set(raw_schema::CACHE_MODEL_SHA256, &solve.model_sha256);
         row.set(raw_schema::SOLVE_WALL_S, &solve.solve_wall_s);
+        row.set(
+            raw_schema::SOLVER_INVOCATIONS,
+            usize::from(solve.source == "real"),
+        );
         row.set(
             raw_schema::WAIVER_ID,
             crate::bo_rewriter::decision::raw_boundary::RAW_BOUNDARY_WAIVER_ID,
@@ -18800,10 +18958,14 @@ fn raw_boundary_wave1_preflight() {
     let root_b =
         PathBuf::from(std::env::var_os("CRAT_RAW_BOUNDARY_BST_ROOT_B").expect("bst root B"));
     assert_ne!(root_a, root_b);
+    let input_a = root_a.join("bst/lib.rs");
+    let input_b = root_b.join("bst/lib.rs");
     assert_eq!(
-        root_a.canonicalize().unwrap(),
-        root_b.canonicalize().unwrap()
+        input_a.canonicalize().unwrap(),
+        input_b.canonicalize().unwrap()
     );
+    assert!(input_a.ends_with("bst/lib.rs"));
+    assert!(input_b.ends_with("bst/lib.rs"));
     fs::create_dir_all(&artifact_dir).expect("create preflight directory");
     let recipe = STANDING_CENSUS_LAUNCH_RECIPE;
     let run = |name: &str, input: &std::path::Path| {
@@ -18825,6 +18987,11 @@ fn raw_boundary_wave1_preflight() {
             Some("0.000000"),
             "{row:?}"
         );
+        assert_eq!(
+            row.get(raw_schema::SOLVER_INVOCATIONS),
+            Some("0"),
+            "{row:?}"
+        );
         row
     };
     let suffixes = [
@@ -18834,7 +19001,7 @@ fn raw_boundary_wave1_preflight() {
         "raw-boundary-subject-index.tsv",
         "raw-boundary-atoms.tsv",
     ];
-    let first = run("bst", &root_a);
+    let first = run("bst", &input_a);
     let root_a_artifacts = suffixes
         .iter()
         .map(|suffix| {
@@ -18842,7 +19009,7 @@ fn raw_boundary_wave1_preflight() {
                 .unwrap_or_else(|error| panic!("read root-A {suffix}: {error}"))
         })
         .collect::<Vec<_>>();
-    let second = run("bst", &root_b);
+    let second = run("bst", &input_b);
     assert_eq!(
         first.get(raw_schema::CACHE_FINGERPRINT),
         second.get(raw_schema::CACHE_FINGERPRINT)
@@ -18957,6 +19124,11 @@ fn raw_boundary_wave1_corpus_census() {
         assert_eq!(
             row.get(raw_schema::SOLVE_WALL_S),
             Some("0.000000"),
+            "{row:?}"
+        );
+        assert_eq!(
+            row.get(raw_schema::SOLVER_INVOCATIONS),
+            Some("0"),
             "{row:?}"
         );
         assert_eq!(row.get(raw_schema::WAVE), Some("wave1"), "{row:?}");
@@ -19161,6 +19333,23 @@ fn raw_boundary_census_schema_renamed_identifier_is_a_compile_error() {
     assert!(
         result.is_err(),
         "a stale raw-boundary schema consumer unexpectedly compiled"
+    );
+}
+
+#[test]
+fn raw_boundary_cache_only_unknown_fingerprint_refuses_before_solver() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let calls = AtomicUsize::new(0);
+    let outcome = cache_only_before_solve(Err(CacheOnlyRefusal::ManifestMiss), || {
+        calls.fetch_add(1, Ordering::SeqCst);
+        "solver-result"
+    });
+    assert_eq!(outcome, Err(CacheOnlyRefusal::ManifestMiss));
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        0,
+        "cache-only refusal occurred after the solver continuation"
     );
 }
 

@@ -16,6 +16,7 @@ pub(crate) const CACHE_STATUS: &str = "raw_boundary_cache_status";
 pub(crate) const CACHE_FINGERPRINT: &str = "raw_boundary_cache_fingerprint";
 pub(crate) const CACHE_MODEL_SHA256: &str = "raw_boundary_cache_model_sha256";
 pub(crate) const SOLVE_WALL_S: &str = "raw_boundary_solve_wall_s";
+pub(crate) const SOLVER_INVOCATIONS: &str = "raw_boundary_solver_invocations";
 pub(crate) const WAIVER_ID: &str = "raw_boundary_waiver_id";
 pub(crate) const WAIVER_CONFIRMED: &str = "raw_boundary_waiver_confirmed";
 pub(crate) const WAIVER_TEXT_SHA256: &str = "raw_boundary_waiver_text_sha256";
@@ -75,6 +76,7 @@ pub(crate) const ALL: &[&str] = &[
     CACHE_FINGERPRINT,
     CACHE_MODEL_SHA256,
     SOLVE_WALL_S,
+    SOLVER_INVOCATIONS,
     WAIVER_ID,
     WAIVER_CONFIRMED,
     WAIVER_TEXT_SHA256,
