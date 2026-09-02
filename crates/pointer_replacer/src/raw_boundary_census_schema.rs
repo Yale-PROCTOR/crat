@@ -44,6 +44,7 @@ pub(crate) const ATOM_FUNCTION_FALLBACK: &str = "raw_boundary_atom_function_fall
 pub(crate) const ARM_B_ROWS: &str = "raw_boundary_arm_b_rows";
 pub(crate) const ARM_B_BOX_ROWS: &str = "raw_boundary_arm_b_box_rows";
 pub(crate) const ARM_B_CROWN_ROWS: &str = "raw_boundary_arm_b_crown_rows";
+pub(crate) const FREE_ARM_B_ROWS: &str = "raw_boundary_free_arm_b_rows";
 pub(crate) const CONTROL_LIBC_SUBJECTS: &str = "raw_boundary_control_libc_subjects";
 pub(crate) const CONTROL_LIBC_EDGES: &str = "raw_boundary_control_libc_edges";
 pub(crate) const CONTROL_FREE_ROWS: &str = "raw_boundary_control_free_rows";
@@ -104,6 +105,7 @@ pub(crate) const ALL: &[&str] = &[
     ARM_B_ROWS,
     ARM_B_BOX_ROWS,
     ARM_B_CROWN_ROWS,
+    FREE_ARM_B_ROWS,
     CONTROL_LIBC_SUBJECTS,
     CONTROL_LIBC_EDGES,
     CONTROL_FREE_ROWS,

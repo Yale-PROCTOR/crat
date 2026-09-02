@@ -1050,11 +1050,15 @@ pub(crate) enum BridgeTemplate {
     RefMutToRawMut,
     RefMutToRawConst,
     RefSharedToRawConst,
+    RefSharedToRawMut,
     SliceMutToRawMut,
     SliceToRawConst,
+    SliceToRawMut,
     OptRefMutToRawMut,
     OptRefToRawConst,
+    OptRefToRawMut,
     OptSliceToRaw,
+    OptSliceToRawMut,
     BoxBorrowViewToRaw,
     KnownFreeDrop,
 }
@@ -1065,11 +1069,15 @@ impl BridgeTemplate {
             Self::RefMutToRawMut => "ref-mut-to-raw-mut",
             Self::RefMutToRawConst => "ref-mut-to-raw-const",
             Self::RefSharedToRawConst => "ref-shared-to-raw-const",
+            Self::RefSharedToRawMut => "ref-shared-to-raw-mut",
             Self::SliceMutToRawMut => "slice-mut-to-raw-mut",
             Self::SliceToRawConst => "slice-to-raw-const",
+            Self::SliceToRawMut => "slice-to-raw-mut",
             Self::OptRefMutToRawMut => "opt-ref-mut-to-raw-mut",
             Self::OptRefToRawConst => "opt-ref-to-raw-const",
+            Self::OptRefToRawMut => "opt-ref-to-raw-mut",
             Self::OptSliceToRaw => "opt-slice-to-raw",
+            Self::OptSliceToRawMut => "opt-slice-to-raw-mut",
             Self::BoxBorrowViewToRaw => "box-borrow-view-to-raw",
             Self::KnownFreeDrop => "known-free-drop",
         }
@@ -1110,16 +1118,25 @@ impl BridgeTemplate {
             Self::RefSharedToRawConst if force_explicit => Ok(BridgeRender::Edit(format!(
                 "core::ptr::from_ref({argument})"
             ))),
+            Self::RefSharedToRawMut => Ok(BridgeRender::Edit(format!(
+                "core::ptr::from_ref({argument}).cast_mut()"
+            ))),
             Self::RefMutToRawMut | Self::RefMutToRawConst | Self::RefSharedToRawConst => {
                 Ok(BridgeRender::ZeroSyntax)
             }
             Self::SliceMutToRawMut => Ok(BridgeRender::Edit(format!("{argument}.as_mut_ptr()"))),
             Self::SliceToRawConst => Ok(BridgeRender::Edit(format!("{argument}.as_ptr()"))),
+            Self::SliceToRawMut => Ok(BridgeRender::Edit(format!(
+                "{argument}.as_ptr().cast_mut()"
+            ))),
             Self::OptRefMutToRawMut => Ok(BridgeRender::Edit(format!(
                 "{argument}.as_deref_mut().map_or(core::ptr::null_mut(), core::ptr::from_mut)"
             ))),
             Self::OptRefToRawConst => Ok(BridgeRender::Edit(format!(
                 "{argument}.as_deref().map_or(core::ptr::null(), core::ptr::from_ref)"
+            ))),
+            Self::OptRefToRawMut => Ok(BridgeRender::Edit(format!(
+                "{argument}.as_deref().map_or(core::ptr::null_mut(), |value| core::ptr::from_ref(value).cast_mut())"
             ))),
             Self::OptSliceToRaw => Ok(BridgeRender::Edit(match target_mutability {
                 RawMutability::Mut => format!(
@@ -1129,6 +1146,9 @@ impl BridgeTemplate {
                     "{argument}.as_deref().map_or(core::ptr::null(), |slice| slice.as_ptr())"
                 ),
             })),
+            Self::OptSliceToRawMut => Ok(BridgeRender::Edit(format!(
+                "{argument}.as_deref().map_or(core::ptr::null_mut(), |slice| slice.as_ptr().cast_mut())"
+            ))),
             Self::BoxBorrowViewToRaw if box_slice => {
                 Ok(BridgeRender::Edit(match target_mutability {
                     RawMutability::Mut => format!("{argument}.as_mut_ptr()"),
@@ -1294,6 +1314,7 @@ fn template_for(
     decision: &super::Decision,
     target: &RawTargetType,
     ownership: Option<super::raw_boundary_contracts::OwnershipContract>,
+    permits_shared_to_mut: bool,
 ) -> Result<BridgeTemplate, RawBoundaryBlockReason> {
     use super::{Decision, box_facts::BoxShape, raw_boundary_contracts::OwnershipContract};
 
@@ -1309,17 +1330,26 @@ fn template_for(
                 (true, RawMutability::Mut) => Ok(BridgeTemplate::RefMutToRawMut),
                 (true, RawMutability::Const) => Ok(BridgeTemplate::RefMutToRawConst),
                 (false, RawMutability::Const) => Ok(BridgeTemplate::RefSharedToRawConst),
+                (false, RawMutability::Mut) if permits_shared_to_mut => {
+                    Ok(BridgeTemplate::RefSharedToRawMut)
+                }
                 (false, RawMutability::Mut) => Err(RawBoundaryBlockReason::SharedToMut),
             }
         }
         Decision::Slice { mutable, .. } => match (*mutable, target.mutability) {
             (true, RawMutability::Mut) => Ok(BridgeTemplate::SliceMutToRawMut),
             (_, RawMutability::Const) => Ok(BridgeTemplate::SliceToRawConst),
+            (false, RawMutability::Mut) if permits_shared_to_mut => {
+                Ok(BridgeTemplate::SliceToRawMut)
+            }
             (false, RawMutability::Mut) => Err(RawBoundaryBlockReason::SharedToMut),
         },
         Decision::Opt { mutable, slice, .. } => {
             if *slice {
                 match (*mutable, target.mutability) {
+                    (false, RawMutability::Mut) if permits_shared_to_mut => {
+                        Ok(BridgeTemplate::OptSliceToRawMut)
+                    }
                     (false, RawMutability::Mut) => Err(RawBoundaryBlockReason::SharedToMut),
                     _ => Ok(BridgeTemplate::OptSliceToRaw),
                 }
@@ -1327,6 +1357,9 @@ fn template_for(
                 match (*mutable, target.mutability) {
                     (true, RawMutability::Mut) => Ok(BridgeTemplate::OptRefMutToRawMut),
                     (_, RawMutability::Const) => Ok(BridgeTemplate::OptRefToRawConst),
+                    (false, RawMutability::Mut) if permits_shared_to_mut => {
+                        Ok(BridgeTemplate::OptRefToRawMut)
+                    }
                     (false, RawMutability::Mut) => Err(RawBoundaryBlockReason::SharedToMut),
                 }
             }
@@ -1395,7 +1428,7 @@ impl RawBoundaryDispositionIndex {
                         site.key.argument_index,
                         &site.target,
                     );
-                    let (retention_verdict, ownership, evidence) =
+                    let (retention_verdict, ownership, permits_shared_to_mut, evidence) =
                         match contract {
                             Ok(contract) => (
                                 RetentionVerdict::NoRetain {
@@ -1407,6 +1440,7 @@ impl RawBoundaryDispositionIndex {
                                     },
                                 },
                                 Some(contract.ownership),
+                                contract.permits_shared_to_mut,
                                 format!("contract:{}", contract.provenance),
                             ),
                             Err(
@@ -1417,6 +1451,7 @@ impl RawBoundaryDispositionIndex {
                                     frontier: Vec::new(),
                                 },
                                 None,
+                                false,
                                 "foreign-retention-unknown".to_owned(),
                             ),
                             Err(super::raw_boundary_contracts::ContractFailure::NotForeign)
@@ -1432,6 +1467,7 @@ impl RawBoundaryDispositionIndex {
                                             frontier: Vec::new(),
                                         }),
                                     None,
+                                    false,
                                     "local-retention-summary".to_owned(),
                                 )
                             }
@@ -1442,8 +1478,9 @@ impl RawBoundaryDispositionIndex {
                                 ));
                             }
                         };
-                    let template = template_for(decision, &site.target, ownership)
-                        .map_err(|reason| (reason, "template-preflight".to_owned()))?;
+                    let template =
+                        template_for(decision, &site.target, ownership, permits_shared_to_mut)
+                            .map_err(|reason| (reason, "template-preflight".to_owned()))?;
                     match retention_verdict {
                         RetentionVerdict::NoRetain { certificate } => {
                             let certificate_started = std::time::Instant::now();
@@ -1588,7 +1625,7 @@ impl RawBoundaryDispositionIndex {
                     pointee: "_".to_owned(),
                     mutability: RawMutability::Const,
                 };
-                let Ok(template) = template_for(decision, &target, None) else {
+                let Ok(template) = template_for(decision, &target, None, false) else {
                     continue;
                 };
                 out.address_sites.push(AddressViewSite {
@@ -2249,6 +2286,7 @@ mod tests {
                 &super::super::Decision::Ref { mutable: false },
                 &target,
                 None,
+                false,
             ),
             Err(RawBoundaryBlockReason::SharedToMut)
         );
@@ -2256,6 +2294,31 @@ mod tests {
             RawBoundaryBlockReason::SharedToMut.key(),
             "raw-boundary-shared-to-mut"
         );
+    }
+
+    #[test]
+    fn rb_x3_read_only_family_permission_has_an_explicit_shared_to_mut_bridge() {
+        let target = RawTargetType {
+            rendered: "*mut i8".to_owned(),
+            pointee: "i8".to_owned(),
+            mutability: RawMutability::Mut,
+        };
+        let template = template_for(
+            &super::super::Decision::Ref { mutable: false },
+            &target,
+            Some(super::super::raw_boundary_contracts::OwnershipContract::BorrowView),
+            true,
+        )
+        .expect("ruled family bridge");
+        assert_eq!(template, BridgeTemplate::RefSharedToRawMut);
+        let BridgeRender::Edit(text) = template
+            .render("p", RawMutability::Mut, false)
+            .expect("explicit bridge")
+        else {
+            panic!("shared-to-mut family bridge must emit syntax");
+        };
+        assert!(text.contains("core::ptr::from_ref(p)"), "{text}");
+        assert!(text.contains(".cast_mut()"), "{text}");
     }
 
     #[test]

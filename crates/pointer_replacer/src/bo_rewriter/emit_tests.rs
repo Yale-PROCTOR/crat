@@ -7566,3 +7566,43 @@ fn raw_boundary_exact_slice_use_region_has_one_owner() {
         artifacts.atom_outcomes
     );
 }
+
+/// Addendum-149 production witness for both RB-X3 family rules. The subjects
+/// are read-only in Rust but cross C positions whose written signatures use
+/// `*mut`; only the exact printf-tail and FILE-stream contracts may license the
+/// explicit address view.
+///
+/// Mutations deleting either family rule leave its named parameter raw (or
+/// block with shared-to-mut), so the signature and bridge assertions identify
+/// which rule was lost.
+#[test]
+fn rb_x3_family_contracts_reach_the_shared_emission_path() {
+    let src = "#![allow(dead_code, unused_unsafe, unused_variables)]\n\
+               #[repr(C)] pub struct File { x: i32 }\n\
+               static FMT: [i8; 3] = [37, 115, 0];\n\
+               extern \"C\" {\n\
+                   fn printf(fmt: *const i8, ...) -> i32;\n\
+                   fn fprintf(stream: *mut File, fmt: *const i8, ...) -> i32;\n\
+               }\n\
+               pub unsafe fn print_arg(p: *mut i8) -> i32 {\n\
+                   let _ = *p; printf(FMT.as_ptr(), p)\n\
+               }\n\
+               pub unsafe fn print_stream(stream: *mut File) -> i32 {\n\
+                   let _ = (*stream).x; fprintf(stream, FMT.as_ptr())\n\
+               }\n";
+    let super::RewriteOutcome::Emitted { source, .. } = super::rewrite_m1(src) else {
+        panic!("both exact family contracts must emit");
+    };
+    assert!(source.contains("print_arg(p: &i8)"), "{source}");
+    assert!(source.contains("print_stream(stream: &File)"), "{source}");
+    assert_eq!(
+        source.matches("core::ptr::from_ref(").count(),
+        2,
+        "one explicit family bridge per subject: {source}"
+    );
+    assert_eq!(
+        source.matches(".cast_mut()").count(),
+        2,
+        "the family permission must not become a general implicit coercion: {source}"
+    );
+}

@@ -18536,8 +18536,12 @@ struct RawBoundaryControlReconciliation {
     box_rows: usize,
     crown_rows: usize,
     arm_b_rows: usize,
+    free_arm_b_rows: usize,
     divergences: String,
     arm_b_ledger: String,
+    free_arm_b_ledger: String,
+    t2_cross_tab: String,
+    libc_site_movement: String,
 }
 
 fn control_edge_parts(edge: &str) -> Option<(&str, usize, usize)> {
@@ -18561,6 +18565,17 @@ fn diagnostic_site_line(site: &str) -> Option<usize> {
         .next()?
         .parse::<usize>()
         .ok()
+}
+
+fn typed_production_disposition(direct_tiers: &str, class_block: &str, node_block: &str) -> String {
+    if [direct_tiers, class_block, node_block]
+        .into_iter()
+        .all(|value| value == "-")
+    {
+        "typed-none".to_owned()
+    } else {
+        format!("tiers={direct_tiers}|class={class_block}|node={node_block}")
+    }
 }
 
 fn reconcile_raw_boundary_controls(
@@ -18609,6 +18624,14 @@ fn reconcile_raw_boundary_controls(
     let mut arm_b = String::from(
         "unit\tprogram\tidentity\tboundary_direction\tmodel_kind\tblocker\tmissing_fact\tarm_a_applicable\n",
     );
+    let mut free_arm_b = String::from(
+        "unit\tprogram\tcontrol_identity\tsubject_identity\tsubject_kind\tproduction_disposition\tblocker\tmissing_fact\n",
+    );
+    let mut libc_site_movement = String::from(
+        "program\tidentity\tcallee\targument_index\tcontrol_line\tproduction_line\tline_delta\ttemplate\tevidence\n",
+    );
+    let mut used_libc_dispositions = std::collections::BTreeSet::<usize>::new();
+    let mut t2_cross_counts = std::collections::BTreeMap::<(String, String, String), usize>::new();
     let mut counts = RawBoundaryControlReconciliation {
         libc_subjects: 0,
         libc_edges: 0,
@@ -18617,8 +18640,12 @@ fn reconcile_raw_boundary_controls(
         box_rows: 0,
         crown_rows: 0,
         arm_b_rows: 0,
+        free_arm_b_rows: 0,
         divergences: String::new(),
         arm_b_ledger: String::new(),
+        free_arm_b_ledger: String::new(),
+        t2_cross_tab: String::new(),
+        libc_site_movement: String::new(),
     };
     for row in &primary.rows {
         let program = primary.field(row, "program")?;
@@ -18642,10 +18669,12 @@ fn reconcile_raw_boundary_controls(
                         continue;
                     };
                     counts.libc_edges += 1;
-                    let matches = dispositions
+                    let candidate = dispositions
                         .iter()
-                        .filter(|record| {
-                            record.get("program").is_some_and(|value| value == program)
+                        .enumerate()
+                        .filter(|(index, record)| {
+                            !used_libc_dispositions.contains(index)
+                                && record.get("program").is_some_and(|value| value == program)
                                 && record
                                     .get("subject_identity")
                                     .is_some_and(|value| value == identity)
@@ -18657,38 +18686,85 @@ fn reconcile_raw_boundary_controls(
                                     .get("callee")
                                     .is_some_and(|value| value.split("::").last() == Some(callee))
                                 && record
-                                    .get("source_site")
-                                    .and_then(|value| diagnostic_site_line(value))
-                                    == Some(line)
+                                    .get("evidence")
+                                    .is_some_and(|value| value.starts_with("contract:"))
                         })
-                        .count();
-                    if matches != 1 {
+                        .min_by_key(|(_, record)| {
+                            record
+                                .get("source_site")
+                                .and_then(|value| diagnostic_site_line(value))
+                                .map_or(usize::MAX, |production_line| {
+                                    production_line.abs_diff(line)
+                                })
+                        });
+                    let Some((matched_index, record)) = candidate else {
                         divergences.push_str(&format!(
-                            "libc-edge\t{program}\t{identity}\texact-site-match-{matches}\t{edge}\n"
+                            "libc-edge\t{program}\t{identity}\tcontract-site-unmatched\t{edge}\n"
                         ));
-                    }
+                        continue;
+                    };
+                    used_libc_dispositions.insert(matched_index);
+                    let production_line = record
+                        .get("source_site")
+                        .and_then(|value| diagnostic_site_line(value))
+                        .unwrap_or(0);
+                    libc_site_movement.push_str(&format!(
+                        "{program}\t{identity}\t{callee}\t{argument}\t{line}\t{production_line}\t{}\t{}\t{}\n",
+                        production_line as isize - line as isize,
+                        record.get("template").map_or("-", String::as_str),
+                        record.get("evidence").map_or("-", String::as_str),
+                    ));
                 }
             }
             (_, "unsafe-bridge-known-no-retention-free-boundary") => {
                 counts.free_rows += 1;
-                let matches = dispositions
+                let production_identity = primary
+                    .columns
+                    .get("our_subject")
+                    .and_then(|index| row.get(*index))
+                    .map_or(identity, String::as_str);
+                let lifecycle_matches = dispositions
                     .iter()
                     .filter(|record| {
                         record.get("program").is_some_and(|value| value == program)
                             && record
                                 .get("subject_identity")
-                                .is_some_and(|value| value == identity)
+                                .is_some_and(|value| value == production_identity)
                             && record.get("tier").is_some_and(|value| value == "T1")
                             && record
                                 .get("template")
                                 .is_some_and(|value| value == "known-free-drop")
                     })
                     .count();
-                if matches != 1 {
+                if lifecycle_matches != 0 {
                     divergences.push_str(&format!(
-                        "free\t{program}\t{identity}\texact-lifecycle-match-{matches}\t-\n"
+                        "free\t{program}\t{identity}\tunexpected-lifecycle-receipt-{lifecycle_matches}\t{production_identity}\n"
                     ));
                 }
+                let Some(subject) =
+                    subject_index.get(&(program.to_owned(), production_identity.to_owned()))
+                else {
+                    divergences.push_str(&format!(
+                        "free\t{program}\t{identity}\tmissing-arm-b-subject\t{production_identity}\n"
+                    ));
+                    continue;
+                };
+                let subject_kind = subject.get("subject_kind").map_or("-", String::as_str);
+                if subject_kind != "param" {
+                    divergences.push_str(&format!(
+                        "free\t{program}\t{identity}\tnon-parameter-arm-b-subject\t{production_identity}:{subject_kind}\n"
+                    ));
+                    continue;
+                }
+                let direct_tiers = subject.get("direct_tiers").map_or("-", String::as_str);
+                let class_block = subject.get("class_block").map_or("-", String::as_str);
+                let node_block = subject.get("node_block").map_or("-", String::as_str);
+                let production_disposition =
+                    typed_production_disposition(direct_tiers, class_block, node_block);
+                counts.free_arm_b_rows += 1;
+                free_arm_b.push_str(&format!(
+                    "free-parameter\t{program}\t{identity}\t{production_identity}\t{subject_kind}\t{production_disposition}\tparameter-owning-transfer-held\tcaller-move-summary\n"
+                ));
             }
             (_, "flows-into-raw-param/retention-unknown-local")
             | (_, "arg-stays-raw/raw-caller-boundary")
@@ -18704,24 +18780,15 @@ fn reconcile_raw_boundary_controls(
                 let direct_tiers = subject.get("direct_tiers").map_or("-", String::as_str);
                 let class_block = subject.get("class_block").map_or("-", String::as_str);
                 let node_block = subject.get("node_block").map_or("-", String::as_str);
-                let matches = match subkind {
-                    "flows-into-raw-param/retention-unknown-local" => {
-                        direct_tiers.split(';').any(|tier| tier == "T2")
-                    }
-                    "arg-stays-raw/raw-caller-boundary" => {
-                        class_block == "arg-stays-raw" || node_block == "arg-stays-raw"
-                    }
-                    "class-collateral/flows-into-raw-param" => {
-                        class_block == "flows-into-raw-param"
-                    }
-                    "class-collateral/arg-stays-raw" => class_block == "arg-stays-raw",
-                    _ => false,
-                };
-                if !matches {
-                    divergences.push_str(&format!(
-                        "t2\t{program}\t{identity}\tclassification-mismatch\t{subkind}:tiers={direct_tiers}:class={class_block}:node={node_block}\n"
-                    ));
-                }
+                let production_disposition =
+                    typed_production_disposition(direct_tiers, class_block, node_block);
+                *t2_cross_counts
+                    .entry((
+                        program.to_owned(),
+                        subkind.to_owned(),
+                        production_disposition,
+                    ))
+                    .or_default() += 1;
             }
             (_, "return-boundary-lifetime-origin-absent") => {
                 counts.crown_rows += 1;
@@ -18772,8 +18839,22 @@ fn reconcile_raw_boundary_controls(
             u8::from(arm_a)
         ));
     }
+    let mut t2_cross_tab = String::from("program\tmarket_label\tproduction_disposition\tcount\n");
+    let mut corpus_t2_cross = std::collections::BTreeMap::<(String, String), usize>::new();
+    for ((program, label, disposition), count) in &t2_cross_counts {
+        t2_cross_tab.push_str(&format!("{program}\t{label}\t{disposition}\t{count}\n"));
+        *corpus_t2_cross
+            .entry((label.clone(), disposition.clone()))
+            .or_default() += *count;
+    }
+    for ((label, disposition), count) in corpus_t2_cross {
+        t2_cross_tab.push_str(&format!("ALL\t{label}\t{disposition}\t{count}\n"));
+    }
     counts.divergences = divergences;
     counts.arm_b_ledger = arm_b;
+    counts.free_arm_b_ledger = free_arm_b;
+    counts.t2_cross_tab = t2_cross_tab;
+    counts.libc_site_movement = libc_site_movement;
     Ok(counts)
 }
 
@@ -19376,6 +19457,21 @@ fn raw_boundary_wave1_corpus_census() {
     .expect("write control divergences");
     fs::write(artifact_dir.join("arm-b-62.tsv"), &controls.arm_b_ledger)
         .expect("write Arm-B ledger");
+    fs::write(
+        artifact_dir.join("free-arm-b-5.tsv"),
+        &controls.free_arm_b_ledger,
+    )
+    .expect("write free-parameter Arm-B receipts");
+    fs::write(
+        artifact_dir.join("t2-market-disposition-cross-tab.tsv"),
+        &controls.t2_cross_tab,
+    )
+    .expect("write T2 label/disposition cross-tab");
+    fs::write(
+        artifact_dir.join("libc-contract-site-movement.tsv"),
+        &controls.libc_site_movement,
+    )
+    .expect("write libc contract site movement");
     assert_eq!(
         (
             controls.libc_subjects,
@@ -19396,6 +19492,11 @@ fn raw_boundary_wave1_corpus_census() {
         controls.divergences
     );
     assert_eq!(controls.arm_b_ledger.lines().count(), 63);
+    assert_eq!(
+        controls.free_arm_b_rows, 5,
+        "free-parameter Arm-B receipt population drift"
+    );
+    assert_eq!(controls.free_arm_b_ledger.lines().count(), 6);
 
     let baseline_diagnostics =
         raw_boundary_program_artifacts(&diagnostic_control_dir, "compiler-diagnostics.tsv")
@@ -19471,6 +19572,7 @@ fn raw_boundary_wave1_corpus_census() {
     aggregate.set(raw_schema::ARM_B_ROWS, controls.arm_b_rows);
     aggregate.set(raw_schema::ARM_B_BOX_ROWS, controls.box_rows);
     aggregate.set(raw_schema::ARM_B_CROWN_ROWS, controls.crown_rows);
+    aggregate.set(raw_schema::FREE_ARM_B_ROWS, controls.free_arm_b_rows);
     aggregate.set(raw_schema::STATUS, "ok");
     let per_program = rows
         .iter()
@@ -19487,10 +19589,11 @@ fn raw_boundary_wave1_corpus_census() {
     fs::write(
         artifact_dir.join("census-receipt.txt"),
         format!(
-            "status=complete\ndata=true\nprograms=20/20\ncache_hits=20/20\nsolver_seconds=0\nlibc={}/{}\nfree={}\nt2={}\narm_b={}\ndiagnostics_baseline={}\ndiagnostics_unchanged={}\ndiagnostics_resolved={}\ndiagnostics_changed={}\ndiagnostics_new={}\n",
+            "status=complete\ndata=true\nprograms=20/20\ncache_hits=20/20\nsolver_seconds=0\nlibc={}/{}\nfree={}\nfree_arm_b={}\nt2={}\narm_b={}\ndiagnostics_baseline={}\ndiagnostics_unchanged={}\ndiagnostics_resolved={}\ndiagnostics_changed={}\ndiagnostics_new={}\n",
             controls.libc_subjects,
             controls.libc_edges,
             controls.free_rows,
+            controls.free_arm_b_rows,
             controls.t2_rows,
             controls.arm_b_rows,
             diagnostic_recon.baseline,
@@ -19523,6 +19626,7 @@ fn raw_boundary_census_schema_is_one_shared_authority() {
         schema::T2_WAIVER_SITES,
         schema::ATOM_ATTEMPTS,
         schema::ARM_B_ROWS,
+        schema::FREE_ARM_B_ROWS,
         schema::RETENTION_FIXPOINT_WALL_S,
     ] {
         assert!(keys.contains(&required), "missing shared key {required}");
@@ -19648,7 +19752,7 @@ fn raw_boundary_external_join_fixture_is_bidirectional_and_builds_arm_b() {
     let subjects = concat!(
         "subject_identity\towner\tmir_local\tsubject_kind\thypothetical\tsettled\tdirect_site_count\tdirect_tiers\traw_open\tclass_id\tclass_admits\tclass_block\tnode_block\tptr_depth\n",
         "p::f::libc#1\tp::f\t1\tparam\tref\tref\t1\tT1\t1\t0\t1\t-\t-\t1\n",
-        "p::f::free#2\tp::f\t2\tparam\tbox\tbox\t1\tT1\t1\t1\t1\t-\t-\t1\n",
+        "p::f::free#2\tp::f\t2\tparam\tdegraded\tdegraded\t1\tblocked\t0\t1\t0\t-\t-\t1\n",
         "p::f::local#3\tp::f\t3\tparam\tref\tref\t1\tT2\t1\t2\t1\t-\t-\t1\n",
         "p::f::caller#4\tp::f\t4\tparam\tref\tdegraded\t0\t-\t0\t3\t0\targ-stays-raw\targ-stays-raw\t1\n",
         "p::f::flow#5\tp::f\t5\tparam\tref\tdegraded\t0\t-\t0\t4\t0\tflows-into-raw-param\t-\t1\n",
@@ -19657,8 +19761,7 @@ fn raw_boundary_external_join_fixture_is_bidirectional_and_builds_arm_b() {
     );
     let dispositions = concat!(
         "caller\tblock\tstatement_index\tcallee\targument_index\tsubject\tsubject_identity\tsource_site\ttier\ttemplate\twaiver_id\tevidence\treason\tdetail\tatom_group\n",
-        "p::f\t0\t0\tstrlen\t0\th\tp::f::libc#1\tp/lib.rs:4:1: 4:2\tT1\tref-shared-to-raw-const\t-\tcontract\t-\t-\ta\n",
-        "p::f\t0\t1\tfree\t0\th\tp::f::free#2\tp/lib.rs:5:1: 5:2\tT1\tknown-free-drop\t-\tcontract\t-\t-\tb\n",
+        "p::f\t0\t0\tstrlen\t0\th\tp::f::libc#1\tp/lib.rs:5:1: 5:2\tT1\tref-shared-to-raw-const\t-\tcontract:pinned-libc-0.2.184\t-\t-\ta\n",
         "p::f\t0\t2\tp::local\t0\th\tp::f::local#3\tp/lib.rs:6:1: 6:2\tT2\tref-shared-to-raw-const\tw\tretention-unknown\tretention-open-boundary\t-\tc\n",
     );
     let result = reconcile_raw_boundary_controls(
@@ -19675,6 +19778,7 @@ fn raw_boundary_external_join_fixture_is_bidirectional_and_builds_arm_b() {
     assert_eq!(result.box_rows, 1);
     assert_eq!(result.crown_rows, 1);
     assert_eq!(result.arm_b_rows, 2);
+    assert_eq!(result.free_arm_b_rows, 1);
     assert_eq!(
         result.divergences.lines().count(),
         1,
@@ -19682,6 +19786,14 @@ fn raw_boundary_external_join_fixture_is_bidirectional_and_builds_arm_b() {
         result.divergences
     );
     assert_eq!(result.arm_b_ledger.lines().count(), 3);
+    assert_eq!(result.free_arm_b_ledger.lines().count(), 2);
+    assert!(
+        result
+            .libc_site_movement
+            .contains("p\tp::f::libc#1\tstrlen\t0\t4\t5\t1"),
+        "{}",
+        result.libc_site_movement
+    );
     for line in result.arm_b_ledger.lines().skip(1) {
         let fields = line.split('\t').collect::<Vec<_>>();
         assert!(!fields[5].is_empty(), "blocker payload disappeared: {line}");
@@ -19690,6 +19802,60 @@ fn raw_boundary_external_join_fixture_is_bidirectional_and_builds_arm_b() {
             "missing-fact payload disappeared: {line}"
         );
     }
+}
+
+#[test]
+fn raw_boundary_market_labels_cross_tab_and_free_params_receipt_without_relabeling() {
+    let primary = concat!(
+        "read\tprogram\trecord_key\tour_subject\tcategory\ttyped_subkind\tconsumer_edges\n",
+        "A\tp\tp::f::market#1\tp::f::market#1\tCONDITIONAL CORE\tflows-into-raw-param/retention-unknown-local\t-\n",
+        "A\tp\tp::f::none#3\tp::f::none#3\tCONDITIONAL CORE\tclass-collateral/flows-into-raw-param\t-\n",
+        "B\tp\tp::f::free\tp::f::free#2\tOUR-WALL\tunsafe-bridge-known-no-retention-free-boundary\t-\n",
+    );
+    let box_control = "subject_key\towner_fn\tmir_local\targ_index\tptr_depth\tfamily\tmodel_kind\tdecision\treason\n";
+    let subjects = concat!(
+        "subject_identity\towner\tmir_local\tsubject_kind\thypothetical\tsettled\tdirect_site_count\tdirect_tiers\traw_open\tclass_id\tclass_admits\tclass_block\tnode_block\tptr_depth\n",
+        "p::f::market#1\tp::f\t1\tparam\tref\tref\t1\tT1\t1\t0\t1\t-\t-\t1\n",
+        "p::f::free#2\tp::f\t2\tparam\tdegraded\tdegraded\t1\tblocked\t0\t-\t0\t-\t-\t1\n",
+        "p::f::none#3\tp::f\t3\tparam\tref\tdegraded\t0\t-\t0\t-\t0\t-\t-\t1\n",
+    );
+    let dispositions = "caller\tblock\tstatement_index\tcallee\targument_index\tsubject\tsubject_identity\tsource_site\ttier\ttemplate\twaiver_id\tevidence\treason\tdetail\tatom_group\n";
+    let result = reconcile_raw_boundary_controls(
+        primary,
+        box_control,
+        &[("p".to_owned(), subjects.to_owned())],
+        &[("p".to_owned(), dispositions.to_owned())],
+    )
+    .expect("fixture reconciles");
+    assert_eq!(
+        result.divergences.lines().count(),
+        1,
+        "{}",
+        result.divergences
+    );
+    assert_eq!(result.t2_rows, 2);
+    assert!(
+        result.t2_cross_tab.contains(
+            "p\tflows-into-raw-param/retention-unknown-local\ttiers=T1|class=-|node=-\t1"
+        ),
+        "{}",
+        result.t2_cross_tab
+    );
+    assert!(
+        result
+            .t2_cross_tab
+            .contains("p\tclass-collateral/flows-into-raw-param\ttyped-none\t1"),
+        "{}",
+        result.t2_cross_tab
+    );
+    assert_eq!(result.free_arm_b_rows, 1);
+    assert!(
+        result
+            .free_arm_b_ledger
+            .contains("free-parameter\tp\tp::f::free\tp::f::free#2"),
+        "{}",
+        result.free_arm_b_ledger
+    );
 }
 
 #[test]
