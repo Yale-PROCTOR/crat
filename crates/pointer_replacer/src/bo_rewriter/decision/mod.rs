@@ -33,6 +33,7 @@ pub(crate) mod box_facts;
 pub(crate) mod co_conversion;
 pub(crate) mod construction;
 pub(crate) mod emitability;
+pub(crate) mod exposure;
 pub(crate) mod lifetime;
 #[cfg(test)]
 pub(crate) mod lifetime_oracle_tests;
