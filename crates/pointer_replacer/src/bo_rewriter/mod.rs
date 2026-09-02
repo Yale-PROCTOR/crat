@@ -174,6 +174,7 @@ pub(crate) struct E2Timings {
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct RawBoundaryArtifacts {
+    pub(crate) exposure: String,
     pub(crate) sites: String,
     pub(crate) retention: String,
     pub(crate) dispositions: String,
@@ -182,6 +183,21 @@ pub(crate) struct RawBoundaryArtifacts {
     pub(crate) atom_outcomes: String,
     pub(crate) final_reverts: String,
     pub(crate) timings: RawBoundaryTimings,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct EmissionRunConfig {
+    pub(crate) configured_exposure: decision::exposure::ConfiguredExposureInput,
+}
+
+impl Default for EmissionRunConfig {
+    fn default() -> Self {
+        Self {
+            configured_exposure: decision::exposure::ConfiguredExposureInput::explicit_empty(
+                "bo-rewriter-default-explicit-empty",
+            ),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -587,6 +603,26 @@ pub(crate) fn rewrite_m1_path_a5_injected(
     )
 }
 
+#[cfg(test)]
+pub(crate) fn rewrite_m1_path_with_emission_config(
+    root: &std::path::Path,
+    mode: A5Mode,
+    attestation: Option<WholeProgramAttestation>,
+    run_config: &EmissionRunConfig,
+) -> RewriteOutcome {
+    rewrite_core_injected_with_config(
+        ::utils::compilation::path_to_input(root),
+        Some(root),
+        MAX_REVERT_ROUNDS,
+        &|_| {},
+        false,
+        false,
+        false,
+        Some((mode, attestation)),
+        run_config,
+    )
+}
+
 fn rewrite_core(
     input: rustc_session::config::Input,
     tree_base: Option<&std::path::Path>,
@@ -621,6 +657,31 @@ fn rewrite_core_injected(
     raw_boundary_full: bool,
     a5_override: Option<(A5Mode, Option<WholeProgramAttestation>)>,
 ) -> RewriteOutcome {
+    rewrite_core_injected_with_config(
+        input,
+        tree_base,
+        max_rounds,
+        inject,
+        probe_only,
+        census_once,
+        raw_boundary_full,
+        a5_override,
+        &EmissionRunConfig::default(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn rewrite_core_injected_with_config(
+    input: rustc_session::config::Input,
+    tree_base: Option<&std::path::Path>,
+    max_rounds: usize,
+    inject: &(dyn Fn(&mut decision::DecisionTable) + Sync),
+    probe_only: bool,
+    census_once: bool,
+    raw_boundary_full: bool,
+    a5_override: Option<(A5Mode, Option<WholeProgramAttestation>)>,
+    run_config: &EmissionRunConfig,
+) -> RewriteOutcome {
     // The string entry's original text, so a baseline exists for it too.
     let virtual_original = match &input {
         rustc_session::config::Input::Str { input, .. } => Some(input.clone()),
@@ -645,7 +706,8 @@ fn rewrite_core_injected(
         //
         // ⚠ Nothing may run a query ahead of this line.
         let capture = ast_transform::capture_ast(tcx)?;
-        let (mut table, decide_ctx) = decide_table_with_ctx_config(tcx, a5_override)?;
+        let (mut table, decide_ctx) =
+            decide_table_with_emission_config(tcx, a5_override, run_config)?;
         let retained_c9_plans = decide_ctx.retained_c9_plans.clone();
         let a5_receipt = decide_ctx.a5_receipt.clone();
         inject(&mut table);
@@ -2228,7 +2290,15 @@ fn decide_table_with_ctx_config<'tcx>(
     tcx: TyCtxt<'tcx>,
     a5_override: Option<(A5Mode, Option<WholeProgramAttestation>)>,
 ) -> Result<(decision::DecisionTable, DecideCtx), String> {
-    decide_table_perturbed_config(tcx, |_| {}, a5_override)
+    decide_table_perturbed_config(tcx, |_| {}, a5_override, &EmissionRunConfig::default())
+}
+
+pub(crate) fn decide_table_with_emission_config<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    a5_override: Option<(A5Mode, Option<WholeProgramAttestation>)>,
+    run_config: &EmissionRunConfig,
+) -> Result<(decision::DecisionTable, DecideCtx), String> {
+    decide_table_perturbed_config(tcx, |_| {}, a5_override, run_config)
 }
 
 /// **Validation-transfer entry.** One emit, one diagnose, no revert loop.
@@ -2313,6 +2383,24 @@ pub(crate) fn diagnose_raw_boundary_census(root: &std::path::Path) -> Result<E1C
         true,
         true,
         None,
+    )
+    .into_e1_capture()
+}
+
+pub(crate) fn diagnose_raw_boundary_census_with_config(
+    root: &std::path::Path,
+    run_config: &EmissionRunConfig,
+) -> Result<E1Capture, String> {
+    rewrite_core_injected_with_config(
+        ::utils::compilation::path_to_input(root),
+        Some(root),
+        MAX_REVERT_ROUNDS,
+        &|_| {},
+        false,
+        true,
+        true,
+        None,
+        run_config,
     )
     .into_e1_capture()
 }
@@ -3509,7 +3597,7 @@ fn decide_table_perturbed<'tcx>(
     tcx: TyCtxt<'tcx>,
     perturb: impl FnOnce(&mut Vec<decision::Subject>),
 ) -> Result<(decision::DecisionTable, DecideCtx), String> {
-    decide_table_perturbed_config(tcx, perturb, None)
+    decide_table_perturbed_config(tcx, perturb, None, &EmissionRunConfig::default())
 }
 
 /// Read-only analysis inputs carried across the solve/cache boundary without
@@ -3562,6 +3650,7 @@ fn decide_table_perturbed_config<'tcx>(
     tcx: TyCtxt<'tcx>,
     perturb: impl FnOnce(&mut Vec<decision::Subject>),
     a5_override: Option<(A5Mode, Option<WholeProgramAttestation>)>,
+    run_config: &EmissionRunConfig,
 ) -> Result<(decision::DecisionTable, DecideCtx), String> {
     let program = collect_program(tcx);
     let slots = CrateSlots::build(&program);
@@ -3606,6 +3695,7 @@ fn decide_table_perturbed_config<'tcx>(
                 cache_load_wall_s: cache_started.elapsed().as_secs_f64(),
                 origin_derivation_wall_s,
             },
+            run_config,
             perturb,
         );
     }
@@ -3643,6 +3733,7 @@ fn decide_table_perturbed_config<'tcx>(
                 cache_load_wall_s: cache_started.elapsed().as_secs_f64(),
                 origin_derivation_wall_s,
             },
+            run_config,
             perturb,
         );
     }
@@ -3701,6 +3792,7 @@ fn decide_table_perturbed_config<'tcx>(
             cache_load_wall_s: cache_started.elapsed().as_secs_f64(),
             origin_derivation_wall_s,
         },
+        run_config,
         perturb,
     )
 }
@@ -3720,6 +3812,7 @@ fn finish_decide<'tcx>(
     mut retained_c9_plans: Vec<PlannedC9Mark>,
     a5_receipt: String,
     analysis: DecisionAnalysisCarrier,
+    run_config: &EmissionRunConfig,
     perturb: impl FnOnce(&mut Vec<decision::Subject>),
 ) -> Result<(decision::DecisionTable, DecideCtx), String> {
     let box_facts = decision::box_facts::BoxOwnershipFacts::derive(&program, &slots, &model)?;
@@ -3915,6 +4008,27 @@ fn finish_decide<'tcx>(
         ),
         &subjects,
     );
+    let converting_signature_functions = e2_hypothetical
+        .entries
+        .iter()
+        .filter(|(subject, decision)| {
+            matches!(subject.kind, decision::SubjectKind::Param { .. })
+                && !matches!(decision, decision::Decision::Degraded(_))
+        })
+        .map(|(subject, _)| subject.fn_did)
+        .collect::<rustc_hash::FxHashSet<_>>();
+    let exposure_seed = decision::exposure::ExposureSeed::derive(
+        &program,
+        &run_config.configured_exposure,
+        lifetime_eligibility.fnptr_web(),
+    )
+    .map_err(|error| format!("raw-boundary exposure seed: {error:?}"))?;
+    let exposure = decision::exposure::ExposurePolicy::derive(
+        &program,
+        &exposure_seed,
+        lifetime_eligibility.fnptr_web(),
+        &converting_signature_functions,
+    );
     let raw_boundary_sites_started = std::time::Instant::now();
     let raw_boundary_sites = decision::raw_boundary::RawBoundarySiteFacts::derive(&program, &facts);
     let raw_boundary_site_derivation_wall_s = raw_boundary_sites_started.elapsed().as_secs_f64();
@@ -4039,6 +4153,7 @@ fn finish_decide<'tcx>(
     };
     let raw_boundary_receipt_started = std::time::Instant::now();
     let raw_boundary_artifacts = RawBoundaryArtifacts {
+        exposure: exposure.receipts_tsv(),
         sites: raw_boundary_sites.to_tsv(),
         retention: retention.to_tsv(),
         dispositions: raw_boundary.receipts_tsv(),
@@ -4096,6 +4211,7 @@ fn finish_decide<'tcx>(
             raw_boundary_sites,
             retention,
             raw_boundary,
+            exposure,
             raw_boundary_artifacts,
             e2_artifacts,
         },
@@ -4212,6 +4328,7 @@ pub(crate) struct DecideCtx {
     raw_boundary_sites: decision::raw_boundary::RawBoundarySiteFacts,
     retention: decision::raw_boundary::RetentionSummaries,
     raw_boundary: decision::raw_boundary::RawBoundaryDispositionIndex,
+    exposure: decision::exposure::ExposurePolicy,
     raw_boundary_artifacts: RawBoundaryArtifacts,
     e2_artifacts: E2Artifacts,
 }

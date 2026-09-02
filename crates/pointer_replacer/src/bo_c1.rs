@@ -179,6 +179,10 @@ impl StandingCensusLaunchRecipe {
         let mut env = self.common_child_env(cache_dir);
         let cache_manifest = std::env::var("CRAT_RAW_BOUNDARY_CACHE_MANIFEST")
             .expect("raw-boundary parent requires accepted cache manifest");
+        let exposure_input = std::env::var("CRAT_RAW_BOUNDARY_EXPOSURE_INPUT")
+            .expect("raw-boundary parent requires configured exposure input");
+        let exposure_input_sha256 = std::env::var("CRAT_RAW_BOUNDARY_EXPOSURE_INPUT_SHA256")
+            .expect("raw-boundary parent requires configured exposure input digest");
         env.extend([
             (
                 "CRAT_RAW_BOUNDARY_ARTIFACT_DIR",
@@ -187,6 +191,11 @@ impl StandingCensusLaunchRecipe {
             ("CRAT_RAW_BOUNDARY_CODE_FRAME", code_frame.to_owned()),
             ("CRAT_RAW_BOUNDARY_CARGO_PROFILE", self.profile.to_owned()),
             ("CRAT_RAW_BOUNDARY_CACHE_MANIFEST", cache_manifest),
+            ("CRAT_RAW_BOUNDARY_EXPOSURE_INPUT", exposure_input),
+            (
+                "CRAT_RAW_BOUNDARY_EXPOSURE_INPUT_SHA256",
+                exposure_input_sha256,
+            ),
         ]);
         env
     }
@@ -9691,6 +9700,69 @@ mod run {
         .map_err(|error| format!("raw-boundary cache-load compiler: {error:?}"))
     }
 
+    fn parse_raw_boundary_exposure_input(
+        contents: &str,
+        program: &str,
+    ) -> Result<crate::bo_rewriter::decision::exposure::ConfiguredExposureInput, String> {
+        const HEADER: &str = "program\tinput_version\tsource_provenance\tconfigured_name_count\tcanonical_names\tcanonical_names_sha256\tstatus";
+        let mut lines = contents.lines();
+        if lines.next() != Some(HEADER) {
+            return Err("configured exposure input header mismatch".to_owned());
+        }
+        let matches = lines
+            .filter_map(|line| {
+                let fields = line.split('\t').collect::<Vec<_>>();
+                (fields.first() == Some(&program)).then_some(fields)
+            })
+            .collect::<Vec<_>>();
+        let [fields] = matches.as_slice() else {
+            return Err(format!(
+                "configured exposure input has {} rows for {program}",
+                matches.len()
+            ));
+        };
+        if fields.len() != 7 || fields[1] != "1" {
+            return Err(format!(
+                "configured exposure input shape/version for {program}"
+            ));
+        }
+        let names = if fields[4] == "-" {
+            Vec::new()
+        } else {
+            fields[4].split(';').map(str::to_owned).collect::<Vec<_>>()
+        };
+        let expected_count = fields[3]
+            .parse::<usize>()
+            .map_err(|_| format!("configured exposure count is not usize for {program}"))?;
+        if names.len() != expected_count {
+            return Err(format!(
+                "configured exposure count mismatch for {program}: {} != {expected_count}",
+                names.len()
+            ));
+        }
+        if (names.is_empty() && fields[6] != "explicit-empty")
+            || (!names.is_empty() && fields[6] != "configured")
+        {
+            return Err(format!("configured exposure status mismatch for {program}"));
+        }
+        crate::bo_rewriter::decision::exposure::ConfiguredExposureInput::checked(
+            fields[2], names, fields[5],
+        )
+        .map_err(|error| format!("configured exposure input for {program}: {error:?}"))
+    }
+
+    #[test]
+    fn raw_boundary_exposure_input_parses_explicit_empty_without_internal_inference() {
+        let input = parse_raw_boundary_exposure_input(
+            "program\tinput_version\tsource_provenance\tconfigured_name_count\tcanonical_names\tcanonical_names_sha256\tstatus\n\
+             bst\t1\tfixture-default\t0\t-\te3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\texplicit-empty\n",
+            "bst",
+        )
+        .expect("explicit empty input");
+        assert!(input.names.is_empty());
+        assert_eq!(input.provenance, "fixture-default");
+    }
+
     pub fn run_raw_boundary_census(input: &std::path::Path) -> Row {
         let started = Instant::now();
         let mut row = Row::default();
@@ -9707,6 +9779,27 @@ mod run {
             .map(std::path::PathBuf::from)
             .expect("raw-boundary census requires CRAT_RAW_BOUNDARY_ARTIFACT_DIR");
         std::fs::create_dir_all(&directory).expect("create raw-boundary artifact directory");
+        let exposure_input_path = std::env::var_os("CRAT_RAW_BOUNDARY_EXPOSURE_INPUT")
+            .map(std::path::PathBuf::from)
+            .expect("raw-boundary worker requires configured exposure input");
+        let exposure_input_bytes = std::fs::read(&exposure_input_path)
+            .expect("read raw-boundary configured exposure input");
+        let exposure_input_sha256 = format!("{:x}", Sha256::digest(&exposure_input_bytes));
+        assert_eq!(
+            exposure_input_sha256,
+            std::env::var("CRAT_RAW_BOUNDARY_EXPOSURE_INPUT_SHA256")
+                .expect("raw-boundary worker requires configured exposure input digest"),
+            "configured exposure input digest drift"
+        );
+        let exposure_input = parse_raw_boundary_exposure_input(
+            std::str::from_utf8(&exposure_input_bytes)
+                .expect("configured exposure input must be UTF-8"),
+            &name,
+        )
+        .expect("configured exposure input row");
+        let emission_config = crate::bo_rewriter::EmissionRunConfig {
+            configured_exposure: exposure_input,
+        };
         let fingerprint = match raw_boundary_cache_fingerprint(input) {
             Ok(fingerprint) => fingerprint,
             Err(error) => {
@@ -9771,7 +9864,12 @@ mod run {
             entry_available
                 .then_some(())
                 .ok_or(super::CacheOnlyRefusal::EntryUnavailable),
-            || crate::bo_rewriter::diagnose_raw_boundary_census(input),
+            || {
+                crate::bo_rewriter::diagnose_raw_boundary_census_with_config(
+                    input,
+                    &emission_config,
+                )
+            },
         ) {
             Err(reason) => {
                 row.set(raw_schema::CODE_FRAME, &code_frame);
@@ -9845,6 +9943,7 @@ mod run {
         };
         let artifact = &capture.raw_boundary_artifacts;
         let artifact_rows = [
+            ("exposure", artifact.exposure.as_str()),
             ("sites", artifact.sites.as_str()),
             ("retention", artifact.retention.as_str()),
             ("dispositions", artifact.dispositions.as_str()),

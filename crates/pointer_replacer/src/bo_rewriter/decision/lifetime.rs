@@ -231,6 +231,7 @@ pub(crate) struct LifetimeEligibility {
     failures: FxHashMap<NodeKey, LifetimeFailure>,
     web_roots: BTreeSet<String>,
     web_members: BTreeMap<String, String>,
+    fnptr_web: Option<FnPtrWeb>,
     web_wall_s: f64,
     derive_wall_s: f64,
 }
@@ -279,6 +280,10 @@ impl LifetimeEligibility {
         &self.web_members
     }
 
+    pub(crate) fn fnptr_web(&self) -> Option<&FnPtrWeb> {
+        self.fnptr_web.as_ref()
+    }
+
     pub(crate) fn web_wall_s(&self) -> f64 {
         self.web_wall_s
     }
@@ -323,6 +328,7 @@ impl LifetimeEligibility {
             failures: FxHashMap::default(),
             web_roots: BTreeSet::new(),
             web_members: BTreeMap::new(),
+            fnptr_web: None,
             web_wall_s: 0.0,
             derive_wall_s: 0.0,
         }
@@ -387,6 +393,7 @@ pub(crate) fn derive_return_eligibility(
                 )
             })
             .collect();
+        result.fnptr_web = Some(web.clone());
     }
 
     let mut return_subjects = escapes
@@ -986,6 +993,14 @@ pub(crate) struct FnPtrWeb {
 }
 
 impl FnPtrWeb {
+    pub(crate) fn roots(&self) -> impl Iterator<Item = LocalDefId> + '_ {
+        self.roots.iter().copied()
+    }
+
+    pub(crate) fn members(&self) -> impl Iterator<Item = LocalDefId> + '_ {
+        self.members.iter().copied()
+    }
+
     pub(crate) fn contains(&self, function: LocalDefId) -> bool {
         self.members.contains(&function)
     }

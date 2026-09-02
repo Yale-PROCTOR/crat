@@ -309,6 +309,55 @@ fn e2_runtime_input_ratchet_matches_synthetic_breaches() {
     );
 }
 
+fn raw_boundary_wave2_runtime_input_offense(line: &str) -> Option<String> {
+    const FORBIDDEN_INPUTS: &[&str] = &[
+        "is_c_exposed_fn",
+        "unified-market-control.tsv",
+        "masked-reason-reconciliation.tsv",
+        "diagnostic-arm-clusters.tsv",
+        "adapter-overlap-153.tsv",
+    ];
+    FORBIDDEN_INPUTS
+        .iter()
+        .find(|needle| line.contains(**needle))
+        .map(|needle| format!("raw-boundary wave 2 production names forbidden input {needle:?}"))
+        .or_else(|| {
+            (line.contains("docs/agents/")
+                && (line.contains("read") || line.contains("include_bytes")))
+            .then(|| "raw-boundary wave 2 production appears to consume docs".to_owned())
+        })
+}
+
+#[test]
+fn dependency_ratchet_raw_boundary_wave2_has_no_docs_or_legacy_helper_input() {
+    let breaches = scan_root(
+        module_root(),
+        &|file| is_test_only_file(file),
+        &raw_boundary_wave2_runtime_input_offense,
+    );
+    assert!(
+        breaches.is_empty(),
+        "raw-boundary wave 2 runtime-input breach:\n{}",
+        breaches.join("\n")
+    );
+}
+
+#[test]
+fn raw_boundary_wave2_runtime_input_ratchet_matches_synthetic_breaches() {
+    assert!(
+        raw_boundary_wave2_runtime_input_offense(
+            "let rows = std::fs::read_to_string(\"docs/agents/unified-market-control.tsv\");"
+        )
+        .is_some()
+    );
+    assert!(
+        raw_boundary_wave2_runtime_input_offense(
+            "let exposed = crate::rewriter::transform::is_c_exposed_fn(tcx, did, names);"
+        )
+        .is_some()
+    );
+}
+
 fn cached_model_fields(source: &str) -> Vec<String> {
     let Some((_, tail)) = source.split_once("struct CachedModel {") else {
         return Vec::new();
