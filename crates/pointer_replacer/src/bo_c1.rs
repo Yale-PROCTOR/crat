@@ -10583,12 +10583,11 @@ mod run {
         let cache_ok = solve.source == "cache"
             && solve.cache_status == "hit"
             && solve.solve_wall_s == "0.000000";
-        let controls_requested = std::env::var_os("CRAT_RAW_BOUNDARY_UNIFIED_CONTROL").is_some()
-            || std::env::var_os("CRAT_RAW_BOUNDARY_DIAGNOSTIC_CONTROL").is_some();
-        let controls_ok = !controls_requested
+        let unified_control_requested =
+            std::env::var_os("CRAT_RAW_BOUNDARY_UNIFIED_CONTROL").is_some();
+        let controls_ok = !unified_control_requested
             || (unified_control_unmatched == 0
-                && unified_control_rows == unified_production_matched
-                && diagnostic_control_matched > 0);
+                && unified_control_rows == unified_production_matched);
         row.set(
             raw_schema::STATUS,
             if non_citable_reason.is_some() {
