@@ -1187,3 +1187,65 @@ mod e2_return_permit_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod pair_plan_tests {
+    use super::*;
+    use super::super::a5_site_proof::A5SiteProofVerdict;
+
+    #[test]
+    fn pair_w1_clear_component_keeps_every_position_safe() {
+        assert_eq!(
+            resolve_pair_roles_for_test(&[
+                (0, 1, A5SiteProofVerdict::Clear, false),
+                (1, 0, A5SiteProofVerdict::Clear, false),
+            ]),
+            ["clear", "clear"]
+        );
+    }
+
+    #[test]
+    fn pair_w2_overlap_chooses_one_primary_and_one_raw_view() {
+        assert_eq!(
+            resolve_pair_roles_for_test(&[
+                (0, 1, A5SiteProofVerdict::Overlapping, false),
+                (1, 0, A5SiteProofVerdict::Overlapping, false),
+            ]),
+            ["primary", "raw-view"]
+        );
+    }
+
+    #[test]
+    fn pair_w3_three_way_component_has_one_canonical_primary() {
+        assert_eq!(
+            resolve_pair_roles_for_test(&[
+                (2, 0, A5SiteProofVerdict::Overlapping, false),
+                (0, 2, A5SiteProofVerdict::Overlapping, false),
+                (1, 2, A5SiteProofVerdict::Overlapping, false),
+            ]),
+            ["primary", "raw-view", "raw-view"]
+        );
+    }
+
+    #[test]
+    fn pair_n1_unknown_is_never_mapped_to_clear() {
+        assert_eq!(
+            resolve_pair_roles_for_test(&[
+                (0, 1, A5SiteProofVerdict::Undeterminable, false),
+                (1, 0, A5SiteProofVerdict::Undeterminable, false),
+            ]),
+            ["blocked", "blocked"]
+        );
+    }
+
+    #[test]
+    fn pair_positive_retention_selects_the_retaining_position_as_primary() {
+        assert_eq!(
+            resolve_pair_roles_for_test(&[
+                (0, 1, A5SiteProofVerdict::Overlapping, false),
+                (1, 0, A5SiteProofVerdict::Overlapping, true),
+            ]),
+            ["raw-view", "primary"]
+        );
+    }
+}
