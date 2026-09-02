@@ -1842,6 +1842,46 @@ mod tests {
         assert_eq!(wrong.refused[0].holder, "decl:ref");
     }
 
+    /// Homonymous functions in distinct modules may share one textual rename
+    /// only when every definition with that name receives a surface. Mutation:
+    /// restoring the old duplicate-name rejection fails the first half; treating
+    /// a mixed population as safe fails the second.
+    #[test]
+    fn surface_name_population_allows_all_or_none_but_not_mixed() {
+        rustc_span::create_default_session_globals_then(|| {
+            let name = Symbol::intern("SortHuffmanTreeItems");
+            let all = [(
+                name,
+                SurfaceNamePopulation {
+                    functions: 2,
+                    surfaced: 2,
+                },
+            )]
+            .into_iter()
+            .collect();
+            let names = finalize_surface_names(&all).expect("both homonyms are surfaced");
+            assert_eq!(
+                names.get(&name).copied(),
+                Some(Symbol::intern("__crat_safe_SortHuffmanTreeItems"))
+            );
+
+            let mixed = [(
+                name,
+                SurfaceNamePopulation {
+                    functions: 2,
+                    surfaced: 1,
+                },
+            )]
+            .into_iter()
+            .collect();
+            assert!(
+                finalize_surface_names(&mixed)
+                    .expect_err("a bare-name rewrite may not cross a mixed population")
+                    .contains("mixed surface function name")
+            );
+        });
+    }
+
     /// **The claimant travels with its span, in order, and REFUSALS DO NOT
     /// ENTER.**
     ///
@@ -2127,41 +2167,61 @@ impl MutVisitor for SurfaceCallVisitor<'_> {
     }
 }
 
-fn collect_surface_names(
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct SurfaceNamePopulation {
+    functions: usize,
+    surfaced: usize,
+}
+
+fn collect_surface_name_populations(
     items: &[P<rustc_ast::Item>],
     global_map: &rustc_ast::node_id::NodeMap<LocalDefId>,
     exposure: &super::decision::exposure::ExposurePolicy,
-    out: &mut FxHashMap<Symbol, Symbol>,
-) -> Result<(), String> {
+    out: &mut FxHashMap<Symbol, SurfaceNamePopulation>,
+) {
     for item in items {
         if let rustc_ast::ItemKind::Mod(_, _, rustc_ast::ModKind::Loaded(inner, _, _, _)) =
             &item.kind
         {
-            collect_surface_names(inner, global_map, exposure, out)?;
+            collect_surface_name_populations(inner, global_map, exposure, out);
             continue;
         }
         let Some(&did) = global_map.get(&item.id) else {
             continue;
         };
-        if matches!(
+        let rustc_ast::ItemKind::Fn(function) = &item.kind else {
+            continue;
+        };
+        let population = out.entry(function.ident.name).or_default();
+        population.functions += 1;
+        if !matches!(
             exposure.plan(did),
             super::decision::exposure::ExposureSurfacePlan::ClosedWorldDirect
                 | super::decision::exposure::ExposureSurfacePlan::NotApplicable
         ) {
-            continue;
-        }
-        let rustc_ast::ItemKind::Fn(function) = &item.kind else {
-            continue;
-        };
-        let original = function.ident.name;
-        let replacement = Symbol::intern(&format!("__crat_safe_{original}"));
-        if out.insert(original, replacement).is_some() {
-            return Err(format!(
-                "inbound-wrapper-unplaceable: duplicate surface function name {original}"
-            ));
+            population.surfaced += 1;
         }
     }
-    Ok(())
+}
+
+fn finalize_surface_names(
+    populations: &FxHashMap<Symbol, SurfaceNamePopulation>,
+) -> Result<FxHashMap<Symbol, Symbol>, String> {
+    let mut out = FxHashMap::default();
+    for (&original, population) in populations {
+        if population.surfaced == 0 {
+            continue;
+        }
+        if population.surfaced != population.functions {
+            return Err(format!(
+                "inbound-wrapper-unplaceable: mixed surface function name {original} \
+                 ({}/{})",
+                population.surfaced, population.functions,
+            ));
+        }
+        out.insert(original, Symbol::intern(&format!("__crat_safe_{original}")));
+    }
+    Ok(out)
 }
 
 fn apply_surface_plans_to_items(
@@ -2262,13 +2322,14 @@ fn apply_surface_plans(
     };
     let mut originals = FxHashMap::default();
     collect_original_functions(&capture.krate.items, &mut originals);
-    let mut surface_names = FxHashMap::default();
-    collect_surface_names(
+    let mut surface_name_populations = FxHashMap::default();
+    collect_surface_name_populations(
         &capture.krate.items,
         &capture.map.global_map,
         exposure,
-        &mut surface_names,
-    )?;
+        &mut surface_name_populations,
+    );
+    let surface_names = finalize_surface_names(&surface_name_populations)?;
     apply_surface_plans_to_items(
         &mut krate.items,
         &originals,
