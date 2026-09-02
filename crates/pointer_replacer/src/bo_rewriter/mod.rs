@@ -178,6 +178,7 @@ pub(crate) struct RawBoundaryArtifacts {
     pub(crate) d4_edges: String,
     pub(crate) pairs: String,
     pub(crate) addresses: String,
+    pub(crate) arm_outcomes: String,
     pub(crate) sites: String,
     pub(crate) retention: String,
     pub(crate) dispositions: String,
@@ -1500,7 +1501,9 @@ fn verify_and_revert(
             );
             if matches!(
                 selection.kind,
-                AtomSelectionKind::Exact | AtomSelectionKind::GroupAtomic
+                AtomSelectionKind::Exact
+                    | AtomSelectionKind::GroupAtomic
+                    | AtomSelectionKind::BisectGroup
             ) {
                 atom_reverify_count += 1;
                 let selected_atoms = selection.atoms.into_iter().collect::<Vec<_>>();
@@ -2739,10 +2742,39 @@ pub(crate) struct EditSite {
     pub atom_covered: bool,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct EditKey {
+    owner: String,
+    subject: String,
+    arms: String,
+    kind: &'static str,
+    file: String,
+    lo: usize,
+    hi: usize,
+    replacement_sha256: String,
+}
+
+impl EditKey {
+    fn render(&self) -> String {
+        format!(
+            "owner={}|subject={}|arms={}|kind={}|interval={}:{}:{}|replacement_sha256={}",
+            self.owner,
+            self.subject,
+            self.arms,
+            self.kind,
+            self.file,
+            self.lo,
+            self.hi,
+            self.replacement_sha256,
+        )
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum AtomSelectionKind {
     Exact,
     GroupAtomic,
+    BisectGroup,
     Fallback,
 }
 
@@ -2816,7 +2848,28 @@ pub(crate) fn select_atoms_on_original_lines(
             .map(|edit| edit.atom_ids.as_slice())
             .collect::<std::collections::BTreeSet<_>>();
         if !alias_group && primary_groups.len() != 1 {
-            return atom_fallback("atom-attribution-ambiguous");
+            let groups = primary_groups
+                .into_iter()
+                .map(|group| group.to_vec())
+                .collect::<Vec<_>>();
+            if groups.len() < 2 {
+                return atom_fallback("atom-attribution-ambiguous");
+            }
+            // One deterministic half only. The following compiler pass is the
+            // sole experiment: success keeps the sibling half, failure falls
+            // back to the established function-level revert. There is no
+            // recursive search and MAX_ATOM_REVERIFIES remains one.
+            let take = groups.len().div_ceil(2);
+            let atoms = groups
+                .into_iter()
+                .take(take)
+                .flatten()
+                .collect::<std::collections::BTreeSet<_>>();
+            return AtomSelection {
+                kind: AtomSelectionKind::BisectGroup,
+                atoms,
+                reason: "atom-bounded-group-bisection",
+            };
         }
         for edit in primary {
             selected.extend(edit.atom_ids.iter().cloned());
@@ -2978,14 +3031,28 @@ fn edit_sites(
             plan::FileKey::Real(path) => path.display().to_string(),
             plan::FileKey::Virtual(name) => name.clone(),
         };
-        for (index, edit) in edits.iter().enumerate() {
+        for edit in edits {
             let (lo_line, hi_line) = line_span(text, edit.lo, edit.hi);
+            let replacement_sha256 = {
+                use sha2::{Digest, Sha256};
+                format!("{:x}", Sha256::digest(edit.replacement.as_bytes()))
+            };
+            let edit_key = EditKey {
+                owner: edit.owner_fn.clone(),
+                subject: edit.subject_id.clone(),
+                arms: edit.required_arms.clone(),
+                kind: edit.edit_kind,
+                file: file.clone(),
+                lo: edit.lo,
+                hi: edit.hi,
+                replacement_sha256,
+            };
             out.push(EditSite {
                 file: file.clone(),
                 fn_path: edit.owner_fn.clone(),
                 lo_line,
                 hi_line,
-                edit_id: format!("{file}:{}:{}:{}:{index}", edit.lo, edit.hi, edit.owner_fn),
+                edit_id: edit_key.render(),
                 atom_ids: edit.atom_ids.clone(),
                 atom_covered: !edit.atom_ids.is_empty()
                     && owners_with_atoms.contains(&edit.owner_fn)
@@ -3397,6 +3464,9 @@ pub(crate) fn validate_plan(
             // out of it, it is simply not subject to it.
             owner_fn: "<crate>".to_owned(),
             atom_ids: Vec::new(),
+            subject_id: "<crate>".to_owned(),
+            required_arms: "-".to_owned(),
+            edit_kind: "fabricated-length-const",
         });
     }
     for (key, kept) in &kept_by_file {
@@ -3531,6 +3601,9 @@ pub(crate) fn emit_files<'tcx>(
             justification: plan::Justification::C9Mark,
             owner_fn: mark.owner_fn.clone(),
             atom_ids: Vec::new(),
+            subject_id: mark.owner_fn.clone(),
+            required_arms: "-".to_owned(),
+            edit_kind: "c9-mark",
         });
     }
     // **The crate root, asked of the compiler rather than guessed** — not
@@ -4162,6 +4235,7 @@ fn finish_decide<'tcx>(
         &raw_boundary,
         &coconv,
     );
+    table.arm_requirements = derive_arm_requirements(&subjects, &coconv, &raw_boundary, &exposure);
     let seam_wall_s = seam_started.elapsed().as_secs_f64();
     let raw_boundary_render_wall_s = seam_started.elapsed().as_secs_f64();
     retained_c9_plans.retain(|mark| {
@@ -4209,6 +4283,7 @@ fn finish_decide<'tcx>(
         d4_edges: coconv.edge_receipts_tsv(tcx),
         pairs: coconv.pair_receipts_tsv(tcx),
         addresses: raw_boundary.addresses_tsv(tcx),
+        arm_outcomes: arm_outcomes_tsv(tcx, &subjects, &table, &coconv, &raw_boundary),
         sites: raw_boundary_sites.to_tsv(),
         retention: retention.to_tsv(),
         dispositions: raw_boundary.receipts_tsv(),
@@ -4271,6 +4346,167 @@ fn finish_decide<'tcx>(
             e2_artifacts,
         },
     ))
+}
+
+fn derive_arm_requirements(
+    subjects: &[decision::Subject],
+    coconv: &decision::co_conversion::CoConv,
+    raw_boundary: &decision::raw_boundary::RawBoundaryDispositionIndex,
+    exposure: &decision::exposure::ExposurePolicy,
+) -> rustc_hash::FxHashMap<
+    (rustc_hir::def_id::LocalDefId, rustc_hir::HirId),
+    decision::RequiredArmSet,
+> {
+    use decision::{Arm, SubjectKind};
+    subjects
+        .iter()
+        .map(|subject| {
+            let key = (subject.fn_did, subject.hir_id);
+            let mut required = coconv.required_arms(key);
+            if matches!(subject.kind, SubjectKind::Param { .. })
+                && !matches!(
+                    exposure.plan(subject.fn_did),
+                    decision::exposure::ExposureSurfacePlan::NotApplicable
+                )
+            {
+                required.insert(Arm::Surface);
+            }
+            if raw_boundary
+                .address_sites()
+                .iter()
+                .any(|site| site.node == key)
+            {
+                required.insert(Arm::Addr);
+            }
+            (key, required)
+        })
+        .collect()
+}
+
+fn arm_outcomes_tsv(
+    tcx: TyCtxt<'_>,
+    subjects: &[decision::Subject],
+    table: &decision::DecisionTable,
+    coconv: &decision::co_conversion::CoConv,
+    raw_boundary: &decision::raw_boundary::RawBoundaryDispositionIndex,
+) -> String {
+    use decision::{Arm, ArmState, Decision, SubjectKind};
+
+    let decisions = table
+        .entries
+        .iter()
+        .map(|(subject, decision)| ((subject.fn_did, subject.hir_id), decision))
+        .collect::<rustc_hash::FxHashMap<_, _>>();
+    let mut rows = Vec::new();
+    for subject in subjects {
+        let key = (subject.fn_did, subject.hir_id);
+        let required = table
+            .arm_requirements
+            .get(&key)
+            .copied()
+            .unwrap_or_default();
+
+        let mut ready = required;
+        let mut blocked_arm = None;
+        let mut blocked_reason = "-".to_owned();
+        if coconv.node_block(key).is_some() {
+            let arm = if coconv.pair_sites().iter().any(|row| {
+                row.subject == key && row.role == decision::co_conversion::PairRole::Blocked
+            }) {
+                Arm::Pair
+            } else {
+                Arm::D4
+            };
+            ready.remove(arm);
+            blocked_arm = Some(arm);
+            blocked_reason = coconv
+                .node_block(key)
+                .map_or_else(|| "-".to_owned(), |reason| reason.key().to_owned());
+        }
+        if let SubjectKind::Param { hir_index } = subject.kind
+            && let Some(block) = table
+                .seams
+                .blocked
+                .iter()
+                .find(|block| block.callee == subject.fn_did && block.index == hir_index)
+        {
+            let arm = if block.block == decision::seam::SeamBlock::SiteOverlap {
+                Arm::Pair
+            } else {
+                Arm::Glue
+            };
+            ready.remove(arm);
+            if blocked_arm.is_none() {
+                blocked_arm = Some(arm);
+                blocked_reason = block.block.key().to_owned();
+            }
+        }
+        if let Some(reason) = raw_boundary.block_reason(key) {
+            ready.remove(Arm::C);
+            if blocked_arm.is_none() {
+                blocked_arm = Some(Arm::C);
+                blocked_reason = reason.key().to_owned();
+            }
+        }
+        let decision = decisions.get(&key).copied();
+        if matches!(decision, Some(Decision::Degraded(_))) && blocked_arm.is_none() {
+            let arm = Arm::ALL
+                .into_iter()
+                .find(|&arm| required.contains(arm))
+                .unwrap_or(Arm::D4);
+            ready.remove(arm);
+            blocked_arm = Some(arm);
+            blocked_reason = "decision-degraded".to_owned();
+        }
+        let terminal = if blocked_arm.is_some() {
+            "blocked"
+        } else if matches!(decision, Some(Decision::Degraded(_))) {
+            "typed-excluded"
+        } else {
+            "planned"
+        };
+        let states = Arm::ALL
+            .into_iter()
+            .map(|arm| {
+                if !required.contains(arm) {
+                    ArmState::NotRequired
+                } else if ready.contains(arm) {
+                    ArmState::Ready
+                } else {
+                    ArmState::Blocked
+                }
+                .key()
+            })
+            .collect::<Vec<_>>();
+        rows.push((
+            subject.label.clone(),
+            format!(
+                "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+                subject.label,
+                tcx.def_path_str(subject.fn_did.to_def_id()),
+                required.render(),
+                ready.render(),
+                ready.render(),
+                states[0],
+                states[1],
+                states[2],
+                states[3],
+                states[4],
+                states[5],
+                terminal,
+                blocked_arm.map_or("-", Arm::key),
+                blocked_reason,
+            ),
+        ));
+    }
+    rows.sort_by(|left, right| left.0.cmp(&right.0));
+    let mut out = String::from(
+        "subject_identity\towner\trequired_arms\tready_arms\tapplied_arms\tsurface_state\td4_state\tc_state\tpair_state\tglue_state\taddr_state\tterminal\tblocking_arm\tblocking_reason\n",
+    );
+    for (_, row) in rows {
+        out.push_str(&row);
+    }
+    out
 }
 
 fn raw_boundary_subjects_tsv(
@@ -6216,8 +6452,8 @@ fn push_overlap_columns(
 #[cfg(test)]
 mod raw_boundary_atom_tests {
     use super::{
-        AtomSelectionKind, EditSite, atom_surviving_edit_ids, select_atoms_on_original_lines,
-        verify,
+        AtomSelectionKind, EditSite, atom_surviving_edit_ids, edit_sites,
+        select_atoms_on_original_lines, verify,
     };
 
     fn diag(line: usize, code: &str, related: &[usize]) -> verify::Diag {
@@ -6293,6 +6529,54 @@ mod raw_boundary_atom_tests {
         assert_eq!(selected.kind, AtomSelectionKind::Fallback);
         assert_eq!(selected.reason, "atom-attribution-ambiguous");
         assert!(selected.atoms.is_empty());
+    }
+
+    #[test]
+    fn atom_w2_same_line_groups_use_one_deterministic_bisection() {
+        let sites = vec![
+            site(2, "a-edit", &["a-site"], true),
+            site(2, "b-edit", &["b-site"], true),
+        ];
+        let selected = select_atoms_on_original_lines(&[diag(2, "E0308", &[])], &sites);
+        assert_eq!(selected.kind, AtomSelectionKind::BisectGroup);
+        assert_eq!(selected.atoms, ["a-site".to_owned()].into_iter().collect());
+        assert_eq!(selected.reason, "atom-bounded-group-bisection");
+    }
+
+    #[test]
+    fn atom_w1_edit_key_carries_subject_arms_kind_interval_and_digest() {
+        use std::collections::BTreeMap;
+
+        use crate::bo_rewriter::plan::{Edit, FileKey, Justification, Plan};
+
+        let file = FileKey::Virtual("fixture.rs".to_owned());
+        let mut plan = Plan::default();
+        plan.by_file.insert(
+            file.clone(),
+            vec![Edit {
+                lo: 0,
+                hi: 1,
+                replacement: "y".to_owned(),
+                justification: Justification::KindDecision { kind: "Ref" },
+                owner_fn: "crate::f".to_owned(),
+                atom_ids: vec!["atom-1".to_owned()],
+                subject_id: "crate::f::p#1".to_owned(),
+                required_arms: "d4+c+pair".to_owned(),
+                edit_kind: "subject-declaration",
+            }],
+        );
+        let rows = edit_sites(&plan, &BTreeMap::from([(file, "x".to_owned())]));
+        let key = &rows[0].edit_id;
+        assert!(
+            key.contains("owner=crate::f|subject=crate::f::p#1"),
+            "{key}"
+        );
+        assert!(
+            key.contains("arms=d4+c+pair|kind=subject-declaration"),
+            "{key}"
+        );
+        assert!(key.contains("interval=fixture.rs:0:1"), "{key}");
+        assert!(key.contains("replacement_sha256="), "{key}");
     }
 
     #[test]

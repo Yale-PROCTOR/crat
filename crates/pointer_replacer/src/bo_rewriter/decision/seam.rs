@@ -2700,6 +2700,26 @@ pub(crate) fn synthesize_with_raw_boundary(
     // lifecycle templates remain in the receipt but produce no edit.
     plan.raw_boundary_receipts = raw_boundary.receipts_tsv();
     plan.raw_boundary_atom_groups = raw_boundary.subject_atom_groups();
+    for pair in coconv
+        .pair_sites()
+        .iter()
+        .filter(|pair| pair.role == super::co_conversion::PairRole::RawView)
+    {
+        if let Some(node) = pair.source_node {
+            plan.raw_boundary_atom_groups
+                .entry(node)
+                .or_default()
+                .push(super::raw_boundary::SubjectAtomKey {
+                    id: pair.atom_id(),
+                    node,
+                    owner: tcx.def_path_str(pair.caller.to_def_id()),
+                });
+        }
+    }
+    for atoms in plan.raw_boundary_atom_groups.values_mut() {
+        atoms.sort_by(|left, right| left.id.cmp(&right.id));
+        atoms.dedup_by(|left, right| left.id == right.id);
+    }
     for (key, disposition, site) in raw_boundary.emission_sites() {
         let Some(template) = disposition.template() else {
             continue;
@@ -2829,7 +2849,7 @@ pub(crate) fn synthesize_with_raw_boundary(
                 .unwrap_or_else(|| "-".to_owned()),
             blind: false,
             overlap: None,
-            atom_ids: Vec::new(),
+            atom_ids: vec![pair.atom_id()],
         });
     }
     for site in raw_boundary.address_sites() {

@@ -5101,6 +5101,9 @@ mod attribution_and_escapes {
                 justification: Justification::KindDecision { kind: "Ref(mut)" },
                 owner_fn: "k::f".to_owned(),
                 atom_ids: Vec::new(),
+                subject_id: "k::f::subject".to_owned(),
+                required_arms: "-".to_owned(),
+                edit_kind: "fixture",
             }],
         );
         let texts = BTreeMap::from([(key, text.to_owned())]);

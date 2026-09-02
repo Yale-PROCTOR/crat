@@ -6057,6 +6057,9 @@ mod arm2_witnesses {
             justification: j,
             owner_fn: String::new(),
             atom_ids: Vec::new(),
+            subject_id: String::new(),
+            required_arms: "-".to_owned(),
+            edit_kind: "fixture",
         };
         let mut plan = Plan::default();
         plan.by_file.insert(
@@ -6133,6 +6136,9 @@ mod arm2_witnesses {
             justification: J::KindDecision { kind: "Ref" },
             owner_fn: String::new(),
             atom_ids: Vec::new(),
+            subject_id: String::new(),
+            required_arms: "-".to_owned(),
+            edit_kind: "fixture",
         };
         let mut whole = Plan::default();
         whole

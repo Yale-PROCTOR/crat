@@ -339,6 +339,19 @@ pub(crate) struct PairSiteDecision {
     pub(crate) peer_receipts: String,
 }
 
+impl PairSiteDecision {
+    pub(crate) fn atom_id(&self) -> String {
+        format!(
+            "pair-site:{}:{}:{}:{}:{}",
+            self.caller.local_def_index.as_u32(),
+            self.callee.local_def_index.as_u32(),
+            self.argument_index,
+            self.span.lo().0,
+            self.subject.1.local_id.as_u32(),
+        )
+    }
+}
+
 fn resolve_pair_roles(
     entries: &[(usize, usize, A5SiteProofVerdict, bool)],
 ) -> BTreeMap<usize, PairRole> {

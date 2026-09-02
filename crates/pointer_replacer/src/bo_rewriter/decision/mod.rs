@@ -20,7 +20,7 @@
 //! owning-reachable fixpoint arrive with S2's breadth.
 
 use rustc_hash::FxHashMap;
-use rustc_hir::def_id::LocalDefId;
+use rustc_hir::{HirId, def_id::LocalDefId};
 use rustc_middle::{mir::Local, ty::TyCtxt};
 use rustc_span::Span;
 
@@ -120,6 +120,10 @@ impl RequiredArmSet {
         self.0 & (1 << (arm as u8)) != 0
     }
 
+    pub(crate) fn remove(&mut self, arm: Arm) {
+        self.0 &= !(1 << (arm as u8));
+    }
+
     pub(crate) fn union(mut self, other: Self) -> Self {
         self.0 |= other.0;
         self
@@ -144,6 +148,16 @@ pub(crate) enum ArmState {
     NotRequired,
     Ready,
     Blocked,
+}
+
+impl ArmState {
+    pub(crate) fn key(self) -> &'static str {
+        match self {
+            Self::NotRequired => "not-required",
+            Self::Ready => "ready",
+            Self::Blocked => "blocked",
+        }
+    }
 }
 
 #[cfg(test)]
@@ -811,6 +825,7 @@ pub(crate) enum Decision {
 pub(crate) struct DecisionTable {
     pub entries: Vec<(Subject, Decision)>,
     pub(crate) exposure: Option<exposure::ExposurePolicy>,
+    pub(crate) arm_requirements: FxHashMap<(LocalDefId, HirId), RequiredArmSet>,
     /// Final E2 carrier; later phases consume it without origin facts.
     pub(crate) lifetime_plan: lifetime::LifetimePlan,
     /// Retained post-solve C-9 call-site emission plans. These are construction
@@ -952,6 +967,7 @@ pub(crate) fn decide(ctx: &Ctx<'_, '_>, subjects: &[Subject]) -> DecisionTable {
     DecisionTable {
         entries,
         exposure: None,
+        arm_requirements: FxHashMap::default(),
         lifetime_plan: Default::default(),
         c9_marks: Vec::new(),
         // `decide` stays PURE over subjects; seams need the call graph and are
@@ -1613,6 +1629,7 @@ mod self_consistency_tests {
     fn table(entries: Vec<Subject>) -> DecisionTable {
         DecisionTable {
             exposure: None,
+            arm_requirements: FxHashMap::default(),
             seams: Default::default(),
             c9_marks: Vec::new(),
             lifetime_plan: Default::default(),

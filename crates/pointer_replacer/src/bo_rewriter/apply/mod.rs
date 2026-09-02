@@ -248,6 +248,9 @@ mod tests {
             justification: Justification::KindDecision { kind: "test" },
             owner_fn: "test::owner".to_owned(),
             atom_ids: Vec::new(),
+            subject_id: "test::subject".to_owned(),
+            required_arms: "-".to_owned(),
+            edit_kind: "fixture",
         }
     }
 

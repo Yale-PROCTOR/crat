@@ -172,6 +172,12 @@ pub(crate) struct Edit {
     /// its declaration/use/seam closure while leaving an independent subject
     /// in the same function intact.
     pub atom_ids: Vec<String>,
+    /// Canonical subject identity and full required-arm set captured when the
+    /// edit is planned. The verifier's EditKey consumes these fields directly;
+    /// it never guesses an arm from replacement text.
+    pub subject_id: String,
+    pub required_arms: String,
+    pub edit_kind: &'static str,
 }
 
 /// The finished plan handed to [`super::apply`], **grouped by file**.
@@ -289,6 +295,19 @@ pub(crate) fn plan(
 ) -> Plan {
     let mut by_file: BTreeMap<FileKey, Vec<Edit>> = BTreeMap::new();
     let mut unplaceable = Vec::new();
+    let mut owner_arms = BTreeMap::<String, super::decision::RequiredArmSet>::new();
+    for (subject, _) in &table.entries {
+        let owner = owner_of(subject);
+        let required = table
+            .arm_requirements
+            .get(&(subject.fn_did, subject.hir_id))
+            .copied()
+            .unwrap_or_default();
+        owner_arms
+            .entry(owner)
+            .and_modify(|arms| *arms = arms.union(required))
+            .or_insert(required);
+    }
 
     // **S3.6-1 seam adapters, placed FIRST.**
     //
@@ -317,6 +336,17 @@ pub(crate) fn plan(
                 },
                 owner_fn: seam.owner_fn.clone(),
                 atom_ids: seam.atom_ids.clone(),
+                subject_id: format!("{}#arg{}", seam.owner_fn, seam.param_index),
+                required_arms: owner_arms
+                    .get(&seam.owner_fn)
+                    .copied()
+                    .unwrap_or_default()
+                    .render(),
+                edit_kind: match seam.source_shape {
+                    "pair-raw-view" => "pair-raw-view",
+                    "address-observation" => "address-observation",
+                    _ => "seam-adapter",
+                },
             }),
             // A span that cannot be located is RECORDED, never dropped: a seam
             // that silently vanishes leaves the callee converted and the call
@@ -343,6 +373,13 @@ pub(crate) fn plan(
                 },
                 owner_fn: body.owner_fn.clone(),
                 atom_ids: Vec::new(),
+                subject_id: body.destination.clone(),
+                required_arms: owner_arms
+                    .get(&body.owner_fn)
+                    .copied()
+                    .unwrap_or_default()
+                    .render(),
+                edit_kind: "body-adapter",
             }),
             Err(reason) => unplaceable.push(Unplaceable {
                 reason,
@@ -418,6 +455,13 @@ pub(crate) fn plan(
         // by hand and the driver built the same string by hand beside it — a
         // duplicated canonicalizer whose two copies had to be edited together.
         let identity = || subject.identity_key(&owner_of(subject));
+        let subject_id = identity();
+        let subject_arms = table
+            .arm_requirements
+            .get(&(subject.fn_did, subject.hir_id))
+            .copied()
+            .unwrap_or_default()
+            .render();
         // A bridge-admitted unannotated Box binding gets its complete type from
         // the rewritten initializer. It still needs a file anchor for its value
         // edits, but deliberately has no declaration splice. Every other form
@@ -556,6 +600,9 @@ pub(crate) fn plan(
                         },
                         owner_fn: owner_of(subject),
                         atom_ids: subject_atom_ids.clone(),
+                        subject_id: subject_id.clone(),
+                        required_arms: subject_arms.clone(),
+                        edit_kind: "box-expression",
                     }),
                     Ok(_) => {
                         use_failure = Some("Box edit is in a different file from the declaration")
@@ -574,6 +621,9 @@ pub(crate) fn plan(
                         },
                         owner_fn: owner_of(subject),
                         atom_ids: subject_atom_ids.clone(),
+                        subject_id: subject_id.clone(),
+                        required_arms: subject_arms.clone(),
+                        edit_kind: "box-delete-store",
                     }),
                     Ok(_) => {
                         use_failure = Some(
@@ -595,6 +645,9 @@ pub(crate) fn plan(
                     },
                     owner_fn: owner_of(subject),
                     atom_ids: subject_atom_ids.clone(),
+                    subject_id: subject_id.clone(),
+                    required_arms: subject_arms.clone(),
+                    edit_kind: "subject-use",
                 }),
                 Ok(_) => {
                     use_failure = Some("slice use is in a different file from the declaration")
@@ -641,6 +694,9 @@ pub(crate) fn plan(
                 justification: Justification::KindDecision { kind },
                 owner_fn: owner_of(subject),
                 atom_ids: subject_atom_ids,
+                subject_id,
+                required_arms: subject_arms,
+                edit_kind: "subject-declaration",
             });
         }
     }
@@ -705,6 +761,7 @@ mod tests {
     #[test]
     fn a_ref_decision_with_no_pointee_span_is_attributed_not_skipped() {
         let table = DecisionTable {
+            arm_requirements: Default::default(),
             exposure: None,
             seams: Default::default(),
             c9_marks: Vec::new(),
@@ -758,6 +815,7 @@ mod tests {
     #[test]
     fn a_degraded_subject_is_not_also_reported_unplaceable() {
         let table = DecisionTable {
+            arm_requirements: Default::default(),
             exposure: None,
             seams: Default::default(),
             c9_marks: Vec::new(),
