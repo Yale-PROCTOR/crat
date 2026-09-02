@@ -7585,6 +7585,49 @@ fn rb_w9_value_observing_comparison_uses_safe_address_views() {
     );
 }
 
+/// ADDR-W1 — a terminal pointer-to-integer observation is a sink. It receives
+/// an explicit address view without requiring an unrelated foreign boundary.
+#[test]
+fn addr_w1_pointer_to_integer_is_a_terminal_safe_view() {
+    let src = "#![allow(dead_code, unused_unsafe)]\n\
+               pub unsafe fn f(p: *const i32) -> usize { p as usize }\n";
+    let super::RewriteOutcome::Emitted { source, .. } = super::rewrite_m1(src) else {
+        panic!("terminal address observation must emit");
+    };
+    assert!(source.contains("p: &i32"), "{source}");
+    assert!(
+        source.contains("core::ptr::from_ref(p) as usize"),
+        "{source}"
+    );
+}
+
+/// ADDR-W1 — same-allocation difference is observation-only and converts both
+/// operands to explicit address views.
+#[test]
+fn addr_w1_offset_from_is_a_terminal_safe_view() {
+    let src = "#![allow(dead_code, unused_unsafe)]\n\
+               pub unsafe fn f(p: *const i32, q: *const i32) -> isize { p.offset_from(q) }\n";
+    let super::RewriteOutcome::Emitted { source, .. } = super::rewrite_m1(src) else {
+        panic!("terminal pointer difference must emit");
+    };
+    assert!(source.contains("p: &i32"), "{source}");
+    assert!(source.contains("q: &i32"), "{source}");
+    assert_eq!(source.matches("core::ptr::from_ref").count(), 2, "{source}");
+}
+
+/// ADDR-N1 — a pointer-producing arithmetic use remains access-producing and
+/// cannot be licensed by an address observation elsewhere in the function.
+#[test]
+fn addr_n1_access_producing_use_keeps_the_subject_raw() {
+    let src = "#![allow(dead_code, unused_unsafe)]\n\
+               pub unsafe fn f(p: *const i32) -> (usize, i32) { (p as usize, *p.offset(1)) }\n";
+    let super::RewriteOutcome::Emitted { source, .. } = super::rewrite_m1(src) else {
+        panic!("mixed address/access fixture must remain emittable");
+    };
+    assert!(source.contains("p: *const i32"), "{source}");
+    assert!(!source.contains("core::ptr::from_ref(p)"), "{source}");
+}
+
 /// Addendum-142 edit-region witness: a depth-two pointer's element access is
 /// already rewritten by the subject-use arm.  The foreign call consumes that
 /// RAW element, not the surrounding safe slice, so the existing use edit owns
