@@ -75,6 +75,104 @@ pub(crate) enum RefGate {
     LiftAdaptable,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[repr(u8)]
+pub(crate) enum Arm {
+    Surface = 0,
+    D4 = 1,
+    C = 2,
+    Pair = 3,
+    Glue = 4,
+    Addr = 5,
+}
+
+impl Arm {
+    pub(crate) const ALL: [Self; 6] = [
+        Self::Surface,
+        Self::D4,
+        Self::C,
+        Self::Pair,
+        Self::Glue,
+        Self::Addr,
+    ];
+
+    pub(crate) fn key(self) -> &'static str {
+        match self {
+            Self::Surface => "surface",
+            Self::D4 => "d4",
+            Self::C => "c",
+            Self::Pair => "pair",
+            Self::Glue => "glue",
+            Self::Addr => "addr",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct RequiredArmSet(u8);
+
+impl RequiredArmSet {
+    pub(crate) fn insert(&mut self, arm: Arm) {
+        self.0 |= 1 << (arm as u8);
+    }
+
+    pub(crate) fn contains(self, arm: Arm) -> bool {
+        self.0 & (1 << (arm as u8)) != 0
+    }
+
+    pub(crate) fn union(mut self, other: Self) -> Self {
+        self.0 |= other.0;
+        self
+    }
+
+    pub(crate) fn render(self) -> String {
+        let arms = Arm::ALL
+            .into_iter()
+            .filter(|&arm| self.contains(arm))
+            .map(Arm::key)
+            .collect::<Vec<_>>();
+        if arms.is_empty() {
+            "-".to_owned()
+        } else {
+            arms.join("+")
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ArmState {
+    NotRequired,
+    Ready,
+    Blocked,
+}
+
+#[cfg(test)]
+mod required_arm_set_tests {
+    use super::*;
+
+    #[test]
+    fn multi_w1_required_arm_set_keeps_every_required_bit_in_fixed_order() {
+        let mut requirements = RequiredArmSet::default();
+        requirements.insert(Arm::Pair);
+        requirements.insert(Arm::C);
+        requirements.insert(Arm::D4);
+        assert_eq!(requirements.render(), "d4+c+pair");
+        assert!(requirements.contains(Arm::D4));
+        assert!(requirements.contains(Arm::C));
+        assert!(requirements.contains(Arm::Pair));
+        assert!(!requirements.contains(Arm::Glue));
+    }
+
+    #[test]
+    fn required_arm_set_union_does_not_drop_an_earlier_arm() {
+        let mut left = RequiredArmSet::default();
+        left.insert(Arm::Surface);
+        let mut right = RequiredArmSet::default();
+        right.insert(Arm::Addr);
+        assert_eq!(left.union(right).render(), "surface+addr");
+    }
+}
+
 /// How the parameter's **declaration** is written in source, for a subject
 /// whose **resolved** type is a pointer.
 ///

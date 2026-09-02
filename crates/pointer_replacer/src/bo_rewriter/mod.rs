@@ -175,6 +175,7 @@ pub(crate) struct E2Timings {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct RawBoundaryArtifacts {
     pub(crate) exposure: String,
+    pub(crate) d4_edges: String,
     pub(crate) sites: String,
     pub(crate) retention: String,
     pub(crate) dispositions: String,
@@ -4154,6 +4155,7 @@ fn finish_decide<'tcx>(
     let raw_boundary_receipt_started = std::time::Instant::now();
     let raw_boundary_artifacts = RawBoundaryArtifacts {
         exposure: exposure.receipts_tsv(),
+        d4_edges: coconv.edge_receipts_tsv(tcx),
         sites: raw_boundary_sites.to_tsv(),
         retention: retention.to_tsv(),
         dispositions: raw_boundary.receipts_tsv(),
@@ -5319,7 +5321,7 @@ pub(crate) fn coconv_tsv(tcx: TyCtxt<'_>) -> Result<String, String> {
         decision::co_conversion::OverlapRule::AllPairs,
     );
     let mut out = String::from(
-        "fn_path\tmir_local\tis_param\tclass_id\tclass_size\tadmissible\tclass_block\tnode_block\tsites\tescapes\tp2_blind_only\tp2_all_pairs\n",
+        "fn_path\tmir_local\tis_param\tclass_id\tclass_size\tadmissible\tclass_block\tnode_block\tmember_admissible\tedge_routes\trequired_arms\tsites\tescapes\tp2_blind_only\tp2_all_pairs\n",
     );
     for (s, _decision) in &table.entries {
         let key = (s.fn_did, s.hir_id);
@@ -5364,8 +5366,19 @@ pub(crate) fn coconv_tsv(tcx: TyCtxt<'_>) -> Result<String, String> {
             None => "-".to_owned(),
         };
         let (p2_blind, p2_all) = (verdict(&blind_only), verdict(&all_pairs));
+        let member_admissible = ctx.coconv.class_of(key).map_or_else(
+            || "-".to_owned(),
+            |_| u8::from(ctx.coconv.admits(key)).to_string(),
+        );
+        let edge_routes = ctx.coconv.edge_routes(key);
+        let edge_routes = if edge_routes.is_empty() {
+            "-".to_owned()
+        } else {
+            edge_routes.join(",")
+        };
+        let required_arms = ctx.coconv.required_arms(key).render();
         out.push_str(&format!(
-            "{}\t{}\t{}\t{class_id}\t{class_size}\t{admissible}\t{class_block}\t{}\t{sites}\t{}\t{p2_blind}\t{p2_all}\n",
+            "{}\t{}\t{}\t{class_id}\t{class_size}\t{admissible}\t{class_block}\t{}\t{member_admissible}\t{edge_routes}\t{required_arms}\t{sites}\t{}\t{p2_blind}\t{p2_all}\n",
             tcx.def_path_str(s.fn_did.to_def_id()),
             s.local.as_u32(),
             u8::from(matches!(s.kind, decision::SubjectKind::Param { .. })),

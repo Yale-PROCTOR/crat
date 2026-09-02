@@ -4490,6 +4490,51 @@ mod coconv_witnesses {
         assert_eq!(q["edge_routes"], "glue", "{q:?}");
     }
 
+    #[test]
+    fn d4_w1_production_keeps_clean_sibling_safe() {
+        let source = format!(
+            "{PRE}pub unsafe fn target(p: *mut i32) {{ *p = 1; }}\n\
+             pub unsafe fn via(x: *mut i32) {{ target(x); }}\n\
+             pub unsafe fn nulls() {{ target(0 as *mut i32); }}\n"
+        );
+        let super::super::RewriteOutcome::Emitted { source, .. } =
+            super::super::rewrite_m1(&source)
+        else {
+            panic!("D4-W1 production fixture must emit")
+        };
+        assert!(source.contains("fn via(x: &mut i32)"), "{source}");
+        assert!(source.contains("fn target(p: *mut i32)"), "{source}");
+    }
+
+    #[test]
+    fn d4_w2_production_emits_safe_to_safe_glue() {
+        let source = format!(
+            "{PRE}pub unsafe fn optional(p: *mut i32) -> i32 {{ if p.is_null() {{ 0 }} else {{ *p }} }}\n\
+             pub unsafe fn caller(q: *mut i32) -> i32 {{ *q = 1; optional(q) }}\n"
+        );
+        let super::super::RewriteOutcome::Emitted { source, .. } =
+            super::super::rewrite_m1(&source)
+        else {
+            panic!("D4-W2 production fixture must emit")
+        };
+        assert!(source.contains("fn caller(q: &mut i32)"), "{source}");
+        assert!(source.contains("optional(Some(q))"), "{source}");
+    }
+
+    #[test]
+    fn d4_cycle_edges_are_all_receipted_and_zero_syntax() {
+        let rows = census(&format!(
+            "{PRE}pub unsafe fn a(p: *mut i32, n: i32) {{ if n > 0 {{ b(p, n - 1); }} }}\n\
+             pub unsafe fn b(p: *mut i32, n: i32) {{ if n > 0 {{ a(p, n - 1); }} }}\n"
+        ));
+        for function in ["a", "b"] {
+            let row = row(&rows, function, 1);
+            assert_eq!(row["member_admissible"], "1", "{row:?}");
+            assert_eq!(row["edge_routes"], "zero-syntax", "{row:?}");
+            assert_eq!(row["required_arms"], "d4", "{row:?}");
+        }
+    }
+
     /// **The argument-shape table, one fixture per blocking shape — and a
     /// negative for the shape that does NOT block.**
     ///
@@ -4582,8 +4627,8 @@ mod coconv_witnesses {
         );
     }
 
-    /// **A converting binding into a DIFFERENTLY-FORMED parameter is its own
-    /// reason**, because it is its own hazard class.
+    /// **D4-W2: a converting binding into a differently-formed SAFE parameter
+    /// becomes a GLUE edge**, rather than demoting the whole class.
     ///
     /// `&mut T` into `*mut T` coerces silently and is caught here or nowhere.
     /// `&mut T` into `Option<&i32>` is `E0308` — the compiler catches it, so it
@@ -4591,10 +4636,10 @@ mod coconv_witnesses {
     /// distinction, and a census reporting both as `flows-into-raw-param` files
     /// a checked risk under an unchecked reason.
     ///
-    /// *Mutation-tested (deletion first):* dropping the `other_form` arm makes
-    /// this read `flows-into-raw-param` and fails.
+    /// *Mutation-tested:* restoring the old class-wide reason makes
+    /// `member_admissible` zero and removes the GLUE receipt.
     #[test]
-    fn a_binding_flowing_into_a_differently_formed_parameter_has_its_own_reason() {
+    fn d4_w2_differently_formed_parameter_is_a_glue_edge() {
         let source = format!(
             "{PRE}pub unsafe fn opty(o: *mut i32) -> i32 {{ if o.is_null() {{ 0 }} else {{ *o }} }}\n\
              pub unsafe fn feeder(r: *mut i32) -> i32 {{ *r = 1; opty(r) }}\n"
@@ -4607,7 +4652,10 @@ mod coconv_witnesses {
             "`opty`'s parameter takes the OPTIONAL form, so it is not a class \
              node — if it were a plain `Ref` this fixture witnesses nothing: {o:?}"
         );
-        assert_eq!(r["node_block"], "flows-into-other-form", "{r:?}");
+        assert_eq!(r["node_block"], "-", "{r:?}");
+        assert_eq!(r["member_admissible"], "1", "{r:?}");
+        assert_eq!(r["edge_routes"], "glue", "{r:?}");
+        assert_eq!(r["required_arms"], "glue", "{r:?}");
         let trace = raw_trace(&source);
         let receipts = tsv_rows(&trace.dispositions);
         let receipt = raw_receipt(&receipts, "feeder::r#1");

@@ -45,7 +45,7 @@ use rustc_middle::ty::TyCtxt;
 use rustc_span::Span;
 
 use super::{
-    Decision, DecisionTable, Subject, SubjectKind,
+    Arm, Decision, DecisionTable, RequiredArmSet, Subject, SubjectKind,
     emitability::{ArgShape, EmitabilityFacts, RefKind},
     lifetime::LifetimeEligibility,
     raw_boundary::RawBoundaryDispositionIndex,
@@ -202,6 +202,81 @@ pub(crate) struct Class {
     pub blocked: Option<BlockReason>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum EdgeForm {
+    Raw,
+    Ref,
+    Slice,
+    Optional,
+    Box,
+}
+
+impl EdgeForm {
+    fn of(decision: &Decision) -> Self {
+        match decision {
+            Decision::Ref { .. } | Decision::InferredRef { .. } => Self::Ref,
+            Decision::Slice { .. } => Self::Slice,
+            Decision::Opt { .. } => Self::Optional,
+            Decision::Box(_) => Self::Box,
+            Decision::Degraded(_) => Self::Raw,
+        }
+    }
+
+    fn key(self) -> &'static str {
+        match self {
+            Self::Raw => "raw",
+            Self::Ref => "ref",
+            Self::Slice => "slice",
+            Self::Optional => "optional",
+            Self::Box => "box",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum EdgeRoute {
+    ZeroSyntax,
+    ArmA,
+    ArmC,
+    Glue,
+}
+
+impl EdgeRoute {
+    pub(crate) fn key(self) -> &'static str {
+        match self {
+            Self::ZeroSyntax => "zero-syntax",
+            Self::ArmA => "arm-a",
+            Self::ArmC => "arm-c",
+            Self::Glue => "glue",
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct EdgeObligation {
+    pub(crate) source: NodeKey,
+    pub(crate) target: NodeKey,
+    pub(crate) caller: LocalDefId,
+    pub(crate) callee: LocalDefId,
+    pub(crate) argument_index: usize,
+    pub(crate) span: Span,
+    pub(crate) source_form: EdgeForm,
+    pub(crate) target_form: EdgeForm,
+    pub(crate) route: EdgeRoute,
+}
+
+#[derive(Clone, Debug)]
+struct EdgeCandidate {
+    source: NodeKey,
+    target: NodeKey,
+    caller: LocalDefId,
+    callee: LocalDefId,
+    argument_index: usize,
+    span: Span,
+    source_form: EdgeForm,
+    target_form: EdgeForm,
+}
+
 /// The finished class structure. **Measurement at task 2; the gate at task 3.**
 #[derive(Clone, Debug, Default)]
 pub(crate) struct CoConv {
@@ -213,6 +288,7 @@ pub(crate) struct CoConv {
     /// reason says why the component cannot convert, this one says which member
     /// is responsible. A census with only the first cannot be acted on.
     node_block: FxHashMap<NodeKey, BlockReason>,
+    edges: Vec<EdgeObligation>,
 }
 
 impl CoConv {
@@ -222,9 +298,7 @@ impl CoConv {
     /// the gate under the hypothetical, so nothing about the class structure
     /// can license it.
     pub(crate) fn admits(&self, key: NodeKey) -> bool {
-        self.class_of
-            .get(&key)
-            .is_some_and(|&id| self.classes[id].blocked.is_none())
+        self.class_of.contains_key(&key) && !self.node_block.contains_key(&key)
     }
 
     /// The reason this subject's CLASS carries, as opposed to the one the
@@ -246,6 +320,66 @@ impl CoConv {
 
     pub(crate) fn node_block(&self, key: NodeKey) -> Option<BlockReason> {
         self.node_block.get(&key).copied()
+    }
+
+    pub(crate) fn edges(&self) -> &[EdgeObligation] {
+        &self.edges
+    }
+
+    pub(crate) fn edge_routes(&self, key: NodeKey) -> Vec<&'static str> {
+        let mut routes = self
+            .edges
+            .iter()
+            .filter(|edge| edge.source == key || edge.target == key)
+            .map(|edge| edge.route.key())
+            .collect::<Vec<_>>();
+        routes.sort_unstable();
+        routes.dedup();
+        routes
+    }
+
+    pub(crate) fn required_arms(&self, key: NodeKey) -> RequiredArmSet {
+        let mut arms = RequiredArmSet::default();
+        if self.class_of(key).is_some_and(|id| {
+            self.classes[id].members.len() > 1 || self.classes[id].blocked.is_some()
+        }) {
+            arms.insert(Arm::D4);
+        }
+        for edge in self
+            .edges
+            .iter()
+            .filter(|edge| edge.source == key || edge.target == key)
+        {
+            match edge.route {
+                EdgeRoute::ArmC => arms.insert(Arm::C),
+                EdgeRoute::Glue => arms.insert(Arm::Glue),
+                EdgeRoute::ZeroSyntax | EdgeRoute::ArmA => {}
+            }
+        }
+        arms
+    }
+
+    pub(crate) fn edge_receipts_tsv(&self, tcx: TyCtxt<'_>) -> String {
+        let mut out = String::from(
+            "caller\tcallee\targument_index\tsource\ttarget\tsource_form\ttarget_form\troute\tsite\n",
+        );
+        for edge in &self.edges {
+            out.push_str(&format!(
+                "{}\t{}\t{}\t{}:{}\t{}:{}\t{}\t{}\t{}\t{}\n",
+                tcx.def_path_str(edge.caller.to_def_id()),
+                tcx.def_path_str(edge.callee.to_def_id()),
+                edge.argument_index,
+                tcx.def_path_str(edge.source.0.to_def_id()),
+                edge.source.1.local_id.as_u32(),
+                tcx.def_path_str(edge.target.0.to_def_id()),
+                edge.target.1.local_id.as_u32(),
+                edge.source_form.key(),
+                edge.target_form.key(),
+                edge.route.key(),
+                super::emitability::EmitabilityFacts::site(tcx, edge.span),
+            ));
+        }
+        out
     }
 }
 
@@ -412,6 +546,11 @@ pub(crate) fn build_with_c9_marks_lifetimes_and_raw_boundary(
             | Decision::Degraded(_) => None,
         })
         .collect();
+    let decision_of = hypothetical
+        .entries
+        .iter()
+        .map(|(subject, decision)| ((subject.fn_did, subject.hir_id), decision))
+        .collect::<FxHashMap<_, _>>();
     let index: FxHashMap<NodeKey, usize> = order.iter().enumerate().map(|(i, k)| (*k, i)).collect();
     let converts: FxHashSet<NodeKey> = order.iter().copied().collect();
 
@@ -432,6 +571,7 @@ pub(crate) fn build_with_c9_marks_lifetimes_and_raw_boundary(
 
     let mut dsu = Dsu::new(order.len());
     let mut node_block: FxHashMap<NodeKey, BlockReason> = FxHashMap::default();
+    let mut edge_candidates = Vec::<EdgeCandidate>::new();
     /// First reason wins, so the census is deterministic under a node that
     /// contributes two.
     fn block(node_block: &mut FxHashMap<NodeKey, BlockReason>, key: NodeKey, reason: BlockReason) {
@@ -578,9 +718,24 @@ pub(crate) fn build_with_c9_marks_lifetimes_and_raw_boundary(
                     ArgShape::AddrOf { base: Some(b), .. } => (Some(b), true),
                     _ => (None, false),
                 };
-                let caller_node = caller_binding
+                let caller_subject = caller_binding
                     .map(|b| (b.owner.def_id, b))
-                    .filter(|k| converts.contains(k));
+                    .filter(|key| decision_of.contains_key(key));
+                let caller_node = caller_subject.filter(|k| converts.contains(k));
+                if !via_borrow
+                    && let (Some(source), Some(target)) = (caller_subject, callee_subject)
+                {
+                    edge_candidates.push(EdgeCandidate {
+                        source,
+                        target,
+                        caller: site.caller,
+                        callee: *callee,
+                        argument_index: arg.index,
+                        span: arg.span,
+                        source_form: EdgeForm::of(decision_of[&source]),
+                        target_form: EdgeForm::of(decision_of[&target]),
+                    });
+                }
 
                 // (a) the CALLER-side gate — banked rule 2. A converting
                 // binding that reaches a parameter which stays raw coerces
@@ -598,7 +753,7 @@ pub(crate) fn build_with_c9_marks_lifetimes_and_raw_boundary(
                         let reason = if via_borrow {
                             BlockReason::BorrowedIntoRawParam
                         } else if callee_subject.is_some_and(|k| other_form.contains(&k)) {
-                            BlockReason::FlowsIntoOtherForm
+                            continue;
                         } else if pinned {
                             BlockReason::FlowsIntoPinnedCallee
                         } else {
@@ -623,6 +778,7 @@ pub(crate) fn build_with_c9_marks_lifetimes_and_raw_boundary(
                         // The edge. Undirected: converting either alone is
                         // `E0308`, so neither end is the cause of the other.
                         Some(caller) => dsu.union(index[&callee_key], index[&caller]),
+                        None if caller_subject.is_some() => {}
                         None => block(&mut node_block, callee_key, BlockReason::ArgStaysRaw),
                     },
                     // `&mut e` satisfies `&mut T` and `&T` alike; `&e` satisfies
@@ -679,10 +835,60 @@ pub(crate) fn build_with_c9_marks_lifetimes_and_raw_boundary(
         }
     }
 
+    let settled = |key: NodeKey, form: EdgeForm| {
+        if form == EdgeForm::Ref && node_block.contains_key(&key) {
+            EdgeForm::Raw
+        } else {
+            form
+        }
+    };
+    let mut edges = edge_candidates
+        .into_iter()
+        .map(|edge| {
+            let source_form = settled(edge.source, edge.source_form);
+            let target_form = settled(edge.target, edge.target_form);
+            let route = match (source_form, target_form) {
+                (left, right) if left == right => EdgeRoute::ZeroSyntax,
+                (EdgeForm::Raw, _) => EdgeRoute::ArmC,
+                (_, EdgeForm::Raw) => EdgeRoute::ArmA,
+                _ => EdgeRoute::Glue,
+            };
+            EdgeObligation {
+                source: edge.source,
+                target: edge.target,
+                caller: edge.caller,
+                callee: edge.callee,
+                argument_index: edge.argument_index,
+                span: edge.span,
+                source_form,
+                target_form,
+                route,
+            }
+        })
+        .collect::<Vec<_>>();
+    edges.sort_by_key(|edge| {
+        (
+            edge.caller.local_def_index.as_u32(),
+            edge.callee.local_def_index.as_u32(),
+            edge.argument_index,
+            edge.span.lo(),
+            edge.span.hi(),
+        )
+    });
+    edges.dedup_by(|left, right| {
+        left.caller == right.caller
+            && left.callee == right.callee
+            && left.argument_index == right.argument_index
+            && left.span == right.span
+            && left.source == right.source
+            && left.target == right.target
+    });
+
     CoConv {
         class_of,
         classes,
         node_block,
+        edges,
     }
 }
 

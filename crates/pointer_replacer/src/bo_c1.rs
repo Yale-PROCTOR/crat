@@ -9944,6 +9944,7 @@ mod run {
         let artifact = &capture.raw_boundary_artifacts;
         let artifact_rows = [
             ("exposure", artifact.exposure.as_str()),
+            ("d4-edges", artifact.d4_edges.as_str()),
             ("sites", artifact.sites.as_str()),
             ("retention", artifact.retention.as_str()),
             ("dispositions", artifact.dispositions.as_str()),
