@@ -1296,7 +1296,7 @@ mod tests {
     /// **Optional, BOTH SIDES.** `Some(..)` one way, `.unwrap()` the other —
     /// the latter on `-3`'s null-panic convention.
     #[test]
-    fn optional_wraps_one_way_and_unwraps_the_other() {
+    fn glue_w1_optional_wraps_safe_values_and_glue_n1_never_unwraps_none() {
         assert_eq!(
             text(
                 Opt {
@@ -1308,28 +1308,24 @@ mod tests {
             "Some(p)"
         );
         assert_eq!(
-            text(
-                Ref { mutable: true },
-                Opt {
-                    mutable: true,
-                    slice: false
-                }
-            ),
-            "p.as_mut().unwrap()",
-            "a MUTABLE optional must not be CONSUMED by the seam"
-        );
-        // The shared twin IS `Copy`, so the plain spelling is correct there and
-        // the two must not be unified — `.as_mut()` on a `&T` optional would
-        // need a `mut` binding the caller may not have.
-        assert_eq!(
-            text(
+            g(
                 Ref { mutable: false },
                 Opt {
                     mutable: false,
                     slice: false
                 }
             ),
-            "p.unwrap()"
+            Err(SeamBlock::NullabilityInsufficient)
+        );
+        assert_eq!(
+            g(
+                Ref { mutable: true },
+                Opt {
+                    mutable: true,
+                    slice: false
+                }
+            ),
+            Err(SeamBlock::NullabilityInsufficient)
         );
     }
 
@@ -1352,19 +1348,16 @@ mod tests {
     /// case, and it is not exotic: `&T` is exactly what a read-only callee
     /// parameter converts to.
     #[test]
-    fn the_unwrap_spelling_is_the_found_sides_and_not_the_expected_sides() {
+    fn glue_n1_optional_required_is_fail_closed_off_the_diagonal_too() {
         assert_eq!(
-            text(
+            g(
                 Ref { mutable: false },
                 Opt {
                     mutable: true,
                     slice: false
                 }
             ),
-            "p.as_mut().unwrap()",
-            "a MUTABLE optional stays borrowed even into a SHARED position — \
-             reading the expected side here would move it, and `E0382` would \
-             appear only at a second use"
+            Err(SeamBlock::NullabilityInsufficient)
         );
         // The other off-diagonal pairing cannot occur: `shared_to_mut` blocks a
         // `&mut` position fed from a shared optional before any spec is built.
@@ -1392,34 +1385,29 @@ mod tests {
     ///
     /// Unwitnessed until mutation M25 swapped them and the suite stayed green.
     #[test]
-    fn a_slice_position_widens_a_thin_optional_and_only_unwraps_a_fat_one() {
+    fn glue_n1_optional_to_required_and_cross_shape_optional_are_held() {
         assert_eq!(
-            text(
+            g(
                 Slice { mutable: false },
                 Opt {
                     mutable: false,
                     slice: true
                 }
             ),
-            "p.unwrap()",
-            "a FAT optional is already the slice"
+            Err(SeamBlock::NullabilityInsufficient)
         );
         assert_eq!(
-            text(
+            g(
                 Slice { mutable: true },
                 Opt {
                     mutable: true,
                     slice: false
                 }
             ),
-            "core::slice::from_mut(p.as_mut().unwrap())",
-            "a THIN optional yields a reference, which must be widened"
+            Err(SeamBlock::NullabilityInsufficient)
         );
-        // The same split under the optional-expected arm, whose core selection
-        // reads the EXPECTED side's fatness instead — the mirror choice, and
-        // the reason the two arms cannot share one rule.
         assert_eq!(
-            text(
+            g(
                 Opt {
                     mutable: false,
                     slice: true
@@ -1429,10 +1417,10 @@ mod tests {
                     slice: false
                 }
             ),
-            "Some(core::slice::from_ref(p.unwrap()))"
+            Err(SeamBlock::NullabilityInsufficient)
         );
         assert_eq!(
-            text(
+            g(
                 Opt {
                     mutable: false,
                     slice: false
@@ -1442,7 +1430,7 @@ mod tests {
                     slice: true
                 }
             ),
-            "Some(&p.unwrap()[0])"
+            Err(SeamBlock::NullabilityInsufficient)
         );
     }
 
