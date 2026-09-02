@@ -9743,6 +9743,7 @@ mod run {
         let mut t1_sites = 0usize;
         let mut t2_sites = 0usize;
         let mut blocked_sites = 0usize;
+        let mut owned_by_other_arm_sites = 0usize;
         let mut t1_surviving = 0usize;
         let mut t2_surviving = 0usize;
         let mut zero_syntax = 0usize;
@@ -9750,14 +9751,14 @@ mod run {
         let mut lifecycle = 0usize;
         for line in artifact.dispositions.lines().skip(1) {
             let fields = line.split('\t').collect::<Vec<_>>();
-            if fields.len() != 15 {
+            if fields.len() != 17 {
                 continue;
             }
             let caller = fields[0];
             let identity = fields[6];
-            let tier = fields[8];
-            let template = fields[9];
-            let atom_group = fields[14]
+            let tier = fields[10];
+            let template = fields[11];
+            let atom_group = fields[16]
                 .split(';')
                 .filter(|atom| *atom != "-" && !atom.is_empty())
                 .collect::<Vec<_>>();
@@ -9777,6 +9778,9 @@ mod run {
                     t2_sites += 1;
                     t2_surviving += usize::from(survives);
                     outcome.has_t2 = true;
+                }
+                "owned-by-box" | "owned-by-other-arm" => {
+                    owned_by_other_arm_sites += 1;
                 }
                 _ => {
                     blocked_sites += 1;
@@ -9888,6 +9892,10 @@ mod run {
         row.set(raw_schema::T2_CANDIDATE_SITES, t2_sites);
         row.set(raw_schema::T2_WAIVER_SITES, t2_sites);
         row.set(raw_schema::BLOCKED_SITES, blocked_sites);
+        row.set(
+            raw_schema::OWNED_BY_OTHER_ARM_SITES,
+            owned_by_other_arm_sites,
+        );
         row.set(raw_schema::ZERO_SYNTAX_SITES, zero_syntax);
         row.set(raw_schema::EXPLICIT_BRIDGE_SITES, explicit);
         row.set(raw_schema::LIFECYCLE_SITES, lifecycle);
@@ -18941,6 +18949,7 @@ fn raw_boundary_wave1_corpus_census() {
         raw_schema::T2_CANDIDATE_SITES,
         raw_schema::T2_WAIVER_SITES,
         raw_schema::BLOCKED_SITES,
+        raw_schema::OWNED_BY_OTHER_ARM_SITES,
         raw_schema::ZERO_SYNTAX_SITES,
         raw_schema::EXPLICIT_BRIDGE_SITES,
         raw_schema::LIFECYCLE_SITES,

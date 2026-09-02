@@ -25,6 +25,7 @@ pub(crate) const T1_CANDIDATE_SITES: &str = "raw_boundary_t1_candidate_sites";
 pub(crate) const T2_CANDIDATE_SITES: &str = "raw_boundary_t2_candidate_sites";
 pub(crate) const T2_WAIVER_SITES: &str = "raw_boundary_t2_waiver_sites";
 pub(crate) const BLOCKED_SITES: &str = "raw_boundary_blocked_sites";
+pub(crate) const OWNED_BY_OTHER_ARM_SITES: &str = "raw_boundary_owned_by_other_arm_sites";
 pub(crate) const ZERO_SYNTAX_SITES: &str = "raw_boundary_zero_syntax_sites";
 pub(crate) const EXPLICIT_BRIDGE_SITES: &str = "raw_boundary_explicit_bridge_sites";
 pub(crate) const LIFECYCLE_SITES: &str = "raw_boundary_lifecycle_sites";
@@ -83,6 +84,7 @@ pub(crate) const ALL: &[&str] = &[
     T2_CANDIDATE_SITES,
     T2_WAIVER_SITES,
     BLOCKED_SITES,
+    OWNED_BY_OTHER_ARM_SITES,
     ZERO_SYNTAX_SITES,
     EXPLICIT_BRIDGE_SITES,
     LIFECYCLE_SITES,

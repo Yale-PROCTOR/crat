@@ -531,6 +531,59 @@ fn box_w3_memset_slice_uses_named_fallback_and_deletes_statement() {
         "zeroing assignment survived: {source}"
     );
     assert!(source.contains("drop(p)"), "{source}");
+    let raw = ::utils::compilation::run_compiler_on_str(&src, |tcx| {
+        super::raw_boundary_trace_artifacts(tcx).expect("Box W3 raw-boundary receipts")
+    })
+    .expect("Box W3 receipt fixture compiles");
+    let owned = raw
+        .dispositions
+        .lines()
+        .skip(1)
+        .map(|line| line.split('\t').collect::<Vec<_>>())
+        .filter(|fields| fields.get(10) == Some(&"owned-by-box"))
+        .collect::<Vec<_>>();
+    assert_eq!(owned.len(), 2, "{}", raw.dispositions);
+    assert!(
+        owned.iter().any(|fields| {
+            fields.get(3) == Some(&"memset")
+                && fields.get(9) == Some(&"box")
+                && fields.get(14) == Some(&"box-initializer-consumed")
+        }),
+        "memset was not typed as Box-owned: {}",
+        raw.dispositions
+    );
+    assert!(
+        owned.iter().any(|fields| {
+            fields.get(3) == Some(&"free")
+                && fields.get(9) == Some(&"box")
+                && fields.get(14) == Some(&"box-lifecycle-owned")
+        }),
+        "free was not typed as Box-owned: {}",
+        raw.dispositions
+    );
+}
+
+#[test]
+fn task90_c2_box_w3_site_ownership_trace_dump() {
+    let src = format!(
+        "{BOX_W1_PREAMBLE}\n\
+         pub unsafe fn f(n: usize) {{\n\
+             let mut p: *mut i32 = malloc(n * core::mem::size_of::<i32>()) as *mut i32;\n\
+             p = memset(p as *mut core::ffi::c_void, 0, n * core::mem::size_of::<i32>()) as *mut i32;\n\
+             free(p as *mut core::ffi::c_void);\n\
+         }}\n"
+    );
+    let (raw, box_plan) = ::utils::compilation::run_compiler_on_str(&src, |tcx| {
+        (
+            super::raw_boundary_trace_artifacts(tcx).expect("raw trace"),
+            super::box_plan_artifact(tcx).expect("Box plan"),
+        )
+    })
+    .expect("Box trace fixture compiles");
+    eprintln!("BOX-W3 RAW SUBJECTS\n{}", raw.subjects);
+    eprintln!("BOX-W3 RAW SITES\n{}", raw.sites);
+    eprintln!("BOX-W3 RAW DISPOSITIONS\n{}", raw.dispositions);
+    eprintln!("BOX-W3 BOX PLAN\n{}", box_plan.tsv);
 }
 
 #[test]
@@ -4222,6 +4275,81 @@ mod coconv_witnesses {
             .collect()
     }
 
+    fn raw_trace(src: &str) -> super::super::RawBoundaryArtifacts {
+        ::utils::compilation::run_compiler_on_str(src, |tcx| {
+            super::super::raw_boundary_trace_artifacts(tcx).expect("raw-boundary trace")
+        })
+        .expect("trace fixture compiles")
+    }
+
+    fn tsv_rows(tsv: &str) -> Vec<BTreeMap<String, String>> {
+        let header = tsv
+            .lines()
+            .next()
+            .expect("TSV header")
+            .split('\t')
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        tsv.lines()
+            .skip(1)
+            .map(|line| {
+                header
+                    .iter()
+                    .cloned()
+                    .zip(line.split('\t').map(str::to_owned))
+                    .collect()
+            })
+            .collect()
+    }
+
+    fn raw_receipt<'a>(
+        rows: &'a [BTreeMap<String, String>],
+        identity: &str,
+    ) -> &'a BTreeMap<String, String> {
+        rows.iter()
+            .find(|row| row["subject_identity"] == identity)
+            .unwrap_or_else(|| panic!("no raw-boundary receipt for {identity}: {rows:#?}"))
+    }
+
+    #[test]
+    fn task90_c1_receipt_trace_dump() {
+        let cases = [
+            (
+                "flows-into-raw-param",
+                format!(
+                    "{PRE}pub unsafe fn sink(p: *mut i32) -> usize {{ p as usize }}\n\
+                     pub unsafe fn src(r: *mut i32) -> usize {{ *r = 1; sink(r) }}\n"
+                ),
+            ),
+            (
+                "flows-into-other-form",
+                format!(
+                    "{PRE}pub unsafe fn opty(o: *mut i32) -> i32 {{ if o.is_null() {{ 0 }} else {{ *o }} }}\n\
+                     pub unsafe fn feeder(r: *mut i32) -> i32 {{ *r = 1; opty(r) }}\n"
+                ),
+            ),
+            (
+                "borrowed-into-raw-param",
+                format!(
+                    "{PRE}pub unsafe fn sink(p: *mut i32) -> usize {{ p as usize }}\n\
+                     pub unsafe fn src(r: *mut i32) -> usize {{ *r = 1; sink(&mut *r) }}\n"
+                ),
+            ),
+            (
+                "escapes-via-foreign-arg",
+                format!(
+                    "{PRE}extern \"C\" {{ fn sink(p: *mut i32); }}\n\
+                     pub unsafe fn subject(p: *mut i32) {{ *p = 1; sink(p); }}\n"
+                ),
+            ),
+        ];
+        for (name, source) in cases {
+            let trace = raw_trace(&source);
+            eprintln!("TRACE {name} SUBJECTS\n{}", trace.subjects);
+            eprintln!("TRACE {name} DISPOSITIONS\n{}", trace.dispositions);
+        }
+    }
+
     /// One row, found by the `fn_path` suffix and MIR local.
     fn row<'a>(
         rows: &'a [BTreeMap<String, String>],
@@ -4394,23 +4522,24 @@ mod coconv_witnesses {
         assert_eq!(row(&rows, "target", 1)["admissible"], "0");
     }
 
-    /// **BANKED RULE 2 — a converting binding that reaches a parameter which
-    /// stays raw is caught at DECISION time.**
+    /// A converting binding that reaches a raw parameter opens only through
+    /// its exact confirmed-T2 boundary receipt.
     ///
     /// `&mut T → *mut T` is an implicit coercion, so this compiles at exit 0
     /// and produces no counter movement at all (§5a, measured). The verify loop
-    /// cannot absorb it as a revert because there is nothing to absorb. If this
-    /// gate is wrong there is no compile-time backstop.
+    /// cannot absorb it as a revert because there is nothing to absorb. The
+    /// receipt assertions below are therefore load-bearing.
     ///
     /// *Mutation-tested (deletion first):* deleting the caller-side arm leaves
     /// `src::r` admissible and fails here — and it fails SILENTLY in
     /// production, which is the reason the witness exists.
     #[test]
-    fn a_converting_binding_into_a_raw_parameter_is_blocked_at_decision_time() {
-        let rows = census(&format!(
+    fn a_converting_binding_into_a_raw_parameter_opens_only_with_confirmed_t2_receipt() {
+        let source = format!(
             "{PRE}pub unsafe fn sink(p: *mut i32) -> usize {{ p as usize }}\n\
              pub unsafe fn src(r: *mut i32) -> usize {{ *r = 1; sink(r) }}\n"
-        ));
+        );
+        let rows = census(&source);
         let sink = row(&rows, "sink", 1);
         let src = row(&rows, "src", 1);
         assert_eq!(
@@ -4418,8 +4547,19 @@ mod coconv_witnesses {
             "`sink`'s parameter is `as`-cast, so it stays raw and is not a \
              node — if it converted, this fixture would witness nothing: {sink:?}"
         );
-        assert_eq!(src["node_block"], "flows-into-raw-param", "{src:?}");
-        assert_eq!(src["admissible"], "0", "{src:?}");
+        assert_eq!(src["node_block"], "-", "{src:?}");
+        assert_eq!(src["admissible"], "1", "{src:?}");
+        let trace = raw_trace(&source);
+        let receipts = tsv_rows(&trace.dispositions);
+        let receipt = raw_receipt(&receipts, "src::r#1");
+        assert_eq!(receipt["tier"], "T2", "{receipt:?}");
+        assert_eq!(receipt["template"], "ref-mut-to-raw-mut", "{receipt:?}");
+        assert_eq!(receipt["target_stays_raw"], "1", "{receipt:?}");
+        assert_eq!(
+            receipt["waiver_id"],
+            super::super::decision::raw_boundary::RAW_BOUNDARY_WAIVER_ID,
+            "{receipt:?}"
+        );
     }
 
     /// **A converting binding into a DIFFERENTLY-FORMED parameter is its own
@@ -4435,10 +4575,11 @@ mod coconv_witnesses {
     /// this read `flows-into-raw-param` and fails.
     #[test]
     fn a_binding_flowing_into_a_differently_formed_parameter_has_its_own_reason() {
-        let rows = census(&format!(
+        let source = format!(
             "{PRE}pub unsafe fn opty(o: *mut i32) -> i32 {{ if o.is_null() {{ 0 }} else {{ *o }} }}\n\
              pub unsafe fn feeder(r: *mut i32) -> i32 {{ *r = 1; opty(r) }}\n"
-        ));
+        );
+        let rows = census(&source);
         let o = row(&rows, "opty", 1);
         let r = row(&rows, "feeder", 1);
         assert_eq!(
@@ -4447,6 +4588,12 @@ mod coconv_witnesses {
              node — if it were a plain `Ref` this fixture witnesses nothing: {o:?}"
         );
         assert_eq!(r["node_block"], "flows-into-other-form", "{r:?}");
+        let trace = raw_trace(&source);
+        let receipts = tsv_rows(&trace.dispositions);
+        let receipt = raw_receipt(&receipts, "feeder::r#1");
+        assert_eq!(receipt["tier"], "T2", "{receipt:?}");
+        assert_eq!(receipt["target_stays_raw"], "0", "{receipt:?}");
+        assert_eq!(receipt["atom_group"], "-", "{receipt:?}");
     }
 
     /// **The PINNED population is excluded structurally, not in prose.**
@@ -4480,13 +4627,10 @@ mod coconv_witnesses {
         );
     }
 
-    /// **P1 — each escape shape blocks under its OWN reason.**
+    /// **P1 — non-boundary escape shapes block under their OWN reasons.**
     ///
-    /// Approved conservative reading (ruling 2026-08-10): a node whose
-    /// reference can leave through a return, a foreign call, a field store or
-    /// a `static mut` store is not safely convertible, and each gets its own
-    /// key so the population stays separately attributable and the scope is
-    /// reversible by ruling rather than by archaeology.
+    /// Return, field, and static stores remain conservative. Addendum 139
+    /// migrates only the exact foreign site carrying the asserted T2 receipt.
     ///
     /// **Paired with a non-escaping node in the same crate** — a gate that
     /// blocked everything would satisfy every positive case at once.
@@ -4494,7 +4638,7 @@ mod coconv_witnesses {
     /// *Mutation-tested (deletion first):* deleting the escape loop makes each
     /// of these read `-` and fails.
     #[test]
-    fn each_escape_shape_blocks_its_node_under_its_own_reason() {
+    fn escape_shapes_stay_conservative_except_the_receipted_foreign_boundary() {
         // One whole source per case: the shapes need different signatures, and
         // splicing a signature through a helper is how the first draft of this
         // fixture produced a crate that did not compile.
@@ -4529,7 +4673,23 @@ mod coconv_witnesses {
         ];
         for (sig, expected) in cases {
             let (blocked, beside) = case(sig);
-            assert_eq!(blocked, expected, "for {sig}");
+            if expected == "escapes-via-foreign-arg" {
+                assert_eq!(blocked, "-", "for {sig}");
+                let source = format!("{PRE}{HDR}{sig}");
+                let trace = raw_trace(&source);
+                let receipts = tsv_rows(&trace.dispositions);
+                let receipt = raw_receipt(&receipts, "subject::p#1");
+                assert_eq!(receipt["tier"], "T2", "{receipt:?}");
+                assert_eq!(receipt["template"], "ref-mut-to-raw-mut", "{receipt:?}");
+                assert_eq!(receipt["target_stays_raw"], "1", "{receipt:?}");
+                assert_eq!(
+                    receipt["waiver_id"],
+                    super::super::decision::raw_boundary::RAW_BOUNDARY_WAIVER_ID,
+                    "{receipt:?}"
+                );
+            } else {
+                assert_eq!(blocked, expected, "for {sig}");
+            }
             assert_eq!(
                 beside, "1",
                 "the non-escaping node beside it must stay admissible, or the \
@@ -4538,7 +4698,8 @@ mod coconv_witnesses {
         }
     }
 
-    /// **P1 — a BORROW of a converting binding into a raw parameter blocks.**
+    /// A BORROW of a converting binding into a raw parameter opens only at its
+    /// exact confirmed-T2 site.
     ///
     /// `f(&mut *r)` today reborrows a raw pointer; after `r` converts it
     /// reborrows a **reference**, so the raw pointer the callee retains can
@@ -4550,19 +4711,29 @@ mod coconv_witnesses {
     /// reborrow rather than the binding, so it forms no class edge and the
     /// owed repair differs.
     #[test]
-    fn a_borrow_of_a_converting_binding_into_a_raw_parameter_blocks() {
-        let rows = census(&format!(
+    fn a_borrow_into_a_raw_parameter_opens_only_with_confirmed_t2_receipt() {
+        let source = format!(
             "{PRE}pub unsafe fn sink(p: *mut i32) -> usize {{ p as usize }}\n\
              pub unsafe fn src(r: *mut i32) -> usize {{ *r = 1; sink(&mut *r) }}\n"
-        ));
+        );
+        let rows = census(&source);
         assert_eq!(
             row(&rows, "sink", 1)["class_id"],
             "-",
             "the callee parameter must stay raw, or the fixture witnesses nothing"
         );
+        assert_eq!(row(&rows, "src", 1)["node_block"], "-");
+        assert_eq!(row(&rows, "src", 1)["admissible"], "1");
+        let trace = raw_trace(&source);
+        let receipts = tsv_rows(&trace.dispositions);
+        let receipt = raw_receipt(&receipts, "src::r#1");
+        assert_eq!(receipt["tier"], "T2", "{receipt:?}");
+        assert_eq!(receipt["template"], "ref-mut-to-raw-mut", "{receipt:?}");
+        assert_eq!(receipt["target_stays_raw"], "1", "{receipt:?}");
         assert_eq!(
-            row(&rows, "src", 1)["node_block"],
-            "borrowed-into-raw-param"
+            receipt["waiver_id"],
+            super::super::decision::raw_boundary::RAW_BOUNDARY_WAIVER_ID,
+            "{receipt:?}"
         );
     }
 
@@ -6377,7 +6548,14 @@ fn e2_w6_lifetime_callee_keeps_adapter_one_evaluation() {
 /// is typed by E2 rather than disappearing behind the ordinary degradation.
 #[test]
 fn e2_n3_n4_external_and_field_rows_are_loudly_held() {
-    fn held(source: &str, suffix: &str) -> super::decision::lifetime::LifetimeFailure {
+    fn inspect(
+        source: &str,
+        suffix: &str,
+    ) -> (
+        &'static str,
+        super::decision::lifetime::LifetimeFailure,
+        String,
+    ) {
         let fixture = Fixture::new(&[("lib.rs", source)]);
         ::utils::compilation::run_compiler_on_path(&fixture.root(), |tcx| {
             let (table, ctx) = super::decide_table_with_ctx_config(
@@ -6395,33 +6573,59 @@ fn e2_n3_n4_external_and_field_rows_are_loudly_held() {
                 .iter()
                 .find(|(subject, _)| subject.label.ends_with(suffix))
                 .expect("held subject");
-            assert!(
-                matches!(decision, super::decision::Decision::Degraded(_)),
-                "held tranche emitted: {decision:#?}"
-            );
-            ctx.lifetime_eligibility
+            let disposition = match decision {
+                super::decision::Decision::Ref { .. } => "ref",
+                super::decision::Decision::InferredRef { .. } => "inferred-ref",
+                super::decision::Decision::Slice { .. } => "slice",
+                super::decision::Decision::Opt { .. } => "optional",
+                super::decision::Decision::Box(_) => "box",
+                super::decision::Decision::Degraded(_) => "degraded",
+            };
+            let failure = ctx
+                .lifetime_eligibility
                 .failure((subject.fn_did, subject.hir_id))
-                .expect("held row must carry an E2 failure")
+                .expect("row must retain its E2 analysis fact");
+            (
+                disposition,
+                failure,
+                ctx.raw_boundary_artifacts.dispositions.clone(),
+            )
         })
         .expect("E2-N3/N4 fixture compiles before rewriting")
     }
 
-    assert_eq!(
-        held(
-            "#![allow(dead_code, unused_unsafe)]\n\
-             unsafe extern \"C\" { fn retain(p: *const i32); }\n\
-             pub unsafe fn f(p: *const i32) { retain(p); }\n",
-            "f::p",
-        ),
-        super::decision::lifetime::LifetimeFailure::ExternalContractAbsent,
+    let (external_disposition, external_failure, external_receipts) = inspect(
+        "#![allow(dead_code, unused_unsafe)]\n\
+         unsafe extern \"C\" { fn retain(p: *const i32); }\n\
+         pub unsafe fn f(p: *const i32) { retain(p); }\n",
+        "f::p",
     );
+    assert_eq!(external_disposition, "ref");
     assert_eq!(
-        held(
-            "#![allow(dead_code, unused_unsafe)]\n\
-             pub struct Holder { pub p: *const i32 }\n\
-             pub unsafe fn f(h: *mut Holder, p: *const i32) { (*h).p = p; }\n",
-            "f::p",
-        ),
+        external_failure,
+        super::decision::lifetime::LifetimeFailure::ExternalContractAbsent,
+        "E2 analysis facts are frozen; only the final disposition moves"
+    );
+    assert!(
+        external_receipts.lines().skip(1).any(|line| {
+            let fields = line.split('\t').collect::<Vec<_>>();
+            fields.get(6) == Some(&"f::p#1")
+                && fields.get(10) == Some(&"T2")
+                && fields.get(11) == Some(&"ref-shared-to-raw-const")
+                && fields.get(12) == Some(&super::decision::raw_boundary::RAW_BOUNDARY_WAIVER_ID)
+        }),
+        "external disposition lacks its exact confirmed-T2 receipt: {external_receipts}"
+    );
+
+    let (field_disposition, field_failure, _) = inspect(
+        "#![allow(dead_code, unused_unsafe)]\n\
+         pub struct Holder { pub p: *const i32 }\n\
+         pub unsafe fn f(h: *mut Holder, p: *const i32) { (*h).p = p; }\n",
+        "f::p",
+    );
+    assert_eq!(field_disposition, "degraded");
+    assert_eq!(
+        field_failure,
         super::decision::lifetime::LifetimeFailure::FieldHeld,
     );
 }

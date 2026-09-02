@@ -5257,6 +5257,16 @@ pub(crate) fn coconv_tsv(tcx: TyCtxt<'_>) -> Result<String, String> {
     Ok(out)
 }
 
+/// Diagnostic-only view of the exact raw-boundary facts consumed by the final
+/// decision. It returns production's carried artifacts; it does not re-derive
+/// a site or read a control file.
+#[cfg(test)]
+pub(crate) fn raw_boundary_trace_artifacts(
+    tcx: TyCtxt<'_>,
+) -> Result<RawBoundaryArtifacts, String> {
+    decide_table_with_ctx(tcx).map(|(_, ctx)| ctx.raw_boundary_artifacts)
+}
+
 /// **S2-2 — the freed-slot kind census.**
 ///
 /// A leaked free's value kind is *observed, not designed* (backlog S2-2,

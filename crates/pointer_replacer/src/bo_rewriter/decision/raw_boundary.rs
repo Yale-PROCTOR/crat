@@ -1195,6 +1195,12 @@ pub(crate) enum RawBoundaryDisposition {
         reason: RawBoundaryBlockReason,
         detail: String,
     },
+    /// Another accepted emitter owns this exact site. It discharges the
+    /// boundary obligation without creating an Arm-A edit or atom.
+    OwnedByOtherArm {
+        owner: &'static str,
+        reason: &'static str,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -1221,23 +1227,67 @@ pub(crate) struct AddressViewSite {
 
 impl RawBoundaryDisposition {
     pub(crate) fn is_open(&self) -> bool {
-        matches!(self, Self::T1 { .. } | Self::T2 { .. })
+        match self {
+            Self::T1 { .. } | Self::T2 { .. } => true,
+            Self::Blocked { .. } | Self::OwnedByOtherArm { .. } => false,
+        }
+    }
+
+    fn is_handled(&self) -> bool {
+        match self {
+            Self::T1 { .. } | Self::T2 { .. } | Self::OwnedByOtherArm { .. } => true,
+            Self::Blocked { .. } => false,
+        }
     }
 
     pub(crate) fn tier(&self) -> &'static str {
         match self {
-            Self::T1 { .. } => "t1",
-            Self::T2 { .. } => "t2",
+            Self::T1 { .. } => "T1",
+            Self::T2 { .. } => "T2",
             Self::Blocked { .. } => "blocked",
+            Self::OwnedByOtherArm { owner: "box", .. } => "owned-by-box",
+            Self::OwnedByOtherArm { .. } => "owned-by-other-arm",
         }
     }
 
     pub(crate) fn template(&self) -> Option<BridgeTemplate> {
         match self {
             Self::T1 { template, .. } | Self::T2 { template, .. } => Some(*template),
-            Self::Blocked { .. } => None,
+            Self::Blocked { .. } | Self::OwnedByOtherArm { .. } => None,
         }
     }
+}
+
+fn box_site_owner(
+    decision: &super::Decision,
+    site: &RawBoundarySiteFact,
+) -> Option<(&'static str, &'static str)> {
+    let plan = match decision {
+        super::Decision::Box(plan) => plan,
+        super::Decision::Ref { .. }
+        | super::Decision::InferredRef { .. }
+        | super::Decision::Slice { .. }
+        | super::Decision::Opt { .. }
+        | super::Decision::Degraded(_) => return None,
+    };
+    let site_span = site.source_span.source_callsite();
+    if plan
+        .delete_statements
+        .iter()
+        .any(|span| span.source_callsite().contains(site_span))
+    {
+        return Some(("box", "box-initializer-consumed"));
+    }
+    plan.expr_edits.iter().find_map(|edit| {
+        edit.span.source_callsite().contains(site_span).then_some((
+            "box",
+            match edit.receipt {
+                "c-free-site-drop" => "box-lifecycle-owned",
+                "realloc-atomic" => "box-realloc-owned",
+                _ => "box-construction-owned",
+            },
+        ))
+    })
 }
 
 fn template_for(
@@ -1300,6 +1350,7 @@ pub(crate) struct RawBoundaryDispositionIndex {
     render_sites: BTreeMap<RawBoundarySiteKey, RawBoundaryRenderSite>,
     site_lookup: Vec<((LocalDefId, HirId), Span, usize, RawBoundarySiteKey)>,
     open_nodes: FxHashSet<(LocalDefId, HirId)>,
+    handled_nodes: FxHashSet<(LocalDefId, HirId)>,
     blocked_nodes: FxHashMap<(LocalDefId, HirId), RawBoundaryBlockReason>,
     address_sites: Vec<AddressViewSite>,
     certificate_replay_wall_s: f64,
@@ -1319,7 +1370,8 @@ impl RawBoundaryDispositionIndex {
             .collect::<FxHashMap<_, _>>();
         let mut out = Self::default();
         let mut certificate_replay_wall_s = 0.0f64;
-        let mut nodes = FxHashMap::<(LocalDefId, HirId), Vec<bool>>::default();
+        let mut open_nodes = FxHashMap::<(LocalDefId, HirId), Vec<bool>>::default();
+        let mut handled_nodes = FxHashMap::<(LocalDefId, HirId), Vec<bool>>::default();
         for site in &site_facts.sites {
             let disposition: Result<RawBoundaryDisposition, (RawBoundaryBlockReason, String)> =
                 (|| {
@@ -1335,6 +1387,9 @@ impl RawBoundaryDispositionIndex {
                             "hypothetical has no safe subject decision".to_owned(),
                         )
                     })?;
+                    if let Some((owner, reason)) = box_site_owner(decision, site) {
+                        return Ok(RawBoundaryDisposition::OwnedByOtherArm { owner, reason });
+                    }
                     let contract = super::raw_boundary_contracts::classify_contract(
                         &site.key.callee,
                         site.key.argument_index,
@@ -1429,12 +1484,13 @@ impl RawBoundaryDispositionIndex {
             let box_slice = site
                 .node
                 .and_then(|node| decisions.get(&node).map(|(_, decision)| *decision))
-                .is_some_and(|decision| {
-                    matches!(
-                        decision,
-                        super::Decision::Box(plan)
-                            if plan.shape == super::box_facts::BoxShape::Slice
-                    )
+                .is_some_and(|decision| match decision {
+                    super::Decision::Box(plan) => plan.shape == super::box_facts::BoxShape::Slice,
+                    super::Decision::Ref { .. }
+                    | super::Decision::InferredRef { .. }
+                    | super::Decision::Slice { .. }
+                    | super::Decision::Opt { .. }
+                    | super::Decision::Degraded(_) => false,
                 });
             let target_stays_raw = site.callee_local.is_none_or(|callee| {
                 hypothetical
@@ -1445,7 +1501,14 @@ impl RawBoundaryDispositionIndex {
                             return None;
                         };
                         (subject.fn_did == callee && hir_index == site.key.argument_index)
-                            .then_some(matches!(decision, super::Decision::Degraded(_)))
+                            .then_some(match decision {
+                                super::Decision::Degraded(_) => true,
+                                super::Decision::Ref { .. }
+                                | super::Decision::InferredRef { .. }
+                                | super::Decision::Slice { .. }
+                                | super::Decision::Opt { .. }
+                                | super::Decision::Box(_) => false,
+                            })
                     })
                     .unwrap_or(true)
             });
@@ -1469,7 +1532,13 @@ impl RawBoundaryDispositionIndex {
                 },
             );
             if let Some(node) = site.node {
-                nodes.entry(node).or_default().push(disposition.is_open());
+                let opens_arm_a = disposition.is_open() && target_stays_raw;
+                let handled = match &disposition {
+                    RawBoundaryDisposition::OwnedByOtherArm { .. } => true,
+                    _ => disposition.is_handled() && target_stays_raw,
+                };
+                open_nodes.entry(node).or_default().push(opens_arm_a);
+                handled_nodes.entry(node).or_default().push(handled);
                 out.site_lookup.push((
                     node,
                     site.source_span.source_callsite(),
@@ -1484,15 +1553,21 @@ impl RawBoundaryDispositionIndex {
         }
         for failure in &site_facts.failures {
             if let Some(node) = failure.node {
-                nodes.entry(node).or_default().push(false);
+                open_nodes.entry(node).or_default().push(false);
+                handled_nodes.entry(node).or_default().push(false);
                 out.blocked_nodes
                     .entry(node)
                     .or_insert(RawBoundaryBlockReason::SiteUnresolved);
             }
         }
-        for (node, verdicts) in nodes {
+        for (node, verdicts) in open_nodes {
             if !verdicts.is_empty() && verdicts.into_iter().all(|open| open) {
                 out.open_nodes.insert(node);
+            }
+        }
+        for (node, verdicts) in handled_nodes {
+            if !verdicts.is_empty() && verdicts.into_iter().all(|handled| handled) {
+                out.handled_nodes.insert(node);
             }
         }
         for observation in &emitability.address_observations {
@@ -1586,13 +1661,13 @@ impl RawBoundaryDispositionIndex {
 
     pub(crate) fn receipts_tsv(&self) -> String {
         let mut out = String::from(
-            "caller\tblock\tstatement_index\tcallee\targument_index\tsubject\tsubject_identity\tsource_site\ttier\ttemplate\twaiver_id\tevidence\treason\tdetail\tatom_group\n",
+            "caller\tblock\tstatement_index\tcallee\targument_index\tsubject\tsubject_identity\tsource_site\ttarget_stays_raw\tsite_owner\ttier\ttemplate\twaiver_id\tevidence\treason\tdetail\tatom_group\n",
         );
         let atom_groups = self.subject_atom_groups();
         for (key, disposition) in &self.by_site {
-            let (template, waiver, evidence, reason, detail) = match disposition {
+            let (template, waiver, evidence, reason, detail, site_owner) = match disposition {
                 RawBoundaryDisposition::T1 { template, evidence } => {
-                    (template.key(), "-", evidence.as_str(), "-", "-")
+                    (template.key(), "-", evidence.as_str(), "-", "-", "arm-a")
                 }
                 RawBoundaryDisposition::T2 {
                     template,
@@ -1604,9 +1679,13 @@ impl RawBoundaryDispositionIndex {
                     "retention-unknown",
                     reason.key(),
                     "-",
+                    "arm-a",
                 ),
                 RawBoundaryDisposition::Blocked { reason, detail } => {
-                    ("-", "-", "-", reason.key(), detail.as_str())
+                    ("-", "-", "-", reason.key(), detail.as_str(), "blocked")
+                }
+                RawBoundaryDisposition::OwnedByOtherArm { owner, reason } => {
+                    ("-", "-", "-", *reason, "-", *owner)
                 }
             };
             let render = self.render_sites.get(key);
@@ -1625,7 +1704,7 @@ impl RawBoundaryDispositionIndex {
                 .filter(|group| !group.is_empty())
                 .unwrap_or_else(|| "-".to_owned());
             out.push_str(&format!(
-                "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+                "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
                 key.caller,
                 key.block,
                 key.statement_index,
@@ -1634,6 +1713,8 @@ impl RawBoundaryDispositionIndex {
                 key.subject,
                 subject_identity,
                 render.map_or("-", |site| site.source_site.as_str()),
+                render.map_or("-", |site| if site.target_stays_raw { "1" } else { "0" }),
+                site_owner,
                 disposition.tier(),
                 template,
                 waiver,
@@ -1725,6 +1806,17 @@ impl RawBoundaryDispositionIndex {
         self.open_nodes.contains(&node)
     }
 
+    fn handles_site(&self, key: &RawBoundarySiteKey) -> bool {
+        match self.by_site.get(key) {
+            Some(RawBoundaryDisposition::OwnedByOtherArm { .. }) => true,
+            Some(RawBoundaryDisposition::T1 { .. } | RawBoundaryDisposition::T2 { .. }) => self
+                .render_sites
+                .get(key)
+                .is_some_and(|site| site.target_stays_raw),
+            Some(RawBoundaryDisposition::Blocked { .. }) | None => false,
+        }
+    }
+
     pub(crate) fn node_dispositions(
         &self,
         node: (LocalDefId, HirId),
@@ -1744,17 +1836,14 @@ impl RawBoundaryDispositionIndex {
 
     pub(crate) fn opens_span(&self, node: (LocalDefId, HirId), span: Span) -> bool {
         let span = span.source_callsite();
-        self.opens_node(node)
+        self.handled_nodes.contains(&node)
             && self
                 .site_lookup
                 .iter()
                 .any(|(candidate, site_span, _, key)| {
                     *candidate == node
                         && (site_span.contains(span) || span.contains(*site_span))
-                        && self
-                            .by_site
-                            .get(key)
-                            .is_some_and(RawBoundaryDisposition::is_open)
+                        && self.handles_site(key)
                 })
     }
 
@@ -1765,7 +1854,7 @@ impl RawBoundaryDispositionIndex {
         argument_index: usize,
     ) -> bool {
         let span = span.source_callsite();
-        self.opens_node(node)
+        self.handled_nodes.contains(&node)
             && self
                 .site_lookup
                 .iter()
@@ -1773,10 +1862,7 @@ impl RawBoundaryDispositionIndex {
                     *candidate == node
                         && *index == argument_index
                         && (site_span.contains(span) || span.contains(*site_span))
-                        && self
-                            .by_site
-                            .get(key)
-                            .is_some_and(RawBoundaryDisposition::is_open)
+                        && self.handles_site(key)
                 })
     }
 
