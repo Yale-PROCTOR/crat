@@ -1385,6 +1385,7 @@ pub(crate) struct RawBoundaryDispositionIndex {
     open_nodes: FxHashSet<(LocalDefId, HirId)>,
     handled_nodes: FxHashSet<(LocalDefId, HirId)>,
     blocked_nodes: FxHashMap<(LocalDefId, HirId), RawBoundaryBlockReason>,
+    address_open_nodes: FxHashSet<(LocalDefId, HirId)>,
     address_sites: Vec<AddressViewSite>,
     certificate_replay_wall_s: f64,
 }
@@ -1608,11 +1609,11 @@ impl RawBoundaryDispositionIndex {
             }
         }
         for observation in &emitability.address_observations {
-            if observation.operands.len() != 2
-                || !observation
-                    .operands
-                    .iter()
-                    .all(|operand| out.open_nodes.contains(&operand.node))
+            if observation.operands.is_empty()
+                || !observation.operands.iter().all(|operand| {
+                    emitability.address_use_class(operand.node)
+                        == super::emitability::AddressUseClass::ValueOnly
+                })
             {
                 continue;
             }
@@ -1643,6 +1644,7 @@ impl RawBoundaryDispositionIndex {
                     target,
                     op: observation.op,
                 });
+                out.address_open_nodes.insert(operand.node);
             }
         }
         out.address_sites.sort_by_key(|site| {
@@ -1766,6 +1768,29 @@ impl RawBoundaryDispositionIndex {
 
     pub(crate) fn address_sites(&self) -> &[AddressViewSite] {
         &self.address_sites
+    }
+
+    pub(crate) fn opens_address(&self, node: (LocalDefId, HirId)) -> bool {
+        self.address_open_nodes.contains(&node)
+    }
+
+    pub(crate) fn addresses_tsv(&self, tcx: TyCtxt<'_>) -> String {
+        let mut out = String::from(
+            "owner\tlocal_def_index\thir_local_id\tsite\top\ttemplate\ttarget_mutability\tuse_class\n",
+        );
+        for site in &self.address_sites {
+            out.push_str(&format!(
+                "{}\t{}\t{}\t{}\t{}\t{}\t{}\tvalue-only\n",
+                site.owner,
+                site.node.0.local_def_index.as_u32(),
+                site.node.1.local_id.as_u32(),
+                super::emitability::EmitabilityFacts::site(tcx, site.span),
+                site.op,
+                site.template.key(),
+                site.target.mutability.key(),
+            ));
+        }
+        out
     }
 
     pub(crate) fn certificate_replay_wall_s(&self) -> f64 {

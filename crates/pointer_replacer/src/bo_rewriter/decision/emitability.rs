@@ -309,6 +309,25 @@ pub(crate) struct AddressObservationFact {
     pub operands: Vec<AddressOperand>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AddressUseClass {
+    ValueOnly,
+    AccessOnly,
+    Both,
+    Neither,
+}
+
+impl AddressUseClass {
+    pub(crate) fn key(self) -> &'static str {
+        match self {
+            Self::ValueOnly => "value-only",
+            Self::AccessOnly => "access-only",
+            Self::Both => "both",
+            Self::Neither => "neither",
+        }
+    }
+}
+
 const WAVE2_BODY_FUNCTIONS: &[&str] = &[
     "src::enc::backward_references_hq::BrotliZopfliCreateCommands",
     "src::enc::block_splitter::BrotliSplitBlock",
@@ -545,10 +564,47 @@ impl<'tcx> Visitor<'tcx> for BodyFacts<'_, 'tcx> {
         }
         match &expr.kind {
             // (1) raw-pointer-only method on a local
-            ExprKind::MethodCall(segment, receiver, _, _) => {
+            ExprKind::MethodCall(segment, receiver, args, _) => {
                 let method = segment.ident.name.to_string();
-                if RAW_ONLY_METHODS.contains(&method.as_str())
-                    && let Some(hir_id) = Self::resolved_local(receiver)
+                let receiver_node = Self::resolved_local(receiver).map(|hir| (self.fn_did, hir));
+                if matches!(method.as_str(), "addr")
+                    && let Some(node) = receiver_node
+                {
+                    self.facts
+                        .address_observations
+                        .push(AddressObservationFact {
+                            owner: self.fn_did,
+                            span: expr.span,
+                            op: "ptr-to-int",
+                            operands: vec![AddressOperand {
+                                node,
+                                span: receiver.span,
+                            }],
+                        });
+                } else if method == "offset_from"
+                    && let Some(left) = receiver_node
+                    && let [right] = args
+                    && let Some(right_hir) = Self::resolved_local(right)
+                {
+                    self.facts
+                        .address_observations
+                        .push(AddressObservationFact {
+                            owner: self.fn_did,
+                            span: expr.span,
+                            op: "difference",
+                            operands: vec![
+                                AddressOperand {
+                                    node: left,
+                                    span: receiver.span,
+                                },
+                                AddressOperand {
+                                    node: (self.fn_did, right_hir),
+                                    span: right.span,
+                                },
+                            ],
+                        });
+                } else if RAW_ONLY_METHODS.contains(&method.as_str())
+                    && let Some((_, hir_id)) = receiver_node
                 {
                     self.facts
                         .raw_only_uses
@@ -708,14 +764,38 @@ impl<'tcx> Visitor<'tcx> for BodyFacts<'_, 'tcx> {
                     }
                 }
             }
-            // (3) a cast of a local to a raw pointer or integer keeps it raw
+            // (3) pointer-to-integer is a terminal value observation; every
+            // other cast remains raw-only. Integer-to-pointer never enters the
+            // address arm because its source is not a raw-pointer local.
             ExprKind::Cast(inner, _) => {
                 if let Some(hir_id) = Self::resolved_local(inner) {
-                    self.facts
-                        .raw_only_uses
-                        .entry((self.fn_did, hir_id))
-                        .or_default()
-                        .push(("as-cast".to_owned(), expr.span));
+                    let typeck = self.tcx.typeck(self.fn_did);
+                    let pointer_to_integer = matches!(
+                        typeck.expr_ty(inner).kind(),
+                        rustc_middle::ty::TyKind::RawPtr(..)
+                    ) && matches!(
+                        typeck.expr_ty(expr).kind(),
+                        rustc_middle::ty::TyKind::Int(_) | rustc_middle::ty::TyKind::Uint(_)
+                    );
+                    if pointer_to_integer {
+                        self.facts
+                            .address_observations
+                            .push(AddressObservationFact {
+                                owner: self.fn_did,
+                                span: expr.span,
+                                op: "ptr-to-int",
+                                operands: vec![AddressOperand {
+                                    node: (self.fn_did, hir_id),
+                                    span: inner.span,
+                                }],
+                            });
+                    } else {
+                        self.facts
+                            .raw_only_uses
+                            .entry((self.fn_did, hir_id))
+                            .or_default()
+                            .push(("as-cast".to_owned(), expr.span));
+                    }
                 }
             }
             _ => {}
@@ -771,6 +851,20 @@ impl EmitabilityFacts {
                 .iter()
                 .any(|operand| operand.node == node)
         })
+    }
+
+    pub(crate) fn address_use_class(&self, node: (LocalDefId, HirId)) -> AddressUseClass {
+        let value = self.is_value_observation_candidate(node);
+        let access = self.raw_only_uses.get(&node).is_some_and(|uses| {
+            uses.iter()
+                .any(|(op, _)| !matches!(op.as_str(), "is_null" | "addr" | "offset_from"))
+        });
+        match (value, access) {
+            (true, false) => AddressUseClass::ValueOnly,
+            (false, true) => AddressUseClass::AccessOnly,
+            (true, true) => AddressUseClass::Both,
+            (false, false) => AddressUseClass::Neither,
+        }
     }
 }
 

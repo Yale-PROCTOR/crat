@@ -1284,7 +1284,7 @@ fn decide_one_ladder(ctx: &Ctx<'_, '_>, subject: &Subject) -> Decision {
         let address_candidate = facts.is_value_observation_candidate(node);
         let address_open = address_candidate
             && (coconv.is_none()
-                || raw_boundary.is_some_and(|raw_boundary| raw_boundary.opens_node(node)));
+                || raw_boundary.is_some_and(|raw_boundary| raw_boundary.opens_address(node)));
         if !address_open {
             return degrade(
                 subject,
