@@ -434,16 +434,6 @@ fn resolve_pair_roles(
     roles
 }
 
-#[cfg(test)]
-fn resolve_pair_roles_for_test(
-    entries: &[(usize, usize, A5SiteProofVerdict, bool)],
-) -> Vec<&'static str> {
-    resolve_pair_roles(entries)
-        .into_values()
-        .map(PairRole::key)
-        .collect()
-}
-
 /// The finished class structure. **Measurement at task 2; the gate at task 3.**
 #[derive(Clone, Debug, Default)]
 pub(crate) struct CoConv {
@@ -1639,6 +1629,15 @@ mod e2_return_permit_tests {
 #[cfg(test)]
 mod pair_plan_tests {
     use super::{super::a5_site_proof::A5SiteProofVerdict, *};
+
+    fn resolve_pair_roles_for_test(
+        entries: &[(usize, usize, A5SiteProofVerdict, bool)],
+    ) -> Vec<&'static str> {
+        resolve_pair_roles(entries)
+            .into_values()
+            .map(PairRole::key)
+            .collect()
+    }
 
     #[test]
     fn pair_w1_clear_component_keeps_every_position_safe() {
