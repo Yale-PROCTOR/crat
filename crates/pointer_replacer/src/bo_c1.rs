@@ -18627,6 +18627,130 @@ impl ParsedTsv {
 }
 
 #[derive(Clone, Debug)]
+struct RawBoundaryExposureMarketReconciliation {
+    control_functions: usize,
+    control_fnptr_web: usize,
+    matched: usize,
+    divergences: String,
+    projection: String,
+}
+
+fn reconcile_raw_boundary_exposure_market(
+    control: &str,
+    production: &[(String, String)],
+) -> Result<RawBoundaryExposureMarketReconciliation, String> {
+    let control = ParsedTsv::parse(control)?;
+    let mut expected = std::collections::BTreeMap::<(String, String), bool>::new();
+    for row in &control.rows {
+        let key = (
+            control.field(row, "program")?.to_owned(),
+            control.field(row, "owner_fn")?.to_owned(),
+        );
+        let fnptr = match control.field(row, "fnptr_web")? {
+            "0" => false,
+            "1" => true,
+            value => return Err(format!("exposure control fnptr_web={value:?}")),
+        };
+        if expected.insert(key.clone(), fnptr).is_some() {
+            return Err(format!("duplicate exposure control identity {key:?}"));
+        }
+    }
+
+    let mut observed = std::collections::BTreeMap::<
+        (String, String),
+        std::collections::BTreeMap<String, String>,
+    >::new();
+    for (program, text) in production {
+        let table = ParsedTsv::parse(text)?;
+        for row in &table.rows {
+            let row_program = table.field(row, "program")?;
+            if row_program != program {
+                return Err(format!(
+                    "exposure receipt program mismatch: {row_program} != {program}"
+                ));
+            }
+            let function = table.field(row, "function")?.to_owned();
+            let fields = table
+                .columns
+                .iter()
+                .map(|(name, &index)| (name.clone(), row[index].clone()))
+                .collect();
+            let key = (program.clone(), function);
+            if observed.insert(key.clone(), fields).is_some() {
+                return Err(format!("duplicate exposure production identity {key:?}"));
+            }
+        }
+    }
+
+    let mut matched = 0usize;
+    let mut divergences = String::from("program\tfunction\tkind\texpected\tobserved\n");
+    let mut projection = String::from(
+        "program\tfunction\tconfigured_name\taddress_taken\tseed_provenance\tfnptr_web\tsurface_plan\tconfigured_input_sha256\tseed_manifest_sha256\n",
+    );
+    for (key, expected_fnptr) in &expected {
+        let Some(row) = observed.get(key) else {
+            divergences.push_str(&format!(
+                "{}\t{}\tmissing-production\tpresent\tmissing\n",
+                key.0, key.1
+            ));
+            continue;
+        };
+        let observed_fnptr = row.get("fnptr_web").map(String::as_str);
+        let expected_fnptr = if *expected_fnptr { "1" } else { "0" };
+        if observed_fnptr != Some(expected_fnptr) {
+            divergences.push_str(&format!(
+                "{}\t{}\tfnptr-web\t{}\t{}\n",
+                key.0,
+                key.1,
+                expected_fnptr,
+                observed_fnptr.unwrap_or("missing")
+            ));
+            continue;
+        }
+        matched += 1;
+        projection.push_str(&format!(
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+            key.0,
+            key.1,
+            row.get("configured_name").map_or("missing", String::as_str),
+            row.get("address_taken").map_or("missing", String::as_str),
+            row.get("seed_provenance").map_or("missing", String::as_str),
+            observed_fnptr.unwrap_or("missing"),
+            row.get("surface_plan").map_or("missing", String::as_str),
+            row.get("configured_input_sha256")
+                .map_or("missing", String::as_str),
+            row.get("seed_manifest_sha256")
+                .map_or("missing", String::as_str),
+        ));
+    }
+    Ok(RawBoundaryExposureMarketReconciliation {
+        control_functions: expected.len(),
+        control_fnptr_web: expected.values().filter(|&&value| value).count(),
+        matched,
+        divergences,
+        projection,
+    })
+}
+
+#[test]
+fn raw_boundary_exposure_market_projection_is_identity_exact_and_multi_source() {
+    let control = "program\towner_fn\tfnptr_web\n\
+                   p\ta::f\t0\n\
+                   p\tb::g\t1\n";
+    let production = "corpus\tprogram\tfunction\tconfigured_name\taddress_taken\tseed_provenance\tfnptr_web\tsurface_plan\tconfigured_input_sha256\tseed_manifest_sha256\n\
+                      rs-crown\tp\ta::f\t1\t0\tconfigured-name\t0\tpositive-seed-entry-shim\tc\tm\n\
+                      rs-crown\tp\tb::g\t0\t1\taddress-taken\t1\tpositive-seed-entry-shim\tc\tm\n";
+    let result =
+        reconcile_raw_boundary_exposure_market(control, &[("p".to_owned(), production.to_owned())])
+            .expect("exposure market reconciliation");
+    assert_eq!(result.control_functions, 2);
+    assert_eq!(result.control_fnptr_web, 1);
+    assert_eq!(result.matched, 2);
+    assert_eq!(result.divergences.lines().count(), 1);
+    assert_eq!(result.projection.lines().count(), 3);
+}
+
+#[derive(Clone, Debug)]
 struct RawBoundaryControlReconciliation {
     libc_subjects: usize,
     libc_edges: usize,
