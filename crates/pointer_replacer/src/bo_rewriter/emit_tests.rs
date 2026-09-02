@@ -4437,14 +4437,14 @@ mod coconv_witnesses {
         );
     }
 
-    /// **One blocked member blocks the whole class.**
+    /// **D4-W1 — one blocked member no longer blocks a clean sibling.**
     ///
     /// `g21_dirty::q` supplies both aliased positions, so the edge pulls it
     /// into the blocked component. Its own arguments are unobjectionable; it is
     /// blocked by transitivity, which is the property that makes a class the
     /// unit of decision.
     #[test]
-    fn one_blocked_member_blocks_the_class_through_the_edge() {
+    fn d4_w1_blocked_member_does_not_block_clean_sibling() {
         // TWO call sites of one callee: `via` supplies a clean bare local, and
         // `nulls` supplies a null literal. The null blocks `t::p`, and `via::x`
         // — whose own argument is unobjectionable — is blocked with it.
@@ -4461,13 +4461,33 @@ mod coconv_witnesses {
         let x = row(&rows, "via", 1);
         assert_eq!(p["class_id"], x["class_id"], "{p:?} vs {x:?}");
         assert_eq!(p["node_block"], "arg-null-literal", "{p:?}");
-        assert_eq!(x["admissible"], "0", "{x:?}");
+        assert_eq!(p["member_admissible"], "0", "{p:?}");
+        assert_eq!(x["member_admissible"], "1", "{x:?}");
+        assert_eq!(x["edge_routes"], "arm-a", "{x:?}");
         assert_eq!(
             x["node_block"], "-",
-            "`x` contributes NO blocking argument of its own — it is blocked by \
-             transitivity, and a census that reported otherwise could not name \
-             the member responsible: {x:?}"
+            "`x` contributes no blocker of its own and must decide independently: {x:?}"
         );
+    }
+
+    /// D4-W2 — every directed edge gets a typed route rather than inheriting a
+    /// class-wide verdict. The ordinary chain is zero-syntax; the optional
+    /// target is GLUE territory rather than a reason to demote its safe source.
+    #[test]
+    fn d4_w2_directed_edges_name_zero_and_glue_routes() {
+        let zero = census(&format!(
+            "{PRE}pub unsafe fn target(p: *mut i32) {{ *p = 1; }}\n\
+             pub unsafe fn caller(q: *mut i32) {{ target(q); }}\n"
+        ));
+        assert_eq!(row(&zero, "caller", 1)["edge_routes"], "zero-syntax");
+
+        let glue = census(&format!(
+            "{PRE}pub unsafe fn optional(p: *mut i32) -> i32 {{ if p.is_null() {{ 0 }} else {{ *p }} }}\n\
+             pub unsafe fn caller(q: *mut i32) -> i32 {{ *q = 1; optional(q) }}\n"
+        ));
+        let q = row(&glue, "caller", 1);
+        assert_eq!(q["member_admissible"], "1", "{q:?}");
+        assert_eq!(q["edge_routes"], "glue", "{q:?}");
     }
 
     /// **The argument-shape table, one fixture per blocking shape — and a
