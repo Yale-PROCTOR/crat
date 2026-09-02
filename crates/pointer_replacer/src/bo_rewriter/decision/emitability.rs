@@ -868,6 +868,32 @@ impl EmitabilityFacts {
     }
 }
 
+#[cfg(test)]
+mod address_use_tests {
+    use rustc_hir::{CRATE_HIR_ID, def_id::CRATE_DEF_ID};
+
+    use super::*;
+
+    #[test]
+    fn addr_n1_value_and_access_is_both_never_value_only() {
+        let node = (CRATE_DEF_ID, CRATE_HIR_ID);
+        let mut facts = EmitabilityFacts::default();
+        facts.address_observations.push(AddressObservationFact {
+            owner: CRATE_DEF_ID,
+            span: rustc_span::DUMMY_SP,
+            op: "ptr-to-int",
+            operands: vec![AddressOperand {
+                node,
+                span: rustc_span::DUMMY_SP,
+            }],
+        });
+        facts
+            .raw_only_uses
+            .insert(node, vec![("offset".to_owned(), rustc_span::DUMMY_SP)]);
+        assert_eq!(facts.address_use_class(node), AddressUseClass::Both);
+    }
+}
+
 /// The arithmetic ops a borrowed-slice form can absorb.
 ///
 /// A strict subset of [`RAW_ONLY_METHODS`], and deliberately narrower than the

@@ -20382,6 +20382,29 @@ fn raw_boundary_census_schema_renamed_identifier_is_a_compile_error() {
     );
 }
 
+fn reconcile_wave2_identity_sets(
+    control: &std::collections::BTreeSet<String>,
+    production: &std::collections::BTreeSet<String>,
+) -> Result<(), String> {
+    let missing = control.difference(production).cloned().collect::<Vec<_>>();
+    let extra = production.difference(control).cloned().collect::<Vec<_>>();
+    if missing.is_empty() && extra.is_empty() {
+        Ok(())
+    } else {
+        Err(format!("missing={missing:?};extra={extra:?}"))
+    }
+}
+
+#[test]
+fn wave2_identity_gate_is_bidirectional_and_rejects_an_omitted_control_row() {
+    let control = ["a".to_owned(), "b".to_owned()].into_iter().collect();
+    let exact = ["a".to_owned(), "b".to_owned()].into_iter().collect();
+    let omitted = ["a".to_owned()].into_iter().collect();
+    assert_eq!(reconcile_wave2_identity_sets(&control, &exact), Ok(()));
+    assert!(reconcile_wave2_identity_sets(&control, &omitted).is_err());
+    assert!(reconcile_wave2_identity_sets(&omitted, &control).is_err());
+}
+
 #[test]
 fn raw_boundary_cache_only_unknown_fingerprint_refuses_before_solver() {
     use std::sync::atomic::{AtomicUsize, Ordering};
