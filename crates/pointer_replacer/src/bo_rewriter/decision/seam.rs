@@ -94,6 +94,10 @@ pub(crate) enum SeamBlock {
     /// The argument's expression is not one this slice can name — a bare cast, a
     /// null literal, a call result, arithmetic.
     UnnameableOperand,
+    /// An optional source cannot satisfy a required target without a positive
+    /// non-null/nonempty proof. Wave 2 has no such proof at this seam, so it
+    /// never inserts an unchecked or panicking unwrap.
+    NullabilityInsufficient,
     /// Two positions at one call site may borrow the same place, and at least
     /// one wants `&mut`. **The gate applies to adapter-generated arguments
     /// exactly as to converted ones** (ruling item 3, 2026-08-11): glue may not
@@ -108,6 +112,7 @@ impl SeamBlock {
             SeamBlock::LengthUnknown => "seam-len-unknown",
             SeamBlock::SharedToMut => "seam-shared-to-mut",
             SeamBlock::UnnameableOperand => "seam-unnameable-operand",
+            SeamBlock::NullabilityInsufficient => "glue-nullability-insufficient",
             SeamBlock::SiteOverlap => "seam-site-overlap",
         }
     }
@@ -1109,54 +1114,15 @@ pub(crate) fn glue(
             ))
         }
 
-        // ---- the null-panic convention (-3), inherited rather than reinvented ----
-        //
-        // `-3` settled that an optional subject's null case PANICS rather than
-        // being silently dropped. `.unwrap()` is that same contract at the seam,
-        // and citing it is the point: a seam that chose its own null behaviour
-        // would give one program two answers to the same question.
-        (Ref { mutable: w }, Opt { mutable: h, slice }) => {
-            if shared_to_mut(w, h) {
-                return Err(SeamBlock::SharedToMut);
-            }
-            let core = if slice {
-                GlueCore::Index0
-            } else {
-                GlueCore::Bare
-            };
-            Some((GlueSpec::core(core, w).with_unwrap(h), SeamFamily::Safe))
+        // Optional-to-required conversion needs positive non-null/nonempty
+        // evidence. None is carried at this seam in wave 2, so both thin and
+        // fat forms fail closed and no unwrap is synthesized.
+        (Ref { .. } | Slice { .. }, Opt { .. }) => {
+            return Err(SeamBlock::NullabilityInsufficient);
         }
-        (Slice { mutable: w }, Opt { mutable: h, slice }) => {
-            if shared_to_mut(w, h) {
-                return Err(SeamBlock::SharedToMut);
-            }
-            let core = if slice {
-                GlueCore::Bare
-            } else {
-                GlueCore::FromRefMut
-            };
-            Some((GlueSpec::core(core, w).with_unwrap(h), SeamFamily::Safe))
-        }
-        (
-            Opt {
-                mutable: w,
-                slice: ws,
-            },
-            Opt { mutable: h, .. },
-        ) => {
-            // Differing fat/thin twins: unwrap, adjust, re-wrap.
-            if shared_to_mut(w, h) {
-                return Err(SeamBlock::SharedToMut);
-            }
-            let core = if ws {
-                GlueCore::FromRefMut
-            } else {
-                GlueCore::Index0
-            };
-            Some((
-                GlueSpec::core(core, w).with_unwrap(h).wrapped(),
-                SeamFamily::Safe,
-            ))
+        (Opt { slice: ws, .. }, Opt { slice: hs, .. }) => {
+            debug_assert_ne!(ws, hs, "identical optional twins matched above");
+            return Err(SeamBlock::NullabilityInsufficient);
         }
 
         // A raw position needs no adapter: `&mut T` coerces to `*mut T` at a
@@ -1370,7 +1336,7 @@ mod tests {
                     slice: false
                 }
             ),
-            Err(SeamBlock::SharedToMut)
+            Err(SeamBlock::NullabilityInsufficient)
         );
     }
 
@@ -2102,15 +2068,14 @@ mod tests {
                 }
             }
         }
-        // **THE EXACT CARDINALITY, not a floor.** This read `>= 14`, which is
-        // the RED-weakening shape: an entire arm can stop emitting — the
-        // `Opt`/`Opt` arm alone is 6 of these pairs — while a floor of 14 stays
-        // green. 44 is derived from the 9×9 product minus the identity/coercion
-        // arms and the `SharedToMut` blocks, and it is pinned so a lost arm
-        // fails HERE rather than showing up as a quiet corpus movement.
+        // **THE EXACT CARDINALITY, not a floor.** Wave 2 deliberately removes
+        // every optional-to-required and cross-shape optional arm that needed
+        // an unwrap without positive evidence. The remaining safe matrix has
+        // 26 emitting cells; pinning it makes both an accidental reopening and
+        // an accidental lost arm fail here rather than in the corpus.
         assert_eq!(
             out.len(),
-            44,
+            26,
             "the product must reach every emitting arm exactly; got {}",
             out.len()
         );
