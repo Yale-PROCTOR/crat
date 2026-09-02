@@ -44,7 +44,7 @@ pub(crate) struct SubjectAtomKey {
     pub owner: String,
 }
 
-fn site_atom_id(key: &RawBoundarySiteKey) -> String {
+pub(crate) fn site_atom_id(key: &RawBoundarySiteKey) -> String {
     format!(
         "raw-boundary-site:{}:{}:{}:{}:{}:{}",
         key.caller,

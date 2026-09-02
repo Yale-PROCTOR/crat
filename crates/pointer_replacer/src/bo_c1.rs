@@ -106,6 +106,27 @@ struct StandingCensusLaunchRecipe {
 }
 
 impl StandingCensusLaunchRecipe {
+    /// Resolve one registered corpus program through the recipe-owned file
+    /// map.  Callers hand this either the selected substrate root (two-root
+    /// checks) or the workspace root (ordinary launches); no representative
+    /// may guess `lib.rs`.
+    fn program_file(
+        self,
+        corpus_root: &std::path::Path,
+        program: CorpusProgram,
+    ) -> std::path::PathBuf {
+        let _ = self;
+        corpus_root.join(program.name).join(program.lib_root)
+    }
+
+    fn workspace_program_file(
+        self,
+        workspace_root: &std::path::Path,
+        program: CorpusProgram,
+    ) -> std::path::PathBuf {
+        self.program_file(&workspace_root.join(substrate_dir()), program)
+    }
+
     fn common_child_env(self, cache_dir: &std::path::Path) -> Vec<(&'static str, String)> {
         vec![
             ("CRAT_BO_CACHE", "1".to_owned()),
@@ -19148,8 +19169,13 @@ fn raw_boundary_wave1_preflight() {
     let root_b =
         PathBuf::from(std::env::var_os("CRAT_RAW_BOUNDARY_BST_ROOT_B").expect("bst root B"));
     assert_ne!(root_a, root_b);
-    let input_a = root_a.join("bst/lib.rs");
-    let input_b = root_b.join("bst/lib.rs");
+    let recipe = STANDING_CENSUS_LAUNCH_RECIPE;
+    let bst = *CORPUS
+        .iter()
+        .find(|program| program.name == "bst")
+        .expect("bst is in the registered corpus map");
+    let input_a = recipe.program_file(&root_a, bst);
+    let input_b = recipe.program_file(&root_b, bst);
     assert_eq!(
         input_a.canonicalize().unwrap(),
         input_b.canonicalize().unwrap()
@@ -19157,7 +19183,6 @@ fn raw_boundary_wave1_preflight() {
     assert!(input_a.ends_with("bst/lib.rs"));
     assert!(input_b.ends_with("bst/lib.rs"));
     fs::create_dir_all(&artifact_dir).expect("create preflight directory");
-    let recipe = STANDING_CENSUS_LAUNCH_RECIPE;
     let run = |name: &str, input: &std::path::Path| {
         let outcome = orchestrate::run_child_env_with_memory_limit_mib(
             name,
@@ -19223,7 +19248,10 @@ fn raw_boundary_wave1_preflight() {
             .iter()
             .find(|program| program.name == program_name)
             .expect("preflight program exists");
-        let row = run(program_name, &program.input_path(&root));
+        let row = run(
+            program_name,
+            &recipe.workspace_program_file(&root, *program),
+        );
         assert!(
             row.get(required_key)
                 .and_then(|value| value.parse::<usize>().ok())
@@ -19294,7 +19322,7 @@ fn raw_boundary_wave1_corpus_census() {
     for program in CORPUS {
         let outcome = orchestrate::run_child_env_with_memory_limit_mib(
             program.name,
-            &program.input_path(&root),
+            &recipe.workspace_program_file(&root, *program),
             "raw-boundary-census",
             Duration::from_secs(recipe.timeout_secs),
             recipe.memory_mib,
@@ -19556,6 +19584,26 @@ fn raw_boundary_cache_manifest_accepts_ratified_rekey_map_column() {
         Ok(false),
         "the ratified method consumes the re-keyed identity, not the retired key"
     );
+}
+
+#[test]
+fn raw_boundary_launch_recipe_owns_the_program_file_map() {
+    let recipe = STANDING_CENSUS_LAUNCH_RECIPE;
+    let root = std::path::Path::new("/code/rs-crown-derived");
+    let bzip2 = *CORPUS
+        .iter()
+        .find(|program| program.name == "bzip2")
+        .expect("bzip2 is registered");
+    let bst = *CORPUS
+        .iter()
+        .find(|program| program.name == "bst")
+        .expect("bst is registered");
+    assert_eq!(
+        recipe.program_file(root, bzip2),
+        root.join("bzip2/c2rust-lib.rs"),
+        "representative launches must not guess lib.rs"
+    );
+    assert_eq!(recipe.program_file(root, bst), root.join("bst/lib.rs"));
 }
 
 #[test]

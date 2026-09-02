@@ -7521,3 +7521,48 @@ fn rb_w9_value_observing_comparison_uses_safe_address_views() {
         "{source}"
     );
 }
+
+/// Addendum-142 edit-region witness: a depth-two pointer's element access is
+/// already rewritten by the subject-use arm.  The foreign call consumes that
+/// RAW element, not the surrounding safe slice, so the existing use edit owns
+/// the exact argument region and the raw-boundary arm must not plan a second
+/// edit over it.
+///
+/// Mutation: deleting the exact-region ownership check recreates two edits at
+/// one span.  The structural plan gate then degrades with an overlap instead of
+/// emitting this fixture, so the outcome assertion kills the mutation before a
+/// corpus launch.
+#[test]
+fn raw_boundary_exact_slice_use_region_has_one_owner() {
+    let src = "#![allow(dead_code, unused_unsafe, unused_variables)]\n\
+               extern \"C\" { fn strlen(s: *const i8) -> usize; }\n\
+               pub unsafe fn f(argc: i32, argv: *mut *mut i8) -> usize {\n\
+                   let _ = argc; strlen(*argv.offset(0))\n\
+               }\n";
+    let super::RewriteOutcome::Emitted { source, .. } = super::rewrite_m1(src) else {
+        panic!("an exact subject-use/raw-boundary region must have one owner");
+    };
+    assert!(
+        source.contains("argv: &[*mut i8]"),
+        "the fixture must actually produce the depth-two slice subject: {source}"
+    );
+    assert!(
+        source.contains("strlen(argv["),
+        "the subject-use carrier must survive at the call: {source}"
+    );
+    assert!(
+        !source.contains(".as_ptr()"),
+        "the raw element must not be mistaken for the surrounding slice: {source}"
+    );
+    let artifacts = ::utils::compilation::run_compiler_on_str(src, |tcx| {
+        super::raw_boundary_trace_artifacts(tcx).expect("raw-boundary trace")
+    })
+    .expect("trace fixture compiles");
+    assert!(
+        artifacts
+            .atom_outcomes
+            .contains("edit-region-owned\traw-boundary-edit-region-owned\t"),
+        "the sole-owner disposition must be receipted: {}",
+        artifacts.atom_outcomes
+    );
+}

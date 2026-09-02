@@ -2187,6 +2187,13 @@ pub(crate) struct SeamPlan {
     /// source for declaration/use dependency closure during atom reverts.
     pub raw_boundary_atom_groups:
         rustc_hash::FxHashMap<(LocalDefId, HirId), Vec<super::raw_boundary::SubjectAtomKey>>,
+    /// Exact call-argument regions already owned by a subject-use edit.
+    ///
+    /// A raw-boundary bridge over the same expression would be a second edit
+    /// with an obsolete view of that expression.  These rows are the loud
+    /// disposition of that collision: the existing use edit remains the sole
+    /// owner and the raw arm emits no competing edit.
+    pub raw_boundary_edit_region_owned: Vec<(String, String)>,
 }
 
 /// The form a decision emits.
@@ -2745,6 +2752,26 @@ pub(crate) fn synthesize_with_raw_boundary(
             continue;
         };
         let spec = GlueSpec::raw_boundary(template, site.target.mutability, site.box_slice, false);
+        let exact_subject_use = site
+            .node
+            .and_then(|node| decision_of.get(&node).copied())
+            .into_iter()
+            .flat_map(|decision| match decision {
+                Decision::Slice { uses, .. } | Decision::Opt { uses, .. } => uses.as_slice(),
+                Decision::Ref { .. }
+                | Decision::InferredRef { .. }
+                | Decision::Box(_)
+                | Decision::Degraded(_) => &[],
+            })
+            .filter(|edit| edit.span == site.span)
+            .collect::<Vec<_>>();
+        if exact_subject_use.len() == 1 {
+            plan.raw_boundary_edit_region_owned.push((
+                super::raw_boundary::site_atom_id(key),
+                "raw-boundary-edit-region-owned".to_owned(),
+            ));
+            continue;
+        }
         let Some(replacement) = spec.render(&argument) else {
             continue;
         };

@@ -4044,7 +4044,13 @@ fn finish_decide<'tcx>(
         dispositions: raw_boundary.receipts_tsv(),
         subjects: raw_boundary_subjects_tsv(tcx, &hypothetical, &table, &coconv, &raw_boundary),
         atoms: raw_boundary.atoms_tsv(),
-        atom_outcomes: String::from("outcome\treason\tatoms\n"),
+        atom_outcomes: {
+            let mut out = String::from("outcome\treason\tatoms\n");
+            for (atom, reason) in &table.seams.raw_boundary_edit_region_owned {
+                out.push_str(&format!("edit-region-owned\t{reason}\t{atom}\n"));
+            }
+            out
+        },
         final_reverts: String::from("kind\tidentity\n"),
         timings: RawBoundaryTimings {
             site_derivation_wall_s: format!("{raw_boundary_site_derivation_wall_s:.6}"),
