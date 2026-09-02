@@ -2285,6 +2285,7 @@ pub(crate) fn synthesize(
     c9_marks: &[crate::analyses::borrow_ownership::a5_producer::PlannedC9Mark],
     a5_site_proofs: &A5SeamProofIndex,
 ) -> SeamPlan {
+    let coconv = super::co_conversion::CoConv::default();
     synthesize_with_raw_boundary(
         tcx,
         facts,
@@ -2293,6 +2294,7 @@ pub(crate) fn synthesize(
         c9_marks,
         a5_site_proofs,
         &super::raw_boundary::RawBoundaryDispositionIndex::default(),
+        &coconv,
     )
 }
 
@@ -2304,6 +2306,7 @@ pub(crate) fn synthesize_with_raw_boundary(
     c9_marks: &[crate::analyses::borrow_ownership::a5_producer::PlannedC9Mark],
     a5_site_proofs: &A5SeamProofIndex,
     raw_boundary: &super::raw_boundary::RawBoundaryDispositionIndex,
+    coconv: &super::co_conversion::CoConv,
 ) -> SeamPlan {
     let sm = tcx.sess.source_map();
     let mut plan = SeamPlan::default();
@@ -2810,6 +2813,70 @@ pub(crate) fn synthesize_with_raw_boundary(
             blind: false,
             overlap: None,
             atom_ids,
+        });
+    }
+
+    // PAIR raw views are decided before the final table, but rendered here by
+    // the same seam algebra as every other safe-to-raw bridge. The callee
+    // subject is intentionally Raw; the caller-side safe value is made
+    // explicit under the recorded T1/T2 tier instead of relying on an implicit
+    // coercion.
+    for pair in coconv
+        .pair_sites()
+        .iter()
+        .filter(|pair| pair.role == super::co_conversion::PairRole::RawView)
+    {
+        let Some(source_node) = pair.source_node else {
+            continue;
+        };
+        let Some(source_decision) = decision_of.get(&source_node).copied() else {
+            continue;
+        };
+        let Some(target) = pair.target.as_ref() else {
+            continue;
+        };
+        let Ok(template) = super::raw_boundary::template_for(source_decision, target, None, false)
+        else {
+            continue;
+        };
+        let Ok(argument) = sm.span_to_snippet(pair.span) else {
+            continue;
+        };
+        let spec = GlueSpec::raw_boundary(template, target.mutability, false, true);
+        let Some(replacement) = spec.render(&argument) else {
+            continue;
+        };
+        if plan
+            .edits
+            .iter()
+            .any(|edit| edit.span == pair.span && edit.replacement == replacement)
+        {
+            continue;
+        }
+        plan.edits.push(SeamEdit {
+            span: pair.span,
+            replacement,
+            owner_fn: tcx.def_path_str(pair.callee.to_def_id()),
+            lifetime_plan_digest: table
+                .lifetime_plan
+                .function(pair.callee)
+                .map(super::lifetime::FunctionPlan::digest),
+            caller_fn: tcx.def_path_str(pair.caller.to_def_id()),
+            param_index: pair.argument_index,
+            source_shape: "pair-raw-view",
+            family: SeamFamily::Safe,
+            len_arm: None,
+            spec,
+            arg_span: pair.span,
+            expected: Form::Raw,
+            found: form_of(source_decision),
+            root_identity: labels
+                .get(&source_node)
+                .cloned()
+                .unwrap_or_else(|| "-".to_owned()),
+            blind: false,
+            overlap: None,
+            atom_ids: Vec::new(),
         });
     }
     for site in raw_boundary.address_sites() {

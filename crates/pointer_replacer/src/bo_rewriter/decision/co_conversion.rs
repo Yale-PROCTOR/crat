@@ -34,6 +34,8 @@
 //! caught. `BlockAll` was deleted at M-3 as measured-dead, and this note is its
 //! other direction — one fact, both places, closed together.
 
+use std::collections::{BTreeMap, BTreeSet};
+
 use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_hir::{
     Expr, ExprKind, HirId, QPath,
@@ -46,9 +48,12 @@ use rustc_span::Span;
 
 use super::{
     Arm, Decision, DecisionTable, RequiredArmSet, Subject, SubjectKind,
+    a5_site_proof::{A5PeerProof, A5SeamProofIndex, A5SiteProofVerdict},
     emitability::{ArgShape, EmitabilityFacts, RefKind},
     lifetime::LifetimeEligibility,
-    raw_boundary::RawBoundaryDispositionIndex,
+    raw_boundary::{
+        RawBoundaryDispositionIndex, RawTargetType, RetentionSummaries, RetentionVerdict,
+    },
 };
 use crate::analyses::borrow_ownership::{a5_overlap::PairSide, a5_producer::PlannedC9Mark};
 
@@ -277,6 +282,155 @@ struct EdgeCandidate {
     target_form: EdgeForm,
 }
 
+/// One site-local result of the ruled argument-pair proof stage. The callee
+/// parameter remains the semantic subject; `source_node` identifies the
+/// caller-side safe value whose explicit raw view is emitted for `RawView`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PairRole {
+    Clear,
+    Primary,
+    RawView,
+    Blocked,
+}
+
+impl PairRole {
+    pub(crate) fn key(self) -> &'static str {
+        match self {
+            Self::Clear => "clear",
+            Self::Primary => "primary",
+            Self::RawView => "raw-view",
+            Self::Blocked => "blocked",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PairTier {
+    None,
+    T1,
+    T2,
+    Blocked,
+}
+
+impl PairTier {
+    pub(crate) fn key(self) -> &'static str {
+        match self {
+            Self::None => "-",
+            Self::T1 => "T1",
+            Self::T2 => "T2",
+            Self::Blocked => "blocked",
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct PairSiteDecision {
+    pub(crate) caller: LocalDefId,
+    pub(crate) callee: LocalDefId,
+    pub(crate) argument_index: usize,
+    pub(crate) span: Span,
+    pub(crate) subject: NodeKey,
+    pub(crate) source_node: Option<NodeKey>,
+    pub(crate) target: Option<RawTargetType>,
+    pub(crate) role: PairRole,
+    pub(crate) tier: PairTier,
+    pub(crate) verdict: A5SiteProofVerdict,
+    pub(crate) reason: String,
+    pub(crate) peer_receipts: String,
+}
+
+fn resolve_pair_roles(
+    entries: &[(usize, usize, A5SiteProofVerdict, bool)],
+) -> BTreeMap<usize, PairRole> {
+    let mut vertices = BTreeSet::new();
+    let mut unknown = BTreeSet::new();
+    let mut overlap = BTreeMap::<usize, BTreeSet<usize>>::new();
+    let mut positive = BTreeSet::new();
+    for &(left, right, verdict, positive_retention) in entries {
+        vertices.extend([left, right]);
+        if positive_retention {
+            positive.insert(left);
+        }
+        match verdict {
+            A5SiteProofVerdict::Clear => {}
+            A5SiteProofVerdict::Overlapping => {
+                overlap.entry(left).or_default().insert(right);
+                overlap.entry(right).or_default().insert(left);
+            }
+            A5SiteProofVerdict::Undeterminable => {
+                unknown.extend([left, right]);
+            }
+        }
+    }
+    let mut roles = vertices
+        .iter()
+        .map(|&index| (index, PairRole::Clear))
+        .collect::<BTreeMap<_, _>>();
+    for index in unknown {
+        roles.insert(index, PairRole::Blocked);
+    }
+
+    let mut seen = BTreeSet::new();
+    for &start in overlap.keys() {
+        if seen.contains(&start) {
+            continue;
+        }
+        let mut stack = vec![start];
+        let mut component = BTreeSet::new();
+        while let Some(index) = stack.pop() {
+            if !component.insert(index) {
+                continue;
+            }
+            stack.extend(overlap.get(&index).into_iter().flatten().copied());
+        }
+        seen.extend(component.iter().copied());
+        if component
+            .iter()
+            .any(|index| roles[index] == PairRole::Blocked)
+        {
+            for index in component {
+                roles.insert(index, PairRole::Blocked);
+            }
+            continue;
+        }
+        // A raw-view vertex may not have positive-retention evidence. Choose
+        // the lowest canonical index whose removal leaves every raw view
+        // admissible; if none exists, the entire component remains blocked.
+        let primary = component.iter().copied().find(|candidate| {
+            component
+                .iter()
+                .all(|index| index == candidate || !positive.contains(index))
+        });
+        let Some(primary) = primary else {
+            for index in component {
+                roles.insert(index, PairRole::Blocked);
+            }
+            continue;
+        };
+        for index in component {
+            roles.insert(
+                index,
+                if index == primary {
+                    PairRole::Primary
+                } else {
+                    PairRole::RawView
+                },
+            );
+        }
+    }
+    roles
+}
+
+#[cfg(test)]
+fn resolve_pair_roles_for_test(
+    entries: &[(usize, usize, A5SiteProofVerdict, bool)],
+) -> Vec<&'static str> {
+    resolve_pair_roles(entries)
+        .into_values()
+        .map(PairRole::key)
+        .collect()
+}
+
 /// The finished class structure. **Measurement at task 2; the gate at task 3.**
 #[derive(Clone, Debug, Default)]
 pub(crate) struct CoConv {
@@ -289,6 +443,7 @@ pub(crate) struct CoConv {
     /// is responsible. A census with only the first cannot be acted on.
     node_block: FxHashMap<NodeKey, BlockReason>,
     edges: Vec<EdgeObligation>,
+    pair_sites: Vec<PairSiteDecision>,
 }
 
 impl CoConv {
@@ -326,6 +481,10 @@ impl CoConv {
         &self.edges
     }
 
+    pub(crate) fn pair_sites(&self) -> &[PairSiteDecision] {
+        &self.pair_sites
+    }
+
     pub(crate) fn edge_routes(&self, key: NodeKey) -> Vec<&'static str> {
         let mut routes = self
             .edges
@@ -356,7 +515,33 @@ impl CoConv {
                 EdgeRoute::ZeroSyntax | EdgeRoute::ArmA => {}
             }
         }
+        if self.pair_sites.iter().any(|site| site.subject == key) {
+            arms.insert(Arm::Pair);
+        }
         arms
+    }
+
+    pub(crate) fn pair_receipts_tsv(&self, tcx: TyCtxt<'_>) -> String {
+        let mut out = String::from(
+            "caller\tcallee\targument_index\tsubject\tsite\tverdict\trole\ttier\treason\tpeer_receipts\n",
+        );
+        for row in &self.pair_sites {
+            out.push_str(&format!(
+                "{}\t{}\t{}\t{}:{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+                tcx.def_path_str(row.caller.to_def_id()),
+                tcx.def_path_str(row.callee.to_def_id()),
+                row.argument_index,
+                tcx.def_path_str(row.subject.0.to_def_id()),
+                row.subject.1.local_id.as_u32(),
+                super::emitability::EmitabilityFacts::site(tcx, row.span),
+                row.verdict.key(),
+                row.role.key(),
+                row.tier.key(),
+                row.reason,
+                row.peer_receipts,
+            ));
+        }
+        out
     }
 
     pub(crate) fn edge_receipts_tsv(&self, tcx: TyCtxt<'_>) -> String {
@@ -506,6 +691,33 @@ pub(crate) fn build_with_c9_marks_lifetimes_and_raw_boundary(
     lifetime_eligibility: &LifetimeEligibility,
     raw_boundary: &RawBoundaryDispositionIndex,
 ) -> CoConv {
+    build_with_c9_marks_lifetimes_raw_boundary_and_pair_proofs(
+        facts,
+        subjects,
+        hypothetical,
+        escapes,
+        overlap,
+        c9_marks,
+        lifetime_eligibility,
+        raw_boundary,
+        None,
+        &RetentionSummaries::default(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn build_with_c9_marks_lifetimes_raw_boundary_and_pair_proofs(
+    facts: &EmitabilityFacts,
+    subjects: &[Subject],
+    hypothetical: &DecisionTable,
+    escapes: &[Escape],
+    overlap: OverlapRule,
+    c9_marks: &[PlannedC9Mark],
+    lifetime_eligibility: &LifetimeEligibility,
+    raw_boundary: &RawBoundaryDispositionIndex,
+    a5_site_proofs: Option<&A5SeamProofIndex>,
+    retention: &RetentionSummaries,
+) -> CoConv {
     // ---- 1. the node set: subjects that would emit a PLAIN reference ----
     //
     // Slice and optional forms are deliberately excluded. `&mut [T]` and
@@ -572,6 +784,7 @@ pub(crate) fn build_with_c9_marks_lifetimes_and_raw_boundary(
     let mut dsu = Dsu::new(order.len());
     let mut node_block: FxHashMap<NodeKey, BlockReason> = FxHashMap::default();
     let mut edge_candidates = Vec::<EdgeCandidate>::new();
+    let mut pair_sites = Vec::<PairSiteDecision>::new();
     /// First reason wins, so the census is deterministic under a node that
     /// contributes two.
     fn block(node_block: &mut FxHashMap<NodeKey, BlockReason>, key: NodeKey, reason: BlockReason) {
@@ -643,7 +856,17 @@ pub(crate) fn build_with_c9_marks_lifetimes_and_raw_boundary(
             // one rooted through a RAW-pointer deref compiles with zero
             // diagnostics. So `&mut (*s).g` is checked exactly when `s` itself
             // converts, and an unknown root is treated as blind.
-            let node_positions: Vec<(NodeKey, Option<HirId>, bool, bool)> = site
+            struct PairPosition {
+                key: NodeKey,
+                argument_index: usize,
+                span: Span,
+                root: Option<HirId>,
+                mutable: bool,
+                blind: bool,
+                source_node: Option<NodeKey>,
+                target: Option<RawTargetType>,
+            }
+            let node_positions: Vec<PairPosition> = site
                 .args
                 .iter()
                 .filter_map(|arg| {
@@ -668,29 +891,199 @@ pub(crate) fn build_with_c9_marks_lifetimes_and_raw_boundary(
                         } => !converts.contains(&(b.owner.def_id, b)),
                         _ => false,
                     };
-                    Some((key, arg.shape.place_root(), wants_mut[&key], blind))
+                    Some(PairPosition {
+                        key,
+                        argument_index: arg.index,
+                        span: arg.span,
+                        root: arg.shape.place_root(),
+                        mutable: wants_mut[&key],
+                        blind,
+                        source_node: arg.shape.place_root().map(|root| (site.caller, root)),
+                        target: arg.target.clone(),
+                    })
                 })
                 .collect();
+            let mut pair_edges = Vec::<(usize, usize, A5PeerProof)>::new();
             for i in 0..node_positions.len() {
                 for j in (i + 1)..node_positions.len() {
-                    let (a, root_a, mut_a, blind_a) = node_positions[i];
-                    let (b, root_b, mut_b, blind_b) = node_positions[j];
+                    let a = &node_positions[i];
+                    let b = &node_positions[j];
                     // Two SHARED borrows of one place are legal, so a conflict
                     // needs at least one `&mut`; H6 measured that demoting the
                     // other side to shared does not rescue it.
-                    if !mut_a && !mut_b {
+                    if !a.mutable && !b.mutable {
                         continue;
                     }
-                    let same_root = !matches!((root_a, root_b), (Some(x), Some(y)) if x != y);
+                    let same_root = !matches!((a.root, b.root), (Some(x), Some(y)) if x != y);
                     let conflicts = match overlap {
-                        OverlapRule::BlindOnly => same_root || blind_a || blind_b,
+                        OverlapRule::BlindOnly => same_root || a.blind || b.blind,
                         OverlapRule::AllPairs => true,
                     };
                     if conflicts {
-                        block(&mut node_block, a, BlockReason::DuplicatePlaceRoot);
-                        block(&mut node_block, b, BlockReason::DuplicatePlaceRoot);
+                        if let Some(proofs) = a5_site_proofs {
+                            pair_edges.push((
+                                i,
+                                j,
+                                proofs.lookup(
+                                    site.caller.local_def_index.as_u32(),
+                                    callee.local_def_index.as_u32(),
+                                    a.argument_index,
+                                    b.argument_index,
+                                    a.span,
+                                    b.span,
+                                ),
+                            ));
+                        } else {
+                            block(&mut node_block, a.key, BlockReason::DuplicatePlaceRoot);
+                            block(&mut node_block, b.key, BlockReason::DuplicatePlaceRoot);
+                        }
                     }
                 }
+            }
+            if let Some(proofs) = a5_site_proofs
+                && !pair_edges.is_empty()
+            {
+                let role_entries = pair_edges
+                    .iter()
+                    .flat_map(|(left, right, proof)| {
+                        let l = &node_positions[*left];
+                        let r = &node_positions[*right];
+                        [
+                            (
+                                l.argument_index,
+                                r.argument_index,
+                                proof.verdict,
+                                matches!(
+                                    retention.get(*callee, l.argument_index),
+                                    Some(RetentionVerdict::Retains { .. })
+                                ),
+                            ),
+                            (
+                                r.argument_index,
+                                l.argument_index,
+                                proof.verdict,
+                                matches!(
+                                    retention.get(*callee, r.argument_index),
+                                    Some(RetentionVerdict::Retains { .. })
+                                ),
+                            ),
+                        ]
+                    })
+                    .collect::<Vec<_>>();
+                let roles = resolve_pair_roles(&role_entries);
+                for position in &node_positions {
+                    let Some(&initial_role) = roles.get(&position.argument_index) else {
+                        continue;
+                    };
+                    let mut role = initial_role;
+                    let incident = pair_edges
+                        .iter()
+                        .filter(|(left, right, _)| {
+                            node_positions[*left].argument_index == position.argument_index
+                                || node_positions[*right].argument_index == position.argument_index
+                        })
+                        .collect::<Vec<_>>();
+                    let verdict = if incident
+                        .iter()
+                        .any(|(_, _, proof)| proof.verdict == A5SiteProofVerdict::Undeterminable)
+                    {
+                        A5SiteProofVerdict::Undeterminable
+                    } else if incident
+                        .iter()
+                        .any(|(_, _, proof)| proof.verdict == A5SiteProofVerdict::Overlapping)
+                    {
+                        A5SiteProofVerdict::Overlapping
+                    } else {
+                        A5SiteProofVerdict::Clear
+                    };
+                    let peer_receipts = incident
+                        .iter()
+                        .map(|(left, right, proof)| {
+                            proof.receipt(
+                                node_positions[*left].argument_index,
+                                node_positions[*right].argument_index,
+                            )
+                        })
+                        .collect::<BTreeSet<_>>()
+                        .into_iter()
+                        .collect::<Vec<_>>()
+                        .join(";");
+                    let (mut tier, mut reason) = match role {
+                        PairRole::RawView => {
+                            match retention.get(*callee, position.argument_index) {
+                                Some(RetentionVerdict::NoRetain { .. }) => {
+                                    (PairTier::T1, "pair-no-retain-certificate".to_owned())
+                                }
+                                Some(RetentionVerdict::Unknown { reason, .. }) => {
+                                    (PairTier::T2, format!("pair-waiver:{}", reason.key()))
+                                }
+                                Some(RetentionVerdict::Retains { .. }) => {
+                                    (PairTier::Blocked, "pair-positive-retention".to_owned())
+                                }
+                                None => {
+                                    (PairTier::T2, "pair-waiver:retention-unavailable".to_owned())
+                                }
+                            }
+                        }
+                        PairRole::Blocked => (
+                            PairTier::Blocked,
+                            if verdict == A5SiteProofVerdict::Undeterminable {
+                                incident
+                                    .iter()
+                                    .filter(|(_, _, proof)| {
+                                        proof.verdict == A5SiteProofVerdict::Undeterminable
+                                    })
+                                    .map(|(_, _, proof)| proof.reason)
+                                    .collect::<BTreeSet<_>>()
+                                    .into_iter()
+                                    .collect::<Vec<_>>()
+                                    .join(";")
+                            } else {
+                                "pair-primary-ambiguous".to_owned()
+                            },
+                        ),
+                        PairRole::Clear | PairRole::Primary => {
+                            (PairTier::None, "pair-proof-accepted".to_owned())
+                        }
+                    };
+                    if role == PairRole::RawView {
+                        let template_available = position
+                            .source_node
+                            .and_then(|node| decision_of.get(&node).copied())
+                            .zip(position.target.as_ref())
+                            .is_some_and(|(decision, target)| {
+                                super::raw_boundary::template_for(decision, target, None, false)
+                                    .is_ok()
+                            });
+                        if !template_available {
+                            role = PairRole::Blocked;
+                            tier = PairTier::Blocked;
+                            reason = "pair-raw-view-template-unavailable".to_owned();
+                        }
+                    }
+                    if matches!(role, PairRole::RawView | PairRole::Blocked) {
+                        block(
+                            &mut node_block,
+                            position.key,
+                            BlockReason::DuplicatePlaceRoot,
+                        );
+                    }
+                    pair_sites.push(PairSiteDecision {
+                        caller: site.caller,
+                        callee: *callee,
+                        argument_index: position.argument_index,
+                        span: position.span,
+                        subject: position.key,
+                        source_node: position.source_node,
+                        target: position.target.clone(),
+                        role,
+                        tier,
+                        verdict,
+                        reason,
+                        peer_receipts,
+                    });
+                }
+                let _ = proofs;
             }
 
             for arg in &site.args {
@@ -813,6 +1206,47 @@ pub(crate) fn build_with_c9_marks_lifetimes_and_raw_boundary(
         }
     }
 
+    // A parameter kind is crate-global. If one call site selects it as a raw
+    // view while another selects it as the safe primary, there is no coherent
+    // per-site presentation in this wave. Fail the affected caller/callee
+    // surface closed rather than letting chronological site order choose.
+    let raw_view_subjects = pair_sites
+        .iter()
+        .filter(|row| row.role == PairRole::RawView)
+        .map(|row| row.subject)
+        .collect::<FxHashSet<_>>();
+    let conflicting_subjects = pair_sites
+        .iter()
+        .filter(|row| row.role == PairRole::Primary && raw_view_subjects.contains(&row.subject))
+        .map(|row| row.subject)
+        .collect::<FxHashSet<_>>();
+    let affected_surfaces = pair_sites
+        .iter()
+        .filter(|row| conflicting_subjects.contains(&row.subject))
+        .map(|row| (row.caller, row.callee))
+        .collect::<FxHashSet<_>>();
+    for row in &mut pair_sites {
+        if affected_surfaces.contains(&(row.caller, row.callee)) {
+            row.role = PairRole::Blocked;
+            row.tier = PairTier::Blocked;
+            row.reason = "pair-primary-ambiguous".to_owned();
+            block(
+                &mut node_block,
+                row.subject,
+                BlockReason::DuplicatePlaceRoot,
+            );
+        }
+    }
+    pair_sites.sort_by_key(|row| {
+        (
+            row.caller.local_def_index.as_u32(),
+            row.callee.local_def_index.as_u32(),
+            row.span.lo(),
+            row.span.hi(),
+            row.argument_index,
+        )
+    });
+
     // ---- 3. components, then ONE blocked member blocks the class ----
     let mut class_id: FxHashMap<usize, usize> = FxHashMap::default();
     let mut classes: Vec<Class> = Vec::new();
@@ -889,6 +1323,7 @@ pub(crate) fn build_with_c9_marks_lifetimes_and_raw_boundary(
         classes,
         node_block,
         edges,
+        pair_sites,
     }
 }
 
@@ -1190,8 +1625,7 @@ mod e2_return_permit_tests {
 
 #[cfg(test)]
 mod pair_plan_tests {
-    use super::*;
-    use super::super::a5_site_proof::A5SiteProofVerdict;
+    use super::{super::a5_site_proof::A5SiteProofVerdict, *};
 
     #[test]
     fn pair_w1_clear_component_keeps_every_position_safe() {

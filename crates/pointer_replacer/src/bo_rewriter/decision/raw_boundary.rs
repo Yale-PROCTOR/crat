@@ -1310,7 +1310,7 @@ fn box_site_owner(
     })
 }
 
-fn template_for(
+pub(crate) fn template_for(
     decision: &super::Decision,
     target: &RawTargetType,
     ownership: Option<super::raw_boundary_contracts::OwnershipContract>,

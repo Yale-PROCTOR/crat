@@ -176,6 +176,7 @@ pub(crate) struct E2Timings {
 pub(crate) struct RawBoundaryArtifacts {
     pub(crate) exposure: String,
     pub(crate) d4_edges: String,
+    pub(crate) pairs: String,
     pub(crate) sites: String,
     pub(crate) retention: String,
     pub(crate) dispositions: String,
@@ -4069,16 +4070,29 @@ fn finish_decide<'tcx>(
         &facts,
     );
     let raw_boundary_decision_wall_s = raw_boundary_decision_started.elapsed().as_secs_f64();
-    let coconv = decision::co_conversion::build_with_c9_marks_lifetimes_and_raw_boundary(
-        &facts,
-        &subjects,
-        &e2_hypothetical,
-        &escapes,
-        decision::co_conversion::OverlapRule::BlindOnly,
-        &retained_c9_plans,
-        &lifetime_eligibility,
-        &raw_boundary,
+    // Derive the attested A5 site index once, before PAIR, and pass the same
+    // immutable object to the settled seam. No downstream arm reclassifies a
+    // pair or pays the global setup twice.
+    let a5_site_proofs = decision::a5_site_proof::A5SeamProofIndex::derive(
+        &program,
+        &slots,
+        analysis.origins.as_ref(),
+        analysis.a5_mode,
+        analysis.attestation,
     );
+    let coconv =
+        decision::co_conversion::build_with_c9_marks_lifetimes_raw_boundary_and_pair_proofs(
+            &facts,
+            &subjects,
+            &e2_hypothetical,
+            &escapes,
+            decision::co_conversion::OverlapRule::BlindOnly,
+            &retained_c9_plans,
+            &lifetime_eligibility,
+            &raw_boundary,
+            Some(&a5_site_proofs),
+            &retention,
+        );
     // **Production is decided AFTER the classes**, because step 2's gate reads
     // them. No cycle: the hypothetical above was decided with `None`.
     // **S3.6-1 step 3 — THE LIFT.** Production decides under `LiftAdaptable`
@@ -4137,14 +4151,6 @@ fn finish_decide<'tcx>(
     // forms both ends actually settle on, so a subject withdrawn later would
     // leave glue bridging to a form that no longer exists.
     let seam_started = std::time::Instant::now();
-    let a5_site_proofs = decision::a5_site_proof::A5SeamProofIndex::derive(
-        &program,
-        &slots,
-        analysis.origins.as_ref(),
-        analysis.a5_mode,
-        analysis.attestation,
-    );
-    let seam_wall_s = seam_started.elapsed().as_secs_f64();
     table.seams = decision::seam::synthesize_with_raw_boundary(
         tcx,
         &facts,
@@ -4153,7 +4159,9 @@ fn finish_decide<'tcx>(
         &retained_c9_plans,
         &a5_site_proofs,
         &raw_boundary,
+        &coconv,
     );
+    let seam_wall_s = seam_started.elapsed().as_secs_f64();
     let raw_boundary_render_wall_s = seam_started.elapsed().as_secs_f64();
     retained_c9_plans.retain(|mark| {
         let params = mark.key.pair.params();
@@ -4198,6 +4206,7 @@ fn finish_decide<'tcx>(
     let raw_boundary_artifacts = RawBoundaryArtifacts {
         exposure: exposure.receipts_tsv(),
         d4_edges: coconv.edge_receipts_tsv(tcx),
+        pairs: coconv.pair_receipts_tsv(tcx),
         sites: raw_boundary_sites.to_tsv(),
         retention: retention.to_tsv(),
         dispositions: raw_boundary.receipts_tsv(),
