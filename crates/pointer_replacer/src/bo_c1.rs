@@ -50,6 +50,10 @@ use crate::{
 const E1_WORKER_SOLVE_SECONDS_KEY: &str = "t_solve_s";
 const BOC1_EFFECTIVE_MEMORY_MIB_ENV: &str = "CRAT_BOC1_EFFECTIVE_MEM_MB";
 
+fn raw_boundary_pair_control_member(prior_verdict: &str, fact_verdict: &str) -> bool {
+    prior_verdict == "a5-unknown" && fact_verdict == "overlapping"
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CacheOnlyRefusal {
     ManifestMiss,
@@ -20122,8 +20126,10 @@ fn raw_boundary_wave2_corpus_census() {
     let expected_pair_sites = named_tsv_rows(&pair_control)
         .into_iter()
         .filter(|row| {
-            row.get("fact_verdict")
-                .is_some_and(|verdict| verdict == "overlapping")
+            raw_boundary_pair_control_member(
+                row.get("prior_a5_verdict").map_or("", String::as_str),
+                row.get("fact_verdict").map_or("", String::as_str),
+            )
         })
         .map(|row| {
             (
@@ -20454,6 +20460,22 @@ fn raw_boundary_launch_recipe_owns_the_program_file_map() {
         "representative launches must not guess lib.rs"
     );
     assert_eq!(recipe.program_file(root, bst), root.join("bst/lib.rs"));
+}
+
+/// The PAIR control is the 73-row tranche whose prior verdict was unknown and
+/// whose artifact-first audit found overlap. The 32 already-known overlapping
+/// rows are re-listed evidence, not members of this control population.
+#[test]
+fn raw_boundary_pair_control_selects_only_newly_resolved_overlaps() {
+    assert!(raw_boundary_pair_control_member(
+        "a5-unknown",
+        "overlapping"
+    ));
+    assert!(!raw_boundary_pair_control_member(
+        "a5-overlapping",
+        "overlapping"
+    ));
+    assert!(!raw_boundary_pair_control_member("a5-unknown", "clear"));
 }
 
 #[test]
