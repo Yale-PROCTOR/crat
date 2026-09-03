@@ -187,6 +187,18 @@ fn raw_boundary_delivery_verdict(
     }
 }
 
+fn raw_boundary_apply_receipt_exclusion<'a>(
+    worker_delivery: &'a str,
+    worker_revert_scope: &'a str,
+    excluded: bool,
+) -> (&'a str, &'a str) {
+    if excluded {
+        ("typed-excluded", "-")
+    } else {
+        (worker_delivery, worker_revert_scope)
+    }
+}
+
 fn raw_boundary_lossless_encode(value: &str) -> String {
     value
         .as_bytes()
@@ -20801,7 +20813,7 @@ fn raw_boundary_wave2_corpus_census() {
     let mut current_by_program = BTreeMap::<String, DeliveryCounts>::new();
     let mut corrected_by_program = BTreeMap::<String, DeliveryCounts>::new();
     let mut subject_delivery = String::from(
-        "corpus\tanalysis_frame\tcode_frame\tdata\tprogram\tsubject_key\tfamily\tbaseline_delivery\tcurrent_delivery\trevert_scope\tcorrected_denominator_member\tregressed_identity\n",
+        "corpus\tanalysis_frame\tcode_frame\tdata\tprogram\tsubject_key\tfamily\tbaseline_delivery\tworker_delivery\tcurrent_delivery\trevert_scope\tcorrected_denominator_member\tregressed_identity\n",
     );
     for (key, baseline_row) in &baseline {
         if !is_four_family(baseline_row) {
@@ -20811,8 +20823,13 @@ fn raw_boundary_wave2_corpus_census() {
             .get(key)
             .unwrap_or_else(|| panic!("current subject missing {key:?}"));
         let baseline_delivery = baseline_row.get("disposition").map_or("-", String::as_str);
-        let current_delivery = current_row.get("delivery").map_or("-", String::as_str);
-        let revert_scope = current_row.get("revert_scope").map_or("-", String::as_str);
+        let worker_delivery = current_row.get("delivery").map_or("-", String::as_str);
+        let corrected_member = !exclusion_keys.contains(key);
+        let (current_delivery, revert_scope) = raw_boundary_apply_receipt_exclusion(
+            worker_delivery,
+            current_row.get("revert_scope").map_or("-", String::as_str),
+            !corrected_member,
+        );
         baseline_by_program
             .entry(key.0.clone())
             .or_default()
@@ -20821,7 +20838,6 @@ fn raw_boundary_wave2_corpus_census() {
             .entry(key.0.clone())
             .or_default()
             .add_current(current_delivery, revert_scope);
-        let corrected_member = !exclusion_keys.contains(key);
         if corrected_member {
             corrected_by_program
                 .entry(key.0.clone())
@@ -20831,13 +20847,14 @@ fn raw_boundary_wave2_corpus_census() {
         let regressed_identity = baseline_delivery == "realized-as-predicted"
             && current_delivery != "realized-as-predicted";
         subject_delivery.push_str(&format!(
-            "rs-crown\t{}\t{}\ttrue\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+            "rs-crown\t{}\t{}\ttrue\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
             crate::analyses::borrow_ownership::model_cache::ANALYSIS_FRAME,
             code_frame,
             key.0,
             key.1,
             baseline_row.get("family").map_or("-", String::as_str),
             baseline_delivery,
+            worker_delivery,
             current_delivery,
             revert_scope,
             u8::from(corrected_member),
@@ -21613,6 +21630,18 @@ fn raw_boundary_delivery_verdict_is_sealed_and_degraded_precedes_regressed() {
     assert_eq!(
         raw_boundary_delivery_verdict(true, true),
         RawBoundaryDelivery::Degraded
+    );
+}
+
+#[test]
+fn raw_boundary_lr1_receipt_exclusion_reclassifies_without_changing_the_worker() {
+    assert_eq!(
+        raw_boundary_apply_receipt_exclusion("degraded", "-", true),
+        ("typed-excluded", "-")
+    );
+    assert_eq!(
+        raw_boundary_apply_receipt_exclusion("reverted", "function", false),
+        ("reverted", "function")
     );
 }
 
