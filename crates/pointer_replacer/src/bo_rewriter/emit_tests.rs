@@ -1656,6 +1656,70 @@ fn a_failing_outcome_carries_its_reverted_count() {
     }
 }
 
+fn census_test_solve_receipt() -> crate::analyses::borrow_ownership::model_cache::SolveReceipt {
+    crate::analyses::borrow_ownership::model_cache::SolveReceipt {
+        source: "cache".to_owned(),
+        cache_status: "hit".to_owned(),
+        fingerprint: "fixture-fingerprint".to_owned(),
+        model_sha256: "fixture-model".to_owned(),
+        cache_entry: Some("fixture-entry".to_owned()),
+        solve_wall_s: "0.000000".to_owned(),
+    }
+}
+
+#[test]
+fn census_capture_keeps_the_terminal_outcome_and_emitted_tree() {
+    let files = [(
+        super::plan::FileKey::Real(std::path::PathBuf::from("/fixture/lib.rs")),
+        "fn f() {}\n".to_owned(),
+    )]
+    .into_iter()
+    .collect::<std::collections::BTreeMap<_, _>>();
+    let facts = super::OutcomeFacts {
+        observed_root: Some(std::path::PathBuf::from("/fixture")),
+        escalated: Some("recovered after attribution\nwith full detail".to_owned()),
+        bisect_probes: 3,
+        verify_rounds: 2,
+        reverted_count: 1,
+        solve_receipt: Some(census_test_solve_receipt()),
+        ..Default::default()
+    };
+    let capture = facts
+        .emitted("fn f() {}\n".to_owned(), files.clone())
+        .into_e1_capture()
+        .expect("capture emitted outcome");
+    assert_eq!(capture.outcome_kind, super::CensusOutcomeKind::Emitted);
+    assert_eq!(
+        capture.escalation,
+        "recovered after attribution\nwith full detail"
+    );
+    assert_eq!((capture.bisect_probes, capture.verify_rounds), (3, 2));
+    assert_eq!(capture.reverted_count, 1);
+    assert_eq!(capture.emitted_files, Some(files));
+}
+
+#[test]
+fn census_capture_keeps_a_degraded_reason_and_has_no_emitted_tree() {
+    let reason = "escalation-required: no progress\nfull residual";
+    let facts = super::OutcomeFacts {
+        observed_root: Some(std::path::PathBuf::from("/fixture")),
+        bisect_probes: 5,
+        verify_rounds: 4,
+        reverted_count: 7,
+        solve_receipt: Some(census_test_solve_receipt()),
+        ..Default::default()
+    };
+    let capture = facts
+        .degraded(reason.to_owned())
+        .into_e1_capture()
+        .expect("capture degraded outcome");
+    assert_eq!(capture.outcome_kind, super::CensusOutcomeKind::Degraded);
+    assert_eq!(capture.escalation, reason);
+    assert_eq!((capture.bisect_probes, capture.verify_rounds), (5, 4));
+    assert_eq!(capture.reverted_count, 7);
+    assert_eq!(capture.emitted_files, None);
+}
+
 /// **An EMITTED outcome carries the ruled `files_touched`, not its map size.**
 ///
 /// The twin of `a_failing_outcome_carries_its_reverted_count`, for the arm that
@@ -4519,6 +4583,19 @@ mod coconv_witnesses {
         };
         assert!(source.contains("fn caller(q: &mut i32)"), "{source}");
         assert!(source.contains("optional(Some(q))"), "{source}");
+    }
+
+    #[test]
+    fn d4_edge_receipt_carries_both_subject_identities() {
+        let source = format!(
+            "{PRE}pub unsafe fn target(p: *mut i32) {{ *p = 1; }}\n\
+             pub unsafe fn caller(q: *mut i32) {{ target(q); }}\n"
+        );
+        let trace = raw_trace(&source);
+        let rows = tsv_rows(&trace.d4_edges);
+        let row = rows.first().expect("one D4 edge");
+        assert_eq!(row["source_subject"], "caller::q#1", "{row:?}");
+        assert_eq!(row["target_subject"], "target::p#1", "{row:?}");
     }
 
     #[test]

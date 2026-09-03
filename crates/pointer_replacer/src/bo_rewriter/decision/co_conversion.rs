@@ -547,13 +547,23 @@ impl CoConv {
         out
     }
 
-    pub(crate) fn edge_receipts_tsv(&self, tcx: TyCtxt<'_>) -> String {
+    pub(crate) fn edge_receipts_tsv(&self, tcx: TyCtxt<'_>, subjects: &[Subject]) -> String {
         let mut out = String::from(
-            "caller\tcallee\targument_index\tsource\ttarget\tsource_form\ttarget_form\troute\tsite\n",
+            "caller\tcallee\targument_index\tsource\ttarget\tsource_subject\ttarget_subject\tsource_form\ttarget_form\troute\tsite\n",
         );
+        let subject_identity = |key: NodeKey| {
+            subjects
+                .iter()
+                .find(|subject| subject.fn_did == key.0 && subject.hir_id == key.1)
+                .map(|subject| {
+                    let owner = tcx.def_path_str(subject.fn_did.to_def_id());
+                    subject.identity_key(&owner)
+                })
+                .unwrap_or_else(|| "temporary".to_owned())
+        };
         for edge in &self.edges {
             out.push_str(&format!(
-                "{}\t{}\t{}\t{}:{}\t{}:{}\t{}\t{}\t{}\t{}\n",
+                "{}\t{}\t{}\t{}:{}\t{}:{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
                 tcx.def_path_str(edge.caller.to_def_id()),
                 tcx.def_path_str(edge.callee.to_def_id()),
                 edge.argument_index,
@@ -561,6 +571,8 @@ impl CoConv {
                 edge.source.1.local_id.as_u32(),
                 tcx.def_path_str(edge.target.0.to_def_id()),
                 edge.target.1.local_id.as_u32(),
+                subject_identity(edge.source),
+                subject_identity(edge.target),
                 edge.source_form.key(),
                 edge.target_form.key(),
                 edge.route.key(),

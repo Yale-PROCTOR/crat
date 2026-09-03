@@ -147,6 +147,32 @@ pub(crate) struct E1Capture {
     /// D4's emitted-MIR Box-drop reconciliation. Empty on non-census paths.
     pub(crate) box_drop_receipt: String,
     pub(crate) solve_receipt: model_cache::SolveReceipt,
+    /// Terminal verify-loop outcome. Kept distinct from the diagnostic count:
+    /// a degraded program may leave an empty final-revert ledger.
+    pub(crate) outcome_kind: CensusOutcomeKind,
+    /// Exact, untruncated escalation/reason payload for the census observer.
+    pub(crate) escalation: String,
+    pub(crate) bisect_probes: usize,
+    pub(crate) verify_rounds: usize,
+    pub(crate) reverted_count: usize,
+    /// The complete emitted Rust-file map on success. A degraded outcome has
+    /// no delivered tree and therefore carries `None`, never an empty map.
+    pub(crate) emitted_files: Option<std::collections::BTreeMap<plan::FileKey, String>>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CensusOutcomeKind {
+    Emitted,
+    Degraded,
+}
+
+impl CensusOutcomeKind {
+    pub(crate) fn key(self) -> &'static str {
+        match self {
+            Self::Emitted => "emitted",
+            Self::Degraded => "degraded",
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -275,6 +301,8 @@ pub(crate) enum RewriteOutcome {
         /// nonzero means attribution failed, the detector fired, and (C) found
         /// the culprit the containing-function heuristic could not.
         bisect_probes: usize,
+        /// Main verify-loop compiler invocations, excluding bisect probes.
+        verify_rounds: usize,
         /// Why the loop escalated, when it did. `None` means it never had to.
         /// Carried on the SUCCESS outcome because a crate recovered by bisect is
         /// still a crate whose attribution was wrong — collapsing that into a
@@ -333,6 +361,8 @@ pub(crate) enum RewriteOutcome {
         emitted_sites: Vec<EmittedSite>,
         /// Bisect probes spent before giving up.
         bisect_probes: usize,
+        /// Main verify-loop compiler invocations, excluding bisect probes.
+        verify_rounds: usize,
         /// Subjects the verify loop took back. **Measured, never zeroed** — the
         /// defect this structure exists to prevent.
         reverted_count: usize,
@@ -1083,6 +1113,7 @@ fn verify_and_revert(
         emitted_sites,
         unplaceable,
         bisect_probes: 0,
+        verify_rounds: 0,
         escalated: None,
         attribution_blind,
         first_diags: Vec::new(),
@@ -1207,6 +1238,7 @@ fn verify_and_revert(
             }
         };
         let probe_started = std::time::Instant::now();
+        facts.verify_rounds += 1;
         let diagnosis = verify::diagnose_crate(staged.root());
         let probe_wall_s = probe_started.elapsed().as_secs_f64();
         if atom_reverify_count > 0 {
@@ -1799,6 +1831,7 @@ fn verify_and_revert(
     match materialized {
         Ok(staged)
             if rollbacks.is_empty() && {
+                facts.verify_rounds += 1;
                 let final_diag = verify::diagnose_crate(staged.root());
                 let final_root = staged.root().parent().unwrap_or(staged.root());
                 baseline.novel(&final_diag.diags, final_root).is_empty()
@@ -2450,6 +2483,8 @@ struct OutcomeFacts {
     emitted_sites: Vec<EmittedSite>,
     unplaceable: Vec<plan::Unplaceable>,
     bisect_probes: usize,
+    /// Main verify-loop compiler invocations, excluding bisect probes.
+    verify_rounds: usize,
     escalated: Option<String>,
     /// The FIRST verify's diagnostics, before any revert round. The validation
     /// transfer compares these against the rendered parser 1:1.
@@ -2546,8 +2581,15 @@ impl RewriteOutcome {
             a5_receipt,
             solve_receipt,
             outcome_reason,
+            outcome_kind,
+            escalation,
+            bisect_probes,
+            verify_rounds,
+            reverted_count,
+            emitted_files,
         ) = match self {
             RewriteOutcome::Emitted {
+                files,
                 observed_root,
                 e1_reverts,
                 e1_adapter_receipt,
@@ -2564,6 +2606,10 @@ impl RewriteOutcome {
                 unplaceable,
                 a5_receipt,
                 solve_receipt,
+                escalated,
+                bisect_probes,
+                verify_rounds,
+                reverted_count,
                 ..
             } => (
                 observed_root,
@@ -2583,6 +2629,12 @@ impl RewriteOutcome {
                 a5_receipt,
                 solve_receipt,
                 "emitted".to_owned(),
+                CensusOutcomeKind::Emitted,
+                escalated.unwrap_or_default(),
+                bisect_probes,
+                verify_rounds,
+                reverted_count,
+                Some(files),
             ),
             RewriteOutcome::Degraded {
                 reason,
@@ -2602,6 +2654,9 @@ impl RewriteOutcome {
                 unplaceable,
                 a5_receipt,
                 solve_receipt,
+                bisect_probes,
+                verify_rounds,
+                reverted_count,
                 ..
             } => (
                 observed_root,
@@ -2620,7 +2675,13 @@ impl RewriteOutcome {
                 unplaceable.len(),
                 a5_receipt,
                 solve_receipt,
+                reason.clone(),
+                CensusOutcomeKind::Degraded,
                 reason,
+                bisect_probes,
+                verify_rounds,
+                reverted_count,
+                None,
             ),
         };
         Ok(E1Capture {
@@ -2642,6 +2703,12 @@ impl RewriteOutcome {
             box_drop_receipt: e1_box_drop_receipt,
             solve_receipt: solve_receipt
                 .ok_or_else(|| "E1 capture has no solve receipt".to_owned())?,
+            outcome_kind,
+            escalation,
+            bisect_probes,
+            verify_rounds,
+            reverted_count,
+            emitted_files,
         })
     }
 
@@ -2677,6 +2744,7 @@ impl OutcomeFacts {
             excluded: self.excluded,
             emitted_sites: self.emitted_sites,
             bisect_probes: self.bisect_probes,
+            verify_rounds: self.verify_rounds,
             escalated: self.escalated,
             unplaceable: self.unplaceable,
             reverted_count: self.reverted_count,
@@ -2707,6 +2775,7 @@ impl OutcomeFacts {
             files_touched: self.files_touched,
             emitted_sites: self.emitted_sites,
             bisect_probes: self.bisect_probes,
+            verify_rounds: self.verify_rounds,
             unplaceable: self.unplaceable,
             reverted_count: self.reverted_count,
             attribution_blind: self.attribution_blind,
@@ -4372,7 +4441,7 @@ fn finish_decide<'tcx>(
     let raw_boundary_receipt_started = std::time::Instant::now();
     let raw_boundary_artifacts = RawBoundaryArtifacts {
         exposure: exposure.receipts_tsv(),
-        d4_edges: coconv.edge_receipts_tsv(tcx),
+        d4_edges: coconv.edge_receipts_tsv(tcx, &subjects),
         pairs: coconv.pair_receipts_tsv(tcx),
         addresses: raw_boundary.addresses_tsv(tcx),
         arm_outcomes: arm_outcomes_tsv(tcx, &subjects, &table, &coconv, &raw_boundary),

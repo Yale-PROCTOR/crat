@@ -74,6 +74,374 @@ fn raw_boundary_r1_other_count(counts: &std::collections::BTreeMap<String, usize
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RawBoundaryProgramOutcome {
+    Emitted,
+    Degraded,
+}
+
+impl RawBoundaryProgramOutcome {
+    fn key(self) -> &'static str {
+        match self {
+            Self::Emitted => "emitted",
+            Self::Degraded => "degraded",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RawBoundaryRevertScope {
+    Function,
+    Program,
+}
+
+impl RawBoundaryRevertScope {
+    fn key(self) -> &'static str {
+        match self {
+            Self::Function => "function",
+            Self::Program => "program",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RawBoundarySubjectDelivery {
+    Realized,
+    Degraded,
+    Reverted(RawBoundaryRevertScope),
+    TypedExcluded,
+}
+
+impl RawBoundarySubjectDelivery {
+    fn key(self) -> &'static str {
+        match self {
+            Self::Realized => "realized-as-predicted",
+            Self::Degraded => "degraded",
+            Self::Reverted(_) => "reverted",
+            Self::TypedExcluded => "typed-excluded",
+        }
+    }
+
+    fn revert_scope(self) -> &'static str {
+        match self {
+            Self::Reverted(scope) => scope.key(),
+            _ => "-",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RawBoundaryDelivery {
+    Clean,
+    Degraded,
+    Regressed,
+}
+
+impl RawBoundaryDelivery {
+    fn key(self) -> &'static str {
+        match self {
+            Self::Clean => "clean",
+            Self::Degraded => "degraded",
+            Self::Regressed => "regressed",
+        }
+    }
+}
+
+fn raw_boundary_site_survives(
+    outcome: RawBoundaryProgramOutcome,
+    function_reverted: bool,
+    atom_reverted: bool,
+) -> bool {
+    outcome == RawBoundaryProgramOutcome::Emitted && !function_reverted && !atom_reverted
+}
+
+fn raw_boundary_subject_delivery(
+    outcome: RawBoundaryProgramOutcome,
+    placed: bool,
+    excluded: bool,
+    function_reverted: bool,
+    atom_reverted: bool,
+) -> RawBoundarySubjectDelivery {
+    if excluded {
+        RawBoundarySubjectDelivery::TypedExcluded
+    } else if !placed {
+        RawBoundarySubjectDelivery::Degraded
+    } else if outcome == RawBoundaryProgramOutcome::Degraded {
+        RawBoundarySubjectDelivery::Reverted(RawBoundaryRevertScope::Program)
+    } else if function_reverted || atom_reverted {
+        RawBoundarySubjectDelivery::Reverted(RawBoundaryRevertScope::Function)
+    } else {
+        RawBoundarySubjectDelivery::Realized
+    }
+}
+
+fn raw_boundary_delivery_verdict(
+    any_degraded_program: bool,
+    any_unwaived_regression: bool,
+) -> RawBoundaryDelivery {
+    if any_degraded_program {
+        RawBoundaryDelivery::Degraded
+    } else if any_unwaived_regression {
+        RawBoundaryDelivery::Regressed
+    } else {
+        RawBoundaryDelivery::Clean
+    }
+}
+
+fn raw_boundary_lossless_encode(value: &str) -> String {
+    value
+        .as_bytes()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn raw_boundary_lossless_decode(value: &str) -> Result<String, String> {
+    if value.len() % 2 != 0 {
+        return Err("odd-length hex string".to_owned());
+    }
+    let bytes = (0..value.len())
+        .step_by(2)
+        .map(|index| {
+            u8::from_str_radix(&value[index..index + 2], 16)
+                .map_err(|error| format!("invalid hex at {index}: {error}"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    String::from_utf8(bytes).map_err(|error| format!("invalid UTF-8: {error}"))
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RawBoundaryTreeReceipt {
+    status: &'static str,
+    input_tree_sha256: String,
+    emitted_tree_sha256: String,
+    file_rows: String,
+    patch: String,
+}
+
+fn raw_boundary_rust_files(root: &std::path::Path) -> Result<Vec<std::path::PathBuf>, String> {
+    fn visit(
+        root: &std::path::Path,
+        directory: &std::path::Path,
+        output: &mut Vec<std::path::PathBuf>,
+    ) -> Result<(), String> {
+        let mut entries = std::fs::read_dir(directory)
+            .map_err(|error| format!("read {}: {error}", directory.display()))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| format!("read {} entry: {error}", directory.display()))?;
+        entries.sort_by_key(std::fs::DirEntry::file_name);
+        for entry in entries {
+            let file_type = entry
+                .file_type()
+                .map_err(|error| format!("stat {}: {error}", entry.path().display()))?;
+            if file_type.is_dir() {
+                visit(root, &entry.path(), output)?;
+            } else if file_type.is_file()
+                && entry
+                    .path()
+                    .extension()
+                    .is_some_and(|extension| extension == "rs")
+            {
+                output.push(
+                    entry
+                        .path()
+                        .strip_prefix(root)
+                        .map_err(|error| {
+                            format!(
+                                "{} is outside {}: {error}",
+                                entry.path().display(),
+                                root.display()
+                            )
+                        })?
+                        .to_path_buf(),
+                );
+            }
+        }
+        Ok(())
+    }
+
+    let mut files = Vec::new();
+    visit(root, root, &mut files)?;
+    files.sort();
+    Ok(files)
+}
+
+fn raw_boundary_tree_digest(files: &[(std::path::PathBuf, Vec<u8>)]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hash = Sha256::new();
+    for (path, bytes) in files {
+        let path = path.to_string_lossy();
+        hash.update((path.len() as u64).to_le_bytes());
+        hash.update(path.as_bytes());
+        hash.update((bytes.len() as u64).to_le_bytes());
+        hash.update(bytes);
+    }
+    format!("{:x}", hash.finalize())
+}
+
+fn raw_boundary_tsv_escape(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('\t', "\\t")
+        .replace('\r', "\\r")
+        .replace('\n', "\\n")
+}
+
+fn raw_boundary_unified_patch(
+    input: &std::path::Path,
+    emitted: &std::path::Path,
+    relative: &std::path::Path,
+) -> Result<Vec<u8>, String> {
+    let relative = relative.to_string_lossy();
+    let output = std::process::Command::new("diff")
+        .args(["-u", "--label"])
+        .arg(format!("a/{relative}"))
+        .arg("--label")
+        .arg(format!("b/{relative}"))
+        .arg(input)
+        .arg(emitted)
+        .output()
+        .map_err(|error| format!("launch diff for {relative}: {error}"))?;
+    match output.status.code() {
+        Some(0 | 1) => Ok(output.stdout),
+        code => Err(format!(
+            "diff for {relative} exited {code:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        )),
+    }
+}
+
+fn raw_boundary_emitted_relative_path(
+    program_root: &std::path::Path,
+    key: &crate::bo_rewriter::plan::FileKey,
+) -> Result<std::path::PathBuf, String> {
+    let crate::bo_rewriter::plan::FileKey::Real(path) = key else {
+        return Err("virtual emitted file in a file-backed census".to_owned());
+    };
+    if let Ok(relative) = path.strip_prefix(program_root) {
+        return Ok(relative.to_path_buf());
+    }
+    let root = program_root
+        .canonicalize()
+        .map_err(|error| format!("canonicalize {}: {error}", program_root.display()))?;
+    let canonical_path = path
+        .canonicalize()
+        .map_err(|error| format!("canonicalize {}: {error}", path.display()))?;
+    canonical_path
+        .strip_prefix(&root)
+        .map(std::path::Path::to_path_buf)
+        .map_err(|error| {
+            format!(
+                "emitted file {} is outside program root {}: {error}",
+                path.display(),
+                program_root.display()
+            )
+        })
+}
+
+fn persist_raw_boundary_emitted_tree(
+    input: &std::path::Path,
+    local_root: &std::path::Path,
+    program: &str,
+    files: Option<&std::collections::BTreeMap<crate::bo_rewriter::plan::FileKey, String>>,
+) -> Result<RawBoundaryTreeReceipt, String> {
+    use sha2::{Digest, Sha256};
+
+    let program_root = input
+        .parent()
+        .ok_or_else(|| format!("{} has no program root", input.display()))?;
+    let relative_files = raw_boundary_rust_files(program_root)?;
+    let input_files = relative_files
+        .iter()
+        .map(|relative| {
+            std::fs::read(program_root.join(relative))
+                .map(|bytes| (relative.clone(), bytes))
+                .map_err(|error| format!("read {}: {error}", program_root.join(relative).display()))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let input_tree_sha256 = raw_boundary_tree_digest(&input_files);
+    let Some(files) = files else {
+        let patch = format!(
+            "# absent-tree\nprogram={program}\noutcome=degraded\ninput_tree_sha256={input_tree_sha256}\n"
+        );
+        return Ok(RawBoundaryTreeReceipt {
+            status: "absent-degraded",
+            input_tree_sha256,
+            emitted_tree_sha256: "absent".to_owned(),
+            file_rows: format!(
+                "file\tinput_sha256\temitted_sha256\tstate\tlocal_path\n-\t-\t-\tabsent-tree\t-\n"
+            ),
+            patch,
+        });
+    };
+
+    let program_output = local_root.join(program);
+    std::fs::create_dir_all(&program_output)
+        .map_err(|error| format!("create {}: {error}", program_output.display()))?;
+    let mut overlays = std::collections::BTreeMap::new();
+    for (key, text) in files {
+        let relative = raw_boundary_emitted_relative_path(program_root, key)?;
+        if overlays.insert(relative.clone(), text.as_bytes()).is_some() {
+            return Err(format!("duplicate emitted file {}", relative.display()));
+        }
+    }
+    let mut emitted_files = Vec::new();
+    let mut file_rows = String::from("file\tinput_sha256\temitted_sha256\tstate\tlocal_path\n");
+    let mut patch = Vec::new();
+    for (relative, input_bytes) in &input_files {
+        let emitted_bytes = overlays
+            .remove(relative)
+            .map_or(input_bytes.as_slice(), |bytes| bytes);
+        let output_path = program_output.join(relative);
+        if let Some(parent) = output_path.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|error| format!("create {}: {error}", parent.display()))?;
+        }
+        std::fs::write(&output_path, emitted_bytes)
+            .map_err(|error| format!("write {}: {error}", output_path.display()))?;
+        let state = if emitted_bytes == input_bytes.as_slice() {
+            "byte-identical"
+        } else {
+            patch.extend(raw_boundary_unified_patch(
+                &program_root.join(relative),
+                &output_path,
+                relative,
+            )?);
+            "changed"
+        };
+        file_rows.push_str(&format!(
+            "{}\t{:x}\t{:x}\t{}\t{}\n",
+            relative.display(),
+            Sha256::digest(input_bytes),
+            Sha256::digest(emitted_bytes),
+            state,
+            output_path.display(),
+        ));
+        emitted_files.push((relative.clone(), emitted_bytes.to_vec()));
+    }
+    if !overlays.is_empty() {
+        return Err(format!(
+            "emitted map contains files absent from the pinned input tree: {:?}",
+            overlays.keys().collect::<Vec<_>>()
+        ));
+    }
+    let persisted_files = raw_boundary_rust_files(&program_output)?;
+    if persisted_files != relative_files {
+        return Err(format!(
+            "local emitted-tree file-set drift for {program}: expected={relative_files:?}; got={persisted_files:?}"
+        ));
+    }
+    let emitted_tree_sha256 = raw_boundary_tree_digest(&emitted_files);
+    let patch = String::from_utf8(patch).map_err(|error| format!("diff output UTF-8: {error}"))?;
+    Ok(RawBoundaryTreeReceipt {
+        status: "present",
+        input_tree_sha256,
+        emitted_tree_sha256,
+        file_rows,
+        patch,
+    })
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CacheOnlyRefusal {
     ManifestMiss,
     EntryUnavailable,
@@ -206,6 +574,8 @@ impl StandingCensusLaunchRecipe {
             .expect("raw-boundary parent requires configured exposure input");
         let exposure_input_sha256 = std::env::var("CRAT_RAW_BOUNDARY_EXPOSURE_INPUT_SHA256")
             .expect("raw-boundary parent requires configured exposure input digest");
+        let emitted_tree_dir = std::env::var("CRAT_RAW_BOUNDARY_EMITTED_TREE_DIR")
+            .expect("raw-boundary parent requires local emitted-tree directory");
         env.extend([
             (
                 "CRAT_RAW_BOUNDARY_ARTIFACT_DIR",
@@ -219,6 +589,7 @@ impl StandingCensusLaunchRecipe {
                 "CRAT_RAW_BOUNDARY_EXPOSURE_INPUT_SHA256",
                 exposure_input_sha256,
             ),
+            ("CRAT_RAW_BOUNDARY_EMITTED_TREE_DIR", emitted_tree_dir),
         ]);
         for key in [
             "CRAT_RAW_BOUNDARY_UNIFIED_CONTROL",
@@ -326,6 +697,20 @@ mod report {
             match self.0.iter_mut().find(|(k, _)| k == key) {
                 Some((_, v)) => *v = value,
                 None => self.0.push((key.to_string(), value)),
+            }
+        }
+
+        /// Insert an already encoded, single-token value without the ordinary
+        /// 120-byte display truncation. This is deliberately narrower than a
+        /// generic raw setter: callers must first use a reversible encoding.
+        pub fn set_lossless_token(&mut self, key: &str, value: &str) {
+            assert!(
+                !value.chars().any(char::is_whitespace) && !value.contains('='),
+                "lossless report value is not one KV token"
+            );
+            match self.0.iter_mut().find(|(candidate, _)| candidate == key) {
+                Some((_, stored)) => *stored = value.to_owned(),
+                None => self.0.push((key.to_owned(), value.to_owned())),
             }
         }
     }
@@ -9823,6 +10208,8 @@ mod run {
             std::env::var("CRAT_BOC1_MEM_MB").unwrap_or_else(|_| "missing".to_owned());
         let effective_memory = std::env::var(super::BOC1_EFFECTIVE_MEMORY_MIB_ENV)
             .unwrap_or_else(|_| "missing".to_owned());
+        let attestation = std::env::var("CRAT_BO_A5_ATTESTATION")
+            .unwrap_or_else(|_| "missing-attestation".to_owned());
         let directory = std::env::var_os("CRAT_RAW_BOUNDARY_ARTIFACT_DIR")
             .map(std::path::PathBuf::from)
             .expect("raw-boundary census requires CRAT_RAW_BOUNDARY_ARTIFACT_DIR");
@@ -9871,6 +10258,7 @@ mod run {
                 return row;
             }
         };
+        let cache_manifest_sha256 = format!("{:x}", Sha256::digest(manifest.as_bytes()));
         let manifest_match =
             match super::accepted_cache_manifest_contains(&manifest, &name, &fingerprint) {
                 Ok(found) => found,
@@ -9953,6 +10341,67 @@ mod run {
             "provisional"
         };
         let solve = &capture.solve_receipt;
+        let program_outcome = match capture.outcome_kind {
+            crate::bo_rewriter::CensusOutcomeKind::Emitted => {
+                super::RawBoundaryProgramOutcome::Emitted
+            }
+            crate::bo_rewriter::CensusOutcomeKind::Degraded => {
+                super::RawBoundaryProgramOutcome::Degraded
+            }
+        };
+        let emitted_tree_dir = std::env::var_os("CRAT_RAW_BOUNDARY_EMITTED_TREE_DIR")
+            .map(std::path::PathBuf::from)
+            .expect("raw-boundary worker requires local emitted-tree directory");
+        let launch_env = [
+            (
+                "CRAT_BO_CACHE",
+                std::env::var("CRAT_BO_CACHE").unwrap_or_default(),
+            ),
+            (
+                "CRAT_BO_CACHE_DIR",
+                std::env::var("CRAT_BO_CACHE_DIR").unwrap_or_default(),
+            ),
+            ("CRAT_BO_A5_ATTESTATION", attestation.clone()),
+            ("CRAT_BOC1_MEM_MB", configured_memory.clone()),
+            (
+                super::BOC1_EFFECTIVE_MEMORY_MIB_ENV,
+                effective_memory.clone(),
+            ),
+            ("CRAT_RAW_BOUNDARY_CODE_FRAME", code_frame.clone()),
+            ("CRAT_RAW_BOUNDARY_CARGO_PROFILE", launch_profile.clone()),
+            (
+                "CRAT_RAW_BOUNDARY_CACHE_MANIFEST",
+                manifest_path.display().to_string(),
+            ),
+            (
+                "CRAT_RAW_BOUNDARY_EXPOSURE_INPUT",
+                exposure_input_path.display().to_string(),
+            ),
+            (
+                "CRAT_RAW_BOUNDARY_EMITTED_TREE_DIR",
+                emitted_tree_dir.display().to_string(),
+            ),
+        ]
+        .into_iter()
+        .map(|(key, value)| format!("{key}={value}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+        let launch_env_sha256 = format!("{:x}", Sha256::digest(launch_env.as_bytes()));
+        let tree_receipt = match super::persist_raw_boundary_emitted_tree(
+            input,
+            &emitted_tree_dir,
+            &name,
+            capture.emitted_files.as_ref(),
+        ) {
+            Ok(receipt) => receipt,
+            Err(error) => {
+                row.set(raw_schema::STATUS, "emitted-tree-ledger-error");
+                row.set("detail", super::report::sanitize(&error));
+                row.set(raw_schema::SOLVER_INVOCATIONS, 0);
+                row.set(raw_schema::DATA, "false");
+                return row;
+            }
+        };
 
         let roots = input
             .parent()
@@ -9969,15 +10418,18 @@ mod run {
         let stamp = |raw: &str| {
             let mut lines = raw.lines();
             let header = lines.next().unwrap_or_default();
-            let prefix_header = "corpus\tanalysis_frame\tcode_frame\traw_boundary_wave\tdata\tbuild_profile\tresource_configured_mib\tresource_effective_mib\tprogram";
+            let prefix_header = "corpus\tanalysis_frame\tcode_frame\traw_boundary_wave\tdata\tbuild_profile\tresource_configured_mib\tresource_effective_mib\ta5_mode\ta5_world\ta5_attestation\tcache_manifest_sha256\tlaunch_env_sha256\tprogram";
             let prefix = format!(
-                "rs-crown\t{}\t{}\twave2\t{}\t{}\t{}\t{}\t{}",
+                "rs-crown\t{}\t{}\twave2\t{}\t{}\t{}\t{}\tprecise_replay\tclosed_world_frozen_graph\t{}\t{}\t{}\t{}",
                 model_cache::ANALYSIS_FRAME,
                 code_frame,
                 data,
                 build_profile,
                 configured_memory,
                 effective_memory,
+                attestation,
+                cache_manifest_sha256,
+                launch_env_sha256,
                 name,
             );
             let mut output = format!("{prefix_header}\t{header}\n");
@@ -9989,6 +10441,70 @@ mod run {
             }
             output
         };
+        let readable_escalation = if capture.escalation.is_empty() {
+            "-".to_owned()
+        } else {
+            super::raw_boundary_tsv_escape(&capture.escalation)
+        };
+        let outcome_receipt = format!(
+            "outcome_kind\tescalation\tescalation_hex\tbisect_probes\tverify_rounds\treverted_count\n{}\t{}\t{}\t{}\t{}\t{}\n",
+            program_outcome.key(),
+            readable_escalation,
+            super::raw_boundary_lossless_encode(&capture.escalation),
+            capture.bisect_probes,
+            capture.verify_rounds,
+            capture.reverted_count,
+        );
+        std::fs::write(
+            directory.join(format!("{name}.raw-boundary-outcome.tsv")),
+            stamp(&outcome_receipt),
+        )
+        .expect("write raw-boundary outcome receipt");
+        std::fs::write(
+            directory.join(format!("{name}.raw-boundary-emitted-tree.tsv")),
+            stamp(&tree_receipt.file_rows),
+        )
+        .expect("write raw-boundary emitted-tree receipt");
+        let stamped_patch = format!(
+            "# corpus=rs-crown\n# analysis_frame={}\n# code_frame={}\n# raw_boundary_wave=wave2\n# data={}\n# build_profile={}\n# resource_configured_mib={}\n# resource_effective_mib={}\n# a5_mode=precise_replay\n# a5_world=closed_world_frozen_graph\n# a5_attestation={}\n# cache_manifest_sha256={}\n# launch_env_sha256={}\n# program={}\n{}",
+            model_cache::ANALYSIS_FRAME,
+            code_frame,
+            data,
+            build_profile,
+            configured_memory,
+            effective_memory,
+            attestation,
+            cache_manifest_sha256,
+            launch_env_sha256,
+            name,
+            tree_receipt.patch,
+        );
+        std::fs::write(
+            directory.join(format!("{name}.raw-boundary-emitted.patch")),
+            &stamped_patch,
+        )
+        .expect("write raw-boundary emitted patch");
+        row.set(raw_schema::OUTCOME_KIND, program_outcome.key());
+        row.set_lossless_token(
+            raw_schema::ESCALATION_HEX,
+            &super::raw_boundary_lossless_encode(&capture.escalation),
+        );
+        row.set(raw_schema::BISECT_PROBES, capture.bisect_probes);
+        row.set(raw_schema::VERIFY_ROUNDS, capture.verify_rounds);
+        row.set(raw_schema::REVERTED_COUNT, capture.reverted_count);
+        row.set(raw_schema::EMITTED_TREE_STATUS, tree_receipt.status);
+        row.set(
+            raw_schema::INPUT_TREE_SHA256,
+            &tree_receipt.input_tree_sha256,
+        );
+        row.set(
+            raw_schema::EMITTED_TREE_SHA256,
+            &tree_receipt.emitted_tree_sha256,
+        );
+        row.set(
+            raw_schema::EMITTED_PATCH_SHA256,
+            format!("{:x}", Sha256::digest(stamped_patch.as_bytes())),
+        );
         let artifact = &capture.raw_boundary_artifacts;
         let artifact_rows = [
             ("exposure", artifact.exposure.as_str()),
@@ -10061,6 +10577,70 @@ mod run {
                 _ => {}
             }
         }
+        let mut subject_outcomes = String::from(
+            "subject_key\towner_fn\tfamily\tplaced\texclusion\tdelivery\trevert_scope\n",
+        );
+        let mut realized_subjects = 0usize;
+        let mut degraded_subjects = 0usize;
+        let mut reverted_function_subjects = 0usize;
+        let mut reverted_program_subjects = 0usize;
+        let mut typed_excluded_subjects = 0usize;
+        for subject in named_tsv_rows(&capture.subject_receipt) {
+            let subject_key = subject.get("subject_key").map_or("-", String::as_str);
+            let owner_fn = subject.get("owner_fn").map_or("-", String::as_str);
+            let family = subject.get("family").map_or("-", String::as_str);
+            let placed = subject.get("placed").is_some_and(|value| value == "1");
+            let exclusion = subject.get("exclusion").map_or("-", String::as_str);
+            let excluded = exclusion != "-";
+            let delivery = super::raw_boundary_subject_delivery(
+                program_outcome,
+                placed,
+                excluded,
+                reverted_functions.contains(owner_fn),
+                false,
+            );
+            if matches!(family, "ref" | "slice" | "optional" | "box") {
+                match delivery {
+                    super::RawBoundarySubjectDelivery::Realized => realized_subjects += 1,
+                    super::RawBoundarySubjectDelivery::Degraded => degraded_subjects += 1,
+                    super::RawBoundarySubjectDelivery::Reverted(
+                        super::RawBoundaryRevertScope::Function,
+                    ) => reverted_function_subjects += 1,
+                    super::RawBoundarySubjectDelivery::Reverted(
+                        super::RawBoundaryRevertScope::Program,
+                    ) => reverted_program_subjects += 1,
+                    super::RawBoundarySubjectDelivery::TypedExcluded => {
+                        typed_excluded_subjects += 1
+                    }
+                }
+            }
+            subject_outcomes.push_str(&format!(
+                "{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+                subject_key,
+                owner_fn,
+                family,
+                u8::from(placed),
+                exclusion,
+                delivery.key(),
+                delivery.revert_scope(),
+            ));
+        }
+        std::fs::write(
+            directory.join(format!("{name}.raw-boundary-subject-outcomes.tsv")),
+            stamp(&subject_outcomes),
+        )
+        .expect("write raw-boundary subject outcomes");
+        row.set(raw_schema::REALIZED_SUBJECTS, realized_subjects);
+        row.set(raw_schema::DEGRADED_SUBJECTS, degraded_subjects);
+        row.set(
+            raw_schema::REVERTED_FUNCTION_SUBJECTS,
+            reverted_function_subjects,
+        );
+        row.set(
+            raw_schema::REVERTED_PROGRAM_SUBJECTS,
+            reverted_program_subjects,
+        );
+        row.set(raw_schema::TYPED_EXCLUDED_SUBJECTS, typed_excluded_subjects);
         #[derive(Default)]
         struct SubjectOutcome {
             has_t1: bool,
@@ -10091,10 +10671,11 @@ mod run {
                 .split(';')
                 .filter(|atom| *atom != "-" && !atom.is_empty())
                 .collect::<Vec<_>>();
-            let survives = !reverted_functions.contains(caller)
-                && atom_group
-                    .iter()
-                    .all(|atom| !reverted_atoms.contains(*atom));
+            let survives = super::raw_boundary_site_survives(
+                program_outcome,
+                reverted_functions.contains(caller),
+                atom_group.iter().any(|atom| reverted_atoms.contains(*atom)),
+            );
             let outcome = subjects.entry(identity.to_owned()).or_default();
             outcome.survives |= survives;
             match tier {
@@ -10395,13 +10976,26 @@ mod run {
         row.set(raw_schema::CODE_FRAME, &code_frame);
         row.set(raw_schema::WAVE, "wave2");
         row.set(raw_schema::DATA, data);
+        row.set(
+            raw_schema::DELIVERY,
+            if program_outcome == super::RawBoundaryProgramOutcome::Degraded {
+                super::RawBoundaryDelivery::Degraded.key()
+            } else {
+                super::RawBoundaryDelivery::Clean.key()
+            },
+        );
         row.set(raw_schema::BUILD_PROFILE, build_profile);
         row.set(raw_schema::LAUNCH_PROFILE, &launch_profile);
+        row.set(raw_schema::A5_MODE, "precise_replay");
+        row.set(raw_schema::A5_WORLD, "closed_world_frozen_graph");
+        row.set(raw_schema::A5_ATTESTATION, &attestation);
         row.set(raw_schema::RESOURCE_CONFIGURED_MIB, &configured_memory);
         row.set(raw_schema::RESOURCE_EFFECTIVE_MIB, &effective_memory);
         row.set(raw_schema::CACHE_STATUS, &solve.cache_status);
         row.set(raw_schema::CACHE_FINGERPRINT, &solve.fingerprint);
         row.set(raw_schema::CACHE_MODEL_SHA256, &solve.model_sha256);
+        row.set(raw_schema::CACHE_MANIFEST_SHA256, &cache_manifest_sha256);
+        row.set(raw_schema::LAUNCH_ENV_SHA256, &launch_env_sha256);
         row.set(raw_schema::SOLVE_WALL_S, &solve.solve_wall_s);
         row.set(
             raw_schema::SOLVER_INVOCATIONS,
@@ -10454,7 +11048,7 @@ mod run {
         );
         row.set(
             raw_schema::SURFACE_CLOSED_DIRECT,
-            surface_count("exposure-indeterminate-closed-world"),
+            surface_count("internal-by-configuration"),
         );
         row.set(
             raw_schema::SURFACE_NOT_APPLICABLE,
@@ -13914,6 +14508,7 @@ fn the_reporting_site_reads_files_touched_not_the_map_size() {
         excluded: Default::default(),
         emitted_sites: Vec::new(),
         bisect_probes: 0,
+        verify_rounds: 0,
         escalated: None,
         unplaceable: Vec::new(),
         reverted_count: 1,
@@ -19900,6 +20495,10 @@ fn raw_boundary_wave2_preflight() {
         "raw-boundary-dispositions.tsv",
         "raw-boundary-subject-index.tsv",
         "raw-boundary-atoms.tsv",
+        "raw-boundary-outcome.tsv",
+        "raw-boundary-subject-outcomes.tsv",
+        "raw-boundary-emitted-tree.tsv",
+        "raw-boundary-emitted.patch",
     ];
     let first = run("bst", &input_a);
     let root_a_artifacts = suffixes
@@ -20057,6 +20656,11 @@ fn raw_boundary_wave2_corpus_census() {
             "{row:?}"
         );
         assert_eq!(row.get(raw_schema::WAVE), Some("wave2"), "{row:?}");
+        assert_eq!(
+            row.get(raw_schema::A5_ATTESTATION),
+            Some(recipe.attestation),
+            "{row:?}"
+        );
         eprintln!(
             "RAW-BOUNDARY-CENSUS program={} stage=complete rc=0 wall={:.3} rss={} digest={}",
             program.name,
@@ -20067,6 +20671,430 @@ fn raw_boundary_wave2_corpus_census() {
         rows.push(row);
     }
     assert_eq!(rows.len(), 20);
+
+    #[derive(Clone, Copy, Debug, Default)]
+    struct DeliveryCounts {
+        realized: usize,
+        degraded: usize,
+        reverted_function: usize,
+        reverted_program: usize,
+        typed_excluded: usize,
+    }
+
+    impl DeliveryCounts {
+        fn add_current(&mut self, disposition: &str, revert_scope: &str) {
+            match (disposition, revert_scope) {
+                ("realized-as-predicted", "-") => self.realized += 1,
+                ("degraded", "-") => self.degraded += 1,
+                ("reverted", "function") => self.reverted_function += 1,
+                ("reverted", "program") => self.reverted_program += 1,
+                ("typed-excluded", "-") => self.typed_excluded += 1,
+                pair => panic!("unsealed raw-boundary delivery pair: {pair:?}"),
+            }
+        }
+
+        fn add_baseline(&mut self, disposition: &str) {
+            match disposition {
+                "realized-as-predicted" => self.realized += 1,
+                "degraded" => self.degraded += 1,
+                "reverted" => self.reverted_function += 1,
+                "typed-excluded" => self.typed_excluded += 1,
+                other => panic!("unsealed baseline delivery: {other}"),
+            }
+        }
+
+        fn delivered_total(self) -> usize {
+            self.realized
+                + self.degraded
+                + self.reverted_function
+                + self.reverted_program
+                + self.typed_excluded
+        }
+    }
+
+    let baseline_dir = PathBuf::from(
+        std::env::var_os("CRAT_RAW_BOUNDARY_DELIVERY_BASELINE_DIR")
+            .expect("raw-boundary census requires the accepted subject-ledger baseline"),
+    );
+    let exclusion_path = PathBuf::from(
+        std::env::var_os("CRAT_RAW_BOUNDARY_PROMOTE_EXCLUSIONS")
+            .expect("raw-boundary census requires the 38-row promote exclusion control"),
+    );
+    let mut baseline = BTreeMap::<(String, String), BTreeMap<String, String>>::new();
+    let mut baseline_digest = Sha256::new();
+    for program in CORPUS {
+        let path = baseline_dir.join(format!("{}.subjects.tsv", program.name));
+        let bytes = fs::read(&path)
+            .unwrap_or_else(|error| panic!("read subject baseline {}: {error}", path.display()));
+        baseline_digest.update(program.name.as_bytes());
+        baseline_digest.update((bytes.len() as u64).to_le_bytes());
+        baseline_digest.update(&bytes);
+        let text = String::from_utf8(bytes).expect("subject baseline must be UTF-8");
+        for row in named_tsv_rows(&text) {
+            let key = (
+                row.get("program").cloned().unwrap_or_default(),
+                row.get("subject_key").cloned().unwrap_or_default(),
+            );
+            assert_eq!(key.0, program.name);
+            assert!(
+                baseline.insert(key.clone(), row).is_none(),
+                "duplicate {key:?}"
+            );
+        }
+    }
+    let baseline_digest = format!("{:x}", baseline_digest.finalize());
+    let current_artifacts =
+        raw_boundary_program_artifacts(&artifact_dir, "raw-boundary-subject-outcomes.tsv")
+            .expect("read current subject outcomes");
+    let mut current = BTreeMap::<(String, String), BTreeMap<String, String>>::new();
+    for (program, text) in current_artifacts {
+        for row in named_tsv_rows(&text) {
+            let key = (
+                row.get("program").cloned().unwrap_or_default(),
+                row.get("subject_key").cloned().unwrap_or_default(),
+            );
+            assert_eq!(key.0, program);
+            assert!(
+                current.insert(key.clone(), row).is_none(),
+                "duplicate {key:?}"
+            );
+        }
+    }
+    let baseline_keys = baseline.keys().cloned().collect::<BTreeSet<_>>();
+    let current_keys = current.keys().cloned().collect::<BTreeSet<_>>();
+    assert_eq!(
+        baseline_keys.len(),
+        7_011,
+        "baseline subject population drift"
+    );
+    assert_eq!(
+        current_keys.len(),
+        7_011,
+        "current subject population drift"
+    );
+    assert_eq!(baseline_keys, current_keys, "subject identity join drift");
+
+    let exclusion_bytes = fs::read(&exclusion_path)
+        .unwrap_or_else(|error| panic!("read exclusions {}: {error}", exclusion_path.display()));
+    let exclusion_sha256 = format!("{:x}", Sha256::digest(&exclusion_bytes));
+    let exclusion_text = String::from_utf8(exclusion_bytes).expect("exclusions must be UTF-8");
+    let exclusion_keys = named_tsv_rows(&exclusion_text)
+        .into_iter()
+        .map(|row| {
+            (
+                row.get("program").cloned().unwrap_or_default(),
+                row.get("subject_key").cloned().unwrap_or_default(),
+            )
+        })
+        .collect::<BTreeSet<_>>();
+    assert_eq!(exclusion_keys.len(), 38, "promote exclusion control drift");
+    assert!(
+        exclusion_keys.is_subset(&baseline_keys),
+        "promote exclusion contains an unknown subject"
+    );
+
+    let is_four_family = |row: &BTreeMap<String, String>| {
+        row.get("family")
+            .is_some_and(|family| matches!(family.as_str(), "ref" | "slice" | "optional" | "box"))
+    };
+    let mut baseline_by_program = BTreeMap::<String, DeliveryCounts>::new();
+    let mut current_by_program = BTreeMap::<String, DeliveryCounts>::new();
+    let mut corrected_by_program = BTreeMap::<String, DeliveryCounts>::new();
+    let mut subject_delivery = String::from(
+        "corpus\tanalysis_frame\tcode_frame\tdata\tprogram\tsubject_key\tfamily\tbaseline_delivery\tcurrent_delivery\trevert_scope\tcorrected_denominator_member\tregressed_identity\n",
+    );
+    for (key, baseline_row) in &baseline {
+        if !is_four_family(baseline_row) {
+            continue;
+        }
+        let current_row = current
+            .get(key)
+            .unwrap_or_else(|| panic!("current subject missing {key:?}"));
+        let baseline_delivery = baseline_row.get("disposition").map_or("-", String::as_str);
+        let current_delivery = current_row.get("delivery").map_or("-", String::as_str);
+        let revert_scope = current_row.get("revert_scope").map_or("-", String::as_str);
+        baseline_by_program
+            .entry(key.0.clone())
+            .or_default()
+            .add_baseline(baseline_delivery);
+        current_by_program
+            .entry(key.0.clone())
+            .or_default()
+            .add_current(current_delivery, revert_scope);
+        let corrected_member = !exclusion_keys.contains(key);
+        if corrected_member {
+            corrected_by_program
+                .entry(key.0.clone())
+                .or_default()
+                .add_current(current_delivery, revert_scope);
+        }
+        let regressed_identity = baseline_delivery == "realized-as-predicted"
+            && current_delivery != "realized-as-predicted";
+        subject_delivery.push_str(&format!(
+            "rs-crown\t{}\t{}\ttrue\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+            crate::analyses::borrow_ownership::model_cache::ANALYSIS_FRAME,
+            code_frame,
+            key.0,
+            key.1,
+            baseline_row.get("family").map_or("-", String::as_str),
+            baseline_delivery,
+            current_delivery,
+            revert_scope,
+            u8::from(corrected_member),
+            u8::from(regressed_identity),
+        ));
+    }
+    fs::write(
+        artifact_dir.join("subject-delivery-ledger.tsv"),
+        &subject_delivery,
+    )
+    .expect("write subject delivery ledger");
+
+    let mut per_program_delivery = String::from(
+        "corpus\tanalysis_frame\tcode_frame\tdata\tprogram\tbaseline_realized\tbaseline_degraded\tbaseline_reverted\tcurrent_realized\tcurrent_degraded\tcurrent_reverted_function\tcurrent_reverted_program\tcurrent_typed_excluded\tcorrected_realized\tcorrected_degraded\tcorrected_reverted_function\tcorrected_reverted_program\tbaseline_to_current_delta\tregression\n",
+    );
+    let mut regression_rows = String::from(
+        "corpus\tanalysis_frame\tcode_frame\tdata\tprogram\tbaseline_realized\tcurrent_realized\tdelta\twaiver\n",
+    );
+    let mut regressed_programs = BTreeSet::new();
+    for program in CORPUS {
+        let baseline_counts = baseline_by_program
+            .get(program.name)
+            .copied()
+            .unwrap_or_default();
+        let current_counts = current_by_program
+            .get(program.name)
+            .copied()
+            .unwrap_or_default();
+        let corrected_counts = corrected_by_program
+            .get(program.name)
+            .copied()
+            .unwrap_or_default();
+        assert_eq!(
+            current_counts.realized,
+            rows.iter()
+                .find(|row| row.get("program") == Some(program.name))
+                .and_then(|row| row.get(raw_schema::REALIZED_SUBJECTS))
+                .unwrap_or("missing")
+                .parse::<usize>()
+                .unwrap_or(usize::MAX),
+            "worker/parent subject count drift for {}",
+            program.name
+        );
+        let regression = current_counts.realized < baseline_counts.realized;
+        if regression {
+            regressed_programs.insert(program.name.to_owned());
+            regression_rows.push_str(&format!(
+                "rs-crown\t{}\t{}\ttrue\t{}\t{}\t{}\t{}\tnone\n",
+                crate::analyses::borrow_ownership::model_cache::ANALYSIS_FRAME,
+                code_frame,
+                program.name,
+                baseline_counts.realized,
+                current_counts.realized,
+                current_counts.realized as isize - baseline_counts.realized as isize,
+            ));
+        }
+        per_program_delivery.push_str(&format!(
+            "rs-crown\t{}\t{}\ttrue\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+            crate::analyses::borrow_ownership::model_cache::ANALYSIS_FRAME,
+            code_frame,
+            program.name,
+            baseline_counts.realized,
+            baseline_counts.degraded,
+            baseline_counts.reverted_function,
+            current_counts.realized,
+            current_counts.degraded,
+            current_counts.reverted_function,
+            current_counts.reverted_program,
+            current_counts.typed_excluded,
+            corrected_counts.realized,
+            corrected_counts.degraded,
+            corrected_counts.reverted_function,
+            corrected_counts.reverted_program,
+            current_counts.realized as isize - baseline_counts.realized as isize,
+            u8::from(regression),
+        ));
+    }
+    fs::write(
+        artifact_dir.join("subject-frame-per-program.tsv"),
+        &per_program_delivery,
+    )
+    .expect("write per-program delivery table");
+    fs::write(artifact_dir.join("regression-rows.tsv"), &regression_rows)
+        .expect("write regression rows");
+
+    let degraded_programs = rows
+        .iter()
+        .filter(|row| row.get(raw_schema::OUTCOME_KIND) == Some("degraded"))
+        .filter_map(|row| row.get("program").map(str::to_owned))
+        .collect::<BTreeSet<_>>();
+    let delivery = raw_boundary_delivery_verdict(
+        !degraded_programs.is_empty(),
+        !regressed_programs.is_empty(),
+    );
+    for row in &mut rows {
+        let program = row.get("program").unwrap_or("missing").to_owned();
+        row.set(
+            raw_schema::DELIVERY,
+            raw_boundary_delivery_verdict(
+                degraded_programs.contains(&program),
+                regressed_programs.contains(&program),
+            )
+            .key(),
+        );
+    }
+
+    let mut outcome_table = String::from(
+        "corpus\tanalysis_frame\tcode_frame\tdata\tprogram\toutcome_kind\tescalation\tbisect_probes\tverify_rounds\treverted_count\tdelivery\th_recover\n",
+    );
+    for row in &rows {
+        let program = row.get("program").unwrap_or("missing");
+        let outcome = row.get(raw_schema::OUTCOME_KIND).unwrap_or("missing");
+        let escalation =
+            raw_boundary_lossless_decode(row.get(raw_schema::ESCALATION_HEX).unwrap_or("missing"))
+                .unwrap_or_else(|error| panic!("decode {program} escalation: {error}"));
+        let h_recover = if matches!(program, "brotli" | "heman") {
+            if escalation.contains("bisect did not recover the crate") {
+                "confirmed"
+            } else if outcome == "emitted" {
+                "refuted-emitted"
+            } else {
+                "not-confirmed"
+            }
+        } else {
+            "not-applicable"
+        };
+        outcome_table.push_str(&format!(
+            "rs-crown\t{}\t{}\ttrue\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+            crate::analyses::borrow_ownership::model_cache::ANALYSIS_FRAME,
+            code_frame,
+            program,
+            outcome,
+            raw_boundary_tsv_escape(&escalation),
+            row.get(raw_schema::BISECT_PROBES).unwrap_or("missing"),
+            row.get(raw_schema::VERIFY_ROUNDS).unwrap_or("missing"),
+            row.get(raw_schema::REVERTED_COUNT).unwrap_or("missing"),
+            row.get(raw_schema::DELIVERY).unwrap_or("missing"),
+            h_recover,
+        ));
+    }
+    fs::write(artifact_dir.join("program-outcomes.tsv"), &outcome_table)
+        .expect("write program outcome table");
+
+    let local_tree_root = PathBuf::from(
+        std::env::var_os("CRAT_RAW_BOUNDARY_EMITTED_TREE_DIR")
+            .expect("raw-boundary census requires local emitted-tree directory"),
+    );
+    let mut tree_ledger = String::from(
+        "corpus\tanalysis_frame\tcode_frame\tdata\tprogram\toutcome_kind\tstatus\tinput_tree_sha256\temitted_tree_sha256\tpatch_sha256\tlocal_tree\n",
+    );
+    for program in CORPUS {
+        let row = rows
+            .iter()
+            .find(|row| row.get("program") == Some(program.name))
+            .expect("program row");
+        let patch_path = artifact_dir.join(format!("{}.raw-boundary-emitted.patch", program.name));
+        let patch = fs::read(&patch_path)
+            .unwrap_or_else(|error| panic!("read {}: {error}", patch_path.display()));
+        assert_eq!(
+            format!("{:x}", Sha256::digest(&patch)),
+            row.get(raw_schema::EMITTED_PATCH_SHA256)
+                .unwrap_or("missing"),
+            "{} patch digest drift",
+            program.name
+        );
+        let program_tree = local_tree_root.join(program.name);
+        let outcome = row.get(raw_schema::OUTCOME_KIND).unwrap_or("missing");
+        if outcome == "emitted" {
+            let files = raw_boundary_rust_files(&program_tree)
+                .unwrap_or_else(|error| panic!("read {} tree: {error}", program.name))
+                .into_iter()
+                .map(|relative| {
+                    let bytes = fs::read(program_tree.join(&relative)).unwrap();
+                    (relative, bytes)
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                raw_boundary_tree_digest(&files),
+                row.get(raw_schema::EMITTED_TREE_SHA256)
+                    .unwrap_or("missing"),
+                "{} local emitted-tree digest drift",
+                program.name
+            );
+        } else {
+            assert_eq!(
+                row.get(raw_schema::EMITTED_TREE_STATUS),
+                Some("absent-degraded"),
+                "{} degraded tree receipt drift",
+                program.name
+            );
+            assert!(
+                !program_tree.exists(),
+                "{} degraded tree exists",
+                program.name
+            );
+        }
+        tree_ledger.push_str(&format!(
+            "rs-crown\t{}\t{}\ttrue\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+            crate::analyses::borrow_ownership::model_cache::ANALYSIS_FRAME,
+            code_frame,
+            program.name,
+            outcome,
+            row.get(raw_schema::EMITTED_TREE_STATUS)
+                .unwrap_or("missing"),
+            row.get(raw_schema::INPUT_TREE_SHA256).unwrap_or("missing"),
+            row.get(raw_schema::EMITTED_TREE_SHA256)
+                .unwrap_or("missing"),
+            row.get(raw_schema::EMITTED_PATCH_SHA256)
+                .unwrap_or("missing"),
+            program_tree.display(),
+        ));
+    }
+    fs::write(artifact_dir.join("emitted-source-ledger.tsv"), &tree_ledger)
+        .expect("write emitted-source ledger");
+
+    let d4_artifacts = raw_boundary_program_artifacts(&artifact_dir, "raw-boundary-d4-edges.tsv")
+        .expect("read D4 edge artifacts");
+    let mut d4_join = String::from(
+        "corpus\tanalysis_frame\tcode_frame\tdata\tprogram\tedges\tsource_subjects\ttarget_subjects\ttemporary_endpoints\tunmatched\n",
+    );
+    for (program, text) in d4_artifacts {
+        let edge_rows = named_tsv_rows(&text);
+        let mut source_subjects = 0usize;
+        let mut target_subjects = 0usize;
+        let mut temporaries = 0usize;
+        let mut unmatched = 0usize;
+        for edge in &edge_rows {
+            for (column, counter) in [
+                ("source_subject", &mut source_subjects),
+                ("target_subject", &mut target_subjects),
+            ] {
+                let identity = edge.get(column).map_or("missing", String::as_str);
+                if identity == "temporary" {
+                    temporaries += 1;
+                } else {
+                    *counter += 1;
+                    unmatched +=
+                        usize::from(!current.contains_key(&(program.clone(), identity.to_owned())));
+                }
+            }
+        }
+        d4_join.push_str(&format!(
+            "rs-crown\t{}\t{}\ttrue\t{}\t{}\t{}\t{}\t{}\t{}\n",
+            crate::analyses::borrow_ownership::model_cache::ANALYSIS_FRAME,
+            code_frame,
+            program,
+            edge_rows.len(),
+            source_subjects,
+            target_subjects,
+            temporaries,
+            unmatched,
+        ));
+        assert_eq!(unmatched, 0, "{program} D4 edge/subject join drift");
+    }
+    fs::write(artifact_dir.join("d4-edge-subject-join.tsv"), &d4_join)
+        .expect("write D4 edge/subject join");
+
     let subjects = raw_boundary_program_artifacts(&artifact_dir, "raw-boundary-subject-index.tsv")
         .expect("read current subjects");
     let dispositions =
@@ -20206,6 +21234,39 @@ fn raw_boundary_wave2_corpus_census() {
             })
             .sum::<usize>()
     };
+    let unique_value = |key: &str| {
+        let values = rows
+            .iter()
+            .filter_map(|row| row.get(key).map(str::to_owned))
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            values.len(),
+            1,
+            "{key} is not one launch identity: {values:?}"
+        );
+        values.into_iter().next().unwrap()
+    };
+    let sum_counts = |counts: &BTreeMap<String, DeliveryCounts>| {
+        counts
+            .values()
+            .copied()
+            .fold(DeliveryCounts::default(), |mut total, row| {
+                total.realized += row.realized;
+                total.degraded += row.degraded;
+                total.reverted_function += row.reverted_function;
+                total.reverted_program += row.reverted_program;
+                total.typed_excluded += row.typed_excluded;
+                total
+            })
+    };
+    let baseline_counts = sum_counts(&baseline_by_program);
+    let current_counts = sum_counts(&current_by_program);
+    let corrected_counts = sum_counts(&corrected_by_program);
+    assert_eq!(baseline_counts.delivered_total(), 4_744);
+    assert_eq!(current_counts.delivered_total(), 4_744);
+    assert_eq!(corrected_counts.delivered_total(), 4_706);
+    assert_eq!(current_counts.typed_excluded, 38);
+    assert_eq!(corrected_counts.typed_excluded, 0);
     let mut aggregate = report::Row::default();
     aggregate.set(raw_schema::CORPUS, "rs-crown");
     aggregate.set(
@@ -20215,6 +21276,37 @@ fn raw_boundary_wave2_corpus_census() {
     aggregate.set(raw_schema::CODE_FRAME, &code_frame);
     aggregate.set(raw_schema::WAVE, "wave2");
     aggregate.set(raw_schema::DATA, "true");
+    aggregate.set(raw_schema::DELIVERY, delivery.key());
+    aggregate.set(
+        raw_schema::BUILD_PROFILE,
+        unique_value(raw_schema::BUILD_PROFILE),
+    );
+    aggregate.set(
+        raw_schema::LAUNCH_PROFILE,
+        unique_value(raw_schema::LAUNCH_PROFILE),
+    );
+    aggregate.set(raw_schema::A5_MODE, unique_value(raw_schema::A5_MODE));
+    aggregate.set(raw_schema::A5_WORLD, unique_value(raw_schema::A5_WORLD));
+    aggregate.set(
+        raw_schema::A5_ATTESTATION,
+        unique_value(raw_schema::A5_ATTESTATION),
+    );
+    aggregate.set(
+        raw_schema::RESOURCE_CONFIGURED_MIB,
+        unique_value(raw_schema::RESOURCE_CONFIGURED_MIB),
+    );
+    aggregate.set(
+        raw_schema::RESOURCE_EFFECTIVE_MIB,
+        unique_value(raw_schema::RESOURCE_EFFECTIVE_MIB),
+    );
+    aggregate.set(
+        raw_schema::CACHE_MANIFEST_SHA256,
+        unique_value(raw_schema::CACHE_MANIFEST_SHA256),
+    );
+    aggregate.set(
+        raw_schema::LAUNCH_ENV_SHA256,
+        unique_value(raw_schema::LAUNCH_ENV_SHA256),
+    );
     for key in [
         raw_schema::SITE_ROWS,
         raw_schema::SUBJECT_ROWS,
@@ -20230,6 +21322,11 @@ fn raw_boundary_wave2_corpus_census() {
         raw_schema::T2_COMPILER_SURVIVING,
         raw_schema::T1_REALIZED_SUBJECTS,
         raw_schema::T2_REALIZED_SUBJECTS,
+        raw_schema::REALIZED_SUBJECTS,
+        raw_schema::DEGRADED_SUBJECTS,
+        raw_schema::REVERTED_FUNCTION_SUBJECTS,
+        raw_schema::REVERTED_PROGRAM_SUBJECTS,
+        raw_schema::TYPED_EXCLUDED_SUBJECTS,
         raw_schema::MASKED_SECONDARY,
         raw_schema::ADDRESS_OBSERVATION_EDITS,
         raw_schema::ATOM_ATTEMPTS,
@@ -20325,6 +21422,45 @@ fn raw_boundary_wave2_corpus_census() {
     aggregate.set(raw_schema::ARM_B_CROWN_ROWS, controls.crown_rows);
     aggregate.set(raw_schema::FREE_ARM_B_ROWS, controls.free_arm_b_rows);
     aggregate.set(raw_schema::STATUS, "ok");
+    let delivery_summary = format!(
+        "corpus\tanalysis_frame\tcode_frame\tdata\tdelivery\tdenominator\trealized\tdegraded\treverted_function\treverted_program\ttyped_excluded\tpromote_rate_pct\tt1_boundary_realized\tt2_boundary_realized\tprograms_emitted\tprograms_degraded\tregressed_programs\tbaseline_artifact_sha256\texclusion_artifact_sha256\n\
+         rs-crown\t{}\t{}\ttrue\t{}\t4744\t{}\t{}\t{}\t{}\t{}\t{:.4}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n\
+         rs-crown\t{}\t{}\ttrue\t{}\t4706\t{}\t{}\t{}\t{}\t{}\t{:.4}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+        crate::analyses::borrow_ownership::model_cache::ANALYSIS_FRAME,
+        code_frame,
+        delivery.key(),
+        current_counts.realized,
+        current_counts.degraded,
+        current_counts.reverted_function,
+        current_counts.reverted_program,
+        current_counts.typed_excluded,
+        current_counts.realized as f64 * 100.0 / 4_744.0,
+        total(raw_schema::T1_REALIZED_SUBJECTS),
+        total(raw_schema::T2_REALIZED_SUBJECTS),
+        20 - degraded_programs.len(),
+        degraded_programs.len(),
+        regressed_programs.len(),
+        baseline_digest,
+        exclusion_sha256,
+        crate::analyses::borrow_ownership::model_cache::ANALYSIS_FRAME,
+        code_frame,
+        delivery.key(),
+        corrected_counts.realized,
+        corrected_counts.degraded,
+        corrected_counts.reverted_function,
+        corrected_counts.reverted_program,
+        corrected_counts.typed_excluded,
+        corrected_counts.realized as f64 * 100.0 / 4_706.0,
+        total(raw_schema::T1_REALIZED_SUBJECTS),
+        total(raw_schema::T2_REALIZED_SUBJECTS),
+        20 - degraded_programs.len(),
+        degraded_programs.len(),
+        regressed_programs.len(),
+        baseline_digest,
+        exclusion_sha256,
+    );
+    fs::write(artifact_dir.join("delivery-summary.tsv"), delivery_summary)
+        .expect("write delivery summary");
     let per_program = rows
         .iter()
         .map(report::to_kv_line)
@@ -20340,7 +21476,24 @@ fn raw_boundary_wave2_corpus_census() {
     fs::write(
         artifact_dir.join("census-receipt.txt"),
         format!(
-            "status=complete\ndata=true\nprograms=20/20\ncache_hits=20/20\nsolver_seconds=0\nlibc={}/{}\nfree={}\nfree_arm_b={}\nt2={}\narm_b={}\ndiagnostics_baseline={}\ndiagnostics_unchanged={}\ndiagnostics_resolved={}\ndiagnostics_changed={}\ndiagnostics_new={}\n",
+            "status=complete\ndata=true\ndelivery={}\nprograms=20/20\nprograms_emitted={}\nprograms_degraded={}\nregressed_programs={}\ncache_hits=20/20\nsolver_seconds=0\nsubject_frame_4744={}/{}/{}/{}/{}\nsubject_frame_4706={}/{}/{}/{}\npromote_rate_4744={}/4744\npromote_rate_4706={}/4706\nt1_boundary_realized={}\nt2_boundary_realized={}\nlibc={}/{}\nfree={}\nfree_arm_b={}\nt2={}\narm_b={}\ndiagnostics_baseline={}\ndiagnostics_unchanged={}\ndiagnostics_resolved={}\ndiagnostics_changed={}\ndiagnostics_new={}\nbaseline_artifact_sha256={}\nexclusion_artifact_sha256={}\n",
+            delivery.key(),
+            20 - degraded_programs.len(),
+            degraded_programs.len(),
+            regressed_programs.len(),
+            current_counts.realized,
+            current_counts.degraded,
+            current_counts.reverted_function,
+            current_counts.reverted_program,
+            current_counts.typed_excluded,
+            corrected_counts.realized,
+            corrected_counts.degraded,
+            corrected_counts.reverted_function,
+            corrected_counts.reverted_program,
+            current_counts.realized,
+            corrected_counts.realized,
+            total(raw_schema::T1_REALIZED_SUBJECTS),
+            total(raw_schema::T2_REALIZED_SUBJECTS),
             controls.libc_subjects,
             controls.libc_edges,
             controls.free_rows,
@@ -20352,6 +21505,8 @@ fn raw_boundary_wave2_corpus_census() {
             diagnostic_recon.resolved,
             diagnostic_recon.changed,
             diagnostic_recon.new,
+            baseline_digest,
+            exclusion_sha256,
         ),
     )
     .expect("write census receipt");
@@ -20379,6 +21534,12 @@ fn raw_boundary_census_schema_is_one_shared_authority() {
         schema::ARM_B_ROWS,
         schema::FREE_ARM_B_ROWS,
         schema::RETENTION_FIXPOINT_WALL_S,
+        schema::OUTCOME_KIND,
+        schema::ESCALATION_HEX,
+        schema::VERIFY_ROUNDS,
+        schema::DELIVERY,
+        schema::EMITTED_TREE_SHA256,
+        schema::REVERTED_PROGRAM_SUBJECTS,
     ] {
         assert!(keys.contains(&required), "missing shared key {required}");
     }
@@ -20390,6 +21551,126 @@ fn raw_boundary_census_schema_is_one_shared_authority() {
             "raw-boundary census key {key:?} bypasses the shared authority"
         );
     }
+}
+
+#[test]
+fn raw_boundary_degraded_outcome_never_survives_an_empty_revert_ledger() {
+    assert!(!raw_boundary_site_survives(
+        RawBoundaryProgramOutcome::Degraded,
+        false,
+        false,
+    ));
+    assert_eq!(
+        raw_boundary_subject_delivery(
+            RawBoundaryProgramOutcome::Degraded,
+            true,
+            false,
+            false,
+            false,
+        ),
+        RawBoundarySubjectDelivery::Reverted(RawBoundaryRevertScope::Program),
+    );
+}
+
+#[test]
+fn raw_boundary_emitted_outcome_preserves_the_existing_revert_reading() {
+    assert!(raw_boundary_site_survives(
+        RawBoundaryProgramOutcome::Emitted,
+        false,
+        false,
+    ));
+    assert!(!raw_boundary_site_survives(
+        RawBoundaryProgramOutcome::Emitted,
+        true,
+        false,
+    ));
+    assert_eq!(
+        raw_boundary_subject_delivery(
+            RawBoundaryProgramOutcome::Emitted,
+            true,
+            false,
+            false,
+            false,
+        ),
+        RawBoundarySubjectDelivery::Realized,
+    );
+    assert_eq!(
+        raw_boundary_subject_delivery(RawBoundaryProgramOutcome::Emitted, true, false, true, false,),
+        RawBoundarySubjectDelivery::Reverted(RawBoundaryRevertScope::Function),
+    );
+}
+
+#[test]
+fn raw_boundary_delivery_verdict_is_sealed_and_degraded_precedes_regressed() {
+    assert_eq!(
+        raw_boundary_delivery_verdict(false, false),
+        RawBoundaryDelivery::Clean
+    );
+    assert_eq!(
+        raw_boundary_delivery_verdict(false, true),
+        RawBoundaryDelivery::Regressed
+    );
+    assert_eq!(
+        raw_boundary_delivery_verdict(true, true),
+        RawBoundaryDelivery::Degraded
+    );
+}
+
+#[test]
+fn raw_boundary_escalation_kv_encoding_is_lossless() {
+    let message = "escalation-required: no progress\nleft = right with spaces\tand tabs; \
+        this tail deliberately exceeds the ordinary 120-byte report field because \
+        the exact rollback explanation is evidence, not a status token";
+    let encoded = raw_boundary_lossless_encode(message);
+    assert!(!encoded.chars().any(char::is_whitespace));
+    assert!(!encoded.contains('='));
+    let mut row = report::Row::default();
+    row.set_lossless_token(raw_schema::ESCALATION_HEX, &encoded);
+    let parsed = report::parse_kv_line(&report::to_kv_line(&row)).expect("parse KV row");
+    assert_eq!(
+        raw_boundary_lossless_decode(
+            parsed
+                .get(raw_schema::ESCALATION_HEX)
+                .expect("lossless escalation key"),
+        ),
+        Ok(message.to_owned())
+    );
+}
+
+#[test]
+fn raw_boundary_emitted_source_ledger_persists_tree_patch_and_digests() {
+    let root = std::env::temp_dir().join(format!(
+        "crat-raw-boundary-tree-ledger-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&root);
+    let input_root = root.join("input");
+    let local_root = root.join("local");
+    std::fs::create_dir_all(&input_root).unwrap();
+    let input = input_root.join("lib.rs");
+    std::fs::write(&input, "fn old() {}\n").unwrap();
+    let files = [(
+        crate::bo_rewriter::plan::FileKey::Real(input.clone()),
+        "fn new() {}\n".to_owned(),
+    )]
+    .into_iter()
+    .collect();
+    let receipt = persist_raw_boundary_emitted_tree(&input, &local_root, "fixture", Some(&files))
+        .expect("persist emitted tree");
+    assert_eq!(receipt.status, "present");
+    assert_ne!(receipt.input_tree_sha256, receipt.emitted_tree_sha256);
+    assert!(receipt.patch.contains("-fn old() {}"));
+    assert!(receipt.patch.contains("+fn new() {}"));
+    assert_eq!(
+        std::fs::read_to_string(local_root.join("fixture/lib.rs")).unwrap(),
+        "fn new() {}\n"
+    );
+    let absent = persist_raw_boundary_emitted_tree(&input, &local_root, "degraded", None)
+        .expect("persist absent-tree receipt");
+    assert_eq!(absent.status, "absent-degraded");
+    assert_eq!(absent.emitted_tree_sha256, "absent");
+    assert!(absent.file_rows.contains("absent-tree"));
+    std::fs::remove_dir_all(&root).unwrap();
 }
 
 #[test]

@@ -115,7 +115,7 @@ impl ExposureSurfacePlan {
         match self {
             Self::PositiveSeedShim => "positive-seed-entry-shim",
             Self::FnPtrRawWrapper => "fnptr-web-raw-wrapper",
-            Self::ClosedWorldDirect => "exposure-indeterminate-closed-world",
+            Self::ClosedWorldDirect => "internal-by-configuration",
             Self::NotApplicable => "not-applicable",
         }
     }
@@ -405,7 +405,7 @@ mod tests {
         );
         assert_eq!(
             ExposureSurfacePlan::ClosedWorldDirect.key(),
-            "exposure-indeterminate-closed-world"
+            "internal-by-configuration"
         );
     }
 
@@ -641,7 +641,7 @@ mod tests {
                 assert!(
                     receipt.lines().any(|line| {
                         line.starts_with(
-                            "helper\t0\t0\tnone\t0\texposure-indeterminate-closed-world\t",
+                            "helper\t0\t0\tnone\t0\tinternal-by-configuration\t",
                         )
                     }),
                     "{receipt}"

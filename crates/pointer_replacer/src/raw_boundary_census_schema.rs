@@ -8,13 +8,24 @@ pub(crate) const ANALYSIS_FRAME: &str = "raw_boundary_analysis_frame";
 pub(crate) const CODE_FRAME: &str = "raw_boundary_code_frame";
 pub(crate) const WAVE: &str = "raw_boundary_wave";
 pub(crate) const DATA: &str = "raw_boundary_data";
+pub(crate) const DELIVERY: &str = "raw_boundary_delivery";
+pub(crate) const OUTCOME_KIND: &str = "raw_boundary_outcome_kind";
+pub(crate) const ESCALATION_HEX: &str = "raw_boundary_escalation_hex";
+pub(crate) const BISECT_PROBES: &str = "raw_boundary_bisect_probes";
+pub(crate) const VERIFY_ROUNDS: &str = "raw_boundary_verify_rounds";
+pub(crate) const REVERTED_COUNT: &str = "raw_boundary_reverted_count";
 pub(crate) const BUILD_PROFILE: &str = "raw_boundary_build_profile";
 pub(crate) const LAUNCH_PROFILE: &str = "raw_boundary_launch_profile";
+pub(crate) const A5_MODE: &str = "raw_boundary_a5_mode";
+pub(crate) const A5_WORLD: &str = "raw_boundary_a5_world";
+pub(crate) const A5_ATTESTATION: &str = "raw_boundary_a5_attestation";
 pub(crate) const RESOURCE_CONFIGURED_MIB: &str = "raw_boundary_resource_configured_mib";
 pub(crate) const RESOURCE_EFFECTIVE_MIB: &str = "raw_boundary_resource_effective_mib";
 pub(crate) const CACHE_STATUS: &str = "raw_boundary_cache_status";
 pub(crate) const CACHE_FINGERPRINT: &str = "raw_boundary_cache_fingerprint";
 pub(crate) const CACHE_MODEL_SHA256: &str = "raw_boundary_cache_model_sha256";
+pub(crate) const CACHE_MANIFEST_SHA256: &str = "raw_boundary_cache_manifest_sha256";
+pub(crate) const LAUNCH_ENV_SHA256: &str = "raw_boundary_launch_env_sha256";
 pub(crate) const SOLVE_WALL_S: &str = "raw_boundary_solve_wall_s";
 pub(crate) const SOLVER_INVOCATIONS: &str = "raw_boundary_solver_invocations";
 pub(crate) const WAIVER_ID: &str = "raw_boundary_waiver_id";
@@ -34,6 +45,15 @@ pub(crate) const T1_COMPILER_SURVIVING: &str = "raw_boundary_t1_compiler_survivi
 pub(crate) const T2_COMPILER_SURVIVING: &str = "raw_boundary_t2_compiler_surviving";
 pub(crate) const T1_REALIZED_SUBJECTS: &str = "raw_boundary_t1_realized_subjects";
 pub(crate) const T2_REALIZED_SUBJECTS: &str = "raw_boundary_t2_realized_subjects";
+pub(crate) const REALIZED_SUBJECTS: &str = "raw_boundary_realized_subjects";
+pub(crate) const DEGRADED_SUBJECTS: &str = "raw_boundary_degraded_subjects";
+pub(crate) const REVERTED_FUNCTION_SUBJECTS: &str = "raw_boundary_reverted_function_subjects";
+pub(crate) const REVERTED_PROGRAM_SUBJECTS: &str = "raw_boundary_reverted_program_subjects";
+pub(crate) const TYPED_EXCLUDED_SUBJECTS: &str = "raw_boundary_typed_excluded_subjects";
+pub(crate) const EMITTED_TREE_STATUS: &str = "raw_boundary_emitted_tree_status";
+pub(crate) const INPUT_TREE_SHA256: &str = "raw_boundary_input_tree_sha256";
+pub(crate) const EMITTED_TREE_SHA256: &str = "raw_boundary_emitted_tree_sha256";
+pub(crate) const EMITTED_PATCH_SHA256: &str = "raw_boundary_emitted_patch_sha256";
 pub(crate) const MASKED_SECONDARY: &str = "raw_boundary_masked_secondary";
 pub(crate) const ADDRESS_OBSERVATION_EDITS: &str = "raw_boundary_address_observation_edits";
 pub(crate) const EXPOSURE_CONFIGURED_MATCHES: &str = "raw_boundary_exposure_configured_matches";
@@ -120,13 +140,24 @@ pub(crate) const ALL: &[&str] = &[
     CODE_FRAME,
     WAVE,
     DATA,
+    DELIVERY,
+    OUTCOME_KIND,
+    ESCALATION_HEX,
+    BISECT_PROBES,
+    VERIFY_ROUNDS,
+    REVERTED_COUNT,
     BUILD_PROFILE,
     LAUNCH_PROFILE,
+    A5_MODE,
+    A5_WORLD,
+    A5_ATTESTATION,
     RESOURCE_CONFIGURED_MIB,
     RESOURCE_EFFECTIVE_MIB,
     CACHE_STATUS,
     CACHE_FINGERPRINT,
     CACHE_MODEL_SHA256,
+    CACHE_MANIFEST_SHA256,
+    LAUNCH_ENV_SHA256,
     SOLVE_WALL_S,
     SOLVER_INVOCATIONS,
     WAIVER_ID,
@@ -146,6 +177,15 @@ pub(crate) const ALL: &[&str] = &[
     T2_COMPILER_SURVIVING,
     T1_REALIZED_SUBJECTS,
     T2_REALIZED_SUBJECTS,
+    REALIZED_SUBJECTS,
+    DEGRADED_SUBJECTS,
+    REVERTED_FUNCTION_SUBJECTS,
+    REVERTED_PROGRAM_SUBJECTS,
+    TYPED_EXCLUDED_SUBJECTS,
+    EMITTED_TREE_STATUS,
+    INPUT_TREE_SHA256,
+    EMITTED_TREE_SHA256,
+    EMITTED_PATCH_SHA256,
     MASKED_SECONDARY,
     ADDRESS_OBSERVATION_EDITS,
     EXPOSURE_CONFIGURED_MATCHES,
