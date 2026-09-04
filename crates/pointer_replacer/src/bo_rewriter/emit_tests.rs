@@ -4982,10 +4982,16 @@ mod attribution_and_escapes {
 
     use super::Fixture;
     use crate::bo_rewriter::{
-        EditSite, EmittedSite, attribute, edit_sites,
+        EditSite, EmittedSite, attribute,
+        bridge_receipt::SignatureClassId,
+        edit_sites,
         plan::{Edit, FileKey, Justification, Plan},
         verify::{Diag, Direction},
     };
+
+    fn class(did: rustc_hir::def_id::LocalDefId) -> SignatureClassId {
+        SignatureClassId::of(did)
+    }
 
     fn diag(file: &str, line: usize) -> Diag {
         Diag {
@@ -5017,15 +5023,18 @@ mod attribution_and_escapes {
     #[test]
     fn a_caller_file_diagnostic_attributes_to_the_edit_that_justifies_it() {
         let root = Path::new("/crate");
+        let callee = class(rustc_hir::def_id::CRATE_DEF_ID);
         // The subject's own function lives in `callee.rs`; the edit landed in
         // `caller.rs`, which holds no subject at all.
         let sites = [EmittedSite {
+            owner_class: callee,
             file: "/crate/callee.rs".to_owned(),
             fn_path: "k::callee".to_owned(),
             lo_line: 1,
             hi_line: 3,
         }];
         let edits = [EditSite {
+            owner_class: Some(callee),
             file: "/crate/caller.rs".to_owned(),
             fn_path: "k::callee".to_owned(),
             lo_line: 10,
@@ -5047,7 +5056,7 @@ mod attribution_and_escapes {
         );
         assert_eq!(
             owners.into_iter().collect::<Vec<_>>(),
-            vec!["k::callee".to_owned()],
+            vec![callee],
             "an error inside a caller-file edit must name the subject that \
              justifies the edit"
         );
@@ -5077,13 +5086,16 @@ mod attribution_and_escapes {
     #[test]
     fn a_diagnostic_outside_every_edit_still_falls_back_to_the_function_extent() {
         let root = Path::new("/crate");
+        let callee = class(rustc_hir::def_id::CRATE_DEF_ID);
         let sites = [EmittedSite {
+            owner_class: callee,
             file: "/crate/callee.rs".to_owned(),
             fn_path: "k::callee".to_owned(),
             lo_line: 1,
             hi_line: 30,
         }];
         let edits = [EditSite {
+            owner_class: Some(callee),
             file: "/crate/callee.rs".to_owned(),
             fn_path: "k::callee".to_owned(),
             lo_line: 1,
@@ -5101,10 +5113,7 @@ mod attribution_and_escapes {
             &BTreeSet::new(),
             root,
         );
-        assert_eq!(
-            owners.into_iter().collect::<Vec<_>>(),
-            vec!["k::callee".to_owned()]
-        );
+        assert_eq!(owners.into_iter().collect::<Vec<_>>(), vec![callee]);
     }
 
     /// **A STALE edit must not blind attribution — Codex adversarial review,
@@ -5125,39 +5134,52 @@ mod attribution_and_escapes {
     /// filter makes this return empty and fails.
     #[test]
     fn a_reverted_owners_edit_does_not_blind_attribution() {
-        let root = Path::new("/crate");
-        let sites = [EmittedSite {
-            file: "/crate/m.rs".to_owned(),
-            fn_path: "k::caller".to_owned(),
-            lo_line: 5,
-            hi_line: 15,
-        }];
-        let edits = [EditSite {
-            file: "/crate/m.rs".to_owned(),
-            fn_path: "k::callee".to_owned(),
-            lo_line: 10,
-            hi_line: 10,
-            edit_id: "reverted-edit".to_owned(),
-            atom_ids: Vec::new(),
-            atom_covered: false,
-        }];
-        let reverted = BTreeSet::from(["k::callee".to_owned()]);
-
-        let owners = attribute(
-            &[diag("/crate/m.rs", 10)],
-            &Default::default(),
-            root,
-            &sites,
-            &edits,
-            &reverted,
-            root,
-        );
-        assert_eq!(
-            owners.into_iter().collect::<Vec<_>>(),
-            vec!["k::caller".to_owned()],
-            "the reverted owner's edit is no longer applied, so it must not \
-             suppress the extent owner that still is"
-        );
+        let fixture = Fixture::new(&[(
+            "lib.rs",
+            "pub unsafe fn caller(p: *mut i32) { callee(p) }\n\
+             pub unsafe fn callee(_p: *mut i32) {}\n",
+        )]);
+        ::utils::compilation::run_compiler_on_path(&fixture.0.join("lib.rs"), |tcx| {
+            let mut ids = tcx.hir_body_owners().collect::<Vec<_>>();
+            ids.sort_by_key(|did| tcx.def_path_str(did.to_def_id()));
+            let callee = class(ids[0]);
+            let caller = class(ids[1]);
+            assert_ne!(callee, caller);
+            let root = Path::new("/crate");
+            let sites = [EmittedSite {
+                owner_class: caller,
+                file: "/crate/m.rs".to_owned(),
+                fn_path: "same-display".to_owned(),
+                lo_line: 5,
+                hi_line: 15,
+            }];
+            let edits = [EditSite {
+                owner_class: Some(callee),
+                file: "/crate/m.rs".to_owned(),
+                fn_path: "same-display".to_owned(),
+                lo_line: 10,
+                hi_line: 10,
+                edit_id: "reverted-edit".to_owned(),
+                atom_ids: Vec::new(),
+                atom_covered: false,
+            }];
+            let reverted = BTreeSet::from([callee]);
+            let owners = attribute(
+                &[diag("/crate/m.rs", 10)],
+                &Default::default(),
+                root,
+                &sites,
+                &edits,
+                &reverted,
+                root,
+            );
+            assert_eq!(
+                owners.into_iter().collect::<Vec<_>>(),
+                vec![caller],
+                "the reverted class's edit must not suppress its homonymous twin"
+            );
+        })
+        .expect("homonym fixture compiles");
     }
 
     /// `edit_sites` converts byte ranges to the LINES a diagnostic reports in.
@@ -5177,7 +5199,8 @@ mod attribution_and_escapes {
                 hi: 11,
                 replacement: "zzz".to_owned(),
                 justification: Justification::KindDecision { kind: "Ref(mut)" },
-                owner_fn: "k::f".to_owned(),
+                owner_class: Some(class(rustc_hir::def_id::CRATE_DEF_ID)),
+                owner_path: "k::f".to_owned(),
                 atom_ids: Vec::new(),
                 subject_id: "k::f::subject".to_owned(),
                 required_arms: "-".to_owned(),

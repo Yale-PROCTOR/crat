@@ -246,7 +246,10 @@ mod tests {
             hi,
             replacement: text.to_owned(),
             justification: Justification::KindDecision { kind: "test" },
-            owner_fn: "test::owner".to_owned(),
+            owner_class: Some(super::super::bridge_receipt::SignatureClassId::of(
+                rustc_hir::def_id::CRATE_DEF_ID,
+            )),
+            owner_path: "test::owner".to_owned(),
             atom_ids: Vec::new(),
             subject_id: "test::subject".to_owned(),
             required_arms: "-".to_owned(),

@@ -581,10 +581,13 @@ pub(crate) fn rewrite_m1_path(root: &std::path::Path) -> RewriteOutcome {
 /// `O(n log n)` probes in the bad case, and at brotli's 566 s per compile that
 /// is not affordable; the non-minimality is the price of the budget.
 fn bisect(
-    candidates: &[String],
-    base: &std::collections::BTreeSet<String>,
-    mut compiles: impl FnMut(&std::collections::BTreeSet<String>) -> bool,
-) -> (std::collections::BTreeSet<String>, usize) {
+    candidates: &[bridge_receipt::SignatureClassId],
+    base: &std::collections::BTreeSet<bridge_receipt::SignatureClassId>,
+    mut compiles: impl FnMut(&std::collections::BTreeSet<bridge_receipt::SignatureClassId>) -> bool,
+) -> (
+    std::collections::BTreeSet<bridge_receipt::SignatureClassId>,
+    usize,
+) {
     let (mut lo, mut hi) = (0usize, candidates.len());
     let mut probes = 0usize;
     while lo < hi {
@@ -776,7 +779,7 @@ fn rewrite_core_injected_with_config(
                     .iter()
                     .map(|r| format!(
                         "{} @{}..{} owner={} just={:?}",
-                        r.reason, r.edit.lo, r.edit.hi, r.edit.owner_fn, r.edit.justification
+                        r.reason, r.edit.lo, r.edit.hi, r.edit.owner_path, r.edit.justification
                     ))
                     .collect::<Vec<_>>()
                     .join(" | ")
@@ -797,7 +800,7 @@ fn rewrite_core_injected_with_config(
         // One entry per EMITTED SUBJECT (not per function), so a revert can move
         // exactly the right number of subjects from emitted to degraded and the
         // accounting identity survives the loop.
-        let mut emitted_subjects: Vec<(String, String, String, Vec<String>)> = Vec::new();
+        let mut emitted_subjects: Vec<EmittedSubject> = Vec::new();
         // PLACEMENT-TRUTH (S2b.3). A `Ref` decision that `plan` could not place
         // produced no edit, so counting it as emitted over-reports the rewrite
         // by exactly the unplaceable set. Exposure is zero on the frozen corpus
@@ -840,17 +843,21 @@ fn rewrite_core_injected_with_config(
             if unplaceable_subjects.contains(key.as_str()) {
                 continue;
             }
-            emitted_subjects.push((
-                owner.clone(),
-                key,
-                decision::emitability::EmitabilityFacts::site(tcx, subject.attribution_span()),
-                table
+            emitted_subjects.push(EmittedSubject {
+                owner_class: bridge_receipt::SignatureClassId::of(subject.fn_did),
+                owner_path: owner.clone(),
+                subject: key,
+                site: decision::emitability::EmitabilityFacts::site(
+                    tcx,
+                    subject.attribution_span(),
+                ),
+                atoms: table
                     .seams
                     .raw_boundary_atom_groups
                     .get(&(subject.fn_did, subject.hir_id))
                     .map(|atoms| atoms.iter().map(|atom| atom.id.clone()).collect())
                     .unwrap_or_default(),
-            ));
+            });
             if !seen_fns.insert(subject.fn_did) {
                 continue;
             }
@@ -871,6 +878,7 @@ fn rewrite_core_injected_with_config(
                 continue;
             };
             emitted_sites.push(EmittedSite {
+                owner_class: bridge_receipt::SignatureClassId::of(subject.fn_did),
                 file: match key {
                     plan::FileKey::Real(path) => path.display().to_string(),
                     plan::FileKey::Virtual(name) => name,
@@ -986,7 +994,7 @@ fn round_files(
     capture: &ast_transform::AstCapture,
     emission_plan: &plan::Plan,
     emission_texts: &std::collections::BTreeMap<plan::FileKey, String>,
-    reverted: &std::collections::BTreeSet<String>,
+    reverted: &std::collections::BTreeSet<bridge_receipt::SignatureClassId>,
     reverted_atoms: &std::collections::BTreeSet<String>,
     root_key: Option<&plan::FileKey>,
     table: &decision::DecisionTable,
@@ -1007,7 +1015,7 @@ fn round_files(
     String,
 > {
     let reverts =
-        ast_transform::revert_set_from_names_and_atoms(tcx, reverted, reverted_atoms, table)?;
+        ast_transform::revert_set_from_classes_and_atoms(reverted, reverted_atoms, table)?;
     // **PER-FILE (A1, revived 2026-08-18).** The one-entry map that stood here
     // was licensed by C-20's corpus measurement — 20/20 single crate-source
     // file — and that measurement still holds. What it did not cover is the
@@ -1037,7 +1045,7 @@ fn verify_and_revert(
     emitted_count: usize,
     root_text: String,
     emitted_sites: Vec<EmittedSite>,
-    emitted_subjects: Vec<(String, String, String, Vec<String>)>,
+    emitted_subjects: Vec<EmittedSubject>,
     a5_receipt: String,
     e1_subject_receipt: String,
     e2_artifacts: E2Artifacts,
@@ -1049,16 +1057,36 @@ fn verify_and_revert(
     let excluded = decision::universe::classify(tcx).excluded;
     // Built ONCE. Every return below goes through `facts.emitted(..)`
     // or `facts.degraded(..)`; no site hand-fills a field.
-    let site_owners: std::collections::BTreeSet<&str> =
-        emitted_sites.iter().map(|s| s.fn_path.as_str()).collect();
+    let site_owners = emitted_sites
+        .iter()
+        .map(|site| site.owner_class)
+        .collect::<std::collections::BTreeSet<_>>();
     let attribution_blind = emission_plan
         .by_file
         .values()
         .flatten()
-        .map(|edit| edit.owner_fn.as_str())
+        .filter_map(|edit| edit.owner_class)
         .collect::<std::collections::BTreeSet<_>>()
         .difference(&site_owners)
         .count();
+    let mut class_paths = std::collections::BTreeMap::new();
+    for edit in emission_plan.by_file.values().flatten() {
+        if let Some(class) = edit.owner_class {
+            class_paths
+                .entry(class)
+                .or_insert_with(|| edit.owner_path.clone());
+        }
+    }
+    for site in &emitted_sites {
+        class_paths
+            .entry(site.owner_class)
+            .or_insert_with(|| site.fn_path.clone());
+    }
+    for subject in &emitted_subjects {
+        class_paths
+            .entry(subject.owner_class)
+            .or_insert_with(|| subject.owner_path.clone());
+    }
     // BASELINE-DIFFERENTIAL GATE. The gate judges what the REWRITE
     // introduced, not what the input already reported: brotli's frozen
     // source trips a deny-by-default lint unedited, which made
@@ -1163,7 +1191,8 @@ fn verify_and_revert(
     let crate_dir = tree_base
         .and_then(|root| root.parent())
         .map(|d| d.to_path_buf());
-    let mut reverted: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let mut reverted: std::collections::BTreeSet<bridge_receipt::SignatureClassId> =
+        std::collections::BTreeSet::new();
     let mut reverted_atoms: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     let mut atom_reverify_count = 0usize;
     let mut pending_atom_retry: Option<(String, Vec<String>)> = None;
@@ -1458,11 +1487,14 @@ fn verify_and_revert(
                 for owner in owners {
                     let edits = e1_edit_contexts
                         .iter()
-                        .filter(|(candidate, _)| *candidate == owner)
-                        .map(|(_, edit)| edit.clone())
+                        .filter(|(candidate, _, _)| *candidate == owner)
+                        .map(|(_, _, edit)| edit.clone())
                         .collect();
                     facts.e1_reverts.push(E1RevertDiagnostic {
-                        function: owner,
+                        function: class_paths
+                            .get(&owner)
+                            .cloned()
+                            .unwrap_or_else(|| format!("local-def-index:{}", owner.order_key())),
                         diagnostic: diagnostic.clone(),
                         site_kind: e1_diagnostic_site(diagnostic),
                         attribution: attribution.to_owned(),
@@ -1507,18 +1539,20 @@ fn verify_and_revert(
                     ));
             }
             let source = std::fs::read_to_string(staged.root()).unwrap_or_default();
-            let (kept, taken): (Vec<_>, Vec<_>) =
-                emitted_subjects.iter().partition(|(owner, _, _, atoms)| {
-                    !reverted.contains(owner)
-                        && atoms.iter().all(|atom| !reverted_atoms.contains(atom))
-                });
+            let (kept, taken): (Vec<_>, Vec<_>) = emitted_subjects.iter().partition(|subject| {
+                !reverted.contains(&subject.owner_class)
+                    && subject
+                        .atoms
+                        .iter()
+                        .all(|atom| !reverted_atoms.contains(atom))
+            });
             // ACCOUNTING: a reverted subject moves from emitted to
             // degraded under its OWN reason key, so
             // `emitted_final + degraded == row count` survives the loop.
-            for (_, subject, site, _) in &taken {
+            for subject in &taken {
                 facts.degradations.push(decision::Degradation {
-                    subject: subject.clone(),
-                    site: site.clone(),
+                    subject: subject.subject.clone(),
+                    site: subject.site.clone(),
                     reason: decision::DegradeReason::RevertedAfterVerifyFailure,
                 });
             }
@@ -1526,7 +1560,7 @@ fn verify_and_revert(
             facts.reverted_count = taken.len();
             facts.files_touched = files_edited;
             facts.raw_boundary_artifacts.final_reverts =
-                render_raw_boundary_final_reverts(&reverted, &reverted_atoms);
+                render_raw_boundary_final_reverts(&reverted, &reverted_atoms, &class_paths);
             return facts.emitted(source, files);
         }
 
@@ -1538,7 +1572,8 @@ fn verify_and_revert(
             let live_atom_sites = planned_edit_sites
                 .iter()
                 .filter(|edit| {
-                    !reverted.contains(&edit.fn_path)
+                    edit.owner_class
+                        .is_some_and(|class| !reverted.contains(&class))
                         && edit
                             .atom_ids
                             .iter()
@@ -1719,11 +1754,11 @@ fn verify_and_revert(
     // reverting every candidate left edits standing, the crate still
     // failed, and bisect returned a non-compiling set. Two derivations
     // assumed identical — the founding class.
-    let candidates: Vec<String> = emission_plan
+    let candidates: Vec<bridge_receipt::SignatureClassId> = emission_plan
         .by_file
         .values()
         .flatten()
-        .map(|edit| edit.owner_fn.clone())
+        .filter_map(|edit| edit.owner_class)
         .filter(|owner| !reverted.contains(owner))
         .collect::<std::collections::BTreeSet<_>>()
         .into_iter()
@@ -1846,15 +1881,17 @@ fn verify_and_revert(
             } =>
         {
             let source = std::fs::read_to_string(staged.root()).unwrap_or_default();
-            let (kept, taken): (Vec<_>, Vec<_>) =
-                emitted_subjects.iter().partition(|(owner, _, _, atoms)| {
-                    !final_reverted.contains(owner)
-                        && atoms.iter().all(|atom| !reverted_atoms.contains(atom))
-                });
-            for (_, subject, site, _) in &taken {
+            let (kept, taken): (Vec<_>, Vec<_>) = emitted_subjects.iter().partition(|subject| {
+                !final_reverted.contains(&subject.owner_class)
+                    && subject
+                        .atoms
+                        .iter()
+                        .all(|atom| !reverted_atoms.contains(atom))
+            });
+            for subject in &taken {
                 facts.degradations.push(decision::Degradation {
-                    subject: subject.clone(),
-                    site: site.clone(),
+                    subject: subject.subject.clone(),
+                    site: subject.site.clone(),
                     reason: decision::DegradeReason::RevertedAfterVerifyFailure,
                 });
             }
@@ -1866,7 +1903,7 @@ fn verify_and_revert(
             facts.bisect_probes = probes;
             facts.escalated = Some(escalation);
             facts.raw_boundary_artifacts.final_reverts =
-                render_raw_boundary_final_reverts(&final_reverted, &reverted_atoms);
+                render_raw_boundary_final_reverts(&final_reverted, &reverted_atoms, &class_paths);
             facts.emitted(source, final_files)
         }
         _ => {
@@ -2819,8 +2856,10 @@ const MAX_ATOM_REVERIFIES: usize = 1;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct EditSite {
     pub file: String,
-    /// The **subject that justifies the edit**, which is `Edit::owner_fn` — not
-    /// the function the edit lands in. That difference is the whole repair.
+    /// Direct signature-class ownership. `None` is only the derived crate-level
+    /// fallback extent declaration.
+    pub owner_class: Option<bridge_receipt::SignatureClassId>,
+    /// Display-only path for receipts.
     pub fn_path: String,
     pub lo_line: usize,
     pub hi_line: usize,
@@ -2885,15 +2924,22 @@ fn atom_fallback(reason: &'static str) -> AtomSelection {
 }
 
 fn render_raw_boundary_final_reverts(
-    functions: &std::collections::BTreeSet<String>,
+    functions: &std::collections::BTreeSet<bridge_receipt::SignatureClassId>,
     atoms: &std::collections::BTreeSet<String>,
+    display_paths: &std::collections::BTreeMap<bridge_receipt::SignatureClassId, String>,
 ) -> String {
-    let mut out = String::from("kind\tidentity\n");
-    for function in functions {
-        out.push_str(&format!("function\t{function}\n"));
+    let mut out = String::from("kind\tidentity\tclass_id\n");
+    for &function in functions {
+        let path = display_paths
+            .get(&function)
+            .map_or("<unknown-local-class>", String::as_str);
+        out.push_str(&format!(
+            "function\t{path}\tlocal-def-index:{}\n",
+            function.order_key()
+        ));
     }
     for atom in atoms {
-        out.push_str(&format!("atom\t{atom}\n"));
+        out.push_str(&format!("atom\t{atom}\t-\n"));
     }
     out
 }
@@ -3105,12 +3151,13 @@ fn edit_sites(
     let mut owners_with_atoms = std::collections::BTreeSet::new();
     let mut owners_with_uncovered_edits = std::collections::BTreeSet::new();
     for edit in planned.by_file.values().flatten() {
+        let Some(owner_class) = edit.owner_class else {
+            continue;
+        };
         if edit.atom_ids.is_empty() {
-            if edit.owner_fn != "<crate>" {
-                owners_with_uncovered_edits.insert(edit.owner_fn.clone());
-            }
+            owners_with_uncovered_edits.insert(owner_class);
         } else {
-            owners_with_atoms.insert(edit.owner_fn.clone());
+            owners_with_atoms.insert(owner_class);
         }
     }
     let mut out = Vec::new();
@@ -3129,7 +3176,7 @@ fn edit_sites(
                 format!("{:x}", Sha256::digest(edit.replacement.as_bytes()))
             };
             let edit_key = EditKey {
-                owner: edit.owner_fn.clone(),
+                owner: edit.owner_path.clone(),
                 subject: edit.subject_id.clone(),
                 arms: edit.required_arms.clone(),
                 kind: edit.edit_kind,
@@ -3140,14 +3187,19 @@ fn edit_sites(
             };
             out.push(EditSite {
                 file: file.clone(),
-                fn_path: edit.owner_fn.clone(),
+                owner_class: edit.owner_class,
+                fn_path: edit.owner_path.clone(),
                 lo_line,
                 hi_line,
                 edit_id: edit_key.render(),
                 atom_ids: edit.atom_ids.clone(),
                 atom_covered: !edit.atom_ids.is_empty()
-                    && owners_with_atoms.contains(&edit.owner_fn)
-                    && !owners_with_uncovered_edits.contains(&edit.owner_fn),
+                    && edit
+                        .owner_class
+                        .is_some_and(|owner| owners_with_atoms.contains(&owner))
+                    && edit
+                        .owner_class
+                        .is_some_and(|owner| !owners_with_uncovered_edits.contains(&owner)),
             });
         }
     }
@@ -3157,7 +3209,7 @@ fn edit_sites(
 fn e1_edit_contexts(
     planned: &plan::Plan,
     texts: &std::collections::BTreeMap<plan::FileKey, String>,
-) -> Vec<(String, E1EditContext)> {
+) -> Vec<(bridge_receipt::SignatureClassId, String, E1EditContext)> {
     let mut out = Vec::new();
     for (key, edits) in &planned.by_file {
         let Some(text) = texts.get(key) else {
@@ -3168,6 +3220,9 @@ fn e1_edit_contexts(
             plan::FileKey::Virtual(name) => name.clone(),
         };
         for edit in edits {
+            let Some(owner_class) = edit.owner_class else {
+                continue;
+            };
             let (lo_line, hi_line) = line_span(text, edit.lo, edit.hi);
             let replacement_head = edit
                 .replacement
@@ -3178,7 +3233,8 @@ fn e1_edit_contexts(
                 .take(160)
                 .collect();
             out.push((
-                edit.owner_fn.clone(),
+                owner_class,
+                edit.owner_path.clone(),
                 E1EditContext {
                     file: file.clone(),
                     lo_line,
@@ -3191,18 +3247,20 @@ fn e1_edit_contexts(
     }
     out.sort_by(|left, right| {
         (
-            left.0.as_str(),
-            left.1.file.as_str(),
-            left.1.lo_line,
-            left.1.hi_line,
-            left.1.shape.as_str(),
+            left.0,
+            left.1.as_str(),
+            left.2.file.as_str(),
+            left.2.lo_line,
+            left.2.hi_line,
+            left.2.shape.as_str(),
         )
             .cmp(&(
-                right.0.as_str(),
-                right.1.file.as_str(),
-                right.1.lo_line,
-                right.1.hi_line,
-                right.1.shape.as_str(),
+                right.0,
+                right.1.as_str(),
+                right.2.file.as_str(),
+                right.2.lo_line,
+                right.2.hi_line,
+                right.2.shape.as_str(),
             ))
     });
     out
@@ -3272,7 +3330,7 @@ fn e1_region_owners(
     original_root: &std::path::Path,
     sites: &[EmittedSite],
     edits: &[EditSite],
-) -> std::collections::BTreeSet<String> {
+) -> std::collections::BTreeSet<bridge_receipt::SignatureClassId> {
     let diagnostic_file = verify::crate_relative(&diagnostic.file, observed_root);
     let mut maps = line_maps
         .iter()
@@ -3302,14 +3360,14 @@ fn e1_region_owners(
     let mut owners = edits
         .iter()
         .filter(|edit| same_file(&edit.file) && edit.lo_line <= hi && lo <= edit.hi_line)
-        .map(|edit| edit.fn_path.clone())
+        .filter_map(|edit| edit.owner_class)
         .collect::<std::collections::BTreeSet<_>>();
     if owners.is_empty() {
         owners.extend(
             sites
                 .iter()
                 .filter(|site| same_file(&site.file) && site.lo_line <= hi && lo <= site.hi_line)
-                .map(|site| site.fn_path.clone()),
+                .map(|site| site.owner_class),
         );
     }
     owners
@@ -3347,13 +3405,13 @@ fn attribute(
     observed_root: &std::path::Path,
     sites: &[EmittedSite],
     edits: &[EditSite],
-    reverted: &std::collections::BTreeSet<String>,
+    reverted: &std::collections::BTreeSet<bridge_receipt::SignatureClassId>,
     original_root: &std::path::Path,
-) -> std::collections::BTreeSet<String> {
+) -> std::collections::BTreeSet<bridge_receipt::SignatureClassId> {
     // **ONLY THE EDITS THIS ROUND ACTUALLY APPLIED.**
     //
     // `edit_sites` is built once from the whole plan, but `render` keeps an
-    // edit only while `!reverted.contains(&edit.owner_fn)`. Attributing through
+    // edit only while its direct owner class is live. Attributing through
     // the unfiltered list is therefore a SECOND derivation of "which edits are
     // live", and the two diverge the moment anything is reverted: a stale edit
     // matches a later round's diagnostic, contributes only an already-reverted
@@ -3366,7 +3424,10 @@ fn attribute(
     // so attribution filters by the SAME predicate `render` filters by.
     let edits: Vec<&EditSite> = edits
         .iter()
-        .filter(|edit| !reverted.contains(&edit.fn_path))
+        .filter(|edit| {
+            edit.owner_class
+                .is_some_and(|class| !reverted.contains(&class))
+        })
         .collect();
     // The SAME canonicalizer as the differential gate, each side against its own
     // root: sites were recorded in the original tree, diagnostics come from the
@@ -3426,7 +3487,9 @@ fn attribute(
             let same_file =
                 single_file || verify::crate_relative(&edit.file, original_root) == diag_rel;
             if same_file && edit.lo_line <= diag_line && diag_line <= edit.hi_line {
-                by_edit.insert(edit.fn_path.clone());
+                if let Some(owner_class) = edit.owner_class {
+                    by_edit.insert(owner_class);
+                }
             }
         }
         if !by_edit.is_empty() {
@@ -3437,7 +3500,7 @@ fn attribute(
             let same_file =
                 single_file || verify::crate_relative(&site.file, original_root) == diag_rel;
             if same_file && site.lo_line <= diag_line && diag_line <= site.hi_line {
-                owners.insert(site.fn_path.clone());
+                owners.insert(site.owner_class);
             }
         }
     }
@@ -3448,10 +3511,20 @@ fn attribute(
 /// diagnostic to it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct EmittedSite {
+    pub owner_class: bridge_receipt::SignatureClassId,
     pub file: String,
     pub fn_path: String,
     pub lo_line: usize,
     pub hi_line: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct EmittedSubject {
+    owner_class: bridge_receipt::SignatureClassId,
+    owner_path: String,
+    subject: String,
+    site: String,
+    atoms: Vec<String>,
 }
 
 /// The rewritten source of every file the plan touched, plus what could not be
@@ -3553,7 +3626,8 @@ pub(crate) fn validate_plan(
             // Added AFTER the revert filter, so this name is never matched
             // against the revert set — it is not a sentinel that must be kept
             // out of it, it is simply not subject to it.
-            owner_fn: "<crate>".to_owned(),
+            owner_class: None,
+            owner_path: "<crate>".to_owned(),
             atom_ids: Vec::new(),
             subject_id: "<crate>".to_owned(),
             required_arms: "-".to_owned(),
@@ -3731,7 +3805,8 @@ pub(crate) fn emit_files<'tcx>(
             hi,
             replacement,
             justification: plan::Justification::C9Mark,
-            owner_fn: mark.owner_fn.clone(),
+            owner_class: Some(bridge_receipt::SignatureClassId::of(mark.owner_did)),
+            owner_path: mark.owner_fn.clone(),
             atom_ids: Vec::new(),
             subject_id: mark.owner_fn.clone(),
             required_arms: "-".to_owned(),
@@ -4465,7 +4540,7 @@ fn finish_decide<'tcx>(
             }
             out
         },
-        final_reverts: String::from("kind\tidentity\n"),
+        final_reverts: String::from("kind\tidentity\tclass_id\n"),
         bridge_events: Vec::new(),
         class_costs: bridge_receipt::class_cost_header(),
         class_collisions: bridge_receipt::class_collision_header(),
@@ -6637,7 +6712,7 @@ fn push_overlap_columns(
 #[cfg(test)]
 mod raw_boundary_atom_tests {
     use super::{
-        AtomSelectionKind, EditSite, atom_surviving_edit_ids, edit_sites,
+        AtomSelectionKind, EditSite, atom_surviving_edit_ids, bridge_receipt, edit_sites,
         select_atoms_on_original_lines, verify,
     };
 
@@ -6661,6 +6736,9 @@ mod raw_boundary_atom_tests {
 
     fn site(line: usize, id: &str, group: &[&str], covered: bool) -> EditSite {
         EditSite {
+            owner_class: Some(bridge_receipt::SignatureClassId::of(
+                rustc_hir::def_id::CRATE_DEF_ID,
+            )),
             file: "fixture.rs".to_owned(),
             fn_path: "crate::f".to_owned(),
             lo_line: line,
@@ -6743,7 +6821,10 @@ mod raw_boundary_atom_tests {
                 hi: 1,
                 replacement: "y".to_owned(),
                 justification: Justification::KindDecision { kind: "Ref" },
-                owner_fn: "crate::f".to_owned(),
+                owner_class: Some(bridge_receipt::SignatureClassId::of(
+                    rustc_hir::def_id::CRATE_DEF_ID,
+                )),
+                owner_path: "crate::f".to_owned(),
                 atom_ids: vec!["atom-1".to_owned()],
                 subject_id: "crate::f::p#1".to_owned(),
                 required_arms: "d4+c+pair".to_owned(),

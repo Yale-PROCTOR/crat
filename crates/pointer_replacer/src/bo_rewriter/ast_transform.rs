@@ -2546,7 +2546,7 @@ fn transform_with(
     for mark in table
         .c9_marks
         .iter()
-        .filter(|mark| reverts.keeps(&mark.owner_fn))
+        .filter(|mark| reverts.keeps(super::bridge_receipt::SignatureClassId::of(mark.owner_did)))
     {
         let key = (mark.call_span.lo().0, mark.call_span.hi().0);
         if c9_marks.insert(key, mark).is_some() {
@@ -3205,14 +3205,12 @@ fn compare_renders(
 /// one direction only — the span side read `emission.plan` unfiltered — and the
 /// two sides then agreed about a population that was not the emitted one.
 ///
-/// It carries **both** vocabularies because the pipeline reverts in both:
-/// `emit_files` filters SUBJECTS by `LocalDefId` at plan-build time, while
-/// `render` filters EDITS by `owner_fn` afterwards. A seam edit is only ever
-/// caught by the second — `plan`'s own comment says so: *"Reverting the callee
-/// reverts its seams with it, because `owner_fn` is the revert key."*
+/// Production carries one vocabulary: direct `LocalDefId` ownership. The
+/// historical text-oracle display names remain test-only.
 #[derive(Default)]
 pub(crate) struct RevertSet {
     pub fns: FxHashSet<LocalDefId>,
+    #[cfg(test)]
     pub names: FxHashSet<String>,
     /// Exact raw-boundary atom IDs selected by the verifier.
     pub atom_names: FxHashSet<String>,
@@ -3220,32 +3218,29 @@ pub(crate) struct RevertSet {
     /// identity; it lets one subject be withheld without reverting siblings in
     /// the same function.
     pub atom_subjects: FxHashSet<(LocalDefId, HirId)>,
+    #[cfg(test)]
     pub subjects: usize,
 }
 
 impl RevertSet {
-    /// Does an edit owned by `owner_fn` survive? **The single place either side
+    /// Does an edit owned by a signature class survive? **The single place either side
     /// asks**, so they cannot diverge on population again.
     ///
     /// **PRODUCTION LAW from 2026-08-16 (M-2).** The type graduated out of
     /// `#[cfg(test)]` when the verify/revert loop was wired to the AST layer:
-    /// production needs a revert vocabulary spanning BOTH keys, because
-    /// `emit_files` filters SUBJECTS by `LocalDefId` while `render` filters
-    /// EDITS by `owner_fn`, and a seam edit is only ever caught by the second.
-    ///
-    /// Applying this to EVERY plan edit reproduces `render`'s semantics exactly.
-    /// It is idempotent on `KindDecision` edits — `emit_files` has already
-    /// dropped those subjects, and `owner_of(subject)` is the same
-    /// `def_path_str` these names are — so one uniform filter is both correct
-    /// and sufficient.
-    pub(crate) fn keeps(&self, owner_fn: &str) -> bool {
-        !self.names.contains(owner_fn)
+    /// production and the AST inputs consume the same direct class ID.
+    pub(crate) fn keeps(&self, owner: super::bridge_receipt::SignatureClassId) -> bool {
+        !self.fns.contains(&owner.local_def_id())
     }
 
     /// Does a carried edit survive both the established function revert and
     /// the raw-boundary atom dependency closure?
-    pub(crate) fn keeps_edit(&self, owner_fn: &str, atom_ids: &[String]) -> bool {
-        self.keeps(owner_fn) && atom_ids.iter().all(|atom| !self.atom_names.contains(atom))
+    pub(crate) fn keeps_edit(
+        &self,
+        owner: super::bridge_receipt::SignatureClassId,
+        atom_ids: &[String],
+    ) -> bool {
+        self.keeps(owner) && atom_ids.iter().all(|atom| !self.atom_names.contains(atom))
     }
 
     /// Does a subject survive? `emit_files`'s own rule, restated for the AST
@@ -3291,8 +3286,8 @@ pub(crate) struct FilteredInputs {
 /// Build both filtered maps from one decision table and one revert set.
 ///
 /// `subject_of` yields each use edit's owning subject so the arm-2 filter can
-/// ask `keeps_subject`; the arm-3 filter asks `keeps` on the seam's own
-/// `owner_fn`, which is the CALLEE — the revert key a seam is caught by.
+/// ask `keeps_subject`; the arm-3 filter asks `keeps` on the seam's direct
+/// callee class ID.
 pub(crate) fn filtered_inputs(
     table: &super::decision::DecisionTable,
     reverts: &RevertSet,
@@ -3345,9 +3340,8 @@ pub(crate) fn filtered_inputs(
         }
     }
     for edit in &table.seams.edits {
-        // ARM 3's filter, on the CALLEE's path: reverting a callee reverts its
-        // seams with it, because `owner_fn` is the revert key.
-        if !reverts.keeps_edit(&edit.owner_fn, &edit.atom_ids) {
+        // ARM 3's filter, on the CALLEE's direct class ID.
+        if !reverts.keeps_edit(edit.owner_class, &edit.atom_ids) {
             continue;
         }
         let key = (edit.span.lo().0, edit.span.hi().0);
@@ -3360,7 +3354,7 @@ pub(crate) fn filtered_inputs(
         );
     }
     for edit in &table.seams.body_edits {
-        if !reverts.keeps(&edit.owner_fn) {
+        if !reverts.keeps(edit.owner_class) {
             continue;
         }
         insert_counting(
@@ -3393,6 +3387,7 @@ pub(crate) fn filtered_inputs(
 ///
 /// Pure over the counts so it has a witness — `oracle_reverts` itself needs a
 /// `TyCtxt` and is corpus-only.
+#[cfg(test)]
 pub(crate) fn revert_resolution_failure(
     by_name: &[(String, usize)],
     wanted: usize,
@@ -3481,15 +3476,15 @@ pub(crate) fn oracle_reverts(
     resolve_reverts(tcx, &wanted, subjects, path)
 }
 
-/// **THE ONE NAME→`LocalDefId` RESOLUTION.** Both revert producers go through
-/// here: the oracle's text format ([`oracle_reverts`]) and the verify loop's own
-/// `BTreeSet<String>` of reverted owners ([`revert_set_from_names`]).
+/// Historical text-oracle name→`LocalDefId` resolution. Production never calls
+/// this test-only adapter.
 ///
 /// It is extracted rather than copied for the reason this module keeps
 /// re-learning: *which functions are reverted* is exactly the kind of fact that
 /// grows a second derivation and then diverges from the first. The stale-edit
 /// attribution defect (S3.6-1 task 2, P3(a)) was that shape, and it was in code
 /// one commit old at the time.
+#[cfg(test)]
 fn resolve_reverts(
     tcx: rustc_middle::ty::TyCtxt<'_>,
     wanted: &FxHashSet<&str>,
@@ -3527,39 +3522,32 @@ fn resolve_reverts(
     }
     Ok(RevertSet {
         fns: out,
+        #[cfg(test)]
         names: seen,
         atom_names: FxHashSet::default(),
         atom_subjects: FxHashSet::default(),
+        #[cfg(test)]
         subjects,
     })
 }
 
-/// **THE LOOP'S REVERT ADAPTER.** The verify loop reverts by owner NAME — the
-/// vocabulary `render` filters edits with. The AST layer needs both
-/// vocabularies, because `emit_files` filters SUBJECTS by `LocalDefId` while the
-/// use and seam arms filter EDITS by `owner_fn`.
-///
-/// ⚠ **An empty name set is not an error and must not resolve to "revert
-/// everything" or fail the injectivity check** — round 0 always has one.
-pub(crate) fn revert_set_from_names(
-    tcx: rustc_middle::ty::TyCtxt<'_>,
-    names: &std::collections::BTreeSet<String>,
-) -> Result<RevertSet, String> {
-    let wanted: FxHashSet<&str> = names.iter().map(String::as_str).collect();
-    resolve_reverts(tcx, &wanted, names.len(), "verify-loop")
-}
-
-/// Verify-loop adapter for the mixed function/atom population. Atom IDs are
-/// validated against the carried decision table, and a selected site expands
-/// to exactly its subject dependency group. Unknown IDs fail loudly rather
-/// than becoming a no-op revert.
-pub(crate) fn revert_set_from_names_and_atoms(
-    tcx: rustc_middle::ty::TyCtxt<'_>,
-    names: &std::collections::BTreeSet<String>,
+/// Production verify-loop adapter. Class ownership arrives as a typed
+/// `LocalDefId` wrapper, so this path performs no rendered-name scan or
+/// resolution. Atom IDs remain checked against the carried decision table.
+pub(crate) fn revert_set_from_classes_and_atoms(
+    classes: &std::collections::BTreeSet<super::bridge_receipt::SignatureClassId>,
     atoms: &std::collections::BTreeSet<String>,
     table: &super::decision::DecisionTable,
 ) -> Result<RevertSet, String> {
-    let mut out = revert_set_from_names(tcx, names)?;
+    let mut out = RevertSet {
+        fns: classes.iter().map(|class| class.local_def_id()).collect(),
+        #[cfg(test)]
+        names: FxHashSet::default(),
+        atom_names: FxHashSet::default(),
+        atom_subjects: FxHashSet::default(),
+        #[cfg(test)]
+        subjects: classes.len(),
+    };
     if atoms.is_empty() {
         return Ok(out);
     }
@@ -5958,6 +5946,9 @@ mod arm2_witnesses {
             let edit = |family| super::super::decision::seam::SeamEdit {
                 span: DUMMY_SP,
                 replacement: String::new(),
+                owner_class: super::super::bridge_receipt::SignatureClassId::of(
+                    rustc_hir::def_id::CRATE_DEF_ID,
+                ),
                 owner_fn: String::new(),
                 lifetime_plan_digest: None,
                 caller_fn: String::new(),
@@ -6201,7 +6192,10 @@ mod arm2_witnesses {
             hi: 1,
             replacement: String::new(),
             justification: j,
-            owner_fn: String::new(),
+            owner_class: Some(super::super::bridge_receipt::SignatureClassId::of(
+                rustc_hir::def_id::CRATE_DEF_ID,
+            )),
+            owner_path: String::new(),
             atom_ids: Vec::new(),
             subject_id: String::new(),
             required_arms: "-".to_owned(),
@@ -6280,7 +6274,10 @@ mod arm2_witnesses {
             hi: 1,
             replacement: String::new(),
             justification: J::KindDecision { kind: "Ref" },
-            owner_fn: String::new(),
+            owner_class: Some(super::super::bridge_receipt::SignatureClassId::of(
+                rustc_hir::def_id::CRATE_DEF_ID,
+            )),
+            owner_path: String::new(),
             atom_ids: Vec::new(),
             subject_id: String::new(),
             required_arms: "-".to_owned(),

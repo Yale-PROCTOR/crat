@@ -34,7 +34,10 @@
 
 use std::{collections::BTreeMap, path::PathBuf};
 
-use super::decision::{Decision, DecisionTable};
+use super::{
+    bridge_receipt::SignatureClassId,
+    decision::{Decision, DecisionTable},
+};
 
 /// Which source file an edit belongs to.
 ///
@@ -164,9 +167,12 @@ pub(crate) struct Edit {
     /// reverting the file or the containing function would take back edits the
     /// culprit did not cause and leave the ones it did.
     ///
-    /// Carried as a rendered path rather than a `LocalDefId` so no compiler type
-    /// enters `plan`.
-    pub owner_fn: String,
+    /// Direct signature-class identity. `None` is reserved for the derived
+    /// crate-level fallback-extent declaration, which has no owning class.
+    pub owner_class: Option<SignatureClassId>,
+    /// Human-readable path for receipts only. No production decision may parse
+    /// or compare this value.
+    pub owner_path: String,
     /// Exact raw-boundary dependency group. Empty for every pre-wave edit.
     /// A group is carried, not reconstructed, so removing one atom can remove
     /// its declaration/use/seam closure while leaving an independent subject
@@ -295,9 +301,9 @@ pub(crate) fn plan(
 ) -> Plan {
     let mut by_file: BTreeMap<FileKey, Vec<Edit>> = BTreeMap::new();
     let mut unplaceable = Vec::new();
-    let mut owner_arms = BTreeMap::<String, super::decision::RequiredArmSet>::new();
+    let mut owner_arms = BTreeMap::<SignatureClassId, super::decision::RequiredArmSet>::new();
     for (subject, _) in &table.entries {
-        let owner = owner_of(subject);
+        let owner = SignatureClassId::of(subject.fn_did);
         let required = table
             .arm_requirements
             .get(&(subject.fn_did, subject.hir_id))
@@ -318,9 +324,8 @@ pub(crate) fn plan(
     // only a *use* edit may cross a file; a seam copies no pointee text, it
     // wraps an expression already present in the caller.
     //
-    // Reverting the callee reverts its seams with it, because `owner_fn` is the
-    // revert key and every seam carries the callee's path. That is what keeps a
-    // half-adapted call from surviving a revert.
+    // Reverting the callee reverts its seams with it because every seam carries
+    // the callee's direct signature-class ID. The path is receipt-only.
     for seam in &table.seams.edits {
         match span_to_loc(seam.span) {
             Ok((file, lo, hi)) => by_file.entry(file).or_default().push(Edit {
@@ -334,11 +339,12 @@ pub(crate) fn plan(
                     },
                     fabricated: seam.spec.len.as_ref().is_some_and(|l| l.is_fabricated()),
                 },
-                owner_fn: seam.owner_fn.clone(),
+                owner_class: Some(seam.owner_class),
+                owner_path: seam.owner_fn.clone(),
                 atom_ids: seam.atom_ids.clone(),
                 subject_id: format!("{}#arg{}", seam.owner_fn, seam.param_index),
                 required_arms: owner_arms
-                    .get(&seam.owner_fn)
+                    .get(&seam.owner_class)
                     .copied()
                     .unwrap_or_default()
                     .render(),
@@ -371,11 +377,12 @@ pub(crate) fn plan(
                     },
                     fabricated: false,
                 },
-                owner_fn: body.owner_fn.clone(),
+                owner_class: Some(body.owner_class),
+                owner_path: body.owner_fn.clone(),
                 atom_ids: Vec::new(),
                 subject_id: body.destination.clone(),
                 required_arms: owner_arms
-                    .get(&body.owner_fn)
+                    .get(&body.owner_class)
                     .copied()
                     .unwrap_or_default()
                     .render(),
@@ -598,7 +605,8 @@ pub(crate) fn plan(
                         } else {
                             Justification::KindDecision { kind: "Box(expr)" }
                         },
-                        owner_fn: owner_of(subject),
+                        owner_class: Some(SignatureClassId::of(subject.fn_did)),
+                        owner_path: owner_of(subject),
                         atom_ids: subject_atom_ids.clone(),
                         subject_id: subject_id.clone(),
                         required_arms: subject_arms.clone(),
@@ -619,7 +627,8 @@ pub(crate) fn plan(
                         justification: Justification::StoreForm {
                             form: "box-delete-initializer-store",
                         },
-                        owner_fn: owner_of(subject),
+                        owner_class: Some(SignatureClassId::of(subject.fn_did)),
+                        owner_path: owner_of(subject),
                         atom_ids: subject_atom_ids.clone(),
                         subject_id: subject_id.clone(),
                         required_arms: subject_arms.clone(),
@@ -643,7 +652,8 @@ pub(crate) fn plan(
                     justification: Justification::KindDecision {
                         kind: if optional { "Opt(use)" } else { "Slice(use)" },
                     },
-                    owner_fn: owner_of(subject),
+                    owner_class: Some(SignatureClassId::of(subject.fn_did)),
+                    owner_path: owner_of(subject),
                     atom_ids: subject_atom_ids.clone(),
                     subject_id: subject_id.clone(),
                     required_arms: subject_arms.clone(),
@@ -692,7 +702,8 @@ pub(crate) fn plan(
                 hi: ty_hi,
                 replacement,
                 justification: Justification::KindDecision { kind },
-                owner_fn: owner_of(subject),
+                owner_class: Some(SignatureClassId::of(subject.fn_did)),
+                owner_path: owner_of(subject),
                 atom_ids: subject_atom_ids,
                 subject_id,
                 required_arms: subject_arms,

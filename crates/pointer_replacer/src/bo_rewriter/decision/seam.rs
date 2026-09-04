@@ -38,6 +38,7 @@ use std::collections::BTreeSet;
 use rustc_span::Span;
 
 use super::a5_site_proof::{A5PeerProof, A5SeamProofIndex, A5SiteProofVerdict};
+use crate::bo_rewriter::bridge_receipt::SignatureClassId;
 
 /// The pointer-ish form a value has at an argument position.
 ///
@@ -281,6 +282,9 @@ pub(crate) struct SeamEdit {
     /// The **argument expression's** span, in the CALLER's file.
     pub span: Span,
     pub replacement: String,
+    /// Direct identity of the converted signature class. This is the sole
+    /// ownership key used by verification; `owner_fn` is display-only.
+    pub owner_class: SignatureClassId,
     /// The callee subject whose conversion justifies this edit — the revert key.
     /// The edit lands in the caller's file and is owned by the callee, which is
     /// the divergence `plan`'s `owner_fn` doc was written for.
@@ -349,6 +353,7 @@ pub(crate) struct SeamEdit {
 pub(crate) struct BodyEdit {
     pub span: Span,
     pub replacement: String,
+    pub owner_class: SignatureClassId,
     pub owner_fn: String,
     pub destination: String,
     pub context: super::emitability::BodyAdapterContext,
@@ -2685,6 +2690,7 @@ pub(crate) fn synthesize_with_raw_boundary(
                         plan.edits.push(SeamEdit {
                             span: pos.span,
                             replacement: candidate.replacement.clone(),
+                            owner_class: SignatureClassId::of(*callee),
                             owner_fn: tcx.def_path_str(callee.to_def_id()),
                             lifetime_plan_digest: table
                                 .lifetime_plan
@@ -2800,9 +2806,13 @@ pub(crate) fn synthesize_with_raw_boundary(
             .and_then(|node| plan.raw_boundary_atom_groups.get(&node))
             .map(|atoms| atoms.iter().map(|atom| atom.id.clone()).collect())
             .unwrap_or_default();
+        let Some((owner_did, _)) = site.node else {
+            continue;
+        };
         plan.edits.push(SeamEdit {
             span: site.span,
             replacement,
+            owner_class: SignatureClassId::of(owner_did),
             owner_fn: key.caller.clone(),
             lifetime_plan_digest: None,
             caller_fn: key.caller.clone(),
@@ -2861,6 +2871,7 @@ pub(crate) fn synthesize_with_raw_boundary(
         plan.edits.push(SeamEdit {
             span: pair.span,
             replacement,
+            owner_class: SignatureClassId::of(pair.callee),
             owner_fn: tcx.def_path_str(pair.callee.to_def_id()),
             lifetime_plan_digest: table
                 .lifetime_plan
@@ -2904,6 +2915,7 @@ pub(crate) fn synthesize_with_raw_boundary(
         plan.edits.push(SeamEdit {
             span: site.span,
             replacement,
+            owner_class: SignatureClassId::of(site.node.0),
             owner_fn: site.owner.clone(),
             lifetime_plan_digest: None,
             caller_fn: site.owner.clone(),
@@ -3067,6 +3079,7 @@ pub(crate) fn synthesize_with_raw_boundary(
                 plan.body_edits.push(BodyEdit {
                     span: site.rhs_span,
                     replacement,
+                    owner_class: SignatureClassId::of(site.owner),
                     owner_fn,
                     destination,
                     context: site.context,
