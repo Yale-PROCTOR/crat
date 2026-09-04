@@ -142,6 +142,9 @@ pub(crate) struct BridgeSitePlan {
     pub(crate) arm: String,
     pub(crate) position: String,
     pub(crate) bridge_kind: String,
+    pub(crate) expected_form: String,
+    pub(crate) found_form: String,
+    pub(crate) argument_kind: String,
     pub(crate) extent: BridgeExtentKind,
     pub(crate) retention: BridgeRetentionTier,
     pub(crate) waiver_id: Option<String>,
@@ -161,6 +164,9 @@ impl BridgeSitePlan {
             arm: arm.to_owned(),
             position: position.into(),
             bridge_kind: bridge_kind.into(),
+            expected_form: "-".to_owned(),
+            found_form: "-".to_owned(),
+            argument_kind: "-".to_owned(),
             extent: BridgeExtentKind::None,
             retention: BridgeRetentionTier::None,
             waiver_id: None,
@@ -189,6 +195,18 @@ impl BridgeSitePlan {
 
     pub(crate) fn with_extent(mut self, extent: BridgeExtentKind) -> Self {
         self.extent = extent;
+        self
+    }
+
+    pub(crate) fn with_forms(
+        mut self,
+        expected_form: impl Into<String>,
+        found_form: impl Into<String>,
+        argument_kind: impl Into<String>,
+    ) -> Self {
+        self.expected_form = expected_form.into();
+        self.found_form = found_form.into();
+        self.argument_kind = argument_kind.into();
         self
     }
 }
@@ -228,6 +246,9 @@ impl BridgeSiteKey {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct BridgeReceiptEvent {
     pub(crate) site: BridgeSiteKey,
+    pub(crate) expected_form: String,
+    pub(crate) found_form: String,
+    pub(crate) argument_kind: String,
     pub(crate) stage: BridgeReceiptStage,
     pub(crate) state: BridgeReceiptState,
     pub(crate) drop_reason: Option<String>,
@@ -245,6 +266,9 @@ impl BridgeReceiptEvent {
     ) -> Self {
         Self {
             site: BridgeSiteKey::for_test(label),
+            expected_form: "-".to_owned(),
+            found_form: "-".to_owned(),
+            argument_kind: "-".to_owned(),
             stage,
             state,
             drop_reason: (state == BridgeReceiptState::Dropped).then(|| "test-drop".to_owned()),
@@ -256,6 +280,18 @@ impl BridgeReceiptEvent {
 
     pub(crate) fn with_extent(mut self, extent: BridgeExtentKind) -> Self {
         self.extent = extent;
+        self
+    }
+
+    pub(crate) fn with_forms(
+        mut self,
+        expected_form: impl Into<String>,
+        found_form: impl Into<String>,
+        argument_kind: impl Into<String>,
+    ) -> Self {
+        self.expected_form = expected_form.into();
+        self.found_form = found_form.into();
+        self.argument_kind = argument_kind.into();
         self
     }
 
@@ -349,6 +385,9 @@ pub(crate) fn reconcile_bridge_events(
         if plan.extent != terminal.extent
             || plan.retention != terminal.retention
             || plan.waiver_id != terminal.waiver_id
+            || plan.expected_form != terminal.expected_form
+            || plan.found_form != terminal.found_form
+            || plan.argument_kind != terminal.argument_kind
         {
             return Err(format!(
                 "bridge site {site} changed evidence between stages"
@@ -365,7 +404,7 @@ pub(crate) fn reconcile_bridge_events(
 }
 
 pub(crate) fn bridge_receipt_header() -> String {
-    "site_key\towner_class\tcaller\tcallee\tarm\tposition\tfile\tlo\thi\tbridge_kind\textent_kind\tretention_tier\twaiver_id\tstage\tstate\tdrop_reason\n".to_owned()
+    "site_key\towner_class\tcaller\tcallee\tarm\tposition\tfile\tlo\thi\tbridge_kind\texpected_form\tfound_form\targument_kind\textent_kind\tretention_tier\twaiver_id\tstage\tstate\tdrop_reason\n".to_owned()
 }
 
 pub(crate) fn render_bridge_events(events: &[BridgeReceiptEvent]) -> String {
@@ -374,7 +413,7 @@ pub(crate) fn render_bridge_events(events: &[BridgeReceiptEvent]) -> String {
         .map(|event| {
             let site = &event.site;
             format!(
-                "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
                 site.receipt_key(),
                 site.owner_class.order_key(),
                 site.caller.local_def_index.as_u32(),
@@ -385,6 +424,9 @@ pub(crate) fn render_bridge_events(events: &[BridgeReceiptEvent]) -> String {
                 site.lo,
                 site.hi,
                 site.bridge_kind,
+                event.expected_form,
+                event.found_form,
+                event.argument_kind,
                 event.extent.key(),
                 event.retention.key(),
                 event.waiver_id.as_deref().unwrap_or("-"),
@@ -423,11 +465,42 @@ mod tests {
 
     #[test]
     fn rcp_w1_bridge_receipt_schema_header_is_sealed() {
-        const SEALED: &str = "site_key\towner_class\tcaller\tcallee\tarm\tposition\tfile\tlo\thi\tbridge_kind\textent_kind\tretention_tier\twaiver_id\tstage\tstate\tdrop_reason\n";
+        const SEALED: &str = "site_key\towner_class\tcaller\tcallee\tarm\tposition\tfile\tlo\thi\tbridge_kind\texpected_form\tfound_form\targument_kind\textent_kind\tretention_tier\twaiver_id\tstage\tstate\tdrop_reason\n";
         assert_eq!(bridge_receipt_header(), SEALED);
         let columns = SEALED.trim_end().split('\t').collect::<Vec<_>>();
-        assert_eq!(columns.len(), 16);
-        assert_eq!(columns.iter().copied().collect::<BTreeSet<_>>().len(), 16);
+        assert_eq!(columns.len(), 19);
+        assert_eq!(columns.iter().copied().collect::<BTreeSet<_>>().len(), 19);
+    }
+
+    /// D7-W1 — the common, sealed bridge receipt carries the two endpoint
+    /// forms and the argument classifier on both plan and terminal rows.
+    #[test]
+    fn d7_w1_bridge_receipt_seals_expected_found_and_argument_kind() {
+        const SEALED: &str = "site_key\towner_class\tcaller\tcallee\tarm\tposition\tfile\tlo\thi\tbridge_kind\texpected_form\tfound_form\targument_kind\textent_kind\tretention_tier\twaiver_id\tstage\tstate\tdrop_reason\n";
+        assert_eq!(bridge_receipt_header(), SEALED);
+        let plan = BridgeReceiptEvent::for_test(
+            "forms",
+            BridgeReceiptStage::Plan,
+            BridgeReceiptState::Planned,
+        )
+        .with_forms("ref-mut", "raw", "field-projection");
+        let terminal = BridgeReceiptEvent::for_test(
+            "forms",
+            BridgeReceiptStage::Terminal,
+            BridgeReceiptState::Applied,
+        )
+        .with_forms("ref-mut", "raw", "field-projection");
+        reconcile_bridge_events(&[plan.clone(), terminal.clone()])
+            .expect("form metadata is stable across receipt stages");
+        let rendered = render_bridge_events(&[plan, terminal]);
+        assert_eq!(rendered.lines().count(), 3);
+        assert!(
+            rendered
+                .lines()
+                .skip(1)
+                .all(|row| row.contains("\tref-mut\traw\tfield-projection\t")),
+            "{rendered}"
+        );
     }
 
     #[test]

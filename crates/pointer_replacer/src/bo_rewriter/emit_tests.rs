@@ -6465,6 +6465,16 @@ fn br_w1_raw_scalar_inbound_reborrows_and_receipts_are_exact() {
         );
         assert!(pair.iter().all(|event| event.waiver_id.is_none()));
         assert!(pair.iter().all(|event| {
+            event.expected_form
+                == if kind == "c-raw-reborrow-mut" {
+                    "ref-mut"
+                } else {
+                    "ref-shared"
+                }
+                && event.found_form == "raw"
+                && event.argument_kind == "bare-local"
+        }));
+        assert!(pair.iter().all(|event| {
             matches!(event.site.callee, BridgeCalleeId::Local(callee) if event.site.owner_class.local_def_id() == callee)
         }));
         assert!(pair.iter().any(|event| {
@@ -6475,6 +6485,10 @@ fn br_w1_raw_scalar_inbound_reborrows_and_receipts_are_exact() {
                 && event.state == BridgeReceiptState::Applied
         }));
     }
+    let rendered = super::bridge_receipt::render_bridge_events(&events);
+    assert!(rendered.starts_with(
+        "site_key\towner_class\tcaller\tcallee\tarm\tposition\tfile\tlo\thi\tbridge_kind\texpected_form\tfound_form\targument_kind\t"
+    ));
     super::bridge_receipt::reconcile_bridge_events(&events).expect("BR-W1 bridge events reconcile");
 }
 
