@@ -429,7 +429,7 @@ fn intervals_overlap(left: &ClassSite, right: &ClassSite) -> bool {
 /// argument.  This one strict nesting is therefore composition, not a byte
 /// collision.  Return `(outer, inner)` so cross-class nesting also records the
 /// readiness dependency needed to keep the composition atomic.
-fn nested_subject_use_composition(
+fn nested_ast_composition(
     left: &ClassSite,
     right: &ClassSite,
 ) -> Option<(SignatureClassId, SignatureClassId)> {
@@ -440,9 +440,13 @@ fn nested_subject_use_composition(
             && (outer.key.lo < inner.key.lo || inner.key.hi < outer.key.hi)
     };
     let composable = |outer: &ClassSite, inner: &ClassSite| {
-        matches!(outer.key.arm.as_str(), "c" | "glue")
-            && inner.key.bridge_kind == "subject-use"
-            && strictly_contains(outer, inner)
+        let bridge_over_subject = matches!(outer.key.arm.as_str(), "c" | "glue")
+            && inner.key.bridge_kind == "subject-use";
+        let pair_over_c = outer.key.owner_class == inner.key.owner_class
+            && outer.key.arm == "pair"
+            && outer.key.bridge_kind == "pair-t2-raw-view"
+            && inner.key.arm == "c";
+        (bridge_over_subject || pair_over_c) && strictly_contains(outer, inner)
     };
     if composable(left, right) {
         Some((left.key.owner_class, right.key.owner_class))
@@ -481,7 +485,7 @@ pub(crate) fn finalize_class_inputs(inputs: Vec<ClassInput>) -> ClassFinalizatio
             if !intervals_overlap(left, right) {
                 continue;
             }
-            if let Some((outer, inner)) = nested_subject_use_composition(left, right) {
+            if let Some((outer, inner)) = nested_ast_composition(left, right) {
                 if outer != inner {
                     composed_dependencies.insert((outer, inner));
                 }
@@ -2599,6 +2603,63 @@ mod wave3_class_tests {
                 !finalized.classes[&ids[2]].is_ready() && !finalized.classes[&ids[3]].is_ready(),
                 "a true crossing reached application"
             );
+        });
+    }
+
+    /// D11-W1 — buffer's measured interval shape.  PAIR owns the outer call
+    /// and first walks its children, so the C bridge on the safe-primary
+    /// operand is applied before PAIR substitutes the peer raw-view temp.  The
+    /// strict nesting is one structural composition; a true PAIR/C crossing is
+    /// still a collision.
+    #[test]
+    fn d11_w1_pair_outer_composes_the_c_primary_operand_only() {
+        use crate::bo_rewriter::decision::Arm;
+        with_classes(2, |ids| {
+            let composed = ClassInput::new(ids[0], arms(&[Arm::C, Arm::Pair]))
+                .with_site(ClassSite::edit(
+                    ids[0],
+                    ids[0],
+                    Arm::C,
+                    "buffer.rs",
+                    21017,
+                    21020,
+                    "c-raw-reborrow-mut",
+                ))
+                .with_site(ClassSite::edit(
+                    ids[0],
+                    ids[0],
+                    Arm::Pair,
+                    "buffer.rs",
+                    21003,
+                    21093,
+                    "pair-t2-raw-view",
+                ));
+            let crossing = ClassInput::new(ids[1], arms(&[Arm::C, Arm::Pair]))
+                .with_site(ClassSite::edit(
+                    ids[1],
+                    ids[1],
+                    Arm::C,
+                    "buffer.rs",
+                    300,
+                    340,
+                    "c-raw-reborrow-mut",
+                ))
+                .with_site(ClassSite::edit(
+                    ids[1],
+                    ids[1],
+                    Arm::Pair,
+                    "buffer.rs",
+                    320,
+                    360,
+                    "pair-t2-raw-view",
+                ));
+            let finalized = finalize_class_inputs(vec![composed, crossing]);
+            assert!(
+                finalized.classes[&ids[0]].is_ready(),
+                "PAIR/C nesting was held: {:?}",
+                finalized.classes[&ids[0]].hold_reasons()
+            );
+            assert!(!finalized.classes[&ids[1]].is_ready());
         });
     }
 
