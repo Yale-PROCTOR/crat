@@ -9152,6 +9152,30 @@ mod run {
             .replace(['\t', '\r', '\n'], " ")
     }
 
+    const RAW_BOUNDARY_DIAGNOSTIC_HEADER: &str = "function\terror_code\tmessage_head\tmessage_full\tfile\tline\tcolumn\tend_line\tend_column\tattribution\n";
+
+    fn full_tsv_field(value: &str) -> String {
+        value
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .replace(['\t', '\r', '\n'], " ")
+    }
+
+    #[test]
+    fn d12_w2_raw_diagnostic_schema_keeps_the_full_primary_message() {
+        assert!(
+            RAW_BOUNDARY_DIAGNOSTIC_HEADER.contains("\tmessage_head\tmessage_full\t")
+                && RAW_BOUNDARY_DIAGNOSTIC_HEADER
+                    .contains("\tline\tcolumn\tend_line\tend_column\tattribution"),
+            "{RAW_BOUNDARY_DIAGNOSTIC_HEADER:?}"
+        );
+        let message = "primary ".repeat(80);
+        assert!(message.len() > 300);
+        assert_eq!(full_tsv_field(&message).len(), message.trim().len());
+        assert!(tsv_field(&message, 300).len() <= 300);
+    }
+
     fn named_tsv_rows(input: &str) -> Vec<BTreeMap<String, String>> {
         let mut lines = input.lines();
         let Some(header) = lines.next() else {
@@ -10594,14 +10618,14 @@ mod run {
             )
             .unwrap_or_else(|error| panic!("write raw-boundary {suffix}: {error}"));
         }
-        let mut diagnostics =
-            String::from("function\terror_code\tmessage_head\tfile\tline\tattribution\n");
+        let mut diagnostics = String::from(RAW_BOUNDARY_DIAGNOSTIC_HEADER);
         for diagnostic in &capture.reverts {
             diagnostics.push_str(&format!(
-                "{}\t{}\t{}\t{}\t{}\t{}\n",
+                "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
                 tsv_field(&diagnostic.function, 300),
                 e1_code(diagnostic.diagnostic.code.as_deref()),
                 tsv_field(&diagnostic.diagnostic.message, 300),
+                full_tsv_field(&diagnostic.diagnostic.message),
                 tsv_field(
                     &crate::bo_rewriter::verify::crate_relative(
                         &diagnostic.diagnostic.file,
@@ -10610,6 +10634,9 @@ mod run {
                     400,
                 ),
                 diagnostic.diagnostic.line,
+                diagnostic.diagnostic.column,
+                diagnostic.diagnostic.end_line,
+                diagnostic.diagnostic.end_column,
                 diagnostic.attribution,
             ));
         }

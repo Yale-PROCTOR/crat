@@ -1249,6 +1249,7 @@ pub(crate) enum BridgeTemplate {
     VoidFromMutAsConst,
     RawCastMut,
     RawCastConst,
+    TypedRawTemporary,
     RefMutToRawMut,
     RefMutToRawConst,
     RefSharedToRawConst,
@@ -1273,6 +1274,7 @@ impl BridgeTemplate {
             Self::VoidFromRefCastMut => "shared-ref-to-mut-raw",
             Self::RawCastMut => "raw-cast-mut",
             Self::RawCastConst => "raw-cast-const",
+            Self::TypedRawTemporary => "typed-raw-temporary",
             Self::RefMutToRawMut => "ref-mut-to-raw-mut",
             Self::RefMutToRawConst => "ref-mut-to-raw-const",
             Self::RefSharedToRawConst => "ref-shared-to-raw-const",
@@ -1350,6 +1352,16 @@ impl BridgeTemplate {
             }
             Self::RawCastMut => Ok(BridgeRender::Edit(format!("{argument}.cast_mut()"))),
             Self::RawCastConst => Ok(BridgeRender::Edit(format!("{argument}.cast_const()"))),
+            Self::TypedRawTemporary => {
+                let pointee = cast_pointee.ok_or(RawBoundaryBlockReason::TemplateUnavailable)?;
+                let target = match target_mutability {
+                    RawMutability::Mut => format!("*mut {pointee}"),
+                    RawMutability::Const => format!("*const {pointee}"),
+                };
+                Ok(BridgeRender::Edit(format!(
+                    "{{ let __crat_raw: {target} = ({argument}) as {target}; __crat_raw }}"
+                )))
+            }
             Self::RefMutToRawMut if force_explicit => Ok(BridgeRender::Edit(format!(
                 "core::ptr::from_mut(&mut *{argument})"
             ))),
@@ -1694,6 +1706,25 @@ pub(crate) fn template_for(
     }
 }
 
+fn template_for_source_form(
+    template: BridgeTemplate,
+    source_shape: &str,
+    source_type: &str,
+    target: &RawTargetType,
+) -> BridgeTemplate {
+    if target.depth2.is_none()
+        && source_shape == "raw-expr"
+        && matches!(
+            source_type.trim_start(),
+            ty if ty.starts_with("*mut ") || ty.starts_with("*const ")
+        )
+    {
+        BridgeTemplate::TypedRawTemporary
+    } else {
+        template
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 pub(crate) struct RawBoundaryDispositionIndex {
     by_site: BTreeMap<RawBoundarySiteKey, RawBoundaryDisposition>,
@@ -1858,7 +1889,7 @@ impl RawBoundaryDispositionIndex {
                                 ));
                             }
                         };
-                    let template =
+                    let mut template =
                         template_for(decision, &site.target, ownership, negative_write.is_some())
                             .map_err(|reason| {
                             let detail = if reason == RawBoundaryBlockReason::SharedToMut {
@@ -1868,6 +1899,12 @@ impl RawBoundaryDispositionIndex {
                             };
                             (reason, detail)
                         })?;
+                    template = template_for_source_form(
+                        template,
+                        site.source_shape,
+                        &site.source_type,
+                        &site.target,
+                    );
                     match retention_verdict {
                         RetentionVerdict::NoRetain { certificate } => {
                             let certificate_started = std::time::Instant::now();
@@ -2818,6 +2855,65 @@ mod tests {
         };
         assert_eq!(text, "core::ptr::from_mut(owner.as_mut())");
         assert!(!text.contains("into_raw"), "{text}");
+    }
+
+    /// D12-W1 — R172's E0282/E0308 pair came from passing an already-raw cast
+    /// to `ptr::from_mut`/`ptr::from_ref`.  A raw temporary keeps its raw value
+    /// and receives an explicit target type; it is not treated as a reference.
+    #[test]
+    fn d12_w1_raw_temporary_has_an_explicit_pointer_type() {
+        let target = RawTargetType {
+            rendered: "*mut core::ffi::c_void".to_owned(),
+            pointee: "core::ffi::c_void".to_owned(),
+            mutability: RawMutability::Mut,
+            depth2: None,
+        };
+        assert_eq!(
+            template_for_source_form(
+                BridgeTemplate::VoidFromMut,
+                "raw-expr",
+                "*mut core::ffi::c_void",
+                &target,
+            ),
+            BridgeTemplate::TypedRawTemporary
+        );
+        assert_eq!(
+            template_for_source_form(
+                BridgeTemplate::VoidFromMut,
+                "cast-of-local",
+                "*mut core::ffi::c_void",
+                &target,
+            ),
+            BridgeTemplate::VoidFromMut,
+            "a rewritten local remains a reference under its cast"
+        );
+        let rendered = BridgeTemplate::TypedRawTemporary
+            .render(
+                "p as *mut core::ffi::c_void",
+                RawMutability::Mut,
+                false,
+                Some("core::ffi::c_void"),
+            )
+            .expect("typed raw temporary");
+        let BridgeRender::Edit(text) = rendered else {
+            panic!("typed raw temporary must emit syntax: {rendered:?}");
+        };
+        assert!(
+            text.contains("let __crat_raw: *mut core::ffi::c_void"),
+            "{text}"
+        );
+        assert!(
+            !text.contains("from_mut") && !text.contains("from_ref"),
+            "{text}"
+        );
+        let source = format!(
+            "fn take(_: *mut core::ffi::c_void) {{}}\n\
+             fn witness(p: *mut i32) {{ unsafe {{ take({text}); }} }}\n"
+        );
+        assert!(
+            ::utils::compilation::run_compiler_on_str(&source, |_| ()).is_ok(),
+            "typed raw bridge must type-check:\n{source}"
+        );
     }
 
     #[test]

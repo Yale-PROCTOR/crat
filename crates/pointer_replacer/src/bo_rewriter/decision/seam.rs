@@ -891,6 +891,7 @@ impl GlueSpec {
                     || matches!(
                         template,
                         super::raw_boundary::BridgeTemplate::OptRefMutToRawMut
+                            | super::raw_boundary::BridgeTemplate::TypedRawTemporary
                             | super::raw_boundary::BridgeTemplate::OptRefToRawConst
                             | super::raw_boundary::BridgeTemplate::OptRefToRawMut
                             | super::raw_boundary::BridgeTemplate::OptSliceToRaw
