@@ -33,7 +33,9 @@ use rustc_hir::{
 use rustc_middle::ty::TyCtxt;
 use rustc_span::Span;
 
-use super::raw_boundary::{ForeignCallArgFact, raw_target_type, symbol_key};
+use super::raw_boundary::{
+    ForeignCallArgFact, RawMutability, RawTargetType, raw_target_type, symbol_key,
+};
 
 /// Methods that exist on raw pointers and not on references.
 ///
@@ -300,10 +302,11 @@ pub(crate) struct BodyAdapterSite {
     pub side_effecting: bool,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct AddressOperand {
     pub node: (LocalDefId, HirId),
     pub span: Span,
+    pub target: RawTargetType,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -311,7 +314,17 @@ pub(crate) struct AddressObservationFact {
     pub owner: LocalDefId,
     pub span: Span,
     pub op: &'static str,
+    pub target_type: String,
     pub operands: Vec<AddressOperand>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ReturnSiteFact {
+    pub owner: LocalDefId,
+    pub span: Span,
+    pub root: Option<HirId>,
+    pub source_shape: &'static str,
+    pub source_type: RawTargetType,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -476,6 +489,9 @@ pub(crate) struct EmitabilityFacts {
     /// Value-observing pointer comparisons, with both operand identities. These
     /// are address sinks only; arithmetic/deref uses never enter this vector.
     pub address_observations: Vec<AddressObservationFact>,
+    /// Original raw-pointer return expressions, including explicit `return`
+    /// operands and function-body tail expressions.
+    pub return_sites: Vec<ReturnSiteFact>,
     /// **S3.6-1** — `callee -> every direct call site, with its arguments`.
     ///
     /// Recorded here rather than derived later, because it is not derivable
@@ -508,10 +524,17 @@ pub(crate) fn collect(tcx: TyCtxt<'_>, functions: &[LocalDefId]) -> EmitabilityF
     // (F1) and would otherwise never be visited at all.
     for owner in tcx.hir_body_owners() {
         let body = tcx.hir_body_owned_by(owner);
+        let tail = (tcx.def_kind(owner) == rustc_hir::def::DefKind::Fn)
+            .then(|| match &body.value.kind {
+                ExprKind::Block(block, _) => block.expr.map(|expr| expr.hir_id),
+                _ => Some(body.value.hir_id),
+            })
+            .flatten();
         let mut visitor = BodyFacts {
             tcx,
             fn_did: owner,
             locals: &local,
+            tail,
             facts: &mut facts,
         };
         visitor.visit_body(body);
@@ -530,6 +553,7 @@ struct BodyFacts<'a, 'tcx> {
     tcx: TyCtxt<'tcx>,
     fn_did: LocalDefId,
     locals: &'a [LocalDefId],
+    tail: Option<HirId>,
     facts: &'a mut EmitabilityFacts,
 }
 
@@ -545,6 +569,34 @@ impl BodyFacts<'_, '_> {
             Res::Local(hir_id) => Some(hir_id),
             _ => None,
         }
+    }
+
+    fn address_operand(&self, expr: &Expr<'_>) -> Option<AddressOperand> {
+        let expr = peel_casts(expr);
+        let hir_id = Self::resolved_local(expr)?;
+        let target = raw_target_type(self.tcx.typeck(self.fn_did).expr_ty(expr))?;
+        Some(AddressOperand {
+            node: (self.fn_did, hir_id),
+            span: expr.span,
+            target,
+        })
+    }
+
+    fn owned_by_call_argument(&self, expr: &Expr<'_>) -> bool {
+        let mut child = expr.hir_id;
+        for _ in 0..4 {
+            let rustc_hir::Node::Expr(parent) = self.tcx.parent_hir_node(child) else {
+                return false;
+            };
+            match &parent.kind {
+                ExprKind::Call(_, args) if args.iter().any(|arg| arg.hir_id == child) => {
+                    return true;
+                }
+                ExprKind::DropTemps(inner) if inner.hir_id == child => child = parent.hir_id,
+                _ => return false,
+            }
+        }
+        false
     }
 }
 
@@ -568,6 +620,23 @@ impl<'tcx> Visitor<'tcx> for BodyFacts<'_, 'tcx> {
     }
 
     fn visit_expr(&mut self, expr: &'tcx Expr<'tcx>) {
+        let explicit_return = matches!(
+            self.tcx.parent_hir_node(expr.hir_id),
+            rustc_hir::Node::Expr(parent)
+                if matches!(parent.kind, ExprKind::Ret(Some(value)) if value.hir_id == expr.hir_id)
+        );
+        if (self.tail == Some(expr.hir_id) || explicit_return)
+            && let Some(source_type) = raw_target_type(self.tcx.typeck(self.fn_did).expr_ty(expr))
+        {
+            let shape = classify_arg(self.tcx, expr);
+            self.facts.return_sites.push(ReturnSiteFact {
+                owner: self.fn_did,
+                span: expr.span,
+                root: shape.place_root(),
+                source_shape: shape.key(),
+                source_type,
+            });
+        }
         if wave2_body_owner(self.tcx, self.fn_did)
             && let ExprKind::Assign(lhs, rhs, _) = expr.kind
             && let Some(destination) = Self::resolved_local(lhs)
@@ -587,7 +656,7 @@ impl<'tcx> Visitor<'tcx> for BodyFacts<'_, 'tcx> {
                 let method = segment.ident.name.to_string();
                 let receiver_node = Self::resolved_local(receiver).map(|hir| (self.fn_did, hir));
                 if matches!(method.as_str(), "addr")
-                    && let Some(node) = receiver_node
+                    && let Some(operand) = self.address_operand(receiver)
                 {
                     self.facts
                         .address_observations
@@ -595,15 +664,16 @@ impl<'tcx> Visitor<'tcx> for BodyFacts<'_, 'tcx> {
                             owner: self.fn_did,
                             span: expr.span,
                             op: "ptr-to-int",
-                            operands: vec![AddressOperand {
-                                node,
-                                span: receiver.span,
-                            }],
+                            target_type: format!(
+                                "{:?}",
+                                self.tcx.typeck(self.fn_did).expr_ty(expr)
+                            ),
+                            operands: vec![operand],
                         });
                 } else if method == "offset_from"
-                    && let Some(left) = receiver_node
                     && let [right] = args
-                    && let Some(right_hir) = Self::resolved_local(right)
+                    && let Some(left) = self.address_operand(receiver)
+                    && let Some(right) = self.address_operand(right)
                 {
                     self.facts
                         .address_observations
@@ -611,16 +681,11 @@ impl<'tcx> Visitor<'tcx> for BodyFacts<'_, 'tcx> {
                             owner: self.fn_did,
                             span: expr.span,
                             op: "difference",
-                            operands: vec![
-                                AddressOperand {
-                                    node: left,
-                                    span: receiver.span,
-                                },
-                                AddressOperand {
-                                    node: (self.fn_did, right_hir),
-                                    span: right.span,
-                                },
-                            ],
+                            target_type: format!(
+                                "{:?}",
+                                self.tcx.typeck(self.fn_did).expr_ty(expr)
+                            ),
+                            operands: vec![left, right],
                         });
                 } else if RAW_ONLY_METHODS.contains(&method.as_str())
                     && let Some((_, hir_id)) = receiver_node
@@ -671,6 +736,24 @@ impl<'tcx> Visitor<'tcx> for BodyFacts<'_, 'tcx> {
                 if let ExprKind::Path(QPath::Resolved(_, path)) = &callee.kind
                     && let Res::Def(rustc_hir::def::DefKind::Fn, def_id) = path.res
                 {
+                    let defining_crate = self.tcx.crate_name(def_id.krate);
+                    let ptr_eq = matches!(defining_crate.as_str(), "core" | "std")
+                        && self.tcx.def_path_str(def_id).ends_with("::ptr::eq");
+                    if ptr_eq
+                        && args.len() == 2
+                        && let Some(left) = self.address_operand(&args[0])
+                        && let Some(right) = self.address_operand(&args[1])
+                    {
+                        self.facts
+                            .address_observations
+                            .push(AddressObservationFact {
+                                owner: self.fn_did,
+                                span: expr.span,
+                                op: "ptr-eq",
+                                target_type: "bool".to_owned(),
+                                operands: vec![left, right],
+                            });
+                    }
                     if let Some(local_did) = def_id.as_local()
                         && self.locals.contains(&local_did)
                     {
@@ -722,7 +805,7 @@ impl<'tcx> Visitor<'tcx> for BodyFacts<'_, 'tcx> {
                                     })
                                     .collect(),
                             });
-                    } else {
+                    } else if !ptr_eq {
                         let sig = self.tcx.fn_sig(def_id).skip_binder().skip_binder();
                         let typeck = self.tcx.typeck(self.fn_did);
                         let symbol = symbol_key(self.tcx, def_id, self.locals);
@@ -778,20 +861,9 @@ impl<'tcx> Visitor<'tcx> for BodyFacts<'_, 'tcx> {
             ExprKind::Binary(op, lhs, rhs) => {
                 use rustc_hir::BinOpKind::*;
                 if matches!(op.node, Lt | Le | Gt | Ge | Eq | Ne) {
-                    let typeck = self.tcx.typeck(self.fn_did);
                     let operands = [lhs, rhs]
                         .into_iter()
-                        .filter_map(|side| {
-                            let hir = Self::resolved_local(side)?;
-                            matches!(
-                                typeck.expr_ty(side).kind(),
-                                rustc_middle::ty::TyKind::RawPtr(..)
-                            )
-                            .then_some(AddressOperand {
-                                node: (self.fn_did, hir),
-                                span: side.span,
-                            })
-                        })
+                        .filter_map(|side| self.address_operand(side))
                         .collect::<Vec<_>>();
                     if operands.len() == 2 {
                         let op = match op.node {
@@ -809,6 +881,7 @@ impl<'tcx> Visitor<'tcx> for BodyFacts<'_, 'tcx> {
                                 owner: self.fn_did,
                                 span: expr.span,
                                 op,
+                                target_type: "bool".to_owned(),
                                 operands,
                             });
                     }
@@ -826,31 +899,35 @@ impl<'tcx> Visitor<'tcx> for BodyFacts<'_, 'tcx> {
             // other cast remains raw-only. Integer-to-pointer never enters the
             // address arm because its source is not a raw-pointer local.
             ExprKind::Cast(inner, _) => {
-                if let Some(hir_id) = Self::resolved_local(inner) {
+                let owned_by_call_boundary = self.owned_by_call_argument(expr);
+                if !owned_by_call_boundary && let Some(operand) = self.address_operand(inner) {
                     let typeck = self.tcx.typeck(self.fn_did);
                     let pointer_to_integer = matches!(
-                        typeck.expr_ty(inner).kind(),
-                        rustc_middle::ty::TyKind::RawPtr(..)
-                    ) && matches!(
                         typeck.expr_ty(expr).kind(),
                         rustc_middle::ty::TyKind::Int(_) | rustc_middle::ty::TyKind::Uint(_)
                     );
-                    if pointer_to_integer {
+                    let pointer_to_pointer = matches!(
+                        typeck.expr_ty(expr).kind(),
+                        rustc_middle::ty::TyKind::RawPtr(..)
+                    );
+                    if pointer_to_integer || pointer_to_pointer {
                         self.facts
                             .address_observations
                             .push(AddressObservationFact {
                                 owner: self.fn_did,
                                 span: expr.span,
-                                op: "ptr-to-int",
-                                operands: vec![AddressOperand {
-                                    node: (self.fn_did, hir_id),
-                                    span: inner.span,
-                                }],
+                                op: if pointer_to_integer {
+                                    "ptr-to-int"
+                                } else {
+                                    "ptr-cast"
+                                },
+                                target_type: format!("{:?}", typeck.expr_ty(expr)),
+                                operands: vec![operand],
                             });
                     } else {
                         self.facts
                             .raw_only_uses
-                            .entry((self.fn_did, hir_id))
+                            .entry(operand.node)
                             .or_default()
                             .push(("as-cast".to_owned(), expr.span));
                     }
@@ -975,9 +1052,16 @@ mod address_use_tests {
             owner: CRATE_DEF_ID,
             span: rustc_span::DUMMY_SP,
             op: "ptr-to-int",
+            target_type: "usize".to_owned(),
             operands: vec![AddressOperand {
                 node,
                 span: rustc_span::DUMMY_SP,
+                target: RawTargetType {
+                    rendered: "*const i32".to_owned(),
+                    pointee: "i32".to_owned(),
+                    mutability: RawMutability::Const,
+                    depth2: None,
+                },
             }],
         });
         facts
@@ -1000,6 +1084,7 @@ pub(crate) const SLICE_ARITHMETIC_OPS: &[&str] = &["offset", "offset_from"];
 pub(crate) struct UseEdit {
     pub span: Span,
     pub replacement: String,
+    pub bridge_kind: &'static str,
 }
 
 /// What a subject's uses permit.
@@ -1292,6 +1377,7 @@ pub(crate) fn collect_opt_uses(
                             UseEdit {
                                 span: not.span,
                                 replacement: format!("{name}.is_some()"),
+                                bridge_kind: "raw-op-is-none",
                             },
                             false,
                         ));
@@ -1300,6 +1386,7 @@ pub(crate) fn collect_opt_uses(
                         UseEdit {
                             span: p.span,
                             replacement: format!("{name}.is_none()"),
+                            bridge_kind: "raw-op-is-none",
                         },
                         false,
                     ))
@@ -1308,6 +1395,7 @@ pub(crate) fn collect_opt_uses(
                     UseEdit {
                         span: use_expr.span,
                         replacement: accessor.deref.clone(),
+                        bridge_kind: "subject-use",
                     },
                     true,
                 )),
@@ -1345,6 +1433,7 @@ pub(crate) fn collect_opt_uses(
                         UseEdit {
                             span: deref.span,
                             replacement: format!("{}[{index}]", accessor.index),
+                            bridge_kind: "subject-use",
                         },
                         true,
                     ))
@@ -1458,6 +1547,7 @@ pub(crate) fn collect_slice_uses(
                 return Some(Some(UseEdit {
                     span: call.span,
                     replacement: format!("{name}[0]"),
+                    bridge_kind: "subject-use",
                 }));
             }
 
@@ -1508,6 +1598,7 @@ pub(crate) fn collect_slice_uses(
                 return Some(Some(UseEdit {
                     span: call.span,
                     replacement: format!("{amp}{name}[{index}..]"),
+                    bridge_kind: "subject-use",
                 }));
             }
 
@@ -1539,6 +1630,7 @@ pub(crate) fn collect_slice_uses(
             Some(Some(UseEdit {
                 span: deref.span,
                 replacement: format!("{name}[{index}]"),
+                bridge_kind: "subject-use",
             }))
         }
 

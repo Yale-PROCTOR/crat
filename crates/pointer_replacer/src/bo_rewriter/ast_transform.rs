@@ -975,6 +975,57 @@ impl MutVisitor for RefDeclVisitor<'_> {
     }
 }
 
+/// Inserts explicit types on previously inferred locals. These sites are
+/// carried by the converted callee's signature class, so the visitor consumes
+/// the final type text selected upstream and performs no type inference.
+struct ExplicitLocalDeclVisitor<'a> {
+    local_map: &'a rustc_ast::node_id::NodeMap<HirId>,
+    global_map: &'a rustc_ast::node_id::NodeMap<LocalDefId>,
+    sites: &'a FxHashMap<(LocalDefId, HirId), String>,
+    current_fn: Option<LocalDefId>,
+    guard: &'a mut Composition,
+    placed: FxHashSet<(LocalDefId, HirId)>,
+    refused: usize,
+}
+
+impl MutVisitor for ExplicitLocalDeclVisitor<'_> {
+    fn visit_item(&mut self, item: &mut rustc_ast::Item) {
+        let saved = self.current_fn;
+        if matches!(item.kind, rustc_ast::ItemKind::Fn(_)) {
+            self.current_fn = self.global_map.get(&item.id).copied();
+        }
+        rustc_ast::mut_visit::walk_item(self, item);
+        self.current_fn = saved;
+    }
+
+    fn visit_local(&mut self, local: &mut rustc_ast::Local) {
+        let Some(fn_did) = self.current_fn else {
+            rustc_ast::mut_visit::walk_local(self, local);
+            return;
+        };
+        let Some(&hir_id) = self.local_map.get(&local.pat.id) else {
+            rustc_ast::mut_visit::walk_local(self, local);
+            return;
+        };
+        let key = (fn_did, hir_id);
+        let Some(ty) = self.sites.get(&key) else {
+            rustc_ast::mut_visit::walk_local(self, local);
+            return;
+        };
+        if local.ty.is_some()
+            || !self
+                .guard
+                .claim(local.pat.id, local.pat.span, "decl:explicit")
+        {
+            self.refused += 1;
+            return;
+        }
+        local.ty = Some(P(::utils::ast::parse_ty(ty.clone())));
+        self.placed.insert(key);
+        rustc_ast::mut_visit::walk_local(self, local);
+    }
+}
+
 /// **ARM 2's SECOND HALF — the use-site rewrites, as grafted nodes.**
 ///
 /// `Slice` and `Opt` are the first dispositions that are not declaration-only:
@@ -1288,11 +1339,12 @@ fn find_by_span<'a>(e: &'a rustc_ast::Expr, want: rustc_span::Span) -> Option<&'
 fn checked_optional(
     argument: rustc_ast::Expr,
     payload: rustc_ast::Expr,
+    binding_type: &str,
 ) -> Option<rustc_ast::ExprKind> {
     const ARG: &str = "__CRAT_E_ADAPT_ARG";
     const PAYLOAD: &str = "__CRAT_E_ADAPT_PAYLOAD";
     let text = format!(
-        "{{ let __crat_call_adapter_ptr = {ARG}; \
+        "{{ let __crat_call_adapter_ptr: {binding_type} = {ARG}; \
          if __crat_call_adapter_ptr.is_null() {{ None }} \
          else {{ Some({PAYLOAD}) }} }}"
     );
@@ -1734,7 +1786,11 @@ impl<'a> SeamGraftVisitor<'a> {
             core
         };
         Some(if spec.null_arm == NullArm::Checked {
-            checked_optional(source_arg, (*core).clone())?
+            checked_optional(
+                source_arg,
+                (*core).clone(),
+                spec.checked_binding_type.as_deref()?,
+            )?
         } else if spec.optional {
             glue_expr(GlueShape::Some_, spec.mutable, core, None)
                 .expect("the `Some` wrapper is length-free and cannot decline")
@@ -2204,9 +2260,28 @@ fn surface_argument(param: &rustc_ast::Param) -> Result<String, String> {
     Ok(expression)
 }
 
+fn surface_return_pointee(ty: &str) -> Option<&str> {
+    let mut ty = ty.trim();
+    if let Some(inner) = ty
+        .strip_prefix("Option<")
+        .and_then(|ty| ty.strip_suffix('>'))
+    {
+        ty = inner.trim();
+    }
+    ty = ty
+        .strip_prefix("&mut ")
+        .or_else(|| ty.strip_prefix('&'))?
+        .trim();
+    if let Some(inner) = ty.strip_prefix('[').and_then(|ty| ty.strip_suffix(']')) {
+        ty = inner.trim();
+    }
+    Some(ty)
+}
+
 fn surface_wrapper_block(
     inner_name: &str,
     function: &rustc_ast::Fn,
+    return_temp_type: Option<&str>,
 ) -> Result<P<rustc_ast::Block>, String> {
     if function.sig.decl.c_variadic() {
         return Err("inbound-wrapper-unplaceable: variadic function".to_owned());
@@ -2225,29 +2300,57 @@ fn surface_wrapper_block(
         rustc_ast::FnRetTy::Ty(ty) => {
             let ty = rustc_ast_pretty::pprust::ty_to_string(ty);
             if ty.starts_with("Option<&mut [") {
+                let result_ty = return_temp_type
+                    .ok_or("inbound-wrapper-unplaceable: return temp type missing")?;
+                let pointee = surface_return_pointee(result_ty)
+                    .ok_or("inbound-wrapper-unplaceable: return pointee missing")?;
                 format!(
-                    "{{ let __crat_result = {call}; __crat_result.map_or(core::ptr::null_mut(), |value| value.as_mut_ptr()) }}"
+                    "{{ let __crat_result: {result_ty} = {call}; __crat_result.map_or(core::ptr::null_mut::<{pointee}>(), |value| value.as_mut_ptr()) }}"
                 )
             } else if ty.starts_with("Option<&[") {
+                let result_ty = return_temp_type
+                    .ok_or("inbound-wrapper-unplaceable: return temp type missing")?;
+                let pointee = surface_return_pointee(result_ty)
+                    .ok_or("inbound-wrapper-unplaceable: return pointee missing")?;
                 format!(
-                    "{{ let __crat_result = {call}; __crat_result.map_or(core::ptr::null(), |value| value.as_ptr()) }}"
+                    "{{ let __crat_result: {result_ty} = {call}; __crat_result.map_or(core::ptr::null::<{pointee}>(), |value| value.as_ptr()) }}"
                 )
             } else if ty.starts_with("Option<&mut ") {
+                let result_ty = return_temp_type
+                    .ok_or("inbound-wrapper-unplaceable: return temp type missing")?;
+                let pointee = surface_return_pointee(result_ty)
+                    .ok_or("inbound-wrapper-unplaceable: return pointee missing")?;
                 format!(
-                    "{{ let __crat_result = {call}; __crat_result.map_or(core::ptr::null_mut(), core::ptr::from_mut) }}"
+                    "{{ let __crat_result: {result_ty} = {call}; __crat_result.map_or(core::ptr::null_mut::<{pointee}>(), core::ptr::from_mut) }}"
                 )
             } else if ty.starts_with("Option<&") {
+                let result_ty = return_temp_type
+                    .ok_or("inbound-wrapper-unplaceable: return temp type missing")?;
+                let pointee = surface_return_pointee(result_ty)
+                    .ok_or("inbound-wrapper-unplaceable: return pointee missing")?;
                 format!(
-                    "{{ let __crat_result = {call}; __crat_result.map_or(core::ptr::null(), core::ptr::from_ref) }}"
+                    "{{ let __crat_result: {result_ty} = {call}; __crat_result.map_or(core::ptr::null::<{pointee}>(), core::ptr::from_ref) }}"
                 )
             } else if ty.starts_with("&mut [") {
-                format!("{{ let __crat_result = {call}; __crat_result.as_mut_ptr() }}")
+                let result_ty = return_temp_type
+                    .ok_or("inbound-wrapper-unplaceable: return temp type missing")?;
+                format!("{{ let __crat_result: {result_ty} = {call}; __crat_result.as_mut_ptr() }}")
             } else if ty.starts_with("&[") {
-                format!("{{ let __crat_result = {call}; __crat_result.as_ptr() }}")
+                let result_ty = return_temp_type
+                    .ok_or("inbound-wrapper-unplaceable: return temp type missing")?;
+                format!("{{ let __crat_result: {result_ty} = {call}; __crat_result.as_ptr() }}")
             } else if ty.starts_with("&mut ") {
-                format!("{{ let __crat_result = {call}; core::ptr::from_mut(__crat_result) }}")
+                let result_ty = return_temp_type
+                    .ok_or("inbound-wrapper-unplaceable: return temp type missing")?;
+                format!(
+                    "{{ let __crat_result: {result_ty} = {call}; core::ptr::from_mut(__crat_result) }}"
+                )
             } else if ty.starts_with('&') {
-                format!("{{ let __crat_result = {call}; core::ptr::from_ref(__crat_result) }}")
+                let result_ty = return_temp_type
+                    .ok_or("inbound-wrapper-unplaceable: return temp type missing")?;
+                format!(
+                    "{{ let __crat_result: {result_ty} = {call}; core::ptr::from_ref(__crat_result) }}"
+                )
             } else if ty.starts_with("Box<") || ty.starts_with("Option<Box<") {
                 return Err("inbound-wrapper-unplaceable: owning return held by Arm B".to_owned());
             } else {
@@ -2358,6 +2461,7 @@ fn apply_surface_plans_to_items(
     global_map: &rustc_ast::node_id::NodeMap<LocalDefId>,
     exposure: &super::decision::exposure::ExposurePolicy,
     surface_names: &FxHashMap<Symbol, Symbol>,
+    return_temp_types: &FxHashMap<LocalDefId, String>,
     reverted: &FxHashSet<LocalDefId>,
     guard: &mut Composition,
 ) -> Result<(), String> {
@@ -2379,6 +2483,7 @@ fn apply_surface_plans_to_items(
                 global_map,
                 exposure,
                 surface_names,
+                return_temp_types,
                 reverted,
                 guard,
             )?;
@@ -2425,7 +2530,11 @@ fn apply_surface_plans_to_items(
             }
             .visit_block(body);
         }
-        outer_fn.body = Some(surface_wrapper_block(&inner_name, inner_fn)?);
+        outer_fn.body = Some(surface_wrapper_block(
+            &inner_name,
+            inner_fn,
+            return_temp_types.get(&did).map(String::as_str),
+        )?);
         inner_fn.ident = Ident::new(Symbol::intern(&inner_name), inner_fn.ident.span);
         item.attrs
             .retain(|attr| !attr.has_name(sym::no_mangle) && !attr.has_name(sym::export_name));
@@ -2458,12 +2567,20 @@ fn apply_surface_plans(
         &mut surface_name_populations,
     );
     let surface_names = finalize_surface_names(&surface_name_populations)?;
+    let return_temp_types = table
+        .seams
+        .explicit_declarations
+        .iter()
+        .filter(|site| site.category == "return-temp")
+        .map(|site| (site.owner_class.local_def_id(), site.emitted_type.clone()))
+        .collect::<FxHashMap<_, _>>();
     apply_surface_plans_to_items(
         &mut krate.items,
         &originals,
         &capture.map.global_map,
         exposure,
         &surface_names,
+        &return_temp_types,
         &reverts.fns,
         guard,
     )
@@ -2637,6 +2754,48 @@ fn transform_with(
     };
     v.visit_crate(&mut krate);
     let decls = v.stats;
+
+    let mut explicit_local_types = FxHashMap::default();
+    for site in table
+        .seams
+        .explicit_declarations
+        .iter()
+        .filter(|site| site.category == "local" && reverts.keeps(site.owner_class))
+    {
+        let Some(node) = site.node else {
+            return Err("declaration-explicit-type-local-missing-node".to_owned());
+        };
+        if explicit_local_types
+            .insert(node, site.emitted_type.clone())
+            .is_some()
+        {
+            return Err(format!(
+                "declaration-explicit-type-duplicate:{}:{}",
+                node.0.local_def_index.as_u32(),
+                node.1.local_id.as_u32(),
+            ));
+        }
+    }
+    if !explicit_local_types.is_empty() {
+        let mut explicit = ExplicitLocalDeclVisitor {
+            local_map: &map.local_map,
+            global_map: &map.global_map,
+            sites: &explicit_local_types,
+            current_fn: None,
+            guard: &mut guard,
+            placed: FxHashSet::default(),
+            refused: 0,
+        };
+        explicit.visit_crate(&mut krate);
+        if explicit.refused != 0 || explicit.placed.len() != explicit_local_types.len() {
+            return Err(format!(
+                "declaration-explicit-type-unplaceable: planned={} placed={} refused={}",
+                explicit_local_types.len(),
+                explicit.placed.len(),
+                explicit.refused,
+            ));
+        }
+    }
 
     // **ARMS 2 AND 3 CONSUME THE SHARED BUILDER** (M-2). Their visitors carry no
     // site check, so their revert semantics live entirely in how these maps are

@@ -114,6 +114,9 @@ pub(crate) enum SeamBlock {
     /// A slice cannot be projected to a required thin reference without a
     /// carried proof that the slice has at least one element.
     NonemptyUnknown,
+    /// A raw expression cannot enter a safe return without the typed origin
+    /// permit that supplies the emitted return lifetime.
+    ReturnLifetimeAbsent,
 }
 
 impl SeamBlock {
@@ -126,6 +129,7 @@ impl SeamBlock {
             SeamBlock::SiteOverlap => "seam-site-overlap",
             SeamBlock::PositiveRetention => "seam-positive-retention",
             SeamBlock::NonemptyUnknown => "seam-nonempty-unknown",
+            SeamBlock::ReturnLifetimeAbsent => "return-lifetime-permit-absent",
         }
     }
 }
@@ -559,6 +563,33 @@ pub(crate) struct BlockedRawBoundary {
     pub reason: String,
 }
 
+/// Final explicit type for a source or generated declaration whose surrounding
+/// inference context changes with its signature class. The type is selected in
+/// the decision phase and consumed verbatim by both receipt and AST emission.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ExplicitDeclarationSite {
+    pub owner_class: SignatureClassId,
+    pub caller: LocalDefId,
+    pub node: Option<(LocalDefId, HirId)>,
+    pub span: Option<Span>,
+    pub category: &'static str,
+    pub emitted_type: String,
+    pub replacement: Option<String>,
+    pub arm: &'static str,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ZeroBridgeSite {
+    pub owner_class: SignatureClassId,
+    pub caller: LocalDefId,
+    pub span: Option<Span>,
+    pub arm: &'static str,
+    pub position: String,
+    pub bridge_kind: &'static str,
+    pub retention: BridgeRetentionTier,
+    pub waiver_id: Option<String>,
+}
+
 /// **The authorization rule for fabrication, as a pure function** (R8).
 ///
 /// One place decides *licensed vs fabricated*, and it decides it from the only
@@ -696,6 +727,9 @@ pub(crate) struct GlueSpec {
     /// algebra so span and AST consumers share one carried template.
     pub raw_boundary: Option<RawBoundaryGlue>,
     pub nonempty_evidence: bool,
+    /// Exact source type for the one-evaluation local introduced by a checked
+    /// nullable bridge. `None` means this spec introduces no local.
+    pub checked_binding_type: Option<String>,
 }
 
 impl GlueSpec {
@@ -709,6 +743,7 @@ impl GlueSpec {
             null_arm: NullArm::None,
             raw_boundary: None,
             nonempty_evidence: false,
+            checked_binding_type: None,
         }
     }
 
@@ -754,6 +789,11 @@ impl GlueSpec {
         self
     }
 
+    pub(crate) fn with_checked_binding_type(mut self, ty: String) -> Self {
+        self.checked_binding_type = Some(ty);
+        self
+    }
+
     pub(crate) fn literal_none(mutable: bool) -> Self {
         Self {
             core: GlueCore::Bare,
@@ -764,6 +804,7 @@ impl GlueSpec {
             null_arm: NullArm::LiteralNone,
             raw_boundary: None,
             nonempty_evidence: false,
+            checked_binding_type: None,
         }
     }
 
@@ -788,6 +829,7 @@ impl GlueSpec {
                 cast_pointee: None,
             }),
             nonempty_evidence: false,
+            checked_binding_type: None,
         }
     }
 
@@ -1065,8 +1107,9 @@ impl GlueSpec {
             }
         };
         Some(if self.null_arm == NullArm::Checked {
+            let ty = self.checked_binding_type.as_deref()?;
             format!(
-                "{{ let {checked_name} = {argument}; if {checked_name}.is_null() {{ None }} else {{ Some({inner}) }} }}"
+                "{{ let {checked_name}: {ty} = {argument}; if {checked_name}.is_null() {{ None }} else {{ Some({inner}) }} }}"
             )
         } else if self.optional {
             format!("Some({inner})")
@@ -1415,8 +1458,9 @@ mod tests {
             (
                 GlueSpec::core(GlueCore::FromRawParts, true)
                     .with_len("n")
-                    .checked(),
-                "{ let __crat_call_adapter_ptr = p; if __crat_call_adapter_ptr.is_null() { None } else { Some(unsafe { core::slice::from_raw_parts_mut(__crat_call_adapter_ptr, (n) as usize) }) } }",
+                    .checked()
+                    .with_checked_binding_type("*mut i32".to_owned()),
+                "{ let __crat_call_adapter_ptr: *mut i32 = p; if __crat_call_adapter_ptr.is_null() { None } else { Some(unsafe { core::slice::from_raw_parts_mut(__crat_call_adapter_ptr, (n) as usize) }) } }",
             ),
             // safe family
             (
@@ -1469,11 +1513,14 @@ mod tests {
     }
 
     fn rendered(got: Result<Option<(GlueSpec, SeamFamily)>, SeamBlock>, arg: &str) -> String {
-        got.unwrap_or_else(|b| panic!("blocked: {b:?}"))
+        let mut spec = got
+            .unwrap_or_else(|b| panic!("blocked: {b:?}"))
             .unwrap_or_else(|| panic!("no edit"))
-            .0
-            .render(arg)
-            .expect("an emitting spec always renders")
+            .0;
+        if spec.null_arm == NullArm::Checked && spec.checked_binding_type.is_none() {
+            spec = spec.with_checked_binding_type("*mut i32".to_owned());
+        }
+        spec.render(arg).expect("an emitting spec always renders")
     }
 
     /// **Reborrow, BOTH SIDES.** `*mut T → &mut T` needs glue; the reverse needs
@@ -1895,7 +1942,7 @@ mod tests {
                 ),
                 "p"
             ),
-            "{ let __crat_call_adapter_ptr = p; if __crat_call_adapter_ptr.is_null() { None } else { Some(unsafe { core::slice::from_raw_parts_mut(__crat_call_adapter_ptr, (n) as usize) }) } }"
+            "{ let __crat_call_adapter_ptr: *mut i32 = p; if __crat_call_adapter_ptr.is_null() { None } else { Some(unsafe { core::slice::from_raw_parts_mut(__crat_call_adapter_ptr, (n) as usize) }) } }"
         );
         // **Without one, the position now FABRICATES** (ruling 2026-08-12,
         // superseding ruling item 4's `None` arm). What ruling B settled is
@@ -2305,7 +2352,11 @@ mod tests {
         for expected in forms {
             for found in forms {
                 if let Ok(Some((spec, _))) = glue(expected, found, Some("n")) {
-                    out.push(spec);
+                    out.push(if spec.null_arm == NullArm::Checked {
+                        spec.with_checked_binding_type("*mut i32".to_owned())
+                    } else {
+                        spec
+                    });
                 }
             }
         }
@@ -2391,6 +2442,11 @@ pub(crate) struct SeamPlan {
     /// Raw-boundary sites whose source had a safe presentation but whose
     /// required bridge was held. These become terminal dropped class sites.
     pub raw_boundary_blocked: Vec<BlockedRawBoundary>,
+    /// Inference-sensitive declaration shapes carried with their final type.
+    pub explicit_declarations: Vec<ExplicitDeclarationSite>,
+    /// Generated/zero-syntax bridge sites that still require plan and terminal
+    /// receipts in their owning signature class.
+    pub zero_bridges: Vec<ZeroBridgeSite>,
 }
 
 /// The form a decision emits.
@@ -2523,6 +2579,7 @@ pub(crate) fn synthesize(
     c9_marks: &[crate::analyses::borrow_ownership::a5_producer::PlannedC9Mark],
     a5_site_proofs: &A5SeamProofIndex,
     retention: &super::raw_boundary::RetentionSummaries,
+    lifetime_eligibility: &super::lifetime::LifetimeEligibility,
 ) -> SeamPlan {
     let coconv = super::co_conversion::CoConv::default();
     synthesize_with_raw_boundary(
@@ -2535,6 +2592,7 @@ pub(crate) fn synthesize(
         &super::raw_boundary::RawBoundaryDispositionIndex::default(),
         &coconv,
         retention,
+        lifetime_eligibility,
     )
 }
 
@@ -2548,6 +2606,7 @@ pub(crate) fn synthesize_with_raw_boundary(
     raw_boundary: &super::raw_boundary::RawBoundaryDispositionIndex,
     coconv: &super::co_conversion::CoConv,
     retention: &super::raw_boundary::RetentionSummaries,
+    lifetime_eligibility: &super::lifetime::LifetimeEligibility,
 ) -> SeamPlan {
     let sm = tcx.sess.source_map();
     let mut plan = SeamPlan::default();
@@ -2616,6 +2675,7 @@ pub(crate) fn synthesize_with_raw_boundary(
                 /// never so this seam stage can block or edit it.
                 raw_boundary_observation: bool,
                 source_shape: &'static str,
+                source_type: String,
             }
             let mut positions: Vec<Pos> = Vec::new();
             for arg in &site.args {
@@ -2752,6 +2812,7 @@ pub(crate) fn synthesize_with_raw_boundary(
                     literal_null,
                     raw_boundary_observation,
                     source_shape: arg.shape.key(),
+                    source_type: arg.source_type.clone(),
                 });
             }
 
@@ -2795,6 +2856,11 @@ pub(crate) fn synthesize_with_raw_boundary(
                     result.and_then(|answer| {
                         answer
                             .map(|(spec, family)| {
+                                let spec = if spec.null_arm == NullArm::Checked {
+                                    spec.with_checked_binding_type(pos.source_type.clone())
+                                } else {
+                                    spec
+                                };
                                 let replacement =
                                     spec.render(text).ok_or(SeamBlock::LengthUnknown)?;
                                 let len_arm = spec.len.as_ref().zip(len_evidence).map(|(l, e)| {
@@ -2975,6 +3041,18 @@ pub(crate) fn synthesize_with_raw_boundary(
                 match &candidates[idx] {
                     Ok(None) => {}
                     Ok(Some(candidate)) => {
+                        if let Some(emitted_type) = candidate.spec.checked_binding_type.clone() {
+                            plan.explicit_declarations.push(ExplicitDeclarationSite {
+                                owner_class: SignatureClassId::of(*callee),
+                                caller: site.caller,
+                                node: None,
+                                span: Some(pos.span),
+                                category: "local-temp",
+                                emitted_type,
+                                replacement: None,
+                                arm: "glue",
+                            });
+                        }
                         // Rule 1 (2026-08-11): the census is a prioritization
                         // overlay, so a pair with no row is REPORTED, not
                         // refused.
@@ -3297,7 +3375,7 @@ pub(crate) fn synthesize_with_raw_boundary(
         let Ok(argument) = sm.span_to_snippet(site.span) else {
             continue;
         };
-        let spec = GlueSpec::raw_boundary(site.template, site.target.mutability, false, true);
+        let spec = GlueSpec::raw_boundary_target(site.template, &site.target, false, true);
         let Some(replacement) = spec.render(&argument) else {
             continue;
         };
@@ -3319,8 +3397,25 @@ pub(crate) fn synthesize_with_raw_boundary(
                 caller: site.node.0,
                 callee: BridgeCalleeId::Local(site.node.0),
                 arm: "addr".to_owned(),
-                position: format!("hir{}", site.node.1.local_id.as_u32()),
-                bridge_kind: site.template.key().to_owned(),
+                position: format!(
+                    "{}={}:hir{}@{}..{}:target={}:sink={}",
+                    if site.op == "ptr-eq" {
+                        if site.operand_index == 0 {
+                            "lhs"
+                        } else {
+                            "rhs"
+                        }
+                    } else {
+                        "operand"
+                    },
+                    site.op,
+                    site.node.1.local_id.as_u32(),
+                    site.span.lo().0,
+                    site.span.hi().0,
+                    site.target.rendered,
+                    site.target_type,
+                ),
+                bridge_kind: site.bridge_kind.to_owned(),
                 extent: receipt_extent(&spec),
                 retention: BridgeRetentionTier::None,
                 waiver_id: None,
@@ -3329,7 +3424,7 @@ pub(crate) fn synthesize_with_raw_boundary(
             lifetime_plan_digest: None,
             caller_fn: site.owner.clone(),
             param_index: usize::MAX,
-            source_shape: "address-observation",
+            source_shape: "raw-op-address-observation",
             family: SeamFamily::Safe,
             len_arm: None,
             spec,
@@ -3340,6 +3435,173 @@ pub(crate) fn synthesize_with_raw_boundary(
             blind: false,
             overlap: None,
             atom_ids,
+        });
+    }
+
+    // Return seams are owned by the returning function's signature class. The
+    // original expression is raw, so even a converted local receives the same
+    // explicit reborrow algebra as an inbound raw boundary. A typed origin
+    // permit is mandatory and supplies the lifetime-plan receipt.
+    let mut return_sites = facts.return_sites.clone();
+    return_sites.sort_by_key(|site| {
+        (
+            site.owner.local_def_index.as_u32(),
+            site.span.lo().0,
+            site.span.hi().0,
+        )
+    });
+    for site in return_sites {
+        let Some(function_plan) = table.lifetime_plan.function(site.owner) else {
+            continue;
+        };
+        if function_plan
+            .lifetime_for(super::lifetime::FnSignatureSlot::RETURN)
+            .is_none()
+        {
+            continue;
+        }
+        let signature = tcx
+            .fn_sig(site.owner.to_def_id())
+            .skip_binder()
+            .skip_binder();
+        let output = signature.output();
+        let rustc_middle::ty::TyKind::RawPtr(_, output_mutability) = *output.kind() else {
+            continue;
+        };
+        let expected_mutable = output_mutability == rustc_middle::ty::Mutability::Mut;
+        let expected = Form::Ref {
+            mutable: expected_mutable,
+        };
+        let Some(root) = site.root else {
+            plan.blocked.push(BlockedSeam {
+                caller: site.owner,
+                callee: site.owner,
+                index: usize::MAX,
+                span: site.span,
+                block: SeamBlock::ReturnLifetimeAbsent,
+                expected: Some(expected),
+                found: Some(Form::Raw),
+                source_shape: "return-seam",
+                candidate_template: "return-raw-to-ref".to_owned(),
+                null_arm: "none".to_owned(),
+                extent_arm: "none".to_owned(),
+                root_identity: "-".to_owned(),
+                blind: false,
+                peers: Vec::new(),
+                overlap: None,
+            });
+            continue;
+        };
+        let node = (site.owner, root);
+        if lifetime_eligibility.return_permit(node).is_none() {
+            plan.blocked.push(BlockedSeam {
+                caller: site.owner,
+                callee: site.owner,
+                index: usize::MAX,
+                span: site.span,
+                block: SeamBlock::ReturnLifetimeAbsent,
+                expected: Some(expected),
+                found: Some(Form::Raw),
+                source_shape: "return-seam",
+                candidate_template: "return-raw-to-ref".to_owned(),
+                null_arm: "none".to_owned(),
+                extent_arm: "none".to_owned(),
+                root_identity: root_label(&labels, site.owner, Some(root)),
+                blind: false,
+                peers: Vec::new(),
+                overlap: None,
+            });
+            continue;
+        }
+        let final_mutable = decision_of.get(&node).is_some_and(|decision| {
+            matches!(
+                decision,
+                Decision::Ref { mutable: true }
+                    | Decision::InferredRef { mutable: true, .. }
+                    | Decision::Slice { mutable: true, .. }
+                    | Decision::Opt { mutable: true, .. }
+            )
+        });
+        if expected_mutable && !final_mutable {
+            plan.blocked.push(BlockedSeam {
+                caller: site.owner,
+                callee: site.owner,
+                index: usize::MAX,
+                span: site.span,
+                block: SeamBlock::SharedToMut,
+                expected: Some(expected),
+                found: Some(Form::Raw),
+                source_shape: "return-seam",
+                candidate_template: "return-raw-to-ref".to_owned(),
+                null_arm: "none".to_owned(),
+                extent_arm: "none".to_owned(),
+                root_identity: root_label(&labels, site.owner, Some(root)),
+                blind: false,
+                peers: Vec::new(),
+                overlap: None,
+            });
+            continue;
+        }
+        let Ok(text) = sm.span_to_snippet(site.span) else {
+            plan.blocked.push(BlockedSeam {
+                caller: site.owner,
+                callee: site.owner,
+                index: usize::MAX,
+                span: site.span,
+                block: SeamBlock::UnnameableOperand,
+                expected: Some(expected),
+                found: Some(Form::Raw),
+                source_shape: "return-seam",
+                candidate_template: "return-raw-to-ref".to_owned(),
+                null_arm: "none".to_owned(),
+                extent_arm: "none".to_owned(),
+                root_identity: root_label(&labels, site.owner, Some(root)),
+                blind: false,
+                peers: Vec::new(),
+                overlap: None,
+            });
+            continue;
+        };
+        let spec = GlueSpec::core(GlueCore::Reborrow, expected_mutable);
+        let Some(replacement) = spec.render(&text) else {
+            continue;
+        };
+        let digest = function_plan.digest();
+        plan.edits.push(SeamEdit {
+            span: site.span,
+            call_span: site.span,
+            replacement,
+            owner_class: SignatureClassId::of(site.owner),
+            bridge: BridgeSitePlan {
+                caller: site.owner,
+                callee: BridgeCalleeId::Local(site.owner),
+                arm: "glue".to_owned(),
+                position: format!(
+                    "return@{}..{}:target={}:lifetime_plan={digest}",
+                    site.span.lo().0,
+                    site.span.hi().0,
+                    site.source_type.rendered,
+                ),
+                bridge_kind: "return-raw-to-ref".to_owned(),
+                extent: BridgeExtentKind::None,
+                retention: BridgeRetentionTier::T1,
+                waiver_id: None,
+            },
+            owner_fn: tcx.def_path_str(site.owner.to_def_id()),
+            lifetime_plan_digest: Some(digest),
+            caller_fn: tcx.def_path_str(site.owner.to_def_id()),
+            param_index: usize::MAX,
+            source_shape: "return-seam",
+            family: SeamFamily::Reborrow,
+            len_arm: None,
+            spec,
+            arg_span: site.span,
+            expected,
+            found: Form::Raw,
+            root_identity: root_label(&labels, site.owner, Some(root)),
+            blind: false,
+            overlap: None,
+            atom_ids: Vec::new(),
         });
     }
 

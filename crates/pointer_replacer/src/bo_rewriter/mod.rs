@@ -4925,8 +4925,11 @@ fn finish_decide<'tcx>(
         &raw_boundary,
         &coconv,
         &retention,
+        &lifetime_eligibility,
     );
-    table.arm_requirements = derive_arm_requirements(&subjects, &coconv, &raw_boundary, &exposure);
+    let arm_requirements =
+        derive_arm_requirements(&subjects, &table, &coconv, &raw_boundary, &exposure);
+    table.arm_requirements = arm_requirements;
     let seam_wall_s = seam_started.elapsed().as_secs_f64();
     let raw_boundary_render_wall_s = seam_started.elapsed().as_secs_f64();
     let c9_before_final_filter = retained_c9_plans.len();
@@ -4967,8 +4970,11 @@ fn finish_decide<'tcx>(
             &raw_boundary,
             &coconv,
             &retention,
+            &lifetime_eligibility,
         );
     }
+    append_surface_declaration_plans(tcx, &exposure, &mut table);
+    append_inferred_local_declaration_plans(tcx, &mut table);
     table.c9_marks = retained_c9_plans.clone();
     let table = table;
 
@@ -5077,8 +5083,178 @@ fn finish_decide<'tcx>(
     ))
 }
 
+fn append_surface_declaration_plans(
+    tcx: TyCtxt<'_>,
+    exposure: &decision::exposure::ExposurePolicy,
+    table: &mut decision::DecisionTable,
+) {
+    use bridge_receipt::SignatureClassId;
+    use decision::{exposure::ExposureSurfacePlan, lifetime::FnSignatureSlot};
+
+    for function in exposure.functions() {
+        if !matches!(
+            function.plan,
+            ExposureSurfacePlan::PositiveSeedShim | ExposureSurfacePlan::FnPtrRawWrapper
+        ) {
+            continue;
+        }
+        let owner = SignatureClassId::of(function.did);
+        let raw_signature = format!(
+            "{:?}",
+            tcx.fn_sig(function.did.to_def_id())
+                .skip_binder()
+                .skip_binder()
+        );
+        table
+            .seams
+            .explicit_declarations
+            .push(decision::seam::ExplicitDeclarationSite {
+                owner_class: owner,
+                caller: function.did,
+                node: None,
+                span: None,
+                category: "wrapper",
+                emitted_type: raw_signature,
+                replacement: None,
+                arm: "surface",
+            });
+
+        let return_plan_digest = table
+            .lifetime_plan
+            .function(function.did)
+            .filter(|plan| plan.lifetime_for(FnSignatureSlot::RETURN).is_some())
+            .map(decision::lifetime::FunctionPlan::digest);
+        if let Some(return_plan_digest) = return_plan_digest {
+            let signature = tcx
+                .fn_sig(function.did.to_def_id())
+                .skip_binder()
+                .skip_binder();
+            if let TyKind::RawPtr(pointee, mutability) = *signature.output().kind() {
+                let emitted_type = format!(
+                    "&{}{}",
+                    if mutability == Mutability::Mut {
+                        "mut "
+                    } else {
+                        ""
+                    },
+                    pointee,
+                );
+                table
+                    .seams
+                    .explicit_declarations
+                    .push(decision::seam::ExplicitDeclarationSite {
+                        owner_class: owner,
+                        caller: function.did,
+                        node: None,
+                        span: None,
+                        category: "return-temp",
+                        emitted_type,
+                        replacement: None,
+                        arm: "surface",
+                    });
+                table
+                    .seams
+                    .zero_bridges
+                    .push(decision::seam::ZeroBridgeSite {
+                        owner_class: owner,
+                        caller: function.did,
+                        span: None,
+                        arm: "surface",
+                        position: format!(
+                            "return:form=ref-to-raw:lifetime_plan={}",
+                            return_plan_digest
+                        ),
+                        bridge_kind: "return-ref-to-raw",
+                        retention: bridge_receipt::BridgeRetentionTier::T1,
+                        waiver_id: None,
+                    });
+            }
+        }
+    }
+
+    for seed in exposure.static_fnptr_seeds() {
+        if !matches!(
+            exposure.plan(seed.function),
+            ExposureSurfacePlan::PositiveSeedShim | ExposureSurfacePlan::FnPtrRawWrapper
+        ) {
+            continue;
+        }
+        table
+            .seams
+            .explicit_declarations
+            .push(decision::seam::ExplicitDeclarationSite {
+                owner_class: SignatureClassId::of(seed.function),
+                caller: seed.owner,
+                node: None,
+                span: Some(seed.span),
+                category: "static",
+                emitted_type: format!(
+                    "{}",
+                    tcx.type_of(seed.owner.to_def_id()).instantiate_identity()
+                ),
+                replacement: None,
+                arm: "surface",
+            });
+    }
+}
+
+fn append_inferred_local_declaration_plans(tcx: TyCtxt<'_>, table: &mut decision::DecisionTable) {
+    use bridge_receipt::SignatureClassId;
+
+    let mut declarations = Vec::new();
+    let mut receives = Vec::new();
+    for (subject, decision) in &table.entries {
+        let (mutable, callee) = match decision {
+            decision::Decision::InferredRef { mutable, callee } => (mutable, callee),
+            decision::Decision::Ref { .. }
+            | decision::Decision::Slice { .. }
+            | decision::Decision::Opt { .. }
+            | decision::Decision::Box(_)
+            | decision::Decision::Degraded(_) => continue,
+        };
+        let Some(name) = subject.param_name.as_deref() else {
+            continue;
+        };
+        let signature = tcx.fn_sig(callee.to_def_id()).skip_binder().skip_binder();
+        let TyKind::RawPtr(pointee, _) = *signature.output().kind() else {
+            continue;
+        };
+        let emitted_type = format!("&{}{}", if *mutable { "mut " } else { "" }, pointee);
+        let owner_class = SignatureClassId::of(*callee);
+        declarations.push(decision::seam::ExplicitDeclarationSite {
+            owner_class,
+            caller: subject.fn_did,
+            node: Some((subject.fn_did, subject.hir_id)),
+            span: Some(subject.binding_span),
+            category: "local",
+            replacement: Some(format!("{name}: {emitted_type}")),
+            emitted_type: emitted_type.clone(),
+            arm: "glue",
+        });
+        if let Some(digest) = table
+            .lifetime_plan
+            .function(*callee)
+            .map(decision::lifetime::FunctionPlan::digest)
+        {
+            receives.push(decision::seam::ZeroBridgeSite {
+                owner_class,
+                caller: subject.fn_did,
+                span: Some(subject.binding_span),
+                arm: "glue",
+                position: format!("caller-receive:type={emitted_type}:lifetime_plan={digest}"),
+                bridge_kind: "return-caller-receive-ref",
+                retention: bridge_receipt::BridgeRetentionTier::None,
+                waiver_id: None,
+            });
+        }
+    }
+    table.seams.explicit_declarations.extend(declarations);
+    table.seams.zero_bridges.extend(receives);
+}
+
 fn derive_arm_requirements(
     subjects: &[decision::Subject],
+    table: &decision::DecisionTable,
     coconv: &decision::co_conversion::CoConv,
     raw_boundary: &decision::raw_boundary::RawBoundaryDispositionIndex,
     exposure: &decision::exposure::ExposurePolicy,
@@ -5092,7 +5268,20 @@ fn derive_arm_requirements(
         .map(|subject| {
             let key = (subject.fn_did, subject.hir_id);
             let mut required = coconv.required_arms(key);
+            let emits_signature = table.entries.iter().any(|(candidate, decision)| {
+                candidate.fn_did == subject.fn_did
+                    && candidate.hir_id == subject.hir_id
+                    && match decision {
+                        decision::Decision::Ref { .. }
+                        | decision::Decision::InferredRef { .. }
+                        | decision::Decision::Slice { .. }
+                        | decision::Decision::Opt { .. }
+                        | decision::Decision::Box(_) => true,
+                        decision::Decision::Degraded(_) => false,
+                    }
+            });
             if matches!(subject.kind, SubjectKind::Param { .. })
+                && emits_signature
                 && !matches!(
                     exposure.plan(subject.fn_did),
                     decision::exposure::ExposureSurfacePlan::NotApplicable
@@ -5105,6 +5294,22 @@ fn derive_arm_requirements(
                 .iter()
                 .any(|site| site.node == key)
             {
+                required.insert(Arm::Addr);
+            }
+            if table.entries.iter().any(|(candidate, decision)| {
+                candidate.fn_did == subject.fn_did
+                    && candidate.hir_id == subject.hir_id
+                    && match decision {
+                        decision::Decision::Slice { uses, .. }
+                        | decision::Decision::Opt { uses, .. } => uses
+                            .iter()
+                            .any(|edit| edit.bridge_kind.starts_with("raw-op-")),
+                        decision::Decision::Ref { .. }
+                        | decision::Decision::InferredRef { .. }
+                        | decision::Decision::Box(_)
+                        | decision::Decision::Degraded(_) => false,
+                    }
+            }) {
                 required.insert(Arm::Addr);
             }
             (key, required)

@@ -246,6 +246,11 @@ impl LifetimeEligibility {
         self.return_permits.len()
     }
 
+    #[cfg(test)]
+    pub(crate) fn remove_return_permit_for_test(&mut self, subject: NodeKey) -> bool {
+        self.return_permits.remove(&subject).is_some()
+    }
+
     pub(crate) fn inferred_permit(&self, subject: NodeKey) -> Option<InferredLifetimePermit> {
         self.inferred_permits.get(&subject).copied()
     }

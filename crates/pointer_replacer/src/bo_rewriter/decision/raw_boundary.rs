@@ -1405,6 +1405,9 @@ pub(crate) struct AddressViewSite {
     pub template: BridgeTemplate,
     pub target: RawTargetType,
     pub op: &'static str,
+    pub operand_index: usize,
+    pub bridge_kind: &'static str,
+    pub target_type: String,
 }
 
 impl RawBoundaryDisposition {
@@ -1902,20 +1905,18 @@ impl RawBoundaryDispositionIndex {
             {
                 continue;
             }
-            for operand in &observation.operands {
+            let mut views = Vec::with_capacity(observation.operands.len());
+            for (operand_index, operand) in observation.operands.iter().enumerate() {
                 let Some((_, decision)) = decisions.get(&operand.node).copied() else {
-                    continue;
+                    views.clear();
+                    break;
                 };
-                let target = RawTargetType {
-                    rendered: "*const _".to_owned(),
-                    pointee: "_".to_owned(),
-                    mutability: RawMutability::Const,
-                    depth2: None,
+                let target = operand.target.clone();
+                let Ok(template) = template_for(decision, &target, None, true) else {
+                    views.clear();
+                    break;
                 };
-                let Ok(template) = template_for(decision, &target, None, false) else {
-                    continue;
-                };
-                out.address_sites.push(AddressViewSite {
+                views.push(AddressViewSite {
                     owner: site_facts
                         .sites
                         .iter()
@@ -1929,9 +1930,22 @@ impl RawBoundaryDispositionIndex {
                     template,
                     target,
                     op: observation.op,
+                    operand_index,
+                    bridge_kind: match observation.op {
+                        "ptr-to-int" | "ptr-cast" => "raw-op-cast-sink",
+                        "ptr-eq" => "raw-op-ptr-eq",
+                        _ => "raw-op-address-view",
+                    },
+                    target_type: observation.target_type.clone(),
                 });
-                out.address_open_nodes.insert(operand.node);
             }
+            if views.len() != observation.operands.len() {
+                continue;
+            }
+            for view in &views {
+                out.address_open_nodes.insert(view.node);
+            }
+            out.address_sites.extend(views);
         }
         out.address_sites.sort_by_key(|site| {
             (

@@ -1085,6 +1085,136 @@ pub(crate) fn plan(
             .or_insert(required);
     }
 
+    for declaration in &table.seams.explicit_declarations {
+        let bridge = BridgeSitePlan {
+            caller: declaration.caller,
+            callee: BridgeCalleeId::Local(declaration.owner_class.local_def_id()),
+            arm: declaration.arm.to_owned(),
+            position: format!("{}:type={}", declaration.category, declaration.emitted_type),
+            bridge_kind: "declaration-explicit-type".to_owned(),
+            extent: BridgeExtentKind::None,
+            retention: BridgeRetentionTier::None,
+            waiver_id: None,
+        };
+        if let (Some(span), Some(replacement)) = (declaration.span, &declaration.replacement) {
+            match span_to_loc(span) {
+                Ok((file, lo, hi)) => {
+                    let subject_id = declaration
+                        .node
+                        .and_then(|node| {
+                            table
+                                .entries
+                                .iter()
+                                .find(|(subject, _)| (subject.fn_did, subject.hir_id) == node)
+                        })
+                        .map(|(subject, _)| subject.identity_key(&owner_of(subject)))
+                        .unwrap_or_else(|| declaration.category.to_owned());
+                    by_file.entry(file).or_default().push(Edit {
+                        lo,
+                        hi,
+                        replacement: replacement.clone(),
+                        justification: Justification::SeamAdapter {
+                            family: "safe",
+                            fabricated: false,
+                        },
+                        owner_class: Some(declaration.owner_class),
+                        owner_path: format!("class#{}", declaration.owner_class.order_key()),
+                        bridge: Some(bridge),
+                        atom_ids: Vec::new(),
+                        subject_id,
+                        required_arms: owner_arms
+                            .get(&declaration.owner_class)
+                            .copied()
+                            .unwrap_or_default()
+                            .render(),
+                        edit_kind: "declaration-explicit-type",
+                    });
+                }
+                Err(reason) => unplaceable.push(Unplaceable {
+                    owner_class: declaration.owner_class,
+                    bridge,
+                    reason,
+                    detail: declaration.category.to_owned(),
+                    subject: declaration.category.to_owned(),
+                }),
+            }
+            continue;
+        }
+        let (file, lo, hi, state) = match declaration.span {
+            None => (
+                "<generated>".to_owned(),
+                0,
+                0,
+                ClassSiteState::ZeroSyntaxReady,
+            ),
+            Some(span) => match span_to_loc(span) {
+                Ok((file, lo, hi)) => (
+                    file_key_label(&file),
+                    u32::try_from(lo).unwrap_or(u32::MAX),
+                    u32::try_from(hi).unwrap_or(u32::MAX),
+                    ClassSiteState::ZeroSyntaxReady,
+                ),
+                Err(reason) => (
+                    "<unplaceable>".to_owned(),
+                    0,
+                    0,
+                    ClassSiteState::Dropped(reason.to_owned()),
+                ),
+            },
+        };
+        preclass_sites.push(ClassSite {
+            key: bridge.materialize(declaration.owner_class, file, lo, hi),
+            edit_key: "-".to_owned(),
+            state,
+            extent: BridgeExtentKind::None,
+            retention: BridgeRetentionTier::None,
+            waiver_id: None,
+        });
+    }
+
+    for site in &table.seams.zero_bridges {
+        let bridge = BridgeSitePlan {
+            caller: site.caller,
+            callee: BridgeCalleeId::Local(site.owner_class.local_def_id()),
+            arm: site.arm.to_owned(),
+            position: site.position.clone(),
+            bridge_kind: site.bridge_kind.to_owned(),
+            extent: BridgeExtentKind::None,
+            retention: site.retention,
+            waiver_id: site.waiver_id.clone(),
+        };
+        let (file, lo, hi, state) = match site.span {
+            None => (
+                "<generated>".to_owned(),
+                0,
+                0,
+                ClassSiteState::ZeroSyntaxReady,
+            ),
+            Some(span) => match span_to_loc(span) {
+                Ok((file, lo, hi)) => (
+                    file_key_label(&file),
+                    u32::try_from(lo).unwrap_or(u32::MAX),
+                    u32::try_from(hi).unwrap_or(u32::MAX),
+                    ClassSiteState::ZeroSyntaxReady,
+                ),
+                Err(reason) => (
+                    "<unplaceable>".to_owned(),
+                    0,
+                    0,
+                    ClassSiteState::Dropped(reason.to_owned()),
+                ),
+            },
+        };
+        preclass_sites.push(ClassSite {
+            key: bridge.materialize(site.owner_class, file, lo, hi),
+            edit_key: "-".to_owned(),
+            state,
+            extent: BridgeExtentKind::None,
+            retention: site.retention,
+            waiver_id: site.waiver_id.clone(),
+        });
+    }
+
     // **S3.6-1 seam adapters, placed FIRST.**
     //
     // A seam edit lands in the CALLER's file and is justified by the CALLEE's
@@ -1098,33 +1228,35 @@ pub(crate) fn plan(
     // the callee's direct signature-class ID. The path is receipt-only.
     for seam in &table.seams.edits {
         match span_to_loc(seam.span) {
-            Ok((file, lo, hi)) => by_file.entry(file).or_default().push(Edit {
-                lo,
-                hi,
-                replacement: seam.replacement.clone(),
-                justification: Justification::SeamAdapter {
-                    family: match seam.family {
-                        super::decision::seam::SeamFamily::Safe => "safe",
-                        super::decision::seam::SeamFamily::Reborrow => "reborrow",
+            Ok((file, lo, hi)) => {
+                by_file.entry(file).or_default().push(Edit {
+                    lo,
+                    hi,
+                    replacement: seam.replacement.clone(),
+                    justification: Justification::SeamAdapter {
+                        family: match seam.family {
+                            super::decision::seam::SeamFamily::Safe => "safe",
+                            super::decision::seam::SeamFamily::Reborrow => "reborrow",
+                        },
+                        fabricated: seam.spec.len.as_ref().is_some_and(|l| l.is_fabricated()),
                     },
-                    fabricated: seam.spec.len.as_ref().is_some_and(|l| l.is_fabricated()),
-                },
-                owner_class: Some(seam.owner_class),
-                owner_path: seam.owner_fn.clone(),
-                bridge: Some(seam.bridge.clone()),
-                atom_ids: seam.atom_ids.clone(),
-                subject_id: format!("{}#arg{}", seam.owner_fn, seam.param_index),
-                required_arms: owner_arms
-                    .get(&seam.owner_class)
-                    .copied()
-                    .unwrap_or_default()
-                    .render(),
-                edit_kind: match seam.source_shape {
-                    "pair-raw-view" => "pair-raw-view",
-                    "address-observation" => "address-observation",
-                    _ => "seam-adapter",
-                },
-            }),
+                    owner_class: Some(seam.owner_class),
+                    owner_path: seam.owner_fn.clone(),
+                    bridge: Some(seam.bridge.clone()),
+                    atom_ids: seam.atom_ids.clone(),
+                    subject_id: format!("{}#arg{}", seam.owner_fn, seam.param_index),
+                    required_arms: owner_arms
+                        .get(&seam.owner_class)
+                        .copied()
+                        .unwrap_or_default()
+                        .render(),
+                    edit_kind: match seam.source_shape {
+                        "pair-raw-view" => "pair-raw-view",
+                        "raw-op-address-observation" => "raw-op-address-observation",
+                        _ => "seam-adapter",
+                    },
+                });
+            }
             // A span that cannot be located is RECORDED, never dropped: a seam
             // that silently vanishes leaves the callee converted and the call
             // site raw, which is the `E0308` this whole slice exists to remove.
@@ -1516,6 +1648,7 @@ pub(crate) fn plan(
             }
         }
         for use_edit in use_edits_in.into_iter().flatten() {
+            let raw_op = use_edit.bridge_kind.starts_with("raw-op-");
             match span_to_loc(use_edit.span) {
                 Ok((file, lo, hi)) if file == ty_file => use_edits.push(Edit {
                     lo,
@@ -1529,14 +1662,22 @@ pub(crate) fn plan(
                     bridge: Some(BridgeSitePlan::local(
                         subject.fn_did,
                         subject.fn_did,
-                        Arm::Surface.key(),
-                        subject_id.clone(),
-                        "subject-use",
+                        if raw_op {
+                            Arm::Addr.key()
+                        } else {
+                            Arm::Surface.key()
+                        },
+                        if raw_op {
+                            format!("{}@{}..{}", subject_id, lo, hi)
+                        } else {
+                            subject_id.clone()
+                        },
+                        use_edit.bridge_kind,
                     )),
                     atom_ids: subject_atom_ids.clone(),
                     subject_id: subject_id.clone(),
                     required_arms: subject_arms.clone(),
-                    edit_kind: "subject-use",
+                    edit_kind: use_edit.bridge_kind,
                 }),
                 Ok(_) => {
                     use_failure = Some("slice use is in a different file from the declaration")
@@ -1677,7 +1818,9 @@ pub(crate) fn plan(
         preclass_sites.push(site);
     }
     for blocked in &table.seams.blocked {
-        let arm = if blocked.block == super::decision::seam::SeamBlock::SiteOverlap {
+        let arm = if blocked.source_shape == "return-seam" {
+            Arm::Glue
+        } else if blocked.block == super::decision::seam::SeamBlock::SiteOverlap {
             Arm::Pair
         } else {
             match (blocked.expected, blocked.found) {

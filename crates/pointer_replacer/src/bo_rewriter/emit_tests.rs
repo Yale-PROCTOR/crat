@@ -5793,6 +5793,7 @@ fn e2_attempt(
             &ctx.retained_c9_plans,
             &ctx.a5_site_proofs,
             &ctx.retention,
+            &ctx.lifetime_eligibility,
         );
         let receipt = super::seam_tsv_from_table(tcx, &table);
         let emission = emit_files(
@@ -5854,16 +5855,21 @@ fn raw_boundary_attempt_with(
                 &raw_boundary,
                 &ctx.coconv,
                 &ctx.retention,
+                &ctx.lifetime_eligibility,
             );
-            table.arm_requirements = super::derive_arm_requirements(
+            let arm_requirements = super::derive_arm_requirements(
                 &ctx.subjects,
+                &table,
                 &ctx.coconv,
                 &raw_boundary,
                 &ctx.exposure,
             );
+            table.arm_requirements = arm_requirements;
             let receipt = format!(
-                "{}\n-- seams --\n{}",
+                "{}\n-- addresses --\n{}\n-- lifetimes --\n{}\n-- seams --\n{}",
                 raw_boundary.receipts_tsv(),
+                raw_boundary.addresses_tsv(tcx),
+                table.lifetime_plan.canonical_receipt(tcx),
                 super::seam_tsv_from_table(tcx, &table)
             );
             let emission = emit_files(
@@ -6304,6 +6310,7 @@ fn e3_attempt_with(
             &ctx.retained_c9_plans,
             &ctx.a5_site_proofs,
             &ctx.retention,
+            &ctx.lifetime_eligibility,
         );
         let receipt = super::seam_tsv_from_table(tcx, &table);
         let emission = emit_files(
@@ -6614,7 +6621,7 @@ fn br_w3_raw_slice_inbound_extents_and_nullable_twins_are_exact() {
         "{source}"
     );
     assert!(
-        source.contains("optional_shared({ let __crat_call_adapter_ptr = read_p;"),
+        source.contains("optional_shared({ let __crat_call_adapter_ptr: *const i32 = read_p;"),
         "{source}"
     );
     assert!(
@@ -6622,7 +6629,7 @@ fn br_w3_raw_slice_inbound_extents_and_nullable_twins_are_exact() {
         "{source}"
     );
     assert!(
-        source.contains("optional_mut({ let __crat_call_adapter_ptr = write_p;"),
+        source.contains("optional_mut({ let __crat_call_adapter_ptr: *mut i32 = write_p;"),
         "{source}"
     );
     assert!(
@@ -6895,13 +6902,16 @@ fn br_w5b_thin_const_and_mut_depth2_storage_use_npo_bridge() {
             &raw_boundary,
             &ctx.coconv,
             &ctx.retention,
+            &ctx.lifetime_eligibility,
         );
-        table.arm_requirements = super::derive_arm_requirements(
+        let arm_requirements = super::derive_arm_requirements(
             &ctx.subjects,
+            &table,
             &ctx.coconv,
             &raw_boundary,
             &ctx.exposure,
         );
+        table.arm_requirements = arm_requirements;
         emit_files(
             tcx,
             &table,
@@ -7424,6 +7434,371 @@ fn br_w10_write_stream_lifecycle_and_missing_evidence_all_hold() {
     );
 }
 
+/// BR-W11 RED: a safe value reaching an `as` sink must first acquire an
+/// explicit raw view, while the already-supported Option null observation must
+/// be accounted as its own ADDR/GLUE bridge rather than a generic subject use.
+#[test]
+fn br_w11_cast_sink_and_is_null_are_explicit_receipted_raw_ops() {
+    let source = "#![allow(dead_code, unused_unsafe, unused_mut, unused_variables)]\n\
+         pub unsafe fn cast_sink(p: *const i32) -> *const u8 { p as *const u8 }\n\
+         pub unsafe fn nullable(p: *mut i32) -> bool { p.is_null() }\n";
+    let attempt = raw_boundary_attempt_with(source, &|table| {
+        for (subject, decision) in &mut table.entries {
+            if subject.label.ends_with("cast_sink::p") {
+                *decision = super::decision::Decision::Ref { mutable: false };
+            }
+        }
+    });
+    let emitted = e2_root_text(&attempt);
+    assert!(
+        emitted.contains("core::ptr::from_ref(p) as *const u8"),
+        "{emitted}"
+    );
+    assert!(emitted.contains("p.is_none()"), "{emitted}");
+    assert!(
+        e2_type_checks(&attempt),
+        "BR-W11 scalar raw ops must type-check"
+    );
+    let events = attempt
+        .emission
+        .plan
+        .bridge_events(&std::collections::BTreeSet::new());
+    for kind in ["raw-op-cast-sink", "raw-op-is-none"] {
+        let pair = events
+            .iter()
+            .filter(|event| event.site.bridge_kind == kind)
+            .collect::<Vec<_>>();
+        assert_eq!(pair.len(), 2, "missing plan/terminal {kind}: {events:#?}");
+        assert!(pair.iter().all(|event| event.site.arm == "addr"));
+    }
+}
+
+/// BR-W11 RED: pointer equality owns the whole expression so nested operand
+/// edits cannot collide. Slice operands compare data pointers, and an optional
+/// operand maps None to a null whose pointee type is explicit.
+#[test]
+fn br_w11_ptr_eq_uses_slice_data_and_typed_option_null_views() {
+    let source = "#![allow(dead_code, unused_unsafe, unused_mut, unused_variables)]\n\
+         pub unsafe fn eq(p: *const i32, q: *const i32) -> bool { core::ptr::eq(p, q) }\n";
+    let attempt = raw_boundary_attempt_with(source, &|table| {
+        for (subject, decision) in &mut table.entries {
+            if subject.label.ends_with("eq::p") {
+                *decision = super::decision::Decision::Slice {
+                    mutable: false,
+                    uses: Vec::new(),
+                };
+            } else if subject.label.ends_with("eq::q") {
+                *decision = super::decision::Decision::Opt {
+                    mutable: false,
+                    slice: false,
+                    uses: Vec::new(),
+                };
+            }
+        }
+    });
+    let emitted = e2_root_text(&attempt);
+    assert!(
+        emitted.contains("core::ptr::eq(p.as_ptr(),"),
+        "{emitted}\n{}",
+        attempt.receipt
+    );
+    assert!(
+        emitted.contains("core::ptr::null::<i32>()"),
+        "{emitted}\n{}",
+        attempt.receipt
+    );
+    assert!(e2_type_checks(&attempt), "BR-W11 ptr::eq must type-check");
+    let events = attempt
+        .emission
+        .plan
+        .bridge_events(&std::collections::BTreeSet::new());
+    let pair = events
+        .iter()
+        .filter(|event| event.site.bridge_kind == "raw-op-ptr-eq")
+        .collect::<Vec<_>>();
+    assert_eq!(
+        pair.len(),
+        4,
+        "one plan/terminal pair per operand: {events:#?}"
+    );
+    assert!(
+        pair.iter()
+            .any(|event| event.site.position.contains("lhs="))
+    );
+    assert!(
+        pair.iter()
+            .any(|event| event.site.position.contains("rhs="))
+    );
+    assert!(
+        pair.iter()
+            .all(|event| event.site.position.contains("target=*const i32"))
+    );
+}
+
+/// BR-W12 RED: one class exercises every inference-sensitive declaration
+/// family. The static/table and raw wrapper keep explicit raw types, while the
+/// generated return temporary and caller local receive the carried safe type.
+#[test]
+fn br_w12_local_static_wrapper_and_return_temp_types_are_explicit() {
+    let source = "#![allow(dead_code, unused_unsafe, unused_mut, unused_variables)]\n\
+         pub type Callback = unsafe fn(*const i32) -> *const i32;\n\
+         pub unsafe fn target(p: *const i32) -> *const i32 { p }\n\
+         pub static TABLE: [Option<Callback>; 1] = [Some(target as Callback)];\n\
+         pub unsafe fn id(p: *const i32) -> *const i32 { p }\n\
+         pub unsafe fn caller(p: *const i32) -> i32 { let q = id(p); *q }\n";
+    let fixture = Fixture::new(&[("lib.rs", source)]);
+    let outcome = super::rewrite_m1_path_a5_injected(
+        &fixture.root(),
+        crate::analyses::borrow_ownership::a5_overlap::A5Mode::PreciseReplay,
+        Some(
+            crate::analyses::borrow_ownership::a5_overlap::WholeProgramAttestation::FrozenBenchmarkGraph,
+        ),
+        &|_| {},
+    );
+    let super::RewriteOutcome::Emitted {
+        source,
+        raw_boundary_artifacts,
+        ..
+    } = outcome
+    else {
+        panic!("BR-W12 declaration fixture must emit: {outcome:#?}");
+    };
+    assert!(
+        source.contains("static TABLE: [Option<Callback>; 1]"),
+        "{source}"
+    );
+    assert!(
+        source.contains("fn target(p: *const i32) -> *const i32"),
+        "{source}"
+    );
+    assert!(source.contains("let __crat_result: &i32 ="), "{source}");
+    assert!(source.contains("let q: &i32 = id(p)"), "{source}");
+    let declarations = raw_boundary_artifacts
+        .bridge_events
+        .iter()
+        .filter(|event| event.site.bridge_kind == "declaration-explicit-type")
+        .collect::<Vec<_>>();
+    for category in ["local", "static", "wrapper", "return-temp"] {
+        assert!(
+            declarations
+                .iter()
+                .any(|event| event.site.position.starts_with(category)),
+            "missing {category} declaration receipt: {declarations:#?}"
+        );
+    }
+    assert_eq!(
+        declarations.len(),
+        8,
+        "four plan/terminal declaration pairs: {declarations:#?}"
+    );
+}
+
+/// BR-W13 RED: a raw tail entering a lifetime-permitted safe return reuses the
+/// inbound bridge algebra and belongs to the returning function's class.
+#[test]
+fn br_w13_raw_tail_to_safe_return_reuses_reborrow_and_lifetime_permit() {
+    let source = "#![allow(dead_code, unused_unsafe, unused_mut, unused_variables)]\n\
+         pub unsafe fn choose(p: *const i32) -> *const i32 { p }\n";
+    let fixture = Fixture::new(&[("lib.rs", source)]);
+    let outcome = super::rewrite_m1_path_a5_injected(
+        &fixture.root(),
+        crate::analyses::borrow_ownership::a5_overlap::A5Mode::PreciseReplay,
+        Some(
+            crate::analyses::borrow_ownership::a5_overlap::WholeProgramAttestation::FrozenBenchmarkGraph,
+        ),
+        &|_| {},
+    );
+    let super::RewriteOutcome::Emitted {
+        source: emitted,
+        raw_boundary_artifacts,
+        ..
+    } = outcome
+    else {
+        panic!("BR-W13 inbound return must emit: {outcome:#?}");
+    };
+    assert!(emitted.contains("unsafe { &*p }"), "{emitted}");
+    let pair = raw_boundary_artifacts
+        .bridge_events
+        .iter()
+        .filter(|event| event.site.bridge_kind == "return-raw-to-ref")
+        .collect::<Vec<_>>();
+    assert_eq!(pair.len(), 2, "{:#?}", raw_boundary_artifacts.bridge_events);
+    assert!(pair.iter().all(|event| {
+        event.site.owner_class.local_def_id() == event.site.caller
+            && event.retention == super::bridge_receipt::BridgeRetentionTier::T1
+            && event.waiver_id.is_none()
+    }));
+}
+
+/// BR-W13 RED: a real raw exposure wrapper converts the safe inner return back
+/// to its raw ABI and carries a return-specific class receipt.
+#[test]
+fn br_w13_surface_safe_return_to_raw_has_class_receipt() {
+    let fixture = Fixture::new(&[(
+        "lib.rs",
+        "#![allow(dead_code, unused_unsafe)]\n\
+         pub unsafe extern \"C\" fn api(p: *const i32) -> *const i32 { p }\n",
+    )]);
+    let outcome = super::rewrite_m1_path_with_emission_config(
+        &fixture.root(),
+        crate::analyses::borrow_ownership::a5_overlap::A5Mode::PreciseReplay,
+        Some(
+            crate::analyses::borrow_ownership::a5_overlap::WholeProgramAttestation::FrozenBenchmarkGraph,
+        ),
+        &super::EmissionRunConfig {
+            configured_exposure: configured_exposure_input("api"),
+        },
+    );
+    let super::RewriteOutcome::Emitted {
+        source,
+        raw_boundary_artifacts,
+        ..
+    } = outcome
+    else {
+        panic!("BR-W13 exposed return must emit: {outcome:#?}");
+    };
+    assert!(
+        source.contains("core::ptr::from_ref(__crat_result)"),
+        "{source}"
+    );
+    let pair = raw_boundary_artifacts
+        .bridge_events
+        .iter()
+        .filter(|event| event.site.bridge_kind == "return-ref-to-raw")
+        .collect::<Vec<_>>();
+    assert_eq!(pair.len(), 2, "{:#?}", raw_boundary_artifacts.bridge_events);
+    assert!(pair.iter().all(|event| {
+        event.retention == super::bridge_receipt::BridgeRetentionTier::T1
+            && event.waiver_id.is_none()
+            && event.site.arm == "surface"
+    }));
+}
+
+/// BR-W13 RED: an inferred receive declaration is still a seam owned by the
+/// returned callee class; the caller's lack of a signature edit cannot orphan
+/// its receipt.
+#[test]
+fn br_w13_caller_receive_is_owned_by_the_returned_callee_class() {
+    let fixture = Fixture::new(&[(
+        "lib.rs",
+        "#![allow(dead_code, unused_unsafe)]\n\
+         pub unsafe fn id(p: *const i32) -> *const i32 { p }\n\
+         pub unsafe fn caller(p: *const i32) -> i32 { let q = id(p); *q }\n",
+    )]);
+    let outcome = super::rewrite_m1_path_a5_injected(
+        &fixture.root(),
+        crate::analyses::borrow_ownership::a5_overlap::A5Mode::PreciseReplay,
+        Some(
+            crate::analyses::borrow_ownership::a5_overlap::WholeProgramAttestation::FrozenBenchmarkGraph,
+        ),
+        &|_| {},
+    );
+    let super::RewriteOutcome::Emitted {
+        source,
+        raw_boundary_artifacts,
+        ..
+    } = outcome
+    else {
+        panic!("BR-W13 caller receive must emit: {outcome:#?}");
+    };
+    assert!(source.contains("let q: &i32 = id(p)"), "{source}");
+    let pair = raw_boundary_artifacts
+        .bridge_events
+        .iter()
+        .filter(|event| event.site.bridge_kind == "return-caller-receive-ref")
+        .collect::<Vec<_>>();
+    assert_eq!(pair.len(), 2, "{:#?}", raw_boundary_artifacts.bridge_events);
+    assert!(pair.iter().all(|event| {
+        matches!(event.site.callee, super::bridge_receipt::BridgeCalleeId::Local(callee)
+            if callee == event.site.owner_class.local_def_id())
+            && event.site.caller != event.site.owner_class.local_def_id()
+            && event.site.position.contains("lifetime_plan=")
+    }));
+}
+
+/// BR-W13/F98 negative: removing the exact subject permit while preserving the
+/// already-finalized safe return plan must drop the return site and hold the
+/// entire class. No downstream retention tier or waiver may recreate it.
+#[test]
+fn br_w13_raw_to_safe_return_without_exact_permit_holds_class() {
+    let fixture = Fixture::new(&[(
+        "lib.rs",
+        "#![allow(dead_code, unused_unsafe)]\n\
+         pub unsafe fn id(p: *const i32) -> *const i32 { p }\n",
+    )]);
+    let emission = ::utils::compilation::run_compiler_on_path(&fixture.root(), |tcx| {
+        let (mut table, ctx) = super::decide_table_with_ctx_config(
+            tcx,
+            Some((
+                crate::analyses::borrow_ownership::a5_overlap::A5Mode::PreciseReplay,
+                Some(
+                    crate::analyses::borrow_ownership::a5_overlap::WholeProgramAttestation::FrozenBenchmarkGraph,
+                ),
+            )),
+        )
+        .expect("BR-W13 negative decision table");
+        let subject = table
+            .entries
+            .iter()
+            .find(|(subject, _)| subject.label.ends_with("id::p"))
+            .map(|(subject, _)| (subject.fn_did, subject.hir_id))
+            .expect("id::p subject");
+        let mut eligibility = ctx.lifetime_eligibility.clone();
+        assert!(eligibility.remove_return_permit_for_test(subject));
+        table.seams = super::decision::seam::synthesize_with_raw_boundary(
+            tcx,
+            &ctx.facts,
+            &ctx.subjects,
+            &table,
+            &ctx.retained_c9_plans,
+            &ctx.a5_site_proofs,
+            &ctx.raw_boundary,
+            &ctx.coconv,
+            &ctx.retention,
+            &eligibility,
+        );
+        let arm_requirements = super::derive_arm_requirements(
+            &ctx.subjects,
+            &table,
+            &ctx.coconv,
+            &ctx.raw_boundary,
+            &ctx.exposure,
+        );
+        table.arm_requirements = arm_requirements;
+        emit_files(
+            tcx,
+            &table,
+            &rustc_hash::FxHashSet::default(),
+            &ctx.retained_c9_plans,
+        )
+        .expect("BR-W13 negative emission")
+    })
+    .expect("BR-W13 negative fixture compiles");
+    let events = emission
+        .plan
+        .bridge_events(&std::collections::BTreeSet::new());
+    assert!(events.iter().any(|event| {
+        event.site.bridge_kind == "return-lifetime-permit-absent"
+            && event.stage == super::bridge_receipt::BridgeReceiptStage::Terminal
+            && event.state == super::bridge_receipt::BridgeReceiptState::Dropped
+    }));
+    assert!(
+        emission
+            .plan
+            .class_finalization
+            .classes
+            .values()
+            .any(|class| matches!(
+                class.disposition,
+                super::plan::SignatureClassDisposition::Held(_)
+            ))
+    );
+    if let Some(emitted) = text_for(&emission, "lib.rs") {
+        assert!(emitted.contains("p: *const i32"), "{emitted}");
+        assert!(!emitted.contains("unsafe { &*p }"), "{emitted}");
+    }
+}
+
 /// E2-X1 RED — the consumer-neutral carrier already reaches `finish_decide`,
 /// but E2-FN has no consumer yet. The lifetime producer must receive the intact
 /// summary object rather than an A5-shaped projection of it.
@@ -7854,9 +8229,9 @@ fn e2_w3_output_storage_uses_source_not_temp_lifetime() {
     assert_eq!(receipt[0].target, "arg1/deref0/depth1");
 }
 
-/// E2-W1 structural RED — the production AST path must materialize the plan,
-/// not merely let co-conversion skip the return escape.  Separate SCC names
-/// make the accepted source-to-return direction visible as `'a: 'b`.
+/// E2-W1/BR-W13 structural witness — the production AST path materializes the
+/// lifetime plan and the return-site reborrow. Separate SCC names make the
+/// accepted source-to-return direction visible as `'a: 'b`.
 #[test]
 fn e2_w1_production_emits_named_signature_lifetimes() {
     let fixture = Fixture::new(&[(
@@ -7887,8 +8262,8 @@ fn e2_w1_production_emits_named_signature_lifetimes() {
         .find(|line| line.contains("fn id"))
         .expect("E2-W1 emitted signature line");
     assert_eq!(
-        signature, "pub unsafe fn id<'a: 'b, 'b>(p: &'a i32) -> &'b i32 { p }",
-        "an unreceipted lifetime node must move this exact structural line",
+        signature, "pub unsafe fn id<'a: 'b, 'b>(p: &'a i32) -> &'b i32 { unsafe { &*p } }",
+        "the lifetime and return bridge must move this exact structural line",
     );
 }
 

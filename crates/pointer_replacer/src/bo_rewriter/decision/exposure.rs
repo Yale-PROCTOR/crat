@@ -318,6 +318,10 @@ impl ExposurePolicy {
         &self.static_fnptr_seeds
     }
 
+    pub(crate) fn functions(&self) -> &[FunctionExposure] {
+        &self.functions
+    }
+
     pub(crate) fn receipts_tsv(&self) -> String {
         let mut out = String::from(
             "function\tconfigured_name\taddress_taken\tseed_provenance\tfnptr_web\tsurface_plan\tsurface_edit\touter_identity\tinner_identity\touter_metric\tinner_metric\tconfigured_input_sha256\tseed_manifest_sha256\n",
