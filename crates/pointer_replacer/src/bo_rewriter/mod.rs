@@ -633,6 +633,13 @@ fn recover_class_groups(
     (result, probes)
 }
 
+fn exact_diagnostic_classes(
+    exact: std::collections::BTreeSet<bridge_receipt::SignatureClassId>,
+    _ready_universe: &std::collections::BTreeSet<bridge_receipt::SignatureClassId>,
+) -> std::collections::BTreeSet<bridge_receipt::SignatureClassId> {
+    exact
+}
+
 fn recovery_budget_deferred(projected_probes: f64, probe_secs: f64, budget_secs: f64) -> bool {
     projected_probes * probe_secs > budget_secs
 }
@@ -1825,7 +1832,7 @@ fn verify_and_revert(
                 .raw_boundary_artifacts
                 .attribution_hits
                 .record(result.rule);
-            attributed.extend(result.classes);
+            attributed.extend(exact_diagnostic_classes(result.classes, &all_ready_classes));
         }
         let newly = attributed
             .difference(&reverted)

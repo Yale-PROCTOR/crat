@@ -421,6 +421,40 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    fn rcp_w1_bridge_receipt_schema_header_is_sealed() {
+        const SEALED: &str = "site_key\towner_class\tcaller\tcallee\tarm\tposition\tfile\tlo\thi\tbridge_kind\textent_kind\tretention_tier\twaiver_id\tstage\tstate\tdrop_reason\n";
+        assert_eq!(bridge_receipt_header(), SEALED);
+        let columns = SEALED.trim_end().split('\t').collect::<Vec<_>>();
+        assert_eq!(columns.len(), 16);
+        assert_eq!(columns.iter().copied().collect::<BTreeSet<_>>().len(), 16);
+    }
+
+    #[test]
+    fn rcp_w2_t2_requires_exact_waiver_and_extent_evidence_is_stable() {
+        let invalid = BridgeReceiptEvent::for_test(
+            "t2",
+            BridgeReceiptStage::Plan,
+            BridgeReceiptState::Planned,
+        )
+        .with_retention(BridgeRetentionTier::T2, None);
+        assert!(invalid.validate().is_err());
+
+        let plan = BridgeReceiptEvent::for_test(
+            "extent",
+            BridgeReceiptStage::Plan,
+            BridgeReceiptState::Planned,
+        )
+        .with_extent(BridgeExtentKind::Fallback);
+        let terminal = BridgeReceiptEvent::for_test(
+            "extent",
+            BridgeReceiptStage::Terminal,
+            BridgeReceiptState::Applied,
+        )
+        .with_extent(BridgeExtentKind::None);
+        assert!(reconcile_bridge_events(&[plan, terminal]).is_err());
+    }
+
     /// CLS-W3 — two real local functions may share the same display label, but
     /// their signature-class identity and revert membership stay distinct.
     #[test]

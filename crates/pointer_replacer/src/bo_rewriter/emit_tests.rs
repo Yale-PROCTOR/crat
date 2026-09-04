@@ -5500,6 +5500,8 @@ fn cls_w5_w6_recovery_replays_are_class_bounded_and_strict() {
             .collect::<Vec<_>>();
         ids.sort();
         let heman_first_round = ids[..7].iter().copied().collect::<BTreeSet<_>>();
+        let ready_universe = ids.iter().copied().collect::<BTreeSet<_>>();
+        let heman_first_round = super::exact_diagnostic_classes(heman_first_round, &ready_universe);
         assert_eq!(
             heman_first_round.len(),
             7,
