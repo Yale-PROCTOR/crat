@@ -1508,11 +1508,14 @@ fn keep_r_raw(table: &mut super::decision::DecisionTable) {
     }
 }
 
-/// **S2b.1.3 — the NO-PROGRESS DETECTOR arm, witnessed.**
+/// **S2b.1.3 — an attribution failure reaches bounded recovery.**
 ///
 /// The inverted-direction shape: the error lands inside `caller`, so span
 /// attribution reverts `caller` — but the culprit is `callee`, and the error
-/// survives. The detector sees the error count fail to fall and escalates.
+/// survives. Atomic class holding can now remove the stale caller interval
+/// before attribution, in which case the loop escalates immediately as
+/// unattributed; otherwise the no-progress detector escalates on the next
+/// round. Both routes must enter bounded recovery.
 ///
 /// **Why injection is legitimate here.** This is a DERIVED breach shape, not an
 /// invention: reality emits it (1 of 86 corpus diagnostics, in heman), and A1's
@@ -1542,8 +1545,9 @@ fn the_no_progress_detector_escalates_when_attribution_is_wrong() {
                  attribute — attribution silently got away with it",
             );
             assert!(
-                reason.contains("no progress"),
-                "escalated, but not via the detector: {reason}"
+                reason.contains("no progress")
+                    || reason.contains("attributed to no rewritten function"),
+                "attribution failure did not reach a typed escalation: {reason}"
             );
             assert!(
                 bisect_probes > 0,
@@ -2376,28 +2380,14 @@ fn emitted_counts_placements_not_ref_decisions() {
             unplaceable,
             ..
         } => {
-            // ⚠ **THIS ASSERTION WAS `files.is_empty()`, AND M-3 CHANGED WHAT IT
-            // MEANS** (I-32, 2026-08-18). It held while the default layer was
-            // `render`, which cannot place an edit inside a macro expansion and
-            // reports the subject `unplaceable`. The AST layer works on the
-            // EXPANDED ast and rewrites the macro's DEFINITION body —
-            // `p: *mut i32` → `p: &mut i32` — so this fixture's text now DOES
-            // change.
-            //
-            // Two consequences, recorded rather than blessed: it is a
-            // capability the span layer never had, and the PLAN still calls the
-            // subject unplaceable, so the text changes while `emitted_count`
-            // counts nothing — an emission the ledger does not account for.
-            //
-            // **Corpus-unreachable**: `unplaceable == 0` on all 20 programs in
-            // BOTH eras, so no reported number depends on it. Asserted here as
-            // the MEASURED truth so any future movement is loud.
             assert_eq!(
-                files_touched, 1,
-                "the AST layer rewrites through the macro definition; 0 would \
-                 mean the capability was lost, and a plan that learned to place \
-                 the subject closes I-32's accounting gap and obliges this test \
-                 to be re-stated"
+                files_touched, 0,
+                "an unplaceable required site holds its whole signature class"
+            );
+            let original = std::fs::read_to_string(fixture.root()).expect("fixture source");
+            assert!(
+                files.values().all(|text| text == &original),
+                "a held class may ride the seeded AST map but its bytes must be unchanged"
             );
             assert_eq!(unplaceable.len(), 1, "{unplaceable:?}");
             assert_eq!(
@@ -2457,7 +2447,7 @@ fn a_degraded_outcome_reports_placements_too() {
     }
 }
 
-/// **S3.0′ — two subjects that render the SAME NAME stay distinct.**
+/// **S3.0′ + wave 3 — same-named subjects stay distinct inside one atomic class.**
 ///
 /// `mixed` has two anonymous pointer parameters, so both carry
 /// `param_name: None`. Both reach `Decision::Ref` (measured, not assumed), and
@@ -2477,9 +2467,9 @@ fn a_degraded_outcome_reports_placements_too() {
 /// the same path the corpus sweep uses. The corpus has never exposed this only
 /// because `unplaceable == 0` there, so the `contains` check never matches.
 ///
-/// *Mutation-tested (Rider 0, deletion first):* deleting the `#{mir_local}`
-/// suffix from [`Subject::identity_key`] — i.e. reverting to the name-only key —
-/// makes this fail with `emitted_count` 0 instead of 1.
+/// Wave 3 changes the terminal outcome: the unplaceable second parameter holds
+/// the whole function-signature class, so the first parameter is now a typed
+/// class-held degradation rather than a partial emission.
 #[test]
 fn two_subjects_with_the_same_rendered_name_stay_distinct() {
     let src = "#![allow(dead_code, unused_unsafe)]\nmacro_rules! ty2 { () => { *mut i32 } }\npub unsafe fn mixed(_: *mut i32, _: ty2!()) -> i32 { 0 }\n";
@@ -2500,15 +2490,17 @@ fn two_subjects_with_the_same_rendered_name_stay_distinct() {
         "the macro-typed parameter is the unplaceable one: {unplaceable:?}"
     );
     assert_eq!(
-        emitted_count, 1,
-        "the PLACEABLE parameter must still be counted — a name-keyed identity \
-         matches it against the other parameter's unplaceable record and drops \
-         it. Emitted source was:\n{source}"
+        emitted_count, 0,
+        "an unplaceable required site must prevent partial signature emission"
     );
     assert!(
-        source.contains("_: &i32"),
-        "the placement the count claims must be visible in the output:\n{source}"
+        !source.contains("_: &i32"),
+        "the sibling parameter was partially emitted despite the class hold:\n{source}"
     );
+    assert!(degradations.iter().any(|record| matches!(
+        record.reason,
+        super::decision::DegradeReason::SignatureClassHeld { .. }
+    )));
     // The identity the corpus pin enforces, on the fixture that breaks it.
     assert_eq!(
         emitted_count + degradations.len() + unplaceable.len(),
@@ -5201,6 +5193,7 @@ mod attribution_and_escapes {
                 justification: Justification::KindDecision { kind: "Ref(mut)" },
                 owner_class: Some(class(rustc_hir::def_id::CRATE_DEF_ID)),
                 owner_path: "k::f".to_owned(),
+                bridge: None,
                 atom_ids: Vec::new(),
                 subject_id: "k::f::subject".to_owned(),
                 required_arms: "-".to_owned(),
@@ -5453,10 +5446,19 @@ fn e_adapt_w3_nested_use_then_seam_composes_at_the_ast_choke_point() {
          \x20   if root.is_null() {{ 0 }} else {{ consume((*root).next) }}\n\
          }}\n"
     );
-    let emitted = e_adapt_source(&src);
+    let attempt = e2_attempt(&src, &|_| {});
     assert!(
-        emitted.contains("consume({") && emitted.contains(".next"),
-        "the inner field-use rewrite and outer optional seam must both survive:\n{emitted}"
+        !attempt
+            .emission
+            .plan
+            .class_finalization
+            .collisions
+            .is_empty(),
+        "the cross-class nested interval must be counted and listed"
+    );
+    assert!(
+        attempt.emission.files.is_empty(),
+        "a cross-class interval collision holds both classes; no edit order is selected"
     );
 }
 
@@ -5606,7 +5608,12 @@ fn force_body_forms(
 }
 
 fn e2_root_text(attempt: &E2Attempt) -> &str {
-    text_for(&attempt.emission, "lib.rs").expect("wave-2 root emitted")
+    text_for(&attempt.emission, "lib.rs").unwrap_or_else(|| {
+        panic!(
+            "wave-2 root emitted; class finalization: {:#?}",
+            attempt.emission.plan.class_finalization
+        )
+    })
 }
 
 fn e2_type_checks(attempt: &E2Attempt) -> bool {
@@ -5719,11 +5726,15 @@ fn e2_body_n3_side_effecting_assignment_is_evaluated_once_and_refused() {
         "the side-effect control must be typed, not silently absent:\n{}",
         attempt.receipt
     );
+    assert!(
+        attempt.emission.files.is_empty(),
+        "the blocked body site holds the whole signature class"
+    );
+    let original = std::fs::read_to_string(attempt.fixture.root()).expect("fixture source");
     assert_eq!(
-        e2_root_text(&attempt).matches("next(p, calls)").count(),
+        original.matches("next(p, calls)").count(),
         1,
-        "the attempted rewrite duplicated or removed the side effect:\n{}",
-        e2_root_text(&attempt)
+        "the unmodified input evaluates the side effect exactly once:\n{original}"
     );
 }
 
@@ -7140,7 +7151,16 @@ fn e_adapt_w3_n1_overlapping_site_stays_closed() {
         "{}",
         attempt.receipt
     );
-    assert!(!e2_root_text(&attempt).contains("from_raw_parts"));
+    assert!(attempt.emission.files.is_empty());
+    assert!(
+        attempt
+            .emission
+            .plan
+            .class_finalization
+            .classes
+            .values()
+            .all(|class| !class.is_ready())
+    );
 }
 
 /// E-ADAPT-W3-N2 — a clear site with no required glue is recorded but never
@@ -7179,7 +7199,7 @@ fn e_adapt_w3_n3_unattested_site_fails_closed_with_typed_reason() {
         "{}",
         attempt.receipt
     );
-    assert!(!e2_root_text(&attempt).contains("core::slice::from_mut"));
+    assert!(attempt.emission.files.is_empty());
 }
 
 /// E-ADAPT-W3-N6 — evidence-backed extents remain preferred after the overlap
@@ -7248,14 +7268,9 @@ fn e_adapt_w3_n8_site_key_does_not_license_an_overlapping_neighbor() {
             .count(),
         2
     );
-    assert!(e2_root_text(&attempt).contains("target(p, p);"));
-    assert_eq!(
-        e2_root_text(&attempt)
-            .matches("core::slice::from_raw_parts_mut")
-            .count(),
-        2,
-        "only the two clear-call arguments may adapt:\n{}",
-        e2_root_text(&attempt)
+    assert!(
+        attempt.emission.files.is_empty(),
+        "one blocked site holds the callee signature and both call-site adapters"
     );
 }
 

@@ -112,6 +112,10 @@ impl Arm {
 pub(crate) struct RequiredArmSet(u8);
 
 impl RequiredArmSet {
+    pub(crate) fn is_empty(self) -> bool {
+        self.0 == 0
+    }
+
     pub(crate) fn insert(&mut self, arm: Arm) {
         self.0 |= 1 << (arm as u8);
     }
@@ -477,6 +481,10 @@ pub(crate) enum DegradeReason {
     /// decision-phase degradation, which is a different thing entirely — the
     /// decision stands; only the emission was withdrawn.
     RevertedAfterVerifyFailure,
+    /// Atomic signature-class finalization held this otherwise-emittable
+    /// subject because another required site/arm in the same class was not
+    /// ready.
+    SignatureClassHeld { reason: String },
     /// BO decided the slot is a raw pointer; leaving the source alone is the
     /// decision, not a failure.
     KindRaw,
@@ -717,6 +725,7 @@ impl DegradeReason {
     pub(crate) fn key(&self) -> &'static str {
         match self {
             DegradeReason::RevertedAfterVerifyFailure => "reverted-after-verify-failure",
+            DegradeReason::SignatureClassHeld { .. } => "signature-class-held",
             DegradeReason::KindRaw => "kind-raw",
             DegradeReason::KindOwning => "kind-owning",
             DegradeReason::BoxFailure { failure } => failure.key(),
@@ -756,6 +765,7 @@ impl DegradeReason {
             DegradeReason::RawPointerOperation { op } => op.clone(),
             DegradeReason::UnsupportedDeclShape { shape } => (*shape).to_owned(),
             DegradeReason::BoxFailure { failure } => failure.detail(),
+            DegradeReason::SignatureClassHeld { reason } => reason.clone(),
             _ => "-".to_owned(),
         }
     }

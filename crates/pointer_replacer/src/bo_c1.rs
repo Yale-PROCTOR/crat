@@ -9169,6 +9169,46 @@ mod run {
             .collect()
     }
 
+    fn atomic_arm_control_counts(rows: &[BTreeMap<String, String>]) -> (usize, usize) {
+        let carries = |row: &BTreeMap<String, String>, field: &str, arm: &str| {
+            row.get(field)
+                .is_some_and(|value| value.split('+').any(|candidate| candidate == arm))
+        };
+        let surface_without_c = rows
+            .iter()
+            .filter(|row| {
+                carries(row, "required_arms", "c")
+                    && carries(row, "applied_arms", "surface")
+                    && !carries(row, "applied_arms", "c")
+            })
+            .count();
+        let blocked_with_applied = rows
+            .iter()
+            .filter(|row| {
+                row.get("terminal").is_some_and(|value| value == "blocked")
+                    && row.get("applied_arms").is_some_and(|value| value != "-")
+            })
+            .count();
+        (surface_without_c, blocked_with_applied)
+    }
+
+    #[test]
+    fn wave3_atomic_arm_controls_reject_the_262_and_1129_shapes() {
+        let broken = named_tsv_rows(
+            "subject_identity\trequired_arms\tapplied_arms\tterminal\n\
+             missing-c\tsurface+c\tsurface\tplanned\n\
+             blocked-partial\td4+pair\tpair\tblocked\n",
+        );
+        assert_eq!(atomic_arm_control_counts(&broken), (1, 1));
+
+        let atomic = named_tsv_rows(
+            "subject_identity\trequired_arms\tapplied_arms\tterminal\n\
+             complete\tsurface+c\tsurface+c\tplanned\n\
+             held\td4+pair\t-\tblocked\n",
+        );
+        assert_eq!(atomic_arm_control_counts(&atomic), (0, 0));
+    }
+
     #[derive(Default)]
     struct E1AdapterCounts {
         placed: usize,
@@ -10810,6 +10850,7 @@ mod run {
                 .count()
         };
         let arm_rows = named_tsv_rows(&artifact.arm_outcomes);
+        let (surface_without_c, blocked_with_applied) = atomic_arm_control_counts(&arm_rows);
         let arm_required = |arm: &str| {
             arm_rows
                 .iter()
@@ -11084,6 +11125,14 @@ mod run {
         row.set(raw_schema::ARM_ADDR_REQUIRED, arm_required("addr"));
         row.set(raw_schema::ARM_PLANNED_UNIQUE, arm_terminal("planned"));
         row.set(raw_schema::ARM_BLOCKED_UNIQUE, arm_terminal("blocked"));
+        row.set(
+            raw_schema::SURFACE_APPLIED_REQUIRED_C_MISSING,
+            surface_without_c,
+        );
+        row.set(
+            raw_schema::BLOCKED_SUBJECT_WITH_APPLIED_ARM,
+            blocked_with_applied,
+        );
         row.set(raw_schema::PAIR_CLEAR, pair_field("verdict", "clear"));
         row.set(
             raw_schema::PAIR_OVERLAPPING,
@@ -11239,7 +11288,15 @@ mod run {
             raw_schema::BRIDGE_DROPPED_EVENTS,
             bridge_summary.dropped_events,
         );
-        row.set(raw_schema::SIGNATURE_CLASS_COUNT, 0);
+        row.set(
+            raw_schema::SIGNATURE_CLASS_COUNT,
+            artifact
+                .bridge_events
+                .iter()
+                .map(|event| event.site.owner_class)
+                .collect::<BTreeSet<_>>()
+                .len(),
+        );
         row.set(raw_schema::ATTRIBUTION_HITS_EXACT_EDIT, 0);
         row.set(raw_schema::ATTRIBUTION_HITS_EXACT_SEAM, 0);
         row.set(raw_schema::ATTRIBUTION_HITS_RELATED_SPAN, 0);

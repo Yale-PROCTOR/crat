@@ -151,6 +151,10 @@ pub(crate) const PER_ARM_TIMERS_STATUS: &str = "raw_boundary_per_arm_timers_stat
 pub(crate) const CROSS_CLASS_COLLISION_COUNT: &str = "raw_boundary_cross_class_collision_count";
 pub(crate) const DEGRADED_OUTPUT_RECEIPT: &str = "raw_boundary_degraded_output_receipt";
 pub(crate) const UNRESOLVED_CLASS_COUNT: &str = "raw_boundary_unresolved_class_count";
+pub(crate) const SURFACE_APPLIED_REQUIRED_C_MISSING: &str =
+    "raw_boundary_surface_applied_required_c_missing";
+pub(crate) const BLOCKED_SUBJECT_WITH_APPLIED_ARM: &str =
+    "raw_boundary_blocked_subject_with_applied_arm";
 pub(crate) const STATUS: &str = "raw_boundary_status";
 
 pub(crate) const BRIDGE_RECEIPT_FILE: &str = "raw-boundary-bridge-receipts.tsv";
@@ -306,5 +310,7 @@ pub(crate) const ALL: &[&str] = &[
     CROSS_CLASS_COLLISION_COUNT,
     DEGRADED_OUTPUT_RECEIPT,
     UNRESOLVED_CLASS_COUNT,
+    SURFACE_APPLIED_REQUIRED_C_MISSING,
+    BLOCKED_SUBJECT_WITH_APPLIED_ARM,
     STATUS,
 ];

@@ -1231,6 +1231,7 @@ pub(crate) struct RawBoundaryRenderSite {
     pub source_shape: &'static str,
     pub source_site: String,
     pub node: Option<(LocalDefId, HirId)>,
+    pub callee_local: Option<LocalDefId>,
     pub target_stays_raw: bool,
     pub subject_identity: String,
 }
@@ -1560,6 +1561,7 @@ impl RawBoundaryDispositionIndex {
                     source_shape: site.source_shape,
                     source_site: site.source_site.clone(),
                     node: site.node,
+                    callee_local: site.callee_local,
                     target_stays_raw,
                     subject_identity: site
                         .node

@@ -133,6 +133,66 @@ pub(crate) struct BridgeSiteKey {
     pub(crate) bridge_kind: String,
 }
 
+/// Site identity known before file-relative byte placement. Planning carries
+/// this typed endpoint/arm data; the span planner materializes the final key.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct BridgeSitePlan {
+    pub(crate) caller: LocalDefId,
+    pub(crate) callee: BridgeCalleeId,
+    pub(crate) arm: String,
+    pub(crate) position: String,
+    pub(crate) bridge_kind: String,
+    pub(crate) extent: BridgeExtentKind,
+    pub(crate) retention: BridgeRetentionTier,
+    pub(crate) waiver_id: Option<String>,
+}
+
+impl BridgeSitePlan {
+    pub(crate) fn local(
+        caller: LocalDefId,
+        callee: LocalDefId,
+        arm: &str,
+        position: impl Into<String>,
+        bridge_kind: impl Into<String>,
+    ) -> Self {
+        Self {
+            caller,
+            callee: BridgeCalleeId::Local(callee),
+            arm: arm.to_owned(),
+            position: position.into(),
+            bridge_kind: bridge_kind.into(),
+            extent: BridgeExtentKind::None,
+            retention: BridgeRetentionTier::None,
+            waiver_id: None,
+        }
+    }
+
+    pub(crate) fn materialize(
+        &self,
+        owner_class: SignatureClassId,
+        file: String,
+        lo: u32,
+        hi: u32,
+    ) -> BridgeSiteKey {
+        BridgeSiteKey {
+            owner_class,
+            caller: self.caller,
+            callee: self.callee.clone(),
+            arm: self.arm.clone(),
+            position: self.position.clone(),
+            file,
+            lo,
+            hi,
+            bridge_kind: self.bridge_kind.clone(),
+        }
+    }
+
+    pub(crate) fn with_extent(mut self, extent: BridgeExtentKind) -> Self {
+        self.extent = extent;
+        self
+    }
+}
+
 impl BridgeSiteKey {
     pub(crate) fn receipt_key(&self) -> String {
         format!(

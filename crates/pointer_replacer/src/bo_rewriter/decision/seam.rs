@@ -38,7 +38,10 @@ use std::collections::BTreeSet;
 use rustc_span::Span;
 
 use super::a5_site_proof::{A5PeerProof, A5SeamProofIndex, A5SiteProofVerdict};
-use crate::bo_rewriter::bridge_receipt::SignatureClassId;
+use crate::bo_rewriter::bridge_receipt::{
+    BridgeCalleeId, BridgeExtentKind, BridgeRetentionTier, BridgeSitePlan,
+    RAW_BOUNDARY_T2_WAIVER_ID, SignatureClassId,
+};
 
 /// The pointer-ish form a value has at an argument position.
 ///
@@ -285,6 +288,7 @@ pub(crate) struct SeamEdit {
     /// Direct identity of the converted signature class. This is the sole
     /// ownership key used by verification; `owner_fn` is display-only.
     pub owner_class: SignatureClassId,
+    pub bridge: BridgeSitePlan,
     /// The callee subject whose conversion justifies this edit — the revert key.
     /// The edit lands in the caller's file and is owned by the callee, which is
     /// the divergence `plan`'s `owner_fn` doc was written for.
@@ -354,6 +358,7 @@ pub(crate) struct BodyEdit {
     pub span: Span,
     pub replacement: String,
     pub owner_class: SignatureClassId,
+    pub bridge: BridgeSitePlan,
     pub owner_fn: String,
     pub destination: String,
     pub context: super::emitability::BodyAdapterContext,
@@ -522,6 +527,7 @@ impl BodyBlock {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct BlockedBody {
+    pub owner_class: SignatureClassId,
     pub owner_fn: String,
     pub destination: String,
     pub span: Span,
@@ -2152,6 +2158,9 @@ pub(crate) struct SeamPlan {
     /// disposition of that collision: the existing use edit remains the sole
     /// owner and the raw arm emits no competing edit.
     pub raw_boundary_edit_region_owned: Vec<(String, String)>,
+    /// Typed PAIR sites, including zero-syntax and blocked roles, retained for
+    /// signature-class completeness rather than reconstructed from TSV.
+    pub pair_sites: Vec<super::co_conversion::PairSiteDecision>,
 }
 
 /// The form a decision emits.
@@ -2167,6 +2176,22 @@ fn form_of(decision: &Decision) -> Form {
         },
         // A degraded subject keeps its raw pointer type.
         Decision::Box(_) | Decision::Degraded(_) => Form::Raw,
+    }
+}
+
+fn receipt_arm(expected: Form, found: Form) -> &'static str {
+    if expected != Form::Raw && found != Form::Raw {
+        "glue"
+    } else {
+        "c"
+    }
+}
+
+fn receipt_extent(spec: &GlueSpec) -> BridgeExtentKind {
+    match spec.len.as_ref() {
+        Some(SeamLen::Licensed(source)) => BridgeExtentKind::Evidence(source.clone()),
+        Some(SeamLen::Fabricated) => BridgeExtentKind::Fallback,
+        None => BridgeExtentKind::None,
     }
 }
 
@@ -2268,6 +2293,7 @@ pub(crate) fn synthesize_with_raw_boundary(
 ) -> SeamPlan {
     let sm = tcx.sess.source_map();
     let mut plan = SeamPlan::default();
+    plan.pair_sites = coconv.pair_sites().to_vec();
 
     // subject key -> decision, and (fn, param index) -> subject key.
     let mut decision_of: FxHashMap<(LocalDefId, HirId), &Decision> = FxHashMap::default();
@@ -2691,6 +2717,16 @@ pub(crate) fn synthesize_with_raw_boundary(
                             span: pos.span,
                             replacement: candidate.replacement.clone(),
                             owner_class: SignatureClassId::of(*callee),
+                            bridge: BridgeSitePlan {
+                                caller: site.caller,
+                                callee: BridgeCalleeId::Local(*callee),
+                                arm: receipt_arm(pos.expected, pos.found).to_owned(),
+                                position: format!("arg{}", pos.index),
+                                bridge_kind: candidate.spec.template_key().to_owned(),
+                                extent: receipt_extent(&candidate.spec),
+                                retention: BridgeRetentionTier::None,
+                                waiver_id: None,
+                            },
                             owner_fn: tcx.def_path_str(callee.to_def_id()),
                             lifetime_plan_digest: table
                                 .lifetime_plan
@@ -2809,10 +2845,34 @@ pub(crate) fn synthesize_with_raw_boundary(
         let Some((owner_did, _)) = site.node else {
             continue;
         };
+        let (retention, waiver_id) = match disposition {
+            super::raw_boundary::RawBoundaryDisposition::T1 { .. } => {
+                (BridgeRetentionTier::T1, None)
+            }
+            super::raw_boundary::RawBoundaryDisposition::T2 { waiver_id, .. } => {
+                debug_assert_eq!(*waiver_id, RAW_BOUNDARY_T2_WAIVER_ID);
+                (BridgeRetentionTier::T2, Some((*waiver_id).to_owned()))
+            }
+            super::raw_boundary::RawBoundaryDisposition::Blocked { .. }
+            | super::raw_boundary::RawBoundaryDisposition::OwnedByOtherArm { .. } => continue,
+        };
         plan.edits.push(SeamEdit {
             span: site.span,
             replacement,
             owner_class: SignatureClassId::of(owner_did),
+            bridge: BridgeSitePlan {
+                caller: owner_did,
+                callee: site.callee_local.map_or_else(
+                    || BridgeCalleeId::Foreign(key.callee.path.clone()),
+                    BridgeCalleeId::Local,
+                ),
+                arm: "c".to_owned(),
+                position: format!("arg{}", key.argument_index),
+                bridge_kind: template.key().to_owned(),
+                extent: receipt_extent(&spec),
+                retention,
+                waiver_id,
+            },
             owner_fn: key.caller.clone(),
             lifetime_plan_digest: None,
             caller_fn: key.caller.clone(),
@@ -2872,6 +2932,22 @@ pub(crate) fn synthesize_with_raw_boundary(
             span: pair.span,
             replacement,
             owner_class: SignatureClassId::of(pair.callee),
+            bridge: BridgeSitePlan {
+                caller: pair.caller,
+                callee: BridgeCalleeId::Local(pair.callee),
+                arm: "pair".to_owned(),
+                position: format!("arg{}", pair.argument_index),
+                bridge_kind: template.key().to_owned(),
+                extent: receipt_extent(&spec),
+                retention: match pair.tier {
+                    super::co_conversion::PairTier::T1 => BridgeRetentionTier::T1,
+                    super::co_conversion::PairTier::T2 => BridgeRetentionTier::T2,
+                    super::co_conversion::PairTier::None
+                    | super::co_conversion::PairTier::Blocked => BridgeRetentionTier::None,
+                },
+                waiver_id: (pair.tier == super::co_conversion::PairTier::T2)
+                    .then(|| RAW_BOUNDARY_T2_WAIVER_ID.to_owned()),
+            },
             owner_fn: tcx.def_path_str(pair.callee.to_def_id()),
             lifetime_plan_digest: table
                 .lifetime_plan
@@ -2916,6 +2992,16 @@ pub(crate) fn synthesize_with_raw_boundary(
             span: site.span,
             replacement,
             owner_class: SignatureClassId::of(site.node.0),
+            bridge: BridgeSitePlan {
+                caller: site.node.0,
+                callee: BridgeCalleeId::Local(site.node.0),
+                arm: "addr".to_owned(),
+                position: format!("hir{}", site.node.1.local_id.as_u32()),
+                bridge_kind: site.template.key().to_owned(),
+                extent: receipt_extent(&spec),
+                retention: BridgeRetentionTier::None,
+                waiver_id: None,
+            },
             owner_fn: site.owner.clone(),
             lifetime_plan_digest: None,
             caller_fn: site.owner.clone(),
@@ -2959,6 +3045,7 @@ pub(crate) fn synthesize_with_raw_boundary(
             .unwrap_or_else(|| format!("{owner_fn}::<unknown-destination>"));
         if site.side_effecting {
             plan.body_blocked.push(BlockedBody {
+                owner_class: SignatureClassId::of(site.owner),
                 owner_fn,
                 destination,
                 span: site.rhs_span,
@@ -3008,6 +3095,7 @@ pub(crate) fn synthesize_with_raw_boundary(
             ),
             ArgShape::NullLit => {
                 plan.body_blocked.push(BlockedBody {
+                    owner_class: SignatureClassId::of(site.owner),
                     owner_fn,
                     destination,
                     span: site.rhs_span,
@@ -3024,6 +3112,7 @@ pub(crate) fn synthesize_with_raw_boundary(
             }
             ArgShape::RawExpr { .. } | ArgShape::Cast { .. } | ArgShape::Other => {
                 plan.body_blocked.push(BlockedBody {
+                    owner_class: SignatureClassId::of(site.owner),
                     owner_fn,
                     destination,
                     span: site.rhs_span,
@@ -3046,6 +3135,7 @@ pub(crate) fn synthesize_with_raw_boundary(
             Ok(Some((spec, family))) => {
                 let Some(text) = text.as_deref() else {
                     plan.body_blocked.push(BlockedBody {
+                        owner_class: SignatureClassId::of(site.owner),
                         owner_fn,
                         destination,
                         span: site.rhs_span,
@@ -3062,6 +3152,7 @@ pub(crate) fn synthesize_with_raw_boundary(
                 };
                 let Some(replacement) = spec.render(text) else {
                     plan.body_blocked.push(BlockedBody {
+                        owner_class: SignatureClassId::of(site.owner),
                         owner_fn,
                         destination,
                         span: site.rhs_span,
@@ -3080,6 +3171,16 @@ pub(crate) fn synthesize_with_raw_boundary(
                     span: site.rhs_span,
                     replacement,
                     owner_class: SignatureClassId::of(site.owner),
+                    bridge: BridgeSitePlan {
+                        caller: site.owner,
+                        callee: BridgeCalleeId::Local(site.owner),
+                        arm: "glue".to_owned(),
+                        position: format!("body:{}", site.context.key()),
+                        bridge_kind: spec.template_key().to_owned(),
+                        extent: receipt_extent(&spec),
+                        retention: BridgeRetentionTier::None,
+                        waiver_id: None,
+                    },
                     owner_fn,
                     destination,
                     context: site.context,
@@ -3094,6 +3195,7 @@ pub(crate) fn synthesize_with_raw_boundary(
                 });
             }
             Err(SeamBlock::SharedToMut) => plan.body_blocked.push(BlockedBody {
+                owner_class: SignatureClassId::of(site.owner),
                 owner_fn,
                 destination,
                 span: site.rhs_span,
@@ -3107,6 +3209,7 @@ pub(crate) fn synthesize_with_raw_boundary(
                 blind,
             }),
             Err(_) => plan.body_blocked.push(BlockedBody {
+                owner_class: SignatureClassId::of(site.owner),
                 owner_fn,
                 destination,
                 span: site.rhs_span,

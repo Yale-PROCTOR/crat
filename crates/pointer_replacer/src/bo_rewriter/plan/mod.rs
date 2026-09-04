@@ -35,8 +35,11 @@
 use std::{collections::BTreeMap, path::PathBuf};
 
 use super::{
-    bridge_receipt::SignatureClassId,
-    decision::{Decision, DecisionTable},
+    bridge_receipt::{
+        BridgeCalleeId, BridgeExtentKind, BridgeRetentionTier, BridgeSiteKey, BridgeSitePlan,
+        SignatureClassId,
+    },
+    decision::{Arm, Decision, DecisionTable, RequiredArmSet},
 };
 
 /// Which source file an edit belongs to.
@@ -53,6 +56,13 @@ pub(crate) enum FileKey {
     Real(PathBuf),
     /// A virtual root — the string entry point's `main.rs`.
     Virtual(String),
+}
+
+fn file_key_label(key: &FileKey) -> String {
+    match key {
+        FileKey::Real(path) => path.display().to_string(),
+        FileKey::Virtual(name) => name.clone(),
+    }
 }
 
 /// A decision that could not be turned into a placed edit.
@@ -73,6 +83,8 @@ pub(crate) enum FileKey {
 /// the slice that measured it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Unplaceable {
+    pub owner_class: SignatureClassId,
+    pub bridge: BridgeSitePlan,
     pub reason: &'static str,
     /// Attribution — which subject, in the artifact's own terms.
     pub detail: String,
@@ -173,6 +185,9 @@ pub(crate) struct Edit {
     /// Human-readable path for receipts only. No production decision may parse
     /// or compare this value.
     pub owner_path: String,
+    /// Typed receipt identity. `None` is reserved for the derived crate-level
+    /// fallback-extent declaration, which has no signature class of its own.
+    pub bridge: Option<BridgeSitePlan>,
     /// Exact raw-boundary dependency group. Empty for every pre-wave edit.
     /// A group is carried, not reconstructed, so removing one atom can remove
     /// its declaration/use/seam closure while leaving an independent subject
@@ -184,6 +199,529 @@ pub(crate) struct Edit {
     pub subject_id: String,
     pub required_arms: String,
     pub edit_kind: &'static str,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum ClassSiteState {
+    EditReady,
+    ZeroSyntaxReady,
+    Dropped(String),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ClassSite {
+    pub key: BridgeSiteKey,
+    pub edit_key: String,
+    pub state: ClassSiteState,
+    pub extent: BridgeExtentKind,
+    pub retention: BridgeRetentionTier,
+    pub waiver_id: Option<String>,
+}
+
+impl ClassSite {
+    pub(crate) fn edit(
+        owner: SignatureClassId,
+        caller: SignatureClassId,
+        arm: Arm,
+        file: &str,
+        lo: u32,
+        hi: u32,
+        kind: &str,
+    ) -> Self {
+        let key = BridgeSiteKey {
+            owner_class: owner,
+            caller: caller.local_def_id(),
+            callee: BridgeCalleeId::Local(owner.local_def_id()),
+            arm: arm.key().to_owned(),
+            position: format!("{lo}..{hi}"),
+            file: file.to_owned(),
+            lo,
+            hi,
+            bridge_kind: kind.to_owned(),
+        };
+        Self {
+            edit_key: format!(
+                "class={}|arm={}|interval={file}:{lo}:{hi}|kind={kind}",
+                owner.order_key(),
+                arm.key()
+            ),
+            key,
+            state: ClassSiteState::EditReady,
+            extent: BridgeExtentKind::None,
+            retention: BridgeRetentionTier::None,
+            waiver_id: None,
+        }
+    }
+
+    pub(crate) fn zero(
+        owner: SignatureClassId,
+        caller: SignatureClassId,
+        arm: Arm,
+        kind: &str,
+    ) -> Self {
+        Self {
+            key: BridgeSiteKey {
+                owner_class: owner,
+                caller: caller.local_def_id(),
+                callee: BridgeCalleeId::Local(owner.local_def_id()),
+                arm: arm.key().to_owned(),
+                position: "zero-syntax".to_owned(),
+                file: "-".to_owned(),
+                lo: 0,
+                hi: 0,
+                bridge_kind: kind.to_owned(),
+            },
+            edit_key: "-".to_owned(),
+            state: ClassSiteState::ZeroSyntaxReady,
+            extent: BridgeExtentKind::None,
+            retention: BridgeRetentionTier::None,
+            waiver_id: None,
+        }
+    }
+
+    pub(crate) fn dropped(
+        owner: SignatureClassId,
+        caller: SignatureClassId,
+        arm: Arm,
+        kind: &str,
+        reason: impl Into<String>,
+    ) -> Self {
+        let mut site = Self::zero(owner, caller, arm, kind);
+        site.state = ClassSiteState::Dropped(reason.into());
+        site
+    }
+
+    fn has_text_interval(&self) -> bool {
+        self.edit_key != "-" && self.key.file != "-"
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum SignatureClassDisposition {
+    Ready,
+    Held(Vec<String>),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct SignatureClassPlan {
+    pub id: SignatureClassId,
+    pub required_arms: RequiredArmSet,
+    pub site_keys: Vec<BridgeSiteKey>,
+    pub edit_keys: Vec<String>,
+    pub depends_on: Vec<SignatureClassId>,
+    pub disposition: SignatureClassDisposition,
+    pub sites: Vec<ClassSite>,
+}
+
+impl SignatureClassPlan {
+    pub(crate) fn is_ready(&self) -> bool {
+        self.disposition == SignatureClassDisposition::Ready
+    }
+
+    pub(crate) fn hold_reasons(&self) -> &[String] {
+        match &self.disposition {
+            SignatureClassDisposition::Ready => &[],
+            SignatureClassDisposition::Held(reasons) => reasons,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ClassInput {
+    pub id: SignatureClassId,
+    pub required_arms: RequiredArmSet,
+    pub sites: Vec<ClassSite>,
+    pub depends_on: Vec<SignatureClassId>,
+    pub block_reasons: Vec<String>,
+}
+
+impl ClassInput {
+    pub(crate) fn new(id: SignatureClassId, required_arms: RequiredArmSet) -> Self {
+        Self {
+            id,
+            required_arms,
+            sites: Vec::new(),
+            depends_on: Vec::new(),
+            block_reasons: Vec::new(),
+        }
+    }
+
+    pub(crate) fn with_site(mut self, site: ClassSite) -> Self {
+        self.sites.push(site);
+        self
+    }
+
+    pub(crate) fn blocked(mut self, reason: impl Into<String>) -> Self {
+        self.block_reasons.push(reason.into());
+        self
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ClassIntervalCollision {
+    pub left_class: SignatureClassId,
+    pub right_class: SignatureClassId,
+    pub left_edit_key: String,
+    pub right_edit_key: String,
+    pub file: String,
+    pub lo: u32,
+    pub hi: u32,
+    pub left_kind: String,
+    pub right_kind: String,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct ClassFinalization {
+    pub classes: BTreeMap<SignatureClassId, SignatureClassPlan>,
+    pub collisions: Vec<ClassIntervalCollision>,
+}
+
+impl ClassFinalization {
+    pub(crate) fn applied_site_count(&self) -> usize {
+        self.classes
+            .values()
+            .filter(|class| class.is_ready())
+            .map(|class| class.sites.len())
+            .sum()
+    }
+
+    pub(crate) fn live_sites<'a>(
+        &'a self,
+        reverted: &'a std::collections::BTreeSet<SignatureClassId>,
+    ) -> impl Iterator<Item = &'a ClassSite> + 'a {
+        self.classes
+            .values()
+            .filter(move |class| class.is_ready() && !reverted.contains(&class.id))
+            .flat_map(|class| class.sites.iter())
+    }
+}
+
+fn intervals_overlap(left: &ClassSite, right: &ClassSite) -> bool {
+    if left.key.file != right.key.file {
+        return false;
+    }
+    if left.key.lo == left.key.hi && right.key.lo == right.key.hi {
+        return left.key.lo == right.key.lo;
+    }
+    left.key.lo < right.key.hi && right.key.lo < left.key.hi
+}
+
+pub(crate) fn finalize_class_inputs(inputs: Vec<ClassInput>) -> ClassFinalization {
+    let mut merged = BTreeMap::<SignatureClassId, ClassInput>::new();
+    for input in inputs {
+        merged
+            .entry(input.id)
+            .and_modify(|class| {
+                class.required_arms = class.required_arms.union(input.required_arms);
+                class.sites.extend(input.sites.clone());
+                class.depends_on.extend(input.depends_on.iter().copied());
+                class.block_reasons.extend(input.block_reasons.clone());
+            })
+            .or_insert(input);
+    }
+
+    let all_sites = merged
+        .values()
+        .flat_map(|class| class.sites.iter())
+        .filter(|site| site.has_text_interval())
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut collisions = Vec::new();
+    for (left_index, left) in all_sites.iter().enumerate() {
+        for right in &all_sites[left_index + 1..] {
+            if left.key.owner_class == right.key.owner_class || !intervals_overlap(left, right) {
+                continue;
+            }
+            let (left, right) = if left.key.owner_class <= right.key.owner_class {
+                (left, right)
+            } else {
+                (right, left)
+            };
+            let lo = left.key.lo.max(right.key.lo);
+            let hi = left.key.hi.min(right.key.hi);
+            collisions.push(ClassIntervalCollision {
+                left_class: left.key.owner_class,
+                right_class: right.key.owner_class,
+                left_edit_key: left.edit_key.clone(),
+                right_edit_key: right.edit_key.clone(),
+                file: left.key.file.clone(),
+                lo,
+                hi,
+                left_kind: left.key.bridge_kind.clone(),
+                right_kind: right.key.bridge_kind.clone(),
+            });
+        }
+    }
+    collisions.sort_by(|left, right| {
+        (
+            left.file.as_str(),
+            left.lo,
+            left.hi,
+            left.left_class,
+            left.right_class,
+            left.left_edit_key.as_str(),
+            left.right_edit_key.as_str(),
+        )
+            .cmp(&(
+                right.file.as_str(),
+                right.lo,
+                right.hi,
+                right.left_class,
+                right.right_class,
+                right.left_edit_key.as_str(),
+                right.right_edit_key.as_str(),
+            ))
+    });
+
+    for collision in &collisions {
+        for class in [collision.left_class, collision.right_class] {
+            merged
+                .get_mut(&class)
+                .expect("collision class came from merged inputs")
+                .block_reasons
+                .push("cross-class-interval-collision".to_owned());
+        }
+    }
+
+    let classes = merged
+        .into_iter()
+        .map(|(id, mut input)| {
+            let missing_arms = Arm::ALL
+                .into_iter()
+                .filter(|&arm| {
+                    input.required_arms.contains(arm)
+                        && !input.sites.iter().any(|site| site.key.arm == arm.key())
+                })
+                .collect::<Vec<_>>();
+            for arm in missing_arms {
+                let reason = format!("missing-required-arm:{}", arm.key());
+                input.block_reasons.push(reason.clone());
+                input.sites.push(ClassSite::dropped(
+                    id,
+                    id,
+                    arm,
+                    "missing-required-site",
+                    reason,
+                ));
+            }
+            for site in &input.sites {
+                if let ClassSiteState::Dropped(reason) = &site.state {
+                    input
+                        .block_reasons
+                        .push(format!("dropped-site:{}:{}", site.key.bridge_kind, reason));
+                }
+            }
+            input.sites.sort_by_key(|site| site.key.receipt_key());
+            input.sites.dedup_by(|left, right| left.key == right.key);
+            input.depends_on.sort();
+            input.depends_on.dedup();
+            input.block_reasons.sort();
+            input.block_reasons.dedup();
+            let site_keys = input.sites.iter().map(|site| site.key.clone()).collect();
+            let edit_keys = input
+                .sites
+                .iter()
+                .map(|site| site.edit_key.clone())
+                .collect();
+            let disposition = if input.block_reasons.is_empty() {
+                SignatureClassDisposition::Ready
+            } else {
+                SignatureClassDisposition::Held(input.block_reasons)
+            };
+            (
+                id,
+                SignatureClassPlan {
+                    id,
+                    required_arms: input.required_arms,
+                    site_keys,
+                    edit_keys,
+                    depends_on: input.depends_on,
+                    disposition,
+                    sites: input.sites,
+                },
+            )
+        })
+        .collect();
+    ClassFinalization {
+        classes,
+        collisions,
+    }
+}
+
+fn arm_from_key(key: &str) -> Option<Arm> {
+    Arm::ALL.into_iter().find(|arm| arm.key() == key)
+}
+
+/// Finalize the real plan into atomic signature classes and remove every edit
+/// whose class is held. All inputs are rewriter-side carriers; no analysis or
+/// cache key is consulted here.
+pub(crate) fn finalize_signature_classes(
+    planned: &mut Plan,
+    table: &DecisionTable,
+    pre_reverted: &rustc_hash::FxHashSet<rustc_hir::def_id::LocalDefId>,
+) {
+    use sha2::{Digest, Sha256};
+
+    let mut by_class = BTreeMap::<SignatureClassId, ClassInput>::new();
+    let mut degraded = BTreeMap::<SignatureClassId, Vec<String>>::new();
+    for (subject, decision) in &table.entries {
+        let id = SignatureClassId::of(subject.fn_did);
+        let mut required = table
+            .arm_requirements
+            .get(&(subject.fn_did, subject.hir_id))
+            .copied()
+            .unwrap_or_default();
+        let (emits, degraded_reason) = match decision {
+            Decision::Ref { .. }
+            | Decision::InferredRef { .. }
+            | Decision::Slice { .. }
+            | Decision::Opt { .. }
+            | Decision::Box(_) => (true, None),
+            Decision::Degraded(record) => (false, Some(record.reason.key())),
+        };
+        if emits {
+            required.insert(Arm::Surface);
+        }
+        if emits || !required.is_empty() {
+            by_class
+                .entry(id)
+                .and_modify(|class| class.required_arms = class.required_arms.union(required))
+                .or_insert_with(|| ClassInput::new(id, required));
+        }
+        if let Some(reason) = degraded_reason.filter(|_| !required.is_empty()) {
+            degraded.entry(id).or_default().push(reason.to_owned());
+        }
+    }
+
+    for site in &planned.preclass_sites {
+        by_class
+            .entry(site.key.owner_class)
+            .or_insert_with(|| ClassInput::new(site.key.owner_class, RequiredArmSet::default()))
+            .sites
+            .push(site.clone());
+    }
+
+    for (file, edits) in &planned.by_file {
+        let file = file_key_label(file);
+        for edit in edits {
+            let Some(owner) = edit.owner_class else {
+                continue;
+            };
+            let Some(bridge) = edit.bridge.as_ref() else {
+                by_class
+                    .entry(owner)
+                    .or_insert_with(|| ClassInput::new(owner, RequiredArmSet::default()))
+                    .block_reasons
+                    .push("missing-bridge-receipt".to_owned());
+                continue;
+            };
+            let lo = u32::try_from(edit.lo).unwrap_or(u32::MAX);
+            let hi = u32::try_from(edit.hi).unwrap_or(u32::MAX);
+            let key = bridge.materialize(owner, file.clone(), lo, hi);
+            let replacement_sha256 = format!("{:x}", Sha256::digest(edit.replacement.as_bytes()));
+            let edit_key = format!(
+                "class={}|arm={}|interval={}:{}:{}|kind={}|replacement_sha256={}",
+                owner.order_key(),
+                bridge.arm,
+                file,
+                edit.lo,
+                edit.hi,
+                bridge.bridge_kind,
+                replacement_sha256
+            );
+            let required_arm = arm_from_key(&bridge.arm);
+            let class = by_class
+                .entry(owner)
+                .or_insert_with(|| ClassInput::new(owner, RequiredArmSet::default()));
+            if let Some(arm) = required_arm {
+                class.required_arms.insert(arm);
+            } else {
+                class
+                    .block_reasons
+                    .push(format!("unknown-site-arm:{}", bridge.arm));
+            }
+            class.sites.push(ClassSite {
+                key,
+                edit_key,
+                state: ClassSiteState::EditReady,
+                extent: bridge.extent.clone(),
+                retention: bridge.retention,
+                waiver_id: bridge.waiver_id.clone(),
+            });
+        }
+    }
+
+    for (id, reasons) in degraded {
+        if let Some(class) = by_class.get_mut(&id) {
+            class.block_reasons.extend(
+                reasons
+                    .into_iter()
+                    .map(|reason| format!("blocked-subject:{reason}")),
+            );
+        }
+    }
+    for &did in pre_reverted {
+        let id = SignatureClassId::of(did);
+        if let Some(class) = by_class.get_mut(&id) {
+            class.block_reasons.push("pre-reverted-class".to_owned());
+        }
+    }
+
+    for class in by_class.values_mut() {
+        if class.required_arms.contains(Arm::D4)
+            && !class.sites.iter().any(|site| site.key.arm == Arm::D4.key())
+        {
+            class.sites.push(ClassSite::zero(
+                class.id,
+                class.id,
+                Arm::D4,
+                "d4-class-membership",
+            ));
+        }
+        if class.required_arms.contains(Arm::Surface)
+            && !class
+                .sites
+                .iter()
+                .any(|site| site.key.arm == Arm::Surface.key())
+            && !class
+                .block_reasons
+                .iter()
+                .any(|reason| reason.starts_with("blocked-subject:"))
+        {
+            class.sites.push(ClassSite::zero(
+                class.id,
+                class.id,
+                Arm::Surface,
+                "surface-zero-syntax",
+            ));
+        }
+        if class.required_arms.contains(Arm::Glue)
+            && !class
+                .sites
+                .iter()
+                .any(|site| site.key.arm == Arm::Glue.key())
+            && !class.sites.iter().any(|site| {
+                site.key.arm == Arm::Glue.key() && matches!(site.state, ClassSiteState::Dropped(_))
+            })
+        {
+            class.sites.push(ClassSite::zero(
+                class.id,
+                class.id,
+                Arm::Glue,
+                "glue-discharged-by-callee-class",
+            ));
+        }
+    }
+
+    let finalization = finalize_class_inputs(by_class.into_values().collect());
+    planned.by_file.retain(|_, edits| {
+        edits.retain(|edit| {
+            edit.owner_class
+                .is_none_or(|class| finalization.classes[&class].is_ready())
+        });
+        !edits.is_empty()
+    });
+    planned.class_finalization = finalization;
 }
 
 /// The finished plan handed to [`super::apply`], **grouped by file**.
@@ -227,6 +765,72 @@ pub(crate) struct Plan {
     /// text, no insertion, and the adapters that name it fail `verify` loudly
     /// rather than emitting a crate with a dangling path.
     pub len_const_item: Option<String>,
+    /// Sites known without a successfully placed text edit (blocked,
+    /// unplaceable, or explicit zero-syntax).
+    pub preclass_sites: Vec<ClassSite>,
+    /// Final signature-class transaction inventory.
+    pub class_finalization: ClassFinalization,
+}
+
+impl Plan {
+    pub(crate) fn class_hold_reason(&self, class: SignatureClassId) -> Option<String> {
+        self.class_finalization
+            .classes
+            .get(&class)
+            .filter(|class| !class.is_ready())
+            .map(|class| class.hold_reasons().join(";"))
+    }
+
+    pub(crate) fn held_classes(&self) -> std::collections::BTreeSet<SignatureClassId> {
+        self.class_finalization
+            .classes
+            .values()
+            .filter(|class| !class.is_ready())
+            .map(|class| class.id)
+            .collect()
+    }
+
+    pub(crate) fn bridge_events(
+        &self,
+        reverted: &std::collections::BTreeSet<SignatureClassId>,
+    ) -> Vec<super::bridge_receipt::BridgeReceiptEvent> {
+        use super::bridge_receipt::{BridgeReceiptEvent, BridgeReceiptStage, BridgeReceiptState};
+        let mut events = Vec::new();
+        for class in self.class_finalization.classes.values() {
+            let terminal_drop = if reverted.contains(&class.id) {
+                Some("class-reverted-after-verify".to_owned())
+            } else if !class.is_ready() {
+                Some(class.hold_reasons().join(";"))
+            } else {
+                None
+            };
+            for site in &class.sites {
+                events.push(BridgeReceiptEvent {
+                    site: site.key.clone(),
+                    stage: BridgeReceiptStage::Plan,
+                    state: BridgeReceiptState::Planned,
+                    drop_reason: None,
+                    extent: site.extent.clone(),
+                    retention: site.retention,
+                    waiver_id: site.waiver_id.clone(),
+                });
+                events.push(BridgeReceiptEvent {
+                    site: site.key.clone(),
+                    stage: BridgeReceiptStage::Terminal,
+                    state: if terminal_drop.is_some() {
+                        BridgeReceiptState::Dropped
+                    } else {
+                        BridgeReceiptState::Applied
+                    },
+                    drop_reason: terminal_drop.clone(),
+                    extent: site.extent.clone(),
+                    retention: site.retention,
+                    waiver_id: site.waiver_id.clone(),
+                });
+            }
+        }
+        events
+    }
 }
 
 /// Turn decisions into edits.
@@ -301,6 +905,7 @@ pub(crate) fn plan(
 ) -> Plan {
     let mut by_file: BTreeMap<FileKey, Vec<Edit>> = BTreeMap::new();
     let mut unplaceable = Vec::new();
+    let mut preclass_sites = Vec::new();
     let mut owner_arms = BTreeMap::<SignatureClassId, super::decision::RequiredArmSet>::new();
     for (subject, _) in &table.entries {
         let owner = SignatureClassId::of(subject.fn_did);
@@ -341,6 +946,7 @@ pub(crate) fn plan(
                 },
                 owner_class: Some(seam.owner_class),
                 owner_path: seam.owner_fn.clone(),
+                bridge: Some(seam.bridge.clone()),
                 atom_ids: seam.atom_ids.clone(),
                 subject_id: format!("{}#arg{}", seam.owner_fn, seam.param_index),
                 required_arms: owner_arms
@@ -358,6 +964,8 @@ pub(crate) fn plan(
             // that silently vanishes leaves the callee converted and the call
             // site raw, which is the `E0308` this whole slice exists to remove.
             Err(reason) => unplaceable.push(Unplaceable {
+                owner_class: seam.owner_class,
+                bridge: seam.bridge.clone(),
                 reason,
                 detail: format!("seam adapter for {}", seam.owner_fn),
                 subject: seam.owner_fn.clone(),
@@ -379,6 +987,7 @@ pub(crate) fn plan(
                 },
                 owner_class: Some(body.owner_class),
                 owner_path: body.owner_fn.clone(),
+                bridge: Some(body.bridge.clone()),
                 atom_ids: Vec::new(),
                 subject_id: body.destination.clone(),
                 required_arms: owner_arms
@@ -389,6 +998,8 @@ pub(crate) fn plan(
                 edit_kind: "body-adapter",
             }),
             Err(reason) => unplaceable.push(Unplaceable {
+                owner_class: body.owner_class,
+                bridge: body.bridge.clone(),
                 reason,
                 detail: format!("body adapter for {}", body.destination),
                 subject: body.owner_fn.clone(),
@@ -463,6 +1074,15 @@ pub(crate) fn plan(
         // duplicated canonicalizer whose two copies had to be edited together.
         let identity = || subject.identity_key(&owner_of(subject));
         let subject_id = identity();
+        let surface_bridge = || {
+            BridgeSitePlan::local(
+                subject.fn_did,
+                subject.fn_did,
+                Arm::Surface.key(),
+                subject_id.clone(),
+                "surface-unplaceable",
+            )
+        };
         let subject_arms = table
             .arm_requirements
             .get(&(subject.fn_did, subject.hir_id))
@@ -479,6 +1099,8 @@ pub(crate) fn plan(
                 Ok((file, _, _)) => (file, None),
                 Err(reason) => {
                     unplaceable.push(Unplaceable {
+                        owner_class: SignatureClassId::of(subject.fn_did),
+                        bridge: surface_bridge(),
                         reason,
                         detail: attribution(),
                         subject: identity(),
@@ -489,6 +1111,8 @@ pub(crate) fn plan(
         } else {
             let Some(pointee_span) = subject.pointee_span else {
                 unplaceable.push(Unplaceable {
+                    owner_class: SignatureClassId::of(subject.fn_did),
+                    bridge: surface_bridge(),
                     reason: "Ref decision on a declaration with no pointee span",
                     detail: attribution(),
                     subject: identity(),
@@ -497,6 +1121,8 @@ pub(crate) fn plan(
             };
             let Some(subject_ty_span) = subject.ty_span else {
                 unplaceable.push(Unplaceable {
+                    owner_class: SignatureClassId::of(subject.fn_did),
+                    bridge: surface_bridge(),
                     reason: "subject has no declared type to splice",
                     detail: attribution(),
                     subject: identity(),
@@ -507,6 +1133,8 @@ pub(crate) fn plan(
                 Ok(located) => located,
                 Err(reason) => {
                     unplaceable.push(Unplaceable {
+                        owner_class: SignatureClassId::of(subject.fn_did),
+                        bridge: surface_bridge(),
                         reason,
                         detail: attribution(),
                         subject: identity(),
@@ -518,6 +1146,8 @@ pub(crate) fn plan(
                 Ok(located) => located,
                 Err(reason) => {
                     unplaceable.push(Unplaceable {
+                        owner_class: SignatureClassId::of(subject.fn_did),
+                        bridge: surface_bridge(),
                         reason,
                         detail: attribution(),
                         subject: identity(),
@@ -527,6 +1157,8 @@ pub(crate) fn plan(
             };
             if pointee_file != ty_file {
                 unplaceable.push(Unplaceable {
+                    owner_class: SignatureClassId::of(subject.fn_did),
+                    bridge: surface_bridge(),
                     reason: "pointee text is in a different file from the declaration",
                     detail: attribution(),
                     subject: identity(),
@@ -535,6 +1167,8 @@ pub(crate) fn plan(
             }
             let Some(source) = source_of(&ty_file) else {
                 unplaceable.push(Unplaceable {
+                    owner_class: SignatureClassId::of(subject.fn_did),
+                    bridge: surface_bridge(),
                     reason: "no source text available for the declaring file",
                     detail: attribution(),
                     subject: identity(),
@@ -543,6 +1177,8 @@ pub(crate) fn plan(
             };
             let Some(source_pointee) = source.get(p_lo..p_hi) else {
                 unplaceable.push(Unplaceable {
+                    owner_class: SignatureClassId::of(subject.fn_did),
+                    bridge: surface_bridge(),
                     reason: "pointee range is outside its own file's source",
                     detail: attribution(),
                     subject: identity(),
@@ -607,6 +1243,29 @@ pub(crate) fn plan(
                         },
                         owner_class: Some(SignatureClassId::of(subject.fn_did)),
                         owner_path: owner_of(subject),
+                        bridge: Some(
+                            BridgeSitePlan::local(
+                                subject.fn_did,
+                                subject.fn_did,
+                                Arm::Surface.key(),
+                                subject_id.clone(),
+                                "box-expression",
+                            )
+                            .with_extent(
+                                if box_plan.fabricated_extent
+                                    && matches!(
+                                        edit.receipt,
+                                        "memset-zero-slice"
+                                            | "realloc-atomic"
+                                            | "default-fill-slice-fallback"
+                                    )
+                                {
+                                    BridgeExtentKind::Fallback
+                                } else {
+                                    BridgeExtentKind::None
+                                },
+                            ),
+                        ),
                         atom_ids: subject_atom_ids.clone(),
                         subject_id: subject_id.clone(),
                         required_arms: subject_arms.clone(),
@@ -629,6 +1288,13 @@ pub(crate) fn plan(
                         },
                         owner_class: Some(SignatureClassId::of(subject.fn_did)),
                         owner_path: owner_of(subject),
+                        bridge: Some(BridgeSitePlan::local(
+                            subject.fn_did,
+                            subject.fn_did,
+                            Arm::Surface.key(),
+                            subject_id.clone(),
+                            "box-delete-store",
+                        )),
                         atom_ids: subject_atom_ids.clone(),
                         subject_id: subject_id.clone(),
                         required_arms: subject_arms.clone(),
@@ -654,6 +1320,13 @@ pub(crate) fn plan(
                     },
                     owner_class: Some(SignatureClassId::of(subject.fn_did)),
                     owner_path: owner_of(subject),
+                    bridge: Some(BridgeSitePlan::local(
+                        subject.fn_did,
+                        subject.fn_did,
+                        Arm::Surface.key(),
+                        subject_id.clone(),
+                        "subject-use",
+                    )),
                     atom_ids: subject_atom_ids.clone(),
                     subject_id: subject_id.clone(),
                     required_arms: subject_arms.clone(),
@@ -667,6 +1340,8 @@ pub(crate) fn plan(
         }
         if let Some(reason) = use_failure {
             unplaceable.push(Unplaceable {
+                owner_class: SignatureClassId::of(subject.fn_did),
+                bridge: surface_bridge(),
                 reason,
                 detail: attribution(),
                 subject: identity(),
@@ -704,6 +1379,13 @@ pub(crate) fn plan(
                 justification: Justification::KindDecision { kind },
                 owner_class: Some(SignatureClassId::of(subject.fn_did)),
                 owner_path: owner_of(subject),
+                bridge: Some(BridgeSitePlan::local(
+                    subject.fn_did,
+                    subject.fn_did,
+                    Arm::Surface.key(),
+                    subject_id.clone(),
+                    "subject-declaration",
+                )),
                 atom_ids: subject_atom_ids,
                 subject_id,
                 required_arms: subject_arms,
@@ -711,6 +1393,137 @@ pub(crate) fn plan(
             });
         }
     }
+    preclass_sites.extend(unplaceable.iter().map(|site| {
+        ClassSite {
+            key: site
+                .bridge
+                .materialize(site.owner_class, "<unplaceable>".to_owned(), 0, 0),
+            edit_key: "-".to_owned(),
+            state: ClassSiteState::Dropped(site.reason.to_owned()),
+            extent: site.bridge.extent.clone(),
+            retention: site.bridge.retention,
+            waiver_id: site.bridge.waiver_id.clone(),
+        }
+    }));
+    for proof in &table.seams.overlap_proofs {
+        use crate::bo_rewriter::decision::a5_site_proof::A5SiteProofVerdict;
+        let owner = SignatureClassId::of(proof.callee);
+        let site = match proof.verdict {
+            A5SiteProofVerdict::Clear => ClassSite::zero(
+                owner,
+                SignatureClassId::of(proof.caller),
+                Arm::Pair,
+                "a5-site-proof-clear",
+            ),
+            A5SiteProofVerdict::Overlapping | A5SiteProofVerdict::Undeterminable => {
+                ClassSite::dropped(
+                    owner,
+                    SignatureClassId::of(proof.caller),
+                    Arm::Pair,
+                    "a5-site-proof-blocked",
+                    proof.reason.clone(),
+                )
+            }
+        };
+        preclass_sites.push(site);
+    }
+    for blocked in &table.seams.blocked {
+        let arm = if blocked.block == super::decision::seam::SeamBlock::SiteOverlap {
+            Arm::Pair
+        } else {
+            match (blocked.expected, blocked.found) {
+                (Some(expected), Some(found))
+                    if expected != super::decision::seam::Form::Raw
+                        && found != super::decision::seam::Form::Raw =>
+                {
+                    Arm::Glue
+                }
+                _ => Arm::C,
+            }
+        };
+        let bridge = BridgeSitePlan::local(
+            blocked.caller,
+            blocked.callee,
+            arm.key(),
+            format!("arg{}", blocked.index),
+            blocked.block.key(),
+        );
+        let (file, lo, hi) = span_to_loc(blocked.span)
+            .map(|(file, lo, hi)| {
+                (
+                    file_key_label(&file),
+                    u32::try_from(lo).unwrap_or(u32::MAX),
+                    u32::try_from(hi).unwrap_or(u32::MAX),
+                )
+            })
+            .unwrap_or_else(|_| ("<unplaceable>".to_owned(), 0, 0));
+        preclass_sites.push(ClassSite {
+            key: bridge.materialize(SignatureClassId::of(blocked.callee), file, lo, hi),
+            edit_key: "-".to_owned(),
+            state: ClassSiteState::Dropped(blocked.block.key().to_owned()),
+            extent: BridgeExtentKind::None,
+            retention: BridgeRetentionTier::None,
+            waiver_id: None,
+        });
+    }
+    for blocked in &table.seams.body_blocked {
+        let bridge = BridgeSitePlan::local(
+            blocked.owner_class.local_def_id(),
+            blocked.owner_class.local_def_id(),
+            Arm::Glue.key(),
+            format!("body:{}", blocked.context.key()),
+            blocked.block.key(),
+        );
+        let (file, lo, hi) = span_to_loc(blocked.span)
+            .map(|(file, lo, hi)| {
+                (
+                    file_key_label(&file),
+                    u32::try_from(lo).unwrap_or(u32::MAX),
+                    u32::try_from(hi).unwrap_or(u32::MAX),
+                )
+            })
+            .unwrap_or_else(|_| ("<unplaceable>".to_owned(), 0, 0));
+        preclass_sites.push(ClassSite {
+            key: bridge.materialize(blocked.owner_class, file, lo, hi),
+            edit_key: "-".to_owned(),
+            state: ClassSiteState::Dropped(blocked.block.key().to_owned()),
+            extent: BridgeExtentKind::None,
+            retention: BridgeRetentionTier::None,
+            waiver_id: None,
+        });
+    }
+    for pair in &table.seams.pair_sites {
+        use super::decision::co_conversion::{PairRole, PairTier};
+        if pair.role == PairRole::RawView {
+            continue;
+        }
+        let owner = SignatureClassId::of(pair.callee);
+        let mut site = match pair.role {
+            PairRole::Clear | PairRole::Primary => ClassSite::zero(
+                owner,
+                SignatureClassId::of(pair.caller),
+                Arm::Pair,
+                pair.role.key(),
+            ),
+            PairRole::Blocked => ClassSite::dropped(
+                owner,
+                SignatureClassId::of(pair.caller),
+                Arm::Pair,
+                pair.role.key(),
+                pair.reason.clone(),
+            ),
+            PairRole::RawView => unreachable!(),
+        };
+        site.retention = match pair.tier {
+            PairTier::T1 => BridgeRetentionTier::T1,
+            PairTier::T2 => BridgeRetentionTier::T2,
+            PairTier::None | PairTier::Blocked => BridgeRetentionTier::None,
+        };
+        site.waiver_id = (pair.tier == PairTier::T2)
+            .then(|| super::bridge_receipt::RAW_BOUNDARY_T2_WAIVER_ID.to_owned());
+        preclass_sites.push(site);
+    }
+
     Plan {
         by_file,
         unplaceable,
@@ -718,6 +1531,8 @@ pub(crate) fn plan(
         // neither which file is the crate root nor the parser for an item.
         root_file: None,
         len_const_item: None,
+        preclass_sites,
+        class_finalization: ClassFinalization::default(),
     }
 }
 
@@ -860,5 +1675,173 @@ mod tests {
              time here: {:?}",
             planned.unplaceable
         );
+    }
+}
+
+#[cfg(test)]
+mod wave3_class_tests {
+    use std::collections::BTreeSet;
+
+    use super::*;
+    use crate::bo_rewriter::{bridge_receipt::SignatureClassId, decision::RequiredArmSet};
+
+    fn with_classes(count: usize, check: impl FnOnce(&[SignatureClassId]) + Send) {
+        let source = (0..count)
+            .map(|index| format!("fn class_{index}() {{}}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        ::utils::compilation::run_compiler_on_str(&source, |tcx| {
+            let mut ids = tcx
+                .hir_body_owners()
+                .map(SignatureClassId::of)
+                .collect::<Vec<_>>();
+            ids.sort();
+            assert_eq!(ids.len(), count);
+            check(&ids);
+        })
+        .expect("class fixture compiles");
+    }
+
+    fn arms(required: &[crate::bo_rewriter::decision::Arm]) -> RequiredArmSet {
+        let mut out = RequiredArmSet::default();
+        for &arm in required {
+            out.insert(arm);
+        }
+        out
+    }
+
+    #[test]
+    fn cls_w1_one_signature_and_all_adapters_revert_as_one_unit() {
+        use crate::bo_rewriter::decision::Arm;
+        with_classes(3, |ids| {
+            let owner = ids[0];
+            let input = ClassInput::new(owner, arms(&[Arm::Surface, Arm::C, Arm::Glue]))
+                .with_site(ClassSite::edit(
+                    owner,
+                    ids[1],
+                    Arm::Surface,
+                    "m.rs",
+                    1,
+                    2,
+                    "signature",
+                ))
+                .with_site(ClassSite::edit(
+                    owner,
+                    ids[1],
+                    Arm::C,
+                    "m.rs",
+                    10,
+                    11,
+                    "caller-a",
+                ))
+                .with_site(ClassSite::edit(
+                    owner,
+                    ids[2],
+                    Arm::Glue,
+                    "m.rs",
+                    20,
+                    21,
+                    "caller-b",
+                ));
+            let finalized = finalize_class_inputs(vec![input]);
+            assert!(finalized.classes[&owner].is_ready());
+            assert_eq!(finalized.classes[&owner].sites.len(), 3);
+            assert_eq!(finalized.live_sites(&BTreeSet::from([owner])).count(), 0);
+        });
+    }
+
+    #[test]
+    fn atm_w1_surface_with_missing_required_c_holds_the_whole_class() {
+        use crate::bo_rewriter::decision::Arm;
+        with_classes(1, |ids| {
+            let owner = ids[0];
+            let input = ClassInput::new(owner, arms(&[Arm::Surface, Arm::C])).with_site(
+                ClassSite::edit(owner, owner, Arm::Surface, "m.rs", 1, 2, "signature"),
+            );
+            let finalized = finalize_class_inputs(vec![input]);
+            assert!(!finalized.classes[&owner].is_ready());
+            assert_eq!(finalized.applied_site_count(), 0);
+        });
+    }
+
+    #[test]
+    fn atm_w2_blocked_class_applies_no_ready_d4_or_pair_site() {
+        use crate::bo_rewriter::decision::Arm;
+        with_classes(1, |ids| {
+            let owner = ids[0];
+            let input = ClassInput::new(owner, arms(&[Arm::D4, Arm::Pair]))
+                .blocked("blocked-subject")
+                .with_site(ClassSite::zero(owner, owner, Arm::D4, "d4-membership"))
+                .with_site(ClassSite::edit(
+                    owner,
+                    owner,
+                    Arm::Pair,
+                    "m.rs",
+                    4,
+                    5,
+                    "pair-view",
+                ));
+            let finalized = finalize_class_inputs(vec![input]);
+            assert!(!finalized.classes[&owner].is_ready());
+            assert_eq!(finalized.applied_site_count(), 0);
+        });
+    }
+
+    #[test]
+    fn atm_w3_zero_syntax_site_is_terminally_applied() {
+        use crate::bo_rewriter::decision::Arm;
+        with_classes(1, |ids| {
+            let owner = ids[0];
+            let input = ClassInput::new(owner, arms(&[Arm::C])).with_site(ClassSite::zero(
+                owner,
+                owner,
+                Arm::C,
+                "identity-coercion",
+            ));
+            let finalized = finalize_class_inputs(vec![input]);
+            assert!(finalized.classes[&owner].is_ready());
+            assert_eq!(finalized.applied_site_count(), 1);
+            assert_eq!(finalized.classes[&owner].sites[0].edit_key, "-");
+            let plan = Plan {
+                class_finalization: finalized,
+                ..Plan::default()
+            };
+            let events = plan.bridge_events(&BTreeSet::new());
+            let summary = crate::bo_rewriter::bridge_receipt::reconcile_bridge_events(&events)
+                .expect("zero-syntax plan/terminal receipt reconciles");
+            assert_eq!(summary.required_sites, 1);
+            assert_eq!(summary.applied_events, 1);
+            assert_eq!(summary.dropped_events, 0);
+        });
+    }
+
+    #[test]
+    fn coll_w1_cross_class_interval_collision_holds_both_classes() {
+        use crate::bo_rewriter::decision::Arm;
+        with_classes(2, |ids| {
+            let left = ClassInput::new(ids[0], arms(&[Arm::Surface])).with_site(ClassSite::edit(
+                ids[0],
+                ids[0],
+                Arm::Surface,
+                "m.rs",
+                10,
+                20,
+                "left",
+            ));
+            let right = ClassInput::new(ids[1], arms(&[Arm::Surface])).with_site(ClassSite::edit(
+                ids[1],
+                ids[1],
+                Arm::Surface,
+                "m.rs",
+                15,
+                25,
+                "right",
+            ));
+            let finalized = finalize_class_inputs(vec![left, right]);
+            assert_eq!(finalized.collisions.len(), 1);
+            assert!(!finalized.classes[&ids[0]].is_ready());
+            assert!(!finalized.classes[&ids[1]].is_ready());
+            assert_eq!(finalized.applied_site_count(), 0);
+        });
     }
 }

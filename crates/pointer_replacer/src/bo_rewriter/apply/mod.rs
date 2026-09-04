@@ -250,6 +250,7 @@ mod tests {
                 rustc_hir::def_id::CRATE_DEF_ID,
             )),
             owner_path: "test::owner".to_owned(),
+            bridge: None,
             atom_ids: Vec::new(),
             subject_id: "test::subject".to_owned(),
             required_arms: "-".to_owned(),

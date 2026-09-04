@@ -795,7 +795,7 @@ fn rewrite_core_injected_with_config(
         } else {
             Vec::new()
         };
-        let degradations: Vec<decision::Degradation> = table.degradations().cloned().collect();
+        let mut degradations: Vec<decision::Degradation> = table.degradations().cloned().collect();
         let mut emitted_sites: Vec<EmittedSite> = Vec::new();
         // One entry per EMITTED SUBJECT (not per function), so a revert can move
         // exactly the right number of subjects from emitted to degraded and the
@@ -835,6 +835,7 @@ fn rewrite_core_injected_with_config(
                 decision::Decision::Degraded(_) => continue,
             }
             let owner = tcx.def_path_str(subject.fn_did.to_def_id());
+            let owner_class = bridge_receipt::SignatureClassId::of(subject.fn_did);
             // S3.0′: the SAME key `plan` stamped into `Unplaceable::subject`.
             // Built here by hand until S3.0′, beside an identical hand-built
             // copy in `plan` — and both keyed on the NAME, so two subjects that
@@ -843,8 +844,19 @@ fn rewrite_core_injected_with_config(
             if unplaceable_subjects.contains(key.as_str()) {
                 continue;
             }
+            if let Some(reason) = emission_plan.class_hold_reason(owner_class) {
+                degradations.push(decision::Degradation {
+                    subject: key,
+                    site: decision::emitability::EmitabilityFacts::site(
+                        tcx,
+                        subject.attribution_span(),
+                    ),
+                    reason: decision::DegradeReason::SignatureClassHeld { reason },
+                });
+                continue;
+            }
             emitted_subjects.push(EmittedSubject {
-                owner_class: bridge_receipt::SignatureClassId::of(subject.fn_did),
+                owner_class,
                 owner_path: owner.clone(),
                 subject: key,
                 site: decision::emitability::EmitabilityFacts::site(
@@ -1014,8 +1026,10 @@ fn round_files(
     ),
     String,
 > {
+    let mut withheld = reverted.clone();
+    withheld.extend(emission_plan.held_classes());
     let reverts =
-        ast_transform::revert_set_from_classes_and_atoms(reverted, reverted_atoms, table)?;
+        ast_transform::revert_set_from_classes_and_atoms(&withheld, reverted_atoms, table)?;
     // **PER-FILE (A1, revived 2026-08-18).** The one-entry map that stood here
     // was licensed by C-20's corpus measurement — 20/20 single crate-source
     // file — and that measurement still holds. What it did not cover is the
@@ -1049,7 +1063,7 @@ fn verify_and_revert(
     a5_receipt: String,
     e1_subject_receipt: String,
     e2_artifacts: E2Artifacts,
-    raw_boundary_artifacts: RawBoundaryArtifacts,
+    mut raw_boundary_artifacts: RawBoundaryArtifacts,
     e1_box_drop_policies: Vec<verify::BoxMirDropPolicy>,
 ) -> RewriteOutcome {
     // `excluded` is a LOCAL again: the loop holds `tcx`, so a value that used
@@ -1069,6 +1083,10 @@ fn verify_and_revert(
         .collect::<std::collections::BTreeSet<_>>()
         .difference(&site_owners)
         .count();
+    raw_boundary_artifacts.bridge_events =
+        emission_plan.bridge_events(&std::collections::BTreeSet::new());
+    raw_boundary_artifacts.class_collisions = render_class_collisions(&emission_plan);
+    raw_boundary_artifacts.arm_outcomes = atomic_arm_outcomes_tsv(tcx, table, &emission_plan);
     let mut class_paths = std::collections::BTreeMap::new();
     for edit in emission_plan.by_file.values().flatten() {
         if let Some(class) = edit.owner_class {
@@ -1561,6 +1579,7 @@ fn verify_and_revert(
             facts.files_touched = files_edited;
             facts.raw_boundary_artifacts.final_reverts =
                 render_raw_boundary_final_reverts(&reverted, &reverted_atoms, &class_paths);
+            facts.raw_boundary_artifacts.bridge_events = emission_plan.bridge_events(&reverted);
             return facts.emitted(source, files);
         }
 
@@ -1904,6 +1923,8 @@ fn verify_and_revert(
             facts.escalated = Some(escalation);
             facts.raw_boundary_artifacts.final_reverts =
                 render_raw_boundary_final_reverts(&final_reverted, &reverted_atoms, &class_paths);
+            facts.raw_boundary_artifacts.bridge_events =
+                emission_plan.bridge_events(&final_reverted);
             facts.emitted(source, final_files)
         }
         _ => {
@@ -2944,6 +2965,25 @@ fn render_raw_boundary_final_reverts(
     out
 }
 
+fn render_class_collisions(plan: &plan::Plan) -> String {
+    let mut out = bridge_receipt::class_collision_header();
+    for collision in &plan.class_finalization.collisions {
+        out.push_str(&format!(
+            "-\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+            collision.left_class.order_key(),
+            collision.right_class.order_key(),
+            collision.left_edit_key,
+            collision.right_edit_key,
+            collision.file,
+            collision.lo,
+            collision.hi,
+            collision.left_kind,
+            collision.right_kind,
+        ));
+    }
+    out
+}
+
 /// Pure selection over original-source lines. Production first translates
 /// rustc's emitted lines back to these coordinates; the unit witnesses use it
 /// directly so exact-vs-group-vs-fallback is observable without a compiler.
@@ -3628,6 +3668,7 @@ pub(crate) fn validate_plan(
             // out of it, it is simply not subject to it.
             owner_class: None,
             owner_path: "<crate>".to_owned(),
+            bridge: None,
             atom_ids: Vec::new(),
             subject_id: "<crate>".to_owned(),
             required_arms: "-".to_owned(),
@@ -3807,12 +3848,20 @@ pub(crate) fn emit_files<'tcx>(
             justification: plan::Justification::C9Mark,
             owner_class: Some(bridge_receipt::SignatureClassId::of(mark.owner_did)),
             owner_path: mark.owner_fn.clone(),
+            bridge: Some(bridge_receipt::BridgeSitePlan::local(
+                mark.owner_did,
+                mark.owner_did,
+                decision::Arm::Pair.key(),
+                format!("c9:{}..{}", mark.call_span.lo().0, mark.call_span.hi().0),
+                "c9-mark",
+            )),
             atom_ids: Vec::new(),
             subject_id: mark.owner_fn.clone(),
             required_arms: "-".to_owned(),
             edit_kind: "c9-mark",
         });
     }
+    plan::finalize_signature_classes(&mut planned, table, reverted);
     // **The crate root, asked of the compiler rather than guessed** — not
     // `files()[0]`, which is source-map insertion order, and not the first
     // planned file, which is whichever file happened to hold an edit.
@@ -4755,6 +4804,93 @@ fn arm_outcomes_tsv(
                 states[5],
                 terminal,
                 blocked_arm.map_or("-", Arm::key),
+                blocked_reason,
+            ),
+        ));
+    }
+    rows.sort_by(|left, right| left.0.cmp(&right.0));
+    let mut out = String::from(
+        "subject_identity\towner\trequired_arms\tready_arms\tapplied_arms\tsurface_state\td4_state\tc_state\tpair_state\tglue_state\taddr_state\tterminal\tblocking_arm\tblocking_reason\n",
+    );
+    for (_, row) in rows {
+        out.push_str(&row);
+    }
+    out
+}
+
+fn atomic_arm_outcomes_tsv(
+    tcx: TyCtxt<'_>,
+    table: &decision::DecisionTable,
+    plan: &plan::Plan,
+) -> String {
+    use decision::{Arm, ArmState, Decision};
+
+    let mut rows = Vec::new();
+    for (subject, decision) in &table.entries {
+        let id = bridge_receipt::SignatureClassId::of(subject.fn_did);
+        let required = table
+            .arm_requirements
+            .get(&(subject.fn_did, subject.hir_id))
+            .copied()
+            .unwrap_or_default();
+        let class = plan.class_finalization.classes.get(&id);
+        let class_ready = class.is_some_and(plan::SignatureClassPlan::is_ready);
+        let decision_degraded = match decision {
+            Decision::Ref { .. }
+            | Decision::InferredRef { .. }
+            | Decision::Slice { .. }
+            | Decision::Opt { .. }
+            | Decision::Box(_) => false,
+            Decision::Degraded(_) => true,
+        };
+        let applied = if class_ready && !decision_degraded {
+            required
+        } else {
+            decision::RequiredArmSet::default()
+        };
+        let states = Arm::ALL
+            .into_iter()
+            .map(|arm| {
+                if !required.contains(arm) {
+                    ArmState::NotRequired
+                } else if class_ready && !decision_degraded {
+                    ArmState::Ready
+                } else {
+                    ArmState::Blocked
+                }
+                .key()
+            })
+            .collect::<Vec<_>>();
+        let terminal = if class.is_some_and(|class| !class.is_ready()) {
+            "blocked"
+        } else if decision_degraded {
+            "typed-excluded"
+        } else {
+            "planned"
+        };
+        let blocked_reason = class
+            .filter(|class| !class.is_ready())
+            .map(|class| class.hold_reasons().join(";"))
+            .unwrap_or_else(|| "-".to_owned());
+        let owner = tcx.def_path_str(subject.fn_did.to_def_id());
+        let identity = subject.identity_key(&owner);
+        rows.push((
+            identity.clone(),
+            format!(
+                "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+                identity,
+                owner,
+                required.render(),
+                applied.render(),
+                applied.render(),
+                states[0],
+                states[1],
+                states[2],
+                states[3],
+                states[4],
+                states[5],
+                terminal,
+                if terminal == "blocked" { "class" } else { "-" },
                 blocked_reason,
             ),
         ));
@@ -6825,6 +6961,7 @@ mod raw_boundary_atom_tests {
                     rustc_hir::def_id::CRATE_DEF_ID,
                 )),
                 owner_path: "crate::f".to_owned(),
+                bridge: None,
                 atom_ids: vec!["atom-1".to_owned()],
                 subject_id: "crate::f::p#1".to_owned(),
                 required_arms: "d4+c+pair".to_owned(),
