@@ -4762,6 +4762,17 @@ fn finish_decide<'tcx>(
         exposure,
     };
 
+    // Complete the frozen A5 site's legacy drops-elaborated reads before the
+    // const-MIR fn-pointer collector becomes the terminal const-body reader
+    // through `mir_for_ctfe`.  The proof object remains derived once and is
+    // passed unchanged to PAIR and seam synthesis below.
+    let a5_site_proofs = decision::a5_site_proof::A5SeamProofIndex::derive(
+        &program,
+        &slots,
+        analysis.origins.as_ref(),
+        analysis.a5_mode,
+        analysis.attestation,
+    );
     let web_started = std::time::Instant::now();
     let fnptr_web = decision::lifetime::derive_fn_ptr_web(&program, analysis.attestation);
     let fnptr_web_wall_s = web_started.elapsed().as_secs_f64();
@@ -4876,16 +4887,6 @@ fn finish_decide<'tcx>(
         &mut_facts,
     );
     let raw_boundary_decision_wall_s = raw_boundary_decision_started.elapsed().as_secs_f64();
-    // Derive the attested A5 site index once, before PAIR, and pass the same
-    // immutable object to the settled seam. No downstream arm reclassifies a
-    // pair or pays the global setup twice.
-    let a5_site_proofs = decision::a5_site_proof::A5SeamProofIndex::derive(
-        &program,
-        &slots,
-        analysis.origins.as_ref(),
-        analysis.a5_mode,
-        analysis.attestation,
-    );
     let coconv =
         decision::co_conversion::build_with_c9_marks_lifetimes_raw_boundary_and_pair_proofs(
             &facts,

@@ -1301,11 +1301,10 @@ fn collect_const_mir_fn_ptr_seeds(program: &RustProgram<'_>) -> Vec<StaticFnPtrS
                 | DefKind::InlineConst
         )
     }) {
-        let body_ref = program
-            .tcx
-            .mir_drops_elaborated_and_const_checked(owner)
-            .borrow();
-        let body = &*body_ref;
+        // Const/static CTFE consumes the `Steal<Body>` behind
+        // `mir_drops_elaborated_and_const_checked`.  `mir_for_ctfe` is the
+        // cached, never-stolen body for these const-context owners.
+        let body = program.tcx.mir_for_ctfe(owner);
         let mut collector = OperandCollector {
             tcx: program.tcx,
             body,
@@ -1400,10 +1399,14 @@ pub(crate) fn derive_fn_ptr_web(
         return Err(LifetimeFailure::FnPtrWebHeld);
     }
 
+    // The frozen call-world builder still reads the drops-elaborated static
+    // body through its legacy consumer.  Complete that read before the CTFE
+    // query below consumes the `Steal`; the const-root collector is the
+    // terminal reader and itself uses only `mir_for_ctfe`.
+    let call_world = resolve_closed_world_call_world(program, attestation);
     let mut roots = collect_fn_ptr_roots(program);
     let static_seeds = collect_const_mir_fn_ptr_seeds(program);
     roots.extend(static_seeds.iter().map(|seed| seed.function));
-    let call_world = resolve_closed_world_call_world(program, attestation);
     let mut members = FxHashSet::default();
     let mut reasons = roots
         .iter()
@@ -1883,5 +1886,33 @@ mod tests {
             differential.tsv().lines().next(),
             Some("side\tunit\tfunction\treason")
         );
+    }
+
+    /// CTFE-BODY-W1 — forcing the CTFE query for a static consumes the
+    /// `Steal<Body>` behind `mir_drops_elaborated_and_const_checked`.  The
+    /// const-initializer function-pointer collector must therefore read the
+    /// cached CTFE body rather than borrowing the consumed wrapper.
+    #[test]
+    fn ctfe_body_w1_static_root_collection_survives_prior_ctfe_query() {
+        let code = r#"
+            pub type Callback = unsafe extern "C" fn(*mut i32) -> i32;
+            pub unsafe extern "C" fn target(p: *mut i32) -> i32 { *p }
+            pub static TABLE: [Option<Callback>; 1] = [Some(target as Callback)];
+        "#;
+        let seeds = ::utils::compilation::run_compiler_on_str(code, |tcx| {
+            let program = crate::bo_rewriter::collect_program(tcx);
+            let table = tcx
+                .hir_body_owners()
+                .find(|owner| matches!(tcx.def_kind(*owner), DefKind::Static { .. }))
+                .expect("fixture static owner");
+            let _ = tcx.mir_for_ctfe(table);
+            collect_const_mir_fn_ptr_seeds(&program)
+                .into_iter()
+                .map(|seed| tcx.item_name(seed.function.to_def_id()).to_string())
+                .collect::<Vec<_>>()
+        })
+        .expect("CTFE-before-collector fixture compiles");
+
+        assert_eq!(seeds, vec!["target"]);
     }
 }
