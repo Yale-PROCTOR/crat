@@ -10487,3 +10487,41 @@ fn d3_w1_generated_inner_use_depends_on_ready_defining_class() {
         "D3-W1 emitted tree must not name a missing generated item:\n{emitted}"
     );
 }
+
+/// D8-W1 — an ordinary local caller of a surfaced function must target the
+/// generated safe inner when its C adapter was planned against that inner's
+/// interface.  The tulip L86 failure instead rendered `target(&[T])`, where
+/// `target` was the terminal raw wrapper and therefore still expected `*const
+/// T`.
+#[test]
+fn d8_w1_ordinary_caller_uses_terminal_safe_inner_interface() {
+    let fixture = Fixture::new(&[(
+        "lib.rs",
+        "#![allow(dead_code, unused_unsafe)]\n\
+         pub unsafe fn target(p: *const i32) -> i32 { *p }\n\
+         pub unsafe fn caller(p: *const i32) -> i32 { target(p) }\n\
+         pub unsafe fn install() {\n\
+             let _callback: unsafe fn(*const i32) -> i32 = target;\n\
+         }\n",
+    )]);
+    let outcome = super::rewrite_m1_path_with_emission_config(
+        &fixture.root(),
+        crate::analyses::borrow_ownership::a5_overlap::A5Mode::PreciseReplay,
+        Some(
+            crate::analyses::borrow_ownership::a5_overlap::WholeProgramAttestation::FrozenBenchmarkGraph,
+        ),
+        &super::EmissionRunConfig::default(),
+    );
+    let super::RewriteOutcome::Emitted { files, .. } = outcome else {
+        panic!("D8-W1 fixture must emit: {outcome:#?}")
+    };
+    let emitted = files.values().next().expect("emitted root");
+    assert!(emitted.contains("fn target(p: *const i32)"), "{emitted}");
+    assert!(emitted.contains("fn __crat_safe_target"), "{emitted}");
+    assert!(emitted.contains("__crat_safe_target(p)"), "{emitted}");
+    let emitted_fixture = Fixture::new(&[("lib.rs", emitted)]);
+    assert!(
+        ::utils::compilation::run_compiler_on_path(&emitted_fixture.root(), |_| ()).is_ok(),
+        "D8-W1 terminal wrapper/inner pairing must type-check:\n{emitted}"
+    );
+}

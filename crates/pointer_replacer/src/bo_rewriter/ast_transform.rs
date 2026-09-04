@@ -2476,13 +2476,14 @@ fn collect_surface_name_populations(
     items: &[P<rustc_ast::Item>],
     global_map: &rustc_ast::node_id::NodeMap<LocalDefId>,
     exposure: &super::decision::exposure::ExposurePolicy,
+    reverted: &FxHashSet<LocalDefId>,
     out: &mut FxHashMap<Symbol, SurfaceNamePopulation>,
 ) {
     for item in items {
         if let rustc_ast::ItemKind::Mod(_, _, rustc_ast::ModKind::Loaded(inner, _, _, _)) =
             &item.kind
         {
-            collect_surface_name_populations(inner, global_map, exposure, out);
+            collect_surface_name_populations(inner, global_map, exposure, reverted, out);
             continue;
         }
         let Some(&did) = global_map.get(&item.id) else {
@@ -2493,11 +2494,13 @@ fn collect_surface_name_populations(
         };
         let population = out.entry(function.ident.name).or_default();
         population.functions += 1;
-        if !matches!(
-            exposure.plan(did),
-            super::decision::exposure::ExposureSurfacePlan::ClosedWorldDirect
-                | super::decision::exposure::ExposureSurfacePlan::NotApplicable
-        ) {
+        if !reverted.contains(&did)
+            && !matches!(
+                exposure.plan(did),
+                super::decision::exposure::ExposureSurfacePlan::ClosedWorldDirect
+                    | super::decision::exposure::ExposureSurfacePlan::NotApplicable
+            )
+        {
             population.surfaced += 1;
         }
     }
@@ -2632,6 +2635,7 @@ fn apply_surface_plans(
         &capture.krate.items,
         &capture.map.global_map,
         exposure,
+        &reverts.fns,
         &mut surface_name_populations,
     );
     let surface_names = finalize_surface_names(&surface_name_populations)?;
@@ -2651,7 +2655,16 @@ fn apply_surface_plans(
         &return_temp_types,
         &reverts.fns,
         guard,
-    )
+    )?;
+    // Call-site adapters are planned against the safe inner's interface, not
+    // the raw wrapper retained for fn-pointer exposure.  Resolve those names
+    // only after final class reverts are known, so a held defining class never
+    // leaves a call to a generated item that was not emitted.
+    SurfaceCallVisitor {
+        names: &surface_names,
+    }
+    .visit_crate(krate);
+    Ok(())
 }
 
 /// **THE ONE AST CAPTURE PER SESSION** (M-2/A).
