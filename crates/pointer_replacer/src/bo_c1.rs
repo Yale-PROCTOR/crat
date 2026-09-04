@@ -11290,12 +11290,7 @@ mod run {
         );
         row.set(
             raw_schema::SIGNATURE_CLASS_COUNT,
-            artifact
-                .bridge_events
-                .iter()
-                .map(|event| event.site.owner_class)
-                .collect::<BTreeSet<_>>()
-                .len(),
+            artifact.signature_class_count,
         );
         row.set(
             raw_schema::ATTRIBUTION_HITS_EXACT_EDIT,
@@ -11317,12 +11312,12 @@ mod run {
             raw_schema::ATTRIBUTION_HITS_UNRESOLVED,
             artifact.attribution_hits.unresolved,
         );
-        row.set(raw_schema::CLASS_BISECT_PROBES, 0);
-        row.set(raw_schema::VERIFY_WALL_S, &timing.initial_verify_wall_s);
         row.set(
-            raw_schema::EMIT_BUDGET_S,
-            std::env::var("CRAT_BOC1_EMIT_TIMEOUT_SECS").unwrap_or_else(|_| "900".to_owned()),
+            raw_schema::CLASS_BISECT_PROBES,
+            artifact.class_bisect_probes,
         );
+        row.set(raw_schema::VERIFY_WALL_S, &artifact.verify_wall_s);
+        row.set(raw_schema::EMIT_BUDGET_S, &artifact.emit_budget_s);
         row.set(
             raw_schema::PER_ARM_TIMERS_STATUS,
             &artifact.per_arm_timers_status,

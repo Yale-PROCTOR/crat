@@ -661,6 +661,34 @@ pub(crate) fn finalize_signature_classes(
         }
     }
 
+    let mut dependency_edges = table
+        .seams
+        .edits
+        .iter()
+        .map(|edit| (SignatureClassId::of(edit.bridge.caller), edit.owner_class))
+        .collect::<Vec<_>>();
+    dependency_edges.extend(table.entries.iter().filter_map(
+        |(subject, decision)| match decision {
+            Decision::InferredRef { callee, .. } => Some((
+                SignatureClassId::of(subject.fn_did),
+                SignatureClassId::of(*callee),
+            )),
+            Decision::Ref { .. }
+            | Decision::Slice { .. }
+            | Decision::Opt { .. }
+            | Decision::Box(_)
+            | Decision::Degraded(_) => None,
+        },
+    ));
+    for (dependent, dependency) in dependency_edges {
+        if dependent == dependency || !by_class.contains_key(&dependency) {
+            continue;
+        }
+        if let Some(class) = by_class.get_mut(&dependent) {
+            class.depends_on.push(dependency);
+        }
+    }
+
     for (id, reasons) in degraded {
         if let Some(class) = by_class.get_mut(&id) {
             class.block_reasons.extend(
@@ -735,6 +763,127 @@ pub(crate) fn finalize_signature_classes(
         .attribution_intervals
         .retain(|site| finalization.classes[&site.owner_class].is_ready());
     planned.class_finalization = finalization;
+}
+
+fn dependency_reach(
+    start: SignatureClassId,
+    classes: &BTreeMap<SignatureClassId, SignatureClassPlan>,
+) -> std::collections::BTreeSet<SignatureClassId> {
+    let mut reached = std::collections::BTreeSet::new();
+    let mut pending = vec![start];
+    while let Some(class) = pending.pop() {
+        if !reached.insert(class) {
+            continue;
+        }
+        if let Some(plan) = classes.get(&class) {
+            pending.extend(
+                plan.depends_on
+                    .iter()
+                    .copied()
+                    .filter(|dependency| classes.contains_key(dependency)),
+            );
+        }
+    }
+    reached
+}
+
+/// Dependency SCCs in the binding recovery order: dependents before the
+/// interfaces they consume, with only the local DefId index as a tie-breaker.
+pub(crate) fn dependency_scc_order(
+    classes: &BTreeMap<SignatureClassId, SignatureClassPlan>,
+) -> Vec<Vec<SignatureClassId>> {
+    let reaches = classes
+        .keys()
+        .copied()
+        .map(|id| (id, dependency_reach(id, classes)))
+        .collect::<BTreeMap<_, _>>();
+    let mut unassigned = classes
+        .keys()
+        .copied()
+        .collect::<std::collections::BTreeSet<_>>();
+    let mut groups = Vec::<Vec<SignatureClassId>>::new();
+    while let Some(&seed) = unassigned.first() {
+        let mut group = unassigned
+            .iter()
+            .copied()
+            .filter(|candidate| {
+                reaches[&seed].contains(candidate) && reaches[candidate].contains(&seed)
+            })
+            .collect::<Vec<_>>();
+        group.sort();
+        for member in &group {
+            unassigned.remove(member);
+        }
+        groups.push(group);
+    }
+
+    let group_of = groups
+        .iter()
+        .enumerate()
+        .flat_map(|(index, group)| group.iter().copied().map(move |id| (id, index)))
+        .collect::<BTreeMap<_, _>>();
+    let mut outgoing = vec![std::collections::BTreeSet::<usize>::new(); groups.len()];
+    let mut indegree = vec![0usize; groups.len()];
+    for (&id, class) in classes {
+        let source = group_of[&id];
+        for dependency in &class.depends_on {
+            let Some(&target) = group_of.get(dependency) else {
+                continue;
+            };
+            if source != target && outgoing[source].insert(target) {
+                indegree[target] += 1;
+            }
+        }
+    }
+    let mut ready = groups
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| indegree[*index] == 0)
+        .map(|(index, group)| (group[0], index))
+        .collect::<std::collections::BTreeSet<_>>();
+    let mut ordered = Vec::new();
+    while let Some(&(key, index)) = ready.first() {
+        ready.remove(&(key, index));
+        ordered.push(groups[index].clone());
+        for &target in &outgoing[index] {
+            indegree[target] -= 1;
+            if indegree[target] == 0 {
+                ready.insert((groups[target][0], target));
+            }
+        }
+    }
+    debug_assert_eq!(ordered.iter().map(Vec::len).sum::<usize>(), classes.len());
+    ordered
+}
+
+pub(crate) fn dependent_closure(
+    classes: &BTreeMap<SignatureClassId, SignatureClassPlan>,
+    seeds: &std::collections::BTreeSet<SignatureClassId>,
+) -> std::collections::BTreeSet<SignatureClassId> {
+    let mut closure = seeds.clone();
+    loop {
+        let before = closure.len();
+        for class in classes.values() {
+            if class.is_ready()
+                && class
+                    .depends_on
+                    .iter()
+                    .any(|dependency| closure.contains(dependency))
+            {
+                closure.insert(class.id);
+            }
+        }
+        if closure.len() == before {
+            return closure;
+        }
+    }
+}
+
+pub(crate) fn strict_recovery_subset(
+    ready: &std::collections::BTreeSet<SignatureClassId>,
+    reverted: &std::collections::BTreeSet<SignatureClassId>,
+) -> bool {
+    !reverted.is_empty() && reverted.is_subset(ready) && reverted.len() < ready.len()
 }
 
 /// The finished plan handed to [`super::apply`], **grouped by file**.
@@ -1878,6 +2027,33 @@ mod wave3_class_tests {
             assert!(!finalized.classes[&ids[0]].is_ready());
             assert!(!finalized.classes[&ids[1]].is_ready());
             assert_eq!(finalized.applied_site_count(), 0);
+        });
+    }
+
+    #[test]
+    fn cls_w4_dependency_order_is_dependents_first_not_local_index_order() {
+        with_classes(3, |ids| {
+            let mut dependent = ClassInput::new(ids[2], RequiredArmSet::default());
+            dependent.depends_on.push(ids[0]);
+            let finalized = finalize_class_inputs(vec![
+                ClassInput::new(ids[0], RequiredArmSet::default()),
+                ClassInput::new(ids[1], RequiredArmSet::default()),
+                dependent,
+            ]);
+            let groups = dependency_scc_order(&finalized.classes);
+            let flattened = groups.into_iter().flatten().collect::<Vec<_>>();
+            let dependent_at = flattened.iter().position(|id| *id == ids[2]).unwrap();
+            let dependency_at = flattened.iter().position(|id| *id == ids[0]).unwrap();
+            assert!(dependent_at < dependency_at, "dependency order was lexical");
+        });
+    }
+
+    #[test]
+    fn cls_w6_revert_all_is_never_a_successful_recovery() {
+        with_classes(3, |ids| {
+            let ready = ids.iter().copied().collect::<BTreeSet<_>>();
+            assert!(strict_recovery_subset(&ready, &BTreeSet::from([ids[0]])));
+            assert!(!strict_recovery_subset(&ready, &ready));
         });
     }
 }

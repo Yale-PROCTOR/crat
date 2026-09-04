@@ -221,6 +221,11 @@ pub(crate) struct RawBoundaryArtifacts {
     pub(crate) degraded_output_receipt: String,
     pub(crate) per_arm_timers_status: String,
     pub(crate) attribution_hits: AttributionHits,
+    pub(crate) signature_class_count: usize,
+    pub(crate) class_bisect_probes: usize,
+    pub(crate) class_verify_rounds: usize,
+    pub(crate) verify_wall_s: String,
+    pub(crate) emit_budget_s: String,
     pub(crate) timings: RawBoundaryTimings,
 }
 
@@ -377,6 +382,11 @@ pub(crate) enum RewriteOutcome {
     /// No emission, with whatever attribution was available.
     Degraded {
         reason: String,
+        /// Byte-identical unmodified root input handed back to the pipeline.
+        source: String,
+        /// Byte-identical unmodified input file set. This is never a partially
+        /// rewritten attempt.
+        files: std::collections::BTreeMap<plan::FileKey, String>,
         degradations: Vec<decision::Degradation>,
         excluded: decision::universe::Excluded,
         /// **Observability of the ATTEMPT.** A crate that fails the gate still
@@ -589,43 +599,69 @@ pub(crate) fn rewrite_m1_path(root: &std::path::Path) -> RewriteOutcome {
 /// report whose values permute between runs is not comparable. Compiling the
 /// string as `<main.rs>` keeps attribution stable, and the emission logic below
 /// is shared regardless, which is what the one-path ruling is actually about.
-/// **(C) — threshold bisect.** Escalation path when attribution is wrong.
-///
-/// Binary-searches the smallest `k` such that reverting the first `k` candidates
-/// (in deterministic sorted order) makes the crate compile. Reverting ALL of
-/// them always compiles — that is the original program — so the search always
-/// terminates, in `ceil(log2(n+1))` probes.
-///
-/// **NOT minimal-set ddmin, and deliberately so.** The result depends on the
-/// candidate order, so it may revert more than strictly necessary. What it buys
-/// is a bounded, terminating escalation that does not trust attribution — which
-/// is exactly what the detector escalated for. A minimal-set search is
-/// `O(n log n)` probes in the bad case, and at brotli's 566 s per compile that
-/// is not affordable; the non-minimality is the price of the budget.
-fn bisect(
-    candidates: &[bridge_receipt::SignatureClassId],
+/// Dependency-group split/recurse recovery. It tests each half independently;
+/// when both halves are necessary it minimizes one while holding the other,
+/// then vice versa. No alphabetical function prefix enters the search.
+fn recover_class_groups(
+    candidates: &[Vec<bridge_receipt::SignatureClassId>],
     base: &std::collections::BTreeSet<bridge_receipt::SignatureClassId>,
     mut compiles: impl FnMut(&std::collections::BTreeSet<bridge_receipt::SignatureClassId>) -> bool,
 ) -> (
     std::collections::BTreeSet<bridge_receipt::SignatureClassId>,
     usize,
 ) {
-    let (mut lo, mut hi) = (0usize, candidates.len());
-    let mut probes = 0usize;
-    while lo < hi {
-        let mid = lo + (hi - lo) / 2;
-        let mut trial = base.clone();
-        trial.extend(candidates[..mid].iter().cloned());
-        probes += 1;
-        if compiles(&trial) {
-            hi = mid;
-        } else {
-            lo = mid + 1;
+    fn minimize<F>(
+        groups: &[Vec<bridge_receipt::SignatureClassId>],
+        base: &std::collections::BTreeSet<bridge_receipt::SignatureClassId>,
+        compiles: &mut F,
+        probes: &mut usize,
+    ) -> std::collections::BTreeSet<bridge_receipt::SignatureClassId>
+    where
+        F: FnMut(&std::collections::BTreeSet<bridge_receipt::SignatureClassId>) -> bool,
+    {
+        if groups.is_empty() {
+            return std::collections::BTreeSet::new();
         }
+        if groups.len() == 1 {
+            return groups[0].iter().copied().collect();
+        }
+        let mid = groups.len() / 2;
+        let (left, right) = groups.split_at(mid);
+        let trial = |base: &std::collections::BTreeSet<_>, groups: &[Vec<_>]| {
+            let mut out = base.clone();
+            out.extend(groups.iter().flatten().copied());
+            out
+        };
+
+        let left_trial = trial(base, left);
+        *probes += 1;
+        if compiles(&left_trial) {
+            return minimize(left, base, compiles, probes);
+        }
+        let right_trial = trial(base, right);
+        *probes += 1;
+        if compiles(&right_trial) {
+            return minimize(right, base, compiles, probes);
+        }
+
+        let mut base_with_right = base.clone();
+        base_with_right.extend(right.iter().flatten().copied());
+        let left_min = minimize(left, &base_with_right, compiles, probes);
+        let mut base_with_left = base.clone();
+        base_with_left.extend(left_min.iter().copied());
+        let right_min = minimize(right, &base_with_left, compiles, probes);
+        left_min.union(&right_min).copied().collect()
     }
+
+    let mut probes = 0usize;
+    let selected = minimize(candidates, base, &mut compiles, &mut probes);
     let mut result = base.clone();
-    result.extend(candidates[..lo].iter().cloned());
+    result.extend(selected);
     (result, probes)
+}
+
+fn recovery_budget_deferred(projected_probes: f64, probe_secs: f64, budget_secs: f64) -> bool {
+    projected_probes * probe_secs > budget_secs
 }
 
 /// Test-only entry that lowers the round cap, so the CAP arm of the dual
@@ -754,6 +790,20 @@ fn rewrite_core_injected_with_config(
         rustc_session::config::Input::Str { input, .. } => Some(input.clone()),
         rustc_session::config::Input::File(_) => None,
     };
+    let fallback_source = virtual_original
+        .clone()
+        .or_else(|| tree_base.and_then(|root| std::fs::read_to_string(root).ok()))
+        .unwrap_or_default();
+    let fallback_files = match tree_base {
+        Some(root) => std::collections::BTreeMap::from([(
+            plan::FileKey::Real(root.to_path_buf()),
+            fallback_source.clone(),
+        )]),
+        None => std::collections::BTreeMap::from([(
+            plan::FileKey::Virtual("main.rs".to_owned()),
+            fallback_source.clone(),
+        )]),
+    };
     let root_hint = tree_base;
     let result = ::utils::compilation::run_compiler_on_input(input, |tcx| {
         // **THE ONE AST CAPTURE PER SESSION — hoisted here, and this position is
@@ -779,6 +829,31 @@ fn rewrite_core_injected_with_config(
         let a5_receipt = decide_ctx.a5_receipt.clone();
         inject(&mut table);
         let table = table;
+        let source_map = tcx.sess.source_map();
+        let crate_dir = tree_base.and_then(std::path::Path::parent);
+        let original_files = source_map
+            .files()
+            .iter()
+            .filter_map(|source_file| {
+                let key = file_key(&source_file.name)?;
+                if let (Some(crate_dir), plan::FileKey::Real(path)) = (crate_dir, &key)
+                    && !path.starts_with(crate_dir)
+                {
+                    return None;
+                }
+                source_file
+                    .src
+                    .as_ref()
+                    .map(|source| (key, source.to_string()))
+            })
+            .collect::<std::collections::BTreeMap<_, _>>();
+        let original_source = virtual_original.clone().unwrap_or_else(|| {
+            tree_base
+                .and_then(|root| original_files.get(&plan::FileKey::Real(root.to_path_buf())))
+                .cloned()
+                .or_else(|| tree_base.and_then(|root| std::fs::read_to_string(root).ok()))
+                .unwrap_or_default()
+        });
         let emission = emit_files(
             tcx,
             &table,
@@ -963,6 +1038,8 @@ fn rewrite_core_injected_with_config(
             emission.files,
             emission_plan,
             emission_texts,
+            original_files,
+            original_source,
             emission.unplaceable,
             degradations,
             emitted_subjects.len(),
@@ -981,8 +1058,18 @@ fn rewrite_core_injected_with_config(
         Ok(Ok(outcome)) => outcome,
         // Nothing was decided, so the facts are genuinely empty here — the one
         // place a zero is the measurement rather than an omission.
-        Ok(Err(reason)) => OutcomeFacts::default().degraded(reason),
-        Err(_) => OutcomeFacts::default().degraded("input crate did not compile".to_owned()),
+        Ok(Err(reason)) => OutcomeFacts {
+            original_source: fallback_source.clone(),
+            original_files: fallback_files.clone(),
+            ..OutcomeFacts::default()
+        }
+        .degraded(reason),
+        Err(_) => OutcomeFacts {
+            original_source: fallback_source,
+            original_files: fallback_files,
+            ..OutcomeFacts::default()
+        }
+        .degraded("input crate did not compile".to_owned()),
     }
 }
 
@@ -1027,7 +1114,7 @@ fn round_files(
     tcx: TyCtxt<'_>,
     capture: &ast_transform::AstCapture,
     emission_plan: &plan::Plan,
-    emission_texts: &std::collections::BTreeMap<plan::FileKey, String>,
+    _emission_texts: &std::collections::BTreeMap<plan::FileKey, String>,
     reverted: &std::collections::BTreeSet<bridge_receipt::SignatureClassId>,
     reverted_atoms: &std::collections::BTreeSet<String>,
     root_key: Option<&plan::FileKey>,
@@ -1076,6 +1163,8 @@ fn verify_and_revert(
     files: std::collections::BTreeMap<plan::FileKey, String>,
     emission_plan: plan::Plan,
     emission_texts: std::collections::BTreeMap<plan::FileKey, String>,
+    original_files: std::collections::BTreeMap<plan::FileKey, String>,
+    original_source: String,
     unplaceable: Vec<plan::Unplaceable>,
     degradations: Vec<decision::Degradation>,
     emitted_count: usize,
@@ -1127,6 +1216,7 @@ fn verify_and_revert(
             .entry(subject.owner_class)
             .or_insert_with(|| subject.owner_path.clone());
     }
+    let all_ready_classes = ready_classes(&emission_plan);
     // BASELINE-DIFFERENTIAL GATE. The gate judges what the REWRITE
     // introduced, not what the input already reported: brotli's frozen
     // source trips a deny-by-default lint unedited, which made
@@ -1165,7 +1255,7 @@ fn verify_and_revert(
     let root_key: Option<plan::FileKey> = files.keys().next().cloned();
     // Round 0 comes from `emit_files`, which returns only files it edited, so
     // the seed is already the ruled definition.
-    let mut files_edited = files.len();
+    let files_edited = files.len();
     let planned_edit_sites = edit_sites(&emission_plan, &emission_texts);
     let nested_seam_composition = emission_plan.by_file.values().any(|edits| {
         edits
@@ -1180,6 +1270,12 @@ fn verify_and_revert(
     };
     let mut baseline: Option<verify::Baseline> = None;
     let mut facts = OutcomeFacts {
+        original_source,
+        original_files,
+        verify_started: Some(std::time::Instant::now()),
+        signature_class_count: emission_plan.class_finalization.classes.len(),
+        emit_budget_s: std::env::var("CRAT_BOC1_EMIT_TIMEOUT_SECS")
+            .unwrap_or_else(|_| "900".to_owned()),
         degradations,
         excluded,
         emitted_count,
@@ -1236,6 +1332,8 @@ fn verify_and_revert(
     let mut reverted_atoms: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     let mut atom_reverify_count = 0usize;
     let mut pending_atom_retry: Option<(String, Vec<String>)> = None;
+    let mut class_attempts =
+        std::collections::BTreeMap::<bridge_receipt::SignatureClassId, usize>::new();
     let mut census_captured = false;
     // **ROUND 0 THROUGH THE SWITCH — the FOURTH site** (ruling 2026-08-18).
     //
@@ -1585,6 +1683,20 @@ fn verify_and_revert(
                         atoms.join(";")
                     ));
             }
+            if !reverted.is_empty() && all_ready_classes.is_subset(&reverted) {
+                facts.reverted_count = reverted.len();
+                facts.raw_boundary_artifacts.bridge_events = emission_plan.bridge_events(&reverted);
+                record_unresolved_classes(
+                    &mut facts.raw_boundary_artifacts,
+                    &all_ready_classes,
+                    &class_paths,
+                    "revert-all-is-not-recovery",
+                );
+                return facts.degraded(
+                    "recovery-degraded: reverting every ready signature class is not success"
+                        .to_owned(),
+                );
+            }
             let source = std::fs::read_to_string(staged.root()).unwrap_or_default();
             let (kept, taken): (Vec<_>, Vec<_>) = emitted_subjects.iter().partition(|subject| {
                 !reverted.contains(&subject.owner_class)
@@ -1754,6 +1866,29 @@ fn verify_and_revert(
             ));
             break;
         }
+        let over_attempted = newly
+            .iter()
+            .copied()
+            .filter(|class| {
+                let attempts = class_attempts.entry(*class).or_default();
+                *attempts += 1;
+                *attempts > MAX_CLASS_ATTEMPTS
+            })
+            .collect::<std::collections::BTreeSet<_>>();
+        if !over_attempted.is_empty() {
+            facts.files_touched = files_edited;
+            facts.reverted_count = reverted.len();
+            record_unresolved_classes(
+                &mut facts.raw_boundary_artifacts,
+                &over_attempted,
+                &class_paths,
+                "per-class-attempt-limit",
+            );
+            return facts.degraded(format!(
+                "recovery-degraded: {} signature class(es) exceeded MAX_CLASS_ATTEMPTS={MAX_CLASS_ATTEMPTS}",
+                over_attempted.len()
+            ));
+        }
         // BATCH revert: the union of this round's attributions, not one
         // at a time — one compile per round rather than one per function.
         reverted.extend(newly);
@@ -1799,47 +1934,50 @@ fn verify_and_revert(
     );
 
     let escalation = escalation.unwrap_or_else(|| "escalation-required".to_owned());
-    // Candidates come from the PLAN's `owner_fn` domain — the exact key
-    // `render` filters on — so `base ∪ candidates` drops EVERY edit and
-    // the base case (revert-all compiles) holds BY CONSTRUCTION.
-    //
-    // They were previously derived from `emitted_sites`, a DIFFERENT
-    // derivation: it skips a subject whose enclosing function's span has
-    // no editable file identity, while the edit is keyed on the
-    // subject's own `ty_span`. brotli found the divergence (2026-07-31):
-    // reverting every candidate left edits standing, the crate still
-    // failed, and bisect returned a non-compiling set. Two derivations
-    // assumed identical — the founding class.
-    let candidates: Vec<bridge_receipt::SignatureClassId> = emission_plan
-        .by_file
-        .values()
-        .flatten()
-        .filter_map(|edit| edit.owner_class)
-        .filter(|owner| !reverted.contains(owner))
-        .collect::<std::collections::BTreeSet<_>>()
+    let recovery_base =
+        plan::dependent_closure(&emission_plan.class_finalization.classes, &reverted);
+    let candidates = plan::dependency_scc_order(&emission_plan.class_finalization.classes)
         .into_iter()
-        .collect();
+        .map(|group| {
+            group
+                .into_iter()
+                .filter(|class| all_ready_classes.contains(class) && !recovery_base.contains(class))
+                .collect::<Vec<_>>()
+        })
+        .filter(|group| !group.is_empty())
+        .collect::<Vec<_>>();
+    let unresolved_candidates = candidates
+        .iter()
+        .flatten()
+        .copied()
+        .collect::<std::collections::BTreeSet<_>>();
 
     // ESCALATION BUDGET. A bisect that cannot finish inside the worker
     // budget is DEFERRED LOUDLY with its attribution state, never
     // silently truncated — a truncated bisect returns a wrong answer
     // that looks like a right one.
-    let projected = (candidates.len() + 1).next_power_of_two().trailing_zeros() as f64;
+    let projected = candidates.len().saturating_mul(3).saturating_add(1) as f64;
     let budget_secs = std::env::var("CRAT_BOC1_EMIT_TIMEOUT_SECS")
         .ok()
         .and_then(|v| v.parse::<f64>().ok())
         .unwrap_or(900.0);
-    if projected * probe_secs > budget_secs {
+    if recovery_budget_deferred(projected, probe_secs, budget_secs) {
         facts.files_touched = files_edited;
-        facts.reverted_count = reverted.len();
+        facts.reverted_count = recovery_base.len();
         facts.escalated = Some(escalation.clone());
+        record_unresolved_classes(
+            &mut facts.raw_boundary_artifacts,
+            &unresolved_candidates,
+            &class_paths,
+            "budget-deferral",
+        );
         return facts.degraded(format!(
-            "escalation-deferred: {escalation}; bisect needs ~{projected} probe(s)                          at ~{probe_secs:.1}s each against a {budget_secs:.0}s budget, with                          {} function(s) already reverted",
-            reverted.len()
+            "escalation-deferred: {escalation}; class recovery needs ~{projected} probe(s) at ~{probe_secs:.1}s each against a {budget_secs:.0}s budget, with {} class(es) already reverted",
+            recovery_base.len()
         ));
     }
 
-    let (final_reverted, probes) = bisect(&candidates, &reverted, |trial| {
+    let (final_reverted, probes) = recover_class_groups(&candidates, &recovery_base, |trial| {
         let Ok((trial_files, rollbacks, _, _)) = round_files(
             tcx,
             capture,
@@ -1867,6 +2005,27 @@ fn verify_and_revert(
         baseline.novel(&probe.diags, probe_root).is_empty()
             && probe.errors.saturating_sub(baseline.errors) == 0
     });
+    facts.bisect_probes = probes;
+    if !plan::strict_recovery_subset(&all_ready_classes, &final_reverted) {
+        let unresolved = if unresolved_candidates.is_empty() {
+            all_ready_classes.clone()
+        } else {
+            unresolved_candidates
+        };
+        facts.files_touched = files_edited;
+        facts.reverted_count = final_reverted.len();
+        facts.escalated = Some(escalation.clone());
+        facts.raw_boundary_artifacts.bridge_events = emission_plan.bridge_events(&final_reverted);
+        record_unresolved_classes(
+            &mut facts.raw_boundary_artifacts,
+            &unresolved,
+            &class_paths,
+            "revert-all-is-not-recovery",
+        );
+        return facts.degraded(format!(
+            "recovery-degraded: {escalation}; class recovery found no strict compiling subset"
+        ));
+    }
 
     // **THE THIRD SITE — routed through `round_files` like the other two**
     // (ruling 2026-08-18). This called `render` directly, with no layer
@@ -1894,6 +2053,16 @@ fn verify_and_revert(
             facts.reverted_count = final_reverted.len();
             facts.bisect_probes = probes;
             facts.escalated = Some(escalation.clone());
+            let unresolved = all_ready_classes
+                .difference(&final_reverted)
+                .copied()
+                .collect::<std::collections::BTreeSet<_>>();
+            record_unresolved_classes(
+                &mut facts.raw_boundary_artifacts,
+                &unresolved,
+                &class_paths,
+                "final-reemit-failed",
+            );
             return facts.degraded(format!("{escalation}; final re-emit failed: {why}"));
         }
     };
@@ -1969,6 +2138,16 @@ fn verify_and_revert(
             facts.reverted_count = final_reverted.len();
             facts.bisect_probes = probes;
             facts.escalated = Some(escalation.clone());
+            let unresolved = all_ready_classes
+                .difference(&final_reverted)
+                .copied()
+                .collect::<std::collections::BTreeSet<_>>();
+            record_unresolved_classes(
+                &mut facts.raw_boundary_artifacts,
+                &unresolved,
+                &class_paths,
+                "final-verify-failed",
+            );
             facts.degraded(format!("{escalation}; bisect did not recover the crate"))
         }
     }
@@ -2574,6 +2753,11 @@ pub(crate) fn diagnose_raw_boundary_census_with_config(
 /// are the only places the variants may be built — enforced by a scan.
 #[derive(Clone, Debug, Default)]
 struct OutcomeFacts {
+    original_source: String,
+    original_files: std::collections::BTreeMap<plan::FileKey, String>,
+    verify_started: Option<std::time::Instant>,
+    signature_class_count: usize,
+    emit_budget_s: String,
     degradations: Vec<decision::Degradation>,
     excluded: decision::universe::Excluded,
     /// Subjects still emitted. **Observability of the ATTEMPT** on a failure —
@@ -2832,11 +3016,37 @@ impl RewriteOutcome {
 }
 
 impl OutcomeFacts {
+    fn stamp_class_costs(&mut self) {
+        let verify_wall_s = self
+            .verify_started
+            .map_or(0.0, |started| started.elapsed().as_secs_f64());
+        let hits = &self.raw_boundary_artifacts.attribution_hits;
+        self.raw_boundary_artifacts.signature_class_count = self.signature_class_count;
+        self.raw_boundary_artifacts.class_bisect_probes = self.bisect_probes;
+        self.raw_boundary_artifacts.class_verify_rounds = self.verify_rounds;
+        self.raw_boundary_artifacts.verify_wall_s = format!("{verify_wall_s:.6}");
+        self.raw_boundary_artifacts.emit_budget_s = self.emit_budget_s.clone();
+        self.raw_boundary_artifacts.class_costs = format!(
+            "{}-\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{verify_wall_s:.6}\t{}\n",
+            bridge_receipt::class_cost_header(),
+            self.signature_class_count,
+            hits.exact_edit,
+            hits.exact_seam,
+            hits.related_span,
+            hits.enclosing_region,
+            hits.unresolved,
+            self.bisect_probes,
+            self.verify_rounds,
+            self.emit_budget_s,
+        );
+    }
+
     fn emitted(
-        self,
+        mut self,
         source: String,
         files: std::collections::BTreeMap<plan::FileKey, String>,
     ) -> RewriteOutcome {
+        self.stamp_class_costs();
         RewriteOutcome::Emitted {
             source,
             files,
@@ -2868,9 +3078,20 @@ impl OutcomeFacts {
         }
     }
 
-    fn degraded(self, reason: String) -> RewriteOutcome {
+    fn degraded(mut self, reason: String) -> RewriteOutcome {
+        self.raw_boundary_artifacts.degraded_output_receipt =
+            "degraded-unmodified-input".to_owned();
+        for event in &mut self.raw_boundary_artifacts.bridge_events {
+            if event.stage == bridge_receipt::BridgeReceiptStage::Terminal {
+                event.state = bridge_receipt::BridgeReceiptState::Dropped;
+                event.drop_reason = Some("program-degraded-unmodified-input".to_owned());
+            }
+        }
+        self.stamp_class_costs();
         RewriteOutcome::Degraded {
             reason,
+            source: self.original_source,
+            files: self.original_files,
             degradations: self.degradations,
             excluded: self.excluded,
             emitted_count: self.emitted_count,
@@ -2902,6 +3123,7 @@ impl OutcomeFacts {
 /// Hard ceiling on revert rounds. Paired with the no-progress detector, never
 /// relied on alone: a cap that fires is a loop that stopped being understood.
 const MAX_REVERT_ROUNDS: usize = 8;
+const MAX_CLASS_ATTEMPTS: usize = 3;
 /// Raw-boundary atom mode is one bounded retry, never a repair loop.
 const MAX_ATOM_REVERIFIES: usize = 1;
 
@@ -3021,6 +3243,38 @@ fn render_class_collisions(plan: &plan::Plan) -> String {
         ));
     }
     out
+}
+
+fn ready_classes(
+    plan: &plan::Plan,
+) -> std::collections::BTreeSet<bridge_receipt::SignatureClassId> {
+    plan.class_finalization
+        .classes
+        .values()
+        .filter(|class| class.is_ready())
+        .map(|class| class.id)
+        .collect()
+}
+
+fn record_unresolved_classes(
+    artifacts: &mut RawBoundaryArtifacts,
+    classes: &std::collections::BTreeSet<bridge_receipt::SignatureClassId>,
+    display_paths: &std::collections::BTreeMap<bridge_receipt::SignatureClassId, String>,
+    reason: &str,
+) {
+    let reason = reason.replace(['\t', '\r', '\n'], " ");
+    let mut out = bridge_receipt::unresolved_class_header();
+    for class in classes {
+        out.push_str(&format!(
+            "-\t{}\t{}\t{}\n",
+            class.order_key(),
+            display_paths
+                .get(class)
+                .map_or("<unknown-local-class>", String::as_str),
+            reason,
+        ));
+    }
+    artifacts.unresolved_classes = out;
 }
 
 /// Pure selection over original-source lines. Production first translates
@@ -4672,6 +4926,7 @@ fn finish_decide<'tcx>(
     table.arm_requirements = derive_arm_requirements(&subjects, &coconv, &raw_boundary, &exposure);
     let seam_wall_s = seam_started.elapsed().as_secs_f64();
     let raw_boundary_render_wall_s = seam_started.elapsed().as_secs_f64();
+    let c9_before_final_filter = retained_c9_plans.len();
     retained_c9_plans.retain(|mark| {
         let call_span = mark.call_span.source_callsite();
         let caller = tcx.def_path_str(mark.caller_did.to_def_id());
@@ -4698,6 +4953,18 @@ fn finish_decide<'tcx>(
                 })
             })
     });
+    if retained_c9_plans.len() != c9_before_final_filter {
+        table.seams = decision::seam::synthesize_with_raw_boundary(
+            tcx,
+            &facts,
+            &subjects,
+            &table,
+            &retained_c9_plans,
+            &a5_site_proofs,
+            &raw_boundary,
+            &coconv,
+        );
+    }
     table.c9_marks = retained_c9_plans.clone();
     let table = table;
 
@@ -4749,6 +5016,11 @@ fn finish_decide<'tcx>(
         degraded_output_receipt: "not-applicable".to_owned(),
         per_arm_timers_status: "queued-no-free-column".to_owned(),
         attribution_hits: AttributionHits::default(),
+        signature_class_count: 0,
+        class_bisect_probes: 0,
+        class_verify_rounds: 0,
+        verify_wall_s: "pending".to_owned(),
+        emit_budget_s: "900".to_owned(),
         timings: RawBoundaryTimings {
             site_derivation_wall_s: format!("{raw_boundary_site_derivation_wall_s:.6}"),
             retention_fixpoint_wall_s: format!("{retention_fixpoint_wall_s:.6}"),

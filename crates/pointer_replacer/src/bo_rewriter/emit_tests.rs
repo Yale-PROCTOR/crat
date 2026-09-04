@@ -7,7 +7,7 @@
 //! is not a question the goldens could ever have asked.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fs,
     path::PathBuf,
     sync::atomic::{AtomicUsize, Ordering},
@@ -1541,8 +1541,48 @@ fn an_unedited_caller_error_reverts_only_converted_callee_class() {
             assert_eq!(bisect_probes, 0, "direct attribution invoked bisect");
             assert_eq!(reverted_count, 1, "more than the callee class reverted");
         }
-        super::RewriteOutcome::Degraded { reason, .. } => {
-            panic!("bisect failed to recover the inverted shape: {reason}")
+        super::RewriteOutcome::Degraded {
+            reason,
+            source,
+            files,
+            reverted_count,
+            bisect_probes,
+            raw_boundary_artifacts,
+            ..
+        } => {
+            assert!(reason.contains("reverting every ready signature class"));
+            assert_eq!(reverted_count, 1);
+            assert_eq!(bisect_probes, 0);
+            assert_eq!(
+                source,
+                std::fs::read_to_string(fixture.root()).expect("root input")
+            );
+            for (key, text) in files {
+                if let super::plan::FileKey::Real(path) = key {
+                    assert_eq!(text, std::fs::read_to_string(path).expect("input file"));
+                }
+            }
+            assert_eq!(
+                raw_boundary_artifacts
+                    .unresolved_classes
+                    .lines()
+                    .skip(1)
+                    .count(),
+                1
+            );
+            assert_eq!(
+                raw_boundary_artifacts.degraded_output_receipt,
+                "degraded-unmodified-input"
+            );
+            assert!(raw_boundary_artifacts.bridge_events.iter().all(|event| {
+                event.stage != super::bridge_receipt::BridgeReceiptStage::Terminal
+                    || event.state == super::bridge_receipt::BridgeReceiptState::Dropped
+            }));
+            let summary = super::bridge_receipt::reconcile_bridge_events(
+                &raw_boundary_artifacts.bridge_events,
+            )
+            .expect("Degraded terminal receipts reconcile");
+            assert_eq!(summary.applied_events, 0);
         }
     }
 }
@@ -5378,6 +5418,79 @@ mod attribution_and_escapes {
     }
 }
 
+#[test]
+fn deg_w1_degraded_carries_byte_identical_unmodified_input_tree() {
+    let key = super::plan::FileKey::Virtual("main.rs".to_owned());
+    let module_key = super::plan::FileKey::Virtual("module.rs".to_owned());
+    let original = "pub fn unchanged() {}\n".to_owned();
+    let module = "pub fn module_unchanged() {}\n".to_owned();
+    let outcome = super::OutcomeFacts {
+        original_source: original.clone(),
+        original_files: BTreeMap::from([
+            (key.clone(), original.clone()),
+            (module_key.clone(), module.clone()),
+        ]),
+        ..super::OutcomeFacts::default()
+    }
+    .degraded("forced-guard".to_owned());
+    let super::RewriteOutcome::Degraded {
+        source,
+        files,
+        raw_boundary_artifacts,
+        ..
+    } = outcome
+    else {
+        panic!("forced outcome must degrade")
+    };
+    assert_eq!(source, original);
+    assert_eq!(files, BTreeMap::from([(key, source), (module_key, module)]));
+    assert_eq!(
+        raw_boundary_artifacts.degraded_output_receipt,
+        "degraded-unmodified-input"
+    );
+}
+
+#[test]
+fn cls_w5_w6_recovery_replays_are_class_bounded_and_strict() {
+    let source = (0..70)
+        .map(|index| format!("pub fn class_{index}() {{}}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    ::utils::compilation::run_compiler_on_str(&source, |tcx| {
+        let mut ids = tcx
+            .hir_body_owners()
+            .map(super::bridge_receipt::SignatureClassId::of)
+            .collect::<Vec<_>>();
+        ids.sort();
+        let heman_first_round = ids[..7].iter().copied().collect::<BTreeSet<_>>();
+        assert_eq!(
+            heman_first_round.len(),
+            7,
+            "seven diagnostics exceeded seven classes"
+        );
+
+        for population in [66usize, 34usize] {
+            let groups = ids[..population]
+                .iter()
+                .copied()
+                .map(|id| vec![id])
+                .collect::<Vec<_>>();
+            let culprit = ids[2];
+            let ready = ids[..population].iter().copied().collect::<BTreeSet<_>>();
+            let (reverted, probes) =
+                super::recover_class_groups(&groups, &BTreeSet::new(), |trial| {
+                    trial.contains(&culprit)
+                });
+            assert!(probes > 0);
+            assert!(super::plan::strict_recovery_subset(&ready, &reverted));
+        }
+    })
+    .expect("recovery replay fixture compiles");
+
+    assert!(super::recovery_budget_deferred(4.0, 3.0, 10.0));
+    assert!(!super::recovery_budget_deferred(4.0, 2.0, 10.0));
+}
+
 /// **THE SEAM, END TO END.** A callee whose parameter takes the optional form,
 /// called with a plain `&mut` — the caller's argument gets `Some(..)` glue.
 ///
@@ -6703,25 +6816,32 @@ fn e2_w2_local_reassignment_keeps_signature_origins_distinct() {
         ),
         &|_| {},
     );
-    let super::RewriteOutcome::Emitted {
+    let super::RewriteOutcome::Degraded {
+        source: degraded_source,
         files,
         reverted_count,
+        raw_boundary_artifacts,
         ..
     } = outcome
     else {
-        panic!("E2-W2 emitted signature failed: plan={plan_dump}; outcome={outcome:#?}");
+        panic!("E2-W2 must type Degraded after revert-all: plan={plan_dump}; outcome={outcome:#?}");
     };
-    let emitted = files
+    let unmodified = files
         .values()
         .find(|text| text.contains("fn cross"))
-        .expect("E2-W2 emitted function");
-    assert!(reverted_count >= 1, "plan={plan_dump}; emitted={emitted}");
+        .expect("E2-W2 unmodified function");
+    assert!(reverted_count >= 1, "plan={plan_dump}; source={unmodified}");
+    assert_eq!(degraded_source, source);
     assert!(
-        emitted.contains("mut a: *const i32")
-            && emitted.contains("mut b: *const i32")
-            && !emitted.contains("fn cross<'"),
+        unmodified.contains("mut a: *const i32")
+            && unmodified.contains("mut b: *const i32")
+            && !unmodified.contains("fn cross<'"),
         "the precision-side negative must revert, never unify by convenience: \
-         plan={plan_dump}; emitted={emitted}",
+         plan={plan_dump}; source={unmodified}",
+    );
+    assert_eq!(
+        raw_boundary_artifacts.degraded_output_receipt,
+        "degraded-unmodified-input"
     );
 }
 
