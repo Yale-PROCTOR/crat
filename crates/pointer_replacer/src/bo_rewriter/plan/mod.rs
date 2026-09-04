@@ -437,9 +437,20 @@ pub(crate) fn finalize_class_inputs(inputs: Vec<ClassInput>) -> ClassFinalizatio
         .cloned()
         .collect::<Vec<_>>();
     let mut collisions = Vec::new();
+    let mut intra_class_collisions = std::collections::BTreeSet::new();
     for (left_index, left) in all_sites.iter().enumerate() {
         for right in &all_sites[left_index + 1..] {
-            if left.key.owner_class == right.key.owner_class || !intervals_overlap(left, right) {
+            if !intervals_overlap(left, right) {
+                continue;
+            }
+            if left.key.owner_class == right.key.owner_class {
+                // Exact duplicate sites are normalized below. Any other pair
+                // would ask the flat splicer to apply two independently
+                // rendered edits to one source interval. Hold the atomic class
+                // unless a future producer explicitly composes them.
+                if left.key != right.key || left.edit_key != right.edit_key {
+                    intra_class_collisions.insert(left.key.owner_class);
+                }
                 continue;
             }
             let (left, right) = if left.key.owner_class <= right.key.owner_class {
@@ -461,6 +472,14 @@ pub(crate) fn finalize_class_inputs(inputs: Vec<ClassInput>) -> ClassFinalizatio
                 right_kind: right.key.bridge_kind.clone(),
             });
         }
+    }
+
+    for class in intra_class_collisions {
+        merged
+            .get_mut(&class)
+            .expect("intra-class collision came from merged inputs")
+            .block_reasons
+            .push("intra-class-interval-overlap".to_owned());
     }
     collisions.sort_by(|left, right| {
         (
@@ -2346,6 +2365,48 @@ mod wave3_class_tests {
             assert!(!finalized.classes[&ids[0]].is_ready());
             assert!(!finalized.classes[&ids[1]].is_ready());
             assert_eq!(finalized.applied_site_count(), 0);
+        });
+    }
+
+    /// D2-W1 — the heman/kazmath failure shape: two edits owned by one
+    /// signature class overlap before application.  The finalizer must hold
+    /// the class rather than let either interval reach the flat splicer.
+    #[test]
+    fn d2_w1_intra_class_interval_overlap_holds_before_apply() {
+        use crate::bo_rewriter::decision::Arm;
+        with_classes(1, |ids| {
+            let owner = ids[0];
+            let input = ClassInput::new(owner, arms(&[Arm::Surface, Arm::C]))
+                .with_site(ClassSite::edit(
+                    owner,
+                    owner,
+                    Arm::Surface,
+                    "kazmath.rs",
+                    42240,
+                    42260,
+                    "outer-signature-edit",
+                ))
+                .with_site(ClassSite::edit(
+                    owner,
+                    owner,
+                    Arm::C,
+                    "kazmath.rs",
+                    42252,
+                    42255,
+                    "nested-call-edit",
+                ));
+            let finalized = finalize_class_inputs(vec![input]);
+            let class = &finalized.classes[&owner];
+            assert!(!class.is_ready());
+            assert_eq!(finalized.applied_site_count(), 0);
+            assert!(
+                class
+                    .hold_reasons()
+                    .iter()
+                    .any(|reason| reason == "intra-class-interval-overlap"),
+                "missing typed intra-class hold: {:?}",
+                class.hold_reasons()
+            );
         });
     }
 

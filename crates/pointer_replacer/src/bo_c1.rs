@@ -10372,9 +10372,11 @@ mod run {
             }
             Ok(Ok(capture)) => capture,
             Ok(Err(error)) => {
-                row.set(raw_schema::STATUS, "instrument-error");
-                row.set("detail", super::report::sanitize(&error));
-                row.set(raw_schema::SOLVER_INVOCATIONS, 0);
+                row = super::raw_boundary_capture_error_row(&error);
+                row.set(raw_schema::CODE_FRAME, &code_frame);
+                row.set(raw_schema::CACHE_STATUS, "hit");
+                row.set(raw_schema::CACHE_FINGERPRINT, &fingerprint);
+                row.set(raw_schema::SOLVE_WALL_S, "0.000000");
                 return row;
             }
         };
@@ -20759,9 +20761,44 @@ fn raw_boundary_worker_row(program: &str, outcome: &orchestrate::ChildOutcome) -
     row
 }
 
+fn raw_boundary_capture_error_row(error: &str) -> report::Row {
+    const PRE_COMPILE_PREFIX: &str = "E1 capture has no observed root: ";
+    let mut row = report::Row::default();
+    row.set(raw_schema::DATA, "false");
+    row.set(raw_schema::DELIVERY, "degraded");
+    row.set(raw_schema::SOLVER_INVOCATIONS, 0);
+    row.set_lossless_token(
+        raw_schema::ESCALATION_HEX,
+        &raw_boundary_lossless_encode(error),
+    );
+    if let Some(reason) = error.strip_prefix(PRE_COMPILE_PREFIX) {
+        row.set(
+            raw_schema::STATUS,
+            format!("degraded-pre-compile:{}", report::sanitize(reason)),
+        );
+        row.set(raw_schema::OUTCOME_KIND, "degraded-pre-compile");
+        row.set(
+            raw_schema::DEGRADED_OUTPUT_RECEIPT,
+            "degraded-unmodified-input",
+        );
+    } else {
+        row.set(raw_schema::STATUS, "instrument-error");
+        row.set(raw_schema::OUTCOME_KIND, "instrument-error");
+    }
+    row.set("detail", report::sanitize(error));
+    row
+}
+
+fn raw_boundary_typed_failure(row: &report::Row) -> bool {
+    row.get(raw_schema::STATUS).is_some_and(|status| {
+        status == "worker-abort"
+            || status == "instrument-error"
+            || status.starts_with("degraded-pre-compile:")
+    })
+}
+
 fn raw_boundary_rows_have_data(rows: &[report::Row]) -> bool {
-    rows.iter()
-        .all(|row| row.get(raw_schema::STATUS) != Some("worker-abort"))
+    rows.iter().all(|row| !raw_boundary_typed_failure(row))
 }
 
 #[test]
@@ -20809,6 +20846,33 @@ fn worker_abort_w1_is_typed_and_row_collection_continues() {
     );
     assert_eq!(rows[1].get(raw_schema::STATUS), Some("ok"));
     assert!(!raw_boundary_rows_have_data(&rows));
+}
+
+/// D2-W2 — a failure before compiler verification is still a typed program
+/// row, and a following program remains present in the collected evidence.
+#[test]
+fn d2_w2_pre_compile_degraded_row_makes_run_non_data_and_collection_continues() {
+    let degraded = raw_boundary_capture_error_row(
+        "E1 capture has no observed root: intra-class-interval-overlap",
+    );
+    let mut ok = report::Row::default();
+    ok.set(raw_schema::STATUS, "ok");
+    let rows = vec![degraded, ok];
+
+    assert_eq!(rows.len(), 2, "typed degradation stopped row collection");
+    assert_eq!(
+        rows[0].get(raw_schema::STATUS),
+        Some("degraded-pre-compile:intra-class-interval-overlap")
+    );
+    assert_eq!(
+        rows[0].get(raw_schema::DEGRADED_OUTPUT_RECEIPT),
+        Some("degraded-unmodified-input")
+    );
+    assert_eq!(rows[1].get(raw_schema::STATUS), Some("ok"));
+    assert!(
+        !raw_boundary_rows_have_data(&rows),
+        "pre-compile degradation must make the run data=false"
+    );
 }
 
 #[test]
@@ -20885,6 +20949,8 @@ fn raw_boundary_wave2_corpus_census() {
         "primary market population drift"
     );
     let recipe = STANDING_CENSUS_LAUNCH_RECIPE;
+    let diagnostic_run =
+        std::env::var("CRAT_RAW_BOUNDARY_RUN_KIND").is_ok_and(|kind| kind == "diagnostic");
     let mut rows = Vec::new();
     for program in CORPUS {
         let outcome = orchestrate::run_child_env_with_memory_limit_mib(
@@ -20896,10 +20962,15 @@ fn raw_boundary_wave2_corpus_census() {
             &recipe.raw_boundary_child_env(&cache_dir, &artifact_dir, &code_frame),
         );
         let row = raw_boundary_worker_row(program.name, &outcome);
-        if row.get(raw_schema::STATUS) == Some("worker-abort") {
+        if raw_boundary_typed_failure(&row)
+            && (row.get(raw_schema::STATUS) == Some("worker-abort") || diagnostic_run)
+        {
             eprintln!(
-                "RAW-BOUNDARY-CENSUS program={} stage=worker-abort rc=1 wall={:.3} rss={}",
-                program.name, outcome.wall_s, outcome.peak_rss_kb
+                "RAW-BOUNDARY-CENSUS program={} stage={} rc=1 wall={:.3} rss={}",
+                program.name,
+                row.get(raw_schema::STATUS).unwrap_or("typed-failure"),
+                outcome.wall_s,
+                outcome.peak_rss_kb
             );
             rows.push(row);
             continue;
@@ -20940,7 +21011,27 @@ fn raw_boundary_wave2_corpus_census() {
             .join("\n")
             + "\n";
         fs::write(artifact_dir.join("per-program.kv"), per_program)
-            .expect("write worker-abort per-program rows");
+            .expect("write typed-failure per-program rows");
+        let failures = rows
+            .iter()
+            .filter(|row| raw_boundary_typed_failure(row))
+            .collect::<Vec<_>>();
+        let mut failure_ledger = String::from("program\tstatus\tdetail\n");
+        for row in &failures {
+            let detail = row
+                .get(raw_schema::ESCALATION_HEX)
+                .and_then(|value| raw_boundary_lossless_decode(value).ok())
+                .or_else(|| row.get("detail").map(str::to_owned))
+                .unwrap_or_else(|| "unavailable".to_owned());
+            failure_ledger.push_str(&format!(
+                "{}\t{}\t{}\n",
+                row.get("program").unwrap_or("unknown"),
+                row.get(raw_schema::STATUS).unwrap_or("typed-failure"),
+                detail.replace(['\t', '\r', '\n'], " "),
+            ));
+        }
+        fs::write(artifact_dir.join("typed-failures.tsv"), failure_ledger)
+            .expect("write typed-failure ledger");
         let aborts = rows
             .iter()
             .filter(|row| row.get(raw_schema::STATUS) == Some("worker-abort"))
@@ -20970,22 +21061,24 @@ fn raw_boundary_wave2_corpus_census() {
         aggregate.set(raw_schema::CODE_FRAME, &code_frame);
         aggregate.set(raw_schema::DATA, "false");
         aggregate.set(raw_schema::DELIVERY, "degraded");
-        aggregate.set(raw_schema::STATUS, "worker-abort");
+        aggregate.set(raw_schema::STATUS, "typed-failure");
         aggregate.set(raw_schema::WORKER_ABORT_COUNT, aborts.len());
         fs::write(
             artifact_dir.join("aggregate.kv"),
             format!("{}\n", report::to_kv_line(&aggregate)),
         )
-        .expect("write worker-abort aggregate");
+        .expect("write typed-failure aggregate");
         fs::write(
             artifact_dir.join("census-receipt.txt"),
             format!(
-                "status=complete-with-worker-abort\ndata=false\ndelivery=degraded\nprograms=20/20\nworker_aborts={}\nin_run_repair=none\n",
-                aborts.len()
+                "status=complete-with-typed-failure\nrun_kind={}\ndata=false\ndelivery=degraded\nprograms=20/20\ntyped_failures={}\nworker_aborts={}\nin_run_repair=none\n",
+                if diagnostic_run { "diagnostic" } else { "formal" },
+                failures.len(),
+                aborts.len(),
             ),
         )
-        .expect("write worker-abort census receipt");
-        raw_boundary_write_manifest(&artifact_dir).expect("write worker-abort artifact manifest");
+        .expect("write typed-failure census receipt");
+        raw_boundary_write_manifest(&artifact_dir).expect("write typed-failure artifact manifest");
         return;
     }
     for row in &rows {
