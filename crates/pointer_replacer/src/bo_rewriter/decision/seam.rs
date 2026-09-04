@@ -2354,6 +2354,117 @@ mod tests {
         }
     }
 
+    /// D5-W1 — PAIR's T2 view has form-specific templates rather than
+    /// reusing the ordinary boundary selector, whose write-evidence gate and
+    /// subject assumptions do not describe this already-selected PAIR role.
+    #[test]
+    fn d5_w1_pair_t2_raw_views_cover_shared_slice_option_and_raw_expressions() {
+        use super::super::raw_boundary::{RawMutability, RawTargetType};
+
+        let target = |mutability: RawMutability| RawTargetType {
+            rendered: format!(
+                "*{} i32",
+                if mutability == RawMutability::Mut {
+                    "mut"
+                } else {
+                    "const"
+                }
+            ),
+            pointee: "i32".to_owned(),
+            mutability,
+            depth2: None,
+        };
+        let shared = Decision::Ref { mutable: false };
+        assert_eq!(
+            super::super::raw_boundary::pair_raw_view_expression(
+                Some(&shared),
+                &target(RawMutability::Const),
+                "value",
+                "bare-local",
+            ),
+            Some("core::ptr::from_ref(value)".to_owned())
+        );
+        let shared_slice = Decision::Slice {
+            mutable: false,
+            uses: Vec::new(),
+        };
+        assert_eq!(
+            super::super::raw_boundary::pair_raw_view_expression(
+                Some(&shared_slice),
+                &target(RawMutability::Const),
+                "values",
+                "bare-local",
+            ),
+            Some("values.as_ptr()".to_owned())
+        );
+        let mutable_slice = Decision::Slice {
+            mutable: true,
+            uses: Vec::new(),
+        };
+        assert_eq!(
+            super::super::raw_boundary::pair_raw_view_expression(
+                Some(&mutable_slice),
+                &target(RawMutability::Mut),
+                "values",
+                "bare-local",
+            ),
+            Some("values.as_mut_ptr()".to_owned())
+        );
+        let optional = Decision::Opt {
+            mutable: false,
+            slice: false,
+            uses: Vec::new(),
+        };
+        assert_eq!(
+            super::super::raw_boundary::pair_raw_view_expression(
+                Some(&optional),
+                &target(RawMutability::Const),
+                "value",
+                "bare-local",
+            ),
+            Some(
+                "value.as_deref().map_or(core::ptr::null::<i32>(), core::ptr::from_ref)".to_owned()
+            )
+        );
+        let optional_slice = Decision::Opt {
+            mutable: true,
+            slice: true,
+            uses: Vec::new(),
+        };
+        assert_eq!(
+            super::super::raw_boundary::pair_raw_view_expression(
+                Some(&optional_slice),
+                &target(RawMutability::Mut),
+                "values",
+                "bare-local",
+            ),
+            Some(
+                "values.as_deref_mut().map_or(core::ptr::null_mut::<i32>(), |slice| slice.as_mut_ptr())"
+                    .to_owned()
+            )
+        );
+        assert_eq!(
+            super::super::raw_boundary::pair_raw_view_expression(
+                None,
+                &target(RawMutability::Const),
+                "array.as_ptr()",
+                "raw-expr",
+            ),
+            Some("array.as_ptr()".to_owned()),
+            "buffer/libzahl raw expressions are already a valid raw view"
+        );
+        assert_eq!(
+            super::super::raw_boundary::pair_raw_view_expression(
+                Some(&shared),
+                &target(RawMutability::Mut),
+                "value",
+                "bare-local",
+            ),
+            None,
+            "R-B forbids manufacturing a mutable raw pointer from shared data"
+        );
+    }
+
     /// Every `(spec, family)` `glue` can return, enumerated by driving `glue`
     /// over the whole `(expected, found)` product rather than by transcribing
     /// the arms a second time.
@@ -3720,26 +3831,15 @@ pub(crate) fn synthesize_with_raw_boundary(
             block_pair_raw_view(&mut plan, pair, "pair-raw-view-source-unplaceable");
             continue;
         };
-        let raw_expression = pair
+        let source_decision = pair
             .source_node
-            .and_then(|source_node| decision_of.get(&source_node).copied())
-            .and_then(|source_decision| {
-                let template =
-                    super::raw_boundary::template_for(source_decision, target, None, false).ok()?;
-                GlueSpec::raw_boundary_target(template, target, false, true).render(&argument)
-            })
-            .or_else(|| match (pair.source_shape, target.mutability) {
-                ("addr-of-mut", super::raw_boundary::RawMutability::Mut) => {
-                    Some(format!("core::ptr::from_mut({argument})"))
-                }
-                ("addr-of-mut", super::raw_boundary::RawMutability::Const) => {
-                    Some(format!("core::ptr::from_ref(&*{argument})"))
-                }
-                ("addr-of", super::raw_boundary::RawMutability::Const) => {
-                    Some(format!("core::ptr::from_ref({argument})"))
-                }
-                _ => None,
-            });
+            .and_then(|source_node| decision_of.get(&source_node).copied());
+        let raw_expression = super::raw_boundary::pair_raw_view_expression(
+            source_decision,
+            target,
+            &argument,
+            pair.source_shape,
+        );
         let Some(raw_expression) = raw_expression else {
             block_pair_raw_view(&mut plan, pair, "pair-raw-view-template-unavailable");
             continue;

@@ -130,6 +130,13 @@ impl RawTargetType {
 }
 
 fn bridge_type_path(tcx: TyCtxt<'_>, ty: Ty<'_>) -> String {
+    if let TyKind::RawPtr(pointee, mutability) = ty.kind() {
+        return format!(
+            "*{} {}",
+            if mutability.is_mut() { "mut" } else { "const" },
+            bridge_type_path(tcx, *pointee)
+        );
+    }
     let rendered = format!("{ty:?}");
     if rendered.rsplit("::").next() == Some("c_void") {
         return "core::ffi::c_void".to_owned();
@@ -185,7 +192,7 @@ pub(crate) fn raw_target_type(tcx: TyCtxt<'_>, ty: Ty<'_>) -> Option<RawTargetTy
         _ => None,
     };
     Some(RawTargetType {
-        rendered: format!("{ty:?}"),
+        rendered: bridge_type_path(tcx, ty),
         pointee: bridge_type_path(tcx, *pointee),
         mutability: if mutability.is_mut() {
             RawMutability::Mut
@@ -194,6 +201,71 @@ pub(crate) fn raw_target_type(tcx: TyCtxt<'_>, ty: Ty<'_>) -> Option<RawTargetTy
         },
         depth2,
     })
+}
+
+/// Render the already-selected same-object PAIR raw-view role.
+///
+/// This is intentionally distinct from [`template_for`]: PAIR has already
+/// established the T2 disposition and must describe the safe source's final
+/// form. Shared data still cannot produce a mutable raw pointer without the
+/// negative-write evidence required by R-B.
+pub(crate) fn pair_raw_view_expression(
+    source: Option<&super::Decision>,
+    target: &RawTargetType,
+    argument: &str,
+    source_shape: &str,
+) -> Option<String> {
+    use super::Decision;
+
+    let pointee = &target.pointee;
+    let raw_passthrough = || {
+        matches!(
+            source_shape,
+            "bare-local" | "cast-of-local" | "raw-expr" | "cast"
+        )
+        .then(|| argument.to_owned())
+    };
+    match source {
+        Some(Decision::Ref { mutable }) | Some(Decision::InferredRef { mutable, .. }) => {
+            match (*mutable, target.mutability) {
+                (true, RawMutability::Mut) => Some(format!("core::ptr::from_mut({argument})")),
+                (true, RawMutability::Const) => Some(format!("core::ptr::from_ref(&*{argument})")),
+                (false, RawMutability::Const) => Some(format!("core::ptr::from_ref({argument})")),
+                (false, RawMutability::Mut) => None,
+            }
+        }
+        Some(Decision::Slice { mutable, .. }) => match (*mutable, target.mutability) {
+            (true, RawMutability::Mut) => Some(format!("{argument}.as_mut_ptr()")),
+            (_, RawMutability::Const) => Some(format!("{argument}.as_ptr()")),
+            (false, RawMutability::Mut) => None,
+        },
+        Some(Decision::Opt { mutable, slice, .. }) => match (*mutable, *slice, target.mutability) {
+            (true, false, RawMutability::Mut) => Some(format!(
+                "{argument}.as_deref_mut().map_or(core::ptr::null_mut::<{pointee}>(), core::ptr::from_mut)"
+            )),
+            (_, false, RawMutability::Const) => Some(format!(
+                "{argument}.as_deref().map_or(core::ptr::null::<{pointee}>(), core::ptr::from_ref)"
+            )),
+            (true, true, RawMutability::Mut) => Some(format!(
+                "{argument}.as_deref_mut().map_or(core::ptr::null_mut::<{pointee}>(), |slice| slice.as_mut_ptr())"
+            )),
+            (_, true, RawMutability::Const) => Some(format!(
+                "{argument}.as_deref().map_or(core::ptr::null::<{pointee}>(), |slice| slice.as_ptr())"
+            )),
+            (false, _, RawMutability::Mut) => None,
+        },
+        Some(Decision::Degraded(_)) | None => match source_shape {
+            "addr-of-mut" if target.mutability == RawMutability::Mut => {
+                Some(format!("core::ptr::from_mut({argument})"))
+            }
+            "addr-of-mut" => Some(format!("core::ptr::from_ref(&*{argument})")),
+            "addr-of" if target.mutability == RawMutability::Const => {
+                Some(format!("core::ptr::from_ref({argument})"))
+            }
+            _ => raw_passthrough(),
+        },
+        Some(Decision::Box(_)) => None,
+    }
 }
 
 /// One resolved argument to a non-body callee. This is the fact the old

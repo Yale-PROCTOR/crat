@@ -1096,25 +1096,18 @@ pub(crate) fn build_with_c9_marks_lifetimes_raw_boundary_and_pair_proofs(
                         role = PairRole::Blocked;
                     }
                     if role == PairRole::RawView {
-                        let order_safe = matches!(
-                            position.source_shape,
-                            "bare-local" | "cast-of-local" | "addr-of-mut" | "addr-of"
-                        );
-                        let template_available = order_safe
-                            && (position
-                                .source_node
-                                .and_then(|node| decision_of.get(&node).copied())
-                                .zip(position.target.as_ref())
-                                .is_some_and(|(decision, target)| {
-                                    super::raw_boundary::template_for(decision, target, None, false)
-                                        .is_ok()
-                                })
-                                || position.target.as_ref().is_some_and(|target| {
-                                    matches!(position.source_shape, "addr-of-mut")
-                                        || (position.source_shape == "addr-of"
-                                            && target.mutability
-                                                == super::raw_boundary::RawMutability::Const)
-                                }));
+                        let source_decision = position
+                            .source_node
+                            .and_then(|node| decision_of.get(&node).copied());
+                        let template_available = position.target.as_ref().is_some_and(|target| {
+                            super::raw_boundary::pair_raw_view_expression(
+                                source_decision,
+                                target,
+                                "__crat_pair_source",
+                                position.source_shape,
+                            )
+                            .is_some()
+                        });
                         if !template_available {
                             role = PairRole::Blocked;
                             tier = PairTier::Blocked;
